@@ -32,7 +32,10 @@ jobs:
         run: python tools/verify_changes.py --plan
       - name: Million-observation chart performance
         timeout-minutes: 3
-        run: python tools/run_ui_checks.py -- python -m pytest -v --tb=short tests/test_quota_chart_performance.py --basetemp artifacts/verification/chart
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path artifacts/verification -Force | Out-Null
+          python tools/run_ui_checks.py -- python -m pytest -v --tb=short tests/test_quota_chart_performance.py --basetemp artifacts/verification/chart
       - name: Full regression
         timeout-minutes: 15
         shell: pwsh
