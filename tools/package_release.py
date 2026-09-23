@@ -30,7 +30,8 @@ def payload(folder: Path):
         rel = path.relative_to(folder).as_posix()
         if path.parent != folder and not rel.startswith(('_internal/', 'LICENSES/')):
             raise ValueError(f'Unexpected distribution path: {rel}')
-        if path.name.lower() in FORBIDDEN_NAMES or path.suffix.lower() in FORBIDDEN_SUFFIXES:
+        if path.name.lower() in FORBIDDEN_NAMES or (path.suffix.lower() in FORBIDDEN_SUFFIXES
+                and rel != '_internal/base_library.zip'):
             raise ValueError(f'Private or diagnostic file in distribution: {rel}')
         if any(part.lower() in {'artifacts', 'screenshots', 'captures', '.codex'} for part in path.parts):
             raise ValueError(f'Diagnostic directory in distribution: {rel}')

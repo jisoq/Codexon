@@ -36,6 +36,12 @@ def test_public_payload_rejects_local_paths_and_unneeded_qt(tmp_path):
     file = folder/'build-manifest.json'
     file.write_text(json.dumps(manifest), encoding='utf-8')
     assert payload(folder)[2] == manifest
+    internal = folder/'_internal';internal.mkdir()
+    (internal/'base_library.zip').write_bytes(b'python standard library archive')
+    assert payload(folder)[2] == manifest
+    (internal/'diagnostics.zip').write_bytes(b'not an app dependency')
+    with pytest.raises(ValueError):payload(folder)
+    (internal/'diagnostics.zip').unlink()
     file.write_text(json.dumps({**manifest,'source':r'C:\Users\developer\repo'}), encoding='utf-8')
     with pytest.raises(ValueError):payload(folder)
     file.write_text(json.dumps(manifest), encoding='utf-8')
