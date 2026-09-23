@@ -50,6 +50,12 @@ WizardStyle=modern
 Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "korean"; MessagesFile: "compiler:Languages\Korean.isl"
 
+[CustomMessages]
+english.ActivationFailure=Codexon could not be activated. Existing launch paths and records are preserved. See install-result.json in the installation folder.
+korean.ActivationFailure=Codexon 설치를 완료하지 못했습니다. 기존 실행 경로와 기록은 보존됩니다. 설치 폴더의 install-result.json을 확인하세요.
+english.ActivationFailureTitle=Installation not completed
+korean.ActivationFailureTitle=설치를 완료하지 못했습니다
+
 [Files]
 Source: "{#ProductDir}\*"; DestDir: "{code:ProductPath}"; Excludes: "CodexonRecovery.exe"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#ProductDir}\CodexonRecovery.exe"; DestDir: "{code:RecoveryDir}"; Flags: ignoreversion
@@ -60,7 +66,7 @@ Root: HKCU; Subkey: "Software\Classes\{#ProtocolName}"; Flags: uninsdeletekey
 Root: HKCU; Subkey: "Software\Classes\AppUserModelId\{#RegistryName}.Recovery"; Flags: uninsdeletekey
 
 [Code]
-var InstallId: String;
+var InstallId: String; ActivationFailed: Boolean;
 
 function InitializeSetup(): Boolean;
 begin
@@ -86,8 +92,24 @@ begin
       '" --report "' + ExpandConstant('{app}\install-result.json') + '"{#ExtraArgs}';
     if ActiveLanguage = 'english' then Args := Args + ' --language en'
     else Args := Args + ' --language ko';
-    if not Exec(RecoveryDir('') + '\CodexonRecovery.exe', Args, '', SW_HIDE, ewWaitUntilTerminated, ExitCode) or (ExitCode <> 0) then
-      RaiseException('설치를 완료하지 못했습니다. 이전 버전과 기록은 보존됩니다. 설치 폴더의 install-result.json을 확인하세요.');
+    if not Exec(RecoveryDir('') + '\CodexonRecovery.exe', Args, '', SW_HIDE, ewWaitUntilTerminated, ExitCode) or (ExitCode <> 0) then begin
+      ActivationFailed := True;
+      Log(CustomMessage('ActivationFailure'));
+      SuppressibleMsgBox(CustomMessage('ActivationFailure'), mbError, MB_OK, IDOK);
+    end;
+  end;
+end;
+
+function GetCustomSetupExitCode(): Integer;
+begin
+  if ActivationFailed then Result := 1001 else Result := 0;
+end;
+
+procedure CurPageChanged(CurPageID: Integer);
+begin
+  if (CurPageID = wpFinished) and ActivationFailed then begin
+    WizardForm.FinishedHeadingLabel.Caption := CustomMessage('ActivationFailureTitle');
+    WizardForm.FinishedLabel.Caption := CustomMessage('ActivationFailure');
   end;
 end;
 

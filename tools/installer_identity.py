@@ -22,5 +22,5 @@ def require_qa_installer(path):
     for language, codepage in translations:
         key = f'\\StringFileInfo\\{language:04x}{codepage:04x}\\ProductName'
         if api.VerQueryValueW(data, key, ctypes.byref(pointer), ctypes.byref(length)):
-            if ctypes.wstring_at(pointer, length.value).rstrip('\0')=='Codexon QA':return
+            if ctypes.wstring_at(pointer, length.value).rstrip('\0').strip()=='Codexon QA':return
     raise ValueError('Only an installer built with -Isolated may run in QA')

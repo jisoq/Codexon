@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 import winreg
+import uuid
 from contextlib import contextmanager
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
@@ -57,14 +58,18 @@ def main():
     if args.broken_installer:require_qa_installer(args.broken_installer)
     if registration():raise RuntimeError('An existing QA installation must be preserved; use a clean QA environment')
     root=args.output.resolve();root.mkdir(parents=True,exist_ok=False)
+    # Keep installed Qt resource paths within Windows' installer path limit.
+    # Evidence paths may be descriptive and much longer than the install root.
+    install=Path(__file__).resolve().parents[1]/'artifacts'/('qa-'+uuid.uuid4().hex[:8])
+    (root/'install-location.json').write_text(json.dumps({'root':str(install)}))
     if args.broken_installer:
-        broken=root/'failed-first-install'
+        broken=install.with_name(install.name+'-f')
         assert run([args.broken_installer.resolve(),'/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',
                     f'/DIR={broken}',f'/LOG={root / "failed-first.log"}'])!=0
         assert not registration()
+        assert read_json(broken/'install-result.json').get('error'), 'Runtime failure must reach activation'
         assert run([next(broken.glob('unins*.exe')),'/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART'])==0
         assert not registration()
-    install=root/'installed'
     command=[args.installer.resolve(),'/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',f'/DIR={install}']
     assert run([*command,f'/LOG={root / "install.log"}'])==0
     first=registration();assert Path(first['InstallRoot'])==install
