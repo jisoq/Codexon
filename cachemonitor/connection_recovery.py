@@ -273,7 +273,15 @@ def main(argv=None):
                         or not (manager.home/'codexon-test-home').exists()):
                     raise ValueError('UI checks require an explicitly isolated test home and port')
                 window.smoke_activations=0
+                window.smoke_reports=0
+                def callback_error(kind,value,trace):
+                    import traceback
+                    args.ui_smoke.with_suffix('.error.txt').write_text(
+                        ''.join(traceback.format_exception(kind,value,trace)),encoding='utf-8')
+                window.root.report_callback_exception=callback_error
                 def report_ui():
+                    window.root.after(250,report_ui)
+                    window.smoke_reports+=1
                     action=args.ui_smoke.with_suffix('.click')
                     button=window.button
                     ready=bool(button.winfo_ismapped() and button.instate(['!disabled']))
@@ -287,8 +295,7 @@ def main(argv=None):
                     atomic_write(args.ui_smoke,json.dumps(dict(busy=window.busy,result=window.result,
                         hwnd=window.root.winfo_id(),button=window.button.winfo_id(),
                         width=button.winfo_width(),height=button.winfo_height(),
-                        ready=ready,activations=window.smoke_activations)).encode())
-                    window.root.after(250,report_ui)
+                        ready=ready,activations=window.smoke_activations,reports=window.smoke_reports)).encode())
                 window.root.after(250,report_ui)
             window.run()
             return 0

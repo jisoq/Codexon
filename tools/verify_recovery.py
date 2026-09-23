@@ -52,6 +52,8 @@ def capture(hwnd,path):
 def wait_report(path,predicate,timeout=30):
     deadline=time.monotonic()+timeout
     while time.monotonic()<deadline:
+        error=path.with_suffix('.error.txt')
+        if error.exists():raise RuntimeError('Recovery UI callback failed: '+error.read_text(encoding='utf-8'))
         data=read_json(path)
         if data and predicate(data):return data
         time.sleep(.2)
@@ -82,7 +84,8 @@ def main():
     try:
         state=wait_report(report,lambda d:not d['busy'] and d.get('result') and d.get('ready'))
         assert state['result']['code']=='refused'
-        capture(state['hwnd'],root/'before.png')
+        # PrintWindow synchronously sends native paint messages into Tk. Keep
+        # external capture after the interaction so it cannot disturb the input.
         report.with_suffix('.click').touch()
         state=wait_report(report,lambda d:(d.get('result') or {}).get('code')=='restored')
         assert state['activations']==1

@@ -30,6 +30,24 @@ jobs:
           python -m pip_audit -r requirements-release.lock
       - name: Plan checks
         run: python tools/verify_changes.py --plan
+      - name: Build Windows package
+        shell: pwsh
+        run: .\build.ps1 -DistPath dist-ci -WorkPath build-ci -PythonPath ((Get-Command python).Source)
+      - name: Check independent offline recovery
+        run: |
+          python tools/run_ui_checks.py -- python tools/verify_recovery.py --executable dist-ci/Codexon/CodexonRecovery.exe --output artifacts/verification/recovery-ko
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tools/run_ui_checks.py -- python tools/verify_recovery.py --executable dist-ci/Codexon/CodexonRecovery.exe --output artifacts/verification/recovery-en --language en
+      - name: Build isolated installer
+        shell: pwsh
+        run: |
+          $compiler = Get-ChildItem "${env:ProgramFiles(x86)}\Inno Setup*\ISCC.exe" | Select-Object -First 1
+          if (-not $compiler) { throw 'Inno Setup compiler is required on this Windows runner' }
+          .\tools\Build-Installer.ps1 -ProductDir dist-ci/Codexon -OutputDir dist-ci/qa-setup -Compiler $compiler.FullName -Isolated
+          python tools/prepare_bad_runtime.py --product dist-ci/Codexon --output dist-ci/bad-runtime
+          .\tools\Build-Installer.ps1 -ProductDir dist-ci/bad-runtime -OutputDir dist-ci/qa-bad-runtime -Compiler $compiler.FullName -Isolated
+      - name: Check installation, update and removal
+        run: python tools/run_ui_checks.py -- python tools/verify_installation.py --installer dist-ci/qa-setup/Codexon-Setup.exe --broken-installer dist-ci/qa-bad-runtime/Codexon-Setup.exe --output artifacts/verification/installation
       - name: Million-observation chart performance
         timeout-minutes: 3
         shell: pwsh
@@ -48,9 +66,6 @@ jobs:
         run: |
           $env:QT_QPA_PLATFORM='offscreen'
           python -m pytest -q tests/test_ui.py tests/test_model_ui.py tests/test_call_transport.py tests/test_quota_detail_card.py
-      - name: Build Windows package
-        shell: pwsh
-        run: .\build.ps1 -DistPath dist-ci -WorkPath build-ci -PythonPath ((Get-Command python).Source)
       - name: Check frozen runtime and Qt Quick interaction
         run: python tools/run_ui_checks.py -- python tools/verify_changes.py --base HEAD --package-exe dist-ci/Codexon/Codexon.exe
       - name: Build previous package and check managed proxy replacement
@@ -64,21 +79,6 @@ jobs:
         run: python tools/run_ui_checks.py -- python tools/verify_gui_handoff.py --executable dist-ci/Codexon/Codexon.exe --output artifacts/verification/gui-handoff
       - name: Check installer payload contents
         run: python tools/package_release.py --product dist-ci/Codexon --validate-only
-      - name: Check independent offline recovery
-        run: |
-          python tools/run_ui_checks.py -- python tools/verify_recovery.py --executable dist-ci/Codexon/CodexonRecovery.exe --output artifacts/verification/recovery-ko
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python tools/run_ui_checks.py -- python tools/verify_recovery.py --executable dist-ci/Codexon/CodexonRecovery.exe --output artifacts/verification/recovery-en --language en
-      - name: Build isolated installer
-        shell: pwsh
-        run: |
-          $compiler = Get-ChildItem "${env:ProgramFiles(x86)}\Inno Setup*\ISCC.exe" | Select-Object -First 1
-          if (-not $compiler) { throw 'Inno Setup compiler is required on this Windows runner' }
-          .\tools\Build-Installer.ps1 -ProductDir dist-ci/Codexon -OutputDir dist-ci/qa-setup -Compiler $compiler.FullName -Isolated
-          python tools/prepare_bad_runtime.py --product dist-ci/Codexon --output dist-ci/bad-runtime
-          .\tools\Build-Installer.ps1 -ProductDir dist-ci/bad-runtime -OutputDir dist-ci/qa-bad-runtime -Compiler $compiler.FullName -Isolated
-      - name: Check installation, update and removal
-        run: python tools/run_ui_checks.py -- python tools/verify_installation.py --installer dist-ci/qa-setup/Codexon-Setup.exe --broken-installer dist-ci/qa-bad-runtime/Codexon-Setup.exe --output artifacts/verification/installation
       - name: Upload redacted synthetic verification evidence
         if: always()
         uses: actions/upload-artifact@v7
