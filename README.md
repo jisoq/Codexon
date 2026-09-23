@@ -2,11 +2,12 @@
 
 [한국어](README.ko.md) · [English](README.md)
 
-**Keep your Codex usage in view.** Codexon is a Windows companion for Codex. Compare request and response model names in an overlay, explore session token usage and API-equivalent costs, and track your remaining usage limits.
+**Did the model you called match the model that responded?** Codexon is a Windows companion for Codex that monitors request/response model mismatches to help you spot signs of model routing. Keep model names and usage visible in an overlay, explore session token usage and API-equivalent costs, and track your remaining usage limits.
 
 ![Codexon overlay with sample sessions](docs/media/overlay-sample.png)
 
-- See the latest call's model names, tokens, cache rate, and API-equivalent cost while working in Codex.
+- **Monitor request/response model mismatches.** Compare the model names recorded in each request and response to see when the reported response model differs from the one you called.
+- See the latest call's tokens, cache rate, and API-equivalent cost in an overlay while working in Codex.
 - Explore sessions and individual calls, including confirmed child-agent usage in session totals.
 - Follow remaining usage limits and reset times. The tray and taskbar widget keep them visible without opening the dashboard.
 
