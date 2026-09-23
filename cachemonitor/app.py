@@ -33,6 +33,7 @@ def main():
     controls.add_argument('--test-model-observer',action='store_true')
     parser.add_argument('--control-report',help='Save observer control result to JSON')
     parser.add_argument('--replace-gui',action='store_true',help=argparse.SUPPRESS)
+    parser.add_argument('--verify-handoff',type=Path,help=argparse.SUPPRESS)
     parser.add_argument("--codex-home", action="append", help="Repeat to monitor multiple local Codex homes")
     parser.add_argument("--hidden", action="store_true")
     parser.add_argument("--index-path", help="Override the app-owned usage index for isolated verification")
@@ -41,7 +42,13 @@ def main():
     parser.add_argument("--smoke-depth", choices=('core','full'), default='full',
                         help="Choose the compact release check or full interaction probe")
     args = parser.parse_args()
-    homes = args.codex_home or [os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))]
+    if args.verify_handoff and (not args.index_path or not args.codex_home or
+            not all((Path(h)/'codexon-test-home').is_file() for h in args.codex_home)):
+        parser.error('Handoff verification requires isolated homes and an explicit index')
+    from .launch_context import resolve_homes, save_homes
+    # Synthetic verification never inherits GUI preferences; controls return before saving.
+    isolated = bool(args.smoke or args.index_path or args.snapshot)
+    homes = (args.codex_home or [os.environ.get('CODEX_HOME', str(Path.home()/'.codex'))]) if isolated else resolve_homes(args.codex_home)
     if args.enable_model_observer or args.disable_model_observer or args.model_observer_status or args.test_model_observer:
         from .observer_control import ObserverManager
         manager=ObserverManager(homes[0],Path(args.index_path).parent if args.index_path else None)
@@ -67,7 +74,7 @@ def main():
     display_language=os.environ.get('CODEXON_LANGUAGE') or QSettings('CacheMonitor','CacheMonitor').value('ui/language','ko')
     set_language(display_language)
     QLocale.setDefault(QLocale('en_US' if display_language=='en' else 'ko_KR'))
-    app.setProperty('cachemonitorDisableShellIntegration', bool(args.smoke))
+    app.setProperty('cachemonitorDisableShellIntegration', bool(args.smoke or args.verify_handoff))
     bundled_fonts = load_bundled_fonts()
     app.setQuitOnLastWindowClosed(False)
     app.setStyle("Fusion")
@@ -80,6 +87,9 @@ def main():
     if not args.smoke:
         # One tray icon per Windows user. A second launch opens the existing dashboard.
         server_name = "CacheMonitor-" + os.environ.get("USERNAME", "user")
+        if args.verify_handoff:
+            import hashlib
+            server_name = 'CodexonQA-'+hashlib.sha256(str(Path(args.index_path).resolve()).encode()).hexdigest()[:24]
         client = QLocalSocket()
         client.connectToServer(server_name)
         if client.waitForConnected(400):
@@ -101,13 +111,14 @@ def main():
             QMessageBox.warning(None, "Codexon", tr("실행 중인 앱 상태를 확인할 수 없습니다."))
             return 1
     smoke_settings = None
-    if args.smoke:
+    if args.smoke or args.verify_handoff:
         smoke_directory = tempfile.TemporaryDirectory(prefix='cachemonitor-qa-')
         smoke_settings = QSettings(str(Path(smoke_directory.name)/'settings.ini'),QSettings.IniFormat)
         if args.index_path is None:args.index_path=str(Path(smoke_directory.name)/'index.sqlite')
-    window = Dashboard(homes,index_path=args.index_path,live_limits=not args.smoke,manage_observer=not args.smoke and args.index_path is None, **({'settings':smoke_settings} if smoke_settings else {}))
+    if not isolated:save_homes(homes)
+    window = Dashboard(homes,index_path=args.index_path,live_limits=not (args.smoke or args.verify_handoff),manage_observer=not args.smoke and args.index_path is None, **({'settings':smoke_settings} if smoke_settings else {}))
     from .overlay import install_overlay
-    install_overlay(window, native_enabled=not args.smoke)
+    install_overlay(window, native_enabled=not (args.smoke or args.verify_handoff))
     app.aboutToQuit.connect(window.observer_panel.stop)
     def finish_update():
         operation=window.update_panel.operation
@@ -133,6 +144,10 @@ def main():
         receive()
 
     server.newConnection.connect(connection)
+    if args.verify_handoff:
+        from .observer_control import atomic_write
+        QTimer.singleShot(250,lambda:atomic_write(args.verify_handoff,json.dumps(dict(
+            pid=os.getpid(),version=VERSION,homes=homes,ready=True,hwnd=int(window.winId()))).encode()))
     if not args.hidden or not QSystemTrayIcon.isSystemTrayAvailable():
         window.show_window()
     if args.smoke:

@@ -23,6 +23,7 @@
 AppId={#RegistryName}
 AppName={#ProductName}
 AppVersion={#ProductVersion}
+VersionInfoProductName={#ProductName}
 AppPublisher=jisoq
 AppPublisherURL=https://github.com/jisoq/Codexon
 DefaultDirName={localappdata}\Programs\{#RegistryName}
@@ -53,16 +54,10 @@ Name: "korean"; MessagesFile: "compiler:Languages\Korean.isl"
 Source: "{#ProductDir}\*"; DestDir: "{code:ProductPath}"; Excludes: "CodexonRecovery.exe"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#ProductDir}\CodexonRecovery.exe"; DestDir: "{code:RecoveryDir}"; Flags: ignoreversion
 
-[Icons]
-Name: "{userprograms}\{#ProductName}"; Filename: "{code:ProductPath}\Codexon.exe"; WorkingDir: "{code:ProductPath}"
-Name: "{userprograms}\{#ProductName} 연결 복구"; Filename: "{code:RecoveryDir}\CodexonRecovery.exe"; AppUserModelID: "{#RegistryName}.Recovery"
-
 [Registry]
 Root: HKCU; Subkey: "Software\{#RegistryName}"; Flags: uninsdeletekey
-Root: HKCU; Subkey: "Software\Classes\{#ProtocolName}"; ValueType: string; ValueData: "URL:Codexon connection recovery"; Flags: uninsdeletekey
-Root: HKCU; Subkey: "Software\Classes\{#ProtocolName}"; ValueType: string; ValueName: "URL Protocol"; ValueData: ""
-Root: HKCU; Subkey: "Software\Classes\{#ProtocolName}\shell\open\command"; ValueType: string; ValueData: """{code:RecoveryDir}\CodexonRecovery.exe"" ""%1"""
-Root: HKCU; Subkey: "Software\Classes\AppUserModelId\{#RegistryName}.Recovery"; ValueType: string; ValueName: "DisplayName"; ValueData: "{#ProductName} 연결 복구"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\{#ProtocolName}"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\AppUserModelId\{#RegistryName}.Recovery"; Flags: uninsdeletekey
 
 [Code]
 var InstallId: String;
@@ -89,8 +84,26 @@ begin
   if CurStep = ssPostInstall then begin
     Args := '--install-root "' + ExpandConstant('{app}') + '" --product-dir "' + ProductPath('') +
       '" --report "' + ExpandConstant('{app}\install-result.json') + '"{#ExtraArgs}';
+    if ActiveLanguage = 'english' then Args := Args + ' --language en'
+    else Args := Args + ' --language ko';
     if not Exec(RecoveryDir('') + '\CodexonRecovery.exe', Args, '', SW_HIDE, ewWaitUntilTerminated, ExitCode) or (ExitCode <> 0) then
       RaiseException('설치를 완료하지 못했습니다. 이전 버전과 기록은 보존됩니다. 설치 폴더의 install-result.json을 확인하세요.');
+  end;
+end;
+
+function FallbackRecovery(): String;
+var FindRec: TFindRec; Candidate: String;
+begin
+  Result := '';
+  if FindFirst(ExpandConstant('{app}\maintenance\*'), FindRec) then begin
+    try
+      repeat
+        if (FindRec.Name <> '.') and (FindRec.Name <> '..') then begin
+          Candidate := ExpandConstant('{app}\maintenance\') + FindRec.Name + '\CodexonRecovery.exe';
+          if FileExists(Candidate) then begin Result := Candidate; Exit; end;
+        end;
+      until not FindNext(FindRec);
+    finally FindClose(FindRec); end;
   end;
 end;
 
@@ -98,7 +111,9 @@ procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var Tool, Args: String; ExitCode: Integer;
 begin
   if CurUninstallStep <> usUninstall then Exit;
-  if not RegQueryStringValue(HKCU, 'Software\{#RegistryName}', 'RecoveryPath', Tool) then
+  if not RegQueryStringValue(HKCU, 'Software\{#RegistryName}', 'RecoveryPath', Tool) or not FileExists(Tool) then
+    Tool := FallbackRecovery();
+  if Tool = '' then
     RaiseException('연결 복구 도구의 위치를 확인하지 못했습니다. 설치 프로그램을 다시 실행한 뒤 제거하세요.');
   Args := '--prepare-uninstall --install-root "' + ExpandConstant('{app}') +
     '" --report "' + ExpandConstant('{app}\uninstall-check.json') + '"{#ExtraArgs}';

@@ -9,9 +9,11 @@ import subprocess
 import sys
 import time
 import winreg
+from contextlib import contextmanager
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from cachemonitor.observer_state import read_json
+from tools.installer_identity import require_qa_installer
 
 KEY=r'Software\Codexon-QA'
 
@@ -27,19 +29,59 @@ def run(command):
     return subprocess.run(list(map(str,command)),timeout=180,creationflags=subprocess.CREATE_NO_WINDOW).returncode
 
 
+@contextmanager
+def prevent_receipt_replace(path):
+    api=ctypes.WinDLL('kernel32',use_last_error=True)
+    api.CreateFileW.argtypes=[W.LPCWSTR,W.DWORD,W.DWORD,ctypes.c_void_p,W.DWORD,W.DWORD,W.HANDLE]
+    api.CreateFileW.restype=W.HANDLE
+    api.CloseHandle.argtypes=[W.HANDLE]
+    handle=api.CreateFileW(str(path),0x80000000,1,None,3,0,None)
+    if handle==W.HANDLE(-1).value:raise ctypes.WinError(ctypes.get_last_error())
+    try:yield
+    finally:api.CloseHandle(handle)
+
+
+def launch_snapshot(root):
+    from cachemonitor.install_activation import shortcuts,snapshot_registry
+    return dict(registry=snapshot_registry(True),receipt=(root/'installation.json').read_bytes(),
+                links={str(p):p.read_bytes() if p.exists() else None for p in shortcuts(True)})
+
+
 def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--installer',type=Path,required=True)
     parser.add_argument('--output',type=Path,required=True)
+    parser.add_argument('--broken-installer',type=Path)
     args=parser.parse_args()
+    require_qa_installer(args.installer)
+    if args.broken_installer:require_qa_installer(args.broken_installer)
     if registration():raise RuntimeError('An existing QA installation must be preserved; use a clean QA environment')
     root=args.output.resolve();root.mkdir(parents=True,exist_ok=False)
+    if args.broken_installer:
+        broken=root/'failed-first-install'
+        assert run([args.broken_installer.resolve(),'/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',
+                    f'/DIR={broken}',f'/LOG={root / "failed-first.log"}'])!=0
+        assert not registration()
+        assert run([next(broken.glob('unins*.exe')),'/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART'])==0
+        assert not registration()
     install=root/'installed'
     command=[args.installer.resolve(),'/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',f'/DIR={install}']
     assert run([*command,f'/LOG={root / "install.log"}'])==0
     first=registration();assert Path(first['InstallRoot'])==install
     assert Path(first['AppPath']).is_file() and Path(first['RecoveryPath']).is_file()
+    from cachemonitor.install_activation import shortcuts
+    from cachemonitor.shell_shortcut import application_id
+    recovery_link=next(p for p in shortcuts(True)[1:] if p.exists())
+    assert application_id(recovery_link)=='Codexon-QA.Recovery'
     record=install/'preserved-record.txt';record.write_text('existing user record')
+    before=launch_snapshot(install)
+    if args.broken_installer:
+        assert run([args.broken_installer.resolve(),*command[1:],f'/LOG={root / "failed-runtime.log"}'])!=0
+        assert launch_snapshot(install)==before
+    with prevent_receipt_replace(install/'installation.json'):
+        assert run([*command,f'/LOG={root / "failed-receipt.log"}'])!=0
+        assert launch_snapshot(install)==before
+    assert not (install/'activation-pending.json').exists()
     assert run([*command,f'/LOG={root / "update.log"}'])==0
     second=registration()
     assert first['AppPath']!=second['AppPath'] and Path(first['AppPath']).is_file()
@@ -72,7 +114,9 @@ def main():
     assert not registration() and not Path(second['AppPath']).exists()
     assert record.read_text()=='existing user record'
     result=dict(passed=True,install=True,reinstall=True,old_payload_preserved=True,
-                busy_uninstall_deferred=True,uninstall=True,records_preserved=True)
+                busy_uninstall_deferred=True,uninstall=True,records_preserved=True,
+                receipt_failure_restored=True,runtime_failure_restored=bool(args.broken_installer),
+                first_failure_removable=bool(args.broken_installer))
     (root/'result.json').write_text(json.dumps(result,indent=2));print(json.dumps(result))
 
 

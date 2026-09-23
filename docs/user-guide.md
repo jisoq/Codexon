@@ -12,11 +12,20 @@ Keep Codexon running and enable **Settings → Session overlay**. The overlay id
 
 Codex version numbers are not an allowlist. Updates that retain the route format continue to work; a changed format may require compatibility work. Task detection does not send model requests. Enable **Settings → General → Starts when you log in to Windows** to start Codexon in the tray at login; reopening Codex alone does not launch a stopped Codexon.
 
+## Average output speed
+
+The dashboard's usage summary and call details show **average output speed** in `tok/s`; the call table offers it as an optional column. The overlay shows the latest call's speed beside cache rate and cost. Select the speed to inspect that call's duration in the dashboard.
+
+Speed is output tokens, including reasoning, divided by the observed time from request to completed response. It includes waiting and network time, not just streaming. Only completed calls with matching proxy timing and valid output counts are measured; missing or conflicting evidence is not zero. The dashboard summary divides eligible output totals by those same calls' total duration and shows measured coverage. Parallel call durations are summed, so this is not overall wall-clock throughput. Existing records with valid timing can be used; no model request is sent to measure speed.
+
 ## Update
 
 Use **Settings → About and troubleshooting → Check and install updates**. Codexon verifies the official installer, prepares a separate version directory and checks its runtime before switching launch paths. The same operation schedules the proxy update after existing connections finish, including idle WebSockets. No active request is force-cancelled or replayed. Finish work and close Codex when a connection update is waiting. A failed new proxy is rolled back; new connections may briefly fail during the switch. Previous payloads remain available for running components and rollback.
 
 Users of legacy portable copies can migrate by running Setup once. If the previous GUI does not support automatic handoff, exit Codexon through its tray and open the installed version from Start. Existing settings and history remain in their original locations.
+
+
+Explicit `--codex-home` selections are saved in `%LOCALAPPDATA%\CacheMonitor\launch.json`. Multiple homes and paths containing spaces are retained after updates and Start-menu launches, even with login startup disabled. Specify `--codex-home` again to change the selection.
 
 ## Remove
 
@@ -26,7 +35,7 @@ Application data under `%LOCALAPPDATA%\CacheMonitor` is separate. `usage-index.s
 
 ## Recover direct connection without the GUI
 
-Open **Codexon 연결 복구** (connection recovery) from Start and select **직접 연결로 복원** (restore direct connection). The tool runs without the desktop app, Qt runtime, internet access or an AI response. **About and troubleshooting → Open Codex connection recovery** opens the same tool.
+Open **Codexon Connection Recovery** from Start and select **Restore direct connection**. The tool runs without the desktop app, Qt runtime, internet access or an AI response. **About and troubleshooting → Open Codex connection recovery** opens the same tool.
 
 After configuration restoration, finish current work and fully restart Codex. Restoring a setting does not prove that model communication has resumed. Manual recovery stays available even when automatic diagnosis reports a responding proxy. Other server settings and authentication are preserved. An unreadable configuration is not overwritten with guessed values.
 

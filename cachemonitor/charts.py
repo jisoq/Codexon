@@ -64,6 +64,7 @@ COLORS = ('#285FBC','#0F766E','#6551A4','#8A641A','#7A8898','#A45A13','#357C9B',
 
 def value_text(value, metric='cost'):
     if value is None: return '—'
+    if metric=='output_speed': return ('<0.1' if 0<value<.1 else f'{value:,.1f}')+' tok/s'
     if metric == 'cost': return usd(value)
     if metric in ('cache_ratio','cache_rate'): return f'{value:.1f}%'
     if metric=='duration': return f'{value:,.2f}초'

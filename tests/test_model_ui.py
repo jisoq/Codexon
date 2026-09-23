@@ -63,6 +63,9 @@ def test_model_columns_counts_filter_and_refresh(tmp_path):
         assert window.table.rowCount()==0 and window.selected_call=='r1'
         assert '현재 조건에서 제외' in window.record_message.text()
         window.search.clear();window.call_filter_controls['model_mismatch'].setChecked(False)
+        if not window.table.isVisible():
+            from cachemonitor.quick_qa import click,control
+            click(window,control(window,window.close_record_button))
         click_row(window,window.table,0)
         assert '요청 모델  gpt-6-astra' in window.detail_sections['conditions'][1].text()
         assert not window.detail_sections['evidence'][0].isVisible()

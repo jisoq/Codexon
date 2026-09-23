@@ -1,5 +1,5 @@
 # The recovery runtime is self-contained. It never loads the desktop Qt bundle.
-a = Analysis(['recovery_main.py'], pathex=[], binaries=[], datas=[], hiddenimports=[],
+a = Analysis(['recovery_main.py'], pathex=[], binaries=[], datas=[('cachemonitor/assets/i18n', 'cachemonitor/assets/i18n')], hiddenimports=[],
              excludes=['PySide6', 'shiboken6', 'pytest', 'aiohttp', 'httpx', 'ijson', 'cryptography'],
              noarchive=False, optimize=0)
 pyz = PYZ(a.pure)

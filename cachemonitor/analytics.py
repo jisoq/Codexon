@@ -66,6 +66,30 @@ def finite(value):
     return type(value) in (int,float) and math.isfinite(value) and value>=0
 
 
+def output_speed(row):
+    """Observed output (including reasoning) per end-to-end response second."""
+    output=token_number(row.get('output'));elapsed=row.get('completion_latency_ms')
+    if (row.get('response_status')!='completed' or not row.get('timing_valid',True)
+            or row.get('observation_missing') or row.get('model_conflict')
+            or row.get('output_conflict') or row.get('transport_source')=='conflict'
+            or output is None or not finite(elapsed) or elapsed<=0):return None
+    reasoning=token_number(row.get('reasoning'))
+    if reasoning is not None and reasoning>output:return None
+    seconds=elapsed/1000
+    if seconds<=0:return None
+    value=output/seconds
+    return value if finite(value) else None
+
+
+def output_speed_summary(rows):
+    """Time-weighted call speed, not wall-clock throughput of parallel calls."""
+    rows=list(rows);valid=[r for r in rows if output_speed(r) is not None]
+    output=sum(r['output'] for r in valid)
+    seconds=sum(r['completion_latency_ms']/1000 for r in valid)
+    return dict(value=output/seconds if seconds else None,output=output,seconds=seconds,
+                n=len(valid),N=len(rows),missing=len(rows)-len(valid))
+
+
 def cache_rows(rows):
     return [r for r in rows if token_number(r.get('input')) is not None and token_number(r.get('cached')) is not None
             and r['cached']<=r['input']]
@@ -137,6 +161,7 @@ def prepare_row(row,session,price=None):
             and not r.get('model_conflict'))
     r['duration']=r['completion_latency_ms']/1000 if timing and finite(r.get('completion_latency_ms')) else None
     r['generation_wait']=r['generation_latency_ms']/1000 if timing and finite(r.get('generation_latency_ms')) else None
+    r['output_speed']=output_speed(r)
     r.update(token_cost(r) if price is None else price)
     return r
 
@@ -153,7 +178,7 @@ def session_summary(rows):
     components=[dict(key=k,label=label,total=sum(r[k] for r in priced) if priced or not rows else None,
                      share=sum(r[k] for r in priced)/cost['sum'] if cost['sum'] else None,n=len(priced),N=len(rows))
                 for k,label in zip(COST_COMPONENTS,COMPONENT_LABELS)]
-    return dict(calls=len(rows),cost=cost,cache=cache,components=components,**composition)
+    return dict(calls=len(rows),cost=cost,cache=cache,output_speed=output_speed_summary(rows),components=components,**composition)
 
 
 def condition_match(row,conditions,unit='response'):

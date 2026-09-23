@@ -204,7 +204,8 @@ def test_long_model_names_are_complete_and_wrapped_in_detail(observed_overlay, t
     assert model.layout()['cache'] >= 48 + len(model.context_rows()) * 18 + 18
     assert model.layout()['height'] >= model.layout()['status'] + 32
     cache_link = next(link for link in model.monitor_links() if link['id'] == 'cache')
-    assert cache_link['y'] == model.layout()['cache'] + 16
+    assert cache_link['y'] == model.layout()['cache'] + 20
+    assert cache_link['y'] + cache_link['height'] <= model.layout()['recent']
     item = next(item for item in model.detail_items()
                 if (''.join(item[0]) if isinstance(item[0], list) else item[0]) == expected)
     assert isinstance(item[0], list) and len(item[0]) > 1

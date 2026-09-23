@@ -98,8 +98,16 @@ def test_restarted_updater_recovers_interrupted_switch(setup):
 
 
 def test_no_upgrade_needed(setup):
-    m,u=setup;m.version=PROXY_VERSION;u.run()
+    m,u=setup;m.version=PROXY_VERSION
+    m.supervisor_command=lambda upstream:['CacheMonitor.exe','--proxy-supervisor']
+    u.run()
     assert read_json(u.path)['phase']=='complete' and not m.task.commands
+
+
+def test_same_version_at_previous_install_path_is_actually_replaced(setup):
+    m,u=setup;m.version=PROXY_VERSION;u.run()
+    assert read_json(u.path)['phase']=='complete'
+    assert m.task.commands==[['new.exe','--proxy-supervisor']] and m.task.stops==1
 
 
 def test_disabled_while_waiting_cancels(setup):

@@ -108,14 +108,15 @@ class ProxyUpdate:
                 health = m.health(timeout=3)
                 if not health or not health.get('control_id'):
                     raise RuntimeError('현재 프록시에서 안전한 업데이트를 지원하지 않습니다.')
-                if health.get('version')==PROXY_VERSION and health.get('lifecycle')=='managed':
-                    self.publish('complete', message='최신 버전입니다.'); return
                 runtime = m.runtime()
                 old_exe = process_executable(runtime['pid'])
-                if Path(old_exe).name.lower() not in ('cachemonitor.exe','codexon.exe'):
-                    raise RuntimeError('배포 실행 파일에서 업데이트하세요.')
                 upstream = m.state().get('upstream') or m.upstream()
                 command = m.supervisor_command(upstream)
+                if (health.get('version')==PROXY_VERSION and health.get('lifecycle')=='managed'
+                        and Path(old_exe).resolve()==Path(command[0]).resolve()):
+                    self.publish('complete', message='최신 버전입니다.'); return
+                if Path(old_exe).name.lower() not in ('cachemonitor.exe','codexon.exe'):
+                    raise RuntimeError('배포 실행 파일에서 업데이트하세요.')
                 rollback = [old_exe, *command[1:]]
                 if health.get('lifecycle')!='managed':
                     # Old binaries do not understand --managed; retain their launcher protocol.

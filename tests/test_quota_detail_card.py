@@ -18,6 +18,10 @@ def test_two_usd_scales_hover_pin_escape_and_gap_card(tmp_path,width,dark):
     host=mount(chart,width,450)
     try:
         plot=render_plot(host,chart)
+        # This test drives the hover slot explicitly. Native cursor updates must
+        # not select a different sample during the event-loop wait below.
+        from PySide6.QtCore import QObject
+        plot.findChild(QObject,'plotHover').setProperty('enabled',False)
         assert chart.cost_ceiling==pytest.approx(33.6)
         assert chart.ceiling==pytest.approx(1344)
         # Ten dollars now span their own cost scale, not the much larger weekly value scale.

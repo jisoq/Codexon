@@ -46,12 +46,17 @@ def dispose(host):
 def render_plot(host,node):
     """Bring the plot into its real scroll view and wait for a painted frame."""
     from .presentation import Scroll
-    parent=node.parent()
+    import time
+    parent=node.parent();scrolls=[]
     while parent:
-        if isinstance(parent,Scroll):parent.ensureWidgetVisible(node)
+        if isinstance(parent,Scroll):
+            parent.ensureWidgetVisible(node);scrolls.append(parent)
         parent=parent.parent()
-    QTest.qWait(50)
-    host.quick.grabFramebuffer()
+    deadline=time.monotonic()+3
+    while True:
+        QTest.qWait(20);host.quick.grabFramebuffer()
+        if all(control(host,s).property('revealTarget') is None for s in scrolls):break
+        if time.monotonic()>deadline:raise AssertionError('Scroll reveal did not settle')
     return control(host,node)
 
 
@@ -76,7 +81,9 @@ def click_row(host,node,row,column=0):
                 scene=cell.mapToScene(QPointF(cell.width()/2,cell.height()/2))
                 if host.quick.rect().contains(scene.toPoint()):
                     click(host,cell);return
-    raise AssertionError(f'Visible table delegate missing: {row}, {column}')
+    raise AssertionError(f'Visible table delegate missing: {row}, {column}; '
+        f'window={host.width()}x{host.height()}, scale={host.devicePixelRatioF()}, '
+        f'table={table.width()}x{table.height()}, visible={node.isVisible()}')
 
 
 def flickable(host,node):

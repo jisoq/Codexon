@@ -6,7 +6,7 @@ from pathlib import Path
 from PySide6.QtCore import QObject, Property, Slot
 
 _language = 'ko'
-_catalog = json.loads((Path(__file__).parent / 'assets' / 'i18n' / 'en.json').read_text(encoding='utf-8'))
+from .translation_catalog import CATALOG as _catalog
 _parts = sorted(((source, target) for source, target in _catalog.items() if len(source) > 1),
                 key=lambda item: len(item[0]), reverse=True)
 

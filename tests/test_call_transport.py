@@ -103,6 +103,9 @@ def test_call_column_filter_selection_refresh_and_diagnostics(tmp_path):
         assert not w.detail_sections['evidence'][0].isVisible()
         assert w.exact_record['transport_evidence']=='HTTP 전환 기록'
         assert w.exact_record['transport_endpoint']=='/responses'
+        if not w.table.isVisible():
+            from cachemonitor.quick_qa import click, control
+            click(w,control(w,w.close_record_button))
         click_row(w,w.table,1)
         s.transports.append(Transport(now-22, 'WebSocket', '/new-path', '갱신 근거', turn='turn'))
         w.receive(snapshot())

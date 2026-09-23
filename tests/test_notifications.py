@@ -64,6 +64,8 @@ def test_http_notifications_do_not_replay_cached_warnings(tmp_path,monkeypatch):
 
 
 def test_confirmed_alerts_reach_tray_and_click_opens_evidence(tmp_path,monkeypatch):
+    # Exercise the source-app notifier without consulting the real installation.
+    monkeypatch.setattr('cachemonitor.installation.installed',lambda:{})
     import os
     from cachemonitor.model_evidence import EvidenceStore,EvidenceReader
     from cachemonitor.dashboard import STYLE

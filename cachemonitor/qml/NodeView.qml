@@ -30,7 +30,7 @@ Item {
     sourceComponent: {
         if (!node) return spacerComponent
         switch(s.kind) {
-        case "row": return s.flow ? flowComponent : s.collapseBelow ? responsiveComponent : rowComponent
+        case "row": return s.flow ? flowComponent : s.minColumnWidth ? adaptiveGridComponent : s.collapseBelow ? responsiveComponent : rowComponent
         case "column": return columnComponent
         case "group": return groupComponent
         case "spacer": return spacerComponent
@@ -86,6 +86,29 @@ Item {
                     visible: modelData.state.visible && modelData.state.kind !== "spacer"
                     width: Math.max(modelData.state.minWidth, implicitWidth)
                     height: Math.max(36, implicitHeight)
+                }
+            }
+        }
+    }
+    Component {
+        id: adaptiveGridComponent
+        Item {
+            implicitHeight: grid.implicitHeight + view.s.margins[1] + view.s.margins[3]
+            GridLayout {
+                id: grid
+                anchors.fill: parent
+                anchors.leftMargin: view.s.margins[0]; anchors.rightMargin: view.s.margins[2]
+                anchors.topMargin: view.s.margins[1]; anchors.bottomMargin: view.s.margins[3]
+                columns: Math.max(1, Math.min(view.node.nodes.length, Math.floor((width + columnSpacing) / (view.s.minColumnWidth + columnSpacing))))
+                columnSpacing: view.s.spacing; rowSpacing: view.s.spacing
+                Repeater {
+                    model: view.node.nodes
+                    NodeChild {
+                        required property var modelData
+                        node: modelData
+                        Layout.fillWidth: true; Layout.fillHeight: false; Layout.alignment: Qt.AlignTop
+                        Layout.minimumWidth: 0; Layout.preferredWidth: 1
+                    }
                 }
             }
         }
@@ -436,7 +459,7 @@ Item {
             id: plot; source: view.node; implicitHeight: view.s.minHeight; implicitWidth: view.s.minWidth
             Accessible.name: view.s.accessible || appLanguage.text("차트 선택")
             Accessible.role: Accessible.Chart
-            HoverHandler { id: plotHover; cursorShape: plot.hoverIndex >= 0 ? Qt.PointingHandCursor : Qt.ArrowCursor; onPointChanged: plot.showTip(point.position.x, point.position.y); onHoveredChanged: if (!hovered) plot.clearHover() }
+            HoverHandler { id: plotHover; objectName: "plotHover"; cursorShape: plot.hoverIndex >= 0 ? Qt.PointingHandCursor : Qt.ArrowCursor; onPointChanged: plot.showTip(point.position.x, point.position.y); onHoveredChanged: if (!hovered) plot.clearHover() }
             UiToolTip { visible: !view.s.quotaDetail && plotHover.hovered && plot.tip.length > 0; text: plot.tip }
             Loader {
                 id: quotaDetailLoader

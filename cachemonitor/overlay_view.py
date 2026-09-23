@@ -11,6 +11,7 @@ from .overlay_navigation import navigation_target
 from .ui_details import recorded, observed_transport, model_comparison
 from .token_colors import TOKEN_COLORS, token_palette, readable
 from .i18n import tr
+from .charts import value_text
 
 LABELS = dict(cached='캐시 읽기', uncached='일반 입력', written='캐시 쓰기', output='출력·추론 제외', reasoning='추론', unknown='미분류')
 ORDER = tuple(LABELS)
@@ -313,12 +314,9 @@ class OverlayContent(Node):
     def monitor_links(self):
         d=self.data or {};links=[];extra=self.context_extra()
         def add(key,target,x,y,w,h):
-            if target:links.append(dict(id=key,x=x,y=y,width=w,height=h,target=target,accessible={'cache':'최근 호출의 토큰 사용량','cost':'최근 호출의 환산 근거','total':'세션 비용 내역','miss':'캐시 미적중 호출 목록','incident':'캐시 저하 근거','collection':'관측 상태 확인'}[key]))
-        value=percent(d.get('cache_rate'));number=value[:-1] if value.endswith('%') else value
-        cache_width=QFontMetrics(font(self.appearance.family,36,600)).horizontalAdvance(number)+(24 if value.endswith('%') else 0)
-        add('cache',navigation_target(d,'cache'),16,132+extra,min(212,cache_width),40)
-        cost=fitted_money(d.get('latest_cost'),124,24,self.appearance.family);cw=metric_width(cost,self.appearance.family,24)
-        add('cost',navigation_target(d,'cost'),364-cw,144+extra,cw,30)
+            if target:links.append(dict(id=key,x=x,y=y,width=w,height=h,target=target,accessible={'cache':'최근 호출의 토큰 사용량','speed':'최근 호출의 평균 출력 속도와 소요시간','cost':'최근 호출의 환산 근거','total':'세션 비용 내역','miss':'캐시 미적중 호출 목록','incident':'캐시 저하 근거','collection':'관측 상태 확인'}[key]))
+        for item in self.headline_metrics():
+            add(item['id'],navigation_target(d,item['id']),item['x'],136+extra,item['width'],38)
         total=fitted_money(d.get('cost'),136,18,self.appearance.family);tw=metric_width(total,self.appearance.family,18)
         add('total',navigation_target(d,'cost_total'),152-tw,322+extra,tw,24)
         status=self.layout()['status']
@@ -411,9 +409,10 @@ class OverlayContent(Node):
     def lines(self):
         d=self.data or {};a,b=self.context()
         return [d.get('title',''),a,b,percent(d.get('cache_rate')),money(d.get('cost')),money(d.get('mean_cost')),money(d.get('latest_cost')),
-                f"{d.get('priced',0)} / {d.get('calls',0)}" if d.get('missing') else str(d.get('calls','—')),self.status_text()]
+                f"{d.get('priced',0)} / {d.get('calls',0)}" if d.get('missing') else str(d.get('calls','—')),self.status_text(),value_text(d.get('latest',{}).get('output_speed'),'output_speed')]
     def refresh_accessibility(self):
         d=self.data or {};values=[d.get('title',''),*self.context(),'현재 작업','최근 캐시 '+percent(d.get('cache_rate')),'최근 비용 API 환산 '+money(d.get('latest_cost'),False),
+              '평균 출력 속도 '+(value_text(d['latest']['output_speed'],'output_speed') if d.get('latest',{}).get('output_speed') is not None else '측정 불가'),
               self.session_scope(),'세션 캐시 적중률 '+percent(d.get('token_composition',{}).get('cache_hit_rate')),
               '세션 비용 '+money(d.get('cost'),False),
               '세션 호출당 평균 '+money(d.get('mean_cost'),False),self.cost_disclosure(),self.status_text()]
@@ -456,6 +455,10 @@ class OverlayContent(Node):
             text(percent(row.get('cache_rate',row.get('rate'))),width=half,size=20,color='warning' if row.get('cache_warning') else 'cached_text',weight=600,height=28,at=y,kind='metric')
             text(fitted_money(row.get('cost'),half,20,self.appearance.family),x=half+12,width=half,size=20,weight=600,height=28,at=y,kind='metric');y+=40
             pair('정확한 비용',money(row.get('cost'),False),numeric=True)
+            pair('평균 출력 속도',value_text(row['output_speed'],'output_speed') if row.get('output_speed') is not None else '측정 불가',numeric=True)
+            if row.get('output_speed') is not None:
+                pair('호출 소요시간',value_text(row['completion_latency_ms']/1000,'duration'),numeric=True)
+                text('출력·추론 포함 / 요청부터 완료까지 · 대기·통신 포함',color='secondary')
             for label,key in [('입력','input'),('캐시 읽기','cached'),('캐시 쓰기','written'),('출력·추론 제외','non_reasoning'),('추론','reasoning'),('입력 미분류','input_unknown'),('출력 미분류','output_unknown'),('미분류','unknown')]:
                 if '미분류' in label and not row.get(key):continue
                 if row.get(key) is None:continue
@@ -523,6 +526,28 @@ class OverlayContent(Node):
         for key,label in [('input_unknown','입력 미분류'),('output_unknown','출력 미분류')]:
             if c.get('counts',{}).get(key):pair(label,tokens(c['counts'][key]),numeric=True)
         return items
+    def headline_metrics(self):
+        """One row shared by painting, hit targets and layout verification."""
+        data=self.data or {};cache=percent(data.get('cache_rate'))
+        speed=data.get('latest',{}).get('output_speed')
+        items=[dict(id='cache',label='최근 캐시',x=16,width=100,
+                    number=cache.removesuffix('%'),unit='%' if cache.endswith('%') else '',size=30,unit_size=16,
+                    color='warning' if data.get('latest',{}).get('cache_warning') or data.get('cache_misses',{}).get('current') else 'cached_text'),
+               dict(id='speed',label='평균 출력 속도',x=126,width=128,
+                    number='—' if speed is None else '<0.1' if 0<speed<.1 else f'{speed:,.1f}',
+                    unit='tok/s' if speed is not None else '',size=24,unit_size=10,color='ink'),
+               dict(id='cost',label='최근 비용 · 환산',x=264,width=100,
+                    number=fitted_money(data.get('latest_cost'),100,24,self.appearance.family),unit='',size=24,unit_size=10,color='ink')]
+        for item in items:
+            def width():
+                return QFontMetrics(font(self.appearance.family,item['size'],600)).horizontalAdvance(item['number'])+(4+QFontMetrics(font(self.appearance.family,item['unit_size'],500)).horizontalAdvance(item['unit']) if item['unit'] else 0)
+            while width()>item['width'] and item['size']>14:item['size']-=1
+            if width()>item['width'] and item['id']=='speed':item['number']=f'{speed:.1e}'
+            item['text_width']=width()
+            item['label_size']=12
+            while QFontMetrics(font(self.appearance.family,item['label_size'])).horizontalAdvance(tr(item['label']))>item['width'] and item['label_size']>10:item['label_size']-=1
+        return items
+
     def paint(self,p):
         p.save();p.scale(self.appearance.scale,self.appearance.scale);d=Drawing(p,self);width=380+self.monitor_x;height=self.base_height()
         surface=QColor(d.colors['surface']);surface.setAlphaF(self.opacity/100);p.setPen(QPen(d.colors['border'],1));p.setBrush(surface);p.drawRoundedRect(QRectF(.5,.5,width-1,height-1),16,16)
@@ -537,12 +562,14 @@ class OverlayContent(Node):
         for index,line in enumerate(self.context_rows()):d.text(line,16,48+index*18,348,18,12,'error' if first.startswith('모델 불일치') else 'secondary')
         p.translate(0,extra);d.text(second,16,66,348,18,12,'secondary')
         d.text('현재 작업',16,94,348,18,11,'secondary',weight=600)
-        d.text('최근 캐시',16,116,212,18,12,'secondary');value=percent(data.get('cache_rate'));number=value[:-1] if value.endswith('%') else value
-        color='warning' if data.get('latest',{}).get('cache_warning') or data.get('cache_misses',{}).get('current') else 'cached_text'
-        number_width=QFontMetrics(font(self.appearance.family,36,600)).horizontalAdvance(number);d.number(number,16,168,190,36,color)
-        if value.endswith('%'):d.number('%',16+number_width+3,168,30,20,color,500)
+        for item in self.headline_metrics():
+            d.text(item['label'],item['x'],116,item['width'],18,item['label_size'],'secondary')
+            x=item['x']+(item['width']-item['text_width'] if item['id']=='cost' else 0)
+            d.number(item['number'],x,168,item['width'],item['size'],item['color'])
+            if item['unit']:
+                x+=QFontMetrics(font(self.appearance.family,item['size'],600)).horizontalAdvance(item['number'])+4
+                d.number(item['unit'],x,168,item['width'],item['unit_size'],item['color'],500)
         c=data.get('token_composition',{})
-        d.text('최근 비용 · 환산',240,116,124,18,12,'secondary');d.metric(fitted_money(data.get('latest_cost'),124,24,self.appearance.family),240,144,124,30,24,baseline=168)
         d.graphs(self.rows()[-12:],16,184,348,12)
         d.text(self.session_scope(),16,274,230,18,11,'secondary',weight=600)
         d.text(('확인분 ' if c.get('cache_hit_partial') else '')+'적중 '+percent(c.get('cache_hit_rate')),248,274,116,18,11,'secondary',right=True)

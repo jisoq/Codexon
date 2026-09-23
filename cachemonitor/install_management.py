@@ -72,9 +72,13 @@ def activate_proxy(manager):
     health = status.get('health') or {}
     if health:
         from .version import PROXY_VERSION
-        if health.get('version')!=PROXY_VERSION or health.get('lifecycle')!='managed':
+        from .proxy_update import process_executable
+        command=manager.supervisor_command(manager.state().get('upstream','chatgpt'))
+        active=process_executable(manager.runtime()['pid'])
+        if (health.get('version')!=PROXY_VERSION or health.get('lifecycle')!='managed'
+                or Path(active).resolve()!=Path(command[0]).resolve()):
             return manager.update_proxy().get('update') or {}
-        manager.task.configure(manager.supervisor_command(manager.state().get('upstream','chatgpt')),autostart=True)
+        manager.task.configure(command,autostart=True)
         return dict(phase='complete', message='연결 구성요소 업데이트 완료')
     if status.get('probe_state')=='refused' and manager.state().get('enabled'):
         manager.attach_supervisor()
@@ -82,7 +86,7 @@ def activate_proxy(manager):
     return dict(phase='recovery_required', message='시작 메뉴의 Codexon 연결 복구를 실행해 주세요.')
 
 
-def finish(root, product, recovery, *, isolated=False, launch=True):
+def finish(root, product, recovery, *, isolated=False, launch=True, language='ko'):
     root = Path(root).resolve()
     product = contained(product, root/'versions')
     recovery = contained(recovery, root/'maintenance')
@@ -99,17 +103,28 @@ def finish(root, product, recovery, *, isolated=False, launch=True):
         value = read_json(report)
         if check.returncode or value.get('errors')!=[] or value.get('version')!=manifest['version']:
             raise RuntimeError('새 버전 실행 검사에 실패했습니다. 이전 버전을 유지합니다.')
+        from .install_activation import Activation, publish_shell
+        activation = Activation(root, isolated)
         previous = read_json(root/'installation.json')
         receipt = dict(product=str(product), recovery=str(recovery), version=manifest['version'],
                        commit=manifest['commit'], previous=previous.get('product'), installed_at=time.time())
         # Keep the previous payload and receipt; only the launch pointers change.
-        if previous:
-            atomic_write(root/('installation-'+uuid.uuid4().hex+'.json'),json.dumps(previous).encode())
-        register(root, product, recovery, isolated=isolated)
-        atomic_write(root/'installation.json',json.dumps(receipt,indent=2).encode())
+        try:
+            if previous:
+                atomic_write(root/('installation-'+uuid.uuid4().hex+'.json'),json.dumps(previous).encode())
+            if not isolated:
+                from .launch_context import running_homes, save_homes
+                homes = running_homes(root)
+                if homes:save_homes(homes)
+            register(root, product, recovery, isolated=isolated)
+            publish_shell(product, recovery, isolated=isolated, language=language)
+            if not isolated:migrate_startup(exe)
+            atomic_write(root/'installation.json',json.dumps(receipt,indent=2).encode())
+            activation.commit()
+        except Exception:
+            activation.rollback()
+            raise
         if not isolated:
-            try:migrate_startup(exe)
-            except OSError:receipt['startup_warning']='로그인 시 자동 실행 경로를 변경하지 못했습니다.'
             result_path = root/'connection-update.json'
             try:
                 result = subprocess.run([str(exe),'--complete-install','--control-report',str(result_path)],
@@ -133,7 +148,7 @@ def processes_under(root):
     script = r"""
 [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
 $root=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__ROOT__')).TrimEnd('\')+'\'
-@(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($root,[StringComparison]::OrdinalIgnoreCase) } | Select-Object ProcessId,ParentProcessId,ExecutablePath) | ConvertTo-Json -Compress
+@(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($root,[StringComparison]::OrdinalIgnoreCase) } | Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine) | ConvertTo-Json -Compress
 """.replace('__ROOT__',encoded)
     result=subprocess.run(['powershell.exe','-NoProfile','-NonInteractive','-EncodedCommand',
                            base64.b64encode(script.encode('utf-16-le')).decode()],
@@ -147,7 +162,9 @@ $root=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__ROOT__')).T
 def prepare_uninstall(root, *, isolated=False):
     root=Path(root).resolve()
     with ProcessLock(root/'install.lock',timeout=5):
-        if not isolated:
+        from .installation import installed
+        registration = installed() if not isolated else {}
+        if not isolated and registration.get('InstallRoot') and Path(registration['InstallRoot']).resolve()==root:
             from .connection_recovery import target, restore
             manager=target()
             restore(manager)
@@ -171,6 +188,8 @@ def prepare_uninstall(root, *, isolated=False):
                     if match and Path(match[1] or match[2]).resolve().is_relative_to(root):
                         winreg.DeleteValue(key,'CacheMonitor')
             except FileNotFoundError:pass
+        from .install_activation import remove_shortcuts
+        remove_shortcuts(isolated)
         return dict(ready=True,records_preserved=True)
 
 

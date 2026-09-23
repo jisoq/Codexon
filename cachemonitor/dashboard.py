@@ -36,7 +36,7 @@ PERIODS = [('최근 30분','30m'),('오늘','today'),('최근 7일','7d'),('최�
 INPUT_BANDS = [('전체 입력 길이',''),('10k 미만','0:10000'),('10–50k','10000:50000'),('50–100k','50000:100000'),('100–200k','100000:200000'),('200–272k','200000:272001'),('272k 초과','272001:inf')]
 CALL_FILTERS = [('미산정','unpriced'),('모드 기록 없음','unknown_mode'),('모델명 불일치','model_mismatch'),('기록 누락·충돌','observation_problem'),('캐시 읽기 0','cache_zero'),('캐시 저하 의심','cache_degradation'),('HTTP/SSE','http')]
 CALL_COLUMNS = [('ts','기록 시각'),('model','요청 모델'),('effort','추론 설정'),('service_tier','요청 모드'),('cost','API 환산액'),('cache_ratio','입력 캐시율')]
-EXTRA_COLUMNS = [('input','입력'),('cached','캐시 읽기'),('written','캐시 쓰기'),('output','출력·추론 포함'),('reasoning','추론'),('response_model','응답 모델'),('response_service_tier','응답 등급'),('transport','통신 방식')]
+EXTRA_COLUMNS = [('input','입력'),('cached','캐시 읽기'),('written','캐시 쓰기'),('output','출력·추론 포함'),('reasoning','추론'),('output_speed','평균 출력 속도'),('response_model','응답 모델'),('response_service_tier','응답 등급'),('transport','통신 방식')]
 
 
 def number(value, decimals=0): return '—' if value is None else f'{value:,.{decimals}f}'
@@ -235,9 +235,11 @@ class Dashboard(TrayWindow):
     def build_overview(self):
         layout=self.scroll_page(0)
         summary=Group();summary.setObjectName('summary');columns=Row(summary);columns.setContentsMargins(16,16,16,16);columns.setSpacing(20)
+        columns.put(minColumnWidth=180)
         self.metrics=[];self.metric_captions=[];self.metric_notes=[]
-        for i,title in enumerate(('API 환산액','호출당 평균','완료 요청당 평균','입력 캐시율')):
+        for i,title in enumerate(('API 환산액','호출당 평균','완료 요청당 평균','입력 캐시율','평균 출력 속도')):
             col=Column();caption=label(title,'muted');value=Button('—');value.put(flat=True,fontSize=30,bold=True,noElide=True)
+            if i==4:value.put(fontSize=24)
             value.clicked.connect(lambda index=i:self.open_summary(index));note=label('','muted',True);note.put(fontSize=12)
             for node in (caption,value,note):col.addWidget(node)
             columns.addLayout(col,1);self.metrics.append(value);self.metric_captions.append(caption);self.metric_notes.append(note)
@@ -741,11 +743,13 @@ class Dashboard(TrayWindow):
         turns=[r for r in self.analysis['turns'] if r.get('complete')];turn_cost=view['turn_stats']
         valid=cache_rows(rows);cache=view['summary']['cache'];inputs=cache['input'];rate=cache['value']
         total=sum(r['cost'] for r in rows if r.get('cost') is not None) if cost['n'] else 0 if not rows else None
-        values=[usd(total),usd(cost['mean']),usd(turn_cost['mean']),value_text(rate,'cache_ratio')]
+        speed=view['summary']['output_speed']
+        values=[usd(total),usd(cost['mean']),usd(turn_cost['mean']),value_text(rate,'cache_ratio'),value_text(speed['value'],'output_speed')]
         notes=[f"산정 {cost['n']:,} / 관측 {len(rows):,}",
             f"유효 {cost['n']:,} / 대상 {len(rows):,}",
             f"유효 {turn_cost['n']:,}요청 · 포함 {sum(t.get('responses',0) for t in turns if t.get('cost') is not None):,}호출",
-            f"유효 {len(valid):,} / 대상 {len(rows):,} · 입력 {inputs:,}"]
+            f"유효 {len(valid):,} / 대상 {len(rows):,} · 입력 {inputs:,}",
+            f"측정 {speed['n']:,} / 대상 {speed['N']:,} · 추론·대기 포함"]
         loading=self.snapshot.get('index',{}).get('loading') and not rows
         for node,value,note,text in zip(self.metrics,values,self.metric_notes,notes):node.setText('수집 중' if loading else value if rows else '—');note.setText(text)
         metric=self.overview_metric.currentData();basis=self.overview_basis.currentData();timeline=[]
@@ -796,9 +800,13 @@ class Dashboard(TrayWindow):
         elif index==3:
             selected=cache_rows(rows);denom=sum(r['input'] for r in selected)
             value=100*sum(r['cached'] for r in selected)/denom if denom else None;extra='동일 유효 표본의 캐시 읽기 합계 / 입력 합계'
+        elif index==4:
+            speed=self.overview['summary']['output_speed']
+            selected=[r for r in rows if r.get('output_speed') is not None]
+            value=speed['value'];extra='출력 토큰 합계(추론 포함) / 호출 소요시간 합계 · 대기·통신 포함'
         else:
             selected=cost_rows;value=stats(rows,'cost')['sum'] if index==0 else stats(rows,'cost')['mean'];extra=''
-        self.select_aggregate(dict(label=self.metric_captions[index].text(),value=value,records=selected,known=len(selected) if sample_n is None else sample_n,N=sample_N,assumption_records=assumptions,metric='cache_ratio' if index==3 else 'cost',extra=extra,amount=index!=3,_summary_index=index),reveal=reveal)
+        self.select_aggregate(dict(label=self.metric_captions[index].text(),value=value,records=selected,known=len(selected) if sample_n is None else sample_n,N=sample_N,assumption_records=assumptions,metric='output_speed' if index==4 else 'cache_ratio' if index==3 else 'cost',extra=extra,amount=index not in (3,4),_summary_index=index),reveal=reveal)
 
     def assumption_text(self,rows):
         from .pricing import mode_assumptions
@@ -1191,7 +1199,7 @@ class Dashboard(TrayWindow):
         if headers!=self.table.model().headers:
             self.table.setHorizontalHeaderLabels(headers)
             for i,width in enumerate(widths):self.table.setColumnWidth(i,width)
-        numeric={'세션 비용 · 하위 포함','API 환산액','호출 수','산정 / 전체 호출','입력 캐시율','선택 / 전체 호출','입력','캐시 읽기','캐시 쓰기','출력·추론 포함','추론'}
+        numeric={'세션 비용 · 하위 포함','API 환산액','호출 수','산정 / 전체 호출','입력 캐시율','선택 / 전체 호출','입력','캐시 읽기','캐시 쓰기','출력·추론 포함','추론','평균 출력 속도'}
         self.table.put(noElideColumns=[i for i,title in enumerate(headers) if title in numeric])
         self.record_rows=records;self.table.set_rows(records,formatter)
         self.render_record_parent(scope_rows)
@@ -1223,6 +1231,7 @@ class Dashboard(TrayWindow):
         if key=='cost':return usd(value) if value is not None else '미산정'
         if key=='cache_ratio':return value_text(cache_ratio(row),'cache_ratio')
         if key=='completion_latency_ms':return value_text(row.get('duration'),'duration')
+        if key=='output_speed':return value_text(value,'output_speed') if value is not None else '측정 불가'
         if key=='observation':return ((row['_incident_phase']+' · ') if row.get('_incident_phase') else '')+('범위 밖 · ' if row.get('_outside') else '')+('캐시 읽기 0 · ' if self.matches_call_filter(row,'cache_zero') else '')+observation(row)
         if key=='service_tier':return request_tier(row) if recorded(request_tier(row)) else '—'
         if key=='transport':return observed_transport(row) or ('동시간대 통신 로그: '+value if value in ('WebSocket','HTTP/SSE') and row.get('transport_source')!='conflict' else '—')
@@ -1316,6 +1325,9 @@ class Dashboard(TrayWindow):
             ('입력 캐시율',value_text(cache_ratio(row),'cache_ratio') if cache_ratio(row) is not None else None)])]
         if row.get('reported_total') is not None and row['reported_total']!=row.get('total'):lines.append(f"총량 관측 차이 · 보고 총량 {number(row['reported_total'])}")
         section['usage']='\n'.join(lines)
+        section['usage']+='\n평균 출력 속도  '+(value_text(row['output_speed'],'output_speed') if row.get('output_speed') is not None else '측정 불가')
+        if row.get('output_speed') is not None:
+            section['time']=entries([('호출 소요시간',value_text(row.get('duration'),'duration'))])+'\n출력·추론 포함 / 요청부터 완료까지 · 대기·통신 포함'
         price_model=row.get('price_model',row.get('model'));rate=(FAST_RATES if request_tier(row)=='Fast' else RATES if request_tier(row)=='Standard' else {}).get(price_model)
         lines=[VERIFIED+' 기준 · API 단가 환산',entries([('가격 모델',price_model)])]
         if rate:

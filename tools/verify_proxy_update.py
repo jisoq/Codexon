@@ -10,7 +10,7 @@ from cachemonitor.observer_control import ObserverManager
 from cachemonitor.observer_task import ObserverTask
 from cachemonitor.observer_state import read_json
 from cachemonitor.model_evidence import home_key
-from cachemonitor.proxy_update import ProxyUpdate
+from cachemonitor.proxy_update import ProxyUpdate, process_executable
 from cachemonitor.version import PROXY_VERSION
 
 
@@ -47,6 +47,7 @@ def main():
             if health and m.runtime().get('phase')=='active':break
             time.sleep(.5)
         assert health and health['version']==old_version
+        previous_instance=health['instance']
         ProxyUpdate(m).publish('queued',source_instance=health['instance'],cancel_requested=False)
         updater.start([str(new),'--proxy-update',*args])
         deadline=time.monotonic()+75
@@ -65,8 +66,12 @@ def main():
         assert health and health['version']==PROXY_VERSION and health['status']=='ok', (state,health)
         assert health.get('lifecycle')=='managed'
         assert m.runtime()['pid']==health['pid']
+        assert health['instance']!=previous_instance
+        assert Path(process_executable(m.runtime()['pid'])).resolve()==new
         assert m.config_path.read_bytes()==before
-        print(json.dumps({'phase':state['phase'],'version':health['version'],'configuration_preserved':True}))
+        result={'phase':state['phase'],'version':health['version'],'configuration_preserved':True,
+                'instance_replaced':True,'new_executable_verified':True}
+        (root/'result.json').write_text(json.dumps(result,indent=2));print(json.dumps(result))
     finally:
         # Stop the isolated updater before taking the same control lock during
         # cleanup, including when a timed-out transition is still in progress.

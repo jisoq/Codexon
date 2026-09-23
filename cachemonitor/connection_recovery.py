@@ -16,6 +16,7 @@ from xml.sax.saxutils import escape
 from .model_evidence import default_path, home_key
 from .observer_control import ObserverManager, URL, atomic_write
 from .observer_state import ProcessLock, read_json
+from .translation_catalog import translate as tr
 
 
 def target(home=None, directory=None, url=None):
@@ -108,8 +109,8 @@ def notify(manager, result):
                 if str(value).lower() in ('false','0'):return False
     except FileNotFoundError:pass
     xml = ('<toast activationType="protocol" launch="'+escape(notification_uri(manager), {'"':'&quot;'})+'">'
-           '<visual><binding template="ToastGeneric"><text>Codexon 연결 확인</text><text>'
-           +escape(result['title'])+'</text><text>눌러서 연결 복구 열기</text></binding></visual></toast>')
+           '<visual><binding template="ToastGeneric"><text>'+escape(tr('Codexon 연결 확인'))+'</text><text>'
+           +escape(tr(result['title']))+'</text><text>'+escape(tr('눌러서 연결 복구 열기'))+'</text></binding></visual></toast>')
     encoded = base64.b64encode(xml.encode()).decode()
     script = """
 $ErrorActionPreference='Stop'
@@ -158,7 +159,7 @@ class RecoveryWindow:
         from tkinter import ttk
         self.manager = manager
         self.root = tk.Tk()
-        self.root.title('Codexon 연결 복구')
+        self.root.title(tr('Codexon 연결 복구'))
         self.root.geometry('580x310')
         self.root.minsize(480, 280)
         self.root.configure(bg='#f5f6f8')
@@ -170,13 +171,13 @@ class RecoveryWindow:
         style.configure('TButton', font=('맑은 고딕', 11), padding=(12, 8))
         frame = tk.Frame(self.root, bg='#f5f6f8', padx=24, pady=24)
         frame.pack(fill='both', expand=True)
-        self.title = tk.Label(frame, text='연결 상태 확인 중…', bg='#f5f6f8', fg='#18212c',
+        self.title = tk.Label(frame, text=tr('연결 상태 확인 중…'), bg='#f5f6f8', fg='#18212c',
                               font=('맑은 고딕', 16, 'bold'), anchor='w', justify='left', wraplength=510)
         self.title.pack(fill='x')
-        self.detail = tk.Label(frame, text='인터넷이나 Codexon 본체 없이 복구할 수 있습니다.', bg='#f5f6f8',
+        self.detail = tk.Label(frame, text=tr('인터넷이나 Codexon 본체 없이 복구할 수 있습니다.'), bg='#f5f6f8',
                                fg='#475365', font=('맑은 고딕', 11), anchor='nw', justify='left', wraplength=510)
         self.detail.pack(fill='both', expand=True, pady=(14, 16))
-        self.button = ttk.Button(frame, text='직접 연결로 복원', command=self.recover)
+        self.button = ttk.Button(frame, text=tr('직접 연결로 복원'), command=self.recover)
         self.button.pack(anchor='w')
         self.root.bind('<Configure>', self.resize)
         self.root.after(100, self.poll)
@@ -203,15 +204,15 @@ class RecoveryWindow:
 
     def recover(self):
         if not self.busy:
-            self.title.configure(text='직접 연결로 복원 중…')
+            self.title.configure(text=tr('직접 연결로 복원 중…'))
             self.submit(restore)
 
     def poll(self):
         try:
             self.result = self.messages.get_nowait()
             self.busy = False
-            self.title.configure(text=self.result['title'])
-            self.detail.configure(text=self.result['detail'])
+            self.title.configure(text=tr(self.result['title']))
+            self.detail.configure(text=tr(self.result['detail']))
             self.button.state(['!disabled'])
         except queue.Empty:
             pass
@@ -236,8 +237,10 @@ def main(argv=None):
     parser.add_argument('--prepare-uninstall', action='store_true')
     parser.add_argument('--isolated-install', action='store_true')
     parser.add_argument('--no-launch', action='store_true')
+    parser.add_argument('--language', choices=('en','ko'))
     parser.add_argument('--ui-smoke', type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    if args.language:os.environ['CODEXON_LANGUAGE']=args.language
     if args.install_root:
         from .install_management import finish, prepare_uninstall
         import sys
@@ -246,7 +249,8 @@ def main(argv=None):
                 result=prepare_uninstall(args.install_root,isolated=args.isolated_install)
             else:
                 result=finish(args.install_root,args.product_dir,Path(sys.executable),
-                              isolated=args.isolated_install,launch=not args.no_launch)
+                              isolated=args.isolated_install,launch=not args.no_launch,
+                              language=args.language or 'ko')
         except Exception as exc:result=dict(error=str(exc))
         if args.report:atomic_write(args.report,json.dumps(result,ensure_ascii=False,indent=2).encode())
         return 1 if result.get('error') else 0

@@ -62,6 +62,7 @@ def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--executable',type=Path,required=True)
     parser.add_argument('--output',type=Path,required=True)
+    parser.add_argument('--language',choices=('ko','en'),default='ko')
     args=parser.parse_args()
     root=args.output.resolve();root.mkdir(parents=True,exist_ok=False)
     # Deliberately copy ONLY the recovery EXE. No desktop executable or Qt runtime.
@@ -74,7 +75,7 @@ def main():
     (home/'config.toml').write_text(original)
     auth=home/'auth.json';auth.write_text('{"synthetic":"preserve"}')
     report=root/'ui.json'
-    command=[str(exe),'--codex-home',str(home),'--data-dir',str(root/'data'),'--proxy-url',url,'--ui-smoke',str(report)]
+    command=[str(exe),'--codex-home',str(home),'--data-dir',str(root/'data'),'--proxy-url',url,'--ui-smoke',str(report),'--language',args.language]
     process=subprocess.Popen(command,creationflags=subprocess.CREATE_NO_WINDOW)
     user=ctypes.WinDLL('user32',use_last_error=True)
     user.PostMessageW.argtypes=[W.HWND,W.UINT,W.WPARAM,W.LPARAM]

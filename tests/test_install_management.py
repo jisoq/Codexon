@@ -8,6 +8,16 @@ import pytest
 from cachemonitor import install_management as install
 
 
+@pytest.fixture(autouse=True)
+def isolated_shell(tmp_path,monkeypatch):
+    from cachemonitor import install_activation as activation
+    monkeypatch.setattr(activation,'shortcuts',lambda isolated:[tmp_path/'menu.lnk'])
+    monkeypatch.setattr(activation,'snapshot_registry',lambda isolated:[])
+    monkeypatch.setattr(activation,'restore_registry',lambda values:None)
+    monkeypatch.setattr(activation,'publish_shell',lambda *a,**k:None)
+    monkeypatch.setattr(activation,'remove_shortcuts',lambda *a:None)
+
+
 def fixture(root):
     product=root/'versions'/'new'/'Codexon';product.mkdir(parents=True)
     recovery=root/'maintenance'/'new'/'CodexonRecovery.exe';recovery.parent.mkdir(parents=True)

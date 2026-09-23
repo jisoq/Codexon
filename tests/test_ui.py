@@ -68,12 +68,16 @@ def test_sequential_drilldown_and_full_call_detail(dashboard):
     assert not w.table.isVisible()  # body < 1280: one full-width detail
     assert 'gpt-6-astra' in w.detail_sections['conditions'][1].text()
     assert '전송 관측 없음' not in w.detail_sections['conditions'][1].text()
-    assert not w.detail_sections['time'][0].isVisible()
+    assert w.detail_sections['time'][0].isVisible()
+    assert '1.50' in w.detail_sections['time'][1].text()
+    assert '평균 출력 속도' in w.detail_sections['usage'][1].text()
     assert not w.detail_sections['evidence'][0].isVisible()
     assert '전체 입력' in w.detail_sections['usage'][1].text()
     assert w.input_composition.rows[0]['label']=='일반 입력'
     w.resize(1800,1000);QTest.qWait(50)
-    assert w.table.isVisible() and w.detail_scroll.state['width']==520
+    wide=w.width()-248>=1280
+    assert w.table.isVisible()==wide
+    assert w.detail_scroll.state['width']==(520 if wide else -1)
     old=w.selected_call;w.receive(copy.deepcopy(w.snapshot));assert w.selected_call==old
     w.close_record_detail();assert w.table.isVisible()
     assert not w.qml_errors
@@ -338,6 +342,11 @@ def test_first_detail_navigation_reveals_actual_heading_and_keeps_close_visible(
 @pytest.mark.parametrize('section',['time','evidence'])
 def test_absent_optional_detail_reveals_recorded_conditions(dashboard,section):
     w=dashboard;w.resize(1120,760)
+    if section=='time':
+        source=copy.deepcopy(w.snapshot)
+        for session in source['sessions']:
+            for row in session['history']:row['timing_valid']=False
+        w.receive(source)
     w.navigate(NavigationTarget('fixture','s1',view='calls',call_id='r1-3',section=section))
     assert not w.detail_sections[section][0].isVisible()
     assert w.detail_sections[section][1].text()==''
@@ -398,8 +407,9 @@ def test_record_actions_do_not_shift_table(dashboard):
     for _ in range(3):w.check_stale();QTest.qWait(20)
     assert table_y()==pytest.approx(before,abs=1)
     click_row(w,w.table,0);QTest.qWait(60)
-    assert w.table.isVisible() and w.close_record_button.isVisible()
-    assert table_y()==pytest.approx(before,abs=1)
+    wide=w.width()-248>=1280
+    assert w.table.isVisible()==wide and w.close_record_button.isVisible()
+    if wide:assert table_y()==pytest.approx(before,abs=1)
     click(w,control(w,w.close_record_button));QTest.qWait(60)
     assert table_y()==pytest.approx(before,abs=1)
     w.nav.setCurrentRow(1);QTest.qWait(30)
@@ -413,7 +423,7 @@ def test_filter_layout_and_pending_states_keep_table_stationary(dashboard,width,
     def position():return control(w,w.table).mapToScene(QPointF(0,0)).y()
     original=position();rows=w.table.rowCount()
     controls=[control(w,n) for n in (w.period,w.project,w.source,w.model,w.effort,w.mode)]
-    if width==1800:
+    if w.width()>=1800:
         assert len({round(c.mapToScene(QPointF(0,0)).y()) for c in controls})==1
         assert original<330
     for node in (w.pending_label,w.record_message):

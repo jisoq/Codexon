@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import argparse
 import json
 import shutil
 import urllib.request
@@ -23,6 +24,9 @@ def digest(path):
 
 
 def main():
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--output',type=Path,default=Path('artifacts/release'))
+    args=parser.parse_args()
     directory = Path('artifacts/third-party-sources').resolve()
     directory.mkdir(parents=True, exist_ok=True)
     entries = []
@@ -52,7 +56,7 @@ def main():
                 raise ValueError(f'Upstream checksum mismatch: {name}')
             temporary.replace(path)
         entries.append({'name': name, 'sha256': expected, 'source': url, 'bytes': path.stat().st_size})
-    output = Path(f'artifacts/release/Codexon-third-party-source-{VERSION}.zip').resolve()
+    output = (args.output/f'Codexon-third-party-source-{VERSION}.zip').resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     if output.exists():
         raise FileExistsError(output)

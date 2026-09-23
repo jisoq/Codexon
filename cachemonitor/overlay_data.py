@@ -1,7 +1,7 @@
 """Filter-independent, call-scoped overlay data from priced analysis records."""
 from copy import deepcopy
 
-from .analytics import stats, population, observation_flags
+from .analytics import stats, population, observation_flags, output_speed
 from .pricing import request_tier, sum_cost
 from .core import token_number, transport_label, token_parts
 from .cache_misses import classify
@@ -109,7 +109,7 @@ def call_summary(row, ordinal, *, miss=False, degradation=False):
         warnings.append('연결 관측 충돌')
     if row.get('cache_policy_conflict'):
         warnings.append('캐시 정책 관측 충돌')
-    result.update(id=_call_id(row), ordinal=ordinal,
+    result.update(id=_call_id(row), ordinal=ordinal,output_speed=output_speed(row),
         model=(row.get('analysis_model') or row.get('requested_model') or row.get('model') or '미확인') if not row.get('model_conflict') else '미확인',
         configured_model=row.get('configured_model') or row.get('model'), model_setting=row.get('model_source')=='settings' or not bool(row.get('requested_model')) and bool(row.get('model')),
         response_model=row.get('response_model') or None,
