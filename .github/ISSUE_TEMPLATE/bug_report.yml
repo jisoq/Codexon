@@ -1,0 +1,28 @@
+name: Bug report
+description: Report a reproducible Codexon problem
+title: "Bug: "
+labels: [bug]
+body:
+  - type: input
+    id: app_version
+    attributes: {label: Codexon version}
+    validations: {required: true}
+  - type: input
+    id: windows_version
+    attributes: {label: Windows version and display scale}
+  - type: input
+    id: codex_version
+    attributes: {label: Codex version}
+  - type: textarea
+    id: steps
+    attributes: {label: Steps to reproduce}
+    validations: {required: true}
+  - type: textarea
+    id: expected
+    attributes: {label: Expected behavior}
+  - type: textarea
+    id: actual
+    attributes: {label: Actual behavior}
+  - type: markdown
+    attributes:
+      value: "Do not upload your .codex folder, databases, full config.toml, backups, or unredacted screenshots. See the user guide for safe diagnostics. Report vulnerabilities privately through the Security tab."

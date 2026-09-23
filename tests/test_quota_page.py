@@ -1,0 +1,241 @@
+"""Exercise the real Quick page, chart selection and its single detail entry."""
+import time
+
+import pytest
+from PySide6.QtCore import QPointF, QSettings, Qt
+from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QApplication
+
+from cachemonitor.presentation import Scroll
+from cachemonitor.quota_panel import QuotaPanel, model_cost_intervals
+from cachemonitor.quota_cycles import QuotaLedger
+from cachemonitor.quick_qa import click, control, dispose, mount, render_plot, click_row, walk
+from cachemonitor.theme import shared_theme
+from test_quota_tracking_integration import activity
+from cachemonitor import quota_tracking_store as tracking
+
+
+@pytest.fixture
+def quota_page(tmp_path):
+    app=QApplication.instance() or QApplication([])
+    from cachemonitor.fonts import load_bundled_fonts
+    load_bundled_fonts()
+    shared_theme().configure('light')
+    now=time.time()
+    ledger=QuotaLedger(tmp_path/'page.sqlite')
+    tracking.enable(ledger.db,'h',now-310)
+    history=[(-300,80),(-270,78),(-240,76),(-210,100),(-180,98),(-150,96),(-120,100),(-90,99),(-60,98)]
+    for offset,remaining in history:
+        at=now+offset
+        deadline=now-120 if offset<-120 else now+604680
+        quota=dict(source='live',account='a',plan_type='pro',bucket='codex',requested_at=at,
+            observed_at=at+.1,windows={
+            'weekly':dict(used_percent=100-remaining,window_minutes=10080,resets_at=deadline),
+            'five_hour':dict(used_percent=20-offset/300,window_minutes=300,resets_at=now+3600)})
+        ledger.observe('h',quota);tracking.observe(ledger.db,'h',quota)
+    activity(ledger,now,{},[now-280,now-190,now-80])
+    quota={**quota,'observed_at':now}
+    panel=QuotaPanel(QSettings(str(tmp_path/'panel.ini'),QSettings.IniFormat))
+    panel.receive({'quota':quota,'report':ledger.report('h',now)})
+    scroll=Scroll();scroll.put(fillViewport=True);scroll.setWidget(panel)
+    yield app,panel,scroll
+    ledger.close()
+
+
+@pytest.mark.parametrize('width,height,dark', [(1120,1000,False),(520,900,False),(1120,1000,True)])
+def test_responsive_page_chart_and_single_details_path(quota_page,tmp_path,width,height,dark):
+    app,panel,scroll=quota_page
+    if dark:shared_theme().configure('dark')
+    host=mount(scroll,width,height)
+    try:
+        plot=render_plot(host,panel.history)
+        assert panel.history.axis[0]>0 and panel.history.axis[1]==100
+        assert panel.basis.text()=='9%p'
+        assert '정기 초기화' in panel.cycle_choice.currentText()
+        assert all(r['local_observed'] for r in panel.history.rows)
+        assert panel.cycle_choice.count()==4
+        assert not panel.details.content.isVisible()
+        # Full-height hit regions select the observation without pixel hunting.
+        box,row,tip=panel.history.hits[-1]
+        click(host,plot,box.center().x(),box.center().y())
+        assert plot.detail['title'] in row['label']
+        plot.forceActiveFocus();QTest.keyClick(host.quick,Qt.Key_Right);QTest.qWait(30)
+        assert plot.detail['title'] in panel.history.rows[0]['label']
+        for node in (panel.basis,panel.cost_value,panel.result):
+            item=control(host,node)
+            texts=[child for child in walk(item) if child.metaObject().indexOfProperty('truncated')>=0 and child.isVisible()]
+            assert texts and all(not t.property('truncated') for t in texts)
+        assert host.grab().save(str(tmp_path/f'quota-{width}-{"dark" if dark else "light"}.png'))
+        scroll.ensureWidgetVisible(panel.details.toggle);QTest.qWait(80)
+        click(host,control(host,panel.details.toggle))
+        assert panel.details.content.isVisible()
+        click_row(host,panel.intervals,1)
+        assert panel.selected_id==panel.intervals.model().rows[1]['id']
+        assert '정기 초기화로 종료' in panel.interval_detail.text()
+        assert panel.table.rowCount()>0
+        scroll.ensureWidgetVisible(panel.interval_detail);QTest.qWait(80)
+        assert host.grab().save(str(tmp_path/f'quota-detail-{width}-{"dark" if dark else "light"}.png'))
+        before=panel.selected_id
+        panel.render(automatic=True);QTest.qWait(40)
+        assert panel.selected_id==before and panel.details.content.isVisible()
+        # Change the chart through its rendered control.
+        scroll.ensureWidgetVisible(panel.window);QTest.qWait(80)
+        choice=control(host,panel.window);choice.forceActiveFocus();QTest.keyClick(host.quick,Qt.Key_Down);QTest.qWait(40)
+        assert panel.window.currentData()=='five_hour'
+        assert not any(r['markers'] for r in panel.history.rows)
+        assert panel.history.axis[1]<100
+        assert panel.basis.text()=='9%p'
+        assert not host.qml_errors
+    finally:
+        dispose(host);shared_theme().configure('light')
+
+
+def test_no_data_error_and_period_without_rows_are_explicit(quota_page):
+    app,panel,scroll=quota_page
+    host=mount(scroll,800,800)
+    try:
+        panel.set_history_period(time.time()+100,None);QTest.qWait(50)
+        assert panel.basis.text()=='—' and not panel.details.isVisible()
+        assert panel.history.rows and panel.conversion_empty.isVisible()
+        assert panel.current['weekly']['value'].text()=='98.0%'
+        panel.receive({'home':'h','issue':'한도 조회 연결 실패','report':{'home':'h','cycles':[],'error':True}})
+        QTest.qWait(50)
+        assert panel.status.isVisible() and panel.status.text()=='한도 조회 연결 실패'
+        assert not panel.details.isVisible()
+        assert not host.qml_errors
+    finally:dispose(host)
+
+
+def test_weekly_value_uses_unrounded_ratio_for_summary_and_intervals(quota_page):
+    from cachemonitor.pricing import usd
+    _,panel,_=quota_page
+    assert panel.result.text()==usd(panel.statistics['per_percent']*100)
+    for row in panel.statistics['intervals']:
+        expected=usd(row['per_percent']*100 if row['per_percent'] is not None else None)
+        assert panel.format_interval(row,3,Qt.DisplayRole)==expected
+    assert panel.intervals.model().headers[3]=='주간할당량 가치'
+    assert '× 100' in panel.result.toolTip()
+
+
+def test_model_filter_combines_request_modes_without_assigning_account_usage():
+    intervals=[dict(id='one',cost=10,delta=4,models=[
+        dict(model='alpha',service_tier='Standard',calls=2,priced=2,cost=3,separate=False),
+        dict(model='alpha',service_tier='Fast',calls=1,priced=1,cost=2,separate=False),
+        dict(model='beta',service_tier='Standard',calls=1,priced=1,cost=5,separate=False)]),
+        dict(id='two',cost=7,delta=2,models=[
+            dict(model='alpha',service_tier='Standard',calls=1,priced=1,cost=7,separate=True)])]
+    selected=model_cost_intervals(intervals,'alpha')
+    assert len(selected)==1
+    assert selected[0]['model_cost']==5
+    assert selected[0]['model_calls']==3
+    assert selected[0]['model_share']==50
+    assert selected[0]['delta']==4
+    assert intervals[0]['cost']==10
+
+
+@pytest.mark.parametrize('width',[960,520])
+def test_rendered_model_filter_preserves_account_chart(quota_page,tmp_path,width):
+    app,panel,scroll=quota_page
+    host=mount(scroll,width,900)
+    try:
+        chart_rows=panel.history.rows
+        total=panel.cost_value.text()
+        assert panel.model_choice.count()==2
+        scroll.ensureWidgetVisible(panel.model_choice);QTest.qWait(40)
+        choice=control(host,panel.model_choice);choice.forceActiveFocus()
+        QTest.keyClick(host.quick,Qt.Key_Down);QTest.qWait(50)
+        assert panel.model_choice.currentData()=='gpt-6-astra'
+        assert panel.basis_label.text()=='선택 모델 호출 수'
+        assert panel.intervals.model().headers[2]=='선택 모델 API'
+        assert panel.intervals.model().headers[3]=='구간 API 비용 비중'
+        assert panel.cost_value.text()==total
+        assert panel.history.rows is chart_rows
+        assert host.grab().save(str(tmp_path/f'quota-model-filter-{width}.png'))
+        assert not host.qml_errors
+    finally:dispose(host)
+
+
+def test_cycle_selector_changes_graph_preserves_lifetime_and_selection_on_refresh(quota_page,tmp_path):
+    app,panel,scroll=quota_page
+    host=mount(scroll,1120,1000)
+    try:
+        assert panel.history.money and panel.cycle_choice.count()==4
+        lifetime=panel.result.text()
+        scroll.ensureWidgetVisible(panel.cycle_choice);QTest.qWait(40)
+        choice=control(host,panel.cycle_choice);choice.forceActiveFocus()
+        QTest.keyClick(host.quick,Qt.Key_Up);QTest.qWait(40)
+        assert panel.cycle_choice.currentIndex()==2
+        period=panel._view['periods'][1]
+        assert panel.history.rows is period['series']['rows']
+        assert panel.history.rows[0]['reset_kind']=='arbitrary_reset'
+        plot=render_plot(host,panel.history)
+        plot.forceActiveFocus();QTest.keyClick(host.quick,Qt.Key_Home)
+        assert panel.history.cursor==0 and '임의 초기화' in plot.detail['note']
+        selected=panel.cycle_choice.currentData()
+        panel.render(automatic=True);QTest.qWait(40)
+        assert panel.cycle_choice.currentData()==selected and panel.history.cursor==0
+        assert panel.result.text()==lifetime
+        panel.set_history_period(time.time(),None)
+        assert panel.result.text()==lifetime and panel.history.rows is period['series']['rows']
+        assert not host.qml_errors
+    finally:dispose(host)
+
+
+@pytest.mark.parametrize('width,dark',[(1120,False),(520,False),(1120,True)])
+def test_complete_value_chart_render_and_cost_lane_selection(quota_page,tmp_path,width,dark):
+    from test_quota_value_history import sample_report
+    app,panel,_=quota_page
+    if dark:shared_theme().configure('dark')
+    report=sample_report();offset=time.time()-280
+    report.update(home='h',at=time.time())
+    for row in report['history']:
+        row['at']+=offset;row['reset']+=offset
+    for cycle in report['cycles']:
+        cycle['start']+=offset;cycle['end']+=offset
+        cycle['endpoints']=[(at+offset,used) for at,used in cycle['endpoints']]
+        for row in cycle['cost_rows']:row['ts']+=offset
+    panel.receive({'home':'h','quota':panel.quota,'report':report})
+    chart=panel.history.parent().parent()
+    scroll=Scroll();scroll.put(fillViewport=True);scroll.setWidget(chart)
+    host=mount(scroll,width,960)
+    try:
+        assert panel.result.text()=='$55.56'
+        panel.cycle_choice.setCurrentIndex(2)
+        plot=render_plot(host,panel.history)
+        rect,row,_=panel.history.hits[1]
+        click(host,plot,rect.center().x(),rect.bottom()-20)
+        assert panel.history.cursor==1 and plot.detail['items'][2]['value']=='$4.00'
+        assert plot.detail['items'][4]['value']=='$40.00'
+        scroll.ensureWidgetVisible(panel.result);QTest.qWait(50)
+        for node in (panel.result,panel.lifetime_basis):
+            item=control(host,node)
+            texts=[child for child in walk(item) if child.metaObject().indexOfProperty('truncated')>=0 and child.isVisible()]
+            assert texts and all(not text.property('truncated') for text in texts)
+        assert host.grab().save(str(tmp_path/f'value-chart-{width}-{"dark" if dark else "light"}.png'))
+        assert not host.qml_errors
+    finally:dispose(host);shared_theme().configure('light')
+
+
+@pytest.mark.parametrize('width,dark',[(1120,False),(520,True)])
+def test_all_view_shows_cumulative_use_reset_marks_and_no_gap_stripes(quota_page,tmp_path,width,dark):
+    app,panel,scroll=quota_page
+    if dark:shared_theme().configure('dark')
+    host=mount(scroll,width,950)
+    try:
+        scroll.ensureWidgetVisible(panel.cycle_choice);QTest.qWait(40)
+        choice=control(host,panel.cycle_choice);choice.forceActiveFocus()
+        QTest.keyClick(host.quick,Qt.Key_Home);QTest.qWait(40)
+        assert panel.cycle_choice.currentData()=='all'
+        plot=render_plot(host,panel.history)
+        assert panel.history.series['cumulative'] and panel.history.gap_width==0
+        assert panel.history.rows[-1]['remaining']==panel.lifetime_statistics['delta']
+        assert panel.history.rows[-1]['cycle_cost']==pytest.approx(panel.lifetime_statistics['cost'])
+        assert len(panel.history.reset_hits)==2
+        rect,reset=panel.history.reset_hits[0]
+        click(host,plot,rect.center().x(),rect.center().y())
+        assert plot.detail['title']==reset['label']
+        plot.dismissDetail()
+        assert host.grab().save(str(tmp_path/f'all-view-{width}-{dark}.png'))
+        QTest.keyClick(host.quick,Qt.Key_End)
+        assert not host.qml_errors
+    finally:dispose(host);shared_theme().configure('light')

@@ -1,0 +1,42 @@
+name: Windows checks
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12.10'
+          cache: pip
+          cache-dependency-path: requirements-release.lock
+      - name: Install locked dependencies
+        run: python -m pip install -r requirements-release.lock
+      - name: Check package vulnerabilities
+        run: |
+          python -m pip install pip-audit
+          python -m pip_audit -r requirements-release.lock
+      - name: Plan checks
+        run: python tools/verify_changes.py --plan
+      - name: Full regression
+        run: python tools/verify_changes.py --full
+      - name: Build Windows package
+        shell: pwsh
+        run: .\build.ps1 -DistPath dist-ci -WorkPath build-ci -PythonPath ((Get-Command python).Source)
+      - name: Check frozen runtime and Qt Quick interaction
+        run: python tools/verify_changes.py --base HEAD --package-exe dist-ci/Codexon/Codexon.exe
+      - name: Check release contents
+        run: python tools/package_release.py --product dist-ci/Codexon --output dist-ci/Codexon-windows-x64-ci.zip
+      - name: Upload redacted synthetic verification evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-verification
+          path: artifacts/verification/
+          if-no-files-found: ignore
