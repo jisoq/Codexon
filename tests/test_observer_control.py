@@ -24,6 +24,8 @@ def manager(tmp_path,monkeypatch):
         def configure(self,command,autostart):self.calls.append(('configure',autostart))
         def remove(self):self.calls.append(('remove',False))
     control.task=Task()
+    control.check_task=Task()
+    monkeypatch.setattr(control,'configure_check',lambda:None)
     return control,registry
 
 

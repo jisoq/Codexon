@@ -2,6 +2,10 @@ if __name__ == "__main__":
     from multiprocessing import freeze_support
     freeze_support()
     import sys
+    if '--complete-install' in sys.argv:
+        sys.argv.remove('--complete-install')
+        from cachemonitor.install_management import complete_main
+        raise SystemExit(complete_main())
     if '--proxy-update' in sys.argv:
         sys.argv.remove('--proxy-update')
         from cachemonitor.proxy_update import main

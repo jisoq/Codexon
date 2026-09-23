@@ -32,6 +32,7 @@ def main():
     controls.add_argument('--model-observer-status',action='store_true')
     controls.add_argument('--test-model-observer',action='store_true')
     parser.add_argument('--control-report',help='Save observer control result to JSON')
+    parser.add_argument('--replace-gui',action='store_true',help=argparse.SUPPRESS)
     parser.add_argument("--codex-home", action="append", help="Repeat to monitor multiple local Codex homes")
     parser.add_argument("--hidden", action="store_true")
     parser.add_argument("--index-path", help="Override the app-owned usage index for isolated verification")
@@ -82,9 +83,19 @@ def main():
         client = QLocalSocket()
         client.connectToServer(server_name)
         if client.waitForConnected(400):
-            client.write(b"show")
+            client.write(b"update-exit" if args.replace_gui else b"show")
             client.waitForBytesWritten(400)
-            return 0
+            if not args.replace_gui:return 0
+            if not client.waitForReadyRead(3000) or bytes(client.readAll())!=b'ready-to-exit':
+                QMessageBox.information(None,'Codexon',tr('새 버전이 설치되었습니다. 기존 Codexon을 트레이에서 종료한 뒤 시작 메뉴에서 다시 여세요. Codex 연결은 유지됩니다.'))
+                return 4
+            client.waitForDisconnected(15000)
+            deadline=time.monotonic()+20
+            while time.monotonic()<deadline:
+                probe=QLocalSocket();probe.connectToServer(server_name)
+                if not probe.waitForConnected(200):break
+                probe.disconnectFromServer();time.sleep(.2)
+            else:return 4
         QLocalServer.removeServer(server_name)
         if not server.listen(server_name):
             QMessageBox.warning(None, "Codexon", tr("실행 중인 앱 상태를 확인할 수 없습니다."))
@@ -98,13 +109,28 @@ def main():
     from .overlay import install_overlay
     install_overlay(window, native_enabled=not args.smoke)
     app.aboutToQuit.connect(window.observer_panel.stop)
+    def finish_update():
+        operation=window.update_panel.operation
+        if operation and operation.isRunning():operation.wait()
+    app.aboutToQuit.connect(finish_update)
 
     def connection():
         client = server.nextPendingConnection()
-        if client:
+        if not client:return
+        def receive():
+            if not client.bytesAvailable():return
+            command=bytes(client.readAll())
+            if command==b'update-exit':
+                if window.observer_panel.busy():
+                    client.write(b'busy');client.flush()
+                else:
+                    client.write(b'ready-to-exit');client.flush()
+                    QTimer.singleShot(100,window.quit_app)
+            else:window.show_window()
             client.disconnectFromServer()
             client.deleteLater()
-        window.show_window()
+        client.readyRead.connect(receive)
+        receive()
 
     server.newConnection.connect(connection)
     if not args.hidden or not QSystemTrayIcon.isSystemTrayAvailable():

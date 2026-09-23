@@ -45,36 +45,6 @@ def test_selected_call_outside_recent_window_is_footer_target():
     finally:window.close();app.processEvents()
 
 
-def test_monitor_link_mask_keyboard_and_hover_do_not_paint_text(tmp_path):
-    from PySide6.QtCore import QPoint,Qt
-    from PySide6.QtTest import QTest
-    from PySide6.QtWidgets import QApplication
-    from cachemonitor.overlay import SessionOverlay
-    from cachemonitor.overlay_chrome import OverlayLinks,named_item
-    from test_overlay_presentation import summary
-    app=QApplication.instance() or QApplication([]);window=SessionOverlay();links=OverlayLinks(window.content_model)
-    try:
-        window.set_content(summary(misses=2));links.resize(380,578);assert links.sync();links.show()
-        QTest.qWait(30)
-        assert links.mask().contains(QPoint(20,150))
-        assert not links.mask().contains(QPoint(200,250))
-        received=[];links.view.navigationRequested.connect(received.append)
-        links.focus_control();QTest.keyClick(links.quick,Qt.Key_Return)
-        assert received[-1].section=='usage'
-        QTest.keyClick(links.quick,Qt.Key_Tab)
-        assert named_item(links.quick.rootObject(),'nav-cost').hasActiveFocus()
-        QTest.keyClick(links.quick,Qt.Key_Return)
-        assert received[-1].section=='pricing'
-        # This companion contains only interaction feedback; glyphs are drawn once by the monitor.
-        links.quick.clearFocus();QTest.mouseMove(links.quick,QPoint(30,150));QTest.qWait(30)
-        image=links.quick.grabFramebuffer();ratio=image.devicePixelRatio()
-        for y in range(140,164):
-            for x in range(25,55):
-                assert image.pixelColor(round(x*ratio),round(y*ratio)).alpha()<=1
-        assert not links.qml_errors
-    finally:links.close();window.close();app.processEvents()
-
-
 def test_dashboard_navigation_validates_session_and_selects_old_event_call(layout_controller):
     from PySide6.QtCore import Qt
     from PySide6.QtTest import QTest

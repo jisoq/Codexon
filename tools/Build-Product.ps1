@@ -48,6 +48,10 @@ try {
     $stagedProduct = Join-Path $stagingRoot $Product
     $stagedExe = Join-Path $stagedProduct ($Product + '.exe')
     if (!(Test-Path -LiteralPath $stagedExe)) { throw 'Build did not produce an executable.' }
+    & $PythonPath -m PyInstaller --noconfirm --clean --distpath $stagedProduct --workpath $workRoot 'CodexonRecovery.spec'
+    if ($LASTEXITCODE -ne 0) { throw 'Independent recovery build failed.' }
+    $recoveryExe = Join-Path $stagedProduct 'CodexonRecovery.exe'
+    $recoveryHash = (Get-FileHash -LiteralPath $recoveryExe -Algorithm SHA256).Hash.ToLowerInvariant()
     # Recheck after compilation: a user may have opened the prior output meanwhile.
     if (Get-CimInstance Win32_Process -Filter "Name='$Product.exe'" | Where-Object { $_.ExecutablePath -eq $executable }) {
         throw 'Output started during compilation. The verified build remains in staging.'
@@ -60,9 +64,13 @@ try {
     Copy-Item -LiteralPath (Join-Path $sourceRoot 'docs/user-guide.md') -Destination (Join-Path $stagedProduct 'USER-GUIDE.md')
     Copy-Item -LiteralPath (Join-Path $sourceRoot 'docs/user-guide.ko.md') -Destination (Join-Path $stagedProduct 'USER-GUIDE.ko.md')
     Copy-Item -LiteralPath (Join-Path $sourceRoot 'LICENSES') -Destination (Join-Path $stagedProduct 'LICENSES') -Recurse
+    $pythonBase = (& $PythonPath -c 'import sys; print(sys.base_prefix)').Trim()
+    $recoveryNotices = Join-Path $stagedProduct 'LICENSES/recovery'
+    New-Item -ItemType Directory -Path $recoveryNotices -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $pythonBase 'tcl/tk8.6/license.terms') -Destination (Join-Path $recoveryNotices 'Tk-license.terms')
     & $PythonPath (Join-Path $sourceRoot 'tools/collect_notices.py') --toc (Join-Path $workRoot "$Product/PYZ-00.toc") --product $stagedProduct
     if ($LASTEXITCODE -ne 0) { throw 'Could not prepare dependency notices.' }
-    [pscustomobject]@{product=$Product;version=([regex]::Match((Get-Content -LiteralPath (Join-Path $sourceRoot 'cachemonitor/version.py') -Raw),'[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.[0-9]+')).Value;commit=$sourceSha;architecture=[System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant();executable=($Product + '.exe');sha256=(Get-FileHash -LiteralPath $stagedExe -Algorithm SHA256).Hash.ToLowerInvariant()} |
+    [pscustomobject]@{product=$Product;version=([regex]::Match((Get-Content -LiteralPath (Join-Path $sourceRoot 'cachemonitor/version.py') -Raw),'[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.[0-9]+')).Value;commit=$sourceSha;architecture=[System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant();executable=($Product + '.exe');sha256=(Get-FileHash -LiteralPath $stagedExe -Algorithm SHA256).Hash.ToLowerInvariant();recovery_sha256=$recoveryHash} |
         ConvertTo-Json | Set-Content -LiteralPath (Join-Path $stagedProduct 'build-manifest.json') -Encoding utf8
     & $PythonPath (Join-Path $sourceRoot 'tools/package_release.py') --product $stagedProduct --validate-only
     if ($LASTEXITCODE -ne 0) { throw 'Public distribution validation failed.' }

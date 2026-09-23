@@ -34,8 +34,18 @@ jobs:
         run: .\build.ps1 -DistPath dist-ci -WorkPath build-ci -PythonPath ((Get-Command python).Source)
       - name: Check frozen runtime and Qt Quick interaction
         run: python tools/verify_changes.py --base HEAD --package-exe dist-ci/Codexon/Codexon.exe
-      - name: Check release contents
-        run: python tools/package_release.py --product dist-ci/Codexon --output dist-ci/Codexon-windows-x64-ci.zip
+      - name: Check installer payload contents
+        run: python tools/package_release.py --product dist-ci/Codexon --validate-only
+      - name: Check independent offline recovery
+        run: python tools/verify_recovery.py --executable dist-ci/Codexon/CodexonRecovery.exe --output artifacts/verification/recovery
+      - name: Build isolated installer
+        shell: pwsh
+        run: |
+          $compiler = Get-ChildItem "${env:ProgramFiles(x86)}\Inno Setup*\ISCC.exe" | Select-Object -First 1
+          if (-not $compiler) { throw 'Inno Setup compiler is required on this Windows runner' }
+          .\tools\Build-Installer.ps1 -ProductDir dist-ci/Codexon -OutputDir dist-ci/qa-setup -Compiler $compiler.FullName -Isolated
+      - name: Check installation, update and removal
+        run: python tools/verify_installation.py --installer dist-ci/qa-setup/Codexon-Setup.exe --output artifacts/verification/installation
       - name: Upload redacted synthetic verification evidence
         if: always()
         uses: actions/upload-artifact@v7

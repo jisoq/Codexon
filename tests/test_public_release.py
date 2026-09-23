@@ -41,12 +41,14 @@ def test_english_token_labels_do_not_change_stored_values():
 def test_public_payload_rejects_local_paths_and_unneeded_qt(tmp_path):
     folder = tmp_path/'Codexon';folder.mkdir()
     exe = folder/'Codexon.exe';exe.write_bytes(b'synthetic executable')
+    recovery=folder/'CodexonRecovery.exe';recovery.write_bytes(b'synthetic recovery')
     for name in ('LICENSE', 'THIRD-PARTY-NOTICES.md', 'BUNDLED-PYTHON.md', 'BUNDLED-QT.md',
                  'SOURCE-OFFER.md', 'USER-GUIDE.md', 'USER-GUIDE.ko.md'):
         (folder/name).write_text('Synthetic release test', encoding='utf-8')
     manifest = {'product':'Codexon','version':'2026.09.23.6','commit':'a'*40,
                 'architecture':'x64','executable':'Codexon.exe',
-                'sha256':hashlib.sha256(exe.read_bytes()).hexdigest()}
+                'sha256':hashlib.sha256(exe.read_bytes()).hexdigest(),
+                'recovery_sha256':hashlib.sha256(recovery.read_bytes()).hexdigest()}
     file = folder/'build-manifest.json'
     file.write_text(json.dumps(manifest), encoding='utf-8')
     assert payload(folder)[2] == manifest

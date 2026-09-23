@@ -75,6 +75,7 @@ class ObserverManager:
         self.url=url.rstrip('/')
         self.task=ObserverTask(home_key(self.home), role='ProxySupervisor')
         self.legacy_task=ObserverTask(home_key(self.home))
+        self.check_task=ObserverTask(home_key(self.home),role='ConnectionCheck')
         self.runtime_path=self.directory/'proxy-runtime.json'
         self.control_lock=self.directory/'observer-control.lock'
         self.cancelled=threading.Event()
@@ -149,9 +150,12 @@ class ObserverManager:
         return command
 
     def supervisor_command(self,upstream):
-        command=self.command(upstream)
-        command[command.index('--model-proxy')]='--proxy-supervisor'
-        return command
+        # Keep the historical task name, but run the relay itself, without a parent watcher.
+        return self.command(upstream)+['--managed']
+
+    def configure_check(self):
+        from .installation import recovery_command
+        return self.check_task.periodic(recovery_command(self.home,self.directory,self.url,check=True))
 
     def runtime(self):
         value=read_json(self.runtime_path)
@@ -273,10 +277,11 @@ class ObserverManager:
             # Persist rollback information before changing shared configuration.
             self.write_state(state)
             self.task.configure(self.supervisor_command(upstream),autostart=True)
+            self.configure_check()
             if self.cancelled.is_set():raise RuntimeError('프록시 켜기를 취소했습니다.')
             if previous_startup==state.get('managed_startup'):startup_value(None)
             backup=self.set_url(self.url)
-            state.update(enabled=True,pending=False,phase='active',upstream=upstream,restart_required=True,
+            state.update(enabled=True,pending=False,phase='active',upstream=upstream,url=self.url,restart_required=True,
                          last_backup=backup or state.get('last_backup'))
             self.write_state(state)
         except Exception:
@@ -285,6 +290,7 @@ class ObserverManager:
                 self.set_url(state.get('previous_url'))
             self.write_state(original_state)
             self.task.configure(self.supervisor_command(upstream),autostart=False)
+            self.check_task.remove()
             raise
         return self.status()
 
@@ -307,7 +313,7 @@ class ObserverManager:
         if current and (current==state.get('managed_startup') or ('--model-proxy' in current and str(self.home) in current)):
             startup_value(state.get('previous_startup'))
         warning=None
-        for task in (self.task,self.legacy_task):
+        for task in (self.task,self.legacy_task,self.check_task):
             try:task.remove()
             except RuntimeError as exc:warning=(warning+'\n' if warning else '')+str(exc)
         state.update(home=home_key(self.home),enabled=False,pending=False,phase='off',proof_at=0,proof_instance=None,
@@ -364,8 +370,8 @@ class ObserverManager:
                 raise RuntimeError('실행 중인 프록시가 없습니다.')
             if not getattr(sys,'frozen',False):
                 raise RuntimeError('업데이트는 설치된 배포 앱에서 실행하세요.')
-            command=self.supervisor_command(self.state().get('upstream') or self.upstream())
-            command[command.index('--proxy-supervisor')]='--proxy-update'
+            command=self.command(self.state().get('upstream') or self.upstream())
+            command[command.index('--model-proxy')]='--proxy-update'
             if read_json(updater.path).get('phase') not in ('switching','rollback'):
                 updater.publish('queued',source_instance=health['instance'],cancel_requested=False,
                                 message='프록시 업데이트 예약 중…')
@@ -388,6 +394,13 @@ class ObserverManager:
         if not state.get('enabled') or self.config()[1].get('openai_base_url')!=self.url:
             return self.status()
         upstream=state.get('upstream') or self.upstream()
+        self.configure_check()
+        health=self.health(timeout=3)
+        if health:
+            # Never start a second relay or replace a live legacy supervisor.
+            if health.get('lifecycle')=='managed':
+                self.task.configure(self.supervisor_command(upstream),autostart=True)
+            return self.status()
         self.task.start(self.supervisor_command(upstream),autostart=True)
         for _ in range(80):
             if self.cancelled.is_set():break

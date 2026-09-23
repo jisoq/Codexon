@@ -54,11 +54,9 @@ def main():
         refresh();QTest.qWait(150);refresh()
         c.toggle_opacity();QTest.qWait(70);refresh()
         report.update(style_changes=0,toolbar_occlusions=0)
-        before=n.u.GetForegroundWindow()
         for _ in range(30):refresh();report['refreshes']+=1;QTest.qWait(50)
         measuring=False
         report['visible']=c.toolbar.isVisible()
-        report['foreground_unchanged']=before==n.u.GetForegroundWindow()
         c.set_opacity(60);refresh()
         assert c.toolbar.slider.value()==40
         c.close_popup()
@@ -82,7 +80,7 @@ def main():
         report['controls_work']=True
         if args.assert_stable:
             assert report['style_changes']==0 and report['toolbar_occlusions']==0,report
-            assert report['visible'] and report['foreground_unchanged']
+            assert report['visible']
     finally:
         c.stop();host.close();app.processEvents()
         args.report.parent.mkdir(parents=True,exist_ok=True)

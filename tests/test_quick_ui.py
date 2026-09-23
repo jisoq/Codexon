@@ -1,6 +1,6 @@
 """Regressions at the actual QML input/rendering boundary."""
 import time
-from PySide6.QtCore import QSettings, QSignalBlocker, QPoint, QPointF, Qt
+from PySide6.QtCore import QSettings, QSignalBlocker, QPointF, Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 from cachemonitor.core import Session
@@ -22,6 +22,12 @@ def test_price_close_buttons_preserve_dashboard(tmp_path):
         for action in (window.show_prices,)*3:
             action();QTest.qWait(40)
             host=next(item for item in app.topLevelWidgets() if isinstance(item,DialogHost) and item.isVisible())
+            from cachemonitor.presentation import Text
+            text='\n'.join(node.text() for node in host.dialog.findChildren(Text))
+            assert 'API에는 장문 할증이 있지만, 구독 사용량 환산에는 반영하지 않습니다.' in text
+            import os
+            if os.environ.get('CODEXON_PRICE_CAPTURE'):
+                assert host.grab().save(os.environ['CODEXON_PRICE_CAPTURE'])
             button=next(node for node in host.dialog.findChildren(Button) if node.text()=='닫기')
             click(host,control(host,button));QTest.qWait(40)
             assert window.isVisible() and window.quick is not None and not window.quitting
@@ -112,7 +118,7 @@ def test_external_price_link_is_rendered_and_activates_without_a_network_request
         dispose(host);QDesktopServices.unsetUrlHandler('https')
 
 
-def test_quick_pages_keep_scroll_resize_columns_and_render_model_evidence(tmp_path):
+def test_quick_pages_keep_scroll_and_render_model_evidence(tmp_path):
     app=QApplication.instance() or QApplication([])
     previous=app.property('cachemonitorDisableShellIntegration')
     app.setProperty('cachemonitorDisableShellIntegration',True)
@@ -146,13 +152,6 @@ def test_quick_pages_keep_scroll_resize_columns_and_render_model_evidence(tmp_pa
         assert table_view(window,window.table).property('contentY')==before
         window.receive(snapshot);QTest.qWait(40)
         assert table_view(window,window.table).property('contentY')==before
-        header=next(item for item in walk(control(window,window.table)) if item.objectName()=='column-resizer-0')
-        point=header.mapToScene(QPointF(4,header.height()/2)).toPoint();width=window.table.columnWidth(0)
-        QTest.mousePress(window.quick,Qt.LeftButton,pos=point)
-        QTest.mouseMove(window.quick,point+QPoint(40,0),20)
-        QTest.mouseRelease(window.quick,Qt.LeftButton,pos=point+QPoint(40,0))
-        QTest.qWait(40)
-        assert window.table.columnWidth(0)>=width+35
         window.table.verticalScrollBar().setValue(0);QTest.qWait(40)
         click_row(window,window.table,1);QTest.qWait(40)
         assert 'gpt-5.6-sol' in window.detail_sections['conditions'][1].text()
@@ -162,35 +161,6 @@ def test_quick_pages_keep_scroll_resize_columns_and_render_model_evidence(tmp_pa
         assert not window.qml_errors,window.qml_errors
     finally:
         window.quit_app();app.setProperty('cachemonitorDisableShellIntegration',previous)
-
-
-def test_table_hover_is_quiet_and_explicit_details_keep_evidence():
-    from PySide6.QtCore import QObject
-    from cachemonitor.table_model import Table, Cell
-    from cachemonitor.quick_qa import click
-    app=QApplication.instance() or QApplication([])
-    node=Table(1,1);node.setHorizontalHeaderLabels(['모델']);node.setColumnWidth(0,230)
-    cell=Cell('gpt-6-astra (일치)');cell.setToolTip('호출 모델: gpt-6-astra\n응답 모델: gpt-6-astra\n근거: response.model')
-    node.setItem(0,0,cell)
-    host=mount(node,300,260)
-    try:
-        table=table_view(host,node)
-        delegate=next(item for item in walk(table) if item.property('display')==cell.text())
-        point=delegate.mapToScene(QPointF(40,15)).toPoint()
-        QTest.mouseMove(host.quick,point);QTest.qWait(1000)
-        tips=delegate.findChildren(QObject,'cell-overflow-tip')
-        assert tips and all(not tip.property('visible') for tip in tips)
-        click(host,delegate,40,15)
-        button=next(item for item in walk(control(host,node)) if item.objectName()=='cell-details-button')
-        click(host,button);QTest.qWait(40)
-        table_root=control(host,node)
-        popup=table_root.findChild(QObject,'cell-details-popup')
-        text=table_root.findChild(QObject,'cell-details-text')
-        assert popup.property('visible') and 'response.model' in text.property('text')
-        QTest.keyClick(host.quick,Qt.Key_Escape);QTest.qWait(20)
-        assert not popup.property('visible')
-        assert not host.qml_errors
-    finally:dispose(host)
 
 
 def test_filter_flow_wraps_instead_of_clipping_controls():

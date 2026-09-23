@@ -10,12 +10,19 @@ from PySide6.QtCore import QThread, Signal, QTimer
 from .overlay_tracking import RouteLog
 
 
-SUPPORTED_CODEX_RELEASES = ('26.915.', '26.917.')
-
-
-def supported_codex_release(version):
-    """Only releases verified against the read-only desktop route log."""
-    return version.startswith(SUPPORTED_CODEX_RELEASES)
+def observe_selection(targets, log, now):
+    """A single live process and its route evidence establish compatibility."""
+    result = {'target': None, 'selection': None, 'issue': ''}
+    if len(targets) == 1:
+        target = targets[0]
+        result.update(target=target, selection=log.poll(target['pid'], now))
+        if result['selection'] is None:
+            result['issue'] = '세션 화면 확인 중'
+    elif targets:
+        result['issue'] = 'Codex 기본 창 한 개에서 지원'
+    else:
+        result['issue'] = 'Codex 창 대기'
+    return result
 
 
 class WindowsOverlay:
@@ -72,8 +79,7 @@ class WindowsOverlay:
             title = ctypes.create_unicode_buffer(512)
             self.u.GetWindowTextW(hwnd, title, len(title))
             if title.value not in ('ChatGPT', 'Codex'): return True
-            found.append({'hwnd': hwnd, 'pid': pid.value, 'version': package[1],
-                          'supported': supported_codex_release(package[1])})
+            found.append({'hwnd': hwnd, 'pid': pid.value, 'version': package[1]})
             return True
         self.u.EnumWindows.argtypes = [type(visit), W.LPARAM]
         self.u.EnumWindows(visit, 0)
@@ -107,15 +113,16 @@ class WindowsOverlay:
 
     def confirm_selection(self, target):
         """Fresh read-only route verification; an HWND alone never implies a task."""
-        matches=[item for item in self.targets() if item['hwnd']==target['hwnd'] and item['pid']==target['pid'] and item.get('supported')]
-        if len(matches)!=1:return None
+        targets=self.targets()
+        if (len(targets)!=1 or targets[0]['hwnd']!=target['hwnd']
+                or targets[0]['pid']!=target['pid']):return None
         local=Path(os.environ['LOCALAPPDATA'])
         if not hasattr(self,'_navigation_log'):
             packaged=list((local/'Packages').glob('OpenAI.Codex_*/LocalCache/Local/Codex/Logs'))
             self._navigation_log=RouteLog(local/'Codex/Logs',packaged)
         try:
             # A bounded read that has not caught up fails closed.
-            return self._navigation_log.poll(target['pid'],time.monotonic())
+            return observe_selection(targets,self._navigation_log,time.monotonic())['selection']
         except (OSError,ValueError):return None
 
     def activate_target(self, hwnd):
@@ -237,18 +244,7 @@ class SelectionTracker(QThread):
                 if dirty or now >= next_targets:
                     targets = native.targets(); next_targets = now + 5;dirty=False
                     hooks.targets={t['hwnd'] for t in targets}
-                result = {'target': None, 'selection': None, 'issue': ''}
-                if len(targets) == 1:
-                    target = targets[0]
-                    if target['supported']:
-                        result.update(target=target, selection=log.poll(target['pid'], now))
-                        if result['selection'] is None: result['issue'] = '세션 화면 확인 중'
-                    else:
-                        result['issue'] = 'Codex 버전의 세션 추적 호환성 확인 필요'
-                elif len(targets) > 1:
-                    result['issue'] = 'Codex 기본 창 한 개에서 지원'
-                else:
-                    result['issue'] = 'Codex 창 대기'
+                result = observe_selection(targets, log, now)
             except (OSError, ValueError) as error:
                 result = {'target': None, 'selection': None, 'issue': '화면 추적 오류: ' + str(error)}
             # Heartbeats permit the UI to hide if this worker stalls or exits.

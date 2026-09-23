@@ -20,12 +20,14 @@ def test_disjoint_cache_write_and_reasoning_costs():
     assert token_cost(row('gpt-5.6-sol'))['cost']==pytest.approx(.162)
 
 
-def test_long_context_threshold_is_per_call_not_aggregate():
+def test_subscription_conversion_has_no_long_context_surcharge():
     short=token_cost({**row(),'input':272000})
     long=token_cost({**row(),'input':272001})
-    assert not short['long_context'] and long['long_context']
-    assert long['cost_cached']==pytest.approx(2*short['cost_cached'])
-    assert long['cost_output']==pytest.approx(1.5*short['cost_output'])
+    assert not short['long_context'] and not long['long_context']
+    assert long['cost_cached']==pytest.approx(short['cost_cached'])
+    assert long['cost_written']==pytest.approx(short['cost_written'])
+    assert long['cost_output']==pytest.approx(short['cost_output'])
+    assert long['cost']-short['cost']==pytest.approx(RATES['gpt-6-astra'].input/1e6)
     mini=token_cost({**row('gpt-5.4-mini'),'input':300000,'cached':200000,'written':None,'output':1000})
     assert not mini['long_context']
     assert mini['cost']==pytest.approx(.0945)
@@ -44,15 +46,15 @@ def test_unknown_prices_or_usage_are_not_zero():
 @pytest.mark.parametrize('model,rates', [('gpt-6-sol',(2,.2,2.5,10)),
                                        ('gpt-6-luna',(.1,.01,.125,.5))])
 @pytest.mark.parametrize('mode,factor', [('Standard',1),('Fast',2)])
-@pytest.mark.parametrize('tokens,long', [(272000,False),(272001,True)])
-def test_gpt6_sol_luna_official_prices(model,rates,mode,factor,tokens,long):
+@pytest.mark.parametrize('tokens', [272000,272001,1000000])
+def test_gpt6_sol_luna_base_api_conversion(model,rates,mode,factor,tokens):
     p=token_cost({**row(model,service_tier=mode),'input':tokens})
     inp,cached,written,output=rates
-    assert p['long_context'] is long
-    assert p['cost_uncached']==pytest.approx((tokens-90000)*inp*factor*(2 if long else 1)/1e6)
-    assert p['cost_cached']==pytest.approx(80000*cached*factor*(2 if long else 1)/1e6)
-    assert p['cost_written']==pytest.approx(10000*written*factor*(2 if long else 1)/1e6)
-    assert p['cost_output']==pytest.approx(2000*output*factor*(1.5 if long else 1)/1e6)
+    assert not p['long_context']
+    assert p['cost_uncached']==pytest.approx((tokens-90000)*inp*factor/1e6)
+    assert p['cost_cached']==pytest.approx(80000*cached*factor/1e6)
+    assert p['cost_written']==pytest.approx(10000*written*factor/1e6)
+    assert p['cost_output']==pytest.approx(2000*output*factor/1e6)
     assert p['cost']==pytest.approx(sum(p[k] for k in ('cost_uncached','cost_cached','cost_written','cost_output')))
     assert token_cost({**row(model),'written':None})['cost'] is None
 

@@ -37,7 +37,8 @@ def test_fixed_fast_rates_thresholds_and_unknown_is_never_base_cost():
         assert assumptions['Standard']['total']==pytest.approx(token_cost(usage(model=model))['cost'])
         assert assumptions['Fast']['total']==pytest.approx(token_cost(usage('Fast',model))['cost'])
         assert unknown['service_tier']=='미확인'
-    assert token_cost({**usage('Fast','gpt-5.5'),'input':272001})['cost'] is None
+    long_fast=token_cost({**usage('Fast','gpt-5.5'),'input':272001})
+    assert long_fast['cost']==pytest.approx((182001*12.5+80000*1.25+10000*12.5+2000*75)/1e6)
     assert token_cost(usage('Fast','gpt-5.5-pro'))['cost'] is None
     assert token_cost(usage('auto'))['cost'] is None
 

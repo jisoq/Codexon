@@ -26,7 +26,7 @@ def test_compatible_old_proxy_version_does_not_request_replacement(tmp_path):
     try:
         panel.display({'configured':True,'phase':'active','version_mismatch':False,
                        'health':{'version':'2026.09.23.1'},'app_version':'2026.09.23.4'})
-        assert not panel.update_button.isVisible()
+        assert not hasattr(panel,'update_button')
         assert '호환됨' in panel.runtime_values['version'].text()
         assert '업데이트 필요' not in panel.runtime_values['version'].text()
     finally:panel.stop();panel.deleteLater();app.processEvents()
@@ -93,31 +93,43 @@ def test_switch_off_during_activation_cancels_then_reconciles_off(tmp_path):
         assert not panel.toggle.isChecked()
     finally:panel.stop();panel.deleteLater()
 
-def test_update_button_render_and_states(tmp_path):
+def test_unified_update_button_render_and_recovery_remains_available(tmp_path,monkeypatch):
     from cachemonitor.quick_qa import mount,control,click,dispose
     from cachemonitor.fonts import load_bundled_fonts
     from PySide6.QtGui import QFont
     app=QApplication.instance() or QApplication([])
     load_bundled_fonts();app.setFont(QFont('Pretendard JP',10))
-    panel=ObserverPanel(tmp_path/'home',tmp_path/'data',active=False)
-    panel.active=True;calls=[]
+    from cachemonitor.update_panel import UpdatePanel
+    from cachemonitor.observer_control import ObserverManager
+    panel=UpdatePanel(ObserverManager(tmp_path/'home',tmp_path/'data'))
+    calls=[]
     initial={'configured':True,'phase':'active','version_mismatch':True,'health':{'version':'old'}}
     waiting={**initial,'update':{'phase':'waiting','message':'기존 연결 종료 대기 · Codex를 닫으면 적용됩니다.'}}
-    panel.manager.update_proxy=lambda:(calls.append('update') or waiting)
+    monkeypatch.setattr('cachemonitor.app_update.update',lambda progress:(calls.append('update') or '설치 시작'))
+    monkeypatch.setattr('cachemonitor.update_panel.open_recovery',lambda *args:calls.append('recovery'))
     panel.manager.cancel_update=lambda:(calls.append('cancel') or initial)
-    panel.display(initial);host=mount(panel,680,560)
+    panel.proxy_status(initial);host=mount(panel,680,350)
+    def finish():
+        for _ in range(200):
+            app.processEvents();QTest.qWait(10)
+            if panel.operation is None:return
+        raise AssertionError('update not finished')
     try:
-        click(host,control(host,panel.update_button));settle(app,panel)
-        assert calls==['update'] and panel.update_button.text()=='업데이트 예약 취소'
+        click(host,control(host,panel.button));finish()
+        assert calls==['update']
+        panel.proxy_status(waiting)
+        assert panel.button.text()=='업데이트 예약 취소'
         QTest.qWait(100)
         assert host.grab().save(str(tmp_path/'update-panel.png'))
         import os
         if os.environ.get('CACHEMONITOR_UPDATE_CAPTURE'):
             assert host.grab().save(os.environ['CACHEMONITOR_UPDATE_CAPTURE'])
-        click(host,control(host,panel.update_button));settle(app,panel)
+        click(host,control(host,panel.button));finish()
         assert calls==['update','cancel']
-        panel.display({**initial,'update':{'phase':'switching','message':'업데이트 중'}})
-        assert not panel.toggle.isEnabled() and not panel.update_button.isEnabled()
-        panel.display({'configured':True,'phase':'active','update':{'phase':'complete','message':'업데이트 완료'}})
-        assert not panel.update_button.isVisible() and panel.toggle.isEnabled()
-    finally:panel.stop();dispose(host)
+        panel.proxy_status({**initial,'update':{'phase':'switching','message':'업데이트 중'}})
+        assert not panel.button.isEnabled() and panel.recovery.isEnabled()
+        click(host,control(host,panel.recovery))
+        assert calls[-1]=='recovery'
+        panel.proxy_status({'configured':True,'phase':'active','update':{'phase':'complete','message':'업데이트 완료'}})
+        assert panel.button.isEnabled()
+    finally:dispose(host)

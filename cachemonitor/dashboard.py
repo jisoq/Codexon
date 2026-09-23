@@ -9,8 +9,8 @@ from datetime import datetime, timedelta
 from html import escape
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, QSettings, QDate, QEvent
-from PySide6.QtGui import QFont
+from PySide6.QtCore import Qt, QTimer, QSettings, QDate, QEvent, QUrl
+from PySide6.QtGui import QFont, QDesktopServices
 from PySide6.QtWidgets import QApplication, QWidget, QSystemTrayIcon
 from .presentation import Button, Choice, Column, DateInput, Group, Input, Navigation, Row, Scroll, Split, Stack, Text, TextArea, Toggle
 from .table_model import Cell, Header, Table, LazyTable
@@ -1318,10 +1318,8 @@ class Dashboard(TrayWindow):
         section['usage']='\n'.join(lines)
         price_model=row.get('price_model',row.get('model'));rate=(FAST_RATES if request_tier(row)=='Fast' else RATES if request_tier(row)=='Standard' else {}).get(price_model)
         lines=[VERIFIED+' 기준 · API 단가 환산',entries([('가격 모델',price_model)])]
-        if row.get('long_context'):lines.append('장문 단가 적용')
         if rate:
-            mul=2 if row.get('long_context') else 1;out_mul=1.5 if row.get('long_context') else 1
-            for label_,tokens,price in [('일반 입력',row.get('ordinary_input'),rate.input*mul),('캐시 읽기',row.get('cached'),None if rate.cached is None else rate.cached*mul),('캐시 쓰기',row.get('written'),(rate.written if rate.written is not None else rate.input)*mul),('출력·추론 포함',row.get('output'),rate.output*out_mul)]:
+            for label_,tokens,price in [('일반 입력',row.get('ordinary_input'),rate.input),('캐시 읽기',row.get('cached'),rate.cached),('캐시 쓰기',row.get('written'),rate.written if rate.written is not None else rate.input),('출력·추론 포함',row.get('output'),rate.output)]:
                 if tokens is not None and price is not None:lines.append(f'{label_}  {number(tokens)} × {usd(price)} / 1,000,000')
         if row.get('cost') is not None:lines.append('API 환산액  '+usd(row['cost']))
         else:lines=['환산 제외 · '+price_reason(row)]
@@ -1396,14 +1394,15 @@ class Dashboard(TrayWindow):
     def show_prices(self):
         dialog=Dialog(self);dialog.setWindowTitle('기준 가격 · '+VERIFIED+' 기준');dialog.resize(980,720)
         body=Column(dialog);body.setContentsMargins(20,20,20,20);body.setSpacing(16);body.addWidget(label(VERIFIED+' 기준 · 고정 단가 환산 · 청구액 아님','section'))
-        prices=table(['가격 모델 · 모드','일반 입력','캐시 읽기','캐시 쓰기','출력','장문 조건'])
-        for i,width in enumerate((260,115,115,125,115,175)):prices.setColumnWidth(i,width)
+        prices=table(['가격 모델 · 모드','일반 입력','캐시 읽기','캐시 쓰기','출력'])
+        for i,width in enumerate((320,145,145,145,145)):prices.setColumnWidth(i,width)
         rows=[]
         for model,standard in RATES.items():
             for mode,rate in (('Standard',standard),('Fast',FAST_RATES.get(model))):
-                if rate:rows.append([model+' · '+mode,usd(rate.input),usd(rate.cached) if rate.cached is not None else '미지원',usd(rate.written) if rate.written is not None else '입력과 동일',usd(rate.output),'입력 > 272,000' if rate.long_threshold else '장문 미산정' if model=='gpt-5.5' and mode=='Fast' else '할증 없음'])
+                if rate:rows.append([model+' · '+mode,usd(rate.input),usd(rate.cached) if rate.cached is not None else '미지원',usd(rate.written) if rate.written is not None else '입력과 동일',usd(rate.output)])
         fill(prices,rows);body.addWidget(prices,1)
-        body.addWidget(label('USD / 100만 토큰 · 장문 입력·캐시 단가 ×2, 출력 단가 ×1.5 · GPT-5.6 Sol 프로모션 확인 기한 2026-11-21','muted',True))
+        body.addWidget(label('API에는 장문 할증이 있지만, 구독 사용량 환산에는 반영하지 않습니다.','muted',True))
+        body.addWidget(label('USD / 100만 토큰 · GPT-5.6 Sol 프로모션 확인 기한 2026-11-21','muted',True))
         body.addWidget(label('가격 별칭: gpt-5.6, gpt-daybreak-blue-latest → gpt-5.6-sol · gpt-5.4-mini-2026-03-17 → gpt-5.4-mini · gpt-5.5-2026-04-23 → gpt-5.5','muted',True))
         buttons=DialogButtons(DialogButtons.Close);buttons.rejected.connect(dialog.reject);body.addWidget(buttons);dialog.open();self.price_dialog=dialog
 
@@ -1459,6 +1458,19 @@ class Dashboard(TrayWindow):
         self.notification_details=Details('최근 알림 · 확인 근거',self.notification_log)
         self.settings_page.add_widget(4, self.notification_details)
         self.settings_page.add_widget(5, label('Codexon '+VERSION, 'section'))
+        from .update_panel import UpdatePanel
+        self.update_panel=UpdatePanel(self.observer_panel.manager,self)
+        self.settings_page.add_widget(5,self.update_panel)
+        self.observer_panel.status_observed.connect(self.update_panel.proxy_status)
+        attribution=Row();attribution.setContentsMargins(0,8,0,16)
+        attribution.addWidget(label('제작자 · jisoq'),1)
+        self.repository_link=Button('GitHub · jisoq/Codexon')
+        self.repository_link.setAccessibleName('Codexon GitHub 저장소 열기')
+        self.repository_link.setToolTip('https://github.com/jisoq/Codexon')
+        self.repository_link.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl('https://github.com/jisoq/Codexon')))
+        attribution.addWidget(self.repository_link)
+        self.settings_page.add_widget(5, attribution)
         self.settings_page.add_widget(5, label('집계 범위: 이 PC에 저장된 Codex 작업 기록입니다. '
             '기록 파일을 만들지 않는 임시 사이드 채팅과 다른 PC의 작업은 포함되지 않습니다.', 'muted', True))
         self.diagnostic_summary=label('','',True)
@@ -1476,7 +1488,10 @@ class Dashboard(TrayWindow):
             self.settings.setValue('notifications/lastProtectionId',incident['id'])
             event=self.confirmed_notifications.record('protection','프록시 보호 정지',incident.get('reason','설정에서 확인하세요.'))
             self.show_confirmed_events([event] if self.notification_options['프록시 장애'].isChecked() else [])
-        self.show_confirmed_events(self.confirmed_notifications.proxy(result))
+        # Installed deployments use one shared, persisted notifier in the scheduled
+        # checker. Keep the in-app path for portable/source deployments only.
+        from .installation import installed
+        if not installed():self.show_confirmed_events(self.confirmed_notifications.proxy(result))
 
     def show_confirmed_events(self,events):
         for event in events:

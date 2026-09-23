@@ -150,7 +150,7 @@ class Tracker:
 
 
 def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *, diagnostics=None,ssl_context=None,
-               control_file=None, control_id='', stop_event=None):
+               control_file=None, control_id='', stop_event=None, managed=None):
     base=URL(upstream)
     if (base.scheme not in ('http','https') or not base.host or base.user is not None
             or base.query_string or base.fragment):
@@ -163,6 +163,7 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
             'service':'cachemonitor-model-observer',
             'version':PROXY_VERSION,'instance':uuid.uuid4().hex,'pid':os.getpid(),
             'identity':hashlib.sha256((home_key(home)+'|'+str(store.path.resolve())).encode()).hexdigest()}
+    if managed:health['lifecycle']='managed'
     app=web.Application(handler_args={'auto_decompress':False,'handler_cancellation':True})
     active_relays={}
     sockets={}
@@ -170,7 +171,11 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
 
     async def control_lifecycle(app):
         async def watch():
+            last_tick=0
             while True:
+                if managed and time.monotonic()-last_tick>=1:
+                    await asyncio.to_thread(managed.tick,health)
+                    last_tick=time.monotonic()
                 command=read_json(control_file) if control_file else {}
                 if command.get('id')==control_id and command.get('action')=='drain':
                     health['draining']=True;health['observation_enabled']=False
@@ -445,6 +450,7 @@ def main():
     parser.add_argument('--upstream-ca',type=Path,help='CA bundle for that upstream only; does not change system trust')
     parser.add_argument('--control-file',type=Path)
     parser.add_argument('--control-id',default='')
+    parser.add_argument('--managed',action='store_true')
     args=parser.parse_args()
     if args.evidence_path.resolve().is_relative_to(Path(args.codex_home).resolve()):
         parser.error('Evidence must be stored outside the Codex home')
@@ -453,7 +459,14 @@ def main():
     if args.upstream_url:endpoint=args.upstream_url
     context=ssl.create_default_context(cafile=str(args.upstream_ca)) if args.upstream_ca else None
     try:
-        if args.control_file:
+        if args.managed:
+            from .observer_control import ObserverManager
+            from .managed_proxy import ManagedProxy
+            manager=ObserverManager(args.codex_home,args.evidence_path.parent,url=f'http://127.0.0.1:{args.port}')
+            loop=proxy_loop()
+            try:loop.run_until_complete(ManagedProxy(manager).serve(store,endpoint,context,args.port))
+            finally:loop.close()
+        elif args.control_file:
             if (args.control_file.resolve().parent != args.evidence_path.resolve().parent
                     or args.control_file.name != 'proxy-control-'+args.control_id+'.json'):
                 parser.error('Control file must belong to the observer data directory')

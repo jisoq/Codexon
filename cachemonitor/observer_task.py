@@ -8,18 +8,21 @@ import subprocess
 
 class ObserverTask:
     def __init__(self, home, role='ModelObserver'):
+        self.role=role
         self.name='CacheMonitor-'+role+'-'+hashlib.sha256(str(home).encode()).hexdigest()[:12]
         self.marker='CacheMonitor model observer: '+str(home)
 
-    def call(self, operation, command=None, autostart=False):
+    def call(self, operation, command=None, autostart=False, periodic=False):
         if os.name!='nt':
             raise RuntimeError('독립 프록시 실행은 Windows 작업 스케줄러가 필요합니다')
         payload=base64.b64encode(json.dumps({'name':self.name,'marker':self.marker,'operation':operation,
             'executable':command[0] if command else '',
             'arguments':subprocess.list2cmdline(command[1:]) if command else '',
-            'autostart':bool(autostart)}).encode()).decode()
+            'autostart':bool(autostart),'periodic':bool(periodic),
+            'restart':3 if self.role in ('ModelObserver','ProxySupervisor','ProxyUpdate') else 0}).encode()).decode()
         script=r'''
 $ErrorActionPreference='Stop'
+[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
 $p=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__PAYLOAD__')) | ConvertFrom-Json
 $service=New-Object -ComObject Schedule.Service
 $service.Connect()
@@ -50,17 +53,23 @@ $definition.RegistrationInfo.Description=$p.marker
 $definition.Settings.Enabled=$true
 $definition.Settings.AllowDemandStart=$true
 $definition.Settings.ExecutionTimeLimit='PT0S'
+if($p.periodic){$definition.Settings.ExecutionTimeLimit='PT45S'}
 $definition.Settings.MultipleInstances=2
 $definition.Settings.DisallowStartIfOnBatteries=$false
 $definition.Settings.StopIfGoingOnBatteries=$false
 $definition.Settings.StartWhenAvailable=$true
-$definition.Settings.RestartCount=3
-$definition.Settings.RestartInterval='PT1M'
+if($p.restart -gt 0){$definition.Settings.RestartCount=$p.restart;$definition.Settings.RestartInterval='PT1M'}
 $definition.Principal.LogonType=3
 $definition.Principal.RunLevel=0
 $user=[Security.Principal.WindowsIdentity]::GetCurrent().Name
 $definition.Principal.UserId=$user
 if($p.autostart){$trigger=$definition.Triggers.Create(9);$trigger.UserId=$user;$trigger.Enabled=$true}
+if($p.periodic){
+    $trigger=$definition.Triggers.Create(1)
+    $trigger.StartBoundary=(Get-Date).AddSeconds(10).ToString('yyyy-MM-ddTHH:mm:ss')
+    $trigger.Repetition.Interval='PT1M'
+    $trigger.Enabled=$true
+}
 $action=$definition.Actions.Create(0)
 $action.Path=$p.executable
 $action.Arguments=$p.arguments
@@ -78,6 +87,7 @@ if($p.operation -eq 'run'){[void]$registered.Run($null)}
 
     def start(self,command,autostart=False):return self.call('run',command,autostart)
     def configure(self,command,autostart):return self.call('configure',command,autostart)
+    def periodic(self,command):return self.call('configure',command,True,periodic=True)
     def remove(self):return self.call('remove')
     def inspect(self):return self.call('inspect')
     def stop(self):return self.call('stop')

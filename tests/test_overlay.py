@@ -11,19 +11,58 @@ from cachemonitor.core import Session
 from cachemonitor.overlay import OverlayController, SessionOverlay
 from cachemonitor.overlay_data import OverlaySummaries, token_composition
 from cachemonitor.overlay_tracking import RouteLog, Selection, overlay_geometry
-from cachemonitor.overlay_windows import supported_codex_release
+from cachemonitor.overlay_windows import WindowsOverlay, observe_selection
 
 
 A = '11111111-1111-1111-1111-111111111111'
 B = '22222222-2222-2222-2222-222222222222'
 
 
-@pytest.mark.parametrize('version,expected',[
-    ('26.915.100.0',True),('26.917.6896.0',True),
-    ('26.916.1.0',False),('26.918.1.0',False),('27.0.0.0',False),
-])
-def test_desktop_overlay_supports_only_verified_route_formats(version,expected):
-    assert supported_codex_release(version) is expected
+@pytest.mark.parametrize('version', ['26.915.100.0', '26.917.6896.0', '26.918.1.0', '27.0.0.0'])
+def test_new_desktop_releases_require_live_route_evidence(tmp_path, version, monkeypatch):
+    target = dict(hwnd=1, pid=42, version=version)
+    reader = RouteLog(tmp_path)
+    assert observe_selection([target], reader, 0)['selection'] is None
+    path = logfile(tmp_path)
+    path.write_text(route(A), encoding='utf-8')
+    assert observe_selection([target], reader, 3)['selection'].thread_id == A
+    # Navigation applies the same evidence rule, without a release allowlist.
+    native = WindowsOverlay.__new__(WindowsOverlay)
+    native.targets = lambda: [target]
+    native._navigation_log = reader
+    monkeypatch.setenv('LOCALAPPDATA', str(tmp_path))
+    assert native.confirm_selection(target).thread_id == A
+    with path.open('a', encoding='utf-8') as stream:
+        stream.write(route(B).rstrip('\n'))
+    assert observe_selection([target], reader, 4)['selection'] is None
+    assert native.confirm_selection(target) is None
+    with path.open('a', encoding='utf-8') as stream:
+        stream.write('\n')
+    assert native.confirm_selection(target).thread_id == B
+
+
+def test_route_compatibility_never_reuses_another_process_or_ambiguous_window(tmp_path, monkeypatch):
+    path = logfile(tmp_path)
+    path.write_text(route(A), encoding='utf-8')
+    reader = RouteLog(tmp_path)
+    old = dict(hwnd=1, pid=42, version='26.917.1.0')
+    new = dict(hwnd=1, pid=43, version='27.0.0.0')
+    assert observe_selection([old], reader, 0)['selection'].thread_id == A
+    assert observe_selection([new], reader, 1)['selection'] is None
+    native = WindowsOverlay.__new__(WindowsOverlay)
+    native.targets = lambda: [new]
+    native._navigation_log = reader
+    monkeypatch.setenv('LOCALAPPDATA', str(tmp_path))
+    assert native.confirm_selection(old) is None
+    current = logfile(tmp_path, pid=43)
+    current.write_text('unrecognized future route format\n', encoding='utf-8')
+    assert observe_selection([new], reader, 4)['selection'] is None
+    current.write_text(route(B), encoding='utf-8')
+    assert observe_selection([new], reader, 5)['selection'].thread_id == B
+    other = dict(hwnd=2, pid=44, version='27.0.0.0')
+    native.targets = lambda: [new, other]
+    assert observe_selection([new, other], reader, 6)['selection'] is None
+    assert native.confirm_selection(new) is None
 
 
 def test_daily_route_log_rollover_keeps_same_process_selection_until_new_route(tmp_path):

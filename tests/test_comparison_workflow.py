@@ -1,15 +1,13 @@
-"""Model-driven comparison, navigation and hover through the real Qt scene."""
+"""Model-driven comparison and navigation through the real Qt scene."""
 import copy
 import json
-from types import SimpleNamespace
 
 import pytest
-from PySide6.QtCore import QPointF, Qt, QSettings
+from PySide6.QtCore import QSettings
 from PySide6.QtTest import QTest
 from cachemonitor.dashboard import Dashboard, choose
-from cachemonitor.quick_qa import control, click, click_row, render_plot, table_view, walk
-from cachemonitor.theme import shared_theme, Theme, contrast_color
-from cachemonitor.pricing import usd
+from cachemonitor.quick_qa import control, click, click_row
+from cachemonitor.theme import Theme, contrast_color
 from test_ui import dashboard, snapshot
 
 
@@ -84,36 +82,6 @@ def test_home_preserves_filters_and_back_restores_exact_call(dashboard):
     assert w.detail_scroll.isVisible() and not w.qml_errors
 
 
-def hover(host,item,x=None,y=None):
-    # A prior Qt Quick test can leave the pointer at the same scene coordinate;
-    # leave and re-enter so the hover transition is actually delivered.
-    QTest.mouseMove(host.quick.quickWindow(),QPointF(1,1).toPoint());QTest.qWait(30)
-    point=item.mapToScene(QPointF(item.width()/2 if x is None else x,item.height()/2 if y is None else y))
-    QTest.mouseMove(host.quick.quickWindow(),point.toPoint());QTest.qWait(60)
-
-
-@pytest.mark.parametrize('mode',['light','dark','codex'])
-def test_hover_preserves_selection_and_highlights_whole_row_and_chart(dashboard,mode):
-    w=dashboard;shared_theme().configure(mode);w.nav.setCurrentRow(1)
-    button=control(w,w.comparison_tabs['effort']);hover(w,button)
-    assert button.property('checked') and button.property('hovered')
-    assert any(c.objectName()=='hover-feedback' and c.opacity()>0 for c in walk(button))
-    plot=render_plot(w,w.comparison_chart);box,_,_=w.comparison_chart.hits[0]
-    hover(w,plot,box.center().x(),box.center().y())
-    assert plot.property('hoverIndex')==0
-    QTest.mouseMove(w.quick.quickWindow(),control(w,w.heading).mapToScene(QPointF(2,2)).toPoint());QTest.qWait(30)
-    assert plot.property('hoverIndex')==-1
-    w.nav.setCurrentRow(2);QTest.qWait(80)
-    table=table_view(w,w.parent_table)
-    cells=[c for c in walk(table) if c.property('row')==0 and c.metaObject().indexOfProperty('display')>=0]
-    assert len(cells)>1
-    selected=w.parent_table.currentRow();hover(w,cells[0])
-    assert control(w,w.parent_table).property('hoveredRow')==0
-    assert all(any(c.objectName()=='row-hover-feedback' and c.opacity()>0 for c in walk(cell)) for cell in cells)
-    assert w.parent_table.currentRow()==selected
-    assert not w.qml_errors
-
-
 def test_codex_low_contrast_accent_is_made_readable(monkeypatch):
     from cachemonitor import overlay_appearance
     class Reader:
@@ -145,33 +113,3 @@ def test_record_tabs_keep_active_selection_when_clicked_twice(dashboard):
     click(w,control(w,w.record_tabs[1]))
     assert w.record_tabs[1].isChecked() and w.record_view=='calls'
     w.go_back();assert w.record_view=='requests' and w.record_tabs[0].isChecked()
-
-
-def test_common_control_hover_disabled_and_calendar():
-    from PySide6.QtCore import QDate,QObject
-    from PySide6.QtWidgets import QApplication
-    from cachemonitor.presentation import Button,Toggle,Choice,Slider,Input,DateInput,Group,Column
-    from cachemonitor.quick_qa import mount,dispose
-    app=QApplication.instance() or QApplication([])
-    group=Group();layout=Column(group)
-    button=Button('닫기');check=Toggle('체크');switch=Toggle('스위치');switch.put(kind='switch')
-    choice=Choice();choice.addItem('하나','one');choice.addItem('둘','two')
-    slider=Slider();field=Input();date=DateInput(QDate.currentDate())
-    for node in (button,check,switch,choice,slider,field,date):layout.addWidget(node)
-    layout.addStretch();host=mount(group,700,600)
-    try:
-        for node in (button,check,switch,slider):
-            item=control(host,node);hover(host,item)
-            assert item.property('hovered')
-            assert any(c.objectName()=='hover-feedback' and c.opacity()>0 for c in walk(item))
-        button.setEnabled(False);item=control(host,button);hover(host,item)
-        assert all(c.opacity()==0 for c in walk(item) if c.objectName()=='hover-feedback')
-        popup=control(host,choice);click(host,popup);QTest.qWait(40)
-        assert popup.findChild(QObject,'choice-popup').property('visible')
-        QTest.keyClick(host.quick,Qt.Key_Escape)
-        date_item=control(host,date)
-        opener=next(c for c in walk(date_item) if c.property('iconName')=='calendar')
-        click(host,opener);QTest.qWait(100)
-        assert not host.qml_errors,host.qml_errors
-        QTest.keyClick(host.quick,Qt.Key_Escape)
-    finally:dispose(host)

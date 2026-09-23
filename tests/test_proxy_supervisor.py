@@ -54,6 +54,7 @@ def manager(tmp_path,monkeypatch):
     m=ObserverManager(home,tmp_path/'data')
     m.task=Task()
     m.legacy_task=Task()
+    m.check_task=Task()
     monkeypatch.setattr('cachemonitor.observer_control.startup_value',lambda *args:None)
     m.config_path.write_text(f'# preserve\nopenai_base_url="{URL}"\nmodel="m"\n')
     m.write_state({'home':home_key(home),'enabled':True,'phase':'active','previous_url':'https://api.openai.com/v1'})

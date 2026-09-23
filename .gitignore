@@ -8,6 +8,7 @@ dist/
 dist-*/
 *.spec
 !Codexon.spec
+!CodexonRecovery.spec
 artifacts/
 .codex/
 .env

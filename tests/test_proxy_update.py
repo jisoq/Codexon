@@ -34,6 +34,7 @@ class Manager:
         self.health_state='healthy' if self.version else 'refused'
         if not self.version:return None
         return dict(control_id='owned',version=self.version,pid=1,instance=self.instance,
+                    lifecycle='managed' if self.version==PROXY_VERSION else 'legacy',
                     active_connections=self.connections,status='ok',draining=self.draining)
     def runtime(self):return dict(pid=1,phase='active')
     def state(self):return dict(enabled=self.enabled,upstream='chatgpt')

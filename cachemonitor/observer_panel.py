@@ -41,14 +41,12 @@ class ObserverPanel(Group):
         self.error_detail=Details('오류 상세',Text(),compact=True)
         self.error_detail.body.setTextFormat(Qt.PlainText)
         self.error_detail.hide();layout.addWidget(self.error_detail)
-        self.update_button=Button('프록시 업데이트');self.update_button.hide()
-        self.update_button.clicked.connect(lambda:self.invoke('cancel_update' if self.last_result.get('update',{}).get('phase') in ('queued','waiting') else 'update_proxy'))
-        layout.addWidget(self.update_button)
+        # Updating is owned by Settings > About, together with the desktop app.
         self.update_status=Text();self.update_status.setWordWrap(True);self.update_status.hide()
         layout.addWidget(self.update_status)
         details=Form();details.setVerticalSpacing(12);details.setHorizontalSpacing(24)
         self.runtime_values={}
-        for key,title in (('guard','자동 복구'),('startup','로그인 시 실행'),('version','버전'),('path','실행 파일')):
+        for key,title in (('guard','연결 관리'),('startup','로그인 시 실행'),('version','버전'),('path','실행 파일')):
             name=Text(title);name.setStyleSheet('color: #6b737c;')
             value=Text('확인 중');value.setWordWrap(True);value.setTextFormat(Qt.PlainText)
             value.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -66,7 +64,6 @@ class ObserverPanel(Group):
     def update_controls(self):
         switching=self.last_result.get('update',{}).get('phase') in ('switching','rollback')
         self.toggle.setEnabled(self.active and not switching)
-        self.update_button.setEnabled(self.active and not self.busy() and not switching)
 
     def request(self,enabled):
         if not self.active:return
@@ -99,8 +96,6 @@ class ObserverPanel(Group):
         error=result.get('error');state=result.get('observer_status',{}) if error else result
         self.last_result=state;self.enabled=state.get('configured',False)
         update=state.get('update') or {};phase_update=update.get('phase')
-        self.update_button.setText('업데이트 예약 취소' if phase_update in ('queued','waiting') else '프록시 업데이트')
-        self.update_button.setVisible(bool(state.get('version_mismatch') and self.enabled) or phase_update in ('queued','waiting','switching','rollback','interrupted'))
         self.update_status.setText(update.get('message',''))
         self.update_status.setVisible(bool(update.get('message')))
         self.update_controls()
@@ -110,7 +105,14 @@ class ObserverPanel(Group):
         text={'off':'꺼짐','starting':'연결 확인 중…','prepared':'꺼짐',
               'validated':'꺼짐 · 연결 시험 완료','active':'켜짐','draining':'꺼짐 · 기존 연결 마무리 중',
               'faulted':'보호 정지','failed':'켜지 못했습니다','recovery_failed':'보호 정지 · 설정 복구 필요',
-              'recovery_required':'연결 확인 필요'}.get(phase,phase)
+              'recovery_required':'연결 확인 필요 · 정보·문제 해결에서 연결 복구'}.get(phase,phase)
+        if error and not state:
+            text='연결 설정 확인 실패 · 정보·문제 해결에서 연결 복구'
+        elif state.get('configured') and state.get('probe_state'):
+            from .connection_recovery import assess
+            assessed=assess(state)
+            if assessed['code'] not in ('responding','updating'):
+                text=assessed['title']
         incident=state.get('incident') or {}
         reason=error or incident.get('reason') or state.get('last_error') or state.get('service_issue') or state.get('cleanup_warning')
         if incident.get('recovery_error'):reason=(reason+'\n' if reason else '')+'설정 복구 실패: '+incident['recovery_error']
@@ -123,11 +125,11 @@ class ObserverPanel(Group):
         version=health.get('version') or '실행 안 됨'
         versions=f"앱 {state.get('app_version','—')} · 프록시 {version}"
         if state.get('version_mismatch'):
-            versions+='\n프록시 업데이트 필요'+(' · 현재 연결 유지 중' if self.enabled else ' · 프록시 사용 꺼짐')
+            versions+='\n정보·문제 해결에서 통합 업데이트'+(' · 현재 연결 유지 중' if self.enabled else ' · 프록시 사용 꺼짐')
         elif health and version!=state.get('app_version'):
             versions+=' · 호환됨'
         self.runtime_values['version'].setText(versions)
-        self.runtime_values['guard'].setText('작동 중' if runtime.get('phase') in ('ready','active','draining') else '실행 안 됨')
+        self.runtime_values['guard'].setText(('프록시 내부 관리' if health.get('lifecycle')=='managed' else '이전 독립 감시') if runtime.get('phase') in ('ready','active','draining') else '실행 상태 확인 필요')
         if health and not health.get('control_id') and runtime.get('phase') in ('ready','active','draining'):
             self.runtime_values['guard'].setText('작동 중 · 이전 프록시는 연결 장애만 감시')
         startup=('켜짐' if registration.get('autostart') else '꺼짐') if registration is not None else '확인 중'

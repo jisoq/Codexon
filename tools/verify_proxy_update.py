@@ -31,7 +31,7 @@ def main():
     verified=subprocess.run([str(old),'--verify-runtime',str(old_report)],timeout=30)
     old_runtime=read_json(old_report)
     assert verified.returncode==0 and old_runtime.get('errors')==[]
-    old_version=old_runtime['version']
+    old_version=old_runtime.get('proxy_version',old_runtime['version'])
     home=root/'home';home.mkdir(exist_ok=True)
     m=ObserverManager(home,root/'data',url=f'http://127.0.0.1:{options.port}')
     updater=ObserverTask(home_key(home),role='ProxyUpdate')
@@ -63,6 +63,8 @@ def main():
                 break
             time.sleep(.5)
         assert health and health['version']==PROXY_VERSION and health['status']=='ok', (state,health)
+        assert health.get('lifecycle')=='managed'
+        assert m.runtime()['pid']==health['pid']
         assert m.config_path.read_bytes()==before
         print(json.dumps({'phase':state['phase'],'version':health['version'],'configuration_preserved':True}))
     finally:
@@ -72,7 +74,7 @@ def main():
         m.turn_off()
         deadline=time.monotonic()+15
         while time.monotonic()<deadline:
-            if not m.health(timeout=1):break
+            if not m.health(timeout=3) and m.health_state=='refused':break
             time.sleep(.5)
         updater.remove()
 

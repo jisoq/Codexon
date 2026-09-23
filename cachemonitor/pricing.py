@@ -10,7 +10,7 @@ from dataclasses import dataclass, replace
 from datetime import date
 
 VERIFIED = '2026-09-23'
-PRICE_POLICY = 'observed-request-mode-v4'
+PRICE_POLICY = 'subscription-base-api-rates-v5'
 PROFILE_NAME = VERIFIED + ' 기준'
 SOURCE = 'https://developers.openai.com/api/docs/pricing'
 CACHE_SOURCE = 'https://developers.openai.com/api/docs/guides/prompt-caching'
@@ -99,14 +99,8 @@ def _token_cost(row):
     if any(type(v) is not int or v < 0 for v in (inp, output)):
         result['price_issue'] = '입력/출력 미확인'
         return result
-    if tier=='Fast' and model=='gpt-5.5' and inp>272000:
-        result['price_issue']='Fast 장문 단가 미확인'
-        return result
-    long = rate.long_threshold is not None and inp > rate.long_threshold
-    result['long_context'] = long
-    p_input = rate.input * (2 if long else 1)
-    p_cached = rate.cached * (2 if long else 1) if rate.cached is not None else None
-    p_output = rate.output * (1.5 if long else 1)
+    # Subscription usage is compared at base API rates, without API context surcharges.
+    p_input, p_cached, p_output = rate.input, rate.cached, rate.output
     result['cost_output'] = output*p_output/1e6
     reasoning = row.get('reasoning')
     if type(reasoning) is int and 0 <= reasoning <= output:
@@ -135,7 +129,7 @@ def _token_cost(row):
     result['cost_uncached'] = (inp-cached-written)*p_input/1e6 if written is not None else 0.0
     result['cost_unclassified'] = (inp-cached)*p_input/1e6 if written is None else 0.0
     result['cost_cached'] = cached*(p_cached or 0)/1e6
-    result['cost_written'] = (written or 0)*(rate.written if rate.written is not None else rate.input)*(2 if long else 1)/1e6
+    result['cost_written'] = (written or 0)*(rate.written if rate.written is not None else rate.input)/1e6
     result['cost_input'] = sum(result[k] for k in COST_COMPONENTS[:-1])
     result['cost'] = result['cost_input']+result['cost_output']
     return result
@@ -192,7 +186,6 @@ def token_cost(row):
         if written is not None and (not valid(written) or valid(inp) and valid(cached) and written>inp-cached):issues.append('캐시 쓰기 범위 오류')
         elif written is None and rate and rate.written is not None:issues.append('캐시 쓰기 미확인')
         if rate and cached and rate.cached is None:issues.append('캐시 읽기 단가 미지원')
-        if mode=='Fast' and model=='gpt-5.5' and valid(inp) and inp>272000:issues.append('Fast 장문 단가 미확인')
         if not issues:issues.append(result['price_issue'])
     result['price_issues']=issues
     return result

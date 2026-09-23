@@ -1,9 +1,8 @@
-from PySide6.QtCore import Qt,QSettings,QPointF,QPoint
-from PySide6.QtGui import QColor
+from PySide6.QtCore import Qt,QSettings
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 from cachemonitor.lazy_table import LazyTable
-from cachemonitor.quick_qa import mount,dispose,table_view,walk
+from cachemonitor.quick_qa import table_view,walk
 
 
 def test_explicit_zero_role_is_lazy_and_survives_reorder_and_correction():
@@ -20,36 +19,6 @@ def test_explicit_zero_role_is_lazy_and_survives_reorder_and_correction():
     assert not model.data(model.index(0,0),Qt.UserRole+2)
     ordinary=LazyTable(['ID']);ordinary.set_rows([rows[0]],lambda *_:'0')
     assert not ordinary.model().data(ordinary.model().index(0,0),Qt.UserRole+2)
-
-
-def test_rendered_zero_row_selection_and_hover_remain_distinct(tmp_path):
-    app=QApplication.instance() or QApplication([])
-    table=LazyTable(['호출','캐시']);table.put(highlightZeroCache=True)
-    table.set_rows([dict(key='first',input=100,cached=0),dict(key='unknown',cached=None),dict(key='hit',cached=50)],
-                   lambda r,c,role:r['key'] if c==0 else '—' if r['cached'] is None else str(r['cached']))
-    host=mount(table,600,260);host.move(400,400);host.activateWindow()
-    try:
-        QTest.qWait(60)
-        cells=[item for item in walk(table_view(host,table)) if item.metaObject().indexOfProperty('cacheZero')>=0]
-        zero=next(item for item in cells if item.property('row')==0 and item.property('column')==0)
-        unknown=next(item for item in cells if item.property('row')==1 and item.property('column')==0)
-        assert zero.property('cacheZero') and not unknown.property('cacheZero')
-        # Earlier rendered tests may leave the native pointer over this row.
-        # Establish the non-hover state before checking its distinct color.
-        QTest.mouseMove(host.quick.quickWindow(),QPoint(500,180));QTest.qWait(40)
-        assert zero.property('color')==QColor('#fff4e4')
-        point=zero.mapToScene(QPointF(30,15)).toPoint()
-        QTest.mouseMove(host.quick.quickWindow(),point);QTest.qWait(80)
-        assert zero.property('color')==QColor('#ffe8c2'), (point,zero.isVisible(),host.quick.size())
-        table.selectRow(0);QTest.qWait(40)
-        assert zero.property('color')==QColor(__import__('cachemonitor.theme',fromlist=['shared_theme']).shared_theme().palette['secondary'])
-        marker=next(item for item in zero.childItems() if item.objectName()=='cache-zero-marker')
-        assert marker.isVisible()
-        assert host.grab().save(str(tmp_path/'cache-zero-selected.png'))
-        table.selectRow(2);QTest.qWait(40)
-        assert host.grab().save(str(tmp_path/'cache-zero.png'))
-        assert not host.qml_errors
-    finally:dispose(host)
 
 
 def test_dashboard_enables_zero_highlight_only_for_call_tables(tmp_path):

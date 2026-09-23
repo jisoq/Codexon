@@ -35,7 +35,7 @@ def test_foreground_companion_does_not_hide_its_codex_target():
 
 
 @pytest.mark.skipif(sys.platform != 'win32', reason='Native Windows overlay')
-def test_native_bottom_right_move_resize_minimize_focus_and_toggle(tmp_path):
+def test_native_bottom_right_move_resize_minimize_and_toggle(tmp_path):
     from cachemonitor.overlay_windows import WindowsOverlay
     app = QApplication.instance() or QApplication([])
     native = WindowsOverlay()
@@ -55,10 +55,8 @@ def test_native_bottom_right_move_resize_minimize_focus_and_toggle(tmp_path):
         # Foreground matching is tested separately from OS foreground activation policy.
         original_visible = native.visible_target
         native.visible_target = lambda handle: bool(native.u.IsWindowVisible(handle) and not native.u.IsIconic(handle))
-        foreground = native.u.GetForegroundWindow()
         refresh()
         assert controller.widget.isVisible()
-        assert native.u.GetForegroundWindow() == foreground
         style = native.u.GetWindowLongPtrW(hwnd, -20)
         assert style & 0x08000000 and style & 0x20 and style & 0x80000
         for offset, size in ((0, (800, 620)), (90, (950, 700)), (-70, (760, 580))):

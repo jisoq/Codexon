@@ -1,6 +1,11 @@
-MIT License
+Codexon Attribution License 1.0
 
 Copyright (c) 2026 jisoq
+Original project: Codexon
+Original author: jisoq
+Original repository: https://github.com/jisoq/Codexon
+
+This is a custom license, not the MIT License.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -9,8 +14,40 @@ to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
 copies of the Software, and to permit persons to whom the Software is
 furnished to do so, subject to the following conditions:
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+1. This license, including its copyright notice, attribution requirements, and
+   warranty disclaimer, shall be included in all copies or substantial portions
+   of the Software, including modified versions and binary distributions.
+
+2. The original project name, original author name, original repository URL,
+   and original copyright notice stated above must be preserved accurately.
+   You must not remove, replace, falsify, or obscure these original attributions.
+   You may add your own authorship, copyright, and repository information for
+   your modifications, clearly distinguished from the original attributions.
+
+3. If you distribute a version of the Software, or a work containing a
+   substantial portion of it, with a graphical user interface, that interface
+   must retain a reasonably accessible and legible original-author attribution
+   to "jisoq" and a working link whose target is
+   "https://github.com/jisoq/Codexon" in its Settings, About, or equivalent
+   information screen. Labels may be translated and the layout may be changed,
+   but the original author identity and original repository URL must remain
+   unchanged. Availability of the external website is not your responsibility.
+   Distributions without a graphical interface must retain the same original
+   attribution in their accompanying documentation or notices.
+
+4. You may modify the Software and identify your modified version under a
+   different name, provided that the original attributions remain intact and
+   are identified as such. Do not present your changes as the work of jisoq or
+   imply endorsement by the original author without permission. Sublicensing
+   must not remove the obligations in this license for the covered Software.
+
+These conditions apply only to material offered under this license. Separately
+licensed third-party components remain governed by their own licenses and
+notices. Nothing here limits rights granted under those licenses, including
+rights to replace or modify LGPL libraries or reverse engineer for debugging
+such modifications. Earlier versions obtained under a different license remain
+available to their recipients under that license; this license does not
+retroactively replace those grants.
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,

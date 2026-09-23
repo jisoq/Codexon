@@ -8,10 +8,10 @@ import re
 import zipfile
 from pathlib import Path
 
-REQUIRED = {'Codexon.exe', 'build-manifest.json', 'LICENSE',
+REQUIRED = {'Codexon.exe', 'CodexonRecovery.exe', 'build-manifest.json', 'LICENSE',
             'THIRD-PARTY-NOTICES.md', 'BUNDLED-PYTHON.md', 'BUNDLED-QT.md', 'SOURCE-OFFER.md',
             'USER-GUIDE.md', 'USER-GUIDE.ko.md'}
-MANIFEST_KEYS = {'product', 'version', 'commit', 'architecture', 'executable', 'sha256'}
+MANIFEST_KEYS = {'product', 'version', 'commit', 'architecture', 'executable', 'sha256', 'recovery_sha256'}
 FORBIDDEN_NAMES = {'.env', 'config.toml', 'auth.json'}
 FORBIDDEN_SUFFIXES = {'.db', '.sqlite', '.jsonl', '.log', '.ini', '.zip', '.sha256'}
 PRIVATE_PATH = re.compile(rb'(?i)(?:[a-z]:\\(?:users|repos)\\|/users/[^/\r\n]+/|\\users\\[^\\\r\n]+\\)')
@@ -48,6 +48,8 @@ def payload(folder: Path):
     exe_hash = hashlib.sha256((folder/'Codexon.exe').read_bytes()).hexdigest()
     if manifest['sha256'].lower() != exe_hash:
         raise ValueError('Public manifest executable hash mismatch')
+    if hashlib.sha256((folder/'CodexonRecovery.exe').read_bytes()).hexdigest()!=manifest['recovery_sha256']:
+        raise ValueError('Public manifest recovery hash mismatch')
     dlls = {p.name.lower() for p in paths if p.suffix.lower() == '.dll'}
     banned = ('qt63d', 'qt6charts', 'qt6graphs', 'qt6datavisualization',
               'qt6quick3d', 'qt6quicktimeline', 'qt6virtualkeyboard',
