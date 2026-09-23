@@ -30,12 +30,15 @@ jobs:
           python -m pip_audit -r requirements-release.lock
       - name: Plan checks
         run: python tools/verify_changes.py --plan
+      - name: Million-observation chart performance
+        timeout-minutes: 3
+        run: python tools/run_ui_checks.py -- python -m pytest -v --tb=short tests/test_quota_chart_performance.py --basetemp artifacts/verification/chart
       - name: Full regression
         timeout-minutes: 15
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path artifacts/verification/full -Force | Out-Null
-          python tools/run_ui_checks.py -- python -m pytest -v --tb=short --durations=10 -o faulthandler_timeout=120 tests 2>&1 | Tee-Object artifacts/verification/full/pytest.log
+          python tools/run_ui_checks.py -- python -m pytest -v --tb=short --durations=10 -o faulthandler_timeout=120 tests --ignore=tests/test_quota_chart_performance.py 2>&1 | Tee-Object artifacts/verification/full/pytest.log
           exit $LASTEXITCODE
       - name: Small-screen rendering
         shell: pwsh

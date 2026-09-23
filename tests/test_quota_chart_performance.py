@@ -45,11 +45,12 @@ def test_million_observations_keep_exact_selection_and_bounded_rendering(tmp_pat
         result={'observations':count,'drawn_points':len(series['samples'][768]),
                 'background_preparation_seconds':preparation,
                 'selection_p95_ms':sorted(lookup)[23],'frame_p95_ms':sorted(samples)[23],
-                'hover_p95_ms':sorted(hover)[23],'new_series_frame_max_ms':max(switch)}
+                'hover_p95_ms':sorted(hover)[23],'new_series_frame_max_ms':max(switch),
+                'new_series_frames_ms':switch}
         (tmp_path/'performance.json').write_text(json.dumps(result,indent=2),encoding='utf-8')
         assert result['selection_p95_ms']<50
         assert result['frame_p95_ms']<100
         assert result['hover_p95_ms']<50
-        assert result['new_series_frame_max_ms']<200
+        assert result['new_series_frame_max_ms']<200,result
         assert not host.qml_errors
     finally:dispose(host)

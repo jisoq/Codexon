@@ -1,8 +1,8 @@
 """A single dual-axis plot with bounded rendering and exact time selection."""
 from bisect import bisect_left, bisect_right
 from math import ceil, floor, log10
-from PySide6.QtCore import Qt, QRectF, QPointF, QLineF, Signal
-from PySide6.QtGui import QColor, QPen, QImage, QPainter
+from PySide6.QtCore import Qt, QRectF, QPointF, Signal
+from PySide6.QtGui import QColor, QPen, QImage, QPainter, QPainterPath
 from .charts import Plot
 from .theme import shared_theme
 from .pricing import usd
@@ -131,24 +131,24 @@ class QuotaHistory(Plot):
         curves=[('remaining','cached',Qt.SolidLine)]
         if self.money:curves += [('cycle_cost','output',Qt.SolidLine),('cycle_value','written',Qt.DashDotLine)]
         xs=[self.x_at(index) for index in indices]
-        points={}
-        for key,_,_ in curves:
+        for key,color,style in curves:
             low,high,_=self.axis if key=='remaining' else (0,self.cost_ceiling if key=='cycle_cost' else self.ceiling,0)
             scale=box.height()/(high-low);bottom=box.bottom()
-            points[key]=[QPointF(x,bottom-(value-low)*scale) if (value:=self.rows[index].get(key)) is not None else None
-                         for index,x in zip(indices,xs)]
-        for key,color,style in curves:
-            previous=None;previous_index=None
-            lines=[];markers=[]
+            previous=None;previous_x=None;previous_index=None
+            path=QPainterPath();markers=[]
             p.setPen(QPen(QColor(palette[color]),2,style))
-            for index,point in zip(indices,points[key]):
-                if point is not None and previous is not None and self.connects(previous_index,index,key):
-                    corner=QPointF(point.x(),previous.y())
-                    lines.extend((QLineF(previous,corner),QLineF(corner,point)))
-                if point is not None and (previous is None or index==indices[-1]):
-                    markers.append(point)
-                previous,previous_index=point,index
-            if lines:p.drawLines(lines)
+            # One native path avoids thousands of temporary Qt line/point
+            # wrappers each time a refreshed series invalidates the image.
+            for index,x in zip(indices,xs):
+                value=self.rows[index].get(key)
+                y=bottom-(value-low)*scale if value is not None else None
+                if y is not None:
+                    if previous is not None and self.connects(previous_index,index,key):
+                        path.moveTo(previous_x,previous);path.lineTo(x,previous)
+                        path.moveTo(x,previous);path.lineTo(x,y)
+                    if previous is None or index==indices[-1]:markers.append(QPointF(x,y))
+                previous,previous_x,previous_index=y,x,index
+            p.setBrush(Qt.NoBrush);p.drawPath(path)
             p.setBrush(QColor(palette[color]))
             for point in markers:p.drawEllipse(point,3,3)
         if count and self.gap_width:
@@ -168,12 +168,12 @@ class QuotaHistory(Plot):
                     p.drawText(QRectF(left-2,box.bottom()-10,self.gap_width+4,20),Qt.AlignCenter,'//')
         self._cache_hits=[]
         for pos,index in enumerate(indices):
-            point=points['remaining'][pos];row=self.rows[index]
-            left=(points['remaining'][pos-1].x()+point.x())/2 if pos else box.left()
-            right=(points['remaining'][pos+1].x()+point.x())/2 if pos+1<len(indices) else box.right()
+            x=xs[pos];row=self.rows[index]
+            left=(xs[pos-1]+x)/2 if pos else box.left()
+            right=(xs[pos+1]+x)/2 if pos+1<len(indices) else box.right()
             self._cache_hits.append((QRectF(left,box.top(),max(1,right-left),box.height()),row,observation_label(row,self.money)))
             if row['reset_kind']:
-                p.setPen(QPen(QColor(palette['muted']),1,Qt.DotLine));p.drawLine(QPointF(point.x(),box.top()),QPointF(point.x(),box.bottom()))
+                p.setPen(QPen(QColor(palette['muted']),1,Qt.DotLine));p.drawLine(QPointF(x,box.top()),QPointF(x,box.bottom()))
         for k in visible_gaps:
             left=self.gap_lefts[k]
             self._cache_hits.append((QRectF(left,box.top(),self.gap_width,box.height()),{},self.gap_label(k)))
