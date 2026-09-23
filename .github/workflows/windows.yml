@@ -9,6 +9,7 @@ permissions:
 env:
   PYTHONUTF8: '1'
   PYTHONIOENCODING: utf-8
+  CODEXON_CI_HEADLESS: '1'
 jobs:
   verify:
     runs-on: windows-latest
@@ -27,7 +28,7 @@ jobs:
           python -m pip_audit -r requirements-release.lock
       - name: Plan checks
         run: python tools/verify_changes.py --plan
-      - name: Full regression
+      - name: Headless regression (interactive UI checked in release verification)
         run: python tools/verify_changes.py --full
       - name: Build Windows package
         shell: pwsh

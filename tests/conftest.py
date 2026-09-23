@@ -5,6 +5,36 @@ import sys
 import pytest
 
 
+# GitHub's hosted Windows runner has no interactive desktop. These checks
+# depend on native focus, window visibility, or rendered delegate hit testing.
+# The release verification runs the unfiltered suite on an interactive PC.
+INTERACTIVE_DESKTOP_TESTS = {
+    'tests/test_call_transport.py::test_call_column_filter_selection_refresh_and_diagnostics',
+    'tests/test_model_ui.py::test_model_columns_counts_filter_and_refresh',
+    'tests/test_overlay_controls.py::test_opacity_popup_has_one_slider_and_keyboard_escape',
+    'tests/test_overlay_controls.py::test_detail_graph_owns_navigation_and_body_alone_scrolls',
+    'tests/test_overlay_controls.py::test_rendered_detail_selection_preserves_latest_monitor_values',
+    'tests/test_overlay_layout_controller.py::test_keyboard_focus_connects_existing_header_graph_scroll_and_popup',
+    'tests/test_overlay_layout_controller.py::test_keyboard_minimize_restore_and_move_keep_existing_control_paths',
+    'tests/test_overlay_layout_controller.py::test_queued_keyboard_focus_cannot_override_new_target_or_hidden_window',
+    'tests/test_overlay_layout_controller.py::test_native_companion_keyboard_routes',
+    'tests/test_overlay_navigation.py::test_monitor_link_mask_keyboard_and_hover_do_not_paint_text',
+    'tests/test_overlay_navigation.py::test_dashboard_navigation_validates_session_and_selects_old_event_call',
+    'tests/test_ui.py::test_sequential_drilldown_and_full_call_detail',
+    'tests/test_ui.py::test_record_actions_do_not_shift_table',
+    'tests/test_ui.py::test_filter_layout_and_pending_states_keep_table_stationary',
+}
+
+
+def pytest_collection_modifyitems(items):
+    if os.environ.get('CODEXON_CI_HEADLESS') != '1':
+        return
+    desktop_only = pytest.mark.skip(reason='Requires an interactive Windows desktop; run in release verification')
+    for item in items:
+        if item.nodeid.split('[', 1)[0] in INTERACTIVE_DESKTOP_TESTS:
+            item.add_marker(desktop_only)
+
+
 @pytest.fixture(autouse=True)
 def isolate_installed_proxy(monkeypatch):
     import urllib.request
