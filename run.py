@@ -8,7 +8,12 @@ if __name__ == "__main__":
         raise SystemExit(main())
     if '--verify-runtime' in sys.argv:
         from cachemonitor.runtime_check import main
-        raise SystemExit(main(sys.argv[sys.argv.index('--verify-runtime')+1]))
+        position = sys.argv.index('--verify-runtime') + 1
+        if position >= len(sys.argv) or sys.argv[position].startswith('--'):
+            if sys.stderr is not None:
+                print('Usage: Codexon.exe --verify-runtime <report.json>', file=sys.stderr)
+            raise SystemExit(2)
+        raise SystemExit(main(sys.argv[position]))
     if '--proxy-supervisor' in sys.argv:
         sys.argv.remove('--proxy-supervisor')
         from cachemonitor.proxy_supervisor import main

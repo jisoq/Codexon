@@ -1,12 +1,24 @@
 """Public-facing translation and payload checks keep internal records intact."""
 import hashlib
 import json
+from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
 from cachemonitor.i18n import set_language, tr
 from cachemonitor.presentation import Choice, Text
 from tools.package_release import payload
+
+
+def test_runtime_check_requires_report_path():
+    root = Path(__file__).resolve().parents[1]
+    result = subprocess.run([sys.executable, str(root/'run.py'), '--verify-runtime'],
+                            cwd=root, capture_output=True, text=True, encoding='utf-8')
+    assert result.returncode == 2
+    assert 'Usage: Codexon.exe --verify-runtime <report.json>' in result.stderr
+    assert 'Traceback' not in result.stderr
 
 
 def test_english_token_labels_do_not_change_stored_values():
