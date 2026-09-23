@@ -25,7 +25,7 @@ Supported installation target: **Windows 10/11 x64**. Setup includes Python, Qt 
 
 ## Get started
 
-**Installing with an AI assistant?** Give it this repository link and ask it to follow the [AI / LLM installation guide](INSTALL.md). The guide covers verified installation, first launch, optional model monitoring, and a ready-to-run source environment.
+**Setting up with an AI assistant?** Give it this repository link and ask it to follow the [AI / LLM installation guide](INSTALL.md). It will ask you to run Setup yourself. Tell it when installation is complete, and it will verify the installation, execution environment and settings.
 
 1. Download `Codexon-Setup.exe` from [Releases](https://github.com/jisoq/Codexon/releases).
 2. Run Setup. No administrator rights or separate Python installation are required.
