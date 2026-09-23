@@ -1,7 +1,7 @@
 """A single dual-axis plot with bounded rendering and exact time selection."""
 from bisect import bisect_left, bisect_right
 from math import ceil, floor, log10
-from PySide6.QtCore import Qt, QRectF, QPointF, Signal
+from PySide6.QtCore import Qt, QRectF, QPointF, QLineF, Signal
 from PySide6.QtGui import QColor, QPen, QImage, QPainter
 from .charts import Plot
 from .theme import shared_theme
@@ -130,17 +130,27 @@ class QuotaHistory(Plot):
         indices=self.series['samples'][256 if box.width()<600 else 768]
         curves=[('remaining','cached',Qt.SolidLine)]
         if self.money:curves += [('cycle_cost','output',Qt.SolidLine),('cycle_value','written',Qt.DashDotLine)]
+        xs=[self.x_at(index) for index in indices]
+        points={}
+        for key,_,_ in curves:
+            low,high,_=self.axis if key=='remaining' else (0,self.cost_ceiling if key=='cycle_cost' else self.ceiling,0)
+            scale=box.height()/(high-low);bottom=box.bottom()
+            points[key]=[QPointF(x,bottom-(value-low)*scale) if (value:=self.rows[index].get(key)) is not None else None
+                         for index,x in zip(indices,xs)]
         for key,color,style in curves:
             previous=None;previous_index=None
+            lines=[];markers=[]
             p.setPen(QPen(QColor(palette[color]),2,style))
-            for index in indices:
-                point=self.point(index,key)
+            for index,point in zip(indices,points[key]):
                 if point is not None and previous is not None and self.connects(previous_index,index,key):
-                    p.drawLine(previous,QPointF(point.x(),previous.y()))
-                    p.drawLine(QPointF(point.x(),previous.y()),point)
+                    corner=QPointF(point.x(),previous.y())
+                    lines.extend((QLineF(previous,corner),QLineF(corner,point)))
                 if point is not None and (previous is None or index==indices[-1]):
-                    p.setBrush(QColor(palette[color]));p.drawEllipse(point,3,3)
+                    markers.append(point)
                 previous,previous_index=point,index
+            if lines:p.drawLines(lines)
+            p.setBrush(QColor(palette[color]))
+            for point in markers:p.drawEllipse(point,3,3)
         if count and self.gap_width:
             p.setPen(QColor(palette['muted']))
             p.drawText(QRectF(box.left(),8,box.width(),20),Qt.AlignLeft,'// 수집 공백')
@@ -158,9 +168,9 @@ class QuotaHistory(Plot):
                     p.drawText(QRectF(left-2,box.bottom()-10,self.gap_width+4,20),Qt.AlignCenter,'//')
         self._cache_hits=[]
         for pos,index in enumerate(indices):
-            point=self.point(index,'remaining');row=self.rows[index]
-            left=(self.point(indices[pos-1],'remaining').x()+point.x())/2 if pos else box.left()
-            right=(self.point(indices[pos+1],'remaining').x()+point.x())/2 if pos+1<len(indices) else box.right()
+            point=points['remaining'][pos];row=self.rows[index]
+            left=(points['remaining'][pos-1].x()+point.x())/2 if pos else box.left()
+            right=(points['remaining'][pos+1].x()+point.x())/2 if pos+1<len(indices) else box.right()
             self._cache_hits.append((QRectF(left,box.top(),max(1,right-left),box.height()),row,observation_label(row,self.money)))
             if row['reset_kind']:
                 p.setPen(QPen(QColor(palette['muted']),1,Qt.DotLine));p.drawLine(QPointF(point.x(),box.top()),QPointF(point.x(),box.bottom()))

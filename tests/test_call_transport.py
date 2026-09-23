@@ -134,6 +134,9 @@ def test_call_column_filter_selection_refresh_and_diagnostics(tmp_path):
             direct['sessions'][0]['history']=reader.enrich('h',direct['sessions'][0]['history'])
             w.receive(direct)
             assert w.table.item(0,transport_column).text()=='HTTP/SSE'
+            if not w.table.isVisible():
+                from cachemonitor.quick_qa import click, control
+                click(w,control(w,w.close_record_button))
             click_row(w,w.table,0)
             assert '호출 ID  10' in w.detail_sections['identity'][1].text()
             assert '통신 방식  HTTP/SSE' in w.detail_sections['conditions'][1].text()

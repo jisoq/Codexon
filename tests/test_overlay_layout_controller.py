@@ -42,9 +42,18 @@ def test_collection_error_does_not_advance_last_confirmed_time(monkeypatch):
 
 
 @pytest.fixture
-def layout_controller(tmp_path):
+def layout_controller(tmp_path,monkeypatch):
     app=QApplication.instance() or QApplication([])
     controller=OverlayController(QSettings(str(tmp_path/'overlay.ini'),QSettings.IniFormat),native_enabled=False)
+    # Test cross-window Qt keyboard routing without requiring foreground rights
+    # in the hosted runner's Windows service session. Native placement is still
+    # exercised by test_native_companion_keyboard_routes below.
+    for control in controller.chrome:
+        original=control.activateWindow
+        def activate(control=control,original=original):
+            original();app.processEvents()
+            app.setActiveWindow(control)
+        monkeypatch.setattr(control,'activateWindow',activate)
     controller.native=Native()
     controller.appearance_reader.read=lambda dark:controller.appearance
     engine=AnalysisEngine();engine.ingest([source()])

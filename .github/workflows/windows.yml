@@ -12,6 +12,7 @@ env:
 jobs:
   verify:
     runs-on: windows-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7
         with:
@@ -30,7 +31,12 @@ jobs:
       - name: Plan checks
         run: python tools/verify_changes.py --plan
       - name: Full regression
-        run: python tools/run_ui_checks.py -- python tools/verify_changes.py --full
+        timeout-minutes: 15
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path artifacts/verification/full -Force | Out-Null
+          python tools/run_ui_checks.py -- python -m pytest -v --tb=short --durations=10 -o faulthandler_timeout=120 tests 2>&1 | Tee-Object artifacts/verification/full/pytest.log
+          exit $LASTEXITCODE
       - name: Small-screen rendering
         shell: pwsh
         run: |
