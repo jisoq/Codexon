@@ -32,6 +32,8 @@ def test_english_token_labels_do_not_change_stored_values():
         assert choice.itemData(0) == 'cached'
         assert choice.state['items'][0]['text'] == 'Cached input'
         assert tr('2 / 2호출') == '2 / 2 calls'
+        assert tr('모양') == 'Appearance'
+        assert tr('알림') == 'Notifications'
     finally:
         set_language('ko')
 

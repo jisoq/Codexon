@@ -49,7 +49,14 @@ class SettingsPage(Group):
         language.setCurrentIndex(max(0,language.findData(parent.settings.value('ui/language','ko'))))
         language.currentIndexChanged.connect(lambda index: parent.settings.setValue('ui/language',language.itemData(index)))
         import time
-        timezone=Text('시스템 시간대 · '+time.tzname[0]);timezone.setWordWrap(True)
+        from datetime import datetime
+        from .i18n import language
+        if language() == 'en':
+            offset=datetime.now().astimezone().strftime('%z')
+            zone='UTC'+offset[:3]+':'+offset[3:]
+        else:
+            zone=time.tzname[0]
+        timezone=Text('시스템 시간대 · '+zone);timezone.setWordWrap(True)
         self.add_widget(0, timezone)
         self.add_row(1, '작업표시줄 위젯', '', self.toggle('widget'))
         self.add_row(1, '표시할 모니터', '연결 해제 시 주 모니터 사용', self.choice('monitor'))
