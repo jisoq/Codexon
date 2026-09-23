@@ -272,19 +272,22 @@ def main(argv=None):
                 if (not args.codex_home or not args.data_dir or manager.url==URL
                         or not (manager.home/'codexon-test-home').exists()):
                     raise ValueError('UI checks require an explicitly isolated test home and port')
+                window.smoke_activations=0
                 def report_ui():
                     action=args.ui_smoke.with_suffix('.click')
-                    if action.exists():
+                    button=window.button
+                    ready=bool(button.winfo_ismapped() and button.instate(['!disabled']))
+                    if action.exists() and ready:
                         action.unlink()
-                        # Deliver ordinary Tk pointer events to the test control only.
-                        # No system pointer movement or foreground-window dependency.
-                        button=window.button
-                        button.event_generate('<Enter>',x=5,y=5)
-                        button.event_generate('<ButtonPress-1>',x=5,y=5)
-                        button.event_generate('<ButtonRelease-1>',x=5,y=5)
+                        # Use Tk's normal button activation binding. A synthetic
+                        # pointer press can lose its pressed state when Windows
+                        # delivers a native Leave event on an unshown desktop.
+                        button.event_generate('<<Invoke>>')
+                        window.smoke_activations+=1
                     atomic_write(args.ui_smoke,json.dumps(dict(busy=window.busy,result=window.result,
                         hwnd=window.root.winfo_id(),button=window.button.winfo_id(),
-                        width=window.button.winfo_width(),height=window.button.winfo_height())).encode())
+                        width=button.winfo_width(),height=button.winfo_height(),
+                        ready=ready,activations=window.smoke_activations)).encode())
                     window.root.after(250,report_ui)
                 window.root.after(250,report_ui)
             window.run()

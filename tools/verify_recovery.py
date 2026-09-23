@@ -80,16 +80,18 @@ def main():
     user=ctypes.WinDLL('user32',use_last_error=True)
     user.PostMessageW.argtypes=[W.HWND,W.UINT,W.WPARAM,W.LPARAM]
     try:
-        state=wait_report(report,lambda d:not d['busy'] and d.get('result'))
+        state=wait_report(report,lambda d:not d['busy'] and d.get('result') and d.get('ready'))
         assert state['result']['code']=='refused'
         capture(state['hwnd'],root/'before.png')
         report.with_suffix('.click').touch()
         state=wait_report(report,lambda d:(d.get('result') or {}).get('code')=='restored')
+        assert state['activations']==1
         capture(state['hwnd'],root/'after.png')
         assert tomllib.loads((home/'config.toml').read_text())=={'model':'synthetic'}
         assert '# untouched personal setting' in (home/'config.toml').read_text()
         assert auth.read_text()=='{"synthetic":"preserve"}'
-        result=dict(passed=True,independent_executable=True,actual_button_click=True,model_requests=0,
+        result=dict(passed=True,independent_executable=True,actual_button_activation=True,
+                    activation_event='Tk <<Invoke>>',model_requests=0,
                     config_restored=True,auth_preserved=True)
         (root/'result.json').write_text(json.dumps(result,indent=2))
         print(json.dumps(result))

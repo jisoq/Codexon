@@ -12,7 +12,7 @@
 
 저장 형식·공통 기반·의존성 변경, 영향 범위 불명확, 누적된 여러 영역 변경에는 전체 회귀 검사를 실행합니다. 대규모 성능 검사는 빌드와 무거운 작업을 멈춘 상태에서 따로 실행합니다. 이전 실패가 남아 있다면 새 실패와 구분하되, 단순히 제외해 성공으로 보고하지 않습니다.
 
-설치형 배포는 `tools/Build-Installer.ps1`로 만듭니다. `-Isolated`로 빌드한 QA 설치기는 별도 설치 ID·레지스트리·바로 가기를 사용하고 운영 프록시 전환과 본체 자동 실행을 생략합니다. `tools/verify_installation.py --installer <QA 설치기> --output <새 검사 폴더>`로 신규 설치·재설치·실행 경로 전환·사용 중 제거 보류·제거를 검증합니다. `tools/verify_recovery.py --executable <CodexonRecovery.exe> --output <새 검사 폴더>`는 복구 EXE만 분리해 실제 창과 버튼을 확인합니다. 물리 커서를 움직이지 않고 격리 검사 창에 Tk 클릭 이벤트를 전달하며, 설정 복원·인증 보존·전후 캡처를 검사합니다. 예약 점검은 격리 홈과 포트에서 실행하고, 검사 종료 후 해당 작업만 제거합니다.
+설치형 배포는 `tools/Build-Installer.ps1`로 만듭니다. `-Isolated`로 빌드한 QA 설치기는 별도 설치 ID·레지스트리·바로 가기를 사용하고 운영 프록시 전환과 본체 자동 실행을 생략합니다. `tools/verify_installation.py --installer <QA 설치기> --output <새 검사 폴더>`로 신규 설치·재설치·실행 경로 전환·사용 중 제거 보류·제거를 검증합니다. `tools/verify_recovery.py --executable <CodexonRecovery.exe> --output <새 검사 폴더>`는 복구 EXE만 분리해 실제 창과 버튼을 확인합니다. 표시되고 활성화된 버튼에 Tk 표준 `<<Invoke>>` 이벤트를 한 번 전달하고, 설정 복원·인증 보존·전후 캡처를 검사합니다. 물리 커서는 움직이지 않습니다. 예약 점검은 격리 홈과 포트에서 실행하고, 검사 종료 후 해당 작업만 제거합니다.
 
 
 Windows UI 검사는 `python tools/run_ui_checks.py -- python tools/verify_changes.py --full`로 실행합니다. 사용자에게 표시하지 않는 임시 Windows 데스크톱에서 실제 Qt 창과 키보드 처리를 검사하며, 사용자 데스크톱으로 전환하거나 물리 커서를 움직이지 않습니다. 작은 화면의 배치는 별도 프로세스에서 `QT_QPA_PLATFORM=offscreen`으로 `test_ui.py`, `test_model_ui.py`, `test_call_transport.py`, `test_quota_detail_card.py`를 실행해 확인합니다. 창 크기는 요청값과 실제값을 구분합니다.

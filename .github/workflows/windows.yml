@@ -67,6 +67,7 @@ jobs:
       - name: Check independent offline recovery
         run: |
           python tools/run_ui_checks.py -- python tools/verify_recovery.py --executable dist-ci/Codexon/CodexonRecovery.exe --output artifacts/verification/recovery-ko
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python tools/run_ui_checks.py -- python tools/verify_recovery.py --executable dist-ci/Codexon/CodexonRecovery.exe --output artifacts/verification/recovery-en --language en
       - name: Build isolated installer
         shell: pwsh
