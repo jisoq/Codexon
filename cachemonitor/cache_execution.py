@@ -232,8 +232,9 @@ async def request_once(url, headers, body, *, websocket=False, timeout=30, permi
 
 
 class Executor:
-    def __init__(self,journal,contexts,send=request_once):
+    def __init__(self,journal,contexts,send=request_once,*,observation_only=False):
         self.journal,self.contexts,self.send=journal,contexts,send
+        self.observation_only=observation_only
         self.generation=0
         self.busy=0
         self.closed=False
@@ -249,6 +250,7 @@ class Executor:
         self.busy=max(0,self.busy-1)
 
     async def run(self,home,sid,rid,url,headers,*,anchor,deadline,latency_bound,websocket=False,round_number=0,max_output_tokens=None,operation=None,valid=lambda:True,expected_generation=None):
+        if self.observation_only:return 'observation_only'
         generation=self.generation if expected_generation is None else expected_generation
         if self.closed:return 'invalidated'
         if self.journal.has_round(home,sid,rid,round_number):return 'duplicate'
@@ -287,6 +289,7 @@ class Executor:
             # Retain numeric provenance even if disabling capture clears Contexts.
             original=dict(self.contexts.usage.get(rid,{}))
             def permit():
+                if self.observation_only:return False
                 if self.closed or self.busy or generation!=self.generation or not valid():return False
                 return self.journal.permit_operation(key,operation) if operation else True
             transport=asyncio.create_task(asyncio.wait_for(self.send(url,headers,body,websocket=websocket,timeout=latency_bound,

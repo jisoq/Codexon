@@ -23,6 +23,40 @@ URL='https://chatgpt.com/backend-api/codex/responses'
 HEADERS={'ChatGPT-Account-ID':'synthetic-account','Content-Length':'1'}
 
 
+def test_observation_only_forwards_user_but_never_executes_or_guards(tmp_path):
+    from aiohttp import ClientSession
+    from cachemonitor.model_proxy import create_app
+    from cachemonitor.model_evidence import EvidenceStore
+    from cachemonitor.cache_control import hook_decision
+    async def scenario():
+        seen=[]
+        async def endpoint(req):
+            seen.append(await req.json())
+            return web.Response(text='data: '+json.dumps(dict(type='response.completed',response=response()))+'\n\n',content_type='text/event-stream')
+        async def forbidden(*a,**kw):raise AssertionError('maintenance transport must never run')
+        path=tmp_path/'cache-control.sqlite'
+        scheduler=Scheduler('home',path,observation_only=True,send=forbidden)
+        scheduler.control.set('automatic',True);scheduler.control.set('guard',True)
+        scheduler.control.set('ui_heartbeat',time.time());allow(scheduler.journal)
+        app=web.Application();app.router.add_post('/responses',endpoint)
+        store=EvidenceStore(tmp_path/'e.sqlite')
+        async with server(app) as upstream,server(create_app(store,'home',upstream,cache_capture=scheduler.capture)) as proxy:
+            async with ClientSession() as client:
+                async with client.post(proxy+'/responses',json=body()) as reply:assert reply.status==200
+                async with client.get(proxy+'/health') as reply:assert (await reply.json())['cache_observation_only']
+            assert scheduler.snapshots
+            scheduler.policy=lambda *a:dict(state='eligible',calls=2,interval=0,latency_bound=30,output_cap=64)
+            await scheduler.tick()
+            assert not scheduler.jobs
+            assert await scheduler.executor.run('home','s','original',upstream,{},anchor=0,deadline=0,latency_bound=30)=='observation_only'
+            scheduler.control.profile('home','s',dict(profile(),written=0))
+            assert hook_decision(path,'home',dict(hook_event_name='UserPromptSubmit',session_id='s',turn_id='t',model='gpt-6-sol'),observe_only=True)=={}
+            assert not scheduler.control.requests()
+            assert len(seen)==1 and not scheduler.journal.rows()
+        await scheduler.close();store.close()
+    run_proxy_test(scenario())
+
+
 def allow(journal,expected=.1):
     scope=target('home',body(),URL,HEADERS,False)
     proposal=journal.operations.propose(scope,expected,expected*10,64,'natural_output_proxy')

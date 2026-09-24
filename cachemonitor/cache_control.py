@@ -90,11 +90,12 @@ class Control:
     def close(self):self.db.close()
 
 
-def hook_decision(path,home,event,timeout=60):
+def hook_decision(path,home,event,timeout=60,*,observe_only=False):
     control=Control(path)
     key=None
     try:
         control.activity(home,event)
+        if observe_only:return {}
         if event.get('hook_event_name')!='UserPromptSubmit':return {}
         if not all(isinstance(event.get(k),str) and event[k] for k in ('session_id','turn_id','model')):return {}
         if not control.get('guard',False) or time.time()-control.get('ui_heartbeat',0)>5:return {}
@@ -137,11 +138,12 @@ def hook_decision(path,home,event,timeout=60):
 def hook_main():
     import argparse
     parser=argparse.ArgumentParser();parser.add_argument('--database',required=True)
+    parser.add_argument('--observe-only',action='store_true')
     args=parser.parse_args()
     try:
         event=json.loads(sys.stdin.buffer.read(1024*1024))
         home=str(Path(os.environ.get('CODEX_HOME',Path.home()/'.codex')).resolve())
-        result=hook_decision(args.database,home,event)
+        result=hook_decision(args.database,home,event,observe_only=args.observe_only)
     except Exception:result={}
     # stdout is a protocol, never a debug or user instruction channel.
     sys.stdout.write(json.dumps(result));sys.stdout.flush()
