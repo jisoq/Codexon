@@ -8,7 +8,7 @@ from .pricing import token_cost
 import json
 
 
-def enrich(sessions,index_path,now):
+def enrich(sessions,index_path,now,homes=None):
     path=control_path(index_path)
     control=Control(path)
     journal=None
@@ -37,8 +37,9 @@ def enrich(sessions,index_path,now):
                 control.db.execute('INSERT OR REPLACE INTO cache_gaps VALUES(?,?,?,?)',
                                    (session['home'],session['id'],turn,json.dumps(gap)))
         journal=Journal(path)
+        maintenance=[r for r in journal.rows() if homes is None or r['home'] in homes]
         groups={}
-        for row in journal.rows():
+        for row in maintenance:
             key=(row['home'],row['sid'])
             if key not in groups:
                 groups[key]=Session('maintenance:'+row['sid'],row['home'],title='캐시 유지',parent_thread_id=row['sid'])
@@ -54,7 +55,6 @@ def enrich(sessions,index_path,now):
             view=session.view(now)
             view.update(source='maintenance',collection_complete=True,archived=False,purpose='maintenance')
             sessions.append(view)
-        maintenance=journal.rows()
         audit=[];effects=[];compactions=[];delegated=[]
         for session in sessions:
             if session.get('purpose')=='maintenance':continue

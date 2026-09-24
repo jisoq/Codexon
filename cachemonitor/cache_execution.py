@@ -111,7 +111,8 @@ class Journal:
 
     def has_round(self,home,sid,snapshot,round_number):
         key=hashlib.sha256(json.dumps([home,sid,snapshot,round_number]).encode()).hexdigest()
-        return self.db.execute('SELECT 1 FROM cache_jobs WHERE id=?',(key,)).fetchone() is not None
+        legacy=hashlib.sha256(json.dumps([home,sid,snapshot]).encode()).hexdigest()
+        return self.db.execute('SELECT 1 FROM cache_jobs WHERE id IN (?,?)',(key,legacy)).fetchone() is not None
 
     def finish(self,key,state,response=None,*,anchor=None,scope_read_lower=None):
         response=response or {}
@@ -136,6 +137,7 @@ class Journal:
                      service_tier=tier or '미확인',state=state,usage_known=usage is not None,
                      snapshot=snapshot,round=round_number,anchor=anchor,scope_read_lower=scope)
             row.update(json.loads(usage) if usage else usage_values({}))
+            row['usage_known']=all(type(row.get(k)) is int and row[k]>=0 for k in ('input','cached','output'))
             row.update(token_cost(row))
             rows.append(row)
         return rows

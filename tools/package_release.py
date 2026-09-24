@@ -33,7 +33,7 @@ def payload(folder: Path):
         if path.name.lower() in FORBIDDEN_NAMES or (path.suffix.lower() in FORBIDDEN_SUFFIXES
                 and rel != '_internal/base_library.zip'):
             raise ValueError(f'Private or diagnostic file in distribution: {rel}')
-        if any(part.lower() in {'artifacts', 'screenshots', 'captures', '.codex'} for part in path.parts):
+        if any(part.lower() in {'artifacts', 'screenshots', 'captures', '.codex'} for part in path.relative_to(folder).parts):
             raise ValueError(f'Diagnostic directory in distribution: {rel}')
         if path.suffix.lower() in {'.json', '.toml', '.txt', '.md', '.qml'} and path.stat().st_size < 5_000_000:
             if PRIVATE_PATH.search(path.read_bytes()):

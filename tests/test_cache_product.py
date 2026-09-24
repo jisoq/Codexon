@@ -139,6 +139,8 @@ def test_unknown_usage_survives_index_and_policy(tmp_path):
     engine=AnalysisEngine();engine.ingest(views)
     assert next(iter(engine.sessions.values()))['prepared']['history'][0]['cost'] is None
     assert cost_bounds(profile(),dict(profile(),cached=0),4) is not None
+    other=[];summary=enrich(other,path,time.time(),{'other-home'})
+    assert not other and summary['calls']==0
 
 
 @pytest.mark.parametrize('outcome',['ok','401','429','lost','overcap','zero'])
