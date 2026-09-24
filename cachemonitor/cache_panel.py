@@ -11,6 +11,7 @@ from .pricing import usd,token_cost
 from .quick_runtime import Confirmation
 
 REASONS={
+    'no_executable_rounds':'유지하지 않음 · 동의 기간 안에 실행할 시간 부족',
     'operating_consent_required':'비활성 · 제한 운용 범위에 대한 동의 필요',
     'operating_scope_unavailable':'비활성 · 초기 운용 대상은 계정이 확인된 Luna·low·Standard HTTP입니다',
     'operating_cost_unobserved':'현재 비교 구간의 비용 예상에 필요한 자료 대기',

@@ -88,6 +88,25 @@ def decide(gaps, *, latency_bound, scheduler_slack, max_calls):
                 net_scenario=net,measured_saving=None,basis='api_equivalent')
 
 
+def executable_rounds(anchor,now,expires_in,limit,*,latency_bound=30,scheduler_slack=1):
+    """Conservative start schedule on the SAME monotonic clock as Executor.
+
+    Renewal starts at request start, never response completion. Reserve latency
+    and scheduling slack before consent expires; account for accumulated late
+    starts rather than assuming every subsequent round starts on the old grid.
+    This is a planning constraint, not a guarantee of server completion.
+    """
+    interval=TTL_SECONDS-latency_bound-scheduler_slack
+    if interval<=0 or now<anchor or now-anchor+latency_bound>=TTL_SECONDS:return 0
+    deadline=now+expires_in;count=0
+    start=max(now,anchor+interval)
+    for _ in range(limit):
+        start+=scheduler_slack
+        if start+latency_bound>=deadline:break
+        count+=1;start+=interval
+    return count
+
+
 def cost_bounds(previous,current,output_cap,input_extra=0):
     """Comparable natural-call scenario, not causal proof of idle expiration.
 
