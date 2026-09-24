@@ -9,6 +9,52 @@ from cachemonitor.observer_state import read_json
 from cachemonitor.model_evidence import home_key
 
 
+def test_observation_task_survives_launcher_exit(tmp_path):
+    import os
+    import socket
+    import pytest
+    from cachemonitor.observer_task import ObserverTask
+    if os.name != 'nt':
+        pytest.skip('Windows Task Scheduler lifecycle')
+    with socket.socket() as listener:
+        listener.bind(('127.0.0.1', 0))
+        port = listener.getsockname()[1]
+    assert port not in (8768, 8769)
+    home = tmp_path / 'home'
+    home.mkdir()
+    root = Path(__file__).resolve().parents[1]
+    manager = ObserverManager(home, tmp_path / 'data', url=f'http://127.0.0.1:{port}')
+    task = ObserverTask(home, role='CacheObservation')
+    command = [str(Path(sys.executable).with_name('pythonw.exe')), str(root / 'run.py'),
+               '--model-proxy', '--cache-observe-only', '--codex-home', str(home),
+               '--evidence-path', str(manager.evidence), '--observation-index',
+               str(tmp_path / 'data' / 'usage-index.sqlite'), '--port', str(port)]
+    launcher = tmp_path / 'launch.py'
+    launcher.write_text('import sys\nsys.path.insert(0, ' + repr(str(root)) + ')\n'
+                        'from cachemonitor.observer_task import ObserverTask\n'
+                        f'ObserverTask({str(home)!r}, role="CacheObservation").start({command!r})\n')
+    try:
+        # The launcher exits completely before the independent worker is checked.
+        subprocess.run([sys.executable, str(launcher)], check=True, timeout=30)
+        deadline = time.monotonic() + 20
+        health = None
+        while time.monotonic() < deadline:
+            health = manager.health(timeout=1)
+            if health:
+                break
+            time.sleep(.1)
+        assert health and health['cache_observation_only'] is True
+        assert health['requests'] == 0
+        state = task.inspect()
+        assert state['state'] == 4 and state['autostart'] is False
+        assert '--cache-observe-only' in state['arguments']
+        # No URL is installed merely by starting the observer.
+        assert not manager.config_path.exists()
+    finally:
+        task.stop()
+        task.remove()
+
+
 def test_managed_relay_is_one_process_and_explicit_off_drains_without_supervisor(tmp_path):
     import socket
     with socket.socket() as socket_:
