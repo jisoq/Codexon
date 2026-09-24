@@ -2,7 +2,7 @@
 from .cache_control import Control,control_path
 from .cache_execution import Journal
 from .core import Session
-from .cache_policy import cost_bounds
+from .cache_policy import cost_bounds,scoped_history
 from .cache_audit import observations
 from .pricing import token_cost
 import json
@@ -14,26 +14,30 @@ def enrich(sessions,index_path,now,homes=None):
     journal=None
     try:
         for session in sessions:
-            for row in session.get('history',[])[-1:]:
+            history=scoped_history(session.get('history',[]))
+            for row in history[-1:]:
                 control.profile(session['home'],session['id'],row)
             inputs=list(control.db.execute("SELECT turn,at FROM cache_inputs WHERE home=? AND sid=? AND kind='UserPromptSubmit' AND at>=? ORDER BY at",
                                            (session['home'],session['id'],now-60*86400)))
             turns={};firsts={}
-            for row in session.get('history',[]):
+            for row in history:
                 if row.get('purpose')!='maintenance':
                     turns[row.get('turn')]=row;firsts.setdefault(row.get('turn'),row)
             for i,(turn,at) in enumerate(inputs):
                 previous=turns.get(turn)
-                if previous is None:continue
+                if previous is None:
+                    # A submitted turn without usage is not a free/no-work gap.
+                    before=[r for r in history if r['ts']<=at]
+                    previous=dict(ts=at,policy_scope=before[-1]['policy_scope'] if before else None)
                 returned=i+1<len(inputs)
                 current=firsts.get(inputs[i+1][0]) if returned else previous
-                if current is None:continue
                 until=inputs[i+1][1] if returned else now
-                bounds=cost_bounds(previous,current,previous.get('output'))
+                bounds=cost_bounds(previous,current or {},previous.get('output'))
                 gap=dict(at=previous['ts'],seconds=max(0,until-previous['ts']),returned=returned,
                          benefit_lower=bounds['benefit_lower'] if bounds else None,
                          maintenance_upper=bounds['maintenance_upper'] if bounds else None,
-                         origin='submission',settled=returned)
+                         origin='submission',settled=returned,scope=previous['policy_scope'],
+                         comparison=bounds['bound_kind'] if bounds else 'required_observation_missing')
                 control.db.execute('INSERT OR REPLACE INTO cache_gaps VALUES(?,?,?,?)',
                                    (session['home'],session['id'],turn,json.dumps(gap)))
         journal=Journal(path)

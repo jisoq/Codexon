@@ -10,10 +10,11 @@ from .pricing import usd,token_cost
 from .quick_runtime import Confirmation
 
 REASONS={
-    'output_bound_not_verified':'출력·추론 상한 지원 확인 대기',
+    'output_bound_not_verified':'실행 경로 확인 필요 · 이력 추가만으로 활성화되지 않음',
+    'history_scope_unobserved':'현재 문맥과 자연 작업 이력 연결 대기',
     'output_budget_unobserved':'자연 작업의 출력 사용량 수집 대기',
     'input_or_price_unobserved':'비교 가능한 입력·요금 정보 수집 대기',
-    'natural_cost_bounds_unobserved':'자연 작업의 비교 자료 수집 대기',
+    'natural_cost_bounds_unobserved':'현재 비교 구간의 필수 사용량·비용 미관측',
     'need_independent_natural_return_history':'복귀 이력 수집 중',
     'no_positive_forward_estimate':'유지하지 않음 · 후속 구간의 예상 이득 없음',
     'natural_history_bounds':'유지 예약 · 자연 작업 이력 기준',
@@ -45,6 +46,8 @@ class CachePanel(Group):
         info=Text('자동 유지에는 프록시와 훅이 필요합니다. 유지 사용량은 전체 합계에 포함됩니다. '
                   '모델 변경 확인은 다음 요청에서 동작하며, 닫기·시간 초과는 그 요청을 중단합니다. 연결 장애 때는 확인을 건너뜁니다.')
         info.setWordWrap(True);layout.addWidget(info)
+        self.activation=Text('ChatGPT 자동 유지는 별도 실행 검증이 필요합니다. 출력·추론 상한 확인 또는 총비용을 보장하지 않는 운용 방식에 대한 별도 승인이 필요하며, 시험 호출은 자동으로 보내지 않습니다.')
+        self.activation.setWordWrap(True);layout.addWidget(self.activation)
         self.timer=QTimer(self);self.timer.setInterval(300);self.timer.timeout.connect(self.poll)
         if active:self.timer.start()
 

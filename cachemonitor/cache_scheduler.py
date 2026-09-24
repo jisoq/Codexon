@@ -36,20 +36,33 @@ class Scheduler:
 
     def invalidate(self):
         self.executor.ingress();self.executor.leave()
-        for job in self.jobs.values():job.cancel()
+        self.cancel_schedules()
         self.snapshots.clear()
+
+    def cancel_schedules(self):
+        for job in self.jobs.values():
+            if not job.done() and not job.cancelling():job.cancel()
 
     def policy(self,sid,snapshot):
         # API documentation does not establish this field for ChatGPT's backend.
         # A mock or explicitly verified provider can advertise the same contract.
         endpoint=urlsplit(snapshot['url'])
         supported=endpoint.hostname=='api.openai.com' or self.control.get('bounded_provider:'+endpoint.netloc,False)
-        if not supported:return dict(state='waiting',reason='output_bound_not_verified')
+        if not supported:return dict(state='waiting',reason='output_bound_not_verified',calls=0,
+            activation='verify_total_output_limit_or_approve_separate_risk_policy',
+            history_can_unlock=False,model=snapshot['row'].get('model'),
+            transport='websocket' if snapshot['websocket'] else 'http')
         rows=[Gap(**json.loads(r[0])) for r in self.control.db.execute('SELECT data FROM cache_gaps WHERE home=? AND sid=?',(self.home,sid))]
         rows=[g for g in rows if g.at>=time.time()-60*86400]
         row=snapshot['row'];profile=self.control.latest(self.home,sid)
-        if profile and profile['key']==row['key'] and not row.get('service_tier'):
-            row={**row,'service_tier':profile.get('service_tier')};snapshot['row']=row
+        if not profile or profile['key']!=row['key'] or not profile.get('policy_scope'):
+            return dict(state='waiting',reason='history_scope_unobserved')
+        row={**row,'service_tier':row.get('service_tier') or profile.get('service_tier'),
+             'compaction_epoch':profile.get('compaction_epoch')};snapshot['row']=row
+        # Do not mix old model/effort/context regimes with the current context.
+        # Unclassified legacy records inside this regime remain unknown, not free.
+        rows=[g for g in rows if g.scope==profile['policy_scope'] or
+              (g.scope is None and g.at>=profile['policy_scope_start'])]
         output_cap=row.get('output')
         if type(output_cap) is not int or output_cap<=0:return dict(state='waiting',reason='output_budget_unobserved')
         # UTF-8 serialized suffix size is a conservative token-count scenario,
@@ -61,7 +74,8 @@ class Scheduler:
         if not bounds:return dict(state='waiting',reason='input_or_price_unobserved')
         # Reprice every historical maintenance against this session's size/budget.
         rows=[Gap(g.at,g.seconds,g.returned,min(g.benefit_lower,bounds['benefit_lower']) if g.benefit_lower is not None else None,
-                  bounds['maintenance_upper'],g.origin,g.settled) for g in rows]
+                  max(g.maintenance_upper,bounds['maintenance_upper']) if g.maintenance_upper is not None else None,
+                  g.origin,g.settled,g.scope,g.comparison) for g in rows]
         caps=[int(g.benefit_lower/bounds['maintenance_upper']) for g in rows if type(g.benefit_lower) in (int,float) and bounds['maintenance_upper']>0]
         decision=decide(rows,latency_bound=30,scheduler_slack=1,max_calls=max(1,min(100,max(caps,default=1))))
         return {**decision,**bounds,'latency_bound':30}
@@ -69,6 +83,8 @@ class Scheduler:
     async def maintain(self,sid,snapshot,decision,revision):
         rid=snapshot['response']['id'];anchor=snapshot['anchor']
         for round_number in range(decision['calls']):
+            if (self.closed or not self.control.get('automatic',False) or
+                    self.executor.generation!=snapshot['generation'] or self.control.revision(self.home)!=revision):break
             result=await self.executor.run(self.home,sid,rid,snapshot['url'],snapshot['headers'],anchor=anchor,
                 deadline=anchor+decision['interval'],latency_bound=decision['latency_bound'],websocket=snapshot['websocket'],
                 round_number=round_number,max_output_tokens=decision['output_cap'],
@@ -86,13 +102,14 @@ class Scheduler:
         self.stopped.add((sid,rid))
 
     async def tick(self):
+        if self.closed:return
         now=self.clock();revision=self.control.revision(self.home)
         if not self.control.get('automatic',False):
             self.invalidate();self.executor.contexts.clear();self.last_tick=now;self.revision=revision
             return
         if now-self.last_tick>5 or revision!=self.revision:
             # Cancel old schedules, but a new Stop may release the latest captured request.
-            for task in self.jobs.values():task.cancel()
+            self.cancel_schedules()
             self.snapshots={s:v for s,v in self.snapshots.items() if v['revision']==revision}
             if now-self.last_tick>5:
                 self.executor.ingress();self.executor.leave();self.snapshots.clear()
@@ -120,6 +137,6 @@ class Scheduler:
 
     async def close(self):
         self.closed=True;self.executor.close()
-        for task in self.jobs.values():task.cancel()
+        self.cancel_schedules()
         await asyncio.gather(*self.jobs.values(),return_exceptions=True)
         self.control.close();self.journal.close()
