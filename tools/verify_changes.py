@@ -209,7 +209,7 @@ PACKAGE_PATTERNS = (
     'run.py', 'start.ps1', 'tools/Build-*.ps1', 'tools/*install*.py', 'tools/prepare_bad_runtime.py',
     'tools/package_release.py', 'tools/collect_notices.py', 'tools/prepare_sources.py',
     'tools/verify_recovery.py', 'tools/verify_gui_handoff.py', 'tools/configure-app-task.ps1',
-    'cachemonitor/install*.py', 'cachemonitor/app.py', 'cachemonitor/app_update.py',
+    'cachemonitor/install*.py', 'cachemonitor/app.py', 'cachemonitor/app_update.py', 'cachemonitor/app_restart.py',
     'cachemonitor/version.py', 'cachemonitor/runtime_check.py', 'cachemonitor/launch_context.py',
     'cachemonitor/windows_integration.py', 'cachemonitor/shell_shortcut.py',
 )

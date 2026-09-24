@@ -40,6 +40,8 @@ def test_calculation_protocol_and_unknown_changes_have_explicit_gates():
     version = select_tests({'cachemonitor/version.py'})
     assert version['package_impact'] and version['proxy_impact']
     assert 'tests/test_proxy_update.py' in version['tests']
+    restart = select_tests({'cachemonitor/app_restart.py'})
+    assert restart['package_impact'] and not restart['proxy_impact']
     unknown = select_tests({'cachemonitor/unmapped_new.py'})
     assert unknown['unmapped'] == ('cachemonitor/unmapped_new.py',)
     assert not unknown['full']

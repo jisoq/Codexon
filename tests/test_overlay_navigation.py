@@ -52,6 +52,14 @@ def test_calculation_labels_open_one_line_without_changing_navigation(tmp_path):
             assert received[-1].call_id==data['latest']['id']
             assert not links.qml_errors
             links.view.navigationRequested.disconnect(received.append)
+        # Outside-click dismissal closes a reusable Qt.Popup. Its scope listener
+        # must still hide it after reopening and changing the selected session.
+        note.present(links,'cache','최근 호출 캐시 읽기 ÷ 입력 × 100',QPoint(100,100))
+        note.close();assert not note.isVisible()
+        note.present(links,'cache','최근 호출 캐시 읽기 ÷ 입력 × 100',QPoint(100,100))
+        assert note.isVisible()
+        window.set_content(dict(data,id='another-session'))
+        assert not note.isVisible()
         window.set_content(data);detail.resize(240,800);detail.show();QTest.qWait(30)
         labels=window.content_model.detail_links()
         speed=next(r for r in labels if r.get('formula')=='선택 호출 출력 토큰 ÷ 소요 시간')

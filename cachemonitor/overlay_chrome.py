@@ -339,10 +339,6 @@ class CalculationNote(QWidget):
         if event.key()==Qt.Key_Escape:self.hide();event.accept()
         else:super().keyPressEvent(event)
 
-    def closeEvent(self,event):
-        self.content.changed.disconnect(self.refresh_scope);super().closeEvent(event)
-
-
 class NavigationModel(Node):
     navigationRequested=Signal(object)
     calculationRequested=Signal(str,str,float,float)
