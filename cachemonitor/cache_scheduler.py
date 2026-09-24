@@ -18,14 +18,14 @@ class Scheduler:
         self.continuous_capture=continuous_capture
         self.home=str(home);self.control=Control(path);self.journal=Journal(path)
         self.executor=Executor(self.journal,Contexts(),observation_only=observation_only,**({'send':send} if send else {}))
-        self.capture=RelayCapture(self.executor,self.snapshot,lambda:self.continuous_capture or self.observation_only or self.control.get('automatic',False))
+        self.capture=RelayCapture(self.executor,self.snapshot,lambda:self.continuous_capture or self.observation_only or self.control.enabled('automatic'))
         self.capture.analysis_revision=2
         self.clock=clock;self.snapshots={};self.jobs={};self.stopped=set();self.evaluations={}
         self.revision=self.control.revision(self.home);self.last_tick=clock();self.closed=False
         self.control.db.execute('DELETE FROM cache_status WHERE home=?',(self.home,))
 
     def snapshot(self,request,response,anchor,url,headers,websocket,generation=None):
-        if not self.continuous_capture and not self.observation_only and not self.control.get('automatic',False):return
+        if not self.continuous_capture and not self.observation_only and not self.control.enabled('automatic'):return
         sid=request.get('prompt_cache_key')
         if not isinstance(sid,str) or not sid:return
         header_sid=next((v for k,v in headers.items() if k.lower()=='session_id'),sid)
@@ -157,7 +157,7 @@ class Scheduler:
 
     async def diagnostic_tick(self):
         key=self.control.get('diagnostic_request')
-        if not key or self.observation_only:return
+        if not key or self.observation_only or not self.control.get('enabled',True):return
         grant=next((g for g in self.journal.operations.grants(self.home) if g['id']==key),None)
         if not grant or grant.get('purpose')!='diagnostic':
             self.control.set('diagnostic_request',None);return
@@ -175,7 +175,7 @@ class Scheduler:
             self.control.set('diagnostic_request',None)
             async def run(sid=sid,snapshot=snapshot,decision=decision):
                 revision=self.control.revision(self.home)
-                def valid():return self.idle(sid,snapshot) and self.control.revision(self.home)==revision
+                def valid():return self.control.get('enabled',True) and self.idle(sid,snapshot) and self.control.revision(self.home)==revision
                 result=await self.executor.run(self.home,sid,snapshot['response']['id'],decision['execution_url'],snapshot['headers'],
                     anchor=snapshot['anchor'],deadline=time.monotonic(),latency_bound=30,websocket=False,
                     operation=decision['operation'],observed_tier=snapshot['row'].get('service_tier'),
@@ -187,10 +187,10 @@ class Scheduler:
     async def maintain(self,sid,snapshot,decision,revision):
         rid=snapshot['response']['id'];anchor=snapshot['anchor']
         for round_number in range(decision['calls']):
-            if (self.closed or not self.control.get('automatic',False) or
+            if (self.closed or not self.control.enabled('automatic') or
                     self.executor.generation!=snapshot['generation'] or self.control.revision(self.home)!=revision):break
             def valid():
-                if not self.control.get('automatic',False) or self.control.revision(self.home)!=revision:return False
+                if not self.control.enabled('automatic') or self.control.revision(self.home)!=revision:return False
                 if decision.get('operation'):
                     grant=self.journal.operations.permission(decision['operation']['scope'])
                     if not grant or grant['id']!=decision['operation']['id']:return False
@@ -229,7 +229,7 @@ class Scheduler:
             self.control.set('worker_heartbeat',time.time())
             self.control.set('worker_snapshots',len(self.snapshots))
             await self.diagnostic_tick()
-        if self.observation_only or (self.continuous_capture and not self.control.get('automatic',False)):
+        if self.observation_only or (self.continuous_capture and not self.control.enabled('automatic')):
             for sid,snapshot in list(self.snapshots.items()):
                 if time.monotonic()-snapshot['anchor']>=1800:
                     self.snapshots.pop(sid,None)
@@ -247,7 +247,7 @@ class Scheduler:
                     'snapshot':snapshot['response']['id'],'observed_at':snapshot['row']['ts']})
             return
         now=self.clock();revision=self.control.revision(self.home)
-        if not self.control.get('automatic',False):
+        if not self.control.enabled('automatic'):
             self.invalidate();self.executor.contexts.clear();self.last_tick=now;self.revision=revision
             return
         if now-self.last_tick>5 or revision!=self.revision:
@@ -264,7 +264,7 @@ class Scheduler:
             if (sid,snapshot['response']['id']) in self.stopped:continue
             latest=self.control.db.execute('SELECT kind,at FROM cache_inputs WHERE home=? AND sid=? ORDER BY rowid DESC LIMIT 1',(self.home,sid)).fetchone()
             if not latest or latest[0]!='Stop' or latest[1]<snapshot['row']['request_start']:continue
-            if not self.control.get('automatic',False):continue
+            if not self.control.enabled('automatic'):continue
             previous=self.evaluations.get(sid)
             if previous and previous[0]==snapshot['response']['id'] and now-previous[1]<60:continue
             self.evaluations[sid]=(snapshot['response']['id'],now)

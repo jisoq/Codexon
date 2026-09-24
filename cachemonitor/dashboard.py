@@ -31,7 +31,7 @@ from .version import VERSION
 from .i18n import tr, Verbatim
 
 STYLE = ''
-TITLES = ('사용 현황','조건 비교','세션 기록','사용 한도','설정')
+TITLES = ('사용 현황','조건 비교','세션 기록','사용 한도','설정','캐시 관리')
 PERIODS = [('최근 30분','30m'),('오늘','today'),('최근 7일','7d'),('최근 30일','30d'),('전체 기록','all'),('직접 지정','custom')]
 INPUT_BANDS = [('전체 입력 길이',''),('10k 미만','0:10000'),('10–50k','10000:50000'),('50–100k','50000:100000'),('100–200k','100000:200000'),('200–272k','200000:272001'),('272k 초과','272001:inf')]
 CALL_FILTERS = [('미산정','unpriced'),('모드 기록 없음','unknown_mode'),('모델명 불일치','model_mismatch'),('기록 누락·충돌','observation_problem'),('캐시 읽기 0','cache_zero'),('캐시 저하 의심','cache_degradation'),('HTTP/SSE','http')]
@@ -166,7 +166,7 @@ class Dashboard(TrayWindow):
         self.health=label('','muted',True);self.health.hide()
         self.setup_tray();self.settings_page.bind_tray(self);self.tray.messageClicked.connect(self.open_notification_details)
         self.tick=QTimer(self);self.tick.timeout.connect(self.check_stale);self.tick.start(1000)
-        self.nav.currentRowChanged.connect(self.change_page)
+        self.nav.currentRowChanged.connect(lambda row:self.change_page(5 if row==4 else row) if row>=0 else None)
         for node in (self.home,self.period,self.project,self.source,self.model,self.effort,self.mode):node.currentIndexChanged.connect(self.filter_changed)
         for node in (self.date_start,self.date_end):node.dateChanged.connect(self.filter_changed)
         self.archive.toggled.connect(self.filter_changed)
@@ -375,7 +375,7 @@ class Dashboard(TrayWindow):
         except (ValueError,TypeError,KeyError):pass
 
     def capture_state(self):
-        return dict(design_version=3,comparison_selection=getattr(self,'comparison_selection',None),compare_model=self.compare_model.currentData(),page=self.current_page,settings_category=self.settings_page.navigation.currentRow(),
+        return dict(design_version=3,comparison_selection=getattr(self,'comparison_selection',None),compare_model=self.compare_model.currentData(),page=self.current_page,settings_category=self.settings_page.stack.currentIndex(),
             common={key:getattr(self,key).currentData() for key in ('home','period','project','source')},
             archive=self.archive.isChecked(),dates=[self.date_start.text(),self.date_end.text()],
             page_filters=copy.deepcopy(self.page_filters),targets=copy.deepcopy(self.targets),baseline=self.baseline,
@@ -425,9 +425,11 @@ class Dashboard(TrayWindow):
         self.search.setText(state.get('search',''));self.outside.setChecked(state.get('outside',False))
         for key,node in self.call_filter_controls.items():node.setChecked(key in state.get('call_filters',[]))
         for key,node in self.extra_column_controls.items():node.setChecked(key in state.get('extras',[]))
-        self.temporary_context=None if initial else state.get('temporary');self.current_page=min(3 if initial else 4,state.get('page',0))
+        self.temporary_context=None if initial else state.get('temporary');self.current_page=max(0,min(5,state.get('page',0)))
+        if self.current_page==5 and not self.cache_master.isChecked():self.current_page=0
+        if initial and self.current_page==4:self.current_page=0
         self.exact_record=None;self.record_request+=1;self._revealed_call=None
-        self.settings_page.navigation.setCurrentRow(state.get('settings_category',0))
+        self.settings_page.reveal(max(0,min(6,state.get('settings_category',0))))
         for key,attr in (('model','model'),('effort','effort'),('service_tier','mode')):
             choose(getattr(self,attr),self.page_filters.get(self.current_page,{}).get(key,''))
         self._restore_positions=state
@@ -566,9 +568,10 @@ class Dashboard(TrayWindow):
         if self.restoring:return
         if self.current_page in (0,2):
             self.page_filters[self.current_page]={key:getattr(self,attr).currentData() for key,attr in (('model','model'),('effort','effort'),('service_tier','mode'))}
-        self.current_page=max(0,min(4,index));self.pages.setCurrentIndex(self.current_page);self.heading.setText(TITLES[self.current_page])
+        if index==5 and not self.cache_master.isChecked():index=4
+        self.current_page=max(0,min(5,index));self.pages.setCurrentIndex(self.current_page);self.heading.setText(TITLES[self.current_page])
         self.restoring=True
-        self.nav.setCurrentRow(self.current_page if self.current_page<4 else -1)
+        self.nav.setCurrentRow(4 if self.current_page==5 else self.current_page if self.current_page<4 else -1)
         for key,attr in (('model','model'),('effort','effort'),('service_tier','mode')):
             if self.current_page in (0,2):choose(getattr(self,attr),self.page_filters[self.current_page].get(key,''))
         self.restoring=False
@@ -1425,6 +1428,15 @@ class Dashboard(TrayWindow):
         body.addWidget(label('가격 별칭: gpt-5.6, gpt-daybreak-blue-latest → gpt-5.6-sol · gpt-5.4-mini-2026-03-17 → gpt-5.4-mini · gpt-5.5-2026-04-23 → gpt-5.5','muted',True))
         buttons=DialogButtons(DialogButtons.Close);buttons.rejected.connect(dialog.reject);body.addWidget(buttons);dialog.open();self.price_dialog=dialog
 
+    def set_cache_enabled(self,enabled):
+        self.cache_panel.set_enabled(enabled)
+        blocked=self.nav.blockSignals(True)
+        self.nav.clear();self.nav.addItems(TITLES[:4]+(('캐시 관리',) if enabled else ()))
+        self.nav.setMaximumHeight(270 if enabled else 220)
+        self.nav.setCurrentRow(4 if enabled and self.current_page==5 else self.current_page if self.current_page<4 else -1)
+        self.nav.blockSignals(blocked)
+        if not enabled and self.current_page==5:self.change_page(4)
+
     def build_settings(self):
         from .settings_page import SettingsPage
         from .controls import Switch
@@ -1434,7 +1446,15 @@ class Dashboard(TrayWindow):
         self.settings_page.add_widget(3, self.observer_panel)
         from .cache_panel import CachePanel
         self.cache_panel=CachePanel(self.observer_home,self.index_path,active=self.cache_control_enabled,parent=self)
-        self.settings_page.add_widget(6,self.cache_panel)
+        cache_scroll=Scroll();cache_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        cache_scroll.setWidget(self.cache_panel);self.pages.addWidget(cache_scroll);self.scrollers[5]=cache_scroll
+        self.cache_master=Switch()
+        self.cache_master.setChecked(self.cache_panel.control.get('enabled',
+            self.cache_panel.control.get('automatic',False) or self.cache_panel.control.get('guard',False)))
+        self.cache_master.setEnabled(self.cache_control_enabled)
+        self.settings_page.add_row(6,'캐시 관리','전용 탭에서 자동 유지와 모델 변경 확인을 각각 설정합니다. 끄면 두 기능이 모두 중지됩니다.',self.cache_master)
+        self.cache_master.toggled.connect(self.set_cache_enabled)
+        self.set_cache_enabled(self.cache_master.isChecked())
         self.observer_panel.status_observed.connect(self.cache_panel.proxy_status)
         legacy_notifications = self.settings.value('notifications',True,type=bool)
         self.notification_master = Switch()

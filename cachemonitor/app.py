@@ -45,6 +45,13 @@ def main():
     parser.add_argument("--smoke-depth", choices=('core','full'), default='full',
                         help="Choose the compact release check or full interaction probe")
     args = parser.parse_args()
+    from .launch_context import cache_paths,save_cache_paths
+    control_only=any((args.enable_model_observer,args.disable_model_observer,args.model_observer_status,args.test_model_observer))
+    if not (args.smoke or args.verify_handoff or args.snapshot or args.index_path or control_only):
+        saved=cache_paths()
+        for key,value in saved.items():
+            if getattr(args,key) is None:setattr(args,key,value)
+        if saved.get('index_path'):args.cache_control=True
     if args.cache_control and not (args.smoke or args.verify_handoff) and not args.quota_path:
         from .quota_cycles import ledger_path
         args.quota_path=str(ledger_path())
@@ -124,6 +131,8 @@ def main():
         smoke_settings = startup_settings if args.verify_handoff else QSettings(str(Path(smoke_directory.name)/'settings.ini'),QSettings.IniFormat)
         if args.index_path is None:args.index_path=str(Path(smoke_directory.name)/'index.sqlite')
     if not isolated:save_homes(homes)
+    if args.cache_control and not (args.smoke or args.verify_handoff):
+        save_homes(homes);save_cache_paths(args.index_path,args.evidence_path,args.quota_path)
     window = Dashboard(homes,index_path=args.index_path,model_evidence_path=args.evidence_path,quota_path=args.quota_path,
         cache_control=args.cache_control or (not args.smoke and args.index_path is None),
         live_limits=not (args.smoke or args.verify_handoff),manage_observer=not args.smoke and args.index_path is None, **({'settings':smoke_settings} if smoke_settings else {}))

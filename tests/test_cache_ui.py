@@ -13,6 +13,54 @@ from test_cache_management import body,response
 from cachemonitor.cache_operating import target
 
 
+def test_master_switch_navigation_and_independent_features(tmp_path):
+    from PySide6.QtCore import QSettings
+    from cachemonitor.dashboard import Dashboard
+    from test_ui import snapshot
+    from cachemonitor.fonts import load_bundled_fonts
+    app=QApplication.instance() or QApplication([]);load_bundled_fonts()
+    previous=app.property('cachemonitorDisableShellIntegration');app.setProperty('cachemonitorDisableShellIntegration',True)
+    settings=QSettings(str(tmp_path/'settings.ini'),QSettings.IniFormat)
+    settings.setValue('ui/theme','light')
+    def create():
+        window=Dashboard(['fixture'],start_worker=False,settings=settings,index_path=tmp_path/'index.sqlite',
+                         cache_control=True,static_snapshot=snapshot(),live_limits=False)
+        window.show();QTest.qWait(80);return window
+    def close(window):
+        window.cache_panel.stop();window.observer_panel.stop();window.quitting=True;window.tick.stop();window.tray.hide();window.close()
+    window=create()
+    try:
+        assert window.nav.count()==4
+        window.open_settings();window.settings_page.reveal(6);QTest.qWait(60)
+        assert window.settings_page.navigation.currentText()=='캐시 관리'
+        assert [window.settings_page.navigation.itemText(i) for i in range(7)]==[
+            '일반','작업표시줄 위젯','세션 오버레이','캐시 관리','알림','프록시','정보·문제 해결']
+        click(window,control(window,window.cache_master));assert window.nav.count()==5
+        window.nav.setCurrentRow(4);QTest.qWait(80)
+        assert window.current_page==5 and window.heading.text()=='캐시 관리'
+        panel=window.cache_panel
+        click(window,control(window,panel.toggles['guard']))
+        assert panel.control.enabled('guard') and not panel.control.enabled('automatic')
+        click(window,control(window,panel.toggles['automatic']))
+        assert panel.control.enabled('guard') and panel.control.enabled('automatic')
+        assert window.grab().save(str(tmp_path/'cache-dashboard.png'))
+        window.resize(1000,700);QTest.qWait(100)
+        assert window.grab().save(str(tmp_path/'cache-dashboard-small.png'))
+        window.cache_master.setChecked(False)
+        assert window.current_page==4 and window.nav.count()==4
+        assert not panel.control.enabled('guard') and not panel.control.enabled('automatic')
+        assert panel.control.get('selection:guard') and panel.control.get('selection:automatic')
+        assert not panel.control.get('guard') and not panel.control.get('automatic')
+        assert not window.qml_errors
+        close(window);window=create()
+        assert not window.cache_master.isChecked() and window.nav.count()==4
+        window.cache_master.setChecked(True)
+        assert window.cache_panel.control.enabled('guard') and window.cache_panel.control.enabled('automatic')
+        assert not window.cache_panel.journal.operations.grants()
+    finally:
+        close(window);app.setProperty('cachemonitorDisableShellIntegration',previous)
+
+
 def test_rendered_hook_approval_cancel_close_timeout_and_disconnect(tmp_path):
     app=QApplication.instance() or QApplication([])
     panel=CachePanel('home',tmp_path/'index.sqlite',active=True)

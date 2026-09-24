@@ -48,6 +48,18 @@ def test_durable_hook_exact_choice_timeout_disconnect(tmp_path):
     control.close()
 
 
+def test_master_disabled_hook_observes_without_confirmation(tmp_path):
+    path=tmp_path/'control.sqlite';control=Control(path)
+    control.profile('home','s',dict(profile(),written=0));control.set('guard',True);control.set('enabled',False)
+    control.set('ui_heartbeat',time.time())
+    event=dict(hook_event_name='UserPromptSubmit',session_id='s',turn_id='off',model='gpt-6-sol')
+    assert control.guard_needed('home',event)
+    assert hook_decision(path,'home',event)=={}
+    assert control.db.execute('SELECT COUNT(*) FROM cache_inputs').fetchone()[0]==1
+    assert not control.requests()
+    control.close()
+
+
 def test_natural_history_to_policy_no_maintenance_prerequisite(tmp_path):
     now=time.time();path=tmp_path/'index.sqlite';control=Control(control_path(path))
     session=Session('s','home')

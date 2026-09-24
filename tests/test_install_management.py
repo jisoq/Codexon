@@ -70,3 +70,11 @@ def test_login_startup_preserves_custom_home_and_disabled_or_unrelated_values():
     assert 'old folder' not in changed
     for unrelated in ('', '"C:\\pythonw.exe" run.py --hidden'):
         assert install.startup_replacement(unrelated,Path('C:/new/Codexon.exe'))==unrelated
+def test_cache_launch_paths_survive_home_update(tmp_path):
+    from cachemonitor.launch_context import save_cache_paths,cache_paths,save_homes,resolve_homes
+    path=tmp_path/'launch.json'
+    index=tmp_path/'observation'/'index.sqlite';quota=tmp_path/'original-quota.sqlite';evidence=tmp_path/'evidence.sqlite'
+    save_cache_paths(index,evidence,quota,path=path)
+    save_homes([tmp_path/'home'],path=path)
+    assert cache_paths(path=path)==dict(index_path=str(index),evidence_path=str(evidence),quota_path=str(quota))
+    assert resolve_homes(path=path)==[str(tmp_path/'home')]

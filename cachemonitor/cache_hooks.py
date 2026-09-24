@@ -8,8 +8,10 @@ import sys
 MARKER='codexon-cache-control'
 
 
-def command(database,observe_only=False):
-    if getattr(sys,'frozen',False):
+def command(database,observe_only=False,executable=None):
+    if executable:
+        parts=[str(Path(executable).resolve()),'--cache-hook']
+    elif getattr(sys,'frozen',False):
         parts=[str(Path(sys.executable).with_name('CodexonHook.exe')),'--cache-hook']
     else:parts=[sys.executable,str(Path(__file__).resolve().parents[1]/'run.py'),'--cache-hook']
     parts+=['--database',str(Path(database).resolve())]
@@ -17,13 +19,13 @@ def command(database,observe_only=False):
     return subprocess.list2cmdline(parts), '& '+' '.join("'"+p.replace("'","''")+"'" for p in parts)
 
 
-def configure(home,database,enabled,*,observe_only=False):
+def configure(home,database,enabled,*,observe_only=False,executable=None):
     path=Path(home)/'hooks.json'
     original=path.read_bytes() if path.exists() else None
     document=json.loads(original.decode('utf-8-sig')) if original else {}
     hooks=document.setdefault('hooks',{})
     if not isinstance(hooks,dict):raise ValueError('Invalid hooks.json')
-    normal,windows=command(database,observe_only)
+    normal,windows=command(database,observe_only,executable)
     for event in ('UserPromptSubmit','Stop'):
         entries=hooks.get(event,[])
         if not isinstance(entries,list):raise ValueError('Invalid hook entries')
