@@ -1,6 +1,7 @@
 """Managed proxy lifecycle owns this scheduler; no independent polling collector."""
 import asyncio
 import json
+import sqlite3
 import time
 from urllib.parse import urlsplit
 
@@ -278,7 +279,9 @@ class Scheduler:
                 if self.continuous_capture:self.control.set('worker_error',False)
             except Exception:
                 self.invalidate()
-                if self.continuous_capture:self.control.set('worker_error',True)
+                if self.continuous_capture:
+                    try:self.control.set('worker_error',True)
+                    except (sqlite3.Error,OSError):pass
             await asyncio.sleep(.2)
 
     async def close(self):

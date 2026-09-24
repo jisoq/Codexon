@@ -13,6 +13,20 @@ from test_cache_management import body,response
 from cachemonitor.cache_operating import target
 
 
+def test_panel_recovers_after_temporary_storage_error(tmp_path,monkeypatch):
+    import sqlite3
+    app=QApplication.instance() or QApplication([])
+    panel=CachePanel('home',tmp_path/'index.sqlite',active=True)
+    original=panel.control.requests
+    try:
+        monkeypatch.setattr(panel.control,'requests',lambda:(_ for _ in ()).throw(sqlite3.OperationalError('database is locked')))
+        panel.poll();assert panel.timer.isActive()
+        monkeypatch.setattr(panel.control,'requests',original)
+        panel.poll();assert panel.control.get('ui_heartbeat')>=time.time()-1
+        assert panel.timer.isActive()
+    finally:panel.stop()
+
+
 def test_master_switch_navigation_and_independent_features(tmp_path):
     from PySide6.QtCore import QSettings
     from cachemonitor.dashboard import Dashboard

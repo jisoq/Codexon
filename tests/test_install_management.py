@@ -78,3 +78,17 @@ def test_cache_launch_paths_survive_home_update(tmp_path):
     save_homes([tmp_path/'home'],path=path)
     assert cache_paths(path=path)==dict(index_path=str(index),evidence_path=str(evidence),quota_path=str(quota))
     assert resolve_homes(path=path)==[str(tmp_path/'home')]
+
+
+def test_cache_launch_paths_are_shared_across_msix_localappdata_views(tmp_path,monkeypatch):
+    from cachemonitor import launch_context as launch
+    monkeypatch.setattr(launch.Path,'home',lambda:tmp_path)
+    first=tmp_path/'msix';second=tmp_path/'ordinary'
+    monkeypatch.setenv('LOCALAPPDATA',str(first))
+    legacy=first/'CacheMonitor'/'launch.json';legacy.parent.mkdir(parents=True)
+    legacy.write_text(json.dumps({'homes':['legacy-home']}))
+    assert launch.resolve_homes()==['legacy-home']
+    launch.save_cache_paths(tmp_path/'index.sqlite',tmp_path/'e.sqlite',tmp_path/'quota.sqlite')
+    monkeypatch.setenv('LOCALAPPDATA',str(second))
+    assert launch.resolve_homes()==['legacy-home']
+    assert launch.cache_paths()['quota_path']==str(tmp_path/'quota.sqlite')

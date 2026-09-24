@@ -60,6 +60,24 @@ def test_master_disabled_hook_observes_without_confirmation(tmp_path):
     control.close()
 
 
+def test_worker_recovers_when_error_reporting_also_hits_a_database_lock(tmp_path,monkeypatch):
+    import sqlite3
+    scheduler=Scheduler('home',tmp_path/'control.sqlite',continuous_capture=True)
+    original=scheduler.control.set;attempts=[]
+    def write(key,value):
+        attempts.append(key)
+        if len(attempts)<=2:raise sqlite3.OperationalError('database is locked')
+        original(key,value)
+        if key=='worker_error' and value is False:scheduler.closed=True
+    monkeypatch.setattr(scheduler.control,'set',write)
+    async def run():
+        await asyncio.wait_for(scheduler.serve(),2)
+        assert scheduler.control.get('worker_heartbeat')
+        await scheduler.close()
+    asyncio.run(run())
+    assert attempts[:2]==['worker_heartbeat','worker_error']
+
+
 def test_natural_history_to_policy_no_maintenance_prerequisite(tmp_path):
     now=time.time();path=tmp_path/'index.sqlite';control=Control(control_path(path))
     session=Session('s','home')
