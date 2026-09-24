@@ -13,16 +13,17 @@ from .core import usage_values
 
 
 class Scheduler:
-    def __init__(self,home,path,*,send=None,clock=time.monotonic):
+    def __init__(self,home,path,*,send=None,clock=time.monotonic,observation_only=False):
+        self.observation_only=observation_only
         self.home=str(home);self.control=Control(path);self.journal=Journal(path)
-        self.executor=Executor(self.journal,Contexts(),**({'send':send} if send else {}))
-        self.capture=RelayCapture(self.executor,self.snapshot,lambda:self.control.get('automatic',False))
+        self.executor=Executor(self.journal,Contexts(),observation_only=observation_only,**({'send':send} if send else {}))
+        self.capture=RelayCapture(self.executor,self.snapshot,lambda:self.observation_only or self.control.get('automatic',False))
         self.clock=clock;self.snapshots={};self.jobs={};self.stopped=set();self.evaluations={}
         self.revision=self.control.revision(self.home);self.last_tick=clock();self.closed=False
         self.control.db.execute('DELETE FROM cache_status WHERE home=?',(self.home,))
 
     def snapshot(self,request,response,anchor,url,headers,websocket,generation=None):
-        if not self.control.get('automatic',False):return
+        if not self.observation_only and not self.control.get('automatic',False):return
         sid=request.get('prompt_cache_key')
         if not isinstance(sid,str) or not sid:return
         header_sid=next((v for k,v in headers.items() if k.lower()=='session_id'),sid)
@@ -106,6 +107,7 @@ class Scheduler:
         decision=decide(rows,latency_bound=30,scheduler_slack=1,max_calls=max_calls)
         if scenarios:
             result={**decision,**scenarios,'latency_bound':30}
+            if self.observation_only:return {**result,'policy_state':decision['state'],'state':'observing','execution_disabled':True}
             if decision['state']!='eligible':return result
             proposal=self.journal.operations.propose(scope,scenarios['maintenance_expected'],
                 scenarios['maintenance_adverse'],scenarios['output_high'],scenarios['basis'])
@@ -159,6 +161,20 @@ class Scheduler:
 
     async def tick(self):
         if self.closed:return
+        if self.observation_only:
+            for sid,snapshot in list(self.snapshots.items()):
+                if time.monotonic()-snapshot['anchor']>=1800:
+                    self.snapshots.pop(sid,None)
+                    rid=snapshot['response']['id'];item=self.executor.contexts.responses.pop(rid,None)
+                    if item:self.executor.contexts.size-=item[2]
+                    self.executor.contexts.usage.pop(rid,None)
+                    continue
+                previous=self.evaluations.get(sid)
+                if previous and previous[0]==snapshot['response']['id'] and time.monotonic()-previous[1]<5:continue
+                self.evaluations[sid]=(snapshot['response']['id'],time.monotonic())
+                self.control.status(self.home,sid,{**self.policy(sid,snapshot),'observation_only':True,
+                    'snapshot':snapshot['response']['id'],'observed_at':snapshot['row']['ts']})
+            return
         now=self.clock();revision=self.control.revision(self.home)
         if not self.control.get('automatic',False):
             self.invalidate();self.executor.contexts.clear();self.last_tick=now;self.revision=revision

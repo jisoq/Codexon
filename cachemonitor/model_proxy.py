@@ -159,6 +159,7 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
     health={'requests':0,'responses':0,'storage_errors':0,'relay_errors':0,'forwarded_response_frames':0,
             'client_disconnects':0,'observation_skips':0,'storage_failure_streak':0,'internal_failure_streak':0,
             'observation_enabled':True,'draining':False,'control_id':control_id,'cache_management':cache_capture is not None,
+            'cache_observation_only':bool(cache_capture and cache_capture.executor.observation_only),
             'forwarded_http_requests':0,'forwarded_http_responses':0,
             'service':'cachemonitor-model-observer',
             'version':PROXY_VERSION,'instance':uuid.uuid4().hex,'pid':os.getpid(),
@@ -476,6 +477,8 @@ def main():
     parser.add_argument('--control-file',type=Path)
     parser.add_argument('--control-id',default='')
     parser.add_argument('--managed',action='store_true')
+    parser.add_argument('--cache-observe-only',action='store_true',help='Capture natural context; disable ALL maintenance execution')
+    parser.add_argument('--observation-index',type=Path,help='Existing sanitized usage index copy for observation profiles')
     args=parser.parse_args()
     if args.evidence_path.resolve().is_relative_to(Path(args.codex_home).resolve()):
         parser.error('Evidence must be stored outside the Codex home')
@@ -484,7 +487,39 @@ def main():
     if args.upstream_url:endpoint=args.upstream_url
     context=ssl.create_default_context(cafile=str(args.upstream_ca)) if args.upstream_ca else None
     try:
-        if args.managed:
+        if args.cache_observe_only:
+            if args.managed or args.control_file or not args.observation_index:
+                parser.error('Observation requires its own index and unmanaged listener')
+            from .cache_scheduler import Scheduler
+            from .index import UsageIndex
+            from concurrent.futures import ThreadPoolExecutor
+            scheduler=Scheduler(args.codex_home,args.observation_index.with_name('cache-control.sqlite'),observation_only=True)
+            app=create_app(store,args.codex_home,endpoint,ssl_context=context,cache_capture=scheduler.capture)
+            async def observe_context(app):
+                pool=ThreadPoolExecutor(max_workers=1);index=None
+                def poll():
+                    nonlocal index
+                    if index is None:index=UsageIndex([args.codex_home],args.observation_index,args.evidence_path)
+                    value=index.poll()
+                    # Existing index/enrich owns profile generation. Never synthesize hooks.
+                    return value['index']['loading']
+                async def collect():
+                    while True:
+                        try:loading=await asyncio.get_running_loop().run_in_executor(pool,poll)
+                        except Exception:loading=False
+                        await asyncio.sleep(1 if loading else 15)
+                tasks=[asyncio.create_task(scheduler.serve()),asyncio.create_task(collect())]
+                try:yield
+                finally:
+                    for task in tasks:task.cancel()
+                    await asyncio.gather(*tasks,return_exceptions=True)
+                    def close_index():
+                        if index:index.close()
+                    await asyncio.get_running_loop().run_in_executor(pool,close_index)
+                    pool.shutdown();await scheduler.close()
+            app.cleanup_ctx.append(observe_context)
+            web.run_app(app,host='127.0.0.1',port=args.port,access_log=None,print=None,loop=proxy_loop())
+        elif args.managed:
             from .observer_control import ObserverManager
             from .managed_proxy import ManagedProxy
             manager=ObserverManager(args.codex_home,args.evidence_path.parent,url=f'http://127.0.0.1:{args.port}')
