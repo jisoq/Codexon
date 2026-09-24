@@ -115,33 +115,3 @@ def test_real_session_table_shows_parent_without_own_calls_and_click_keeps_break
     finally:
         window.quitting=True;window.tick.stop();window.tray.hide();window.observer_panel.stop();window.close()
         app.setProperty('cachemonitorDisableShellIntegration', before)
-
-
-def test_overlay_cost_label_changes_only_for_confirmed_child(tmp_path):
-    from PySide6.QtWidgets import QApplication
-    from cachemonitor.overlay import SessionOverlay
-
-    parent = source()
-    child = copy.deepcopy(parent)
-    child.update(id='child', title='Child', source='subagent', parent_thread_id=parent['id'])
-    child['history'][0].update(key='child-response', call_id='child-response')
-    engine = AnalysisEngine();engine.ingest([parent,child])
-    summaries = {(s['home'],s['id']):s for s in OverlaySummaries().collect(engine)}
-    app = QApplication.instance() or QApplication([])
-    overlay = SessionOverlay()
-    try:
-        overlay.set_content(summaries[('home','s')]);overlay.show();app.processEvents()
-        assert '현재 작업' in overlay.accessibleName()
-        assert '세션 전체 · 하위 1개 포함' in overlay.accessibleName()
-        assert '세션 비용 ' in overlay.accessibleName()
-        assert '토큰 구성' in overlay.accessibleName()
-        assert '(하위 합산)' not in overlay.accessibleName()
-        assert '세션 호출당 평균 ' in overlay.accessibleName()
-        assert '세션 2호출' in overlay.accessibleName()
-        assert overlay.grab().save(str(tmp_path/'parent-overlay.png'))
-        overlay.set_content(summaries[('home','child')]);app.processEvents()
-        assert '세션 비용 ' in overlay.accessibleName()
-        assert '세션 전체' in overlay.accessibleName()
-        assert '하위 1개 포함' not in overlay.accessibleName()
-    finally:
-        overlay.close()

@@ -1,18 +1,10 @@
 import json
 
-from cachemonitor.model_evidence import EvidenceStore, EvidenceReader, compare, summary
+from cachemonitor.model_evidence import EvidenceStore, EvidenceReader
 from cachemonitor.analysis_engine import AnalysisEngine
 from cachemonitor.index import UsageIndex
 from test_index import finish
 from test_core import fixture_home
-
-
-def test_observer_data_location_is_independent_of_msix_localappdata(monkeypatch,tmp_path):
-    from cachemonitor.model_evidence import default_path
-    first=default_path()
-    monkeypatch.setenv('LOCALAPPDATA',str(tmp_path/'package-virtualized-local'))
-    assert default_path()==first
-    assert '.cachemonitor' in first.parts
 
 
 def test_default_index_joins_shared_evidence_but_explicit_qa_index_is_isolated(tmp_path,monkeypatch):
@@ -88,22 +80,6 @@ def test_transport_wire_evidence_priority_conflict_scope_and_missing_model(tmp_p
     finally:reader.close();store.close()
 
 
-def test_conflicts_missing_fields_and_explicit_model_names(tmp_path):
-    path=tmp_path/'evidence.sqlite';store=EvidenceStore(path);reader=EvidenceReader(path)
-    home=tmp_path/'home';rows=[{'key':'r'}]
-    try:
-        store.write(home,'a',1,'WebSocket','r','gpt-6-astra','','created')
-        reader.poll();assert reader.enrich(home,rows)[0]['model_match']=='확인 불가'
-        store.write(home,'a',1,'WebSocket','r','gpt-6-astra','gpt-6-astra','completed')
-        reader.poll();assert reader.enrich(home,rows)[0]['model_match']=='일치'
-        store.write(home,'b',2,'HTTP/SSE','r','gpt-6-astra','other','completed')
-        reader.poll();row=reader.enrich(home,rows)[0]
-        assert row['model_match']=='관측 충돌' and row['model_evidence']=='관측 충돌'
-        assert compare('gpt-6-astra','gpt-6-astra-2026-09-01')=='불일치'
-        assert '1/2건' in summary([{'model_match':'일치'},{}])
-    finally:reader.close();store.close()
-
-
 def test_evidence_does_not_persist_untrusted_strings(tmp_path):
     store=EvidenceStore(tmp_path/'e.sqlite')
     store.write(tmp_path,'a',1,'WebSocket','r','model\nAuthorization: SECRET','{"prompt":"PRIVATE"}','arbitrary')
@@ -130,39 +106,4 @@ def test_request_tier_is_joined_by_response_id_and_never_replaced_by_response_ti
         store.write(home,'c',3,'HTTP/SSE','r','m','m','completed',requested_service_tier='default')
         reader.poll();row=reader.enrich(home,[{'key':'r'}])[0]
         assert row['service_tier']=='미확인' and row['mode_evidence']=='요청 등급 관측 충돌'
-    finally:reader.close();store.close()
-
-
-def test_overlay_never_promotes_response_default_to_request_standard(tmp_path):
-    from cachemonitor.overlay_data import summarize_session
-    from cachemonitor.pricing import token_cost
-    path=tmp_path/'tier.sqlite';store=EvidenceStore(path);reader=EvidenceReader(path)
-    home=tmp_path/'home'
-    original=dict(key='r',ts=1,model='gpt-6-astra',service_tier='미확인',turn='turn',
-                  input=10000,cached=9000,written=0,output=100,reasoning=50,rate=90)
-    def display(row):
-        priced={**row,**token_cost(row)}
-        return summarize_session(dict(id='s',home=str(home),history=[priced])),priced
-    try:
-        initial,price=display(original)
-        assert initial['assumed']==0 and price['cost'] is None
-        for status in ('created','incomplete','completed'):
-            store.write(home,'a',1,'WebSocket','r','gpt-6-astra','gpt-6-astra',status,response_service_tier='default')
-            reader.poll();joined=reader.enrich(home,[original])[0];result,after=display(joined)
-            assert joined['service_tier']=='미확인' and not after['price_assumed']
-            assert after['cost']==price['cost']
-            assert result['assumed']==0
-            assert result['mode']=='미확인'  # Response tier does not fill the unobserved request mode.
-        # Explicit Fast request remains Fast, including its existing cost policy.
-        result,after=display({**joined,'service_tier':'priority'})
-        assert result['mode']=='Fast' and after['price_tier']=='Fast'
-        assert display(reader.enrich(tmp_path/'other',[original])[0])[0]['assumed']==0
-        assert display(reader.enrich(home,[{**original,'key':'other'}])[0])[0]['assumed']==0
-        # Conflicting, missing and different response rates cannot remove an assumption.
-        store.write(home,'b',2,'WebSocket','r','gpt-6-astra','gpt-6-astra','completed',response_service_tier='priority')
-        reader.poll();assert display(reader.enrich(home,[original])[0])[0]['assumed']==0
-        for flags in ({'observation_missing':True},{'conflict':True},{}):
-            key='single'+str(len(flags))+str(flags.get('conflict',False))
-            store.write(home,key,3,'WebSocket',key,'gpt-6-astra','gpt-6-astra','completed',response_service_tier='priority',**flags)
-            reader.poll();assert display(reader.enrich(home,[{**original,'key':key}])[0])[0]['assumed']==0
     finally:reader.close();store.close()

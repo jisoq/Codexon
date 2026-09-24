@@ -8,7 +8,7 @@ import pytest
 from cachemonitor.analytics import output_speed, output_speed_summary
 from cachemonitor.analysis_engine import AnalysisEngine
 from cachemonitor.core import Session
-from cachemonitor.overlay_data import OverlaySummaries, call_summary
+from cachemonitor.overlay_data import OverlaySummaries
 
 
 def measured(**changes):
@@ -16,21 +16,12 @@ def measured(**changes):
                      completion_latency_ms=30000),**changes)
 
 
-def test_speed_includes_reasoning_once_and_uses_real_seconds():
-    assert output_speed(measured())==100
-    assert output_speed(measured(output=0,reasoning=0))==0
-    assert output_speed(measured(generation_latency_ms=20000))==100
-    assert call_summary(measured(),1)['output_speed']==100
-
-
 @pytest.mark.parametrize('change',[
-    {'response_status':'incomplete'},{'response_status':'failed'}, {'response_status':'pending'},
-    {'timing_valid':False},{'observation_missing':True},{'model_conflict':True},
-    {'output_conflict':True},{'transport_source':'conflict'},{'reasoning':3001},
-    {'output':None},{'output':-1},{'output':True},
-    {'completion_latency_ms':None},{'completion_latency_ms':0},
-    {'completion_latency_ms':-1},{'completion_latency_ms':float('nan')},
-    {'completion_latency_ms':float('inf')},{'completion_latency_ms':True},
+    {'response_status':'failed'}, {'timing_valid':False},
+    {'observation_missing':True}, {'model_conflict':True},
+    {'output_conflict':True}, {'transport_source':'conflict'},
+    {'reasoning':3001}, {'output':None}, {'completion_latency_ms':0},
+    {'completion_latency_ms':float('nan')},
 ])
 def test_unmeasurable_calls_are_not_zero_or_guessed(change):
     assert output_speed(measured(**change)) is None

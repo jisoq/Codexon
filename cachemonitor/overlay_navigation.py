@@ -31,6 +31,12 @@ def navigation_target(data, kind, *, call=None, event=None, status=None):
     if not data or not data.get('home') or not data.get('id'):
         return None
     base = dict(home=data['home'], sid=data['id'])
+    if kind == 'speed_alert':
+        health = data.get('speed_health', {})
+        if health.get('active'):
+            return NavigationTarget(**base, view='speed_alert',
+                                    event_id=str(health['incident_id']), call_id=str(health['call_id']))
+        return None
     if kind == 'session':
         return NavigationTarget(**base)
     if kind == 'cost_total':

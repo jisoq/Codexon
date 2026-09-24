@@ -1,9 +1,6 @@
 """Public-facing translation and payload checks keep internal records intact."""
 import hashlib
 import json
-from pathlib import Path
-import subprocess
-import sys
 
 import pytest
 
@@ -12,13 +9,52 @@ from cachemonitor.presentation import Choice, Text
 from tools.package_release import payload
 
 
-def test_runtime_check_requires_report_path():
-    root = Path(__file__).resolve().parents[1]
-    result = subprocess.run([sys.executable, str(root/'run.py'), '--verify-runtime'],
-                            cwd=root, capture_output=True, text=True, encoding='utf-8')
-    assert result.returncode == 2
-    assert 'Usage: Codexon.exe --verify-runtime <report.json>' in result.stderr
-    assert 'Traceback' not in result.stderr
+def test_language_choice_is_saved_and_used_on_next_window(tmp_path):
+    from PySide6.QtCore import QSettings, Qt
+    from PySide6.QtWidgets import QApplication
+    from PySide6.QtTest import QTest
+    from cachemonitor.dashboard import Dashboard
+    from cachemonitor.quick_qa import control, click
+    app=QApplication.instance() or QApplication([])
+    previous=app.property('cachemonitorDisableShellIntegration')
+    app.setProperty('cachemonitorDisableShellIntegration',True)
+    path=str(tmp_path/'language.ini');windows=[]
+    set_language('ko')
+    try:
+        settings=QSettings(path,QSettings.IniFormat)
+        window=Dashboard([],start_worker=False,settings=settings);windows.append(window)
+        window.open_settings();window.show();QTest.qWait(40)
+        choice=window.settings_page.controls['language']
+        restart=window.settings_page.controls['restart'];requests=[]
+        window.settings_page.restartRequested.connect(lambda:requests.append(True))
+        assert not control(window,restart).isEnabled()
+        control(window,choice).forceActiveFocus()
+        QTest.keyClick(window.quick,Qt.Key_End);QTest.qWait(20)
+        settings.sync()
+        saved=QSettings(path,QSettings.IniFormat)
+        assert saved.value('ui/language')=='en'
+        assert control(window,restart).isEnabled()
+        QTest.keyClick(window.quick,Qt.Key_Home);QTest.qWait(20)
+        assert not control(window,restart).isEnabled()
+        QTest.keyClick(window.quick,Qt.Key_End);QTest.qWait(20)
+        click(window,control(window,restart))
+        assert requests==[True] and not control(window,restart).isEnabled()
+        window.quit_app()
+        set_language(saved.value('ui/language'))
+        reopened=Dashboard([],start_worker=False,settings=saved);windows.append(reopened)
+        reopened.open_settings();reopened.show();QTest.qWait(40)
+        choice=reopened.settings_page.controls['language']
+        assert control(reopened,choice).property('currentText')=='English'
+        assert not control(reopened,reopened.settings_page.controls['restart']).isEnabled()
+        assert reopened.settings_page.navigation.state['items'][0]['text']=='General'
+        assert reopened.grab().save(str(tmp_path/'english-settings.png'))
+        control(reopened,choice).forceActiveFocus()
+        QTest.keyClick(reopened.quick,Qt.Key_Home);QTest.qWait(20);saved.sync()
+        assert QSettings(path,QSettings.IniFormat).value('ui/language')=='ko'
+        assert not reopened.qml_errors
+    finally:
+        for window in windows:window.quit_app()
+        set_language('ko');app.setProperty('cachemonitorDisableShellIntegration',previous)
 
 
 def test_english_token_labels_do_not_change_stored_values():
@@ -35,6 +71,33 @@ def test_english_token_labels_do_not_change_stored_values():
         assert tr('모양') == 'Appearance'
         assert tr('알림') == 'Notifications'
     finally:
+        set_language('ko')
+
+
+def test_user_text_is_verbatim_even_when_equal_to_a_translation_key(tmp_path):
+    from cachemonitor.i18n import Verbatim
+    from cachemonitor.table_model import Table, Cell
+    from cachemonitor.quick_qa import mount, dispose, walk
+    from PySide6.QtWidgets import QApplication
+    app=QApplication.instance() or QApplication([])
+    set_language('en');host=None
+    try:
+        for text in ('사용한도 주석 표시 정리','사용 한도','캐시 읽기'):
+            assert tr(text)!=text
+            assert tr(Verbatim(text))==text
+            assert tr(text)!=text
+            assert Text(Verbatim(text)).state['text']==text
+        choice=Choice();choice.addItem(Verbatim('캐시 읽기'),'project')
+        assert choice.state['items'][0]['text']=='캐시 읽기'
+        table=Table();table.setColumnCount(1);table.setHorizontalHeaderLabels(['작업'])
+        table.setRowCount(1);table.setItem(0,0,Cell(Verbatim('사용한도 주석 표시 정리')))
+        host=mount(table)
+        labels=[item.property('text') for item in walk(host.quick.rootObject()) if item.objectName()=='cell-label']
+        assert '사용한도 주석 표시 정리' in labels
+        assert host.grab().save(str(tmp_path/'english-raw-title.png'))
+        assert not host.qml_errors
+    finally:
+        if host:dispose(host)
         set_language('ko')
 
 

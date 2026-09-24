@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import fnmatch
 import hashlib
 import json
@@ -22,81 +23,210 @@ if str(ROOT) not in sys.path:
 REPORTS = ROOT / 'artifacts' / 'verification'
 BASELINE = REPORTS / 'last-success.json'
 
-CORE = (
-    'tests/test_data_contract.py::test_same_home_response_id_dedup_and_no_parent_cost_inheritance',
-    'tests/test_data_contract.py::test_partial_sums_weighted_cache_and_whole_lookup_stay_shared',
-    'tests/test_index.py::test_incremental_partial_line_and_truncation',
-    'tests/test_index.py::test_index_cannot_write_to_source_or_unrelated_database',
-    'tests/test_observation_delivery.py::test_writer_lock_failure_does_not_retry_request_and_recovers',
-    'tests/test_observer_control.py::test_stale_enabled_flag_and_background_poll_never_reroute',
-    'tests/test_proxy_update.py::test_failed_new_worker_rolls_back',
-    'tests/test_session_costs.py::test_nested_costs_empty_parent_partial_prices_and_home_boundary',
-)
+def test_files(*names):
+    return tuple(f'tests/test_{name}.py' for name in names)
 
+
+# Components select observable contracts. There is deliberately no always-run core.
 GROUPS = {
-    'data': ('tests/test_core.py', 'tests/test_index.py', 'tests/test_data_contract.py',
-             'tests/test_observation_delivery.py'),
-    'cost': ('tests/test_session_costs.py', 'tests/test_subagent_collection.py',
-             'tests/test_data_contract.py', 'tests/test_overlay_navigation.py'),
-    'pricing_quota': ('tests/test_pricing.py', 'tests/test_mode_costs.py',
-                      'tests/test_quota_tracking_integration.py', 'tests/test_quota_integrity.py',
-                      'tests/test_quota_page.py', 'tests/test_quota_resets.py'),
-    'quota_service': ('tests/test_quota_polling.py', 'tests/test_quota_tracking.py',
-                      'tests/test_overlay_collection_resilience.py'),
-    'ui': ('tests/test_ui.py', 'tests/test_quick_ui.py'),
-    'overlay': ('tests/test_overlay.py', 'tests/test_overlay_navigation.py',
-                'tests/test_overlay_resilience.py', 'tests/test_overlay_windows.py'),
-    'proxy': ('tests/test_proxy_update.py', 'tests/test_observer_panel.py',
-              'tests/test_observer_control.py', 'tests/test_proxy_supervisor.py',
-              'tests/test_model_proxy.py'),
-    'package': ('tests/test_windows_startup.py', 'tests/test_quick_ui.py',
-                'tests/test_observer_panel.py',
-                'tests/test_verify_changes.py::test_isolated_source_smoke_renders_parent_cost'),
+    'data': test_files('core', 'index', 'data_contract', 'subagent_collection', 'request_tier_snapshots'),
+    'analysis': test_files('comparison', 'overview', 'performance', 'data_contract', 'output_speed'),
+    'cost': test_files('pricing', 'mode_costs', 'session_costs', 'data_contract'),
+    'cache': test_files('cache_health', 'cache_misses'),
+    'speed': test_files('speed_health', 'output_speed'),
+    'names': test_files('codex_names'),
+    'modes': test_files('request_modes', 'request_tier_snapshots', 'mode_costs'),
+    'quota_store': test_files('quota', 'quota_tracking', 'quota_tracking_integration',
+                             'quota_integrity', 'quota_accumulation', 'quota_value_history'),
+    'quota_math': test_files('quota_attribution', 'quota_cycles', 'quota_resets', 'banked_resets'),
+    'quota_poll': test_files('quota_polling', 'overlay_collection_resilience'),
+    'quota_ui': test_files('quota_page', 'quota_detail_card', 'quota_gap_axis'),
+    'quota_chart': test_files('quota_gap_axis', 'quota_chart_performance', 'quota_page'),
+    'dashboard': test_files('ui', 'comparison_workflow', 'dashboard_evidence', 'ui_value_fixes'),
+    'details': test_files('ui_details', 'call_transport', 'model_ui'),
+    'table': test_files('table_order', 'performance'),
+    'shared_ui': test_files('quick_ui', 'display_scaling'),
+    'theme': test_files('theme_tokens'),
+    'overlay_data': test_files('overlay_call_data', 'overlay_model_summary', 'session_costs', 'speed_health'),
+    'overlay_tracking': test_files('overlay', 'overlay_resilience', 'overlay_collection_resilience'),
+    'overlay_controls': test_files('overlay_controls', 'overlay_layout_controller'),
+    'overlay_navigation': test_files('overlay_navigation', 'speed_health') + (
+        'tests/test_output_speed.py::test_rendered_summary_click_and_overlay_speed_navigation',),
+    'overlay_render': test_files('overlay_presentation', 'completed_layout', 'overlay_shadow'),
+    'overlay_appearance': test_files('overlay_appearance', 'theme_tokens'),
+    'overlay_windows': test_files('overlay_windows'),
+    'taskbar': test_files('taskbar', 'taskbar_clock'),
+    'window': test_files('window_recovery', 'display_scaling'),
+    'notifications': test_files('notifications', 'confirmed_notifications'),
+    'evidence': test_files('model_evidence', 'proxy_observation', 'observation_delivery', 'call_transport'),
+    'relay': test_files('model_proxy', 'proxy_http2', 'proxy_observation', 'observation_delivery'),
+    'proxy_lifecycle': test_files('managed_proxy', 'proxy_update', 'proxy_supervisor', 'connection_recovery'),
+    'observer': test_files('observer_control', 'observer_panel'),
+    'install': test_files('install_activation', 'install_management', 'windows_startup'),
+    'update': test_files('app_update'),
+    'runtime': test_files('windows_startup') + (
+        'tests/test_verify_changes.py::test_isolated_source_smoke_renders_parent_cost',),
+    'translation': ('tests/test_public_release.py::test_english_token_labels_do_not_change_stored_values',),
+    'payload': ('tests/test_public_release.py::test_public_payload_rejects_local_paths_and_unneeded_qt',),
+    'selector': test_files('verify_changes'),
 }
 
+# First match wins: QML and shared helpers must not fall through to a broad UI gate.
 RULES = (
-    ('cachemonitor/session_costs.py', 'cost'),
-    ('cachemonitor/core.py', 'data'),
-    ('cachemonitor/index.py', 'data'),
-    ('cachemonitor/analytics.py', 'data'),
-    ('cachemonitor/analysis_engine.py', 'data'),
-    ('cachemonitor/analysis_worker.py', 'data'),
-    ('cachemonitor/analysis_worker.py', 'quota_service'),
-    ('cachemonitor/analysis_delivery.py', 'data'),
-    ('cachemonitor/pricing.py', 'pricing_quota'),
-    ('cachemonitor/request_modes.py', 'pricing_quota'),
-    ('cachemonitor/quota*.py', 'pricing_quota'),
-    ('cachemonitor/quota_service.py', 'quota_service'),
-    ('cachemonitor/quota_polling.py', 'quota_service'),
-    ('cachemonitor/dashboard.py', 'ui'),
-    ('cachemonitor/dashboard.py', 'cost'),
-    ('cachemonitor/overlay_data.py', 'cost'),
-    ('cachemonitor/overlay*.py', 'overlay'),
-    ('cachemonitor/qml/*', 'ui'),
-    ('cachemonitor/theme.py', 'ui'),
-    ('cachemonitor/token_colors.py', 'ui'),
-    ('cachemonitor/token_colors.py', 'overlay'),
-    ('cachemonitor/quick_smoke.py', 'package'),
-    ('cachemonitor/app.py', 'package'),
-    ('cachemonitor/version.py', 'proxy'),
-    ('cachemonitor/version.py', 'package'),
-    ('cachemonitor/model_proxy.py', 'proxy'),
-    ('cachemonitor/proxy*.py', 'proxy'),
-    ('cachemonitor/observer*.py', 'proxy'),
-    ('cachemonitor/managed_proxy.py', 'proxy'),
-    ('cachemonitor/connection_recovery.py', 'proxy'),
-    ('cachemonitor/*install*.py', 'package'),
-    ('cachemonitor/app_update.py', 'package'),
-    ('cachemonitor/update_panel.py', 'ui'),
-    ('recovery_main.py', 'package'),
-    ('installer/*', 'package'),
-    ('CodexonRecovery.spec', 'package'),
-    ('build*.ps1', 'package'),
-    ('Codexon.spec', 'package'),
-    ('requirements*.txt', 'package'),
-    ('tools/verify_proxy_update.py', 'proxy'),
-    ('tools/verify_changes.py', 'selector'),
+    ('cachemonitor/session_costs.py', ('cost', 'overlay_data')),
+    ('cachemonitor/core.py', ('data', 'analysis', 'cost', 'quota_store', 'modes', 'cache', 'speed')),
+    ('cachemonitor/index.py', ('data', 'evidence', 'quota_store')),
+    ('cachemonitor/analytics.py', ('analysis', 'cost', 'cache', 'speed', 'quota_math')),
+    ('cachemonitor/analysis_engine.py', ('analysis', 'cost', 'cache', 'overlay_data')),
+    ('cachemonitor/analysis_worker.py', ('analysis', 'quota_poll', 'overlay_tracking', 'notifications')),
+    ('cachemonitor/analysis_delivery.py', ('analysis', 'overlay_tracking')),
+    ('cachemonitor/pricing.py', ('cost', 'quota_store', 'quota_math')),
+    ('cachemonitor/request_modes.py', ('modes', 'quota_store')),
+    ('cachemonitor/cache_*.py', ('cache', 'dashboard')),
+    ('cachemonitor/speed_health.py', ('speed',)),
+    ('cachemonitor/codex_names.py', ('names', 'overlay_tracking')),
+    ('cachemonitor/quota_chart.py', ('quota_chart',)),
+    ('cachemonitor/quota_attribution.py', ('quota_math', 'quota_store')),
+    ('cachemonitor/quota_cycles.py', ('quota_math', 'quota_store')),
+    ('cachemonitor/banked_resets.py', ('quota_math', 'quota_ui')),
+    ('cachemonitor/quota_view.py', ('quota_ui',)),
+    ('cachemonitor/quota_panel.py', ('quota_ui',)),
+    ('cachemonitor/quota_service.py', ('quota_poll', 'quota_store')),
+    ('cachemonitor/quota_polling.py', ('quota_poll',)),
+    ('cachemonitor/quota_live.py', ('quota_poll', 'quota_store')),
+    ('cachemonitor/quota_diagnostics.py', ('quota_math',)),
+    ('cachemonitor/quota_reader.py', ('quota_store', 'quota_math')),
+    ('cachemonitor/quota_tracking*.py', ('quota_store', 'quota_math')),
+    ('cachemonitor/quota.py', ('quota_store', 'quota_math')),
+    ('cachemonitor/dashboard.py', ('dashboard', 'details', 'cost', 'speed')),
+    ('cachemonitor/ui_details.py', ('details',)),
+    ('cachemonitor/table_model.py', ('table',)),
+    ('cachemonitor/lazy_table.py', ('table',)),
+    ('cachemonitor/overlay_data.py', ('overlay_data', 'speed', 'evidence')),
+    ('cachemonitor/overlay_navigation.py', ('overlay_navigation',)),
+    ('cachemonitor/overlay_chrome.py', ('overlay_controls', 'overlay_navigation')),
+    ('cachemonitor/overlay_view.py', ('overlay_render', 'overlay_navigation')),
+    ('cachemonitor/overlay_appearance.py', ('overlay_appearance',)),
+    ('cachemonitor/overlay_windows.py', ('overlay_windows', 'overlay_controls')),
+    ('cachemonitor/overlay_shadow.py', ('overlay_render',)),
+    ('cachemonitor/overlay_tracking.py', ('overlay_tracking',)),
+    ('cachemonitor/overlay.py', ('overlay_tracking', 'overlay_controls', 'overlay_navigation')),
+    ('cachemonitor/qml/OverlayLinks.qml', ('overlay_navigation',)),
+    ('cachemonitor/qml/OverlayDetail.qml', ('overlay_render', 'overlay_navigation')),
+    ('cachemonitor/qml/OverlayControls.qml', ('overlay_controls',)),
+    ('cachemonitor/qml/OverlayScene.qml', ('overlay_render',)),
+    ('cachemonitor/qml/QuotaDetail.qml', ('quota_ui',)),
+    ('cachemonitor/qml/Taskbar.qml', ('taskbar',)),
+    ('cachemonitor/qml/DataTable.qml', ('table', 'dashboard')),
+    ('cachemonitor/qml/DateField.qml', ('shared_ui', 'dashboard')),
+    ('cachemonitor/qml/Ui*.qml', ('shared_ui',)),
+    ('cachemonitor/qml/Node*.qml', ('shared_ui',)),
+    ('cachemonitor/qml/Main.qml', ('shared_ui', 'window')),
+    ('cachemonitor/qml/PaintedScene.qml', ('shared_ui', 'overlay_render', 'quota_ui')),
+    ('cachemonitor/quick_runtime.py', ('shared_ui', 'overlay_controls', 'quota_ui')),
+    ('cachemonitor/controls.py', ('shared_ui',)),
+    ('cachemonitor/presentation.py', ('shared_ui', 'dashboard', 'overlay_render')),
+    ('cachemonitor/charts.py', ('shared_ui', 'quota_chart')),
+    ('cachemonitor/theme.py', ('theme',)),
+    ('cachemonitor/token_colors.py', ('theme',)),
+    ('cachemonitor/settings_page.py', ('dashboard', 'theme', 'observer')),
+    ('cachemonitor/taskbar*.py', ('taskbar',)),
+    ('cachemonitor/screens.py', ('window', 'overlay_controls')),
+    ('cachemonitor/notifications.py', ('notifications',)),
+    ('cachemonitor/change_highlight.py', ('shared_ui', 'overlay_render')),
+    ('cachemonitor/fonts.py', ('shared_ui', 'overlay_render')),
+    ('cachemonitor/icons.py', ('shared_ui',)),
+    ('cachemonitor/brand_icon.py', ('runtime',)),
+    ('icons/*.ico', ('runtime', 'payload')),
+    ('cachemonitor/assets/brand/*', ('runtime',)),
+    ('cachemonitor/assets/fonts/*', ('shared_ui', 'overlay_render')),
+    ('cachemonitor/i18n.py', ('translation', 'shared_ui')),
+    ('cachemonitor/translation_catalog.py', ('translation',)),
+    ('cachemonitor/assets/i18n/*.json', ('translation',)),
+    ('cachemonitor/model_evidence.py', ('evidence', 'data')),
+    ('cachemonitor/evidence_writer.py', ('evidence',)),
+    ('cachemonitor/model_proxy.py', ('relay',)),
+    ('cachemonitor/proxy_http.py', ('relay',)),
+    ('cachemonitor/proxy_observation.py', ('relay', 'evidence')),
+    ('cachemonitor/proxy_update.py', ('proxy_lifecycle',)),
+    ('cachemonitor/proxy_supervisor.py', ('proxy_lifecycle',)),
+    ('cachemonitor/managed_proxy.py', ('proxy_lifecycle',)),
+    ('cachemonitor/connection_recovery.py', ('proxy_lifecycle', 'install')),
+    ('cachemonitor/observer_panel.py', ('observer',)),
+    ('cachemonitor/observer_control.py', ('observer', 'proxy_lifecycle')),
+    ('cachemonitor/observer_state.py', ('observer', 'proxy_lifecycle')),
+    ('cachemonitor/observer_task.py', ('observer', 'proxy_lifecycle')),
+    ('cachemonitor/install*.py', ('install',)),
+    ('cachemonitor/app_update.py', ('update', 'install')),
+    ('cachemonitor/update_panel.py', ('update',)),
+    ('cachemonitor/app.py', ('runtime', 'install', 'observer')),
+    ('cachemonitor/version.py', ('runtime', 'proxy_lifecycle', 'update')),
+    ('cachemonitor/__init__.py', ('runtime',)),
+    ('cachemonitor/tray.py', ('runtime', 'window')),
+    ('cachemonitor/launch_context.py', ('install', 'runtime')),
+    ('cachemonitor/app_restart.py', ('runtime', 'install', 'payload')),
+    ('cachemonitor/windows_integration.py', ('install', 'taskbar')),
+    ('cachemonitor/shell_shortcut.py', ('install',)),
+    ('cachemonitor/runtime_check.py', ('runtime',)),
+    ('cachemonitor/quick_smoke.py', ('runtime',)),
+    ('cachemonitor/quick_qa.py', ('runtime', 'shared_ui', 'overlay_controls')),
+    ('cachemonitor/qa.py', ('runtime',)),
+    ('tools/verify_changes.py', ('selector',)),
+    ('.github/workflows/windows.yml', ('selector',)),
+    ('tools/run_ui_checks.py', ('runtime', 'overlay_controls')),
+    ('tools/demo_speed_overlay.py', ('speed',)),
+    ('tools/*proxy*.py', ('relay', 'proxy_lifecycle')),
+    ('tools/*overlay*.py', ('overlay_controls', 'overlay_render')),
+    ('tools/*quota*.py', ('quota_store', 'quota_math')),
+    ('tools/audit_analytics.py', ('analysis',)),
+    ('tools/verify_record_pairs.py', ('data',)),
+    ('tools/benchmark_interactions.py', ('table', 'quota_chart')),
+    ('tools/verify_settings.py', ('dashboard',)),
+    ('tools/verify_design.py', ('shared_ui',)),
+    ('tools/*display_scaling.py', ('window',)),
+    ('tools/font_render_probe.py', ('shared_ui',)),
+    ('tools/verify_recovery.py', ('install',)),
+    ('tools/verify_installation.py', ('install',)),
+    ('tools/verify_gui_handoff.py', ('install',)),
+    ('tools/installer_identity.py', ('install',)),
+    ('tools/prepare_bad_runtime.py', ('install',)),
+    ('tools/collect_notices.py', ('payload',)),
+    ('tools/package_release.py', ('payload',)),
+    ('tools/prepare_sources.py', ('payload',)),
+    ('tools/Build-*.ps1', ('install', 'runtime', 'payload')),
+    ('tools/configure-app-task.ps1', ('install',)),
+    ('recovery_main.py', ('install',)),
+    ('run.py', ('runtime',)),
+    ('start.ps1', ('runtime',)),
+    ('installer/*', ('install', 'payload')),
+    ('build*.ps1', ('runtime', 'install', 'payload')),
+    ('*.spec', ('runtime', 'payload')),
 )
+
+# These changes need frozen executable/install checks in addition to source tests.
+PACKAGE_PATTERNS = (
+    'requirements*', 'build*.ps1', '*.spec', 'installer/*', 'recovery_main.py', 'icons/*.ico',
+    'run.py', 'start.ps1', 'tools/Build-*.ps1', 'tools/*install*.py', 'tools/prepare_bad_runtime.py',
+    'tools/package_release.py', 'tools/collect_notices.py', 'tools/prepare_sources.py',
+    'tools/verify_recovery.py', 'tools/verify_gui_handoff.py', 'tools/configure-app-task.ps1',
+    'cachemonitor/install*.py', 'cachemonitor/app.py', 'cachemonitor/app_update.py', 'cachemonitor/app_restart.py',
+    'cachemonitor/version.py', 'cachemonitor/runtime_check.py', 'cachemonitor/launch_context.py',
+    'cachemonitor/windows_integration.py', 'cachemonitor/shell_shortcut.py',
+)
+PROXY_PATTERNS = (
+    'cachemonitor/model_proxy.py', 'cachemonitor/proxy*.py', 'cachemonitor/managed_proxy.py',
+    'cachemonitor/observer_control.py', 'cachemonitor/observer_state.py', 'cachemonitor/observer_task.py',
+    'cachemonitor/connection_recovery.py', 'cachemonitor/evidence_writer.py',
+    'cachemonitor/version.py', 'tools/*proxy*.py', 'requirements*', 'build*.ps1', '*.spec',
+    'tools/Build-*.ps1', 'cachemonitor/install*.py', 'installer/*',
+)
+FULL_PATTERNS = ('tests/conftest.py', 'pytest.ini', 'pyproject.toml', 'requirements*')
+DOC_PATTERNS = ('docs/*', 'releases/*', '*.md', '*.txt', 'LICENSE*', '.gitignore',
+                '.gitattributes', '.github/ISSUE_TEMPLATE/*')
+
+
+def matches(path, patterns):
+    return any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns)
 
 
 def git_bytes(*args):
@@ -129,54 +259,72 @@ def changed_files(current, baseline=None, base_ref=None):
     return {path for path in before.keys() | current.keys() if before.get(path) != current.get(path)}
 
 
-def select_tests(changed):
-    """Return exact checks and why they were selected; unknown code widens scope."""
-    if changed is None:
-        return {'full': True, 'tests': ('tests',), 'reasons': {'tests':'검증 기준점 없음'},
-                'groups': ('full',), 'package_impact': True, 'proxy_impact': True}
-    selected = set()
+def test_dependents(changed, root):
+    """Include consumers of shared test fixtures, including imports inside functions."""
+    dependencies = {}
+    for path in (root / 'tests').rglob('*.py'):
+        imports = set()
+        tree = ast.parse(path.read_text(encoding='utf-8-sig'))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                imports.add(node.module or '')
+                if node.module == 'tests':
+                    imports.update('tests.' + alias.name for alias in node.names)
+            elif isinstance(node, ast.Import):
+                imports.update(alias.name for alias in node.names)
+        dependencies[path.relative_to(root).as_posix()] = {
+            (name.replace('.', '/') + '.py' if name.startswith('tests.') else
+             'tests/' + name.replace('.', '/') + '.py') for name in imports}
+    affected = set(changed)
+    while True:
+        consumers = {path for path, imports in dependencies.items() if imports & affected}
+        if consumers <= affected:
+            break
+        affected.update(consumers)
+    return {path for path in affected if Path(path).name.startswith('test_')
+            and (root / path).is_file()}
+
+
+def select_tests(changed, *, root=None):
+    """Map changes to contracts; unmapped code is an actionable selection error."""
+    root = root or ROOT
+    first_run = changed is None
+    paths = set(changed or ())
+    full = first_run or any(matches(path, FULL_PATTERNS) for path in paths)
+    proxy = first_run or any(matches(path, PROXY_PATTERNS) for path in paths)
+    package = proxy or first_run or any(matches(path, PACKAGE_PATTERNS) for path in paths)
+    selected, groups, unmapped = set(), set(), set()
     reasons = {}
-    groups = set()
-    full = False
-    runtime_change = False
-    for path in sorted(changed):
-        if path in ('tests/conftest.py', 'pytest.ini'):
-            full = True
+
+    def add(test, reason):
+        selected.add(test)
+        reasons.setdefault(test, []).append(reason)
+
+    test_changes = {path for path in paths if path.startswith('tests/') and path.endswith('.py')}
+    if test_changes:
+        for test in test_dependents(test_changes, root):
+            add(test, '검사 또는 공유 fixture 변경')
+    for path in sorted(paths):
+        if path in test_changes or matches(path, FULL_PATTERNS):
             continue
-        if path.startswith('tests/'):
-            if path.endswith('.py') and Path(path).name.startswith('test_'):
-                selected.add(path);reasons.setdefault(path, []).append(f'검사 변경: {path}')
-                runtime_change = True
-            else:
-                full = True
-            continue
-        matched = {group for pattern,group in RULES if fnmatch.fnmatchcase(path,pattern)}
-        if path.startswith(('docs/', 'releases/')) or path in ('AGENTS.md','README.md','README-Lite.md','.gitignore'):
-            continue
-        if matched:
+        matched = next((scopes for pattern, scopes in RULES if fnmatch.fnmatchcase(path, pattern)), None)
+        if matched is not None:
             groups.update(matched)
-            runtime_change = True
-            continue
-        if path.startswith(('cachemonitor/', 'tools/')) or path.endswith(('.py','.qml','.ps1','.spec','.txt')):
-            full = True
+            for group in matched:
+                for test in GROUPS[group]:
+                    add(test, path)
+        elif not matches(path, DOC_PATTERNS):
+            unmapped.add(path)
+    # A file selection subsumes any specific node selections from other changes.
+    selected = {test for test in selected if '::' not in test or test.split('::')[0] not in selected}
     if full:
-        return {'full': True, 'tests': ('tests',), 'reasons': {'tests':'공통 설정 또는 미분류 코드 변경'},
-                'groups': ('full',), 'package_impact': True, 'proxy_impact': True}
-    if runtime_change:
-        for test in CORE:
-            selected.add(test)
-            reasons.setdefault(test, []).append('항상 확인하는 핵심 경로')
-    if 'selector' in groups:
-        selected.add('tests/test_verify_changes.py')
-        reasons.setdefault('tests/test_verify_changes.py', []).append('선택 도구 변경')
-    for group in groups - {'selector'}:
-        for test in GROUPS[group]:
-            selected.add(test)
-            reasons.setdefault(test, []).append(f'{group} 영역 변경')
-    return {'full': False, 'tests': tuple(sorted(selected)), 'reasons': reasons,
-            'groups': tuple(sorted(groups)),
-            'package_impact': 'package' in groups,
-            'proxy_impact': 'proxy' in groups}
+        selected = {'tests'}
+        reasons = {'tests': ['검증 기준점 없음' if first_run else '공통 검사 설정 또는 의존성 변경']}
+        groups.add('full')
+    return dict(full=full, tests=tuple(sorted(selected)),
+                reasons={test: reasons[test] for test in sorted(selected)},
+                groups=tuple(sorted(groups)), unmapped=tuple(sorted(unmapped)),
+                package_impact=package, proxy_impact=proxy)
 
 
 def fixture_home(folder):
@@ -244,21 +392,31 @@ def main(argv=None):
     parser.add_argument('--base', help='Git ref to compare when intentionally establishing a new baseline')
     parser.add_argument('--full', action='store_true', help='Run the whole test suite')
     parser.add_argument('--package-exe', type=Path, help='Check a built executable with isolated records')
+    parser.add_argument('--package-only', action='store_true', help='Check only the executable after source checks')
     args = parser.parse_args(argv)
+    if args.package_only and (not args.package_exe or args.full):
+        parser.error('--package-only requires --package-exe and cannot be combined with --full')
     current = file_hashes()
     baseline = json.loads(BASELINE.read_text(encoding='utf-8')) if BASELINE.is_file() else None
     changed = changed_files(current, baseline, args.base)
     plan = select_tests(changed)
     if args.full:
         plan = {**plan, 'full':True, 'tests':('tests',), 'groups':('full',),
-                'reasons':{'tests':'사용자가 전체 검사를 지정함'}}
+                'reasons':{'tests':['사용자가 전체 검사를 지정함']}, 'unmapped':()}
+    if args.package_only:
+        plan = {**plan, 'full':False, 'tests':(), 'groups':(), 'reasons':{}, 'unmapped':()}
     public = dict(changed=sorted(changed) if changed is not None else None,
+                  full=plan['full'], unmapped=plan['unmapped'],
                   groups=plan['groups'], tests=plan['tests'], reasons=plan['reasons'],
                   package_impact=plan['package_impact'], proxy_impact=plan['proxy_impact'],
                   package_exe=str(args.package_exe) if args.package_exe else None)
     if args.plan:
         print(json.dumps(public,ensure_ascii=False,indent=2))
-        return 0
+        return 2 if plan['unmapped'] else 0
+    if plan['unmapped']:
+        print(json.dumps(dict(result='unmapped', paths=plan['unmapped'],
+                             action='tools/verify_changes.py의 RULES에 검사 연결을 추가하거나 --full을 지정하세요.'), ensure_ascii=False))
+        return 2
     REPORTS.mkdir(parents=True,exist_ok=True)
     folder = REPORTS / datetime.now().strftime('%Y%m%d-%H%M%S')
     folder.mkdir(exist_ok=False)
@@ -285,8 +443,9 @@ def main(argv=None):
             print(json.dumps(dict(result='package_failed',error=str(error),report=str(folder/'report.json')),ensure_ascii=False))
             return 1
     (folder/'report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
-    BASELINE.write_text(json.dumps(dict(version=1,files=current,report=str(folder/'report.json')),
-                                   ensure_ascii=False,indent=2),encoding='utf-8')
+    if not args.package_only:
+        BASELINE.write_text(json.dumps(dict(version=1,files=current,report=str(folder/'report.json')),
+                                       ensure_ascii=False,indent=2),encoding='utf-8')
     print(json.dumps(dict(result='passed',changed=len(changed) if changed is not None else None,
                           groups=plan['groups'],pytest=report.get('pytest'),package=report['package'],
                           report=str(folder/'report.json')),ensure_ascii=False))

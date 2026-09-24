@@ -243,7 +243,7 @@ class ComparisonChart(AnalyticalPlot):
         for (gx,gy),rows in cells.items():
             rect=QRectF(left+gx*6,top+gy*6,6,6);shade=self.color('accent');shade.setAlpha(min(255,80+len(rows)*12));p.fillRect(rect,shade)
             self.remember(rect,{'records':rows,'kind':'scatter_cell'},f'{len(rows):,}개 실제 표본')
-        p.setPen(self.color('muted'));p.drawText(QRectF(left,0,w,22),Qt.AlignLeft,'API 환산액')
+        p.setPen(self.color('muted'));p.drawText(QRectF(left,0,w,22),Qt.AlignLeft,'비용')
         p.drawText(QRectF(left,self.height()-24,w,22),Qt.AlignRight,'소요시간')
 
 class TokenComposition(AnalyticalPlot):
@@ -252,13 +252,14 @@ class TokenComposition(AnalyticalPlot):
         super().__init__();self.side=side;self.total=None;self.setFixedHeight(172 if side=='input' else 146)
     def set_parts(self,parts):
         self.total=parts.get('total')
-        labels={'ordinary':'일반 입력' if self.side=='input' else '일반 출력','read':'캐시 읽기',
+        labels={'ordinary':'일반 입력' if self.side=='input' else '추론 외','read':'캐시 읽기',
                 'write':'캐시 쓰기','reasoning':'추론','unclassified':'입력 미분류' if self.side=='input' else '출력 미분류'}
         colors={'ordinary':'uncached' if self.side=='input' else 'output','read':'cached','write':'written','reasoning':'reasoning','unclassified':'unknown'}
-        self.set_rows([dict(key=k,label=label,total=parts[k],color=colors[k]) for k,label in labels.items() if k in parts])
+        order=('read','write','ordinary','unclassified') if self.side=='input' else ('reasoning','ordinary','unclassified')
+        self.set_rows([dict(key=k,label=labels[k],total=parts[k],color=colors[k]) for k in order if k in parts])
     def paint(self,painter):
         p=self.base();p.setPen(self.color('ink'))
-        title='입력 구성' if self.side=='input' else '출력 구성'
+        title='입력' if self.side=='input' else '출력'
         p.drawText(QRectF(0,0,self.width(),24),Qt.AlignLeft,title+' · '+('미확인' if self.total is None else f'{self.total:,} 토큰'))
         p.fillRect(QRectF(0,30,self.width(),14),self.color('secondary'));x=0
         for i,row in enumerate(self.rows):

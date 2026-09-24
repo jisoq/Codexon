@@ -70,7 +70,8 @@ def start_smoke(window,app,path,fonts,depth='full'):
                 i,row=parents[0]
                 click_row(window,window.parent_table,i);settle()
                 assert window.selected_session==(row['home'],row['sid'])
-                assert '세션 비용' in window.session_scope.text()
+                from .i18n import tr
+                assert tr('비용') in window.session_scope.text()
                 if row['cost'] is not None:
                     assert abs(row['cost']-(row['own_cost'] or 0)-(row['child_cost'] or 0))<1e-9
                 target=path.with_name(path.stem+'-session-cost.png')
@@ -96,6 +97,59 @@ def start_smoke(window,app,path,fonts,depth='full'):
                     QTest.keyClick(window.quick,Qt.Key_Home)
                     assert window.table.currentRow()==0
             report['record_keyboard']=True
+            from .overlay_chrome import named_item
+            from .overlay_view import palette
+            overlay=window.overlay;overlay.timer.stop();overlay.input_timer.stop()
+            links=overlay.links;note=overlay.calculation_note;note.winId()
+            links.resize(overlay.widget.panel_width(),overlay.widget.panel_height())
+            links.sync();links.show();QTest.qWait(40)
+            click(links,named_item(links.quick.rootObject(),'nav-formula-cache'))
+            QTest.qWait(40)
+            assert note.isVisible() and note.label.text()
+            assert note.label.fontMetrics().horizontalAdvance(note.label.text())<=note.label.width()
+            rendered=note.label.grab().toImage();ink=palette(overlay.widget.content_model.appearance)['ink']
+            assert sum(max(abs(rendered.pixelColor(x,y).red()-ink.red()),
+                           abs(rendered.pixelColor(x,y).green()-ink.green()),
+                           abs(rendered.pixelColor(x,y).blue()-ink.blue()))<25
+                       for y in range(rendered.height()) for x in range(rendered.width()))>50
+            target=path.with_name(path.stem+'-calculation.png')
+            assert note.grab().save(str(target));report['screens'].append(str(target))
+            report['calculation_note']=dict(text=note.label.text(),visible_ink=True)
+            note.hide();links.hide()
+            from .i18n import language, set_language
+            from PySide6.QtGui import QImage, QPainter
+            from .analysis_engine import AnalysisEngine
+            from .overlay_data import OverlaySummaries
+            from .core import Session
+            session=Session('title-check','fixture',title='사용한도 주석 표시 정리')
+            session.add_usage(time.time(),'call',dict(input_tokens=1000,cached_input_tokens=800,
+                output_tokens=100,reasoning_output_tokens=20),'gpt-6-astra','turn','high','Standard')
+            engine=AnalysisEngine();engine.ingest([session.view(time.time())])
+            original_data=overlay.widget.content_model.data
+            data=OverlaySummaries().collect(engine)[0];data['title']='사용한도 주석 표시 정리'
+            overlay.widget.set_content(data);model=overlay.widget.content_model
+            locale=language();title_images=[]
+            try:
+                for selected in ('ko','en'):
+                    set_language(selected)
+                    frame=QImage(model.panel_width(),model.panel_height(),QImage.Format_ARGB32_Premultiplied);frame.fill(0)
+                    painter=QPainter(frame);model.paint(painter);painter.end()
+                    title_images.append(frame.copy(16,12,260,28))
+                    if selected=='en':
+                        target=path.with_name(path.stem+'-raw-title.png');assert frame.save(str(target));report['screens'].append(str(target))
+                assert title_images[0]==title_images[1]
+                report['session_title_preserved']=True
+            finally:set_language(locale);overlay.widget.set_content(original_data)
+            window.open_settings();window.settings_page.navigation.setCurrentRow(0);QTest.qWait(60)
+            choices=window.settings_page.controls;choice=choices['language'];button=choices['restart']
+            choice.setCurrentIndex(choice.findData(locale));QTest.qWait(20)
+            assert not control(window,button).isEnabled()
+            choice.setCurrentIndex(choice.findData('ko' if locale=='en' else 'en'));QTest.qWait(20)
+            assert control(window,button).isEnabled()
+            target=path.with_name(path.stem+'-restart.png');assert window.grab().save(str(target));report['screens'].append(str(target))
+            choice.setCurrentIndex(choice.findData(locale));QTest.qWait(20)
+            assert not control(window,button).isEnabled()
+            report['restart_setting_state']=True
             window.nav.setCurrentRow(0);settle()
             assert window.grab().save(str(path))
             if window.tray.isSystemTrayAvailable():

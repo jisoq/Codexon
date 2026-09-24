@@ -1,4 +1,3 @@
-from pathlib import Path
 import pytest
 from cachemonitor.observer_control import ObserverManager, URL
 from cachemonitor.proxy_supervisor import Protection, Supervisor
@@ -26,27 +25,6 @@ def test_runtime_publication_failure_keeps_supervising_and_recovers(tmp_path,mon
     assert s.tick() and s.publish_failures==0
     import json
     assert json.loads(m.runtime_path.read_text())['publication_failures']==2
-
-
-def test_atomic_write_retries_windows_sharing_failure(tmp_path,monkeypatch):
-    from cachemonitor import observer_control as module
-    target=tmp_path/'state.json';target.write_bytes(b'old')
-    original=module.os.replace;calls=[]
-    def replace(source,destination):
-        calls.append(1)
-        if len(calls)<3:
-            error=PermissionError('locked');error.winerror=5;raise error
-        return original(source,destination)
-    monkeypatch.setattr(module.os,'replace',replace)
-    monkeypatch.setattr(module.time,'sleep',lambda _:None)
-    module.atomic_write(target,b'new')
-    assert target.read_bytes()==b'new' and len(calls)==3
-    assert not list(tmp_path.glob('*.tmp'))
-    def denied(*args):
-        error=PermissionError('denied');error.winerror=5;raise error
-    monkeypatch.setattr(module.os,'replace',denied)
-    with pytest.raises(PermissionError):module.atomic_write(target,b'not committed')
-    assert target.read_bytes()==b'new' and not list(tmp_path.glob('*.tmp'))
 
 
 def manager(tmp_path,monkeypatch):

@@ -11,6 +11,11 @@ _parts = sorted(((source, target) for source, target in _catalog.items() if len(
                 key=lambda item: len(item[0]), reverse=True)
 
 
+class Verbatim(str):
+    """Presentation content supplied by the user, never a translation key."""
+    def __str__(self):return self
+
+
 def set_language(value):
     global _language
     _language = 'en' if value == 'en' else 'ko'
@@ -21,8 +26,9 @@ def language():
     return _language
 
 
-@lru_cache(maxsize=8192)
+@lru_cache(maxsize=8192, typed=True)
 def tr(value):
+    if isinstance(value,Verbatim):return str.__str__(value)
     if _language != 'en' or not isinstance(value, str):
         return value
     exact = _catalog.get(value)

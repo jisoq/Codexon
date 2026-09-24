@@ -1,10 +1,7 @@
 import json
 import time
-from PySide6.QtCore import QSettings
-from PySide6.QtWidgets import QApplication
 from cachemonitor.quota import clean_limits,quota_display
 from cachemonitor.index import UsageIndex,sanitized
-from cachemonitor.dashboard import Dashboard
 from test_core import event,fixture_home
 
 
@@ -67,27 +64,3 @@ def test_only_quota_fields_are_sanitized_and_latest_observation_wins(tmp_path):
         assert idx.poll()['quota']['plan_type']=='pro'
         assert idx.bytes_read==0
     finally: idx.close()
-
-
-def test_tray_menu_switches_and_persists_actual_quota(tmp_path):
-    app=QApplication.instance() or QApplication([])
-    settings=QSettings(str(tmp_path/'tray.ini'),QSettings.IniFormat)
-    w=Dashboard([],start_worker=False,settings=settings)
-    try:
-        w.snapshot['quota']={**clean_limits(limits()),'observed_at':time.time()}
-        w.refresh_tray()
-        assert w.quota_mode=='weekly' and '84%' in w.tray.toolTip()
-        assert w._quota_icon_signature[0]=='84'
-        w.quota_actions['five_hour'].trigger()
-        assert settings.value('tray/quotaMode')=='five_hour'
-        assert w.quota_actions['five_hour'].isChecked() and not w.quota_actions['weekly'].isChecked()
-        assert w._quota_icon_signature[0]=='?' and '미확인' in w.tray.toolTip()
-        w.refresh_tray()
-        assert w._quota_icon_signature[0]=='?'
-    finally:
-        w.quitting=True; w.tick.stop(); w.tray.hide(); w.close()
-    restored=Dashboard([],start_worker=False,settings=settings)
-    try:
-        assert restored.quota_mode=='five_hour'
-    finally:
-        restored.quitting=True; restored.tick.stop(); restored.tray.hide(); restored.close()

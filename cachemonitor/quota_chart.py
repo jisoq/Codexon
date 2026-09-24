@@ -48,13 +48,18 @@ class QuotaHistory(Plot):
     def point(self,index,key):
         row=self.rows[index];value=row.get(key)
         if value is None:return None
-        low,high,_=self.axis if key=='remaining' else (0,self.cost_ceiling if key=='cycle_cost' else self.ceiling,0)
+        low,high=self.bounds(key)
         return QPointF(self.x_at(index),
                        self.box.bottom()-self.box.height()*(value-low)/(high-low))
 
+    def bounds(self,key):
+        if key=='remaining':return self.axis[:2]
+        if key=='cycle_cost':return 0,self.cost_ceiling
+        return self.value_floor,self.ceiling
+
     def x_at(self,index):
-        return (self.box.left()+self.series['active_times'][index]*self.time_scale+
-                bisect_right(self.series['gap_indices'],index)*self.gap_width)
+        return min(self.box.right(),self.box.left()+self.series['active_times'][index]*self.time_scale+
+                   bisect_right(self.series['gap_indices'],index)*self.gap_width)
 
     def gap_at(self,x,y):
         if not self.box.contains(QPointF(x,y)):return None
@@ -81,7 +86,16 @@ class QuotaHistory(Plot):
             target=max(1,self.series['high'])/4;unit=10**floor(log10(target));step=ceil(target/unit)*unit
             self.axis=(0,step*4,step)
         else:self.axis=remaining_axis([{'remaining':self.series['low']},{'remaining':self.series['high']}])
-        self.ceiling=max(self.series['value_maximum'],self.reference or 0)*1.12 or 1
+        value_low=self.series['value_minimum']
+        value_high=self.series['value_maximum']
+        if self.reference is not None:
+            value_low=self.reference if value_low is None else min(value_low,self.reference)
+            value_high=max(value_high,self.reference)
+        # Missing observations do not imply zero; keep flat series readable too.
+        if value_low is None:self.value_floor,self.ceiling=0,1
+        else:
+            padding=max((value_high-value_low)*.12,value_high*.01,.0001)
+            self.value_floor=max(0,value_low-padding);self.ceiling=value_high+padding
         self.cost_ceiling=self.series['cost_maximum']*1.12 or 1
         cost_width=max(82,p.fontMetrics().horizontalAdvance(usd(self.cost_ceiling))+14)
         value_width=max(92,p.fontMetrics().horizontalAdvance(usd(self.ceiling))+14)
@@ -115,16 +129,16 @@ class QuotaHistory(Plot):
             p.setPen(QPen(QColor(palette['border']),1));p.drawLine(QPointF(box.left(),y),QPointF(box.right(),y))
             p.setPen(QColor(palette['muted']));p.drawText(QRectF(0,y-9,44,18),Qt.AlignRight|Qt.AlignVCenter,f'{value:g}'+('%p' if cumulative else '%'))
         if self.money:
-            for offset,width,ceiling,color,title in ((0,cost_width,self.cost_ceiling,'output','누적 API\nUSD'),
-                                                    (cost_width,value_width,self.ceiling,'written','주간 동등\nUSD / 100%p')):
+            for offset,width,axis_low,ceiling,color,title in ((0,cost_width,0,self.cost_ceiling,'output','누적 API\nUSD'),
+                                                    (cost_width,value_width,self.value_floor,self.ceiling,'written','주간 동등\nUSD / 100%p')):
                 x=box.right()+offset
                 p.setPen(QPen(QColor(palette[color]),1));p.drawLine(QPointF(x,box.top()),QPointF(x,box.bottom()))
                 p.drawText(QRectF(x+7,0,width-7,34),Qt.AlignLeft,title)
                 for fraction in (0,.5,1):
                     y=box.bottom()-box.height()*fraction
-                    p.drawText(QRectF(x+7,y-9,width-7,18),Qt.AlignLeft|Qt.AlignVCenter,usd(ceiling*fraction))
+                    p.drawText(QRectF(x+7,y-9,width-7,18),Qt.AlignLeft|Qt.AlignVCenter,usd(axis_low+(ceiling-axis_low)*fraction))
             if self.reference is not None:
-                y=box.bottom()-box.height()*self.reference/self.ceiling
+                y=box.bottom()-box.height()*(self.reference-self.value_floor)/(self.ceiling-self.value_floor)
                 p.setPen(QPen(QColor(palette['accent']),1,Qt.DashLine))
                 p.drawLine(QPointF(box.left(),y),QPointF(box.right(),y))
         indices=self.series['samples'][256 if box.width()<600 else 768]
@@ -132,7 +146,7 @@ class QuotaHistory(Plot):
         if self.money:curves += [('cycle_cost','output',Qt.SolidLine),('cycle_value','written',Qt.DashDotLine)]
         xs=[self.x_at(index) for index in indices]
         for key,color,style in curves:
-            low,high,_=self.axis if key=='remaining' else (0,self.cost_ceiling if key=='cycle_cost' else self.ceiling,0)
+            low,high=self.bounds(key)
             scale=box.height()/(high-low);bottom=box.bottom()
             previous=None;previous_x=None;previous_index=None
             path=QPainterPath();markers=[]
@@ -238,26 +252,22 @@ class QuotaHistory(Plot):
 
     def detail_for(self,index):
         row=self.rows[index];previous=self.rows[index-1] if index else None
-        comparable=previous is not None and row['connect'] and not row['reset_kind']
-        change=row['remaining']-previous['remaining'] if comparable else None
         cumulative=self.series.get('cumulative',False)
-        items=[dict(label='누적 소모량' if cumulative else '잔여량',value=f"{row['remaining']:g}"+('%p' if cumulative else '%'),color='cached'),
-               dict(label='직전 관측 대비',value=f'{change:+g}%p' if change is not None else '—',color='cached')]
+        items=[dict(label='누적 소모량' if cumulative else '잔여량',value=f"{row['remaining']:g}"+('%p' if cumulative else '%'),color='cached')]
+        completed=None
         if self.money:
-            cost=row.get('cycle_cost');old=previous.get('cycle_cost') if comparable else None
-            difference=cost-old if cost is not None and old is not None else None
-            increase=('+'+usd(difference) if difference>=0 else '−'+usd(-difference)) if difference is not None else '—'
-            items += [dict(label='누적 API 환산액',value=usd(cost),color='output'),
-                      dict(label='API 증가액',value=increase,color='output'),
-                      dict(label='주간 동등 · 100%p'+(' · 마지막 확인값' if row.get('value_held') else ''),value=usd(row.get('cycle_value')),color='written'),
-                      dict(label='전체 누적 기준',value=usd(self.reference),color='accent')]
+            items += [dict(label='누적 API 환산액',value=usd(row.get('cycle_cost')),color='output'),
+                      dict(label='주간 동등 가치',value=usd(row.get('cycle_value')),color='written')]
+            amount=self.series['completed_costs'][index]
+            if amount is not None:
+                completed=dict(label='완료 구간별 API 환산액',value=usd(amount))
         if row['reset_kind']:note=(' · '.join(row.get('markers',[])) or '사용량 리셋')+' · 새 주기'
         elif not previous:note=''
         elif not row['connect']:note='' if self.series.get('active_only') else '공백 이후 첫 관측'
         elif self.money and row.get('cycle_cost') is None:note='금액 확인 중'
         elif self.money and row.get('cycle_value') is None:note='동등 가치 계산 대기'
         else:note=''
-        return dict(title=clock(row['at'],True),at=row['at'],items=items,note=note)
+        return dict(title=clock(row['at'],True),at=row['at'],items=items,note=note,completed=completed)
 
     def refresh_detail(self,detail):
         if not detail or not self.rows:return {}

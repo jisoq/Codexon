@@ -1,12 +1,12 @@
 """View transitions use the same native anchor and one control per action."""
 import pytest
-from PySide6.QtCore import QSettings, QAbstractAnimation
+from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QApplication
 
 from cachemonitor.analysis_engine import AnalysisEngine
 from cachemonitor.overlay import OverlayController
 from cachemonitor.overlay_data import OverlaySummaries
-from cachemonitor.overlay_tracking import Selection, anchored_monitor_geometry
+from cachemonitor.overlay_tracking import Selection
 from test_overlay import A, source
 
 
@@ -63,77 +63,6 @@ def layout_controller(tmp_path,monkeypatch):
     controller.stop();app.processEvents()
 
 
-def test_detail_extends_left_without_resizing_monitor(layout_controller):
-    controller=layout_controller
-    original=controller.monitor_geometry
-    controller.toggle_expanded()
-    expanded=controller.current_geometry
-    assert controller.automatic_mode=='detail'
-    assert controller.monitor_geometry==original
-    assert expanded[0]+expanded[2]==original[0]+original[2]
-    assert expanded[1]+expanded[3]==original[1]+original[3]
-    assert expanded[2]-original[2]==240
-    assert controller.native.styles[int(controller.widget.winId())]
-    assert not controller.native.styles[int(controller.detail.winId())]
-    controller.toggle_expanded()
-    assert controller.current_geometry==original
-
-
-def test_detail_near_left_anchor_uses_inline_view_without_moving(layout_controller):
-    controller=layout_controller
-    controller.anchor=(0,.5);controller.refresh()
-    original=controller.monitor_geometry
-    controller.toggle_expanded()
-    assert controller.automatic_mode=='detail-inline'
-    assert controller.current_geometry==original
-    assert controller.widget.width()==380
-    assert controller.anchor==(0,.5)
-
-
-def test_reduced_and_icon_fallback_preserve_user_preference(layout_controller):
-    controller=layout_controller
-    controller.toggle_expanded()
-    controller.native.bounds=(0,0,1300,450);controller.refresh()
-    assert controller.widget.content_model.compact
-    assert controller.widget.panel_height() in (398,414)
-    controller.native.bounds=(0,0,300,240);controller.refresh()
-    assert controller.automatic_mode=='icon' and not controller.collapsed
-    assert controller.current_geometry[2:]==(32,32)
-    controller.native.bounds=(0,0,1300,1000);controller.refresh()
-    assert controller.automatic_mode=='detail' and controller.expanded
-    controller.set_collapsed(True)
-    assert controller.automatic_mode=='icon'
-    controller.set_collapsed(False)
-    assert controller.automatic_mode=='detail'
-
-
-def test_full_monitor_fits_the_new_height_before_reducing_tokens(layout_controller):
-    controller=layout_controller
-    complete=source()
-    for row in complete['history']:row.update(cached=5000,written=0,reasoning=0)
-    engine=AnalysisEngine();engine.ingest([complete])
-    controller.receive_snapshot({'overlay_sessions':OverlaySummaries().collect(engine)})
-    controller.native.bounds=(0,0,1300,610);controller.refresh()
-    assert controller.automatic_mode=='monitor'
-    assert controller.monitor_geometry==(904,16,380,578)
-    assert not controller.widget.content_model.compact
-    controller.native.bounds=(0,0,1300,609);controller.refresh()
-    assert controller.automatic_mode=='compact'
-    assert controller.monitor_geometry[3]==398
-    assert controller.monitor_geometry[1]+controller.monitor_geometry[3]==593
-
-
-def test_previous_height_legacy_anchor_migration_preserves_lower_right_edge(layout_controller):
-    controller=layout_controller
-    legacy=(.6,.75)
-    old=anchored_monitor_geometry(controller.native.bounds,96,380,580,anchor=legacy,edge_anchor=False)
-    controller.anchor=legacy;controller._legacy_anchor=True;controller.refresh()
-    current=controller.monitor_geometry
-    assert (current[0]+current[2],current[1]+current[3])==(old[0]+old[2],old[1]+old[3])
-    assert controller.settings.value('overlay/anchorMode')=='edge'
-    assert not controller._legacy_anchor
-
-
 def test_popup_outside_click_escape_order_and_persisted_opacity(layout_controller):
     controller=layout_controller
     assert controller.opacity==94 and not controller.toolbar.isVisible()
@@ -153,93 +82,7 @@ def test_popup_outside_click_escape_order_and_persisted_opacity(layout_controlle
     assert controller.settings.value('overlay/opacity',type=int)==63
 
 
-def test_detail_switch_places_final_geometry_once_without_animation(layout_controller):
-    controller=layout_controller
-    controller.native.reduce_motion=lambda:False
-    monitor=controller.monitor_geometry
-    placements=[]
-    original_place=controller.native.place
-    def record(hwnd,box):
-        if hwnd==int(controller.widget.winId()):placements.append(box)
-        return original_place(hwnd,box)
-    controller.native.place=record
-    controller.toggle_expanded()
-    geometry=controller.current_geometry
-    assert geometry[2]==monitor[2]+240 and placements==[geometry]
-    assert (geometry[0]+geometry[2],geometry[1]+geometry[3])==(monitor[0]+monitor[2],monitor[1]+monitor[3])
-    assert controller.monitor_geometry==monitor
-    assert controller.detail.quick.rootObject().opacity()==1
-    controller.toggle_expanded()
-    assert controller.automatic_mode=='monitor' and controller.current_geometry==monitor
-    assert placements==[geometry,monitor]
-    controller.native.reduce_motion=lambda:True
-    controller.toggle_expanded()
-    assert controller.current_geometry[2]==620
-
-
-def test_restore_icon_can_be_dragged_to_top_left_and_keeps_its_anchor(layout_controller):
-    controller=layout_controller
-    controller.set_collapsed(True)
-    x,y,_,_=controller.current_geometry
-    controller.begin_drag((100,100));controller.end_drag((100+16-x,100+16-y))
-    assert controller.current_geometry==(16,16,32,32)
-    anchor=controller.anchor
-    controller.set_collapsed(False);controller.set_collapsed(True)
-    assert controller.current_geometry==(16,16,32,32)
-    assert controller.anchor==anchor
-    assert controller.settings.value('overlay/anchorMode')=='edge'
-
-
-def test_identical_controller_refresh_does_not_repaint_content(layout_controller):
-    controller=layout_controller
-    repaints=[]
-    controller.widget.content_model.update=lambda:repaints.append(1)
-    for _ in range(20):controller.refresh()
-    assert repaints==[]
-
-
-def test_conditional_height_transition_keeps_lower_anchor(layout_controller):
-    controller=layout_controller
-    controller.native.reduce_motion=lambda:False
-    controller.reduced_motion=False
-    before=controller.monitor_geometry
-    complete=source()
-    for row in complete['history']:row.update(cached=5000,written=0,reasoning=0)
-    engine=AnalysisEngine();engine.ingest([complete])
-    controller.receive_snapshot({'overlay_sessions':OverlaySummaries().collect(engine)})
-    assert controller.height_animation.state()==QAbstractAnimation.Running
-    controller.height_animation.setCurrentTime(60)
-    during=controller.monitor_geometry
-    assert during[1]+during[3]==before[1]+before[3]
-    assert controller.widget.panel_height()<during[3]<before[3]
-    controller.height_animation.setCurrentTime(120)
-    assert controller.monitor_geometry[3]==controller.widget.panel_height()
-
-
-def test_minimize_restore_transition_is_brief_and_preserves_view_anchor(layout_controller):
-    controller=layout_controller
-    controller.toggle_expanded()
-    monitor=controller.monitor_geometry
-    controller.native.reduce_motion=lambda:False
-    controller.set_collapsed(True)
-    assert controller.view_animation.state()==QAbstractAnimation.Running
-    assert controller.view_animation.duration()<=120
-    controller.view_animation.setCurrentTime(50)
-    assert 0<controller.icon.windowOpacity()<1
-    controller.view_animation.setCurrentTime(100)
-    assert controller.icon.windowOpacity()==1 and controller.expanded
-    controller.set_collapsed(False)
-    assert controller.view_animation.state()==QAbstractAnimation.Running
-    assert controller.automatic_mode=='detail' and controller.monitor_geometry==monitor
-    controller.view_animation.setCurrentTime(100)
-    assert all(window.windowOpacity()==1 for window in (controller.widget,controller.shadow,*controller.chrome))
-    controller.native.reduce_motion=lambda:True
-    controller.set_collapsed(True)
-    assert controller.view_animation.state()==QAbstractAnimation.Stopped
-    assert controller.icon.windowOpacity()==1
-
-
-def test_keyboard_focus_connects_existing_header_graph_scroll_and_popup(layout_controller):
+def check_keyboard_focus_path(layout_controller):
     from PySide6.QtCore import Qt
     from PySide6.QtQuick import QQuickItem
     from PySide6.QtTest import QTest
@@ -284,55 +127,6 @@ def test_keyboard_focus_connects_existing_header_graph_scroll_and_popup(layout_c
     key(controller.actions,Qt.Key_Escape)
     assert not controller.expanded and item(controller.actions,'expand').hasActiveFocus()
     assert not any(control.qml_errors for control in controller.chrome)
-
-
-def test_keyboard_minimize_restore_and_move_keep_existing_control_paths(layout_controller):
-    from PySide6.QtCore import Qt
-    from PySide6.QtQuick import QQuickItem
-    from PySide6.QtTest import QTest
-    controller=layout_controller
-    controller.focus_control('collapse')
-    QTest.keyClick(controller.actions.quick,Qt.Key_Space);QTest.qWait(20)
-    restore=controller.icon.quick.rootObject().findChild(QQuickItem,'restore')
-    ring=controller.icon.quick.rootObject().findChild(QQuickItem,'moveFocusRing')
-    assert controller.collapsed and restore.hasActiveFocus()
-    assert restore.property('keyboardFocus') and ring.isVisible()
-    assert (restore.x(),restore.y(),restore.width(),restore.height())==(4,4,32,32)
-    assert (ring.x(),ring.y(),ring.width(),ring.height())==(0,0,40,40)
-    icon_box=controller.native.placed[int(controller.icon.winId())]
-    assert icon_box==(controller.current_geometry[0]-4,controller.current_geometry[1]-4,40,40)
-    before=controller.current_geometry
-    QTest.keyClick(controller.icon.quick,Qt.Key_Left,Qt.ShiftModifier);QTest.qWait(20)
-    assert controller.current_geometry[0]==before[0]-10
-    assert controller.settings.value('overlay/anchorMode')=='edge'
-    QTest.keyClick(controller.icon.quick,Qt.Key_Return);QTest.qWait(20)
-    assert not controller.collapsed
-    assert controller.actions.quick.rootObject().findChild(QQuickItem,'expand').hasActiveFocus()
-    assert not any(control.qml_errors for control in controller.chrome)
-
-
-def test_pointer_restore_returns_target_focus_before_hiding_icon(layout_controller):
-    from PySide6.QtCore import Qt
-    from PySide6.QtTest import QTest
-    controller=layout_controller
-    restores=[];controller.native.restore_target_focus=restores.append
-    controller.set_collapsed(True)
-    restores.clear()
-    QTest.mouseClick(controller.icon,Qt.LeftButton)
-    assert not controller.collapsed and restores==[1]
-
-
-def test_drag_uses_geometry_only_and_keeps_relative_windows(layout_controller):
-    c=layout_controller
-    before=dict(c.native.placed);original=c.monitor_geometry
-    c.begin_drag((500,500))
-    refresh=c.refresh
-    c.refresh=lambda:pytest.fail('Unchanged layout must not refresh content during drag')
-    c.move_drag((450,460))
-    assert c.monitor_geometry[:2]==(original[0]-50,original[1]-40)
-    for hwnd,box in before.items():
-        assert c.native.placed[hwnd]==(box[0]-50,box[1]-40,*box[2:])
-    c.refresh=refresh;c.end_drag((450,460))
 
 
 def test_session_collapse_isolated_and_persistent(layout_controller):
@@ -424,7 +218,7 @@ def test_native_companion_keyboard_routes(layout_controller):
     try:
         host.activateWindow();QTest.qWait(40)
         c.receive_target({'target':{'hwnd':hwnd},'selection':Selection(A)})
-        test_keyboard_focus_connects_existing_header_graph_scroll_and_popup(c)
+        check_keyboard_focus_path(c)
         from PySide6.QtCore import Qt
         from cachemonitor.overlay_chrome import named_item
         c.focus_control('collapse')

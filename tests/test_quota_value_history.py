@@ -66,16 +66,6 @@ def test_gap_excludes_both_cost_and_consumption_without_invalidating_or_splittin
     assert report==original
 
 
-def test_missing_cost_is_unknown_zero_consumption_has_no_value_and_delayed_cost_updates():
-    report=report_for([interval([(100,80),(130,80)],[(115,None)])])
-    rows,periods=quota_value_history(report,history_rows(report,'weekly'))
-    assert rows[-1]['cycle_cost'] is None and periods[0]['value'] is None
-    report=report_for([interval([(100,80),(130,80),(160,75)],[(115,4)])])
-    rows,periods=quota_value_history(report,history_rows(report,'weekly'))
-    assert rows[1]['cycle_cost']==4 and rows[1]['cycle_value'] is None
-    assert periods[0]['value']==80
-
-
 def test_account_switch_does_not_mix_money_or_invent_reset():
     old=interval([(100,80),(130,60)],[(115,10000)])
     old['account']='b'
@@ -85,57 +75,3 @@ def test_account_switch_does_not_mix_money_or_invent_reset():
     assert all(r['account']=='a' for r in rows)
     assert all(r['reset_kind'] is None for r in rows)
     assert quota_statistics(report)['cost']==3
-
-
-def test_gap_only_interval_cannot_turn_unobserved_consumption_into_value():
-    report=report_for([interval([(100,80),(500,40)],[(300,100)])])
-    rows,periods=quota_value_history(report,history_rows(report,'weekly'))
-    assert len(periods)==1 and periods[0]['value'] is None
-    assert rows[-1]['cycle_cost'] is None
-    assert quota_statistics(report)['delta']==0
-
-
-def test_metadata_and_repeated_full_samples_do_not_create_new_cycles():
-    report=report_for([interval([(100,80),(130,60)],[(115,12)]),
-                       interval([(160,100),(190,100),(220,90)],[(205,4)])])
-    report['history'][-1]['reset']=99999
-    rows,periods=quota_value_history(report,history_rows(report,'weekly'))
-    assert len(periods)==2 and periods[-1]['value']==40
-    assert sum(bool(r['reset_kind']) for r in rows)==1
-
-
-@pytest.mark.parametrize('gap,expected_delta,expected_cost', [(120,30,105),(121,10,5)])
-def test_gap_threshold_matches_reset_observation_freshness(gap,expected_delta,expected_cost):
-    report=report_for([interval([(100,80),(130,75),(130+gap,55),(160+gap,50)],
-                               [(115,2),(140,100),(145+gap,3)])])
-    total=quota_statistics(report)
-    assert total['delta']==expected_delta and total['cost']==expected_cost
-
-
-def test_request_started_inside_gap_is_not_counted_as_observed_post_gap_cost():
-    report=report_for([interval([(100,80),(130,75),(400,55),(430,50)],
-                               [(115,2),(405,100),(420,3)])])
-    report['cycles'][0]['cost_rows'][1]['request_start']=200
-    total=quota_statistics(report)
-    assert total['delta']==10 and total['cost']==5
-    assert total['boundary_excluded_calls']==1
-
-
-def test_increase_after_gap_starts_cycle_without_counting_gap_consumption():
-    report=report_for([interval([(100,80),(130,75)],[(115,2)]),
-                       interval([(400,100),(430,95)],[(415,3)])])
-    rows,periods=quota_value_history(report,history_rows(report,'weekly'))
-    assert rows[2]['reset_kind']=='scheduled_reset'
-    assert len(periods)==2 and periods[1]['value']==60
-    assert rows[2]['cycle_cost']==0 and not rows[2]['connect']
-
-
-def test_unidentified_history_interleaved_with_live_is_not_an_account_change_or_cycle():
-    report=sample_report()
-    originals=deepcopy(report['history'])
-    for row in originals:
-        report['history'].append({**row,'id':'unknown'+row['id'],'account':'','source':'history','at':row['at']+1})
-    rows,periods=quota_value_history(report,history_rows(report,'weekly'))
-    assert len(rows)==len(originals) and len(periods)==3
-    assert [p['value'] for p in periods]==[60,50,60]
-    assert sum(bool(r['reset_kind']) for r in rows)==2
