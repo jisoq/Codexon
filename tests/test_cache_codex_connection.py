@@ -19,12 +19,12 @@ from cachemonitor.core import usage_values
 from test_model_proxy import server
 
 
-@pytest.mark.parametrize('websocket',[False,True])
-def test_installed_codex_independent_request(tmp_path,websocket):
+@pytest.mark.parametrize('websocket,maintenance_websocket',[(False,False),(True,True),(True,False)])
+def test_installed_codex_independent_request(tmp_path,websocket,maintenance_websocket):
     try:executable=locate_codex()
     except RuntimeError:pytest.skip('Installed Codex runtime unavailable; mock unit tests are separate')
     async def scenario():
-        seen=[];snapshots=[];notices=[];futures={};sequence=0
+        seen=[];wire=[];snapshots=[];notices=[];futures={};sequence=0
         journal=Journal(tmp_path/'jobs.sqlite');store=EvidenceStore(tmp_path/'e.sqlite')
         contexts=Contexts();executor=Executor(journal,contexts)
         def events(body):
@@ -41,10 +41,10 @@ def test_installed_codex_independent_request(tmp_path,websocket):
                 ws=web.WebSocketResponse();await ws.prepare(request)
                 async for message in ws:
                     if message.type!=web.WSMsgType.TEXT:continue
-                    body=json.loads(message.data);seen.append(body)
+                    body=json.loads(message.data);seen.append(body);wire.append('WebSocket')
                     for event in events(body):await ws.send_json(event)
                 return ws
-            body=await request.json();seen.append(body)
+            body=await request.json();seen.append(body);wire.append('HTTP')
             return web.Response(text=''.join('data: '+json.dumps(e)+'\n\n' for e in events(body)),content_type='text/event-stream')
         app=web.Application();app.router.add_route('*','/responses',endpoint)
         home=tmp_path/'home';home.mkdir()
@@ -88,10 +88,19 @@ def test_installed_codex_independent_request(tmp_path,websocket):
                 (home/'config.toml').write_text(''.join('[hooks.state.'+json.dumps(k)+']\nenabled=true\ntrusted_hash='+json.dumps(v['trusted_hash'])+'\n' for k,v in trusted.items()),encoding='utf-8')
                 thread=await rpc('thread/start',dict(model='gpt-6-luna',modelProvider='isolated',cwd=str(tmp_path),sandbox='read-only',approvalPolicy='never',ephemeral=False,baseInstructions='Reply OK. No tools.',config={'hooks.state':trusted}))
                 tid=thread['thread']['id'];await turn(tid,'Remember SYNTHETIC_ORIGINAL. Reply OK.')
+                if websocket and not maintenance_websocket:
+                    await turn(tid,'SYNTHETIC_DELTA. Reply OK.')
                 before=await rpc('thread/read',dict(threadId=tid,includeTurns=True))
                 snapshot=snapshots[-1];rid=snapshot[1]['id']
-                result=await executor.run(str(home),tid,rid,upstream+'/responses',snapshot[4],anchor=time.monotonic()-1700,deadline=time.monotonic(),latency_bound=20,websocket=websocket)
+                original_context=contexts.responses[rid][0]
+                result=await executor.run(str(home),tid,rid,upstream+'/responses',snapshot[4],anchor=time.monotonic()-1700,deadline=time.monotonic(),latency_bound=20,websocket=maintenance_websocket)
                 assert result=='completed'
+                assert wire[-1]==('WebSocket' if maintenance_websocket else 'HTTP')
+                assert seen[-1]['input'][:len(original_context['input'])]==original_context['input']
+                if websocket and not maintenance_websocket:
+                    assert len(wire[:-1])>=2 and set(wire[:-1])=={'WebSocket'}
+                    assert 'SYNTHETIC_ORIGINAL' in json.dumps(seen[-1]) and 'SYNTHETIC_DELTA' in json.dumps(seen[-1])
+                    assert 'previous_response_id' not in seen[-1] and 'type' not in seen[-1]
                 after=await rpc('thread/read',dict(threadId=tid,includeTurns=True))
                 assert before['thread']['turns']==after['thread']['turns']
                 assert ('tools' in seen[-1])==('tools' in snapshot[0])
