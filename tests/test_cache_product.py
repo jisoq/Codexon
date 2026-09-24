@@ -121,6 +121,11 @@ def test_current_cohort_recovers_after_changes_but_keeps_unknown_and_no_return(t
     rows[10]['output']=None
     assert evaluate(rows[-1]['ts']+10)['reason']=='natural_cost_bounds_unobserved'
     rows[10]['output']=4
+    old_scope=json.loads(control.db.execute("SELECT data FROM cache_gaps WHERE turn='5'").fetchone()[0])['scope']
+    saved=dict(rows[10]);rows[10].update(input=1,input_conflict=True)
+    assert evaluate(rows[-1]['ts']+10)['reason']=='natural_cost_bounds_unobserved'
+    assert json.loads(control.db.execute("SELECT data FROM cache_gaps WHERE turn='5'").fetchone()[0])['scope']==old_scope
+    rows[10]=saved
     # Censored no-return cost survives selection, including unknown cost.
     evaluate(rows[-1]['ts']+20000)
     gap=Gap(**json.loads(control.db.execute("SELECT data FROM cache_gaps WHERE turn='7'").fetchone()[0]))
