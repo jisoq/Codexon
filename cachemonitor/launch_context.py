@@ -23,7 +23,22 @@ def resolve_homes(explicit=None, *, path=None):
 def save_homes(homes, *, path=None):
     path = Path(path or preference_path())
     path.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write(path, json.dumps({'homes': [str(Path(h).resolve()) for h in homes]}, ensure_ascii=False).encode())
+    document=read_json(path);document['homes']=[str(Path(h).resolve()) for h in homes]
+    atomic_write(path, json.dumps(document, ensure_ascii=False).encode())
+
+
+def cache_paths(*,path=None):
+    saved=read_json(path or preference_path()).get('cache_paths',{})
+    return {key:value for key,value in saved.items() if key in ('index_path','evidence_path','quota_path')
+            and isinstance(value,str) and Path(value).is_absolute()} if isinstance(saved,dict) else {}
+
+
+def save_cache_paths(index_path,evidence_path,quota_path,*,path=None):
+    path=Path(path or preference_path());document=read_json(path)
+    document['cache_paths']={key:str(Path(value).resolve()) for key,value in
+        (('index_path',index_path),('evidence_path',evidence_path),('quota_path',quota_path)) if value}
+    path.parent.mkdir(parents=True,exist_ok=True)
+    atomic_write(path,json.dumps(document,ensure_ascii=False).encode())
 
 
 def command_arguments(command):

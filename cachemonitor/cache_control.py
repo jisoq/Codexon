@@ -37,6 +37,9 @@ class Control:
     def set(self,key,value):
         self.db.execute('INSERT OR REPLACE INTO cache_preferences VALUES(?,?)',(key,json.dumps(value)))
 
+    def enabled(self,feature):
+        return self.get('enabled',True) and self.get(feature,False)
+
     def profile(self,home,sid,row):
         keep=('key','ts','model','effort','service_tier','input','cached','written','output','reasoning','cost','purpose',
               'compaction_epoch','policy_scope','policy_scope_start','output_samples','output_mean','output_high','output_missing')
@@ -98,7 +101,7 @@ def hook_decision(path,home,event,timeout=60,*,observe_only=False):
         if observe_only:return {}
         if event.get('hook_event_name')!='UserPromptSubmit':return {}
         if not all(isinstance(event.get(k),str) and event[k] for k in ('session_id','turn_id','model')):return {}
-        if not control.get('guard',False) or time.time()-control.get('ui_heartbeat',0)>5:return {}
+        if not control.enabled('guard') or time.time()-control.get('ui_heartbeat',0)>5:return {}
         if not control.guard_needed(home,event):return {}
         key=uuid.uuid4().hex;now=time.time()
         digest=hashlib.sha256(str(event.get('prompt','')).encode()).hexdigest()
