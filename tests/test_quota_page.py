@@ -84,6 +84,8 @@ def test_responsive_page_chart_and_single_details_path(quota_page,tmp_path,width
         assert panel.window.currentData()=='five_hour'
         assert not any(r['markers'] for r in panel.history.rows)
         assert panel.history.axis[1]<100
+        assert [key for key,_,_ in panel.history.curves()]==['remaining']
+        assert len(panel.history.detail_for(0)['items'])==1
         assert panel.basis.text()=='9%p'
         assert not host.qml_errors
     finally:
@@ -128,5 +130,23 @@ def test_cycle_selector_changes_graph_preserves_lifetime_and_selection_on_refres
         assert panel.result.text()==lifetime
         panel.set_history_period(time.time(),None)
         assert panel.result.text()==lifetime and panel.history.rows is period['series']['rows']
+        # The all-cycles entry keeps the fourth USD series while the percent
+        # axis changes to cumulative consumption. Check the real Quick scene.
+        panel.cycle_choice.setCurrentIndex(0)
+        plot=render_plot(host,panel.history)
+        assert panel.history.series is panel._view['overall']
+        assert panel.history.series['cumulative']
+        assert len(panel.history.curves())==4
+        assert panel.remaining_legend.text()=='━ 누적 소모량 · %p'
+        # This fixture starts mid-plateau or skips percent boundaries, so it
+        # must stay unpriced even in the cumulative view.
+        assert all(value is None for value in panel.history.series['completed_costs'])
+        index=0
+        plot.activateAt(panel.history.x_at(index),panel.history.box.center().y())
+        QTest.qWait(30)
+        from cachemonitor.pricing import usd
+        assert plot.detail['items'][0]['label']=='누적 소모량'
+        assert plot.detail['items'][3]['value']==usd(panel.history.series['completed_costs'][index])
+        assert host.grab().save(str(tmp_path/'quota-all-cycles.png'))
         assert not host.qml_errors
     finally:dispose(host)

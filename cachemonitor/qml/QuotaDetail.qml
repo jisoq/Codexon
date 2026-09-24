@@ -71,25 +71,6 @@ Rectangle {
                 }
             }
         }
-        RowLayout {
-            visible: !!card.plot.detail.completed
-            Layout.fillWidth: true
-            spacing: 10
-            Text {
-                text: appLanguage.text(card.plot.detail.completed ? card.plot.detail.completed.label : "")
-                font.family: appTheme.family; font.pixelSize: 12
-                color: appTheme.palette.muted
-                wrapMode: Text.Wrap; Layout.fillWidth: true
-            }
-            Text {
-                objectName: "quotaCompletedCost"
-                text: card.plot.detail.completed ? card.plot.detail.completed.value : ""
-                font.family: appTheme.family; font.pixelSize: 12
-                color: appTheme.palette.muted
-                wrapMode: Text.Wrap; horizontalAlignment: Text.AlignRight
-                Layout.maximumWidth: card.availableWidth * 0.57
-            }
-        }
         Text {
             text: appLanguage.text(card.plot.detail.note || "")
             visible: text.length > 0

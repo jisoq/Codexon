@@ -118,7 +118,9 @@ def prepare_series(rows):
     """Bound drawing size while retaining extrema and exact selectable records."""
     times=[];breaks=[];gaps=0;maximum=0;low=100;high=0;cost_maximum=0;value_maximum=0
     value_minimum=None
-    missing={key:[] for key in ('cycle_cost','cycle_value')}
+    completed=completed_percent_costs(rows)
+    completed_maximum=max((value for value in completed if value is not None),default=0)
+    missing={key:[] for key in ('cycle_cost','cycle_value','completed_cost')}
     counts={key:0 for key in missing}
     active_times=[];gap_indices=[];gap_seconds=[0.0];active=0.0
     for index,row in enumerate(rows):
@@ -137,7 +139,10 @@ def prepare_series(rows):
         value=row.get('cycle_value')
         if value is not None:value_minimum=value if value_minimum is None else min(value_minimum,value)
         for key in missing:
-            counts[key]+=row.get(key) is None
+            counts[key]+=(completed[index] if key=='completed_cost' else row.get(key)) is None
+            if key=='completed_cost' and index:
+                counts[key]+=bool(row.get('reset_kind') or any(
+                    row.get(field)!=rows[index-1].get(field) for field in ('cycle_start','account')))
             missing[key].append(counts[key])
     samples={}
     for budget in (256,768):
@@ -147,12 +152,13 @@ def prepare_series(rows):
         for i,row in enumerate(rows):
             bucket=min(budget-1,int(active_times[i]/span*budget))
             state=buckets.setdefault(bucket,[i,i,{}]);state[1]=i
-            for key in ('remaining','cycle_cost','cycle_value'):
-                value=row.get(key)
+            for key in ('remaining','cycle_cost','cycle_value','completed_cost'):
+                values=completed if key=='completed_cost' else None
+                value=values[i] if values is not None else row.get(key)
                 if value is None:continue
                 pair=state[2].setdefault(key,[i,i])
-                if value<rows[pair[0]][key]:pair[0]=i
-                if value>rows[pair[1]][key]:pair[1]=i
+                if value<(values[pair[0]] if values is not None else rows[pair[0]][key]):pair[0]=i
+                if value>(values[pair[1]] if values is not None else rows[pair[1]][key]):pair[1]=i
             if row['reset_kind']:selected.add(i)
         # Preserve both ends of the compressed breaks. Very dense breaks are
         # already represented by the bounded time buckets and the break mask.
@@ -165,7 +171,7 @@ def prepare_series(rows):
     return dict(rows=rows,times=times,breaks=breaks,missing=missing,samples=samples,maximum=maximum,low=low,high=high,
                 active_times=active_times,gap_indices=gap_indices,gap_seconds=gap_seconds,
                 cost_maximum=cost_maximum,value_minimum=value_minimum,value_maximum=value_maximum,
-                completed_costs=completed_percent_costs(rows))
+                completed_costs=completed,completed_maximum=completed_maximum)
 
 
 def prepare_quota_view(report):
