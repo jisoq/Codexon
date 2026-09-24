@@ -97,6 +97,51 @@ def test_natural_policy_consent_capture_wire_and_final_accounting(tmp_path):
     run_proxy_test(scenario())
 
 
+def test_policy_prices_only_rounds_fitting_consent_time_for_each_session(tmp_path):
+    from cachemonitor.cache_policy import executable_rounds
+    async def scenario():
+        index=tmp_path/'index.sqlite';seed_history(index);seed_history(index,'later-session')
+        scheduler=Scheduler('home',control_path(index));scheduler.control.set('automatic',True)
+        operation=allow(scheduler.journal)
+        for sid in ('session','later-session'):
+            request=dict(body(),prompt_cache_key=sid);result=dict(response(),id='warm5')
+            result['usage'].update(input_tokens=100000,input_tokens_details={'cached_tokens':99000,'cache_write_tokens':0})
+            scheduler.executor.contexts.completed(request,result)
+            scheduler.snapshot(request,result,time.monotonic(),URL,HEADERS,False)
+        # Every returned interval needs TWO maintenance rounds to cover it.
+        for sid,turn,data in scheduler.control.db.execute('SELECT sid,turn,data FROM cache_gaps').fetchall():
+            gap=json.loads(data)
+            if gap['returned']:gap['seconds']=4000
+            scheduler.control.db.execute('UPDATE cache_gaps SET data=? WHERE sid=? AND turn=?',(json.dumps(gap),sid,turn))
+        for remaining,state,calls in ((3600,'eligible',2),(2400,'off',0),(1700,'off',0)):
+            scheduler.journal.db.execute('UPDATE cache_operating_grants SET expires=?',(time.time()+remaining,))
+            for sid in ('session','later-session'):
+                decision=scheduler.policy(sid,scheduler.snapshots[sid])
+                assert (decision['state'],decision['calls'])==(state,calls),decision
+                if remaining==2400:assert decision['reason']=='no_positive_forward_estimate'
+                if remaining==1700:assert decision['reason']=='no_executable_rounds'
+        # Tick actually schedules nothing, and expiry is never extended.
+        expiry=scheduler.journal.operations.grants()[0]['expires']
+        for sid in scheduler.snapshots:scheduler.control.activity('home',dict(session_id=sid,turn_id='stop',hook_event_name='Stop'))
+        await scheduler.tick()
+        assert not scheduler.jobs and not scheduler.journal.rows()
+        assert scheduler.journal.operations.grants()[0]['expires']==expiry
+        # Revalidate the whole remaining plan before the first send, including
+        # a decision made before a scheduling delay reduced the available time.
+        scheduler.journal.db.execute('UPDATE cache_operating_grants SET expires=?',(time.time()+2400,))
+        await scheduler.maintain('later-session',scheduler.snapshots['later-session'],
+            dict(calls=2,interval=0,latency_bound=30,operation=operation),scheduler.control.revision('home'))
+        assert not scheduler.journal.rows()
+        # A delayed start and execution margin are included, not completion time.
+        assert executable_rounds(0,1200,2400,2)==2
+        assert executable_rounds(1200,1200,2400,2)==1
+        assert executable_rounds(0,1769,30,2)==0
+        assert executable_rounds(0,1769.5,1800,2)==1
+        assert executable_rounds(0,1800,3600,2)==0
+        await scheduler.close()
+    run_proxy_test(scenario())
+
+
 @pytest.mark.parametrize('second_session',[False,True])
 def test_shared_call_limit_serialization_and_same_context_rounds(tmp_path,second_session):
     async def scenario():

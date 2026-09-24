@@ -7,7 +7,7 @@ from urllib.parse import urlsplit
 from .cache_capture import RelayCapture
 from .cache_control import Control
 from .cache_execution import Contexts,Executor,Journal
-from .cache_policy import Gap,decide,cost_bounds,operating_scenarios
+from .cache_policy import Gap,decide,cost_bounds,operating_scenarios,executable_rounds
 from .cache_operating import target
 from .core import usage_values
 
@@ -99,6 +99,10 @@ class Scheduler:
                 self.journal.operations.stop(grant['id'],'call_limit')
                 return dict(state='stopped',reason='call_limit',calls=0,server_output_cap=False)
             max_calls=min(max_calls,2,remaining)
+            expires_in=grant['expires']-time.time() if grant and not grant['stopped'] else 3600
+            max_calls=executable_rounds(snapshot['anchor'],time.monotonic(),expires_in,max_calls)
+            if not max_calls:
+                return dict(state='off',reason='no_executable_rounds',calls=0,server_output_cap=False)
         decision=decide(rows,latency_bound=30,scheduler_slack=1,max_calls=max_calls)
         if scenarios:
             result={**decision,**scenarios,'latency_bound':30}
@@ -120,11 +124,22 @@ class Scheduler:
         for round_number in range(decision['calls']):
             if (self.closed or not self.control.get('automatic',False) or
                     self.executor.generation!=snapshot['generation'] or self.control.revision(self.home)!=revision):break
+            def valid():
+                if not self.control.get('automatic',False) or self.control.revision(self.home)!=revision:return False
+                if decision.get('operation'):
+                    grant=self.journal.operations.permission(decision['operation']['scope'])
+                    if not grant or grant['id']!=decision['operation']['id']:return False
+                    # A delayed first start may invalidate the remaining profitable
+                    # plan even while this individual request is still permitted.
+                    needed=decision['calls']-round_number
+                    if executable_rounds(anchor,time.monotonic(),grant['expires']-time.time(),needed,
+                                         latency_bound=decision['latency_bound'])<needed:return False
+                return True
             result=await self.executor.run(self.home,sid,rid,snapshot['url'],snapshot['headers'],anchor=anchor,
                 deadline=anchor+decision['interval'],latency_bound=decision['latency_bound'],websocket=snapshot['websocket'],
                 round_number=round_number,max_output_tokens=decision.get('output_cap'),operation=decision.get('operation'),
                 expected_generation=snapshot['generation'],
-                valid=lambda:self.control.get('automatic',False) and self.control.revision(self.home)==revision)
+                valid=valid)
             self.control.status(self.home,sid,dict(state=result,round=round_number+1,measured_saving=None))
             if result=='operation_deferred':
                 self.evaluations.pop(sid,None);return
