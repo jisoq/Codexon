@@ -46,9 +46,10 @@ def scoped_history(history):
 
 
 def decide(gaps, *, latency_bound, scheduler_slack, max_calls):
-    """Bootstrap from natural warm/cold calls and a bounded output allowance.
+    """Bootstrap from natural warm/cold calls and supplied cost scenarios.
 
-    Caller supplies conservative same-model cost bounds using pricing.token_cost.
+    Legacy maintenance_upper is a scenario cost, not a server total-cost cap.
+    Caller supplies same-model scenarios using pricing.token_cost.
     No prior maintenance sample is necessary. Missing natural bounds defer, and
     nonpositive holdout value selects off. Unknown-origin gaps never become humans.
     """
@@ -90,7 +91,8 @@ def decide(gaps, *, latency_bound, scheduler_slack, max_calls):
 def cost_bounds(previous,current,output_cap,input_extra=0):
     """Comparable natural-call scenario, not causal proof of idle expiration.
 
-    An execution cap covers output AND reasoning. Unknown writes stay unknown.
+    output_cap is the legacy name for the output-token scenario (including
+    reasoning). Only a verified execution path may enforce it. Unknown writes stay unknown.
     Read reuse is a scenario assumption; actual zero-hit work is charged in full.
     """
     if type(output_cap) is not int or output_cap<=0:return None
@@ -119,3 +121,28 @@ def cost_bounds(previous,current,output_cap,input_extra=0):
     return dict(benefit_lower=max(0,cold-warm),maintenance_upper=maintenance,
                 bound_kind='changed_conditions_no_benefit' if changed else 'comparable_call_scenario',output_cap=output_cap,
                 reuse_assumption=previous['cached'],write_composition='bounded_not_observed')
+
+
+def operating_scenarios(row,profile,input_extra,maintenance):
+    """Natural output is a bootstrap proxy, not a promise about an ACK response.
+
+    Missing natural records remain a veto. After maintenance, include every
+    matching observation; an unknown cost cannot make the forecast cheaper.
+    """
+    if profile.get('output_missing') or not profile.get('output_samples'):return None
+    if any(not r['usage_known'] or r['cost'] is None for r in maintenance):return None
+    mean=profile.get('output_mean');high=profile.get('output_high')
+    if type(mean) not in (int,float) or type(high) is not int:return None
+    if maintenance:
+        # Retain the larger natural baseline while the initial pilot is small.
+        mean=max(mean,sum(r['output'] for r in maintenance)/len(maintenance))
+        high=max(high,max(r['output'] for r in maintenance))
+    expected=cost_bounds(row,{**row,'cached':0},max(1,ceil(mean)),input_extra)
+    cold=cost_bounds({**row,'cached':0},{**row,'cached':0},max(1,high),input_extra)
+    if not expected or not cold:return None
+    return dict(benefit_lower=expected['benefit_lower'],maintenance_expected=expected['maintenance_upper'],
+                maintenance_adverse=cold['maintenance_upper'],output_high=max(1,high),
+                output_estimate=mean,server_output_cap=False,
+                basis='natural_output_and_maintenance' if maintenance else 'natural_output_proxy',
+                natural_samples=profile['output_samples'],maintenance_samples=len(maintenance),
+                write_composition='scenario_not_observed',reuse_assumption=row['cached'])

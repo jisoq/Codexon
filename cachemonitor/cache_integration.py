@@ -16,6 +16,10 @@ def enrich(sessions,index_path,now,homes=None):
         for session in sessions:
             history=scoped_history(session.get('history',[]))
             for row in history[-1:]:
+                cohort=[r for r in history if r['policy_scope']==row['policy_scope'] and r['ts']>=now-60*86400]
+                outputs=[r['output'] for r in cohort if type(r.get('output')) is int and r['output']>=0]
+                row=dict(row,output_samples=len(outputs),output_mean=sum(outputs)/len(outputs) if outputs else None,
+                         output_high=max(outputs,default=None),output_missing=len(cohort)-len(outputs))
                 control.profile(session['home'],session['id'],row)
             inputs=list(control.db.execute("SELECT turn,at FROM cache_inputs WHERE home=? AND sid=? AND kind='UserPromptSubmit' AND at>=? ORDER BY at",
                                            (session['home'],session['id'],now-60*86400)))

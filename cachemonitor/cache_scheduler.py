@@ -7,7 +7,8 @@ from urllib.parse import urlsplit
 from .cache_capture import RelayCapture
 from .cache_control import Control
 from .cache_execution import Contexts,Executor,Journal
-from .cache_policy import Gap,decide,cost_bounds
+from .cache_policy import Gap,decide,cost_bounds,operating_scenarios
+from .cache_operating import target
 from .core import usage_values
 
 
@@ -47,11 +48,10 @@ class Scheduler:
         # API documentation does not establish this field for ChatGPT's backend.
         # A mock or explicitly verified provider can advertise the same contract.
         endpoint=urlsplit(snapshot['url'])
-        supported=endpoint.hostname=='api.openai.com' or self.control.get('bounded_provider:'+endpoint.netloc,False)
-        if not supported:return dict(state='waiting',reason='output_bound_not_verified',calls=0,
-            activation='verify_total_output_limit_or_approve_separate_risk_policy',
-            history_can_unlock=False,model=snapshot['row'].get('model'),
-            transport='websocket' if snapshot['websocket'] else 'http')
+        supported=endpoint.hostname=='api.openai.com' or (endpoint.hostname!='chatgpt.com' and self.control.get('bounded_provider:'+endpoint.netloc,False))
+        scope=target(self.home,snapshot['request'],snapshot['url'],snapshot['headers'],snapshot['websocket']) if not supported else None
+        if not supported and not scope:return dict(state='disabled',reason='operating_scope_unavailable',calls=0,
+            history_can_unlock=False,server_output_cap=False)
         rows=[Gap(**json.loads(r[0])) for r in self.control.db.execute('SELECT data FROM cache_gaps WHERE home=? AND sid=?',(self.home,sid))]
         rows=[g for g in rows if g.at>=time.time()-60*86400]
         row=snapshot['row'];profile=self.control.latest(self.home,sid)
@@ -72,12 +72,37 @@ class Scheduler:
         extra=len(json.dumps(maintenance['input'][len(original['input']):],ensure_ascii=False).encode())
         bounds=cost_bounds(row,{**row,'cached':0},output_cap,extra)
         if not bounds:return dict(state='waiting',reason='input_or_price_unobserved')
+        operation=None;scenarios=None
+        if not supported:
+            grants={g['id'] for g in self.journal.operations.grants() if g['scope']==scope}
+            observed=[r for r in self.journal.rows() if r['operation'] in grants]
+            scenarios=operating_scenarios(row,profile,extra,observed)
+            if not scenarios:
+                grant=self.journal.operations.permission(scope)
+                return dict(state='stopped' if grant and grant['stopped'] else 'waiting',
+                    reason=grant['stopped'] if grant and grant['stopped'] else 'operating_cost_unobserved',calls=0,server_output_cap=False)
+            # Feed the existing chronological comparison with an estimate, not
+            # an invented output/cost guarantee. Preserve unknown historical costs.
+            bounds={**scenarios,'maintenance_upper':scenarios['maintenance_expected']}
         # Reprice every historical maintenance against this session's size/budget.
         rows=[Gap(g.at,g.seconds,g.returned,min(g.benefit_lower,bounds['benefit_lower']) if g.benefit_lower is not None else None,
                   max(g.maintenance_upper,bounds['maintenance_upper']) if g.maintenance_upper is not None else None,
                   g.origin,g.settled,g.scope,g.comparison) for g in rows]
         caps=[int(g.benefit_lower/bounds['maintenance_upper']) for g in rows if type(g.benefit_lower) in (int,float) and bounds['maintenance_upper']>0]
         decision=decide(rows,latency_bound=30,scheduler_slack=1,max_calls=max(1,min(100,max(caps,default=1))))
+        if scenarios:
+            result={**decision,**scenarios,'latency_bound':30}
+            if decision['state']!='eligible':return result
+            proposal=self.journal.operations.propose(scope,scenarios['maintenance_expected'],
+                scenarios['maintenance_adverse'],scenarios['output_high'],scenarios['basis'])
+            grant=self.journal.operations.permission(scope)
+            if not grant:return {**result,'state':'disabled','reason':'operating_consent_required','calls':0,
+                'history_can_unlock':False,'proposal':proposal['id']}
+            operation=dict(id=grant['id'],scope=scope,expected=scenarios['maintenance_expected'],
+                           adverse=scenarios['maintenance_adverse'],output_high=scenarios['output_high'])
+            reason=self.journal.operations.check(operation)
+            if reason:return {**result,'state':'stopped' if reason!='operation_busy' else 'waiting','reason':reason,'calls':0}
+            return {**result,'operation':operation,'calls':min(decision['calls'],self.journal.operations.stats(grant)['remaining'])}
         return {**decision,**bounds,'latency_bound':30}
 
     async def maintain(self,sid,snapshot,decision,revision):
@@ -87,16 +112,22 @@ class Scheduler:
                     self.executor.generation!=snapshot['generation'] or self.control.revision(self.home)!=revision):break
             result=await self.executor.run(self.home,sid,rid,snapshot['url'],snapshot['headers'],anchor=anchor,
                 deadline=anchor+decision['interval'],latency_bound=decision['latency_bound'],websocket=snapshot['websocket'],
-                round_number=round_number,max_output_tokens=decision['output_cap'],
+                round_number=round_number,max_output_tokens=decision.get('output_cap'),operation=decision.get('operation'),
                 expected_generation=snapshot['generation'],
                 valid=lambda:self.control.get('automatic',False) and self.control.revision(self.home)==revision)
             self.control.status(self.home,sid,dict(state=result,round=round_number+1,measured_saving=None))
+            if result=='operation_deferred':
+                self.evaluations.pop(sid,None);return
             renewal=self.executor.renewals.get((self.home,sid,rid))
             if result!='completed' or not renewal:break
             # A smaller maintained portion cannot inherit the full benefit estimate.
-            if renewal['read_lower']<(snapshot['row'].get('cached') or 0):break
+            if renewal['read_lower']<(snapshot['row'].get('cached') or 0):
+                if decision.get('operation'):self.journal.operations.stop(decision['operation']['id'],'partial_reuse')
+                break
             observed=next(r for r in self.journal.rows() if r['home']==self.home and r['sid']==sid and r['snapshot']==rid and r['round']==round_number)
-            if (observed['cost'] is None or observed['cost']>decision['maintenance_upper'] or
+            if decision.get('operation'):
+                if self.journal.operations.check(decision['operation']):break
+            elif (observed['cost'] is None or observed['cost']>decision['maintenance_upper'] or
                     observed.get('output') is None or observed['output']>decision['output_cap']):break
             anchor=renewal['anchor']
         self.stopped.add((sid,rid))

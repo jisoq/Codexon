@@ -33,7 +33,7 @@ GROUPS = {
     'analysis': test_files('comparison', 'overview', 'performance', 'data_contract', 'output_speed'),
     'cost': test_files('pricing', 'mode_costs', 'session_costs', 'data_contract'),
     'cache_connection': test_files('cache_codex_connection'),
-    'cache': test_files('cache_health', 'cache_misses', 'cache_management','cache_product'),
+    'cache': test_files('cache_health', 'cache_misses', 'cache_management','cache_product','cache_operating'),
     'cache_ui': test_files('cache_ui'),
     'speed': test_files('speed_health', 'output_speed'),
     'names': test_files('codex_names'),
@@ -75,6 +75,7 @@ GROUPS = {
 
 # First match wins: QML and shared helpers must not fall through to a broad UI gate.
 RULES = (
+    ('cachemonitor/cache_operating.py', ('cache','cache_ui','cache_connection')),
     ('cachemonitor/cache_panel.py', ('cache_ui','cache_connection')),
     ('cachemonitor/cache_hooks.py', ('cache','cache_ui','cache_connection')),
     ('cachemonitor/cache_control.py', ('cache','cache_ui','cache_connection')),

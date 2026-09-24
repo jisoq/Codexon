@@ -8,6 +8,9 @@ from cachemonitor.cache_control import hook_decision
 from cachemonitor.cache_panel import CachePanel
 from cachemonitor.quick_qa import mount,dispose,control,click
 from test_cache_product import profile
+from test_cache_operating import URL,HEADERS
+from test_cache_management import body,response
+from cachemonitor.cache_operating import target
 
 
 def test_rendered_hook_approval_cancel_close_timeout_and_disconnect(tmp_path):
@@ -49,3 +52,44 @@ def test_rendered_hook_approval_cancel_close_timeout_and_disconnect(tmp_path):
         assert not host.qml_errors
     finally:
         panel.stop();pool.shutdown();dispose(host)
+
+
+def test_rendered_operating_scope_consent_close_revoke_and_cost_status(tmp_path):
+    app=QApplication.instance() or QApplication([])
+    panel=CachePanel('home',tmp_path/'index.sqlite',active=True);host=mount(panel)
+    try:
+        proposal=panel.journal.operations.propose(target('home',body(),URL,HEADERS,False),.01,.1,64,'natural_output_proxy')
+        panel.poll();QTest.qWait(50)
+        assert panel.consent_button.isEnabled()
+        # Closing/cancelling the concrete scope never grants permission.
+        for choice in ('close','cancel','approve'):
+            panel.show_operating();QTest.qWait(80);dialog=panel.operating_dialog
+            assert dialog is not None and not dialog.host.qml_errors
+            if choice=='approve':assert dialog.host.grab().save(str(tmp_path/'operating-consent.png'))
+            if choice=='close':dialog.host.close()
+            else:click(dialog.host,control(dialog.host,dialog.confirm if choice=='approve' else dialog.cancel))
+            QTest.qWait(60)
+            assert panel.operating_dialog is None
+            assert bool(panel.journal.operations.grants())==(choice=='approve')
+        grant=panel.journal.operations.grants()[0]
+        assert grant['scope']==proposal['scope'] and grant['max_calls']==2
+        assert not panel.control.get('automatic',False)  # Permission is separate from activation.
+        assert panel.control.get('bounded_provider:chatgpt.com') is None
+        assert '남은 2/2회' in panel.operating_status.text()
+        operation=dict(id=grant['id'],scope=grant['scope'],expected=.01,adverse=.1,output_high=64)
+        key=panel.journal.reserve('home','s',0,body(),'original',operation=operation)
+        assert panel.journal.permit_operation(key,operation)
+        result=response();result['usage']['output_tokens']=1000000
+        panel.journal.finish(key,'completed',result,scope_read_lower=80)
+        panel.poll();assert '관측 비용 기준 도달' in panel.operating_status.text()
+        assert '남은 1/2회' in panel.operating_status.text()
+        assert host.grab().save(str(tmp_path/'operating-cost-stop.png')) and not host.qml_errors
+        # New consent is explicit after a stop; it does not reuse the old allowance.
+        panel.show_operating();QTest.qWait(60)
+        dialog=panel.operating_dialog;click(dialog.host,control(dialog.host,dialog.confirm));QTest.qWait(50)
+        assert len(panel.journal.operations.grants())==2
+        panel.revoke_operating();assert panel.journal.operations.grants()[0]['stopped']=='revoked'
+        panel.control.set('automatic',False);panel.control.set('automatic',True);panel.poll()
+        assert '철회' in panel.operating_status.text()
+    finally:
+        panel.stop();dispose(host)
