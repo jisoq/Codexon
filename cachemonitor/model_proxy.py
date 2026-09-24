@@ -497,8 +497,8 @@ def main():
             from .cache_scheduler import Scheduler
             from .index import UsageIndex
             from concurrent.futures import ThreadPoolExecutor
-            from .observer_state import ProcessLock
-            cache_lock=ProcessLock(args.observation_index.with_name('cache-worker.lock'))
+            from .cache_execution import execution_owner
+            cache_lock=execution_owner(args.observation_index.with_name('cache-control.sqlite'))
             cache_lock.__enter__()
             scheduler=Scheduler(args.codex_home,args.observation_index.with_name('cache-control.sqlite'),
                 observation_only=args.cache_observe_only,continuous_capture=args.cache_worker)

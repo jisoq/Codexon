@@ -10,12 +10,30 @@ import json
 import sqlite3
 import time
 from collections import OrderedDict
+from contextlib import contextmanager,ExitStack
+from pathlib import Path
 
 import aiohttp
 
 from .core import usage_values
 from .pricing import token_cost
 from .cache_audit import TTL_SECONDS
+
+
+@contextmanager
+def execution_owner(path,*,proxy_owned=False):
+    """One lifetime owner per journal, including transitions from older workers.
+
+    Both paths take cache-worker.lock. Taking the legacy supervisor lock first
+    also prevents a new standalone worker recovering an older managed relay's
+    sent requests. A managed relay already holds that outer lifetime lock.
+    """
+    from .observer_state import ProcessLock
+    directory=Path(path).resolve().parent
+    with ExitStack() as locks:
+        if not proxy_owned:locks.enter_context(ProcessLock(directory/'proxy-supervisor.lock'))
+        locks.enter_context(ProcessLock(directory/'cache-worker.lock'))
+        yield
 
 
 class Contexts:
@@ -157,7 +175,7 @@ class Journal:
             self.db.execute('ROLLBACK');raise
 
     def recover_exclusive(self):
-        """Only the process-lock owner may call this at startup."""
+        """Only the lifetime execution_owner may call this at startup."""
         self.db.execute("UPDATE cache_jobs SET state='unknown' WHERE state='sent'")
         self.db.execute("UPDATE cache_jobs SET state='cancelled' WHERE state='reserved'")
         for key, in self.db.execute("SELECT id FROM cache_jobs WHERE state='unknown' AND operation IS NOT NULL").fetchall():

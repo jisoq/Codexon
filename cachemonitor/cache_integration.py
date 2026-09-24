@@ -27,6 +27,26 @@ def enrich(sessions,index_path,now,homes=None):
             for row in history:
                 if row.get('purpose') not in ('maintenance','diagnostic'):
                     turns[row.get('turn')]=row;firsts.setdefault(row.get('turn'),row)
+            # These terminal guard choices cannot release a request. A released,
+            # unavailable or unresolved ticket is NOT evidence of no transmission.
+            # Actual usage takes precedence even if a conflicting ticket exists.
+            blocked={r[0] for r in control.db.execute("""SELECT i.turn FROM cache_inputs i
+                JOIN cache_tickets t ON t.home=i.home AND t.sid=i.sid AND t.turn=i.turn AND t.model=i.model
+                WHERE i.home=? AND i.sid=? AND i.kind='UserPromptSubmit'
+                AND t.state IN ('cancel','dismiss','timeout')""",(session['home'],session['id'])) if r[0] not in turns}
+            for i,(turn,at) in enumerate(inputs):
+                if turn not in blocked:continue
+                before=[r for r in history if r['ts']<=at]
+                # Preserve the cancellation, without inventing zero token usage or
+                # a natural return. The surrounding real request's gap below spans
+                # the entire idle period, including time after this cancellation.
+                gap=dict(at=at,seconds=max(0,(inputs[i+1][1] if i+1<len(inputs) else now)-at),
+                    returned=False,benefit_lower=None,maintenance_upper=None,origin='guard_cancelled',
+                    settled=True,scope=before[-1]['policy_scope'] if before else None,
+                    comparison='confirmed_not_sent')
+                control.db.execute('INSERT OR REPLACE INTO cache_gaps VALUES(?,?,?,?)',
+                    (session['home'],session['id'],turn,json.dumps(gap)))
+            inputs=[(turn,at) for turn,at in inputs if turn not in blocked]
             for i,(turn,at) in enumerate(inputs):
                 previous=turns.get(turn)
                 if previous is None:
