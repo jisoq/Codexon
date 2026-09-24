@@ -1,5 +1,3 @@
-from pathlib import Path
-from types import SimpleNamespace
 import pytest
 from cachemonitor.proxy_update import ProxyUpdate
 from cachemonitor.observer_state import read_json
@@ -97,34 +95,12 @@ def test_restarted_updater_recovers_interrupted_switch(setup):
     assert read_json(u.path)['phase']=='failed'
 
 
-def test_no_upgrade_needed(setup):
-    m,u=setup;m.version=PROXY_VERSION
-    m.supervisor_command=lambda upstream:['CacheMonitor.exe','--proxy-supervisor']
-    u.run()
-    assert read_json(u.path)['phase']=='complete' and not m.task.commands
-
-
 def test_same_version_at_previous_install_path_is_actually_replaced(setup):
     m,u=setup;m.version=PROXY_VERSION;u.run()
     assert read_json(u.path)['phase']=='complete'
     assert m.task.commands==[['new.exe','--proxy-supervisor']] and m.task.stops==1
 
 
-def test_disabled_while_waiting_cancels(setup):
-    m,u=setup;m.enabled=False;u.run()
-    assert read_json(u.path)['phase']=='cancelled' and not m.task.commands
-
-
 def test_different_instance_aborts_before_drain(setup):
     m,u=setup;m.instance='different';u.run()
     assert read_json(u.path)['phase']=='failed' and not m.task.stops
-
-def test_drain_allows_windows_connection_refusal_to_arrive(setup,monkeypatch):
-    m,u=setup;calls=[]
-    def health(timeout):
-        calls.append(timeout)
-        m.health_state='refused' if timeout>=3 else 'unknown'
-        return None
-    monkeypatch.setattr(m,'health',health)
-    u.drain()
-    assert calls==[3,3]

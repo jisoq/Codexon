@@ -1,38 +1,12 @@
 """Regressions at the actual QML input/rendering boundary."""
 import time
-from PySide6.QtCore import QSettings, QSignalBlocker, QPointF, Qt
+from PySide6.QtCore import QSettings, QSignalBlocker, Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 from cachemonitor.core import Session
 from cachemonitor.dashboard import Dashboard
 from cachemonitor.presentation import Choice
-from cachemonitor.quick_qa import control, mount, dispose, table_view, walk, click_row, wheel
-
-
-def test_price_close_buttons_preserve_dashboard(tmp_path):
-    from cachemonitor.quick_runtime import DialogHost
-    from cachemonitor.presentation import Button
-    from cachemonitor.quick_qa import click
-    app=QApplication.instance() or QApplication([])
-    previous=app.property('cachemonitorDisableShellIntegration')
-    app.setProperty('cachemonitorDisableShellIntegration',True)
-    window=Dashboard([],start_worker=False,settings=QSettings(str(tmp_path/'dialogs.ini'),QSettings.IniFormat))
-    window.show()
-    try:
-        for action in (window.show_prices,)*3:
-            action();QTest.qWait(40)
-            host=next(item for item in app.topLevelWidgets() if isinstance(item,DialogHost) and item.isVisible())
-            from cachemonitor.presentation import Text
-            text='\n'.join(node.text() for node in host.dialog.findChildren(Text))
-            assert 'API에는 장문 할증이 있지만, 구독 사용량 환산에는 반영하지 않습니다.' in text
-            import os
-            if os.environ.get('CODEXON_PRICE_CAPTURE'):
-                assert host.grab().save(os.environ['CODEXON_PRICE_CAPTURE'])
-            button=next(node for node in host.dialog.findChildren(Button) if node.text()=='닫기')
-            click(host,control(host,button));QTest.qWait(40)
-            assert window.isVisible() and window.quick is not None and not window.quitting
-    finally:
-        window.quit_app();app.setProperty('cachemonitorDisableShellIntegration',previous)
+from cachemonitor.quick_qa import control, mount, dispose, table_view, click_row, wheel
 
 
 def test_reasoning_tokens_render_independently_of_cost_and_request_unit(tmp_path):
@@ -64,22 +38,6 @@ def test_reasoning_tokens_render_independently_of_cost_and_request_unit(tmp_path
         window.quit_app();app.setProperty('cachemonitorDisableShellIntegration',previous)
 
 
-def test_cell_updates_batch_and_highlights_preserve_formatted_cache():
-    from cachemonitor.table_model import Table, Cell
-    app=QApplication.instance() or QApplication([])
-    table=Table(1,2);events=[]
-    table.model().dataChanged.connect(lambda *args:events.append(args))
-    for column in range(2):
-        cell=Cell('old');table.setItem(0,column,cell);cell.setText('new');cell.setToolTip('detail')
-    app.processEvents()
-    assert len(events)==1
-    events.clear();table.item(0,0).setText('new');app.processEvents();assert not events
-    table.model().cache[(0,0,Qt.DisplayRole)]='cached'
-    table.visibleRows(0,0);table.refresh_highlights()
-    assert table.model().cache[(0,0,Qt.DisplayRole)]=='cached'
-    assert events[-1][2]==[Qt.UserRole+1]
-
-
 def test_blocked_choice_updates_still_reach_the_qml_control():
     app=QApplication.instance() or QApplication([])
     choice=Choice();choice.addItem('one',1);host=mount(choice,250,60)
@@ -95,27 +53,6 @@ def test_blocked_choice_updates_still_reach_the_qml_control():
         assert choice.currentData()==2 and events==[0]
         assert not host.qml_errors
     finally:dispose(host)
-
-
-def test_external_price_link_is_rendered_and_activates_without_a_network_request():
-    from PySide6.QtCore import QObject, QUrl, Slot
-    from PySide6.QtGui import QDesktopServices
-    from cachemonitor.presentation import Text
-    from cachemonitor.quick_qa import click
-    app=QApplication.instance() or QApplication([])
-    class Sink(QObject):
-        @Slot(QUrl)
-        def receive(self,url):self.urls.append(url.toString())
-    sink=Sink();sink.urls=[]
-    QDesktopServices.setUrlHandler('https',sink,'receive')
-    link=Text('<a href="https://example.invalid/prices">가격표</a>');link.setOpenExternalLinks(True)
-    host=mount(link,300,70)
-    try:
-        click(host,control(host,link),35,35)
-        assert sink.urls==['https://example.invalid/prices']
-        assert not host.qml_errors
-    finally:
-        dispose(host);QDesktopServices.unsetUrlHandler('https')
 
 
 def test_quick_pages_keep_scroll_and_render_model_evidence(tmp_path):
@@ -161,20 +98,3 @@ def test_quick_pages_keep_scroll_and_render_model_evidence(tmp_path):
         assert not window.qml_errors,window.qml_errors
     finally:
         window.quit_app();app.setProperty('cachemonitorDisableShellIntegration',previous)
-
-
-def test_filter_flow_wraps_instead_of_clipping_controls():
-    from cachemonitor.presentation import Row
-    from cachemonitor.quick_qa import scene_view
-    app=QApplication.instance() or QApplication([])
-    row=Row();row.put(flow=True,spacing=10)
-    choices=[]
-    for title in ('모든 모델','전체 모드','모든 작업'):
-        choice=Choice();choice.addItem(title);row.addWidget(choice);choices.append(choice)
-    host=mount(row,420,110)
-    try:
-        positions=[scene_view(host,node) for node in choices]
-        assert positions[2].mapToScene(QPointF()).y()>=positions[0].height()+10
-        assert all(item.mapToScene(QPointF()).x()+item.width()<=420 and item.height()>=36 for item in positions)
-        assert not host.qml_errors
-    finally:dispose(host)

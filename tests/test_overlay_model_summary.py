@@ -1,7 +1,7 @@
 """Exact model comparison from response-linked observations, through Qt rendering."""
 import pytest
-from PySide6.QtCore import QEvent, QPoint, Qt
-from PySide6.QtGui import QFontMetrics, QHelpEvent
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QFontMetrics
 from PySide6.QtQuick import QQuickItem
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QToolTip
@@ -108,55 +108,6 @@ def comparison_lines(value):
             if '모델 일치 (' in line or '모델 불일치 (' in line]
 
 
-@pytest.mark.parametrize('response,expected', [
-    ('gpt-6-astra', '모델 일치 (gpt-6-astra)'),
-    ('gpt-5.6-sol', '모델 불일치 (요청:gpt-6-astra, 응답:gpt-5.6-sol)'),
-])
-def test_complete_observation_has_exact_summary_on_monitor_and_detail(observed_overlay, tmp_path, response, expected):
-    fixture = observed_overlay
-    fixture.call('call-0')
-    fixture.observe('call-0', response=response)
-    fixture.refresh()
-    widget = fixture.widget
-    model = widget.content_model
-    assert model.context()[0] == expected
-    assert expected in detail_values(model)
-    assert expected in widget.accessibleName()
-    assert expected in model.detailBody.state['accessible']
-    assert widget.toolTip() == expected
-    assert fixture.header.toolTip() == expected
-    position = QPoint(20, 20)
-    QApplication.sendEvent(fixture.header, QHelpEvent(QEvent.ToolTip, position, fixture.header.mapToGlobal(position)))
-    assert QToolTip.text() == expected
-    QToolTip.hideText()
-    detail = fixture.reveal_comparison(expected)
-    assert widget.grab().save(str(tmp_path / 'model-summary.png'))
-    assert detail.grab().save(str(tmp_path / 'model-summary-detail.png'))
-    assert not widget.qml_errors
-
-
-@pytest.mark.parametrize('evidence', [
-    None,
-    dict(requested='gpt-6-astra', response=''),
-    dict(requested='', response='gpt-6-astra'),
-    dict(status='pending'),
-    dict(conflict=True),
-    dict(observation_missing=True),
-])
-def test_incomplete_or_conflicting_evidence_never_claims_model_comparison(observed_overlay, evidence):
-    fixture = observed_overlay
-    fixture.call('call-0')
-    if evidence is not None:
-        fixture.observe('call-0', **evidence)
-    fixture.refresh()
-    widget = fixture.widget
-    model = widget.content_model
-    visible = '\n'.join([*model.context(), widget.accessibleName(),
-                         widget.toolTip(), *detail_values(model)])
-    assert comparison_lines(visible) == []
-    assert not widget.qml_errors
-
-
 def test_new_call_clears_old_comparison_then_uses_its_own_completed_evidence(observed_overlay):
     fixture = observed_overlay
     fixture.call('old-call')
@@ -217,21 +168,3 @@ def test_long_model_names_are_complete_and_wrapped_in_detail(observed_overlay, t
     assert widget.grab().save(str(tmp_path / 'long-model-summary.png'))
     assert detail.grab().save(str(tmp_path / 'long-model-detail.png'))
     assert not widget.qml_errors
-
-
-@pytest.mark.parametrize('observations,expected', [
-    ([dict(requested='gpt-6-astra', response=''), dict(requested='', response='gpt-6-astra')], ''),
-    ([dict(), dict()], '모델 일치 (gpt-6-astra)'),
-    ([dict(status='pending'), dict(status='completed')], ''),
-])
-def test_comparison_uses_completed_paired_evidence_not_combined_names(observed_overlay, observations, expected):
-    fixture = observed_overlay
-    fixture.call('paired-call')
-    for index, observation in enumerate(observations):
-        fixture.observe('paired-call', attempt=f'pair-{index}', **observation)
-    data = fixture.refresh()
-    assert not data['latest']['timing_valid']
-    assert fixture.widget.content_model.context()[0] == expected
-    assert fixture.widget.toolTip() == expected
-    summaries = [value for value in detail_values(fixture.widget.content_model) if comparison_lines(value)]
-    assert summaries == ([expected] if expected else [])

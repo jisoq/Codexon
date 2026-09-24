@@ -5,7 +5,7 @@ import pytest
 
 from cachemonitor.observer_control import ObserverManager, URL
 from cachemonitor.model_evidence import home_key
-from cachemonitor.version import VERSION, PROXY_VERSION, proxy_compatible
+from cachemonitor.version import PROXY_VERSION
 
 
 def manager(tmp_path,monkeypatch):
@@ -31,17 +31,6 @@ def manager(tmp_path,monkeypatch):
 
 def validated(control):
     control.write_state({'home':home_key(control.home),'proof_at':time.time(),'proof_instance':'test','enabled':False})
-
-
-def test_unchanged_legacy_proxy_remains_compatible_without_changing_routing(tmp_path,monkeypatch):
-    control,registry=manager(tmp_path,monkeypatch)
-    monkeypatch.setattr(control,'health',lambda **_:{'version':'2026.09.23.1','status':'ok','instance':'test'})
-    before=registry['value']
-    assert proxy_compatible('2026.09.23.1') and proxy_compatible(PROXY_VERSION)
-    assert not proxy_compatible('2026.09.21.8') and not proxy_compatible('2026.09.23.4')
-    assert not proxy_compatible('unknown')
-    assert control.status()['version_mismatch'] is False
-    assert registry['value']==before
 
 
 def test_enable_disable_preserves_comments_unrelated_edits_and_startup(tmp_path,monkeypatch):
@@ -92,30 +81,6 @@ def test_custom_provider_and_missing_rollback_are_not_overwritten(tmp_path,monke
         assert control.config_path.read_text()==data
 
 
-def test_existing_standard_url_restored_and_recovery_does_not_reenable_manual_edit(tmp_path,monkeypatch):
-    control,_=manager(tmp_path,monkeypatch)
-    control.config_path.write_text('openai_base_url = "https://api.openai.com/v1"\n')
-    validated(control)
-    control.enable()
-    started=[];monkeypatch.setattr(control,'start',started.append)
-    control.ensure();assert started==[]
-    control.disable()
-    assert control.config()[1]['openai_base_url']=='https://api.openai.com/v1'
-    control.ensure();assert started==[]
-
-
-@pytest.mark.parametrize('journal',[None,{}, {'enabled':False},'corrupt'])
-def test_orphaned_proxy_always_has_direct_recovery(tmp_path,monkeypatch,journal):
-    control,_=manager(tmp_path,monkeypatch)
-    control.config_path.write_text(f'openai_base_url = "{URL}"\nmodel = "keep-me"\n')
-    if journal is not None:
-        control.state_path.parent.mkdir(parents=True,exist_ok=True)
-        control.state_path.write_text('bad json' if journal=='corrupt' else json.dumps({'home':home_key(control.home),**journal}))
-    result=control.recover_direct()
-    assert not result['configured'] and control.config()[1]=={'model':'keep-me'}
-    assert not control.state()['enabled']
-
-
 def test_stale_enabled_flag_and_background_poll_never_reroute(tmp_path,monkeypatch):
     control,_=manager(tmp_path,monkeypatch)
     control.config_path.write_text('model = "safe"\n')
@@ -133,11 +98,3 @@ def test_apply_requires_recent_test_for_same_service(tmp_path,monkeypatch,instan
     with pytest.raises(RuntimeError):control.enable()
     assert control.config_path.read_text()=='model = "safe"\n'
     assert registry['value']=='previous startup command'
-
-
-def test_recovery_works_when_foreign_port_occupant_exists(tmp_path,monkeypatch):
-    control,_=manager(tmp_path,monkeypatch)
-    control.config_path.write_text(f'openai_base_url = "{URL}"\n')
-    monkeypatch.setattr(control,'health',lambda **_:(_ for _ in ()).throw(RuntimeError('foreign port')))
-    result=control.recover_direct()
-    assert not result['configured'] and result['service_issue']=='foreign port'

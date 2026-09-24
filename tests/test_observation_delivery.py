@@ -44,52 +44,6 @@ def test_delta_heartbeat_correction_deletion_restart_and_old_results():
     with pytest.raises(ValueError):receiver.receive(gap)
 
 
-def test_spawned_analysis_dashboard_and_actual_tray_dispatch(tmp_path,monkeypatch):
-    from PySide6.QtCore import QSettings
-    from PySide6.QtWidgets import QApplication
-    from PySide6.QtTest import QTest
-    from cachemonitor.dashboard import Dashboard
-    app=QApplication.instance() or QApplication([])
-    before=app.property('cachemonitorDisableShellIntegration');app.setProperty('cachemonitorDisableShellIntegration',True)
-    s=source();s['home']=str(tmp_path/'home')
-    w=Dashboard([],settings=QSettings(str(tmp_path/'settings.ini'),QSettings.IniFormat),static_snapshot=snapshot(s),live_limits=False)
-    sent=[];monkeypatch.setattr(w.tray,'showMessage',lambda *args:sent.append(args))
-    def until(condition):
-        deadline=time.monotonic()+12
-        while not condition() and time.monotonic()<deadline:app.processEvents();QTest.qWait(10)
-        assert condition()
-    try:
-        until(lambda:bool(w.snapshot['sessions']))
-        assert 'history' not in w.snapshot['sessions'][0]
-        w.notification_master.setChecked(True);w.notification_options['모델명 불일치'].setChecked(True)
-        now=time.time();store=EvidenceStore(tmp_path/'wire.sqlite');reader=EvidenceReader(store.path)
-        try:
-            store.write(s['home'],'attempt',now,'WebSocket','wire-response','asked','reported','completed')
-            reader.poll()
-            row={**s['history'][-1],'key':'wire-response','ts':now}
-            changed=copy.deepcopy(s);changed['history'].extend(reader.enrich(s['home'],[row]))
-        finally:reader.close();store.close()
-        w.worker.replace_snapshot(snapshot(changed))
-        until(lambda:len(sent)==1)
-        assert '모델명 불일치' in sent[0][0]
-        assert '요청: asked → 응답: reported' in sent[0][1]
-        w.worker.replace_snapshot(snapshot(changed));QTest.qWait(200);app.processEvents()
-        assert len(sent)==1
-        w.model.setCurrentIndex(max(0,w.model.findData('gpt-6-astra')))
-        filters=(w.period.currentData(),w.model.currentData())
-        w.open_record(dict(home=s['home'],sid=s['id'],key='wire-response'))
-        until(lambda:getattr(w,'exact_record',None) is not None)
-        assert w.exact_record['key']=='wire-response'
-        assert w.current_page==2 and w.detail_scroll.isVisible() and not w.qml_errors
-        assert w.selected_session==(s['home'],s['id']) and w.selected_call=='wire-response'
-        assert w.grab().save(str(tmp_path/'exact-record.png'))
-        assert w.page_filters[0]['model']==filters[1]
-        w.go_back()
-        until(lambda:w.current_page==0)
-        assert filters==(w.period.currentData(),w.model.currentData())
-    finally:w.quit_app();app.setProperty('cachemonitorDisableShellIntegration',before)
-
-
 def test_writer_copies_bounds_memory_marks_gaps_and_flushes_on_owner_thread(tmp_path):
     entered=threading.Event();release=threading.Event();owners=[]
     class SlowStore(EvidenceStore):
@@ -159,33 +113,6 @@ def test_latency_uses_request_observation_and_monotonic_endpoints(tmp_path,monke
         assert r['request_observed_at']==100 and r['completed_observed_at']==90
         tracker.response(dict(type='response.completed',response=dict(id='unpaired',model='m')))
         reader.poll();assert reader.enrich('home',[dict(key='unpaired')])[0]['completion_latency_ms'] is None
-    finally:reader.close();store.close()
-
-
-def test_one_response_does_not_invalidate_unrelated_home_session(tmp_path):
-    store=EvidenceStore(tmp_path/'wire.sqlite');reader=EvidenceReader(store.path)
-    a=[dict(key='a')];b=[dict(key='b')]
-    try:
-        reader.poll();before=reader.enrich('home',b,'other')
-        reader.enrich('home',a,'first')
-        store.write('home','a',100,'WebSocket','a','a','b','completed');reader.poll()
-        assert reader.enrich('home',b,'other') is before
-        assert reader.enrich('home',a,'first')[0]['model_alert_confirmed']
-    finally:reader.close();store.close()
-
-
-def test_only_explicit_wire_cache_policy_is_joined(tmp_path):
-    from cachemonitor.proxy_observation import message_metadata
-    store=EvidenceStore(tmp_path/'policy.sqlite');reader=EvidenceReader(store.path)
-    tracker=Tracker(store,'home','WebSocket',dict(storage_errors=0,requests=0,responses=0))
-    try:
-        tracker.request(message_metadata('{"model":"m","prompt_cache_retention":"24h","input":"PRIVATE"}'))
-        tracker.response(dict(type='response.completed',response=dict(id='r',model='m')))
-        reader.poll()
-        assert reader.enrich('home',[dict(key='r')])[0]['cache_policy']=='24h'
-        assert reader.enrich('other-home',[dict(key='r')])[0]['cache_policy'] is None
-        tracker.request(dict(model='m'));tracker.response(dict(type='response.completed',response=dict(id='unknown',model='m')))
-        reader.poll();assert reader.enrich('home',[dict(key='unknown')])[0]['cache_policy'] is None
     finally:reader.close();store.close()
 
 

@@ -80,6 +80,7 @@ Item {
             required property string display; required property string tooltip
             required property string cellBackground; required property real changedCell
             required property bool cacheZero
+            required property bool verbatim
             required property real cellBar
             required property int alignment
             property bool exactValue: (root.node.state.noElideColumns || []).indexOf(root.node.logicalColumn(column)) >= 0
@@ -89,7 +90,7 @@ Item {
             Rectangle { anchors.left: parent.left; anchors.right: parent.right; anchors.bottom: parent.bottom; height: 1; color: (appTheme.palette && appTheme.color("#edf0f5")) }
             Rectangle { visible: root.node.state.selected === row && column === 0; width: 2; height: parent.height; color: appTheme.palette.accent }
             Rectangle { objectName: "cell-data-bar"; visible: !!root.node.state.dataBars && cellBar >= 0; anchors.left: parent.left; anchors.leftMargin: 6; anchors.verticalCenter: parent.verticalCenter; width: Math.min(140,Math.max(0,parent.width-12))*Math.max(0,cellBar); height: 14; radius: 2; color: appTheme.palette.accent; opacity: .16 }
-            Text { id: cellLabel; objectName: "cell-label"; anchors.fill: parent; anchors.leftMargin: 9; anchors.rightMargin: 9; text: appLanguage.text(display); wrapMode: !exactValue && root.node.state.rowHeight > 40 ? Text.Wrap : Text.NoWrap; elide: exactValue ? Text.ElideNone : Text.ElideRight; horizontalAlignment: alignment & Qt.AlignRight ? Text.AlignRight : Text.AlignLeft; verticalAlignment: Text.AlignVCenter; font.pixelSize: 14; font.family: appTheme.family; font.features: { "tnum": 1 }; color: (appTheme.palette && appTheme.color("#263344")) }
+            Text { id: cellLabel; objectName: "cell-label"; anchors.fill: parent; anchors.leftMargin: 9; anchors.rightMargin: 9; text: verbatim ? display : appLanguage.text(display); wrapMode: !exactValue && root.node.state.rowHeight > 40 ? Text.Wrap : Text.NoWrap; elide: exactValue ? Text.ElideNone : Text.ElideRight; horizontalAlignment: alignment & Qt.AlignRight ? Qt.AlignRight : Qt.AlignLeft; verticalAlignment: Text.AlignVCenter; font.pixelSize: 14; font.family: appTheme.family; font.features: { "tnum": 1 }; color: (appTheme.palette && appTheme.color("#263344")) }
             Rectangle { anchors.fill: parent; color: (appTheme.palette && appTheme.color("#2397c0")); opacity: changedCell * .18 }
             Rectangle { objectName: "cache-zero-marker"; visible: cacheZero && column === 0; anchors.left: parent.left; anchors.top: parent.top; anchors.bottom: parent.bottom; width: 3; color: (appTheme.palette && appTheme.color("#c77e23")) }
             Rectangle { objectName:"row-hover-feedback";anchors.fill:parent;color:appTheme.palette.accent;opacity:root.hoveredRow===row ? .08 : 0 }

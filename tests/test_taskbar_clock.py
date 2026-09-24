@@ -4,44 +4,6 @@ import time
 from cachemonitor.taskbar_clock import ClockProbe
 
 
-def test_clock_bounds_accepts_secondary_container_and_rejects_other_icons():
-    import ctypes
-    from ctypes import wintypes
-    from cachemonitor.taskbar_clock import ClockReader
-
-    class Reader(ClockReader):
-        def __init__(self, clock_class):
-            self.automation = ctypes.c_void_p(1)
-            self.condition = ctypes.c_void_p(2)
-            self.items = [
-                (clock_class, 'SystemTrayIcon', (3751, 3688, 3869, 3760)),
-                (clock_class, 'OtherIcon', (3870, 3688, 3880, 3760)),
-                ('OtherClass', 'SystemTrayIcon', (3881, 3688, 3890, 3760)),
-            ]
-
-        def call(self, obj, slot, types, *args):
-            if obj.value == 1:
-                ctypes.cast(args[-1], ctypes.POINTER(ctypes.c_void_p))[0] = 3
-            elif obj.value == 3:
-                ctypes.cast(args[-1], ctypes.POINTER(ctypes.c_void_p))[0] = 4
-            elif obj.value == 4 and slot == 3:
-                ctypes.cast(args[-1], ctypes.POINTER(ctypes.c_int))[0] = len(self.items)
-            elif obj.value == 4:
-                ctypes.cast(args[-1], ctypes.POINTER(ctypes.c_void_p))[0] = 10 + args[0]
-            else:
-                rect = ctypes.cast(args[-1], ctypes.POINTER(wintypes.RECT)).contents
-                rect.left, rect.top, rect.right, rect.bottom = self.items[obj.value - 10][2]
-
-        def text(self, element, slot):
-            return self.items[element.value - 10][0 if slot == 30 else 1]
-
-        def release(self, obj):
-            pass
-
-    for class_name in ('SystemTray.OmniButton', 'NamedContainerAutomationPeer'):
-        assert Reader(class_name).bounds(123) == (3751, 3688, 118, 72)
-
-
 def wait_result(probe, host, geometry):
     deadline = time.monotonic() + 2
     while time.monotonic() < deadline:

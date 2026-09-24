@@ -4,6 +4,7 @@ import math
 from PySide6.QtCore import QObject, Qt, QAbstractTableModel, QModelIndex, Signal, Property, Slot, QTimer
 from PySide6.QtGui import QColor
 from .presentation import Node, ScrollPosition
+from .i18n import Verbatim
 
 
 class Cell:
@@ -48,12 +49,13 @@ class Rows(QAbstractTableModel):
         self.formatter=None;self.cache=OrderedDict();self.formatted=0
     def rowCount(self,parent=QModelIndex()):return 0 if parent.isValid() else len(self.rows)
     def columnCount(self,parent=QModelIndex()):return 0 if parent.isValid() else len(self.headers)
-    def roleNames(self):return {Qt.DisplayRole:b'display',Qt.ToolTipRole:b'tooltip',Qt.BackgroundRole:b'cellBackground',Qt.TextAlignmentRole:b'alignment',Qt.UserRole+1:b'changedCell',Qt.UserRole+2:b'cacheZero',Qt.UserRole+3:b'cellBar'}
+    def roleNames(self):return {Qt.DisplayRole:b'display',Qt.ToolTipRole:b'tooltip',Qt.BackgroundRole:b'cellBackground',Qt.TextAlignmentRole:b'alignment',Qt.UserRole+1:b'changedCell',Qt.UserRole+2:b'cacheZero',Qt.UserRole+3:b'cellBar',Qt.UserRole+4:b'verbatim'}
     def headerData(self,section,orientation,role=Qt.DisplayRole):
         if orientation==Qt.Horizontal and role==Qt.DisplayRole and section<len(self.headers):return self.headers[self.owner._order[section]]
     def data(self,index,role=Qt.DisplayRole):
         if not index.isValid() or not 0<=index.row()<len(self.rows) or not 0<=index.column()<len(self.owner._order):return None
         row=index.row();col=self.owner._order[index.column()]
+        if role==Qt.UserRole+4:return isinstance(self.data(index,Qt.DisplayRole),Verbatim)
         if role==Qt.UserRole+1:return self.owner.changes.strength(row,col)
         if role==Qt.UserRole+2:
             record=self.rows[row]

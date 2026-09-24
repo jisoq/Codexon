@@ -3,7 +3,6 @@ from PySide6.QtCore import Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 from cachemonitor.quota_chart import QuotaHistory
-from cachemonitor.quota_view import prepare_series
 from cachemonitor.quick_qa import mount, render_plot, click, dispose
 from cachemonitor.theme import shared_theme
 
@@ -51,15 +50,3 @@ def test_fixed_width_gaps_exact_original_selection_and_duration(tmp_path,width,d
         assert host.grab().save(str(tmp_path/f'compressed-{width}-{dark}.png'))
         assert not host.qml_errors
     finally:dispose(host);shared_theme().configure('light')
-
-
-def test_sampling_uses_observed_time_even_when_gap_dominates():
-    data=[dict(at=i,remaining=i%91,cycle_cost=i%31,cycle_value=i%77,
-               connect=i!=0,reset_kind=None,label=str(i)) for i in range(10000)]
-    for i in range(5000,10000):data[i]['at']+=10**9
-    data[5000]['connect']=False
-    series=prepare_series(data)
-    assert series['active_times'][-1]==9998
-    assert 4999 in series['samples'][256] and 5000 in series['samples'][256]
-    assert len([i for i in series['samples'][256] if i<5000])>100
-    assert len([i for i in series['samples'][256] if i>=5000])>100

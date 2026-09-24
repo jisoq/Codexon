@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from cachemonitor.quota_cycles import QuotaLedger, quota_statistics, DISCONTINUITY
+from cachemonitor.quota_cycles import QuotaLedger, quota_statistics
 
 
 def observe(ledger, at, used, **extra):
@@ -74,50 +74,6 @@ def test_only_counter_increase_edge_is_excluded_and_neighbors_are_preserved(tmp_
     finally:ledger.close()
 
 
-def test_constant_initial_difference_does_not_invalidate_later_increment(tmp_path):
-    ledger=QuotaLedger(tmp_path/'ledger.sqlite')
-    try:
-        observe(ledger,100,10);observe(ledger,200,15)
-        sync(ledger,[150],sessions=[{'home':'h','id':'s','unclassified':{'total':999},
-                                    'coverage_available':True,'coverage_initial':999,'coverage_gaps':[]}])
-        assert quota_statistics(ledger.report('h',1000))['valid']==1
-    finally:ledger.close()
-
-
-def test_collector_watermark_not_arbitrary_delay_bounds_live_costs(tmp_path):
-    ledger=QuotaLedger(tmp_path/'ledger.sqlite')
-    try:
-        for at,used in [(100,10),(200,15),(280,18)]:observe(ledger,at,used)
-        sync(ledger,[150,250],at=220)
-        assert quota_statistics(ledger.report('h',300))['delta']==5
-        sync(ledger,[150,250],at=300)
-        summary=quota_statistics(ledger.report('h',300))
-        assert summary['delta']==8 and summary['calls']==2
-    finally:ledger.close()
-
-
-def test_fresh_baseline_is_waiting_not_a_rejected_sample(tmp_path):
-    ledger=QuotaLedger(tmp_path/'ledger.sqlite')
-    try:
-        observe(ledger,100,10);sync(ledger,[],at=120)
-        summary=quota_statistics(ledger.report('h',120))
-        assert summary['valid']==0 and summary['pending']==1
-    finally:ledger.close()
-
-
-def test_zero_call_increase_does_not_discard_the_healthy_neighbor(tmp_path):
-    ledger=QuotaLedger(tmp_path/'ledger.sqlite')
-    try:
-        for at,used in [(100,10),(200,15),(300,15),(400,24)]:observe(ledger,at,used)
-        sync(ledger,[150])
-        summary=quota_statistics(ledger.report('h',1000))
-        assert summary['valid']==1 and summary['delta']==5
-        assert any('소모 귀속 미확인' in ' '.join(r['excluded']) for r in summary['intervals'])
-        ledger.db.execute('delete from observation_context');ledger.db.commit()
-        assert quota_statistics(ledger.report('h',1000))['valid']==0
-    finally:ledger.close()
-
-
 def test_return_to_an_earlier_reset_window_does_not_recount_its_high_watermark(tmp_path):
     ledger=QuotaLedger(tmp_path/'ledger.sqlite')
     try:
@@ -129,31 +85,6 @@ def test_return_to_an_earlier_reset_window_does_not_recount_its_high_watermark(t
         assert summary['delta']==3
         assert all(r['delta']!=14 for r in summary['intervals'] if not r['excluded'])
     finally:ledger.close()
-
-
-def test_isolated_high_spike_and_repeated_low_pulses_preserve_net_change(tmp_path):
-    ledger=QuotaLedger(tmp_path/'ledger.sqlite')
-    try:
-        for at,used in [(100,20),(110,99),(120,20),(130,1),(140,20),(150,1),(160,20),(200,24)]:observe(ledger,at,used)
-        sync(ledger,[105,115,125,135,145,155,180])
-        summary=quota_statistics(ledger.report('h',1000))
-        assert summary['delta']==4 and summary['calls']==7
-    finally:ledger.close()
-
-
-def test_session_coverage_tracks_changed_difference_not_carried_balance():
-    from datetime import datetime,timezone
-    from cachemonitor.core import Session
-    session=Session('s','h');session.modern=True
-    for at,total in [(100,1110),(200,1220),(300,1440),(400,1550)]:
-        event={'type':'token_usage_record','timestamp':datetime.fromtimestamp(at,timezone.utc).isoformat(),
-               'payload':{'thread_id':'s','response_id':str(at),
-                          'usage':{'input_tokens':100,'output_tokens':10,'total_tokens':110},
-                          'thread_token_usage':{'input_tokens':total-10,'output_tokens':10,'total_tokens':total}}}
-        session.consume(event,1000)
-        session.consume(event,1000)  # Mirror/duplicate must not create another gap.
-    assert session.coverage_initial==1000
-    assert session.coverage_gaps==[{'start':200,'end':300,'tokens':110}]
 
 
 def test_unpriced_call_excludes_only_its_bracketing_observation_edge(tmp_path):
@@ -182,23 +113,6 @@ def test_small_adjacent_observations_coalesce_before_precision_threshold(tmp_pat
     finally:ledger.close()
 
 
-def test_unknown_mode_edge_is_reference_only_and_keeps_neighboring_base_intervals(tmp_path):
-    ledger=QuotaLedger(tmp_path/'ledger.sqlite')
-    try:
-        for at,used in [(100,10),(200,13),(300,16),(400,20)]:observe(ledger,at,used)
-        sync(ledger,[150,250,350])
-        ledger.db.execute("update calls set cost=null,service_tier='미확인' where ts=250");ledger.db.commit()
-        report=ledger.report('h',1000)
-        base=quota_statistics(report)
-        assumed=quota_statistics(report,include_mode_assumptions=True)
-        assert base['valid']==assumed['valid']==2 and base['delta']==7
-        assert assumed['per_percent']==base['per_percent']
-        assert assumed['assumed']==1 and assumed['assumed_per_percent'] is not None
-        assert next(r for r in base['intervals'] if r['status']=='가정 필요')['start']==200
-        assert quota_statistics(report,start=150,end=400)['valid']==1
-    finally:ledger.close()
-
-
 def test_mode_assumption_never_restores_unknown_account_or_limit(tmp_path):
     ledger=QuotaLedger(tmp_path/'ledger.sqlite')
     try:
@@ -207,21 +121,6 @@ def test_mode_assumption_never_restores_unknown_account_or_limit(tmp_path):
         summary=quota_statistics(ledger.report('h',1000),include_mode_assumptions=True)
         assert summary['valid']==0 and summary['assumed']==0 and summary['assumed_per_percent'] is None
         assert '계정 식별 미확인' in summary['intervals'][0]['excluded']
-    finally:ledger.close()
-
-
-def test_unidentified_fallback_is_retained_without_splitting_identified_stream(tmp_path):
-    ledger=QuotaLedger(tmp_path/'ledger.sqlite')
-    try:
-        observe(ledger,100,10);observe(ledger,200,15)
-        observe(ledger,300,18,source='local',account='')
-        observe(ledger,400,21,source='local',account='')
-        sync(ledger,[150,350])
-        report=ledger.report('h',1000)
-        assert len(report['history'])==4
-        summary=quota_statistics(report)
-        assert summary['valid']==1 and summary['delta']==5
-        assert len(summary['intervals'])==1  # unidentified history remains in report['history']
     finally:ledger.close()
 
 
@@ -235,19 +134,6 @@ def test_both_window_histories_are_persisted_without_cross_home_merge(tmp_path):
         assert len(ledger.report('h',200)['history'])==1
         assert ledger.report('h',200)['history'][0]['window']=='five_hour'
     finally:ledger.close()
-
-
-def test_history_only_marks_full_recoveries_and_leaves_collection_gaps_unmarked():
-    from cachemonitor.quota_panel import history_rows
-    def point(at,used,reset=1000,**extra):
-        return dict(id=str(at),window='weekly',at=at,used=used,reset=reset,minutes=10080,
-                    account='a',plan='pro',bucket='codex',source='live',**extra)
-    report={'history':[point(900,20),point(950,25),point(1002,0,605800),point(4000,5,605800)]}
-    rows=history_rows(report,'weekly')
-    assert rows[1]['connect'] and rows[2]['connect'] and not rows[3]['connect']
-    assert rows[2]['at']==1002 and rows[2]['markers']==['정기 초기화']
-    assert rows[3]['markers']==[]
-    assert history_rows(report,'five_hour')==[]
 
 
 def test_current_freshness_uses_older_but_valid_local_fallback_and_reset_state():

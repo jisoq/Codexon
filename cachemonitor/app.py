@@ -71,7 +71,9 @@ def main():
     configure_font_rendering()
     configure_high_dpi()
     app = QApplication(sys.argv[:1])
-    display_language=os.environ.get('CODEXON_LANGUAGE') or QSettings('CacheMonitor','CacheMonitor').value('ui/language','ko')
+    startup_settings=(QSettings(str(Path(args.index_path).parent/'handoff-settings.ini'),QSettings.IniFormat)
+                      if args.verify_handoff else QSettings('CacheMonitor','CacheMonitor'))
+    display_language=os.environ.get('CODEXON_LANGUAGE') or startup_settings.value('ui/language','ko')
     set_language(display_language)
     QLocale.setDefault(QLocale('en_US' if display_language=='en' else 'ko_KR'))
     app.setProperty('cachemonitorDisableShellIntegration', bool(args.smoke or args.verify_handoff))
@@ -113,12 +115,19 @@ def main():
     smoke_settings = None
     if args.smoke or args.verify_handoff:
         smoke_directory = tempfile.TemporaryDirectory(prefix='cachemonitor-qa-')
-        smoke_settings = QSettings(str(Path(smoke_directory.name)/'settings.ini'),QSettings.IniFormat)
+        smoke_settings = startup_settings if args.verify_handoff else QSettings(str(Path(smoke_directory.name)/'settings.ini'),QSettings.IniFormat)
         if args.index_path is None:args.index_path=str(Path(smoke_directory.name)/'index.sqlite')
     if not isolated:save_homes(homes)
     window = Dashboard(homes,index_path=args.index_path,live_limits=not (args.smoke or args.verify_handoff),manage_observer=not args.smoke and args.index_path is None, **({'settings':smoke_settings} if smoke_settings else {}))
     from .overlay import install_overlay
     install_overlay(window, native_enabled=not (args.smoke or args.verify_handoff))
+    def restart():
+        from .app_restart import launch_replacement
+        try:launch_replacement(homes,index_path=args.index_path,handoff=args.verify_handoff)
+        except OSError:
+            window.settings_page.refresh_restart()
+            QMessageBox.warning(window,'Codexon',tr('앱을 다시 시작하지 못했습니다. 다시 시도해 주세요.'))
+    window.settings_page.restartRequested.connect(restart)
     app.aboutToQuit.connect(window.observer_panel.stop)
     def finish_update():
         operation=window.update_panel.operation
@@ -137,6 +146,18 @@ def main():
                 else:
                     client.write(b'ready-to-exit');client.flush()
                     QTimer.singleShot(100,window.quit_app)
+            elif command==b'verify-settings-restart' and args.verify_handoff:
+                def exercise_restart():
+                    from .quick_qa import control, click
+                    from PySide6.QtTest import QTest
+                    window.open_settings();window.settings_page.navigation.setCurrentRow(0);window.show();QTest.qWait(60)
+                    choice=window.settings_page.controls['language'];button=window.settings_page.controls['restart']
+                    choice.setCurrentIndex(choice.findData('ko' if display_language=='en' else 'en'));QTest.qWait(30)
+                    assert control(window,button).isEnabled()
+                    window.grab().save(str(args.verify_handoff.with_suffix('.png')))
+                    click(window,control(window,button))
+                client.write(b'restarting');client.flush()
+                QTimer.singleShot(100,exercise_restart)
             else:window.show_window()
             client.disconnectFromServer()
             client.deleteLater()
@@ -147,7 +168,8 @@ def main():
     if args.verify_handoff:
         from .observer_control import atomic_write
         QTimer.singleShot(250,lambda:atomic_write(args.verify_handoff,json.dumps(dict(
-            pid=os.getpid(),version=VERSION,homes=homes,ready=True,hwnd=int(window.winId()))).encode()))
+            pid=os.getpid(),version=VERSION,homes=homes,ready=True,hwnd=int(window.winId()),language=display_language,
+            restart_enabled=window.settings_page.controls['restart'].isEnabled())).encode()))
     if not args.hidden or not QSystemTrayIcon.isSystemTrayAvailable():
         window.show_window()
     if args.smoke:

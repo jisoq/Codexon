@@ -17,6 +17,7 @@ Canvas {
         else if(name==="plus" || name==="minus") { c.moveTo(5,12);c.lineTo(19,12);if(name==="plus"){c.moveTo(12,5);c.lineTo(12,19)} }
         else if(name==="calendar") { c.rect(4,5,16,16);c.moveTo(4,10);c.lineTo(20,10);c.moveTo(8,3);c.lineTo(8,7);c.moveTo(16,3);c.lineTo(16,7) }
         else if(name==="external") { c.moveTo(14,4);c.lineTo(20,4);c.lineTo(20,10);c.moveTo(20,4);c.lineTo(10,14);c.moveTo(10,5);c.lineTo(4,5);c.lineTo(4,20);c.lineTo(19,20);c.lineTo(19,14) }
+        else if(name==="restart") { c.arc(12,12,8,-Math.PI/3,Math.PI*1.5);c.moveTo(12,4);c.lineTo(16,4);c.lineTo(16,8) }
         c.stroke()
     }
 }

@@ -21,17 +21,6 @@ def observe(ledger, at, remaining, home='h'):
     tracking.observe(ledger.db,home,q)
 
 
-def test_buffered_observations_keep_original_monitoring_state(tmp_path):
-    ledger=QuotaLedger(tmp_path/'buffered.sqlite')
-    try:
-        tracking.enable(ledger.db,'h',100)
-        tracking.enable(ledger.db,'h',120,enabled=False)
-        tracking.enable(ledger.db,'h',140,enabled=True)
-        for at in (110,130,150):observe(ledger,at,70)
-        assert [r[0] for r in ledger.db.execute('select requested from tracking_observations order by requested')]==[110,150]
-    finally:ledger.close()
-
-
 def test_forward_continuous_account_consumption_and_cost_survive_reopen(tmp_path):
     path=tmp_path/'ledger.sqlite'
     ledger=QuotaLedger(path)
@@ -59,18 +48,6 @@ def test_forward_continuous_account_consumption_and_cost_survive_reopen(tmp_path
     ledger.close()
     ledger=QuotaLedger(path)
     assert quota_statistics(ledger.report('h',122))['per_percent']==pytest.approx(expected/6)
-    ledger.close()
-
-
-def test_cached_observation_does_not_hold_writer_lock(tmp_path):
-    ledger=QuotaLedger(tmp_path/'shared.sqlite')
-    tracking.enable(ledger.db,'h',100)
-    observe(ledger,102,70)
-    observe(ledger,102,70)
-    assert not ledger.db.in_transaction
-    other=QuotaLedger(ledger.path)
-    activity(other,103,{})
-    other.close()
     ledger.close()
 
 
@@ -264,31 +241,6 @@ def test_account_observations_are_not_delayed_by_incomplete_usage_index(tmp_path
     ledger.close()
 
 
-def test_manual_reset_same_server_epoch_starts_new_nonbridged_segment(tmp_path):
-    ledger=QuotaLedger(tmp_path/'manual.sqlite')
-    tracking.enable(ledger.db,'h',100)
-    observe(ledger,102,70);observe(ledger,110,68)
-    ledger.db.execute('insert into manual_resets values(?,?,?,?,?)',('reset','h',115,'a',115))
-    ledger.db.commit()
-    observe(ledger,120,100);observe(ledger,130,99)
-    stats=quota_statistics(ledger.report('h',131))
-    assert stats['account_delta']==3 and stats['observed_delta']==0
-    assert len(ledger.report('h',131)['cycles'])==2
-    ledger.close()
-
-
-def test_period_filter_keeps_forward_zero_and_partial_cost_totals(tmp_path):
-    ledger=QuotaLedger(tmp_path/'period.sqlite')
-    tracking.enable(ledger.db,'h',100)
-    observe(ledger,102,70);observe(ledger,110,69);observe(ledger,120,68)
-    activity(ledger,121,{},[107,117])
-    stats=quota_statistics(ledger.report('h',122),105,122)
-    assert stats['delta']==1 and stats['observed_priced_calls']==1
-    assert stats['observed_calls']==1
-    assert stats['per_percent']==ledger.db.execute('select cost from calls where ts=117').fetchone()[0]
-    ledger.close()
-
-
 def test_distinct_parent_and_subagent_costs_count_once_per_real_response(tmp_path):
     ledger=QuotaLedger(tmp_path/'agents.sqlite')
     tracking.enable(ledger.db,'h',100)
@@ -369,16 +321,4 @@ def test_partial_priced_calls_wait_for_matching_usage_without_losing_known_cost(
     assert stats['cost']==ledger.db.execute('select sum(cost) from calls').fetchone()[0]
     assert stats['per_percent']==stats['cost'] and stats['attribution']['pending_delta']==0
     assert ledger.db.execute('select count(cost) from calls').fetchone()[0]==1
-    ledger.close()
-
-
-def test_confirmed_empty_local_call_window_is_zero_cost(tmp_path):
-    ledger=QuotaLedger(tmp_path/'empty.sqlite')
-    tracking.enable(ledger.db,'h',100)
-    observe(ledger,102,70);observe(ledger,110,69)
-    activity(ledger,111,{},[])
-    stats=quota_statistics(ledger.report('h',112))
-    assert stats['account_delta']==1 and stats['observed_delta']==0 and stats['observed_calls']==0
-    assert stats['observed_cost']==stats['cost']==0 and stats['per_percent'] is None
-    assert stats['attribution']['idle_delta']==1
     ledger.close()

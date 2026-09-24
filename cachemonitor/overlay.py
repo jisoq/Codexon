@@ -30,11 +30,12 @@ class OverlayController(QObject):
         self.widget = SessionOverlay()
         from .overlay_shadow import OverlayShadow
         self.shadow=OverlayShadow()
-        from .overlay_chrome import OverlayChrome, OverlayDetail, OverlayLinks
+        from .overlay_chrome import OverlayChrome, OverlayDetail, OverlayLinks, CalculationNote
         self.header=OverlayChrome('header');self.toolbar=OverlayChrome('toolbar');self.icon=OverlayChrome('icon');self.actions=OverlayChrome('actions')
         self.detail=OverlayDetail(self.widget.content_model)
         self.links=OverlayLinks(self.widget.content_model)
-        self.links.view.navigationRequested.connect(self.navigation_requested)
+        self.calculation_note=self.widget.content_model.calculation_note=CalculationNote(self.widget.content_model)
+        self.links.view.navigationRequested.connect(self.navigate_monitor)
         self.detail.view.navigationRequested.connect(self.navigation_requested)
         self.links.wheel_forwarder=self.forward_wheel
         self.chrome=(self.header,self.toolbar,self.icon,self.actions,self.detail,self.links)
@@ -120,6 +121,14 @@ class OverlayController(QObject):
         self.input_timer.timeout.connect(self.poll_popup)
         self._pointer_down=False
         if self.native and self.enabled: self.timer.start(1000)
+
+    def navigate_monitor(self, target):
+        if target.view != 'speed_alert':
+            self.navigation_requested.emit(target);return
+        if self.widget.content_model.open_speed_detail(target):
+            self.expanded=True
+            self.close_popup();self.refresh()
+            self.detail.focus_control('detailScroll')
 
     def open_session(self):
         from .overlay_navigation import navigation_target
@@ -226,6 +235,9 @@ class OverlayController(QObject):
     def toggle_expanded(self):
         self.close_popup()
         self.expanded=not self.expanded
+        if not self.expanded:
+            self.widget.content_model.speed_detail=False
+            self.widget.content_model.sync_details()
         self.settings.setValue('overlay/expanded',self.expanded)
         self.changed.emit();self.refresh()
 
@@ -545,12 +557,14 @@ class OverlayController(QObject):
             self.native.configure(int(self.shadow.winId()),click_through=True)
             for control in self.chrome:self.native.configure(int(control.winId()),click_through=False)
             if hasattr(self.native,'set_companions'):
-                self.native.set_companions(int(control.winId()) for control in self.chrome)
+                self.native.set_companions(int(control.winId()) for control in (*self.chrome,self.calculation_note))
             self.chrome_native=self.native
         for control in self.chrome:
             if hasattr(control,'apply_appearance'):control.apply_appearance(self.appearance,self.opacity)
             if hasattr(control,'view'):control.view.put(reducedMotion=self.reduced_motion)
         content.put(reducedMotion=self.reduced_motion)
+        self.icon.view.put(speedWarning=bool(content.speed_alert().get('active')),
+                           warning=self.widget.content_model.state.get('overlayWarning'))
         self.header.set_title(data.get('title','') if data else '',content.context()[0])
         self.header.session_scope=((data or {}).get('home'),(data or {}).get('id'))
         if mode=='icon':

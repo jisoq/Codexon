@@ -26,6 +26,7 @@ def test_release_assets_cannot_mix_sources_or_be_ambiguous():
 
 def test_failed_download_never_launches_installer(tmp_path,monkeypatch):
     import io
+    monkeypatch.setattr(app_update,'VERSION','2026.09.23.9')
     value=release()
     monkeypatch.setattr(app_update,'installed',lambda:dict(InstallRoot=str(tmp_path)))
     monkeypatch.setattr(app_update,'read_url',lambda url,*a:json.dumps(value).encode() if url.endswith('latest') else (('0'*64)+'  Codexon-Setup.exe').encode())
@@ -37,6 +38,7 @@ def test_failed_download_never_launches_installer(tmp_path,monkeypatch):
 
 def test_verified_release_launches_one_installer_and_preserves_settings(tmp_path,monkeypatch):
     import io
+    monkeypatch.setattr(app_update,'VERSION','2026.09.23.9')
     value=release();data=b'payload';digest=hashlib.sha256(data).hexdigest()
     value['assets'][0]['digest']='sha256:'+digest
     monkeypatch.setattr(app_update,'installed',lambda:dict(InstallRoot=str(tmp_path)))
