@@ -19,7 +19,7 @@ class ObserverTask:
             'executable':command[0] if command else '',
             'arguments':subprocess.list2cmdline(command[1:]) if command else '',
             'autostart':bool(autostart),'periodic':bool(periodic),
-            'restart':3 if self.role in ('ModelObserver','ProxySupervisor','ProxyUpdate','CacheObservation') else 0}).encode()).decode()
+            'restart':3 if self.role in ('ModelObserver','ProxySupervisor','ProxyUpdate','CacheObservation','CacheObservationV2') else 0}).encode()).decode()
         script=r'''
 $ErrorActionPreference='Stop'
 [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
@@ -35,7 +35,7 @@ if($p.operation -eq 'inspect'){
     $a=$existing.Definition.Actions.Item(1)
     $login=$false
     foreach($t in $existing.Definition.Triggers){if($t.Type -eq 9 -and $t.Enabled){$login=$true}}
-    @{registered=$true;autostart=$login;executable=$a.Path;arguments=$a.Arguments;state=$existing.State} | ConvertTo-Json -Compress
+    @{registered=$true;autostart=$login;executable=$a.Path;arguments=$a.Arguments;state=$existing.State;restartCount=$existing.Definition.Settings.RestartCount} | ConvertTo-Json -Compress
     exit 0
 }
 if($p.operation -eq 'remove'){
