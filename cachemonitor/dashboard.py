@@ -1076,13 +1076,14 @@ class Dashboard(TrayWindow):
         self.parent_table=self.request_parent_table if self.parent_kind=='requests' else self.session_parent_table
         self.parent_stack.setCurrentIndex(1 if self.parent_kind=='requests' else 0)
         if self.parent_kind=='requests':
-            records=[dict(r) for r in self.lookup['session_turns'].get(self.selected_session,[])]
+            records=[dict(r,call_mean=stats(r.get('calls',[]),'cost')['mean']) for r in self.lookup['session_turns'].get(self.selected_session,[])]
             unlinked=[r for r in scope_rows if (r['home'],r['sid'])==self.selected_session and not r.get('turn')]
-            if unlinked:records.append(dict(home=self.selected_session[0],sid=self.selected_session[1],turn='__unlinked__',state='요청 미연결',responses=len(unlinked),cost=sum_cost(unlinked)['cost'],ts=max(r['ts'] for r in unlinked)))
+            if unlinked:
+                records.append(dict(home=self.selected_session[0],sid=self.selected_session[1],turn='__unlinked__',state='요청 미연결',responses=len(unlinked),cost=sum_cost(unlinked)['cost'],call_mean=stats(unlinked,'cost')['mean'],ts=max(r['ts'] for r in unlinked)))
             sorting=self.sort.currentData();key='cost' if sorting.startswith('cost') else 'ts'
             records.sort(key=lambda r:(r.get(key) is None,-r[key] if sorting.endswith('desc') and isinstance(r.get(key),(int,float)) else r.get(key,0)))
-            headers=['요청 시작','상태','호출 수','비용'];widths=[175,150,90,130]
-            formatter=lambda r,c,role:[date_time(r.get('started_at')),r.get('state') or '완료 기록 없음',number(r.get('responses')),usd(r.get('cost'))][c]
+            headers=['요청 시작','상태','호출 수','비용','평균 호출 비용'];widths=[175,150,90,130,160]
+            formatter=lambda r,c,role:[date_time(r.get('started_at')),r.get('state') or '완료 기록 없음',number(r.get('responses')),usd(r.get('cost')),usd(r.get('call_mean'))][c]
             selected=next((i for i,r in enumerate(records) if r.get('turn')==self.selected_turn),-1)
             self.record_parent_title.setText('요청');self.parent_table.put(rowHeight=40,leftColumns=[0,1])
         else:
@@ -1179,13 +1180,14 @@ class Dashboard(TrayWindow):
             else:self.table.put(rowHeight=40)
         elif self.record_view=='requests':
             visible_turns={r.get('turn') for r in rows}
-            records=[dict(t) for t in self.lookup['session_turns'].get(self.selected_session,[]) if t.get('turn') in visible_turns]
+            records=[dict(t,call_mean=stats(t.get('calls',[]),'cost')['mean']) for t in self.lookup['session_turns'].get(self.selected_session,[]) if t.get('turn') in visible_turns]
             unlinked=[r for r in rows if not r.get('turn')]
-            if unlinked:records.append(dict(home=self.selected_session[0],sid=self.selected_session[1],turn='__unlinked__',state=f'요청 미연결 {len(unlinked):,}호출',responses=len(unlinked),cost=sum_cost(unlinked)['cost'],ts=max(r['ts'] for r in unlinked)))
-            headers=['요청 시작','완료 시각','상태','선택 / 전체 호출','비용'];widths=[175,175,160,140,160];self.table.put(leftColumns=[0,1,2],rowHeight=40)
+            if unlinked:
+                records.append(dict(home=self.selected_session[0],sid=self.selected_session[1],turn='__unlinked__',state=f'요청 미연결 {len(unlinked):,}호출',responses=len(unlinked),cost=sum_cost(unlinked)['cost'],call_mean=stats(unlinked,'cost')['mean'],ts=max(r['ts'] for r in unlinked)))
+            headers=['요청 시작','완료 시각','상태','선택 / 전체 호출','비용','평균 호출 비용'];widths=[175,175,160,140,160,160];self.table.put(leftColumns=[0,1,2],rowHeight=40)
             def formatter(r,c,role):
                 whole=r.get('total_responses',r.get('responses',0))
-                return [date_time(r.get('started_at')),date_time(r.get('ended_at')),r.get('state') or '완료 기록 없음',f"{r.get('responses',0):,} / {whole:,}",usd(r.get('cost'))][c]
+                return [date_time(r.get('started_at')),date_time(r.get('ended_at')),r.get('state') or '완료 기록 없음',f"{r.get('responses',0):,} / {whole:,}",usd(r.get('cost')),usd(r.get('call_mean'))][c]
         else:
             records=list(rows);self.table.put(leftColumns=[0,1,2,3],rowHeight=40)
             if self.outside.isChecked() and self.selected_turn and self.selected_session:
@@ -1201,7 +1203,7 @@ class Dashboard(TrayWindow):
         if headers!=self.table.model().headers:
             self.table.setHorizontalHeaderLabels(headers)
             for i,width in enumerate(widths):self.table.setColumnWidth(i,width)
-        numeric={'비용 · 하위 포함','비용','호출 수','산정 / 전체 호출','캐시 적중률','선택 / 전체 호출','입력','캐시 읽기','캐시 쓰기','출력','추론','추론 외','평균 출력 속도'}
+        numeric={'비용 · 하위 포함','비용','평균 호출 비용','호출 수','산정 / 전체 호출','캐시 적중률','선택 / 전체 호출','입력','캐시 읽기','캐시 쓰기','출력','추론','추론 외','평균 출력 속도'}
         self.table.put(noElideColumns=[i for i,title in enumerate(headers) if title in numeric])
         self.record_rows=records;self.table.set_rows(records,formatter)
         self.render_record_parent(scope_rows)
