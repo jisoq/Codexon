@@ -72,6 +72,45 @@ def test_sequential_drilldown_and_full_call_detail(dashboard,tmp_path):
     assert not w.qml_errors
 
 
+@pytest.mark.parametrize('unlinked',[False,True])
+@pytest.mark.parametrize('all_unpriced',[False,True])
+def test_request_average_call_cost_in_both_tables_and_filtered_scope(dashboard,unlinked,all_unpriced):
+    from cachemonitor.pricing import usd
+    w=dashboard
+    if unlinked or all_unpriced:
+        value=copy.deepcopy(w.snapshot)
+        for session in value['sessions']:
+            for row in session['history']:
+                if row['turn'] in ('t0','t7'):
+                    if all_unpriced:row['output']=None
+                    if unlinked:row['turn']=None
+        w.receive(value)
+    w.nav.setCurrentRow(2)
+
+    def check(node,rows):
+        model=node.model();column=model.headers.index('평균 호출 비용')
+        assert column==model.headers.index('비용')+1
+        for index,row in enumerate(rows):
+            calls=[r for r in w.analysis['responses'] if (r['home'],r['sid'])==w.selected_session
+                   and (not r.get('turn') if row['turn']=='__unlinked__' else r.get('turn')==row['turn'])]
+            priced=[r['cost'] for r in calls if r['cost'] is not None]
+            expected=sum(priced)/len(priced) if priced else None
+            assert model.data(model.index(index,column))==usd(expected)
+
+    for mode in ('','Standard'):
+        choose(w.mode,mode);w.filter_changed()
+        w.selected_turn=None;w.record_view='requests';w.render_explorer()
+        check(w.table,w.record_rows)
+        missing=next(r for r in w.record_rows if r['turn']==('__unlinked__' if unlinked else 't7'))
+        assert (missing['call_mean'] is None)==all_unpriced
+        if mode and not unlinked:
+            assert missing['responses']==1 and missing['total_responses']==2
+        w.activate_record(0)
+        assert w.parent_kind=='requests'
+        check(w.parent_table,w.parent_rows)
+    assert not w.qml_errors
+
+
 def test_overlay_context_clears_blocking_filters_and_back_restores(dashboard):
     w=dashboard;w.nav.setCurrentRow(1);choose(w.band,'0:10000');w.render()
     before=w.capture_state()
