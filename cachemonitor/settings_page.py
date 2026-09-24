@@ -19,14 +19,14 @@ class SettingsPage(Group):
         self.navigation.addItems(self.TITLES); self.navigation.setFixedWidth(160)
         self.navigation.setStyleSheet('Navigation { border: none; background: transparent; } '
             'Navigation::item { padding: 11px 12px; border-radius: 5px; margin-bottom: 3px; } '
-            'Navigation::item:selected { background: #e8edf2; color: #233444; }')
+            'Navigation::item:selected { background: selection; color: ink; }')
         self.stack = Stack()
         shell.addWidget(self.navigation); shell.addWidget(self.stack, 1)
         self.layouts = []; self.scrollers = []
         for title in self.TITLES:
             area = Scroll(); area.setWidgetResizable(True)
             body = Group();body.setObjectName('settingsBody')
-            body.setStyleSheet('Group#settingsBody { background: white; }')
+            body.put(background='surface')
             layout = Column(body); layout.setContentsMargins(4, 3, 12, 18)
             layout.setSpacing(0)
             heading = Text(title); heading.setStyleSheet('font-size: 19px; font-weight: 600;')
@@ -104,14 +104,14 @@ class SettingsPage(Group):
 
     def add_row(self, category, title, description, control):
         row = Group(); row.setObjectName('preferenceRow')
-        row.setStyleSheet('Group#preferenceRow { border-bottom: 1px solid #e3e7eb; }')
+        row.setStyleSheet('Group#preferenceRow { border-bottom: 1px solid border; }')
         layout = Row(row); layout.setContentsMargins(0, 20, 0, 20); layout.setSpacing(24)
         copy = Column(); copy.setSpacing(5)
         name = Text(title); name.setWordWrap(True); name.setStyleSheet('font-weight: 500;')
         copy.addWidget(name)
         if description:
             detail = Text(description); detail.setWordWrap(True)
-            detail.setStyleSheet('color: #66768c; font-size: 13px;')
+            detail.setStyleSheet('color: muted; font-size: 13px;')
             copy.addWidget(detail)
         layout.addLayout(copy, 1); layout.addWidget(control, 0, Qt.AlignVCenter)
         control.setAccessibleName(title)

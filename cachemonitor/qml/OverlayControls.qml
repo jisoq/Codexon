@@ -7,7 +7,7 @@ Rectangle {
     property var s: presentation.state
     property bool moveControl: s.chromeKind === "icon" || s.chromeKind === "header"
     property real outerMargin: moveControl ? 4 * s.scale : 0
-    color: moveControl ? "transparent" : "#01000000"
+    color: moveControl ? "transparent" : appTheme.palette.hit_surface
     Keys.onEscapePressed: event => { root.presentation.escapePanel(); event.accepted = true; }
 
     Item {
@@ -39,7 +39,7 @@ Rectangle {
     Rectangle {
         anchors.fill: moveTarget
         visible: root.moveControl
-        color: "#01000000"
+        color: appTheme.palette.hit_surface
     }
 
     Rectangle {

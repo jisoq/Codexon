@@ -9,7 +9,7 @@ ScrollBar {
     opacity: size < 0.999 ? 1 : 0
     contentItem: Rectangle {
         implicitWidth: 6; implicitHeight: 6; radius: 3
-        color: control.pressed ? (appTheme.palette && appTheme.color("#6f849d")) : control.hovered ? (appTheme.palette && appTheme.color("#94a4b8")) : (appTheme.palette && appTheme.color("#bdc8d6"))
+        color: control.pressed ? (appTheme.palette && appTheme.color("muted")) : control.hovered ? (appTheme.palette && appTheme.color("muted")) : (appTheme.palette && appTheme.color("border"))
     }
-    background: Rectangle { color: (appTheme.palette && appTheme.color("#eef2f7")); radius: 4 }
+    background: Rectangle { color: (appTheme.palette && appTheme.color("secondary")); radius: 4 }
 }

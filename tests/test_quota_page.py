@@ -55,9 +55,10 @@ def test_responsive_page_chart_and_single_details_path(quota_page,tmp_path,width
         assert all(r['local_observed'] for r in panel.history.rows)
         assert panel.cycle_choice.count()==4
         assert not panel.details.content.isVisible()
-        # Full-height hit regions select the observation without pixel hunting.
-        box,row,tip=panel.history.hits[-1]
-        click(host,plot,box.center().x(),box.center().y())
+        # Select the exact observation; between records the chart now reports
+        # the step value at the cursor, rather than a future nearest record.
+        row=panel.history.rows[-1]
+        plot.activateAt(panel.history.x_at(len(panel.history.rows)-1),panel.history.box.center().y())
         assert plot.detail['title'] in row['label']
         plot.forceActiveFocus();QTest.keyClick(host.quick,Qt.Key_Right);QTest.qWait(30)
         assert plot.detail['title'] in panel.history.rows[0]['label']

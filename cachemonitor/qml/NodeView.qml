@@ -65,7 +65,7 @@ Item {
             implicitHeight: childrenView.implicitHeight
             Rectangle {
                 anchors.left: parent.left; anchors.right: parent.right; anchors.bottom: parent.bottom
-                height: 1; color: (appTheme.palette && appTheme.color("#e5eaf0")); visible: view.s.style === "preferenceRow"
+                height: 1; color: (appTheme.palette && appTheme.color("border")); visible: view.s.style === "preferenceRow"
             }
             NodeChild {
                 id: childrenView; anchors.top: parent.top; anchors.bottom: parent.bottom; anchors.horizontalCenter: parent.horizontalCenter
@@ -77,6 +77,7 @@ Item {
     Component {
         id: flowComponent
         Flow {
+            layoutDirection: view.s.alignRight ? Qt.RightToLeft : Qt.LeftToRight
             spacing: view.s.spacing
             Repeater {
                 model: view.node.nodes
@@ -152,13 +153,13 @@ Item {
     Component {
         id: textComponent
         Item {
-            implicitWidth: (view.s.wrap ? 220 : Math.min(900, label.implicitWidth)) + view.s.margins[0] + view.s.margins[2]
+            implicitWidth: (view.s.wrap ? 220 : Math.min(900, label.implicitWidth)) + view.s.margins[0] + view.s.margins[2] + (view.s.swatch ? 18 : 0)
             // Text and TextEdit use different line metrics. Reserve the height
             // of the visible renderer, including its final wrapped line.
             implicitHeight: Math.ceil(view.s.selectable ? selectableText.contentHeight : label.contentHeight) + view.s.margins[1] + view.s.margins[3]
             Text {
                 id: label; anchors.fill: parent
-                anchors.leftMargin: view.s.margins[0]; anchors.rightMargin: view.s.margins[2]
+                anchors.leftMargin: view.s.margins[0] + (view.s.swatch ? 18 : 0); anchors.rightMargin: view.s.margins[2]
                 anchors.topMargin: view.s.margins[1]; anchors.bottomMargin: view.s.margins[3]
                 visible: !view.s.selectable
                 text: view.s.text; textFormat: view.s.rich || view.s.externalLinks ? Text.RichText : Text.PlainText
@@ -167,7 +168,7 @@ Item {
                 font.family: view.s.fontFamily || appTheme.family; font.pixelSize: view.s.fontSize; font.bold: view.s.bold
                 color: appTheme.palette && appTheme.color(view.s.color)
                 horizontalAlignment: view.s.alignment & Qt.AlignRight ? Text.AlignRight : Text.AlignLeft
-                linkColor: (appTheme.palette && appTheme.color("#326ba9"))
+                linkColor: (appTheme.palette && appTheme.color("accent"))
                 verticalAlignment: Text.AlignVCenter
                 Accessible.name: view.s.accessible || text
                 onLinkActivated: link => { if (view.s.externalLinks) Qt.openUrlExternally(link) }
@@ -178,7 +179,14 @@ Item {
                 text: label.text; textFormat: view.s.rich || view.s.externalLinks ? TextEdit.RichText : TextEdit.PlainText
                 wrapMode: view.s.wrap ? TextEdit.Wrap : TextEdit.NoWrap
                 font: label.font; color: label.color; readOnly: true; selectByMouse: true; activeFocusOnTab: true
+                selectionColor: appTheme.palette.selection; selectedTextColor: appTheme.palette.ink
                 onLinkActivated: link => { if (view.s.externalLinks) Qt.openUrlExternally(link) }
+            }
+            Rectangle {
+                visible: !!view.s.swatch
+                anchors.left: parent.left; anchors.verticalCenter: parent.verticalCenter
+                width: 12; height: 4
+                color: view.s.swatch ? (appTheme.palette && appTheme.color(view.s.swatch)) : "transparent"
             }
             HoverHandler { id: textHover }
             UiToolTip { visible: textHover.hovered && (view.s.tooltip.length > 0 || label.truncated); text: view.s.tooltip || label.text }
@@ -193,10 +201,10 @@ Item {
                 text: view.s.text; readOnly: true; selectByMouse: true
                 textFormat: view.s.rich ? TextEdit.RichText : TextEdit.PlainText
                 wrapMode: TextEdit.Wrap; font.family: appTheme.family; font.pixelSize: 14
-                placeholderText: view.s.placeholder; color: (appTheme.palette && appTheme.readableText(view.s.color, "#f8fafc"))
+                placeholderText: view.s.placeholder; color: (appTheme.palette && appTheme.readableText(view.s.color, "secondary"))
                 selectionColor: appTheme.palette.accent
-                selectedTextColor: appTheme.readableText("#ffffff", "accent")
-                background: Rectangle { color: (appTheme.palette && appTheme.color("#f8fafc")); border.color: (appTheme.palette && appTheme.color("#dfe4ea")) }
+                selectedTextColor: appTheme.readableText("surface", "accent")
+                background: Rectangle { color: (appTheme.palette && appTheme.color("secondary")); border.color: (appTheme.palette && appTheme.color("border")) }
             }
         }
     }
@@ -260,12 +268,12 @@ Item {
                 contentItem: Text {
                     text: modelData.text; font.family: appTheme.family; font.pixelSize: 14
                     font.weight: highlighted ? Font.DemiBold : Font.Normal
-                    color: highlighted ? (appTheme.palette && appTheme.color("#235b99")) : (appTheme.palette && appTheme.color("#526278"))
+                    color: highlighted ? (appTheme.palette && appTheme.color("accent")) : (appTheme.palette && appTheme.color("muted"))
                     verticalAlignment: Text.AlignVCenter; elide: Text.ElideRight
                 }
                 background: Rectangle {
-                    radius: 6; color: highlighted ? (appTheme.palette && appTheme.color("#e7eff9")) : parent.hovered ? (appTheme.palette && appTheme.color("#edf1f6")) : "transparent"
-                    border.color: parent.activeFocus ? (appTheme.palette && appTheme.color("#3976bb")) : "transparent"
+                    radius: 6; color: highlighted ? (appTheme.palette && appTheme.color("secondary")) : parent.hovered ? (appTheme.palette && appTheme.color("secondary")) : "transparent"
+                    border.color: parent.activeFocus ? (appTheme.palette && appTheme.color("accent")) : "transparent"
                     Rectangle { objectName:"hover-feedback";anchors.fill:parent;radius:6;color:appTheme.palette.accent;opacity:navigationItem.hovered ? .08 : 0 }
                 }
                 onClicked: view.node.choose(index)
@@ -386,13 +394,13 @@ Item {
     Component {
         id: tabsComponent
         Rectangle {
-          color: (appTheme.palette && appTheme.color("white")); radius: 6; border.color: (appTheme.palette && appTheme.color("#e1e7ef"))
+          color: (appTheme.palette && appTheme.color("surface")); radius: 6; border.color: (appTheme.palette && appTheme.color("border"))
           implicitWidth: tabsLayout.implicitWidth; implicitHeight: tabsLayout.implicitHeight
           ColumnLayout {
             id: tabsLayout; anchors.fill: parent; anchors.margins: 1; spacing: 0
             TabBar {
                 Layout.fillWidth: true; currentIndex: view.s.index
-                background: Rectangle { color: (appTheme.palette && appTheme.color("white")); Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; color: (appTheme.palette && appTheme.color("#dfe5ee")) } }
+                background: Rectangle { color: (appTheme.palette && appTheme.color("surface")); Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; color: (appTheme.palette && appTheme.color("border")) } }
                 Repeater {
                     model: view.node.nodes
                     TabButton {
@@ -403,13 +411,13 @@ Item {
                         contentItem: Text {
                             text: modelData.state.tabTitle; font.family: appTheme.family; font.pixelSize: 14
                             font.bold: index === view.s.index
-                            color: index === view.s.index ? (appTheme.palette && appTheme.color("#235b99")) : (appTheme.palette && appTheme.color("#66768c"))
+                            color: index === view.s.index ? (appTheme.palette && appTheme.color("accent")) : (appTheme.palette && appTheme.color("muted"))
                             horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter
                             elide: Text.ElideRight
                         }
                         background: Rectangle {
-                            color: parent.hovered ? (appTheme.palette && appTheme.color("#edf3fa")) : "transparent"
-                            Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: index === view.s.index ? 2 : 1; color: index === view.s.index ? (appTheme.palette && appTheme.color("#326ba9")) : (appTheme.palette && appTheme.color("#dfe5ee")) }
+                            color: parent.hovered ? (appTheme.palette && appTheme.color("secondary")) : "transparent"
+                            Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: index === view.s.index ? 2 : 1; color: index === view.s.index ? (appTheme.palette && appTheme.color("accent")) : (appTheme.palette && appTheme.color("border")) }
                         }
                         onClicked: view.node.choose(index)
                     }
@@ -429,7 +437,7 @@ Item {
             orientation: view.s.horizontal ? Qt.Horizontal : Qt.Vertical
             handle: Rectangle {
                 implicitWidth: 10; implicitHeight: 10; color: "transparent"
-                Rectangle { anchors.centerIn: parent; width: 2; height: 28; radius: 1; color: SplitHandle.hovered ? (appTheme.palette && appTheme.color("#3976bb")) : (appTheme.palette && appTheme.color("#cdd5df")) }
+                Rectangle { anchors.centerIn: parent; width: 2; height: 28; radius: 1; color: SplitHandle.hovered ? (appTheme.palette && appTheme.color("accent")) : (appTheme.palette && appTheme.color("border")) }
             }
             onWidthChanged: if (!resizing) view.node.requestFit()
             onResizingChanged: {
@@ -464,7 +472,7 @@ Item {
             Loader {
                 id: quotaDetailLoader
                 active: !!view.s.quotaDetail
-                sourceComponent: Component { QuotaDetail { plot: quotaDetailLoader.parent } }
+                sourceComponent: Component { QuotaDetails { plot: quotaDetailLoader.parent } }
             }
             TapHandler { onTapped: eventPoint => { plot.forceActiveFocus(); plot.activateAt(eventPoint.position.x,eventPoint.position.y) } }
             Keys.onPressed: event => { plot.key(event.key); event.accepted = true }

@@ -1,19 +1,33 @@
 """Read Codex desktop appearance preferences without modifying its config."""
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 from pathlib import Path
 import re
 import tomllib
 import math
+from PySide6.QtGui import QGuiApplication, QPalette
+from .token_colors import oklab, lch, mix
+
+
+def system_seed(role, dark=True):
+    """Use the OS palette when Codex has no chrome settings; never a literal fallback."""
+    palette=QGuiApplication.palette() if QGuiApplication.instance() else QPalette()
+    value=palette.color(getattr(QPalette.ColorRole,role)).name()
+    if role in ('Window','WindowText'):
+        lightness,a,b=oklab(value)
+        wants_dark=dark if role=='Window' else not dark
+        if (lightness<.5)!=wants_dark:
+            value=lch(1-lightness,math.hypot(a,b),math.degrees(math.atan2(b,a)))
+    return value
 
 
 @dataclass(frozen=True)
 class Appearance:
     dark: bool = True
-    surface: str = '#1C211E'
-    ink: str = '#F1F5F2'
-    accent: str = '#80cbc4'
-    warning: str = '#EDB563'
+    surface: str = field(default_factory=lambda:system_seed('Window'))
+    ink: str = field(default_factory=lambda:system_seed('WindowText'))
+    accent: str = field(default_factory=lambda:system_seed('Highlight'))
+    warning: str | None = None
     contrast: float = 60
     family: str = 'Pretendard JP'
     font_size: float = 14
@@ -25,7 +39,7 @@ class Appearance:
 
 
 def default_appearance(dark):
-    return Appearance() if dark else Appearance(False, '#F7F8F7', '#1D2521', '#386F9E', '#9B5E17')
+    return Appearance(dark,system_seed('Window',dark),system_seed('WindowText',dark),system_seed('Highlight',dark))
 
 
 def color(value, fallback):
@@ -36,13 +50,8 @@ def number(value, fallback, low, high):
     return min(high, max(low, value)) if type(value) in (int, float) and math.isfinite(value) else fallback
 
 
-def raised_surface(surface, dark):
-    channels = [int(surface[i:i+2], 16) for i in (1, 3, 5)]
-    # Preserve the chrome hue while giving floating panels their own surface.
-    # Pure-white themes need a small shade instead of an invisible white tint.
-    target, mix = (255, .035 if dark else .10)
-    if not dark and min(channels) >= 250: target, mix = 0, .025
-    return '#' + ''.join(f'{round(channel*(1-mix)+target*mix):02x}' for channel in channels)
+def raised_surface(surface, dark, ink=None):
+    return mix(surface,ink or system_seed('WindowText',dark),.055)
 
 
 def resolve_appearance(desktop, system_dark, families=()):
@@ -70,7 +79,7 @@ def resolve_appearance(desktop, system_dark, families=()):
                       fallback.warning,
                       number(theme.get('contrast'), 60 if dark else 45, 0, 100), selected,
                       number(desktop.get('sansFontSize'), 14, 1, float('inf')),
-                      raised_surface(surface, dark) if surface != fallback.surface else surface)
+                      raised_surface(surface, dark, color(theme.get('ink'),fallback.ink)))
 
 
 class CodexAppearance:
@@ -97,7 +106,7 @@ class CodexAppearance:
                 self.signature = signature
             self.issue = ''
         except FileNotFoundError:
-            self.desktop = {}; self.signature = None; self.issue = 'Codex 모양 설정 없음'
+            self.signature = None; self.issue = 'Codex 모양 설정 없음'
         except (OSError, ValueError):
             # An atomic replacement or partial write must not flash an unrelated theme.
             self.issue = 'Codex 모양 설정 읽기 지연'

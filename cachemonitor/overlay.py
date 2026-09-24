@@ -497,6 +497,8 @@ class OverlayController(QObject):
             else:
                 self.appearance = default_appearance(system_dark() if mode == 'system' else mode == 'dark')
             self.dark = self.appearance.dark
+            from .theme import shared_theme
+            shared_theme().configure(mode,appearance=self.appearance)
             self.reduced_motion=bool(hasattr(self.native,'reduce_motion') and self.native.reduce_motion())
             self.next_theme = time.monotonic()+1
         self.widget.set_content(data, note, appearance=self.appearance)

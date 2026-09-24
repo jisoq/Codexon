@@ -7,6 +7,8 @@ from .charts import Plot
 from .theme import shared_theme
 from .pricing import usd
 from .quota_view import clock, prepare_series, observation_label
+from .quota_share import share_at
+from .token_colors import color_distance
 from .i18n import LocalizedPainter, tr
 
 
@@ -30,6 +32,7 @@ class QuotaHistory(Plot):
         self.money=False;self.reference=None;self.series=prepare_series([])
         self.put(quotaDetail=True)
         self._cache_key=None;self.box=QRectF()
+        self.strip_box=QRectF();self.inspection_x=None
         self.gap_lefts=[];self.gap_rights=[];self.gap_width=24
         self.setAccessibleName('잔여량과 API 동등 가치 · 방향키로 시각 선택')
         shared_theme().changed.connect(self.update)
@@ -37,6 +40,9 @@ class QuotaHistory(Plot):
     def set_series(self,series):
         if self.series is series:return
         self.series=series;self.rows=series['rows'];self.cursor=min(self.cursor,max(0,len(self.rows)-1))
+        share=series.get('model_share')
+        self.setFixedHeight(440 if share else 340)
+        shared_theme().register_models(share['models'] if share else [])
         self._cache_key=None;self.update()
 
     def set_rows(self,rows):self.set_series(prepare_series(rows))
@@ -62,9 +68,13 @@ class QuotaHistory(Plot):
         return self.series['completed_costs'][index] if key=='completed_cost' else self.rows[index].get(key)
 
     def curves(self):
-        return [('remaining','cached',Qt.SolidLine)]+([
+        curves=[('remaining','cached',Qt.SolidLine)]+([
             ('cycle_cost','output',Qt.SolidLine),('cycle_value','written',Qt.DashDotLine),
             ('completed_cost','completed',Qt.SolidLine)] if self.money else [])
+        palette=shared_theme().palette
+        if any(color_distance(palette[a[1]],palette[b[1]])<.04 for i,a in enumerate(curves) for b in curves[i+1:]):
+            return [(key,color,style) for (key,color,_),style in zip(curves,(Qt.SolidLine,Qt.DashLine,Qt.DashDotLine,Qt.DotLine))]
+        return curves
 
     def x_at(self,index):
         return min(self.box.right(),self.box.left()+self.series['active_times'][index]*self.time_scale+
@@ -115,7 +125,9 @@ class QuotaHistory(Plot):
         value_width=max(92,p.fontMetrics().horizontalAdvance(usd(self.ceiling))+14)
         right=cost_width+value_width if self.money else 18
         left=remaining_width+(completed_width if self.money else 0)
-        self.box=box=QRectF(left,58,max(1,self.width()-left-right),self.height()-98)
+        extra=100 if self.series.get('model_share') else 0
+        self.box=box=QRectF(left,58,max(1,self.width()-left-right),self.height()-98-extra)
+        self.strip_box=QRectF(box.left(),box.bottom()+65,box.width(),34) if extra else QRectF()
         gap_indices=self.series['gap_indices'];count=len(gap_indices)
         # Keep all gaps equally narrow; cap their total footprint only when
         # an exceptionally dense set cannot fit at the normal 24 px width.
@@ -169,7 +181,7 @@ class QuotaHistory(Plot):
             low,high=self.bounds(key)
             scale=box.height()/(high-low);bottom=box.bottom()
             previous=None;previous_x=None;previous_index=None
-            path=QPainterPath();markers=[]
+            path=QPainterPath()
             p.setPen(QPen(QColor(palette[color]),2,style))
             # One native path avoids thousands of temporary Qt line/point
             # wrappers each time a refreshed series invalidates the image.
@@ -180,7 +192,6 @@ class QuotaHistory(Plot):
                     if previous is not None and self.connects(previous_index,index,key):
                         path.moveTo(previous_x,previous);path.lineTo(x,previous)
                         path.moveTo(x,previous);path.lineTo(x,y)
-                    if previous is None or not self.connects(previous_index,index,key) or index==indices[-1]:markers.append(QPointF(x,y))
                 previous,previous_x,previous_index=y,x,index
                 # A completed amount belongs to its whole plateau, up to the
                 # next boundary, even when that next plateau is still pending.
@@ -189,8 +200,6 @@ class QuotaHistory(Plot):
                             and self.series['missing'][key][index+1]==self.series['missing'][key][index]+1):
                         path.moveTo(x,y);path.lineTo(self.x_at(index+1),y)
             p.setBrush(Qt.NoBrush);p.drawPath(path)
-            p.setBrush(QColor(palette[color]))
-            for point in markers:p.drawEllipse(point,3,3)
         if count and self.gap_width:
             p.setPen(QColor(palette['muted']))
             p.drawText(QRectF(box.left(),8,box.width(),20),Qt.AlignLeft,'// 수집 공백')
@@ -225,7 +234,55 @@ class QuotaHistory(Plot):
         p.setPen(QColor(palette['muted']))
         p.drawText(QRectF(box.left(),box.bottom()+10,box.width()/2,20),Qt.AlignLeft,clock(self.rows[0]['at']))
         p.drawText(QRectF(box.center().x(),box.bottom()+10,box.width()/2,20),Qt.AlignRight,clock(self.rows[-1]['at']))
+        self.draw_model_share(p,palette)
         p.end();return pic
+
+    def x_at_time(self,at):
+        times=self.series['times'];index=bisect_left(times,at)
+        if index==0:return self.x_at(0)
+        if index>=len(times):return self.x_at(len(times)-1)
+        lo,hi=times[index-1:index+1]
+        return self.x_at(index-1)+(self.x_at(index)-self.x_at(index-1))*(at-lo)/(hi-lo)
+
+    def time_at_x(self,x):
+        gaps=bisect_right(self.gap_rights,x+1e-7)
+        return self.series['times'][0]+(x-self.box.left()-gaps*self.gap_width)/max(self.time_scale,1e-12)+self.series['gap_seconds'][gaps]
+
+    def draw_model_share(self,p,palette):
+        from PySide6.QtGui import QBrush
+        share=self.series.get('model_share')
+        if not share:return
+        area=self.strip_box
+        p.setPen(QColor(palette['muted']))
+        p.drawText(QRectF(area.left(),area.top()-25,area.width(),22),Qt.AlignLeft,
+                   p.fontMetrics().elidedText(tr('모델별 점유율 · 5분'),Qt.ElideRight,int(area.width())))
+        p.drawText(QRectF(0,area.top(),area.left()-8,20),Qt.AlignRight,'100%')
+        p.drawText(QRectF(0,area.bottom()-20,area.left()-8,20),Qt.AlignRight,'0%')
+        p.fillRect(area,QColor(palette['track']))
+        p.fillRect(area,QBrush(QColor(palette['muted']),Qt.BDiagPattern))
+        p.save();p.setClipRect(area);p.setRenderHint(QPainter.Antialiasing,False)
+        for start,end,bucket in share['spans']:
+            item=share['bins'][bucket];x=self.x_at_time(start);right=self.x_at_time(end)
+            width=right-x
+            if width<=0:continue
+            rect=QRectF(x,area.top(),width,area.height())
+            p.fillRect(rect,QColor(palette['track']))
+            if item['state']=='unknown':
+                p.fillRect(rect,QBrush(QColor(palette['muted']),Qt.BDiagPattern));continue
+            if item['state']=='zero':continue
+            y=area.bottom()
+            for name in share['models']:
+                height=area.height()*item['shares'].get(name,0)/100
+                if height<=0:continue
+                y-=height;p.fillRect(QRectF(x,y,width,height),QColor(shared_theme().model_color(name)))
+                pattern=shared_theme().model_pattern(name)
+                if pattern:p.fillRect(QRectF(x,y,width,height),QBrush(QColor(palette['surface']),pattern))
+        p.restore()
+
+    def set_inspection(self,detail,x,y):
+        self.inspection_x=x if detail else None
+        self.inspection_at=detail.get('inspection_at',detail.get('at')) if detail else None
+        self.update()
 
     def paint(self,painter):
         p=self.base();palette=shared_theme().palette;p.fillRect(self.rect(),QColor(palette['surface']))
@@ -234,23 +291,18 @@ class QuotaHistory(Plot):
         key=(id(self.series),self.width(),self.height(),self.money,self.reference,tuple(palette.items()),shared_theme().family,self._painter.device().devicePixelRatioF())
         if key!=self._cache_key:self._picture=self.static_image();self._cache_key=key
         p.drawImage(0,0,self._picture);self.hits=self._cache_hits
-        index=min(self.cursor,len(self.rows)-1);point=self.point(index,'remaining')
+        if self.inspection_x is None:return
+        x=max(self.box.left(),min(self.box.right(),self.x_at_time(self.inspection_at) if self.inspection_at is not None else self.inspection_x))
         p.setPen(QPen(QColor(palette['muted']),1,Qt.DotLine))
-        p.drawLine(QPointF(point.x(),self.box.top()),QPointF(point.x(),self.box.bottom()))
-        for key,color,_ in self.curves():
-            point=self.point(index,key)
-            if point is not None:
-                p.setPen(QPen(QColor(palette[color]),1));p.setBrush(QColor(palette[color]));p.drawEllipse(point,4,4)
+        p.drawLine(QPointF(x,self.box.top()),QPointF(x,self.strip_box.bottom() if not self.strip_box.isNull() else self.box.bottom()))
 
     def index_at(self,x,y):
-        if not self.rows or not self.box.contains(QPointF(x,y)):return None
-        if self.gap_at(x,y) is not None:return None
+        if not self.rows or not (self.box.contains(QPointF(x,y)) or self.strip_box.contains(QPointF(x,y))):return None
+        if self.gap_at(x,self.box.center().y()) is not None:return None
         gaps=bisect_right(self.gap_rights,x+1e-7)
         times=self.series['times']
         at=times[0]+(x-self.box.left()-gaps*self.gap_width)/self.time_scale+self.series['gap_seconds'][gaps]
-        index=min(bisect_left(times,at),len(times)-1)
-        if index and at-times[index-1]<times[index]-at:index-=1
-        return index
+        return max(0,min(bisect_right(times,at+1e-6)-1,len(times)-1))
 
     def tip_at(self,x,y):
         for rect,reset in getattr(self,'reset_hits',[]):
@@ -261,6 +313,7 @@ class QuotaHistory(Plot):
         return observation_label(self.rows[index],self.money) if index is not None else ''
 
     def detail_at(self,x,y):
+        if self.strip_box.contains(QPointF(x,y)):y=self.box.center().y()
         for rect,reset in getattr(self,'reset_hits',[]):
             if rect.contains(QPointF(x,y)):
                 return dict(title=reset['label'],at=reset['at'],reset_at=reset['at'],items=[
@@ -274,7 +327,24 @@ class QuotaHistory(Plot):
                 dict(label='관측 재개',value=clock(self.rows[index]['at'],True),color='ink')],
                 note='')
         index=self.index_at(x,y)
-        return self.detail_for(index) if index is not None else {}
+        if index is None:return {}
+        detail=self.detail_for(index)
+        return self.with_share(detail,self.time_at_x(x))
+
+    def with_share(self,detail,at):
+        share=self.series.get('model_share')
+        if not share:return detail
+        item=share_at(self.series,at)
+        details=[];note='미확인'
+        if item:
+            note={'unknown':'미확인 · 모델 비용과 차트 증가분의 대응을 확인할 수 없습니다',
+                  'zero':'확인된 비용 증가 없음','cost':''}[item['state']]
+            details=[dict(label=name,value=f"{item['shares'].get(name,0):.1f}%",model=name,
+                          color='ink') for name in share['models']] if item['state']=='cost' else []
+        return {**detail,'inspection_at':at,'chart_top':self.box.top(),'chart_bottom':self.box.bottom(),
+                'strip_top':self.strip_box.top(),'strip_bottom':self.strip_box.bottom(),
+                'share':dict(title=(clock(item['start'],True)+' → '+clock(item['end'],True)) if item else '모델별 점유율 · 5분',
+                             items=details,note=note)}
 
     def detail_for(self,index):
         row=self.rows[index];previous=self.rows[index-1] if index else None
@@ -291,7 +361,7 @@ class QuotaHistory(Plot):
         elif self.money and row.get('cycle_cost') is None:note='금액 확인 중'
         elif self.money and row.get('cycle_value') is None:note='동등 가치 계산 대기'
         else:note=''
-        return dict(title=clock(row['at'],True),at=row['at'],items=items,note=note)
+        return self.with_share(dict(title=clock(row['at'],True),at=row['at'],items=items,note=note),row['at'])
 
     def refresh_detail(self,detail):
         if not detail or not self.rows:return {}
@@ -300,7 +370,7 @@ class QuotaHistory(Plot):
         at=detail.get('gap_end',detail.get('at'))
         index=bisect_left(self.series['times'],at)
         if index>=len(self.rows) or self.rows[index]['at']!=at:return {}
-        if 'gap_end' not in detail:return self.detail_for(index)
+        if 'gap_end' not in detail:return self.with_share(self.detail_for(index),detail.get('inspection_at',at))
         gap=bisect_left(self.series['gap_indices'],index)
         if gap>=len(self.gap_lefts) or self.series['gap_indices'][gap]!=index:return {}
         return self.detail_at((self.gap_lefts[gap]+self.gap_rights[gap])/2,self.box.center().y())

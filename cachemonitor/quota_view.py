@@ -176,6 +176,7 @@ def prepare_series(rows):
 
 def prepare_quota_view(report):
     from .pricing import usd
+    from .quota_share import prepare_model_share
     rows,periods=quota_value_history(report,history_rows(report,'weekly'))
     times=[r['at'] for r in rows]
     overall=[];offset_cost=offset_delta=0;resets=[]
@@ -192,6 +193,7 @@ def prepare_quota_view(report):
                             'cycle_value':(offset_cost+row['confirmed_cost'])/(offset_delta+row['confirmed_delta'])*100
                             if offset_delta+row['confirmed_delta']>0 else None})
         period['series']=prepare_series(own)
+        period['series']['model_share']=prepare_model_share(period['series'],period['cost_intervals'])
         period['series']['active_only']=True
         if period['reset_kind']:
             resets.append(dict(at=period['start'],label=RESET_NAMES[period['reset_kind']],number=i+1))
@@ -206,6 +208,7 @@ def prepare_quota_view(report):
         for days in (7,30,90):
             summaries[days]=quota_statistics(report,now-days*86400,include_mode_assumptions=True)
     all_series=prepare_series(overall)
+    all_series['model_share']=prepare_model_share(all_series,[interval for period in periods for interval in period.pop('cost_intervals')])
     all_series.update(active_only=True,cumulative=True,resets=resets)
     return dict(periods=periods,overall=all_series,lifetime=lifetime,summaries=summaries,
                 five_hour=prepare_series(history_rows(report,'five_hour')))
