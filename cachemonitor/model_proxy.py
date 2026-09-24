@@ -150,7 +150,7 @@ class Tracker:
 
 
 def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *, diagnostics=None,ssl_context=None,
-               control_file=None, control_id='', stop_event=None, managed=None):
+               control_file=None, control_id='', stop_event=None, managed=None, cache_capture=None):
     base=URL(upstream)
     if (base.scheme not in ('http','https') or not base.host or base.user is not None
             or base.query_string or base.fragment):
@@ -158,7 +158,7 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
     upstream=upstream.rstrip('/')
     health={'requests':0,'responses':0,'storage_errors':0,'relay_errors':0,'forwarded_response_frames':0,
             'client_disconnects':0,'observation_skips':0,'storage_failure_streak':0,'internal_failure_streak':0,
-            'observation_enabled':True,'draining':False,'control_id':control_id,
+            'observation_enabled':True,'draining':False,'control_id':control_id,'cache_management':cache_capture is not None,
             'forwarded_http_requests':0,'forwarded_http_responses':0,
             'service':'cachemonitor-model-observer',
             'version':PROXY_VERSION,'instance':uuid.uuid4().hex,'pid':os.getpid(),
@@ -248,6 +248,13 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
         response_observer=None
         connection=None
         lease=None
+        cache_record=None
+        ws_capture=None
+        if cache_capture is not None and observe and not is_ws:
+            # Invalidate at ingress, before connection establishment or upload.
+            cache_record=cache_capture.begin(headers,url,time.monotonic())
+            if request.headers.get('Content-Encoding','identity') not in ('','identity'):
+                cache_record['request'].failed=True
         try:
             if is_ws:
                 protocols=tuple(p.strip() for p in request.headers.get('Sec-WebSocket-Protocol','').split(',') if p.strip())
@@ -263,8 +270,12 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
                     await downstream.prepare(request)
                     sockets[relay_id]=(downstream,tracker,observe)
 
+                    if cache_capture is not None:
+                        from .cache_capture import WebSocketCapture
+                        ws_capture=WebSocketCapture(cache_capture,tracker,headers,url)
+
                     async def relay(source,destination,outbound):
-                        nonlocal phase
+                        nonlocal phase,cache_record
                         async for msg in source:
                             if msg.type in (WSMsgType.TEXT,WSMsgType.BINARY):
                                 diagnostic['forwarding']=diagnostic.get('forwarding',0)+1
@@ -278,7 +289,13 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
                                     if outbound:
                                         if obj.get('type')=='response.create': tracker.request(obj)
                                         elif obj.get('type') not in ('response.cancel',):diagnostic['idle_unknown']=True
-                                    else: tracker.response(obj)
+                                    if ws_capture is not None:
+                                        raw=msg.data.encode() if isinstance(msg.data,str) else msg.data
+                                        try:
+                                            if outbound:ws_capture.outgoing(obj,raw)
+                                            else:ws_capture.incoming(obj,raw)
+                                        except Exception:ws_capture.disable()
+                                    if not outbound:tracker.response(obj)
                                 try:
                                     if msg.type==WSMsgType.TEXT: await destination.send_str(msg.data)
                                     else: await destination.send_bytes(msg.data)
@@ -327,6 +344,7 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
                 try:
                     async for chunk in request.content.iter_chunked(65536):
                         phase='request_read';diagnostic['request_bytes']+=len(chunk)
+                        if cache_record is not None:cache_record['request'].feed(chunk)
                         if request_observer is not None:request_observer.feed(chunk)
                         phase='upstream_write'
                         yield chunk
@@ -362,6 +380,10 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
             # until that many bytes arrive, delaying or deadlocking a live stream.
             async for chunk in response.aiter_raw():
                 diagnostic['response_bytes']+=len(chunk)
+                if cache_record is not None:
+                    if response.headers.get('Content-Encoding','identity') not in ('','identity'):
+                        cache_record['response'].failed=True
+                    cache_record['response'].feed(chunk)
                 if response_observer is not None:response_observer.feed(chunk)
                 phase='downstream_write'
                 await downstream.write(chunk)
@@ -417,6 +439,9 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
                 return downstream
             return web.json_response({'error':{'message':'Local relay connection failed'}},status=502)
         finally:
+            if ws_capture is not None:ws_capture.close()
+            if cache_record is not None:
+                cache_capture.finish(cache_record,websocket=is_ws)
             try:
                 if response is not None:await response.aclose()
             finally:

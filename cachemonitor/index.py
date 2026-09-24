@@ -36,7 +36,9 @@ def sanitized(event):
     kind, p = event.get('type'), event.get('payload')
     if not isinstance(p, dict):
         return None
-    if kind == 'turn_context':
+    if kind=='compacted':
+        clean={}
+    elif kind == 'turn_context':
         settings = (p.get('collaboration_mode') or {}).get('settings') or {}
         clean = {k: p.get(k) for k in ('turn_id', 'model')}
         clean['effort'] = p.get('effort') or p.get('reasoning_effort') or settings.get('reasoning_effort')
@@ -56,7 +58,7 @@ def sanitized(event):
             clean = {'type': typ, 'info': {k: usage_only(info.get(k)) for k in ('total_token_usage', 'last_token_usage')}}
             limits=clean_limits(p.get('rate_limits'))
             if limits is not None: clean['rate_limits']=limits
-        elif typ in ('task_started', 'task_complete', 'task_completed', 'turn_aborted'):
+        elif typ in ('task_started', 'task_complete', 'task_completed', 'turn_aborted','context_compacted'):
             clean = {'type': typ, 'turn_id': p.get('turn_id')}
         elif typ=='thread_settings_applied':
             settings=p.get('thread_settings')
@@ -73,6 +75,7 @@ def sanitized(event):
 
 class UsageIndex:
     def __init__(self, homes, path=None, model_evidence_path=None):
+        self.cache_index_path=path
         self.homes = [Path(h).resolve() for h in homes]
         self.path = Path(path) if path else Path(os.environ.get('LOCALAPPDATA', Path.home())) / 'CacheMonitor' / 'usage-index.sqlite'
         if any(self.path.resolve().is_relative_to(h) for h in self.homes):
@@ -94,10 +97,10 @@ class UsageIndex:
         ''')
         # Re-read source incrementally once to recover settings snapshots omitted
         # by the old sanitizer. Keep existing events while this backfill proceeds.
-        self.tier_backfill=self.db.execute('pragma user_version').fetchone()[0]<2
+        self.tier_backfill=self.db.execute('pragma user_version').fetchone()[0]<3
         if self.tier_backfill:
             self.db.execute('update files set offset=0')
-            self.db.execute('pragma user_version=2')
+            self.db.execute('pragma user_version=3')
             self.db.commit()
         self.monitor = Monitor(self.homes)
         self.metadata = {(r[0],r[1]):json.loads(r[2]) for r in self.db.execute('select home,tid,data from metadata') if r[0] in {str(h) for h in self.homes}}
@@ -436,8 +439,15 @@ class UsageIndex:
             view['usage_revision']=self.session_revisions[key]
             views.append(view)
         self.version += bool(changed)
+        cache_management={}
+        try:
+            from .cache_integration import enrich
+            cache_management=enrich(views,self.cache_index_path,now)
+        except (sqlite3.Error,OSError):
+            self.errors.append('캐시 유지 사용량 연결 실패')
         return {'ts': now, 'sessions': sorted(views, key=lambda s: s['activity'], reverse=True),
-                'request_activity': list(self.model_evidence.activity_records.values()),
+                'request_activity': list(self.model_evidence.activity_records.values())+cache_management.pop('request_activity',[]),
+                'cache_management':cache_management,
                 'usage_collection_complete':usage_complete,'last_usage_collection_success':self.last_usage_success,
                 'usage_errors':usage_errors,
                 'homes': [str(h) for h in self.homes], 'errors': list(dict.fromkeys(self.errors)),

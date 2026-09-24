@@ -8,7 +8,7 @@ import re
 import zipfile
 from pathlib import Path
 
-REQUIRED = {'Codexon.exe', 'CodexonRecovery.exe', 'build-manifest.json', 'LICENSE',
+REQUIRED = {'Codexon.exe', 'CodexonRecovery.exe', 'CodexonHook.exe','build-manifest.json', 'LICENSE',
             'THIRD-PARTY-NOTICES.md', 'BUNDLED-PYTHON.md', 'BUNDLED-QT.md', 'SOURCE-OFFER.md',
             'USER-GUIDE.md', 'USER-GUIDE.ko.md'}
 MANIFEST_KEYS = {'product', 'version', 'commit', 'architecture', 'executable', 'sha256', 'recovery_sha256'}

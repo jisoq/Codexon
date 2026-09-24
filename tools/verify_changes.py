@@ -32,7 +32,9 @@ GROUPS = {
     'data': test_files('core', 'index', 'data_contract', 'subagent_collection', 'request_tier_snapshots'),
     'analysis': test_files('comparison', 'overview', 'performance', 'data_contract', 'output_speed'),
     'cost': test_files('pricing', 'mode_costs', 'session_costs', 'data_contract'),
-    'cache': test_files('cache_health', 'cache_misses'),
+    'cache_connection': test_files('cache_codex_connection'),
+    'cache': test_files('cache_health', 'cache_misses', 'cache_management','cache_product'),
+    'cache_ui': test_files('cache_ui'),
     'speed': test_files('speed_health', 'output_speed'),
     'names': test_files('codex_names'),
     'modes': test_files('request_modes', 'request_tier_snapshots', 'mode_costs'),
@@ -73,6 +75,13 @@ GROUPS = {
 
 # First match wins: QML and shared helpers must not fall through to a broad UI gate.
 RULES = (
+    ('cachemonitor/cache_panel.py', ('cache_ui','cache_connection')),
+    ('cachemonitor/cache_hooks.py', ('cache','cache_ui','cache_connection')),
+    ('cachemonitor/cache_control.py', ('cache','cache_ui','cache_connection')),
+    ('cachemonitor/cache_integration.py', ('cache','data','cost','quota_store')),
+    ('cachemonitor/cache_scheduler.py', ('cache','cache_connection','proxy_lifecycle')),
+    ('cachemonitor/cache_execution.py', ('cache', 'cache_connection')),
+    ('cachemonitor/cache_capture.py', ('cache', 'relay', 'cache_connection')),
     ('cachemonitor/session_costs.py', ('cost', 'overlay_data')),
     ('cachemonitor/core.py', ('data', 'analysis', 'cost', 'quota_store', 'modes', 'cache', 'speed')),
     ('cachemonitor/index.py', ('data', 'evidence', 'quota_store')),
@@ -147,7 +156,7 @@ RULES = (
     ('cachemonitor/assets/i18n/*.json', ('translation',)),
     ('cachemonitor/model_evidence.py', ('evidence', 'data')),
     ('cachemonitor/evidence_writer.py', ('evidence',)),
-    ('cachemonitor/model_proxy.py', ('relay',)),
+    ('cachemonitor/model_proxy.py', ('relay', 'cache_connection')),
     ('cachemonitor/proxy_http.py', ('relay',)),
     ('cachemonitor/proxy_observation.py', ('relay', 'evidence')),
     ('cachemonitor/proxy_update.py', ('proxy_lifecycle',)),

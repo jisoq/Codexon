@@ -52,10 +52,11 @@ def start_smoke(window,app,path,fonts,depth='full'):
             click(window,control(window,tracking))
             assert window.settings.value('quota/trackingEnabled',True,type=bool) is original
             report['weekly_monitoring_toggle']=True
-            for category in range(6 if depth=='full' else 1):
+            for category in (range(len(window.settings_page.TITLES)) if depth=='full' else (0,6)):
                 window.settings_page.navigation.setCurrentRow(category);QTest.qWait(60)
                 target=path.with_name(path.stem+f'-settings-{category}.png')
                 assert window.grab().save(str(target));report['screens'].append(str(target))
+            report['cache_management_page']=bool(control(window,window.cache_panel.summary))
             window.nav.setCurrentRow(2);settle()
             search=control(window,window.search);search.forceActiveFocus()
             QTest.keyClicks(window.quick,'__qml_no_such_session__');QTest.qWait(60)

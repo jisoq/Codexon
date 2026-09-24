@@ -11,3 +11,5 @@ Codexon source code is licensed under the custom [Codexon Attribution License 1.
 | Other bundled Python packages and native libraries | Runtime dependencies | The frozen module graph generates `BUNDLED-PYTHON.md` and copies the installed license files under `LICENSES/python/`. |
 
 The PyInstaller build must exclude unused GPL-only Qt modules such as Qt Charts, Qt Graphs, Qt Quick 3D, and Qt Virtual Keyboard. If any are actually required, the distribution terms must be reviewed before release. Codexon's license does not override a bundled library's license.
+
+Cache-management design acknowledges [CacheKeeper](https://github.com/grapefruit0205/cachekeeper), commit `9f0fda397cb559b60bf9eb96d72b1fd721ed7c72`, MIT, Copyright (c) 2026 Junseok Pak. Codexon's implementation adapts its audit/automatic-maintenance/guard objectives to Codex telemetry and execution; it does not copy Claude quota coefficients or cache lifetimes. The MIT notice is retained in `LICENSES/CacheKeeper-MIT.txt`.

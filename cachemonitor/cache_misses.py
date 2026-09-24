@@ -4,7 +4,7 @@
 def classify(rows):
     # Collection already deduplicates response identities. Preserve its stable
     # order for equal timestamps and never use the first row of a filtered view.
-    ordered=sorted(rows,key=lambda r:r['ts'])
+    ordered=sorted((r for r in rows if r.get('purpose')!='maintenance'),key=lambda r:r['ts'])
     first=ordered[0] if ordered else None
     events=[{'key':r.get('key'),'ts':r['ts'],'input':r.get('input')}
             for r in ordered if type(r.get('input')) is int and r['input']>0 and type(r.get('cached')) is int and r['cached']==0]

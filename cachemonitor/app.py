@@ -129,6 +129,7 @@ def main():
             QMessageBox.warning(window,'Codexon',tr('앱을 다시 시작하지 못했습니다. 다시 시도해 주세요.'))
     window.settings_page.restartRequested.connect(restart)
     app.aboutToQuit.connect(window.observer_panel.stop)
+    app.aboutToQuit.connect(window.cache_panel.stop)
     def finish_update():
         operation=window.update_panel.operation
         if operation and operation.isRunning():operation.wait()

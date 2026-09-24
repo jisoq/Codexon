@@ -476,6 +476,8 @@ class OverlayContent(Node):
         d=self.data or {};values=[]
         if d.get('descendants'):
             values.append(f"자체 {money(d.get('own_cost'),False)} + 하위 {money(d.get('child_cost'),False)}")
+        if d.get('maintenance_calls'):
+            values.append(f"캐시 유지 {d['maintenance_calls']}회 포함 · {money(d.get('maintenance_cost'),False)} · 미확인 {d.get('maintenance_missing',0)}회")
         if d.get('assumed'):values.append(f"Standard 가정 {d['assumed']}호출")
         if d.get('coverage_gap'):values.append('이전 기록 누락')
         return ' · '.join(values)

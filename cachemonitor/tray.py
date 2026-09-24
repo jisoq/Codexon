@@ -159,6 +159,7 @@ class TrayWindow(QuickHost):
 
     def quit_app(self):
         self.quitting = True
+        if getattr(self,'cache_panel',None):self.cache_panel.stop()
         if getattr(self,'overlay',None):self.overlay.stop()
         for service in getattr(self,'quota_services',{}).values(): service.stop()
         self.tick.stop()
