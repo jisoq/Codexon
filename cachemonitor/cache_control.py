@@ -38,7 +38,8 @@ class Control:
         self.db.execute('INSERT OR REPLACE INTO cache_preferences VALUES(?,?)',(key,json.dumps(value)))
 
     def profile(self,home,sid,row):
-        keep=('key','ts','model','effort','service_tier','input','cached','written','output','reasoning','cost','purpose')
+        keep=('key','ts','model','effort','service_tier','input','cached','written','output','reasoning','cost','purpose',
+              'compaction_epoch','policy_scope','policy_scope_start')
         clean={k:row.get(k) for k in keep}
         if clean.get('purpose')=='maintenance':return
         old=self.db.execute('SELECT data FROM cache_profiles WHERE home=? AND sid=? AND model=?',(home,sid,row.get('model') or '')).fetchone()

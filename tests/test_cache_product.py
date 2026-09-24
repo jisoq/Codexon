@@ -62,7 +62,7 @@ def test_natural_history_to_policy_no_maintenance_prerequisite(tmp_path):
     views=[session.view(now)]
     enrich(views,path,now)
     scheduler=Scheduler('home',control_path(path));scheduler.control.set('automatic',True)
-    row=profile();request={**body(),'prompt_cache_key':'s'};result=response()
+    row=dict(profile(),key='warm5');request={**body(),'prompt_cache_key':'s'};result=dict(response(),id='warm5')
     result['usage'].update(input_tokens=100000,input_tokens_details={'cached_tokens':99000})
     scheduler.executor.contexts.completed(request,result)
     scheduler.snapshot(request,result,time.monotonic(),'https://api.openai.com/v1/responses',{},False)
@@ -73,7 +73,115 @@ def test_natural_history_to_policy_no_maintenance_prerequisite(tmp_path):
     assert not scheduler.journal.rows()
     assert decision['output_cap']==row['output']
     assert decision['write_composition']=='bounded_not_observed' and row['written'] is None
+    scheduler.snapshots['s']['url']='https://chatgpt.com/backend-api/codex/responses'
+    blocked=scheduler.policy('s',scheduler.snapshots['s'])
+    assert blocked['state']=='waiting' and blocked['history_can_unlock'] is False
+    assert blocked['calls']==0 and blocked['activation']=='verify_total_output_limit_or_approve_separate_risk_policy'
     asyncio.run(scheduler.close());control.close()
+
+
+@pytest.mark.parametrize('change',[None,'model','effort','service_tier','input','compaction_epoch'])
+def test_current_cohort_recovers_after_changes_but_keeps_unknown_and_no_return(tmp_path,change):
+    from cachemonitor.cache_policy import Gap,decide
+    path=tmp_path/'index.sqlite';control=Control(control_path(path));rows=[]
+    start=time.time()-18000
+    def append(i):
+        row=dict(profile(),ts=start+i*2100,key='cold'+str(i),turn=str(i),cached=0,compaction_epoch=0)
+        if i>=2 and change:
+            row[change]={'model':'gpt-6-sol','effort':'high','service_tier':'Fast','input':90000,'compaction_epoch':1}[change]
+        row['cached']=0
+        warm=dict(row,ts=row['ts']+1,key='warm'+str(i),cached=row['input']-1000)
+        rows.extend((row,warm))
+        control.activity('home',dict(session_id='s',turn_id=str(i),hook_event_name='UserPromptSubmit',model=row['model']))
+        control.db.execute('UPDATE cache_inputs SET at=? WHERE turn=?',(row['ts']-1,str(i)))
+    def evaluate(now):
+        enrich([dict(id='s',home='home',history=rows)],path,now)
+        scheduler=Scheduler('home',control_path(path));scheduler.control.set('automatic',True)
+        row=rows[-1];request=dict(body(),model=row['model'],reasoning={'effort':row['effort']},service_tier=row['service_tier'],prompt_cache_key='s')
+        result=dict(response(),id=row['key']);scheduler.executor.contexts.completed(request,result)
+        scheduler.snapshot(request,result,time.monotonic(),'https://api.openai.com/v1/responses',{},False)
+        scheduler.snapshots['s']['row']=row
+        decision=scheduler.policy('s',scheduler.snapshots['s']);asyncio.run(scheduler.close())
+        return decision
+    for i in range(3):append(i)
+    first=evaluate(rows[-1]['ts']+10)
+    if change:assert first['reason']=='need_independent_natural_return_history'
+    for i in range(3,8):append(i)
+    assert evaluate(rows[-1]['ts']+10)['state']=='eligible'
+    gaps=[Gap(**json.loads(r[0])) for r in control.db.execute('SELECT data FROM cache_gaps ORDER BY turn')]
+    if change:
+        assert gaps[1].benefit_lower==0 and gaps[1].maintenance_upper>0
+        assert gaps[1].scope!=gaps[-1].scope
+    # No read is an observed zero-benefit interval, not missing data.
+    rows[7]['cached']=0
+    assert evaluate(rows[-1]['ts']+10)['reason']!='natural_cost_bounds_unobserved'
+    zero=json.loads(control.db.execute("SELECT data FROM cache_gaps WHERE turn='3'").fetchone()[0])
+    assert zero['benefit_lower']==0 and zero['maintenance_upper']>0
+    # Missing return usage within this regime still vetoes a profit claim.
+    rows[10]['output']=None
+    assert evaluate(rows[-1]['ts']+10)['reason']=='natural_cost_bounds_unobserved'
+    rows[10]['output']=4
+    # Censored no-return cost survives selection, including unknown cost.
+    evaluate(rows[-1]['ts']+20000)
+    gap=Gap(**json.loads(control.db.execute("SELECT data FROM cache_gaps WHERE turn='7'").fetchone()[0]))
+    assert not gap.returned and not gap.settled and gap.seconds==20000 and gap.maintenance_upper>0
+    assert decide([Gap(1,2100,True,1,.1,'submission'),gap],latency_bound=30,scheduler_slack=1,max_calls=1)['state']=='off'
+    rows[-1]['output']=None
+    assert evaluate(rows[-1]['ts']+20000)['reason'] in ('output_budget_unobserved','natural_cost_bounds_unobserved')
+    # A submission with no token record must not vanish from the cohort.
+    rows[-1]['output']=4
+    control.db.execute('INSERT INTO cache_inputs VALUES(?,?,?,?,?,?)',('home','s','missing',rows[-1]['ts']+10,'gpt-6-luna','UserPromptSubmit'))
+    assert evaluate(rows[-1]['ts']+20000)['reason']=='natural_cost_bounds_unobserved'
+    control.close()
+
+
+@pytest.mark.parametrize('mode',['disable','return_disable','close','lost','timeout'])
+def test_sent_usage_drains_through_repeated_invalidation_and_shutdown(tmp_path,mode):
+    from aiohttp import web,ClientSession
+    from test_model_proxy import server,run_proxy_test
+    async def scenario():
+        entered=asyncio.Event();release=asyncio.Event();seen=[]
+        async def endpoint(req):
+            value=await req.json();seen.append(value)
+            if 'max_output_tokens' in value:
+                entered.set();await release.wait()
+                if mode=='lost':req.transport.close();return web.Response()
+                if mode=='timeout':await asyncio.sleep(.3)
+            return web.Response(text='data: '+json.dumps(dict(type='response.completed',response=response()))+'\n\n',content_type='text/event-stream')
+        app=web.Application();app.router.add_post('/responses',endpoint)
+        path=control_path(tmp_path/'index.sqlite');scheduler=Scheduler('home',path);scheduler.control.set('automatic',True)
+        async with server(app) as upstream:
+            scheduler.executor.contexts.completed(body(),response())
+            scheduler.snapshot(body(),response(),time.monotonic(),upstream+'/responses',{},False)
+            scheduler.control.activity('home',dict(session_id='session',turn_id='t',hook_event_name='Stop'))
+            scheduler.policy=lambda *a:dict(state='eligible',calls=2,interval=0,latency_bound=.2 if mode=='timeout' else 2,output_cap=4,maintenance_upper=1)
+            await scheduler.tick();await asyncio.wait_for(entered.wait(),2)
+            job=scheduler.jobs['session'];closing=None
+            if mode=='close':closing=asyncio.create_task(scheduler.close());await asyncio.sleep(0)
+            else:
+                if mode=='return_disable':
+                    scheduler.executor.ingress();scheduler.executor.leave()
+                    scheduler.control.activity('home',dict(session_id='session',turn_id='return',hook_event_name='UserPromptSubmit'))
+                    # A natural request finishes while independent maintenance is held.
+                    async with ClientSession() as client:
+                        async with client.post(upstream+'/responses',json=body()) as reply:assert reply.status==200
+                scheduler.control.set('automatic',False)
+            for _ in range(4):
+                await scheduler.tick();job.cancel();await asyncio.sleep(.01)
+            assert not job.done()
+            release.set();await asyncio.wait_for(job,2)
+            if closing:await closing
+            else:await scheduler.close()
+            journal=Journal(path);rows=journal.rows();assert len(rows)==1
+            missing=mode in ('lost','timeout')
+            assert rows[0]['state']==('unknown' if missing else 'completed')
+            assert rows[0]['usage_known']==(not missing)
+            assert rows[0]['scope_read_lower']==(None if missing else 80)
+            assert sum('max_output_tokens' in b for b in seen)==1
+            journal.close()
+            views=[];summary=enrich(views,tmp_path/'index.sqlite',time.time())
+            assert summary['calls']==1 and summary['priced']==(not missing)
+    run_proxy_test(scenario())
 
 
 def test_scheduler_rounds_ingress_suspend_and_usage_pipeline(tmp_path):
@@ -143,7 +251,7 @@ def test_unknown_usage_survives_index_and_policy(tmp_path):
     assert not other and summary['calls']==0
 
 
-@pytest.mark.parametrize('outcome',['ok','401','429','lost','overcap','zero'])
+@pytest.mark.parametrize('outcome',['ok','401','429','lost','overcap','zero','incomplete'])
 def test_relay_to_scheduler_to_transport_failure_and_stop_contract(tmp_path,outcome):
     from aiohttp import web,ClientSession
     from cachemonitor.model_proxy import create_app
@@ -159,7 +267,8 @@ def test_relay_to_scheduler_to_transport_failure_and_stop_contract(tmp_path,outc
                 if outcome=='lost':req.transport.close();return web.Response()
                 if outcome=='overcap':r['usage']['output_tokens']=20
                 if outcome=='zero':r['usage']['input_tokens_details']['cached_tokens']=0
-            return web.Response(text='data: '+json.dumps({'type':'response.completed','response':r})+'\n\n',content_type='text/event-stream')
+                if outcome=='incomplete':r.update(status='incomplete',incomplete_details={'reason':'max_output_tokens'})
+            return web.Response(text='data: '+json.dumps({'type':'response.'+r['status'],'response':r})+'\n\n',content_type='text/event-stream')
         scheduler=Scheduler('home',tmp_path/'control.sqlite');scheduler.control.set('automatic',True)
         store=EvidenceStore(tmp_path/'e.sqlite');up=web.Application();up.router.add_post('/responses',endpoint)
         try:
@@ -178,5 +287,6 @@ def test_relay_to_scheduler_to_transport_failure_and_stop_contract(tmp_path,outc
                 if outcome in ('401','429','lost'):assert rows[0]['input'] is None and rows[0]['state']=='unknown'
                 elif outcome=='overcap':assert rows[0]['output']==20
                 elif outcome=='zero':assert rows[0]['scope_read_lower']==0
+                elif outcome=='incomplete':assert rows[0]['state']=='unknown' and rows[0]['usage_known'] and rows[0]['cost'] is not None
         finally:await scheduler.close();store.close()
     run_proxy_test(scenario())

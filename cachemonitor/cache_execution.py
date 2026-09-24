@@ -242,16 +242,21 @@ class Executor:
             return 'invalidated'
         try:
             sent_anchor=time.monotonic()
-            transport=asyncio.create_task(self.send(url,headers,body,websocket=websocket,timeout=latency_bound,
-                permit=lambda:not self.closed and not self.busy and generation==self.generation and valid()))
-            try:response=await asyncio.shield(transport)
-            except asyncio.CancelledError:
-                # User ingress invalidates future rounds, but a sent independent
-                # request drains within its timeout so its usage is not discarded.
-                response=await transport
+            # Retain numeric provenance even if disabling capture clears Contexts.
+            original=dict(self.contexts.usage.get(rid,{}))
+            transport=asyncio.create_task(asyncio.wait_for(self.send(url,headers,body,websocket=websocket,timeout=latency_bound,
+                permit=lambda:not self.closed and not self.busy and generation==self.generation and valid()),latency_bound))
+            while True:
+                try:
+                    response=await asyncio.shield(transport)
+                    break
+                except asyncio.CancelledError:
+                    # Repeated invalidation only cancels scheduling. A sent
+                    # transport owns its deadline and must not lose recoverable usage.
+                    if transport.cancelled():raise
+                    continue
             state='completed' if response.get('status')=='completed' and isinstance(response.get('usage'),dict) else 'unknown'
             usage=usage_values(response.get('usage') or {})
-            original=self.contexts.usage.get(rid,{})
             # Inclusion/exclusion lower bound: deduct every token outside original
             # input before attributing any read to that unchanged input. Not full renewal.
             i,c,o=usage.get('input'),usage.get('cached'),original.get('input')

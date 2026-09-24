@@ -14,6 +14,32 @@ class Gap:
     maintenance_upper: float
     origin: str = 'unknown'
     settled: bool = True
+    scope: str | None = None
+    comparison: str = 'legacy_unclassified'
+
+
+def changed_conditions(previous,current):
+    """Only observed changes establish a new cohort; missing data never does."""
+    known=lambda v:v not in (None,'','미확인')
+    changed=[k for k in ('model','effort','service_tier','compaction_epoch')
+             if known(previous.get(k)) and known(current.get(k)) and previous[k]!=current[k]]
+    if all(type(r.get('input')) is int for r in (previous,current)) and current['input']<previous['input']:
+        changed.append('context_shrink')
+    return changed
+
+
+def scoped_history(history):
+    """Continuous context regime, including unknown/unprofitable calls inside it."""
+    result=[];known={};scope=None;start=None
+    for row in sorted(history,key=lambda r:r['ts']):
+        if row.get('purpose')=='maintenance':continue
+        if scope is None or changed_conditions(known,row):
+            start=0 if scope is None else row['ts']
+            scope=row['key'];known={}
+        for key in ('model','effort','service_tier','compaction_epoch','input'):
+            if row.get(key) not in (None,'','미확인'):known[key]=row[key]
+        result.append(dict(row,policy_scope=scope,policy_scope_start=start))
+    return result
 
 
 def decide(gaps, *, latency_bound, scheduler_slack, max_calls):
@@ -65,25 +91,27 @@ def cost_bounds(previous,current,output_cap,input_extra=0):
     Read reuse is a scenario assumption; actual zero-hit work is charged in full.
     """
     if type(output_cap) is not int or output_cap<=0:return None
-    if not all(previous.get(k)==current.get(k) and previous.get(k) is not None
-               for k in ('model','effort','service_tier')):return None
-    if previous.get('compaction_epoch')!=current.get('compaction_epoch'):return None
+    changed=changed_conditions(previous,current)
+    if not all(previous.get(k) not in (None,'','미확인') for k in ('model','effort','service_tier')):return None
+    # A known transition offers no attributable benefit in the source cohort,
+    # but its preceding idle maintenance would still have cost money.
+    target=previous if changed else current
+    if not changed and not all(previous.get(k)==current.get(k) for k in ('model','effort','service_tier')):return None
     keys=('input','cached','output')
-    if any(type(r.get(k)) is not int or r[k]<0 for r in (previous,current) for k in keys):return None
-    if any(r['cached']>r['input'] or r.get('input_conflict') for r in (previous,current)):return None
-    if current['input']<previous['input'] or previous['cached']<=0:return None
-    lost=max(0,min(previous['cached'],current['input'])-current['cached'])
+    if any(type(r.get(k)) is not int or r[k]<0 for r in (previous,target) for k in keys):return None
+    if any(r['cached']>r['input'] or r.get('input_conflict') for r in (previous,target)):return None
+    lost=0 if changed else max(0,min(previous['cached'],current['input'])-current['cached'])
     # Cost of replacement input minus reading it, at the SAME target model rates.
     # Unknown write counts are not observations of writes. Bound that missing
     # composition using BOTH endpoints; never replace the source usage.
-    cold_values=[token_cost({**current,'input':lost,'cached':0,'written':w,'output':0,'reasoning':0})['cost'] for w in (0,lost)]
+    cold_values=[token_cost({**target,'input':lost,'cached':0,'written':w,'output':0,'reasoning':0})['cost'] for w in (0,lost)]
     cold=min(cold_values) if all(v is not None for v in cold_values) else None
-    warm=token_cost({**current,'input':lost,'cached':lost,'written':0,'output':0,'reasoning':0})['cost']
+    warm=token_cost({**target,'input':lost,'cached':lost,'written':0,'output':0,'reasoning':0})['cost']
     maintenance_values=[token_cost({**previous,'input':previous['input']+input_extra,
         'cached':previous['cached'],'written':w,'output':output_cap,'reasoning':None})['cost']
         for w in (0,previous['input']+input_extra-previous['cached'])]
     maintenance=max(maintenance_values) if all(v is not None for v in maintenance_values) else None
     if any(x is None for x in (cold,warm,maintenance)):return None
     return dict(benefit_lower=max(0,cold-warm),maintenance_upper=maintenance,
-                bound_kind='comparable_call_scenario',output_cap=output_cap,
+                bound_kind='changed_conditions_no_benefit' if changed else 'comparable_call_scenario',output_cap=output_cap,
                 reuse_assumption=previous['cached'],write_composition='bounded_not_observed')

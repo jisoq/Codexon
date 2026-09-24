@@ -40,6 +40,11 @@ def test_rendered_hook_approval_cancel_close_timeout_and_disconnect(tmp_path):
             if choice=='approve':assert '진행 허용' in panel.hook_status.text()
         panel.display(dict(calls=2,priced=1,known_cost=.01,shortfalls=1,audit=[]))
         assert '비용 미확인 1회' in panel.summary.text()
+        panel.control.set('automatic',True);panel.proxy_ready=True
+        panel.control.status('home','s',dict(state='waiting',reason='output_bound_not_verified',history_can_unlock=False))
+        panel.poll()
+        assert '이력 추가만으로 활성화되지 않음' in panel.status.text()
+        assert '시험 호출은 자동으로 보내지 않습니다' in panel.activation.text()
         assert host.grab().save(str(tmp_path/'cache-settings.png'))
         assert not host.qml_errors
     finally:
