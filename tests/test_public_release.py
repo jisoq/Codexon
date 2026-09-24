@@ -102,7 +102,7 @@ def test_user_text_is_verbatim_even_when_equal_to_a_translation_key(tmp_path):
 
 
 def test_public_payload_rejects_local_paths_and_unneeded_qt(tmp_path):
-    folder = tmp_path/'Codexon';folder.mkdir()
+    folder = tmp_path/'.codex'/'Codexon';folder.mkdir(parents=True)
     exe = folder/'Codexon.exe';exe.write_bytes(b'synthetic executable')
     recovery=folder/'CodexonRecovery.exe';recovery.write_bytes(b'synthetic recovery')
     (folder/'CodexonHook.exe').write_bytes(b'synthetic hook helper')

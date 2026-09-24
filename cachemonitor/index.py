@@ -442,7 +442,7 @@ class UsageIndex:
         cache_management={}
         try:
             from .cache_integration import enrich
-            cache_management=enrich(views,self.cache_index_path,now)
+            cache_management=enrich(views,self.cache_index_path,now,{str(h) for h in self.homes})
         except (sqlite3.Error,OSError):
             self.errors.append('캐시 유지 사용량 연결 실패')
         return {'ts': now, 'sessions': sorted(views, key=lambda s: s['activity'], reverse=True),
