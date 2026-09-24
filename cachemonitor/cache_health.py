@@ -29,6 +29,7 @@ class CacheHealth:
                 and not any(row.get(k) for k in ('observation_missing','cache_policy_conflict','model_conflict','mode_conflict','input_conflict')))
 
     def update(self,rows):
+        rows=[r for r in rows if r.get('purpose')!='maintenance']
         rows=sorted(rows,key=lambda r:r['ts'])
         if len(rows)<len(self.rows) or any(a is not b for a,b in zip(self.rows,rows)):
             self.reset();self.rows=[]
@@ -40,14 +41,17 @@ class CacheHealth:
             recent.append(row)
         valid=[r for r in recent if self.valid(r)]
         total=sum(r['input'] for r in valid)
-        return dict(state=self.state,reason=self.reason,incident=deepcopy(self.incident),
+        from .cache_audit import observations
+        return dict(state=self.state,reason=self.reason,incident=deepcopy(self.incident),audit=observations(rows[-101:])[-100:],
                     incidents=len(self.events),events=deepcopy(self.events),
                     recent_rate=sum(r['cached'] for r in valid)/total*100 if total else None,
                     valid=len(valid),sample=len(recent),partial=len(valid)!=len(recent),provisional=True)
 
     def consume(self,row):
         scope=segment(row)
-        if scope!=self.scope:
+        if scope!=self.scope or (self.last is not None and (
+                row.get('compaction_epoch')!=self.last.get('compaction_epoch') or
+                (self.valid(row) and self.valid(self.last) and row['input']<self.last['cached']))):
             self.baseline.clear();self.scope=scope;self.candidate_rows=[];self.recovery_rows=[]
             self.candidate=0;self.recovery=0;self.incident=None
         if not self.valid(row):

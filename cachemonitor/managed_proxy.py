@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import json
 import os
 import time
@@ -61,14 +62,25 @@ class ManagedProxy:
                 return
             atomic_write(self.control, json.dumps({'action':'run','id':self.instance}).encode())
             stop = asyncio.Event()
+            from .cache_scheduler import Scheduler
+            scheduler=None
+            try:
+                scheduler=Scheduler(self.manager.home,self.manager.directory/'cache-control.sqlite')
+                scheduler.journal.recover_exclusive()
+            except (OSError,sqlite3.Error):
+                pass  # Optional cache control cannot prevent user transport startup.
             app = create_app(store, self.manager.home, endpoint, ssl_context=context,
                              control_file=self.control, control_id=self.instance,
-                             stop_event=stop, managed=self)
+                             stop_event=stop, managed=self,cache_capture=scheduler.capture if scheduler else None)
             runner = web.AppRunner(app, access_log=None)
             await runner.setup()
+            scheduler_task=asyncio.create_task(scheduler.serve()) if scheduler else None
             try:
                 await web.TCPSite(runner, '127.0.0.1', port).start()
                 await stop.wait()
             finally:
+                if scheduler_task:
+                    scheduler_task.cancel();await asyncio.gather(scheduler_task,return_exceptions=True)
                 await runner.cleanup()
+                if scheduler:await scheduler.close()
                 self.publish({}, 'stopped')

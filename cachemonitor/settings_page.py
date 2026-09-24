@@ -8,7 +8,7 @@ from .i18n import tr
 
 class SettingsPage(Group):
     restartRequested = Signal()
-    TITLES = ('일반', '작업표시줄 위젯', '세션 오버레이', '프록시', '알림', '정보·문제 해결')
+    TITLES = ('일반', '작업표시줄 위젯', '세션 오버레이', '프록시', '알림', '정보·문제 해결', '캐시 관리')
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -35,7 +35,7 @@ class SettingsPage(Group):
             area.setWidget(body); self.stack.addWidget(area)
             self.layouts.append(layout); self.scrollers.append(area)
         self.navigation.currentRowChanged.connect(self.stack.setCurrentIndex)
-        self.navigation.setCurrentRow(max(0,min(5,parent.settings.value('settings/category',0,type=int))))
+        self.navigation.setCurrentRow(max(0,min(len(self.TITLES)-1,parent.settings.value('settings/category',0,type=int))))
         self.navigation.currentRowChanged.connect(lambda index:parent.settings.setValue('settings/category',index))
         self.add_row(0, 'Windows 로그인 시 시작', '트레이에서 시작', self.toggle('startup'))
         self.add_row(0, '잔여량 표시', '', self.choice('quota'))

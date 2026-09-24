@@ -105,6 +105,7 @@ def test_public_payload_rejects_local_paths_and_unneeded_qt(tmp_path):
     folder = tmp_path/'Codexon';folder.mkdir()
     exe = folder/'Codexon.exe';exe.write_bytes(b'synthetic executable')
     recovery=folder/'CodexonRecovery.exe';recovery.write_bytes(b'synthetic recovery')
+    (folder/'CodexonHook.exe').write_bytes(b'synthetic hook helper')
     for name in ('LICENSE', 'THIRD-PARTY-NOTICES.md', 'BUNDLED-PYTHON.md', 'BUNDLED-QT.md',
                  'SOURCE-OFFER.md', 'USER-GUIDE.md', 'USER-GUIDE.ko.md'):
         (folder/name).write_text('Synthetic release test', encoding='utf-8')

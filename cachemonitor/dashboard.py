@@ -534,7 +534,7 @@ class Dashboard(TrayWindow):
             'home':choices.get('homes') or self.snapshot['homes'],
             'cache_policy':choices.get('cache_policies') or sorted({r.get('cache_policy') or '미확인' for r in rows})}
         names={'model':'모든 모델','effort':'모든 추론 설정','service_tier':'모든 요청 모드','project':'모든 프로젝트','source':'모든 작업 종류','home':'모든 Codex 홈','cache_policy':'모든 캐시 정책'}
-        source_names={'user':'직접 작업','subagent':'하위 에이전트','guardian_review':'내부 검토','unknown':'기타'}
+        source_names={'user':'직접 작업','subagent':'하위 에이전트','guardian_review':'내부 검토','maintenance':'캐시 유지','unknown':'기타'}
         def caption(key,value):
             if key=='source':return source_names.get(value,value)
             if key=='project':return project_labels.get(value,Path(value).name or '프로젝트 없는 작업')
@@ -651,6 +651,7 @@ class Dashboard(TrayWindow):
 
     def receive(self,value):
         self.snapshot=value
+        if hasattr(self,'cache_panel'):self.cache_panel.display(value.get('cache_management',{}))
         if not self.async_mode:self.engine.ingest(value['sessions'])
         overlay=getattr(self,'overlay',None)
         if overlay:overlay.receive_snapshot(value)
@@ -1055,7 +1056,7 @@ class Dashboard(TrayWindow):
         for session in self.analysis['sessions']:
             key=(session['home'],session['id']);group=rollups[key]
             if not group['calls'] or show_keys is not None and key not in show_keys:continue
-            source={'user':'직접 작업','subagent':'하위 에이전트','guardian_review':'내부 검토'}.get(session.get('source'),'기타')
+            source={'user':'직접 작업','subagent':'하위 에이전트','guardian_review':'내부 검토','maintenance':'캐시 유지'}.get(session.get('source'),'기타')
             if group['descendants']:source+=f" · 하위 {group['descendants']}"
             records.append(dict(home=key[0],sid=key[1],title=Verbatim(session['title']) if session.get('title') else '제목 없음',
                 project=Verbatim(session.get('project_name') or Path(session.get('cwd','')).name) if session.get('project_name') or session.get('cwd') else '프로젝트 없음',
@@ -1427,6 +1428,10 @@ class Dashboard(TrayWindow):
         self.pages.addWidget(self.settings_page)
         self.observer_panel=ObserverPanel(self.observer_home,self.observer_directory,active=self.manage_observer,parent=self)
         self.settings_page.add_widget(3, self.observer_panel)
+        from .cache_panel import CachePanel
+        self.cache_panel=CachePanel(self.observer_home,self.index_path,active=self.manage_observer,parent=self)
+        self.settings_page.add_widget(6,self.cache_panel)
+        self.observer_panel.status_observed.connect(self.cache_panel.proxy_status)
         legacy_notifications = self.settings.value('notifications',True,type=bool)
         self.notification_master = Switch()
         self.notification_master.setChecked(self.settings.value('notifications/enabled', legacy_notifications, type=bool))

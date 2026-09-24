@@ -1637,5 +1637,12 @@
   "확인된 비용 증가 없음": "No recorded cost increase",
   "미확인 · 모델 비용과 차트 증가분의 대응을 확인할 수 없습니다": "Unknown · Model costs cannot be reconciled with the chart increase",
   "━ 비용 증가 없음": "━ No cost increase",
-  "▧ 미확인": "▧ Unknown"
+  "▧ 미확인": "▧ Unknown",
+  "캐시 관리": "Cache management",
+  "자동 유지": "Automatic maintenance",
+  "모델 변경 확인": "Confirm model changes",
+  "Codex 훅 연결": "Connect Codex hooks",
+  "훅 연결 해제": "Disconnect hooks",
+  "이 요청 진행": "Proceed with this request",
+  "캐시 유지": "Cache maintenance"
 }

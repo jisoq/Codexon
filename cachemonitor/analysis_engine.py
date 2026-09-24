@@ -33,7 +33,7 @@ class BoundedCache:
 
 def row_signature(row):
     return tuple(row.get(k) for k in ('key','ts','turn','model','effort','input','cached','written','output','reasoning','total','service_tier',
-        'reported_total','total_discrepancy','input_conflict','output_conflict') + TRANSPORT_FIELDS + MODEL_FIELDS)
+        'reported_total','total_discrepancy','input_conflict','output_conflict','purpose','compaction_epoch') + TRANSPORT_FIELDS + MODEL_FIELDS)
 
 
 class AnalysisEngine:

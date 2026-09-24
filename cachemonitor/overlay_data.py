@@ -271,6 +271,9 @@ class OverlaySummaries:
                     mean_cost=group['cost']/group['priced'] if group['priced'] else None,
                     coverage_gap=group['gap'],token_composition=token_composition({'history':rows}),
                     assumed=sum(updated[member][1]['assumed'] for member in group['members']))
+                maintenance=[r for r in rows if r.get('purpose')=='maintenance']
+                value.update(maintenance_calls=len(maintenance),maintenance_cost=sum_cost(maintenance)['cost'] if maintenance else None,
+                    maintenance_missing=sum(r.get('cost') is None for r in maintenance))
             merged[key]=(signature,value)
             result.append(value)
         self.rollups=merged
