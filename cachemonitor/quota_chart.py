@@ -1,4 +1,4 @@
-"""A single dual-axis plot with bounded rendering and exact time selection."""
+"""Four matching series/axes with bounded rendering and exact time selection."""
 from bisect import bisect_left, bisect_right
 from math import ceil, floor, log10
 from PySide6.QtCore import Qt, QRectF, QPointF, Signal
@@ -7,7 +7,7 @@ from .charts import Plot
 from .theme import shared_theme
 from .pricing import usd
 from .quota_view import clock, prepare_series, observation_label
-from .i18n import LocalizedPainter
+from .i18n import LocalizedPainter, tr
 
 
 class GapPixels:
@@ -46,7 +46,7 @@ class QuotaHistory(Plot):
                 (key=='remaining' or self.series['missing'][key][a]==self.series['missing'][key][b]))
 
     def point(self,index,key):
-        row=self.rows[index];value=row.get(key)
+        value=self.value_at(index,key)
         if value is None:return None
         low,high=self.bounds(key)
         return QPointF(self.x_at(index),
@@ -55,7 +55,16 @@ class QuotaHistory(Plot):
     def bounds(self,key):
         if key=='remaining':return self.axis[:2]
         if key=='cycle_cost':return 0,self.cost_ceiling
+        if key=='completed_cost':return 0,self.completed_ceiling
         return self.value_floor,self.ceiling
+
+    def value_at(self,index,key):
+        return self.series['completed_costs'][index] if key=='completed_cost' else self.rows[index].get(key)
+
+    def curves(self):
+        return [('remaining','cached',Qt.SolidLine)]+([
+            ('cycle_cost','output',Qt.SolidLine),('cycle_value','written',Qt.DashDotLine),
+            ('completed_cost','completed',Qt.SolidLine)] if self.money else [])
 
     def x_at(self,index):
         return min(self.box.right(),self.box.left()+self.series['active_times'][index]*self.time_scale+
@@ -97,10 +106,16 @@ class QuotaHistory(Plot):
             padding=max((value_high-value_low)*.12,value_high*.01,.0001)
             self.value_floor=max(0,value_low-padding);self.ceiling=value_high+padding
         self.cost_ceiling=self.series['cost_maximum']*1.12 or 1
+        self.completed_ceiling=self.series['completed_maximum']*1.12 or 1
+        completed_width=max(82,p.fontMetrics().horizontalAdvance(usd(self.completed_ceiling))+14)
+        remaining_title='누적 소모\n%p' if cumulative else '잔여량\n%'
+        remaining_labels=[f'{self.axis[1]:g}'+('%p' if cumulative else '%'),*tr(remaining_title).splitlines()]
+        remaining_width=max(60,max(p.fontMetrics().horizontalAdvance(label) for label in remaining_labels)+14)
         cost_width=max(82,p.fontMetrics().horizontalAdvance(usd(self.cost_ceiling))+14)
         value_width=max(92,p.fontMetrics().horizontalAdvance(usd(self.ceiling))+14)
         right=cost_width+value_width if self.money else 18
-        self.box=box=QRectF(52,38,max(1,self.width()-52-right),self.height()-78)
+        left=remaining_width+(completed_width if self.money else 0)
+        self.box=box=QRectF(left,58,max(1,self.width()-left-right),self.height()-98)
         gap_indices=self.series['gap_indices'];count=len(gap_indices)
         # Keep all gaps equally narrow; cap their total footprint only when
         # an exceptionally dense set cannot fit at the normal 24 px width.
@@ -127,25 +142,30 @@ class QuotaHistory(Plot):
         for value in ticks:
             y=box.bottom()-box.height()*(value-low)/(high-low)
             p.setPen(QPen(QColor(palette['border']),1));p.drawLine(QPointF(box.left(),y),QPointF(box.right(),y))
-            p.setPen(QColor(palette['muted']));p.drawText(QRectF(0,y-9,44,18),Qt.AlignRight|Qt.AlignVCenter,f'{value:g}'+('%p' if cumulative else '%'))
+            p.setPen(QColor(palette['cached']));p.drawText(QRectF(box.left()-remaining_width,y-9,remaining_width-7,18),Qt.AlignRight|Qt.AlignVCenter,f'{value:g}'+('%p' if cumulative else '%'))
+        p.setPen(QPen(QColor(palette['cached']),1))
+        p.drawLine(QPointF(box.left(),box.top()),QPointF(box.left(),box.bottom()))
+        p.drawText(QRectF(box.left()-remaining_width,0,remaining_width-7,54),Qt.AlignRight|Qt.AlignVCenter|Qt.TextWordWrap,
+                   remaining_title)
         if self.money:
-            for offset,width,axis_low,ceiling,color,title in ((0,cost_width,0,self.cost_ceiling,'output','누적 API\nUSD'),
-                                                    (cost_width,value_width,self.value_floor,self.ceiling,'written','주간 동등\nUSD / 100%p')):
-                x=box.right()+offset
+            for x,width,axis_low,ceiling,color,title,on_left in (
+                    (box.left()-remaining_width,completed_width,0,self.completed_ceiling,'completed','완료 구간\nUSD',True),
+                    (box.right(),cost_width,0,self.cost_ceiling,'output','누적 API\nUSD',False),
+                    (box.right()+cost_width,value_width,self.value_floor,self.ceiling,'written','주간 동등\nUSD / 100%p',False)):
+                text_x=x-width if on_left else x+7
+                alignment=Qt.AlignRight if on_left else Qt.AlignLeft
                 p.setPen(QPen(QColor(palette[color]),1));p.drawLine(QPointF(x,box.top()),QPointF(x,box.bottom()))
-                p.drawText(QRectF(x+7,0,width-7,34),Qt.AlignLeft,title)
+                p.drawText(QRectF(text_x,0,width-7,54),alignment|Qt.AlignVCenter|Qt.TextWordWrap,title)
                 for fraction in (0,.5,1):
                     y=box.bottom()-box.height()*fraction
-                    p.drawText(QRectF(x+7,y-9,width-7,18),Qt.AlignLeft|Qt.AlignVCenter,usd(axis_low+(ceiling-axis_low)*fraction))
+                    p.drawText(QRectF(text_x,y-9,width-7,18),alignment|Qt.AlignVCenter,usd(axis_low+(ceiling-axis_low)*fraction))
             if self.reference is not None:
                 y=box.bottom()-box.height()*(self.reference-self.value_floor)/(self.ceiling-self.value_floor)
                 p.setPen(QPen(QColor(palette['accent']),1,Qt.DashLine))
                 p.drawLine(QPointF(box.left(),y),QPointF(box.right(),y))
         indices=self.series['samples'][256 if box.width()<600 else 768]
-        curves=[('remaining','cached',Qt.SolidLine)]
-        if self.money:curves += [('cycle_cost','output',Qt.SolidLine),('cycle_value','written',Qt.DashDotLine)]
         xs=[self.x_at(index) for index in indices]
-        for key,color,style in curves:
+        for key,color,style in self.curves():
             low,high=self.bounds(key)
             scale=box.height()/(high-low);bottom=box.bottom()
             previous=None;previous_x=None;previous_index=None
@@ -154,14 +174,20 @@ class QuotaHistory(Plot):
             # One native path avoids thousands of temporary Qt line/point
             # wrappers each time a refreshed series invalidates the image.
             for index,x in zip(indices,xs):
-                value=self.rows[index].get(key)
+                value=self.value_at(index,key)
                 y=bottom-(value-low)*scale if value is not None else None
                 if y is not None:
                     if previous is not None and self.connects(previous_index,index,key):
                         path.moveTo(previous_x,previous);path.lineTo(x,previous)
                         path.moveTo(x,previous);path.lineTo(x,y)
-                    if previous is None or index==indices[-1]:markers.append(QPointF(x,y))
+                    if previous is None or not self.connects(previous_index,index,key) or index==indices[-1]:markers.append(QPointF(x,y))
                 previous,previous_x,previous_index=y,x,index
+                # A completed amount belongs to its whole plateau, up to the
+                # next boundary, even when that next plateau is still pending.
+                if key=='completed_cost' and y is not None and index+1<len(self.rows):
+                    if (self.value_at(index+1,key) is None and self.series['breaks'][index]==self.series['breaks'][index+1]
+                            and self.series['missing'][key][index+1]==self.series['missing'][key][index]+1):
+                        path.moveTo(x,y);path.lineTo(self.x_at(index+1),y)
             p.setBrush(Qt.NoBrush);p.drawPath(path)
             p.setBrush(QColor(palette[color]))
             for point in markers:p.drawEllipse(point,3,3)
@@ -211,7 +237,7 @@ class QuotaHistory(Plot):
         index=min(self.cursor,len(self.rows)-1);point=self.point(index,'remaining')
         p.setPen(QPen(QColor(palette['muted']),1,Qt.DotLine))
         p.drawLine(QPointF(point.x(),self.box.top()),QPointF(point.x(),self.box.bottom()))
-        for key,color in ([('remaining','cached')]+([('cycle_cost','output'),('cycle_value','written')] if self.money else [])):
+        for key,color,_ in self.curves():
             point=self.point(index,key)
             if point is not None:
                 p.setPen(QPen(QColor(palette[color]),1));p.setBrush(QColor(palette[color]));p.drawEllipse(point,4,4)
@@ -254,20 +280,18 @@ class QuotaHistory(Plot):
         row=self.rows[index];previous=self.rows[index-1] if index else None
         cumulative=self.series.get('cumulative',False)
         items=[dict(label='누적 소모량' if cumulative else '잔여량',value=f"{row['remaining']:g}"+('%p' if cumulative else '%'),color='cached')]
-        completed=None
         if self.money:
             items += [dict(label='누적 API 환산액',value=usd(row.get('cycle_cost')),color='output'),
                       dict(label='주간 동등 가치',value=usd(row.get('cycle_value')),color='written')]
             amount=self.series['completed_costs'][index]
-            if amount is not None:
-                completed=dict(label='완료 구간별 API 환산액',value=usd(amount))
+            items.append(dict(label='완료 구간별 API 환산액',value=usd(amount),color='completed'))
         if row['reset_kind']:note=(' · '.join(row.get('markers',[])) or '사용량 리셋')+' · 새 주기'
         elif not previous:note=''
         elif not row['connect']:note='' if self.series.get('active_only') else '공백 이후 첫 관측'
         elif self.money and row.get('cycle_cost') is None:note='금액 확인 중'
         elif self.money and row.get('cycle_value') is None:note='동등 가치 계산 대기'
         else:note=''
-        return dict(title=clock(row['at'],True),at=row['at'],items=items,note=note,completed=completed)
+        return dict(title=clock(row['at'],True),at=row['at'],items=items,note=note)
 
     def refresh_detail(self,detail):
         if not detail or not self.rows:return {}

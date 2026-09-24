@@ -4,10 +4,10 @@ from PySide6.QtGui import QGuiApplication, QFontDatabase, QColor
 
 LIGHT = dict(background='#F6F8FB', surface='#FFFFFF', secondary='#EDF2F7', ink='#182535',
              muted='#5C6C80', border='#D9E2EC', accent='#285FBC', cached='#0F766E',
-             written='#8A641A', output='#6551A4', unknown='#7A8898', warning='#A45A13', error='#B42332')
+             written='#8A641A', output='#6551A4', completed='#B95443', unknown='#7A8898', warning='#A45A13', error='#B42332')
 DARK = dict(background='#11161D', surface='#19212B', secondary='#222D3A', ink='#EDF2F7',
             muted='#A7B5C7', border='#354253', accent='#8BB5FF', cached='#55C5B8',
-            written='#D6B56B', output='#B9A4EB', unknown='#8B99AA', warning='#E4B06A', error='#FF929D')
+            written='#D6B56B', output='#B9A4EB', completed='#F49B87', unknown='#8B99AA', warning='#E4B06A', error='#FF929D')
 
 def contrast_color(color, background, minimum=3):
     def luminance(value):
@@ -52,7 +52,7 @@ class Theme(QObject):
             dark = appearance.dark; palette = dict(DARK if dark else LIGHT)
         palette.update(surface=appearance.surface, ink=appearance.ink, **token_palette(appearance))
         family = appearance.family
-        for key in ('warning','error'):
+        for key in ('warning','error','completed'):
             palette[key]=contrast_color(palette[key],palette['surface'])
         palette['muted']=contrast_color(palette['muted'],palette['surface'],4.5)
         if (palette, dark, family) != (self._palette, self._dark, self._family):

@@ -182,6 +182,7 @@ class QuotaPanel(Group):
         self.history.selected.connect(self.select_observation)
         self.history_legend=Row();self.history_legend.put(flow=True);self.history_legend.setSpacing(16)
         for name,color in (('━ 잔여량 · %','#0F766E'),('━ 누적 API 환산액 · USD','#6551A4'),
+                           ('━ 완료 구간별 API 환산액 · USD','#B95443'),
                            ('┄ 주간 동등 가치 · USD','#8A641A'),('╌ 전체 누적 기준 · USD','#285FBC')):
             legend=Text(name);legend.put(fontSize=12,color=color);self.history_legend.addWidget(legend)
             if name.startswith('━ 잔여량'):self.remaining_legend=legend
