@@ -24,7 +24,7 @@ def test_observation_task_survives_launcher_exit(tmp_path):
     home.mkdir()
     root = Path(__file__).resolve().parents[1]
     manager = ObserverManager(home, tmp_path / 'data', url=f'http://127.0.0.1:{port}')
-    task = ObserverTask(home, role='CacheObservation')
+    task = ObserverTask(home, role='CacheObservationV2')
     command = [str(Path(sys.executable).with_name('pythonw.exe')), str(root / 'run.py'),
                '--model-proxy', '--cache-observe-only', '--codex-home', str(home),
                '--evidence-path', str(manager.evidence), '--observation-index',
@@ -32,7 +32,7 @@ def test_observation_task_survives_launcher_exit(tmp_path):
     launcher = tmp_path / 'launch.py'
     launcher.write_text('import sys\nsys.path.insert(0, ' + repr(str(root)) + ')\n'
                         'from cachemonitor.observer_task import ObserverTask\n'
-                        f'ObserverTask({str(home)!r}, role="CacheObservation").start({command!r})\n')
+                        f'ObserverTask({str(home)!r}, role="CacheObservationV2").start({command!r})\n')
     try:
         # The launcher exits completely before the independent worker is checked.
         subprocess.run([sys.executable, str(launcher)], check=True, timeout=30)
@@ -48,6 +48,9 @@ def test_observation_task_survives_launcher_exit(tmp_path):
         state = task.inspect()
         assert state['state'] == 4 and state['autostart'] is False
         assert '--cache-observe-only' in state['arguments']
+        task.configure(command, autostart=True)
+        assert task.inspect()['restartCount'] == 3
+        assert manager.health(timeout=1)['pid'] == health['pid']
         # No URL is installed merely by starting the observer.
         assert not manager.config_path.exists()
     finally:
