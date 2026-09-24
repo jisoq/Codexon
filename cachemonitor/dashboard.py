@@ -90,7 +90,8 @@ def record_summary(rows):
 
 
 class Dashboard(TrayWindow):
-    def __init__(self, homes, start_worker=True, settings=None, index_path=None, static_snapshot=None, live_limits=True, manage_observer=False,model_evidence_path=None,cache_control=None):
+    def __init__(self, homes, start_worker=True, settings=None, index_path=None, static_snapshot=None, live_limits=True, manage_observer=False,model_evidence_path=None,cache_control=None,quota_path=None):
+        self.quota_path=quota_path
         self.cache_control_enabled=manage_observer if cache_control is None else cache_control
         super().__init__()
         self.settings=settings or QSettings('CacheMonitor','CacheMonitor')
@@ -172,7 +173,7 @@ class Dashboard(TrayWindow):
         self.restore_preferences();self.restoring=False;self.change_page(self.current_page)
         if start_worker:
             if homes and static_snapshot is None:self.start_quota_service(homes[0])
-            self.worker=AnalysisBridge(homes,index_path,static_snapshot,model_evidence_path)
+            self.worker=AnalysisBridge(homes,index_path,static_snapshot,model_evidence_path,quota_path)
             self.worker.snapshot.connect(self.receive);self.worker.result.connect(self.analysis_ready)
             self.worker.failure.connect(self.analysis_failed);self.worker.record.connect(self.record_ready);self.worker.start();self.render()
         elif static_snapshot is not None:self.receive(static_snapshot)
@@ -204,13 +205,13 @@ class Dashboard(TrayWindow):
         self.quota_services=services
         for candidate in self.snapshot.get('homes',[home]):
             if candidate not in services:
-                service=QuotaService(candidate,self.index_path,live=self.live_limits,
+                service=QuotaService(candidate,self.index_path,live=self.live_limits,quota_path=self.quota_path,
                     tracking_enabled=self.settings.value('quota/trackingEnabled',True,type=bool))
                 services[candidate]=service
                 service.updated.connect(lambda value,expected=service: self.receive_quota(value) if self.quota_service is expected else None)
                 service.start()
         if home not in services:
-            services[home]=QuotaService(home,self.index_path,live=self.live_limits,
+            services[home]=QuotaService(home,self.index_path,live=self.live_limits,quota_path=self.quota_path,
                 tracking_enabled=self.settings.value('quota/trackingEnabled',True,type=bool))
             services[home].updated.connect(lambda value,expected=services[home]:self.receive_quota(value) if self.quota_service is expected else None)
             services[home].start()
