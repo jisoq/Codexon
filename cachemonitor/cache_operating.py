@@ -11,6 +11,20 @@ import uuid
 from urllib.parse import urlsplit
 
 
+def maintenance_route(url, websocket):
+    """Select the independent transport, never change the user's connection.
+
+    Only the exact Codex endpoint may cross from a captured WebSocket to HTTP.
+    Contexts must already have reconstructed its complete response chain.
+    This is a wire conversion, not proof of cross-transport cache retention.
+    """
+    endpoint=urlsplit(url)
+    if (endpoint.scheme in ('https','wss') and endpoint.netloc=='chatgpt.com' and
+        endpoint.path=='/backend-api/codex/responses' and not endpoint.query and not endpoint.fragment):
+        return endpoint._replace(scheme='https').geturl(),False
+    return url,websocket
+
+
 def target(home, request, url, headers, websocket):
     endpoint=urlsplit(url)
     account=next((v for k,v in headers.items() if k.lower()=='chatgpt-account-id'),None)

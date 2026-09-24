@@ -8,7 +8,7 @@ from .cache_capture import RelayCapture
 from .cache_control import Control
 from .cache_execution import Contexts,Executor,Journal
 from .cache_policy import Gap,decide,cost_bounds,operating_scenarios,executable_rounds
-from .cache_operating import target
+from .cache_operating import target,maintenance_route
 from .core import usage_values
 
 
@@ -18,6 +18,7 @@ class Scheduler:
         self.home=str(home);self.control=Control(path);self.journal=Journal(path)
         self.executor=Executor(self.journal,Contexts(),observation_only=observation_only,**({'send':send} if send else {}))
         self.capture=RelayCapture(self.executor,self.snapshot,lambda:self.observation_only or self.control.get('automatic',False))
+        self.capture.analysis_revision=2
         self.clock=clock;self.snapshots={};self.jobs={};self.stopped=set();self.evaluations={}
         self.revision=self.control.revision(self.home);self.last_tick=clock();self.closed=False
         self.control.db.execute('DELETE FROM cache_status WHERE home=?',(self.home,))
@@ -50,8 +51,9 @@ class Scheduler:
         # A mock or explicitly verified provider can advertise the same contract.
         endpoint=urlsplit(snapshot['url'])
         supported=endpoint.hostname=='api.openai.com' or (endpoint.hostname!='chatgpt.com' and self.control.get('bounded_provider:'+endpoint.netloc,False))
-        scope=target(self.home,snapshot['request'],snapshot['url'],snapshot['headers'],snapshot['websocket']) if not supported else None
-        if not supported and not scope:return dict(state='disabled',reason='operating_scope_unavailable',calls=0,
+        execution_url,execution_websocket=maintenance_route(snapshot['url'],snapshot['websocket'])
+        scope=target(self.home,snapshot['request'],execution_url,snapshot['headers'],execution_websocket) if not supported else None
+        if not self.observation_only and not supported and not scope:return dict(state='disabled',reason='operating_scope_unavailable',calls=0,
             history_can_unlock=False,server_output_cap=False)
         rows=[Gap(**json.loads(r[0])) for r in self.control.db.execute('SELECT data FROM cache_gaps WHERE home=? AND sid=?',(self.home,sid))]
         rows=[g for g in rows if g.at>=time.time()-60*86400]
@@ -74,7 +76,7 @@ class Scheduler:
         bounds=cost_bounds(row,{**row,'cached':0},output_cap,extra)
         if not bounds:return dict(state='waiting',reason='input_or_price_unobserved')
         operation=None;scenarios=None
-        if not supported:
+        if not supported or self.observation_only:
             grants={g['id'] for g in self.journal.operations.grants() if g['scope']==scope}
             observed=[r for r in self.journal.rows() if r['operation'] in grants]
             scenarios=operating_scenarios(row,profile,extra,observed)
@@ -91,10 +93,21 @@ class Scheduler:
                   g.origin,g.settled,g.scope,g.comparison) for g in rows]
         caps=[int(g.benefit_lower/bounds['maintenance_upper']) for g in rows if type(g.benefit_lower) in (int,float) and bounds['maintenance_upper']>0]
         max_calls=max(1,min(100,max(caps,default=1)))
+        if self.observation_only:
+            # Cost visibility does not depend on a grant, return history or an
+            # executable schedule. Never change grants while observing.
+            decision=decide(rows,latency_bound=30,scheduler_slack=1,max_calls=min(2,max_calls))
+            return {**decision,**scenarios,'policy_state':decision['state'],'policy_calls':decision['calls'],
+                'state':'observing','calls':0,'execution_disabled':True,
+                'source_transport':'WebSocket' if snapshot['websocket'] else 'HTTP',
+                'maintenance_transport':'WebSocket' if execution_websocket else 'HTTP',
+                'model':row['model'],'effort':row['effort'],'service_tier':row['service_tier'],
+                'operating_scope_available':bool(scope),'cost_stop_scenario':2*scenarios['maintenance_expected'],
+                'cost_valid_until':row['request_start']+1800,'transport_reuse_verified':False}
         if scenarios:
             # Optimize INSIDE the consent allowance, never truncate a profitable
             # long-horizon policy to a shorter, potentially loss-making pilot.
-            grant=self.journal.operations.permission(scope)
+            grant=self.journal.operations.permission(scope) if scope else None
             remaining=self.journal.operations.stats(grant)['remaining'] if grant and not grant['stopped'] else 2
             if not remaining:
                 self.journal.operations.stop(grant['id'],'call_limit')
@@ -107,7 +120,6 @@ class Scheduler:
         decision=decide(rows,latency_bound=30,scheduler_slack=1,max_calls=max_calls)
         if scenarios:
             result={**decision,**scenarios,'latency_bound':30}
-            if self.observation_only:return {**result,'policy_state':decision['state'],'state':'observing','execution_disabled':True}
             if decision['state']!='eligible':return result
             proposal=self.journal.operations.propose(scope,scenarios['maintenance_expected'],
                 scenarios['maintenance_adverse'],scenarios['output_high'],scenarios['basis'])
@@ -118,7 +130,7 @@ class Scheduler:
                            adverse=scenarios['maintenance_adverse'],output_high=scenarios['output_high'])
             reason=self.journal.operations.check(operation)
             if reason:return {**result,'state':'stopped' if reason!='operation_busy' else 'waiting','reason':reason,'calls':0}
-            return {**result,'operation':operation}
+            return {**result,'operation':operation,'execution_url':execution_url,'execution_websocket':execution_websocket}
         return {**decision,**bounds,'latency_bound':30}
 
     async def maintain(self,sid,snapshot,decision,revision):
@@ -137,8 +149,8 @@ class Scheduler:
                     if executable_rounds(anchor,time.monotonic(),grant['expires']-time.time(),needed,
                                          latency_bound=decision['latency_bound'])<needed:return False
                 return True
-            result=await self.executor.run(self.home,sid,rid,snapshot['url'],snapshot['headers'],anchor=anchor,
-                deadline=anchor+decision['interval'],latency_bound=decision['latency_bound'],websocket=snapshot['websocket'],
+            result=await self.executor.run(self.home,sid,rid,decision.get('execution_url',snapshot['url']),snapshot['headers'],anchor=anchor,
+                deadline=anchor+decision['interval'],latency_bound=decision['latency_bound'],websocket=decision.get('execution_websocket',snapshot['websocket']),
                 round_number=round_number,max_output_tokens=decision.get('output_cap'),operation=decision.get('operation'),
                 expected_generation=snapshot['generation'],
                 valid=valid)
@@ -168,6 +180,7 @@ class Scheduler:
                     rid=snapshot['response']['id'];item=self.executor.contexts.responses.pop(rid,None)
                     if item:self.executor.contexts.size-=item[2]
                     self.executor.contexts.usage.pop(rid,None)
+                    self.control.db.execute('DELETE FROM cache_status WHERE home=? AND sid=?',(self.home,sid))
                     continue
                 previous=self.evaluations.get(sid)
                 if previous and previous[0]==snapshot['response']['id'] and time.monotonic()-previous[1]<5:continue

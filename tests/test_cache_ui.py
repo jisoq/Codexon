@@ -48,6 +48,13 @@ def test_rendered_hook_approval_cancel_close_timeout_and_disconnect(tmp_path):
         panel.poll()
         assert '이력 추가만으로 활성화되지 않음' in panel.status.text()
         assert '시험 호출은 자동으로 보내지 않습니다' in panel.activation.text()
+        panel.control.status('home','s',dict(state='observing',observation_only=True,observed_at=time.time(),
+            model='gpt-6-astra',effort='high',service_tier='Standard',source_transport='WebSocket',maintenance_transport='HTTP',
+            maintenance_expected=.012,maintenance_adverse=.1,cost_stop_scenario=.024,operating_scope_available=False))
+        panel.poll()
+        assert '관측 전용' in panel.status.text() and '사용자 WebSocket' in panel.forecast.text()
+        assert '현재 모델은 초기 운용 대상 밖' in panel.forecast.text()
+        assert not panel.consent_button.isEnabled()
         assert host.grab().save(str(tmp_path/'cache-settings.png'))
         assert not host.qml_errors
     finally:

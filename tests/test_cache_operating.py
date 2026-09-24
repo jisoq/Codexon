@@ -43,7 +43,9 @@ def test_observation_only_forwards_user_but_never_executes_or_guards(tmp_path):
         async with server(app) as upstream,server(create_app(store,'home',upstream,cache_capture=scheduler.capture)) as proxy:
             async with ClientSession() as client:
                 async with client.post(proxy+'/responses',json=body()) as reply:assert reply.status==200
-                async with client.get(proxy+'/health') as reply:assert (await reply.json())['cache_observation_only']
+                async with client.get(proxy+'/health') as reply:
+                    health=await reply.json()
+                    assert health['cache_observation_only'] and health['cache_analysis_revision']==2
             assert scheduler.snapshots
             scheduler.policy=lambda *a:dict(state='eligible',calls=2,interval=0,latency_bound=30,output_cap=64)
             await scheduler.tick()
@@ -76,7 +78,8 @@ def seed_history(index,sid='session'):
     control.close()
 
 
-def test_natural_policy_consent_capture_wire_and_final_accounting(tmp_path):
+@pytest.mark.parametrize('source_websocket',[False,True])
+def test_natural_policy_consent_capture_wire_and_final_accounting(tmp_path,source_websocket):
     async def scenario():
         index=tmp_path/'index.sqlite';seed_history(index);seen=[]
         async def endpoint(req):
@@ -88,6 +91,7 @@ def test_natural_policy_consent_capture_wire_and_final_accounting(tmp_path):
         async with server(app) as upstream:
             async def send(url,headers,value,**options):
                 assert url==URL
+                assert options['websocket'] is False
                 return await request_once(upstream+'/responses',headers,value,**options)
             scheduler=Scheduler('home',control_path(index),send=send);scheduler.control.set('automatic',True)
             request=dict(body(),max_output_tokens=64);original=dict(response(),id='warm5')
@@ -95,7 +99,7 @@ def test_natural_policy_consent_capture_wire_and_final_accounting(tmp_path):
             captured=scheduler.capture.begin(HEADERS,URL,time.monotonic())
             captured['request'].feed(json.dumps(request).encode())
             captured['response'].feed(b'data: '+json.dumps(dict(type='response.completed',response=original)).encode()+b'\n\n')
-            scheduler.capture.finish(captured)
+            scheduler.capture.finish(captured,websocket=source_websocket)
             snapshot=scheduler.snapshots['session']
             decision=scheduler.policy('session',snapshot)
             assert decision['state']=='disabled' and decision['reason']=='operating_consent_required'
@@ -128,6 +132,38 @@ def test_natural_policy_consent_capture_wire_and_final_accounting(tmp_path):
         assert summary['calls']==summary['priced']==1 and summary['known_cost']==rows[0]['cost']
         assert len(views)==1 and views[0]['purpose']=='maintenance'
         views=[];assert enrich(views,index,time.time())['known_cost']==summary['known_cost']
+    run_proxy_test(scenario())
+
+
+def test_observation_prices_current_model_without_execution_scope_or_return_history(tmp_path):
+    async def scenario():
+        index=tmp_path/'index.sqlite'
+        scheduler=Scheduler('home',control_path(index),observation_only=True)
+        request={**body(),'model':'gpt-6-astra','reasoning':{'effort':'high'},'type':'response.create'}
+        original=response()
+        original['usage'].update(input_tokens=100000,input_tokens_details={'cached_tokens':99000,'cache_write_tokens':0})
+        history=[dict(profile(),model='gpt-6-astra',effort='high',key=original['id'],ts=time.time(),turn='natural')]
+        enrich([dict(home='home',id='session',history=history)],index,time.time())
+        scheduler.executor.contexts.completed(request,original)
+        scheduler.snapshot(request,original,time.monotonic(),URL,HEADERS,True)
+        await scheduler.tick()
+        decision=scheduler.policy('session',scheduler.snapshots['session'])
+        assert decision['state']=='observing' and decision['policy_state']!='eligible'
+        assert decision['source_transport']=='WebSocket' and decision['maintenance_transport']=='HTTP'
+        assert decision['maintenance_adverse']>decision['maintenance_expected']>0
+        assert decision['model']=='gpt-6-astra' and decision['effort']=='high'
+        assert not decision['operating_scope_available'] and decision['execution_disabled']
+        assert not decision['transport_reuse_verified']
+        assert not scheduler.journal.operations.proposals('home') and not scheduler.jobs
+        assert not scheduler.journal.operations.grants() and not scheduler.journal.rows()
+        # Observation does not broaden which model may actually execute.
+        scheduler.observation_only=False
+        assert scheduler.policy('session',scheduler.snapshots['session'])['reason']=='operating_scope_unavailable'
+        scheduler.observation_only=True
+        scheduler.snapshots['session']['anchor']-=1800
+        await scheduler.tick()
+        assert not scheduler.control.db.execute('SELECT 1 FROM cache_status').fetchone()
+        await scheduler.close()
     run_proxy_test(scenario())
 
 

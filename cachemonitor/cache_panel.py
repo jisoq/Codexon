@@ -13,7 +13,7 @@ from .quick_runtime import Confirmation
 REASONS={
     'no_executable_rounds':'유지하지 않음 · 동의 기간 안에 실행할 시간 부족',
     'operating_consent_required':'비활성 · 제한 운용 범위에 대한 동의 필요',
-    'operating_scope_unavailable':'비활성 · 초기 운용 대상은 계정이 확인된 Luna·low·Standard HTTP입니다',
+    'operating_scope_unavailable':'비활성 · 초기 유지 대상은 계정이 확인된 Luna·low·Standard입니다. 사용자 연결 방식은 자동 처리됩니다',
     'operating_cost_unobserved':'현재 비교 구간의 비용 예상에 필요한 자료 대기',
     'operation_busy':'앞선 유지 요청의 사용량 회수 중',
     'operation_deferred':'공유 운용 허용량 확인 대기',
@@ -55,6 +55,7 @@ class CachePanel(Group):
             row=Row();row.addWidget(Text(title),1);toggle=Switch();toggle.setChecked(self.control.get(key,False))
             toggle.toggled.connect(lambda value,k=key:self.control.set(k,value));row.addWidget(toggle);layout.addLayout(row)
         self.status=Text('자연 작업 이력 수집 중');self.status.setWordWrap(True);layout.addWidget(self.status)
+        self.forecast=Text();self.forecast.setWordWrap(True);self.forecast.setTextFormat(Qt.PlainText);layout.addWidget(self.forecast)
         self.summary=Text();self.summary.setWordWrap(True);self.summary.setTextFormat(Qt.PlainText);layout.addWidget(self.summary)
         self.audit=Text();self.audit.setWordWrap(True);self.audit.setTextFormat(Qt.PlainText);layout.addWidget(self.audit)
         row=Row();connect=Button('Codex 훅 연결');disconnect=Button('훅 연결 해제')
@@ -97,8 +98,19 @@ class CachePanel(Group):
                     if self.dialog:self.dialog.reject()
             if not self.dialog and waiting:self.show_ticket(waiting[0])
             states=[json.loads(r[0]) for r in self.control.db.execute('SELECT data FROM cache_status WHERE home=?',(self.home,))]
+            forecasts=[s for s in states if s.get('observation_only') and s.get('maintenance_expected') is not None
+                       and s.get('cost_valid_until',s.get('observed_at',0)+1800)>time.time()]
+            if forecasts:
+                s=max(forecasts,key=lambda s:s.get('observed_at',0))
+                self.forecast.setText(f"현재 문맥 예상 · {s.get('model')} · {s.get('effort')} · {s.get('service_tier')}\n"
+                    f"사용자 {s.get('source_transport')} → 별도 유지 {s.get('maintenance_transport')}\n"
+                    f"1회 예상 C {usd(s['maintenance_expected'])} · 재사용 실패 시나리오 {usd(s['maintenance_adverse'])} · 2C {usd(s['cost_stop_scenario'])}\n"
+                    'API 환산 시나리오 · 총비용 상한이나 유지 효과 실측이 아닙니다. 관측만으로 실행되지 않습니다.'
+                    +(' 현재 모델은 초기 운용 대상 밖입니다.' if not s.get('operating_scope_available') else ''))
+            else:self.forecast.setText('')
             self.poll_operating()
-            if not self.control.get('automatic',False):self.status.setText('자동 유지 꺼짐 · 사용량 분석은 계속됩니다')
+            if any(s.get('observation_only') for s in states):self.status.setText('관측 전용 · 추가 유지 요청 없음 · 사용자 연결 방식 변경 불필요')
+            elif not self.control.get('automatic',False):self.status.setText('자동 유지 꺼짐 · 사용량 분석은 계속됩니다')
             elif not self.proxy_ready:self.status.setText('자동 유지 대기 · 캐시 관리를 지원하는 프록시 연결 필요')
             elif states:
                 self.status.setText(' / '.join(dict.fromkeys(REASONS.get(s.get('reason',s.get('state')),s.get('state','대기')) for s in states)))
@@ -124,6 +136,7 @@ class CachePanel(Group):
         proposal=proposals[0];scope=proposal['scope']
         text=(f"계정 {scope['account'][:12]}\n홈 {scope['home']}\n"
             f"{scope['model']} · {scope['effort']} · Standard · HTTP\n"
+            '사용자 대화는 기존 연결 유지 · 복원한 전체 문맥으로 별도 HTTP 유지 요청\n'
             f"동의 후 60분, 모든 세션 합계 최대 2회, 순차 실행\n"
             f"1회 예상 {usd(proposal['expected'])}, 캐시 재사용 실패 시나리오 {usd(proposal['adverse'])}\n"
             f"관측 API 환산 합계 {usd(proposal['cost_stop'])} 도달 시 후속 호출 중단\n\n"
