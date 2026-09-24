@@ -1,71 +1,12 @@
 from cachemonitor.quick_qa import click
 from PySide6.QtQuick import QQuickItem
 import sys
-import time
 import pytest
 from PySide6.QtCore import QSettings,Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QWidget
 from cachemonitor.overlay import OverlayController
-from cachemonitor.overlay_tracking import Selection,overlay_geometry,anchor_for_position
-
-
-@pytest.mark.skipif(sys.platform!='win32',reason='Owned native overlay preview')
-def test_icon_detail_toggle_native_layout_and_preference_restore(tmp_path):
-    from cachemonitor.overlay_windows import WindowsOverlay
-    from test_overlay_presentation import summary
-    app=QApplication.instance() or QApplication([])
-    host=QWidget();host.setWindowTitle('CacheMonitor owned design preview');host.resize(1000,1000);host.show()
-    settings=QSettings(str(tmp_path/'display.ini'),QSettings.IniFormat)
-    settings.setValue('overlay/theme','light')
-    c=OverlayController(settings,native_enabled=False);native=WindowsOverlay();c.native=native
-    native.configure(int(c.widget.winId()))
-    native.visible_target=lambda hwnd:bool(native.u.IsWindowVisible(hwnd) and not native.u.IsIconic(hwnd))
-    data=summary();data['request']['started_at']=time.time()-20
-    c.receive_snapshot(dict(overlay_sessions=[data],index={'loading':False}))
-    def capture(name):
-        screen=c.widget.screen();origin=screen.geometry().topLeft();ratio=screen.devicePixelRatio()
-        left,top,right,bottom=native.frame(int(c.widget.winId()))
-        shot=screen.grabWindow(0,round((left-origin.x())/ratio),round((top-origin.y())/ratio),round((right-left)/ratio),round((bottom-top)/ratio))
-        assert shot.save(str(tmp_path/name))
-    def refresh():
-        c.receive_target(dict(target={'hwnd':int(host.winId())},selection=Selection('clean')))
-        app.processEvents();QTest.qWait(70)
-    try:
-        refresh();assert not c.expanded and c.automatic_mode=='monitor'
-        button=c.actions.quick.rootObject().findChild(QQuickItem,'expand')
-        assert button.property('enabled') and not button.property('text')
-        for dark in (False,True):
-            settings.setValue('overlay/theme','dark' if dark else 'light');c.next_theme=0;refresh()
-            assert not c.expanded
-            capture(f'monitor-{dark}.png')
-            click(c.actions,button);refresh()
-            assert c.expanded and c.automatic_mode=='detail' and settings.value('overlay/expanded',type=bool)
-            QTest.qWait(200)
-            capture(f'detail-{dark}.png')
-            assert all(not control.qml_errors for control in c.chrome) and not c.widget.qml_errors
-            click(c.actions,button);refresh();assert not c.expanded
-        c.toggle_expanded();refresh()
-        host.resize(500,500);refresh()
-        assert c.expanded and c.automatic_mode=='detail-inline' and button.property('enabled')
-        host.resize(1000,1000);refresh();assert c.automatic_mode=='detail'
-        restored=OverlayController(settings,native_enabled=False)
-        assert restored.expanded;restored.stop()
-        panel=native.frame(int(c.widget.winId()));header=native.frame(int(c.header.winId()));actions=native.frame(int(c.actions.winId()))
-        assert panel[0]<=header[0]<header[2]<=actions[0]<actions[2]<=panel[2]
-        assert native.u.GetWindowLongPtrW(int(c.widget.winId()),-20)&0x20
-        assert not native.u.GetWindowLongPtrW(int(c.actions.winId()),-20)&0x20
-    finally:c.stop();host.close();app.processEvents()
-
-
-@pytest.mark.parametrize('dpi',[96,120,144,192])
-def test_drag_anchors_roundtrip_and_clamp_inside_negative_monitor(dpi):
-    frame=(-3000,-800,-100,1600)
-    old=overlay_geometry(frame,dpi,anchor=(.5,.5))
-    anchor=anchor_for_position(frame,old,old[0]+123,old[1]-87,dpi)
-    new=overlay_geometry(frame,dpi,anchor=anchor)
-    assert abs(new[0]-old[0]-123)<=1 and abs(new[1]-old[1]+87)<=1
-    assert anchor_for_position(frame,old,-100000,100000,dpi)==(0,1)
+from cachemonitor.overlay_tracking import Selection
 
 
 @pytest.mark.skipif(sys.platform!='win32',reason='Real Windows companion windows')

@@ -28,15 +28,15 @@ from .notifications import ConfirmedNotifications
 from .ui_details import Details, strong, recorded, record_issues, price_reason, observed_transport, model_comparison
 from .theme import shared_theme
 from .version import VERSION
-from .i18n import tr
+from .i18n import tr, Verbatim
 
 STYLE = ''
 TITLES = ('사용 현황','조건 비교','세션 기록','사용 한도','설정')
 PERIODS = [('최근 30분','30m'),('오늘','today'),('최근 7일','7d'),('최근 30일','30d'),('전체 기록','all'),('직접 지정','custom')]
 INPUT_BANDS = [('전체 입력 길이',''),('10k 미만','0:10000'),('10–50k','10000:50000'),('50–100k','50000:100000'),('100–200k','100000:200000'),('200–272k','200000:272001'),('272k 초과','272001:inf')]
 CALL_FILTERS = [('미산정','unpriced'),('모드 기록 없음','unknown_mode'),('모델명 불일치','model_mismatch'),('기록 누락·충돌','observation_problem'),('캐시 읽기 0','cache_zero'),('캐시 저하 의심','cache_degradation'),('HTTP/SSE','http')]
-CALL_COLUMNS = [('ts','기록 시각'),('model','요청 모델'),('effort','추론 설정'),('service_tier','요청 모드'),('cost','API 환산액'),('cache_ratio','입력 캐시율')]
-EXTRA_COLUMNS = [('input','입력'),('cached','캐시 읽기'),('written','캐시 쓰기'),('output','출력·추론 포함'),('reasoning','추론'),('output_speed','평균 출력 속도'),('response_model','응답 모델'),('response_service_tier','응답 등급'),('transport','통신 방식')]
+CALL_COLUMNS = [('ts','기록 시각'),('model','요청 모델'),('effort','추론 설정'),('service_tier','요청 모드'),('cost','비용'),('cache_ratio','캐시 적중률')]
+EXTRA_COLUMNS = [('input','입력'),('cached','캐시 읽기'),('written','캐시 쓰기'),('output','출력'),('reasoning','추론'),('non_reasoning','추론 외'),('output_speed','평균 출력 속도'),('response_model','응답 모델'),('response_service_tier','응답 등급'),('transport','통신 방식')]
 
 
 def number(value, decimals=0): return '—' if value is None else f'{value:,.{decimals}f}'
@@ -142,7 +142,7 @@ class Dashboard(TrayWindow):
         self.pending_label=label('','muted');self.pending_label.setFixedHeight(36);self.pending_label.setMaximumWidth(280);header.addWidget(self.pending_label)
         self.price_button=Button('기준 가격');self.price_button.clicked.connect(self.show_prices);header.addWidget(self.price_button);layout.addLayout(header)
         self.common_filters=Row();self.common_filters.put(flow=True,spacing=8)
-        self.home=combo([('모든 Codex 홈','')]+[(h,h) for h in homes]);self.home.setMinimumWidth(205)
+        self.home=combo([('모든 Codex 홈','')]+[(Verbatim(h),h) for h in homes]);self.home.setMinimumWidth(205)
         self.period=combo(PERIODS);choose(self.period,'30d')
         self.date_start=DateInput(QDate.currentDate().addDays(-29));self.date_end=DateInput(QDate.currentDate())
         self.project=combo([('모든 프로젝트','')]);self.project.setMinimumWidth(220)
@@ -237,7 +237,7 @@ class Dashboard(TrayWindow):
         summary=Group();summary.setObjectName('summary');columns=Row(summary);columns.setContentsMargins(16,16,16,16);columns.setSpacing(20)
         columns.put(minColumnWidth=180)
         self.metrics=[];self.metric_captions=[];self.metric_notes=[]
-        for i,title in enumerate(('API 환산액','호출당 평균','완료 요청당 평균','입력 캐시율','평균 출력 속도')):
+        for i,title in enumerate(('비용','평균 호출 비용','완료 요청당 평균','캐시 적중률','평균 출력 속도')):
             col=Column();caption=label(title,'muted');value=Button('—');value.put(flat=True,fontSize=30,bold=True,noElide=True)
             if i==4:value.put(fontSize=24)
             value.clicked.connect(lambda index=i:self.open_summary(index));note=label('','muted',True);note.put(fontSize=12)
@@ -245,8 +245,8 @@ class Dashboard(TrayWindow):
             columns.addLayout(col,1);self.metrics.append(value);self.metric_captions.append(caption);self.metric_notes.append(note)
         layout.addWidget(summary);layout.addWidget(label('고정 단가 환산 · 청구액 아님','muted'))
         controls=Row();controls.put(flow=True);controls.addWidget(label('시간 추이','section'))
-        self.overview_metric=combo([('환산액','cost'),('호출 수','count'),('입력 캐시율','cache_ratio')])
-        self.overview_basis=combo([('합계','total'),('호출당 평균','call_mean'),('완료 요청당 평균','turn_mean')])
+        self.overview_metric=combo([('환산액','cost'),('호출 수','count'),('캐시 적중률','cache_ratio')])
+        self.overview_basis=combo([('합계','total'),('평균 호출 비용','call_mean'),('완료 요청당 평균','turn_mean')])
         self.overview_bucket=combo([('자동','auto'),('5분','5min'),('시간','hour'),('일','day'),('주','week'),('월','month')])
         for node in (self.overview_metric,self.overview_basis,self.overview_bucket):controls.addWidget(node);node.currentIndexChanged.connect(self.render)
         layout.addLayout(controls);self.timeline=UsageTrend();self.timeline.selected.connect(self.select_aggregate);layout.addWidget(self.timeline)
@@ -287,12 +287,12 @@ class Dashboard(TrayWindow):
         self.comparison_note=label('비교할 조건을 선택하세요','muted',True);layout.addWidget(self.comparison_note)
         options=Group();options_layout=Column(options)
         conditions=Row();conditions.put(flow=True,spacing=8)
-        self.band=combo(INPUT_BANDS);self.cache_band=combo([('전체 입력 캐시율',''),('0%','zero'),('0% 초과–25% 미만','0:25'),('25–50% 미만','25:50'),('50–75% 미만','50:75'),('75–100% 미만','75:100'),('100%','full')])
+        self.band=combo(INPUT_BANDS);self.cache_band=combo([('전체 캐시 적중률',''),('0%','zero'),('0% 초과–25% 미만','0:25'),('25–50% 미만','25:50'),('50–75% 미만','50:75'),('75–100% 미만','75:100'),('100%','full')])
         self.transport=combo([('모든 통신 방식',''),('WebSocket','WebSocket'),('HTTP/SSE','HTTP/SSE'),('통신 기록 없음','미확인')])
         self.transport_source=combo([('관측·추정 전체',''),('관측','observed'),('추정','estimated')]);self.cache_policy=combo([('모든 캐시 정책','')])
         for node in (self.band,self.cache_band,self.transport,self.transport_source,self.cache_policy):conditions.addWidget(node);node.currentIndexChanged.connect(self.render)
         options_layout.addLayout(conditions)
-        self.unit=combo([('호출','response'),('완료 요청','turn')]);self.comparison_metric=combo([('API 환산액','cost'),('입력 토큰','input'),('출력 토큰·추론 포함','output'),('추론 토큰','reasoning'),('입력 캐시율','cache_ratio')])
+        self.unit=combo([('호출','response'),('완료 요청','turn')]);self.comparison_metric=combo([('비용','cost'),('입력 토큰','input'),('출력','output'),('추론 토큰','reasoning'),('캐시 적중률','cache_ratio')])
         self.method=combo([('평균','mean'),('중앙값','median'),('P90','p90')]);self.comparison_mode=combo([('관측 비교','observed'),('동일 토큰 환산','repricing')])
         for node in (self.unit,self.comparison_metric):header.addWidget(node)
         for node in (self.method,self.comparison_mode):options_layout.addWidget(node)
@@ -302,7 +302,7 @@ class Dashboard(TrayWindow):
         self.comparison_options=Details('세부 조건·계산 방식',options,compact=True);layout.addWidget(self.comparison_options)
         self.comparison_chart=ComparisonChart();self.comparison_chart.selected.connect(self.select_comparison);layout.addWidget(self.comparison_chart)
         self.difference_note=label('','muted',True);layout.addWidget(self.difference_note)
-        self.matrix_body=Group();ml=Column(self.matrix_body);self.matrix_by=combo([('입력 길이','input'),('입력 캐시율','cache'),('작업 종류','source'),('프로젝트','project')]);self.matrix_by.currentIndexChanged.connect(self.render)
+        self.matrix_body=Group();ml=Column(self.matrix_body);self.matrix_by=combo([('입력 길이','input'),('캐시 적중률','cache'),('작업 종류','source'),('프로젝트','project')]);self.matrix_by.currentIndexChanged.connect(self.render)
         ml.addWidget(self.matrix_by);self.matrix=table(['대상','조건','대표값','유효 / 대상']);self.matrix.put(inline=True);self.matrix.cellClicked.connect(self.select_matrix);ml.addWidget(self.matrix)
         self.condition_details=Details('조건별 보기',self.matrix_body,compact=True);layout.addWidget(self.condition_details)
         self.budget_details=Details('평균 환산액 구성',compact=True);layout.addWidget(self.budget_details)
@@ -357,7 +357,7 @@ class Dashboard(TrayWindow):
         dh=Row();dh.addWidget(label('호출 상세','section'));detail_layout.addLayout(dh)
         self.close_record_button=action('close','호출 상세 닫기',self.close_record_detail);self.close_record_button.hide();self.navigation_row.addWidget(self.close_record_button)
         self.detail_sections={}
-        for key,title in (('identity','작업'),('conditions','조건'),('usage','사용량'),('pricing','환산'),('time','시간'),('evidence','데이터 문제')):
+        for key,title in (('identity','작업'),('conditions','조건'),('usage','토큰'),('pricing','환산'),('time','시간'),('evidence','데이터 문제')):
             body=Group();bl=Column(body);bl.addWidget(label(title,'section'));text=label('','',True);text.setTextInteractionFlags(Qt.TextSelectableByMouse|Qt.TextSelectableByKeyboard);bl.addWidget(text);detail_layout.addWidget(body);self.detail_sections[key]=(body,text)
             if key=='usage':
                 self.input_composition=TokenComposition('input');self.output_composition=TokenComposition('output')
@@ -472,10 +472,10 @@ class Dashboard(TrayWindow):
     def update_navigation(self):
         if self.current_page==2:
             session=next((s for s in self.snapshot['sessions'] if self.selected_session==(s['home'],s['id'])),None)
-            path='세션 기록'
+            path=tr('세션 기록')
             if session:path+=' / '+(session.get('title') or session['id'])
             if self.selected_turn:path+=' / '+self.selected_turn
-            if self.selected_call:path+=' / 호출 상세'
+            if self.selected_call:path+=' / '+tr('호출 상세')
             deep=bool(self.selected_turn or self.selected_call or self.temporary_context or self.record_view=='calls')
         else:
             path=TITLES[self.current_page];deep=False
@@ -483,7 +483,7 @@ class Dashboard(TrayWindow):
                 path+=' / '+(self.compare_model.currentText() or '모델 선택')
                 if self.comparison_detail['group'].isVisible():path+=' / 선택 상세';deep=True
         self.navigation_row.setVisible(self.current_page in (1,2) or bool(self.back_stack))
-        self.path_label.setText(path);self.path_label.setToolTip(path)
+        self.path_label.setText(Verbatim(path) if self.current_page==2 else path);self.path_label.setToolTip(Verbatim(path) if self.current_page==2 else path)
         self.close_record_button.setVisible(self.current_page==2 and self.detail_scroll.isVisible())
         self.record_message.setVisible(self.current_page==2)
         self.home_button.setEnabled(deep)
@@ -547,7 +547,7 @@ class Dashboard(TrayWindow):
             if [(node.itemText(i),node.itemData(i)) for i in range(node.count())]==entries:continue
             blocked=node.blockSignals(True);node.clear()
             for title,value in entries:
-                node.addItem(str(title),value)
+                node.addItem(Verbatim(title) if key=='project' else str(title),value)
                 if key=='project' and value:node.setItemData(node.count()-1,'\n'.join(project_paths.get(value,[])),Qt.ToolTipRole)
             # An explicit selection survives zero samples, even when the source disappears.
             if current and node.findData(current)<0:node.addItem(str(caption(key,current)),current)
@@ -641,13 +641,13 @@ class Dashboard(TrayWindow):
 
     def scope_text(self,q):
         if self.temporary_context and q['page']==2:
-            ctx=self.temporary_context;names=[ctx.get('home',''),ctx.get('sid',''),'전체 기록 · 자체 호출']
+            ctx=self.temporary_context;names=[ctx.get('home',''),ctx.get('sid',''),tr('전체 기록 · 자체 호출')]
             names += list(ctx.get('filters',[]))
-            return ' · '.join(str(x) for x in names if x)
-        names=[q.get('home') or ('모든 Codex 홈' if len(self.snapshot['homes'])>1 else (self.snapshot['homes'][0] if self.snapshot['homes'] else '로컬 기록')),
-            self.period.currentText(),q.get('project') or '모든 프로젝트',self.source.currentText()]
+            return Verbatim(' · '.join(str(x) for x in names if x))
+        names=[Verbatim(q['home']) if q.get('home') else ('모든 Codex 홈' if len(self.snapshot['homes'])>1 else (Verbatim(self.snapshot['homes'][0]) if self.snapshot['homes'] else '로컬 기록')),
+            self.period.currentText(),Verbatim(q['project']) if q.get('project') else '모든 프로젝트',self.source.currentText()]
         if q['page'] in (0,2):names += [q.get(k) for k in ('model','effort','service_tier') if q.get(k)]
-        return ' · '.join(str(x) for x in names if x)
+        return Verbatim(' · '.join(tr(x) for x in names if x))
 
     def receive(self,value):
         self.snapshot=value
@@ -679,7 +679,7 @@ class Dashboard(TrayWindow):
         self.view_result=result;self.applied_key=result['key'];self.analysis=result['analysis'];self.lookup=result['lookup']
         self.table.live_update=automatic
         a=self.analysis;rows=a['responses'];sessions=len({(r['home'],r['sid']) for r in rows})
-        self.scope_note.setText(self.scope_text(query)+f' · 관측 {len(rows):,}호출 · {sessions:,}세션'+(' · 수집 중' if query.get('loading') else ''))
+        self.scope_note.setText(Verbatim(self.scope_text(query)+tr(f' · 관측 {len(rows):,}호출 · {sessions:,}세션'+(' · 수집 중' if query.get('loading') else ''))))
         if self.current_page==0:self.render_overview()
         elif self.current_page==1:
             comparison=result.get('comparison',{})
@@ -904,15 +904,15 @@ class Dashboard(TrayWindow):
         if self.restoring:return
         self.restoring=True
         unit=self.unit.currentData();current=self.comparison_metric.currentData();self.comparison_metric.clear()
-        items=[('API 환산액','cost'),('호출 소요시간' if unit=='response' else '요청 경과시간','duration'),
-            ('입력 토큰' if unit=='response' else '입력 토큰 합계','input'),('출력 토큰·추론 포함' if unit=='response' else '출력 토큰 합계·추론 포함','output'),('추론 토큰' if unit=='response' else '추론 토큰 합계','reasoning'),('입력 캐시율','cache_ratio')]
+        items=[('비용','cost'),('호출 소요시간' if unit=='response' else '요청 경과시간','duration'),
+            ('입력 토큰' if unit=='response' else '입력 토큰 합계','input'),('출력' if unit=='response' else '출력 합계','output'),('추론 토큰' if unit=='response' else '추론 토큰 합계','reasoning'),('캐시 적중률','cache_ratio')]
         if unit=='turn':items.append(('요청당 호출 수','responses'))
         for text,key in items:self.comparison_metric.addItem(text,key)
         choose(self.comparison_metric,current)
         if self.comparison_mode.currentData()=='repricing':choose(self.comparison_metric,'cost');choose(self.result_view,'distribution')
         self.comparison_metric.setEnabled(self.comparison_mode.currentData()!='repricing');self.result_view.setEnabled(self.comparison_mode.currentData()!='repricing')
         self.sync_comparison_labels()
-        self.band.setAccessibleName('시작 입력 길이' if unit=='turn' else '입력 길이');self.cache_band.setAccessibleName('시작 입력 캐시율' if unit=='turn' else '입력 캐시율')
+        self.band.setAccessibleName('시작 입력 길이' if unit=='turn' else '입력 길이');self.cache_band.setAccessibleName('시작 캐시 적중률' if unit=='turn' else '캐시 적중률')
         self.restoring=False;self.render()
 
     def sync_comparison_labels(self):
@@ -924,8 +924,8 @@ class Dashboard(TrayWindow):
         self.method.setEnabled(not weighted)
         request=self.unit.currentData()=='turn'
         self.band.setItemText(0,'전체 시작 입력 길이' if request else '전체 입력 길이')
-        self.cache_band.setItemText(0,'전체 시작 입력 캐시율' if request else '전체 입력 캐시율')
-        self.matrix_by.setItemText(0,'시작 입력 길이' if request else '입력 길이');self.matrix_by.setItemText(1,'시작 입력 캐시율' if request else '입력 캐시율')
+        self.cache_band.setItemText(0,'전체 시작 캐시 적중률' if request else '전체 캐시 적중률')
+        self.matrix_by.setItemText(0,'시작 입력 길이' if request else '입력 길이');self.matrix_by.setItemText(1,'시작 캐시 적중률' if request else '캐시 적중률')
 
     def render_comparison(self,*_):
         if self.restoring or not self.view_result or self.current_page!=1:return
@@ -1011,8 +1011,8 @@ class Dashboard(TrayWindow):
 
     def select_scatter(self,records,title):
         pieces=['소요시간 '+value_text(stats(records,'duration')['mean'],'duration'),
-                '입력 '+number(stats(records,'input')['mean'],1),'출력·추론 포함 '+number(stats(records,'output')['mean'],1),
-                '입력 캐시율 '+value_text(stats(records,'rate')['value'],'cache_ratio')]
+                '입력 '+number(stats(records,'input')['mean'],1),'출력 '+number(stats(records,'output')['mean'],1),
+                '캐시 적중률 '+value_text(stats(records,'rate')['value'],'cache_ratio')]
         for key,name in (('cwd','프로젝트'),('source','작업 종류')):
             values={str(r.get(key) or r.get('project') or '미확인') for r in records}
             pieces.append(name+' · '+(next(iter(values)) if len(values)==1 else str(len(values))+'개'))
@@ -1057,8 +1057,8 @@ class Dashboard(TrayWindow):
             if not group['calls'] or show_keys is not None and key not in show_keys:continue
             source={'user':'직접 작업','subagent':'하위 에이전트','guardian_review':'내부 검토'}.get(session.get('source'),'기타')
             if group['descendants']:source+=f" · 하위 {group['descendants']}"
-            records.append(dict(home=key[0],sid=key[1],title=session.get('title') or '제목 없음',
-                project=session.get('project_name') or Path(session.get('cwd','')).name or '프로젝트 없음',
+            records.append(dict(home=key[0],sid=key[1],title=Verbatim(session['title']) if session.get('title') else '제목 없음',
+                project=Verbatim(session.get('project_name') or Path(session.get('cwd','')).name) if session.get('project_name') or session.get('cwd') else '프로젝트 없음',
                 source=source,cost=group['cost'],own_cost=group['own_cost'],child_cost=group['child_cost'],
                 descendants=group['descendants'],partial=group['partial'],known=group['priced'],
                 calls=group['calls'],cache_ratio=group['cache_ratio'],ts=group['latest_ts']))
@@ -1080,7 +1080,7 @@ class Dashboard(TrayWindow):
             if unlinked:records.append(dict(home=self.selected_session[0],sid=self.selected_session[1],turn='__unlinked__',state='요청 미연결',responses=len(unlinked),cost=sum_cost(unlinked)['cost'],ts=max(r['ts'] for r in unlinked)))
             sorting=self.sort.currentData();key='cost' if sorting.startswith('cost') else 'ts'
             records.sort(key=lambda r:(r.get(key) is None,-r[key] if sorting.endswith('desc') and isinstance(r.get(key),(int,float)) else r.get(key,0)))
-            headers=['요청 시작','상태','호출 수','API 환산액'];widths=[175,150,90,130]
+            headers=['요청 시작','상태','호출 수','비용'];widths=[175,150,90,130]
             formatter=lambda r,c,role:[date_time(r.get('started_at')),r.get('state') or '완료 기록 없음',number(r.get('responses')),usd(r.get('cost'))][c]
             selected=next((i for i,r in enumerate(records) if r.get('turn')==self.selected_turn),-1)
             self.record_parent_title.setText('요청');self.parent_table.put(rowHeight=40,leftColumns=[0,1])
@@ -1091,8 +1091,8 @@ class Dashboard(TrayWindow):
             filters=[k for k,n in self.call_filter_controls.items() if n.isChecked()]+list((self.temporary_context or {}).get('filters',[]))
             if filters:rows=[r for r in rows if any(self.matches_call_filter(r,key) for key in filters)]
             records=self.session_records(rows,matching)
-            headers=['세션 · 프로젝트','세션 비용 · 하위 포함','산정 / 전체 호출','최근 기록'];widths=[260,170,140,175]
-            formatter=lambda r,c,role:[r['title']+'\n'+r['project']+' · '+r['source'],('확인분 ' if r['partial'] and r['cost'] is not None else '')+usd(r['cost']),f"{r['known']:,} / {r['calls']:,}",date_time(r['ts'])][c]
+            headers=['세션 · 프로젝트','비용 · 하위 포함','산정 / 전체 호출','최근 기록'];widths=[260,170,140,175]
+            formatter=lambda r,c,role:[Verbatim(tr(r['title'])+'\n'+tr(r['project'])+' · '+tr(r['source'])),('확인분 ' if r['partial'] and r['cost'] is not None else '')+usd(r['cost']),f"{r['known']:,} / {r['calls']:,}",date_time(r['ts'])][c]
             selected=next((i for i,r in enumerate(records) if (r['home'],r['sid'])==self.selected_session),-1)
             self.record_parent_title.setText('세션');self.parent_table.put(rowHeight=60,leftColumns=[0,3])
         pair=self.parent_kind+'/'+self.record_view
@@ -1159,28 +1159,29 @@ class Dashboard(TrayWindow):
         self.restoring=False
         if not session:self.session_scope.setText('')
         residual=(session or {}).get('unclassified');self.residual_details.setVisible(bool(residual))
-        if residual:self.residual_details.set_sections([('별도 누계', ' · '.join(f'{name} {number(residual.get(key))}' for key,name in (('input','입력'),('cached','캐시 읽기'),('written','캐시 쓰기'),('output','출력'),('reasoning','추론'),('total','총 토큰')))),('집계','호출·요청 통계에 포함하지 않음')])
+        if residual:self.residual_details.set_sections([('별도 누계', ' · '.join(f'{name} {number(residual.get(key))}' for key,name in (('input','입력'),('cached','캐시 읽기'),('written','캐시 쓰기'),('output','출력'),('reasoning','추론'),('total','Total')))),('집계','호출·요청 통계에 포함하지 않음')])
         if session:
             group=session_costs(self.analysis['sessions'],own_costs(scope_rows))[self.selected_session]
             cost=('확인분 ' if group['partial'] and group['cost'] is not None else '')+usd(group['cost'])
             detail=(f" · 자체 {usd(group['own_cost'])} + 하위 {usd(group['child_cost'])}"
                     if group['descendants'] else '')
-            self.session_scope.setText(f"{session.get('project_name') or Path(session.get('cwd','')).name or '프로젝트 없음'} · {self.period.currentText() if not ctx else '전체 기록'}\n세션 비용 {cost}{detail} · 산정 {group['priced']:,}/{group['calls']:,}호출")
+            project=session.get('project_name') or Path(session.get('cwd','')).name or tr('프로젝트 없음')
+            self.session_scope.setText(Verbatim(project+' · '+tr(self.period.currentText() if not ctx else '전체 기록')+'\n'+tr(f"비용 {cost}{detail} · 산정 {group['priced']:,}/{group['calls']:,}호출")))
         if self.record_view=='sessions':
             records=self.session_records(rows,matching)
-            headers=['세션명','프로젝트','작업 종류','세션 비용 · 하위 포함','산정 / 전체 호출','입력 캐시율','최근 기록 시각'];self.table.put(leftColumns=[0,1,2,6])
+            headers=['세션명','프로젝트','작업 종류','비용 · 하위 포함','산정 / 전체 호출','캐시 적중률','최근 기록 시각'];self.table.put(leftColumns=[0,1,2,6])
             formatter=lambda r,c,role:[r['title'],r['project'],r['source'],('확인분 ' if r['partial'] and r['cost'] is not None else '')+usd(r['cost']),f"{r['known']:,} / {r['calls']:,}",value_text(r['cache_ratio'],'cache_ratio'),date_time(r['ts'])][c]
             widths=[270,220,130,170,140,120,175]
             if self.width()-248<1000:
-                headers=['세션명 · 프로젝트 · 작업 종류','세션 비용 · 하위 포함','산정 / 전체 호출','최근 기록 시각'];widths=[310,190,140,175];self.table.put(rowHeight=60,leftColumns=[0,3])
-                formatter=lambda r,c,role:[r['title']+'\n'+r['project']+' · '+r['source'],('확인분 ' if r['partial'] and r['cost'] is not None else '')+usd(r['cost']),f"{r['known']:,} / {r['calls']:,}",date_time(r['ts'])][c]
+                headers=['세션명 · 프로젝트 · 작업 종류','비용 · 하위 포함','산정 / 전체 호출','최근 기록 시각'];widths=[310,190,140,175];self.table.put(rowHeight=60,leftColumns=[0,3])
+                formatter=lambda r,c,role:[Verbatim(tr(r['title'])+'\n'+tr(r['project'])+' · '+tr(r['source'])),('확인분 ' if r['partial'] and r['cost'] is not None else '')+usd(r['cost']),f"{r['known']:,} / {r['calls']:,}",date_time(r['ts'])][c]
             else:self.table.put(rowHeight=40)
         elif self.record_view=='requests':
             visible_turns={r.get('turn') for r in rows}
             records=[dict(t) for t in self.lookup['session_turns'].get(self.selected_session,[]) if t.get('turn') in visible_turns]
             unlinked=[r for r in rows if not r.get('turn')]
             if unlinked:records.append(dict(home=self.selected_session[0],sid=self.selected_session[1],turn='__unlinked__',state=f'요청 미연결 {len(unlinked):,}호출',responses=len(unlinked),cost=sum_cost(unlinked)['cost'],ts=max(r['ts'] for r in unlinked)))
-            headers=['요청 시작','완료 시각','상태','선택 / 전체 호출','API 환산액'];widths=[175,175,160,140,160];self.table.put(leftColumns=[0,1,2],rowHeight=40)
+            headers=['요청 시작','완료 시각','상태','선택 / 전체 호출','비용'];widths=[175,175,160,140,160];self.table.put(leftColumns=[0,1,2],rowHeight=40)
             def formatter(r,c,role):
                 whole=r.get('total_responses',r.get('responses',0))
                 return [date_time(r.get('started_at')),date_time(r.get('ended_at')),r.get('state') or '완료 기록 없음',f"{r.get('responses',0):,} / {whole:,}",usd(r.get('cost'))][c]
@@ -1199,7 +1200,7 @@ class Dashboard(TrayWindow):
         if headers!=self.table.model().headers:
             self.table.setHorizontalHeaderLabels(headers)
             for i,width in enumerate(widths):self.table.setColumnWidth(i,width)
-        numeric={'세션 비용 · 하위 포함','API 환산액','호출 수','산정 / 전체 호출','입력 캐시율','선택 / 전체 호출','입력','캐시 읽기','캐시 쓰기','출력·추론 포함','추론','평균 출력 속도'}
+        numeric={'비용 · 하위 포함','비용','호출 수','산정 / 전체 호출','캐시 적중률','선택 / 전체 호출','입력','캐시 읽기','캐시 쓰기','출력','추론','추론 외','평균 출력 속도'}
         self.table.put(noElideColumns=[i for i,title in enumerate(headers) if title in numeric])
         self.record_rows=records;self.table.set_rows(records,formatter)
         self.render_record_parent(scope_rows)
@@ -1236,7 +1237,7 @@ class Dashboard(TrayWindow):
         if key=='service_tier':return request_tier(row) if recorded(request_tier(row)) else '—'
         if key=='transport':return observed_transport(row) or ('동시간대 통신 로그: '+value if value in ('WebSocket','HTTP/SSE') and row.get('transport_source')!='conflict' else '—')
         if key in ('input','cached','written','output','reasoning'):return number(value)
-        return str(value) if recorded(value) else '—'
+        return Verbatim(value) if recorded(value) else '—'
 
     def activate_record(self,index,*_):
         if not 0<=index<len(self.record_rows):return
@@ -1296,14 +1297,15 @@ class Dashboard(TrayWindow):
 
     def render_record_detail(self,row):
         from .core import token_parts
-        def entries(values):
-            return '\n'.join(f'{name}  {value}' for name,value in values if recorded(value))
+        def entries(values, literal=False):
+            text='\n'.join(f'{tr(name) if literal else name}  {value}' for name,value in values if recorded(value))
+            return Verbatim(text) if literal else text
         section={key:'' for key in self.detail_sections}
         section['identity']=entries([('작업',row.get('title')),('프로젝트',row.get('project_name')),
             ('기록 시각',date_time(row['ts']) if row.get('ts') is not None else None),
-            ('세션 ID',row.get('sid')),('요청 ID',row.get('turn')),('호출 ID',call_id(row))])
+            ('세션 ID',row.get('sid')),('요청 ID',row.get('turn')),('호출 ID',call_id(row))],literal=True)
         parent=next((session for session in self.snapshot.get('sessions',[]) if session['id']==row.get('parent_thread_id') and session['home']==row['home']),None)
-        if parent:section['identity']+='\n상위 작업  '+parent['title']
+        if parent:section['identity']=Verbatim(section['identity']+'\n'+tr('상위 작업')+'  '+parent['title'])
         mode=request_tier(row)
         mode_source={'applied_settings':'당시 적용 설정','turn_context':'로컬 턴 기록','wire':'실제 요청'}.get(row.get('request_mode_source'))
         conditions=[('요청 모델',row.get('model')),('추론 설정',row.get('effort')),
@@ -1320,20 +1322,20 @@ class Dashboard(TrayWindow):
         for chart,key in ((self.input_composition,'input'),(self.output_composition,'output')):
             chart.setVisible(parts[key].get('total') is not None)
             chart.set_parts(parts[key])
-        lines=[entries([('전체 입력',number(row['input']) if row.get('input') is not None else None),
-            ('전체 출력·추론 포함',number(row['output']) if row.get('output') is not None else None),
-            ('입력 캐시율',value_text(cache_ratio(row),'cache_ratio') if cache_ratio(row) is not None else None)])]
+        lines=[entries([('입력',number(row['input']) if row.get('input') is not None else None),
+            ('출력',number(row['output']) if row.get('output') is not None else None),
+            ('캐시 적중률',value_text(cache_ratio(row),'cache_ratio') if cache_ratio(row) is not None else None)])]
         if row.get('reported_total') is not None and row['reported_total']!=row.get('total'):lines.append(f"총량 관측 차이 · 보고 총량 {number(row['reported_total'])}")
         section['usage']='\n'.join(lines)
         section['usage']+='\n평균 출력 속도  '+(value_text(row['output_speed'],'output_speed') if row.get('output_speed') is not None else '측정 불가')
         if row.get('output_speed') is not None:
-            section['time']=entries([('호출 소요시간',value_text(row.get('duration'),'duration'))])+'\n출력·추론 포함 / 요청부터 완료까지 · 대기·통신 포함'
+            section['time']=entries([('호출 소요시간',value_text(row.get('duration'),'duration'))])+'\n출력 / 요청부터 완료까지 · 대기·통신 포함'
         price_model=row.get('price_model',row.get('model'));rate=(FAST_RATES if request_tier(row)=='Fast' else RATES if request_tier(row)=='Standard' else {}).get(price_model)
         lines=[VERIFIED+' 기준 · API 단가 환산',entries([('가격 모델',price_model)])]
         if rate:
-            for label_,tokens,price in [('일반 입력',row.get('ordinary_input'),rate.input),('캐시 읽기',row.get('cached'),rate.cached),('캐시 쓰기',row.get('written'),rate.written if rate.written is not None else rate.input),('출력·추론 포함',row.get('output'),rate.output)]:
+            for label_,tokens,price in [('일반 입력',row.get('ordinary_input'),rate.input),('캐시 읽기',row.get('cached'),rate.cached),('캐시 쓰기',row.get('written'),rate.written if rate.written is not None else rate.input),('출력',row.get('output'),rate.output)]:
                 if tokens is not None and price is not None:lines.append(f'{label_}  {number(tokens)} × {usd(price)} / 1,000,000')
-        if row.get('cost') is not None:lines.append('API 환산액  '+usd(row['cost']))
+        if row.get('cost') is not None:lines.append('비용  '+usd(row['cost']))
         else:lines=['환산 제외 · '+price_reason(row)]
         section['pricing']='\n'.join(x for x in lines if x)
         section['evidence']='\n'.join(record_issues(row))
@@ -1359,7 +1361,7 @@ class Dashboard(TrayWindow):
         segment=event.get('segment',());names=('분석 모델','추론 설정','요청 모드','캐시 정책')
         self.detail_sections['conditions'][1].setText('\n'.join(f'{name}  {value}' for name,value in zip(names,segment) if recorded(value)))
         fields=[]
-        fields.append('기준 입력 캐시율  '+value_text(event.get('baseline_rate',0)*100,'cache_ratio'))
+        fields.append('기준 캐시 적중률  '+value_text(event.get('baseline_rate',0)*100,'cache_ratio'))
         fields.append('기준 캐시 읽기 평균  '+number(event.get('baseline_read'),1))
         for label_,keys in [('기준 호출',event.get('baseline_keys',[])),('발생 호출',event.get('occurrence_keys',[])),('회복 호출',event.get('recovery_keys',[]))]:
             if not keys:continue

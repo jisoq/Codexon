@@ -56,7 +56,7 @@ Rectangle {
                 Layout.fillWidth: true
                 spacing: 10
                 Text {
-                    text: modelData.label
+                    text: appLanguage.text(modelData.label)
                     font.family: appTheme.family; font.pixelSize: 13
                     color: appTheme.palette[modelData.color] || appTheme.palette.ink
                     wrapMode: Text.Wrap; Layout.fillWidth: true
@@ -71,8 +71,27 @@ Rectangle {
                 }
             }
         }
+        RowLayout {
+            visible: !!card.plot.detail.completed
+            Layout.fillWidth: true
+            spacing: 10
+            Text {
+                text: appLanguage.text(card.plot.detail.completed ? card.plot.detail.completed.label : "")
+                font.family: appTheme.family; font.pixelSize: 12
+                color: appTheme.palette.muted
+                wrapMode: Text.Wrap; Layout.fillWidth: true
+            }
+            Text {
+                objectName: "quotaCompletedCost"
+                text: card.plot.detail.completed ? card.plot.detail.completed.value : ""
+                font.family: appTheme.family; font.pixelSize: 12
+                color: appTheme.palette.muted
+                wrapMode: Text.Wrap; horizontalAlignment: Text.AlignRight
+                Layout.maximumWidth: card.availableWidth * 0.57
+            }
+        }
         Text {
-            text: card.plot.detail.note || ""
+            text: appLanguage.text(card.plot.detail.note || "")
             visible: text.length > 0
             Layout.fillWidth: true
             wrapMode: Text.Wrap

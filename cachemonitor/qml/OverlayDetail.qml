@@ -9,6 +9,8 @@ Rectangle {
     property real unitScale: s.overlayScale || 1
     property string selectedCall: s.detailSelected || ""
     onSelectedCallChanged: if (bodyScroll) bodyScroll.contentY = 0
+    property bool speedOpen: s.detailSpeedOpen || false
+    onSpeedOpenChanged: if (bodyScroll) bodyScroll.contentY = 0
     color: "#01000000"
     clip: true
     Keys.onEscapePressed: event => { root.presentation.escapePanel(); event.accepted = true; }
@@ -94,14 +96,23 @@ Rectangle {
                 id: evidenceLink
                 required property var modelData
                 objectName: "evidence-" + modelData.id
-                x: Math.max(0, modelData.x - 4) * root.unitScale
-                y: (modelData.y - 4) * root.unitScale
+                x: Math.max(0, modelData.x - (modelData.formula ? 0 : 4)) * root.unitScale
+                y: (modelData.y - (modelData.formula ? 0 : 4)) * root.unitScale
                 width: Math.min(bodyScroll.width, modelData.width * root.unitScale)
-                height: (modelData.height + 8) * root.unitScale
+                height: (modelData.height + (modelData.formula ? 0 : 8)) * root.unitScale
                 activeFocusOnTab: true
-                Accessible.role: Accessible.Link; Accessible.name: modelData.accessible
-                Accessible.onPressAction: root.presentation.keyboardActivate(modelData.id)
-                Keys.onReturnPressed: root.presentation.keyboardActivate(modelData.id)
+                function activate() {
+                    if (modelData.formula) {
+                        const point = evidenceLink.mapToItem(null, 0, height);
+                        root.presentation.showCalculation(modelData.id, point.x, point.y);
+                    } else root.presentation.keyboardActivate(modelData.id);
+                }
+                Accessible.role: modelData.formula ? Accessible.Button : Accessible.Link
+                Accessible.name: appLanguage.text(modelData.accessible)
+                Accessible.onPressAction: activate()
+                Keys.onReturnPressed: activate()
+                Keys.onEnterPressed: activate()
+                Keys.onSpacePressed: activate()
                 Rectangle {
                     x: 4 * root.unitScale; y: parent.height - 4 * root.unitScale
                     width: parent.width - 8 * root.unitScale; height: root.unitScale
@@ -113,7 +124,10 @@ Rectangle {
                     id: evidencePointer
                     anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
                     onPressed: root.presentation.captureNavigation(evidenceLink.modelData.id)
-                    onClicked: root.presentation.activateNavigation()
+                    onClicked: {
+                        if (evidenceLink.modelData.formula) evidenceLink.activate();
+                        else root.presentation.activateNavigation();
+                    }
                 }
             }
         }

@@ -51,6 +51,74 @@ def test_interrupted_activation_is_recovered_before_next_attempt(tmp_path,monkey
     transaction.commit()
 
 
+@pytest.mark.parametrize('startup,fail_write',[
+    (None,False),('',False),('"C:\\Python\\pythonw.exe" run.py --hidden',False),
+    ('"C:\\old folder\\Codexon.exe" --hidden --codex-home "C:\\first home" --codex-home C:\\second',False),
+    ('"C:\\old folder\\Codexon.exe" --hidden --codex-home "C:\\first home" --codex-home C:\\second',True),
+])
+def test_update_retargets_login_startup_and_rolls_back_unconfirmed_write(tmp_path,monkeypatch,startup,fail_write):
+    """Exercise the production activation path using disposable real registry keys."""
+    import uuid
+    import winreg
+    from cachemonitor import launch_context
+    key_path=r'Software\Codexon-Test-'+uuid.uuid4().hex
+    startup_path=key_path+r'\Run'
+    approved_path=key_path+r'\StartupApproved'
+    product,recovery=fixture(tmp_path)
+    receipt=tmp_path/'installation.json';receipt.write_bytes(b'{"product":"old"}')
+    link=tmp_path/'menu.lnk';link.write_bytes(b'old shortcut')
+    monkeypatch.setattr(install,'KEY',key_path)
+    monkeypatch.setattr(install,'STARTUP_KEY',startup_path)
+    slots=[(key_path,name) for name in ('InstallRoot','AppPath','RecoveryPath')]+[(startup_path,'CacheMonitor')]
+    monkeypatch.setattr(activation,'registry_slots',lambda isolated:slots)
+    monkeypatch.setattr(activation,'shortcuts',lambda isolated:[link])
+    monkeypatch.setattr(activation,'publish_shell',lambda *a,**k:link.write_bytes(b'new shortcut'))
+    monkeypatch.setattr(launch_context,'preference_path',lambda:tmp_path/'launch.json')
+    monkeypatch.setattr(launch_context,'running_homes',lambda root:[])
+    def run(command,**kwargs):
+        Path(command[-1]).write_text(json.dumps(dict(errors=[],version='test',phase='off')))
+        return subprocess.CompletedProcess(command,0)
+    monkeypatch.setattr(install.subprocess,'run',run)
+    original_write=winreg.SetValueEx
+    def write(key,name,reserved,kind,value):
+        if fail_write and name=='CacheMonitor' and str(product) in value:return
+        original_write(key,name,reserved,kind,value)
+    disabled=bytes([3,0,0,0])+bytes(8)
+    try:
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER,key_path) as key:
+            for name in ('InstallRoot','AppPath','RecoveryPath'):
+                winreg.SetValueEx(key,name,0,winreg.REG_SZ,'old '+name)
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER,startup_path) as key:
+            if startup is not None:winreg.SetValueEx(key,'CacheMonitor',0,winreg.REG_SZ,startup)
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER,approved_path) as key:
+            winreg.SetValueEx(key,'CacheMonitor',0,winreg.REG_BINARY,disabled)
+        before=activation.snapshot_registry(False)
+        monkeypatch.setattr(winreg,'SetValueEx',write)
+        if fail_write:
+            with pytest.raises(OSError,match='로그인 시 시작'):
+                install.finish(tmp_path,product,recovery,launch=False)
+            assert activation.snapshot_registry(False)==before
+            assert receipt.read_bytes()==b'{"product":"old"}' and link.read_bytes()==b'old shortcut'
+        else:
+            install.finish(tmp_path,product,recovery,launch=False)
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,startup_path) as key:
+                if startup is None:
+                    with pytest.raises(FileNotFoundError):winreg.QueryValueEx(key,'CacheMonitor')
+                else:
+                    expected=(subprocess.list2cmdline([str(product/'Codexon.exe')])+
+                              ' --hidden --codex-home "C:\\first home" --codex-home C:\\second'
+                              if 'Codexon.exe' in startup else startup)
+                    assert winreg.QueryValueEx(key,'CacheMonitor')==(expected,winreg.REG_SZ)
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,key_path) as key:
+                assert winreg.QueryValueEx(key,'AppPath')[0]==str(product/'Codexon.exe')
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,approved_path) as key:
+            assert winreg.QueryValueEx(key,'CacheMonitor')==(disabled,winreg.REG_BINARY)
+        assert not (tmp_path/'activation-pending.json').exists()
+    finally:
+        for path in (startup_path,approved_path,key_path):
+            winreg.DeleteKey(winreg.HKEY_CURRENT_USER,path)
+
+
 def test_custom_homes_survive_restart_without_login_startup(tmp_path,monkeypatch):
     path=tmp_path/'launch.json';homes=[str(tmp_path/'Work Home'),str(tmp_path/'Second Home')]
     command=subprocess.list2cmdline(['C:/old/Codexon.exe','--codex-home',homes[0],'--codex-home',homes[1]])

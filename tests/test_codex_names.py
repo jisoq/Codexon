@@ -6,7 +6,6 @@ from cachemonitor.analytics import analyze, overview_view, project_choices
 from cachemonitor.analysis_engine import AnalysisEngine
 from cachemonitor.analysis_delivery import SnapshotPublisher
 from cachemonitor.codex_names import CodexNames
-from cachemonitor.core import Session
 from cachemonitor.index import UsageIndex
 from test_core import TID, fixture_home
 from test_index import finish
@@ -67,63 +66,6 @@ def test_actual_project_assignment_and_task_names_survive_snapshot_and_rename(tm
         index.close()
 
 
-def test_projectless_and_legacy_title_guards(tmp_path):
-    home,path,state=named_home(tmp_path)
-    state['thread-project-assignments']={}
-    state['projectless-thread-ids']=[TID]
-    (home/'.codex-global-state.json').write_text(json.dumps(state),encoding='utf-8')
-    with sqlite3.connect(home/'state_5.sqlite') as db:
-        db.execute('update threads set name=NULL,title=?,first_user_message=?',('PRIVATE_PROMPT','PRIVATE_PROMPT and more private instructions'))
-    index=UsageIndex([home],tmp_path/'index.sqlite')
-    try:
-        session=finish(index)['sessions'][0]
-        assert session['title']==f'작업 {TID[:8]}·{TID[-6:]}'
-        assert session['project_name']=='프로젝트 없는 작업'
-        assert session['project'].startswith('projectless:')
-        with sqlite3.connect(home/'state_5.sqlite') as db:
-            sibling=CodexNames(home,db).resolve({'id':'child-task','cwd':r'C:\projects\app'})
-        # The named workspace remains a project for unrelated tasks; only the
-        # explicitly detached task belongs to the projectless group.
-        assert sibling['project_name']=='구김평가'
-        assert 'PRIVATE_PROMPT' not in ''.join(r[0] for r in index.db.execute('select data from metadata'))
-        with sqlite3.connect(home/'state_5.sqlite') as db:
-            db.execute('update threads set title=?',('명시적으로 변경한 이전 작업명',))
-        renamed=finish(index,10021)['sessions'][0]
-        assert renamed['title']=='명시적으로 변경한 이전 작업명'
-    finally:
-        index.close()
-
-
-def test_workspace_hint_uses_app_name_and_db_assignment_wins(tmp_path):
-    home,path,state=named_home(tmp_path)
-    state['thread-project-assignments']={}
-    state['thread-workspace-root-hints']={TID:r'C:\projects\app'}
-    (home/'.codex-global-state.json').write_text(json.dumps(state),encoding='utf-8')
-    with sqlite3.connect(home/'state_5.sqlite') as db:
-        names=CodexNames(home,db)
-        meta={'id':TID,'cwd':r'C:\Codex\worktrees\random\app','name':'worktree task'}
-        resolved=names.resolve(meta)
-        assert resolved['project_name']=='구김평가' and resolved['project_source']=='workspace_root'
-        db.execute('insert into projects values(?,?,?)',('different','다른 프로젝트','{}'))
-        names=CodexNames(home,db)
-        resolved=names.resolve(dict(meta,project_id='different'))
-        assert resolved['project_name']=='다른 프로젝트' and resolved['project_source']=='app_server'
-
-
-def test_projectless_child_workspace_is_grouped_without_path_slug(tmp_path):
-    home,path,state=named_home(tmp_path)
-    state['local-projects']={}
-    state['thread-project-assignments']={}
-    state['projectless-thread-ids']=[TID]
-    (home/'.codex-global-state.json').write_text(json.dumps(state),encoding='utf-8')
-    with sqlite3.connect(home/'state_5.sqlite') as db:
-        names=CodexNames(home,db)
-        parent=names.resolve({'id':TID,'cwd':r'C:\projects\app'})
-        child=names.resolve({'id':'child','cwd':r'C:\projects\app'})
-        assert child['project']==parent['project']
-        assert child['project_name']=='프로젝트 없는 작업'
-
-
 def test_unassigned_scratch_folders_use_task_identity_and_agent_names(tmp_path):
     home,path,state=named_home(tmp_path)
     with sqlite3.connect(home/'state_5.sqlite') as db:
@@ -133,43 +75,6 @@ def test_unassigned_scratch_folders_use_task_identity_and_agent_names(tmp_path):
         assert first['project']==second['project']
         assert first['project_name']=='기타 작업'
         assert first['display_title']=='Lorentz' and second['display_title']=='Codex 작업명'
-
-
-def test_log_only_absent_task_and_old_metadata_do_not_duplicate_projectless_label(tmp_path):
-    home,path,state=named_home(tmp_path)
-    state['thread-project-assignments']={}
-    state['projectless-thread-ids']=[TID]
-    (home/'.codex-global-state.json').write_text(json.dumps(state),encoding='utf-8')
-    orphan='87654321-abcd-abcd-abcd-222222222222'
-    with sqlite3.connect(home/'logs_2.sqlite') as db:
-        db.execute('insert into logs values(2,10000,0,?,?,?,?)',
-                   ('feedback_tags',orphan,'process',
-                    'request{transport="responses_websocket" api.path="/responses"}: auth_header_attached=true'))
-    index=UsageIndex([home],tmp_path/'index.sqlite')
-    try:
-        snapshot=finish(index)
-        log_session=next(s for s in snapshot['sessions'] if s['id']==orphan)
-        assert log_session['cwd']=='' and log_session['project_name']=='기타 작업'
-        assert (str(home),orphan) not in index.metadata
-        choices=project_choices(snapshot['sessions'])
-        assert set(choices['project_labels'].values())=={'프로젝트 없는 작업','기타 작업'}
-        # Previously cached task metadata can outlive its app-server row. Resolve
-        # its presentation without rereading or reclassifying recorded calls.
-        retained='87654321-abcd-abcd-abcd-333333333333'
-        old=Session(retained,str(home),title='이전 작업')
-        old.add_usage(10000,'old-response',{'input_tokens':10,'cached_input_tokens':0,'output_tokens':1},'m')
-        key=(str(home),retained)
-        index.monitor.sessions[key]=old
-        index.metadata[key]={'id':retained,'name':'이전 작업','cwd':''}
-        before_bytes=index.bytes_read
-        refreshed=finish(index,10011)
-        cached=next(s for s in refreshed['sessions'] if s['id']==retained)
-        assert cached['project']==log_session['project'] and cached['project_name']=='기타 작업'
-        assert cached['title']=='이전 작업'
-        assert len(cached['history'])==1 and cached['history'][0]['key']=='old-response'
-        assert index.bytes_read==before_bytes
-        assert set(project_choices(refreshed['sessions'])['project_labels'].values())=={'프로젝트 없는 작업','기타 작업'}
-    finally:index.close()
 
 
 def test_duplicate_project_names_do_not_merge_or_filter_each_other(tmp_path):

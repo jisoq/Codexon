@@ -1,5 +1,5 @@
 """Application preferences, with existing actions as the shared control surface."""
-from PySide6.QtCore import Qt, QSignalBlocker
+from PySide6.QtCore import Qt, QSignalBlocker, QTimer, Signal
 from .presentation import Button, Choice, Column, Group, Navigation, Row, Scroll, Slider, Stack, Text, Toggle
 from PySide6.QtWidgets import QApplication
 from .controls import Switch
@@ -7,6 +7,7 @@ from .i18n import tr
 
 
 class SettingsPage(Group):
+    restartRequested = Signal()
     TITLES = ('일반', '작업표시줄 위젯', '세션 오버레이', '프록시', '알림', '정보·문제 해결')
 
     def __init__(self, parent=None):
@@ -43,11 +44,22 @@ class SettingsPage(Group):
         tracking.setChecked(parent.settings.value('quota/trackingEnabled',True,type=bool))
         tracking.toggled.connect(parent.set_quota_tracking_enabled)
         self.add_row(0, '모양', '', self.choice('theme'))
-        language=self.choice('language')
-        self.add_row(0, '언어', '다음 실행부터 적용', language)
-        for title,value in (('한국어','ko'),('English','en')):language.addItem(title,value)
-        language.setCurrentIndex(max(0,language.findData(parent.settings.value('ui/language','ko'))))
-        language.currentIndexChanged.connect(lambda index: parent.settings.setValue('ui/language',language.itemData(index)))
+        language_choice=self.choice('language')
+        language_controls=Group();language_layout=Row(language_controls);language_layout.setContentsMargins(0,0,0,0);language_layout.setSpacing(8)
+        restart=Button('Codexon 재시작');restart.put(iconName='restart');restart.setFixedSize(32,32)
+        restart.setToolTip('Codexon 재시작');restart.setAccessibleName('Codexon 재시작')
+        self.controls['restart']=restart
+        language_layout.addWidget(language_choice);language_layout.addWidget(restart)
+        self.add_row(0, '언어', '다음 실행부터 적용', language_controls)
+        language_choice.setAccessibleName('언어')
+        for title,value in (('한국어','ko'),('English','en')):language_choice.addItem(title,value)
+        language_choice.setCurrentIndex(max(0,language_choice.findData(parent.settings.value('ui/language','ko'))))
+        def save_language(index):
+            parent.settings.setValue('ui/language',language_choice.itemData(index))
+            self.refresh_restart()
+        language_choice.currentIndexChanged.connect(save_language)
+        restart.clicked.connect(self.request_restart)
+        self.refresh_restart()
         import time
         from datetime import datetime
         from .i18n import language
@@ -65,6 +77,16 @@ class SettingsPage(Group):
         self.add_row(2, '위치', '제목을 끌어서 이동', self.controls['reset_position'])
         for key in ('startup', 'quota', 'widget', 'monitor', 'overlay', 'reset_position', 'theme'):
             self.controls[key].setEnabled(False)
+
+    def refresh_restart(self):
+        from .i18n import language
+        self.controls['restart'].setEnabled(self.owner.settings.value('ui/language','ko')!=language())
+
+    def request_restart(self):
+        self.owner.settings.sync()
+        self.controls['restart'].setEnabled(False)
+        self.restartRequested.emit()
+        QTimer.singleShot(30000,self.refresh_restart)
 
     def toggle(self, key):
         control = Switch(); control.setAccessibleName(key)

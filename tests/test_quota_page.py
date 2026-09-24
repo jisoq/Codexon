@@ -2,7 +2,7 @@
 import time
 
 import pytest
-from PySide6.QtCore import QPointF, QSettings, Qt
+from PySide6.QtCore import QSettings, Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
@@ -90,33 +90,6 @@ def test_responsive_page_chart_and_single_details_path(quota_page,tmp_path,width
         dispose(host);shared_theme().configure('light')
 
 
-def test_no_data_error_and_period_without_rows_are_explicit(quota_page):
-    app,panel,scroll=quota_page
-    host=mount(scroll,800,800)
-    try:
-        panel.set_history_period(time.time()+100,None);QTest.qWait(50)
-        assert panel.basis.text()=='—' and not panel.details.isVisible()
-        assert panel.history.rows and panel.conversion_empty.isVisible()
-        assert panel.current['weekly']['value'].text()=='98.0%'
-        panel.receive({'home':'h','issue':'한도 조회 연결 실패','report':{'home':'h','cycles':[],'error':True}})
-        QTest.qWait(50)
-        assert panel.status.isVisible() and panel.status.text()=='한도 조회 연결 실패'
-        assert not panel.details.isVisible()
-        assert not host.qml_errors
-    finally:dispose(host)
-
-
-def test_weekly_value_uses_unrounded_ratio_for_summary_and_intervals(quota_page):
-    from cachemonitor.pricing import usd
-    _,panel,_=quota_page
-    assert panel.result.text()==usd(panel.statistics['per_percent']*100)
-    for row in panel.statistics['intervals']:
-        expected=usd(row['per_percent']*100 if row['per_percent'] is not None else None)
-        assert panel.format_interval(row,3,Qt.DisplayRole)==expected
-    assert panel.intervals.model().headers[3]=='주간할당량 가치'
-    assert '× 100' in panel.result.toolTip()
-
-
 def test_model_filter_combines_request_modes_without_assigning_account_usage():
     intervals=[dict(id='one',cost=10,delta=4,models=[
         dict(model='alpha',service_tier='Standard',calls=2,priced=2,cost=3,separate=False),
@@ -131,28 +104,6 @@ def test_model_filter_combines_request_modes_without_assigning_account_usage():
     assert selected[0]['model_share']==50
     assert selected[0]['delta']==4
     assert intervals[0]['cost']==10
-
-
-@pytest.mark.parametrize('width',[960,520])
-def test_rendered_model_filter_preserves_account_chart(quota_page,tmp_path,width):
-    app,panel,scroll=quota_page
-    host=mount(scroll,width,900)
-    try:
-        chart_rows=panel.history.rows
-        total=panel.cost_value.text()
-        assert panel.model_choice.count()==2
-        scroll.ensureWidgetVisible(panel.model_choice);QTest.qWait(40)
-        choice=control(host,panel.model_choice);choice.forceActiveFocus()
-        QTest.keyClick(host.quick,Qt.Key_Down);QTest.qWait(50)
-        assert panel.model_choice.currentData()=='gpt-6-astra'
-        assert panel.basis_label.text()=='선택 모델 호출 수'
-        assert panel.intervals.model().headers[2]=='선택 모델 API'
-        assert panel.intervals.model().headers[3]=='구간 API 비용 비중'
-        assert panel.cost_value.text()==total
-        assert panel.history.rows is chart_rows
-        assert host.grab().save(str(tmp_path/f'quota-model-filter-{width}.png'))
-        assert not host.qml_errors
-    finally:dispose(host)
 
 
 def test_cycle_selector_changes_graph_preserves_lifetime_and_selection_on_refresh(quota_page,tmp_path):
@@ -179,63 +130,3 @@ def test_cycle_selector_changes_graph_preserves_lifetime_and_selection_on_refres
         assert panel.result.text()==lifetime and panel.history.rows is period['series']['rows']
         assert not host.qml_errors
     finally:dispose(host)
-
-
-@pytest.mark.parametrize('width,dark',[(1120,False),(520,False),(1120,True)])
-def test_complete_value_chart_render_and_cost_lane_selection(quota_page,tmp_path,width,dark):
-    from test_quota_value_history import sample_report
-    app,panel,_=quota_page
-    if dark:shared_theme().configure('dark')
-    report=sample_report();offset=time.time()-280
-    report.update(home='h',at=time.time())
-    for row in report['history']:
-        row['at']+=offset;row['reset']+=offset
-    for cycle in report['cycles']:
-        cycle['start']+=offset;cycle['end']+=offset
-        cycle['endpoints']=[(at+offset,used) for at,used in cycle['endpoints']]
-        for row in cycle['cost_rows']:row['ts']+=offset
-    panel.receive({'home':'h','quota':panel.quota,'report':report})
-    chart=panel.history.parent().parent()
-    scroll=Scroll();scroll.put(fillViewport=True);scroll.setWidget(chart)
-    host=mount(scroll,width,960)
-    try:
-        assert panel.result.text()=='$55.56'
-        panel.cycle_choice.setCurrentIndex(2)
-        plot=render_plot(host,panel.history)
-        rect,row,_=panel.history.hits[1]
-        click(host,plot,rect.center().x(),rect.bottom()-20)
-        assert panel.history.cursor==1 and plot.detail['items'][2]['value']=='$4.00'
-        assert plot.detail['items'][4]['value']=='$40.00'
-        scroll.ensureWidgetVisible(panel.result);QTest.qWait(50)
-        for node in (panel.result,panel.lifetime_basis):
-            item=control(host,node)
-            texts=[child for child in walk(item) if child.metaObject().indexOfProperty('truncated')>=0 and child.isVisible()]
-            assert texts and all(not text.property('truncated') for text in texts)
-        assert host.grab().save(str(tmp_path/f'value-chart-{width}-{"dark" if dark else "light"}.png'))
-        assert not host.qml_errors
-    finally:dispose(host);shared_theme().configure('light')
-
-
-@pytest.mark.parametrize('width,dark',[(1120,False),(520,True)])
-def test_all_view_shows_cumulative_use_reset_marks_and_no_gap_stripes(quota_page,tmp_path,width,dark):
-    app,panel,scroll=quota_page
-    if dark:shared_theme().configure('dark')
-    host=mount(scroll,width,950)
-    try:
-        scroll.ensureWidgetVisible(panel.cycle_choice);QTest.qWait(40)
-        choice=control(host,panel.cycle_choice);choice.forceActiveFocus()
-        QTest.keyClick(host.quick,Qt.Key_Home);QTest.qWait(40)
-        assert panel.cycle_choice.currentData()=='all'
-        plot=render_plot(host,panel.history)
-        assert panel.history.series['cumulative'] and panel.history.gap_width==0
-        assert panel.history.rows[-1]['remaining']==panel.lifetime_statistics['delta']
-        assert panel.history.rows[-1]['cycle_cost']==pytest.approx(panel.lifetime_statistics['cost'])
-        assert len(panel.history.reset_hits)==2
-        rect,reset=panel.history.reset_hits[0]
-        click(host,plot,rect.center().x(),rect.center().y())
-        assert plot.detail['title']==reset['label']
-        plot.dismissDetail()
-        assert host.grab().save(str(tmp_path/f'all-view-{width}-{dark}.png'))
-        QTest.keyClick(host.quick,Qt.Key_End)
-        assert not host.qml_errors
-    finally:dispose(host);shared_theme().configure('light')

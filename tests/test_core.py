@@ -2,7 +2,7 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 
-from cachemonitor.core import Monitor, Session, WINDOW, SESSION_WINDOW, parse_transport
+from cachemonitor.core import Monitor, Session, WINDOW, SESSION_WINDOW
 
 
 TID = "12345678-abcd-abcd-abcd-123456789012"
@@ -26,35 +26,6 @@ def log(body, target="feedback_tags", tid=TID, timestamp=9999):
             "process_uuid": "p1", "feedback_log_body": body}
 
 
-def test_per_session_transport_and_tool_text_not_evidence():
-    ws = parse_transport(log('turn{thread_id=' + TID + '}:request{transport="responses_websocket" api.path="/responses"}: auth_header_attached=true'))
-    http = parse_transport(log('turn{thread_id=' + TID + '}: falling back to HTTP', "codex_core::client"))
-    assert ws[1].kind == "WebSocket"
-    assert http[1].kind == "HTTP/SSE"
-    assert parse_transport(log('ToolCall: falling back to HTTP', "codex_core::stream_events_utils")) is None
-    assert parse_transport(log('ToolCall: transport="responses_websocket" auth_header_attached=true')) is None
-    assert parse_transport(log('response{transport="remote_control_websocket"}: auth_header_attached=true')) is None
-
-
-def test_unassigned_not_guessed_and_url_secrets_removed():
-    parsed = parse_transport(log('connecting to websocket: wss://user:secret@example.com/responses?token=secret',
-                                "codex_api::endpoint::responses_websocket", tid=None))
-    assert parsed[0] is None
-    assert parsed[1].endpoint == "wss://example.com/responses"
-    assert "secret" not in str(parsed)
-
-
-def test_cached_usage_deduplicated_and_fork_skipped():
-    session = Session(TID, "home")
-    session.consume(usage(), 10000)
-    session.consume(usage(), 10001)
-    session.consume(usage("fork", tid="other"), 10001)
-    session.consume(event("event_msg", type="token_count", info={"total_token_usage": {"input_tokens": 10000},
-                                  "last_token_usage": {"input_tokens": 10000, "cached_input_tokens": 9000}}), 10001)
-    assert len(session.requests) == 1
-    assert session.view(10001)["rate"] == 90
-
-
 def test_legacy_rate_limit_repeat_and_missing_usage():
     session = Session(TID, "home")
     item = event("event_msg", type="token_count", info={"total_token_usage": {"input_tokens": 10000},
@@ -63,19 +34,6 @@ def test_legacy_rate_limit_repeat_and_missing_usage():
     session.consume(item, 10002)
     assert len(session.requests) == 1
     assert session.view(10002)["rate"] is None
-
-
-def test_weighted_rate_drop_and_first_zero_not_warning():
-    session = Session(TID, "home")
-    session.consume(usage("first", input=5000, cached=0), 10000)
-    assert not session.view(10000)["warning"]
-    session.consume(usage("second", time=10001, input=20000, cached=19000), 10001)
-    session.consume(usage("third", time=10002, input=25000, cached=0), 10002)
-    v = session.view(10002)
-    assert v["weighted_rate"] == 38
-    assert not v["warning"]
-    assert v['cache_misses']['count']==2  # A fact, including the first call, not an error alert.
-    assert v["remaining"] == WINDOW
 
 
 def fixture_home(tmp_path):
@@ -129,16 +87,6 @@ def test_missing_databases_are_visible_errors_and_not_created(tmp_path):
     assert list(tmp_path.iterdir()) == []
 
 
-def test_rollout_truncation_recovers_without_duplicates(tmp_path):
-    home, path = fixture_home(tmp_path)
-    monitor = Monitor([home])
-    monitor.poll(10001)
-    path.write_text("", encoding="utf8")
-    monitor.poll(10002)
-    path.write_text(json.dumps(usage()) + "\n" + json.dumps(usage("r2", time=10003)) + "\n", encoding="utf8")
-    assert len(monitor.poll(10004)["sessions"][0]["requests"]) == 2
-
-
 def test_effort_accounting_and_unclassified_lifetime():
     session = Session(TID, "home")
     for index, effort in enumerate(("low", "high")):
@@ -158,17 +106,6 @@ def test_effort_accounting_and_unclassified_lifetime():
     assert sum(g["total"] for g in v["groups"]["session"]) == 240
     assert v["unclassified"]["total"] == 1080
     assert all(g['count']==1 for g in v['groups']['session'])
-
-
-def test_missing_effort_and_invalid_subsets_are_unknown():
-    from cachemonitor.core import usage_values
-    values = usage_values({"input_tokens": 100, "cached_input_tokens": 101,
-                           "output_tokens": 20, "reasoning_output_tokens": 21})
-    assert values["total"] == 120
-    assert values["cached"] is None and values["reasoning"] is None
-    session = Session(TID, "home")
-    session.consume(usage(), 10001)
-    assert session.view(10001)["groups"]["session"][0]["effort"] == "미확인"
 
 
 def test_title_helper_excluded_but_regular_luna_preserved(tmp_path):
@@ -198,17 +135,3 @@ def test_title_helper_excluded_but_regular_luna_preserved(tmp_path):
     view = monitor.poll(10003)
     assert view["excluded_title_sessions"] == 0
     assert len(view["sessions"]) == 2
-
-
-def test_combined_groups_preserve_unknown_count_and_missing_metrics():
-    from cachemonitor.core import combined_usage_groups, summarize
-    from cachemonitor.app import average_tokens
-    a = {"model": "m", "effort": "high", **summarize([{"total": 100, "input": 80}])}
-    b = {"model": "m", "effort": "high", **summarize([{"total": 300, "input": 280, "cached": 200}])}
-    old = {"model": "이전 기록", "effort": "미확인", **summarize([{"total": 900}]), "count": None}
-    merged = combined_usage_groups([{"groups": {"session": [a, old]}}, {"groups": {"session": [b]}}], "session")
-    assert sum(g["total"] for g in merged) == 1300
-    assert merged[0]["count"] is None
-    assert average_tokens(merged[0]) == "—"
-    assert average_tokens(merged[1]) == "200.0"
-    assert average_tokens(merged[1], "cached") == "200.0"

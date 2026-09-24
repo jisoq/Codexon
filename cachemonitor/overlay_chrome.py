@@ -1,7 +1,7 @@
 """Interactive companions for the otherwise click-through overlay."""
-from PySide6.QtCore import Qt, QObject, Property, Signal, Slot, QSignalBlocker, QEvent, QRect, QTimer
+from PySide6.QtCore import Qt, QObject, Property, Signal, Slot, QSignalBlocker, QEvent, QRect, QTimer, QPoint
 from PySide6.QtGui import QFont, QFontMetrics, QRegion
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QWidget, QLabel, QVBoxLayout
 from .overlay_appearance import default_appearance
 from .presentation import Node, Slider, Text
 from .quick_runtime import QuickHost
@@ -86,7 +86,23 @@ class OverlayHost(QuickHost):
 
     def hideEvent(self,event):
         self._cancel_keyboard_focus()
+        note=getattr(getattr(self,'view',None),'content',None)
+        note=getattr(note,'calculation_note',None)
+        if note and note.owner is self:note.hide()
         super().hideEvent(event)
+
+    def show_calculation(self,key,formula,x,y):
+        content=self.view.content
+        note=getattr(content,'calculation_note',None)
+        if note is None:
+            note=content.calculation_note=CalculationNote(content)
+        note.present(self,key,formula,self.quick.mapToGlobal(QPoint(round(x),round(y))))
+
+    def moveEvent(self,event):
+        content=getattr(getattr(self,'view',None),'content',None)
+        note=getattr(content,'calculation_note',None)
+        if note and note.owner is self:note.hide()
+        super().moveEvent(event)
 
 
 class OverlayChrome(OverlayHost):
@@ -278,13 +294,64 @@ class OverlayChrome(OverlayHost):
             event.accept()
 
 
+class CalculationNote(QWidget):
+    """One click-opened line shared by the monitor and its detail companion."""
+    def __init__(self,content):
+        super().__init__(None,Qt.Popup|Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_NoMouseReplay)
+        self.setWindowTitle('계산 방법');self.content=content;self.owner=None;self.key=None
+        self.setObjectName('calculationNote')
+        layout=QVBoxLayout(self);layout.setContentsMargins(10,7,10,7)
+        self.label=QLabel(self);self.label.setObjectName('calculationText')
+        self.label.setTextFormat(Qt.PlainText);self.label.setWordWrap(False)
+        layout.addWidget(self.label);content.changed.connect(self.refresh_scope)
+
+    def present(self,owner,key,formula,anchor):
+        if self.isVisible() and self.owner is owner and self.key==key:self.hide();return
+        from .overlay_view import palette, font
+        from .i18n import tr
+        self.owner=owner;self.key=key;self.scope=self.identity();appearance=self.content.appearance
+        colors=palette(appearance);size=round(12*appearance.scale)
+        text=tr(formula);self.label.setText(text)
+        self.setStyleSheet('QWidget#calculationNote { background: '+colors['surface'].name()+'; border: 1px solid '+colors['border'].name()+'; } '
+                          'QLabel { color: '+colors['ink'].name()+'; background: transparent; border: none; }')
+        self.setAccessibleName(text)
+        screen=QApplication.screenAt(anchor) or owner.screen();area=screen.availableGeometry()
+        metrics=QFontMetrics(font(appearance.family,size))
+        # Keep one readable line, including at the edge of a small display.
+        while metrics.horizontalAdvance(text)+24>area.width() and size>10:
+            size-=1;metrics=QFontMetrics(font(appearance.family,size))
+        self.label.setFont(font(appearance.family,size))
+        self.resize(min(area.width(),metrics.horizontalAdvance(text)+24),metrics.height()+18)
+        x=max(area.left(),min(anchor.x(),area.right()-self.width()+1))
+        y=anchor.y()+4
+        if y+self.height()>area.bottom()+1:y=anchor.y()-self.height()-22
+        self.move(x,max(area.top(),y));self.show()
+
+    def identity(self):
+        d=self.content.data or {}
+        return d.get('home'),d.get('id'),self.content.compact,self.content.detail_inline,self.content.appearance
+
+    def refresh_scope(self):
+        if self.isVisible() and self.scope!=self.identity():self.hide()
+
+    def keyPressEvent(self,event):
+        if event.key()==Qt.Key_Escape:self.hide();event.accept()
+        else:super().keyPressEvent(event)
+
 class NavigationModel(Node):
     navigationRequested=Signal(object)
+    calculationRequested=Signal(str,str,float,float)
     def __init__(self,content):
-        super().__init__();self.content=content;self.targets={};self.captured=None
+        super().__init__();self.content=content;self.targets={};self.formulas={};self.captured=None
     def link_state(self,links):
-        self.targets={link['id']:link['target'] for link in links}
+        self.targets={link['id']:link['target'] for link in links if link.get('target')}
+        self.formulas={link['id']:link['formula'] for link in links if link.get('formula')}
         return [{k:v for k,v in link.items() if k!='target'} for link in links]
+    @Slot(str,float,float)
+    def showCalculation(self,key,x,y):
+        formula=self.formulas.get(key)
+        if formula:self.calculationRequested.emit(key,formula,x,y)
     @Slot(str)
     def captureNavigation(self,key):self.captured=self.targets.get(key)
     @Slot()
@@ -337,6 +404,7 @@ class OverlayDetail(OverlayHost):
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.setFocusPolicy(Qt.StrongFocus)
         self.view = DetailModel(content)
+        self.view.calculationRequested.connect(self.show_calculation)
         self.view.escapeRequested.connect(self.escape)
         self.view.interactionRequested.connect(self.begin_interaction)
         self.set_scene(self.view, 'OverlayDetail.qml', transparent=True)
@@ -389,6 +457,7 @@ class OverlayLinks(OverlayHost):
         self.setWindowTitle('Cache Monitor · 기록 링크');self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.view=NavigationModel(content);self.wheel_forwarder=None
+        self.view.calculationRequested.connect(self.show_calculation)
         self.set_scene(self.view,'OverlayLinks.qml',transparent=True)
         self.quick.installEventFilter(self)
     def focus_control(self,name='monitorLinks'):
@@ -399,7 +468,8 @@ class OverlayLinks(OverlayHost):
     def sync(self):
         from .overlay_view import palette
         c=self.view.content;scale=c.appearance.scale;links=self.view.link_state(c.monitor_links())
-        self.view.put(links=links,scale=scale,accent=palette(c.appearance)['accent'].name())
+        self.view.put(links=links,scale=scale,accent=palette(c.appearance)['accent'].name(),
+                      warning=palette(c.appearance)['warning'].name())
         region=QRegion()
         for link in links:
             region|=QRegion(QRect(round(link['x']*scale),round(link['y']*scale),round(link['width']*scale),round(link['height']*scale)))

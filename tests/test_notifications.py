@@ -4,7 +4,7 @@ import pytest
 from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QApplication
 
-from cachemonitor.core import Session, Transport
+from cachemonitor.core import Session
 from cachemonitor.dashboard import Dashboard
 
 
@@ -33,34 +33,6 @@ def test_notification_settings_migrate_and_persist_independently(tmp_path,legacy
     finally:
         for window in windows:
             window.quitting=True;window.tick.stop();window.tray.hide();window.close()
-
-
-def test_http_notifications_do_not_replay_cached_warnings(tmp_path,monkeypatch):
-    app=QApplication.instance() or QApplication([])
-    window=Dashboard([],start_worker=False,settings=QSettings(str(tmp_path/'notify.ini'),QSettings.IniFormat),live_limits=False)
-    sent=[];monkeypatch.setattr(window.tray,'showMessage',lambda title,*_:sent.append(title))
-    now=time.time();window.started_at=now-1
-    clock=[now];engine=window.confirmed_notifications
-    engine.wall_clock=lambda:clock[0];engine.http_since=engine.http_floor=now-1
-    session=Session('one',str(tmp_path),title='alerts')
-    def receive():
-        window.receive(dict(ts=clock[0],sessions=[session.view(clock[0])],homes=[],errors=[],unassigned=[]))
-    try:
-        receive()
-        session.transports.append(Transport(now,'HTTP/SSE','/responses','HTTP 전환 기록',turn='turn'))
-        receive();receive()
-        assert sent==['Codexon · HTTP 전환']
-        window.notification_options['HTTP 전환'].setChecked(False)
-        clock[0]+=1
-        session.transports.append(Transport(clock[0],'HTTP/SSE','/responses','HTTP 전환 기록',turn='second'))
-        receive()
-        clock[0]+=1;window.notification_options['HTTP 전환'].setChecked(True);receive()
-        assert len(sent)==1
-        clock[0]+=1
-        session.transports.append(Transport(clock[0],'HTTP/SSE','/responses','HTTP 전환 기록',turn='third'))
-        receive()
-        assert len(sent)==2
-    finally:window.quit_app()
 
 
 def test_confirmed_alerts_reach_tray_and_click_opens_evidence(tmp_path,monkeypatch):

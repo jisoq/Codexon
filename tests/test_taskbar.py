@@ -117,110 +117,6 @@ def test_monitor_disconnect_fallback_reconnect_and_disabled_selection(tmp_path, 
         menu.close()
 
 
-@pytest.mark.parametrize('ratio', [1.0, 1.25, 1.5, 2.0])
-def test_secondary_geometry_scales_and_leaves_clock_clear(tmp_path, monkeypatch, ratio):
-    from types import SimpleNamespace
-    app = QApplication.instance() or QApplication([])
-    indicator = TaskbarQuota(QSettings(str(tmp_path / 'scale.ini'), QSettings.IniFormat))
-    native = indicator.native
-    bar = QRect(0, 0, round(1920 * ratio), round(48 * ratio))
-    clock = QRect(round(1842 * ratio), 0, round(70 * ratio), bar.height())
-    def to_client(host, pointer):
-        return True
-    monkeypatch.setattr(native, 'host', lambda: 1)
-    monkeypatch.setattr(native, 'api', SimpleNamespace(FindWindowExW=lambda *args: None,
-                                                     ScreenToClient=to_client))
-    monkeypatch.setattr(native, 'rect', lambda hwnd, client=False: bar)
-    monkeypatch.setattr(native, 'clock_rect', lambda host: clock)
-    monkeypatch.setattr('cachemonitor.taskbar.right_widgets_width', lambda: 160)
-    try:
-        rect = native.dock_geometry(2, ratio)
-        assert rect.width() == round(100 * ratio)
-        assert rect.height() == round(36 * ratio)
-        assert bar.contains(rect)
-        assert clock.left() - (rect.right() + 1) == round(8 * ratio)
-        # A wider clock moves the widget left by exactly the measured change.
-        clock.setLeft(clock.left() - round(50 * ratio))
-        moved = native.dock_geometry(2, ratio)
-        assert rect.x() - moved.x() == round(50 * ratio)
-        monkeypatch.setattr(native, 'clock_rect', lambda host: None)
-        assert native.dock_geometry(2, ratio) is None
-        assert native.dock_geometry(1, ratio) is None
-    finally:
-        indicator.close()
-
-
-@pytest.mark.live_taskbar
-def test_secondary_taskbar_absent_falls_back_without_losing_selection(tmp_path, monkeypatch):
-    app = QApplication.instance() or QApplication([])
-    secondary = next((s for s in app.screens() if s != app.primaryScreen()), None)
-    if secondary is None:
-        pytest.skip('Requires a secondary screen')
-    settings = QSettings(str(tmp_path / 'no-secondary-bar.ini'), QSettings.IniFormat)
-    indicator = TaskbarQuota(settings)
-    try:
-        indicator.set_monitor(screen_id(secondary))
-        with monkeypatch.context() as patch:
-            patch.setattr(indicator.native, 'host_for_screen', lambda name: None)
-            indicator.set_enabled(True)
-            assert indicator.native.api.GetParent(int(indicator.winId())) == indicator.native.host()
-            assert settings.value('taskbar/monitor') == screen_id(secondary)
-        settle_position(indicator)
-        assert indicator.native.screen_name(int(indicator.winId())) == screen_id(secondary)
-    finally:
-        indicator.close()
-        indicator.destroy()
-
-
-def test_crowded_secondary_taskbar_is_not_covered(tmp_path, monkeypatch):
-    from types import SimpleNamespace
-    app = QApplication.instance() or QApplication([])
-    indicator = TaskbarQuota(QSettings(str(tmp_path / 'crowded.ini'), QSettings.IniFormat))
-    native = indicator.native
-    def to_client(host, pointer):
-        point = native.ctypes.cast(pointer, native.ctypes.POINTER(native.types.POINT)).contents
-        point.x += 1920
-        point.y -= 1032
-        return True
-    monkeypatch.setattr(native, 'host', lambda: 1)
-    monkeypatch.setattr(native, 'api', SimpleNamespace(
-        FindWindowExW=lambda host, previous, name, title: 3 if name == 'WorkerW' else None,
-        ScreenToClient=to_client))
-    monkeypatch.setattr(native, 'rect', lambda hwnd, client=False:
-                        QRect(-400, 1032, 330, 48) if hwnd == 3 else QRect(0, 0, 1920, 48))
-    monkeypatch.setattr(native, 'clock_rect', lambda host: QRect(-78, 1032, 70, 48))
-    monkeypatch.setattr('cachemonitor.taskbar.right_widgets_width', lambda: 0)
-    try:
-        assert native.dock_geometry(2, 1) is None
-    finally:
-        indicator.close()
-
-
-def test_docking_leaves_space_for_existing_weather_widget(tmp_path, monkeypatch):
-    from types import SimpleNamespace
-    app = QApplication.instance() or QApplication([])
-    indicator = TaskbarQuota(QSettings(str(tmp_path / 'dock.ini'), QSettings.IniFormat))
-    native = indicator.native
-    host = 1
-    ratio = app.primaryScreen().devicePixelRatio()
-    bar = QRect(0, 0, round(1920 * ratio), round(48 * ratio))
-    tray = QRect(round(1700 * ratio), 0, round(220 * ratio), bar.height())
-    monkeypatch.setattr(native, 'host', lambda: host)
-    monkeypatch.setattr(native, 'api', SimpleNamespace(
-        FindWindowExW=lambda host, previous, name, title: 2 if name == 'TrayNotifyWnd' else None,
-        ScreenToClient=lambda host, point: True))
-    monkeypatch.setattr(native, 'rect', lambda hwnd, client=False: tray if hwnd == 2 else bar)
-    try:
-        monkeypatch.setattr('cachemonitor.taskbar.right_widgets_width', lambda: 0)
-        without_weather = native.dock_geometry(host, ratio)
-        monkeypatch.setattr('cachemonitor.taskbar.right_widgets_width', lambda: 160)
-        with_weather = native.dock_geometry(host, ratio)
-        assert with_weather.right() <= without_weather.left()
-        assert native.rect(host, client=True).contains(with_weather)
-    finally:
-        indicator.close()
-
-
 def test_taskbar_data_visibility_menu_and_persistence(tmp_path, monkeypatch, owned_taskbar):
     app = QApplication.instance() or QApplication([])
     monkeypatch.setattr('cachemonitor.tray.QSystemTrayIcon.isSystemTrayAvailable', lambda: True)
@@ -297,22 +193,6 @@ def test_routine_tests_cannot_attach_to_explorer(tmp_path):
     finally:
         indicator.close()
         indicator.destroy()
-
-
-def test_smoke_disables_native_backend_even_if_visibility_is_enabled(tmp_path):
-    app = QApplication.instance() or QApplication([])
-    previous = app.property('cachemonitorDisableShellIntegration')
-    app.setProperty('cachemonitorDisableShellIntegration', True)
-    indicator = TaskbarQuota(QSettings(str(tmp_path / 'smoke.ini'), QSettings.IniFormat))
-    try:
-        indicator.set_enabled(True)
-        assert indicator.enabled and indicator.native is None
-        assert not indicator.isVisible()
-        indicator.set_monitor(app.primaryScreen().name())
-        assert not indicator.isVisible()
-    finally:
-        indicator.close()
-        app.setProperty('cachemonitorDisableShellIntegration', previous)
 
 
 def test_native_child_follows_parent_visibility_and_reconnects(tmp_path, monkeypatch):

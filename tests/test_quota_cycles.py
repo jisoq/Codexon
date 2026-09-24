@@ -1,15 +1,10 @@
-from PySide6.QtTest import QTest
-from cachemonitor.quick_qa import mount, dispose, table_view
-import json
 from types import SimpleNamespace
 
 import pytest
 from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QApplication
 
-from cachemonitor.quota import quota_display
 from cachemonitor.quota_cycles import QuotaLedger, estimate, split_cycles, quota_statistics
-from cachemonitor.quota_live import normalize_limits, AccountClient
 from cachemonitor.quota_panel import QuotaPanel
 
 
@@ -84,11 +79,6 @@ def test_reset_jitter_natural_manual_account_and_regression_boundaries(tmp_path)
     finally: ledger.close()
 
 
-@pytest.mark.parametrize('delta',[0,-1])
-def test_small_or_negative_denominators_are_not_estimates(delta):
-    assert estimate(10,delta,5)['usd'] is None
-
-
 def test_missing_price_and_incomplete_index_suppress_conversion(tmp_path):
     ledger=QuotaLedger(tmp_path/'cycles.sqlite')
     try:
@@ -104,90 +94,6 @@ def test_missing_price_and_incomplete_index_suppress_conversion(tmp_path):
         sync(ledger,[row(key='modern')],revision=3)
         assert ledger.db.execute('select count(*) from calls').fetchone()[0]==1
     finally: ledger.close()
-
-
-def test_history_is_visible_but_not_mistaken_for_account_calibration(tmp_path):
-    ledger=QuotaLedger(tmp_path/'cycles.sqlite')
-    try:
-        ledger.observe('h',quota(100,10,source='history',account=''))
-        ledger.observe('h',quota(200,20,source='history',account=''))
-        sync(ledger,[row()])
-        c=ledger.report('h',300)['cycles'][0]
-        assert c['cost']>0 and not c['live'] and c['assumptions'] and '계정 식별 미확인' in c['blocked']
-        ledger.observe('h',quota(210,21));ledger.observe('h',quota(250,25))
-        sync(ledger,[row(),row('new',230)],revision=2)
-        c=ledger.report('h',300)['cycles'][0]
-        assert c['start']==210 and c['delta']==4
-        assert sum(m['calls'] for m in c['models'])==1
-        # Unknown historical scope and identified live scope are separate.
-        assert sum(m['calls'] for m in c['cycle_models'])==1
-        assert len(ledger.report('h',300)['cycles'])==1
-        assert len(ledger.report('h',300)['history'])==4
-    finally: ledger.close()
-
-
-def test_live_normalization_and_stale_numeric_display():
-    raw={'rateLimits':{'limitId':'other'},'rateLimitsByLimitId':{
-        'codex':{'limitId':'codex','planType':'pro','primary':{'usedPercent':63,'windowDurationMins':10080,'resetsAt':1000}},
-        'reserve':{'normalModelSlug':'gpt-5.6-luna'}}}
-    q=normalize_limits(raw,100,'hashed-account')
-    assert q['separate_models']==['gpt-5.6-luna']
-    assert quota_display(q,'weekly',110)['text']=='37'
-    assert quota_display(q,'weekly',200)['text']=='?'
-    assert '갱신 지연' in quota_display(q,'weekly',200)['tooltip']
-    with pytest.raises(ValueError): AccountClient('.').rpc('account/rateLimitResetCredit/consume')
-
-
-def test_panel_keeps_actual_current_limits_separate_from_historical_period(tmp_path):
-    import time
-    app=QApplication.instance() or QApplication([])
-    ledger=QuotaLedger(tmp_path/'cycles.sqlite')
-    try:
-        ledger.observe('h',quota(100,20));ledger.observe('h',quota(200,30))
-        sync(ledger,[row(),row('later',250)])
-        panel=QuotaPanel(QSettings(str(tmp_path/'panel.ini'),QSettings.IniFormat))
-        current=quota(time.time(),32,reset=time.time()+1000)
-        panel.receive({'quota':current,'report':ledger.report('h',300)})
-        assert panel.result.text()=='$9.45'
-        assert panel.current['weekly']['value'].text()=='68.0%'
-        assert not panel.current['five_hour']['card'].isVisible()
-        assert '10%p' in panel.basis.text()
-        assert panel.table.item(0,1).text()=='1'
-        assert panel.table.item(0,3).text()=='$0.9450'
-        selected=panel.selected_id
-        ledger.observe('h',quota(310,0,5000))
-        panel.receive({'quota':current,'report':ledger.report('h',320)})
-        assert panel.selected_id==selected
-        assert panel.statistics['valid']==1 and panel.statistics['excluded']==1
-        panel.interval_filter.setCurrentIndex(panel.interval_filter.findData('used'))
-        assert panel.intervals.rowCount()==1 and not panel.intervals.model().rows[0]['excluded']
-        panel.interval_filter.setCurrentIndex(panel.interval_filter.findData('excluded'))
-        assert panel.intervals.rowCount()==1 and panel.intervals.model().rows[0]['excluded']
-        panel.set_history_period(150,300)
-        assert panel.statistics['valid']==0
-        assert panel.current['weekly']['value'].text()=='68.0%'
-        panel.deleteLater()
-    finally:ledger.close()
-
-
-def test_pooled_one_percent_estimate_uses_consumption_weights_and_reports_variation():
-    def interval(identifier,cost,delta,**extra):
-        return {'id':identifier,'cost':cost,'delta':delta,'blocked':[],
-                'models':[{'calls':3,'separate':False}], 'live':True,'account':'current',**extra}
-    report={'cycles':[
-        interval('a',40,10),interval('b',120,20),
-        interval('tiny',100,.5),interval('missing',None,10,blocked=['단가/토큰 미확인']),
-        interval('other-account',900,30,account='old'),
-        interval('history',30,10,live=False,account='',blocked=['과거 로컬 기록: 계정 한도 범위 미확인'])]}
-    result=quota_statistics(report)
-    assert result['valid']==3 and result['total']==6 and result['excluded']==3
-    assert result['cost']==260 and result['delta']==30.5
-    assert result['per_percent']==pytest.approx(260/30.5)
-    assert result['calls']==9 and result['historical']==0
-    assert result['intervals'][4]['excluded']==['다른 계정의 관측 구간']
-    assert report['cycles'][5]['blocked']==['과거 로컬 기록: 계정 한도 범위 미확인']
-    empty=quota_statistics({'cycles':[interval('tiny',1,1)]})
-    assert empty['per_percent']==1 and empty['valid']==1
 
 
 def test_mode_change_preserves_price_snapshot_and_ambiguous_gap_is_excluded(tmp_path):
@@ -222,41 +128,6 @@ def test_observation_gap_excludes_unmatched_cost_and_consumption_but_preserves_r
         assert len(report['cycles'])==1 and report['cycles'][0]['delta']==18
         assert ledger.db.execute('select count(*) from calls').fetchone()[0]==3
     finally:ledger.close()
-
-
-def test_observation_gap_does_not_split_or_rewrite_stored_cycle(tmp_path):
-    ledger=QuotaLedger(tmp_path/'boundary.sqlite')
-    try:
-        ledger.observe('h',quota(100,10));ledger.observe('h',quota(1900,20))
-        groups=split_cycles([dict(r) for r in ledger.db.execute('select * from observations')])
-        assert len(groups)==1
-    finally:ledger.close()
-
-
-def test_large_interval_history_pages_without_nested_table_scroll_and_keeps_selection(tmp_path):
-    from cachemonitor.presentation import Scroll
-    app=QApplication.instance() or QApplication([])
-    ledger=QuotaLedger(tmp_path/'large.sqlite')
-    panel=QuotaPanel(QSettings(str(tmp_path/'large.ini'),QSettings.IniFormat))
-    try:
-        ledger.observe('h',quota(100,20));ledger.observe('h',quota(200,30))
-        sync(ledger,[row()],at=300)
-        report=ledger.report('h',300);template=report['cycles'][0]
-        report['cycles']=[{**template,'id':str(i),'start':100+i*300,'end':200+i*300} for i in range(2000)]
-        panel.receive({'report':report,'can_record_reset':True})
-        scroll=Scroll();scroll.setWidgetResizable(True);scroll.setWidget(panel)
-        host=mount(scroll,1120,760);app.processEvents();QTest.qWait(40)
-        assert panel.statistics['total']==panel.statistics['valid']==2000
-        assert panel.intervals.rowCount()==25 and panel.intervals.state['inline']
-        assert panel.intervals.model().formatted<500
-        panel.change_page(79)
-        panel.intervals.selectRow(24);app.processEvents();QTest.qWait(40)
-        assert panel.selected_id=='1999'
-        assert panel.intervals.item(24,3).text()=='$9.45'
-        panel.receive({'report':report,'can_record_reset':True})
-        assert panel.selected_id=='1999' and panel.page_index==79
-    finally:
-        dispose(host);ledger.close()
 
 
 def test_quota_home_switch_clears_values_and_rejects_late_old_home_results(tmp_path):

@@ -15,6 +15,8 @@ from .observer_control import atomic_write
 from .observer_state import ProcessLock, read_json
 from .installation import KEY
 
+STARTUP_KEY = r'Software\Microsoft\Windows\CurrentVersion\Run'
+
 
 def startup_replacement(command, executable):
     match=re.fullmatch(r'\s*(?:"([^"]+)"|(\S+))(.*)',command,flags=re.DOTALL)
@@ -25,15 +27,27 @@ def startup_replacement(command, executable):
 
 
 def migrate_startup(executable):
+    """Retarget an enabled packaged app without changing its login preferences.
+
+    Keep the value name (and Windows StartupApproved state) and arguments intact.
+    A failed read-back must reach the activation transaction so it can roll back.
+    """
     import winreg
     try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,r'Software\Microsoft\Windows\CurrentVersion\Run',
-                            0,winreg.KEY_READ|winreg.KEY_SET_VALUE) as key:
-            try:command,kind=winreg.QueryValueEx(key,'CacheMonitor')
-            except FileNotFoundError:return
-            updated=startup_replacement(command,executable)
-            if updated!=command:winreg.SetValueEx(key,'CacheMonitor',0,kind,updated)
-    except FileNotFoundError:pass
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,STARTUP_KEY,
+                             0,winreg.KEY_READ|winreg.KEY_SET_VALUE)
+    except FileNotFoundError:return
+    with key:
+        try:command,kind=winreg.QueryValueEx(key,'CacheMonitor')
+        except FileNotFoundError:return
+        if kind not in (winreg.REG_SZ, winreg.REG_EXPAND_SZ):return
+        updated=startup_replacement(command,executable)
+        if updated==command:return
+        winreg.SetValueEx(key,'CacheMonitor',0,kind,updated)
+        try:actual=winreg.QueryValueEx(key,'CacheMonitor')
+        except FileNotFoundError:actual=None
+        if actual!=(updated,kind):
+            raise OSError('Windows 로그인 시 시작 경로를 갱신하지 못했습니다. 이전 설치 상태를 유지합니다.')
 
 
 def contained(path, root):

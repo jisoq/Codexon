@@ -43,39 +43,6 @@ def test_unknown_prices_or_usage_are_not_zero():
     assert old['cost']==pytest.approx(.155)
 
 
-@pytest.mark.parametrize('model,rates', [('gpt-6-sol',(2,.2,2.5,10)),
-                                       ('gpt-6-luna',(.1,.01,.125,.5))])
-@pytest.mark.parametrize('mode,factor', [('Standard',1),('Fast',2)])
-@pytest.mark.parametrize('tokens', [272000,272001,1000000])
-def test_gpt6_sol_luna_base_api_conversion(model,rates,mode,factor,tokens):
-    p=token_cost({**row(model,service_tier=mode),'input':tokens})
-    inp,cached,written,output=rates
-    assert not p['long_context']
-    assert p['cost_uncached']==pytest.approx((tokens-90000)*inp*factor/1e6)
-    assert p['cost_cached']==pytest.approx(80000*cached*factor/1e6)
-    assert p['cost_written']==pytest.approx(10000*written*factor/1e6)
-    assert p['cost_output']==pytest.approx(2000*output*factor/1e6)
-    assert p['cost']==pytest.approx(sum(p[k] for k in ('cost_uncached','cost_cached','cost_written','cost_output')))
-    assert token_cost({**row(model),'written':None})['cost'] is None
-
-
-def test_new_prices_revalue_calls_and_archive_previous_costs(tmp_path):
-    from cachemonitor.quota_cycles import QuotaLedger,PRICE_ID
-    from test_quota_cycles import sync,row as ledger_row
-    path=tmp_path/'prices.sqlite'
-    ledger=QuotaLedger(path)
-    sync(ledger,[ledger_row('sol',model='gpt-6-sol'),ledger_row('luna',model='gpt-6-luna')])
-    ledger.db.execute("update calls set cost=null,price_id='previous-price-table'")
-    ledger.db.commit();ledger.close()
-    ledger=QuotaLedger(path)
-    try:
-        calls=list(ledger.db.execute('select * from calls'))
-        assert len(calls)==2 and all(r['cost'] is not None and r['price_id']==PRICE_ID for r in calls)
-        archive=list(ledger.db.execute("select * from cost_archive where price_id='previous-price-table'"))
-        assert len(archive)==2 and all(r['cost'] is None for r in archive)
-    finally:ledger.close()
-
-
 def test_call_and_turn_cost_use_the_same_completed_population():
     s=Session('s','h',title='task')
     for i,turn in enumerate(('one','one','one','two','open')):

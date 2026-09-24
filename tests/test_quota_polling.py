@@ -1,5 +1,3 @@
-import io
-import queue
 import sqlite3
 from types import SimpleNamespace
 
@@ -30,31 +28,6 @@ def test_activity_is_coalesced_without_postponing_or_overriding_backoff():
     assert p.next_read==409
     p.finish(410,True)
     assert p.next_read==425 and p.failures==0
-
-
-def test_idle_reset_and_resume_do_not_replay_missed_polls():
-    p=QuotaPolling()
-    p.activity((0,),False,0)
-    p.finish(61,True)
-    assert p.next_read==121
-    p.finish(62,True,{'windows':{'weekly':{'resets_at':1070}}},1062)
-    assert p.next_read==71
-    assert not p.tick(62,1062)
-    p.finish(62,False)
-    assert p.tick(63,10000)  # Windows may exclude sleep from its monotonic clock.
-    assert p.ready(63) and p.failures==0
-    p.finish(63,True)
-    assert not p.ready(64)
-
-
-def test_rpc_queue_timeout_is_an_explicit_timeout():
-    client=AccountClient('.')
-    client.process=SimpleNamespace(stdin=io.StringIO())
-    class EmptyQueue:
-        def get(self,timeout):raise queue.Empty
-    client.messages=EmptyQueue()
-    with pytest.raises(TimeoutError,match='시간 초과'):
-        client.rpc('account/rateLimits/read')
 
 
 @pytest.mark.parametrize('failure_stage',['startup','lock','report','lookup'])

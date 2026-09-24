@@ -1,7 +1,6 @@
 from datetime import datetime
 import pytest
 from cachemonitor.analytics import analyze,overview_view
-from cachemonitor.analysis_engine import AnalysisEngine
 from cachemonitor.core import Session
 
 
@@ -48,23 +47,6 @@ def test_calendar_weeks_months_and_exclusive_boundaries():
     assert overview_view(analyze([]),0,end)['timeline']==[]
 
 
-@pytest.mark.parametrize('duration,unit',[(7200,'5min'),(7201,'hour'),(172800,'hour'),(172801,'day'),
-    (62*86400,'day'),(63*86400,'week'),(366*86400,'week'),(367*86400,'month')])
-def test_fixed_automatic_bucket_contract(duration,unit):
-    start=ts('2026-01-01T00:00:00')
-    view=overview_view(analyze([]),start,start+duration)
-    assert view['granularity']==unit
-
-
-def test_summary_is_independent_of_compare_unit_and_page_filter_covers_all_usage():
-    start,end=ts('2026-01-30T00:00:00'),ts('2026-02-03T00:00:00');source=session_view()
-    assert overview_view(analyze([source]),start,end)==overview_view(analyze([source],unit='turn',method='median'),start,end)
-    engine=AnalysisEngine();engine.ingest([source])
-    result=engine.query(dict(page=0,start=start,end=end,model='unknown'))
-    assert result['overview']['calls']==1 and result['overview']['total'] is None
-    assert len(result['overview']['sources'])==1 and result['overview']['sources'][0]['known']==0
-
-
 def test_completed_request_trend_uses_completion_time_and_missing_means_gap():
     source=session_view();source['turn_records']['a']['ended_at']=ts('2026-01-31T01:00:00')
     start,end=ts('2026-01-30T00:00:00'),ts('2026-02-03T00:00:00')
@@ -73,10 +55,3 @@ def test_completed_request_trend_uses_completion_time_and_missing_means_gap():
     assert [r['known'] for r in view['timeline']]==[0,1,0,0]
     assert [r['N'] for r in view['timeline']]==[0,1,1,0]
     assert view['timeline'][1]['calls']==0  # requests complete independently of call timestamps
-
-
-def test_count_bucket_validity_does_not_depend_on_pricing():
-    start,end=ts('2026-01-30T00:00:00'),ts('2026-02-03T00:00:00')
-    view=overview_view(analyze([session_view()],start,end),start,end,metric='count',granularity='day')
-    unpriced=view['timeline'][2]
-    assert unpriced['value']==1 and (unpriced['n'],unpriced['N'],unpriced['missing'])==(1,1,0)

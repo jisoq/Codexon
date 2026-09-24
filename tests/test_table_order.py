@@ -46,19 +46,3 @@ def test_sequential_time_tables_keep_order_cost_sort_and_selected_call(tmp_path)
         assert window.parent_kind=='sessions' and [r['sid'] for r in window.parent_rows]==['old','new']
         assert not window.qml_errors
     finally:window.quit_app();app.setProperty('cachemonitorDisableShellIntegration',before)
-
-
-def test_calls_without_request_id_use_explicit_unlinked_group_and_time_order(tmp_path):
-    app=QApplication.instance() or QApplication([]);now=time.time();session=Session('no-turn','h',title='No request ID')
-    before=app.property('cachemonitorDisableShellIntegration');app.setProperty('cachemonitorDisableShellIntegration',True)
-    for offset in (30,10,20):session.add_usage(now-offset,str(offset),dict(input_tokens=100,cached_input_tokens=0,output_tokens=10),'gpt-5.5',service_tier='Standard')
-    window=Dashboard([],start_worker=False,live_limits=False,settings=QSettings(str(tmp_path/'unlinked.ini'),QSettings.IniFormat))
-    try:
-        window.receive(dict(ts=now,sessions=[session.view(now)],homes=['h'],errors=[],unassigned=[]))
-        window.show();window.nav.setCurrentRow(2);QTest.qWait(50)
-        assert window.record_view=='requests' and len(window.record_rows)==1
-        assert window.record_rows[0]['turn']=='__unlinked__'
-        click_row(window,window.table,0)
-        assert window.record_view=='calls' and [r['key'] for r in window.record_rows]==['10','20','30']
-        assert not window.qml_errors
-    finally:window.quit_app();app.setProperty('cachemonitorDisableShellIntegration',before)

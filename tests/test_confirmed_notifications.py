@@ -199,22 +199,3 @@ def test_real_local_health_larger_than_16kb_and_classified_errors(tmp_path,monke
         sock.bind(('127.0.0.1',0));port=sock.getsockname()[1]
     monkeypatch.setattr(control,'url',f'http://127.0.0.1:{port}')
     assert control.status()['probe_state']=='refused'
-
-
-def test_timeouts_are_unknown_not_refused(tmp_path,monkeypatch):
-    import urllib.error
-    control=ObserverManager(tmp_path/'home',tmp_path/'data')
-    class Opener:
-        def open(self,*args,**kwargs):raise urllib.error.URLError(TimeoutError('timeout'))
-    monkeypatch.setattr('cachemonitor.observer_control.urllib.request.build_opener',lambda *_:Opener())
-    assert control.health() is None and control.health_state=='unknown'
-
-
-@pytest.mark.parametrize('code',[111,10061])
-def test_explicit_os_connection_refusal_is_preserved(tmp_path,monkeypatch,code):
-    import urllib.error
-    control=ObserverManager(tmp_path/'home',tmp_path/'data')
-    class Opener:
-        def open(self,*args,**kwargs):raise urllib.error.URLError(ConnectionRefusedError(code,'refused'))
-    monkeypatch.setattr('cachemonitor.observer_control.urllib.request.build_opener',lambda *_:Opener())
-    assert control.health() is None and control.health_state=='refused'

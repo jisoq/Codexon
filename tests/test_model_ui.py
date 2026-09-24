@@ -33,7 +33,7 @@ def test_model_columns_counts_filter_and_refresh(tmp_path):
         click_row(window,window.table,0)
         assert window.record_view=='calls' and window.table.rowCount()==3
         assert window.table.model().headers==[
-            '기록 시각','요청 모델','추론 설정','요청 모드','API 환산액','입력 캐시율']
+            '기록 시각','요청 모델','추론 설정','요청 모드','비용','캐시 적중률']
         assert [r['key'] for r in window.record_rows]==['r2','r1','r0']
         assert [window.table.item(i,1).text() for i in range(3)]==[
             'gpt-6-astra','gpt-6-astra (불일치)','gpt-6-astra (일치)']

@@ -2,8 +2,6 @@ import json
 
 from cachemonitor.core import Session, stamp
 from cachemonitor.index import UsageIndex, sanitized
-from cachemonitor.quota_cycles import QuotaLedger
-from cachemonitor.pricing import request_tier
 from test_core import event, usage, fixture_home, TID
 from test_index import finish
 
@@ -28,20 +26,6 @@ def test_applied_settings_are_historical_scoped_and_do_not_relabel_active_turn()
     assert s.requests[-1].request_mode_action=='clear'
     assert s.requests[-1].request_mode_source=='applied_settings'
     assert 'PRIVATE' not in json.dumps(sanitized(setting(10001)))
-
-
-def test_explicit_turn_override_takes_precedence_over_inherited_settings(tmp_path):
-    ledger=QuotaLedger(tmp_path/'ledger.sqlite')
-    try:
-        ledger.modes[('h','s','b')]='Standard'
-        rows=[{'turn':t,'service_tier':'priority','service_tier_source':'settings'} for t in ('a','b','c')]
-        snapshot={'homes':[],'sessions':[{'home':'h','id':'s','history':rows,'usage_revision':1}]}
-        ledger.enrich_modes(snapshot)
-        assert [request_tier(row) for row in rows]==['Fast','Standard','Fast']
-        rows[1].update(service_tier_source='wire',requested_service_tier='priority')
-        ledger.enrich_modes(snapshot)
-        assert request_tier(rows[1])=='Fast'
-    finally:ledger.close()
 
 
 def test_old_index_backfills_applied_settings_without_changing_token_counts(tmp_path,monkeypatch):

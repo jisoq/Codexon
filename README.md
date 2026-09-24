@@ -34,6 +34,20 @@ Enable **Settings → Proxy → Use proxy** to compare the requested and reporte
 
 Codexon reports a model match or mismatch only when completed request/response evidence can be linked reliably. Missing or conflicting evidence is not treated as a mismatch. The reported model name does not prove which hardware or internal model implementation handled the request.
 
+### Proxy latency overhead
+
+In the supplied measurements, median proxy overhead was **0.16ms** for a 4KB WebSocket request and **0.88ms** for 256KB. At 20MB, median overhead was **70.91ms** over WebSocket and **40.12ms** over HTTP/SSE.
+
+| Request condition | Median added time | 95th percentile |
+| --- | ---: | ---: |
+| WebSocket 4KB | 0.16ms | 0.28ms |
+| WebSocket 256KB | 0.88ms | 1.22ms |
+| WebSocket 2MB | 8.39ms | 12.92ms |
+| WebSocket 20MB | 70.91ms | 95.09ms |
+| HTTP/SSE 20MB | 40.12ms | 65.63ms |
+
+These figures describe time added by the proxy, not total response time or model generation time. Overhead is not zero and can vary with the environment and transfer size.
+
 ## Updates and recovery
 
 Use **Settings → About and troubleshooting → Check and install updates**. For connection problems, open **Codexon Connection Recovery** from Start. See the [user guide](docs/user-guide.md) for record preservation, recovery and removal.

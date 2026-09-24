@@ -50,6 +50,7 @@ def history_rows(report, mode, start=None, end=None):
                            if mode=='weekly' else None)
         row['markers']=[RESET_NAMES[row['reset_kind']]] if row['reset_kind'] else []
         row['connect']=bool(continuous and rows)
+        row['tracking_continuous']=same_tracking
         row['label']=f"{clock(row['at'],True)} · 잔여 {row['remaining']:g}%"+(' · '+row['markers'][0] if row['markers'] else '')
         if start is None or record['at']>=start:rows.append(row)
         previous=row
@@ -68,9 +69,55 @@ def observation_label(row, money=False):
     return label
 
 
+def completed_percent_costs(rows):
+    """Price a displayed percent only after its next 1pp decrease is observed.
+
+    Every observation on a plateau shares its completed amount. Never fill in
+    skipped percent boundaries or price a partial opening plateau. An idle gap
+    with unchanged allowance and cost does not discard the observed plateau.
+    This runs during preparation so detail selection stays constant-time.
+    """
+    # Summing interval costs in a different order can move the same USD value
+    # by a few floating-point bits. This is not a decrease or new gap activity.
+    def same_cost(a,b):
+        return a is not None and b is not None and math.isclose(a,b,rel_tol=0,abs_tol=1e-9)
+
+    amounts=[None]*len(rows)
+    start=0;valid=False
+    previous=None
+    for index,row in enumerate(rows):
+        remaining=row.get('reported_remaining',row['remaining'])
+        cost=row.get('period_cost',row.get('cycle_cost'))
+        known=(cost is not None and math.isfinite(cost) and cost>=0)
+        boundary=(previous is None or row.get('reset_kind') or
+                  any(row.get(key)!=previous.get(key) for key in ('cycle_start','account')))
+        if boundary:
+            start=index
+            valid=(remaining==100 and known and cost==0)
+        elif not row['connect'] and not (
+                row.get('tracking_continuous') and known and
+                remaining==previous.get('reported_remaining',previous['remaining']) and
+                same_cost(cost,previous.get('period_cost',previous.get('cycle_cost')))):
+            start=index;valid=False
+        else:
+            old_remaining=previous.get('reported_remaining',previous['remaining'])
+            old_cost=previous.get('period_cost',previous.get('cycle_cost'))
+            valid=valid and known and old_cost is not None and (cost>=old_cost or same_cost(cost,old_cost))
+            if remaining!=old_remaining:
+                if valid and old_remaining-remaining==1 and float(old_remaining).is_integer():
+                    opening=rows[start]
+                    amount=max(0,cost-opening.get('period_cost',opening.get('cycle_cost')))
+                    amounts[start:index]=[amount]*(index-start)
+                start=index
+                valid=(remaining<old_remaining and float(remaining).is_integer() and known)
+        previous=row
+    return amounts
+
+
 def prepare_series(rows):
     """Bound drawing size while retaining extrema and exact selectable records."""
     times=[];breaks=[];gaps=0;maximum=0;low=100;high=0;cost_maximum=0;value_maximum=0
+    value_minimum=None
     missing={key:[] for key in ('cycle_cost','cycle_value')}
     counts={key:0 for key in missing}
     active_times=[];gap_indices=[];gap_seconds=[0.0];active=0.0
@@ -87,6 +134,8 @@ def prepare_series(rows):
         maximum=max(maximum,row.get('cycle_cost') or 0,row.get('cycle_value') or 0)
         cost_maximum=max(cost_maximum,row.get('cycle_cost') or 0)
         value_maximum=max(value_maximum,row.get('cycle_value') or 0)
+        value=row.get('cycle_value')
+        if value is not None:value_minimum=value if value_minimum is None else min(value_minimum,value)
         for key in missing:
             counts[key]+=row.get(key) is None
             missing[key].append(counts[key])
@@ -115,7 +164,8 @@ def prepare_series(rows):
         samples[budget]=sorted(selected)
     return dict(rows=rows,times=times,breaks=breaks,missing=missing,samples=samples,maximum=maximum,low=low,high=high,
                 active_times=active_times,gap_indices=gap_indices,gap_seconds=gap_seconds,
-                cost_maximum=cost_maximum,value_maximum=value_maximum)
+                cost_maximum=cost_maximum,value_minimum=value_minimum,value_maximum=value_maximum,
+                completed_costs=completed_percent_costs(rows))
 
 
 def prepare_quota_view(report):
@@ -131,6 +181,7 @@ def prepare_quota_view(report):
             if not index or row['local_range']!=own[index-1]['local_range']:row['connect']=False
             cost=offset_cost+(row['cycle_cost'] or 0);delta=offset_delta+row['cycle_delta']
             overall.append({**row,'reported_remaining':row['remaining'],'remaining':delta,
+                            'period_cost':row['cycle_cost'],
                             'cycle_cost':cost,'cycle_delta':delta,
                             'cycle_value':(offset_cost+row['confirmed_cost'])/(offset_delta+row['confirmed_delta'])*100
                             if offset_delta+row['confirmed_delta']>0 else None})

@@ -80,6 +80,12 @@ Rectangle {
         radius: 12 * root.s.scale; color: "transparent"
         border.width: 2 * root.s.scale; border.color: root.s.accent
     }
+    Rectangle {
+        visible: root.s.chromeKind === "icon" && (root.s.speedWarning || false)
+        x: 26 * root.s.scale; y: 5 * root.s.scale
+        width: 5 * root.s.scale; height: width; radius: width / 2
+        color: root.s.warning || root.s.accent
+    }
     component IconButton: ToolButton {
         id: button
         property string glyph

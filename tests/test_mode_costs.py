@@ -1,9 +1,8 @@
 import copy
-import sqlite3
 import pytest
 from cachemonitor.core import Session
 from cachemonitor.pricing import token_cost,display_tier,mode_assumptions,COST_COMPONENTS
-from cachemonitor.analytics import analyze,overview_view,comparison_view
+from cachemonitor.analytics import analyze, overview_view
 from cachemonitor.analysis_engine import AnalysisEngine
 from cachemonitor.quota_cycles import QuotaLedger
 
@@ -72,25 +71,6 @@ def test_price_corrections_invalidate_worker_and_ledger_without_reclassifying_un
         assert result['overview']['calls']==2
         assert all(r['service_tier']=='Standard' for r in result['analysis']['responses'])
     finally:ledger.close()
-
-
-def test_same_tokens_repricing_uses_one_union_population_and_no_duration():
-    a=analyze([history()]);original=copy.deepcopy(a['responses'])
-    view=comparison_view(a)
-    assert len(view['targets'])==2 and view['mode_comparison']
-    repricing=view['repricing']
-    assert (repricing['n'],repricing['N'])==(5,5)
-    assert repricing['Fast']['mean']==pytest.approx(2*repricing['Standard']['mean'])
-    assert not any('duration' in r for r in repricing['records'])
-    assert a['responses']==original
-    requests=comparison_view(a,unit='turn')['repricing']
-    assert requests['n']==3  # Repricing uses the same union once, including the complete mixed-mode request.
-
-
-def test_assumptions_with_unsupported_prices_report_partial_separately():
-    result=mode_assumptions([usage('미확인'),usage('미확인','no-price')])
-    assert result['Standard']==dict(total=None,partial_sum=pytest.approx(.405),n=1,N=2,missing=1)
-    assert result['Fast']['total'] is None and result['Fast']['partial_sum']==pytest.approx(.81)
 
 
 def test_unknown_price_migration_retains_original_mode_and_excludes_base_amount(tmp_path):

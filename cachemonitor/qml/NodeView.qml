@@ -164,7 +164,7 @@ Item {
                 text: view.s.text; textFormat: view.s.rich || view.s.externalLinks ? Text.RichText : Text.PlainText
                 wrapMode: view.s.wrap ? Text.Wrap : Text.NoWrap
                 elide: view.s.wrap || view.s.noElide ? Text.ElideNone : Text.ElideRight
-                font.family: appTheme.family; font.pixelSize: view.s.fontSize; font.bold: view.s.bold
+                font.family: view.s.fontFamily || appTheme.family; font.pixelSize: view.s.fontSize; font.bold: view.s.bold
                 color: appTheme.palette && appTheme.color(view.s.color)
                 horizontalAlignment: view.s.alignment & Qt.AlignRight ? Text.AlignRight : Text.AlignLeft
                 linkColor: (appTheme.palette && appTheme.color("#326ba9"))

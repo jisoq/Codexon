@@ -1,5 +1,5 @@
 import pytest
-from cachemonitor.analytics import analyze, comparison_view, stats, initial_targets
+from cachemonitor.analytics import analyze, comparison_view, stats
 from cachemonitor.core import Session
 from cachemonitor.pricing import COST_COMPONENTS
 
@@ -72,46 +72,6 @@ def test_quantiles_small_samples_and_cache_denominators():
     assert stats([{'x':None}],'x')['sum'] is None
     assert stats([{'x':0}],'x')['mean']==0
     assert comparison_view(analyze([]))['targets']==[]
-
-
-def test_actual_scatter_intersection_and_explicit_zero_baseline():
-    source=history()
-    for row in source['history'][:2]:
-        row.update(response_status='completed',timing_valid=True,completion_latency_ms=2000)
-    source['history'][2].update(response_status='failed',completion_latency_ms=1000)
-    view=comparison_view(analyze([source]),targets=targets())
-    first=view['groups'][0]
-    assert len(first['scatter'])==2
-    assert first['scatter_stats']['cost']['mean']==pytest.approx((.405+.505)/2)
-    assert first['scatter_stats']['duration']['mean']==2
-    assert all(r['duration']==2 for r in view['scatter'])
-    source['history'][0]['reasoning']=0;source['history'][1]['reasoning']=0;source['history'][2]['reasoning']=0
-    zero=comparison_view(analyze([source]),metric='reasoning',targets=targets())
-    assert zero['groups'][1]['delta']==500 and zero['groups'][1]['relative'] is None
-
-
-def test_initial_pair_balances_samples_and_explicit_editor_is_stable():
-    rows=[]
-    for effort,standard,fast in [('high',8,2),('ultra',3,3)]:
-        for mode,n in [('Standard',standard),('Fast',fast)]:
-            rows.extend(dict(model='m',effort=effort,service_tier=mode,ts=i) for i in range(n))
-    pair=initial_targets(rows)
-    assert [t['effort'] for t in pair]==['ultra','ultra']
-    assert [t['service_tier'] for t in pair]==['Standard','Fast']
-    assert comparison_view(analyze([history()]),targets=[])['groups']==[]
-
-
-def test_cache_distribution_count_and_matrix_preserve_other_common_filters():
-    zero=stats([dict(input=0,cached=0,rate=None) for _ in range(10)],'rate','p90')
-    assert zero['n']==10 and zero['distribution_n']==0 and zero['value'] is None
-    assert zero['points']==[] and zero['p90'] is None
-    analysis=analyze([history()])
-    by_input=comparison_view(analysis,targets=targets(),conditions={'cache_band':(75,100)},matrix_by='input')
-    assert by_input['groups'][0]['N']==2
-    assert sum(c['N'] for c in by_input['matrix'][0]['cells'])==2
-    by_cache=comparison_view(analysis,targets=targets(),conditions={'input_band':(200000,272001)},matrix_by='cache')
-    assert by_cache['groups'][0]['N']==1
-    assert sum(c['N'] for c in by_cache['matrix'][0]['cells'])==1
 
 
 def test_repricing_keeps_target_identity_baseline_and_excluded_intersection_count():

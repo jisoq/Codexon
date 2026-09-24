@@ -7,13 +7,14 @@ from .core import token_number, transport_label, token_parts
 from .cache_misses import classify
 from .cache_health import CacheHealth
 from .session_costs import session_costs
+from .speed_health import SpeedHealth
 
 
 TOKEN_LABELS = {'cached': '캐시 읽기', 'uncached': '일반 입력', 'written': '캐시 쓰기',
-                'output': '출력·추론 제외', 'reasoning': '추론', 'input_unknown': '입력 미분류',
+                'reasoning': '추론', 'output': '추론 외', 'input_unknown': '입력 미분류',
                 'output_unknown': '출력 미분류', 'unknown': '미분류'}
-TOKEN_ORDER = ('cached', 'uncached', 'written', 'output', 'reasoning', 'unknown')
-COMPARISON_ORDER = ('uncached', 'written', 'output', 'reasoning')
+TOKEN_ORDER = ('cached', 'uncached', 'written', 'reasoning', 'output', 'unknown')
+COMPARISON_ORDER = ('uncached', 'written', 'reasoning', 'output')
 
 
 def observed_mode(row):
@@ -51,7 +52,7 @@ def token_composition(session):
         return [dict(key=key,label=TOKEN_LABELS[key],tokens=counts[key],known=known.get(key,True),share=counts[key]/denominator if denominator else 0)
                 for key in keys if counts[key] or key not in ('input_unknown','output_unknown')]
     input_parts=group(('cached','written','uncached','input_unknown'),inp_total) if any(token_number(r.get('input')) is not None for r in rows) else []
-    output_parts=group(('output','reasoning','output_unknown'),out_total) if any(token_number(r.get('output')) is not None for r in rows) else []
+    output_parts=group(('reasoning','output','output_unknown'),out_total) if any(token_number(r.get('output')) is not None for r in rows) else []
     unknown=counts['input_unknown']+counts['output_unknown'];known['unknown']=bool(unknown)
     displayed={**counts,'unknown':unknown};maximum=max((displayed[k] for k in COMPARISON_ORDER),default=0)
     bars=[dict(key=k,label=TOKEN_LABELS[k],tokens=displayed[k],known=known[k],share=displayed[k]/total if total else 0,
@@ -62,7 +63,7 @@ def token_composition(session):
         cache_hit_rate=cache['value'],cache_hit_partial=bool(cache['missing']),cache_valid=cache['n'],cache_target=cache['N'],
         written_known=bool(rows) and all(token_number(r.get('written')) is not None for r in rows),
         unknown=unknown,non_cache_total=total-counts['cached'],bar_max=maximum,bars=bars,
-        parts=[dict(key=k,label=TOKEN_LABELS[k],tokens=v,share=v/total) for k,v in displayed.items() if k in TOKEN_ORDER and v and total])
+        parts=[dict(key=k,label=TOKEN_LABELS[k],tokens=displayed[k],share=displayed[k]/total) for k in TOKEN_ORDER if displayed[k] and total])
 
 
 class OverlayCacheHealth(CacheHealth):
@@ -227,8 +228,11 @@ class OverlaySummaries:
         self.cache = {}
         self.health = {}
         self.rollups = {}
+        self.speed_health = SpeedHealth()
+        self.presented = {}
 
     def collect(self, engine):
+        speeds = self.speed_health.collect(engine)
         updated = {}
         for key, state in engine.sessions.items():
             source=state.get('source',state['prepared'])
@@ -270,4 +274,13 @@ class OverlaySummaries:
             merged[key]=(signature,value)
             result.append(value)
         self.rollups=merged
-        return result
+        presented={};output=[]
+        for summary in result:
+            key=(summary['home'],summary['id'])
+            speed=speeds.get(key,{'active':False})
+            previous=self.presented.get(key)
+            value=(previous[2] if previous and previous[0] is summary and previous[1]==speed
+                   else dict(summary,speed_health=speed))
+            presented[key]=(summary,speed,value);output.append(value)
+        self.presented=presented
+        return output

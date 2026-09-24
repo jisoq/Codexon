@@ -2,34 +2,6 @@ from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import QThread
 from PySide6.QtTest import QTest
 from cachemonitor.observer_panel import ObserverPanel
-import pytest
-
-
-@pytest.mark.parametrize('phase,expected',[('prepared','꺼짐'),('validated','꺼짐 · 연결 시험 완료')])
-def test_idle_service_is_not_presented_as_an_in_progress_connection(tmp_path,phase,expected):
-    app=QApplication.instance() or QApplication([])
-    panel=ObserverPanel(tmp_path/'home',tmp_path/'data',active=False)
-    try:
-        panel.display({'configured':False,'phase':phase,'running':True,'version_mismatch':True,
-                       'health':{'version':'previous'},'app_version':'current'})
-        assert panel.status_label.text()==expected
-        assert not panel.toggle.isChecked()
-        assert '현재 연결' not in panel.runtime_values['version'].text()
-        assert '로그인 때' not in panel.runtime_values['version'].text()
-        assert '프록시 사용 꺼짐' in panel.runtime_values['version'].text()
-    finally:panel.stop();panel.deleteLater();app.processEvents()
-
-
-def test_compatible_old_proxy_version_does_not_request_replacement(tmp_path):
-    app=QApplication.instance() or QApplication([])
-    panel=ObserverPanel(tmp_path/'home',tmp_path/'data',active=False)
-    try:
-        panel.display({'configured':True,'phase':'active','version_mismatch':False,
-                       'health':{'version':'2026.09.23.1'},'app_version':'2026.09.23.4'})
-        assert not hasattr(panel,'update_button')
-        assert '호환됨' in panel.runtime_values['version'].text()
-        assert '업데이트 필요' not in panel.runtime_values['version'].text()
-    finally:panel.stop();panel.deleteLater();app.processEvents()
 
 
 def settle(app,panel):

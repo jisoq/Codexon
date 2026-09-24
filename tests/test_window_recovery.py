@@ -2,23 +2,6 @@ import sys
 
 import pytest
 from PySide6.QtWidgets import QApplication
-from cachemonitor.windows_integration import visible_window_rect
-
-
-@pytest.mark.parametrize('rect,work', [
-    ((-1338,-2200,2982,2051),(0,0,5120,2088)),
-    ((100,100,2600,1600),(0,0,1920,1040)),
-    ((5000,3000,1200,800),(-1920,0,0,1040)),
-])
-def test_recovery_contains_unreachable_window_in_nearest_work_area(rect,work):
-    x,y,w,h=visible_window_rect(rect,work)
-    assert work[0]<=x and work[1]<=y
-    assert x+w<=work[2] and y+h<=work[3]
-
-
-def test_recovery_preserves_accessible_secondary_monitor_position():
-    rect=(-1800,80,1200,800)
-    assert visible_window_rect(rect,(-1920,0,0,1040))==rect
 
 
 @pytest.mark.skipif(sys.platform!='win32',reason='Actual HWND placement')

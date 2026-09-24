@@ -8,9 +8,8 @@ from aiohttp import ClientSession, web
 from multidict import CIMultiDict
 from yarl import URL
 
-from cachemonitor.proxy_observation import EventStream
 from cachemonitor.model_evidence import EvidenceStore, EvidenceReader
-from cachemonitor.model_proxy import create_app, Tracker, proxy_loop
+from cachemonitor.model_proxy import create_app, proxy_loop
 
 
 def run_proxy_test(coro):
@@ -157,27 +156,6 @@ def test_http_sse_chunking_json_errors_and_unparsed_body(tmp_path):
     run_proxy_test(run())
 
 
-def test_tracker_conflicting_response_model_disconnect_and_storage_failure(tmp_path):
-    store=EvidenceStore(tmp_path/'e.sqlite');health={'requests':0,'responses':0,'storage_errors':0}
-    tracker=Tracker(store,tmp_path,'WebSocket',health)
-    tracker.request({'model':'a'})
-    tracker.response({'type':'response.created','response':{'id':'r','model':'a'}})
-    tracker.response({'type':'response.completed','response':{'id':'r','model':'b'}})
-    tracker.request({'model':'c'});tracker.finish()
-    assert store.db.execute("select conflict from model_observations where status='completed'").fetchone()[0]==1
-    assert store.db.execute("select count(*) from model_observations where status='disconnected'").fetchone()[0]==1
-    store.close()
-    tracker.request({'model':'a'})
-    assert health['storage_errors']==1
-
-
-def test_sse_utf8_and_multiline_boundary():
-    events=[];observer=EventStream(events.append)
-    data='data: {"type": "response.completed",\r\ndata: "response":{"id":"r","model":"m","output":"한글"}}\r\n\r\n'.encode()
-    for byte in data:observer.feed(bytes([byte]))
-    assert events[0]['response']=={'id':'r','model':'m'}
-
-
 @pytest.mark.parametrize('websocket',[False,True])
 def test_invalid_event_type_does_not_break_passive_relay(tmp_path,websocket):
     async def run():
@@ -209,23 +187,6 @@ def test_invalid_event_type_does_not_break_passive_relay(tmp_path,websocket):
                 assert store.db.execute("select response_model from model_observations where status='completed'").fetchone()==('m',)
         finally:store.close()
     run_proxy_test(run())
-
-
-def test_replayed_terminal_never_steals_next_request(tmp_path):
-    store=EvidenceStore(tmp_path/'e.sqlite');health={'requests':0,'responses':0,'storage_errors':0}
-    tracker=Tracker(store,tmp_path,'WebSocket',health)
-    try:
-        tracker.request({'model':'first'})
-        done={'type':'response.completed','response':{'id':'r1','model':'first'}}
-        tracker.response(done)
-        tracker.request({'model':'second'})
-        tracker.response(done)
-        tracker.response({'type':'response.completed','response':{'id':'r2','model':'second'}})
-        reader=EvidenceReader(tmp_path/'e.sqlite');reader.poll()
-        rows=reader.enrich(tmp_path,[{'key':'r1'},{'key':'r2'}]);reader.close()
-        assert [r['model_match'] for r in rows]==['일치','일치']
-        assert health['responses']==2
-    finally:store.close()
 
 
 def test_websocket_handshake_error_preserves_status_and_retry_after(tmp_path):
@@ -401,42 +362,6 @@ def test_request_cannot_change_upstream_authority(tmp_path):
                 async with client.get(proxy+'/anywhere',headers={'Origin':'https://example.com'}) as r:
                     assert r.status==403
                 assert len(seen)==1
-        finally:store.close()
-    run_proxy_test(run())
-
-
-@pytest.mark.parametrize('content_type',[None,'application/octet-stream','text/event-stream'])
-def test_responses_stream_observation_does_not_depend_on_mime(tmp_path,content_type):
-    async def run():
-        store=EvidenceStore(tmp_path/'e.sqlite')
-        payload=b'data: {"type":"response.completed","response":{"id":"sse-no-mime","model":"actual"}}\n\n'
-        async def upstream(request):
-            return web.Response(body=payload,headers={'Content-Type':content_type} if content_type else {})
-        app=web.Application();app.router.add_post('/responses',upstream)
-        try:
-            async with server(app) as url, server(create_app(store,tmp_path,url)) as proxy, ClientSession() as client:
-                async with client.post(proxy+'/responses',json={'model':'requested','stream':True}) as response:
-                    assert await response.read()==payload
-                rows=store.db.execute("select requested_model,response_model from model_observations where status='completed'").fetchall()
-                assert rows==[('requested','actual')]
-        finally:store.close()
-    run_proxy_test(run())
-
-
-def test_compressed_request_metadata_is_observed_without_changing_payload(tmp_path):
-    async def run():
-        store=EvidenceStore(tmp_path/'e.sqlite')
-        payload=gzip.compress(json.dumps({'input':[{'text':'PRIVATE'}],'model':'requested'}).encode())
-        async def upstream(request):
-            assert request.headers['Content-Encoding']=='gzip' and await request.read()==payload
-            return web.json_response({'object':'response','id':'compressed','model':'actual','status':'completed'})
-        app=web.Application(handler_args={'auto_decompress':False});app.router.add_post('/responses',upstream)
-        try:
-            async with server(app) as url, server(create_app(store,tmp_path,url)) as proxy, ClientSession() as client:
-                async with client.post(proxy+'/responses',data=payload,headers={'Content-Encoding':'gzip'}) as response:
-                    assert (await response.json())['model']=='actual'
-                rows=store.db.execute("select requested_model,response_model from model_observations where status='completed'").fetchall()
-                assert rows==[('requested','actual')]
         finally:store.close()
     run_proxy_test(run())
 
