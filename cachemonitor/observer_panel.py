@@ -31,7 +31,7 @@ class ObserverPanel(Group):
         row=Row();copy=Column()
         title=Text('프록시 사용');title.setStyleSheet('font-weight: 500;');copy.addWidget(title)
         description=Text('호출·응답 모델 확인 · 켤 때 검증 호출 1회')
-        description.setWordWrap(True);description.setStyleSheet('color: #6b737c; font-size: 12px;')
+        description.setWordWrap(True);description.setStyleSheet('color: muted; font-size: 12px;')
         copy.addWidget(description);row.addLayout(copy,1)
         self.toggle=Switch();self.toggle.setAccessibleName('프록시 사용');row.addWidget(self.toggle)
         layout.addLayout(row)
@@ -47,13 +47,13 @@ class ObserverPanel(Group):
         details=Form();details.setVerticalSpacing(12);details.setHorizontalSpacing(24)
         self.runtime_values={}
         for key,title in (('guard','연결 관리'),('startup','로그인 시 실행'),('version','버전'),('path','실행 파일')):
-            name=Text(title);name.setStyleSheet('color: #6b737c;')
+            name=Text(title);name.setStyleSheet('color: muted;')
             value=Text('확인 중');value.setWordWrap(True);value.setTextFormat(Qt.PlainText)
             value.setTextInteractionFlags(Qt.TextSelectableByMouse)
             self.runtime_values[key]=value;details.addRow(name,value)
         layout.addWidget(Details('연결 정보',details))
         self.restart_label=Text();self.restart_label.setWordWrap(False);self.restart_label.setFixedHeight(24)
-        self.restart_label.setStyleSheet('color: #946b2c;');layout.addWidget(self.restart_label)
+        self.restart_label.setStyleSheet('color: warning;');layout.addWidget(self.restart_label)
         self.toggle.toggled.connect(self.request)
         self.timer=QTimer(self);self.timer.setInterval(15000)
         self.timer.timeout.connect(lambda:self.invoke('ensure'))
@@ -120,7 +120,7 @@ class ObserverPanel(Group):
         self.error_detail.body.setText(str(reason or ''))
         self.error_detail.setVisible(bool(reason))
         self.status_label.setStyleSheet('font-size: 15px; font-weight: 600; padding: 12px 0; color: '
-            +('#a24d3d' if error or phase in ('faulted','failed','recovery_failed','recovery_required') else '#327159' if self.enabled else '#6b737c')+';')
+            +('error' if error or phase in ('faulted','failed','recovery_failed','recovery_required') else 'success' if self.enabled else 'muted')+';')
         health=state.get('health') or {};runtime=state.get('runtime') or {};registration=state.get('registration')
         version=health.get('version') or '실행 안 됨'
         versions=f"앱 {state.get('app_version','—')} · 프록시 {version}"

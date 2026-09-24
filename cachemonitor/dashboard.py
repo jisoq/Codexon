@@ -762,8 +762,8 @@ class Dashboard(TrayWindow):
         self.timeline.set_rows([] if loading or not rows else timeline)
         self.source_bars.empty_text=self.timeline.empty_text;self.component_bars.empty_text=self.timeline.empty_text
         self.source_bars.setFixedHeight(max(200,40*len(view.get('sources',[]))));self.source_bars.set_rows([{**r,'metric':'cost'} for r in view.get('sources',[])])
-        component_colors={'cost_uncached':'#285FBC','cost_cached':'#0F766E','cost_written':'#8A641A','cost_unclassified':'#7A8898','cost_output':'#6551A4'}
-        self.component_bars.set_rows([{**r,'color':component_colors.get(r['key'],'#7A8898'),'metric':'cost','records':rows,'known':r.get('n',0),'calls':r.get('N',0),'missing':r.get('N',0)-r.get('n',0)} for r in view.get('components',[])] if rows else [])
+        component_colors={'cost_uncached':'uncached','cost_cached':'cached','cost_written':'written','cost_unclassified':'unknown','cost_output':'output'}
+        self.component_bars.set_rows([{**r,'color':component_colors.get(r['key'],'unknown'),'metric':'cost','records':rows,'known':r.get('n',0),'calls':r.get('N',0),'missing':r.get('N',0)-r.get('n',0)} for r in view.get('components',[])] if rows else [])
         attention=view.get('attention',{})
         self.attention_rows={}
         for key,button in self.attention_buttons.items():

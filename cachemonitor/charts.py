@@ -31,13 +31,13 @@ class Plot(Node):
         p = self._painter
         p.setRenderHint(QPainter.Antialiasing)
         p.setRenderHint(QPainter.TextAntialiasing)
-        p.fillRect(self.rect(), QColor('white'))
+        p.fillRect(self.rect(), QColor(shared_theme().palette['surface']))
         font = QFont(self.font())
         font.setPixelSize(14)
         p.setFont(font)
         self.hits = []
         if not self.rows:
-            p.setPen(QColor('#677382'))
+            p.setPen(QColor(shared_theme().palette['muted']))
             p.drawText(self.rect(), Qt.AlignCenter, getattr(self,'empty_text','기록 없음'))
         if self.hasFocus():
             p.setPen(QPen(QColor(shared_theme().palette['accent']), 1, Qt.DotLine))
@@ -60,7 +60,7 @@ class Plot(Node):
         elif self.rows and key in (Qt.Key_Return,Qt.Key_Space):self.selected.emit(self.rows[self.cursor])
 
 
-COLORS = ('#285FBC','#0F766E','#6551A4','#8A641A','#7A8898','#A45A13','#357C9B','#97588C')
+COLORS = ('cached','uncached','written','output','reasoning','completed','unknown','warning')
 
 def value_text(value, metric='cost'):
     if value is None: return '—'

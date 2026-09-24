@@ -12,14 +12,14 @@ Item {
         detailsText.text = root.node.cellDetails(root.node.state.selected, table.keyboardColumn)
         details.open()
     }
-    Rectangle { anchors.fill: parent; color: (appTheme.palette && appTheme.color("white")); border.color: (appTheme.palette && appTheme.color("#e1e7ef")); radius: 6 }
+    Rectangle { anchors.fill: parent; color: (appTheme.palette && appTheme.color("surface")); border.color: (appTheme.palette && appTheme.color("border")); radius: 6 }
     HorizontalHeaderView {
         id: header; anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top
         syncView: table; clip: true
         delegate: Rectangle {
             required property var display; required property int column; implicitWidth: 150; implicitHeight: 40
-            color: (appTheme.palette && appTheme.color("#f0f4f8"))
-            Text { id: headerLabel; anchors.fill: parent; anchors.margins: 9; text: appLanguage.text(display); elide: Text.ElideRight; verticalAlignment: Text.AlignVCenter; color: (appTheme.palette && appTheme.color("#526278")); font.pixelSize: 14; font.weight: Font.Medium; font.family: appTheme.family }
+            color: (appTheme.palette && appTheme.color("secondary"))
+            Text { id: headerLabel; anchors.fill: parent; anchors.margins: 9; text: appLanguage.text(display); elide: Text.ElideRight; verticalAlignment: Text.AlignVCenter; color: (appTheme.palette && appTheme.color("muted")); font.pixelSize: 14; font.weight: Font.Medium; font.family: appTheme.family }
             HoverHandler { id: headerHover }
             UiToolTip { visible: headerHover.hovered && headerLabel.truncated; text: appLanguage.text(display) }
             MouseArea {
@@ -86,13 +86,13 @@ Item {
             property bool exactValue: (root.node.state.noElideColumns || []).indexOf(root.node.logicalColumn(column)) >= 0
             implicitWidth: exactValue ? Math.max(70,cellLabel.implicitWidth+18) : 150
             implicitHeight: root.node.state.rowHeight
-            color: root.node.state.selected === row ? (appTheme.palette && appTheme.color("#e7f0fb")) : cacheZero ? (root.hoveredRow === row ? (appTheme.palette && appTheme.color("#ffe8c2")) : (appTheme.palette && appTheme.color("#fff4e4"))) : cellBackground || (root.hoveredRow === row ? (appTheme.palette && appTheme.color("#f2f6fa")) : (appTheme.palette && appTheme.color("white")))
-            Rectangle { anchors.left: parent.left; anchors.right: parent.right; anchors.bottom: parent.bottom; height: 1; color: (appTheme.palette && appTheme.color("#edf0f5")) }
+            color: root.node.state.selected === row ? (appTheme.palette && appTheme.color("secondary")) : cacheZero ? (root.hoveredRow === row ? (appTheme.palette && appTheme.color("warning_hover")) : (appTheme.palette && appTheme.color("warning_surface"))) : cellBackground || (root.hoveredRow === row ? (appTheme.palette && appTheme.color("secondary")) : (appTheme.palette && appTheme.color("surface")))
+            Rectangle { anchors.left: parent.left; anchors.right: parent.right; anchors.bottom: parent.bottom; height: 1; color: (appTheme.palette && appTheme.color("border")) }
             Rectangle { visible: root.node.state.selected === row && column === 0; width: 2; height: parent.height; color: appTheme.palette.accent }
             Rectangle { objectName: "cell-data-bar"; visible: !!root.node.state.dataBars && cellBar >= 0; anchors.left: parent.left; anchors.leftMargin: 6; anchors.verticalCenter: parent.verticalCenter; width: Math.min(140,Math.max(0,parent.width-12))*Math.max(0,cellBar); height: 14; radius: 2; color: appTheme.palette.accent; opacity: .16 }
-            Text { id: cellLabel; objectName: "cell-label"; anchors.fill: parent; anchors.leftMargin: 9; anchors.rightMargin: 9; text: verbatim ? display : appLanguage.text(display); wrapMode: !exactValue && root.node.state.rowHeight > 40 ? Text.Wrap : Text.NoWrap; elide: exactValue ? Text.ElideNone : Text.ElideRight; horizontalAlignment: alignment & Qt.AlignRight ? Qt.AlignRight : Qt.AlignLeft; verticalAlignment: Text.AlignVCenter; font.pixelSize: 14; font.family: appTheme.family; font.features: { "tnum": 1 }; color: (appTheme.palette && appTheme.color("#263344")) }
-            Rectangle { anchors.fill: parent; color: (appTheme.palette && appTheme.color("#2397c0")); opacity: changedCell * .18 }
-            Rectangle { objectName: "cache-zero-marker"; visible: cacheZero && column === 0; anchors.left: parent.left; anchors.top: parent.top; anchors.bottom: parent.bottom; width: 3; color: (appTheme.palette && appTheme.color("#c77e23")) }
+            Text { id: cellLabel; objectName: "cell-label"; anchors.fill: parent; anchors.leftMargin: 9; anchors.rightMargin: 9; text: verbatim ? display : appLanguage.text(display); wrapMode: !exactValue && root.node.state.rowHeight > 40 ? Text.Wrap : Text.NoWrap; elide: exactValue ? Text.ElideNone : Text.ElideRight; horizontalAlignment: alignment & Qt.AlignRight ? Qt.AlignRight : Qt.AlignLeft; verticalAlignment: Text.AlignVCenter; font.pixelSize: 14; font.family: appTheme.family; font.features: { "tnum": 1 }; color: (appTheme.palette && appTheme.color("ink")) }
+            Rectangle { anchors.fill: parent; color: (appTheme.palette && appTheme.color("accent")); opacity: changedCell * .18 }
+            Rectangle { objectName: "cache-zero-marker"; visible: cacheZero && column === 0; anchors.left: parent.left; anchors.top: parent.top; anchors.bottom: parent.bottom; width: 3; color: (appTheme.palette && appTheme.color("warning")) }
             Rectangle { objectName:"row-hover-feedback";anchors.fill:parent;color:appTheme.palette.accent;opacity:root.hoveredRow===row ? .08 : 0 }
             HoverHandler { id: hover;cursorShape:Qt.PointingHandCursor;onHoveredChanged: { if(hovered) root.hoveredRow=row;else if(root.hoveredRow===row) root.hoveredRow=-1 } }
             UiToolTip { objectName: "cell-overflow-tip"; visible: hover.hovered && cellLabel.truncated; text: display }
@@ -121,12 +121,12 @@ Item {
     }
     Rectangle {
         id: footer; anchors.left: parent.left; anchors.right: parent.right; anchors.bottom: parent.bottom
-        height: 30; color: (appTheme.palette && appTheme.color("#fafbfd"))
-        Rectangle { anchors.top: parent.top; width: parent.width; height: 1; color: (appTheme.palette && appTheme.color("#e1e7ef")) }
+        height: 30; color: (appTheme.palette && appTheme.color("secondary"))
+        Rectangle { anchors.top: parent.top; width: parent.width; height: 1; color: (appTheme.palette && appTheme.color("border")) }
         Text {
             anchors.left: parent.left; anchors.leftMargin: 9; anchors.verticalCenter: parent.verticalCenter
             text: table.rows.toLocaleString(Qt.locale(), "f", 0) + appLanguage.text("개")
-            color: (appTheme.palette && appTheme.color("#66768c")); font.family: appTheme.family; font.pixelSize: 12
+            color: (appTheme.palette && appTheme.color("muted")); font.family: appTheme.family; font.pixelSize: 12
         }
         UiButton {
             objectName: "cell-details-button"
@@ -140,7 +140,7 @@ Item {
     }
     Text {
         anchors.centerIn: table; visible: table.rows === 0
-        text: appLanguage.text("기록 없음"); color: (appTheme.palette && appTheme.color("#77859a")); font.family: appTheme.family; font.pixelSize: 14
+        text: appLanguage.text("기록 없음"); color: (appTheme.palette && appTheme.color("muted")); font.family: appTheme.family; font.pixelSize: 14
     }
     Popup {
         id: details; objectName: "cell-details-popup"
@@ -148,16 +148,16 @@ Item {
         width: Math.min(540, parent ? parent.width - 48 : 540)
         height: Math.min(380, parent ? parent.height - 48 : 380)
         padding: 20; modal: true; focus: true
-        background: Rectangle { color: (appTheme.palette && appTheme.color("white")); radius: 8; border.color: (appTheme.palette && appTheme.color("#cdd5df")) }
+        background: Rectangle { color: (appTheme.palette && appTheme.color("surface")); radius: 8; border.color: (appTheme.palette && appTheme.color("border")) }
         contentItem: ColumnLayout {
-            Text { text: appLanguage.text("셀 상세"); font.family: appTheme.family; font.pixelSize: 18; font.bold: true; color: (appTheme.palette && appTheme.color("#243247")) }
+            Text { text: appLanguage.text("셀 상세"); font.family: appTheme.family; font.pixelSize: 18; font.bold: true; color: (appTheme.palette && appTheme.color("ink")) }
             ScrollView {
                 Layout.fillWidth: true; Layout.fillHeight: true; clip: true
                 contentWidth: availableWidth
                 TextArea {
                     id: detailsText; objectName: "cell-details-text"
                     readOnly: true; selectByMouse: true; wrapMode: TextEdit.Wrap
-                    textFormat: TextEdit.PlainText; color: (appTheme.palette && appTheme.color("#344054"))
+                    textFormat: TextEdit.PlainText; color: (appTheme.palette && appTheme.color("ink"))
                     font.family: appTheme.family; font.pixelSize: 14
                     background: null
                 }

@@ -26,7 +26,7 @@ Item {
             Keys.onReturnPressed: activate()
             Keys.onEnterPressed: activate()
             Keys.onSpacePressed: activate()
-            Rectangle { anchors.fill: parent; color: "#01000000" }
+            Rectangle { anchors.fill: parent; color: appTheme.palette.hit_surface }
             Rectangle {
                 x: 0; y: parent.height - root.s.scale
                 width: parent.width; height: root.s.scale; color: root.s.accent

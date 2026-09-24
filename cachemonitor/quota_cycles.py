@@ -470,6 +470,7 @@ def quota_value_history(report, rows):
                             'priced_calls': summary['observed_priced_calls'],
                             'calls': summary['observed_calls'],
                             'value': value*100 if value is not None else None})
+            periods[-1]['cost_intervals']=intervals
     return result, periods
 
 

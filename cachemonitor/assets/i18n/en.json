@@ -1631,5 +1631,11 @@
   "호출별 (입력 − 캐시 읽기 − 캐시 쓰기) 합계": "Sum of (input − cache reads − cache writes) per call",
   "호출별 (출력 − 추론) 합계": "Sum of (output − reasoning) per call",
   "Codexon 재시작": "Restart Codexon",
-  "앱을 다시 시작하지 못했습니다. 다시 시도해 주세요.": "Could not restart the app. Please try again."
+  "앱을 다시 시작하지 못했습니다. 다시 시도해 주세요.": "Could not restart the app. Please try again.",
+  "모델별 점유율 · 5분": "Model share · 5 min",
+  "모델별 점유율 · 5분 · API 환산액 증가분": "Model share · 5 min · API-equivalent cost increase",
+  "확인된 비용 증가 없음": "No recorded cost increase",
+  "미확인 · 모델 비용과 차트 증가분의 대응을 확인할 수 없습니다": "Unknown · Model costs cannot be reconciled with the chart increase",
+  "━ 비용 증가 없음": "━ No cost increase",
+  "▧ 미확인": "▧ Unknown"
 }

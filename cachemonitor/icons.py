@@ -15,10 +15,10 @@ def tray_icon(rate=None, warning=False, error=False, text=None):
     brand = QPixmap(str(Path(__file__).parent/'assets'/'brand'/f'codexon-{mode}-ui.png')).scaled(60, 60, Qt.KeepAspectRatio, Qt.SmoothTransformation)
     painter.drawPixmap(2, 2, brand)
     if text is not None or error or warning:
-        color = "#a57929" if error else "#b64235" if warning else "#263344"
+        color = shared_theme().palette['error' if error else 'warning' if warning else 'ink']
         painter.setBrush(QColor(color));painter.setPen(Qt.NoPen)
         painter.drawRoundedRect(29, 29, 34, 34, 10, 10)
-        painter.setPen(Qt.white)
+        painter.setPen(QColor(shared_theme().readableText('surface',color)))
         label = text if text is not None else "!"
         painter.setFont(QFont("Segoe UI", 12 if len(label)>2 else 17, QFont.Bold))
         painter.drawText(29, 29, 34, 34, Qt.AlignCenter, label)

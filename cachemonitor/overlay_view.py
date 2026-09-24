@@ -9,7 +9,7 @@ from .quick_runtime import QuickHost
 from .overlay_appearance import default_appearance
 from .overlay_navigation import navigation_target
 from .ui_details import recorded, observed_transport, model_comparison
-from .token_colors import TOKEN_COLORS, token_palette, readable
+from .token_colors import TOKEN_COLORS, ui_palette, readable
 from .i18n import tr, Verbatim
 from .charts import value_text
 
@@ -132,23 +132,10 @@ def contrast(a,b):
     lo,hi=sorted((luminance(a),luminance(b)));return (hi+.05)/(lo+.05)
 
 def palette(appearance):
-    dark=appearance.dark
-    p=dict(surface=appearance.panel_surface or appearance.surface,ink=appearance.ink,
-           band='#252C27' if dark else '#EDF1EE',secondary='#B6C2BA' if dark else '#53615A',
-           meta='#95A59B' if dark else '#647069',border='#455048' if dark else '#CDD5D0',
-           track='#343D37' if dark else '#E2E7E4',warning='#EDB563' if dark else '#9B5E17',
-           error='#F08B85' if dark else '#AF443E',**token_palette(appearance))
-    if p['surface'].lower()!=default_appearance(dark).surface.lower():
-        p.update(band=mix(p['surface'],p['ink'],.06),secondary=mix(p['ink'],p['surface'],.24),
-                 meta=mix(p['ink'],p['surface'],.34),border=mix(p['surface'],p['ink'],.23),track=mix(p['surface'],p['ink'],.12))
-    target=max(('#FFFFFF','#000000'),key=lambda value:contrast(value,p['surface']))
-    p['cached_text']=readable(p['cached'], (p['surface'],))
-    for key in ('ink','secondary','meta','warning','error'):
-        for _ in range(64):
-            if contrast(p[key],p['surface'])>=5:break
-            p[key]=mix(p[key],target,.08)
-        if contrast(p[key],p['surface'])<4.5:p[key]=target
+    p=ui_palette(appearance)
+    p.update(surface=p['overlay'],band=p['panel'],secondary=p['muted'],meta=p['muted'])
     return {key:QColor(value) for key,value in p.items()}
+
 
 class Drawing:
     def __init__(self,painter,content):
