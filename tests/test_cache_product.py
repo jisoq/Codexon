@@ -112,6 +112,49 @@ def test_natural_history_to_policy_no_maintenance_prerequisite(tmp_path):
     asyncio.run(scheduler.close());control.close()
 
 
+@pytest.mark.parametrize('choice',['cancel','dismiss','timeout','released','unavailable','waiting'])
+def test_guard_cancellation_preserves_idle_exposure_without_waiting_for_nonexistent_usage(tmp_path,choice):
+    from cachemonitor.cache_policy import Gap,decide
+    path=tmp_path/'index.sqlite';control=Control(control_path(path));start=time.time()-230000;history=[]
+    def append(i):
+        at=start+i*2100;turn=str(i)
+        control.db.execute('INSERT INTO cache_inputs VALUES(?,?,?,?,?,?)',('home','s',turn,at,'gpt-6-luna','UserPromptSubmit'))
+        row=dict(profile(),key='cold'+turn,turn=turn,ts=at+1,cached=0)
+        history.extend((row,dict(row,key='warm'+turn,ts=at+2,cached=99000)))
+    def evaluate(now):
+        enrich([dict(home='home',id='s',history=history)],path,now)
+        gaps={turn:Gap(**json.loads(data)) for turn,data in control.db.execute('SELECT turn,data FROM cache_gaps')}
+        return gaps,decide(list(gaps.values()),latency_bound=30,scheduler_slack=1,max_calls=2)
+    for i in range(6):append(i)
+    now=history[-1]['ts']+10
+    before,decision=evaluate(now);assert decision['state']=='eligible'
+    at=start+2*2100+100
+    control.db.execute('INSERT INTO cache_inputs VALUES(?,?,?,?,?,?)',('home','s','guard',at,'gpt-6-sol','UserPromptSubmit'))
+    # First reproduce the pre-decision gap, then persist the terminal choice.
+    assert evaluate(now)[1]['reason']=='natural_cost_bounds_unobserved'
+    control.db.execute('INSERT INTO cache_tickets VALUES(?,?,?,?,?,?,?,?,?)',('ticket','home','s','guard','gpt-6-sol','digest',at,at+60,choice))
+    after,decision=evaluate(now)
+    denied=choice in ('cancel','dismiss','timeout')
+    if denied:
+        assert decision['state']=='eligible'
+        assert {k:v for k,v in after.items() if k!='guard'}==before
+        assert after['guard'].origin=='guard_cancelled' and after['guard'].benefit_lower is None
+    else:assert decision['reason']=='natural_cost_bounds_unobserved'
+    for i in range(6,106):append(i)
+    after,decision=evaluate(history[-1]['ts']+10)
+    assert (decision['state']=='eligible')==denied
+    if denied:
+        # A cancelled last submission cannot erase an expensive censored idle gap.
+        control.db.execute("UPDATE cache_inputs SET at=? WHERE turn='guard'",(history[-1]['ts']+10,))
+        gaps,_=evaluate(history[-1]['ts']+20000)
+        assert gaps['105'].seconds==20000 and not gaps['105'].returned and gaps['105'].maintenance_upper>0
+        # Contradictory real request evidence wins over cancellation, even if its
+        # usage is incomplete. Neither missing usage nor observed losses are free.
+        history.append(dict(history[-1],turn='guard',key='sent-anyway',ts=history[-1]['ts']+11,output=None))
+        assert evaluate(history[-1]['ts']+20000)[1]['reason']=='natural_cost_bounds_unobserved'
+    control.close()
+
+
 @pytest.mark.parametrize('change',[None,'model','effort','service_tier','input','compaction_epoch'])
 def test_current_cohort_recovers_after_changes_but_keeps_unknown_and_no_return(tmp_path,change):
     from cachemonitor.cache_policy import Gap,decide

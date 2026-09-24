@@ -163,8 +163,7 @@ class CachePanel(Group):
                     if self.dialog:self.dialog.reject()
             if not self.dialog and waiting:self.show_ticket(waiting[0])
             states=[json.loads(r[0]) for r in self.control.db.execute('SELECT data FROM cache_status WHERE home=?',(self.home,))]
-            forecasts=[s for s in states if (s.get('observation_only') or s.get('passive_analysis')) and s.get('maintenance_expected') is not None
-                       and s.get('cost_valid_until',s.get('observed_at',0)+1800)>time.time()]
+            forecasts=self.control.forecasts(self.home,time.time())
             if forecasts:
                 s=max(forecasts,key=lambda s:s.get('observed_at',0))
                 self.estimate.setText(f"유지 1회 예상 {usd(s['maintenance_expected'])} · 재사용 실패 시 {usd(s['maintenance_adverse'])}\nAPI 환산 예상이며 실제 비용 상한이 아닙니다.")

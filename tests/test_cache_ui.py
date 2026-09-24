@@ -27,6 +27,40 @@ def test_panel_recovers_after_temporary_storage_error(tmp_path,monkeypatch):
     finally:panel.stop()
 
 
+def test_forecast_survives_automatic_policy_and_execution_states_but_not_context_or_expiry(tmp_path):
+    import asyncio
+    from cachemonitor.cache_scheduler import Scheduler
+    from cachemonitor.cache_integration import enrich
+    app=QApplication.instance() or QApplication([])
+    index=tmp_path/'index.sqlite';panel=CachePanel('home',index,active=True);host=mount(panel)
+    scheduler=Scheduler('home',panel.path,continuous_capture=True)
+    try:
+        row=dict(profile(),turn='t',ts=time.time(),key='original')
+        enrich([dict(home='home',id='session',history=[row])],index,time.time())
+        request=body();result=dict(response(),id='original')
+        scheduler.executor.contexts.completed(request,result)
+        scheduler.snapshot(request,result,time.monotonic(),URL,HEADERS,False)
+        snapshot=scheduler.snapshots['session']
+        observed=scheduler.policy('session',snapshot,observe=True)
+        panel.poll();label=panel.estimate.text()
+        assert '유지 1회 예상' in label
+        scheduler.control.set('automatic',True)
+        decision=scheduler.policy('session',snapshot)
+        assert decision.get('maintenance_expected')==observed['maintenance_expected']
+        assert not decision.get('observation_only') and not decision.get('passive_analysis')
+        for status in (decision,dict(state='reserved'),dict(state='completed'),dict(state='stopped',reason='revoked')):
+            scheduler.control.status('home','session',status)
+            panel.poll();assert panel.estimate.text()==label
+        forecast=scheduler.control.forecasts('home',time.time())[0]
+        scheduler.control.forecast('home','session',dict(forecast,cost_valid_until=time.time()-1))
+        panel.poll();assert '수집하고' in panel.estimate.text()
+        scheduler.control.forecast('home','session',forecast)
+        scheduler.control.profile('home','session',dict(row,key='changed',ts=row['ts']+1,model='gpt-6-astra'))
+        panel.poll();assert '수집하고' in panel.estimate.text()
+        assert not host.qml_errors
+    finally:asyncio.run(scheduler.close());panel.stop();dispose(host)
+
+
 def test_master_switch_navigation_and_independent_features(tmp_path):
     from PySide6.QtCore import QSettings
     from cachemonitor.dashboard import Dashboard
@@ -111,6 +145,7 @@ def test_rendered_hook_approval_cancel_close_timeout_and_disconnect(tmp_path):
         assert '이력 추가만으로 활성화되지 않음' in panel.status.text()
         assert '시험 호출은 자동으로 보내지 않습니다' in panel.activation.text()
         panel.control.status('home','s',dict(state='observing',observation_only=True,observed_at=time.time(),
+            snapshot='original',
             model='gpt-6-astra',effort='high',service_tier='Standard',source_transport='WebSocket',maintenance_transport='HTTP',
             maintenance_expected=.012,maintenance_adverse=.1,cost_stop_scenario=.024,operating_scope_available=False))
         panel.poll()

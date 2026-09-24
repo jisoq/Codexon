@@ -36,6 +36,9 @@ class Scheduler:
              'ts':time.time(),'request_start':time.time()-(time.monotonic()-anchor),'key':response['id']}
         self.snapshots[sid]=dict(request=request,response=response,anchor=anchor,url=url,headers=headers,websocket=websocket,row=row,
                                 generation=self.executor.generation if generation is None else generation,revision=self.control.revision(self.home))
+        # A new context must never borrow the previous context's estimate, even
+        # while the usage collector is still catching up with this response.
+        self.control.forecast(self.home,sid,dict(snapshot=response['id'],observed_at=row['ts']))
         # Contexts owns the bounded copy. Drop evicted snapshots and credentials.
         self.snapshots={s:v for s,v in self.snapshots.items() if v['response']['id'] in self.executor.contexts.responses}
 
@@ -64,8 +67,6 @@ class Scheduler:
              'compaction_epoch':profile.get('compaction_epoch')};snapshot['row']=row
         scope=target(self.home,snapshot['request'],execution_url,snapshot['headers'],execution_websocket,
                      observed_tier=row.get('service_tier')) if not supported else None
-        if not observing and not supported and not scope:return dict(state='disabled',reason='operating_scope_unavailable',calls=0,
-            history_can_unlock=False,server_output_cap=False)
         # Do not mix old model/effort/context regimes with the current context.
         # Unclassified legacy records inside this regime remain unknown, not free.
         rows=[g for g in rows if g.scope==profile['policy_scope'] or
@@ -91,6 +92,18 @@ class Scheduler:
             # Feed the existing chronological comparison with an estimate, not
             # an invented output/cost guarantee. Preserve unknown historical costs.
             bounds={**scenarios,'maintenance_upper':scenarios['maintenance_expected']}
+        forecast=scenarios or operating_scenarios(row,profile,extra,[])
+        if forecast:
+            self.control.forecast(self.home,sid,{**forecast,
+                'snapshot':snapshot['response']['id'],'observed_at':row['ts'],
+                'model':row['model'],'effort':row['effort'],'service_tier':row['service_tier'],
+                'source_transport':'WebSocket' if snapshot['websocket'] else 'HTTP',
+                'maintenance_transport':'WebSocket' if execution_websocket else 'HTTP',
+                'operating_scope_available':bool(scope),'cost_stop_scenario':2*forecast['maintenance_expected'],
+                'cost_valid_until':time.time()+1800-(time.monotonic()-snapshot['anchor']),
+                'worker_revision':3 if self.continuous_capture else 2})
+        if not observing and not supported and not scope:return dict(state='disabled',reason='operating_scope_unavailable',calls=0,
+            history_can_unlock=False,server_output_cap=False)
         # Reprice every historical maintenance against this session's size/budget.
         rows=[Gap(g.at,g.seconds,g.returned,min(g.benefit_lower,bounds['benefit_lower']) if g.benefit_lower is not None else None,
                   max(g.maintenance_upper,bounds['maintenance_upper']) if g.maintenance_upper is not None else None,
@@ -269,7 +282,8 @@ class Scheduler:
             previous=self.evaluations.get(sid)
             if previous and previous[0]==snapshot['response']['id'] and now-previous[1]<60:continue
             self.evaluations[sid]=(snapshot['response']['id'],now)
-            decision=self.policy(sid,snapshot);self.control.status(self.home,sid,decision)
+            decision=self.policy(sid,snapshot)
+            self.control.status(self.home,sid,{**decision,'snapshot':snapshot['response']['id'],'observed_at':snapshot['row']['ts']})
             if decision['state']=='eligible':self.jobs[sid]=asyncio.create_task(self.maintain(sid,snapshot,decision,revision))
 
     async def serve(self):
