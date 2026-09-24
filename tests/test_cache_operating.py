@@ -69,6 +69,14 @@ def test_natural_policy_consent_capture_wire_and_final_accounting(tmp_path):
             assert decision['maintenance_adverse']>decision['maintenance_expected']>0
             assert 'output_cap' not in decision and 'maintenance_upper' not in decision
             assert scheduler.control.get('bounded_provider:chatgpt.com') is None
+            # Longer-return history can justify 3 calls but not this 2-call pilot.
+            saved=list(scheduler.control.db.execute('SELECT turn,data FROM cache_gaps'))
+            for turn,data in saved:
+                gap=json.loads(data)
+                if gap['returned']:gap['seconds']=5800
+                scheduler.control.db.execute('UPDATE cache_gaps SET data=? WHERE turn=?',(json.dumps(gap),turn))
+            assert scheduler.policy('session',snapshot)['reason']=='no_positive_forward_estimate'
+            for turn,data in saved:scheduler.control.db.execute('UPDATE cache_gaps SET data=? WHERE turn=?',(data,turn))
             scheduler.journal.operations.consent(decision['proposal'])
             real_policy=scheduler.policy
             scheduler.policy=lambda sid,snap:dict(real_policy(sid,snap),interval=0)

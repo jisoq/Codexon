@@ -89,7 +89,17 @@ class Scheduler:
                   max(g.maintenance_upper,bounds['maintenance_upper']) if g.maintenance_upper is not None else None,
                   g.origin,g.settled,g.scope,g.comparison) for g in rows]
         caps=[int(g.benefit_lower/bounds['maintenance_upper']) for g in rows if type(g.benefit_lower) in (int,float) and bounds['maintenance_upper']>0]
-        decision=decide(rows,latency_bound=30,scheduler_slack=1,max_calls=max(1,min(100,max(caps,default=1))))
+        max_calls=max(1,min(100,max(caps,default=1)))
+        if scenarios:
+            # Optimize INSIDE the consent allowance, never truncate a profitable
+            # long-horizon policy to a shorter, potentially loss-making pilot.
+            grant=self.journal.operations.permission(scope)
+            remaining=self.journal.operations.stats(grant)['remaining'] if grant and not grant['stopped'] else 2
+            if not remaining:
+                self.journal.operations.stop(grant['id'],'call_limit')
+                return dict(state='stopped',reason='call_limit',calls=0,server_output_cap=False)
+            max_calls=min(max_calls,2,remaining)
+        decision=decide(rows,latency_bound=30,scheduler_slack=1,max_calls=max_calls)
         if scenarios:
             result={**decision,**scenarios,'latency_bound':30}
             if decision['state']!='eligible':return result
@@ -102,7 +112,7 @@ class Scheduler:
                            adverse=scenarios['maintenance_adverse'],output_high=scenarios['output_high'])
             reason=self.journal.operations.check(operation)
             if reason:return {**result,'state':'stopped' if reason!='operation_busy' else 'waiting','reason':reason,'calls':0}
-            return {**result,'operation':operation,'calls':min(decision['calls'],self.journal.operations.stats(grant)['remaining'])}
+            return {**result,'operation':operation}
         return {**decision,**bounds,'latency_bound':30}
 
     async def maintain(self,sid,snapshot,decision,revision):
