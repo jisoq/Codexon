@@ -33,7 +33,7 @@ def scoped_history(history):
     """Continuous context regime, including unknown/unprofitable calls inside it."""
     result=[];known={};scope=None;start=None
     for row in sorted(history,key=lambda r:r['ts']):
-        if row.get('purpose')=='maintenance':continue
+        if row.get('purpose') in ('maintenance','diagnostic'):continue
         if scope is None or changed_conditions(known,row):
             start=0 if scope is None else row['ts']
             scope=row['key'];known={}

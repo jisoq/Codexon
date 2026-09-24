@@ -90,7 +90,8 @@ def record_summary(rows):
 
 
 class Dashboard(TrayWindow):
-    def __init__(self, homes, start_worker=True, settings=None, index_path=None, static_snapshot=None, live_limits=True, manage_observer=False):
+    def __init__(self, homes, start_worker=True, settings=None, index_path=None, static_snapshot=None, live_limits=True, manage_observer=False,model_evidence_path=None,cache_control=None):
+        self.cache_control_enabled=manage_observer if cache_control is None else cache_control
         super().__init__()
         self.settings=settings or QSettings('CacheMonitor','CacheMonitor')
         self.observer_home=homes[0] if homes else str(Path.home()/'.codex')
@@ -171,7 +172,7 @@ class Dashboard(TrayWindow):
         self.restore_preferences();self.restoring=False;self.change_page(self.current_page)
         if start_worker:
             if homes and static_snapshot is None:self.start_quota_service(homes[0])
-            self.worker=AnalysisBridge(homes,index_path,static_snapshot)
+            self.worker=AnalysisBridge(homes,index_path,static_snapshot,model_evidence_path)
             self.worker.snapshot.connect(self.receive);self.worker.result.connect(self.analysis_ready)
             self.worker.failure.connect(self.analysis_failed);self.worker.record.connect(self.record_ready);self.worker.start();self.render()
         elif static_snapshot is not None:self.receive(static_snapshot)
@@ -1431,7 +1432,7 @@ class Dashboard(TrayWindow):
         self.observer_panel=ObserverPanel(self.observer_home,self.observer_directory,active=self.manage_observer,parent=self)
         self.settings_page.add_widget(3, self.observer_panel)
         from .cache_panel import CachePanel
-        self.cache_panel=CachePanel(self.observer_home,self.index_path,active=self.manage_observer,parent=self)
+        self.cache_panel=CachePanel(self.observer_home,self.index_path,active=self.cache_control_enabled,parent=self)
         self.settings_page.add_widget(6,self.cache_panel)
         self.observer_panel.status_observed.connect(self.cache_panel.proxy_status)
         legacy_notifications = self.settings.value('notifications',True,type=bool)

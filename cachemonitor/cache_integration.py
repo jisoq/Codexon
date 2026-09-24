@@ -25,7 +25,7 @@ def enrich(sessions,index_path,now,homes=None):
                                            (session['home'],session['id'],now-60*86400)))
             turns={};firsts={}
             for row in history:
-                if row.get('purpose')!='maintenance':
+                if row.get('purpose') not in ('maintenance','diagnostic'):
                     turns[row.get('turn')]=row;firsts.setdefault(row.get('turn'),row)
             for i,(turn,at) in enumerate(inputs):
                 previous=turns.get(turn)
@@ -48,24 +48,24 @@ def enrich(sessions,index_path,now,homes=None):
         maintenance=[r for r in journal.rows() if homes is None or r['home'] in homes]
         groups={}
         for row in maintenance:
-            key=(row['home'],row['sid'])
+            key=(row['home'],row['sid'],row['purpose'])
             if key not in groups:
-                groups[key]=Session('maintenance:'+row['sid'],row['home'],title='캐시 유지',parent_thread_id=row['sid'])
+                groups[key]=Session(row['purpose']+':'+row['sid'],row['home'],title='연결 진단' if row['purpose']=='diagnostic' else '캐시 유지',parent_thread_id=row['sid'])
             session=groups[key]
             session.add_usage(row['ts'],row['key'],dict(input_tokens=row['input'],cached_input_tokens=row['cached'],
                 cache_write_input_tokens=row['written'],output_tokens=row['output'],reasoning_output_tokens=row['reasoning']),
                 row['model'],turn=row['key'],effort=row['effort'],service_tier=row['service_tier'])
             request=session.requests[-1]
-            request.purpose='maintenance';request.request_start=row['request_start']
+            request.purpose=row['purpose'];request.request_start=row['request_start']
             session.turn_records[row['key']]=dict(started_at=row['request_start'],ended_at=row['request_end'],
                 state={'completed':'완료','sent':'진행','unknown':'미확인'}.get(row['state'],'중단'))
-        for session in groups.values():
+        for (_,_,purpose),session in groups.items():
             view=session.view(now)
-            view.update(source='maintenance',collection_complete=True,archived=False,purpose='maintenance')
+            view.update(source='maintenance',collection_complete=True,archived=False,purpose=purpose)
             sessions.append(view)
         audit=[];effects=[];compactions=[];delegated=[]
         for session in sessions:
-            if session.get('purpose')=='maintenance':continue
+            if session.get('purpose') in ('maintenance','diagnostic'):continue
             history=session.get('history',[])
             if session.get('parent_thread_id'):delegated.extend(history)
             for previous,current in zip(history,history[1:]):
@@ -73,7 +73,7 @@ def enrich(sessions,index_path,now,homes=None):
                     compactions.append(dict(before=previous.get('input'),after=current.get('input'),quality_measured=False))
             for item in observations(history[-101:])[-100:]:
                 audit.append({**item,'title':session.get('title') or session['id'],'sid':session['id'],'home':session['home']})
-            own=[r for r in maintenance if r['home']==session['home'] and r['sid']==session['id']]
+            own=[r for r in maintenance if r['home']==session['home'] and r['sid']==session['id'] and r['purpose']=='maintenance']
             for snapshot in dict.fromkeys(r['snapshot'] for r in own):
                 jobs=[r for r in own if r['snapshot']==snapshot]
                 original=next((r for r in history if r['key']==snapshot),None)
@@ -86,7 +86,7 @@ def enrich(sessions,index_path,now,homes=None):
                     user_response=follow['key'] if follow else None,user_read=follow.get('cached') if follow else None,
                     user_input=follow.get('input') if follow else None,causal_saving=None))
         audit.sort(key=lambda r:r['ts'])
-        return dict(calls=len(maintenance),known_cost=sum(r['cost'] for r in maintenance if r['cost'] is not None),
+        return dict(calls=len(maintenance),diagnostic_calls=sum(r['purpose']=='diagnostic' for r in maintenance),known_cost=sum(r['cost'] for r in maintenance if r['cost'] is not None),
                     priced=sum(r['cost'] is not None for r in maintenance),
                     unknown=sum(not r['usage_known'] for r in maintenance),audit=audit[-100:],
                     shortfalls=sum(bool(r['reuse_shortfall_scenario']) for r in audit[-100:]),effects=effects[-100:],
@@ -95,7 +95,7 @@ def enrich(sessions,index_path,now,homes=None):
                         priced=sum(token_cost(r)['cost'] is not None for r in delegated)),
                     request_activity=[dict(home=r['home'],attempt=r['key'],response_id=r['key'],
                         request_observed_at=r['request_start'],ts=r['ts'],
-                        status='completed' if r['state']=='completed' else 'created',purpose='maintenance') for r in maintenance])
+                        status='completed' if r['state']=='completed' else 'created',purpose=r['purpose']) for r in maintenance])
     finally:
         if journal:journal.close()
         control.close()
