@@ -22,8 +22,9 @@ def changed_conditions(previous,current):
     """Only observed changes establish a new cohort; missing data never does."""
     known=lambda v:v not in (None,'','미확인')
     changed=[k for k in ('model','effort','service_tier','compaction_epoch')
-             if known(previous.get(k)) and known(current.get(k)) and previous[k]!=current[k]]
-    if all(type(r.get('input')) is int for r in (previous,current)) and current['input']<previous['input']:
+             if known(previous.get(k)) and known(current.get(k)) and previous[k]!=current[k]
+             and (k!='service_tier' or not any(r.get('mode_conflict') for r in (previous,current)))]
+    if all(type(r.get('input')) is int and not r.get('input_conflict') for r in (previous,current)) and current['input']<previous['input']:
         changed.append('context_shrink')
     return changed
 
@@ -37,6 +38,8 @@ def scoped_history(history):
             start=0 if scope is None else row['ts']
             scope=row['key'];known={}
         for key in ('model','effort','service_tier','compaction_epoch','input'):
+            if key=='input' and row.get('input_conflict'):continue
+            if key=='service_tier' and row.get('mode_conflict'):continue
             if row.get(key) not in (None,'','미확인'):known[key]=row[key]
         result.append(dict(row,policy_scope=scope,policy_scope_start=start))
     return result
@@ -97,6 +100,7 @@ def cost_bounds(previous,current,output_cap,input_extra=0):
     # but its preceding idle maintenance would still have cost money.
     target=previous if changed else current
     if not changed and not all(previous.get(k)==current.get(k) for k in ('model','effort','service_tier')):return None
+    if not changed and previous.get('compaction_epoch')!=current.get('compaction_epoch'):return None
     keys=('input','cached','output')
     if any(type(r.get(k)) is not int or r[k]<0 for r in (previous,target) for k in keys):return None
     if any(r['cached']>r['input'] or r.get('input_conflict') for r in (previous,target)):return None
