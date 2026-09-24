@@ -99,6 +99,7 @@ class Dashboard(TrayWindow):
         self.observer_directory=Path(index_path).parent if index_path else None
         self.manage_observer=manage_observer;self.quota_service=None;self.quota_issue=''
         self.index_path=index_path;self.live_limits=live_limits
+        self.model_evidence_path=model_evidence_path
         self.snapshot={'ts':time.time(),'sessions':[],'homes':homes,'unassigned':[],'errors':[]}
         self.quitting=False;self.worker=None;self.engine=AnalysisEngine();self.async_mode=start_worker
         self.analysis=analyze([]);self.analysis_pending=False;self.analysis_errors=[];self.analysis_error_history=[]
@@ -1442,7 +1443,11 @@ class Dashboard(TrayWindow):
         from .controls import Switch
         self.settings_page = SettingsPage(self)
         self.pages.addWidget(self.settings_page)
-        self.observer_panel=ObserverPanel(self.observer_home,self.observer_directory,active=self.manage_observer,parent=self)
+        manager=None
+        if self.cache_control_enabled and self.index_path and self.model_evidence_path:
+            from .cache_worker_control import CacheWorkerManager
+            manager=CacheWorkerManager(self.observer_home,self.index_path,self.model_evidence_path)
+        self.observer_panel=ObserverPanel(self.observer_home,self.observer_directory,active=self.manage_observer,parent=self,manager=manager)
         self.settings_page.add_widget(3, self.observer_panel)
         from .cache_panel import CachePanel
         self.cache_panel=CachePanel(self.observer_home,self.index_path,active=self.cache_control_enabled,parent=self)

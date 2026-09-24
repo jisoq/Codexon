@@ -135,7 +135,7 @@ def main():
         save_homes(homes);save_cache_paths(args.index_path,args.evidence_path,args.quota_path)
     window = Dashboard(homes,index_path=args.index_path,model_evidence_path=args.evidence_path,quota_path=args.quota_path,
         cache_control=args.cache_control or (not args.smoke and args.index_path is None),
-        live_limits=not (args.smoke or args.verify_handoff),manage_observer=not args.smoke and args.index_path is None, **({'settings':smoke_settings} if smoke_settings else {}))
+        live_limits=not (args.smoke or args.verify_handoff),manage_observer=not (args.smoke or args.verify_handoff) and (args.index_path is None or args.cache_control), **({'settings':smoke_settings} if smoke_settings else {}))
     from .overlay import install_overlay
     install_overlay(window, native_enabled=not (args.smoke or args.verify_handoff))
     def restart():

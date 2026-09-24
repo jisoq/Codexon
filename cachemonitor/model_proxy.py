@@ -517,8 +517,12 @@ def main():
                     while True:
                         try:loading=await asyncio.get_running_loop().run_in_executor(pool,poll)
                         except Exception:
-                            loading=False;scheduler.control.set('collector_error',True)
-                        else:scheduler.control.set('collector_error',False)
+                            loading=False
+                            try:scheduler.control.set('collector_error',True)
+                            except (sqlite3.Error,OSError):pass
+                        else:
+                            try:scheduler.control.set('collector_error',False)
+                            except (sqlite3.Error,OSError):pass
                         await asyncio.sleep(1 if loading else 15)
                 tasks=[asyncio.create_task(scheduler.serve()),asyncio.create_task(collect())]
                 try:yield

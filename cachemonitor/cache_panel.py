@@ -72,7 +72,7 @@ class CachePanel(Group):
     def __init__(self,home,index_path=None,active=True,parent=None):
         super().__init__(parent);self.home=str(home)
         self.path=':memory:' if not active and index_path is None else control_path(index_path)
-        self.control=Control(self.path);self.active=active;self.dialog=None;self.ticket=None;self.last_ticket=None;self.closed=False;self.proxy_ready=False
+        self.control=Control(self.path);self.active=active;self.dialog=None;self.ticket=None;self.last_ticket=None;self.closed=False;self.proxy_ready=False;self.relay_connected=False
         self.journal=Journal(self.path);self.operating_dialog=None
         layout=Column(self);layout.setContentsMargins(0,0,8,20);layout.setSpacing(20)
         layout.addWidget(copy('작업 사이의 캐시 재사용을 돕고, 모델 변경으로 입력 처리 부담이 커질 때 알려줍니다.'))
@@ -179,7 +179,8 @@ class CachePanel(Group):
             self.poll_operating()
             heartbeat=self.control.get('worker_heartbeat',0)
             if heartbeat and time.time()-heartbeat<5:self.proxy_ready=True
-            self.connection_status.setText('작업기 연결됨' if heartbeat and time.time()-heartbeat<20 else '작업기 연결 확인 필요')
+            self.connection_status.setText('작업기 연결됨' if heartbeat and time.time()-heartbeat<20 else
+                '프록시 연결됨 · 분석 갱신 확인 필요' if self.relay_connected else '작업기 연결 확인 필요')
             diagnostic=self.control.get('diagnostic_result',{})
             self.diagnostic_status.setText('연결 진단 · '+REASONS.get(diagnostic.get('reason'),diagnostic.get('state','')) if diagnostic else '')
             count=self.control.db.execute('SELECT COUNT(*) FROM cache_inputs WHERE home=?',(self.home,)).fetchone()[0]
@@ -196,13 +197,16 @@ class CachePanel(Group):
             if self.control.get('collector_error') or self.control.get('worker_error'):
                 self.status.setText('장애 · 관측 저장 또는 분석 처리 확인 필요')
             elif heartbeat and time.time()-heartbeat>=20:
-                self.proxy_ready=False;self.status.setText('장애 · 캐시 작업기 연결 끊김')
+                self.proxy_ready=False;self.status.setText('분석 갱신 멈춤 · 작업기 재시작 필요')
             if not self.control.get('enabled',True):self.status.setText('캐시 관리 꺼짐')
             self.next_action.setText('관측 자료가 모이면 자동으로 다시 판단합니다. 이력이 부족하거나 예상 이득이 없으면 유지 요청을 보내지 않습니다.'
                 if not any(s.get('state')=='eligible' for s in states) else '실행 전 사용자 작업 여부와 남은 운용 범위를 다시 확인합니다.')
+            if heartbeat and time.time()-heartbeat>=20:
+                self.next_action.setText('현재 요청 연결은 보존합니다. 다음 Windows 시작 시 새 작업기가 적용됩니다.')
         except Exception:
-            # Stop heartbeats: outstanding hooks will follow the infrastructure policy.
-            self.timer.stop();self.hook_status.setText('확인 저장소 장애 · 대기 요청은 중단될 수 있으며 새 요청은 확인을 건너뜁니다')
+            # Do not permanently lose observation after a transient database lock.
+            # No successful poll means no fresh heartbeat for waiting hooks.
+            self.hook_status.setText('확인 저장소 연결 재시도 중 · 확인되지 않은 요청은 기존 제한시간을 따릅니다')
 
     def poll_operating(self):
         grants=self.journal.operations.grants(self.home)
@@ -263,6 +267,7 @@ class CachePanel(Group):
     def proxy_status(self,state):
         health=state.get('health') or {}
         self.proxy_ready=bool(health.get('cache_management') and state.get('configured'))
+        self.relay_connected=self.proxy_ready
 
     def show_ticket(self,ticket):
         self.ticket=ticket;self.choice='dismiss'
