@@ -23,6 +23,93 @@ URL='https://chatgpt.com/backend-api/codex/responses'
 HEADERS={'ChatGPT-Account-ID':'synthetic-account','Content-Length':'1'}
 
 
+def test_diagnostic_astra_uses_product_executor_without_return_history(tmp_path):
+    async def scenario():
+        index=tmp_path/'index.sqlite';seen=[]
+        async def endpoint(req):
+            seen.append(await req.json())
+            value=response();value['id']='diagnostic-result'
+            value['usage'].update(input_tokens=100000,input_tokens_details={'cached_tokens':100000,'cache_write_tokens':0})
+            return web.Response(text='data: '+json.dumps(dict(type='response.completed',response=value))+'\n\n',content_type='text/event-stream')
+        app=web.Application();app.router.add_post('/responses',endpoint)
+        async with server(app) as upstream:
+            async def send(url,headers,value,**options):
+                assert url==URL and not options['websocket']
+                return await request_once(upstream+'/responses',headers,value,**options)
+            scheduler=Scheduler('home',control_path(index),send=send,continuous_capture=True)
+            request={**body(),'model':'gpt-6-astra','reasoning':{'effort':'high'}}
+            request.pop('service_tier')  # Installed Codex omits Standard on the wire.
+            assert target('home',request,URL,HEADERS,False) is None
+            assert target('home',{**request,'service_tier':'priority'},URL,HEADERS,False,observed_tier='default') is None
+            original=response();original['usage'].update(input_tokens=100000,input_tokens_details={'cached_tokens':99000,'cache_write_tokens':0})
+            history=[dict(profile(),model='gpt-6-astra',effort='high',key=original['id'],ts=time.time(),turn='natural')]
+            enrich([dict(home='home',id='session',history=history)],index,time.time())
+            scheduler.executor.contexts.completed(request,original)
+            scheduler.snapshot(request,original,time.monotonic(),URL,HEADERS,False)
+            estimate=scheduler.policy('session',scheduler.snapshots['session'],observe=True)
+            assert estimate['policy_state']!='eligible'
+            proposal=scheduler.journal.operations.propose(target('home',request,URL,HEADERS,False,observed_tier='default'),
+                estimate['maintenance_expected'],estimate['maintenance_adverse'],estimate['output_high'],estimate['basis'],
+                cost_stop=.464502,purpose='diagnostic',dynamic_estimate=True)
+            key=scheduler.journal.operations.consent(proposal['id'])
+            scheduler.control.set('diagnostic_request',key)
+            scheduler.control.activity('home',dict(session_id='session',turn_id='t',hook_event_name='UserPromptSubmit'))
+            await scheduler.tick();assert not seen and scheduler.control.get('diagnostic_request')==key
+            scheduler.control.activity('home',dict(session_id='session',turn_id='t',hook_event_name='Stop'))
+            await scheduler.tick();await scheduler.jobs['diagnostic:'+key]
+            await scheduler.tick()
+            assert len(seen)==1 and not scheduler.control.get('diagnostic_request')
+            assert seen[0]['tools']==request['tools'] and seen[0]['reasoning']==request['reasoning']
+            assert seen[0]['tool_choice']=='none' and 'max_output_tokens' not in seen[0]
+            assert 'service_tier' not in seen[0]  # Keep the original wire representation.
+            rows=scheduler.journal.rows();assert rows[0]['purpose']=='diagnostic' and rows[0]['cost']>0
+            await scheduler.close()
+        views=[dict(home='home',id='session',history=history)]
+        summary=enrich(views,index,time.time())
+        assert summary['diagnostic_calls']==summary['calls']==summary['priced']==1
+        assert not summary['effects'] and views[-1]['purpose']=='diagnostic'
+        from cachemonitor.analysis_engine import AnalysisEngine
+        from cachemonitor.quota_cycles import QuotaLedger
+        from cachemonitor.overlay_data import OverlaySummaries
+        engine=AnalysisEngine();engine.ingest(views[-1:])
+        assert next(iter(engine.sessions.values()))['prepared']['history'][0]['cost']==rows[0]['cost']
+        assert summary['known_cost']==rows[0]['cost']
+        ledger=QuotaLedger(tmp_path/'quota.sqlite')
+        snapshot=dict(homes=['home'],sessions=views[-1:],ts=time.time(),usage_collection_complete=True,
+            request_activity=summary['request_activity'],index=dict(loading=False,usage_complete=True,last_usage_success=time.time()))
+        ledger.sync(engine,snapshot);ledger.sync(engine,snapshot)
+        assert ledger.db.execute('SELECT COUNT(*),SUM(cost) FROM calls').fetchone()==pytest.approx((1,rows[0]['cost']))
+        ledger.close()
+        from cachemonitor.core import Session
+        parent=Session('session','home',title='Natural work')
+        parent.add_usage(time.time()-1,'original',original['usage'],'gpt-6-astra','natural','high','default')
+        engine.ingest([parent.view(time.time()),views[-1]])
+        overlay=next(s for s in OverlaySummaries().collect(engine) if s['id']=='session')
+        assert overlay['calls']==2 and overlay['maintenance_calls']==0
+    run_proxy_test(scenario())
+
+
+def test_dynamic_estimate_and_combined_cost_gate_are_checked_again_before_upload(tmp_path):
+    journal=Journal(tmp_path/'c.sqlite');scope=target('home',body(),URL,HEADERS,False)
+    proposal=journal.operations.propose(scope,.1,1,64,'natural_output_proxy',cost_stop=.464502,purpose='diagnostic',dynamic_estimate=True)
+    key=journal.operations.consent(proposal['id'])
+    operation=dict(id=key,scope=scope,purpose='diagnostic',expected=.3,adverse=3,output_high=64)
+    assert journal.operations.check(operation) is None  # New expected cost is not frozen C.
+    reserved=journal.reserve('home','s',0,body(),'original',operation=operation)
+    assert not journal.permit_operation(reserved,dict(operation,expected=.5))
+    assert not journal.rows() and journal.operations.stats(journal.operations.grants()[0])['calls']==0
+    journal.finish(reserved,'cancelled')
+    reserved=journal.reserve('home','s',0,body(),'second',operation=operation)
+    assert journal.permit_operation(reserved,operation)
+    value=response();value['usage']['output_tokens']=4
+    journal.finish(reserved,'completed',value,scope_read_lower=80)
+    grant=journal.operations.grants()[0];observed=journal.operations.stats(grant)['observed']
+    assert observed>0 and not grant['stopped']
+    assert journal.operations.check(dict(operation,expected=.464502-observed+.000001))=='projected_cost_stop'
+    assert journal.operations.check(dict(operation,scope={**scope,'effort':'high'}))=='scope_mismatch'
+    journal.close()
+
+
 def test_observation_only_forwards_user_but_never_executes_or_guards(tmp_path):
     from aiohttp import ClientSession
     from cachemonitor.model_proxy import create_app
@@ -152,13 +239,14 @@ def test_observation_prices_current_model_without_execution_scope_or_return_hist
         assert decision['source_transport']=='WebSocket' and decision['maintenance_transport']=='HTTP'
         assert decision['maintenance_adverse']>decision['maintenance_expected']>0
         assert decision['model']=='gpt-6-astra' and decision['effort']=='high'
-        assert not decision['operating_scope_available'] and decision['execution_disabled']
+        assert decision['operating_scope_available'] and decision['execution_disabled']
         assert not decision['transport_reuse_verified']
         assert not scheduler.journal.operations.proposals('home') and not scheduler.jobs
         assert not scheduler.journal.operations.grants() and not scheduler.journal.rows()
         # Observation does not broaden which model may actually execute.
         scheduler.observation_only=False
-        assert scheduler.policy('session',scheduler.snapshots['session'])['reason']=='operating_scope_unavailable'
+        assert scheduler.policy('session',scheduler.snapshots['session'])['state']!='eligible'
+        assert not scheduler.journal.operations.grants()
         scheduler.observation_only=True
         scheduler.snapshots['session']['anchor']-=1800
         await scheduler.tick()

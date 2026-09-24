@@ -479,22 +479,31 @@ def main():
     parser.add_argument('--control-id',default='')
     parser.add_argument('--managed',action='store_true')
     parser.add_argument('--cache-observe-only',action='store_true',help='Capture natural context; disable ALL maintenance execution')
+    parser.add_argument('--cache-worker',action='store_true',help='Continuous analysis with explicitly authorized independent execution')
     parser.add_argument('--observation-index',type=Path,help='Existing sanitized usage index copy for observation profiles')
     args=parser.parse_args()
     if args.evidence_path.resolve().is_relative_to(Path(args.codex_home).resolve()):
         parser.error('Evidence must be stored outside the Codex home')
     store=EvidenceWriter(args.evidence_path)
+    cache_lock=None
     endpoint={'chatgpt':'https://chatgpt.com/backend-api/codex','openai':'https://api.openai.com/v1'}[args.upstream]
     if args.upstream_url:endpoint=args.upstream_url
     context=ssl.create_default_context(cafile=str(args.upstream_ca)) if args.upstream_ca else None
     try:
-        if args.cache_observe_only:
+        if args.cache_observe_only or args.cache_worker:
+            if args.cache_observe_only and args.cache_worker:parser.error('Choose observation only or cache worker')
             if args.managed or args.control_file or not args.observation_index:
                 parser.error('Observation requires its own index and unmanaged listener')
             from .cache_scheduler import Scheduler
             from .index import UsageIndex
             from concurrent.futures import ThreadPoolExecutor
-            scheduler=Scheduler(args.codex_home,args.observation_index.with_name('cache-control.sqlite'),observation_only=True)
+            from .observer_state import ProcessLock
+            cache_lock=ProcessLock(args.observation_index.with_name('cache-worker.lock'))
+            cache_lock.__enter__()
+            scheduler=Scheduler(args.codex_home,args.observation_index.with_name('cache-control.sqlite'),
+                observation_only=args.cache_observe_only,continuous_capture=args.cache_worker)
+            scheduler.journal.recover_exclusive()
+            if args.cache_worker:scheduler.capture.analysis_revision=3
             app=create_app(store,args.codex_home,endpoint,ssl_context=context,cache_capture=scheduler.capture)
             async def observe_context(app):
                 pool=ThreadPoolExecutor(max_workers=1);index=None
@@ -507,7 +516,9 @@ def main():
                 async def collect():
                     while True:
                         try:loading=await asyncio.get_running_loop().run_in_executor(pool,poll)
-                        except Exception:loading=False
+                        except Exception:
+                            loading=False;scheduler.control.set('collector_error',True)
+                        else:scheduler.control.set('collector_error',False)
                         await asyncio.sleep(1 if loading else 15)
                 tasks=[asyncio.create_task(scheduler.serve()),asyncio.create_task(collect())]
                 try:yield
@@ -548,6 +559,7 @@ def main():
             web.run_app(create_app(store,args.codex_home,endpoint,ssl_context=context),host='127.0.0.1',port=args.port,
                         access_log=None,print=None,loop=proxy_loop())
     finally:
+        if cache_lock:cache_lock.__exit__(None,None,None)
         if not store.close():
             raise SystemExit('관측 저장 종료 미완료 · 저장 대기 또는 누락 기록을 확인하세요')
 

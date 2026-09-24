@@ -37,6 +37,8 @@ def main():
     parser.add_argument("--codex-home", action="append", help="Repeat to monitor multiple local Codex homes")
     parser.add_argument("--hidden", action="store_true")
     parser.add_argument("--index-path", help="Override the app-owned usage index for isolated verification")
+    parser.add_argument('--evidence-path',help='Use the matching observer evidence database')
+    parser.add_argument('--cache-control',action='store_true',help='Enable cache controls for an independently managed source worker')
     parser.add_argument("--snapshot", action="store_true", help="Print sanitized live observations without starting the UI")
     parser.add_argument("--smoke", metavar="PNG", help="Render actual data, check tray lifecycle and exit")
     parser.add_argument("--smoke-depth", choices=('core','full'), default='full',
@@ -118,12 +120,14 @@ def main():
         smoke_settings = startup_settings if args.verify_handoff else QSettings(str(Path(smoke_directory.name)/'settings.ini'),QSettings.IniFormat)
         if args.index_path is None:args.index_path=str(Path(smoke_directory.name)/'index.sqlite')
     if not isolated:save_homes(homes)
-    window = Dashboard(homes,index_path=args.index_path,live_limits=not (args.smoke or args.verify_handoff),manage_observer=not args.smoke and args.index_path is None, **({'settings':smoke_settings} if smoke_settings else {}))
+    window = Dashboard(homes,index_path=args.index_path,model_evidence_path=args.evidence_path,
+        cache_control=args.cache_control or (not args.smoke and args.index_path is None),
+        live_limits=not (args.smoke or args.verify_handoff),manage_observer=not args.smoke and args.index_path is None, **({'settings':smoke_settings} if smoke_settings else {}))
     from .overlay import install_overlay
     install_overlay(window, native_enabled=not (args.smoke or args.verify_handoff))
     def restart():
         from .app_restart import launch_replacement
-        try:launch_replacement(homes,index_path=args.index_path,handoff=args.verify_handoff)
+        try:launch_replacement(homes,index_path=args.index_path,handoff=args.verify_handoff,evidence_path=args.evidence_path,cache_control=args.cache_control)
         except OSError:
             window.settings_page.refresh_restart()
             QMessageBox.warning(window,'Codexon',tr('앱을 다시 시작하지 못했습니다. 다시 시도해 주세요.'))

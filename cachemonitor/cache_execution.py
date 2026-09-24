@@ -88,7 +88,7 @@ class Journal:
         ''')
         columns={r[1] for r in self.db.execute('pragma table_info(cache_jobs)')}
         for name,kind in (('snapshot','TEXT'),('round','INTEGER'),('anchor','REAL'),('scope_read_lower','INTEGER'),
-                          ('operation','TEXT'),('expected_cost','REAL'),('adverse_cost','REAL'),('output_high','INTEGER'),('read_required','INTEGER')):
+                          ('operation','TEXT'),('expected_cost','REAL'),('adverse_cost','REAL'),('output_high','INTEGER'),('read_required','INTEGER'),('purpose','TEXT')):
             if name not in columns:self.db.execute(f'ALTER TABLE cache_jobs ADD COLUMN {name} {kind}')
         from .cache_operating import Operations
         self.operations=Operations(self)
@@ -108,8 +108,9 @@ class Journal:
                     self.db.execute('COMMIT');return None
             self.db.execute('INSERT INTO cache_jobs(id,home,sid,generation,state,model,effort,tier,snapshot,round) VALUES(?,?,?,?,?,?,?,?,?,?)',
                 (key,home,sid,generation,'reserved',body['model'],
-                 (body.get('reasoning') or {}).get('effort'),body.get('service_tier'),snapshot,round_number))
+                 (body.get('reasoning') or {}).get('effort'),body.get('service_tier') or (operation['scope']['tier'] if operation else None),snapshot,round_number))
             if operation:
+                self.db.execute('UPDATE cache_jobs SET purpose=? WHERE id=?',(operation.get('purpose','maintenance'),key))
                 self.db.execute('UPDATE cache_jobs SET operation=?,expected_cost=?,adverse_cost=?,output_high=?,read_required=? WHERE id=?',
                     (operation['id'],operation['expected'],operation['adverse'],operation['output_high'],operation.get('read_required',0),key))
                 self.db.execute('COMMIT')
@@ -164,9 +165,9 @@ class Journal:
 
     def rows(self):
         rows=[]
-        for key,home,sid,state,start,end,rid,model,effort,tier,usage,snapshot,round_number,anchor,scope,operation in self.db.execute(
-                'SELECT id,home,sid,state,started,ended,response_id,model,effort,tier,usage,snapshot,round,anchor,scope_read_lower,operation FROM cache_jobs WHERE started IS NOT NULL ORDER BY started,id'):
-            row=dict(key=rid or 'maintenance:'+key,job_id=key,operation=operation,home=home,sid=sid,purpose='maintenance',
+        for key,home,sid,state,start,end,rid,model,effort,tier,usage,snapshot,round_number,anchor,scope,operation,purpose in self.db.execute(
+                'SELECT id,home,sid,state,started,ended,response_id,model,effort,tier,usage,snapshot,round,anchor,scope_read_lower,operation,purpose FROM cache_jobs WHERE started IS NOT NULL ORDER BY started,id'):
+            row=dict(key=rid or 'maintenance:'+key,job_id=key,operation=operation,home=home,sid=sid,purpose=purpose or 'maintenance',
                      ts=end or start,request_start=start,request_end=end,model=model,effort=effort,
                      service_tier=tier or '미확인',state=state,usage_known=usage is not None,
                      snapshot=snapshot,round=round_number,anchor=anchor,scope_read_lower=scope)
@@ -249,7 +250,7 @@ class Executor:
     def leave(self):
         self.busy=max(0,self.busy-1)
 
-    async def run(self,home,sid,rid,url,headers,*,anchor,deadline,latency_bound,websocket=False,round_number=0,max_output_tokens=None,operation=None,valid=lambda:True,expected_generation=None):
+    async def run(self,home,sid,rid,url,headers,*,anchor,deadline,latency_bound,websocket=False,round_number=0,max_output_tokens=None,operation=None,valid=lambda:True,expected_generation=None,observed_tier=None):
         if self.observation_only:return 'observation_only'
         generation=self.generation if expected_generation is None else expected_generation
         if self.closed:return 'invalidated'
@@ -268,7 +269,7 @@ class Executor:
         body=self.contexts.maintenance(rid)
         if operation:
             from .cache_operating import target
-            if target(home,body,url,headers,websocket)!=operation['scope']:return 'scope_mismatch'
+            if target(home,body,url,headers,websocket,observed_tier=observed_tier)!=operation['scope']:return 'scope_mismatch'
             operation=dict(operation,read_required=self.contexts.usage.get(rid,{}).get('cached') or 0)
             # Permission to bear risk is not evidence of a server capability.
             body.pop('max_output_tokens',None)

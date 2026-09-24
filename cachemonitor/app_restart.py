@@ -5,12 +5,14 @@ import subprocess
 import sys
 
 
-def launch_replacement(homes, *, index_path=None, handoff=None):
+def launch_replacement(homes, *, index_path=None, handoff=None,evidence_path=None,cache_control=False):
     command=[sys.executable]
     if not getattr(sys,'frozen',False):command.append(str(Path(__file__).resolve().parents[1]/'run.py'))
     command.append('--replace-gui')
     for home in homes:command.extend(('--codex-home',str(home)))
     if index_path:command.extend(('--index-path',str(index_path)))
+    if evidence_path:command.extend(('--evidence-path',str(evidence_path)))
+    if cache_control:command.append('--cache-control')
     if handoff:command.extend(('--verify-handoff',str(handoff)))
     env=dict(os.environ,PYINSTALLER_RESET_ENVIRONMENT='1')
     env.pop('CODEXON_LANGUAGE',None)

@@ -13,7 +13,17 @@ from .quick_runtime import Confirmation
 REASONS={
     'no_executable_rounds':'유지하지 않음 · 동의 기간 안에 실행할 시간 부족',
     'operating_consent_required':'비활성 · 제한 운용 범위에 대한 동의 필요',
-    'operating_scope_unavailable':'비활성 · 초기 유지 대상은 계정이 확인된 Luna·low·Standard입니다. 사용자 연결 방식은 자동 처리됩니다',
+    'operating_scope_unavailable':'범위 밖 · 계정·모델·effort·Standard HTTP 확인 필요',
+    'scope_mismatch':'범위 밖 · 이번 허용 대상과 현재 문맥이 다름',
+    'purpose_mismatch':'범위 밖 · 허용된 요청 목적과 다름',
+    'projected_cost_stop':'실행하지 않음 · 관측 합계와 다음 예상액이 비용 기준 초과',
+    'fresh_context_required':'자료 수집 중 · 새 연결의 완료된 문맥 필요',
+    'user_active':'사용자 작업 중 · 독립 요청 보류',
+    'diagnostic_completed':'진단 완료 · 응답·사용량 회수됨',
+    'diagnostic_unknown':'진단 중단 · 응답 또는 사용량 미확인',
+    'diagnostic_invalidated':'진단 취소 · 사용자 작업 우선',
+    'diagnostic_ready':'진단 준비됨',
+    'verification_complete':'제한 검증 종료 · 추가 호출 권한 종료',
     'operating_cost_unobserved':'현재 비교 구간의 비용 예상에 필요한 자료 대기',
     'operation_busy':'앞선 유지 요청의 사용량 회수 중',
     'operation_deferred':'공유 운용 허용량 확인 대기',
@@ -70,6 +80,7 @@ class CachePanel(Group):
             '호출 수는 제한하지만 한 요청의 출력·추론·총비용은 보장하지 않습니다. 시험 호출은 자동으로 보내지 않습니다.')
         self.activation.setWordWrap(True);layout.addWidget(self.activation)
         self.operating_status=Text('제한 운용 동의 없음');self.operating_status.setWordWrap(True);layout.addWidget(self.operating_status)
+        self.diagnostic_status=Text();self.diagnostic_status.setWordWrap(True);layout.addWidget(self.diagnostic_status)
         row=Row();self.consent_button=Button('초기 운용 범위 확인');self.revoke_button=Button('운용 허용 철회')
         self.consent_button.setEnabled(False);self.revoke_button.setEnabled(False)
         self.consent_button.clicked.connect(self.show_operating);self.revoke_button.clicked.connect(self.revoke_operating)
@@ -98,7 +109,7 @@ class CachePanel(Group):
                     if self.dialog:self.dialog.reject()
             if not self.dialog and waiting:self.show_ticket(waiting[0])
             states=[json.loads(r[0]) for r in self.control.db.execute('SELECT data FROM cache_status WHERE home=?',(self.home,))]
-            forecasts=[s for s in states if s.get('observation_only') and s.get('maintenance_expected') is not None
+            forecasts=[s for s in states if (s.get('observation_only') or s.get('passive_analysis')) and s.get('maintenance_expected') is not None
                        and s.get('cost_valid_until',s.get('observed_at',0)+1800)>time.time()]
             if forecasts:
                 s=max(forecasts,key=lambda s:s.get('observed_at',0))
@@ -106,32 +117,47 @@ class CachePanel(Group):
                     f"사용자 {s.get('source_transport')} → 별도 유지 {s.get('maintenance_transport')}\n"
                     f"1회 예상 C {usd(s['maintenance_expected'])} · 재사용 실패 시나리오 {usd(s['maintenance_adverse'])} · 2C {usd(s['cost_stop_scenario'])}\n"
                     'API 환산 시나리오 · 총비용 상한이나 유지 효과 실측이 아닙니다. 관측만으로 실행되지 않습니다.'
-                    +(' 현재 모델은 초기 운용 대상 밖입니다.' if not s.get('operating_scope_available') else ''))
+                    +(' 새 실행 경로의 문맥은 아직 미확인입니다.' if self.control.get('worker_heartbeat') and s.get('worker_revision')!=3 else
+                      ' 현재 문맥은 실행 범위 밖입니다.' if not s.get('operating_scope_available') else ''))
             else:self.forecast.setText('')
             self.poll_operating()
-            if any(s.get('observation_only') for s in states):self.status.setText('관측 전용 · 추가 유지 요청 없음 · 사용자 연결 방식 변경 불필요')
-            elif not self.control.get('automatic',False):self.status.setText('자동 유지 꺼짐 · 사용량 분석은 계속됩니다')
+            heartbeat=self.control.get('worker_heartbeat',0)
+            if heartbeat and time.time()-heartbeat<5:self.proxy_ready=True
+            diagnostic=self.control.get('diagnostic_result',{})
+            self.diagnostic_status.setText('연결 진단 · '+REASONS.get(diagnostic.get('reason'),diagnostic.get('state','')) if diagnostic else '')
+            count=self.control.db.execute('SELECT COUNT(*) FROM cache_inputs WHERE home=?',(self.home,)).fetchone()[0]
+            if not observed:self.hook_status.setText(f'실제 훅 적재 {count}건' if count else '훅 이벤트 미수집 · 신뢰 설정과 실제 실행은 별도입니다')
+            if heartbeat and not self.control.get('worker_snapshots',0):self.status.setText('기존 연결 관측 중 · 새 작업기 문맥 수집 중')
+            elif any(s.get('observation_only') for s in states):self.status.setText('관측 전용 · 추가 유지 요청 없음 · 사용자 연결 방식 변경 불필요')
+            elif not self.control.get('automatic',False):
+                policy=' / '.join(dict.fromkeys(REASONS.get(s.get('reason'),'자료 수집 중') for s in states))
+                self.status.setText('자동 유지 꺼짐 · '+(policy or '자료 수집 중'))
             elif not self.proxy_ready:self.status.setText('자동 유지 대기 · 캐시 관리를 지원하는 프록시 연결 필요')
             elif states:
                 self.status.setText(' / '.join(dict.fromkeys(REASONS.get(s.get('reason',s.get('state')),s.get('state','대기')) for s in states)))
+            if self.control.get('collector_error') or self.control.get('worker_error'):
+                self.status.setText('장애 · 관측 저장 또는 분석 처리 확인 필요')
+            elif heartbeat and time.time()-heartbeat>=20:
+                self.proxy_ready=False;self.status.setText('장애 · 캐시 작업기 연결 끊김')
         except Exception:
             # Stop heartbeats: outstanding hooks will follow the infrastructure policy.
             self.timer.stop();self.hook_status.setText('확인 저장소 장애 · 대기 요청은 중단될 수 있으며 새 요청은 확인을 건너뜁니다')
 
     def poll_operating(self):
         grants=self.journal.operations.grants(self.home)
-        self.consent_button.setEnabled(self.active and bool(self.journal.operations.proposals(self.home)) and not self.operating_dialog)
+        self.consent_button.setEnabled(self.active and any(p.get('purpose','maintenance')=='maintenance'
+            for p in self.journal.operations.proposals(self.home)) and not self.operating_dialog)
         self.revoke_button.setEnabled(self.active and any(not g['stopped'] and g['expires']>time.time() for g in grants))
         if grants:
             g=grants[0];s=self.journal.operations.stats(g)
             reason=g['stopped'] or ('permission_expired' if g['expires']<=time.time() else None)
             self.operating_status.setText(f"계정 {g['scope']['account'][:12]} · {g['scope']['model']} · 남은 {s['remaining']}/{g['max_calls']}회\n"
                 f"API 환산 관측 확인분 {usd(s['observed'])} / 후속 중단 기준 {usd(g['cost_stop'])} · 비용 미확인 {s['unknown']}회\n"
-                f"{REASONS.get(reason,reason) if reason else '허용됨 · 자동 정책이 이득 있는 경우만 예약'} · 종료 {time.strftime('%H:%M',time.localtime(g['expires']))}")
+                f"{REASONS.get(reason,reason) if reason else ('진단만 허용됨' if g.get('purpose')=='diagnostic' else '허용됨 · 자동 정책이 이득 있는 경우만 예약')} · 종료 {time.strftime('%H:%M',time.localtime(g['expires']))}")
 
     def show_operating(self):
         if self.operating_dialog:return
-        proposals=self.journal.operations.proposals(self.home)
+        proposals=[p for p in self.journal.operations.proposals(self.home) if p.get('purpose','maintenance')=='maintenance']
         if not proposals:return
         proposal=proposals[0];scope=proposal['scope']
         text=(f"계정 {scope['account'][:12]}\n홈 {scope['home']}\n"
@@ -189,7 +215,7 @@ class CachePanel(Group):
         self.dialog=None;self.ticket=None
 
     def display(self,data):
-        self.summary.setText(f'유지 요청 {data.get("calls",0)}회 · API 환산 확인분 {usd(data.get("known_cost")) if data.get("priced") else "—"} · 비용 미확인 {data.get("calls",0)-data.get("priced",0)}회\n'
+        self.summary.setText(f'독립 요청 {data.get("calls",0)}회 (진단 {data.get("diagnostic_calls",0)}회) · API 환산 확인분 {usd(data.get("known_cost")) if data.get("priced") else "—"} · 비용 미확인 {data.get("calls",0)-data.get("priced",0)}회\n'
             f'최근 비교 가능한 읽기 감소 {data.get("shortfalls",0)}회 · 절감 실측: 미확인')
         names=dict(session_start='시작',model_changed='모델 변경',effort_changed='effort 변경',
                    service_tier_changed='모드 변경',idle_over_design_lifetime='30분 이상 간격',compaction='압축')
