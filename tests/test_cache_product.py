@@ -74,9 +74,11 @@ def test_natural_history_to_policy_no_maintenance_prerequisite(tmp_path):
     assert decision['output_cap']==row['output']
     assert decision['write_composition']=='bounded_not_observed' and row['written'] is None
     scheduler.snapshots['s']['url']='https://chatgpt.com/backend-api/codex/responses'
+    scheduler.snapshots['s']['headers']={'ChatGPT-Account-ID':'synthetic'}
+    scheduler.control.set('bounded_provider:chatgpt.com',True)  # Cannot override the handed-off rejection.
     blocked=scheduler.policy('s',scheduler.snapshots['s'])
-    assert blocked['state']=='waiting' and blocked['history_can_unlock'] is False
-    assert blocked['calls']==0 and blocked['activation']=='verify_total_output_limit_or_approve_separate_risk_policy'
+    assert blocked['state']=='disabled' and blocked['history_can_unlock'] is False
+    assert blocked['calls']==0 and blocked['reason']=='operating_consent_required' and not blocked['server_output_cap']
     asyncio.run(scheduler.close());control.close()
 
 

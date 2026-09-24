@@ -87,10 +87,13 @@ class Journal:
                 WHERE state IN ('reserved','sent');
         ''')
         columns={r[1] for r in self.db.execute('pragma table_info(cache_jobs)')}
-        for name,kind in (('snapshot','TEXT'),('round','INTEGER'),('anchor','REAL'),('scope_read_lower','INTEGER')):
+        for name,kind in (('snapshot','TEXT'),('round','INTEGER'),('anchor','REAL'),('scope_read_lower','INTEGER'),
+                          ('operation','TEXT'),('expected_cost','REAL'),('adverse_cost','REAL'),('output_high','INTEGER'),('read_required','INTEGER')):
             if name not in columns:self.db.execute(f'ALTER TABLE cache_jobs ADD COLUMN {name} {kind}')
+        from .cache_operating import Operations
+        self.operations=Operations(self)
 
-    def reserve(self,home,sid,generation,body,snapshot,round_number=0):
+    def reserve(self,home,sid,generation,body,snapshot,round_number=0,operation=None):
         if type(round_number) is not int or round_number<0:raise ValueError('invalid_round')
         key=hashlib.sha256(json.dumps([home,sid,snapshot,round_number]).encode()).hexdigest()
         if round_number:
@@ -98,12 +101,34 @@ class Journal:
                                   (home,sid,snapshot,round_number-1)).fetchone()
             if not prior or prior[0]!='completed' or not prior[1] or prior[2]!=generation:return None
         try:
+            if operation:
+                self.db.execute('BEGIN IMMEDIATE')
+                reason=self.operations.check(operation)
+                if reason:
+                    self.db.execute('COMMIT');return None
             self.db.execute('INSERT INTO cache_jobs(id,home,sid,generation,state,model,effort,tier,snapshot,round) VALUES(?,?,?,?,?,?,?,?,?,?)',
                 (key,home,sid,generation,'reserved',body['model'],
                  (body.get('reasoning') or {}).get('effort'),body.get('service_tier'),snapshot,round_number))
+            if operation:
+                self.db.execute('UPDATE cache_jobs SET operation=?,expected_cost=?,adverse_cost=?,output_high=?,read_required=? WHERE id=?',
+                    (operation['id'],operation['expected'],operation['adverse'],operation['output_high'],operation.get('read_required',0),key))
+                self.db.execute('COMMIT')
         except sqlite3.IntegrityError:
+            if operation and self.db.in_transaction:self.db.execute('ROLLBACK')
             return None
+        except BaseException:
+            if operation and self.db.in_transaction:self.db.execute('ROLLBACK')
+            raise
         return key
+
+    def permit_operation(self,key,operation):
+        self.db.execute('BEGIN IMMEDIATE')
+        try:
+            reason=self.operations.check(operation,exclude=key)
+            allowed=not reason and self.sent(key)
+            self.db.execute('COMMIT');return allowed
+        except BaseException:
+            self.db.execute('ROLLBACK');raise
 
     def sent(self,key):
         return self.db.execute("UPDATE cache_jobs SET state='sent',started=? WHERE id=? AND state='reserved'",
@@ -119,20 +144,29 @@ class Journal:
         usage=response.get('usage')
         # Store a strict token allowlist; not output, prompts or server errors.
         clean=usage_values(usage) if isinstance(usage,dict) else None
-        self.db.execute('UPDATE cache_jobs SET state=?,ended=?,response_id=?,usage=? WHERE id=?',
-            (state,time.time(),response.get('id'),json.dumps(clean) if clean is not None else None,key))
-        self.db.execute('UPDATE cache_jobs SET anchor=?,scope_read_lower=? WHERE id=?',(anchor,scope_read_lower,key))
+        # Completion releases the shared reservation and records any stop in ONE
+        # transaction, so another connection cannot start before reconciliation.
+        self.db.execute('BEGIN IMMEDIATE')
+        try:
+            self.db.execute('UPDATE cache_jobs SET state=?,ended=?,response_id=?,usage=?,anchor=?,scope_read_lower=? WHERE id=?',
+                (state,time.time(),response.get('id'),json.dumps(clean) if clean is not None else None,anchor,scope_read_lower,key))
+            self.operations.reconcile(key)
+            self.db.execute('COMMIT')
+        except BaseException:
+            self.db.execute('ROLLBACK');raise
 
     def recover_exclusive(self):
         """Only the process-lock owner may call this at startup."""
         self.db.execute("UPDATE cache_jobs SET state='unknown' WHERE state='sent'")
         self.db.execute("UPDATE cache_jobs SET state='cancelled' WHERE state='reserved'")
+        for key, in self.db.execute("SELECT id FROM cache_jobs WHERE state='unknown' AND operation IS NOT NULL").fetchall():
+            self.operations.reconcile(key)
 
     def rows(self):
         rows=[]
-        for key,home,sid,state,start,end,rid,model,effort,tier,usage,snapshot,round_number,anchor,scope in self.db.execute(
-                'SELECT id,home,sid,state,started,ended,response_id,model,effort,tier,usage,snapshot,round,anchor,scope_read_lower FROM cache_jobs WHERE started IS NOT NULL ORDER BY started,id'):
-            row=dict(key=rid or 'maintenance:'+key,home=home,sid=sid,purpose='maintenance',
+        for key,home,sid,state,start,end,rid,model,effort,tier,usage,snapshot,round_number,anchor,scope,operation in self.db.execute(
+                'SELECT id,home,sid,state,started,ended,response_id,model,effort,tier,usage,snapshot,round,anchor,scope_read_lower,operation FROM cache_jobs WHERE started IS NOT NULL ORDER BY started,id'):
+            row=dict(key=rid or 'maintenance:'+key,job_id=key,operation=operation,home=home,sid=sid,purpose='maintenance',
                      ts=end or start,request_start=start,request_end=end,model=model,effort=effort,
                      service_tier=tier or '미확인',state=state,usage_known=usage is not None,
                      snapshot=snapshot,round=round_number,anchor=anchor,scope_read_lower=scope)
@@ -155,6 +189,7 @@ async def request_once(url, headers, body, *, websocket=False, timeout=30, permi
     headers={k:v for k,v in headers.items() if k.lower() not in excluded and not k.lower().startswith('sec-websocket-')}
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout),
                                     cookie_jar=aiohttp.DummyCookieJar(),trust_env=False) as client:
+        client._retry_connection=False
         if websocket:
             body.pop('stream',None)
             body['type']='response.create'
@@ -213,7 +248,7 @@ class Executor:
     def leave(self):
         self.busy=max(0,self.busy-1)
 
-    async def run(self,home,sid,rid,url,headers,*,anchor,deadline,latency_bound,websocket=False,round_number=0,max_output_tokens=None,valid=lambda:True,expected_generation=None):
+    async def run(self,home,sid,rid,url,headers,*,anchor,deadline,latency_bound,websocket=False,round_number=0,max_output_tokens=None,operation=None,valid=lambda:True,expected_generation=None):
         generation=self.generation if expected_generation is None else expected_generation
         if self.closed:return 'invalidated'
         if self.journal.has_round(home,sid,rid,round_number):return 'duplicate'
@@ -229,23 +264,33 @@ class Executor:
                 age+latency_bound>=TTL_SECONDS):
             return 'invalidated'
         body=self.contexts.maintenance(rid)
-        if max_output_tokens is not None:
+        if operation:
+            from .cache_operating import target
+            if target(home,body,url,headers,websocket)!=operation['scope']:return 'scope_mismatch'
+            operation=dict(operation,read_required=self.contexts.usage.get(rid,{}).get('cached') or 0)
+            # Permission to bear risk is not evidence of a server capability.
+            body.pop('max_output_tokens',None)
+            if self.journal.operations.check(operation):return 'operation_deferred'
+        elif max_output_tokens is not None:
             if type(max_output_tokens) is not int or max_output_tokens<=0:raise ValueError('invalid_output_bound')
             body['max_output_tokens']=max_output_tokens
-        key=self.journal.reserve(home,sid,generation,body,rid,round_number)
+        key=self.journal.reserve(home,sid,generation,body,rid,round_number,operation)
         if key is None:
-            return 'duplicate'
+            return 'operation_deferred' if operation else 'duplicate'
         # No await between final invalidation check and durable send intent.
         if self.closed or self.busy or generation!=self.generation:
             self.journal.finish(key,'cancelled');return 'invalidated'
-        if not self.journal.sent(key):
+        if not operation and not self.journal.sent(key):
             return 'invalidated'
         try:
             sent_anchor=time.monotonic()
             # Retain numeric provenance even if disabling capture clears Contexts.
             original=dict(self.contexts.usage.get(rid,{}))
+            def permit():
+                if self.closed or self.busy or generation!=self.generation or not valid():return False
+                return self.journal.permit_operation(key,operation) if operation else True
             transport=asyncio.create_task(asyncio.wait_for(self.send(url,headers,body,websocket=websocket,timeout=latency_bound,
-                permit=lambda:not self.closed and not self.busy and generation==self.generation and valid()),latency_bound))
+                permit=permit),latency_bound))
             while True:
                 try:
                     response=await asyncio.shield(transport)
@@ -267,7 +312,10 @@ class Executor:
             # Original response chain remains untouched. Unknown or zero overlap cannot renew.
             return state
         except (Exception,asyncio.CancelledError):
-            self.journal.finish(key,'unknown')
+            started=self.journal.db.execute('SELECT started FROM cache_jobs WHERE id=?',(key,)).fetchone()[0]
+            self.journal.finish(key,'unknown' if started is not None else 'cancelled')
+            if operation and started is None and not self.closed and generation==self.generation and valid():
+                self.journal.operations.stop(operation['id'],'request_failed')
             return 'unknown'
 
     def close(self):
