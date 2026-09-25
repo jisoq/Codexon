@@ -30,6 +30,21 @@ def locked(path):
     else:probe.__exit__(None,None,None);return False
 
 
+def legacy_channel_matches(path):
+    legacy=path.with_suffix('.collection.sqlite')
+    if not legacy.is_file():return False
+    try:
+        with closing(sqlite3.connect(legacy.as_uri()+'?mode=ro',uri=True)) as db:
+            row=db.execute('SELECT payload FROM snapshot WHERE id=1').fetchone()
+        if row:
+            source=json.loads(zlib.decompress(row[0]))['index']['path']
+            return os.path.normcase(str(Path(source).resolve()))==os.path.normcase(str(path))
+    except (OSError,sqlite3.Error,ValueError,KeyError,zlib.error):pass
+    if locked(path.with_suffix('.collector.lock')):
+        raise CollectionScopeError('이전 수집기의 색인 경로 확인을 기다리고 있습니다.')
+    return False
+
+
 class CollectionChannel:
     """IPC contains sanitized results and requested homes, never source offsets."""
     def __init__(self,homes,path=None,evidence=None):
@@ -37,44 +52,65 @@ class CollectionChannel:
         self.homes=list(dict.fromkeys(str(Path(h).resolve()) for h in homes))
         if any(self.path.is_relative_to(Path(h)) for h in self.homes):
             raise ValueError('앱 색인은 Codex 원본 폴더 밖에 저장해야 합니다')
-        self.scope=str(Path(evidence).resolve()) if evidence else ''
-        self.snapshot_path=self.path.with_suffix('.collection.sqlite')
+        from .model_evidence import default_path
+        self.default_evidence=self.path.with_name('model-evidence.sqlite') if path is not None else default_path()
+        self.scope=self.scope_key(evidence)
+        self.legacy=False
+        if not self.companion('.collection.sqlite').exists():self.legacy=legacy_channel_matches(self.path)
+        self.snapshot_path=self.companion('.collection.sqlite')
         self.snapshot_path.parent.mkdir(parents=True,exist_ok=True)
         self.db=sqlite3.connect(self.snapshot_path)
+        tables={row[0] for row in self.db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if tables-{'snapshot','consumers','control'}:
+            self.db.close()
+            raise ValueError('다른 데이터베이스를 수집 통신용으로 사용할 수 없습니다')
         self.db.execute('PRAGMA journal_mode=WAL')
         self.db.execute('CREATE TABLE IF NOT EXISTS snapshot (id INTEGER PRIMARY KEY, scope TEXT, epoch TEXT, sequence INTEGER, observed REAL, payload BLOB)')
         self.db.execute('CREATE TABLE IF NOT EXISTS consumers (id TEXT PRIMARY KEY, scope TEXT, homes TEXT, observed REAL)')
         self.db.execute('CREATE TABLE IF NOT EXISTS control (instance TEXT PRIMARY KEY, action TEXT)')
+        previous=self.db.execute('SELECT scope FROM snapshot WHERE id=1').fetchone() if self.legacy else None
+        self.wire_scope=previous[0] if previous and self.scope_key(previous[0])==self.scope else self.scope
         self.client=uuid.uuid4().hex;self.cached=None;self.identity=None
+
+    def companion(self,suffix):
+        # Existing channels are reused only after their stored index identity
+        # matches. New indexes retain the complete filename, including suffix.
+        return self.path.with_suffix(suffix) if self.legacy else self.path.with_name(self.path.name+'.codexon-'+suffix.lstrip('.'))
+
+    def scope_key(self,evidence):
+        return os.path.normcase(str(Path(evidence or self.default_evidence).resolve()))
 
     def subscribe(self,now):
         self.db.execute('INSERT OR REPLACE INTO consumers VALUES(?,?,?,?)',
-            (self.client,self.scope,json.dumps(self.homes),now));self.db.commit()
+            (self.client,self.wire_scope,json.dumps(self.homes),now));self.db.commit()
 
     def requested_homes(self,now):
         homes=list(self.homes)
-        for row in self.db.execute('SELECT homes FROM consumers WHERE scope=? AND observed>=? ORDER BY observed,id',(self.scope,now-60)):
-            homes.extend(home for home in json.loads(row[0]) if home not in homes)
+        for scope,value in self.db.execute('SELECT scope,homes FROM consumers WHERE observed>=? ORDER BY observed,id',(now-60,)):
+            if self.scope_key(scope)==self.scope:homes.extend(home for home in json.loads(value) if home not in homes)
         return homes
 
     def publish(self,snapshot,epoch,sequence):
         payload=zlib.compress(json.dumps(snapshot,ensure_ascii=False,separators=(',',':')).encode('utf-8'),1)
         self.db.execute('INSERT OR REPLACE INTO snapshot VALUES(1,?,?,?,?,?)',
-            (self.scope,epoch,sequence,snapshot['ts'],payload));self.db.commit()
+            (self.wire_scope,epoch,sequence,snapshot['ts'],payload));self.db.commit()
 
     def read(self):
         with closing(sqlite3.connect(self.snapshot_path.as_uri()+'?mode=ro',uri=True)) as db:
             db.execute('BEGIN')
             row=db.execute('SELECT scope,epoch,sequence FROM snapshot WHERE id=1').fetchone()
             if not row:return None
-            if row[0]!=self.scope:
-                if locked(self.path.with_suffix('.collector.lock')):
+            if self.scope_key(row[0])!=self.scope:
+                if locked(self.companion('.collector.lock')):
                     raise CollectionScopeError('사용량 색인에 다른 관측 DB가 연결되어 있습니다. 별도 색인 경로를 사용하세요.')
                 return None
             identity=(row[1],row[2])
             if identity!=self.identity:
                 payload=db.execute('SELECT payload FROM snapshot WHERE id=1').fetchone()[0]
                 self.cached=json.loads(zlib.decompress(payload));self.identity=identity
+            source=self.cached.get('index',{}).get('path')
+            if not source or os.path.normcase(str(Path(source).resolve()))!=os.path.normcase(str(self.path)):
+                raise CollectionScopeError('수집 결과의 사용량 색인 경로가 일치하지 않습니다.')
         return deepcopy(self.cached)
 
     def close(self):
@@ -96,7 +132,7 @@ class CollectionClient:
         self.path=self.channel.path;self.next_start=0;self.autostart=autostart
         self.worker_marker=None
         if worker:
-            self.worker_marker=ProcessLock(self.path.with_suffix('.worker-consumer.lock'))
+            self.worker_marker=ProcessLock(self.channel.companion('.worker-consumer.lock'))
             self.worker_marker.__enter__()
 
     def command(self):
@@ -131,14 +167,14 @@ class CollectionClient:
         if replace:
             # Register the replacement before requesting a cooperative stop.
             # Never terminate a GUI, cache worker, or active proxy connection.
-            with ProcessLock(self.path.with_suffix('.collector-update.lock')):
+            with ProcessLock(self.channel.companion('.collector-update.lock')):
                 current=self.channel.read()
                 if not current or current.get('collection',{}).get('instance')!=collection['instance']:return
                 task.configure(self.command(),autostart=False)
                 self.channel.db.execute('INSERT OR REPLACE INTO control VALUES(?,?)',(collection['instance'],'stop'))
                 self.channel.db.commit()
                 deadline=time.monotonic()+3
-                while locked(self.path.with_suffix('.collector.lock')):
+                while locked(self.channel.companion('.collector.lock')):
                     if time.monotonic()>=deadline:raise RuntimeError('백그라운드 수집기 교체 대기')
                     time.sleep(.05)
         task.start(self.command(),autostart=False)
@@ -187,7 +223,7 @@ class CollectorService:
     """Construct only in the dedicated --usage-collector background process."""
     def __init__(self,homes,path=None,evidence=None):
         self.channel=CollectionChannel(homes,path,evidence)
-        self.lock=ProcessLock(self.channel.path.with_suffix('.collector.lock'))
+        self.lock=ProcessLock(self.channel.companion('.collector.lock'))
         try:self.lock.__enter__()
         except BaseException:self.channel.close();raise
         self.index=None;self.epoch=uuid.uuid4().hex;self.instance=uuid.uuid4().hex;self.sequence=0;self.last=None
@@ -202,7 +238,7 @@ class CollectorService:
         # Only this service adapts its sanitized index; clients never scan it.
         legacy=bool(self.channel.index_path is not None
             and locked(self.channel.path.with_name('cache-worker.lock'))
-            and not locked(self.channel.path.with_suffix('.worker-consumer.lock')))
+            and not locked(self.channel.companion('.worker-consumer.lock')))
         if legacy and not self.channel.path.exists():
             snapshot=empty_snapshot(homes,self.channel.path,now)
         else:
@@ -248,7 +284,7 @@ def isolated_collector(homes,path,evidence=None,*,reuse=False):
     client=CollectionClient(homes,path,evidence,autostart=False)
     try:previous=client.channel.read()
     except BaseException:client.close();raise
-    if reuse and previous and locked(client.path.with_suffix('.collector.lock')):
+    if reuse and previous and locked(client.channel.companion('.collector.lock')):
         client.close();return lambda:None
     instance=uuid.uuid4().hex
     child=subprocess.Popen(client.command()+['--instance',instance],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
@@ -269,7 +305,7 @@ def isolated_collector(homes,path,evidence=None,*,reuse=False):
             candidate=(value or {}).get('collection',{}).get('instance')
             if candidate==instance:return cleanup
             if child.poll() is not None:
-                if reuse and child.returncode==0 and value and locked(client.path.with_suffix('.collector.lock')):
+                if reuse and child.returncode==0 and value and locked(client.channel.companion('.collector.lock')):
                     return lambda:None
                 raise RuntimeError('격리 수집기를 시작하지 못했습니다')
             time.sleep(.05)

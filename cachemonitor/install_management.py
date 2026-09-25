@@ -230,6 +230,8 @@ def prepare_uninstall(root, *, isolated=False):
                 if not any('--usage-collector' in (p.get('CommandLine') or '') for p in processes_under(root)):break
                 time.sleep(.1)
             else:raise RuntimeError('백그라운드 수집기 종료를 기다린 뒤 제거를 다시 실행하세요')
+        from .observer_task import remove_installation_collectors
+        remove_installation_collectors(root)
         if not isolated:
             import winreg
             from .observer_task import ObserverTask

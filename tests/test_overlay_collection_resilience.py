@@ -388,8 +388,65 @@ def test_snapshot_command_cleans_only_its_own_collector(tmp_path,borrowed):
             '--snapshot','--codex-home',str(home),'--index-path',str(path)],capture_output=True,text=True,encoding='utf-8',timeout=40)
         assert result.returncode==0,result.stderr
         assert json.loads(result.stdout)['sessions']
-        assert locked(path.with_suffix('.collector.lock'))==borrowed
+        assert locked(path.with_name(path.name+'.codexon-collector.lock'))==borrowed
         if service:assert not service.stopping()
         if before is not None:assert task.inspect()==before
     finally:
         if service:service.close()
+
+
+def test_index_suffixes_have_independent_channels_and_locks(tmp_path):
+    from cachemonitor.usage_collection import CollectionClient,CollectorService,empty_snapshot
+    services=[];clients=[];home=tmp_path/'home'
+    try:
+        for name in ('index','index.db','index.sqlite'):
+            path=tmp_path/name
+            service=CollectorService([home],path);services.append(service)
+            client=CollectionClient([home],path,worker=True,autostart=False);clients.append(client)
+            service.channel.publish(empty_snapshot([str(home)],path,100),service.epoch,1)
+        assert len({service.channel.snapshot_path for service in services})==3
+        assert len({service.lock.path for service in services})==3
+        for client,service in zip(clients,services):
+            assert client.poll(100)['index']['path']==str(service.channel.path)
+    finally:
+        for client in clients:client.close()
+        for service in services:service.close()
+
+
+@pytest.mark.parametrize('explicit_index',[False,True])
+def test_implicit_and_explicit_effective_evidence_share_scope(tmp_path,monkeypatch,explicit_index):
+    from cachemonitor import model_evidence
+    from cachemonitor.usage_collection import CollectionClient,CollectorService,empty_snapshot
+    monkeypatch.setenv('LOCALAPPDATA',str(tmp_path/'local'))
+    monkeypatch.setattr(model_evidence,'default_path',lambda:tmp_path/'default-evidence.sqlite')
+    path=tmp_path/'index.sqlite' if explicit_index else None;home=tmp_path/'home'
+    service=CollectorService([home],path)
+    client=CollectionClient([home],path,service.channel.default_evidence,autostart=False)
+    try:
+        service.channel.publish(empty_snapshot([str(home)],service.channel.path,100),service.epoch,1)
+        assert client.channel.scope==service.channel.scope
+        assert client.poll(100)['errors']==[]
+        assert service.channel.db.execute('SELECT count(*) FROM consumers').fetchone()[0]==1
+    finally:client.close();service.close()
+
+
+@pytest.mark.parametrize('other_name',['index','index.db'])
+def test_legacy_channel_is_reused_only_for_its_recorded_index(tmp_path,other_name):
+    import json,zlib
+    from cachemonitor.observer_state import ProcessLock
+    from cachemonitor.usage_collection import CollectionClient,CollectorService,empty_snapshot
+    home=tmp_path/'home';path=tmp_path/'index.sqlite';legacy=path.with_suffix('.collection.sqlite')
+    snapshot=empty_snapshot([str(home)],path,100)
+    with sqlite3.connect(legacy) as db:
+        db.execute('CREATE TABLE snapshot (id INTEGER PRIMARY KEY,scope TEXT,epoch TEXT,sequence INTEGER,observed REAL,payload BLOB)')
+        db.execute('INSERT INTO snapshot VALUES(1,?,?,?,?,?)',('', 'legacy',1,100,zlib.compress(json.dumps(snapshot).encode())))
+    with ProcessLock(path.with_suffix('.collector.lock')):
+        client=CollectionClient([home],path,autostart=False)
+        other=CollectorService([home],tmp_path/other_name)
+        try:
+            assert client.channel.legacy and client.channel.snapshot_path==legacy
+            assert client.channel.companion('.collector.lock')==path.with_suffix('.collector.lock')
+            assert client.poll(100)['index']['path']==str(path)
+            assert client.channel.wire_scope==''
+            assert not other.channel.legacy and other.channel.snapshot_path!=legacy
+        finally:client.close();other.close()

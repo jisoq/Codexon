@@ -83,6 +83,23 @@ def test_uninstall_stops_only_collector_after_other_components_exit(tmp_path,mon
     assert index.read_bytes()==b'preserve records'
 
 
+def test_uninstall_removes_idle_owned_collector_task_only(tmp_path,monkeypatch):
+    import sys
+    if sys.platform!='win32':pytest.skip('Windows task definitions')
+    from cachemonitor.observer_task import ObserverTask
+    root=tmp_path/'installed'
+    owned=ObserverTask(str(tmp_path/'owned-index.sqlite'),role='UsageCollector')
+    foreign=ObserverTask(str(tmp_path/'other-index.sqlite'),role='UsageCollector')
+    try:
+        owned.configure([str(root/'versions'/'old'/'Codexon.exe'),'--usage-collector','--index-path',str(tmp_path/'owned-index.sqlite')],False)
+        foreign.configure([str(tmp_path/'another-install'/'Codexon.exe'),'--usage-collector','--index-path',str(tmp_path/'other-index.sqlite')],False)
+        monkeypatch.setattr(install,'processes_under',lambda root:[])
+        assert owned.inspect()['registered'] and foreign.inspect()['registered']
+        assert install.prepare_uninstall(root,isolated=True)['ready']
+        assert not owned.inspect()['registered'] and foreign.inspect()['registered']
+    finally:owned.remove();foreign.remove()
+
+
 def test_product_cannot_escape_installation_root(tmp_path):
     with pytest.raises(ValueError):install.contained(tmp_path/'outside',tmp_path/'versions')
 
