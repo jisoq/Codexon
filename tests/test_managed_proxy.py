@@ -74,6 +74,9 @@ def test_same_journal_relay_transition_cannot_recover_a_live_request(tmp_path,fi
     finally:
         for process in reversed(processes):stop(process)
         if journal:journal.close()
+        from cachemonitor.observer_task import ObserverTask
+        collector=ObserverTask(str((directory/'index.sqlite').resolve()),role='UsageCollector')
+        collector.stop();collector.remove()
 
 
 def test_execution_owner_respects_both_legacy_lifetime_locks(tmp_path):
@@ -134,6 +137,8 @@ def test_observation_task_survives_launcher_exit(tmp_path):
     finally:
         task.stop()
         task.remove()
+        collector=ObserverTask(str((tmp_path/'data'/'usage-index.sqlite').resolve()),role='UsageCollector')
+        collector.stop();collector.remove()
 
 
 def test_managed_relay_is_one_process_and_explicit_off_drains_without_supervisor(tmp_path):

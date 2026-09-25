@@ -10,7 +10,7 @@ from PySide6.QtCore import Qt, QTimer, QSettings, QLocale
 from PySide6.QtGui import QFont, QFontInfo
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication, QMessageBox, QSystemTrayIcon
-from .index import UsageIndex
+from .usage_collection import CollectionClient
 from .dashboard import Dashboard as UsageDashboard, STYLE, average_tokens
 from .fonts import load_bundled_fonts, configure_font_rendering, configure_high_dpi
 from .version import VERSION
@@ -80,11 +80,12 @@ def main():
         if sys.stdout is not None:print(text)
         return 1 if result.get('error') else 0
     if args.snapshot:
-        monitor = UsageIndex(homes,args.index_path)
+        monitor = CollectionClient(homes,args.index_path,args.evidence_path)
         for _ in range(1000):
             snapshot = monitor.poll()
             if not snapshot["index"]["loading"]:
                 break
+            time.sleep(.1)
         print(json.dumps(snapshot, ensure_ascii=False, indent=2))
         monitor.close()
         return 0 if not snapshot["errors"] else 1
@@ -140,7 +141,12 @@ def main():
     if not isolated:save_homes(homes)
     if args.cache_control and not (args.smoke or args.verify_handoff):
         save_homes(homes);save_cache_paths(args.index_path,args.evidence_path,args.quota_path)
+    if args.smoke or args.verify_handoff:
+        from .usage_collection import isolated_collector
+        collector_cleanup=isolated_collector(homes,args.index_path,args.evidence_path)
+        app.aboutToQuit.connect(collector_cleanup)
     window = Dashboard(homes,index_path=args.index_path,model_evidence_path=args.evidence_path,quota_path=args.quota_path,
+        collection_autostart=not (args.smoke or args.verify_handoff),
         cache_control=args.cache_control or (not args.smoke and args.index_path is None),
         live_limits=not (args.smoke or args.verify_handoff),manage_observer=not (args.smoke or args.verify_handoff) and (args.index_path is None or args.cache_control), **({'settings':smoke_settings} if smoke_settings else {}))
     from .overlay import install_overlay

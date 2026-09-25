@@ -59,6 +59,30 @@ def test_uninstall_defers_when_any_payload_process_is_in_use(tmp_path,monkeypatc
     with pytest.raises(RuntimeError,match='끝난 뒤'):install.prepare_uninstall(tmp_path,isolated=True)
 
 
+@pytest.mark.parametrize('busy',[False,True])
+def test_uninstall_stops_only_collector_after_other_components_exit(tmp_path,monkeypatch,busy):
+    from cachemonitor import observer_task
+    index=tmp_path/'data with spaces'/'index.sqlite';index.parent.mkdir();index.write_bytes(b'preserve records')
+    exe=tmp_path/'versions'/'Codexon.exe'
+    processes=[dict(ExecutablePath=str(exe),ProcessId=42,
+        CommandLine=f'"{exe}" --usage-collector --index-path "{index}"')]
+    if busy:processes.append(dict(ExecutablePath=str(exe),ProcessId=43,CommandLine=f'"{exe}" --model-proxy'))
+    monkeypatch.setattr(install,'processes_under',lambda root:list(processes))
+    calls=[]
+    class Task:
+        def __init__(self,scope,role):calls.append((scope,role))
+        def stop(self):processes.clear();calls.append('stop')
+        def remove(self):calls.append('remove')
+    monkeypatch.setattr(observer_task,'ObserverTask',Task)
+    if busy:
+        with pytest.raises(RuntimeError,match='끝난 뒤'):install.prepare_uninstall(tmp_path,isolated=True)
+        assert not calls
+    else:
+        assert install.prepare_uninstall(tmp_path,isolated=True)['ready']
+        assert calls==[(str(index),'UsageCollector'),'stop','remove']
+    assert index.read_bytes()==b'preserve records'
+
+
 def test_product_cannot_escape_installation_root(tmp_path):
     with pytest.raises(ValueError):install.contained(tmp_path/'outside',tmp_path/'versions')
 

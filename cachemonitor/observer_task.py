@@ -59,7 +59,7 @@ class ObserverTask:
             'executable':command[0] if command else '',
             'arguments':subprocess.list2cmdline(command[1:]) if command else '',
             'autostart':bool(autostart),'periodic':bool(periodic),
-            'restart':3 if self.role in ('ModelObserver','ProxySupervisor','ProxyUpdate','CacheObservation','CacheObservationV2','CacheWorker') else 0}).encode()).decode()
+            'restart':3 if self.role in ('ModelObserver','ProxySupervisor','ProxyUpdate','CacheObservation','CacheObservationV2','CacheWorker','UsageCollector') else 0}).encode()).decode()
         script=r'''
 $ErrorActionPreference='Stop'
 [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
