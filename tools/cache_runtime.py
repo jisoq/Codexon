@@ -28,9 +28,9 @@ def main():
             if not args.authorization or not args.account_hash or len(args.account_hash)!=64 or not args.model or not args.effort or args.cost_stop is None:
                 parser.error('Explicit authorization, full account hash, model, effort and cost stop required')
             if control.get('authorization:'+args.authorization):raise ValueError('authorization_already_used')
-            states=[json.loads(r[0]) for r in control.db.execute('SELECT data FROM cache_status WHERE home=?',(home,))]
+            states=control.forecasts(home,time.time())
             states=[s for s in states if s.get('model')==args.model and s.get('effort')==args.effort and
-                    s.get('service_tier') in ('default','Standard') and s.get('cost_valid_until',0)>time.time() and s.get('maintenance_expected')]
+                    s.get('service_tier') in ('default','Standard') and s.get('maintenance_expected')]
             if not states:raise ValueError('fresh_pricing_required')
             estimate=max(states,key=lambda s:s.get('observed_at',0))
             scope=dict(home=home,account=args.account_hash,model=args.model,effort=args.effort,tier='default',transport='http',
@@ -55,14 +55,14 @@ def main():
                 if grant.get('purpose')!='diagnostic' or grant['stopped'] or grant['expires']<=time.time():raise ValueError('grant_inactive')
                 if control.get('diagnostic_request'):raise ValueError('diagnostic_already_queued')
                 control.set('diagnostic_request',grant['id'])
-        states=[json.loads(r[0]) for r in control.db.execute('SELECT data FROM cache_status WHERE home=?',(home,))]
+        states=control.forecasts(home,time.time())
         print(json.dumps(dict(home=home,worker_heartbeat=control.get('worker_heartbeat'),
             worker_snapshots=control.get('worker_snapshots',0),
             collector_error=control.get('collector_error'),worker_error=control.get('worker_error'),
             hooks=[dict(kind=k,count=n,last_at=t) for k,n,t in control.db.execute(
                 'SELECT kind,COUNT(*),MAX(at) FROM cache_inputs WHERE home=? GROUP BY kind',(home,))],
             profiles=control.db.execute('SELECT COUNT(*) FROM cache_profiles WHERE home=?',(home,)).fetchone()[0],
-            current_scenarios=[s for s in states if s.get('cost_valid_until',0)>time.time()],
+            current_scenarios=states,
             diagnostic=control.get('diagnostic_result'),pending=control.get('diagnostic_request'),
             grants=[dict(g,stats=journal.operations.stats(g)) for g in journal.operations.grants(home)],
             usage=journal.rows()),ensure_ascii=False,indent=2))

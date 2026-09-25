@@ -7,6 +7,7 @@ import asyncio
 import copy
 import hashlib
 import json
+import re
 import sqlite3
 import time
 from collections import OrderedDict
@@ -18,6 +19,128 @@ import aiohttp
 from .core import usage_values
 from .pricing import token_cost
 from .cache_audit import TTL_SECONDS
+
+
+class RequestFailure(ConnectionError):
+    def __init__(self,transport):
+        super().__init__(transport['failure'])
+        self.transport=transport
+
+
+def error_evidence(raw,headers,body,*,http_status=None,response_headers=None,read_error=None,truncated=False):
+    """Bounded error evidence only. Request values are used in memory to redact echoes.
+
+    JSON bodies retain diagnostic fields, not arbitrary server/request payloads.
+    Missing fields and incomplete reads are independent of unknown token usage.
+    """
+    fields=('code','type','param','detail','message')
+    private=[]
+    def strings(value):
+        if isinstance(value,str):yield value
+        elif isinstance(value,dict):
+            for v in value.values():yield from strings(v)
+        elif isinstance(value,list):
+            for v in value:yield from strings(v)
+    private.extend(str(v) for k,v in headers.items() if k.lower() not in ('content-type','accept','connection','content-length'))
+    for k in ('input','instructions','tools','prompt_cache_key','previous_response_id'):
+        private.extend(strings(body.get(k)))
+    # Split long prose as well as matching complete values: an error may echo
+    # only one line/token, or end midway through a credential at the read limit.
+    secrets=set()
+    for value in private:
+        secrets.add(value)
+        secrets.update(re.findall(r'[\w+/=@.:-]{4,}',value))
+    secrets.discard('')
+    def clean(value,*,identifier=False):
+        value=str(value)
+        for secret in private:
+            if not secret or len(secret)>len(value):continue
+            if len(secret)<4:
+                value=re.sub(r'(?<!\w)'+re.escape(secret)+r'(?!\w)','[redacted]',value)
+            else:
+                value=value.replace(secret,'[redacted]')
+                value=value.replace(json.dumps(secret)[1:-1],'[redacted]')
+        if not (identifier and re.fullmatch(r'[A-Za-z0-9_.\[\]-]{1,128}',value)):
+            value=re.sub(r'[\w+/=@.:-]{4,}',lambda m:'[redacted]' if m[0] in secrets else m[0],value)
+            tail=re.search(r'[\w+/=@.:-]{4,}$',value)
+            if tail and any(s.startswith(tail[0]) for s in secrets):value=value[:tail.start()]+'[redacted]'
+        value=re.sub(r'(?i)\bBearer\s+[^\s,;"\']+','Bearer [redacted]',value)
+        value=re.sub(r'\b(?:sk-[\w-]+|eyJ[\w.-]+)','[redacted]',value)
+        value=re.sub(r'(?i)(authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|cookie|password)\s*[=:]\s*[^\r\n,;}]+',r'\1=[redacted]',value)
+        # Unparseable request-shaped payloads cannot safely be retained as text.
+        value=re.sub(r'(?is)["\']?(?:input|instructions|messages|tools|content|prompt)["\']?\s*:\s*.*','[request payload omitted]',value)
+        return value
+    text=raw.decode('utf-8',errors='replace')
+    result=dict(http_status=http_status,request_ids={},read_error=read_error,
+                body_truncated=truncated,body_complete=not truncated and read_error is None,
+                body_bytes=len(raw),decode_replaced='\ufffd' in text)
+    for k,v in (response_headers or {}).items():
+        if k.lower() in ('x-request-id','request-id','openai-request-id','x-amzn-requestid','cf-ray'):
+            result['request_ids'][k.lower()]=clean(v)[:256]
+    diagnostics=[];omitted=False
+    def project(value,depth=0):
+        nonlocal omitted
+        if depth>12:omitted=True;return None
+        if isinstance(value,dict):
+            out={}
+            for k,v in value.items():
+                if k in fields and (v is None or isinstance(v,(str,int,float,bool))):
+                    sanitized=clean(v,identifier=k in ('code','type','param')) if v is not None else None
+                    if sanitized and len(sanitized)>1024:omitted=True
+                    out[k]=sanitized[:1024] if sanitized is not None else None
+                    diagnostics.append((k,out[k]))
+                elif k in ('request_id','requestId') and isinstance(v,str):
+                    out[k]=clean(v)[:256];result['request_ids'].setdefault(k,out[k])
+                elif k.lower() in ('input','instructions','tools','messages','headers','authorization','request','body','output','content'):
+                    omitted=True
+                elif isinstance(v,(dict,list)):
+                    child=project(v,depth+1)
+                    if child:out[clean(k)[:64]]=child
+                else:omitted=True
+            return out
+        if isinstance(value,list):
+            if len(value)>32:omitted=True
+            return [x for v in value[:32] if (x:=project(v,depth+1))]
+        if isinstance(value,str):return clean(value)[:2048]
+        return None
+    try:
+        parsed=json.loads(text)
+        projected=project(parsed)
+        preview=json.dumps(projected,ensure_ascii=False) if projected is not None else ''
+        result['body_format']='json'
+    except (ValueError,RecursionError):
+        preview=clean(text)
+        result['body_format']='invalid_json' if text.lstrip().startswith(('{','[')) else 'text' if text else 'empty'
+    result.update(body=preview[:2048],body_omitted=omitted,preview_truncated=len(preview)>2048,
+                  fields=[dict(field=k,value=v) for k,v in diagnostics][:32],
+                  fields_truncated=len(diagnostics)>32,
+                  missing_fields=[k for k in fields if not any(n==k for n,v in diagnostics)])
+    return result
+
+
+def terminal_response(response,headers,body,http_status,response_headers):
+    transport=error_evidence(b'',headers,body,http_status=http_status,response_headers=response_headers)
+    if response.get('error') or response.get('status')=='failed':
+        raw=json.dumps({'error':response.get('error')}).encode()
+        transport=error_evidence(raw[:16384],headers,body,http_status=http_status,
+            response_headers=response_headers,truncated=len(raw)>16384)
+        transport.update(failure='maintenance_rejected',rejected=True)
+    transport['response_status']=response.get('status')
+    return dict(response,_transport=transport)
+
+
+async def http_failure(response,headers,body):
+    raw=bytearray();limit=16384;read_error=None
+    try:
+        while len(raw)<=limit:
+            chunk=await response.content.read(min(4096,limit+1-len(raw)))
+            if not chunk:break
+            raw.extend(chunk)
+    except (asyncio.TimeoutError,asyncio.CancelledError):read_error='timeout'
+    except Exception as exc:read_error=type(exc).__name__
+    evidence=error_evidence(bytes(raw[:limit]),headers,body,http_status=response.status,
+        response_headers=response.headers,read_error=read_error,truncated=len(raw)>limit)
+    raise RequestFailure(dict(evidence,failure='maintenance_http_'+str(response.status),rejected=True))
 
 
 @contextmanager
@@ -146,17 +269,18 @@ class Journal:
         legacy=hashlib.sha256(json.dumps([home,sid,snapshot]).encode()).hexdigest()
         return self.db.execute('SELECT 1 FROM cache_jobs WHERE id IN (?,?)',(key,legacy)).fetchone() is not None
 
-    def finish(self,key,state,response=None,*,anchor=None,scope_read_lower=None):
+    def finish(self,key,state,response=None,*,anchor=None,scope_read_lower=None,transport=None):
         response=response or {}
         usage=response.get('usage')
-        # Store a strict token allowlist; not output, prompts or server errors.
+        # Store token allowlist and already sanitized transport evidence only.
         clean=usage_values(usage) if isinstance(usage,dict) else None
         # Completion releases the shared reservation and records any stop in ONE
         # transaction, so another connection cannot start before reconciliation.
         self.db.execute('BEGIN IMMEDIATE')
         try:
-            self.db.execute('UPDATE cache_jobs SET state=?,ended=?,response_id=?,usage=?,anchor=?,scope_read_lower=? WHERE id=?',
-                (state,time.time(),response.get('id'),json.dumps(clean) if clean is not None else None,anchor,scope_read_lower,key))
+            self.db.execute('UPDATE cache_jobs SET state=?,ended=?,response_id=?,usage=?,anchor=?,scope_read_lower=?,transport=? WHERE id=?',
+                (state,time.time(),response.get('id'),json.dumps(clean) if clean is not None else None,anchor,scope_read_lower,
+                 json.dumps(transport) if transport is not None else None,key))
             self.operations.reconcile(key)
             self.db.execute('COMMIT')
         except BaseException:
@@ -171,12 +295,13 @@ class Journal:
 
     def rows(self):
         rows=[]
-        for key,home,sid,state,start,end,rid,model,effort,tier,usage,snapshot,round_number,anchor,scope,operation,purpose in self.db.execute(
-                'SELECT id,home,sid,state,started,ended,response_id,model,effort,tier,usage,snapshot,round,anchor,scope_read_lower,operation,purpose FROM cache_jobs WHERE started IS NOT NULL ORDER BY started,id'):
+        for key,home,sid,state,start,end,rid,model,effort,tier,usage,snapshot,round_number,anchor,scope,operation,purpose,transport in self.db.execute(
+                'SELECT id,home,sid,state,started,ended,response_id,model,effort,tier,usage,snapshot,round,anchor,scope_read_lower,operation,purpose,transport FROM cache_jobs WHERE started IS NOT NULL ORDER BY started,id'):
             row=dict(key=rid or 'maintenance:'+key,job_id=key,operation=operation,home=home,sid=sid,purpose=purpose or 'maintenance',
                      ts=end or start,request_start=start,request_end=end,model=model,effort=effort,
                      service_tier=tier or '미확인',state=state,usage_known=usage is not None,
-                     snapshot=snapshot,round=round_number,anchor=anchor,scope_read_lower=scope)
+                     snapshot=snapshot,round=round_number,anchor=anchor,scope_read_lower=scope,
+                     transport=json.loads(transport) if transport else None)
             row.update(json.loads(usage) if usage else usage_values({}))
             row['usage_known']=all(type(row.get(k)) is int and row[k]>=0 for k in ('input','cached','output'))
             row.update(token_cost(row))
@@ -209,9 +334,10 @@ async def request_once(url, headers, body, *, websocket=False, timeout=30, permi
                         raise ConnectionError('maintenance_disconnected')
                     event=json.loads(msg.data)
                     if event.get('type') in ('response.completed','response.failed','response.incomplete'):
-                        return event['response']
+                        return terminal_response(event['response'],headers,body,101,{})
                     if event.get('type')=='error':
-                        raise ConnectionError('maintenance_rejected')
+                        raise RequestFailure(dict(error_evidence(msg.data.encode()[:16384],headers,body,http_status=101,
+                            truncated=len(msg.data.encode())>16384),failure='maintenance_rejected',rejected=True))
         else:
             body.pop('type',None)
             body['stream']=True
@@ -223,7 +349,7 @@ async def request_once(url, headers, body, *, websocket=False, timeout=30, permi
             headers={**headers,'Content-Type':'application/json'}
             async with client.post(url,headers=headers,data=upload(),allow_redirects=False) as response:
                 if response.status!=200:
-                    raise ConnectionError('maintenance_http_'+str(response.status))
+                    await http_failure(response,headers,body)
                 data=[]
                 async for line in response.content:
                     line=line.rstrip(b'\r\n')
@@ -232,9 +358,11 @@ async def request_once(url, headers, body, *, websocket=False, timeout=30, permi
                     elif not line and data:
                         event=json.loads(b'\n'.join(data));data=[]
                         if event.get('type') in ('response.completed','response.failed','response.incomplete'):
-                            return event['response']
+                            return terminal_response(event['response'],headers,body,response.status,response.headers)
                         if event.get('type')=='error':
-                            raise ConnectionError('maintenance_rejected')
+                            raw=json.dumps(event).encode()
+                            raise RequestFailure(dict(error_evidence(raw[:16384],headers,body,http_status=response.status,
+                                response_headers=response.headers,truncated=len(raw)>16384),failure='maintenance_rejected',rejected=True))
     raise ConnectionError('maintenance_missing_terminal')
 
 
@@ -310,23 +438,27 @@ class Executor:
                     # transport owns its deadline and must not lose recoverable usage.
                     if transport.cancelled():raise
                     continue
-            state='completed' if response.get('status')=='completed' and isinstance(response.get('usage'),dict) else 'unknown'
+            state=('failed' if (response.get('_transport') or {}).get('rejected') else
+                   'completed' if response.get('status')=='completed' and isinstance(response.get('usage'),dict) else 'unknown')
             usage=usage_values(response.get('usage') or {})
             # Inclusion/exclusion lower bound: deduct every token outside original
             # input before attributing any read to that unchanged input. Not full renewal.
             i,c,o=usage.get('input'),usage.get('cached'),original.get('input')
             lower=max(0,c-max(0,i-o)) if all(type(v) is int for v in (i,c,o)) and 0<=c<=i and o<=i else None
-            self.journal.finish(key,state,response,anchor=time.time()-(time.monotonic()-sent_anchor),scope_read_lower=lower)
+            self.journal.finish(key,state,response,anchor=time.time()-(time.monotonic()-sent_anchor),scope_read_lower=lower,
+                                transport=response.get('_transport'))
             if state=='completed' and lower and generation==self.generation:
                 self.renewals[home,sid,rid]=dict(round=round_number,anchor=sent_anchor,read_lower=lower,generation=generation)
             # Original response chain remains untouched. Unknown or zero overlap cannot renew.
             return state
-        except (Exception,asyncio.CancelledError):
+        except (Exception,asyncio.CancelledError) as exc:
             started=self.journal.db.execute('SELECT started FROM cache_jobs WHERE id=?',(key,)).fetchone()[0]
-            self.journal.finish(key,'unknown' if started is not None else 'cancelled')
+            evidence=exc.transport if isinstance(exc,RequestFailure) else dict(failure=type(exc).__name__)
+            state='failed' if started is not None and evidence.get('rejected') else 'unknown' if started is not None else 'cancelled'
+            self.journal.finish(key,state,transport=evidence)
             if operation and started is None and not self.closed and generation==self.generation and valid():
                 self.journal.operations.stop(operation['id'],'request_failed')
-            return 'unknown'
+            return 'failed' if state=='failed' else 'unknown'
 
     def close(self):
         self.closed=True
