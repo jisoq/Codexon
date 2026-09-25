@@ -92,6 +92,7 @@ RULES = (
     ('cachemonitor/analytics.py', ('analysis', 'cost', 'cache', 'speed', 'quota_math')),
     ('cachemonitor/analysis_engine.py', ('analysis', 'cost', 'cache', 'overlay_data')),
     ('cachemonitor/analysis_worker.py', ('analysis', 'quota_poll', 'overlay_tracking', 'notifications')),
+    ('cachemonitor/usage_collection.py', ('data', 'quota_poll', 'overlay_tracking', 'cache_connection')),
     ('cachemonitor/analysis_delivery.py', ('analysis', 'overlay_tracking')),
     ('cachemonitor/pricing.py', ('cost', 'quota_store', 'quota_math')),
     ('cachemonitor/request_modes.py', ('modes', 'quota_store')),

@@ -208,11 +208,28 @@ def prepare_uninstall(root, *, isolated=False):
                     if not health or health.get('active_connections'):break
                     time.sleep(.2)
             # Existing sockets are allowed to finish; a busy app/relay defers removal.
+        collectors=[]
         for process in processes_under(root):
             name=Path(process['ExecutablePath']).name.lower()
             if name.startswith('unins'):continue
             if process['ProcessId'] in (os.getpid(),os.getppid()) and Path(process['ExecutablePath']).resolve()==Path(sys.executable).resolve():continue
+            if '--usage-collector' in (process.get('CommandLine') or ''):
+                collectors.append(process);continue
             raise RuntimeError('Codexon을 종료하고 진행 중인 연결이 끝난 뒤 제거를 다시 실행하세요. 연결 설정과 기록은 보존됩니다.')
+        if collectors:
+            from .observer_task import ObserverTask
+            from .launch_context import command_arguments
+            for process in collectors:
+                args=command_arguments(process['CommandLine'])
+                if '--index-path' not in args:raise RuntimeError('수집기 경로를 확인할 수 없습니다')
+                index=args[args.index('--index-path')+1]
+                task=ObserverTask(str(Path(index).resolve()),role='UsageCollector')
+                task.stop();task.remove()
+            deadline=time.monotonic()+5
+            while time.monotonic()<deadline:
+                if not any('--usage-collector' in (p.get('CommandLine') or '') for p in processes_under(root)):break
+                time.sleep(.1)
+            else:raise RuntimeError('백그라운드 수집기 종료를 기다린 뒤 제거를 다시 실행하세요')
         if not isolated:
             import winreg
             from .observer_task import ObserverTask

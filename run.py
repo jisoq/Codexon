@@ -2,6 +2,10 @@ if __name__ == "__main__":
     from multiprocessing import freeze_support
     freeze_support()
     import sys
+    if '--usage-collector' in sys.argv:
+        sys.argv.remove('--usage-collector')
+        from cachemonitor.usage_collection import main
+        raise SystemExit(main())
     if '--cache-hook' in sys.argv:
         sys.argv.remove('--cache-hook')
         from cachemonitor.cache_control import hook_main

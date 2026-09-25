@@ -495,7 +495,7 @@ def main():
             if args.managed or args.control_file or not args.observation_index:
                 parser.error('Observation requires its own index and unmanaged listener')
             from .cache_scheduler import Scheduler
-            from .index import UsageIndex
+            from .usage_collection import CollectionClient
             from concurrent.futures import ThreadPoolExecutor
             from .cache_execution import execution_owner
             cache_lock=execution_owner(args.observation_index.with_name('cache-control.sqlite'))
@@ -512,7 +512,7 @@ def main():
                 pool=ThreadPoolExecutor(max_workers=1);index=None
                 def poll():
                     nonlocal index
-                    if index is None:index=UsageIndex([args.codex_home],args.observation_index,args.evidence_path)
+                    if index is None:index=CollectionClient([args.codex_home],args.observation_index,args.evidence_path,worker=True)
                     value=index.poll()
                     # Existing index/enrich owns profile generation. Never synthesize hooks.
                     return value['index']['loading']
