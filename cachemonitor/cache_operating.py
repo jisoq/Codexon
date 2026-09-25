@@ -43,10 +43,6 @@ def target(home, request, url, headers, websocket,*,observed_tier=None):
 class Operations:
     def __init__(self,journal):
         self.journal=journal;self.db=journal.db
-        self.db.executescript('''
-          CREATE TABLE IF NOT EXISTS cache_operating_proposals(id TEXT PRIMARY KEY,home TEXT,data TEXT,at REAL);
-          CREATE TABLE IF NOT EXISTS cache_operating_grants(id TEXT PRIMARY KEY,home TEXT,data TEXT,created REAL,expires REAL,stopped TEXT);
-        ''')
 
     def propose(self,scope,expected,adverse,output_high,basis,*,cost_stop=None,purpose='maintenance',dynamic_estimate=False):
         if not scope or not all(type(v) in (int,float) and math.isfinite(v) and v>0 for v in (expected,adverse,output_high)):return None

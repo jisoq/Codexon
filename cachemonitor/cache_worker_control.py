@@ -43,6 +43,10 @@ class CacheWorkerManager(ObserverManager):
 
     def ensure(self):return self.status()
 
+    def test_connection(self):
+        # An extra model probe would bypass the cache execution grant and ledger.
+        return self.status()
+
     def turn_on(self):
         with ProcessLock(self.control_lock,timeout=5):
             configured=self.config()[1].get('openai_base_url')

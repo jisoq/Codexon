@@ -75,6 +75,9 @@ def test_update_retargets_login_startup_and_rolls_back_unconfirmed_write(tmp_pat
     monkeypatch.setattr(activation,'publish_shell',lambda *a,**k:link.write_bytes(b'new shortcut'))
     monkeypatch.setattr(launch_context,'preference_path',lambda:tmp_path/'launch.json')
     monkeypatch.setattr(launch_context,'running_homes',lambda root:[])
+    from cachemonitor import observer_task
+    retired=[]
+    monkeypatch.setattr(observer_task,'retire_desktop_startups',lambda root:retired.append(root))
     def run(command,**kwargs):
         Path(command[-1]).write_text(json.dumps(dict(errors=[],version='test',phase='off')))
         return subprocess.CompletedProcess(command,0)
@@ -114,6 +117,7 @@ def test_update_retargets_login_startup_and_rolls_back_unconfirmed_write(tmp_pat
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER,approved_path) as key:
             assert winreg.QueryValueEx(key,'CacheMonitor')==(disabled,winreg.REG_BINARY)
         assert not (tmp_path/'activation-pending.json').exists()
+        assert retired==([] if fail_write else [tmp_path])
     finally:
         for path in (startup_path,approved_path,key_path):
             winreg.DeleteKey(winreg.HKEY_CURRENT_USER,path)

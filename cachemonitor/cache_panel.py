@@ -1,7 +1,8 @@
 """Shared cache analysis/settings and confirmation surface."""
 import json
 import time
-from PySide6.QtCore import QTimer,Qt
+import sqlite3
+from PySide6.QtCore import QTimer,Qt,Signal,QSignalBlocker
 from .cache_control import Control,control_path
 from .cache_execution import Journal
 from .cache_hooks import configure
@@ -69,11 +70,13 @@ REASONS={
 
 
 class CachePanel(Group):
+    storage_ready=Signal()
     def __init__(self,home,index_path=None,active=True,parent=None):
         super().__init__(parent);self.home=str(home)
         self.path=':memory:' if not active and index_path is None else control_path(index_path)
-        self.control=Control(self.path);self.active=active;self.dialog=None;self.ticket=None;self.last_ticket=None;self.closed=False;self.proxy_ready=False;self.relay_connected=False
-        self.journal=Journal(self.path);self.operating_dialog=None
+        self.control=None;self.journal=None;self.open_storage()
+        self.active=active;self.dialog=None;self.ticket=None;self.last_ticket=None;self.closed=False;self.proxy_ready=False;self.relay_connected=False
+        self.operating_dialog=None
         layout=Column(self);layout.setContentsMargins(0,0,8,20);layout.setSpacing(20)
         layout.addWidget(copy('작업 사이의 캐시 재사용을 돕고, 모델 변경으로 입력 처리 부담이 커질 때 알려줍니다.'))
         state,body=card('현재 상태');self.status=copy('자연 작업 이력 수집 중','section');body.addWidget(self.status)
@@ -90,7 +93,9 @@ class CachePanel(Group):
             ('automatic','자동 유지','돌아올 가능성과 예상 이득이 충분할 때, 허용된 범위에서 별도 요청으로 캐시 재사용을 돕습니다.'),
             ('guard','모델 변경 확인','다음 요청에서 모델 변경으로 입력 처리 부담이 크게 늘어날 때 진행 여부를 묻습니다. 추가 모델 요청은 보내지 않습니다.')):
             node,body=card(title);row=Row();row.addWidget(copy('개별 기능 켜기'),1)
-            toggle=Switch();toggle.setAccessibleName(title);toggle.setChecked(self.control.get('selection:'+key,self.control.get(key,False)));self.toggles[key]=toggle
+            toggle=Switch();toggle.setAccessibleName(title)
+            toggle.setChecked(self.control.get('selection:'+key,self.control.get(key,False)) if self.control else False)
+            toggle.setEnabled(active and self.control is not None);self.toggles[key]=toggle
             toggle.toggled.connect(lambda value,k=key:self.set_feature(k,value));row.addWidget(toggle);body.addLayout(row)
             body.addWidget(copy(description));controls.addWidget(node,1)
         layout.addLayout(controls)
@@ -126,7 +131,27 @@ class CachePanel(Group):
         self.timer=QTimer(self);self.timer.setInterval(300);self.timer.timeout.connect(self.poll)
         if active:self.timer.start()
 
+    def open_storage(self):
+        control=None
+        try:
+            control=Control(self.path,timeout=.05)
+            journal=Journal(self.path,timeout=.05)
+        except (sqlite3.Error,OSError):
+            if control:control.close()
+            return False
+        self.control,self.journal=control,journal
+        return True
+
+    def restore_controls(self):
+        if not self.control:return False
+        enabled=self.control.get('enabled',self.control.get('automatic',False) or self.control.get('guard',False))
+        for key,toggle in self.toggles.items():
+            with QSignalBlocker(toggle):toggle.setChecked(self.control.get('selection:'+key,self.control.get(key,False)))
+            toggle.setEnabled(self.active and enabled)
+        return enabled
+
     def set_enabled(self,enabled):
+        if not self.control:return
         self.control.set('enabled',bool(enabled))
         for key,toggle in self.toggles.items():
             toggle.setEnabled(self.active and enabled)
@@ -137,6 +162,7 @@ class CachePanel(Group):
         self.poll()
 
     def set_feature(self,key,value):
+        if not self.control:return
         self.control.set('selection:'+key,bool(value))
         # Existing relays can drain without a restart: they understand these gates.
         self.control.set(key,bool(value) and self.control.get('enabled',True))
@@ -150,6 +176,12 @@ class CachePanel(Group):
 
     def poll(self):
         try:
+            if not self.control:
+                if not self.open_storage():
+                    self.status.setText('저장소 연결 재시도 중')
+                    self.next_action.setText('다른 작업이 기록을 저장하고 있습니다. 연결되면 기존 설정과 기록을 불러옵니다.')
+                    return
+                self.restore_controls();self.storage_ready.emit()
             self.control.set('ui_heartbeat',time.time())
             waiting=self.control.requests()
             observed=self.ticket or self.last_ticket
@@ -324,5 +356,5 @@ class CachePanel(Group):
         self.closed=True
         if self.dialog:self.dialog.reject()
         if self.operating_dialog:self.operating_dialog.reject()
-        self.control.close()
-        self.journal.close()
+        if self.control:self.control.close()
+        if self.journal:self.journal.close()

@@ -1429,14 +1429,22 @@ class Dashboard(TrayWindow):
         body.addWidget(label('가격 별칭: gpt-5.6, gpt-daybreak-blue-latest → gpt-5.6-sol · gpt-5.4-mini-2026-03-17 → gpt-5.4-mini · gpt-5.5-2026-04-23 → gpt-5.5','muted',True))
         buttons=DialogButtons(DialogButtons.Close);buttons.rejected.connect(dialog.reject);body.addWidget(buttons);dialog.open();self.price_dialog=dialog
 
-    def set_cache_enabled(self,enabled):
-        self.cache_panel.set_enabled(enabled)
+    def set_cache_enabled(self,enabled,*,persist=True):
+        if persist:self.cache_panel.set_enabled(enabled)
         blocked=self.nav.blockSignals(True)
         self.nav.clear();self.nav.addItems(TITLES[:4]+(('캐시 관리',) if enabled else ()))
         self.nav.setMaximumHeight(270 if enabled else 220)
         self.nav.setCurrentRow(4 if enabled and self.current_page==5 else self.current_page if self.current_page<4 else -1)
         self.nav.blockSignals(blocked)
         if not enabled and self.current_page==5:self.change_page(4)
+
+    def restore_cache_controls(self):
+        enabled=self.cache_panel.restore_controls()
+        blocked=self.cache_master.blockSignals(True)
+        self.cache_master.setChecked(enabled)
+        self.cache_master.blockSignals(blocked)
+        self.cache_master.setEnabled(self.cache_control_enabled and self.cache_panel.control is not None)
+        self.set_cache_enabled(enabled,persist=False)
 
     def build_settings(self):
         from .settings_page import SettingsPage
@@ -1454,12 +1462,10 @@ class Dashboard(TrayWindow):
         cache_scroll=Scroll();cache_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         cache_scroll.setWidget(self.cache_panel);self.pages.addWidget(cache_scroll);self.scrollers[5]=cache_scroll
         self.cache_master=Switch()
-        self.cache_master.setChecked(self.cache_panel.control.get('enabled',
-            self.cache_panel.control.get('automatic',False) or self.cache_panel.control.get('guard',False)))
-        self.cache_master.setEnabled(self.cache_control_enabled)
         self.settings_page.add_row(6,'캐시 관리','전용 탭에서 자동 유지와 모델 변경 확인을 각각 설정합니다. 끄면 두 기능이 모두 중지됩니다.',self.cache_master)
         self.cache_master.toggled.connect(self.set_cache_enabled)
-        self.set_cache_enabled(self.cache_master.isChecked())
+        self.cache_panel.storage_ready.connect(self.restore_cache_controls)
+        self.restore_cache_controls()
         self.observer_panel.status_observed.connect(self.cache_panel.proxy_status)
         legacy_notifications = self.settings.value('notifications',True,type=bool)
         self.notification_master = Switch()
