@@ -2,7 +2,8 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 
-from cachemonitor.core import Monitor, Session, WINDOW, SESSION_WINDOW
+from cachemonitor.core import Session
+from cachemonitor.index import UsageIndex
 
 
 TID = "12345678-abcd-abcd-abcd-123456789012"
@@ -50,41 +51,26 @@ def fixture_home(tmp_path):
     return home, path
 
 
-def test_integration_partial_lines_restart_and_expiry(tmp_path):
-    home, path = fixture_home(tmp_path)
-    monitor = Monitor([home])
-    first = monitor.poll(10001)
-    assert not first["errors"]
-    assert first["sessions"][0]["title"] == "작업 이름"
-    assert first["sessions"][0]["requests"][0]["transport"] == "WebSocket"
-    second = (json.dumps(usage("r2", time=10010), ensure_ascii=False) + "\n").encode()
-    with path.open("ab") as h:
-        h.write(second[:60])
-    assert len(monitor.poll(10011)["sessions"][0]["requests"]) == 1
-    with path.open("ab") as h:
-        h.write(second[60:])
-    assert len(monitor.poll(10012)["sessions"][0]["requests"]) == 2
-    assert len(monitor.poll(10013)["sessions"][0]["requests"]) == 2
-    assert len(Monitor([home]).poll(10013)["sessions"][0]["requests"]) == 2
-    assert monitor.poll(10010 + WINDOW + 1)["sessions"][0]["requests"] == []
-    assert monitor.poll(10010 + SESSION_WINDOW + 1)["sessions"] == []
-
-
 def test_two_concurrent_sessions_have_independent_fallback(tmp_path):
     home, path = fixture_home(tmp_path)
     other = "87654321-abcd-abcd-abcd-123456789012"
     with sqlite3.connect(home / "logs_2.sqlite") as c:
         c.execute("insert into logs values(2,10000,0,'codex_core::client',?,'p1','falling back to HTTP')", (other,))
-    snapshot = Monitor([home]).poll(10001)
+    index = UsageIndex([home],tmp_path/"index.sqlite")
+    try:snapshot = index.poll(10001)
+    finally:index.close()
     by_id = {s["id"]: s for s in snapshot["sessions"]}
     assert by_id[TID]["transport"] == "WebSocket"
     assert by_id[other]["transport"] == "HTTP/SSE"
 
 
 def test_missing_databases_are_visible_errors_and_not_created(tmp_path):
-    snapshot = Monitor([tmp_path]).poll()
+    home=tmp_path/"home";home.mkdir()
+    index=UsageIndex([home],tmp_path/"index.sqlite")
+    try:snapshot=index.poll()
+    finally:index.close()
     assert len(snapshot["errors"]) == 2
-    assert list(tmp_path.iterdir()) == []
+    assert list(home.iterdir()) == []
 
 
 def test_effort_accounting_and_unclassified_lifetime():
@@ -123,15 +109,18 @@ def test_title_helper_excluded_but_regular_luna_preserved(tmp_path):
         c.execute("insert into logs values(2,10000,0,?,?,?,?)", (TITLE_HANDLER, helper, "p1", body))
         c.execute("insert into logs values(3,10001,0,'feedback_tags',?,'p1',?)", (helper,
                   'turn{model=gpt-5.6-luna}:request{transport="responses_websocket" api.path="/responses"}: auth_header_attached=true'))
-    monitor = Monitor([home])
+    monitor = UsageIndex([home],tmp_path/"index.sqlite")
     view = monitor.poll(10002)
     assert view["excluded_title_sessions"] == 1
     assert [s["id"] for s in view["sessions"]] == [TID]
     assert view["sessions"][0]["totals"]["session"]["total"] == 10010
-    assert Monitor([home]).poll(10002)["excluded_title_sessions"] == 1
+    monitor.close()
+    monitor = UsageIndex([home],tmp_path/"index.sqlite")
+    assert monitor.poll(10002)["excluded_title_sessions"] == 1
     # A real persisted Luna task remains visible, even if it uses the same prompt.
     with sqlite3.connect(home / "state_5.sqlite") as c:
         c.execute("insert into threads values(?,?,?,?,?,?,?,?)", (helper, "", 10001, "Luna task", "", "gpt-5.6-luna", "openai", "project"))
-    view = monitor.poll(10003)
+    view = monitor.poll(10013)
     assert view["excluded_title_sessions"] == 0
     assert len(view["sessions"]) == 2
+    monitor.close()

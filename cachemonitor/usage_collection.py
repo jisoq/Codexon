@@ -30,21 +30,6 @@ def locked(path):
     else:probe.__exit__(None,None,None);return False
 
 
-def legacy_channel_matches(path):
-    legacy=path.with_suffix('.collection.sqlite')
-    if not legacy.is_file():return False
-    try:
-        with closing(sqlite3.connect(legacy.as_uri()+'?mode=ro',uri=True)) as db:
-            row=db.execute('SELECT payload FROM snapshot WHERE id=1').fetchone()
-        if row:
-            source=json.loads(zlib.decompress(row[0]))['index']['path']
-            return os.path.normcase(str(Path(source).resolve()))==os.path.normcase(str(path))
-    except (OSError,sqlite3.Error,ValueError,KeyError,zlib.error):pass
-    if locked(path.with_suffix('.collector.lock')):
-        raise CollectionScopeError('이전 수집기의 색인 경로 확인을 기다리고 있습니다.')
-    return False
-
-
 class CollectionChannel:
     """IPC contains sanitized results and requested homes, never source offsets."""
     def __init__(self,homes,path=None,evidence=None):
@@ -55,8 +40,6 @@ class CollectionChannel:
         from .model_evidence import default_path
         self.default_evidence=self.path.with_name('model-evidence.sqlite') if path is not None else default_path()
         self.scope=self.scope_key(evidence)
-        self.legacy=False
-        if not self.companion('.collection.sqlite').exists():self.legacy=legacy_channel_matches(self.path)
         self.snapshot_path=self.companion('.collection.sqlite')
         self.snapshot_path.parent.mkdir(parents=True,exist_ok=True)
         self.db=sqlite3.connect(self.snapshot_path)
@@ -68,39 +51,35 @@ class CollectionChannel:
         self.db.execute('CREATE TABLE IF NOT EXISTS snapshot (id INTEGER PRIMARY KEY, scope TEXT, epoch TEXT, sequence INTEGER, observed REAL, payload BLOB)')
         self.db.execute('CREATE TABLE IF NOT EXISTS consumers (id TEXT PRIMARY KEY, scope TEXT, homes TEXT, observed REAL)')
         self.db.execute('CREATE TABLE IF NOT EXISTS control (instance TEXT PRIMARY KEY, action TEXT)')
-        previous=self.db.execute('SELECT scope FROM snapshot WHERE id=1').fetchone() if self.legacy else None
-        self.wire_scope=previous[0] if previous and self.scope_key(previous[0])==self.scope else self.scope
         self.client=uuid.uuid4().hex;self.cached=None;self.identity=None
 
     def companion(self,suffix):
-        # Existing channels are reused only after their stored index identity
-        # matches. New indexes retain the complete filename, including suffix.
-        return self.path.with_suffix(suffix) if self.legacy else self.path.with_name(self.path.name+'.codexon-'+suffix.lstrip('.'))
+        return self.path.with_name(self.path.name+'.codexon-'+suffix.lstrip('.'))
 
     def scope_key(self,evidence):
         return os.path.normcase(str(Path(evidence or self.default_evidence).resolve()))
 
     def subscribe(self,now):
         self.db.execute('INSERT OR REPLACE INTO consumers VALUES(?,?,?,?)',
-            (self.client,self.wire_scope,json.dumps(self.homes),now));self.db.commit()
+            (self.client,self.scope,json.dumps(self.homes),now));self.db.commit()
 
     def requested_homes(self,now):
         homes=list(self.homes)
         for scope,value in self.db.execute('SELECT scope,homes FROM consumers WHERE observed>=? ORDER BY observed,id',(now-60,)):
-            if self.scope_key(scope)==self.scope:homes.extend(home for home in json.loads(value) if home not in homes)
+            if scope==self.scope:homes.extend(home for home in json.loads(value) if home not in homes)
         return homes
 
     def publish(self,snapshot,epoch,sequence):
         payload=zlib.compress(json.dumps(snapshot,ensure_ascii=False,separators=(',',':')).encode('utf-8'),1)
         self.db.execute('INSERT OR REPLACE INTO snapshot VALUES(1,?,?,?,?,?)',
-            (self.wire_scope,epoch,sequence,snapshot['ts'],payload));self.db.commit()
+            (self.scope,epoch,sequence,snapshot['ts'],payload));self.db.commit()
 
     def read(self):
         with closing(sqlite3.connect(self.snapshot_path.as_uri()+'?mode=ro',uri=True)) as db:
             db.execute('BEGIN')
             row=db.execute('SELECT scope,epoch,sequence FROM snapshot WHERE id=1').fetchone()
             if not row:return None
-            if self.scope_key(row[0])!=self.scope:
+            if row[0]!=self.scope:
                 if locked(self.companion('.collector.lock')):
                     raise CollectionScopeError('사용량 색인에 다른 관측 DB가 연결되어 있습니다. 별도 색인 경로를 사용하세요.')
                 return None
@@ -127,13 +106,9 @@ def empty_snapshot(homes,path,now):
 
 class CollectionClient:
     """GUI/cache clients never instantiate a source index or acquire its lock."""
-    def __init__(self,homes,path=None,model_evidence_path=None,*,worker=False,autostart=True):
+    def __init__(self,homes,path=None,model_evidence_path=None,*,autostart=True):
         self.channel=CollectionChannel(homes,path,model_evidence_path)
         self.path=self.channel.path;self.next_start=0;self.autostart=autostart
-        self.worker_marker=None
-        if worker:
-            self.worker_marker=ProcessLock(self.channel.companion('.worker-consumer.lock'))
-            self.worker_marker.__enter__()
 
     def command(self):
         parts=[sys.executable]
@@ -216,7 +191,6 @@ class CollectionClient:
 
     def close(self):
         self.channel.close()
-        if self.worker_marker:self.worker_marker.__exit__(None,None,None);self.worker_marker=None
 
 
 class CollectorService:
@@ -234,21 +208,13 @@ class CollectorService:
     def poll(self,now=None):
         from .index import UsageIndex
         now=now or time.time();homes=self.channel.requested_homes(now)
-        # Preserve active connections during upgrade from a collecting worker.
-        # Only this service adapts its sanitized index; clients never scan it.
-        legacy=bool(self.channel.index_path is not None
-            and locked(self.channel.path.with_name('cache-worker.lock'))
-            and not locked(self.channel.companion('.worker-consumer.lock')))
-        if legacy and not self.channel.path.exists():
-            snapshot=empty_snapshot(homes,self.channel.path,now)
-        else:
-            if self.index and (homes!=[str(h) for h in self.index.homes] or self.index.read_only!=legacy):
-                self.index.close();self.index=None;self.epoch=uuid.uuid4().hex
-            if self.index is None:self.index=UsageIndex(homes,self.channel.index_path,self.channel.evidence,read_only=legacy)
-            snapshot=self.index.poll(now)
+        if self.index and homes!=[str(h) for h in self.index.homes]:
+            self.index.close();self.index=None;self.epoch=uuid.uuid4().hex
+        if self.index is None:self.index=UsageIndex(homes,self.channel.index_path,self.channel.evidence)
+        snapshot=self.index.poll(now)
         snapshot={**snapshot,'sessions':[dict(s,usage_revision=f'{self.epoch}:{s.get("usage_revision")}') for s in snapshot['sessions']],
             'collection':dict(pid=os.getpid(),instance=self.instance,version=VERSION,
-                executable=str(Path(sys.executable).resolve()),mode='indexed_compatibility' if legacy else 'dedicated')}
+                executable=str(Path(sys.executable).resolve()))}
         self.sequence+=1;self.channel.publish(snapshot,self.epoch,self.sequence);self.last=snapshot
         return snapshot
 

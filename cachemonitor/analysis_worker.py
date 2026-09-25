@@ -1,4 +1,4 @@
-"""Process boundary: collecting, indexing and CPU analysis never execute on Qt's UI thread."""
+"""Analyze shared collector snapshots outside Qt's UI thread."""
 import multiprocessing as mp
 import threading
 import time
@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from bisect import bisect_left
 from PySide6.QtCore import QThread, Signal
 from .analysis_engine import AnalysisEngine
-from .usage_collection import CollectionClient as UsageIndex
+from .usage_collection import CollectionClient
 from .quota_cycles import QuotaLedger, ledger_path
 from .overlay_data import OverlaySummaries
 from .analysis_delivery import SnapshotPublisher, SnapshotReceiver
@@ -39,7 +39,7 @@ def expiry(engine,q):
 
 def process_main(connection,homes,index_path,static_snapshot=None,model_evidence_path=None,quota_path=None,collection_autostart=True):
     quota_path=quota_path or ledger_path(index_path)
-    index=None
+    collector=None
     ledger=None
     ledger_issue=None
     ledger_retry=0
@@ -70,8 +70,8 @@ def process_main(connection,homes,index_path,static_snapshot=None,model_evidence
             snapshot=static_snapshot
             engine.ingest(snapshot['sessions'])
         else:
-            index=UsageIndex(homes,index_path,model_evidence_path)
-            index.autostart=collection_autostart
+            collector=CollectionClient(homes,index_path,model_evidence_path)
+            collector.autostart=collection_autostart
             try:ledger=QuotaLedger(quota_path)
             except sqlite3.Error as error:disable_ledger(error)
         def publish():
@@ -93,7 +93,7 @@ def process_main(connection,homes,index_path,static_snapshot=None,model_evidence
                     connection.send({'kind':'record','id':message['id'],
                                      'row':engine.record(*message['identity'])})
             if not frozen and time.monotonic()>=next_poll:
-                snapshot=index.poll()
+                snapshot=collector.poll()
                 if ledger is None and time.monotonic()>=ledger_retry:
                     try:ledger=QuotaLedger(quota_path)
                     except sqlite3.Error as error:disable_ledger(error)
@@ -105,7 +105,7 @@ def process_main(connection,homes,index_path,static_snapshot=None,model_evidence
                     try:
                         ledger.sync(engine,snapshot)
                         if not imported and not snapshot['index']['loading']:
-                            for home in snapshot['homes']: ledger.import_observations(index.path,home)
+                            for home in snapshot['homes']: ledger.import_observations(collector.path,home)
                             imported=True
                         ledger_issue=None
                         ledger_failures=0
@@ -132,7 +132,7 @@ def process_main(connection,homes,index_path,static_snapshot=None,model_evidence
         try: connection.send({'kind':'fatal','error':traceback.format_exc(limit=6)})
         except (OSError,EOFError): pass
     finally:
-        if index: index.close()
+        if collector: collector.close()
         if ledger: ledger.close()
         connection.close()
 

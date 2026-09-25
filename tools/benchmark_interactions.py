@@ -16,7 +16,7 @@ def main():
     parser.add_argument('--snapshot',help='Reuse/create one frozen local snapshot for both builds')
     args=parser.parse_args();sys.path.insert(0,args.source_root)
     from cachemonitor.index import UsageIndex
-    from cachemonitor.core import Monitor
+    from cachemonitor.core import SessionRegistry
     from cachemonitor.dashboard import Dashboard,STYLE
     from PySide6.QtCore import QSettings,QTimer
     from PySide6.QtTest import QTest
@@ -27,7 +27,7 @@ def main():
         index=UsageIndex.__new__(UsageIndex)
         index.db=sqlite3.connect(Path(args.index).resolve().as_uri()+'?mode=ro',uri=True)
         index.metadata={(r[0],r[1]):json.loads(r[2]) for r in index.db.execute('select home,tid,data from metadata')}
-        index.monitor=Monitor([]); index.loaded=set(); index.turn_states={}
+        index.monitor=SessionRegistry(); index.loaded=set(); index.turn_states={}
         from collections import defaultdict
         index.new_events=defaultdict(list);index.event_tails={};index.rebuild_required=set()
         now=time.time()

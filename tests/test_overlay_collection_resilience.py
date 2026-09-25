@@ -40,7 +40,7 @@ def test_quota_storage_failure_keeps_publishing_real_calls(monkeypatch,tmp_path,
         def recv(self):return {'kind':'stop'}
         def send(self,value):snapshots.append(value)
         def close(self):pass
-    monkeypatch.setattr(analysis_worker,'UsageIndex',Index)
+    monkeypatch.setattr(analysis_worker,'CollectionClient',Index)
     monkeypatch.setattr(analysis_worker,'QuotaLedger',Ledger)
     analysis_worker.process_main(Connection(),['home'],tmp_path/'index.sqlite')
     assert index_paths==[tmp_path/'index.sqlite']
@@ -87,7 +87,7 @@ def test_usage_ledger_retries_after_transient_failure(monkeypatch,tmp_path):
         def recv(self):return {'kind':'stop'}
         def send(self,value):snapshots.append(value)
         def close(self):pass
-    monkeypatch.setattr(analysis_worker,'UsageIndex',Index)
+    monkeypatch.setattr(analysis_worker,'CollectionClient',Index)
     monkeypatch.setattr(analysis_worker,'QuotaLedger',Ledger)
     analysis_worker.process_main(Connection(),['h'],tmp_path/'index.sqlite',quota_path=quota_path)
     assert len(opens)==2 and opens[1]-opens[0]>=5
@@ -112,7 +112,7 @@ def test_service_collects_large_record_once_for_gui_and_worker(tmp_path,monkeypa
     index=tmp_path/'index.sqlite'
     service=CollectorService([home],index)
     gui=CollectionClient([home],index,autostart=False)
-    worker=CollectionClient([home],index,worker=True,autostart=False)
+    worker=CollectionClient([home],index,autostart=False)
     try:
         for _ in range(10):
             produced=service.poll(10010)
@@ -130,60 +130,6 @@ def test_service_collects_large_record_once_for_gui_and_worker(tmp_path,monkeypa
             assert client.poll(10010)['sessions']
         assert service.index.db.execute('select offset from files').fetchone()[0]==path.stat().st_size
     finally:gui.close();worker.close();service.close()
-
-
-def test_service_adapts_legacy_worker_without_gui_index_access(tmp_path,monkeypatch):
-    from cachemonitor.index import UsageIndex
-    from cachemonitor.usage_collection import CollectionClient,CollectorService
-    from cachemonitor.observer_state import ProcessLock
-    from test_core import fixture_home
-    home,_=fixture_home(tmp_path);path=tmp_path/'index.sqlite'
-    legacy=UsageIndex([home],path);legacy.poll(10010)
-    service=CollectorService([home],path);gui=CollectionClient([home],path,autostart=False)
-    try:
-        with ProcessLock(tmp_path/'cache-worker.lock'):
-            snapshot=service.poll(10011)
-            assert snapshot['collection']['mode']=='indexed_compatibility'
-            assert service.index.read_only and service.index.bytes_read==0
-            with pytest.raises(sqlite3.OperationalError):service.index.db.execute('DELETE FROM events')
-            def no_index(*args,**kwargs):raise AssertionError('GUI opened source index')
-            with monkeypatch.context() as m:
-                m.setattr(UsageIndex,'__init__',no_index)
-                assert gui.poll(10011)['sessions']
-        legacy.close()
-        assert service.poll(10012)['collection']['mode']=='dedicated'
-        assert not service.index.read_only
-    finally:legacy.close();gui.close();service.close()
-
-
-def test_legacy_missing_rollout_keeps_history_without_blocking_completion(tmp_path):
-    from cachemonitor.index import UsageIndex
-    from test_core import fixture_home
-    home,record=fixture_home(tmp_path);path=tmp_path/'index.sqlite'
-    writer=UsageIndex([home],path)
-    before=writer.poll(10010)
-    writer.db.execute('UPDATE files SET offset=0');writer.db.commit()
-    reader=UsageIndex([home],path,read_only=True)
-    try:
-        assert reader.poll(10011)['index']['loading']
-        record.unlink()
-        after=reader.poll(10012)
-        assert not after['index']['loading'] and after['usage_collection_complete']
-        assert [r['key'] for s in after['sessions'] for r in s['history']]==[r['key'] for s in before['sessions'] for r in s['history']]
-        assert reader.bytes_read==0
-    finally:reader.close();writer.close()
-
-
-def test_empty_legacy_index_is_complete(tmp_path):
-    from cachemonitor.index import UsageIndex
-    home=tmp_path/'empty home';home.mkdir();path=tmp_path/'index.sqlite'
-    writer=UsageIndex([home],path);writer.poll(10010)
-    reader=UsageIndex([home],path,read_only=True)
-    try:
-        snapshot=reader.poll(10011)
-        assert snapshot['sessions']==[] and snapshot['usage_collection_complete']
-        assert snapshot['index']['files']==0 and not snapshot['index']['loading']
-    finally:reader.close();writer.close()
 
 
 def test_missing_or_stalled_service_only_requests_service_restart(tmp_path,monkeypatch):
@@ -215,7 +161,7 @@ def test_service_collects_all_requested_homes(tmp_path):
     path=tmp_path/'index.sqlite'
     service=CollectorService([first],path)
     gui=CollectionClient([second,first],path,autostart=False)
-    worker=CollectionClient([first],path,worker=True,autostart=False)
+    worker=CollectionClient([first],path,autostart=False)
     try:
         service.poll(10010);assert gui.poll(10010)['index']['loading']
         produced=service.poll(10011)
@@ -402,7 +348,7 @@ def test_index_suffixes_have_independent_channels_and_locks(tmp_path):
         for name in ('index','index.db','index.sqlite'):
             path=tmp_path/name
             service=CollectorService([home],path);services.append(service)
-            client=CollectionClient([home],path,worker=True,autostart=False);clients.append(client)
+            client=CollectionClient([home],path,autostart=False);clients.append(client)
             service.channel.publish(empty_snapshot([str(home)],path,100),service.epoch,1)
         assert len({service.channel.snapshot_path for service in services})==3
         assert len({service.lock.path for service in services})==3
@@ -428,25 +374,3 @@ def test_implicit_and_explicit_effective_evidence_share_scope(tmp_path,monkeypat
         assert client.poll(100)['errors']==[]
         assert service.channel.db.execute('SELECT count(*) FROM consumers').fetchone()[0]==1
     finally:client.close();service.close()
-
-
-@pytest.mark.parametrize('other_name',['index','index.db'])
-def test_legacy_channel_is_reused_only_for_its_recorded_index(tmp_path,other_name):
-    import json,zlib
-    from cachemonitor.observer_state import ProcessLock
-    from cachemonitor.usage_collection import CollectionClient,CollectorService,empty_snapshot
-    home=tmp_path/'home';path=tmp_path/'index.sqlite';legacy=path.with_suffix('.collection.sqlite')
-    snapshot=empty_snapshot([str(home)],path,100)
-    with sqlite3.connect(legacy) as db:
-        db.execute('CREATE TABLE snapshot (id INTEGER PRIMARY KEY,scope TEXT,epoch TEXT,sequence INTEGER,observed REAL,payload BLOB)')
-        db.execute('INSERT INTO snapshot VALUES(1,?,?,?,?,?)',('', 'legacy',1,100,zlib.compress(json.dumps(snapshot).encode())))
-    with ProcessLock(path.with_suffix('.collector.lock')):
-        client=CollectionClient([home],path,autostart=False)
-        other=CollectorService([home],tmp_path/other_name)
-        try:
-            assert client.channel.legacy and client.channel.snapshot_path==legacy
-            assert client.channel.companion('.collector.lock')==path.with_suffix('.collector.lock')
-            assert client.poll(100)['index']['path']==str(path)
-            assert client.channel.wire_scope==''
-            assert not other.channel.legacy and other.channel.snapshot_path!=legacy
-        finally:client.close();other.close()
