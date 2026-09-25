@@ -17,31 +17,26 @@ def control_path(index_path=None):
 
 
 class Control:
-    def __init__(self,path):
-        if str(path)!=':memory:':
-            path=Path(path);path.parent.mkdir(parents=True,exist_ok=True)
-        self.db=sqlite3.connect(str(path),timeout=.5,isolation_level=None)
-        self.db.executescript('''PRAGMA journal_mode=WAL;
-          CREATE TABLE IF NOT EXISTS cache_preferences(key TEXT PRIMARY KEY,value TEXT);
-          CREATE TABLE IF NOT EXISTS cache_profiles(home TEXT,sid TEXT,model TEXT,data TEXT,PRIMARY KEY(home,sid,model));
-          CREATE TABLE IF NOT EXISTS cache_inputs(home TEXT,sid TEXT,turn TEXT,at REAL,model TEXT,kind TEXT,PRIMARY KEY(home,sid,turn,kind));
-          CREATE TABLE IF NOT EXISTS cache_tickets(id TEXT PRIMARY KEY,home TEXT,sid TEXT,turn TEXT,model TEXT,digest TEXT,created REAL,expires REAL,state TEXT);
-          CREATE TABLE IF NOT EXISTS cache_status(home TEXT,sid TEXT,data TEXT,PRIMARY KEY(home,sid));
-          CREATE TABLE IF NOT EXISTS cache_gaps(home TEXT,sid TEXT,turn TEXT,data TEXT,PRIMARY KEY(home,sid,turn));
-        ''')
+    def __init__(self,path,*,timeout=.5):
+        from .cache_db import connect
+        self.db=connect(path,timeout)
 
     def get(self,key,default=None):
         row=self.db.execute('SELECT value FROM cache_preferences WHERE key=?',(key,)).fetchone()
         return json.loads(row[0]) if row else default
 
     def set(self,key,value):
+        if self.get(key,object())==value:return
         self.db.execute('INSERT OR REPLACE INTO cache_preferences VALUES(?,?)',(key,json.dumps(value)))
+
+    def enabled(self,feature):
+        return self.get('enabled',True) and self.get(feature,False)
 
     def profile(self,home,sid,row):
         keep=('key','ts','model','effort','service_tier','input','cached','written','output','reasoning','cost','purpose',
               'compaction_epoch','policy_scope','policy_scope_start','output_samples','output_mean','output_high','output_missing')
         clean={k:row.get(k) for k in keep}
-        if clean.get('purpose')=='maintenance':return
+        if clean.get('purpose') in ('maintenance','diagnostic'):return
         old=self.db.execute('SELECT data FROM cache_profiles WHERE home=? AND sid=? AND model=?',(home,sid,row.get('model') or '')).fetchone()
         if old and json.loads(old[0])==clean:return
         self.db.execute('INSERT OR REPLACE INTO cache_profiles VALUES(?,?,?,?)',(home,sid,row.get('model') or '',json.dumps(clean)))
@@ -62,6 +57,23 @@ class Control:
 
     def status(self,home,sid,value):
         self.db.execute('INSERT OR REPLACE INTO cache_status VALUES(?,?,?)',(home,sid,json.dumps(value)))
+
+    def forecast(self,home,sid,value):
+        self.db.execute('INSERT OR REPLACE INTO cache_forecasts VALUES(?,?,?)',(home,sid,json.dumps(value)))
+
+    def forecasts(self,home,now):
+        values={sid:json.loads(data) for sid,data in self.db.execute('SELECT sid,data FROM cache_forecasts WHERE home=?',(home,))}
+        # An older live worker may still publish its estimate with the status.
+        for sid,data in self.db.execute('SELECT sid,data FROM cache_status WHERE home=?',(home,)):
+            values.setdefault(sid,json.loads(data))
+        result=[]
+        for sid,value in values.items():
+            if value.get('maintenance_expected') is None or value.get('maintenance_adverse') is None:continue
+            if value.get('cost_valid_until',value.get('observed_at',0)+1800)<=now:continue
+            profile=self.latest(home,sid)
+            if profile and value.get('snapshot')!=profile['key']:continue
+            result.append(value)
+        return result
 
     def requests(self):
         now=time.time()
@@ -98,7 +110,7 @@ def hook_decision(path,home,event,timeout=60,*,observe_only=False):
         if observe_only:return {}
         if event.get('hook_event_name')!='UserPromptSubmit':return {}
         if not all(isinstance(event.get(k),str) and event[k] for k in ('session_id','turn_id','model')):return {}
-        if not control.get('guard',False) or time.time()-control.get('ui_heartbeat',0)>5:return {}
+        if not control.enabled('guard') or time.time()-control.get('ui_heartbeat',0)>5:return {}
         if not control.guard_needed(home,event):return {}
         key=uuid.uuid4().hex;now=time.time()
         digest=hashlib.sha256(str(event.get('prompt','')).encode()).hexdigest()

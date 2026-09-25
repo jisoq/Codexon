@@ -21,6 +21,38 @@ def profile():
                 input=100000,cached=99000,written=None,output=4,reasoning=2)
 
 
+def test_simultaneous_schema_startup_and_existing_wal_reader_under_write_lock(tmp_path):
+    import threading
+    import sqlite3
+    path=tmp_path/'cache-control.sqlite';barrier=threading.Barrier(8)
+    def open_both(i):
+        barrier.wait()
+        control=Control(path,timeout=5);journal=Journal(path)
+        try:
+            control.set('client:'+str(i),i)
+            return journal.db.execute('PRAGMA user_version').fetchone()[0]
+        finally:control.close();journal.close()
+    with ThreadPoolExecutor(8) as pool:assert list(pool.map(open_both,range(8)))==[2]*8
+    # Upgrade an existing journal without changing consumed calls or permissions.
+    with sqlite3.connect(path) as old:
+        old.execute('ALTER TABLE cache_jobs DROP COLUMN transport')
+        old.execute('PRAGMA user_version=1')
+        old.execute("INSERT INTO cache_jobs(id,state,started,usage) VALUES('old','unknown',1,NULL)")
+        old.execute("INSERT INTO cache_operating_grants VALUES('grant','home','{}',1,2,'usage_unresolved')")
+    upgraded=Journal(path)
+    assert upgraded.rows()[0]['transport'] is None and upgraded.rows()[0]['cost'] is None
+    assert upgraded.db.execute('SELECT expires,stopped FROM cache_operating_grants').fetchone()==(2,'usage_unresolved')
+    upgraded.close()
+    writer=sqlite3.connect(path,isolation_level=None);writer.execute('BEGIN IMMEDIATE')
+    try:
+        writer.execute("UPDATE cache_preferences SET value='99' WHERE key='client:0'")
+        # An ordinary reader must not need a schema/write lock on every launch.
+        reader=Control(path,timeout=.05);journal=Journal(path,timeout=.05)
+        assert reader.get('client:0')==0
+        reader.close();journal.close()
+    finally:writer.rollback();writer.close()
+
+
 def test_durable_hook_exact_choice_timeout_disconnect(tmp_path):
     path=tmp_path/'c.sqlite';control=Control(path);control.set('guard',True)
     control.profile('home','s',dict(profile(),written=0))
@@ -46,6 +78,36 @@ def test_durable_hook_exact_choice_timeout_disconnect(tmp_path):
             assert hook_decision(path,'home',event)['continue'] is False
     assert 'not persisted' not in path.read_bytes().decode(errors='ignore')
     control.close()
+
+
+def test_master_disabled_hook_observes_without_confirmation(tmp_path):
+    path=tmp_path/'control.sqlite';control=Control(path)
+    control.profile('home','s',dict(profile(),written=0));control.set('guard',True);control.set('enabled',False)
+    control.set('ui_heartbeat',time.time())
+    event=dict(hook_event_name='UserPromptSubmit',session_id='s',turn_id='off',model='gpt-6-sol')
+    assert control.guard_needed('home',event)
+    assert hook_decision(path,'home',event)=={}
+    assert control.db.execute('SELECT COUNT(*) FROM cache_inputs').fetchone()[0]==1
+    assert not control.requests()
+    control.close()
+
+
+def test_worker_recovers_when_error_reporting_also_hits_a_database_lock(tmp_path,monkeypatch):
+    import sqlite3
+    scheduler=Scheduler('home',tmp_path/'control.sqlite',continuous_capture=True)
+    original=scheduler.control.set;attempts=[]
+    def write(key,value):
+        attempts.append(key)
+        if len(attempts)<=2:raise sqlite3.OperationalError('database is locked')
+        original(key,value)
+        if key=='worker_error' and value is False:scheduler.closed=True
+    monkeypatch.setattr(scheduler.control,'set',write)
+    async def run():
+        await asyncio.wait_for(scheduler.serve(),2)
+        assert scheduler.control.get('worker_heartbeat')
+        await scheduler.close()
+    asyncio.run(run())
+    assert attempts[:2]==['worker_heartbeat','worker_error']
 
 
 def test_natural_history_to_policy_no_maintenance_prerequisite(tmp_path):
@@ -80,6 +142,49 @@ def test_natural_history_to_policy_no_maintenance_prerequisite(tmp_path):
     assert blocked['state']=='disabled' and blocked['history_can_unlock'] is False
     assert blocked['calls']==0 and blocked['reason']=='operating_consent_required' and not blocked['server_output_cap']
     asyncio.run(scheduler.close());control.close()
+
+
+@pytest.mark.parametrize('choice',['cancel','dismiss','timeout','released','unavailable','waiting'])
+def test_guard_cancellation_preserves_idle_exposure_without_waiting_for_nonexistent_usage(tmp_path,choice):
+    from cachemonitor.cache_policy import Gap,decide
+    path=tmp_path/'index.sqlite';control=Control(control_path(path));start=time.time()-230000;history=[]
+    def append(i):
+        at=start+i*2100;turn=str(i)
+        control.db.execute('INSERT INTO cache_inputs VALUES(?,?,?,?,?,?)',('home','s',turn,at,'gpt-6-luna','UserPromptSubmit'))
+        row=dict(profile(),key='cold'+turn,turn=turn,ts=at+1,cached=0)
+        history.extend((row,dict(row,key='warm'+turn,ts=at+2,cached=99000)))
+    def evaluate(now):
+        enrich([dict(home='home',id='s',history=history)],path,now)
+        gaps={turn:Gap(**json.loads(data)) for turn,data in control.db.execute('SELECT turn,data FROM cache_gaps')}
+        return gaps,decide(list(gaps.values()),latency_bound=30,scheduler_slack=1,max_calls=2)
+    for i in range(6):append(i)
+    now=history[-1]['ts']+10
+    before,decision=evaluate(now);assert decision['state']=='eligible'
+    at=start+2*2100+100
+    control.db.execute('INSERT INTO cache_inputs VALUES(?,?,?,?,?,?)',('home','s','guard',at,'gpt-6-sol','UserPromptSubmit'))
+    # First reproduce the pre-decision gap, then persist the terminal choice.
+    assert evaluate(now)[1]['reason']=='natural_cost_bounds_unobserved'
+    control.db.execute('INSERT INTO cache_tickets VALUES(?,?,?,?,?,?,?,?,?)',('ticket','home','s','guard','gpt-6-sol','digest',at,at+60,choice))
+    after,decision=evaluate(now)
+    denied=choice in ('cancel','dismiss','timeout')
+    if denied:
+        assert decision['state']=='eligible'
+        assert {k:v for k,v in after.items() if k!='guard'}==before
+        assert after['guard'].origin=='guard_cancelled' and after['guard'].benefit_lower is None
+    else:assert decision['reason']=='natural_cost_bounds_unobserved'
+    for i in range(6,106):append(i)
+    after,decision=evaluate(history[-1]['ts']+10)
+    assert (decision['state']=='eligible')==denied
+    if denied:
+        # A cancelled last submission cannot erase an expensive censored idle gap.
+        control.db.execute("UPDATE cache_inputs SET at=? WHERE turn='guard'",(history[-1]['ts']+10,))
+        gaps,_=evaluate(history[-1]['ts']+20000)
+        assert gaps['105'].seconds==20000 and not gaps['105'].returned and gaps['105'].maintenance_upper>0
+        # Contradictory real request evidence wins over cancellation, even if its
+        # usage is incomplete. Neither missing usage nor observed losses are free.
+        history.append(dict(history[-1],turn='guard',key='sent-anyway',ts=history[-1]['ts']+11,output=None))
+        assert evaluate(history[-1]['ts']+20000)[1]['reason']=='natural_cost_bounds_unobserved'
+    control.close()
 
 
 @pytest.mark.parametrize('change',[None,'model','effort','service_tier','input','compaction_epoch'])
@@ -291,7 +396,8 @@ def test_relay_to_scheduler_to_transport_failure_and_stop_contract(tmp_path,outc
                 assert requests[1]['tools']==requests[0]['tools'] and requests[1]['tool_choice']=='none'
                 assert requests[1]['reasoning']==requests[0]['reasoning']
                 rows=scheduler.journal.rows()
-                if outcome in ('401','429','lost'):assert rows[0]['input'] is None and rows[0]['state']=='unknown'
+                if outcome in ('401','429','lost'):
+                    assert rows[0]['input'] is None and rows[0]['state']==('unknown' if outcome=='lost' else 'failed')
                 elif outcome=='overcap':assert rows[0]['output']==20
                 elif outcome=='zero':assert rows[0]['scope_read_lower']==0
                 elif outcome=='incomplete':assert rows[0]['state']=='unknown' and rows[0]['usage_known'] and rows[0]['cost'] is not None

@@ -57,6 +57,8 @@ def test_usage_ledger_retries_after_transient_failure(monkeypatch,tmp_path):
     snapshots=[]
     writes=[]
     opens=[]
+    paths=[]
+    quota_path=tmp_path/'retained-quota.sqlite'
     session=source()
     class Index:
         path='unused'
@@ -65,7 +67,7 @@ def test_usage_ledger_retries_after_transient_failure(monkeypatch,tmp_path):
             errors=[],unassigned=[],index={'loading':False})
         def close(self):pass
     class Ledger:
-        def __init__(self,*args):self.db=self;opens.append(clock[0])
+        def __init__(self,*args):self.db=self;opens.append(clock[0]);paths.append(args[0])
         def enrich_modes(self,*args):pass
         def sync(self,*args):
             writes.append(clock[0])
@@ -82,7 +84,10 @@ def test_usage_ledger_retries_after_transient_failure(monkeypatch,tmp_path):
         def close(self):pass
     monkeypatch.setattr(analysis_worker,'UsageIndex',Index)
     monkeypatch.setattr(analysis_worker,'QuotaLedger',Ledger)
-    analysis_worker.process_main(Connection(),['h'],tmp_path/'index.sqlite')
+    analysis_worker.process_main(Connection(),['h'],tmp_path/'index.sqlite',quota_path=quota_path)
     assert len(opens)==2 and opens[1]-opens[0]>=5
+    assert paths==[quota_path,quota_path]
+    from cachemonitor.quota_service import QuotaService
+    assert QuotaService(tmp_path/'home',tmp_path/'different-index.sqlite',live=False,quota_path=quota_path).path==quota_path
     assert snapshots[0]['value']['ledger_error']
     assert 'ledger_error' not in snapshots[-1]['value']

@@ -3,10 +3,78 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+import pytest
 
 from cachemonitor.observer_control import ObserverManager
 from cachemonitor.observer_state import read_json
 from cachemonitor.model_evidence import home_key
+
+
+@pytest.mark.parametrize('first_mode',['managed','cache-worker'])
+def test_same_journal_relay_transition_cannot_recover_a_live_request(tmp_path,first_mode):
+    import socket
+    import os
+    from cachemonitor.cache_execution import Journal
+    from test_cache_management import body,response
+    def port():
+        with socket.socket() as listener:
+            listener.bind(('127.0.0.1',0));return listener.getsockname()[1]
+    home=tmp_path/'home';home.mkdir();directory=tmp_path/'data'
+    manager=ObserverManager(home,directory,url=f'http://127.0.0.1:{port()}')
+    manager.set_url(manager.url);manager.write_state(dict(home=home_key(home),enabled=True,phase='active'))
+    def command(mode,url):
+        value=[sys.executable,str(Path(__file__).resolve().parents[1]/'run.py'),'--model-proxy','--'+mode,
+            '--codex-home',str(home),'--evidence-path',str(manager.evidence),'--port',url.rsplit(':',1)[1]]
+        if mode=='cache-worker':value+=['--observation-index',str(directory/'index.sqlite')]
+        return value
+    processes=[]
+    def start(mode):
+        process=subprocess.Popen(command(mode,manager.url),stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        processes.append(process);deadline=time.monotonic()+20
+        while time.monotonic()<deadline:
+            health=manager.health(timeout=.5)
+            if health:return process,health
+            if process.poll() is not None:raise AssertionError(process.communicate())
+            time.sleep(.1)
+        raise AssertionError('fixture relay did not start')
+    def stop(process):
+        # Only this fixture's process tree; Windows venv uses a redirector parent.
+        if process.poll() is not None:return
+        if os.name=='nt':subprocess.run(['taskkill','/PID',str(process.pid),'/T','/F'],capture_output=True,timeout=10)
+        else:process.terminate()
+        process.communicate(timeout=10)
+    journal=None
+    try:
+        first,health=start(first_mode);assert health['cache_management']
+        journal=Journal(directory/'cache-control.sqlite')
+        live=journal.reserve('home','live',0,body(),'live');journal.sent(live)
+        abandoned=journal.reserve('home','abandoned',0,body(),'abandoned');journal.sent(abandoned)
+        other='cache-worker' if first_mode=='managed' else 'managed'
+        contender=subprocess.run(command(other,f'http://127.0.0.1:{port()}'),capture_output=True,timeout=20)
+        assert contender.returncode!=0
+        assert {row['state'] for row in journal.rows()}=={'sent'}
+        assert manager.health(timeout=1)['pid']==health['pid']
+        journal.finish(live,'completed',response())
+        stop(first)
+        second,health=start(other)
+        rows={row['sid']:row for row in journal.rows()}
+        assert rows['live']['state']=='completed' and rows['live']['usage_known']
+        assert rows['abandoned']['state']=='unknown' and not rows['abandoned']['usage_known']
+        assert health['requests']==0
+    finally:
+        for process in reversed(processes):stop(process)
+        if journal:journal.close()
+
+
+def test_execution_owner_respects_both_legacy_lifetime_locks(tmp_path):
+    from cachemonitor.cache_execution import execution_owner
+    from cachemonitor.observer_state import ProcessLock
+    path=tmp_path/'cache-control.sqlite'
+    for name in ('proxy-supervisor.lock','cache-worker.lock'):
+        with ProcessLock(tmp_path/name):
+            with pytest.raises(RuntimeError):
+                with execution_owner(path):pytest.fail('legacy executor is alive')
+        with execution_owner(path):pass
 
 
 def test_observation_task_survives_launcher_exit(tmp_path):

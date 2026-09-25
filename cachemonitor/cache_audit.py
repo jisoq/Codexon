@@ -8,7 +8,7 @@ def observations(rows):
     result = []
     previous = None
     for row in sorted(rows, key=lambda r: r['ts']):
-        if row.get('purpose') == 'maintenance':
+        if row.get('purpose') in ('maintenance','diagnostic'):
             continue
         changes = []
         estimate = None

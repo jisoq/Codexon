@@ -25,32 +25,32 @@ def maintenance_route(url, websocket):
     return url,websocket
 
 
-def target(home, request, url, headers, websocket):
+def target(home, request, url, headers, websocket,*,observed_tier=None):
     endpoint=urlsplit(url)
+    if observed_tier=='Standard':observed_tier='default'
     account=next((v for k,v in headers.items() if k.lower()=='chatgpt-account-id'),None)
-    # Initial consent workflow is deliberately limited to the investigated path.
-    # This is not a statement about support on other models or WebSocket.
+    # Scope identification is not authorization or a claim of model support.
     if (endpoint.scheme!='https' or endpoint.netloc!='chatgpt.com' or endpoint.query or endpoint.fragment or
         endpoint.path!='/backend-api/codex/responses' or websocket or not isinstance(account,str) or not account or
-        request.get('model')!='gpt-6-luna' or (request.get('reasoning') or {}).get('effort')!='low' or
-        request.get('service_tier')!='default'):return None
+        not isinstance(request.get('model'),str) or not request['model'] or
+        not isinstance((request.get('reasoning') or {}).get('effort'),str) or
+        (request.get('service_tier') or observed_tier)!='default'):return None
     return dict(home=str(home),account=hashlib.sha256(account.encode()).hexdigest(),
-                model=request['model'],effort='low',tier='default',transport='http',
+                model=request['model'],effort=request['reasoning']['effort'],tier='default',transport='http',
                 endpoint='https://chatgpt.com/backend-api/codex/responses')
 
 
 class Operations:
     def __init__(self,journal):
         self.journal=journal;self.db=journal.db
-        self.db.executescript('''
-          CREATE TABLE IF NOT EXISTS cache_operating_proposals(id TEXT PRIMARY KEY,home TEXT,data TEXT,at REAL);
-          CREATE TABLE IF NOT EXISTS cache_operating_grants(id TEXT PRIMARY KEY,home TEXT,data TEXT,created REAL,expires REAL,stopped TEXT);
-        ''')
 
-    def propose(self,scope,expected,adverse,output_high,basis):
+    def propose(self,scope,expected,adverse,output_high,basis,*,cost_stop=None,purpose='maintenance',dynamic_estimate=False):
         if not scope or not all(type(v) in (int,float) and math.isfinite(v) and v>0 for v in (expected,adverse,output_high)):return None
+        if purpose not in ('maintenance','diagnostic'):raise ValueError('invalid_purpose')
+        if cost_stop is not None and (not isinstance(cost_stop,(int,float)) or not math.isfinite(cost_stop) or cost_stop<=0):raise ValueError('invalid_cost_stop')
         # These are consent defaults, not inferred optimal limits or cost caps.
-        proposal=dict(scope=scope,duration=3600,max_calls=2,cost_stop=2*expected,
+        proposal=dict(scope=scope,duration=3600,max_calls=2,cost_stop=2*expected if cost_stop is None else cost_stop,
+                      purpose=purpose,dynamic_estimate=dynamic_estimate,
                       expected=expected,adverse=adverse,output_high=output_high,basis=basis,
                       server_output_limit='unsupported_in_tested_http_request')
         key=hashlib.sha256(json.dumps(proposal,sort_keys=True).encode()).hexdigest()
@@ -78,7 +78,7 @@ class Operations:
                     unknown=sum(r['cost'] is None for r in rows))
 
     def consent(self,proposal_id):
-        """Called only by an affirmative UI action on the exact displayed scope."""
+        """Called only for explicit authorization of this exact scope."""
         self.db.execute('BEGIN IMMEDIATE')
         try:
             record=self.db.execute('SELECT data,at FROM cache_operating_proposals WHERE id=?',(proposal_id,)).fetchone()
@@ -106,6 +106,9 @@ class Operations:
         grant=next((g for g in self.grants() if g['id']==operation['id']),None)
         if not grant or grant['scope']!=operation['scope']:return 'scope_mismatch'
         if grant['stopped']:return grant['stopped']
+        if operation.get('purpose','maintenance')!=grant.get('purpose','maintenance'):return 'purpose_mismatch'
+        if not all(type(operation.get(k)) in (int,float) and math.isfinite(operation[k]) and operation[k]>0
+                   for k in ('expected','adverse','output_high')):return 'operating_cost_unobserved'
         if self.db.execute("SELECT 1 FROM cache_jobs WHERE operation IS NOT NULL AND state IN ('reserved','sent') AND id!=?",
                            (exclude or '',)).fetchone():return 'operation_busy'
         reason=None;stats=self.stats(grant)
@@ -113,7 +116,8 @@ class Operations:
         elif any(r['operation'] and r['cost'] is None for r in self.journal.rows()):reason='usage_unresolved'
         elif stats['calls']>=grant['max_calls']:reason='call_limit'
         elif stats['observed']>=grant['cost_stop']:reason='observed_cost_stop'
-        elif operation['expected']>grant['expected'] or operation['adverse']>grant['adverse']:reason='scope_cost_increased'
+        elif not grant.get('dynamic_estimate') and (operation['expected']>grant['expected'] or operation['adverse']>grant['adverse']):reason='scope_cost_increased'
+        elif stats['observed']+operation['expected']>grant['cost_stop']:return 'projected_cost_stop'
         if reason:self.stop(grant['id'],reason);return reason
         # One shared in-flight reservation, including other homes and grants.
         return None

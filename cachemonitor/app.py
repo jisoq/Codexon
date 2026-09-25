@@ -37,11 +37,24 @@ def main():
     parser.add_argument("--codex-home", action="append", help="Repeat to monitor multiple local Codex homes")
     parser.add_argument("--hidden", action="store_true")
     parser.add_argument("--index-path", help="Override the app-owned usage index for isolated verification")
+    parser.add_argument('--evidence-path',help='Use the matching observer evidence database')
+    parser.add_argument('--cache-control',action='store_true',help='Enable cache controls for an independently managed source worker')
+    parser.add_argument('--quota-path',help='Keep quota history independent of the usage index location')
     parser.add_argument("--snapshot", action="store_true", help="Print sanitized live observations without starting the UI")
     parser.add_argument("--smoke", metavar="PNG", help="Render actual data, check tray lifecycle and exit")
     parser.add_argument("--smoke-depth", choices=('core','full'), default='full',
                         help="Choose the compact release check or full interaction probe")
     args = parser.parse_args()
+    from .launch_context import cache_paths,save_cache_paths
+    control_only=any((args.enable_model_observer,args.disable_model_observer,args.model_observer_status,args.test_model_observer))
+    if not (args.smoke or args.verify_handoff or args.snapshot or args.index_path or control_only):
+        saved=cache_paths()
+        for key,value in saved.items():
+            if getattr(args,key) is None:setattr(args,key,value)
+        if saved.get('index_path'):args.cache_control=True
+    if args.cache_control and not (args.smoke or args.verify_handoff) and not args.quota_path:
+        from .quota_cycles import ledger_path
+        args.quota_path=str(ledger_path())
     if args.verify_handoff and (not args.index_path or not args.codex_home or
             not all((Path(h)/'codexon-test-home').is_file() for h in args.codex_home)):
         parser.error('Handoff verification requires isolated homes and an explicit index')
@@ -51,7 +64,13 @@ def main():
     homes = (args.codex_home or [os.environ.get('CODEX_HOME', str(Path.home()/'.codex'))]) if isolated else resolve_homes(args.codex_home)
     if args.enable_model_observer or args.disable_model_observer or args.model_observer_status or args.test_model_observer:
         from .observer_control import ObserverManager
-        manager=ObserverManager(homes[0],Path(args.index_path).parent if args.index_path else None)
+        saved=cache_paths() if not args.index_path else {}
+        if args.cache_control or saved.get('index_path'):
+            from .cache_worker_control import CacheWorkerManager
+            index=args.index_path or saved.get('index_path');evidence=args.evidence_path or saved.get('evidence_path')
+            if not index or not evidence:parser.error('Cache control requires matching index and evidence paths')
+            manager=CacheWorkerManager(homes[0],index,evidence)
+        else:manager=ObserverManager(homes[0],Path(args.index_path).parent if args.index_path else None)
         try:
             result=(manager.test_connection() if args.test_model_observer else manager.turn_on() if args.enable_model_observer else manager.turn_off() if args.disable_model_observer else manager.ensure())
         except Exception as exc:result={'error':str(exc)}
@@ -118,12 +137,16 @@ def main():
         smoke_settings = startup_settings if args.verify_handoff else QSettings(str(Path(smoke_directory.name)/'settings.ini'),QSettings.IniFormat)
         if args.index_path is None:args.index_path=str(Path(smoke_directory.name)/'index.sqlite')
     if not isolated:save_homes(homes)
-    window = Dashboard(homes,index_path=args.index_path,live_limits=not (args.smoke or args.verify_handoff),manage_observer=not args.smoke and args.index_path is None, **({'settings':smoke_settings} if smoke_settings else {}))
+    if args.cache_control and not (args.smoke or args.verify_handoff):
+        save_homes(homes);save_cache_paths(args.index_path,args.evidence_path,args.quota_path)
+    window = Dashboard(homes,index_path=args.index_path,model_evidence_path=args.evidence_path,quota_path=args.quota_path,
+        cache_control=args.cache_control or (not args.smoke and args.index_path is None),
+        live_limits=not (args.smoke or args.verify_handoff),manage_observer=not (args.smoke or args.verify_handoff) and (args.index_path is None or args.cache_control), **({'settings':smoke_settings} if smoke_settings else {}))
     from .overlay import install_overlay
     install_overlay(window, native_enabled=not (args.smoke or args.verify_handoff))
     def restart():
         from .app_restart import launch_replacement
-        try:launch_replacement(homes,index_path=args.index_path,handoff=args.verify_handoff)
+        try:launch_replacement(homes,index_path=args.index_path,handoff=args.verify_handoff,evidence_path=args.evidence_path,cache_control=args.cache_control,quota_path=args.quota_path)
         except OSError:
             window.settings_page.refresh_restart()
             QMessageBox.warning(window,'Codexon',tr('앱을 다시 시작하지 못했습니다. 다시 시도해 주세요.'))
