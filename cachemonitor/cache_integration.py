@@ -6,6 +6,7 @@ from .cache_policy import cost_bounds,scoped_history
 from .cache_audit import observations
 from .pricing import token_cost
 import json
+import hashlib
 
 
 def enrich(sessions,index_path,now,homes=None):
@@ -66,9 +67,10 @@ def enrich(sessions,index_path,now,homes=None):
                                    (session['home'],session['id'],turn,json.dumps(gap)))
         journal=Journal(path)
         maintenance=[r for r in journal.rows() if homes is None or r['home'] in homes]
-        groups={}
+        groups={};revisions={}
         for row in maintenance:
             key=(row['home'],row['sid'],row['purpose'])
+            revisions.setdefault(key,[]).append(row)
             if key not in groups:
                 groups[key]=Session(row['purpose']+':'+row['sid'],row['home'],title='연결 진단' if row['purpose']=='diagnostic' else '캐시 유지',parent_thread_id=row['sid'])
             session=groups[key]
@@ -79,9 +81,11 @@ def enrich(sessions,index_path,now,homes=None):
             request.purpose=row['purpose'];request.request_start=row['request_start']
             session.turn_records[row['key']]=dict(started_at=row['request_start'],ended_at=row['request_end'],
                 state={'completed':'완료','sent':'진행','unknown':'미확인'}.get(row['state'],'중단'))
-        for (_,_,purpose),session in groups.items():
+        for key,session in groups.items():
+            purpose=key[2]
             view=session.view(now)
-            view.update(source='maintenance',collection_complete=True,archived=False,purpose=purpose)
+            revision=hashlib.sha256(json.dumps(revisions[key],sort_keys=True,separators=(',',':')).encode()).hexdigest()
+            view.update(source='maintenance',collection_complete=True,archived=False,purpose=purpose,usage_revision=revision)
             sessions.append(view)
         audit=[];effects=[];compactions=[];delegated=[]
         for session in sessions:
@@ -113,9 +117,9 @@ def enrich(sessions,index_path,now,homes=None):
                     compactions=compactions[-100:],delegation=dict(calls=len(delegated),
                         known_cost=sum(token_cost(r)['cost'] or 0 for r in delegated),
                         priced=sum(token_cost(r)['cost'] is not None for r in delegated)),
-                    request_activity=[dict(home=r['home'],attempt=r['key'],response_id=r['key'],
-                        request_observed_at=r['request_start'],ts=r['ts'],
-                        status='completed' if r['state']=='completed' else 'created',purpose=r['purpose']) for r in maintenance])
+                    request_activity=[dict(home=r['home'],attempt='maintenance:'+r['job_id'],response_id=r['key'],
+                        request_observed_at=r['request_start'],completed_observed_at=r['request_end'],ts=r['ts'],
+                        status='created' if r['state']=='sent' else r['state'],purpose=r['purpose']) for r in maintenance])
     finally:
         if journal:journal.close()
         control.close()

@@ -9,6 +9,27 @@ from cachemonitor.quota_view import prepare_series, prepare_quota_view
 from cachemonitor.i18n import set_language
 
 
+def test_zero_usage_bar_uses_its_padded_axis_position(tmp_path):
+    from cachemonitor.charts import UsageTrend
+    from PySide6.QtGui import QColor
+    app=QApplication.instance() or QApplication([])
+    chart=UsageTrend();chart.samples=False;chart.set_rows([dict(value=0,n=0,label='zero')])
+    host=mount(chart,600,300)
+    try:
+        plot=render_plot(host,chart)
+        picture=host.quick.grabFramebuffer();ratio=picture.width()/host.quick.width()
+        x=(86+chart.width()-16)/2;bottom=chart.height()-46;y=(24+bottom)/2
+        origin=plot.mapToScene(QPointF(0,0));x+=origin.x();y+=origin.y();bottom+=origin.y()
+        accent=QColor(shared_theme().palette['accent'])
+        def marked(at):
+            return any(picture.pixelColor(px,py)==accent
+                for px in range(round((x-4)*ratio),round((x+4)*ratio))
+                for py in range(round((at-4)*ratio),round((at+4)*ratio)))
+        assert picture.save(str(tmp_path/'zero-usage.png'))
+        assert marked(y) and not marked(bottom)
+    finally:dispose(host)
+
+
 @pytest.mark.parametrize('width,dark,language',[(520,False,'ko'),(1120,True,'ko'),(520,True,'en')])
 def test_four_matching_axes_detail_pin_escape_and_gap_card(tmp_path,width,dark,language):
     app=QApplication.instance() or QApplication([])

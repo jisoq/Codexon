@@ -388,6 +388,35 @@ def test_unknown_usage_survives_index_and_policy(tmp_path):
     assert not other and summary['calls']==0
 
 
+@pytest.mark.parametrize('state',['completed','failed','unknown'])
+def test_maintenance_revision_and_terminal_tracking_do_not_remain_pending(tmp_path,state):
+    from cachemonitor import quota_tracking_store as tracking
+    path=tmp_path/'index.sqlite';journal=Journal(control_path(path));ledger=QuotaLedger(tmp_path/'ledger.sqlite')
+    tracking.enable(ledger.db,'home',time.time()-10)
+    def snapshot():
+        views=[];summary=enrich(views,path,time.time())
+        tracking.sync_activity(ledger.db,dict(homes=['home'],sessions=[],ts=time.time(),
+            usage_collection_complete=True,request_activity=summary['request_activity']))
+        return views,summary
+    try:
+        key=journal.reserve('home','s',0,body(),'original');journal.sent(key)
+        before,_=snapshot();assert ledger.db.execute('SELECT end FROM tracking_wire').fetchone()[0] is None
+        journal.finish(key,state,response() if state=='completed' else None)
+        after,summary=snapshot()
+        assert before[0]['usage_revision']!=after[0]['usage_revision']
+        activity=summary['request_activity'][0]
+        assert activity['status']==state and activity['completed_observed_at']==journal.rows()[0]['request_end']
+        rows=ledger.db.execute('SELECT end,status FROM tracking_wire').fetchall()
+        assert len(rows)==1 and rows[0]['end']==activity['completed_observed_at'] and rows[0]['status']==state
+        engine=AnalysisEngine();assert engine.ingest(after)
+        unchanged,_=snapshot();assert unchanged[0]['usage_revision']==after[0]['usage_revision']
+        class NoScan(list):
+            def __iter__(self):raise AssertionError('Unchanged usage must not scan historical calls')
+        unchanged[0]['history']=NoScan(unchanged[0]['history'])
+        assert not engine.ingest(unchanged)
+    finally:journal.close();ledger.close()
+
+
 @pytest.mark.parametrize('outcome',['ok','401','429','lost','overcap','zero','incomplete'])
 def test_relay_to_scheduler_to_transport_failure_and_stop_contract(tmp_path,outcome):
     from aiohttp import web,ClientSession
