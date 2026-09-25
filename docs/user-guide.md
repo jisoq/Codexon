@@ -22,6 +22,8 @@ Speed is output tokens, including reasoning, divided by the observed time from r
 
 ## Update
 
+Checking for updates does not immediately install or replace a connection. When a newer release is found, review the disconnection warning and finish active responses and server requests before choosing **Install**. Applying connection components also requires confirmation when the app is current. **Later** or closing the confirmation cancels the operation.
+
 App updates can be checked and installed while the proxy is off. If no newer release is available, the updater says so; it also updates connection components that are enabled.
 
 Use **Settings → About and troubleshooting → Check and install updates**. Codexon verifies the official installer, prepares a separate version directory and checks its runtime before switching launch paths. The same operation retires idle connections, waits for active responses and sent maintenance usage, then checks that the old process, listener and ownership locks are released. Completion requires three consecutive checks of the exact target version, deployment, role and readiness. No active request is force-cancelled or replayed. Failed startup restores the original role, command and autostart preference. Legacy workers without cooperative shutdown remain running with an explicit blocked reason. New connections may briefly fail during the switch. Previous payloads remain available for running components and rollback.

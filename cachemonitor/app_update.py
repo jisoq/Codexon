@@ -60,18 +60,40 @@ def launch_installer(output,root):
                                                   '/LOG='+str(output.parent/'setup.log')])
 
 
-def update(progress=lambda _:None, manager=None):
+def check_update(progress=lambda _:None, manager=None):
+    """Read the offered release without installing or changing the connection."""
     install=installed()
     if not install:
         raise RuntimeError('설치형 Codexon에서 업데이트할 수 있습니다. 설치 프로그램을 한 번 실행해 주세요.')
     progress('업데이트 확인 중…')
     release=json.loads(read_url('https://api.github.com/repos/'+REPOSITORY+'/releases/latest'))
     if version_parts(release['tag_name'])<=version_parts(VERSION):
-        from .install_management import activate_proxy, connection_manager
-        state=activate_proxy(manager if manager is not None else connection_manager())
-        if state.get('phase') == 'off':
-            return '설치할 새 버전이 없습니다.'
+        from .install_management import connection_manager
+        manager=manager if manager is not None else connection_manager()
+        status=manager.status()
+        return dict(kind='proxy' if status.get('configured') else 'none',manager=manager,
+                    connections=connection_count(status))
+    release_asset(release)
+    try:status=manager.status() if manager is not None else {}
+    except Exception:status={}
+    return dict(kind='app',release=release,install=install,connections=connection_count(status))
+
+
+def connection_count(status):
+    count=(status.get('health') or {}).get('active_connections')
+    return count if type(count) is int and count>=0 else None
+
+
+def update(progress=lambda _:None, manager=None, *, plan=None):
+    # The GUI passes the exact offer the user confirmed; do not fetch a newer
+    # release between confirmation and installation.
+    plan=check_update(progress,manager) if plan is None else plan
+    if plan['kind']=='none':return '설치할 새 버전이 없습니다.'
+    if plan['kind']=='proxy':
+        from .install_management import activate_proxy
+        state=activate_proxy(plan['manager'])
         return '설치할 새 버전이 없습니다. '+(state.get('message') or '')
+    release,install=plan['release'],plan['install']
     asset,checksum=release_asset(release)
     text=read_url(checksum['browser_download_url'],1024).decode('ascii').strip()
     match=re.fullmatch(r'([a-fA-F0-9]{64})\s+\*?Codexon-Setup\.exe',text)
@@ -97,6 +119,6 @@ def update(progress=lambda _:None, manager=None):
     finally:
         partial.unlink(missing_ok=True)
     progress('새 버전 설치 중…')
-    # The user's click authorizes installation. Inno never closes applications itself.
+    # The GUI confirms installation before entering this operation.
     launch_installer(output,install['InstallRoot'])
     return '업데이트 설치를 시작했습니다. 연결이 끝나면 프록시도 적용됩니다.'

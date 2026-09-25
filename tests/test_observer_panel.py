@@ -77,7 +77,8 @@ def test_unified_update_button_render_and_recovery_remains_available(tmp_path,mo
     calls=[]
     initial={'configured':True,'phase':'active','version_mismatch':True,'health':{'version':'old'}}
     waiting={**initial,'update':{'phase':'waiting','message':'진행 중 응답 및 캐시 작업 정산 대기'}}
-    monkeypatch.setattr('cachemonitor.app_update.update',lambda progress,manager:(calls.append('update') or '설치 시작'))
+    monkeypatch.setattr('cachemonitor.app_update.check_update',lambda progress,manager:dict(kind='proxy',manager=manager))
+    monkeypatch.setattr('cachemonitor.app_update.update',lambda progress,manager,**kw:(calls.append('update') or '설치 시작'))
     monkeypatch.setattr('cachemonitor.update_panel.open_recovery',lambda *args:calls.append('recovery'))
     panel.manager.cancel_update=lambda:(calls.append('cancel') or initial)
     panel.proxy_status(initial);host=mount(panel,680,350)
@@ -88,6 +89,9 @@ def test_unified_update_button_render_and_recovery_remains_available(tmp_path,mo
         raise AssertionError('update not finished')
     try:
         click(host,control(host,panel.button));finish()
+        assert calls==[] and panel.confirming
+        dialog=panel.dialog
+        click(dialog.host,control(dialog.host,dialog.confirm));finish()
         assert calls==['update']
         panel.proxy_status(waiting)
         assert panel.button.text()=='업데이트 취소'
