@@ -46,6 +46,48 @@ foreach($task in $folder.GetTasks(1)){
     return json.loads(result.stdout.decode('utf-8-sig'))
 
 
+def remove_installation_collectors(root):
+    """Remove owned collector definitions, including exhausted or stopped tasks."""
+    from pathlib import Path
+    if os.name!='nt':return {'removed':[]}
+    payload=base64.b64encode(str(Path(root).resolve()).encode()).decode()
+    script=r'''
+$ErrorActionPreference='Stop'
+[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
+$root=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__ROOT__')).TrimEnd('\')+'\'
+$service=New-Object -ComObject Schedule.Service
+$service.Connect()
+$folder=$service.GetFolder('\')
+$removed=@()
+$prefix='CacheMonitor model observer: '
+foreach($task in $folder.GetTasks(1)){
+    if(!$task.Name.StartsWith('CacheMonitor-UsageCollector-')){continue}
+    $definition=$task.Definition
+    if($definition.Actions.Count -ne 1){continue}
+    $action=$definition.Actions.Item(1)
+    if(![IO.Path]::IsPathRooted($action.Path)){continue}
+    $path=[IO.Path]::GetFullPath($action.Path)
+    if(!$path.StartsWith($root,[StringComparison]::OrdinalIgnoreCase) -or [IO.Path]::GetFileName($path) -ne 'Codexon.exe'){continue}
+    if($action.Arguments -notmatch '(^|\s)--usage-collector(\s|$)'){continue}
+    $description=$definition.RegistrationInfo.Description
+    if(!$description.StartsWith($prefix)){continue}
+    $scope=$description.Substring($prefix.Length)
+    $sha=[Security.Cryptography.SHA256]::Create()
+    try{$hash=($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($scope)) | ForEach-Object {$_.ToString('x2')}) -join ''}finally{$sha.Dispose()}
+    if($task.Name -ne ('CacheMonitor-UsageCollector-'+$hash.Substring(0,12))){continue}
+    $task.Stop(0)
+    $folder.DeleteTask($task.Name,0)
+    $removed+=$task.Name
+}
+@{removed=$removed} | ConvertTo-Json -Compress
+'''.replace('__ROOT__',payload)
+    encoded=base64.b64encode(script.encode('utf-16-le')).decode()
+    result=subprocess.run(['powershell.exe','-NoProfile','-NonInteractive','-EncodedCommand',encoded],
+        capture_output=True,timeout=20,creationflags=subprocess.CREATE_NO_WINDOW)
+    if result.returncode:raise RuntimeError('설치된 백그라운드 수집기 작업을 정리하지 못했습니다.')
+    return json.loads(result.stdout.decode('utf-8-sig'))
+
+
 class ObserverTask:
     def __init__(self, home, role='ModelObserver'):
         self.role=role
