@@ -59,14 +59,22 @@ def verify_legacy_collector(root,old,new):
     from cachemonitor.usage_collection import locked
     root.mkdir();home=root/'home';home.mkdir();index=root/'index.sqlite';evidence=root/'evidence.sqlite'
     task=ObserverTask(str(index),role='UsageCollector')
-    legacy=index.with_suffix('.collection.sqlite');client=None
+    channels={index.with_suffix('.collection.sqlite'):index.with_suffix('.collector.lock'),
+              index.with_name(index.name+'.codexon-collection.sqlite'):index.with_name(index.name+'.codexon-collector.lock')}
+    previous_channel=None;client=None
     def snapshot():
-        if not legacy.exists():return {}
-        try:
-            with sqlite3.connect(legacy.as_uri()+'?mode=ro',uri=True) as db:
-                row=db.execute('SELECT payload FROM snapshot WHERE id=1').fetchone()
-                return json.loads(zlib.decompress(row[0])) if row else {}
-        except sqlite3.OperationalError:return {}
+        nonlocal previous_channel
+        for path in channels:
+            if not path.exists():continue
+            try:
+                with sqlite3.connect(path.as_uri()+'?mode=ro',uri=True) as db:
+                    row=db.execute('SELECT payload FROM snapshot WHERE id=1').fetchone()
+                    value=json.loads(zlib.decompress(row[0])) if row else {}
+                    if value.get('collection'):
+                        previous_channel=path
+                        return value
+            except sqlite3.OperationalError:pass
+        return {}
     try:
         task.start([str(old),'--usage-collector','--codex-home',str(home),'--index-path',str(index),'--evidence-path',str(evidence)])
         before=await_value(snapshot,lambda s:s.get('collection'))['collection']
@@ -74,11 +82,14 @@ def verify_legacy_collector(root,old,new):
         client=CollectionClient([home],index,evidence)
         after=await_value(client.poll,lambda s:s.get('collection',{}).get('pid') not in (None,before['pid']))['collection']
         assert after['executable']==str(new) and not identity.same_process(process)
-        assert not locked(index.with_suffix('.collector.lock'))
+        if previous_channel!=client.channel.snapshot_path:assert not locked(channels[previous_channel])
+        assert locked(client.channel.companion('.collector.lock'))
         client.close();client=None
         AppServices(None,[str(home)],index,evidence).stop_collection()
         assert not identity.process_identity(after['pid'])
-        return dict(before=before,after=after,cooperative=True,old_instance_exited=True)
+        assert all(not locked(lock) for lock in channels.values())
+        return dict(before=before,after=after,previous_channel=previous_channel.name,
+                    cooperative=True,old_instance_exited=True)
     finally:
         if client:client.close()
         task.stop();task.remove()
