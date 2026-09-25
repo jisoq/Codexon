@@ -58,12 +58,11 @@ class ObserverPanel(Group):
         self.timer=QTimer(self);self.timer.setInterval(15000)
         self.timer.timeout.connect(lambda:self.invoke('ensure'))
         self.update_controls()
-        if active:self.timer.start();QTimer.singleShot(0,lambda:self.invoke('ensure'))
+        if active:self.timer.start();QTimer.singleShot(0,lambda:self.invoke('resume'))
 
     def busy(self):return self.operation is not None
     def update_controls(self):
-        switching=self.last_result.get('update',{}).get('phase') in ('switching','rollback')
-        self.toggle.setEnabled(self.active and not switching)
+        self.toggle.setEnabled(self.active)
 
     def request(self,enabled):
         if not self.active:return
@@ -124,7 +123,9 @@ class ObserverPanel(Group):
         health=state.get('health') or {};runtime=state.get('runtime') or {};registration=state.get('registration')
         version=health.get('version') or '실행 안 됨'
         versions=f"앱 {state.get('app_version','—')} · 프록시 {version}"
-        if state.get('version_mismatch'):
+        if state.get('proxy_update_available'):
+            versions+=' → '+state.get('target_proxy_version','새 버전')+' 업데이트 가능'
+        elif state.get('version_mismatch'):
             versions+='\n정보·문제 해결에서 통합 업데이트'+(' · 현재 연결 유지 중' if self.enabled else ' · 프록시 사용 꺼짐')
         elif health and version!=state.get('app_version'):
             versions+=' · 호환됨'
@@ -137,8 +138,8 @@ class ObserverPanel(Group):
         startup=('켜짐' if registration.get('autostart') else '꺼짐') if registration is not None else '확인 중'
         if state.get('registration_issue'):startup='확인 필요: '+state['registration_issue']
         self.runtime_values['startup'].setText(startup)
-        self.runtime_values['path'].setText(str((registration or {}).get('executable') or state.get('app_path','—')))
-        restart=bool(state.get('restart_required') or self.enabled)
+        self.runtime_values['path'].setText(str(state.get('running_proxy_path') or ('실행 경로 미확인' if health else '실행 안 됨')))
+        restart=bool(state.get('restart_required')) and phase_update!='complete'
         self.restart_label.setText('연결 변경 적용: Codex 재시작' if restart else '')
         self.restart_label.setVisible(restart)
         self.status_observed.emit(state)

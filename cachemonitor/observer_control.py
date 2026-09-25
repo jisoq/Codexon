@@ -79,6 +79,15 @@ class ObserverManager:
         self.runtime_path=self.directory/'proxy-runtime.json'
         self.control_lock=self.directory/'observer-control.lock'
         self.cancelled=threading.Event()
+        if url==URL:
+            # Reopen the app-owned address, including a nondefault local port.
+            # Health still verifies the home/evidence identity before control.
+            saved=read_json(self.state_path)
+            if saved.get('home')==home_key(self.home) and saved.get('url'):
+                from urllib.parse import urlsplit
+                address=urlsplit(saved['url'])
+                if address.scheme=='http' and address.hostname=='127.0.0.1' and address.port and not address.username and address.path in ('','/'):
+                    self.url=saved['url'].rstrip('/')
 
     def state(self):
         if not self.state_path.exists():return {}
@@ -276,7 +285,7 @@ class ObserverManager:
             state.update(pending=True)
             # Persist rollback information before changing shared configuration.
             self.write_state(state)
-            self.task.configure(self.supervisor_command(upstream),autostart=True)
+            self.task.configure(self.supervisor_command(upstream),autostart=False)
             self.configure_check()
             if self.cancelled.is_set():raise RuntimeError('프록시 켜기를 취소했습니다.')
             if previous_startup==state.get('managed_startup'):startup_value(None)
@@ -298,6 +307,8 @@ class ObserverManager:
         return self.recover_direct()
 
     def recover_direct(self):
+        from .app_services import disable_resume
+        disable_resume(self)
         try:state=self.state()
         except (ValueError,OSError):
             if self.state_path.exists():
@@ -332,6 +343,8 @@ class ObserverManager:
 
     def turn_on(self):
         with ProcessLock(self.control_lock):
+            from .app_services import require_running
+            require_running(self)
             if self.config()[1].get('openai_base_url')==self.url:
                 return self.attach_supervisor()
             try:
@@ -355,25 +368,33 @@ class ObserverManager:
                 raise
 
     def turn_off(self):
-        with ProcessLock(self.control_lock):return self.recover_direct()
+        with ProcessLock(self.control_lock):
+            from .app_services import disable_resume
+            disable_resume(self)
+            return self.recover_direct()
 
     def update_proxy(self):
         from .proxy_update import ProxyUpdate, BUSY
         with ProcessLock(self.control_lock):
             updater=ProxyUpdate(self)
             task=ObserverTask(home_key(self.home),role='ProxyUpdate')
-            if read_json(updater.path).get('phase') in BUSY and task.inspect().get('state')==4:
+            current=read_json(updater.path)
+            if current.get('phase') in BUSY and (task.inspect().get('state') in (2,4)
+                    or time.time()-current.get('updated_at',0)<30):
                 return self.status()
-            recovering=read_json(updater.path).get('phase') in ('switching','rollback')
+            prior=read_json(updater.path)
+            recovering=bool(prior.get('source')) and not prior.get('restored') and prior.get('phase') in (*BUSY,'failed')
             health=self.health(timeout=3)
-            if (not health and not recovering) or not self.state().get('enabled'):
+            if (not health and not recovering) or not updater.target.enabled():
                 raise RuntimeError('실행 중인 프록시가 없습니다.')
             if not getattr(sys,'frozen',False):
                 raise RuntimeError('업데이트는 설치된 배포 앱에서 실행하세요.')
-            command=self.command(self.state().get('upstream') or self.upstream())
+            command=self.command(self.upstream() if getattr(self,'shared_cache_worker',False) else self.state().get('upstream') or self.upstream())
             command[command.index('--model-proxy')]='--proxy-update'
-            if read_json(updater.path).get('phase') not in ('switching','rollback'):
+            if not recovering:
+                atomic_write(updater.path,b'{}')
                 updater.publish('queued',source_instance=health['instance'],cancel_requested=False,
+                                scope=updater.target.scope,
                                 message='프록시 업데이트 예약 중…')
             try:task.start(command,autostart=False)
             except Exception:
@@ -381,15 +402,33 @@ class ObserverManager:
         return self.status()
 
     def cancel_update(self):
-        from .proxy_update import ProxyUpdate
+        from .proxy_update import ProxyUpdate, BUSY
         with ProcessLock(self.control_lock):
             updater=ProxyUpdate(self)
-            if read_json(updater.path).get('phase') in ('queued','waiting'):
-                updater.publish('waiting',cancel_requested=True,message='예약 취소 중…')
+            phase=read_json(updater.path).get('phase')
+            if phase in BUSY:
+                updater.publish(phase,cancel_requested=True,message='예약 취소 중…')
         return self.status()
+
+    def update_status(self):
+        from .proxy_update import BUSY
+        update=read_json(self.directory/'proxy-update.json')
+        if update.get('phase') in BUSY and time.time()-update.get('updated_at',0)>90:
+            update={**update,'phase':'interrupted','message':'업데이트가 중단되었습니다. 다시 눌러 복구할 수 있습니다.'}
+        return update
+
+    def running_path(self,health):
+        if not health or not isinstance(health.get('pid'),int):return None
+        from .proxy_update import process_executable
+        try:return process_executable(health['pid'])
+        except OSError:return None
 
     def attach_supervisor(self):
         """Adopt an already configured observer without touching its live sockets."""
+        from .app_services import require_running
+        require_running(self)
+        from .proxy_update import BUSY
+        if read_json(self.directory/'proxy-update.json').get('phase') in BUSY:return self.status()
         state=self.state()
         if not state.get('enabled') or self.config()[1].get('openai_base_url')!=self.url:
             return self.status()
@@ -399,9 +438,9 @@ class ObserverManager:
         if health:
             # Never start a second relay or replace a live legacy supervisor.
             if health.get('lifecycle')=='managed':
-                self.task.configure(self.supervisor_command(upstream),autostart=True)
+                self.task.configure(self.supervisor_command(upstream),autostart=False)
             return self.status()
-        self.task.start(self.supervisor_command(upstream),autostart=True)
+        self.task.start(self.supervisor_command(upstream),autostart=False)
         for _ in range(80):
             if self.cancelled.is_set():break
             runtime=self.runtime()
@@ -413,6 +452,8 @@ class ObserverManager:
         raise RuntimeError('독립 감시 시작을 확인하지 못했습니다. 기존 연결은 유지됩니다.')
 
     def resume(self):
+        from .app_services import resume_proxy
+        if resume_proxy(self):return self.status()
         with ProcessLock(self.control_lock):
             if self.config()[1].get('openai_base_url')==self.url and self.state().get('enabled'):
                 return self.attach_supervisor()
@@ -431,9 +472,7 @@ class ObserverManager:
         valid=self.proof_valid(state,health)
         phase=('active' if state.get('enabled') and health else 'recovery_required') if configured else ('validated' if valid else 'prepared' if health else 'off')
         runtime=self.runtime()
-        update=read_json(self.directory/'proxy-update.json')
-        if update.get('phase') in ('queued','waiting','switching','rollback') and time.time()-update.get('updated_at',0)>90:
-            update={**update,'phase':'interrupted','message':'업데이트가 중단되었습니다. 다시 눌러 복구할 수 있습니다.'}
+        update=self.update_status()
         if state.get('phase')=='recovery_failed':phase='recovery_failed'
         elif not configured and state.get('phase') in ('faulted','failed'):phase=state['phase']
         elif not configured and runtime.get('phase')=='draining':phase='draining'
@@ -441,6 +480,8 @@ class ObserverManager:
                 'health':health,'service_issue':issue,'evidence_path':str(self.evidence),
                 'probe_state':self.health_state,'runtime':runtime,'app_version':VERSION,
                 'update':update,
+                'running_proxy_path':self.running_path(health),
+                'target_proxy_version':PROXY_VERSION,'proxy_update_available':bool(health and health.get('version')!=PROXY_VERSION),
                 'app_path':self.command(state.get('upstream','chatgpt'))[0],
                 'version_mismatch':bool(health and not proxy_compatible(health.get('version'))),
                 'incident':state.get('incident'),'last_error':state.get('last_error'),

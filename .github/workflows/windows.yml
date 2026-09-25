@@ -104,14 +104,19 @@ jobs:
       - name: Check frozen runtime and Qt Quick interaction
         if: steps.plan.outputs.package == 'true'
         run: python tools/run_ui_checks.py -- python tools/verify_changes.py --package-only --package-exe dist-ci/Codexon/Codexon.exe
-      - name: Build previous package and check managed proxy replacement
+      - name: Build previous release and check both proxy roles with idle connections
         if: steps.plan.outputs.proxy == 'true'
         shell: pwsh
         run: |
-          git worktree add --detach ../codexon-previous a60680d
+          git worktree add --detach ../codexon-previous v2026.09.25.6
           & ../codexon-previous/build.ps1 -DistPath ../codexon-previous-dist -WorkPath ../codexon-previous-build -PythonPath ((Get-Command python).Source)
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python tools/verify_proxy_update.py --old-exe ../codexon-previous-dist/Codexon/Codexon.exe --new-exe dist-ci/Codexon/Codexon.exe --output artifacts/verification/proxy-update
+          python tools/verify_proxy_update.py --old-exe ../codexon-previous-dist/Codexon/Codexon.exe --new-exe dist-ci/Codexon/Codexon.exe --idle-connections 100 --output artifacts/verification/proxy-update
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tools/verify_proxy_update.py --old-exe ../codexon-previous-dist/Codexon/Codexon.exe --new-exe dist-ci/Codexon/Codexon.exe --cache-worker --idle-connections 100 --output artifacts/verification/cache-worker-update
+      - name: Check packaged app exit, service resume and collector migration
+        if: steps.plan.outputs.proxy == 'true'
+        run: python tools/run_ui_checks.py -- python tools/verify_app_services.py --executable dist-ci/Codexon/Codexon.exe --legacy-collector-exe ../codexon-previous-dist/Codexon/Codexon.exe --output artifacts/verification/app-services
       - name: Check packaged GUI handoff with multiple custom homes
         if: steps.plan.outputs.package == 'true'
         run: python tools/run_ui_checks.py -- python tools/verify_gui_handoff.py --executable dist-ci/Codexon/Codexon.exe --output artifacts/verification/gui-handoff

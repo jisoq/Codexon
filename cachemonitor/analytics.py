@@ -10,6 +10,7 @@ from .core import METRICS, LINEAGE_FIELDS, summarize, token_number, token_parts
 from .pricing import COST_KEYS, COST_COMPONENTS, token_cost, sum_cost, request_tier, display_tier, unknown_mode_calls, mode_assumptions
 from .cache_misses import classify
 from .cache_health import CacheHealth
+from .workload import internal_review
 
 EFFORTS=('none','minimal','low','medium','high','xhigh','max','ultra')
 KEYS=('total','input','cached','written','ordinary_input','output','reasoning','uncached','non_reasoning','duration','generation_wait','rate')
@@ -246,7 +247,7 @@ def request_record(key,items,whole,session,start,end):
 
 def analyze(sessions,start=0,end=float('inf'),model='',source='',archived=True,
             unit='response',method='mean',input_band=None,with_comparisons=True,service_tier='',effort='',home='',project='',sid=''):
-    selected=[s for s in sessions if (archived or not s.get('archived')) and (not source or s.get('source','unknown')==source)
+    selected=[s for s in sessions if not internal_review(s) and (archived or not s.get('archived')) and (not source or s.get('source','unknown')==source)
               and (not home or s['home']==home) and (not sid or s['id']==sid) and (not project or project_matches(s,project))]
     responses=[];whole_turns=defaultdict(list);groups=defaultdict(list);session_map={}
     seen=set()

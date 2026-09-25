@@ -581,7 +581,7 @@ class OverlayContent(Node):
             pair('자체 호출 비용',money(d.get('own_cost'),False),numeric=True)
             pair(f"하위 {d['descendants']}개 비용",money(d.get('child_cost'),False),numeric=True,formula='하위 작업 호출의 API 환산액 합계')
         pair('평균 호출 비용',money(d.get('mean_cost'),False),numeric=True)
-        if d.get('partial'):
+        if d.get('missing'):
             text(f"산정 {d.get('priced',0)} / {d.get('calls',0)}호출",color='secondary')
         if d.get('assumed'):text(f"Standard 가정 {d['assumed']}호출",color='secondary')
         c=d.get('token_composition',{})

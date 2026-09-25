@@ -8,12 +8,12 @@ class UpdateOperation(QThread):
     progress=Signal(str)
     result=Signal(str)
 
-    def __init__(self,parent=None,action=None):
-        super().__init__(parent);self.action=action
+    def __init__(self,parent=None,action=None,manager=None):
+        super().__init__(parent);self.action=action;self.manager=manager
 
     def run(self):
         from .app_update import update
-        try:self.result.emit(self.action() if self.action else update(self.progress.emit))
+        try:self.result.emit(self.action() if self.action else update(self.progress.emit,self.manager))
         except Exception as exc:self.result.emit(str(exc))
 
 
@@ -38,12 +38,13 @@ class UpdatePanel(Group):
         except Exception as exc:self.status.setText(str(exc))
 
     def start(self):
+        from .proxy_update import BUSY
         if self.operation:return
         self.button.setEnabled(False)
         action=None
-        if self.proxy_update.get('phase') in ('queued','waiting'):
+        if self.proxy_update.get('phase') in BUSY:
             action=lambda:self.manager.cancel_update().get('update',{}).get('message','예약 취소 요청 완료')
-        self.operation=UpdateOperation(self,action)
+        self.operation=UpdateOperation(self,action,self.manager)
         self.operation.progress.connect(self.status.setText)
         self.operation.result.connect(self.status.setText)
         self.operation.finished.connect(self.finished)
@@ -55,9 +56,10 @@ class UpdatePanel(Group):
         self.button.setEnabled(True)
 
     def proxy_status(self,result):
+        from .proxy_update import BUSY
         if self.operation:return
         update=result.get('update') or {}
         self.proxy_update=update
-        self.button.setText('업데이트 예약 취소' if update.get('phase') in ('queued','waiting') else '업데이트 확인 및 설치')
-        self.button.setEnabled(update.get('phase') not in ('switching','rollback'))
-        if update.get('message'):self.status.setText(update['message'])
+        self.button.setText('업데이트 취소' if update.get('phase') in BUSY else '업데이트 확인 및 설치')
+        self.button.setEnabled(True)
+        if update.get('message') and update.get('phase')!='off':self.status.setText(update['message'])

@@ -7,7 +7,7 @@ from urllib.parse import urlsplit
 from .observer_control import ObserverManager
 from .observer_task import ObserverTask
 from .observer_state import read_json,ProcessLock
-from .version import VERSION,proxy_compatible
+from .version import VERSION,PROXY_VERSION,proxy_compatible
 
 
 class CacheWorkerManager(ObserverManager):
@@ -40,9 +40,25 @@ class CacheWorkerManager(ObserverManager):
             phase='active' if configured and health else 'recovery_required' if configured else 'off',
             probe_state=self.health_state,runtime={'phase':'active' if health else 'stopped'},registration=registration,
             app_version=VERSION,app_path=sys.executable,version_mismatch=bool(health and not proxy_compatible(health.get('version'))),
+            target_proxy_version=PROXY_VERSION,proxy_update_available=bool(health and health.get('version')!=PROXY_VERSION),
+            update=self.update_status(),
+            running_proxy_path=self.running_path(health),
             shared_cache_worker=True,url=self.url,evidence_path=str(self.evidence))
 
     def ensure(self):return self.status()
+
+    def resume(self):
+        from .app_services import resume_proxy
+        from .proxy_update import BUSY
+        resume_proxy(self)
+        with ProcessLock(self.control_lock,timeout=30):
+            if read_json(self.directory/'proxy-update.json').get('phase') in BUSY:return self.status()
+            health=self.health(timeout=3)
+            if health:
+                from .proxy_target import ProxyTarget
+                source=ProxyTarget(self).capture(health)
+                self.task.configure(source['command'],autostart=False)
+        return self.status()
 
     def test_connection(self):
         # An extra model probe would bypass the cache execution grant and ledger.
@@ -50,20 +66,22 @@ class CacheWorkerManager(ObserverManager):
 
     def turn_on(self):
         with ProcessLock(self.control_lock,timeout=5):
+            from .app_services import require_running
+            require_running(self)
             configured=self.config()[1].get('openai_base_url')
             if configured not in (None,self.url):raise RuntimeError('다른 연결이 설정되어 있습니다. 기존 연결을 보존합니다.')
             health=self.health(timeout=3)
             if health and not health.get('cache_management'):raise RuntimeError('캐시 작업기가 아닌 연결을 보존합니다.')
             if not health:
                 if self.health_state!='refused':raise RuntimeError('기존 연결 상태를 확인하지 못했습니다.')
-                self.task.start(self.command(),autostart=True)
+                self.task.start(self.command(),autostart=False)
                 until=time.monotonic()+15
                 while not self.cancelled.is_set() and time.monotonic()<until:
                     health=self.health(timeout=1)
                     if health:break
                     time.sleep(.2)
                 if not health or self.cancelled.is_set():raise RuntimeError('연결 준비가 완료되지 않았습니다. 주소는 변경하지 않았습니다.')
-            self.task.configure(self.command(),autostart=True)
+            self.task.configure(self.command(),autostart=False)
             from .observer_control import atomic_write
             import json
             atomic_write(self.route_path,json.dumps({'url':self.url}).encode())
@@ -72,6 +90,8 @@ class CacheWorkerManager(ObserverManager):
 
     def turn_off(self):
         with ProcessLock(self.control_lock,timeout=5):
+            from .app_services import disable_resume
+            disable_resume(self)
             if self.config()[1].get('openai_base_url') not in (None,self.url):raise RuntimeError('다른 연결을 보존합니다.')
             from .observer_control import atomic_write
             import json
@@ -86,8 +106,7 @@ class CacheWorkerManager(ObserverManager):
         return {**self.status(),'restart_required':True}
 
     def update_proxy(self):
-        self.task.configure(self.command(),autostart=self.config()[1].get('openai_base_url')==self.url)
-        return {**self.status(),'update':{'phase':'waiting','message':'기존 연결 유지 중 · 다음 작업기 기동부터 설치본 적용'}}
+        return super().update_proxy()
 
     def recover_direct(self):
         # Recovery/uninstall removes registration and drains without killing a

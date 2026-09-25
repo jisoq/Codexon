@@ -64,7 +64,9 @@ def test_same_journal_relay_transition_cannot_recover_a_live_request(tmp_path,fi
         assert {row['state'] for row in journal.rows()}=={'sent'}
         assert manager.health(timeout=1)['pid']==health['pid']
         journal.finish(live,'completed',response())
-        stop(first,graceful=first_mode=='cache-worker')
+        # This fixture deliberately left an unowned sent row: simulate a crash
+        # to test recovery, not a graceful shutdown that must preserve settlement.
+        stop(first)
         second,health=start(other)
         rows={row['sid']:row for row in journal.rows()}
         assert rows['live']['state']=='completed' and rows['live']['usage_known']

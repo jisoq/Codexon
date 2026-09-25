@@ -13,13 +13,14 @@ import hashlib
 import ssl
 
 import httpx
-from aiohttp import ClientSession, ClientTimeout, DummyCookieJar, WSMsgType, WSServerHandshakeError, web
+from aiohttp import ClientSession, ClientTimeout, DummyCookieJar, TCPConnector, WSMsgType, WSServerHandshakeError, web
 from multidict import CIMultiDict
 from yarl import URL
 from .model_evidence import EvidenceStore, default_path, identifier, home_key
 from .version import PROXY_VERSION
 from .proxy_observation import DecodedObservation, SelectedJSON, ResponseMetadata, message_metadata
 from .proxy_http import HTTPRelayPool
+from .proxy_websocket import POLICY, Activity, WebSocketBudget, LocalCapacity
 from .observer_state import read_json
 from .evidence_writer import EvidenceWriter
 
@@ -35,9 +36,6 @@ class ClientDisconnected(ConnectionError):
 
 
 def proxy_loop():
-    # This process only needs socket I/O. On Windows, the Proactor transport's
-    # shutdown() can raise WinError 10022 before detaching a closed socket,
-    # leaving server shutdown waiting forever. Use the standard socket loop.
     return asyncio.SelectorEventLoop() if os.name=='nt' else asyncio.new_event_loop()
 
 
@@ -150,7 +148,8 @@ class Tracker:
 
 
 def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *, diagnostics=None,ssl_context=None,
-               control_file=None, control_id='', stop_event=None, managed=None, cache_capture=None):
+               control_file=None, control_id='', stop_event=None, managed=None, cache_capture=None,
+               scheduler=None, runtime_identity=None, policy=POLICY, clock=time.monotonic):
     base=URL(upstream)
     if (base.scheme not in ('http','https') or not base.host or base.user is not None
             or base.query_string or base.fragment):
@@ -162,14 +161,30 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
             'cache_observation_only':bool(cache_capture and cache_capture.executor.observation_only),
             'cache_analysis_revision':getattr(cache_capture,'analysis_revision',None),
             'forwarded_http_requests':0,'forwarded_http_responses':0,
+            'websocket_policy':dict(vars(policy)),
             'service':'cachemonitor-model-observer',
+            'lifecycle_revision':2,
+            'storage_flush_receipt':bool(control_file or managed),
             'version':PROXY_VERSION,'instance':uuid.uuid4().hex,'pid':os.getpid(),
             'identity':hashlib.sha256((home_key(home)+'|'+str(store.path.resolve())).encode()).hexdigest()}
     if managed:health['lifecycle']='managed'
+    health.update(runtime_identity or {})
     app=web.Application(handler_args={'auto_decompress':False,'handler_cancellation':True})
     active_relays={}
     sockets={}
     recent_relays=deque(maxlen=32)
+    budget=WebSocketBudget(policy,clock)
+
+    def public(diagnostic):
+        return {k:v for k,v in diagnostic.items() if not k.startswith('_')}
+
+    def apply_control():
+        command=read_json(control_file) if control_file else {}
+        if command.get('id')==control_id and command.get('action')=='pause' and scheduler:scheduler.pause()
+        if command.get('id')==control_id and command.get('action')=='drain':health['draining']=True
+        if health['draining']:
+            budget.draining=True;budget.changed.set()
+            if scheduler:scheduler.pause()
 
     async def control_lifecycle(app):
         async def watch():
@@ -178,22 +193,20 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
                 if managed and time.monotonic()-last_tick>=1:
                     await asyncio.to_thread(managed.tick,health)
                     last_tick=time.monotonic()
-                command=read_json(control_file) if control_file else {}
-                if command.get('id')==control_id and command.get('action')=='drain':
-                    health['draining']=True;health['observation_enabled']=False
+                apply_control()
                 if health['draining']:
-                    for relay_id,(ws,tracker,known) in list(sockets.items()):
-                        diagnostic=active_relays.get(relay_id,{})
-                        if (known and not diagnostic.get('idle_unknown') and not diagnostic.get('forwarding')
-                                and not tracker.active and not any(tracker.pending.values())):
-                            await ws.close(code=1001, message=b'Observer disabled')
-                    if not active_relays and stop_event is not None:stop_event.set()
-                await asyncio.sleep(.2)
+                    budget.draining=True
+                    budget.changed.set()
+                    if scheduler:scheduler.pause()
+                    if not active_relays and (not scheduler or scheduler.settled) and stop_event is not None:stop_event.set()
+                budget.reap()
+                await asyncio.sleep(policy.check_seconds)
         task=asyncio.create_task(watch())
         try:yield
         finally:
             task.cancel();await asyncio.gather(task,return_exceptions=True)
-    if control_file:app.cleanup_ctx.append(control_lifecycle)
+            await budget.close()
+    app.cleanup_ctx.append(control_lifecycle)
 
     async def preserve_response_headers(request,response):
         supplied=request.get(RELAY_HEADERS)
@@ -204,6 +217,7 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
 
     async def lifecycle(app):
         async with ClientSession(timeout=ClientTimeout(total=None,connect=30,sock_read=600),
+                                 connector=TCPConnector(limit=policy.budget,limit_per_host=policy.budget,ssl=ssl_context or True),
                                  auto_decompress=False,trust_env=False,cookie_jar=DummyCookieJar(),
                                  skip_auto_headers={'Accept','Accept-Encoding','User-Agent','Content-Type'}) as client:
             # Keep the OS trust store used by the previous transport. HTTP/2 is
@@ -215,16 +229,24 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
     app.cleanup_ctx.append(lifecycle)
 
     async def handle(request):
+        apply_control()
         # Never accept browser-origin traffic or act as an arbitrary forward proxy.
         if request.headers.get('Origin'):
             raise web.HTTPForbidden(text='Browser requests are not supported')
         if request.path=='/health' and request.method=='GET':
             if hasattr(store,'status'):health.update(store.status())
+            inventory=budget.status()
+            selector=getattr(asyncio.get_running_loop(),'_selector',None)
             return web.json_response({'status':'degraded' if health['storage_failure_streak'] else 'ok',**health,
+                'websocket_states':inventory['states'],'websocket_connections':inventory,
+                'http_connections':sum(d['transport']=='HTTP/SSE' for d in active_relays.values()),
+                'selector_sockets':len(selector.get_map()) if hasattr(selector,'get_map') else None,
+                'http_pool':dict(clients=len(getattr(app[HTTP_CLIENT],'clients',())),waiting=getattr(app[HTTP_CLIENT],'waiting',0)),
+                'cache_execution':scheduler.status() if scheduler else None,
                 'active_connections':len(active_relays),
-                'active_relays':list(active_relays.values())[-32:],'recent_relays':list(recent_relays)})
+                'active_relays':[public(d) for d in list(active_relays.values())[-32:]],'recent_relays':list(recent_relays)})
         if health['draining']:
-            return web.json_response({'error':{'code':'observer_disabled','message':'Observer disabled; restart Codex to use direct connection'}},status=503)
+            return web.json_response({'error':{'code':'local_proxy_draining','message':'Local proxy is replacing its connection worker; reconnect'}},status=503,headers={'Retry-After':'1'})
         if request.rel_url.is_absolute() or not request.raw_path.startswith('/'):
             raise web.HTTPBadRequest(text='Only origin-form request targets are supported')
         # Append the untouched request target to the fixed base. URL joining would
@@ -252,6 +274,7 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
         lease=None
         cache_record=None
         ws_capture=None
+        activity=Activity(clock,known=observe) if is_ws else None
         if cache_capture is not None and observe and not is_ws:
             # Invalidate at ingress, before connection establishment or upload.
             cache_record=cache_capture.begin(headers,url,time.monotonic())
@@ -259,18 +282,37 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
                 cache_record['request'].failed=True
         try:
             if is_ws:
+                await budget.reserve(relay_id,activity)
+                activity.connecting=True
                 protocols=tuple(p.strip() for p in request.headers.get('Sec-WebSocket-Protocol','').split(',') if p.strip())
                 async with client.ws_connect(url,headers=headers,
-                                             protocols=protocols,max_msg_size=128*1024*1024) as upstream_ws:
+                                             protocols=protocols,max_msg_size=128*1024*1024,autoping=False) as upstream_ws:
                     diagnostic['upstream_status']=101
                     diagnostic['upstream_http']=f'{upstream_ws._response.version.major}.{upstream_ws._response.version.minor}'
                     downstream=web.WebSocketResponse(protocols=([upstream_ws.protocol] if upstream_ws.protocol else ()),
-                                                     max_msg_size=128*1024*1024,compress=False)
+                                                     max_msg_size=128*1024*1024,compress=False,autoping=False)
                     relay_headers=headers_without_hop(upstream_ws._response.headers,websocket=True)
                     request[RELAY_HEADERS]={name.lower() for name in relay_headers}
                     downstream.headers.extend(relay_headers)
                     await downstream.prepare(request)
+                    diagnostic['_activity_at']=time.monotonic()
                     sockets[relay_id]=(downstream,tracker,observe)
+                    relay_tasks=[]
+                    handler=asyncio.current_task()
+                    upstream_transport=getattr(upstream_ws._response.connection,'transport',None)
+                    async def retire(reason):
+                        diagnostic['retirement_reason']=reason
+                        try:
+                            async with asyncio.timeout(policy.close_seconds):
+                                await asyncio.gather(downstream.close(code=1001,message=b'Local connection renewal'),
+                                                     upstream_ws.close(code=1001,message=b'Local connection renewal'))
+                        except (TimeoutError,ConnectionError):pass
+                        finally:
+                            if request.transport:request.transport.abort()
+                            if upstream_transport:upstream_transport.abort()
+                            for task in relay_tasks:task.cancel()
+                            if not handler.done():handler.cancel()
+                    budget.connected(relay_id,retire)
 
                     if cache_capture is not None:
                         from .cache_capture import WebSocketCapture
@@ -280,17 +322,18 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
                         nonlocal phase,cache_record
                         async for msg in source:
                             if msg.type in (WSMsgType.TEXT,WSMsgType.BINARY):
+                                obj=message_metadata(msg.data)
+                                if not activity.begin(obj,outbound):return 1001
+                                diagnostic['_activity_at']=time.monotonic()
                                 diagnostic['forwarding']=diagnostic.get('forwarding',0)+1
                                 phase='upstream_write' if outbound else 'downstream_write'
                                 diagnostic['request_frames' if outbound else 'response_frames']+=1
                                 diagnostic['last_client_frame_at' if outbound else 'last_upstream_frame_at']=time.time()
                                 diagnostic['request_bytes' if outbound else 'response_bytes']+=len(msg.data.encode('utf-8') if isinstance(msg.data,str) else msg.data)
                                 if observe:
-                                    obj=message_metadata(msg.data)
                                     diagnostic['last_client_event' if outbound else 'last_upstream_event']=identifier(obj.get('type'))
                                     if outbound:
                                         if obj.get('type')=='response.create': tracker.request(obj)
-                                        elif obj.get('type') not in ('response.cancel',):diagnostic['idle_unknown']=True
                                     if ws_capture is not None:
                                         raw=msg.data.encode() if isinstance(msg.data,str) else msg.data
                                         try:
@@ -298,6 +341,7 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
                                             else:ws_capture.incoming(obj,raw)
                                         except Exception:ws_capture.disable()
                                     if not outbound:tracker.response(obj)
+                                    if not isinstance(obj.get('type'),str) or not obj['type']:diagnostic['idle_unknown']=True
                                 try:
                                     if msg.type==WSMsgType.TEXT: await destination.send_str(msg.data)
                                     else: await destination.send_bytes(msg.data)
@@ -306,6 +350,12 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
                                     raise
                                 if not outbound: health['forwarded_response_frames']+=1
                                 diagnostic['forwarding']-=1
+                                activity.delivered(obj,outbound)
+                                budget.reap()
+                            elif msg.type==WSMsgType.PING:
+                                await destination.ping(msg.data)
+                            elif msg.type==WSMsgType.PONG:
+                                await destination.pong(msg.data)
                             elif msg.type==WSMsgType.ERROR:
                                 diagnostic['websocket_error_side']='client' if outbound else 'upstream'
                                 diagnostic['websocket_error_type']=type(source.exception()).__name__
@@ -316,6 +366,7 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
 
                     tasks=[asyncio.create_task(relay(downstream,upstream_ws,True)),
                            asyncio.create_task(relay(upstream_ws,downstream,False))]
+                    relay_tasks.extend(tasks)
                     try:
                         done,pending=await asyncio.wait(tasks,return_when=asyncio.FIRST_COMPLETED)
                         for task in done: task.result()
@@ -406,6 +457,10 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
                 diagnostic['outcome']='client_disconnected'
             else:diagnostic['outcome']='cancelled'
             raise
+        except LocalCapacity:
+            diagnostic['outcome']='local_capacity'
+            return web.json_response({'error':{'code':'local_proxy_capacity','message':'Local relay connection capacity exhausted'}},
+                                     status=503,headers={'Retry-After':'1'})
         except (ClientDisconnected,ConnectionResetError) as exc:
             if isinstance(exc,ClientDisconnected) or phase.startswith('downstream') or request.transport is None or request.transport.is_closing():
                 health['client_disconnects']+=1
@@ -444,10 +499,15 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
             if ws_capture is not None:ws_capture.close()
             if cache_record is not None:
                 cache_capture.finish(cache_record,websocket=is_ws)
+            # A failed upstream close must not leave a phantom active relay or
+            # prevent pool release. Closing is best-effort after forwarding ends.
             try:
                 if response is not None:await response.aclose()
+            except Exception as exc:diagnostic['cleanup_error_type']=type(exc).__name__
             finally:
-                if lease is not None:await connection.__aexit__(None,None,None)
+                try:
+                    if lease is not None:await connection.__aexit__(None,None,None)
+                except Exception as exc:diagnostic['cleanup_error_type']=type(exc).__name__
             if response_observer is not None:
                 response_observer.finish()
                 diagnostic['response_observation']=response_observer.error or response_observer.consumer.error or 'parsed'
@@ -458,9 +518,10 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
             diagnostic.setdefault('outcome','finished')
             active_relays.pop(relay_id,None)
             sockets.pop(relay_id,None)
-            recent_relays.append(dict(diagnostic))
+            if is_ws:budget.release(relay_id)
+            recent_relays.append(public(diagnostic))
             if diagnostics is not None:
-                try:diagnostics(diagnostic)
+                try:diagnostics(public(diagnostic))
                 except Exception:pass  # Optional diagnostics must never change transport behavior.
 
     app.router.add_route('*','/{tail:.*}',handle)
@@ -489,6 +550,10 @@ def main():
     endpoint={'chatgpt':'https://chatgpt.com/backend-api/codex','openai':'https://api.openai.com/v1'}[args.upstream]
     if args.upstream_url:endpoint=args.upstream_url
     context=ssl.create_default_context(cafile=str(args.upstream_ca)) if args.upstream_ca else None
+    from .proxy_identity import runtime_identity
+    identity=runtime_identity(args.codex_home,args.evidence_path,role='cache-observer' if args.cache_observe_only else
+        'cache-worker' if args.cache_worker else 'observer',upstream=endpoint,index=args.observation_index)
+    identity['listen_url']=f'http://127.0.0.1:{args.port}'
     try:
         if args.cache_observe_only or args.cache_worker:
             if args.cache_observe_only and args.cache_worker:parser.error('Choose observation only or cache worker')
@@ -498,8 +563,8 @@ def main():
             from .usage_collection import CollectionClient
             from concurrent.futures import ThreadPoolExecutor
             from .cache_execution import execution_owner
-            cache_lock=execution_owner(args.observation_index.with_name('cache-control.sqlite'))
-            cache_lock.__enter__()
+            owner=execution_owner(args.observation_index.with_name('cache-control.sqlite'))
+            owner.__enter__();cache_lock=owner
             scheduler=Scheduler(args.codex_home,args.observation_index.with_name('cache-control.sqlite'),
                 observation_only=args.cache_observe_only,continuous_capture=args.cache_worker)
             scheduler.journal.recover_exclusive()
@@ -507,7 +572,7 @@ def main():
             stop=asyncio.Event();control_id=uuid.uuid4().hex
             app=create_app(store,args.codex_home,endpoint,ssl_context=context,cache_capture=scheduler.capture,
                 control_file=args.evidence_path.parent/('proxy-control-'+control_id+'.json'),
-                control_id=control_id,stop_event=stop)
+                control_id=control_id,stop_event=stop,scheduler=scheduler,runtime_identity=identity)
             async def observe_context(app):
                 pool=ThreadPoolExecutor(max_workers=1);index=None
                 def poll():
@@ -552,7 +617,7 @@ def main():
             from .managed_proxy import ManagedProxy
             manager=ObserverManager(args.codex_home,args.evidence_path.parent,url=f'http://127.0.0.1:{args.port}')
             loop=proxy_loop()
-            try:loop.run_until_complete(ManagedProxy(manager).serve(store,endpoint,context,args.port))
+            try:loop.run_until_complete(ManagedProxy(manager).serve(store,endpoint,context,args.port,identity=identity))
             finally:loop.close()
         elif args.control_file:
             if (args.control_file.resolve().parent != args.evidence_path.resolve().parent
@@ -561,7 +626,7 @@ def main():
             async def serve():
                 stop=asyncio.Event()
                 app=create_app(store,args.codex_home,endpoint,ssl_context=context,control_file=args.control_file,
-                               control_id=args.control_id,stop_event=stop)
+                               control_id=args.control_id,stop_event=stop,runtime_identity=identity)
                 runner=web.AppRunner(app,access_log=None)
                 await runner.setup()
                 try:
@@ -575,9 +640,17 @@ def main():
             web.run_app(create_app(store,args.codex_home,endpoint,ssl_context=context),host='127.0.0.1',port=args.port,
                         access_log=None,print=None,loop=proxy_loop())
     finally:
-        if cache_lock:cache_lock.__exit__(None,None,None)
-        if not store.close():
-            raise SystemExit('관측 저장 종료 미완료 · 저장 대기 또는 누락 기록을 확인하세요')
+        try:
+            if not store.close():
+                raise SystemExit('관측 저장 종료 미완료 · 저장 대기 또는 누락 기록을 확인하세요')
+            if cache_lock or args.control_file:
+                from .observer_control import atomic_write
+                import json
+                stopped_id=control_id if cache_lock else args.control_id
+                atomic_write(args.evidence_path.parent/('proxy-control-'+stopped_id+'.json'),
+                    json.dumps(dict(action='stopped',id=stopped_id,storage_flushed=True)).encode())
+        finally:
+            if cache_lock:cache_lock.__exit__(None,None,None)
 
 
 if __name__=='__main__':

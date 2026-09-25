@@ -8,6 +8,7 @@ from .cache_health import CacheHealth
 from .core import TRANSPORT_FIELDS, summarize, METRICS
 from .model_evidence import FIELDS as MODEL_FIELDS
 from .pricing import token_cost, sum_cost, RATES, FAST_RATES, ALIASES, VERIFIED, PRICE_POLICY, request_tier, display_tier, unknown_mode_calls
+from .workload import internal_review
 
 
 class BoundedCache:
@@ -39,6 +40,7 @@ def row_signature(row):
 class AnalysisEngine:
     def __init__(self):
         self.sessions=OrderedDict()
+        self.internal_sessions=OrderedDict()
         self.parts=BoundedCache(2048,160000)
         self.results=BoundedCache(6,160000)
         self.statistics=BoundedCache(2048,160000)
@@ -50,6 +52,7 @@ class AnalysisEngine:
         self.metrics={'priced_calls':0,'session_rebuilds':0,'part_builds':0,'view_builds':0,'cache_hits':0}
 
     def ingest(self,sessions):
+        previous_sessions={**self.sessions,**self.internal_sessions}
         price_signature=(VERIFIED,PRICE_POLICY,tuple(RATES.items()),tuple(FAST_RATES.items()),tuple(ALIASES.items()))
         # A collector revision covers corrections as well as append. Unversioned
         # callers retain the full fingerprint path.
@@ -59,7 +62,7 @@ class AnalysisEngine:
                     repr(s.get('coverage_gaps',[])),repr(s.get('turn_states',{})),repr(s.get('unclassified')))
                    for s in sessions) if all(s.get('usage_revision') is not None for s in sessions) else None
         if fast is not None and fast==getattr(self,'_ingest_key',None) and price_signature==self.pricing_signature:
-            for s in sessions:self.sessions[(s['home'],s['id'])]['source']=s
+            for s in sessions:previous_sessions[(s['home'],s['id'])]['source']=s
             return False
         self._ingest_key=fast
         owners={}
@@ -73,7 +76,7 @@ class AnalysisEngine:
         updated=OrderedDict()
         for source in sessions:
             key=(source['home'],source['id'])
-            old=self.sessions.get(key)
+            old=previous_sessions.get(key)
             revision=source.get('usage_revision')
             owned_history=[r for r in source['history'] if owners[call_identity(source['home'],source['id'],r.get('key'))]==key]
             metadata=tuple(source.get(k) for k in ('title','cwd','project','project_name','source','archived','collection_complete','pending','parent_thread_id','agent_path','agent_nickname','spawn_depth'))+(tuple(source.get('request_state',{}).items()),
@@ -128,11 +131,14 @@ class AnalysisEngine:
             updated[key]={'source':source,'prepared':prepared,'records':records,'fingerprint':fingerprint,
                           'revision':self.generation,'timestamps':sorted(r['ts'] for r in history),'boundaries':boundaries,'whole_turns':dict(whole_turns)}
             self.metrics['session_rebuilds']+=1
-        if set(updated)!=set(self.sessions): changed=True
-        self.sessions=updated
+        if set(updated)!=set(previous_sessions): changed=True
+        self.internal_sessions=OrderedDict((key,state) for key,state in updated.items() if internal_review(state['prepared']))
+        work=OrderedDict((key,state) for key,state in updated.items() if key not in self.internal_sessions)
+        if set(work)!=set(self.sessions):changed=True
+        self.sessions=work
         if changed:
             self.revision+=1
-            self.timestamps=sorted(r['ts'] for s in updated.values() for r in s['prepared']['history'])
+            self.timestamps=sorted(r['ts'] for s in work.values() for r in s['prepared']['history'])
             # Old result objects may remain on screen, but cannot answer a newer revision.
             self.results.clear()
         return changed

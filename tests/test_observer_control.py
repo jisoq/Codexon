@@ -40,7 +40,7 @@ def test_enable_disable_preserves_comments_unrelated_edits_and_startup(tmp_path,
     validated(control)
     result=control.enable()
     assert result['enabled'] and result['configured'] and result['running']
-    assert ('configure',True) in control.task.calls
+    assert ('configure',False) in control.task.calls
     changed=control.config_path.read_text()
     assert '# Personal settings' in changed
     assert tomllib.loads(changed)['features']['alpha'] is True

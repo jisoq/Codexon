@@ -29,4 +29,6 @@ QA 설치기 식별은 파일 이름이 아닌 EXE의 ProductName `Codexon QA`�
 
 `tools/verify_gui_handoff.py --executable <Codexon.exe> --output <새 폴더>`는 같은 빌드의 서로 다른 설치 경로 사이에서 이전 GUI 종료와 새 GUI 시작을 확인합니다. 공백이 포함된 두 홈, 별도 IPC 이름과 DB를 사용하고 자동 시작 설정은 건드리지 않습니다. 이전 버전과 새 버전의 프록시 교체는 `verify_proxy_update.py`로 별도로 확인합니다.
 
+`tools/verify_app_services.py --executable <Codexon.exe> --output <새 폴더>`는 일반 프록시·캐시 작업기·관측 전용 작업기의 앱 종료와 재개를 격리된 홈·포트에서 확인합니다. 유휴 소켓 종료, 기록 저장 후 프로세스·리스너·잠금 해제, 수집기 종료, 예약 작업의 재시작 중지, 역할을 보존한 재개와 직접 연결 복원을 검사합니다.
+
 최종 배포 폴더에는 일반 `Codexon-Setup.exe`, 해당 체크섬, `tools/prepare_sources.py --output <배포 폴더>`로 만든 Qt/PySide6 소스 ZIP과 체크섬을 함께 준비합니다. QA 설치기는 포함하지 않습니다. manifest의 커밋·앱 버전·파일 해시를 최종 커밋과 대조하고, 검증 로그와 화면을 보존합니다.

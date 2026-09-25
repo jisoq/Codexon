@@ -272,7 +272,7 @@ def test_current_cohort_recovers_after_changes_but_keeps_unknown_and_no_return(t
     control.close()
 
 
-@pytest.mark.parametrize('mode',['disable','return_disable','close','lost','timeout'])
+@pytest.mark.parametrize('mode',['disable','return_disable','close','lost','timeout','update'])
 def test_sent_usage_drains_through_repeated_invalidation_and_shutdown(tmp_path,mode):
     from aiohttp import web,ClientSession
     from test_model_proxy import server,run_proxy_test
@@ -295,6 +295,10 @@ def test_sent_usage_drains_through_repeated_invalidation_and_shutdown(tmp_path,m
             await scheduler.tick();await asyncio.wait_for(entered.wait(),2)
             job=scheduler.jobs['session'];closing=None
             if mode=='close':closing=asyncio.create_task(scheduler.close());await asyncio.sleep(0)
+            elif mode=='update':
+                scheduler.pause()
+                assert scheduler.control.enabled('automatic') and scheduler.status()['sent']==1
+                assert not scheduler.settled
             else:
                 if mode=='return_disable':
                     scheduler.executor.ingress();scheduler.executor.leave()
@@ -307,6 +311,7 @@ def test_sent_usage_drains_through_repeated_invalidation_and_shutdown(tmp_path,m
                 await scheduler.tick();job.cancel();await asyncio.sleep(.01)
             assert not job.done()
             release.set();await asyncio.wait_for(job,2)
+            if mode=='update':assert scheduler.settled and scheduler.control.enabled('automatic')
             if closing:await closing
             else:await scheduler.close()
             journal=Journal(path);rows=journal.rows();assert len(rows)==1

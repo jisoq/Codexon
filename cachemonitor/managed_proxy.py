@@ -54,7 +54,7 @@ class ManagedProxy:
             health['observation_enabled'] = False
         self.publish(health, 'draining' if health['draining'] else 'active' if configured else 'ready')
 
-    async def serve(self, store, endpoint, context, port):
+    async def serve(self, store, endpoint, context, port,identity=None):
         from aiohttp import web
         from .model_proxy import create_app
         # Same lifetime lock as the legacy supervisor permits safe update/migration.
@@ -77,7 +77,8 @@ class ManagedProxy:
                 # can run without cache execution; never recover that owner's rows.
             app = create_app(store, self.manager.home, endpoint, ssl_context=context,
                              control_file=self.control, control_id=self.instance,
-                             stop_event=stop, managed=self,cache_capture=scheduler.capture if scheduler else None)
+                             stop_event=stop, managed=self,cache_capture=scheduler.capture if scheduler else None,
+                             scheduler=scheduler,runtime_identity=identity)
             runner = web.AppRunner(app, access_log=None)
             scheduler_task=None
             try:
@@ -90,4 +91,6 @@ class ManagedProxy:
                     scheduler_task.cancel();await asyncio.gather(scheduler_task,return_exceptions=True)
                 await runner.cleanup()
                 if scheduler:await scheduler.close()
+                if await asyncio.to_thread(store.close) is False:raise RuntimeError('관측 저장 종료 미완료')
+                atomic_write(self.control,json.dumps(dict(action='stopped',id=self.instance,storage_flushed=True)).encode())
                 self.publish({}, 'stopped')

@@ -80,7 +80,21 @@ class CachePanel(Group):
         self.active=active;self.dialog=None;self.ticket=None;self.last_ticket=None;self.closed=False;self.proxy_ready=False;self.relay_connected=False
         self.operating_dialog=None
         layout=Column(self);layout.setContentsMargins(0,0,8,20);layout.setSpacing(20)
-        layout.addWidget(copy('작업 사이의 캐시 재사용을 돕고, 모델 변경으로 입력 처리 부담이 커질 때 알려줍니다.'))
+        features,body=card('개별 기능 켜기');self.toggles={}
+        body.addWidget(copy('작업 사이의 캐시 재사용을 돕고, 모델 변경으로 입력 처리 부담이 커질 때 알려줍니다.'))
+        for key,title,description in (
+            ('automatic','자동 유지','돌아올 가능성과 예상 이득이 충분할 때, 허용된 범위에서 별도 요청으로 캐시 재사용을 돕습니다.'),
+            ('guard','모델 변경 확인','다음 요청에서 모델 변경으로 입력 처리 부담이 크게 늘어날 때 진행 여부를 묻습니다. 추가 모델 요청은 보내지 않습니다.')):
+            feature=Column();feature.setSpacing(6)
+            row=Row();row.addWidget(copy(title,'section'),1)
+            toggle=Switch();toggle.setAccessibleName(title)
+            toggle.setChecked(self.control.get('selection:'+key,self.control.get(key,False)) if self.control else False)
+            toggle.setEnabled(active and self.control is not None);self.toggles[key]=toggle
+            toggle.toggled.connect(lambda value,k=key:self.set_feature(k,value));row.addWidget(toggle);feature.addLayout(row)
+            feature.addWidget(copy(description));body.addLayout(feature)
+        body.addWidget(copy('두 기능은 독립적으로 사용할 수 있습니다. 설정의 캐시 관리를 끄면 둘 다 중지됩니다.'))
+        layout.addWidget(features)
+        divider=Group();divider.setFixedHeight(1);divider.put(background='border');layout.addWidget(divider)
         state,body=card('현재 상태');self.status=copy('자연 작업 이력 수집 중','section');body.addWidget(self.status)
         self.next_action=copy('평소처럼 작업하면 관측 자료와 유지 판단이 갱신됩니다.');body.addWidget(self.next_action);layout.addWidget(state)
         metrics=Group();metrics.setObjectName('summary');columns=Row(metrics);columns.put(minColumnWidth=175)
@@ -90,18 +104,6 @@ class CachePanel(Group):
             col=Column();col.setSpacing(6);col.addWidget(copy(title));value=copy('—','metric');value.put(fontSize=26,bold=True)
             col.addWidget(value);col.addWidget(copy(note));columns.addLayout(col,1);self.metrics[key]=value
         layout.addWidget(metrics)
-        controls=Row();controls.put(collapseBelow=950,spacing=20);self.toggles={}
-        for key,title,description in (
-            ('automatic','자동 유지','돌아올 가능성과 예상 이득이 충분할 때, 허용된 범위에서 별도 요청으로 캐시 재사용을 돕습니다.'),
-            ('guard','모델 변경 확인','다음 요청에서 모델 변경으로 입력 처리 부담이 크게 늘어날 때 진행 여부를 묻습니다. 추가 모델 요청은 보내지 않습니다.')):
-            node,body=card(title);row=Row();row.addWidget(copy('개별 기능 켜기'),1)
-            toggle=Switch();toggle.setAccessibleName(title)
-            toggle.setChecked(self.control.get('selection:'+key,self.control.get(key,False)) if self.control else False)
-            toggle.setEnabled(active and self.control is not None);self.toggles[key]=toggle
-            toggle.toggled.connect(lambda value,k=key:self.set_feature(k,value));row.addWidget(toggle);body.addLayout(row)
-            body.addWidget(copy(description));controls.addWidget(node,1)
-        layout.addLayout(controls)
-        layout.addWidget(copy('두 기능은 독립적으로 사용할 수 있습니다. 설정의 캐시 관리를 끄면 둘 다 중지됩니다.'))
         operation,body=card('자동 유지 판단과 운용 범위')
         self.operation_badge=copy('운용 허용 없음','section');body.addWidget(self.operation_badge)
         self.estimate=copy('현재 문맥의 예상 비용을 수집하고 있습니다.');body.addWidget(self.estimate)

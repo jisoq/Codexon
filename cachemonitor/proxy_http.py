@@ -12,6 +12,7 @@ import asyncio
 import ssl
 
 import httpx
+from .proxy_websocket import POLICY, LocalCapacity
 
 
 class NoCookieJar(CookieJar):
@@ -30,10 +31,16 @@ class HTTPRelayPool:
         self.slots=asyncio.Semaphore(limit)
         self.idle=asyncio.LifoQueue()
         self.clients=set()
+        self.waiting=0
 
     @asynccontextmanager
     async def lease(self):
-        await self.slots.acquire()
+        if self.waiting>=POLICY.waiters:raise LocalCapacity()
+        self.waiting+=1
+        try:
+            try:await asyncio.wait_for(self.slots.acquire(),POLICY.capacity_seconds)
+            except asyncio.TimeoutError:raise LocalCapacity() from None
+        finally:self.waiting-=1
         client=None
         lease=None
         try:

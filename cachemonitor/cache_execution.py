@@ -373,6 +373,7 @@ class Executor:
         self.observation_only=observation_only
         self.generation=0
         self.busy=0
+        self.paused=False
         self.closed=False
         self.renewals={}
 
@@ -388,7 +389,7 @@ class Executor:
     async def run(self,home,sid,rid,url,headers,*,anchor,deadline,latency_bound,websocket=False,round_number=0,max_output_tokens=None,operation=None,valid=lambda:True,expected_generation=None,observed_tier=None):
         if self.observation_only:return 'observation_only'
         generation=self.generation if expected_generation is None else expected_generation
-        if self.closed:return 'invalidated'
+        if self.closed or self.paused:return 'invalidated'
         if self.journal.has_round(home,sid,rid,round_number):return 'duplicate'
         renewal=self.renewals.get((home,sid,rid))
         if round_number:
@@ -398,7 +399,7 @@ class Executor:
         if remaining>0:
             await asyncio.sleep(remaining)
         age=time.monotonic()-anchor
-        if (self.closed or self.busy or not valid() or generation!=self.generation or age<0 or
+        if (self.closed or self.paused or self.busy or not valid() or generation!=self.generation or age<0 or
                 age+latency_bound>=TTL_SECONDS):
             return 'invalidated'
         body=self.contexts.maintenance(rid)
@@ -416,7 +417,7 @@ class Executor:
         if key is None:
             return 'operation_deferred' if operation else 'duplicate'
         # No await between final invalidation check and durable send intent.
-        if self.closed or self.busy or generation!=self.generation:
+        if self.closed or self.paused or self.busy or generation!=self.generation:
             self.journal.finish(key,'cancelled');return 'invalidated'
         if not operation and not self.journal.sent(key):
             return 'invalidated'
@@ -426,7 +427,7 @@ class Executor:
             original=dict(self.contexts.usage.get(rid,{}))
             def permit():
                 if self.observation_only:return False
-                if self.closed or self.busy or generation!=self.generation or not valid():return False
+                if self.closed or self.paused or self.busy or generation!=self.generation or not valid():return False
                 return self.journal.permit_operation(key,operation) if operation else True
             transport=asyncio.create_task(asyncio.wait_for(self.send(url,headers,body,websocket=websocket,timeout=latency_bound,
                 permit=permit),latency_bound))

@@ -157,8 +157,13 @@ class TrayWindow(QuickHost):
             QMessageBox.warning(self, "자동 시작 설정 실패", str(exc))
             self.startup.setChecked(self.startup_enabled())
 
-    def quit_app(self):
-        self.quitting = True
+    def quit_app(self,checked=False,*,handoff=False):
+        if getattr(self,'_closing',False):return
+        self._closing=True
+        if hasattr(self,'save_preferences'):self.save_preferences()
+        panel=getattr(self,'observer_panel',None)
+        if panel:
+            panel.active=False;panel.timer.stop();panel.pending=None;panel.manager.cancelled.set()
         if getattr(self,'cache_panel',None):self.cache_panel.stop()
         if getattr(self,'overlay',None):self.overlay.stop()
         for service in getattr(self,'quota_services',{}).values(): service.stop()
@@ -167,7 +172,41 @@ class TrayWindow(QuickHost):
         if hasattr(self,'defer_timer'): self.defer_timer.stop()
         if self.worker:
             self.worker.requestInterruption()
-            self.worker.wait()
+        managed=getattr(self,'manage_observer',False)
+        collection=bool(self.worker and self.worker.collection_autostart)
+        if handoff or not (managed or collection):
+            if self.worker:self.worker.wait()
+            self.finish_quit();return
+        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import QProgressDialog
+        from .app_shutdown import ShutdownOperation
+        self.shutdown_dialog=QProgressDialog(tr('관련 작업 마무리 중…'),'',0,0,self)
+        self.shutdown_dialog.setWindowTitle(tr('Codexon 종료 중'))
+        self.shutdown_dialog.setCancelButton(None)
+        self.shutdown_dialog.setWindowFlag(Qt.WindowCloseButtonHint,False)
+        self.shutdown_dialog.setWindowModality(Qt.ApplicationModal)
+        self.shutdown_dialog.setMinimumDuration(0)
+        self.shutdown_dialog.show()
+        update=getattr(self,'update_panel',None)
+        workers=[self.worker,panel.operation if panel else None,update.operation if update else None]
+        self.shutdown_operation=ShutdownOperation(panel.manager if managed else None,
+            self.snapshot['homes'],self.index_path,self.model_evidence_path,workers,self)
+        self.shutdown_operation.progress.connect(lambda text:self.shutdown_dialog.setLabelText(tr(text)))
+        self.shutdown_operation.finished.connect(self.shutdown_finished)
+        self.shutdown_operation.start()
+
+    def shutdown_finished(self):
+        error=self.shutdown_operation.error
+        self.shutdown_dialog.close()
+        if error:
+            self._closing=False
+            QMessageBox.warning(self,tr('안전한 종료 확인 필요'),
+                tr('진행 중 작업을 강제로 끊지 않았습니다. 종료를 다시 누르면 이어서 확인합니다.')+'\n'+error)
+            return
+        self.finish_quit()
+
+    def finish_quit(self):
+        self.quitting=True
         self.tray.hide()
         self.taskbar_quota.close()
         self.release_scene()
