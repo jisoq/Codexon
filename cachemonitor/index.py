@@ -416,7 +416,7 @@ class UsageIndex:
         # Retain their observed events, but absent sources cannot be queued work.
         self.queue=deque((path,row[0],row[1]) for path,row in files.items() if row[2]<row[3] and Path(path).exists())
         self.done_files=len(files)-len(self.queue)
-        complete=bool(files) and not self.queue
+        complete=not self.queue
         if complete:self.last_usage_success=now
         return self.snapshot(now,changed,complete,[])
 

@@ -174,6 +174,18 @@ def test_legacy_missing_rollout_keeps_history_without_blocking_completion(tmp_pa
     finally:reader.close();writer.close()
 
 
+def test_empty_legacy_index_is_complete(tmp_path):
+    from cachemonitor.index import UsageIndex
+    home=tmp_path/'empty home';home.mkdir();path=tmp_path/'index.sqlite'
+    writer=UsageIndex([home],path);writer.poll(10010)
+    reader=UsageIndex([home],path,read_only=True)
+    try:
+        snapshot=reader.poll(10011)
+        assert snapshot['sessions']==[] and snapshot['usage_collection_complete']
+        assert snapshot['index']['files']==0 and not snapshot['index']['loading']
+    finally:reader.close();writer.close()
+
+
 def test_missing_or_stalled_service_only_requests_service_restart(tmp_path,monkeypatch):
     from cachemonitor.index import UsageIndex
     from cachemonitor.usage_collection import CollectionClient,CollectorService
@@ -206,19 +218,72 @@ def test_service_collects_all_requested_homes(tmp_path):
     worker=CollectionClient([first],path,worker=True,autostart=False)
     try:
         service.poll(10010);assert gui.poll(10010)['index']['loading']
-        service.poll(10011);both=gui.poll(10011);own=worker.poll(10011)
+        produced=service.poll(10011)
+        produced['unassigned']=[dict(home=str(first),turn='one'),dict(home=str(second),turn='two')]
+        produced['quota']={'account':'first'}
+        service.channel.publish(produced,service.epoch,service.sequence+1)
+        both=gui.poll(10011);own=worker.poll(10011)
         assert {s['home'] for s in both['sessions']}=={str(first),str(second)}
         assert {s['home'] for s in own['sessions']}=={str(first)}
         assert not both['index']['loading']
+        assert both['homes']==[str(second),str(first)] and both['quota'] is None
+        assert own['unassigned']==[dict(home=str(first),turn='one')]
     finally:gui.close();worker.close();service.close()
 
 
-def _collect_in_process(home,path):
+def test_subscription_merge_preserves_primary_home(tmp_path):
+    from cachemonitor.usage_collection import CollectionChannel
+    homes=[tmp_path/'z-primary',tmp_path/'a-secondary'];extra=tmp_path/'b-extra'
+    service=CollectionChannel(homes,tmp_path/'index.sqlite')
+    consumer=CollectionChannel([extra,homes[1]],tmp_path/'index.sqlite')
+    try:
+        consumer.subscribe(100)
+        assert service.requested_homes(101)==[str(h.resolve()) for h in [*homes,extra]]
+    finally:consumer.close();service.close()
+
+
+def test_scheduler_timeout_is_reported_and_retried(tmp_path,monkeypatch):
+    import subprocess
+    from cachemonitor.usage_collection import CollectionClient
+    from cachemonitor.observer_task import ObserverTask
+    calls=[]
+    def timeout(*args,**kwargs):calls.append(1);raise subprocess.TimeoutExpired('scheduler',20)
+    monkeypatch.setattr(ObserverTask,'start',timeout)
+    client=CollectionClient([tmp_path/'home'],tmp_path/'index.sqlite')
+    try:
+        assert '백그라운드 수집기 시작 지연' in client.poll(100)['errors']
+        client.poll(101);assert len(calls)==1
+        assert '백그라운드 수집기 시작 지연' in client.poll(131)['errors']
+        assert len(calls)==2
+    finally:client.close()
+
+
+def test_conflicting_evidence_scope_is_rejected_without_replacing_collector(tmp_path,monkeypatch):
+    from cachemonitor.usage_collection import CollectionClient,CollectorService,empty_snapshot
+    from cachemonitor.observer_task import ObserverTask
+    home=tmp_path/'home';path=tmp_path/'index.sqlite'
+    service=CollectorService([home],path,tmp_path/'first.sqlite')
+    client=CollectionClient([home],path,tmp_path/'second.sqlite')
+    def unexpected(*args,**kwargs):raise AssertionError('Conflicting client started a collector')
+    monkeypatch.setattr(ObserverTask,'start',unexpected)
+    try:
+        service.channel.publish(empty_snapshot([str(home)],path,100),service.epoch,1)
+        rejected=client.poll(101)
+        assert rejected['sessions']==[] and not rejected['index']['loading']
+        assert '다른 관측 DB' in rejected['errors'][0]
+        assert service.channel.db.execute('SELECT count(*) FROM consumers').fetchone()[0]==0
+        assert service.channel.read()['errors']==[] and not service.stopping()
+    finally:client.close();service.close()
+
+
+def _collect_in_process(home,path,version=None):
     import time
+    from cachemonitor import usage_collection
+    if version:usage_collection.VERSION=version
     from cachemonitor.usage_collection import CollectorService
     service=CollectorService([home],path)
     try:
-        while True:
+        while not service.stopping():
             service.poll();time.sleep(.05)
     finally:service.close()
 
@@ -267,3 +332,64 @@ def test_service_survives_gui_close_and_restarts_as_separate_process(tmp_path,mo
         for process in processes:
             if process.is_alive():process.terminate()
             process.join(3)
+
+
+def test_fresh_old_collector_is_replaced_cooperatively(tmp_path,monkeypatch):
+    import multiprocessing as mp,time
+    from cachemonitor.usage_collection import CollectionClient,VERSION
+    from cachemonitor.observer_task import ObserverTask
+    from test_core import fixture_home
+    home,_=fixture_home(tmp_path);path=tmp_path/'index.sqlite'
+    context=mp.get_context('spawn');processes=[];configured=[]
+    def launch(version=None):
+        process=context.Process(target=_collect_in_process,args=(str(home),str(path),version))
+        process.start();processes.append(process);return process
+    old=launch('2026.09.25.5');client=CollectionClient([home],path,autostart=False)
+    monkeypatch.setattr(ObserverTask,'configure',lambda self,command,autostart:configured.append(command))
+    monkeypatch.setattr(ObserverTask,'start',lambda *args,**kwargs:launch())
+    try:
+        deadline=time.monotonic()+10
+        while time.monotonic()<deadline:
+            before=client.poll()
+            if before.get('collection',{}).get('pid')==old.pid:break
+            time.sleep(.05)
+        assert before['collection']['version']=='2026.09.25.5'
+        client.autostart=True;client.poll()
+        old.join(3);assert not old.is_alive() and old.exitcode==0
+        assert configured and len(processes)==2
+        deadline=time.monotonic()+10
+        while time.monotonic()<deadline:
+            after=client.poll()
+            if after.get('collection',{}).get('pid')==processes[-1].pid:break
+            time.sleep(.05)
+        assert after['collection']['version']==VERSION and after['sessions']
+        assert after['collection']['instance']!=before['collection']['instance']
+    finally:
+        client.close()
+        for process in processes:
+            if process.is_alive():process.terminate()
+            process.join(3)
+
+
+@pytest.mark.parametrize('borrowed',[False,True])
+def test_snapshot_command_cleans_only_its_own_collector(tmp_path,borrowed):
+    import json,subprocess,sys
+    from pathlib import Path
+    from cachemonitor.usage_collection import locked,CollectorService
+    from cachemonitor.observer_task import ObserverTask
+    from test_core import fixture_home
+    home,_=fixture_home(tmp_path);path=tmp_path/'index.sqlite'
+    task=ObserverTask(str(path),role='UsageCollector')
+    before=task.inspect() if sys.platform=='win32' else None
+    service=CollectorService([home],path) if borrowed else None
+    try:
+        if service:service.poll()
+        result=subprocess.run([sys.executable,str(Path(__file__).resolve().parents[1]/'run.py'),
+            '--snapshot','--codex-home',str(home),'--index-path',str(path)],capture_output=True,text=True,encoding='utf-8',timeout=40)
+        assert result.returncode==0,result.stderr
+        assert json.loads(result.stdout)['sessions']
+        assert locked(path.with_suffix('.collector.lock'))==borrowed
+        if service:assert not service.stopping()
+        if before is not None:assert task.inspect()==before
+    finally:
+        if service:service.close()
