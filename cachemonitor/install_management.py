@@ -82,6 +82,7 @@ def activate_proxy(manager):
     status = manager.status()
     if not status.get('configured'):
         return dict(phase='off', message='프록시 사용 꺼짐')
+    if getattr(manager,'shared_cache_worker',False):return manager.update_proxy()['update']
     manager.configure_check()
     health = status.get('health') or {}
     if health:
@@ -139,6 +140,9 @@ def finish(root, product, recovery, *, isolated=False, launch=True, language='ko
             activation.rollback()
             raise
         if not isolated:
+            from .observer_task import retire_desktop_startups
+            try:retire_desktop_startups(root)
+            except RuntimeError as exc:receipt['startup_warning']=str(exc)
             result_path = root/'connection-update.json'
             try:
                 result = subprocess.run([str(exe),'--complete-install','--control-report',str(result_path)],
@@ -213,7 +217,14 @@ def complete_main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--control-report',type=Path,required=True)
     args=parser.parse_args()
-    try:result=activate_proxy(target())
+    try:
+        from .launch_context import cache_paths,resolve_homes
+        paths=cache_paths()
+        if paths.get('index_path') and paths.get('evidence_path'):
+            from .cache_worker_control import CacheWorkerManager
+            manager=CacheWorkerManager(resolve_homes()[0],paths['index_path'],paths['evidence_path'])
+        else:manager=target()
+        result=activate_proxy(manager)
     except Exception as exc:result=dict(phase='recovery_required',error=str(exc))
     atomic_write(args.control_report,json.dumps(result,ensure_ascii=False).encode())
     return 1 if result.get('error') else 0

@@ -29,7 +29,7 @@ class CacheHealth:
                 and not any(row.get(k) for k in ('observation_missing','cache_policy_conflict','model_conflict','mode_conflict','input_conflict')))
 
     def update(self,rows):
-        rows=[r for r in rows if r.get('purpose')!='maintenance']
+        rows=[r for r in rows if r.get('purpose') not in ('maintenance','diagnostic')]
         rows=sorted(rows,key=lambda r:r['ts'])
         if len(rows)<len(self.rows) or any(a is not b for a,b in zip(self.rows,rows)):
             self.reset();self.rows=[]

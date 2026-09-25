@@ -37,7 +37,8 @@ def expiry(engine,q):
     return min(candidates)
 
 
-def process_main(connection,homes,index_path,static_snapshot=None,model_evidence_path=None):
+def process_main(connection,homes,index_path,static_snapshot=None,model_evidence_path=None,quota_path=None):
+    quota_path=quota_path or ledger_path(index_path)
     index=None
     ledger=None
     ledger_issue=None
@@ -47,7 +48,7 @@ def process_main(connection,homes,index_path,static_snapshot=None,model_evidence
     def disable_ledger(error):
         nonlocal ledger,ledger_issue,ledger_retry,ledger_failures
         from .quota_diagnostics import record_failure, storage_issue
-        record_failure(ledger_path(index_path), 'usage ledger sync', error)
+        record_failure(quota_path, 'usage ledger sync', error)
         ledger_issue=storage_issue(error)
         ledger_failures+=1
         ledger_retry=time.monotonic()+min(60,5*2**min(ledger_failures-1,4))
@@ -70,7 +71,7 @@ def process_main(connection,homes,index_path,static_snapshot=None,model_evidence
             engine.ingest(snapshot['sessions'])
         else:
             index=UsageIndex(homes,index_path,model_evidence_path)
-            try:ledger=QuotaLedger(ledger_path(index_path))
+            try:ledger=QuotaLedger(quota_path)
             except sqlite3.Error as error:disable_ledger(error)
         def publish():
             light=publisher.publish(snapshot,engine,overlays.collect(engine))
@@ -93,7 +94,7 @@ def process_main(connection,homes,index_path,static_snapshot=None,model_evidence
             if not frozen and time.monotonic()>=next_poll:
                 snapshot=index.poll()
                 if ledger is None and time.monotonic()>=ledger_retry:
-                    try:ledger=QuotaLedger(ledger_path(index_path))
+                    try:ledger=QuotaLedger(quota_path)
                     except sqlite3.Error as error:disable_ledger(error)
                 if ledger:
                     try:ledger.enrich_modes(snapshot)
@@ -142,10 +143,11 @@ class AnalysisBridge(QThread):
     result=Signal(object)
     failure=Signal(str)
     record=Signal(object)
-    def __init__(self,homes,index_path=None,static_snapshot=None,model_evidence_path=None):
+    def __init__(self,homes,index_path=None,static_snapshot=None,model_evidence_path=None,quota_path=None):
         super().__init__()
         self.homes,self.index_path,self.static_snapshot=homes,index_path,static_snapshot
         self.model_evidence_path=model_evidence_path
+        self.quota_path=quota_path
         self.lock=threading.Lock()
         self.pending=None
         self.commands=[]
@@ -172,7 +174,7 @@ class AnalysisBridge(QThread):
             receiver=SnapshotReceiver()
             context=mp.get_context('spawn')
             parent,child=context.Pipe()
-            self.process=context.Process(target=process_main,args=(child,self.homes,self.index_path,self.static_snapshot,self.model_evidence_path),daemon=True)
+            self.process=context.Process(target=process_main,args=(child,self.homes,self.index_path,self.static_snapshot,self.model_evidence_path,self.quota_path),daemon=True)
             try:
                 self.process.start()
             except (OSError,RuntimeError) as error:

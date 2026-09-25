@@ -75,8 +75,11 @@ GROUPS = {
 
 # First match wins: QML and shared helpers must not fall through to a broad UI gate.
 RULES = (
+    ('cachemonitor/cache_db.py', ('cache','cache_ui','cache_connection','proxy_lifecycle')),
+    ('tools/cache_runtime.py', ('cache',)),
     ('cachemonitor/cache_operating.py', ('cache','cache_ui','cache_connection')),
     ('cachemonitor/cache_panel.py', ('cache_ui','cache_connection')),
+    ('cachemonitor/cache_worker_control.py', ('observer','cache','proxy_lifecycle')),
     ('cachemonitor/cache_hooks.py', ('cache','cache_ui','cache_connection')),
     ('cachemonitor/cache_control.py', ('cache','cache_ui','cache_connection')),
     ('cachemonitor/cache_integration.py', ('cache','data','cost','quota_store')),

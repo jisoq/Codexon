@@ -13,6 +13,141 @@ from test_cache_management import body,response
 from cachemonitor.cache_operating import target
 
 
+def test_panel_recovers_after_temporary_storage_error(tmp_path,monkeypatch):
+    import sqlite3
+    app=QApplication.instance() or QApplication([])
+    panel=CachePanel('home',tmp_path/'index.sqlite',active=True)
+    original=panel.control.requests
+    try:
+        monkeypatch.setattr(panel.control,'requests',lambda:(_ for _ in ()).throw(sqlite3.OperationalError('database is locked')))
+        panel.poll();assert panel.timer.isActive()
+        monkeypatch.setattr(panel.control,'requests',original)
+        panel.poll();assert panel.control.get('ui_heartbeat')>=time.time()-1
+        assert panel.timer.isActive()
+    finally:panel.stop()
+
+
+def test_dashboard_survives_boot_schema_lock_and_restores_saved_cache_settings(tmp_path):
+    import sqlite3
+    from PySide6.QtCore import QSettings
+    from cachemonitor.cache_control import Control,control_path
+    from cachemonitor.cache_execution import Journal
+    from cachemonitor.dashboard import Dashboard
+    from test_ui import snapshot
+    app=QApplication.instance() or QApplication([])
+    previous=app.property('cachemonitorDisableShellIntegration');app.setProperty('cachemonitorDisableShellIntegration',True)
+    index=tmp_path/'index.sqlite';path=control_path(index)
+    saved=Control(path)
+    for key in ('enabled','automatic','guard'):saved.set(key,True)
+    saved.db.execute('PRAGMA user_version=0');saved.close()
+    journal=Journal(path);key=journal.reserve('fixture','session',0,body(),'pending');journal.sent(key);journal.close()
+    writer=sqlite3.connect(path,isolation_level=None)
+    writer.execute('PRAGMA user_version=0');writer.execute('BEGIN IMMEDIATE')
+    window=None
+    try:
+        window=Dashboard(['fixture'],start_worker=False,settings=QSettings(str(tmp_path/'ui.ini'),QSettings.IniFormat),
+            index_path=index,cache_control=True,static_snapshot=snapshot(),live_limits=False)
+        window.show();QTest.qWait(100)
+        assert window.cache_panel.control is None and not window.cache_master.isEnabled()
+        window.open_settings();QTest.qWait(30)
+        assert window.current_page==4 and window.cache_panel.timer.isActive()
+        writer.rollback()
+        until=time.monotonic()+3
+        while window.cache_panel.control is None and time.monotonic()<until:QTest.qWait(50)
+        assert window.cache_master.isEnabled() and window.cache_master.isChecked()
+        assert window.nav.count()==5 and window.cache_panel.control.enabled('automatic')
+        assert window.cache_panel.control.enabled('guard')
+        assert window.cache_panel.journal.rows()[0]['state']=='sent'
+        assert not window.qml_errors
+    finally:
+        writer.close()
+        if window:
+            window.cache_panel.stop();window.observer_panel.stop();window.quitting=True;window.tick.stop();window.tray.hide();window.close()
+        app.setProperty('cachemonitorDisableShellIntegration',previous)
+
+
+def test_forecast_survives_automatic_policy_and_execution_states_but_not_context_or_expiry(tmp_path):
+    import asyncio
+    from cachemonitor.cache_scheduler import Scheduler
+    from cachemonitor.cache_integration import enrich
+    app=QApplication.instance() or QApplication([])
+    index=tmp_path/'index.sqlite';panel=CachePanel('home',index,active=True);host=mount(panel)
+    scheduler=Scheduler('home',panel.path,continuous_capture=True)
+    try:
+        row=dict(profile(),turn='t',ts=time.time(),key='original')
+        enrich([dict(home='home',id='session',history=[row])],index,time.time())
+        request=body();result=dict(response(),id='original')
+        scheduler.executor.contexts.completed(request,result)
+        scheduler.snapshot(request,result,time.monotonic(),URL,HEADERS,False)
+        snapshot=scheduler.snapshots['session']
+        observed=scheduler.policy('session',snapshot,observe=True)
+        panel.poll();label=panel.estimate.text()
+        assert '유지 1회 예상' in label
+        scheduler.control.set('automatic',True)
+        decision=scheduler.policy('session',snapshot)
+        assert decision.get('maintenance_expected')==observed['maintenance_expected']
+        assert not decision.get('observation_only') and not decision.get('passive_analysis')
+        for status in (decision,dict(state='reserved'),dict(state='completed'),dict(state='stopped',reason='revoked')):
+            scheduler.control.status('home','session',status)
+            panel.poll();assert panel.estimate.text()==label
+        forecast=scheduler.control.forecasts('home',time.time())[0]
+        scheduler.control.forecast('home','session',dict(forecast,cost_valid_until=time.time()-1))
+        panel.poll();assert '수집하고' in panel.estimate.text()
+        scheduler.control.forecast('home','session',forecast)
+        scheduler.control.profile('home','session',dict(row,key='changed',ts=row['ts']+1,model='gpt-6-astra'))
+        panel.poll();assert '수집하고' in panel.estimate.text()
+        assert not host.qml_errors
+    finally:asyncio.run(scheduler.close());panel.stop();dispose(host)
+
+
+def test_master_switch_navigation_and_independent_features(tmp_path):
+    from PySide6.QtCore import QSettings
+    from cachemonitor.dashboard import Dashboard
+    from test_ui import snapshot
+    from cachemonitor.fonts import load_bundled_fonts
+    app=QApplication.instance() or QApplication([]);load_bundled_fonts()
+    previous=app.property('cachemonitorDisableShellIntegration');app.setProperty('cachemonitorDisableShellIntegration',True)
+    settings=QSettings(str(tmp_path/'settings.ini'),QSettings.IniFormat)
+    settings.setValue('ui/theme','light')
+    def create():
+        window=Dashboard(['fixture'],start_worker=False,settings=settings,index_path=tmp_path/'index.sqlite',
+                         cache_control=True,static_snapshot=snapshot(),live_limits=False)
+        window.show();QTest.qWait(80);return window
+    def close(window):
+        window.cache_panel.stop();window.observer_panel.stop();window.quitting=True;window.tick.stop();window.tray.hide();window.close()
+    window=create()
+    try:
+        assert window.nav.count()==4
+        window.open_settings();window.settings_page.reveal(6);QTest.qWait(60)
+        assert window.settings_page.navigation.currentText()=='캐시 관리'
+        assert [window.settings_page.navigation.itemText(i) for i in range(7)]==[
+            '일반','작업표시줄 위젯','세션 오버레이','캐시 관리','알림','프록시','정보·문제 해결']
+        click(window,control(window,window.cache_master));assert window.nav.count()==5
+        window.nav.setCurrentRow(4);QTest.qWait(80)
+        assert window.current_page==5 and window.heading.text()=='캐시 관리'
+        panel=window.cache_panel
+        click(window,control(window,panel.toggles['guard']))
+        assert panel.control.enabled('guard') and not panel.control.enabled('automatic')
+        click(window,control(window,panel.toggles['automatic']))
+        assert panel.control.enabled('guard') and panel.control.enabled('automatic')
+        assert window.grab().save(str(tmp_path/'cache-dashboard.png'))
+        window.resize(1000,700);QTest.qWait(100)
+        assert window.grab().save(str(tmp_path/'cache-dashboard-small.png'))
+        window.cache_master.setChecked(False)
+        assert window.current_page==4 and window.nav.count()==4
+        assert not panel.control.enabled('guard') and not panel.control.enabled('automatic')
+        assert panel.control.get('selection:guard') and panel.control.get('selection:automatic')
+        assert not panel.control.get('guard') and not panel.control.get('automatic')
+        assert not window.qml_errors
+        close(window);window=create()
+        assert not window.cache_master.isChecked() and window.nav.count()==4
+        window.cache_master.setChecked(True)
+        assert window.cache_panel.control.enabled('guard') and window.cache_panel.control.enabled('automatic')
+        assert not window.cache_panel.journal.operations.grants()
+    finally:
+        close(window);app.setProperty('cachemonitorDisableShellIntegration',previous)
+
+
 def test_rendered_hook_approval_cancel_close_timeout_and_disconnect(tmp_path):
     app=QApplication.instance() or QApplication([])
     panel=CachePanel('home',tmp_path/'index.sqlite',active=True)
@@ -49,11 +184,12 @@ def test_rendered_hook_approval_cancel_close_timeout_and_disconnect(tmp_path):
         assert '이력 추가만으로 활성화되지 않음' in panel.status.text()
         assert '시험 호출은 자동으로 보내지 않습니다' in panel.activation.text()
         panel.control.status('home','s',dict(state='observing',observation_only=True,observed_at=time.time(),
+            snapshot='original',
             model='gpt-6-astra',effort='high',service_tier='Standard',source_transport='WebSocket',maintenance_transport='HTTP',
             maintenance_expected=.012,maintenance_adverse=.1,cost_stop_scenario=.024,operating_scope_available=False))
         panel.poll()
         assert '관측 전용' in panel.status.text() and '사용자 WebSocket' in panel.forecast.text()
-        assert '현재 모델은 초기 운용 대상 밖' in panel.forecast.text()
+        assert '현재 문맥은 실행 범위 밖' in panel.forecast.text()
         assert not panel.consent_button.isEnabled()
         assert host.grab().save(str(tmp_path/'cache-settings.png'))
         assert not host.qml_errors

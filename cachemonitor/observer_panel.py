@@ -22,15 +22,15 @@ class ObserverOperation(QThread):
 
 class ObserverPanel(Group):
     status_observed=Signal(dict)
-    def __init__(self,home,directory=None,active=False,parent=None):
+    def __init__(self,home,directory=None,active=False,parent=None,manager=None):
         super().__init__(parent)
-        self.manager=ObserverManager(home,directory)
+        self.manager=manager or ObserverManager(home,directory)
         self.operation=None;self.active=active;self.enabled=False
         self.pending=None;self.last_result={};self.operation_name=''
         layout=Column(self);layout.setContentsMargins(0,0,0,10);layout.setSpacing(16)
         row=Row();copy=Column()
         title=Text('프록시 사용');title.setStyleSheet('font-weight: 500;');copy.addWidget(title)
-        description=Text('호출·응답 모델 확인 · 켤 때 검증 호출 1회')
+        description=Text('모델 관측과 캐시 관리가 같은 연결을 사용합니다.' if manager else '호출·응답 모델 확인 · 켤 때 검증 호출 1회')
         description.setWordWrap(True);description.setStyleSheet('color: muted; font-size: 12px;')
         copy.addWidget(description);row.addLayout(copy,1)
         self.toggle=Switch();self.toggle.setAccessibleName('프록시 사용');row.addWidget(self.toggle)
@@ -132,6 +132,8 @@ class ObserverPanel(Group):
         self.runtime_values['guard'].setText(('프록시 내부 관리' if health.get('lifecycle')=='managed' else '이전 독립 감시') if runtime.get('phase') in ('ready','active','draining') else '실행 상태 확인 필요')
         if health and not health.get('control_id') and runtime.get('phase') in ('ready','active','draining'):
             self.runtime_values['guard'].setText('작동 중 · 이전 프록시는 연결 장애만 감시')
+        if state.get('shared_cache_worker'):
+            self.runtime_values['guard'].setText('모델 관측·캐시 관리 통합 연결 · '+state['url'])
         startup=('켜짐' if registration.get('autostart') else '꺼짐') if registration is not None else '확인 중'
         if state.get('registration_issue'):startup='확인 필요: '+state['registration_issue']
         self.runtime_values['startup'].setText(startup)
