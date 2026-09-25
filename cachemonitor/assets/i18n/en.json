@@ -1782,5 +1782,16 @@
   "훅 연결 실패: ": "Hook connection failed: ",
   "훅 이벤트 미수집 · 신뢰 설정과 실제 실행은 별도입니다": "No hook events collected · trusting a command and actually running it are separate",
   "훅 파일 연결 완료 · Codex에서 신뢰 허용 필요": "Hook file connected · trust approval in Codex is required",
-  "작업기 실행 중 · 새 요청 연결 꺼짐": "Worker running · routing for new requests is off"
+  "작업기 실행 중 · 새 요청 연결 꺼짐": "Worker running · routing for new requests is off",
+  "새 버전 {version}을 설치하시겠습니까?": "Install the new version {version}?",
+  "앱은 최신 버전입니다. 연결 구성요소를 확인하고 적용하시겠습니까?": "The app is up to date. Check and apply connection component updates?",
+  "업데이트 중 Codex 연결이 끊길 수 있습니다. 진행 중인 응답과 서버 호출이 모두 끝난 뒤 진행해 주세요. 계속하시겠습니까?": "Updating may disconnect Codex. Wait until all active responses and server requests have finished before proceeding. Continue?",
+  "업데이트 확인": "Check for updates",
+  "설치": "Install",
+  "나중에": "Later",
+  "업데이트를 취소했습니다.": "Update cancelled.",
+  "켜짐 · 독립 실행": "On · starts independently",
+  "Codexon과 함께 실행 · 일반 설정의 자동 시작을 따름": "Starts with Codexon · follows startup in General settings",
+  "확인 시점에 프록시 연결 {count}개가 열려 있습니다. 대기 중인 연결도 포함됩니다.": "At the time of this check, {count} proxy connections are open, including idle connections.",
+  "현재 프록시 연결 수를 확인하지 못했습니다.": "The current proxy connection count could not be determined."
 }

@@ -135,7 +135,7 @@ class ObserverPanel(Group):
             self.runtime_values['guard'].setText('작동 중 · 이전 프록시는 연결 장애만 감시')
         if state.get('shared_cache_worker'):
             self.runtime_values['guard'].setText('모델 관측·캐시 관리 통합 연결 · '+state['url'])
-        startup=('켜짐' if registration.get('autostart') else '꺼짐') if registration is not None else '확인 중'
+        startup=('켜짐 · 독립 실행' if registration.get('autostart') else 'Codexon과 함께 실행 · 일반 설정의 자동 시작을 따름') if registration is not None else '확인 중'
         if state.get('registration_issue'):startup='확인 필요: '+state['registration_issue']
         self.runtime_values['startup'].setText(startup)
         self.runtime_values['path'].setText(str(state.get('running_proxy_path') or ('실행 경로 미확인' if health else '실행 안 됨')))
