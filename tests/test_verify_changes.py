@@ -31,6 +31,11 @@ def test_small_ui_changes_select_their_consumer_without_backend_or_package_check
 
 
 def test_calculation_protocol_and_unknown_changes_have_explicit_gates():
+    for source in ('cachemonitor/cache_execution.py','cachemonitor/cache_capture.py','cachemonitor/model_proxy.py',
+                   'cachemonitor/cache_scheduler.py','cachemonitor/cache_control.py','cachemonitor/cache_hooks.py','cachemonitor/cache_operating.py'):
+        chosen=select_tests({source})
+        assert 'tests/test_cache_codex_connection.py' in chosen['tests']
+        assert not chosen['full']
     price = select_tests({'cachemonitor/pricing.py'})
     assert {'tests/test_pricing.py', 'tests/test_quota_tracking_integration.py',
             'tests/test_session_costs.py'} <= set(price['tests'])

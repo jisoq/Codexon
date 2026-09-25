@@ -98,3 +98,49 @@ def test_apply_requires_recent_test_for_same_service(tmp_path,monkeypatch,instan
     with pytest.raises(RuntimeError):control.enable()
     assert control.config_path.read_text()=='model = "safe"\n'
     assert registry['value']=='previous startup command'
+def test_cache_worker_reuses_single_configured_route_without_model_probe(tmp_path,monkeypatch):
+    from cachemonitor.cache_worker_control import CacheWorkerManager
+    from cachemonitor.version import PROXY_VERSION
+    from types import SimpleNamespace
+    home=tmp_path/'home';home.mkdir();(home/'config.toml').write_text('openai_base_url="http://127.0.0.1:18771"\n')
+    index=tmp_path/'analysis'/'index.sqlite';index.parent.mkdir()
+    monkeypatch.chdir(tmp_path)
+    manager=CacheWorkerManager(home,'analysis/index.sqlite','model-evidence.sqlite');calls=[]
+    assert manager.index==index.resolve() and manager.evidence==(tmp_path/'model-evidence.sqlite').resolve()
+    assert manager.directory==tmp_path.resolve() and manager.control_lock.is_absolute()
+    manager.health_state='ok'
+    monkeypatch.setattr(manager,'health',lambda **kw:dict(cache_management=True,version=PROXY_VERSION,active_connections=3))
+    manager.task=SimpleNamespace(inspect=lambda:dict(registered=True,autostart=True),
+        configure=lambda command,**kw:calls.append((command,kw)),
+        start=lambda *a,**kw:(_ for _ in ()).throw(AssertionError('Second proxy started')))
+    assert manager.ensure()['configured'] and manager.url=='http://127.0.0.1:18771'
+    assert manager.turn_on()['shared_cache_worker']
+    assert '--cache-worker' in calls[0][0] and '--cache-observe-only' not in calls[0][0]
+    assert calls[0][0][-1]=='18771'
+    assert calls[0][0][calls[0][0].index('--upstream')+1]=='openai'
+    (home/'auth.json').write_text('{"auth_mode":"chatgpt"}')
+    assert manager.command()[manager.command().index('--upstream')+1]=='chatgpt'
+    assert manager.command('openai')[manager.command('openai').index('--upstream')+1]=='openai'
+    assert not manager.turn_off()['configured']
+    assert 'openai_base_url' not in (home/'config.toml').read_text()
+    restored=CacheWorkerManager(home,index,tmp_path/'model-evidence.sqlite')
+    assert restored.url=='http://127.0.0.1:18771'
+
+
+def test_cache_worker_recovery_removes_task_and_drains_without_forced_stop(tmp_path,monkeypatch):
+    from types import SimpleNamespace
+    from cachemonitor import observer_control
+    from cachemonitor.cache_worker_control import CacheWorkerManager
+    home=tmp_path/'custom';home.mkdir()
+    (home/'config.toml').write_text('openai_base_url="http://127.0.0.1:18772"\nmodel="preserve"\n')
+    manager=CacheWorkerManager(home,tmp_path/'index.sqlite',tmp_path/'evidence.sqlite')
+    manager.health_state='ok'
+    identity='a'*32;removed=[]
+    monkeypatch.setattr(observer_control,'startup_value',lambda *a:None)
+    monkeypatch.setattr(manager,'health',lambda **kw:dict(cache_management=True,control_id=identity,active_connections=1))
+    for field in ('task','legacy_task','check_task'):
+        setattr(manager,field,SimpleNamespace(remove=lambda f=field:removed.append(f),inspect=lambda:dict(registered=False)))
+    result=manager.recover_direct()
+    assert not result['configured'] and 'task' in removed
+    assert json.loads((tmp_path/('proxy-control-'+identity+'.json')).read_text())==dict(action='drain',id=identity)
+    assert (home/'config.toml').read_text()=='model="preserve"\n'

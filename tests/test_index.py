@@ -15,6 +15,26 @@ def finish(index, now=10010):
     raise AssertionError('index did not finish')
 
 
+def test_top_level_compaction_is_indexed_and_backfilled_without_private_payload(tmp_path):
+    home,path=fixture_home(tmp_path);cache=tmp_path/'index.sqlite'
+    with path.open('a',encoding='utf-8') as stream:
+        stream.write(json.dumps(event('compacted',10001,message='PRIVATE_COMPACTION_TEXT'))+'\n')
+        stream.write(json.dumps(usage('after',time=10002))+'\n')
+    for legacy in (False,True):
+        if legacy:
+            with sqlite3.connect(cache) as db:
+                db.execute("DELETE FROM events WHERE data LIKE '%compacted%'")
+                db.execute('PRAGMA user_version=3')
+        index=UsageIndex([home],cache)
+        try:
+            value=finish(index)
+            history=analyze(value['sessions'])['responses']
+            assert next(r for r in history if r['key']=='after')['compaction_epoch']==1
+            stored=''.join(r[0] for r in index.db.execute('SELECT data FROM events'))
+            assert 'compacted' in stored and 'PRIVATE_COMPACTION_TEXT' not in stored
+        finally:index.close()
+
+
 def test_split_history_dedup_effort_restart_and_private_content(tmp_path):
     home, current = fixture_home(tmp_path)
     folder = home / 'sessions'

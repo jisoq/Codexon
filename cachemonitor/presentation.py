@@ -28,7 +28,7 @@ class Node(QObject):
                            maxHeight=16777215, width=-1, height=-1, stretch=0,
                            spacing=8, margins=[0, 0, 0, 0], wrap=False,
                            rich=False, selectable=False, fontSize=14, bold=False,
-                           color='#182535', background='transparent', placeholder='',
+                           color='ink', background='transparent', placeholder='',
                            checked=False, checkable=False, index=0, items=[],
                            minimum=0, maximum=100, value=0)
 
@@ -104,17 +104,17 @@ class Node(QObject):
     def setObjectName(self,name):
         super().setObjectName(name)
         styles={'brand':dict(fontSize=21,bold=True),'heading':dict(fontSize=24,bold=True),
-                'section':dict(fontSize=16,bold=True),'muted':dict(color='#5C6C80'),
-                'number':dict(fontSize=30,bold=True,noElide=True),'sidebar':dict(background='#FFFFFF'),
-                'workspace':dict(background='#F6F8FB'),
-                'panel':dict(background='#FFFFFF',border='#D9E2EC',radius=10),
-                'summary':dict(background='#FFFFFF',border='#D9E2EC',radius=10)}
+                'section':dict(fontSize=16,bold=True),'muted':dict(color='muted'),
+                'number':dict(fontSize=30,bold=True,noElide=True),'sidebar':dict(background='surface'),
+                'workspace':dict(background='background'),
+                'panel':dict(background='surface',border='border',radius=10),
+                'summary':dict(background='surface',border='border',radius=10)}
         self.put(style=name,**styles.get(name,{}))
 
     def setStyleSheet(self,style):
         """Extract the existing design tokens; QML owns control styling."""
         size=re.search(r'font-size:\s*(\d+)px',style)
-        color=re.search(r'(?:^|[;{]\s*)color:\s*(#[0-9a-fA-F]+)',style)
+        color=re.search(r'(?:^|[;{]\s*)color:\s*([a-zA-Z_]+)',style)
         weight=re.search(r'font-weight:\s*(\d+)',style)
         values={}
         if size: values['fontSize']=int(size[1])

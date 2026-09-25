@@ -12,13 +12,13 @@ CheckBox {
     indicator: Rectangle {
         x: control.leftPadding; anchors.verticalCenter: parent.verticalCenter
         implicitWidth: 18; implicitHeight: 18; radius: 4
-        color: control.checked ? (appTheme.palette && appTheme.color("#326ba9")) : (appTheme.palette && appTheme.color("white"))
-        border.color: control.activeFocus ? (appTheme.palette && appTheme.color("#1b4d85")) : control.checked ? (appTheme.palette && appTheme.color("#326ba9")) : (appTheme.palette && appTheme.color("#98a8bb"))
+        color: control.checked ? (appTheme.palette && appTheme.color("accent")) : (appTheme.palette && appTheme.color("surface"))
+        border.color: control.activeFocus ? (appTheme.palette && appTheme.color("focus")) : control.checked ? (appTheme.palette && appTheme.color("accent")) : (appTheme.palette && appTheme.color("muted"))
         border.width: control.activeFocus ? 2 : 1
-        Text { anchors.centerIn: parent; text: "✓"; visible: control.checked; color: (appTheme.palette && appTheme.color("white")); font.pixelSize: 14 }
+        Text { anchors.centerIn: parent; text: "✓"; visible: control.checked; color: appTheme.palette.onaccent; font.pixelSize: 14 }
     }
     contentItem: Text {
-        text: control.text; font: control.font; color: control.enabled ? (appTheme.palette && appTheme.color("#344054")) : (appTheme.palette && appTheme.color("#98a2b3"))
+        text: control.text; font: control.font; color: control.enabled ? (appTheme.palette && appTheme.color("ink")) : (appTheme.palette && appTheme.color("unknown"))
         leftPadding: control.indicator.width + control.spacing
         verticalAlignment: Text.AlignVCenter
     }

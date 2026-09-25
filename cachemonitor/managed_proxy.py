@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import json
 import os
 import time
 import uuid
+from contextlib import ExitStack
 
 from .model_evidence import home_key
 from .observer_control import atomic_write
@@ -56,19 +58,36 @@ class ManagedProxy:
         from aiohttp import web
         from .model_proxy import create_app
         # Same lifetime lock as the legacy supervisor permits safe update/migration.
-        with ProcessLock(self.manager.directory / 'proxy-supervisor.lock'):
+        with ProcessLock(self.manager.directory / 'proxy-supervisor.lock'), ExitStack() as cache_lifetime:
             if not self.allowed():
                 return
             atomic_write(self.control, json.dumps({'action':'run','id':self.instance}).encode())
             stop = asyncio.Event()
+            from .cache_scheduler import Scheduler
+            from .cache_execution import execution_owner
+            scheduler=None
+            try:
+                cache_lifetime.enter_context(execution_owner(self.manager.directory/'cache-control.sqlite',proxy_owned=True))
+                scheduler=Scheduler(self.manager.home,self.manager.directory/'cache-control.sqlite')
+                scheduler.journal.recover_exclusive()
+            except (OSError,sqlite3.Error,RuntimeError):
+                if scheduler:await scheduler.close();scheduler=None
+                cache_lifetime.close()
+                # A different owner may be draining this journal. User transport
+                # can run without cache execution; never recover that owner's rows.
             app = create_app(store, self.manager.home, endpoint, ssl_context=context,
                              control_file=self.control, control_id=self.instance,
-                             stop_event=stop, managed=self)
+                             stop_event=stop, managed=self,cache_capture=scheduler.capture if scheduler else None)
             runner = web.AppRunner(app, access_log=None)
-            await runner.setup()
+            scheduler_task=None
             try:
+                await runner.setup()
+                scheduler_task=asyncio.create_task(scheduler.serve()) if scheduler else None
                 await web.TCPSite(runner, '127.0.0.1', port).start()
                 await stop.wait()
             finally:
+                if scheduler_task:
+                    scheduler_task.cancel();await asyncio.gather(scheduler_task,return_exceptions=True)
                 await runner.cleanup()
+                if scheduler:await scheduler.close()
                 self.publish({}, 'stopped')

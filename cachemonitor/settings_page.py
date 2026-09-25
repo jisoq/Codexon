@@ -8,7 +8,8 @@ from .i18n import tr
 
 class SettingsPage(Group):
     restartRequested = Signal()
-    TITLES = ('일반', '작업표시줄 위젯', '세션 오버레이', '프록시', '알림', '정보·문제 해결')
+    TITLES = ('일반', '작업표시줄 위젯', '세션 오버레이', '프록시', '알림', '정보·문제 해결', '캐시 관리')
+    ORDER = (0, 1, 2, 6, 4, 3, 5)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -16,17 +17,17 @@ class SettingsPage(Group):
         self.controls = {}
         shell = Row(self); shell.setContentsMargins(0, 0, 0, 0); shell.setSpacing(24)
         self.navigation = Navigation(); self.navigation.setObjectName('settingsNavigation')
-        self.navigation.addItems(self.TITLES); self.navigation.setFixedWidth(160)
+        self.navigation.addItems([self.TITLES[i] for i in self.ORDER]); self.navigation.setFixedWidth(160)
         self.navigation.setStyleSheet('Navigation { border: none; background: transparent; } '
             'Navigation::item { padding: 11px 12px; border-radius: 5px; margin-bottom: 3px; } '
-            'Navigation::item:selected { background: #e8edf2; color: #233444; }')
+            'Navigation::item:selected { background: selection; color: ink; }')
         self.stack = Stack()
         shell.addWidget(self.navigation); shell.addWidget(self.stack, 1)
         self.layouts = []; self.scrollers = []
         for title in self.TITLES:
             area = Scroll(); area.setWidgetResizable(True)
             body = Group();body.setObjectName('settingsBody')
-            body.setStyleSheet('Group#settingsBody { background: white; }')
+            body.put(background='surface')
             layout = Column(body); layout.setContentsMargins(4, 3, 12, 18)
             layout.setSpacing(0)
             heading = Text(title); heading.setStyleSheet('font-size: 19px; font-weight: 600;')
@@ -34,9 +35,10 @@ class SettingsPage(Group):
             layout.addWidget(heading); layout.addStretch()
             area.setWidget(body); self.stack.addWidget(area)
             self.layouts.append(layout); self.scrollers.append(area)
-        self.navigation.currentRowChanged.connect(self.stack.setCurrentIndex)
-        self.navigation.setCurrentRow(max(0,min(5,parent.settings.value('settings/category',0,type=int))))
-        self.navigation.currentRowChanged.connect(lambda index:parent.settings.setValue('settings/category',index))
+        self.navigation.currentRowChanged.connect(lambda row:self.stack.setCurrentIndex(self.ORDER[row]) if row>=0 else None)
+        category=max(0,min(len(self.TITLES)-1,parent.settings.value('settings/category',0,type=int)))
+        self.navigation.setCurrentRow(self.ORDER.index(category))
+        self.navigation.currentRowChanged.connect(lambda row:parent.settings.setValue('settings/category',self.ORDER[row]) if row>=0 else None)
         self.add_row(0, 'Windows 로그인 시 시작', '트레이에서 시작', self.toggle('startup'))
         self.add_row(0, '잔여량 표시', '', self.choice('quota'))
         tracking=self.toggle('weekly_tracking')
@@ -104,14 +106,14 @@ class SettingsPage(Group):
 
     def add_row(self, category, title, description, control):
         row = Group(); row.setObjectName('preferenceRow')
-        row.setStyleSheet('Group#preferenceRow { border-bottom: 1px solid #e3e7eb; }')
+        row.setStyleSheet('Group#preferenceRow { border-bottom: 1px solid border; }')
         layout = Row(row); layout.setContentsMargins(0, 20, 0, 20); layout.setSpacing(24)
         copy = Column(); copy.setSpacing(5)
         name = Text(title); name.setWordWrap(True); name.setStyleSheet('font-weight: 500;')
         copy.addWidget(name)
         if description:
             detail = Text(description); detail.setWordWrap(True)
-            detail.setStyleSheet('color: #66768c; font-size: 13px;')
+            detail.setStyleSheet('color: muted; font-size: 13px;')
             copy.addWidget(detail)
         layout.addLayout(copy, 1); layout.addWidget(control, 0, Qt.AlignVCenter)
         control.setAccessibleName(title)
@@ -164,5 +166,5 @@ class SettingsPage(Group):
         self.controls['reset_position'].setEnabled(True)
 
     def reveal(self, category, widget=None):
-        self.navigation.setCurrentRow(category)
+        self.navigation.setCurrentRow(self.ORDER.index(category))
         if widget is not None: self.scrollers[category].ensureWidgetVisible(widget)
