@@ -80,9 +80,9 @@ def error_evidence(raw,headers,body,*,http_status=None,response_headers=None,rea
     diagnostics=[];omitted=False
     def project(value,depth=0):
         nonlocal omitted
-        if depth>12:omitted=True;return None
+        if depth>12:omitted=True;return []
         if isinstance(value,dict):
-            out={}
+            out={};children=[]
             for k,v in value.items():
                 if k in fields and (v is None or isinstance(v,(str,int,float,bool))):
                     sanitized=clean(v,identifier=k in ('code','type','param')) if v is not None else None
@@ -94,15 +94,16 @@ def error_evidence(raw,headers,body,*,http_status=None,response_headers=None,rea
                 elif k.lower() in ('input','instructions','tools','messages','headers','authorization','request','body','output','content'):
                     omitted=True
                 elif isinstance(v,(dict,list)):
-                    child=project(v,depth+1)
-                    if child:out[clean(k)[:64]]=child
+                    # Unknown wrappers may contain diagnostics, but their keys,
+                    # structure and scalar contents are not diagnostic evidence.
+                    omitted=True;children.extend(project(v,depth+1))
                 else:omitted=True
-            return out
+            return ([out] if out else [])+children
         if isinstance(value,list):
             if len(value)>32:omitted=True
-            return [x for v in value[:32] if (x:=project(v,depth+1))]
-        if isinstance(value,str):return clean(value)[:2048]
-        return None
+            return [item for v in value[:32] for item in project(v,depth+1)]
+        omitted=True
+        return []
     try:
         parsed=json.loads(text)
         projected=project(parsed)

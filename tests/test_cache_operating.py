@@ -23,7 +23,7 @@ URL='https://chatgpt.com/backend-api/codex/responses'
 HEADERS={'ChatGPT-Account-ID':'synthetic-account','Content-Length':'1'}
 
 
-@pytest.mark.parametrize('kind',['unsupported','schema','text','malformed','truncated','timeout','lost','empty','event','failed_event'])
+@pytest.mark.parametrize('kind',['unsupported','schema','nested','text','malformed','truncated','timeout','lost','empty','event','failed_event'])
 def test_http_error_evidence_survives_product_executor_and_journal(tmp_path,kind):
     async def scenario():
         path=tmp_path/'c.sqlite';seen=[]
@@ -43,6 +43,10 @@ def test_http_error_evidence_survives_product_executor_and_journal(tmp_path,kind
             elif kind=='schema':
                 payload={'detail':[{'code':'invalid_tool_schema','type':'validation_error','param':'tools.0',
                     'message':'Tool schema missing required property','detail':'Missing property'}]}
+            elif kind=='nested':
+                payload={'metadata':{'private_account_label':{'notes':['UNRELATED PRIVATE RESPONSE DATA',
+                    {'code':'invalid_tool_schema','type':'validation_error','param':'tools.0',
+                     'message':'Tool schema missing required property','detail':'Missing property'}]}}}
             else:payload=None
             if payload:return web.json_response(payload,status=400,headers={'x-request-id':'req-'+kind})
             if kind=='empty':return web.Response(status=400,headers={'x-request-id':'req-empty'})
@@ -73,7 +77,7 @@ def test_http_error_evidence_survives_product_executor_and_journal(tmp_path,kind
         assert row['state']=='failed' and row['input'] is None and row['cost'] is None and not row['usage_known']
         assert journal.operations.stats(journal.operations.grants()[0])['calls']==1
         assert journal.operations.grants()[0]['stopped']=='usage_unresolved'
-        if kind in ('unsupported','schema'):
+        if kind in ('unsupported','schema','nested'):
             fields={f['field']:f['value'] for f in evidence['fields']}
             assert fields['code']==('unsupported_parameter' if kind=='unsupported' else 'invalid_tool_schema')
             assert all(k in fields for k in ('code','type','param','detail','message'))
@@ -86,6 +90,7 @@ def test_http_error_evidence_survives_product_executor_and_journal(tmp_path,kind
         assert len(evidence['body'])<=2048
         stored='\n'.join(journal.db.iterdump())
         assert prompt not in stored and secret not in stored and 'synthetic-account' not in stored
+        assert 'UNRELATED PRIVATE RESPONSE DATA' not in stored and 'private_account_label' not in stored
         journal.close()
     run_proxy_test(scenario())
 
