@@ -216,9 +216,9 @@ class AnalysisBridge(QThread):
                 # Keep draining the pipe so a final snapshot cannot block the
                 # child before it commits/closes its ledger and subscription.
                 while self.process.is_alive():
-                    if parent.poll(.05):
-                        try:parent.recv()
-                        except (EOFError,OSError):break
+                    try:
+                        if parent.poll(.05):parent.recv()
+                    except (EOFError,OSError):break
                     self.process.join(.05)
                 self.process.join()
                 parent.close()
