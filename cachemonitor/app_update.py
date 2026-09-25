@@ -60,17 +60,18 @@ def launch_installer(output,root):
                                                   '/LOG='+str(output.parent/'setup.log')])
 
 
-def update(progress=lambda _:None):
+def update(progress=lambda _:None, manager=None):
     install=installed()
     if not install:
         raise RuntimeError('설치형 Codexon에서 업데이트할 수 있습니다. 설치 프로그램을 한 번 실행해 주세요.')
     progress('업데이트 확인 중…')
     release=json.loads(read_url('https://api.github.com/repos/'+REPOSITORY+'/releases/latest'))
     if version_parts(release['tag_name'])<=version_parts(VERSION):
-        from .install_management import activate_proxy
-        from .connection_recovery import target
-        state=activate_proxy(target())
-        return state.get('message') or '최신 버전입니다.'
+        from .install_management import activate_proxy, connection_manager
+        state=activate_proxy(manager if manager is not None else connection_manager())
+        if state.get('phase') == 'off':
+            return '설치할 새 버전이 없습니다.'
+        return '설치할 새 버전이 없습니다. '+(state.get('message') or '')
     asset,checksum=release_asset(release)
     text=read_url(checksum['browser_download_url'],1024).decode('ascii').strip()
     match=re.fullmatch(r'([a-fA-F0-9]{64})\s+\*?Codexon-Setup\.exe',text)

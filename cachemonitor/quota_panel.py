@@ -10,6 +10,7 @@ from PySide6.QtGui import QColor, QPen, QPolygonF
 from .presentation import Button, Choice, Column, Group, Row, Text, Toggle
 from .table_model import Cell, Header, Table
 from .pricing import usd
+from .workload import call_count
 from .quota import quota_display
 from .banked_resets import reset_credit_display
 from .quota_cycles import quota_statistics, quota_value_history
@@ -379,7 +380,7 @@ class QuotaPanel(Group):
         if period:
             self.cycle_value.setText(f"누적 소모량 {period['delta']:g}%p" if all_cycles else '선택 주기 '+usd(period['value']))
             self.cycle_basis.setText(f"주간 100%p 기준 · 누적 API {usd(period['cost'])} / 소모 {period['delta']:g}%p"
-                                    f" · 산정 {period['priced_calls']:,}/{period['calls']:,}호출")
+                                    ' · '+('산정 ' if period['priced_calls']<period['calls'] else '')+call_count(period['priced_calls'],period['calls'])+'호출')
         else:
             self.cycle_value.setText('선택 주기 —');self.cycle_basis.setText('관측된 사용량 리셋 주기가 없습니다')
         for node in (self.cycle_choice,self.cycle_value,self.cycle_basis,self.history_legend):node.setVisible(weekly)
@@ -406,7 +407,7 @@ class QuotaPanel(Group):
         self.result.setToolTip(f"전체 누적 {usd(lifetime['cost'])} ÷ {lifetime['delta']:g}%p × 100 · 주간 100%p의 관측 기반 추정")
         self.lifetime_basis.setText(
             f"주간 100%p 기준 · 누적 API {usd(lifetime['cost'])} / 소모 {lifetime['delta']:g}%p"
-            f" · 산정 {lifetime['observed_priced_calls']:,}/{lifetime['observed_calls']:,}호출"
+            ' · '+('산정 ' if lifetime['observed_priced_calls']<lifetime['observed_calls'] else '')+call_count(lifetime['observed_priced_calls'],lifetime['observed_calls'])+'호출'+
             '\n관측 기반 추정 · 수집 공백 제외' if lifetime['total'] else '계산에 필요한 관측을 기다리고 있습니다')
         self.render_history()
         days=self.period.currentData()
@@ -454,13 +455,14 @@ class QuotaPanel(Group):
 
     def render_intervals(self,*_,automatic=False):
         selected_model=self.model_choice.currentData()
-        self.intervals.setHorizontalHeaderLabels(
-            ['기간','계정 소모량','선택 모델 API','구간 API 비용 비중','산정 / 모델 호출'] if selected_model else
-            ['기간','소모량','API 환산액','주간할당량 가치','산정 / 전체 호출'])
         mode=self.interval_filter.currentData();rows=model_cost_intervals(self.statistics['intervals'],selected_model)
         if mode=='used':rows=[r for r in rows if not r['excluded']]
         elif mode=='excluded':rows=[r for r in rows if r['excluded'] or r.get('assumptions')]
         self.filtered_intervals=rows
+        partial=any(r['model_priced']<r['model_calls'] if selected_model else r.get('priced_calls',r['calls'])<r['calls'] for r in rows)
+        self.intervals.setHorizontalHeaderLabels(
+            ['기간','계정 소모량','선택 모델 API','구간 API 비용 비중','산정 / 모델 호출' if partial else '호출 수'] if selected_model else
+            ['기간','소모량','API 환산액','주간할당량 가치','산정 / 전체 호출' if partial else '호출 수'])
         self.intervals.setVisible(bool(rows))
         self.interval_empty.setVisible(not rows)
         self.interval_empty.setText('선택 조건에 맞는 구간 0개' if self.statistics['total'] else '')
@@ -494,11 +496,11 @@ class QuotaPanel(Group):
             values=[f"{clock(interval['start'])} → {clock(interval['end'])}",f"{interval['delta']:g}%p",
                     usd(interval['model_cost']),
                     f"{interval['model_share']:.1f}%" if interval['model_share'] is not None else '—',
-                    f"{interval['model_priced']:,}/{interval['model_calls']:,}"]
+                    call_count(interval['model_priced'],interval['model_calls'])]
         else:
             values=[f"{clock(interval['start'])} → {clock(interval['end'])}",f"{interval['delta']:g}%p",
                     usd(interval['cost']),usd(interval['per_percent']*100 if interval['per_percent'] is not None else None),
-                    f"{interval.get('priced_calls',interval['calls']):,}/{interval['calls']:,}"]
+                    call_count(interval.get('priced_calls',interval['calls']),interval['calls'])]
         return values[col]
 
     def select_interval(self):

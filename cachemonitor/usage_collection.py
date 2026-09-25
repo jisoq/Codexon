@@ -121,6 +121,22 @@ class CollectionClient:
 
     def ensure_service(self,now,snapshot):
         if not self.autostart or now<self.next_start:return
+        from .observer_state import read_json
+        session=read_json(self.channel.companion('.session.json'))
+        if session.get('scope')==self.channel.scope and session.get('stopped'):return
+        legacy_lock=self.path.with_suffix('.collector.lock')
+        if legacy_lock.exists() and locked(legacy_lock):
+            from .collection_lifecycle import retire_legacy
+            from .observer_task import ObserverTask
+            self.next_start=now+30
+            with ProcessLock(self.channel.companion('.collector-update.lock')):
+                # Retarget crash recovery before asking the exact old instance
+                # to commit and stop. Multi-instance prevention stays enabled.
+                task=ObserverTask(str(self.path),role='UsageCollector')
+                task.configure(self.command(),autostart=False)
+                retire_legacy(self.channel)
+                task.start(self.command(),autostart=False)
+            return
         collection=(snapshot or {}).get('collection',{})
         version=collection.get('version')
         newer=bool(version and tuple(int(p) for p in version.split('.') if p.isdigit())>
@@ -133,7 +149,7 @@ class CollectionClient:
             if active and Path(active).resolve()!=Path(sys.executable).resolve():different_binary=False
         replace=bool(collection and not newer and (version!=VERSION or different_binary))
         if newer:return
-        if snapshot and now-snapshot['ts']<=30 and not replace:return
+        if snapshot and now-snapshot['ts']<=30 and not replace and locked(self.channel.companion('.collector.lock')):return
         self.next_start=now+30
         from .observer_task import ObserverTask
         # Task Scheduler owns lifetime/restart outside the GUI's process tree.
@@ -197,13 +213,20 @@ class CollectorService:
     """Construct only in the dedicated --usage-collector background process."""
     def __init__(self,homes,path=None,evidence=None):
         self.channel=CollectionChannel(homes,path,evidence)
+        legacy_lock=self.channel.path.with_suffix('.collector.lock')
+        if legacy_lock.exists() and locked(legacy_lock):
+            self.channel.close()
+            raise RuntimeError('이전 수집기의 기록 저장과 종료 대기')
         self.lock=ProcessLock(self.channel.companion('.collector.lock'))
         try:self.lock.__enter__()
         except BaseException:self.channel.close();raise
         self.index=None;self.epoch=uuid.uuid4().hex;self.instance=uuid.uuid4().hex;self.sequence=0;self.last=None
 
     def stopping(self):
-        return self.channel.db.execute("SELECT 1 FROM control WHERE instance=? AND action='stop'",(self.instance,)).fetchone() is not None
+        from .observer_state import read_json
+        session=read_json(self.channel.companion('.session.json'))
+        return (session.get('scope')==self.channel.scope and session.get('stopped') or
+                self.channel.db.execute("SELECT 1 FROM control WHERE instance=? AND action='stop'",(self.instance,)).fetchone() is not None)
 
     def poll(self,now=None):
         from .index import UsageIndex
@@ -223,6 +246,16 @@ class CollectorService:
             if self.index:self.index.close();self.index=None
             self.channel.close()
         finally:self.lock.__exit__(None,None,None)
+
+
+def resume_collection(homes,path=None,evidence=None):
+    """Only an explicit GUI launch resumes collection after application exit."""
+    from .observer_control import atomic_write
+    channel=CollectionChannel(homes,path,evidence)
+    try:
+        with ProcessLock(channel.companion('.collector-update.lock'),timeout=30):
+            atomic_write(channel.companion('.session.json'),json.dumps(dict(scope=channel.scope,stopped=False)).encode())
+    finally:channel.close()
 
 
 def main():

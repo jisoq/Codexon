@@ -11,6 +11,12 @@ from cachemonitor.model_evidence import home_key
 from cachemonitor.observer_state import read_json
 
 
+@pytest.mark.parametrize('phase',['queued','waiting','stopping','starting','verifying','rollback'])
+def test_intentional_update_does_not_report_listener_gap_as_failure(phase):
+    result=assess(dict(configured=True,probe_state='refused',update=dict(phase=phase,message='current phase')))
+    assert result['code']=='updating' and not result['confirmed'] and result['detail']=='current phase'
+
+
 @pytest.fixture
 def manager(tmp_path,monkeypatch):
     home=tmp_path/'home';home.mkdir()

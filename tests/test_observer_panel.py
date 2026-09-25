@@ -11,16 +11,16 @@ def settle(app,panel):
     raise AssertionError('Proxy operation did not finish')
 
 
-def test_opening_panel_only_reads_existing_proxy_state(tmp_path,monkeypatch):
+def test_opening_panel_resumes_app_owned_services_once(tmp_path,monkeypatch):
     from cachemonitor.observer_control import ObserverManager
     app=QApplication.instance() or QApplication([])
     calls=[]
     monkeypatch.setattr(ObserverManager,'ensure',lambda self:(calls.append('ensure') or {'configured':False,'phase':'off'}))
-    monkeypatch.setattr(ObserverManager,'resume',lambda self:(_ for _ in ()).throw(AssertionError('startup changed proxy task')))
+    monkeypatch.setattr(ObserverManager,'resume',lambda self:(calls.append('resume') or {'configured':False,'phase':'off'}))
     panel=ObserverPanel(tmp_path/'home',tmp_path/'data',active=True)
     try:
         settle(app,panel)
-        assert calls==['ensure']
+        assert calls==['resume']
     finally:panel.stop();panel.deleteLater();app.processEvents()
 
 
@@ -76,8 +76,8 @@ def test_unified_update_button_render_and_recovery_remains_available(tmp_path,mo
     panel=UpdatePanel(ObserverManager(tmp_path/'home',tmp_path/'data'))
     calls=[]
     initial={'configured':True,'phase':'active','version_mismatch':True,'health':{'version':'old'}}
-    waiting={**initial,'update':{'phase':'waiting','message':'기존 연결 종료 대기 · Codex를 닫으면 적용됩니다.'}}
-    monkeypatch.setattr('cachemonitor.app_update.update',lambda progress:(calls.append('update') or '설치 시작'))
+    waiting={**initial,'update':{'phase':'waiting','message':'진행 중 응답 및 캐시 작업 정산 대기'}}
+    monkeypatch.setattr('cachemonitor.app_update.update',lambda progress,manager:(calls.append('update') or '설치 시작'))
     monkeypatch.setattr('cachemonitor.update_panel.open_recovery',lambda *args:calls.append('recovery'))
     panel.manager.cancel_update=lambda:(calls.append('cancel') or initial)
     panel.proxy_status(initial);host=mount(panel,680,350)
@@ -90,7 +90,7 @@ def test_unified_update_button_render_and_recovery_remains_available(tmp_path,mo
         click(host,control(host,panel.button));finish()
         assert calls==['update']
         panel.proxy_status(waiting)
-        assert panel.button.text()=='업데이트 예약 취소'
+        assert panel.button.text()=='업데이트 취소'
         QTest.qWait(100)
         assert host.grab().save(str(tmp_path/'update-panel.png'))
         import os
@@ -99,7 +99,7 @@ def test_unified_update_button_render_and_recovery_remains_available(tmp_path,mo
         click(host,control(host,panel.button));finish()
         assert calls==['update','cancel']
         panel.proxy_status({**initial,'update':{'phase':'switching','message':'업데이트 중'}})
-        assert not panel.button.isEnabled() and panel.recovery.isEnabled()
+        assert panel.button.isEnabled() and panel.recovery.isEnabled()
         click(host,control(host,panel.recovery))
         assert calls[-1]=='recovery'
         panel.proxy_status({'configured':True,'phase':'active','update':{'phase':'complete','message':'업데이트 완료'}})

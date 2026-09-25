@@ -88,6 +88,10 @@ def test_installer_retires_only_owned_gui_logon_tasks(tmp_path):
         assert result['retired']==[desktop.name]
         assert not desktop.inspect()['autostart']
         assert worker.inspect()['autostart'] and other.inspect()['autostart']
+        worker.suspend()
+        suspended=worker.inspect()
+        assert not suspended['enabled'] and not suspended['autostart'] and suspended['restartCount']==0
+        assert other.inspect()['autostart']
         assert retire_desktop_startups(root)['retired']==[]
     finally:
         for task in (desktop,worker,other):task.remove()

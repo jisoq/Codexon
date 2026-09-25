@@ -24,6 +24,7 @@ class Scheduler:
         self.capture.analysis_revision=2
         self.clock=clock;self.snapshots={};self.jobs={};self.stopped=set();self.evaluations={}
         self.revision=self.control.revision(self.home);self.last_tick=clock();self.closed=False
+        self.paused=False
         self.control.db.execute('DELETE FROM cache_status WHERE home=?',(self.home,))
 
     def snapshot(self,request,response,anchor,url,headers,websocket,generation=None):
@@ -42,6 +43,26 @@ class Scheduler:
         self.control.forecast(self.home,sid,dict(snapshot=response['id'],observed_at=row['ts']))
         # Contexts owns the bounded copy. Drop evicted snapshots and credentials.
         self.snapshots={s:v for s,v in self.snapshots.items() if v['response']['id'] in self.executor.contexts.responses}
+
+    def pause(self):
+        if self.paused:return
+        self.paused=True;self.executor.paused=True
+        # Cancellation stops schedules, while Executor shields sent transports
+        # until their usage and reservation are durably reconciled.
+        self.cancel_schedules()
+
+    @property
+    def settled(self):
+        try:
+            return all(job.done() for job in self.jobs.values()) and not self.journal.db.execute(
+                "SELECT 1 FROM cache_jobs WHERE state IN ('reserved','sent') LIMIT 1").fetchone()
+        except sqlite3.Error:return False
+
+    def status(self):
+        try:sent=self.journal.db.execute("SELECT count(*) FROM cache_jobs WHERE state='sent'").fetchone()[0]
+        except sqlite3.Error:sent=None
+        return dict(ready=not self.closed,ownership=True,paused=self.paused,sent=sent,settled=self.settled,
+                    user_relays=self.executor.busy,observation_only=self.observation_only)
 
     def invalidate(self):
         self.executor.ingress();self.executor.leave()
@@ -202,7 +223,7 @@ class Scheduler:
     async def maintain(self,sid,snapshot,decision,revision):
         rid=snapshot['response']['id'];anchor=snapshot['anchor']
         for round_number in range(decision['calls']):
-            if (self.closed or not self.control.enabled('automatic') or
+            if (self.closed or self.paused or not self.control.enabled('automatic') or
                     self.executor.generation!=snapshot['generation'] or self.control.revision(self.home)!=revision):break
             def valid():
                 if not self.control.enabled('automatic') or self.control.revision(self.home)!=revision:return False
@@ -239,7 +260,7 @@ class Scheduler:
         self.stopped.add((sid,rid))
 
     async def tick(self):
-        if self.closed:return
+        if self.closed or self.paused:return
         for sid,snapshot in list(self.snapshots.items()):
             active=self.jobs.get(sid)
             # A bounded, already authorized maintenance sequence owns its context

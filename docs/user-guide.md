@@ -8,6 +8,8 @@ When you enable the optional proxy, Codexon backs up the **entire prior** Codex 
 
 ## Session overlay and Codex updates
 
+Work totals include user-directed tasks and their subagents. Internal `codex-auto-review` approval calls are excluded from model choices, work call counts, costs and cache analysis; diagnostics in Settings show their separate count. Original records and the quota ledger are retained. Fully priced work shows only its call count; a priced/total ratio appears only when work calls have an unknown cost.
+
 Keep Codexon running and enable **Settings → Session overlay**. The overlay identifies one Codex task window and reads that process's current route before matching it to local usage records. It appears while that Codex window or its overlay controls are active. Incomplete or ambiguous records, multiple task windows and remote tasks do not substitute another task's usage.
 
 Codex version numbers are not an allowlist. Updates that retain the route format continue to work; a changed format may require compatibility work. Task detection does not send model requests. Enable **Settings → General → Starts when you log in to Windows** to start Codexon in the tray at login; reopening Codex alone does not launch a stopped Codexon.
@@ -20,7 +22,9 @@ Speed is output tokens, including reasoning, divided by the observed time from r
 
 ## Update
 
-Use **Settings → About and troubleshooting → Check and install updates**. Codexon verifies the official installer, prepares a separate version directory and checks its runtime before switching launch paths. The same operation schedules the proxy update after existing connections finish, including idle WebSockets. No active request is force-cancelled or replayed. Finish work and close Codex when a connection update is waiting. A failed new proxy is rolled back; new connections may briefly fail during the switch. Previous payloads remain available for running components and rollback.
+App updates can be checked and installed while the proxy is off. If no newer release is available, the updater says so; it also updates connection components that are enabled.
+
+Use **Settings → About and troubleshooting → Check and install updates**. Codexon verifies the official installer, prepares a separate version directory and checks its runtime before switching launch paths. The same operation retires idle connections, waits for active responses and sent maintenance usage, then checks that the old process, listener and ownership locks are released. Completion requires three consecutive checks of the exact target version, deployment, role and readiness. No active request is force-cancelled or replayed. Failed startup restores the original role, command and autostart preference. Legacy workers without cooperative shutdown remain running with an explicit blocked reason. New connections may briefly fail during the switch. Previous payloads remain available for running components and rollback.
 
 Users of legacy portable copies can migrate by running Setup once. If the previous GUI does not support automatic handoff, exit Codexon through its tray and open the installed version from Start. Existing settings and history remain in their original locations.
 
@@ -80,3 +84,5 @@ Maintenance is a separate child session included once in overall usage, costs, p
 The source `--cache-worker` continuously analyzes natural requests, while `--cache-observe-only` remains unable to send independent requests. A separately authorized diagnostic uses the same executor, pre-upload permit and usage ledger without requiring profitable return history. It retains the original model, effort, context and tool definitions, with tools disabled. Before sending, observed cost plus the refreshed estimate must fit the explicitly authorized stop criterion. Diagnostic usage is included in totals but excluded from natural returns and maintenance effects. `tools/cache_runtime.py` manages one-time, nonrenewing 60-minute / two-call diagnostic grants and explicit termination. No failed or ambiguous request is retried.
 
 For a source worker, start the GUI with matching `--index-path`, `--evidence-path`, and `--cache-control`. Run the worker independently through Windows Task Scheduler. Apply the new URL only to new connections and preserve ongoing conversations. Existing settings and history remain intact. Ending a diagnostic grant leaves passive collection and policy analysis running.
+
+**Quit** stops issuing new cache requests, waits for active responses, sent maintenance usage and record writes, then closes the worker, collector and analysis process. The exit progress window remains visible while waiting. Consent and remaining allowances are preserved; the next app launch resumes the same role. Closing to the tray keeps the app running. App updates and language restarts hand over services. Quit restores the app-owned route to direct access; an already running Codex client that cached the previous address needs a restart to adopt that route.

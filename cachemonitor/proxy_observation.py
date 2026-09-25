@@ -9,7 +9,7 @@ import zstandard
 
 MAX_OBSERVATION = 128 * 1024 * 1024
 CHUNK = 65536
-FIELDS = {'model','stream_id','type','object','id','status','generate','stream','prompt_cache_retention',
+FIELDS = {'model','stream_id','type','object','id','event_id','response_id','status','generate','stream','prompt_cache_retention',
           'service_tier','response.id','response.model','response.status','response.service_tier'}
 
 

@@ -10,6 +10,7 @@ import sqlite3
 import time
 
 from .pricing import ALIASES, RATES, FAST_RATES, VERIFIED, PRICE_POLICY, token_cost, request_tier
+from .workload import INTERNAL_REVIEW_MODEL
 
 
 TOKEN_FIELDS = ('input', 'cached', 'written', 'output', 'reasoning')
@@ -684,7 +685,7 @@ class QuotaLedger:
         from .quota_tracking_store import sync_activity
         if not hasattr(self,'_tracking_sync_cache'):self._tracking_sync_cache={}
         sync_activity(self.db, snapshot,self._tracking_sync_cache)
-        for key, session in engine.sessions.items():
+        for key, session in {**engine.sessions,**getattr(engine,'internal_sessions',{})}.items():
             revision = session['revision']
             if self.revisions.get(key) == revision:
                 continue
@@ -813,7 +814,7 @@ class QuotaLedger:
                   if 'coverage_issues' in tables else [])
         calls = list(self.db.execute(f'''select * from (
             select *,row_number() over(partition by uid order by cost is null,home) as copy_rank
-            from calls where home in ({slots}) and ts>=?) where copy_rank=1 order by ts''',(*scope,cutoff)))
+            from calls where home in ({slots}) and ts>=? and model<>?) where copy_rank=1 order by ts''',(*scope,cutoff,INTERNAL_REVIEW_MODEL)))
         if tracking is not None:
             completed={r['response']:r['ended'] for r in self.db.execute(
                 f"select response,min(end) as ended from tracking_wire where home in ({slots}) "
@@ -887,7 +888,7 @@ class QuotaLedger:
                 count(*) as calls,count(cost) as priced,avg(cost) as mean_cost,{fields},sum(cost) as cost,
                 sum(service_tier='미확인') as unknown_mode_calls,
                 sum(cost is null) as missing,group_concat(distinct price_id) as prices
-                from calls where home=? and ts>? and ts<=? group by model,displayed_tier order by sum(cost) desc''', (home,start,end))
+                from calls where home=? and ts>? and ts<=? and model<>? group by model,displayed_tier order by sum(cost) desc''', (home,start,end,INTERNAL_REVIEW_MODEL))
             return [{**dict(row),'service_tier':row['displayed_tier'],
                      'separate': ALIASES.get(row['model'],row['model']) in separate} for row in rows]
         for i, group in enumerate(groups):

@@ -29,6 +29,7 @@ from .ui_details import Details, strong, recorded, record_issues, price_reason, 
 from .theme import shared_theme
 from .version import VERSION
 from .i18n import tr, Verbatim
+from .workload import call_count
 
 STYLE = ''
 TITLES = ('사용 현황','조건 비교','세션 기록','사용 한도','설정','캐시 관리')
@@ -656,9 +657,12 @@ class Dashboard(TrayWindow):
         return Verbatim(' · '.join(tr(x) for x in names if x))
 
     def receive(self,value):
+        if not self.async_mode:
+            self.engine.ingest(value['sessions'])
+            value={**value,'sessions':[s['source'] for s in self.engine.sessions.values()],
+                   'internal_review_calls':sum(len(s['prepared']['history']) for s in self.engine.internal_sessions.values())}
         self.snapshot=value
         if hasattr(self,'cache_panel'):self.cache_panel.display(value.get('cache_management',{}))
-        if not self.async_mode:self.engine.ingest(value['sessions'])
         overlay=getattr(self,'overlay',None)
         if overlay:overlay.receive_snapshot(value)
         self.refresh_choices();index=value.get('index',{})
@@ -752,7 +756,7 @@ class Dashboard(TrayWindow):
         total=sum(r['cost'] for r in rows if r.get('cost') is not None) if cost['n'] else 0 if not rows else None
         speed=view['summary']['output_speed']
         values=[usd(total),usd(cost['mean']),usd(turn_cost['mean']),value_text(rate,'cache_ratio'),value_text(speed['value'],'output_speed')]
-        notes=[f"산정 {cost['n']:,} / 관측 {len(rows):,}",
+        notes=[f"산정 {cost['n']:,} / 관측 {len(rows):,}" if cost['n']<len(rows) else f"관측 {len(rows):,}호출",
             f"유효 {cost['n']:,} / 대상 {len(rows):,}",
             f"유효 {turn_cost['n']:,}요청 · 포함 {sum(t.get('responses',0) for t in turns if t.get('cost') is not None):,}호출",
             f"유효 {len(valid):,} / 대상 {len(rows):,} · 입력 {inputs:,}",
@@ -1099,8 +1103,9 @@ class Dashboard(TrayWindow):
             filters=[k for k,n in self.call_filter_controls.items() if n.isChecked()]+list((self.temporary_context or {}).get('filters',[]))
             if filters:rows=[r for r in rows if any(self.matches_call_filter(r,key) for key in filters)]
             records=self.session_records(rows,matching)
-            headers=['세션 · 프로젝트','비용 · 하위 포함','산정 / 전체 호출','최근 기록'];widths=[260,170,140,175]
-            formatter=lambda r,c,role:[Verbatim(tr(r['title'])+'\n'+tr(r['project'])+' · '+tr(r['source'])),('확인분 ' if r['partial'] and r['cost'] is not None else '')+usd(r['cost']),f"{r['known']:,} / {r['calls']:,}",date_time(r['ts'])][c]
+            count_header='산정 / 전체 호출' if any(r['known']<r['calls'] for r in records) else '호출 수'
+            headers=['세션 · 프로젝트','비용 · 하위 포함',count_header,'최근 기록'];widths=[260,170,140,175]
+            formatter=lambda r,c,role:[Verbatim(tr(r['title'])+'\n'+tr(r['project'])+' · '+tr(r['source'])),('확인분 ' if r['partial'] and r['cost'] is not None else '')+usd(r['cost']),call_count(r['known'],r['calls']),date_time(r['ts'])][c]
             selected=next((i for i,r in enumerate(records) if (r['home'],r['sid'])==self.selected_session),-1)
             self.record_parent_title.setText('세션');self.parent_table.put(rowHeight=60,leftColumns=[0,3])
         pair=self.parent_kind+'/'+self.record_view
@@ -1174,15 +1179,17 @@ class Dashboard(TrayWindow):
             detail=(f" · 자체 {usd(group['own_cost'])} + 하위 {usd(group['child_cost'])}"
                     if group['descendants'] else '')
             project=session.get('project_name') or Path(session.get('cwd','')).name or tr('프로젝트 없음')
-            self.session_scope.setText(Verbatim(project+' · '+tr(self.period.currentText() if not ctx else '전체 기록')+'\n'+tr(f"비용 {cost}{detail} · 산정 {group['priced']:,}/{group['calls']:,}호출")))
+            count=('산정 ' if group['priced']<group['calls'] else '')+call_count(group['priced'],group['calls'])+'호출'
+            self.session_scope.setText(Verbatim(project+' · '+tr(self.period.currentText() if not ctx else '전체 기록')+'\n'+tr(f"비용 {cost}{detail} · {count}")))
         if self.record_view=='sessions':
             records=self.session_records(rows,matching)
-            headers=['세션명','프로젝트','작업 종류','비용 · 하위 포함','산정 / 전체 호출','캐시 적중률','최근 기록 시각'];self.table.put(leftColumns=[0,1,2,6])
-            formatter=lambda r,c,role:[r['title'],r['project'],r['source'],('확인분 ' if r['partial'] and r['cost'] is not None else '')+usd(r['cost']),f"{r['known']:,} / {r['calls']:,}",value_text(r['cache_ratio'],'cache_ratio'),date_time(r['ts'])][c]
+            count_header='산정 / 전체 호출' if any(r['known']<r['calls'] for r in records) else '호출 수'
+            headers=['세션명','프로젝트','작업 종류','비용 · 하위 포함',count_header,'캐시 적중률','최근 기록 시각'];self.table.put(leftColumns=[0,1,2,6])
+            formatter=lambda r,c,role:[r['title'],r['project'],r['source'],('확인분 ' if r['partial'] and r['cost'] is not None else '')+usd(r['cost']),call_count(r['known'],r['calls']),value_text(r['cache_ratio'],'cache_ratio'),date_time(r['ts'])][c]
             widths=[270,220,130,170,140,120,175]
             if self.width()-248<1000:
-                headers=['세션명 · 프로젝트 · 작업 종류','비용 · 하위 포함','산정 / 전체 호출','최근 기록 시각'];widths=[310,190,140,175];self.table.put(rowHeight=60,leftColumns=[0,3])
-                formatter=lambda r,c,role:[Verbatim(tr(r['title'])+'\n'+tr(r['project'])+' · '+tr(r['source'])),('확인분 ' if r['partial'] and r['cost'] is not None else '')+usd(r['cost']),f"{r['known']:,} / {r['calls']:,}",date_time(r['ts'])][c]
+                headers=['세션명 · 프로젝트 · 작업 종류','비용 · 하위 포함',count_header,'최근 기록 시각'];widths=[310,190,140,175];self.table.put(rowHeight=60,leftColumns=[0,3])
+                formatter=lambda r,c,role:[Verbatim(tr(r['title'])+'\n'+tr(r['project'])+' · '+tr(r['source'])),('확인분 ' if r['partial'] and r['cost'] is not None else '')+usd(r['cost']),call_count(r['known'],r['calls']),date_time(r['ts'])][c]
             else:self.table.put(rowHeight=40)
         elif self.record_view=='requests':
             visible_turns={r.get('turn') for r in rows}
@@ -1411,6 +1418,7 @@ class Dashboard(TrayWindow):
         self.diagnostic_summary.setText('사용량 수집 · '+('확인 필요' if errors else '정상' if complete else '수집 중')+'<br>마지막 성공 수집 · '+date_time(last)+'<br>모델 관측 · '+('확인 필요' if self.snapshot.get('model_errors') else '수신 대기' if not self.snapshot['sessions'] else '기록 확인')+'<br>한도 조회 · '+(self.quota_issue or ('수신 대기' if not getattr(self,'live_quota',None) else '정상')))
         text='수집 대상\n'+'\n'.join(self.snapshot.get('homes',[]))+'\n\n'+('수집 오류\n'+'\n'.join(map(str,errors)) if errors else '')
         text+='\n한도 원장 · '+str(self.snapshot.get('ledger_error') or '정상')
+        text+='\n자동 승인 검토 · '+str(self.snapshot.get('internal_review_calls',0))+'호출 (작업 집계에서 제외)'
         if self.analysis_errors:text+='\n분석 오류\n'+'\n'.join(self.analysis_errors)
         self.diagnostics.setPlainText(text)
 

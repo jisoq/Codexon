@@ -16,6 +16,7 @@ class SnapshotPublisher:
         models=[];cache=[]
         for source in snapshot['sessions']:
             key=(source['home'],source['id'])
+            if key not in engine.sessions:continue
             state=engine.sessions[key]
             light={k:v for k,v in source.items() if k not in ('history','requests','groups','totals','cache_misses','turn_states','transports','coverage_gaps')}
             # Sliding-window countdown is derived from activity, not repeatedly shipped.
@@ -42,7 +43,8 @@ class SnapshotPublisher:
                        sessions=[s for k,s in sessions.items() if self.sessions.get(k)!=s],
                        overlay_sessions=[s for k,s in overlays.items() if self.overlays.get(k)!=s],
                        removed=removed,data_revision=engine.revision,
-                       model_candidates=models,cache_candidates=cache)
+                       model_candidates=models,cache_candidates=cache,
+                       internal_review_calls=sum(len(s['prepared']['history']) for s in engine.internal_sessions.values()))
         self.models={k:v for k,v in self.models.items() if k in sessions}
         if self.sequence==1 or engine.revision!=getattr(self,'revision',None):
             message['models']=sorted(set().union(*self.models.values()) if self.models else set())

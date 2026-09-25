@@ -82,19 +82,11 @@ def activate_proxy(manager):
     status = manager.status()
     if not status.get('configured'):
         return dict(phase='off', message='프록시 사용 꺼짐')
-    if getattr(manager,'shared_cache_worker',False):return manager.update_proxy()['update']
+    if getattr(manager,'shared_cache_worker',False):return manager.update_proxy().get('update') or {}
     manager.configure_check()
     health = status.get('health') or {}
     if health:
-        from .version import PROXY_VERSION
-        from .proxy_update import process_executable
-        command=manager.supervisor_command(manager.state().get('upstream','chatgpt'))
-        active=process_executable(manager.runtime()['pid'])
-        if (health.get('version')!=PROXY_VERSION or health.get('lifecycle')!='managed'
-                or Path(active).resolve()!=Path(command[0]).resolve()):
-            return manager.update_proxy().get('update') or {}
-        manager.task.configure(command,autostart=True)
-        return dict(phase='complete', message='연결 구성요소 업데이트 완료')
+        return manager.update_proxy().get('update') or {}
     if status.get('probe_state')=='refused' and manager.state().get('enabled'):
         manager.attach_supervisor()
         return dict(phase='complete', message='연결 구성요소 시작 완료')
@@ -151,6 +143,11 @@ def finish(root, product, recovery, *, isolated=False, launch=True, language='ko
                 if result.returncode:raise RuntimeError('Connection update did not complete')
             except (OSError,RuntimeError,subprocess.TimeoutExpired):
                 receipt['connection'] = dict(phase='recovery_required',message='연결 복구를 실행해 주세요.')
+            if launch:
+                from .app_services import suspended
+                if suspended(connection_manager()):
+                    launch=False
+                    receipt['launch']='앱 종료 요청을 유지했습니다.'
             if launch:
                 from .observer_task import ObserverTask
                 # A new task identity must be able to run while the old GUI task

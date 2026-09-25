@@ -52,9 +52,10 @@ def assess(status):
                     detail='Codex가 이전 연결을 사용 중이라면 작업을 마친 뒤 완전히 종료하고 다시 여세요.' if restart
                     else '다른 연결·로그인·서버 문제는 이 도구의 확인 범위에 포함되지 않습니다.')
     update = status.get('update') or {}
-    if update.get('phase') in ('switching', 'rollback'):
+    from .proxy_update import BUSY
+    if update.get('phase') in BUSY:
         return dict(code='updating', confirmed=False, can_recover=True, status=status,
-                    title='연결 구성요소를 전환하고 있습니다', detail='기존 요청이 끝날 때까지 기다립니다.')
+                    title='연결 구성요소를 전환하고 있습니다', detail=update.get('message') or '교체 상태를 확인하고 있습니다.')
     probe = status.get('probe_state')
     health = status.get('health') or {}
     if probe in ('refused', 'identity_mismatch'):

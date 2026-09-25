@@ -12,6 +12,47 @@ from cachemonitor.core import Session
 from test_data_contract import source
 
 
+def review_session(parent):
+    review=copy.deepcopy(parent)
+    review.update(id='review',source='subagent',parent_thread_id=parent['id'])
+    review['history'][0].update(key='review-response',call_id='review-response',
+                               model='codex-auto-review',configured_model='codex-auto-review')
+    return review
+
+
+def test_internal_review_is_separate_from_work_models_rollups_and_delivery(tmp_path):
+    from cachemonitor.analytics import analyze
+    from cachemonitor.analysis_delivery import SnapshotPublisher, SnapshotReceiver
+    parent=source();review=review_session(parent)
+    worker=copy.deepcopy(parent)
+    worker.update(id='worker',source='subagent',parent_thread_id=parent['id'])
+    worker['history'][0].update(key='worker-response',call_id='worker-response',written=None)
+    from cachemonitor.cache_integration import enrich
+    cache=enrich([parent,review,worker],tmp_path/'index.sqlite',110)
+    assert cache['delegation']['calls']==1
+    engine=AnalysisEngine();overlays=OverlaySummaries()
+    engine.ingest([parent,review,worker])
+    assert len(engine.internal_sessions)==1
+    analysis=engine.query(dict(page=0,start=0,end=200))['analysis']
+    assert {r['sid'] for r in analysis['responses']}=={'s','worker'}
+    assert analysis['unpriced_count']==1  # A real worker with missing usage stays visible.
+    assert len(analyze([parent,review,worker])['responses'])==2
+    summary=next(s for s in overlays.collect(engine) if s['id']=='s')
+    assert (summary['calls'],summary['priced'],summary['missing'],summary['descendants'])==(2,1,1,1)
+    snapshot=dict(ts=110,sessions=[parent,review,worker],homes=['home'])
+    publisher=SnapshotPublisher();receiver=SnapshotReceiver()
+    delivered=receiver.receive(publisher.publish(snapshot,engine,overlays.collect(engine)))
+    assert delivered['internal_review_calls']==1
+    assert {s['id'] for s in delivered['sessions']}=={'s','worker'}
+    assert 'codex-auto-review' not in delivered['models']
+    # Internal calls are retained unchanged for diagnostics/accounting, not priced as zero.
+    assert review['history'][0]['model']=='codex-auto-review'
+    assert engine.internal_sessions[('home','review')]['prepared']['history'][0]['cost'] is None
+    engine.ingest([parent,review])
+    summary=next(s for s in overlays.collect(engine) if s['id']=='s')
+    assert (summary['calls'],summary['priced'],summary['missing'],summary.get('descendants',0))==(1,1,0,0)
+
+
 def test_nested_costs_empty_parent_partial_prices_and_home_boundary():
     sessions = [dict(home='h', id='parent'),
                 dict(home='h', id='child', parent_thread_id='parent'),
@@ -93,7 +134,8 @@ def test_real_session_table_shows_parent_without_own_calls_and_click_keeps_break
         cache_write_input_tokens=0, output_tokens=10), 'gpt-6-astra', 'turn', 'high', service_tier='Standard')
     child = child_session.view(now)
     child.update(source='subagent', parent_thread_id='parent', archived=False, collection_complete=True)
-    snapshot = dict(ts=now, sessions=[parent, child], homes=['fixture'], errors=[],
+    review=review_session(child);review['parent_thread_id']='parent'
+    snapshot = dict(ts=now, sessions=[parent, child, review], homes=['fixture'], errors=[],
                     unassigned=[], index={'loading':False})
     app = QApplication.instance() or QApplication([])
     before = app.property('cachemonitorDisableShellIntegration')
@@ -107,10 +149,16 @@ def test_real_session_table_shows_parent_without_own_calls_and_click_keeps_break
         own_child = next(r for r in records if r['sid']=='child')
         assert group['own_cost']==0 and group['cost']==own_child['cost']
         assert group['descendants']==1 and group['calls']==1
+        assert {r['sid'] for r in records}=={'parent','child'}
+        assert 'codex-auto-review' not in [window.model.itemData(i) for i in range(window.model.count())]
+        assert '산정 / 전체 호출' not in window.parent_table.model().headers
         index = next(i for i,r in enumerate(window.parent_rows) if r['sid']=='parent')
         click_row(window, window.parent_table, index);app.processEvents()
         assert window.selected_session==('fixture','parent')
         assert '자체 ' in window.session_scope.text() and ' + 하위 ' in window.session_scope.text()
+        assert '산정' not in window.session_scope.text()
+        window.render_diagnostics()
+        assert '자동 승인 검토 · 1호출' in window.diagnostics.toPlainText()
         assert window.grab().save(str(tmp_path/'parent-cost.png'))
     finally:
         window.quitting=True;window.tick.stop();window.tray.hide();window.observer_panel.stop();window.close()

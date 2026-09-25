@@ -5,6 +5,7 @@ from .core import Session
 from .cache_policy import cost_bounds,scoped_history
 from .cache_audit import observations
 from .pricing import token_cost
+from .workload import internal_review
 import json
 import hashlib
 
@@ -15,6 +16,7 @@ def enrich(sessions,index_path,now,homes=None):
     journal=None
     try:
         for session in sessions:
+            if internal_review(session):continue
             history=scoped_history(session.get('history',[]))
             for row in history[-1:]:
                 cohort=[r for r in history if r['policy_scope']==row['policy_scope'] and r['ts']>=now-60*86400]
@@ -89,7 +91,7 @@ def enrich(sessions,index_path,now,homes=None):
             sessions.append(view)
         audit=[];effects=[];compactions=[];delegated=[]
         for session in sessions:
-            if session.get('purpose') in ('maintenance','diagnostic'):continue
+            if session.get('purpose') in ('maintenance','diagnostic') or internal_review(session):continue
             history=session.get('history',[])
             if session.get('parent_thread_id'):delegated.extend(history)
             for previous,current in zip(history,history[1:]):

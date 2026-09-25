@@ -101,6 +101,7 @@ class ObserverTask:
             'executable':command[0] if command else '',
             'arguments':subprocess.list2cmdline(command[1:]) if command else '',
             'autostart':bool(autostart),'periodic':bool(periodic),
+            'update_watchdog':self.role=='ProxyUpdate',
             'restart':3 if self.role in ('ModelObserver','ProxySupervisor','ProxyUpdate','CacheObservation','CacheObservationV2','CacheWorker','UsageCollector') else 0}).encode()).decode()
         script=r'''
 $ErrorActionPreference='Stop'
@@ -115,9 +116,10 @@ if($existing -and $existing.Definition.RegistrationInfo.Description -ne $p.marke
 if($p.operation -eq 'inspect'){
     if(!$existing){@{registered=$false;autostart=$false} | ConvertTo-Json -Compress;exit 0}
     $a=$existing.Definition.Actions.Item(1)
-    $login=$false
+    $login=$false;$periodic=$false
     foreach($t in $existing.Definition.Triggers){if($t.Type -eq 9 -and $t.Enabled){$login=$true}}
-    @{registered=$true;autostart=$login;executable=$a.Path;arguments=$a.Arguments;state=$existing.State;restartCount=$existing.Definition.Settings.RestartCount} | ConvertTo-Json -Compress
+    foreach($t in $existing.Definition.Triggers){if($t.Type -eq 1 -and $t.Enabled){$periodic=$true}}
+    @{registered=$true;autostart=$login;periodic=$periodic;enabled=$existing.Enabled;running=$existing.GetInstances(0).Count;execution_limit=$existing.Definition.Settings.ExecutionTimeLimit;executable=$a.Path;arguments=$a.Arguments;state=$existing.State;restartCount=$existing.Definition.Settings.RestartCount} | ConvertTo-Json -Compress
     exit 0
 }
 if($p.operation -eq 'remove'){
@@ -128,6 +130,30 @@ if($p.operation -eq 'remove'){
 if($p.operation -eq 'stop'){
     if($existing){$existing.Stop(0)}
     @{stopped=$true} | ConvertTo-Json -Compress
+    exit 0
+}
+if($p.operation -eq 'suspend'){
+    if($existing){
+        $definition=$existing.Definition
+        $definition.Settings.Enabled=$false
+        foreach($trigger in $definition.Triggers){$trigger.Enabled=$false}
+        # A present RestartOnFailure element cannot contain Count=0.
+        [xml]$xml=$definition.XmlText
+        $restart=$xml.SelectSingleNode("//*[local-name()='RestartOnFailure']")
+        if($restart){[void]$restart.ParentNode.RemoveChild($restart)}
+        $definition.XmlText=$xml.OuterXml
+        [void]$folder.RegisterTaskDefinition($p.name,$definition,6,$definition.Principal.UserId,$null,3)
+    }
+    @{suspended=$true} | ConvertTo-Json -Compress
+    exit 0
+}
+if($p.operation -eq 'finish_update'){
+    if($existing){
+        $definition=$existing.Definition
+        foreach($trigger in $definition.Triggers){if($trigger.Type -eq 1){$trigger.Enabled=$false}}
+        [void]$folder.RegisterTaskDefinition($p.name,$definition,6,$definition.Principal.UserId,$null,3)
+    }
+    @{watchdog=$false} | ConvertTo-Json -Compress
     exit 0
 }
 $definition=$service.NewTask(0)
@@ -146,7 +172,7 @@ $definition.Principal.RunLevel=0
 $user=[Security.Principal.WindowsIdentity]::GetCurrent().Name
 $definition.Principal.UserId=$user
 if($p.autostart){$trigger=$definition.Triggers.Create(9);$trigger.UserId=$user;$trigger.Enabled=$true}
-if($p.periodic){
+if($p.periodic -or $p.update_watchdog){
     $trigger=$definition.Triggers.Create(1)
     $trigger.StartBoundary=(Get-Date).AddSeconds(10).ToString('yyyy-MM-ddTHH:mm:ss')
     $trigger.Repetition.Interval='PT1M'
@@ -173,3 +199,5 @@ if($p.operation -eq 'run'){[void]$registered.Run($null)}
     def remove(self):return self.call('remove')
     def inspect(self):return self.call('inspect')
     def stop(self):return self.call('stop')
+    def suspend(self):return self.call('suspend')
+    def finish_update(self):return self.call('finish_update')

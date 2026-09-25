@@ -19,12 +19,12 @@ from cachemonitor.core import usage_values
 from test_model_proxy import server
 
 
-@pytest.mark.parametrize('websocket,maintenance_websocket',[(False,False),(True,True),(True,False)])
-def test_installed_codex_independent_request(tmp_path,websocket,maintenance_websocket):
+@pytest.mark.parametrize('websocket,maintenance_websocket,native_reconnect',[(False,False,False),(True,True,False),(True,False,False),(True,False,True)])
+def test_installed_codex_independent_request(tmp_path,websocket,maintenance_websocket,native_reconnect):
     try:executable=locate_codex()
     except RuntimeError:pytest.skip('Installed Codex runtime unavailable; mock unit tests are separate')
     async def scenario():
-        seen=[];wire=[];snapshots=[];notices=[];futures={};sequence=0
+        seen=[];wire=[];snapshots=[];notices=[];futures={};sequence=0;clock_offset=[0.]
         journal=Journal(tmp_path/'jobs.sqlite');store=EvidenceStore(tmp_path/'e.sqlite')
         contexts=Contexts();executor=Executor(journal,contexts)
         def events(body):
@@ -32,7 +32,10 @@ def test_installed_codex_independent_request(tmp_path,websocket,maintenance_webs
             item=dict(type='message',id=mid,role='assistant',status='completed',content=[dict(type='output_text',text='OK',annotations=[])])
             response=dict(id=rid,object='response',created_at=int(time.time()),status='completed',model=body['model'],output=[item],
                 usage=dict(input_tokens=5000,input_tokens_details=dict(cached_tokens=4096,cache_write_tokens=0),output_tokens=2,output_tokens_details=dict(reasoning_tokens=0),total_tokens=5002))
-            return [dict(type='response.created',response={**response,'status':'in_progress','output':[]}),
+            return [dict(type='codex.response.metadata',headers={'x-models-etag':'synthetic'}),
+                    dict(type='codex.rate_limits',rate_limits={'primary':{'used_percent':1,'window_minutes':300,'reset_after_seconds':60}}),
+                    dict(type='responsesapi.websocket_timing'),
+                    dict(type='response.created',response={**response,'status':'in_progress','output':[]}),
                     dict(type='response.output_item.added',output_index=0,item={**item,'status':'in_progress','content':[]}),
                     dict(type='response.output_text.delta',item_id=mid,output_index=0,content_index=0,delta='OK'),
                     dict(type='response.output_item.done',output_index=0,item=item),dict(type='response.completed',response=response)]
@@ -50,12 +53,17 @@ def test_installed_codex_independent_request(tmp_path,websocket,maintenance_webs
         home=tmp_path/'home';home.mkdir()
         control=Control(tmp_path/'control.sqlite');control.set('guard',True)
         configure(home,tmp_path/'control.sqlite',True)
-        async with server(app) as upstream,server(create_app(store,home,upstream,cache_capture=RelayCapture(executor,lambda *a:snapshots.append(a)))) as proxy:
+        async with server(app) as upstream,server(create_app(store,home,upstream,cache_capture=RelayCapture(executor,lambda *a:snapshots.append(a)),clock=lambda:time.monotonic()+clock_offset[0])) as proxy:
             config={'model_provider':'isolated','model':'gpt-6-luna','model_providers.isolated.name':'Loopback only',
                     'model_providers.isolated.base_url':proxy,'model_providers.isolated.wire_api':'responses',
                     'model_providers.isolated.needs_openai_auth':False,'model_providers.isolated.supports_websockets':websocket,
                     'model_providers.isolated.request_max_retries':0,'model_providers.isolated.stream_max_retries':0,'analytics.enabled':False}
             command=[executable,'app-server']
+            if native_reconnect:
+                # Exercise the installed client's normal reconnect policy.
+                # Disabling every retry explicitly forces fallback on closure.
+                config.pop('model_providers.isolated.request_max_retries')
+                config.pop('model_providers.isolated.stream_max_retries')
             for key,value in config.items():command+=['-c',key+'='+json.dumps(value)]
             process=await asyncio.create_subprocess_exec(*command,cwd=tmp_path,env={**os.environ,'CODEX_HOME':str(home)},
                 stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.DEVNULL,creationflags=getattr(__import__('subprocess'),'CREATE_NO_WINDOW',0))
@@ -88,6 +96,27 @@ def test_installed_codex_independent_request(tmp_path,websocket,maintenance_webs
                 (home/'config.toml').write_text(''.join('[hooks.state.'+json.dumps(k)+']\nenabled=true\ntrusted_hash='+json.dumps(v['trusted_hash'])+'\n' for k,v in trusted.items()),encoding='utf-8')
                 thread=await rpc('thread/start',dict(model='gpt-6-luna',modelProvider='isolated',cwd=str(tmp_path),sandbox='read-only',approvalPolicy='never',ephemeral=False,baseInstructions='Reply OK. No tools.',config={'hooks.state':trusted}))
                 tid=thread['thread']['id'];await turn(tid,'Remember SYNTHETIC_ORIGINAL. Reply OK.')
+                if native_reconnect:
+                    clock_offset[0]=301
+                    await asyncio.sleep(1.2)
+                    from aiohttp import ClientSession
+                    async with ClientSession() as health_client:
+                        health=await (await health_client.get(proxy+'/health')).json()
+                    assert health['websocket_connections']['retired']['idle_expired']>=1
+                    assert health['active_connections']==0
+                    before_count=len(seen)
+                    await turn(tid,'SYNTHETIC_AFTER_IDLE. Reply OK.')
+                    # The installed client must rebuild context on a new socket;
+                    # a mock that accepts a stale response id would hide data loss.
+                    new_requests=seen[before_count:]
+                    assert len(new_requests)==1,new_requests
+                    assert not new_requests[0].get('previous_response_id')
+                    assert 'SYNTHETIC_ORIGINAL' in json.dumps(new_requests[0])
+                    assert 'SYNTHETIC_AFTER_IDLE' in json.dumps(new_requests[0])
+                    assert set(wire)=={'WebSocket'}
+                    await turn(tid,'SYNTHETIC_THIRD. Reply OK.')
+                    assert set(wire)=={'WebSocket'} and len(seen)==before_count+2
+                    return
                 if websocket and not maintenance_websocket:
                     await turn(tid,'SYNTHETIC_DELTA. Reply OK.')
                 before=await rpc('thread/read',dict(threadId=tid,includeTurns=True))

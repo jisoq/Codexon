@@ -29,6 +29,7 @@ def test_files(*names):
 
 # Components select observable contracts. There is deliberately no always-run core.
 GROUPS = {
+    'app_lifetime': test_files('app_services', 'observer_panel', 'windows_startup', 'proxy_update'),
     'data': test_files('core', 'index', 'data_contract', 'subagent_collection', 'request_tier_snapshots'),
     'analysis': test_files('comparison', 'overview', 'performance', 'data_contract', 'output_speed'),
     'cost': test_files('pricing', 'mode_costs', 'session_costs', 'data_contract'),
@@ -61,7 +62,7 @@ GROUPS = {
     'window': test_files('window_recovery', 'display_scaling'),
     'notifications': test_files('notifications', 'confirmed_notifications'),
     'evidence': test_files('model_evidence', 'proxy_observation', 'observation_delivery', 'call_transport'),
-    'relay': test_files('model_proxy', 'proxy_http2', 'proxy_observation', 'observation_delivery'),
+    'relay': test_files('model_proxy', 'proxy_websocket', 'proxy_http2', 'proxy_observation', 'observation_delivery'),
     'proxy_lifecycle': test_files('managed_proxy', 'proxy_update', 'proxy_supervisor', 'connection_recovery'),
     'observer': test_files('observer_control', 'observer_panel'),
     'install': test_files('install_activation', 'install_management', 'windows_startup'),
@@ -75,6 +76,8 @@ GROUPS = {
 
 # First match wins: QML and shared helpers must not fall through to a broad UI gate.
 RULES = (
+    ('cachemonitor/proxy_identity.py', ('proxy_lifecycle','install')),
+    ('cachemonitor/proxy_target.py', ('proxy_lifecycle','install')),
     ('cachemonitor/cache_db.py', ('cache','cache_ui','cache_connection','proxy_lifecycle')),
     ('tools/cache_runtime.py', ('cache',)),
     ('cachemonitor/cache_operating.py', ('cache','cache_ui','cache_connection')),
@@ -87,6 +90,7 @@ RULES = (
     ('cachemonitor/cache_execution.py', ('cache', 'cache_connection')),
     ('cachemonitor/cache_capture.py', ('cache', 'relay', 'cache_connection')),
     ('cachemonitor/session_costs.py', ('cost', 'overlay_data')),
+    ('cachemonitor/workload.py', ('cost', 'analysis', 'overlay_data')),
     ('cachemonitor/core.py', ('data', 'analysis', 'cost', 'quota_store', 'modes', 'cache', 'speed')),
     ('cachemonitor/index.py', ('data', 'evidence', 'quota_store')),
     ('cachemonitor/analytics.py', ('analysis', 'cost', 'cache', 'speed', 'quota_math')),
@@ -162,6 +166,7 @@ RULES = (
     ('cachemonitor/model_evidence.py', ('evidence', 'data')),
     ('cachemonitor/evidence_writer.py', ('evidence',)),
     ('cachemonitor/model_proxy.py', ('relay', 'cache_connection')),
+    ('cachemonitor/proxy_websocket.py', ('relay', 'cache_connection')),
     ('cachemonitor/proxy_http.py', ('relay',)),
     ('cachemonitor/proxy_observation.py', ('relay', 'evidence')),
     ('cachemonitor/proxy_update.py', ('proxy_lifecycle',)),
@@ -178,6 +183,11 @@ RULES = (
     ('cachemonitor/app.py', ('runtime', 'install', 'observer')),
     ('cachemonitor/version.py', ('runtime', 'proxy_lifecycle', 'update')),
     ('cachemonitor/__init__.py', ('runtime',)),
+    ('cachemonitor/app_services.py', ('app_lifetime',)),
+    ('cachemonitor/collection_lifecycle.py', ('app_lifetime','quota_poll')),
+    ('tools/verify_app_services.py', ('app_lifetime',)),
+    ('cachemonitor/app_shutdown.py', ('app_lifetime',)),
+    ('cachemonitor/proxy_drain.py', ('proxy_lifecycle', 'app_lifetime')),
     ('cachemonitor/tray.py', ('runtime', 'window')),
     ('cachemonitor/launch_context.py', ('install', 'runtime')),
     ('cachemonitor/app_restart.py', ('runtime', 'install', 'payload')),

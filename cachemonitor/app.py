@@ -34,6 +34,7 @@ def main():
     parser.add_argument('--control-report',help='Save observer control result to JSON')
     parser.add_argument('--replace-gui',action='store_true',help=argparse.SUPPRESS)
     parser.add_argument('--verify-handoff',type=Path,help=argparse.SUPPRESS)
+    parser.add_argument('--verify-services',action='store_true',help=argparse.SUPPRESS)
     parser.add_argument("--codex-home", action="append", help="Repeat to monitor multiple local Codex homes")
     parser.add_argument("--hidden", action="store_true")
     parser.add_argument("--index-path", help="Override the app-owned usage index for isolated verification")
@@ -45,6 +46,8 @@ def main():
     parser.add_argument("--smoke-depth", choices=('core','full'), default='full',
                         help="Choose the compact release check or full interaction probe")
     args = parser.parse_args()
+    if args.verify_services and not args.verify_handoff:
+        parser.error('Service verification requires isolated handoff verification')
     explicit_index = args.index_path
     from .launch_context import cache_paths,save_cache_paths
     control_only=any((args.enable_model_observer,args.disable_model_observer,args.model_observer_status,args.test_model_observer))
@@ -146,14 +149,17 @@ def main():
     if not isolated:save_homes(homes)
     if args.cache_control and not (args.smoke or args.verify_handoff):
         save_homes(homes);save_cache_paths(args.index_path,args.evidence_path,args.quota_path)
-    if args.smoke or args.verify_handoff:
+    if (args.smoke or args.verify_handoff) and not args.verify_services:
         from .usage_collection import isolated_collector
         collector_cleanup=isolated_collector(homes,args.index_path,args.evidence_path)
         app.aboutToQuit.connect(collector_cleanup)
+    if not (args.smoke or args.verify_handoff) or args.verify_services:
+        from .usage_collection import resume_collection
+        resume_collection(homes,args.index_path,args.evidence_path)
     window = Dashboard(homes,index_path=args.index_path,model_evidence_path=args.evidence_path,quota_path=args.quota_path,
-        collection_autostart=not (args.smoke or args.verify_handoff),
+        collection_autostart=not (args.smoke or args.verify_handoff) or args.verify_services,
         cache_control=args.cache_control or (not args.smoke and args.index_path is None),
-        live_limits=not (args.smoke or args.verify_handoff),manage_observer=not (args.smoke or args.verify_handoff) and (args.index_path is None or args.cache_control), **({'settings':smoke_settings} if smoke_settings else {}))
+        live_limits=not (args.smoke or args.verify_handoff),manage_observer=args.verify_services or (not (args.smoke or args.verify_handoff) and (args.index_path is None or args.cache_control)), **({'settings':smoke_settings} if smoke_settings else {}))
     from .overlay import install_overlay
     install_overlay(window, native_enabled=not (args.smoke or args.verify_handoff))
     def restart():
@@ -177,11 +183,14 @@ def main():
             if not client.bytesAvailable():return
             command=bytes(client.readAll())
             if command==b'update-exit':
-                if window.observer_panel.busy():
+                if window.observer_panel.busy() or getattr(window,'_closing',False):
                     client.write(b'busy');client.flush()
                 else:
                     client.write(b'ready-to-exit');client.flush()
-                    QTimer.singleShot(100,window.quit_app)
+                    QTimer.singleShot(100,lambda:window.quit_app(handoff=True))
+            elif command==b'verify-quit' and args.verify_services:
+                client.write(b'quitting');client.flush()
+                QTimer.singleShot(100,window.quit_app)
             elif command==b'verify-settings-restart' and args.verify_handoff:
                 def exercise_restart():
                     from .quick_qa import control, click

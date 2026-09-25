@@ -6,6 +6,7 @@ from PySide6.QtGui import QColor, QPen, QPolygonF, QPainter, QFont
 from .presentation import Node
 from .pricing import usd
 from .theme import shared_theme
+from .workload import call_count
 
 def dynamic_bounds(values):
     """Fit visible finite data, with padding even for a constant value."""
@@ -170,9 +171,10 @@ class SourceBars(AnalyticalPlot):
             p.drawText(QRectF(right+8,y,162,step/2),Qt.AlignRight|Qt.AlignVCenter,
                        f"{usd(value)} · {share*100:.1f}%" if share is not None else usd(value))
             p.setPen(self.color('muted'));font=p.font();small=font;small.setPixelSize(12);p.setFont(small)
-            sample=f"{row.get('known',row.get('n',0)):,} / {row.get('calls',row.get('N',0)):,}호출"
+            priced,calls=row.get('known',row.get('n',0)),row.get('calls',row.get('N',0))
+            sample=call_count(priced,calls)+'호출'
             p.drawText(QRectF(right+8,y+step/2,162,step/2),Qt.AlignRight|Qt.AlignVCenter,sample);font.setPixelSize(14);p.setFont(font)
-            self.remember(QRectF(0,y,self.width(),step),row,f"{row.get('label','')} · {usd(value)} · 산정 {row.get('known',0):,} / 대상 {row.get('calls',0):,}")
+            self.remember(QRectF(0,y,self.width(),step),row,f"{row.get('label','')} · {usd(value)} · "+('산정 ' if priced<calls else '')+sample)
 
 def comparison_axis(rows, metric, view='distribution'):
     """Shared linear bounds cover every visible mark, excluding hidden outliers."""

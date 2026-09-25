@@ -60,6 +60,19 @@ def test_call_selection_is_by_identifier_and_never_changes_monitor():
     finally:w.close();app.processEvents()
 
 
+def test_pricing_ratio_requires_an_unpriced_work_call():
+    app=QApplication.instance() or QApplication([]);w=SessionOverlay();data=summary()
+    try:
+        # A cumulative coverage gap is independent of pricing the observed calls.
+        data.update(partial=True,coverage_gap=True,missing=0)
+        w.set_content(data)
+        assert not any('산정 ' in str(item[0]) for item in w.content_model._detail_items)
+        data={**data,'priced':data['calls']-1,'missing':1}
+        w.set_content(data)
+        assert any('산정 ' in str(item[0]) for item in w.content_model._detail_items)
+    finally:w.close();app.processEvents()
+
+
 def test_detail_expansion_preserves_monitor_pixels_and_font_scale():
     app=QApplication.instance() or QApplication([]);w=SessionOverlay()
     try:

@@ -40,6 +40,19 @@ def test_standard_report_keeps_unknown_mode_separate_and_unpriced(tmp_path):
     finally:ledger.close()
 
 
+def test_internal_review_stays_in_ledger_but_not_work_usage_or_models(tmp_path):
+    ledger=QuotaLedger(tmp_path/'internal-review.sqlite')
+    try:
+        ledger.observe('h',quota(100,20))
+        ledger.observe('h',quota(200,30))
+        sync(ledger,[row(),row('review',160,model='codex-auto-review')])
+        cycle=ledger.report('h',300)['cycles'][0]
+        assert {r['model'] for r in cycle['models']}=={'gpt-6-astra'}
+        assert sum(r['calls'] for r in cycle['models'])==cycle['priced_calls']==1
+        assert ledger.db.execute("select count(*) from calls where model='codex-auto-review'").fetchone()[0]==1
+    finally:ledger.close()
+
+
 def test_same_window_formula_cache_and_reasoning_not_double_counted(tmp_path):
     ledger = QuotaLedger(tmp_path/'cycles.sqlite')
     try:
