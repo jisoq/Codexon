@@ -326,6 +326,27 @@ def test_natural_policy_consent_capture_wire_and_final_accounting(tmp_path,sourc
     run_proxy_test(scenario())
 
 
+@pytest.mark.parametrize('observation_only,automatic',[(True,False),(False,False),(False,True)])
+def test_expired_inactive_contexts_are_removed_in_every_worker_mode(tmp_path,observation_only,automatic):
+    async def scenario():
+        scheduler=Scheduler('home',tmp_path/'c.sqlite',observation_only=observation_only,continuous_capture=True)
+        scheduler.control.set('automatic',automatic)
+        request=body();original=response();sid=request['prompt_cache_key']
+        scheduler.executor.contexts.completed(request,original)
+        scheduler.snapshot(request,original,time.monotonic()-1801,URL,{'Authorization':'synthetic-secret'},False)
+        scheduler.control.status('home',sid,dict(state='waiting'))
+        scheduler.evaluations[sid]=(original['id'],time.monotonic())
+        try:
+            await scheduler.tick()
+            assert not scheduler.snapshots and not scheduler.evaluations
+            assert not scheduler.executor.contexts.responses and not scheduler.executor.contexts.usage
+            assert scheduler.executor.contexts.size==0 and not scheduler.jobs
+            assert not scheduler.control.db.execute('SELECT 1 FROM cache_status').fetchone()
+            assert scheduler.control.get('worker_snapshots')==0
+        finally:await scheduler.close()
+    run_proxy_test(scenario())
+
+
 def test_observation_prices_current_model_without_execution_scope_or_return_history(tmp_path):
     async def scenario():
         index=tmp_path/'index.sqlite'

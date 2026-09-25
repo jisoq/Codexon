@@ -208,14 +208,16 @@ class CachePanel(Group):
                 self.forecast.setText('');self.estimate.setText('현재 문맥의 예상 비용을 수집하고 있습니다.')
             self.poll_operating()
             heartbeat=self.control.get('worker_heartbeat',0)
-            if heartbeat and time.time()-heartbeat<5:self.proxy_ready=True
-            self.connection_status.setText('작업기 연결됨' if heartbeat and time.time()-heartbeat<20 else
-                '프록시 연결됨 · 분석 갱신 확인 필요' if self.relay_connected else '작업기 연결 확인 필요')
+            fresh=bool(heartbeat and time.time()-heartbeat<20)
+            self.proxy_ready=self.relay_connected and (not heartbeat or fresh)
+            self.connection_status.setText('작업기 연결됨' if self.relay_connected and fresh else
+                '프록시 연결됨 · 분석 갱신 확인 필요' if self.relay_connected else
+                '작업기 실행 중 · 새 요청 연결 꺼짐' if fresh else '작업기 연결 확인 필요')
             diagnostic=self.control.get('diagnostic_result',{})
             self.diagnostic_status.setText('연결 진단 · '+REASONS.get(diagnostic.get('reason'),diagnostic.get('state','')) if diagnostic else '')
             count=self.control.db.execute('SELECT COUNT(*) FROM cache_inputs WHERE home=?',(self.home,)).fetchone()[0]
             if not observed:self.hook_status.setText(formatted('실제 훅 적재 {v0}건', v0=count) if count else '훅 이벤트 미수집 · 신뢰 설정과 실제 실행은 별도입니다')
-            if heartbeat and not self.control.get('worker_snapshots',0):self.status.setText('기존 연결 관측 중 · 새 작업기 문맥 수집 중')
+            if self.proxy_ready and heartbeat and not self.control.get('worker_snapshots',0):self.status.setText('기존 연결 관측 중 · 새 작업기 문맥 수집 중')
             elif any(s.get('observation_only') for s in states):self.status.setText('관측 전용 · 추가 유지 요청 없음 · 사용자 연결 방식 변경 불필요')
             elif not self.control.enabled('automatic'):
                 self.status.setText('자동 유지 꺼짐')
