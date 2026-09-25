@@ -12,7 +12,7 @@ from collections import defaultdict
 from collections import deque
 from pathlib import Path
 
-from .core import LINEAGE_FIELDS, TRANSPORT_FIELDS, Monitor, Session, readonly, stamp, session_lineage
+from .core import LINEAGE_FIELDS, TRANSPORT_FIELDS, SessionRegistry, Session, readonly, stamp, session_lineage
 from .codex_names import CodexNames, task_select
 from .quota import clean_limits
 from .model_evidence import EvidenceReader, default_path as evidence_path, FIELDS as MODEL_FIELDS
@@ -74,20 +74,19 @@ def sanitized(event):
 
 
 class UsageIndex:
-    def __init__(self, homes, path=None, model_evidence_path=None, *, read_only=False):
-        self.read_only=read_only
+    def __init__(self, homes, path=None, model_evidence_path=None):
         self.cache_index_path=path
         self.homes = [Path(h).resolve() for h in homes]
-        self.path = Path(path) if path else Path(os.environ.get('LOCALAPPDATA', Path.home())) / 'CacheMonitor' / 'usage-index.sqlite'
+        self.path = Path(path) if path else Path(os.environ.get('LOCALAPPDATA', Path.home())) / 'CacheSessionRegistry' / 'usage-index.sqlite'
         if any(self.path.resolve().is_relative_to(h) for h in self.homes):
             raise ValueError('앱 색인은 Codex 원본 폴더 밖에 저장해야 합니다')
-        if not read_only:self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(self.path.resolve().as_uri()+'?mode=ro',uri=True) if read_only else sqlite3.connect(self.path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.db = sqlite3.connect(self.path)
         tables = {r[0] for r in self.db.execute("select name from sqlite_master where type='table'")}
         if tables - {'files','events','metadata'}:
             self.db.close()
             raise ValueError('다른 데이터베이스를 앱 색인으로 사용할 수 없습니다')
-        if not read_only:self.db.executescript('''
+        self.db.executescript('''
             PRAGMA journal_mode=WAL;
             CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY, home TEXT, tid TEXT,
                 offset INTEGER, size INTEGER, mtime INTEGER, inode TEXT);
@@ -99,11 +98,11 @@ class UsageIndex:
         # Recover settings snapshots and top-level compactions omitted by older
         # scanners. Keep existing events while this incremental backfill proceeds.
         self.tier_backfill=self.db.execute('pragma user_version').fetchone()[0]<4
-        if self.tier_backfill and not read_only:
+        if self.tier_backfill:
             self.db.execute('update files set offset=0')
             self.db.execute('pragma user_version=4')
             self.db.commit()
-        self.monitor = Monitor(self.homes)
+        self.monitor = SessionRegistry()
         self.metadata = {(r[0],r[1]):json.loads(r[2]) for r in self.db.execute('select home,tid,data from metadata') if r[0] in {str(h) for h in self.homes}}
         self.files = []
         self.queue = deque()
@@ -130,7 +129,6 @@ class UsageIndex:
         self.names = {}
         self.lineage = {key:{field:meta[field] for field in LINEAGE_FIELDS if field in meta}
                         for key,meta in self.metadata.items() if meta.get('parent_thread_id')}
-        self.indexed_files={}
 
     def observe_quota(self,home,limits,observed):
         if limits is None or not observed: return
@@ -165,7 +163,6 @@ class UsageIndex:
                 except (OSError,ValueError,TypeError,AttributeError): continue
 
     def discover(self, now):
-        if self.read_only:raise RuntimeError('Read-only index cannot collect source records')
         paths = {}
         for home in self.homes:
             try:
@@ -214,7 +211,6 @@ class UsageIndex:
         self.last_discovery = now
 
     def scan_file(self, path, home, tid):
-        if self.read_only:raise RuntimeError('Read-only index cannot collect source records')
         p = Path(path)
         try:
             st = p.stat()
@@ -363,7 +359,6 @@ class UsageIndex:
         self.loaded.add(key)
 
     def poll(self, now=None):
-        if self.read_only:return self.poll_index(now)
         now = now or time.time()
         self.errors = []
         if not self.queue and (not self.files or now - self.last_discovery >= 10):
@@ -395,33 +390,8 @@ class UsageIndex:
         if usage_complete:self.last_usage_success=now
         return self.snapshot(now,changed,usage_complete,usage_errors)
 
-    def poll_index(self, now=None):
-        """Compatibility reader for a running older collector; never scan rollouts."""
-        now=now or time.time();self.errors=[]
-        homes={str(home) for home in self.homes}
-        self.db.execute('BEGIN')
-        try:
-            files={r[0]:tuple(r[1:]) for r in self.db.execute('select path,home,tid,offset,size,mtime,inode from files') if r[1] in homes}
-            metadata={(r[0],r[1]):json.loads(r[2]) for r in self.db.execute('select home,tid,data from metadata') if r[0] in homes}
-            changed={tuple(row[:2]) for path,row in files.items() if self.indexed_files.get(path)!=row}
-            changed.update(tuple(row[:2]) for path,row in self.indexed_files.items() if path not in files)
-            changed.update(key for key,meta in metadata.items() if self.metadata.get(key)!=meta)
-            self.metadata=metadata
-            for key in changed:
-                self.rebuild_required.add(key);self.rebuild(key,now)
-            self.indexed_files=files
-        finally:self.db.rollback()
-        self.files=[(path,row[0],row[1]) for path,row in files.items()]
-        # Legacy indexes retain rows after a rollout is archived or deleted.
-        # Retain their observed events, but absent sources cannot be queued work.
-        self.queue=deque((path,row[0],row[1]) for path,row in files.items() if row[2]<row[3] and Path(path).exists())
-        self.done_files=len(files)-len(self.queue)
-        complete=not self.queue
-        if complete:self.last_usage_success=now
-        return self.snapshot(now,changed,complete,[])
-
     def snapshot(self,now,changed,usage_complete,usage_errors):
-        for home in (() if self.read_only else self.homes):
+        for home in self.homes:
             try:
                 self.monitor.read_logs(home, now)
             except (OSError, sqlite3.Error) as exc:
@@ -431,6 +401,8 @@ class UsageIndex:
             self.errors.append(self.model_evidence.error)
         views = []
         for key, s in self.monitor.sessions.items():
+            meta = self.metadata.get(key, {})
+            s.metadata_seen = bool(meta)
             s.trim(now)
             if s.excluded_title:
                 continue
@@ -438,7 +410,6 @@ class UsageIndex:
                 continue
             view = s.view(now,use_cache=True)
             view['history'] = self.model_evidence.enrich(s.home, view['history'],s.id)
-            meta = self.metadata.get(key, {})
             if not meta.get('project') or not meta.get('project_name'):
                 names=self.names.get(str(s.home))
                 if names:
@@ -476,7 +447,7 @@ class UsageIndex:
         cache_management={}
         try:
             from .cache_integration import enrich
-            cache_management=enrich(views,self.cache_index_path,now,{str(h) for h in self.homes},update_profiles=not self.read_only)
+            cache_management=enrich(views,self.cache_index_path,now,{str(h) for h in self.homes})
         except (sqlite3.Error,OSError):
             self.errors.append('캐시 유지 사용량 연결 실패')
         return {'ts': now, 'sessions': sorted(views, key=lambda s: s['activity'], reverse=True),

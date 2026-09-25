@@ -512,7 +512,7 @@ def main():
                 pool=ThreadPoolExecutor(max_workers=1);index=None
                 def poll():
                     nonlocal index
-                    if index is None:index=CollectionClient([args.codex_home],args.observation_index,args.evidence_path,worker=True)
+                    if index is None:index=CollectionClient([args.codex_home],args.observation_index,args.evidence_path)
                     value=index.poll()
                     # Existing index/enrich owns profile generation. Never synthesize hooks.
                     return value['index']['loading']

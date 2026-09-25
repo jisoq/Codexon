@@ -3,7 +3,7 @@ import argparse,importlib.util,json,math,sqlite3,sys,time
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from cachemonitor.index import UsageIndex
-from cachemonitor.core import Monitor
+from cachemonitor.core import SessionRegistry
 from cachemonitor.analysis_engine import AnalysisEngine
 from cachemonitor.analytics import comparison_view,overview_view
 
@@ -18,7 +18,7 @@ def main():
     idx=UsageIndex.__new__(UsageIndex)
     idx.db=sqlite3.connect(Path(args.index).resolve().as_uri()+'?mode=ro',uri=True)
     idx.metadata={(r[0],r[1]):json.loads(r[2]) for r in idx.db.execute('select home,tid,data from metadata')}
-    idx.monitor=Monitor([]); idx.loaded=set(); idx.turn_states={}
+    idx.monitor=SessionRegistry(); idx.loaded=set(); idx.turn_states={}
     now=time.time()
     for key in idx.db.execute('select distinct home,tid from events').fetchall(): idx.rebuild(key,now)
     sessions=[]

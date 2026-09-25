@@ -23,6 +23,10 @@ The product build also freezes `CodexonRecovery.exe` with its own Python/Tcl/Tk 
 
 Use `-Isolated` and a separate output directory for installation QA. The QA installer uses a separate app ID and never activates the production proxy. Validate the payload with `python tools/package_release.py --product <product-directory> --validate-only`. Publish `Codexon-Setup.exe` and `Codexon-Setup.exe.sha256`; the app updater uses the checksum automatically. Do not publish a portable app ZIP. Keep all bundled third-party notices, source offers and relinking instructions. Signing credentials are not stored in this repository.
 
+## Usage collection
+
+`CollectorService` is the sole owner of source collection and `UsageIndex`. The GUI and cache worker consume `CollectionClient` snapshots. Keep one IPC format and one collection path; retired worker readers, direct scanners and their compatibility branches must be removed with their callers. Move still-relevant tests onto the supported path instead of retaining unused production code for old tests. Add compatibility behavior only for an explicitly supported migration requirement.
+
 ## Graph axes
 
 All numerical graph axes must automatically fit the finite values currently displayed, with readable padding. Do not force a zero origin or a fixed percentage/currency range. Recompute after filters or data changes; ignore missing values rather than treating them as zero, and handle empty or constant series without a degenerate range. Axis labels, marks and inspection coordinates must use the same bounds. Normalized 100% composition strips and progress indicators retain their semantic denominator; they are not absolute-value graph axes.

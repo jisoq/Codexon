@@ -9,7 +9,7 @@ import time
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from cachemonitor.quota_cycles import QuotaLedger
 from cachemonitor.index import UsageIndex
-from cachemonitor.core import Monitor
+from cachemonitor.core import SessionRegistry
 from cachemonitor.analysis_engine import AnalysisEngine
 
 
@@ -39,7 +39,7 @@ def rebuild(source,index_path,destination):
     index=UsageIndex.__new__(UsageIndex)
     index.db=sqlite3.connect(index_path.resolve().as_uri()+'?mode=ro',uri=True)
     index.metadata={(h,s):json.loads(d) for h,s,d in index.db.execute('select home,tid,data from metadata')}
-    index.monitor=Monitor([]);index.loaded=set();index.turn_states={}
+    index.monitor=SessionRegistry();index.loaded=set();index.turn_states={}
     index.new_events=defaultdict(list);index.event_tails={};index.rebuild_required=set()
     now=time.time()
     for key in index.db.execute('select distinct home,tid from events').fetchall():index.rebuild(key,now)

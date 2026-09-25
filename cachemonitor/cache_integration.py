@@ -9,12 +9,12 @@ import json
 import hashlib
 
 
-def enrich(sessions,index_path,now,homes=None,*,update_profiles=True):
+def enrich(sessions,index_path,now,homes=None):
     path=control_path(index_path)
     control=Control(path)
     journal=None
     try:
-        for session in (sessions if update_profiles else ()):
+        for session in sessions:
             history=scoped_history(session.get('history',[]))
             for row in history[-1:]:
                 cohort=[r for r in history if r['policy_scope']==row['policy_scope'] and r['ts']>=now-60*86400]

@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import json
 import re
 import sqlite3
-import time
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -276,9 +274,6 @@ class Session:
     model: str = ""
     provider: str = ""
     cwd: str = ""
-    path: str = ""
-    offset: int = 0
-    identity: tuple = ()
     modern: bool = False
     total_key: tuple = ()
     requests: deque = field(default_factory=deque)
@@ -525,42 +520,19 @@ class Session:
         return result
 
 
-class Monitor:
-    def __init__(self, homes):
-        self.homes = [Path(p).resolve() for p in homes]
+class SessionRegistry:
+    """Sessions and transport observations shared by the usage index."""
+    def __init__(self):
         self.sessions = {}
         self.cursors = {}
         self.title_requests = {}
         self.unassigned = deque()
-        self.errors = []
 
     def session(self, home, tid):
         key = (str(home), tid)
         if key not in self.sessions:
             self.sessions[key] = Session(tid, str(home), title_request=key in self.title_requests)
         return self.sessions[key]
-
-    def read_metadata(self, home, now):
-        with readonly(home / "state_5.sqlite") as conn:
-            columns = {x[1] for x in conn.execute("PRAGMA table_info(threads)")}
-            required = {"id", "rollout_path", "updated_at"}
-            if not required <= columns:
-                raise ValueError("세션 데이터 형식이 지원되지 않습니다")
-            selection = [x for x in ("id", "rollout_path", "name", "title", "model", "model_provider", "cwd") if x in columns]
-            rows = conn.execute(f"SELECT {','.join(selection)} FROM threads WHERE updated_at >= ?", (now - SESSION_WINDOW,))
-            for row in rows:
-                s = self.session(home, row["id"])
-                s.metadata_seen = True
-                for column, attr in (("title", "title"), ("model", "model"), ("model_provider", "provider"), ("cwd", "cwd")):
-                    if column in selection:
-                        setattr(s, attr, row[column] or "")
-                if "name" in selection and row["name"]:
-                    s.title = row["name"]
-                s.title = " ".join(s.title.split())
-                if s.cwd.startswith("\\\\?\\"):
-                    s.cwd = s.cwd[4:]
-                if s.path != row["rollout_path"]:
-                    s.path, s.offset, s.identity, s.modern, s.total_key = row["rollout_path"], 0, (), False, ()
 
     def read_logs(self, home, now):
         with readonly(home / "logs_2.sqlite") as conn:
@@ -600,59 +572,3 @@ class Monitor:
                 else:
                     self.unassigned.append({"home": str(home), **vars(transport)})
             self.cursors[str(home)] = high
-
-    def read_rollout(self, session, now):
-        if not session.path:
-            return
-        path = Path(session.path)
-        stat = path.stat()
-        identity = (stat.st_dev, stat.st_ino)
-        if stat.st_size < session.offset or (session.identity and session.identity != identity):
-            session.offset, session.modern, session.total_key = 0, False, ()
-        session.identity = identity
-        with path.open("rb") as handle:
-            handle.seek(session.offset)
-            consumed = 0
-            while consumed < 8 * 1024 * 1024:
-                pos = handle.tell()
-                line = handle.readline()
-                if not line or not line.endswith(b"\n"):
-                    handle.seek(pos)  # Retry an incomplete UTF-8/JSON line next poll.
-                    break
-                consumed += len(line)
-                # Skip message contents cheaply. They can contain fake event JSON.
-                if any(b'"' + t + b'"' in line[:250] for t in (b"token_usage_record", b"event_msg", b"turn_context")):
-                    try:
-                        event=json.loads(line)
-                        event['event_id']=f'{path.name}:{pos}'
-                        session.consume(event, now)
-                    except (ValueError, TypeError, AttributeError):
-                        self.errors.append(f"일부 기록을 읽지 못했습니다: {session.id[:8]}")
-                session.offset = handle.tell()
-            session.pending = session.offset < stat.st_size
-
-    def poll(self, now=None):
-        now = time.time() if now is None else now
-        self.errors = []
-        for home in self.homes:
-            for label, action in (("세션 목록", self.read_metadata), ("연결 기록", self.read_logs)):
-                try:
-                    action(home, now)
-                except (OSError, sqlite3.Error, ValueError) as exc:
-                    self.errors.append(f"{home.name} / {label}: {exc}")
-        for key, session in list(self.sessions.items()):
-            try:
-                self.read_rollout(session, now)
-            except (OSError, ValueError) as exc:
-                self.errors.append(f"세션 {session.id[:8]} 읽기 실패: {exc}")
-            session.trim(now)
-            if not session.pending and not session.running and session.activity < now - SESSION_WINDOW:
-                del self.sessions[key]
-        self.title_requests = {k: ts for k, ts in self.title_requests.items() if ts >= now - SESSION_WINDOW}
-        self.unassigned = deque(x for x in self.unassigned if x["ts"] >= now - WINDOW)
-        views = sorted((s.view(now) for s in self.sessions.values()
-                        if not s.excluded_title and (s.activity >= now - SESSION_WINDOW or s.running or s.pending)),
-                       key=lambda x: x["activity"], reverse=True)
-        return {"ts": now, "sessions": views, "unassigned": list(self.unassigned),
-                "excluded_title_sessions": sum(s.excluded_title for s in self.sessions.values()),
-                "errors": list(dict.fromkeys(self.errors)), "homes": [str(x) for x in self.homes]}
