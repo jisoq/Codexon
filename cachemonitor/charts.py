@@ -136,7 +136,7 @@ class UsageTrend(AnalyticalPlot):
                     if previous is not None:p.drawLine(previous,QPointF(x,y))
                     p.setBrush(self.color('surface'));p.drawEllipse(QPointF(x,y),3,3);previous=QPointF(x,y)
                 elif value==0:
-                    p.setPen(QPen(self.color('accent'),2));p.drawEllipse(QPointF(x,bottom),2,2)
+                    p.setPen(QPen(self.color('accent'),2));p.drawEllipse(QPointF(x,y),2,2)
                 else:p.fillRect(QRectF(x-min(40,step*.65)/2,y,min(40,step*.65),max(1,bottom-y)),self.color('accent'))
             else:
                 previous=None;p.setPen(QPen(self.color('unknown'),1));p.setBrush(Qt.NoBrush);p.drawEllipse(QPointF(x,bottom),3,3)

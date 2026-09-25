@@ -104,7 +104,10 @@ def test_cache_worker_reuses_single_configured_route_without_model_probe(tmp_pat
     from types import SimpleNamespace
     home=tmp_path/'home';home.mkdir();(home/'config.toml').write_text('openai_base_url="http://127.0.0.1:18771"\n')
     index=tmp_path/'analysis'/'index.sqlite';index.parent.mkdir()
-    manager=CacheWorkerManager(home,index,tmp_path/'model-evidence.sqlite');calls=[]
+    monkeypatch.chdir(tmp_path)
+    manager=CacheWorkerManager(home,'analysis/index.sqlite','model-evidence.sqlite');calls=[]
+    assert manager.index==index.resolve() and manager.evidence==(tmp_path/'model-evidence.sqlite').resolve()
+    assert manager.directory==tmp_path.resolve() and manager.control_lock.is_absolute()
     manager.health_state='ok'
     monkeypatch.setattr(manager,'health',lambda **kw:dict(cache_management=True,version=PROXY_VERSION,active_connections=3))
     manager.task=SimpleNamespace(inspect=lambda:dict(registered=True,autostart=True),

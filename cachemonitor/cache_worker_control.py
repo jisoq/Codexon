@@ -13,9 +13,10 @@ from .version import VERSION,proxy_compatible
 class CacheWorkerManager(ObserverManager):
     shared_cache_worker=True
     def __init__(self,home,index_path,evidence_path):
-        self.index=Path(index_path)
-        super().__init__(home,Path(evidence_path).parent)
-        self.evidence=Path(evidence_path)
+        self.index=Path(index_path).resolve()
+        evidence=Path(evidence_path).resolve()
+        super().__init__(home,evidence.parent)
+        self.evidence=evidence
         self.task=ObserverTask(str(self.home),role='CacheWorker')
         self.route_path=self.index.with_name('cache-route.json')
         route=read_json(self.route_path).get('url') or self.config()[1].get('openai_base_url')
