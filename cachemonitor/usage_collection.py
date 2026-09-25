@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import subprocess
 import sys
 import time
 import uuid
@@ -12,6 +13,10 @@ import zlib
 
 from .observer_state import ProcessLock
 from .version import VERSION
+
+
+class CollectionScopeError(RuntimeError):
+    pass
 
 
 def index_location(path=None):
@@ -47,10 +52,10 @@ class CollectionChannel:
             (self.client,self.scope,json.dumps(self.homes),now));self.db.commit()
 
     def requested_homes(self,now):
-        homes=set(self.homes)
-        for row in self.db.execute('SELECT homes FROM consumers WHERE scope=? AND observed>=?',(self.scope,now-60)):
-            homes.update(json.loads(row[0]))
-        return sorted(homes)
+        homes=list(self.homes)
+        for row in self.db.execute('SELECT homes FROM consumers WHERE scope=? AND observed>=? ORDER BY observed,id',(self.scope,now-60)):
+            homes.extend(home for home in json.loads(row[0]) if home not in homes)
+        return homes
 
     def publish(self,snapshot,epoch,sequence):
         payload=zlib.compress(json.dumps(snapshot,ensure_ascii=False,separators=(',',':')).encode('utf-8'),1)
@@ -61,7 +66,11 @@ class CollectionChannel:
         with closing(sqlite3.connect(self.snapshot_path.as_uri()+'?mode=ro',uri=True)) as db:
             db.execute('BEGIN')
             row=db.execute('SELECT scope,epoch,sequence FROM snapshot WHERE id=1').fetchone()
-            if not row or row[0]!=self.scope:return None
+            if not row:return None
+            if row[0]!=self.scope:
+                if locked(self.path.with_suffix('.collector.lock')):
+                    raise CollectionScopeError('사용량 색인에 다른 관측 DB가 연결되어 있습니다. 별도 색인 경로를 사용하세요.')
+                return None
             identity=(row[1],row[2])
             if identity!=self.identity:
                 payload=db.execute('SELECT payload FROM snapshot WHERE id=1').fetchone()[0]
@@ -101,19 +110,50 @@ class CollectionClient:
 
     def ensure_service(self,now,snapshot):
         if not self.autostart or now<self.next_start:return
-        if snapshot and now-snapshot['ts']<=30:return
+        collection=(snapshot or {}).get('collection',{})
+        version=collection.get('version')
+        newer=bool(version and tuple(int(p) for p in version.split('.') if p.isdigit())>
+                   tuple(int(p) for p in VERSION.split('.')))
+        different_binary=bool(getattr(sys,'frozen',False) and
+            collection.get('executable')!=str(Path(sys.executable).resolve()))
+        if different_binary and version==VERSION:
+            from .installation import installed
+            active=installed().get('AppPath')
+            if active and Path(active).resolve()!=Path(sys.executable).resolve():different_binary=False
+        replace=bool(collection and not newer and (version!=VERSION or different_binary))
+        if newer:return
+        if snapshot and now-snapshot['ts']<=30 and not replace:return
         self.next_start=now+30
         from .observer_task import ObserverTask
         # Task Scheduler owns lifetime/restart outside the GUI's process tree.
         # Only the dedicated executable acquires the source collector lock.
-        ObserverTask(str(self.path),role='UsageCollector').start(self.command(),autostart=False)
+        task=ObserverTask(str(self.path),role='UsageCollector')
+        if replace:
+            # Register the replacement before requesting a cooperative stop.
+            # Never terminate a GUI, cache worker, or active proxy connection.
+            with ProcessLock(self.path.with_suffix('.collector-update.lock')):
+                current=self.channel.read()
+                if not current or current.get('collection',{}).get('instance')!=collection['instance']:return
+                task.configure(self.command(),autostart=False)
+                self.channel.db.execute('INSERT OR REPLACE INTO control VALUES(?,?)',(collection['instance'],'stop'))
+                self.channel.db.commit()
+                deadline=time.monotonic()+3
+                while locked(self.path.with_suffix('.collector.lock')):
+                    if time.monotonic()>=deadline:raise RuntimeError('백그라운드 수집기 교체 대기')
+                    time.sleep(.05)
+        task.start(self.command(),autostart=False)
 
     def poll(self,now=None):
-        now=now or time.time();self.channel.subscribe(now)
-        snapshot=self.channel.read()
+        now=now or time.time()
+        try:snapshot=self.channel.read()
+        except CollectionScopeError as error:
+            snapshot=empty_snapshot(self.channel.homes,self.path,now)
+            snapshot['errors']=[str(error)];snapshot['index']['loading']=False
+            return snapshot
+        self.channel.subscribe(now)
         start_error=False
         try:self.ensure_service(now,snapshot)
-        except (OSError,RuntimeError):start_error=True
+        except (OSError,RuntimeError,subprocess.SubprocessError):start_error=True
         if snapshot is None:snapshot=empty_snapshot(self.channel.homes,self.path,now)
         elif now-snapshot['ts']>30:
             snapshot['errors']=list(dict.fromkeys([*snapshot.get('errors',[]),'수집 결과 갱신 지연']))
@@ -121,10 +161,13 @@ class CollectionClient:
             snapshot['index']={**snapshot['index'],'usage_complete':False}
         if start_error:snapshot['errors']=[*snapshot.get('errors',[]),'백그라운드 수집기 시작 지연']
         homes=set(self.channel.homes)
+        primary_matches=bool(snapshot['homes'] and self.channel.homes and snapshot['homes'][0]==self.channel.homes[0])
+        if not primary_matches:snapshot['quota']=None
         if set(snapshot['homes'])!=homes:
             missing=not homes.issubset(snapshot['homes'])
             snapshot={**snapshot,'homes':self.channel.homes,
                 'sessions':[s for s in snapshot['sessions'] if s['home'] in homes],
+                'unassigned':[r for r in snapshot.get('unassigned',[]) if r.get('home') in homes],
                 'request_activity':[r for r in snapshot.get('request_activity',[]) if r.get('home') in homes]}
             if missing:
                 snapshot['index']={**snapshot['index'],'loading':True,'usage_complete':False}
@@ -132,6 +175,7 @@ class CollectionClient:
             # The GUI registers all monitored homes. Cache consumers need only
             # status; never expose aggregates from other homes.
             snapshot['cache_management']={};snapshot['quota']=None
+        snapshot['homes']=self.channel.homes
         return snapshot
 
     def close(self):
@@ -167,7 +211,8 @@ class CollectorService:
             if self.index is None:self.index=UsageIndex(homes,self.channel.index_path,self.channel.evidence,read_only=legacy)
             snapshot=self.index.poll(now)
         snapshot={**snapshot,'sessions':[dict(s,usage_revision=f'{self.epoch}:{s.get("usage_revision")}') for s in snapshot['sessions']],
-            'collection':dict(pid=os.getpid(),instance=self.instance,version=VERSION,mode='indexed_compatibility' if legacy else 'dedicated')}
+            'collection':dict(pid=os.getpid(),instance=self.instance,version=VERSION,
+                executable=str(Path(sys.executable).resolve()),mode='indexed_compatibility' if legacy else 'dedicated')}
         self.sequence+=1;self.channel.publish(snapshot,self.epoch,self.sequence);self.last=snapshot
         return snapshot
 
@@ -185,9 +230,11 @@ def main():
     parser.add_argument('--index-path',type=Path,required=True)
     parser.add_argument('--evidence-path',type=Path)
     parser.add_argument('--default-index',action='store_true')
+    parser.add_argument('--instance',help=argparse.SUPPRESS)
     args=parser.parse_args()
     try:service=CollectorService(args.codex_home,None if args.default_index else args.index_path,args.evidence_path)
     except RuntimeError:return 0
+    if args.instance:service.instance=args.instance
     try:
         while not service.stopping():
             snapshot=service.poll()
@@ -195,14 +242,16 @@ def main():
     finally:service.close()
 
 
-def isolated_collector(homes,path,evidence=None):
+def isolated_collector(homes,path,evidence=None,*,reuse=False):
     """QA owns a dedicated child service; never register a persistent test task."""
     import subprocess
     client=CollectionClient(homes,path,evidence,autostart=False)
-    previous=client.channel.read()
-    previous_instance=(previous or {}).get('collection',{}).get('instance')
-    instance=None
-    child=subprocess.Popen(client.command(),stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
+    try:previous=client.channel.read()
+    except BaseException:client.close();raise
+    if reuse and previous and locked(client.path.with_suffix('.collector.lock')):
+        client.close();return lambda:None
+    instance=uuid.uuid4().hex
+    child=subprocess.Popen(client.command()+['--instance',instance],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
         creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0)
     def cleanup():
         if child.poll() is None and instance:
@@ -218,9 +267,11 @@ def isolated_collector(homes,path,evidence=None):
         while time.monotonic()<deadline:
             value=client.channel.read()
             candidate=(value or {}).get('collection',{}).get('instance')
-            if candidate and candidate!=previous_instance:
-                instance=candidate;return cleanup
-            if child.poll() is not None:raise RuntimeError('격리 수집기를 시작하지 못했습니다')
+            if candidate==instance:return cleanup
+            if child.poll() is not None:
+                if reuse and child.returncode==0 and value and locked(client.path.with_suffix('.collector.lock')):
+                    return lambda:None
+                raise RuntimeError('격리 수집기를 시작하지 못했습니다')
             time.sleep(.05)
         raise RuntimeError('격리 수집기 준비 시간 초과')
     except BaseException:cleanup();raise

@@ -80,15 +80,20 @@ def main():
         if sys.stdout is not None:print(text)
         return 1 if result.get('error') else 0
     if args.snapshot:
-        monitor = CollectionClient(homes,args.index_path,args.evidence_path)
-        for _ in range(1000):
-            snapshot = monitor.poll()
-            if not snapshot["index"]["loading"]:
-                break
-            time.sleep(.1)
-        print(json.dumps(snapshot, ensure_ascii=False, indent=2))
-        monitor.close()
-        return 0 if not snapshot["errors"] else 1
+        from .usage_collection import isolated_collector
+        monitor = CollectionClient(homes,args.index_path,args.evidence_path,autostart=False)
+        cleanup=lambda:None
+        try:
+            cleanup=isolated_collector(homes,args.index_path,args.evidence_path,reuse=True)
+            for _ in range(1000):
+                snapshot = monitor.poll()
+                if not snapshot["index"]["loading"] or snapshot['errors']:
+                    break
+                time.sleep(.1)
+            print(json.dumps(snapshot, ensure_ascii=False, indent=2))
+            return 0 if not snapshot["errors"] else 1
+        finally:
+            monitor.close();cleanup()
     configure_font_rendering()
     configure_high_dpi()
     app = QApplication(sys.argv[:1])
