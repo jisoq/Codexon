@@ -5,6 +5,31 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 import pytest
 from cachemonitor.cache_control import Control,control_path,hook_decision
+
+
+@pytest.mark.parametrize('oversized',[False,True])
+@pytest.mark.parametrize('observe_only',[False,True])
+def test_hook_payload_limit_does_not_bypass_confirmation(monkeypatch,capsys,tmp_path,oversized,observe_only):
+    import io
+    from types import SimpleNamespace
+    from cachemonitor import cache_control
+    event=dict(hook_event_name='UserPromptSubmit',session_id='s',turn_id='t',model='gpt-6-sol',prompt='')
+    raw=json.dumps(event).encode()
+    event['prompt']='x'*(1024*1024-len(raw)+int(oversized))
+    raw=json.dumps(event).encode();assert len(raw)==1024*1024+int(oversized)
+    calls=[]
+    monkeypatch.setattr(cache_control.sys,'argv',['hook','--database',str(tmp_path/'c.sqlite')]+(['--observe-only'] if observe_only else []))
+    monkeypatch.setattr(cache_control.sys,'stdin',SimpleNamespace(buffer=io.BytesIO(raw)))
+    def decide(path,home,value,**options):
+        calls.append((value,options));return {}
+    monkeypatch.setattr(cache_control,'hook_decision',decide)
+    assert cache_control.hook_main()==0
+    result=json.loads(capsys.readouterr().out)
+    if oversized:
+        assert not calls
+        assert (result=={}) if observe_only else (result['continue'] is False)
+    else:
+        assert result=={} and calls==[(event,dict(observe_only=observe_only))]
 from cachemonitor.cache_execution import Journal
 from cachemonitor.cache_integration import enrich
 from cachemonitor.cache_policy import cost_bounds

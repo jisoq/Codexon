@@ -153,9 +153,14 @@ def hook_main():
     parser.add_argument('--observe-only',action='store_true')
     args=parser.parse_args()
     try:
-        event=json.loads(sys.stdin.buffer.read(1024*1024))
-        home=str(Path(os.environ.get('CODEX_HOME',Path.home()/'.codex')).resolve())
-        result=hook_decision(args.database,home,event,observe_only=args.observe_only)
+        limit=1024*1024
+        raw=sys.stdin.buffer.read(limit+1)
+        if len(raw)>limit:
+            result={} if args.observe_only else {'continue':False,'stopReason':'Codexon: hook input exceeds 1 MiB; confirmation could not be checked.'}
+        else:
+            event=json.loads(raw)
+            home=str(Path(os.environ.get('CODEX_HOME',Path.home()/'.codex')).resolve())
+            result=hook_decision(args.database,home,event,observe_only=args.observe_only)
     except Exception:result={}
     # stdout is a protocol, never a debug or user instruction channel.
     sys.stdout.write(json.dumps(result));sys.stdout.flush()
