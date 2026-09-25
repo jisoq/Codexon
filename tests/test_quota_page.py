@@ -49,7 +49,9 @@ def test_responsive_page_chart_and_single_details_path(quota_page,tmp_path,width
     host=mount(scroll,width,height)
     try:
         plot=render_plot(host,panel.history)
-        assert panel.history.axis[0]>0 and panel.history.axis[1]==100
+        remaining=[row['remaining'] for row in panel.history.rows]
+        assert 0<panel.history.axis[0]<min(remaining)
+        assert panel.history.axis[1]>max(remaining)
         assert panel.basis.text()=='9%p'
         assert '정기 초기화' in panel.cycle_choice.currentText()
         assert all(r['local_observed'] for r in panel.history.rows)

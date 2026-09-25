@@ -95,12 +95,12 @@ class UsageIndex:
             CREATE INDEX IF NOT EXISTS events_session ON events(home,tid,ts);
             CREATE TABLE IF NOT EXISTS metadata(home TEXT, tid TEXT, data TEXT, PRIMARY KEY(home,tid));
         ''')
-        # Re-read source incrementally once to recover settings snapshots omitted
-        # by the old sanitizer. Keep existing events while this backfill proceeds.
-        self.tier_backfill=self.db.execute('pragma user_version').fetchone()[0]<3
+        # Recover settings snapshots and top-level compactions omitted by older
+        # scanners. Keep existing events while this incremental backfill proceeds.
+        self.tier_backfill=self.db.execute('pragma user_version').fetchone()[0]<4
         if self.tier_backfill:
             self.db.execute('update files set offset=0')
-            self.db.execute('pragma user_version=3')
+            self.db.execute('pragma user_version=4')
             self.db.commit()
         self.monitor = Monitor(self.homes)
         self.metadata = {(r[0],r[1]):json.loads(r[2]) for r in self.db.execute('select home,tid,data from metadata') if r[0] in {str(h) for h in self.homes}}
@@ -278,7 +278,7 @@ class UsageIndex:
                     break
                 consumed += len(line)
                 digest.update(line)
-                if any(t in line[:250] for t in (b'"turn_context"', b'"token_usage_record"', b'"event_msg"')):
+                if any(t in line[:250] for t in (b'"turn_context"', b'"token_usage_record"', b'"event_msg"', b'"compacted"')):
                     try:
                         clean = sanitized(json.loads(line))
                         if clean:

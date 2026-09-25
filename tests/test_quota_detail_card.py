@@ -212,6 +212,12 @@ def test_dynamic_axes_fit_values_and_ignore_missing():
     assert dynamic_bounds([900,901])[0]>0
     assert dynamic_bounds([None,50,51])[0]>0
     assert dynamic_bounds([None,float('nan')])==(0,1)
+    assert dynamic_bounds([0])[0]<0<dynamic_bounds([0])[1]
+    assert dynamic_bounds([0,1])[0]<0
+    from cachemonitor.quota_panel import remaining_axis
+    assert remaining_axis([dict(remaining=0)])[0]<0
+    assert remaining_axis([dict(remaining=100)])[1]>100
+    assert remaining_axis([dict(remaining=None)])[0:2]==(0,1)
     assert comparison_axis([{'value':98},{'value':99}], 'cache_ratio')[0]>90
 
 

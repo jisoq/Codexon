@@ -9,7 +9,7 @@ BUCKET_SECONDS=300
 def prepare_model_share(series, intervals):
     rows=series['rows'];times=series['times']
     if not rows:return dict(bins={},spans=[],models=[])
-    additions=defaultdict(lambda:defaultdict(float));unknown=set();names=set()
+    additions=defaultdict(lambda:defaultdict(lambda:defaultdict(float)));unknown=set();names=set()
     for interval in intervals:
         separate=set(interval.get('separate_models',[]))
         for event in interval.get('cost_rows',[]):
@@ -19,7 +19,7 @@ def prepare_model_share(series, intervals):
             if index>=len(rows) or rows[index]['at']>interval['end']:continue
             cost=event.get('cost');names.add(name)
             if cost is None or not math.isfinite(cost) or cost<0:unknown.add(index)
-            else:additions[index][name]+=cost
+            else:additions[index][math.floor(event['ts']/BUCKET_SECONDS)][name]+=cost
         for at in interval.get('pending_usage_times',[]):
             index=bisect_left(times,at)
             if index<len(rows):unknown.add(index)
@@ -41,12 +41,14 @@ def prepare_model_share(series, intervals):
         after=row.get('period_cost',row.get('cycle_cost'))
         values=additions[index]
         verified=(before is not None and after is not None and
-                  math.isclose(after-before,sum(values.values()),rel_tol=0,abs_tol=1e-7))
+                  math.isclose(after-before,sum(sum(costs.values()) for costs in values.values()),rel_tol=0,abs_tol=1e-7))
         item['unknown']|=not verified or index in unknown
         if not verified or index in unknown:
             for covered in range(first,last+1):
                 if covered in bins:bins[covered]['unknown']=True
-        for name,cost in values.items():item['costs'][name]=item['costs'].get(name,0)+cost
+        for event_bucket,costs in values.items():
+            item=bins.setdefault(event_bucket,dict(costs={},unknown=False))
+            for name,cost in costs.items():item['costs'][name]=item['costs'].get(name,0)+cost
     for bucket,item in bins.items():
         item['start']=bucket*BUCKET_SECONDS;item['end']=(bucket+1)*BUCKET_SECONDS
         item['total']=sum(item['costs'].values())

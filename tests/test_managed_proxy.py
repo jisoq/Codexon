@@ -27,19 +27,28 @@ def test_same_journal_relay_transition_cannot_recover_a_live_request(tmp_path,fi
             '--codex-home',str(home),'--evidence-path',str(manager.evidence),'--port',url.rsplit(':',1)[1]]
         if mode=='cache-worker':value+=['--observation-index',str(directory/'index.sqlite')]
         return value
-    processes=[]
+    processes=[];controls={}
     def start(mode):
         process=subprocess.Popen(command(mode,manager.url),stdout=subprocess.PIPE,stderr=subprocess.PIPE)
         processes.append(process);deadline=time.monotonic()+20
         while time.monotonic()<deadline:
             health=manager.health(timeout=.5)
-            if health:return process,health
+            if health:
+                controls[process.pid]=health.get('control_id')
+                return process,health
             if process.poll() is not None:raise AssertionError(process.communicate())
             time.sleep(.1)
         raise AssertionError('fixture relay did not start')
-    def stop(process):
+    def stop(process,graceful=False):
         # Only this fixture's process tree; Windows venv uses a redirector parent.
         if process.poll() is not None:return
+        if graceful:
+            from cachemonitor.observer_control import atomic_write
+            identity=controls[process.pid];assert identity
+            atomic_write(directory/('proxy-control-'+identity+'.json'),json.dumps(dict(action='drain',id=identity)).encode())
+            process.communicate(timeout=35)
+            assert process.returncode==0
+            return
         if os.name=='nt':subprocess.run(['taskkill','/PID',str(process.pid),'/T','/F'],capture_output=True,timeout=10)
         else:process.terminate()
         process.communicate(timeout=10)
@@ -55,12 +64,13 @@ def test_same_journal_relay_transition_cannot_recover_a_live_request(tmp_path,fi
         assert {row['state'] for row in journal.rows()}=={'sent'}
         assert manager.health(timeout=1)['pid']==health['pid']
         journal.finish(live,'completed',response())
-        stop(first)
+        stop(first,graceful=first_mode=='cache-worker')
         second,health=start(other)
         rows={row['sid']:row for row in journal.rows()}
         assert rows['live']['state']=='completed' and rows['live']['usage_known']
         assert rows['abandoned']['state']=='unknown' and not rows['abandoned']['usage_known']
         assert health['requests']==0
+        stop(second,graceful=other=='cache-worker')
     finally:
         for process in reversed(processes):stop(process)
         if journal:journal.close()

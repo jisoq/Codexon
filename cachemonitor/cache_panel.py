@@ -12,7 +12,7 @@ from .pricing import usd,token_cost
 from .quick_runtime import Confirmation
 from .ui_details import Details
 from .table_model import LazyTable
-from .i18n import Verbatim
+from .i18n import Verbatim,formatted,tr
 
 
 def copy(text='',style='muted'):
@@ -200,13 +200,10 @@ class CachePanel(Group):
             forecasts=self.control.forecasts(self.home,time.time())
             if forecasts:
                 s=max(forecasts,key=lambda s:s.get('observed_at',0))
-                self.estimate.setText(f"유지 1회 예상 {usd(s['maintenance_expected'])} · 재사용 실패 시 {usd(s['maintenance_adverse'])}\nAPI 환산 예상이며 실제 비용 상한이 아닙니다.")
-                self.forecast.setText(f"현재 문맥 예상 · {s.get('model')} · {s.get('effort')} · {s.get('service_tier')}\n"
-                    f"사용자 {s.get('source_transport')} → 별도 유지 {s.get('maintenance_transport')}\n"
-                    f"1회 예상 C {usd(s['maintenance_expected'])} · 재사용 실패 시나리오 {usd(s['maintenance_adverse'])} · 2C {usd(s['cost_stop_scenario'])}\n"
-                    'API 환산 시나리오 · 총비용 상한이나 유지 효과 실측이 아닙니다. 관측만으로 실행되지 않습니다.'
-                    +(' 새 실행 경로의 문맥은 아직 미확인입니다.' if self.control.get('worker_heartbeat') and s.get('worker_revision')!=3 else
-                      ' 현재 문맥은 실행 범위 밖입니다.' if not s.get('operating_scope_available') else ''))
+                self.estimate.setText(formatted('유지 1회 예상 {v0} · 재사용 실패 시 {v1}\nAPI 환산 예상이며 실제 비용 상한이 아닙니다.', v0=usd(s['maintenance_expected']), v1=usd(s['maintenance_adverse'])))
+                self.forecast.setText(Verbatim(formatted('현재 문맥 예상 · {v0} · {v1} · {v2}\n사용자 {v3} → 별도 유지 {v4}\n1회 예상 C {v5} · 재사용 실패 시나리오 {v6} · 2C {v7}\nAPI 환산 시나리오 · 총비용 상한이나 유지 효과 실측이 아닙니다. 관측만으로 실행되지 않습니다.', v0=s.get('model'), v1=s.get('effort'), v2=s.get('service_tier'), v3=s.get('source_transport'), v4=s.get('maintenance_transport'), v5=usd(s['maintenance_expected']), v6=usd(s['maintenance_adverse']), v7=usd(s['cost_stop_scenario']))
+                    +tr(' 새 실행 경로의 문맥은 아직 미확인입니다.' if self.control.get('worker_heartbeat') and s.get('worker_revision')!=3 else
+                      ' 현재 문맥은 실행 범위 밖입니다.' if not s.get('operating_scope_available') else '')))
             else:
                 self.forecast.setText('');self.estimate.setText('현재 문맥의 예상 비용을 수집하고 있습니다.')
             self.poll_operating()
@@ -217,7 +214,7 @@ class CachePanel(Group):
             diagnostic=self.control.get('diagnostic_result',{})
             self.diagnostic_status.setText('연결 진단 · '+REASONS.get(diagnostic.get('reason'),diagnostic.get('state','')) if diagnostic else '')
             count=self.control.db.execute('SELECT COUNT(*) FROM cache_inputs WHERE home=?',(self.home,)).fetchone()[0]
-            if not observed:self.hook_status.setText(f'실제 훅 적재 {count}건' if count else '훅 이벤트 미수집 · 신뢰 설정과 실제 실행은 별도입니다')
+            if not observed:self.hook_status.setText(formatted('실제 훅 적재 {v0}건', v0=count) if count else '훅 이벤트 미수집 · 신뢰 설정과 실제 실행은 별도입니다')
             if heartbeat and not self.control.get('worker_snapshots',0):self.status.setText('기존 연결 관측 중 · 새 작업기 문맥 수집 중')
             elif any(s.get('observation_only') for s in states):self.status.setText('관측 전용 · 추가 유지 요청 없음 · 사용자 연결 방식 변경 불필요')
             elif not self.control.enabled('automatic'):
@@ -253,29 +250,17 @@ class CachePanel(Group):
             if maintenance:
                 reason_maintenance=maintenance['stopped'] or ('permission_expired' if maintenance['expires']<=time.time() else None)
                 self.operation_badge.setText(REASONS.get(reason_maintenance,'운용 종료') if reason_maintenance else
-                    f"운용 허용됨 · 남은 {self.journal.operations.stats(maintenance)['remaining']}회")
+                    formatted('운용 허용됨 · 남은 {v0}회', v0=self.journal.operations.stats(maintenance)['remaining']))
             else:self.operation_badge.setText('자동 유지 운용 허용 없음')
-            self.operating_status.setText(f"계정 {g['scope']['account'][:12]} · {g['scope']['model']} · 남은 {s['remaining']}/{g['max_calls']}회\n"
-                f"API 환산 관측 확인분 {usd(s['observed'])} / 후속 중단 기준 {usd(g['cost_stop'])} · 비용 미확인 {s['unknown']}회\n"
-                f"{REASONS.get(reason,reason) if reason else ('진단만 허용됨' if g.get('purpose')=='diagnostic' else '허용됨 · 자동 정책이 이득 있는 경우만 예약')} · 종료 {time.strftime('%H:%M',time.localtime(g['expires']))}")
+            self.operating_status.setText(formatted('계정 {v0} · {v1} · 남은 {v2}/{v3}회\nAPI 환산 관측 확인분 {v4} / 후속 중단 기준 {v5} · 비용 미확인 {v6}회\n{v7} · 종료 {v8}', v0=g['scope']['account'][:12], v1=g['scope']['model'], v2=s['remaining'], v3=g['max_calls'], v4=usd(s['observed']), v5=usd(g['cost_stop']), v6=s['unknown'], v7=tr(REASONS.get(reason, reason) if reason else '진단만 허용됨' if g.get('purpose') == 'diagnostic' else '허용됨 · 자동 정책이 이득 있는 경우만 예약'), v8=time.strftime('%H:%M', time.localtime(g['expires']))))
 
     def show_operating(self):
         if self.operating_dialog:return
         proposals=[p for p in self.journal.operations.proposals(self.home) if p.get('purpose','maintenance')=='maintenance']
         if not proposals:return
         proposal=proposals[0];scope=proposal['scope']
-        text=(f"계정 {scope['account'][:12]}\n홈 {scope['home']}\n"
-            f"{scope['model']} · {scope['effort']} · Standard · HTTP\n"
-            '사용자 대화는 기존 연결 유지 · 복원한 전체 문맥으로 별도 HTTP 유지 요청\n'
-            f"동의 후 60분, 모든 세션 합계 최대 2회, 순차 실행\n"
-            f"1회 예상 {usd(proposal['expected'])}, 캐시 재사용 실패 시나리오 {usd(proposal['adverse'])}\n"
-            f"관측 API 환산 합계 {usd(proposal['cost_stop'])} 도달 시 후속 호출 중단\n\n"
-            '예상치는 자연 작업의 출력·추론과 현재 문맥에 근거합니다. 실측 유지 기록이 있으면 함께 반영합니다. '
-            '서버측 출력 상한은 보장되지 않으며, 한 호출이 위 예상·시나리오·중단 기준을 초과할 수 있습니다. '
-            '30초 연결 제한도 서버 처리·비용 중단 보장이 아닙니다. 오류·미확인 비용·예상 초과·재사용 저하는 후속 실행을 중단합니다. '
-            '이는 구독 한도나 실제 청구액이 아닙니다. 자동 정책이 순이득 없음을 선택하면 호출하지 않습니다.\n'
-            '이 범위를 허용할까요? 자동 유지 설정과 프록시·훅 연결은 별도로 필요합니다.')
-        self.operating_dialog=Confirmation('총비용 상한 없는 제한 운용',text,self)
+        text=(formatted('계정 {v0}\n홈 {v1}\n{v2} · {v3} · Standard · HTTP\n사용자 대화는 기존 연결 유지 · 복원한 전체 문맥으로 별도 HTTP 유지 요청\n동의 후 60분, 모든 세션 합계 최대 2회, 순차 실행\n1회 예상 {v4}, 캐시 재사용 실패 시나리오 {v5}\n관측 API 환산 합계 {v6} 도달 시 후속 호출 중단\n\n예상치는 자연 작업의 출력·추론과 현재 문맥에 근거합니다. 실측 유지 기록이 있으면 함께 반영합니다. 서버측 출력 상한은 보장되지 않으며, 한 호출이 위 예상·시나리오·중단 기준을 초과할 수 있습니다. 30초 연결 제한도 서버 처리·비용 중단 보장이 아닙니다. 오류·미확인 비용·예상 초과·재사용 저하는 후속 실행을 중단합니다. 이는 구독 한도나 실제 청구액이 아닙니다. 자동 정책이 순이득 없음을 선택하면 호출하지 않습니다.\n이 범위를 허용할까요? 자동 유지 설정과 프록시·훅 연결은 별도로 필요합니다.', v0=scope['account'][:12], v1=scope['home'], v2=scope['model'], v3=scope['effort'], v4=usd(proposal['expected']), v5=usd(proposal['adverse']), v6=usd(proposal['cost_stop'])))
+        self.operating_dialog=Confirmation(tr('총비용 상한 없는 제한 운용'),text,self,scrollable=True)
         self.operating_dialog.resize(650,580)
         self.operating_dialog.confirm.setText('이 범위 허용')
         self.operating_dialog.finished.connect(lambda result:self.operating_decided(result,proposal['id']))
@@ -304,9 +289,7 @@ class CachePanel(Group):
 
     def show_ticket(self,ticket):
         self.ticket=ticket;self.choice='dismiss'
-        self.dialog=Confirmation('모델 변경 확인',f"{ticket['model']} 모델로 이번 요청을 진행할까요?\n"
-            '같은 크기의 입력을 새 모델에서 처리하면 부담이 커질 수 있습니다. 기존 모델의 캐시가 삭제된다는 뜻은 아닙니다.\n'
-            '60초 안에 선택하세요. 닫기·시간 초과는 이번 요청을 중단합니다.',self)
+        self.dialog=Confirmation(tr('모델 변경 확인'),formatted('{v0} 모델로 이번 요청을 진행할까요?\n같은 크기의 입력을 새 모델에서 처리하면 부담이 커질 수 있습니다. 기존 모델의 캐시가 삭제된다는 뜻은 아닙니다.\n60초 안에 선택하세요. 닫기·시간 초과는 이번 요청을 중단합니다.', v0=ticket['model']),self)
         self.dialog.confirm.setText('이 요청 진행')
         self.dialog.cancel.clicked.connect(lambda:setattr(self,'choice','cancel'))
         self.dialog.finished.connect(self.decided);self.dialog.open()
@@ -320,36 +303,35 @@ class CachePanel(Group):
         self.dialog=None;self.ticket=None
 
     def display(self,data):
-        self.metrics['calls'].setText(f"{data.get('calls',0):,}회")
+        self.metrics['calls'].setText(formatted('{v0:,}회', v0=data.get('calls', 0)))
         self.metrics['cost'].setText(usd(data.get('known_cost')) if data.get('priced') else '—')
-        self.metrics['unknown'].setText(f"{data.get('calls',0)-data.get('priced',0):,}회")
+        self.metrics['unknown'].setText(formatted('{v0:,}회', v0=data.get('calls', 0) - data.get('priced', 0)))
         self.metrics['saving'].setText('미확인')
-        self.summary.setText(f'독립 요청 {data.get("calls",0)}회 (진단 {data.get("diagnostic_calls",0)}회) · API 환산 확인분 {usd(data.get("known_cost")) if data.get("priced") else "—"} · 비용 미확인 {data.get("calls",0)-data.get("priced",0)}회\n'
-            f'최근 비교 가능한 읽기 감소 {data.get("shortfalls",0)}회 · 절감 실측: 미확인')
+        self.summary.setText(formatted('독립 요청 {v0}회 (진단 {v1}회) · API 환산 확인분 {v2} · 비용 미확인 {v3}회\n최근 비교 가능한 읽기 감소 {v4}회 · 절감 실측: 미확인', v0=data.get('calls', 0), v1=data.get('diagnostic_calls', 0), v2=usd(data.get('known_cost')) if data.get('priced') else '—', v3=data.get('calls', 0) - data.get('priced', 0), v4=data.get('shortfalls', 0)))
         names=dict(session_start='시작',model_changed='모델 변경',effort_changed='effort 변경',
                    service_tier_changed='모드 변경',idle_over_design_lifetime='30분 이상 간격',compaction='압축')
         lines=[];activities=[]
         for row in data.get('audit',[])[-12:]:
-            changes=' · '.join(names.get(c,c) for c in row['changes'])
-            scope=f"읽기 감소 시나리오 {row['reuse_shortfall_scenario']:,}토큰" if row.get('reuse_shortfall_scenario') else ''
+            changes=' · '.join(tr(names.get(c,c)) for c in row['changes'])
+            scope=formatted('읽기 감소 시나리오 {v0:,}토큰', v0=row['reuse_shortfall_scenario']) if row.get('reuse_shortfall_scenario') else ''
             if changes or scope:
                 activities.append([Verbatim(row['title']),changes or scope,
                     f"{row['read']:,}" if row.get('read') is not None else '미관측',
                     f"{row['written']:,}" if row.get('written') is not None else '미관측'])
-                lines.append(f"{row['title']} · {changes or scope} · 읽기 {row.get('read') if row.get('read') is not None else '미관측'} / 쓰기 {row.get('written') if row.get('written') is not None else '미관측'}")
-        self.audit.setText('최근 캐시 분석 · 선행 변화는 확정 원인이 아닙니다\n'+'\n'.join(lines))
+                lines.append(formatted('{v0} · {v1} · 읽기 {v2} / 쓰기 {v3}', v0=row['title'], v1=changes or scope, v2=tr(row.get('read') if row.get('read') is not None else '미관측'), v3=tr(row.get('written') if row.get('written') is not None else '미관측')))
+        self.audit.setText(Verbatim(tr('최근 캐시 분석 · 선행 변화는 확정 원인이 아닙니다\n')+'\n'.join(lines)))
         self.activity.set_rows(list(reversed(activities)),lambda row,col,role:row[col])
         effects=[e for e in data.get('effects',[]) if e.get('user_response')]
         if effects:
             e=effects[-1]
-            self.audit.setText(self.audit.text()+f"\n최근 유지 후 사용자 요청: 입력 {e['user_input']} / 캐시 읽기 {e['user_read']} · 유지 {e['maintenance_calls']}회 · 인과적 절감 미확인")
+            self.audit.setText(Verbatim(self.audit.text()+formatted('\n최근 유지 후 사용자 요청: 입력 {v0} / 캐시 읽기 {v1} · 유지 {v2}회 · 인과적 절감 미확인', v0=e['user_input'], v1=e['user_read'], v2=e['maintenance_calls'])))
         compactions=data.get('compactions',[]);delegation=data.get('delegation',{})
-        auxiliary=f"\n보조 분석 · 압축 관측 {len(compactions)}회 · 하위 작업 {delegation.get('calls',0)}호출"
+        auxiliary=formatted('\n보조 분석 · 압축 관측 {v0}회 · 하위 작업 {v1}호출', v0=len(compactions), v1=delegation.get('calls', 0))
         if compactions:
-            c=compactions[-1];auxiliary+=f"\n최근 압축 전후 입력 {c['before']} → {c['after']}토큰 · 맥락 품질 별도 확인"
+            c=compactions[-1];auxiliary+=formatted('\n최근 압축 전후 입력 {v0} → {v1}토큰 · 맥락 품질 별도 확인', v0=c['before'], v1=c['after'])
         if delegation.get('calls'):
-            auxiliary+=f" · API 환산 확인분 {usd(delegation.get('known_cost'))} · 산정 {delegation.get('priced',0)}호출"
-        self.audit.setText(self.audit.text()+auxiliary)
+            auxiliary+=formatted(' · API 환산 확인분 {v0} · 산정 {v1}호출', v0=usd(delegation.get('known_cost')), v1=delegation.get('priced', 0))
+        self.audit.setText(Verbatim(self.audit.text()+auxiliary))
 
     def stop(self):
         self.timer.stop()

@@ -114,7 +114,30 @@ def test_cache_worker_reuses_single_configured_route_without_model_probe(tmp_pat
     assert manager.turn_on()['shared_cache_worker']
     assert '--cache-worker' in calls[0][0] and '--cache-observe-only' not in calls[0][0]
     assert calls[0][0][-1]=='18771'
+    assert calls[0][0][calls[0][0].index('--upstream')+1]=='openai'
+    (home/'auth.json').write_text('{"auth_mode":"chatgpt"}')
+    assert manager.command()[manager.command().index('--upstream')+1]=='chatgpt'
+    assert manager.command('openai')[manager.command('openai').index('--upstream')+1]=='openai'
     assert not manager.turn_off()['configured']
     assert 'openai_base_url' not in (home/'config.toml').read_text()
     restored=CacheWorkerManager(home,index,tmp_path/'model-evidence.sqlite')
     assert restored.url=='http://127.0.0.1:18771'
+
+
+def test_cache_worker_recovery_removes_task_and_drains_without_forced_stop(tmp_path,monkeypatch):
+    from types import SimpleNamespace
+    from cachemonitor import observer_control
+    from cachemonitor.cache_worker_control import CacheWorkerManager
+    home=tmp_path/'custom';home.mkdir()
+    (home/'config.toml').write_text('openai_base_url="http://127.0.0.1:18772"\nmodel="preserve"\n')
+    manager=CacheWorkerManager(home,tmp_path/'index.sqlite',tmp_path/'evidence.sqlite')
+    manager.health_state='ok'
+    identity='a'*32;removed=[]
+    monkeypatch.setattr(observer_control,'startup_value',lambda *a:None)
+    monkeypatch.setattr(manager,'health',lambda **kw:dict(cache_management=True,control_id=identity,active_connections=1))
+    for field in ('task','legacy_task','check_task'):
+        setattr(manager,field,SimpleNamespace(remove=lambda f=field:removed.append(f),inspect=lambda:dict(registered=False)))
+    result=manager.recover_direct()
+    assert not result['configured'] and 'task' in removed
+    assert json.loads((tmp_path/('proxy-control-'+identity+'.json')).read_text())==dict(action='drain',id=identity)
+    assert (home/'config.toml').read_text()=='model="preserve"\n'

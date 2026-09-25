@@ -48,6 +48,18 @@ def test_five_minute_shares_follow_recorded_cost_increments_not_lifetime_totals(
     series['model_share']=prepare_model_share(series,intervals)
     assert share_at(series,1380)['state']=='unknown'
 
+
+def test_model_shares_keep_call_time_across_observation_bucket_boundary():
+    series=prepare_series([dict(at=t,remaining=90,cycle_cost=cost,cycle_value=1,
+        cycle_start=0,connect=bool(i),reset_kind=None,label=str(t))
+        for i,(t,cost) in enumerate(((270,0),(330,10),(390,10)))])
+    intervals=[dict(start=270,end=390,cost_rows=[dict(ts=299,model='a',cost=3),dict(ts=301,model='b',cost=7)])]
+    series['model_share']=prepare_model_share(series,intervals)
+    assert share_at(series,299)['costs']=={'a':3}
+    assert share_at(series,301)['costs']=={'b':7}
+    assert share_at(series,299)['shares']=={'a':100}
+    assert share_at(series,301)['shares']=={'b':100}
+
 @pytest.mark.parametrize('surface,ink,accent',SEEDS)
 def test_accent_bounded_palette_and_shared_roles(surface,ink,accent):
     appearance=Appearance(dark=surface in ('#212121','#101c2c'),surface=surface,ink=ink,accent=accent)

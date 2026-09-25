@@ -315,9 +315,11 @@ class TaskbarQuota(QuickHost):
         self.update_theme()
 
     def update_theme(self):
-        from .theme import shared_theme
-        palette=shared_theme().palette
-        theme = (dark_taskbar(), self._warning, self.devicePixelRatioF(),palette['ink'],palette['warning'])
+        from .token_colors import ui_palette
+        from .overlay_appearance import default_appearance
+        dark = dark_taskbar()
+        palette=ui_palette(default_appearance(dark))
+        theme = (dark, self._warning, self.devicePixelRatioF(),palette['ink'],palette['warning'])
         if theme == self._theme:
             return
         self._theme = theme

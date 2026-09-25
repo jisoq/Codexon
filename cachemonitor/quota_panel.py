@@ -27,15 +27,9 @@ def home_key(value):
 
 
 def remaining_axis(rows):
-    values=[r['remaining'] for r in rows]
-    if not values:return 0,100,25
-    low,high=min(values),max(values)
-    span=max(5,high-low)
-    step=next((n for n in (1,2,5,10,20,25) if n>=span*1.2/4),25)
-    padding=max(span*.1,(5-(high-low))/2)
-    bottom=max(0,math.floor((low-padding)/step)*step)
-    top=min(100,math.ceil((high+padding)/step)*step)
-    return bottom,top,step
+    from .charts import dynamic_bounds
+    low,high=dynamic_bounds(r.get('remaining') for r in rows)
+    return low,high,(high-low)/4
 
 
 def model_cost_intervals(intervals, selected_model):

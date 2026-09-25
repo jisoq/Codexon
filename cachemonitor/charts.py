@@ -13,7 +13,7 @@ def dynamic_bounds(values):
     if not values:return 0.,1.
     low,high=min(values),max(values)
     padding=max((high-low)*.12,abs(high)*.01,abs(low)*.01,1e-6)
-    return max(0.,low-padding) if low>=0 else low-padding,high+padding
+    return low-padding,high+padding
 
 
 class Plot(Node):
