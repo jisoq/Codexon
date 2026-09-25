@@ -2,7 +2,7 @@
 
 [한국어](README.ko.md) · [English](README.md)
 
-**Codexon compares requested model names with the model names recorded in server responses, and shows usage over your Codex window.**
+**Codexon is a Windows app for analyzing Codex usage and cache behavior, comparing request/response model names, and managing optional cache maintenance. Its overlay keeps usage visible over your Codex window while you work.**
 
 ![Codexon overlay with sample sessions](docs/media/overlay-sample.png)
 
@@ -11,6 +11,7 @@
 - Explore sessions and individual calls, including confirmed child-agent usage in session totals.
 - Compare usage across models, reasoning efforts and service tiers, and inspect the calls behind each result.
 - Follow remaining usage limits and reset times. The tray and taskbar widget keep them visible without opening the dashboard.
+- Inspect maintenance decisions and costs in the Cache management tab, with separate controls for automatic maintenance and model-change confirmation.
 
 Costs are estimates using API prices; they are not your Codex bill. Model monitoring compares names recorded for a request and its response. Live limit checks use the installed Codex app-server and require an available account connection.
 
@@ -47,6 +48,19 @@ In the supplied measurements, median proxy overhead was **0.16ms** for a 4KB Web
 | HTTP/SSE 20MB | 40.12ms | 65.63ms |
 
 These figures describe time added by the proxy, not total response time or model generation time. Overhead is not zero and can vary with the environment and transfer size.
+
+## Optional cache management
+
+Enable **Settings → Cache management** to reveal the **Cache management** tab. Automatic maintenance and model-change confirmation have separate controls; both are off by default.
+
+- **Observation and decisions:** See current cache status, estimated maintenance cost, observed API-equivalent cost, recent activity and reasons for stopping. Decisions use ordinary work history. Insufficient comparable evidence or no expected net benefit means no maintenance request.
+- **Automatic maintenance:** During idle periods, a separate request with the original context attempts to preserve cache reuse. It requires a managed proxy, connected Codex hooks and explicit operating consent. Turning on the setting does not grant that consent. A new user request cancels scheduled maintenance and takes priority.
+- **Model-change confirmation:** When comparable cache evidence indicates that a model change would substantially increase input reprocessing cost, Codexon asks whether to continue the pending request. It does not intervene in every model change or replace the model automatically.
+- **Usage accounting:** Independent requests appear as **Cache maintenance** sessions and are counted once in usage totals. Missing usage or cost remains unknown and stops further maintenance. A background collector supplies the same observations to the dashboard and cache worker.
+
+The current initial operating grant covers the displayed account, home, model, reasoning effort, Standard tier and HTTP route for **60 minutes and at most 2 calls across all sessions**. Maintenance requests consume usage. Cost estimates and observed-cost stop thresholds are not server-enforced total cost caps; a single call can exceed an estimate. Expected benefit and observed cache reuse do not establish actual net savings.
+
+After **Connect Codex hooks**, trust the command in Codex and start a new task. Disabling the master switch stops new maintenance requests and revokes operating consent while preserving records. See the [cache management guide](docs/user-guide.md#cache-management) for connection steps and decision and stopping conditions.
 
 ## Updates and recovery
 
