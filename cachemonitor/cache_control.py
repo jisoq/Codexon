@@ -17,25 +17,16 @@ def control_path(index_path=None):
 
 
 class Control:
-    def __init__(self,path):
-        if str(path)!=':memory:':
-            path=Path(path);path.parent.mkdir(parents=True,exist_ok=True)
-        self.db=sqlite3.connect(str(path),timeout=.5,isolation_level=None)
-        self.db.executescript('''PRAGMA journal_mode=WAL;
-          CREATE TABLE IF NOT EXISTS cache_preferences(key TEXT PRIMARY KEY,value TEXT);
-          CREATE TABLE IF NOT EXISTS cache_profiles(home TEXT,sid TEXT,model TEXT,data TEXT,PRIMARY KEY(home,sid,model));
-          CREATE TABLE IF NOT EXISTS cache_inputs(home TEXT,sid TEXT,turn TEXT,at REAL,model TEXT,kind TEXT,PRIMARY KEY(home,sid,turn,kind));
-          CREATE TABLE IF NOT EXISTS cache_tickets(id TEXT PRIMARY KEY,home TEXT,sid TEXT,turn TEXT,model TEXT,digest TEXT,created REAL,expires REAL,state TEXT);
-          CREATE TABLE IF NOT EXISTS cache_status(home TEXT,sid TEXT,data TEXT,PRIMARY KEY(home,sid));
-          CREATE TABLE IF NOT EXISTS cache_forecasts(home TEXT,sid TEXT,data TEXT,PRIMARY KEY(home,sid));
-          CREATE TABLE IF NOT EXISTS cache_gaps(home TEXT,sid TEXT,turn TEXT,data TEXT,PRIMARY KEY(home,sid,turn));
-        ''')
+    def __init__(self,path,*,timeout=.5):
+        from .cache_db import connect
+        self.db=connect(path,timeout)
 
     def get(self,key,default=None):
         row=self.db.execute('SELECT value FROM cache_preferences WHERE key=?',(key,)).fetchone()
         return json.loads(row[0]) if row else default
 
     def set(self,key,value):
+        if self.get(key,object())==value:return
         self.db.execute('INSERT OR REPLACE INTO cache_preferences VALUES(?,?)',(key,json.dumps(value)))
 
     def enabled(self,feature):

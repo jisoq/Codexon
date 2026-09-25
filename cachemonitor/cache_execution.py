@@ -93,21 +93,9 @@ class Contexts:
 
 
 class Journal:
-    def __init__(self,path):
-        self.db=sqlite3.connect(path,isolation_level=None)
-        self.db.executescript('''
-            PRAGMA journal_mode=WAL;
-            CREATE TABLE IF NOT EXISTS cache_jobs(
-                id TEXT PRIMARY KEY, home TEXT, sid TEXT, generation INTEGER,
-                state TEXT, started REAL, ended REAL, response_id TEXT,
-                model TEXT, effort TEXT, tier TEXT, usage TEXT);
-            CREATE UNIQUE INDEX IF NOT EXISTS one_cache_job ON cache_jobs(home,sid)
-                WHERE state IN ('reserved','sent');
-        ''')
-        columns={r[1] for r in self.db.execute('pragma table_info(cache_jobs)')}
-        for name,kind in (('snapshot','TEXT'),('round','INTEGER'),('anchor','REAL'),('scope_read_lower','INTEGER'),
-                          ('operation','TEXT'),('expected_cost','REAL'),('adverse_cost','REAL'),('output_high','INTEGER'),('read_required','INTEGER'),('purpose','TEXT')):
-            if name not in columns:self.db.execute(f'ALTER TABLE cache_jobs ADD COLUMN {name} {kind}')
+    def __init__(self,path,*,timeout=5):
+        from .cache_db import connect
+        self.db=connect(path,timeout)
         from .cache_operating import Operations
         self.operations=Operations(self)
 

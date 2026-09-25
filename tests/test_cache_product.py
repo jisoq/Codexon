@@ -21,6 +21,28 @@ def profile():
                 input=100000,cached=99000,written=None,output=4,reasoning=2)
 
 
+def test_simultaneous_schema_startup_and_existing_wal_reader_under_write_lock(tmp_path):
+    import threading
+    import sqlite3
+    path=tmp_path/'cache-control.sqlite';barrier=threading.Barrier(8)
+    def open_both(i):
+        barrier.wait()
+        control=Control(path,timeout=5);journal=Journal(path)
+        try:
+            control.set('client:'+str(i),i)
+            return journal.db.execute('PRAGMA user_version').fetchone()[0]
+        finally:control.close();journal.close()
+    with ThreadPoolExecutor(8) as pool:assert list(pool.map(open_both,range(8)))==[1]*8
+    writer=sqlite3.connect(path,isolation_level=None);writer.execute('BEGIN IMMEDIATE')
+    try:
+        writer.execute("UPDATE cache_preferences SET value='99' WHERE key='client:0'")
+        # An ordinary reader must not need a schema/write lock on every launch.
+        reader=Control(path,timeout=.05);journal=Journal(path,timeout=.05)
+        assert reader.get('client:0')==0
+        reader.close();journal.close()
+    finally:writer.rollback();writer.close()
+
+
 def test_durable_hook_exact_choice_timeout_disconnect(tmp_path):
     path=tmp_path/'c.sqlite';control=Control(path);control.set('guard',True)
     control.profile('home','s',dict(profile(),written=0))

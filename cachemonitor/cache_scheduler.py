@@ -17,7 +17,7 @@ class Scheduler:
     def __init__(self,home,path,*,send=None,clock=time.monotonic,observation_only=False,continuous_capture=False):
         self.observation_only=observation_only
         self.continuous_capture=continuous_capture
-        self.home=str(home);self.control=Control(path);self.journal=Journal(path)
+        self.home=str(home);self.control=Control(path,timeout=5);self.journal=Journal(path)
         self.executor=Executor(self.journal,Contexts(),observation_only=observation_only,**({'send':send} if send else {}))
         self.capture=RelayCapture(self.executor,self.snapshot,lambda:self.continuous_capture or self.observation_only or self.control.enabled('automatic'))
         self.capture.analysis_revision=2

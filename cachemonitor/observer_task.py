@@ -6,6 +6,46 @@ import os
 import subprocess
 
 
+def retire_desktop_startups(root):
+    """Installer handoff tasks must not compete with the app's Run preference.
+
+    Disable only logon triggers of owned GUI tasks in this installation. Keep
+    definitions, history, running processes and every proxy task untouched.
+    """
+    from pathlib import Path
+    payload=base64.b64encode(str(Path(root).resolve()/'versions').encode()).decode()
+    script=r'''
+$ErrorActionPreference='Stop'
+[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
+$root=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__ROOT__')).TrimEnd('\')+'\'
+$service=New-Object -ComObject Schedule.Service
+$service.Connect()
+$folder=$service.GetFolder('\')
+$changed=@()
+foreach($task in $folder.GetTasks(1)){
+    if(!$task.Name.StartsWith('CacheMonitor-Desktop-')){continue}
+    $definition=$task.Definition
+    if($definition.Actions.Count -ne 1){continue}
+    $action=$definition.Actions.Item(1)
+    $path=[IO.Path]::GetFullPath($action.Path)
+    if(!$path.StartsWith($root,[StringComparison]::OrdinalIgnoreCase) -or [IO.Path]::GetFileName($path) -ne 'Codexon.exe'){continue}
+    if($definition.RegistrationInfo.Description -ne ('CacheMonitor model observer: '+$action.Path)){continue}
+    $update=$false
+    foreach($trigger in $definition.Triggers){if($trigger.Type -eq 9 -and $trigger.Enabled){$trigger.Enabled=$false;$update=$true}}
+    if($update){
+        [void]$folder.RegisterTaskDefinition($task.Name,$definition,6,$definition.Principal.UserId,$null,3)
+        $changed+=$task.Name
+    }
+}
+@{retired=$changed} | ConvertTo-Json -Compress
+'''.replace('__ROOT__',payload)
+    encoded=base64.b64encode(script.encode('utf-16-le')).decode()
+    result=subprocess.run(['powershell.exe','-NoProfile','-NonInteractive','-EncodedCommand',encoded],
+        capture_output=True,timeout=20,creationflags=subprocess.CREATE_NO_WINDOW)
+    if result.returncode:raise RuntimeError('이전 GUI의 중복 자동 시작을 정리하지 못했습니다.')
+    return json.loads(result.stdout.decode('utf-8-sig'))
+
+
 class ObserverTask:
     def __init__(self, home, role='ModelObserver'):
         self.role=role

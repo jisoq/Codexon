@@ -73,3 +73,21 @@ app.exec()
     assert result.returncode == 0, result.stderr
     visibility = json.loads(result.stdout)
     assert all(visibility.values()), visibility
+@pytest.mark.skipif(sys.platform != 'win32',reason='Windows Task Scheduler')
+def test_installer_retires_only_owned_gui_logon_tasks(tmp_path):
+    from cachemonitor.observer_task import ObserverTask,retire_desktop_startups
+    root=tmp_path/'installation';exe=root/'versions'/'old'/'Codexon.exe'
+    outside=tmp_path/'other-installation'/'versions'/'old'/'Codexon.exe'
+    desktop=ObserverTask(str(exe),role='Desktop');other=ObserverTask(str(outside),role='Desktop')
+    worker=ObserverTask(str(exe),role='CacheWorker')
+    try:
+        for task,path in ((desktop,exe),(worker,exe),(other,outside)):
+            path.parent.mkdir(parents=True,exist_ok=True)
+            task.configure([str(path),'--hidden'],autostart=True)
+        result=retire_desktop_startups(root)
+        assert result['retired']==[desktop.name]
+        assert not desktop.inspect()['autostart']
+        assert worker.inspect()['autostart'] and other.inspect()['autostart']
+        assert retire_desktop_startups(root)['retired']==[]
+    finally:
+        for task in (desktop,worker,other):task.remove()

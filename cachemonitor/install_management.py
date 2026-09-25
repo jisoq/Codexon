@@ -140,6 +140,9 @@ def finish(root, product, recovery, *, isolated=False, launch=True, language='ko
             activation.rollback()
             raise
         if not isolated:
+            from .observer_task import retire_desktop_startups
+            try:retire_desktop_startups(root)
+            except RuntimeError as exc:receipt['startup_warning']=str(exc)
             result_path = root/'connection-update.json'
             try:
                 result = subprocess.run([str(exe),'--complete-install','--control-report',str(result_path)],

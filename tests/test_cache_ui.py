@@ -27,6 +27,45 @@ def test_panel_recovers_after_temporary_storage_error(tmp_path,monkeypatch):
     finally:panel.stop()
 
 
+def test_dashboard_survives_boot_schema_lock_and_restores_saved_cache_settings(tmp_path):
+    import sqlite3
+    from PySide6.QtCore import QSettings
+    from cachemonitor.cache_control import Control,control_path
+    from cachemonitor.cache_execution import Journal
+    from cachemonitor.dashboard import Dashboard
+    from test_ui import snapshot
+    app=QApplication.instance() or QApplication([])
+    previous=app.property('cachemonitorDisableShellIntegration');app.setProperty('cachemonitorDisableShellIntegration',True)
+    index=tmp_path/'index.sqlite';path=control_path(index)
+    saved=Control(path)
+    for key in ('enabled','automatic','guard'):saved.set(key,True)
+    saved.db.execute('PRAGMA user_version=0');saved.close()
+    journal=Journal(path);key=journal.reserve('fixture','session',0,body(),'pending');journal.sent(key);journal.close()
+    writer=sqlite3.connect(path,isolation_level=None)
+    writer.execute('PRAGMA user_version=0');writer.execute('BEGIN IMMEDIATE')
+    window=None
+    try:
+        window=Dashboard(['fixture'],start_worker=False,settings=QSettings(str(tmp_path/'ui.ini'),QSettings.IniFormat),
+            index_path=index,cache_control=True,static_snapshot=snapshot(),live_limits=False)
+        window.show();QTest.qWait(100)
+        assert window.cache_panel.control is None and not window.cache_master.isEnabled()
+        window.open_settings();QTest.qWait(30)
+        assert window.current_page==4 and window.cache_panel.timer.isActive()
+        writer.rollback()
+        until=time.monotonic()+3
+        while window.cache_panel.control is None and time.monotonic()<until:QTest.qWait(50)
+        assert window.cache_master.isEnabled() and window.cache_master.isChecked()
+        assert window.nav.count()==5 and window.cache_panel.control.enabled('automatic')
+        assert window.cache_panel.control.enabled('guard')
+        assert window.cache_panel.journal.rows()[0]['state']=='sent'
+        assert not window.qml_errors
+    finally:
+        writer.close()
+        if window:
+            window.cache_panel.stop();window.observer_panel.stop();window.quitting=True;window.tick.stop();window.tray.hide();window.close()
+        app.setProperty('cachemonitorDisableShellIntegration',previous)
+
+
 def test_forecast_survives_automatic_policy_and_execution_states_but_not_context_or_expiry(tmp_path):
     import asyncio
     from cachemonitor.cache_scheduler import Scheduler

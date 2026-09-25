@@ -64,7 +64,13 @@ def main():
     homes = (args.codex_home or [os.environ.get('CODEX_HOME', str(Path.home()/'.codex'))]) if isolated else resolve_homes(args.codex_home)
     if args.enable_model_observer or args.disable_model_observer or args.model_observer_status or args.test_model_observer:
         from .observer_control import ObserverManager
-        manager=ObserverManager(homes[0],Path(args.index_path).parent if args.index_path else None)
+        saved=cache_paths() if not args.index_path else {}
+        if args.cache_control or saved.get('index_path'):
+            from .cache_worker_control import CacheWorkerManager
+            index=args.index_path or saved.get('index_path');evidence=args.evidence_path or saved.get('evidence_path')
+            if not index or not evidence:parser.error('Cache control requires matching index and evidence paths')
+            manager=CacheWorkerManager(homes[0],index,evidence)
+        else:manager=ObserverManager(homes[0],Path(args.index_path).parent if args.index_path else None)
         try:
             result=(manager.test_connection() if args.test_model_observer else manager.turn_on() if args.enable_model_observer else manager.turn_off() if args.disable_model_observer else manager.ensure())
         except Exception as exc:result={'error':str(exc)}
