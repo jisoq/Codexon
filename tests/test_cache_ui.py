@@ -1,12 +1,13 @@
 """Rendered Qt confirmations operate the same durable hook tickets."""
 import time
+import pytest
 from concurrent.futures import ThreadPoolExecutor
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 from PySide6.QtTest import QTest
 from cachemonitor.cache_control import hook_decision
 from cachemonitor.cache_panel import CachePanel
-from cachemonitor.quick_qa import mount,dispose,control,click
+from cachemonitor.quick_qa import mount,dispose,control,click,render_plot
 from test_cache_product import profile
 from test_cache_operating import URL,HEADERS
 from test_cache_management import body,response
@@ -100,7 +101,8 @@ def test_forecast_survives_automatic_policy_and_execution_states_but_not_context
     finally:asyncio.run(scheduler.close());panel.stop();dispose(host)
 
 
-def test_master_switch_navigation_and_independent_features(tmp_path):
+@pytest.mark.parametrize('size',[(1440,940),(1000,700)])
+def test_master_switch_navigation_and_independent_features(tmp_path,size):
     from PySide6.QtCore import QSettings
     from cachemonitor.dashboard import Dashboard
     from test_ui import snapshot
@@ -112,7 +114,7 @@ def test_master_switch_navigation_and_independent_features(tmp_path):
     def create():
         window=Dashboard(['fixture'],start_worker=False,settings=settings,index_path=tmp_path/'index.sqlite',
                          cache_control=True,static_snapshot=snapshot(),live_limits=False)
-        window.show();QTest.qWait(80);return window
+        window.resize(*size);window.show();QTest.qWait(80);return window
     def close(window):
         window.cache_panel.stop();window.observer_panel.stop();window.quitting=True;window.tick.stop();window.tray.hide();window.close()
     window=create()
@@ -126,9 +128,11 @@ def test_master_switch_navigation_and_independent_features(tmp_path):
         window.nav.setCurrentRow(4);QTest.qWait(80)
         assert window.current_page==5 and window.heading.text()=='캐시 관리'
         panel=window.cache_panel
-        click(window,control(window,panel.toggles['guard']))
+        # Narrow windows stack these cards. Reveal each switch inside its real
+        # scroll viewport before clicking; scene coordinates alone can be clipped.
+        click(window,render_plot(window,panel.toggles['guard']))
         assert panel.control.enabled('guard') and not panel.control.enabled('automatic')
-        click(window,control(window,panel.toggles['automatic']))
+        click(window,render_plot(window,panel.toggles['automatic']))
         assert panel.control.enabled('guard') and panel.control.enabled('automatic')
         assert window.grab().save(str(tmp_path/'cache-dashboard.png'))
         window.resize(1000,700);QTest.qWait(100)
