@@ -177,15 +177,36 @@ $root=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__ROOT__')).T
     return values if isinstance(values,list) else [values]
 
 
+def connection_manager():
+    from .launch_context import cache_paths,resolve_homes
+    paths=cache_paths()
+    if paths.get('index_path') and paths.get('evidence_path'):
+        from .cache_worker_control import CacheWorkerManager
+        return CacheWorkerManager(resolve_homes()[0],paths['index_path'],paths['evidence_path'])
+    from .connection_recovery import target
+    return target()
+
+
 def prepare_uninstall(root, *, isolated=False):
     root=Path(root).resolve()
     with ProcessLock(root/'install.lock',timeout=5):
         from .installation import installed
         registration = installed() if not isolated else {}
         if not isolated and registration.get('InstallRoot') and Path(registration['InstallRoot']).resolve()==root:
-            from .connection_recovery import target, restore
-            manager=target()
+            from .connection_recovery import restore
+            from .launch_context import resolve_homes
+            from .cache_hooks import remove_installation
+            manager=connection_manager()
+            for home in set([str(manager.home),*resolve_homes()]):remove_installation(home,root)
             restore(manager)
+            # A newly drained worker exits cooperatively; busy streams remain
+            # alive and the existing process check defers payload deletion.
+            if getattr(manager,'shared_cache_worker',False):
+                deadline=time.monotonic()+5
+                while time.monotonic()<deadline:
+                    health=manager.health(timeout=1)
+                    if not health or health.get('active_connections'):break
+                    time.sleep(.2)
             # Existing sockets are allowed to finish; a busy app/relay defers removal.
         for process in processes_under(root):
             name=Path(process['ExecutablePath']).name.lower()
@@ -218,13 +239,7 @@ def complete_main():
     parser.add_argument('--control-report',type=Path,required=True)
     args=parser.parse_args()
     try:
-        from .launch_context import cache_paths,resolve_homes
-        paths=cache_paths()
-        if paths.get('index_path') and paths.get('evidence_path'):
-            from .cache_worker_control import CacheWorkerManager
-            manager=CacheWorkerManager(resolve_homes()[0],paths['index_path'],paths['evidence_path'])
-        else:manager=target()
-        result=activate_proxy(manager)
+        result=activate_proxy(connection_manager())
     except Exception as exc:result=dict(phase='recovery_required',error=str(exc))
     atomic_write(args.control_report,json.dumps(result,ensure_ascii=False).encode())
     return 1 if result.get('error') else 0

@@ -14,6 +14,25 @@ from cachemonitor.taskbar import TaskbarQuota
 pytestmark = pytest.mark.skipif(sys.platform != 'win32', reason='Windows taskbar integration')
 
 
+@pytest.mark.parametrize('dark',[False,True])
+def test_taskbar_text_uses_taskbar_theme_when_app_theme_disagrees(tmp_path,monkeypatch,dark):
+    from cachemonitor import taskbar
+    from cachemonitor.theme import shared_theme
+    from cachemonitor.token_colors import contrast_ratio,ui_palette
+    from cachemonitor.overlay_appearance import default_appearance
+    app=QApplication.instance() or QApplication([])
+    shared_theme().configure('light' if dark else 'dark')
+    monkeypatch.setattr(taskbar,'dark_taskbar',lambda:dark)
+    indicator=TaskbarQuota(QSettings(str(tmp_path/'taskbar.ini'),QSettings.IniFormat))
+    try:
+        background=ui_palette(default_appearance(dark))['surface']
+        for remaining in (80,5):
+            indicator.set_display(dict(text=str(remaining),remaining=remaining),'weekly','fixture')
+            assert contrast_ratio(indicator.view.state['foreground'],background)>=4.5
+            assert contrast_ratio(indicator.view.state['valueColor'],background)>=4.5
+    finally:indicator.close();indicator.destroy()
+
+
 def settle_position(indicator):
     deadline = time.monotonic() + 3
     while time.monotonic() < deadline:

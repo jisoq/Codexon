@@ -146,7 +146,7 @@ class QuotaHistory(Plot):
             for x,reset in boundaries:
                 self.reset_hits.append((QRectF(x-8,7,16,24),reset))
         low,high,step=self.axis
-        ticks=[low+step*i for i in range(5)] if cumulative else range(low,high+1,step)
+        ticks=[low+step*i for i in range(5)]
         for value in ticks:
             y=box.bottom()-box.height()*(value-low)/(high-low)
             p.setPen(QPen(QColor(palette['border']),1));p.drawLine(QPointF(box.left(),y),QPointF(box.right(),y))

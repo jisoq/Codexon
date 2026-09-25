@@ -24,10 +24,10 @@ class CacheWorkerManager(ObserverManager):
         if parsed.scheme=='http' and parsed.hostname=='127.0.0.1' and parsed.port and not parsed.username and parsed.path in ('','/'):
             self.url=route.rstrip('/')
 
-    def command(self,upstream='chatgpt'):
+    def command(self,upstream=None):
         parts=[sys.executable]
         if not getattr(sys,'frozen',False):parts.append(str(Path(__file__).resolve().parents[1]/'run.py'))
-        return parts+['--model-proxy','--cache-worker','--codex-home',str(self.home),
+        return parts+['--model-proxy','--cache-worker','--upstream',upstream or self.upstream(),'--codex-home',str(self.home),
             '--evidence-path',str(self.evidence),'--observation-index',str(self.index),'--port',str(urlsplit(self.url).port)]
 
     def status(self):
@@ -38,7 +38,7 @@ class CacheWorkerManager(ObserverManager):
         return dict(configured=configured,enabled=configured,running=bool(health),health=health,
             phase='active' if configured and health else 'recovery_required' if configured else 'off',
             probe_state=self.health_state,runtime={'phase':'active' if health else 'stopped'},registration=registration,
-            app_version=VERSION,app_path=self.command()[0],version_mismatch=bool(health and not proxy_compatible(health.get('version'))),
+            app_version=VERSION,app_path=sys.executable,version_mismatch=bool(health and not proxy_compatible(health.get('version'))),
             shared_cache_worker=True,url=self.url,evidence_path=str(self.evidence))
 
     def ensure(self):return self.status()
@@ -87,3 +87,22 @@ class CacheWorkerManager(ObserverManager):
     def update_proxy(self):
         self.task.configure(self.command(),autostart=self.config()[1].get('openai_base_url')==self.url)
         return {**self.status(),'update':{'phase':'waiting','message':'기존 연결 유지 중 · 다음 작업기 기동부터 설치본 적용'}}
+
+    def recover_direct(self):
+        # Recovery/uninstall removes registration and drains without killing a
+        # live user stream. Scheduler cleanup still collects sent usage.
+        import json,re
+        from .observer_control import atomic_write
+        from .cache_execution import Journal
+        path=self.index.with_name('cache-control.sqlite')
+        if path.exists():
+            journal=Journal(path)
+            try:
+                for grant in journal.operations.grants(str(self.home)):journal.operations.stop(grant['id'],'revoked')
+            finally:journal.close()
+        health=self.health(timeout=3)
+        result=super().recover_direct()
+        identity=(health or {}).get('control_id','')
+        if health and health.get('cache_management') and re.fullmatch(r'[0-9a-f]{32}',identity):
+            atomic_write(self.directory/('proxy-control-'+identity+'.json'),json.dumps(dict(action='drain',id=identity)).encode())
+        return result

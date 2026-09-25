@@ -45,6 +45,7 @@ def main():
     parser.add_argument("--smoke-depth", choices=('core','full'), default='full',
                         help="Choose the compact release check or full interaction probe")
     args = parser.parse_args()
+    explicit_index = args.index_path
     from .launch_context import cache_paths,save_cache_paths
     control_only=any((args.enable_model_observer,args.disable_model_observer,args.model_observer_status,args.test_model_observer))
     if not (args.smoke or args.verify_handoff or args.snapshot or args.index_path or control_only):
@@ -60,7 +61,7 @@ def main():
         parser.error('Handoff verification requires isolated homes and an explicit index')
     from .launch_context import resolve_homes, save_homes
     # Synthetic verification never inherits GUI preferences; controls return before saving.
-    isolated = bool(args.smoke or args.index_path or args.snapshot)
+    isolated = bool(args.smoke or explicit_index or args.snapshot)
     homes = (args.codex_home or [os.environ.get('CODEX_HOME', str(Path.home()/'.codex'))]) if isolated else resolve_homes(args.codex_home)
     if args.enable_model_observer or args.disable_model_observer or args.model_observer_status or args.test_model_observer:
         from .observer_control import ObserverManager

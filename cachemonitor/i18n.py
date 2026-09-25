@@ -26,6 +26,11 @@ def language():
     return _language
 
 
+def formatted(template, **values):
+    """Translate the complete template while preserving inserted user data."""
+    return Verbatim(tr(template).format(**values))
+
+
 @lru_cache(maxsize=8192, typed=True)
 def tr(value):
     if isinstance(value,Verbatim):return str.__str__(value)

@@ -504,7 +504,10 @@ def main():
                 observation_only=args.cache_observe_only,continuous_capture=args.cache_worker)
             scheduler.journal.recover_exclusive()
             if args.cache_worker:scheduler.capture.analysis_revision=3
-            app=create_app(store,args.codex_home,endpoint,ssl_context=context,cache_capture=scheduler.capture)
+            stop=asyncio.Event();control_id=uuid.uuid4().hex
+            app=create_app(store,args.codex_home,endpoint,ssl_context=context,cache_capture=scheduler.capture,
+                control_file=args.evidence_path.parent/('proxy-control-'+control_id+'.json'),
+                control_id=control_id,stop_event=stop)
             async def observe_context(app):
                 pool=ThreadPoolExecutor(max_workers=1);index=None
                 def poll():
@@ -534,7 +537,16 @@ def main():
                     await asyncio.get_running_loop().run_in_executor(pool,close_index)
                     pool.shutdown();await scheduler.close()
             app.cleanup_ctx.append(observe_context)
-            web.run_app(app,host='127.0.0.1',port=args.port,access_log=None,print=None,loop=proxy_loop())
+            async def serve_cache():
+                runner=web.AppRunner(app,access_log=None)
+                await runner.setup()
+                try:
+                    await web.TCPSite(runner,'127.0.0.1',args.port).start()
+                    await stop.wait()
+                finally:await runner.cleanup()
+            loop=proxy_loop()
+            try:loop.run_until_complete(serve_cache())
+            finally:loop.close()
         elif args.managed:
             from .observer_control import ObserverManager
             from .managed_proxy import ManagedProxy

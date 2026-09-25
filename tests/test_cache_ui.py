@@ -14,6 +14,38 @@ from test_cache_management import body,response
 from cachemonitor.cache_operating import target
 
 
+def test_english_cache_consent_is_complete_and_preserves_user_text(tmp_path):
+    import ast
+    from pathlib import Path
+    from cachemonitor.i18n import set_language,tr
+    from cachemonitor.translation_catalog import CATALOG
+    from cachemonitor.presentation import Text,Scroll
+    from cachemonitor.quick_qa import scroll_extent
+    source=Path(__file__).resolve().parents[1]/'cachemonitor/cache_panel.py'
+    literals={n.value for n in ast.walk(ast.parse(source.read_text(encoding='utf-8')))
+              if isinstance(n,ast.Constant) and isinstance(n.value,str) and any('\uac00'<=c<='\ud7a3' for c in n.value)}
+    assert not literals-set(CATALOG)
+    app=QApplication.instance() or QApplication([]);set_language('en')
+    panel=CachePanel('home',tmp_path/'index.sqlite');host=mount(panel)
+    try:
+        panel.display(dict(calls=1,priced=0,audit=[dict(title='작업 자료 원문',changes=['model_changed'],read=0,written=None)]))
+        assert '작업 자료 원문' in panel.audit.state['text'] and 'Model changed' in panel.audit.state['text']
+        assert tr('작업기 연결됨')=='Worker connected'
+        panel.journal.operations.propose(target('home',body(),URL,HEADERS,False),.01,.1,64,'natural_output_proxy')
+        panel.show_operating();QTest.qWait(100);dialog=panel.operating_dialog
+        messages=[n.state['text'] for n in dialog.findChildren(Text)]
+        message='\n'.join(messages)
+        assert 'one call may exceed' in message and 'at most 2 sequential calls' in message
+        assert not any('\uac00'<=c<='\ud7a3' for c in message)
+        assert dialog.host.windowTitle()=='Limited operation without a total cost cap'
+        dialog.host.resize(450,320);QTest.qWait(60)
+        scroll=dialog.findChild(Scroll);assert scroll is not None
+        assert scroll_extent(dialog.host,scroll)>0
+        assert dialog.host.grab().save(str(tmp_path/'english-cache-consent.png'))
+        dialog.reject();QTest.qWait(30);assert not panel.journal.operations.grants()
+    finally:panel.stop();dispose(host);set_language('ko')
+
+
 def test_panel_recovers_after_temporary_storage_error(tmp_path,monkeypatch):
     import sqlite3
     app=QApplication.instance() or QApplication([])

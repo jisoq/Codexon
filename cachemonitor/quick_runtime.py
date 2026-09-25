@@ -179,11 +179,15 @@ class DialogHost(QuickHost):
 
 
 class Confirmation(Dialog):
-    def __init__(self,title,message,parent=None):
+    def __init__(self,title,message,parent=None,*,scrollable=False):
         super().__init__(parent);self.setWindowTitle(title);self.resize(530,270)
         from .presentation import Text
         layout=Column(self);layout.setContentsMargins(22,20,22,20)
-        text=Text(message);text.setWordWrap(True);layout.addWidget(text,1)
+        text=Text(message);text.setWordWrap(True)
+        if scrollable:
+            from .presentation import Scroll
+            scroll=Scroll();scroll.setWidget(text);layout.addWidget(scroll,1)
+        else:layout.addWidget(text,1)
         row=Row();row.addStretch()
         self.confirm=Button('확인');self.cancel=Button('취소');self.cancel.put(defaultFocus=True)
         self.confirm.clicked.connect(lambda:self.finish(1));self.cancel.clicked.connect(self.reject)
