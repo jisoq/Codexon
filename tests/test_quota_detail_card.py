@@ -25,7 +25,8 @@ def test_four_matching_axes_detail_pin_escape_and_gap_card(tmp_path,width,dark,l
         from PySide6.QtCore import QObject
         plot.findChild(QObject,'plotHover').setProperty('enabled',False)
         assert chart.cost_ceiling==pytest.approx(33.6)
-        assert chart.completed_ceiling==pytest.approx(11.2)
+        assert chart.completed_floor==pytest.approx(9.9)
+        assert chart.completed_ceiling==pytest.approx(10.1)
         assert chart.box.width()>150
         # The rendered axes and labels use the same palette as their curves.
         picture=chart._picture;ratio=picture.devicePixelRatio()
@@ -200,3 +201,33 @@ def test_completed_curve_keeps_peaks_and_breaks_at_unknown_values_and_resets():
         chart.set_rows(rows)
         assert chart.value_at(3,'completed_cost')==7
         assert not chart.connects(1,3,'completed_cost')
+
+
+def test_dynamic_axes_fit_values_and_ignore_missing():
+    from cachemonitor.charts import dynamic_bounds, comparison_axis
+    for values in ([900,901],[4],[0],[None,50,51],[-12,-10],[.000001,.000002]):
+        low,high=dynamic_bounds(values)
+        assert low<high
+        assert all(low<=v<=high for v in values if v is not None)
+    assert dynamic_bounds([900,901])[0]>0
+    assert dynamic_bounds([None,50,51])[0]>0
+    assert dynamic_bounds([None,float('nan')])==(0,1)
+    assert comparison_axis([{'value':98},{'value':99}], 'cache_ratio')[0]>90
+
+
+def test_cumulative_and_cost_axes_do_not_force_zero():
+    app=QApplication.instance() or QApplication([])
+    rows=[dict(at=1000+i*60,remaining=900+i,cycle_cost=500+i,cycle_value=1000+i,
+               connect=bool(i),reset_kind=None,label=str(i)) for i in range(4)]
+    series=prepare_series(rows);series['cumulative']=True
+    chart=QuotaHistory();chart.money=True;chart.set_series(series)
+    host=mount(chart,1120,450)
+    try:
+        render_plot(host,chart)
+        assert chart.axis[0]>800
+        assert chart.bounds('cycle_cost')[0]>490
+        assert chart.bounds('cycle_value')[0]>980
+        for i in range(4):
+            for key in ('remaining','cycle_cost','cycle_value'):
+                assert chart.box.contains(chart.point(i,key))
+    finally:dispose(host)

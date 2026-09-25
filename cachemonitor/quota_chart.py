@@ -3,7 +3,7 @@ from bisect import bisect_left, bisect_right
 from math import ceil, floor, log10
 from PySide6.QtCore import Qt, QRectF, QPointF, Signal
 from PySide6.QtGui import QColor, QPen, QImage, QPainter, QPainterPath
-from .charts import Plot
+from .charts import Plot, dynamic_bounds
 from .theme import shared_theme
 from .pricing import usd
 from .quota_view import clock, prepare_series, observation_label
@@ -60,8 +60,8 @@ class QuotaHistory(Plot):
 
     def bounds(self,key):
         if key=='remaining':return self.axis[:2]
-        if key=='cycle_cost':return 0,self.cost_ceiling
-        if key=='completed_cost':return 0,self.completed_ceiling
+        if key=='cycle_cost':return self.cost_floor,self.cost_ceiling
+        if key=='completed_cost':return self.completed_floor,self.completed_ceiling
         return self.value_floor,self.ceiling
 
     def value_at(self,index,key):
@@ -102,21 +102,17 @@ class QuotaHistory(Plot):
         p.setRenderHint(QPainter.Antialiasing)
         cumulative=self.series.get('cumulative',False)
         if cumulative:
-            target=max(1,self.series['high'])/4;unit=10**floor(log10(target));step=ceil(target/unit)*unit
-            self.axis=(0,step*4,step)
+            low,high=dynamic_bounds((self.series['low'],self.series['high']))
+            self.axis=(low,high,(high-low)/4)
         else:self.axis=remaining_axis([{'remaining':self.series['low']},{'remaining':self.series['high']}])
         value_low=self.series['value_minimum']
         value_high=self.series['value_maximum']
         if self.reference is not None:
             value_low=self.reference if value_low is None else min(value_low,self.reference)
             value_high=max(value_high,self.reference)
-        # Missing observations do not imply zero; keep flat series readable too.
-        if value_low is None:self.value_floor,self.ceiling=0,1
-        else:
-            padding=max((value_high-value_low)*.12,value_high*.01,.0001)
-            self.value_floor=max(0,value_low-padding);self.ceiling=value_high+padding
-        self.cost_ceiling=self.series['cost_maximum']*1.12 or 1
-        self.completed_ceiling=self.series['completed_maximum']*1.12 or 1
+        self.value_floor,self.ceiling=dynamic_bounds((value_low,value_high) if value_low is not None else ())
+        self.cost_floor,self.cost_ceiling=dynamic_bounds((self.series['cost_minimum'],self.series['cost_maximum']) if self.series['cost_minimum'] is not None else ())
+        self.completed_floor,self.completed_ceiling=dynamic_bounds((self.series['completed_minimum'],self.series['completed_maximum']) if self.series['completed_minimum'] is not None else ())
         completed_width=max(82,p.fontMetrics().horizontalAdvance(usd(self.completed_ceiling))+14)
         remaining_title='누적 소모\n%p' if cumulative else '잔여량\n%'
         remaining_labels=[f'{self.axis[1]:g}'+('%p' if cumulative else '%'),*tr(remaining_title).splitlines()]
@@ -150,7 +146,7 @@ class QuotaHistory(Plot):
             for x,reset in boundaries:
                 self.reset_hits.append((QRectF(x-8,7,16,24),reset))
         low,high,step=self.axis
-        ticks=[step*i for i in range(5)] if cumulative else range(low,high+1,step)
+        ticks=[low+step*i for i in range(5)] if cumulative else range(low,high+1,step)
         for value in ticks:
             y=box.bottom()-box.height()*(value-low)/(high-low)
             p.setPen(QPen(QColor(palette['border']),1));p.drawLine(QPointF(box.left(),y),QPointF(box.right(),y))
@@ -161,8 +157,8 @@ class QuotaHistory(Plot):
                    remaining_title)
         if self.money:
             for x,width,axis_low,ceiling,color,title,on_left in (
-                    (box.left()-remaining_width,completed_width,0,self.completed_ceiling,'completed','완료 구간\nUSD',True),
-                    (box.right(),cost_width,0,self.cost_ceiling,'output','누적 API\nUSD',False),
+                    (box.left()-remaining_width,completed_width,self.completed_floor,self.completed_ceiling,'completed','완료 구간\nUSD',True),
+                    (box.right(),cost_width,self.cost_floor,self.cost_ceiling,'output','누적 API\nUSD',False),
                     (box.right()+cost_width,value_width,self.value_floor,self.ceiling,'written','주간 동등\nUSD / 100%p',False)):
                 text_x=x-width if on_left else x+7
                 alignment=Qt.AlignRight if on_left else Qt.AlignLeft
