@@ -156,6 +156,24 @@ def test_service_adapts_legacy_worker_without_gui_index_access(tmp_path,monkeypa
     finally:legacy.close();gui.close();service.close()
 
 
+def test_legacy_missing_rollout_keeps_history_without_blocking_completion(tmp_path):
+    from cachemonitor.index import UsageIndex
+    from test_core import fixture_home
+    home,record=fixture_home(tmp_path);path=tmp_path/'index.sqlite'
+    writer=UsageIndex([home],path)
+    before=writer.poll(10010)
+    writer.db.execute('UPDATE files SET offset=0');writer.db.commit()
+    reader=UsageIndex([home],path,read_only=True)
+    try:
+        assert reader.poll(10011)['index']['loading']
+        record.unlink()
+        after=reader.poll(10012)
+        assert not after['index']['loading'] and after['usage_collection_complete']
+        assert [r['key'] for s in after['sessions'] for r in s['history']]==[r['key'] for s in before['sessions'] for r in s['history']]
+        assert reader.bytes_read==0
+    finally:reader.close();writer.close()
+
+
 def test_missing_or_stalled_service_only_requests_service_restart(tmp_path,monkeypatch):
     from cachemonitor.index import UsageIndex
     from cachemonitor.usage_collection import CollectionClient,CollectorService
