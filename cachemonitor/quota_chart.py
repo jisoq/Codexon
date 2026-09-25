@@ -211,17 +211,14 @@ class QuotaHistory(Plot):
                 if self.gap_width>=12:
                     p.setPen(QColor(palette['muted']))
                     p.drawText(QRectF(left-2,box.bottom()-10,self.gap_width+4,20),Qt.AlignCenter,'//')
-        self._cache_hits=[]
+        # Exact selection, gap detection and tooltips use the time index below.
+        # The shared hover adapter only needs a clickable plot surface; rebuilding
+        # thousands of sampled rectangles and formatted labels blocks repaint.
+        self._cache_hits=[(QRectF(box),{},'')]
         for pos,index in enumerate(indices):
             x=xs[pos];row=self.rows[index]
-            left=(xs[pos-1]+x)/2 if pos else box.left()
-            right=(xs[pos+1]+x)/2 if pos+1<len(indices) else box.right()
-            self._cache_hits.append((QRectF(left,box.top(),max(1,right-left),box.height()),row,observation_label(row,self.money)))
             if row['reset_kind']:
                 p.setPen(QPen(QColor(palette['muted']),1,Qt.DotLine));p.drawLine(QPointF(x,box.top()),QPointF(x,box.bottom()))
-        for k in visible_gaps:
-            left=self.gap_lefts[k]
-            self._cache_hits.append((QRectF(left,box.top(),self.gap_width,box.height()),{},self.gap_label(k)))
         for rect,reset in self.reset_hits:
             x=rect.center().x()
             p.setPen(QPen(QColor(palette['muted']),1,Qt.DashLine));p.drawLine(QPointF(x,box.top()),QPointF(x,box.bottom()))

@@ -10,11 +10,19 @@ from tools.package_release import payload
 
 
 def test_language_choice_is_saved_and_used_on_next_window(tmp_path):
-    from PySide6.QtCore import QSettings, Qt
+    from PySide6.QtCore import QSettings, Qt, QCoreApplication, QEvent
+    from PySide6.QtGui import QKeyEvent
     from PySide6.QtWidgets import QApplication
     from PySide6.QtTest import QTest
     from cachemonitor.dashboard import Dashboard
     from cachemonitor.quick_qa import control, click, render_plot
+    def choose_edge(host,choice,key):
+        # Exercise the rendered ComboBox without depending on which native
+        # QWidget happens to own keyboard focus after earlier window tests.
+        item=render_plot(host,choice)
+        for kind in (QEvent.KeyPress,QEvent.KeyRelease):
+            QCoreApplication.sendEvent(item,QKeyEvent(kind,key,Qt.NoModifier))
+        QTest.qWait(20)
     app=QApplication.instance() or QApplication([])
     previous=app.property('cachemonitorDisableShellIntegration')
     app.setProperty('cachemonitorDisableShellIntegration',True)
@@ -28,15 +36,14 @@ def test_language_choice_is_saved_and_used_on_next_window(tmp_path):
         restart=window.settings_page.controls['restart'];requests=[]
         window.settings_page.restartRequested.connect(lambda:requests.append(True))
         assert not control(window,restart).isEnabled()
-        render_plot(window,choice).forceActiveFocus()
-        QTest.keyClick(window.quick,Qt.Key_End);QTest.qWait(20)
+        choose_edge(window,choice,Qt.Key_End)
         settings.sync()
         saved=QSettings(path,QSettings.IniFormat)
         assert saved.value('ui/language')=='en'
         assert control(window,restart).isEnabled()
-        QTest.keyClick(window.quick,Qt.Key_Home);QTest.qWait(20)
+        choose_edge(window,choice,Qt.Key_Home)
         assert not control(window,restart).isEnabled()
-        QTest.keyClick(window.quick,Qt.Key_End);QTest.qWait(20)
+        choose_edge(window,choice,Qt.Key_End)
         click(window,control(window,restart))
         assert requests==[True] and not control(window,restart).isEnabled()
         window.quit_app()
@@ -48,8 +55,7 @@ def test_language_choice_is_saved_and_used_on_next_window(tmp_path):
         assert not control(reopened,reopened.settings_page.controls['restart']).isEnabled()
         assert reopened.settings_page.navigation.state['items'][0]['text']=='General'
         assert reopened.grab().save(str(tmp_path/'english-settings.png'))
-        render_plot(reopened,choice).forceActiveFocus()
-        QTest.keyClick(reopened.quick,Qt.Key_Home);QTest.qWait(20);saved.sync()
+        choose_edge(reopened,choice,Qt.Key_Home);saved.sync()
         assert QSettings(path,QSettings.IniFormat).value('ui/language')=='ko'
         assert not reopened.qml_errors
     finally:
