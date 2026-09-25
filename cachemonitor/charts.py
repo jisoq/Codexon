@@ -1,10 +1,20 @@
 """Selectable analytical charts; each mark retains its actual record population."""
 from collections import defaultdict
+from math import isfinite
 from PySide6.QtCore import Qt, QRectF, QPointF, QRect, Signal
 from PySide6.QtGui import QColor, QPen, QPolygonF, QPainter, QFont
 from .presentation import Node
 from .pricing import usd
 from .theme import shared_theme
+
+def dynamic_bounds(values):
+    """Fit visible finite data, with padding even for a constant value."""
+    values=[v for v in values if v is not None and isfinite(v)]
+    if not values:return 0.,1.
+    low,high=min(values),max(values)
+    padding=max((high-low)*.12,abs(high)*.01,abs(low)*.01,1e-6)
+    return max(0.,low-padding) if low>=0 else low-padding,high+padding
+
 
 class Plot(Node):
     kind = "plot"
@@ -111,16 +121,16 @@ class UsageTrend(AnalyticalPlot):
         if not self.rows:return
         left,right,top=86,self.width()-16,24
         bottom=self.height()-(104 if self.samples else 46)
-        peak=100 if self.metric=='cache_ratio' else max([r.get('value') or 0 for r in self.rows]+[0]) or 1
+        low,peak=dynamic_bounds(r.get('value') for r in self.rows)
         for f in (0,.5,1):
             y=bottom-(bottom-top)*f; p.setPen(QPen(self.color('border'),1));p.drawLine(QPointF(left,y),QPointF(right,y))
-            p.setPen(self.color('muted'));p.drawText(QRectF(0,y-10,left-10,20),Qt.AlignRight|Qt.AlignVCenter,value_text(peak*f,self.metric))
+            p.setPen(self.color('muted'));p.drawText(QRectF(0,y-10,left-10,20),Qt.AlignRight|Qt.AlignVCenter,value_text(low+(peak-low)*f,self.metric))
         step=(right-left)/len(self.rows); previous=None
         maxn=max([r.get('n',0) for r in self.rows]+[1])
         for i,row in enumerate(self.rows):
             x=left+step*(i+.5); value=row.get('value'); n=row.get('n',0)
             if value is not None:
-                y=bottom-(bottom-top)*value/peak
+                y=bottom-(bottom-top)*(value-low)/(peak-low)
                 if self.line:
                     p.setPen(QPen(self.color('accent'),2))
                     if previous is not None:p.drawLine(previous,QPointF(x,y))
@@ -148,12 +158,14 @@ class SourceBars(AnalyticalPlot):
         p=self.base()
         if not self.rows:return
         left=min(190,self.width()*.33);right=self.width()-170;span=max(20,right-left)
-        peak=max([r.get('total') or 0 for r in self.rows]+[0]) or 1;step=(self.height()-8)/len(self.rows)
+        low,peak=dynamic_bounds(r.get('total') for r in self.rows);step=(self.height()-8)/len(self.rows)
+        p.setPen(self.color('muted'));p.drawText(QRectF(left,0,span,18),Qt.AlignCenter,usd(low)+' – '+usd(peak))
+        step=(self.height()-28)/len(self.rows)
         for i,row in enumerate(self.rows):
-            y=i*step;value=row.get('total');p.setPen(self.color('ink'))
+            y=20+i*step;value=row.get('total');p.setPen(self.color('ink'))
             name=p.fontMetrics().elidedText(row.get('label','미확인'),Qt.ElideRight,int(left-12))
             p.drawText(QRectF(0,y,left-12,step),Qt.AlignLeft|Qt.AlignVCenter,name)
-            if value is not None:p.fillRect(QRectF(left,y+step/2-5,span*value/peak,10),QColor(shared_theme().color(row.get('color',COLORS[i%8]))))
+            if value is not None:p.fillRect(QRectF(left,y+step/2-5,span*(value-low)/(peak-low),10),QColor(shared_theme().color(row.get('color',COLORS[i%8]))))
             p.setPen(self.color('ink'));share=row.get('share')
             p.drawText(QRectF(right+8,y,162,step/2),Qt.AlignRight|Qt.AlignVCenter,
                        f"{usd(value)} · {share*100:.1f}%" if share is not None else usd(value))
@@ -170,11 +182,7 @@ def comparison_axis(rows, metric, view='distribution'):
             n=row.get('distribution_n',row.get('n',0))
             values.extend(row.get('points',[]) if n<10 else
                           [row.get(k) for k in ('p10','q1','median','q3','p90')])
-    values=[v for v in values if v is not None]
-    if not values:return 0,100 if metric=='cache_ratio' else 1
-    low,high=min(values),max(values)
-    padding=(high-low)*.08 if high>low else max(abs(high)*.08,.01)
-    return max(0,low-padding),max(high+padding,.01)
+    return dynamic_bounds(values)
 
 
 class ComparisonChart(AnalyticalPlot):
@@ -224,16 +232,16 @@ class ComparisonChart(AnalyticalPlot):
         if not samples:
             p.setPen(self.color('muted'));p.drawText(self.rect(),Qt.AlignCenter,'환산액·시간 교집합 표본 없음');return
         left,top,w,h=88,28,max(20,self.width()-112),self.height()-80
-        xmax=max([r['x'] for r in samples]+[1]);ymax=max([r['y'] for r in samples]+[0]) or 1
+        xmin,xmax=dynamic_bounds(r['x'] for r in samples);ymin,ymax=dynamic_bounds(r['y'] for r in samples)
         for f in (0,.5,1):
             p.setPen(QPen(self.color('border'),1));p.drawLine(QPointF(left,top+h*(1-f)),QPointF(left+w,top+h*(1-f)))
-            p.setPen(self.color('muted'));p.drawText(QRectF(0,top+h*(1-f)-10,left-10,22),Qt.AlignRight,usd(ymax*f))
-            p.drawText(QRectF(left+w*f-45,top+h+8,90,22),Qt.AlignCenter,value_text(xmax*f,'completion_latency_ms'))
+            p.setPen(self.color('muted'));p.drawText(QRectF(0,top+h*(1-f)-10,left-10,22),Qt.AlignRight,usd(ymin+(ymax-ymin)*f))
+            p.drawText(QRectF(left+w*f-45,top+h+8,90,22),Qt.AlignCenter,value_text(xmin+(xmax-xmin)*f,'completion_latency_ms'))
         if cache and cache[0]==size:points,cells=cache[2:]
         else:
             points=[];cells=defaultdict(list)
             for row in samples:
-                x=left+w*row['x']/xmax;y=top+h*(1-row['y']/ymax)
+                x=left+w*(row['x']-xmin)/(xmax-xmin);y=top+h*(1-(row['y']-ymin)/(ymax-ymin))
                 if len(samples)>2000:cells[(int((x-left)//6),int((y-top)//6))].append(row)
                 else:points.append((x,y,row))
             self._scatter_geometry=(size,samples,points,cells)

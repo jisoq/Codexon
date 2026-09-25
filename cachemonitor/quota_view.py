@@ -116,7 +116,7 @@ def completed_percent_costs(rows):
 
 def prepare_series(rows):
     """Bound drawing size while retaining extrema and exact selectable records."""
-    times=[];breaks=[];gaps=0;maximum=0;low=100;high=0;cost_maximum=0;value_maximum=0
+    times=[];breaks=[];gaps=0;maximum=0;low=float('inf');high=0;cost_maximum=0;value_maximum=0
     value_minimum=None
     completed=completed_percent_costs(rows)
     completed_maximum=max((value for value in completed if value is not None),default=0)
@@ -170,6 +170,8 @@ def prepare_series(rows):
         samples[budget]=sorted(selected)
     return dict(rows=rows,times=times,breaks=breaks,missing=missing,samples=samples,maximum=maximum,low=low,high=high,
                 active_times=active_times,gap_indices=gap_indices,gap_seconds=gap_seconds,
+                cost_minimum=min((r['cycle_cost'] for r in rows if r.get('cycle_cost') is not None),default=None),
+                completed_minimum=min((v for v in completed if v is not None),default=None),
                 cost_maximum=cost_maximum,value_minimum=value_minimum,value_maximum=value_maximum,
                 completed_costs=completed,completed_maximum=completed_maximum)
 
