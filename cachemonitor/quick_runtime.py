@@ -46,6 +46,7 @@ class QuickPlot(QQuickPaintedItem):
     def detailY(self):return self._detail_y
     def set_detail(self,value,x,y,pinned=False):
         self._detail=value;self._detail_x=x;self._detail_y=y;self._detail_pinned=pinned
+        if self._source and hasattr(self._source,'set_inspection'):self._source.set_inspection(value,x,y)
         self.detailChanged.emit()
     @Slot()
     def dismissDetail(self):self.set_detail({},0,0)
@@ -57,9 +58,11 @@ class QuickPlot(QQuickPaintedItem):
             self._source.paint(painter)
             if self._detail_pinned and hasattr(self._source,'refresh_detail'):
                 current=self._source.refresh_detail(self._detail)
-                if current!=self._detail:self._detail=current;self.detailChanged.emit()
+                if current!=self._detail:
+                    self._detail=current;self.detailChanged.emit()
+                    if hasattr(self._source,'set_inspection'):self._source.set_inspection(current,self._detail_x,self._detail_y)
             from .theme import shared_theme
-            if self._hover is not None:
+            if self._hover is not None and not hasattr(self._source,'set_inspection'):
                 hit=next((rect for rect,row,tip in reversed(self._source.hits) if rect.contains(self._hover)),None)
                 if hit is not None:
                     color=QColor(shared_theme().palette['accent']);color.setAlpha(24)
@@ -176,11 +179,15 @@ class DialogHost(QuickHost):
 
 
 class Confirmation(Dialog):
-    def __init__(self,title,message,parent=None):
+    def __init__(self,title,message,parent=None,*,scrollable=False):
         super().__init__(parent);self.setWindowTitle(title);self.resize(530,270)
         from .presentation import Text
         layout=Column(self);layout.setContentsMargins(22,20,22,20)
-        text=Text(message);text.setWordWrap(True);layout.addWidget(text,1)
+        text=Text(message);text.setWordWrap(True)
+        if scrollable:
+            from .presentation import Scroll
+            scroll=Scroll();scroll.setWidget(text);layout.addWidget(scroll,1)
+        else:layout.addWidget(text,1)
         row=Row();row.addStretch()
         self.confirm=Button('확인');self.cancel=Button('취소');self.cancel.put(defaultFocus=True)
         self.confirm.clicked.connect(lambda:self.finish(1));self.cancel.clicked.connect(self.reject)

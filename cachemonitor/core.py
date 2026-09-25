@@ -255,6 +255,7 @@ class Request:
     configured_service_tier: str | None = None
     request_mode_source: str = "unknown"
     request_mode_action: str = "unknown"
+    compaction_epoch: int = 0
 
     def values(self):
         return {**vars(self), "call_id":self.key, "uncached": self.input - self.cached if self.input is not None and self.cached is not None else None,
@@ -309,6 +310,7 @@ class Session:
     agent_path: str = ""
     agent_nickname: str = ""
     spawn_depth: int | None = None
+    compaction_epoch: int = 0
 
     @property
     def excluded_title(self):
@@ -324,6 +326,7 @@ class Session:
                                       values["output"], model, turn, values["reasoning"], values["total"], effort, service_tier,service_tier_source,
                                       configured_model or model,model_source,values['reported_total'],values['total_discrepancy'],values['input_conflict'],values['output_conflict']))
         request=self.requests[-1]
+        request.compaction_epoch=self.compaction_epoch
         for field_name,value in (mode_metadata or {}).items():
             if field_name in ('configured_service_tier','request_mode_source','request_mode_action'):setattr(request,field_name,value)
         self.coverage_total += values['total'] or 0
@@ -336,6 +339,9 @@ class Session:
         if not isinstance(payload, dict):
             return
         kind = event.get("type")
+        if kind=='compacted' or kind=='event_msg' and payload.get('type')=='context_compacted':
+            self.compaction_epoch+=1
+            return
         if kind == 'session_meta':
             for key, value in session_lineage(payload, self.id).items():
                 setattr(self, key, value)

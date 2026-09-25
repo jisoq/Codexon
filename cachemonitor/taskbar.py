@@ -249,7 +249,8 @@ class TaskbarQuota(QuickHost):
         self._warning = False
         self._theme = None
         self.caption=Text('주간');self.value=Text('?')
-        self.view=Node();self.view.put(logo='',caption='주간',value='?',foreground='#202020',valueColor='#202020')
+        from .theme import shared_theme
+        self.view=Node();self.view.put(logo='',caption='주간',value='?',foreground=shared_theme().palette['ink'],valueColor=shared_theme().palette['ink'])
         self.set_scene(self.view,'Taskbar.qml',transparent=True)
         self.quick.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.timer = QTimer(self)
@@ -314,13 +315,16 @@ class TaskbarQuota(QuickHost):
         self.update_theme()
 
     def update_theme(self):
-        theme = (dark_taskbar(), self._warning, self.devicePixelRatioF())
+        from .token_colors import ui_palette
+        from .overlay_appearance import default_appearance
+        dark = dark_taskbar()
+        palette=ui_palette(default_appearance(dark))
+        theme = (dark, self._warning, self.devicePixelRatioF(),palette['ink'],palette['warning'])
         if theme == self._theme:
             return
         self._theme = theme
-        dark, warning, ratio = theme
-        foreground = '#ffffff' if dark else '#202020'
-        value_color = ('#ffb4a8' if dark else '#b42318') if warning else foreground
+        dark, warning, ratio, foreground, warning_color = theme
+        value_color = warning_color if warning else foreground
         from PySide6.QtCore import QBuffer, QIODevice
         buffer=QBuffer();buffer.open(QIODevice.WriteOnly)
         brand_pixmap(dark,ratio).save(buffer,'PNG')

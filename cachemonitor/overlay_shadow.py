@@ -17,7 +17,7 @@ def shadow_padding(dark):
 
 
 @lru_cache(maxsize=12)
-def shadow_image(width, height, dark, scale):
+def shadow_image(width, height, dark, scale, color=None):
     """Render in Qt logical pixels; the window system applies display DPI once."""
     padding=shadow_padding(dark)*scale
     panel_width,panel_height=width*scale,height*scale
@@ -29,7 +29,10 @@ def shadow_image(width, height, dark, scale):
     painter=QPainter(mask)
     painter.setRenderHint(QPainter.Antialiasing)
     painter.setPen(Qt.NoPen)
-    painter.setBrush(QColor(0,0,0,round(255*(.26 if dark else .10))))
+    from .token_colors import ui_palette
+    shade=QColor(color or ui_palette(default_appearance(dark))['shadow'])
+    shade.setAlpha(round(255*(.26 if dark else .10)))
+    painter.setBrush(shade)
     painter.drawRoundedRect(QRectF(0,0,panel_width,panel_height),16*scale,16*scale)
     painter.end()
 
@@ -50,7 +53,7 @@ def shadow_image(width, height, dark, scale):
     painter.setRenderHint(QPainter.Antialiasing)
     painter.setCompositionMode(QPainter.CompositionMode_Clear)
     painter.setPen(Qt.NoPen)
-    painter.setBrush(Qt.black)
+    painter.setBrush(shade)
     painter.drawRoundedRect(QRectF(padding,padding,panel_width,panel_height),16*scale,16*scale)
     painter.end()
     return image
@@ -119,7 +122,8 @@ class OverlayShadow(QuickHost):
     def refresh_shadow(self):
         width,height=self._panel_size
         scale=self.appearance.scale
-        key=(width,height,self.appearance.dark,scale)
+        from .token_colors import ui_palette
+        key=(width,height,self.appearance.dark,scale,ui_palette(self.appearance)['shadow'])
         if key==self._render_key:return
         self._render_key=key
         self.view.image=shadow_image(*key)

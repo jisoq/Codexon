@@ -136,9 +136,11 @@ class OverlayChrome(OverlayHost):
         self.setAccessibleName(names[kind])
         if kind in ('header', 'icon'): self.setCursor(Qt.OpenHandCursor)
         self.view = ChromeModel()
+        from .overlay_view import palette
+        initial = palette(self.appearance)
         self.view.put(chromeKind=kind, scale=1., opacity=94, hovered=False, pressed=False,
-                      expanded=False, canExpand=True, popupOpen=False, surface='#1C211E',
-                      ink='#F1F5F2', meta='#95A59B', border='#455048', accent='#79C4A5',
+                      expanded=False, canExpand=True, popupOpen=False,
+                      **{key:initial[key].name() for key in ('surface','ink','meta','border','accent')},
                       family='Pretendard JP', reducedMotion=False)
         self.set_scene(self.view, 'OverlayControls.qml', transparent=True)
         self.quick.setFocusPolicy(Qt.StrongFocus)

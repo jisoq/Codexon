@@ -82,8 +82,8 @@ class Details(Group):
         self.toggle.setText(title)
         self.toggle.setCheckable(True)
         self.toggle.put(disclosure=True)
-        self.toggle.setStyleSheet('Button { border: none; padding: 4px 0; color: #526278; } '
-                                 'Button:hover { color: #263344; } Button:focus { outline: 1px solid #3466a3; }')
+        self.toggle.setStyleSheet('Button { border: none; padding: 4px 0; color: muted; } '
+                                 'Button:hover { color: ink; } Button:focus { outline: 1px solid accent; }')
         self.body=content if content is not None else Text()
         if isinstance(self.body,Text):
             if self.body.kind != 'textarea':self.body.setTextFormat(Qt.RichText)

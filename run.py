@@ -2,6 +2,10 @@ if __name__ == "__main__":
     from multiprocessing import freeze_support
     freeze_support()
     import sys
+    if '--cache-hook' in sys.argv:
+        sys.argv.remove('--cache-hook')
+        from cachemonitor.cache_control import hook_main
+        raise SystemExit(hook_main())
     if '--complete-install' in sys.argv:
         sys.argv.remove('--complete-install')
         from cachemonitor.install_management import complete_main

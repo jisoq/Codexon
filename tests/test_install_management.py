@@ -70,3 +70,68 @@ def test_login_startup_preserves_custom_home_and_disabled_or_unrelated_values():
     assert 'old folder' not in changed
     for unrelated in ('', '"C:\\pythonw.exe" run.py --hidden'):
         assert install.startup_replacement(unrelated,Path('C:/new/Codexon.exe'))==unrelated
+def test_cache_launch_paths_survive_home_update(tmp_path):
+    from cachemonitor.launch_context import save_cache_paths,cache_paths,save_homes,resolve_homes
+    path=tmp_path/'launch.json'
+    index=tmp_path/'observation'/'index.sqlite';quota=tmp_path/'original-quota.sqlite';evidence=tmp_path/'evidence.sqlite'
+    save_cache_paths(index,evidence,quota,path=path)
+    save_homes([tmp_path/'home'],path=path)
+    assert cache_paths(path=path)==dict(index_path=str(index),evidence_path=str(evidence),quota_path=str(quota))
+    assert resolve_homes(path=path)==[str(tmp_path/'home')]
+
+
+def test_cache_launch_paths_are_shared_across_msix_localappdata_views(tmp_path,monkeypatch):
+    from cachemonitor import launch_context as launch
+    monkeypatch.setattr(launch.Path,'home',lambda:tmp_path)
+    first=tmp_path/'msix';second=tmp_path/'ordinary'
+    monkeypatch.setenv('LOCALAPPDATA',str(first))
+    legacy=first/'CacheMonitor'/'launch.json';legacy.parent.mkdir(parents=True)
+    legacy.write_text(json.dumps({'homes':['legacy-home']}))
+    assert launch.resolve_homes()==['legacy-home']
+    launch.save_cache_paths(tmp_path/'index.sqlite',tmp_path/'e.sqlite',tmp_path/'quota.sqlite')
+    monkeypatch.setenv('LOCALAPPDATA',str(second))
+    assert launch.resolve_homes()==['legacy-home']
+    assert launch.cache_paths()['quota_path']==str(tmp_path/'quota.sqlite')
+
+
+def test_normal_launch_resolves_saved_homes_after_restoring_cache_paths(tmp_path,monkeypatch):
+    from cachemonitor import app,launch_context as launch
+    import sys
+    monkeypatch.setattr(sys,'argv',['Codexon.exe'])
+    monkeypatch.setattr(launch,'cache_paths',lambda:dict(index_path=str(tmp_path/'index.sqlite'),quota_path=str(tmp_path/'quota.sqlite')))
+    calls=[]
+    monkeypatch.setattr(launch,'resolve_homes',lambda explicit:(calls.append(explicit) or [str(tmp_path/'custom home')]))
+    class BeforeGUI(Exception):pass
+    monkeypatch.setattr(app,'configure_font_rendering',lambda:(_ for _ in ()).throw(BeforeGUI()))
+    with pytest.raises(BeforeGUI):app.main()
+    assert calls==[None]
+
+
+def test_uninstall_removes_only_own_installation_hooks_and_uses_saved_worker(tmp_path,monkeypatch):
+    from cachemonitor import cache_hooks,launch_context,connection_recovery,installation
+    root=tmp_path/'installed';home=tmp_path/'custom home';home.mkdir()
+    owned=root/'versions'/'old'/'CodexonHook.exe'
+    cache_hooks.configure(home,tmp_path/'cache.sqlite',True,executable=owned)
+    path=home/'hooks.json';document=json.loads(path.read_text())
+    external={'description':'another hook','hooks':[{'command':'external-tool'}]}
+    document['hooks']['UserPromptSubmit'].append(external)
+    path.write_text(json.dumps(document));auth=home/'auth.json';auth.write_text('preserve')
+    monkeypatch.setattr(launch_context,'cache_paths',lambda:dict(index_path=str(tmp_path/'index.sqlite'),evidence_path=str(tmp_path/'evidence.sqlite')))
+    monkeypatch.setattr(launch_context,'resolve_homes',lambda *a:[str(home)])
+    from cachemonitor.cache_worker_control import CacheWorkerManager
+    assert isinstance(install.connection_manager(),CacheWorkerManager)
+    assert install.connection_manager().home==home
+    manager=SimpleNamespace(home=home,shared_cache_worker=True,health=lambda **kw:None)
+    monkeypatch.setattr(install,'connection_manager',lambda:manager)
+    monkeypatch.setattr(installation,'installed',lambda:dict(InstallRoot=str(root)))
+    restored=[];monkeypatch.setattr(connection_recovery,'restore',lambda m:restored.append(m))
+    monkeypatch.setattr(install,'processes_under',lambda r:[dict(ExecutablePath=str(root/'Codexon.exe'),ProcessId=42)])
+    with pytest.raises(RuntimeError,match='끝난 뒤'):install.prepare_uninstall(root)
+    assert restored==[manager] and auth.read_text()=='preserve'
+    remaining=json.loads(path.read_text())['hooks']
+    assert remaining['UserPromptSubmit']==[external] and remaining['Stop']==[]
+    assert (home/'hooks.before-codexon-uninstall.json').is_file()
+    other=tmp_path/'other'/'CodexonHook.exe'
+    cache_hooks.configure(home,tmp_path/'cache.sqlite',True,executable=other)
+    before=path.read_bytes();assert not cache_hooks.remove_installation(home,root)
+    assert path.read_bytes()==before

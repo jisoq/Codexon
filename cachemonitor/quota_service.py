@@ -20,10 +20,10 @@ class QuotaService(QThread):
     # as AnalysisBridge does, rather than recursively copying QVariant maps.
     updated = Signal(object)
 
-    def __init__(self, home, index_path=None, live=True, tracking_enabled=True):
+    def __init__(self, home, index_path=None, live=True, tracking_enabled=True,quota_path=None):
         super().__init__()
         self.home = str(Path(home).resolve())
-        self.path = ledger_path(index_path)
+        self.path = Path(quota_path) if quota_path else ledger_path(index_path)
         self.live = live
         self.wake = threading.Event()
         self.tracking_enabled=tracking_enabled

@@ -11,7 +11,7 @@ Rectangle {
     onSelectedCallChanged: if (bodyScroll) bodyScroll.contentY = 0
     property bool speedOpen: s.detailSpeedOpen || false
     onSpeedOpenChanged: if (bodyScroll) bodyScroll.contentY = 0
-    color: "#01000000"
+    color: appTheme.palette.hit_surface
     clip: true
     Keys.onEscapePressed: event => { root.presentation.escapePanel(); event.accepted = true; }
 
@@ -39,7 +39,7 @@ Rectangle {
         Rectangle {
             anchors.fill: parent; anchors.margins: -4 * root.unitScale
             visible: graph.activeFocus && graph.keyboardFocus; color: "transparent"; radius: 4 * root.unitScale
-            border.width: 2 * root.unitScale; border.color: root.s.overlayAccent || "#79C4A5"
+            border.width: 2 * root.unitScale; border.color: root.s.overlayAccent || appTheme.palette.accent
         }
         MouseArea {
             anchors.fill: parent; hoverEnabled: true
@@ -139,14 +139,14 @@ Rectangle {
             visible: root.s.detailHasSelection || false
             text: appLanguage.text("대시보드에서 열기")
             contentItem: Text {
-                text: openDashboard.text; color: root.s.overlayInk || "#EDF2F7"
+                text: openDashboard.text; color: root.s.overlayInk || appTheme.palette.ink
                 font.family: root.s.overlayFamily || "Pretendard JP"; font.pixelSize: 14 * root.unitScale
                 horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter
             }
             background: Rectangle {
-                radius: 6 * root.unitScale; color: root.s.overlaySurface || "#222D3A"
+                radius: 6 * root.unitScale; color: root.s.overlaySurface || appTheme.palette.overlay
                 border.width: openDashboard.visualFocus ? 2 : 1
-                border.color: openDashboard.visualFocus ? root.s.overlayAccent : root.s.overlayBorder || "#354253"
+                border.color: openDashboard.visualFocus ? root.s.overlayAccent : root.s.overlayBorder || appTheme.palette.border
             }
             Accessible.name: appLanguage.text("선택 호출의 전체 상세를 대시보드에서 열기")
             onPressed: root.presentation.captureNavigation("selected")
@@ -164,7 +164,7 @@ Rectangle {
                 root.presentation.startInteraction(); bodyScroll.forceActiveFocus(Qt.MouseFocusReason);
                 bodyScroll.keyboardFocus = false;
             }
-            contentItem: Rectangle { radius: width / 2; color: root.s.overlayInk || "#F1F5F2"; opacity: 0.30 }
+            contentItem: Rectangle { radius: width / 2; color: root.s.overlayInk || appTheme.palette.ink; opacity: 0.30 }
             background: Item {}
         }
     }
@@ -173,6 +173,6 @@ Rectangle {
         width: bodyScroll.width + 8 * root.unitScale; height: bodyScroll.height + 8 * root.unitScale
         visible: bodyScroll.activeFocus && bodyScroll.keyboardFocus
         color: "transparent"; radius: 4 * root.unitScale
-        border.width: 2 * root.unitScale; border.color: root.s.overlayAccent || "#79C4A5"
+        border.width: 2 * root.unitScale; border.color: root.s.overlayAccent || appTheme.palette.accent
     }
 }

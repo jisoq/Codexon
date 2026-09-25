@@ -5,7 +5,7 @@ import QtQuick.Layouts
 Rectangle {
     id: root
     required property var presentation
-    color: "#01000000"
+    color: appTheme.palette.hit_surface
     RowLayout {
         anchors.centerIn: parent; spacing: 4
         Image { source: root.presentation.state.logo; Layout.preferredWidth: 18; Layout.preferredHeight: 18; sourceSize.width: 36; sourceSize.height: 36 }
