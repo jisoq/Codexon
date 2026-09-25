@@ -23,6 +23,105 @@ URL='https://chatgpt.com/backend-api/codex/responses'
 HEADERS={'ChatGPT-Account-ID':'synthetic-account','Content-Length':'1'}
 
 
+@pytest.mark.parametrize('kind',['unsupported','schema','text','malformed','truncated','timeout','lost','empty','event','failed_event'])
+def test_http_error_evidence_survives_product_executor_and_journal(tmp_path,kind):
+    async def scenario():
+        path=tmp_path/'c.sqlite';seen=[]
+        secret='sk-private-credential';prompt='ORIGINAL PRIVATE CONVERSATION'
+        headers={**HEADERS,'Authorization':'Bearer '+secret}
+        request={**body(),'input':[{'role':'user','content':prompt}]}
+        async def endpoint(req):
+            seen.append(await req.json())
+            if kind in ('event','failed_event'):
+                error=dict(code='invalid_tool_schema',type='invalid_request_error',param='tools',message='Invalid schema '+prompt)
+                event=dict(type='error',error=error) if kind=='event' else dict(type='response.failed',response=dict(status='failed',error=error))
+                return web.Response(text='data: '+json.dumps(event)+'\n\n',content_type='text/event-stream',headers={'x-request-id':'req-'+kind})
+            if kind=='unsupported':
+                payload={'error':{'code':'unsupported_parameter','type':'invalid_request_error','param':'max_output_tokens',
+                    'detail':'Output limit not supported','message':'Unsupported parameter '+prompt+' '+secret},
+                    'request':request,'authorization':'Bearer '+secret}
+            elif kind=='schema':
+                payload={'detail':[{'code':'invalid_tool_schema','type':'validation_error','param':'tools.0',
+                    'message':'Tool schema missing required property','detail':'Missing property'}]}
+            else:payload=None
+            if payload:return web.json_response(payload,status=400,headers={'x-request-id':'req-'+kind})
+            if kind=='empty':return web.Response(status=400,headers={'x-request-id':'req-empty'})
+            text=('Unsupported request '+prompt+' Authorization=Bearer '+secret if kind=='text' else
+                  '{"error":{"code":"bad_schema","message":"'+prompt+' '+secret+'"' if kind=='malformed' else
+                  'Rejected '+prompt+' '+secret+' '+'x'*20000 if kind=='truncated' else
+                  '{"error":{"code":"partial_error","message":"'+prompt+'"')
+            reply=web.StreamResponse(status=400,headers={'x-request-id':'req-'+kind})
+            await reply.prepare(req);await reply.write(text.encode())
+            if kind=='timeout':await asyncio.sleep(.3)
+            if kind=='lost':req.transport.close()
+            return reply
+        app=web.Application();app.router.add_post('/responses',endpoint)
+        async with server(app) as upstream:
+            async def send(url,h,value,**options):return await request_once(upstream+'/responses',h,value,**options)
+            journal=Journal(path);contexts=Contexts();contexts.completed(request,response())
+            executor=Executor(journal,contexts,send=send);operation=allow(journal)
+            opts=dict(anchor=time.monotonic(),deadline=time.monotonic(),latency_bound=.1 if kind=='timeout' else 2,operation=operation)
+            start=time.monotonic()
+            assert await executor.run('home','s','original',URL,headers,**opts)=='failed'
+            if kind=='timeout':assert time.monotonic()-start<.25
+            assert await executor.run('home','s','original',URL,headers,**opts)=='duplicate'
+            journal.close()
+        journal=Journal(path);rows=journal.rows();assert len(rows)==len(seen)==1
+        row=rows[0];evidence=row['transport']
+        assert evidence['http_status']==(200 if kind in ('event','failed_event') else 400) and evidence['rejected']
+        assert evidence['request_ids']['x-request-id']=='req-'+kind
+        assert row['state']=='failed' and row['input'] is None and row['cost'] is None and not row['usage_known']
+        assert journal.operations.stats(journal.operations.grants()[0])['calls']==1
+        assert journal.operations.grants()[0]['stopped']=='usage_unresolved'
+        if kind in ('unsupported','schema'):
+            fields={f['field']:f['value'] for f in evidence['fields']}
+            assert fields['code']==('unsupported_parameter' if kind=='unsupported' else 'invalid_tool_schema')
+            assert all(k in fields for k in ('code','type','param','detail','message'))
+            assert evidence['body_complete'] and not evidence['missing_fields']
+        if kind=='malformed':assert evidence['body_format']=='invalid_json' and evidence['body_complete']
+        if kind=='text':assert evidence['body_format']=='text' and 'Unsupported request' in evidence['body']
+        if kind=='truncated':assert evidence['body_truncated'] and not evidence['body_complete']
+        if kind in ('timeout','lost'):assert evidence['read_error'] and evidence['body_bytes']>0 and not evidence['body_complete']
+        if kind=='empty':assert evidence['body_format']=='empty' and len(evidence['missing_fields'])==5
+        assert len(evidence['body'])<=2048
+        stored='\n'.join(journal.db.iterdump())
+        assert prompt not in stored and secret not in stored and 'synthetic-account' not in stored
+        journal.close()
+    run_proxy_test(scenario())
+
+
+@pytest.mark.parametrize('state',['observed','reserved','completed','stopped'])
+def test_cli_uses_panel_forecasts_after_status_changes_and_rejects_stale_context(tmp_path,monkeypatch,capsys,state):
+    from tools.cache_runtime import main
+    home=str((tmp_path/'home').resolve());path=tmp_path/'c.sqlite'
+    control=Control(path);now=time.time()
+    row=dict(profile(),key='current',ts=now)
+    control.profile(home,'s',row)
+    forecast=dict(snapshot='current',observed_at=now,cost_valid_until=now+100,model=row['model'],effort=row['effort'],
+                  service_tier='default',maintenance_expected=.1,maintenance_adverse=1,output_high=64,basis='natural_output_proxy')
+    control.forecast(home,'s',forecast)
+    control.status(home,'s',dict(state=state,maintenance_expected=99,maintenance_adverse=999,cost_valid_until=now+100))
+    def invoke(action,*extra):
+        monkeypatch.setattr('sys.argv',['cache_runtime.py',action,'--database',str(path),'--home',home,*extra])
+        main();output=capsys.readouterr().out
+        if action=='authorize-diagnostic':output=output[output.index('\n')+1:]
+        return json.loads(output)
+    assert invoke('status')['current_scenarios']==control.forecasts(home,time.time())==[forecast]
+    args=('--authorization','test-only','--account-hash','a'*64,'--model',row['model'],'--effort',row['effort'],'--cost-stop','1')
+    result=invoke('authorize-diagnostic',*args)
+    assert result['grants'][0]['expected']==.1 and result['grants'][0]['max_calls']==2
+    assert not result['usage']
+    # An existing persistent forecast must never fall back to a status amount.
+    for stale in ('expired','new_context'):
+        control.forecast(home,'s',dict(forecast,cost_valid_until=now-1) if stale=='expired' else forecast)
+        if stale=='new_context':control.profile(home,'s',dict(row,key='next',ts=now+1))
+        assert invoke('status')['current_scenarios']==control.forecasts(home,time.time())==[]
+        fresh_args=('--authorization','unused-'+stale,*args[2:])
+        with pytest.raises(ValueError,match='fresh_pricing_required'):invoke('authorize-diagnostic',*fresh_args)
+        assert control.get('authorization:unused-'+stale) is None
+    control.close()
+
+
 def test_diagnostic_astra_uses_product_executor_without_return_history(tmp_path):
     async def scenario():
         index=tmp_path/'index.sqlite';seen=[]

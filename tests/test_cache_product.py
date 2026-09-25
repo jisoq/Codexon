@@ -32,7 +32,17 @@ def test_simultaneous_schema_startup_and_existing_wal_reader_under_write_lock(tm
             control.set('client:'+str(i),i)
             return journal.db.execute('PRAGMA user_version').fetchone()[0]
         finally:control.close();journal.close()
-    with ThreadPoolExecutor(8) as pool:assert list(pool.map(open_both,range(8)))==[1]*8
+    with ThreadPoolExecutor(8) as pool:assert list(pool.map(open_both,range(8)))==[2]*8
+    # Upgrade an existing journal without changing consumed calls or permissions.
+    with sqlite3.connect(path) as old:
+        old.execute('ALTER TABLE cache_jobs DROP COLUMN transport')
+        old.execute('PRAGMA user_version=1')
+        old.execute("INSERT INTO cache_jobs(id,state,started,usage) VALUES('old','unknown',1,NULL)")
+        old.execute("INSERT INTO cache_operating_grants VALUES('grant','home','{}',1,2,'usage_unresolved')")
+    upgraded=Journal(path)
+    assert upgraded.rows()[0]['transport'] is None and upgraded.rows()[0]['cost'] is None
+    assert upgraded.db.execute('SELECT expires,stopped FROM cache_operating_grants').fetchone()==(2,'usage_unresolved')
+    upgraded.close()
     writer=sqlite3.connect(path,isolation_level=None);writer.execute('BEGIN IMMEDIATE')
     try:
         writer.execute("UPDATE cache_preferences SET value='99' WHERE key='client:0'")
@@ -386,7 +396,8 @@ def test_relay_to_scheduler_to_transport_failure_and_stop_contract(tmp_path,outc
                 assert requests[1]['tools']==requests[0]['tools'] and requests[1]['tool_choice']=='none'
                 assert requests[1]['reasoning']==requests[0]['reasoning']
                 rows=scheduler.journal.rows()
-                if outcome in ('401','429','lost'):assert rows[0]['input'] is None and rows[0]['state']=='unknown'
+                if outcome in ('401','429','lost'):
+                    assert rows[0]['input'] is None and rows[0]['state']==('unknown' if outcome=='lost' else 'failed')
                 elif outcome=='overcap':assert rows[0]['output']==20
                 elif outcome=='zero':assert rows[0]['scope_read_lower']==0
                 elif outcome=='incomplete':assert rows[0]['state']=='unknown' and rows[0]['usage_known'] and rows[0]['cost'] is not None
