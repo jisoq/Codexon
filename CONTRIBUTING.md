@@ -23,6 +23,18 @@ The product build also freezes `CodexonRecovery.exe` with its own Python/Tcl/Tk 
 
 Use `-Isolated` and a separate output directory for installation QA. The QA installer uses a separate app ID and never activates the production proxy. Validate the payload with `python tools/package_release.py --product <product-directory> --validate-only`. Publish `Codexon-Setup.exe` and `Codexon-Setup.exe.sha256`; the app updater uses the checksum automatically. Do not publish a portable app ZIP. Keep all bundled third-party notices, source offers and relinking instructions. Signing credentials are not stored in this repository.
 
+## Releases
+
+PRs are optional. Push changes directly to `main`; push CI checks the affected behavior. To release, set a new `VERSION` in `cachemonitor/version.py`, push it, then run:
+
+```powershell
+gh workflow run windows.yml --ref main -f publish=true
+```
+
+This runs the full source, package, installation and proxy checks, builds the production installer from that same verified package, and publishes the installer, checksums and third-party sources. The release tag is `v<VERSION>` and points to the commit selected when the workflow started. Existing tags are not overwritten. Running the workflow without `publish=true` performs full verification only.
+
+Release publication depends on successful CI, rather than requiring CI before a direct push to `main`. Keep force pushes and branch deletion disabled. See [verification](docs/verification.md) for the checks and evidence.
+
 ## Graph axes
 
 All numerical graph axes must automatically fit the finite values currently displayed, with readable padding. Do not force a zero origin or a fixed percentage/currency range. Recompute after filters or data changes; ignore missing values rather than treating them as zero, and handle empty or constant series without a degenerate range. Axis labels, marks and inspection coordinates must use the same bounds. Normalized 100% composition strips and progress indicators retain their semantic denominator; they are not absolute-value graph axes.
