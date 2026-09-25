@@ -14,6 +14,24 @@ from test_cache_management import body,response
 from cachemonitor.cache_operating import target
 
 
+def test_worker_heartbeat_does_not_reenable_disabled_route(tmp_path):
+    app=QApplication.instance() or QApplication([])
+    panel=CachePanel('home',tmp_path/'index.sqlite',active=True)
+    try:
+        panel.control.set('automatic',True)
+        panel.control.set('worker_heartbeat',time.time())
+        panel.control.set('worker_snapshots',1)
+        panel.proxy_status(dict(configured=False,health=dict(cache_management=True)))
+        panel.poll()
+        assert not panel.proxy_ready and not panel.relay_connected
+        assert panel.connection_status.text()=='작업기 실행 중 · 새 요청 연결 꺼짐'
+        assert panel.status.text()=='자동 유지 대기 · 캐시 관리를 지원하는 프록시 연결 필요'
+        panel.proxy_status(dict(configured=True,health=dict(cache_management=True)))
+        panel.poll();assert panel.proxy_ready
+        assert panel.connection_status.text()=='작업기 연결됨'
+    finally:panel.stop()
+
+
 def test_english_cache_consent_is_complete_and_preserves_user_text(tmp_path):
     import ast
     from pathlib import Path
@@ -214,7 +232,8 @@ def test_rendered_hook_approval_cancel_close_timeout_and_disconnect(tmp_path):
             if choice=='approve':assert '진행 허용' in panel.hook_status.text()
         panel.display(dict(calls=2,priced=1,known_cost=.01,shortfalls=1,audit=[]))
         assert '비용 미확인 1회' in panel.summary.text()
-        panel.control.set('automatic',True);panel.proxy_ready=True
+        panel.control.set('automatic',True)
+        panel.proxy_status(dict(configured=True,health=dict(cache_management=True)))
         panel.control.status('home','s',dict(state='waiting',reason='output_bound_not_verified',history_can_unlock=False))
         panel.poll()
         assert '이력 추가만으로 활성화되지 않음' in panel.status.text()

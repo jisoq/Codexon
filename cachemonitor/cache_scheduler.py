@@ -11,6 +11,7 @@ from .cache_execution import Contexts,Executor,Journal
 from .cache_policy import Gap,decide,cost_bounds,operating_scenarios,executable_rounds
 from .cache_operating import target,maintenance_route
 from .core import usage_values
+from .cache_audit import TTL_SECONDS
 
 
 class Scheduler:
@@ -239,19 +240,23 @@ class Scheduler:
 
     async def tick(self):
         if self.closed:return
+        for sid,snapshot in list(self.snapshots.items()):
+            active=self.jobs.get(sid)
+            # A bounded, already authorized maintenance sequence owns its context
+            # until it collects sent usage and finishes its permitted renewals.
+            if active and not active.done():continue
+            if time.monotonic()-snapshot['anchor']>=TTL_SECONDS:
+                self.snapshots.pop(sid,None);self.evaluations.pop(sid,None)
+                rid=snapshot['response']['id'];item=self.executor.contexts.responses.pop(rid,None)
+                if item:self.executor.contexts.size-=item[2]
+                self.executor.contexts.usage.pop(rid,None);self.stopped.discard((sid,rid))
+                self.control.db.execute('DELETE FROM cache_status WHERE home=? AND sid=?',(self.home,sid))
         if self.continuous_capture:
             self.control.set('worker_heartbeat',time.time())
             self.control.set('worker_snapshots',len(self.snapshots))
             await self.diagnostic_tick()
         if self.observation_only or (self.continuous_capture and not self.control.enabled('automatic')):
             for sid,snapshot in list(self.snapshots.items()):
-                if time.monotonic()-snapshot['anchor']>=1800:
-                    self.snapshots.pop(sid,None)
-                    rid=snapshot['response']['id'];item=self.executor.contexts.responses.pop(rid,None)
-                    if item:self.executor.contexts.size-=item[2]
-                    self.executor.contexts.usage.pop(rid,None)
-                    self.control.db.execute('DELETE FROM cache_status WHERE home=? AND sid=?',(self.home,sid))
-                    continue
                 previous=self.evaluations.get(sid)
                 if previous and previous[0]==snapshot['response']['id'] and time.monotonic()-previous[1]<5:continue
                 self.evaluations[sid]=(snapshot['response']['id'],time.monotonic())

@@ -1781,5 +1781,6 @@
   "훅 연결 갱신": "Update hook connection",
   "훅 연결 실패: ": "Hook connection failed: ",
   "훅 이벤트 미수집 · 신뢰 설정과 실제 실행은 별도입니다": "No hook events collected · trusting a command and actually running it are separate",
-  "훅 파일 연결 완료 · Codex에서 신뢰 허용 필요": "Hook file connected · trust approval in Codex is required"
+  "훅 파일 연결 완료 · Codex에서 신뢰 허용 필요": "Hook file connected · trust approval in Codex is required",
+  "작업기 실행 중 · 새 요청 연결 꺼짐": "Worker running · routing for new requests is off"
 }

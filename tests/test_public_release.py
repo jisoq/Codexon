@@ -14,7 +14,7 @@ def test_language_choice_is_saved_and_used_on_next_window(tmp_path):
     from PySide6.QtWidgets import QApplication
     from PySide6.QtTest import QTest
     from cachemonitor.dashboard import Dashboard
-    from cachemonitor.quick_qa import control, click
+    from cachemonitor.quick_qa import control, click, render_plot
     app=QApplication.instance() or QApplication([])
     previous=app.property('cachemonitorDisableShellIntegration')
     app.setProperty('cachemonitorDisableShellIntegration',True)
@@ -28,7 +28,7 @@ def test_language_choice_is_saved_and_used_on_next_window(tmp_path):
         restart=window.settings_page.controls['restart'];requests=[]
         window.settings_page.restartRequested.connect(lambda:requests.append(True))
         assert not control(window,restart).isEnabled()
-        control(window,choice).forceActiveFocus()
+        render_plot(window,choice).forceActiveFocus()
         QTest.keyClick(window.quick,Qt.Key_End);QTest.qWait(20)
         settings.sync()
         saved=QSettings(path,QSettings.IniFormat)
@@ -48,7 +48,7 @@ def test_language_choice_is_saved_and_used_on_next_window(tmp_path):
         assert not control(reopened,reopened.settings_page.controls['restart']).isEnabled()
         assert reopened.settings_page.navigation.state['items'][0]['text']=='General'
         assert reopened.grab().save(str(tmp_path/'english-settings.png'))
-        control(reopened,choice).forceActiveFocus()
+        render_plot(reopened,choice).forceActiveFocus()
         QTest.keyClick(reopened.quick,Qt.Key_Home);QTest.qWait(20);saved.sync()
         assert QSettings(path,QSettings.IniFormat).value('ui/language')=='ko'
         assert not reopened.qml_errors
