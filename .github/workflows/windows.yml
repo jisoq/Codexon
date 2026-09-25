@@ -55,7 +55,7 @@ jobs:
         run: |
           $base = if ($env:EVENT_NAME -eq 'pull_request') { $env:PR_BASE } else { $env:PUSH_BASE }
           $all = $env:EVENT_NAME -eq 'workflow_dispatch' -or -not $base -or $base -match '^0+$'
-          $checkArgs = if ($all) { @('--full') } else { @('--base', $base) }
+          [string[]]$checkArgs = if ($all) { @('--full') } else { @('--base', $base) }
           $raw = python tools/verify_changes.py --plan @checkArgs
           if ($LASTEXITCODE -ne 0) { throw ($raw -join "`n") }
           $plan = ($raw -join "`n") | ConvertFrom-Json
@@ -76,7 +76,7 @@ jobs:
         timeout-minutes: 15
         shell: pwsh
         run: |
-          $checkArgs = if ($env:VERIFY_FULL -eq 'True') { @('--full') } else { @('--base', $env:VERIFY_BASE) }
+          [string[]]$checkArgs = if ($env:VERIFY_FULL -eq 'True') { @('--full') } else { @('--base', $env:VERIFY_BASE) }
           python tools/run_ui_checks.py -- python tools/verify_changes.py @checkArgs
           exit $LASTEXITCODE
       - name: Build Windows package
