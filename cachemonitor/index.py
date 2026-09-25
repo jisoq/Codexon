@@ -412,7 +412,9 @@ class UsageIndex:
             self.indexed_files=files
         finally:self.db.rollback()
         self.files=[(path,row[0],row[1]) for path,row in files.items()]
-        self.queue=deque((path,row[0],row[1]) for path,row in files.items() if row[2]<row[3])
+        # Legacy indexes retain rows after a rollout is archived or deleted.
+        # Retain their observed events, but absent sources cannot be queued work.
+        self.queue=deque((path,row[0],row[1]) for path,row in files.items() if row[2]<row[3] and Path(path).exists())
         self.done_files=len(files)-len(self.queue)
         complete=bool(files) and not self.queue
         if complete:self.last_usage_success=now
