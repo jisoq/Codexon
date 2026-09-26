@@ -182,7 +182,7 @@ def main(argv=None):
     parser.add_argument('--isolated-install', action='store_true')
     parser.add_argument('--no-launch', action='store_true')
     parser.add_argument('--native-install', action='store_true', help=argparse.SUPPRESS)
-    parser.add_argument('--install-caller-pid', type=int, help=argparse.SUPPRESS)
+    parser.add_argument('--install-caller-pid', type=int, action='append', help=argparse.SUPPRESS)
     parser.add_argument('--language', choices=('en','ko'))
     parser.add_argument('--ui-smoke', type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)

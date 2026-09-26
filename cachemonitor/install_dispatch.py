@@ -29,7 +29,9 @@ def native_install(args):
     command=[sys.executable]
     if not getattr(sys,'frozen',False):command.append(str(Path(__file__).resolve().parents[1]/'recovery_main.py'))
     command+=['--native-install','--install-root',str(args.install_root),'--report',str(report)]
-    if args.prepare_uninstall:command+=['--install-caller-pid',str(os.getpid())]
+    if args.prepare_uninstall:
+        # A one-file recovery executable has both a bootloader and Python process.
+        for pid in (os.getpid(),os.getppid()):command+=['--install-caller-pid',str(pid)]
     for key in ('product_dir','language'):
         value=getattr(args,key,None)
         if value:command+=['--'+key.replace('_','-'),str(value)]

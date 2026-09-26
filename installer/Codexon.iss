@@ -72,13 +72,14 @@ procedure ExitBootstrap(Code: Integer);
 external 'ExitProcess@kernel32.dll stdcall';
 
 function NativeSetup: Boolean;
-var Request, Params, Arg, Lower, Script: String; Proof: AnsiString;
+var Request, Params, Arg, Lower, Script, Source: String; Proof: AnsiString;
     I, Count, Code: Integer; Service, Task: Variant;
 begin
+  Source := ExpandConstant('{srcexe}');
   Request := ExpandConstant('{param:CODEXONREQUEST|}');
   if Request <> '' then begin
     if not LoadStringFromFile(Request+'.ready', Proof) or
-       (CompareText(Trim(String(Proof)), GetSHA256OfFile(ExpandConstant('{srcexe}'))) <> 0) then
+       (CompareText(Trim(String(Proof)), GetSHA256OfFile(Source)) <> 0) then
       RaiseException('Native installation request is invalid.');
     Service := CreateOleObject('Schedule.Service');
     Service.Connect();
@@ -92,8 +93,8 @@ begin
   ExtractTemporaryFile('native-setup.ps1');
   Script := ExpandConstant('{tmp}\native-setup.ps1');
   Request := ExpandConstant('{tmp}\native-request.ini');
-  SetIniString('request', 'source', ExpandConstant('{srcexe}'), Request);
-  SetIniString('request', 'sha256', GetSHA256OfFile(ExpandConstant('{srcexe}')), Request);
+  SetIniString('request', 'source', Source, Request);
+  SetIniString('request', 'sha256', GetSHA256OfFile(Source), Request);
   Count := 0;
   for I := 1 to ParamCount do begin
     Arg := ParamStr(I); Lower := Lowercase(Arg);
