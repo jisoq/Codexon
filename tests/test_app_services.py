@@ -182,6 +182,28 @@ def test_legacy_collector_control_checks_real_index_before_retirement(tmp_path,m
     finally:owner.__exit__(None,None,None);channel.close()
 
 
+@pytest.mark.parametrize('changed',['created','home','evidence'])
+def test_collector_control_rejects_reused_pid_and_wrong_command_scope(tmp_path,monkeypatch,changed):
+    from cachemonitor.collection_lifecycle import collector_process
+    from cachemonitor.usage_collection import CollectionChannel
+    channel=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite')
+    process=dict(pid=123,created=2,executable=str(tmp_path/'collector'))
+    command=[process['executable'],'--usage-collector','--index-path',str(channel.path),
+             '--codex-home',channel.homes[0],'--evidence-path',str(channel.default_evidence)]
+    snapshot=dict(homes=channel.homes,collection=dict(pid=123,instance='old',
+        executable=process['executable'],process_created=2))
+    if changed=='created':snapshot['collection']['process_created']=1
+    if changed=='home':command[command.index('--codex-home')+1]=str(tmp_path/'other-home')
+    if changed=='evidence':command[-1]=str(tmp_path/'other-evidence.sqlite')
+    monkeypatch.setattr(services.identity,'process_identity',lambda _:process)
+    monkeypatch.setattr(services.identity,'process_command',lambda _:command)
+    monkeypatch.setattr(services.identity,'same_process',lambda _:True)
+    try:
+        with pytest.raises(RuntimeError,match='소유권'):collector_process(channel,snapshot)
+        assert not channel.db.execute('SELECT * FROM control').fetchall()
+    finally:channel.close()
+
+
 def test_quit_waits_responsively_and_handoff_does_not_stop_services(tmp_path,monkeypatch):
     import threading
     from PySide6.QtCore import QSettings

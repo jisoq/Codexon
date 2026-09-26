@@ -1,5 +1,7 @@
 # AI / LLM installation guide
 
+**Choose the operating system first.** For macOS, follow [the macOS guide](docs/macos.md) ([한국어](docs/macos.ko.md)); use the native DMG, per-user app links and installation receipt. The Windows Setup, registry and PowerShell instructions below apply only to Windows. An explicitly authorized remote port/build/install task can use the macOS installer's documented noninteractive mode; do not wait for a second authorization the user has already provided.
+
 This is the entry point for an AI assistant given the [Codexon repository](https://github.com/jisoq/Codexon) and a request to install or set up Codexon. **The user runs Setup; the AI verifies the installed application and its environment after the user reports completion.** Respond in the user's language.
 
 Follow this conversation flow:

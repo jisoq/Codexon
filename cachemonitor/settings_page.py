@@ -1,4 +1,5 @@
 """Application preferences, with existing actions as the shared control surface."""
+import sys
 from PySide6.QtCore import Qt, QSignalBlocker, QTimer, Signal
 from .presentation import Button, Choice, Column, Group, Navigation, Row, Scroll, Slider, Stack, Text, Toggle
 from PySide6.QtWidgets import QApplication
@@ -13,6 +14,8 @@ class SettingsPage(Group):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        if sys.platform == 'darwin':
+            self.TITLES = ('일반', '메뉴 막대', *self.TITLES[2:])
         self.owner = parent
         self.controls = {}
         shell = Row(self); shell.setContentsMargins(0, 0, 0, 0); shell.setSpacing(24)
@@ -39,7 +42,10 @@ class SettingsPage(Group):
         category=max(0,min(len(self.TITLES)-1,parent.settings.value('settings/category',0,type=int)))
         self.navigation.setCurrentRow(self.ORDER.index(category))
         self.navigation.currentRowChanged.connect(lambda row:parent.settings.setValue('settings/category',self.ORDER[row]) if row>=0 else None)
-        self.add_row(0, 'Windows 로그인 시 시작', '트레이에서 시작', self.toggle('startup'))
+        self.add_row(0, '로그인 시 시작' if sys.platform == 'darwin' else 'Windows 로그인 시 시작',
+                     '메뉴 막대에서 시작' if sys.platform == 'darwin' else '트레이에서 시작', self.toggle('startup'))
+        self.startup_status=Text('');self.startup_status.setWordWrap(True);self.startup_status.hide()
+        self.add_widget(0,self.startup_status)
         self.add_row(0, '잔여량 표시', '', self.choice('quota'))
         tracking=self.toggle('weekly_tracking')
         self.add_row(0, '주간 환산 모니터링', '', tracking)
@@ -72,13 +78,52 @@ class SettingsPage(Group):
             zone=time.tzname[0]
         timezone=Text('시스템 시간대 · '+zone);timezone.setWordWrap(True)
         self.add_widget(0, timezone)
-        self.add_row(1, '작업표시줄 위젯', '', self.toggle('widget'))
-        self.add_row(1, '표시할 모니터', '연결 해제 시 주 모니터 사용', self.choice('monitor'))
+        self.add_row(1, '메뉴 막대 잔여량 표시' if sys.platform == 'darwin' else '작업표시줄 위젯', '', self.toggle('widget'))
+        monitor_row = self.add_row(1, '표시할 모니터', '연결 해제 시 주 모니터 사용', self.choice('monitor'))
+        if sys.platform == 'darwin':
+            monitor_row.hide()
+            text = Text('메뉴 막대 위치는 macOS가 관리합니다. 잔여량을 누르면 메뉴를 엽니다.')
+            text.setWordWrap(True)
+            self.add_widget(1, text)
         self.add_row(2, '세션 오버레이', '현재 작업의 비용·토큰', self.toggle('overlay'))
         self.controls['reset_position']=Button('위치 초기화')
         self.add_row(2, '위치', '제목을 끌어서 이동', self.controls['reset_position'])
         for key in ('startup', 'quota', 'widget', 'monitor', 'overlay', 'reset_position', 'theme'):
             self.controls[key].setEnabled(False)
+        if sys.platform == 'darwin':
+            self._setup_macos_permissions()
+
+    def _setup_macos_permissions(self):
+        from .macos_status import NotificationPermission
+        self.notification_permission = NotificationPermission(self)
+        status = Text('알림 권한을 확인합니다.');status.setWordWrap(True)
+        button = Button('알림 허용')
+        self.controls['notification_permission'] = button
+        self.add_widget(4, status)
+        self.add_row(4, 'macOS 알림 권한', '허용하지 않아도 앱 안의 알림 기록은 유지합니다.', button)
+        def changed(value):
+            messages = {'authorized': 'macOS 알림이 허용되어 있습니다.', 'provisional': 'macOS 알림이 조용히 전달됩니다.',
+                        'not_determined': '알림을 받으려면 알림 허용을 누르세요.',
+                        'denied': 'macOS에서 알림을 차단했습니다. 알림 설정에서 허용하세요.',
+                        'unavailable': '알림은 설치한 Codexon 앱에서 사용할 수 있습니다. 앱 안의 알림 기록은 유지합니다.'}
+            status.setText(messages[value])
+            button.setText('알림 설정 열기' if value in ('denied', 'authorized', 'provisional') else '알림 허용')
+            button.setEnabled(value != 'unavailable')
+        self.notification_permission.changed.connect(changed)
+        def request():
+            if self.notification_permission.status in ('denied', 'authorized', 'provisional'):
+                self.open_system_settings('com.apple.Notifications-Settings.extension')
+            else:
+                self.notification_permission.request()
+        button.clicked.connect(request)
+        QApplication.instance().applicationStateChanged.connect(lambda _: self.notification_permission.refresh())
+        self.notification_permission.refresh()
+
+    @staticmethod
+    def open_system_settings(pane):
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+        QDesktopServices.openUrl(QUrl('x-apple.systempreferences:'+pane))
 
     def refresh_restart(self):
         from .i18n import language
@@ -143,6 +188,13 @@ class SettingsPage(Group):
 
     def bind_tray(self, owner):
         self.bind_action('startup', owner.startup)
+        def startup_status():
+            note=owner.startup.statusTip()
+            self.startup_status.setText(note)
+            self.startup_status.setVisible(bool(note))
+            self.controls['startup'].setToolTip(note)
+        owner.startup.changed.connect(startup_status)
+        startup_status()
         self.bind_action('widget', owner.taskbar_action)
         self.bind_choices('quota', owner.quota_actions)
         self.taskbar = owner.taskbar_quota
@@ -164,6 +216,59 @@ class SettingsPage(Group):
     def bind_overlay(self, controller):
         self.controls['reset_position'].clicked.connect(controller.reset_position)
         self.controls['reset_position'].setEnabled(True)
+        if sys.platform != 'darwin':
+            return
+        self.overlay_controller = controller
+        self.overlay_status = Text('');self.overlay_status.setWordWrap(True)
+        self.add_widget(2, self.overlay_status)
+        sessions = self.choice('overlay_session')
+        self.add_row(2, '표시할 세션', '자동 추적이 어려우면 세션을 직접 선택하세요. 선택한 세션은 독립 패널에 고정합니다.', sessions)
+        screens = self.choice('overlay_monitor')
+        self.add_row(2, '독립 패널 모니터', '연결 해제 시 주 모니터를 사용합니다.', screens)
+        access = Button('손쉬운 사용 설정 열기')
+        access.clicked.connect(lambda: self.open_system_settings('com.apple.preference.security?Privacy_Accessibility'))
+        self.add_row(2, '창 추적과 휠 전달', '손쉬운 사용을 허용하면 창 변경 감지와 Codex로 휠 전달을 지원합니다. 권한 없이도 독립 패널을 사용할 수 있습니다.', access)
+        self.overlay_permission = Text('');self.overlay_permission.setWordWrap(True)
+        self.add_widget(2, self.overlay_permission)
+        def select(index):
+            value = sessions.itemData(index)
+            if value is None:
+                controller.follow_codex()
+            else:
+                controller.set_manual_session(*value)
+        sessions.currentIndexChanged.connect(select)
+        screens.currentIndexChanged.connect(lambda index: controller.set_monitor(screens.itemData(index) or ''))
+        self.overlay_settings_timer = QTimer(self)
+        self.overlay_settings_timer.setInterval(2000)
+        self.overlay_settings_timer.timeout.connect(self.refresh_overlay_settings)
+        self.overlay_settings_timer.start()
+        controller.changed.connect(self.refresh_overlay_settings)
+        self.refresh_overlay_settings()
+
+    def refresh_overlay_settings(self):
+        controller = self.overlay_controller
+        self.overlay_status.setText(controller.status_text())
+        sessions = self.controls['overlay_session']
+        signature = tuple((s['home'], s['id'], s.get('title', '')) for s in controller.sessions[:100])
+        if signature != getattr(self, '_overlay_session_signature', None):
+            self._overlay_session_signature = signature
+            with QSignalBlocker(sessions):
+                sessions.clear();sessions.addItem('Codex의 현재 세션 자동 추적', None)
+                for home, sid, title in signature:
+                    sessions.addItem(title or sid, (home, sid))
+        with QSignalBlocker(sessions):
+            sessions.setCurrentIndex(max(0, sessions.findData(controller.manual_session)))
+        from .screens import screen_id
+        screens = self.controls['overlay_monitor']
+        with QSignalBlocker(screens):
+            screens.clear();screens.addItem('주 모니터', '')
+            for screen in QApplication.screens():
+                screens.addItem(screen.name(), screen_id(screen))
+            screens.setCurrentIndex(max(0, screens.findData(controller.settings.value('overlay/monitor', ''))))
+        allowed = bool(controller.native and hasattr(controller.native, 'accessibility_enabled')
+                       and controller.native.accessibility_enabled())
+        self.overlay_permission.setText('손쉬운 사용이 허용되어 있습니다.' if allowed
+                                        else '손쉬운 사용을 아직 허용하지 않았습니다. 기본 창 추적과 독립 패널은 계속 사용할 수 있습니다.')
 
     def reveal(self, category, widget=None):
         self.navigation.setCurrentRow(self.ORDER.index(category))

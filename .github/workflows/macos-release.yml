@@ -1,0 +1,174 @@
+name: Publish signed macOS release
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Optional vVERSION tag; an existing Windows tag must point to this commit
+        type: string
+        required: false
+      publish:
+        description: Publish after both native architectures and notarization pass
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: macos-signed-release
+  cancel-in-progress: false
+env:
+  PYTHONUTF8: '1'
+  PYTHONIOENCODING: utf-8
+jobs:
+  select:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+      commit: ${{ steps.release.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12.13'
+      - name: Bind the release to this immutable commit
+        id: release
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: python tools/mac_release.py select --tag "$REQUESTED_TAG"
+  sources:
+    needs: select
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.select.outputs.commit }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12.13'
+      - name: Mirror the exact bundled third-party sources
+        run: python tools/prepare_sources.py --output dist-macos-sources
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos-signed-sources
+          path: dist-macos-sources/
+          if-no-files-found: error
+          compression-level: 0
+  verify:
+    needs: select
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            architecture: arm64
+          - runner: macos-15-intel
+            architecture: x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      CODEXON_TEAM_ID: ${{ vars.MACOS_DEVELOPER_TEAM_ID }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.select.outputs.commit }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12.13'
+          cache: pip
+          cache-dependency-path: requirements-macos.lock
+      - name: Install hashed macOS dependencies
+        run: python -m pip install --require-hashes -r requirements-macos.lock
+      - name: Verify all source contracts
+        env:
+          QT_QPA_PLATFORM: offscreen
+          CODEXON_DATA_DIR: ${{ runner.temp }}/codexon-source-qa
+        run: python tools/verify_changes.py --full
+      - name: Verify native Cocoa adapters without requesting permissions
+        env:
+          CODEXON_DATA_DIR: ${{ runner.temp }}/codexon-native-qa
+        run: python tools/verify_macos_desktop.py --output artifacts/macos-desktop.json
+      - name: Sign, notarize and staple all shipped apps and the disk image
+        env:
+          CODEXON_DEVELOPER_ID_P12_BASE64: ${{ secrets.MACOS_DEVELOPER_ID_P12_BASE64 }}
+          CODEXON_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_P12_PASSWORD }}
+          CODEXON_NOTARY_KEY_BASE64: ${{ secrets.MACOS_NOTARY_KEY_BASE64 }}
+          CODEXON_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          CODEXON_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: python tools/mac_signing.py -- python tools/mac_build.py --architecture ${{ matrix.architecture }} --output dist-macos-release --work build-macos-release
+      - name: Validate the sealed, notarized payload
+        run: python tools/mac_package.py --product dist-macos-release/package
+      - name: Verify installation, rollback and independent recovery
+        run: python tools/mac_verify.py --product dist-macos-release/package --output artifacts/macos-installation
+      - name: Verify the frozen Qt runtime and actual dashboard interaction
+        run: python tools/run_ui_checks.py -- python tools/verify_changes.py --package-only --package-exe dist-macos-release/raw/Codexon.app/Contents/MacOS/Codexon
+      - name: Verify installed login app handoff and preserved custom homes
+        run: python tools/mac_handoff.py --product dist-macos-release/package --output artifacts/macos-handoff.json
+      - name: Bind publication assets to the successful verification
+        env:
+          RELEASE_COMMIT: ${{ needs.select.outputs.commit }}
+          RELEASE_VERSION: ${{ needs.select.outputs.version }}
+        run: |
+          python tools/mac_release.py stage --build dist-macos-release \
+            --native artifacts/macos-desktop.json --installation artifacts/macos-installation/result.json --handoff artifacts/macos-handoff.json \
+            --output dist-macos-assets/${{ matrix.architecture }} --architecture ${{ matrix.architecture }} \
+            --commit "$RELEASE_COMMIT" --version "$RELEASE_VERSION" --team "$CODEXON_TEAM_ID"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos-signed-${{ matrix.architecture }}
+          path: dist-macos-assets/${{ matrix.architecture }}/
+          if-no-files-found: error
+          compression-level: 0
+      - name: Preserve synthetic verification evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-signed-evidence-${{ matrix.architecture }}
+          path: |
+            artifacts/macos-desktop.json
+            artifacts/macos-handoff.json
+            artifacts/macos-installation/
+            artifacts/verification/
+            dist-macos-release/build-report.json
+          if-no-files-found: ignore
+  publish:
+    needs: [select, sources, verify]
+    if: inputs.publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: publish-release
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.select.outputs.commit }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12.13'
+      - uses: actions/download-artifact@v8
+        with:
+          name: macos-signed-arm64
+          path: dist-macos-publish/arm64
+      - uses: actions/download-artifact@v8
+        with:
+          name: macos-signed-x86_64
+          path: dist-macos-publish/x86_64
+      - uses: actions/download-artifact@v8
+        with:
+          name: macos-signed-sources
+          path: dist-macos-publish/sources
+      - name: Publish only the exact verified commit and never overwrite assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_COMMIT: ${{ needs.select.outputs.commit }}
+          RELEASE_TAG: ${{ needs.select.outputs.tag }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+          CODEXON_TEAM_ID: ${{ vars.MACOS_DEVELOPER_TEAM_ID }}
+        run: |
+          python tools/mac_release.py publish --folder dist-macos-publish \
+            --commit "$RELEASE_COMMIT" --tag "$RELEASE_TAG" --team "$CODEXON_TEAM_ID" \
+            --repository "$RELEASE_REPOSITORY"

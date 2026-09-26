@@ -1479,7 +1479,7 @@ class Dashboard(TrayWindow):
         self.notification_master = Switch()
         self.notification_master.setChecked(self.settings.value('notifications/enabled', legacy_notifications, type=bool))
         self.notification_master.toggled.connect(lambda value: self.settings.setValue('notifications/enabled', value))
-        self.settings_page.add_row(4, '알림 표시', 'Windows 알림을 표시합니다. 보호 정지와 상태 확인은 계속 작동합니다.', self.notification_master)
+        self.settings_page.add_row(4, '알림 표시', '시스템 알림을 표시합니다. 보호 정지와 상태 확인은 계속 작동합니다.', self.notification_master)
         self.notification_options = {}
         for kind,key,description in (
             ('HTTP 전환','http_fallback','WebSocket에서 HTTP/SSE로 전환됐다는 기록이 새로 확인되면 알립니다.'),

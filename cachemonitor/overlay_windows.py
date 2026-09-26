@@ -93,6 +93,9 @@ class WindowsOverlay:
             return None
         return rect.left, rect.top, rect.right, rect.bottom
 
+    def dpi(self, hwnd):
+        return self.u.GetDpiForWindow(hwnd) or 96
+
     def visible_target(self, hwnd):
         return bool(self.u.IsWindow(hwnd) and self.u.IsWindowVisible(hwnd)
                     and not self.u.IsIconic(hwnd)
@@ -130,7 +133,7 @@ class WindowsOverlay:
         if self.u.IsIconic(hwnd):self.u.ShowWindow(hwnd,9)
         return bool(self.u.SetForegroundWindow(hwnd))
 
-    def forward_wheel(self, hwnd, delta, position, modifiers):
+    def forward_wheel(self, hwnd, delta, position, modifiers, pixel_delta=None):
         from PySide6.QtCore import Qt
         if not self.visible_target(hwnd):return False
         flags=(4 if modifiers & Qt.ShiftModifier else 0)|(8 if modifiers & Qt.ControlModifier else 0)

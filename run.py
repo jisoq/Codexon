@@ -2,6 +2,14 @@ if __name__ == "__main__":
     from multiprocessing import freeze_support
     freeze_support()
     import sys
+    if '--launchd-service' in sys.argv:
+        sys.argv.remove('--launchd-service')
+        from cachemonitor.macos_services import main
+        raise SystemExit(main())
+    if '--recovery-notification' in sys.argv:
+        sys.argv.remove('--recovery-notification')
+        from cachemonitor.macos_notifications import recovery_notification_main
+        raise SystemExit(recovery_notification_main())
     if '--usage-collector' in sys.argv:
         sys.argv.remove('--usage-collector')
         from cachemonitor.usage_collection import main

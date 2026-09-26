@@ -11,10 +11,31 @@ from .overlay_navigation import navigation_target
 from .ui_details import recorded, observed_transport, model_comparison
 from .token_colors import TOKEN_COLORS, ui_palette, readable
 from .i18n import tr, Verbatim
-from .charts import value_text
+from .charts import value_text, dynamic_bounds
 
 LABELS = dict(cached='캐시 읽기', uncached='일반 입력', written='캐시 쓰기', reasoning='추론', output='추론 외', unknown='미분류')
 ORDER = tuple(LABELS)
+
+
+def graph_number(value):
+    return value if isinstance(value, (int, float)) and math.isfinite(value) else None
+
+
+def call_graph_axes(rows, capacity):
+    """The marks, labels and accessibility description use one visible range."""
+    visible = rows[-capacity:]
+    rates = [graph_number(row.get('cache_rate', row.get('rate'))) for row in visible]
+    costs = [graph_number(row.get('cost')) for row in visible]
+    return dict(cache=dynamic_bounds(rates), cost=dynamic_bounds(costs),
+                cache_known=any(value is not None for value in rates),
+                cost_known=any(value is not None for value in costs))
+
+
+def graph_axis_text(bounds, known, percent=False):
+    if not known:
+        return '—'
+    low, high = bounds
+    return (f'{low:.3g}–{high:.3g}%' if percent else f'${low:.3g}–${high:.3g}')
 
 # Descriptions follow the displayed population; raw per-call fields have none.
 CALCULATIONS = {
@@ -178,32 +199,34 @@ class Drawing:
         cost_y=cache_y+cache_h+(28 if detail else 8);cost_h=24 if detail else 20;bottom=cost_y+cost_h
         self.text(f'최근 {capacity}호출',x,y,width)
         self.text('캐시',x,cache_y+cache_h-16,28,color='meta');self.text('비용',x,cost_y+cost_h-16,28,color='meta')
-        peak=max((r['cost'] for r in rows if r.get('cost') is not None),default=None)
-        if detail:
-            self.text('100%',x,cache_y-2,32,color='meta');self.text(money(peak),x+left,cost_y-20,plot,color='meta',right=True)
-        else:self.text(money(peak),x+left,y,plot,color='meta',right=True)
+        axes=call_graph_axes(rows,capacity)
+        rate_low,rate_high=axes['cache'];cost_low,cost_high=axes['cost']
+        self.text(graph_axis_text(axes['cache'],axes['cache_known'],True),x+left,y,plot,color='meta',right=True)
+        self.text(graph_axis_text(axes['cost'],axes['cost_known']),x+left,bottom+2,plot,12,10,'meta',right=True)
         self.line(x+left,cache_y+cache_h,x+width,cache_y+cache_h,'track');self.line(x+left,bottom,x+width,bottom,'track')
         selected=m.selected_id
         for index,row in enumerate(rows[-capacity:]):
             cx=x+left+(capacity-len(rows[-capacity:])+index+.5)*step;bar=min(16,step*.55)
-            rate=row.get('cache_rate',row.get('rate'))
+            rate=graph_number(row.get('cache_rate',row.get('rate')))
             if detail and m.call_id(row)==selected:
                 self.rect(cx-step/2,cache_y,step,bottom-cache_y,'accent',alpha=.07);self.line(cx,cache_y,cx,bottom,'accent',.8)
             elif detail and m.call_id(row)==m.hover_id:
                 self.rect(cx-step/2,cache_y,step,bottom-cache_y,'accent',alpha=.04)
             warning=bool(row.get('cache_warning') or row.get('cache_miss'));color='warning' if warning else 'cached'
             if rate is None:self.line(cx-bar/2,cache_y+cache_h/2,cx+bar/2,cache_y+cache_h/2,'meta',1,True)
-            elif rate==0:self.line(cx-bar/2,cache_y+cache_h,cx+bar/2,cache_y+cache_h,color,1.5)
+            elif rate==0:
+                cy=cache_y+cache_h-cache_h*(rate-rate_low)/(rate_high-rate_low)
+                self.line(cx-bar/2,cy,cx+bar/2,cy,color,1.5)
             else:
-                height=cache_h*max(0,min(100,rate))/100;self.rect(cx-bar/2,cache_y+cache_h-height,bar,height,color)
+                height=cache_h*(rate-rate_low)/(rate_high-rate_low);self.rect(cx-bar/2,cache_y+cache_h-height,bar,height,color)
             if warning:self.line(cx,cache_y+3,cx,cache_y+7,'warning',1.2);self.dot(cx,cache_y+10,'warning',.8)
             if index==len(rows[-capacity:])-1:self.dot(cx,cache_y-3,color,1.3)
             if m.call_id(row)==m.highlight_id:
                 self.line(cx-bar/2-1,cache_y,cx-bar/2-1,cache_y+cache_h,color,1)
-            cost=row.get('cost')
+            cost=graph_number(row.get('cost'))
             if cost is None:self.line(cx-bar/2,cost_y+cost_h/2,cx+bar/2,cost_y+cost_h/2,'meta',1,True)
-            elif peak is not None and peak>0:
-                cy=bottom-cost_h*cost/peak;self.line(cx,bottom,cx,cy,'secondary',1);self.dot(cx,cy,'secondary',1.3)
+            else:
+                cy=bottom-cost_h*(cost-cost_low)/(cost_high-cost_low);self.line(cx,bottom,cx,cy,'secondary',1);self.dot(cx,cy,'secondary',1.3)
     def tokens(self,x,y,width=348,title='토큰'):
         c=(self.model.data or {}).get('token_composition',{})
         self.text(title,x,y,width*.5,20,12,weight=500)
@@ -279,7 +302,7 @@ class OverlayContent(Node):
     kind='plot';WIDTH=380;HEIGHT=546;BODY_SIZE=12
     def __init__(self):
         super().__init__();self.data=None;self.note='기록 확인 중';self.opacity=94;self.appearance=default_appearance(True);self.dark=True;self.compact=False
-        self.detail_open=False;self.detail_inline=False;self.detail_width=208
+        self.detail_open=False;self.detail_inline=False;self.detail_width=208;self.pinned=False
         self.selected_id=None;self.selected_snapshot=None;self.hover_id=None;self.follow_latest=True;self.quota_lines=('','')
         self.speed_detail=False
         self.highlight_id=None;self._highlight_timer=QTimer(self);self._highlight_timer.setSingleShot(True)
@@ -297,18 +320,21 @@ class OverlayContent(Node):
         if values==(self.compact,self.detail_open,self.detail_inline):return
         self.compact,self.detail_open,self.detail_inline=values;self.detail_width=348 if self.detail_inline else 208
         self.sync_details();self.update()
-    def set_content(self,data,note='',dark=True,appearance=None):
+    def display_title(self):
+        title=(self.data or {}).get('title','')
+        return (tr('고정 · ') if self.pinned else '')+title
+    def set_content(self,data,note='',dark=True,appearance=None,pinned=False):
         appearance=appearance or default_appearance(dark)
         checking=note in ('기록 확인 중','세션 기록 확인 중','기록 수집 중 · 잠정값')
         if data and checking:data={key:data[key] for key in ('id','home','title') if key in data}
         if note.startswith('원격 작업') or note=='현재 세션 식별 불가':data=None
-        if (data,note,appearance)==(self.data,self.note,self.appearance):return
+        if (data,note,appearance,bool(pinned))==(self.data,self.note,self.appearance,self.pinned):return
         old=(self.data or {}).get('id'),(self.data or {}).get('home');new=(data or {}).get('id'),(data or {}).get('home')
         old_call=self.call_id(self.rows()[-1]) if self.rows() else None
         if old!=new:
             self.selected_id=None;self.selected_snapshot=None;self.hover_id=None;self.follow_latest=True
             self.speed_detail=False
-        self.data=data;self.note=note;self.appearance=appearance;self.dark=appearance.dark
+        self.data=data;self.note=note;self.appearance=appearance;self.dark=appearance.dark;self.pinned=bool(pinned)
         if old!=new:self.clear_highlight()
         elif self.rows() and old_call!=self.call_id(self.rows()[-1]) and not self.state.get('reducedMotion'):
             self.highlight_id=self.call_id(self.rows()[-1]);self._highlight_timer.start(120)
@@ -338,11 +364,14 @@ class OverlayContent(Node):
     def sync_details(self):
         items=self.detail_items();self._detail_items=items;height=max((r[2]+r[4] for r in items),default=16)
         colors=palette(self.appearance)
+        axes=call_graph_axes(self.rows(),24)
+        graph_accessible=('최근 24호출 · 캐시 '+graph_axis_text(axes['cache'],axes['cache_known'],True)
+                          +' · 비용 '+graph_axis_text(axes['cost'],axes['cost_known']))
         self.put(detailBodyHeight=round(height*self.appearance.scale),detailWidth=self.detail_width,detailTitle='호출 상세',
                  detailSpeedOpen=self.speed_detail,
                  overlayFamily=self.appearance.family,overlaySurface=colors['surface'].name(),overlayBorder=colors['border'].name(),
                  overlayWarning=colors['warning'].name(),
-                 detailHasSelection=bool(self.selected()),detailGraphAccessible='최근 24호출 · 캐시 0–100% · 환산액',detailSelected=self.selected_id or '')
+                 detailHasSelection=bool(self.selected()),detailGraphAccessible=graph_accessible,detailSelected=self.selected_id or '')
         self._graph.update();self._body.update()
         self._body.setAccessibleName('\n'.join(''.join(r[0]) if isinstance(r[0],list) else r[0] for r in items))
     def monitor_links(self):
@@ -490,10 +519,10 @@ class OverlayContent(Node):
     def composition_height(self):return 0 if self.compact else self.composition_full_height()
     def lines(self):
         d=self.data or {};a,b=self.context()
-        return [d.get('title',''),a,b,percent(d.get('cache_rate')),money(d.get('cost')),money(d.get('mean_cost')),money(d.get('latest_cost')),
+        return [self.display_title(),a,b,percent(d.get('cache_rate')),money(d.get('cost')),money(d.get('mean_cost')),money(d.get('latest_cost')),
                 f"{d.get('priced',0)} / {d.get('calls',0)}" if d.get('missing') else str(d.get('calls','—')),self.status_text(),value_text(d.get('latest',{}).get('output_speed'),'output_speed')]
     def refresh_accessibility(self):
-        d=self.data or {};values=[d.get('title',''),*self.context(),'최근 호출','캐시 '+percent(d.get('cache_rate')),'비용 '+money(d.get('latest_cost'),False),
+        d=self.data or {};values=[self.display_title(),*self.context(),'최근 호출','캐시 '+percent(d.get('cache_rate')),'비용 '+money(d.get('latest_cost'),False),
               '평균 출력 속도 '+(value_text(d['latest']['output_speed'],'output_speed') if d.get('latest',{}).get('output_speed') is not None else '측정 불가'),
               self.session_scope(),'세션 캐시 적중률 '+percent(d.get('token_composition',{}).get('cache_hit_rate')),
               '비용 '+money(d.get('cost'),False),
@@ -657,10 +686,10 @@ class OverlayContent(Node):
         if self.detail_open:
             if not self.detail_inline:
                 d.text('호출 상세',16,12,208,28,14,weight=600);d.line(self.monitor_x,12,self.monitor_x,height-12)
-            else:d.text(Verbatim((self.data or {}).get('title','')),16,12,260,28,14,weight=600,elide=True)
+            else:d.text(Verbatim(self.display_title()),16,12,260,28,14,weight=600,elide=True)
         if self.detail_inline:p.restore();return
         p.save();p.translate(self.monitor_x,0);data=self.data or {};layout=self.layout()
-        d.text(Verbatim(data.get('title','')),16,12,260,28,14,weight=600,elide=True)
+        d.text(Verbatim(self.display_title()),16,12,260,28,14,weight=600,elide=True)
         first,second=self.context();extra=self.context_extra()
         for index,line in enumerate(self.context_rows()):d.text(line,16,48+index*18,348,18,12,'error' if first.startswith('모델 불일치') else 'secondary')
         p.translate(0,extra);d.text(second,16,66,348,18,12,'secondary')

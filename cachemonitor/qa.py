@@ -12,6 +12,24 @@ def taskbar_probe(window, app, path):
     import ctypes
     import sys
     from .taskbar import taskbar_rect
+    if sys.platform == 'darwin':
+        from .macos_status import MacStatusTray
+        tray = window.tray
+        if not isinstance(tray, MacStatusTray):
+            return {'native_status_deferred': 'Isolated GUI smoke disables menu bar integration; verify_macos_desktop.py checks the native boundary.'}
+        before = tray.appkit.NSWorkspace.sharedWorkspace().frontmostApplication()
+        before_pid = int(before.processIdentifier()) if before else None
+        window.hide()
+        window.refresh_tray()
+        app.processEvents()
+        after = tray.appkit.NSWorkspace.sharedWorkspace().frontmostApplication()
+        assert tray.item.isVisible() and not window.isVisible()
+        assert (int(after.processIdentifier()) if after else None) == before_pid
+        tray.rebuild_menu(tray.menu)
+        assert tray.item.menu() == tray.menu
+        return {'native_visible_with_dashboard_closed': True, 'refresh_preserves_focus': True,
+                'single_status_item': True, 'text': str(tray.item.button().title()),
+                'native_menu_items': int(tray.menu.numberOfItems())}
     if sys.platform != 'win32':
         return {'excluded': 'Windows 전용 표시'}
     indicator = window.taskbar_quota

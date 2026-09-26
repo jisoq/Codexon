@@ -4,3 +4,8 @@ tomlkit==0.15.1
 httpx[http2]==0.28.1
 ijson==3.5.1
 zstandard==0.25.0
+pyobjc-framework-Cocoa==12.2.2; sys_platform == 'darwin'
+pyobjc-framework-Quartz==12.2.2; sys_platform == 'darwin'
+pyobjc-framework-ApplicationServices==12.2.2; sys_platform == 'darwin'
+pyobjc-framework-ServiceManagement==12.2.2; sys_platform == 'darwin'
+pyobjc-framework-UserNotifications==12.2.2; sys_platform == 'darwin'

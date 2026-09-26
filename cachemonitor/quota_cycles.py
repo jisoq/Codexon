@@ -26,7 +26,8 @@ def ledger_path(index_path=None):
     if index_path:
         index = Path(index_path)
         return index.with_name(index.stem + '-quota-cycles.sqlite')
-    return Path(os.environ.get('LOCALAPPDATA', Path.home())) / 'CacheMonitor' / 'quota-cycles.sqlite'
+    from .platform_paths import app_data_dir
+    return app_data_dir() / 'quota-cycles.sqlite'
 
 
 def split_cycles(observations, manual_resets=()):

@@ -20,7 +20,8 @@ class CollectionScopeError(RuntimeError):
 
 
 def index_location(path=None):
-    return (Path(path) if path else Path(os.environ.get('LOCALAPPDATA',Path.home()))/'CacheMonitor'/'usage-index.sqlite').resolve()
+    from .platform_paths import app_data_dir
+    return (Path(path) if path else app_data_dir()/'usage-index.sqlite').resolve()
 
 
 def locked(path):
@@ -119,6 +120,14 @@ class CollectionClient:
         if self.channel.evidence:parts+=['--evidence-path',str(self.channel.evidence)]
         return parts
 
+    def wait_for_exit(self,task):
+        # Releasing SQLite/collector locks precedes process exit. Both launchd
+        # and Task Scheduler ignore a new start while the old instance remains.
+        deadline=time.monotonic()+3
+        while locked(self.channel.companion('.collector.lock')) or task.inspect().get('running'):
+            if time.monotonic()>=deadline:raise RuntimeError('백그라운드 수집기 교체 대기')
+            time.sleep(.05)
+
     def ensure_service(self,now,snapshot):
         if not self.autostart or now<self.next_start:return
         from .observer_state import read_json
@@ -135,6 +144,7 @@ class CollectionClient:
                 task=ObserverTask(str(self.path),role='UsageCollector')
                 task.configure(self.command(),autostart=False)
                 retire_legacy(self.channel)
+                self.wait_for_exit(task)
                 task.start(self.command(),autostart=False)
             return
         collection=(snapshot or {}).get('collection',{})
@@ -152,7 +162,7 @@ class CollectionClient:
         if snapshot and now-snapshot['ts']<=30 and not replace and locked(self.channel.companion('.collector.lock')):return
         self.next_start=now+30
         from .observer_task import ObserverTask
-        # Task Scheduler owns lifetime/restart outside the GUI's process tree.
+        # The platform service manager owns lifetime outside the GUI process.
         # Only the dedicated executable acquires the source collector lock.
         task=ObserverTask(str(self.path),role='UsageCollector')
         if replace:
@@ -164,10 +174,7 @@ class CollectionClient:
                 task.configure(self.command(),autostart=False)
                 self.channel.db.execute('INSERT OR REPLACE INTO control VALUES(?,?)',(collection['instance'],'stop'))
                 self.channel.db.commit()
-                deadline=time.monotonic()+3
-                while locked(self.channel.companion('.collector.lock')):
-                    if time.monotonic()>=deadline:raise RuntimeError('백그라운드 수집기 교체 대기')
-                    time.sleep(.05)
+                self.wait_for_exit(task)
         task.start(self.command(),autostart=False)
 
     def poll(self,now=None):
@@ -235,9 +242,12 @@ class CollectorService:
             self.index.close();self.index=None;self.epoch=uuid.uuid4().hex
         if self.index is None:self.index=UsageIndex(homes,self.channel.index_path,self.channel.evidence)
         snapshot=self.index.poll(now)
+        from .proxy_identity import process_identity
+        process=process_identity(os.getpid()) if sys.platform=='darwin' or os.name=='nt' else None
         snapshot={**snapshot,'sessions':[dict(s,usage_revision=f'{self.epoch}:{s.get("usage_revision")}') for s in snapshot['sessions']],
             'collection':dict(pid=os.getpid(),instance=self.instance,version=VERSION,
-                executable=str(Path(sys.executable).resolve()))}
+                executable=process['executable'] if process else str(Path(sys.executable).resolve()),
+                process_created=process['created'] if process else None)}
         self.sequence+=1;self.channel.publish(snapshot,self.epoch,self.sequence);self.last=snapshot
         return snapshot
 

@@ -2,11 +2,10 @@
 import json
 import re
 import time
-from pathlib import Path
 
 from .observer_state import ProcessLock, read_json
 from .observer_control import atomic_write
-from .proxy_target import ProxyTarget, option
+from .proxy_target import ProxyTarget
 from . import proxy_identity as identity
 
 
@@ -126,7 +125,7 @@ class AppServices:
         channel=CollectionChannel(self.homes,self.index,self.evidence)
         try:
             with ProcessLock(channel.companion('.collector-update.lock'),timeout=30):
-                from .collection_lifecycle import retire_legacy
+                from .collection_lifecycle import collector_process,retire_legacy
                 retire_legacy(channel)
                 snapshot=channel.read()
                 collection=(snapshot or {}).get('collection') or {}
@@ -134,21 +133,14 @@ class AppServices:
                 process=None
                 if locked(lock):
                     if not collection.get('instance'):raise RuntimeError('수집기 종료 소유권 확인 대기')
-                    process=identity.process_identity(collection['pid'])
-                    if not process:raise RuntimeError('수집기 실행 정보가 변경되었습니다.')
-                    command=identity.process_command(process['pid'])
-                    if ('--usage-collector' not in command or
-                        Path(option(command,'--index-path','')).resolve()!=channel.path or
-                        Path(process['executable']).resolve()!=Path(collection['executable']).resolve() or
-                        not set((snapshot or {}).get('homes',[])).issubset(set(channel.homes))):
-                        raise RuntimeError('다른 수집기 또는 다른 Codex 홈의 기록을 보존합니다.')
+                    process=collector_process(channel,snapshot)
                 atomic_write(channel.companion('.session.json'),json.dumps(dict(scope=channel.scope,stopped=True)).encode())
                 task=ObserverTask(str(channel.path),role='UsageCollector');task.suspend()
                 if process:
                     channel.db.execute('INSERT OR REPLACE INTO control VALUES(?,?)',(collection['instance'],'stop'))
                     channel.db.commit()
                     self.progress('수집 기록 저장과 프로세스 종료 확인 중…')
-                    self.wait(lambda:not identity.same_process(process) and not locked(lock),
+                    self.wait(lambda:identity.process_exited(process) and not locked(lock),
                               '수집 기록 저장 또는 수집기 종료 확인 지연')
                 self.wait(lambda:not task.inspect().get('running'),'수집기 작업 종료 확인 지연')
         finally:channel.close()

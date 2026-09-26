@@ -47,7 +47,7 @@ class ProxyUpdate:
         report=self.manager.directory/'proxy-update-runtime.json'
         report.unlink(missing_ok=True)
         result=subprocess.run([sys.executable,'--verify-runtime',str(report)],timeout=30,
-                              creationflags=subprocess.CREATE_NO_WINDOW)
+                              creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
         value=read_json(report)
         if (result.returncode or value.get('version')!=VERSION
                 or value.get('proxy_version')!=PROXY_VERSION or value.get('errors')!=[]):

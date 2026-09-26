@@ -116,8 +116,10 @@ def main():
     app.setStyleSheet(STYLE)
     server = QLocalServer()
     if not args.smoke:
-        # One tray icon per Windows user. A second launch opens the existing dashboard.
-        server_name = "CacheMonitor-" + os.environ.get("USERNAME", "user")
+        # One instance per OS user. A second launch opens the existing dashboard.
+        from .platform_paths import instance_name
+        server_name = instance_name()
+        server.setSocketOptions(QLocalServer.UserAccessOption)
         if args.verify_handoff:
             import hashlib
             server_name = 'CodexonQA-'+hashlib.sha256(str(Path(args.index_path).resolve()).encode()).hexdigest()[:24]
@@ -128,7 +130,10 @@ def main():
             client.waitForBytesWritten(400)
             if not args.replace_gui:return 0
             if not client.waitForReadyRead(3000) or bytes(client.readAll())!=b'ready-to-exit':
-                QMessageBox.information(None,'Codexon',tr('새 버전이 설치되었습니다. 기존 Codexon을 트레이에서 종료한 뒤 시작 메뉴에서 다시 여세요. Codex 연결은 유지됩니다.'))
+                message = ('새 버전이 설치되었습니다. 기존 Codexon을 메뉴 막대에서 종료한 뒤 Applications에서 다시 여세요. Codex 연결은 유지됩니다.'
+                           if sys.platform == 'darwin' else
+                           '새 버전이 설치되었습니다. 기존 Codexon을 트레이에서 종료한 뒤 시작 메뉴에서 다시 여세요. Codex 연결은 유지됩니다.')
+                QMessageBox.information(None,'Codexon',tr(message))
                 return 4
             client.waitForDisconnected(15000)
             deadline=time.monotonic()+20
@@ -162,6 +167,9 @@ def main():
         live_limits=not (args.smoke or args.verify_handoff),manage_observer=args.verify_services or (not (args.smoke or args.verify_handoff) and (args.index_path is None or args.cache_control)), **({'settings':smoke_settings} if smoke_settings else {}))
     from .overlay import install_overlay
     install_overlay(window, native_enabled=not (args.smoke or args.verify_handoff))
+    if sys.platform == 'darwin':
+        from .macos_application import install as install_macos_lifecycle
+        install_macos_lifecycle(app, window, native=not (args.smoke or args.verify_handoff))
     def restart():
         from .app_restart import launch_replacement
         try:launch_replacement(homes,index_path=args.index_path,handoff=args.verify_handoff,evidence_path=args.evidence_path,cache_control=args.cache_control,quota_path=args.quota_path)

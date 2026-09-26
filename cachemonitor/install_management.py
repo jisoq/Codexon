@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import ntpath
 import re
 from pathlib import Path
 import subprocess
@@ -22,7 +23,7 @@ def startup_replacement(command, executable):
     match=re.fullmatch(r'\s*(?:"([^"]+)"|(\S+))(.*)',command,flags=re.DOTALL)
     if not match:return command
     old=match[1] or match[2]
-    if Path(old).name.lower() not in ('cachemonitor.exe','codexon.exe'):return command
+    if ntpath.basename(old).lower() not in ('cachemonitor.exe','codexon.exe'):return command
     return subprocess.list2cmdline([str(executable)])+match[3]
 
 
@@ -90,7 +91,8 @@ def activate_proxy(manager):
     if status.get('probe_state')=='refused' and manager.state().get('enabled'):
         manager.attach_supervisor()
         return dict(phase='complete', message='연결 구성요소 시작 완료')
-    return dict(phase='recovery_required', message='시작 메뉴의 Codexon 연결 복구를 실행해 주세요.')
+    return dict(phase='recovery_required', message=('Applications의 Codexon Recovery를 실행해 주세요.'
+                if sys.platform == 'darwin' else '시작 메뉴의 Codexon 연결 복구를 실행해 주세요.'))
 
 
 def finish(root, product, recovery, *, isolated=False, launch=True, language='ko'):
@@ -106,7 +108,7 @@ def finish(root, product, recovery, *, isolated=False, launch=True, language='ko
     with ProcessLock(root/'install.lock',timeout=10):
         report = root/('runtime-'+uuid.uuid4().hex+'.json')
         check = subprocess.run([str(exe),'--verify-runtime',str(report)],timeout=45,
-                               creationflags=subprocess.CREATE_NO_WINDOW)
+                               creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0)
         value = read_json(report)
         if check.returncode or value.get('errors')!=[] or value.get('version')!=manifest['version']:
             raise RuntimeError('새 버전 실행 검사에 실패했습니다. 이전 버전을 유지합니다.')
@@ -138,7 +140,7 @@ def finish(root, product, recovery, *, isolated=False, launch=True, language='ko
             result_path = root/'connection-update.json'
             try:
                 result = subprocess.run([str(exe),'--complete-install','--control-report',str(result_path)],
-                                        timeout=60,creationflags=subprocess.CREATE_NO_WINDOW)
+                                        timeout=60,creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0)
                 receipt['connection'] = read_json(result_path)
                 if result.returncode:raise RuntimeError('Connection update did not complete')
             except (OSError,RuntimeError,subprocess.TimeoutExpired):
@@ -158,6 +160,9 @@ def finish(root, product, recovery, *, isolated=False, launch=True, language='ko
 
 
 def processes_under(root):
+    if sys.platform == 'darwin':
+        from .macos_process import processes_under as mac_processes_under
+        return mac_processes_under(root)
     import base64
     encoded = base64.b64encode(str(Path(root).resolve()).encode()).decode()
     script = r"""
@@ -186,6 +191,9 @@ def connection_manager():
 
 def prepare_uninstall(root, *, isolated=False):
     root=Path(root).resolve()
+    if read_json(root/'installation.json').get('platform') == 'darwin':
+        from .macos_installation import prepare_uninstall as mac_uninstall
+        return mac_uninstall(root)
     with ProcessLock(root/'install.lock',timeout=5):
         from .installation import installed
         registration = installed() if not isolated else {}

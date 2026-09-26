@@ -272,6 +272,9 @@ class OverlayChrome(OverlayHost):
 
     def event_position(self, event):
         point = event.globalPosition().toPoint()
+        import sys
+        if sys.platform == 'darwin':
+            return point.x(), point.y()
         screen = QApplication.screenAt(point) or self.windowHandle().screen()
         origin, scale = screen.geometry().topLeft(), screen.devicePixelRatio()
         # Event coordinates are immutable; a later cursor sample loses fast drags.

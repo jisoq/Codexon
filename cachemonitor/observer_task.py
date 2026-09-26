@@ -1,9 +1,10 @@
-"""Launch the observer from Windows Task Scheduler, outside the caller's job tree."""
+"""Application service contract, backed by Task Scheduler or user LaunchAgents."""
 import base64
 import hashlib
 import json
 import os
 import subprocess
+import sys
 
 
 def retire_desktop_startups(root):
@@ -12,6 +13,9 @@ def retire_desktop_startups(root):
     Disable only logon triggers of owned GUI tasks in this installation. Keep
     definitions, history, running processes and every proxy task untouched.
     """
+    if sys.platform=='darwin':
+        from .macos_services import retire_desktop_startups as retire
+        return retire(root)
     from pathlib import Path
     payload=base64.b64encode(str(Path(root).resolve()/'versions').encode()).decode()
     script=r'''
@@ -49,6 +53,9 @@ foreach($task in $folder.GetTasks(1)){
 def remove_installation_collectors(root):
     """Remove owned collector definitions, including exhausted or stopped tasks."""
     from pathlib import Path
+    if sys.platform=='darwin':
+        from .macos_services import remove_installation_tasks
+        return remove_installation_tasks(root,roles={'UsageCollector'})
     if os.name!='nt':return {'removed':[]}
     payload=base64.b64encode(str(Path(root).resolve()).encode()).decode()
     script=r'''
@@ -95,8 +102,12 @@ class ObserverTask:
         self.marker='CacheMonitor model observer: '+str(home)
 
     def call(self, operation, command=None, autostart=False, periodic=False):
+        if sys.platform=='darwin':
+            from .macos_services import LaunchAgent
+            return LaunchAgent(self.marker.removeprefix('CacheMonitor model observer: '),self.role).call(
+                operation,command,autostart,periodic)
         if os.name!='nt':
-            raise RuntimeError('독립 프록시 실행은 Windows 작업 스케줄러가 필요합니다')
+            raise RuntimeError('이 운영체제의 백그라운드 서비스를 지원하지 않습니다')
         payload=base64.b64encode(json.dumps({'name':self.name,'marker':self.marker,'operation':operation,
             'executable':command[0] if command else '',
             'arguments':subprocess.list2cmdline(command[1:]) if command else '',

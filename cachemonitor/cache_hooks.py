@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import shlex
 
 MARKER='codexon-cache-control'
 
@@ -25,7 +26,7 @@ def remove_installation(home,root):
             if entry.get('description')==MARKER:
                 for hook in entry.get('hooks',[]):
                     args=command_arguments(hook.get('command','')) if hook.get('command') else []
-                    if args and Path(args[0]).name.lower()=='codexonhook.exe' and Path(args[0]).resolve().is_relative_to(root):owned=True
+                    if args and Path(args[0]).name.lower() in ('codexonhook.exe','codexonhook','codexon') and Path(args[0]).resolve().is_relative_to(root):owned=True
             if owned:changed=True
             else:retained.append(entry)
         hooks[event]=retained
@@ -44,11 +45,22 @@ def command(database,observe_only=False,executable=None):
     if executable:
         parts=[str(Path(executable).resolve()),'--cache-hook']
     elif getattr(sys,'frozen',False):
-        parts=[str(Path(sys.executable).with_name('CodexonHook.exe')),'--cache-hook']
+        hook_executable = str(Path(sys.executable).with_name('CodexonHook.exe')) if os.name=='nt' else sys.executable
+        if sys.platform == 'darwin':
+            from .installation import installed
+            receipt = installed()
+            if receipt.get('applications') and receipt.get('AppPath'):
+                candidate = Path(receipt['applications'])/'Codexon.app/Contents/MacOS/Codexon'
+                if candidate.is_file() and candidate.resolve() == Path(receipt['AppPath']).resolve():
+                    # Keep the user's trusted hook command stable across updates.
+                    # The installer atomically changes this owned app link only
+                    # after signature and runtime verification of the new bundle.
+                    hook_executable = str(candidate)
+        parts=[hook_executable,'--cache-hook']
     else:parts=[sys.executable,str(Path(__file__).resolve().parents[1]/'run.py'),'--cache-hook']
     parts+=['--database',str(Path(database).resolve())]
     if observe_only:parts+=['--observe-only']
-    return subprocess.list2cmdline(parts), '& '+' '.join("'"+p.replace("'","''")+"'" for p in parts)
+    return (subprocess.list2cmdline(parts) if os.name=='nt' else shlex.join(parts)), '& '+' '.join("'"+p.replace("'","''")+"'" for p in parts)
 
 
 def configure(home,database,enabled,*,observe_only=False,executable=None):

@@ -172,8 +172,9 @@ def test_master_switch_navigation_and_independent_features(tmp_path,size):
         assert window.nav.count()==4
         window.open_settings();window.settings_page.reveal(6);QTest.qWait(60)
         assert window.settings_page.navigation.currentText()=='캐시 관리'
+        import sys
         assert [window.settings_page.navigation.itemText(i) for i in range(7)]==[
-            '일반','작업표시줄 위젯','세션 오버레이','캐시 관리','알림','프록시','정보·문제 해결']
+            '일반','메뉴 막대' if sys.platform=='darwin' else '작업표시줄 위젯','세션 오버레이','캐시 관리','알림','프록시','정보·문제 해결']
         click(window,control(window,window.cache_master));assert window.nav.count()==5
         window.nav.setCurrentRow(4);QTest.qWait(80)
         assert window.current_page==5 and window.heading.text()=='캐시 관리'

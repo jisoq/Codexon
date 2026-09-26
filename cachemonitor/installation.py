@@ -10,6 +10,9 @@ KEY = r'Software\Codexon'
 
 
 def installed():
+    if sys.platform == 'darwin':
+        from .macos_installation import installed as mac_installed
+        return mac_installed()
     if os.name != 'nt':
         return {}
     import winreg
@@ -25,7 +28,13 @@ def recovery_command(home=None, directory=None, url=None, *, check=False):
     if getattr(sys, 'frozen', False):
         candidate = Path(installed().get('RecoveryPath', ''))
         if not candidate.is_file():
-            candidate = Path(sys.executable).with_name('CodexonRecovery.exe')
+            if sys.platform == 'darwin':
+                from .macos_installation import bundle_for, executable
+                bundle = bundle_for(sys.executable)
+                recovery = bundle.parent/'Codexon Recovery.app' if bundle else None
+                candidate = executable(recovery) if recovery and recovery.is_dir() else Path('')
+            else:
+                candidate = Path(sys.executable).with_name('CodexonRecovery.exe')
         if not candidate.is_file():
             raise RuntimeError('연결 복구 도구가 없습니다. Codexon 설치 프로그램을 다시 실행하세요.')
         command = [str(candidate)]

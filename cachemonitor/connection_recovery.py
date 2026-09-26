@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import queue
 import subprocess
+import sys
 import threading
 import time
 from urllib.parse import urlsplit
@@ -96,6 +97,9 @@ def notification_uri(manager):
 
 
 def notify(manager, result):
+    if sys.platform == 'darwin':
+        from .macos_notifications import notify_recovery
+        return notify_recovery(manager, result)
     if os.name != 'nt':
         return False
     from .installation import installed
@@ -244,7 +248,6 @@ def main(argv=None):
     if args.language:os.environ['CODEXON_LANGUAGE']=args.language
     if args.install_root:
         from .install_management import finish, prepare_uninstall
-        import sys
         try:
             if args.prepare_uninstall:
                 result=prepare_uninstall(args.install_root,isolated=args.isolated_install)
@@ -268,11 +271,14 @@ def main(argv=None):
         elif args.restore:result = restore(manager)
         elif args.status:result = inspect(manager)
         else:
-            window=RecoveryWindow(manager)
-            if args.ui_smoke:
-                if (not args.codex_home or not args.data_dir or manager.url==URL
-                        or not (manager.home/'codexon-test-home').exists()):
-                    raise ValueError('UI checks require an explicitly isolated test home and port')
+            if args.ui_smoke and (not args.codex_home or not args.data_dir or manager.url==URL
+                    or not (manager.home/'codexon-test-home').exists()):
+                raise ValueError('UI checks require an explicitly isolated test home and port')
+            if sys.platform == 'darwin':
+                from .macos_recovery import RecoveryWindow as MacRecoveryWindow
+                window=MacRecoveryWindow(manager,smoke=args.ui_smoke)
+            else:window=RecoveryWindow(manager)
+            if args.ui_smoke and sys.platform != 'darwin':
                 window.smoke_activations=0
                 window.smoke_reports=0
                 def callback_error(kind,value,trace):

@@ -91,7 +91,7 @@ class ProxyTarget:
         return command
 
     def exited(self,source):
-        return all(not identity.same_process(p) for p in source['processes'])
+        return all(identity.process_exited(p) for p in source['processes'])
 
     def stopped(self,source):
         if not (self.exited(source)
@@ -113,7 +113,7 @@ class ProxyTarget:
         if not health or health.get('version')!=version or health.get('status')!='ok' or health.get('draining'):return False
         if health.get('instance')==source['instance']:return False
         worker=identity.process_identity(health['pid'])
-        if not worker or Path(worker['executable']).resolve()!=Path(command[0]).resolve():return False
+        if not worker or not identity.executable_matches(worker['executable'],command[0]):return False
         actual=identity.process_command(worker['pid'])
         self.validate_command(actual)
         if self.cache and bool(health.get('cache_observation_only'))!=('--cache-observe-only' in command):return False

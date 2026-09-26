@@ -175,7 +175,9 @@ def test_settings_is_the_single_persisted_overlay_control(tmp_path):
     window.worker = AnalysisBridge([], static_snapshot={})  # signals only; no collector or native tracker
     controller = install_overlay(window, native_enabled=False)
     try:
-        assert [a.text() for a in window.tray.contextMenu().actions() if not a.isSeparator()]==['대시보드 열기','종료']
+        import sys
+        expected = ['대시보드 열기', '세션 패널', '종료'] if sys.platform == 'darwin' else ['대시보드 열기', '종료']
+        assert [a.text() for a in window.tray.contextMenu().actions() if not a.isSeparator()] == expected
         action = window.overlay_action
         assert action.isChecked() and controller.enabled
         action.trigger()
