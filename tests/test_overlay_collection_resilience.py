@@ -111,8 +111,8 @@ def test_service_collects_large_record_once_for_gui_and_worker(tmp_path,monkeypa
         stream.write(json.dumps(usage('last',time=10002))+'\n')
     index=tmp_path/'index.sqlite'
     service=CollectorService([home],index)
-    gui=CollectionClient([home],index,autostart=False)
-    worker=CollectionClient([home],index,autostart=False)
+    gui=CollectionClient([home],index)
+    worker=CollectionClient([home],index)
     try:
         for _ in range(10):
             produced=service.poll(10010)
@@ -132,7 +132,7 @@ def test_service_collects_large_record_once_for_gui_and_worker(tmp_path,monkeypa
     finally:gui.close();worker.close();service.close()
 
 
-def test_missing_or_stalled_service_only_requests_service_restart(tmp_path,monkeypatch):
+def test_missing_or_stalled_service_is_read_only_for_consumers(tmp_path,monkeypatch):
     from cachemonitor.index import UsageIndex
     from cachemonitor.usage_collection import CollectionClient,CollectorService
     from cachemonitor.observer_task import ObserverTask
@@ -147,8 +147,8 @@ def test_missing_or_stalled_service_only_requests_service_restart(tmp_path,monke
         snapshot=gui.poll(10045)
         assert snapshot['sessions'] and snapshot['errors']
         assert not snapshot['usage_collection_complete'] and snapshot['ts']==10010
-        assert starts[0][0]=='UsageCollector' and '--usage-collector' in starts[0][1]
-        gui.poll(10046);assert len(starts)==1
+        assert starts==[]
+        gui.poll(10046);assert starts==[]
         assert not hasattr(gui,'index') and not hasattr(gui,'collector')
     finally:gui.close()
 
@@ -160,19 +160,20 @@ def test_service_collects_all_requested_homes(tmp_path):
     first,_=fixture_home(tmp_path/'one');second,_=fixture_home(tmp_path/'two')
     path=tmp_path/'index.sqlite'
     service=CollectorService([first],path)
-    gui=CollectionClient([second,first],path,autostart=False)
-    worker=CollectionClient([first],path,autostart=False)
+    gui=CollectionClient([second,first],path)
+    worker=CollectionClient([first],path)
     try:
         service.poll(10010);assert gui.poll(10010)['index']['loading']
         produced=service.poll(10011)
         produced['unassigned']=[dict(home=str(first),turn='one'),dict(home=str(second),turn='two')]
-        produced['quota']={'account':'first'}
+        produced['quota_by_home']={str(first):{'account':'first'},str(second):{'account':'second'}}
         service.channel.publish(produced,service.epoch,service.sequence+1)
         both=gui.poll(10011);own=worker.poll(10011)
         assert {s['home'] for s in both['sessions']}=={str(first),str(second)}
         assert {s['home'] for s in own['sessions']}=={str(first)}
         assert not both['index']['loading']
-        assert both['homes']==[str(second),str(first)] and both['quota'] is None
+        assert both['homes']==[str(second),str(first)] and both['quota_by_home'][str(second)]['account']=='second'
+        assert own['quota_by_home']=={str(first):{'account':'first'}}
         assert own['unassigned']==[dict(home=str(first),turn='one')]
     finally:gui.close();worker.close();service.close()
 
@@ -186,22 +187,6 @@ def test_subscription_merge_preserves_primary_home(tmp_path):
         consumer.subscribe(100)
         assert service.requested_homes(101)==[str(h.resolve()) for h in [*homes,extra]]
     finally:consumer.close();service.close()
-
-
-def test_scheduler_timeout_is_reported_and_retried(tmp_path,monkeypatch):
-    import subprocess
-    from cachemonitor.usage_collection import CollectionClient
-    from cachemonitor.observer_task import ObserverTask
-    calls=[]
-    def timeout(*args,**kwargs):calls.append(1);raise subprocess.TimeoutExpired('scheduler',20)
-    monkeypatch.setattr(ObserverTask,'start',timeout)
-    client=CollectionClient([tmp_path/'home'],tmp_path/'index.sqlite')
-    try:
-        assert '백그라운드 수집기 시작 지연' in client.poll(100)['errors']
-        client.poll(101);assert len(calls)==1
-        assert '백그라운드 수집기 시작 지연' in client.poll(131)['errors']
-        assert len(calls)==2
-    finally:client.close()
 
 
 def test_conflicting_evidence_scope_is_rejected_without_replacing_collector(tmp_path,monkeypatch):
@@ -234,7 +219,7 @@ def _collect_in_process(home,path,version=None):
     finally:service.close()
 
 
-def test_service_survives_gui_close_and_restarts_as_separate_process(tmp_path,monkeypatch):
+def test_consumer_close_does_not_own_service_and_app_restarts_dead_collector(tmp_path,monkeypatch):
     import json,multiprocessing as mp,time
     from cachemonitor.usage_collection import CollectionClient
     from cachemonitor.observer_task import ObserverTask
@@ -245,7 +230,7 @@ def test_service_survives_gui_close_and_restarts_as_separate_process(tmp_path,mo
     def launch():
         process=context.Process(target=_collect_in_process,args=(str(home),str(path)))
         process.start();processes.append(process);return process
-    producer=launch();gui=CollectionClient([home],path,autostart=False)
+    producer=launch();gui=CollectionClient([home],path)
     try:
         until=time.monotonic()+10
         while time.monotonic()<until:
@@ -255,7 +240,7 @@ def test_service_survives_gui_close_and_restarts_as_separate_process(tmp_path,mo
         assert first['collection']['pid']==producer.pid
         gui.close()
         with record.open('a',encoding='utf-8') as stream:stream.write(json.dumps(usage('after-gui-close',time=10020))+'\n')
-        gui=CollectionClient([home],path,autostart=False)
+        gui=CollectionClient([home],path)
         until=time.monotonic()+5
         while time.monotonic()<until:
             snapshot=gui.poll()
@@ -265,7 +250,13 @@ def test_service_survives_gui_close_and_restarts_as_separate_process(tmp_path,mo
         assert snapshot['collection']['pid']==producer.pid
         producer.terminate();producer.join(5)
         monkeypatch.setattr(ObserverTask,'start',lambda *args,**kwargs:launch())
-        gui.autostart=True;stale=gui.poll(time.time()+31)
+        from cachemonitor.app_services import AppServices
+        owner=AppServices(None,[str(home)],path)
+        monkeypatch.setattr(ObserverTask,'inspect',lambda self:{'running':0})
+        clock=[0];owner.clock=lambda:clock[0]
+        owner.poll_collection();assert len(processes)==1
+        clock[0]=60;owner.poll_collection()
+        stale=gui.poll(time.time()+31)
         assert stale['errors'] and not hasattr(gui,'index')
         until=time.monotonic()+10
         while time.monotonic()<until:
@@ -290,7 +281,7 @@ def test_fresh_old_collector_is_replaced_cooperatively(tmp_path,monkeypatch):
     def launch(version=None):
         process=context.Process(target=_collect_in_process,args=(str(home),str(path),version))
         process.start();processes.append(process);return process
-    old=launch('2026.09.25.5');client=CollectionClient([home],path,autostart=False)
+    old=launch('2026.09.25.5');client=CollectionClient([home],path)
     monkeypatch.setattr(ObserverTask,'configure',lambda self,command,autostart:configured.append(command))
     monkeypatch.setattr(ObserverTask,'start',lambda *args,**kwargs:launch())
     try:
@@ -300,7 +291,12 @@ def test_fresh_old_collector_is_replaced_cooperatively(tmp_path,monkeypatch):
             if before.get('collection',{}).get('pid')==old.pid:break
             time.sleep(.05)
         assert before['collection']['version']=='2026.09.25.5'
-        client.autostart=True;client.poll()
+        from cachemonitor.app_services import AppServices
+        import sys
+        owner=AppServices(None,[str(home)],path)
+        monkeypatch.setattr(ObserverTask,'inspect',lambda self:{'running':0})
+        monkeypatch.setattr('cachemonitor.app_services.identity.process_command',lambda pid:[sys.executable,'run.py','--usage-collector','--index-path',str(path),'--codex-home',str(home)])
+        owner.start_collection()
         old.join(3);assert not old.is_alive() and old.exitcode==0
         assert configured and len(processes)==2
         deadline=time.monotonic()+10
@@ -330,7 +326,7 @@ def test_snapshot_command_cleans_only_its_own_collector(tmp_path,borrowed):
     service=CollectorService([home],path) if borrowed else None
     try:
         if service:service.poll()
-        result=subprocess.run([sys.executable,str(Path(__file__).resolve().parents[1]/'run.py'),
+        result=subprocess.run([sys.executable,'-X','utf8',str(Path(__file__).resolve().parents[1]/'run.py'),
             '--snapshot','--codex-home',str(home),'--index-path',str(path)],capture_output=True,text=True,encoding='utf-8',timeout=40)
         assert result.returncode==0,result.stderr
         assert json.loads(result.stdout)['sessions']
@@ -348,7 +344,7 @@ def test_index_suffixes_have_independent_channels_and_locks(tmp_path):
         for name in ('index','index.db','index.sqlite'):
             path=tmp_path/name
             service=CollectorService([home],path);services.append(service)
-            client=CollectionClient([home],path,autostart=False);clients.append(client)
+            client=CollectionClient([home],path);clients.append(client)
             service.channel.publish(empty_snapshot([str(home)],path,100),service.epoch,1)
         assert len({service.channel.snapshot_path for service in services})==3
         assert len({service.lock.path for service in services})==3
@@ -367,7 +363,7 @@ def test_implicit_and_explicit_effective_evidence_share_scope(tmp_path,monkeypat
     monkeypatch.setattr(model_evidence,'default_path',lambda:tmp_path/'default-evidence.sqlite')
     path=tmp_path/'index.sqlite' if explicit_index else None;home=tmp_path/'home'
     service=CollectorService([home],path)
-    client=CollectionClient([home],path,service.channel.default_evidence,autostart=False)
+    client=CollectionClient([home],path,service.channel.default_evidence)
     try:
         service.channel.publish(empty_snapshot([str(home)],service.channel.path,100),service.epoch,1)
         assert client.channel.scope==service.channel.scope

@@ -148,7 +148,8 @@ def test_taskbar_data_visibility_menu_and_persistence(tmp_path, monkeypatch, own
         assert indicator.isVisible()
         assert indicator.native.api.GetParent(int(indicator.winId())) == indicator.native.host()
         now = time.time()
-        w.snapshot['quota'] = {'plan_type': 'pro', 'has_five_hour': False,
+        w.snapshot['quota_by_home']={}
+        w.snapshot['quota_by_home'][w.observer_home] = {'plan_type': 'pro', 'has_five_hour': False,
                                'observed_at': now, 'windows': {'weekly': {
                                    'used_percent': 16, 'resets_at': now + 100}}}
         w.refresh_tray()
@@ -164,14 +165,14 @@ def test_taskbar_data_visibility_menu_and_persistence(tmp_path, monkeypatch, own
         assert w.isVisible() and not w.isMinimized()
         w.set_quota_mode('five_hour')
         assert indicator.caption.text() == '5시간' and indicator.value.text() == '?'
-        w.snapshot['quota']['unlimited_windows']=['five_hour'];w.refresh_tray()
+        w.snapshot['quota_by_home'][w.observer_home]['unlimited_windows']=['five_hour'];w.refresh_tray()
         assert indicator.value.text()=='∞'
         w.set_quota_mode('weekly')
-        w.snapshot['quota']['windows']['weekly']['used_percent'] = 95
+        w.snapshot['quota_by_home'][w.observer_home]['windows']['weekly']['used_percent'] = 95
         w.refresh_tray()
         assert indicator.value.text() == '5%' and indicator._warning
-        w.snapshot['quota']['windows']['weekly']['resets_at'] = now - 1
-        w.snapshot['quota']['observed_at'] = now - 2  # No server observation since this reset.
+        w.snapshot['quota_by_home'][w.observer_home]['windows']['weekly']['resets_at'] = now - 1
+        w.snapshot['quota_by_home'][w.observer_home]['observed_at'] = now - 2  # No server observation since this reset.
         w.refresh_tray()
         assert indicator.value.text() == '?' and not indicator._warning
         w.taskbar_action.trigger()

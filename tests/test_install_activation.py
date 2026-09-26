@@ -55,6 +55,7 @@ def test_interrupted_activation_is_recovered_before_next_attempt(tmp_path,monkey
     (None,False),('',False),('"C:\\Python\\pythonw.exe" run.py --hidden',False),
     ('"C:\\old folder\\Codexon.exe" --hidden --codex-home "C:\\first home" --codex-home C:\\second',False),
     ('"C:\\old folder\\Codexon.exe" --hidden --codex-home "C:\\first home" --codex-home C:\\second',True),
+    ('"C:\\old folder\\Codexon.exe" --hidden --codex-home "C:\\first home" --codex-home C:\\second','pointer'),
 ])
 def test_update_retargets_login_startup_and_rolls_back_unconfirmed_write(tmp_path,monkeypatch,startup,fail_write):
     """Exercise the production activation path using disposable real registry keys."""
@@ -74,6 +75,7 @@ def test_update_retargets_login_startup_and_rolls_back_unconfirmed_write(tmp_pat
     monkeypatch.setattr(activation,'shortcuts',lambda isolated:[link])
     monkeypatch.setattr(activation,'publish_shell',lambda *a,**k:link.write_bytes(b'new shortcut'))
     monkeypatch.setattr(launch_context,'preference_path',lambda:tmp_path/'launch.json')
+    monkeypatch.setattr('cachemonitor.installation.pointer_path',lambda:tmp_path/'shared-installation.json')
     monkeypatch.setattr(launch_context,'running_homes',lambda root:[])
     from cachemonitor import observer_task
     retired=[]
@@ -82,9 +84,14 @@ def test_update_retargets_login_startup_and_rolls_back_unconfirmed_write(tmp_pat
         Path(command[-1]).write_text(json.dumps(dict(errors=[],version='test',phase='off')))
         return subprocess.CompletedProcess(command,0)
     monkeypatch.setattr(install.subprocess,'run',run)
+    original_atomic=install.atomic_write
+    def atomic(path,data):
+        if fail_write=='pointer' and path==tmp_path/'shared-installation.json':raise OSError('shared pointer failure')
+        return original_atomic(path,data)
+    monkeypatch.setattr(install,'atomic_write',atomic)
     original_write=winreg.SetValueEx
     def write(key,name,reserved,kind,value):
-        if fail_write and name=='CacheMonitor' and str(product) in value:return
+        if fail_write is True and name=='CacheMonitor' and str(product) in value:return
         original_write(key,name,reserved,kind,value)
     disabled=bytes([3,0,0,0])+bytes(8)
     try:
@@ -98,10 +105,11 @@ def test_update_retargets_login_startup_and_rolls_back_unconfirmed_write(tmp_pat
         before=activation.snapshot_registry(False)
         monkeypatch.setattr(winreg,'SetValueEx',write)
         if fail_write:
-            with pytest.raises(OSError,match='로그인 시 시작'):
+            with pytest.raises(OSError,match='shared pointer' if fail_write=='pointer' else '로그인 시 시작'):
                 install.finish(tmp_path,product,recovery,launch=False)
             assert activation.snapshot_registry(False)==before
             assert receipt.read_bytes()==b'{"product":"old"}' and link.read_bytes()==b'old shortcut'
+            assert not (tmp_path/'shared-installation.json').exists()
         else:
             install.finish(tmp_path,product,recovery,launch=False)
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER,startup_path) as key:
@@ -114,6 +122,7 @@ def test_update_retargets_login_startup_and_rolls_back_unconfirmed_write(tmp_pat
                     assert winreg.QueryValueEx(key,'CacheMonitor')==(expected,winreg.REG_SZ)
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER,key_path) as key:
                 assert winreg.QueryValueEx(key,'AppPath')[0]==str(product/'Codexon.exe')
+            assert json.loads((tmp_path/'shared-installation.json').read_text(encoding='utf-8'))['AppPath']==str(product/'Codexon.exe')
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER,approved_path) as key:
             assert winreg.QueryValueEx(key,'CacheMonitor')==(disabled,winreg.REG_BINARY)
         assert not (tmp_path/'activation-pending.json').exists()

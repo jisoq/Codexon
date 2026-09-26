@@ -72,7 +72,8 @@ def test_current_release_updates_the_active_cache_worker(tmp_path,monkeypatch):
     from types import SimpleNamespace
     from cachemonitor import install_management
     calls=[]
-    manager=SimpleNamespace(shared_cache_worker=True,status=lambda:{'configured':True},
+    manager=SimpleNamespace(shared_cache_worker=True,status=lambda:{'configured':True,'health':{'status':'ok'}},
+        cleanup_legacy_check=lambda:None,adopt_registrations=lambda:None,
         update_proxy=lambda:calls.append(True) or {'update':{'phase':'queued','message':'연결 종료 후 적용'}})
     monkeypatch.setattr(app_update,'VERSION',release()['tag_name'].lstrip('v'))
     monkeypatch.setattr(app_update,'installed',lambda:dict(InstallRoot=str(tmp_path)))

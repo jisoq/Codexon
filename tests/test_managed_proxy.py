@@ -132,7 +132,8 @@ def test_observation_task_survives_launcher_exit(tmp_path):
         assert state['state'] == 4 and state['autostart'] is False
         assert '--cache-observe-only' in state['arguments']
         task.configure(command, autostart=True)
-        assert task.inspect()['restartCount'] == 3
+        assert task.inspect()['restartCount'] == 0
+        assert not task.inspect()['autostart'] and not task.inspect()['periodic']
         assert manager.health(timeout=1)['pid'] == health['pid']
         # No URL is installed merely by starting the observer.
         assert not manager.config_path.exists()

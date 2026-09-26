@@ -48,6 +48,57 @@ def launch_snapshot(root):
                 links={str(p):p.read_bytes() if p.exists() else None for p in shortcuts(True)})
 
 
+def verify_cleanup(first,second,root):
+    """Real GUI/collector handoff must precede deletion, including on QA installs."""
+    import hashlib
+    from PySide6.QtCore import QCoreApplication
+    from PySide6.QtNetwork import QLocalSocket
+    from tools.verify_recovery import wait_report
+    home=root/'cleanup home';home.mkdir();(home/'codexon-test-home').touch()
+    index=root/'cleanup-data'/'index.sqlite'
+    index.parent.mkdir()
+    with socket.socket() as probe:probe.bind(('127.0.0.1',0));port=probe.getsockname()[1]
+    assert port!=8768
+    (index.parent/'cache-route.json').write_text(json.dumps({'url':f'http://127.0.0.1:{port}'}))
+    args=['--codex-home',str(home),'--index-path',str(index),'--evidence-path',str(index.parent/'model-evidence.sqlite'),
+          '--cache-control','--verify-services','--hidden']
+    processes=[]
+    app=QCoreApplication.instance() or QCoreApplication([])
+    try:
+        for n,registration in enumerate((first,second)):
+            report=root/f'cleanup-gui-{n}.json'
+            command=[registration['AppPath'],*args,'--verify-handoff',str(report)]
+            if n:command.append('--replace-gui')
+            processes.append(subprocess.Popen(command,creationflags=subprocess.CREATE_NO_WINDOW))
+            wait_report(report,lambda d:d.get('ready'))
+            if not n:
+                from cachemonitor.usage_collection import CollectionChannel
+                channel=CollectionChannel([str(home)],index,index.parent/'model-evidence.sqlite')
+                try:
+                    deadline=time.monotonic()+30
+                    while time.monotonic()<deadline:
+                        source=(channel.read() or {}).get('collection') or {}
+                        if Path(source.get('executable',''))==Path(registration['AppPath']):break
+                        time.sleep(.2)
+                    else:raise RuntimeError('Previous QA collector did not become ready')
+                finally:channel.close()
+        assert processes[0].wait(timeout=30)==0
+        journal=Path(second['InstallRoot'])/'cleanup.json'
+        def cleaned(value):
+            return (value.get('product')==str(Path(second['AppPath']).parent)
+                    and any(i.get('status')=='removed' for i in value.get('items',[]))
+                    and not Path(first['AppPath']).exists() and not Path(first['RecoveryPath']).exists())
+        wait_report(journal,cleaned)
+        assert Path(second['AppPath']).is_file() and Path(second['RecoveryPath']).is_file()
+        (root/'cleanup-result.json').write_text(json.dumps(read_json(journal),indent=2))
+    finally:
+        client=QLocalSocket()
+        client.connectToServer('CodexonQA-'+hashlib.sha256(str(index.resolve()).encode()).hexdigest()[:24])
+        if client.waitForConnected(2000):
+            client.write(b'verify-quit');client.waitForBytesWritten(2000);client.waitForReadyRead(3000)
+        for process in processes:process.wait(timeout=45)
+
+
 def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--installer',type=Path,required=True)
@@ -91,6 +142,7 @@ def main():
     second=registration()
     assert first['AppPath']!=second['AppPath'] and Path(first['AppPath']).is_file()
     assert read_json(install/'installation.json')['previous']==str(Path(first['AppPath']).parent)
+    verify_cleanup(first,second,root)
     with winreg.OpenKey(winreg.HKEY_CURRENT_USER,r'Software\Classes\codexon-recovery-qa\shell\open\command') as key:
         assert second['RecoveryPath'] in winreg.QueryValueEx(key,'')[0]
     # Keep a real independent recovery window open to test removal deferral.
@@ -118,7 +170,7 @@ def main():
     assert run([*uninstall,f'/LOG={root / "uninstall.log"}'])==0
     assert not registration() and not Path(second['AppPath']).exists()
     assert record.read_text()=='existing user record'
-    result=dict(passed=True,install=True,reinstall=True,old_payload_preserved=True,
+    result=dict(passed=True,install=True,reinstall=True,old_payload_preserved_until_ready=True,old_payload_cleaned=True,
                 busy_uninstall_deferred=True,uninstall=True,records_preserved=True,
                 receipt_failure_restored=True,runtime_failure_restored=bool(args.broken_installer),
                 first_failure_removable=bool(args.broken_installer))

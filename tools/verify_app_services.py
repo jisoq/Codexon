@@ -15,7 +15,7 @@ from cachemonitor.observer_task import ObserverTask
 from cachemonitor.proxy_target import ProxyTarget
 from cachemonitor.observer_state import read_json
 from cachemonitor.model_evidence import home_key
-from cachemonitor.usage_collection import CollectionClient,resume_collection
+from cachemonitor.usage_collection import CollectionClient
 from cachemonitor import proxy_identity as identity
 from verify_proxy_update import IdleConnections
 
@@ -27,6 +27,32 @@ def await_value(read,predicate,seconds=30):
         if predicate(value):return value
         time.sleep(.2)
     raise AssertionError('Readiness timeout')
+
+
+def legacy_schedule(task):
+    """Seed an old repeating/restarting definition without starting it."""
+    import base64
+    # The generated task name contains only a fixed prefix and a hex scope hash.
+    assert all(c.isalnum() or c=='-' for c in task.name)
+    script="""
+$service=New-Object -ComObject Schedule.Service
+$service.Connect()
+$folder=$service.GetFolder('\\')
+$task=$folder.GetTask('__TASK__')
+$definition=$task.Definition
+$trigger=$definition.Triggers.Create(1)
+$trigger.StartBoundary=(Get-Date).AddDays(1).ToString('yyyy-MM-ddTHH:mm:ss')
+$trigger.Repetition.Interval='PT1M'
+$definition.Settings.RestartCount=3
+$definition.Settings.RestartInterval='PT1M'
+[void]$folder.RegisterTaskDefinition('__TASK__',$definition,6,$definition.Principal.UserId,$null,3)
+""".replace('__TASK__',task.name)
+    encoded=base64.b64encode(script.encode('utf-16-le')).decode()
+    result=subprocess.run(['powershell.exe','-NoProfile','-NonInteractive','-EncodedCommand',encoded],
+                          capture_output=True,timeout=20,creationflags=subprocess.CREATE_NO_WINDOW)
+    assert result.returncode==0,result.stderr
+    registration=task.inspect()
+    assert registration['periodic'] and registration['restartCount']==3
 
 
 def quit_gui(executable,home,index,evidence,cache):
@@ -79,6 +105,7 @@ def verify_legacy_collector(root,old,new):
         task.start([str(old),'--usage-collector','--codex-home',str(home),'--index-path',str(index),'--evidence-path',str(evidence)])
         before=await_value(snapshot,lambda s:s.get('collection'))['collection']
         process=identity.process_identity(before['pid'])
+        AppServices(None,[str(home)],index,evidence).start_collection()
         client=CollectionClient([home],index,evidence)
         after=await_value(client.poll,lambda s:s.get('collection',{}).get('pid') not in (None,before['pid']))['collection']
         assert after['executable']==str(new) and not identity.same_process(process)
@@ -117,17 +144,35 @@ def verify(root,executable,role):
     command+=['--cache-observe-only' if role=='cache-observer' else '--cache-worker','--observation-index',str(index)] if cache else ['--managed']
     collector=ObserverTask(str(index.resolve()),role='UsageCollector')
     client=None
-    tasks=[manager.task,manager.check_task,manager.legacy_task,collector,ObserverTask(home_key(home),role='ProxyUpdate')]
+    tasks=[manager.task,manager.legacy_task,ObserverTask(home_key(home),role='ConnectionCheck'),collector,ObserverTask(home_key(home),role='ProxyUpdate')]
     services=AppServices(manager,[str(home)],index,evidence)
     try:
-        resume_collection([home],index,evidence)
+        checker=tasks[2]
+        checker.configure([str(executable.with_name('CodexonRecovery.exe')),'--check',
+            '--codex-home',str(home),'--data-dir',str(data),'--proxy-url',url],autostart=True)
+        legacy_schedule(checker)
         manager.task.start(command,autostart=True)
+        legacy_schedule(manager.task)
         before=await_value(lambda:manager.health(timeout=1),lambda h:bool(h))
         source=ProxyTarget(manager).capture(before)
         assert source['role']==role
+        reboot_recovered=False
+        if cache:
+            # A reboot can leave the route/registration intact without an exit
+            # journal or flush receipt. Stop only this idle synthetic worker.
+            manager.task.suspend();manager.task.stop()
+            await_value(lambda:identity.port_free(url) and identity.locks_free(ProxyTarget(manager).locks),bool)
+            assert manager.config()[1]['openai_base_url']==url
+            assert manager.ensure()['phase']=='recovery_required'
+            assert manager.resume()['phase']=='active'
+            restarted=manager.health(timeout=2)
+            assert restarted['instance']!=before['instance'] and restarted['role']==role
+            assert manager.config()[1]['openai_base_url']==url
+            before=restarted;source=ProxyTarget(manager).capture(before)
+            reboot_recovered=True
         collector.start([str(executable),'--usage-collector','--codex-home',str(home),
                          '--index-path',str(index),'--evidence-path',str(evidence)])
-        client=CollectionClient([home],index,evidence,autostart=False)
+        client=CollectionClient([home],index,evidence)
         snapshot=await_value(client.poll,lambda s:bool(s.get('collection')))
         old_collector=identity.process_identity(snapshot['collection']['pid'])
         client.close();client=None
@@ -137,13 +182,13 @@ def verify(root,executable,role):
         manager.task.suspend()
         assert manager.health(timeout=2)['instance']==before['instance']
         quit_gui(executable,home,index,evidence,cache)
+        assert not checker.inspect()['registered']
         assert ProxyTarget(manager).stopped(source) and not identity.same_process(old_collector)
         assert manager.config()[1].get('openai_base_url') is None
         for task in tasks:
             registered=task.inspect()
             assert not registered.get('running') and not registered.get('autostart') and not registered.get('periodic')
             if registered['registered']:assert not registered['enabled'] and registered['restartCount']==0
-        resume_collection([home],index,evidence)
         assert resume_proxy(manager)
         after=manager.health(timeout=2)
         assert after['instance']!=before['instance'] and after['role']==role and not after['draining']
@@ -154,7 +199,8 @@ def verify(root,executable,role):
         assert identity.port_free(url) and identity.locks_free(ProxyTarget(manager).locks)
         return dict(role=role,before={k:before.get(k) for k in ('pid','version','instance','executable')},
                     resumed={k:after.get(k) for k in ('pid','version','instance','executable')},
-                    gui_exited=True,collector_stopped=True,slot_cleanup=True,tasks_suspended=True,route_restored=True)
+                    gui_exited=True,collector_stopped=True,slot_cleanup=True,tasks_suspended=True,route_restored=True,
+                    reboot_recovered=reboot_recovered,legacy_check_removed=True)
     finally:
         if client:client.close()
         upstream.close()

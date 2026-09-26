@@ -20,7 +20,7 @@ def test_opening_panel_resumes_app_owned_services_once(tmp_path,monkeypatch):
     panel=ObserverPanel(tmp_path/'home',tmp_path/'data',active=True)
     try:
         settle(app,panel)
-        assert calls==['resume']
+        assert calls==[]  # The app owns startup; a panel never starts a service.
     finally:panel.stop();panel.deleteLater();app.processEvents()
 
 

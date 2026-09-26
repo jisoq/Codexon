@@ -84,16 +84,16 @@ def main():
         assert response.status==status
         return json.loads(response.read())
     try:
-        manager.task.start(command,autostart=True)
+        manager.task.start(command,autostart=False)
         h=wait_until(health);worker=h['pid']
         runtime=wait_until(lambda:manager.runtime() if manager.runtime().get('worker_pid')==worker else None)
         assert runtime['worker_pid']==worker and runtime['pid']!=worker
-        info=manager.task.inspect();assert info['autostart'] and '--proxy-supervisor' in info['arguments']
+        info=manager.task.inspect();assert not info['autostart'] and '--proxy-supervisor' in info['arguments']
         parent=subprocess.check_output(['powershell.exe','-NoProfile','-NonInteractive','-Command',
             f'(Get-CimInstance Win32_Process -Filter "ProcessId={int(runtime["pid"])}").ParentProcessId'],
             creationflags=subprocess.CREATE_NO_WINDOW,text=True).strip()
         assert int(parent)!=__import__('os').getpid()
-        report.update(supervisor_pid=runtime['pid'],worker_pid=worker,parent_pid=int(parent),autostart=True)
+        report.update(supervisor_pid=runtime['pid'],worker_pid=worker,parent_pid=int(parent),autostart=False)
         for status in (401,429,503,200):request(status)
         assert manager.state()['enabled'] and health()['internal_failure_streak']==0
         report['upstream_errors_did_not_stop_proxy']=True

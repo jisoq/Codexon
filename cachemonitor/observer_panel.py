@@ -1,5 +1,5 @@
 """One proxy switch; preparation, verification and recovery stay in the controller."""
-from PySide6.QtCore import Qt,QThread, QTimer, QSignalBlocker, Signal
+from PySide6.QtCore import Qt,QThread, QSignalBlocker, Signal
 from .presentation import Button, Column, Form, Group, Row, Text
 from .controls import Switch
 from .observer_control import ObserverManager
@@ -25,6 +25,7 @@ class ObserverPanel(Group):
     def __init__(self,home,directory=None,active=False,parent=None,manager=None):
         super().__init__(parent)
         self.manager=manager or ObserverManager(home,directory)
+        self.services=None
         self.operation=None;self.active=active;self.enabled=False
         self.pending=None;self.last_result={};self.operation_name=''
         layout=Column(self);layout.setContentsMargins(0,0,0,10);layout.setSpacing(16)
@@ -55,10 +56,7 @@ class ObserverPanel(Group):
         self.restart_label=Text();self.restart_label.setWordWrap(False);self.restart_label.setFixedHeight(24)
         self.restart_label.setStyleSheet('color: warning;');layout.addWidget(self.restart_label)
         self.toggle.toggled.connect(self.request)
-        self.timer=QTimer(self);self.timer.setInterval(15000)
-        self.timer.timeout.connect(lambda:self.invoke('ensure'))
         self.update_controls()
-        if active:self.timer.start();QTimer.singleShot(0,lambda:self.invoke('resume'))
 
     def busy(self):return self.operation is not None
     def update_controls(self):
@@ -78,7 +76,10 @@ class ObserverPanel(Group):
         self.operation_name=operation;self.manager.cancelled.clear()
         if operation=='turn_on':self.status_label.setText('연결 확인 중…')
         elif operation=='turn_off':self.status_label.setText('직접 연결로 복원 중…')
-        self.operation=ObserverOperation(self.manager,operation,self)
+        if self.services:
+            from .app_shutdown import ServiceOperation
+            self.operation=ServiceOperation(self.services,operation,self)
+        else:self.operation=ObserverOperation(self.manager,operation,self)
         self.operation.result.connect(self.display);self.operation.finished.connect(self.finished)
         self.operation.start()
         self.update_controls()
@@ -145,7 +146,7 @@ class ObserverPanel(Group):
         self.status_observed.emit(state)
 
     def stop(self):
-        self.active=False;self.timer.stop();self.pending=None;self.manager.cancelled.set()
+        self.active=False;self.pending=None;self.manager.cancelled.set()
         # Never destroy a running QThread while its transaction is rolling back.
         # Network and scheduler operations have their own bounded timeouts.
         if self.operation and self.operation.isRunning():self.operation.wait()

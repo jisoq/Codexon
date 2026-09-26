@@ -8,7 +8,6 @@ from collections import deque
 from PySide6.QtCore import QThread, Signal
 from .quota_cycles import QuotaLedger, ledger_path
 from .quota_live import AccountClient
-from .quota_reader import QuotaReader
 from .quota import select_current_quota
 from . import quota_tracking_store as tracking_store
 from .quota_polling import QuotaPolling
@@ -29,6 +28,12 @@ class QuotaService(QThread):
         self.tracking_enabled=tracking_enabled
         self.tracking_after=time.time()
         self.tracking_changes=queue.SimpleQueue()
+        self.local_observations=queue.SimpleQueue()
+
+    def supply_local(self, quota):
+        """Receive the collector's observation without changing its timestamp."""
+        self.local_observations.put(quota)
+        self.wake.set()
 
     def set_tracking_enabled(self, enabled):
         self.tracking_enabled=bool(enabled)
@@ -42,12 +47,11 @@ class QuotaService(QThread):
         client = AccountClient(self.home)
         client.cache_seconds = QuotaPolling.MINIMUM
         self.client = client
-        reader = QuotaReader(self.home)
         latest = direct = local = None
         polling = QuotaPolling()
         pending = deque()
         controls = deque()
-        next_storage = next_report = next_local = 0
+        next_storage = next_report = 0
         storage_failures = 0
         lookup_issue = database_issue = ''
         emitted_issue = None
@@ -79,7 +83,7 @@ class QuotaService(QThread):
                 now = time.time()
                 if polling.tick(time.monotonic(), now):
                     client.close()
-                    next_storage = next_local = next_report = 0
+                    next_storage = next_report = 0
                 if time.monotonic() >= next_storage:
                     try:
                         stage = 'open ledger'
@@ -131,20 +135,13 @@ class QuotaService(QThread):
                             pending.append(('failure', time.time()))
                         polling.finish(time.monotonic(), False)
                     next_report = 0
-                if (not direct or time.time()-direct['observed_at'] >= 90) and time.monotonic() >= next_local:
-                    try:
-                        local_result = reader.poll()
-                        quota = local_result['quota']
-                        if local_result.get('errors'):
-                            lookup_issue = lookup_issue or '로컬 한도 기록 읽기 지연'
-                        if quota:
-                            local = {**quota, 'source': 'local', 'max_age': 120}
-                            if self.tracking_enabled:
-                                pending.append(('local', local))
-                    except Exception as exc:
-                        record_failure(self.path, 'local lookup', exc)
-                        lookup_issue = lookup_issue or '로컬 한도 기록 읽기 지연'
-                    next_local = time.monotonic()+15
+                while not self.local_observations.empty():
+                    quota = self.local_observations.get()
+                    if quota and (local is None or quota['observed_at'] > local['observed_at']):
+                        local = {**quota, 'source': 'local', 'max_age': 120}
+                        if self.tracking_enabled:
+                            pending.append(('local', local))
+                        next_report = 0
                 publish = report is None or time.monotonic() >= next_report
                 if ledger is not None:
                     try:

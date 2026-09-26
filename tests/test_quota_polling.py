@@ -9,6 +9,34 @@ from cachemonitor.quota_cycles import QuotaLedger
 from cachemonitor import quota_service as module
 
 
+def test_shared_local_quota_keeps_its_age_during_account_failure(tmp_path,monkeypatch):
+    clock=[1000.0]
+    monkeypatch.setattr(module,'time',SimpleNamespace(time=lambda:clock[0],monotonic=lambda:clock[0]))
+    class Client:
+        def __init__(self,*args):pass
+        def fetch(self):raise ConnectionError('synthetic offline account')
+        def close(self):pass
+    monkeypatch.setattr(module,'AccountClient',Client)
+    service=module.QuotaService(tmp_path/'home',tmp_path/'index.sqlite',tracking_enabled=False)
+    observation=dict(home=service.home,observed_at=1000,plan_type='pro',
+        windows={'weekly':dict(used_percent=25,resets_at=2000,window_minutes=10080)})
+    service.supply_local(observation)
+    reports=[];service.updated.connect(reports.append)
+    class Wake:
+        def clear(self):pass
+        def wait(self,seconds):
+            clock[0]+=5
+            service.local_observations.put(observation)  # Delivery is not a fresh observation.
+    service.wake=Wake()
+    service.isInterruptionRequested=lambda:clock[0]>1130
+    service.run()
+    assert reports[0]['quota']['observed_at']==1000
+    assert reports[0]['quota']['windows']['weekly']['used_percent']==25
+    from cachemonitor.quota import quota_display
+    assert quota_display(reports[-1]['quota'],'weekly',now=1130)['remaining'] is None
+    assert all(r['quota']['observed_at']==1000 for r in reports)
+
+
 def test_activity_is_coalesced_without_postponing_or_overriding_backoff():
     p=QuotaPolling()
     p.activity(('start',),True,0)

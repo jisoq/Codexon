@@ -84,7 +84,7 @@ def main():
         return 1 if result.get('error') else 0
     if args.snapshot:
         from .usage_collection import isolated_collector
-        monitor = CollectionClient(homes,args.index_path,args.evidence_path,autostart=False)
+        monitor = CollectionClient(homes,args.index_path,args.evidence_path)
         cleanup=lambda:None
         try:
             cleanup=isolated_collector(homes,args.index_path,args.evidence_path,reuse=True)
@@ -153,9 +153,6 @@ def main():
         from .usage_collection import isolated_collector
         collector_cleanup=isolated_collector(homes,args.index_path,args.evidence_path)
         app.aboutToQuit.connect(collector_cleanup)
-    if not (args.smoke or args.verify_handoff) or args.verify_services:
-        from .usage_collection import resume_collection
-        resume_collection(homes,args.index_path,args.evidence_path)
     window = Dashboard(homes,index_path=args.index_path,model_evidence_path=args.evidence_path,quota_path=args.quota_path,
         collection_autostart=not (args.smoke or args.verify_handoff) or args.verify_services,
         cache_control=args.cache_control or (not args.smoke and args.index_path is None),
@@ -220,4 +217,11 @@ def main():
     if args.smoke:
         from .quick_smoke import start_smoke
         start_smoke(window,app,args.smoke,bundled_fonts,depth=args.smoke_depth)
+    from .observer_state import read_json
+    qa_cleanup=(args.verify_handoff and args.verify_services and getattr(sys,'frozen',False)
+                and read_json(Path(sys.executable).parent.parent.parent.parent/'installation.json').get('isolated'))
+    if not (args.smoke or args.verify_handoff) or qa_cleanup:
+        # Cleanup can only follow this GUI's event-loop startup and the service
+        # controller's independently verified readiness, never a launch request.
+        QTimer.singleShot(0,lambda:setattr(window.app_services,'gui_ready',True))
     return app.exec()

@@ -560,8 +560,6 @@ def main():
             if args.managed or args.control_file or not args.observation_index:
                 parser.error('Observation requires its own index and unmanaged listener')
             from .cache_scheduler import Scheduler
-            from .usage_collection import CollectionClient
-            from concurrent.futures import ThreadPoolExecutor
             from .cache_execution import execution_owner
             owner=execution_owner(args.observation_index.with_name('cache-control.sqlite'))
             owner.__enter__();cache_lock=owner
@@ -574,33 +572,11 @@ def main():
                 control_file=args.evidence_path.parent/('proxy-control-'+control_id+'.json'),
                 control_id=control_id,stop_event=stop,scheduler=scheduler,runtime_identity=identity)
             async def observe_context(app):
-                pool=ThreadPoolExecutor(max_workers=1);index=None
-                def poll():
-                    nonlocal index
-                    if index is None:index=CollectionClient([args.codex_home],args.observation_index,args.evidence_path)
-                    value=index.poll()
-                    # Existing index/enrich owns profile generation. Never synthesize hooks.
-                    return value['index']['loading']
-                async def collect():
-                    while True:
-                        try:loading=await asyncio.get_running_loop().run_in_executor(pool,poll)
-                        except Exception:
-                            loading=False
-                            try:scheduler.control.set('collector_error',True)
-                            except (sqlite3.Error,OSError):pass
-                        else:
-                            try:scheduler.control.set('collector_error',False)
-                            except (sqlite3.Error,OSError):pass
-                        await asyncio.sleep(1 if loading else 15)
-                tasks=[asyncio.create_task(scheduler.serve()),asyncio.create_task(collect())]
+                task=asyncio.create_task(scheduler.serve())
                 try:yield
                 finally:
-                    for task in tasks:task.cancel()
-                    await asyncio.gather(*tasks,return_exceptions=True)
-                    def close_index():
-                        if index:index.close()
-                    await asyncio.get_running_loop().run_in_executor(pool,close_index)
-                    pool.shutdown();await scheduler.close()
+                    task.cancel();await asyncio.gather(task,return_exceptions=True)
+                    await scheduler.close()
             app.cleanup_ctx.append(observe_context)
             async def serve_cache():
                 runner=web.AppRunner(app,access_log=None)

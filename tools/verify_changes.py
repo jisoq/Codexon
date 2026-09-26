@@ -65,7 +65,7 @@ GROUPS = {
     'relay': test_files('model_proxy', 'proxy_websocket', 'proxy_http2', 'proxy_observation', 'observation_delivery'),
     'proxy_lifecycle': test_files('managed_proxy', 'proxy_update', 'proxy_supervisor', 'connection_recovery'),
     'observer': test_files('observer_control', 'observer_panel'),
-    'install': test_files('install_activation', 'install_management', 'windows_startup'),
+    'install': test_files('install_activation', 'install_management', 'install_dispatch', 'install_cleanup', 'legacy_release', 'windows_startup'),
     'update': test_files('app_update'),
     'runtime': test_files('windows_startup') + (
         'tests/test_verify_changes.py::test_isolated_source_smoke_renders_parent_cost',),
@@ -111,10 +111,11 @@ RULES = (
     ('cachemonitor/quota_view.py', ('quota_ui',)),
     ('cachemonitor/quota_panel.py', ('quota_ui',)),
     ('cachemonitor/quota_service.py', ('quota_poll', 'quota_store')),
+    # A diff against a supported old revision can still contain this deleted reader.
+    ('cachemonitor/quota_reader.py', ('quota_poll', 'quota_store')),
     ('cachemonitor/quota_polling.py', ('quota_poll',)),
     ('cachemonitor/quota_live.py', ('quota_poll', 'quota_store')),
     ('cachemonitor/quota_diagnostics.py', ('quota_math',)),
-    ('cachemonitor/quota_reader.py', ('quota_store', 'quota_math')),
     ('cachemonitor/quota_tracking*.py', ('quota_store', 'quota_math')),
     ('cachemonitor/quota.py', ('quota_store', 'quota_math')),
     ('cachemonitor/dashboard.py', ('dashboard', 'details', 'cost', 'speed')),
@@ -213,6 +214,7 @@ RULES = (
     ('tools/font_render_probe.py', ('shared_ui',)),
     ('tools/verify_recovery.py', ('install',)),
     ('tools/verify_installation.py', ('install',)),
+    ('tools/prepare_legacy_release.py', ('install',)),
     ('tools/verify_gui_handoff.py', ('install',)),
     ('tools/installer_identity.py', ('install',)),
     ('tools/prepare_bad_runtime.py', ('install',)),
@@ -238,6 +240,7 @@ PACKAGE_PATTERNS = (
     'cachemonitor/install*.py', 'cachemonitor/app.py', 'cachemonitor/app_update.py', 'cachemonitor/app_restart.py',
     'cachemonitor/version.py', 'cachemonitor/runtime_check.py', 'cachemonitor/launch_context.py',
     'cachemonitor/windows_integration.py', 'cachemonitor/shell_shortcut.py',
+    'tools/prepare_legacy_release.py',
 )
 PROXY_PATTERNS = (
     'cachemonitor/model_proxy.py', 'cachemonitor/proxy*.py', 'cachemonitor/managed_proxy.py',
@@ -245,6 +248,7 @@ PROXY_PATTERNS = (
     'cachemonitor/connection_recovery.py', 'cachemonitor/evidence_writer.py',
     'cachemonitor/version.py', 'tools/*proxy*.py', 'requirements*', 'build*.ps1', '*.spec',
     'tools/Build-*.ps1', 'cachemonitor/install*.py', 'installer/*',
+    'tools/prepare_legacy_release.py',
 )
 FULL_PATTERNS = ('tests/conftest.py', 'pytest.ini', 'pyproject.toml', 'requirements*')
 DOC_PATTERNS = ('docs/*', 'releases/*', '*.md', '*.txt', 'LICENSE*', '.gitignore',

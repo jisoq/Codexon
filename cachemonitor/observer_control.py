@@ -75,7 +75,6 @@ class ObserverManager:
         self.url=url.rstrip('/')
         self.task=ObserverTask(home_key(self.home), role='ProxySupervisor')
         self.legacy_task=ObserverTask(home_key(self.home))
-        self.check_task=ObserverTask(home_key(self.home),role='ConnectionCheck')
         self.runtime_path=self.directory/'proxy-runtime.json'
         self.control_lock=self.directory/'observer-control.lock'
         self.cancelled=threading.Event()
@@ -162,9 +161,40 @@ class ObserverManager:
         # Keep the historical task name, but run the relay itself, without a parent watcher.
         return self.command(upstream)+['--managed']
 
-    def configure_check(self):
-        from .installation import recovery_command
-        return self.check_task.periodic(recovery_command(self.home,self.directory,self.url,check=True))
+    def cleanup_legacy_check(self):
+        """Retire only the old checker for this exact home, data directory and URL."""
+        from .launch_context import command_arguments
+        from .proxy_target import option
+        task=ObserverTask(home_key(self.home),role='ConnectionCheck')
+        registration=task.inspect()
+        if not registration.get('registered'):return
+        command=command_arguments('checker '+registration.get('arguments',''))
+        if ('--check' not in command or
+                Path(option(command,'--codex-home','')).resolve()!=self.home.resolve() or
+                Path(option(command,'--data-dir','')).resolve()!=self.directory.resolve() or
+                option(command,'--proxy-url')!=self.url):return
+        task.suspend()
+        task.stop()
+        deadline=time.monotonic()+10
+        while task.inspect().get('running'):
+            if time.monotonic()>=deadline:raise RuntimeError('이전 연결 점검 종료 대기')
+            time.sleep(.1)
+        task.remove()
+        for name in ('connection-check.json','connection-check.lock'):
+            (self.directory/name).unlink(missing_ok=True)
+
+    def adopt_registrations(self):
+        """Remove autonomous triggers only from registrations for this connection."""
+        from .launch_context import command_arguments
+        from .proxy_target import ProxyTarget
+        target=ProxyTarget(self)
+        for task in (self.task,self.legacy_task):
+            registration=task.inspect()
+            if not registration.get('registered') or not registration.get('executable'):continue
+            command=[registration['executable'],*command_arguments('worker '+registration.get('arguments',''))[1:]]
+            try:target.validate_command(command)
+            except (ValueError,RuntimeError):continue
+            task.configure(command,autostart=False)
 
     def runtime(self):
         value=read_json(self.runtime_path)
@@ -286,7 +316,6 @@ class ObserverManager:
             # Persist rollback information before changing shared configuration.
             self.write_state(state)
             self.task.configure(self.supervisor_command(upstream),autostart=False)
-            self.configure_check()
             if self.cancelled.is_set():raise RuntimeError('프록시 켜기를 취소했습니다.')
             if previous_startup==state.get('managed_startup'):startup_value(None)
             backup=self.set_url(self.url)
@@ -299,7 +328,6 @@ class ObserverManager:
                 self.set_url(state.get('previous_url'))
             self.write_state(original_state)
             self.task.configure(self.supervisor_command(upstream),autostart=False)
-            self.check_task.remove()
             raise
         return self.status()
 
@@ -324,7 +352,9 @@ class ObserverManager:
         if current and (current==state.get('managed_startup') or ('--model-proxy' in current and str(self.home) in current)):
             startup_value(state.get('previous_startup'))
         warning=None
-        for task in (self.task,self.legacy_task,self.check_task):
+        try:self.cleanup_legacy_check()
+        except RuntimeError as exc:warning=str(exc)
+        for task in (self.task,self.legacy_task):
             try:task.remove()
             except RuntimeError as exc:warning=(warning+'\n' if warning else '')+str(exc)
         state.update(home=home_key(self.home),enabled=False,pending=False,phase='off',proof_at=0,proof_instance=None,
@@ -433,7 +463,6 @@ class ObserverManager:
         if not state.get('enabled') or self.config()[1].get('openai_base_url')!=self.url:
             return self.status()
         upstream=state.get('upstream') or self.upstream()
-        self.configure_check()
         health=self.health(timeout=3)
         if health:
             # Never start a second relay or replace a live legacy supervisor.
@@ -478,7 +507,7 @@ class ObserverManager:
         elif not configured and runtime.get('phase')=='draining':phase='draining'
         return {'enabled':bool(configured),'configured':configured,'running':health is not None,'validated':valid,'phase':phase,
                 'health':health,'service_issue':issue,'evidence_path':str(self.evidence),
-                'probe_state':self.health_state,'runtime':runtime,'app_version':VERSION,
+                'probe_state':self.health_state,'url':self.url,'runtime':runtime,'app_version':VERSION,
                 'update':update,
                 'running_proxy_path':self.running_path(health),
                 'target_proxy_version':PROXY_VERSION,'proxy_update_available':bool(health and health.get('version')!=PROXY_VERSION),

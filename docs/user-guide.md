@@ -45,7 +45,7 @@ Open **Codexon Connection Recovery** from Start and select **Restore direct conn
 
 After configuration restoration, finish current work and fully restart Codex. Restoring a setting does not prove that model communication has resumed. Manual recovery stays available even when automatic diagnosis reports a responding proxy. Other server settings and authentication are preserved. An unreadable configuration is not overwritten with guessed values.
 
-While proxy use is enabled, a Windows scheduled task checks local state briefly at login and every minute, including while the desktop app is closed. Two confirmed fault observations produce one notification that opens the same recovery tool. Uncertain delays do not trigger alerts or routing changes. Turning proxy use off removes scheduled checks. If recovery fails, preserve configuration and backups; never delete the whole `config.toml` or `.codex` folder.
+While the app is running, it checks local connection state every 15 seconds. Three matching confirmed faults observed at least 15 seconds apart produce one alert. Uncertain delays do not terminate connections. Normal app exit stops related services and leaves no independent periodic checker. After an app crash, reopen the app or use Start menu connection recovery. If recovery fails, preserve configuration and backups; never delete the whole `config.toml` or `.codex` folder.
 
 ## Safe bug reports
 
@@ -88,3 +88,5 @@ The source `--cache-worker` continuously analyzes natural requests, while `--cac
 For a source worker, start the GUI with matching `--index-path`, `--evidence-path`, and `--cache-control`. Run the worker independently through Windows Task Scheduler. Apply the new URL only to new connections and preserve ongoing conversations. Existing settings and history remain intact. Ending a diagnostic grant leaves passive collection and policy analysis running.
 
 **Quit** stops issuing new cache requests, waits for active responses, sent maintenance usage and record writes, then closes the worker, collector and analysis process. The exit progress window remains visible while waiting. Consent and remaining allowances are preserved; the next app launch resumes the same role. Closing to the tray keeps the app running. App updates and language restarts hand over services. Quit restores the app-owned route to direct access; an already running Codex client that cached the previous address needs a restart to adopt that route.
+
+After the new app and required background components are ready and previous processes have exited, Codexon removes old application and recovery folders identified by installation history, along with obsolete owned scheduled tasks. Items still in use or referenced by existing hooks are retained and checked again on the next app launch. Hook trust approval is not bypassed. Downloaded Setup files and the downloads folder are never deleted automatically.

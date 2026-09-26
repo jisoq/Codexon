@@ -73,7 +73,8 @@ class Activation:
         paths = [self.root/'installation.json', *shortcuts(isolated)]
         if not isolated:
             from .launch_context import preference_path
-            paths.append(preference_path())
+            from .installation import pointer_path
+            paths.extend([preference_path(),pointer_path()])
         self.state = dict(registry=snapshot_registry(isolated), files=[
             [str(p), base64.b64encode(p.read_bytes()).decode() if p.exists() else None] for p in paths])
         atomic_write(self.journal, json.dumps(self.state, ensure_ascii=False).encode())

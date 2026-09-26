@@ -458,7 +458,7 @@ class UsageIndex:
                 'homes': [str(h) for h in self.homes], 'errors': list(dict.fromkeys(self.errors)),
                 'unassigned': list(self.monitor.unassigned),
                 'excluded_title_sessions': sum(s.excluded_title for s in self.monitor.sessions.values()),
-                'quota':self.quota_by_home.get(str(self.homes[0])) if self.homes else None,
+                'quota_by_home':dict(self.quota_by_home),
                 'index': {'loading': bool(self.queue), 'done': min(self.done_files, len(self.files)),
                           'usage_complete':usage_complete,'last_usage_success':self.last_usage_success,
                           'files': len(self.files), 'bytes_read': self.bytes_read, 'version': self.version,

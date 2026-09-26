@@ -20,6 +20,15 @@ COLUMNS=(('snapshot','TEXT'),('round','INTEGER'),('anchor','REAL'),('scope_read_
     ('operation','TEXT'),('expected_cost','REAL'),('adverse_cost','REAL'),('output_high','INTEGER'),('read_required','INTEGER'),('purpose','TEXT'),('transport','TEXT'))
 
 
+def revoke_grants(path,home):
+    """Offline revocation needs only SQLite, never the request execution runtime."""
+    if not Path(path).exists():return
+    db=connect(path,timeout=5)
+    try:
+        db.execute("UPDATE cache_operating_grants SET stopped=COALESCE(stopped,'revoked') WHERE home=?",(str(home),))
+    finally:db.close()
+
+
 def connect(path,timeout=.5):
     if str(path)!=':memory:':Path(path).parent.mkdir(parents=True,exist_ok=True)
     db=sqlite3.connect(str(path),timeout=min(timeout,.05),isolation_level=None)
