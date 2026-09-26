@@ -28,7 +28,7 @@ public class Launcher {
  public static int Main(string[] a) {
   uint n=0; bool packaged=GetCurrentPackageFullName(ref n,IntPtr.Zero)==122;
   int code=1001;
-  if(packaged) { using(var p=Process.Start(new ProcessStartInfo(a[0],a[1]){UseShellExecute=false})) {p.WaitForExit();code=p.ExitCode;} }
+  if(packaged) { using(var p=Process.Start(new ProcessStartInfo(a[0],a[1]){UseShellExecute=false,CreateNoWindow=true})) {p.WaitForExit();code=p.ExitCode;} }
   File.WriteAllText(a[2],"{\"packaged\":"+packaged.ToString().ToLowerInvariant()+",\"exit_code\":"+code+"}");
   return code;
  }
@@ -73,10 +73,16 @@ public class Launcher {
     & $Python -B tools/run_ui_checks.py -- $Python -B tools/verify_installation.py --installer $Installer --broken-installer $BrokenInstaller --output (Join-Path $root 'installation')
     if ($LASTEXITCODE) { throw 'MSIX-origin installation checks failed' }
 } finally {
-    if ($package) { Remove-AppxPackage -Package $package.PackageFullName }
-    if ($certificate) {
-        Remove-Item -LiteralPath ('Cert:\LocalMachine\TrustedPeople\'+$certificate.Thumbprint) -ErrorAction SilentlyContinue
-        Remove-Item -LiteralPath ('Cert:\CurrentUser\My\'+$certificate.Thumbprint) -ErrorAction SilentlyContinue
+    try {
+        if ($package) { Remove-AppxPackage -Package $package.PackageFullName }
+    } finally {
+        if ($certificate) {
+            foreach ($store in @('Cert:\LocalMachine\TrustedPeople\','Cert:\CurrentUser\My\')) {
+                $path=$store+$certificate.Thumbprint
+                if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path }
+                if (Test-Path -LiteralPath $path) { throw 'Test signing certificate cleanup failed' }
+            }
+        }
+        Remove-Item Env:CODEXON_QA_PACKAGE_FAMILY,Env:CODEXON_QA_PACKAGE_LAUNCHER,Env:CODEXON_QA_PACKAGE_REPORTS -ErrorAction SilentlyContinue
     }
-    Remove-Item Env:CODEXON_QA_PACKAGE_FAMILY,Env:CODEXON_QA_PACKAGE_LAUNCHER,Env:CODEXON_QA_PACKAGE_REPORTS -ErrorAction SilentlyContinue
 }

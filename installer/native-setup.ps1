@@ -81,9 +81,26 @@ if (!$Worker) {
 
 $exitCode = 1001
 $result = @{}
+$mutex = $null
+$ownsMutex = $false
 try {
     [uint32]$size = 0
     if ([SetupEnvironment]::GetCurrentPackageFullName([ref]$size,[IntPtr]::Zero) -ne 15700) { throw 'Native Windows environment was not established' }
+    $registry = Read-Request 'registry'
+    if ($registry -notin @('Codexon','Codexon-QA')) { throw 'Unknown installation identity' }
+    $mutex = New-Object Threading.Mutex $false,('Local\'+$registry+'.NativeInstaller')
+    $ownsMutex = $mutex.WaitOne(0)
+    if (!$ownsMutex) { throw 'Another installation is already running' }
+    $uninstallKey = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\'+$registry+'_is1'
+    $previousMetadata = @{}
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($uninstallKey)
+    if ($key) {
+        try {
+            foreach ($name in @('DisplayIcon','DisplayVersion','UninstallString','QuietUninstallString','InstallLocation')) {
+                if ($key.GetValueNames() -contains $name) { $previousMetadata[$name] = $key.GetValue($name) }
+            }
+        } finally { $key.Dispose() }
+    }
     $stage = Split-Path -Parent $Request
     $setup = Join-Path $stage 'Codexon-Setup.exe'
     if ((Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash -ne (Read-Request 'sha256')) { throw 'Native installer hash mismatch' }
@@ -99,12 +116,25 @@ try {
     $arguments += Quote-Argument ('/CODEXONREQUEST='+$Request)
     $process = Start-Process -FilePath $setup -ArgumentList $arguments -PassThru -Wait
     $exitCode = $process.ExitCode
+    # Inno writes its uninstall metadata before the activation transaction.
+    # A failed upgrade must not leave its icon/version pointing at that payload.
+    if ($exitCode -ne 0 -and $previousMetadata.Count) {
+        $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($uninstallKey)
+        try {
+            foreach ($name in $previousMetadata.Keys) {
+                $key.SetValue($name,$previousMetadata[$name],[Microsoft.Win32.RegistryValueKind]::String)
+                if ($key.GetValue($name) -ne $previousMetadata[$name]) { throw 'Uninstall metadata rollback failed' }
+            }
+        } finally { $key.Dispose() }
+    }
     $result.exit_code = $exitCode
 } catch {
     $result.error = $_.Exception.Message
     $result.exit_code = 1001
     $exitCode = 1001
 } finally {
+    if ($ownsMutex) { $mutex.ReleaseMutex() }
+    if ($mutex) { $mutex.Dispose() }
     $result | ConvertTo-Json | Set-Content -LiteralPath (Join-Path (Split-Path -Parent $Request) 'result.json') -Encoding utf8
 }
 exit $exitCode
