@@ -60,18 +60,19 @@ def test_uninstall_defers_when_any_payload_process_is_in_use(tmp_path,monkeypatc
 
 
 @pytest.mark.parametrize('same_request',[True,False])
-def test_native_uninstall_exempts_only_its_waiting_dispatcher(tmp_path,monkeypatch,same_request):
+@pytest.mark.parametrize('callers',[[42],[42,43]])
+def test_native_uninstall_exempts_only_its_waiting_dispatcher(tmp_path,monkeypatch,same_request,callers):
     import sys
     from cachemonitor import observer_task
     exe=tmp_path/'maintenance'/'new'/'CodexonRecovery.exe'
     monkeypatch.setattr(sys,'executable',str(exe))
     root=tmp_path if same_request else tmp_path/'other'
     command=f'"{exe}" --prepare-uninstall --install-root "{root}"'
-    monkeypatch.setattr(install,'processes_under',lambda root:[dict(ExecutablePath=str(exe),ProcessId=42,CommandLine=command)])
+    monkeypatch.setattr(install,'processes_under',lambda root:[dict(ExecutablePath=str(exe),ProcessId=pid,CommandLine=command) for pid in callers])
     monkeypatch.setattr(observer_task,'remove_installation_collectors',lambda root:None)
-    if same_request:assert install.prepare_uninstall(tmp_path,isolated=True,caller_pid=42)['ready']
+    if same_request:assert install.prepare_uninstall(tmp_path,isolated=True,caller_pid=callers)['ready']
     else:
-        with pytest.raises(RuntimeError,match='끝난 뒤'):install.prepare_uninstall(tmp_path,isolated=True,caller_pid=42)
+        with pytest.raises(RuntimeError,match='끝난 뒤'):install.prepare_uninstall(tmp_path,isolated=True,caller_pid=callers)
 
 
 @pytest.mark.parametrize('busy',[False,True])

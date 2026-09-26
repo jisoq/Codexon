@@ -206,6 +206,7 @@ def connection_manager():
 
 def prepare_uninstall(root, *, isolated=False, caller_pid=None):
     root=Path(root).resolve()
+    callers=set(caller_pid if isinstance(caller_pid,list) else [caller_pid])
     with ProcessLock(root/'install.lock',timeout=5):
         from .installation import installed
         registration = installed() if not isolated else {}
@@ -230,7 +231,7 @@ def prepare_uninstall(root, *, isolated=False, caller_pid=None):
             name=Path(process['ExecutablePath']).name.lower()
             if name.startswith('unins'):continue
             if process['ProcessId'] in (os.getpid(),os.getppid()) and Path(process['ExecutablePath']).resolve()==Path(sys.executable).resolve():continue
-            if process['ProcessId']==caller_pid and Path(process['ExecutablePath']).resolve()==Path(sys.executable).resolve():
+            if process['ProcessId'] in callers and Path(process['ExecutablePath']).resolve()==Path(sys.executable).resolve():
                 from .launch_context import command_arguments
                 from .proxy_target import option
                 arguments=command_arguments(process.get('CommandLine') or '')
