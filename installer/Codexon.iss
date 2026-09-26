@@ -95,6 +95,7 @@ begin
   Request := ExpandConstant('{tmp}\native-request.ini');
   SetIniString('request', 'source', Source, Request);
   SetIniString('request', 'sha256', GetSHA256OfFile(Source), Request);
+  SetIniString('request', 'registry', '{#RegistryName}', Request);
   Count := 0;
   for I := 1 to ParamCount do begin
     Arg := ParamStr(I); Lower := Lowercase(Arg);

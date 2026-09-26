@@ -62,7 +62,13 @@ def prevent_receipt_replace(path):
 
 def launch_snapshot(root):
     from cachemonitor.install_activation import shortcuts,snapshot_registry
+    uninstall={}
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER,r'Software\Microsoft\Windows\CurrentVersion\Uninstall\Codexon-QA_is1') as key:
+        for name in ('DisplayIcon','DisplayVersion','UninstallString','QuietUninstallString','InstallLocation'):
+            try:uninstall[name]=winreg.QueryValueEx(key,name)
+            except FileNotFoundError:pass
     return dict(registry=snapshot_registry(True),receipt=(root/'installation.json').read_bytes(),
+                uninstall=uninstall,
                 links={str(p):p.read_bytes() if p.exists() else None for p in shortcuts(True)})
 
 
@@ -143,6 +149,8 @@ def main():
     assert run([*command,f'/LOG={root / "install.log"}'])==0
     first=registration();assert Path(first['InstallRoot'])==install
     assert Path(first['AppPath']).is_file() and Path(first['RecoveryPath']).is_file()
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER,r'Software\Microsoft\Windows\CurrentVersion\Uninstall\Codexon-QA_is1') as key:
+        assert Path(winreg.QueryValueEx(key,'DisplayIcon')[0].strip('"'))==Path(first['AppPath'])
     from cachemonitor.install_activation import shortcuts
     from cachemonitor.shell_shortcut import application_id
     recovery_link=next(p for p in shortcuts(True)[1:] if p.exists())
@@ -158,6 +166,8 @@ def main():
     assert not (install/'activation-pending.json').exists()
     assert run([*command,f'/LOG={root / "update.log"}'])==0
     second=registration()
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER,r'Software\Microsoft\Windows\CurrentVersion\Uninstall\Codexon-QA_is1') as key:
+        assert Path(winreg.QueryValueEx(key,'DisplayIcon')[0].strip('"'))==Path(second['AppPath'])
     assert first['AppPath']!=second['AppPath'] and Path(first['AppPath']).is_file()
     assert read_json(install/'installation.json')['previous']==str(Path(first['AppPath']).parent)
     verify_cleanup(first,second,root)
