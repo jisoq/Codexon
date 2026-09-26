@@ -54,6 +54,8 @@ english.ActivationFailure=Codexon could not be activated. Existing launch paths 
 korean.ActivationFailure=Codexon 설치를 완료하지 못했습니다. 기존 실행 경로와 기록은 보존됩니다. 설치 폴더의 install-result.json을 확인하세요.
 english.ActivationFailureTitle=Installation not completed
 korean.ActivationFailureTitle=설치를 완료하지 못했습니다
+english.NativeFailure=Installation did not complete. Check the installation log for details.
+korean.NativeFailure=설치가 완료되지 않았습니다. 설치 로그에서 원인을 확인해 주세요.
 
 [Files]
 Source: "native-setup.ps1"; Flags: dontcopy
@@ -73,6 +75,7 @@ external 'ExitProcess@kernel32.dll stdcall';
 
 function NativeSetup: Boolean;
 var Request, Params, Arg, Lower, Script, Source: String; Proof: AnsiString;
+    Lines: TArrayOfString;
     I, Count, Code: Integer; Service, Task: Variant;
 begin
   Source := ExpandConstant('{srcexe}');
@@ -93,9 +96,10 @@ begin
   ExtractTemporaryFile('native-setup.ps1');
   Script := ExpandConstant('{tmp}\native-setup.ps1');
   Request := ExpandConstant('{tmp}\native-request.ini');
-  SetIniString('request', 'source', Source, Request);
-  SetIniString('request', 'sha256', GetSHA256OfFile(Source), Request);
-  SetIniString('request', 'registry', '{#RegistryName}', Request);
+  SetArrayLength(Lines,3);
+  Lines[0] := 'source='+Source;
+  Lines[1] := 'sha256='+GetSHA256OfFile(Source);
+  Lines[2] := 'registry={#RegistryName}';
   Count := 0;
   for I := 1 to ParamCount do begin
     Arg := ParamStr(I); Lower := Lowercase(Arg);
@@ -103,17 +107,22 @@ begin
     if (Lower='/silent') or (Lower='/verysilent') or (Lower='/suppressmsgboxes') or
        (Lower='/norestart') or (Lower='/sp-') or (Lower='/log') or
        (Pos('/log=',Lower)=1) or (Pos('/dir=',Lower)=1) or (Pos('/lang=',Lower)=1) then begin
-      SetIniString('request','arg'+IntToStr(Count),Arg,Request);
+      SetArrayLength(Lines,Count+4);
+      Lines[Count+3] := 'arg'+IntToStr(Count)+'='+Arg;
       Count := Count+1;
     end;
   end;
-  SetIniString('request','count',IntToStr(Count),Request);
+  SetArrayLength(Lines,Count+4);
+  Lines[Count+3] := 'count='+IntToStr(Count);
+  if not SaveStringsToUTF8File(Request,Lines,False) then RaiseException('Cannot write the installation request');
   Params := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File '+AddQuotes(Script)+' -Request '+AddQuotes(Request);
-  if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Params,
-              '', SW_HIDE, ewWaitUntilTerminated, Code) then Code := 1001;
+  if not ExecAndLogOutput(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Params,
+              '', SW_HIDE, ewWaitUntilTerminated, Code, nil) then Code := 1001;
   DeleteFile(Script);
   DeleteFile(Request);
   RemoveDir(ExpandConstant('{tmp}'));
+  if (Code <> 0) and (Code <> 2) then
+    SuppressibleMsgBox(CustomMessage('NativeFailure'), mbError, MB_OK, IDOK);
   { Returning False would report cancellation even after a successful worker. }
   ExitBootstrap(Code);
   Result := False;

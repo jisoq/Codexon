@@ -13,17 +13,16 @@ trap {
 }
 Add-Type @'
 using System;
-using System.Text;
 using System.Runtime.InteropServices;
 public static class SetupEnvironment {
- [DllImport("kernel32.dll", CharSet=CharSet.Unicode)] public static extern uint GetPrivateProfileString(string section,string key,string fallback,StringBuilder value,uint size,string path);
  [DllImport("kernel32.dll", CharSet=CharSet.Unicode)] public static extern int GetCurrentPackageFullName(ref uint size,IntPtr name);
 }
 '@
 function Read-Request([string]$Key) {
-    $value = New-Object Text.StringBuilder 32768
-    [void][SetupEnvironment]::GetPrivateProfileString('request',$Key,'',$value,32768,$Request)
-    return $value.ToString()
+    foreach ($line in [IO.File]::ReadAllLines($Request,[Text.Encoding]::UTF8)) {
+        if ($line.StartsWith($Key+'=',[StringComparison]::Ordinal)) { return $line.Substring($Key.Length+1) }
+    }
+    throw ('Missing installer request field: '+$Key)
 }
 function Quote-Argument([string]$Value) {
     return '"' + ($Value -replace '(\\*)"','$1$1\"' -replace '(\\+)$','$1$1') + '"'

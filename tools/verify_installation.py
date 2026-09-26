@@ -5,6 +5,7 @@ from ctypes import wintypes as W
 import json
 import os
 import base64
+import shutil
 from pathlib import Path
 import socket
 import subprocess
@@ -133,6 +134,12 @@ def main():
     if args.broken_installer:require_qa_installer(args.broken_installer)
     if registration():raise RuntimeError('An existing QA installation must be preserved; use a clean QA environment')
     root=args.output.resolve();root.mkdir(parents=True,exist_ok=False)
+    # Exercise paths that cannot round-trip through the current ANSI code page.
+    download=root/'download \u6e2c\u8a66\U0001f642'
+    download.mkdir()
+    copied=download/'Codexon-Setup.exe'
+    shutil.copy2(args.installer,copied)
+    args.installer=copied
     # Keep installed Qt resource paths within Windows' installer path limit.
     # Evidence paths may be descriptive and much longer than the install root.
     install=Path(__file__).resolve().parents[1]/'artifacts'/('qa-'+uuid.uuid4().hex[:8])
@@ -198,11 +205,12 @@ def main():
     assert run([*uninstall,f'/LOG={root / "uninstall.log"}'])==0
     assert not registration() and not Path(second['AppPath']).exists()
     assert record.read_text()=='existing user record'
-    result=dict(passed=True,install=True,reinstall=True,old_payload_preserved_until_ready=True,old_payload_cleaned=True,
+    result=dict(passed=True,install=True,reinstall=True,unicode_download_path=True,old_payload_preserved_until_ready=True,old_payload_cleaned=True,
                 busy_uninstall_deferred=True,uninstall=True,records_preserved=True,
                 receipt_failure_restored=True,runtime_failure_restored=bool(args.broken_installer),
                 first_failure_removable=bool(args.broken_installer))
     (root/'result.json').write_text(json.dumps(result,indent=2));print(json.dumps(result))
+    copied.unlink();download.rmdir()
 
 
 if __name__=='__main__':main()
