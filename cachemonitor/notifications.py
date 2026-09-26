@@ -169,21 +169,18 @@ class ConfirmedNotifications:
         return events
 
     def proxy(self,result):
+        from .connection_recovery import assess
         now=self.clock()
-        state=result.get('probe_state','unknown')
-        if result.get('configured') is False:
-            if self.incident:self.incident['resolution']='프록시 사용 해제'
+        assessed=assess({**result,'configured':result.get('configured',False)})
+        state=assessed['code']
+        if state in ('direct','responding'):
+            if self.incident:self.incident['resolution']='프록시 사용 해제' if state=='direct' else '정상 식별 응답 확인'
             self.incident=None;self.streak=None
             return []
-        if state=='healthy' and result.get('configured') is True:
-            if self.incident:self.incident['resolution']='정상 식별 응답 확인'
-            self.incident=None;self.streak=None
-            return []
-        if (not self.proxy_enabled or result.get('configured') is not True
-                or state not in ('refused','identity_mismatch')):
+        if not self.proxy_enabled or not assessed['confirmed']:
             self.streak=None
             return []
-        if self.incident:return []
+        if self.incident and self.incident.get('code')==state:return []
         if self.streak is None or self.streak[0]!=state or now-self.streak[2]>45:
             self.streak=[state,now,now,1]
             return []
@@ -192,9 +189,11 @@ class ConfirmedNotifications:
         if self.streak[3]<3 or now-self.streak[1]<30:return []
         if state=='refused':
             title='로컬 프록시 연결 거부'
-            detail='127.0.0.1:8768 연결이 15초 이상 간격으로 3회 거부됐습니다. 설정 → 프록시에서 확인하세요.'
-        else:
+            detail=f"{result.get('url') or '설정된 프록시'} 연결이 15초 이상 간격으로 3회 거부됐습니다. 설정 → 프록시에서 확인하세요."
+        elif state=='identity_mismatch':
             title='프록시 식별 정보 불일치'
             detail='설정된 모델 관측 서비스와 응답의 식별 정보가 3회 다르게 확인됐습니다. 설정 → 프록시에서 확인하세요.'
+        else:title,detail=assessed['title'],assessed['detail']
         self.incident=self.record('proxy',title,detail)
+        self.incident['code']=state
         return [self.incident]

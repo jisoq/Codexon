@@ -1,4 +1,4 @@
-"""Offline recovery and bounded scheduled checks. No Qt, login or model calls."""
+"""Offline, user-invoked connection recovery. No Qt, login or model calls."""
 from __future__ import annotations
 
 import argparse
@@ -11,7 +11,6 @@ import subprocess
 import threading
 import time
 from urllib.parse import urlsplit
-from xml.sax.saxutils import escape
 
 from .model_evidence import default_path, home_key
 from .observer_control import ObserverManager, URL, atomic_write
@@ -20,6 +19,15 @@ from .translation_catalog import translate as tr
 
 
 def target(home=None, directory=None, url=None):
+    from .launch_context import cache_paths, resolve_homes
+    paths = cache_paths()
+    if paths.get('index_path') and paths.get('evidence_path'):
+        selected = resolve_homes()[0]
+        if ((home is None or Path(home).resolve()==Path(selected).resolve()) and
+                (directory is None or Path(directory).resolve()==Path(paths['evidence_path']).resolve().parent)):
+            from .cache_worker_control import CacheWorkerManager
+            manager = CacheWorkerManager(selected, paths['index_path'], paths['evidence_path'])
+            if url is None or url==manager.url:return manager
     directory = Path(directory) if directory else default_path().parent
     state = read_json(directory / 'model-observer.json')
     home = Path(home or state.get('home') or os.environ.get('CODEX_HOME') or Path.home()/'.codex')
@@ -44,7 +52,7 @@ def inspect(manager):
 
 
 def assess(status):
-    """Use the same interpretation in the GUI, scheduled checks and recovery window."""
+    """Use the same interpretation in the GUI and recovery window."""
     if not status['configured']:
         restart = status.get('restart_required', False)
         return dict(code='direct', confirmed=False, can_recover=True, status=status,
@@ -88,70 +96,6 @@ def restore(manager):
     if status.get('cleanup_warning'):
         detail+=' 예약 작업 해제가 완료되지 않았습니다. 이 도구에서 복원을 다시 실행해 주세요.'
     return dict(code='restored', title='연결 설정 복원 완료',detail=detail)
-
-
-def notification_uri(manager):
-    data = json.dumps(dict(home=str(manager.home), directory=str(manager.directory), url=manager.url)).encode()
-    return 'codexon-recovery:' + base64.urlsafe_b64encode(data).decode()
-
-
-def notify(manager, result):
-    if os.name != 'nt':
-        return False
-    from .installation import installed
-    if not installed():
-        return False  # Portable users retain the standalone manual tool.
-    import winreg
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,r'Software\CacheMonitor\CacheMonitor\notifications') as key:
-            for name in ('enabled','proxy_failure'):
-                try:value=winreg.QueryValueEx(key,name)[0]
-                except FileNotFoundError:continue
-                if str(value).lower() in ('false','0'):return False
-    except FileNotFoundError:pass
-    xml = ('<toast activationType="protocol" launch="'+escape(notification_uri(manager), {'"':'&quot;'})+'">'
-           '<visual><binding template="ToastGeneric"><text>'+escape(tr('Codexon 연결 확인'))+'</text><text>'
-           +escape(tr(result['title']))+'</text><text>'+escape(tr('눌러서 연결 복구 열기'))+'</text></binding></visual></toast>')
-    encoded = base64.b64encode(xml.encode()).decode()
-    script = """
-$ErrorActionPreference='Stop'
-[Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,ContentType=WindowsRuntime] > $null
-[Windows.Data.Xml.Dom.XmlDocument,Windows.Data.Xml.Dom.XmlDocument,ContentType=WindowsRuntime] > $null
-$xml=New-Object Windows.Data.Xml.Dom.XmlDocument
-$xml.LoadXml([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__XML__')))
-$toast=[Windows.UI.Notifications.ToastNotification]::new($xml)
-$toast.Tag='connection'
-$toast.Group='Codexon'
-[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('Codexon.Recovery').Show($toast)
-""".replace('__XML__', encoded)
-    code = base64.b64encode(script.encode('utf-16-le')).decode()
-    result = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-EncodedCommand', code],
-                            capture_output=True, timeout=12, creationflags=subprocess.CREATE_NO_WINDOW)
-    return result.returncode == 0
-
-
-def check_once(manager, *, notification=notify, now=None):
-    now = time.time() if now is None else now
-    # A second scheduled invocation exits; it never competes for configuration locks.
-    try:
-        with ProcessLock(manager.directory/'connection-check.lock'):
-            result = inspect(manager)
-            path = manager.directory/'connection-check.json'
-            prior = read_json(path)
-            same = prior.get('code') == result['code'] and 5 <= now-prior.get('at', 0) <= 180
-            count = prior.get('count', 0)+1 if same else 1
-            notified = prior.get('notified_code') == result['code']
-            # Two separate confirmed observations; unknowns never produce alerts.
-            if result['confirmed'] and count >= 2 and not notified:
-                notified = notification(manager, result)
-            notified_code=result['code'] if notified else prior.get('notified_code')
-            if result['code'] in ('direct','responding'):notified_code=None
-            atomic_write(path, json.dumps(dict(code=result['code'], at=now, count=count,
-                                               notified=notified,notified_code=notified_code,
-                                               title=result['title']), ensure_ascii=False).encode())
-            return result
-    except RuntimeError:
-        return dict(code='busy', confirmed=False)
 
 
 class RecoveryWindow:
@@ -229,7 +173,6 @@ def main(argv=None):
     parser.add_argument('--codex-home', type=Path)
     parser.add_argument('--data-dir', type=Path)
     parser.add_argument('--proxy-url')
-    parser.add_argument('--check', action='store_true')
     parser.add_argument('--status', action='store_true')
     parser.add_argument('--restore', action='store_true')
     parser.add_argument('--report', type=Path)
@@ -238,15 +181,22 @@ def main(argv=None):
     parser.add_argument('--prepare-uninstall', action='store_true')
     parser.add_argument('--isolated-install', action='store_true')
     parser.add_argument('--no-launch', action='store_true')
+    parser.add_argument('--native-install', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--language', choices=('en','ko'))
     parser.add_argument('--ui-smoke', type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     if args.language:os.environ['CODEXON_LANGUAGE']=args.language
     if args.install_root:
         from .install_management import finish, prepare_uninstall
+        from .install_dispatch import packaged_context, native_install
         import sys
         try:
-            if args.prepare_uninstall:
+            packaged=packaged_context()
+            if args.native_install and packaged:
+                raise RuntimeError('Windows 기본 환경에서 설치를 시작하지 못했습니다. 기존 설치를 유지합니다.')
+            if packaged:
+                result=native_install(args)
+            elif args.prepare_uninstall:
                 result=prepare_uninstall(args.install_root,isolated=args.isolated_install)
             else:
                 result=finish(args.install_root,args.product_dir,Path(sys.executable),
@@ -264,8 +214,7 @@ def main(argv=None):
         except (ValueError, KeyError, TypeError):parser.error('Invalid recovery link')
     try:
         manager = target(args.codex_home, args.data_dir, args.proxy_url)
-        if args.check:result = check_once(manager)
-        elif args.restore:result = restore(manager)
+        if args.restore:result = restore(manager)
         elif args.status:result = inspect(manager)
         else:
             window=RecoveryWindow(manager)

@@ -104,71 +104,21 @@ def empty_snapshot(homes,path,now):
         index=dict(loading=True,done=0,files=0,bytes_read=0,version=0,path=str(path)))
 
 
+def collector_command(channel):
+    parts=[sys.executable]
+    if not getattr(sys,'frozen',False):parts.append(str(Path(__file__).resolve().parents[1]/'run.py'))
+    parts+=['--usage-collector','--index-path',str(channel.path)]
+    if channel.index_path is None:parts.append('--default-index')
+    for home in channel.homes:parts+=['--codex-home',home]
+    if channel.evidence:parts+=['--evidence-path',str(channel.evidence)]
+    return parts
+
+
 class CollectionClient:
     """GUI/cache clients never instantiate a source index or acquire its lock."""
-    def __init__(self,homes,path=None,model_evidence_path=None,*,autostart=True):
+    def __init__(self,homes,path=None,model_evidence_path=None):
         self.channel=CollectionChannel(homes,path,model_evidence_path)
-        self.path=self.channel.path;self.next_start=0;self.autostart=autostart
-
-    def command(self):
-        parts=[sys.executable]
-        if not getattr(sys,'frozen',False):parts.append(str(Path(__file__).resolve().parents[1]/'run.py'))
-        parts+=['--usage-collector','--index-path',str(self.path)]
-        if self.channel.index_path is None:parts.append('--default-index')
-        for home in self.channel.homes:parts+=['--codex-home',home]
-        if self.channel.evidence:parts+=['--evidence-path',str(self.channel.evidence)]
-        return parts
-
-    def ensure_service(self,now,snapshot):
-        if not self.autostart or now<self.next_start:return
-        from .observer_state import read_json
-        session=read_json(self.channel.companion('.session.json'))
-        if session.get('scope')==self.channel.scope and session.get('stopped'):return
-        legacy_lock=self.path.with_suffix('.collector.lock')
-        if legacy_lock.exists() and locked(legacy_lock):
-            from .collection_lifecycle import retire_legacy
-            from .observer_task import ObserverTask
-            self.next_start=now+30
-            with ProcessLock(self.channel.companion('.collector-update.lock')):
-                # Retarget crash recovery before asking the exact old instance
-                # to commit and stop. Multi-instance prevention stays enabled.
-                task=ObserverTask(str(self.path),role='UsageCollector')
-                task.configure(self.command(),autostart=False)
-                retire_legacy(self.channel)
-                task.start(self.command(),autostart=False)
-            return
-        collection=(snapshot or {}).get('collection',{})
-        version=collection.get('version')
-        newer=bool(version and tuple(int(p) for p in version.split('.') if p.isdigit())>
-                   tuple(int(p) for p in VERSION.split('.')))
-        different_binary=bool(getattr(sys,'frozen',False) and
-            collection.get('executable')!=str(Path(sys.executable).resolve()))
-        if different_binary and version==VERSION:
-            from .installation import installed
-            active=installed().get('AppPath')
-            if active and Path(active).resolve()!=Path(sys.executable).resolve():different_binary=False
-        replace=bool(collection and not newer and (version!=VERSION or different_binary))
-        if newer:return
-        if snapshot and now-snapshot['ts']<=30 and not replace and locked(self.channel.companion('.collector.lock')):return
-        self.next_start=now+30
-        from .observer_task import ObserverTask
-        # Task Scheduler owns lifetime/restart outside the GUI's process tree.
-        # Only the dedicated executable acquires the source collector lock.
-        task=ObserverTask(str(self.path),role='UsageCollector')
-        if replace:
-            # Register the replacement before requesting a cooperative stop.
-            # Never terminate a GUI, cache worker, or active proxy connection.
-            with ProcessLock(self.channel.companion('.collector-update.lock')):
-                current=self.channel.read()
-                if not current or current.get('collection',{}).get('instance')!=collection['instance']:return
-                task.configure(self.command(),autostart=False)
-                self.channel.db.execute('INSERT OR REPLACE INTO control VALUES(?,?)',(collection['instance'],'stop'))
-                self.channel.db.commit()
-                deadline=time.monotonic()+3
-                while locked(self.channel.companion('.collector.lock')):
-                    if time.monotonic()>=deadline:raise RuntimeError('백그라운드 수집기 교체 대기')
-                    time.sleep(.05)
-        task.start(self.command(),autostart=False)
+        self.path=self.channel.path
 
     def poll(self,now=None):
         now=now or time.time()
@@ -178,18 +128,13 @@ class CollectionClient:
             snapshot['errors']=[str(error)];snapshot['index']['loading']=False
             return snapshot
         self.channel.subscribe(now)
-        start_error=False
-        try:self.ensure_service(now,snapshot)
-        except (OSError,RuntimeError,subprocess.SubprocessError):start_error=True
         if snapshot is None:snapshot=empty_snapshot(self.channel.homes,self.path,now)
         elif now-snapshot['ts']>30:
             snapshot['errors']=list(dict.fromkeys([*snapshot.get('errors',[]),'수집 결과 갱신 지연']))
             snapshot['usage_collection_complete']=False
             snapshot['index']={**snapshot['index'],'usage_complete':False}
-        if start_error:snapshot['errors']=[*snapshot.get('errors',[]),'백그라운드 수집기 시작 지연']
         homes=set(self.channel.homes)
-        primary_matches=bool(snapshot['homes'] and self.channel.homes and snapshot['homes'][0]==self.channel.homes[0])
-        if not primary_matches:snapshot['quota']=None
+        snapshot['quota_by_home']={home:quota for home,quota in snapshot.get('quota_by_home',{}).items() if home in homes}
         if set(snapshot['homes'])!=homes:
             missing=not homes.issubset(snapshot['homes'])
             snapshot={**snapshot,'homes':self.channel.homes,
@@ -201,7 +146,7 @@ class CollectionClient:
                 snapshot['usage_collection_complete']=False
             # The GUI registers all monitored homes. Cache consumers need only
             # status; never expose aggregates from other homes.
-            snapshot['cache_management']={};snapshot['quota']=None
+            snapshot['cache_management']={}
         snapshot['homes']=self.channel.homes
         return snapshot
 
@@ -221,6 +166,10 @@ class CollectorService:
         try:self.lock.__enter__()
         except BaseException:self.channel.close();raise
         self.index=None;self.epoch=uuid.uuid4().hex;self.instance=uuid.uuid4().hex;self.sequence=0;self.last=None
+        self.executable=str(Path(sys.executable).resolve())
+        if os.name=='nt':
+            from .proxy_identity import process_identity
+            self.executable=process_identity(os.getpid())['executable']
 
     def stopping(self):
         from .observer_state import read_json
@@ -237,7 +186,7 @@ class CollectorService:
         snapshot=self.index.poll(now)
         snapshot={**snapshot,'sessions':[dict(s,usage_revision=f'{self.epoch}:{s.get("usage_revision")}') for s in snapshot['sessions']],
             'collection':dict(pid=os.getpid(),instance=self.instance,version=VERSION,
-                executable=str(Path(sys.executable).resolve()))}
+                executable=self.executable)}
         self.sequence+=1;self.channel.publish(snapshot,self.epoch,self.sequence);self.last=snapshot
         return snapshot
 
@@ -246,16 +195,6 @@ class CollectorService:
             if self.index:self.index.close();self.index=None
             self.channel.close()
         finally:self.lock.__exit__(None,None,None)
-
-
-def resume_collection(homes,path=None,evidence=None):
-    """Only an explicit GUI launch resumes collection after application exit."""
-    from .observer_control import atomic_write
-    channel=CollectionChannel(homes,path,evidence)
-    try:
-        with ProcessLock(channel.companion('.collector-update.lock'),timeout=30):
-            atomic_write(channel.companion('.session.json'),json.dumps(dict(scope=channel.scope,stopped=False)).encode())
-    finally:channel.close()
 
 
 def main():
@@ -280,13 +219,13 @@ def main():
 def isolated_collector(homes,path,evidence=None,*,reuse=False):
     """QA owns a dedicated child service; never register a persistent test task."""
     import subprocess
-    client=CollectionClient(homes,path,evidence,autostart=False)
+    client=CollectionClient(homes,path,evidence)
     try:previous=client.channel.read()
     except BaseException:client.close();raise
     if reuse and previous and locked(client.channel.companion('.collector.lock')):
         client.close();return lambda:None
     instance=uuid.uuid4().hex
-    child=subprocess.Popen(client.command()+['--instance',instance],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
+    child=subprocess.Popen(collector_command(client.channel)+['--instance',instance],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
         creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0)
     def cleanup():
         if child.poll() is None and instance:

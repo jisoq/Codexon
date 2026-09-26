@@ -94,15 +94,15 @@ class ObserverTask:
         self.name='CacheMonitor-'+role+'-'+hashlib.sha256(str(home).encode()).hexdigest()[:12]
         self.marker='CacheMonitor model observer: '+str(home)
 
-    def call(self, operation, command=None, autostart=False, periodic=False):
+    def call(self, operation, command=None, autostart=False):
         if os.name!='nt':
             raise RuntimeError('독립 프록시 실행은 Windows 작업 스케줄러가 필요합니다')
         payload=base64.b64encode(json.dumps({'name':self.name,'marker':self.marker,'operation':operation,
             'executable':command[0] if command else '',
             'arguments':subprocess.list2cmdline(command[1:]) if command else '',
-            'autostart':bool(autostart),'periodic':bool(periodic),
+            'autostart':bool(autostart) if self.role not in ('ModelObserver','ProxySupervisor','CacheObservation','CacheObservationV2','CacheWorker','UsageCollector') else False,
             'update_watchdog':self.role=='ProxyUpdate',
-            'restart':3 if self.role in ('ModelObserver','ProxySupervisor','ProxyUpdate','CacheObservation','CacheObservationV2','CacheWorker','UsageCollector') else 0}).encode()).decode()
+            'restart':3 if self.role=='ProxyUpdate' else 0}).encode()).decode()
         script=r'''
 $ErrorActionPreference='Stop'
 [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
@@ -161,7 +161,6 @@ $definition.RegistrationInfo.Description=$p.marker
 $definition.Settings.Enabled=$true
 $definition.Settings.AllowDemandStart=$true
 $definition.Settings.ExecutionTimeLimit='PT0S'
-if($p.periodic){$definition.Settings.ExecutionTimeLimit='PT45S'}
 $definition.Settings.MultipleInstances=2
 $definition.Settings.DisallowStartIfOnBatteries=$false
 $definition.Settings.StopIfGoingOnBatteries=$false
@@ -172,7 +171,7 @@ $definition.Principal.RunLevel=0
 $user=[Security.Principal.WindowsIdentity]::GetCurrent().Name
 $definition.Principal.UserId=$user
 if($p.autostart){$trigger=$definition.Triggers.Create(9);$trigger.UserId=$user;$trigger.Enabled=$true}
-if($p.periodic -or $p.update_watchdog){
+if($p.update_watchdog){
     $trigger=$definition.Triggers.Create(1)
     $trigger.StartBoundary=(Get-Date).AddSeconds(10).ToString('yyyy-MM-ddTHH:mm:ss')
     $trigger.Repetition.Interval='PT1M'
@@ -195,7 +194,6 @@ if($p.operation -eq 'run'){[void]$registered.Run($null)}
 
     def start(self,command,autostart=False):return self.call('run',command,autostart)
     def configure(self,command,autostart):return self.call('configure',command,autostart)
-    def periodic(self,command):return self.call('configure',command,True,periodic=True)
     def remove(self):return self.call('remove')
     def inspect(self):return self.call('inspect')
     def stop(self):return self.call('stop')

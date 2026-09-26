@@ -9,19 +9,44 @@ import sys
 KEY = r'Software\Codexon'
 
 
+def pointer_path():
+    # Registry/AppData overlays in a packaged caller can retain an old install.
+    return Path.home()/'.cachemonitor'/'installation.json'
+
+
+def valid_paths(value):
+    try:
+        root=Path(value['InstallRoot']).resolve()
+        app=Path(value['AppPath']).resolve();recovery=Path(value['RecoveryPath']).resolve()
+        return (app.name=='Codexon.exe' and recovery.name=='CodexonRecovery.exe'
+                and app.is_relative_to(root/'versions') and recovery.is_relative_to(root/'maintenance')
+                and app.is_file() and recovery.is_file())
+    except (KeyError,TypeError,OSError,ValueError):return False
+
+
 def installed():
     if os.name != 'nt':
         return {}
+    from .observer_state import read_json
+    shared=read_json(pointer_path())
+    if valid_paths(shared):return shared
     import winreg
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, KEY) as key:
-            return {name: winreg.QueryValueEx(key, name)[0]
-                    for name in ('InstallRoot', 'AppPath', 'RecoveryPath')}
+            value={name: winreg.QueryValueEx(key, name)[0]
+                   for name in ('InstallRoot', 'AppPath', 'RecoveryPath')}
     except OSError:
         return {}
+    # Migrate readers of installations that predate the shared pointer.
+    receipt=read_json(Path(value['InstallRoot'])/'installation.json')
+    if receipt.get('product') and receipt.get('recovery'):
+        current=dict(InstallRoot=value['InstallRoot'],AppPath=str(Path(receipt['product'])/'Codexon.exe'),
+                     RecoveryPath=receipt['recovery'])
+        if valid_paths(current):return current
+    return value
 
 
-def recovery_command(home=None, directory=None, url=None, *, check=False):
+def recovery_command(home=None, directory=None, url=None):
     if getattr(sys, 'frozen', False):
         candidate = Path(installed().get('RecoveryPath', ''))
         if not candidate.is_file():
@@ -31,8 +56,6 @@ def recovery_command(home=None, directory=None, url=None, *, check=False):
         command = [str(candidate)]
     else:
         command = [sys.executable, str(Path(__file__).resolve().parents[1] / 'recovery_main.py')]
-    if check:
-        command.append('--check')
     if home is not None:
         command += ['--codex-home', str(home)]
     if directory is not None:

@@ -42,25 +42,25 @@ def test_only_quota_fields_are_sanitized_and_latest_observation_wins(tmp_path):
     idx=UsageIndex([home],tmp_path/'cache.sqlite')
     try:
         snap=idx.poll()
-        assert snap['quota']['windows']['weekly']['used_percent']==16
+        assert snap['quota_by_home'][str(home)]['windows']['weekly']['used_percent']==16
         revision=snap['sessions'][0]['usage_revision']
         changed=limits()
         changed['primary']['used_percent']=17
         with path.open('a',encoding='utf8') as output:
             output.write(json.dumps(event('event_msg',10050,type='token_count',rate_limits=changed,info=None))+'\n')
         after=idx.poll()
-        assert after['quota']['windows']['weekly']['used_percent']==17
+        assert after['quota_by_home'][str(home)]['windows']['weekly']['used_percent']==17
         assert after['sessions'][0]['usage_revision']==revision
-        observed=snap['quota']['observed_at']
+        observed=snap['quota_by_home'][str(home)]['observed_at']
         idx.observe_quota(home,clean_limits(limits('plus',300)),observed-1)
         assert idx.quota_by_home[str(home)]['plan_type']=='pro'
         # The second home cannot replace the allowance of the configured first home.
         idx.observe_quota(tmp_path/'other',clean_limits(limits('plus',300)),observed+1)
-        assert idx.poll()['quota']['plan_type']=='pro'
+        assert idx.poll()['quota_by_home'][str(home)]['plan_type']=='pro'
     finally: idx.close()
     # Existing indexed files still seed quota without replaying all usage bytes.
     idx=UsageIndex([home],tmp_path/'cache.sqlite')
     try:
-        assert idx.poll()['quota']['plan_type']=='pro'
+        assert idx.poll()['quota_by_home'][str(home)]['plan_type']=='pro'
         assert idx.bytes_read==0
     finally: idx.close()

@@ -25,7 +25,7 @@ Use `-Isolated` and a separate output directory for installation QA. The QA inst
 
 ## Usage collection
 
-`CollectorService` is the sole owner of source collection and `UsageIndex`. The GUI and cache worker consume `CollectionClient` snapshots. Keep one IPC format and one collection path; retired worker readers, direct scanners and their compatibility branches must be removed with their callers. Move still-relevant tests onto the supported path instead of retaining unused production code for old tests. Add compatibility behavior only for an explicitly supported migration requirement.
+`CollectorService` is the sole owner of source collection and `UsageIndex`. The GUI consumes read-only `CollectionClient` snapshots; the cache worker never starts or polls the collector. `AppServices` alone owns ordinary service startup, adoption, bounded restart, and shutdown. Quota services receive local quota observations from those same snapshots. Keep one IPC format and one collection path; retired worker readers, direct scanners and their compatibility branches must be removed with their callers. Move still-relevant tests onto the supported path instead of retaining unused production code for old tests. Add compatibility behavior only for an explicitly supported migration requirement.
 
 ## Releases
 

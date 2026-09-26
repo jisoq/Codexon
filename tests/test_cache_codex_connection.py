@@ -86,7 +86,9 @@ def test_installed_codex_independent_request(tmp_path,websocket,maintenance_webs
                 for _ in range(200):
                     if any(n.get('method')=='turn/completed' and n.get('params',{}).get('turn',{}).get('id')==turn_id for n in notices):return
                     await asyncio.sleep(.05)
-                raise TimeoutError('isolated turn')
+                # Keep the deadline; distinguish client/hook startup from relay failure.
+                methods=[n.get('method') for n in notices[-12:]]
+                raise TimeoutError(f'isolated turn: process={process.returncode}, wire={wire}, notices={methods}')
             try:
                 await rpc('initialize',dict(clientInfo=dict(name='cache_integration_test',version='1'),capabilities={'experimentalApi':True}))
                 process.stdin.write(b'{"method":"initialized"}\n');await process.stdin.drain()

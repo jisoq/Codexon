@@ -69,7 +69,7 @@ class TrayWindow(QuickHost):
         self.refresh_tray()
 
     def refresh_tray(self):
-        quota=getattr(self,'live_quota',self.snapshot.get('quota'))
+        quota=getattr(self,'live_quota',self.snapshot.get('quota_by_home',{}).get(self.observer_home))
         display=quota_display(quota,getattr(self,'quota_mode','weekly'),time.time())
         error=bool(self.snapshot.get('errors')) or bool(getattr(self,'analysis_errors',[]))
         warning=any(s.get('warning') for s in self.snapshot.get('sessions',[]))
@@ -161,9 +161,11 @@ class TrayWindow(QuickHost):
         if getattr(self,'_closing',False):return
         self._closing=True
         if hasattr(self,'save_preferences'):self.save_preferences()
+        controller=getattr(self,'service_controller',None)
+        if controller:controller.stop()
         panel=getattr(self,'observer_panel',None)
         if panel:
-            panel.active=False;panel.timer.stop();panel.pending=None;panel.manager.cancelled.set()
+            panel.active=False;panel.pending=None;panel.manager.cancelled.set()
         if getattr(self,'cache_panel',None):self.cache_panel.stop()
         if getattr(self,'overlay',None):self.overlay.stop()
         for service in getattr(self,'quota_services',{}).values(): service.stop()
@@ -173,8 +175,9 @@ class TrayWindow(QuickHost):
         if self.worker:
             self.worker.requestInterruption()
         managed=getattr(self,'manage_observer',False)
-        collection=bool(self.worker and self.worker.collection_autostart)
+        collection=bool(getattr(self,'app_services',None) and self.app_services.collection)
         if handoff or not (managed or collection):
+            if controller and controller.operation:controller.operation.wait()
             if self.worker:self.worker.wait()
             self.finish_quit();return
         from PySide6.QtCore import Qt
@@ -188,9 +191,9 @@ class TrayWindow(QuickHost):
         self.shutdown_dialog.setMinimumDuration(0)
         self.shutdown_dialog.show()
         update=getattr(self,'update_panel',None)
-        workers=[self.worker,panel.operation if panel else None,update.operation if update else None]
-        self.shutdown_operation=ShutdownOperation(panel.manager if managed else None,
-            self.snapshot['homes'],self.index_path,self.model_evidence_path,workers,self)
+        workers=[self.worker,panel.operation if panel else None,update.operation if update else None,
+                 controller.operation if controller else None]
+        self.shutdown_operation=ShutdownOperation(self.app_services,workers,self)
         self.shutdown_operation.progress.connect(lambda text:self.shutdown_dialog.setLabelText(tr(text)))
         self.shutdown_operation.finished.connect(self.shutdown_finished)
         self.shutdown_operation.start()

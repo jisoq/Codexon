@@ -77,7 +77,7 @@ class CachePanel(Group):
         super().__init__(parent);self.home=str(home)
         self.path=':memory:' if not active and index_path is None else control_path(index_path)
         self.control=None;self.journal=None;self.open_storage()
-        self.active=active;self.dialog=None;self.ticket=None;self.last_ticket=None;self.closed=False;self.proxy_ready=False;self.relay_connected=False
+        self.active=active;self.dialog=None;self.ticket=None;self.last_ticket=None;self.closed=False;self.proxy_ready=False;self.relay_connected=False;self.collection_error=False
         self.operating_dialog=None
         layout=Column(self);layout.setContentsMargins(0,0,8,20);layout.setSpacing(20)
         features,body=card('개별 기능 켜기');self.toggles={}
@@ -228,7 +228,7 @@ class CachePanel(Group):
                 latest=max(states,key=lambda s:s.get('observed_at',0))
                 self.status.setText(REASONS.get(latest.get('reason',latest.get('state')),'자료 수집 중'))
             else:self.status.setText('자료 수집 중')
-            if self.control.get('collector_error') or self.control.get('worker_error'):
+            if self.collection_error or getattr(self,'collection_issue',False) or self.control.get('worker_error'):
                 self.status.setText('장애 · 관측 저장 또는 분석 처리 확인 필요')
             elif heartbeat and time.time()-heartbeat>=20:
                 self.proxy_ready=False;self.status.setText('분석 갱신 멈춤 · 작업기 재시작 필요')
@@ -287,6 +287,7 @@ class CachePanel(Group):
         self.poll_operating()
 
     def proxy_status(self,state):
+        self.collection_issue=bool(state.get('collection_issue'))
         health=state.get('health') or {}
         self.proxy_ready=bool(health.get('cache_management') and state.get('configured'))
         self.relay_connected=self.proxy_ready

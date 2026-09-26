@@ -5,10 +5,49 @@ from types import SimpleNamespace
 
 import pytest
 
-from cachemonitor.connection_recovery import inspect, restore, check_once, target, assess
+from cachemonitor.connection_recovery import inspect, restore, target, assess
 from cachemonitor.observer_control import ObserverManager
 from cachemonitor.model_evidence import home_key
 from cachemonitor.observer_state import read_json
+
+
+def test_start_menu_recovery_uses_the_saved_cache_connection(tmp_path,monkeypatch):
+    from cachemonitor import launch_context,install_management
+    from cachemonitor.cache_worker_control import CacheWorkerManager
+    home=tmp_path/'custom home';home.mkdir()
+    index=tmp_path/'analysis'/'index.sqlite';index.parent.mkdir()
+    evidence=tmp_path/'data'/'evidence.sqlite'
+    route='http://127.0.0.1:18771'
+    index.with_name('cache-route.json').write_text(json.dumps(dict(url=route)))
+    (home/'config.toml').write_text('openai_base_url="'+route+'"\nmodel="preserve"\n')
+    (home/'auth.json').write_text('preserve authentication')
+    monkeypatch.setattr(launch_context,'cache_paths',lambda:dict(index_path=str(index),evidence_path=str(evidence)))
+    monkeypatch.setattr(launch_context,'resolve_homes',lambda:[str(home)])
+    manager=target()
+    manager.health_state='refused'
+    assert isinstance(manager,CacheWorkerManager) and manager.url==route
+    assert isinstance(target(home),CacheWorkerManager)
+    assert isinstance(target(home,evidence.parent,route),CacheWorkerManager)
+    assert install_management.connection_manager().index==manager.index
+    monkeypatch.setattr('cachemonitor.observer_control.startup_value',lambda *a:None)
+    monkeypatch.setattr(manager,'health',lambda **_:None)
+    from cachemonitor.cache_db import connect
+    db=connect(index.with_name('cache-control.sqlite'))
+    db.executemany('INSERT INTO cache_operating_grants(id,home,data) VALUES(?,?,?)',
+                   [('owned',str(home),'{}'),('other',str(tmp_path/'other'),'{}')])
+    db.close()
+    task=SimpleNamespace(remove=lambda:None,inspect=lambda:dict(registered=False))
+    manager.task=manager.legacy_task=task
+    monkeypatch.setattr(manager,'cleanup_legacy_check',lambda:None)
+    assert restore(manager)['code']=='restored'
+    assert manager.config()[1]=={'model':'preserve'}
+    assert (home/'auth.json').read_text()=='preserve authentication'
+    assert inspect(manager)['status']['restart_required']
+    db=connect(index.with_name('cache-control.sqlite'))
+    assert db.execute('SELECT id,stopped FROM cache_operating_grants ORDER BY id').fetchall()==[('other',None),('owned','revoked')]
+    db.close()
+    explicit=target(home,tmp_path/'explicit',url='http://127.0.0.1:18772')
+    assert not isinstance(explicit,CacheWorkerManager) and explicit.url.endswith(':18772')
 
 
 @pytest.mark.parametrize('phase',['queued','waiting','stopping','starting','verifying','rollback'])
@@ -23,7 +62,8 @@ def manager(tmp_path,monkeypatch):
     manager=ObserverManager(home,tmp_path/'data',url='http://127.0.0.1:18991')
     manager.config_path.write_text('# preserve me\nopenai_base_url="http://127.0.0.1:18991"\nmodel="keep"\n')
     task=SimpleNamespace(remove=lambda:None)
-    manager.task=manager.legacy_task=manager.check_task=task
+    manager.task=manager.legacy_task=task
+    monkeypatch.setattr(manager,'cleanup_legacy_check',lambda:None)
     monkeypatch.setattr('cachemonitor.observer_control.startup_value',lambda *a:None)
     def refused(**_):manager.health_state='refused';return None
     monkeypatch.setattr(manager,'health',refused)
@@ -60,30 +100,21 @@ def test_custom_connection_is_never_replaced(manager):
     assert manager.config_path.read_bytes()==before
 
 
-def test_check_persists_dedup_across_runs_and_never_changes_route(manager):
-    calls=[];notify=lambda *args:(calls.append(1) or True)
+def test_app_checks_deduplicate_without_changing_route(manager,monkeypatch):
+    from cachemonitor.notifications import ConfirmedNotifications
+    clock=[100]
+    notices=ConfirmedNotifications(clock=lambda:clock[0])
     before=manager.config_path.read_bytes()
-    check_once(manager,notification=notify,now=100)
-    assert calls==[]
-    check_once(manager,notification=notify,now=160)
-    check_once(manager,notification=notify,now=220)
-    assert calls==[1]
-    # A missed run must not produce a new notification for the same unresolved fault.
-    check_once(manager,notification=notify,now=1000)
-    check_once(manager,notification=notify,now=1060)
-    assert calls==[1]
+    assert notices.proxy(manager.status())==[]
+    clock[0]=115;assert notices.proxy(manager.status())==[]
+    clock[0]=130;assert len(notices.proxy(manager.status()))==1
+    for at in (145,1000,1015):
+        clock[0]=at;assert notices.proxy(manager.status())==[]
+    monkeypatch.setattr(manager,'health',lambda **k:setattr(manager,'health_state','unknown'))
+    clock[0]=1030;assert notices.proxy(manager.status())==[]
+    assert notices.incident['code']=='refused'
     assert manager.config_path.read_bytes()==before
-
-
-def test_unknown_is_not_an_alert_and_does_not_clear_existing_incident(manager,monkeypatch):
-    calls=[];notify=lambda *a:(calls.append(1) or True)
-    check_once(manager,notification=notify,now=100)
-    check_once(manager,notification=notify,now=160)
-    def unknown(**_):manager.health_state='unknown';return None
-    monkeypatch.setattr(manager,'health',unknown)
-    for now in (220,280,340):assert check_once(manager,notification=notify,now=now)['code']=='unknown'
-    assert calls==[1]
-    assert read_json(manager.directory/'connection-check.json')['notified_code']=='refused'
+    assert not (manager.directory/'connection-check.json').exists()
 
 
 def test_health_response_does_not_claim_model_connectivity():

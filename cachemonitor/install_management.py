@@ -79,11 +79,15 @@ def register(root, product, recovery, *, isolated=False):
 
 
 def activate_proxy(manager):
+    manager.cleanup_legacy_check()
+    manager.adopt_registrations()
     status = manager.status()
     if not status.get('configured'):
         return dict(phase='off', message='프록시 사용 꺼짐')
-    if getattr(manager,'shared_cache_worker',False):return manager.update_proxy().get('update') or {}
-    manager.configure_check()
+    if getattr(manager,'shared_cache_worker',False):
+        if not status.get('health'):
+            manager.resume()
+        return manager.update_proxy().get('update') or {}
     health = status.get('health') or {}
     if health:
         return manager.update_proxy().get('update') or {}
@@ -114,23 +118,32 @@ def finish(root, product, recovery, *, isolated=False, launch=True, language='ko
         activation = Activation(root, isolated)
         previous = read_json(root/'installation.json')
         receipt = dict(product=str(product), recovery=str(recovery), version=manifest['version'],
-                       commit=manifest['commit'], previous=previous.get('product'), installed_at=time.time())
-        # Keep the previous payload and receipt; only the launch pointers change.
+                       commit=manifest['commit'], previous=previous.get('product'), installed_at=time.time(),
+                       isolated=isolated)
+        # Keep rollback payloads until the new GUI verifies all service handoffs.
         try:
             if previous:
                 atomic_write(root/('installation-'+uuid.uuid4().hex+'.json'),json.dumps(previous).encode())
             if not isolated:
-                from .launch_context import running_homes, save_homes
+                from .launch_context import running_homes, save_homes, resolve_homes
                 homes = running_homes(root)
                 if homes:save_homes(homes)
+                receipt['homes']=resolve_homes(homes)
             register(root, product, recovery, isolated=isolated)
             publish_shell(product, recovery, isolated=isolated, language=language)
             if not isolated:migrate_startup(exe)
             atomic_write(root/'installation.json',json.dumps(receipt,indent=2).encode())
+            if not isolated:
+                from .installation import pointer_path
+                atomic_write(pointer_path(),json.dumps(dict(InstallRoot=str(root),AppPath=str(exe),
+                    RecoveryPath=str(recovery))).encode())
             activation.commit()
         except Exception:
             activation.rollback()
             raise
+        from .install_cleanup import queue
+        try:queue(root)
+        except (OSError,ValueError,RuntimeError) as exc:receipt['cleanup_warning']=str(exc)
         if not isolated:
             from .observer_task import retire_desktop_startups
             try:retire_desktop_startups(root)
@@ -161,6 +174,7 @@ def processes_under(root):
     import base64
     encoded = base64.b64encode(str(Path(root).resolve()).encode()).decode()
     script = r"""
+$ErrorActionPreference='Stop'
 [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
 $root=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__ROOT__')).TrimEnd('\')+'\'
 @(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($root,[StringComparison]::OrdinalIgnoreCase) } | Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine) | ConvertTo-Json -Compress
@@ -175,11 +189,6 @@ $root=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__ROOT__')).T
 
 
 def connection_manager():
-    from .launch_context import cache_paths,resolve_homes
-    paths=cache_paths()
-    if paths.get('index_path') and paths.get('evidence_path'):
-        from .cache_worker_control import CacheWorkerManager
-        return CacheWorkerManager(resolve_homes()[0],paths['index_path'],paths['evidence_path'])
     from .connection_recovery import target
     return target()
 
@@ -245,6 +254,10 @@ def prepare_uninstall(root, *, isolated=False):
             except FileNotFoundError:pass
         from .install_activation import remove_shortcuts
         remove_shortcuts(isolated)
+        if not isolated:
+            from .installation import pointer_path
+            path=pointer_path();value=read_json(path)
+            if value.get('InstallRoot')==str(root):path.unlink(missing_ok=True)
         return dict(ready=True,records_preserved=True)
 
 

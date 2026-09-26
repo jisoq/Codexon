@@ -117,6 +117,18 @@ jobs:
       - name: Check packaged app exit, service resume and collector migration
         if: steps.plan.outputs.proxy == 'true'
         run: python tools/run_ui_checks.py -- python tools/verify_app_services.py --executable dist-ci/Codexon/Codexon.exe --legacy-collector-exe ../codexon-previous-dist/Codexon/Codexon.exe --output artifacts/verification/app-services
+      - name: Check migration from the actual published installer
+        if: steps.plan.outputs.proxy == 'true'
+        shell: pwsh
+        run: |
+          python tools/prepare_legacy_release.py --tag v2026.09.25.6 --output artifacts/legacy-published
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $published = Get-Content artifacts/legacy-published/result.json -Raw | ConvertFrom-Json
+          python tools/verify_proxy_update.py --old-exe $published.executable --new-exe dist-ci/Codexon/Codexon.exe --idle-connections 100 --output artifacts/verification/published-proxy-update
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tools/verify_proxy_update.py --old-exe $published.executable --new-exe dist-ci/Codexon/Codexon.exe --cache-worker --idle-connections 100 --output artifacts/verification/published-cache-update
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tools/run_ui_checks.py -- python tools/verify_app_services.py --executable dist-ci/Codexon/Codexon.exe --legacy-collector-exe $published.executable --output artifacts/verification/published-app-services
       - name: Check packaged GUI handoff with multiple custom homes
         if: steps.plan.outputs.package == 'true'
         run: python tools/run_ui_checks.py -- python tools/verify_gui_handoff.py --executable dist-ci/Codexon/Codexon.exe --output artifacts/verification/gui-handoff

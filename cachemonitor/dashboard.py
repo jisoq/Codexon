@@ -175,13 +175,22 @@ class Dashboard(TrayWindow):
         self.restore_preferences();self.restoring=False;self.change_page(self.current_page)
         if start_worker:
             if homes and static_snapshot is None:self.start_quota_service(homes[0])
-            self.worker=AnalysisBridge(homes,index_path,static_snapshot,model_evidence_path,quota_path,collection_autostart)
+            self.worker=AnalysisBridge(homes,index_path,static_snapshot,model_evidence_path,quota_path)
             self.worker.snapshot.connect(self.receive);self.worker.result.connect(self.analysis_ready)
             self.worker.failure.connect(self.analysis_failed);self.worker.record.connect(self.record_ready);self.worker.start();self.render()
         elif static_snapshot is not None:self.receive(static_snapshot)
         self.setCentralWidget(root)
         if hasattr(self.quota_panel,'set_homes'):self.quota_panel.set_homes(homes)
         if hasattr(self.quota_panel,'home_selected'):self.quota_panel.home_selected.connect(self.start_quota_service)
+        from .app_services import AppServices
+        from .app_shutdown import ServiceController
+        self.app_services=AppServices(self.observer_panel.manager if manage_observer else None,
+            homes,index_path,model_evidence_path,collection=bool(start_worker and collection_autostart and static_snapshot is None))
+        self.service_controller=ServiceController(self.app_services,self)
+        self.observer_panel.services=self.app_services if manage_observer else None
+        self.service_controller.result.connect(self.observer_panel.display)
+        if manage_observer or self.app_services.collection:
+            QTimer.singleShot(0,self.service_controller.start)
 
     def fit_screen(self):
         screen=self.screen() or QApplication.primaryScreen()
@@ -217,6 +226,7 @@ class Dashboard(TrayWindow):
                 tracking_enabled=self.settings.value('quota/trackingEnabled',True,type=bool))
             services[home].updated.connect(lambda value,expected=services[home]:self.receive_quota(value) if self.quota_service is expected else None)
             services[home].start()
+        services[home].supply_local(self.snapshot.get('quota_by_home',{}).get(services[home].home))
         self.live_quota=None;self.quota_service=services[home]
         self.refresh_tray()
         self.quota_service.wake.set()
@@ -662,6 +672,10 @@ class Dashboard(TrayWindow):
             value={**value,'sessions':[s['source'] for s in self.engine.sessions.values()],
                    'internal_review_calls':sum(len(s['prepared']['history']) for s in self.engine.internal_sessions.values())}
         self.snapshot=value
+        for service in getattr(self,'quota_services',{}).values():
+            service.supply_local(value.get('quota_by_home',{}).get(service.home))
+        if hasattr(self,'cache_panel'):
+            self.cache_panel.collection_error=bool(value.get('errors') or value.get('usage_errors'))
         if hasattr(self,'cache_panel'):self.cache_panel.display(value.get('cache_management',{}))
         overlay=getattr(self,'overlay',None)
         if overlay:overlay.receive_snapshot(value)
@@ -1550,10 +1564,7 @@ class Dashboard(TrayWindow):
             self.settings.setValue('notifications/lastProtectionId',incident['id'])
             event=self.confirmed_notifications.record('protection','프록시 보호 정지',incident.get('reason','설정에서 확인하세요.'))
             self.show_confirmed_events([event] if self.notification_options['프록시 장애'].isChecked() else [])
-        # Installed deployments use one shared, persisted notifier in the scheduled
-        # checker. Keep the in-app path for portable/source deployments only.
-        from .installation import installed
-        if not installed():self.show_confirmed_events(self.confirmed_notifications.proxy(result))
+        self.show_confirmed_events(self.confirmed_notifications.proxy(result))
 
     def show_confirmed_events(self,events):
         for event in events:

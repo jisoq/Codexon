@@ -24,8 +24,7 @@ def manager(tmp_path,monkeypatch):
         def configure(self,command,autostart):self.calls.append(('configure',autostart))
         def remove(self):self.calls.append(('remove',False))
     control.task=Task()
-    control.check_task=Task()
-    monkeypatch.setattr(control,'configure_check',lambda:None)
+    monkeypatch.setattr(control,'cleanup_legacy_check',lambda:None)
     return control,registry
 
 
@@ -138,7 +137,7 @@ def test_cache_worker_recovery_removes_task_and_drains_without_forced_stop(tmp_p
     identity='a'*32;removed=[]
     monkeypatch.setattr(observer_control,'startup_value',lambda *a:None)
     monkeypatch.setattr(manager,'health',lambda **kw:dict(cache_management=True,control_id=identity,active_connections=1))
-    for field in ('task','legacy_task','check_task'):
+    for field in ('task','legacy_task'):
         setattr(manager,field,SimpleNamespace(remove=lambda f=field:removed.append(f),inspect=lambda:dict(registered=False)))
     result=manager.recover_direct()
     assert not result['configured'] and 'task' in removed

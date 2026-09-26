@@ -37,7 +37,7 @@ def expiry(engine,q):
     return min(candidates)
 
 
-def process_main(connection,homes,index_path,static_snapshot=None,model_evidence_path=None,quota_path=None,collection_autostart=True):
+def process_main(connection,homes,index_path,static_snapshot=None,model_evidence_path=None,quota_path=None):
     quota_path=quota_path or ledger_path(index_path)
     collector=None
     ledger=None
@@ -71,7 +71,6 @@ def process_main(connection,homes,index_path,static_snapshot=None,model_evidence
             engine.ingest(snapshot['sessions'])
         else:
             collector=CollectionClient(homes,index_path,model_evidence_path)
-            collector.autostart=collection_autostart
             try:ledger=QuotaLedger(quota_path)
             except sqlite3.Error as error:disable_ledger(error)
         def publish():
@@ -144,12 +143,11 @@ class AnalysisBridge(QThread):
     result=Signal(object)
     failure=Signal(str)
     record=Signal(object)
-    def __init__(self,homes,index_path=None,static_snapshot=None,model_evidence_path=None,quota_path=None,collection_autostart=True):
+    def __init__(self,homes,index_path=None,static_snapshot=None,model_evidence_path=None,quota_path=None):
         super().__init__()
         self.homes,self.index_path,self.static_snapshot=homes,index_path,static_snapshot
         self.model_evidence_path=model_evidence_path
         self.quota_path=quota_path
-        self.collection_autostart=collection_autostart
         self.lock=threading.Lock()
         self.pending=None
         self.commands=[]
@@ -176,7 +174,7 @@ class AnalysisBridge(QThread):
             receiver=SnapshotReceiver()
             context=mp.get_context('spawn')
             parent,child=context.Pipe()
-            self.process=context.Process(target=process_main,args=(child,self.homes,self.index_path,self.static_snapshot,self.model_evidence_path,self.quota_path,self.collection_autostart),daemon=True)
+            self.process=context.Process(target=process_main,args=(child,self.homes,self.index_path,self.static_snapshot,self.model_evidence_path,self.quota_path),daemon=True)
             try:
                 self.process.start()
             except (OSError,RuntimeError) as error:
