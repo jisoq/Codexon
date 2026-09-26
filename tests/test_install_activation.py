@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 import subprocess
+import sys
 
 import pytest
 
@@ -56,6 +57,7 @@ def test_interrupted_activation_is_recovered_before_next_attempt(tmp_path,monkey
     ('"C:\\old folder\\Codexon.exe" --hidden --codex-home "C:\\first home" --codex-home C:\\second',False),
     ('"C:\\old folder\\Codexon.exe" --hidden --codex-home "C:\\first home" --codex-home C:\\second',True),
 ])
+@pytest.mark.skipif(sys.platform != 'win32', reason='Windows registry activation contract')
 def test_update_retargets_login_startup_and_rolls_back_unconfirmed_write(tmp_path,monkeypatch,startup,fail_write):
     """Exercise the production activation path using disposable real registry keys."""
     import uuid
@@ -155,6 +157,7 @@ def test_recovery_translation_does_not_import_qt():
     assert result.returncode==0,result.stderr
 
 
+@pytest.mark.skipif(sys.platform != 'win32', reason='Windows shell shortcut identity')
 def test_shortcut_preserves_recovery_application_identity(tmp_path):
     import os
     import sys

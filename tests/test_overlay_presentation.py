@@ -12,6 +12,21 @@ from cachemonitor.overlay_appearance import default_appearance
 from cachemonitor.overlay_view import money, percent
 
 
+def test_call_axes_fit_only_visible_finite_values_and_preserve_constant_series():
+    from cachemonitor.overlay_view import call_graph_axes
+    rows=[dict(cache_rate=0,cost=1000)]+[dict(cache_rate=92+i/10,cost=2+i/100) for i in range(12)]
+    axes=call_graph_axes(rows,12)
+    assert 90<axes['cache'][0]<92 and 93.1<axes['cache'][1]<95
+    assert 1<axes['cost'][0]<2 and 2.11<axes['cost'][1]<3
+    assert axes['cache']!=call_graph_axes(rows,24)['cache']
+    constant=call_graph_axes([dict(cache_rate=50,cost=3),dict(cache_rate=None,cost=float('nan'))],12)
+    assert 0<constant['cache'][0]<50<constant['cache'][1]<100
+    assert 0<constant['cost'][0]<3<constant['cost'][1]
+    empty=call_graph_axes([dict(cache_rate=None,cost=float('inf'))],12)
+    assert not empty['cache_known'] and not empty['cost_known']
+    assert empty['cache'][0]<empty['cache'][1]
+
+
 def summary(misses=0, count=12):
     s=Session('clean','home',title='CacheMonitor 세션 오버레이 디자인 구현')
     for i in range(count):
@@ -36,6 +51,25 @@ def test_english_overlay_keeps_session_title_pixels(tmp_path):
         assert images[0].copy(16,12,260,28)==images[1].copy(16,12,260,28)
         assert images[0].copy(16,94,200,36)!=images[1].copy(16,94,200,36)
         assert w.accessibleName().splitlines()[0]==data['title']
+    finally:
+        w.close();set_language('ko');app.processEvents()
+
+
+def test_pinned_title_changes_painted_pixels_and_accessibility_without_mutating_session():
+    from cachemonitor.i18n import set_language
+    app=QApplication.instance() or QApplication([]);w=SessionOverlay();data=summary()
+    data['title']='작업 세션';original=copy.deepcopy(data)
+    try:
+        for language,prefix in (('ko','고정 · '),('en','Pinned · ')):
+            set_language(language);images=[]
+            for pinned in (False,True):
+                w.set_content(data,pinned=pinned);m=w.content_model
+                image=QImage(m.panel_width(),m.panel_height(),QImage.Format_ARGB32_Premultiplied);image.fill(0)
+                painter=QPainter(image);m.paint(painter);painter.end();images.append(image)
+                assert w.accessibleName().splitlines()[0]==(prefix if pinned else '')+data['title']
+            assert images[0].copy(16,12,260,28)!=images[1].copy(16,12,260,28)
+            assert images[0].copy(16,48,348,496)==images[1].copy(16,48,348,496)
+            assert data==original
     finally:
         w.close();set_language('ko');app.processEvents()
 

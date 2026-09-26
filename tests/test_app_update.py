@@ -15,13 +15,13 @@ def release():
 
 
 def test_release_assets_cannot_mix_sources_or_be_ambiguous():
-    value=release();assert app_update.release_asset(value)[0]['size']==7
+    value=release();assert app_update.release_asset(value,platform_name='win32')[0]['size']==7
     value['assets'][0]['browser_download_url']='https://evil.example/setup.exe'
-    with pytest.raises(ValueError):app_update.release_asset(value)
+    with pytest.raises(ValueError):app_update.release_asset(value,platform_name='win32')
     value=release();value['assets'].append(value['assets'][0])
-    with pytest.raises(ValueError):app_update.release_asset(value)
+    with pytest.raises(ValueError):app_update.release_asset(value,platform_name='win32')
     value=release();value['prerelease']=True
-    with pytest.raises(ValueError):app_update.release_asset(value)
+    with pytest.raises(ValueError):app_update.release_asset(value,platform_name='win32')
 
 
 def test_failed_download_never_launches_installer(tmp_path,monkeypatch):

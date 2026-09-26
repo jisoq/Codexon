@@ -1,0 +1,67 @@
+name: macOS checks
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+env:
+  PYTHONUTF8: '1'
+  PYTHONIOENCODING: utf-8
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12.13'
+          cache: pip
+          cache-dependency-path: requirements-macos.lock
+      - name: Install locked macOS dependencies
+        run: python -m pip install --require-hashes -r requirements-macos.lock
+      - name: Verify the full source contract
+        env:
+          QT_QPA_PLATFORM: offscreen
+          CODEXON_DATA_DIR: ${{ runner.temp }}/codexon-source-qa
+        run: python tools/verify_changes.py --full
+      - name: Verify the native desktop adapters without requesting permissions
+        env:
+          CODEXON_DATA_DIR: ${{ runner.temp }}/codexon-desktop-qa
+        run: python tools/verify_macos_desktop.py --output artifacts/macos-desktop.json
+      - name: Build native ad-hoc QA apps and disk image
+        run: python tools/mac_build.py --output dist-macos-ci --work build-macos-ci
+      - name: Verify immutable installation, rollback and independent recovery
+        run: python tools/mac_verify.py --product dist-macos-ci/package --output artifacts/macos-installation --allow-ad-hoc
+      - name: Verify the frozen Qt runtime and actual dashboard interaction
+        run: python tools/run_ui_checks.py -- python tools/verify_changes.py --package-only --package-exe dist-macos-ci/raw/Codexon.app/Contents/MacOS/Codexon
+      - name: Verify installed login app handoff and preserved custom homes
+        run: python tools/mac_handoff.py --product dist-macos-ci/package --output artifacts/macos-handoff.json --allow-ad-hoc
+      - name: Validate the sealed macOS payload
+        run: python tools/mac_package.py --product dist-macos-ci/package --allow-ad-hoc
+      - name: Upload synthetic evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-verification-${{ matrix.runner }}
+          path: |
+            artifacts/macos-installation/
+            artifacts/macos-desktop.json
+            artifacts/macos-handoff.json
+            artifacts/verification/
+            dist-macos-ci/build-report.json
+          if-no-files-found: ignore
+      - name: Upload local test image
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-ad-hoc-qa-${{ matrix.runner }}
+          path: |
+            dist-macos-ci/*.dmg
+            dist-macos-ci/*.sha256
+          if-no-files-found: error

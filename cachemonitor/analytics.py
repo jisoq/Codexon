@@ -26,7 +26,8 @@ def effort_key(value):
 
 
 def project_key(path):
-    return ntpath.normcase(ntpath.normpath(path.removeprefix('\\\\?\\'))) if path else '미확인'
+    from .platform_paths import path_identity
+    return path_identity(path) if path else '미확인'
 
 
 def project_identity(session):

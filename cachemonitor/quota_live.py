@@ -4,28 +4,13 @@ import json
 import os
 from pathlib import Path
 import queue
-import shutil
 import subprocess
 import threading
 import time
+from .codex_runtime import locate_codex, runtime_environment
 
 from .quota import clean_limits
 from .banked_resets import normalize_reset_credits
-
-
-def locate_codex():
-    candidates = []
-    direct = shutil.which('codex.exe')
-    if direct:
-        candidates.append(Path(direct))
-    root = Path(os.environ.get('LOCALAPPDATA', Path.home())) / 'OpenAI' / 'Codex' / 'bin'
-    candidates.extend(root.glob('*/codex.exe'))
-    npm = Path(os.environ.get('APPDATA', Path.home())) / 'npm' / 'node_modules' / '@openai'
-    candidates.extend(npm.glob('codex*/**/codex.exe'))
-    candidates = [p for p in candidates if p.is_file()]
-    if not candidates:
-        raise RuntimeError('Codex 실행 파일을 찾을 수 없습니다. 로컬 기록으로 확인합니다.')
-    return str(max(candidates, key=lambda p: p.stat().st_mtime))
 
 
 def normalize_limits(result, observed, account):
@@ -63,8 +48,7 @@ class AccountClient:
         self.cache_seconds = 30
 
     def start(self):
-        env = os.environ.copy()
-        env['CODEX_HOME'] = self.home
+        env = runtime_environment(self.home)
         self.process = subprocess.Popen([locate_codex(), 'app-server'], env=env,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             text=True, encoding='utf-8', creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
@@ -138,6 +122,17 @@ class AccountClient:
         except Exception:
             self.close()
             raise
+
+    def account_type(self):
+        """Read auth type using Codex's credential store; never return credentials."""
+        try:
+            if self.process is None or self.process.poll() is not None:
+                self.start()
+            account = self.rpc('account/read', {'refreshToken': False}).get('account') or {}
+            value = account.get('type')
+            return value if value in ('chatgpt', 'apiKey', 'amazonBedrock') else None
+        finally:
+            self.close()
 
     def close(self):
         if self.process:

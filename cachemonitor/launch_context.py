@@ -12,7 +12,8 @@ from .observer_state import read_json
 def preference_path():
     # Codex's MSIX children and ordinary Start-menu launches can see different
     # files at the same LocalAppData path. Share the route outside that overlay.
-    return Path.home()/'.cachemonitor'/'launch.json'
+    from .platform_paths import launch_preferences_path
+    return launch_preferences_path()
 
 
 def preferences(path=None):
@@ -52,6 +53,9 @@ def save_cache_paths(index_path,evidence_path,quota_path,*,path=None):
 
 def command_arguments(command):
     """Parse legacy Windows launch arguments without losing spaces or repeats."""
+    if os.name != 'nt':
+        import shlex
+        return shlex.split(command)
     import ctypes
     from ctypes import wintypes as W
     shell = ctypes.WinDLL('shell32')
@@ -80,7 +84,7 @@ def running_homes(root):
     """Migrate explicit homes from an older GUI before asking it to exit."""
     from .install_management import processes_under
     for process in processes_under(root):
-        if Path(process['ExecutablePath']).name.lower() != 'codexon.exe':continue
+        if Path(process['ExecutablePath']).name.lower() not in ('codexon.exe', 'codexon'):continue
         command = process.get('CommandLine') or ''
         arguments=command_arguments(command)
         if any(flag in arguments for flag in ('--model-proxy','--proxy-supervisor','--proxy-update',

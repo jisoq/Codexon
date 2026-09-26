@@ -22,7 +22,8 @@ UNKNOWN = '확인 불가'
 def default_path():
     # MSIX can redirect LocalAppData differently for Codex children and ordinary
     # desktop launches. The user-profile directory is shared by both contexts.
-    return Path.home() / '.cachemonitor' / 'model-observer' / 'model-evidence.sqlite'
+    from .platform_paths import observer_data_dir
+    return observer_data_dir() / 'model-evidence.sqlite'
 
 
 def identifier(value):

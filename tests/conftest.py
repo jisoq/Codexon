@@ -1,8 +1,48 @@
-"""Never let routine tests reparent Qt windows into the user's Explorer."""
+"""Keep routine tests away from the user's services, storage and Explorer."""
 import os
 import sys
 
 import pytest
+
+
+@pytest.fixture(scope='session', autouse=True)
+def isolate_macos_services(tmp_path_factory):
+    if sys.platform != 'darwin':
+        yield
+        return
+    root = tmp_path_factory.mktemp('macos-runtime')
+    values = {'CODEXON_SERVICE_TEST_ROOT': str(root / 'launchd'),
+              'CODEXON_DATA_DIR': str(root / 'data')}
+    previous = {name: os.environ.get(name) for name in values}
+    for name, value in values.items():
+        os.environ.setdefault(name, value)
+    try:
+        yield
+    finally:
+        try:
+            if previous['CODEXON_SERVICE_TEST_ROOT'] is None:
+                import json
+                import time
+                from pathlib import Path
+                from cachemonitor.macos_services import LaunchAgent
+                service_root = Path(values['CODEXON_SERVICE_TEST_ROOT']) / 'services'
+                for receipt in service_root.glob('*/job.json'):
+                    value = json.loads(receipt.read_text())
+                    service = LaunchAgent(value['scope'], value['role'])
+                    assert service.label.startswith('com.codexon.qa.') and service.state_path == receipt
+                    service.deactivate(remove=True, stop=True)
+                    deadline = time.monotonic() + 5
+                    while service.inspect().get('running') and time.monotonic() < deadline:
+                        time.sleep(.05)
+                    assert not service.inspect().get('running'), 'A QA service did not stop'
+                    service.deactivate(remove=True, stop=True)
+                    assert service.loaded(service.state()) is None
+        finally:
+            for name, value in previous.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
 
 
 @pytest.fixture(autouse=True)

@@ -11,9 +11,7 @@ from test_overlay import A, source
 
 
 class Native:
-    class API:
-        def GetDpiForWindow(self, hwnd): return 96
-    u=API()
+    def dpi(self, hwnd): return 96
     bounds=(0,0,1300,1000)
     down=False
     pointer=(0,0)

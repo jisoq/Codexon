@@ -2,6 +2,7 @@
 import ctypes
 import os
 import subprocess
+import sys
 
 
 def visible_window_rect(rect, work):
@@ -70,6 +71,9 @@ class WindowsStartup:
         self.name, self.key_path = name, key_path
 
     def enabled(self):
+        if sys.platform == 'darwin':
+            from .macos_startup import MacStartup
+            return MacStartup().enabled()
         if os.name != 'nt':
             return False
         import winreg
@@ -80,6 +84,9 @@ class WindowsStartup:
             return False
 
     def set_enabled(self, enabled, command):
+        if sys.platform == 'darwin':
+            from .macos_startup import MacStartup
+            return MacStartup().set_enabled(enabled, command)
         import winreg
         with winreg.CreateKey(winreg.HKEY_CURRENT_USER, self.key_path) as key:
             if enabled:

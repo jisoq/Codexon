@@ -2,12 +2,22 @@
 import ctypes
 import json
 import os
+import platform
 from pathlib import Path
 import sys
 import traceback
 
 
 def modules():
+    if sys.platform == 'darwin':
+        dyld = ctypes.CDLL(None)
+        dyld._dyld_image_count.restype = ctypes.c_uint32
+        dyld._dyld_get_image_name.argtypes = [ctypes.c_uint32]
+        dyld._dyld_get_image_name.restype = ctypes.c_char_p
+        paths = [os.fsdecode(dyld._dyld_get_image_name(index))
+                 for index in range(dyld._dyld_image_count())]
+        return [path for path in paths if any(word in path.lower() for word in
+                ('qt', 'pyside', 'shiboken', 'python', 'appkit', 'applicationservices'))]
     if os.name!='nt':return []
     from ctypes import wintypes as W
     api=ctypes.WinDLL('kernel32',use_last_error=True)
@@ -28,10 +38,15 @@ def modules():
 def main(output):
     from .version import VERSION, PROXY_VERSION
     report={'executable':sys.executable,'version':VERSION,'proxy_version':PROXY_VERSION,
+            'platform':sys.platform,'architecture':platform.machine(),
             'before':modules(),'errors':[]}
     try:
         from PySide6 import QtCore,QtGui,QtWidgets,QtQml,QtQuick,QtQuickWidgets
         report.update(pyside=QtCore.__version__,qt=QtCore.qVersion())
+        if sys.platform == 'darwin':
+            import AppKit, Quartz, ApplicationServices, ServiceManagement, UserNotifications
+            report['macos_frameworks'] = ['AppKit', 'Quartz', 'ApplicationServices',
+                                        'ServiceManagement', 'UserNotifications']
     except Exception:
         report['errors'].append(traceback.format_exc())
     report['after']=modules()

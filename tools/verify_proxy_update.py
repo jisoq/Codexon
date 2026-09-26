@@ -1,8 +1,11 @@
 """Packaged update smoke: isolated home, evidence DB, port and scheduler tasks."""
 import argparse
 import asyncio
+from contextlib import contextmanager
 import threading
 import json
+import os
+import socket
 import subprocess
 import sys
 import time
@@ -14,6 +17,33 @@ from cachemonitor.observer_state import read_json
 from cachemonitor.model_evidence import home_key
 from cachemonitor.proxy_update import ProxyUpdate, process_executable
 from cachemonitor.version import PROXY_VERSION
+
+
+@contextmanager
+def isolated_environment(root):
+    """All native registration and settings belong to this verification only."""
+    values={}
+    if sys.platform=='darwin':
+        values={'CODEXON_SERVICE_TEST_ROOT':str(root/'launchd'),
+                'CODEXON_DATA_DIR':str(root/'runtime-data'),'QT_QPA_PLATFORM':'offscreen'}
+    previous={key:os.environ.get(key) for key in values}
+    os.environ.update(values)
+    try:yield
+    finally:
+        for key,value in previous.items():
+            if value is None:os.environ.pop(key,None)
+            else:os.environ[key]=value
+
+
+def stop_task(task):
+    """Only the caller's unique fixture task may receive a forced cleanup."""
+    task.stop()
+    if sys.platform=='darwin':
+        deadline=time.monotonic()+15
+        while task.inspect().get('running'):
+            if time.monotonic()>=deadline:raise RuntimeError('Isolated service cleanup did not complete')
+            time.sleep(.1)
+    task.remove()
 
 
 class IdleConnections:
@@ -57,7 +87,7 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--old-exe',type=Path,required=True)
     parser.add_argument('--new-exe',type=Path,required=True)
-    parser.add_argument('--port',type=int,default=18769)
+    parser.add_argument('--port',type=int,default=0)
     parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--cache-worker',action='store_true')
     parser.add_argument('--idle-connections',type=int,default=0)
@@ -65,18 +95,23 @@ def main():
     parser.add_argument('--exercise-rollback',action='store_true')
     parser.add_argument('--interrupt-after-drain',action='store_true')
     options=parser.parse_args()
+    if options.port==0:
+        with socket.socket() as reservation:
+            reservation.bind(('127.0.0.1',0));options.port=reservation.getsockname()[1]
     if options.port in (8768,8771) or not 1024<=options.port<=65535:
         parser.error('운영 프록시 포트를 제외한 테스트 전용 포트를 지정하세요.')
     old=options.old_exe.resolve();new=options.new_exe.resolve()
     if not old.is_file() or not new.is_file():
         parser.error('두 배포 실행 파일이 모두 필요합니다.')
     root=options.output.resolve();root.mkdir(parents=True,exist_ok=True)
+    environment=isolated_environment(root);environment.__enter__()
     old_report=root/'old-runtime.json'
     verified=subprocess.run([str(old),'--verify-runtime',str(old_report)],timeout=30)
     old_runtime=read_json(old_report)
     assert verified.returncode==0 and old_runtime.get('errors')==[]
     old_version=old_runtime.get('proxy_version',old_runtime['version'])
     home=root/'home';home.mkdir(exist_ok=True)
+    (home/'codexon-test-home').touch()
     m=ObserverManager(home,root/'data',url=f'http://127.0.0.1:{options.port}')
     if options.cache_worker:
         from cachemonitor.cache_worker_control import CacheWorkerManager
@@ -90,6 +125,7 @@ def main():
     args=['--codex-home',str(home),'--evidence-path',str(m.evidence),'--upstream','chatgpt','--port',str(options.port)]
     before=m.config_path.read_bytes()
     peers=IdleConnections()
+    injected=[]
     try:
         roles=['--model-proxy','--cache-worker','--observation-index',str(m.index)] if options.cache_worker else ['--proxy-supervisor']
         m.task.start([str(old),*roles,*args,'--upstream-url',peers.url],autostart=False)
@@ -122,8 +158,14 @@ def main():
                 "updater.drain=drain\nupdater.run()\n",encoding='utf-8')
             # Two launchers must still produce one replacement. Task Scheduler
             # restarts the failed independent updater from the same journal.
-            updater.start([sys.executable,str(fixture)])
-            updater.start([sys.executable,str(fixture)])
+            if sys.platform=='darwin':
+                # Fault injection is a QA process, not a product supervisor.
+                # launchd worker restart is separately verified by the native
+                # service test; here we verify the real journal resumes safely.
+                injected=[subprocess.Popen([sys.executable,str(fixture)]) for _ in range(2)]
+            else:
+                updater.start([sys.executable,str(fixture)])
+                updater.start([sys.executable,str(fixture)])
         elif options.exercise_rollback:
             fixture=root/'verification_failure.py'
             constructor=(f"CacheWorkerManager({str(home)!r},{str(m.index)!r},{str(m.evidence)!r})" if options.cache_worker else
@@ -138,12 +180,18 @@ def main():
                 "        updater.publish('verifying',rejected_instance=result['instance'])\n"
                 "        raise RuntimeError('Isolated verification failure injection')\n    return result\n"
                 "updater.ready=ready\nupdater.run()\n",encoding='utf-8')
-            updater.start([sys.executable,str(fixture)])
+            if sys.platform=='darwin':injected=[subprocess.Popen([sys.executable,str(fixture)])]
+            else:updater.start([sys.executable,str(fixture)])
         else:updater.start([str(new),'--proxy-update',*args,*updater_args])
         deadline=time.monotonic()+(150 if options.interrupt_after_drain else 75)
+        recovered=False
         while time.monotonic()<deadline:
             state=read_json(m.directory/'proxy-update.json')
             if state.get('phase') in ('complete','failed'):break
+            if (sys.platform=='darwin' and options.interrupt_after_drain and not recovered
+                    and injected and all(child.poll() is not None for child in injected)):
+                assert any(child.returncode==75 for child in injected)
+                injected.append(subprocess.Popen([sys.executable,str(fixture)]));recovered=True
             time.sleep(.5)
         if options.expect_unsupported:
             assert state.get('phase')=='failed' and same_process(old_identity),state
@@ -157,7 +205,7 @@ def main():
             registration=updater.inspect()
             if not registration.get('periodic'):break
             time.sleep(.2)
-        assert registration['periodic'] is False and registration['execution_limit']=='PT0S'
+        assert not registration.get('periodic') and registration.get('execution_limit','PT0S')=='PT0S'
         if options.exercise_rollback:assert state.get('restored') and state.get('rejected_instance'),state
         expected_version=old_version if options.exercise_rollback else PROXY_VERSION
         expected_executable=old if options.exercise_rollback else new
@@ -181,21 +229,28 @@ def main():
         from cachemonitor.proxy_websocket import POLICY
         if not options.exercise_rollback:assert health['websocket_policy']==vars(POLICY)
         assert m.config_path.read_bytes()==before
-        result={'phase':state['phase'],'previous':previous,'rollback_verified':options.exercise_rollback,'updater_restart_verified':options.interrupt_after_drain,'current':{**{k:health.get(k) for k in ('version','role','executable','instance','pid')},'executable':str(expected_executable),'role':'cache-worker' if options.cache_worker else 'observer'},'idle_connections_drained':options.idle_connections,'configuration_preserved':True,
+        result={'phase':state['phase'],'previous':previous,'rollback_verified':options.exercise_rollback,
+                'updater_restart_verified':options.interrupt_after_drain and sys.platform!='darwin',
+                'interrupted_journal_resume_verified':options.interrupt_after_drain,
+                'current':{**{k:health.get(k) for k in ('version','role','executable','instance','pid')},'executable':str(expected_executable),'role':'cache-worker' if options.cache_worker else 'observer'},'idle_connections_drained':options.idle_connections,'configuration_preserved':True,
                 'instance_replaced':True,'new_executable_verified':True}
         (root/'result.json').write_text(json.dumps(result,indent=2));print(json.dumps(result))
     finally:
         # Stop the isolated updater before taking the same control lock during
         # cleanup, including when a timed-out transition is still in progress.
         updater.stop()
+        for child in injected:
+            if child.poll() is None:child.terminate()
+            child.wait(timeout=15)
         m.recover_direct()
         deadline=time.monotonic()+15
         while time.monotonic()<deadline:
             if not m.health(timeout=3) and m.health_state=='refused':break
             time.sleep(.5)
         peers.close()
-        m.task.stop();m.task.remove();updater.remove()
+        stop_task(m.task);stop_task(updater)
         if options.cache_worker:
-            collector=ObserverTask(str(m.index.resolve()),role='UsageCollector');collector.stop();collector.remove()
+            collector=ObserverTask(str(m.index.resolve()),role='UsageCollector');stop_task(collector)
+        environment.__exit__(None,None,None)
 
 if __name__=='__main__':main()

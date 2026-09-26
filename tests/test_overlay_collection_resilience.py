@@ -293,6 +293,7 @@ def test_fresh_old_collector_is_replaced_cooperatively(tmp_path,monkeypatch):
     old=launch('2026.09.25.5');client=CollectionClient([home],path,autostart=False)
     monkeypatch.setattr(ObserverTask,'configure',lambda self,command,autostart:configured.append(command))
     monkeypatch.setattr(ObserverTask,'start',lambda *args,**kwargs:launch())
+    monkeypatch.setattr(ObserverTask,'inspect',lambda self:{'running':int(old.is_alive())})
     try:
         deadline=time.monotonic()+10
         while time.monotonic()<deadline:

@@ -1,4 +1,4 @@
-"""Packaged Windows service exit/resume using isolated homes, tasks and ports."""
+"""Packaged service exit/resume using isolated homes, jobs and ports."""
 import argparse
 import json
 import socket
@@ -17,7 +17,7 @@ from cachemonitor.observer_state import read_json
 from cachemonitor.model_evidence import home_key
 from cachemonitor.usage_collection import CollectionClient,resume_collection
 from cachemonitor import proxy_identity as identity
-from verify_proxy_update import IdleConnections
+from verify_proxy_update import IdleConnections,isolated_environment,stop_task
 
 
 def await_value(read,predicate,seconds=30):
@@ -38,7 +38,7 @@ def quit_gui(executable,home,index,evidence,cache):
     command=[str(executable),'--codex-home',str(home),'--index-path',str(index),'--evidence-path',str(evidence),
              '--verify-handoff',str(report),'--verify-services','--hidden']
     if cache:command.append('--cache-control')
-    process=subprocess.Popen(command,creationflags=subprocess.CREATE_NO_WINDOW)
+    process=subprocess.Popen(command,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
     try:
         await_value(lambda:read_json(report),lambda r:r.get('ready'))
         client=QLocalSocket()
@@ -50,7 +50,8 @@ def quit_gui(executable,home,index,evidence,cache):
     finally:
         if process.poll() is None:
             # The isolated fixture owns this GUI and its analysis child only.
-            subprocess.run(['taskkill','/PID',str(process.pid),'/T','/F'],capture_output=True,timeout=15)
+            if sys.platform=='darwin':process.terminate()
+            else:subprocess.run(['taskkill','/PID',str(process.pid),'/T','/F'],capture_output=True,timeout=15)
             process.wait(timeout=10)
 
 
@@ -92,7 +93,7 @@ def verify_legacy_collector(root,old,new):
                     cooperative=True,old_instance_exited=True)
     finally:
         if client:client.close()
-        task.stop();task.remove()
+        stop_task(task)
 
 
 def verify(root,executable,role):
@@ -160,7 +161,7 @@ def verify(root,executable,role):
         upstream.close()
         # Scoped QA cleanup only, including a failed assertion's own children.
         for task in tasks:
-            task.stop();task.remove()
+            stop_task(task)
 
 
 def main():
@@ -172,6 +173,7 @@ def main():
     assert exe.is_file() and not root.exists()
     root.mkdir(parents=True)
     original=sys.executable;frozen=getattr(sys,'frozen',None)
+    environment=isolated_environment(root);environment.__enter__()
     sys.executable=str(exe);sys.frozen=True
     try:
         legacy=verify_legacy_collector(root/'legacy-collector',args.legacy_collector_exe.resolve(),exe) if args.legacy_collector_exe else None
@@ -183,6 +185,7 @@ def main():
         sys.executable=original
         if frozen is None:del sys.frozen
         else:sys.frozen=frozen
+        environment.__exit__(None,None,None)
 
 
 if __name__=='__main__':main()

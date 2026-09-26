@@ -53,6 +53,8 @@ def atomic_write(path, data):
     temporary=path.with_name(path.name+'.'+uuid.uuid4().hex+'.tmp')
     try:
         temporary.write_bytes(data)
+        if os.name != 'nt':
+            temporary.chmod(0o600)
         for attempt in range(6):
             try:
                 os.replace(temporary,path)
@@ -253,7 +255,8 @@ class ObserverManager:
         return self.status()
 
     def verification_environment(self):
-        return {**os.environ,'CODEX_HOME':str(self.home)}
+        from .codex_runtime import runtime_environment
+        return runtime_environment(self.home)
 
     def upstream(self):
         _,config=self.config()
@@ -266,6 +269,13 @@ class ObserverManager:
         if auth.exists():
             data=json.loads(auth.read_text(encoding='utf-8'))
             if data.get('auth_mode')=='chatgpt' or data.get('tokens'):return 'chatgpt'
+            if data.get('auth_mode')=='apikey' or data.get('OPENAI_API_KEY'):return 'openai'
+        if sys.platform == 'darwin':
+            from .quota_live import AccountClient
+            kind=AccountClient(self.home).account_type()
+            if kind=='chatgpt':return 'chatgpt'
+            if kind=='amazonBedrock':
+                raise ValueError('Bedrock 연결은 자동 프록시 전환을 지원하지 않습니다. 기존 연결을 유지합니다.')
         return 'openai'
 
     def enable(self):

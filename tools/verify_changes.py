@@ -29,6 +29,10 @@ def test_files(*names):
 
 # Components select observable contracts. There is deliberately no always-run core.
 GROUPS = {
+    'platform': test_files('platform_support', 'codex_names', 'cache_codex_connection'),
+    'macos_services': test_files('macos_services', 'macos_process', 'app_services', 'managed_proxy'),
+    'macos_ui': test_files('macos_overlay', 'macos_status', 'macos_application'),
+    'macos_install': test_files('macos_installation', 'macos_update', 'macos_release'),
     'app_lifetime': test_files('app_services', 'observer_panel', 'windows_startup', 'proxy_update'),
     'data': test_files('core', 'index', 'data_contract', 'subagent_collection', 'request_tier_snapshots'),
     'analysis': test_files('comparison', 'overview', 'performance', 'data_contract', 'output_speed'),
@@ -76,6 +80,23 @@ GROUPS = {
 
 # First match wins: QML and shared helpers must not fall through to a broad UI gate.
 RULES = (
+    ('cachemonitor/platform_paths.py', ('platform', 'data', 'install')),
+    ('cachemonitor/codex_runtime.py', ('platform', 'quota_poll')),
+    ('cachemonitor/macos_services.py', ('macos_services', 'proxy_lifecycle')),
+    ('cachemonitor/macos_service_entry.py', ('macos_services', 'proxy_lifecycle')),
+    ('cachemonitor/macos_process.py', ('macos_services', 'proxy_lifecycle')),
+    ('cachemonitor/macos_startup.py', ('macos_services', 'install')),
+    ('cachemonitor/overlay_macos.py', ('macos_ui', 'overlay_tracking', 'overlay_controls', 'window')),
+    ('cachemonitor/macos_application.py', ('macos_ui', 'app_lifetime', 'window')),
+    ('cachemonitor/macos_status.py', ('macos_ui', 'taskbar', 'notifications', 'dashboard')),
+    ('cachemonitor/macos_notifications.py', ('macos_ui', 'notifications', 'install')),
+    ('cachemonitor/macos_installation.py', ('macos_install', 'install', 'update')),
+    ('cachemonitor/macos_recovery.py', ('macos_install', 'install', 'proxy_lifecycle')),
+    ('tools/*macos*.py', ('macos_install', 'macos_ui', 'macos_services', 'runtime', 'payload')),
+    ('tools/mac_*.py', ('macos_install', 'install', 'runtime', 'payload')),
+    ('mac_installer_main.py', ('macos_install', 'install', 'payload')),
+    ('.github/workflows/macos.yml', ('selector', 'macos_install', 'install')),
+    ('.github/workflows/macos-release.yml', ('selector', 'macos_install', 'update')),
     ('cachemonitor/proxy_identity.py', ('proxy_lifecycle','install')),
     ('cachemonitor/proxy_target.py', ('proxy_lifecycle','install')),
     ('cachemonitor/cache_db.py', ('cache','cache_ui','cache_connection','proxy_lifecycle')),
@@ -83,7 +104,7 @@ RULES = (
     ('cachemonitor/cache_operating.py', ('cache','cache_ui','cache_connection')),
     ('cachemonitor/cache_panel.py', ('cache_ui','cache_connection')),
     ('cachemonitor/cache_worker_control.py', ('observer','cache','proxy_lifecycle')),
-    ('cachemonitor/cache_hooks.py', ('cache','cache_ui','cache_connection')),
+    ('cachemonitor/cache_hooks.py', ('platform','cache','cache_ui','cache_connection')),
     ('cachemonitor/cache_control.py', ('cache','cache_ui','cache_connection')),
     ('cachemonitor/cache_integration.py', ('cache','data','cost','quota_store')),
     ('cachemonitor/cache_scheduler.py', ('cache','cache_connection','proxy_lifecycle')),
@@ -149,7 +170,7 @@ RULES = (
     ('cachemonitor/charts.py', ('shared_ui', 'quota_chart')),
     ('cachemonitor/theme.py', ('theme',)),
     ('cachemonitor/token_colors.py', ('theme',)),
-    ('cachemonitor/settings_page.py', ('dashboard', 'theme', 'observer')),
+    ('cachemonitor/settings_page.py', ('dashboard', 'theme', 'observer', 'macos_ui')),
     ('cachemonitor/taskbar*.py', ('taskbar',)),
     ('cachemonitor/screens.py', ('window', 'overlay_controls')),
     ('cachemonitor/notifications.py', ('notifications',)),
@@ -188,7 +209,7 @@ RULES = (
     ('tools/verify_app_services.py', ('app_lifetime',)),
     ('cachemonitor/app_shutdown.py', ('app_lifetime',)),
     ('cachemonitor/proxy_drain.py', ('proxy_lifecycle', 'app_lifetime')),
-    ('cachemonitor/tray.py', ('runtime', 'window')),
+    ('cachemonitor/tray.py', ('runtime', 'window', 'macos_ui')),
     ('cachemonitor/launch_context.py', ('install', 'runtime')),
     ('cachemonitor/app_restart.py', ('runtime', 'install', 'payload')),
     ('cachemonitor/windows_integration.py', ('install', 'taskbar')),
@@ -231,6 +252,9 @@ RULES = (
 
 # These changes need frozen executable/install checks in addition to source tests.
 PACKAGE_PATTERNS = (
+    'cachemonitor/macos*.py', 'cachemonitor/overlay_macos.py', 'tools/*macos*.py', 'tools/mac_*.py',
+    'mac_installer_main.py', '.github/workflows/macos.yml', 'cachemonitor/codex_runtime.py',
+    'cachemonitor/platform_paths.py',
     'requirements*', 'build*.ps1', '*.spec', 'installer/*', 'recovery_main.py', 'icons/*.ico',
     'run.py', 'start.ps1', 'tools/Build-*.ps1', 'tools/*install*.py', 'tools/prepare_bad_runtime.py',
     'tools/package_release.py', 'tools/collect_notices.py', 'tools/prepare_sources.py',
@@ -240,6 +264,9 @@ PACKAGE_PATTERNS = (
     'cachemonitor/windows_integration.py', 'cachemonitor/shell_shortcut.py',
 )
 PROXY_PATTERNS = (
+    'cachemonitor/macos_services.py', 'cachemonitor/macos_service_entry.py', 'cachemonitor/macos_process.py',
+    'cachemonitor/macos_installation.py', 'cachemonitor/macos_recovery.py',
+    'cachemonitor/codex_runtime.py', 'cachemonitor/platform_paths.py',
     'cachemonitor/model_proxy.py', 'cachemonitor/proxy*.py', 'cachemonitor/managed_proxy.py',
     'cachemonitor/observer_control.py', 'cachemonitor/observer_state.py', 'cachemonitor/observer_task.py',
     'cachemonitor/connection_recovery.py', 'cachemonitor/evidence_writer.py',

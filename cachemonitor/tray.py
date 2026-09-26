@@ -14,7 +14,14 @@ import time
 
 class TrayWindow(QuickHost):
     def setup_tray(self):
-        self.tray = QSystemTrayIcon(tray_icon(), self)
+        native_mac = (sys.platform == 'darwin'
+                      and QApplication.platformName() == 'cocoa'
+                      and not QApplication.instance().property('cachemonitorDisableShellIntegration'))
+        if native_mac:
+            from .macos_status import MacStatusTray
+            self.tray = MacStatusTray(tray_icon(), self)
+        else:
+            self.tray = QSystemTrayIcon(tray_icon(), self)
         menu = QMenu()
         menu.addAction(tr("대시보드 열기"), self.show_window)
         menu.addSeparator()
@@ -31,16 +38,25 @@ class TrayWindow(QuickHost):
             menu.addAction(action)
             self.quota_actions[mode]=action
         menu.addSeparator()
-        self.taskbar_quota = TaskbarQuota(self.settings,activation_hint='클릭: 대시보드')
+        if sys.platform == 'darwin':
+            from .macos_status import MacQuotaIndicator
+            self.taskbar_quota = MacQuotaIndicator(self.settings, self.tray, self)
+        else:
+            self.taskbar_quota = TaskbarQuota(self.settings,activation_hint='클릭: 대시보드')
         self.taskbar_quota.activated.connect(self.show_window)
-        self.taskbar_action = QAction(tr('작업표시줄 잔여량 위젯'), self, checkable=True)
+        self.taskbar_action = QAction(tr('메뉴 막대 잔여량 표시' if sys.platform == 'darwin' else '작업표시줄 잔여량 위젯'), self, checkable=True)
         self.taskbar_action.setChecked(self.settings.value('taskbar/enabled', True, type=bool))
         self.taskbar_action.triggered.connect(self.set_taskbar_enabled)
         menu.addAction(self.taskbar_action)
         self.taskbar_quota.add_monitor_menu(menu)
         menu.addSeparator()
-        self.startup = QAction(tr("Windows 로그인 시 시작"), self, checkable=True)
-        self.startup.setChecked(self.startup_enabled())
+        self.startup = QAction(tr('로그인 시 시작' if sys.platform == 'darwin' else 'Windows 로그인 시 시작'), self, checkable=True)
+        self._startup_last_verified = None
+        try:
+            self._startup_last_verified = self.startup_enabled()
+        except (OSError, RuntimeError):
+            self.startup_unavailable()
+        self.startup.setChecked(bool(self._startup_last_verified))
         self.startup.triggered.connect(self.set_startup)
         menu.addAction(self.startup)
         menu.addAction(tr("종료"), self.quit_app)
@@ -52,7 +68,8 @@ class TrayWindow(QuickHost):
             menu.insertSeparator(actions[-1])
             self.exit_action = actions[-1]
         self.tray.setContextMenu(menu)
-        self.tray.activated.connect(lambda reason: menu.popup(QCursor.pos()) if reason == QSystemTrayIcon.Trigger else None)
+        if not native_mac:
+            self.tray.activated.connect(lambda reason: menu.popup(QCursor.pos()) if reason == QSystemTrayIcon.Trigger else None)
         self.tray.show()
         self.refresh_tray()
         self.taskbar_quota.set_enabled(self.taskbar_action.isChecked())
@@ -124,38 +141,35 @@ class TrayWindow(QuickHost):
 
     @staticmethod
     def startup_enabled():
-        if os.name != "nt":
-            return False
-        import winreg
-        try:
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run") as key:
-                return bool(winreg.QueryValueEx(key, "CacheMonitor")[0])
-        except OSError:
-            return False
+        from .windows_integration import WindowsStartup
+        return WindowsStartup('CacheMonitor').enabled()
+
+    def startup_unavailable(self):
+        self.startup.setEnabled(False)
+        self.startup.setText(tr('자동 시작 상태 확인 실패'))
+        note=tr('자동 시작 상태를 확인하지 못해 설정을 잠갔습니다. 앱을 다시 열어 확인하세요.')
+        self.startup.setStatusTip(note)
+        self.startup.setToolTip(note)
 
     def set_startup(self, enabled):
-        if os.name != "nt":
-            return
-        import subprocess
-        import winreg
+        from .windows_integration import WindowsStartup
         try:
-            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run") as key:
-                if enabled:
-                    if getattr(sys, "frozen", False):
-                        command = [sys.executable, "--hidden"]
-                    else:
-                        command = [str(Path(sys.executable).with_name("pythonw.exe")), str(Path(__file__).resolve().parents[1] / "run.py"), "--hidden"]
-                    for home in self.snapshot["homes"]:
-                        command.extend(["--codex-home", home])
-                    winreg.SetValueEx(key, "CacheMonitor", 0, winreg.REG_SZ, subprocess.list2cmdline(command))
-                else:
-                    try:
-                        winreg.DeleteValue(key, "CacheMonitor")
-                    except FileNotFoundError:
-                        pass
-        except OSError as exc:
+            if getattr(sys, 'frozen', False):
+                command = [sys.executable, '--hidden']
+            else:
+                executable = str(Path(sys.executable).with_name('pythonw.exe')) if os.name == 'nt' else sys.executable
+                command = [executable, str(Path(__file__).resolve().parents[1] / 'run.py'), '--hidden']
+            for home in self.snapshot['homes']:
+                command.extend(['--codex-home', home])
+            WindowsStartup('CacheMonitor').set_enabled(enabled, command)
+            self._startup_last_verified = bool(enabled)
+        except (OSError, RuntimeError) as exc:
             QMessageBox.warning(self, "자동 시작 설정 실패", str(exc))
-            self.startup.setChecked(self.startup_enabled())
+            try:
+                self._startup_last_verified = self.startup_enabled()
+            except (OSError, RuntimeError):
+                self.startup_unavailable()
+            self.startup.setChecked(bool(self._startup_last_verified))
 
     def quit_app(self,checked=False,*,handoff=False):
         if getattr(self,'_closing',False):return

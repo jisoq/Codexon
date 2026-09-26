@@ -1,5 +1,9 @@
 # 변경 범위별 검증
 
+macOS의 공통 소스 검사는 `python tools/run_ui_checks.py -- python tools/verify_changes.py --full`로 Qt offscreen에서 실행합니다. 네이티브 검증은 `python tools/verify_macos_desktop.py --output artifacts/macos-native.json`, 실제 launchd 검증은 `CODEXON_RUN_LAUNCHD_TESTS=1 python -m pytest tests/test_macos_services.py tests/test_macos_process.py`로 분리합니다. QA 서비스는 `CODEXON_SERVICE_TEST_ROOT`의 전용 경로와 고유 label을 사용합니다. 테스트에서 운영 Codex 홈·포트·서비스 이름을 사용하지 않습니다.
+
+실제 Mac 패키지는 `python tools/mac_verify.py --product <package> --output <새 검사 폴더> --allow-ad-hoc`로 설치·재설치·실패 복원·독립 복구·자료 보존 제거를 검증합니다. `--allow-ad-hoc`는 로컬 QA 전용입니다. 외부 배포용 Developer ID 서명·공증은 자격증명이 준비된 배포에서 별도로 검증합니다. offscreen 통과를 실제 Codex 창 추적, 알림 허용·전달, 여러 물리 화면, 로그인 재기동까지 확인한 것으로 보고하지 않습니다.
+
 `python tools/verify_changes.py --plan`은 마지막 성공 기록과 현재 파일 내용을 비교해 선택 이유와 검사 목록을 보여 줍니다. `python tools/verify_changes.py`가 같은 선택을 실행합니다. 커밋·staged·unstaged·신규·삭제 파일을 포함합니다. 처음 실행해 기준점이 없거나 공통 테스트 설정·의존성을 바꿨을 때는 전체 검사를 실행합니다. 특정 Git 상태와 비교하려면 `--base <ref>`를 지정합니다.
 
 항상 붙는 공통 검사 묶음은 없습니다. 수정한 기능의 관찰 가능한 동작을 검사하는 가장 작은 신뢰할 수 있는 범위를 선택합니다. 작은 UI 변경에 DB·프록시·설치 검사나 별도의 전체 UI 검사를 덧붙이지 않습니다. 예를 들어 오버레이 컨트롤 QML은 컨트롤·배치 검사, 공통 버튼 QML은 대표 공통 UI 검사, 번역 JSON은 번역 계약 검사만 실행합니다. 공유 런타임 변경은 실제 영향을 받는 화면으로 범위를 넓힙니다. 데이터 계산·원본 보호·통신·설정 복구 검사는 해당 로직이 변경될 때 선택합니다.

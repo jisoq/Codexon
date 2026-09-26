@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
+import platform
 import time
 import urllib.request
 from urllib.parse import urlsplit
@@ -28,12 +30,21 @@ def asset_url(value):
     return value
 
 
-def release_asset(release):
+def release_asset(release, *, platform_name=None, architecture=None):
     if release.get('draft') or release.get('prerelease'):
         raise ValueError('정식 배포가 아닙니다.')
     assets=release.get('assets',[])
-    setups=[a for a in assets if a.get('name')=='Codexon-Setup.exe']
-    hashes=[a for a in assets if a.get('name')=='Codexon-Setup.exe.sha256']
+    platform_name = sys.platform if platform_name is None else platform_name
+    if platform_name == 'darwin':
+        architecture = architecture or platform.machine()
+        if architecture not in ('arm64', 'x86_64'):raise ValueError('지원하는 macOS 아키텍처를 확인하지 못했습니다.')
+        names = (f'Codexon-macOS-{architecture}.dmg', 'Codexon-macOS-universal2.dmg')
+        offered = [name for name in names if any(a.get('name') == name for a in assets)
+                   and any(a.get('name') == name+'.sha256' for a in assets)]
+        name = offered[0] if offered else names[0]
+    else:name = 'Codexon-Setup.exe'
+    setups=[a for a in assets if a.get('name')==name]
+    hashes=[a for a in assets if a.get('name')==name+'.sha256']
     if len(setups)!=1 or len(hashes)!=1:
         raise ValueError('이 배포에는 설치형 업데이트가 없습니다. 현재 버전은 유지됩니다.')
     for a in (setups[0],hashes[0]):asset_url(a['browser_download_url'])
@@ -53,7 +64,32 @@ def version_parts(value):
     return tuple(map(int,value.lstrip('v').split('.')))
 
 
-def launch_installer(output,root):
+def mac_release():
+    """Windows-only publications do not hide the newest compatible Mac build."""
+    architecture=platform.machine()
+    if architecture not in ('arm64','x86_64'):
+        raise ValueError('지원하는 macOS 아키텍처를 확인하지 못했습니다.')
+    names=(f'Codexon-macOS-{architecture}.dmg','Codexon-macOS-universal2.dmg')
+    selected=None
+    for page in range(1,21):
+        releases=json.loads(read_url(f'https://api.github.com/repos/{REPOSITORY}/releases?per_page=100&page={page}'))
+        if not isinstance(releases,list):raise ValueError('배포 목록을 확인하지 못했습니다.')
+        for release in releases:
+            if release.get('draft') or release.get('prerelease'):continue
+            try:version=version_parts(release.get('tag_name',''))
+            except ValueError:continue
+            assets={asset.get('name') for asset in release.get('assets',[])}
+            if not any(name in assets and name+'.sha256' in assets for name in names):continue
+            release_asset(release,platform_name='darwin',architecture=architecture)
+            if selected is None or version>version_parts(selected['tag_name']):selected=release
+        if len(releases)<100:return selected
+    raise ValueError('배포 목록이 확인 범위를 초과했습니다. 현재 버전을 유지합니다.')
+
+
+def launch_installer(output,root,version=None):
+    if sys.platform == 'darwin':
+        from .macos_installation import launch_update
+        return launch_update(output, root, expected_version=version.lstrip('v') if version else None)
     from .observer_task import ObserverTask
     # The installer outlives the old GUI's task/job during the handoff.
     ObserverTask(str(root),role='Installer').start([str(output),'/SILENT','/SUPPRESSMSGBOXES','/NORESTART',
@@ -66,14 +102,15 @@ def check_update(progress=lambda _:None, manager=None):
     if not install:
         raise RuntimeError('설치형 Codexon에서 업데이트할 수 있습니다. 설치 프로그램을 한 번 실행해 주세요.')
     progress('업데이트 확인 중…')
-    release=json.loads(read_url('https://api.github.com/repos/'+REPOSITORY+'/releases/latest'))
-    if version_parts(release['tag_name'])<=version_parts(VERSION):
+    release=(mac_release() if install.get('platform')=='darwin' else
+             json.loads(read_url('https://api.github.com/repos/'+REPOSITORY+'/releases/latest')))
+    if release is None or version_parts(release['tag_name'])<=version_parts(VERSION):
         from .install_management import connection_manager
         manager=manager if manager is not None else connection_manager()
         status=manager.status()
         return dict(kind='proxy' if status.get('configured') else 'none',manager=manager,
                     connections=connection_count(status))
-    release_asset(release)
+    release_asset(release, platform_name=install.get('platform', 'win32'))
     try:status=manager.status() if manager is not None else {}
     except Exception:status={}
     return dict(kind='app',release=release,install=install,connections=connection_count(status))
@@ -94,17 +131,18 @@ def update(progress=lambda _:None, manager=None, *, plan=None):
         state=activate_proxy(plan['manager'])
         return '설치할 새 버전이 없습니다. '+(state.get('message') or '')
     release,install=plan['release'],plan['install']
-    asset,checksum=release_asset(release)
+    asset,checksum=release_asset(release, platform_name=install.get('platform', 'win32'))
     text=read_url(checksum['browser_download_url'],1024).decode('ascii').strip()
-    match=re.fullmatch(r'([a-fA-F0-9]{64})\s+\*?Codexon-Setup\.exe',text)
+    name=asset['name']
+    match=re.fullmatch(r'([a-fA-F0-9]{64})\s+\*?'+re.escape(name),text)
     if not match:raise ValueError('설치 파일 검증 정보가 올바르지 않습니다.')
     expected=match[1].lower()
     size=asset.get('size')
     if type(size) is not int or not 0<size<2_000_000_000:raise ValueError('설치 파일 크기가 올바르지 않습니다.')
     directory=Path(install['InstallRoot'])/'downloads'/uuid.uuid4().hex
     directory.mkdir(parents=True)
-    partial=directory/'Codexon-Setup.partial'
-    output=directory/'Codexon-Setup.exe'
+    partial=directory/(name+'.partial')
+    output=directory/name
     progress('새 버전 다운로드 중…')
     digest=hashlib.sha256();total=0;deadline=time.monotonic()+600
     try:
@@ -120,5 +158,5 @@ def update(progress=lambda _:None, manager=None, *, plan=None):
         partial.unlink(missing_ok=True)
     progress('새 버전 설치 중…')
     # The GUI confirms installation before entering this operation.
-    launch_installer(output,install['InstallRoot'])
+    launch_installer(output,install['InstallRoot'],release['tag_name'])
     return '업데이트 설치를 시작했습니다. 연결이 끝나면 프록시도 적용됩니다.'

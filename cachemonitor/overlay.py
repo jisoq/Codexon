@@ -1,5 +1,6 @@
 """Native overlay coordination, separate from Codex and the data collector."""
 import os
+import sys
 import time
 import math
 from PySide6.QtCore import Qt, QTimer, QObject, Signal, QVariantAnimation, QEasingCurve
@@ -18,6 +19,11 @@ def system_dark():
                                r'Software\Microsoft\Windows\CurrentVersion\Themes\Personalize') as key:
                 return not bool(winreg.QueryValueEx(key, 'AppsUseLightTheme')[0])
         except OSError: pass
+    app = QApplication.instance()
+    if app:
+        scheme = app.styleHints().colorScheme()
+        if scheme != Qt.ColorScheme.Unknown:
+            return scheme == Qt.ColorScheme.Dark
     return True
 
 
@@ -86,6 +92,8 @@ class OverlayController(QObject):
         self.position = settings.value('overlay/position', 'bottom-right')
         if self.position not in ('top-right', 'bottom-right'): self.position = 'bottom-right'
         self.target_state = {}
+        self.automatic_state = {}
+        self.manual_session = None
         self.observed_at = self.snapshot_at = 0
         self.snapshot_wall_time = None
         self.header.open_session.connect(self.open_session)
@@ -108,19 +116,73 @@ class OverlayController(QObject):
         for control in (*self.chrome,self.shadow):
             control.winId()
             control.windowHandle().screenChanged.connect(lambda screen: QTimer.singleShot(0,self.refresh))
-        if os.name == 'nt' and native_enabled:
-            from .overlay_windows import WindowsOverlay, SelectionTracker
-            self.native = WindowsOverlay()
-            self.native.configure(int(self.widget.winId()))
-            self.tracker = SelectionTracker()
-            self.tracker.observed.connect(self.receive_target)
-            if self.enabled:self.tracker.start()
+        if native_enabled:
+            if os.name == 'nt':
+                from .overlay_windows import WindowsOverlay, SelectionTracker
+                self.native = WindowsOverlay()
+                self.tracker = SelectionTracker()
+            elif sys.platform == 'darwin':
+                from .overlay_macos import MacOverlay, MacSelectionTracker
+                self.native = MacOverlay()
+                self.native.screen_name = settings.value('overlay/monitor', '')
+                self.tracker = MacSelectionTracker(self.native)
+            if self.native:
+                self.native.configure(int(self.widget.winId()))
+                self.tracker.observed.connect(self.receive_target)
         self.timer = QTimer(self.widget)
         self.timer.timeout.connect(self.refresh)
         self.input_timer=QTimer(self.widget)
         self.input_timer.timeout.connect(self.poll_popup)
         self._pointer_down=False
         if self.native and self.enabled: self.timer.start(1000)
+        if self.tracker and self.enabled:self.tracker.start()
+
+    def set_manual_session(self, home, sid):
+        """An explicit user selection may open a panel without desktop access."""
+        matches = [s for s in self.session_lookup.get(sid, []) if s['home'] == home]
+        if len(matches) != 1:
+            return False
+        self.manual_session = (home, sid)
+        self.set_enabled(True)
+        self.collapsed = False
+        self._store_collapsed()
+        self._update_manual_target()
+        self.changed.emit()
+        self.refresh()
+        return True
+
+    def follow_codex(self):
+        self.manual_session = None
+        self.receive_target(self.automatic_state)
+        self.changed.emit()
+
+    def _update_manual_target(self):
+        if self.manual_session is None:
+            return
+        from .overlay_tracking import Selection
+        self.target_state = dict(target=dict(hwnd=0, pid=os.getpid(), manual=True),
+                                 selection=Selection(self.manual_session[1]),
+                                 issue='선택한 세션을 독립 패널에 표시합니다.')
+        self.observed_at = time.monotonic()
+
+    def selection_matches(self, sid):
+        matches = self.session_lookup.get(sid, [])
+        if self.manual_session is not None:
+            matches = [s for s in matches if s['home'] == self.manual_session[0]]
+        return matches
+
+    def set_monitor(self, name):
+        self.settings.setValue('overlay/monitor', name)
+        if self.native and hasattr(self.native, 'screen_name'):
+            self.native.screen_name = name
+        self.refresh()
+
+    def status_text(self):
+        if not self.enabled:
+            return '세션 패널을 껐습니다.'
+        if self.manual_session:
+            return '선택한 세션을 독립 패널에 표시합니다. Codex를 따라가려면 자동 추적을 선택하세요.'
+        return self.target_state.get('issue') or 'Codex의 현재 세션을 자동으로 표시합니다.'
 
     def navigate_monitor(self, target):
         if target.view != 'speed_alert':
@@ -139,12 +201,12 @@ class OverlayController(QObject):
 
     def selected_scope(self,home,sid):
         selection=self.target_state.get('selection')
-        matches=self.session_lookup.get(sid,[])
+        matches=self.selection_matches(sid)
         return bool(selection and selection.host=='local' and selection.thread_id==sid and len(matches)==1 and matches[0]['home']==home)
 
     def selection_confirmed(self):
         selection=self.target_state.get('selection')
-        return bool(selection and selection.host=='local' and len(self.session_lookup.get(selection.thread_id,[]))==1
+        return bool(selection and selection.host=='local' and len(self.selection_matches(selection.thread_id))==1
                     and time.monotonic()-self.observed_at<=3)
 
     def navigation_availability(self, home, sid):
@@ -166,7 +228,8 @@ class OverlayController(QObject):
         # Re-read current route and process identity immediately before activation.
         if not hasattr(self.native,'confirm_selection'):
             return dict(enabled=False,reason='현재 세션 확인 불가')
-        selection=self.native.confirm_selection(window)
+        selection=(self.target_state.get('selection') if self.manual_session
+                   else self.native.confirm_selection(window))
         if not selection or selection.host!='local' or selection.thread_id!=target.sid:
             return dict(enabled=False,reason='Codex의 현재 세션과 다름' if selection else '현재 세션 확인 불가')
         data=next((s for s in self.session_lookup.get(target.sid,[]) if s['home']==target.home),None)
@@ -191,7 +254,7 @@ class OverlayController(QObject):
 
     def forward_wheel(self,event):
         target=self.target_state.get('target')
-        if self.native and target:self.native.forward_wheel(target['hwnd'],event.angleDelta(),event.globalPosition(),event.modifiers())
+        if self.native and target:self.native.forward_wheel(target['hwnd'],event.angleDelta(),event.globalPosition(),event.modifiers(),event.pixelDelta())
 
     def can_present(self,home,sid):
         return bool(self.enabled and self.selected_scope(home,sid) and self.widget.isVisible()
@@ -248,7 +311,7 @@ class OverlayController(QObject):
     def _session_collapse_key(self):
         selection=self.target_state.get('selection')
         if not selection or selection.host!='local':return None
-        matches=self.session_lookup.get(selection.thread_id,[])
+        matches=self.selection_matches(selection.thread_id)
         if len(matches)!=1:return None
         import hashlib
         home=os.path.normcase(os.path.abspath(matches[0]['home']))
@@ -309,7 +372,7 @@ class OverlayController(QObject):
     def move_keyboard(self, dx, dy):
         target=self.target_state.get('target')
         if not target or not self.native:return
-        dpi=self.native.u.GetDpiForWindow(target['hwnd']) or 96
+        dpi=self.native.dpi(target['hwnd'])
         self.begin_drag((0,0))
         self.end_drag((round(dx*dpi/96),round(dy*dpi/96)))
 
@@ -319,7 +382,7 @@ class OverlayController(QObject):
         if hwnd != self.target_state.get('target',{}).get('hwnd'):return
         frame=self.native.frame(hwnd)
         if not frame:return
-        current=position or self.native.cursor();dpi=self.native.u.GetDpiForWindow(hwnd) or 96
+        current=position or self.native.cursor();dpi=self.native.dpi(hwnd)
         from .overlay_tracking import monitor_anchor_for_position
         self.anchor=monitor_anchor_for_position(frame,geometry,geometry[0]+current[0]-cursor[0],
                       geometry[1]+current[1]-cursor[1],dpi,
@@ -371,11 +434,17 @@ class OverlayController(QObject):
         for control in self.chrome:control.hide()
 
     def receive_target(self, state):
+        self.automatic_state = state
+        if self.manual_session:
+            self._update_manual_target()
+            self.refresh()
+            return
         if state.get('selection')!=self.target_state.get('selection'):
             self.close_popup()
             self.widget.set_content(None,'기록 확인 중',appearance=self.appearance)
         self.target_state = state
         self.observed_at = time.monotonic()
+        self.changed.emit()
         self.refresh()
 
     def set_position(self, position):
@@ -401,7 +470,7 @@ class OverlayController(QObject):
             return None, '기록 확인 중'
         if selection.host != 'local':
             return None, '원격 작업 · 로컬 기록 없음'
-        matches = self.session_lookup.get(selection.thread_id,[])
+        matches = self.selection_matches(selection.thread_id)
         if len(matches) != 1:
             return None, '기록 확인 중' if self.loading else '호출 기록 없음' if not matches else '현재 세션 식별 불가'
         note = ('수집 오류' if self.errors else '수집 지연' if time.monotonic()-self.snapshot_at > 10
@@ -475,6 +544,7 @@ class OverlayController(QObject):
 
     def refresh(self):
         if self.stopped: return
+        self._update_manual_target()
         target = self.target_state.get('target')
         selection = self.target_state.get('selection')
         self.issue = self.target_state.get('issue', '')
@@ -486,7 +556,7 @@ class OverlayController(QObject):
         frame = self.native.frame(target['hwnd'])
         if not frame:
             self.hide_all(); return
-        dpi = self.native.u.GetDpiForWindow(target['hwnd']) or 96
+        dpi = self.native.dpi(target['hwnd'])
         self._placement_context=(frame,dpi)
         self._load_collapsed()
         data, note = self.content()
@@ -501,7 +571,7 @@ class OverlayController(QObject):
             shared_theme().configure(mode,appearance=self.appearance)
             self.reduced_motion=bool(hasattr(self.native,'reduce_motion') and self.native.reduce_motion())
             self.next_theme = time.monotonic()+1
-        self.widget.set_content(data, note, appearance=self.appearance)
+        self.widget.set_content(data, note, appearance=self.appearance, pinned=self.manual_session is not None)
         from .overlay_tracking import anchored_monitor_geometry, extend_monitor_left
         content=self.widget.content_model
         scale=self.appearance.scale
@@ -567,7 +637,7 @@ class OverlayController(QObject):
         content.put(reducedMotion=self.reduced_motion)
         self.icon.view.put(speedWarning=bool(content.speed_alert().get('active')),
                            warning=self.widget.content_model.state.get('overlayWarning'))
-        self.header.set_title(data.get('title','') if data else '',content.context()[0])
+        self.header.set_title(content.display_title(),content.context()[0])
         self.header.session_scope=((data or {}).get('home'),(data or {}).get('id'))
         if mode=='icon':
             self.close_popup()
@@ -676,6 +746,33 @@ def install_overlay(window, native_enabled=True):
         menu.insertAction(before,action)
         menu.insertMenu(before, theme_menu)
         menu.insertSeparator(before)
+    if sys.platform == 'darwin':
+        panel_menu = QMenu(tr('세션 패널'), menu)
+        menu.insertMenu(before, panel_menu)
+        panel_menu.addAction(action)
+        automatic = panel_menu.addAction(tr('Codex의 현재 세션 자동 추적'))
+        automatic.setCheckable(True)
+        automatic.triggered.connect(controller.follow_codex)
+        sessions_menu = panel_menu.addMenu(tr('세션을 선택해 독립 패널 열기'))
+        status = panel_menu.addAction('')
+        status.setEnabled(False)
+        def refresh_panel_menu():
+            automatic.setChecked(controller.manual_session is None)
+            status.setText(tr(controller.status_text()))
+        panel_menu.aboutToShow.connect(refresh_panel_menu)
+        def refresh_sessions_menu():
+            sessions_menu.clear()
+            if not controller.sessions:
+                sessions_menu.addAction(tr('수집된 세션이 없습니다. 대시보드에서 수집 상태를 확인하세요.')).setEnabled(False)
+            for session in controller.sessions[:100]:
+                home, sid = session['home'], session['id']
+                title = session.get('title') or sid
+                item = sessions_menu.addAction(title[:90])
+                item.setCheckable(True)
+                item.setChecked(controller.manual_session == (home, sid))
+                item.triggered.connect(lambda checked, home=home, sid=sid: controller.set_manual_session(home, sid))
+        sessions_menu.aboutToShow.connect(refresh_sessions_menu)
+        panel_menu.addAction(tr('위치 초기화'), controller.reset_position)
     window.worker.failure.connect(lambda error: setattr(controller, 'errors', [error]))
     QApplication.instance().aboutToQuit.connect(controller.stop)
     return controller

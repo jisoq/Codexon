@@ -7,7 +7,8 @@ import json
 import os
 from pathlib import Path
 import subprocess
-import winreg
+if os.name == 'nt':
+    import winreg
 
 from .observer_control import atomic_write
 

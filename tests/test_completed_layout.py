@@ -69,13 +69,18 @@ def test_detail_last_wrapped_line_is_visible_and_selectable(completed_dashboard,
         editors.append(editor)
     clipboard = QApplication.clipboard()
     previous = QMimeData()
-    for mime_type in clipboard.mimeData().formats():
-        previous.setData(mime_type, clipboard.mimeData().data(mime_type))
+    previous_data = clipboard.mimeData()
+    previous_formats = previous_data.formats() if previous_data is not None else ()
+    for mime_type in previous_formats:
+        previous.setData(mime_type, previous_data.data(mime_type))
     try:
         assert QMetaObject.invokeMethod(editors[-1], 'copy')
         assert clipboard.text() == long_text
     finally:
-        clipboard.setMimeData(previous)
+        if previous_formats:
+            clipboard.setMimeData(previous)
+        else:
+            clipboard.clear()
     for editor in editors:
         QMetaObject.invokeMethod(editor, 'deselect')
     scroll = control(window, window.detail_scroll)

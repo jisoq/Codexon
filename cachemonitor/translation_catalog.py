@@ -1,6 +1,7 @@
 """Translation data and saved language, usable without the desktop Qt runtime."""
 import json
 import os
+import sys
 from pathlib import Path
 
 CATALOG = json.loads((Path(__file__).parent/'assets/i18n/en.json').read_text(encoding='utf-8'))
@@ -14,6 +15,11 @@ def saved_language():
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Software\CacheMonitor\CacheMonitor\ui') as key:
                 value = winreg.QueryValueEx(key, 'language')[0]
         except OSError:pass
+    if value is None and sys.platform == 'darwin':
+        # QSettings NativeFormat uses this domain/key. CoreFoundation sees the
+        # preference daemon's current value without depending on desktop Qt.
+        from CoreFoundation import CFPreferencesCopyAppValue
+        value = CFPreferencesCopyAppValue('ui.language', 'com.cachemonitor.CacheMonitor')
     return 'en' if value=='en' else 'ko'
 
 

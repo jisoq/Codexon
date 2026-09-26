@@ -2,7 +2,7 @@
 
 [한국어](README.ko.md) · [English](README.md)
 
-**Codexon is a Windows app for analyzing Codex usage and cache behavior, comparing request/response model names, and managing optional cache maintenance. Its overlay keeps usage visible over your Codex window while you work.**
+**Codexon is a Windows and macOS app for analyzing Codex usage and cache behavior, comparing request/response model names, and managing optional cache maintenance. Its overlay keeps usage visible over your Codex window while you work.**
 
 ![Codexon overlay with sample sessions](docs/media/overlay-sample.png)
 
@@ -15,9 +15,11 @@
 
 Costs are estimates using API prices; they are not your Codex bill. Model monitoring compares names recorded for a request and its response. Live limit checks use the installed Codex app-server and require an available account connection.
 
-Supported installation target: **Windows 10/11 x64**. Setup includes Python, Qt and the independent connection recovery tool. Codexon can use your existing Codex account connection; no separate API key is required.
+Installation targets: **Windows 10/11 x64** and **macOS 13 or later on Apple Silicon or Intel**. Packages include Python, Qt and the independent connection recovery tool. Codexon can use your existing Codex account connection; no separate API key is required.
 
 ## Get started
+
+**On a Mac:** use the matching `Codexon-macOS-arm64.dmg` or `Codexon-macOS-x86_64.dmg` when available in the release. Open **Install Codexon**, then open **Codexon** from your user Applications folder. See the [macOS guide](docs/macos.md) for the menu bar, standalone session panel, permissions, build instructions and the distinction between local builds and notarized releases. The steps below are for Windows.
 
 **Setting up with an AI assistant?** Give it this repository link and ask it to follow the [AI / LLM installation guide](INSTALL.md). It will ask you to run Setup yourself. Tell it when installation is complete, and it will verify the installation, execution environment and settings.
 

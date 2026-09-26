@@ -2,7 +2,7 @@
 
 [English](README.md) · [한국어](README.ko.md)
 
-**Codexon은 Codex의 사용량과 캐시를 분석하고, 요청·응답 모델명 비교와 선택적 캐시 관리를 제공하는 Windows 앱입니다. 작업 중에는 Codex 창 위의 오버레이로 사용량을 확인할 수 있습니다.**
+**Codexon은 Codex의 사용량과 캐시를 분석하고, 요청·응답 모델명 비교와 선택적 캐시 관리를 제공하는 Windows·macOS 앱입니다. 작업 중에는 Codex 창 위의 오버레이로 사용량을 확인할 수 있습니다.**
 
 ![샘플 세션으로 실행한 Codexon 오버레이](docs/media/overlay-sample.png)
 
@@ -15,9 +15,11 @@
 
 비용은 **실제 청구액이 아닌 API 가격 기준 환산액**입니다. 모델 관찰은 요청·응답에 기록된 모델명을 비교합니다. 실시간 한도 조회는 설치된 Codex의 app-server와 계정 연결을 사용합니다.
 
-설치 대상은 **Windows 10/11 x64**입니다. Python·Qt와 독립 연결 복구 도구가 설치 파일에 포함됩니다. Codex 계정 연결을 이용하며, Codexon을 위해 별도의 API 키를 발급할 필요는 없습니다.
+설치 대상은 **Windows 10/11 x64**, **macOS 13 이상 Apple Silicon·Intel**입니다. Python·Qt와 독립 연결 복구 도구가 설치 파일에 포함됩니다. Codex 계정 연결을 이용하며, Codexon을 위해 별도의 API 키를 발급할 필요는 없습니다.
 
 ## 시작하기
+
+**Mac에서는** 릴리즈에 제공된 `Codexon-macOS-arm64.dmg` 또는 `Codexon-macOS-x86_64.dmg`를 선택합니다. **Install Codexon**을 연 뒤 사용자 Applications 폴더의 **Codexon**을 실행하세요. 메뉴 막대·독립 세션 패널·권한·빌드와 로컬 빌드/공증 배포의 차이는 [Mac 사용 안내](docs/macos.ko.md)를 참고하세요. 아래 단계는 Windows용입니다.
 
 **AI와 함께 설치·설정을 확인하려면** 이 저장소 링크를 주고 [AI / LLM 전용 설치 안내](INSTALL.md)를 따르도록 요청하세요. AI가 안내한 Setup을 직접 실행해 설치한 뒤 완료했다고 알려주면, AI가 설치 상태와 실행 환경·설정을 검증합니다.
 

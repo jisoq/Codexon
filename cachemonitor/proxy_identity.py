@@ -1,4 +1,4 @@
-"""Process and deployment identity for cooperative proxy replacement on Windows."""
+"""Process and deployment identity for cooperative service replacement."""
 import ctypes
 import hashlib
 import json
@@ -17,6 +17,9 @@ def digest(path):
 
 
 def process_identity(pid):
+    if sys.platform=='darwin':
+        from .macos_process import process_identity as native_identity
+        return native_identity(pid)
     from ctypes import wintypes as W
     api=ctypes.WinDLL('kernel32',use_last_error=True)
     api.OpenProcess.argtypes=[W.DWORD,W.BOOL,W.DWORD];api.OpenProcess.restype=W.HANDLE
@@ -42,6 +45,9 @@ def process_identity(pid):
 
 
 def process_command(pid):
+    if sys.platform=='darwin':
+        from .macos_process import process_command as native_command
+        return native_command(pid)
     from .launch_context import command_arguments
     script=f"[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); (Get-CimInstance Win32_Process -Filter 'ProcessId={int(pid)}').CommandLine | ConvertTo-Json -Compress"
     result=subprocess.run(['powershell.exe','-NoProfile','-NonInteractive','-Command',script],
@@ -56,8 +62,17 @@ def same_process(saved):
     return process_identity(saved['pid'])==saved
 
 
+def process_exited(saved):
+    """A transient kernel read failure is never proof of a safe replacement."""
+    try:return not same_process(saved)
+    except OSError:return False
+
+
 def listener_pids(url):
     """Read the OS listener table; Windows refusals can outlast short probes."""
+    if sys.platform=='darwin':
+        from .macos_process import listener_pids as native_listeners
+        return native_listeners(url)
     from ctypes import wintypes as W
     api=ctypes.WinDLL('iphlpapi')
     api.GetExtendedTcpTable.argtypes=[ctypes.c_void_p,ctypes.POINTER(W.DWORD),W.BOOL,W.ULONG,ctypes.c_int,W.ULONG]
@@ -88,6 +103,15 @@ def locks_free(paths):
 
 def deployment(executable):
     executable=Path(executable).resolve()
+    if sys.platform=='darwin':
+        from .macos_installation import bundle_for,manifest_for,verify_bundle
+        bundle=bundle_for(executable)
+        if bundle is None:raise RuntimeError('macOS 앱 번들 경로를 확인하지 못했습니다.')
+        manifest=read_json(manifest_for(executable))
+        if manifest.get('product')!='Codexon' or not manifest.get('commit'):
+            raise RuntimeError('배포 파일 무결성 확인 실패 · 기존 프록시를 유지합니다.')
+        verify_bundle(bundle,identifier='io.github.jisoq.codexon',allow_ad_hoc=True)
+        return dict(executable=str(executable),sha256=digest(executable),commit=manifest['commit'])
     manifest=read_json(executable.parent/'build-manifest.json')
     sha=digest(executable)
     if manifest.get('product')!='Codexon' or manifest.get('sha256')!=sha or not manifest.get('commit'):
@@ -97,8 +121,26 @@ def deployment(executable):
 
 def runtime_identity(home,evidence,*,role,upstream,index=None):
     executable=str(Path(sys.executable).resolve())
+    if sys.platform=='darwin':
+        from .macos_installation import manifest_for
+        manifest=read_json(manifest_for(executable))
+    else:manifest=read_json(Path(executable).parent/'build-manifest.json')
     return dict(role=role,home=str(Path(home).resolve()),evidence_path=str(Path(evidence).resolve()),
                 index_path=str(Path(index).resolve()) if index else None,upstream=upstream,
                 executable=executable,executable_sha256=digest(executable),
-                deployment_commit=read_json(Path(executable).parent/'build-manifest.json').get('commit'),
-                process_created=process_identity(os.getpid())['created'] if os.name=='nt' else None)
+                deployment_commit=manifest.get('commit'),
+                process_created=process_identity(os.getpid())['created'] if os.name=='nt' or sys.platform=='darwin' else None)
+
+
+def executable_matches(actual,expected):
+    """Account for Python's documented framework launcher, never just basename."""
+    actual,expected=Path(actual).resolve(),Path(expected).resolve()
+    if actual==expected:return True
+    if sys.platform!='darwin':return False
+    # Homebrew/framework venv launchers exec the framework's Python.app binary.
+    # Frozen Codexon executables do not use this exception.
+    if expected.parent.name!='bin':return False
+    root=expected.parent.parent
+    if root.parent.name!='Versions' or root.parent.parent.name!='Python.framework':return False
+    if expected.name not in ('python','python3',f'python{root.name}'):return False
+    return actual==(root/'Resources'/'Python.app'/'Contents'/'MacOS'/'Python').resolve()

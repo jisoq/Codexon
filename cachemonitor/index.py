@@ -77,7 +77,11 @@ class UsageIndex:
     def __init__(self, homes, path=None, model_evidence_path=None):
         self.cache_index_path=path
         self.homes = [Path(h).resolve() for h in homes]
-        self.path = Path(path) if path else Path(os.environ.get('LOCALAPPDATA', Path.home())) / 'CacheSessionRegistry' / 'usage-index.sqlite'
+        from .platform_paths import app_data_dir
+        import sys
+        default = (app_data_dir() if sys.platform == 'darwin' or os.environ.get('CODEXON_DATA_DIR')
+                   else Path(os.environ.get('LOCALAPPDATA', Path.home())) / 'CacheSessionRegistry')
+        self.path = Path(path) if path else default / 'usage-index.sqlite'
         if any(self.path.resolve().is_relative_to(h) for h in self.homes):
             raise ValueError('앱 색인은 Codex 원본 폴더 밖에 저장해야 합니다')
         self.path.parent.mkdir(parents=True, exist_ok=True)

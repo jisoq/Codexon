@@ -5,10 +5,11 @@ import hashlib
 import json
 import ntpath
 import sqlite3
+from .platform_paths import path_identity, path_within, parent_path
 
 
 def path_key(path):
-    return ntpath.normcase(ntpath.normpath(path.removeprefix('\\\\?\\'))) if path else ''
+    return path_identity(path)
 
 
 def label(value):
@@ -44,7 +45,7 @@ class CodexNames:
         outputs = self.state.get('thread-projectless-output-directories', {})
         if isinstance(outputs, dict):
             self.projectless.update(outputs)
-            self.projectless_roots.update(path_key(ntpath.dirname(path)) for path in outputs.values() if isinstance(path,str) and path)
+            self.projectless_roots.update(path_key(parent_path(path)) for path in outputs.values() if isinstance(path,str) and path)
         try:
             for tid, cwd in db.execute('select id,cwd from threads'):
                 if tid in self.projectless and cwd:
@@ -103,8 +104,7 @@ class CodexNames:
             for pid, roots in self.roots.items():
                 for root in roots:
                     normalized = path_key(root)
-                    if any(path_key(p) == normalized or path_key(p).startswith(normalized.rstrip('\\') + '\\')
-                           for p in (hint, cwd) if p):
+                    if any(path_within(p, root) for p in (hint, cwd) if p):
                         candidates.append((len(normalized), pid))
             if candidates:
                 length = max(item[0] for item in candidates)

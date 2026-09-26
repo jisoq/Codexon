@@ -7,6 +7,8 @@ import sys
 
 
 def screen_id(screen):
+    if sys.platform == 'darwin' and screen.serialNumber():
+        return '|'.join((screen.manufacturer(), screen.model(), screen.serialNumber()))
     if sys.platform!='win32':return screen.name()
     import ctypes
     from ctypes import wintypes as W
