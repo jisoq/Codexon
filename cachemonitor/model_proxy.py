@@ -5,7 +5,7 @@ import argparse
 import asyncio
 import time
 import uuid
-from collections import OrderedDict, defaultdict, deque
+from collections import OrderedDict, defaultdict, deque, Counter
 from pathlib import Path
 import os
 import sqlite3
@@ -163,7 +163,7 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
             'forwarded_http_requests':0,'forwarded_http_responses':0,
             'websocket_policy':dict(vars(policy)),
             'service':'cachemonitor-model-observer',
-            'lifecycle_revision':2,
+            'lifecycle_revision':2,'supports_force_shutdown':bool(control_file),
             'storage_flush_receipt':bool(control_file or managed),
             'version':PROXY_VERSION,'instance':uuid.uuid4().hex,'pid':os.getpid(),
             'identity':hashlib.sha256((home_key(home)+'|'+str(store.path.resolve())).encode()).hexdigest()}
@@ -172,6 +172,8 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
     app=web.Application(handler_args={'auto_decompress':False,'handler_cancellation':True})
     active_relays={}
     sockets={}
+    relay_controls={}
+    force_applied=False
     recent_relays=deque(maxlen=32)
     budget=WebSocketBudget(policy,clock)
 
@@ -181,19 +183,28 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
     def apply_control():
         command=read_json(control_file) if control_file else {}
         if command.get('id')==control_id and command.get('action')=='pause' and scheduler:scheduler.pause()
-        if command.get('id')==control_id and command.get('action')=='drain':health['draining']=True
+        if command.get('id')==control_id and command.get('action') in ('drain','force_shutdown'):
+            health['draining']=True
+            if command['action']=='force_shutdown':health['force_stopping']=True
         if health['draining']:
             budget.draining=True;budget.changed.set()
             if scheduler:scheduler.pause()
 
     async def control_lifecycle(app):
         async def watch():
+            nonlocal force_applied
             last_tick=0
             while True:
                 if managed and time.monotonic()-last_tick>=1:
                     await asyncio.to_thread(managed.tick,health)
                     last_tick=time.monotonic()
                 apply_control()
+                if health.get('force_stopping') and not force_applied:
+                    force_applied=True
+                    if scheduler:scheduler.force_shutdown()
+                    for task,transport in list(relay_controls.values()):
+                        if transport:transport.abort()
+                        if not task.done():task.cancel()
                 if health['draining']:
                     budget.draining=True
                     budget.changed.set()
@@ -244,6 +255,8 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
                 'http_pool':dict(clients=len(getattr(app[HTTP_CLIENT],'clients',())),waiting=getattr(app[HTTP_CLIENT],'waiting',0)),
                 'cache_execution':scheduler.status() if scheduler else None,
                 'active_connections':len(active_relays),
+                'connection_sessions':[dict(session_id=sid,connections=count) for sid,count in
+                    Counter(d.get('_session_id','') for d in active_relays.values()).items()],
                 'active_relays':[public(d) for d in list(active_relays.values())[-32:]],'recent_relays':list(recent_relays)})
         if health['draining']:
             return web.json_response({'error':{'code':'local_proxy_draining','message':'Local proxy is replacing its connection worker; reconnect'}},status=503,headers={'Retry-After':'1'})
@@ -265,7 +278,9 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
                     'request_encoding':identifier(request.headers.get('Content-Encoding','')),
                     'request_bytes':0,'response_bytes':0,'request_frames':0,'response_frames':0}
         relay_id=uuid.uuid4().hex
+        diagnostic['_session_id']=identifier(request.headers.get('session_id',''))
         active_relays[relay_id]=diagnostic
+        relay_controls[relay_id]=(asyncio.current_task(),request.transport)
         phase='upstream_connect'
         response=None
         request_observer=None
@@ -518,6 +533,7 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
             diagnostic.setdefault('outcome','finished')
             active_relays.pop(relay_id,None)
             sockets.pop(relay_id,None)
+            relay_controls.pop(relay_id,None)
             if is_ws:budget.release(relay_id)
             recent_relays.append(public(diagnostic))
             if diagnostics is not None:

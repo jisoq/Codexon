@@ -51,6 +51,10 @@ class Scheduler:
         # until their usage and reservation are durably reconciled.
         self.cancel_schedules()
 
+    def force_shutdown(self):
+        self.pause()
+        self.executor.force_shutdown()
+
     @property
     def settled(self):
         try:

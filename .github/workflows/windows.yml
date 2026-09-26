@@ -100,7 +100,11 @@ jobs:
           .\tools\Build-Installer.ps1 -ProductDir dist-ci/bad-runtime -OutputDir dist-ci/qa-bad-runtime -Compiler $compiler.FullName -Isolated
       - name: Check installation, update and removal
         if: steps.plan.outputs.package == 'true'
-        run: python tools/run_ui_checks.py -- python tools/verify_installation.py --installer dist-ci/qa-setup/Codexon-Setup.exe --broken-installer dist-ci/qa-bad-runtime/Codexon-Setup.exe --output artifacts/verification/installation
+        run: python tools/run_native_checks.py --output artifacts/verification/native-installation -- python tools/run_ui_checks.py -- python tools/verify_installation.py --installer dist-ci/qa-setup/Codexon-Setup.exe --broken-installer dist-ci/qa-bad-runtime/Codexon-Setup.exe --output artifacts/verification/installation
+      - name: Check installation from an MSIX process
+        if: steps.plan.outputs.package == 'true'
+        shell: powershell
+        run: .\tools\verify_msix_installation.ps1 -Installer dist-ci/qa-setup/Codexon-Setup.exe -BrokenInstaller dist-ci/qa-bad-runtime/Codexon-Setup.exe -Output artifacts/verification/msix-installation -Python ((Get-Command python).Source)
       - name: Check frozen runtime and Qt Quick interaction
         if: steps.plan.outputs.package == 'true'
         run: python tools/run_ui_checks.py -- python tools/verify_changes.py --package-only --package-exe dist-ci/Codexon/Codexon.exe

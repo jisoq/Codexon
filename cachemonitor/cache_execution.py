@@ -376,6 +376,7 @@ class Executor:
         self.paused=False
         self.closed=False
         self.renewals={}
+        self.transports=set()
 
     def ingress(self):
         self.generation+=1
@@ -431,6 +432,8 @@ class Executor:
                 return self.journal.permit_operation(key,operation) if operation else True
             transport=asyncio.create_task(asyncio.wait_for(self.send(url,headers,body,websocket=websocket,timeout=latency_bound,
                 permit=permit),latency_bound))
+            self.transports.add(transport)
+            transport.add_done_callback(self.transports.discard)
             while True:
                 try:
                     response=await asyncio.shield(transport)
@@ -461,6 +464,11 @@ class Executor:
             if operation and started is None and not self.closed and generation==self.generation and valid():
                 self.journal.operations.stop(operation['id'],'request_failed')
             return 'failed' if state=='failed' else 'unknown'
+
+    def force_shutdown(self):
+        self.close()
+        self.paused=True
+        for transport in tuple(self.transports):transport.cancel()
 
     def close(self):
         self.closed=True

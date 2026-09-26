@@ -8,6 +8,43 @@ import sys
 MARKER='codexon-cache-control'
 
 
+def migrate_installation(home,root,executable,*,before_write=lambda path,data:None):
+    """Retarget owned installed hooks, preserving arguments and unrelated entries."""
+    import re
+    from .launch_context import command_arguments
+    path=Path(home)/'hooks.json'
+    if not path.exists():return False
+    original=path.read_bytes();document=json.loads(original.decode('utf-8-sig'))
+    root=Path(root).resolve();executable=Path(executable).resolve();changed=False
+    for entries in document.get('hooks',{}).values():
+        for entry in entries:
+            if entry.get('description')!=MARKER:continue
+            for hook in entry.get('hooks',[]):
+                normal=hook.get('command','')
+                args=command_arguments(normal) if normal else []
+                if not args or Path(args[0]).name.lower()!='codexonhook.exe':continue
+                old=Path(args[0]).resolve()
+                if not old.is_relative_to(root/'versions') or old==executable:continue
+                if not executable.is_file():raise OSError('New installed hook executable is missing')
+                match=re.fullmatch(r'\s*(?:"[^"]+"|\S+)(.*)',normal,flags=re.DOTALL)
+                if not match:raise ValueError('Unknown owned hook command')
+                windows=hook.get('commandWindows')
+                if windows is not None:
+                    quoted=re.fullmatch(r"\s*&\s*'((?:[^']|'')+)'(.*)",windows,flags=re.DOTALL)
+                    if not quoted or Path(quoted[1].replace("''","'")).resolve()!=old:
+                        raise ValueError('Owned hook commands disagree; previous installation retained')
+                    hook['commandWindows']="& '"+str(executable).replace("'","''")+"'"+quoted[2]
+                hook['command']=subprocess.list2cmdline([str(executable)])+match[1]
+                changed=True
+    if not changed:return False
+    from .observer_control import atomic_write
+    data=(json.dumps(document,ensure_ascii=False,indent=2)+'\n').encode()
+    before_write(path,data)
+    if path.read_bytes()!=original:raise RuntimeError('Hook file changed during installation')
+    atomic_write(path,data)
+    return True
+
+
 def remove_installation(home,root):
     """Remove only owned entries that would point into the deleted payload."""
     from .launch_context import command_arguments

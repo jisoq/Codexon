@@ -182,6 +182,7 @@ def main(argv=None):
     parser.add_argument('--isolated-install', action='store_true')
     parser.add_argument('--no-launch', action='store_true')
     parser.add_argument('--native-install', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--install-caller-pid', type=int, help=argparse.SUPPRESS)
     parser.add_argument('--language', choices=('en','ko'))
     parser.add_argument('--ui-smoke', type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
@@ -194,10 +195,10 @@ def main(argv=None):
             packaged=packaged_context()
             if args.native_install and packaged:
                 raise RuntimeError('Windows 기본 환경에서 설치를 시작하지 못했습니다. 기존 설치를 유지합니다.')
-            if packaged:
+            if not args.native_install:
                 result=native_install(args)
             elif args.prepare_uninstall:
-                result=prepare_uninstall(args.install_root,isolated=args.isolated_install)
+                result=prepare_uninstall(args.install_root,isolated=args.isolated_install,caller_pid=args.install_caller_pid)
             else:
                 result=finish(args.install_root,args.product_dir,Path(sys.executable),
                               isolated=args.isolated_install,launch=not args.no_launch,

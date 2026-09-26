@@ -85,6 +85,10 @@ class Activation:
         except OSError as exc:errors.append(str(exc))
         for path, data in self.state['files']:
             try:
+                expected=self.state.get('guards',{}).get(path)
+                if expected is not None:
+                    current=base64.b64encode(Path(path).read_bytes()).decode() if Path(path).exists() else None
+                    if current not in (expected,data):raise OSError('Concurrent edit preserved: '+path)
                 if data is None:Path(path).unlink(missing_ok=True)
                 else:
                     old = base64.b64decode(data)
@@ -92,6 +96,13 @@ class Activation:
             except OSError as exc:errors.append(str(exc))
         if errors:raise RuntimeError('Activation rollback needs retry: '+'; '.join(errors))
         self.journal.unlink(missing_ok=True)
+
+    def track_file(self, path, expected):
+        path=Path(path)
+        if any(saved==str(path) for saved,_ in self.state['files']):return
+        self.state['files'].append([str(path),base64.b64encode(path.read_bytes()).decode() if path.exists() else None])
+        self.state.setdefault('guards',{})[str(path)]=base64.b64encode(expected).decode()
+        atomic_write(self.journal,json.dumps(self.state,ensure_ascii=False).encode())
 
     def commit(self):
         self.journal.unlink()
@@ -121,12 +132,18 @@ foreach ($entry in $entries) {
   $link.TargetPath=$entry.target
   $link.WorkingDirectory=$entry.cwd
   $link.Save()
+  $verified=$shell.CreateShortcut($entry.path)
+  if($verified.TargetPath -ne $entry.target -or $verified.WorkingDirectory -ne $entry.cwd){throw 'Shortcut verification failed'}
 }
 """.replace('__DATA__', encoded)
     result = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-EncodedCommand',
         base64.b64encode(script.encode('utf-16-le')).decode()], capture_output=True,
         timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)
     if result.returncode:raise OSError('Cannot update Start menu shortcuts')
+    for path,field,value in values:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,path) as key:
+            if winreg.QueryValueEx(key,field)!=(value,winreg.REG_SZ):
+                raise OSError('Shell registry verification failed')
     from .shell_shortcut import application_id
     application_id(selected,name+'.Recovery')
     for path in links[1:]:

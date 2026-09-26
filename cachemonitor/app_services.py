@@ -207,7 +207,7 @@ class AppServices:
             if self.clock()>=deadline:raise RuntimeError(message)
             self.sleep(.2)
 
-    def stop_proxy(self):
+    def stop_proxy(self,*,force_requested=lambda:False):
         from .model_evidence import home_key
         from .observer_task import ObserverTask
         from .proxy_update import ProxyUpdate, BUSY
@@ -270,7 +270,7 @@ class AppServices:
 
         if source:
             ProxyDrain(m,self.target,publish=self.publish,before_drain=restore_route,
-                       clock=self.clock,sleep=self.sleep).run(source)
+                       clock=self.clock,sleep=self.sleep,force_requested=force_requested).run(source)
         restore_route()
         self.save(phase='stopped')
 
@@ -307,10 +307,10 @@ class AppServices:
                 self.wait(lambda:not task.inspect().get('running'),'수집기 작업 종료 확인 지연')
         finally:channel.close()
 
-    def stop(self):
+    def stop(self,*,force_requested=lambda:False):
         self.deactivate()
         if self.manager:
-            try:self.stop_proxy()
+            try:self.stop_proxy(force_requested=force_requested)
             except Exception:
                 self.save(phase='failed');raise
         if self.collection:self.stop_collection()

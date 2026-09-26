@@ -29,6 +29,7 @@ def native_install(args):
     command=[sys.executable]
     if not getattr(sys,'frozen',False):command.append(str(Path(__file__).resolve().parents[1]/'recovery_main.py'))
     command+=['--native-install','--install-root',str(args.install_root),'--report',str(report)]
+    if args.prepare_uninstall:command+=['--install-caller-pid',str(os.getpid())]
     for key in ('product_dir','language'):
         value=getattr(args,key,None)
         if value:command+=['--'+key.replace('_','-'),str(value)]
@@ -44,8 +45,11 @@ def native_install(args):
             if not result:raise RuntimeError('설치 결과를 읽지 못했습니다. 설치 기록을 보존합니다.')
             if not registration.get('running'):
                 task.remove()
+                if registration.get('last_result') != (1 if result.get('error') else 0):
+                    raise RuntimeError('Windows 설치 작업의 종료 코드와 결과가 일치하지 않습니다.')
                 return result
-        elif not registration.get('running') and registration.get('state') not in (2,4):
+        elif (not registration.get('running') and registration.get('state') not in (2,4)
+              and registration.get('last_result')!=267011):
             task.remove()
             raise RuntimeError('Windows 설치 작업이 결과 없이 종료되었습니다. 기존 설치를 확인해 주세요.')
         time.sleep(.5)

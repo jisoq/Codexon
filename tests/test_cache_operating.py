@@ -460,7 +460,7 @@ def test_shared_call_limit_serialization_and_same_context_rounds(tmp_path,second
     run_proxy_test(scenario())
 
 
-@pytest.mark.parametrize('outcome',['overshoot','cost_excess','output_excess','partial','missing','missing_write','429','timeout','return_disable','close','revoke','incomplete'])
+@pytest.mark.parametrize('outcome',['overshoot','cost_excess','output_excess','partial','missing','missing_write','429','timeout','return_disable','close','force','revoke','incomplete'])
 def test_durable_stops_drain_and_unknown_usage(tmp_path,outcome):
     async def scenario():
         index=tmp_path/'index.sqlite';entered=asyncio.Event();release=asyncio.Event();seen=[]
@@ -489,6 +489,9 @@ def test_durable_stops_drain_and_unknown_usage(tmp_path,outcome):
             await scheduler.tick();await asyncio.wait_for(entered.wait(),2)
             task=scheduler.jobs['session'];closing=None
             if outcome=='close':closing=asyncio.create_task(scheduler.close())
+            elif outcome=='force':
+                scheduler.force_shutdown()
+                await asyncio.wait_for(asyncio.shield(task),1)
             elif outcome=='return_disable':
                 scheduler.executor.ingress();scheduler.executor.leave();scheduler.control.set('automatic',False)
                 for _ in range(3):await scheduler.tick();task.cancel();await asyncio.sleep(0)
@@ -499,7 +502,7 @@ def test_durable_stops_drain_and_unknown_usage(tmp_path,outcome):
         journal=Journal(control_path(index));journal.recover_exclusive()
         rows=journal.rows();grant=journal.operations.grants()[0]
         assert len(seen)==len(rows)==1
-        unknown=outcome in ('missing','missing_write','429','timeout')
+        unknown=outcome in ('missing','missing_write','429','timeout','force')
         assert (rows[0]['cost'] is None)==unknown
         if outcome=='overshoot':
             assert rows[0]['cost']>grant['cost_stop'] and grant['stopped']=='observed_cost_stop'

@@ -163,6 +163,72 @@ def test_session_collapse_reloads_from_fresh_controller(layout_controller):
     finally:restored.stop()
 
 
+@pytest.mark.parametrize('mode', ['monitor','detail','icon'])
+@pytest.mark.parametrize('source', ['known','missing','remote'])
+def test_drag_moves_without_content_refresh(layout_controller,monkeypatch,mode,source):
+    c=layout_controller
+    if source=='missing':c.receive_snapshot({'overlay_sessions':[]})
+    if source=='remote':c.receive_target({'target':{'hwnd':1},'selection':Selection(A,host='remote')})
+    c.expanded=mode=='detail';c.collapsed=mode=='icon';c.refresh()
+    def unexpected(*args,**kwargs):pytest.fail('Pure drag refreshed content')
+    monkeypatch.setattr(c.widget,'set_content',unexpected)
+    c.begin_drag((500,500));before=c.current_geometry
+    c.move_drag((480,480))
+    assert c.current_geometry[:2]==(before[0]-20,before[1]-20)
+    c.cancel_drag()
+
+
+def test_drag_coalesces_positions_and_applies_latest_snapshot_on_release(layout_controller,monkeypatch):
+    from copy import deepcopy
+    c=layout_controller;app=QApplication.instance();before=c.current_geometry
+    original=c.widget.set_content;updates=[]
+    def record(*args,**kwargs):updates.append(args[0]);return original(*args,**kwargs)
+    monkeypatch.setattr(c.widget,'set_content',record)
+    c.begin_drag((500,500))
+    for i in range(1,21):
+        data=deepcopy(c.sessions[0]);data['title']=f'update {i}'
+        c.receive_snapshot({'overlay_sessions':[data]})
+        c.queue_drag((500-i,500-i))
+    assert not updates and c.current_geometry==before
+    app.processEvents()
+    assert c.current_geometry[:2]==(before[0]-20,before[1]-20)
+    c.queue_drag((450,450));c.end_drag((460,460))
+    final=c.current_geometry
+    assert final[:2]==(before[0]-40,before[1]-40)
+    assert len(updates)==1 and updates[0]['title']=='update 20'
+    app.processEvents()
+    assert c.current_geometry==final and not c.drag_timer.isActive()
+
+
+@pytest.mark.parametrize('reason',['hidden','stale','selection','capture'])
+def test_drag_cancellation_discards_pending_position(layout_controller,reason):
+    import time
+    from PySide6.QtCore import QEvent,QPoint
+    c=layout_controller;c.begin_drag((500,500));c.queue_drag((400,400));before=c.anchor
+    if reason=='hidden':c.native.visible=False;c.refresh()
+    elif reason=='stale':c.observed_at=time.monotonic()-4;c.refresh()
+    elif reason=='selection':c.receive_target({'target':{'hwnd':1},'selection':Selection('another')})
+    else:
+        c.header.press=QPoint(0,0)
+        QApplication.sendEvent(c.header,QEvent(QEvent.UngrabMouse))
+    QApplication.processEvents()
+    assert c.drag_context is None and not c.drag_timer.isActive() and c.anchor==before
+
+
+@pytest.mark.parametrize('dpi',[96,144])
+def test_drag_layout_change_keeps_deferred_content(layout_controller,monkeypatch,dpi):
+    c=layout_controller;c.begin_drag((500,500))
+    def unexpected(*args,**kwargs):pytest.fail('Layout applied deferred content')
+    monkeypatch.setattr(c.widget,'set_content',unexpected)
+    c.native.bounds=(0,0,1200,900)
+    monkeypatch.setattr(c.native.u,'GetDpiForWindow',lambda hwnd:dpi)
+    c.refresh()
+    c.move_drag((480,480))
+    assert c._placement_context==(c.native.bounds,dpi)
+    assert c.current_geometry[0]+c.current_geometry[2]<=1184
+    c.cancel_drag()
+
+
 @pytest.mark.parametrize('destination',['opacityButton','restore'])
 @pytest.mark.parametrize('tab_activation',[False,True])
 def test_delayed_window_activation_preserves_keyboard_destination(layout_controller,destination,tab_activation):

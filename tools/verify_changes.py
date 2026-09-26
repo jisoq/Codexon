@@ -189,7 +189,7 @@ RULES = (
     ('tools/verify_app_services.py', ('app_lifetime',)),
     ('cachemonitor/app_shutdown.py', ('app_lifetime',)),
     ('cachemonitor/proxy_drain.py', ('proxy_lifecycle', 'app_lifetime')),
-    ('cachemonitor/tray.py', ('runtime', 'window')),
+    ('cachemonitor/tray.py', ('runtime', 'window', 'app_lifetime')),
     ('cachemonitor/launch_context.py', ('install', 'runtime')),
     ('cachemonitor/app_restart.py', ('runtime', 'install', 'payload')),
     ('cachemonitor/windows_integration.py', ('install', 'taskbar')),
@@ -214,6 +214,8 @@ RULES = (
     ('tools/font_render_probe.py', ('shared_ui',)),
     ('tools/verify_recovery.py', ('install',)),
     ('tools/verify_installation.py', ('install',)),
+    ('tools/verify_msix_installation.ps1', ('install',)),
+    ('tools/run_native_checks.py', ('install',)),
     ('tools/prepare_legacy_release.py', ('install',)),
     ('tools/verify_gui_handoff.py', ('install',)),
     ('tools/installer_identity.py', ('install',)),
@@ -234,6 +236,7 @@ RULES = (
 # These changes need frozen executable/install checks in addition to source tests.
 PACKAGE_PATTERNS = (
     'requirements*', 'build*.ps1', '*.spec', 'installer/*', 'recovery_main.py', 'icons/*.ico',
+    'tools/verify_msix_installation.ps1', 'tools/run_native_checks.py',
     'run.py', 'start.ps1', 'tools/Build-*.ps1', 'tools/*install*.py', 'tools/prepare_bad_runtime.py',
     'tools/package_release.py', 'tools/collect_notices.py', 'tools/prepare_sources.py',
     'tools/verify_recovery.py', 'tools/verify_gui_handoff.py', 'tools/configure-app-task.ps1',

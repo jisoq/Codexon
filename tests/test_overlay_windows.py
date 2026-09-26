@@ -12,6 +12,57 @@ from cachemonitor.overlay import OverlayController
 from cachemonitor.overlay_tracking import Selection, anchored_monitor_geometry
 
 
+@pytest.mark.skipif(sys.platform != 'win32', reason='Native Windows enumeration callback')
+@pytest.mark.parametrize('styles, expected', [
+    ([0x240100], [1]),                         # Main window only.
+    ([0x280088, 0x240100], [2]),               # Pet before main in Z order.
+    ([0x240100, 0x2800a8], [1]),               # Click-through Mini after main.
+    ([0x280088], []),                         # No main window.
+    ([0x240100, 0x280088, 0x240100], [1, 3]),  # Two real main windows stay ambiguous.
+    ([0x240108, 0x280088], [1]),               # Topmost main is still eligible.
+])
+def test_tool_windows_do_not_count_as_primary_targets(styles, expected, monkeypatch, tmp_path):
+    from ctypes import wintypes as W
+    from cachemonitor.overlay_windows import WindowsOverlay, observe_selection
+
+    class API:
+        @staticmethod
+        def EnumWindows(visit, context):
+            for hwnd in range(1, len(styles)+1):
+                assert visit(hwnd, context)
+        def IsWindowVisible(self, hwnd): return True
+        def GetClassNameW(self, hwnd, buffer, size): buffer.value = 'Chrome_WidgetWin_1'
+        def GetWindowLongPtrW(self, hwnd, index):
+            assert index == -20
+            return styles[hwnd-1]
+        def GetWindowThreadProcessId(self, hwnd, pointer):
+            ctypes.cast(pointer, ctypes.POINTER(W.DWORD)).contents.value = 42
+        def GetWindowTextW(self, hwnd, buffer, size): buffer.value = 'ChatGPT'
+        def OpenProcess(self, *args): return 42
+        def QueryFullProcessImageNameW(self, process, flags, buffer, size):
+            buffer.value = r'C:\Program Files\WindowsApps\OpenAI.Codex_26.924.2738.0_x64__fixture\app\ChatGPT.exe'
+            return True
+        def CloseHandle(self, process): pass
+
+    selection = Selection('11111111-1111-1111-1111-111111111111')
+    class Log:
+        def poll(self, pid, now):
+            assert pid == 42
+            return selection
+
+    native = WindowsOverlay.__new__(WindowsOverlay)
+    native.u = native.k = API()
+    native._navigation_log = Log()
+    monkeypatch.setenv('LOCALAPPDATA', str(tmp_path))
+    targets = native.targets()
+    assert [target['hwnd'] for target in targets] == expected
+    observed = observe_selection(targets, native._navigation_log, 0)
+    wanted = selection if len(expected) == 1 else None
+    assert observed['selection'] == wanted
+    candidate = dict(hwnd=expected[0] if expected else 1, pid=42)
+    assert native.confirm_selection(candidate) == wanted
+
+
 @pytest.mark.skipif(sys.platform != 'win32', reason='Native Windows overlay')
 def test_foreground_companion_does_not_hide_its_codex_target():
     from cachemonitor.overlay_windows import WindowsOverlay

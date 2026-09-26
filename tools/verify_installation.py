@@ -3,6 +3,8 @@ import argparse
 import ctypes
 from ctypes import wintypes as W
 import json
+import os
+import base64
 from pathlib import Path
 import socket
 import subprocess
@@ -27,6 +29,22 @@ def registration():
 
 
 def run(command):
+    if os.environ.get('CODEXON_QA_PACKAGE_FAMILY') and Path(command[0]).name=='Codexon-Setup.exe':
+        require_qa_installer(Path(command[0]))
+        proof=Path(os.environ['CODEXON_QA_PACKAGE_REPORTS'])/(uuid.uuid4().hex+'.json')
+        request=dict(family=os.environ['CODEXON_QA_PACKAGE_FAMILY'],launcher=os.environ['CODEXON_QA_PACKAGE_LAUNCHER'],
+            arguments=subprocess.list2cmdline([str(command[0]),subprocess.list2cmdline(list(map(str,command[1:]))),str(proof)]))
+        encoded=base64.b64encode(json.dumps(request).encode()).decode()
+        script="$p=ConvertFrom-Json ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('"+encoded+"'))); Invoke-CommandInDesktopPackage -PackageFamilyName $p.family -AppId Launcher -Command $p.launcher -Args $p.arguments -PreventBreakaway -ErrorAction Stop"
+        subprocess.run(['powershell.exe','-NoProfile','-NonInteractive','-EncodedCommand',base64.b64encode(script.encode('utf-16-le')).decode()],check=True,creationflags=subprocess.CREATE_NO_WINDOW)
+        deadline=time.monotonic()+180
+        while time.monotonic()<deadline:
+            value=read_json(proof)
+            if value:
+                assert value['packaged'] is True,'MSIX context was not established'
+                return value['exit_code']
+            time.sleep(.5)
+        raise RuntimeError('Packaged installer did not complete; preserve its evidence')
     return subprocess.run(list(map(str,command)),timeout=180,creationflags=subprocess.CREATE_NO_WINDOW).returncode
 
 

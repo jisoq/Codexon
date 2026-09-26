@@ -55,12 +55,13 @@ $definition.Settings.RestartInterval='PT1M'
     assert registration['periodic'] and registration['restartCount']==3
 
 
-def quit_gui(executable,home,index,evidence,cache):
+def quit_gui(executable,home,index,evidence,cache,*,force=False):
     from PySide6.QtCore import QCoreApplication
     from PySide6.QtNetwork import QLocalSocket
     import hashlib
     app=QCoreApplication.instance() or QCoreApplication([])
     report=index.parent/'gui.json'
+    report.unlink(missing_ok=True)
     command=[str(executable),'--codex-home',str(home),'--index-path',str(index),'--evidence-path',str(evidence),
              '--verify-handoff',str(report),'--verify-services','--hidden']
     if cache:command.append('--cache-control')
@@ -72,6 +73,13 @@ def quit_gui(executable,home,index,evidence,cache):
         assert client.waitForConnected(3000)
         client.write(b'verify-quit');assert client.waitForBytesWritten(3000)
         assert client.waitForReadyRead(3000) and bytes(client.readAll())==b'quitting'
+        deadline=time.monotonic()+15
+        while time.monotonic()<deadline and process.poll() is None:
+            time.sleep(.2)
+            choice=QLocalSocket();choice.connectToServer('CodexonQA-'+hashlib.sha256(str(index.resolve()).encode()).hexdigest()[:24])
+            if not choice.waitForConnected(1000):continue
+            choice.write(b'verify-exit-force' if force else b'verify-exit-safe');choice.waitForBytesWritten(1000)
+            if choice.waitForReadyRead(1000) and bytes(choice.readAll())==b'accepted':break
         assert process.wait(timeout=90)==0
     finally:
         if process.poll() is None:
@@ -195,7 +203,16 @@ def verify(root,executable,role):
         assert not manager.task.inspect()['autostart']
         assert manager.config()[1]['openai_base_url']==url
         assert not resume_proxy(manager)
-        services.stop()
+        upstream.open(url,2)
+        import asyncio
+        async def busy():
+            for ws in upstream.sockets:
+                if not ws.closed:await ws.send_json({'type':'response.create','model':'synthetic'})
+        asyncio.run_coroutine_threadsafe(busy(),upstream.loop).result(5)
+        await_value(lambda:manager.health(timeout=1),lambda h:h and h['websocket_states']['responding']==2)
+        forced_source=ProxyTarget(manager).capture(manager.health(timeout=2))
+        quit_gui(executable,home,index,evidence,cache,force=True)
+        assert ProxyTarget(manager).stopped(forced_source)
         assert identity.port_free(url) and identity.locks_free(ProxyTarget(manager).locks)
         return dict(role=role,before={k:before.get(k) for k in ('pid','version','instance','executable')},
                     resumed={k:after.get(k) for k in ('pid','version','instance','executable')},

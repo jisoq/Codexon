@@ -300,7 +300,7 @@ def test_quit_waits_responsively_and_handoff_does_not_stop_services(tmp_path,mon
     app=QApplication.instance() or QApplication([])
     app.setProperty('cachemonitorDisableShellIntegration',True)
     release=threading.Event();entered=threading.Event();finished=[]
-    def stop(self):entered.set();assert release.wait(10)
+    def stop(self,**kwargs):entered.set();assert release.wait(10)
     monkeypatch.setattr(services.AppServices,'stop',stop)
     window=Dashboard([str(tmp_path/'home')],start_worker=False,live_limits=False,
         index_path=str(tmp_path/'index.sqlite'),settings=QSettings(str(tmp_path/'settings.ini'),QSettings.IniFormat))
@@ -323,3 +323,69 @@ def test_quit_waits_responsively_and_handoff_does_not_stop_services(tmp_path,mon
         release.set()
         if getattr(window,'shutdown_operation',None):window.shutdown_operation.wait()
         window.quitting=True;window.close();window.deleteLater();app.processEvents()
+
+
+def test_exit_inventory_uses_exact_home_and_session(tmp_path):
+    from cachemonitor.app_shutdown import ExitConnectionCheck,exit_message
+    manager=SimpleNamespace(home=tmp_path/'home',health=lambda **kw:dict(active_connections=4,
+        supports_force_shutdown=True,connection_sessions=[dict(session_id='a',connections=2),
+        dict(session_id='b',connections=1),dict(session_id='',connections=1)]))
+    check=ExitConnectionCheck(manager,None);check.run()
+    text=exit_message(check,dict(sessions=[dict(home=str(manager.home),id='a',title='My chat'),
+        dict(home=str(tmp_path/'other'),id='b',title='Wrong home')]))
+    assert check.count==4 and 'My chat' in text and 'Wrong home' not in text
+    assert 'b · 연결 1개' in text and '세션 확인 불가' in text
+    manager.health=lambda **kw:None;manager.health_state='unknown'
+    unknown=ExitConnectionCheck(manager,None);unknown.run();assert unknown.count is None
+    manager.health_state='refused'
+    empty=ExitConnectionCheck(manager,None);empty.run();assert empty.count==0
+
+
+@pytest.mark.parametrize('initial',[True,False])
+def test_force_exit_can_escalate_unknown_connections(running,initial):
+    manager,runtime=running
+    runtime['health'].update(supports_force_shutdown=True,websocket_states={'unknown':1})
+    requested=[initial];commands=[]
+    def health(**kw):
+        control=read_json(manager.directory/('proxy-control-'+'a'*32+'.json'))
+        commands.append(control.get('action'))
+        if control.get('action')=='force_shutdown':runtime['health']=None
+        manager.health_state='healthy' if runtime['health'] else 'refused'
+        return runtime['health']
+    manager.health=health
+    lifecycle=services.AppServices(manager,[],collection=False,sleep=lambda _:requested.__setitem__(0,True))
+    lifecycle.stop(force_requested=lambda:requested[0])
+    assert 'force_shutdown' in commands and runtime['health'] is None
+    assert read_json(services.session_path(manager))['phase']=='stopped'
+
+
+def test_exit_dialog_buttons_and_escape(tmp_path):
+    from PySide6.QtWidgets import QApplication
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+    from cachemonitor.app_shutdown import ExitConfirmation,ShutdownProgress
+    app=QApplication.instance() or QApplication([])
+    check=SimpleNamespace(count=1,manager=SimpleNamespace(home=tmp_path),
+        health=dict(supports_force_shutdown=True,connection_sessions=[dict(session_id='session',connections=1)]))
+    for choice in ('cancel','confirm','force','escape'):
+        dialog=ExitConfirmation(check,{},None);results=[];dialog.finished.connect(results.append);dialog.open()
+        app.processEvents();QTest.qWait(30)
+        assert dialog.host.quick.status().name=='Ready' and not dialog.host.qml_errors
+        if choice=='escape':QTest.keyClick(dialog.host,Qt.Key_Escape)
+        else:
+            from cachemonitor.quick_qa import click,control
+            click(dialog.host,control(dialog.host,getattr(dialog,choice)))
+        for _ in range(5):app.processEvents();QTest.qWait(5)
+        assert results==[dict(cancel=0,confirm=1,force=2,escape=0)[choice]]
+    progress=ShutdownProgress(None,True);progress.show();app.processEvents()
+    QTest.keyClick(progress,Qt.Key_Escape);assert progress.isVisible()
+    progress.force.click();assert not progress.force.isEnabled()
+    progress.accept();progress.deleteLater();app.processEvents()
+
+
+def test_force_rejects_unsupported_worker(running):
+    manager,runtime=running
+    runtime['work']=100
+    with pytest.raises(RuntimeError,match='업데이트'):
+        services.AppServices(manager,[],collection=False).stop(force_requested=lambda:True)
+    assert runtime['health'] is not None
