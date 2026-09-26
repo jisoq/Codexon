@@ -315,7 +315,7 @@ def test_dependents(changed, root):
             and (root / path).is_file()}
 
 
-def select_tests(changed, *, root=None):
+def select_tests(changed, *, root=None, deleted=()):
     """Map changes to contracts; unmapped code is an actionable selection error."""
     root = root or ROOT
     first_run = changed is None
@@ -325,6 +325,7 @@ def select_tests(changed, *, root=None):
     package = proxy or first_run or any(matches(path, PACKAGE_PATTERNS) for path in paths)
     selected, groups, unmapped = set(), set(), set()
     reasons = {}
+    removed_contract=False
 
     def add(test, reason):
         selected.add(test)
@@ -344,12 +345,19 @@ def select_tests(changed, *, root=None):
                 for test in GROUPS[group]:
                     add(test, path)
         elif not matches(path, DOC_PATTERNS):
-            unmapped.add(path)
+            if path in deleted and not (root/path).exists():
+                # A removed subsystem has no current rule or executable tests.
+                # Validate all remaining consumers and the frozen product.
+                full=package=proxy=True
+                removed_contract=True
+            else:unmapped.add(path)
     # A file selection subsumes any specific node selections from other changes.
     selected = {test for test in selected if '::' not in test or test.split('::')[0] not in selected}
     if full:
         selected = {'tests'}
-        reasons = {'tests': ['검증 기준점 없음' if first_run else '공통 검사 설정 또는 의존성 변경']}
+        reasons = {'tests': ['검증 기준점 없음' if first_run else
+                            '제거된 구성요소의 남은 참조와 패키지 검증' if removed_contract else
+                            '공통 검사 설정 또는 의존성 변경']}
         groups.add('full')
     return dict(full=full, tests=tuple(sorted(selected)),
                 reasons={test: reasons[test] for test in sorted(selected)},
@@ -429,7 +437,7 @@ def main(argv=None):
     current = file_hashes()
     baseline = json.loads(BASELINE.read_text(encoding='utf-8')) if BASELINE.is_file() else None
     changed = changed_files(current, baseline, args.base)
-    plan = select_tests(changed)
+    plan = select_tests(changed,deleted=set(changed or ())-current.keys())
     if args.full:
         plan = {**plan, 'full':True, 'tests':('tests',), 'groups':('full',),
                 'reasons':{'tests':['사용자가 전체 검사를 지정함']}, 'unmapped':()}

@@ -86,6 +86,16 @@ def test_current_code_is_mapped_and_selected_tests_still_exist():
             assert node in {n.name for n in tree.body if isinstance(n, ast.FunctionDef)}, target
 
 
+def test_removed_unmapped_subsystem_requires_full_source_and_package_checks(tmp_path):
+    removed={'cachemonitor/retired_platform.py','.github/workflows/retired-platform.yml'}
+    plan=select_tests(removed,root=tmp_path,deleted=removed)
+    assert not plan['unmapped'] and plan['tests']==('tests',)
+    assert plan['full'] and plan['package_impact'] and plan['proxy_impact']
+    assert select_tests({'cachemonitor/new_contract.py'},root=tmp_path)['unmapped']
+    path=tmp_path/'cachemonitor/new_contract.py';path.parent.mkdir();path.touch()
+    assert select_tests({'cachemonitor/new_contract.py'},root=tmp_path,deleted={str(path.relative_to(tmp_path)).replace('\\','/')})['unmapped']
+
+
 def test_unmapped_and_package_only_runs_do_not_advance_source_baseline(tmp_path, monkeypatch, capsys):
     import tools.verify_changes as verify
     baseline = tmp_path/'last-success.json'
