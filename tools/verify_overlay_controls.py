@@ -89,32 +89,52 @@ def main():
             from PySide6.QtTest import QTest
             native.visible_target=lambda h:h==hwnd and bool(native.u.IsWindowVisible(h) and not native.u.IsIconic(h))
             poll();QTest.qWait(150)
-            samples=[];errors=[]
-            for expanded in (False,True):
+            samples=[];errors=[];scenarios=[];pending_at=[None];queue_wait=[]
+            original_move=controller.move_drag
+            def measured_move(position=None):
+                if pending_at[0] is not None:
+                    queue_wait.append((time.perf_counter()-pending_at[0])*1000);pending_at[0]=None
+                return original_move(position)
+            controller.move_drag=measured_move
+            def stats(values):
+                values=sorted(values)
+                return dict(n=len(values),median_ms=median(values),p95_ms=values[int(.95*(len(values)-1))],max_ms=max(values)) if values else {}
+            for scenario,expanded in ((s,e) for s in ('steady','updates','burst') for e in (False,True)):
+                start_index=len(samples);queue_wait.clear();controller.anchor=(1,1)
                 controller.expanded=expanded;controller.refresh();QTest.qWait(100)
                 point=QPoint(20,20);origin=controller.header.mapToGlobal(point)
                 def mouse(kind,global_point,button,buttons):
                     event=QMouseEvent(kind,QPointF(controller.header.mapFromGlobal(global_point)),QPointF(global_point),button,buttons,Qt.NoModifier)
                     app.sendEvent(controller.header,event)
                 mouse(QEvent.MouseButtonPress,origin,Qt.LeftButton,Qt.LeftButton)
+                previous_pointer=origin
                 for i in range(80):
                     controller.observed_at=time.monotonic()
                     pointer=origin-QPoint(i%40,i%20)
+                    if scenario=='burst':pointer=origin-QPoint((i%2)*160,(i%2)*80)
                     started=time.perf_counter()
-                    mouse(QEvent.MouseMove,pointer,Qt.NoButton,Qt.LeftButton)
+                    if scenario=='updates' and i%12==0:poll()
+                    count=16 if scenario=='burst' else 1
+                    for j in range(1,count+1):
+                        pending_at[0]=time.perf_counter()
+                        point=previous_pointer+(pointer-previous_pointer)* (j/count)
+                        mouse(QEvent.MouseMove,point,Qt.NoButton,Qt.LeftButton)
+                    previous_pointer=pointer
                     app.processEvents()
                     rect=native.frame(int(controller.widget.winId()))
                     box=controller.current_geometry
                     errors.append(max(abs(rect[0]-box[0]),abs(rect[1]-box[1])))
                     samples.append((time.perf_counter()-started)*1000)
-                    if i in (0,40,79):
-                        controller.widget.screen().grabWindow(0).save(str(args.output.with_name(args.output.stem+f'-{expanded}-{i}.png')))
+                    if scenario=='steady' and i in (0,40,79):
+                        controller.widget.quick.grabFramebuffer().save(str(args.output.with_name(args.output.stem+f'-{expanded}-{i}.png')))
                     QTest.qWait(16)
                 mouse(QEvent.MouseButtonRelease,pointer,Qt.LeftButton,Qt.NoButton)
+                scenarios.append(dict(scenario=scenario,expanded=expanded,processing=stats(samples[start_index:]),queue_wait=stats(queue_wait)))
             values=sorted(samples)
             report['drag_benchmark']={'n':len(values),'median_ms':median(values),'p95_ms':values[int(.95*(len(values)-1))],
                 'max_ms':max(values),'max_geometry_error_px':max(errors),'raw_ms':samples,
                 'measurement':'Qt mouse event dispatch through native position readback; physical display latency not measured'}
+            report['drag_benchmark']['scenarios']=scenarios
             finish()
         QTimer.singleShot(0,benchmark)
         QTimer.singleShot(30000,finish)

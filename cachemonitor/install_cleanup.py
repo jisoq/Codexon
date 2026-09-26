@@ -259,4 +259,4 @@ def after_services(services):
                 if not snapshot or time.time()-snapshot.get('ts',0)>30:return
             finally:channel.close()
         services.cleanup_report=cleanup(root,exe,services)
-        services.cleanup_attempted=True
+        services.cleanup_attempted=not any(item.get('status')=='deferred' for item in services.cleanup_report.get('items',[]))

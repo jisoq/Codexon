@@ -16,7 +16,8 @@ def run_proxy_test(coro):
     with asyncio.Runner(loop_factory=proxy_loop) as runner:return runner.run(coro)
 
 
-def test_managed_shutdown_finishes_inflight_websocket_without_replay(tmp_path):
+@pytest.mark.parametrize('force',[False,True])
+def test_managed_shutdown_finishes_inflight_websocket_without_replay(tmp_path,force):
     async def run():
         token='own-worker';control=tmp_path/('proxy-control-'+token+'.json')
         control.write_text(json.dumps({'id':token,'action':'run'}))
@@ -42,6 +43,11 @@ def test_managed_shutdown_finishes_inflight_websocket_without_replay(tmp_path):
                     health=await (await client.get(proxy+'/health')).json()
                     assert health['draining'] and health['active_connections']==1
                     assert not stop.is_set() and not ws.closed
+                    if force:
+                        control.write_text(json.dumps({'id':token,'action':'force_shutdown'}))
+                        await asyncio.wait_for(stop.wait(),3)
+                        assert len(received)==1
+                        finish.set();return
                     finish.set()
                     assert (await ws.receive_json())['response']['output']=='KEEP_FINAL'
                     await asyncio.wait_for(ws.receive(),3)
@@ -51,7 +57,8 @@ def test_managed_shutdown_finishes_inflight_websocket_without_replay(tmp_path):
     run_proxy_test(run())
 
 
-def test_managed_shutdown_keeps_inflight_http_tool_bytes(tmp_path):
+@pytest.mark.parametrize('force',[False,True])
+def test_managed_shutdown_keeps_inflight_http_tool_bytes(tmp_path,force):
     async def run():
         token='own-worker';control=tmp_path/('proxy-control-'+token+'.json')
         stop=asyncio.Event();finish=asyncio.Event();received=[]
@@ -72,6 +79,11 @@ def test_managed_shutdown_keeps_inflight_http_tool_bytes(tmp_path):
                     assert not stop.is_set()
                     rejected=await client.post(proxy+'/tool',data=b'do-not-forward')
                     assert rejected.status==503
+                    if force:
+                        control.write_text(json.dumps({'id':token,'action':'force_shutdown'}))
+                        await asyncio.wait_for(stop.wait(),3)
+                        assert received==[b'original']
+                        finish.set();return
                     finish.set();assert await response.read()==b'last'
                 await asyncio.wait_for(stop.wait(),3)
                 assert received==[b'original']
@@ -487,5 +499,31 @@ def test_websocket_compaction_shaped_large_request_and_idle_gap(tmp_path):
                 assert trace['last_upstream_event']=='response.completed'
                 assert 'encrypted_content' not in json.dumps(health)
                 assert store.db.execute("select requested_service_tier from model_observations where status='completed'").fetchone()==('priority',)
+        finally:store.close()
+    run_proxy_test(run())
+
+
+def test_connection_sessions_include_all_relays_without_logging_identifiers(tmp_path):
+    async def run():
+        async def endpoint(request):
+            ws=web.WebSocketResponse();await ws.prepare(request)
+            await ws.receive_json()
+            await ws.send_json({'type':'response.created','response':{'id':'active'}})
+            async for _ in ws:pass
+            return ws
+        upstream=web.Application();upstream.router.add_get('/responses',endpoint)
+        store=EvidenceStore(tmp_path/'e.sqlite');connections=[]
+        try:
+            async with server(upstream) as url, server(create_app(store,tmp_path/'home',url)) as proxy, ClientSession() as client:
+                for i in range(35):
+                    ws=await client.ws_connect(proxy+'/responses',headers={'session_id':'same' if i<34 else ''})
+                    connections.append(ws)
+                    await ws.send_json({'type':'response.create','model':'m'})
+                    await ws.receive_json()
+                health=await (await client.get(proxy+'/health')).json()
+                assert health['active_connections']==35
+                assert {r['session_id']:r['connections'] for r in health['connection_sessions']}=={'same':34,'':1}
+                assert all('_session_id' not in r and 'session_id' not in r for r in health['active_relays'])
+                for ws in connections:await ws.close()
         finally:store.close()
     run_proxy_test(run())

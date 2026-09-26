@@ -7,9 +7,9 @@ from .quick_runtime import QuickHost
 from .quota import quota_display
 from .icons import tray_icon
 from .i18n import tr
+from .app_shutdown import ExitConnectionCheck, ExitConfirmation, ShutdownProgress
 from .taskbar import TaskbarQuota
 import time
-
 
 
 class TrayWindow(QuickHost):
@@ -159,6 +159,53 @@ class TrayWindow(QuickHost):
 
     def quit_app(self,checked=False,*,handoff=False):
         if getattr(self,'_closing',False):return
+        check=getattr(self,'exit_check',None)
+        dialog=getattr(self,'exit_confirmation',None)
+        if check:
+            if handoff:self._exit_handoff=True
+            return
+        if handoff:
+            if dialog:dialog.reject()
+            self.begin_quit(handoff=True);return
+        if dialog:return
+        services=getattr(self,'app_services',None)
+        manager=services.manager if services else None
+        if manager is None:
+            self.begin_quit();return
+        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import QProgressDialog
+        self.exit_check_dialog=QProgressDialog(tr('열린 연결 확인 중…'),'',0,0,self)
+        self.exit_check_dialog.setWindowTitle(tr('Codexon 종료 확인'))
+        self.exit_check_dialog.setCancelButton(None)
+        self.exit_check_dialog.setWindowFlag(Qt.WindowCloseButtonHint,False)
+        self.exit_check_dialog.setWindowModality(Qt.ApplicationModal)
+        self.exit_check_dialog.setMinimumDuration(0)
+        self.exit_check_dialog.show()
+        self.exit_check=ExitConnectionCheck(manager,self)
+        self.exit_check.finished.connect(self.exit_connections_checked)
+        self.exit_check.start()
+
+    def exit_connections_checked(self):
+        check=self.exit_check;self.exit_check=None
+        count=check.count;check.deleteLater()
+        self.exit_check_dialog.close();self.exit_check_dialog.deleteLater()
+        self.exit_check_dialog=None
+        if getattr(self,'_exit_handoff',False):
+            self._exit_handoff=False;self.begin_quit(handoff=True);return
+        self._exit_force_supported=check.health.get('supports_force_shutdown') is True
+        if count==0:
+            self.begin_quit();return
+        self.exit_confirmation=ExitConfirmation(check,self.snapshot,self)
+        self.exit_confirmation.finished.connect(self.exit_decided)
+        self.exit_confirmation.open()
+
+    def exit_decided(self,result):
+        dialog=self.exit_confirmation;self.exit_confirmation=None
+        if dialog:dialog.deleteLater()
+        if result in (1,2) and not getattr(self,'_closing',False):self.begin_quit(force=result==2)
+
+    def begin_quit(self,*,handoff=False,force=False):
+        if getattr(self,'_closing',False):return
         self._closing=True
         if hasattr(self,'save_preferences'):self.save_preferences()
         controller=getattr(self,'service_controller',None)
@@ -180,31 +227,29 @@ class TrayWindow(QuickHost):
             if controller and controller.operation:controller.operation.wait()
             if self.worker:self.worker.wait()
             self.finish_quit();return
-        from PySide6.QtCore import Qt
-        from PySide6.QtWidgets import QProgressDialog
         from .app_shutdown import ShutdownOperation
-        self.shutdown_dialog=QProgressDialog(tr('관련 작업 마무리 중…'),'',0,0,self)
-        self.shutdown_dialog.setWindowTitle(tr('Codexon 종료 중'))
-        self.shutdown_dialog.setCancelButton(None)
-        self.shutdown_dialog.setWindowFlag(Qt.WindowCloseButtonHint,False)
-        self.shutdown_dialog.setWindowModality(Qt.ApplicationModal)
-        self.shutdown_dialog.setMinimumDuration(0)
+        self.shutdown_dialog=ShutdownProgress(self,getattr(self,'_exit_force_supported',False))
         self.shutdown_dialog.show()
         update=getattr(self,'update_panel',None)
         workers=[self.worker,panel.operation if panel else None,update.operation if update else None,
                  controller.operation if controller else None]
         self.shutdown_operation=ShutdownOperation(self.app_services,workers,self)
+        self.shutdown_dialog.force.clicked.connect(self.shutdown_operation.request_force)
+        if force:
+            self.shutdown_operation.request_force()
+            self.shutdown_dialog.force.setEnabled(False)
         self.shutdown_operation.progress.connect(lambda text:self.shutdown_dialog.setLabelText(tr(text)))
         self.shutdown_operation.finished.connect(self.shutdown_finished)
         self.shutdown_operation.start()
 
     def shutdown_finished(self):
         error=self.shutdown_operation.error
-        self.shutdown_dialog.close()
+        self.shutdown_dialog.accept()
+        self.shutdown_dialog.deleteLater()
         if error:
             self._closing=False
             QMessageBox.warning(self,tr('안전한 종료 확인 필요'),
-                tr('진행 중 작업을 강제로 끊지 않았습니다. 종료를 다시 누르면 이어서 확인합니다.')+'\n'+error)
+                tr('종료를 완료하지 못했습니다. 종료를 다시 누르면 재시도합니다.')+'\n'+error)
             return
         self.finish_quit()
 

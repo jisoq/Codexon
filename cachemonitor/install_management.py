@@ -69,6 +69,9 @@ def register(root, product, recovery, *, isolated=False):
         try:
             for name, value in values.items():
                 winreg.SetValueEx(key, name, 0, winreg.REG_SZ, value)
+            for name, value in values.items():
+                if winreg.QueryValueEx(key, name) != (value, winreg.REG_SZ):
+                    raise OSError('Installation registry read-back did not match')
         except OSError:
             for name,value in previous.items():
                 if value is None:
@@ -129,14 +132,22 @@ def finish(root, product, recovery, *, isolated=False, launch=True, language='ko
                 homes = running_homes(root)
                 if homes:save_homes(homes)
                 receipt['homes']=resolve_homes(homes)
+                from .cache_hooks import migrate_installation
+                hook_homes=set(receipt['homes'])
+                for record in [previous, *[read_json(p) for p in root.glob('installation-*.json')]]:
+                    hook_homes.update(h for h in record.get('homes',[]) if isinstance(h,str) and Path(h).is_absolute())
+                for home in hook_homes:
+                    migrate_installation(home,root,product/'CodexonHook.exe',before_write=activation.track_file)
             register(root, product, recovery, isolated=isolated)
             publish_shell(product, recovery, isolated=isolated, language=language)
             if not isolated:migrate_startup(exe)
             atomic_write(root/'installation.json',json.dumps(receipt,indent=2).encode())
             if not isolated:
                 from .installation import pointer_path
-                atomic_write(pointer_path(),json.dumps(dict(InstallRoot=str(root),AppPath=str(exe),
-                    RecoveryPath=str(recovery))).encode())
+                pointer=dict(InstallRoot=str(root),AppPath=str(exe),RecoveryPath=str(recovery))
+                atomic_write(pointer_path(),json.dumps(pointer).encode())
+                if read_json(pointer_path())!=pointer:raise OSError('Installation pointer verification failed')
+            if read_json(root/'installation.json')!=receipt:raise OSError('Installation receipt verification failed')
             activation.commit()
         except Exception:
             activation.rollback()
@@ -193,7 +204,7 @@ def connection_manager():
     return target()
 
 
-def prepare_uninstall(root, *, isolated=False):
+def prepare_uninstall(root, *, isolated=False, caller_pid=None):
     root=Path(root).resolve()
     with ProcessLock(root/'install.lock',timeout=5):
         from .installation import installed
@@ -219,6 +230,11 @@ def prepare_uninstall(root, *, isolated=False):
             name=Path(process['ExecutablePath']).name.lower()
             if name.startswith('unins'):continue
             if process['ProcessId'] in (os.getpid(),os.getppid()) and Path(process['ExecutablePath']).resolve()==Path(sys.executable).resolve():continue
+            if process['ProcessId']==caller_pid and Path(process['ExecutablePath']).resolve()==Path(sys.executable).resolve():
+                from .launch_context import command_arguments
+                from .proxy_target import option
+                arguments=command_arguments(process.get('CommandLine') or '')
+                if '--prepare-uninstall' in arguments and Path(option(arguments,'--install-root','')).resolve()==root:continue
             if '--usage-collector' in (process.get('CommandLine') or ''):
                 collectors.append(process);continue
             raise RuntimeError('Codexon을 종료하고 진행 중인 연결이 끝난 뒤 제거를 다시 실행하세요. 연결 설정과 기록은 보존됩니다.')

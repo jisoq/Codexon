@@ -188,6 +188,20 @@ def main():
             elif command==b'verify-quit' and args.verify_services:
                 client.write(b'quitting');client.flush()
                 QTimer.singleShot(100,window.quit_app)
+            elif command in (b'verify-exit-safe',b'verify-exit-force') and args.verify_services:
+                dialog=getattr(window,'exit_confirmation',None)
+                progress=getattr(window,'shutdown_dialog',None)
+                if dialog and dialog.host:
+                    from .quick_qa import control,click
+                    button=dialog.force if command==b'verify-exit-force' else dialog.confirm
+                    assert button.isEnabled()
+                    dialog.host.grab().save(str(args.verify_handoff.with_suffix('.exit.png')))
+                    click(dialog.host,control(dialog.host,button))
+                    client.write(b'accepted')
+                elif progress and command==b'verify-exit-force' and progress.force.isEnabled():
+                    progress.force.click();client.write(b'accepted')
+                else:client.write(b'waiting')
+                client.flush()
             elif command==b'verify-settings-restart' and args.verify_handoff:
                 def exercise_restart():
                     from .quick_qa import control, click

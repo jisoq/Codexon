@@ -7,7 +7,7 @@ import pytest
 from cachemonitor import connection_recovery as recovery, install_dispatch as dispatch
 
 
-@pytest.mark.parametrize('native,packaged',[(False,True),(True,False),(True,True)])
+@pytest.mark.parametrize('native,packaged',[(False,False),(False,True),(True,False),(True,True)])
 def test_installer_mutates_only_the_native_environment(tmp_path,monkeypatch,native,packaged):
     calls=[]
     monkeypatch.setattr(dispatch,'packaged_context',lambda:packaged)
@@ -17,7 +17,7 @@ def test_installer_mutates_only_the_native_environment(tmp_path,monkeypatch,nati
     args=['--install-root',str(tmp_path),'--product-dir',str(tmp_path/'product'),'--report',str(report)]
     if native:args.append('--native-install')
     assert recovery.main(args)==int(native and packaged)
-    assert calls==([] if native and packaged else ['dispatch'] if packaged else ['finish'])
+    assert calls==([] if native and packaged else ['dispatch'] if not native else ['finish'])
     assert bool(json.loads(report.read_text(encoding='utf-8')).get('error'))==(native and packaged)
 
 
@@ -32,7 +32,7 @@ def test_native_activation_requires_its_own_completed_receipt(tmp_path,monkeypat
             assert command[command.index('--report')+1]==str(self.report)
             assert '--native-install' in command and '--no-launch' in command and '--isolated-install' in command
             if result is not None:self.report.write_text(json.dumps(result))
-        def inspect(self):return dict(running=0,state=3)
+        def inspect(self):return dict(running=0,state=3,last_result=1 if result and result.get('error') else 0)
         def remove(self):calls.append('removed')
     monkeypatch.setattr(dispatch,'ObserverTask',Task)
     args=SimpleNamespace(install_root=tmp_path/'installed',product_dir=tmp_path/'new',language='en',

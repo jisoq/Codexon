@@ -119,7 +119,7 @@ if($p.operation -eq 'inspect'){
     $login=$false;$periodic=$false
     foreach($t in $existing.Definition.Triggers){if($t.Type -eq 9 -and $t.Enabled){$login=$true}}
     foreach($t in $existing.Definition.Triggers){if($t.Type -eq 1 -and $t.Enabled){$periodic=$true}}
-    @{registered=$true;autostart=$login;periodic=$periodic;enabled=$existing.Enabled;running=$existing.GetInstances(0).Count;execution_limit=$existing.Definition.Settings.ExecutionTimeLimit;executable=$a.Path;arguments=$a.Arguments;state=$existing.State;restartCount=$existing.Definition.Settings.RestartCount} | ConvertTo-Json -Compress
+    @{registered=$true;autostart=$login;periodic=$periodic;enabled=$existing.Enabled;running=$existing.GetInstances(0).Count;execution_limit=$existing.Definition.Settings.ExecutionTimeLimit;executable=$a.Path;arguments=$a.Arguments;state=$existing.State;last_result=$existing.LastTaskResult;restartCount=$existing.Definition.Settings.RestartCount} | ConvertTo-Json -Compress
     exit 0
 }
 if($p.operation -eq 'remove'){

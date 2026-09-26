@@ -66,6 +66,10 @@ class OverlayController(QObject):
         except (TypeError,ValueError):pass
         self._legacy_anchor=self.anchor is not None and settings.value('overlay/anchorMode','')!='edge'
         self.drag_context=None;self.current_geometry=None;self.chrome_native=None
+        self._drag_selection=None;self._pending_drag_position=None
+        self.drag_timer=QTimer(self)
+        self.drag_timer.setSingleShot(True)
+        self.drag_timer.timeout.connect(self.flush_drag)
         self.actions.collapse.connect(lambda:self.set_collapsed(True))
         self.actions.expand.connect(self.toggle_expanded)
         self.actions.opacity_toggle.connect(self.toggle_opacity)
@@ -78,8 +82,9 @@ class OverlayController(QObject):
                 control.interaction_started.connect(lambda control=control:self.activate_control(control))
         for control in (self.header,self.icon):
             control.drag_started.connect(self.begin_drag)
-            control.drag_moved.connect(self.move_drag)
+            control.drag_moved.connect(self.queue_drag)
             control.drag_finished.connect(self.end_drag)
+            control.drag_cancelled.connect(self.cancel_pointer_drag)
             control.move_requested.connect(self.move_keyboard)
         self.native = self.tracker = None
         self.enabled = settings.value('overlay/enabled', True, type=bool)
@@ -303,8 +308,40 @@ class OverlayController(QObject):
     def begin_drag(self,position=None):
         if self.native and self.current_geometry:
             self.close_popup()
+            self.height_animation.stop()
             geometry=self.current_geometry if self.automatic_mode=='icon' else self.monitor_geometry
             self.drag_context=(position or self.native.cursor(),geometry,self.target_state.get('target',{}).get('hwnd'))
+            self._drag_selection=self.target_state.get('selection')
+            self._drag_position=self.drag_context[0]
+
+    def queue_drag(self,position):
+        # One event-loop callback owns movement; queued input replaces its destination.
+        if not self.drag_context:return
+        self._pending_drag_position=position
+        if not self.drag_timer.isActive():self.drag_timer.start(0)
+
+    def flush_drag(self):
+        position=self._pending_drag_position
+        self._pending_drag_position=None
+        if position is not None:self.move_drag(position)
+
+    def cancel_drag(self):
+        self.drag_timer.stop();self._pending_drag_position=None
+        self.drag_context=None;self._drag_selection=None
+        for control in (self.header,self.icon):control.cancel_drag()
+
+    def cancel_pointer_drag(self):
+        self.cancel_drag()
+        self.refresh()
+
+    def drag_valid(self):
+        target=self.target_state.get('target') or {}
+        return bool(self.drag_context and self.enabled and self.native
+                    and target.get('hwnd')==self.drag_context[2]
+                    and self.target_state.get('selection')==self._drag_selection
+                    and self._drag_selection and self._drag_selection.thread_id
+                    and time.monotonic()-self.observed_at<=3
+                    and self.native.visible_target(target['hwnd']))
 
     def move_keyboard(self, dx, dy):
         target=self.target_state.get('target')
@@ -315,20 +352,23 @@ class OverlayController(QObject):
 
     def move_drag(self,position=None):
         if not self.drag_context or not self.native:return
+        if not self.drag_valid():self.cancel_drag();self.refresh();return
         cursor,geometry,hwnd=self.drag_context
         if hwnd != self.target_state.get('target',{}).get('hwnd'):return
         frame=self.native.frame(hwnd)
-        if not frame:return
+        if not frame:self.hide_all();return
         current=position or self.native.cursor();dpi=self.native.u.GetDpiForWindow(hwnd) or 96
+        self._drag_position=current
         from .overlay_tracking import monitor_anchor_for_position
         self.anchor=monitor_anchor_for_position(frame,geometry,geometry[0]+current[0]-cursor[0],
                       geometry[1]+current[1]-cursor[1],dpi,
                       reference_width=380*self.appearance.scale,reference_height=560*self.appearance.scale)
-        if not self.move_only(frame,dpi):self.refresh()
+        if not self.move_only(frame,dpi):
+            self._refresh(drag_layout=True)
 
     def move_only(self,frame,dpi):
         if (getattr(self,'_placement_context',None)!=(frame,dpi) or not self.enabled
-                or not self.selection_confirmed() or not self.native.visible_target(self.drag_context[2])
+                or not self.drag_valid()
                 or self.height_animation.state()==QVariantAnimation.Running):return False
         from .overlay_tracking import anchored_monitor_geometry,extend_monitor_left
         old=self.current_geometry if self.automatic_mode=='icon' else self.monitor_geometry
@@ -356,14 +396,18 @@ class OverlayController(QObject):
         return self.native.place(hwnd,geometry)
 
     def end_drag(self,position=None):
+        self.drag_timer.stop();self._pending_drag_position=None
         self.move_drag(position)
-        self.drag_context=None
+        was_dragging=self.drag_context is not None
+        self.cancel_drag()
         if self.anchor is not None:
             self.settings.setValue('overlay/anchorX',self.anchor[0]);self.settings.setValue('overlay/anchorY',self.anchor[1])
             self.settings.setValue('overlay/anchorMode','edge');self._legacy_anchor=False
             self.changed.emit()
+        if was_dragging:self.refresh()
 
     def hide_all(self):
+        self.cancel_drag()
         self.height_animation.stop();self._height_context=None
         self.view_animation.stop();self.advance_view(1.)
         self.close_popup()
@@ -371,6 +415,8 @@ class OverlayController(QObject):
         for control in self.chrome:control.hide()
 
     def receive_target(self, state):
+        if (state.get('selection')!=self.target_state.get('selection')
+                or state.get('target')!=self.target_state.get('target')):self.cancel_drag()
         if state.get('selection')!=self.target_state.get('selection'):
             self.close_popup()
             self.widget.set_content(None,'기록 확인 중',appearance=self.appearance)
@@ -474,6 +520,9 @@ class OverlayController(QObject):
         self._pointer_down=pressed
 
     def refresh(self):
+        self._refresh()
+
+    def _refresh(self,drag_layout=False):
         if self.stopped: return
         target = self.target_state.get('target')
         selection = self.target_state.get('selection')
@@ -482,15 +531,20 @@ class OverlayController(QObject):
                 or not selection.thread_id or time.monotonic()-self.observed_at > 3
                 or not self.native.visible_target(target['hwnd'])):
             self.hide_all(); return
-        self._placements={}
         frame = self.native.frame(target['hwnd'])
         if not frame:
             self.hide_all(); return
         dpi = self.native.u.GetDpiForWindow(target['hwnd']) or 96
+        if self.drag_context:
+            if not self.drag_valid():self.cancel_drag()
+            # Keep receiving snapshots and heartbeats, but leave the displayed
+            # content alone until release. Geometry changes still need layout.
+            elif not drag_layout and getattr(self,'_placement_context',None)==(frame,dpi):return
+        self._placements={}
         self._placement_context=(frame,dpi)
-        self._load_collapsed()
-        data, note = self.content()
-        if time.monotonic() >= self.next_theme:
+        if not self.drag_context:self._load_collapsed()
+        data,note=(self.widget.data,self.widget.note) if self.drag_context else self.content()
+        if not self.drag_context and time.monotonic() >= self.next_theme:
             mode = self.settings.value('ui/theme', self.settings.value('overlay/theme', 'codex'))
             if mode == 'codex':
                 self.appearance = self.appearance_reader.read(system_dark())
@@ -501,7 +555,7 @@ class OverlayController(QObject):
             shared_theme().configure(mode,appearance=self.appearance)
             self.reduced_motion=bool(hasattr(self.native,'reduce_motion') and self.native.reduce_motion())
             self.next_theme = time.monotonic()+1
-        self.widget.set_content(data, note, appearance=self.appearance)
+        if not self.drag_context:self.widget.set_content(data, note, appearance=self.appearance)
         from .overlay_tracking import anchored_monitor_geometry, extend_monitor_left
         content=self.widget.content_model
         scale=self.appearance.scale
@@ -527,7 +581,7 @@ class OverlayController(QObject):
                 self.height_animation.stop();self._height_context=context;self._height_target=monitor[3]
             elif monitor[3]!=self._height_target:
                 self.height_animation.stop();self._height_target=monitor[3]
-                if (self.widget.isVisible() and self.monitor_geometry and not self.reduced_motion
+                if (not self.drag_context and self.widget.isVisible() and self.monitor_geometry and not self.reduced_motion
                         and abs(self.monitor_geometry[3]-monitor[3])<=round(40*scale*dpi/96)):
                     self.height_animation.setStartValue(self.monitor_geometry[3]);self.height_animation.setEndValue(monitor[3])
                     self._configuring_height=True
@@ -622,6 +676,11 @@ class OverlayController(QObject):
             if mode!=previous_mode and hasattr(self.native,'raise_companion'):
                 for control in (self.header,self.actions,self.toolbar):
                     if control.isVisible():self.native.raise_companion(int(control.winId()))
+        if self.drag_context:
+            # Rebase after resize/DPI/inline transitions, including screenChanged
+            # refreshes arriving between pointer events.
+            bounds=self.current_geometry if mode=='icon' else self.monitor_geometry
+            self.drag_context=(self._drag_position,bounds,target['hwnd'])
 
     def stop(self):
         if self.stopped: return

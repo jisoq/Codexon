@@ -1793,5 +1793,15 @@
   "켜짐 · 독립 실행": "On · starts independently",
   "Codexon과 함께 실행 · 일반 설정의 자동 시작을 따름": "Starts with Codexon · follows startup in General settings",
   "확인 시점에 프록시 연결 {count}개가 열려 있습니다. 대기 중인 연결도 포함됩니다.": "At the time of this check, {count} proxy connections are open, including idle connections.",
-  "현재 프록시 연결 수를 확인하지 못했습니다.": "The current proxy connection count could not be determined."
+  "현재 프록시 연결 수를 확인하지 못했습니다.": "The current proxy connection count could not be determined.",
+  "안전 종료": "Safe exit",
+  "강제 종료": "Force exit",
+  "세션 확인 불가": "Unknown session",
+  "{title} · 연결 {count}개": "{title} · {count} connections",
+  "열린 연결 확인 중…": "Checking open connections…",
+  "Codexon 종료 확인": "Exit Codexon",
+  "안전 종료는 응답 완료를 기다립니다. 강제 종료는 진행 중 연결과 캐시 요청을 끊고 기록 저장 후 종료합니다.": "Safe exit waits for responses. Force exit interrupts connections and cache requests, saves records, and exits.",
+  "강제 종료를 지원하려면 연결 구성요소를 업데이트하세요.": "Update the connection components to enable force exit.",
+  "강제 종료하면 진행 중인 응답이 중단됩니다.": "Force exit interrupts responses in progress.",
+  "종료를 완료하지 못했습니다. 종료를 다시 누르면 재시도합니다.": "Exit could not complete. Choose Exit again to retry."
 }

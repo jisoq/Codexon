@@ -117,6 +117,7 @@ class OverlayChrome(OverlayHost):
     drag_started = Signal(object)
     drag_moved = Signal(object)
     drag_finished = Signal(object)
+    drag_cancelled = Signal()
     focus_requested = Signal(str)
     move_requested = Signal(int, int)
 
@@ -259,6 +260,17 @@ class OverlayChrome(OverlayHost):
             self.setCursor(Qt.ClosedHandCursor)
             self.drag_started.emit(self.event_position(event))
             event.accept()
+
+    def cancel_drag(self):
+        self.press=None;self.moved=False;self.pressed_scope=None
+        self.view.put(pressed=False)
+        if self.kind in ('header','icon'):self.setCursor(Qt.OpenHandCursor)
+
+    def event(self,event):
+        if (event.type() in (QEvent.UngrabMouse,QEvent.Hide)
+                and getattr(self,'press',None) is not None):
+            self.cancel_drag();self.drag_cancelled.emit()
+        return super().event(event)
 
     def nativeEvent(self, event_type, message):
         if self.kind in ('header','icon'):

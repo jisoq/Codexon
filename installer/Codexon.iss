@@ -33,7 +33,6 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0
 CloseApplications=no
-SetupMutex={#RegistryName}.Setup
 RestartApplications=no
 DisableProgramGroupPage=yes
 DisableDirPage=yes
@@ -57,6 +56,7 @@ english.ActivationFailureTitle=Installation not completed
 korean.ActivationFailureTitle=설치를 완료하지 못했습니다
 
 [Files]
+Source: "native-setup.ps1"; Flags: dontcopy
 Source: "{#ProductDir}\*"; DestDir: "{code:ProductPath}"; Excludes: "CodexonRecovery.exe"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#ProductDir}\CodexonRecovery.exe"; DestDir: "{code:RecoveryDir}"; Flags: ignoreversion
 
@@ -68,10 +68,59 @@ Root: HKCU; Subkey: "Software\Classes\AppUserModelId\{#RegistryName}.Recovery"; 
 [Code]
 var InstallId: String; ActivationFailed: Boolean;
 
+procedure ExitBootstrap(Code: Integer);
+external 'ExitProcess@kernel32.dll stdcall';
+
+function NativeSetup: Boolean;
+var Request, Params, Arg, Lower, Script: String; Proof: AnsiString;
+    I, Count, Code: Integer; Service, Task: Variant;
+begin
+  Request := ExpandConstant('{param:CODEXONREQUEST|}');
+  if Request <> '' then begin
+    if not LoadStringFromFile(Request+'.ready', Proof) or
+       (CompareText(Trim(String(Proof)), GetSHA256OfFile(ExpandConstant('{srcexe}'))) <> 0) then
+      RaiseException('Native installation request is invalid.');
+    Service := CreateOleObject('Schedule.Service');
+    Service.Connect();
+    Task := Service.GetFolder('\').GetTask('Codexon-Setup-'+ExtractFileName(ExtractFileDir(Request)));
+    if Task.State <> 4 then RaiseException('Native installation task is not running.');
+    if CheckForMutexes('{#RegistryName}.Setup') then RaiseException('Another installation is running.');
+    CreateMutex('{#RegistryName}.Setup');
+    Result := True;
+    Exit;
+  end;
+  ExtractTemporaryFile('native-setup.ps1');
+  Script := ExpandConstant('{tmp}\native-setup.ps1');
+  Request := ExpandConstant('{tmp}\native-request.ini');
+  SetIniString('request', 'source', ExpandConstant('{srcexe}'), Request);
+  SetIniString('request', 'sha256', GetSHA256OfFile(ExpandConstant('{srcexe}')), Request);
+  Count := 0;
+  for I := 1 to ParamCount do begin
+    Arg := ParamStr(I); Lower := Lowercase(Arg);
+    { Never forward the loader's /SL5 or other internal parameters. }
+    if (Lower='/silent') or (Lower='/verysilent') or (Lower='/suppressmsgboxes') or
+       (Lower='/norestart') or (Lower='/sp-') or (Lower='/log') or
+       (Pos('/log=',Lower)=1) or (Pos('/dir=',Lower)=1) or (Pos('/lang=',Lower)=1) then begin
+      SetIniString('request','arg'+IntToStr(Count),Arg,Request);
+      Count := Count+1;
+    end;
+  end;
+  SetIniString('request','count',IntToStr(Count),Request);
+  Params := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File '+AddQuotes(Script)+' -Request '+AddQuotes(Request);
+  if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Params,
+              '', SW_HIDE, ewWaitUntilTerminated, Code) then Code := 1001;
+  DeleteFile(Script);
+  DeleteFile(Request);
+  RemoveDir(ExpandConstant('{tmp}'));
+  { Returning False would report cancellation even after a successful worker. }
+  ExitBootstrap(Code);
+  Result := False;
+end;
+
 function InitializeSetup(): Boolean;
 begin
+  Result := NativeSetup();
   InstallId := GetDateTimeString('yyyymmdd-hhnnss', '-', ':') + '-' + IntToStr(Random(1000000));
-  Result := True;
 end;
 
 function ProductPath(Param: String): String;
@@ -88,7 +137,7 @@ procedure CurStepChanged(CurStep: TSetupStep);
 var ExitCode: Integer; Args: String;
 begin
   if CurStep = ssPostInstall then begin
-    Args := '--install-root "' + ExpandConstant('{app}') + '" --product-dir "' + ProductPath('') +
+    Args := '--native-install --install-root "' + ExpandConstant('{app}') + '" --product-dir "' + ProductPath('') +
       '" --report "' + ExpandConstant('{app}\install-result.json') + '"{#ExtraArgs}';
     if ActiveLanguage = 'english' then Args := Args + ' --language en'
     else Args := Args + ' --language ko';

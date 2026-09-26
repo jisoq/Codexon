@@ -66,6 +66,8 @@ class WindowsOverlay:
             cls = ctypes.create_unicode_buffer(128)
             self.u.GetClassNameW(hwnd, cls, len(cls))
             if cls.value != 'Chrome_WidgetWin_1': return True
+            # Mini/Pet shares the main window's title and process, but is a tool window.
+            if self.u.GetWindowLongPtrW(hwnd, -20) & 0x80: return True  # WS_EX_TOOLWINDOW
             pid = W.DWORD(); self.u.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
             process = self.k.OpenProcess(0x1000, False, pid.value)
             if not process: return True

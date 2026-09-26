@@ -8,10 +8,11 @@ from .observer_state import ProcessLock
 
 class ProxyDrain:
     def __init__(self, manager, target, *, allowed=lambda:None, publish=lambda *a,**k:None,
-                 before_drain=lambda source:None, clock=time.monotonic, sleep=time.sleep):
+                 before_drain=lambda source:None, force_requested=lambda:False, clock=time.monotonic, sleep=time.sleep):
         self.manager,self.target=manager,target
         self.allowed,self.publish,self.before_drain=allowed,publish,before_drain
         self.clock,self.sleep=clock,sleep
+        self.force_requested=force_requested
 
     def run(self, source):
         m=self.manager
@@ -20,7 +21,7 @@ class ProxyDrain:
         # client finishes/closes it instead of draining away every new ingress.
         # This also permits migration from the first lifecycle build, which did
         # not yet recognize Codex's metadata and rate-limit notifications.
-        while health and (health.get('websocket_states') or {}).get('unknown'):
+        while health and (health.get('websocket_states') or {}).get('unknown') and not self.force_requested():
             self.allowed()
             if health['instance']!=source['instance']:raise RuntimeError('다른 프록시 인스턴스를 보존합니다.')
             self.publish('waiting',message='진행 여부를 판정할 수 없는 기존 연결의 종료 대기 · 통신 유지 중')
@@ -47,12 +48,23 @@ class ProxyDrain:
         # No response deadline. Only after work has settled does the 30-second
         # process/port/ownership-lock exit deadline begin.
         exit_deadline=None
+        force_sent=False
         while True:
             self.allowed()
             if self.target.stopped(source):return
             current=m.health(timeout=1)
             if current and current['instance']!=source['instance']:
                 raise RuntimeError('종료 확인 중 다른 인스턴스가 발견되었습니다.')
+            if self.force_requested() and not force_sent and current:
+                if not current.get('supports_force_shutdown'):
+                    raise RuntimeError('강제 종료를 지원하려면 연결 구성요소를 업데이트하세요.')
+                captured=self.target.capture(current)
+                control=current.get('control_id','')
+                if captured['instance']!=source['instance'] or control!=source.get('control_id'):
+                    raise RuntimeError('종료 확인 중 다른 인스턴스가 발견되었습니다.')
+                atomic_write(m.directory/('proxy-control-'+control+'.json'),
+                             json.dumps(dict(action='force_shutdown',id=control)).encode())
+                force_sent=True;exit_deadline=self.clock()+30
             states=(current or {}).get('websocket_states')
             execution=(current or {}).get('cache_execution') or {}
             settled=self.target.exited(source) or (current is None and m.health_state=='refused') or (
