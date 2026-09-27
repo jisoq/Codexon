@@ -62,7 +62,7 @@ def main():
     def event(kind):report['events'].append({'kind':kind,**snapshot()});save()
     button.clicked.connect(lambda:event('click-through'))
     controller.actions.collapse.connect(lambda:event('collapse'))
-    controller.actions.expand.connect(lambda:event('detail'))
+    controller.links.view.detailRequested.connect(lambda target:event('detail'))
     controller.icon.restore.connect(lambda:event('restore'))
     controller.toolbar.opacity_changed.connect(lambda _:event('opacity'))
     controller.header.drag_finished.connect(lambda:event('drag-panel'))

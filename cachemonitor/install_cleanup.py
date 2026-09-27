@@ -253,7 +253,7 @@ def after_services(services):
             channel=CollectionChannel(services.homes,services.index,services.evidence)
             try:
                 locks.enter_context(ProcessLock(channel.companion('.collector-update.lock')))
-                snapshot=channel.read()
+                snapshot=channel.read_header()
                 source=services.collector_identity(channel,snapshot)
                 if not source or Path(source['process']['executable']).resolve()!=exe.resolve():return
                 if not snapshot or time.time()-snapshot.get('ts',0)>30:return

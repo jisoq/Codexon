@@ -91,7 +91,8 @@ def quit_gui(executable,home,index,evidence,cache,*,force=False):
 def verify_legacy_collector(root,old,new):
     import sqlite3,zlib
     from cachemonitor.usage_collection import locked
-    root.mkdir();home=root/'home';home.mkdir();index=root/'index.sqlite';evidence=root/'evidence.sqlite'
+    from verify_changes import fixture_home
+    root.mkdir();home=fixture_home(root);index=root/'custom index.sqlite';evidence=root/'custom evidence.sqlite'
     task=ObserverTask(str(index),role='UsageCollector')
     channels={index.with_suffix('.collection.sqlite'):index.with_suffix('.collector.lock'),
               index.with_name(index.name+'.codexon-collection.sqlite'):index.with_name(index.name+'.codexon-collector.lock')}
@@ -111,11 +112,19 @@ def verify_legacy_collector(root,old,new):
         return {}
     try:
         task.start([str(old),'--usage-collector','--codex-home',str(home),'--index-path',str(index),'--evidence-path',str(evidence)])
-        before=await_value(snapshot,lambda s:s.get('collection'))['collection']
+        original=await_value(snapshot,lambda s:s.get('collection') and sum(len(v.get('history',[])) for v in s.get('sessions',[]))>=2)
+        before=original['collection']
+        def records(value):
+            return {(v['id'],r['key']):{k:r.get(k) for k in ('ts','input','cached','written','output','reasoning','total')} for v in value['sessions'] for r in v['history']}
+        expected=records(original)
         process=identity.process_identity(before['pid'])
         AppServices(None,[str(home)],index,evidence).start_collection()
         client=CollectionClient([home],index,evidence)
-        after=await_value(client.poll,lambda s:s.get('collection',{}).get('pid') not in (None,before['pid']))['collection']
+        migrated=await_value(client.poll,lambda s:s.get('collection',{}).get('pid') not in (None,before['pid']) and len(records(s))==len(expected))
+        after=migrated['collection'];assert records(migrated)==expected
+        with sqlite3.connect(client.channel.snapshot_path) as db:
+            schema=json.loads(zlib.decompress(db.execute('SELECT payload FROM snapshot WHERE id=1').fetchone()[0]))['collection_schema']
+        assert schema==2
         assert after['executable']==str(new) and not identity.same_process(process)
         if previous_channel!=client.channel.snapshot_path:assert not locked(channels[previous_channel])
         assert locked(client.channel.companion('.collector.lock'))
@@ -123,8 +132,17 @@ def verify_legacy_collector(root,old,new):
         AppServices(None,[str(home)],index,evidence).stop_collection()
         assert not identity.process_identity(after['pid'])
         assert all(not locked(lock) for lock in channels.values())
+        AppServices(None,[str(home)],index,evidence).start_collection()
+        client=CollectionClient([home],index,evidence)
+        resumed=await_value(client.poll,lambda s:s.get('collection',{}).get('pid') not in (None,after['pid']) and len(records(s))==len(expected))
+        assert records(resumed)==expected
+        client.close();client=None
+        AppServices(None,[str(home)],index,evidence).stop_collection()
+        assert not identity.process_identity(resumed['collection']['pid'])
+        assert all(not locked(lock) for lock in channels.values())
         return dict(before=before,after=after,previous_channel=previous_channel.name,
-                    cooperative=True,old_instance_exited=True)
+                    cooperative=True,old_instance_exited=True,previous_schema=original.get('collection_schema',1),
+                    current_schema=schema,preserved_calls=len(expected),preserved_sessions=len(migrated['sessions']),restart_preserved=True)
     finally:
         if client:client.close()
         task.stop();task.remove()

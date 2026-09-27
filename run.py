@@ -2,6 +2,18 @@ if __name__ == "__main__":
     from multiprocessing import freeze_support
     freeze_support()
     import sys
+    if '--benchmark-dashboard' in sys.argv:
+        sys.argv.remove('--benchmark-dashboard')
+        from cachemonitor.performance_probe import main
+        try:code=main()
+        except Exception:
+            import json,traceback
+            from pathlib import Path
+            report=Path(sys.argv[sys.argv.index('--output')+1])
+            report.parent.mkdir(parents=True,exist_ok=True)
+            report.write_text(json.dumps({'error':traceback.format_exc()},indent=2),encoding='utf-8')
+            code=1
+        raise SystemExit(code)
     if '--usage-collector' in sys.argv:
         sys.argv.remove('--usage-collector')
         from cachemonitor.usage_collection import main

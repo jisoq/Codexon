@@ -51,6 +51,7 @@ def navigation_target(data, kind, *, call=None, event=None, status=None):
     identity = (call or {}).get('call_id') or (call or {}).get('id') or (call or {}).get('key')
     if identity is None:
         return None
+    base=dict(home=call.get('home') or data['home'],sid=call.get('sid') or data['id'])
     section = {'cache': 'usage', 'speed': 'time', 'cost': 'pricing', 'observation': 'evidence', 'call': 'identity'}.get(kind)
     if kind=='speed' and call.get('output_speed') is None:section='usage'
     if section:

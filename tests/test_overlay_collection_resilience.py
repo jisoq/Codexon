@@ -370,3 +370,74 @@ def test_implicit_and_explicit_effective_evidence_share_scope(tmp_path,monkeypat
         assert client.poll(100)['errors']==[]
         assert service.channel.db.execute('SELECT count(*) FROM consumers').fetchone()[0]==1
     finally:client.close();service.close()
+
+
+def test_collection_reuses_history_and_atomically_replaces_current_sessions(tmp_path):
+    import copy
+    import json
+    import zlib
+    from cachemonitor.usage_collection import CollectionChannel, empty_snapshot
+    path=tmp_path/'index.sqlite'
+    writer=CollectionChannel([],path);reader=CollectionChannel([],path)
+    snapshot=empty_snapshot([],path,100)
+    snapshot['sessions']=[dict(home='h',id='s',history=[dict(key='a',output=1)],remaining=10)]
+    snapshot['request_activity']=[dict(home='h',attempt='a',status='started'),dict(home='h',attempt='b',status='started')]
+    try:
+        writer.publish(snapshot,'first',1)
+        first=reader.read(shared=True)
+        assert first==snapshot
+        snapshot['ts']=101;snapshot['sessions'][0]['remaining']=9
+        writer.publish(snapshot,'first',2)
+        second=reader.read(shared=True)
+        assert second['sessions'][0]['history'] is first['sessions'][0]['history']
+        assert second==snapshot
+        assert second['request_activity'][0] is first['request_activity'][0]
+        header=reader.read_header()
+        assert header['ts']==101 and 'sessions' not in header
+        isolated=reader.read();isolated['sessions'][0]['history'][0]['output']=99
+        assert reader.read(shared=True)['sessions'][0]['history'][0]['output']==1
+        snapshot['sessions'][0]['history'][0]['output']=2
+        snapshot['request_activity'][0]['status']='completed'
+        snapshot['request_activity'].reverse()
+        writer.publish(snapshot,'first',4)  # Consumers may miss intermediate revisions.
+        assert reader.read()==snapshot
+        assert first['sessions'][0]['history'][0]['output']==1
+        writer.publish(snapshot,'restart',1)
+        assert reader.read()==snapshot
+        snapshot['sessions']=[];snapshot['request_activity']=[];writer.publish(snapshot,'restart',2)
+        assert reader.read()['sessions']==[]
+        assert writer.db.execute('SELECT count(*) FROM sessions').fetchone()[0]==0
+        # Upgrade begins with a previous full-blob publication.
+        legacy=copy.deepcopy(snapshot);legacy['ts']=102
+        with writer.db:
+            writer.db.execute('UPDATE snapshot SET epoch=?,sequence=?,payload=?',
+                ('legacy',1,zlib.compress(json.dumps(legacy).encode())))
+        assert reader.read()==legacy
+    finally:reader.close();writer.close()
+
+
+def test_collection_interrupted_transaction_preserves_published_revision(tmp_path):
+    import copy,sqlite3
+    from cachemonitor.usage_collection import CollectionChannel,empty_snapshot
+    path=tmp_path/'custom.sqlite';writer=CollectionChannel([],path);reader=CollectionChannel([],path)
+    original=empty_snapshot([],path,100)
+    original['sessions']=[dict(home='h',id='s',history=[dict(key='one',output=1)])]
+    try:
+        writer.publish(original,'first',1);assert reader.read()==original
+        updated=copy.deepcopy(original);updated['sessions'][0]['history'][0]['output']=2
+        db=writer.db
+        class Interrupted:
+            def __enter__(self):return db.__enter__()
+            def __exit__(self,*args):return db.__exit__(*args)
+            def executemany(self,*args):return db.executemany(*args)
+            def execute(self,sql,*args):
+                if 'INSERT OR REPLACE INTO snapshot' in sql:raise sqlite3.OperationalError('interrupted publication')
+                return db.execute(sql,*args)
+        writer.db=Interrupted()
+        with pytest.raises(sqlite3.OperationalError):writer.publish(updated,'first',2)
+        writer.db=db
+        assert reader.read()==original
+        writer.publish(updated,'first',3);assert reader.read()==updated
+    finally:
+        if 'db' in locals():writer.db=db
+        reader.close();writer.close()

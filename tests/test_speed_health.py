@@ -72,26 +72,18 @@ def test_correction_and_duplicate_response_do_not_keep_false_evidence():
     assert not health(duplicated)['active']
 
 
-def test_open_details_rejects_stale_session_incident_and_missing_observation():
+def test_detail_includes_current_health_without_another_entry():
     from PySide6.QtWidgets import QApplication
     from cachemonitor.overlay_view import OverlayContent
-    from cachemonitor.overlay_navigation import navigation_target
     app=QApplication.instance() or QApplication([])
-    s=session([100]*10+[35]*3)
-    data=dict(s, speed_health=health(s))
-    content=OverlayContent();content.set_content(data)
-    target=navigation_target(data,'speed_alert')
-    assert content.open_speed_detail(target)
-    assert content.speed_detail and '세션 재생성을 권장합니다.' in content.detailBody.state['accessible']
+    source=session([100]*10+[35]*3)
+    data=dict(source,speed_health=health(source))
+    content=OverlayContent();content.set_content(data);content.set_layout(detail=True)
+    assert '세션 재생성을 권장합니다.' in content.detailBody.state['accessible']
+    assert not any(link['id']=='speed-info' for link in content.monitor_links())
     content.set_content(dict(data,speed_health={'active':False}))
-    assert '출력 속도 저하' not in content.detailBody.state['accessible']
     assert '세션 재생성' not in content.detailBody.state['accessible']
-    assert not any(link['id']=='speed-info' for link in content.monitor_links())
-    content.set_content(dict(data,id='different'))
-    assert not content.speed_detail and not content.open_speed_detail(target)
     content.set_content(data,note='수집 지연')
-    assert not content.open_speed_detail(target)
-    assert not any(link['id']=='speed-info' for link in content.monitor_links())
-    content.set_content(dict(data,speed_health=dict(data['speed_health'],incident_id='new')))
-    assert not content.open_speed_detail(target)
+    assert '세션 재생성' not in content.detailBody.state['accessible']
+    assert [r['id'] for r in content.monitor_links() if r.get('target')]==['session','collection']
     content.deleteLater();app.processEvents()

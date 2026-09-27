@@ -45,6 +45,7 @@ class AnalysisEngine:
         self.results=BoundedCache(6,160000)
         self.statistics=BoundedCache(2048,160000)
         self.summaries=BoundedCache(64,160000)
+        self.page_results=BoundedCache(8,160000)
         self.revision=0
         self.generation=0
         self.pricing_signature=None
@@ -91,6 +92,12 @@ class AnalysisEngine:
                 continue
             changed=True
             self.generation+=1
+            if old and not reprice and old['fingerprint'][1:]==fingerprint[1:]:
+                before=old['fingerprint'][0]
+                if before[:6]+before[7:]==metadata[:6]+metadata[7:]:
+                    updated[key]={**old,'source':source,'prepared':{**old['prepared'],'collection_complete':source.get('collection_complete')},
+                        'fingerprint':fingerprint,'revision':self.generation}
+                    continue
             previous=old['records'] if old and not reprice else {}
             misses=classify(owned_history)
             miss_keys={e['key'] for e in misses['events']}
@@ -170,6 +177,24 @@ class AnalysisEngine:
         # Request boundaries and partial buckets can change without call membership.
         return (self.revision,q['page'],freeze(q))
 
+    def page_query(self,q):
+        if not q.get('presentation'):return self.query(q)
+        from .dashboard_views import project, refresh_bounds
+        from .analysis_worker import expiry
+        stable={k:v for k,v in q.items() if k!='now' and (q.get('period')=='custom' or k not in ('start','end'))}
+        key=self.query_key(stable)
+        cached=self.page_results.get(key)
+        if cached and q['now']<cached[1]:return refresh_bounds(cached[0],q)
+        value=project(self,q)
+        deadline=expiry(self,q)
+        if q['page']==0 and q.get('period')!='custom':
+            from .analytics import _bucket_start, _next_bucket, _local_timestamp
+            unit=value['overview']['granularity']
+            deadline=min(deadline,_local_timestamp(_next_bucket(_bucket_start(q['end'],unit),unit)))
+        value['valid_until']=deadline
+        self.page_results.put(key,(value,deadline),value['analysis']['response_count']+1)
+        return value
+
     def query(self,q):
         key=self.query_key(q)
         cached=self.results.get(key)
@@ -197,7 +222,8 @@ class AnalysisEngine:
             boundaries=state['boundaries']
             request_interval=(bisect_left(boundaries,start),bisect_left(boundaries,end))
             part_key=(session_key,state['revision'],interval,request_interval,model,effort,mode)
-            part=self.parts.get(part_key)
+            recent=state.get("recent_part")
+            part=recent[1] if recent and recent[0]==part_key else self.parts.get(part_key)
             if part is None:
                 part=analyze([s],start,end,model,with_comparisons=False,service_tier=mode,effort=effort)
                 part['_sorted_responses']=sorted(part['responses'],key=lambda r:r['ts'])
@@ -208,6 +234,7 @@ class AnalysisEngine:
                 part['_turn_lookup']=dict(lookup)
                 self.parts.put(part_key,part,len(s['history'])+1)
                 self.metrics['part_builds']+=1
+            state['recent_part']=(part_key,part)
             responses.extend(part['responses']); turns.extend(part['turns'])
             if part['responses']:
                 bysession[session_key]=part['_sorted_responses']
@@ -237,6 +264,9 @@ class AnalysisEngine:
                 'whole_turns':dict(whole_turns)},
                 'revision':self.revision}
         result['filter_choices']=observed_choices(responses)
+        if q['page']==2:
+            from .session_costs import own_costs, session_costs
+            result['session_costs']=session_costs(selected,own_costs(responses))
         if q['page']==0: result['overview']=overview_view(a,start,end,q.get('metric','cost'),q.get('granularity','auto'),q.get('basis','total'),q.get('group_by','project'),self.stat,self.summary)
         if q['page']==1: result['comparison']=comparison_view(a,q.get('metric','cost'),q.get('band'),self.stat,q.get('targets'),q.get('baseline','A'),
             unit,q.get('method','mean'),q.get('conditions'),q.get('matrix_by','input'),q.get('comparison_type',''))

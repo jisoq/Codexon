@@ -3,6 +3,7 @@ import QtQuick.Controls.Basic
 
 CheckBox {
     id: control
+    property color textColor: appTheme.palette.ink
     hoverEnabled: true
     HoverHandler { cursorShape: control.enabled ? Qt.PointingHandCursor : Qt.ArrowCursor }
     implicitHeight: 36
@@ -18,7 +19,7 @@ CheckBox {
         Text { anchors.centerIn: parent; text: "✓"; visible: control.checked; color: appTheme.palette.onaccent; font.pixelSize: 14 }
     }
     contentItem: Text {
-        text: control.text; font: control.font; color: control.enabled ? (appTheme.palette && appTheme.color("ink")) : (appTheme.palette && appTheme.color("unknown"))
+        text: control.text; font: control.font; color: control.enabled ? (appTheme.palette && control.textColor) : (appTheme.palette && appTheme.color("unknown"))
         leftPadding: control.indicator.width + control.spacing
         verticalAlignment: Text.AlignVCenter
     }

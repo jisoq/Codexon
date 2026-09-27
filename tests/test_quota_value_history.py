@@ -75,3 +75,17 @@ def test_account_switch_does_not_mix_money_or_invent_reset():
     assert all(r['account']=='a' for r in rows)
     assert all(r['reset_kind'] is None for r in rows)
     assert quota_statistics(report)['cost']==3
+
+
+def test_completed_opening_survives_latest_collection_lag():
+    from cachemonitor.quota_view import prepare_quota_view
+    c=interval([(100,100),(130,100),(160,99),(190,98)],[(120,2),(150,3),(180,7)])
+    c['cost_complete_at']=190
+    report=report_for([c])
+    expected=prepare_quota_view(report)['periods'][0]['series']['completed_costs']
+    c['endpoints'].append((220,2));c['end']=220
+    report=report_for([c]);c['cost_complete']=False
+    actual=prepare_quota_view(report)['periods'][0]['series']['completed_costs']
+    assert actual[:3]==expected[:3]==[5,5,7]
+    c['cost_complete_at']=None
+    assert prepare_quota_view(report)['periods'][0]['series']['completed_costs'][0] is None

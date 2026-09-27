@@ -72,10 +72,10 @@ def test_quick_pages_keep_scroll_and_render_model_evidence(tmp_path):
     try:
         window.receive(snapshot);window.nav.setCurrentRow(2);window.show();QTest.qWait(100)
         from cachemonitor.dashboard import choose
-        choose(window.record_view_choice,'calls');window.record_view_changed();QTest.qWait(40)
+        window.record_view='calls';window.render_explorer();QTest.qWait(40)
         window.extra_column_controls['response_model'].setChecked(True);QTest.qWait(40)
         response_column=window.table.model().headers.index('응답 모델')
-        assert response_column==6
+        assert response_column==7
         assert '호출 소요시간' not in window.table.model().headers and '관측 상태' not in window.table.model().headers
         assert window.table.item(0,response_column).text()=='gpt-6-astra'
         assert window.table.item(1,response_column).text()=='gpt-5.6-sol'
@@ -94,7 +94,7 @@ def test_quick_pages_keep_scroll_and_render_model_evidence(tmp_path):
         assert 'gpt-5.6-sol' in window.detail_sections['conditions'][1].text()
         assert window.detail_scroll.isVisible() and not window.table.isVisible()
         window.close_record_detail();assert window.table.isVisible()
-        assert window.selected_session==('fixture','quick')  # opening a call preserves its parent scope
+        assert window.selected_call_scope==('fixture','quick')  # global calls retain exact owning scope
         assert not window.qml_errors,window.qml_errors
     finally:
         window.quit_app();app.setProperty('cachemonitorDisableShellIntegration',previous)

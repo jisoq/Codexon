@@ -28,21 +28,42 @@ def test_sequential_time_tables_keep_order_cost_sort_and_selected_call(tmp_path)
     window=Dashboard([],start_worker=False,live_limits=False,settings=QSettings(str(tmp_path/'order.ini'),QSettings.IniFormat))
     try:
         window.receive(snapshot());window.resize(1800,1000);window.show();window.nav.setCurrentRow(2);QTest.qWait(50)
-        assert window.parent_kind=='sessions'
-        assert [r['sid'] for r in window.parent_rows]==['new','old']
-        click_row(window,window.parent_table,0)
-        assert window.record_view=='requests' and [r['turn'] for r in window.record_rows]==['second','first']
-        click_row(window,window.table,1)
-        assert window.record_view=='calls' and [r['key'] for r in window.record_rows]==['new-2','new-1']
-        click_row(window,window.table,1)
+        window.activate_record(0)
+        assert window.record_view=='sessions'
+        assert [r['sid'] for r in window.record_rows]==['new','old']
+        click_row(window,window.table,0)
+        assert window.record_view=='requests' and [r['turn'] for r in window.record_rows]==['first','second']
+        click_row(window,window.table,0)
+        assert window.record_view=='calls' and [r['key'] for r in window.record_rows]==['new-1','new-2']
+        click_row(window,window.table,0)
         assert window.selected_call=='new-1' and window.detail_scroll.isVisible()
         add(newer,1,'new-4','first');window.receive(snapshot());QTest.qWait(50)
         assert window.selected_turn=='first' and window.selected_call=='new-1'
         assert window.exact_record['key']=='new-1'
-        assert [r['key'] for r in window.record_rows]==['new-4','new-2','new-1']
-        assert [r['key'] for r in window.lookup['turns'][('h','new','first')]]==['new-1','new-2','new-4']
+        assert [r['key'] for r in window.record_rows]==['new-1','new-2','new-4']
+        assert [r['key'] for r in window.engine.query(window.query())['lookup']['turns'][('h','new','first')]]==['new-1','new-2','new-4']
         window.close_record_detail();window.go_back();window.go_back()
         window.sort.setCurrentIndex(window.sort.findData('cost_desc'))
-        assert window.parent_kind=='sessions' and [r['sid'] for r in window.parent_rows]==['old','new']
+        assert window.record_view=='sessions' and [r['sid'] for r in window.record_rows]==['old','new']
         assert not window.qml_errors
+    finally:window.quit_app();app.setProperty('cachemonitorDisableShellIntegration',before)
+
+
+def test_restored_selection_uses_absolute_index_in_paged_records(tmp_path):
+    app=QApplication.instance() or QApplication([])
+    before=app.property('cachemonitorDisableShellIntegration');app.setProperty('cachemonitorDisableShellIntegration',True)
+    window=Dashboard([],start_worker=False,live_limits=False,settings=QSettings(str(tmp_path/'paged.ini'),QSettings.IniFormat))
+    now=time.time();session=Session('paged','fixture',title='Paged calls')
+    for i in range(350):
+        session.add_usage(now-400+i,str(i),dict(input_tokens=100,output_tokens=10),'gpt-6-astra')
+    try:
+        window.receive(dict(ts=now,sessions=[session.view(now)],homes=[],errors=[],unassigned=[],index={'loading':False}))
+        window.nav.setCurrentRow(2);window.selected_session=None;window.selected_turn=None;window.record_view='calls'
+        window.use_history_table();window.table.first_visible=180;window.table.last_visible=190;window.render_explorer()
+        assert window.record_rows.start>0
+        window.table.select_row(185);state=window.capture_state();key=window.table.row_key(window.record_rows[185])
+        window.table.select_row(-1);window._restore_positions=state
+        window.apply_result(window.view_result,window.query())
+        assert window.table.currentRow()==185
+        assert window.table.row_key(window.record_rows[window.table.currentRow()])==key
     finally:window.quit_app();app.setProperty('cachemonitorDisableShellIntegration',before)

@@ -19,9 +19,9 @@ Rectangle {
         activeFocusOnTab: visible
         property bool keyboardFocus: false
         onActiveFocusChanged: if (!activeFocus) keyboardFocus = false
-        Accessible.role: root.s.chromeKind === "icon" ? Accessible.Button : Accessible.Link
-        Accessible.name: root.s.chromeKind === "icon" ? appLanguage.text("복원") : (root.s.title || appLanguage.text("세션 제목")) + appLanguage.text(" · 세션 기록 열기")
-        Accessible.onPressAction: if (root.s.chromeKind === "icon") root.presentation.restorePanel(); else root.presentation.openSession()
+        Accessible.role: root.s.chromeKind === "icon" ? Accessible.Button : Accessible.Pane
+        Accessible.name: root.s.chromeKind === "icon" ? appLanguage.text("복원") : (root.s.title || appLanguage.text("세션 제목")) + appLanguage.text(" · 이동")
+        Accessible.onPressAction: if (root.s.chromeKind === "icon") root.presentation.restorePanel()
         Keys.onPressed: event => {
             keyboardFocus = true;
             const step = (event.modifiers & Qt.ShiftModifier) ? 10 : 1;
@@ -31,8 +31,7 @@ Rectangle {
                 event.accepted = true;
             } else if (root.s.chromeKind === "icon" && [Qt.Key_Space, Qt.Key_Return, Qt.Key_Enter].indexOf(event.key) >= 0) {
                 root.presentation.restorePanel(); event.accepted = true;
-            } else if (root.s.chromeKind === "header" && [Qt.Key_Return, Qt.Key_Enter].indexOf(event.key) >= 0) {
-                root.presentation.openSession(); event.accepted = true;
+
             }
         }
     }
@@ -91,7 +90,7 @@ Rectangle {
         property string glyph
         property string actionName
         property bool selected: false
-        width: 24 * root.s.scale; height: width; padding: 5 * root.s.scale
+        width: 22 * root.s.scale; height: width; padding: 5 * root.s.scale
         focusPolicy: Qt.TabFocus; hoverEnabled: true
         Accessible.name: actionName
         Accessible.checkable: glyph === "detail" || glyph === "opacity"
@@ -114,7 +113,7 @@ Rectangle {
                 c.strokeStyle = button.selected ? root.s.accent : root.s.meta; c.fillStyle = c.strokeStyle;
                 c.globalAlpha = button.enabled ? 1 : 0.38;
                 c.lineWidth = 1.5; c.lineCap = "round"; c.lineJoin = "round";
-                c.scale(root.s.scale, root.s.scale);
+                c.scale(root.s.scale * 12 / 14, root.s.scale * 12 / 14);
                 if (button.glyph === "detail") {
                     c.strokeRect(1, 1, 12, 12);
                     c.beginPath(); c.moveTo(5, 1); c.lineTo(5, 13); c.stroke();
@@ -132,22 +131,16 @@ Rectangle {
     }
     Item {
         x: 4 * root.s.scale; y: 4 * root.s.scale
-        width: 80 * root.s.scale; height: 24 * root.s.scale
+        width: 70 * root.s.scale; height: 22 * root.s.scale
         visible: root.s.chromeKind === "actions"
         IconButton {
-            id: detailButton
-            objectName: "expand"; x: 0; glyph: "detail"; selected: root.s.expanded
-            actionName: root.s.expanded ? appLanguage.text("상세 닫기 · 열림") : appLanguage.text("상세 열기 · 닫힘")
-            onClicked: root.presentation.expandPanel()
-        }
-        IconButton {
             id: opacityButton
-            objectName: "opacityButton"; x: 28 * root.s.scale; glyph: "opacity"; selected: root.s.popupOpen
+            objectName: "opacityButton"; x: 24 * root.s.scale; glyph: "opacity"; selected: root.s.popupOpen
             actionName: root.s.popupOpen ? appLanguage.text("투명도 닫기 · 열림") : appLanguage.text("투명도 열기 · 닫힘")
             onClicked: root.presentation.toggleOpacity()
         }
         IconButton {
-            objectName: "collapse"; x: 56 * root.s.scale; glyph: "minimize"; actionName: appLanguage.text("최소화")
+            objectName: "collapse"; x: 48 * root.s.scale; glyph: "minimize"; actionName: appLanguage.text("최소화")
             onClicked: root.presentation.collapsePanel()
         }
     }

@@ -94,13 +94,15 @@ def interaction_probe(window,app,settle):
                 'max_ms':round(max(values)*1000,3)}
     window.model.setCurrentIndex(0)
     window.selected_session=None;window.selected_turn=None;window.selected_call=None
-    window.selected_event=None;window.temporary_context=None;window.record_view='sessions'
+    window.selected_event=None;window.temporary_context=None;window.history_navigation.project='';window.record_view='projects'
     window.search.clear();window.nav.setCurrentRow(2);window.render();settle()
-    candidates=[(index,row) for index,row in enumerate(window.parent_rows)
-                if window.lookup['session_turns'].get((row['home'],row['sid']))]
+    if not window.record_rows:return {'excluded':'프로젝트 기록 없음'}
+    window.activate_record(0);settle()
+    candidates=[(index,row) for index,row in enumerate(window.record_rows)
+                if row.get('calls')]
     if not candidates:return {'excluded':'탐색 가능한 요청 구간 없음'}
     session,row=max(candidates,key=lambda value:value[1]['calls'])
-    click_row(window,window.parent_table,session);settle()
+    click_row(window,window.table,session);settle()
     assert window.record_view=='requests' and window.selected_session==(row['home'],row['sid'])
     turns=[row['turn'] for row in sorted(window.record_rows,key=lambda row:row.get('responses',0),reverse=True)[:12]]
     if not turns:return {'excluded':'선택 세션에 요청 기록 없음'}
@@ -113,7 +115,7 @@ def interaction_probe(window,app,settle):
         assert window.record_view=='calls' and window.selected_turn==turn
         assert window.table.rowCount()==expected
         stamps=[row.get('ts',0) for row in window.record_rows]
-        assert stamps==sorted(stamps,reverse=True)
+        assert stamps==sorted(stamps)
         latest_first[turn]=len(stamps)
         window.go_back();settle();assert window.record_view=='requests'
     index=next(i for i,row in enumerate(window.record_rows) if row['turn']==turns[0])

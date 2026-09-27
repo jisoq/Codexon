@@ -27,15 +27,22 @@ class OverlayController(QObject):
     def __init__(self, settings, native_enabled=True, appearance_path=None):
         super().__init__()
         self.settings = settings
+        self.record_loader=None;self.record_serial=0;self.pending_record=None
         self.widget = SessionOverlay()
+        content=self.widget.content_model;content.settings=settings
+        content.monitor_tab=settings.value('overlay/monitorTab','latest')
+        if content.monitor_tab not in ('history','latest'):content.monitor_tab='latest'
+        content.composition_unit=settings.value('overlay/compositionUnit','tokens')
+        if content.composition_unit not in ('tokens','usd'):content.composition_unit='tokens'
         from .overlay_shadow import OverlayShadow
         self.shadow=OverlayShadow()
-        from .overlay_chrome import OverlayChrome, OverlayDetail, OverlayLinks, CalculationNote
+        from .overlay_chrome import OverlayChrome, OverlayDetail, OverlayLinks
         self.header=OverlayChrome('header');self.toolbar=OverlayChrome('toolbar');self.icon=OverlayChrome('icon');self.actions=OverlayChrome('actions')
         self.detail=OverlayDetail(self.widget.content_model)
         self.links=OverlayLinks(self.widget.content_model)
-        self.calculation_note=self.widget.content_model.calculation_note=CalculationNote(self.widget.content_model)
-        self.links.view.navigationRequested.connect(self.navigate_monitor)
+        self.links.view.navigationRequested.connect(self.navigation_requested)
+        self.links.view.detailRequested.connect(self.open_call_detail)
+        self.links.view.callSelected.connect(self.select_call)
         self.detail.view.navigationRequested.connect(self.navigation_requested)
         self.links.wheel_forwarder=self.forward_wheel
         self.chrome=(self.header,self.toolbar,self.icon,self.actions,self.detail,self.links)
@@ -71,7 +78,6 @@ class OverlayController(QObject):
         self.drag_timer.setSingleShot(True)
         self.drag_timer.timeout.connect(self.flush_drag)
         self.actions.collapse.connect(lambda:self.set_collapsed(True))
-        self.actions.expand.connect(self.toggle_expanded)
         self.actions.opacity_toggle.connect(self.toggle_opacity)
         self.icon.restore.connect(lambda:self.set_collapsed(False))
         self.toolbar.opacity_changed.connect(self.set_opacity)
@@ -93,7 +99,6 @@ class OverlayController(QObject):
         self.target_state = {}
         self.observed_at = self.snapshot_at = 0
         self.snapshot_wall_time = None
-        self.header.open_session.connect(self.open_session)
         self.sessions = []
         self.session_lookup = {}
         self.loading = True
@@ -127,20 +132,33 @@ class OverlayController(QObject):
         self._pointer_down=False
         if self.native and self.enabled: self.timer.start(1000)
 
-    def navigate_monitor(self, target):
-        if target.view != 'speed_alert':
-            self.navigation_requested.emit(target);return
-        if self.widget.content_model.open_speed_detail(target):
-            self.expanded=True
-            self.close_popup();self.refresh()
-            self.detail.focus_control('detailScroll')
+    def select_call(self,value):
+        target,snapshot=value
+        content=self.widget.content_model
+        row=next((r for r in [snapshot,*content.rows(),content.selected()] if r and
+                  (r.get('home'),r.get('sid'),str(r.get('id')))==(target.home,target.sid,target.call_id)),None)
+        if not row:return False
+        self.pending_record=None;content.selected_snapshot=row;content.selected_id=content.call_id(row)
+        content.select(content.call_id(row));content.update()
+        return True
 
-    def open_session(self):
-        from .overlay_navigation import navigation_target
-        data,_=self.content()
-        target=navigation_target(data,'session')
-        pressed=getattr(self.header,'pressed_scope',None)
-        if target and self.selection_confirmed() and (pressed is None or pressed==(target.home,target.sid)):self.navigation_requested.emit(target)
+    def open_call_detail(self,target):
+        if not self.select_call(target):return
+        self.expanded=True;self.settings.setValue('overlay/expanded',True)
+        self.close_popup();self.refresh();self.focus_control('detailScroll')
+
+    def receive_record(self,value):
+        pending=self.pending_record
+        if not pending or value.get('id')!=pending[0]:return
+        self.pending_record=None
+        content=self.widget.content_model;data=content.data or {}
+        if (data.get('home'),data.get('id'))!=pending[1]:return
+        row=value.get('row')
+        if row:
+            from .overlay_data import call_summary
+            row=call_summary(row,0)
+            content.selected_snapshot=row;content.selected_id=content.call_id(row);content.follow_latest=False
+            content.sync_details();content.update()
 
     def selected_scope(self,home,sid):
         selection=self.target_state.get('selection')
@@ -175,13 +193,14 @@ class OverlayController(QObject):
         if not selection or selection.host!='local' or selection.thread_id!=target.sid:
             return dict(enabled=False,reason='Codex의 현재 세션과 다름' if selection else '현재 세션 확인 불가')
         data=next((s for s in self.session_lookup.get(target.sid,[]) if s['home']==target.home),None)
-        rows=(data or {}).get('all_calls',(data or {}).get('recent',[]))
+        rows=(data or {}).get('recent',[])
         call_id=target.call_id
         if target.event_id:
             event=next((e for e in (data or {}).get('cache_degradation',{}).get('events',[]) if str(e.get('id'))==target.event_id),None)
             if not event:return dict(enabled=False,reason='대상 기록을 찾을 수 없음')
             keys=event.get('occurrence_keys',event.get('keys',[]));call_id=keys[0] if keys else None
-        if call_id and not any(str(self.widget.content_model.call_id(row))==str(call_id) for row in rows):
+        missing=call_id and not any(str(row.get('id'))==str(call_id) for row in rows)
+        if missing and not self.record_loader:
             return dict(enabled=False,reason='대상 기록을 찾을 수 없음')
         if not self.native.activate_target(window['hwnd']):
             return dict(enabled=False,reason='현재 세션 확인 불가')
@@ -192,6 +211,10 @@ class OverlayController(QObject):
         self.refresh()
         if call_id:
             self.widget.content_model.select(call_id)
+            if missing:
+                self.record_serial+=1;request=f'overlay-record-{self.record_serial}'
+                self.pending_record=(request,(target.home,target.sid))
+                self.record_loader(request,(target.home,target.sid,call_id))
         return dict(enabled=True,reason='')
 
     def forward_wheel(self,event):
@@ -241,7 +264,6 @@ class OverlayController(QObject):
         self.close_popup()
         self.expanded=not self.expanded
         if not self.expanded:
-            self.widget.content_model.speed_detail=False
             self.widget.content_model.sync_details()
         self.settings.setValue('overlay/expanded',self.expanded)
         self.changed.emit();self.refresh()
@@ -288,7 +310,7 @@ class OverlayController(QObject):
             self.view_animation.setEndValue(1.)
             self.view_animation.start()
         else:self.advance_view(1.)
-        if keyboard:self.focus_control('restore' if self.automatic_mode=='icon' else 'expand')
+        if keyboard:self.focus_control('restore' if self.automatic_mode=='icon' else 'call-detail')
 
     def advance_view(self, value):
         for control in (self.widget,self.shadow,*self.chrome):control.setWindowOpacity(float(value))
@@ -464,7 +486,7 @@ class OverlayController(QObject):
             self.native.activate_companion(int(control.winId()))
 
     def focus_control(self, name):
-        if name in ('monitorLinks','monitorLinksLast'):
+        if name in ('monitorLinks','monitorLinksLast','call-detail'):
             if self.links.isVisible():
                 self.activate_control(self.links);self.links.focus_control(name);return
             name='dragTitle' if name=='monitorLinks' else 'collapse'
@@ -499,7 +521,7 @@ class OverlayController(QObject):
             return
         elif self.expanded:
             self.toggle_expanded()
-            self.focus_control('expand')
+            self.focus_control('call-detail')
             return
         target=self.target_state.get('target')
         if self.native and target and hasattr(self.native,'restore_target_focus'):
@@ -613,7 +635,7 @@ class OverlayController(QObject):
             self.native.configure(int(self.shadow.winId()),click_through=True)
             for control in self.chrome:self.native.configure(int(control.winId()),click_through=False)
             if hasattr(self.native,'set_companions'):
-                self.native.set_companions(int(control.winId()) for control in (*self.chrome,self.calculation_note))
+                self.native.set_companions(int(control.winId()) for control in self.chrome)
             self.chrome_native=self.native
         for control in self.chrome:
             if hasattr(control,'apply_appearance'):control.apply_appearance(self.appearance,self.opacity)
@@ -657,8 +679,9 @@ class OverlayController(QObject):
             else:self.detail.hide()
             if not inline and self.links.sync():place(self.links,(0,0,380,geometry[3]/native_scale),monitor)
             else:self.links.hide()
-            place(self.header,(12,8,268,36),monitor)
-            self.actions_geometry=place(self.actions,(280,8,88,32),monitor)
+            if inline:place(self.header,(150,12,134,32),monitor)
+            else:place(self.header,(12,12,278,32),monitor)
+            self.actions_geometry=place(self.actions,(290,13,78,30),monitor)
             if self.popup_open:
                 # Align below the header. The monitor already guarantees enough
                 # interior width; clamping also handles rounded native pixels.
@@ -698,6 +721,9 @@ def install_overlay(window, native_enabled=True):
     from PySide6.QtWidgets import QMenu
     controller = OverlayController(window.settings, native_enabled=native_enabled)
     window.overlay = controller
+    if getattr(window,'worker',None) and hasattr(window.worker,'request_record'):
+        controller.record_loader=window.worker.request_record
+        window.worker.record.connect(controller.receive_record)
     if hasattr(window,'navigate'):controller.navigation_requested.connect(window.navigate)
     if hasattr(window,'refresh_overlay_availability'):controller.changed.connect(window.refresh_overlay_availability)
     if getattr(window,'quota_service',None):

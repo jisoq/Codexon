@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from datetime import date
 import re
+from functools import wraps
 
 from PySide6.QtCore import QObject, Property, Signal, Slot, Qt, QDate, QSize, QTimer
 from .i18n import localize_state
@@ -15,9 +16,13 @@ from .i18n import localize_state
 
 class Node(QObject):
     changed = Signal()
+    stateChanged = Signal()
+    textValueChanged = Signal()
     structureChanged = Signal()
     revealRequested = Signal(QObject)
     kind = 'group'
+    _batch_depth=0
+    _batched={}
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -32,8 +37,13 @@ class Node(QObject):
                            checked=False, checkable=False, index=0, items=[],
                            minimum=0, maximum=100, value=0)
 
-    @Property('QVariantMap', notify=changed)
+    @Property('QVariantMap', notify=stateChanged)
     def state(self): return localize_state(self._state)
+
+    @Property(str,notify=textValueChanged)
+    def textValue(self):
+        from .i18n import tr
+        return tr(self._state['text'])
 
     @Property(str,constant=True)
     def uid(self):return str(id(self))
@@ -42,14 +52,25 @@ class Node(QObject):
     def nodes(self): return self._nodes
 
     def put(self, **values):
-        if any(self._state.get(k) != v for k, v in values.items()):
+        keys={k for k,v in values.items() if self._state.get(k)!=v}
+        if keys:
             self._state.update(values)
             if self.signalsBlocked():
                 if not hasattr(self,'_notify_timer'):
                     self._notify_timer=QTimer(self);self._notify_timer.setSingleShot(True)
-                    self._notify_timer.timeout.connect(self.changed)
+                    self._notify_timer.timeout.connect(self.update)
                 self._notify_timer.start(0)
-            else:self.changed.emit()
+            else:
+                self.notify_state(bool(keys-{'text'}),'text' in keys)
+
+    def notify_state(self,state=True,text=False):
+        if Node._batch_depth:
+            old=Node._batched.get(self,(False,False))
+            Node._batched[self]=(old[0] or state,old[1] or text)
+            return
+        if text:self.textValueChanged.emit()
+        if state:self.stateChanged.emit()
+        self.changed.emit()
 
     def append(self, node, stretch=0, index=None):
         node.setParent(self)
@@ -100,7 +121,8 @@ class Node(QObject):
     def setHtml(self,value): self.put(text=str(value),rich=True)
     def toPlainText(self): return re.sub('<[^>]+>','',self.text())
     def clear(self): self.setText('')
-    def update(self): self.changed.emit()
+    def update(self):
+        self.notify_state(True,True)
     def setObjectName(self,name):
         super().setObjectName(name)
         styles={'brand':dict(fontSize=21,bold=True),'heading':dict(fontSize=24,bold=True),
@@ -329,3 +351,19 @@ class ScrollPosition(QObject):
         if self._value!=value:self._value=value;self.changed.emit()
     def value(self):return self._value
     def sizeHint(self):return QSize(12,12)
+
+
+def batched_updates(function):
+    """Publish each node's final presentation state once per GUI transaction."""
+    @wraps(function)
+    def apply(*args,**kwargs):
+        Node._batch_depth+=1
+        try:return function(*args,**kwargs)
+        finally:
+            Node._batch_depth-=1
+            if not Node._batch_depth:
+                from shiboken6 import isValid
+                pending=Node._batched;Node._batched={}
+                for node,flags in pending.items():
+                    if isValid(node):node.notify_state(*flags)
+    return apply

@@ -1,4 +1,8 @@
 {
+  "계산 기준": "Calculation basis",
+  "세션 근거": "Session evidence",
+  "세션 근거 · 출력 속도 저하": "Session evidence · Output slowdown",
+  " · 이동": " · Move",
   " 잔여량 ": " remaining ",
   "%p · 산정 ": "%p · Calculation ",
   "%p × 100 · 주간 100%p의 관측 기반 추정": "%p × 100 · Observation-based estimate of 100%p per week",
@@ -1803,5 +1807,22 @@
   "안전 종료는 응답 완료를 기다립니다. 강제 종료는 진행 중 연결과 캐시 요청을 끊고 기록 저장 후 종료합니다.": "Safe exit waits for responses. Force exit interrupts connections and cache requests, saves records, and exits.",
   "강제 종료를 지원하려면 연결 구성요소를 업데이트하세요.": "Update the connection components to enable force exit.",
   "강제 종료하면 진행 중인 응답이 중단됩니다.": "Force exit interrupts responses in progress.",
-  "종료를 완료하지 못했습니다. 종료를 다시 누르면 재시도합니다.": "Exit could not complete. Choose Exit again to retry."
+  "종료를 완료하지 못했습니다. 종료를 다시 누르면 재시도합니다.": "Exit could not complete. Choose Exit again to retry.",
+  "프로젝트 · 세션": "Projects · sessions",
+  "요청 · 시작": "Request · start",
+  "모델 · 추론 · 모드": "Model · effort · mode",
+  "하위 세션": "Child sessions",
+  "필터·표시 항목": "Filters and columns",
+  "환산액 · 하위 포함": "Estimated cost · incl. children",
+  "입력 / 출력": "Input / output",
+  "API 단가 기준 · 청구액 아님": "API price estimate · not a bill",
+  "누적 환산액": "Cumulative equivalent",
+  "입력 / 출력 구성": "Input / output composition",
+  "입력 / 출력 환산액": "Input / output equivalent",
+  "환산액 ($)": "Equivalent ($)",
+  "캐시 (%)": "Cache (%)",
+  "출력 속도 (tok/s)": "Output speed (tok/s)",
+  "개수": "Count",
+  "모델 호출": "Model calls",
+  "호출-응답 일치": "Request-response match"
 }

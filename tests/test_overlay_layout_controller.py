@@ -88,44 +88,30 @@ def check_keyboard_focus_path(layout_controller):
     from PySide6.QtTest import QTest
     controller=layout_controller
     controller.toggle_expanded()
-    def item(control,name):return control.quick.rootObject().findChild(QQuickItem,name)
+    from cachemonitor.overlay_chrome import named_item
+    def item(control,name):return named_item(control.quick.rootObject(),name)
     def key(control,value,modifier=Qt.NoModifier):
         QTest.keyClick(control.quick,value,modifier);QTest.qWait(20)
-    controller.focus_control('expand')
-    key(controller.actions,Qt.Key_Tab)
-    graph=item(controller.detail,'detailGraph')
+    controller.focus_control('detailScroll')
     body=item(controller.detail,'detailScroll')
-    assert graph.hasActiveFocus() and graph.property('keyboardFocus')
-    key(controller.detail,Qt.Key_Tab)
-    assert body.hasActiveFocus() and body.property('keyboardFocus')
+    assert body.hasActiveFocus()
     key(controller.detail,Qt.Key_End)
     assert body.property('contentY')==max(0,body.property('contentHeight')-body.height())
-    assert body.hasActiveFocus()
-    from cachemonitor.overlay_chrome import named_item
-    for link in controller.detail.view.state['detailLinks']:
-        key(controller.detail,Qt.Key_Tab)
-        assert named_item(controller.detail.quick.rootObject(),'evidence-'+link['id']).hasActiveFocus()
-    key(controller.detail,Qt.Key_Tab)
+    key(controller.detail,Qt.Key_Tab,Qt.ShiftModifier)
+    assert item(controller.detail,'closeDetail').hasActiveFocus()
+    key(controller.detail,Qt.Key_Tab,Qt.ShiftModifier)
     assert item(controller.detail,'openDashboard').hasActiveFocus()
+    key(controller.detail,Qt.Key_Escape)
+    assert not controller.expanded
+    assert item(controller.links,'nav-call-detail').hasActiveFocus()
+    key(controller.links,Qt.Key_Return)
+    assert controller.expanded and body.hasActiveFocus()
     key(controller.detail,Qt.Key_Tab)
     assert item(controller.actions,'opacityButton').hasActiveFocus()
     key(controller.actions,Qt.Key_Space)
-    assert controller.popup_open and item(controller.toolbar,'opacity').hasActiveFocus()
+    assert controller.popup_open
     key(controller.toolbar,Qt.Key_Escape)
     assert not controller.popup_open and controller.expanded
-    assert item(controller.actions,'opacityButton').hasActiveFocus()
-    key(controller.actions,Qt.Key_Tab,Qt.ShiftModifier)
-    assert body.hasActiveFocus()
-    key(controller.detail,Qt.Key_Tab,Qt.ShiftModifier)
-    assert graph.hasActiveFocus()
-    key(controller.detail,Qt.Key_Tab,Qt.ShiftModifier)
-    assert item(controller.actions,'expand').hasActiveFocus()
-    key(controller.actions,Qt.Key_Tab,Qt.ShiftModifier)
-    assert item(controller.header,'dragTitle').hasActiveFocus()
-    key(controller.header,Qt.Key_Tab)
-    assert item(controller.actions,'expand').hasActiveFocus()
-    key(controller.actions,Qt.Key_Escape)
-    assert not controller.expanded and item(controller.actions,'expand').hasActiveFocus()
     assert not any(control.qml_errors for control in controller.chrome)
 
 
@@ -293,7 +279,7 @@ def test_native_companion_keyboard_routes(layout_controller):
         assert c.collapsed and restore.hasActiveFocus() and restore.property('keyboardFocus')
         assert named_item(c.icon.quick.rootObject(),'moveFocusRing').isVisible()
         QTest.keyClick(c.icon.quick,Qt.Key_Return);QTest.qWait(20)
-        assert not c.collapsed and named_item(c.actions.quick.rootObject(),'expand').hasActiveFocus()
+        assert not c.collapsed and named_item(c.links.quick.rootObject(),'nav-call-detail').hasActiveFocus()
         assert not c.actions.quick.grabFramebuffer().isNull()
     finally:
         c.hide_all();host.close()

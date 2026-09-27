@@ -1,7 +1,7 @@
 """Filter-independent, call-scoped overlay data from priced analysis records."""
 from copy import deepcopy
 
-from .analytics import stats, population, observation_flags, output_speed
+from .analytics import stats, population, observation_flags, output_speed, output_speed_summary
 from .pricing import request_tier, sum_cost
 from .core import token_number, transport_label, token_parts
 from .cache_misses import classify
@@ -64,6 +64,26 @@ def token_composition(session):
         written_known=bool(rows) and all(token_number(r.get('written')) is not None for r in rows),
         unknown=unknown,non_cache_total=total-counts['cached'],bar_max=maximum,bars=bars,
         parts=[dict(key=k,label=TOKEN_LABELS[k],tokens=displayed[k],share=displayed[k]/total) for k in TOKEN_ORDER if displayed[k] and total])
+
+
+def cost_composition(rows):
+    """Disjoint amounts over exactly the headline's priced population."""
+    priced=[r for r in rows if r.get('cost') is not None]
+    groups=[]
+    for section,keys in (('input',(('cached','cost_cached'),('written','cost_written'),('uncached','cost_uncached'),('input_unknown','cost_unclassified'))),
+                         ('output',(('reasoning','cost_reasoning'),('output','cost_non_reasoning'),('output_unknown',None)))):
+        counts=dict.fromkeys((k for k,_ in keys),0.)
+        for row in priced:
+            if section=='output' and (row.get('output_conflict') or any(row.get(k) is None for k in ('cost_reasoning','cost_non_reasoning'))):
+                counts['output_unknown']+=row.get('cost_output') or 0
+            else:
+                for key,field in keys:counts[key]+=row.get(field) or 0
+        total=sum(counts.values()) if priced else None
+        groups.append((section,total,[dict(key=k,label=TOKEN_LABELS[k],tokens=v,known=bool(priced),share=v/total if total else 0)
+                                     for k,v in counts.items() if v or not k.endswith('unknown')]))
+    result=dict(priced=len(priced),calls=len(rows),partial=len(priced)<len(rows),known=bool(priced))
+    for section,total,parts in groups:result.update({section+'_total':total,section+'_parts':parts})
+    return result
 
 
 class OverlayCacheHealth(CacheHealth):
@@ -163,8 +183,8 @@ def summarize_session(session,health=None):
     first=max(0,len(rows)-24)
     all_calls=[call_summary(row,ordinal,miss=is_miss(row),
                         degradation=row.get('key') in degradation_keys)
-            for ordinal,row in enumerate(rows,1)]
-    recent=all_calls[first:]
+            for ordinal,row in enumerate(rows[-12:],max(1,len(rows)-11))]
+    recent=all_calls
     latest_call=recent[-1] if recent else {}
     lifecycle=session.get('request_state') or {}
     current=[r for r in rows if lifecycle.get('turn') and r.get('turn')==lifecycle['turn']]
@@ -212,10 +232,12 @@ def summarize_session(session,health=None):
             'unattached_total':token_number((session.get('unclassified') or {}).get('total')),
             'assumed': assumed, 'coverage_gap': gap, 'warnings': latest_call.get('warnings',[]),
             'latest_ts': latest.get('ts'), 'latest_key': latest.get('key'),
-            'latest':latest_call,'request':request,'recent':recent,'all_calls':all_calls,'cache_health':health,
-            'model_mismatch_count':sum(r['model_mismatch'] for r in all_calls),
-            'observation_missing_count':sum(observation_flags(r)['missing'] for r in all_calls),
-            'observation_conflict_count':sum(observation_flags(r)['conflict'] for r in all_calls),
+            'latest':latest_call,'request':request,'recent':recent,'cache_health':health,
+            'output_speed_summary':output_speed_summary(rows),'cost_composition':cost_composition(rows),
+            'members':[(session['home'],session['id'])],
+            'model_mismatch_count':len(mismatches),
+            'observation_missing_count':sum(observation_flags(r)['missing'] for r in rows),
+            'observation_conflict_count':sum(observation_flags(r)['conflict'] for r in rows),
             'cache_degradation':{'count':len(degradation),'events':deepcopy(degradation),
                 'current':bool(latest_call.get('cache_degradation'))},
             'statuses':statuses,'session_evidence':evidence,
@@ -271,6 +293,14 @@ class OverlaySummaries:
                     mean_cost=group['cost']/group['priced'] if group['priced'] else None,
                     coverage_gap=group['gap'],token_composition=token_composition({'history':rows}),
                     assumed=sum(updated[member][1]['assumed'] for member in group['members']))
+                recent=sorted((dict(r,source_title=updated[member][1]['title']) for member in group['members']
+                               for r in updated[member][1]['recent']),key=lambda r:(r['ts'],str(r.get('home')),str(r.get('sid')),str(r['id'])))[-12:]
+                value.update(recent=recent,latest=recent[-1] if recent else {},members=group['members'],
+                             output_speed_summary=output_speed_summary(rows),cost_composition=cost_composition(rows),
+                             active_requests=sum(updated[m][1]['request'].get('state')=='진행' for m in group['members']))
+                if recent:
+                    value.update({k:recent[-1].get(k) for k in ('model','model_setting','response_model','model_mismatch','model_state','effort','mode','response_mode','transport','transport_state','cache_rate')})
+                    value.update(latest_cost=recent[-1].get('cost'),latest_ts=recent[-1].get('ts'),latest_key=recent[-1].get('key'))
                 maintenance=[r for r in rows if r.get('purpose')=='maintenance']
                 value.update(maintenance_calls=len(maintenance),maintenance_cost=sum_cost(maintenance)['cost'] if maintenance else None,
                     maintenance_missing=sum(r.get('cost') is None for r in maintenance))

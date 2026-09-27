@@ -1,7 +1,7 @@
 """Interactive companions for the otherwise click-through overlay."""
-from PySide6.QtCore import Qt, QObject, Property, Signal, Slot, QSignalBlocker, QEvent, QRect, QTimer, QPoint
-from PySide6.QtGui import QFont, QFontMetrics, QRegion
-from PySide6.QtWidgets import QApplication, QWidget, QLabel, QVBoxLayout
+from PySide6.QtCore import Qt, QObject, Property, Signal, Slot, QSignalBlocker, QEvent, QRect, QTimer
+from PySide6.QtGui import QRegion
+from PySide6.QtWidgets import QApplication
 from .overlay_appearance import default_appearance
 from .presentation import Node, Slider, Text
 from .quick_runtime import QuickHost
@@ -18,22 +18,16 @@ def named_item(root,name):
 class ChromeModel(Node):
     opacityRequested = Signal(int)
     collapseRequested = Signal()
-    expandRequested = Signal()
     opacityToggleRequested = Signal()
     escapeRequested = Signal()
     interactionRequested = Signal()
     moveRequested = Signal(int, int)
     restoreRequested = Signal()
-    openSessionRequested = Signal()
-    @Slot()
-    def openSession(self):self.openSessionRequested.emit()
 
     @Slot(int)
     def transparency(self, value): self.opacityRequested.emit(100 - value)
     @Slot()
     def collapsePanel(self): self.collapseRequested.emit()
-    @Slot()
-    def expandPanel(self): self.expandRequested.emit()
     @Slot()
     def toggleOpacity(self): self.opacityToggleRequested.emit()
     @Slot()
@@ -86,29 +80,11 @@ class OverlayHost(QuickHost):
 
     def hideEvent(self,event):
         self._cancel_keyboard_focus()
-        note=getattr(getattr(self,'view',None),'content',None)
-        note=getattr(note,'calculation_note',None)
-        if note and note.owner is self:note.hide()
         super().hideEvent(event)
-
-    def show_calculation(self,key,formula,x,y):
-        content=self.view.content
-        note=getattr(content,'calculation_note',None)
-        if note is None:
-            note=content.calculation_note=CalculationNote(content)
-        note.present(self,key,formula,self.quick.mapToGlobal(QPoint(round(x),round(y))))
-
-    def moveEvent(self,event):
-        content=getattr(getattr(self,'view',None),'content',None)
-        note=getattr(content,'calculation_note',None)
-        if note and note.owner is self:note.hide()
-        super().moveEvent(event)
 
 
 class OverlayChrome(OverlayHost):
-    open_session = Signal()
     collapse = Signal()
-    expand = Signal()
     restore = Signal()
     opacity_toggle = Signal()
     escape = Signal()
@@ -149,13 +125,11 @@ class OverlayChrome(OverlayHost):
         self.quick.setMouseTracking(True)
         self.view.opacityRequested.connect(self.opacity_changed)
         self.view.collapseRequested.connect(self.collapse)
-        self.view.expandRequested.connect(self.expand)
         self.view.opacityToggleRequested.connect(self.opacity_toggle)
         self.view.escapeRequested.connect(self.escape)
         self.view.interactionRequested.connect(self.begin_interaction)
         self.view.moveRequested.connect(self.move_requested)
         self.view.restoreRequested.connect(self.restore)
-        self.view.openSessionRequested.connect(self.open_session)
         if kind in ('header', 'icon'): self.quick.setAttribute(Qt.WA_TransparentForMouseEvents)
         if kind == 'toolbar':
             # Existing settings adapter; the sole visible input is the QML slider.
@@ -183,17 +157,12 @@ class OverlayChrome(OverlayHost):
         key=(title,model_summary,self.appearance.family,self.appearance.scale)
         if key==getattr(self,'_title_key',None):return
         self._title_key=key
-        font = QFont(self.appearance.family)
-        font.setPixelSize(round(14 * self.appearance.scale))
-        font.setWeight(QFont.DemiBold)
-        elided = QFontMetrics(font).horizontalAdvance(title) > 260 * self.appearance.scale
-        self.setToolTip('\n'.join(value for value in (title if elided else '',model_summary) if value))
         self.setAccessibleName('\n'.join(value for value in (title,model_summary) if value))
         self.view.put(title=title)
 
     def focus_control(self, name=None):
         """Called only after the controller opens or activates this companion."""
-        name = name or {'toolbar': 'opacity', 'icon': 'restore', 'header': 'dragTitle'}.get(self.kind, 'expand')
+        name = name or {'toolbar': 'opacity', 'icon': 'restore', 'header': 'dragTitle'}.get(self.kind, 'opacityButton')
         self.focus_item(name)
 
     def keyboard_focus(self, name=None):
@@ -212,16 +181,15 @@ class OverlayChrome(OverlayHost):
     def eventFilter(self, watched, event):
         if watched is self.quick and event.type()==QEvent.KeyPress and event.key() in (Qt.Key_Tab,Qt.Key_Backtab):
             reverse=event.key()==Qt.Key_Backtab or bool(event.modifiers() & Qt.ShiftModifier)
-            if self.kind=='header':target='monitorLinksLast' if reverse else 'expand'
+            if self.kind=='header':target='monitorLinksLast' if reverse else 'opacityButton'
             elif self.kind in ('toolbar','icon'):target=None
             else:
                 active=self.quick.quickWindow().activeFocusItem()
-                name=active.objectName() if active else 'expand'
+                name=active.objectName() if active else 'opacityButton'
                 expanded=self.view.state.get('expanded',False)
-                targets={'expand':('dragTitle','detailGraph' if expanded else 'opacityButton'),
-                         'opacityButton':('detailScroll' if expanded else 'expand','collapse'),
+                targets={'opacityButton':('detailScroll' if expanded else 'dragTitle','collapse'),
                          'collapse':('opacityButton','monitorLinks')}
-                target=targets.get(name,targets['expand'])[0 if reverse else 1]
+                target=targets.get(name,targets['opacityButton'])[0 if reverse else 1]
             if target:self.focus_requested.emit(target)
             event.accept();return True
         return super().eventFilter(watched,event)
@@ -303,76 +271,49 @@ class OverlayChrome(OverlayHost):
             self.setCursor(Qt.OpenHandCursor)
             self.drag_finished.emit(self.event_position(event))
             if clicked and self.kind == 'icon': self.restore.emit()
-            elif clicked and self.kind == 'header': self.open_session.emit()
+            # Header clicks only finish a drag gesture.
             self.pressed_scope=None
             event.accept()
 
 
-class CalculationNote(QWidget):
-    """One click-opened line shared by the monitor and its detail companion."""
-    def __init__(self,content):
-        super().__init__(None,Qt.Popup|Qt.FramelessWindowHint)
-        self.setAttribute(Qt.WA_NoMouseReplay)
-        self.setWindowTitle('계산 방법');self.content=content;self.owner=None;self.key=None
-        self.setObjectName('calculationNote')
-        layout=QVBoxLayout(self);layout.setContentsMargins(10,7,10,7)
-        self.label=QLabel(self);self.label.setObjectName('calculationText')
-        self.label.setTextFormat(Qt.PlainText);self.label.setWordWrap(False)
-        layout.addWidget(self.label);content.changed.connect(self.refresh_scope)
-
-    def present(self,owner,key,formula,anchor):
-        if self.isVisible() and self.owner is owner and self.key==key:self.hide();return
-        from .overlay_view import palette, font
-        from .i18n import tr
-        self.owner=owner;self.key=key;self.scope=self.identity();appearance=self.content.appearance
-        colors=palette(appearance);size=round(12*appearance.scale)
-        text=tr(formula);self.label.setText(text)
-        self.setStyleSheet('QWidget#calculationNote { background: '+colors['surface'].name()+'; border: 1px solid '+colors['border'].name()+'; } '
-                          'QLabel { color: '+colors['ink'].name()+'; background: transparent; border: none; }')
-        self.setAccessibleName(text)
-        screen=QApplication.screenAt(anchor) or owner.screen();area=screen.availableGeometry()
-        metrics=QFontMetrics(font(appearance.family,size))
-        # Keep one readable line, including at the edge of a small display.
-        while metrics.horizontalAdvance(text)+24>area.width() and size>10:
-            size-=1;metrics=QFontMetrics(font(appearance.family,size))
-        self.label.setFont(font(appearance.family,size))
-        self.resize(min(area.width(),metrics.horizontalAdvance(text)+24),metrics.height()+18)
-        x=max(area.left(),min(anchor.x(),area.right()-self.width()+1))
-        y=anchor.y()+4
-        if y+self.height()>area.bottom()+1:y=anchor.y()-self.height()-22
-        self.move(x,max(area.top(),y));self.show()
-
-    def identity(self):
-        d=self.content.data or {}
-        return d.get('home'),d.get('id'),self.content.compact,self.content.detail_inline,self.content.appearance
-
-    def refresh_scope(self):
-        if self.isVisible() and self.scope!=self.identity():self.hide()
-
-    def keyPressEvent(self,event):
-        if event.key()==Qt.Key_Escape:self.hide();event.accept()
-        else:super().keyPressEvent(event)
-
 class NavigationModel(Node):
     navigationRequested=Signal(object)
-    calculationRequested=Signal(str,str,float,float)
+    detailRequested=Signal(object)
+    callSelected=Signal(object)
     def __init__(self,content):
-        super().__init__();self.content=content;self.targets={};self.formulas={};self.captured=None
+        super().__init__();self.content=content;self.targets={};self.captured=None
     def link_state(self,links):
+        self.interactions={link['id']:link.get('interaction','navigate') for link in links}
         self.targets={link['id']:link['target'] for link in links if link.get('target')}
-        self.formulas={link['id']:link['formula'] for link in links if link.get('formula')}
+        self.actions={link['id']:link['action'] for link in links if link.get('action')}
         return [{k:v for k,v in link.items() if k!='target'} for link in links]
-    @Slot(str,float,float)
-    def showCalculation(self,key,x,y):
-        formula=self.formulas.get(key)
-        if formula:self.calculationRequested.emit(key,formula,x,y)
     @Slot(str)
-    def captureNavigation(self,key):self.captured=self.targets.get(key)
+    def captureNavigation(self,key):
+        self.captured=self.targets.get(key) or getattr(self,'actions',{}).get(key)
+        self.captured_interaction=getattr(self,'interactions',{}).get(key,'navigate')
+        rows=[*self.content.rows(),self.content.selected()] if hasattr(self.content,'rows') else []
+        self.captured_row=next((dict(r) for r in rows if r and self.captured and not isinstance(self.captured,str) and (r.get('home'),r.get('sid'),str(r.get('id')))==(self.captured.home,self.captured.sid,self.captured.call_id)),None)
+        self.captured_scope=((self.content.data or {}).get('home'),(self.content.data or {}).get('id'))
     @Slot()
     def activateNavigation(self):
         target,self.captured=self.captured,None;data=self.content.data or {}
-        if target and (target.home,target.sid)==(data.get('home'),data.get('id')):
-            self.navigationRequested.emit(target)
+        if getattr(self,'captured_scope',None)!=(data.get('home'),data.get('id')):return
+        if isinstance(target,str):self.content.monitor_action(target);return
+        if target and (target.home,target.sid) in [tuple(v) for v in data.get('members',[(data.get('home'),data.get('id'))])]:
+            signal={'detail':self.detailRequested,'select':self.callSelected}.get(self.captured_interaction,self.navigationRequested)
+            signal.emit((target,self.captured_row) if self.captured_interaction in ('detail','select') else target)
+    @Slot(str)
+    def inspectCall(self,key):
+        row=None
+        if key.startswith('call-') and key[5:].isdigit():
+            index=int(key[5:]);rows=self.content.rows()
+            if index<len(rows):row=rows[index]
+        identity=self.content.call_id(row) if row else None
+        if getattr(self.content,'inspected_call',None)!=identity:
+            self.content.inspected_call=identity;self.content.update()
+
+    @Slot(int)
+    def scrollLower(self,delta):self.content.scroll_lower(delta)
     @Slot(str)
     def keyboardActivate(self,key):self.captureNavigation(key);self.activateNavigation()
 
@@ -418,7 +359,6 @@ class OverlayDetail(OverlayHost):
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.setFocusPolicy(Qt.StrongFocus)
         self.view = DetailModel(content)
-        self.view.calculationRequested.connect(self.show_calculation)
         self.view.escapeRequested.connect(self.escape)
         self.view.interactionRequested.connect(self.begin_interaction)
         self.set_scene(self.view, 'OverlayDetail.qml', transparent=True)
@@ -427,7 +367,7 @@ class OverlayDetail(OverlayHost):
 
     def apply_appearance(self, appearance, opacity): self.view.sync()
 
-    def focus_control(self, name='detailGraph'):
+    def focus_control(self, name='detailScroll'):
         self.focus_item(name)
 
     def begin_interaction(self):
@@ -442,11 +382,11 @@ class OverlayDetail(OverlayHost):
         if watched is self.quick and event.type()==QEvent.KeyPress and event.key() in (Qt.Key_Tab,Qt.Key_Backtab):
             reverse=event.key()==Qt.Key_Backtab or bool(event.modifiers() & Qt.ShiftModifier)
             active=self.quick.quickWindow().activeFocusItem()
-            name=active.objectName() if active else 'detailGraph'
-            names=['detailGraph','detailScroll']+['evidence-'+item['id'] for item in self.view.state.get('detailLinks',[])]+(['openDashboard'] if self.view.state.get('detailHasSelection') else [])
+            name=active.objectName() if active else 'detailScroll'
+            names=(['openDashboard'] if self.view.state.get('detailHasSelection') else [])+['closeDetail','detailScroll']
             index=names.index(name) if name in names else 0;index+=-1 if reverse else 1
             if 0<=index<len(names):self.focus_control(names[index])
-            else:self.focus_requested.emit('expand' if reverse else 'opacityButton')
+            else:self.focus_requested.emit('call-detail' if reverse else 'opacityButton')
             event.accept();return True
         return super().eventFilter(watched,event)
 
@@ -471,13 +411,15 @@ class OverlayLinks(OverlayHost):
         self.setWindowTitle('Cache Monitor · 기록 링크');self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.view=NavigationModel(content);self.wheel_forwarder=None
-        self.view.calculationRequested.connect(self.show_calculation)
+        content.changed.connect(self.sync)
         self.set_scene(self.view,'OverlayLinks.qml',transparent=True)
         self.quick.installEventFilter(self)
+        self.quick.setMouseTracking(True)
+        self._hover_position=None
     def focus_control(self,name='monitorLinks'):
         links=self.view.state.get('links',[])
         if not links:return
-        key=links[-1 if name=='monitorLinksLast' else 0]['id']
+        key=name if any(r['id']==name for r in links) else links[-1 if name=='monitorLinksLast' else 0]['id']
         self.focus_item('nav-'+key)
     def sync(self):
         from .overlay_view import palette
@@ -490,10 +432,41 @@ class OverlayLinks(OverlayHost):
         if links:
             if region!=self.mask():self.setMask(region)
         else:self.hide()
+        if self._hover_position is not None:self.inspect_position(self._hover_position)
         return bool(links)
+    def inspect_position(self,position):
+        scale=self.view.content.appearance.scale
+        x,y=position.x()/scale,position.y()/scale
+        key=next((r['id'] for r in self.view.state.get('links',[])
+                  if r['id'].startswith('call-') and r['x']<=x<r['x']+r['width']
+                  and r['y']<=y<r['y']+r['height']), '')
+        self.view.inspectCall(key)
+
+    def hideEvent(self,event):
+        self._hover_position=None;self.view.inspectCall('')
+        super().hideEvent(event)
+
     def eventFilter(self,watched,event):
+        if watched is self.quick:
+            if event.type()==QEvent.MouseMove:
+                self._hover_position=event.position();self.inspect_position(self._hover_position)
+            elif event.type()==QEvent.Leave:
+                self._hover_position=None;self.view.inspectCall('')
+
         if event.type()==QEvent.Wheel and self.wheel_forwarder:
+            c=self.view.content
+            if c.compact and event.position().y()/c.appearance.scale>=c.layout()['context']:
+                c.scroll_lower(-event.angleDelta().y()/4);event.accept();return True
             self.wheel_forwarder(event);event.accept();return True
+        if watched is self.quick and event.type()==QEvent.KeyPress and event.key() in (Qt.Key_Left,Qt.Key_Right,Qt.Key_Home,Qt.Key_End):
+            active=self.quick.quickWindow().activeFocusItem()
+            if active and active.objectName().startswith('nav-call-') and active.objectName()!='nav-call-detail':
+                rows=[r for r in self.view.state.get('links',[]) if r.get('interaction')=='select']
+                index=next((i for i,r in enumerate(rows) if 'nav-'+r['id']==active.objectName()),0)
+                index=0 if event.key()==Qt.Key_Home else len(rows)-1 if event.key()==Qt.Key_End else max(0,min(len(rows)-1,index+(-1 if event.key()==Qt.Key_Left else 1)))
+                self.focus_item('nav-'+rows[index]['id']);self.view.keyboardActivate(rows[index]['id']);return True
+        if event.type()==QEvent.KeyPress and self.view.content.compact and event.key() in (Qt.Key_Up,Qt.Key_Down):
+            self.view.content.scroll_lower(-24 if event.key()==Qt.Key_Up else 24);return True
         if event.type()==QEvent.KeyPress and event.key()==Qt.Key_Escape:
             self.escape.emit();return True
         if event.type()==QEvent.KeyPress and event.key() in (Qt.Key_Tab,Qt.Key_Backtab):

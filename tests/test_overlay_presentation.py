@@ -33,8 +33,8 @@ def test_english_overlay_keeps_session_title_pixels(tmp_path):
             image=QImage(m.panel_width(),m.panel_height(),QImage.Format_ARGB32_Premultiplied);image.fill(0)
             painter=QPainter(image);m.paint(painter);painter.end();images.append(image)
             assert image.save(str(tmp_path/f'raw-title-{language}.png'))
-        assert images[0].copy(16,12,260,28)==images[1].copy(16,12,260,28)
-        assert images[0].copy(16,94,200,36)!=images[1].copy(16,94,200,36)
+        assert images[0].copy(16,16,260,24)==images[1].copy(16,16,260,24)
+        assert images[0].copy(16,66,200,20)!=images[1].copy(16,66,200,20)
         assert w.accessibleName().splitlines()[0]==data['title']
     finally:
         w.close();set_language('ko');app.processEvents()
@@ -47,21 +47,21 @@ def test_call_selection_is_by_identifier_and_never_changes_monitor():
         m.detailGraph.key(Qt.Key_Home);old=m.selected_id;before=w.lines()
         assert old!=latest and not m.follow_latest
         updated=summary(count=25);w.set_content(updated)
-        assert m.selected_id==old and m.selected()['key']==old and w.lines()[3:7]==[percent(updated['cache_rate']),money(updated['cost']),money(updated['mean_cost']),money(updated['latest_cost'])]
+        assert m.selected_id==old and m.call_id(m.selected())==old and w.lines()[3:7]==[percent(updated['cache_rate']),money(updated['cost']),money(updated['mean_cost']),money(updated['latest_cost'])]
         m.detailGraph.key(Qt.Key_End);assert m.follow_latest
-        w.set_content(summary(count=26));assert m.selected_id==m.rows()[-1]['id']
+        w.set_content(summary(count=26));assert m.selected_id==m.call_id(m.rows()[-1])
         m.detailGraph.key(Qt.Key_Left);fixed=m.selected_id
         body=copy.deepcopy(m._detail_items)
         m.detailGraph.hover_at(208-4,50)
-        assert m.selected_id==fixed and m.selected()['id']==fixed and m._detail_items==body
-        m.detailGraph.clear_hover();assert m.selected()['id']==fixed
+        assert m.selected_id==fixed and m.call_id(m.selected())==fixed and m._detail_items==body
+        m.detailGraph.clear_hover();assert m.call_id(m.selected())==fixed
         w.set_content(None,'기록 확인 중');assert m.selected_id is None and m.rows()==[] and m.selected()=={}
         assert all(value=='—' for value in w.lines()[3:7])
     finally:w.close();app.processEvents()
 
 
 def test_pricing_ratio_requires_an_unpriced_work_call():
-    app=QApplication.instance() or QApplication([]);w=SessionOverlay();data=summary()
+    app=QApplication.instance() or QApplication([]);w=SessionOverlay();w.set_layout(detail=True);data=summary()
     try:
         # A cumulative coverage gap is independent of pricing the observed calls.
         data.update(partial=True,coverage_gap=True,missing=0)
@@ -81,14 +81,14 @@ def test_detail_expansion_preserves_monitor_pixels_and_font_scale():
             image=QImage(m.panel_width(),m.panel_height(),QImage.Format_ARGB32_Premultiplied);image.fill(0)
             p=QPainter(image);m.paint(p);p.end();return image
         normal=render();m.set_layout(detail=True);detail=render()
-        assert m.panel_width()==620 and m.panel_height()==546 and m.monitor_x==240
-        normal_crop=normal.copy(16,48,348,496);detail_crop=detail.copy(256,48,348,496)
+        assert m.panel_width()==620 and m.panel_height()==522 and m.monitor_x==240
+        normal_crop=normal.copy(16,48,348,470);detail_crop=detail.copy(256,48,348,470)
         a=bytes(normal_crop.constBits());b=bytes(detail_crop.constBits())
         # Qt's translated antialias coverage may differ by one channel level.
         assert max(abs(x-y) for x,y in zip(a,b))<=1
         for size in (10,14,21):
             w.set_content(summary(),appearance=replace(default_appearance(True),font_size=size));s=max(1,size/14)
-            assert m.panel_width()==round(620*s) and m.panel_height()==round(546*s)
+            assert m.panel_width()==round(620*s) and m.panel_height()==round(522*s)
     finally:w.close();app.processEvents()
 
 
