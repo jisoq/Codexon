@@ -22,7 +22,10 @@ def test_zero_usage_bar_uses_its_padded_axis_position(tmp_path):
         origin=plot.mapToScene(QPointF(0,0));x+=origin.x();y+=origin.y();bottom+=origin.y()
         accent=QColor(shared_theme().palette['accent'])
         def marked(at):
-            return any(picture.pixelColor(px,py)==accent
+            # At 1x, the tiny antialiased circle may have no fully covered
+            # pixel. Allow only two 8-bit levels of compositor rounding;
+            # still require the accent at zero's axis position, not the floor.
+            return any(max(abs(a-b) for a,b in zip(picture.pixelColor(px,py).getRgb(),accent.getRgb()))<=2
                 for px in range(round((x-4)*ratio),round((x+4)*ratio))
                 for py in range(round((at-4)*ratio),round((at+4)*ratio)))
         assert picture.save(str(tmp_path/'zero-usage.png'))
