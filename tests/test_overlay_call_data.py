@@ -21,8 +21,8 @@ def test_recent_calls_are_chronological_and_share_latest_call_context():
                     service_tier='priority', effort='ultra', cached=0, cost=None,
                     transport='WebSocket', transport_source='response_id')
     result=summarize_session(session(list(reversed(rows))))
-    assert [r['id'] for r in result['recent']]==[f'call-{i}' for i in range(6,30)]
-    assert [r['ordinal'] for r in result['recent']]==list(range(7,31))
+    assert [r['id'] for r in result['recent']]==[f'call-{i}' for i in range(18,30)]
+    assert [r['ordinal'] for r in result['recent']]==list(range(19,31))
     latest=result['latest']
     assert latest is result['recent'][-1]
     for key in ('model','response_model','effort','mode','transport','cache_rate'):

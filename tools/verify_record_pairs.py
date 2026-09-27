@@ -33,23 +33,22 @@ with tempfile.TemporaryDirectory() as tmp:
     try:
         for width,height in ((1440,940),(1120,760)):
             w.resize(width,height);settle()
-            assert w.parent_kind=='sessions' and w.record_view=='requests'
-            left=table_view(w,w.parent_table);right=table_view(w,w.table)
-            assert left.width()>220 and right.width()>300,(left.width(),right.width())
-            capture(f'{width}-requests')
-            click_row(w,w.parent_table,1);settle()
+            w.go_home();settle()
+            assert w.record_view=='projects' and w.selected_session is None
+            capture(f'{width}-projects')
+            click_row(w,w.table,0);settle()
+            assert w.record_view=='sessions'
+            click_row(w,w.table,0);settle()
+            assert w.record_view=='requests'
             session=w.selected_session
-            click_row(w,w.table,1);settle()
-            assert w.parent_kind=='requests' and w.record_view=='calls'
-            assert w.parent_rows[w.parent_table.currentRow()]['turn']==w.selected_turn
-            capture(f'{width}-calls')
-            table_view(w,w.parent_table).forceActiveFocus()
+            capture(f'{width}-requests')
+            table_view(w,w.table).forceActiveFocus()
             QTest.keyClick(w.quick,Qt.Key_Home);QTest.keyClick(w.quick,Qt.Key_Return);settle()
-            assert w.selected_turn==w.parent_rows[0]['turn']
+            assert w.record_view=='calls'
+            capture(f'{width}-calls')
             w.go_back();settle()
             assert w.record_view=='requests' and w.selected_session==session
-            assert w.parent_rows[w.parent_table.currentRow()]['sid']==session[1]
-        (out/'result.json').write_text(json.dumps({'adjacent_depths':True,'mouse_and_keyboard':True,'back_preserves_session':True,'sizes':[1440,1120],'qml_errors':w.qml_errors}),encoding='utf-8')
-        print('Record pair verification passed')
+        (out/'result.json').write_text(json.dumps({'project_first_hierarchy':True,'mouse_and_keyboard':True,'back_preserves_session':True,'sizes':[1440,1120],'qml_errors':w.qml_errors}),encoding='utf-8')
+        print('History navigation verification passed')
     finally:
         w.quitting=True;w.tick.stop();w.tray.hide();w.observer_panel.stop();w.close()

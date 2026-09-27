@@ -54,7 +54,7 @@ def test_filtered_dashboard_and_overlay_share_call_values_without_previous_fallb
     assert result['overview']['summary']['output_speed']['value']==125
     data=OverlaySummaries().collect(engine)[0]
     assert data['latest']['output_speed']==100
-    assert [r['output_speed'] for r in data['all_calls']]==[None,200,100]
+    assert [r['output_speed'] for r in data['recent']]==[None,200,100]
     end=source['sessions'][0]['history'][-1]['ts']
     assert engine.query(dict(page=0,start=end,end=source['ts']+1))['overview']['summary']['output_speed']['value']==100
     source['sessions'][0]['history'][-1]['timing_valid']=False
@@ -87,30 +87,31 @@ def test_rendered_summary_click_and_overlay_speed_navigation(tmp_path):
         assert '2 / 대상 3' in window.metric_notes[4].text()
         assert window.quick.grabFramebuffer().save(str(tmp_path/'dashboard.png'))
         click(window,control(window,window.metrics[4]));QTest.qWait(50)
-        assert [r['output_speed'] for r in window.aggregate_records]==[200,100]
+        assert [r['output_speed'] for r in __import__('cachemonitor.dashboard_views',fromlist=['resolve_population']).resolve_population(window.engine,window.aggregate_records)]==[200,100]
         assert '125.0 tok/s' in window.overview_detail['text'].text()
         engine=AnalysisEngine();engine.ingest(source['sessions']);data=OverlaySummaries().collect(engine)[0]
         overlay.set_content(data);overlay.show();QTest.qWait(60)
         m=overlay.content_model
         assert m.headline_metrics()[1]['number']=='100.0'
-        m.select(data['all_calls'][1]['id'])
+        m.select(data['recent'][1]['id'])
         assert m.selected()['output_speed']==200 and m.headline_metrics()[1]['number']=='100.0'
         m.select(data['latest']['id'])
         assert overlay.quick.grabFramebuffer().save(str(tmp_path/'overlay.png'))
+        m.monitor_action('tab-latest')
         links.setGeometry(overlay.geometry());links.sync();links.show();QTest.qWait(30)
-        targets=[];links.view.navigationRequested.connect(targets.append)
-        item=named_item(links.quick.rootObject(),'nav-speed')
+        targets=[];links.view.detailRequested.connect(lambda value:targets.append(value[0]))
+        item=named_item(links.quick.rootObject(),'nav-call-detail')
         click(links,item)
-        assert targets[-1].call_id==data['latest']['id'] and targets[-1].section=='time'
+        assert targets[-1].call_id==data['latest']['id'] and targets[-1].section=='identity'
         window.navigate(targets[-1])
         for _ in range(40):
             QTest.qWait(25)
             if window.detail_scroll.verticalPosition.value()>0:break
-        assert window.detail_scroll.verticalPosition.value()>0
+        assert window.selected_call==data['latest']['id']
         assert '100.0 tok/s' in window.detail_sections['usage'][1].text()
         assert '30.00' in window.detail_sections['time'][1].text()
         assert window.quick.grabFramebuffer().save(str(tmp_path/'call-detail.png'))
-        choose(window.record_view_choice,'calls');window.record_view_changed()
+        window.record_view='calls';window.render_explorer()
         window.extra_column_controls['output_speed'].setChecked(True);window.render_explorer()
         index=[key for key,title in window.active_columns].index('output_speed')
         assert window.response_cell(data['latest'],index,Qt.DisplayRole)=='100.0 tok/s'

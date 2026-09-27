@@ -6,14 +6,14 @@ RowLayout {
     id: root
     required property var node
     UiInput {
-        id: field; text: root.node.state.text; implicitWidth: 118
+        id: field; text: root.node.textValue; implicitWidth: 118
         inputMask: "9999-99-99"; Accessible.name: appLanguage.text("날짜")
         onEditingFinished: root.node.edit(text)
     }
     UiButton { iconName: "calendar"; flat:true; implicitWidth: 36; Accessible.name: appLanguage.text("달력 열기"); onClicked: calendar.open() }
     Popup {
         id: calendar; y: root.height; modal: false; padding: 12
-        property date selected: new Date(root.node.state.text + "T12:00:00")
+        property date selected: new Date(root.node.textValue + "T12:00:00")
         contentItem: ColumnLayout {
             RowLayout {
                 UiButton { iconName: "left";flat:true; implicitWidth: 36;Accessible.name:appLanguage.text("이전 달"); onClicked: calendar.selected = new Date(grid.year, grid.month - 1, 1) }

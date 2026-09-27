@@ -18,6 +18,7 @@ class ChangeHighlight(QObject):
         if not self.view.live_update:self.clear();return {}
         return self.visible()
     def after(self,previous):
+        if not previous:return
         now=time.monotonic()
         for key,value in self.visible().items():
             if key in previous and previous[key]!=value:self.active[key]=now

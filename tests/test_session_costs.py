@@ -107,8 +107,9 @@ def test_overlay_parent_refreshes_for_child_cost_without_recounting_responses():
     assert first[('home', 's')]['token_composition']['total']==240
     assert first[('home', 's')]['token_composition']['cached']==80
     assert first[('home', 's')]['token_composition']['cache_hit_rate']==pytest.approx(40)
-    assert first[('home', 's')]['cache_rate']==80  # Most recent own call stays distinct.
-    assert len(first[('home', 's')]['all_calls'])==1  # Recent call remains this task's own call.
+    assert first[('home', 's')]['cache_rate']==first[('home', 's')]['latest']['cache_rate']
+    assert len(first[('home', 's')]['recent'])==2
+    assert 'all_calls' not in first[('home', 's')]
     query = engine.query(dict(page=0, start=0, end=200))
     assert query['analysis']['totals']['cost'] == pytest.approx(own_parent + own_child)
     assert len(query['analysis']['responses']) == 2
@@ -144,16 +145,17 @@ def test_real_session_table_shows_parent_without_own_calls_and_click_keeps_break
         settings=QSettings(str(tmp_path/'dashboard.ini'), QSettings.IniFormat), static_snapshot=snapshot)
     try:
         window.show();window.change_page(2);app.processEvents()
-        records = window.session_records(window.analysis['responses'])
+        window.activate_record(0)
+        records = list(window.record_rows)
         group = next(r for r in records if r['sid']=='parent')
-        own_child = next(r for r in records if r['sid']=='child')
+        own_child = window.engine.query(window.query())['session_costs'][('fixture','child')]
         assert group['own_cost']==0 and group['cost']==own_child['cost']
         assert group['descendants']==1 and group['calls']==1
-        assert {r['sid'] for r in records}=={'parent','child'}
+        assert {r['sid'] for r in records}=={'parent'}
         assert 'codex-auto-review' not in [window.model.itemData(i) for i in range(window.model.count())]
         assert '산정 / 전체 호출' not in window.parent_table.model().headers
-        index = next(i for i,r in enumerate(window.parent_rows) if r['sid']=='parent')
-        click_row(window, window.parent_table, index);app.processEvents()
+        index = next(i for i,r in enumerate(window.record_rows) if r['sid']=='parent')
+        click_row(window, window.table, index);app.processEvents()
         assert window.selected_session==('fixture','parent')
         assert '자체 ' in window.session_scope.text() and ' + 하위 ' in window.session_scope.text()
         assert '산정' not in window.session_scope.text()

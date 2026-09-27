@@ -43,6 +43,19 @@ class Header:
     def setDefaultAlignment(self,value):self.owner.put(headerAlignment=int(value))
 
 
+class WindowRows:
+    """Logical row count with bounded loaded records; iteration visits loaded rows."""
+    def __init__(self,window):
+        self.start=window['start'];self.total=window['total'];self.values=window['rows']
+    def __len__(self):return self.total
+    def __iter__(self):return iter(self.values)
+    def __getitem__(self,index):
+        if isinstance(index,slice):return [self[i] for i in range(*index.indices(self.total))]
+        if not 0<=index<self.total:raise IndexError(index)
+        return self.values[index-self.start] if self.start<=index<self.start+len(self.values) else {'_placeholder':True}
+    def covers(self,first,last):return first>=self.start and last<self.start+len(self.values)
+
+
 class Rows(QAbstractTableModel):
     def __init__(self,owner,headers):
         super().__init__(owner);self.owner=owner;self.headers=list(headers);self.rows=[]
@@ -55,6 +68,13 @@ class Rows(QAbstractTableModel):
     def data(self,index,role=Qt.DisplayRole):
         if not index.isValid() or not 0<=index.row()<len(self.rows) or not 0<=index.column()<len(self.owner._order):return None
         row=index.row();col=self.owner._order[index.column()]
+        if isinstance(self.rows,WindowRows) and self.rows[row].get('_placeholder'):
+            if role in (Qt.DisplayRole,Qt.ToolTipRole,Qt.BackgroundRole):return ''
+            if role in (Qt.UserRole+2,Qt.UserRole+4):return False
+            if role==Qt.UserRole+3:return -1.
+            if role==Qt.UserRole+1:return 0.
+            if role==Qt.TextAlignmentRole:return int(Qt.AlignLeft|Qt.AlignVCenter)
+            return None
         if role==Qt.UserRole+4:return isinstance(self.data(index,Qt.DisplayRole),Verbatim)
         if role==Qt.UserRole+1:return self.owner.changes.strength(row,col)
         if role==Qt.UserRole+2:
@@ -88,7 +108,10 @@ class Rows(QAbstractTableModel):
         if new_count<old_count:self.beginRemoveRows(QModelIndex(),new_count,old_count-1)
         elif new_count>old_count:self.beginInsertRows(QModelIndex(),old_count,new_count-1)
         same_formatter=formatter==self.formatter
-        changed={i for i in range(min(old_count,new_count)) if rows[i]!=self.rows[i]} if same_formatter else set(range(new_count))
+        if isinstance(rows,WindowRows):
+            candidates=range(rows.start,rows.start+len(rows.values))
+            changed={i for i in candidates if not same_formatter or i>=old_count or rows[i]!=self.rows[i]}
+        else:changed={i for i in range(min(old_count,new_count)) if rows[i]!=self.rows[i]} if same_formatter else set(range(new_count))
         self.rows=rows;self.formatter=formatter
         if same_formatter:
             self.cache=OrderedDict((k,v) for k,v in self.cache.items() if k[0] not in changed and k[0]<new_count)
@@ -107,6 +130,7 @@ class Table(Node):
     cellClicked=Signal(int,int)
     cellActivated=Signal(int,int)
     scrollRequested=Signal(int,int)
+    rangeRequested=Signal()
     def __init__(self,rows=0,columns=0,parent=None,headers=None):
         super().__init__(parent);headers=headers or ['']*columns
         self._order=list(range(len(headers)));self._model=Rows(self,headers)
@@ -141,7 +165,9 @@ class Table(Node):
     def frameWidth(self):return 0
     def setColumnCount(self,count):self.setHorizontalHeaderLabels(['']*count)
     def setColumnWidth(self,col,width):
-        widths=list(self._state['widths']);old=widths[col];widths[col]=width
+        widths=list(self._state['widths']);old=widths[col]
+        if old==width:return
+        widths[col]=width
         self.put(widths=widths);self.columnResized.emit(col,old,width)
     @Slot(int,float)
     def resizeColumn(self,visual,width):self.setColumnWidth(self._order[visual],max(45,round(width)))
@@ -201,6 +227,7 @@ class Table(Node):
     def selectRow(self,row):
         if row!=self._selected:self._selected=row;self.put(selected=row);self.itemSelectionChanged.emit()
     def select_row(self,row):
+        if row==self._selected:return
         blocked=self.blockSignals(True);self.selectRow(row);self.blockSignals(blocked);self.changed.emit()
     @Slot(int,int)
     def click(self,row,col):self.selectRow(row);self.cellClicked.emit(row,self._order[col])
@@ -210,7 +237,10 @@ class Table(Node):
         if 0<=row<self.rowCount() and 0<=column<self.columnCount():
             self.selectRow(row);self.cellActivated.emit(row,self._order[column])
     @Slot(int,int)
-    def visibleRows(self,first,last):self.first_visible=first;self.last_visible=last
+    def visibleRows(self,first,last):
+        self.first_visible=first;self.last_visible=last
+        rows=self._model.rows
+        if isinstance(rows,WindowRows) and first>=0 and last>=first and not rows.covers(max(0,first-32),min(len(rows)-1,last+32)):self.rangeRequested.emit()
     def scrollTo(self,index,*args):self.scrollRequested.emit(index.row(),index.column())
     @staticmethod
     def row_key(row):
@@ -231,6 +261,23 @@ class Table(Node):
             if new is not None:self._vertical.setValue(new*height+offset)
         if selected is not None:self.select_row(next((i for i,row in enumerate(rows) if self.row_key(row)==selected),-1))
         self.changes.after(previous)
+
+    def set_window(self,window,formatter,schema):
+        previous=self.changes.before();old=self._model.rows;top=self.first_visible
+        anchor=self.row_key(old[top]) if self.live_update and 0<=top<len(old) and not old[top].get('_placeholder') else None
+        selected=self.row_key(old[self._selected]) if 0<=self._selected<len(old) and not old[self._selected].get('_placeholder') else None
+        if getattr(self,'_window_schema',None)!=schema:
+            self._window_formatter=formatter;self._window_schema=schema
+            self._model.cache.clear();self._model.formatter=None
+        self._model.replace(WindowRows(window),self._window_formatter)
+        indices={self.row_key(r):window['start']+i for i,r in enumerate(window['rows'])}
+        if anchor in indices:
+            self._vertical.setValue(self._vertical.value()+(indices[anchor]-top)*self._state['rowHeight'])
+        if selected in indices:self.select_row(indices[selected])
+        elif self._selected>=window['total']:self.select_row(-1)
+        self.changes.after(previous)
+        return self._model.rows
+
 
 
 class LazyTable(Table):

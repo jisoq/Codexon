@@ -10,9 +10,9 @@ from html import escape
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, QSettings, QDate, QEvent, QUrl
-from PySide6.QtGui import QFont, QDesktopServices
+from PySide6.QtGui import QFont, QFontMetricsF, QDesktopServices
 from PySide6.QtWidgets import QApplication, QWidget, QSystemTrayIcon
-from .presentation import Button, Choice, Column, DateInput, Group, Input, Navigation, Row, Scroll, Split, Stack, Text, TextArea, Toggle
+from .presentation import batched_updates, Button, Choice, Column, DateInput, Group, Input, Navigation, Row, Scroll, Split, Stack, Text, TextArea, Toggle
 from .table_model import Cell, Header, Table, LazyTable
 from .quick_runtime import Dialog, DialogButtons
 from .tray import TrayWindow, tray_icon
@@ -30,13 +30,14 @@ from .theme import shared_theme
 from .version import VERSION
 from .i18n import tr, Verbatim
 from .workload import call_count
+from .history_navigation import HistoryNavigation, HistoryWorkspace, HistoryTree
 
 STYLE = ''
 TITLES = ('사용 현황','조건 비교','세션 기록','사용 한도','설정','캐시 관리')
 PERIODS = [('최근 30분','30m'),('오늘','today'),('최근 7일','7d'),('최근 30일','30d'),('전체 기록','all'),('직접 지정','custom')]
 INPUT_BANDS = [('전체 입력 길이',''),('10k 미만','0:10000'),('10–50k','10000:50000'),('50–100k','50000:100000'),('100–200k','100000:200000'),('200–272k','200000:272001'),('272k 초과','272001:inf')]
 CALL_FILTERS = [('미산정','unpriced'),('모드 기록 없음','unknown_mode'),('모델명 불일치','model_mismatch'),('기록 누락·충돌','observation_problem'),('캐시 읽기 0','cache_zero'),('캐시 저하 의심','cache_degradation'),('HTTP/SSE','http')]
-CALL_COLUMNS = [('ts','기록 시각'),('model','요청 모델'),('effort','추론 설정'),('service_tier','요청 모드'),('cost','비용'),('cache_ratio','캐시 적중률')]
+CALL_COLUMNS = [('ts','기록 시각'),('model','모델 · 추론 · 모드'),('cost','환산액'),('input','입력'),('output','출력'),('cache_ratio','캐시 적중률'),('completion_latency_ms','소요시간')]
 EXTRA_COLUMNS = [('input','입력'),('cached','캐시 읽기'),('written','캐시 쓰기'),('output','출력'),('reasoning','추론'),('non_reasoning','추론 외'),('output_speed','평균 출력 속도'),('response_model','응답 모델'),('response_service_tier','응답 등급'),('transport','통신 방식')]
 
 
@@ -91,6 +92,31 @@ def record_summary(rows):
 
 
 class Dashboard(TrayWindow):
+    @property
+    def record_view(self):return self.history_navigation.view
+    @record_view.setter
+    def record_view(self,value):self.history_navigation.view=value
+
+    @property
+    def selected_session(self):return self.history_navigation.session
+    @selected_session.setter
+    def selected_session(self,value):self.history_navigation.session=value
+
+    @property
+    def selected_turn(self):return self.history_navigation.request
+    @selected_turn.setter
+    def selected_turn(self,value):self.history_navigation.request=value
+
+    @property
+    def selected_call(self):return self.history_navigation.call
+    @selected_call.setter
+    def selected_call(self,value):self.history_navigation.call=value
+
+    @property
+    def selected_event(self):return self.history_navigation.event
+    @selected_event.setter
+    def selected_event(self,value):self.history_navigation.event=value
+
     def __init__(self, homes, start_worker=True, settings=None, index_path=None, static_snapshot=None, live_limits=True, manage_observer=False,model_evidence_path=None,cache_control=None,quota_path=None,collection_autostart=True):
         self.quota_path=quota_path
         self.cache_control_enabled=manage_observer if cache_control is None else cache_control
@@ -110,8 +136,10 @@ class Dashboard(TrayWindow):
         self.current_page=0;self.restoring=True;self.back_stack=[];self.temporary_context=None;self.navigation_signature=None
         self.page_filters={0:{'model':'','effort':'','service_tier':''},2:{'model':'','effort':'','service_tier':''}}
         self.targets=[];self.comparison_edited=False;self.baseline='A';self.filter_values={}
+        self.history_navigation=HistoryNavigation()
         self.selected_session=None;self.selected_turn=None;self.selected_call=None;self.selected_event=None;self.selected_call_scope=None
-        self.record_section='identity';self.record_view='sessions';self.record_rows=[];self.exact_record=None
+        self.record_section='identity';self.record_view='projects';self.record_rows=[];self.exact_record=None
+        self.population_request=0;self.pending_population=None
         self.record_request=0;self.record_status='';self.aggregate_records=[];self.aggregate_selection=None
         self.interaction_time=0;self.deferred_result=None;self.defer_timer=QTimer(self)
         self.defer_timer.setSingleShot(True);self.defer_timer.timeout.connect(self.apply_deferred)
@@ -135,13 +163,14 @@ class Dashboard(TrayWindow):
         self.settings_button=Button('설정');self.settings_button.put(flat=True);self.settings_button.clicked.connect(self.open_settings)
         side_layout.addWidget(self.settings_button);self.index_status=label('수집 중','muted',True);self.index_status.put(fontSize=12);side_layout.addWidget(self.index_status)
         shell.addWidget(side)
-        content=Group();content.put(contentWidth=1808);shell.addWidget(content,1);layout=Column(content)
+        content=Group();self.content=content;content.put(contentWidth=1808);shell.addWidget(content,1);layout=Column(content)
         layout.setContentsMargins(24,20,24,20);layout.setSpacing(10)
         header=Row();self.back_button=action('back','뒤로',self.go_back)
         self.home_button=action('home','현재 탭 처음으로',self.go_home)
         self.navigation_row=Row();self.navigation_row.setSpacing(4)
         self.navigation_row.addWidget(self.home_button);self.navigation_row.addWidget(self.back_button)
         self.path_label=label('','muted');self.path_label.put(noElide=False);self.navigation_row.addWidget(self.path_label,1)
+        self.history_path=Row();self.history_path.setSpacing(4);self.navigation_row.addWidget(self.history_path,1)
         self.heading=label(TITLES[0],'heading');header.addWidget(self.heading);header.addStretch()
         self.pending_label=label('','muted');self.pending_label.setFixedHeight(36);self.pending_label.setMaximumWidth(280);header.addWidget(self.pending_label)
         self.price_button=Button('기준 가격');self.price_button.clicked.connect(self.show_prices);header.addWidget(self.price_button);layout.addLayout(header)
@@ -177,7 +206,7 @@ class Dashboard(TrayWindow):
             if homes and static_snapshot is None:self.start_quota_service(homes[0])
             self.worker=AnalysisBridge(homes,index_path,static_snapshot,model_evidence_path,quota_path)
             self.worker.snapshot.connect(self.receive);self.worker.result.connect(self.analysis_ready)
-            self.worker.failure.connect(self.analysis_failed);self.worker.record.connect(self.record_ready);self.worker.start();self.render()
+            self.worker.failure.connect(self.analysis_failed);self.worker.record.connect(self.record_ready);self.worker.population.connect(self.population_ready);self.worker.start();self.render()
         elif static_snapshot is not None:self.receive(static_snapshot)
         self.setCentralWidget(root)
         if hasattr(self.quota_panel,'set_homes'):self.quota_panel.set_homes(homes)
@@ -311,7 +340,7 @@ class Dashboard(TrayWindow):
         for node in (self.unit,self.comparison_metric):header.addWidget(node)
         for node in (self.method,self.comparison_mode):options_layout.addWidget(node)
         for node in (self.unit,self.comparison_metric,self.method,self.comparison_mode):node.currentIndexChanged.connect(self.comparison_metric_changed)
-        self.result_view=combo([('분포','distribution')]);self.result_view.currentIndexChanged.connect(self.render_comparison)
+        self.result_view=combo([('분포','distribution')]);self.result_view.currentIndexChanged.connect(self.render)
         self.result_view.hide()
         self.comparison_options=Details('세부 조건·계산 방식',options,compact=True);layout.addWidget(self.comparison_options)
         self.comparison_chart=ComparisonChart();self.comparison_chart.selected.connect(self.select_comparison);layout.addWidget(self.comparison_chart)
@@ -328,7 +357,7 @@ class Dashboard(TrayWindow):
     def build_explorer(self):
         page=Group();layout=Column(page);layout.setSpacing(12)
         self.breadcrumb=self.path_label
-        self.session_scope=label('','muted');self.session_scope.setFixedWidth(520);self.session_scope.setFixedHeight(42);self.session_scope.put(fontSize=12)
+        self.session_scope=label('','muted');self.session_scope.setMinimumWidth(0);self.session_scope.setFixedHeight(42);self.session_scope.put(fontSize=12)
         self.residual_details=Details('누계 차액·미분류',compact=True);self.residual_details.hide();layout.addWidget(self.residual_details)
         controls=Row();controls.put(flow=True,spacing=8);controls.addWidget(self.session_scope);self.record_view_choice=combo([('세션','sessions'),('호출','calls')]);self.record_view_choice.hide()
         self.record_tabs=[]
@@ -336,7 +365,7 @@ class Dashboard(TrayWindow):
             tab=Button();tab.setCheckable(True);tab.put(flat=True,selectionTab=True)
             tab.clicked.connect(lambda index=i:self.select_record_view(index));controls.addWidget(tab);self.record_tabs.append(tab)
         self.record_view_choice.currentIndexChanged.connect(self.record_view_changed)
-        self.search=Input();self.search.setPlaceholderText('작업명 · 프로젝트명 · 세션 ID');self.search.setFixedWidth(260);self.search_timer=QTimer(self);self.search_timer.setSingleShot(True);self.search_timer.setInterval(0)
+        self.search=Input();self.search.setPlaceholderText('작업명 · 프로젝트명 · 세션 ID');self.search.setFixedWidth(260);self.search_timer=QTimer(self);self.search_timer.setSingleShot(True);self.search_timer.setInterval(120)
         self.search_timer.timeout.connect(self.render_explorer)
         self.search.textChanged.connect(lambda:self.search_timer.start());controls.addWidget(self.search)
         self.sort=combo([('최신 기록 순','time_desc'),('오래된 기록 순','time_asc'),('환산액 높은 순','cost_desc'),('환산액 낮은 순','cost_asc')]);self.sort.currentIndexChanged.connect(self.render_explorer);controls.addWidget(self.sort)
@@ -348,25 +377,35 @@ class Dashboard(TrayWindow):
         extra_row=Row();extra_row.put(flow=True);self.call_columns_row=extra_row;self.extra_column_controls={}
         for key,title in EXTRA_COLUMNS:
             node=Toggle(title);node.toggled.connect(self.render_explorer);extra_row.addWidget(node);self.extra_column_controls[key]=node
-        fl.addLayout(extra_row);self.record_filters=Details('호출 필터·열 선택',filter_body,compact=True);layout.addWidget(self.record_filters)
+        fl.addLayout(extra_row);self.record_filters=Details('필터·표시 항목',filter_body,compact=True);layout.addWidget(self.record_filters)
+        self.record_filters.toggle.toggled.connect(lambda _:self.sync_history_filters())
         self.record_message=label('','muted');self.record_message.setFixedHeight(24);self.record_message.setMaximumWidth(300);self.navigation_row.addWidget(self.record_message)
-        self.records_body=Row();self.records_body.setSpacing(24)
-        self.record_pair=Split();self.record_pair.setSizes([420,650]);self.records_body.addWidget(self.record_pair,1)
+        self.records_body=HistoryWorkspace();self.records_body.resized.connect(self.layout_record_detail)
         self.record_parent=Group();parent_layout=Column(self.record_parent)
-        self.record_parent_title=label('세션','section');parent_layout.addWidget(self.record_parent_title)
+        self.record_parent.setFixedWidth(248)
+        self.record_parent_title=label('프로젝트 · 세션','section');parent_layout.addWidget(self.record_parent_title)
         self.parent_stack=Stack();parent_layout.addWidget(self.parent_stack,1)
-        self.session_parent_table=table([]);self.request_parent_table=table([])
-        for parent_table in (self.session_parent_table,self.request_parent_table):
+        self.session_parent_table=HistoryTree([])
+        for parent_table in (self.session_parent_table,):
             parent_table.setMinimumHeight(200);self.parent_stack.addWidget(parent_table)
-            parent_table.cellClicked.connect(self.activate_record_parent);parent_table.cellActivated.connect(self.activate_record_parent)
+            parent_table.cellClicked.connect(self.activate_record_parent);parent_table.cellActivated.connect(lambda index,*_:self.activate_record_parent(index,1))
         self.parent_table=self.session_parent_table
-        self.record_pair.addWidget(self.record_parent)
+        self.records_body.addWidget(self.record_parent)
         self.record_current=Group();current_layout=Column(self.record_current)
         self.record_current_title=label('요청','section');current_layout.addWidget(self.record_current_title)
-        self.table=table([]);self.table.setMinimumHeight(200);self.table.cellClicked.connect(self.activate_record);self.table.cellActivated.connect(self.activate_record);current_layout.addWidget(self.table,1)
-        self.record_pair.addWidget(self.record_current)
-        self.parent_rows=[];self.parent_kind='sessions';self.record_pair_kind=None
-        self.record_pair.splitterMoved.connect(self.save_record_pair)
+        self.history_tables={};self.history_table_stack=Stack();current_layout.addWidget(self.history_table_stack,1)
+        for kind in ('projects','sessions','children','requests','calls'):
+            node=table([]);node.setMinimumHeight(200)
+            node.cellClicked.connect(lambda row,col:self.activate_record(row) if col==0 else None)
+            node.cellActivated.connect(self.activate_record)
+            self.history_tables[kind]=node;self.history_table_stack.addWidget(node)
+        self.table=self.history_tables['projects']
+        self.records_body.addWidget(self.record_current)
+        self.history_summary=label('','muted',True);self.records_body.addWidget(self.history_summary)
+        self.range_timer=QTimer(self);self.range_timer.setSingleShot(True);self.range_timer.timeout.connect(self.render_explorer)
+        for node in (*self.history_tables.values(),self.session_parent_table):
+            node.rangeRequested.connect(lambda:self.range_timer.start(0) if not self.analysis_pending else None)
+        self.parent_rows=[];self.parent_kind='tree'
         self.detail_scroll=Scroll();self.detail_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff);detail=Group();detail_layout=Column(detail);detail_layout.setSpacing(24)
         dh=Row();dh.addWidget(label('호출 상세','section'));detail_layout.addLayout(dh)
         self.close_record_button=action('close','호출 상세 닫기',self.close_record_detail);self.close_record_button.hide();self.navigation_row.addWidget(self.close_record_button)
@@ -387,7 +426,7 @@ class Dashboard(TrayWindow):
         except (ValueError,TypeError,KeyError):pass
 
     def capture_state(self):
-        return dict(design_version=3,comparison_selection=getattr(self,'comparison_selection',None),compare_model=self.compare_model.currentData(),page=self.current_page,settings_category=self.settings_page.stack.currentIndex(),
+        return dict(design_version=4,history_navigation=self.history_navigation.capture(),comparison_selection=getattr(self,'comparison_selection',None),compare_model=self.compare_model.currentData(),page=self.current_page,settings_category=self.settings_page.stack.currentIndex(),
             common={key:getattr(self,key).currentData() for key in ('home','period','project','source')},
             archive=self.archive.isChecked(),dates=[self.date_start.text(),self.date_end.text()],
             page_filters=copy.deepcopy(self.page_filters),targets=copy.deepcopy(self.targets),baseline=self.baseline,
@@ -406,6 +445,7 @@ class Dashboard(TrayWindow):
 
     def restore_state(self,state,initial=False):
         previous=self.restoring;self.restoring=True
+        self.history_navigation.restore({} if initial else state.get('history_navigation',{}))
         for key,value in state.get('common',{}).items():
             node=getattr(self,key)
             if value and node.findData(value)<0:node.addItem(str(value),value)
@@ -433,7 +473,9 @@ class Dashboard(TrayWindow):
         self.selected_session=tuple(state['selected_session']) if state.get('selected_session') else None
         self.selected_turn=state.get('selected_turn');self.selected_call=state.get('selected_call');self.selected_event=state.get('selected_event')
         self.selected_call_scope=tuple(state['selected_call_scope']) if state.get('selected_call_scope') else self.selected_session
-        self.record_section=state.get('record_section','identity');self.record_view=state.get('record_view','sessions')
+        self.record_section=state.get('record_section','identity');self.record_view=state.get('record_view','projects')
+        if initial:
+            self.record_view='projects';self.selected_session=self.selected_turn=self.selected_call=self.selected_event=self.selected_call_scope=None
         self.search.setText(state.get('search',''));self.outside.setChecked(state.get('outside',False))
         for key,node in self.call_filter_controls.items():node.setChecked(key in state.get('call_filters',[]))
         for key,node in self.extra_column_controls.items():node.setChecked(key in state.get('extras',[]))
@@ -444,6 +486,7 @@ class Dashboard(TrayWindow):
         self.settings_page.reveal(max(0,min(6,state.get('settings_category',0))))
         for key,attr in (('model','model'),('effort','effort'),('service_tier','mode')):
             choose(getattr(self,attr),self.page_filters.get(self.current_page,{}).get(key,''))
+        if initial:state={**state,'record_scroll':0,'record_horizontal':0,'record_selection':None,'parent_scroll':0,'parent_horizontal':0}
         self._restore_positions=state
         self.parent_table.verticalScrollBar().setValue(state.get('parent_scroll',0));self.parent_table.horizontalScrollBar().setValue(state.get('parent_horizontal',0))
         self.restoring=previous
@@ -489,16 +532,20 @@ class Dashboard(TrayWindow):
         if self.current_page==2:
             session=next((s for s in self.snapshot['sessions'] if self.selected_session==(s['home'],s['id'])),None)
             path=tr('세션 기록')
+            if self.history_navigation.project:
+                labels=self.snapshot.get('filter_choices',{}).get('project_labels',{})
+                path+=' / '+labels.get(self.history_navigation.project,self.history_navigation.project)
             if session:path+=' / '+(session.get('title') or session['id'])
             if self.selected_turn:path+=' / '+self.selected_turn
             if self.selected_call:path+=' / '+tr('호출 상세')
-            deep=bool(self.selected_turn or self.selected_call or self.temporary_context or self.record_view=='calls')
+            deep=bool(self.history_navigation.project or self.selected_turn or self.selected_call or self.temporary_context or self.record_view=='calls')
         else:
             path=TITLES[self.current_page];deep=False
             if self.current_page==1:
                 path+=' / '+(self.compare_model.currentText() or '모델 선택')
                 if self.comparison_detail['group'].isVisible():path+=' / 선택 상세';deep=True
         self.navigation_row.setVisible(self.current_page in (1,2) or bool(self.back_stack))
+        self.history_path.setVisible(self.current_page==2);self.path_label.setVisible(self.current_page!=2)
         self.path_label.setText(Verbatim(path) if self.current_page==2 else path);self.path_label.setToolTip(Verbatim(path) if self.current_page==2 else path)
         self.close_record_button.setVisible(self.current_page==2 and self.detail_scroll.isVisible())
         self.record_message.setVisible(self.current_page==2)
@@ -510,7 +557,7 @@ class Dashboard(TrayWindow):
         if self.current_page==2:
             self.selected_session=self.selected_turn=self.selected_call=self.selected_event=None
             self.selected_call_scope=None;self.exact_record=None;self.temporary_context=None
-            self.record_view='sessions';self.record_request+=1;self.render()
+            self.history_navigation.project='';self.record_view='projects';self.record_request+=1;self.render()
         elif self.current_page==1:self.close_aggregate(self.comparison_detail['group'])
         self.update_navigation()
 
@@ -587,6 +634,9 @@ class Dashboard(TrayWindow):
         for key,attr in (('model','model'),('effort','effort'),('service_tier','mode')):
             if self.current_page in (0,2):choose(getattr(self,attr),self.page_filters[self.current_page].get(key,''))
         self.restoring=False
+        self.content.put(contentWidth=0 if index==2 else 1808)
+        self.project.setVisible(index!=2)
+        self.sync_history_filters()
         self.common_filters.setVisible(index<3);self.scope_note.setVisible(index<3)
         for node in (self.model,self.effort,self.mode):node.setVisible(index in (0,2))
         self.price_button.setVisible(index!=4);self.pending_timer.stop();self.pending_label.hide();self.pages.show()
@@ -615,6 +665,18 @@ class Dashboard(TrayWindow):
         if page in (0,2):q.update(self.page_filters[page])
         if self.temporary_context and page==2:
             q.update(start=0,end=self.snapshot['ts']+.000001,period='all',home=self.temporary_context.get('home',''),sid=self.temporary_context.get('sid',''),project='',source='',archived=True,model='',effort='',service_tier='')
+        q.update(presentation=True,result_view=self.result_view.currentData(),compare_model=self.compare_model.currentData())
+        if page==2:
+            self.use_history_table()
+            q['project']=''
+            scope=self.selected_call_scope or self.selected_session
+            q['explorer']=dict(project=self.history_navigation.project,expanded=sorted(self.history_navigation.expanded),view=self.record_view,session=self.selected_session,turn=self.selected_turn,
+                event=self.selected_event,search=self.search.text(),sort=self.sort.currentData(),
+                filters=[k for k,n in self.call_filter_controls.items() if n.isChecked()],
+                outside=self.outside.isChecked(),context=self.temporary_context,
+                call_identity=(*scope,self.selected_call) if scope and self.selected_call else None)
+            q['table_windows']={name:dict(start=max(0,node.first_visible-32),size=max(128,min(512,(node.last_visible-node.first_visible+1)*3)))
+                for name,node in (('records',self.table),('parents',self.parent_table))}
         return q
 
     def render(self,*_,automatic=False):
@@ -628,29 +690,40 @@ class Dashboard(TrayWindow):
             return
         self.overview_basis.setVisible(self.overview_metric.currentData()=='cost')
         q=self.query()
+        if automatic and q['page']==2:
+            for name,node in (('records',self.table),('parents',self.parent_table)):
+                i=node.first_visible
+                if 0<=i<node.rowCount():
+                    row=node.model().rows[i]
+                    if not row.get('_placeholder'):
+                        window=q['table_windows'][name]
+                        window.update(anchor=list(node.row_key(row)),anchor_offset=i-window['start'])
         if self.async_mode:
             # Retain exact overview bucket endpoints; record/comparison populations
             # are reusable until the worker's next call or request boundary.
-            key_query={k:v for k,v in q.items() if k!='now' and (q['page']==0 or q['period']=='custom' or k not in ('start','end'))}
+            key_query={k:v for k,v in q.items() if k!='now' and (q['period']=='custom' or k not in ('start','end'))}
             logical=(self.snapshot.get('data_revision',0),json.dumps(key_query,sort_keys=True))
             if automatic and self.analysis_pending:
                 self._refresh_after_pending=getattr(self,'pending_logical',None)!=logical
                 return
             self.request_id+=1
+            if not automatic:self.deferred_result=None;self.defer_timer.stop()
             self.pending_query=q;self.pending_automatic=automatic;self.pending_logical=logical
             cached=self.client_cache.get(logical)
             if cached and q['now']<cached[1]:
-                if self.view_result is cached[0] and automatic:
+                from .dashboard_views import refresh_bounds
+                value=refresh_bounds(cached[0],q)
+                if self.view_result is value and automatic:
                     self.analysis_pending=False
                     return
-                self.apply_result(cached[0],q,automatic)
+                self.apply_result(value,q,automatic)
                 return
             self.analysis_pending=True
             if not automatic:
                 self.pending_timer.start()
             if self.worker:self.worker.request(self.request_id,q,logical)
         else:
-            self.apply_result(self.engine.query(q),q,automatic)
+            self.apply_result(self.engine.page_query(q),q,automatic)
 
     def show_analysis_pending(self):
         if self.analysis_pending:
@@ -688,14 +761,15 @@ class Dashboard(TrayWindow):
 
     def analysis_ready(self,message):
         result=message['result']
-        self.client_cache.put(message['logical'],(result,message['valid_until']),len(result['analysis']['responses'])+len(result['analysis']['turns'])+1)
         if message['id']!=self.request_id:return
+        self.client_cache.put(message['logical'],(result,message['valid_until']),result['analysis']['response_count']+1)
         self.analysis_errors.clear();self.worker_metrics=message.get('metrics',{})
         if self.pending_automatic and time.monotonic()-self.interaction_time<.15:
             self.deferred_result=(message['id'],message['result'],self.pending_query)
             self.defer_timer.start(160)
         else:self.apply_result(message['result'],self.pending_query,self.pending_automatic)
 
+    @batched_updates
     def apply_result(self,result,query,automatic=False):
         if query['page']!=self.current_page:return
         if automatic and getattr(self,'_ever_shown',False) and (not self.isVisible() or self.isMinimized()):
@@ -703,17 +777,24 @@ class Dashboard(TrayWindow):
         self.analysis_pending=False;self.pending_timer.stop();self.pending_label.hide();self.pages.show()
         self.view_result=result;self.applied_key=result['key'];self.analysis=result['analysis'];self.lookup=result['lookup']
         self.table.live_update=automatic
-        a=self.analysis;rows=a['responses'];sessions=len({(r['home'],r['sid']) for r in rows})
-        self.scope_note.setText(Verbatim(self.scope_text(query)+tr(f' · 관측 {len(rows):,}호출 · {sessions:,}세션'+(' · 수집 중' if query.get('loading') else ''))))
-        if self.current_page==0:self.render_overview()
-        elif self.current_page==1:
-            comparison=result.get('comparison',{})
-            if not self.comparison_edited and not self.targets:
-                self.targets=copy.deepcopy(comparison.get('targets',[]))
-                if self.targets and not comparison.get('mode_comparison'):choose(self.compare_type,'effort')
-                self.refresh_target_editors()
-            self.render_comparison()
-        elif self.current_page==2:self.render_explorer()
+        self.parent_table.live_update=automatic
+        a=self.analysis;count=a['response_count'];sessions=a['session_count']
+        self.scope_note.setText(Verbatim(self.scope_text(query)+tr(f' · 관측 {count:,}호출 · {sessions:,}세션'+(' · 수집 중' if query.get('loading') else ''))))
+        if not hasattr(self,'_applied_pages'):self._applied_pages={}
+        display=tuple(k for k,n in self.extra_column_controls.items() if n.isChecked()) if self.current_page==2 else ()
+        previous=self._applied_pages.get(self.current_page)
+        detail_changed=self.current_page==2 and bool(self.selected_call or self.selected_event)!=self.detail_scroll.isVisible()
+        if previous is None or previous[0] is not result or previous[1]!=display or detail_changed or getattr(self,'_restore_positions',None):
+            if self.current_page==0:self.render_overview()
+            elif self.current_page==1:
+                comparison=result.get('comparison',{})
+                if not self.comparison_edited and not self.targets:
+                    self.targets=copy.deepcopy(comparison.get('targets',[]))
+                    if self.targets and not comparison.get('mode_comparison'):choose(self.compare_type,'effort')
+                    self.refresh_target_editors()
+                self.render_comparison()
+            elif self.current_page==2:self.apply_explorer()
+            self._applied_pages[self.current_page]=(result,display)
         state=getattr(self,'_restore_positions',None)
         if state:
             self._restore_positions=None
@@ -726,7 +807,7 @@ class Dashboard(TrayWindow):
             selected=state.get('record_selection')
             if selected is not None:
                 wanted=tuple(selected) if isinstance(selected,(list,tuple)) else selected
-                self.table.select_row(next((i for i,row in enumerate(self.record_rows) if self.table.row_key(row)==wanted),-1))
+                self.table.select_row(next((i for i,row in enumerate(self.record_rows,getattr(self.record_rows,'start',0)) if self.table.row_key(row)==wanted),-1))
         self.save_preferences()
         if getattr(self,'_refresh_after_pending',False):
             self._refresh_after_pending=False;QTimer.singleShot(0,lambda:self.render(automatic=True))
@@ -764,16 +845,16 @@ class Dashboard(TrayWindow):
         if int(time.time())%10==0:shared_theme().configure(self.settings.value('ui/theme',self.settings.value('overlay/theme','codex')))
 
     def render_overview(self,*_):
-        view=self.view_result.get('overview',{});self.overview=view;rows=self.analysis['responses'];cost=view['call_stats']
-        turns=[r for r in self.analysis['turns'] if r.get('complete')];turn_cost=view['turn_stats']
-        valid=cache_rows(rows);cache=view['summary']['cache'];inputs=cache['input'];rate=cache['value']
-        total=sum(r['cost'] for r in rows if r.get('cost') is not None) if cost['n'] else 0 if not rows else None
+        view=self.view_result.get('overview',{});self.overview=view;rows=self.analysis['response_count'];cost=view['call_stats']
+        turn_cost=view['turn_stats']
+        cache=view['summary']['cache'];inputs=cache['input'];rate=cache['value']
+        total=view['total']
         speed=view['summary']['output_speed']
         values=[usd(total),usd(cost['mean']),usd(turn_cost['mean']),value_text(rate,'cache_ratio'),value_text(speed['value'],'output_speed')]
-        notes=[f"산정 {cost['n']:,} / 관측 {len(rows):,}" if cost['n']<len(rows) else f"관측 {len(rows):,}호출",
-            f"유효 {cost['n']:,} / 대상 {len(rows):,}",
-            f"유효 {turn_cost['n']:,}요청 · 포함 {sum(t.get('responses',0) for t in turns if t.get('cost') is not None):,}호출",
-            f"유효 {len(valid):,} / 대상 {len(rows):,} · 입력 {inputs:,}",
+        notes=[f"산정 {cost['n']:,} / 관측 {rows:,}" if cost['n']<rows else f"관측 {rows:,}호출",
+            f"유효 {cost['n']:,} / 대상 {rows:,}",
+            f"유효 {turn_cost['n']:,}요청 · 포함 {view['request_calls']:,}호출",
+            f"유효 {view['cache_known']:,} / 대상 {rows:,} · 입력 {inputs:,}",
             f"측정 {speed['n']:,} / 대상 {speed['N']:,} · 추론·대기 포함"]
         loading=self.snapshot.get('index',{}).get('loading') and not rows
         for node,value,note,text in zip(self.metrics,values,self.metric_notes,notes):node.setText('수집 중' if loading else value if rows else '—');note.setText(text)
@@ -788,16 +869,15 @@ class Dashboard(TrayWindow):
         self.source_bars.empty_text=self.timeline.empty_text;self.component_bars.empty_text=self.timeline.empty_text
         self.source_bars.setFixedHeight(max(200,40*len(view.get('sources',[]))));self.source_bars.set_rows([{**r,'metric':'cost'} for r in view.get('sources',[])])
         component_colors={'cost_uncached':'uncached','cost_cached':'cached','cost_written':'written','cost_unclassified':'unknown','cost_output':'output'}
-        self.component_bars.set_rows([{**r,'color':component_colors.get(r['key'],'unknown'),'metric':'cost','records':rows,'known':r.get('n',0),'calls':r.get('N',0),'missing':r.get('N',0)-r.get('n',0)} for r in view.get('components',[])] if rows else [])
+        self.component_bars.set_rows([{**r,'color':component_colors.get(r['key'],'unknown'),'metric':'cost','population':self.view_result['all_population'],'population_count':rows,'assumptions':view['assumptions'],'known':r.get('n',0),'calls':r.get('N',0),'missing':r.get('N',0)-r.get('n',0)} for r in view.get('components',[])] if rows else [])
         attention=view.get('attention',{})
         self.attention_rows={}
         for key,button in self.attention_buttons.items():
-            items=attention.get(key)
-            if items is None:items=[r for r in rows if self.matches_call_filter(r,key)]
-            if isinstance(items,int):items=[r for r in rows if self.matches_call_filter(r,key)]
-            self.attention_rows[key]=items;button.setText(dict((v,k) for k,v in [('미산정 호출','unpriced'),('모델명 불일치','model_mismatch'),('캐시 저하 의심','cache_degradation'),('기록 누락','observation_missing')])[key]+f' {len(items):,}')
-            button.setVisible(bool(items))
-        self.attention.setVisible(any(self.attention_rows.values()))
+            items=attention.get(key,{'count':0})
+            self.attention_rows[key]=items
+            button.setText(dict((v,k) for k,v in [('미산정 호출','unpriced'),('모델명 불일치','model_mismatch'),('캐시 저하 의심','cache_degradation'),('기록 누락','observation_missing')])[key]+f" {items['count']:,}")
+            button.setVisible(bool(items['count']))
+        self.attention.setVisible(any(item['count'] for item in self.attention_rows.values()))
         if self.aggregate_selection and self.overview_detail['group'].isVisible():
             selected=self.aggregate_selection
             if '_summary_index' in selected:self.open_summary(selected['_summary_index'],reveal=False)
@@ -811,70 +891,61 @@ class Dashboard(TrayWindow):
                 else:self.overview_detail['group'].hide();self.aggregate_selection=None;self.aggregate_records=[]
 
     def open_summary(self,index,*,reveal=True):
-        rows=self.analysis['responses'];cost_rows=[r for r in rows if r.get('cost') is not None];sample_n=None;sample_N=len(rows);assumptions=rows
-        if index==2:
-            turns=[t for t in self.analysis['turns'] if t.get('complete') and t.get('cost') is not None]
-            selected=[r for t in turns for r in self.lookup['turns'].get((t['home'],t['sid'],t['turn']),[])]
-            value=stats(turns,'cost')['mean'];extra='완료 요청 유효 '+str(len(turns))+' / 대상 '+str(len(self.analysis['turns']))
-            sample_n=len(turns);sample_N=len(self.analysis['turns']);assumptions=[t for t in self.analysis['turns'] if t.get('complete')]
-            reasons=defaultdict(int)
-            for t in self.analysis['turns']:
-                if not t.get('complete'):
-                    for reason in t.get('exclusions',[]) or [t.get('state','기록 불완전')]:reasons[str(reason)]+=1
-            extra+=' · '+', '.join(f'{k} {v}' for k,v in reasons.items())
-        elif index==3:
-            selected=cache_rows(rows);denom=sum(r['input'] for r in selected)
-            value=100*sum(r['cached'] for r in selected)/denom if denom else None;extra='동일 유효 표본의 캐시 읽기 합계 / 입력 합계'
-        elif index==4:
-            speed=self.overview['summary']['output_speed']
-            selected=[r for r in rows if r.get('output_speed') is not None]
-            value=speed['value'];extra='출력 토큰 합계(추론 포함) / 호출 소요시간 합계 · 대기·통신 포함'
-        else:
-            selected=cost_rows;value=stats(rows,'cost')['sum'] if index==0 else stats(rows,'cost')['mean'];extra=''
-        self.select_aggregate(dict(label=self.metric_captions[index].text(),value=value,records=selected,known=len(selected) if sample_n is None else sample_n,N=sample_N,assumption_records=assumptions,metric='output_speed' if index==4 else 'cache_ratio' if index==3 else 'cost',extra=extra,amount=index not in (3,4),_summary_index=index),reveal=reveal)
+        row=self.view_result['summaries'][index]
+        self.select_aggregate(dict(row,label=self.metric_captions[index].text(),
+            metric='output_speed' if index==4 else 'cache_ratio' if index==3 else 'cost',
+            amount=index not in (3,4),_summary_index=index),reveal=reveal)
 
-    def assumption_text(self,rows):
-        from .pricing import mode_assumptions
+    def assumption_text(self,assumptions):
         lines=[]
-        for mode,result in mode_assumptions(rows).items():
+        for mode,result in assumptions.items():
             value=usd(result['total']) if result['total'] is not None else usd(result['partial_sum'])
             lines.append(f"{mode} 가정 추가액 {value} · 포함 {result['n']:,} / 산정 불가 {result['missing']:,}")
         return '<br>'.join(lines)
 
+    def population_ready(self,message):
+        pending=self.pending_population
+        if not pending or pending[0]!=message['id'] or pending[3]!=self.current_page:return
+        self.pending_population=None
+        self.select_aggregate({**pending[1],**message['summary']},reveal=pending[2])
+
     def select_aggregate(self,row,*,reveal=True):
+        if row.get('population') and 'assumptions' not in row:
+            self.population_request+=1;self.pending_population=(self.population_request,row,reveal,self.current_page)
+            if self.async_mode:
+                self.worker.request_population(self.population_request,row['population'],row.get('assumption_population'))
+            else:
+                from .dashboard_views import population_summary
+                self.population_ready(dict(id=self.population_request,summary=population_summary(self.engine,row['population'],row.get('assumption_population'))))
+            return
         if self.current_page==1:self.comparison_selection={'id':row.get('id'),'matrix_label':row.get('matrix_label')}
         self.aggregate_selection=dict(row);panel=self.comparison_detail if self.current_page==1 else self.overview_detail
-        records=row.get('records',row.get('rows'))
-        if records is None and row.get('start_ts') is not None:records=[r for r in self.analysis['responses'] if row['start_ts']<=r['ts']<row['end_ts']]
-        if records is None:records=[r for r in self.analysis['responses'] if r.get('cost') is not None]
-        self.aggregate_records=list(records);panel['title'].setText(row.get('label',row.get('id','선택 상세')))
-        n=row.get('known',row.get('n',len(records)));N=row.get('N',row.get('calls',len(records)));value=row.get('value',row.get('total'))
+        self.aggregate_records=row.get('population')
+        panel['title'].setText(row.get('label',row.get('id','선택 상세')))
+        count=row.get('population_count',row.get('N',0))
+        n=row.get('known',row.get('n',count));N=row.get('N',row.get('calls',count));value=row.get('value',row.get('total'))
         metric=row.get('metric',self.comparison_metric.currentData() if self.current_page==1 else self.overview_metric.currentData())
         lines=[value_text(value,metric),f'유효 {n:,} / 대상 {N:,}',row.get('extra','')]
         if row.get('start_ts') is not None:lines.append(date_time(row['start_ts'])+' ≤ 기록 시각 < '+date_time(row['end_ts']))
         if row.get('exclusions'):lines.append(' · '.join(f'{k} {v:,}' for k,v in row['exclusions'].items()))
         if row.get('request_exclusions'):lines.append('요청 제외 · '+' · '.join(f'{k} {v:,}' for k,v in row['request_exclusions'].items()))
         panel['text'].setText('<br>'.join(escape(str(x)) for x in lines if x));panel['group'].show()
-        panel['records'].setEnabled(bool(records));panel['apply_band'].setVisible(bool(row.get('input_band')))
-        amount=row.get('amount',metric=='cost') and any(request_tier(r)=='미확인' for sample in row.get('assumption_records',records) for r in sample.get('calls',[sample]));panel['assumptions'].setVisible(amount)
-        if amount:
-            population=row.get('assumption_records',records)
-            calls=[r for sample in population for r in sample.get('calls',[sample])]
-            panel['assumptions'].body.setText(self.assumption_text(calls))
+        panel['records'].setEnabled(bool(self.aggregate_records) and bool(count));panel['apply_band'].setVisible(bool(row.get('input_band')))
+        assumptions=row.get('assumptions',{})
+        amount=row.get('amount',metric=='cost') and any(v.get('N') for v in assumptions.values())
+        panel['assumptions'].setVisible(amount)
+        if amount:panel['assumptions'].body.setText(self.assumption_text(assumptions))
         if reveal:self.scrollers[self.current_page].ensureWidgetVisible(panel['group'])
         self.update_navigation()
 
     def open_aggregate_records(self):
-        self.aggregate_records=[r for sample in self.aggregate_records for r in sample.get('calls',[sample])]
-        self.push_state();self.temporary_context={'records':[list(identity(r)) for r in self.aggregate_records],'label':'선택 집계의 호출','home':'','sid':''}
+        if not self.aggregate_records:return
+        self.push_state();self.temporary_context={'population':self.aggregate_records,'label':'선택 집계의 호출','home':'','sid':''}
         self.selected_session=None;self.selected_turn=None;self.selected_call=None;self.record_view='calls';self.search.clear();self.change_page(2)
+
     def open_attention(self,key):
-        self.aggregate_records=self.attention_rows[key]
-        if key=='cache_degradation':
-            events=self.aggregate_records
-            keys={(e['home'],e['sid'],str(k)) for e in events for k in e['occurrence_keys']}
-            self.aggregate_records=[r for r in self.analysis['responses'] if (r['home'],r['sid'],str(call_id(r))) in keys]
-        self.open_aggregate_records()
+        self.aggregate_records=self.attention_rows[key].get('population');self.open_aggregate_records()
+
     def apply_selected_band(self):
         band=(self.aggregate_selection or {}).get('input_band')
         if band:
@@ -958,9 +1029,9 @@ class Dashboard(TrayWindow):
         comparison=self.view_result.get('comparison',{});groups=comparison.get('groups',[])
         if self.comparison_mode.currentData()=='repricing':
             groups=comparison.get('repricing_groups',[])
-        self.comparison_unknown_rows=[r for r in self.analysis['responses'] if r.get('model')==self.compare_model.currentData() and not recorded(request_tier(r))]
-        self.comparison_unknown.setVisible(bool(self.comparison_unknown_rows))
-        self.comparison_unknown.setText(f'모드 기록 없음 {len(self.comparison_unknown_rows):,}호출 · 별도 기록 보기')
+        self.comparison_unknown_rows=self.view_result['unknown_population']
+        self.comparison_unknown.setVisible(bool(self.comparison_unknown_rows['count']))
+        self.comparison_unknown.setText(f'모드 기록 없음 {self.comparison_unknown_rows['count']:,}호출 · 별도 기록 보기')
         self.compare_groups=groups;plot=[];lines=[];metric=self.comparison_metric.currentData();view=self.result_view.currentData()
         self.comparison_note.setText(('동일 토큰 환산 · 같은 표본의 Standard/Fast 단가 적용' if self.comparison_mode.currentData()=='repricing' else '같은 추론 설정의 Standard · Fast 분포' if self.compare_type.currentData()=='mode' else 'Standard · 기록된 모든 추론 설정') if self.targets else '선택한 모델의 기록이 없습니다')
         self.update_navigation()
@@ -1024,13 +1095,13 @@ class Dashboard(TrayWindow):
 
 
     def open_unknown_comparison(self):
-        self.aggregate_records=list(self.comparison_unknown_rows);self.open_aggregate_records()
+        self.aggregate_records=self.comparison_unknown_rows['population'];self.open_aggregate_records()
 
     def select_comparison(self,row):
         if row.get('kind')=='scatter_cell':
             self.select_scatter(row['records'],'산점도 선택 구간');return
         if row.get('home') and row.get('sid'):
-            self.select_scatter([row],('요청 '+str(row.get('turn',''))) if isinstance(row.get('calls'),list) else '호출 '+str(call_id(row)))
+            self.select_scatter([row],('요청 '+str(row.get('turn',''))) if row.get('sample_unit')=='turn' else '호출 '+str(call_id(row)))
             return
         self.select_aggregate({**row,'label':row.get('id','대상'),'metric':self.comparison_metric.currentData()});self.update_navigation()
 
@@ -1041,7 +1112,7 @@ class Dashboard(TrayWindow):
         for key,name in (('cwd','프로젝트'),('source','작업 종류')):
             values={str(r.get(key) or r.get('project') or '미확인') for r in records}
             pieces.append(name+' · '+(next(iter(values)) if len(values)==1 else str(len(values))+'개'))
-        self.select_aggregate(dict(label=title,records=records,n=len(records),N=len(records),value=stats(records,'cost')['mean'],metric='cost',extra=' · '.join(pieces)))
+        self.select_aggregate(dict(label=title,population={'union':[r['population'] for r in records]},population_count=len(records),n=len(records),N=len(records),value=stats(records,'cost')['mean'],metric='cost',extra=' · '.join(pieces)))
     def select_matrix(self,index,column=1,*_):
         if 0<=index<len(self.matrix_rows) and 1<=column<=len(self.matrix_labels):
             row=self.matrix_rows[index];cell=row['cells'].get(self.matrix_labels[column-1])
@@ -1071,180 +1142,163 @@ class Dashboard(TrayWindow):
 
     def call_filter_changed(self,checked):
         if self.restoring:return
-        if checked:self.record_view='calls'
+        # Filters narrow the current level without changing the route.
         self.render_explorer()
 
-    def session_records(self, rows, show_keys=None):
-        rollups=session_costs(self.analysis['sessions'],own_costs(rows))
-        records=[]
-        for session in self.analysis['sessions']:
-            key=(session['home'],session['id']);group=rollups[key]
-            if not group['calls'] or show_keys is not None and key not in show_keys:continue
-            source={'user':'직접 작업','subagent':'하위 에이전트','guardian_review':'내부 검토','maintenance':'캐시 유지'}.get(session.get('source'),'기타')
-            if group['descendants']:source+=f" · 하위 {group['descendants']}"
-            records.append(dict(home=key[0],sid=key[1],title=Verbatim(session['title']) if session.get('title') else '제목 없음',
-                project=Verbatim(session.get('project_name') or Path(session.get('cwd','')).name) if session.get('project_name') or session.get('cwd') else '프로젝트 없음',
-                source=source,cost=group['cost'],own_cost=group['own_cost'],child_cost=group['child_cost'],
-                descendants=group['descendants'],partial=group['partial'],known=group['priced'],
-                calls=group['calls'],cache_ratio=group['cache_ratio'],ts=group['latest_ts']))
-        sorting=self.sort.currentData();key='cost' if sorting.startswith('cost') else 'ts'
-        records.sort(key=lambda r:(r.get(key) is None,-r[key] if sorting.endswith('desc') and isinstance(r.get(key),(int,float)) else r.get(key,0)))
-        return records
+    def sync_history_filters(self):
+        show=self.current_page!=2 or self.record_filters.toggle.isChecked()
+        for node in (self.home,self.source,self.archive,self.model,self.effort,self.mode):
+            node.setVisible(show and self.current_page<3)
 
-    def save_record_pair(self,*_):
-        if self.record_pair_kind:
-            self.settings.setValue('dashboard/recordPair/'+self.record_pair_kind,json.dumps(self.record_pair.state['sizes']))
+    def render_history_path(self,data):
+        entries=[dict(title='프로젝트',action='root')]+[dict(item,action='scope') for item in data.get('path',[])]
+        if self.selected_turn:entries.append(dict(title='요청',action='request'))
+        if self.selected_call:entries.append(dict(title='호출 상세',action='leaf'))
+        buttons=getattr(self,'_history_path_buttons',[])
+        while len(buttons)<len(entries):
+            button=Button();button.setMaximumWidth(240)
+            button.clicked.connect(lambda node=button:self.activate_history_path(node))
+            self.history_path.addWidget(button);buttons.append(button)
+        self._history_path_buttons=buttons
+        for i,button in enumerate(buttons):
+            button.setVisible(i<len(entries))
+            if i<len(entries):
+                button.destination=entries[i];text=('› ' if i else '')+entries[i]['title'];button.setText(Verbatim(text))
+                font=QFont();font.setPixelSize(14)
+                button.setFixedWidth(min(240,max(72,int(QFontMetricsF(font).horizontalAdvance(text))+28)))
+                button.setToolTip(Verbatim(entries[i]['title']))
+                button.setEnabled(entries[i]['action']!='leaf')
 
-    def render_record_parent(self, scope_rows):
-        self.parent_kind='requests' if self.record_view=='calls' and self.selected_session else 'sessions'
-        self.parent_table=self.request_parent_table if self.parent_kind=='requests' else self.session_parent_table
-        self.parent_stack.setCurrentIndex(1 if self.parent_kind=='requests' else 0)
-        if self.parent_kind=='requests':
-            records=[dict(r,call_mean=stats(r.get('calls',[]),'cost')['mean']) for r in self.lookup['session_turns'].get(self.selected_session,[])]
-            unlinked=[r for r in scope_rows if (r['home'],r['sid'])==self.selected_session and not r.get('turn')]
-            if unlinked:
-                records.append(dict(home=self.selected_session[0],sid=self.selected_session[1],turn='__unlinked__',state='요청 미연결',responses=len(unlinked),cost=sum_cost(unlinked)['cost'],call_mean=stats(unlinked,'cost')['mean'],ts=max(r['ts'] for r in unlinked)))
-            sorting=self.sort.currentData();key='cost' if sorting.startswith('cost') else 'ts'
-            records.sort(key=lambda r:(r.get(key) is None,-r[key] if sorting.endswith('desc') and isinstance(r.get(key),(int,float)) else r.get(key,0)))
-            headers=['요청 시작','상태','호출 수','비용','평균 호출 비용'];widths=[175,150,90,130,160]
-            formatter=lambda r,c,role:[date_time(r.get('started_at')),r.get('state') or '완료 기록 없음',number(r.get('responses')),usd(r.get('cost')),usd(r.get('call_mean'))][c]
-            selected=next((i for i,r in enumerate(records) if r.get('turn')==self.selected_turn),-1)
-            self.record_parent_title.setText('요청');self.parent_table.put(rowHeight=40,leftColumns=[0,1])
-        else:
-            rows=scope_rows;search=self.search.text().casefold().strip();matching=None
-            if search:
-                matching={(s['home'],s['id']) for s in self.analysis['sessions'] if search in ' '.join(str(s.get(k,'')) for k in ('title','project_name','agent_nickname','cwd','id')).casefold()}
-            filters=[k for k,n in self.call_filter_controls.items() if n.isChecked()]+list((self.temporary_context or {}).get('filters',[]))
-            if filters:rows=[r for r in rows if any(self.matches_call_filter(r,key) for key in filters)]
-            records=self.session_records(rows,matching)
-            count_header='산정 / 전체 호출' if any(r['known']<r['calls'] for r in records) else '호출 수'
-            headers=['세션 · 프로젝트','비용 · 하위 포함',count_header,'최근 기록'];widths=[260,170,140,175]
-            formatter=lambda r,c,role:[Verbatim(tr(r['title'])+'\n'+tr(r['project'])+' · '+tr(r['source'])),('확인분 ' if r['partial'] and r['cost'] is not None else '')+usd(r['cost']),call_count(r['known'],r['calls']),date_time(r['ts'])][c]
-            selected=next((i for i,r in enumerate(records) if (r['home'],r['sid'])==self.selected_session),-1)
-            self.record_parent_title.setText('세션');self.parent_table.put(rowHeight=60,leftColumns=[0,3])
-        pair=self.parent_kind+'/'+self.record_view
-        if pair!=self.record_pair_kind:
-            self.record_pair_kind=pair
-            try:sizes=json.loads(self.settings.value('dashboard/recordPair/'+pair,'[420,650]'))
-            except (ValueError,TypeError):sizes=[420,650]
-            self.record_pair.setSizes(sizes)
-        if headers!=self.parent_table.model().headers:
-            self.parent_table.setHorizontalHeaderLabels(headers)
-            self.parent_table.put(widths=widths)
-        self.parent_rows=records;self.parent_table.set_rows(records,formatter);self.parent_table.select_row(selected)
-        self.record_current_title.setText('요청' if self.record_view=='requests' else '호출')
+    def activate_history_path(self,button):
+        item=button.destination
+        if item['action']=='root':self.go_home()
+        elif item['action']=='scope':self.enter_history(item)
+        elif item['action']=='request':self.close_record_detail()
 
-    def activate_record_parent(self,index,*_):
+    def render_record_parent(self,data):
+        self.parent_kind='tree';self.parent_table=self.session_parent_table
+        self.parent_stack.setCurrentIndex(0)
+        if self.parent_table.model().headers!=['','프로젝트 · 세션']:
+            self.parent_table.setHorizontalHeaderLabels(['','프로젝트 · 세션'])
+        self.parent_table.put(widths=[32,216],rowHeight=40,leftColumns=[0,1],stretchVisual=1,treeNavigation=True)
+        self.parent_rows=self.parent_table.set_window(data['parents'],self.history_tree_cell,('tree',))
+        from .history_projection import node_key
+        active=node_key('session',*self.selected_session) if self.selected_session else node_key('project',self.history_navigation.project)
+        self.parent_table.select_row(next((data['parents']['start']+i for i,r in enumerate(data['parents']['rows']) if r['key']==active),-1))
+        self.record_current_title.setText({'projects':'프로젝트','sessions':'세션','children':'하위 세션','requests':'요청','calls':'호출'}.get(self.record_view,''))
+
+    def history_tree_cell(self,row,column,role):
+        if column==0:return ('▾' if row.get('expanded') else '▸') if row.get('expandable') else ''
+        return '  '*row.get('depth',0)+row['title']
+
+    def activate_record_parent(self,index,column=1,*_):
         if not 0<=index<len(self.parent_rows):return
         row=self.parent_rows[index]
-        self.selected_call=None;self.selected_event=None;self.exact_record=None;self._revealed_call=None
-        if self.parent_kind=='sessions':
-            self.selected_session=(row['home'],row['sid']);self.selected_turn=None
-        else:self.selected_turn=row.get('turn')
-        self.render_explorer();self.save_preferences()
+        if row.get('_placeholder'):return
+        if column==0:
+            if row.get('expandable'):self.history_navigation.toggle(row['key']);self.render_explorer()
+            return
+        self.enter_history(row)
+
+    def enter_history(self,row):
+        self.push_state()
+        self.selected_call=self.selected_event=self.selected_turn=None;self.exact_record=None
+        self.history_navigation.project=row['project_id']
+        from .history_projection import node_key
+        self.history_navigation.expanded.add(row.get('key') or (node_key('session',row['home'],row['sid']) if row.get('sid') else node_key('project',row['project_id'])))
+        self.selected_session=(row['home'],row['sid']) if row.get('sid') else None
+        self.record_view='requests' if self.selected_session else 'sessions'
+        choose(self.sort,'time_asc' if self.selected_session else 'time_desc')
+        self.table.verticalScrollBar().setValue(0)
+        self.render_explorer()
+
+    def use_history_table(self):
+        kind=self.record_view if self.record_view in self.history_tables else 'projects'
+        self.table=self.history_tables[kind]
+        self.history_table_stack.setCurrentIndex(list(self.history_tables).index(kind))
 
     def render_explorer(self,*_):
-        if self.restoring or self.current_page!=2 or not self.view_result:return
-        rows=list(self.analysis['responses']);scope_rows=rows
-        if self.selected_session and self.record_view!='sessions':rows=[r for r in rows if (r['home'],r['sid'])==self.selected_session]
-        if self.selected_turn:rows=[r for r in rows if r.get('turn')==self.selected_turn]
-        if self.selected_turn=='__unlinked__':rows=[r for r in scope_rows if not r.get('turn') and (r['home'],r['sid'])==self.selected_session]
-        ctx=self.temporary_context or {}
-        if ctx.get('records') is not None:
-            keys={tuple(k) for k in ctx['records']};rows=[r for r in rows if identity(r) in keys]
-        filters=[k for k,n in self.call_filter_controls.items() if n.isChecked()]+list(ctx.get('filters',[]))
-        if filters:rows=[r for r in rows if any(self.matches_call_filter(r,key) for key in filters)]
-        search=self.search.text().casefold().strip()
-        matching=({(v['home'],v['id']) for v in self.analysis['sessions']
-                   if search in ' '.join(str(v.get(k,'')) for k in ('title','project_name','agent_nickname','cwd','id')).casefold()}
-                  if search else None)
-        if matching is not None and self.selected_session and self.record_view!='sessions':
-            rows=[r for r in rows if (r['home'],r['sid']) in matching]
-        if self.record_view=='sessions' or (self.record_view=='requests' and not self.selected_session):
-            sessions=self.session_records(rows,matching)
-            if sessions:
-                self.selected_session=(sessions[0]['home'],sessions[0]['sid']);self.selected_turn=None
-                self.record_view='requests';self.render_explorer();return
-            self.record_view='requests'
-        self.filtered=rows;self.record_status=''
-        self.table.put(highlightZeroCache=self.record_view=='calls')
-        session=next((s for s in self.analysis['sessions'] if self.selected_session==(s['home'],s['id'])),None)
-        if self.selected_event:
-            event=next((e for e in (session or {}).get('cache_health',{}).get('events',[]) if str(e.get('id'))==str(self.selected_event)),None)
-            phases={str(k):name for field,name in (('baseline_keys','기준'),('occurrence_keys','발생'),('recovery_keys','회복')) for k in (event or {}).get(field,[])}
-            rows=[dict(r,_incident_phase=phases[str(call_id(r))]) for r in rows if str(call_id(r)) in phases]
+        if self.restoring or self.current_page!=2:return
+        self.render()
+
+    def apply_explorer(self):
+        data=self.view_result['explorer'];ctx=self.temporary_context or {}
+        self.selected_session=tuple(data['session']) if data['session'] else None
+        self.selected_turn=data['turn'];self.record_view=data['view'];self.record_status=''
+        self.use_history_table()
+        session=data['metadata'];records=data['records']['rows']
+        self.render_history_path(data)
+        self.table.put(highlightZeroCache=self.record_view=='calls',navigationColumn=0)
+        summary=data.get('summary',{})
+        self.history_summary.setText(f"환산액 {'확인분 ' if summary.get('partial') and summary.get('cost') is not None else ''}{usd(summary.get('cost'))} · 호출 {summary.get('calls',0):,} · 캐시 {value_text(summary.get('cache_ratio'),'cache_ratio')}\n입력 {number(summary.get('input'))} · 출력 {number(summary.get('output'))} · API 단가 기준 · 청구액 아님")
         self.update_navigation()
         self.outside.setVisible(self.record_view=='calls');self.call_columns_row.setVisible(self.record_view=='calls')
-        self.record_filters.toggle.setText('호출 필터·열 선택' if self.record_view=='calls' else '호출 필터')
-        self.sort.setVisible(True)
+        self.record_filters.toggle.setText('필터·표시 항목')
+        self.session_scope.setVisible(bool(session));self.sort.setVisible(True)
         current=self.record_view
-        self.restoring=True;self.record_view_choice.clear()
-        for title,key in ([('요청','requests'),('호출','calls')] if self.selected_session else [('세션','sessions'),('호출','calls')]):self.record_view_choice.addItem(title,key)
+        wide=self.records_body.available_width>=1800
+        self.restoring=True
+        items=[('요청','requests'),(f"하위 세션({data.get('child_count',0)})",'children')] if self.selected_session else [('프로젝트','projects'),('세션','sessions')]
+        if [(self.record_view_choice.itemText(i),self.record_view_choice.itemData(i)) for i in range(self.record_view_choice.count())]!=items:
+            self.record_view_choice.clear()
+            for title,key in items:self.record_view_choice.addItem(title,key)
         choose(self.record_view_choice,current)
         for i,tab in enumerate(self.record_tabs):
-            tab.setText(self.record_view_choice.itemText(i));tab.setChecked(i==self.record_view_choice.currentIndex())
+            tab.setVisible(bool(self.selected_session) and self.record_view in ('requests','children') and (i==0 or data.get('child_count',0)>0));tab.setText(self.record_view_choice.itemText(i));tab.setChecked(i==self.record_view_choice.currentIndex())
         self.restoring=False
-        if not session:self.session_scope.setText('')
+        self.sync_history_filters()
+        if not session:
+            summary=data.get('summary',{})
+            self.session_scope.setText(f"환산액 {usd(summary.get('cost'))} · {summary.get('calls',0):,}호출 · API 단가 기준 · 청구액 아님")
         residual=(session or {}).get('unclassified');self.residual_details.setVisible(bool(residual))
         if residual:self.residual_details.set_sections([('별도 누계', ' · '.join(f'{name} {number(residual.get(key))}' for key,name in (('input','입력'),('cached','캐시 읽기'),('written','캐시 쓰기'),('output','출력'),('reasoning','추론'),('total','Total')))),('집계','호출·요청 통계에 포함하지 않음')])
         if session:
-            group=session_costs(self.analysis['sessions'],own_costs(scope_rows))[self.selected_session]
+            group=data['group']
             cost=('확인분 ' if group['partial'] and group['cost'] is not None else '')+usd(group['cost'])
             detail=(f" · 자체 {usd(group['own_cost'])} + 하위 {usd(group['child_cost'])}"
                     if group['descendants'] else '')
             project=session.get('project_name') or Path(session.get('cwd','')).name or tr('프로젝트 없음')
             count=('산정 ' if group['priced']<group['calls'] else '')+call_count(group['priced'],group['calls'])+'호출'
             self.session_scope.setText(Verbatim(project+' · '+tr(self.period.currentText() if not ctx else '전체 기록')+'\n'+tr(f"비용 {cost}{detail} · {count}")))
-        if self.record_view=='sessions':
-            records=self.session_records(rows,matching)
-            count_header='산정 / 전체 호출' if any(r['known']<r['calls'] for r in records) else '호출 수'
-            headers=['세션명','프로젝트','작업 종류','비용 · 하위 포함',count_header,'캐시 적중률','최근 기록 시각'];self.table.put(leftColumns=[0,1,2,6])
-            formatter=lambda r,c,role:[r['title'],r['project'],r['source'],('확인분 ' if r['partial'] and r['cost'] is not None else '')+usd(r['cost']),call_count(r['known'],r['calls']),value_text(r['cache_ratio'],'cache_ratio'),date_time(r['ts'])][c]
-            widths=[270,220,130,170,140,120,175]
-            if self.width()-248<1000:
-                headers=['세션명 · 프로젝트 · 작업 종류','비용 · 하위 포함',count_header,'최근 기록 시각'];widths=[310,190,140,175];self.table.put(rowHeight=60,leftColumns=[0,3])
-                formatter=lambda r,c,role:[Verbatim(tr(r['title'])+'\n'+tr(r['project'])+' · '+tr(r['source'])),('확인분 ' if r['partial'] and r['cost'] is not None else '')+usd(r['cost']),call_count(r['known'],r['calls']),date_time(r['ts'])][c]
-            else:self.table.put(rowHeight=40)
+        if self.record_view in ('projects','sessions','children'):
+            headers=['프로젝트' if self.record_view=='projects' else '세션','요청 / 호출','환산액 · 하위 포함','캐시 적중률','최근 활동'];widths=[260,110,140,110,155]
+            self.table.put(leftColumns=[0,4],rowHeight=56)
+            if wide:headers+=['입력','출력'];widths+=[110,110]
+            def formatter(r,c,role,view=self.record_view):
+                title=r['title']
+                if view=='projects':title+=f"\n작업 {r['roots']} · 하위 {r['children']}"
+                elif r.get('descendants'):title+=f"\n하위 {r['descendants']}"
+                return [Verbatim(title),f"{r.get('requests',0)} / {r.get('calls',0)}",('확인분 ' if r.get('partial') and r.get('cost') is not None else '')+usd(r.get('cost')),value_text(r.get('cache_ratio'),'cache_ratio'),date_time(r.get('ts')),number(r.get('input')),number(r.get('output'))][c]
         elif self.record_view=='requests':
-            visible_turns={r.get('turn') for r in rows}
-            records=[dict(t,call_mean=stats(t.get('calls',[]),'cost')['mean']) for t in self.lookup['session_turns'].get(self.selected_session,[]) if t.get('turn') in visible_turns]
-            unlinked=[r for r in rows if not r.get('turn')]
-            if unlinked:
-                records.append(dict(home=self.selected_session[0],sid=self.selected_session[1],turn='__unlinked__',state=f'요청 미연결 {len(unlinked):,}호출',responses=len(unlinked),cost=sum_cost(unlinked)['cost'],call_mean=stats(unlinked,'cost')['mean'],ts=max(r['ts'] for r in unlinked)))
-            headers=['요청 시작','완료 시각','상태','선택 / 전체 호출','비용','평균 호출 비용'];widths=[175,175,160,140,160,160];self.table.put(leftColumns=[0,1,2],rowHeight=40)
+            headers=['요청 · 시작','상태','소요시간','선택 / 전체 호출','환산액'];widths=[260,110,110,130,140];self.table.put(leftColumns=[0,1],rowHeight=48)
+            if wide:headers+=['완료 시각','입력 / 출력','캐시 적중률'];widths+=[155,130,100]
             def formatter(r,c,role):
                 whole=r.get('total_responses',r.get('responses',0))
-                return [date_time(r.get('started_at')),date_time(r.get('ended_at')),r.get('state') or '완료 기록 없음',f"{r.get('responses',0):,} / {whole:,}",usd(r.get('cost')),usd(r.get('call_mean'))][c]
+                return [f"요청 {r.get('ordinal') or '미연결'} · "+date_time(r.get('started_at')),r.get('state') or '완료 기록 없음',value_text(r.get('duration'),'duration'),f"{r.get('responses',0):,} / {whole:,}",usd(r.get('cost')),date_time(r.get('ended_at')),number(r.get('input'))+' / '+number(r.get('output')),value_text(r.get('rate'),'cache_ratio')][c]
         else:
-            records=list(rows);self.table.put(leftColumns=[0,1,2,3],rowHeight=40)
-            if self.outside.isChecked() and self.selected_turn and self.selected_session:
-                whole=self.lookup.get('whole_turns',{}).get((*self.selected_session,self.selected_turn),[]);keys={identity(r) for r in records}
-                records += [dict(r,_outside=True) for r in whole if identity(r) not in keys]
-            available={key for key,title in EXTRA_COLUMNS if any(recorded(r.get(key)) for r in records)}
-            for key,node in self.extra_column_controls.items():node.setVisible(key in available)
-            self.active_columns=CALL_COLUMNS+[c for c in EXTRA_COLUMNS if c[0] in available and self.extra_column_controls[c[0]].isChecked()]
-            headers=[title for key,title in self.active_columns];widths=[175,200,90,110,140,110]+[150]*(len(headers)-len(CALL_COLUMNS))
+            self.table.put(leftColumns=[0,1],rowHeight=56)
+            available=set(data['available'])
+            for key,node in self.extra_column_controls.items():node.setVisible(key in available and key not in {k for k,_ in CALL_COLUMNS})
+            self.active_columns=CALL_COLUMNS+[c for c in EXTRA_COLUMNS if c[0] not in {key for key,_ in CALL_COLUMNS} and c[0] in available and (self.extra_column_controls[c[0]].isChecked() or wide and c[0]=='output_speed')]
+            headers=[title for key,title in self.active_columns];widths=[155,220,100,95,95,105,95]+[150]*(len(headers)-len(CALL_COLUMNS))
             formatter=self.response_cell
-        sorting=self.sort.currentData();key='cost' if sorting.startswith('cost') else 'ts';descending=sorting.endswith('desc')
-        records.sort(key=lambda r:(r.get(key) is None,-r[key] if descending and isinstance(r.get(key),(int,float)) else r.get(key,0)))
         if headers!=self.table.model().headers:
             self.table.setHorizontalHeaderLabels(headers)
-            for i,width in enumerate(widths):self.table.setColumnWidth(i,width)
-        numeric={'비용 · 하위 포함','비용','평균 호출 비용','호출 수','산정 / 전체 호출','캐시 적중률','선택 / 전체 호출','입력','캐시 읽기','캐시 쓰기','출력','추론','추론 외','평균 출력 속도'}
+            self.table.put(widths=widths)
+        self.table.put(columnStretchWeights=[3]+[1]*(len(headers)-1))
+        numeric={'환산액','환산액 · 하위 포함','소요시간','비용 · 하위 포함','비용','평균 호출 비용','호출 수','산정 / 전체 호출','캐시 적중률','선택 / 전체 호출','입력','캐시 읽기','캐시 쓰기','출력','추론','추론 외','평균 출력 속도'}
         self.table.put(noElideColumns=[i for i,title in enumerate(headers) if title in numeric])
-        self.record_rows=records;self.table.set_rows(records,formatter)
-        self.render_record_parent(scope_rows)
+        self.record_rows=self.table.set_window(data['records'],formatter,(self.record_view,tuple(headers)))
+        self.render_record_parent(data)
         self.update_navigation()
         if ctx and ctx.get('sid') and session is None:self.record_status='대상 기록을 찾을 수 없음'
         elif not records:self.record_status='조건에 맞는 기록 없음' if self.snapshot['sessions'] else '사용 기록 없음'
         if self.selected_event:self.render_event_detail()
         elif self.selected_call:
-            scope=self.selected_call_scope or self.selected_session
-            selected_identity=identity(self.exact_record) if self.exact_record else (*scope,self.selected_call) if scope else None
-            found=next((r for r in scope_rows if identity(r)==selected_identity),None)
-            if found:self.exact_record=found;self.render_record_detail(found)
-            elif not self.exact_record:self.request_exact_record()
-            if self.exact_record and not any(identity(r)==identity(self.exact_record) for r in records):self.record_status='기록 갱신으로 현재 조건에서 제외됨'
+            self.exact_record=data['detail']
+            if self.exact_record:self.render_record_detail(self.exact_record)
+            else:self.request_exact_record()
+            if self.exact_record and not data['detail_in_scope']:self.record_status='기록 갱신으로 현재 조건에서 제외됨'
         else:self.detail_scroll.hide()
         self.record_message.setText(self.record_status);self.layout_record_detail()
 
@@ -1257,7 +1311,9 @@ class Dashboard(TrayWindow):
             if key=='model':
                 basis='실제 요청 기록' if row.get('model_source')=='wire' else '당시 로컬 요청 설정' if row.get('model_source')=='settings' else '모델 기록 없음'
                 return '\n'.join(x for x in [basis,model_comparison(row),*record_issues(row)] if x)
-        if key=='model' and model_comparison(row):return f"{value} ({row['model_match']})"
+        if key=='model':
+            model=str(value or '—')+(f" ({row['model_match']})" if model_comparison(row) else '')
+            return Verbatim(model+'\n'+str(row.get('effort') or '—')+' · '+request_tier(row))
         if key=='ts':return date_time(value)
         if key=='cost':return usd(value) if value is not None else '미산정'
         if key=='cache_ratio':return value_text(cache_ratio(row),'cache_ratio')
@@ -1272,6 +1328,9 @@ class Dashboard(TrayWindow):
     def activate_record(self,index,*_):
         if not 0<=index<len(self.record_rows):return
         row=self.record_rows[index]
+        if row.get('_placeholder'):return
+        if self.record_view in ('projects','sessions','children'):
+            self.enter_history(row);return
         if self.record_view=='sessions':
             self.push_state();self.selected_session=(row['home'],row['sid']);self.selected_turn=None;self.record_view='requests';self.render_explorer()
         elif self.record_view=='requests':
@@ -1420,10 +1479,13 @@ class Dashboard(TrayWindow):
     def layout_record_detail(self):
         active=bool(self.selected_call or self.selected_event) and self.detail_scroll.isVisible()
         self.close_record_button.setVisible(active and self.current_page==2)
-        wide=self.width()-248>=1280
-        self.table.setVisible(not active or wide);self.detail_scroll.put(width=520 if wide else -1,minWidth=520 if wide else 0,maxWidth=520 if wide else 16777215,stretch=0 if wide else 1)
-        self.record_parent.setVisible(not active);self.record_current.setVisible(self.table.isVisible())
-        self.record_pair.setVisible(self.table.isVisible());self.record_pair.put(focusIndex=1 if active else -1)
+        wide=self.records_body.available_width>=1800
+        if wide!=getattr(self,'_history_wide',False):
+            self._history_wide=wide
+            if self.current_page==2 and self.view_result and 'explorer' in self.view_result and not self.analysis_pending:QTimer.singleShot(0,self.apply_explorer)
+        self.records_body.put(detailed=active,routeToken=str((self.record_view,self.selected_session,self.selected_turn)))
+        self.table.setVisible(not active or wide);self.detail_scroll.put(width=-1,minWidth=0,maxWidth=16777215,stretch=1)
+        self.record_parent.setVisible(True);self.record_current.setVisible(self.table.isVisible())
     def render_diagnostics(self):
         if not hasattr(self,'diagnostics'):return
         index=self.snapshot.get('index',{});errors=self.snapshot.get('usage_errors',self.snapshot.get('errors',[]))

@@ -102,7 +102,7 @@ def test_process_queries_latest_selection_cache_and_clean_shutdown(tmp_path):
         w.source.setCurrentIndex(w.source.findData('subagent'))
         w.source.setCurrentIndex(0)
         w.nav.setCurrentRow(2); settle()
-        assert w.parent_kind=='sessions' and w.parent_table.rowCount()==1
+        assert w.record_view=='projects' and w.table.rowCount()==1 and w.selected_session is None
         assert w.worker.process.pid is not None
         assert not w.analysis_errors
         count=w.worker_metrics['view_builds']
@@ -121,7 +121,7 @@ def test_process_queries_latest_selection_cache_and_clean_shutdown(tmp_path):
             app.processEvents();QTest.qWait(40)
             if w.snapshot['data_revision']>old_revision and not w.analysis_pending: break
             QTest.qWait(10)
-        assert len(w.analysis['responses'])==8
+        assert w.analysis['response_count']==8
         assert w.worker_metrics['priced_calls']==priced+1
         assert not w.analysis_errors
         # Only the worker created by this test is terminated; it must recover the latest snapshot.
@@ -134,7 +134,7 @@ def test_process_queries_latest_selection_cache_and_clean_shutdown(tmp_path):
                 break
             QTest.qWait(20)
         assert w.worker.process.pid!=old_pid
-        assert not w.analysis_errors and len(w.analysis['responses'])==8
+        assert not w.analysis_errors and w.analysis['response_count']==8
     finally:
         w.quitting=True; w.tick.stop()
         w.worker.requestInterruption()
@@ -163,3 +163,101 @@ def test_hidden_dashboard_defers_all_page_refreshes(tmp_path,monkeypatch):
         assert calls==['quota'] and not w._display_dirty
     finally:
         w.quitting=True;w.tick.stop();w.tray.hide();w.close()
+
+
+def test_active_session_parts_survive_more_sessions_than_query_lru():
+    source=history()
+    sessions=[dict(source,id=f'session-{i}',home=f'home-{i}') for i in range(2200)]
+    engine=AnalysisEngine();engine.ingest(sessions)
+    first=engine.query(query(page=2,include_whole_history=False))
+    builds=engine.metrics['part_builds']
+    second=engine.query(query(page=2,now=111,end=111,include_whole_history=False))
+    assert engine.metrics['part_builds']==builds
+    assert second['analysis']['totals']==first['analysis']['totals']
+
+
+def test_dashboard_projection_bounds_rows_and_preserves_drilldown():
+    import pickle
+    from cachemonitor.dashboard_views import resolve_population
+    source=history()
+    sessions=[dict(source,id=f's-{i}',home=f'home-{i}',title=f'Session {i}') for i in range(800)]
+    engine=AnalysisEngine();engine.ingest(sessions)
+    overview=engine.page_query(query(page=0,presentation=True))
+    assert overview['analysis']['response_count']==5600
+    assert 'responses' not in overview['analysis']
+    assert len(pickle.dumps(overview))<200_000
+    summary=overview['summaries'][0]
+    records=resolve_population(engine,summary['population'])
+    assert sum(r['cost'] for r in records)==pytest.approx(overview['overview']['total'])
+    q=query(page=2,presentation=True,explorer=dict(view='calls',search='',sort='cost_desc'),
+        table_windows={'records':{'start':500,'size':128},'parents':{'start':0,'size':64}})
+    from cachemonitor.history_projection import node_key
+    from cachemonitor.analytics import project_identity
+    q['explorer']['expanded']=[node_key('project',project_identity(source))]
+    projected=engine.page_query(q)['explorer']
+    assert projected['records']['total']==5600
+    assert projected['records']['start']==500 and len(projected['records']['rows'])==128
+    assert len(projected['parents']['rows'])==64
+    assert all('calls' not in row or not isinstance(row['calls'],list) for row in projected['records']['rows'])
+    q['explorer']['search']='Session 42'
+    found=engine.page_query(q)['explorer']
+    assert all('Session 42' in r['title'] for r in found['records']['rows'])
+    assert found['records']['total']<5600
+
+
+def test_worker_discards_superseded_result_before_sending(monkeypatch):
+    from cachemonitor import analysis_worker
+    source=history()
+    snapshot=dict(ts=110,sessions=[source],homes=[],errors=[],unassigned=[],index={'loading':False})
+    messages=[dict(kind='query',id=1,logical='first',query=query(page=2))];sent=[]
+    original=AnalysisEngine.page_query
+    def compute(self,q):
+        result=original(self,q)
+        if not any(m.get('id')==2 for m in messages) and not getattr(self,'tested_supersession',False):
+            self.tested_supersession=True
+            messages.append(dict(kind='query',id=2,logical='latest',query=query(page=0)))
+        return result
+    monkeypatch.setattr(AnalysisEngine,'page_query',compute)
+    class Connection:
+        def poll(self,*args):return bool(messages)
+        def recv(self):return messages.pop(0)
+        def send(self,value):
+            sent.append(value)
+            if value['kind']=='result':messages.append({'kind':'stop'})
+        def close(self):pass
+    analysis_worker.process_main(Connection(),[],None,static_snapshot=snapshot)
+    assert [m['id'] for m in sent if m['kind']=='result']==[2]
+
+
+def test_projected_cache_expires_at_sliding_boundary_and_metadata_revision():
+    engine=AnalysisEngine();source=history();engine.ingest([source])
+    q=query(page=2,presentation=True,period='30m',start=99,end=1899,now=1899)
+    first=engine.page_query(q)
+    assert first['analysis']['response_count']==7
+    assert engine.page_query({**q,'now':1899.5,'end':1899.5,'start':99.5}) is first
+    later={**q,'now':1900.1,'end':1900.1,'start':100.1}
+    assert engine.page_query(later)['analysis']['response_count']==6
+    source=copy.deepcopy(source);source['title']='Renamed session';engine.ingest([source])
+    renamed=engine.page_query(later)
+    assert renamed['revision']!=first['revision']
+    from cachemonitor.history_projection import node_key
+    from cachemonitor.analytics import project_identity
+    expanded={**later,'explorer':{'view':'sessions','project':project_identity(source)}}
+    assert engine.page_query(expanded)['explorer']['records']['rows'][0]['title']=='Renamed session'
+    engine.ingest([])
+    assert engine.page_query(later)['analysis']['response_count']==0
+
+
+def test_projected_partial_bucket_updates_without_reaggregating():
+    engine=AnalysisEngine();source=history()
+    epoch=datetime(2026,9,14,12).timestamp()
+    for row in source['history']:row['ts']+=epoch
+    for row in source['turn_records'].values():
+        for key in ('started_at','ended_at'):row[key]+=epoch
+    engine.ingest([source])
+    q=query(page=0,presentation=True,now=epoch+110,end=epoch+110)
+    first=engine.page_query(q);builds=engine.metrics['view_builds']
+    second=engine.page_query({**q,'now':epoch+111,'end':epoch+111})
+    assert engine.metrics['view_builds']==builds
+    assert second['overview']['timeline'][-1]['end_ts']==epoch+111
+    assert second['overview']['total']==first['overview']['total']

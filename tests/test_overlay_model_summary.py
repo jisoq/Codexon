@@ -127,12 +127,12 @@ def test_new_call_clears_old_comparison_then_uses_its_own_completed_evidence(obs
     fixture.refresh()
     latest = '모델 일치 (gpt-5.6-luna)'
     assert model.context()[0] == latest
-    assert latest in detail_values(model) and fixture.widget.toolTip() == latest
+    assert latest in detail_values(model) and fixture.widget.toolTip() == ''
     # Inspecting an older call changes only the call-detail comparison.
     model.detailGraph.key(Qt.Key_Home)
     assert model.selected()['key'] == 'old-call'
     assert old in detail_values(model)
-    assert model.context()[0] == latest and fixture.widget.toolTip() == latest
+    assert model.context()[0] == latest and fixture.widget.toolTip() == ''
 
 
 def test_long_model_names_are_complete_and_wrapped_in_detail(observed_overlay, tmp_path):
@@ -146,17 +146,18 @@ def test_long_model_names_are_complete_and_wrapped_in_detail(observed_overlay, t
     model = widget.content_model
     expected = f'모델 불일치 (요청:{requested}, 응답:{response})'
     assert expected in widget.accessibleName()
-    assert widget.toolTip() == expected
-    assert fixture.header.toolTip() == expected
+    assert widget.toolTip() == ''
+    assert fixture.header.toolTip() == ''
     assert ''.join(model.context_rows()) == expected
     top_metrics = QFontMetrics(font(model.appearance.family, 12))
     assert len(model.context_rows()) > 1
     assert all(top_metrics.horizontalAdvance(line) <= 348 for line in model.context_rows())
-    assert model.layout()['cache'] >= 48 + len(model.context_rows()) * 18 + 18
-    assert model.layout()['height'] >= model.layout()['status'] + 32
-    cache_link = next(link for link in model.monitor_links() if link['id'] == 'cache')
-    assert cache_link['y'] == model.layout()['cache'] + 20
-    assert cache_link['y'] + cache_link['height'] <= model.layout()['recent']
+    assert model.base_height()==574  # The unpriced-call note adds one row; long model names add none.
+    assert model.layout()['height'] >= model.layout()['status'] + 28
+    model.monitor_action('tab-latest')
+    detail_link = next(link for link in model.monitor_links() if link['id'] == 'call-detail')
+    assert detail_link['y'] == model.layout()['tab']
+    assert not any(link['id'] in ('cache','cost','speed','latest-context') for link in model.monitor_links())
     item = next(item for item in model.detail_items()
                 if (''.join(item[0]) if isinstance(item[0], list) else item[0]) == expected)
     assert isinstance(item[0], list) and len(item[0]) > 1

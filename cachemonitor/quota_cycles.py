@@ -225,11 +225,12 @@ def _clip_quota_interval(cycle, start=None, end=None):
     alternatives=[token_cost({**r,'service_tier':'Standard'})['cost'] if r['service_tier']=='미확인'
                   else r['cost'] for r in eligible]
     pending=[at for at in cycle.get('pending_usage_times',[]) if lo<at<=hi]
-    return {**cycle,'pending_usage_times':pending,'pending_usage_calls':len(pending),
+    complete = (cycle['cost_complete_at'] is not None and cycle['cost_complete_at'] >= hi) if 'cost_complete_at' in cycle else cycle.get('cost_complete', False)
+    return {**cycle,'cost_complete':complete,'pending_usage_times':pending,'pending_usage_calls':len(pending),
             'start':lo,'end':hi,'delta':endpoints[-1][1]-endpoints[0][1],'models':models,
             'endpoints':endpoints,'cost_rows':rows,'used_start':endpoints[0][1],'used_end':endpoints[-1][1],
             'cost':(sum(r['cost'] for r in eligible if r['cost'] is not None) if any(r['cost'] is not None for r in eligible)
-                    else 0 if not eligible and cycle.get('cost_complete') and not pending else None)
+                    else 0 if not eligible and complete and not pending else None)
                    if cycle.get('forward_tracking') else
                    sum(r['cost'] for r in eligible) if eligible and all(r['cost'] is not None for r in eligible) else None,
             'priced_calls':sum(r['cost'] is not None for r in eligible),
@@ -418,7 +419,7 @@ def quota_value_history(report, rows):
                 delta = max(0, used-endpoints[0][1])
                 pending = any(t <= at for t in interval.get('pending_usage_times', []))
                 cost = (subtotal if priced else 0 if not position and
-                        interval.get('cost_complete') and not pending else None)
+                        ((interval['cost_complete_at'] is not None and interval['cost_complete_at'] >= at) if 'cost_complete_at' in interval else interval.get('cost_complete')) and not pending else None)
                 if not forward and (missing or not priced):
                     cost = None
                 if at == interval['end']:
@@ -635,7 +636,17 @@ class QuotaLedger:
                 self.db.execute('insert or replace into mode_scan values(?,?,?)',(home,latest,self.mode_backfill.get(home,0)))
             except sqlite3.Error:pass
         self.db.commit()
-        for session in snapshot['sessions']:
+        previous=getattr(self,'_enriched_sessions',{})
+        enriched={};sessions=[]
+        for source in snapshot['sessions']:
+            key=(source['home'],source['id'])
+            revision=self.mode_revisions.get(key,0)
+            old=previous.get(key)
+            if old and old[0] is source['history'] and old[1]==revision:
+                session={**source,'history':old[2],
+                    'usage_revision':(source.get('usage_revision'),revision)}
+                enriched[key]=old;sessions.append(session);continue
+            session={**source,'history':[dict(row) for row in source['history']]}
             for row in session['history']:
                 recorded=row.setdefault('_record_service_tier',request_tier(row))
                 evidence=self.mode_evidence.get((session['home'],session['id'],row.get('turn')))
@@ -650,6 +661,9 @@ class QuotaLedger:
                 elif row.get('service_tier_source')=='settings':row['service_tier']=explicit or recorded
                 else:row['service_tier']=recorded if recorded!='미확인' else explicit or '미확인'
             session['usage_revision']=(session.get('usage_revision'),self.mode_revisions.get((session['home'],session['id']),0))
+            enriched[key]=(source['history'],revision,session['history']);sessions.append(session)
+        self._enriched_sessions=enriched
+        snapshot['sessions']=sessions
 
     def observe(self, home, quota, commit=True):
         for name, observed_window in (quota or {}).get('windows', {}).items():
@@ -731,23 +745,30 @@ class QuotaLedger:
             if usage_errors is None:
                 usage_errors=[error for error in snapshot.get('errors',[])
                               if '기록 읽기' in error or '세션 목록' in error or '일부 기록 형식' in error]
-            self.db.execute('delete from coverage_issues where home=?', (home,))
-            for session in snapshot['sessions']:
-                if session['home'] != home:
-                    continue
-                history = session.get('history', [])
-                times = [r['ts'] for r in history if r.get('ts') is not None]
-                if session.get('unclassified') and not session.get('coverage_available'):
+            signatures=getattr(self,'_coverage_signatures',{})
+            relevant=[s for s in snapshot['sessions'] if s['home']==home]
+            signature=(tuple(usage_errors),tuple((s.get('id',''),repr(s.get('usage_revision')) if s.get('usage_revision') is not None else tuple(r.get('ts') for r in s.get('history',[])),
+                bool(s.get('unclassified')),s.get('coverage_available'),repr(s.get('coverage_gaps',[]))) for s in relevant))
+            if signatures.get(home)!=signature:
+                self.db.execute('delete from coverage_issues where home=?', (home,))
+                for session in snapshot['sessions']:
+                    if session['home'] != home:
+                        continue
+                    history = session.get('history', [])
+                    times = [r['ts'] for r in history if r.get('ts') is not None]
+                    if session.get('unclassified') and not session.get('coverage_available'):
+                        self.db.execute('insert or replace into coverage_issues values(?,?,?,?,?)',
+                                        (home,session.get('id',''),min(times) if times else None,
+                                         max(times) if times else None,'참고: 누계 차액의 발생 경계 미확인'))
+                    for gap in session.get('coverage_gaps', []):
+                        self.db.execute('insert or replace into coverage_issues values(?,?,?,?,?)',
+                                        (home, session.get('id',''),gap['start'],gap['end'],
+                                         f"누계 차액 증가 {gap['tokens']}토큰 · {gap['start']}"))
+                if usage_errors:
                     self.db.execute('insert or replace into coverage_issues values(?,?,?,?,?)',
-                                    (home,session.get('id',''),min(times) if times else None,
-                                     max(times) if times else None,'참고: 누계 차액의 발생 경계 미확인'))
-                for gap in session.get('coverage_gaps', []):
-                    self.db.execute('insert or replace into coverage_issues values(?,?,?,?,?)',
-                                    (home, session.get('id',''),gap['start'],gap['end'],
-                                     f"누계 차액 증가 {gap['tokens']}토큰 · {gap['start']}"))
-            if usage_errors:
-                self.db.execute('insert or replace into coverage_issues values(?,?,?,?,?)',
-                                (home, '', None, None, '로컬 호출 기록 읽기 실패: '+' · '.join(usage_errors)))
+                                    (home, '', None, None, '로컬 호출 기록 읽기 실패: '+' · '.join(usage_errors)))
+                signatures[home]=signature
+                self._coverage_signatures=signatures
             unclassified = sum(bool(s.get('unclassified')) for s in snapshot['sessions'] if s['home'] == home)
             index=snapshot.get('index',{})
             loading=bool(index.get('loading'))
@@ -1038,7 +1059,7 @@ class QuotaLedger:
                 'boundary_uncertain':group.get('boundary_uncertain',False),
                 'boundary_excluded_calls':boundary_excluded,
                 'priced_calls':priced_count,
-                'cost_complete':cost_complete,
+                'cost_complete':cost_complete, 'cost_complete_at':completed_at,
                 'pending_usage_calls':len(pending_usage_times),
                 'pending_usage_times':pending_usage_times,
                 'cost_rows':[{**{k:r[k] for k in ('uid','ts','model','service_tier','cost',*TOKEN_FIELDS)},

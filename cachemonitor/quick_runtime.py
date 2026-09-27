@@ -4,8 +4,8 @@ QWidget is used only as the Windows native host (tray/window ownership). Every
 application control and view inside the host is rendered by Qt Quick.
 """
 from pathlib import Path
-from PySide6.QtCore import QObject, Property, Signal, Slot, QUrl, Qt, QTimer
-from PySide6.QtGui import QFont, QPainter, QColor, QPen
+from PySide6.QtCore import QObject, Property, Signal, Slot, QUrl, Qt, QTimer, QRectF
+from PySide6.QtGui import QFont, QPainter, QColor, QPen, QImage
 from PySide6.QtQml import qmlRegisterType
 from PySide6.QtQuick import QQuickPaintedItem
 from PySide6.QtQuickWidgets import QQuickWidget
@@ -22,18 +22,25 @@ class QuickPlot(QQuickPaintedItem):
         super().__init__(parent);self._source=None;self._tip='';self._hover=None;self._hover_index=-1
         self._detail={};self._detail_pinned=False;self._detail_x=0;self._detail_y=0
         self.setAntialiasing(True)
-        self.activeFocusChanged.connect(self.update)
+        self._static_image=None;self._static_key=None
+        self.activeFocusChanged.connect(self.invalidate)
     @Property(QObject,notify=sourceChanged)
     def source(self):return self._source
     @source.setter
     def source(self,value):
         if self._source is value:return
-        if self._source:self._source.changed.disconnect(self.update)
+        if self._source:self._source.changed.disconnect(self.invalidate)
         self._source=value
-        if value:value.changed.connect(self.update)
-        self.sourceChanged.emit();self.update()
+        if value:value.changed.connect(self.invalidate)
+        self.sourceChanged.emit();self.invalidate()
     @Property(str,notify=tipChanged)
     def tip(self):return self._tip
+    @Property(QRectF,notify=tipChanged)
+    def hoverRect(self):
+        if self._source and not hasattr(self._source,'set_inspection') and 0<=self._hover_index<len(self._source.hits):
+            return self._source.hits[self._hover_index][0]
+        return QRectF()
+
     @Property(int,notify=tipChanged)
     def hoverIndex(self):return self._hover_index
     @Property('QVariantMap',notify=detailChanged)
@@ -50,23 +57,37 @@ class QuickPlot(QQuickPaintedItem):
         self.detailChanged.emit()
     @Slot()
     def dismissDetail(self):self.set_detail({},0,0)
+    def invalidate(self):
+        self._static_image=None
+        self.update()
+
     def paint(self,painter):
         if self._source:
             from .i18n import LocalizedPainter
             self._source._paint_width=int(self.width());self._source._paint_height=int(self.height())
-            self._source._focused=self.hasActiveFocus();self._source._painter=LocalizedPainter(painter)
-            self._source.paint(painter)
+            self._source._focused=self.hasActiveFocus()
+            dpr=self.window().devicePixelRatio() if self.window() else 1.
+            key=(int(self.width()),int(self.height()),dpr,self.hasActiveFocus())
+            if not hasattr(self._source,'set_inspection') and key[0]>0 and key[1]>0:
+                if self._static_image is None or self._static_key!=key:
+                    image=QImage(max(1,round(key[0]*dpr)),max(1,round(key[1]*dpr)),QImage.Format_ARGB32_Premultiplied)
+                    image.setDevicePixelRatio(dpr);image.fill(Qt.transparent)
+                    cached_painter=QPainter(image)
+                    try:
+                        self._source._painter=LocalizedPainter(cached_painter)
+                        self._source.paint(cached_painter)
+                    finally:
+                        cached_painter.end();self._source._painter=None
+                    self._static_image=image;self._static_key=key
+                painter.drawImage(0,0,self._static_image)
+            else:
+                self._source._painter=LocalizedPainter(painter)
+                self._source.paint(painter)
             if self._detail_pinned and hasattr(self._source,'refresh_detail'):
                 current=self._source.refresh_detail(self._detail)
                 if current!=self._detail:
                     self._detail=current;self.detailChanged.emit()
                     if hasattr(self._source,'set_inspection'):self._source.set_inspection(current,self._detail_x,self._detail_y)
-            from .theme import shared_theme
-            if self._hover is not None and not hasattr(self._source,'set_inspection'):
-                hit=next((rect for rect,row,tip in reversed(self._source.hits) if rect.contains(self._hover)),None)
-                if hit is not None:
-                    color=QColor(shared_theme().palette['accent']);color.setAlpha(24)
-                    painter.fillRect(hit,color);color.setAlpha(150);painter.setPen(QPen(color,1));painter.setBrush(Qt.NoBrush);painter.drawRect(hit.adjusted(1,1,-1,-1))
             self._source._painter=None
     @Slot(float,float)
     def activateAt(self,x,y):
@@ -77,16 +98,18 @@ class QuickPlot(QQuickPaintedItem):
     def showTip(self,x,y):
         from PySide6.QtCore import QPointF
         point=QPointF(x,y)
-        index=next((i for i,(rect,row,tip) in reversed(list(enumerate(self._source.hits))) if rect.contains(point)),-1) if self._source else -1
+        index=next((i for i in range(len(self._source.hits)-1,-1,-1) if self._source.hits[i][0].contains(point)),-1) if self._source else -1
         self._hover=point
-        if index!=self._hover_index:self._hover_index=index;self.tipChanged.emit();self.update()
-        value=self._source.tip_at(x,y) if self._source else ''
+        if index!=self._hover_index:self._hover_index=index;self.tipChanged.emit()
+        from .charts import Plot
+        value=(self._source.tip_at(x,y) if type(self._source).tip_at is not Plot.tip_at
+               else self._source.hits[index][2] if index>=0 else '') if self._source else ''
         if self._tip!=value:self._tip=value;self.tipChanged.emit()
         if self._source and hasattr(self._source,'detail_at') and not self._detail_pinned:
             self.set_detail(self._source.detail_at(x,y),x,y)
     @Slot()
     def clearHover(self):
-        self._hover=None;self._hover_index=-1;self._tip="";self.tipChanged.emit();self.update()
+        self._hover=None;self._hover_index=-1;self._tip="";self.tipChanged.emit()
         if not self._detail_pinned:self.dismissDetail()
     @Slot(int)
     def key(self,key):

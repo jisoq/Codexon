@@ -176,10 +176,15 @@ class QuotaPanel(Group):
         self.history=QuotaHistory()
         self.history.selected.connect(self.select_observation)
         self.history_legend=Row();self.history_legend.put(flow=True,alignRight=True);self.history_legend.setSpacing(16)
+        self.legend_toggles={}
         for name,color in (('━ 잔여량 · %','cached'),('━ 누적 API 환산액 · USD','output'),
                            ('━ 완료 구간별 API 환산액 · USD','completed'),
                            ('┄ 주간 동등 가치 · USD','written'),('╌ 전체 누적 기준 · USD','accent')):
-            legend=Text(name);legend.put(fontSize=12,color=color);self.history_legend.addWidget(legend)
+            key={'cached':'remaining','output':'cycle_cost','completed':'completed_cost','written':'cycle_value','accent':'reference'}[color]
+            legend=Toggle(name);legend.setChecked(True)
+            legend.toggled.connect(lambda visible,k=key:self.history.set_series_visible(k,visible))
+            self.legend_toggles[key]=legend
+            legend.put(fontSize=12,color=color);self.history_legend.addWidget(legend)
             if name.startswith('━ 잔여량'):self.remaining_legend=legend
         self.reset_legend=Text('◆ 사용량 리셋');self.reset_legend.put(fontSize=12,color='muted')
         self.history_legend.addWidget(self.reset_legend)
@@ -358,7 +363,7 @@ class QuotaPanel(Group):
         self.history.money=weekly;self.history.reference=self.lifetime_value
         self.history.empty_text='표시할 사용 기록이 없습니다' if weekly else '수집된 잔여량이 없습니다'
         self.chart_title.setText('전체 사용량 추이' if weekly and all_cycles else '선택 주기의 사용량 추이' if weekly else '5시간 잔여량 추이')
-        self.remaining_legend.setText('━ 누적 소모량 · %p' if all_cycles else '━ 잔여량 · %')
+        self.remaining_legend.setText('━ 누적 소모량 · %p' if weekly and all_cycles else '━ 잔여량 · %')
         self.reset_legend.setVisible(weekly and all_cycles)
         self.history.set_series(series)
         models=series.get('model_share',{}).get('models',[])
@@ -383,7 +388,9 @@ class QuotaPanel(Group):
                                     ' · '+('산정 ' if period['priced_calls']<period['calls'] else '')+call_count(period['priced_calls'],period['calls'])+'호출')
         else:
             self.cycle_value.setText('선택 주기 —');self.cycle_basis.setText('관측된 사용량 리셋 주기가 없습니다')
-        for node in (self.cycle_choice,self.cycle_value,self.cycle_basis,self.history_legend):node.setVisible(weekly)
+        for node in (self.cycle_choice,self.cycle_value,self.cycle_basis):node.setVisible(weekly)
+
+        for key,toggle in self.legend_toggles.items():toggle.setVisible(weekly or key=='remaining')
 
     def select_observation(self,row):
         self.history.setAccessibleName(observation_label(row,self.history.money))

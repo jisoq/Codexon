@@ -47,7 +47,8 @@ def dashboard(tmp_path):
 
 def test_sequential_drilldown_and_full_call_detail(dashboard,tmp_path):
     w=dashboard;w.nav.setCurrentRow(2);QTest.qWait(40)
-    click_row(w,w.parent_table,0);assert w.record_view=='requests'
+    click_row(w,w.table,0);assert w.record_view=='sessions'
+    click_row(w,w.table,0);assert w.record_view=='requests'
     click_row(w,w.table,0);assert w.record_view=='calls'
     click_row(w,w.table,0);assert w.selected_call and w.detail_scroll.isVisible()
     assert not w.table.isVisible()  # body < 1280: one full-width detail
@@ -57,16 +58,16 @@ def test_sequential_drilldown_and_full_call_detail(dashboard,tmp_path):
     assert '1.50' in w.detail_sections['time'][1].text()
     assert '평균 출력 속도' in w.detail_sections['usage'][1].text()
     assert not w.detail_sections['evidence'][0].isVisible()
-    assert '입력  11,500' in w.detail_sections['usage'][1].text()
+    assert '입력  10,000' in w.detail_sections['usage'][1].text()
     assert [r['label'] for r in w.input_composition.rows[:3]]==['캐시 읽기','캐시 쓰기','일반 입력']
     assert [r['label'] for r in w.output_composition.rows[:2]]==['추론','추론 외']
     from cachemonitor.quick_qa import render_plot
     render_plot(w,w.output_composition)
     assert w.grab().save(str(tmp_path/'dashboard-token-hierarchy.png'))
     w.resize(1800,1000);QTest.qWait(50)
-    wide=w.width()-248>=1280
+    wide=w.records_body.available_width>=1800
     assert w.table.isVisible()==wide
-    assert w.detail_scroll.state['width']==(520 if wide else -1)
+    assert w.detail_scroll.state['width']==-1
     old=w.selected_call;w.receive(copy.deepcopy(w.snapshot));assert w.selected_call==old
     w.close_record_detail();assert w.table.isVisible()
     assert not w.qml_errors
@@ -74,7 +75,7 @@ def test_sequential_drilldown_and_full_call_detail(dashboard,tmp_path):
 
 @pytest.mark.parametrize('unlinked',[False,True])
 @pytest.mark.parametrize('all_unpriced',[False,True])
-def test_request_average_call_cost_in_both_tables_and_filtered_scope(dashboard,unlinked,all_unpriced):
+def test_request_statistics_in_current_level_and_filtered_scope(dashboard,unlinked,all_unpriced):
     from cachemonitor.pricing import usd
     w=dashboard
     if unlinked or all_unpriced:
@@ -87,15 +88,15 @@ def test_request_average_call_cost_in_both_tables_and_filtered_scope(dashboard,u
         w.receive(value)
     w.nav.setCurrentRow(2)
 
+    w.activate_record(0);w.activate_record(0)
     def check(node,rows):
-        model=node.model();column=model.headers.index('평균 호출 비용')
-        assert column==model.headers.index('비용')+1
+        assert '소요시간' in node.model().headers
         for index,row in enumerate(rows):
-            calls=[r for r in w.analysis['responses'] if (r['home'],r['sid'])==w.selected_session
+            calls=[r for r in w.engine.query(w.query())['analysis']['responses'] if (r['home'],r['sid'])==w.selected_session
                    and (not r.get('turn') if row['turn']=='__unlinked__' else r.get('turn')==row['turn'])]
             priced=[r['cost'] for r in calls if r['cost'] is not None]
             expected=sum(priced)/len(priced) if priced else None
-            assert model.data(model.index(index,column))==usd(expected)
+            assert row['call_mean']==expected
 
     for mode in ('','Standard'):
         choose(w.mode,mode);w.filter_changed()
@@ -105,9 +106,8 @@ def test_request_average_call_cost_in_both_tables_and_filtered_scope(dashboard,u
         assert (missing['call_mean'] is None)==all_unpriced
         if mode and not unlinked:
             assert missing['responses']==1 and missing['total_responses']==2
-        w.activate_record(0)
-        assert w.parent_kind=='requests'
-        check(w.parent_table,w.parent_rows)
+        assert w.parent_kind=='tree'
+        assert all('turn' not in r for r in w.parent_rows)
     assert not w.qml_errors
 
 
@@ -151,7 +151,8 @@ def test_preferences_restore_observed_dimensions_before_snapshot(dashboard,tmp_p
         assert second.model.currentData()=='gpt-6-astra' and second.effort.currentData()=='high'
         assert second.project.currentData()==project_key('V:/work/project-1')
         assert second.project.currentText()=='project-1'
-        assert len(second.analysis['responses'])==8
+        assert second.record_view=='projects' and second.selected_session is None
+        assert second.analysis['response_count']==24
     finally:second.quitting=True;second.tick.stop();second.tray.hide();second.observer_panel.stop();second.close()
 
 
@@ -160,6 +161,7 @@ def test_call_filter_is_accessible_from_normal_record_views(dashboard,within_ses
     w=dashboard;w.resize(1150,900);w.nav.setCurrentRow(2);QTest.qWait(30)
     if not within_session:
         w.selected_session=None;w.record_view='calls';w.render_explorer()
+    if within_session:w.activate_record(0);w.activate_record(0)
     scope=w.selected_session
     assert w.record_view==('requests' if within_session else 'calls')
     assert w.record_filters.isVisible()
@@ -167,19 +169,21 @@ def test_call_filter_is_accessible_from_normal_record_views(dashboard,within_ses
     checkbox=control(w,w.call_filter_controls['cache_zero'])
     assert checkbox.isVisible()
     click(w,checkbox)
-    assert w.record_view=='calls' and w.record_view_choice.currentData()=='calls'
-    assert w.selected_session==scope and len(w.record_rows)==(2 if within_session else 6)
-    assert all(r['cached']==0 for r in w.record_rows)
-    assert w.call_columns_row.isVisible()
+    assert w.record_view==('requests' if within_session else 'calls')
+    assert w.selected_session==scope and len(w.record_rows)==(1 if within_session else 6)
+    if within_session:
+        assert w.record_rows[0]['responses']==2
+    else:assert all(r['cached']==0 for r in w.record_rows)
     assert w.quick.grabFramebuffer().save(str(tmp_path/'call-filter.png'))
     click(w,control(w,w.call_filter_controls['cache_zero']))
-    assert len(w.record_rows)==(16 if within_session else 48)
+    assert len(w.record_rows)==(8 if within_session else 48)
     assert not w.qml_errors
 
 
 def test_call_detail_back_restores_same_call_list_before_request_list(dashboard):
     w=dashboard;w.resize(1150,900);w.nav.setCurrentRow(2);QTest.qWait(30)
     click_row(w,w.table,0)
+    click_row(w,w.table,0);click_row(w,w.table,0)
     before=[r['key'] for r in w.record_rows];turn=w.selected_turn;session=w.selected_session
     click_row(w,w.table,0)
     assert w.selected_call and not w.table.isVisible()

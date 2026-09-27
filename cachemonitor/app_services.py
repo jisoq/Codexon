@@ -121,7 +121,7 @@ class AppServices:
                 task=ObserverTask(str(channel.path),role='UsageCollector')
                 command=collector_command(channel)
                 retire_legacy(channel)
-                snapshot=channel.read()
+                snapshot=channel.read_header()
                 source=self.collector_identity(channel,snapshot)
                 version=((snapshot or {}).get('collection') or {}).get('version','')
                 newer=tuple(int(p) for p in version.split('.') if p.isdigit())>tuple(int(p) for p in VERSION.split('.') if p.isdigit())
@@ -161,7 +161,7 @@ class AppServices:
         channel=CollectionChannel(self.homes,self.index,self.evidence)
         try:
             with ProcessLock(channel.companion('.collector-update.lock')):
-                snapshot=channel.read()
+                snapshot=channel.read_header()
                 source=self.collector_identity(channel,snapshot)
                 stopped=read_json(channel.companion('.session.json'))
                 task=ObserverTask(str(channel.path),role='UsageCollector')
@@ -282,7 +282,7 @@ class AppServices:
             with ProcessLock(channel.companion('.collector-update.lock'),timeout=30):
                 from .collection_lifecycle import retire_legacy
                 retire_legacy(channel)
-                snapshot=channel.read()
+                snapshot=channel.read_header()
                 collection=(snapshot or {}).get('collection') or {}
                 lock=channel.companion('.collector.lock')
                 process=None

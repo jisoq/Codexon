@@ -155,6 +155,7 @@ jobs:
           python tools/prepare_sources.py --output dist-ci/release
           if ($LASTEXITCODE -ne 0) { throw 'Third-party source preparation failed.' }
           Copy-Item dist-ci/Codexon/build-manifest.json dist-ci/release/build-manifest.json
+          Copy-Item "docs/releases/$($env:RELEASE_TAG.Substring(1)).md" dist-ci/release/RELEASE_NOTES.md
       - name: Upload verified release assets
         if: inputs.publish
         uses: actions/upload-artifact@v7
@@ -194,8 +195,9 @@ jobs:
           sha256sum --check *.sha256
           test "$(jq -r .commit build-manifest.json)" = "$GITHUB_SHA"
           test "v$(jq -r .version build-manifest.json)" = "$RELEASE_TAG"
+          printf '\n\nSource: %s. Full verification: %s/%s/actions/runs/%s\n' "$GITHUB_SHA" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" >> RELEASE_NOTES.md
           gh release create "$RELEASE_TAG" Codexon-Setup.exe Codexon-Setup.exe.sha256 \
             Codexon-third-party-source-*.zip Codexon-third-party-source-*.zip.sha256 \
             --target "$GITHUB_SHA" --title "Codexon ${RELEASE_TAG#v}" --draft \
-            --notes "Source: $GITHUB_SHA. Full verification: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            --notes-file RELEASE_NOTES.md
           gh release edit "$RELEASE_TAG" --draft=false --latest

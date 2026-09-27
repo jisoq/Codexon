@@ -9,19 +9,60 @@ Rectangle {
     property real unitScale: s.overlayScale || 1
     property string selectedCall: s.detailSelected || ""
     onSelectedCallChanged: if (bodyScroll) bodyScroll.contentY = 0
-    property bool speedOpen: s.detailSpeedOpen || false
-    onSpeedOpenChanged: if (bodyScroll) bodyScroll.contentY = 0
     color: appTheme.palette.hit_surface
     clip: true
     Keys.onEscapePressed: event => { root.presentation.escapePanel(); event.accepted = true; }
 
+    Button {
+        id: openDashboard
+        objectName: "openDashboard"
+        x: 16 * root.unitScale; y: 12 * root.unitScale
+        width: implicitWidth; height: 28 * root.unitScale
+        enabled: root.s.detailHasSelection || false
+        text: appLanguage.text("호출 상세")
+        padding: 0
+        contentItem: Text {
+            text: openDashboard.text
+            font.family: root.s.overlayFamily || "Pretendard JP"
+            font.pixelSize: 14 * root.unitScale; font.weight: Font.DemiBold
+            color: openDashboard.enabled && (openDashboard.hovered || openDashboard.visualFocus) ? root.s.overlayAccent : root.s.overlayInk || appTheme.palette.ink
+            verticalAlignment: Text.AlignVCenter
+            font.underline: openDashboard.enabled && (openDashboard.hovered || openDashboard.visualFocus)
+        }
+        background: Rectangle { color: "transparent"; border.width: openDashboard.visualFocus ? 2 : 0; border.color: root.s.overlayAccent || appTheme.palette.accent }
+        Accessible.name: appLanguage.text("선택 호출의 전체 상세를 대시보드에서 열기")
+        onPressed: root.presentation.captureNavigation("selected")
+        onClicked: root.presentation.activateNavigation()
+        HoverHandler { cursorShape: openDashboard.enabled ? Qt.PointingHandCursor : Qt.ArrowCursor }
+    }
+    ToolButton {
+        id: closeDetail
+        objectName: "closeDetail"
+        x: ((root.s.detailWidth || 208) > 208 ? 290 : 204) * root.unitScale
+        y: 12 * root.unitScale; width: 24 * root.unitScale; height: 28 * root.unitScale
+        text: "×"
+        contentItem: Text {
+            text: closeDetail.text; color: root.s.overlayInk || appTheme.palette.ink
+            font.pixelSize: 18 * root.unitScale
+            horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter
+        }
+        background: Rectangle {
+            radius: 4 * root.unitScale
+            color: closeDetail.hovered ? (root.s.overlaySurface || appTheme.palette.overlay) : "transparent"
+            border.width: closeDetail.visualFocus ? 2 : 0
+            border.color: root.s.overlayAccent || appTheme.palette.accent
+        }
+        Accessible.name: appLanguage.text("상세 닫기")
+        onClicked: root.presentation.escapePanel()
+    }
     QuickPlot {
         id: graph
+        visible: false
         objectName: "detailGraph"
         x: 16 * root.unitScale; y: 52 * root.unitScale
         width: (root.s.detailWidth || 208) * root.unitScale; height: 152 * root.unitScale
         source: root.presentation.detailGraph
-        activeFocusOnTab: true
+        activeFocusOnTab: false
         property bool keyboardFocus: false
         property bool pointerFocus: false
         onActiveFocusChanged: {
@@ -56,7 +97,7 @@ Rectangle {
     Flickable {
         id: bodyScroll
         objectName: "detailScroll"
-        x: 16 * root.unitScale; y: 216 * root.unitScale
+        x: 16 * root.unitScale; y: 52 * root.unitScale
         width: (root.s.detailWidth || 208) * root.unitScale
         height: Math.max(0, parent.height - y - 16 * root.unitScale)
         clip: true; boundsBehavior: Flickable.StopAtBounds
@@ -79,7 +120,7 @@ Rectangle {
             }
         }
         contentWidth: width
-        contentHeight: Math.max(height, (root.s.detailBodyHeight || 0) + (root.s.detailHasSelection ? 48 * root.unitScale : 0))
+        contentHeight: Math.max(height, (root.s.detailBodyHeight || 0))
         onContentYChanged: root.presentation.detailBody.setScrollOffset(contentY)
         onMovementStarted: root.presentation.startInteraction()
         QuickPlot {
@@ -89,69 +130,6 @@ Rectangle {
             source: root.presentation.detailBody
             Accessible.role: Accessible.StaticText
             Accessible.name: source.state.accessible || ""
-        }
-        Repeater {
-            model: root.s.detailLinks || []
-            delegate: Item {
-                id: evidenceLink
-                required property var modelData
-                objectName: "evidence-" + modelData.id
-                x: Math.max(0, modelData.x - (modelData.formula ? 0 : 4)) * root.unitScale
-                y: (modelData.y - (modelData.formula ? 0 : 4)) * root.unitScale
-                width: Math.min(bodyScroll.width, modelData.width * root.unitScale)
-                height: (modelData.height + (modelData.formula ? 0 : 8)) * root.unitScale
-                activeFocusOnTab: true
-                function activate() {
-                    if (modelData.formula) {
-                        const point = evidenceLink.mapToItem(null, 0, height);
-                        root.presentation.showCalculation(modelData.id, point.x, point.y);
-                    } else root.presentation.keyboardActivate(modelData.id);
-                }
-                Accessible.role: modelData.formula ? Accessible.Button : Accessible.Link
-                Accessible.name: appLanguage.text(modelData.accessible)
-                Accessible.onPressAction: activate()
-                Keys.onReturnPressed: activate()
-                Keys.onEnterPressed: activate()
-                Keys.onSpacePressed: activate()
-                Rectangle {
-                    x: 4 * root.unitScale; y: parent.height - 4 * root.unitScale
-                    width: parent.width - 8 * root.unitScale; height: root.unitScale
-                    color: root.s.overlayAccent
-                    visible: evidencePointer.containsMouse || evidenceLink.activeFocus
-                }
-                onActiveFocusChanged: if (activeFocus) bodyScroll.contentY = Math.max(0, y - 24 * root.unitScale)
-                MouseArea {
-                    id: evidencePointer
-                    anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
-                    onPressed: root.presentation.captureNavigation(evidenceLink.modelData.id)
-                    onClicked: {
-                        if (evidenceLink.modelData.formula) evidenceLink.activate();
-                        else root.presentation.activateNavigation();
-                    }
-                }
-            }
-        }
-        Button {
-            id: openDashboard
-            objectName: "openDashboard"
-            y: (root.s.detailBodyHeight || 0) + 8 * root.unitScale
-            width: bodyScroll.width; height: 36 * root.unitScale
-            visible: root.s.detailHasSelection || false
-            text: appLanguage.text("대시보드에서 열기")
-            contentItem: Text {
-                text: openDashboard.text; color: root.s.overlayInk || appTheme.palette.ink
-                font.family: root.s.overlayFamily || "Pretendard JP"; font.pixelSize: 14 * root.unitScale
-                horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter
-            }
-            background: Rectangle {
-                radius: 6 * root.unitScale; color: root.s.overlaySurface || appTheme.palette.overlay
-                border.width: openDashboard.visualFocus ? 2 : 1
-                border.color: openDashboard.visualFocus ? root.s.overlayAccent : root.s.overlayBorder || appTheme.palette.border
-            }
-            Accessible.name: appLanguage.text("선택 호출의 전체 상세를 대시보드에서 열기")
-            onPressed: root.presentation.captureNavigation("selected")
-            onClicked: root.presentation.activateNavigation()
-            onActiveFocusChanged: if (activeFocus) bodyScroll.contentY = Math.max(0, bodyScroll.contentHeight - bodyScroll.height)
         }
         ScrollBar.vertical: ScrollBar {
             objectName: "detailScrollBar"

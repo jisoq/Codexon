@@ -49,11 +49,13 @@ Item {
         case "tabs": return tabsComponent
         case "split": return splitComponent
         case "table": return tableComponent
+        case "historyWorkspace": return historyWorkspaceComponent
         case "plot": return plotComponent
         default: return spacerComponent
         }
     }
     Component { id: spacerComponent; Item {} }
+    Component { id: historyWorkspaceComponent; HistoryWorkspace { node: view.node } }
     Component {
         id: groupComponent
         Rectangle {
@@ -162,7 +164,7 @@ Item {
                 anchors.leftMargin: view.s.margins[0] + (view.s.swatch ? 18 : 0); anchors.rightMargin: view.s.margins[2]
                 anchors.topMargin: view.s.margins[1]; anchors.bottomMargin: view.s.margins[3]
                 visible: !view.s.selectable
-                text: view.s.text; textFormat: view.s.rich || view.s.externalLinks ? Text.RichText : Text.PlainText
+                text: view.node.textValue; textFormat: view.s.rich || view.s.externalLinks ? Text.RichText : Text.PlainText
                 wrapMode: view.s.wrap ? Text.Wrap : Text.NoWrap
                 elide: view.s.wrap || view.s.noElide ? Text.ElideNone : Text.ElideRight
                 font.family: view.s.fontFamily || appTheme.family; font.pixelSize: view.s.fontSize; font.bold: view.s.bold
@@ -198,7 +200,7 @@ Item {
             implicitHeight: 170; implicitWidth: 200; clip: true
             contentWidth: availableWidth
             TextArea {
-                text: view.s.text; readOnly: true; selectByMouse: true
+                text: view.node.textValue; readOnly: true; selectByMouse: true
                 textFormat: view.s.rich ? TextEdit.RichText : TextEdit.PlainText
                 wrapMode: TextEdit.Wrap; font.family: appTheme.family; font.pixelSize: 14
                 placeholderText: view.s.placeholder; color: (appTheme.palette && appTheme.readableText(view.s.color, "secondary"))
@@ -211,7 +213,7 @@ Item {
     Component {
         id: buttonComponent
         UiButton {
-            text: view.s.text; checkable: view.s.checkable; checked: view.s.checked
+            text: view.node.textValue; checkable: view.s.checkable; checked: view.s.checked
             font.pixelSize: view.s.fontSize; font.bold: view.s.bold
             disclosure: !!view.s.disclosure
             iconName: view.s.iconName || ""
@@ -226,7 +228,8 @@ Item {
     Component {
         id: toggleComponent
         UiCheckBox {
-            text: view.s.text; checked: view.s.checked; onClicked: view.node.activate()
+            textColor: appTheme.color(view.s.color || "ink")
+            text: view.node.textValue; checked: view.s.checked; onClicked: view.node.activate()
             Accessible.name: view.s.accessible || text
             UiToolTip { visible: parent.hovered && view.s.tooltip.length > 0; text: view.s.tooltip }
         }
@@ -283,7 +286,7 @@ Item {
     Component {
         id: inputComponent
         UiInput {
-            text: view.s.text; placeholderText: view.s.placeholder
+            text: view.node.textValue; placeholderText: view.s.placeholder
             Accessible.name: view.s.accessible || placeholderText
             onTextEdited: view.node.edit(text)
         }
@@ -467,6 +470,14 @@ Item {
             id: plot; source: view.node; implicitHeight: view.s.minHeight; implicitWidth: view.s.minWidth
             Accessible.name: view.s.accessible || appLanguage.text("차트 선택")
             Accessible.role: Accessible.Chart
+            Rectangle {
+                property rect area: plot.hoverRect
+                x: area.x + 1; y: area.y + 1
+                width: Math.max(0,area.width - 2); height: Math.max(0,area.height - 2)
+                visible: width > 0 && height > 0
+                color: Qt.alpha(appTheme.color("accent"),0.10)
+                border.color: Qt.alpha(appTheme.color("accent"),0.6); border.width: 1
+            }
             HoverHandler { id: plotHover; objectName: "plotHover"; cursorShape: plot.hoverIndex >= 0 ? Qt.PointingHandCursor : Qt.ArrowCursor; onPointChanged: plot.showTip(point.position.x, point.position.y); onHoveredChanged: if (!hovered) plot.clearHover() }
             UiToolTip { visible: !view.s.quotaDetail && plotHover.hovered && plot.tip.length > 0; text: plot.tip }
             Loader {

@@ -49,7 +49,7 @@ def test_auto_fallback_restores_preference_anchor_and_clickthrough(tmp_path):
         from PySide6.QtQuick import QQuickItem
         root=controller.actions.quick.rootObject()
         assert controller.can_present('home',A)
-        assert root.findChild(QQuickItem,'evidence') is None and root.findChild(QQuickItem,'expand') is not None
+        assert root.findChild(QQuickItem,'evidence') is None and root.findChild(QQuickItem,'expand') is None
         assert controller.expanded and not hasattr(controller,'open_evidence')
         host.resize(700,450);refresh()
         assert controller.automatic_mode in ('detail','detail-inline') and controller.widget.content_model.compact and controller.widget.isVisible()

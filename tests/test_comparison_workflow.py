@@ -21,10 +21,10 @@ def many_efforts():
 
 
 def test_home_preserves_filters_and_back_restores_exact_call(dashboard):
-    w=dashboard;w.nav.setCurrentRow(2);click_row(w,w.parent_table,1);click_row(w,w.table,1);click_row(w,w.table,1)
+    w=dashboard;w.nav.setCurrentRow(2);click_row(w,w.table,1);click_row(w,w.table,0);click_row(w,w.table,1);click_row(w,w.table,1)
     before=w.capture_state();assert w.selected_call
     click(w,control(w,w.home_button))
-    assert w.record_view=='requests' and w.selected_call is None and w.selected_turn is None
+    assert w.record_view=='projects' and w.selected_session is None and w.selected_call is None and w.selected_turn is None
     assert w.period.currentData()==before['common']['period']
     click(w,control(w,w.back_button))
     assert w.selected_call==before['selected_call'] and w.selected_turn==before['selected_turn']

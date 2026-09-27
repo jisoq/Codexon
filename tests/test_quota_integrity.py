@@ -211,6 +211,8 @@ def test_bare_none_without_history_is_unknown_and_same_turn_conflict_does_not_fa
               {'turn':turn,'service_tier_source':'wire','requested_service_tier':'priority'},
               {'turn':turn,'service_tier_source':'wire','requested_service_tier':'priority','mode_conflict':True}]
         snap={'homes':[home],'sessions':[{'home':home,'id':'s','history':rows}]};ledger.enrich_modes(snap)
+        assert 'service_tier' not in rows[0]  # Published source records remain read-only.
+        rows=snap['sessions'][0]['history']
         assert [r['service_tier'] for r in rows]==['미확인','미확인','Fast','미확인']
         assert rows[1]['request_mode_source']=='settings_conflict' and rows[1]['mode_conflict']
     finally:ledger.close()

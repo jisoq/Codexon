@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from bisect import bisect_left
 from PySide6.QtCore import QThread, Signal
 from .analysis_engine import AnalysisEngine
+from .analytics import _local_timestamp
 from .usage_collection import CollectionClient
 from .quota_cycles import QuotaLedger, ledger_path
 from .overlay_data import OverlaySummaries
@@ -26,7 +27,7 @@ def expiry(engine,q):
                 for stamp in (request.get('started_at'),request.get('ended_at')):
                     if stamp is not None and stamp>=q['start']:candidates.append(stamp+duration+.002)
     if q.get('period') in ('today','7d','30d') or q['page']==0:
-        candidates.append(datetime.combine(datetime.fromtimestamp(now).date()+timedelta(days=1),datetime.min.time()).timestamp())
+        candidates.append(_local_timestamp(datetime.combine(datetime.fromtimestamp(now).date()+timedelta(days=1),datetime.min.time())))
     i=bisect_left(engine.timestamps,q['end'])
     if q.get('period')!='custom' and i<len(engine.timestamps): candidates.append(engine.timestamps[i]+0.002)
     if q.get('period')!='custom':
@@ -66,6 +67,7 @@ def process_main(connection,homes,index_path,static_snapshot=None,model_evidence
         frozen=static_snapshot is not None
         next_poll=0
         pending=None
+        ready=None
         if static_snapshot is not None:
             snapshot=static_snapshot
             engine.ingest(snapshot['sessions'])
@@ -83,15 +85,21 @@ def process_main(connection,homes,index_path,static_snapshot=None,model_evidence
                 if message['kind']=='stop': return
                 if message['kind']=='freeze': frozen=True
                 elif message['kind']=='replace':
-                    snapshot=message['snapshot']; engine.ingest(snapshot['sessions']); publish()
-                elif message['kind']=='query': pending=message
+                    ready=None;snapshot=message['snapshot']; engine.ingest(snapshot['sessions']); publish()
+                elif message['kind']=='query': pending=message;ready=None
                 elif message['kind']=='sync':
                     publisher=SnapshotPublisher()
                     if snapshot is not None:publish()
+                elif message['kind']=='population':
+                    from .dashboard_views import population_summary
+                    connection.send(dict(kind='population',id=message['id'],
+                        summary=population_summary(engine,message['population'],message.get('assumptions'))))
                 elif message['kind']=='record':
                     connection.send({'kind':'record','id':message['id'],
                                      'row':engine.record(*message['identity'])})
-            if not frozen and time.monotonic()>=next_poll:
+            if ready is not None:
+                connection.send(ready);ready=None
+            if not frozen and time.monotonic()>=next_poll and (snapshot is None or pending is None or time.monotonic()>=next_poll+1):
                 snapshot=collector.poll()
                 if ledger is None and time.monotonic()>=ledger_retry:
                     try:ledger=QuotaLedger(quota_path)
@@ -118,10 +126,11 @@ def process_main(connection,homes,index_path,static_snapshot=None,model_evidence
             if pending is not None and snapshot is not None:
                 request=pending; pending=None
                 try:
-                    result=engine.query(request['query'])
-                    connection.send({'kind':'result','id':request['id'],'logical':request['logical'],
-                                     'result':result,'valid_until':expiry(engine,request['query']),
-                                     'metrics':dict(engine.metrics)})
+                    result=engine.page_query(request['query'])
+                    ready={'kind':'result','id':request['id'],'logical':request['logical'],
+                           'result':result,'valid_until':result.get('valid_until',expiry(engine,request['query'])),
+                           'metrics':dict(engine.metrics)}
+                    continue
                 except Exception:
                     connection.send({'kind':'error','id':request['id'],'error':traceback.format_exc(limit=6)})
             connection.poll(.02)
@@ -143,6 +152,7 @@ class AnalysisBridge(QThread):
     result=Signal(object)
     failure=Signal(str)
     record=Signal(object)
+    population=Signal(object)
     def __init__(self,homes,index_path=None,static_snapshot=None,model_evidence_path=None,quota_path=None):
         super().__init__()
         self.homes,self.index_path,self.static_snapshot=homes,index_path,static_snapshot
@@ -165,6 +175,9 @@ class AnalysisBridge(QThread):
         with self.lock:
             self.last_record={'kind':'record','id':request_id,'identity':identity}
             self.commands.append(self.last_record)
+    def request_population(self,request_id,population,assumptions=None):
+        with self.lock:self.commands.append(dict(kind='population',id=request_id,population=population,assumptions=assumptions))
+
     def replace_snapshot(self,snapshot):
         with self.lock:
             self.static_snapshot=snapshot
@@ -201,6 +214,7 @@ class AnalysisBridge(QThread):
                             with self.lock:
                                 if self.last_record and self.last_record['id']==message['id']:self.last_record=None
                             self.record.emit(message)
+                        elif message['kind']=='population':self.population.emit(message)
                         elif message['kind']=='result': self.result.emit(message)
                         elif message['kind'] in ('error','fatal'):
                             self.failure.emit(message['error'])

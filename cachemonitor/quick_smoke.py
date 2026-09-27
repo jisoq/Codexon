@@ -14,7 +14,7 @@ def start_smoke(window,app,path,fonts,depth='full'):
 
     def settle():
         deadline=time.monotonic()+30
-        while window.analysis_pending or window.view_result is None:
+        while window.analysis_pending or window.view_result is None or window.search_timer.isActive() or window.range_timer.isActive() or window.deferred_result:
             app.processEvents();QTest.qWait(20)
             if window.analysis_errors:raise AssertionError(window.analysis_errors)
             if time.monotonic()>deadline:raise AssertionError('Analysis response timed out')
@@ -59,17 +59,18 @@ def start_smoke(window,app,path,fonts,depth='full'):
             report['cache_management_page']=bool(control(window,window.cache_panel.summary))
             window.nav.setCurrentRow(2);settle()
             search=control(window,window.search);search.forceActiveFocus()
-            QTest.keyClicks(window.quick,'__qml_no_such_session__');QTest.qWait(60)
+            QTest.keyClicks(window.quick,'__qml_no_such_session__');settle()
             assert window.table.rowCount()==0
             assert window.record_message.text() in ('조건에 맞는 기록 없음','사용 기록 없음')
             QTest.keyClick(window.quick,Qt.Key_A,Qt.ControlModifier);QTest.keyClick(window.quick,Qt.Key_Backspace)
-            QTest.qWait(80);assert window.search.text()==''
+            settle();assert window.search.text()==''
             report['search_keyboard']=True
-            parents=[(i,row) for i,row in enumerate(window.parent_rows) if row.get('descendants')]
+            if window.record_view=='projects' and window.record_rows:window.activate_record(0);settle()
+            parents=[(i,row) for i,row in enumerate(window.record_rows) if row.get('descendants')]
             if parents:
                 from .quick_qa import click_row
                 i,row=parents[0]
-                click_row(window,window.parent_table,i);settle()
+                click_row(window,window.table,i);settle()
                 assert window.selected_session==(row['home'],row['sid'])
                 from .i18n import tr
                 assert tr('비용') in window.session_scope.text()
@@ -99,24 +100,8 @@ def start_smoke(window,app,path,fonts,depth='full'):
                     assert window.table.currentRow()==0
             report['record_keyboard']=True
             from .overlay_chrome import named_item
-            from .overlay_view import palette
             overlay=window.overlay;overlay.timer.stop();overlay.input_timer.stop()
-            links=overlay.links;note=overlay.calculation_note;note.winId()
-            links.resize(overlay.widget.panel_width(),overlay.widget.panel_height())
-            links.sync();links.show();QTest.qWait(40)
-            click(links,named_item(links.quick.rootObject(),'nav-formula-cache'))
-            QTest.qWait(40)
-            assert note.isVisible() and note.label.text()
-            assert note.label.fontMetrics().horizontalAdvance(note.label.text())<=note.label.width()
-            rendered=note.label.grab().toImage();ink=palette(overlay.widget.content_model.appearance)['ink']
-            assert sum(max(abs(rendered.pixelColor(x,y).red()-ink.red()),
-                           abs(rendered.pixelColor(x,y).green()-ink.green()),
-                           abs(rendered.pixelColor(x,y).blue()-ink.blue()))<25
-                       for y in range(rendered.height()) for x in range(rendered.width()))>50
-            target=path.with_name(path.stem+'-calculation.png')
-            assert note.grab().save(str(target));report['screens'].append(str(target))
-            report['calculation_note']=dict(text=note.label.text(),visible_ink=True)
-            note.hide();links.hide()
+            links=overlay.links
             from .i18n import language, set_language
             from PySide6.QtGui import QImage, QPainter
             from .analysis_engine import AnalysisEngine
@@ -129,6 +114,27 @@ def start_smoke(window,app,path,fonts,depth='full'):
             original_data=overlay.widget.content_model.data
             data=OverlaySummaries().collect(engine)[0];data['title']='사용한도 주석 표시 정리'
             overlay.widget.set_content(data);model=overlay.widget.content_model
+            from PySide6.QtCore import QPoint
+            links.resize(model.panel_width(),model.panel_height());links.sync();links.show();QTest.qWait(40)
+            assert named_item(links.quick.rootObject(),'nav-composition-input') is None
+            assert not any(link.get('formula') for link in model.monitor_links())
+            scale=model.appearance.scale
+            assert not links.mask().contains(QPoint(round(50*scale),round((model.layout()['rows']+9)*scale)))
+            previous_tab,previous_unit=model.monitor_tab,model.composition_unit
+            size=(model.panel_width(),model.panel_height())
+            for tab in ('latest','history'):
+                click(links,named_item(links.quick.rootObject(),'nav-tab-'+tab));QTest.qWait(20)
+                assert model.monitor_tab==tab
+                for unit in ('tokens','usd'):
+                    click(links,named_item(links.quick.rootObject(),'nav-unit-'+unit));QTest.qWait(20)
+                    assert model.composition_unit==unit and not model.detail_links()
+                    assert (model.panel_width(),model.panel_height())==size
+                    frame=QImage(*size,QImage.Format_ARGB32_Premultiplied);frame.fill(0)
+                    painter=QPainter(frame);model.paint(painter);painter.end()
+                    target=path.with_name(path.stem+'-overlay-'+tab+'-'+unit+'.png')
+                    assert frame.save(str(target));report['screens'].append(str(target))
+            report['overlay_controls']=dict(passive_composition=True,unit_toggle=True,tab_toggle=True,stable_size=True)
+            model.monitor_action('tab-'+previous_tab);model.monitor_action('unit-'+previous_unit);links.hide()
             locale=language();title_images=[]
             try:
                 for selected in ('ko','en'):

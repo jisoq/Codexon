@@ -153,3 +153,37 @@ def test_cycle_selector_changes_graph_preserves_lifetime_and_selection_on_refres
         assert host.grab().save(str(tmp_path/'quota-all-cycles.png'))
         assert not host.qml_errors
     finally:dispose(host)
+
+
+@pytest.mark.parametrize('width,dark',[(520,False),(1120,True)])
+def test_legend_visibility_survives_refresh_and_updates_pinned_details(quota_page,width,dark):
+    app,panel,scroll=quota_page
+    shared_theme().configure('dark' if dark else 'light')
+    host=mount(scroll,width,1000)
+    try:
+        chart=panel.history
+        plot=render_plot(host,chart)
+        series=chart.series
+        plot.activateAt(chart.x_at(0),chart.box.center().y())
+        toggle=panel.legend_toggles['cycle_cost']
+        scroll.ensureWidgetVisible(toggle);QTest.qWait(50)
+        click(host,control(host,toggle));render_plot(host,chart)
+        assert chart.series is series
+        assert not chart.visible('cycle_cost')
+        assert all(i['label']!='누적 API 환산액' for i in plot.detail['items'])
+        panel.render(automatic=True)
+        assert not chart.visible('cycle_cost') and not toggle.isChecked()
+        control(host,toggle).forceActiveFocus();QTest.keyClick(host.quick,Qt.Key_Space)
+        render_plot(host,chart)
+        assert chart.visible('cycle_cost')
+        for toggle in panel.legend_toggles.values():toggle.setChecked(False)
+        render_plot(host,chart)
+        assert chart.curves()==[] and chart.box.width()>width*.7
+        assert not chart.detail_for(0)['items']
+        panel.window.setCurrentIndex(1);render_plot(host,chart)
+        assert panel.remaining_legend.isVisible()
+        assert not panel.legend_toggles['cycle_cost'].isVisible()
+        panel.remaining_legend.setChecked(True);render_plot(host,chart)
+        assert [c[0] for c in chart.curves()]==['remaining']
+        assert not host.qml_errors
+    finally:dispose(host);shared_theme().configure('light')
