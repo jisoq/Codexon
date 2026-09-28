@@ -1,13 +1,73 @@
-"""One-time cooperative retirement of collectors using the old IPC filename."""
+"""Cooperative collector upgrades and preservation of the previous default index."""
+from contextlib import closing
 import json
 import os
 from pathlib import Path
 import sqlite3
 import time
 import zlib
+import tempfile
 
 from .proxy_target import option
 from . import proxy_identity as identity
+from .usage_paths import index_location,legacy_index_location
+
+
+def startup_snapshot(channel):
+    """Recognize the old default-path bug for control only, never for display."""
+    from .usage_collection import CollectionScopeError
+    try:return channel.read_header(),False
+    except CollectionScopeError:
+        if channel.index_path is not None or channel.path!=index_location():raise
+        with closing(sqlite3.connect(channel.snapshot_path.as_uri()+'?mode=ro',uri=True)) as db:
+            row=db.execute('SELECT scope,payload FROM snapshot WHERE id=1').fetchone()
+        if not row or row[0]!=channel.scope:raise
+        snapshot=json.loads(zlib.decompress(row[1]));source=snapshot.get('collection') or {}
+        version=source.get('version','').split('.')
+        if (len(version)!=4 or not all(p.isdigit() for p in version) or
+                not (tuple(map(int,version))<=(2026,9,27,1)) or
+                snapshot.get('collection_schema',1) not in (1,2) or
+                Path(snapshot.get('index',{}).get('path','')).resolve()!=legacy_index_location() or
+                not snapshot.get('homes') or not set(snapshot['homes']).issubset(channel.homes) or
+                not source.get('instance') or not source.get('pid') or not source.get('executable')):raise
+        process=identity.process_identity(source['pid'])
+        if process:
+            command=identity.process_command(process['pid'])
+            # The remaining identity checks are also required by AppServices.
+            if '--default-index' not in command or not identity.same_process(process):raise
+        return snapshot,True
+
+
+def migrate_default_index(channel):
+    """Called only by CollectorService while holding its exclusive writer lock."""
+    from .usage_collection import locked
+    destination=channel.path;source=legacy_index_location()
+    if channel.index_path is not None or destination.exists() or not source.is_file():return False
+    # Earlier collectors may use either lock spelling. Never copy their index
+    # until the owning process has completed its cooperative shutdown.
+    for lock in (channel.path.with_suffix('.collector.lock'),
+                 source.with_suffix('.collector.lock'),
+                 source.with_name(source.name+'.codexon-collector.lock')):
+        if lock.exists() and locked(lock):
+            raise RuntimeError('이전 수집기의 기록 저장과 종료 대기')
+    descriptor,name=tempfile.mkstemp(prefix=destination.name+'.migration-',suffix='.tmp',dir=destination.parent)
+    os.close(descriptor);temporary=Path(name)
+    try:
+        with closing(sqlite3.connect(source.as_uri()+'?mode=ro',uri=True)) as old:
+            tables={row[0] for row in old.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if tables!={'files','events','metadata'}:
+                raise RuntimeError('이전 사용량 색인의 형식을 확인하지 못했습니다. 원본을 보존합니다.')
+            with closing(sqlite3.connect(temporary)) as new:
+                old.backup(new)
+                if new.execute('PRAGMA quick_check').fetchall()!=[('ok',)]:
+                    raise RuntimeError('이전 사용량 색인을 검증하지 못했습니다. 원본을 보존합니다.')
+                new.execute('PRAGMA journal_mode=DELETE')
+        # Atomic publication without overwriting an index created by another
+        # owner. Both names are on the same filesystem; unlink only our temp.
+        try:os.link(temporary,destination)
+        except FileExistsError:return False
+        return True
+    finally:temporary.unlink(missing_ok=True)
 
 
 def retire_legacy(channel,*,clock=time.monotonic,sleep=time.sleep):
