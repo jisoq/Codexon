@@ -16,6 +16,7 @@ from .core import LINEAGE_FIELDS, TRANSPORT_FIELDS, SessionRegistry, Session, re
 from .codex_names import CodexNames, task_select
 from .quota import clean_limits
 from .model_evidence import EvidenceReader, default_path as evidence_path, FIELDS as MODEL_FIELDS
+from .usage_paths import index_location
 
 
 def usage_only(value):
@@ -77,7 +78,7 @@ class UsageIndex:
     def __init__(self, homes, path=None, model_evidence_path=None):
         self.cache_index_path=path
         self.homes = [Path(h).resolve() for h in homes]
-        self.path = Path(path) if path else Path(os.environ.get('LOCALAPPDATA', Path.home())) / 'CacheSessionRegistry' / 'usage-index.sqlite'
+        self.path = index_location(path)
         if any(self.path.resolve().is_relative_to(h) for h in self.homes):
             raise ValueError('앱 색인은 Codex 원본 폴더 밖에 저장해야 합니다')
         self.path.parent.mkdir(parents=True, exist_ok=True)

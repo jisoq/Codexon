@@ -30,7 +30,7 @@ def test_files(*names):
 # Components select observable contracts. There is deliberately no always-run core.
 GROUPS = {
     'app_lifetime': test_files('app_services', 'observer_panel', 'windows_startup', 'proxy_update'),
-    'data': test_files('core', 'index', 'data_contract', 'subagent_collection', 'request_tier_snapshots'),
+    'data': test_files('core', 'index', 'data_contract', 'subagent_collection', 'request_tier_snapshots', 'collection_defaults'),
     'analysis': test_files('comparison', 'overview', 'performance', 'data_contract', 'output_speed'),
     'cost': test_files('pricing', 'mode_costs', 'session_costs', 'data_contract'),
     'cache_connection': test_files('cache_codex_connection'),
@@ -98,6 +98,7 @@ RULES = (
     ('cachemonitor/analysis_engine.py', ('analysis', 'cost', 'cache', 'overlay_data')),
     ('cachemonitor/analysis_worker.py', ('analysis', 'quota_poll', 'overlay_tracking', 'notifications')),
     ('cachemonitor/usage_collection.py', ('data', 'quota_poll', 'overlay_tracking', 'cache_connection')),
+    ('cachemonitor/usage_paths.py', ('data', 'quota_poll', 'evidence')),
     ('cachemonitor/analysis_delivery.py', ('analysis', 'overlay_tracking')),
     ('cachemonitor/pricing.py', ('cost', 'quota_store', 'quota_math')),
     ('cachemonitor/request_modes.py', ('modes', 'quota_store')),

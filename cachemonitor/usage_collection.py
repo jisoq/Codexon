@@ -13,14 +13,11 @@ import zlib
 
 from .observer_state import ProcessLock
 from .version import VERSION
+from .usage_paths import index_location
 
 
 class CollectionScopeError(RuntimeError):
     pass
-
-
-def index_location(path=None):
-    return (Path(path) if path else Path(os.environ.get('LOCALAPPDATA',Path.home()))/'CacheMonitor'/'usage-index.sqlite').resolve()
 
 
 def locked(path):
@@ -207,7 +204,8 @@ class CollectionClient:
         try:snapshot=self.channel.read(shared=True)
         except CollectionScopeError as error:
             snapshot=empty_snapshot(self.channel.homes,self.path,now)
-            snapshot['errors']=[str(error)];snapshot['index']['loading']=False
+            snapshot['errors']=[str(error)];snapshot['usage_errors']=[str(error)]
+            snapshot['index']['loading']=False
             return snapshot
         self.channel.subscribe(now)
         if snapshot is None:snapshot=empty_snapshot(self.channel.homes,self.path,now)
@@ -247,6 +245,11 @@ class CollectorService:
         self.lock=ProcessLock(self.channel.companion('.collector.lock'))
         try:self.lock.__enter__()
         except BaseException:self.channel.close();raise
+        try:
+            from .collection_lifecycle import migrate_default_index
+            migrate_default_index(self.channel)
+        except BaseException:
+            self.lock.__exit__(None,None,None);self.channel.close();raise
         self.index=None;self.epoch=uuid.uuid4().hex;self.instance=uuid.uuid4().hex;self.sequence=0;self.last=None
         self.executable=str(Path(sys.executable).resolve())
         if os.name=='nt':
@@ -288,6 +291,8 @@ def main():
     parser.add_argument('--default-index',action='store_true')
     parser.add_argument('--instance',help=argparse.SUPPRESS)
     args=parser.parse_args()
+    if args.default_index and args.index_path.resolve()!=index_location():
+        parser.error('--default-index requires --index-path to match the default usage index')
     try:service=CollectorService(args.codex_home,None if args.default_index else args.index_path,args.evidence_path)
     except RuntimeError:return 0
     if args.instance:service.instance=args.instance

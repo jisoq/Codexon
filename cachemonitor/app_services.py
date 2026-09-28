@@ -112,7 +112,7 @@ class AppServices:
     def start_collection(self):
         """Startup/adoption is the only collection migration entry point."""
         from .usage_collection import CollectionChannel,collector_command,locked
-        from .collection_lifecycle import retire_legacy
+        from .collection_lifecycle import retire_legacy,startup_snapshot
         from .observer_task import ObserverTask
         from .version import VERSION
         channel=CollectionChannel(self.homes,self.index,self.evidence)
@@ -121,12 +121,12 @@ class AppServices:
                 task=ObserverTask(str(channel.path),role='UsageCollector')
                 command=collector_command(channel)
                 retire_legacy(channel)
-                snapshot=channel.read_header()
+                snapshot,broken_default=startup_snapshot(channel)
                 source=self.collector_identity(channel,snapshot)
                 version=((snapshot or {}).get('collection') or {}).get('version','')
                 newer=tuple(int(p) for p in version.split('.') if p.isdigit())>tuple(int(p) for p in VERSION.split('.') if p.isdigit())
                 if newer and source:raise RuntimeError('새 버전 수집기를 이전 앱으로 교체하지 않습니다.')
-                replace=source and (version!=VERSION or
+                replace=source and (broken_default or version!=VERSION or
                     getattr(sys,'frozen',False) and Path(source['process']['executable']).resolve()!=Path(sys.executable).resolve())
                 if replace:
                     task.configure(command,autostart=False)
