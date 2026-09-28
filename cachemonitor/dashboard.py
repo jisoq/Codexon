@@ -1,5 +1,6 @@
 """Full dashboard: shared evidence, explicit populations and reversible navigation."""
 from __future__ import annotations
+from .tooltips import TEXT as TIPS
 
 import copy
 import json
@@ -283,10 +284,12 @@ class Dashboard(TrayWindow):
         for i,title in enumerate(('비용','평균 호출 비용','완료 요청당 평균','캐시 적중률','평균 출력 속도')):
             col=Column();caption=label(title,'muted');value=Button('—');value.put(flat=True,fontSize=30,bold=True,noElide=True)
             if i==4:value.put(fontSize=24)
+            tip=TIPS[('cost','mean','request_mean','cache_total','speed_total')[i]]
+            caption.setToolTip(tip);value.setToolTip(tip)
             value.clicked.connect(lambda index=i:self.open_summary(index));note=label('','muted',True);note.put(fontSize=12)
             for node in (caption,value,note):col.addWidget(node)
             columns.addLayout(col,1);self.metrics.append(value);self.metric_captions.append(caption);self.metric_notes.append(note)
-        layout.addWidget(summary);layout.addWidget(label('고정 단가 환산 · 청구액 아님','muted'))
+        layout.addWidget(summary)
         controls=Row();controls.put(flow=True);controls.addWidget(label('시간 추이','section'))
         self.overview_metric=combo([('환산액','cost'),('호출 수','count'),('캐시 적중률','cache_ratio')])
         self.overview_basis=combo([('합계','total'),('평균 호출 비용','call_mean'),('완료 요청당 평균','turn_mean')])
@@ -302,7 +305,7 @@ class Dashboard(TrayWindow):
         pair.addWidget(sources,3);pair.addWidget(panel('환산액 구성',self.component_bars),2);layout.addLayout(pair)
         self.attention=Row();self.attention.put(flow=True);self.attention_buttons={}
         for title,key in (('미산정 호출','unpriced'),('모델명 불일치','model_mismatch'),('캐시 저하 의심','cache_degradation'),('기록 누락','observation_missing')):
-            button=Button(title);button.put(flat=True);button.clicked.connect(lambda k=key:self.open_attention(k));self.attention_buttons[key]=button;self.attention.addWidget(button)
+            button=Button(title);button.put(flat=True);button.setToolTip(TIPS['unpriced'] if key=='unpriced' else '');button.clicked.connect(lambda k=key:self.open_attention(k));self.attention_buttons[key]=button;self.attention.addWidget(button)
         layout.addLayout(self.attention);self.overview_detail=self.aggregate_panel(layout)
 
     def aggregate_panel(self,layout):
@@ -816,7 +819,7 @@ class Dashboard(TrayWindow):
         self.client_cache.clear();self.pending_logical=None
         self.pending_timer.stop()
         self.analysis_pending=False;self.analysis_errors=[error];self.analysis_error_history=(self.analysis_error_history+[error])[-10:]
-        self.pending_label.setText('갱신 실패 · 이전 결과 표시' if self.view_result else '계산 실패 · 수집 상태 확인');self.pending_label.setToolTip('설정의 수집 상태에서 오류를 확인할 수 있습니다.');self.pending_label.show();self.pages.show()
+        self.pending_label.setText('갱신 실패 · 이전 결과 표시' if self.view_result else '계산 실패 · 수집 상태 확인');self.pending_label.setToolTip('');self.pending_label.show();self.pages.show()
         self.render_diagnostics()
 
     def eventFilter(self,watched,event):

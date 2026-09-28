@@ -11,7 +11,7 @@ Rectangle {
     onSelectedCallChanged: if (bodyScroll) bodyScroll.contentY = 0
     color: appTheme.palette.hit_surface
     clip: true
-    Keys.onEscapePressed: event => { root.presentation.escapePanel(); event.accepted = true; }
+
 
     Button {
         id: openDashboard
@@ -63,33 +63,17 @@ Rectangle {
         width: (root.s.detailWidth || 208) * root.unitScale; height: 152 * root.unitScale
         source: root.presentation.detailGraph
         activeFocusOnTab: false
-        property bool keyboardFocus: false
-        property bool pointerFocus: false
-        onActiveFocusChanged: {
-            if (!activeFocus) { keyboardFocus = false; pointerFocus = false; }
-            else if (!pointerFocus) keyboardFocus = true;
-        }
+
         Accessible.role: Accessible.Chart
         Accessible.name: appLanguage.text("최근 24호출 캐시율과 API 환산 비용")
-        Keys.onPressed: event => {
-            pointerFocus = false; keyboardFocus = true;
-            if ([Qt.Key_Left, Qt.Key_Right, Qt.Key_Home, Qt.Key_End].indexOf(event.key) >= 0) {
-                root.presentation.detailGraph.key(event.key); event.accepted = true;
-            }
-        }
-        Rectangle {
-            anchors.fill: parent; anchors.margins: -4 * root.unitScale
-            visible: graph.activeFocus && graph.keyboardFocus; color: "transparent"; radius: 4 * root.unitScale
-            border.width: 2 * root.unitScale; border.color: root.s.overlayAccent || appTheme.palette.accent
-        }
+
+
         MouseArea {
             anchors.fill: parent; hoverEnabled: true
             onPositionChanged: mouse => root.presentation.detailGraph.hover_at(mouse.x, mouse.y)
             onExited: root.presentation.detailGraph.clear_hover()
             onPressed: mouse => {
-                graph.pointerFocus = true;
                 root.presentation.startInteraction(); graph.forceActiveFocus(Qt.MouseFocusReason);
-                graph.keyboardFocus = false;
             }
             onClicked: mouse => root.presentation.detailGraph.activate_at(mouse.x, mouse.y)
         }
@@ -102,23 +86,9 @@ Rectangle {
         height: Math.max(0, parent.height - y - 16 * root.unitScale)
         clip: true; boundsBehavior: Flickable.StopAtBounds
         flickableDirection: Flickable.VerticalFlick
-        activeFocusOnTab: true
-        property bool keyboardFocus: false
-        property bool pointerFocus: false
-        onActiveFocusChanged: {
-            if (!activeFocus) { keyboardFocus = false; pointerFocus = false; }
-            else if (!pointerFocus) keyboardFocus = true;
-        }
-        Keys.onPressed: event => {
-            pointerFocus = false; keyboardFocus = true;
-            const maximum = Math.max(0, contentHeight - height);
-            if ([Qt.Key_Up, Qt.Key_Down, Qt.Key_PageUp, Qt.Key_PageDown, Qt.Key_Home, Qt.Key_End].indexOf(event.key) >= 0) {
-                const amount = event.key === Qt.Key_Up ? -24 * root.unitScale : event.key === Qt.Key_Down ? 24 * root.unitScale :
-                               event.key === Qt.Key_PageUp ? -height : event.key === Qt.Key_PageDown ? height : 0;
-                contentY = event.key === Qt.Key_Home ? 0 : event.key === Qt.Key_End ? maximum : Math.max(0, Math.min(maximum, contentY + amount));
-                event.accepted = true;
-            }
-        }
+        activeFocusOnTab: false
+
+
         contentWidth: width
         contentHeight: Math.max(height, (root.s.detailBodyHeight || 0))
         onContentYChanged: root.presentation.detailBody.setScrollOffset(contentY)
@@ -138,19 +108,11 @@ Rectangle {
             y: bodyScroll.y; height: bodyScroll.height
             width: 4 * root.unitScale; policy: ScrollBar.AsNeeded
             onPressedChanged: if (pressed) {
-                bodyScroll.pointerFocus = true;
                 root.presentation.startInteraction(); bodyScroll.forceActiveFocus(Qt.MouseFocusReason);
-                bodyScroll.keyboardFocus = false;
             }
             contentItem: Rectangle { radius: width / 2; color: root.s.overlayInk || appTheme.palette.ink; opacity: 0.30 }
             background: Item {}
         }
     }
-    Rectangle {
-        x: bodyScroll.x - 4 * root.unitScale; y: bodyScroll.y - 4 * root.unitScale
-        width: bodyScroll.width + 8 * root.unitScale; height: bodyScroll.height + 8 * root.unitScale
-        visible: bodyScroll.activeFocus && bodyScroll.keyboardFocus
-        color: "transparent"; radius: 4 * root.unitScale
-        border.width: 2 * root.unitScale; border.color: root.s.overlayAccent || appTheme.palette.accent
-    }
+
 }

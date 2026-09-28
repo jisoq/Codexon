@@ -255,3 +255,85 @@ def test_native_child_follows_parent_visibility_and_reconnects(tmp_path, monkeyp
         indicator.close()
         indicator.destroy()
         native.api.DestroyWindow(host)
+
+
+def test_drag_persistence_click_and_bounds(tmp_path, owned_taskbar):
+    from PySide6.QtCore import QEvent, QPointF
+    from PySide6.QtGui import QMouseEvent
+    app = QApplication.instance() or QApplication([])
+    settings = QSettings(str(tmp_path / 'drag.ini'), QSettings.IniFormat)
+    widget = TaskbarQuota(settings)
+    clicks = []
+    widget.activated.connect(lambda: clicks.append(True))
+    def pointer(kind, x, button=Qt.NoButton):
+        event = QMouseEvent(kind, QPointF(20, 15), QPointF(x, 120),
+                            button, Qt.LeftButton if kind != QEvent.MouseButtonRelease else Qt.NoButton,
+                            Qt.NoModifier)
+        app.sendEvent(widget, event)
+    try:
+        widget.set_enabled(True)
+        pointer(QEvent.MouseButtonPress, 200, Qt.LeftButton)
+        pointer(QEvent.MouseButtonRelease, 201, Qt.LeftButton)
+        assert len(clicks) == 1
+        key = widget._placement[2]
+        assert not settings.contains(key)
+        pointer(QEvent.MouseButtonPress, 200, Qt.LeftButton)
+        pointer(QEvent.MouseMove, -1000)
+        widget.sync_position()
+        assert widget._gesture['fraction'] == 0
+        assert not settings.contains(key)
+        pointer(QEvent.MouseButtonRelease, -1000, Qt.LeftButton)
+        assert len(clicks) == 1
+        assert settings.value(key, type=float) == 0
+        assert widget._placement[1].x() == 0
+        pointer(QEvent.MouseButtonPress, 200, Qt.LeftButton)
+        pointer(QEvent.MouseMove, 2000)
+        pointer(QEvent.MouseButtonRelease, 2000, Qt.LeftButton)
+        assert settings.value(key, type=float) == 1
+        assert widget._placement[1].right() == 599
+        pointer(QEvent.MouseButtonPress, 200, Qt.LeftButton)
+        pointer(QEvent.MouseMove, -1000)
+        widget.set_enabled(False)
+        pointer(QEvent.MouseButtonRelease, -1000, Qt.LeftButton)
+        assert settings.value(key, type=float) == 1
+    finally:
+        widget.close(); widget.destroy()
+    restored = TaskbarQuota(settings)
+    try:
+        restored.set_enabled(True)
+        assert restored._placement[1].right() == 599
+    finally:
+        restored.close(); restored.destroy()
+
+
+@pytest.mark.parametrize('width,ratio', [(600, 1), (900, 1.5), (1200, 2)])
+def test_manual_geometry_scales_without_clock_probe(width, ratio):
+    from cachemonitor.taskbar import NativeTaskbar
+    native = NativeTaskbar.__new__(NativeTaskbar)
+    native.rect = lambda host, client=False: QRect(0, 0, width, round(48 * ratio))
+    rect = native.manual_geometry(1, ratio, .5)
+    assert rect.width() == round(100 * ratio)
+    assert rect.x() == round((width - rect.width()) * .5)
+    assert rect.y() == (round(48 * ratio) - rect.height()) // 2
+
+
+def test_drag_layout_change_cancels_without_saving(tmp_path, owned_taskbar, monkeypatch):
+    from PySide6.QtCore import QEvent, QPointF
+    from PySide6.QtGui import QMouseEvent
+    app = QApplication.instance() or QApplication([])
+    settings = QSettings(str(tmp_path / 'cancel.ini'), QSettings.IniFormat)
+    widget = TaskbarQuota(settings)
+    try:
+        widget.set_enabled(True)
+        context, rect, key = widget._placement
+        widget._gesture = dict(context=context, rect=rect, key=key,
+                               press=QPointF(200, 120), moved=True, fraction=.1)
+        original = widget.native.rect
+        monkeypatch.setattr(widget.native, 'rect', lambda hwnd, client=False:
+                            QRect(0, 0, 800, 48) if client else original(hwnd))
+        app.sendEvent(widget, QMouseEvent(QEvent.MouseButtonRelease, QPointF(20, 15),
+                      QPointF(250, 120), Qt.LeftButton, Qt.NoButton, Qt.NoModifier))
+        assert widget._gesture is None
+        assert not settings.contains(key)
+    finally:
+        widget.close(); widget.destroy()

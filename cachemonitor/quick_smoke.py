@@ -119,7 +119,14 @@ def start_smoke(window,app,path,fonts,depth='full'):
             assert named_item(links.quick.rootObject(),'nav-composition-input') is None
             assert not any(link.get('formula') for link in model.monitor_links())
             scale=model.appearance.scale
-            assert not links.mask().contains(QPoint(round(50*scale),round((model.layout()['rows']+9)*scale)))
+            assert links.mask().contains(QPoint(round(50*scale),round((model.layout()['rows']+9)*scale)))
+            composition_links=[link for link in model.monitor_links()
+                               if link['x']<=50<link['x']+link['width'] and
+                               link['y']<=model.layout()['rows']+9<link['y']+link['height']]
+            assert composition_links and all(link.get('interaction')=='tooltip' for link in composition_links)
+            selected=model.selected_id
+            for link in composition_links:links.view.activateLink(link['id'])
+            assert model.selected_id==selected
             previous_tab,previous_unit=model.monitor_tab,model.composition_unit
             size=(model.panel_width(),model.panel_height())
             for tab in ('latest','history'):

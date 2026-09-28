@@ -22,7 +22,11 @@ Item {
             color: (appTheme.palette && appTheme.color("secondary"))
             Text { id: headerLabel; anchors.fill: parent; anchors.margins: 9; text: appLanguage.text(display); elide: Text.ElideRight; verticalAlignment: Text.AlignVCenter; color: (appTheme.palette && appTheme.color("muted")); font.pixelSize: 14; font.weight: Font.Medium; font.family: appTheme.family }
             HoverHandler { id: headerHover }
-            UiToolTip { visible: headerHover.hovered && headerLabel.truncated; text: appLanguage.text(display) }
+            UiToolTip {
+                property string explanation: (root.viewState.headerTips || {})[column] || ""
+                visible: headerHover.hovered && (explanation.length > 0 || headerLabel.truncated)
+                text: appLanguage.text(explanation || display)
+            }
             MouseArea {
                 objectName: "column-resizer-" + column
                 anchors.right: parent.right; anchors.top: parent.top; anchors.bottom: parent.bottom; width: 8

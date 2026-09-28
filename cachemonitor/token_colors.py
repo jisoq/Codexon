@@ -102,7 +102,8 @@ def _palette(surface, ink, accent, panel_surface):
     for key in (*TOKEN_ROLES,'accent'):p[key+'_text']=readable(p[key],backgrounds)
     p['warning_surface']=mix(surface,p['warning'],.09)
     p['warning_hover']=mix(surface,p['warning'],.16)
-    p['tooltip_surface']=panel;p['tooltip_ink']=ink
+    p['tooltip_surface']=ink
+    p['tooltip_ink']=readable(surface,(ink,))
     hit=QColor(surface);hit.setAlpha(1);p['hit_surface']=hit.name(QColor.HexArgb)
     return tuple(p.items())
 

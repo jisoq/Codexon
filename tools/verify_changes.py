@@ -76,6 +76,8 @@ GROUPS = {
 
 # First match wins: QML and shared helpers must not fall through to a broad UI gate.
 RULES = (
+    ("tools/preview_overlay.py", ("overlay_render",)),
+    ("cachemonitor/tooltips.py", ("dashboard", "quota_ui", "overlay_render", "translation")),
     ('cachemonitor/proxy_identity.py', ('proxy_lifecycle','install')),
     ('cachemonitor/proxy_target.py', ('proxy_lifecycle','install')),
     ('cachemonitor/cache_db.py', ('cache','cache_ui','cache_connection','proxy_lifecycle')),

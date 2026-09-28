@@ -38,7 +38,7 @@ def test_child_call_navigation_and_scope_switch_guard():
     content=SimpleNamespace(data=dict(home='h',id='root',members=[('h','root'),('h','child')],latest=row))
     target=navigation_target(content.data,'call');assert target.sid=='child'
     nav=NavigationModel(content);received=[];nav.navigationRequested.connect(received.append)
-    nav.link_state([dict(id='call',target=target)]);nav.keyboardActivate('call');assert received==[target]
+    nav.link_state([dict(id='call',target=target)]);nav.activateLink('call');assert received==[target]
     nav.captureNavigation('call');content.data={**content.data,'id':'different'};nav.activateNavigation();assert received==[target]
 
 
@@ -80,7 +80,7 @@ def test_compact_pills_and_hover_keep_latest_and_selection():
     nav.inspectCall('');assert content.inspected_call is None
 
 
-def test_layout_collapses_notices_and_composition_has_no_hit_regions():
+def test_layout_collapses_notices_and_composition_has_tooltip_only_regions():
     from copy import deepcopy
     from PySide6.QtWidgets import QApplication
     from cachemonitor.overlay_view import OverlayContent
@@ -99,11 +99,11 @@ def test_layout_collapses_notices_and_composition_has_no_hit_regions():
     assert base['divider']==base['rows']+3*18+12
     assert [r['id'] for r in m.monitor_links() if r['id'].startswith('tab-')]==['tab-latest','tab-history']
     assert not any(r.get('formula') or r['id'].startswith('composition-') for r in m.monitor_links())
-    # Every category location remains outside all native hit rectangles.
+    # Composition tooltips must never become navigation or mutation targets.
     for x,count in ((28,3),(204,2)):
         for i in range(count):
             px,py=x+20,base['rows']+i*18+9
-            assert not any(r['x']<=px<r['x']+r['width'] and r['y']<=py<r['y']+r['height'] for r in m.monitor_links())
+            assert not any(r['x']<=px<r['x']+r['width'] and r['y']<=py<r['y']+r['height'] for r in m.monitor_links() if r.get('interaction')!='tooltip')
     for tab in ('history','latest'):
         m.monitor_action('tab-'+tab)
         for unit in ('usd','tokens'):
@@ -206,3 +206,28 @@ def test_graph_pin_toggle_refresh_and_window_expiry():
     assert not m.graph_pinned and m.follow_latest
     m.pin_call(m.call_id(m.rows()[0]));m.monitor_action('tab-latest')
     assert not m.graph_pinned
+
+
+def test_english_recent_call_number():
+    from PySide6.QtWidgets import QApplication
+    from PySide6.QtGui import QImage,QPainter
+    from cachemonitor.overlay_view import OverlayContent,Drawing
+    from cachemonitor.overlay_monitor import paint
+    from cachemonitor.i18n import set_language,formatted
+    from test_overlay_presentation import summary
+    app=QApplication.instance() or QApplication([])
+    try:
+        set_language('en')
+        assert str(formatted('{number}번: ',number=2))=='Call 2: '
+        m=OverlayContent();m.set_content(summary());m.monitor_tab='history';m.inspected_call=m.call_id(m.rows()[0])
+        canvas=QImage(m.panel_width(),m.panel_height(),QImage.Format_ARGB32_Premultiplied)
+        painter=QPainter(canvas)
+        class Capture(Drawing):
+            labels=[]
+            def text(self,value,*args,**kwargs):self.labels.append(str(value));super().text(value,*args,**kwargs)
+        drawing=Capture(painter,m)
+        try:paint(drawing,m)
+        finally:painter.end()
+        assert any('Call 1:' in text for text in drawing.labels)
+        assert not any('번:' in text for text in drawing.labels)
+    finally:set_language('ko')

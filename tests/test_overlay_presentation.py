@@ -87,13 +87,13 @@ def test_call_selection_is_by_identifier_and_never_changes_monitor():
     app=QApplication.instance() or QApplication([]);w=SessionOverlay();data=summary(count=24)
     try:
         w.set_content(data);m=w.content_model;latest=m.selected_id
-        m.detailGraph.key(Qt.Key_Home);old=m.selected_id;before=w.lines()
+        m.select(m.call_id(m.rows()[0]));old=m.selected_id;before=w.lines()
         assert old!=latest and not m.follow_latest
         updated=summary(count=25);w.set_content(updated)
         assert m.selected_id==old and m.call_id(m.selected())==old and w.lines()[3:7]==[percent(updated['cache_rate']),money(updated['cost']),money(updated['mean_cost']),money(updated['latest_cost'])]
-        m.detailGraph.key(Qt.Key_End);assert m.follow_latest
+        m.select(m.call_id(m.rows()[-1]));assert m.follow_latest
         w.set_content(summary(count=26));assert m.selected_id==m.call_id(m.rows()[-1])
-        m.detailGraph.key(Qt.Key_Left);fixed=m.selected_id
+        m.select(m.call_id(m.rows()[-2]));fixed=m.selected_id
         body=copy.deepcopy(m._detail_items)
         m.detailGraph.hover_at(208-4,50)
         assert m.selected_id==fixed and m.call_id(m.selected())==fixed and m._detail_items==body

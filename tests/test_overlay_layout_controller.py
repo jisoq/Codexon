@@ -45,9 +45,7 @@ def test_collection_error_does_not_advance_last_confirmed_time(monkeypatch):
 def layout_controller(tmp_path,monkeypatch):
     app=QApplication.instance() or QApplication([])
     controller=OverlayController(QSettings(str(tmp_path/'overlay.ini'),QSettings.IniFormat),native_enabled=False)
-    # Test cross-window Qt keyboard routing without requiring foreground rights
-    # in the hosted runner's Windows service session. Native placement is still
-    # exercised by test_native_companion_keyboard_routes below.
+    # Keep mouse-driven companion activation deterministic on the QA desktop.
     for control in controller.chrome:
         original=control.activateWindow
         def activate(control=control,original=original):
@@ -82,37 +80,6 @@ def test_popup_outside_click_escape_order_and_persisted_opacity(layout_controlle
     assert controller.settings.value('overlay/opacity',type=int)==63
 
 
-def check_keyboard_focus_path(layout_controller):
-    from PySide6.QtCore import Qt
-    from PySide6.QtQuick import QQuickItem
-    from PySide6.QtTest import QTest
-    controller=layout_controller
-    controller.toggle_expanded()
-    from cachemonitor.overlay_chrome import named_item
-    def item(control,name):return named_item(control.quick.rootObject(),name)
-    def key(control,value,modifier=Qt.NoModifier):
-        QTest.keyClick(control.quick,value,modifier);QTest.qWait(20)
-    controller.focus_control('detailScroll')
-    body=item(controller.detail,'detailScroll')
-    assert body.hasActiveFocus()
-    key(controller.detail,Qt.Key_End)
-    assert body.property('contentY')==max(0,body.property('contentHeight')-body.height())
-    key(controller.detail,Qt.Key_Tab,Qt.ShiftModifier)
-    assert item(controller.detail,'closeDetail').hasActiveFocus()
-    key(controller.detail,Qt.Key_Tab,Qt.ShiftModifier)
-    assert item(controller.detail,'openDashboard').hasActiveFocus()
-    key(controller.detail,Qt.Key_Escape)
-    assert not controller.expanded
-    assert item(controller.actions,'expand').hasActiveFocus()
-    key(controller.actions,Qt.Key_Return)
-    assert controller.expanded and body.hasActiveFocus()
-    key(controller.detail,Qt.Key_Tab)
-    assert item(controller.actions,'opacityButton').hasActiveFocus()
-    key(controller.actions,Qt.Key_Space)
-    assert controller.popup_open
-    key(controller.toolbar,Qt.Key_Escape)
-    assert not controller.popup_open and controller.expanded
-    assert not any(control.qml_errors for control in controller.chrome)
 
 
 def test_session_collapse_isolated_and_persistent(layout_controller):
@@ -215,74 +182,10 @@ def test_drag_layout_change_keeps_deferred_content(layout_controller,monkeypatch
     c.cancel_drag()
 
 
-@pytest.mark.parametrize('destination',['opacityButton','restore'])
-@pytest.mark.parametrize('tab_activation',[False,True])
-def test_delayed_window_activation_preserves_keyboard_destination(layout_controller,destination,tab_activation):
-    from PySide6.QtCore import Qt,QEvent
-    from PySide6.QtGui import QFocusEvent
-    from PySide6.QtTest import QTest
-    from cachemonitor.overlay_chrome import named_item
-    c=layout_controller
-    if destination=='restore':c.set_collapsed(True)
-    c.focus_control(destination);QTest.qWait(20)
-    control=c.icon if destination=='restore' else c.actions
-    item=named_item(control.quick.rootObject(),destination)
-    # Native activation can arrive after the cross-window Tab request. The
-    # widget's default FocusIn handler then picks its first QML tab stop.
-    app=QApplication.instance()
-    app.sendEvent(control.quick,QFocusEvent(QEvent.FocusOut,Qt.ActiveWindowFocusReason))
-    app.sendEvent(control.quick,QFocusEvent(QEvent.FocusIn,Qt.TabFocusReason if tab_activation else Qt.ActiveWindowFocusReason))
-    QTest.qWait(20)
-    assert item.hasActiveFocus()
-    assert item.property('keyboardFocus' if destination=='restore' else 'visualFocus')
-    if destination=='restore':assert named_item(control.quick.rootObject(),'moveFocusRing').isVisible()
 
 
-def test_queued_keyboard_focus_cannot_override_new_target_or_hidden_window(layout_controller):
-    from PySide6.QtCore import Qt,QEvent
-    from PySide6.QtGui import QFocusEvent
-    from PySide6.QtTest import QTest
-    from cachemonitor.overlay_chrome import named_item
-    c=layout_controller;control=c.actions;app=QApplication.instance()
-    c.focus_control('opacityButton')
-    app.sendEvent(control.quick,QFocusEvent(QEvent.FocusIn,Qt.TabFocusReason))
-    c.focus_control('collapse');QTest.qWait(20)
-    assert named_item(control.quick.rootObject(),'collapse').hasActiveFocus()
-    app.sendEvent(control.quick,QFocusEvent(QEvent.FocusIn,Qt.TabFocusReason))
-    control.hide();QTest.qWait(20)
-    assert not control.isVisible() and not control.quick.hasFocus()
 
 
-def test_native_companion_keyboard_routes(layout_controller):
-    import sys
-    if sys.platform!='win32':pytest.skip('Windows native companion activation')
-    from PySide6.QtWidgets import QWidget
-    from PySide6.QtTest import QTest
-    from cachemonitor.overlay_windows import WindowsOverlay
-    c=layout_controller;host=QWidget();host.resize(1300,1000);host.show()
-    native=WindowsOverlay();hwnd=int(host.winId())
-    # The automation host may deny foreground activation. Keep only this owned
-    # surface visible; test real companion placement and Qt keyboard routing.
-    native.visible_target=lambda h:h==hwnd and bool(native.u.IsWindowVisible(h) and not native.u.IsIconic(h)
-        )
-    native.reduce_motion=lambda:True
-    c.native=native
-    try:
-        host.activateWindow();QTest.qWait(40)
-        c.receive_target({'target':{'hwnd':hwnd},'selection':Selection(A)})
-        check_keyboard_focus_path(c)
-        from PySide6.QtCore import Qt
-        from cachemonitor.overlay_chrome import named_item
-        c.focus_control('collapse')
-        QTest.keyClick(c.actions.quick,Qt.Key_Space);QTest.qWait(20)
-        restore=named_item(c.icon.quick.rootObject(),'restore')
-        assert c.collapsed and restore.hasActiveFocus() and restore.property('keyboardFocus')
-        assert named_item(c.icon.quick.rootObject(),'moveFocusRing').isVisible()
-        QTest.keyClick(c.icon.quick,Qt.Key_Return);QTest.qWait(20)
-        assert not c.collapsed and named_item(c.actions.quick.rootObject(),'expand').hasActiveFocus()
-        assert not c.actions.quick.grabFramebuffer().isNull()
-    finally:
-        c.hide_all();host.close()
 
 
 @pytest.mark.parametrize('dpi',[96,120,144,192])
