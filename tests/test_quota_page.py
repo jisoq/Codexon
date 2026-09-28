@@ -36,10 +36,37 @@ def quota_page(tmp_path):
     activity(ledger,now,{},[now-280,now-190,now-80])
     quota={**quota,'observed_at':now}
     panel=QuotaPanel(QSettings(str(tmp_path/'panel.ini'),QSettings.IniFormat))
+    panel.window.setCurrentIndex(panel.window.findData('weekly'))
     panel.receive({'quota':quota,'report':ledger.report('h',now)})
     scroll=Scroll();scroll.put(fillViewport=True);scroll.setWidget(panel)
     yield app,panel,scroll
     ledger.close()
+
+
+def test_default_history_displays_pretracking_allowance_without_costs(quota_page,tmp_path):
+    app,source,_=quota_page
+    old={**next(r for r in source.report['history'] if r['window']=='weekly'),
+         'at':source.report['tracking']['started']-60,'used':35,'account':''}
+    report={**source.report,'history':[old,*source.report['history']]}
+    report.pop('view',None)
+    panel=QuotaPanel(QSettings(str(tmp_path/'history.ini'),QSettings.IniFormat))
+    panel.receive({'quota':source.quota,'report':report})
+    assert panel.window.currentData()=='weekly_history'
+    host=mount(panel,1120,1000)
+    try:
+        plot=render_plot(host,panel.history)
+        assert panel.history.rows[0]['at']==old['at']
+        assert panel.history.rows[0]['remaining']==65
+        assert '계정 미확인' in panel.history.rows[0]['label']
+        assert not panel.history.rows[1]['connect']
+        assert not panel.history.money and not panel.cycle_choice.isVisible()
+        assert all(r.get('cycle_cost') is None for r in panel.history.rows)
+        plot.activateAt(panel.history.x_at(0),panel.history.box.center().y())
+        assert panel.history.cursor==0
+        host.grab().save(str(tmp_path/'historical-allowance.png'))
+        panel.window.setCurrentIndex(panel.window.findData('weekly'))
+        assert all(r['at']>=report['tracking']['started'] for r in panel.history.rows)
+    finally:dispose(host)
 
 
 @pytest.mark.parametrize('width,height,dark', [(1120,1000,False),(520,900,False),(1120,1000,True)])

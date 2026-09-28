@@ -375,6 +375,7 @@ class QuotaHistory(Plot):
         elif self.visible('cycle_cost') and row.get('cycle_cost') is None:note='금액 확인 중'
         elif self.visible('cycle_value') and row.get('cycle_value') is None:note='동등 가치 계산 대기'
         else:note=''
+        if row.get('observation_note'):note=' · '.join(filter(None,(note,row['observation_note'])))
         return self.with_share(dict(title=clock(row['at'],True),at=row['at'],items=items,note=note),row['at'])
 
     def refresh_detail(self,detail):
