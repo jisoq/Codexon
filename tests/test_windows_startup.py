@@ -14,14 +14,22 @@ import ctypes
 import json
 import sys
 from pathlib import Path
-from PySide6.QtCore import QSettings, QTimer
-from PySide6.QtWidgets import QApplication, QSystemTrayIcon
+from PySide6.QtCore import QRect, QSettings, QTimer, Qt
+from PySide6.QtWidgets import QApplication, QSystemTrayIcon, QWidget
 import cachemonitor.app as ui
 
 root = Path(sys.argv[1])
 ui.QSettings = lambda *_: QSettings(str(root / "settings.ini"), QSettings.IniFormat)
 app = QApplication([])
 app.setQuitOnLastWindowClosed(False)
+# Exercise real native parenting without requiring Explorer on the QA desktop.
+from cachemonitor.taskbar import NativeTaskbar
+host_window = QWidget(None, Qt.Tool | Qt.WindowDoesNotAcceptFocus)
+host_window.resize(600, 48)
+host_window.show()
+host_id = int(host_window.winId())
+NativeTaskbar.host = lambda self: host_id
+NativeTaskbar.dock_geometry = lambda self, host, ratio: QRect(450, 6, 100, 36)
 window = ui.Dashboard([str(root)], start_worker=False)
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 user32.IsWindowVisible.argtypes = (ctypes.c_void_p,)
@@ -32,7 +40,7 @@ user32.IsIconic.restype = ctypes.c_int
 def visible():
     return bool(user32.IsWindowVisible(int(window.winId())))
 
-def check():
+def check_window():
     result = {"initially_hidden": not visible()}
     indicator = window.taskbar_quota
     result["taskbar_native_visible_at_hidden_startup"] = bool(user32.IsWindowVisible(int(indicator.winId())))
@@ -56,10 +64,19 @@ def check():
     window.tray.hide()
     window.quitting = True
     window.close()
+    host_window.close()
     app.quit()
 
+def check():
+    try:
+        check_window()
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        app.exit(1)
+
 QTimer.singleShot(100, check)
-app.exec()
+sys.exit(app.exec())
 '''
     startup = subprocess.STARTUPINFO()
     startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
