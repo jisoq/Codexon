@@ -155,8 +155,7 @@ def test_long_model_names_are_complete_and_wrapped_in_detail(observed_overlay, t
     assert model.base_height()==574  # The unpriced-call note adds one row; long model names add none.
     assert model.layout()['height'] >= model.layout()['status'] + 28
     model.monitor_action('tab-latest')
-    detail_link = next(link for link in model.monitor_links() if link['id'] == 'call-detail')
-    assert detail_link['y'] == model.layout()['tab']
+    assert not any(link['id']=='call-detail' for link in model.monitor_links())
     assert not any(link['id'] in ('cache','cost','speed','latest-context') for link in model.monitor_links())
     item = next(item for item in model.detail_items()
                 if (''.join(item[0]) if isinstance(item[0], list) else item[0]) == expected)
