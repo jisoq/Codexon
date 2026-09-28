@@ -109,6 +109,32 @@ def test_unclassified_connection_waits_without_blocking_ingress(setup,monkeypatc
     assert read_json(u.path)['phase']=='complete' and len(m.task.starts)==1
 
 
+@pytest.mark.parametrize('recovered',['idle','unknown','other-instance'])
+def test_drain_rechecks_identity_and_sends_control_after_initial_health_timeout(setup,monkeypatch,recovered):
+    m,u=setup;source=u.target.capture(m.health());health=m.health;wait=u.sleep;calls=[0]
+    def observed(**kwargs):
+        calls[0]+=1
+        if calls[0]<=2:
+            m.health_state='unknown';return None
+        value=health(**kwargs)
+        if value and recovered=='other-instance':value['instance']='another-worker'
+        if value and recovered=='unknown':value['websocket_states']={'unknown':int(calls[0]==3)}
+        return value
+    def bounded_wait(n):
+        if calls[0]<=2 or recovered=='unknown' and calls[0]==3:
+            assert not (m.directory/('proxy-control-'+m.control+'.json')).exists()
+        assert calls[0]<8,'Recovered health never received the drain request'
+        wait(n)
+    monkeypatch.setattr(m,'health',observed);u.sleep=bounded_wait
+    if recovered=='other-instance':
+        with pytest.raises(RuntimeError,match='인스턴스'):u.drain(source)
+        assert m.version=='old' and not (m.directory/('proxy-control-'+m.control+'.json')).exists()
+    else:
+        u.drain(source)
+        assert u.target.stopped(source) and m.draining
+    assert not m.task.starts
+
+
 def test_failed_start_restores_exact_role_command_and_autostart(setup):
     m,u=setup;old=list(m.command);m.fail_new=True;u.run()
     assert m.version=='old' and m.command==old

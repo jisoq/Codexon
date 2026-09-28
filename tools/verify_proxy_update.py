@@ -103,7 +103,12 @@ def main():
         from cachemonitor.proxy_identity import process_identity,same_process
         old_identity=process_identity(health['pid'])
         peers.open(m.url,options.idle_connections)
-        assert m.health(timeout=3)['active_connections']==options.idle_connections
+        deadline=time.monotonic()+30
+        while time.monotonic()<deadline:
+            observed=m.health(timeout=3)
+            if observed and observed['instance']==previous_instance and observed['active_connections']==options.idle_connections:break
+            time.sleep(.2)
+        else:raise AssertionError(('Previous proxy connections did not become observable',m.health_state,observed))
         previous=dict(version=health['version'],instance=health['instance'],process=old_identity,role='cache-worker' if options.cache_worker else 'observer')
         ProxyUpdate(m).publish('queued',source_instance=health['instance'],cancel_requested=False)
         updater_args=['--cache-worker','--observation-index',str(m.index)] if options.cache_worker else []
