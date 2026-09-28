@@ -184,3 +184,25 @@ def test_hover_repeats_across_columns_refreshes_and_leave():
                 assert m.inspected_call==m.call_id(m.rows()[index])
             QApplication.sendEvent(host.quick,QEvent(QEvent.Leave));assert m.inspected_call is None
     finally:host.close()
+
+
+def test_graph_pin_toggle_refresh_and_window_expiry():
+    from PySide6.QtWidgets import QApplication
+    from cachemonitor.overlay_view import OverlayContent
+    from cachemonitor.overlay_chrome import NavigationModel
+    from test_overlay_presentation import summary
+    app=QApplication.instance() or QApplication([])
+    m=OverlayContent();m.set_content(summary(count=12));m.monitor_action('tab-history')
+    latest=m.selected_id;m.pin_call(latest)
+    m.set_content(summary(count=13))
+    assert m.graph_pinned and m.selected_id==latest and not m.follow_latest
+    NavigationModel(m).inspectCall('call-0')
+    assert m.selected_id==latest
+    m.pin_call(latest)
+    assert not m.graph_pinned and m.selected_id==m.call_id(m.rows()[-1])
+    first=m.call_id(m.rows()[0]);m.pin_call(first);m.pin_call(first,toggle=False)
+    assert m.graph_pinned
+    m.set_content(summary(count=14))
+    assert not m.graph_pinned and m.follow_latest
+    m.pin_call(m.call_id(m.rows()[0]));m.monitor_action('tab-latest')
+    assert not m.graph_pinned

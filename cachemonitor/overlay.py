@@ -42,7 +42,9 @@ class OverlayController(QObject):
         self.links=OverlayLinks(self.widget.content_model)
         self.links.view.navigationRequested.connect(self.navigation_requested)
         self.links.view.detailRequested.connect(self.open_call_detail)
-        self.links.view.callSelected.connect(self.select_call)
+        self.links.view.callSelected.connect(self.pin_call)
+        self.actions.view.detailPressed.connect(self.capture_detail)
+        self.actions.view.detailClicked.connect(self.activate_detail)
         self.detail.view.navigationRequested.connect(self.navigation_requested)
         self.links.wheel_forwarder=self.forward_wheel
         self.chrome=(self.header,self.toolbar,self.icon,self.actions,self.detail,self.links)
@@ -132,6 +134,27 @@ class OverlayController(QObject):
         self._pointer_down=False
         if self.native and self.enabled: self.timer.start(1000)
 
+    def pin_call(self,value):
+        target,snapshot=value
+        content=self.widget.content_model
+        if snapshot and any(content.call_id(r)==content.call_id(snapshot) for r in content.rows()):
+            self.pending_record=None;content.pin_call(content.call_id(snapshot))
+
+    def capture_detail(self):
+        from .overlay_navigation import navigation_target
+        c=self.widget.content_model;data=c.data or {}
+        row=c.selected() if c.monitor_tab=='history' and c.graph_pinned else data.get('latest') or {}
+        self._detail_capture=((data.get('home'),data.get('id')),navigation_target(data,'call',call=row),dict(row),self.expanded)
+
+    def activate_detail(self):
+        captured=getattr(self,'_detail_capture',None);self._detail_capture=None
+        if not captured:return
+        scope,target,row,expanded=captured;data=self.widget.content_model.data or {}
+        if scope!=(data.get('home'),data.get('id')):return
+        if expanded:
+            self.toggle_expanded();self.focus_control('expand')
+        elif target:self.open_call_detail((target,row))
+
     def select_call(self,value):
         target,snapshot=value
         content=self.widget.content_model
@@ -139,7 +162,10 @@ class OverlayController(QObject):
                   (r.get('home'),r.get('sid'),str(r.get('id')))==(target.home,target.sid,target.call_id)),None)
         if not row:return False
         self.pending_record=None;content.selected_snapshot=row;content.selected_id=content.call_id(row)
-        content.select(content.call_id(row));content.update()
+        pinned=content.graph_pinned
+        content.select(content.call_id(row))
+        if pinned:content.follow_latest=False
+        content.update()
         return True
 
     def open_call_detail(self,target):
@@ -210,6 +236,7 @@ class OverlayController(QObject):
         self.observed_at=time.monotonic();self.target_state={**self.target_state,'selection':selection}
         self.refresh()
         if call_id:
+            self.widget.content_model.graph_pinned=False
             self.widget.content_model.select(call_id)
             if missing:
                 self.record_serial+=1;request=f'overlay-record-{self.record_serial}'
@@ -310,7 +337,7 @@ class OverlayController(QObject):
             self.view_animation.setEndValue(1.)
             self.view_animation.start()
         else:self.advance_view(1.)
-        if keyboard:self.focus_control('restore' if self.automatic_mode=='icon' else 'call-detail')
+        if keyboard:self.focus_control('restore' if self.automatic_mode=='icon' else 'expand')
 
     def advance_view(self, value):
         for control in (self.widget,self.shadow,*self.chrome):control.setWindowOpacity(float(value))
@@ -486,7 +513,7 @@ class OverlayController(QObject):
             self.native.activate_companion(int(control.winId()))
 
     def focus_control(self, name):
-        if name in ('monitorLinks','monitorLinksLast','call-detail'):
+        if name in ('monitorLinks','monitorLinksLast'):
             if self.links.isVisible():
                 self.activate_control(self.links);self.links.focus_control(name);return
             name='dragTitle' if name=='monitorLinks' else 'collapse'
@@ -521,7 +548,7 @@ class OverlayController(QObject):
             return
         elif self.expanded:
             self.toggle_expanded()
-            self.focus_control('call-detail')
+            self.focus_control('expand')
             return
         target=self.target_state.get('target')
         if self.native and target and hasattr(self.native,'restore_target_focus'):

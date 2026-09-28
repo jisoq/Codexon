@@ -77,7 +77,9 @@ def test_dashboard_navigation_validates_session_and_selects_old_event_call(layou
     activated=[];c.native.confirm_selection=lambda window:Selection(data['id'])
     c.native.activate_target=lambda hwnd:activated.append(hwnd) or True
     target=navigation_target(data,'incident',event=data['cache_degradation']['events'][0])
+    c.widget.content_model.pin_call(c.widget.content_model.call_id(c.widget.content_model.rows()[0]))
     assert c.navigate_from_dashboard(target)['enabled']
+    assert not c.widget.content_model.graph_pinned
     c.receive_record({'id':requests[-1],'row':old_row})
     assert activated==[1] and c.widget.content_model.selected_id==c.widget.content_model.call_id(old_row)
     received=[];c.navigation_requested.connect(received.append)
@@ -113,15 +115,15 @@ def test_unique_entries_selection_and_captured_call(layout_controller):
     c.receive_snapshot({'overlay_sessions':[data]})
     c.receive_target({'target':{'hwnd':1},'selection':Selection(data['id'])})
     m=c.widget.content_model;received=[];c.navigation_requested.connect(received.append)
-    assert {r['id'] for r in m.monitor_links() if r.get('target')}=={'session','call-detail'}
+    assert {r['id'] for r in m.monitor_links() if r.get('target')}=={'session'}
     c.links.view.keyboardActivate('session')
     assert received[-1].sort=='time_desc' and received[-1].view=='requests'
     m.monitor_action('tab-history');c.refresh()
     c.links.view.keyboardActivate('call-0')
     assert not c.expanded and m.selected_id==m.call_id(data['recent'][0])
-    c.links.view.captureNavigation('call-detail')
+    c.capture_detail()
     c.receive_snapshot({'overlay_sessions':[summary(count=40)]})
-    c.links.view.activateNavigation()
+    c.activate_detail()
     assert c.expanded and m.selected()['id']==data['recent'][0]['id']
     assert not m.detail_links()
     formulas=[r[0] for r in m._detail_items]
@@ -136,9 +138,41 @@ def test_passive_metrics_and_inline_header_regions(layout_controller):
     c.links.sync()
     assert not c.links.mask().contains(QPoint(50,m.layout()['cache']+35))
     assert not c.links.mask().contains(QPoint(50,m.layout()['result_value']+10))
-    assert named_item(c.actions.quick.rootObject(),'expand') is None
+    assert named_item(c.actions.quick.rootObject(),'expand') is not None
     c.expanded=True;c.native.bounds=(0,0,550,1000);c.refresh()
     if m.detail_inline:
         assert c.header.width()==round(134*m.appearance.scale)
     assert named_item(c.detail.quick.rootObject(),'closeDetail') is not None
     assert not any(control.qml_errors for control in c.chrome)
+
+
+def test_header_pointer_and_graph_pin_values(layout_controller,monkeypatch):
+    from PySide6.QtCore import Qt,QPoint
+    from PySide6.QtTest import QTest
+    from PySide6.QtGui import QImage,QPainter
+    from cachemonitor.overlay_view import Drawing
+    from cachemonitor.overlay_chrome import named_item
+    c=layout_controller;m=c.widget.content_model
+    m.monitor_action('tab-history');c.refresh()
+    def click_call(index):
+        link=next(r for r in m.monitor_links() if r['id']=='call-'+str(index))
+        QTest.mouseClick(c.links.quick,Qt.LeftButton,Qt.NoModifier,QPoint(round((link['x']+link['width']/2)*m.appearance.scale),round((link['y']+20)*m.appearance.scale)))
+        QTest.qWait(20)
+    click_call(0);assert m.graph_pinned
+    values=[];original=Drawing.text
+    def record(d,text,*args,**kw):
+        values.append(str(text));return original(d,text,*args,**kw)
+    monkeypatch.setattr(Drawing,'text',record)
+    def render():
+        values.clear();image=QImage(m.panel_width(),m.panel_height(),QImage.Format_ARGB32_Premultiplied);image.fill(0)
+        painter=QPainter(image);m.paint(painter);painter.end();return list(values)
+    before=render();c.links.view.inspectCall('call-1');assert render()==before
+    button=named_item(c.actions.quick.rootObject(),'expand')
+    point=button.mapToScene(button.boundingRect().center()).toPoint()
+    QTest.mouseClick(c.actions.quick,Qt.LeftButton,Qt.NoModifier,point);QTest.qWait(30)
+    assert c.expanded
+    QTest.mouseClick(c.actions.quick,Qt.LeftButton,Qt.NoModifier,point);QTest.qWait(30)
+    assert not c.expanded
+    click_call(0);assert not m.graph_pinned
+    c.capture_detail();m.set_content(dict(m.data,id='changed'));c.activate_detail()
+    assert not c.expanded

@@ -103,8 +103,8 @@ def check_keyboard_focus_path(layout_controller):
     assert item(controller.detail,'openDashboard').hasActiveFocus()
     key(controller.detail,Qt.Key_Escape)
     assert not controller.expanded
-    assert item(controller.links,'nav-call-detail').hasActiveFocus()
-    key(controller.links,Qt.Key_Return)
+    assert item(controller.actions,'expand').hasActiveFocus()
+    key(controller.actions,Qt.Key_Return)
     assert controller.expanded and body.hasActiveFocus()
     key(controller.detail,Qt.Key_Tab)
     assert item(controller.actions,'opacityButton').hasActiveFocus()
@@ -279,7 +279,25 @@ def test_native_companion_keyboard_routes(layout_controller):
         assert c.collapsed and restore.hasActiveFocus() and restore.property('keyboardFocus')
         assert named_item(c.icon.quick.rootObject(),'moveFocusRing').isVisible()
         QTest.keyClick(c.icon.quick,Qt.Key_Return);QTest.qWait(20)
-        assert not c.collapsed and named_item(c.links.quick.rootObject(),'nav-call-detail').hasActiveFocus()
+        assert not c.collapsed and named_item(c.actions.quick.rootObject(),'expand').hasActiveFocus()
         assert not c.actions.quick.grabFramebuffer().isNull()
     finally:
         c.hide_all();host.close()
+
+
+@pytest.mark.parametrize('dpi',[96,120,144,192])
+@pytest.mark.parametrize('font_size',[14,21])
+def test_fallback_boundaries_preserve_anchor(layout_controller,monkeypatch,dpi,font_size):
+    from dataclasses import replace
+    c=layout_controller;c.appearance=replace(c.appearance,font_size=font_size)
+    monkeypatch.setattr(c.native.u,'GetDpiForWindow',lambda hwnd:dpi)
+    c.native.bounds=(0,0,2400,2400);c.refresh()
+    m=c.widget.content_model;factor=dpi/96;gap=round(16*factor)
+    full=round(m.monitor_height(False)*factor);compact=round(m.monitor_height(True)*factor)
+    width=round(700*c.appearance.scale*factor)+2*gap;anchor=c.anchor
+    for height,reduced,icon in ((full,False,False),(full-1,True,False),(compact,True,False),(compact-1,True,True),(full,False,False)):
+        c.native.bounds=(0,0,width,height+2*gap);c.refresh()
+        assert (c.automatic_mode=='icon')==icon
+        assert m.compact==reduced and c.anchor==anchor and not c.collapsed
+    c.expanded=True;c.native.bounds=(0,0,round(380*c.appearance.scale*factor)+2*gap,full+2*gap);c.refresh()
+    assert c.automatic_mode=='detail-inline'

@@ -277,7 +277,7 @@ class OverlayContent(Node):
     def __init__(self):
         super().__init__();self.data=None;self.note='기록 확인 중';self.opacity=94;self.appearance=default_appearance(True);self.dark=True;self.compact=False
         self.detail_open=False;self.detail_inline=False;self.detail_width=208
-        self.selected_id=None;self.selected_snapshot=None;self.hover_id=None;self.follow_latest=True;self.quota_lines=('','')
+        self.selected_id=None;self.selected_snapshot=None;self.hover_id=None;self.follow_latest=True;self.graph_pinned=False;self.quota_lines=('','')
         self.monitor_tab='latest';self.composition_unit='tokens';self.lower_offset=0;self.settings=None
         self.highlight_id=None;self._highlight_timer=QTimer(self);self._highlight_timer.setSingleShot(True)
         self._highlight_timer.timeout.connect(self.clear_highlight)
@@ -306,13 +306,15 @@ class OverlayContent(Node):
         old=(self.data or {}).get('id'),(self.data or {}).get('home');new=(data or {}).get('id'),(data or {}).get('home')
         old_call=self.call_id(self.rows()[-1]) if self.rows() else None
         if old!=new:
-            self.selected_id=None;self.selected_snapshot=None;self.hover_id=None;self.follow_latest=True
+            self.selected_id=None;self.selected_snapshot=None;self.hover_id=None;self.follow_latest=True;self.graph_pinned=False
         self.data=data;self.note=note;self.appearance=appearance;self.dark=appearance.dark
         self.lower_offset=min(self.lower_offset,max(0,self.base_height(False)-self.base_height()))
         if old!=new:self.inspected_call=None;self.lower_offset=0;self.clear_highlight()
         elif self.rows() and old_call!=self.call_id(self.rows()[-1]) and not self.state.get('reducedMotion'):
             self.highlight_id=self.call_id(self.rows()[-1]);self._highlight_timer.start(120)
-        if not self.rows():self.selected_id=None;self.selected_snapshot=None;self.hover_id=None;self.follow_latest=True
+        if not self.rows():self.selected_id=None;self.selected_snapshot=None;self.hover_id=None;self.follow_latest=True;self.graph_pinned=False
+        if self.graph_pinned and not any(self.call_id(r)==self.selected_id for r in self.rows()):
+            self.release_pin()
         if self.follow_latest and self.rows():self.selected_snapshot=self.rows()[-1];self.selected_id=self.call_id(self.selected_snapshot)
         elif self.selected_id:self.selected_snapshot=next((r for r in self.rows() if self.call_id(r)==self.selected_id),self.selected_snapshot)
         self.put(overlayScale=appearance.scale,overlayInk=appearance.ink,overlayAccent=palette(appearance)['accent'].name(),collecting=False);self.sync_details();self.refresh_accessibility();self.update()
@@ -326,6 +328,16 @@ class OverlayContent(Node):
         self.selected_id=key;self.hover_id=None;self.selected_snapshot=next((r for r in self.rows() if self.call_id(r)==key or str(r.get('id'))==str(key)),previous)
         if self.selected_snapshot:self.selected_id=self.call_id(self.selected_snapshot)
         self.follow_latest=bool(self.rows() and self.selected_id==self.call_id(self.rows()[-1]));self.sync_details()
+    def pin_call(self,key,toggle=True):
+        if toggle and self.graph_pinned and self.selected_id==key:self.release_pin()
+        else:
+            self.select(key);self.graph_pinned=True;self.follow_latest=False
+        self.update()
+    def release_pin(self):
+        self.graph_pinned=False;self.follow_latest=True
+        rows=self.rows();self.selected_snapshot=rows[-1] if rows else None
+        self.selected_id=self.call_id(rows[-1]) if rows else None
+        self.sync_details()
     def selected(self):return next((r for r in self.rows() if self.call_id(r)==self.selected_id),self.selected_snapshot or {})
     def speed_alert(self):
         # Collection trouble is not evidence that the current session is slow.
@@ -344,7 +356,9 @@ class OverlayContent(Node):
         return links(self)
 
     def monitor_action(self,action):
-        if action.startswith('tab-'):self.monitor_tab=action[4:];self.lower_offset=0
+        if action.startswith('tab-'):
+            if self.graph_pinned:self.release_pin()
+            self.monitor_tab=action[4:];self.lower_offset=0
         elif action.startswith('unit-'):self.composition_unit=action[5:]
         if self.settings is not None:
             self.settings.setValue('overlay/monitorTab',self.monitor_tab)
@@ -462,7 +476,7 @@ class OverlayContent(Node):
         d=self.data or {};row=self.selected();w=self.detail_width;items=[];y=0
         def text(value,x=0,width=None,size=11,color='ink',weight=400,height=18,at=None,right=False,kind=None):
             nonlocal y
-            yy=y if at is None else at;limit=width if width is not None else w;value=str(value)
+            yy=y if at is None else at;limit=width if width is not None else w;value=tr(str(value))
             if at is None:
                 metrics=QFontMetrics(font(self.appearance.family,size,weight));lines=[];line=''
                 for char in value:
@@ -476,6 +490,7 @@ class OverlayContent(Node):
             nonlocal y
             first=len(items)
             formula=formula or CALCULATIONS.get(label)
+            value=tr(str(value))
             metrics=QFontMetrics(font(self.appearance.family,11))
             if numeric and metrics.horizontalAdvance(str(value))>w-92:
                 text(label,color='secondary');items[first][8]['formula']=formula

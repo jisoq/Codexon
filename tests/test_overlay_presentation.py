@@ -40,6 +40,49 @@ def test_english_overlay_keeps_session_title_pixels(tmp_path):
         w.close();set_language('ko');app.processEvents()
 
 
+def test_english_overlay_translates_visible_text_before_detail_layout(monkeypatch):
+    import re
+    from PySide6.QtGui import QFontMetrics
+    from cachemonitor.i18n import set_language, tr, Verbatim
+    from cachemonitor.overlay_view import Drawing, font
+    app=QApplication.instance() or QApplication([])
+    data=summary(misses=2);data['title']='Sample task'
+    for row in (data['latest'],data['recent'][-1]):
+        row.update(output_speed=72.0,completion_latency_ms=40560,
+                   requested_model='gpt-6-astra',response_model='gpt-6-astra',
+                   model_match='일치',model_setting=False,
+                   transport='WebSocket',transport_source='response_id')
+    original=copy.deepcopy(data);drawn=[]
+    draw_text=Drawing.text
+    def record(d,value,*args,**kwargs):
+        drawn.append(tr(value))
+        return draw_text(d,value,*args,**kwargs)
+    monkeypatch.setattr(Drawing,'text',record)
+    set_language('en');w=SessionOverlay()
+    try:
+        w.set_content(data);w.set_layout(detail=True);m=w.content_model
+        for unit in ('tokens','usd'):
+            for tab in ('latest','history'):
+                m.monitor_action('unit-'+unit);m.monitor_action('tab-'+tab)
+                image=QImage(m.panel_width(),m.panel_height(),QImage.Format_ARGB32_Premultiplied)
+                image.fill(0);p=QPainter(image);m.paint(p);p.end()
+        detail=[line for item in m._detail_items for line in (item[0] if isinstance(item[0],list) else [item[0]])]
+        assert not [value for value in drawn+detail if re.search('[가-힣]',value)]
+        assert 'Output speed' in drawn and 'Current' in drawn and 'Recent' in drawn
+        assert '40.56 s' in detail
+        assert data==original
+        # Full sentences must be translated before line splitting, not fragment by fragment.
+        formulas=[item for item in m._detail_items if isinstance(item[0],list)]
+        assert formulas
+        for item in formulas:
+            metrics=QFontMetrics(font(m.appearance.family,item[5],item[7]))
+            assert all(metrics.horizontalAdvance(line)<=item[3] for line in item[0])
+        assert tr(Verbatim('세션 2회 40.56초'))=='세션 2회 40.56초'
+    finally:
+        w.close();set_language('ko');app.processEvents()
+    assert tr('40.56초 · 2회')=='40.56초 · 2회'
+
+
 def test_call_selection_is_by_identifier_and_never_changes_monitor():
     app=QApplication.instance() or QApplication([]);w=SessionOverlay();data=summary(count=24)
     try:

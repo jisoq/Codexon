@@ -134,6 +134,15 @@ Rectangle {
         width: 70 * root.s.scale; height: 22 * root.s.scale
         visible: root.s.chromeKind === "actions"
         IconButton {
+            objectName: "expand"; x: 0; glyph: "detail"; selected: root.s.expanded
+            actionName: appLanguage.text(root.s.expanded ? "상세 닫기 · 열림" : "상세 열기 · 닫힘")
+            onPressed: { root.presentation.startInteraction(); forceActiveFocus(Qt.MouseFocusReason); root.presentation.captureDetail(); }
+            onClicked: root.presentation.toggleDetail()
+            Keys.onReturnPressed: { root.presentation.captureDetail(); root.presentation.toggleDetail(); }
+            Keys.onEnterPressed: { root.presentation.captureDetail(); root.presentation.toggleDetail(); }
+            Accessible.onPressAction: { root.presentation.captureDetail(); root.presentation.toggleDetail(); }
+        }
+        IconButton {
             id: opacityButton
             objectName: "opacityButton"; x: 24 * root.s.scale; glyph: "opacity"; selected: root.s.popupOpen
             actionName: root.s.popupOpen ? appLanguage.text("투명도 닫기 · 열림") : appLanguage.text("투명도 열기 · 닫힘")

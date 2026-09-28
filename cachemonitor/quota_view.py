@@ -118,7 +118,8 @@ def prepare_series(rows):
     """Bound drawing size while retaining extrema and exact selectable records."""
     times=[];breaks=[];gaps=0;maximum=0;low=float('inf');high=0;cost_maximum=0;value_maximum=0
     value_minimum=None
-    completed=completed_percent_costs(rows)
+    calculated=completed_percent_costs(rows)
+    completed=[row.get('completed_cost',calculated[i]) for i,row in enumerate(rows)]
     completed_maximum=max((value for value in completed if value is not None),default=0)
     missing={key:[] for key in ('cycle_cost','cycle_value','completed_cost')}
     counts={key:0 for key in missing}
@@ -180,6 +181,8 @@ def prepare_quota_view(report):
     from .pricing import usd
     from .quota_share import prepare_model_share
     rows,periods=quota_value_history(report,history_rows(report,'weekly'))
+    completed=completed_percent_costs(rows)
+    rows=[{**row,'completed_cost':amount} for row,amount in zip(rows,completed)]
     times=[r['at'] for r in rows]
     overall=[];offset_cost=offset_delta=0;resets=[]
     for i,period in enumerate(periods):
