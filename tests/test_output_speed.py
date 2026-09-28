@@ -99,9 +99,12 @@ def test_rendered_summary_click_and_overlay_speed_navigation(tmp_path):
         assert overlay.quick.grabFramebuffer().save(str(tmp_path/'overlay.png'))
         m.monitor_action('tab-latest')
         links.setGeometry(overlay.geometry());links.sync();links.show();QTest.qWait(30)
-        targets=[];links.view.detailRequested.connect(lambda value:targets.append(value[0]))
-        item=named_item(links.quick.rootObject(),'nav-call-detail')
-        click(links,item)
+        # Detail entry lives in the header; the detail panel owns dashboard navigation.
+        from cachemonitor.overlay_chrome import DetailModel
+        detail=DetailModel(m);targets=[];detail.navigationRequested.connect(targets.append)
+        detail.captureNavigation('selected');detail.activateNavigation()
+        detail.content.changed.disconnect(detail.sync)
+        assert named_item(links.quick.rootObject(),'nav-call-detail') is None
         assert targets[-1].call_id==data['latest']['id'] and targets[-1].section=='identity'
         window.navigate(targets[-1])
         for _ in range(40):

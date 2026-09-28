@@ -16,6 +16,12 @@ def named_item(root,name):
 
 
 class ChromeModel(Node):
+    detailPressed = Signal()
+    detailClicked = Signal()
+    @Slot()
+    def captureDetail(self): self.detailPressed.emit()
+    @Slot()
+    def toggleDetail(self): self.detailClicked.emit()
     opacityRequested = Signal(int)
     collapseRequested = Signal()
     opacityToggleRequested = Signal()
@@ -181,13 +187,14 @@ class OverlayChrome(OverlayHost):
     def eventFilter(self, watched, event):
         if watched is self.quick and event.type()==QEvent.KeyPress and event.key() in (Qt.Key_Tab,Qt.Key_Backtab):
             reverse=event.key()==Qt.Key_Backtab or bool(event.modifiers() & Qt.ShiftModifier)
-            if self.kind=='header':target='monitorLinksLast' if reverse else 'opacityButton'
+            if self.kind=='header':target='monitorLinksLast' if reverse else 'expand'
             elif self.kind in ('toolbar','icon'):target=None
             else:
                 active=self.quick.quickWindow().activeFocusItem()
                 name=active.objectName() if active else 'opacityButton'
                 expanded=self.view.state.get('expanded',False)
-                targets={'opacityButton':('detailScroll' if expanded else 'dragTitle','collapse'),
+                targets={'expand':('detailScroll' if expanded else 'dragTitle','opacityButton'),
+                         'opacityButton':('expand','collapse'),
                          'collapse':('opacityButton','monitorLinks')}
                 target=targets.get(name,targets['opacityButton'])[0 if reverse else 1]
             if target:self.focus_requested.emit(target)
@@ -386,7 +393,7 @@ class OverlayDetail(OverlayHost):
             names=(['openDashboard'] if self.view.state.get('detailHasSelection') else [])+['closeDetail','detailScroll']
             index=names.index(name) if name in names else 0;index+=-1 if reverse else 1
             if 0<=index<len(names):self.focus_control(names[index])
-            else:self.focus_requested.emit('call-detail' if reverse else 'opacityButton')
+            else:self.focus_requested.emit('expand' if reverse else 'opacityButton')
             event.accept();return True
         return super().eventFilter(watched,event)
 
@@ -464,7 +471,7 @@ class OverlayLinks(OverlayHost):
                 rows=[r for r in self.view.state.get('links',[]) if r.get('interaction')=='select']
                 index=next((i for i,r in enumerate(rows) if 'nav-'+r['id']==active.objectName()),0)
                 index=0 if event.key()==Qt.Key_Home else len(rows)-1 if event.key()==Qt.Key_End else max(0,min(len(rows)-1,index+(-1 if event.key()==Qt.Key_Left else 1)))
-                self.focus_item('nav-'+rows[index]['id']);self.view.keyboardActivate(rows[index]['id']);return True
+                self.focus_item('nav-'+rows[index]['id']);self.view.content.pin_call(self.view.content.call_id(self.view.content.rows()[index]),toggle=False);return True
         if event.type()==QEvent.KeyPress and self.view.content.compact and event.key() in (Qt.Key_Up,Qt.Key_Down):
             self.view.content.scroll_lower(-24 if event.key()==Qt.Key_Up else 24);return True
         if event.type()==QEvent.KeyPress and event.key()==Qt.Key_Escape:

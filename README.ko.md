@@ -4,7 +4,9 @@
 
 **Codexon은 Codex의 사용량과 캐시를 분석하고, 요청·응답 모델명 비교와 선택적 캐시 관리를 제공하는 Windows 앱입니다. 작업 중에는 Codex 창 위의 오버레이로 사용량을 확인할 수 있습니다.**
 
-![샘플 세션으로 실행한 Codexon 오버레이](docs/media/overlay-sample.png)
+[![토큰 개수와 모델 일치 상태를 표시한 Codexon 오버레이의 라이트·다크 테마](docs/media/overlay-ko-hero.png)](docs/media/overlay-ko-hero.png)
+
+동일한 샘플 세션을 라이트·다크 테마로 렌더링한 화면입니다.
 
 - 요청·응답 모델명 차이를 확인하고 해당 호출의 기록을 살펴봅니다.
 - 작업 중 최근 호출의 토큰, 캐시율, API 환산 비용을 오버레이에서 확인합니다.
@@ -16,6 +18,27 @@
 비용은 **실제 청구액이 아닌 API 가격 기준 환산액**입니다. 모델 관찰은 요청·응답에 기록된 모델명을 비교합니다. 실시간 한도 조회는 설치된 Codex의 app-server와 계정 연결을 사용합니다.
 
 설치 대상은 **Windows 10/11 x64**입니다. Python·Qt와 독립 연결 복구 도구가 설치 파일에 포함됩니다. Codex 계정 연결을 이용하며, Codexon을 위해 별도의 API 키를 발급할 필요는 없습니다.
+
+## 오버레이 보기
+
+`개수 / $`로 세션의 토큰 수량 구성과 API 환산액 구성을 전환합니다. **현재 / 최근**으로 마지막 확인 호출과 최근 12호출의 추이를 전환합니다. 어느 화면에서도 상단의 세션 합계를 함께 볼 수 있습니다.
+
+| 현재 호출 | 최근 호출 추이 |
+| --- | --- |
+| **토큰 개수**<br>[![토큰 개수 구성과 현재 호출](docs/media/overlay-ko-tokens-current.png)](docs/media/overlay-ko-tokens-current.png) | **토큰 개수**<br>[![토큰 개수 구성과 최근 호출 추이](docs/media/overlay-ko-tokens-recent.png)](docs/media/overlay-ko-tokens-recent.png) |
+| **API 환산액**<br>[![환산액 구성과 현재 호출](docs/media/overlay-ko-usd-current.png)](docs/media/overlay-ko-usd-current.png) | **API 환산액**<br>[![환산액 구성과 최근 호출 추이](docs/media/overlay-ko-usd-recent.png)](docs/media/overlay-ko-usd-recent.png) |
+
+이미지를 열면 원래 크기로 확인할 수 있습니다.
+
+**모델 일치 / 모델 불일치** — 현재 호출에서 요청·응답 모델명이 같으면 요청 모델명 옆에 `(일치)`를 표시합니다. 다르면 해당 줄을 강조하고 `(응답: gpt-6-sol)`처럼 응답 모델명을 함께 표시합니다.
+
+[![왼쪽은 모델 일치, 오른쪽은 모델 불일치](docs/media/overlay-ko-models.png)](docs/media/overlay-ko-models.png)
+
+헤더의 **상세 열기** 버튼을 누르면 오버레이에 호출 상세가 열립니다. 최근 화면에서는 그래프에서 호출을 먼저 선택해 해당 기록을 살펴볼 수 있습니다. 상세 패널의 **호출 상세**를 누르면 대시보드의 전체 기록으로 이동합니다.
+
+[![세션 오버레이 옆에 열린 호출 상세](docs/media/overlay-ko-detail.png)](docs/media/overlay-ko-detail.png)
+
+헤더 버튼으로 배경 투명도를 조절하거나 오버레이를 최소화합니다. 최소화 아이콘을 누르면 다시 펼쳐집니다. 모든 이미지는 가상 샘플 데이터를 앱에서 렌더링한 화면입니다. 비용은 실제 청구액이 아닌 API 가격 기준 환산액이며, 모델 비교는 요청·응답에 기록된 이름을 비교한 결과로 내부 모델 구현을 증명하지 않습니다.
 
 ## 시작하기
 

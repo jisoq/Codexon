@@ -26,10 +26,11 @@ def partial_text(data):
 
 def miss_text(data):
     from .overlay_view import amount
+    from .i18n import formatted
     misses=data.get('cache_misses',{})
     if not misses.get('count'):return ''
-    prefix='본 세션 ' if data.get('descendants') else ''
-    return f"{prefix}캐시 미적중 {misses['count']}회: 해당 입력 {amount(misses.get('input'))}"
+    template='본 세션 캐시 미적중 {count}회: 해당 입력 {tokens}' if data.get('descendants') else '캐시 미적중 {count}회: 해당 입력 {tokens}'
+    return formatted(template,count=misses['count'],tokens=amount(misses.get('input')))
 
 
 def footer(m, include_call=True):
@@ -160,7 +161,8 @@ def paint(d,m):
     if m.monitor_tab=='history':
         rows=m.rows();step=BODY_WIDTH/max(1,len(rows))
         inspected=next((r for r in rows if m.call_id(r)==getattr(m,'inspected_call',None)),None)
-        displayed=inspected or m.selected() or latest
+        displayed=m.selected() if m.graph_pinned else inspected or latest
+        if m.graph_pinned:inspected=None
         for lane,(key,label,fmt) in enumerate((('cost','비용 ($)',money),('cache_rate','캐시 (%)',percent),('output_speed','출력 속도 (tok/s)',lambda n:'—' if n is None else f'{n:.1f}'),('reasoning','추론 (토큰)',amount))):
             y=g['recent']+lane*GRAPH_ROW;low,high=dynamic_bounds(graph_value(r,key) for r in rows)
             d.text(label,28,y,168,16,10,'secondary');d.text((str(inspected.get('ordinal',''))+'번: ' if inspected else '')+fmt(graph_value(displayed,key)),220,y,144,16,11,right=True)
@@ -171,7 +173,7 @@ def paint(d,m):
                 yy=y+20+24*(high-val)/(high-low)
                 condition=tuple(row.get(k) for k in ('model','effort','mode','transport','home','sid'))
                 if previous and (key!='output_speed' or condition==previous[2]):d.line(previous[0],previous[1],x,yy,'accent',1)
-                active=inspected is row or m.call_id(row)==m.selected_id
+                active=m.call_id(row)==m.call_id(displayed)
                 if active:d.line(x,y+19,x,y+45,'secondary',.6)
                 d.dot(x,yy,'warning' if row.get('cache_warning') else 'accent',3 if active else 2)
                 previous=(x,yy,condition)
@@ -232,8 +234,7 @@ def links(m):
             width=QFontMetrics(font(m.appearance.family,12,600)).horizontalAdvance(tr(label))
             add(key,28 if key=='collection' else 16,y,width,20,target=target,interaction=interaction,accessible=label)
     heading('session','세션',g['session'],navigation_target(data,'session'))
-    selected=data.get('latest') if m.monitor_tab=='latest' else m.selected()
-    heading('call-detail','모델 호출',g['tab'],navigation_target(data,'call',call=selected or {}),'detail')
+
     if m.note and ('오류' in m.note or '지연' in m.note):
         heading('collection',m.note,g['status'],navigation_target(data,'collection'))
     if m.compact:add('scroll',28,g['context'],336,g['body_end']-g['context'],action='scroll',accessible='하단 스크롤 (위아래 방향키)')

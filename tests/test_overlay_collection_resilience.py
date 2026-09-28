@@ -318,21 +318,25 @@ def test_snapshot_command_cleans_only_its_own_collector(tmp_path,borrowed):
     import json,subprocess,sys
     from pathlib import Path
     from cachemonitor.usage_collection import locked,CollectorService
-    from cachemonitor.observer_task import ObserverTask
     from test_core import fixture_home
     home,_=fixture_home(tmp_path);path=tmp_path/'index.sqlite'
-    task=ObserverTask(str(path),role='UsageCollector')
-    before=task.inspect() if sys.platform=='win32' else None
+    bootstrap="""import sys,runpy
+from cachemonitor.observer_task import ObserverTask
+def forbidden(*args,**kwargs): raise AssertionError('Snapshot must not access Task Scheduler')
+ObserverTask.call=forbidden
+sys.argv=sys.argv[1:]
+runpy.run_path(sys.argv[0],run_name='__main__')
+"""
     service=CollectorService([home],path) if borrowed else None
     try:
-        if service:service.poll()
-        result=subprocess.run([sys.executable,'-X','utf8',str(Path(__file__).resolve().parents[1]/'run.py'),
+        if service:service.poll();epoch=service.epoch
+        result=subprocess.run([sys.executable,'-X','utf8','-c',bootstrap,str(Path(__file__).resolve().parents[1]/'run.py'),
             '--snapshot','--codex-home',str(home),'--index-path',str(path)],capture_output=True,text=True,encoding='utf-8',timeout=40)
         assert result.returncode==0,result.stderr
         assert json.loads(result.stdout)['sessions']
         assert locked(path.with_name(path.name+'.codexon-collector.lock'))==borrowed
         if service:assert not service.stopping()
-        if before is not None:assert task.inspect()==before
+        if service:assert service.epoch==epoch
     finally:
         if service:service.close()
 

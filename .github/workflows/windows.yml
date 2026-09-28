@@ -79,6 +79,18 @@ jobs:
           [string[]]$checkArgs = if ($env:VERIFY_FULL -eq 'True') { @('--full') } else { @('--base', $env:VERIFY_BASE) }
           python tools/run_ui_checks.py -- python tools/verify_changes.py @checkArgs
           exit $LASTEXITCODE
+      - name: Check overlay native scaling
+        shell: pwsh
+        run: |
+          $plan = Get-Content artifacts/verification/plan.json -Raw | ConvertFrom-Json
+          if (-not $plan.full -and -not ($plan.tests -match 'test_overlay_resilience|test_overlay_layout_controller')) { exit 0 }
+          $failed = $false
+          foreach ($scale in @('1', '1.25', '1.5', '2')) {
+            $env:CODEXON_OVERLAY_QA_OUTPUT = "artifacts/verification/overlay-scale-$scale"
+            python tools/run_ui_checks.py --scale $scale -- python -m pytest -q tests/test_overlay_resilience.py::test_auto_fallback_restores_preference_anchor_and_clickthrough --junitxml="artifacts/verification/overlay-scale-$scale.xml"
+            if ($LASTEXITCODE -ne 0) { $failed = $true }
+          }
+          if ($failed) { exit 1 }
       - name: Build Windows package
         if: steps.plan.outputs.package == 'true'
         shell: pwsh

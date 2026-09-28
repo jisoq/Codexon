@@ -55,6 +55,10 @@ def tr(value):
         return f'Valid {match[1]} of {match[2]} · input {match[3]}'
     value = re.sub(r'관측\s*([\d,]+)호출\s*·\s*([\d,]+)세션',
                    lambda match: f'{match[1]} observed calls · {match[2]} sessions', value)
+    # Numeric units are not standalone catalog keys. Preserve the displayed
+    # number and translate before the word-fragment fallback.
+    value = re.sub(r'(\d[\d,.]*)초', r'\1 s', value)
+    value = re.sub(r'(\d[\d,]*)회', r'\1 times', value)
     rendered = value
     for source, target in _parts:
         if source in rendered:

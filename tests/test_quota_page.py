@@ -141,9 +141,9 @@ def test_cycle_selector_changes_graph_preserves_lifetime_and_selection_on_refres
         assert panel.history.series['cumulative']
         assert len(panel.history.curves())==4
         assert panel.remaining_legend.text()=='━ 누적 소모량 · %p'
-        # This fixture starts mid-plateau or skips percent boundaries, so it
-        # must stay unpriced even in the cumulative view.
-        assert all(value is None for value in panel.history.series['completed_costs'])
+        # The last cycle has a complete 99 -> 98 boundary, even though its
+        # opening idle observation is hidden from the display.
+        assert panel.history.series['completed_costs']==[None]*6+[pytest.approx(.0105),None]
         index=0
         plot.activateAt(panel.history.x_at(index),panel.history.box.center().y())
         QTest.qWait(30)

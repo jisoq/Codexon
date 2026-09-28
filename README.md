@@ -4,7 +4,9 @@
 
 **Codexon is a Windows app for analyzing Codex usage and cache behavior, comparing request/response model names, and managing optional cache maintenance. Its overlay keeps usage visible over your Codex window while you work.**
 
-![Codexon overlay with sample sessions](docs/media/overlay-sample.png)
+[![Codexon overlay in light and dark themes, showing token counts and a matching model](docs/media/overlay-en-hero.png)](docs/media/overlay-en-hero.png)
+
+Light and dark themes, rendered from the same sample session.
 
 - Inspect recorded request/response model-name differences and the calls behind them.
 - See the latest call's tokens, cache rate, and API-equivalent cost in an overlay while working in Codex.
@@ -16,6 +18,27 @@
 Costs are estimates using API prices; they are not your Codex bill. Model monitoring compares names recorded for a request and its response. Live limit checks use the installed Codex app-server and require an available account connection.
 
 Supported installation target: **Windows 10/11 x64**. Setup includes Python, Qt and the independent connection recovery tool. Codexon can use your existing Codex account connection; no separate API key is required.
+
+## Overlay views
+
+Switch **Count / $** to see the session's token composition or API-equivalent cost composition. Switch **Current / Recent** to see the latest confirmed call or trends across the 12 most recent calls. The session totals stay visible above both views.
+
+| Current call | Recent calls |
+| --- | --- |
+| **Token counts**<br>[![Token counts and current call](docs/media/overlay-en-tokens-current.png)](docs/media/overlay-en-tokens-current.png) | **Token counts**<br>[![Token counts and recent call trends](docs/media/overlay-en-tokens-recent.png)](docs/media/overlay-en-tokens-recent.png) |
+| **API-equivalent cost**<br>[![Cost composition and current call](docs/media/overlay-en-usd-current.png)](docs/media/overlay-en-usd-current.png) | **API-equivalent cost**<br>[![Cost composition and recent call trends](docs/media/overlay-en-usd-recent.png)](docs/media/overlay-en-usd-recent.png) |
+
+Open an image to inspect it at full size.
+
+**Model match / Model mismatch** — The current-call view shows the requested model followed by `(match)` when the recorded names agree. If they differ, it highlights the line and includes the response model, such as `(response: gpt-6-sol)`.
+
+[![Model match on the left and model mismatch on the right](docs/media/overlay-en-models.png)](docs/media/overlay-en-models.png)
+
+Use **Open details** in the header to open the overlay's call details. In the recent-call view, select a graph point first to inspect that call. Select **Call details** in the detail panel to open the full dashboard record.
+
+[![Call details beside the session overlay](docs/media/overlay-en-detail.png)](docs/media/overlay-en-detail.png)
+
+The header controls adjust background transparency and minimize the overlay; select the minimized icon to restore it. All images use synthetic sample data rendered by the app. Costs are API-price estimates, not billed charges. Model comparison reflects recorded request/response names, not proof of the underlying model implementation.
 
 ## Get started
 
