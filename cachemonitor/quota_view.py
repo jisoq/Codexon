@@ -9,7 +9,7 @@ def clock(ts, full=False):
     return datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S' if full else '%m/%d %H:%M') if ts else '—'
 
 
-def history_rows(report, mode, start=None, end=None):
+def history_rows(report, mode, start=None, end=None, *, current_account_only=True):
     """Show remaining allowance and only actual full-recovery events."""
     rows=[]
     previous=None
@@ -19,7 +19,7 @@ def history_rows(report, mode, start=None, end=None):
     enabled=True
     by_time={}
     account=report.get('account')
-    identified=account and any(r.get('account')==account and r['window']==mode for r in report.get('history',[]))
+    identified=current_account_only and account and any(r.get('account')==account and r['window']==mode for r in report.get('history',[]))
     for record in report.get('history',[]):
         if identified and record.get('account')!=account:continue
         if record['window']!=mode:
@@ -42,7 +42,7 @@ def history_rows(report, mode, start=None, end=None):
         row=dict(record)
         same_tracking=bool(previous and enabled and not interrupted and
                            record['at']>previous['at'])
-        if previous and previous.get('account') and record.get('account') and previous['account']!=record['account']:
+        if previous and (previous.get('account') or '')!=(record.get('account') or ''):
             same_tracking=False
         continuous=bool(same_tracking and record['at']-previous['at']<=OBSERVATION_FRESHNESS)
         row['remaining']=100-record['used']
@@ -52,6 +52,9 @@ def history_rows(report, mode, start=None, end=None):
         row['connect']=bool(continuous and rows)
         row['tracking_continuous']=same_tracking
         row['label']=f"{clock(row['at'],True)} · 잔여 {row['remaining']:g}%"+(' · '+row['markers'][0] if row['markers'] else '')
+        if not current_account_only and not record.get('account'):
+            row['observation_note']='계정 미확인'
+            row['label']+=' · '+row['observation_note']
         if start is None or record['at']>=start:rows.append(row)
         previous=row
     return rows
@@ -179,7 +182,10 @@ def prepare_series(rows):
 def prepare_quota_view(report):
     from .pricing import usd
     from .quota_share import prepare_model_share
-    rows,periods=quota_value_history(report,history_rows(report,'weekly'))
+    weekly_history=history_rows(report,'weekly')
+    started=(report.get('tracking') or {}).get('started')
+    attributed_history=[row for row in weekly_history if started is None or row['at']>=started]
+    rows,periods=quota_value_history(report,attributed_history)
     times=[r['at'] for r in rows]
     overall=[];offset_cost=offset_delta=0;resets=[]
     for i,period in enumerate(periods):
@@ -213,7 +219,8 @@ def prepare_quota_view(report):
     all_series['model_share']=prepare_model_share(all_series,[interval for period in periods for interval in period.pop('cost_intervals')])
     all_series.update(active_only=True,cumulative=True,resets=resets)
     return dict(periods=periods,overall=all_series,lifetime=lifetime,summaries=summaries,
-                five_hour=prepare_series(history_rows(report,'five_hour')))
+                weekly_history=prepare_series(history_rows(report,'weekly',current_account_only=False)),
+                five_hour=prepare_series(history_rows(report,'five_hour',current_account_only=False)))
 
 
 __all__ = ('clock','history_rows','observation_label','prepare_series','prepare_quota_view')

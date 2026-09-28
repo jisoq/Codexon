@@ -171,6 +171,12 @@ def test_new_policy_preserves_history_but_never_recalculates_old_observations(tm
     assert quota_statistics(ledger.report('h',101))['observed_delta']==0
     assert ledger.db.execute('select count(*) from tracking_observations').fetchone()[0]==count
     assert ledger.db.execute('select started from tracking_policies where version=?',('legacy',)).fetchone()[0]==10
+    from cachemonitor.quota_view import prepare_quota_view
+    preserved=ledger.report('h',101)
+    assert [r['at'] for r in preserved['history']]==[21.1,31.1]
+    view=prepare_quota_view(preserved)
+    assert [r['remaining'] for r in view['weekly_history']['rows']]==[90,80]
+    assert not view['overall']['rows'] and not view['periods']
     observe(ledger,102,70);observe(ledger,110,69.75)
     activity(ledger,111,{'orphan':dict(started_at=11,ended_at=None)},[19,107])
     assert quota_statistics(ledger.report('h',112))['observed_delta']==pytest.approx(.25)
@@ -178,6 +184,9 @@ def test_new_policy_preserves_history_but_never_recalculates_old_observations(tm
     ledger=QuotaLedger(path)
     tracking.enable(ledger.db,'h',200)
     assert ledger.report('h',201)['tracking']['started']==100
+    view=prepare_quota_view(ledger.report('h',201))
+    assert len(view['weekly_history']['rows'])==4
+    assert all(r['at']>=100 for r in view['overall']['rows'])
     assert quota_statistics(ledger.report('h',201))['observed_calls']==1
     ledger.close()
 

@@ -4,6 +4,8 @@
 
 Codexon reads local Codex session records and usage metadata. Its usage index stores the fields needed for tokens, cache, model, time, status, and session analysis. It does not need conversation text to calculate these views. The index still contains local paths and identifiers. The separate quota ledger and model-observation data retain observed history. The dashboard may display your project and task names.
 
+The default quota chart, **Weekly remaining allowance history**, includes observations from before tracking began. The same selector offers **5 hours** and **Weekly usage and cost estimates**. Historical observations without an account identifier are marked as such in their details; chart lines do not connect different account identities. Cost estimates retain their existing tracking boundaries.
+
 When you enable the optional proxy, Codexon backs up the **entire prior** Codex `config.toml` in `%USERPROFILE%\.cachemonitor\model-observer\backups`. That backup can contain sensitive values from your configuration. The proxy relays Codex requests. Live limits are read through the installed Codex `app-server` account RPC; analysis of past usage is based on local records. Codexon is not an offline-only product.
 
 ## Session overlay and Codex updates
