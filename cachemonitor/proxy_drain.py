@@ -16,45 +16,37 @@ class ProxyDrain:
 
     def run(self, source):
         m=self.manager
-        health=m.health(timeout=3)
-        # Unclassified work cannot be retired safely. Keep serving while the
-        # client finishes/closes it instead of draining away every new ingress.
-        # This also permits migration from the first lifecycle build, which did
-        # not yet recognize Codex's metadata and rate-limit notifications.
-        while health and (health.get('websocket_states') or {}).get('unknown') and not self.force_requested():
-            self.allowed()
-            if health['instance']!=source['instance']:raise RuntimeError('다른 프록시 인스턴스를 보존합니다.')
-            self.publish('waiting',message='진행 여부를 판정할 수 없는 기존 연결의 종료 대기 · 통신 유지 중')
-            self.sleep(1)
-            health=m.health(timeout=3)
-        if health:
-            if health['instance']!=source['instance']:raise RuntimeError('다른 프록시 인스턴스를 보존합니다.')
-            control_id=health.get('control_id','')
-            import re
-            if not re.fullmatch('[0-9a-f]{32}',control_id):
-                raise RuntimeError('실행 중인 구버전에 안전 종료 제어가 없습니다. 기존 응답을 보존했습니다.')
-            self.before_drain(source)
-            self.publish('waiting',message='진행 중 응답 및 캐시 작업 정산 대기')
-            if len(source.get('processes',[]))>1 and not self.target.cache:
-                # Legacy supervisor observes the existing off phase before its
-                # child exits, so it drains rather than treating exit as a crash.
-                # Keep enabled and the user's route intact for the replacement.
-                with ProcessLock(m.control_lock,timeout=5):
-                    self.allowed()
-                    state=m.state();state.update(phase='off',replacement_instance=source['instance'])
-                    m.write_state(state)
-            atomic_write(m.directory/('proxy-control-'+control_id+'.json'),
-                         json.dumps(dict(action='drain',id=control_id)).encode())
-        # No response deadline. Only after work has settled does the 30-second
-        # process/port/ownership-lock exit deadline begin.
+        # A missing health response is not an acknowledgement of shutdown.
+        # Issue the drain after a later successful probe as well, while keeping
+        # the same identity and unclassified-work checks used for the first one.
+        drain_sent=False
         exit_deadline=None
         force_sent=False
         while True:
             self.allowed()
             if self.target.stopped(source):return
-            current=m.health(timeout=1)
+            current=m.health(timeout=1 if drain_sent else 3)
             if current and current['instance']!=source['instance']:
                 raise RuntimeError('종료 확인 중 다른 인스턴스가 발견되었습니다.')
+            if current and not drain_sent:
+                if (current.get('websocket_states') or {}).get('unknown') and not self.force_requested():
+                    self.publish('waiting',message='진행 여부를 판정할 수 없는 기존 연결의 종료 대기 · 통신 유지 중')
+                    self.sleep(1)
+                    continue
+                control_id=current.get('control_id','')
+                if not re.fullmatch('[0-9a-f]{32}',control_id):
+                    raise RuntimeError('실행 중인 구버전에 안전 종료 제어가 없습니다. 기존 응답을 보존했습니다.')
+                self.before_drain(source)
+                self.publish('waiting',message='진행 중 응답 및 캐시 작업 정산 대기')
+                if len(source.get('processes',[]))>1 and not self.target.cache:
+                    # The legacy supervisor must see off before its child exits.
+                    with ProcessLock(m.control_lock,timeout=5):
+                        self.allowed()
+                        state=m.state();state.update(phase='off',replacement_instance=source['instance'])
+                        m.write_state(state)
+                atomic_write(m.directory/('proxy-control-'+control_id+'.json'),
+                             json.dumps(dict(action='drain',id=control_id)).encode())
+                drain_sent=True
             if self.force_requested() and not force_sent and current:
                 if not current.get('supports_force_shutdown'):
                     raise RuntimeError('강제 종료를 지원하려면 연결 구성요소를 업데이트하세요.')

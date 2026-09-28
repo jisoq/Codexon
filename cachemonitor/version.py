@@ -1,4 +1,4 @@
-VERSION = '2026.09.28.2'
+VERSION = '2026.09.28.3'
 
 # The independently running proxy changes only when its own implementation or
 # compatibility contract changes. Earlier releases since 2026.09.21.9 contain
