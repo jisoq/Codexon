@@ -45,6 +45,7 @@ def test_auto_fallback_restores_preference_anchor_and_clickthrough(tmp_path):
     def refresh():
         app.processEvents();controller.receive_target(dict(target={'hwnd':int(host.winId())},selection=Selection(A)))
     def resize_frame(width,height):
+        import ctypes
         from ctypes import wintypes as W
         hwnd=int(host.winId());deadline=time.monotonic()+3
         desired=(width,height)
