@@ -166,14 +166,13 @@ def test_legend_visibility_survives_refresh_and_updates_pinned_details(quota_pag
         series=chart.series
         plot.activateAt(chart.x_at(0),chart.box.center().y())
         toggle=panel.legend_toggles['cycle_cost']
-        scroll.ensureWidgetVisible(toggle);QTest.qWait(50)
-        click(host,control(host,toggle));render_plot(host,chart)
+        click(host,render_plot(host,toggle));render_plot(host,chart)
         assert chart.series is series
         assert not chart.visible('cycle_cost')
         assert all(i['label']!='누적 API 환산액' for i in plot.detail['items'])
         panel.render(automatic=True)
         assert not chart.visible('cycle_cost') and not toggle.isChecked()
-        control(host,toggle).forceActiveFocus();QTest.keyClick(host.quick,Qt.Key_Space)
+        render_plot(host,toggle).forceActiveFocus();QTest.keyClick(host.quick,Qt.Key_Space)
         render_plot(host,chart)
         assert chart.visible('cycle_cost')
         for toggle in panel.legend_toggles.values():toggle.setChecked(False)
