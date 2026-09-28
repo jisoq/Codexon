@@ -36,8 +36,6 @@ def test_zero_usage_bar_uses_its_padded_axis_position(tmp_path):
 @pytest.mark.parametrize('width,dark,language',[(520,False,'ko'),(1120,True,'ko'),(520,True,'en')])
 def test_four_matching_axes_detail_pin_escape_and_gap_card(tmp_path,width,dark,language):
     app=QApplication.instance() or QApplication([])
-    from cachemonitor.fonts import load_bundled_fonts
-    load_bundled_fonts()
     shared_theme().configure('dark' if dark else 'light')
     set_language(language)
     rows=[dict(at=1000+i*60,remaining=90-i,cycle_cost=i*10,cycle_value=1000+i*50,
