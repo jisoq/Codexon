@@ -72,14 +72,18 @@ def quit_gui(executable,home,index,evidence,cache,*,force=False):
         client.connectToServer('CodexonQA-'+hashlib.sha256(str(index.resolve()).encode()).hexdigest()[:24])
         assert client.waitForConnected(3000)
         client.write(b'verify-quit');assert client.waitForBytesWritten(3000)
-        assert client.waitForReadyRead(3000) and bytes(client.readAll())==b'quitting'
+        # Qt may receive the reply while waitForBytesWritten pumps socket events.
+        # waitForReadyRead alone waits for new bytes, even with a buffered reply.
+        ready=client.bytesAvailable() or client.waitForReadyRead(3000)
+        reply=bytes(client.readAll())
+        assert ready and reply==b'quitting',(reply,client.errorString(),process.poll())
         deadline=time.monotonic()+15
         while time.monotonic()<deadline and process.poll() is None:
             time.sleep(.2)
             choice=QLocalSocket();choice.connectToServer('CodexonQA-'+hashlib.sha256(str(index.resolve()).encode()).hexdigest()[:24])
             if not choice.waitForConnected(1000):continue
             choice.write(b'verify-exit-force' if force else b'verify-exit-safe');choice.waitForBytesWritten(1000)
-            if choice.waitForReadyRead(1000) and bytes(choice.readAll())==b'accepted':break
+            if (choice.bytesAvailable() or choice.waitForReadyRead(1000)) and bytes(choice.readAll())==b'accepted':break
         assert process.wait(timeout=90)==0
     finally:
         if process.poll() is None:
