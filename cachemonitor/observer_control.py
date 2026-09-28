@@ -245,12 +245,20 @@ class ObserverManager:
         return self.status()
 
     def test_connection(self):
+        from contextlib import closing
         from .quota_live import locate_codex
+        def observations(query,parameters=()):
+            # The proxy writer creates its database on the first observation.
+            # A connection check must not create or write that database itself.
+            if not self.evidence.exists():return []
+            with closing(sqlite3.connect(self.evidence.resolve().as_uri()+'?mode=ro',uri=True)) as db:
+                if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='model_observations'").fetchone():return []
+                return db.execute(query,parameters).fetchall()
         before=self.config_path.read_bytes() if self.config_path.exists() else b''
         self.prepare()
         health_before=self.health()
-        with sqlite3.connect(self.evidence.resolve().as_uri()+'?mode=ro',uri=True) as db:
-            offset=db.execute('SELECT coalesce(max(seq),0) FROM model_observations').fetchone()[0]
+        checkpoint=observations('SELECT coalesce(max(seq),0) FROM model_observations')
+        offset=checkpoint[0][0] if checkpoint else 0
         _,config=self.config()
         model=config.get('model') or 'gpt-6-astra'
         with tempfile.TemporaryDirectory(prefix='cachemonitor-connection-test-') as folder:
@@ -268,11 +276,15 @@ class ObserverManager:
                     raise RuntimeError('연결 시험이 취소되거나 시간이 초과됐습니다. 직접 연결은 유지됩니다.')
                 try:output,_=process.communicate(timeout=.25);break
                 except subprocess.TimeoutExpired:pass
-        health=self.health()
-        with sqlite3.connect(self.evidence.resolve().as_uri()+'?mode=ro',uri=True) as db:
-            rows=db.execute("SELECT requested_model,response_model,conflict FROM model_observations WHERE seq>? AND status='completed'",(offset,)).fetchall()
+        deadline=time.monotonic()+5
+        while True:
+            health=self.health()
+            rows=observations("SELECT requested_model,response_model,conflict FROM model_observations WHERE seq>? AND status='completed'",(offset,))
+            if (rows or process.returncode or self.cancelled.is_set() or not health or
+                    health.get('instance')!=health_before.get('instance') or time.monotonic()>=deadline):break
+            time.sleep(.05)
         unchanged=(self.config_path.read_bytes() if self.config_path.exists() else b'')==before
-        if not (unchanged and process.returncode==0 and b'MODEL_OBSERVER_READY' in output and rows and
+        if not (unchanged and not self.cancelled.is_set() and process.returncode==0 and b'MODEL_OBSERVER_READY' in output and rows and
                 all(a==b==model and not conflict for a,b,conflict in rows) and health and
                 health.get('instance')==health_before.get('instance') and health.get('status')=='ok' and
                 health.get('relay_errors',0)==health_before.get('relay_errors',0)):
