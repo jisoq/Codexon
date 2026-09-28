@@ -85,7 +85,6 @@ class OverlayController(QObject):
         self.toolbar.opacity_changed.connect(self.set_opacity)
         for control in self.chrome:
             control.escape.connect(self.escape)
-            control.focus_requested.connect(self.focus_control)
             if hasattr(control,'interaction_started'):
                 control.interaction_started.connect(lambda control=control:self.activate_control(control))
         for control in (self.header,self.icon):
@@ -93,7 +92,6 @@ class OverlayController(QObject):
             control.drag_moved.connect(self.queue_drag)
             control.drag_finished.connect(self.end_drag)
             control.drag_cancelled.connect(self.cancel_pointer_drag)
-            control.move_requested.connect(self.move_keyboard)
         self.native = self.tracker = None
         self.enabled = settings.value('overlay/enabled', True, type=bool)
         self.position = settings.value('overlay/position', 'bottom-right')
@@ -140,6 +138,7 @@ class OverlayController(QObject):
         if snapshot and any(content.call_id(r)==content.call_id(snapshot) for r in content.rows()):
             self.pending_record=None;content.pin_call(content.call_id(snapshot))
 
+
     def capture_detail(self):
         from .overlay_navigation import navigation_target
         c=self.widget.content_model;data=c.data or {}
@@ -152,7 +151,7 @@ class OverlayController(QObject):
         scope,target,row,expanded=captured;data=self.widget.content_model.data or {}
         if scope!=(data.get('home'),data.get('id')):return
         if expanded:
-            self.toggle_expanded();self.focus_control('expand')
+            self.toggle_expanded()
         elif target:self.open_call_detail((target,row))
 
     def select_call(self,value):
@@ -171,7 +170,7 @@ class OverlayController(QObject):
     def open_call_detail(self,target):
         if not self.select_call(target):return
         self.expanded=True;self.settings.setValue('overlay/expanded',True)
-        self.close_popup();self.refresh();self.focus_control('detailScroll')
+        self.close_popup();self.refresh()
 
     def receive_record(self,value):
         pending=self.pending_record
@@ -321,7 +320,6 @@ class OverlayController(QObject):
             self.view_animation.stop();self.advance_view(1.)
 
     def set_collapsed(self, collapsed):
-        keyboard=self.actions.keyboard_focus() if collapsed else self.icon.keyboard_focus()
         previous_mode=self.automatic_mode
         was_visible=any(control.isVisible() for control in (self.widget,self.icon))
         self.close_popup()
@@ -337,7 +335,6 @@ class OverlayController(QObject):
             self.view_animation.setEndValue(1.)
             self.view_animation.start()
         else:self.advance_view(1.)
-        if keyboard:self.focus_control('restore' if self.automatic_mode=='icon' else 'expand')
 
     def advance_view(self, value):
         for control in (self.widget,self.shadow,*self.chrome):control.setWindowOpacity(float(value))
@@ -392,12 +389,6 @@ class OverlayController(QObject):
                     and time.monotonic()-self.observed_at<=3
                     and self.native.visible_target(target['hwnd']))
 
-    def move_keyboard(self, dx, dy):
-        target=self.target_state.get('target')
-        if not target or not self.native:return
-        dpi=self.native.u.GetDpiForWindow(target['hwnd']) or 96
-        self.begin_drag((0,0))
-        self.end_drag((round(dx*dpi/96),round(dy*dpi/96)))
 
     def move_drag(self,position=None):
         if not self.drag_context or not self.native:return
@@ -512,16 +503,6 @@ class OverlayController(QObject):
         if self.native and hasattr(self.native,'activate_companion'):
             self.native.activate_companion(int(control.winId()))
 
-    def focus_control(self, name):
-        if name in ('monitorLinks','monitorLinksLast'):
-            if self.links.isVisible():
-                self.activate_control(self.links);self.links.focus_control(name);return
-            name='dragTitle' if name=='monitorLinks' else 'collapse'
-        control=(self.detail if name in ('detailGraph','detailScroll') else
-                 self.header if name=='dragTitle' else self.icon if name=='restore' else self.actions)
-        if not control.isVisible():return
-        self.activate_control(control)
-        control.focus_control(name)
 
     def close_popup(self):
         self.popup_open=False
@@ -539,16 +520,13 @@ class OverlayController(QObject):
         self.refresh()
         if self.popup_open:
             self.activate_control(self.toolbar)
-            self.toolbar.focus_control()
 
     def escape(self):
         if self.popup_open:
             self.close_popup()
-            self.focus_control('opacityButton')
             return
         elif self.expanded:
             self.toggle_expanded()
-            self.focus_control('expand')
             return
         target=self.target_state.get('target')
         if self.native and target and hasattr(self.native,'restore_target_focus'):
@@ -676,7 +654,7 @@ class OverlayController(QObject):
             self.close_popup()
             self.widget.hide();self.shadow.hide();self.header.hide();self.actions.hide();self.detail.hide();self.links.hide()
             # Keep the target and its anchor at 32px; the transparent gutter
-            # only permits the external keyboard focus ring to be painted.
+            # preserves the companion window boundary.
             self.icon.resize(round(40*scale),round(40*scale))
             if not self.icon.isVisible():self.icon.show()
             gutter=round(4*scale*dpi/96)

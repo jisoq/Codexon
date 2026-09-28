@@ -13,14 +13,15 @@ def test_composition_is_passive_and_controls_persist(tmp_path):
     links=OverlayLinks(m)
     try:
         w.set_content(summary());links.sync();before=m.base_height()
-        links.view.keyboardActivate('unit-usd')
+        links.view.activateLink('unit-usd')
         assert m.composition_unit=='usd' and m.settings.value('overlay/compositionUnit')=='usd'
-        links.view.keyboardActivate('tab-latest')
+        links.view.activateLink('tab-latest')
         assert m.monitor_tab=='latest' and m.base_height()==before
         assert not any(r.get('formula') or r['id'].startswith('composition-') for r in m.monitor_links())
-        assert not links.mask().contains(QPoint(50,m.layout()['rows']+9))
+        assert links.mask().contains(QPoint(50,m.layout()['rows']+9))
+        assert all(r.get('interaction')=='tooltip' for r in m.monitor_links() if r['x']<=50<r['x']+r['width'] and r['y']<=m.layout()['rows']+9<r['y']+r['height'])
         assert m.monitor_tab=='latest'
-        links.view.keyboardActivate('tab-history')
+        links.view.activateLink('tab-history')
         assert m.settings.value('overlay/monitorTab')=='history'
         w.set_content(dict(summary(),id='other'));assert not m.detail_links()
         assert not links.qml_errors
@@ -83,10 +84,9 @@ def test_dashboard_navigation_validates_session_and_selects_old_event_call(layou
     c.receive_record({'id':requests[-1],'row':old_row})
     assert activated==[1] and c.widget.content_model.selected_id==c.widget.content_model.call_id(old_row)
     received=[];c.navigation_requested.connect(received.append)
-    c.detail.focus_control('openDashboard');QTest.qWait(20)
     button=named_item(c.detail.quick.rootObject(),'openDashboard')
-    assert button.hasActiveFocus()
-    QTest.keyClick(c.detail.quick,Qt.Key_Space)
+    from cachemonitor.quick_qa import click
+    click(c.detail,button)
     assert received[-1].call_id==old
     c.native.confirm_selection=lambda window:Selection('other')
     assert not c.navigate_from_dashboard(target)['enabled'] and activated==[1]
@@ -116,10 +116,10 @@ def test_unique_entries_selection_and_captured_call(layout_controller):
     c.receive_target({'target':{'hwnd':1},'selection':Selection(data['id'])})
     m=c.widget.content_model;received=[];c.navigation_requested.connect(received.append)
     assert {r['id'] for r in m.monitor_links() if r.get('target')}=={'session'}
-    c.links.view.keyboardActivate('session')
+    c.links.view.activateLink('session')
     assert received[-1].sort=='time_desc' and received[-1].view=='requests'
     m.monitor_action('tab-history');c.refresh()
-    c.links.view.keyboardActivate('call-0')
+    c.links.view.activateLink('call-0')
     assert not c.expanded and m.selected_id==m.call_id(data['recent'][0])
     c.capture_detail()
     c.receive_snapshot({'overlay_sessions':[summary(count=40)]})
@@ -136,8 +136,12 @@ def test_passive_metrics_and_inline_header_regions(layout_controller):
     from cachemonitor.overlay_chrome import named_item
     c=layout_controller;m=c.widget.content_model
     c.links.sync()
-    assert not c.links.mask().contains(QPoint(50,m.layout()['cache']+35))
-    assert not c.links.mask().contains(QPoint(50,m.layout()['result_value']+10))
+    assert c.links.mask().contains(QPoint(50,m.layout()['cache']+35))
+    assert c.links.mask().contains(QPoint(50,m.layout()['result_value']+10))
+    before=m.selected_id
+    for link in m.monitor_links():
+        if link.get('interaction')=='tooltip':c.links.view.activateLink(link['id'])
+    assert m.selected_id==before
     assert named_item(c.actions.quick.rootObject(),'expand') is not None
     c.expanded=True;c.native.bounds=(0,0,550,1000);c.refresh()
     if m.detail_inline:
@@ -176,3 +180,20 @@ def test_header_pointer_and_graph_pin_values(layout_controller,monkeypatch):
     click_call(0);assert not m.graph_pinned
     c.capture_detail();m.set_content(dict(m.data,id='changed'));c.activate_detail()
     assert not c.expanded
+
+
+
+
+def test_tooltip_translations_and_theme_contrast():
+    from cachemonitor.tooltips import TEXT
+    from cachemonitor.i18n import tr,set_language
+    from cachemonitor.token_colors import ui_palette,contrast_ratio
+    from cachemonitor.overlay_appearance import default_appearance
+    try:
+        set_language('en')
+        for value in TEXT.values():assert tr(value)!=value
+        for dark in (True,False):
+            colors=ui_palette(default_appearance(dark))
+            assert colors['tooltip_surface']!=colors['panel']
+            assert contrast_ratio(colors['tooltip_surface'],colors['tooltip_ink'])>=4.5
+    finally:set_language('ko')

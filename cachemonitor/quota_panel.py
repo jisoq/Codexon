@@ -1,3 +1,4 @@
+from .tooltips import TEXT as TIPS
 """Current reported allowance and auditable weekly local-call conversion."""
 from datetime import datetime
 import math
@@ -157,7 +158,7 @@ class QuotaPanel(Group):
         chart_layout=Column(chart);chart_layout.setContentsMargins(16,16,16,14);chart_layout.setSpacing(10)
         headline=Text('주간 사용량 API 동등 가치 · 전체 누적');headline.put(fontSize=15,bold=True)
         chart_layout.addWidget(headline)
-        self.result=Text();self.result.put(fontSize=34,bold=True,noElide=True)
+        self.result=Text();self.result.setToolTip(TIPS["quota_total"]);self.result.put(fontSize=34,bold=True,noElide=True)
         chart_layout.addWidget(self.result)
         self.lifetime_basis=Text();self.lifetime_basis.put(fontSize=12,color='muted',wrap=True)
         chart_layout.addWidget(self.lifetime_basis)
@@ -169,7 +170,7 @@ class QuotaPanel(Group):
         chart_layout.addLayout(controls)
         self.cycle_choice=Choice();self.cycle_choice.setAccessibleName('사용량 리셋 주기 선택')
         chart_layout.addWidget(self.cycle_choice)
-        self.cycle_value=Text();self.cycle_value.put(fontSize=22,bold=True,wrap=True)
+        self.cycle_value=Text();self.cycle_value.setToolTip(TIPS["quota_cycle"]);self.cycle_value.put(fontSize=22,bold=True,wrap=True)
         chart_layout.addWidget(self.cycle_value)
         self.cycle_basis=Text();self.cycle_basis.put(fontSize=12,color='muted',wrap=True)
         chart_layout.addWidget(self.cycle_basis)
@@ -184,6 +185,7 @@ class QuotaPanel(Group):
             legend=Toggle(name);legend.setChecked(True)
             legend.toggled.connect(lambda visible,k=key:self.history.set_series_visible(k,visible))
             self.legend_toggles[key]=legend
+            if key in ("completed_cost","cycle_value","reference"):legend.setToolTip(TIPS[{"completed_cost":"interval","cycle_value":"quota_cycle","reference":"quota_total"}[key]])
             legend.put(fontSize=12,color=color);self.history_legend.addWidget(legend)
             if name.startswith('━ 잔여량'):self.remaining_legend=legend
         self.reset_legend=Text('◆ 사용량 리셋');self.reset_legend.put(fontSize=12,color='muted')
@@ -199,7 +201,7 @@ class QuotaPanel(Group):
         title=Text('관측 내역');title.put(fontSize=18,bold=True);conversion_layout.addWidget(title)
         conversion_layout.addLayout(scope)
         metrics=Row();metrics.put(collapseBelow=620,columns=2);metrics.setSpacing(20)
-        self.basis=Text();self.cost_value=Text()
+        self.basis=Text();self.cost_value=Text();self.basis.setToolTip(TIPS["quota_used"]);self.cost_value.setToolTip(TIPS["cost"])
         for name,value in (('소모량',self.basis),('API 환산액',self.cost_value)):
             metric=Column();label=Text(name);label.put(fontSize=13,color='muted');metric.addWidget(label)
             if value is self.basis:self.basis_label=label
@@ -226,7 +228,7 @@ class QuotaPanel(Group):
         paging=self.paging=Row()
         self.previous_page=Button('이전 구간');self.next_page=Button('다음 구간')
         for button,icon,title in ((self.previous_page,'left','이전 구간'),(self.next_page,'right','다음 구간')):
-            button.setText('');button.put(iconName=icon,flat=True);button.setFixedSize(36,36);button.setAccessibleName(title);button.setToolTip(title)
+            button.setText('');button.put(iconName=icon,flat=True);button.setFixedSize(36,36);button.setAccessibleName(title);button.setToolTip(title+" 보기")
         self.page_status=Text()
         paging.addWidget(self.previous_page);paging.addWidget(self.page_status,1);paging.addWidget(self.next_page)
         detail_layout.addLayout(paging)
@@ -411,7 +413,6 @@ class QuotaPanel(Group):
             self.model_choice.blockSignals(False)
         self.lifetime_value=lifetime['per_percent']*100 if lifetime['per_percent'] is not None else None
         self.result.setText(usd(self.lifetime_value))
-        self.result.setToolTip(f"전체 누적 {usd(lifetime['cost'])} ÷ {lifetime['delta']:g}%p × 100 · 주간 100%p의 관측 기반 추정")
         self.lifetime_basis.setText(
             f"주간 100%p 기준 · 누적 API {usd(lifetime['cost'])} / 소모 {lifetime['delta']:g}%p"
             ' · '+('산정 ' if lifetime['observed_priced_calls']<lifetime['observed_calls'] else '')+call_count(lifetime['observed_priced_calls'],lifetime['observed_calls'])+'호출'+
@@ -426,14 +427,14 @@ class QuotaPanel(Group):
         selected_model=self.model_choice.currentData()
         model_intervals=model_cost_intervals(summary['intervals'],selected_model)
         if selected_model is None:
-            self.basis_label.setText('소모량')
+            self.basis_label.setText('소모량');self.basis.setToolTip(TIPS['quota_used'])
             self.cost_label.setText('API 환산액')
             self.basis.setText(f"{summary['observed_delta']:g}%p" if summary['total'] else '—')
             self.cost_value.setText(usd(summary['observed_cost']) if summary['total'] else '—')
             self.conversion_empty.setText('환산할 로컬 사용 기록이 없습니다' if not summary['total'] else
                                            '소모량이 누적되면 주간할당량 가치를 표시합니다' if value is None else '')
         else:
-            self.basis_label.setText('선택 모델 호출 수')
+            self.basis_label.setText('선택 모델 호출 수');self.basis.setToolTip('')
             calls=sum(row['model_calls'] for row in model_intervals)
             priced=sum(row['model_priced'] for row in model_intervals)
             self.cost_label.setText('확인된 API 환산액' if priced<calls else 'API 환산액')
@@ -470,6 +471,7 @@ class QuotaPanel(Group):
         self.intervals.setHorizontalHeaderLabels(
             ['기간','계정 소모량','선택 모델 API','구간 API 비용 비중','산정 / 모델 호출' if partial else '호출 수'] if selected_model else
             ['기간','소모량','API 환산액','주간할당량 가치','산정 / 전체 호출' if partial else '호출 수'])
+        self.intervals.put(headerTips={'4':TIPS['coverage']} if partial else {})
         self.intervals.setVisible(bool(rows))
         self.interval_empty.setVisible(not rows)
         self.interval_empty.setText('선택 조건에 맞는 구간 0개' if self.statistics['total'] else '')

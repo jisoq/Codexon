@@ -243,17 +243,6 @@ class DetailGraph(Node):
     @Slot()
     def clear_hover(self):
         if self.content.hover_id is not None:self.content.hover_id=None;self.update()
-    @Slot(int)
-    def key(self,key):
-        m=self.content;rows=m.rows()
-        if not rows:return
-        index=next((i for i,r in enumerate(rows) if m.call_id(r)==m.selected_id),-1)
-        if key==Qt.Key_Left:index=max(0,index-1)
-        elif key==Qt.Key_Right:index=min(len(rows)-1,index+1)
-        elif key==Qt.Key_Home:index=0
-        elif key==Qt.Key_End:index=len(rows)-1
-        else:return
-        m.select(m.call_id(rows[index]))
 
 class DetailBody(Node):
     def __init__(self,content):super().__init__(content);self.content=content;self.scroll_offset=0

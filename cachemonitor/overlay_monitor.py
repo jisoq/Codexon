@@ -105,7 +105,7 @@ def toggle_segments(m,kind):
     """Share compact, right-aligned label geometry with native hit regions."""
     from PySide6.QtGui import QFontMetrics
     from .overlay_view import font
-    from .i18n import tr
+    from .i18n import tr,formatted
     options=(('tokens','개수'),('usd','$')) if kind=='unit' else (('latest','현재'),('history','최근'))
     metrics=QFontMetrics(font(m.appearance.family,11))
     widths=[max(28,metrics.horizontalAdvance(tr(label))+14) for _,label in options]
@@ -119,7 +119,7 @@ def paint(d,m):
     from .overlay_view import amount,money,percent
     data=m.data or {};latest=data.get('latest') or {};c=data.get('token_composition',{});g=m.layout()
     from PySide6.QtGui import QFontMetrics
-    from .i18n import tr
+    from .i18n import tr,formatted
     d.text('세션',16,g['session'],80,20,12,weight=600)
     count_x=16+QFontMetrics(d.p.font()).horizontalAdvance(tr('세션'))+8
     child=f" (하위 {data['descendants']}개 포함)" if data.get('descendants') else ''
@@ -165,7 +165,7 @@ def paint(d,m):
         if m.graph_pinned:inspected=None
         for lane,(key,label,fmt) in enumerate((('cost','비용 ($)',money),('cache_rate','캐시 (%)',percent),('output_speed','출력 속도 (tok/s)',lambda n:'—' if n is None else f'{n:.1f}'),('reasoning','추론 (토큰)',amount))):
             y=g['recent']+lane*GRAPH_ROW;low,high=dynamic_bounds(graph_value(r,key) for r in rows)
-            d.text(label,28,y,168,16,10,'secondary');d.text((str(inspected.get('ordinal',''))+'번: ' if inspected else '')+fmt(graph_value(displayed,key)),220,y,144,16,11,right=True)
+            d.text(label,28,y,168,16,10,'secondary');d.text((formatted('{number}번: ',number=inspected.get('ordinal','')) if inspected else '')+fmt(graph_value(displayed,key)),220,y,144,16,11,right=True)
             previous=None
             for i,row in enumerate(rows):
                 val=graph_value(row,key);x=BODY_LEFT+(i+.5)*step
@@ -217,7 +217,7 @@ def paint(d,m):
 
 
 
-def links(m):
+def action_links(m):
     data=m.data or {};result=[];g=m.layout()
     def add(key,x,y,w,h,**kw):result.append(dict(id=key,x=x,y=y,width=w,height=h,accessible=kw.pop('accessible',key),targetHint=key.startswith('call-') or key=='latest-context',**kw))
     for x,w,key,label in toggle_segments(m,'tab'):
@@ -228,7 +228,7 @@ def links(m):
         add(action,x,g['unit']-2,w,24,action=action,accessible='개수: 토큰 수로 보기' if key=='tokens' else '달러 환산액으로 보기')
     from PySide6.QtGui import QFontMetrics
     from .overlay_view import font
-    from .i18n import tr
+    from .i18n import tr,formatted
     def heading(key,label,y,target,interaction='navigate'):
         if target:
             width=QFontMetrics(font(m.appearance.family,12,600)).horizontalAdvance(tr(label))
@@ -247,4 +247,40 @@ def links(m):
             if bottom>y:
                 add('call-'+str(i),x,y,step,bottom-y,target=navigation_target(data,'call',call=row),
                     interaction='select',selected=m.call_id(row)==m.selected_id,accessible=str(row.get('ordinal',i+1))+' 호출 선택')
+    return result
+
+
+
+
+def links(m):
+    from .tooltips import TEXT
+    from .ui_details import model_comparison
+    data=m.data or {};row=data.get('latest') or {};result=action_links(m)
+    def add(key,x,y,w,h,tip):
+        if tip:result.append(dict(id='tip-'+key,x=x,y=y,width=w,height=h,tooltip=tip,accessible=tip,interaction='tooltip'))
+    g=m.layout()
+    for x,key in zip(METRIC_COLUMNS,('cost','cache_total','speed_total')):add(key,x,CARD_Y,100,CARD_HEIGHT,TEXT[key])
+    for item in result:
+        if item.get('action') in ('unit-tokens','unit-usd','tab-latest','tab-history'):
+            item['tooltip']={'unit-tokens':'토큰 개수로 보기','unit-usd':'토큰 USD로 보기','tab-latest':'마지막 확인 호출','tab-history':'최근 12회 호출'}[item['action']]
+    comp=data.get('cost_composition' if m.composition_unit=='usd' else 'token_composition',{})
+    for x,section,title in ((28,'input','입력'),(204,'output','출력')):
+        add(section,x,g['tokens'],160,20,TEXT[title])
+        for i,part in enumerate(comp.get(section+'_parts',[])):
+            add(section+str(i),x,g['rows']+i*18,160,18,TEXT.get(part['label'],''))
+    if g.get('miss') is not None:add('miss',28,g['miss'],336,18,TEXT['miss'])
+    model_y=None
+    if m.monitor_tab=='latest':
+        offset=m.lower_offset
+        for x,key in zip(METRIC_COLUMNS,('cost','cache','speed')):
+            y=g['result']-offset
+            if y>=g['context'] and y+48<=g['body_end']:add('latest-'+key,x,y,108,48,TEXT[key])
+        model_y=g['model']-offset
+        y=g['duration']-offset
+        if y>=g['context'] and y+18<=g['body_end']:add('duration',28,y,336,18,TEXT['duration'])
+    if model_y is not None:
+        comparison=model_comparison(row)
+        tip='라우팅 의심' if comparison.startswith('모델 불일치') else '' if comparison else '비교 기록 부족 또는 응답 확인 대기'
+        if row.get('model_state')=='관측 충돌':tip=''
+        add('model',16,model_y,348,20,tip)
     return result

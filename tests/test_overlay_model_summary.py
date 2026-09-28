@@ -129,7 +129,7 @@ def test_new_call_clears_old_comparison_then_uses_its_own_completed_evidence(obs
     assert model.context()[0] == latest
     assert latest in detail_values(model) and fixture.widget.toolTip() == ''
     # Inspecting an older call changes only the call-detail comparison.
-    model.detailGraph.key(Qt.Key_Home)
+    model.select(model.call_id(model.rows()[0]))
     assert model.selected()['key'] == 'old-call'
     assert old in detail_values(model)
     assert model.context()[0] == latest and fixture.widget.toolTip() == ''

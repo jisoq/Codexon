@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from PySide6.QtGui import QActionGroup
 import sys
+import math
 
 from PySide6.QtCore import QPoint, QRect, Qt, QTimer, Signal
 from PySide6.QtWidgets import QApplication
@@ -138,6 +139,15 @@ class NativeTaskbar:
             self._clock_probe.close()
             self._clock_probe = None
 
+    def manual_geometry(self, host, ratio, fraction):
+        bar = self.rect(host, client=True)
+        if bar is None or bar.width() < bar.height():
+            return None
+        width = min(round(100 * ratio), bar.width())
+        height = min(round(36 * ratio), bar.height())
+        return QRect(round((bar.width() - width) * fraction),
+                     (bar.height() - height) // 2, width, height)
+
     def dock_geometry(self, host, ratio):
         bar = self.rect(host, client=True)
         if bar is None or bar.width() < bar.height():
@@ -232,6 +242,8 @@ class TaskbarQuota(QuickHost):
         super().__init__(None, Qt.Tool | Qt.FramelessWindowHint |
                          Qt.WindowDoesNotAcceptFocus)
         self.settings = settings
+        self._gesture = None
+        self._placement = None
         self.monitor_name = settings.value('taskbar/monitor', '', type=str)
         self.activation_hint = activation_hint
         from .i18n import tr
@@ -288,6 +300,7 @@ class TaskbarQuota(QuickHost):
             self.monitor_actions[name] = action
 
     def set_monitor(self, name):
+        self._gesture = None
         self.monitor_name = name
         self.settings.setValue('taskbar/monitor', name)
         self.sync_position()
@@ -297,6 +310,7 @@ class TaskbarQuota(QuickHost):
                     QApplication.primaryScreen())
 
     def set_enabled(self, enabled):
+        self._gesture = None
         self.enabled = bool(enabled)
         if self.enabled:
             self.sync_position()
@@ -336,6 +350,7 @@ class TaskbarQuota(QuickHost):
             return
         screen = self.target_screen()
         if screen is None:
+            self._gesture = None
             self.hide()
             return
         host = (self.native.host() if screen == QApplication.primaryScreen()
@@ -345,6 +360,7 @@ class TaskbarQuota(QuickHost):
             screen = QApplication.primaryScreen()
             host = self.native.host()
         if not host:
+            self._gesture = None
             self.embedding_error = '표시할 작업표시줄을 찾을 수 없습니다'
             self.hide()
             return
@@ -353,7 +369,20 @@ class TaskbarQuota(QuickHost):
             self.destroy()
             self._native_id = None
         ratio = screen.devicePixelRatio()
-        rect = self.native.dock_geometry(host, ratio)
+        context = (host, screen_id(screen), ratio, self.native.rect(host, client=True))
+        if self._gesture is not None:
+            if self._gesture['context'] == context and self._native_id and self.native.api.IsWindow(self._native_id):
+                return
+            self._gesture = None
+        key = 'taskbar/positions/' + screen_id(screen)
+        try:
+            fraction = float(self.settings.value(key))
+            if not math.isfinite(fraction):
+                fraction = None
+        except (TypeError, ValueError):
+            fraction = None
+        rect = (self.native.dock_geometry(host, ratio) if fraction is None else
+                self.native.manual_geometry(host, ratio, max(0., min(1., fraction))))
         if rect is None:
             self.embedding_error = '작업표시줄 위젯 위치를 확인할 수 없습니다'
             self.hide()
@@ -372,13 +401,57 @@ class TaskbarQuota(QuickHost):
         self.show()
         if self.native.position(hwnd, rect):
             self.embedding_error = None
+            self._placement = (context, QRect(rect), key)
         else:
             self.embedding_error = '작업표시줄 위젯 배치 실패'
             self.hide()
 
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and self._placement and self.enabled:
+            context, rect, key = self._placement
+            self._gesture = dict(context=context, rect=QRect(rect), key=key,
+                                 press=event.globalPosition(), moved=False, fraction=None)
+            event.accept()
+
+    def _move_pointer(self, event):
+        gesture = self._gesture
+        if gesture is None:
+            return
+        self.sync_position()
+        if self._gesture is not gesture:
+            return
+        delta = event.globalPosition() - gesture['press']
+        if not gesture['moved'] and delta.manhattanLength() < QApplication.startDragDistance():
+            return
+        gesture['moved'] = True
+        host, name, ratio, bar = gesture['context']
+        rect = QRect(gesture['rect'])
+        span = max(0, bar.width() - rect.width())
+        x = max(0, min(span, rect.x() + round(delta.x() * ratio)))
+        rect.moveLeft(x)
+        if self.native.position(int(self.winId()), rect):
+            gesture['fraction'] = x / span if span else 0.
+        else:
+            self._gesture = None
+            self.sync_position()
+
+    def mouseMoveEvent(self, event):
+        if self._gesture is not None:
+            self._move_pointer(event)
+            event.accept()
+
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton:
-            self.activated.emit()
+            self._move_pointer(event)
+            gesture = self._gesture
+            self._gesture = None
+            if gesture is not None:
+                if gesture['moved']:
+                    if gesture['fraction'] is not None:
+                        self.settings.setValue(gesture['key'], gesture['fraction'])
+                    self.sync_position()
+                else:
+                    self.activated.emit()
             event.accept()
 
     def contextMenuEvent(self, event):
@@ -386,6 +459,7 @@ class TaskbarQuota(QuickHost):
         event.accept()
 
     def closeEvent(self, event):
+        self._gesture = None
         self.timer.stop()
         if self.native is not None:
             self.native.close()

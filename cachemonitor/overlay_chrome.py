@@ -27,7 +27,6 @@ class ChromeModel(Node):
     opacityToggleRequested = Signal()
     escapeRequested = Signal()
     interactionRequested = Signal()
-    moveRequested = Signal(int, int)
     restoreRequested = Signal()
 
     @Slot(int)
@@ -40,56 +39,13 @@ class ChromeModel(Node):
     def escapePanel(self): self.escapeRequested.emit()
     @Slot()
     def startInteraction(self): self.interactionRequested.emit()
-    @Slot(int, int)
-    def movePanel(self, dx, dy): self.moveRequested.emit(dx, dy)
     @Slot()
     def restorePanel(self): self.restoreRequested.emit()
 
 
-class OverlayHost(QuickHost):
-    """Keep explicit keyboard destinations across delayed native activation."""
-    def __init__(self,*args):
-        super().__init__(*args)
-        self._keyboard_target=None
-        self._focus_generation=0
-
-    def focus_item(self,name):
-        self._focus_generation+=1;self._keyboard_target=name
-        self.activateWindow();self.quick.setFocus(Qt.TabFocusReason)
-        self._apply_keyboard_focus()
-
-    def _apply_keyboard_focus(self):
-        if not self.quick or not self._keyboard_target:return
-        item=named_item(self.quick.rootObject(),self._keyboard_target)
-        if item is None:return
-        self.quick.quickWindow().contentItem().forceActiveFocus(Qt.TabFocusReason)
-        if item.metaObject().indexOfProperty('pointerFocus')>=0:item.setProperty('pointerFocus',False)
-        item.forceActiveFocus(Qt.TabFocusReason)
-        if item.metaObject().indexOfProperty('focusReason')>=0:item.setProperty('focusReason',Qt.TabFocusReason)
-        if item.metaObject().indexOfProperty('keyboardFocus')>=0:item.setProperty('keyboardFocus',True)
-
-    def _cancel_keyboard_focus(self):
-        self._focus_generation+=1;self._keyboard_target=None
-
-    def eventFilter(self,watched,event):
-        if watched is self.quick:
-            if event.type()==QEvent.MouseButtonPress:self._cancel_keyboard_focus()
-            elif event.type()==QEvent.FocusIn and self._keyboard_target:
-                generation=self._focus_generation
-                # QQuickWidget handles FocusIn after this filter, potentially
-                # replacing the destination with the first tab stop.
-                def restore():
-                    if (generation==self._focus_generation and self.quick
-                            and self.isVisible() and self.quick.hasFocus()):self._apply_keyboard_focus()
-                QTimer.singleShot(0,self,restore)
-        return super().eventFilter(watched,event)
-
-    def hideEvent(self,event):
-        self._cancel_keyboard_focus()
-        super().hideEvent(event)
 
 
-class OverlayChrome(OverlayHost):
+class OverlayChrome(QuickHost):
     collapse = Signal()
     restore = Signal()
     opacity_toggle = Signal()
@@ -100,8 +56,6 @@ class OverlayChrome(OverlayHost):
     drag_moved = Signal(object)
     drag_finished = Signal(object)
     drag_cancelled = Signal()
-    focus_requested = Signal(str)
-    move_requested = Signal(int, int)
 
     def __init__(self, kind):
         flags = Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
@@ -115,7 +69,7 @@ class OverlayChrome(OverlayHost):
         self.setWindowTitle('Cache Monitor · ' + names[kind])
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
-        self.setFocusPolicy(Qt.StrongFocus)
+        self.setFocusPolicy(Qt.NoFocus)
         self.setAccessibleName(names[kind])
         if kind in ('header', 'icon'): self.setCursor(Qt.OpenHandCursor)
         self.view = ChromeModel()
@@ -126,7 +80,7 @@ class OverlayChrome(OverlayHost):
                       **{key:initial[key].name() for key in ('surface','ink','meta','border','accent')},
                       family='Pretendard JP', reducedMotion=False)
         self.set_scene(self.view, 'OverlayControls.qml', transparent=True)
-        self.quick.setFocusPolicy(Qt.StrongFocus)
+        self.quick.setFocusPolicy(Qt.NoFocus)
         self.quick.installEventFilter(self)
         self.quick.setMouseTracking(True)
         self.view.opacityRequested.connect(self.opacity_changed)
@@ -134,7 +88,6 @@ class OverlayChrome(OverlayHost):
         self.view.opacityToggleRequested.connect(self.opacity_toggle)
         self.view.escapeRequested.connect(self.escape)
         self.view.interactionRequested.connect(self.begin_interaction)
-        self.view.moveRequested.connect(self.move_requested)
         self.view.restoreRequested.connect(self.restore)
         if kind in ('header', 'icon'): self.quick.setAttribute(Qt.WA_TransparentForMouseEvents)
         if kind == 'toolbar':
@@ -166,17 +119,7 @@ class OverlayChrome(OverlayHost):
         self.setAccessibleName('\n'.join(value for value in (title,model_summary) if value))
         self.view.put(title=title)
 
-    def focus_control(self, name=None):
-        """Called only after the controller opens or activates this companion."""
-        name = name or {'toolbar': 'opacity', 'icon': 'restore', 'header': 'dragTitle'}.get(self.kind, 'opacityButton')
-        self.focus_item(name)
 
-    def keyboard_focus(self, name=None):
-        from PySide6.QtQuick import QQuickItem
-        name = name or ('restore' if self.kind == 'icon' else 'collapse')
-        item = named_item(self.quick.rootObject(), name)
-        return bool(item is not None and item.hasActiveFocus() and
-                    item.property('keyboardFocus' if self.kind == 'icon' else 'visualFocus'))
 
     def begin_interaction(self):
         self.interaction_started.emit()
@@ -184,22 +127,6 @@ class OverlayChrome(OverlayHost):
         self.quick.setFocus(Qt.MouseFocusReason)
         self.quick.quickWindow().contentItem().forceActiveFocus(Qt.MouseFocusReason)
 
-    def eventFilter(self, watched, event):
-        if watched is self.quick and event.type()==QEvent.KeyPress and event.key() in (Qt.Key_Tab,Qt.Key_Backtab):
-            reverse=event.key()==Qt.Key_Backtab or bool(event.modifiers() & Qt.ShiftModifier)
-            if self.kind=='header':target='monitorLinksLast' if reverse else 'expand'
-            elif self.kind in ('toolbar','icon'):target=None
-            else:
-                active=self.quick.quickWindow().activeFocusItem()
-                name=active.objectName() if active else 'opacityButton'
-                expanded=self.view.state.get('expanded',False)
-                targets={'expand':('detailScroll' if expanded else 'dragTitle','opacityButton'),
-                         'opacityButton':('expand','collapse'),
-                         'collapse':('opacityButton','monitorLinks')}
-                target=targets.get(name,targets['opacityButton'])[0 if reverse else 1]
-            if target:self.focus_requested.emit(target)
-            event.accept();return True
-        return super().eventFilter(watched,event)
 
     def closeEvent(self, event):
         self.release_scene()
@@ -213,21 +140,9 @@ class OverlayChrome(OverlayHost):
         self.view.put(hovered=False)
         super().leaveEvent(event)
 
-    def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Escape:
-            self.escape.emit()
-            event.accept()
-        elif self.kind == 'icon' and event.key() in (Qt.Key_Space, Qt.Key_Return, Qt.Key_Enter):
-            self.restore.emit()
-            event.accept()
-        else: super().keyPressEvent(event)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton and self.kind in ('header', 'icon'):
-            self._cancel_keyboard_focus()
-            from PySide6.QtQuick import QQuickItem
-            target=self.quick.rootObject().findChild(QQuickItem,'restore' if self.kind=='icon' else 'dragTitle')
-            if target is not None:target.setProperty('keyboardFocus',False)
             self.view.put(pressed=True)
             self.pressed_scope=getattr(self,'session_scope',None)
             self.press = event.globalPosition().toPoint()
@@ -322,7 +237,7 @@ class NavigationModel(Node):
     @Slot(int)
     def scrollLower(self,delta):self.content.scroll_lower(delta)
     @Slot(str)
-    def keyboardActivate(self,key):self.captureNavigation(key);self.activateNavigation()
+    def activateLink(self,key):self.captureNavigation(key);self.activateNavigation()
 
 
 class DetailModel(NavigationModel):
@@ -353,29 +268,26 @@ class DetailModel(NavigationModel):
     def startInteraction(self): self.interactionRequested.emit()
 
 
-class OverlayDetail(OverlayHost):
+class OverlayDetail(QuickHost):
     """Only this pane receives graph and scrolling input beside the monitor."""
     escape = Signal()
     interaction_started = Signal()
-    focus_requested = Signal(str)
 
     def __init__(self, content):
         super().__init__(None, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setWindowTitle('Cache Monitor · 호출 상세')
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
-        self.setFocusPolicy(Qt.StrongFocus)
+        self.setFocusPolicy(Qt.NoFocus)
         self.view = DetailModel(content)
         self.view.escapeRequested.connect(self.escape)
         self.view.interactionRequested.connect(self.begin_interaction)
         self.set_scene(self.view, 'OverlayDetail.qml', transparent=True)
-        self.quick.setFocusPolicy(Qt.StrongFocus)
+        self.quick.setFocusPolicy(Qt.NoFocus)
         self.quick.installEventFilter(self)
 
     def apply_appearance(self, appearance, opacity): self.view.sync()
 
-    def focus_control(self, name='detailScroll'):
-        self.focus_item(name)
 
     def begin_interaction(self):
         self.interaction_started.emit()
@@ -383,25 +295,7 @@ class OverlayDetail(OverlayHost):
         self.quick.setFocus(Qt.MouseFocusReason)
         self.quick.quickWindow().contentItem().forceActiveFocus(Qt.MouseFocusReason)
 
-    def eventFilter(self, watched, event):
-        # QQuickWidget otherwise moves Tab out of the last QML item before
-        # that item's Keys handler runs, losing the companion-window route.
-        if watched is self.quick and event.type()==QEvent.KeyPress and event.key() in (Qt.Key_Tab,Qt.Key_Backtab):
-            reverse=event.key()==Qt.Key_Backtab or bool(event.modifiers() & Qt.ShiftModifier)
-            active=self.quick.quickWindow().activeFocusItem()
-            name=active.objectName() if active else 'detailScroll'
-            names=(['openDashboard'] if self.view.state.get('detailHasSelection') else [])+['closeDetail','detailScroll']
-            index=names.index(name) if name in names else 0;index+=-1 if reverse else 1
-            if 0<=index<len(names):self.focus_control(names[index])
-            else:self.focus_requested.emit('expand' if reverse else 'opacityButton')
-            event.accept();return True
-        return super().eventFilter(watched,event)
 
-    def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Escape:
-            self.escape.emit()
-            event.accept()
-        else: super().keyPressEvent(event)
 
     def closeEvent(self, event):
         self.view.content.changed.disconnect(self.view.sync)
@@ -409,9 +303,8 @@ class OverlayDetail(OverlayHost):
         super().closeEvent(event)
 
 
-class OverlayLinks(OverlayHost):
+class OverlayLinks(QuickHost):
     escape=Signal()
-    focus_requested=Signal(str)
     interaction_started=Signal()
     def __init__(self,content):
         super().__init__(None,Qt.Tool|Qt.FramelessWindowHint|Qt.WindowStaysOnTopHint)
@@ -423,11 +316,6 @@ class OverlayLinks(OverlayHost):
         self.quick.installEventFilter(self)
         self.quick.setMouseTracking(True)
         self._hover_position=None
-    def focus_control(self,name='monitorLinks'):
-        links=self.view.state.get('links',[])
-        if not links:return
-        key=name if any(r['id']==name for r in links) else links[-1 if name=='monitorLinksLast' else 0]['id']
-        self.focus_item('nav-'+key)
     def sync(self):
         from .overlay_view import palette
         c=self.view.content;scale=c.appearance.scale;links=self.view.link_state(c.monitor_links())
@@ -465,26 +353,6 @@ class OverlayLinks(OverlayHost):
             if c.compact and event.position().y()/c.appearance.scale>=c.layout()['context']:
                 c.scroll_lower(-event.angleDelta().y()/4);event.accept();return True
             self.wheel_forwarder(event);event.accept();return True
-        if watched is self.quick and event.type()==QEvent.KeyPress and event.key() in (Qt.Key_Left,Qt.Key_Right,Qt.Key_Home,Qt.Key_End):
-            active=self.quick.quickWindow().activeFocusItem()
-            if active and active.objectName().startswith('nav-call-') and active.objectName()!='nav-call-detail':
-                rows=[r for r in self.view.state.get('links',[]) if r.get('interaction')=='select']
-                index=next((i for i,r in enumerate(rows) if 'nav-'+r['id']==active.objectName()),0)
-                index=0 if event.key()==Qt.Key_Home else len(rows)-1 if event.key()==Qt.Key_End else max(0,min(len(rows)-1,index+(-1 if event.key()==Qt.Key_Left else 1)))
-                self.focus_item('nav-'+rows[index]['id']);self.view.content.pin_call(self.view.content.call_id(self.view.content.rows()[index]),toggle=False);return True
-        if event.type()==QEvent.KeyPress and self.view.content.compact and event.key() in (Qt.Key_Up,Qt.Key_Down):
-            self.view.content.scroll_lower(-24 if event.key()==Qt.Key_Up else 24);return True
-        if event.type()==QEvent.KeyPress and event.key()==Qt.Key_Escape:
-            self.escape.emit();return True
-        if event.type()==QEvent.KeyPress and event.key() in (Qt.Key_Tab,Qt.Key_Backtab):
-            reverse=event.key()==Qt.Key_Backtab or bool(event.modifiers() & Qt.ShiftModifier)
-            active=self.quick.quickWindow().activeFocusItem();name=active.objectName() if active else ''
-            names=['nav-'+link['id'] for link in self.view.state.get('links',[])]
-            if name in names:
-                index=names.index(name)+(-1 if reverse else 1)
-                if 0<=index<len(names):self.focus_item(names[index])
-                else:self.focus_requested.emit('collapse' if reverse else 'dragTitle')
-                return True
         if event.type()==QEvent.MouseButtonPress:self.interaction_started.emit()
         return super().eventFilter(watched,event)
     def closeEvent(self,event):self.release_scene();super().closeEvent(event)
