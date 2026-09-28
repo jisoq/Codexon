@@ -164,8 +164,7 @@ class QuotaPanel(Group):
         controls=Row();controls.setSpacing(12)
         self.chart_title=chart_title=Text('선택 주기의 사용량 추이');chart_title.put(fontSize=18,bold=True)
         controls.addWidget(chart_title,1)
-        self.window=Choice();self.window.addItem('주간 사용량·환산','weekly');self.window.addItem('5시간','five_hour')
-        self.window.addItem('주간 잔여량 이력','weekly_history');self.window.setCurrentIndex(2)
+        self.window=Choice();self.window.addItem('주간','weekly');self.window.addItem('5시간','five_hour')
         self.window.setAccessibleName('한도 이력 종류');controls.addWidget(self.window)
         chart_layout.addLayout(controls)
         self.cycle_choice=Choice();self.cycle_choice.setAccessibleName('사용량 리셋 주기 선택')
@@ -356,15 +355,14 @@ class QuotaPanel(Group):
                      priced_calls=lifetime['observed_priced_calls'],calls=lifetime['observed_calls'],
                      value=lifetime['per_percent']*100 if lifetime['per_percent'] is not None else None)
                 if all_cycles else self._view['periods'][index-1] if index>0 else None)
-        series=(period['series'] if period else prepare_series([])) if weekly else self._view[self.window.currentData()]
+        series=(period['series'] if period else prepare_series([])) if weekly else self._view['five_hour']
         old=self.history.rows[self.history.cursor]['at'] if self.history.rows else None
-        same=getattr(self,'_selected_cycle',None)==(self.window.currentData(),period['start'] if period else None)
+        same=getattr(self,'_selected_cycle',None)==(weekly,period['start'] if period else None)
         follow=not self.history.rows or self.history.cursor==len(self.history.rows)-1
-        self._selected_cycle=(self.window.currentData(),period['start'] if period else None)
+        self._selected_cycle=(weekly,period['start'] if period else None)
         self.history.money=weekly;self.history.reference=self.lifetime_value
         self.history.empty_text='표시할 사용 기록이 없습니다' if weekly else '수집된 잔여량이 없습니다'
-        self.chart_title.setText('전체 사용량 추이' if weekly and all_cycles else '선택 주기의 사용량 추이' if weekly else
-                                '주간 잔여량 이력' if self.window.currentData()=='weekly_history' else '5시간 잔여량 추이')
+        self.chart_title.setText('전체 사용량 추이' if weekly and all_cycles else '선택 주기의 사용량 추이' if weekly else '5시간 잔여량 추이')
         self.remaining_legend.setText('━ 누적 소모량 · %p' if weekly and all_cycles else '━ 잔여량 · %')
         self.reset_legend.setVisible(weekly and all_cycles)
         self.history.set_series(series)

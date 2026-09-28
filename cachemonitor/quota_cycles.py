@@ -1086,13 +1086,11 @@ class QuotaLedger:
         last_reset = relevant_resets[-1] if relevant_resets else None
         pending = any(r.get('reset_pending') and r['manual_reset_id']==last_reset['id'] for r in result) if last_reset else False
         if tracking is not None:pending=False
-        # Tracking activation limits attribution, not the observed allowance history.
-        history = ([dict(r) for r in self.db.execute('select * from window_observations where home=? and at<=? order by at,id',(home,now))]
+        history = ([dict(r) for r in self.db.execute('select * from window_observations where home=? and at>=? and at<=? order by at,id',(home,cutoff,now))]
                    if 'window_observations' in tables else [])
         # Existing ledgers retain their weekly observations without rewriting raw evidence.
         known={(r['at'],r['source'],r['account'],r['used'],r['reset']) for r in history if r['window']=='weekly'}
-        historical = self.db.execute('select * from observations where home=? and at<=? order by at,id',(home,now))
-        history += [{**dict(r),'window':'weekly'} for r in historical
+        history += [{**r,'window':'weekly'} for r in raw
                     if (r['at'],r['source'],r['account'],r['used'],r['reset']) not in known]
         request_windows=[]
         if tracking is not None:
