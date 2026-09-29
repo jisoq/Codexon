@@ -38,6 +38,9 @@ def main():
             task.remove();value=read_json(report)
             if not value or value.get('exit_code')!=state.get('last_result'):
                 raise RuntimeError('Native QA exit and receipt do not agree')
+            for name in ('stdout.log','stderr.log'):
+                log=output/name
+                if log.exists():print(log.read_text(encoding='utf-8',errors='replace'),end='',flush=True)
             print(json.dumps(value));return value['exit_code']
         time.sleep(1)
     raise RuntimeError('Native QA still running; task and evidence retained')
