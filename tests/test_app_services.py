@@ -10,6 +10,60 @@ from cachemonitor.observer_state import read_json
 from cachemonitor.proxy_target import ProxyTarget
 
 
+@pytest.mark.parametrize('name',['custom index.collection.sqlite','custom index.sqlite.codexon-collection.sqlite'])
+@pytest.mark.parametrize('schema',[1,2])
+def test_package_collector_reader_restores_both_released_ipc_formats(tmp_path,monkeypatch,name,schema):
+    import sqlite3,zlib
+    from pathlib import Path
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]/'tools'))
+    from verify_app_services import read_collection_snapshot
+    path=tmp_path/name
+    encode=lambda value:zlib.compress(json.dumps(value).encode())
+    sessions=[dict(home='fixture',id='one',history=[dict(key='call-one',input=100,output=5)],remaining=7),
+              dict(home='fixture',id='two',history=[dict(key='call-two',input=200,output=9)],remaining=3)]
+    activity=[dict(home='fixture',attempt='first',status='completed'),
+              dict(home='fixture',attempt='second',status='created')]
+    expected=dict(collection={'version':'released'},sessions=sessions,request_activity=activity)
+    header=dict(expected)
+    with sqlite3.connect(path) as db:
+        db.execute('CREATE TABLE snapshot(id INTEGER PRIMARY KEY,payload BLOB)')
+        if schema==2:
+            header.pop('sessions');header.pop('request_activity')
+            header.update(collection_schema=2,activity_revision=4,
+                session_manifest=[dict(home=s['home'],sid=s['id'],revision=4,state={'remaining':s['remaining']}) for s in sessions])
+            db.execute('CREATE TABLE sessions(home TEXT,sid TEXT,revision INTEGER,payload BLOB)')
+            db.executemany('INSERT INTO sessions VALUES(?,?,?,?)',
+                [(s['home'],s['id'],4,encode({**s,'remaining':99})) for s in reversed(sessions)])
+            db.execute('CREATE TABLE activity(position INTEGER,payload BLOB)')
+            db.executemany('INSERT INTO activity VALUES(?,?)',[(i,encode(value)) for i,value in reversed(list(enumerate(activity)))])
+            expected['collection_schema']=2
+        db.execute('INSERT INTO snapshot VALUES(1,?)',(encode(header),))
+    original=path.read_bytes()
+    restored=read_collection_snapshot(path)
+    assert restored==expected
+    assert sum(len(session['history']) for session in restored['sessions'])==2
+    assert path.read_bytes()==original
+
+
+@pytest.mark.parametrize('stored_revision',[None,3])
+def test_package_collector_reader_rejects_missing_or_mismatched_session_revision(tmp_path,monkeypatch,stored_revision):
+    import sqlite3,zlib
+    from pathlib import Path
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]/'tools'))
+    from verify_app_services import read_collection_snapshot
+    path=tmp_path/'collection.sqlite'
+    encode=lambda value:zlib.compress(json.dumps(value).encode())
+    header=dict(collection_schema=2,session_manifest=[dict(home='fixture',sid='session',revision=4,state={})])
+    with sqlite3.connect(path) as db:
+        db.execute('CREATE TABLE snapshot(id INTEGER PRIMARY KEY,payload BLOB)')
+        db.execute('CREATE TABLE sessions(home TEXT,sid TEXT,revision INTEGER,payload BLOB)')
+        db.execute('INSERT INTO snapshot VALUES(1,?)',(encode(header),))
+        if stored_revision is not None:
+            db.execute('INSERT INTO sessions VALUES(?,?,?,?)',('fixture','session',stored_revision,encode({'history':[]})))
+    with pytest.raises(ValueError,match='session revision'):
+        read_collection_snapshot(path)
+
+
 @pytest.fixture
 def running(tmp_path,monkeypatch):
     home=tmp_path/'home';home.mkdir()
