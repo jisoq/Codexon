@@ -8,7 +8,7 @@
 
 Light and dark themes, rendered from the same sample session.
 
-- Inspect recorded request/response model-name differences and the calls behind them.
+- **Spot a request/response model mismatch directly in the overlay.** Compare the requested and reported model names when investigating routing behavior.
 - See the latest call's tokens, cache rate, and API-equivalent cost in an overlay while working in Codex.
 - Explore sessions and individual calls, including confirmed child-agent usage in session totals.
 - Compare usage across models, reasoning efforts and service tiers, and inspect the calls behind each result.
@@ -18,6 +18,22 @@ Light and dark themes, rendered from the same sample session.
 Costs are estimates using API prices; they are not your Codex bill. Model monitoring compares names recorded for a request and its response. Live limit checks use the installed Codex app-server and require an available account connection.
 
 Supported installation target: **Windows 10/11 x64**. Setup includes Python, Qt and the independent connection recovery tool. Codexon can use your existing Codex account connection; no separate API key is required.
+
+## Requested one model, got a different name back?
+
+**Check the requested model against the model reported in the response, right in the overlay.** A mismatch highlights the line and shows the response model, such as `(response: gpt-6-sol)`. Matching names display `(match)` beside the requested model.
+
+[![Model match on the left, highlighted response-model mismatch on the right](docs/media/overlay-en-models.png)](docs/media/overlay-en-models.png)
+
+Use the difference as a clue when investigating routing behavior, then open **Call details** to inspect that call's record. These are recorded request/response names; they do not establish the internal routing path or underlying model implementation. The image above uses synthetic data to demonstrate the mismatch display.
+
+## Weekly allowance, measured from real usage
+
+**Psst... as of September 29, this Pro x20 weekly allowance works out to about $1,300 at API prices. You didn't hear it from us.**
+
+[![Pro x20 weekly allowance and API-equivalent estimate rendered by the app from real usage records](docs/media/quota-en-2026-09-29.png)](docs/media/quota-en-2026-09-29.png)
+
+Rendered with the app's chart renderer from real local records as of **September 29, 2026, 19:49 KST**. Locally observed intervals in the current cycle account for **$246.96** in API-equivalent usage and **19 percentage points** of allowance consumed, yielding **$1,299.80** when extrapolated to a full weekly allowance. Account-wide remaining allowance and locally observed consumption cover different scopes; observation gaps are compressed in the chart.
 
 ## Overlay views
 
@@ -30,15 +46,11 @@ Switch **Count / $** to see the session's token composition or API-equivalent co
 
 Open an image to inspect it at full size.
 
-**Model match / Model mismatch** — The current-call view shows the requested model followed by `(match)` when the recorded names agree. If they differ, it highlights the line and includes the response model, such as `(response: gpt-6-sol)`.
-
-[![Model match on the left and model mismatch on the right](docs/media/overlay-en-models.png)](docs/media/overlay-en-models.png)
-
 Use **Open details** in the header to open the overlay's call details. In the recent-call view, select a graph point first to inspect that call. Select **Call details** in the detail panel to open the full dashboard record.
 
 [![Call details beside the session overlay](docs/media/overlay-en-detail.png)](docs/media/overlay-en-detail.png)
 
-The header controls adjust background transparency and minimize the overlay; select the minimized icon to restore it. All images use synthetic sample data rendered by the app. Costs are API-price estimates, not billed charges. Model comparison reflects recorded request/response names, not proof of the underlying model implementation.
+The header controls adjust background transparency and minimize the overlay; select the minimized icon to restore it. Overlay images use synthetic sample data rendered by the app. Costs are API-price estimates, not billed charges. Model comparison reflects recorded request/response names.
 
 ## Get started
 
