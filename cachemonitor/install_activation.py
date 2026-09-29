@@ -6,7 +6,6 @@ import ctypes
 import json
 import os
 from pathlib import Path
-import subprocess
 import winreg
 
 from .observer_control import atomic_write
@@ -122,24 +121,12 @@ def publish_shell(product, recovery, *, isolated=False, language='ko'):
     selected = links[2] if language=='en' else links[1]
     entries = [dict(path=str(links[0]), target=str(product/'Codexon.exe'), cwd=str(product)),
                dict(path=str(selected), target=str(recovery), cwd=str(recovery.parent))]
-    encoded = base64.b64encode(json.dumps(entries).encode()).decode()
-    script = """
-$ErrorActionPreference='Stop'
-$entries=ConvertFrom-Json ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__DATA__')))
-$shell=New-Object -ComObject WScript.Shell
-foreach ($entry in $entries) {
-  $link=$shell.CreateShortcut($entry.path)
-  $link.TargetPath=$entry.target
-  $link.WorkingDirectory=$entry.cwd
-  $link.Save()
-  $verified=$shell.CreateShortcut($entry.path)
-  if($verified.TargetPath -ne $entry.target -or $verified.WorkingDirectory -ne $entry.cwd){throw 'Shortcut verification failed'}
-}
-""".replace('__DATA__', encoded)
-    result = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-EncodedCommand',
-        base64.b64encode(script.encode('utf-16-le')).decode()], capture_output=True,
-        timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)
-    if result.returncode:raise OSError('Cannot update Start menu shortcuts')
+    from .shell_shortcut import shortcut
+    for entry in entries:
+        shortcut(entry['path'],entry['target'],entry['cwd'])
+        target,cwd=shortcut(entry['path'])
+        if Path(target)!=Path(entry['target']) or Path(cwd)!=Path(entry['cwd']):
+            raise OSError('Shortcut verification failed')
     for path,field,value in values:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER,path) as key:
             if winreg.QueryValueEx(key,field)!=(value,winreg.REG_SZ):
