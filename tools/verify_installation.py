@@ -5,6 +5,7 @@ from ctypes import wintypes as W
 import json
 import os
 import base64
+import re
 import shutil
 from pathlib import Path
 import socket
@@ -20,6 +21,14 @@ from cachemonitor.observer_state import read_json
 from tools.installer_identity import require_qa_installer
 
 KEY=r'Software\Codexon-QA'
+
+
+def native_language(log):
+    lines=Path(log).read_text(encoding='utf-8-sig',errors='replace').splitlines()
+    command=next(line for line in lines if 'Setup command line:' in line)
+    languages=re.findall(r'/LANG=(english|korean)\b',command,re.IGNORECASE)
+    assert len(languages)==1,'Native Setup must receive the selected language exactly once'
+    return languages[0].lower()
 
 
 def registration():
@@ -154,6 +163,7 @@ def main():
         assert not registration()
     command=[args.installer.resolve(),'/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',f'/DIR={install}']
     assert run([*command,f'/LOG={root / "install.log"}'])==0
+    first_language=native_language(root/'install.log.native.log')
     first=registration();assert Path(first['InstallRoot'])==install
     assert Path(first['AppPath']).is_file() and Path(first['RecoveryPath']).is_file()
     with winreg.OpenKey(winreg.HKEY_CURRENT_USER,r'Software\Microsoft\Windows\CurrentVersion\Uninstall\Codexon-QA_is1') as key:
@@ -162,6 +172,7 @@ def main():
     from cachemonitor.shell_shortcut import application_id
     recovery_link=next(p for p in shortcuts(True)[1:] if p.exists())
     assert application_id(recovery_link)=='Codexon-QA.Recovery'
+    assert recovery_link==shortcuts(True)[2 if first_language=='english' else 1]
     record=install/'preserved-record.txt';record.write_text('existing user record')
     before=launch_snapshot(install)
     if args.broken_installer:
@@ -171,7 +182,12 @@ def main():
         assert run([*command,f'/LOG={root / "failed-receipt.log"}'])!=0
         assert launch_snapshot(install)==before
     assert not (install/'activation-pending.json').exists()
-    assert run([*command,f'/LOG={root / "update.log"}'])==0
+    update_language='korean' if first_language=='english' else 'english'
+    assert run([*command,f'/LANG={update_language}',f'/LOG={root / "update.log"}'])==0
+    assert native_language(root/'update.log.native.log')==update_language
+    links=shortcuts(True)
+    assert links[2 if update_language=='english' else 1].is_file()
+    assert not links[1 if update_language=='english' else 2].exists()
     second=registration()
     with winreg.OpenKey(winreg.HKEY_CURRENT_USER,r'Software\Microsoft\Windows\CurrentVersion\Uninstall\Codexon-QA_is1') as key:
         assert Path(winreg.QueryValueEx(key,'DisplayIcon')[0].strip('"'))==Path(second['AppPath'])
@@ -206,6 +222,7 @@ def main():
     assert not registration() and not Path(second['AppPath']).exists()
     assert record.read_text()=='existing user record'
     result=dict(passed=True,install=True,reinstall=True,unicode_download_path=True,old_payload_preserved_until_ready=True,old_payload_cleaned=True,
+                native_language_preserved=True,
                 busy_uninstall_deferred=True,uninstall=True,records_preserved=True,
                 receipt_failure_restored=True,runtime_failure_restored=bool(args.broken_installer),
                 first_failure_removable=bool(args.broken_installer))

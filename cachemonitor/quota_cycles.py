@@ -647,26 +647,33 @@ class QuotaLedger:
             key=(source['home'],source['id'])
             revision=self.mode_revisions.get(key,0)
             old=previous.get(key)
-            if old and old[0] is source['history'] and old[1]==revision:
+            history=old[0] if old and source['history'] is old[2] else source['history']
+            source_revision=old[3] if old and source['history'] is old[2] else source.get('usage_revision')
+            if old and old[0] is history and old[1]==revision:
                 session={**source,'history':old[2],
-                    'usage_revision':(source.get('usage_revision'),revision)}
+                    'usage_revision':(source_revision,revision)}
                 enriched[key]=old;sessions.append(session);continue
-            session={**source,'history':[dict(row) for row in source['history']]}
-            for row in session['history']:
-                recorded=row.setdefault('_record_service_tier',request_tier(row))
-                evidence=self.mode_evidence.get((session['home'],session['id'],row.get('turn')))
-                explicit=self.modes.get((session['home'],session['id'],row.get('turn')))
+            rows=[]
+            for row in history:
+                recorded=request_tier(row)
+                changes={}
+                evidence=self.mode_evidence.get((*key,row.get('turn')))
+                explicit=self.modes.get((*key,row.get('turn')))
                 if row.get('service_tier_source')=='wire':
-                    row['service_tier']='미확인' if row.get('mode_conflict') else request_tier({'service_tier':row.get('requested_service_tier')})
+                    changes['service_tier']='미확인' if row.get('mode_conflict') else request_tier({'service_tier':row.get('requested_service_tier')})
                 elif row.get('mode_conflict') and row.get('request_mode_source')!='settings_conflict':
-                    row['service_tier']='미확인'
+                    changes['service_tier']='미확인'
                 elif evidence and evidence['request_mode_source']!='unobserved':
-                    row['service_tier']=evidence['mode'];row['service_tier_source']='settings'
-                    row.update({k:v for k,v in evidence.items() if k!='mode'})
-                elif row.get('service_tier_source')=='settings':row['service_tier']=explicit or recorded
-                else:row['service_tier']=recorded if recorded!='미확인' else explicit or '미확인'
-            session['usage_revision']=(session.get('usage_revision'),self.mode_revisions.get((session['home'],session['id']),0))
-            enriched[key]=(source['history'],revision,session['history']);sessions.append(session)
+                    changes.update(service_tier=evidence['mode'],service_tier_source='settings')
+                    changes.update({k:v for k,v in evidence.items() if k!='mode'})
+                elif row.get('service_tier_source')=='settings':changes['service_tier']=explicit or recorded
+                else:changes['service_tier']=recorded if recorded!='미확인' else explicit or '미확인'
+                # Keep the collector's read-only row when enrichment changes nothing.
+                # The cache retains its original history for later evidence corrections.
+                rows.append({**row,**changes} if any(k not in row or row[k]!=v for k,v in changes.items()) else row)
+            session={**source,'history':rows}
+            session['usage_revision']=(source_revision,revision)
+            enriched[key]=(history,revision,rows,source_revision);sessions.append(session)
         self._enriched_sessions=enriched
         snapshot['sessions']=sessions
 

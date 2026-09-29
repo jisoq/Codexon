@@ -1,5 +1,6 @@
 """Regressions at the actual QML input/rendering boundary."""
 import time
+import pytest
 from PySide6.QtCore import QSettings, QSignalBlocker, Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
@@ -7,6 +8,32 @@ from cachemonitor.core import Session
 from cachemonitor.dashboard import Dashboard
 from cachemonitor.presentation import Choice
 from cachemonitor.quick_qa import control, mount, dispose, table_view, click_row, wheel, walk
+
+
+def test_deferred_pages_apply_pending_state_and_keep_loaded_scroll():
+    from cachemonitor.presentation import Stack, Scroll, Column, Text
+    from cachemonitor.quick_qa import scene_view
+    app=QApplication.instance() or QApplication([])
+    pages=Stack();pages.put(deferPages=True);pages.addWidget(Text('First page'))
+    body=Column();title=Text('Before visit');body.addWidget(title);body.addSpacing(1800)
+    page=Scroll();page.setWidget(body);pages.addWidget(page)
+    page.verticalPosition.setValue(320)
+    host=mount(pages,640,480)
+    try:
+        with pytest.raises(AssertionError,match='Presentation node not rendered'):
+            scene_view(host,page)
+        title.setText('Updated before visit')
+        pages.setCurrentIndex(1);QTest.qWait(80)
+        item=control(host,page)
+        assert any(child.property('text')=='Updated before visit' for child in walk(control(host,title)))
+        assert item.property('contentItem').property('contentY')==320
+        pages.setCurrentIndex(0);QTest.qWait(20)
+        page.verticalPosition.setValue(520)
+        pages.setCurrentIndex(1);QTest.qWait(40)
+        assert control(host,page) is item
+        assert item.property('contentItem').property('contentY')==520
+        assert not host.qml_errors
+    finally:dispose(host)
 
 
 def test_independent_scenes_survive_other_scene_shutdown():

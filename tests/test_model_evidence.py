@@ -88,6 +88,28 @@ def test_evidence_does_not_persist_untrusted_strings(tmp_path):
     assert 'SECRET' not in text and 'PRIVATE' not in text
 
 
+def test_observation_indexes_share_records_without_mutating_previous_values(tmp_path):
+    from cachemonitor.model_evidence import home_key
+    path=tmp_path/'wire.sqlite';store=EvidenceStore(path);reader=EvidenceReader(path)
+    home=tmp_path/'home';key=home_key(home);history=[{'key':'response'}]
+    try:
+        store.write(home,'attempt',1,'HTTP/SSE','response',status='created')
+        reader.poll()
+        first=reader.activity_records[(key,'attempt')]
+        assert reader.records[(key,'response')]['attempt'] is first
+        joined=reader.enrich(home,history)
+        joined[0]['response_status']='local change'
+        assert first['status']=='created'
+        store.write(home,'attempt',2,'HTTP/SSE','response',status='completed')
+        reader.poll()
+        second=reader.activity_records[(key,'attempt')]
+        assert reader.records[(key,'response')]['attempt'] is second
+        assert second is not first and first['status']=='created'
+        assert second['status']=='completed'
+        assert reader.enrich(home,history)[0]['response_status']=='completed'
+    finally:reader.close();store.close()
+
+
 def test_request_tier_is_joined_by_response_id_and_never_replaced_by_response_tier(tmp_path):
     path=tmp_path/'tier.sqlite';store=EvidenceStore(path);reader=EvidenceReader(path)
     home=tmp_path/'home'

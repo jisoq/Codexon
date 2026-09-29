@@ -1,7 +1,9 @@
 """Read-only collection clients and an independent background collector service."""
 from contextlib import closing
 from copy import deepcopy
+from hashlib import sha256
 import json
+import marshal
 import os
 from pathlib import Path
 import sqlite3
@@ -18,6 +20,16 @@ from .usage_paths import index_location
 
 class CollectionScopeError(RuntimeError):
     pass
+
+
+def publication_fingerprint(value):
+    # An in-process comparison only. The IPC payload remains JSON. Check all
+    # fields so in-place corrections cannot hide behind an unchanged revision.
+    try:encoded=marshal.dumps(value,4)
+    except ValueError:
+        # JSON also accepts dict/list subclasses that marshal does not accept.
+        encoded=json.dumps(value,ensure_ascii=False,separators=(',',':')).encode('utf-8')
+    return sha256(encoded).digest()
 
 
 def locked(path):
@@ -76,23 +88,25 @@ class CollectionChannel:
         for session in snapshot['sessions']:
             key=(session['home'],session['id'])
             heavy={k:v for k,v in session.items() if k not in volatile}
+            fingerprint=publication_fingerprint(heavy)
             old=previous.get(key)
-            if old is not None and heavy==old[1]:
+            if old is not None and fingerprint==old[1]:
                 revision=old[0];current[key]=old
             else:
                 revision=sequence
                 encoded=json.dumps(heavy,ensure_ascii=False,separators=(',',':')).encode('utf-8')
                 writes.append((*key,revision,zlib.compress(encoded,1)))
-                current[key]=(revision,deepcopy(heavy))
+                current[key]=(revision,fingerprint)
             manifest.append(dict(home=key[0],sid=key[1],revision=revision,
                 state={k:v for k,v in session.items() if k in volatile}))
         old_activity=self.published_activity if previous is self.published else {}
         activities={};activity_writes=[]
         for position,record in enumerate(snapshot.get('request_activity',[])):
             key=(record['home'],record['attempt']);old=old_activity.get(key)
-            if old and old[0]==position and old[1]==record:activities[key]=old
+            fingerprint=publication_fingerprint(record)
+            if old and old[0]==position and old[1]==fingerprint:activities[key]=old
             else:
-                activities[key]=(position,deepcopy(record))
+                activities[key]=(position,fingerprint)
                 activity_writes.append((*key,sequence,position,zlib.compress(json.dumps(record,ensure_ascii=False,separators=(',',':')).encode(),1)))
         removed_activity=old_activity.keys()-activities.keys()
         activity_revision=sequence if activity_writes or removed_activity or previous is not self.published else getattr(self,'activity_revision',sequence)

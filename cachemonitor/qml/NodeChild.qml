@@ -4,7 +4,13 @@ import QtQuick.Layouts
 Item {
     id: child
     property alias item: content.item
-    Loader { id: content; anchors.fill: parent }
+    property bool loadRequested: true
+    property bool retained: false
+    Loader {
+        id: content; anchors.fill: parent
+        active: child.loadRequested || child.retained
+        onLoaded: child.retained = true
+    }
     required property var node
     property bool horizontalParent: false
     property var s: node ? node.state : ({})

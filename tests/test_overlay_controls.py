@@ -15,6 +15,10 @@ def test_native_collapse_restore_opacity_drag_and_control_window_styles(tmp_path
     app=QApplication.instance() or QApplication([])
     host=QWidget();host.setWindowTitle('Cache Monitor owned control test');host.resize(900,760);host.show()
     native=WindowsOverlay();settings=QSettings(str(tmp_path/'overlay.ini'),QSettings.IniFormat)
+    # The popup timer must consume owned input, never a user's desktop click.
+    cursor=[(0,0)];pressed=[False]
+    native.cursor=lambda:cursor[0]
+    native.primary_down=lambda:pressed[0]
     controller=OverlayController(settings,native_enabled=False,appearance_path=tmp_path/'missing.toml')
     controller.native=native
     native.configure(int(controller.widget.winId()))
@@ -35,6 +39,14 @@ def test_native_collapse_restore_opacity_drag_and_control_window_styles(tmp_path
         assert controller.toolbar.isVisible()
         controller.toolbar.slider.setValue(60)
         assert controller.opacity==40 and settings.value('overlay/opacity',type=int)==40
+        assert controller.input_timer.isActive()
+        x,y,_,_=controller.popup_geometry
+        cursor[0]=(x+1,y+1);pressed[0]=True;controller.poll_popup()
+        assert controller.popup_open and controller.toolbar.isVisible()
+        pressed[0]=False;controller.poll_popup()
+        cursor[0]=(-10000,-10000);pressed[0]=True;controller.poll_popup()
+        assert not controller.popup_open and not controller.toolbar.isVisible() and not controller.input_timer.isActive()
+        pressed[0]=False
         pixels=controller.widget.grab().toImage();scale=pixels.devicePixelRatio()
         assert 85<=pixels.pixelColor(round(12*scale),round(100*scale)).alpha()<=110
         click(controller.actions,controller.actions.quick.rootObject().findChild(QQuickItem,'collapse'));refresh()
@@ -42,7 +54,7 @@ def test_native_collapse_restore_opacity_drag_and_control_window_styles(tmp_path
         assert not controller.header.isVisible() and not controller.toolbar.isVisible()
         QTest.mouseClick(controller.icon,Qt.LeftButton);refresh()
         assert not controller.collapsed and controller.widget.isVisible()
-        cursor=[(0,0)];native.cursor=lambda:cursor[0]
+        cursor[0]=(0,0)
         start=controller.current_geometry
         controller.begin_drag();cursor[0]=(-120,-90);controller.move_drag();controller.end_drag();refresh()
         moved=native.frame(panel)

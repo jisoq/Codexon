@@ -189,7 +189,7 @@ class Dashboard(TrayWindow):
         for node,width in ((self.period,150),(self.project,190),(self.source,155),(self.model,190),(self.effort,150),(self.mode,150)):
             node.setFixedWidth(width)
         self.scope_note=label('수집 중','muted');self.scope_note.put(fontSize=12);self.scope_note.setFixedHeight(18);layout.addWidget(self.scope_note)
-        self.pages=Stack();layout.addWidget(self.pages,1);self.scrollers={}
+        self.pages=Stack();self.pages.put(deferPages=True);layout.addWidget(self.pages,1);self.scrollers={}
         self.build_overview();self.build_compare();self.build_explorer()
         from .quota_panel import QuotaPanel
         self.quota_panel=QuotaPanel(self.settings);quota_scroll=Scroll();quota_scroll.put(fillViewport=True)

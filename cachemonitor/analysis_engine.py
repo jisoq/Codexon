@@ -9,6 +9,7 @@ from .core import TRANSPORT_FIELDS, summarize, METRICS
 from .model_evidence import FIELDS as MODEL_FIELDS
 from .pricing import token_cost, sum_cost, RATES, FAST_RATES, ALIASES, VERIFIED, PRICE_POLICY, request_tier, display_tier, unknown_mode_calls
 from .workload import internal_review
+from .analysis_records import compact_record, public_record, public_records
 
 
 class BoundedCache:
@@ -128,7 +129,7 @@ class AnalysisEngine:
                 records[identity]=(context,row)
                 history.append(row)
             health=CacheHealth().update(history)
-            history=annotate_incidents(history,health)
+            history=[compact_record(row) for row in annotate_incidents(history,health)]
             for row in history:
                 identity=row['key']
                 records[identity]=(records[identity][0],row)
@@ -159,7 +160,7 @@ class AnalysisEngine:
     def record(self,home,sid,response_id):
         state=self.sessions.get((home,sid))
         found=state['records'].get(response_id) if state else None
-        return dict(found[1]) if found else None
+        return public_record(found[1]) if found else None
 
     def stat(self,rows,key,method='mean'):
         signature=(key,method,tuple(map(id,rows)))
@@ -184,14 +185,14 @@ class AnalysisEngine:
         return (self.revision,q['page'],freeze(q))
 
     def page_query(self,q):
-        if not q.get('presentation'):return self.query(q)
+        if not q.get('presentation'):return public_records(self.query(q))
         from .dashboard_views import project, refresh_bounds
         from .analysis_worker import expiry
         stable={k:v for k,v in q.items() if k!='now' and (q.get('period')=='custom' or k not in ('start','end'))}
         key=self.query_key(stable)
         cached=self.page_results.get(key)
         if cached and q['now']<cached[1]:return refresh_bounds(cached[0],q)
-        value=project(self,q)
+        value=public_records(project(self,q))
         deadline=expiry(self,q)
         if q['page']==0 and q.get('period')!='custom':
             from .analytics import _bucket_start, _next_bucket, _local_timestamp
