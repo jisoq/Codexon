@@ -200,11 +200,14 @@ class Contexts:
         self.usage[rid]=usage_values(response.get('usage') or {})
         self.size+=size
 
+    def maintenance_suffix(self,rid):
+        return [*copy.deepcopy(self.responses[rid][1]),
+                {'role':'user','content':[{'type':'input_text','text':'Reply exactly ACK. Do not call tools.'}]}]
+
     def maintenance(self, rid):
-        request,output,_=self.responses[rid]
+        request,_,_=self.responses[rid]
         body=copy.deepcopy(request)
-        body['input']+=copy.deepcopy(output)
-        body['input'].append({'role':'user','content':[{'type':'input_text','text':'Reply exactly ACK. Do not call tools.'}]})
+        body['input']+=self.maintenance_suffix(rid)
         # Definitions, order, schemas, instructions and reasoning stay identical.
         body['tool_choice']='none'
         body.pop('generate',None)

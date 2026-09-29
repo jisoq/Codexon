@@ -47,7 +47,8 @@ def enrich(sessions,index_path,now,homes=None):
                     returned=False,benefit_lower=None,maintenance_upper=None,origin='guard_cancelled',
                     settled=True,scope=before[-1]['policy_scope'] if before else None,
                     comparison='confirmed_not_sent')
-                control.db.execute('INSERT OR REPLACE INTO cache_gaps VALUES(?,?,?,?)',
+                control.db.execute('INSERT INTO cache_gaps VALUES(?,?,?,?) ON CONFLICT(home,sid,turn) '
+                    'DO UPDATE SET data=excluded.data WHERE cache_gaps.data IS NOT excluded.data',
                     (session['home'],session['id'],turn,json.dumps(gap)))
             inputs=[(turn,at) for turn,at in inputs if turn not in blocked]
             for i,(turn,at) in enumerate(inputs):
@@ -65,7 +66,8 @@ def enrich(sessions,index_path,now,homes=None):
                          maintenance_upper=bounds['maintenance_upper'] if bounds else None,
                          origin='submission',settled=returned,scope=previous['policy_scope'],
                          comparison=bounds['bound_kind'] if bounds else 'required_observation_missing')
-                control.db.execute('INSERT OR REPLACE INTO cache_gaps VALUES(?,?,?,?)',
+                control.db.execute('INSERT INTO cache_gaps VALUES(?,?,?,?) ON CONFLICT(home,sid,turn) '
+                    'DO UPDATE SET data=excluded.data WHERE cache_gaps.data IS NOT excluded.data',
                                    (session['home'],session['id'],turn,json.dumps(gap)))
         journal=Journal(path)
         maintenance=[r for r in journal.rows() if homes is None or r['home'] in homes]

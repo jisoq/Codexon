@@ -30,6 +30,9 @@ class BoundedCache:
             self.weight-=old
     def clear(self):
         self.data.clear(); self.weight=0
+    def discard(self,predicate):
+        for key in tuple(self.data):
+            if predicate(key):self.weight-=self.data.pop(key)[1]
 
 
 def row_signature(row):
@@ -148,6 +151,9 @@ class AnalysisEngine:
             self.timestamps=sorted(r['ts'] for s in work.values() for r in s['prepared']['history'])
             # Old result objects may remain on screen, but cannot answer a newer revision.
             self.results.clear()
+            self.page_results.clear()
+            self.parts.discard(lambda key:key[0] not in updated or key[1]!=updated[key[0]]['revision'])
+            self.__dict__.pop('_explorer_projection',None)
         return changed
 
     def record(self,home,sid,response_id):

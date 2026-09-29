@@ -73,6 +73,7 @@ def quota(args):
     ledger.db = sqlite3.connect(args.database.resolve().as_uri() + '?mode=ro', uri=True)
     ledger.db.row_factory = sqlite3.Row
     ledger.db.execute('pragma query_only=on')
+    ledger.db.execute(f'pragma cache_size=-{getattr(QuotaLedger,"CACHE_KIB",2000)}')
     home = ledger.db.execute('select home from tracking_config order by home limit 1').fetchone()[0]
     samples = []; previous = None
     try:

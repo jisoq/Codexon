@@ -218,13 +218,14 @@ def build(db, home, now):
     health_rows = list(db.execute(f'select * from tracking_health where home in ({slots})', homes))
     complete = len(health_rows) == len(homes) and all(h['complete'] and now-h['at'] <= 15 for h in health_rows)
     lookup_failed = bool(db.execute('select 1 from tracking_gaps where home=? and start>=? and end is null', (home, started)).fetchone())
-    wire = list(db.execute(f'select * from tracking_wire where home in ({slots}) and start>=?', (*homes, started)))
-    known_responses={r[0] for r in db.execute(f'select uid from calls where home in ({slots})',homes)}
+    pending_responses=[dict(r) for r in db.execute(
+        f"select w.* from tracking_wire w where w.home in ({slots}) and w.start>=? and w.response<>'' "
+        f'and not exists(select 1 from calls c where c.home in ({slots}) and c.uid=w.response)',
+        (*homes,started,*homes))]
     return dict(groups=groups, homes=homes, enabled=monitoring, account=account,
                 controls=[dict(r) for r in controls],
                 ownership_gaps=[], phase='on' if monitoring else 'off',
                 started=started, policy=POLICY_VERSION, complete=complete,
                 lookup_failed=lookup_failed,
                 last_observed_at=max((r['at'] for r in raw.values()), default=None),
-                pending_responses=[dict(r) for r in wire if r['response'] and
-                    r['response'] not in known_responses])
+                pending_responses=pending_responses)

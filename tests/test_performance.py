@@ -179,6 +179,25 @@ def test_active_session_parts_survive_more_sessions_than_query_lru():
     assert second['analysis']['totals']==first['analysis']['totals']
 
 
+def test_live_revisions_release_obsolete_views_without_rebuilding_unchanged_sessions():
+    source=history();other=copy.deepcopy(source);other['id']='other';other['home']='other-home'
+    engine=AnalysisEngine();engine.ingest([source,other])
+    first=engine.page_query(query(page=2,presentation=True))
+    builds=engine.metrics['part_builds']
+    for i in range(12):
+        changed=copy.deepcopy(source)
+        changed['history'][0]['output']+=i+1
+        changed['history'][0]['total']+=i+1
+        engine.ingest([changed,other])
+        latest=engine.page_query(query(page=2,presentation=True))
+        assert latest['analysis']['response_count']==14
+        assert engine.parts.weight<=16
+        assert engine.page_results.weight==15
+    assert engine.metrics['part_builds']==builds+12
+    assert first['analysis']['totals']['cost']<latest['analysis']['totals']['cost']
+    assert engine.page_query(query(page=2,presentation=True)) is latest
+
+
 def test_dashboard_projection_bounds_rows_and_preserves_drilldown():
     import pickle
     from cachemonitor.dashboard_views import resolve_population

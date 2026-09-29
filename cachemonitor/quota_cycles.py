@@ -480,11 +480,13 @@ def quota_value_history(report, rows):
 
 
 class QuotaLedger:
+    CACHE_KIB=4096
     def __init__(self, path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(self.path, timeout=8)
         try:
+            self.db.execute(f'PRAGMA cache_size=-{self.CACHE_KIB}')
             self._initialize()
         except Exception:
             self.db.close()
@@ -837,20 +839,27 @@ class QuotaLedger:
             completed_at=min((r[0] for r in marks),default=None) if len(marks)==len(scope) and all(r[0] is not None for r in marks) else None
         issues = ([dict(r) for r in self.db.execute(f'select * from coverage_issues where home in ({slots})',scope)]
                   if 'coverage_issues' in tables else [])
-        calls = list(self.db.execute(f'''select * from (
-            select *,row_number() over(partition by uid order by cost is null,home) as copy_rank
-            from calls where home in ({slots}) and ts>=? and model<>?) where copy_rank=1 order by ts''',(*scope,cutoff,INTERNAL_REVIEW_MODEL)))
+        # The primary key already makes response IDs unique within one home.
+        if len(scope)==1:
+            calls=list(self.db.execute('select *,1 as copy_rank from calls where home=? and ts>=? '
+                'and model<>? order by ts,uid',(*scope,cutoff,INTERNAL_REVIEW_MODEL)))
+        else:
+            calls = list(self.db.execute(f'''select * from (
+                select *,row_number() over(partition by uid order by cost is null,home) as copy_rank
+                from calls where home in ({slots}) and ts>=? and model<>?) where copy_rank=1 order by ts''',(*scope,cutoff,INTERNAL_REVIEW_MODEL)))
         if tracking is not None:
-            completed={r['response']:r['ended'] for r in self.db.execute(
-                f"select response,min(end) as ended from tracking_wire where home in ({slots}) "
-                "and status='completed' and end is not null and response<>'' group by response",scope)}
+            wire=list(self.db.execute(f"select * from tracking_wire where home in ({slots}) and response<>''",scope))
+            completed={}
+            for row in wire:
+                if row['status']=='completed' and row['end'] is not None:
+                    completed[row['response']]=min(completed.get(row['response'],row['end']),row['end'])
             # A usage record may arrive after the final quota lookup. Exact
             # response identity assigns its cost to the observed completion,
             # without rewriting the underlying usage timestamp.
             boundaries={(r['home'],r['uid']):r['started'] for r in self.db.execute(
                 f'select * from tracking_call_boundaries where home in ({slots})',scope)}
             exact_starts={}
-            for r in self.db.execute(f"select * from tracking_wire where home in ({slots}) and response<>''",scope):
+            for r in wire:
                 boundaries[(r['home'],r['response'])]=r['start']
                 exact_starts[(r['home'],r['response'])]=r['start']
             calls=sorted(({**dict(r),'ts':completed.get(r['uid'],r['ts']),
@@ -1099,7 +1108,7 @@ class QuotaLedger:
         request_windows=[]
         if tracking is not None:
             by_response={}
-            for row in self.db.execute(f"select * from tracking_wire where home in ({slots}) and response<>''",scope):
+            for row in wire:
                 if row['status'] not in ('created','completed'):continue
                 old=by_response.get(row['response'])
                 if old is None or (row['end'] is not None and old['end'] is None):

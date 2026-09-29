@@ -31,6 +31,10 @@ def test_context_chain_and_tool_definitions_unchanged():
     assert maintenance['tools']==source['tools'] and maintenance['tool_choice']=='none'
     assert maintenance['reasoning']==source['reasoning'] and source==before
     assert 'ACK' not in json.dumps(contexts.full(delta))
+    suffix=contexts.maintenance_suffix('original')
+    assert suffix==maintenance['input'][len(source['input']):]
+    suffix[0]['content'].append({'type':'output_text','text':'changed copy'})
+    assert contexts.maintenance_suffix('original')==maintenance['input'][len(source['input']):]
 
 
 def test_policy_bootstrap_holdout_and_no_return_cost():

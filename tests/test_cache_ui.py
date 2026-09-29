@@ -78,6 +78,27 @@ def test_panel_recovers_after_temporary_storage_error(tmp_path,monkeypatch):
     finally:panel.stop()
 
 
+def test_hidden_cache_report_keeps_guard_polling_and_bounds_heartbeat_writes(tmp_path,monkeypatch):
+    app=QApplication.instance() or QApplication([])
+    panel=CachePanel('home',tmp_path/'index.sqlite',active=True)
+    panel.timer.stop();panel.set_reports_enabled(False)
+    now=[1000.];monkeypatch.setattr('cachemonitor.cache_panel.time.time',lambda:now[0])
+    forecasts=[];original=panel.control.forecasts
+    monkeypatch.setattr(panel.control,'forecasts',lambda *args:(forecasts.append(True),original(*args))[1])
+    try:
+        before=panel.control.db.total_changes
+        for i in range(5):
+            now[0]=1000.+i*.2;panel.poll()
+        assert panel.control.db.total_changes-before==1
+        assert panel.control.get('ui_heartbeat')==1000.
+        assert forecasts==[]
+        panel.display(dict(calls=11,priced=0))
+        now[0]=1001.;panel.set_reports_enabled(True)
+        assert forecasts and panel.metrics['calls'].text()=='11회'
+        assert panel.control.get('ui_heartbeat')==1001.
+    finally:panel.stop()
+
+
 def test_dashboard_survives_boot_schema_lock_and_restores_saved_cache_settings(tmp_path):
     import sqlite3
     from PySide6.QtCore import QSettings
@@ -202,9 +223,11 @@ def test_master_switch_navigation_and_independent_features(tmp_path,size):
         close(window);app.setProperty('cachemonitorDisableShellIntegration',previous)
 
 
-def test_rendered_hook_approval_cancel_close_timeout_and_disconnect(tmp_path):
+@pytest.mark.parametrize('reports_enabled',[False,True])
+def test_rendered_hook_approval_cancel_close_timeout_and_disconnect(tmp_path,reports_enabled):
     app=QApplication.instance() or QApplication([])
     panel=CachePanel('home',tmp_path/'index.sqlite',active=True)
+    panel.set_reports_enabled(reports_enabled)
     panel.control.set('guard',True);panel.control.profile('home','s',dict(profile(),written=0))
     host=mount(panel);pool=ThreadPoolExecutor(1)
     try:
@@ -231,6 +254,7 @@ def test_rendered_hook_approval_cancel_close_timeout_and_disconnect(tmp_path):
             assert panel.dialog is None
             if choice=='approve':assert '진행 허용' in panel.hook_status.text()
         panel.display(dict(calls=2,priced=1,known_cost=.01,shortfalls=1,audit=[]))
+        panel.set_reports_enabled(True)
         assert '비용 미확인 1회' in panel.summary.text()
         panel.control.set('automatic',True)
         panel.proxy_status(dict(configured=True,health=dict(cache_management=True)))
