@@ -133,7 +133,10 @@ def process_main(connection,homes,index_path,static_snapshot=None,model_evidence
                     continue
                 except Exception:
                     connection.send({'kind':'error','id':request['id'],'error':traceback.format_exc(limit=6)})
-            connection.poll(.02)
+            # Incoming UI requests wake this wait immediately. Only collection
+            # needs a timer; an idle analyzer does not need 50 wakeups a second.
+            delay=1. if frozen else max(0.,min(1.,next_poll-time.monotonic()))
+            connection.poll(delay)
     except (EOFError,BrokenPipeError,OSError):
         pass
     except Exception:

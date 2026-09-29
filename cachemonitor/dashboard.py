@@ -258,7 +258,7 @@ class Dashboard(TrayWindow):
             services[home].start()
         services[home].supply_local(self.snapshot.get('quota_by_home',{}).get(services[home].home))
         self.live_quota=None;self.quota_service=services[home]
-        self.sync_quota_reports()
+        self.sync_report_demand()
         self.refresh_tray()
         self.quota_service.wake.set()
 
@@ -272,10 +272,12 @@ class Dashboard(TrayWindow):
         if self.quota_panel.receive(value) is False:return
         self.live_quota=value.get('quota');self.quota_issue=value.get('issue','');self.refresh_tray()
 
-    def sync_quota_reports(self):
-        visible=getattr(self,'current_page',0)==3 and self.isVisible() and not self.isMinimized()
+    def sync_report_demand(self):
+        visible=self.isVisible() and not self.isMinimized()
+        page=getattr(self,'current_page',0)
         for service in getattr(self,'quota_services',{}).values():
-            service.set_reports_enabled(visible and service is self.quota_service)
+            service.set_reports_enabled(visible and page==3 and service is self.quota_service)
+        if hasattr(self,'cache_panel'):self.cache_panel.set_reports_enabled(visible and page==5)
 
     def scroll_page(self,index):
         area=Scroll();area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff);body=Group();layout=Column(body)
@@ -638,7 +640,7 @@ class Dashboard(TrayWindow):
             self.page_filters[self.current_page]={key:getattr(self,attr).currentData() for key,attr in (('model','model'),('effort','effort'),('service_tier','mode'))}
         if index==5 and not self.cache_master.isChecked():index=4
         self.current_page=max(0,min(5,index));self.pages.setCurrentIndex(self.current_page);self.heading.setText(TITLES[self.current_page])
-        self.sync_quota_reports()
+        self.sync_report_demand()
         self.restoring=True
         self.nav.setCurrentRow(4 if self.current_page==5 else self.current_page if self.current_page<4 else -1)
         for key,attr in (('model','model'),('effort','effort'),('service_tier','mode')):
@@ -750,6 +752,8 @@ class Dashboard(TrayWindow):
         return Verbatim(' · '.join(tr(x) for x in names if x))
 
     def receive(self,value):
+        if value.get('data_revision')!=self.snapshot.get('data_revision'):
+            self.client_cache.clear()
         if not self.async_mode:
             self.engine.ingest(value['sessions'])
             value={**value,'sessions':[s['source'] for s in self.engine.sessions.values()],
@@ -843,16 +847,16 @@ class Dashboard(TrayWindow):
         if hasattr(self,'detail_scroll'):self.layout_record_detail()
     def showEvent(self,event):
         super().showEvent(event)
-        self.sync_quota_reports()
+        self.sync_report_demand()
         if getattr(self,'_display_dirty',False):
             self._display_dirty=False;QTimer.singleShot(0,lambda:self.render(automatic=True))
 
     def hideEvent(self,event):
-        super().hideEvent(event);self.sync_quota_reports()
+        super().hideEvent(event);self.sync_report_demand()
 
     def changeEvent(self,event):
         super().changeEvent(event)
-        if event.type()==QEvent.WindowStateChange:self.sync_quota_reports()
+        if event.type()==QEvent.WindowStateChange:self.sync_report_demand()
 
     def closeEvent(self,event):
         self.settings.setValue('dashboard/geometry',self.saveGeometry());self.save_preferences();super().closeEvent(event)

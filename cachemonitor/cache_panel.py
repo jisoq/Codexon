@@ -80,6 +80,7 @@ class CachePanel(Group):
         self.control=None;self.journal=None;self.open_storage()
         self.active=active;self.dialog=None;self.ticket=None;self.last_ticket=None;self.closed=False;self.proxy_ready=False;self.relay_connected=False;self.collection_error=False
         self.operating_dialog=None;self.pending_automatic=False
+        self.reports_enabled=True;self.pending_summary=None
         layout=Column(self);layout.setContentsMargins(0,0,8,20);layout.setSpacing(20)
         features,body=card('기능 설정');self.toggles={}
         for key,title,description in (
@@ -175,6 +176,14 @@ class CachePanel(Group):
             self.hook_status.setText('훅 파일 연결 완료 · Codex에서 신뢰 허용 필요' if enabled else 'Codexon 훅 연결 해제됨')
         except (OSError,ValueError,RuntimeError) as exc:self.hook_status.setText('훅 연결 실패: '+str(exc))
 
+    def set_reports_enabled(self,enabled):
+        if self.reports_enabled==enabled:return
+        self.reports_enabled=enabled
+        if enabled:
+            if self.pending_summary is not None:
+                data=self.pending_summary;self.pending_summary=None;self.display(data)
+            self.poll()
+
     def poll(self):
         try:
             if not self.control:
@@ -183,7 +192,8 @@ class CachePanel(Group):
                     self.next_action.setText('다른 작업이 기록을 저장하고 있습니다. 연결되면 기존 설정과 기록을 불러옵니다.')
                     return
                 self.restore_controls();self.storage_ready.emit()
-            self.control.set('ui_heartbeat',time.time())
+            now=time.time();heartbeat=self.control.get('ui_heartbeat',0)
+            if not heartbeat or now-heartbeat>=1 or heartbeat>now:self.control.set('ui_heartbeat',now)
             waiting=self.control.requests()
             observed=self.ticket or self.last_ticket
             if observed:
@@ -195,6 +205,7 @@ class CachePanel(Group):
                         'dismiss':'확인창 닫힘 · 요청 중단'}.get(state[0],state[0]))
                     if self.dialog:self.dialog.reject()
             if not self.dialog and waiting:self.show_ticket(waiting[0])
+            if not self.reports_enabled and not self.pending_automatic and not self.operating_dialog:return
             states=[json.loads(r[0]) for r in self.control.db.execute('SELECT data FROM cache_status WHERE home=?',(self.home,))]
             forecasts=self.control.forecasts(self.home,time.time())
             if forecasts:
@@ -308,6 +319,9 @@ class CachePanel(Group):
         self.dialog=None;self.ticket=None
 
     def display(self,data):
+        if not self.reports_enabled:
+            self.pending_summary=data
+            return
         self.metrics['calls'].setText(formatted('{v0:,}회', v0=data.get('calls', 0)))
         self.metrics['cost'].setText(usd(data.get('known_cost')) if data.get('priced') else '—')
         self.metrics['unknown'].setText(formatted('{v0:,}회', v0=data.get('calls', 0) - data.get('priced', 0)))

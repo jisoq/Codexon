@@ -76,6 +76,7 @@ class OverlayController(QObject):
         self._legacy_anchor=self.anchor is not None and settings.value('overlay/anchorMode','')!='edge'
         self.drag_context=None;self.current_geometry=None;self.chrome_native=None
         self._native_scenes={}
+        self._screen_handles={}
         self._drag_selection=None;self._pending_drag_position=None
         self.drag_timer=QTimer(self)
         self.drag_timer.setSingleShot(True)
@@ -115,10 +116,10 @@ class OverlayController(QObject):
         self.widget.winId()
         # Qt 5 can apply its suggested size after SetWindowPos during WM_DPICHANGED.
         # Reanchor after that event finishes, preserving our logical dimensions.
-        self.widget.windowHandle().screenChanged.connect(lambda screen: QTimer.singleShot(0, self.refresh))
+        self.watch_screen(self.widget)
         for control in (*self.chrome,self.shadow):
             control.winId()
-            control.windowHandle().screenChanged.connect(lambda screen: QTimer.singleShot(0,self.refresh))
+            self.watch_screen(control)
         if os.name == 'nt' and native_enabled:
             from .overlay_windows import WindowsOverlay, SelectionTracker
             self.native = WindowsOverlay()
@@ -553,12 +554,22 @@ class OverlayController(QObject):
     def configure_scene(self,window,click_through=False):
         # Adding the first Quick scene can recreate a native backing surface.
         # Reapply input policy once for that surface, never on every heartbeat.
+        self.watch_screen(window)
         key=(self.native,int(window.winId()),window._quick)
         if self._native_scenes.get(window)==key:return
         self.native.configure(key[1],click_through=click_through)
         self._native_scenes[window]=key
         if hasattr(self.native,'set_companions'):
             self.native.set_companions(int(control.winId()) for control in self.chrome)
+
+    def watch_screen(self,window):
+        handle=window.windowHandle()
+        if self._screen_handles.get(window) is handle:return
+        self._screen_handles[window]=handle
+        handle.screenChanged.connect(self.screen_changed)
+
+    def screen_changed(self,screen):
+        QTimer.singleShot(0,self.refresh)
 
     def _refresh(self,drag_layout=False):
         if self.stopped: return

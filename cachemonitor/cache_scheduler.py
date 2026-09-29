@@ -101,9 +101,8 @@ class Scheduler:
         if type(output_cap) is not int or output_cap<=0:return dict(state='waiting',reason='output_budget_unobserved')
         # UTF-8 serialized suffix size is a conservative token-count scenario,
         # not a tokenizer measurement. The actual input cost is reconciled later.
-        maintenance=self.executor.contexts.maintenance(snapshot['response']['id'])
-        original=self.executor.contexts.responses[snapshot['response']['id']][0]
-        extra=len(json.dumps(maintenance['input'][len(original['input']):],ensure_ascii=False).encode())
+        suffix=self.executor.contexts.maintenance_suffix(snapshot['response']['id'])
+        extra=len(json.dumps(suffix,ensure_ascii=False).encode())
         bounds=cost_bounds(row,{**row,'cached':0},output_cap,extra)
         if not bounds:return dict(state='waiting',reason='input_or_price_unobserved')
         operation=None;scenarios=None
@@ -277,7 +276,8 @@ class Scheduler:
                 self.executor.contexts.usage.pop(rid,None);self.stopped.discard((sid,rid))
                 self.control.db.execute('DELETE FROM cache_status WHERE home=? AND sid=?',(self.home,sid))
         if self.continuous_capture:
-            self.control.set('worker_heartbeat',time.time())
+            now=time.time();heartbeat=self.control.get('worker_heartbeat',0)
+            if not heartbeat or now-heartbeat>=1 or heartbeat>now:self.control.set('worker_heartbeat',now)
             self.control.set('worker_snapshots',len(self.snapshots))
             await self.diagnostic_tick()
         if self.observation_only or (self.continuous_capture and not self.control.enabled('automatic')):

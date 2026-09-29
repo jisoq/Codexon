@@ -95,8 +95,7 @@ def test_native_bottom_right_move_resize_minimize_and_toggle(tmp_path):
     controller = OverlayController(QSettings(str(tmp_path/'native.ini'), QSettings.IniFormat),
                                    native_enabled=False, appearance_path=tmp_path/'codex.toml')
     controller.native = native
-    hwnd = int(controller.widget.winId()); target = int(host.winId())
-    native.configure(hwnd)
+    target = int(host.winId())
     def refresh():
         controller.receive_target({'target': {'hwnd': target, 'pid': 0},
                                    'selection': Selection('fixture')})
@@ -108,6 +107,10 @@ def test_native_bottom_right_move_resize_minimize_and_toggle(tmp_path):
         native.visible_target = lambda handle: bool(native.u.IsWindowVisible(handle) and not native.u.IsIconic(handle))
         refresh()
         assert controller.widget.isVisible()
+        # Deferred Quick creation can replace the initial native surface.
+        # Verify the live window configured by the controller after first show.
+        hwnd = int(controller.widget.winId())
+        assert native.u.IsWindow(hwnd)
         style = native.u.GetWindowLongPtrW(hwnd, -20)
         assert style & 0x08000000 and style & 0x20 and style & 0x80000
         for offset, size in ((0, (800, 620)), (90, (950, 700)), (-70, (760, 580))):
