@@ -138,6 +138,7 @@ def main():
     parser.add_argument('--installer',type=Path,required=True)
     parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--broken-installer',type=Path)
+    parser.add_argument('--initial-language',choices=('english','korean'))
     args=parser.parse_args()
     require_qa_installer(args.installer)
     if args.broken_installer:require_qa_installer(args.broken_installer)
@@ -162,6 +163,7 @@ def main():
         assert run([next(broken.glob('unins*.exe')),'/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART'])==0
         assert not registration()
     command=[args.installer.resolve(),'/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',f'/DIR={install}']
+    if args.initial_language:command.append(f'/LANG={args.initial_language}')
     assert run([*command,f'/LOG={root / "install.log"}'])==0
     first_language=native_language(root/'install.log.native.log')
     first=registration();assert Path(first['InstallRoot'])==install
@@ -183,7 +185,11 @@ def main():
         assert launch_snapshot(install)==before
     assert not (install/'activation-pending.json').exists()
     update_language='korean' if first_language=='english' else 'english'
-    assert run([*command,f'/LANG={update_language}',f'/LOG={root / "update.log"}'])==0
+    update=[arg for arg in command if not str(arg).lower().startswith('/lang=')]
+    update_exit=run([*update,f'/LANG={update_language}',f'/LOG={root / "update.log"}'])
+    activation=read_json(install/'install-result.json')
+    (root/'update-activation.json').write_text(json.dumps(activation,ensure_ascii=False,indent=2),encoding='utf-8')
+    assert update_exit==0,activation
     assert native_language(root/'update.log.native.log')==update_language
     links=shortcuts(True)
     assert links[2 if update_language=='english' else 1].is_file()
