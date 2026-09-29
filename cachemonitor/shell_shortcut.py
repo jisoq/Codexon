@@ -22,6 +22,44 @@ class PROPVARIANT(C.Structure):
     _fields_=[('vt',W.WORD),('r1',W.WORD),('r2',W.WORD),('r3',W.WORD),('value',Value)]
 
 
+def shortcut(path,target=None,cwd=None):
+    """Save or read a link through IShellLinkW and IPersistFile (Unicode)."""
+    ole=C.OleDLL('ole32');initialized=False
+    ole.CoInitializeEx.argtypes=[C.c_void_p,W.DWORD]
+    try:
+        ole.CoInitializeEx(None,2);initialized=True
+    except OSError as exc:
+        if getattr(exc,'winerror',None)!=-2147417850:raise
+    link=C.c_void_p();persist=C.c_void_p()
+    def invoke(pointer,index,*args):
+        table=C.cast(pointer,C.POINTER(C.POINTER(C.c_void_p))).contents
+        result=C.WINFUNCTYPE(C.c_long,C.c_void_p,*[type(arg) for arg in args])(table[index])(pointer,*args)
+        if result<0:raise OSError(f'Shortcut method {index} failed: {result:#x}')
+    try:
+        clsid=GUID.parse('00021401-0000-0000-c000-000000000046')
+        iid=GUID.parse('000214f9-0000-0000-c000-000000000046')
+        ole.CoCreateInstance.argtypes=[C.POINTER(GUID),C.c_void_p,W.DWORD,C.POINTER(GUID),C.POINTER(C.c_void_p)]
+        ole.CoCreateInstance(C.byref(clsid),None,1,C.byref(iid),C.byref(link))
+        file_iid=GUID.parse('0000010b-0000-0000-c000-000000000046')
+        invoke(link,0,C.pointer(file_iid),C.pointer(persist))
+        if target is not None:
+            invoke(link,20,W.LPCWSTR(str(target)))
+            invoke(link,9,W.LPCWSTR(str(cwd)))
+            invoke(persist,6,W.LPCWSTR(str(path)),W.BOOL(True))
+        else:
+            invoke(persist,5,W.LPCWSTR(str(path)),W.DWORD(0))
+        target_buffer=C.create_unicode_buffer(32768);cwd_buffer=C.create_unicode_buffer(32768)
+        invoke(link,3,C.cast(target_buffer,W.LPWSTR),C.c_int(len(target_buffer)),C.c_void_p(),W.DWORD(0))
+        invoke(link,8,C.cast(cwd_buffer,W.LPWSTR),C.c_int(len(cwd_buffer)))
+        return target_buffer.value,cwd_buffer.value
+    finally:
+        for pointer in (persist,link):
+            if pointer:
+                table=C.cast(pointer,C.POINTER(C.POINTER(C.c_void_p))).contents
+                C.WINFUNCTYPE(W.ULONG,C.c_void_p)(table[2])(pointer)
+        if initialized:ole.CoUninitialize()
+
+
 def application_id(path,value=None):
     ole=C.OleDLL('ole32');shell=C.OleDLL('shell32')
     ole.CoInitializeEx.argtypes=[C.c_void_p,W.DWORD]

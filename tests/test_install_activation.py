@@ -208,14 +208,16 @@ def test_recovery_translation_does_not_import_qt():
     assert result.returncode==0,result.stderr
 
 
-def test_shortcut_preserves_recovery_application_identity(tmp_path):
-    import os
+@pytest.mark.parametrize('name',['recovery','연결 복구','recovery-\U0001f642'])
+def test_shortcut_preserves_recovery_application_identity(tmp_path,name):
     import sys
-    from cachemonitor.shell_shortcut import application_id
-    link=tmp_path/'recovery.lnk'
-    script='$s=(New-Object -ComObject WScript.Shell).CreateShortcut($env:CODEXON_QA_SHORTCUT);$s.TargetPath=$env:CODEXON_QA_TARGET;$s.Save()'
-    subprocess.run(['powershell.exe','-NoProfile','-NonInteractive','-Command',script],check=True,
-        env={**os.environ,'CODEXON_QA_SHORTCUT':str(link),'CODEXON_QA_TARGET':sys.executable},
-        creationflags=subprocess.CREATE_NO_WINDOW)
+    from cachemonitor.shell_shortcut import application_id,shortcut
+    directory=tmp_path/name;directory.mkdir()
+    link=directory/(name+'.lnk')
+    target=directory/(name+'.exe');target.touch()
+    shortcut(link,target,directory)
+    assert tuple(map(Path,shortcut(link)))==(target,directory)
     application_id(link,'Codexon-QA.Recovery')
     assert application_id(link)=='Codexon-QA.Recovery'
+    shortcut(link,sys.executable,Path(sys.executable).parent)
+    assert tuple(map(Path,shortcut(link)))==(Path(sys.executable),Path(sys.executable).parent)
