@@ -44,7 +44,9 @@ def test_language_choice_is_saved_and_used_on_next_window(tmp_path):
         choose_edge(window,choice,Qt.Key_Home)
         assert not control(window,restart).isEnabled()
         choose_edge(window,choice,Qt.Key_End)
-        click(window,control(window,restart))
+        # The restart button appears after the language change and may wrap
+        # below the choice. Reveal it and settle the painted layout first.
+        click(window,render_plot(window,restart))
         assert requests==[True] and not control(window,restart).isEnabled()
         window.quit_app()
         set_language(saved.value('ui/language'))
