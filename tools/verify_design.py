@@ -116,8 +116,10 @@ def main():
                             window.select_compare_type('effort');settle()
                         if page==2:
                             state=window.capture_state()
-                            assert window.parent_kind=='sessions' and window.parent_table.rowCount()==30
-                            click_row(window,window.parent_table,0);settle();assert window.record_view=='requests'
+                            assert window.record_view=='projects' and window.table.rowCount()==3
+                            click_row(window,window.table,0);settle()
+                            assert window.record_view=='sessions' and window.table.rowCount()==10
+                            click_row(window,window.table,0);settle();assert window.record_view=='requests'
                             capture(prefix+'-requests')
                             request=window.record_rows[0];click_row(window,window.table,0);settle()
                             assert window.record_view=='calls' and window.table.rowCount()==request['responses']

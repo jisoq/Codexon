@@ -54,7 +54,7 @@ The dashboard reads local Codex records. If there are no records yet, use Codex 
 
 ## Optional model monitoring
 
-Enable **Settings → Proxy → Use proxy** to compare the requested and reported response model. Turning it on sends one verification call through your existing Codex account connection. Once setup succeeds, restart Codex to apply the connection change. Session history, cost analysis and usage-limit views can be used without the proxy.
+Enable **Settings → Codex integration → Proxy → Use proxy** to compare the requested and reported response model. Turning it on sends one verification call through your existing Codex account connection. Once setup succeeds, restart Codex to apply the connection change. Session history, cost analysis and usage-limit views can be used without the proxy.
 
 Codexon reports a model match or mismatch only when completed request/response evidence can be linked reliably. Missing or conflicting evidence is not treated as a mismatch. The reported model name does not prove which hardware or internal model implementation handled the request.
 
@@ -74,7 +74,7 @@ These figures describe time added by the proxy, not total response time or model
 
 ## Optional cache management
 
-Enable **Settings → Cache management** to reveal the **Cache management** tab. Automatic maintenance and model-change confirmation have separate controls; both are off by default.
+Enable **Settings → Codex integration → Cache refresh** to reveal the **Cache management** tab. Automatic maintenance and model-change confirmation have separate controls; both are off by default.
 
 - **Observation and decisions:** See current cache status, estimated maintenance cost, observed API-equivalent cost, recent activity and reasons for stopping. Decisions use ordinary work history. Insufficient comparable evidence or no expected net benefit means no maintenance request.
 - **Automatic maintenance:** During idle periods, a separate request with the original context attempts to preserve cache reuse. It requires a managed proxy, connected Codex hooks and explicit operating consent. Turning on the setting does not grant that consent. A new user request cancels scheduled maintenance and takes priority.
@@ -87,7 +87,7 @@ After **Connect Codex hooks**, trust the command in Codex and start a new task. 
 
 ## Updates and recovery
 
-Use **Settings → About and troubleshooting → Check and install updates**. For connection problems, open **Codexon Connection Recovery** from Start. See the [user guide](docs/user-guide.md) for record preservation, recovery and removal.
+Use **Settings → About → Check for updates**. For connection problems, open **Codexon Connection Recovery** from Start. See the [user guide](docs/user-guide.md) for record preservation, recovery and removal.
 
 ## Local data and removal
 

@@ -65,7 +65,7 @@ def test_switch_off_during_activation_cancels_then_reconciles_off(tmp_path):
         assert not panel.toggle.isChecked()
     finally:panel.stop();panel.deleteLater()
 
-def test_unified_update_button_render_and_recovery_remains_available(tmp_path,monkeypatch):
+def test_unified_update_check_then_explicit_install_and_cancel(tmp_path,monkeypatch):
     from cachemonitor.quick_qa import mount,control,click,dispose
     from cachemonitor.fonts import load_bundled_fonts
     from PySide6.QtGui import QFont
@@ -81,7 +81,7 @@ def test_unified_update_button_render_and_recovery_remains_available(tmp_path,mo
     monkeypatch.setattr('cachemonitor.app_update.update',lambda progress,manager,**kw:(calls.append('update') or '설치 시작'))
     monkeypatch.setattr('cachemonitor.update_panel.open_recovery',lambda *args:calls.append('recovery'))
     panel.manager.cancel_update=lambda:(calls.append('cancel') or initial)
-    panel.proxy_status(initial);host=mount(panel,680,350)
+    panel.proxy_status(initial);host=mount(panel,680,650)
     def finish():
         for _ in range(200):
             app.processEvents();QTest.qWait(10)
@@ -89,7 +89,10 @@ def test_unified_update_button_render_and_recovery_remains_available(tmp_path,mo
         raise AssertionError('update not finished')
     try:
         click(host,control(host,panel.button));finish()
-        assert calls==[] and panel.confirming
+        assert calls==[] and panel.offer and not panel.confirming
+        QTest.qWait(30)
+        click(host,control(host,panel.execute))
+        assert panel.confirming
         dialog=panel.dialog
         click(dialog.host,control(dialog.host,dialog.confirm));finish()
         assert calls==['update']
@@ -103,9 +106,7 @@ def test_unified_update_button_render_and_recovery_remains_available(tmp_path,mo
         click(host,control(host,panel.button));finish()
         assert calls==['update','cancel']
         panel.proxy_status({**initial,'update':{'phase':'switching','message':'업데이트 중'}})
-        assert panel.button.isEnabled() and panel.recovery.isEnabled()
-        click(host,control(host,panel.recovery))
-        assert calls[-1]=='recovery'
+        assert panel.button.isEnabled()
         panel.proxy_status({'configured':True,'phase':'active','update':{'phase':'complete','message':'업데이트 완료'}})
         assert panel.button.isEnabled()
     finally:dispose(host)

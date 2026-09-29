@@ -52,8 +52,8 @@ def start_smoke(window,app,path,fonts,depth='full'):
             click(window,control(window,tracking))
             assert window.settings.value('quota/trackingEnabled',True,type=bool) is original
             report['weekly_monitoring_toggle']=True
-            for category in (range(len(window.settings_page.TITLES)) if depth=='full' else (0,6)):
-                window.settings_page.navigation.setCurrentRow(category);QTest.qWait(60)
+            for category in (window.settings_page.IDS if depth=='full' else ('general','integration')):
+                window.settings_page.reveal(category);QTest.qWait(60)
                 target=path.with_name(path.stem+f'-settings-{category}.png')
                 assert window.grab().save(str(target));report['screens'].append(str(target))
             report['cache_management_page']=bool(control(window,window.cache_panel.summary))
@@ -62,7 +62,14 @@ def start_smoke(window,app,path,fonts,depth='full'):
             QTest.keyClicks(window.quick,'__qml_no_such_session__');settle()
             assert window.table.rowCount()==0
             assert window.record_message.text() in ('조건에 맞는 기록 없음','사용 기록 없음')
-            QTest.keyClick(window.quick,Qt.Key_A,Qt.ControlModifier);QTest.keyClick(window.quick,Qt.Key_Backspace)
+            # Send the edit keys to the rendered field. Other native windows
+            # (including the overlay) must not redirect this test's input.
+            from PySide6.QtCore import QCoreApplication,QEvent
+            from PySide6.QtGui import QKeyEvent
+            search.forceActiveFocus()
+            for key,modifiers in ((Qt.Key_A,Qt.ControlModifier),(Qt.Key_Backspace,Qt.NoModifier)):
+                for event_type in (QEvent.KeyPress,QEvent.KeyRelease):
+                    QCoreApplication.sendEvent(search,QKeyEvent(event_type,key,modifiers))
             settle();assert window.search.text()==''
             report['search_keyboard']=True
             if window.record_view=='projects' and window.record_rows:window.activate_record(0);settle()

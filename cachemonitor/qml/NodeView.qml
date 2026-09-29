@@ -10,6 +10,7 @@ Item {
     Loader { id: content; anchors.fill: parent }
     required property var node
     property var s: node ? node.state : ({})
+    Connections { target: view.node; function onFocusRequested() { if (view.item) view.item.forceActiveFocus(Qt.TabFocusReason) } }
     property bool horizontalParent: false
     activeFocusOnTab: s.kind === "plot"
     onActiveFocusChanged: if (activeFocus && s.kind === "plot" && item) item.forceActiveFocus()
@@ -213,6 +214,7 @@ Item {
     Component {
         id: buttonComponent
         UiButton {
+            role: view.s.role || "secondary"
             text: view.node.textValue; checkable: view.s.checkable; checked: view.s.checked
             font.pixelSize: view.s.fontSize; font.bold: view.s.bold
             disclosure: !!view.s.disclosure
@@ -220,6 +222,8 @@ Item {
             selectionTab: !!view.s.selectionTab
             flat: !!view.s.flat
             Component.onCompleted: if (view.s.defaultFocus) forceActiveFocus()
+            Keys.onReturnPressed: event => { if (view.s.activateOnReturn) view.node.activate(); else event.accepted = false }
+            Keys.onEnterPressed: event => { if (view.s.activateOnReturn) view.node.activate(); else event.accepted = false }
             onClicked: view.node.activate()
             Accessible.name: view.s.accessible || text
             UiToolTip { visible: parent.hovered && view.s.tooltip.length > 0; text: view.s.tooltip }
@@ -288,6 +292,7 @@ Item {
         UiInput {
             text: view.node.textValue; placeholderText: view.s.placeholder
             Accessible.name: view.s.accessible || placeholderText
+            Keys.onEscapePressed: event => { if (view.s.clearOnEscape) { view.node.edit(""); event.accepted = true } else event.accepted = false }
             onTextEdited: view.node.edit(text)
         }
     }

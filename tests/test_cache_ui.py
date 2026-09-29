@@ -25,7 +25,7 @@ def test_worker_heartbeat_does_not_reenable_disabled_route(tmp_path):
         panel.poll()
         assert not panel.proxy_ready and not panel.relay_connected
         assert panel.connection_status.text()=='작업기 실행 중 · 새 요청 연결 꺼짐'
-        assert panel.status.text()=='자동 유지 대기 · 캐시 관리를 지원하는 프록시 연결 필요'
+        assert panel.status.text()=='캐시 자동 갱신 대기 · 캐시 관리를 지원하는 프록시 연결 필요'
         panel.proxy_status(dict(configured=True,health=dict(cache_management=True)))
         panel.poll();assert panel.proxy_ready
         assert panel.connection_status.text()=='작업기 연결됨'
@@ -143,10 +143,10 @@ def test_forecast_survives_automatic_policy_and_execution_states_but_not_context
             panel.poll();assert panel.estimate.text()==label
         forecast=scheduler.control.forecasts('home',time.time())[0]
         scheduler.control.forecast('home','session',dict(forecast,cost_valid_until=time.time()-1))
-        panel.poll();assert '수집하고' in panel.estimate.text()
+        panel.poll();assert '집계 중' in panel.estimate.text()
         scheduler.control.forecast('home','session',forecast)
         scheduler.control.profile('home','session',dict(row,key='changed',ts=row['ts']+1,model='gpt-6-astra'))
-        panel.poll();assert '수집하고' in panel.estimate.text()
+        panel.poll();assert '집계 중' in panel.estimate.text()
         assert not host.qml_errors
     finally:asyncio.run(scheduler.close());panel.stop();dispose(host)
 
@@ -170,10 +170,10 @@ def test_master_switch_navigation_and_independent_features(tmp_path,size):
     window=create()
     try:
         assert window.nav.count()==4
-        window.open_settings();window.settings_page.reveal(6);QTest.qWait(60)
-        assert window.settings_page.navigation.currentText()=='캐시 관리'
-        assert [window.settings_page.navigation.itemText(i) for i in range(7)]==[
-            '일반','작업표시줄 위젯','세션 오버레이','캐시 관리','알림','프록시','정보·문제 해결']
+        window.open_settings();window.settings_page.reveal('integration');QTest.qWait(60)
+        assert window.settings_page.navigation.currentText()=='Codex 연동'
+        assert [window.settings_page.navigation.itemText(i) for i in range(6)]==[
+            '일반','화면 표시','알림','Codex 연동','문제 해결','앱 정보']
         click(window,control(window,window.cache_master));assert window.nav.count()==5
         window.nav.setCurrentRow(4);QTest.qWait(80)
         assert window.current_page==5 and window.heading.text()=='캐시 관리'
@@ -181,8 +181,8 @@ def test_master_switch_navigation_and_independent_features(tmp_path,size):
         # Narrow windows stack these cards. Reveal each switch inside its real
         # scroll viewport before clicking; scene coordinates alone can be clipped.
         click(window,render_plot(window,panel.toggles['guard']))
-        assert panel.control.enabled('guard') and not panel.control.enabled('automatic')
-        click(window,render_plot(window,panel.toggles['automatic']))
+        assert panel.control.enabled('guard') and panel.control.enabled('automatic')
+        assert 'automatic' not in panel.toggles
         assert panel.control.enabled('guard') and panel.control.enabled('automatic')
         assert window.grab().save(str(tmp_path/'cache-dashboard.png'))
         window.resize(1000,700);QTest.qWait(100)
@@ -190,7 +190,7 @@ def test_master_switch_navigation_and_independent_features(tmp_path,size):
         window.cache_master.setChecked(False)
         assert window.current_page==4 and window.nav.count()==4
         assert not panel.control.enabled('guard') and not panel.control.enabled('automatic')
-        assert panel.control.get('selection:guard') and panel.control.get('selection:automatic')
+        assert panel.control.get('selection:guard') and not panel.control.get('selection:automatic')
         assert not panel.control.get('guard') and not panel.control.get('automatic')
         assert not window.qml_errors
         close(window);window=create()
@@ -245,7 +245,7 @@ def test_rendered_hook_approval_cancel_close_timeout_and_disconnect(tmp_path):
         panel.poll()
         assert '관측 전용' in panel.status.text() and '사용자 WebSocket' in panel.forecast.text()
         assert '현재 문맥은 실행 범위 밖' in panel.forecast.text()
-        assert not panel.consent_button.isEnabled()
+        assert not panel.journal.operations.proposals(panel.home)
         assert host.grab().save(str(tmp_path/'cache-settings.png'))
         assert not host.qml_errors
     finally:
@@ -258,10 +258,10 @@ def test_rendered_operating_scope_consent_close_revoke_and_cost_status(tmp_path)
     try:
         proposal=panel.journal.operations.propose(target('home',body(),URL,HEADERS,False),.01,.1,64,'natural_output_proxy')
         panel.poll();QTest.qWait(50)
-        assert panel.consent_button.isEnabled()
+        assert panel.journal.operations.proposals(panel.home)
         # Closing/cancelling the concrete scope never grants permission.
         for choice in ('close','cancel','approve'):
-            panel.show_operating();QTest.qWait(80);dialog=panel.operating_dialog
+            panel.set_enabled(True);QTest.qWait(80);dialog=panel.operating_dialog
             assert dialog is not None and not dialog.host.qml_errors
             if choice=='approve':assert dialog.host.grab().save(str(tmp_path/'operating-consent.png'))
             if choice=='close':dialog.host.close()
@@ -271,7 +271,7 @@ def test_rendered_operating_scope_consent_close_revoke_and_cost_status(tmp_path)
             assert bool(panel.journal.operations.grants())==(choice=='approve')
         grant=panel.journal.operations.grants()[0]
         assert grant['scope']==proposal['scope'] and grant['max_calls']==2
-        assert not panel.control.get('automatic',False)  # Permission is separate from activation.
+        assert panel.control.get('automatic',False)  # The switch activates only after approval.
         assert panel.control.get('bounded_provider:chatgpt.com') is None
         assert '남은 2/2회' in panel.operating_status.text()
         operation=dict(id=grant['id'],scope=grant['scope'],expected=.01,adverse=.1,output_high=64)
@@ -288,6 +288,36 @@ def test_rendered_operating_scope_consent_close_revoke_and_cost_status(tmp_path)
         assert len(panel.journal.operations.grants())==2
         panel.revoke_operating();assert panel.journal.operations.grants()[0]['stopped']=='revoked'
         panel.control.set('automatic',False);panel.control.set('automatic',True);panel.poll()
-        assert '철회' in panel.operating_status.text()
+        assert '캐시 갱신 중지' in panel.operating_status.text()
     finally:
         panel.stop();dispose(host)
+
+
+@pytest.mark.parametrize('approve',[False,True])
+@pytest.mark.parametrize('delayed',[False,True])
+def test_settings_switch_owns_refresh_and_consent(tmp_path,approve,delayed):
+    app=QApplication.instance() or QApplication([])
+    panel=CachePanel('home',tmp_path/'index.sqlite',active=True);host=mount(panel)
+    try:
+        def propose():
+            panel.journal.operations.propose(target('home',body(),URL,HEADERS,False),.01,.1,64,'natural_output_proxy')
+        if not delayed:propose()
+        panel.set_enabled(True)
+        assert panel.control.enabled('automatic') and set(panel.toggles)=={'guard'}
+        if delayed:
+            assert panel.operating_dialog is None
+            propose();panel.poll()
+        QTest.qWait(60)
+        dialog=panel.operating_dialog
+        assert dialog is not None
+        click(dialog.host,control(dialog.host,dialog.confirm if approve else dialog.cancel))
+        QTest.qWait(40)
+        assert panel.control.get('enabled') is approve
+        assert panel.control.enabled('automatic') is approve
+        assert bool(panel.journal.operations.grants()) is approve
+        if approve:
+            panel.set_enabled(False)
+            assert not panel.control.enabled('automatic')
+            assert panel.journal.operations.grants()[0]['stopped']=='revoked'
+        assert not host.qml_errors
+    finally:panel.stop();dispose(host)

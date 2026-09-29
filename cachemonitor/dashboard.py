@@ -404,7 +404,7 @@ class Dashboard(TrayWindow):
             self.history_tables[kind]=node;self.history_table_stack.addWidget(node)
         self.table=self.history_tables['projects']
         self.records_body.addWidget(self.record_current)
-        self.history_summary=label('','muted',True);self.records_body.addWidget(self.history_summary)
+        self.history_summary=label('','muted',True);self.records_body.addWidget(Details('집계 상세',self.history_summary,compact=True))
         self.range_timer=QTimer(self);self.range_timer.setSingleShot(True);self.range_timer.timeout.connect(self.render_explorer)
         for node in (*self.history_tables.values(),self.session_parent_table):
             node.rangeRequested.connect(lambda:self.range_timer.start(0) if not self.analysis_pending else None)
@@ -429,7 +429,7 @@ class Dashboard(TrayWindow):
         except (ValueError,TypeError,KeyError):pass
 
     def capture_state(self):
-        return dict(design_version=4,history_navigation=self.history_navigation.capture(),comparison_selection=getattr(self,'comparison_selection',None),compare_model=self.compare_model.currentData(),page=self.current_page,settings_category=self.settings_page.stack.currentIndex(),
+        return dict(design_version=4,history_navigation=self.history_navigation.capture(),comparison_selection=getattr(self,'comparison_selection',None),compare_model=self.compare_model.currentData(),page=self.current_page,settings_category=self.settings_page.current_category(),
             common={key:getattr(self,key).currentData() for key in ('home','period','project','source')},
             archive=self.archive.isChecked(),dates=[self.date_start.text(),self.date_end.text()],
             page_filters=copy.deepcopy(self.page_filters),targets=copy.deepcopy(self.targets),baseline=self.baseline,
@@ -441,7 +441,7 @@ class Dashboard(TrayWindow):
             extras=[k for k,n in self.extra_column_controls.items() if n.isChecked()],outside=self.outside.isChecked(),
             scrolls={str(k):v.verticalPosition.value() for k,v in self.scrollers.items()},
             record_scroll=self.table.verticalScrollBar().value(),detail_scroll=self.detail_scroll.verticalPosition.value(),
-            record_horizontal=self.table.horizontalScrollBar().value(),settings_scrolls=[s.verticalPosition.value() for s in self.settings_page.scrollers],
+            record_horizontal=self.table.horizontalScrollBar().value(),settings_scrolls=self.settings_page.capture_scrolls(),
             parent_scroll=self.parent_table.verticalScrollBar().value(),parent_horizontal=self.parent_table.horizontalScrollBar().value(),
             record_selection=self.table.row_key(self.record_rows[self.table.currentRow()]) if 0<=self.table.currentRow()<len(self.record_rows) else None,
             widths=self.table.state['widths'],temporary=copy.deepcopy(self.temporary_context))
@@ -486,7 +486,7 @@ class Dashboard(TrayWindow):
         if self.current_page==5 and not self.cache_master.isChecked():self.current_page=0
         if initial and self.current_page==4:self.current_page=0
         self.exact_record=None;self.record_request+=1;self._revealed_call=None
-        self.settings_page.reveal(max(0,min(6,state.get('settings_category',0))))
+        self.settings_page.reveal(state.get('settings_category','general'))
         for key,attr in (('model','model'),('effort','effort'),('service_tier','mode')):
             choose(getattr(self,attr),self.page_filters.get(self.current_page,{}).get(key,''))
         if initial:state={**state,'record_scroll':0,'record_horizontal':0,'record_selection':None,'parent_scroll':0,'parent_horizontal':0}
@@ -499,7 +499,7 @@ class Dashboard(TrayWindow):
                 if int(key) in self.scrollers:self.scrollers[int(key)].verticalPosition.setValue(value)
             self.table.verticalScrollBar().setValue(state.get('record_scroll',0));self.detail_scroll.verticalPosition.setValue(state.get('detail_scroll',0))
             self.table.horizontalScrollBar().setValue(state.get('record_horizontal',0))
-            for area,value in zip(self.settings_page.scrollers,state.get('settings_scrolls',[])):area.verticalPosition.setValue(value)
+            self.settings_page.restore_scrolls(state.get('settings_scrolls',{}))
             if len(state.get('widths',[]))==self.table.columnCount():self.table.put(widths=state['widths'])
             if self.current_page>=3:self._restore_positions=None
 
@@ -648,7 +648,7 @@ class Dashboard(TrayWindow):
 
     def open_settings(self):self.show_window();self.change_page(4)
     def open_notification_details(self):
-        self.open_settings();self.notification_details.toggle.setChecked(True);self.settings_page.reveal(4,self.notification_details)
+        self.open_settings();self.notification_details.toggle.setChecked(True);self.settings_page.reveal('notifications',self.notification_details)
 
     def query(self):
         start,end=self.bounds();page=self.current_page
@@ -805,7 +805,7 @@ class Dashboard(TrayWindow):
                 if int(key) in self.scrollers:self.scrollers[int(key)].verticalPosition.setValue(value)
             self.table.verticalScrollBar().setValue(state.get('record_scroll',0));self.detail_scroll.verticalPosition.setValue(state.get('detail_scroll',0))
             self.table.horizontalScrollBar().setValue(state.get('record_horizontal',0))
-            for area,value in zip(self.settings_page.scrollers,state.get('settings_scrolls',[])):area.verticalPosition.setValue(value)
+            self.settings_page.restore_scrolls(state.get('settings_scrolls',{}))
             if len(state.get('widths',[]))==self.table.columnCount():self.table.put(widths=state['widths'])
             selected=state.get('record_selection')
             if selected is not None:
@@ -1364,7 +1364,7 @@ class Dashboard(TrayWindow):
         for node in self.call_filter_controls.values():node.setChecked(False)
         self.outside.setChecked(False);self.restoring=False
         if target.tab=='settings':
-            self.change_page(4);self.settings_page.reveal(5,self.diagnostic_details)
+            self.change_page(4);self.settings_page.reveal('troubleshooting',self.diagnostic_details)
         else:
             self.record_message.setText('대상 기록을 읽는 중 · '+target.sid);self.change_page(2)
             if target.call_id:self.request_exact_record()
@@ -1523,6 +1523,9 @@ class Dashboard(TrayWindow):
         self.nav.setMaximumHeight(270 if enabled else 220)
         self.nav.setCurrentRow(4 if enabled and self.current_page==5 else self.current_page if self.current_page<4 else -1)
         self.nav.blockSignals(blocked)
+        if hasattr(self,'cache_shortcut'):
+            self.cache_shortcut.setEnabled(enabled)
+            self.cache_shortcut_note.setText('캐시 갱신을 켜면 사용 기록과 모델 변경 확인 설정을 열 수 있습니다.' if not enabled else '')
         if not enabled and self.current_page==5:self.change_page(4)
 
     def restore_cache_controls(self):
@@ -1543,28 +1546,35 @@ class Dashboard(TrayWindow):
             from .cache_worker_control import CacheWorkerManager
             manager=CacheWorkerManager(self.observer_home,self.index_path,self.model_evidence_path)
         self.observer_panel=ObserverPanel(self.observer_home,self.observer_directory,active=self.manage_observer,parent=self,manager=manager)
-        self.settings_page.add_widget(3, self.observer_panel)
+        self.settings_page.add_widget('integration', self.observer_panel,section='프록시',title='프록시 사용',description='요청 모델과 응답 모델을 비교할 수 있도록 Codex 연결을 중계합니다.',target=self.observer_panel.toggle,aliases='proxy connection')
+        self.settings_page.entries[-1]['description']=self.observer_panel.description.text()
+        self.settings_page.entries.append(dict(id='connection-details',category='integration',section='프록시',title='연결 정보',description='',widget=self.observer_panel.connection_details,target=self.observer_panel.connection_details.toggle,aliases='connection information'))
         from .cache_panel import CachePanel
         self.cache_panel=CachePanel(self.observer_home,self.index_path,active=self.cache_control_enabled,parent=self)
         cache_scroll=Scroll();cache_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         cache_scroll.setWidget(self.cache_panel);self.pages.addWidget(cache_scroll);self.scrollers[5]=cache_scroll
         self.cache_master=Switch()
-        self.settings_page.add_row(6,'캐시 관리','전용 탭에서 자동 유지와 모델 변경 확인을 각각 설정합니다. 끄면 두 기능이 모두 중지됩니다.',self.cache_master)
+        self.settings_page.add_row('integration','캐시 갱신','기존 캐시 재사용을 시도하는 추가 요청입니다. 켤 때 예상 비용과 실행 범위를 확인합니다.',self.cache_master,section='캐시',aliases='캐시 관리 cache refresh')
+        self.cache_shortcut=Button('캐시 관리 열기');self.cache_shortcut.clicked.connect(lambda:self.change_page(5) if self.cache_master.isChecked() else None)
+        self.cache_shortcut_note=Text();self.cache_shortcut_note.setWordWrap(True)
+        self.settings_page.add_widget('integration',self.cache_shortcut,section='캐시',title='캐시 관리',target=self.cache_shortcut)
+        self.settings_page.add_widget('integration',self.cache_shortcut_note,section='캐시')
         self.cache_master.toggled.connect(self.set_cache_enabled)
         self.cache_panel.storage_ready.connect(self.restore_cache_controls)
+        self.cache_panel.enabled_changed.connect(lambda _:self.restore_cache_controls())
         self.restore_cache_controls()
         self.observer_panel.status_observed.connect(self.cache_panel.proxy_status)
         legacy_notifications = self.settings.value('notifications',True,type=bool)
         self.notification_master = Switch()
         self.notification_master.setChecked(self.settings.value('notifications/enabled', legacy_notifications, type=bool))
         self.notification_master.toggled.connect(lambda value: self.settings.setValue('notifications/enabled', value))
-        self.settings_page.add_row(4, '알림 표시', 'Windows 알림을 표시합니다. 보호 정지와 상태 확인은 계속 작동합니다.', self.notification_master)
+        self.settings_page.add_row('notifications', '알림 표시', '알림을 꺼도 연결 상태 확인과 보호 기능은 계속 작동합니다.', self.notification_master,section='전체 알림')
         self.notification_options = {}
         for kind,key,description in (
-            ('HTTP 전환','http_fallback','WebSocket에서 HTTP/SSE로 전환됐다는 기록이 새로 확인되면 알립니다.'),
-            ('캐시 저하 의심','cache_drop','원본 미적중은 호출별로 기록하고, 비교 가능한 반복 미적중·읽기량 감소를 사건으로 알립니다. 임계값은 잠정값입니다.'),
-            ('모델명 불일치','model_mismatch','같은 응답 ID의 완료 응답에서 요청·응답 모델명 차이가 확정되면 알립니다. 누락·관측 충돌은 알리지 않습니다.'),
-            ('프록시 장애','proxy_failure','확인된 프록시 장애와 자동 보호 정지를 알립니다. 단발 지연이나 사용자 취소는 장애로 알리지 않습니다.'),
+            ('HTTP 전환','http_fallback','연결 문제가 생긴 뒤 통신 방식이 바뀌었는지 확인할 수 있도록 전환 기록을 알립니다.'),
+            ('캐시 저하 의심','cache_drop','캐시 재사용이 줄어든 상황을 확인할 수 있도록 반복 미적중이나 읽기량 감소를 알립니다. 판단 기준은 잠정값입니다.'),
+            ('모델명 불일치','model_mismatch','요청한 모델과 응답에 기록된 모델이 다른 경우 알립니다. 완료된 응답에서 차이가 확인된 경우만 알립니다.'),
+            ('프록시 장애','proxy_failure','연결 복구가 필요한 상황을 놓치지 않도록 프록시 장애와 자동 보호 정지를 알립니다. 일시적인 지연은 제외합니다.'),
         ):
             setting='notifications/'+key
             option=Switch()
@@ -1574,7 +1584,7 @@ class Dashboard(TrayWindow):
             if not self.settings.contains(setting):self.settings.setValue(setting,enabled)
             option.toggled.connect(lambda value,key=setting:self.settings.setValue(key,value))
             self.notification_options[kind]=option
-            self.settings_page.add_row(4, kind, description, option)
+            self.settings_page.add_row('notifications', kind, description, option,section='알림 종류')
         cache_enabled=lambda *_:self.confirmed_notifications.enable_cache(self.notification_master.isChecked() and self.notification_options['캐시 저하 의심'].isChecked())
         self.notification_master.toggled.connect(cache_enabled)
         self.notification_options['캐시 저하 의심'].toggled.connect(cache_enabled)
@@ -1585,7 +1595,7 @@ class Dashboard(TrayWindow):
         self.cache_scope.addItem('전체 세션','all');self.cache_scope.addItem('현재 선택 세션','selected')
         self.cache_scope.setCurrentIndex(max(0,self.cache_scope.findData(self.settings.value('notifications/cacheScope','all'))))
         self.cache_scope.currentIndexChanged.connect(lambda *_:self.settings.setValue('notifications/cacheScope',self.cache_scope.currentData()))
-        self.settings_page.add_row(4,'캐시 알림 범위','현재 세션이 확인될 때만 해당 세션에 적용합니다.',self.cache_scope)
+        self.settings_page.add_row('notifications','캐시 알림 범위','현재 선택 세션으로 좁히면 다른 작업의 캐시 알림은 표시하지 않습니다. 현재 세션을 확인할 수 없을 때도 표시하지 않습니다.',self.cache_scope,section='적용 범위')
         for kind,handler in (('모델명 불일치',self.confirmed_notifications.enable_model),
                              ('프록시 장애',self.confirmed_notifications.enable_proxy)):
             handler(self.notification_options[kind].isChecked())
@@ -1596,32 +1606,45 @@ class Dashboard(TrayWindow):
         self.notification_log.put(leftColumns=[0,1,3],emptyText='이번 실행에서 발생한 알림 없음')
         for column,width in enumerate((175,160,70,430)):self.notification_log.setColumnWidth(column,width)
         self.notification_log.cellClicked.connect(self.open_notification_record);self.notification_log.cellActivated.connect(self.open_notification_record)
-        self.notification_details=Details('최근 알림 · 확인 근거',self.notification_log)
-        self.settings_page.add_widget(4, self.notification_details)
-        self.settings_page.add_widget(5, label('Codexon '+VERSION, 'section'))
+        self.notification_details=Details('최근 알림',self.notification_log)
+        self.settings_page.add_widget('notifications', self.notification_details,section='최근 알림',title='최근 알림',aliases='notification history')
+        def sync_notification_controls(*_):
+            for option in self.notification_options.values():option.setEnabled(self.notification_master.isChecked())
+            self.cache_scope.setEnabled(self.notification_master.isChecked() and self.notification_options['캐시 저하 의심'].isChecked())
+        self.notification_master.toggled.connect(sync_notification_controls)
+        self.notification_options['캐시 저하 의심'].toggled.connect(sync_notification_controls)
+        sync_notification_controls()
+        self.settings_page.add_widget('about', label('Codexon '+VERSION, 'section'),section='버전',title='현재 버전')
         from .update_panel import UpdatePanel
         self.update_panel=UpdatePanel(self.observer_panel.manager,self)
-        self.settings_page.add_widget(5,self.update_panel)
+        self.update_panel.heading.hide()
+        self.settings_page.add_widget('about',self.update_panel,section='업데이트',title='업데이트 확인',target=self.update_panel.button,aliases='정보 문제 해결 update')
+        self.recovery_button=Button('Codex 연결 복구 열기')
+        self.recovery_button.clicked.connect(self.update_panel.open_recovery)
+        self.recovery_status=Text();self.recovery_status.setWordWrap(True)
+        self.update_panel.recovery_status=self.recovery_status
+        self.settings_page.add_row('troubleshooting','연결 복구','Codex 연결에 문제가 있으면 복구 도구에서 연결 상태를 확인하고 설정을 복원할 수 있습니다.',self.recovery_button,section='연결 복구',aliases='recovery repair')
+        self.settings_page.add_widget('troubleshooting',self.recovery_status,section='연결 복구')
         self.observer_panel.status_observed.connect(self.update_panel.proxy_status)
         attribution=Row();attribution.setContentsMargins(0,8,0,16)
-        attribution.addWidget(label('제작자 · jisoq'),1)
-        self.repository_link=Button('GitHub · jisoq/Codexon')
+        attribution.addWidget(label('제작자: jisoq'),1)
+        self.repository_link=Button('GitHub: jisoq/Codexon')
         self.repository_link.setAccessibleName('Codexon GitHub 저장소 열기')
         self.repository_link.setToolTip('https://github.com/jisoq/Codexon')
         self.repository_link.clicked.connect(
             lambda: QDesktopServices.openUrl(QUrl('https://github.com/jisoq/Codexon')))
         attribution.addWidget(self.repository_link)
-        self.settings_page.add_widget(5, attribution)
-        self.settings_page.add_widget(5, label('집계 범위: 이 PC에 저장된 Codex 작업 기록입니다. '
+        self.settings_page.add_widget('about', attribution,section='제작자',title='저장소',target=self.repository_link,aliases='GitHub')
+        self.settings_page.add_widget('troubleshooting', label('집계 범위: 이 PC에 저장된 Codex 작업 기록입니다. '
             '기록 파일을 만들지 않는 임시 사이드 채팅과 다른 PC의 작업은 포함되지 않습니다.', 'muted', True))
         self.diagnostic_summary=label('','',True)
         self.diagnostic_summary.setTextFormat(Qt.RichText)
-        self.settings_page.add_widget(5, self.diagnostic_summary)
+        self.settings_page.add_widget('troubleshooting', self.diagnostic_summary,title='수집 상태')
         self.diagnostics = TextArea()
         self.diagnostics.setReadOnly(True)
         self.diagnostics.setMinimumHeight(230)
         self.diagnostic_details=Details('수집 상세',self.diagnostics)
-        self.settings_page.add_widget(5, self.diagnostic_details)
+        self.settings_page.add_widget('troubleshooting', self.diagnostic_details,title='진단 상세',aliases='수집 상세 diagnostics')
 
     def receive_proxy_status(self,result):
         incident=result.get('incident') or {}
@@ -1654,4 +1677,4 @@ class Dashboard(TrayWindow):
         if not 0<=index<len(self.notification_log.model().rows):return
         event=self.notification_log.model().rows[index]
         if event.get('target'):self.navigate(event['target'])
-        else:self.settings_page.reveal(5,self.diagnostic_details)
+        else:self.settings_page.reveal('troubleshooting',self.diagnostic_details)

@@ -42,7 +42,7 @@ def test_quick_theme_selection_updates_overlay_and_preserves_state(tmp_path):
         controller.receive_target(dict(target={'hwnd': 1}, selection=Selection('clean')))
         QTest.qWait(80)
     try:
-        window.tick.stop(); window.show(); window.open_settings(); QTest.qWait(100)
+        window.tick.stop(); window.show(); window.open_settings(); window.settings_page.reveal('display'); QTest.qWait(100)
         refresh(); controller.toggle_expanded(); refresh()
         model = controller.widget.content_model
         model.select(model.call_id(model.rows()[0]))
