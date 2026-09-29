@@ -181,7 +181,10 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: windows-verification
-          path: artifacts/verification/
+          path: |
+            artifacts/verification/
+            !artifacts/verification/**/*.sqlite*
+            !artifacts/verification/**/*.lock
           if-no-files-found: ignore
   publish:
     needs: verify
