@@ -6,11 +6,11 @@ application control and view inside the host is rendered by Qt Quick.
 from pathlib import Path
 from PySide6.QtCore import QObject, Property, Signal, Slot, QUrl, Qt, QTimer, QRectF
 from PySide6.QtGui import QFont, QPainter, QColor, QPen, QImage
-from PySide6.QtQml import qmlRegisterType
+from PySide6.QtQml import qmlRegisterType, QQmlEngine, QQmlContext, QQmlComponent
 from PySide6.QtQuick import QQuickPaintedItem
 from PySide6.QtQuickWidgets import QQuickWidget
 from PySide6.QtQuickControls2 import QQuickStyle
-from PySide6.QtWidgets import QWidget, QVBoxLayout
+from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout
 from .presentation import Group, Column, Button, Row
 
 
@@ -132,34 +132,90 @@ def register_types():
         _registered=True
 
 
+def shared_engine():
+    """Share compiled QML and type data, while each scene owns its context."""
+    app=QApplication.instance()
+    engine=getattr(app,'_codexon_qml_engine',None)
+    if engine is None:
+        engine=QQmlEngine(app)
+        app._codexon_qml_engine=engine
+        import atexit
+        app.aboutToQuit.connect(release_quick_scenes)
+        atexit.register(release_quick_scenes)
+    return engine
+
+
+def release_quick_scenes():
+    """Destroy views before their shared engine, including non-event-loop tools."""
+    from shiboken6 import delete, isValid
+    app=QApplication.instance()
+    if app is None:return
+    engine=getattr(app,'_codexon_qml_engine',None)
+    if engine is None or not isValid(engine):return
+    for widget in QApplication.allWidgets():
+        if isinstance(widget,QuickHost) and isValid(widget):widget.release_scene()
+    del app._codexon_qml_engine
+    delete(engine)
+
+
 class QuickHost(QWidget):
     def __init__(self,parent=None,flags=Qt.Window):
-        super().__init__(parent,flags);self.quick=None;self.presentation=None;self.qml_errors=[]
+        super().__init__(parent,flags);self._quick=None;self._scene=None;self.presentation=None;self.qml_errors=[]
+    @property
+    def quick(self):
+        if self._quick is None and self._scene is not None:self._create_scene()
+        return self._quick
     def setCentralWidget(self,node):
         self.set_scene(node,'Main.qml')
 
-    def set_scene(self,node,filename,transparent=False):
-        register_types();self.presentation=node;node.setParent(self)
-        self.quick=QQuickWidget(self);self.quick.setResizeMode(QQuickWidget.SizeRootObjectToView)
+    def set_scene(self,node,filename,transparent=False,*,deferred=False,shared=False):
+        self.presentation=node;node.setParent(self)
+        self._scene=(filename,transparent,shared)
+        if not deferred:self._create_scene()
+
+    def _create_scene(self):
+        register_types()
+        filename,transparent,shared=self._scene
+        self._scene=None
+        node=self.presentation
+        self._quick=QQuickWidget(shared_engine(),self) if shared else QQuickWidget(self)
+        engine=self.quick.engine()
+        self.quick.setResizeMode(QQuickWidget.SizeRootObjectToView)
         from .theme import shared_theme
         from .i18n import Translator
-        self.quick.rootContext().setContextProperty('appTheme', shared_theme())
-        self._translator=Translator(self)
-        self.quick.rootContext().setContextProperty('appLanguage', self._translator)
-        self.quick.engine().warnings.connect(lambda errors:self.qml_errors.extend(e.toString() for e in errors))
+        context=QQmlContext(engine.rootContext(),self.quick)
+        context.setContextProperty('appTheme', shared_theme())
+        self._translator=Translator(context)
+        context.setContextProperty('appLanguage', self._translator)
+        engine.warnings.connect(self._qml_warnings)
         if transparent:self.quick.setClearColor(Qt.transparent)
-        self.quick.setInitialProperties({'presentation':node})
-        self.quick.setSource(QUrl.fromLocalFile(str(Path(__file__).parent/'qml'/filename)))
+        source=QUrl.fromLocalFile(str(Path(__file__).parent/'qml'/filename))
+        component=QQmlComponent(engine,source,self.quick)
+        root=component.createWithInitialProperties({'presentation':node},context)
+        self.quick.setContent(source,component,root)
         layout=QVBoxLayout(self);layout.setContentsMargins(0,0,0,0);layout.addWidget(self.quick)
         if self.quick.status()==QQuickWidget.Error:
             raise RuntimeError('\n'.join(error.toString() for error in self.quick.errors()))
+        self.configure_quick(self.quick)
+
+    def configure_quick(self,quick):
+        pass
+
+    def setVisible(self,visible):
+        if visible and self._quick is None and self._scene is not None:self._create_scene()
+        super().setVisible(visible)
+
+    def _qml_warnings(self,errors):
+        self.qml_errors.extend(error.toString() for error in errors)
 
     def release_scene(self):
-        if self.quick is not None:
+        self._scene=None
+        if self._quick is not None:
+            self.quick.engine().warnings.disconnect(self._qml_warnings)
             self.quick.setSource(QUrl())
             from shiboken6 import delete
             delete(self.quick)
-            self.quick=None
+            self._quick=None
 
 
 class Dialog(Group):

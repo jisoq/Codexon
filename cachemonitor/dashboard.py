@@ -247,17 +247,18 @@ class Dashboard(TrayWindow):
         for candidate in self.snapshot.get('homes',[home]):
             if candidate not in services:
                 service=QuotaService(candidate,self.index_path,live=self.live_limits,quota_path=self.quota_path,
-                    tracking_enabled=self.settings.value('quota/trackingEnabled',True,type=bool))
+                    tracking_enabled=self.settings.value('quota/trackingEnabled',True,type=bool),reports_enabled=False)
                 services[candidate]=service
                 service.updated.connect(lambda value,expected=service: self.receive_quota(value) if self.quota_service is expected else None)
                 service.start()
         if home not in services:
             services[home]=QuotaService(home,self.index_path,live=self.live_limits,quota_path=self.quota_path,
-                tracking_enabled=self.settings.value('quota/trackingEnabled',True,type=bool))
+                tracking_enabled=self.settings.value('quota/trackingEnabled',True,type=bool),reports_enabled=False)
             services[home].updated.connect(lambda value,expected=services[home]:self.receive_quota(value) if self.quota_service is expected else None)
             services[home].start()
         services[home].supply_local(self.snapshot.get('quota_by_home',{}).get(services[home].home))
         self.live_quota=None;self.quota_service=services[home]
+        self.sync_quota_reports()
         self.refresh_tray()
         self.quota_service.wake.set()
 
@@ -267,9 +268,14 @@ class Dashboard(TrayWindow):
             service.set_tracking_enabled(enabled)
 
     def receive_quota(self,value):
-        self.quota_panel.defer_render=self.current_page!=3 or (getattr(self,'_ever_shown',False) and not self.isVisible())
+        self.quota_panel.defer_render=self.current_page!=3 or not self.isVisible() or self.isMinimized()
         if self.quota_panel.receive(value) is False:return
         self.live_quota=value.get('quota');self.quota_issue=value.get('issue','');self.refresh_tray()
+
+    def sync_quota_reports(self):
+        visible=getattr(self,'current_page',0)==3 and self.isVisible() and not self.isMinimized()
+        for service in getattr(self,'quota_services',{}).values():
+            service.set_reports_enabled(visible and service is self.quota_service)
 
     def scroll_page(self,index):
         area=Scroll();area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff);body=Group();layout=Column(body)
@@ -632,6 +638,7 @@ class Dashboard(TrayWindow):
             self.page_filters[self.current_page]={key:getattr(self,attr).currentData() for key,attr in (('model','model'),('effort','effort'),('service_tier','mode'))}
         if index==5 and not self.cache_master.isChecked():index=4
         self.current_page=max(0,min(5,index));self.pages.setCurrentIndex(self.current_page);self.heading.setText(TITLES[self.current_page])
+        self.sync_quota_reports()
         self.restoring=True
         self.nav.setCurrentRow(4 if self.current_page==5 else self.current_page if self.current_page<4 else -1)
         for key,attr in (('model','model'),('effort','effort'),('service_tier','mode')):
@@ -684,7 +691,7 @@ class Dashboard(TrayWindow):
 
     def render(self,*_,automatic=False):
         if self.restoring or not hasattr(self,'diagnostics'):return
-        if automatic and getattr(self,'_ever_shown',False) and (not self.isVisible() or self.isMinimized()):
+        if automatic and (not self.isVisible() or self.isMinimized()):
             self._display_dirty=True;return
         custom=self.period.currentData()=='custom';self.date_start.setVisible(custom);self.date_end.setVisible(custom)
         if self.current_page>=3:
@@ -775,7 +782,7 @@ class Dashboard(TrayWindow):
     @batched_updates
     def apply_result(self,result,query,automatic=False):
         if query['page']!=self.current_page:return
-        if automatic and getattr(self,'_ever_shown',False) and (not self.isVisible() or self.isMinimized()):
+        if automatic and (not self.isVisible() or self.isMinimized()):
             self.analysis_pending=False;self._display_dirty=True;return
         self.analysis_pending=False;self.pending_timer.stop();self.pending_label.hide();self.pages.show()
         self.view_result=result;self.applied_key=result['key'];self.analysis=result['analysis'];self.lookup=result['lookup']
@@ -835,9 +842,17 @@ class Dashboard(TrayWindow):
         super().resizeEvent(event)
         if hasattr(self,'detail_scroll'):self.layout_record_detail()
     def showEvent(self,event):
-        super().showEvent(event);self._ever_shown=True
+        super().showEvent(event)
+        self.sync_quota_reports()
         if getattr(self,'_display_dirty',False):
             self._display_dirty=False;QTimer.singleShot(0,lambda:self.render(automatic=True))
+
+    def hideEvent(self,event):
+        super().hideEvent(event);self.sync_quota_reports()
+
+    def changeEvent(self,event):
+        super().changeEvent(event)
+        if event.type()==QEvent.WindowStateChange:self.sync_quota_reports()
 
     def closeEvent(self,event):
         self.settings.setValue('dashboard/geometry',self.saveGeometry());self.save_preferences();super().closeEvent(event)

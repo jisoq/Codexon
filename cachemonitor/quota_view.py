@@ -182,13 +182,13 @@ def prepare_quota_view(report):
     from .quota_share import prepare_model_share
     rows,periods=quota_value_history(report,history_rows(report,'weekly'))
     completed=completed_percent_costs(rows)
-    rows=[{**row,'completed_cost':amount} for row,amount in zip(rows,completed)]
+    for row,amount in zip(rows,completed):row['completed_cost']=amount
     times=[r['at'] for r in rows]
     overall=[];offset_cost=offset_delta=0;resets=[]
     for i,period in enumerate(periods):
         lo=bisect_left(times,period['start'])
         hi=bisect_left(times,periods[i+1]['start']) if i+1<len(periods) else len(rows)
-        own=[dict(row) for row in rows[lo:hi] if row['local_observed']]
+        own=[row for row in rows[lo:hi] if row['local_observed']]
         for index,row in enumerate(own):
             if not index or row['local_range']!=own[index-1]['local_range']:row['connect']=False
             cost=offset_cost+(row['cycle_cost'] or 0);delta=offset_delta+row['cycle_delta']
@@ -210,8 +210,11 @@ def prepare_quota_view(report):
     now=report.get('at')
     summaries={None:lifetime}
     if now is not None:
+        earliest=min((cycle['start'] for cycle in report.get('cycles',[])),default=now)
         for days in (7,30,90):
-            summaries[days]=quota_statistics(report,now-days*86400,include_mode_assumptions=True)
+            start=now-days*86400
+            summaries[days]=(lifetime if start<=earliest else
+                             quota_statistics(report,start,include_mode_assumptions=True))
     all_series=prepare_series(overall)
     all_series['model_share']=prepare_model_share(all_series,[interval for period in periods for interval in period.pop('cost_intervals')])
     all_series.update(active_only=True,cumulative=True,resets=resets)

@@ -100,7 +100,7 @@ class OverlayShadow(QuickHost):
         self._render_key=None
         self._clip_key=None
         self.view=ShadowModel()
-        self.set_scene(self.view,'OverlayScene.qml',transparent=True)
+        self.set_scene(self.view,'OverlayScene.qml',transparent=True,deferred=True,shared=True)
         self.refresh_shadow()
 
     @property

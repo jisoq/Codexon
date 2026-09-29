@@ -152,6 +152,7 @@ def test_preferences_restore_observed_dimensions_before_snapshot(dashboard,tmp_p
         assert second.project.currentData()==project_key('V:/work/project-1')
         assert second.project.currentText()=='project-1'
         assert second.record_view=='projects' and second.selected_session is None
+        second.show();QTest.qWait(20)
         assert second.analysis['response_count']==24
     finally:second.quitting=True;second.tick.stop();second.tray.hide();second.observer_panel.stop();second.close()
 

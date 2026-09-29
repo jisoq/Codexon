@@ -85,6 +85,7 @@ def test_process_queries_latest_selection_cache_and_clean_shutdown(tmp_path):
     snapshot={'ts':epoch+110,'sessions':[source],'homes':[],'errors':[],'unassigned':[],
               'index':{'loading':False,'done':1,'files':1}}
     w=Dashboard([],settings=QSettings(str(tmp_path/'worker.ini'),QSettings.IniFormat),static_snapshot=snapshot)
+    w.show()
     def settle():
         limit=time.monotonic()+20
         while time.monotonic()<limit:
@@ -143,7 +144,8 @@ def test_process_queries_latest_selection_cache_and_clean_shutdown(tmp_path):
         w.tray.hide(); w.close()
 
 
-def test_hidden_dashboard_defers_all_page_refreshes(tmp_path,monkeypatch):
+@pytest.mark.parametrize('shown_before',[False,True])
+def test_hidden_dashboard_defers_all_page_refreshes(tmp_path,monkeypatch,shown_before):
     from PySide6.QtCore import QSettings
     from PySide6.QtWidgets import QApplication
     from cachemonitor.dashboard import Dashboard
@@ -151,7 +153,8 @@ def test_hidden_dashboard_defers_all_page_refreshes(tmp_path,monkeypatch):
     w=Dashboard([],start_worker=False,live_limits=False,
         settings=QSettings(str(tmp_path/'hidden.ini'),QSettings.IniFormat))
     try:
-        w.show();app.processEvents();w.hide();app.processEvents();w.tick.stop()
+        if shown_before:w.show();app.processEvents();w.hide();app.processEvents()
+        w.tick.stop()
         calls=[]
         monkeypatch.setattr(w.quota_panel,'refresh_status',lambda:calls.append('quota'))
         monkeypatch.setattr(w,'render_diagnostics',lambda:calls.append('diagnostics'))

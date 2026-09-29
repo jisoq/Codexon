@@ -64,6 +64,7 @@ def test_unpriced_call_explains_missing_input_without_claiming_collection_error(
 def test_open_aggregate_refreshes_values_and_records_without_reveal(tmp_path):
     import copy
     window=dashboard(tmp_path)
+    window.show()
     try:
         snapshot=sample();window.receive(snapshot);window.open_summary(0)
         before=window.aggregate_selection['value']

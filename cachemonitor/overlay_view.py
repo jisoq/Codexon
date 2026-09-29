@@ -631,7 +631,7 @@ class SessionOverlay(QuickHost):
     def __init__(self):
         super().__init__(None,Qt.Tool|Qt.FramelessWindowHint|Qt.WindowStaysOnTopHint|Qt.WindowDoesNotAcceptFocus|Qt.WindowTransparentForInput)
         self.setWindowTitle('Cache Monitor · 세션 오버레이');self.setAttribute(Qt.WA_TranslucentBackground);self.setAttribute(Qt.WA_ShowWithoutActivating);self.setAttribute(Qt.WA_TransparentForMouseEvents)
-        self.content_model=OverlayContent();self.set_scene(self.content_model,'OverlayScene.qml',transparent=True);self.resize(self.panel_width(),self.panel_height())
+        self.content_model=OverlayContent();self.set_scene(self.content_model,'OverlayScene.qml',transparent=True,deferred=True,shared=True);self.resize(self.panel_width(),self.panel_height())
         self.content_model.changed.connect(lambda:self.setAccessibleName(self.content_model.state.get('accessible','')))
     @property
     def opacity(self):return self.content_model.opacity

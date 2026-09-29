@@ -219,6 +219,7 @@ def build(db, home, now):
     complete = len(health_rows) == len(homes) and all(h['complete'] and now-h['at'] <= 15 for h in health_rows)
     lookup_failed = bool(db.execute('select 1 from tracking_gaps where home=? and start>=? and end is null', (home, started)).fetchone())
     wire = list(db.execute(f'select * from tracking_wire where home in ({slots}) and start>=?', (*homes, started)))
+    known_responses={r[0] for r in db.execute(f'select uid from calls where home in ({slots})',homes)}
     return dict(groups=groups, homes=homes, enabled=monitoring, account=account,
                 controls=[dict(r) for r in controls],
                 ownership_gaps=[], phase='on' if monitoring else 'off',
@@ -226,4 +227,4 @@ def build(db, home, now):
                 lookup_failed=lookup_failed,
                 last_observed_at=max((r['at'] for r in raw.values()), default=None),
                 pending_responses=[dict(r) for r in wire if r['response'] and
-                    not db.execute(f'select 1 from calls where home in ({slots}) and uid=?', (*homes,r['response'])).fetchone()])
+                    r['response'] not in known_responses])

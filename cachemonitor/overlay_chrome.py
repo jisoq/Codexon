@@ -79,17 +79,13 @@ class OverlayChrome(QuickHost):
                       expanded=False, canExpand=True, popupOpen=False,
                       **{key:initial[key].name() for key in ('surface','ink','meta','border','accent')},
                       family='Pretendard JP', reducedMotion=False)
-        self.set_scene(self.view, 'OverlayControls.qml', transparent=True)
-        self.quick.setFocusPolicy(Qt.NoFocus)
-        self.quick.installEventFilter(self)
-        self.quick.setMouseTracking(True)
+        self.set_scene(self.view, 'OverlayControls.qml', transparent=True,deferred=True,shared=True)
         self.view.opacityRequested.connect(self.opacity_changed)
         self.view.collapseRequested.connect(self.collapse)
         self.view.opacityToggleRequested.connect(self.opacity_toggle)
         self.view.escapeRequested.connect(self.escape)
         self.view.interactionRequested.connect(self.begin_interaction)
         self.view.restoreRequested.connect(self.restore)
-        if kind in ('header', 'icon'): self.quick.setAttribute(Qt.WA_TransparentForMouseEvents)
         if kind == 'toolbar':
             # Existing settings adapter; the sole visible input is the QML slider.
             self.slider = Slider()
@@ -97,6 +93,12 @@ class OverlayChrome(QuickHost):
             self.slider.valueChanged.connect(lambda value: self.opacity_changed.emit(100 - value))
             self.percent = Text()
         self.apply_appearance(self.appearance, self.opacity)
+
+    def configure_quick(self,quick):
+        quick.setFocusPolicy(Qt.NoFocus)
+        quick.installEventFilter(self)
+        quick.setMouseTracking(True)
+        if self.kind in ('header','icon'):quick.setAttribute(Qt.WA_TransparentForMouseEvents)
 
     def apply_appearance(self, appearance, opacity):
         if (appearance, opacity) == (getattr(self, '_applied_appearance', None), getattr(self, '_applied_opacity', None)): return
@@ -282,9 +284,11 @@ class OverlayDetail(QuickHost):
         self.view = DetailModel(content)
         self.view.escapeRequested.connect(self.escape)
         self.view.interactionRequested.connect(self.begin_interaction)
-        self.set_scene(self.view, 'OverlayDetail.qml', transparent=True)
-        self.quick.setFocusPolicy(Qt.NoFocus)
-        self.quick.installEventFilter(self)
+        self.set_scene(self.view, 'OverlayDetail.qml', transparent=True,deferred=True,shared=True)
+
+    def configure_quick(self,quick):
+        quick.setFocusPolicy(Qt.NoFocus)
+        quick.installEventFilter(self)
 
     def apply_appearance(self, appearance, opacity): self.view.sync()
 
@@ -312,10 +316,11 @@ class OverlayLinks(QuickHost):
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.view=NavigationModel(content);self.wheel_forwarder=None
         content.changed.connect(self.sync)
-        self.set_scene(self.view,'OverlayLinks.qml',transparent=True)
-        self.quick.installEventFilter(self)
-        self.quick.setMouseTracking(True)
+        self.set_scene(self.view,'OverlayLinks.qml',transparent=True,deferred=True,shared=True)
         self._hover_position=None
+    def configure_quick(self,quick):
+        quick.installEventFilter(self)
+        quick.setMouseTracking(True)
     def sync(self):
         from .overlay_view import palette
         c=self.view.content;scale=c.appearance.scale;links=self.view.link_state(c.monitor_links())
