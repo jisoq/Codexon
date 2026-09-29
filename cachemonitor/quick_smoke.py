@@ -2,7 +2,7 @@
 import json
 import time
 from pathlib import Path
-from PySide6.QtCore import QTimer, Qt
+from PySide6.QtCore import QTimer, Qt, QSignalBlocker
 from PySide6.QtTest import QTest
 from PySide6.QtQuickWidgets import QQuickWidget
 from .quick_qa import control, table_view
@@ -56,7 +56,28 @@ def start_smoke(window,app,path,fonts,depth='full'):
                 window.settings_page.reveal(category);QTest.qWait(60)
                 target=path.with_name(path.stem+f'-settings-{category}.png')
                 assert window.grab().save(str(target));report['screens'].append(str(target))
-            report['cache_management_page']=bool(control(window,window.cache_panel.summary))
+            # Visit the deferred page without activating cache requests. The
+            # presentation flag only opens navigation; its service signal stays blocked.
+            cache_enabled=window.cache_master.isChecked()
+            cache_details=None
+            try:
+                with QSignalBlocker(window.cache_master):window.cache_master.setChecked(True)
+                window.change_page(5);settle()
+                from .ui_details import Details
+                from .quick_qa import render_plot
+                cache_details=window.cache_panel.summary.parent()
+                while cache_details is not None and not isinstance(cache_details,Details):cache_details=cache_details.parent()
+                assert cache_details is not None
+                details_open=cache_details.toggle.isChecked()
+                if not details_open:click(window,render_plot(window,cache_details.toggle))
+                render_plot(window,window.cache_panel.summary)
+                assert window.current_page==5 and control(window,window.cache_panel.summary).isVisible()
+                target=path.with_name(path.stem+'-cache.png')
+                assert window.grab().save(str(target));report['screens'].append(str(target))
+                report['cache_management_page']=True
+            finally:
+                if cache_details is not None:cache_details.toggle.setChecked(details_open)
+                with QSignalBlocker(window.cache_master):window.cache_master.setChecked(cache_enabled)
             window.nav.setCurrentRow(2);settle()
             search=control(window,window.search);search.forceActiveFocus()
             QTest.keyClicks(window.quick,'__qml_no_such_session__');settle()

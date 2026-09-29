@@ -8,6 +8,7 @@ from .cache_misses import classify
 from .cache_health import CacheHealth
 from .session_costs import session_costs
 from .speed_health import SpeedHealth
+from .analysis_records import public_record
 
 
 TOKEN_LABELS = {'cached': '캐시 읽기', 'uncached': '일반 입력', 'written': '캐시 쓰기',
@@ -100,7 +101,7 @@ def _call_id(row):
 
 def call_summary(row, ordinal, *, miss=False, degradation=False):
     """Keep absent observations absent, and all headline fields on one call."""
-    result = dict(row)
+    result = public_record(row)
     parts = token_parts(row)
     inp, cached, written, out, reasoning = (token_number(row.get(key))
         for key in ('input', 'cached', 'written', 'output', 'reasoning'))

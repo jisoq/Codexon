@@ -39,7 +39,7 @@ class SettingsPage(Group):
         shell=Row();shell.setSpacing(24);root.addLayout(shell,1)
         self.navigation=Navigation();self.navigation.setObjectName('settingsNavigation')
         self.navigation.addItems(self.TITLES);self.navigation.setFixedWidth(160)
-        self.stack=Stack();self.stack.setMaximumWidth(840);shell.addWidget(self.navigation);shell.addWidget(self.stack,1);shell.addStretch()
+        self.stack=Stack();self.stack.put(deferPages=True);self.stack.setMaximumWidth(840);shell.addWidget(self.navigation);shell.addWidget(self.stack,1);shell.addStretch()
         self.layouts={};self.scrollers={}
         for category,title in zip(self.IDS,self.TITLES):
             area=Scroll();area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)

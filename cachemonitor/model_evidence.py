@@ -146,10 +146,13 @@ class EvidenceReader:
             return
         for row in rows:
             self.offset = row['seq']
-            self.activity_records[(row['home'], row['attempt'])] = dict(row)
+            # Both indexes read the same observation. Later events replace the
+            # dict rather than mutate it, preserving previously returned values.
+            record = dict(row)
+            self.activity_records[(row['home'], row['attempt'])] = record
             if row['response_id']:
                 key = (row['home'], row['response_id'])
-                self.records.setdefault(key, {})[row['attempt']] = dict(row)
+                self.records.setdefault(key, {})[row['attempt']] = record
                 # Invalidate only joined histories containing this exact response.
                 for cache_key in self.dependencies.pop(key,set()):
                     self.cache.pop(cache_key,None)

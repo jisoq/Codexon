@@ -384,7 +384,8 @@ def test_collection_reuses_history_and_atomically_replaces_current_sessions(tmp_
     path=tmp_path/'index.sqlite'
     writer=CollectionChannel([],path);reader=CollectionChannel([],path)
     snapshot=empty_snapshot([],path,100)
-    snapshot['sessions']=[dict(home='h',id='s',history=[dict(key='a',output=1)],remaining=10)]
+    snapshot['sessions']=[dict(home='h',id='s',history=[dict(key='a',output=1)],remaining=10,
+                               usage_revision=1,turn_records={'turn':{'state':'running'}})]
     snapshot['request_activity']=[dict(home='h',attempt='a',status='started'),dict(home='h',attempt='b',status='started')]
     try:
         writer.publish(snapshot,'first',1)
@@ -401,11 +402,17 @@ def test_collection_reuses_history_and_atomically_replaces_current_sessions(tmp_
         isolated=reader.read();isolated['sessions'][0]['history'][0]['output']=99
         assert reader.read(shared=True)['sessions'][0]['history'][0]['output']==1
         snapshot['sessions'][0]['history'][0]['output']=2
+        snapshot['sessions'][0]['turn_records']['turn']['state']='completed'
+        snapshot['sessions'][0]['provider']='changed'
         snapshot['request_activity'][0]['status']='completed'
         snapshot['request_activity'].reverse()
         writer.publish(snapshot,'first',4)  # Consumers may miss intermediate revisions.
         assert reader.read()==snapshot
         assert first['sessions'][0]['history'][0]['output']==1
+        assert first['sessions'][0]['turn_records']['turn']['state']=='running'
+        # Preserve the existing JSON payload contract for dict subclasses.
+        from collections import OrderedDict
+        snapshot['sessions'][0]['turn_records']=OrderedDict(snapshot['sessions'][0]['turn_records'])
         writer.publish(snapshot,'restart',1)
         assert reader.read()==snapshot
         snapshot['sessions']=[];snapshot['request_activity']=[];writer.publish(snapshot,'restart',2)

@@ -31,6 +31,7 @@ def test_native_activation_requires_its_own_completed_receipt(tmp_path,monkeypat
             calls.append(command)
             assert command[command.index('--report')+1]==str(self.report)
             assert '--native-install' in command and '--no-launch' in command and '--isolated-install' in command
+            assert command[command.index('--language')+1]=='en'
             if result is not None:self.report.write_text(json.dumps(result))
         def inspect(self):return dict(running=0,state=3,last_result=1 if result and result.get('error') else 0)
         def remove(self):calls.append('removed')

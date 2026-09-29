@@ -106,12 +106,16 @@ begin
     { Never forward the loader's /SL5 or other internal parameters. }
     if (Lower='/silent') or (Lower='/verysilent') or (Lower='/suppressmsgboxes') or
        (Lower='/norestart') or (Lower='/sp-') or (Lower='/log') or
-       (Pos('/log=',Lower)=1) or (Pos('/dir=',Lower)=1) or (Pos('/lang=',Lower)=1) then begin
+       (Pos('/log=',Lower)=1) or (Pos('/dir=',Lower)=1) then begin
       SetArrayLength(Lines,Count+4);
       Lines[Count+3] := 'arg'+IntToStr(Count)+'='+Arg;
       Count := Count+1;
     end;
   end;
+  { The bootstrap already selected a language. Reuse it without another dialog. }
+  SetArrayLength(Lines,Count+4);
+  Lines[Count+3] := 'arg'+IntToStr(Count)+'=/LANG='+ActiveLanguage;
+  Count := Count+1;
   SetArrayLength(Lines,Count+4);
   Lines[Count+3] := 'count='+IntToStr(Count);
   if not SaveStringsToUTF8File(Request,Lines,False) then RaiseException('Cannot write the installation request');

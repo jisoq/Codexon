@@ -3,6 +3,7 @@ from collections import Counter
 
 from .analytics import cache_rows, observation_flags, stats
 from .pricing import mode_assumptions, request_tier, sum_cost
+from .analysis_records import record_items
 
 
 def identity(row):
@@ -139,7 +140,7 @@ def explorer(engine,result,selection):
     while cursor in hierarchy['items']:
         item=hierarchy['items'][cursor];chain.append({k:item[k] for k in ('title','home','sid','project_id')});cursor=hierarchy['parent'].get(cursor)
     path.extend(reversed(chain))
-    available=sorted({key for row in records for key,value in row.items() if value not in (None,'','미확인','확인 불가') and not isinstance(value,(dict,list))})
+    available=sorted({key for row in records for key,value in record_items(row) if value not in (None,'','미확인','확인 불가') and not isinstance(value,(dict,list))})
     selected_identity=selection.get('call_identity')
     detail=engine.record(*selected_identity) if selected_identity else None
     event_keys={str(k) for field in ('baseline_keys','occurrence_keys','recovery_keys') for k in (event or {}).get(field,[])}

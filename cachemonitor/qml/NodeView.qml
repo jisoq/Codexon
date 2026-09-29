@@ -312,6 +312,11 @@ Item {
             padding: 0; rightPadding: 12
             property var revealTarget: null
             property string revealGeometry: ""
+            property bool restoringPosition: true
+            Component.onCompleted: Qt.callLater(function() {
+                scroll.contentItem.contentY = view.node.verticalPosition.position
+                scroll.restoringPosition = false
+            })
             function cancelReveal() { revealTarget=null; revealGeometry="" }
             onVisibleChanged: if (!visible) cancelReveal()
             Keys.onPressed: event => {
@@ -347,7 +352,7 @@ Item {
             contentWidth: body.width; contentHeight: body.implicitHeight
             Connections {
                 target: scroll.contentItem
-                function onContentYChanged() { view.node.verticalPosition.observe(scroll.contentItem.contentY) }
+                function onContentYChanged() { if (!scroll.restoringPosition) view.node.verticalPosition.observe(scroll.contentItem.contentY) }
                 function onMovementStarted() { scroll.cancelReveal() }
             }
             Connections {
@@ -396,7 +401,16 @@ Item {
         id: stackComponent
         StackLayout {
             currentIndex: view.s.index
-            Repeater { model: view.node.nodes; NodeChild { required property var modelData; node: modelData; Layout.fillWidth: true; Layout.fillHeight: true } }
+            Repeater {
+                model: view.node.nodes
+                NodeChild {
+                    required property var modelData
+                    required property int index
+                    node: modelData
+                    loadRequested: !view.s.deferPages || index === view.s.index
+                    Layout.fillWidth: true; Layout.fillHeight: true
+                }
+            }
         }
     }
     Component {
