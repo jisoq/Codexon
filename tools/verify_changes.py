@@ -113,7 +113,7 @@ RULES = (
     ('cachemonitor/quota_attribution.py', ('quota_math', 'quota_store')),
     ('cachemonitor/quota_cycles.py', ('quota_math', 'quota_store')),
     ('cachemonitor/banked_resets.py', ('quota_math', 'quota_ui')),
-    ('cachemonitor/quota_view.py', ('quota_ui',)),
+    ('cachemonitor/quota_view.py', ('quota_ui', 'quota_chart')),
     ('cachemonitor/quota_panel.py', ('quota_ui',)),
     ('cachemonitor/quota_service.py', ('quota_poll', 'quota_store')),
     # A diff against a supported old revision can still contain this deleted reader.
@@ -152,7 +152,8 @@ RULES = (
     ('cachemonitor/qml/Node*.qml', ('shared_ui',)),
     ('cachemonitor/qml/Main.qml', ('shared_ui', 'window')),
     ('cachemonitor/qml/PaintedScene.qml', ('shared_ui', 'overlay_render', 'quota_ui')),
-    ('cachemonitor/quick_runtime.py', ('shared_ui', 'overlay_controls', 'quota_ui')),
+    ('cachemonitor/quick_runtime.py', ('shared_ui', 'overlay_controls', 'overlay_render', 'overlay_navigation', 'quota_ui', 'taskbar', 'window', 'translation')),
+    ('tools/benchmark_resources.py', ('quota_math', 'quota_store', 'shared_ui')),
     ('cachemonitor/controls.py', ('shared_ui',)),
     ('cachemonitor/presentation.py', ('shared_ui', 'dashboard', 'overlay_render')),
     ('cachemonitor/charts.py', ('shared_ui', 'quota_chart')),

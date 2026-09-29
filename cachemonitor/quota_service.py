@@ -19,7 +19,7 @@ class QuotaService(QThread):
     # as AnalysisBridge does, rather than recursively copying QVariant maps.
     updated = Signal(object)
 
-    def __init__(self, home, index_path=None, live=True, tracking_enabled=True,quota_path=None):
+    def __init__(self, home, index_path=None, live=True, tracking_enabled=True,quota_path=None,reports_enabled=True):
         super().__init__()
         self.home = str(Path(home).resolve())
         self.path = Path(quota_path) if quota_path else ledger_path(index_path)
@@ -29,6 +29,13 @@ class QuotaService(QThread):
         self.tracking_after=time.time()
         self.tracking_changes=queue.SimpleQueue()
         self.local_observations=queue.SimpleQueue()
+        self.reports_enabled=reports_enabled
+
+    def set_reports_enabled(self,enabled):
+        enabled=bool(enabled)
+        if enabled!=self.reports_enabled:
+            self.reports_enabled=enabled
+            self.wake.set()
 
     def supply_local(self, quota):
         """Receive the collector's observation without changing its timestamp."""
@@ -57,6 +64,7 @@ class QuotaService(QThread):
         emitted_issue = None
         report = None
         stage = 'initialize'
+        was_reporting=self.reports_enabled
 
         def storage_failed(exc):
             nonlocal ledger, database_issue, next_storage, storage_failures
@@ -74,6 +82,9 @@ class QuotaService(QThread):
         try:
             while not self.isInterruptionRequested():
                 self.wake.clear()
+                if self.reports_enabled!=was_reporting:
+                    was_reporting=self.reports_enabled
+                    if was_reporting:next_report=0
                 while not self.tracking_changes.empty():
                     change = self.tracking_changes.get_nowait()
                     controls.append(change)
@@ -142,7 +153,7 @@ class QuotaService(QThread):
                         if self.tracking_enabled:
                             pending.append(('local', local))
                         next_report = 0
-                publish = report is None or time.monotonic() >= next_report
+                publish = (report is None and self.reports_enabled) or time.monotonic() >= next_report
                 if ledger is not None:
                     try:
                         stage = 'save observations'
@@ -155,7 +166,7 @@ class QuotaService(QThread):
                                 if kind == 'quota':
                                     tracking_store.observe(ledger.db, self.home, value)
                             pending.popleft()
-                        if publish:
+                        if publish and self.reports_enabled:
                             stage = 'report'
                             updated_report = ledger.report(self.home)
                             from .quota_view import prepare_quota_view
@@ -169,9 +180,10 @@ class QuotaService(QThread):
                 latest = select_current_quota(direct, local, time.time())
                 issue = ' · '.join(v for v in (lookup_issue, database_issue) if v)
                 if publish or issue != emitted_issue:
-                    self.updated.emit({'home': self.home, 'quota': latest,
-                        'issue': issue,
-                        'report': report or {'home': self.home, 'cycles': [], 'error': True, 'index_loading': False}})
+                    value={'home':self.home,'quota':latest,'issue':issue}
+                    if self.reports_enabled:
+                        value['report']=report or {'home':self.home,'cycles':[],'error':True,'index_loading':False}
+                    self.updated.emit(value)
                     emitted_issue = issue
                     next_report = time.monotonic()+5
                 self.wake.wait(1)

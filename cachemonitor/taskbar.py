@@ -263,11 +263,13 @@ class TaskbarQuota(QuickHost):
         self.caption=Text('주간');self.value=Text('?')
         from .theme import shared_theme
         self.view=Node();self.view.put(logo='',caption='주간',value='?',foreground=shared_theme().palette['ink'],valueColor=shared_theme().palette['ink'])
-        self.set_scene(self.view,'Taskbar.qml',transparent=True)
-        self.quick.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.set_scene(self.view,'Taskbar.qml',transparent=True,deferred=True,shared=True)
         self.timer = QTimer(self)
         self.timer.setInterval(1000)
         self.timer.timeout.connect(self.sync_position)
+
+    def configure_quick(self,quick):
+        quick.setAttribute(Qt.WA_TransparentForMouseEvents)
 
     def add_monitor_menu(self, menu):
         self.monitor_menu = menu.addMenu('표시할 모니터')
@@ -392,6 +394,8 @@ class TaskbarQuota(QuickHost):
             self.windowHandle().setScreen(screen)
         self.resize(round(rect.width() / ratio), round(rect.height() / ratio))
         self.update_theme()
+        # Finish the Qt backing surface before native parenting into the taskbar.
+        if self._scene is not None:self._create_scene()
         hwnd = int(self.winId())
         self._native_id = hwnd
         if not self.native.attach(hwnd, host):

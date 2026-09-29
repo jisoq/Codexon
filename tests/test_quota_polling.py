@@ -58,6 +58,46 @@ def test_activity_is_coalesced_without_postponing_or_overriding_backoff():
     assert p.next_read==425 and p.failures==0
 
 
+def test_hidden_reports_keep_recording_and_resume_with_current_history(tmp_path,monkeypatch):
+    clock=[1000.0];builds=[];lookups=[];updates=[]
+    fake_time=SimpleNamespace(time=lambda:clock[0],monotonic=lambda:clock[0])
+    monkeypatch.setattr(module,'time',fake_time)
+    from cachemonitor import quota_tracking_store
+    monkeypatch.setattr(quota_tracking_store,'time',fake_time)
+    class Client:
+        def __init__(self,*args):pass
+        def close(self):pass
+        def fetch(self):
+            lookups.append(clock[0])
+            return dict(source='live',account='test',bucket='codex',plan_type='pro',
+                requested_at=clock[0],observed_at=clock[0],elapsed=0,
+                windows={'weekly':dict(used_percent=20+len(lookups),resets_at=20000,window_minutes=10080)})
+    class Ledger(QuotaLedger):
+        def report(self,home):
+            builds.append(clock[0]);return super().report(home,now=clock[0])
+    monkeypatch.setattr(module,'AccountClient',Client)
+    monkeypatch.setattr(module,'QuotaLedger',Ledger)
+    service=module.QuotaService(tmp_path/'home',tmp_path/'index.sqlite',reports_enabled=False)
+    service.updated.connect(lambda value:updates.append((clock[0],value)))
+    class Wake:
+        def clear(self):pass
+        def set(self):pass
+        def wait(self,seconds):
+            clock[0]+=seconds
+            if clock[0]==1007:service.set_reports_enabled(True)
+            if clock[0]==1012:service.set_reports_enabled(False)
+    service.wake=Wake()
+    service.isInterruptionRequested=lambda:clock[0]>=1032
+    service.run()
+    assert builds and builds[0]==1007 and all(1007<=at<1012 for at in builds)
+    assert any(at>=1012 and value['quota']['observed_at']>=1012 for at,value in updates)
+    assert all('report' not in value for at,value in updates if at<1007 or at>=1012)
+    assert next(value for at,value in updates if at==1007)['report']['history']
+    with sqlite3.connect(service.path) as db:
+        saved=[row[0] for row in db.execute('select received from tracking_observations order by received')]
+    assert saved==lookups
+
+
 @pytest.mark.parametrize('failure_stage',['startup','lock','report','lookup'])
 def test_polling_recovers_and_preserves_history(tmp_path,monkeypatch,failure_stage):
     # Run real ledger SQL with a deterministic clock; no Codex/proxy requests.

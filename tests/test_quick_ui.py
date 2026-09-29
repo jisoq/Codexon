@@ -6,7 +6,29 @@ from PySide6.QtWidgets import QApplication
 from cachemonitor.core import Session
 from cachemonitor.dashboard import Dashboard
 from cachemonitor.presentation import Choice
-from cachemonitor.quick_qa import control, mount, dispose, table_view, click_row, wheel
+from cachemonitor.quick_qa import control, mount, dispose, table_view, click_row, wheel, walk
+
+
+def test_independent_scenes_survive_other_scene_shutdown():
+    from cachemonitor.presentation import Text
+    from cachemonitor.quick_runtime import QuickHost
+    app=QApplication.instance() or QApplication([])
+    first=Text('first');second=Text('second')
+    def scene(node):
+        host=QuickHost();host.resize(240,100)
+        host.set_scene(node,'Main.qml',shared=True);host.show();QTest.qWait(20)
+        return host
+    a=scene(first);b=scene(second)
+    try:
+        assert any(item.property('text')=='first' for item in walk(control(a,first)))
+        assert any(item.property('text')=='second' for item in walk(control(b,second)))
+        dispose(a);a=None
+        second.setText('still active');QTest.qWait(20)
+        assert any(item.property('text')=='still active' for item in walk(control(b,second)))
+        assert not b.quick.grabFramebuffer().isNull() and not b.qml_errors
+    finally:
+        if a is not None:dispose(a)
+        dispose(b)
 
 
 def test_reasoning_tokens_render_independently_of_cost_and_request_unit(tmp_path):

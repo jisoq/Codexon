@@ -272,11 +272,14 @@ def quota_statistics(report, start=None, end=None, include_mode_assumptions=Fals
     attribution=dict(idle_delta=0,pending_delta=0,unmatched_calls=0,pending_windows=0)
     account_delta=sum(max(0,c['delta']) for c in scoped if not current_account or c.get('account')==current_account)
     if report.get('tracking') is not None:
-        from .quota_attribution import local_request_intervals
+        from .quota_attribution import local_request_intervals, RequestWindows
+        requests=RequestWindows(report.get('request_windows',[]))
         local=[]
         for cycle in scoped:
             if current_account and cycle.get('account')!=current_account:continue
-            parts,diagnostics=local_request_intervals(cycle,report.get('request_windows',[]),_clip_quota_interval)
+            points=cycle.get('endpoints',[])
+            overlapping=requests.overlapping(points[0][0],points[-1][0]) if points else ()
+            parts,diagnostics=local_request_intervals(cycle,overlapping,_clip_quota_interval)
             local.extend(parts)
             for key in attribution:attribution[key]+=diagnostics[key]
         scoped=local
@@ -818,14 +821,15 @@ class QuotaLedger:
                         and r['minutes']==10080]
         manual_resets = [dict(r) for r in self.db.execute(
             'select * from manual_resets where home=? and at<=? order by at,id', (home,now))]
-        groups = split_cycles(observations, manual_resets)
         from .quota_tracking_store import build
         tracking = build(self.db, home, now)
         scope = tracking['homes'] if tracking is not None else [home]
         slots = ','.join('?' for _ in scope)
         if tracking is not None:
             groups = tracking['groups']
-        elif groups:groups[-1]['provisional']=True
+        else:
+            groups = split_cycles(observations, manual_resets)
+            if groups:groups[-1]['provisional']=True
         state = self.db.execute('select * from state where home=?', (home,)).fetchone()
         completed_at=(state['complete_at'] if 'complete_at' in state.keys() else state['at'] if not state['loading'] else None) if state else None
         if tracking is not None:

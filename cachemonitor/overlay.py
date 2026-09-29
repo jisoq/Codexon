@@ -75,6 +75,7 @@ class OverlayController(QObject):
         except (TypeError,ValueError):pass
         self._legacy_anchor=self.anchor is not None and settings.value('overlay/anchorMode','')!='edge'
         self.drag_context=None;self.current_geometry=None;self.chrome_native=None
+        self._native_scenes={}
         self._drag_selection=None;self._pending_drag_position=None
         self.drag_timer=QTimer(self)
         self.drag_timer.setSingleShot(True)
@@ -549,6 +550,16 @@ class OverlayController(QObject):
     def refresh(self):
         self._refresh()
 
+    def configure_scene(self,window,click_through=False):
+        # Adding the first Quick scene can recreate a native backing surface.
+        # Reapply input policy once for that surface, never on every heartbeat.
+        key=(self.native,int(window.winId()),window._quick)
+        if self._native_scenes.get(window)==key:return
+        self.native.configure(key[1],click_through=click_through)
+        self._native_scenes[window]=key
+        if hasattr(self.native,'set_companions'):
+            self.native.set_companions(int(control.winId()) for control in self.chrome)
+
     def _refresh(self,drag_layout=False):
         if self.stopped: return
         target = self.target_state.get('target')
@@ -636,11 +647,9 @@ class OverlayController(QObject):
         self.current_geometry=geometry
         self.monitor_geometry=monitor
         if self.chrome_native is not self.native:
-            self.native.configure(int(self.widget.winId()),click_through=True)
-            self.native.configure(int(self.shadow.winId()),click_through=True)
-            for control in self.chrome:self.native.configure(int(control.winId()),click_through=False)
-            if hasattr(self.native,'set_companions'):
-                self.native.set_companions(int(control.winId()) for control in self.chrome)
+            self.configure_scene(self.widget,True)
+            self.configure_scene(self.shadow,True)
+            for control in self.chrome:self.configure_scene(control)
             self.chrome_native=self.native
         for control in self.chrome:
             if hasattr(control,'apply_appearance'):control.apply_appearance(self.appearance,self.opacity)
@@ -657,6 +666,7 @@ class OverlayController(QObject):
             # preserves the companion window boundary.
             self.icon.resize(round(40*scale),round(40*scale))
             if not self.icon.isVisible():self.icon.show()
+            self.configure_scene(self.icon)
             gutter=round(4*scale*dpi/96)
             icon_geometry=(geometry[0]-gutter,geometry[1]-gutter,geometry[2]+2*gutter,geometry[3]+2*gutter)
             if not self._place(int(self.icon.winId()),icon_geometry):self.icon.hide()
@@ -668,14 +678,17 @@ class OverlayController(QObject):
             shadow_geometry=self.shadow.physical_geometry(geometry,dpi/96)
             self.shadow.clip_to_frame(frame,shadow_geometry,dpi/96)
             if not self.shadow.isVisible():self.shadow.show()
+            self.configure_scene(self.shadow,True)
             if not self._place(int(self.shadow.winId()),shadow_geometry):self.shadow.hide()
             if not self.widget.isVisible(): self.widget.show()
+            self.configure_scene(self.widget,True)
             if not self._place(int(self.widget.winId()), geometry):self.hide_all();return
             native_scale=dpi/96*scale
             def place(control,area,origin=geometry):
                 x,y,w,h=area
                 control.resize(round(w*scale),round(h*scale))
                 if not control.isVisible():control.show()
+                self.configure_scene(control)
                 placed=(origin[0]+round(x*native_scale),origin[1]+round(y*native_scale),round(w*native_scale),round(h*native_scale))
                 if not self._place(int(control.winId()),placed):control.hide()
                 return placed
@@ -699,6 +712,7 @@ class OverlayController(QObject):
                 self.toolbar.resize(round(160*scale),round(40*scale))
                 self.popup_geometry=(px,py,popup_w,popup_h)
                 if not self.toolbar.isVisible():self.toolbar.show()
+                self.configure_scene(self.toolbar)
                 if not self._place(int(self.toolbar.winId()),self.popup_geometry):self.close_popup()
             else:self.toolbar.hide()
             if mode!=previous_mode and hasattr(self.native,'raise_companion'):

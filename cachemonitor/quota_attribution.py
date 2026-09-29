@@ -3,6 +3,29 @@ from bisect import bisect_left, bisect_right
 import math
 
 
+class RequestWindows:
+    """Index real request bounds once, without changing their attribution rules."""
+    def __init__(self,requests):
+        spans=[]
+        for row in requests:
+            start,end=row.get('start'),row.get('end')
+            if start is None:start=end
+            if type(start) not in (int,float) or not math.isfinite(start):continue
+            if end is not None and (type(end) not in (int,float) or not math.isfinite(end) or end<start):continue
+            spans.append((start,float('inf') if end is None else end,row))
+        self.starts=sorted(spans,key=lambda span:span[0])
+        self.ends=sorted(spans,key=lambda span:span[1])
+        self.start_times=[span[0] for span in self.starts]
+        self.end_times=[span[1] for span in self.ends]
+
+    def overlapping(self,start,end):
+        hi=bisect_right(self.start_times,end)
+        lo=bisect_left(self.end_times,start)
+        if hi<=len(self.ends)-lo:
+            return (row for _,until,row in self.starts[:hi] if until>=start)
+        return (row for since,_,row in self.ends[lo:] if since<=end)
+
+
 def merged_ranges(ranges):
     result=[]
     for lo,hi in sorted(ranges):

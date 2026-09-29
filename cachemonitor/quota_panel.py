@@ -279,7 +279,7 @@ class QuotaPanel(Group):
             return False
         if incoming_home:self.expected_home=home_key(incoming_home)
         self.quota=value.get('quota');self.issue=value.get('issue','')
-        self.report=value.get('report') or {'cycles':[]}
+        if 'report' in value:self.report=value['report'] or {'cycles':[]}
         if getattr(self,'defer_render',False):self._render_dirty=True
         else:self.render(automatic=True)
         return True
