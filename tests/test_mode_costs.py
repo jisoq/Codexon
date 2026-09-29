@@ -24,7 +24,7 @@ def history():
 
 
 def test_fixed_fast_rates_thresholds_and_unknown_is_never_base_cost():
-    for model in ('gpt-6-astra','gpt-5.6-sol','gpt-5.6-terra','gpt-5.6-luna','gpt-5.4-mini'):
+    for model in ('gpt-6-astra','gpt-6.1-sol','gpt-5.6-sol','gpt-5.6-terra','gpt-5.6-luna','gpt-5.4-mini'):
         for inp in (100000,272001):
             base={**usage(model=model),'input':inp}
             standard=token_cost(base);fast=token_cost(dict(base,service_tier='Fast'))
