@@ -92,6 +92,34 @@ def quit_gui(executable,home,index,evidence,cache,*,force=False):
             process.wait(timeout=10)
 
 
+def read_collection_snapshot(path):
+    """Read both released IPC formats without initializing or changing the DB."""
+    from contextlib import closing
+    import sqlite3,zlib
+    with closing(sqlite3.connect(path.resolve().as_uri()+'?mode=ro',uri=True)) as db:
+        # The header and its session revisions belong to one committed snapshot.
+        db.execute('BEGIN')
+        row=db.execute('SELECT payload FROM snapshot WHERE id=1').fetchone()
+        if not row:return {}
+        value=json.loads(zlib.decompress(row[0]))
+        schema=value.get('collection_schema',1)
+        if schema==1:return value
+        if schema!=2:raise ValueError(f'Unsupported collector snapshot schema: {schema}')
+        sessions=[]
+        for entry in value.pop('session_manifest'):
+            stored=db.execute('SELECT revision,payload FROM sessions WHERE home=? AND sid=?',
+                              (entry['home'],entry['sid'])).fetchone()
+            if stored is None or stored[0]!=entry['revision']:
+                raise ValueError('Collector session revision does not match the snapshot')
+            sessions.append({**json.loads(zlib.decompress(stored[1])),**entry['state']})
+        value['sessions']=sessions
+        if 'activity_revision' in value:
+            value['request_activity']=[json.loads(zlib.decompress(row[0]))
+                                       for row in db.execute('SELECT payload FROM activity ORDER BY position')]
+            value.pop('activity_revision')
+        return value
+
+
 def verify_legacy_collector(root,old,new):
     import sqlite3,zlib
     from cachemonitor.usage_collection import locked
@@ -106,12 +134,10 @@ def verify_legacy_collector(root,old,new):
         for path in channels:
             if not path.exists():continue
             try:
-                with sqlite3.connect(path.as_uri()+'?mode=ro',uri=True) as db:
-                    row=db.execute('SELECT payload FROM snapshot WHERE id=1').fetchone()
-                    value=json.loads(zlib.decompress(row[0])) if row else {}
-                    if value.get('collection'):
-                        previous_channel=path
-                        return value
+                value=read_collection_snapshot(path)
+                if value.get('collection'):
+                    previous_channel=path
+                    return value
             except sqlite3.OperationalError:pass
         return {}
     try:
