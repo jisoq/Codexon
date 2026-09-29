@@ -21,8 +21,8 @@ def copy(text='',style='muted'):
 
 
 def card(title):
-    node=Group();node.setObjectName('summary');layout=Column(node)
-    layout.setContentsMargins(20,18,20,18);layout.setSpacing(12)
+    node=Group();layout=Column(node)
+    layout.setContentsMargins(20,12,20,12);layout.setSpacing(8)
     layout.addWidget(copy(title,'section'))
     return node,layout
 
@@ -34,7 +34,7 @@ REASONS={
     'purpose_mismatch':'범위 밖 · 허용된 요청 목적과 다름',
     'projected_cost_stop':'실행하지 않음 · 관측 합계와 다음 예상액이 비용 기준 초과',
     'fresh_context_required':'자료 수집 중 · 새 연결의 완료된 문맥 필요',
-    'user_active':'사용자 작업 중 · 독립 요청 보류',
+    'user_active':'사용자 작업 중 · 추가 요청 보류',
     'diagnostic_completed':'진단 완료 · 응답·사용량 회수됨',
     'diagnostic_unknown':'진단 중단 · 응답 또는 사용량 미확인',
     'diagnostic_failed':'진단 중단 · 서버 오류 응답 확인',
@@ -54,7 +54,7 @@ REASONS={
     'output_above_observed':'중단 · 출력이 참고 관측량 초과',
     'reuse_unconfirmed':'중단 · 원래 입력 재사용 확인 불가',
     'partial_reuse':'중단 · 예상한 기존 캐시 범위보다 적게 재사용',
-    'revoked':'운용 허용 철회됨',
+    'revoked':'캐시 갱신 중지됨',
     'output_bound_not_verified':'실행 경로 확인 필요 · 이력 추가만으로 활성화되지 않음',
     'history_scope_unobserved':'현재 문맥과 자연 작업 이력 연결 대기',
     'output_budget_unobserved':'자연 작업의 출력 사용량 수집 대기',
@@ -73,18 +73,17 @@ REASONS={
 
 class CachePanel(Group):
     storage_ready=Signal()
+    enabled_changed=Signal(bool)
     def __init__(self,home,index_path=None,active=True,parent=None):
         super().__init__(parent);self.home=str(home)
         self.path=':memory:' if not active and index_path is None else control_path(index_path)
         self.control=None;self.journal=None;self.open_storage()
         self.active=active;self.dialog=None;self.ticket=None;self.last_ticket=None;self.closed=False;self.proxy_ready=False;self.relay_connected=False;self.collection_error=False
-        self.operating_dialog=None
+        self.operating_dialog=None;self.pending_automatic=False
         layout=Column(self);layout.setContentsMargins(0,0,8,20);layout.setSpacing(20)
-        features,body=card('개별 기능 켜기');self.toggles={}
-        body.addWidget(copy('작업 사이의 캐시 재사용을 돕고, 모델 변경으로 입력 처리 부담이 커질 때 알려줍니다.'))
+        features,body=card('기능 설정');self.toggles={}
         for key,title,description in (
-            ('automatic','자동 유지','돌아올 가능성과 예상 이득이 충분할 때, 허용된 범위에서 별도 요청으로 캐시 재사용을 돕습니다.'),
-            ('guard','모델 변경 확인','다음 요청에서 모델 변경으로 입력 처리 부담이 크게 늘어날 때 진행 여부를 묻습니다. 추가 모델 요청은 보내지 않습니다.')):
+            ('guard','모델 변경 확인','모델이 바뀌면 기존 캐시를 재사용하지 못해 입력 처리 비용이 늘어날 수 있습니다. 이 기능을 켜면 비용이 크게 늘어날 것으로 예상되는 모델 변경을 감지하고, 요청을 보내기 전에 진행 여부를 묻습니다.'),):
             feature=Column();feature.setSpacing(6)
             row=Row();row.addWidget(copy(title,'section'),1)
             toggle=Switch();toggle.setAccessibleName(title)
@@ -92,46 +91,40 @@ class CachePanel(Group):
             toggle.setEnabled(active and self.control is not None);self.toggles[key]=toggle
             toggle.toggled.connect(lambda value,k=key:self.set_feature(k,value));row.addWidget(toggle);feature.addLayout(row)
             feature.addWidget(copy(description));body.addLayout(feature)
-        body.addWidget(copy('두 기능은 독립적으로 사용할 수 있습니다. 설정의 캐시 관리를 끄면 둘 다 중지됩니다.'))
         layout.addWidget(features)
-        divider=Group();divider.setFixedHeight(1);divider.put(background='border');layout.addWidget(divider)
-        state,body=card('현재 상태');self.status=copy('자연 작업 이력 수집 중','section');body.addWidget(self.status)
-        self.next_action=copy('평소처럼 작업하면 관측 자료와 유지 판단이 갱신됩니다.');body.addWidget(self.next_action);layout.addWidget(state)
+        state,body=card('현재 상태');self.status=copy('요청 기록 대기','section');body.addWidget(self.status)
+        self.next_action=copy('평소처럼 작업하면 관측 자료와 유지 판단이 갱신됩니다.');layout.insertWidget(0,state)
         metrics=Group();metrics.setObjectName('summary');columns=Row(metrics);columns.put(minColumnWidth=175)
         columns.setContentsMargins(20,18,20,18);columns.setSpacing(20);self.metrics={}
-        for key,title,note in (('calls','독립 요청','유지와 진단 요청 합계'),('cost','관측 환산액','전체 사용량에도 포함'),
-                               ('unknown','비용 미확인','확인 전 후속 실행 중단'),('saving','절감 효과','자연 복귀 후 별도 확인')):
+        for key,title,note in (('calls','추가 요청','갱신 요청과 연결 시험'),('cost','API 환산 비용','전체 사용량에도 포함'),
+                               ('unknown','비용 미확인','확인 전 후속 실행 중단')):
             col=Column();col.setSpacing(6);col.addWidget(copy(title));value=copy('—','metric');value.put(fontSize=26,bold=True)
-            col.addWidget(value);col.addWidget(copy(note));columns.addLayout(col,1);self.metrics[key]=value
+            col.addWidget(value);columns.addLayout(col,1);self.metrics[key]=value
         layout.addWidget(metrics)
-        operation,body=card('자동 유지 판단과 운용 범위')
-        self.operation_badge=copy('운용 허용 없음','section');body.addWidget(self.operation_badge)
-        self.estimate=copy('현재 문맥의 예상 비용을 수집하고 있습니다.');body.addWidget(self.estimate)
-        row=Row();row.put(flow=True)
-        self.consent_button=Button('운용 범위 확인');self.revoke_button=Button('운용 허용 철회')
-        self.consent_button.setEnabled(False);self.revoke_button.setEnabled(False)
-        self.consent_button.clicked.connect(self.show_operating);self.revoke_button.clicked.connect(self.revoke_operating)
-        row.addWidget(self.consent_button);row.addWidget(self.revoke_button);body.addLayout(row);layout.addWidget(operation)
-        connection,body=card('연결과 관측')
-        self.connection_status=copy('작업기 연결 확인 중','section');body.addWidget(self.connection_status)
+        operation,body=card('갱신 실행')
+        self.operation_badge=copy('갱신 허용 필요','section');body.addWidget(self.operation_badge)
+        self.estimate=copy('예상 비용 집계 중');body.addWidget(self.estimate)
+        connection,body=card('연결 상태')
+        self.connection_status=copy('캐시 서비스 연결 확인 중','section');body.addWidget(self.connection_status)
         self.hook_status=copy('훅 실행 이력을 확인하고 있습니다.');body.addWidget(self.hook_status)
         row=Row();row.put(flow=True);self.connect_button=Button('훅 연결 갱신');self.disconnect_button=Button('훅 연결 해제')
         self.connect_button.setEnabled(active);self.disconnect_button.setEnabled(active)
         self.connect_button.clicked.connect(lambda:self.configure(True));self.disconnect_button.clicked.connect(lambda:self.configure(False))
-        row.addWidget(self.connect_button);row.addWidget(self.disconnect_button);body.addLayout(row);layout.addWidget(connection)
-        activity,body=card('최근 캐시 활동')
-        body.addWidget(copy('관측한 변화입니다. 캐시 읽기 감소의 원인이나 절감 효과가 확정된 것은 아닙니다.'))
-        self.activity=LazyTable(['작업','관측한 변화','캐시 읽기','캐시 쓰기']);self.activity.put(rowHeight=40,emptyText='아직 비교 가능한 활동이 없습니다.',leftColumns=[0,1])
+        row.addWidget(self.connect_button);row.addWidget(self.disconnect_button);body.addLayout(row)
+        activity,body=card('캐시 사용 기록')
+        self.activity=LazyTable(['작업','변경 항목','캐시 읽기','캐시 쓰기']);self.activity.put(rowHeight=40,emptyText='아직 비교 가능한 활동이 없습니다.',leftColumns=[0,1])
         self.activity.setMinimumHeight(180);self.activity.setMaximumHeight(380)
         for column,width in enumerate((330,260,140,140)):self.activity.setColumnWidth(column,width)
         body.addWidget(self.activity);layout.addWidget(activity)
         details=Group();detail=Column(details);detail.setSpacing(14)
+        detail.addWidget(operation);detail.addWidget(connection);detail.addWidget(self.next_action)
+        self.metrics['saving']=copy('절감액: 산출 안 됨');detail.addWidget(self.metrics['saving'])
         self.forecast=copy();self.summary=copy();self.audit=copy();self.operating_status=copy('제한 운용 동의 없음');self.diagnostic_status=copy()
         self.activation=copy('시험한 ChatGPT HTTP 요청은 출력 상한 인자를 지원하지 않습니다. 제한 운용은 별도 동의가 필요합니다. '
             '호출 수는 제한하지만 한 요청의 출력·추론·총비용은 보장하지 않습니다. 시험 호출은 자동으로 보내지 않습니다.')
         for node in (self.forecast,self.summary,self.audit,self.operating_status,self.diagnostic_status,self.activation):detail.addWidget(node)
         detail.addWidget(copy('모델 변경 확인창을 닫거나 시간이 초과되면 그 요청은 중단됩니다. 확인 연결 장애 때는 새 요청의 확인을 건너뜁니다.'))
-        layout.addWidget(Details('비용 근거와 진단 이력',details))
+        layout.addWidget(Details('기술 상세',details))
         self.timer=QTimer(self);self.timer.setInterval(300);self.timer.timeout.connect(self.poll)
         if active:self.timer.start()
 
@@ -157,13 +150,17 @@ class CachePanel(Group):
     def set_enabled(self,enabled):
         if not self.control:return
         self.control.set('enabled',bool(enabled))
+        self.pending_automatic=bool(enabled) and not any(g.get('purpose','maintenance')=='maintenance' and not g['stopped'] and g['expires']>time.time() for g in self.journal.operations.grants(self.home))
+        self.set_feature('automatic',enabled)
         for key,toggle in self.toggles.items():
             toggle.setEnabled(self.active and enabled)
             self.set_feature(key,toggle.isChecked())
         if not enabled:
+            if self.operating_dialog:self.operating_dialog.reject()
             self.revoke_operating();self.control.set('diagnostic_request',None)
             for ticket in self.control.requests():self.control.resolve(ticket,'dismiss')
         self.poll()
+        self.enabled_changed.emit(bool(enabled))
 
     def set_feature(self,key,value):
         if not self.control:return
@@ -207,7 +204,7 @@ class CachePanel(Group):
                     +tr(' 새 실행 경로의 문맥은 아직 미확인입니다.' if self.control.get('worker_heartbeat') and s.get('worker_revision')!=3 else
                       ' 현재 문맥은 실행 범위 밖입니다.' if not s.get('operating_scope_available') else '')))
             else:
-                self.forecast.setText('');self.estimate.setText('현재 문맥의 예상 비용을 수집하고 있습니다.')
+                self.forecast.setText('');self.estimate.setText('예상 비용 집계 중')
             self.poll_operating()
             heartbeat=self.control.get('worker_heartbeat',0)
             fresh=bool(heartbeat and time.time()-heartbeat<20)
@@ -218,12 +215,12 @@ class CachePanel(Group):
             diagnostic=self.control.get('diagnostic_result',{})
             self.diagnostic_status.setText('연결 진단 · '+REASONS.get(diagnostic.get('reason'),diagnostic.get('state','')) if diagnostic else '')
             count=self.control.db.execute('SELECT COUNT(*) FROM cache_inputs WHERE home=?',(self.home,)).fetchone()[0]
-            if not observed:self.hook_status.setText(formatted('실제 훅 적재 {v0}건', v0=count) if count else '훅 이벤트 미수집 · 신뢰 설정과 실제 실행은 별도입니다')
+            if not observed:self.hook_status.setText(formatted('실제 훅 적재 {v0}건', v0=count) if count else '모델 변경 확인 기록 없음')
             if self.proxy_ready and heartbeat and not self.control.get('worker_snapshots',0):self.status.setText('기존 연결 관측 중 · 새 작업기 문맥 수집 중')
             elif any(s.get('observation_only') for s in states):self.status.setText('관측 전용 · 추가 유지 요청 없음 · 사용자 연결 방식 변경 불필요')
             elif not self.control.enabled('automatic'):
-                self.status.setText('자동 유지 꺼짐')
-            elif not self.proxy_ready:self.status.setText('자동 유지 대기 · 캐시 관리를 지원하는 프록시 연결 필요')
+                self.status.setText('캐시 자동 갱신 꺼짐')
+            elif not self.proxy_ready:self.status.setText('캐시 자동 갱신 대기 · 캐시 관리를 지원하는 프록시 연결 필요')
             elif states:
                 latest=max(states,key=lambda s:s.get('observed_at',0))
                 self.status.setText(REASONS.get(latest.get('reason',latest.get('state')),'자료 수집 중'))
@@ -244,9 +241,7 @@ class CachePanel(Group):
 
     def poll_operating(self):
         grants=self.journal.operations.grants(self.home)
-        self.consent_button.setEnabled(self.active and self.control.get('enabled',True) and any(p.get('purpose','maintenance')=='maintenance'
-            for p in self.journal.operations.proposals(self.home)) and not self.operating_dialog)
-        self.revoke_button.setEnabled(self.active and any(not g['stopped'] and g['expires']>time.time() for g in grants))
+        if self.pending_automatic and not self.operating_dialog:self.show_operating()
         if grants:
             g=grants[0];s=self.journal.operations.stats(g)
             reason=g['stopped'] or ('permission_expired' if g['expires']<=time.time() else None)
@@ -255,7 +250,7 @@ class CachePanel(Group):
                 reason_maintenance=maintenance['stopped'] or ('permission_expired' if maintenance['expires']<=time.time() else None)
                 self.operation_badge.setText(REASONS.get(reason_maintenance,'운용 종료') if reason_maintenance else
                     formatted('운용 허용됨 · 남은 {v0}회', v0=self.journal.operations.stats(maintenance)['remaining']))
-            else:self.operation_badge.setText('자동 유지 운용 허용 없음')
+            else:self.operation_badge.setText('캐시 자동 갱신 갱신 허용 필요')
             self.operating_status.setText(formatted('계정 {v0} · {v1} · 남은 {v2}/{v3}회\nAPI 환산 관측 확인분 {v4} / 후속 중단 기준 {v5} · 비용 미확인 {v6}회\n{v7} · 종료 {v8}', v0=g['scope']['account'][:12], v1=g['scope']['model'], v2=s['remaining'], v3=g['max_calls'], v4=usd(s['observed']), v5=usd(g['cost_stop']), v6=s['unknown'], v7=tr(REASONS.get(reason, reason) if reason else '진단만 허용됨' if g.get('purpose') == 'diagnostic' else '허용됨 · 자동 정책이 이득 있는 경우만 예약'), v8=time.strftime('%H:%M', time.localtime(g['expires']))))
 
     def show_operating(self):
@@ -263,15 +258,16 @@ class CachePanel(Group):
         proposals=[p for p in self.journal.operations.proposals(self.home) if p.get('purpose','maintenance')=='maintenance']
         if not proposals:return
         proposal=proposals[0];scope=proposal['scope']
-        text=(formatted('계정 {v0}\n홈 {v1}\n{v2} · {v3} · Standard · HTTP\n사용자 대화는 기존 연결 유지 · 복원한 전체 문맥으로 별도 HTTP 유지 요청\n동의 후 60분, 모든 세션 합계 최대 2회, 순차 실행\n1회 예상 {v4}, 캐시 재사용 실패 시나리오 {v5}\n관측 API 환산 합계 {v6} 도달 시 후속 호출 중단\n\n예상치는 자연 작업의 출력·추론과 현재 문맥에 근거합니다. 실측 유지 기록이 있으면 함께 반영합니다. 서버측 출력 상한은 보장되지 않으며, 한 호출이 위 예상·시나리오·중단 기준을 초과할 수 있습니다. 30초 연결 제한도 서버 처리·비용 중단 보장이 아닙니다. 오류·미확인 비용·예상 초과·재사용 저하는 후속 실행을 중단합니다. 이는 구독 한도나 실제 청구액이 아닙니다. 자동 정책이 순이득 없음을 선택하면 호출하지 않습니다.\n이 범위를 허용할까요? 자동 유지 설정과 프록시·훅 연결은 별도로 필요합니다.', v0=scope['account'][:12], v1=scope['home'], v2=scope['model'], v3=scope['effort'], v4=usd(proposal['expected']), v5=usd(proposal['adverse']), v6=usd(proposal['cost_stop'])))
+        text=(formatted('계정 {v0}\n홈 {v1}\n{v2} · {v3} · Standard · HTTP\n사용자 대화는 기존 연결 유지 · 복원한 전체 문맥으로 별도 HTTP 유지 요청\n동의 후 60분, 모든 세션 합계 최대 2회, 순차 실행\n1회 예상 {v4}, 캐시 재사용 실패 시나리오 {v5}\n관측 API 환산 합계 {v6} 도달 시 후속 호출 중단\n\n예상치는 자연 작업의 출력·추론과 현재 문맥에 근거합니다. 실측 유지 기록이 있으면 함께 반영합니다. 서버측 출력 상한은 보장되지 않으며, 한 호출이 위 예상·시나리오·중단 기준을 초과할 수 있습니다. 30초 연결 제한도 서버 처리·비용 중단 보장이 아닙니다. 오류·미확인 비용·예상 초과·재사용 저하는 후속 실행을 중단합니다. 이는 구독 한도나 실제 청구액이 아닙니다. 자동 정책이 순이득 없음을 선택하면 호출하지 않습니다.\n이 범위를 허용할까요? 캐시 자동 갱신 설정과 프록시·훅 연결은 별도로 필요합니다.', v0=scope['account'][:12], v1=scope['home'], v2=scope['model'], v3=scope['effort'], v4=usd(proposal['expected']), v5=usd(proposal['adverse']), v6=usd(proposal['cost_stop'])))
         self.operating_dialog=Confirmation(tr('총비용 상한 없는 제한 운용'),text,self,scrollable=True)
         self.operating_dialog.resize(650,580)
-        self.operating_dialog.confirm.setText('이 범위 허용')
+        self.operating_dialog.confirm.setText('자동 갱신 켜기' if self.pending_automatic else '이 범위 허용')
         self.operating_dialog.finished.connect(lambda result:self.operating_decided(result,proposal['id']))
         self.operating_dialog.open()
 
     def operating_decided(self,result,proposal_id):
         self.operating_dialog=None
+        activate=self.pending_automatic;self.pending_automatic=False
         if self.closed:return
         if result==1:
             try:self.journal.operations.consent(proposal_id)
@@ -279,7 +275,11 @@ class CachePanel(Group):
                 self.operating_status.setText({'usage_unresolved':'비용 미확인 기록을 먼저 확인해야 합니다. 새 동의로 무시할 수 없습니다.',
                     'existing_permission':'기존 범위가 유효합니다. 확대하려면 먼저 철회하고 새 범위를 확인하세요.',
                     'proposal_expired':'예상 자료가 오래되었습니다. 새 정책 평가 후 확인하세요.'}.get(str(exc),'운용 동의를 저장하지 못했습니다.'))
+                if activate:self.set_enabled(False)
                 return
+        if result==1 and activate:
+            self.set_feature('automatic',True)
+        if activate and result!=1:self.set_enabled(False)
         self.poll_operating()
 
     def revoke_operating(self):
@@ -311,8 +311,8 @@ class CachePanel(Group):
         self.metrics['calls'].setText(formatted('{v0:,}회', v0=data.get('calls', 0)))
         self.metrics['cost'].setText(usd(data.get('known_cost')) if data.get('priced') else '—')
         self.metrics['unknown'].setText(formatted('{v0:,}회', v0=data.get('calls', 0) - data.get('priced', 0)))
-        self.metrics['saving'].setText('미확인')
-        self.summary.setText(formatted('독립 요청 {v0}회 (진단 {v1}회) · API 환산 확인분 {v2} · 비용 미확인 {v3}회\n최근 비교 가능한 읽기 감소 {v4}회 · 절감 실측: 미확인', v0=data.get('calls', 0), v1=data.get('diagnostic_calls', 0), v2=usd(data.get('known_cost')) if data.get('priced') else '—', v3=data.get('calls', 0) - data.get('priced', 0), v4=data.get('shortfalls', 0)))
+        self.metrics['saving'].setText('절감액: 산출 안 됨')
+        self.summary.setText(formatted('추가 요청 {v0}회 (진단 {v1}회) · API 환산 확인분 {v2} · 비용 미확인 {v3}회\n최근 비교 가능한 읽기 감소 {v4}회 · 절감 실측: 미확인', v0=data.get('calls', 0), v1=data.get('diagnostic_calls', 0), v2=usd(data.get('known_cost')) if data.get('priced') else '—', v3=data.get('calls', 0) - data.get('priced', 0), v4=data.get('shortfalls', 0)))
         names=dict(session_start='시작',model_changed='모델 변경',effort_changed='effort 변경',
                    service_tier_changed='모드 변경',idle_over_design_lifetime='30분 이상 간격',compaction='압축')
         lines=[];activities=[]

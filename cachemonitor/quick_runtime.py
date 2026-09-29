@@ -212,7 +212,7 @@ class Confirmation(Dialog):
             scroll=Scroll();scroll.setWidget(text);layout.addWidget(scroll,1)
         else:layout.addWidget(text,1)
         row=Row();row.addStretch()
-        self.confirm=Button('확인');self.cancel=Button('취소');self.cancel.put(defaultFocus=True)
+        self.confirm=Button('확인');self.confirm.put(role='primary');self.cancel=Button('취소');self.cancel.put(defaultFocus=True)
         self.confirm.clicked.connect(lambda:self.finish(1));self.cancel.clicked.connect(self.reject)
         row.addWidget(self.confirm);row.addWidget(self.cancel);layout.addLayout(row)
 

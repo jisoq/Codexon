@@ -59,7 +59,13 @@ def test_four_matching_axes_detail_pin_escape_and_gap_card(tmp_path,width,dark,l
                 ('completed',0,chart.box.left()-60),('cached',chart.box.left()-60,chart.box.left()),
                 ('output',chart.box.right(),chart.box.right()+82),('written',chart.box.right()+82,chart.width())):
             expected=QColor(shared_theme().palette[token])
-            assert any(picture.pixelColor(x,y)==expected
+            # Text glyphs are antialiased on a transparent QPicture surface.
+            # Compare their actual RGB color at strongly covered pixels; a
+            # Korean glyph need not contain a fully opaque pixel. Converting
+            # premultiplied channels back to RGB can round by 1-2 levels,
+            # as in the zero-usage marker check above.
+            assert any(picture.pixelColor(x,y).alpha()>=240 and
+                       max(abs(a-b) for a,b in zip(picture.pixelColor(x,y).getRgb()[:3],expected.getRgb()[:3]))<=2
                        for x in range(round(left*ratio),round(right*ratio))
                        for y in range(round(54*ratio))),token
         assert chart.point(1,'completed_cost') is not None

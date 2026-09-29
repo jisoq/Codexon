@@ -20,6 +20,7 @@ class Node(QObject):
     textValueChanged = Signal()
     structureChanged = Signal()
     revealRequested = Signal(QObject)
+    focusRequested = Signal()
     kind = 'group'
     _batch_depth=0
     _batched={}
@@ -189,7 +190,7 @@ class Button(Text):
     kind='button'
     def __init__(self,text='',parent=None):
         super().__init__(text,parent)
-        self.put(flat=True)
+        self.put(role='secondary')
         icon={'닫기':'close','제거':'minus','추가':'plus','대상 추가':'plus','이전 구간':'left','다음 구간':'right'}.get(text)
         if icon:
             self.put(iconName=icon);self.setFixedSize(36,36)
@@ -251,7 +252,14 @@ class Choice(Node):
     def setCurrentRow(self,index):self.setCurrentIndex(index)
 
 
-class Navigation(Choice):kind='navigation'
+class Navigation(Choice):
+    kind='navigation'
+    activated=Signal(int)
+
+    @Slot(int)
+    def choose(self,index):
+        super().choose(index)
+        self.activated.emit(index)
 
 
 class Stack(Node):

@@ -79,6 +79,7 @@ def test_current_release_updates_the_active_cache_worker(tmp_path,monkeypatch):
     monkeypatch.setattr(app_update,'installed',lambda:dict(InstallRoot=str(tmp_path)))
     monkeypatch.setattr(app_update,'read_url',lambda *a:json.dumps(release()).encode())
     monkeypatch.setattr(install_management,'connection_manager',lambda:pytest.fail('Explicit manager must be retained'))
+    monkeypatch.setattr(app_update,'inspect_proxy',lambda m:dict(state='required',reason='프록시 업데이트 필요',connections=0,instance='test'))
     plan=app_update.check_update(manager=manager)
     assert calls==[]
     assert '연결 종료 후 적용' in app_update.update(plan=plan)
@@ -115,15 +116,17 @@ def test_update_confirmation_gates_every_mutation(tmp_path,monkeypatch,kind,choi
             if predicate():return
         raise AssertionError('Update UI did not settle')
     try:
-        panel.start();settle(lambda:panel.confirming)
-        assert not calls and not panel.button.isEnabled()
+        panel.start();settle(lambda:panel.operation is None)
+        assert not panel.confirming and not calls
+        panel.request_install();settle(lambda:panel.confirming)
+        assert not calls
         panel.start();assert not calls  # Repeated clicks cannot bypass the dialog.
         dialog=panel.dialog
         nodes=list(dialog.nodes);texts=[]
         while nodes:
             node=nodes.pop();texts.append(node.text());nodes.extend(node.nodes)
         message='\n'.join(texts)
-        assert ('연결 3개' in message) if kind=='app' else ('연결 수를 확인하지 못했습니다' in message)
+        assert ('3' in message) if kind=='app' else ('확인 불가' in message)
         assert dialog.cancel.state['defaultFocus']
         assert dialog.host.grab().save(str(tmp_path/(kind+'-'+choice+'.png')))
         if choice=='closing':

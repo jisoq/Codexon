@@ -60,6 +60,27 @@ def launch_installer(output,root):
                                                   '/LOG='+str(output.parent/'setup.log')])
 
 
+def inspect_proxy(manager):
+    from .proxy_target import ProxyTarget
+    from .proxy_identity import deployment
+    from .version import PROXY_VERSION
+    import sys
+    status=manager.status()
+    if not status.get('configured'):return dict(state='off',reason='프록시 사용 안 함',connections=connection_count(status))
+    health=status.get('health')
+    if not health:
+        return dict(state='recovery' if status.get('probe_state')=='refused' else 'unknown',
+                    reason='연결 복구 필요' if status.get('probe_state')=='refused' else '확인 불가',connections=None)
+    target=ProxyTarget(manager)
+    source=target.capture(health);command=target.replacement(source)
+    distribution=deployment(sys.executable)
+    current=target.ready(health,{**source,'instance':''},command,PROXY_VERSION,distribution,read_only=True)
+    reason=('최신 상태' if current else '프록시 업데이트 필요' if health.get('version')!=PROXY_VERSION
+            else '이전 설치본 실행 중' if source['executable_sha256']!=distribution['sha256'] or Path(source['command'][0]).resolve()!=Path(sys.executable).resolve()
+            else '프록시 실행 상태 갱신 필요')
+    return dict(state='current' if current else 'required',reason=reason,connections=connection_count(status),instance=health['instance'])
+
+
 def check_update(progress=lambda _:None, manager=None):
     """Read the offered release without installing or changing the connection."""
     install=installed()
@@ -70,9 +91,10 @@ def check_update(progress=lambda _:None, manager=None):
     if version_parts(release['tag_name'])<=version_parts(VERSION):
         from .install_management import connection_manager
         manager=manager if manager is not None else connection_manager()
-        status=manager.status()
-        return dict(kind='proxy' if status.get('configured') else 'none',manager=manager,
-                    connections=connection_count(status))
+        try:proxy=inspect_proxy(manager)
+        except Exception as exc:proxy=dict(state='unknown',reason='확인 불가',error=str(exc),connections=None)
+        return dict(kind='proxy' if proxy['state']=='required' else 'none',manager=manager,
+                    proxy=proxy,reason=proxy['reason'],connections=proxy['connections'])
     release_asset(release)
     try:status=manager.status() if manager is not None else {}
     except Exception:status={}
@@ -90,6 +112,10 @@ def update(progress=lambda _:None, manager=None, *, plan=None):
     plan=check_update(progress,manager) if plan is None else plan
     if plan['kind']=='none':return '설치할 새 버전이 없습니다.'
     if plan['kind']=='proxy':
+        current=inspect_proxy(plan['manager'])
+        if current['state']=='current':return '모두 최신 상태'
+        if current['state']!='required' or current.get('instance')!=plan.get('proxy',{}).get('instance') or current['reason']!=plan.get('reason'):
+            return '상태 변경 감지: 업데이트 확인 필요'
         from .install_management import activate_proxy
         state=activate_proxy(plan['manager'])
         return '설치할 새 버전이 없습니다. '+(state.get('message') or '')

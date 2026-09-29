@@ -29,6 +29,7 @@ def test_files(*names):
 
 # Components select observable contracts. There is deliberately no always-run core.
 GROUPS = {
+    'settings': test_files('settings'),
     'app_lifetime': test_files('app_services', 'observer_panel', 'windows_startup', 'proxy_update'),
     'data': test_files('core', 'index', 'data_contract', 'subagent_collection', 'request_tier_snapshots', 'collection_defaults'),
     'analysis': test_files('comparison', 'overview', 'performance', 'data_contract', 'output_speed'),
@@ -157,7 +158,7 @@ RULES = (
     ('cachemonitor/charts.py', ('shared_ui', 'quota_chart')),
     ('cachemonitor/theme.py', ('theme',)),
     ('cachemonitor/token_colors.py', ('theme',)),
-    ('cachemonitor/settings_page.py', ('dashboard', 'theme', 'observer')),
+    ('cachemonitor/settings_page.py', ('settings', 'dashboard', 'theme', 'observer')),
     ('cachemonitor/taskbar*.py', ('taskbar',)),
     ('cachemonitor/screens.py', ('window', 'overlay_controls')),
     ('cachemonitor/notifications.py', ('notifications',)),

@@ -109,7 +109,7 @@ class ProxyTarget:
                 if db.execute("SELECT 1 FROM cache_jobs WHERE state IN ('reserved','sent') LIMIT 1").fetchone():return False
         return True
 
-    def ready(self,health,source,command,version,distribution=None):
+    def ready(self,health,source,command,version,distribution=None,*,read_only=False):
         if not health or health.get('version')!=version or health.get('status')!='ok' or health.get('draining'):return False
         if health.get('instance')==source['instance']:return False
         worker=identity.process_identity(health['pid'])
@@ -130,5 +130,5 @@ class ProxyTarget:
         if identity.digest(worker['executable'])!=distribution['sha256']:return False
         if self.cache:
             state=health.get('cache_execution') or {}
-            return state.get('ready') and state.get('ownership') and not state.get('paused') and not identity.locks_free(self.locks)
+            return state.get('ready') and state.get('ownership') and not state.get('paused') and (read_only or not identity.locks_free(self.locks))
         return health.get('lifecycle')=='managed' and self.manager.runtime().get('phase') in ('active','ready')

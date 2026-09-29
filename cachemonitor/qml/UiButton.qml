@@ -3,6 +3,8 @@ import QtQuick.Controls.Basic
 
 Button {
     id: control
+    property string role: "secondary"
+    readonly property bool quiet: role === "quiet" || disclosure || flat
     property bool disclosure: false
     property bool selectionTab: false
     property string iconName: ""
@@ -19,7 +21,7 @@ Button {
         Text {
             id: caption; anchors.fill:parent; visible: !control.iconName.length
             text: control.text; font: control.font; leftPadding: control.disclosure ? 18 : 0
-            color: !control.enabled ? appTheme.palette.unknown : control.checked ? appTheme.palette.accent : appTheme.palette.ink
+            color: !control.enabled ? appTheme.palette.unknown : control.role === "primary" ? appTheme.readableText("surface", "accent") : control.checked ? appTheme.palette.accent : appTheme.palette.ink
             horizontalAlignment: control.disclosure ? Text.AlignLeft : Text.AlignHCenter; verticalAlignment: Text.AlignVCenter
             elide: Text.ElideRight
             Item {
@@ -32,8 +34,8 @@ Button {
     }
     background: Rectangle {
         radius: 6
-        color: control.disclosure || control.flat ? "transparent" : control.checked ? appTheme.palette.secondary : appTheme.palette.surface
-        border.color: control.activeFocus ? appTheme.palette.accent : control.disclosure || control.flat ? "transparent" : appTheme.palette.border
+        color: control.quiet ? "transparent" : control.role === "primary" ? appTheme.palette.accent : control.checked ? appTheme.palette.secondary : appTheme.palette.surface
+        border.color: control.activeFocus ? appTheme.palette.accent : control.quiet ? "transparent" : appTheme.palette.border
         border.width: control.activeFocus ? 2 : 1
         Rectangle { objectName:"hover-feedback";anchors.fill:parent;radius:parent.radius;color:appTheme.palette.accent;opacity:!control.enabled ? 0 : control.down ? .16 : control.hovered ? .09 : 0 }
         Rectangle { visible:control.selectionTab && control.checked;anchors.bottom:parent.bottom;anchors.left:parent.left;anchors.right:parent.right;height:2;color:appTheme.palette.accent }
