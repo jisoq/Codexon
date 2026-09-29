@@ -20,6 +20,19 @@ def test_disjoint_cache_write_and_reasoning_costs():
     assert token_cost(row('gpt-5.6-sol'))['cost']==pytest.approx(.162)
 
 
+@pytest.mark.parametrize('tier, expected', [
+    ('default', (.02, .008, .025, .02, .073)),
+    ('priority', (.04, .016, .05, .04, .146)),
+])
+def test_gpt61_sol_official_rates(tier, expected):
+    priced=token_cost(row('gpt-6.1-sol',service_tier=tier))
+    assert priced['price_model']=='gpt-6.1-sol'
+    assert tuple(priced[key] for key in (
+        'cost_uncached','cost_cached','cost_written','cost_output','cost'))==pytest.approx(expected)
+    assert priced['price_issues']==[]
+    assert token_cost(row('gpt-6-sol'))['cost']==pytest.approx(.081)
+
+
 def test_subscription_conversion_has_no_long_context_surcharge():
     short=token_cost({**row(),'input':272000})
     long=token_cost({**row(),'input':272001})

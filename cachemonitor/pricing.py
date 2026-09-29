@@ -1,6 +1,7 @@
 """Request-tier API token-equivalent USD, not a historical Codex bill.
 
 Verified 2026-09-23 against OpenAI's pricing and individual model pages.
+GPT-6.1 Sol added from its official model pricing on 2026-09-30.
 All amounts are USD per million tokens. Cache writes replace ordinary input
 pricing for the written portion; they are not added at full price a second time.
 """
@@ -9,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from datetime import date
 
-VERIFIED = '2026-09-23'
+VERIFIED = '2026-09-30'
 PRICE_POLICY = 'subscription-base-api-rates-v5'
 PROFILE_NAME = VERIFIED + ' 기준'
 SOURCE = 'https://developers.openai.com/api/docs/pricing'
@@ -37,6 +38,7 @@ RATES = {
     'gpt-5.6-terra': Rate(2, .2, 12, 2.5),
     'gpt-5.6-luna': Rate(.2, .02, 1.2, .25),
     'gpt-6-astra': Rate(10, 1, 50, 12.5),
+    'gpt-6.1-sol': Rate(2, .1, 10, 2.5),
     'gpt-6-sol': Rate(2, .2, 10, 2.5),
     'gpt-6-luna': Rate(.1, .01, .5, .125),
 }
@@ -47,7 +49,7 @@ ALIASES = {
     'gpt-5.5-2026-04-23': 'gpt-5.5',
 }
 FAST_RATES = {m:replace(r,input=r.input*2,cached=r.cached*2,output=r.output*2,written=r.written*2)
-              for m,r in RATES.items() if m.startswith(('gpt-5.6-','gpt-6-'))}
+              for m,r in RATES.items() if m.startswith(('gpt-5.6-','gpt-6-','gpt-6.1-'))}
 FAST_RATES.update({'gpt-5.5':Rate(12.5,1.25,75,long_threshold=None),
                    'gpt-5.4-mini':Rate(1.5,.15,9,long_threshold=None)})
 
