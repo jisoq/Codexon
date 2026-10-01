@@ -147,6 +147,15 @@ jobs:
       - name: Check packaged GUI handoff with multiple custom homes
         if: steps.plan.outputs.package == 'true'
         run: python tools/run_ui_checks.py -- python tools/verify_gui_handoff.py --executable dist-ci/Codexon/Codexon.exe --output artifacts/verification/gui-handoff
+      - name: Check proxy replacement with a custom observation filename
+        if: steps.plan.outputs.proxy == 'true'
+        shell: pwsh
+        run: |
+          python tools/prepare_legacy_release.py --tag v2026.10.01.1 --output artifacts/legacy-custom-path
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $published = Get-Content artifacts/legacy-custom-path/result.json -Raw | ConvertFrom-Json
+          python tools/verify_proxy_update.py --old-exe $published.executable --new-exe dist-ci/Codexon/Codexon.exe --idle-connections 100 --custom-evidence --output artifacts/verification/custom-observation-update
+          exit $LASTEXITCODE
       - name: Check installer payload contents
         if: steps.plan.outputs.package == 'true'
         run: python tools/package_release.py --product dist-ci/Codexon --validate-only

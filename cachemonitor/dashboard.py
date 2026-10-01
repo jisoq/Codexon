@@ -123,7 +123,7 @@ class Dashboard(TrayWindow):
         super().__init__()
         self.settings=settings or QSettings('CacheMonitor','CacheMonitor')
         self.observer_home=homes[0] if homes else str(Path.home()/'.codex')
-        self.observer_directory=Path(index_path).parent if index_path else None
+        self.observer_directory=Path(model_evidence_path).parent if model_evidence_path else Path(index_path).parent if index_path else None
         self.manage_observer=manage_observer;self.quota_service=None;self.quota_issue=''
         self.index_path=index_path;self.live_limits=live_limits
         self.model_evidence_path=model_evidence_path

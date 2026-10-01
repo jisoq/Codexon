@@ -182,6 +182,7 @@ def main():
     parser.add_argument('--upstream-url',help='Fixed upstream for isolated verification')
     args = parser.parse_args()
     manager = ObserverManager(args.codex_home, args.evidence_path.parent, url=f'http://127.0.0.1:{args.port}')
+    manager.evidence=args.evidence_path.resolve()
     worker_command=manager.command(args.upstream)
     if args.upstream_url:worker_command+=['--upstream-url',args.upstream_url]
     supervisor = Supervisor(manager, args.upstream,worker_command=worker_command)

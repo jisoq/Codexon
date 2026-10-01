@@ -65,7 +65,7 @@ def main():
     if args.enable_model_observer or args.disable_model_observer or args.model_observer_status or args.test_model_observer:
         from .observer_control import ObserverManager
         from .connection_recovery import target
-        manager=target(homes[0],Path(args.evidence_path).parent if args.evidence_path else Path(args.index_path).parent if args.index_path else None)
+        manager=target(homes[0],Path(args.evidence_path).parent if args.evidence_path else Path(args.index_path).parent if args.index_path else None,index=args.index_path)
         if args.evidence_path:manager.evidence=Path(args.evidence_path)
         try:
             result=(manager.test_connection() if args.test_model_observer else manager.turn_on() if args.enable_model_observer else manager.turn_off() if args.disable_model_observer else manager.ensure())
