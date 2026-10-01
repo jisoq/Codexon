@@ -6,6 +6,16 @@ from cachemonitor.proxy_update import ProxyUpdate
 from cachemonitor.observer_state import ProcessLock,read_json
 from cachemonitor.version import PROXY_VERSION
 
+def test_packaged_idle_observation_accounts_for_all_opened_peers():
+    from tools.verify_proxy_update import idle_observation
+    health=dict(active_connections=32,requests=0,websocket_policy=dict(idle_limit=32),
+        websocket_connections=dict(retired=dict(idle_limit=68)))
+    assert idle_observation(health,100)
+    assert not idle_observation({**health,'active_connections':31},100)
+    assert not idle_observation({**health,'websocket_connections':{}},100)
+    assert not idle_observation({**health,'requests':1},100)
+    assert idle_observation(dict(active_connections=100),100)
+
 
 class Target:
     cache=False

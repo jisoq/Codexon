@@ -75,6 +75,17 @@ class IdleConnections:
         self.thread.join(15)
         assert not self.thread.is_alive()
 
+def idle_observation(health, requested):
+    """Account for every opened peer, including the released idle-limit policy."""
+    if not health:
+        return False
+    limit = health.get('websocket_policy', {}).get('idle_limit', requested)
+    expected = min(requested, limit)
+    retired = health.get('websocket_connections', {}).get('retired', {}).get('idle_limit', 0)
+    return (health.get('active_connections') == expected
+            and retired == requested - expected
+            and health.get('requests', 0) == 0)
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--old-exe', type=Path, required=True)
@@ -125,7 +136,7 @@ def main():
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             observed = m.health(timeout=3)
-            if observed and observed['instance'] == previous_instance and (observed['active_connections'] == options.idle_connections):
+            if observed and observed['instance'] == previous_instance and idle_observation(observed, options.idle_connections):
                 break
             time.sleep(0.2)
         else:
@@ -155,7 +166,7 @@ def main():
             time.sleep(0.5)
         if options.expect_unsupported:
             assert state.get('phase') == 'failed' and same_process(old_identity), state
-            assert m.health(timeout=3)['active_connections'] == options.idle_connections
+            assert idle_observation(m.health(timeout=3), options.idle_connections)
             result = dict(phase='blocked', previous=previous, message=state['message'], old_process_preserved=True)
             (root / 'result.json').write_text(json.dumps(result, indent=2), encoding='utf-8')
             print(json.dumps(result))
@@ -195,7 +206,8 @@ def main():
         if not options.exercise_rollback:
             assert health['websocket_policy'] == vars(POLICY)
         assert m.config_path.read_bytes() == before
-        result = {'phase': state['phase'], 'previous': previous, 'rollback_verified': options.exercise_rollback, 'updater_restart_verified': options.interrupt_after_drain, 'current': {**{k: health.get(k) for k in ('version', 'role', 'executable', 'instance', 'pid')}, 'executable': str(expected_executable), 'role': 'observer'}, 'idle_connections_drained': options.idle_connections, 'configuration_preserved': True, 'instance_replaced': True, 'new_executable_verified': True}
+        assert health['active_connections'] == 0, health
+        result = {'phase': state['phase'], 'previous': previous, 'rollback_verified': options.exercise_rollback, 'updater_restart_verified': options.interrupt_after_drain, 'current': {**{k: health.get(k) for k in ('version', 'role', 'executable', 'instance', 'pid')}, 'executable': str(expected_executable), 'role': 'observer'}, 'idle_connections_opened': options.idle_connections, 'idle_connections_retired_before_update': options.idle_connections-observed['active_connections'], 'idle_connections_drained': observed['active_connections'], 'configuration_preserved': True, 'instance_replaced': True, 'new_executable_verified': True}
         (root / 'result.json').write_text(json.dumps(result, indent=2))
         print(json.dumps(result))
     finally:

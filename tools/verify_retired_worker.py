@@ -55,8 +55,11 @@ def verify(root,old,new,role):
         gui=subprocess.Popen([str(new),'--codex-home',str(home),'--index-path',str(index),'--evidence-path',str(evidence),
             '--verify-handoff',str(report),'--verify-services','--hidden'],creationflags=subprocess.CREATE_NO_WINDOW)
         wait(lambda:read_json(report),lambda v:v.get('ready'))
-        after=wait(lambda:manager.health(timeout=1),lambda v:bool(v and v.get('version')==PROXY_VERSION and
-            v.get('lifecycle')=='managed' and v.get('instance')!=before['instance'] and not v.get('cache_management')))
+        try:
+            after=wait(lambda:manager.health(timeout=1),lambda v:bool(v and v.get('version')==PROXY_VERSION and
+                v.get('lifecycle')=='managed' and v.get('instance')!=before['instance'] and not v.get('cache_management')))
+        except RuntimeError as exc:
+            raise RuntimeError(str(exc)+': '+json.dumps(read_json(report).get('services',{}),ensure_ascii=True)) from exc
         wait(lambda:database.exists(),lambda exists:not exists)
         assert manager.config()[1]['openai_base_url']==manager.url
         assert not task.inspect().get('registered')
@@ -80,7 +83,12 @@ def verify(root,old,new,role):
                 raise RuntimeError('GUI quit request delivery failed')
             client.waitForReadyRead(3000);return bytes(client.readAll())
         assert send(b'verify-quit')==b'quitting'
-        wait(lambda:send(b'verify-exit-safe',closing=True) if gui.poll() is None else b'accepted',lambda v:v==b'accepted')
+        # The GUI can close its socket before its confirmation reply arrives.
+        # Delivery acknowledgement is advisory; the actual zero exit is required.
+        deadline=time.monotonic()+15
+        while gui.poll() is None and time.monotonic()<deadline:
+            if send(b'verify-exit-safe',closing=True)==b'accepted':break
+            time.sleep(.2)
         assert gui.wait(timeout=90)==0
         assert not database.exists()
         return dict(role=role,route_preserved=True,usage_preserved=True,hooks_removed=True,registration_removed=True,old_instance=before['instance'],new_instance=after['instance'])

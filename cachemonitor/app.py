@@ -213,6 +213,12 @@ def main():
     server.newConnection.connect(connection)
     if args.verify_handoff:
         from .observer_control import atomic_write
+        def record_services(result):
+            from .observer_state import read_json
+            report=read_json(args.verify_handoff)
+            report['services']=result
+            atomic_write(args.verify_handoff,json.dumps(report).encode())
+        window.service_controller.result.connect(record_services)
         QTimer.singleShot(250,lambda:atomic_write(args.verify_handoff,json.dumps(dict(
             pid=os.getpid(),version=VERSION,homes=homes,ready=True,hwnd=int(window.winId()),language=display_language,
             restart_enabled=window.settings_page.controls['restart'].isEnabled())).encode()))
