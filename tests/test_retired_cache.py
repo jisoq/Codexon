@@ -48,6 +48,18 @@ def test_conflicting_usage_stops_retirement_without_overwrite(tmp_path):
     assert old.exists()
 
 
+def test_receipt_free_release_requires_clean_exit_and_durable_settlement(tmp_path):
+    from cachemonitor.retired_cache import verify_legacy_settlement
+    old=tmp_path/'cache-control.sqlite';legacy_db(old)
+    verify_legacy_settlement(old,0)
+    with pytest.raises(RuntimeError,match='did not exit cleanly'):verify_legacy_settlement(old,1)
+    with closing(sqlite3.connect(old)) as db,db:db.execute("UPDATE cache_jobs SET state='sent'")
+    with pytest.raises(RuntimeError,match='settlement incomplete'):verify_legacy_settlement(old,0)
+    with closing(sqlite3.connect(old)) as db,db:db.execute("UPDATE cache_jobs SET state='unknown',usage=NULL")
+    verify_legacy_settlement(old,0)
+    assert old.exists()
+
+
 def test_owned_hooks_removed_with_unrelated_entries_preserved(tmp_path):
     path=tmp_path/'hooks.json';other=dict(description='my hook',hooks=[dict(command='custom')])
     path.write_text(json.dumps({'hooks':{'Stop':[dict(description='codexon-cache-control',hooks=[]),other]}}),encoding='utf-8')
@@ -94,10 +106,28 @@ def legacy(tmp_path,monkeypatch):
     monkeypatch.setattr('cachemonitor.retired_cache.identity.same_process',same)
     monkeypatch.setattr('cachemonitor.retired_cache.identity.port_free',lambda _:not runtime['old'] and not runtime['new'])
     monkeypatch.setattr('cachemonitor.retired_cache.identity.locks_free',lambda _:not runtime['old'])
-    def health(**_):return dict(cache_management=True,instance='old',pid=1,control_id=control) if runtime['old'] else runtime['new']
+    def health(**_):return dict(cache_management=True,instance='old',pid=1,control_id=control,storage_flush_receipt=True) if runtime['old'] else runtime['new']
     monkeypatch.setattr(m,'health',health)
     def sleep(seconds):runtime['clock']+=seconds
     return m,runtime,lambda:runtime['clock'],sleep
+
+
+@pytest.mark.parametrize('exit_code',[0,1])
+def test_legacy_worker_without_receipt_uses_owned_process_exit(legacy,monkeypatch,exit_code):
+    from contextlib import nullcontext
+    m,runtime,clock,sleep=legacy;health=m.health
+    def without_receipt(**kwargs):
+        value=health(**kwargs)
+        if value and value.get('cache_management'):value.pop('storage_flush_receipt',None)
+        return value
+    monkeypatch.setattr(m,'health',without_receipt)
+    monkeypatch.setattr('cachemonitor.retired_cache.exit_monitor',lambda saved:nullcontext(lambda:exit_code))
+    if exit_code:
+        with pytest.raises(RuntimeError,match='did not exit cleanly'):retire(m,clock=clock,sleep=sleep)
+        assert m.retirement_index.with_name('cache-control.sqlite').exists() and not runtime['removed']
+    else:
+        assert retire(m,clock=clock,sleep=sleep)
+        assert runtime['removed'] and not m.retirement_index.with_name('cache-control.sqlite').exists()
 
 
 @pytest.mark.parametrize('role',['--cache-worker','--cache-observe-only'])
