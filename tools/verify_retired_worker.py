@@ -69,12 +69,18 @@ def verify(root,old,new,role):
         from PySide6.QtNetwork import QLocalSocket
         app=QCoreApplication.instance() or QCoreApplication([])
         name='CodexonQA-'+hashlib.sha256(str(index.resolve()).encode()).hexdigest()[:24]
-        def send(command):
-            client=QLocalSocket();client.connectToServer(name);assert client.waitForConnected(3000)
-            client.write(command);assert client.waitForBytesWritten(3000)
+        def send(command,*,closing=False):
+            client=QLocalSocket();client.connectToServer(name)
+            if not client.waitForConnected(3000):
+                if closing:return b'closing'
+                raise RuntimeError('GUI readiness IPC unavailable')
+            client.write(command)
+            if not client.waitForBytesWritten(3000):
+                if closing:return b'closing'
+                raise RuntimeError('GUI quit request delivery failed')
             client.waitForReadyRead(3000);return bytes(client.readAll())
         assert send(b'verify-quit')==b'quitting'
-        wait(lambda:send(b'verify-exit-safe') if gui.poll() is None else b'accepted',lambda v:v==b'accepted')
+        wait(lambda:send(b'verify-exit-safe',closing=True) if gui.poll() is None else b'accepted',lambda v:v==b'accepted')
         assert gui.wait(timeout=90)==0
         assert not database.exists()
         return dict(role=role,route_preserved=True,usage_preserved=True,hooks_removed=True,registration_removed=True,old_instance=before['instance'],new_instance=after['instance'])

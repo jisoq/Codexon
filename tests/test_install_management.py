@@ -162,3 +162,25 @@ def test_normal_launch_resolves_saved_homes_after_restoring_connection_paths(tmp
     monkeypatch.setattr(app,'configure_font_rendering',lambda:(_ for _ in ()).throw(BeforeGUI()))
     with pytest.raises(BeforeGUI):app.main()
     assert calls==[None]
+
+
+def test_restart_keeps_custom_paths_and_service_ownership(tmp_path,monkeypatch):
+    from cachemonitor import app_restart
+    captured=[]
+    monkeypatch.setattr(app_restart.subprocess,'Popen',lambda command,**kwargs:captured.append(command))
+    app_restart.launch_replacement([tmp_path/'home'],index_path=tmp_path/'index.sqlite',
+        evidence_path=tmp_path/'evidence.sqlite',managed_services=True)
+    assert '--managed-services' in captured[0] and '--cache-control' not in captured[0]
+    assert str(tmp_path/'index.sqlite') in captured[0] and str(tmp_path/'evidence.sqlite') in captured[0]
+
+
+def test_managed_restart_resolves_saved_homes_with_explicit_index(tmp_path,monkeypatch):
+    from cachemonitor import app,launch_context
+    import sys
+    monkeypatch.setattr(sys,'argv',['Codexon.exe','--managed-services','--index-path',str(tmp_path/'index.sqlite')])
+    calls=[]
+    monkeypatch.setattr(launch_context,'resolve_homes',lambda explicit:calls.append(explicit) or [str(tmp_path/'custom home')])
+    class BeforeGUI(Exception):pass
+    monkeypatch.setattr(app,'configure_font_rendering',lambda:(_ for _ in ()).throw(BeforeGUI()))
+    with pytest.raises(BeforeGUI):app.main()
+    assert calls==[None]

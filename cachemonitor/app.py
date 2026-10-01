@@ -35,6 +35,7 @@ def main():
     parser.add_argument('--replace-gui',action='store_true',help=argparse.SUPPRESS)
     parser.add_argument('--verify-handoff',type=Path,help=argparse.SUPPRESS)
     parser.add_argument('--verify-services',action='store_true',help=argparse.SUPPRESS)
+    parser.add_argument('--managed-services',action='store_true',help=argparse.SUPPRESS)
     parser.add_argument("--codex-home", action="append", help="Repeat to monitor multiple local Codex homes")
     parser.add_argument("--hidden", action="store_true")
     parser.add_argument("--index-path", help="Override the app-owned usage index for isolated verification")
@@ -59,7 +60,7 @@ def main():
         parser.error('Handoff verification requires isolated homes and an explicit index')
     from .launch_context import resolve_homes, save_homes
     # Synthetic verification never inherits GUI preferences; controls return before saving.
-    isolated = bool(args.smoke or explicit_index or args.snapshot)
+    isolated = bool(args.smoke or args.snapshot or (explicit_index and not args.managed_services))
     homes = (args.codex_home or [os.environ.get('CODEX_HOME', str(Path.home()/'.codex'))]) if isolated else resolve_homes(args.codex_home)
     if args.enable_model_observer or args.disable_model_observer or args.model_observer_status or args.test_model_observer:
         from .observer_control import ObserverManager
@@ -151,7 +152,7 @@ def main():
     install_overlay(window, native_enabled=not (args.smoke or args.verify_handoff))
     def restart():
         from .app_restart import launch_replacement
-        try:launch_replacement(homes,index_path=args.index_path,handoff=args.verify_handoff,evidence_path=args.evidence_path,quota_path=args.quota_path)
+        try:launch_replacement(homes,index_path=args.index_path,handoff=args.verify_handoff,evidence_path=args.evidence_path,quota_path=args.quota_path,managed_services=not isolated)
         except OSError:
             window.settings_page.refresh_restart()
             QMessageBox.warning(window,'Codexon',tr('앱을 다시 시작하지 못했습니다. 다시 시도해 주세요.'))
