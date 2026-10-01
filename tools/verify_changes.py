@@ -29,14 +29,13 @@ def test_files(*names):
 
 # Components select observable contracts. There is deliberately no always-run core.
 GROUPS = {
+    'retirement': test_files('retired_cache'),
     'settings': test_files('settings'),
     'app_lifetime': test_files('app_services', 'observer_panel', 'windows_startup', 'proxy_update'),
     'data': test_files('core', 'index', 'data_contract', 'subagent_collection', 'request_tier_snapshots', 'collection_defaults'),
     'analysis': test_files('comparison', 'overview', 'performance', 'data_contract', 'output_speed'),
     'cost': test_files('pricing', 'mode_costs', 'session_costs', 'data_contract'),
-    'cache_connection': test_files('cache_codex_connection'),
-    'cache': test_files('cache_health', 'cache_misses', 'cache_management','cache_product','cache_operating'),
-    'cache_ui': test_files('cache_ui'),
+    'cache': test_files('cache_health', 'cache_misses'),
     'speed': test_files('speed_health', 'output_speed'),
     'names': test_files('codex_names'),
     'modes': test_files('request_modes', 'request_tier_snapshots', 'mode_costs'),
@@ -77,21 +76,19 @@ GROUPS = {
 
 # First match wins: QML and shared helpers must not fall through to a broad UI gate.
 RULES = (
+    ('cachemonitor/retired_cache.py', ('retirement','proxy_lifecycle','install')),
+    ('cachemonitor/usage_archive.py', ('retirement','data','quota_store')),
+    ('cachemonitor/cache_health.py', ('cache','notifications')),
+    ('cachemonitor/cache_misses.py', ('cache',)),
+    ('cachemonitor/cache_audit.py', ('cache',)),
+    ('cachemonitor/cache_*', ('retirement',)),
+    ('tools/cache_runtime.py', ('retirement',)),
+    ('tools/verify_cache_retention.py', ('retirement',)),
+    ('tools/verify_retired_worker.py', ('retirement','proxy_lifecycle','install')),
     ("tools/preview_overlay.py", ("overlay_render",)),
     ("cachemonitor/tooltips.py", ("dashboard", "quota_ui", "overlay_render", "translation")),
     ('cachemonitor/proxy_identity.py', ('proxy_lifecycle','install')),
     ('cachemonitor/proxy_target.py', ('proxy_lifecycle','install')),
-    ('cachemonitor/cache_db.py', ('cache','cache_ui','cache_connection','proxy_lifecycle')),
-    ('tools/cache_runtime.py', ('cache',)),
-    ('cachemonitor/cache_operating.py', ('cache','cache_ui','cache_connection')),
-    ('cachemonitor/cache_panel.py', ('cache_ui','cache_connection')),
-    ('cachemonitor/cache_worker_control.py', ('observer','cache','proxy_lifecycle')),
-    ('cachemonitor/cache_hooks.py', ('cache','cache_ui','cache_connection')),
-    ('cachemonitor/cache_control.py', ('cache','cache_ui','cache_connection')),
-    ('cachemonitor/cache_integration.py', ('cache','data','cost','quota_store')),
-    ('cachemonitor/cache_scheduler.py', ('cache','cache_connection','proxy_lifecycle')),
-    ('cachemonitor/cache_execution.py', ('cache', 'cache_connection')),
-    ('cachemonitor/cache_capture.py', ('cache', 'relay', 'cache_connection')),
     ('cachemonitor/session_costs.py', ('cost', 'overlay_data')),
     ('cachemonitor/workload.py', ('cost', 'analysis', 'overlay_data')),
     ('cachemonitor/core.py', ('data', 'analysis', 'cost', 'quota_store', 'modes', 'cache', 'speed')),
@@ -101,12 +98,11 @@ RULES = (
     ('cachemonitor/analysis_engine.py', ('analysis', 'cost', 'cache', 'overlay_data')),
     ('cachemonitor/analysis_records.py', ('analysis', 'cost', 'cache', 'overlay_data', 'dashboard', 'details')),
     ('cachemonitor/analysis_worker.py', ('analysis', 'quota_poll', 'overlay_tracking', 'notifications')),
-    ('cachemonitor/usage_collection.py', ('data', 'quota_poll', 'overlay_tracking', 'cache_connection')),
+    ('cachemonitor/usage_collection.py', ('data', 'quota_poll', 'overlay_tracking', 'retirement')),
     ('cachemonitor/usage_paths.py', ('data', 'quota_poll', 'evidence')),
     ('cachemonitor/analysis_delivery.py', ('analysis', 'overlay_tracking')),
     ('cachemonitor/pricing.py', ('cost', 'quota_store', 'quota_math')),
     ('cachemonitor/request_modes.py', ('modes', 'quota_store')),
-    ('cachemonitor/cache_*.py', ('cache', 'dashboard')),
     ('cachemonitor/speed_health.py', ('speed',)),
     ('cachemonitor/codex_names.py', ('names', 'overlay_tracking')),
     ('cachemonitor/quota_chart.py', ('quota_chart',)),
@@ -176,8 +172,8 @@ RULES = (
     ('cachemonitor/assets/i18n/*.json', ('translation',)),
     ('cachemonitor/model_evidence.py', ('evidence', 'data')),
     ('cachemonitor/evidence_writer.py', ('evidence',)),
-    ('cachemonitor/model_proxy.py', ('relay', 'cache_connection')),
-    ('cachemonitor/proxy_websocket.py', ('relay', 'cache_connection')),
+    ('cachemonitor/model_proxy.py', ('relay', 'retirement')),
+    ('cachemonitor/proxy_websocket.py', ('relay', 'retirement')),
     ('cachemonitor/proxy_http.py', ('relay',)),
     ('cachemonitor/proxy_observation.py', ('relay', 'evidence')),
     ('cachemonitor/proxy_update.py', ('proxy_lifecycle',)),
@@ -246,6 +242,7 @@ RULES = (
 
 # These changes need frozen executable/install checks in addition to source tests.
 PACKAGE_PATTERNS = (
+    'cachemonitor/retired_cache.py','cachemonitor/usage_archive.py','tools/verify_retired_worker.py',
     'requirements*', 'build*.ps1', '*.spec', 'installer/*', 'recovery_main.py', 'icons/*.ico',
     'tools/verify_msix_installation.ps1', 'tools/run_native_checks.py',
     'run.py', 'start.ps1', 'tools/Build-*.ps1', 'tools/*install*.py', 'tools/prepare_bad_runtime.py',
@@ -257,6 +254,7 @@ PACKAGE_PATTERNS = (
     'tools/prepare_legacy_release.py',
 )
 PROXY_PATTERNS = (
+    'cachemonitor/retired_cache.py','tools/verify_retired_worker.py',
     'cachemonitor/model_proxy.py', 'cachemonitor/proxy*.py', 'cachemonitor/managed_proxy.py',
     'cachemonitor/observer_control.py', 'cachemonitor/observer_state.py', 'cachemonitor/observer_task.py',
     'cachemonitor/connection_recovery.py', 'cachemonitor/evidence_writer.py',

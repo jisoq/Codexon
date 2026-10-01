@@ -63,8 +63,8 @@ def observation_label(row, money=False):
     if 'reported_remaining' in row:
         label=f"{clock(row['at'],True)} · 누적 소모 {row['remaining']:g}%p"
     if money:
-        label+=(f" · 누적 API {usd(row.get('cycle_cost'))}"
-                f" · 주간 동등 가치 {usd(row.get('cycle_value'))}")
+        label+=(f" / 누적 환산액 {usd(row.get('cycle_cost'))}"
+                f" / 주간 동등 가치 {usd(row.get('cycle_value'))}")
         if row.get('value_held'):label+=' · 마지막 확인값'
     return label
 

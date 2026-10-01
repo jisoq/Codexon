@@ -1,7 +1,7 @@
 """Shared tooltip copy for explanations, never duplicate status labels."""
 
 TEXT = {
-    'cost': '모델별 단가 기준 사용량 환산액',
+    'cost': 'Standard 기준 단가 / Fast 2.5배 / 구독 가치 환산액',
     'cache': '캐시 읽기 ÷ 입력 × 100',
     'cache_total': '캐시 읽기 합계 ÷ 입력 합계 × 100',
     'speed': '현재 출력 토큰 ÷ 소요시간',

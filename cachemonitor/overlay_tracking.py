@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
 import re
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 
 ROUTE_MARKER = 'IAB_LIFECYCLE received browser sidebar owner sync'
@@ -61,8 +61,15 @@ class RouteLog:
             raw = fields.get('ownerRoutePath', '')
             try:
                 route = urlsplit(raw)
-                candidate = route.path.removeprefix('/local/') if route.path.startswith('/local/') else ''
-                tid = candidate if UUID.fullmatch(candidate) else None
+                if route.path.startswith('/local/'):
+                    candidate = route.path.removeprefix('/local/')
+                    tid = candidate if UUID.fullmatch(candidate) else None
+                elif route.path.startswith('/c/'):
+                    candidate = unquote(route.path.removeprefix('/c/'))
+                    # The Work conversation namespace is part of its identity.
+                    tid = candidate if UUID.fullmatch(candidate.removeprefix('local-chatgpt:')) else None
+                else:
+                    tid = None
                 host = parse_qs(route.query).get('hostId', ['local'])[0]
             except ValueError:
                 tid, host = None, 'local'

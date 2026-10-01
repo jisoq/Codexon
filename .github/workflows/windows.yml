@@ -120,7 +120,7 @@ jobs:
       - name: Check frozen runtime and Qt Quick interaction
         if: steps.plan.outputs.package == 'true'
         run: python tools/run_ui_checks.py -- python tools/verify_changes.py --package-only --package-exe dist-ci/Codexon/Codexon.exe
-      - name: Build previous release and check both proxy roles with idle connections
+      - name: Build previous release and check observation proxy with idle connections
         if: steps.plan.outputs.proxy == 'true'
         shell: pwsh
         run: |
@@ -129,7 +129,6 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python tools/verify_proxy_update.py --old-exe ../codexon-previous-dist/Codexon/Codexon.exe --new-exe dist-ci/Codexon/Codexon.exe --idle-connections 100 --output artifacts/verification/proxy-update
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python tools/verify_proxy_update.py --old-exe ../codexon-previous-dist/Codexon/Codexon.exe --new-exe dist-ci/Codexon/Codexon.exe --cache-worker --idle-connections 100 --output artifacts/verification/cache-worker-update
       - name: Check packaged app exit, service resume and collector migration
         if: steps.plan.outputs.proxy == 'true'
         run: python tools/run_ui_checks.py -- python tools/verify_app_services.py --executable dist-ci/Codexon/Codexon.exe --legacy-collector-exe ../codexon-previous-dist/Codexon/Codexon.exe --output artifacts/verification/app-services
@@ -140,9 +139,9 @@ jobs:
           python tools/prepare_legacy_release.py --tag v2026.09.25.6 --output artifacts/legacy-published
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $published = Get-Content artifacts/legacy-published/result.json -Raw | ConvertFrom-Json
-          python tools/verify_proxy_update.py --old-exe $published.executable --new-exe dist-ci/Codexon/Codexon.exe --idle-connections 100 --output artifacts/verification/published-proxy-update
+          python tools/run_ui_checks.py -- python tools/verify_retired_worker.py --old-exe $published.executable --new-exe dist-ci/Codexon/Codexon.exe --output artifacts/verification/published-worker-retirement
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python tools/verify_proxy_update.py --old-exe $published.executable --new-exe dist-ci/Codexon/Codexon.exe --cache-worker --idle-connections 100 --output artifacts/verification/published-cache-update
+          python tools/verify_proxy_update.py --old-exe $published.executable --new-exe dist-ci/Codexon/Codexon.exe --idle-connections 100 --output artifacts/verification/published-proxy-update
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python tools/run_ui_checks.py -- python tools/verify_app_services.py --executable dist-ci/Codexon/Codexon.exe --legacy-collector-exe $published.executable --output artifacts/verification/published-app-services
       - name: Check packaged GUI handoff with multiple custom homes

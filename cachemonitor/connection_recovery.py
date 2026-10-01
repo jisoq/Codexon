@@ -18,16 +18,12 @@ from .observer_state import ProcessLock, read_json
 from .translation_catalog import translate as tr
 
 
-def target(home=None, directory=None, url=None):
-    from .launch_context import cache_paths, resolve_homes
-    paths = cache_paths()
-    if paths.get('index_path') and paths.get('evidence_path'):
-        selected = resolve_homes()[0]
-        if ((home is None or Path(home).resolve()==Path(selected).resolve()) and
-                (directory is None or Path(directory).resolve()==Path(paths['evidence_path']).resolve().parent)):
-            from .cache_worker_control import CacheWorkerManager
-            manager = CacheWorkerManager(selected, paths['index_path'], paths['evidence_path'])
-            if url is None or url==manager.url:return manager
+def target(home=None, directory=None, url=None,*,index=None):
+    from .launch_context import connection_paths, resolve_homes
+    paths=connection_paths()
+    selected=resolve_homes()[0]
+    if paths.get('evidence_path') and (home is None or Path(home).resolve()==Path(selected).resolve()) and directory is None:
+        directory=Path(paths['evidence_path']).parent
     directory = Path(directory) if directory else default_path().parent
     state = read_json(directory / 'model-observer.json')
     home = Path(home or state.get('home') or os.environ.get('CODEX_HOME') or Path.home()/'.codex')
@@ -37,7 +33,12 @@ def target(home=None, directory=None, url=None):
             or parsed.username or parsed.password or parsed.path not in ('', '/')
             or parsed.query or parsed.fragment):
         raise ValueError('Codexon 로컬 프록시 주소가 아닙니다. 설정을 변경하지 않았습니다.')
-    return ObserverManager(home, directory, url)
+    manager=ObserverManager(home,directory,url)
+    if paths.get('evidence_path') and Path(paths['evidence_path']).parent.resolve()==directory.resolve():
+        manager.evidence=Path(paths['evidence_path']).resolve()
+    from .retired_cache import select_route
+    select_route(manager,index or (paths.get('index_path') if manager.home.resolve()==Path(selected).resolve() else None))
+    return manager
 
 
 def inspect(manager):
@@ -88,6 +89,8 @@ def assess(status):
 
 
 def restore(manager):
+    from .retired_cache import retire
+    retire(manager,restore_only=True)
     with ProcessLock(manager.control_lock, timeout=5):
         status=manager.recover_direct()
         if manager.config()[1].get('openai_base_url') == manager.url:

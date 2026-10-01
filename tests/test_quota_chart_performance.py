@@ -34,7 +34,7 @@ def test_million_observations_keep_exact_selection_and_bounded_rendering(tmp_pat
             chart.activate_at(x,chart.box.center().y())
             lookup.append((time.perf_counter()-start)*1000)
             assert chart.cursor==wanted
-            assert chart.tip_at(x,chart.box.center().y())==rows[wanted]['label']+f" · 누적 API ${rows[wanted]['cycle_cost']:.2f}"+f" · 주간 동등 가치 ${rows[wanted]['cycle_value']:.2f}"
+            assert chart.tip_at(x,chart.box.center().y())==rows[wanted]['label']+f" / 누적 환산액 ${rows[wanted]['cycle_cost']:.2f}"+f" / 주간 동등 가치 ${rows[wanted]['cycle_value']:.2f}"
             start=time.perf_counter();app.processEvents();host.quick.grabFramebuffer()
             samples.append((time.perf_counter()-start)*1000)
             start=time.perf_counter();plot.showTip(x,chart.box.center().y())

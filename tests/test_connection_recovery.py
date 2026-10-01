@@ -11,43 +11,6 @@ from cachemonitor.model_evidence import home_key
 from cachemonitor.observer_state import read_json
 
 
-def test_start_menu_recovery_uses_the_saved_cache_connection(tmp_path,monkeypatch):
-    from cachemonitor import launch_context,install_management
-    from cachemonitor.cache_worker_control import CacheWorkerManager
-    home=tmp_path/'custom home';home.mkdir()
-    index=tmp_path/'analysis'/'index.sqlite';index.parent.mkdir()
-    evidence=tmp_path/'data'/'evidence.sqlite'
-    route='http://127.0.0.1:18771'
-    index.with_name('cache-route.json').write_text(json.dumps(dict(url=route)))
-    (home/'config.toml').write_text('openai_base_url="'+route+'"\nmodel="preserve"\n')
-    (home/'auth.json').write_text('preserve authentication')
-    monkeypatch.setattr(launch_context,'cache_paths',lambda:dict(index_path=str(index),evidence_path=str(evidence)))
-    monkeypatch.setattr(launch_context,'resolve_homes',lambda:[str(home)])
-    manager=target()
-    manager.health_state='refused'
-    assert isinstance(manager,CacheWorkerManager) and manager.url==route
-    assert isinstance(target(home),CacheWorkerManager)
-    assert isinstance(target(home,evidence.parent,route),CacheWorkerManager)
-    assert install_management.connection_manager().index==manager.index
-    monkeypatch.setattr('cachemonitor.observer_control.startup_value',lambda *a:None)
-    monkeypatch.setattr(manager,'health',lambda **_:None)
-    from cachemonitor.cache_db import connect
-    db=connect(index.with_name('cache-control.sqlite'))
-    db.executemany('INSERT INTO cache_operating_grants(id,home,data) VALUES(?,?,?)',
-                   [('owned',str(home),'{}'),('other',str(tmp_path/'other'),'{}')])
-    db.close()
-    task=SimpleNamespace(remove=lambda:None,inspect=lambda:dict(registered=False))
-    manager.task=manager.legacy_task=task
-    monkeypatch.setattr(manager,'cleanup_legacy_check',lambda:None)
-    assert restore(manager)['code']=='restored'
-    assert manager.config()[1]=={'model':'preserve'}
-    assert (home/'auth.json').read_text()=='preserve authentication'
-    assert inspect(manager)['status']['restart_required']
-    db=connect(index.with_name('cache-control.sqlite'))
-    assert db.execute('SELECT id,stopped FROM cache_operating_grants ORDER BY id').fetchall()==[('other',None),('owned','revoked')]
-    db.close()
-    explicit=target(home,tmp_path/'explicit',url='http://127.0.0.1:18772')
-    assert not isinstance(explicit,CacheWorkerManager) and explicit.url.endswith(':18772')
 
 
 @pytest.mark.parametrize('phase',['queued','waiting','stopping','starting','verifying','rollback'])

@@ -21,7 +21,7 @@ from .analytics import analyze, stats, session_summary, cache_rows, observation_
 from .analysis_engine import AnalysisEngine, BoundedCache
 from .analysis_worker import AnalysisBridge
 from .core import day_start, summarize, transport_label
-from .pricing import usd, RATES, FAST_RATES, VERIFIED, request_tier, display_tier, token_cost, sum_cost
+from .pricing import usd, RATES, FAST_RATES, VERIFIED, SUPPORTED_MODELS, supported_model, request_tier, display_tier, token_cost, sum_cost
 from .session_costs import own_costs, session_costs
 from .charts import UsageTrend, SourceBars, ComparisonChart, TokenComposition, value_text, COLORS
 from .observer_panel import ObserverPanel
@@ -34,7 +34,7 @@ from .workload import call_count
 from .history_navigation import HistoryNavigation, HistoryWorkspace, HistoryTree
 
 STYLE = ''
-TITLES = ('사용 현황','조건 비교','세션 기록','사용 한도','설정','캐시 관리')
+TITLES = ('사용 현황','조건 비교','세션 기록','사용 한도','설정')
 PERIODS = [('최근 30분','30m'),('오늘','today'),('최근 7일','7d'),('최근 30일','30d'),('전체 기록','all'),('직접 지정','custom')]
 INPUT_BANDS = [('전체 입력 길이',''),('10k 미만','0:10000'),('10–50k','10000:50000'),('50–100k','50000:100000'),('100–200k','100000:200000'),('200–272k','200000:272001'),('272k 초과','272001:inf')]
 CALL_FILTERS = [('미산정','unpriced'),('모드 기록 없음','unknown_mode'),('모델명 불일치','model_mismatch'),('기록 누락·충돌','observation_problem'),('캐시 읽기 0','cache_zero'),('캐시 저하 의심','cache_degradation'),('HTTP/SSE','http')]
@@ -118,9 +118,8 @@ class Dashboard(TrayWindow):
     @selected_event.setter
     def selected_event(self,value):self.history_navigation.event=value
 
-    def __init__(self, homes, start_worker=True, settings=None, index_path=None, static_snapshot=None, live_limits=True, manage_observer=False,model_evidence_path=None,cache_control=None,quota_path=None,collection_autostart=True):
+    def __init__(self, homes, start_worker=True, settings=None, index_path=None, static_snapshot=None, live_limits=True, manage_observer=False,model_evidence_path=None,quota_path=None,collection_autostart=True):
         self.quota_path=quota_path
-        self.cache_control_enabled=manage_observer if cache_control is None else cache_control
         super().__init__()
         self.settings=settings or QSettings('CacheMonitor','CacheMonitor')
         self.observer_home=homes[0] if homes else str(Path.home()/'.codex')
@@ -174,7 +173,7 @@ class Dashboard(TrayWindow):
         self.history_path=Row();self.history_path.setSpacing(4);self.navigation_row.addWidget(self.history_path,1)
         self.heading=label(TITLES[0],'heading');header.addWidget(self.heading);header.addStretch()
         self.pending_label=label('','muted');self.pending_label.setFixedHeight(36);self.pending_label.setMaximumWidth(280);header.addWidget(self.pending_label)
-        self.price_button=Button('기준 가격');self.price_button.clicked.connect(self.show_prices);header.addWidget(self.price_button);layout.addLayout(header)
+        self.price_button=Button('기준 환산 단가');self.price_button.clicked.connect(self.show_prices);header.addWidget(self.price_button);layout.addLayout(header)
         self.common_filters=Row();self.common_filters.put(flow=True,spacing=8)
         self.home=combo([('모든 Codex 홈','')]+[(Verbatim(h),h) for h in homes]);self.home.setMinimumWidth(205)
         self.period=combo(PERIODS);choose(self.period,'30d')
@@ -277,7 +276,6 @@ class Dashboard(TrayWindow):
         page=getattr(self,'current_page',0)
         for service in getattr(self,'quota_services',{}).values():
             service.set_reports_enabled(visible and page==3 and service is self.quota_service)
-        if hasattr(self,'cache_panel'):self.cache_panel.set_reports_enabled(visible and page==5)
 
     def scroll_page(self,index):
         area=Scroll();area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff);body=Group();layout=Column(body)
@@ -474,7 +472,7 @@ class Dashboard(TrayWindow):
         self.comparison_selection=state.get('comparison_selection')
         if not self.comparison_selection:self.comparison_detail['group'].hide()
         model=state.get('compare_model') or next((t.get('model') for t in self.targets if t.get('model')),'')
-        if model and self.compare_model.findData(model)<0:self.compare_model.addItem(model,model)
+        if supported_model(model) and self.compare_model.findData(model)<0:self.compare_model.addItem(model,model)
         choose(self.compare_model,model)
         for key,value in state.get('choices',{}).items():
             if key=='compare_type' and value not in ('effort','mode'):value='effort'
@@ -490,8 +488,7 @@ class Dashboard(TrayWindow):
         self.search.setText(state.get('search',''));self.outside.setChecked(state.get('outside',False))
         for key,node in self.call_filter_controls.items():node.setChecked(key in state.get('call_filters',[]))
         for key,node in self.extra_column_controls.items():node.setChecked(key in state.get('extras',[]))
-        self.temporary_context=None if initial else state.get('temporary');self.current_page=max(0,min(5,state.get('page',0)))
-        if self.current_page==5 and not self.cache_master.isChecked():self.current_page=0
+        self.temporary_context=None if initial else state.get('temporary');self.current_page=max(0,min(4,state.get('page',0)))
         if initial and self.current_page==4:self.current_page=0
         self.exact_record=None;self.record_request+=1;self._revealed_call=None
         self.settings_page.reveal(state.get('settings_category','general'))
@@ -638,11 +635,10 @@ class Dashboard(TrayWindow):
         if self.restoring:return
         if self.current_page in (0,2):
             self.page_filters[self.current_page]={key:getattr(self,attr).currentData() for key,attr in (('model','model'),('effort','effort'),('service_tier','mode'))}
-        if index==5 and not self.cache_master.isChecked():index=4
-        self.current_page=max(0,min(5,index));self.pages.setCurrentIndex(self.current_page);self.heading.setText(TITLES[self.current_page])
+        self.current_page=max(0,min(4,index));self.pages.setCurrentIndex(self.current_page);self.heading.setText(TITLES[self.current_page])
         self.sync_report_demand()
         self.restoring=True
-        self.nav.setCurrentRow(4 if self.current_page==5 else self.current_page if self.current_page<4 else -1)
+        self.nav.setCurrentRow(self.current_page if self.current_page<4 else -1)
         for key,attr in (('model','model'),('effort','effort'),('service_tier','mode')):
             if self.current_page in (0,2):choose(getattr(self,attr),self.page_filters[self.current_page].get(key,''))
         self.restoring=False
@@ -761,9 +757,6 @@ class Dashboard(TrayWindow):
         self.snapshot=value
         for service in getattr(self,'quota_services',{}).values():
             service.supply_local(value.get('quota_by_home',{}).get(service.home))
-        if hasattr(self,'cache_panel'):
-            self.cache_panel.collection_error=bool(value.get('errors') or value.get('usage_errors'))
-        if hasattr(self,'cache_panel'):self.cache_panel.display(value.get('cache_management',{}))
         overlay=getattr(self,'overlay',None)
         if overlay:overlay.receive_snapshot(value)
         self.refresh_choices();index=value.get('index',{})
@@ -977,8 +970,9 @@ class Dashboard(TrayWindow):
         if not hasattr(self,'compare_model'):return
         old=self.restoring;self.restoring=True
         current=self.compare_model.currentData()
-        values=list(self.filter_values.get('model',[]))
-        if current and current not in values:values.append(current)
+        values=[m for m in self.filter_values.get('model',[]) if supported_model(m)]
+        if supported_model(current) and current not in values:values.append(current)
+        if current not in values:current=None
         if not current:current='gpt-6-astra' if 'gpt-6-astra' in values else (values[0] if values else '')
         if [self.compare_model.itemData(i) for i in range(self.compare_model.count())]!=values:
             self.compare_model.clear()
@@ -1252,7 +1246,7 @@ class Dashboard(TrayWindow):
         self.render_history_path(data)
         self.table.put(highlightZeroCache=self.record_view=='calls',navigationColumn=0)
         summary=data.get('summary',{})
-        self.history_summary.setText(f"환산액 {'확인분 ' if summary.get('partial') and summary.get('cost') is not None else ''}{usd(summary.get('cost'))} · 호출 {summary.get('calls',0):,} · 캐시 {value_text(summary.get('cache_ratio'),'cache_ratio')}\n입력 {number(summary.get('input'))} · 출력 {number(summary.get('output'))} · API 단가 기준 · 청구액 아님")
+        self.history_summary.setText(f"환산액 {'확인분 ' if summary.get('partial') and summary.get('cost') is not None else ''}{usd(summary.get('cost'))} / 호출 {summary.get('calls',0):,} / 캐시 {value_text(summary.get('cache_ratio'),'cache_ratio')}\n입력 {number(summary.get('input'))} / 출력 {number(summary.get('output'))} / 구독 가치 기준 / 청구액 아님")
         self.update_navigation()
         self.outside.setVisible(self.record_view=='calls');self.call_columns_row.setVisible(self.record_view=='calls')
         self.record_filters.toggle.setText('필터·표시 항목')
@@ -1271,7 +1265,7 @@ class Dashboard(TrayWindow):
         self.sync_history_filters()
         if not session:
             summary=data.get('summary',{})
-            self.session_scope.setText(f"환산액 {usd(summary.get('cost'))} · {summary.get('calls',0):,}호출 · API 단가 기준 · 청구액 아님")
+            self.session_scope.setText(f"환산액 {usd(summary.get('cost'))} / {summary.get('calls',0):,}호출 / 구독 가치 기준 / 청구액 아님")
         residual=(session or {}).get('unclassified');self.residual_details.setVisible(bool(residual))
         if residual:self.residual_details.set_sections([('별도 누계', ' · '.join(f'{name} {number(residual.get(key))}' for key,name in (('input','입력'),('cached','캐시 읽기'),('written','캐시 쓰기'),('output','출력'),('reasoning','추론'),('total','Total')))),('집계','호출·요청 통계에 포함하지 않음')])
         if session:
@@ -1442,7 +1436,7 @@ class Dashboard(TrayWindow):
         if row.get('output_speed') is not None:
             section['time']=entries([('호출 소요시간',value_text(row.get('duration'),'duration'))])+'\n출력 / 요청부터 완료까지 · 대기·통신 포함'
         price_model=row.get('price_model',row.get('model'));rate=(FAST_RATES if request_tier(row)=='Fast' else RATES if request_tier(row)=='Standard' else {}).get(price_model)
-        lines=[VERIFIED+' 기준 · API 단가 환산',entries([('가격 모델',price_model)])]
+        lines=[VERIFIED+' 기준 / 구독 가치 환산',entries([('가격 모델',price_model)])]
         if rate:
             for label_,tokens,price in [('일반 입력',row.get('ordinary_input'),rate.input),('캐시 읽기',row.get('cached'),rate.cached),('캐시 쓰기',row.get('written'),rate.written if rate.written is not None else rate.input),('출력',row.get('output'),rate.output)]:
                 if tokens is not None and price is not None:lines.append(f'{label_}  {number(tokens)} × {usd(price)} / 1,000,000')
@@ -1521,68 +1515,38 @@ class Dashboard(TrayWindow):
         self.diagnostics.setPlainText(text)
 
     def show_prices(self):
-        dialog=Dialog(self);dialog.setWindowTitle('기준 가격 · '+VERIFIED+' 기준');dialog.resize(980,720)
-        body=Column(dialog);body.setContentsMargins(20,20,20,20);body.setSpacing(16);body.addWidget(label(VERIFIED+' 기준 · 고정 단가 환산 · 청구액 아님','section'))
-        prices=table(['가격 모델 · 모드','일반 입력','캐시 읽기','캐시 쓰기','출력'])
+        dialog=Dialog(self);dialog.setWindowTitle('기준 환산 단가 / '+VERIFIED+' 기준');dialog.resize(980,720)
+        body=Column(dialog);body.setContentsMargins(20,20,20,20);body.setSpacing(16);body.addWidget(label(VERIFIED+' 기준 / Standard 기준 단가 / Fast 2.5배 / 청구액 아님','section'))
+        prices=table(['가격 모델 / 모드','일반 입력','캐시 읽기','캐시 쓰기','출력'])
         for i,width in enumerate((320,145,145,145,145)):prices.setColumnWidth(i,width)
         rows=[]
-        for model,standard in RATES.items():
+        for model in SUPPORTED_MODELS:
+            standard=RATES[model]
             for mode,rate in (('Standard',standard),('Fast',FAST_RATES.get(model))):
-                if rate:rows.append([model+' · '+mode,usd(rate.input),usd(rate.cached) if rate.cached is not None else '미지원',usd(rate.written) if rate.written is not None else '입력과 동일',usd(rate.output)])
+                if rate:rows.append([model+' / '+mode,usd(rate.input),usd(rate.cached) if rate.cached is not None else '미지원',usd(rate.written) if rate.written is not None else '입력과 동일',usd(rate.output)])
         fill(prices,rows);body.addWidget(prices,1)
-        body.addWidget(label('API에는 장문 할증이 있지만, 구독 사용량 환산에는 반영하지 않습니다.','muted',True))
-        body.addWidget(label('USD / 100만 토큰 · GPT-5.6 Sol 프로모션 확인 기한 2026-11-21','muted',True))
-        body.addWidget(label('가격 별칭: gpt-5.6, gpt-daybreak-blue-latest → gpt-5.6-sol · gpt-5.4-mini-2026-03-17 → gpt-5.4-mini · gpt-5.5-2026-04-23 → gpt-5.5','muted',True))
+        body.addWidget(label('Standard 기준 단가에 구독 소모 배율을 적용합니다. Fast 환산액은 같은 토큰 Standard 대비 2.5배입니다.','muted',True))
+        body.addWidget(label('구독 가치 환산은 API 장문 할증을 반영하지 않습니다.','muted',True))
+        body.addWidget(label('USD / 100만 토큰 / GPT-5.6 Sol 프로모션 확인 기한 2026-11-21','muted',True))
+        body.addWidget(label('가격 별칭: gpt-5.6, gpt-daybreak-blue-latest → gpt-5.6-sol / gpt-5.5-2026-04-23 → gpt-5.5','muted',True))
         buttons=DialogButtons(DialogButtons.Close);buttons.rejected.connect(dialog.reject);body.addWidget(buttons);dialog.open();self.price_dialog=dialog
 
-    def set_cache_enabled(self,enabled,*,persist=True):
-        if persist:self.cache_panel.set_enabled(enabled)
-        blocked=self.nav.blockSignals(True)
-        self.nav.clear();self.nav.addItems(TITLES[:4]+(('캐시 관리',) if enabled else ()))
-        self.nav.setMaximumHeight(270 if enabled else 220)
-        self.nav.setCurrentRow(4 if enabled and self.current_page==5 else self.current_page if self.current_page<4 else -1)
-        self.nav.blockSignals(blocked)
-        if hasattr(self,'cache_shortcut'):
-            self.cache_shortcut.setEnabled(enabled)
-            self.cache_shortcut_note.setText('캐시 갱신을 켜면 사용 기록과 모델 변경 확인 설정을 열 수 있습니다.' if not enabled else '')
-        if not enabled and self.current_page==5:self.change_page(4)
 
-    def restore_cache_controls(self):
-        enabled=self.cache_panel.restore_controls()
-        blocked=self.cache_master.blockSignals(True)
-        self.cache_master.setChecked(enabled)
-        self.cache_master.blockSignals(blocked)
-        self.cache_master.setEnabled(self.cache_control_enabled and self.cache_panel.control is not None)
-        self.set_cache_enabled(enabled,persist=False)
+
+
 
     def build_settings(self):
         from .settings_page import SettingsPage
         from .controls import Switch
         self.settings_page = SettingsPage(self)
         self.pages.addWidget(self.settings_page)
-        manager=None
-        if self.cache_control_enabled and self.index_path and self.model_evidence_path:
-            from .cache_worker_control import CacheWorkerManager
-            manager=CacheWorkerManager(self.observer_home,self.index_path,self.model_evidence_path)
+        from .connection_recovery import target
+        manager=target(self.observer_home,self.observer_directory,index=self.index_path)
+        if self.model_evidence_path:manager.evidence=Path(self.model_evidence_path)
         self.observer_panel=ObserverPanel(self.observer_home,self.observer_directory,active=self.manage_observer,parent=self,manager=manager)
         self.settings_page.add_widget('integration', self.observer_panel,section='프록시',title='프록시 사용',description='요청 모델과 응답 모델을 비교할 수 있도록 Codex 연결을 중계합니다.',target=self.observer_panel.toggle,aliases='proxy connection')
         self.settings_page.entries[-1]['description']=self.observer_panel.description.text()
         self.settings_page.entries.append(dict(id='connection-details',category='integration',section='프록시',title='연결 정보',description='',widget=self.observer_panel.connection_details,target=self.observer_panel.connection_details.toggle,aliases='connection information'))
-        from .cache_panel import CachePanel
-        self.cache_panel=CachePanel(self.observer_home,self.index_path,active=self.cache_control_enabled,parent=self)
-        cache_scroll=Scroll();cache_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        cache_scroll.setWidget(self.cache_panel);self.pages.addWidget(cache_scroll);self.scrollers[5]=cache_scroll
-        self.cache_master=Switch()
-        self.settings_page.add_row('integration','캐시 갱신','기존 캐시 재사용을 시도하는 추가 요청입니다. 켤 때 예상 비용과 실행 범위를 확인합니다.',self.cache_master,section='캐시',aliases='캐시 관리 cache refresh')
-        self.cache_shortcut=Button('캐시 관리 열기');self.cache_shortcut.clicked.connect(lambda:self.change_page(5) if self.cache_master.isChecked() else None)
-        self.cache_shortcut_note=Text();self.cache_shortcut_note.setWordWrap(True)
-        self.settings_page.add_widget('integration',self.cache_shortcut,section='캐시',title='캐시 관리',target=self.cache_shortcut)
-        self.settings_page.add_widget('integration',self.cache_shortcut_note,section='캐시')
-        self.cache_master.toggled.connect(self.set_cache_enabled)
-        self.cache_panel.storage_ready.connect(self.restore_cache_controls)
-        self.cache_panel.enabled_changed.connect(lambda _:self.restore_cache_controls())
-        self.restore_cache_controls()
-        self.observer_panel.status_observed.connect(self.cache_panel.proxy_status)
         legacy_notifications = self.settings.value('notifications',True,type=bool)
         self.notification_master = Switch()
         self.notification_master.setChecked(self.settings.value('notifications/enabled', legacy_notifications, type=bool))

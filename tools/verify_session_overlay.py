@@ -20,6 +20,7 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from cachemonitor.fonts import configure_font_rendering, configure_high_dpi, load_bundled_fonts
 from cachemonitor.overlay import OverlayController, SessionOverlay
+from cachemonitor.overlay_monitor import WIDTH, ACTIONS_X, POPUP_X
 from cachemonitor.overlay_appearance import CodexAppearance, resolve_appearance
 from cachemonitor.overlay_data import token_composition
 
@@ -34,7 +35,7 @@ def main():
     args = parser.parse_args()
     if args.readme and args.live_seconds:
         parser.error('--readme cannot be combined with --live-seconds')
-    from cachemonitor.i18n import set_language
+    from cachemonitor.i18n import set_language, tr
     set_language(args.language)
     configure_font_rendering(); configure_high_dpi()
     from PySide6.QtCore import QSettings, QTimer, Qt
@@ -51,7 +52,7 @@ def main():
     from cachemonitor.overlay_chrome import OverlayChrome, OverlayDetail
     # Explicit fixture calls exercise the production summary; no history is
     # reconstructed from an aggregate. These images are render-test artifacts.
-    title='Sample task · Usage review' if args.language=='en' else '예시 작업 · 사용량 살펴보기'
+    title='Sample task - Usage review' if args.language=='en' else '예시 작업 - 사용량 살펴보기'
     session=Session('render-fixture','render-fixture',title=title)
     for i,rate in enumerate((0,72,83,90,96,96,92,88,94,91,0,86,92,96,91,98,95,96,98,91,96,98,97,96)):
         session.add_usage(1789884000+i*13,str(i),dict(input_tokens=100000,cached_input_tokens=rate*1000,
@@ -75,21 +76,21 @@ def main():
         widget.set_layout(detail=expanded,inline=inline,reduced=reduced)
         actions.apply_appearance(theme,94);actions.view.put(expanded=expanded,popupOpen=opacity_popup)
         actions.resize(78,30);actions.show();widget.show()
-        if expanded:detail.resize(380 if inline else 240,widget.panel_height());detail.show()
+        if expanded:detail.resize(WIDTH if inline else 240,widget.panel_height());detail.show()
         else:detail.hide()
         if opacity_popup:popup.resize(160,40);popup.apply_appearance(theme,94);popup.show()
         else:popup.hide()
         QTest.qWait(160 if args.readme else 70)
         if scroll_label:
             from PySide6.QtQuick import QQuickItem
-            row=next(item for item in widget.content_model._detail_items if item[0]==scroll_label)
+            row=next(item for item in widget.content_model._detail_items if item[0]==tr(scroll_label))
             scroller=detail.quick.rootObject().findChild(QQuickItem,'detailScroll')
             scroller.setProperty('contentY',min(row[2],scroller.property('contentHeight')-scroller.height()))
             QTest.qWait(40)
         result=widget.grab();painter=QPainter(result)
         if expanded:painter.drawPixmap(0,0,detail.grab())
-        painter.drawPixmap(round(widget.content_model.monitor_x+290),13,actions.grab())
-        if opacity_popup:painter.drawPixmap(round(widget.content_model.monitor_x+204),44,popup.grab())
+        painter.drawPixmap(round(widget.content_model.monitor_x+ACTIONS_X),13,actions.grab())
+        if opacity_popup:painter.drawPixmap(round(widget.content_model.monitor_x+POPUP_X),44,popup.grab())
         painter.end()
         path=args.output.with_name(args.output.stem+'-'+name).with_suffix('.png')
         assert result.save(str(path)), f'Could not save {path}'
@@ -178,9 +179,9 @@ def main():
     incident_engine=AnalysisEngine();incident_engine.ingest([incident.view(1789884400)])
     incident_data=OverlaySummaries().collect(incident_engine)[0]
     capture('degradation-evidence',incident_data,expanded=True,scroll_label='세션 저하 의심')
-    canvas=QPixmap(380*2+48,widget.panel_height()+32);canvas.fill(QColor('#BAC4BE'))
+    canvas=QPixmap(WIDTH*2+48,widget.panel_height()+32);canvas.fill(QColor('#BAC4BE'))
     painter=QPainter(canvas)
-    for i,image in enumerate(images):painter.drawPixmap(16+i*396,16,image)
+    for i,image in enumerate(images):painter.drawPixmap(16+i*(WIDTH+16),16,image)
     painter.end();canvas.save(str(args.output.with_suffix('.png')))
     for window in (popup,detail,actions,widget):window.close()
     families=QFontDatabase.families()

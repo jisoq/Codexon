@@ -202,5 +202,5 @@ def test_fallback_boundaries_preserve_anchor(layout_controller,monkeypatch,dpi,f
         c.native.bounds=(0,0,width,height+2*gap);c.refresh()
         assert (c.automatic_mode=='icon')==icon
         assert m.compact==reduced and c.anchor==anchor and not c.collapsed
-    c.expanded=True;c.native.bounds=(0,0,round(380*c.appearance.scale*factor)+2*gap,full+2*gap);c.refresh()
+    c.expanded=True;c.native.bounds=(0,0,round(350*c.appearance.scale*factor)+2*gap,full+2*gap);c.refresh()
     assert c.automatic_mode=='detail-inline'

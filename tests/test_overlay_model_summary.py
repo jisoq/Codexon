@@ -152,7 +152,7 @@ def test_long_model_names_are_complete_and_wrapped_in_detail(observed_overlay, t
     top_metrics = QFontMetrics(font(model.appearance.family, 12))
     assert len(model.context_rows()) > 1
     assert all(top_metrics.horizontalAdvance(line) <= 348 for line in model.context_rows())
-    assert model.base_height()==574  # The unpriced-call note adds one row; long model names add none.
+    assert model.base_height()==594  # The unpriced-call note adds one row; long model names add none.
     assert model.layout()['height'] >= model.layout()['status'] + 28
     model.monitor_action('tab-latest')
     assert not any(link['id']=='call-detail' for link in model.monitor_links())

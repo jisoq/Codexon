@@ -3,15 +3,32 @@ import math
 from .charts import dynamic_bounds
 from .overlay_navigation import navigation_target
 
-BODY_LEFT=28
-BODY_WIDTH=336
-METRIC_COLUMNS=(28,140,252)
+WIDTH=350
+MARGIN=12
+RIGHT=WIDTH-MARGIN
+SECTION_WIDTH=WIDTH-2*MARGIN
+BODY_LEFT=MARGIN+8
+BODY_WIDTH=RIGHT-BODY_LEFT
+COLUMN_GAP=16
+COLUMN_WIDTH=(BODY_WIDTH-COLUMN_GAP)/2
+OUTPUT_LEFT=BODY_LEFT+COLUMN_WIDTH+COLUMN_GAP
+METRIC_GAP=12
+METRIC_WIDTH=(BODY_WIDTH-2*METRIC_GAP)/3
+METRIC_COLUMNS=tuple(BODY_LEFT+i*(METRIC_WIDTH+METRIC_GAP) for i in range(3))
+ACTIONS_X=RIGHT-74
+INLINE_CLOSE_X=ACTIONS_X-28
+INLINE_HEADER_WIDTH=INLINE_CLOSE_X-154
+HEADER_X=MARGIN-4
+HEADER_WIDTH=ACTIONS_X-HEADER_X
+TITLE_WIDTH=HEADER_WIDTH-8
+POPUP_X=RIGHT-160
 # Logical coordinates shared by painting, native masks and scroll limits.
 TITLE_Y=16
 TITLE_HEIGHT=24
 SECTION_GAP=12
+GROUP_GAP=16
 SESSION_Y=TITLE_Y+TITLE_HEIGHT+SECTION_GAP
-CARD_Y=SESSION_Y+20+SECTION_GAP
+CARD_Y=SESSION_Y+20+GROUP_GAP
 CARD_HEIGHT=64
 GRAPH_ROW=52
 GRAPH_COUNT=4
@@ -47,7 +64,7 @@ def footer(m, include_call=True):
 
 def geometry(data, reduced=False, has_footer=False):
     data=data or {}
-    composition=CARD_Y+CARD_HEIGHT+SECTION_GAP
+    composition=CARD_Y+CARD_HEIGHT+GROUP_GAP
     bar=composition+22;rows=bar+14
     populations=[data.get(key,{}) for key in ('token_composition','cost_composition')]
     counts={section:max((len(c.get(section+'_parts',[])) for c in populations),default=0)
@@ -58,7 +75,7 @@ def geometry(data, reduced=False, has_footer=False):
     if partial is not None:end=partial+18
     miss=end+8 if miss_text(data) else None
     if miss is not None:end=miss+18
-    divider=end+SECTION_GAP;tab=divider+SECTION_GAP;context=tab+20+SECTION_GAP
+    divider=end+GROUP_GAP;tab=divider+GROUP_GAP;context=tab+20+GROUP_GAP
     content_end=context+GRAPH_ROW*GRAPH_COUNT-8
     full_height=content_end+(8+18 if has_footer else 0)+16
     height=min(432,full_height) if reduced else full_height
@@ -109,7 +126,7 @@ def toggle_segments(m,kind):
     options=(('tokens','개수'),('usd','$')) if kind=='unit' else (('latest','현재'),('history','최근'))
     metrics=QFontMetrics(font(m.appearance.family,11))
     widths=[max(28,metrics.horizontalAdvance(tr(label))+14) for _,label in options]
-    x=364-sum(widths);segments=[]
+    x=RIGHT-sum(widths);segments=[]
     for (key,label),width in zip(options,widths):
         segments.append((x,width,key,label));x+=width
     return segments
@@ -120,39 +137,39 @@ def paint(d,m):
     data=m.data or {};latest=data.get('latest') or {};c=data.get('token_composition',{});g=m.layout()
     from PySide6.QtGui import QFontMetrics
     from .i18n import tr,formatted
-    d.text('세션',16,g['session'],80,20,12,weight=600)
-    count_x=16+QFontMetrics(d.p.font()).horizontalAdvance(tr('세션'))+8
+    d.text('세션',MARGIN,g['session'],80,20,12,weight=600)
+    count_x=MARGIN+QFontMetrics(d.p.font()).horizontalAdvance(tr('세션'))+8
     child=f" (하위 {data['descendants']}개 포함)" if data.get('descendants') else ''
     d.text(f"{data.get('calls',0):,}호출"+child,count_x,g['session'],toggle_segments(m,'unit')[0][0]-8-count_x,20,11,'secondary',elide=True)
     values=(money(data.get('cost')),percent(c.get('cache_hit_rate')),speed(data.get('output_speed_summary',{}).get('value')))
-    d.rect(16,CARD_Y,348,CARD_HEIGHT,'band',8)
+    d.rect(MARGIN,CARD_Y,SECTION_WIDTH,CARD_HEIGHT,'band',8)
     for x,label,value in zip(METRIC_COLUMNS,('비용','캐시 적중률','평균 출력 속도'),values):
-        d.text(label,x,CARD_Y+8,100,18,11,'secondary')
-        d.text(value,x,CARD_Y+30,100,26,20 if x in METRIC_COLUMNS[:2] else 18,color='cached_text' if x==140 else 'ink',weight=600,elide=True)
-    if g['partial'] is not None:d.text(partial_text(data),28,g['partial'],336,18,10,'secondary',elide=True)
-    if g['miss'] is not None:d.text(miss_text(data),28,g['miss'],336,18,11,'secondary',elide=True)
+        d.text(label,x,CARD_Y+8,METRIC_WIDTH,18,11,'secondary')
+        d.text(value,x,CARD_Y+30,METRIC_WIDTH,26,20 if x in METRIC_COLUMNS[:2] else 18,color='cached_text' if x==METRIC_COLUMNS[1] else 'ink',weight=600,elide=True)
+    if g['partial'] is not None:d.text(partial_text(data),BODY_LEFT,g['partial'],BODY_WIDTH,18,10,'secondary',elide=True)
+    if g['miss'] is not None:d.text(miss_text(data),BODY_LEFT,g['miss'],BODY_WIDTH,18,11,'secondary',elide=True)
     currency=m.composition_unit=='usd'
     comp=data.get('cost_composition',{}) if currency else c
     segments=toggle_segments(m,'unit')
-    d.rect(segments[0][0],g['unit'],364-segments[0][0],20,'band',10)
+    d.rect(segments[0][0],g['unit'],RIGHT-segments[0][0],20,'band',10)
     for x,w,key,label in segments:
         if m.composition_unit==key:d.rect(x+1,g['unit']+1,w-2,18,'selection',9)
         d.text(label,x+7,g['unit'],w-7,20,11)
     fmt=money if currency else amount
-    for x,section,title in ((28,'input','입력'),(204,'output','출력')):
+    for x,section,title in ((BODY_LEFT,'input','입력'),(OUTPUT_LEFT,'output','출력')):
         d.text(title,x,g['tokens'],64,18,11,weight=600)
-        d.text(fmt(comp.get(section+'_total')),x+64,g['tokens'],96,18,11,right=True)
-        d.rect(x,g['bar'],160,6,'track',3);offset=0
+        d.text(fmt(comp.get(section+'_total')),x+64,g['tokens'],COLUMN_WIDTH-64,18,11,right=True)
+        d.rect(x,g['bar'],COLUMN_WIDTH,6,'track',3);offset=0
         for i,part in enumerate(comp.get(section+'_parts',[])):
             color=part['key'] if not part['key'].endswith('unknown') else 'unknown'
-            length=160*part['share'];d.rect(x+offset,g['bar'],length,6,color);offset+=length
+            length=COLUMN_WIDTH*part['share'];d.rect(x+offset,g['bar'],length,6,color);offset+=length
             d.rect(x,g['rows']+i*18+5,4,4,color)
-            d.text('미분류' if color=='unknown' else part['label'],x+9,g['rows']+i*18,76,18,11,'secondary')
-            d.text(fmt(part['tokens']) if part.get('known',True) else '—',x+85,g['rows']+i*18,75,18,11,right=True)
-    d.line(16,g['divider'],364,g['divider'],'border',1)
-    d.text('모델 호출',16,g['tab'],160,20,12,weight=600)
+            d.text('미분류' if color=='unknown' else part['label'],x+9,g['rows']+i*18,80,18,11,'secondary')
+            d.text(fmt(part['tokens']) if part.get('known',True) else '—',x+89,g['rows']+i*18,COLUMN_WIDTH-89,18,11,right=True)
+    d.line(MARGIN,g['divider'],RIGHT,g['divider'],'border',1)
+    d.text('모델 호출',MARGIN,g['tab'],160,20,12,weight=600)
     segments=toggle_segments(m,'tab')
-    d.rect(segments[0][0],g['tab'],364-segments[0][0],20,'band',10)
+    d.rect(segments[0][0],g['tab'],RIGHT-segments[0][0],20,'band',10)
     for x,w,key,label in segments:
         if m.monitor_tab==key:d.rect(x+1,g['tab']+1,w-2,18,'selection',9)
         d.text(label,x+7,g['tab'],w-7,20,11)
@@ -165,7 +182,7 @@ def paint(d,m):
         if m.graph_pinned:inspected=None
         for lane,(key,label,fmt) in enumerate((('cost','비용 ($)',money),('cache_rate','캐시 (%)',percent),('output_speed','출력 속도 (tok/s)',lambda n:'—' if n is None else f'{n:.1f}'),('reasoning','추론 (토큰)',amount))):
             y=g['recent']+lane*GRAPH_ROW;low,high=dynamic_bounds(graph_value(r,key) for r in rows)
-            d.text(label,28,y,168,16,10,'secondary');d.text((formatted('{number}번: ',number=inspected.get('ordinal','')) if inspected else '')+fmt(graph_value(displayed,key)),220,y,144,16,11,right=True)
+            d.text(label,BODY_LEFT,y,BODY_WIDTH-144,16,10,'secondary');d.text((formatted('{number}번: ',number=inspected.get('ordinal','')) if inspected else '')+fmt(graph_value(displayed,key)),RIGHT-144,y,144,16,11,right=True)
             previous=None
             for i,row in enumerate(rows):
                 val=graph_value(row,key);x=BODY_LEFT+(i+.5)*step
@@ -181,39 +198,39 @@ def paint(d,m):
         from .ui_details import observed_transport
         model,suffix,mismatch=model_text(latest)
         if mismatch:
-            d.text(model+suffix,28,g['model'],336,20,12,'error',weight=600,elide=True)
+            d.text(model+suffix,BODY_LEFT,g['model'],BODY_WIDTH,20,12,'error',weight=600,elide=True)
         else:
             from .overlay_view import font
             from PySide6.QtCore import Qt
             metrics=QFontMetrics(font(m.appearance.family,12))
             suffix_width=metrics.horizontalAdvance(tr(suffix))
-            visible=metrics.elidedText(model,Qt.ElideRight,max(0,336-suffix_width))
+            visible=metrics.elidedText(model,Qt.ElideRight,max(0,BODY_WIDTH-suffix_width))
             width=metrics.horizontalAdvance(visible)
-            d.text(visible,28,g['model'],width,20,12)
-            d.text(suffix,28+width,g['model'],336-width,20,12,'secondary')
+            d.text(visible,BODY_LEFT,g['model'],width,20,12)
+            d.text(suffix,BODY_LEFT+width,g['model'],BODY_WIDTH-width,20,12,'secondary')
         meta=f"추론 {latest.get('effort','미확인')}    모드 {latest.get('mode','미확인')}    연결 {observed_transport(latest) or '미확인'}"
-        d.text(meta,28,g['meta'],336,20,11,'secondary',elide=True)
+        d.text(meta,BODY_LEFT,g['meta'],BODY_WIDTH,20,11,'secondary',elide=True)
         for x,label,value in zip(METRIC_COLUMNS,('비용','캐시 적중률','출력 속도'),(money(latest.get('cost')),percent(latest.get('cache_rate')),speed(latest.get('output_speed')))):
-            d.text(label,x,g['result'],108,18,11,'secondary',center=True);d.text(value,x,g['result_value'],108,26,18,color='cached_text' if x==140 else 'ink',weight=600,elide=True,center=True)
+            d.text(label,x,g['result'],METRIC_WIDTH,18,11,'secondary',center=True);d.text(value,x,g['result_value'],METRIC_WIDTH,26,18,color='cached_text' if x==METRIC_COLUMNS[1] else 'ink',weight=600,elide=True,center=True)
         duration=latest.get('completion_latency_ms')
-        d.text('소요시간: '+(f'{duration/1000:.2f}초' if duration is not None else '—'),28,g['duration'],336,18,11,center=True)
+        d.text('소요시간: '+(f'{duration/1000:.2f}초' if duration is not None else '—'),BODY_LEFT,g['duration'],BODY_WIDTH,18,11,center=True)
         for x,section,label,part_key,part_label,color in (
-                (28,'input','입력','cached','캐시 읽기','cached'),
-                (204,'output','출력','reasoning','추론','reasoning')):
+                (BODY_LEFT,'input','입력','cached','캐시 읽기','cached'),
+                (OUTPUT_LEFT,'output','출력','reasoning','추론','reasoning')):
             total=latest.get(section);part=latest.get(part_key)
             valid=(type(total) is int and total>0 and type(part) is int and 0<=part<=total
                    and not latest.get(section+'_conflict'))
             d.text(label,x,g['call_tokens'],60,20,11,'secondary')
-            d.text(amount(total),x+60,g['call_tokens'],100,20,14,weight=600,right=True)
-            d.rect(x,g['call_bar'],160,6,'track',2)
+            d.text(amount(total),x+60,g['call_tokens'],COLUMN_WIDTH-60,20,14,weight=600,right=True)
+            d.rect(x,g['call_bar'],COLUMN_WIDTH,6,'track',2)
             if valid:
-                if section=='output':d.rect(x,g['call_bar'],160,6,'output',2)
-                d.rect(x,g['call_bar'],160*part/total,6,color,2)
+                if section=='output':d.rect(x,g['call_bar'],COLUMN_WIDTH,6,'output',2)
+                d.rect(x,g['call_bar'],COLUMN_WIDTH*part/total,6,color,2)
             d.text(part_label,x,g['call_parts'],82,20,10,'secondary')
-            d.text(amount(part),x+82,g['call_parts'],78,20,11,right=True)
+            d.text(amount(part),x+82,g['call_parts'],COLUMN_WIDTH-82,20,11,right=True)
     d.p.restore()
     status,color=footer(m,include_call=m.monitor_tab=='latest')
-    if status:d.text(status,28,g['status'],336,18,11,color,elide=True)
+    if status:d.text(status,BODY_LEFT,g['status'],BODY_WIDTH,18,11,color,elide=True)
 
 
 
@@ -232,12 +249,12 @@ def action_links(m):
     def heading(key,label,y,target,interaction='navigate'):
         if target:
             width=QFontMetrics(font(m.appearance.family,12,600)).horizontalAdvance(tr(label))
-            add(key,28 if key=='collection' else 16,y,width,20,target=target,interaction=interaction,accessible=label)
+            add(key,BODY_LEFT if key=='collection' else MARGIN,y,width,20,target=target,interaction=interaction,accessible=label)
     heading('session','세션',g['session'],navigation_target(data,'session'))
 
     if m.note and ('오류' in m.note or '지연' in m.note):
         heading('collection',m.note,g['status'],navigation_target(data,'collection'))
-    if m.compact:add('scroll',28,g['context'],336,g['body_end']-g['context'],action='scroll',accessible='하단 스크롤 (위아래 방향키)')
+    if m.compact:add('scroll',BODY_LEFT,g['context'],BODY_WIDTH,g['body_end']-g['context'],action='scroll',accessible='하단 스크롤 (위아래 방향키)')
     if m.monitor_tab=='history':
         rows=m.rows()
         for i,row in enumerate(rows):
@@ -259,28 +276,28 @@ def links(m):
     def add(key,x,y,w,h,tip):
         if tip:result.append(dict(id='tip-'+key,x=x,y=y,width=w,height=h,tooltip=tip,accessible=tip,interaction='tooltip'))
     g=m.layout()
-    for x,key in zip(METRIC_COLUMNS,('cost','cache_total','speed_total')):add(key,x,CARD_Y,100,CARD_HEIGHT,TEXT[key])
+    for x,key in zip(METRIC_COLUMNS,('cost','cache_total','speed_total')):add(key,x,CARD_Y,METRIC_WIDTH,CARD_HEIGHT,TEXT[key])
     for item in result:
         if item.get('action') in ('unit-tokens','unit-usd','tab-latest','tab-history'):
             item['tooltip']={'unit-tokens':'토큰 개수로 보기','unit-usd':'토큰 USD로 보기','tab-latest':'마지막 확인 호출','tab-history':'최근 12회 호출'}[item['action']]
     comp=data.get('cost_composition' if m.composition_unit=='usd' else 'token_composition',{})
-    for x,section,title in ((28,'input','입력'),(204,'output','출력')):
-        add(section,x,g['tokens'],160,20,TEXT[title])
+    for x,section,title in ((BODY_LEFT,'input','입력'),(OUTPUT_LEFT,'output','출력')):
+        add(section,x,g['tokens'],COLUMN_WIDTH,20,TEXT[title])
         for i,part in enumerate(comp.get(section+'_parts',[])):
-            add(section+str(i),x,g['rows']+i*18,160,18,TEXT.get(part['label'],''))
-    if g.get('miss') is not None:add('miss',28,g['miss'],336,18,TEXT['miss'])
+            add(section+str(i),x,g['rows']+i*18,COLUMN_WIDTH,18,TEXT.get(part['label'],''))
+    if g.get('miss') is not None:add('miss',BODY_LEFT,g['miss'],BODY_WIDTH,18,TEXT['miss'])
     model_y=None
     if m.monitor_tab=='latest':
         offset=m.lower_offset
         for x,key in zip(METRIC_COLUMNS,('cost','cache','speed')):
             y=g['result']-offset
-            if y>=g['context'] and y+48<=g['body_end']:add('latest-'+key,x,y,108,48,TEXT[key])
+            if y>=g['context'] and y+48<=g['body_end']:add('latest-'+key,x,y,METRIC_WIDTH,48,TEXT[key])
         model_y=g['model']-offset
         y=g['duration']-offset
-        if y>=g['context'] and y+18<=g['body_end']:add('duration',28,y,336,18,TEXT['duration'])
+        if y>=g['context'] and y+18<=g['body_end']:add('duration',BODY_LEFT,y,BODY_WIDTH,18,TEXT['duration'])
     if model_y is not None:
         comparison=model_comparison(row)
         tip='라우팅 의심' if comparison.startswith('모델 불일치') else '' if comparison else '비교 기록 부족 또는 응답 확인 대기'
         if row.get('model_state')=='관측 충돌':tip=''
-        add('model',16,model_y,348,20,tip)
+        add('model',MARGIN,model_y,SECTION_WIDTH,20,tip)
     return result

@@ -1,9 +1,9 @@
-VERSION = '2026.09.30.1'
+VERSION = '2026.10.01.1'
 
 # The independently running proxy changes only when its own implementation or
 # compatibility contract changes. Earlier releases since 2026.09.21.9 contain
 # the same proxy implementation but reported the desktop app version.
-PROXY_VERSION = '2026.09.29.6'
+PROXY_VERSION = '2026.10.01.1'
 _LEGACY_PROXY_MIN = (2026, 9, 21, 9)
 _LEGACY_PROXY_MAX = (2026, 9, 23, 2)
 

@@ -95,7 +95,7 @@ def verify_cleanup(first,second,root):
     assert port!=8768
     (index.parent/'cache-route.json').write_text(json.dumps({'url':f'http://127.0.0.1:{port}'}))
     args=['--codex-home',str(home),'--index-path',str(index),'--evidence-path',str(index.parent/'model-evidence.sqlite'),
-          '--cache-control','--verify-services','--hidden']
+          '--verify-services','--hidden']
     processes=[]
     app=QCoreApplication.instance() or QCoreApplication([])
     try:

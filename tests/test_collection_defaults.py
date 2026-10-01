@@ -63,7 +63,6 @@ def test_conflicting_default_cli_path_fails_before_creating_files(default_home,t
 
 def test_default_migration_preserves_wal_records_and_never_overwrites(default_home):
     from cachemonitor.model_evidence import default_path
-    from cachemonitor.cache_control import control_path
     old=UsageIndex([default_home],legacy_index_location())
     try:
         old.poll(10002)
@@ -74,7 +73,7 @@ def test_default_migration_preserves_wal_records_and_never_overwrites(default_ho
             assert client.poll(10003)['sessions'] and not snapshot['usage_errors']
             assert service.index.path==client.path==index_location()
             assert service.index.model_evidence.path==default_path()
-            assert control_path(service.index.cache_index_path)==default_path().with_name('cache-control.sqlite')
+            assert not default_path().with_name('cache-control.sqlite').exists()
             assert service.index.db.execute("SELECT data FROM metadata WHERE home='retained'").fetchone()==('{}',)
             assert legacy_index_location().exists()
             service.index.db.execute("UPDATE metadata SET data='[]' WHERE home='retained'");service.index.db.commit()

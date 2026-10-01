@@ -93,10 +93,10 @@ def main():
         assert tomllib.loads((home/'config.toml').read_text())=={'model':'synthetic'}
         assert '# untouched personal setting' in (home/'config.toml').read_text()
         assert auth.read_text()=='{"synthetic":"preserve"}'
-        verify_saved_cache_recovery(root/'saved-cache',exe)
+        verify_saved_connection_recovery(root/'saved-connection',exe)
         result=dict(passed=True,independent_executable=True,actual_button_activation=True,
                     activation_event='Tk <<Invoke>>',model_requests=0,
-                    config_restored=True,auth_preserved=True,saved_cache_recovery=True)
+                    config_restored=True,auth_preserved=True,saved_connection_recovery=True)
         (root/'result.json').write_text(json.dumps(result,indent=2))
         print(json.dumps(result))
     finally:
@@ -107,24 +107,20 @@ def main():
         process.wait(timeout=20)
 
 
-def verify_saved_cache_recovery(root,exe):
+def verify_saved_connection_recovery(root,exe):
     """Exercise Start-menu defaults with only the standalone recovery payload."""
     import os
-    from cachemonitor.cache_db import connect
     profile=root/'profile';home=root/'custom home';home.mkdir(parents=True)
     index=root/'analysis'/'index.sqlite';index.parent.mkdir()
     evidence=root/'data'/'model-evidence.sqlite'
     preferences=profile/'.cachemonitor'/'launch.json';preferences.parent.mkdir(parents=True)
-    preferences.write_text(json.dumps(dict(homes=[str(home)],cache_paths=dict(index_path=str(index),
+    preferences.write_text(json.dumps(dict(homes=[str(home)],connection_paths=dict(index_path=str(index),
         evidence_path=str(evidence)))),encoding='utf-8')
     with socket.socket() as sock:sock.bind(('127.0.0.1',0));port=sock.getsockname()[1]
     assert port not in (8768,8771)
     url=f'http://127.0.0.1:{port}'
-    index.with_name('cache-route.json').write_text(json.dumps(dict(url=url)),encoding='utf-8')
     (home/'config.toml').write_text('model="synthetic"\nopenai_base_url="'+url+'"\n',encoding='utf-8')
     auth=home/'auth.json';auth.write_text('{"synthetic":"preserve"}',encoding='utf-8')
-    db=connect(index.with_name('cache-control.sqlite'))
-    db.execute('INSERT INTO cache_operating_grants(id,home,data) VALUES(?,?,?)',('synthetic',str(home),'{}'));db.close()
     env={**os.environ,'USERPROFILE':str(profile),'CODEX_HOME':str(home)}
     report=root/'result.json'
     for action in ('--status','--restore'):
@@ -134,8 +130,8 @@ def verify_saved_cache_recovery(root,exe):
         assert state['code']==('refused' if action=='--status' else 'restored'),state
     assert tomllib.loads((home/'config.toml').read_text(encoding='utf-8'))==dict(model='synthetic')
     assert auth.read_text(encoding='utf-8')=='{"synthetic":"preserve"}'
-    db=connect(index.with_name('cache-control.sqlite'))
-    assert db.execute('SELECT stopped FROM cache_operating_grants').fetchone()==('revoked',);db.close()
+    assert not index.with_name('cache-control.sqlite').exists()
+
 
 
 if __name__=='__main__':main()

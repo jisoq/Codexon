@@ -54,7 +54,7 @@ class Manager:
             status='ok',draining=self.draining,active_connections=self.connections)
 
 
-@pytest.fixture(params=[False,True],ids=['observer','cache-worker'])
+@pytest.fixture(params=[False],ids=['observer'])
 def setup(tmp_path,monkeypatch,request):
     m=Manager(tmp_path,request.param);now=[0.]
     target=Target(m);target.cache=request.param

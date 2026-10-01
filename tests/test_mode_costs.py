@@ -24,12 +24,14 @@ def history():
 
 
 def test_fixed_fast_rates_thresholds_and_unknown_is_never_base_cost():
-    for model in ('gpt-6-astra','gpt-6.1-sol','gpt-5.6-sol','gpt-5.6-terra','gpt-5.6-luna','gpt-5.4-mini'):
+    for model in ('gpt-6-astra','gpt-6.1-sol','gpt-6-sol','gpt-6-luna','gpt-5.5','gpt-5.6-sol','gpt-5.6-terra','gpt-5.6-luna','gpt-5.4-mini'):
         for inp in (100000,272001):
             base={**usage(model=model),'input':inp}
             standard=token_cost(base);fast=token_cost(dict(base,service_tier='Fast'))
-            assert fast['cost']==pytest.approx(2*standard['cost'])
+            assert fast['cost']==pytest.approx(2.5*standard['cost'])
             assert sum(fast[k] for k in COST_COMPONENTS)==pytest.approx(fast['cost'])
+            for component in COST_COMPONENTS:
+                assert fast[component]==pytest.approx(2.5*standard[component])
         unknown=usage('미확인',model)
         assert token_cost(unknown)['cost'] is None and not token_cost(unknown)['price_assumed']
         assumptions=mode_assumptions([unknown])
@@ -45,7 +47,7 @@ def test_fixed_fast_rates_thresholds_and_unknown_is_never_base_cost():
 def test_modes_and_mixed_request_keep_exact_metric_denominators():
     a=analyze([history()]);overview=overview_view(a,1000000,1000010)
     assert (overview['call_stats']['n'],overview['call_stats']['missing'])==(5,1)
-    assert overview['total']==pytest.approx(2.835)
+    assert overview['total']==pytest.approx(3.24)
     assert overview['turn_stats']['n']==3 and overview['completed']==4
     standard=analyze([history()],service_tier='Standard')
     unknown=analyze([history()],service_tier='미확인')
@@ -64,7 +66,7 @@ def test_price_corrections_invalidate_worker_and_ledger_without_reclassifying_un
         changed=copy.deepcopy(source);changed['history'][0]['service_tier']='Fast';engine.ingest([changed])
         ledger.sync(engine,dict(snap,sessions=[changed]))
         assert engine.metrics['priced_calls']==before+1
-        assert ledger.db.execute("select cost from calls where uid='0'").fetchone()[0]==pytest.approx(.81)
+        assert ledger.db.execute("select cost from calls where uid='0'").fetchone()[0]==pytest.approx(1.0125)
         assert ledger.db.execute("select cost from calls where uid='5'").fetchone()[0] is None
         q=dict(page=0,start=1000000,end=1000010,service_tier='Standard')
         result=engine.query(q)
@@ -78,8 +80,35 @@ def test_unknown_price_migration_retains_original_mode_and_excludes_base_amount(
     source=history();engine=AnalysisEngine();engine.ingest([source]);path=tmp_path/'ledger.sqlite'
     ledger=QuotaLedger(path);ledger.sync(engine,dict(homes=['h'],sessions=[source],ts=1000010,index={'loading':False}))
     ledger.db.execute("update calls set cost=.405,price_id='old-standard-assumption' where uid='5'")
+    ledger.db.execute("update calls set cost=.81,price_id='old-fast-2x' where uid='2'")
     ledger.db.commit();ledger.close();restored=QuotaLedger(path)
     try:
         row=restored.db.execute("select cost,service_tier,price_id from calls where uid='5'").fetchone()
         assert row['cost'] is None and row['service_tier']=='미확인' and row['price_id']==PRICE_ID
+        fast=restored.db.execute("select * from calls where uid='2'").fetchone()
+        assert fast['cost']==pytest.approx(1.0125) and fast['service_tier']=='Fast'
+        assert (fast['input'],fast['cached'],fast['written'],fast['output'])==(100000,80000,10000,2000)
+        assert restored.db.execute("select cost from cost_archive where uid='2' and price_id='old-fast-2x'").fetchone()[0]==.81
+        restored.close();restored=QuotaLedger(path)
+        assert restored.db.execute("select count(*) from cost_archive where uid='2'").fetchone()[0]==1
     finally:restored.close()
+
+
+def test_imported_usage_reprices_without_recreating_retired_permissions(tmp_path):
+    import json
+    import sqlite3
+    from contextlib import closing
+    from cachemonitor.usage_archive import sessions
+    path=tmp_path/'index.sqlite'
+    tokens=dict(input=100000,cached=80000,written=10000,output=2000,reasoning=1000)
+    record=dict(tokens,home='fixture',sid='session',ts=2,request_start=1,request_end=2,
+        model='gpt-6-astra',effort='high',service_tier='priority',state='completed',purpose='maintenance')
+    with closing(sqlite3.connect(path)) as db,db:
+        db.execute('CREATE TABLE usage_archive(home TEXT,response_id TEXT,data TEXT,PRIMARY KEY(home,response_id))')
+        db.execute('INSERT INTO usage_archive VALUES(?,?,?)',('fixture','response',json.dumps(record)))
+    for _ in range(2):
+        with closing(sqlite3.connect(path)) as db:
+            history=sessions(db,10,{'fixture'})[0]['history']
+            assert len(history)==1 and history[0]['key']=='response'
+            assert token_cost(history[0])['cost']==pytest.approx(1.0125)
+    assert not path.with_name('cache-control.sqlite').exists()

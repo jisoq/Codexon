@@ -151,7 +151,7 @@ def estimate(cost, delta, n, blocked=()):
     if not math.isfinite(delta) or delta <= 0:
         reasons.append('소모율 변화 없음: 다음 관측 대기')
     if cost is None or not math.isfinite(cost) or cost < 0:
-        reasons.append('API 환산액 미확인')
+        reasons.append('구독 가치 환산액 미확인')
     if not 0 <= n <= 100:
         reasons.append('n은 0~100 범위여야 합니다')
     if reasons:
@@ -292,7 +292,7 @@ def quota_statistics(report, start=None, end=None, include_mode_assumptions=Fals
             result['reasons'] = []
         waiting = cycle.get('pending') or cycle.get('reset_pending') or any('수집' in r and '대기' in r for r in blockers)
         insufficient = (cycle['delta'] == 0 and all(
-            '소모율 변화' in r or r in ('대응하는 모델 호출 없음','API 환산액 미확인')
+            '소모율 변화' in r or r in ('대응하는 모델 호출 없음','구독 가치 환산액 미확인')
             for r in result['reasons']))
         assumption_blockers = [r for r in blockers if not r.startswith('요청 모드 미확인')]
         assumption = estimate(cycle.get('mode_standard_cost'),cycle['delta'],1,assumption_blockers)

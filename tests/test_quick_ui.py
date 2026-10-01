@@ -67,7 +67,7 @@ def test_reasoning_tokens_render_independently_of_cost_and_request_unit(tmp_path
     for i,(effort,tokens) in enumerate((('low',0),('low',None),('high',4000),('high',8000))):
         usage={'input_tokens':5000,'cached_input_tokens':0,'output_tokens':9000}
         if tokens is not None:usage['reasoning_output_tokens']=tokens
-        session.add_usage(now-10+i,str(i),usage,'unpriced-model','open',effort,service_tier='Standard')
+        session.add_usage(now-10+i,str(i),usage,'gpt-6-astra','open',effort,service_tier='Standard')
     host=None
     try:
         window.receive({'ts':now,'sessions':[session.view(now)],'homes':[],'errors':[],'unassigned':[]})

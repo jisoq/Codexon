@@ -1,8 +1,9 @@
 import copy
+import sys
 
 import pytest
 from PySide6.QtCore import QSettings
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QWidget
 
 from cachemonitor.analysis_engine import AnalysisEngine
 from cachemonitor.core import Session
@@ -17,26 +18,27 @@ B = '22222222-2222-2222-2222-222222222222'
 
 
 @pytest.mark.parametrize('version', ['26.915.100.0', '26.917.6896.0', '26.918.1.0', '27.0.0.0'])
-def test_new_desktop_releases_require_live_route_evidence(tmp_path, version, monkeypatch):
+@pytest.mark.parametrize('prefix,namespace', [('/local/', ''), ('/c/', ''), ('/c/local-chatgpt%3A', 'local-chatgpt:')])
+def test_new_desktop_releases_require_live_route_evidence(tmp_path, version, monkeypatch, prefix, namespace):
     target = dict(hwnd=1, pid=42, version=version)
     reader = RouteLog(tmp_path)
     assert observe_selection([target], reader, 0)['selection'] is None
     path = logfile(tmp_path)
-    path.write_text(route(A), encoding='utf-8')
-    assert observe_selection([target], reader, 3)['selection'].thread_id == A
+    path.write_text(route(A, prefix=prefix), encoding='utf-8')
+    assert observe_selection([target], reader, 3)['selection'].thread_id == namespace+A
     # Navigation applies the same evidence rule, without a release allowlist.
     native = WindowsOverlay.__new__(WindowsOverlay)
     native.targets = lambda: [target]
     native._navigation_log = reader
     monkeypatch.setenv('LOCALAPPDATA', str(tmp_path))
-    assert native.confirm_selection(target).thread_id == A
+    assert native.confirm_selection(target).thread_id == namespace+A
     with path.open('a', encoding='utf-8') as stream:
-        stream.write(route(B).rstrip('\n'))
+        stream.write(route(B, prefix=prefix).rstrip('\n'))
     assert observe_selection([target], reader, 4)['selection'] is None
     assert native.confirm_selection(target) is None
     with path.open('a', encoding='utf-8') as stream:
         stream.write('\n')
-    assert native.confirm_selection(target).thread_id == B
+    assert native.confirm_selection(target).thread_id == namespace+B
 
 
 def test_route_compatibility_never_reuses_another_process_or_ambiguous_window(tmp_path, monkeypatch):
@@ -110,15 +112,85 @@ def test_summary_reuses_cache_and_updates_price_corrections_and_title():
     assert new['cost'] > old['cost']
 
 
-def route(tid=A, window='1', suffix=''):
+def route(tid=A, window='1', suffix='', *, prefix='/local/'):
     return (f'2026-09-19T01:00:00Z info IAB_LIFECYCLE received browser sidebar owner sync '
-            f'windowId={window} ownerRoutePath=/local/{tid}{suffix}\n')
+            f'windowId={window} ownerRoutePath={prefix}{tid}{suffix}\n')
 
 
 def logfile(tmp_path, pid=42, suffix='0'):
     path = tmp_path / '2026/09/19' / f'codex-desktop-example-{pid}-t0-i1-{suffix}.log'
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
+
+
+@pytest.mark.parametrize('prefix,namespace', [('/local/', ''), ('/c/', ''), ('/c/local-chatgpt%3A', 'local-chatgpt:')])
+def test_route_activity_and_host_preserve_conversation_identity(tmp_path, prefix, namespace):
+    path = logfile(tmp_path)
+    raw = route(A, suffix='?hostId=remote%3Atest', prefix=prefix)
+    path.write_text(raw, encoding='utf-8')
+    reader = RouteLog(tmp_path)
+    selected = reader.poll(42, 0)
+    assert selected == Selection(namespace+A, 'remote:test', '1', raw.split('ownerRoutePath=')[1].strip())
+    for tid, active, expected in ((B, 'false', selected), (namespace+A, 'false', None),
+                                  (namespace+A, 'true', selected)):
+        with path.open('a', encoding='utf-8') as stream:
+            stream.write(f'info thread_stream_view_activity_changed active={active} conversationId={tid} rendererWindowId=1\n')
+        assert reader.poll(42, .1) == expected
+
+
+@pytest.mark.parametrize('invalid_path', ['/c/not-a-uuid', f'/c/{A}/extra', f'/c/{A}/',
+                                         '/c/local-chatgpt%3Anot-a-uuid', f'/c/local-chatgpt%3A{A}%2Fextra',
+                                         f'/unknown/{A}', f'/local/local-chatgpt:{A}'])
+def test_unknown_route_clears_work_selection(tmp_path, invalid_path):
+    path = logfile(tmp_path)
+    path.write_text(route(A, prefix='/c/'), encoding='utf-8')
+    reader = RouteLog(tmp_path)
+    assert reader.poll(42, 0).thread_id == A
+    with path.open('a', encoding='utf-8') as stream:
+        stream.write(route('', prefix=invalid_path))
+    assert reader.poll(42, .1).thread_id is None
+
+
+@pytest.mark.skipif(sys.platform != 'win32', reason='Owned native Windows windows')
+def test_work_routes_render_matching_records_and_missing_record_notice(tmp_path):
+    from PySide6.QtTest import QTest
+
+    app = QApplication.instance() or QApplication([])
+    host = QWidget()
+    host.resize(1100, 1000)
+    host.show()
+    controller = OverlayController(QSettings(str(tmp_path/'work-overlay.ini'), QSettings.IniFormat),
+                                   native_enabled=False, appearance_path=tmp_path/'codex.toml')
+    native = WindowsOverlay()
+    controller.native = native
+    # Visibility belongs to this test window, independent of desktop focus.
+    native.visible_target = lambda hwnd: bool(native.u.IsWindowVisible(hwnd))
+    reader = RouteLog(tmp_path)
+    path = logfile(tmp_path)
+    engine = AnalysisEngine()
+    engine.ingest([source()])
+    controller.receive_snapshot({'overlay_sessions': OverlaySummaries().collect(engine)})
+    try:
+        for index, (prefix, tid, expected) in enumerate((('/c/', A, A), ('/c/', B, None),
+                                                       ('/c/local-chatgpt%3A', A, None), ('/local/', A, A))):
+            with path.open('a', encoding='utf-8') as stream:
+                stream.write(route(tid, prefix=prefix))
+            controller.receive_target({'target': {'hwnd': int(host.winId())},
+                                       'selection': reader.poll(42, index)})
+            QTest.qWait(100)
+            assert controller.widget.isVisible()
+            assert (controller.widget.data or {}).get('id') == expected
+            assert controller.widget.note == ('' if expected else '호출 기록 없음')
+            assert not controller.widget.qml_errors
+            assert controller.widget.grab().save(str(tmp_path/f'work-route-{index}.png'))
+        with path.open('a', encoding='utf-8') as stream:
+            stream.write(route(A, prefix='/unknown/'))
+        controller.receive_target({'target': {'hwnd': int(host.winId())}, 'selection': reader.poll(42, 4)})
+        assert not controller.widget.isVisible()
+    finally:
+        controller.stop()
+        host.close()
+        app.processEvents()
 
 
 def test_process_restart_log_rotation_and_multiple_windows_never_reuse_old_selection(tmp_path):

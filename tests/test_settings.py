@@ -36,13 +36,15 @@ def test_search_navigation_and_preserved_preferences(tmp_path,monkeypatch,langua
         assert page.result_body.count()==1 and page.result_body.nodes[0].kind=='text'
         control(window,page.search).forceActiveFocus();QTest.keyClick(window.quick,Qt.Key_Escape)
         assert page.search.text()=='' and page.stack.currentIndex()==4
-        page.search.setText('CACHE refresh');assert page.result_body.count()==1
+        page.search.setText('CACHE refresh');assert page.result_body.count()==1 and page.result_body.nodes[0].kind=='text'
         page.reveal('notifications');window.notification_master.setChecked(False)
         assert all(not option.isEnabled() for option in window.notification_options.values())
         values=[option.isChecked() for option in window.notification_options.values()]
         window.notification_master.setChecked(True)
         assert values==[option.isChecked() for option in window.notification_options.values()]
-        assert not window.cache_shortcut.isEnabled()
+        assert not hasattr(window,'cache_panel')
+        assert not hasattr(window,'cache_master')
+        assert window.nav.count()==4
         calls=[];monkeypatch.setattr('cachemonitor.update_panel.open_recovery',lambda *args:calls.append(args))
         page.reveal('troubleshooting');click(window,render_plot(window,window.recovery_button));assert len(calls)==1
         page.search.setText('cache');page.navigation.choose(page.navigation.currentRow())

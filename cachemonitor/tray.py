@@ -213,7 +213,6 @@ class TrayWindow(QuickHost):
         panel=getattr(self,'observer_panel',None)
         if panel:
             panel.active=False;panel.pending=None;panel.manager.cancelled.set()
-        if getattr(self,'cache_panel',None):self.cache_panel.stop()
         if getattr(self,'overlay',None):self.overlay.stop()
         for service in getattr(self,'quota_services',{}).values(): service.stop()
         self.tick.stop()
