@@ -197,7 +197,7 @@ class Dashboard(TrayWindow):
         self.health=label('','muted',True);self.health.hide()
         self.setup_tray();self.settings_page.bind_tray(self);self.tray.messageClicked.connect(self.open_notification_details)
         self.tick=QTimer(self);self.tick.timeout.connect(self.check_stale);self.tick.start(1000)
-        self.nav.currentRowChanged.connect(lambda row:self.change_page(5 if row==4 else row) if row>=0 else None)
+        self.nav.currentRowChanged.connect(lambda row:self.change_page(row) if row>=0 else None)
         for node in (self.home,self.period,self.project,self.source,self.model,self.effort,self.mode):node.currentIndexChanged.connect(self.filter_changed)
         for node in (self.date_start,self.date_end):node.dateChanged.connect(self.filter_changed)
         self.archive.toggled.connect(self.filter_changed)

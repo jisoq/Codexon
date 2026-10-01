@@ -217,6 +217,8 @@ def main():
             from .observer_state import read_json
             report=read_json(args.verify_handoff)
             report['services']=result
+            if result.get('error'):
+                report['service_errors']=[*report.get('service_errors',[]),result['error']][-8:]
             atomic_write(args.verify_handoff,json.dumps(report).encode())
         window.service_controller.result.connect(record_services)
         QTimer.singleShot(250,lambda:atomic_write(args.verify_handoff,json.dumps(dict(

@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 import sqlite3
 import time
-from contextlib import closing
+from contextlib import closing,contextmanager,nullcontext
 from urllib.parse import urlsplit
 
 from .observer_control import atomic_write
@@ -17,6 +17,38 @@ MARKER='codexon-cache-control'
 
 
 def legacy_command(command):return any(flag in command for flag in FLAGS)
+
+
+@contextmanager
+def exit_monitor(saved):
+    """Hold the owned process handle so its real exit code survives teardown."""
+    import ctypes
+    from ctypes import wintypes as W
+    api=ctypes.WinDLL('kernel32',use_last_error=True)
+    api.OpenProcess.argtypes=[W.DWORD,W.BOOL,W.DWORD];api.OpenProcess.restype=W.HANDLE
+    api.GetExitCodeProcess.argtypes=[W.HANDLE,ctypes.POINTER(W.DWORD)]
+    api.CloseHandle.argtypes=[W.HANDLE]
+    handle=api.OpenProcess(0x1000,False,saved['pid'])
+    if not handle:raise OSError('Legacy exit ownership unavailable')
+    try:
+        if not identity.same_process(saved):raise RuntimeError('Legacy process changed before shutdown')
+        def code():
+            value=W.DWORD()
+            if not api.GetExitCodeProcess(handle,ctypes.byref(value)):raise OSError('Legacy exit result unavailable')
+            return value.value
+        yield code
+    finally:api.CloseHandle(handle)
+
+
+def verify_legacy_settlement(database,exit_code):
+    """Receipt-free releases must exit cleanly with no unsettled send intent."""
+    if exit_code!=0:raise RuntimeError('Legacy worker did not exit cleanly; records preserved')
+    if not database.is_file():raise RuntimeError('Legacy usage settlement unavailable')
+    with closing(sqlite3.connect(database.resolve().as_uri()+'?mode=ro',uri=True)) as db:
+        db.execute('PRAGMA query_only=ON')
+        if db.execute('PRAGMA quick_check').fetchall()!=[('ok',)]:raise RuntimeError('Legacy usage integrity unconfirmed')
+        if db.execute("SELECT 1 FROM cache_jobs WHERE state IN ('reserved','sent') LIMIT 1").fetchone():
+            raise RuntimeError('Legacy send settlement incomplete; records preserved')
 
 
 def select_route(manager,index=None):
@@ -173,13 +205,17 @@ def retire(manager,*,restore_only=False,clock=time.monotonic,sleep=time.sleep):
             control=health.get('control_id','')
             import re
             if not re.fullmatch('[0-9a-f]{32}',control):raise RuntimeError('Retired worker lacks safe shutdown')
-            atomic_write(manager.directory/('proxy-control-'+control+'.json'),json.dumps(dict(id=control,action='drain')).encode())
-            deadline=clock()+30
-            while identity.same_process(old) or not identity.port_free(manager.url):
-                if clock()>=deadline:raise RuntimeError('Retired response settlement incomplete; connection preserved')
-                sleep(.2)
-            final=read_json(manager.directory/('proxy-control-'+control+'.json'))
-            if final.get('action')!='stopped' or not final.get('storage_flushed'):raise RuntimeError('Retired usage flush unconfirmed')
+            receipt_required=health.get('storage_flush_receipt',health.get('lifecycle_revision',0)>=2)
+            with nullcontext(None) if receipt_required else exit_monitor(old) as exit_code:
+                atomic_write(manager.directory/('proxy-control-'+control+'.json'),json.dumps(dict(id=control,action='drain')).encode())
+                deadline=clock()+30
+                while identity.same_process(old) or not identity.port_free(manager.url):
+                    if clock()>=deadline:raise RuntimeError('Retired response settlement incomplete; connection preserved')
+                    sleep(.2)
+                if receipt_required:
+                    final=read_json(manager.directory/('proxy-control-'+control+'.json'))
+                    if final.get('action')!='stopped' or not final.get('storage_flushed'):raise RuntimeError('Retired usage flush unconfirmed')
+                else:verify_legacy_settlement(database,exit_code())
         deadline=clock()+30
         while task.inspect().get('running') or not identity.locks_free([storage/'cache-worker.lock']):
             if clock()>=deadline:raise RuntimeError('Retired task or storage settlement incomplete')

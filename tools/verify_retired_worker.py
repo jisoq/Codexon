@@ -59,7 +59,8 @@ def verify(root,old,new,role):
             after=wait(lambda:manager.health(timeout=1),lambda v:bool(v and v.get('version')==PROXY_VERSION and
                 v.get('lifecycle')=='managed' and v.get('instance')!=before['instance'] and not v.get('cache_management')))
         except RuntimeError as exc:
-            raise RuntimeError(str(exc)+': '+json.dumps(read_json(report).get('services',{}),ensure_ascii=True)) from exc
+            state=read_json(report)
+            raise RuntimeError(str(exc)+': '+json.dumps(dict(services=state.get('services',{}),errors=state.get('service_errors',[])),ensure_ascii=True)) from exc
         wait(lambda:database.exists(),lambda exists:not exists)
         assert manager.config()[1]['openai_base_url']==manager.url
         assert not task.inspect().get('registered')
