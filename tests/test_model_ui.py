@@ -3,7 +3,7 @@ from pathlib import Path
 import time
 
 from PySide6.QtCore import QSettings
-from PySide6.QtTest import QTest
+from PySide6.QtTest import QTest,QSignalSpy
 from PySide6.QtWidgets import QApplication
 
 from cachemonitor.dashboard import Dashboard, STYLE
@@ -60,7 +60,9 @@ def test_model_columns_counts_filter_and_refresh(tmp_path):
         assert [r['key'] for r in window.record_rows]==['r1']
         window.receive(snapshot)
         assert window.selected_call=='r1' and window.exact_record['key']=='r1'
-        window.search.setText('no such session');QTest.qWait(150)
+        search_complete=QSignalSpy(window.search_timer.timeout)
+        window.search.setText('no such session')
+        assert search_complete.count() or search_complete.wait(1000)
         assert window.table.rowCount()==0 and window.selected_call=='r1'
         assert '현재 조건에서 제외' in window.record_message.text()
         window.search.clear();window.call_filter_controls['model_mismatch'].setChecked(False)
