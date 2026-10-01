@@ -27,9 +27,6 @@ def test_internal_review_is_separate_from_work_models_rollups_and_delivery(tmp_p
     worker=copy.deepcopy(parent)
     worker.update(id='worker',source='subagent',parent_thread_id=parent['id'])
     worker['history'][0].update(key='worker-response',call_id='worker-response',written=None)
-    from cachemonitor.cache_integration import enrich
-    cache=enrich([parent,review,worker],tmp_path/'index.sqlite',110)
-    assert cache['delegation']['calls']==1
     engine=AnalysisEngine();overlays=OverlaySummaries()
     engine.ingest([parent,review,worker])
     assert len(engine.internal_sessions)==1

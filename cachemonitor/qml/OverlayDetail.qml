@@ -7,6 +7,7 @@ Rectangle {
     required property var presentation
     property var s: presentation.state
     property real unitScale: s.overlayScale || 1
+    property real bodyMargin: (s.detailWidth || 208) > 208 ? 12 : 16
     property string selectedCall: s.detailSelected || ""
     onSelectedCallChanged: if (bodyScroll) bodyScroll.contentY = 0
     color: appTheme.palette.hit_surface
@@ -16,7 +17,7 @@ Rectangle {
     Button {
         id: openDashboard
         objectName: "openDashboard"
-        x: 16 * root.unitScale; y: 12 * root.unitScale
+        x: root.bodyMargin * root.unitScale; y: 12 * root.unitScale
         width: implicitWidth; height: 28 * root.unitScale
         enabled: root.s.detailHasSelection || false
         text: appLanguage.text("호출 상세")
@@ -38,7 +39,7 @@ Rectangle {
     ToolButton {
         id: closeDetail
         objectName: "closeDetail"
-        x: ((root.s.detailWidth || 208) > 208 ? 290 : 204) * root.unitScale
+        x: ((root.s.detailWidth || 208) > 208 ? root.s.detailCloseX : 204) * root.unitScale
         y: 12 * root.unitScale; width: 24 * root.unitScale; height: 28 * root.unitScale
         text: "×"
         contentItem: Text {
@@ -59,13 +60,13 @@ Rectangle {
         id: graph
         visible: false
         objectName: "detailGraph"
-        x: 16 * root.unitScale; y: 52 * root.unitScale
+        x: root.bodyMargin * root.unitScale; y: 52 * root.unitScale
         width: (root.s.detailWidth || 208) * root.unitScale; height: 152 * root.unitScale
         source: root.presentation.detailGraph
         activeFocusOnTab: false
 
         Accessible.role: Accessible.Chart
-        Accessible.name: appLanguage.text("최근 24호출 캐시율과 API 환산 비용")
+        Accessible.name: appLanguage.text("최근 24호출 캐시율과 구독 가치 환산액")
 
 
         MouseArea {
@@ -81,7 +82,7 @@ Rectangle {
     Flickable {
         id: bodyScroll
         objectName: "detailScroll"
-        x: 16 * root.unitScale; y: 52 * root.unitScale
+        x: root.bodyMargin * root.unitScale; y: 52 * root.unitScale
         width: (root.s.detailWidth || 208) * root.unitScale
         height: Math.max(0, parent.height - y - 16 * root.unitScale)
         clip: true; boundsBehavior: Flickable.StopAtBounds
@@ -104,7 +105,7 @@ Rectangle {
         ScrollBar.vertical: ScrollBar {
             objectName: "detailScrollBar"
             parent: root
-            x: bodyScroll.x + bodyScroll.width + 6 * root.unitScale
+            x: bodyScroll.x + bodyScroll.width + ((root.s.detailWidth || 208) > 208 ? 2 : 6) * root.unitScale
             y: bodyScroll.y; height: bodyScroll.height
             width: 4 * root.unitScale; policy: ScrollBar.AsNeeded
             onPressedChanged: if (pressed) {

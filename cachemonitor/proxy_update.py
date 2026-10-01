@@ -78,7 +78,7 @@ class ProxyUpdate:
         # Recheck the user's off/cancel action while holding the same control lock.
         with ProcessLock(self.manager.control_lock,timeout=5):
             self.allowed()
-            if not self.target.cache and source.get('state_phase'):
+            if source.get('state_phase'):
                 state=self.manager.state()
                 if state.get('replacement_instance')==source['instance']:
                     state['phase']=source['state_phase'];state.pop('replacement_instance',None)
@@ -218,15 +218,7 @@ def main():
     parser.add_argument('--evidence-path',type=Path,required=True)
     parser.add_argument('--upstream')
     parser.add_argument('--port',type=int,default=8768)
-    parser.add_argument('--cache-worker',action='store_true')
-    parser.add_argument('--cache-observe-only',action='store_true')
-    parser.add_argument('--observation-index',type=Path)
     args=parser.parse_args()
-    if args.cache_worker or args.cache_observe_only:
-        if not args.observation_index:parser.error('Cache worker index required')
-        from .cache_worker_control import CacheWorkerManager
-        manager=CacheWorkerManager(args.codex_home,args.observation_index,args.evidence_path)
-        if manager.url!=f'http://127.0.0.1:{args.port}':raise RuntimeError('캐시 경로 주소와 교체 주소가 다릅니다.')
-    else:manager=ObserverManager(args.codex_home,args.evidence_path.parent,url=f'http://127.0.0.1:{args.port}')
+    manager=ObserverManager(args.codex_home,args.evidence_path.parent,url=f'http://127.0.0.1:{args.port}')
     ProxyUpdate(manager).run()
     return 0

@@ -36,15 +36,15 @@ def save_homes(homes, *, path=None):
     atomic_write(path, json.dumps(document, ensure_ascii=False).encode())
 
 
-def cache_paths(*,path=None):
-    saved=preferences(path).get('cache_paths',{})
+def connection_paths(*,path=None):
+    saved=preferences(path).get('connection_paths',preferences(path).get('cache_paths',{}))
     return {key:value for key,value in saved.items() if key in ('index_path','evidence_path','quota_path')
             and isinstance(value,str) and Path(value).is_absolute()} if isinstance(saved,dict) else {}
 
 
-def save_cache_paths(index_path,evidence_path,quota_path,*,path=None):
+def save_connection_paths(index_path,evidence_path,quota_path,*,path=None):
     document=preferences(path);path=Path(path or preference_path())
-    document['cache_paths']={key:str(Path(value).resolve()) for key,value in
+    document['connection_paths']={key:str(Path(value).resolve()) for key,value in
         (('index_path',index_path),('evidence_path',evidence_path),('quota_path',quota_path)) if value}
     path.parent.mkdir(parents=True,exist_ok=True)
     atomic_write(path,json.dumps(document,ensure_ascii=False).encode())

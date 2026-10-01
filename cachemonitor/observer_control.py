@@ -431,7 +431,7 @@ class ObserverManager:
                 raise RuntimeError('실행 중인 프록시가 없습니다.')
             if not getattr(sys,'frozen',False):
                 raise RuntimeError('업데이트는 설치된 배포 앱에서 실행하세요.')
-            command=self.command(self.upstream() if getattr(self,'shared_cache_worker',False) else self.state().get('upstream') or self.upstream())
+            command=self.command(self.state().get('upstream') or self.upstream())
             command[command.index('--model-proxy')]='--proxy-update'
             if not recovering:
                 atomic_write(updater.path,b'{}')
@@ -481,6 +481,7 @@ class ObserverManager:
             if health.get('lifecycle')=='managed':
                 self.task.configure(self.supervisor_command(upstream),autostart=False)
             return self.status()
+        if self.health_state!='refused':return self.status()
         self.task.start(self.supervisor_command(upstream),autostart=False)
         for _ in range(80):
             if self.cancelled.is_set():break

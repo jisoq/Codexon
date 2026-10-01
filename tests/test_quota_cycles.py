@@ -118,7 +118,7 @@ def test_mode_change_preserves_price_snapshot_and_ambiguous_gap_is_excluded(tmp_
         ledger.db.commit()
         sync(ledger,[row(service_tier='Fast'),row('gap',250)],revision=2)
         stored=ledger.db.execute("select cost,price_id,service_tier from calls where uid='r1'").fetchone()
-        assert stored['cost']==pytest.approx(1.89) and stored['service_tier']=='Fast'
+        assert stored['cost']==pytest.approx(2.3625) and stored['service_tier']=='Fast'
         assert ledger.db.execute("select cost from cost_archive where price_id='old-rates'").fetchone()[0]==42
         ledger.observe('h',quota(300,0,2000))
         older=ledger.report('h',350)['cycles'][1]

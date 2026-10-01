@@ -145,7 +145,9 @@ def test_passive_metrics_and_inline_header_regions(layout_controller):
     assert named_item(c.actions.quick.rootObject(),'expand') is not None
     c.expanded=True;c.native.bounds=(0,0,550,1000);c.refresh()
     if m.detail_inline:
-        assert c.header.width()==round(134*m.appearance.scale)
+        assert c.header.width()==round(82*m.appearance.scale)
+        close=named_item(c.detail.quick.rootObject(),'closeDetail')
+        assert close.x()+close.width() < c.actions_geometry[0]-c.monitor_geometry[0]
     assert named_item(c.detail.quick.rootObject(),'closeDetail') is not None
     assert not any(control.qml_errors for control in c.chrome)
 

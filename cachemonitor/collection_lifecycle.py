@@ -55,7 +55,7 @@ def migrate_default_index(channel):
     try:
         with closing(sqlite3.connect(source.as_uri()+'?mode=ro',uri=True)) as old:
             tables={row[0] for row in old.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-            if tables!={'files','events','metadata'}:
+            if not {'files','events','metadata'}.issubset(tables) or tables-{'files','events','metadata','usage_archive'}:
                 raise RuntimeError('이전 사용량 색인의 형식을 확인하지 못했습니다. 원본을 보존합니다.')
             with closing(sqlite3.connect(temporary)) as new:
                 old.backup(new)

@@ -86,5 +86,5 @@ def test_repricing_keeps_target_identity_baseline_and_excluded_intersection_coun
     assert fast['id']=='D' and standard['id']=='G' and fast['baseline'] and not standard['baseline']
     assert (fast['n'],fast['N'],fast['missing'])==(2,3,1)
     assert (standard['n'],standard['N'],standard['missing'])==(2,3,1)
-    assert fast['delta']==0 and standard['delta']==pytest.approx(-standard['value'])
-    assert standard['relative']==pytest.approx(-50)
+    assert fast['delta']==0 and standard['delta']==pytest.approx(-1.5*standard['value'])
+    assert standard['relative']==pytest.approx(-60)

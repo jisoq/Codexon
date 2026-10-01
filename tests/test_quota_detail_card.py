@@ -78,7 +78,7 @@ def test_four_matching_axes_detail_pin_escape_and_gap_card(tmp_path,width,dark,l
         assert chart.point(0,'cycle_cost').y()-chart.point(1,'cycle_cost').y()>chart.box.height()*.25
         x=chart.x_at(1);y=chart.box.center().y()
         plot.showTip(x,y)
-        assert [item['label'] for item in plot.detail['items']]==['잔여량','누적 API 환산액','주간 동등 가치','완료 구간별 API 환산액']
+        assert [item['label'] for item in plot.detail['items']]==['잔여량','누적 구독 가치 환산액','주간 동등 가치','완료 구간별 구독 가치 환산액']
         assert [item['value'] for item in plot.detail['items']]==['89%','$10.00','$1,050.00','$10.00']
         assert plot.detail['items'][3]['color']=='completed'
         assert not plot.detailPinned
@@ -161,7 +161,7 @@ def test_completed_recorded_cost_survives_running_calls_and_unchanged_idle_gap()
     assert chart.series['completed_costs']==[None,12,12,12,None,None]
     detail=chart.detail_for(2)
     assert detail['items'][3]['value']=='$12.00'
-    assert [r['label'] for r in detail['items']]==['잔여량','누적 API 환산액','주간 동등 가치','완료 구간별 API 환산액']
+    assert [r['label'] for r in detail['items']]==['잔여량','누적 구독 가치 환산액','주간 동등 가치','완료 구간별 구독 가치 환산액']
     assert detail['note']==''
     # Turning tracking off or an unexplained cost increase still breaks evidence.
     rows[3]['tracking_continuous']=False

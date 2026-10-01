@@ -68,17 +68,18 @@ def test_no_new_release_succeeds_with_proxy_off(tmp_path,monkeypatch,current):
     assert app_update.update()=='설치할 새 버전이 없습니다.'
 
 
-def test_current_release_updates_the_active_cache_worker(tmp_path,monkeypatch):
+def test_current_release_updates_the_active_observation_proxy(tmp_path,monkeypatch):
     from types import SimpleNamespace
     from cachemonitor import install_management
     calls=[]
-    manager=SimpleNamespace(shared_cache_worker=True,status=lambda:{'configured':True,'health':{'status':'ok'}},
+    manager=SimpleNamespace(status=lambda:{'configured':True,'health':{'status':'ok'}},
         cleanup_legacy_check=lambda:None,adopt_registrations=lambda:None,
         update_proxy=lambda:calls.append(True) or {'update':{'phase':'queued','message':'연결 종료 후 적용'}})
     monkeypatch.setattr(app_update,'VERSION',release()['tag_name'].lstrip('v'))
     monkeypatch.setattr(app_update,'installed',lambda:dict(InstallRoot=str(tmp_path)))
     monkeypatch.setattr(app_update,'read_url',lambda *a:json.dumps(release()).encode())
     monkeypatch.setattr(install_management,'connection_manager',lambda:pytest.fail('Explicit manager must be retained'))
+    monkeypatch.setattr('cachemonitor.retired_cache.retire',lambda m:False)
     monkeypatch.setattr(app_update,'inspect_proxy',lambda m:dict(state='required',reason='프록시 업데이트 필요',connections=0,instance='test'))
     plan=app_update.check_update(manager=manager)
     assert calls==[]

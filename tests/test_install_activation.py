@@ -11,28 +11,25 @@ from test_install_management import fixture
 
 @pytest.mark.parametrize('concurrent',[False,True])
 def test_owned_hook_migration_and_rollback_preserve_user_edits(tmp_path,monkeypatch,concurrent):
-    from cachemonitor import cache_hooks
+    from cachemonitor import retired_cache
     root=tmp_path/'installed';root.mkdir()
     old=root/'versions'/'old'/'CodexonHook.exe'
     new=root/'versions'/'new'/'CodexonHook.exe';new.parent.mkdir(parents=True);new.touch()
     home=tmp_path/'custom home';home.mkdir()
     database=tmp_path/'custom database.sqlite'
-    normal,windows=cache_hooks.command(database,True,old)
+    normal=str(old)+' --cache-hook';windows=normal
     foreign={'description':'user hook','hooks':[{'command':'user-tool --keep'}]}
     document={'enabled':False,'custom':'preserve','hooks':{'Stop':[
-        {'description':cache_hooks.MARKER,'matcher':'keep','hooks':[
+        {'description':retired_cache.MARKER,'matcher':'keep','hooks':[
             {'type':'command','command':normal,'commandWindows':windows,'timeout':123}]},foreign]}}
     path=home/'hooks.json';original=json.dumps(document).encode();path.write_bytes(original)
     monkeypatch.setattr(activation,'shortcuts',lambda isolated:[])
     monkeypatch.setattr(activation,'snapshot_registry',lambda isolated:[])
     transaction=activation.Activation(root,True)
-    assert cache_hooks.migrate_installation(home,root,new,before_write=transaction.track_file)
-    actual=json.loads(path.read_bytes());hook=actual['hooks']['Stop'][0]['hooks'][0]
-    expected_normal,expected_windows=cache_hooks.command(database,True,new)
-    assert hook['command']==expected_normal and hook['commandWindows']==expected_windows
-    assert hook['timeout']==123 and actual['enabled'] is False
-    assert actual['hooks']['Stop'][1]==foreign and actual['custom']=='preserve'
-    assert not cache_hooks.migrate_installation(home,root,new)
+    assert retired_cache.remove_hooks(home,before_write=transaction.track_file)
+    actual=json.loads(path.read_bytes())
+    assert actual['enabled'] is False and actual['hooks']['Stop']==[foreign] and actual['custom']=='preserve'
+    assert not retired_cache.remove_hooks(home)
     if concurrent:
         edited=path.read_bytes()+b'\n';path.write_bytes(edited)
         with pytest.raises(RuntimeError,match='Concurrent edit preserved'):transaction.rollback()
@@ -41,16 +38,6 @@ def test_owned_hook_migration_and_rollback_preserve_user_edits(tmp_path,monkeypa
         transaction.rollback();assert path.read_bytes()==original
 
 
-def test_owned_hook_disagreement_does_not_overwrite_or_enable_hooks(tmp_path):
-    from cachemonitor import cache_hooks
-    root=tmp_path/'installed';old=root/'versions'/'old'/'CodexonHook.exe'
-    new=root/'versions'/'new'/'CodexonHook.exe';new.parent.mkdir(parents=True);new.touch()
-    normal,_=cache_hooks.command(tmp_path/'database',executable=old)
-    path=tmp_path/'hooks.json';original=json.dumps({'hooks':{'Stop':[
-        {'description':cache_hooks.MARKER,'hooks':[{'command':normal,'commandWindows':"& 'user-tool'"}]}]}}).encode()
-    path.write_bytes(original)
-    with pytest.raises(ValueError,match='disagree'):cache_hooks.migrate_installation(tmp_path,root,new)
-    assert path.read_bytes()==original
 
 
 @pytest.mark.parametrize('phase',['shell','receipt'])

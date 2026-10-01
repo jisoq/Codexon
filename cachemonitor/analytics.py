@@ -7,7 +7,7 @@ import math
 import ntpath
 import hashlib
 from .core import METRICS, LINEAGE_FIELDS, summarize, token_number, token_parts
-from .pricing import COST_KEYS, COST_COMPONENTS, token_cost, sum_cost, request_tier, display_tier, unknown_mode_calls, mode_assumptions
+from .pricing import COST_KEYS, COST_COMPONENTS, token_cost, sum_cost, request_tier, display_tier, unknown_mode_calls, mode_assumptions, supported_model
 from .cache_misses import classify
 from .cache_health import CacheHealth
 from .workload import internal_review
@@ -410,6 +410,7 @@ def observed_choices(rows):
 
 
 def initial_targets(rows):
+    rows=[r for r in rows if supported_model(r.get('model'))]
     pairs=defaultdict(lambda:defaultdict(list))
     for r in rows:pairs[(r.get('model') or '미확인',r.get('effort') or '미확인')][display_tier(r)].append(r)
     choices=[(min(len(modes['Standard']),len(modes['Fast'])),max(r['ts'] for mode in ('Standard','Fast') for r in modes[mode]),m,e)

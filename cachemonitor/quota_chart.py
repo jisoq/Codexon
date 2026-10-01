@@ -35,7 +35,7 @@ class QuotaHistory(Plot):
         self._cache_key=None;self.box=QRectF()
         self.strip_box=QRectF();self.inspection_x=None
         self.gap_lefts=[];self.gap_rights=[];self.gap_width=24
-        self.setAccessibleName('잔여량과 API 동등 가치 · 방향키로 시각 선택')
+        self.setAccessibleName('잔여량과 구독 가치 / 방향키로 시각 선택')
         shared_theme().changed.connect(self.update)
 
     def set_series_visible(self,key,visible):
@@ -174,7 +174,7 @@ class QuotaHistory(Plot):
         if self.money:
             for x,width,axis_low,ceiling,color,title,on_left in (
                     (box.left()-remaining_width,completed_width,self.completed_floor,self.completed_ceiling,'completed','완료 구간\nUSD',True),
-                    (box.right(),cost_width,self.cost_floor,self.cost_ceiling,'output','누적 API\nUSD',False),
+                    (box.right(),cost_width,self.cost_floor,self.cost_ceiling,'output','누적 환산액\nUSD',False),
                     (box.right()+cost_width,value_width,self.value_floor,self.ceiling,'written','주간 동등\nUSD / 100%p',False)):
                 if not width:continue
                 text_x=x-width if on_left else x+7
@@ -363,10 +363,10 @@ class QuotaHistory(Plot):
         cumulative=self.series.get('cumulative',False)
         items=[dict(label='누적 소모량' if cumulative else '잔여량',value=f"{row['remaining']:g}"+('%p' if cumulative else '%'),color='cached')]
         if self.money:
-            items += [dict(label='누적 API 환산액',value=usd(row.get('cycle_cost')),color='output'),
+            items += [dict(label='누적 구독 가치 환산액',value=usd(row.get('cycle_cost')),color='output'),
                       dict(label='주간 동등 가치',value=usd(row.get('cycle_value')),color='written')]
             amount=self.series['completed_costs'][index]
-            items.append(dict(label='완료 구간별 API 환산액',value=usd(amount),color='completed'))
+            items.append(dict(label='완료 구간별 구독 가치 환산액',value=usd(amount),color='completed'))
         colors={'cached':'remaining','output':'cycle_cost','written':'cycle_value','completed':'completed_cost'}
         items=[item for item in items if self.visible(colors[item['color']])]
         if row['reset_kind']:note=(' · '.join(row.get('markers',[])) or '사용량 리셋')+' · 새 주기'

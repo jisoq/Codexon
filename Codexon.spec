@@ -82,11 +82,8 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
 )
-hook_exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name='CodexonHook',
-    debug=False, strip=False, upx=True, console=True, icon='icons/Codexon.ico')
 coll = COLLECT(
     exe,
-    hook_exe,
     a.binaries,
     a.datas,
     strip=False,

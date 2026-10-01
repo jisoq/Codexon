@@ -57,13 +57,3 @@ def test_shared_installation_pointer_overrides_stale_registry_view(tmp_path,monk
     monkeypatch.setattr(winreg,'OpenKey',lambda *a,**k:pytest.fail('A stale registry view must not override the committed pointer'))
     assert installation.installed()==expected
     assert not installation.valid_paths({**expected,'AppPath':str(tmp_path/'other.exe')})
-
-
-def test_update_recovers_stopped_cache_worker_before_scheduling_replacement():
-    from cachemonitor.install_management import activate_proxy
-    calls=[]
-    manager=SimpleNamespace(shared_cache_worker=True,status=lambda:dict(configured=True,health=None),
-        cleanup_legacy_check=lambda:calls.append('retire-check'),adopt_registrations=lambda:calls.append('adopt'),
-        resume=lambda:calls.append('resume'),update_proxy=lambda:(calls.append('update') or {'update':{'phase':'queued'}}))
-    assert activate_proxy(manager)=={'phase':'queued'}
-    assert calls==['retire-check','adopt','resume','update']

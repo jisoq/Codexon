@@ -54,7 +54,7 @@ def test_inactive_details_and_freshness_do_not_repaint():
     assert not changes
     content.monitor_action('tab-latest');assert content.monitor_tab=='latest'
     content.set_layout(reduced=True);content.scroll_lower(999)
-    assert content.lower_offset==90 and content.layout()['tokens']==160
+    assert content.lower_offset==110 and content.layout()['tokens']==168
 
 
 def test_compact_pills_and_hover_keep_latest_and_selection():
@@ -73,7 +73,7 @@ def test_compact_pills_and_hover_keep_latest_and_selection():
         pair=[r for r in controls if r['id'].startswith(prefix)]
         assert len(pair)==2 and sum(r['width'] for r in pair)<100
         assert pair[0]['x']+pair[0]['width']==pair[1]['x']
-        assert pair[1]['x']+pair[1]['width']==364
+        assert pair[1]['x']+pair[1]['width']==338
     nav=NavigationModel(content);nav.inspectCall('call-0')
     assert content.inspected_call==content.call_id(content.rows()[0])
     assert content.selected_id==selected and content.data['latest'] is latest
@@ -88,19 +88,19 @@ def test_layout_collapses_notices_and_composition_has_tooltip_only_regions():
     app=QApplication.instance() or QApplication([])
     m=OverlayContent();m.set_content(summary());base=m.layout()
     assert m.monitor_tab=='latest' and base['miss'] is None and base['partial'] is None
-    assert base['tokens']==base['cache']+64+12
+    assert base['tokens']==base['cache']+64+16
     assert base['unit']==base['session']
     assert base['session']-(base['header']+24)==12
-    assert base['cache']-(base['session']+20)==12
-    assert base['tab']-base['divider']==12
+    assert base['cache']-(base['session']+20)==16
+    assert base['tab']-base['divider']==16
     assert base['status'] is None
     assert base['height']-(base['call_parts']+20)==16
     assert base['call_parts']+20==base['recent']+4*52-8
-    assert base['divider']==base['rows']+3*18+12
+    assert base['divider']==base['rows']+3*18+16
     assert [r['id'] for r in m.monitor_links() if r['id'].startswith('tab-')]==['tab-latest','tab-history']
     assert not any(r.get('formula') or r['id'].startswith('composition-') for r in m.monitor_links())
     # Composition tooltips must never become navigation or mutation targets.
-    for x,count in ((28,3),(204,2)):
+    for x,count in ((20,3),(187,2)):
         for i in range(count):
             px,py=x+20,base['rows']+i*18+9
             assert not any(r['x']<=px<r['x']+r['width'] and r['y']<=py<r['y']+r['height'] for r in m.monitor_links() if r.get('interaction')!='tooltip')
@@ -157,7 +157,7 @@ def test_recent_renders_four_call_series_without_latest_identity(monkeypatch):
     graph_top=m.layout()['recent']+3*52
     assert len([p for p in dots if graph_top<=p[1]<graph_top+52])==2
     links=[r for r in m.monitor_links() if r.get('interaction')=='select']
-    assert len(links)==3 and all(r['width']==112 for r in links)
+    assert len(links)==3 and all(r['width']==106 for r in links)
     assert not any(r.get('formula') for r in links)
 
 

@@ -238,9 +238,6 @@ class CollectionClient:
             if missing:
                 snapshot['index']={**snapshot['index'],'loading':True,'usage_complete':False}
                 snapshot['usage_collection_complete']=False
-            # The GUI registers all monitored homes. Cache consumers need only
-            # status; never expose aggregates from other homes.
-            snapshot['cache_management']={}
         snapshot['homes']=self.channel.homes
         return snapshot
 

@@ -162,6 +162,6 @@ def test_explicit_record_tier_survives_sanitizing_index_and_restart(tmp_path):
             snapshot=finish(index)
             rows=analyze(snapshot['sessions'])['responses']
             assert len(rows)==1 and rows[0]['service_tier']=='Fast'
-            assert rows[0]['cost']==pytest.approx(.81)
+            assert rows[0]['cost']==pytest.approx(1.0125)
             assert not any('must-not-persist' in r[0] for r in index.db.execute('select data from events'))
         finally:index.close()

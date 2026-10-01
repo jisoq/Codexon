@@ -48,7 +48,7 @@ def test_native_collapse_restore_opacity_drag_and_control_window_styles(tmp_path
         assert not controller.popup_open and not controller.toolbar.isVisible() and not controller.input_timer.isActive()
         pressed[0]=False
         pixels=controller.widget.grab().toImage();scale=pixels.devicePixelRatio()
-        assert 85<=pixels.pixelColor(round(12*scale),round(100*scale)).alpha()<=110
+        assert 85<=pixels.pixelColor(round(6*scale),round(100*scale)).alpha()<=110
         click(controller.actions,controller.actions.quick.rootObject().findChild(QQuickItem,'collapse'));refresh()
         assert controller.collapsed and controller.icon.isVisible() and not controller.widget.isVisible()
         assert not controller.header.isVisible() and not controller.toolbar.isVisible()

@@ -76,7 +76,6 @@ def sanitized(event):
 
 class UsageIndex:
     def __init__(self, homes, path=None, model_evidence_path=None):
-        self.cache_index_path=path
         self.homes = [Path(h).resolve() for h in homes]
         self.path = index_location(path)
         if any(self.path.resolve().is_relative_to(h) for h in self.homes):
@@ -84,7 +83,7 @@ class UsageIndex:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(self.path)
         tables = {r[0] for r in self.db.execute("select name from sqlite_master where type='table'")}
-        if tables - {'files','events','metadata'}:
+        if tables - {'files','events','metadata','usage_archive'}:
             self.db.close()
             raise ValueError('다른 데이터베이스를 앱 색인으로 사용할 수 없습니다')
         self.db.executescript('''
@@ -96,6 +95,7 @@ class UsageIndex:
             CREATE INDEX IF NOT EXISTS events_session ON events(home,tid,ts);
             CREATE TABLE IF NOT EXISTS metadata(home TEXT, tid TEXT, data TEXT, PRIMARY KEY(home,tid));
         ''')
+        self.db.execute('CREATE TABLE IF NOT EXISTS usage_archive(home TEXT,response_id TEXT,data TEXT,PRIMARY KEY(home,response_id))')
         # Recover settings snapshots and top-level compactions omitted by older
         # scanners. Keep existing events while this incremental backfill proceeds.
         self.tier_backfill=self.db.execute('pragma user_version').fetchone()[0]<4
@@ -445,15 +445,10 @@ class UsageIndex:
             view['usage_revision']=self.session_revisions[key]
             views.append(view)
         self.version += bool(changed)
-        cache_management={}
-        try:
-            from .cache_integration import enrich
-            cache_management=enrich(views,self.cache_index_path,now,{str(h) for h in self.homes})
-        except (sqlite3.Error,OSError):
-            self.errors.append('캐시 유지 사용량 연결 실패')
+        from .usage_archive import sessions as archived_sessions
+        views.extend(archived_sessions(self.db,now,{str(h) for h in self.homes}))
         return {'ts': now, 'sessions': sorted(views, key=lambda s: s['activity'], reverse=True),
-                'request_activity': list(self.model_evidence.activity_records.values())+cache_management.pop('request_activity',[]),
-                'cache_management':cache_management,
+                'request_activity': list(self.model_evidence.activity_records.values()),
                 'usage_collection_complete':usage_complete,'last_usage_collection_success':self.last_usage_success,
                 'usage_errors':usage_errors,
                 'homes': [str(h) for h in self.homes], 'errors': list(dict.fromkeys(self.errors)),

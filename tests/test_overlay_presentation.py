@@ -124,14 +124,14 @@ def test_detail_expansion_preserves_monitor_pixels_and_font_scale():
             image=QImage(m.panel_width(),m.panel_height(),QImage.Format_ARGB32_Premultiplied);image.fill(0)
             p=QPainter(image);m.paint(p);p.end();return image
         normal=render();m.set_layout(detail=True);detail=render()
-        assert m.panel_width()==620 and m.panel_height()==522 and m.monitor_x==240
-        normal_crop=normal.copy(16,48,348,470);detail_crop=detail.copy(256,48,348,470)
+        assert m.panel_width()==590 and m.panel_height()==542 and m.monitor_x==240
+        normal_crop=normal.copy(12,48,326,490);detail_crop=detail.copy(252,48,326,490)
         a=bytes(normal_crop.constBits());b=bytes(detail_crop.constBits())
         # Qt's translated antialias coverage may differ by one channel level.
         assert max(abs(x-y) for x,y in zip(a,b))<=1
         for size in (10,14,21):
             w.set_content(summary(),appearance=replace(default_appearance(True),font_size=size));s=max(1,size/14)
-            assert m.panel_width()==round(620*s) and m.panel_height()==round(522*s)
+            assert m.panel_width()==round(590*s) and m.panel_height()==round(542*s)
     finally:w.close();app.processEvents()
 
 

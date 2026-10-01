@@ -12,7 +12,7 @@ class SettingsPage(Group):
     TITLES = ('일반', '화면 표시', '알림', 'Codex 연동', '문제 해결', '앱 정보')
     ENTRY_IDS = {
         '언어':'language','시스템 시간대':'timezone','위치':'overlay-position',
-        '프록시 사용':'proxy','캐시 갱신':'cache-refresh','캐시 관리':'cache-management',
+        '프록시 사용':'proxy',
         '알림 표시':'notifications-enabled','HTTP 전환':'http-fallback',
         '캐시 저하 의심':'cache-drop','모델명 불일치':'model-mismatch','프록시 장애':'proxy-failure',
         '캐시 알림 범위':'cache-scope','최근 알림':'notification-history','현재 버전':'version',

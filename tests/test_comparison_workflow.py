@@ -1,8 +1,65 @@
 """Model-driven comparison and navigation through the real Qt scene."""
 import copy
+import pytest
 
 from cachemonitor.quick_qa import control, click, click_row
 from test_ui import dashboard, snapshot
+
+
+@pytest.mark.parametrize('language', ['ko', 'en'])
+def test_subscription_rates_and_historical_models_render(tmp_path, language):
+    from pathlib import Path
+    from PySide6.QtCore import QSettings
+    from PySide6.QtWidgets import QApplication
+    from PySide6.QtTest import QTest
+    from cachemonitor.dashboard import Dashboard
+    from cachemonitor.i18n import set_language
+    from cachemonitor.lazy_table import LazyTable
+    from cachemonitor.presentation import Text
+    from cachemonitor.pricing import SUPPORTED_MODELS, token_cost
+    app=QApplication.instance() or QApplication([])
+    previous=app.property('cachemonitorDisableShellIntegration')
+    app.setProperty('cachemonitorDisableShellIntegration',True)
+    set_language(language)
+    source=snapshot()
+    for model in ('gpt-5.4-mini', 'gpt-5.5-pro', 'gpt-5.6'):
+        row=copy.deepcopy(source['sessions'][0]['history'][0])
+        row.update(key='historical-'+model,model=model,configured_model=model,requested_model=model,
+                   cached=0,written=0,service_tier='Standard')
+        source['sessions'][0]['history'].append(row)
+    window=None
+    try:
+        window=Dashboard(['fixture'],start_worker=False,live_limits=False,
+                         settings=QSettings(str(tmp_path/'value.ini'),QSettings.IniFormat),static_snapshot=source)
+        window.show();QTest.qWait(80)
+        window.refresh_target_editors()
+        assert window.model.findData('gpt-5.5-pro')>=0
+        assert window.model.findData('gpt-5.4-mini')>=0
+        assert window.compare_model.findData('gpt-5.5-pro')<0
+        assert window.compare_model.findData('gpt-5.4-mini')<0
+        assert window.compare_model.findData('gpt-5.6')>=0
+        priced=next(iter(window.engine.sessions.values()))['prepared']['history']
+        for model in ('gpt-5.4-mini','gpt-5.5-pro'):
+            record=next(r for r in priced if r['model']==model)
+            assert record['cost'] is not None and record['cost']==token_cost(record)['cost']
+        window.show_prices();dialog=window.price_dialog;QTest.qWait(80)
+        prices=dialog.findChild(LazyTable).model().rows
+        assert len(prices)==2*len(SUPPORTED_MODELS)
+        assert {r[0].split(' / ')[0] for r in prices}==set(SUPPORTED_MODELS)
+        labels='\n'.join(n.state['text'] for n in dialog.findChildren(Text))
+        assert ('Fast 2.5 x' if language=='en' else 'Fast 2.5배') in labels
+        if language=='en':assert not any('\uac00'<=c<='\ud7a3' for c in labels)
+        assert not window.qml_errors and not dialog.host.qml_errors
+        output=Path(__file__).resolve().parents[1]/'artifacts/verification/subscription-value'
+        output.mkdir(parents=True,exist_ok=True)
+        assert dialog.host.grab().save(str(output/f'rates-{language}.png'))
+        dialog.reject()
+        window.nav.setCurrentRow(3);QTest.qWait(50)
+        assert window.grab().save(str(output/f'quota-{language}.png'))
+    finally:
+        if window:
+            window.quit_app()
+        set_language('ko');app.setProperty('cachemonitorDisableShellIntegration',previous)
 
 
 def many_efforts():

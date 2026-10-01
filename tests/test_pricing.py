@@ -22,7 +22,7 @@ def test_disjoint_cache_write_and_reasoning_costs():
 
 @pytest.mark.parametrize('tier, expected', [
     ('default', (.02, .008, .025, .02, .073)),
-    ('priority', (.04, .016, .05, .04, .146)),
+    ('priority', (.05, .02, .0625, .05, .1825)),
 ])
 def test_gpt61_sol_official_rates(tier, expected):
     priced=token_cost(row('gpt-6.1-sol',service_tier=tier))

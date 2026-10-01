@@ -169,7 +169,7 @@ def test_legend_visibility_survives_refresh_and_updates_pinned_details(quota_pag
         click(host,render_plot(host,toggle));render_plot(host,chart)
         assert chart.series is series
         assert not chart.visible('cycle_cost')
-        assert all(i['label']!='누적 API 환산액' for i in plot.detail['items'])
+        assert all(i['label']!='누적 구독 가치 환산액' for i in plot.detail['items'])
         panel.render(automatic=True)
         assert not chart.visible('cycle_cost') and not toggle.isChecked()
         render_plot(host,toggle).forceActiveFocus();QTest.keyClick(host.quick,Qt.Key_Space)

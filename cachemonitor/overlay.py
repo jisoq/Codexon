@@ -6,6 +6,7 @@ from PySide6.QtCore import Qt, QTimer, QObject, Signal, QVariantAnimation, QEasi
 from PySide6.QtGui import QAction, QActionGroup, QFontDatabase
 from PySide6.QtWidgets import QApplication
 from .overlay_view import OverlayContent, SessionOverlay, TOKEN_COLORS
+from .overlay_monitor import WIDTH, ACTIONS_X, HEADER_X, HEADER_WIDTH, POPUP_X, INLINE_HEADER_WIDTH
 from .overlay_tracking import overlay_geometry, anchor_for_position
 from .overlay_appearance import CodexAppearance, default_appearance
 
@@ -404,7 +405,7 @@ class OverlayController(QObject):
         from .overlay_tracking import monitor_anchor_for_position
         self.anchor=monitor_anchor_for_position(frame,geometry,geometry[0]+current[0]-cursor[0],
                       geometry[1]+current[1]-cursor[1],dpi,
-                      reference_width=380*self.appearance.scale,reference_height=560*self.appearance.scale)
+                      reference_width=WIDTH*self.appearance.scale,reference_height=560*self.appearance.scale)
         if not self.move_only(frame,dpi):
             self._refresh(drag_layout=True)
 
@@ -608,11 +609,11 @@ class OverlayController(QObject):
         from .overlay_tracking import anchored_monitor_geometry, extend_monitor_left
         content=self.widget.content_model
         scale=self.appearance.scale
-        monitor_width=380*scale
+        monitor_width=WIDTH*scale
         if self._legacy_anchor:
             from .overlay_tracking import edge_anchor_from_legacy
             # Interpret saved free-space anchors with the previous monitor height.
-            self.anchor=edge_anchor_from_legacy(frame,dpi,monitor_width,580*scale,self.anchor)
+            self.anchor=edge_anchor_from_legacy(frame,dpi,380*scale,580*scale,self.anchor)
             self.settings.setValue('overlay/anchorX',self.anchor[0]);self.settings.setValue('overlay/anchorY',self.anchor[1])
             self.settings.setValue('overlay/anchorMode','edge');self._legacy_anchor=False
         full_height=content.monitor_height(reduced=False)
@@ -704,18 +705,18 @@ class OverlayController(QObject):
                 if not self._place(int(control.winId()),placed):control.hide()
                 return placed
             if mode in ('detail','detail-inline'):
-                place(self.detail,(0,0,380 if inline else 240,geometry[3]/native_scale))
+                place(self.detail,(0,0,WIDTH if inline else 240,geometry[3]/native_scale))
             else:self.detail.hide()
-            if not inline and self.links.sync():place(self.links,(0,0,380,geometry[3]/native_scale),monitor)
+            if not inline and self.links.sync():place(self.links,(0,0,WIDTH,geometry[3]/native_scale),monitor)
             else:self.links.hide()
-            if inline:place(self.header,(150,12,134,32),monitor)
-            else:place(self.header,(12,12,278,32),monitor)
-            self.actions_geometry=place(self.actions,(290,13,78,30),monitor)
+            if inline:place(self.header,(150,12,INLINE_HEADER_WIDTH,32),monitor)
+            else:place(self.header,(HEADER_X,12,HEADER_WIDTH,32),monitor)
+            self.actions_geometry=place(self.actions,(ACTIONS_X,13,78,30),monitor)
             if self.popup_open:
                 # Align below the header. The monitor already guarantees enough
                 # interior width; clamping also handles rounded native pixels.
                 popup_w,popup_h=round(160*native_scale),round(40*native_scale)
-                px=monitor[0]+round(204*native_scale)
+                px=monitor[0]+round(POPUP_X*native_scale)
                 py=monitor[1]+round(44*native_scale)
                 gap=round(16*dpi/96)
                 px=min(frame[2]-gap-popup_w,max(frame[0]+gap,px))

@@ -12,13 +12,14 @@ from .ui_details import recorded, observed_transport, model_comparison
 from .token_colors import TOKEN_COLORS, ui_palette, readable
 from .i18n import tr, Verbatim
 from .charts import value_text
+from .overlay_monitor import WIDTH, MARGIN, SECTION_WIDTH, TITLE_WIDTH, INLINE_CLOSE_X
 
 LABELS = dict(cached='캐시 읽기', uncached='일반 입력', written='캐시 쓰기', reasoning='추론', output='추론 외', unknown='미분류')
 ORDER = tuple(LABELS)
 
 # Descriptions follow the displayed population; raw per-call fields have none.
 CALCULATIONS = {
-    '비용':'세션 API 환산액 합계',
+    '비용':'세션 구독 가치 환산액 합계',
     '평균 호출 비용':'세션 비용 ÷ 호출 수',
     '캐시 적중률':'세션 캐시 읽기 합계 ÷ 입력 합계 × 100',
     'Total':'세션 총 토큰 합계',
@@ -31,7 +32,7 @@ CALCULATIONS = {
     '캐시 읽기 0':'입력이 있고 캐시 읽기가 0인 호출 수',
     '자체 캐시 읽기 0':'자체 호출 중 입력이 있고 캐시 읽기가 0인 호출 수',
     '해당 입력':'캐시 미적중 호출의 입력 토큰 합계',
-    '자체 호출 비용':'자체 호출의 API 환산액 합계',
+    '자체 호출 비용':'자체 호출 구독 가치 환산액 합계',
     '최근 평균':'최근 3개 비교 호출의 출력 합계 ÷ 소요 시간 합계',
     '평소 기준':'이전 비교 호출의 출력 합계 ÷ 소요 시간 합계',
     '속도 감소':'(1 − 최근 평균 ÷ 평소 기준) × 100',
@@ -262,7 +263,7 @@ class DetailBody(Node):
             else:d.text(value,x,y,w,h,size,color,weight,right=style.get('right',False))
 
 class OverlayContent(Node):
-    kind='plot';WIDTH=380;HEIGHT=522;BODY_SIZE=12
+    kind='plot';WIDTH=WIDTH;HEIGHT=542;BODY_SIZE=12
     def __init__(self):
         super().__init__();self.data=None;self.note='기록 확인 중';self.opacity=94;self.appearance=default_appearance(True);self.dark=True;self.compact=False
         self.detail_open=False;self.detail_inline=False;self.detail_width=208
@@ -281,7 +282,7 @@ class OverlayContent(Node):
     def set_layout(self,reduced=False,detail=False,inline=False,**kwargs):
         values=(kwargs.get('compact',reduced),kwargs.get('detail_open',detail),kwargs.get('detail_inline',inline))
         if values==(self.compact,self.detail_open,self.detail_inline):return
-        self.compact,self.detail_open,self.detail_inline=values;self.lower_offset=0;self.detail_width=348 if self.detail_inline else 208
+        self.compact,self.detail_open,self.detail_inline=values;self.lower_offset=0;self.detail_width=SECTION_WIDTH if self.detail_inline else 208
         self.sync_details();self.update()
     def set_content(self,data,note='',dark=True,appearance=None):
         appearance=appearance or default_appearance(dark)
@@ -334,7 +335,7 @@ class OverlayContent(Node):
     def sync_details(self):
         items=self.detail_items() if self.detail_open else [];self._detail_items=items;height=max((r[2]+r[4] for r in items),default=16)
         colors=palette(self.appearance)
-        self.put(detailBodyHeight=round(height*self.appearance.scale),detailWidth=self.detail_width,detailTitle='호출 상세',
+        self.put(detailBodyHeight=round(height*self.appearance.scale),detailWidth=self.detail_width,detailTitle='호출 상세',detailCloseX=INLINE_CLOSE_X,
                  overlayFamily=self.appearance.family,overlaySurface=colors['surface'].name(),overlayBorder=colors['border'].name(),
                  overlayWarning=colors['warning'].name(),
                  detailHasSelection=bool(self.selected()),detailGraphAccessible='선택 호출 상세',detailSelected=str(self.selected_id or ''))
@@ -370,7 +371,7 @@ class OverlayContent(Node):
         if not value:return []
         metrics=QFontMetrics(font(self.appearance.family,12));lines=[];line=''
         for char in value:
-            if line and metrics.horizontalAdvance(line+char)>348:lines.append(line);line=''
+            if line and metrics.horizontalAdvance(line+char)>SECTION_WIDTH:lines.append(line);line=''
             line+=char
         lines.append(line)
         return lines
@@ -414,7 +415,7 @@ class OverlayContent(Node):
         return geometry(self.data,reduced,has_footer=bool(footer(self)[0]))
     def base_height(self,reduced=None):return self.layout(reduced)['height']
     def monitor_height(self,reduced=False):return round(self.base_height(reduced)*self.appearance.scale)
-    def panel_width(self):return round((380+self.monitor_x)*self.appearance.scale)
+    def panel_width(self):return round((WIDTH+self.monitor_x)*self.appearance.scale)
     def panel_height(self):return round(self.base_height()*self.appearance.scale)
     def amount(self,value):return amount(value)
     def money(self,value,*args):return money(value)
@@ -509,10 +510,10 @@ class OverlayContent(Node):
         if row:
             text(f"{timestamp(row.get('ts'))} · {row.get('ordinal','—')}호출",color='secondary');y+=8;half=(w-12)/2
             text('캐시',width=half,color='secondary',at=y);items[-1][8]['formula']='선택 호출 캐시 읽기 ÷ 입력 × 100'
-            text('비용',x=half+12,width=half,color='secondary',at=y);items[-1][8]['formula']='선택 호출 API 비용';y+=18
+            text('비용',x=half+12,width=half,color='secondary',at=y);items[-1][8]['formula']='선택 호출 구독 가치 환산액';y+=18
             text(percent(row.get('cache_rate',row.get('rate'))),width=half,size=20,color='warning' if row.get('cache_warning') else 'cached_text',weight=600,height=28,at=y,kind='metric')
             text(fitted_money(row.get('cost'),half,20,self.appearance.family),x=half+12,width=half,size=20,weight=600,height=28,at=y,kind='metric');y+=40
-            pair('정확한 비용',money(row.get('cost'),False),numeric=True,formula='선택 호출 API 비용')
+            pair('정확한 비용',money(row.get('cost'),False),numeric=True,formula='선택 호출 구독 가치 환산액')
             pair('평균 출력 속도',value_text(row['output_speed'],'output_speed') if row.get('output_speed') is not None else '측정 불가',numeric=True,formula='선택 호출 출력 토큰 ÷ 소요 시간')
             if row.get('output_speed') is not None:
                 pair('호출 소요시간',value_text(row['completion_latency_ms']/1000,'duration'),numeric=True)
@@ -536,7 +537,7 @@ class OverlayContent(Node):
         pair('비용',money(d.get('cost'),False),numeric=True)
         if d.get('descendants'):
             pair('자체 호출 비용',money(d.get('own_cost'),False),numeric=True)
-            pair(f"하위 {d['descendants']}개 비용",money(d.get('child_cost'),False),numeric=True,formula='하위 작업 호출의 API 환산액 합계')
+            pair(f"하위 {d['descendants']}개 비용",money(d.get('child_cost'),False),numeric=True,formula='하위 작업 호출 구독 가치 환산액 합계')
         pair('평균 호출 비용',money(d.get('mean_cost'),False),numeric=True)
         if d.get('missing'):
             text(f"산정 {d.get('priced',0)} / {d.get('calls',0)}호출",color='secondary')
@@ -576,7 +577,7 @@ class OverlayContent(Node):
                     pair('캐시 적중률',percent(call.get('cache_rate')),numeric=True,formula='해당 호출 캐시 읽기 ÷ 입력 × 100')
         y+=16
         if self.compact:
-            height=(28+sum(54+24*max(1,len(c.get(k,[]))) for k in ('input_parts','output_parts'))) if w<348 else self.composition_full_height()
+            height=(28+sum(54+24*max(1,len(c.get(k,[]))) for k in ('input_parts','output_parts'))) if w<300 else self.composition_full_height()
             text('토큰',height=height,kind='tokens');y+=12
         token_label='Total · 확인분' if c.get('partial') else 'Total'
         pair(token_label,tokens(c.get('total') if c.get('known',d and d.get('calls')) else None),numeric=True)
@@ -613,7 +614,7 @@ class OverlayContent(Node):
         return items
 
     def paint(self,p):
-        p.save();p.scale(self.appearance.scale,self.appearance.scale);d=Drawing(p,self);width=380+self.monitor_x;height=self.base_height()
+        p.save();p.scale(self.appearance.scale,self.appearance.scale);d=Drawing(p,self);width=WIDTH+self.monitor_x;height=self.base_height()
         surface=QColor(d.colors['surface']);surface.setAlphaF(self.opacity/100);p.setPen(QPen(d.colors['border'],1));p.setBrush(surface);p.drawRoundedRect(QRectF(.5,.5,width-1,height-1),16,16)
         if self.detail_open:
             if not self.detail_inline:
@@ -621,7 +622,7 @@ class OverlayContent(Node):
             else:pass
         if self.detail_inline:p.restore();return
         p.save();p.translate(self.monitor_x,0);data=self.data or {};layout=self.layout()
-        d.text(Verbatim(data.get('title','')),16,layout['header'],270,24,14,weight=600,elide=True)
+        d.text(Verbatim(data.get('title','')),MARGIN,layout['header'],TITLE_WIDTH,24,14,weight=600,elide=True)
         from .overlay_monitor import paint
         paint(d,self)
         p.restore();p.restore()

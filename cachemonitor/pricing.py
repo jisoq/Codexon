@@ -1,7 +1,8 @@
-"""Request-tier API token-equivalent USD, not a historical Codex bill.
+"""Subscription value in USD using Standard base rates and usage multipliers.
 
 Verified 2026-09-23 against OpenAI's pricing and individual model pages.
 GPT-6.1 Sol added from its official model pricing on 2026-09-30.
+Included-subscription Fast multiplier verified on 2026-10-01.
 All amounts are USD per million tokens. Cache writes replace ordinary input
 pricing for the written portion; they are not added at full price a second time.
 """
@@ -11,8 +12,12 @@ from dataclasses import dataclass, replace
 from datetime import date
 
 VERIFIED = '2026-09-30'
-PRICE_POLICY = 'subscription-base-api-rates-v5'
-PROFILE_NAME = VERIFIED + ' 기준'
+PRICE_POLICY = 'subscription-value-fast-2.5-v6'
+PROFILE_NAME = VERIFIED + ' 기준 / Fast 2.5배'
+FAST_MULTIPLIER = 2.5
+SPEED_SOURCE = 'https://learn.chatgpt.com/docs/agent-configuration/speed'
+SUPPORTED_MODELS = ('gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna',
+                    'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5')
 SOURCE = 'https://developers.openai.com/api/docs/pricing'
 CACHE_SOURCE = 'https://developers.openai.com/api/docs/guides/prompt-caching'
 COST_COMPONENTS = ('cost_uncached', 'cost_cached', 'cost_written', 'cost_unclassified', 'cost_output')
@@ -48,10 +53,16 @@ ALIASES = {
     'gpt-5.4-mini-2026-03-17': 'gpt-5.4-mini',
     'gpt-5.5-2026-04-23': 'gpt-5.5',
 }
-FAST_RATES = {m:replace(r,input=r.input*2,cached=r.cached*2,output=r.output*2,written=r.written*2)
-              for m,r in RATES.items() if m.startswith(('gpt-5.6-','gpt-6-','gpt-6.1-'))}
-FAST_RATES.update({'gpt-5.5':Rate(12.5,1.25,75,long_threshold=None),
-                   'gpt-5.4-mini':Rate(1.5,.15,9,long_threshold=None)})
+FAST_RATES = {m:replace(r,input=r.input*FAST_MULTIPLIER,
+                       cached=None if r.cached is None else r.cached*FAST_MULTIPLIER,
+                       output=r.output*FAST_MULTIPLIER,
+                       written=None if r.written is None else r.written*FAST_MULTIPLIER)
+              for m,r in RATES.items() if m != 'gpt-5.5-pro'}
+
+
+def supported_model(model):
+    """Picker eligibility is independent of historical pricing and account RPC."""
+    return ALIASES.get(model, model) in SUPPORTED_MODELS
 
 
 def request_tier(row):
@@ -147,9 +158,9 @@ def sum_cost(rows, strict=False):
 
 
 def price_note():
-    note = f'{PROFILE_NAME} · 고정 단가 환산 · 청구액 아님'
+    note = f'{PROFILE_NAME} / 구독 가치 환산액 / 청구액 아님'
     if date.today().isoformat() > '2026-11-21':
-        note += ' · GPT-5.6 Sol 프로모션 단가 재확인 필요'
+        note += ' / GPT-5.6 Sol 프로모션 단가 재확인 필요'
     return note
 
 

@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from cachemonitor import app_services as services
-from cachemonitor.cache_worker_control import CacheWorkerManager
+from cachemonitor.observer_control import ObserverManager
 from cachemonitor.observer_state import read_json
 from cachemonitor.proxy_target import ProxyTarget
 
@@ -67,20 +67,23 @@ def test_package_collector_reader_rejects_missing_or_mismatched_session_revision
 @pytest.fixture
 def running(tmp_path,monkeypatch):
     home=tmp_path/'home';home.mkdir()
-    manager=CacheWorkerManager(home,tmp_path/'data'/'index.sqlite',tmp_path/'data'/'evidence.sqlite')
+    manager=ObserverManager(home,tmp_path/'data');manager.index=tmp_path/'data'/'index.sqlite'
     manager.set_url(manager.url)
-    command=[sys.executable,str(tmp_path/'run.py'),'--model-proxy','--cache-observe-only',
+    from cachemonitor.model_evidence import home_key
+    manager.write_state(dict(home=home_key(home),enabled=True,phase='active',url=manager.url,previous_url=None))
+    command=[sys.executable,str(tmp_path/'run.py'),'--model-proxy','--managed',
              '--codex-home',str(home),'--evidence-path',str(manager.evidence),
-             '--observation-index',str(manager.index),'--port',manager.url.rsplit(':',1)[1]]
-    runtime={'health':dict(instance='old',version='old',control_id='a'*32,cache_management=True), 'work':2,'starts':[],'suspended':[]}
+             '--port',manager.url.rsplit(':',1)[1]]
+    runtime={'health':dict(instance='old',version='old',control_id='a'*32,lifecycle='managed'), 'work':2,'starts':[],'suspended':[]}
     class Task:
         def __init__(self,*a,role='worker',**k):self.role=role
         def suspend(self):runtime['suspended'].append(self.role)
+        def configure(self,command,autostart=False):runtime['registration']={'registered':True,'executable':command[0],'arguments':'','running':0}
         def inspect(self):return runtime.get('registration',{'running':0,'autostart':False})
         def start(self,command,autostart=False):
             assert not runtime['health']
             runtime['starts'].append((command,autostart))
-            runtime['health']=dict(instance='new',version=services_version(),control_id='b'*32,cache_management=True)
+            runtime['health']=dict(instance='new',version=services_version(),control_id='b'*32,lifecycle='managed')
     monkeypatch.setattr('cachemonitor.observer_task.ObserverTask',Task)
     manager.task=Task();manager.legacy_task=Task(role='legacy')
     monkeypatch.setattr(manager,'cleanup_legacy_check',lambda:None)
@@ -117,7 +120,7 @@ def test_app_restarts_only_dead_processes_with_a_session_budget(running,monkeypa
     owner.poll()
     def restart():
         starts.append(clock[0])
-        runtime['health']=dict(instance='restart-'+str(len(starts)),version=services_version(),control_id='c'*32,cache_management=True)
+        runtime['health']=dict(instance='restart-'+str(len(starts)),version=services_version(),control_id='c'*32,lifecycle='managed')
         return manager.status()
     monkeypatch.setattr(manager,'resume',restart)
     for start in (0,60,120):
@@ -166,28 +169,6 @@ def test_legacy_check_cleanup_matches_the_full_connection(tmp_path,monkeypatch):
     manager.cleanup_legacy_check();assert calls==['suspend','stop','remove']
 
 
-def test_exit_drains_then_restores_observation_role_without_revoking_preferences(running):
-    manager,runtime=running
-    from cachemonitor.cache_control import Control
-    control=Control(manager.index.with_name('cache-control.sqlite'))
-    control.set('automatic',True);control.set('selection:automatic',True)
-    messages=[]
-    lifecycle=services.AppServices(manager,[str(manager.home)],manager.index,manager.evidence,progress=messages.append)
-    lifecycle.stop_proxy()
-    assert runtime['health'] is None and runtime['work']==0
-    assert manager.config()[1].get('openai_base_url') is None
-    assert services.suspended(manager) and not ProxyTarget(manager).enabled()
-    assert '진행 중 응답 및 캐시 작업 정산 대기' in messages
-    assert {'worker','legacy','ProxyUpdate'}.issubset(runtime['suspended'])
-    assert control.get('automatic') and control.get('selection:automatic')
-    assert services.resume_proxy(manager)
-    assert len(runtime['starts'])==1
-    command,autostart=runtime['starts'][0]
-    assert '--cache-observe-only' in command and '--managed' not in command and not autostart
-    assert manager.config()[1]['openai_base_url']==manager.url
-    assert not services.suspended(manager)
-    assert not services.resume_proxy(manager)
-    control.close()
 
 
 @pytest.mark.parametrize('action',['off','custom-route'])
@@ -214,34 +195,12 @@ def test_gui_start_during_update_does_not_register_the_old_worker(running,monkey
     manager,runtime=running
     services.atomic_write(manager.directory/'proxy-update.json',b'{"phase":"starting"}')
     monkeypatch.setattr(manager,'status',lambda:{'update':'starting'})
-    assert manager.resume()=={'update':'starting'}
+    assert manager.resume()['update']=='starting'
     assert not runtime['starts']
 
 
-@pytest.mark.parametrize('role',['--cache-worker','--cache-observe-only'])
-def test_gui_launch_restarts_configured_worker_after_reboot(running,monkeypatch,role):
-    manager,runtime=running
-    command=ProxyTarget(manager).capture(runtime['health'])['command']
-    command[command.index('--cache-observe-only')]=role
-    runtime['health']=None
-    runtime['registration']=dict(registered=True,executable=command[0],arguments='synthetic arguments',running=0)
-    monkeypatch.setattr('cachemonitor.launch_context.command_arguments',lambda _:['worker',*command[1:]])
-    before=manager.config_path.read_bytes()
-    assert manager.ensure()['phase']=='recovery_required' and not runtime['starts']
-    assert manager.resume()['phase']=='active'
-    assert runtime['starts']==[(command,False)]
-    assert manager.config_path.read_bytes()==before
 
 
-def test_reboot_after_update_uses_new_app_without_stale_drain_controls(running,monkeypatch):
-    manager,runtime=running
-    command=ProxyTarget(manager).capture(runtime['health'])['command']
-    legacy=[*command[1:],'--control-file',str(manager.directory/'old-control.json'),'--control-id','a'*32]
-    runtime['health']=None
-    runtime['registration']=dict(registered=True,executable=str(manager.directory/'removed-old'/'Codexon.exe'),arguments='',running=0)
-    monkeypatch.setattr('cachemonitor.launch_context.command_arguments',lambda _:['worker',*legacy])
-    assert manager.resume()['phase']=='active'
-    assert runtime['starts']==[(command,False)]
 
 
 @pytest.mark.parametrize('route,state',[('direct','refused'),('custom','refused'),('owned','unknown')])
@@ -255,20 +214,6 @@ def test_gui_launch_does_not_enable_an_off_or_unconfirmed_connection(running,mon
     assert not runtime['starts']
 
 
-@pytest.mark.parametrize('blocked',['port','lock','wrong-home','running'])
-def test_reboot_recovery_preserves_an_unconfirmed_worker(running,monkeypatch,blocked):
-    manager,runtime=running
-    command=ProxyTarget(manager).capture(runtime['health'])['command']
-    if blocked=='wrong-home':command[command.index('--codex-home')+1]=str(manager.home/'other')
-    runtime['health']=None
-    runtime['registration']=dict(registered=True,executable=command[0],arguments='',running=int(blocked=='running'))
-    monkeypatch.setattr('cachemonitor.launch_context.command_arguments',lambda _:['worker',*command[1:]])
-    monkeypatch.setattr(services.identity,'port_free',lambda _:blocked!='port')
-    monkeypatch.setattr(services.identity,'locks_free',lambda _:blocked!='lock')
-    if blocked=='running':manager.resume()
-    else:
-        with pytest.raises(RuntimeError):manager.resume()
-    assert not runtime['starts']
 
 
 def test_collection_client_never_starts_or_resumes_service(tmp_path,monkeypatch):

@@ -82,15 +82,13 @@ def register(root, product, recovery, *, isolated=False):
 
 
 def activate_proxy(manager):
+    from .retired_cache import retire
+    retire(manager)
     manager.cleanup_legacy_check()
     manager.adopt_registrations()
     status = manager.status()
     if not status.get('configured'):
         return dict(phase='off', message='프록시 사용 꺼짐')
-    if getattr(manager,'shared_cache_worker',False):
-        if not status.get('health'):
-            manager.resume()
-        return manager.update_proxy().get('update') or {}
     health = status.get('health') or {}
     if health:
         return manager.update_proxy().get('update') or {}
@@ -132,12 +130,12 @@ def finish(root, product, recovery, *, isolated=False, launch=True, language='ko
                 homes = running_homes(root)
                 if homes:save_homes(homes)
                 receipt['homes']=resolve_homes(homes)
-                from .cache_hooks import migrate_installation
+                from .retired_cache import remove_hooks
                 hook_homes=set(receipt['homes'])
                 for record in [previous, *[read_json(p) for p in root.glob('installation-*.json')]]:
                     hook_homes.update(h for h in record.get('homes',[]) if isinstance(h,str) and Path(h).is_absolute())
                 for home in hook_homes:
-                    migrate_installation(home,root,product/'CodexonHook.exe',before_write=activation.track_file)
+                    remove_hooks(home,before_write=activation.track_file)
             register(root, product, recovery, isolated=isolated)
             publish_shell(product, recovery, isolated=isolated, language=language)
             if not isolated:migrate_startup(exe)
@@ -213,18 +211,12 @@ def prepare_uninstall(root, *, isolated=False, caller_pid=None):
         if not isolated and registration.get('InstallRoot') and Path(registration['InstallRoot']).resolve()==root:
             from .connection_recovery import restore
             from .launch_context import resolve_homes
-            from .cache_hooks import remove_installation
+            from .retired_cache import remove_hooks
             manager=connection_manager()
-            for home in set([str(manager.home),*resolve_homes()]):remove_installation(home,root)
+            for home in set([str(manager.home),*resolve_homes()]):remove_hooks(home)
             restore(manager)
             # A newly drained worker exits cooperatively; busy streams remain
             # alive and the existing process check defers payload deletion.
-            if getattr(manager,'shared_cache_worker',False):
-                deadline=time.monotonic()+5
-                while time.monotonic()<deadline:
-                    health=manager.health(timeout=1)
-                    if not health or health.get('active_connections'):break
-                    time.sleep(.2)
             # Existing sockets are allowed to finish; a busy app/relay defers removal.
         collectors=[]
         for process in processes_under(root):

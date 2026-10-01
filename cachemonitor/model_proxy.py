@@ -148,8 +148,8 @@ class Tracker:
 
 
 def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *, diagnostics=None,ssl_context=None,
-               control_file=None, control_id='', stop_event=None, managed=None, cache_capture=None,
-               scheduler=None, runtime_identity=None, policy=POLICY, clock=time.monotonic):
+               control_file=None, control_id='', stop_event=None, managed=None,
+               runtime_identity=None, policy=POLICY, clock=time.monotonic):
     base=URL(upstream)
     if (base.scheme not in ('http','https') or not base.host or base.user is not None
             or base.query_string or base.fragment):
@@ -157,9 +157,7 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
     upstream=upstream.rstrip('/')
     health={'requests':0,'responses':0,'storage_errors':0,'relay_errors':0,'forwarded_response_frames':0,
             'client_disconnects':0,'observation_skips':0,'storage_failure_streak':0,'internal_failure_streak':0,
-            'observation_enabled':True,'draining':False,'control_id':control_id,'cache_management':cache_capture is not None,
-            'cache_observation_only':bool(cache_capture and cache_capture.executor.observation_only),
-            'cache_analysis_revision':getattr(cache_capture,'analysis_revision',None),
+            'observation_enabled':True,'draining':False,'control_id':control_id,
             'forwarded_http_requests':0,'forwarded_http_responses':0,
             'websocket_policy':dict(vars(policy)),
             'service':'cachemonitor-model-observer',
@@ -182,13 +180,11 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
 
     def apply_control():
         command=read_json(control_file) if control_file else {}
-        if command.get('id')==control_id and command.get('action')=='pause' and scheduler:scheduler.pause()
         if command.get('id')==control_id and command.get('action') in ('drain','force_shutdown'):
             health['draining']=True
             if command['action']=='force_shutdown':health['force_stopping']=True
         if health['draining']:
             budget.draining=True;budget.changed.set()
-            if scheduler:scheduler.pause()
 
     async def control_lifecycle(app):
         async def watch():
@@ -201,15 +197,13 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
                 apply_control()
                 if health.get('force_stopping') and not force_applied:
                     force_applied=True
-                    if scheduler:scheduler.force_shutdown()
                     for task,transport in list(relay_controls.values()):
                         if transport:transport.abort()
                         if not task.done():task.cancel()
                 if health['draining']:
                     budget.draining=True
                     budget.changed.set()
-                    if scheduler:scheduler.pause()
-                    if not active_relays and (not scheduler or scheduler.settled) and stop_event is not None:stop_event.set()
+                    if not active_relays and stop_event is not None:stop_event.set()
                 budget.reap()
                 await asyncio.sleep(policy.check_seconds)
         task=asyncio.create_task(watch())
@@ -253,7 +247,6 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
                 'http_connections':sum(d['transport']=='HTTP/SSE' for d in active_relays.values()),
                 'selector_sockets':len(selector.get_map()) if hasattr(selector,'get_map') else None,
                 'http_pool':dict(clients=len(getattr(app[HTTP_CLIENT],'clients',())),waiting=getattr(app[HTTP_CLIENT],'waiting',0)),
-                'cache_execution':scheduler.status() if scheduler else None,
                 'active_connections':len(active_relays),
                 'connection_sessions':[dict(session_id=sid,connections=count) for sid,count in
                     Counter(d.get('_session_id','') for d in active_relays.values()).items()],
@@ -287,14 +280,7 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
         response_observer=None
         connection=None
         lease=None
-        cache_record=None
-        ws_capture=None
         activity=Activity(clock,known=observe) if is_ws else None
-        if cache_capture is not None and observe and not is_ws:
-            # Invalidate at ingress, before connection establishment or upload.
-            cache_record=cache_capture.begin(headers,url,time.monotonic())
-            if request.headers.get('Content-Encoding','identity') not in ('','identity'):
-                cache_record['request'].failed=True
         try:
             if is_ws:
                 await budget.reserve(relay_id,activity)
@@ -329,12 +315,9 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
                             if not handler.done():handler.cancel()
                     budget.connected(relay_id,retire)
 
-                    if cache_capture is not None:
-                        from .cache_capture import WebSocketCapture
-                        ws_capture=WebSocketCapture(cache_capture,tracker,headers,url)
 
                     async def relay(source,destination,outbound):
-                        nonlocal phase,cache_record
+                        nonlocal phase
                         async for msg in source:
                             if msg.type in (WSMsgType.TEXT,WSMsgType.BINARY):
                                 obj=message_metadata(msg.data)
@@ -349,12 +332,6 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
                                     diagnostic['last_client_event' if outbound else 'last_upstream_event']=identifier(obj.get('type'))
                                     if outbound:
                                         if obj.get('type')=='response.create': tracker.request(obj)
-                                    if ws_capture is not None:
-                                        raw=msg.data.encode() if isinstance(msg.data,str) else msg.data
-                                        try:
-                                            if outbound:ws_capture.outgoing(obj,raw)
-                                            else:ws_capture.incoming(obj,raw)
-                                        except Exception:ws_capture.disable()
                                     if not outbound:tracker.response(obj)
                                     if not isinstance(obj.get('type'),str) or not obj['type']:diagnostic['idle_unknown']=True
                                 try:
@@ -412,7 +389,6 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
                 try:
                     async for chunk in request.content.iter_chunked(65536):
                         phase='request_read';diagnostic['request_bytes']+=len(chunk)
-                        if cache_record is not None:cache_record['request'].feed(chunk)
                         if request_observer is not None:request_observer.feed(chunk)
                         phase='upstream_write'
                         yield chunk
@@ -448,10 +424,6 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
             # until that many bytes arrive, delaying or deadlocking a live stream.
             async for chunk in response.aiter_raw():
                 diagnostic['response_bytes']+=len(chunk)
-                if cache_record is not None:
-                    if response.headers.get('Content-Encoding','identity') not in ('','identity'):
-                        cache_record['response'].failed=True
-                    cache_record['response'].feed(chunk)
                 if response_observer is not None:response_observer.feed(chunk)
                 phase='downstream_write'
                 await downstream.write(chunk)
@@ -511,9 +483,6 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
                 return downstream
             return web.json_response({'error':{'message':'Local relay connection failed'}},status=502)
         finally:
-            if ws_capture is not None:ws_capture.close()
-            if cache_record is not None:
-                cache_capture.finish(cache_record,websocket=is_ws)
             # A failed upstream close must not leave a phantom active relay or
             # prevent pool release. Closing is best-effort after forwarding ends.
             try:
@@ -555,56 +524,18 @@ def main():
     parser.add_argument('--control-file',type=Path)
     parser.add_argument('--control-id',default='')
     parser.add_argument('--managed',action='store_true')
-    parser.add_argument('--cache-observe-only',action='store_true',help='Capture natural context; disable ALL maintenance execution')
-    parser.add_argument('--cache-worker',action='store_true',help='Continuous analysis with explicitly authorized independent execution')
-    parser.add_argument('--observation-index',type=Path,help='Existing sanitized usage index copy for observation profiles')
     args=parser.parse_args()
     if args.evidence_path.resolve().is_relative_to(Path(args.codex_home).resolve()):
         parser.error('Evidence must be stored outside the Codex home')
     store=EvidenceWriter(args.evidence_path)
-    cache_lock=None
     endpoint={'chatgpt':'https://chatgpt.com/backend-api/codex','openai':'https://api.openai.com/v1'}[args.upstream]
     if args.upstream_url:endpoint=args.upstream_url
     context=ssl.create_default_context(cafile=str(args.upstream_ca)) if args.upstream_ca else None
     from .proxy_identity import runtime_identity
-    identity=runtime_identity(args.codex_home,args.evidence_path,role='cache-observer' if args.cache_observe_only else
-        'cache-worker' if args.cache_worker else 'observer',upstream=endpoint,index=args.observation_index)
+    identity=runtime_identity(args.codex_home,args.evidence_path,role='observer',upstream=endpoint)
     identity['listen_url']=f'http://127.0.0.1:{args.port}'
     try:
-        if args.cache_observe_only or args.cache_worker:
-            if args.cache_observe_only and args.cache_worker:parser.error('Choose observation only or cache worker')
-            if args.managed or args.control_file or not args.observation_index:
-                parser.error('Observation requires its own index and unmanaged listener')
-            from .cache_scheduler import Scheduler
-            from .cache_execution import execution_owner
-            owner=execution_owner(args.observation_index.with_name('cache-control.sqlite'))
-            owner.__enter__();cache_lock=owner
-            scheduler=Scheduler(args.codex_home,args.observation_index.with_name('cache-control.sqlite'),
-                observation_only=args.cache_observe_only,continuous_capture=args.cache_worker)
-            scheduler.journal.recover_exclusive()
-            if args.cache_worker:scheduler.capture.analysis_revision=3
-            stop=asyncio.Event();control_id=uuid.uuid4().hex
-            app=create_app(store,args.codex_home,endpoint,ssl_context=context,cache_capture=scheduler.capture,
-                control_file=args.evidence_path.parent/('proxy-control-'+control_id+'.json'),
-                control_id=control_id,stop_event=stop,scheduler=scheduler,runtime_identity=identity)
-            async def observe_context(app):
-                task=asyncio.create_task(scheduler.serve())
-                try:yield
-                finally:
-                    task.cancel();await asyncio.gather(task,return_exceptions=True)
-                    await scheduler.close()
-            app.cleanup_ctx.append(observe_context)
-            async def serve_cache():
-                runner=web.AppRunner(app,access_log=None)
-                await runner.setup()
-                try:
-                    await web.TCPSite(runner,'127.0.0.1',args.port).start()
-                    await stop.wait()
-                finally:await runner.cleanup()
-            loop=proxy_loop()
-            try:loop.run_until_complete(serve_cache())
-            finally:loop.close()
-        elif args.managed:
+        if args.managed:
             from .observer_control import ObserverManager
             from .managed_proxy import ManagedProxy
             manager=ObserverManager(args.codex_home,args.evidence_path.parent,url=f'http://127.0.0.1:{args.port}')
@@ -632,17 +563,13 @@ def main():
             web.run_app(create_app(store,args.codex_home,endpoint,ssl_context=context),host='127.0.0.1',port=args.port,
                         access_log=None,print=None,loop=proxy_loop())
     finally:
-        try:
-            if not store.close():
-                raise SystemExit('관측 저장 종료 미완료 · 저장 대기 또는 누락 기록을 확인하세요')
-            if cache_lock or args.control_file:
-                from .observer_control import atomic_write
-                import json
-                stopped_id=control_id if cache_lock else args.control_id
-                atomic_write(args.evidence_path.parent/('proxy-control-'+stopped_id+'.json'),
-                    json.dumps(dict(action='stopped',id=stopped_id,storage_flushed=True)).encode())
-        finally:
-            if cache_lock:cache_lock.__exit__(None,None,None)
+        if not store.close():
+            raise SystemExit('관측 저장 종료 미완료 / 저장 대기 또는 누락 기록 확인 필요')
+        if args.control_file:
+            from .observer_control import atomic_write
+            import json
+            atomic_write(args.evidence_path.parent/('proxy-control-'+args.control_id+'.json'),
+                json.dumps(dict(action='stopped',id=args.control_id,storage_flushed=True)).encode())
 
 
 if __name__=='__main__':

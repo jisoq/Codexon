@@ -152,11 +152,11 @@ class QuotaPanel(Group):
         self.period.setAccessibleName('잔여량과 환산 내역의 조회 기간');scope.addWidget(self.period)
         scope.addWidget(Text('주간 환산 모델'))
         self.model_choice=Choice();self.model_choice.addItem('전체 모델',None)
-        self.model_choice.setAccessibleName('주간 한도 API 환산액의 모델 필터')
+        self.model_choice.setAccessibleName('주간 구독 가치 환산 모델 필터')
         scope.addWidget(self.model_choice)
         chart=Group();chart.put(background='surface',radius=6)
         chart_layout=Column(chart);chart_layout.setContentsMargins(16,16,16,14);chart_layout.setSpacing(10)
-        headline=Text('주간 사용량 API 동등 가치 · 전체 누적');headline.put(fontSize=15,bold=True)
+        headline=Text('주간 사용량 구독 가치 / 전체 누적');headline.put(fontSize=15,bold=True)
         chart_layout.addWidget(headline)
         self.result=Text();self.result.setToolTip(TIPS["quota_total"]);self.result.put(fontSize=34,bold=True,noElide=True)
         chart_layout.addWidget(self.result)
@@ -178,8 +178,8 @@ class QuotaPanel(Group):
         self.history.selected.connect(self.select_observation)
         self.history_legend=Row();self.history_legend.put(flow=True,alignRight=True);self.history_legend.setSpacing(16)
         self.legend_toggles={}
-        for name,color in (('━ 잔여량 · %','cached'),('━ 누적 API 환산액 · USD','output'),
-                           ('━ 완료 구간별 API 환산액 · USD','completed'),
+        for name,color in (('━ 잔여량 / %','cached'),('━ 누적 구독 가치 환산액 / USD','output'),
+                           ('━ 완료 구간별 구독 가치 환산액 / USD','completed'),
                            ('┄ 주간 동등 가치 · USD','written'),('╌ 전체 누적 기준 · USD','accent')):
             key={'cached':'remaining','output':'cycle_cost','completed':'completed_cost','written':'cycle_value','accent':'reference'}[color]
             legend=Toggle(name);legend.setChecked(True)
@@ -202,7 +202,7 @@ class QuotaPanel(Group):
         conversion_layout.addLayout(scope)
         metrics=Row();metrics.put(collapseBelow=620,columns=2);metrics.setSpacing(20)
         self.basis=Text();self.cost_value=Text();self.basis.setToolTip(TIPS["quota_used"]);self.cost_value.setToolTip(TIPS["cost"])
-        for name,value in (('소모량',self.basis),('API 환산액',self.cost_value)):
+        for name,value in (('소모량',self.basis),('구독 가치 환산액',self.cost_value)):
             metric=Column();label=Text(name);label.put(fontSize=13,color='muted');metric.addWidget(label)
             if value is self.basis:self.basis_label=label
             else:self.cost_label=label
@@ -218,7 +218,7 @@ class QuotaPanel(Group):
         for label,value in (('전체 구간','all'),('환산 구간','used'),('비용 제외 사유가 있는 구간','excluded')):
             self.interval_filter.addItem(label,value)
         self.interval_filter.setAccessibleName('환산 구간 상태');detail_layout.addWidget(self.interval_filter)
-        self.intervals=LazyTable(['기간','소모량','API 환산액','주간할당량 가치','산정 / 전체 호출'])
+        self.intervals=LazyTable(['기간','소모량','구독 가치 환산액','주간할당량 가치','산정 / 전체 호출'])
         self.intervals.put(inline=True)
         self.intervals.verticalHeader().setDefaultSectionSize(40)
         self.intervals.horizontalHeader().setSectionResizeMode(0,Header.Stretch)
@@ -240,7 +240,7 @@ class QuotaPanel(Group):
         self.assumption_value=Text();self.assumption_value.setWordWrap(True);self.assumption_value.hide();detail_layout.addWidget(self.assumption_value)
         self.table=Table();self.table.put(inline=True)
         self.table.setColumnCount(5)
-        self.table.setHorizontalHeaderLabels(['모델 · 요청 모드','호출 수','산정 호출 수','API 환산액','한도'])
+        self.table.setHorizontalHeaderLabels(['모델 / 요청 모드','호출 수','산정 호출 수','구독 가치 환산액','한도'])
         self.table.verticalHeader().setDefaultSectionSize(40)
         self.table.horizontalHeader().setSectionResizeMode(0,Header.Stretch)
         for col,width in enumerate((320,90,110,130,130)):self.table.setColumnWidth(col,width)
@@ -386,7 +386,7 @@ class QuotaPanel(Group):
         if rows:self.select_observation(rows[self.history.cursor])
         if period:
             self.cycle_value.setText(f"누적 소모량 {period['delta']:g}%p" if all_cycles else '선택 주기 '+usd(period['value']))
-            self.cycle_basis.setText(f"주간 100%p 기준 · 누적 API {usd(period['cost'])} / 소모 {period['delta']:g}%p"
+            self.cycle_basis.setText(f"주간 100%p 기준 / 누적 환산액 {usd(period['cost'])} / 소모 {period['delta']:g}%p"
                                     ' · '+('산정 ' if period['priced_calls']<period['calls'] else '')+call_count(period['priced_calls'],period['calls'])+'호출')
         else:
             self.cycle_value.setText('선택 주기 —');self.cycle_basis.setText('관측된 사용량 리셋 주기가 없습니다')
@@ -414,7 +414,7 @@ class QuotaPanel(Group):
         self.lifetime_value=lifetime['per_percent']*100 if lifetime['per_percent'] is not None else None
         self.result.setText(usd(self.lifetime_value))
         self.lifetime_basis.setText(
-            f"주간 100%p 기준 · 누적 API {usd(lifetime['cost'])} / 소모 {lifetime['delta']:g}%p"
+            f"주간 100%p 기준 / 누적 환산액 {usd(lifetime['cost'])} / 소모 {lifetime['delta']:g}%p"
             ' · '+('산정 ' if lifetime['observed_priced_calls']<lifetime['observed_calls'] else '')+call_count(lifetime['observed_priced_calls'],lifetime['observed_calls'])+'호출'+
             '\n관측 기반 추정 · 수집 공백 제외' if lifetime['total'] else '계산에 필요한 관측을 기다리고 있습니다')
         self.render_history()
@@ -428,7 +428,7 @@ class QuotaPanel(Group):
         model_intervals=model_cost_intervals(summary['intervals'],selected_model)
         if selected_model is None:
             self.basis_label.setText('소모량');self.basis.setToolTip(TIPS['quota_used'])
-            self.cost_label.setText('API 환산액')
+            self.cost_label.setText('구독 가치 환산액')
             self.basis.setText(f"{summary['observed_delta']:g}%p" if summary['total'] else '—')
             self.cost_value.setText(usd(summary['observed_cost']) if summary['total'] else '—')
             self.conversion_empty.setText('환산할 로컬 사용 기록이 없습니다' if not summary['total'] else
@@ -437,12 +437,12 @@ class QuotaPanel(Group):
             self.basis_label.setText('선택 모델 호출 수');self.basis.setToolTip('')
             calls=sum(row['model_calls'] for row in model_intervals)
             priced=sum(row['model_priced'] for row in model_intervals)
-            self.cost_label.setText('확인된 API 환산액' if priced<calls else 'API 환산액')
+            self.cost_label.setText('확인된 구독 가치 환산액' if priced<calls else '구독 가치 환산액')
             self.basis.setText(f"{calls:,}회")
             known=[row['model_cost'] for row in model_intervals if row['model_cost'] is not None]
             self.cost_value.setText(usd(sum(known)) if known else '—')
             self.conversion_empty.setText('선택 기간에 이 모델의 관측된 호출이 없습니다' if not model_intervals else
-                                           '선택 모델의 API 비용을 확인할 수 없습니다' if not known else
+                                           '선택 모델의 구독 가치 환산액을 확인할 수 없습니다' if not known else
                                            f'{priced:,}/{calls:,}호출의 비용 확인' if priced<calls else '')
         self.conversion_empty.setVisible(bool(self.conversion_empty.text()))
         self.details.setVisible(bool(model_intervals))
@@ -469,8 +469,8 @@ class QuotaPanel(Group):
         self.filtered_intervals=rows
         partial=any(r['model_priced']<r['model_calls'] if selected_model else r.get('priced_calls',r['calls'])<r['calls'] for r in rows)
         self.intervals.setHorizontalHeaderLabels(
-            ['기간','계정 소모량','선택 모델 API','구간 API 비용 비중','산정 / 모델 호출' if partial else '호출 수'] if selected_model else
-            ['기간','소모량','API 환산액','주간할당량 가치','산정 / 전체 호출' if partial else '호출 수'])
+            ['기간','계정 소모량','선택 모델 환산액','구간 구독 가치 환산액 비중','산정 / 모델 호출' if partial else '호출 수'] if selected_model else
+            ['기간','소모량','구독 가치 환산액','주간할당량 가치','산정 / 전체 호출' if partial else '호출 수'])
         self.intervals.put(headerTips={'4':TIPS['coverage']} if partial else {})
         self.intervals.setVisible(bool(rows))
         self.interval_empty.setVisible(not rows)
