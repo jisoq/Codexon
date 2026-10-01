@@ -188,6 +188,44 @@ def test_product_has_no_cache_executor_or_control_interface():
     assert 'scheduler' not in inspect.signature(create_app).parameters
 
 
+def test_dashboard_and_worker_share_separate_observation_directory(tmp_path,monkeypatch):
+    from PySide6.QtCore import QSettings
+    from PySide6.QtWidgets import QApplication
+    from cachemonitor.dashboard import Dashboard
+    from cachemonitor.proxy_target import ProxyTarget
+    app=QApplication.instance() or QApplication([])
+    previous=app.property('cachemonitorDisableShellIntegration');app.setProperty('cachemonitorDisableShellIntegration',True)
+    home=tmp_path/'home';home.mkdir();index=tmp_path/'usage'/'index.sqlite';evidence=tmp_path/'observations'/'custom.sqlite'
+    index.parent.mkdir();evidence.parent.mkdir()
+    atomic_write(index.with_name('cache-route.json'),json.dumps(dict(url='http://127.0.0.1:18992')).encode())
+    monkeypatch.setattr('cachemonitor.launch_context.preferences',lambda *args,**kwargs:{})
+    window=Dashboard([str(home)],start_worker=False,live_limits=False,index_path=index,model_evidence_path=evidence,
+        settings=QSettings(str(tmp_path/'settings.ini'),QSettings.IniFormat))
+    try:
+        m=window.observer_panel.manager
+        assert m.directory.resolve()==evidence.parent.resolve() and m.evidence.resolve()==evidence.resolve()
+        assert m.retirement_index==index.resolve() and m.url=='http://127.0.0.1:18992'
+        assert ProxyTarget(m).locks==[evidence.parent/'proxy-supervisor.lock']
+        command=m.supervisor_command('chatgpt')
+        assert command[command.index('--evidence-path')+1]==str(evidence)
+    finally:window.quit_app();app.setProperty('cachemonitorDisableShellIntegration',previous)
+
+
+@pytest.mark.parametrize('entry',['proxy_update','proxy_supervisor'])
+def test_proxy_entry_points_use_explicit_observation_filename(tmp_path,monkeypatch,entry):
+    import importlib
+    module=importlib.import_module('cachemonitor.'+entry);captured={}
+    evidence=tmp_path/'observations'/'custom.sqlite'
+    monkeypatch.setattr(sys,'argv',['worker','--codex-home',str(tmp_path/'home'),'--evidence-path',str(evidence),'--port','18993'])
+    if entry=='proxy_update':
+        monkeypatch.setattr(module,'ProxyUpdate',lambda m:SimpleNamespace(run=lambda:captured.update(manager=m,command=m.command('chatgpt'))))
+    else:
+        monkeypatch.setattr(module,'Supervisor',lambda m,upstream,worker_command:SimpleNamespace(run=lambda:captured.update(manager=m,command=worker_command)))
+    module.main()
+    assert captured['manager'].evidence==evidence.resolve()
+    assert captured['command'][captured['command'].index('--evidence-path')+1]==str(evidence.resolve())
+
+
 def test_app_service_start_retires_before_adopting_proxy(tmp_path,monkeypatch):
     from cachemonitor.app_services import AppServices
     events=[]

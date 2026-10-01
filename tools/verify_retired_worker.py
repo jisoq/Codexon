@@ -29,10 +29,11 @@ def wait(read,valid,seconds=90):
 
 def verify(root,old,new,role):
     root.mkdir(parents=True,exist_ok=False);home=root/'custom home';home.mkdir();(home/'codexon-test-home').touch()
-    data=root/'data';data.mkdir();index=data/'index.sqlite';evidence=data/'model-evidence.sqlite'
+    data=root/'data';data.mkdir();index=data/'index.sqlite'
+    evidence=root/'observations'/'custom-observations.sqlite';evidence.parent.mkdir()
     with socket.socket() as sock:sock.bind(('127.0.0.1',0));port=sock.getsockname()[1]
     assert port!=8768
-    manager=ObserverManager(home,data,f'http://127.0.0.1:{port}');manager.retirement_index=index
+    manager=ObserverManager(home,evidence.parent,f'http://127.0.0.1:{port}');manager.evidence=evidence;manager.retirement_index=index
     manager.write_state(dict(home=home_key(home),url=manager.url,enabled=True,phase='active',previous_url=None,upstream='chatgpt'))
     manager.set_url(manager.url)
     atomic_write(data/'cache-route.json',json.dumps(dict(url=manager.url)).encode())

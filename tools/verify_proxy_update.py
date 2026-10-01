@@ -93,6 +93,7 @@ def main():
     parser.add_argument('--port', type=int, default=18769)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--idle-connections', type=int, default=0)
+    parser.add_argument('--custom-evidence', action='store_true')
     parser.add_argument('--expect-unsupported', action='store_true')
     parser.add_argument('--exercise-rollback', action='store_true')
     parser.add_argument('--interrupt-after-drain', action='store_true')
@@ -113,6 +114,7 @@ def main():
     home = root / 'home'
     home.mkdir(exist_ok=True)
     m = ObserverManager(home, root / 'data', url=f'http://127.0.0.1:{options.port}')
+    if options.custom_evidence:m.evidence=root/'data'/'custom-observations.sqlite'
     updater = ObserverTask(home_key(home), role='ProxyUpdate')
     home.joinpath('config.toml').write_text(f'openai_base_url="http://127.0.0.1:{options.port}"\n')
     m.write_state(dict(home=home_key(home), enabled=True, phase='active', upstream='chatgpt'))
@@ -120,7 +122,7 @@ def main():
     before = m.config_path.read_bytes()
     peers = IdleConnections()
     try:
-        roles = ['--proxy-supervisor']
+        roles = ['--model-proxy','--managed'] if options.custom_evidence else ['--proxy-supervisor']
         m.task.start([str(old), *roles, *args, '--upstream-url', peers.url], autostart=False)
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:

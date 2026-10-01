@@ -539,6 +539,7 @@ def main():
             from .observer_control import ObserverManager
             from .managed_proxy import ManagedProxy
             manager=ObserverManager(args.codex_home,args.evidence_path.parent,url=f'http://127.0.0.1:{args.port}')
+            manager.evidence=args.evidence_path.resolve()
             loop=proxy_loop()
             try:loop.run_until_complete(ManagedProxy(manager).serve(store,endpoint,context,args.port,identity=identity))
             finally:loop.close()

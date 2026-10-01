@@ -220,5 +220,6 @@ def main():
     parser.add_argument('--port',type=int,default=8768)
     args=parser.parse_args()
     manager=ObserverManager(args.codex_home,args.evidence_path.parent,url=f'http://127.0.0.1:{args.port}')
+    manager.evidence=args.evidence_path.resolve()
     ProxyUpdate(manager).run()
     return 0
