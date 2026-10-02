@@ -1,6 +1,7 @@
 """Fixed logical-pixel monitor and identifier-based call inspection."""
 import math
 import re
+import time
 from datetime import datetime
 from PySide6.QtCore import Qt, QRectF, QPointF, QObject, Property, Slot, QTimer
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen, QBrush
@@ -137,12 +138,12 @@ def palette(appearance):
 class Drawing:
     def __init__(self,painter,content):
         self.p=painter;self.model=content;self.colors=palette(content.appearance);painter.setRenderHint(QPainter.Antialiasing)
-    def text(self,value,x,y,w,h=16,size=11,color='ink',weight=400,right=False,elide=False,center=False):
+    def text(self,value,x,y,w,h=16,size=11,color='ink',weight=400,right=False,elide=False,center=False,wrap=False):
         literal=isinstance(value,Verbatim);value=tr(str(value))
         p=self.p;p.setFont(font(self.model.appearance.family,size,weight));p.setPen(self.colors.get(color,color))
         if elide:value=QFontMetrics(p.font()).elidedText(str(value),Qt.ElideRight,round(w))
         alignment=Qt.AlignHCenter if center else Qt.AlignRight if right else Qt.AlignLeft
-        p.drawText(QRectF(x,y,w,h),alignment|Qt.AlignVCenter,Verbatim(value) if literal else str(value))
+        p.drawText(QRectF(x,y,w,h),alignment|Qt.AlignVCenter|(Qt.TextWordWrap if wrap else 0),Verbatim(value) if literal else str(value))
     def number(self,value,x,baseline,w,size,color='ink',weight=600,right=False):
         value=tr(str(value))
         p=self.p;p.setFont(font(self.model.appearance.family,size,weight));p.setPen(self.colors[color])
@@ -165,11 +166,11 @@ class Drawing:
         if pattern:
             hatch=QColor(self.colors['surface']);hatch.setAlpha(145);p.setBrush(QBrush(hatch,Qt.BDiagPattern));p.drawRect(QRectF(x,y,w,h))
     def line(self,x,y,x2,y2,color='border',width=1,dashed=False):
-        pen=QPen(self.colors.get(color,color),width)
+        pen=QPen(QColor(self.colors.get(color,color)),width)
         if dashed:pen.setDashPattern([1,1])
         self.p.setPen(pen);self.p.drawLine(QPointF(x,y),QPointF(x2,y2))
     def dot(self,x,y,color='ink',r=1.5):
-        self.p.setPen(Qt.NoPen);self.p.setBrush(self.colors[color]);self.p.drawEllipse(QPointF(x,y),r,r)
+        self.p.setPen(Qt.NoPen);self.p.setBrush(QColor(self.colors.get(color,color)));self.p.drawEllipse(QPointF(x,y),r,r)
     def graphs(self,rows,x,y,width,capacity,detail=False):
         m=self.model;left=36;plot=width-left;step=plot/capacity
         cache_y=y+20;cache_h=64 if detail else 32
@@ -269,6 +270,8 @@ class OverlayContent(Node):
         self.detail_open=False;self.detail_inline=False;self.detail_width=208
         self.selected_id=None;self.selected_snapshot=None;self.hover_id=None;self.follow_latest=True;self.graph_pinned=False;self.quota_lines=('','')
         self.monitor_tab='latest';self.composition_unit='tokens';self.lower_offset=0;self.settings=None
+        self._freshness_label=''
+        self._agent_scope=None;self._agent_slots={}
         self.highlight_id=None;self._highlight_timer=QTimer(self);self._highlight_timer.setSingleShot(True)
         self._highlight_timer.timeout.connect(self.clear_highlight)
         self._graph=DetailGraph(self);self._body=DetailBody(self)
@@ -279,6 +282,30 @@ class OverlayContent(Node):
     def detailBody(self):return self._body
     @property
     def monitor_x(self):return 240 if self.detail_open and not self.detail_inline else 0
+    @property
+    def is_remote(self):return self.note.startswith('원격 작업')
+    def notice_card(self):
+        from .overlay_monitor import REMOTE_HEADING,REMOTE_DESCRIPTION
+        if self.is_remote:return REMOTE_HEADING,REMOTE_DESCRIPTION
+        if self.note in ('기록 확인 중','세션 기록 확인 중','기록 수집 중 · 잠정값'):
+            return '기록 확인 중','세션 기록을 읽고 있습니다. 확인된 사용량이 준비되면 표시합니다.'
+        if self.note=='호출 기록 없음' or not self.note and (self.data or {}).get('calls')==0:
+            return '호출 기록 대기','아직 수집된 호출이 없습니다. 호출 기록이 수집되면 사용량을 표시합니다.'
+        return None
+    def freshness_text(self):return self._freshness_label
+    @staticmethod
+    def collection_age(data,note):
+        if not data or note not in ('수집 지연','수집 오류'):return ''
+        from .i18n import formatted
+        at=data.get('_collection',{}).get('last_confirmed_at')
+        if not at:return tr('이전 확인값 표시 중: 확인 시각 없음')
+        seconds=max(0,int(time.time()-at))
+        if seconds<60:return tr('1분 이내 확인값 표시 중')
+        if seconds<3600:return formatted('{minutes}분 전 확인값 표시 중',minutes=seconds//60)
+        return formatted('{time} 확인값 표시 중',time=timestamp(at))
+    def display_title(self):
+        from .overlay_monitor import REMOTE_TITLE
+        return tr(REMOTE_TITLE) if self.is_remote else (self.data or {}).get('title') or (tr('세션 사용량') if self.notice_card() else '')
     def set_layout(self,reduced=False,detail=False,inline=False,**kwargs):
         values=(kwargs.get('compact',reduced),kwargs.get('detail_open',detail),kwargs.get('detail_inline',inline))
         if values==(self.compact,self.detail_open,self.detail_inline):return
@@ -291,13 +318,15 @@ class OverlayContent(Node):
         if note.startswith('원격 작업') or note=='현재 세션 식별 불가':data=None
         def visible(value):
             return {k:v for k,v in (value or {}).items() if k!='_collection'} | {'_errors':(value or {}).get('_collection',{}).get('errors',[])}
-        if (visible(data),note,appearance)==(visible(self.data),self.note,self.appearance):
+        freshness=self.collection_age(data,note)
+        if (visible(data),note,appearance,freshness)==(visible(self.data),self.note,self.appearance,self._freshness_label):
             self.data=data;return
         old=(self.data or {}).get('id'),(self.data or {}).get('home');new=(data or {}).get('id'),(data or {}).get('home')
         old_call=self.call_id(self.rows()[-1]) if self.rows() else None
         if old!=new:
             self.selected_id=None;self.selected_snapshot=None;self.hover_id=None;self.follow_latest=True;self.graph_pinned=False
         self.data=data;self.note=note;self.appearance=appearance;self.dark=appearance.dark
+        self._freshness_label=freshness
         self.lower_offset=min(self.lower_offset,max(0,self.base_height(False)-self.base_height()))
         if old!=new:self.inspected_call=None;self.lower_offset=0;self.clear_highlight()
         elif self.rows() and old_call!=self.call_id(self.rows()[-1]) and not self.state.get('reducedMotion'):
@@ -311,6 +340,17 @@ class OverlayContent(Node):
     def clear_highlight(self):
         self.highlight_id=None;self._highlight_timer.stop();self.update();self._graph.update()
     def rows(self):return (self.data or {}).get('recent',[])[-12:]
+    def graph_colors(self,rows):
+        from .token_colors import categorical
+        data=self.data or {};scope=(data.get('home'),data.get('id'))
+        if scope!=self._agent_scope:
+            self._agent_scope=scope;self._agent_slots={scope:0}
+        for row in rows:
+            agent=(row.get('home'),row.get('sid'))
+            if agent not in self._agent_slots:self._agent_slots[agent]=len(self._agent_slots)
+        colors=ui_palette(self.appearance)
+        series=categorical(self.appearance.accent,(colors['surface'],colors['overlay']),len(self._agent_slots))
+        return {agent:series[index] for agent,index in self._agent_slots.items()}
     @staticmethod
     def call_id(row):return (row.get('home'),row.get('sid'),row.get('id') or row.get('key'))
     def select(self,key):
@@ -410,9 +450,12 @@ class OverlayContent(Node):
         return scope(self.data or {})
     def notice(self):return (self.status_text(),self.states()[0][1]) if self.states() else ('','muted')
     def layout(self,reduced=None):
+        if self.notice_card():
+            from .overlay_monitor import notice_geometry
+            return notice_geometry(self)
         reduced=self.compact if reduced is None else reduced
         from .overlay_monitor import geometry,footer
-        return geometry(self.data,reduced,has_footer=bool(footer(self)[0]))
+        return geometry(self.data,reduced,has_footer=bool(footer(self)[0]),has_freshness=bool(self.freshness_text()))
     def base_height(self,reduced=None):return self.layout(reduced)['height']
     def monitor_height(self,reduced=False):return round(self.base_height(reduced)*self.appearance.scale)
     def panel_width(self):return round((WIDTH+self.monitor_x)*self.appearance.scale)
@@ -436,10 +479,14 @@ class OverlayContent(Node):
         return 84+24*(rows-1)
     def composition_height(self):return 0 if self.compact else self.composition_full_height()
     def lines(self):
+        if self.notice_card():return [self.display_title(),*[tr(text) for text in self.notice_card()]]
         d=self.data or {};a,b=self.context()
         return [d.get('title',''),a,b,percent(d.get('cache_rate')),money(d.get('cost')),money(d.get('mean_cost')),money(d.get('latest_cost')),
                 f"{d.get('priced',0)} / {d.get('calls',0)}" if d.get('missing') else str(d.get('calls','—')),self.status_text(),value_text(d.get('latest',{}).get('output_speed'),'output_speed')]
     def refresh_accessibility(self):
+        if self.notice_card():
+            self.setAccessibleName(Verbatim('\n'.join(self.lines())))
+            return
         d=self.data or {};values=[d.get('title',''),*self.context(),'최근 호출','캐시 '+percent(d.get('cache_rate')),'비용 '+money(d.get('latest_cost'),False),
               '평균 출력 속도 '+(value_text(d['latest']['output_speed'],'output_speed') if d.get('latest',{}).get('output_speed') is not None else '측정 불가'),
               self.session_scope(),'세션 캐시 적중률 '+percent(d.get('token_composition',{}).get('cache_hit_rate')),
@@ -461,6 +508,7 @@ class OverlayContent(Node):
             values.extend(p['label']+' '+(fmt(p['tokens']) if p.get('known',True) else '미확인') for p in comp.get(section+'_parts',[]))
         misses=d.get('cache_misses',{})
         if misses.get('count'):values.append(f"{'자체 ' if d.get('descendants') else ''}캐시 미적중 {misses['count']}회 · 해당 입력 {amount(misses.get('input'),True)}토큰")
+        values.append(self.freshness_text())
         self.setAccessibleName(Verbatim(values[0]+'\n'+tr('\n'.join(filter(None,values[1:])))))
     def detail_items(self):
         d=self.data or {};row=self.selected();w=self.detail_width;items=[];y=0
@@ -622,7 +670,7 @@ class OverlayContent(Node):
             else:pass
         if self.detail_inline:p.restore();return
         p.save();p.translate(self.monitor_x,0);data=self.data or {};layout=self.layout()
-        d.text(Verbatim(data.get('title','')),MARGIN,layout['header'],TITLE_WIDTH,24,14,weight=600,elide=True)
+        d.text(Verbatim(self.display_title()),MARGIN,layout['header'],TITLE_WIDTH,24,14,weight=600,elide=True)
         from .overlay_monitor import paint
         paint(d,self)
         p.restore();p.restore()

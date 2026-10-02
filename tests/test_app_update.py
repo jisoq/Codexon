@@ -99,6 +99,54 @@ def test_update_panel_keeps_success_when_proxy_is_off():
     panel.deleteLater()
     app.processEvents()
 
+
+@pytest.mark.parametrize('previous_kind',[None,'none','app'])
+def test_failed_update_recheck_labels_previous_result_and_recovers(monkeypatch,previous_kind):
+    from urllib.error import URLError
+    from PySide6.QtWidgets import QApplication
+    from PySide6.QtTest import QTest
+    from cachemonitor.update_panel import UpdatePanel
+    app=QApplication.instance() or QApplication([])
+    panel=UpdatePanel(None)
+    def settle():
+        for _ in range(300):
+            app.processEvents();QTest.qWait(10)
+            if panel.operation is None:return
+        raise AssertionError('Update check did not finish')
+    try:
+        if previous_kind:
+            panel.pending_plan=dict(kind=previous_kind,reason='프록시 사용 안 함')
+            panel.finished()
+        def fail(*args):raise URLError(TimeoutError('synthetic timeout'))
+        monkeypatch.setattr(app_update,'check_update',fail)
+        panel.start();settle()
+        assert panel.app_state.text()==panel.proxy_state.text()=='이번 확인 실패'
+        assert '응답이 늦어지고 있습니다' in panel.status.text()
+        assert 'synthetic timeout' not in panel.status.text()
+        assert 'synthetic timeout' in panel.error_detail.body.text()
+        assert panel.error_detail.isVisible() and not panel.error_detail.content.isVisible()
+        assert ('마지막 성공 확인' in panel.checked.text()) if previous_kind else ('성공한 업데이트 확인 기록 없음'==panel.checked.text())
+        assert not panel.execute.isVisible() and panel.offer is None
+        panel.proxy_status({'update':{'phase':'complete','message':'이전 업데이트 완료'}})
+        assert '응답이 늦어지고 있습니다' in panel.status.text()
+        monkeypatch.setattr(app_update,'check_update',lambda *args:dict(kind='none',reason='프록시 사용 안 함'))
+        panel.start();settle()
+        assert '최신 버전' in panel.app_state.text()
+        assert panel.checked.text().startswith('최근 확인')
+        assert not panel.error_detail.isVisible() and panel.button.isEnabled()
+    finally:
+        if panel.operation:panel.operation.wait()
+        panel.deleteLater();app.processEvents()
+
+
+def test_update_failure_explanations_do_not_confuse_file_and_network_errors():
+    from urllib.error import HTTPError, URLError
+    from cachemonitor.update_panel import failure_message
+    assert '요청을 제한' not in failure_message(HTTPError('https://example.test',403,'Forbidden',None,None),True)
+    assert '요청을 제한' in failure_message(HTTPError('https://example.test',429,'Too Many Requests',None,None),True)
+    assert '연결하지 못했습니다' in failure_message(URLError(OSError('synthetic refusal')),True)
+    assert '파일 접근 권한' in failure_message(PermissionError('synthetic file denial'),False)
+
 @pytest.mark.parametrize('kind',['app','proxy'])
 @pytest.mark.parametrize('choice',['accept','later','close','closing'])
 def test_update_confirmation_gates_every_mutation(tmp_path,monkeypatch,kind,choice):

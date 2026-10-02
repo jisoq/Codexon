@@ -1,7 +1,7 @@
 import copy
 import pytest
 from cachemonitor.core import Session
-from cachemonitor.pricing import token_cost,display_tier,mode_assumptions,COST_COMPONENTS
+from cachemonitor.pricing import token_cost,display_tier,mode_assumptions,COST_COMPONENTS,COST_KEYS
 from cachemonitor.analytics import analyze, overview_view
 from cachemonitor.analysis_engine import AnalysisEngine
 from cachemonitor.quota_cycles import QuotaLedger
@@ -24,11 +24,13 @@ def history():
 
 
 def test_fixed_fast_rates_thresholds_and_unknown_is_never_base_cost():
-    for model in ('gpt-6-astra','gpt-6.1-sol','gpt-6-sol','gpt-6-luna','gpt-5.5','gpt-5.6-sol','gpt-5.6-terra','gpt-5.6-luna','gpt-5.4-mini'):
+    for model in ('gpt-6-astra','gpt-6-sol','gpt-6.1-sol','gpt-6-luna','gpt-5.5',
+                  'gpt-5.6-sol','gpt-5.6-terra','gpt-5.6-luna','gpt-5.4-mini'):
         for inp in (100000,272001):
             base={**usage(model=model),'input':inp}
             standard=token_cost(base);fast=token_cost(dict(base,service_tier='Fast'))
-            assert fast['cost']==pytest.approx(2.5*standard['cost'])
+            for key in COST_KEYS:
+                assert fast[key]==pytest.approx(2.5*standard[key])
             assert sum(fast[k] for k in COST_COMPONENTS)==pytest.approx(fast['cost'])
             for component in COST_COMPONENTS:
                 assert fast[component]==pytest.approx(2.5*standard[component])
@@ -44,7 +46,7 @@ def test_fixed_fast_rates_thresholds_and_unknown_is_never_base_cost():
     assert token_cost(usage('auto'))['cost'] is None
 
 
-def test_modes_and_mixed_request_keep_exact_metric_denominators():
+def test_modes_and_mixed_request_keep_exact_metric_denominators(tmp_path):
     a=analyze([history()]);overview=overview_view(a,1000000,1000010)
     assert (overview['call_stats']['n'],overview['call_stats']['missing'])==(5,1)
     assert overview['total']==pytest.approx(3.24)
@@ -56,6 +58,21 @@ def test_modes_and_mixed_request_keep_exact_metric_denominators():
     assert next(t for t in a['turns'] if t['turn']=='mixed')['service_tier']=='혼합'
     assert unknown['totals']['cost'] is None and unknown['totals']['reasoning']==1000
     assert display_tier(unknown['responses'][0])=='미확인'
+    from cachemonitor.overlay_data import OverlaySummaries
+    source=history();source['history']=source['history'][:-1]
+    engine=AnalysisEngine();engine.ingest([source]);ledger=QuotaLedger(tmp_path/'totals.sqlite')
+    try:
+        ledger.observe('h',dict(windows={'weekly':dict(used_percent=10,resets_at=2000000,window_minutes=10080)},
+                               plan_type='pro',observed_at=999999,source='live',account='a'))
+        ledger.observe('h',dict(windows={'weekly':dict(used_percent=20,resets_at=2000000,window_minutes=10080)},
+                               plan_type='pro',observed_at=1000010,source='live',account='a'))
+        ledger.sync(engine,dict(homes=['h'],sessions=[source],ts=1000010,index={'loading':False}))
+        overlay=OverlaySummaries().collect(engine)[0]
+        report=ledger.report('h',1000010)
+        assert overlay['cost']==pytest.approx(overview['total'])
+        assert engine.query(dict(page=2,start=999999,end=1000010))['session_costs'][('h','s')]['cost']==pytest.approx(overview['total'])
+        assert report['cycles'][0]['cost']==pytest.approx(overview['total'])
+    finally:ledger.close()
 
 
 def test_price_corrections_invalidate_worker_and_ledger_without_reclassifying_unknown(tmp_path):
@@ -73,6 +90,23 @@ def test_price_corrections_invalidate_worker_and_ledger_without_reclassifying_un
         assert result['overview']['calls']==2
         assert all(r['service_tier']=='Standard' for r in result['analysis']['responses'])
     finally:ledger.close()
+
+
+def test_price_policy_change_invalidates_revision_shortcut_and_overlay(monkeypatch):
+    from dataclasses import replace
+    from cachemonitor import pricing
+    from cachemonitor.overlay_data import OverlaySummaries
+    source=history();source['usage_revision']=1
+    engine=AnalysisEngine();overlays=OverlaySummaries();engine.ingest([source])
+    first=overlays.collect(engine)[0]
+    assert not engine.ingest([source])
+    rate=pricing.RATES['gpt-6-astra']
+    monkeypatch.setitem(pricing.SUBSCRIPTION_FAST_MULTIPLIERS,'gpt-6-astra',3)
+    monkeypatch.setitem(pricing.FAST_RATES,'gpt-6-astra',replace(rate,input=30,cached=3,written=37.5,output=150))
+    assert engine.ingest([source])
+    assert overlays.collect(engine)[0]['cost']==pytest.approx(3.645)
+    assert first['cost']==pytest.approx(3.24)
+    assert engine.record('h','s','5')['cost'] is None
 
 
 def test_unknown_price_migration_retains_original_mode_and_excludes_base_amount(tmp_path):
@@ -112,3 +146,35 @@ def test_imported_usage_reprices_without_recreating_retired_permissions(tmp_path
             assert len(history)==1 and history[0]['key']=='response'
             assert token_cost(history[0])['cost']==pytest.approx(1.0125)
     assert not path.with_name('cache-control.sqlite').exists()
+
+
+def test_subscription_policy_migration_archives_old_costs_and_keeps_source_records(tmp_path):
+    from cachemonitor.quota_cycles import PRICE_ID, TOKEN_FIELDS
+    source=history()
+    for index,model in ((0,'gpt-5.5-pro'),(1,'gpt-5.4-mini'),(3,'gpt-5.6'),(4,'gpt-daybreak-blue-latest')):
+        source['history'][index].update(model=model,configured_model=model)
+    engine=AnalysisEngine();engine.ingest([source]);path=tmp_path/'migration.sqlite'
+    snapshot=dict(homes=['h'],sessions=[source],ts=1000010,index={'loading':False})
+    ledger=QuotaLedger(path)
+    ledger.sync(engine,snapshot)
+    ledger.db.execute("insert into prices values('old-v5','{\"policy\":\"old-v5\"}')")
+    ledger.db.execute("update calls set cost=.81,price_id='old-v5'")
+    ledger.db.commit()
+    fields=('home','uid','sid','ts','model','service_tier',*TOKEN_FIELDS)
+    original=[tuple(row[key] for key in fields) for row in ledger.db.execute('select * from calls order by uid')]
+    ledger.close()
+    for _ in range(2):
+        restored=QuotaLedger(path)
+        try:
+            rows=list(restored.db.execute('select * from calls order by uid'))
+            assert [tuple(row[key] for key in fields) for row in rows]==original
+            assert rows[2]['cost']==pytest.approx(1.0125)
+            assert rows[1]['cost']==pytest.approx(.03)
+            assert rows[3]['cost']==pytest.approx(.162)
+            assert all(rows[index]['cost'] is None for index in (0,4,5))
+            assert all(row['price_id']==PRICE_ID for row in rows)
+            restored.sync(engine,snapshot);restored.sync(engine,snapshot)
+            archived=list(restored.db.execute("select * from cost_archive where price_id='old-v5'"))
+            assert len(archived)==len(rows) and all(row['cost']==.81 for row in archived)
+            assert restored.db.execute("select data from prices where id='old-v5'").fetchone()[0]=='{"policy":"old-v5"}'
+        finally:restored.close()

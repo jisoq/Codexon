@@ -46,8 +46,8 @@ Item {
     }
     NodeChild {
         node: root.node.nodes[3]
-        x: root.wide ? root.width - 400 : 0; y: 0
-        width: root.wide ? 400 : root.width; height: root.height
+        x: root.wide ? root.width - 400 : root.mainX; y: 0
+        width: root.wide ? 400 : root.mainWidth; height: root.height
         visible: root.detailed
     }
 }

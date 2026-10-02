@@ -118,7 +118,7 @@ class QuotaPanel(Group):
         self.status=Text()
         self.status.put(color='error',fontSize=13,wrap=False);self.status.setFixedHeight(24)
         heading.addWidget(self.status,1)
-        current=Row();current.put(collapseBelow=720);current.setSpacing(16)
+        current=self.current_row=Row();current.put(collapseBelow=720);current.setSpacing(16)
         limits=Group();limits_layout=Row(limits);limits_layout.put(collapseBelow=420);limits_layout.setSpacing(16)
         current.addWidget(limits,2)
         self.current={}
@@ -156,13 +156,20 @@ class QuotaPanel(Group):
         scope.addWidget(self.model_choice)
         chart=Group();chart.put(background='surface',radius=6)
         chart_layout=Column(chart);chart_layout.setContentsMargins(16,16,16,14);chart_layout.setSpacing(10)
-        headline=Text('주간 사용량 구독 가치 / 전체 누적');headline.put(fontSize=15,bold=True)
+        self.history_waiting=Group()
+        waiting_layout=Column(self.history_waiting);waiting_layout.setSpacing(8)
+        waiting_title=Text('사용량 기록 수집 대기');waiting_title.put(fontSize=18,bold=True)
+        waiting_note=Text('로컬 작업의 사용량이 수집되면 소모량과 구독 가치 환산액을 표시합니다.')
+        waiting_note.put(fontSize=14,color='muted',wrap=True)
+        waiting_layout.addWidget(waiting_title);waiting_layout.addWidget(waiting_note)
+        chart_layout.addWidget(self.history_waiting)
+        headline=self.summary_heading=Text('주간 사용량 구독 가치 / 전체 누적');headline.put(fontSize=15,bold=True)
         chart_layout.addWidget(headline)
         self.result=Text();self.result.setToolTip(TIPS["quota_total"]);self.result.put(fontSize=34,bold=True,noElide=True)
         chart_layout.addWidget(self.result)
         self.lifetime_basis=Text();self.lifetime_basis.put(fontSize=12,color='muted',wrap=True)
         chart_layout.addWidget(self.lifetime_basis)
-        controls=Row();controls.setSpacing(12)
+        controls=self.history_controls=Row();controls.setSpacing(12)
         self.chart_title=chart_title=Text('선택 주기의 사용량 추이');chart_title.put(fontSize=18,bold=True)
         controls.addWidget(chart_title,1)
         self.window=Choice();self.window.addItem('주간','weekly');self.window.addItem('5시간','five_hour')
@@ -192,6 +199,8 @@ class QuotaPanel(Group):
         self.history_legend.addWidget(self.reset_legend)
         chart_layout.addLayout(self.history_legend)
         chart_layout.addWidget(self.history)
+        self.history_empty=Text();self.history_empty.put(fontSize=14,color='muted',wrap=True)
+        chart_layout.addWidget(self.history_empty)
         self.model_legend=Row();self.model_legend.put(flow=True);self.model_legend.setSpacing(16)
         chart_layout.addLayout(self.model_legend)
         self.cycle_choice.currentIndexChanged.connect(self.render_history)
@@ -296,6 +305,8 @@ class QuotaPanel(Group):
         self.reset_count.setText(resets['count']);self.reset_note.setText(resets['note'])
         self.reset_details.set_sections(resets['sections']);self.reset_details.setVisible(bool(resets['sections']))
         available=set((quota or {}).get('windows',{})) | set((quota or {}).get('unlimited_windows',[])) | set((quota or {}).get('window_conflicts',[]))
+        self.current_row.setVisible(bool(available or quota))
+        self.reset_card.setVisible(bool(quota))
         self.current_empty.setVisible(not available and not self.issue)
         tracking=self.report.get('tracking')
         observed=(quota or {}).get('observed_at')
@@ -381,6 +392,13 @@ class QuotaPanel(Group):
                 label=Text(name);label.put(fontSize=12,color='muted');self.model_legend.addWidget(label)
         self.model_legend.setVisible(weekly and bool(self.history.rows))
         rows=self.history.rows
+        any_history=bool(self._view['overall']['rows'] or self._view['five_hour']['rows'] or
+                         any(item['series']['rows'] for item in self._view['periods']))
+        self.history_controls.setVisible(any_history)
+        self.history_legend.setVisible(bool(rows))
+        self.history.setVisible(bool(rows))
+        self.history_empty.setText(self.history.empty_text)
+        self.history_empty.setVisible(any_history and not rows)
         self.history.cursor=(len(rows)-1 if rows and (follow or not same) else
                              min(bisect_left(series['times'],old),len(rows)-1) if rows and old is not None else 0)
         if rows:self.select_observation(rows[self.history.cursor])
@@ -390,7 +408,8 @@ class QuotaPanel(Group):
                                     ' · '+('산정 ' if period['priced_calls']<period['calls'] else '')+call_count(period['priced_calls'],period['calls'])+'호출')
         else:
             self.cycle_value.setText('선택 주기 —');self.cycle_basis.setText('관측된 사용량 리셋 주기가 없습니다')
-        for node in (self.cycle_choice,self.cycle_value,self.cycle_basis):node.setVisible(weekly)
+        self.cycle_choice.setVisible(weekly and any_history and bool(self._view['periods']))
+        for node in (self.cycle_value,self.cycle_basis):node.setVisible(weekly and bool(lifetime['total']))
 
         for key,toggle in self.legend_toggles.items():toggle.setVisible(weekly or key=='remaining')
 
@@ -401,6 +420,9 @@ class QuotaPanel(Group):
         self.refresh_status()
         self.lifetime_statistics=(self.report.get('view') or {}).get('lifetime') or quota_statistics(self.report)
         lifetime=self.lifetime_statistics
+        has_usage=bool(lifetime['total'])
+        self.history_waiting.setVisible(not has_usage)
+        for node in (self.summary_heading,self.result,self.lifetime_basis,self.conversion):node.setVisible(has_usage)
         selected_model=self.model_choice.currentData()
         available=sorted({model['model'] for row in lifetime['intervals'] for model in row['models']
                           if model.get('model') and not model.get('separate')})

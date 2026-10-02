@@ -60,7 +60,10 @@ def start_smoke(window,app,path,fonts,depth='full'):
             search=control(window,window.search);search.forceActiveFocus()
             QTest.keyClicks(window.quick,'__qml_no_such_session__');settle()
             assert window.table.rowCount()==0
-            assert window.record_message.text() in ('조건에 맞는 기록 없음','사용 기록 없음')
+            expected='검색 조건에 맞는 기록 없음' if window.snapshot['sessions'] else '사용 기록 없음'
+            assert window.record_message.text()==expected
+            assert window.table.state['emptyText']==expected
+            if window.snapshot['sessions']:assert window.table.nodes[0].isVisible()
             # Send the edit keys to the rendered field. Other native windows
             # (including the overlay) must not redirect this test's input.
             from PySide6.QtCore import QCoreApplication,QEvent

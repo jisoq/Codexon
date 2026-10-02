@@ -57,6 +57,7 @@ def price_reason(row):
         '기준 단가 미확인':'이 모델의 환산 단가가 등록되지 않음',
         '모델 단가 미확인':'이 모델의 환산 단가가 등록되지 않음',
         'Fast 장문 단가 미확인':'Fast 장문 요청의 공식 단가가 제공되지 않음',
+        '구독 배율 미확인':'구독 배율 미확인',
     }
     if row.get('mode_conflict'):
         replacements['요청 모드 미확인']='요청 모드 기록이 서로 다름'
@@ -64,7 +65,7 @@ def price_reason(row):
         for key in ('모델 미확인','분석 모델 미확인'):
             replacements[key]='요청 모델 기록이 서로 다름'
     reasons=row.get('price_issues') or [row.get('price_issue')]
-    return ' · '.join(dict.fromkeys(replacements.get(x,x) for x in reasons if x)) or '환산에 필요한 사용 기록이 없습니다.'
+    return ' / '.join(dict.fromkeys(replacements.get(x,x) for x in reasons if x)) or '환산에 필요한 사용 기록이 없습니다.'
 
 
 def strong(value):

@@ -30,6 +30,79 @@ def test_scope_omits_absent_children():
     assert scope({'calls':28,'descendants':2})=='세션 (하위 2개 포함) : 28호출'
 
 
+@pytest.mark.parametrize('gap',[False,True])
+def test_all_recent_graphs_connect_same_agent_across_interleaved_calls(monkeypatch,gap):
+    from PySide6.QtWidgets import QApplication
+    from PySide6.QtGui import QImage,QPainter
+    from cachemonitor.overlay_view import Drawing,OverlayContent
+    from cachemonitor.overlay_monitor import BODY_LEFT,BODY_WIDTH
+    from test_overlay_presentation import summary
+    app=QApplication.instance() or QApplication([])
+    m=OverlayContent();data=summary(count=6)
+    for i,row in enumerate(data['recent']):
+        row.update(home='home',sid='parent' if i%2==0 else 'child',cost=i+1,cache_rate=80+i,
+                   output_speed=10+i,reasoning=i,output=100,model='example',effort='high',mode='Standard',transport='WebSocket')
+    if gap:data['recent'][2].update(cost=None,cache_rate=None,output_speed=None,reasoning=None)
+    m.set_content(data);m.monitor_action('tab-history');segments=[]
+    colors=m.graph_colors(data['recent'])
+    original=Drawing.line
+    def line(d,x,y,x2,y2,color='border',width=1,dashed=False):
+        if color in colors.values() and width==1:segments.append((x,y,x2,y2,color))
+        return original(d,x,y,x2,y2,color,width,dashed)
+    monkeypatch.setattr(Drawing,'line',line)
+    image=QImage(m.panel_width(),m.panel_height(),QImage.Format_ARGB32_Premultiplied);image.fill(0)
+    p=QPainter(image);m.paint(p);p.end()
+    step=BODY_WIDTH/6
+    for lane in range(4):
+        top=m.layout()['recent']+lane*52
+        pairs=[(round((a-BODY_LEFT)/step-.5),round((b-BODY_LEFT)/step-.5))
+               for a,y,b,y2,color in segments if top<=y<top+52]
+        assert pairs==([(1,3),(3,5)] if gap else [(0,2),(1,3),(2,4),(3,5)])
+        for a,y,b,y2,color in segments:
+            if top<=y<top+52:
+                i=round((a-BODY_LEFT)/step-.5)
+                assert color==colors[('home','parent' if i%2==0 else 'child')]
+
+
+def test_agent_colors_survive_rolling_calls_and_meet_theme_contrast():
+    from PySide6.QtWidgets import QApplication
+    from cachemonitor.overlay_view import OverlayContent
+    from cachemonitor.overlay_appearance import default_appearance
+    from cachemonitor.token_colors import contrast_ratio,ui_palette
+    app=QApplication.instance() or QApplication([])
+    m=OverlayContent();data=dict(home='h',id='parent')
+    rows=[dict(home='h',sid=s) for s in ('parent','child-1','child-2')]
+    for dark in (True,False):
+        m.set_content(data,appearance=default_appearance(dark))
+        before=m.graph_colors(rows)
+        assert len({before[('h',row['sid'])] for row in rows})==3
+        after=m.graph_colors(rows[1:]+[dict(home='h',sid='child-3')])
+        assert all(after[key]==value for key,value in before.items())
+        assert m.graph_colors(rows)==after
+        bg=ui_palette(m.appearance)['overlay']
+        assert all(contrast_ratio(color,bg)>=3 for color in after.values())
+
+
+def test_waiting_cards_and_old_values_are_distinct(monkeypatch):
+    from PySide6.QtWidgets import QApplication
+    from cachemonitor.overlay_view import OverlayContent
+    from test_overlay_presentation import summary
+    app=QApplication.instance() or QApplication([])
+    m=OverlayContent()
+    for data,note,heading in ((None,'기록 확인 중','기록 확인 중'),(None,'호출 기록 없음','호출 기록 대기'),(summary(count=0),'','호출 기록 대기')):
+        m.set_content(data,note)
+        assert m.notice_card()[0]==heading and not m.monitor_links()
+        assert '0호출' not in m.state['accessible'] and '미확인' not in m.state['accessible']
+    data=summary();data['_collection']={'last_confirmed_at':700}
+    monkeypatch.setattr('cachemonitor.overlay_view.time.time',lambda:1000)
+    m.set_content(data,'수집 지연');assert not m.notice_card()
+    assert m.data['cost']==data['cost'] and m.freshness_text()=='5분 전 확인값 표시 중'
+    assert m.freshness_text() in m.state['accessible']
+    data['_collection']['last_confirmed_at']=640
+    m.set_content(data,'수집 지연');assert m.freshness_text()=='6분 전 확인값 표시 중'
+    m.set_content(data);assert not m.freshness_text() and m.monitor_links()
+
+
 def test_child_call_navigation_and_scope_switch_guard():
     from types import SimpleNamespace
     from cachemonitor.overlay_navigation import navigation_target

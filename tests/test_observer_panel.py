@@ -65,6 +65,32 @@ def test_switch_off_during_activation_cancels_then_reconciles_off(tmp_path):
         assert not panel.toggle.isChecked()
     finally:panel.stop();panel.deleteLater()
 
+
+def test_intentional_off_is_distinct_from_failed_activation(tmp_path):
+    app=QApplication.instance() or QApplication([])
+    panel=ObserverPanel(tmp_path/'home',tmp_path/'data',active=False)
+    try:
+        panel.display({'configured':True,'phase':'active','runtime':{'phase':'ready'}})
+        panel.connection_details.toggle.setChecked(True)
+        off={'configured':False,'phase':'off','registration':{'autostart':False}}
+        panel.display(off)
+        assert panel.status_label.text()=='프록시 사용 안 함'
+        assert panel.runtime_values['guard'].text()=='프록시 사용 안 함'
+        assert not panel.connection_details.content.isVisible()
+        panel.connection_details.toggle.setChecked(True)
+        panel.display(off)
+        assert panel.connection_details.content.isVisible()  # Polls preserve an explicit expansion.
+        panel.display({'error':'synthetic failure','observer_status':{**off,'phase':'failed'}})
+        assert panel.status_label.text()=='켜지 못했습니다'
+        assert panel.runtime_values['guard'].text()=='실행 상태 확인 필요'
+        assert panel.error_detail.isVisible()
+        panel.display({'error':'synthetic settings failure','observer_status':off})
+        assert panel.status_label.text()=='프록시 설정 변경 실패'
+        panel.display(off)
+        assert not panel.error_detail.isVisible()
+        assert panel.status_label.text()=='프록시 사용 안 함'
+    finally:panel.stop();panel.deleteLater();app.processEvents()
+
 def test_unified_update_check_then_explicit_install_and_cancel(tmp_path,monkeypatch):
     from cachemonitor.quick_qa import mount,control,click,dispose
     from cachemonitor.fonts import load_bundled_fonts

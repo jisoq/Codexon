@@ -1,5 +1,6 @@
 """Project-first navigation and bounded, reusable history projections."""
 import copy
+import pytest
 from tests.test_ui import dashboard, snapshot
 from tests.test_performance import history, query
 from cachemonitor.analysis_engine import AnalysisEngine
@@ -99,3 +100,60 @@ def test_missing_and_cyclic_parents_remain_reachable():
     roots=engine.page_query(q)['explorer']['records']['rows']
     assert any(r['sid']=='orphan' for r in roots)
     assert sum(r['calls'] for r in roots)==project['calls']
+
+
+def test_empty_search_actions_restore_rows_and_preserve_route(dashboard,tmp_path):
+    from PySide6.QtTest import QTest
+    from cachemonitor.dashboard import choose
+    from cachemonitor.quick_qa import click,control,walk
+    w=dashboard;w.change_page(2);w.activate_record(0);w.activate_record(0);w.activate_record(0)
+    route=(w.history_navigation.project,w.selected_session,w.selected_turn,w.record_view)
+    choose(w.mode,'Fast');w.filter_changed();w.search.setText('없는 작업 12345');QTest.qWait(150)
+    assert not w.record_rows
+    title=next(item for item in walk(control(w,w.table)) if item.objectName()=='table-empty-title')
+    assert title.property('text')=='검색 조건에 맞는 기록 없음'
+    clear_search,reset_filters=w.table.nodes
+    assert w.quick.grabFramebuffer().save(str(tmp_path/'검색결과없음.png'))
+    assert control(w,clear_search).isVisible() and control(w,reset_filters).isVisible()
+    click(w,control(w,reset_filters))
+    assert (w.history_navigation.project,w.selected_session,w.selected_turn,w.record_view)==route
+    assert not w.mode.currentData() and w.period.currentData()=='all'
+    assert w.search.text()=='없는 작업 12345' and not w.record_rows
+    assert not control(w,reset_filters).isVisible()
+    click(w,control(w,clear_search))
+    assert w.record_rows and not w.search.text()
+    assert (w.history_navigation.project,w.selected_session,w.selected_turn,w.record_view)==route
+    assert not control(w,clear_search).isVisible()
+    w.go_back()
+    assert w.search.text()=='없는 작업 12345' and not w.record_rows
+    assert not w.qml_errors
+
+
+@pytest.mark.parametrize('loading',[False,True])
+def test_source_empty_history_distinguishes_collection(dashboard,loading,tmp_path):
+    from PySide6.QtTest import QTest
+    from cachemonitor.quick_qa import control,walk
+    w=dashboard;w.change_page(2)
+    value=copy.deepcopy(w.snapshot);value['sessions']=[];value['index']['loading']=loading
+    w.receive(value);QTest.qWait(40)
+    expected='사용 기록 수집 중' if loading else '사용 기록 없음'
+    title=next(item for item in walk(control(w,w.table)) if item.objectName()=='table-empty-title')
+    assert title.property('text')==expected and w.record_message.text()==expected
+    assert not any(control(w,node).isVisible() for node in w.table.nodes)
+    assert w.quick.grabFramebuffer().save(str(tmp_path/('수집중.png' if loading else '기록없음.png')))
+    w.receive(snapshot());QTest.qWait(40)
+    assert w.record_rows and not w.table.state['emptyText']
+    assert not w.qml_errors
+
+
+def test_reset_empty_history_filters_preserves_overlay_context(dashboard):
+    from cachemonitor.overlay_navigation import NavigationTarget
+    w=dashboard;w.navigate(NavigationTarget('fixture','s0',view='calls',request_id='t0'))
+    context=copy.deepcopy(w.temporary_context)
+    route=(w.history_navigation.project,w.selected_session,w.selected_turn,w.record_view)
+    w.call_filter_controls['observation_problem'].setChecked(True)
+    w.reset_history_filters()
+    assert w.temporary_context==context
+    assert (w.history_navigation.project,w.selected_session,w.selected_turn,w.record_view)==route
+    assert not any(node.isChecked() for node in w.call_filter_controls.values())
+    assert w.record_rows

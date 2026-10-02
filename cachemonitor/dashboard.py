@@ -21,7 +21,9 @@ from .analytics import analyze, stats, session_summary, cache_rows, observation_
 from .analysis_engine import AnalysisEngine, BoundedCache
 from .analysis_worker import AnalysisBridge
 from .core import day_start, summarize, transport_label
-from .pricing import usd, RATES, FAST_RATES, VERIFIED, SUPPORTED_MODELS, supported_model, request_tier, display_tier, token_cost, sum_cost
+from .pricing import (usd, RATES, ALIASES, VERIFIED, MULTIPLIER_VERIFIED, MODEL_VERIFIED,
+                      standard_rate, subscription_multiplier, rate_verified, SUPPORTED_MODELS, supported_model,
+                      request_tier, display_tier, token_cost, sum_cost)
 from .session_costs import own_costs, session_costs
 from .charts import UsageTrend, SourceBars, ComparisonChart, TokenComposition, value_text, COLORS
 from .observer_panel import ObserverPanel
@@ -173,7 +175,7 @@ class Dashboard(TrayWindow):
         self.history_path=Row();self.history_path.setSpacing(4);self.navigation_row.addWidget(self.history_path,1)
         self.heading=label(TITLES[0],'heading');header.addWidget(self.heading);header.addStretch()
         self.pending_label=label('','muted');self.pending_label.setFixedHeight(36);self.pending_label.setMaximumWidth(280);header.addWidget(self.pending_label)
-        self.price_button=Button('기준 환산 단가');self.price_button.clicked.connect(self.show_prices);header.addWidget(self.price_button);layout.addLayout(header)
+        self.price_button=Button('API 가격표');self.price_button.clicked.connect(self.show_prices);header.addWidget(self.price_button);layout.addLayout(header)
         self.common_filters=Row();self.common_filters.put(flow=True,spacing=8)
         self.home=combo([('모든 Codex 홈','')]+[(Verbatim(h),h) for h in homes]);self.home.setMinimumWidth(205)
         self.period=combo(PERIODS);choose(self.period,'30d')
@@ -405,6 +407,9 @@ class Dashboard(TrayWindow):
         self.history_tables={};self.history_table_stack=Stack();current_layout.addWidget(self.history_table_stack,1)
         for kind in ('projects','sessions','children','requests','calls'):
             node=table([]);node.setMinimumHeight(200)
+            clear_search=Button('검색 지우기');clear_search.clicked.connect(self.clear_history_search)
+            reset_filters=Button('필터 초기화');reset_filters.clicked.connect(self.reset_history_filters)
+            node.addWidget(clear_search);node.addWidget(reset_filters)
             node.cellClicked.connect(lambda row,col:self.activate_record(row) if col==0 else None)
             node.cellActivated.connect(self.activate_record)
             self.history_tables[kind]=node;self.history_table_stack.addWidget(node)
@@ -1237,6 +1242,39 @@ class Dashboard(TrayWindow):
         if self.restoring or self.current_page!=2:return
         self.render()
 
+    def clear_history_search(self):
+        self.push_state();self.search.clear();self.search_timer.stop();self.render_explorer()
+
+    def history_filters_active(self):
+        if any(node.isChecked() for node in self.call_filter_controls.values()):return True
+        if self.temporary_context:return False
+        return (self.period.currentData()!='all' or not self.archive.isChecked()
+                or any(node.currentData() for node in (self.home,self.source,self.model,self.effort,self.mode)))
+
+    def reset_history_filters(self):
+        self.push_state();self.restoring=True
+        for node in self.call_filter_controls.values():node.setChecked(False)
+        if not self.temporary_context:
+            for node in (self.home,self.source,self.model,self.effort,self.mode):choose(node,'')
+            choose(self.period,'all');self.archive.setChecked(True)
+            self.page_filters[2]={'model':'','effort':'','service_tier':''}
+        self.restoring=False;self.search_timer.stop();self.render_explorer()
+
+    def history_empty_state(self,data):
+        if data['records']['total']:return '','',False,False
+        ctx=self.temporary_context or {}
+        if self.snapshot.get('index',{}).get('loading'):
+            return '사용 기록 수집 중','기록을 읽고 있습니다. 수집이 끝나면 자동으로 표시됩니다.',False,False
+        if ctx.get('sid') and data['metadata'] is None:
+            return '대상 기록을 찾을 수 없음','',False,False
+        if not self.snapshot['sessions']:
+            return '사용 기록 없음','Codex 작업 기록이 수집되면 여기에 표시됩니다.',False,False
+        search=bool(self.search.text().strip());filters=self.history_filters_active()
+        if search or filters:
+            title='검색 조건에 맞는 기록 없음' if search else '조건에 맞는 기록 없음'
+            return title,'검색어나 필터를 변경해 다른 기록을 확인하세요.',search,filters
+        return '현재 범위에 기록 없음','선택한 프로젝트 또는 세션에 표시할 기록이 없습니다.',False,False
+
     def apply_explorer(self):
         data=self.view_result['explorer'];ctx=self.temporary_context or {}
         self.selected_session=tuple(data['session']) if data['session'] else None
@@ -1246,7 +1284,7 @@ class Dashboard(TrayWindow):
         self.render_history_path(data)
         self.table.put(highlightZeroCache=self.record_view=='calls',navigationColumn=0)
         summary=data.get('summary',{})
-        self.history_summary.setText(f"환산액 {'확인분 ' if summary.get('partial') and summary.get('cost') is not None else ''}{usd(summary.get('cost'))} / 호출 {summary.get('calls',0):,} / 캐시 {value_text(summary.get('cache_ratio'),'cache_ratio')}\n입력 {number(summary.get('input'))} / 출력 {number(summary.get('output'))} / 구독 가치 기준 / 청구액 아님")
+        self.history_summary.setText(f"환산액 {'확인분 ' if summary.get('partial') and summary.get('cost') is not None else ''}{usd(summary.get('cost'))} / 호출 {summary.get('calls',0):,} / 캐시 {value_text(summary.get('cache_ratio'),'cache_ratio')}\n입력 {number(summary.get('input'))} / 출력 {number(summary.get('output'))}")
         self.update_navigation()
         self.outside.setVisible(self.record_view=='calls');self.call_columns_row.setVisible(self.record_view=='calls')
         self.record_filters.toggle.setText('필터·표시 항목')
@@ -1265,7 +1303,7 @@ class Dashboard(TrayWindow):
         self.sync_history_filters()
         if not session:
             summary=data.get('summary',{})
-            self.session_scope.setText(f"환산액 {usd(summary.get('cost'))} / {summary.get('calls',0):,}호출 / 구독 가치 기준 / 청구액 아님")
+            self.session_scope.setText(f"환산액 {usd(summary.get('cost'))} / {summary.get('calls',0):,}호출")
         residual=(session or {}).get('unclassified');self.residual_details.setVisible(bool(residual))
         if residual:self.residual_details.set_sections([('별도 누계', ' · '.join(f'{name} {number(residual.get(key))}' for key,name in (('input','입력'),('cached','캐시 읽기'),('written','캐시 쓰기'),('output','출력'),('reasoning','추론'),('total','Total')))),('집계','호출·요청 통계에 포함하지 않음')])
         if session:
@@ -1307,8 +1345,10 @@ class Dashboard(TrayWindow):
         self.record_rows=self.table.set_window(data['records'],formatter,(self.record_view,tuple(headers)))
         self.render_record_parent(data)
         self.update_navigation()
-        if ctx and ctx.get('sid') and session is None:self.record_status='대상 기록을 찾을 수 없음'
-        elif not records:self.record_status='조건에 맞는 기록 없음' if self.snapshot['sessions'] else '사용 기록 없음'
+        self.record_status,empty_description,clear_search,reset_filters=self.history_empty_state(data)
+        self.table.put(emptyText=self.record_status,emptyDescription=empty_description)
+        self.table.nodes[0].setVisible(clear_search);self.table.nodes[1].setVisible(reset_filters)
+        self.parent_table.put(emptyText=self.record_status or '기록 없음')
         if self.selected_event:self.render_event_detail()
         elif self.selected_call:
             self.exact_record=data['detail']
@@ -1435,13 +1475,16 @@ class Dashboard(TrayWindow):
         section['usage']+='\n평균 출력 속도  '+(value_text(row['output_speed'],'output_speed') if row.get('output_speed') is not None else '측정 불가')
         if row.get('output_speed') is not None:
             section['time']=entries([('호출 소요시간',value_text(row.get('duration'),'duration'))])+'\n출력 / 요청부터 완료까지 · 대기·통신 포함'
-        price_model=row.get('price_model',row.get('model'));rate=(FAST_RATES if request_tier(row)=='Fast' else RATES if request_tier(row)=='Standard' else {}).get(price_model)
-        lines=[VERIFIED+' 기준 / 구독 가치 환산',entries([('가격 모델',price_model)])]
+        price_model=row.get('price_model',row.get('model'));rate=standard_rate(row.get('model'))
+        multiplier=subscription_multiplier(row.get('model'),request_tier(row))
+        lines=[f'API 단가 확인 {rate_verified(price_model)} / 구독 배율 확인 {MULTIPLIER_VERIFIED}',
+               'Standard API 단가 × 구독 차감 배율',entries([('가격 모델',price_model)])]
         if rate:
             for label_,tokens,price in [('일반 입력',row.get('ordinary_input'),rate.input),('캐시 읽기',row.get('cached'),rate.cached),('캐시 쓰기',row.get('written'),rate.written if rate.written is not None else rate.input),('출력',row.get('output'),rate.output)]:
                 if tokens is not None and price is not None:lines.append(f'{label_}  {number(tokens)} × {usd(price)} / 1,000,000')
-        if row.get('cost') is not None:lines.append('비용  '+usd(row['cost']))
-        else:lines=['환산 제외 · '+price_reason(row)]
+        if row.get('cost') is not None:
+            lines.extend([f'구독 배율  × {multiplier:g}', '환산액  '+usd(row['cost'])])
+        else:lines=['환산 제외 / '+price_reason(row)]
         section['pricing']='\n'.join(x for x in lines if x)
         section['evidence']='\n'.join(record_issues(row))
         for key,text in section.items():
@@ -1515,20 +1558,22 @@ class Dashboard(TrayWindow):
         self.diagnostics.setPlainText(text)
 
     def show_prices(self):
-        dialog=Dialog(self);dialog.setWindowTitle('기준 환산 단가 / '+VERIFIED+' 기준');dialog.resize(980,720)
-        body=Column(dialog);body.setContentsMargins(20,20,20,20);body.setSpacing(16);body.addWidget(label(VERIFIED+' 기준 / Standard 기준 단가 / Fast 2.5배 / 청구액 아님','section'))
-        prices=table(['가격 모델 / 모드','일반 입력','캐시 읽기','캐시 쓰기','출력'])
-        for i,width in enumerate((320,145,145,145,145)):prices.setColumnWidth(i,width)
+        dialog=Dialog(self);dialog.setWindowTitle(tr('API 가격표')+' / '+MODEL_VERIFIED+' '+tr('지원 모델'));dialog.resize(1080,720)
+        body=Column(dialog);body.setContentsMargins(20,20,20,20);body.setSpacing(16)
+        body.addWidget(label('Standard API 단가 × 구독 차감 배율','section'))
+        prices=table(['모델','일반 입력','캐시 읽기','캐시 쓰기','출력','Fast 배수'])
+        for i,width in enumerate((310,135,135,135,135,160)):prices.setColumnWidth(i,width)
         rows=[]
-        for model in SUPPORTED_MODELS:
-            standard=RATES[model]
-            for mode,rate in (('Standard',standard),('Fast',FAST_RATES.get(model))):
-                if rate:rows.append([model+' / '+mode,usd(rate.input),usd(rate.cached) if rate.cached is not None else '미지원',usd(rate.written) if rate.written is not None else '입력과 동일',usd(rate.output)])
+        for model in (*SUPPORTED_MODELS, 'gpt-daybreak-blue-latest'):
+            rate=standard_rate(model);multiplier=subscription_multiplier(model,'Fast')
+            rows.append([model,usd(rate.input),usd(rate.cached) if rate.cached is not None else '미지원',
+                         usd(rate.written) if rate.written is not None else '입력 단가',usd(rate.output),
+                         f'×{multiplier:g}' if multiplier is not None else '미지원'])
         fill(prices,rows);body.addWidget(prices,1)
-        body.addWidget(label('Standard 기준 단가에 구독 소모 배율을 적용합니다. Fast 환산액은 같은 토큰 Standard 대비 2.5배입니다.','muted',True))
-        body.addWidget(label('구독 가치 환산은 API 장문 할증을 반영하지 않습니다.','muted',True))
-        body.addWidget(label('USD / 100만 토큰 / GPT-5.6 Sol 프로모션 확인 기한 2026-11-21','muted',True))
-        body.addWidget(label('가격 별칭: gpt-5.6, gpt-daybreak-blue-latest → gpt-5.6-sol / gpt-5.5-2026-04-23 → gpt-5.5','muted',True))
+        body.addWidget(label('Standard 1배 / 장문 할증 제외 / USD / 100만 토큰','muted',True))
+        body.addWidget(label(f'API 단가 확인 {VERIFIED} / GPT-6.1 Sol 단가 확인 {rate_verified("gpt-6.1-sol")}\n구독 배율 확인 {MULTIPLIER_VERIFIED}','muted',True))
+        body.addWidget(label('GPT-5.6 Sol 프로모션 확인 기한 2026-11-21','muted',True))
+        body.addWidget(label('가격 별칭: '+' / '.join(f'{alias} → {model}' for alias,model in ALIASES.items()),'muted',True))
         buttons=DialogButtons(DialogButtons.Close);buttons.rejected.connect(dialog.reject);body.addWidget(buttons);dialog.open();self.price_dialog=dialog
 
 

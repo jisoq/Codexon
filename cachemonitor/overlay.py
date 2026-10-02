@@ -290,6 +290,7 @@ class OverlayController(QObject):
         self.refresh()
 
     def toggle_expanded(self):
+        if self.widget.content_model.notice_card():return
         self.close_popup()
         self.expanded=not self.expanded
         if not self.expanded:
@@ -528,7 +529,7 @@ class OverlayController(QObject):
         if self.popup_open:
             self.close_popup()
             return
-        elif self.expanded:
+        elif self.expanded and not self.widget.content_model.notice_card():
             self.toggle_expanded()
             return
         target=self.target_state.get('target')
@@ -645,7 +646,7 @@ class OverlayController(QObject):
         if self.collapsed or monitor is None:
             mode='icon'
             geometry=monitor_box(32*scale,32*scale)
-        elif self.expanded:
+        elif self.expanded and not content.notice_card():
             side=extend_monitor_left(frame,dpi,monitor,240*scale)
             inline=side is None
             geometry=side or monitor
@@ -669,7 +670,7 @@ class OverlayController(QObject):
         content.put(reducedMotion=self.reduced_motion)
         self.icon.view.put(speedWarning=bool(content.speed_alert().get('active')),
                            warning=self.widget.content_model.state.get('overlayWarning'))
-        self.header.set_title(data.get('title','') if data else '',content.context()[0])
+        self.header.set_title(content.display_title(),content.context()[0])
         self.header.session_scope=((data or {}).get('home'),(data or {}).get('id'))
         if mode=='icon':
             self.close_popup()
@@ -684,7 +685,7 @@ class OverlayController(QObject):
             if not self._place(int(self.icon.winId()),icon_geometry):self.icon.hide()
         else:
             self.icon.hide()
-            self.actions.view.put(expanded=self.expanded,canExpand=True,popupOpen=self.popup_open)
+            self.actions.view.put(expanded=self.expanded and not content.notice_card(),canExpand=not content.notice_card(),popupOpen=self.popup_open)
             self.shadow.apply_appearance(self.appearance,self.opacity)
             self.shadow.set_panel_size(self.widget.panel_width()/scale,geometry[3]/(dpi/96*scale))
             shadow_geometry=self.shadow.physical_geometry(geometry,dpi/96)

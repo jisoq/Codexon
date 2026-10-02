@@ -104,6 +104,25 @@ def test_session_collapse_isolated_and_persistent(layout_controller):
     assert not c.collapsed and c._session_collapse_key()!=first_key
 
 
+def test_remote_session_replaces_metrics_and_restores_local_detail(layout_controller):
+    c=layout_controller;m=c.widget.content_model
+    c.toggle_expanded();local_height=m.base_height()
+    c.receive_target({'target':{'hwnd':1},'selection':Selection(A,host='remote:test')})
+    assert m.is_remote and m.data is None and not m.rows()
+    assert c.automatic_mode=='monitor' and not c.detail.isVisible()
+    assert m.base_height()<local_height and not m.monitor_links()
+    assert not c.actions.view.state['canExpand']
+    assert m.lines()[0]=='원격 세션' and '0호출' not in m.state['accessible']
+    c.toggle_expanded()
+    assert c.expanded  # The local detail preference survives the remote card.
+    c.receive_snapshot({'overlay_sessions':c.sessions})
+    assert m.is_remote and m.data is None
+    c.receive_target({'target':{'hwnd':1},'selection':Selection(A)})
+    assert not m.is_remote and m.data['id']==A
+    assert c.automatic_mode=='detail' and c.detail.isVisible()
+    assert c.actions.view.state['canExpand'] and m.base_height()==local_height
+
+
 def test_session_collapse_reloads_from_fresh_controller(layout_controller):
     from copy import deepcopy
     c=layout_controller;c.set_collapsed(True);c.settings.sync()

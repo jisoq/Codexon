@@ -98,11 +98,11 @@ def test_complete_request_requires_boundaries_full_membership_and_collected_inte
 
 def test_price_aliases_never_merge_analysis_identity_or_effort():
     view=source([dict(input_tokens=100,cached_input_tokens=80,cache_write_input_tokens=10,output_tokens=20)]*2)
-    view['history'][0].update(model='gpt-5.6',configured_model='gpt-5.6',effort='ultra')
+    view['history'][0].update(model='gpt-daybreak-blue-latest',configured_model='gpt-daybreak-blue-latest',effort='ultra')
     view['history'][1].update(model='gpt-5.6-sol',configured_model='gpt-5.6-sol',effort='max')
     a=analyze([view]);assert len(a['groups'])==2
     assert {r['price_model'] for r in a['responses']}=={'gpt-5.6-sol'}
-    assert {r['model'] for r in a['responses']}=={'gpt-5.6','gpt-5.6-sol'}
+    assert {r['model'] for r in a['responses']}=={'gpt-daybreak-blue-latest','gpt-5.6-sol'}
     assert {r['effort'] for r in a['responses']}=={'max','ultra'}
 
 
