@@ -99,7 +99,8 @@ def test_call_selection_is_by_identifier_and_never_changes_monitor():
         assert m.selected_id==fixed and m.call_id(m.selected())==fixed and m._detail_items==body
         m.detailGraph.clear_hover();assert m.call_id(m.selected())==fixed
         w.set_content(None,'기록 확인 중');assert m.selected_id is None and m.rows()==[] and m.selected()=={}
-        assert all(value=='—' for value in w.lines()[3:7])
+        assert m.notice_card()[0]=='기록 확인 중' and not m.monitor_links()
+        assert all(value!='—' for value in w.lines())
     finally:w.close();app.processEvents()
 
 

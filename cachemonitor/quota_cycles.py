@@ -9,13 +9,18 @@ from pathlib import Path
 import sqlite3
 import time
 
-from .pricing import ALIASES, RATES, FAST_RATES, VERIFIED, PRICE_POLICY, token_cost, request_tier
+from .pricing import (ALIASES, RATES, FAST_RATES, VERIFIED, RATE_VERIFIED, MODEL_VERIFIED,
+                      MULTIPLIER_VERIFIED, SUBSCRIPTION_FAST_MULTIPLIERS, PRICE_POLICY, token_cost, request_tier)
 from .workload import INTERNAL_REVIEW_MODEL
 
 
 TOKEN_FIELDS = ('input', 'cached', 'written', 'output', 'reasoning')
 PRICE_SNAPSHOT = json.dumps({'rates': {k: asdict(v) for k, v in RATES.items()},
-                             'fast_rates': {k:asdict(v) for k,v in FAST_RATES.items()}, 'policy':PRICE_POLICY, 'aliases': ALIASES, 'verified': VERIFIED}, sort_keys=True)
+                             'fast_rates': {k:asdict(v) for k,v in FAST_RATES.items()},
+                             'subscription_fast_multipliers': SUBSCRIPTION_FAST_MULTIPLIERS,
+                             'multiplier_verified': MULTIPLIER_VERIFIED, 'model_verified': MODEL_VERIFIED,
+                             'rate_verified': RATE_VERIFIED,
+                             'policy':PRICE_POLICY, 'aliases': ALIASES, 'verified': VERIFIED}, sort_keys=True)
 PRICE_ID = hashlib.sha256(PRICE_SNAPSHOT.encode()).hexdigest()[:16]
 RESET_TOLERANCE = 120
 MAX_OBSERVATION_GAP = 30 * 60

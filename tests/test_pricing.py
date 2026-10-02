@@ -1,6 +1,6 @@
 import pytest
 
-from cachemonitor.pricing import token_cost, RATES
+from cachemonitor.pricing import token_cost, RATES, ALIASES, SUBSCRIPTION_FAST_MULTIPLIERS, COST_KEYS, SUPPORTED_MODELS
 from cachemonitor.analytics import analyze
 from cachemonitor.core import Session
 
@@ -41,9 +41,6 @@ def test_subscription_conversion_has_no_long_context_surcharge():
     assert long['cost_written']==pytest.approx(short['cost_written'])
     assert long['cost_output']==pytest.approx(short['cost_output'])
     assert long['cost']-short['cost']==pytest.approx(RATES['gpt-6-astra'].input/1e6)
-    mini=token_cost({**row('gpt-5.4-mini'),'input':300000,'cached':200000,'written':None,'output':1000})
-    assert not mini['long_context']
-    assert mini['cost']==pytest.approx(.0945)
 
 
 def test_unknown_prices_or_usage_are_not_zero():
@@ -51,9 +48,31 @@ def test_unknown_prices_or_usage_are_not_zero():
         p=token_cost({**row(),**change})
         assert p['cost'] is None and p['price_issue']
         assert p['cost_output'] is None
-    assert token_cost(row('gpt-5.6'))['cost']==token_cost(row('gpt-5.6-sol'))['cost']
+    assert token_cost(row('gpt-daybreak-blue-latest'))['cost']==token_cost(row('gpt-5.6-sol'))['cost']
     old=token_cost({**row('gpt-5.5'),'written':None,'cached':90000})
     assert old['cost']==pytest.approx(.155)
+
+
+def test_codex_catalog_new_sol_rates_and_historical_models():
+    assert set(SUPPORTED_MODELS)=={'gpt-6.1-sol','gpt-6-astra','gpt-6-sol','gpt-6-luna',
+        'gpt-5.6-sol','gpt-5.6-terra','gpt-5.6-luna','gpt-5.5'}
+    assert set(SUBSCRIPTION_FAST_MULTIPLIERS)==set(RATES)-{'gpt-5.5-pro'}
+    # Historical records keep their prices even after removal from the picker.
+    assert token_cost(row('gpt-5.4-mini'))['cost']==pytest.approx(.03)
+    for alias,model in ALIASES.items():
+        assert token_cost(row(alias))['cost']==token_cost(row(model))['cost']
+    sol=token_cost(row('gpt-6.1-sol'))
+    assert sol['cost']==pytest.approx(.073)
+    assert sol['cost_cached']==pytest.approx(.008)
+    assert sol['cost_written']==pytest.approx(.025)
+    assert sol['cost_output']==pytest.approx(.02)
+
+
+@pytest.mark.parametrize('tier',['Fast','fast','priority'])
+def test_daybreak_fast_is_unpriced_before_resolving_standard_alias(tier):
+    daybreak=token_cost(row('gpt-daybreak-blue-latest',service_tier=tier))
+    assert all(daybreak[key] is None for key in COST_KEYS)
+    assert daybreak['price_issue']=='구독 배율 미확인'
 
 
 def test_call_and_turn_cost_use_the_same_completed_population():

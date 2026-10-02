@@ -148,9 +148,28 @@ Item {
             onClicked: root.showDetails()
         }
     }
-    Text {
+    ColumnLayout {
+        objectName: "table-empty-state"
         anchors.centerIn: table; visible: table.rows === 0
-        text: appLanguage.text("기록 없음"); color: (appTheme.palette && appTheme.color("muted")); font.family: appTheme.family; font.pixelSize: 14
+        width: Math.max(0, Math.min(480, table.width - 32)); spacing: 12
+        Text {
+            objectName: "table-empty-title"
+            Layout.fillWidth: true; horizontalAlignment: Text.AlignHCenter; wrapMode: Text.Wrap
+            text: appLanguage.text(root.viewState.emptyText || "기록 없음")
+            color: appTheme.palette.muted; font.family: appTheme.family; font.pixelSize: 14
+        }
+        Text {
+            Layout.fillWidth: true; horizontalAlignment: Text.AlignHCenter; wrapMode: Text.Wrap
+            visible: text.length > 0; text: appLanguage.text(root.viewState.emptyDescription || "")
+            color: appTheme.palette.muted; font.family: appTheme.family; font.pixelSize: 13
+        }
+        RowLayout {
+            Layout.alignment: Qt.AlignHCenter; spacing: 8
+            Repeater {
+                model: root.node.nodes
+                NodeChild { required property var modelData; node: modelData; horizontalParent: true }
+            }
+        }
     }
     Popup {
         id: details; objectName: "cell-details-popup"

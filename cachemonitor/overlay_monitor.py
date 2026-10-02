@@ -32,6 +32,23 @@ CARD_Y=SESSION_Y+20+GROUP_GAP
 CARD_HEIGHT=64
 GRAPH_ROW=52
 GRAPH_COUNT=4
+REMOTE_TITLE='원격 세션'
+REMOTE_HEADING='사용량 표시 미지원'
+REMOTE_DESCRIPTION='이 오버레이는 로컬 세션만 지원하며, 원격 기기의 사용량은 표시하지 않습니다.'
+
+
+def notice_geometry(m):
+    from PySide6.QtCore import Qt, QRect
+    from PySide6.QtGui import QFontMetrics
+    from .overlay_view import font
+    from .i18n import tr
+    text_width=SECTION_WIDTH-32
+    body_height=QFontMetrics(font(m.appearance.family,11)).boundingRect(
+        QRect(0,0,text_width,1000),Qt.TextWordWrap,tr(m.notice_card()[1])).height()
+    body_y=SESSION_Y+16+20+8
+    height=body_y+body_height+32
+    return dict(header=TITLE_Y,context=body_y,body=body_y,body_height=body_height,
+                height=height,full_height=height)
 
 
 def partial_text(data):
@@ -62,14 +79,15 @@ def footer(m, include_call=True):
     return text,'warning' if alert or note else 'secondary'
 
 
-def geometry(data, reduced=False, has_footer=False):
+def geometry(data, reduced=False, has_footer=False, has_freshness=False):
     data=data or {}
-    composition=CARD_Y+CARD_HEIGHT+GROUP_GAP
+    shift=28 if has_freshness else 0
+    composition=CARD_Y+shift+CARD_HEIGHT+GROUP_GAP
     bar=composition+22;rows=bar+14
     populations=[data.get(key,{}) for key in ('token_composition','cost_composition')]
     counts={section:max((len(c.get(section+'_parts',[])) for c in populations),default=0)
             for section in ('input','output')}
-    unit=SESSION_Y
+    unit=SESSION_Y+shift
     end=max(rows+max(counts.values())*18,bar+6)
     partial=end+8 if partial_text(data) else None
     if partial is not None:end=partial+18
@@ -79,7 +97,7 @@ def geometry(data, reduced=False, has_footer=False):
     content_end=context+GRAPH_ROW*GRAPH_COUNT-8
     full_height=content_end+(8+18 if has_footer else 0)+16
     height=min(432,full_height) if reduced else full_height
-    return dict(header=TITLE_Y,session=SESSION_Y,cache=CARD_Y,tokens=composition,bar=bar,rows=rows,
+    return dict(header=TITLE_Y,session=SESSION_Y+shift,cache=CARD_Y+shift,tokens=composition,bar=bar,rows=rows,
                 unit=unit,partial=partial,miss=miss,divider=divider,tab=tab,context=context,
                 model=context,meta=context+24,recent=context,result=context+56,
                 result_value=context+78,duration=context+112,call_tokens=context+142,
@@ -133,19 +151,29 @@ def toggle_segments(m,kind):
 
 
 def paint(d,m):
+    notice=m.notice_card()
+    if notice:
+        g=m.layout()
+        d.rect(MARGIN,SESSION_Y,SECTION_WIDTH,g['height']-SESSION_Y-16,'band',8)
+        d.text(notice[0],MARGIN+16,SESSION_Y+16,SECTION_WIDTH-32,20,12,weight=600)
+        d.text(notice[1],MARGIN+16,g['body'],SECTION_WIDTH-32,g['body_height'],11,'secondary',wrap=True)
+        return
     from .overlay_view import amount,money,percent
     data=m.data or {};latest=data.get('latest') or {};c=data.get('token_composition',{});g=m.layout()
     from PySide6.QtGui import QFontMetrics
     from .i18n import tr,formatted
+    if m.freshness_text():
+        d.rect(MARGIN,SESSION_Y,SECTION_WIDTH,22,'band',6)
+        d.text(m.freshness_text(),BODY_LEFT,SESSION_Y,BODY_WIDTH-8,22,11,'secondary',elide=True)
     d.text('세션',MARGIN,g['session'],80,20,12,weight=600)
     count_x=MARGIN+QFontMetrics(d.p.font()).horizontalAdvance(tr('세션'))+8
     child=f" (하위 {data['descendants']}개 포함)" if data.get('descendants') else ''
     d.text(f"{data.get('calls',0):,}호출"+child,count_x,g['session'],toggle_segments(m,'unit')[0][0]-8-count_x,20,11,'secondary',elide=True)
     values=(money(data.get('cost')),percent(c.get('cache_hit_rate')),speed(data.get('output_speed_summary',{}).get('value')))
-    d.rect(MARGIN,CARD_Y,SECTION_WIDTH,CARD_HEIGHT,'band',8)
+    d.rect(MARGIN,g['cache'],SECTION_WIDTH,CARD_HEIGHT,'band',8)
     for x,label,value in zip(METRIC_COLUMNS,('비용','캐시 적중률','평균 출력 속도'),values):
-        d.text(label,x,CARD_Y+8,METRIC_WIDTH,18,11,'secondary')
-        d.text(value,x,CARD_Y+30,METRIC_WIDTH,26,20 if x in METRIC_COLUMNS[:2] else 18,color='cached_text' if x==METRIC_COLUMNS[1] else 'ink',weight=600,elide=True)
+        d.text(label,x,g['cache']+8,METRIC_WIDTH,18,11,'secondary')
+        d.text(value,x,g['cache']+30,METRIC_WIDTH,26,20 if x in METRIC_COLUMNS[:2] else 18,color='cached_text' if x==METRIC_COLUMNS[1] else 'ink',weight=600,elide=True)
     if g['partial'] is not None:d.text(partial_text(data),BODY_LEFT,g['partial'],BODY_WIDTH,18,10,'secondary',elide=True)
     if g['miss'] is not None:d.text(miss_text(data),BODY_LEFT,g['miss'],BODY_WIDTH,18,11,'secondary',elide=True)
     currency=m.composition_unit=='usd'
@@ -177,23 +205,29 @@ def paint(d,m):
     d.p.translate(0,-m.lower_offset)
     if m.monitor_tab=='history':
         rows=m.rows();step=BODY_WIDTH/max(1,len(rows))
+        agent_colors=m.graph_colors(rows)
         inspected=next((r for r in rows if m.call_id(r)==getattr(m,'inspected_call',None)),None)
         displayed=m.selected() if m.graph_pinned else inspected or latest
         if m.graph_pinned:inspected=None
         for lane,(key,label,fmt) in enumerate((('cost','비용 ($)',money),('cache_rate','캐시 (%)',percent),('output_speed','출력 속도 (tok/s)',lambda n:'—' if n is None else f'{n:.1f}'),('reasoning','추론 (토큰)',amount))):
             y=g['recent']+lane*GRAPH_ROW;low,high=dynamic_bounds(graph_value(r,key) for r in rows)
             d.text(label,BODY_LEFT,y,BODY_WIDTH-144,16,10,'secondary');d.text((formatted('{number}번: ',number=inspected.get('ordinal','')) if inspected else '')+fmt(graph_value(displayed,key)),RIGHT-144,y,144,16,11,right=True)
-            previous=None
+            previous={}
             for i,row in enumerate(rows):
+                agent=(row.get('home'),row.get('sid'))
+                color=agent_colors[agent]
                 val=graph_value(row,key);x=BODY_LEFT+(i+.5)*step
-                if val is None:previous=None;continue
+                if val is None:previous.pop(agent,None);continue
                 yy=y+20+24*(high-val)/(high-low)
-                condition=tuple(row.get(k) for k in ('model','effort','mode','transport','home','sid'))
-                if previous and (key!='output_speed' or condition==previous[2]):d.line(previous[0],previous[1],x,yy,'accent',1)
+                condition=tuple(row.get(k) for k in ('model','effort','mode','transport'))
+                prior=previous.get(agent) if agent[1] else None
+                if prior and (key!='output_speed' or condition==prior[2]):d.line(prior[0],prior[1],x,yy,color,1)
                 active=m.call_id(row)==m.call_id(displayed)
                 if active:d.line(x,y+19,x,y+45,'secondary',.6)
-                d.dot(x,yy,'warning' if row.get('cache_warning') else 'accent',3 if active else 2)
-                previous=(x,yy,condition)
+                radius=3 if active else 2
+                if row.get('cache_warning'):d.dot(x,yy,'warning',radius+1.5)
+                d.dot(x,yy,color,radius)
+                previous[agent]=(x,yy,condition)
     else:
         from .ui_details import observed_transport
         model,suffix,mismatch=model_text(latest)
@@ -235,6 +269,7 @@ def paint(d,m):
 
 
 def action_links(m):
+    if m.notice_card():return []
     data=m.data or {};result=[];g=m.layout()
     def add(key,x,y,w,h,**kw):result.append(dict(id=key,x=x,y=y,width=w,height=h,accessible=kw.pop('accessible',key),targetHint=key.startswith('call-') or key=='latest-context',**kw))
     for x,w,key,label in toggle_segments(m,'tab'):
@@ -270,13 +305,14 @@ def action_links(m):
 
 
 def links(m):
+    if m.notice_card():return []
     from .tooltips import TEXT
     from .ui_details import model_comparison
     data=m.data or {};row=data.get('latest') or {};result=action_links(m)
     def add(key,x,y,w,h,tip):
         if tip:result.append(dict(id='tip-'+key,x=x,y=y,width=w,height=h,tooltip=tip,accessible=tip,interaction='tooltip'))
     g=m.layout()
-    for x,key in zip(METRIC_COLUMNS,('cost','cache_total','speed_total')):add(key,x,CARD_Y,METRIC_WIDTH,CARD_HEIGHT,TEXT[key])
+    for x,key in zip(METRIC_COLUMNS,('cost','cache_total','speed_total')):add(key,x,g['cache'],METRIC_WIDTH,CARD_HEIGHT,TEXT[key])
     for item in result:
         if item.get('action') in ('unit-tokens','unit-usd','tab-latest','tab-history'):
             item['tooltip']={'unit-tokens':'토큰 개수로 보기','unit-usd':'토큰 USD로 보기','tab-latest':'마지막 확인 호출','tab-history':'최근 12회 호출'}[item['action']]

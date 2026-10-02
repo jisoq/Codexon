@@ -1,9 +1,28 @@
 """The single desktop entry point for app and proxy updates."""
-from PySide6.QtCore import QThread, Signal
-from .i18n import tr
+from PySide6.QtCore import Qt, QThread, Signal
+from .i18n import formatted, tr
 from .presentation import Button, Column, Group, Text, Row
 from .quick_runtime import Dialog
 from .installation import open_recovery
+from .ui_details import Details
+
+
+def failure_message(error,checking):
+    """Keep transport diagnostics in details and put a useful next step first."""
+    from urllib.error import HTTPError, URLError
+    if isinstance(error,HTTPError):
+        if error.code==429:return '업데이트 서버가 요청을 제한하고 있습니다. 잠시 후 다시 시도해 주세요.'
+        return '업데이트 서버에서 정보를 받지 못했습니다. 잠시 후 다시 시도해 주세요.'
+    reason=error.reason if isinstance(error,URLError) else error
+    if isinstance(reason,TimeoutError):return '업데이트 서버 응답이 늦어지고 있습니다. 잠시 후 다시 시도해 주세요.'
+    if isinstance(error,(URLError,ConnectionError)) or checking and isinstance(error,OSError):
+        return '업데이트 서버에 연결하지 못했습니다. 인터넷 연결을 확인한 뒤 다시 시도해 주세요.'
+    if isinstance(error,OSError):
+        return '업데이트 파일을 준비하지 못했습니다. 저장 공간과 파일 접근 권한을 확인해 주세요.'
+    if str(error).startswith('설치형 Codexon에서 업데이트할 수 있습니다.'):
+        return str(error)
+    return ('업데이트 정보를 확인하지 못했습니다. 다시 시도해 주세요.' if checking else
+            '업데이트를 완료하지 못했습니다. 다시 확인 후 시도해 주세요.')
 
 
 class UpdateOperation(QThread):
@@ -16,7 +35,7 @@ class UpdateOperation(QThread):
     def run(self):
         from .app_update import check_update
         try:self.result.emit(self.action() if self.action else check_update(self.progress.emit,self.manager))
-        except Exception as exc:self.result.emit(str(exc))
+        except Exception as exc:self.result.emit(exc)
 
 
 class UpdatePanel(Group):
@@ -28,6 +47,9 @@ class UpdatePanel(Group):
         self.proxy_update={}
         self.pending_plan=None
         self.confirming=False
+        self.checking=False
+        self.operation_error=False
+        self.last_success=None
         layout=Column(self);layout.setContentsMargins(0,8,0,16);layout.setSpacing(10)
         self.offer=None
         self.heading=Text('업데이트');self.heading.put(fontSize=18,bold=True);layout.addWidget(self.heading)
@@ -36,6 +58,9 @@ class UpdatePanel(Group):
         self.button.clicked.connect(self.start)
         layout.addWidget(self.button)
         self.status=Text('');self.status.setWordWrap(True);layout.addWidget(self.status)
+        self.error_detail=Details('오류 상세',Text(),compact=True)
+        self.error_detail.body.setTextFormat(Qt.PlainText)
+        self.error_detail.hide();layout.addWidget(self.error_detail)
         from .version import VERSION
         self.app_state=Text('확인 전');self.proxy_state=Text('확인 전')
         self.proxy_detail=Text('Codex 통신 중계')
@@ -44,7 +69,7 @@ class UpdatePanel(Group):
             row=Row();row.put(collapseBelow=420);title=Text(name);title.put(bold=True);row.addWidget(title,2)
             state.setWordWrap(True);row.addWidget(state,1);body.addLayout(row)
             detail.put(fontSize=13,color='muted');detail.setWordWrap(True);body.addWidget(detail);layout.addWidget(group)
-        self.checked=Text('');self.checked.put(fontSize=13,color='muted');layout.addWidget(self.checked)
+        self.checked=Text('');self.checked.put(fontSize=13,color='muted');self.checked.setWordWrap(True);layout.addWidget(self.checked)
         self.execute=Button('');self.execute.setVisible(False);self.execute.clicked.connect(self.request_install);layout.addWidget(self.execute)
 
     def open_recovery(self):
@@ -64,6 +89,15 @@ class UpdatePanel(Group):
         self.button.setEnabled(False)
         self.execute.setEnabled(False)
         self.pending_plan=None
+        self.checking=action is None
+        self.operation_error=False
+        self.error_detail.hide();self.error_detail.toggle.setChecked(False)
+        self.status.put(color='ink')
+        if self.checking:
+            self.offer=None;self.execute.hide()
+            self.status.setText('업데이트 확인 중…')
+            for state in (self.app_state,self.proxy_state):
+                state.setText('확인 중');state.put(color='muted')
         self.operation=UpdateOperation(self,action,self.manager)
         self.operation.progress.connect(self.status.setText)
         self.operation.result.connect(self.receive_result)
@@ -71,7 +105,18 @@ class UpdatePanel(Group):
         self.operation.start()
 
     def receive_result(self,result):
-        if isinstance(result,dict):self.pending_plan=result
+        if isinstance(result,Exception):
+            self.operation_error=True
+            self.status.setText(failure_message(result,self.checking));self.status.put(color='warning')
+            self.error_detail.body.setText(str(result));self.error_detail.show()
+            if self.checking:
+                self.offer=None;self.execute.hide()
+                for state in (self.app_state,self.proxy_state):
+                    state.setText('이번 확인 실패');state.put(color='warning')
+                if self.last_success:
+                    self.checked.setText(formatted('마지막 성공 확인 {time}\n앱: {app} / 프록시: {proxy}',**self.last_success))
+                else:self.checked.setText('성공한 업데이트 확인 기록 없음')
+        elif isinstance(result,dict):self.pending_plan=result
         else:self.status.setText(result)
 
     def confirm_install(self,plan):
@@ -127,6 +172,9 @@ class UpdatePanel(Group):
             self.proxy_state.setText(tr(plan.get('reason','앱 업데이트 후 프록시 확인')))
             self.proxy_state.put(color='warning' if plan['kind']=='proxy' else 'muted')
             self.checked.setText(tr('최근 확인')+' '+datetime.now().strftime('%H:%M'))
+            self.last_success=dict(time=datetime.now().strftime('%Y-%m-%d %H:%M'),
+                app=tr('업데이트 가능' if plan['kind']=='app' else '최신 버전'),
+                proxy=tr(plan.get('reason','앱 업데이트 후 프록시 확인')))
             self.execute.setText('업데이트 설치' if plan['kind']=='app' else '프록시 재시작')
             self.execute.setVisible(plan['kind'] in ('app','proxy'))
             self.status.setText(plan.get('reason','설치할 새 버전이 없습니다.'))
@@ -149,4 +197,4 @@ class UpdatePanel(Group):
         self.proxy_update=update
         self.button.setText('업데이트 취소' if update.get('phase') in BUSY else '업데이트 확인')
         self.button.setEnabled(True)
-        if update.get('message') and update.get('phase')!='off':self.status.setText(update['message'])
+        if not self.operation_error and update.get('message') and update.get('phase')!='off':self.status.setText(update['message'])

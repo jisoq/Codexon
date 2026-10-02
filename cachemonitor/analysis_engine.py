@@ -7,7 +7,7 @@ from .cache_misses import classify
 from .cache_health import CacheHealth
 from .core import TRANSPORT_FIELDS, summarize, METRICS
 from .model_evidence import FIELDS as MODEL_FIELDS
-from .pricing import token_cost, sum_cost, RATES, FAST_RATES, ALIASES, VERIFIED, PRICE_POLICY, request_tier, display_tier, unknown_mode_calls
+from .pricing import token_cost, sum_cost, pricing_signature, request_tier, display_tier, unknown_mode_calls
 from .workload import internal_review
 from .analysis_records import compact_record, public_record, public_records
 
@@ -58,7 +58,7 @@ class AnalysisEngine:
 
     def ingest(self,sessions):
         previous_sessions={**self.sessions,**self.internal_sessions}
-        price_signature=(VERIFIED,PRICE_POLICY,tuple(RATES.items()),tuple(FAST_RATES.items()),tuple(ALIASES.items()))
+        price_signature=pricing_signature()
         # A collector revision covers corrections as well as append. Unversioned
         # callers retain the full fingerprint path.
         fast=tuple(((s['home'],s['id']),s.get('usage_revision'),
@@ -74,7 +74,7 @@ class AnalysisEngine:
         for source in sorted(sessions,key=lambda s:(s['home'],s['id'])):
             for row in source['history']:
                 owners.setdefault(call_identity(source['home'],source['id'],row.get('key')),(source['home'],source['id']))
-        price_signature=(VERIFIED,PRICE_POLICY,tuple(RATES.items()),tuple(FAST_RATES.items()),tuple(ALIASES.items()))
+        price_signature=pricing_signature()
         reprice=price_signature!=self.pricing_signature
         self.pricing_signature=price_signature
         changed=False

@@ -111,6 +111,55 @@ def test_model_filter_combines_request_modes_without_assigning_account_usage():
     assert intervals[0]['cost']==10
 
 
+@pytest.mark.parametrize('width,dark',[(520,False),(1120,True)])
+def test_waiting_state_becomes_observed_zero_and_keeps_history_during_lookup_failure(tmp_path,width,dark):
+    from test_quota_value_history import interval, report_for
+    app=QApplication.instance() or QApplication([])
+    shared_theme().configure('dark' if dark else 'light')
+    panel=QuotaPanel(QSettings(str(tmp_path/'대기상태.ini'),QSettings.IniFormat))
+    scroll=Scroll();scroll.put(fillViewport=True);scroll.setWidget(panel)
+    host=mount(scroll,width,900)
+    try:
+        def visible_text():
+            return '\n'.join(str(item.property('text')) for item in walk(host.quick.rootObject())
+                             if item.isVisible() and item.metaObject().indexOfProperty('text')>=0)
+        QTest.qWait(40)
+        text=visible_text()
+        assert '사용량 기록 수집 대기' in text
+        assert '0%p' not in text and '$0.0000' not in text
+        assert not panel.history.isVisible() and not panel.history_controls.isVisible()
+        assert not panel.history_legend.isVisible() and not panel.conversion.isVisible()
+        assert host.grab().save(str(tmp_path/f'한도수집대기_{width}.png'))
+        # A five-hour observation remains reachable before weekly usage exists.
+        panel.receive({'report':{'cycles':[],'history':[
+            dict(at=100,used=0,window='five_hour',source='live')]}})
+        QTest.qWait(40)
+        assert panel.history_controls.isVisible() and panel.history_empty.isVisible()
+        choice=control(host,panel.window);choice.forceActiveFocus()
+        QTest.keyClick(host.quick,Qt.Key_Down);QTest.qWait(40)
+        assert panel.history.isVisible() and panel.history.rows[0]['remaining']==100
+        assert panel.history_waiting.isVisible()
+        QTest.keyClick(host.quick,Qt.Key_Up);QTest.qWait(40)
+        # A confirmed zero interval must not be mistaken for missing evidence.
+        cycle=interval([(100,80),(130,80)],[(115,0)])
+        report=report_for([cycle])
+        panel.receive({'report':report})
+        QTest.qWait(40)
+        assert panel.statistics['total'] and panel.basis.text()=='0%p'
+        assert panel.cost_value.text()=='$0.0000'
+        assert panel.history.isVisible() and panel.history_legend.isVisible()
+        assert not panel.history_waiting.isVisible() and panel.conversion.isVisible()
+        assert panel.history.rows
+        rows=panel.history.rows
+        panel.receive({'issue':'Codex 한도 조회 실패'})
+        QTest.qWait(40)
+        assert panel.status.isVisible() and panel.history.rows is rows
+        assert panel.basis.text()=='0%p' and panel.cost_value.text()=='$0.0000'
+        assert not panel.history_waiting.isVisible()
+        assert not host.qml_errors
+    finally:dispose(host);shared_theme().configure('light')
+
+
 def test_cycle_selector_changes_graph_preserves_lifetime_and_selection_on_refresh(quota_page,tmp_path):
     app,panel,scroll=quota_page
     host=mount(scroll,1120,1000)

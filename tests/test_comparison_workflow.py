@@ -44,10 +44,11 @@ def test_subscription_rates_and_historical_models_render(tmp_path, language):
             assert record['cost'] is not None and record['cost']==token_cost(record)['cost']
         window.show_prices();dialog=window.price_dialog;QTest.qWait(80)
         prices=dialog.findChild(LazyTable).model().rows
-        assert len(prices)==2*len(SUPPORTED_MODELS)
-        assert {r[0].split(' / ')[0] for r in prices}==set(SUPPORTED_MODELS)
+        assert len(prices)==len(SUPPORTED_MODELS)+1
+        assert {r[0] for r in prices}==set(SUPPORTED_MODELS)|{'gpt-daybreak-blue-latest'}
+        assert all(r[-1]==('미지원' if r[0]=='gpt-daybreak-blue-latest' else '×2.5') for r in prices)
         labels='\n'.join(n.state['text'] for n in dialog.findChildren(Text))
-        assert ('Fast 2.5 x' if language=='en' else 'Fast 2.5배') in labels
+        assert ('Standard API token rates' if language=='en' else 'Standard API 단가') in labels
         if language=='en':assert not any('\uac00'<=c<='\ud7a3' for c in labels)
         assert not window.qml_errors and not dialog.host.qml_errors
         output=Path(__file__).resolve().parents[1]/'artifacts/verification/subscription-value'

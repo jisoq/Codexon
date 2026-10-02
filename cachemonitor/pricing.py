@@ -1,4 +1,4 @@
-"""Subscription value in USD using Standard base rates and usage multipliers.
+"""Standard API token rates weighted by included subscription usage.
 
 Verified 2026-09-23 against OpenAI's pricing and individual model pages.
 GPT-6.1 Sol added from its official model pricing on 2026-09-30.
@@ -11,14 +11,18 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from datetime import date
 
-VERIFIED = '2026-09-30'
-PRICE_POLICY = 'subscription-value-fast-2.5-v6'
-PROFILE_NAME = VERIFIED + ' 기준 / Fast 2.5배'
+VERIFIED = '2026-09-23'
+PRICE_POLICY = 'subscription-standard-api-equivalent-v6'
+MULTIPLIER_VERIFIED = '2026-10-01'
 FAST_MULTIPLIER = 2.5
-SPEED_SOURCE = 'https://learn.chatgpt.com/docs/agent-configuration/speed'
 SUPPORTED_MODELS = ('gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna',
                     'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5')
+MODEL_VERIFIED = '2026-09-30'
+RATE_VERIFIED = {'gpt-6.1-sol': '2026-09-30'}
+PROFILE_NAME = VERIFIED + ' 단가 / ' + MULTIPLIER_VERIFIED + ' 구독 배율'
 SOURCE = 'https://developers.openai.com/api/docs/pricing'
+MODEL_SOURCE = 'https://learn.chatgpt.com/docs/models'
+MULTIPLIER_SOURCE = 'https://learn.chatgpt.com/docs/agent-configuration/speed'
 CACHE_SOURCE = 'https://developers.openai.com/api/docs/guides/prompt-caching'
 COST_COMPONENTS = ('cost_uncached', 'cost_cached', 'cost_written', 'cost_unclassified', 'cost_output')
 COST_KEYS = ('cost', 'cost_input', 'cost_uncached', 'cost_cached', 'cost_written', 'cost_unclassified',
@@ -53,16 +57,47 @@ ALIASES = {
     'gpt-5.4-mini-2026-03-17': 'gpt-5.4-mini',
     'gpt-5.5-2026-04-23': 'gpt-5.5',
 }
-FAST_RATES = {m:replace(r,input=r.input*FAST_MULTIPLIER,
-                       cached=None if r.cached is None else r.cached*FAST_MULTIPLIER,
-                       output=r.output*FAST_MULTIPLIER,
-                       written=None if r.written is None else r.written*FAST_MULTIPLIER)
-              for m,r in RATES.items() if m != 'gpt-5.5-pro'}
+# Included subscription usage only. Purchased credits use a different multiplier.
+SUBSCRIPTION_FAST_MULTIPLIERS = dict.fromkeys((model for model in RATES if model != 'gpt-5.5-pro'), FAST_MULTIPLIER)
+FAST_RATES = {model: replace(RATES[model], **{
+    key: value * multiplier if value is not None else None
+    for key, value in vars(RATES[model]).items() if key in ('input', 'cached', 'output', 'written')})
+    for model, multiplier in SUBSCRIPTION_FAST_MULTIPLIERS.items()}
 
 
 def supported_model(model):
-    """Picker eligibility is independent of historical pricing and account RPC."""
     return ALIASES.get(model, model) in SUPPORTED_MODELS
+
+
+def standard_rate(model):
+    return RATES.get(ALIASES.get(model, model))
+
+
+def subscription_multiplier(model, tier):
+    if tier == 'Standard' and standard_rate(model) is not None:
+        return 1.0
+    # Check the selected Codex model before resolving its pricing alias.
+    # Daybreak Blue has Standard prices but does not offer Fast.
+    if tier != 'Fast' or model == 'gpt-daybreak-blue-latest':
+        return None
+    return SUBSCRIPTION_FAST_MULTIPLIERS.get(ALIASES.get(model, model))
+
+
+def request_rate(row):
+    model, tier = row.get('model'), request_tier(row)
+    if subscription_multiplier(model, tier) is None:
+        return None
+    return FAST_RATES.get(ALIASES.get(model, model)) if tier == 'Fast' else standard_rate(model)
+
+
+def rate_verified(model):
+    return RATE_VERIFIED.get(ALIASES.get(model, model), VERIFIED)
+
+
+def pricing_signature():
+    return (VERIFIED, tuple(RATE_VERIFIED.items()), MULTIPLIER_VERIFIED, MODEL_VERIFIED,
+            PRICE_POLICY, tuple(RATES.items()), tuple(FAST_RATES.items()),
+            tuple(SUBSCRIPTION_FAST_MULTIPLIERS.items()), tuple(ALIASES.items()))
 
 
 def request_tier(row):
@@ -98,15 +133,15 @@ def usd(value):
 def _token_cost(row):
     model = ALIASES.get(row.get('model'), row.get('model'))
     tier=request_tier(row)
-    rate = (FAST_RATES if tier=='Fast' else RATES if tier=='Standard' else {}).get(model)
+    rate = request_rate(row)
     result = {key: None for key in COST_KEYS}
     result.update(price_model=model, price_tier=tier, price_assumed=False, price_issue='', long_context=False,
-                  price_profile=PROFILE_NAME)
+                  price_profile=rate_verified(model) + ' 단가 / ' + MULTIPLIER_VERIFIED + ' 구독 배율')
     if tier not in ('Fast','Standard'):
         result['price_issue']='요청 모드 미확인' if tier=='미확인' else '요청 모드 단가 미지원'
         return result
     if rate is None:
-        result['price_issue'] = '기준 단가 미확인'
+        result['price_issue'] = '구독 배율 미확인' if model in RATES else '기준 단가 미확인'
         return result
     inp, cached, output = row.get('input'), row.get('cached'), row.get('output')
     if any(type(v) is not int or v < 0 for v in (inp, output)):
@@ -158,7 +193,7 @@ def sum_cost(rows, strict=False):
 
 
 def price_note():
-    note = f'{PROFILE_NAME} / 구독 가치 환산액 / 청구액 아님'
+    note = f'{PROFILE_NAME} / Standard API 단가 × 구독 차감 배율'
     if date.today().isoformat() > '2026-11-21':
         note += ' / GPT-5.6 Sol 프로모션 단가 재확인 필요'
     return note
@@ -184,11 +219,12 @@ def token_cost(row):
     if result['cost'] is None:
         model=ALIASES.get(row.get('model'),row.get('model'))
         mode=request_tier(row)
-        rate=(FAST_RATES if mode=='Fast' else RATES if mode=='Standard' else {}).get(model)
+        rate=request_rate(row)
         if not model:issues.append('분석 모델 미확인')
         elif model not in RATES:issues.append('모델 기준 단가 미확인')
         if mode=='미확인':issues.append('요청 모드 미확인')
-        elif mode not in ('Standard','Fast') or model in RATES and rate is None:issues.append('요청 모드 단가 미지원')
+        elif mode not in ('Standard','Fast'):issues.append('요청 모드 단가 미지원')
+        elif model in RATES and rate is None:issues.append('구독 배율 미확인')
         inp,cached,written,output=(row.get(k) for k in ('input','cached','written','output'))
         valid=lambda value:type(value) is int and value>=0
         if not valid(inp):issues.append('입력 토큰 미확인')

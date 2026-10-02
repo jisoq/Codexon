@@ -1,5 +1,6 @@
 """User-facing evidence distinguishes missing source data from real failures."""
 import time
+import pytest
 
 from PySide6.QtCore import QSettings, Qt
 from PySide6.QtWidgets import QApplication
@@ -44,6 +45,53 @@ def test_real_conflict_is_visible_but_missing_wire_evidence_is_not_an_error(tmp_
     finally:window.quit_app()
 
 
+@pytest.mark.parametrize('language',['ko','en'])
+def test_subscription_prices_and_call_detail_render_supported_models(tmp_path,language):
+    from PySide6.QtTest import QTest
+    from cachemonitor.i18n import set_language
+    from cachemonitor.pricing import usd
+    from cachemonitor.table_model import Table
+    from cachemonitor.quick_qa import render_plot
+    set_language(language);window=dashboard(tmp_path)
+    try:
+        snapshot=sample();snapshot['sessions'][0]['history'][0]['service_tier']='Fast'
+        window.receive(snapshot);window.show();window.nav.setCurrentRow(2)
+        window.record_view='calls';window.render_explorer()
+        row=window.record_rows[0];window.activate_record(0)
+        window.record_section='pricing';window.render_record_detail(row)
+        detail=window.detail_sections['pricing'][1]
+        assert '× 2.5' in detail.text() and usd(row['cost']) in detail.text()
+        assert '$10.00' in detail.text()  # Standard Astra input rate.
+        assert '청구액' not in detail.text() and '청구액' not in window.history_summary.text()
+        rendered=render_plot(window,window.detail_sections['pricing'][0])
+        assert rendered.isVisible() and rendered.height()>0
+        assert window.grab().save(str(tmp_path/f'subscription-detail-{language}.png'))
+        window.show_prices();dialog=window.price_dialog
+        prices=next(node for node in dialog.findChildren(Table))
+        assert window.price_button.text()=='API 가격표'
+        assert dialog.host.windowTitle().startswith('API prices' if language=='en' else 'API 가격표')
+        assert prices.model().headers==['모델','일반 입력','캐시 읽기','캐시 쓰기','출력','Fast 배수']
+        rows=prices.model().rows
+        models=[cells[0] for cells in rows]
+        assert len(models)==9 and 'gpt-6.1-sol' in models and 'gpt-daybreak-blue-latest' in models
+        assert all(model not in models for model in ('gpt-5.5-pro','gpt-5.4-mini','gpt-5.6'))
+        assert next(cells for cells in rows if cells[0]=='gpt-daybreak-blue-latest')[-1]=='미지원'
+        sol=next(cells for cells in rows if cells[0]=='gpt-6.1-sol')
+        assert sol[1:]==['$2.00','$0.1000','$2.50','$10.00','×2.5']
+        assert '청구액' not in str(dialog.state)
+        if language=='en':
+            assert 'Subscription multiplier' in detail.state['text']
+            assert 'Standard API token rates' in detail.state['text']
+            assert 'not a bill' not in str(dialog.state)
+        QTest.qWait(80)
+        assert dialog.host.grab().save(str(tmp_path/f'subscription-prices-{language}.png'))
+        assert not window.qml_errors and not dialog.host.qml_errors
+    finally:
+        if getattr(window,'price_dialog',None) and window.price_dialog.host:
+            window.price_dialog.reject();QTest.qWait(30)
+        window.quit_app();set_language('ko')
+
+
 def test_unpriced_call_explains_missing_input_without_claiming_collection_error(tmp_path):
     window=dashboard(tmp_path)
     try:
@@ -51,7 +99,7 @@ def test_unpriced_call_explains_missing_input_without_claiming_collection_error(
         window.record_view='calls';window.render_explorer()
         row=dict(window.record_rows[0],cost=None,service_tier='미확인',price_issue='요청 모드 미확인',price_issues=['요청 모드 미확인'])
         window.render_record_detail(row)
-        assert window.detail_sections['pricing'][1].text()=='환산 제외 · 요청 모드가 기록되지 않음'
+        assert window.detail_sections['pricing'][1].text()=='환산 제외 / 요청 모드가 기록되지 않음'
         assert not window.detail_sections['evidence'][0].isVisible()
         assert '요청 모드가 기록되지 않음' in window.detail_sections['pricing'][1].text()
         assert '미확인' in window.response_cell(row,1,Qt.DisplayRole)
