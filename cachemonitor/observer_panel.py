@@ -32,7 +32,7 @@ class ObserverPanel(Group):
         layout=Column(self);layout.setContentsMargins(0,0,0,10);layout.setSpacing(16)
         row=Row();copy=Column()
         title=Text('프록시 사용');title.setStyleSheet('font-weight: 500;');copy.addWidget(title)
-        description=Text('요청 모델과 응답 모델 비교. 프록시 사용 시 연결 확인 요청 1회.')
+        description=Text('요청 모델과 응답 모델 비교. 켜기 전 로컬 준비 상태 확인.')
         self.description=description
         description.setWordWrap(True);description.setStyleSheet('color: muted; font-size: 12px;')
         copy.addWidget(description);row.addLayout(copy,1)
@@ -76,7 +76,7 @@ class ObserverPanel(Group):
     def invoke(self,operation):
         if not self.active or self.busy():return
         self.operation_name=operation;self.manager.cancelled.clear()
-        if operation=='turn_on':self.status_label.setText('연결 확인 중…')
+        if operation=='turn_on':self.status_label.setText('로컬 프록시 준비 확인 중…')
         elif operation=='turn_off':self.status_label.setText('직접 연결로 복원 중…')
         if self.services:
             from .app_shutdown import ServiceOperation
@@ -104,8 +104,8 @@ class ObserverPanel(Group):
         if self.pending is None:
             with QSignalBlocker(self.toggle):self.toggle.setChecked(self.enabled)
         phase=state.get('phase','off')
-        text={'off':'꺼짐','starting':'연결 확인 중…','prepared':'꺼짐',
-              'validated':'꺼짐 , 연결 시험 완료','active':'켜짐','draining':'꺼짐 , 기존 연결 마무리 중',
+        text={'off':'꺼짐','starting':'로컬 프록시 준비 확인 중…','prepared':'꺼짐',
+              'validated':'꺼짐 , 로컬 프록시 준비 완료','active':'켜짐','draining':'꺼짐 , 기존 연결 마무리 중',
               'faulted':'보호 정지','failed':'켜지 못했습니다','recovery_failed':'보호 정지 , 설정 복구 필요',
               'recovery_required':'연결 확인 필요 , 문제 해결에서 연결 복구'}.get(phase,phase)
         if error and not state:
@@ -120,7 +120,7 @@ class ObserverPanel(Group):
         if incident.get('recovery_error'):reason=(reason+'\n' if reason else '')+'설정 복구 실패: '+incident['recovery_error']
         inactive=not self.enabled and phase in ('off','prepared','validated') and not reason and not state.get('registration_issue')
         if inactive:
-            text='프록시 사용 안 함'+(' , 연결 시험 완료' if phase=='validated' else '')
+            text='프록시 사용 안 함'+(' , 로컬 프록시 준비 완료' if phase=='validated' else '')
             if not self.inactive:self.connection_details.toggle.setChecked(False)
         elif error and phase in ('off','prepared','validated') and state:
             text='프록시 설정 변경 실패'

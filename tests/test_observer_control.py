@@ -63,50 +63,46 @@ def test_failed_start_never_changes_config_or_startup(tmp_path,monkeypatch):
     assert not control.state_path.exists()
 
 
-@pytest.mark.parametrize('scenario',['first_request','existing','delayed','missing','wrong_model'])
-def test_connection_waits_for_first_observation_without_creating_the_database(tmp_path,monkeypatch,scenario):
-    import threading
-    from cachemonitor.model_evidence import EvidenceStore
+def test_local_readiness_does_not_generate_or_read_observations(tmp_path,monkeypatch):
     control,_=manager(tmp_path,monkeypatch)
     control.config_path.write_text('model = "test-model"\n')
     before=control.config_path.read_bytes();auth=control.home.joinpath('auth.json').read_bytes()
-    monkeypatch.setattr('cachemonitor.quota_live.locate_codex',lambda:'isolated-test-codex')
-    workers=[];calls=[]
-    if scenario=='existing':
-        store=EvidenceStore(control.evidence)
-        store.write(control.home,'old',1,'HTTP/SSE','old-response','wrong','wrong','completed');store.close()
-    def record():
-        store=EvidenceStore(control.evidence)
-        try:store.write(control.home,'new',2,'HTTP/SSE','new-response','test-model',
-                        'wrong' if scenario=='wrong_model' else 'test-model','completed')
-        finally:store.close()
-    class Probe:
-        returncode=0
-        def __init__(self,command,**kwargs):
-            calls.append(command)
-            assert control.evidence.exists()==(scenario=='existing')
-        def communicate(self,timeout):
-            if scenario=='delayed':
-                worker=threading.Timer(.15,record);worker.start();workers.append(worker)
-            elif scenario!='missing':record()
-            return b'MODEL_OBSERVER_READY',b''
-    monkeypatch.setattr('cachemonitor.observer_control.subprocess.Popen',Probe)
-    if scenario=='missing':
-        clock=iter(range(100))
-        monkeypatch.setattr('cachemonitor.observer_control.time.monotonic',lambda:next(clock))
-        monkeypatch.setattr('cachemonitor.observer_control.time.sleep',lambda _:None)
-    try:
-        if scenario in ('missing','wrong_model'):
-            with pytest.raises(RuntimeError,match='연결 시험이 통과하지 못했습니다'):control.test_connection()
-            assert not control.state().get('proof_at')
-        else:
-            result=control.test_connection()
-            assert result['validated'] and not result['configured']
-        assert len(calls)==1
-        assert control.config_path.read_bytes()==before and control.home.joinpath('auth.json').read_bytes()==auth
-        if scenario=='missing':assert not control.evidence.exists()
-    finally:
-        for worker in workers:worker.join(2)
+    # An unavailable CLI and unrelated/corrupt evidence cannot block local readiness.
+    control.directory.mkdir(parents=True)
+    control.evidence.write_bytes(b'unrelated evidence must remain untouched')
+    monkeypatch.setattr('subprocess.Popen',lambda *a,**kw:pytest.fail('No CLI or model invocation'))
+    monkeypatch.setattr('sqlite3.connect',lambda *a,**kw:pytest.fail('No observation lookup'))
+    result=control.check_ready()
+    assert result['validated'] and not result['configured']
+    assert control.config_path.read_bytes()==before and control.home.joinpath('auth.json').read_bytes()==auth
+    assert control.evidence.read_bytes()==b'unrelated evidence must remain untouched'
+    assert 'proof_model' not in control.state()
+
+
+@pytest.mark.parametrize('failure',['unreachable','degraded','draining','observation_disabled',
+                                    'incompatible','missing_instance','cancelled','config_changed'])
+def test_local_readiness_failure_never_applies_route(tmp_path,monkeypatch,failure):
+    control,_=manager(tmp_path,monkeypatch)
+    control.config_path.write_text('model = "keep"\n')
+    health={'status':'ok','instance':'test','version':PROXY_VERSION}
+    if failure=='unreachable':health=None
+    elif failure=='degraded':health['status']='degraded'
+    elif failure=='draining':health['draining']=True
+    elif failure=='observation_disabled':health['observation_enabled']=False
+    elif failure=='incompatible':health['version']='unknown'
+    elif failure=='missing_instance':health.pop('instance')
+    original=control.prepare
+    def prepare():
+        original()
+        if failure=='cancelled':control.cancelled.set()
+        if failure=='config_changed':control.config_path.write_text('model = "changed"\n')
+        monkeypatch.setattr(control,'health',lambda **_:health)
+    monkeypatch.setattr(control,'prepare',prepare)
+    with pytest.raises(RuntimeError,match='프록시 준비'):
+        control.check_ready()
+    assert not control.state().get('proof_at')
+    assert 'openai_base_url' not in control.config()[1]
+    assert control.config()[1]['model']==('changed' if failure=='config_changed' else 'keep')
 
 
 def test_disable_preserves_manual_routing_change(tmp_path,monkeypatch):
