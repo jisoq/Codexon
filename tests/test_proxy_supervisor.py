@@ -98,7 +98,7 @@ def test_turn_on_cancellation_after_validation_cannot_apply_route(tmp_path,monke
     m=manager(tmp_path,monkeypatch)
     m.config_path.write_text('model="keep"\n')
     def test():m.cancelled.set()
-    monkeypatch.setattr(m,'test_connection',test)
+    monkeypatch.setattr(m,'check_ready',test)
     monkeypatch.setattr(m,'health',lambda **kw:None)
     with pytest.raises(RuntimeError,match='취소'):m.turn_on()
     assert m.config()[1]=={'model':'keep'}
@@ -121,7 +121,7 @@ def test_failed_turn_on_reports_rollback_failure_without_false_off(tmp_path,monk
     def fail_after_apply():
         m.set_url(m.url)
         raise RuntimeError('verification failed')
-    monkeypatch.setattr(m,'test_connection',fail_after_apply)
+    monkeypatch.setattr(m,'check_ready',fail_after_apply)
     monkeypatch.setattr(m,'recover_direct',lambda:(_ for _ in ()).throw(OSError('config locked')))
     monkeypatch.setattr(m,'health',lambda **kw:None)
     with pytest.raises(RuntimeError,match='설정 복구 실패'):m.turn_on()

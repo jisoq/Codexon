@@ -5,15 +5,12 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import subprocess
 import sys
 import time
 import tomllib
 import urllib.error
 import urllib.request
 import uuid
-import tempfile
-import sqlite3
 import threading
 import errno
 
@@ -209,15 +206,21 @@ class ObserverManager:
                 raise RuntimeError('이전 프록시가 연결을 유지하고 있습니다. 다음 Windows 로그인 후 새 버전에서 다시 켜세요.')
         self.task.start(self.supervisor_command(upstream),autostart=False)
         for _ in range(60):
-            if self.cancelled.is_set():raise RuntimeError('연결 시험을 취소했습니다. 직접 연결은 유지됩니다.')
+            if self.cancelled.is_set():raise RuntimeError('프록시 준비 확인을 취소했습니다. 직접 연결은 유지됩니다.')
             health=self.health()
             if health and health.get('version')==PROXY_VERSION and self.runtime().get('phase')=='ready':return
             time.sleep(.1)
         raise RuntimeError('모델 검증 서비스를 시작하지 못했습니다. Codex 연결 설정은 적용하지 않았습니다.')
 
+    @staticmethod
+    def local_ready(health):
+        return bool(health and health.get('instance') and health.get('status')=='ok'
+                    and proxy_compatible(health.get('version')) and not health.get('draining')
+                    and health.get('observation_enabled',True))
+
     def proof_valid(self,state,health):
-        return bool(isinstance(state.get('proof_at'),(int,float)) and health and health.get('instance') and state.get('proof_instance')==health['instance']
-                    and proxy_compatible(health.get('version')) and health.get('status')=='ok'
+        return bool(isinstance(state.get('proof_at'),(int,float)) and self.local_ready(health)
+                    and state.get('proof_instance')==health['instance']
                     and 0<=time.time()-state.get('proof_at',0)<300)
 
     def prepare(self):
@@ -244,58 +247,21 @@ class ObserverManager:
         self.write_state(state)
         return self.status()
 
-    def test_connection(self):
-        from contextlib import closing
-        from .quota_live import locate_codex
-        def observations(query,parameters=()):
-            # The proxy writer creates its database on the first observation.
-            # A connection check must not create or write that database itself.
-            if not self.evidence.exists():return []
-            with closing(sqlite3.connect(self.evidence.resolve().as_uri()+'?mode=ro',uri=True)) as db:
-                if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='model_observations'").fetchone():return []
-                return db.execute(query,parameters).fetchall()
+    def check_ready(self):
+        """Validate only the owned local relay; never generate a model response."""
         before=self.config_path.read_bytes() if self.config_path.exists() else b''
         self.prepare()
-        health_before=self.health()
-        checkpoint=observations('SELECT coalesce(max(seq),0) FROM model_observations')
-        offset=checkpoint[0][0] if checkpoint else 0
-        _,config=self.config()
-        model=config.get('model') or 'gpt-6-astra'
-        with tempfile.TemporaryDirectory(prefix='cachemonitor-connection-test-') as folder:
-            command=[locate_codex(),'exec','--ignore-user-config','--ephemeral','--skip-git-repo-check',
-                     '--sandbox','read-only','--json','-m',model,'-c',f'openai_base_url="{self.url}"',
-                     '-c','model_reasoning_effort="low"',
-                     'Transport verification only. Do not use tools. Reply exactly MODEL_OBSERVER_READY.']
-            process=subprocess.Popen(command,cwd=folder,env=self.verification_environment(),
-                stdout=subprocess.PIPE,stderr=subprocess.PIPE,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0)
-            deadline=time.monotonic()+90
-            while True:
-                if self.cancelled.is_set() or time.monotonic()>deadline:
-                    process.kill();process.communicate()
-                    raise RuntimeError('연결 시험이 취소되거나 시간이 초과됐습니다. 직접 연결은 유지됩니다.')
-                try:output,_=process.communicate(timeout=.25);break
-                except subprocess.TimeoutExpired:pass
-        deadline=time.monotonic()+5
-        while True:
-            health=self.health()
-            rows=observations("SELECT requested_model,response_model,conflict FROM model_observations WHERE seq>? AND status='completed'",(offset,))
-            if (rows or process.returncode or self.cancelled.is_set() or not health or
-                    health.get('instance')!=health_before.get('instance') or time.monotonic()>=deadline):break
-            time.sleep(.05)
+        health=self.health(timeout=3)
         unchanged=(self.config_path.read_bytes() if self.config_path.exists() else b'')==before
-        if not (unchanged and not self.cancelled.is_set() and process.returncode==0 and b'MODEL_OBSERVER_READY' in output and rows and
-                all(a==b==model and not conflict for a,b,conflict in rows) and health and
-                health.get('instance')==health_before.get('instance') and health.get('status')=='ok' and
-                health.get('relay_errors',0)==health_before.get('relay_errors',0)):
-            raise RuntimeError('연결 시험이 통과하지 못했습니다. 전역 프록시는 적용하지 않았습니다.')
+        if self.cancelled.is_set():
+            raise RuntimeError('프록시 준비 확인을 취소했습니다. 직접 연결은 유지됩니다.')
+        if not (unchanged and self.local_ready(health)):
+            raise RuntimeError('로컬 프록시 준비 상태를 확인하지 못했습니다. 연결 설정은 변경하지 않았습니다.')
         state=self.state()
-        state.update(phase='validated',proof_at=time.time(),proof_instance=health['instance'],proof_model=model)
+        state.pop('proof_model',None)
+        state.update(phase='validated',proof_at=time.time(),proof_instance=health['instance'])
         self.write_state(state)
         return self.status()
-
-    def verification_environment(self):
-        return {**os.environ,'CODEX_HOME':str(self.home)}
 
     def upstream(self):
         _,config=self.config()
@@ -315,7 +281,7 @@ class ObserverManager:
         _,config=self.config()
         upstream=self.upstream()
         if not self.proof_valid(state,self.health()):
-            raise RuntimeError('먼저 연결 시험을 통과해야 합니다. Codex 연결 설정은 변경하지 않았습니다.')
+            raise RuntimeError('먼저 로컬 프록시 준비 상태를 확인해야 합니다. Codex 연결 설정은 변경하지 않았습니다.')
         if not (state.get('enabled') or state.get('pending')):
             if config.get('openai_base_url')==self.url:
                 raise ValueError('기존 로컬 프록시 설정의 복원 정보가 없습니다. 먼저 기존 설정을 확인하세요.')
@@ -390,7 +356,7 @@ class ObserverManager:
             if self.config()[1].get('openai_base_url')==self.url:
                 return self.attach_supervisor()
             try:
-                self.test_connection()
+                self.check_ready()
                 if self.cancelled.is_set():raise RuntimeError('프록시 켜기를 취소했습니다.')
                 result=self.enable()
                 if self.cancelled.is_set():raise RuntimeError('프록시 켜기를 취소했습니다.')
