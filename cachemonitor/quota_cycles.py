@@ -611,7 +611,7 @@ class QuotaLedger:
 
     def enrich_modes(self, snapshot):
         from contextlib import closing
-        from .request_modes import request_mode_observation
+        from .request_modes import request_mode_observation, mode_parents, ParentModeTimeline
         for home in snapshot.get('homes',[]):
             path=Path(home)/'logs_2.sqlite'
             if not path.exists():continue
@@ -647,17 +647,25 @@ class QuotaLedger:
             except sqlite3.Error:pass
         self.db.commit()
         previous=getattr(self,'_enriched_sessions',{})
-        enriched={};sessions=[]
-        for source in snapshot['sessions']:
+        enriched={};resolved={};timelines={}
+        parents=mode_parents(snapshot['sessions'])
+        def resolve(source):
+            if id(source) in resolved:return resolved[id(source)]
             key=(source['home'],source['id'])
+            parent=resolve(parents[key]) if key in parents else None
             revision=self.mode_revisions.get(key,0)
+            if parent is not None:
+                revision=(revision,id(parent['history']),repr(parent.get('turn_records',{})),
+                          repr(source.get('turn_records',{})),parent.get('usage_revision'))
             old=previous.get(key)
             history=old[0] if old and source['history'] is old[2] else source['history']
             source_revision=old[3] if old and source['history'] is old[2] else source.get('usage_revision')
             if old and old[0] is history and old[1]==revision:
                 session={**source,'history':old[2],
                     'usage_revision':(source_revision,revision)}
-                enriched[key]=old;sessions.append(session);continue
+                enriched[key]=old;resolved[id(source)]=session
+                return session
+            parent_timeline=timeline(parent) if parent is not None else None
             rows=[]
             for row in history:
                 recorded=request_tier(row)
@@ -675,10 +683,21 @@ class QuotaLedger:
                 else:changes['service_tier']=recorded if recorded!='미확인' else explicit or '미확인'
                 # Keep the collector's read-only row when enrichment changes nothing.
                 # The cache retains its original history for later evidence corrections.
-                rows.append({**row,**changes} if any(k not in row or row[k]!=v for k,v in changes.items()) else row)
+                value={**row,**changes} if any(k not in row or row[k]!=v for k,v in changes.items()) else row
+                rows.append(parent_timeline.inherit(source,value) if parent_timeline is not None else value)
             session={**source,'history':rows}
             session['usage_revision']=(source_revision,revision)
-            enriched[key]=(history,revision,rows,source_revision);sessions.append(session)
+            # Retain the parent history referenced by the dependency identity.
+            enriched[key]=(history,revision,rows,source_revision,parent)
+            resolved[id(source)]=session
+            return session
+        def timeline(session):
+            key=(session['home'],session['id'])
+            if key not in timelines:
+                parent=resolve(parents[key]) if key in parents else None
+                timelines[key]=ParentModeTimeline(session,self.modes,timeline(parent) if parent is not None else None)
+            return timelines[key]
+        sessions=[resolve(source) for source in snapshot['sessions']]
         self._enriched_sessions=enriched
         snapshot['sessions']=sessions
 
