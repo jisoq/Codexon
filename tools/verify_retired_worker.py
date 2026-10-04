@@ -16,6 +16,7 @@ from cachemonitor.observer_task import ObserverTask
 from cachemonitor.observer_state import read_json
 from cachemonitor.model_evidence import home_key
 from cachemonitor.version import PROXY_VERSION
+from tools.qa_ipc import command_reply
 
 
 def wait(read,valid,seconds=90):
@@ -79,11 +80,11 @@ def verify(root,old,new,role):
             if not client.waitForConnected(3000):
                 if closing:return b'closing'
                 raise RuntimeError('GUI readiness IPC unavailable')
-            client.write(command)
-            if not client.waitForBytesWritten(3000):
+            try:
+                return command_reply(client,command,b'accepted' if closing else b'quitting')
+            except RuntimeError:
                 if closing:return b'closing'
-                raise RuntimeError('GUI quit request delivery failed')
-            client.waitForReadyRead(3000);return bytes(client.readAll())
+                raise
         assert send(b'verify-quit')==b'quitting'
         # The GUI can close its socket before its confirmation reply arrives.
         # Delivery acknowledgement is advisory; the actual zero exit is required.
