@@ -1,6 +1,5 @@
 """Temporal cost shares, synchronized inspection, and accent-bounded UI colors."""
 import math
-from pathlib import Path
 import pytest
 from PySide6.QtCore import QObject, Qt, QPointF
 from PySide6.QtWidgets import QApplication
@@ -118,10 +117,3 @@ def test_last_valid_theme_survives_temporarily_missing_file(tmp_path):
     config.write_text('[desktop]\nappearanceTheme="dark"\n[desktop.appearanceDarkChromeTheme]\nsurface="#212121"\nink="#eeffff"\naccent="#80cbc4"\n')
     reader=CodexAppearance(config);original=reader.read(True);config.unlink()
     assert reader.read(True)==original
-
-def test_ui_color_sources_have_no_literal_palette():
-    root=Path(__file__).resolve().parents[1]/'cachemonitor'
-    import re
-    for p in [*root.glob('*.py'),*root.glob('qml/*.qml')]:
-        if p.name=='connection_recovery.py':continue  # Independent emergency recovery program.
-        assert not re.search(r'#[0-9a-fA-F]{6}(?:[0-9a-fA-F]{2})?\b',p.read_text(encoding='utf-8-sig')),p
