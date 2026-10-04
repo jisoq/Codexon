@@ -16,6 +16,7 @@ from cachemonitor.model_evidence import home_key
 from cachemonitor.usage_collection import CollectionClient
 from cachemonitor import proxy_identity as identity
 from verify_proxy_update import IdleConnections
+from tools.qa_ipc import command_reply
 
 def await_value(read, predicate, seconds=30):
     end = time.monotonic() + seconds
@@ -51,11 +52,7 @@ def quit_gui(executable, home, index, evidence, cache, *, force=False):
         client = QLocalSocket()
         client.connectToServer('CodexonQA-' + hashlib.sha256(str(index.resolve()).encode()).hexdigest()[:24])
         assert client.waitForConnected(3000)
-        client.write(b'verify-quit')
-        assert client.waitForBytesWritten(3000)
-        ready = client.bytesAvailable() or client.waitForReadyRead(3000)
-        reply = bytes(client.readAll())
-        assert ready and reply == b'quitting', (reply, client.errorString(), process.poll())
+        assert command_reply(client,b'verify-quit',b'quitting') == b'quitting'
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline and process.poll() is None:
             time.sleep(0.2)
@@ -63,10 +60,12 @@ def quit_gui(executable, home, index, evidence, cache, *, force=False):
             choice.connectToServer('CodexonQA-' + hashlib.sha256(str(index.resolve()).encode()).hexdigest()[:24])
             if not choice.waitForConnected(1000):
                 continue
-            choice.write(b'verify-exit-force' if force else b'verify-exit-safe')
-            choice.waitForBytesWritten(1000)
-            if (choice.bytesAvailable() or choice.waitForReadyRead(1000)) and bytes(choice.readAll()) == b'accepted':
-                break
+            try:
+                command_reply(choice,b'verify-exit-force' if force else b'verify-exit-safe',
+                              b'accepted',timeout_ms=1000)
+            except RuntimeError:
+                continue  # The GUI can close the socket while exiting; require zero exit below.
+            break
         assert process.wait(timeout=90) == 0
     finally:
         if process.poll() is None:

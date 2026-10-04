@@ -72,6 +72,7 @@ GROUPS = {
     'translation': ('tests/test_public_release.py::test_english_token_labels_do_not_change_stored_values',),
     'payload': ('tests/test_public_release.py::test_public_payload_rejects_local_paths_and_unneeded_qt',),
     'selector': test_files('verify_changes'),
+    'qa_ipc': test_files('qa_ipc'),
 }
 
 # First match wins: QML and shared helpers must not fall through to a broad UI gate.
@@ -84,7 +85,8 @@ RULES = (
     ('cachemonitor/cache_*', ('retirement',)),
     ('tools/cache_runtime.py', ('retirement',)),
     ('tools/verify_cache_retention.py', ('retirement',)),
-    ('tools/verify_retired_worker.py', ('retirement','proxy_lifecycle','install')),
+    ('tools/verify_retired_worker.py', ('retirement','proxy_lifecycle','install','qa_ipc')),
+    ('tools/qa_ipc.py', ('qa_ipc',)),
     ("tools/preview_overlay.py", ("overlay_render",)),
     ("cachemonitor/tooltips.py", ("dashboard", "quota_ui", "overlay_render", "translation")),
     ('cachemonitor/proxy_identity.py', ('proxy_lifecycle','install')),
@@ -192,7 +194,7 @@ RULES = (
     ('cachemonitor/__init__.py', ('runtime',)),
     ('cachemonitor/app_services.py', ('app_lifetime',)),
     ('cachemonitor/collection_lifecycle.py', ('app_lifetime','quota_poll')),
-    ('tools/verify_app_services.py', ('app_lifetime',)),
+    ('tools/verify_app_services.py', ('app_lifetime','qa_ipc')),
     ('cachemonitor/app_shutdown.py', ('app_lifetime',)),
     ('cachemonitor/proxy_drain.py', ('proxy_lifecycle', 'app_lifetime')),
     ('cachemonitor/tray.py', ('runtime', 'window', 'app_lifetime')),
