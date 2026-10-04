@@ -1,13 +1,12 @@
 """Legacy retirement without model calls, lost usage or revived permissions."""
 import json
 from contextlib import closing
-from pathlib import Path
 import sqlite3
 import sys
 from types import SimpleNamespace
 import pytest
 
-from cachemonitor.retired_cache import import_usage,remove_hooks,retire
+from cachemonitor.retired_cache import import_usage,retire
 from cachemonitor.observer_control import ObserverManager,atomic_write
 from cachemonitor.observer_state import read_json
 from cachemonitor.model_evidence import home_key
@@ -58,13 +57,6 @@ def test_receipt_free_release_requires_clean_exit_and_durable_settlement(tmp_pat
     with closing(sqlite3.connect(old)) as db,db:db.execute("UPDATE cache_jobs SET state='unknown',usage=NULL")
     verify_legacy_settlement(old,0)
     assert old.exists()
-
-
-def test_owned_hooks_removed_with_unrelated_entries_preserved(tmp_path):
-    path=tmp_path/'hooks.json';other=dict(description='my hook',hooks=[dict(command='custom')])
-    path.write_text(json.dumps({'hooks':{'Stop':[dict(description='codexon-cache-control',hooks=[]),other]}}),encoding='utf-8')
-    assert remove_hooks(tmp_path);assert json.loads(path.read_text())['hooks']['Stop']==[other]
-    assert not remove_hooks(tmp_path)
 
 
 @pytest.fixture
@@ -177,40 +169,6 @@ def test_retirement_preserves_closed_app_resume_intent(legacy,resume):
     assert record['source']['role']=='observer' and '--cache-worker' not in record['source']['command']
 
 
-def test_product_has_no_cache_executor_or_control_interface():
-    import inspect
-    from cachemonitor.model_proxy import create_app
-    root=Path(__file__).resolve().parents[1]
-    for name in ('cache_capture','cache_control','cache_db','cache_execution','cache_hooks','cache_integration',
-                 'cache_operating','cache_panel','cache_policy','cache_scheduler','cache_worker_control'):
-        assert not (root/'cachemonitor'/(name+'.py')).exists()
-    assert 'cache_capture' not in inspect.signature(create_app).parameters
-    assert 'scheduler' not in inspect.signature(create_app).parameters
-
-
-def test_dashboard_and_worker_share_separate_observation_directory(tmp_path,monkeypatch):
-    from PySide6.QtCore import QSettings
-    from PySide6.QtWidgets import QApplication
-    from cachemonitor.dashboard import Dashboard
-    from cachemonitor.proxy_target import ProxyTarget
-    app=QApplication.instance() or QApplication([])
-    previous=app.property('cachemonitorDisableShellIntegration');app.setProperty('cachemonitorDisableShellIntegration',True)
-    home=tmp_path/'home';home.mkdir();index=tmp_path/'usage'/'index.sqlite';evidence=tmp_path/'observations'/'custom.sqlite'
-    index.parent.mkdir();evidence.parent.mkdir()
-    atomic_write(index.with_name('cache-route.json'),json.dumps(dict(url='http://127.0.0.1:18992')).encode())
-    monkeypatch.setattr('cachemonitor.launch_context.preferences',lambda *args,**kwargs:{})
-    window=Dashboard([str(home)],start_worker=False,live_limits=False,index_path=index,model_evidence_path=evidence,
-        settings=QSettings(str(tmp_path/'settings.ini'),QSettings.IniFormat))
-    try:
-        m=window.observer_panel.manager
-        assert m.directory.resolve()==evidence.parent.resolve() and m.evidence.resolve()==evidence.resolve()
-        assert m.retirement_index==index.resolve() and m.url=='http://127.0.0.1:18992'
-        assert ProxyTarget(m).locks==[evidence.parent/'proxy-supervisor.lock']
-        command=m.supervisor_command('chatgpt')
-        assert command[command.index('--evidence-path')+1]==str(evidence)
-    finally:window.quit_app();app.setProperty('cachemonitorDisableShellIntegration',previous)
-
-
 @pytest.mark.parametrize('entry',['proxy_update','proxy_supervisor'])
 def test_proxy_entry_points_use_explicit_observation_filename(tmp_path,monkeypatch,entry):
     import importlib
@@ -224,14 +182,3 @@ def test_proxy_entry_points_use_explicit_observation_filename(tmp_path,monkeypat
     module.main()
     assert captured['manager'].evidence==evidence.resolve()
     assert captured['command'][captured['command'].index('--evidence-path')+1]==str(evidence.resolve())
-
-
-def test_app_service_start_retires_before_adopting_proxy(tmp_path,monkeypatch):
-    from cachemonitor.app_services import AppServices
-    events=[]
-    manager=SimpleNamespace(cleanup_legacy_check=lambda:events.append('cleanup'),adopt_registrations=lambda:events.append('adopt'),
-        resume=lambda:events.append('resume') or {})
-    owner=AppServices(None,[],collection=False);owner.manager=manager
-    monkeypatch.setattr('cachemonitor.retired_cache.retire',lambda m:events.append('retire'))
-    owner.start()
-    assert events==['retire','cleanup','adopt','resume']

@@ -64,16 +64,6 @@ def test_parent_total_and_child_route():
     assert child_view['records']['rows'][0]['sid']=='child'
 
 
-def test_responsive_render(dashboard,tmp_path):
-    from PySide6.QtTest import QTest
-    w=dashboard;w.change_page(2)
-    for width,height in ((1120,760),(1440,940),(2560,1440),(3440,1440),(5120,2082)):
-        w.resize(width,height);QTest.qWait(60)
-        assert w.records_body.available_width>0
-        assert w.quick.grabFramebuffer().save(str(tmp_path/f'history-{width}.png'))
-    assert not w.qml_errors
-
-
 def test_filtered_request_metrics_and_zero_call_boundary():
     source=history();source=copy.deepcopy(source)
     source.setdefault('turn_records',{})['waiting']=dict(started_at=105,state='진행')

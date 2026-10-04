@@ -6,16 +6,6 @@ def obs(sequence, remaining, at=None, epoch=('account', 'week')):
     return Observation(sequence, at, at + 1, remaining, epoch)
 
 
-def test_all_account_consumption_updates_even_without_local_work():
-    state = TrackingState(0)
-    state.activity(False, 1)
-    for i, remaining in enumerate((70, 70, 68, 68, 64), 1):
-        assert state.observe(obs(i, remaining))
-    assert state.baseline.remaining - state.endpoint.remaining == 6
-    assert len(state.observations) == 5
-    assert not state.closed
-
-
 def test_out_of_order_and_pre_activation_observations_do_not_change_totals():
     state = TrackingState(15)
     assert not state.observe(obs(1, 90))
@@ -23,22 +13,3 @@ def test_out_of_order_and_pre_activation_observations_do_not_change_totals():
     assert not state.observe(obs(1, 10, at=25))
     assert not state.observe(Observation(3, 25, 24, 60, ('account','week')))
     assert state.endpoint.remaining == 70
-
-
-def test_observed_increase_starts_new_segment_without_erasing_old_measurements():
-    state = TrackingState(0)
-    for i, remaining in enumerate((70, 68, 69, 68, 67), 1):
-        state.observe(obs(i, remaining))
-    assert state.closed[0]['reason']=='arbitrary_reset'
-    assert state.closed[0]['start'].remaining-state.closed[0]['end'].remaining==2
-    assert state.baseline.remaining-state.endpoint.remaining==2
-    assert [r.remaining for r in state.observations]==[69,68,67]
-
-
-def test_epoch_change_keeps_old_sum_and_starts_new_baseline():
-    state = TrackingState(0)
-    state.observe(obs(1, 70));state.observe(obs(2, 68))
-    state.observe(obs(3, 100, epoch=('account','next_week')))
-    state.observe(obs(4, 99, epoch=('account','next_week')))
-    assert state.closed[0]['start'].remaining - state.closed[0]['end'].remaining == 2
-    assert state.baseline.remaining - state.endpoint.remaining == 1

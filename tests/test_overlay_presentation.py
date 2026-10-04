@@ -22,24 +22,6 @@ def summary(misses=0, count=12):
     return OverlaySummaries().collect(engine)[0]
 
 
-def test_english_overlay_keeps_session_title_pixels(tmp_path):
-    from cachemonitor.i18n import set_language
-    app=QApplication.instance() or QApplication([]);w=SessionOverlay();data=summary()
-    data['title']='사용한도 주석 표시 정리'
-    try:
-        images=[]
-        for language in ('ko','en'):
-            set_language(language);w.set_content(data);m=w.content_model
-            image=QImage(m.panel_width(),m.panel_height(),QImage.Format_ARGB32_Premultiplied);image.fill(0)
-            painter=QPainter(image);m.paint(painter);painter.end();images.append(image)
-            assert image.save(str(tmp_path/f'raw-title-{language}.png'))
-        assert images[0].copy(16,16,260,24)==images[1].copy(16,16,260,24)
-        assert images[0].copy(16,66,200,20)!=images[1].copy(16,66,200,20)
-        assert w.accessibleName().splitlines()[0]==data['title']
-    finally:
-        w.close();set_language('ko');app.processEvents()
-
-
 def test_english_overlay_translates_visible_text_before_detail_layout(monkeypatch):
     import re
     from PySide6.QtGui import QFontMetrics

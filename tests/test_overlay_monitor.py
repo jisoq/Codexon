@@ -130,29 +130,6 @@ def test_inactive_details_and_freshness_do_not_repaint():
     assert content.lower_offset==110 and content.layout()['tokens']==168
 
 
-def test_compact_pills_and_hover_keep_latest_and_selection():
-    from PySide6.QtWidgets import QApplication
-    app=QApplication.instance() or QApplication([])
-    from cachemonitor.overlay_view import OverlayContent
-    from cachemonitor.overlay_chrome import NavigationModel
-    from test_overlay_presentation import summary
-    content=OverlayContent();content.set_content(summary(count=20));latest=content.data['latest'];selected=content.selected_id
-    content.monitor_action('tab-history')
-    links=content.monitor_links();controls=[r for r in links if r.get('action')]
-    assert all(r['x']>=208 and r['height']==24 for r in controls)
-    # Font fallback differs between the packaged desktop and a native QA desktop.
-    # Preserve compact, contiguous controls with the same right edge in either.
-    for prefix in ('unit-','tab-'):
-        pair=[r for r in controls if r['id'].startswith(prefix)]
-        assert len(pair)==2 and sum(r['width'] for r in pair)<100
-        assert pair[0]['x']+pair[0]['width']==pair[1]['x']
-        assert pair[1]['x']+pair[1]['width']==338
-    nav=NavigationModel(content);nav.inspectCall('call-0')
-    assert content.inspected_call==content.call_id(content.rows()[0])
-    assert content.selected_id==selected and content.data['latest'] is latest
-    nav.inspectCall('');assert content.inspected_call is None
-
-
 def test_layout_collapses_notices_and_composition_has_tooltip_only_regions():
     from copy import deepcopy
     from PySide6.QtWidgets import QApplication

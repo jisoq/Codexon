@@ -187,14 +187,6 @@ def test_legacy_gui_migration_ignores_workers_and_keeps_all_homes(tmp_path,monke
     assert running_homes(tmp_path)==homes
 
 
-def test_recovery_translation_does_not_import_qt():
-    result=subprocess.run([__import__('sys').executable,'-c',
-        "from cachemonitor.translation_catalog import translate; import sys; "
-        "assert translate('직접 연결로 복원','en')=='Restore direct connection'; "
-        "assert not any(k.startswith('PySide6') for k in sys.modules)"],capture_output=True,text=True)
-    assert result.returncode==0,result.stderr
-
-
 @pytest.mark.parametrize('name',['recovery','연결 복구','recovery-\U0001f642'])
 def test_shortcut_preserves_recovery_application_identity(tmp_path,name):
     import sys

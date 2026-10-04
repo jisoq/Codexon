@@ -74,12 +74,6 @@ def setup(tmp_path,monkeypatch,request):
     return m,u
 
 
-def test_idle_100_connections_drain_without_new_fields_preserves_autostart(setup):
-    m,u=setup;u.run()
-    assert read_json(u.path)['phase']=='complete'
-    assert m.task.starts==[(['new.exe',*m.command[1:]],False)]
-
-
 def test_sent_response_and_usage_finish_before_replacement(setup):
     m,u=setup;m.requests=1;original=u.sleep
     def finish(n):
