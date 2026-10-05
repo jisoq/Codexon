@@ -4,6 +4,62 @@ from types import SimpleNamespace
 
 import pytest
 
+
+@pytest.mark.parametrize('held',[False,True,'exited','unreadable'])
+def test_collector_stale_pid_does_not_block_restart(tmp_path,monkeypatch,held):
+    from cachemonitor.usage_collection import CollectionChannel
+    owner=services.AppServices(None,[])
+    channel=CollectionChannel([],tmp_path/'index.sqlite')
+    queries=[];probes=[]
+    def locked(path):
+        probes.append(path)
+        if held=='unreadable':raise PermissionError('lock access denied')
+        return held is True or held=='exited' and len(probes)==1
+    def identify(pid):
+        queries.append(pid)
+        raise PermissionError('process access denied')
+    monkeypatch.setattr('cachemonitor.usage_collection.locked',locked)
+    monkeypatch.setattr(services.identity,'process_identity',identify)
+    try:
+        if held is True or held=='unreadable':
+            with pytest.raises(PermissionError):owner.collector_identity(channel,{'collection':{'pid':123}})
+        else:assert owner.collector_identity(channel,{'collection':{'pid':123}}) is None
+        assert bool(queries)==(held is True or held=='exited')
+    finally:channel.close()
+
+
+def test_collector_restart_requires_new_publication_and_preserves_retry_budget(tmp_path,monkeypatch):
+    from cachemonitor.usage_collection import CollectionChannel
+    from cachemonitor.observer_task import ObserverTask
+    channel=CollectionChannel([],tmp_path/'index.sqlite')
+    snapshot={'ts':1000,'collection':{'pid':123,'instance':'old','version':'2026.09.28.4'}}
+    clock=[0];starts=[]
+    monkeypatch.setattr('cachemonitor.usage_collection.CollectionChannel',lambda *a:channel)
+    monkeypatch.setattr(channel,'close',lambda:None)
+    monkeypatch.setattr(channel,'read_header',lambda:snapshot)
+    monkeypatch.setattr('cachemonitor.collection_lifecycle.retire_legacy',lambda c:None)
+    monkeypatch.setattr('cachemonitor.usage_collection.locked',lambda p:False)
+    monkeypatch.setattr(ObserverTask,'inspect',lambda self:{'running':False})
+    monkeypatch.setattr(ObserverTask,'start',lambda *a,**k:starts.append(clock[0]))
+    monkeypatch.setattr(services.identity,'process_identity',lambda pid:pytest.fail('stale PID queried'))
+    monkeypatch.setattr(services.time,'time',lambda:1000)
+    owner=services.AppServices(None,[],channel.path,clock=lambda:clock[0])
+    try:
+        assert owner.start()['collection_issue']=='수집 시작 중'
+        assert starts==[0]
+        assert owner.poll_collection()=='수집 시작 중'
+        for at in (30,90,120,150,210,500):
+            clock[0]=at;owner.poll_collection()
+        assert starts==[0,90,150,210]
+        snapshot['collection']['instance']='new'
+        assert owner.poll_collection()=='수집 결과 갱신 지연'
+        assert owner.collector_pending is not None
+        monkeypatch.setattr(owner,'collector_identity',lambda *a:{'instance':'new'})
+        assert owner.poll_collection()==''
+        assert owner.collector_pending is None
+        assert owner.retries['collection']['count']==3
+    finally:channel.db.close()
+
 from cachemonitor import app_services as services
 from cachemonitor.observer_control import ObserverManager
 from cachemonitor.observer_state import read_json

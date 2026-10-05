@@ -7,7 +7,7 @@ from .charts import Plot, dynamic_bounds
 from .theme import shared_theme
 from .pricing import usd
 from .quota_view import clock, prepare_series, observation_label
-from .quota_share import share_at
+from .quota_share import share_at, share_label, share_color_key
 from .token_colors import color_distance
 from .i18n import LocalizedPainter, tr
 
@@ -52,7 +52,7 @@ class QuotaHistory(Plot):
         self.series=series;self.rows=series['rows'];self.cursor=min(self.cursor,max(0,len(self.rows)-1))
         share=series.get('model_share')
         self.setFixedHeight(440 if share else 340)
-        shared_theme().register_models(share['models'] if share else [])
+        shared_theme().register_models([name for name,mode in share['models']] if share else [])
         self._cache_key=None;self.update()
 
     def set_rows(self,rows):self.set_series(prepare_series(rows))
@@ -267,7 +267,7 @@ class QuotaHistory(Plot):
         area=self.strip_box
         p.setPen(QColor(palette['muted']))
         p.drawText(QRectF(area.left(),area.top()-25,area.width(),22),Qt.AlignLeft,
-                   p.fontMetrics().elidedText(tr('모델별 점유율 · 5분'),Qt.ElideRight,int(area.width())))
+                   p.fontMetrics().elidedText(tr('모델 및 모드별 점유율 / 5분'),Qt.ElideRight,int(area.width())))
         p.drawText(QRectF(0,area.top(),area.left()-8,20),Qt.AlignRight,'100%')
         p.drawText(QRectF(0,area.bottom()-20,area.left()-8,20),Qt.AlignRight,'0%')
         p.fillRect(area,QColor(palette['track']))
@@ -286,8 +286,8 @@ class QuotaHistory(Plot):
             for name in share['models']:
                 height=area.height()*item['shares'].get(name,0)/100
                 if height<=0:continue
-                y-=height;p.fillRect(QRectF(x,y,width,height),QColor(shared_theme().model_color(name)))
-                pattern=shared_theme().model_pattern(name)
+                y-=height;p.fillRect(QRectF(x,y,width,height),QColor(shared_theme().color(share_color_key(name))))
+                pattern=shared_theme().model_pattern(name[0])
                 if pattern:p.fillRect(QRectF(x,y,width,height),QBrush(QColor(palette['surface']),pattern))
         p.restore()
 
@@ -351,11 +351,11 @@ class QuotaHistory(Plot):
         if item:
             note={'unknown':'미확인 · 모델 비용과 차트 증가분의 대응을 확인할 수 없습니다',
                   'zero':'확인된 비용 증가 없음','cost':''}[item['state']]
-            details=[dict(label=name,value=f"{item['shares'].get(name,0):.1f}%",model=name,
-                          color='ink') for name in share['models']] if item['state']=='cost' else []
+            details=[dict(label=share_label(name),value=f"{item['shares'].get(name,0):.1f}%",model=name[0],
+                          service_tier=name[1],swatch=share_color_key(name),color='ink') for name in share['models']] if item['state']=='cost' else []
         return {**detail,'inspection_at':at,'chart_top':self.box.top(),'chart_bottom':self.box.bottom(),
                 'strip_top':self.strip_box.top(),'strip_bottom':self.strip_box.bottom(),
-                'share':dict(title=(clock(item['start'],True)+' → '+clock(item['end'],True)) if item else '모델별 점유율 · 5분',
+                'share':dict(title=(clock(item['start'],True)+' → '+clock(item['end'],True)) if item else '모델 및 모드별 점유율 / 5분',
                              items=details,note=note)}
 
     def detail_for(self,index):

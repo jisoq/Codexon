@@ -31,7 +31,7 @@ def dashboard(tmp_path):
 def test_real_conflict_is_visible_but_missing_wire_evidence_is_not_an_error(tmp_path):
     window=dashboard(tmp_path)
     try:
-        window.receive(sample());window.nav.setCurrentRow(2)
+        window.receive(sample());window.nav.setCurrentRow(window.navigation_pages.index(2))
         window.record_view='calls';window.render_explorer()
         row=window.record_rows[0]
         assert record_issues(row)==[]
@@ -55,7 +55,7 @@ def test_subscription_prices_and_call_detail_render_supported_models(tmp_path,la
     set_language(language);window=dashboard(tmp_path)
     try:
         snapshot=sample();snapshot['sessions'][0]['history'][0]['service_tier']='Fast'
-        window.receive(snapshot);window.show();window.nav.setCurrentRow(2)
+        window.receive(snapshot);window.show();window.nav.setCurrentRow(window.navigation_pages.index(2))
         window.record_view='calls';window.render_explorer()
         row=window.record_rows[0];window.activate_record(0)
         window.record_section='pricing';window.render_record_detail(row)
@@ -95,7 +95,7 @@ def test_subscription_prices_and_call_detail_render_supported_models(tmp_path,la
 def test_unpriced_call_explains_missing_input_without_claiming_collection_error(tmp_path):
     window=dashboard(tmp_path)
     try:
-        window.receive(sample());window.nav.setCurrentRow(2)
+        window.receive(sample());window.nav.setCurrentRow(window.navigation_pages.index(2))
         window.record_view='calls';window.render_explorer()
         row=dict(window.record_rows[0],cost=None,service_tier='미확인',price_issue='요청 모드 미확인',price_issues=['요청 모드 미확인'])
         window.render_record_detail(row)

@@ -17,6 +17,23 @@ A = '11111111-1111-1111-1111-111111111111'
 B = '22222222-2222-2222-2222-222222222222'
 
 
+def test_missing_session_retains_service_error_and_clears_on_recovery():
+    from types import SimpleNamespace
+    import time
+    controller=SimpleNamespace(target_state={'selection':SimpleNamespace(thread_id=A,host='local')},
+        session_lookup={},collection_issue='process access denied',errors=[],loading=False,
+        snapshot_at=time.monotonic(),refresh=lambda:None)
+    assert OverlayController.content(controller)==(None,'수집 오류')
+    OverlayController.receive_collection_status(controller,{'phase':'active'})
+    assert controller.collection_issue=='process access denied'
+    OverlayController.receive_collection_status(controller,{'collection_issue':''})
+    assert OverlayController.content(controller)==(None,'호출 기록 없음')
+    controller.errors=['stale snapshot']
+    assert OverlayController.content(controller)==(None,'수집 오류')
+    controller.target_state['selection'].host='remote'
+    assert OverlayController.content(controller)[1].startswith('원격 작업')
+
+
 @pytest.mark.parametrize('version', ['26.915.100.0', '26.917.6896.0', '26.918.1.0', '27.0.0.0'])
 @pytest.mark.parametrize('prefix,namespace', [('/local/', ''), ('/c/', ''), ('/c/local-chatgpt%3A', 'local-chatgpt:')])
 def test_new_desktop_releases_require_live_route_evidence(tmp_path, version, monkeypatch, prefix, namespace):

@@ -60,31 +60,47 @@ Rectangle {
                 background: Rectangle { radius: 4; color: parent.hovered ? appTheme.palette.hover : "transparent" }
             }
         }
-        Repeater {
-            model: card.detailData.items || []
-            delegate: RowLayout {
-                required property var modelData
-                Layout.fillWidth: true
-                spacing: 10
-                Rectangle {
-                    visible: !!modelData.model
-                    Layout.preferredWidth: visible ? 10 : 0
-                    Layout.preferredHeight: 10
-                    color: modelData.model ? (appTheme.palette && appTheme.color("model:" + modelData.model)) : "transparent"
-                }
-                Text {
-                    text: appLanguage.text(modelData.label)
-                    font.family: appTheme.family; font.pixelSize: 13
-                    color: modelData.model ? appTheme.palette.ink : (appTheme.palette && appTheme.readableText(modelData.color, "surface"))
-                    wrapMode: Text.Wrap; Layout.fillWidth: true
-                }
-                Text {
-                    objectName: "quotaDetailValue"
-                    text: modelData.value
-                    font.family: appTheme.family; font.pixelSize: 15; font.bold: true
-                    color: appTheme.palette.ink
-                    wrapMode: Text.Wrap; horizontalAlignment: Text.AlignRight
-                    Layout.maximumWidth: card.availableWidth * 0.57
+        ScrollView {
+            id: itemScroll
+            objectName: "quotaDetailItems"
+            Layout.fillWidth: true
+            Layout.preferredHeight: Math.min(itemColumn.implicitHeight, Math.max(60, (card.parent ? card.parent.height : 800) * 0.45))
+            contentWidth: availableWidth
+            contentHeight: itemColumn.implicitHeight
+            clip: true
+            enabled: contentHeight > height
+            ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+            ColumnLayout {
+                id: itemColumn
+                width: itemScroll.availableWidth
+                spacing: 5
+                Repeater {
+                    model: card.detailData.items || []
+                    delegate: RowLayout {
+                        required property var modelData
+                        Layout.fillWidth: true
+                        spacing: 10
+                        Rectangle {
+                            visible: !!modelData.model
+                            Layout.preferredWidth: visible ? 10 : 0
+                            Layout.preferredHeight: 10
+                            color: modelData.model ? (appTheme.palette && appTheme.color(modelData.swatch)) : "transparent"
+                        }
+                        Text {
+                            text: appLanguage.text(modelData.label)
+                            font.family: appTheme.family; font.pixelSize: 13
+                            color: modelData.model ? appTheme.palette.ink : (appTheme.palette && appTheme.readableText(modelData.color, "surface"))
+                            wrapMode: Text.Wrap; Layout.fillWidth: true
+                        }
+                        Text {
+                            objectName: "quotaDetailValue"
+                            text: modelData.value
+                            font.family: appTheme.family; font.pixelSize: 15; font.bold: true
+                            color: appTheme.palette.ink
+                            wrapMode: Text.Wrap; horizontalAlignment: Text.AlignRight
+                            Layout.maximumWidth: card.availableWidth * 0.57
+                        }
+                    }
                 }
             }
         }

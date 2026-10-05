@@ -17,6 +17,7 @@ from .version import VERSION
 
 REPOSITORY = 'jisoq/Codexon'
 HEADERS = {'Accept':'application/vnd.github+json','User-Agent':'Codexon-Updater'}
+RELEASE_URL = 'https://api.github.com/repos/'+REPOSITORY+'/releases/latest'
 
 
 def asset_url(value):
@@ -53,6 +54,29 @@ def version_parts(value):
     return tuple(map(int,value.lstrip('v').split('.')))
 
 
+def validated_release(value):
+    """Keep only usable, same-release installer metadata; never touch local services."""
+    if not isinstance(value,dict):raise ValueError('배포 정보 형식을 확인하지 못했습니다.')
+    tag=value.get('tag_name')
+    if not isinstance(tag,str):raise ValueError('배포 버전 형식을 확인하지 못했습니다.')
+    version_parts(tag)
+    try:
+        setup,checksum=release_asset(value)
+        prefix='https://github.com/'+REPOSITORY+'/releases/download/'+tag+'/'
+        for asset in (setup,checksum):
+            if asset['browser_download_url']!=prefix+asset['name']:
+                raise ValueError('배포 버전과 파일 주소가 일치하지 않습니다.')
+        if type(setup.get('size')) is not int or not 0<setup['size']<2_000_000_000:
+            raise ValueError('설치 파일 크기가 올바르지 않습니다.')
+        digest=setup.get('digest')
+        if digest is not None and (not isinstance(digest,str) or not re.fullmatch(r'sha256:[a-fA-F0-9]{64}',digest)):
+            raise ValueError('설치 파일 검증 정보가 올바르지 않습니다.')
+        return dict(tag_name=tag,assets=[{k:a[k] for k in ('name','browser_download_url','size','digest') if k in a}
+                                         for a in (setup,checksum)])
+    except (KeyError,TypeError,AttributeError) as exc:
+        raise ValueError('배포 정보 형식을 확인하지 못했습니다.') from exc
+
+
 def launch_installer(output,root):
     from .observer_task import ObserverTask
     # The installer outlives the old GUI's task/job during the handoff.
@@ -81,13 +105,13 @@ def inspect_proxy(manager):
     return dict(state='current' if current else 'required',reason=reason,connections=connection_count(status),instance=health['instance'])
 
 
-def check_update(progress=lambda _:None, manager=None):
+def check_update(progress=lambda _:None, manager=None, *, release=None):
     """Read the offered release without installing or changing the connection."""
     install=installed()
     if not install:
         raise RuntimeError('설치형 Codexon에서 업데이트할 수 있습니다. 설치 프로그램을 한 번 실행해 주세요.')
     progress('업데이트 확인 중…')
-    release=json.loads(read_url('https://api.github.com/repos/'+REPOSITORY+'/releases/latest'))
+    release=validated_release(json.loads(read_url(RELEASE_URL)) if release is None else release)
     if version_parts(release['tag_name'])<=version_parts(VERSION):
         from .install_management import connection_manager
         manager=manager if manager is not None else connection_manager()

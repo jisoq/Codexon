@@ -162,6 +162,12 @@ def main():
         operation=window.update_panel.operation
         if operation and operation.isRunning():operation.wait()
     app.aboutToQuit.connect(finish_update)
+    from .update_monitor import UpdateMonitor, production_updates_allowed
+    if production_updates_allowed(isolated=bool(isolated or args.smoke or args.verify_handoff or args.verify_services)):
+        monitor=UpdateMonitor(window.settings,window)
+        window.bind_update_monitor(monitor)
+        app.aboutToQuit.connect(monitor.stop)
+        monitor.start()
 
     def connection():
         client = server.nextPendingConnection()

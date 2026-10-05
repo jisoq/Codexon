@@ -36,7 +36,7 @@ from .workload import call_count
 from .history_navigation import HistoryNavigation, HistoryWorkspace, HistoryTree
 
 STYLE = ''
-TITLES = ('사용 현황','조건 비교','세션 기록','사용 한도','설정')
+TITLES = ('사용 현황','조건 비교','세션 기록','사용 한도','설정','성능 추이')
 PERIODS = [('최근 30분','30m'),('오늘','today'),('최근 7일','7d'),('최근 30일','30d'),('전체 기록','all'),('직접 지정','custom')]
 INPUT_BANDS = [('전체 입력 길이',''),('10k 미만','0:10000'),('10–50k','10000:50000'),('50–100k','50000:100000'),('100–200k','100000:200000'),('200–272k','200000:272001'),('272k 초과','272001:inf')]
 CALL_FILTERS = [('미산정','unpriced'),('모드 기록 없음','unknown_mode'),('모델명 불일치','model_mismatch'),('기록 누락·충돌','observation_problem'),('캐시 읽기 0','cache_zero'),('캐시 저하 의심','cache_degradation'),('HTTP/SSE','http')]
@@ -160,8 +160,11 @@ class Dashboard(TrayWindow):
         side=Group();side.setFixedWidth(200);side.setObjectName('sidebar');side_layout=Column(side)
         side_layout.setContentsMargins(16,24,16,20);side_layout.setSpacing(24)
         side_layout.addWidget(label('CODEX·ON','brand'))
-        self.nav=Navigation();self.nav.addItems(TITLES[:4]);self.nav.setObjectName('navigation');self.nav.setMaximumHeight(220)
+        self.navigation_pages=(0,1,5,2,3)
+        self.nav=Navigation();self.nav.addItems(tuple(TITLES[i] for i in self.navigation_pages));self.nav.setObjectName('navigation');self.nav.setMaximumHeight(220)
         side_layout.addWidget(self.nav);side_layout.addStretch()
+        self.update_available=Button('업데이트 가능');self.update_available.hide()
+        self.update_available.clicked.connect(self.open_updates);side_layout.addWidget(self.update_available)
         self.settings_button=Button('설정');self.settings_button.put(flat=True);self.settings_button.clicked.connect(self.open_settings)
         side_layout.addWidget(self.settings_button);self.index_status=label('수집 중','muted',True);self.index_status.put(fontSize=12);side_layout.addWidget(self.index_status)
         shell.addWidget(side)
@@ -196,10 +199,13 @@ class Dashboard(TrayWindow):
         self.quota_panel=QuotaPanel(self.settings);quota_scroll=Scroll();quota_scroll.put(fillViewport=True)
         quota_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff);quota_scroll.setWidget(self.quota_panel);self.pages.addWidget(quota_scroll)
         self.scrollers[3]=quota_scroll;self.build_settings()
+        from .performance_panel import PerformancePanel
+        self.performance_panel=PerformancePanel(self)
+        self.pages.addWidget(self.performance_panel);self.scrollers[5]=self.performance_panel.chart_scroll
         self.health=label('','muted',True);self.health.hide()
-        self.setup_tray();self.settings_page.bind_tray(self);self.tray.messageClicked.connect(self.open_notification_details)
+        self.setup_tray();self.settings_page.bind_tray(self);self.tray.messageClicked.connect(self.open_tray_notification)
         self.tick=QTimer(self);self.tick.timeout.connect(self.check_stale);self.tick.start(1000)
-        self.nav.currentRowChanged.connect(lambda row:self.change_page(row) if row>=0 else None)
+        self.nav.currentRowChanged.connect(lambda row:self.change_page(self.navigation_pages[row]) if row>=0 else None)
         for node in (self.home,self.period,self.project,self.source,self.model,self.effort,self.mode):node.currentIndexChanged.connect(self.filter_changed)
         for node in (self.date_start,self.date_end):node.dateChanged.connect(self.filter_changed)
         self.archive.toggled.connect(self.filter_changed)
@@ -220,6 +226,7 @@ class Dashboard(TrayWindow):
         self.service_controller=ServiceController(self.app_services,self)
         self.observer_panel.services=self.app_services if manage_observer else None
         self.service_controller.result.connect(self.observer_panel.display)
+        self.service_controller.result.connect(self.receive_collection_status)
         if manage_observer or self.app_services.collection:
             QTimer.singleShot(0,self.service_controller.start)
 
@@ -493,7 +500,7 @@ class Dashboard(TrayWindow):
         self.search.setText(state.get('search',''));self.outside.setChecked(state.get('outside',False))
         for key,node in self.call_filter_controls.items():node.setChecked(key in state.get('call_filters',[]))
         for key,node in self.extra_column_controls.items():node.setChecked(key in state.get('extras',[]))
-        self.temporary_context=None if initial else state.get('temporary');self.current_page=max(0,min(4,state.get('page',0)))
+        self.temporary_context=None if initial else state.get('temporary');self.current_page=max(0,min(5,state.get('page',0)))
         if initial and self.current_page==4:self.current_page=0
         self.exact_record=None;self.record_request+=1;self._revealed_call=None
         self.settings_page.reveal(state.get('settings_category','general'))
@@ -511,7 +518,7 @@ class Dashboard(TrayWindow):
             self.table.horizontalScrollBar().setValue(state.get('record_horizontal',0))
             self.settings_page.restore_scrolls(state.get('settings_scrolls',{}))
             if len(state.get('widths',[]))==self.table.columnCount():self.table.put(widths=state['widths'])
-            if self.current_page>=3:self._restore_positions=None
+            if self.current_page in (3,4):self._restore_positions=None
 
     def save_preferences(self):
         if self.restoring or self.temporary_context:return
@@ -640,10 +647,10 @@ class Dashboard(TrayWindow):
         if self.restoring:return
         if self.current_page in (0,2):
             self.page_filters[self.current_page]={key:getattr(self,attr).currentData() for key,attr in (('model','model'),('effort','effort'),('service_tier','mode'))}
-        self.current_page=max(0,min(4,index));self.pages.setCurrentIndex(self.current_page);self.heading.setText(TITLES[self.current_page])
+        self.current_page=max(0,min(5,index));self.pages.setCurrentIndex(self.current_page);self.heading.setText(TITLES[self.current_page])
         self.sync_report_demand()
         self.restoring=True
-        self.nav.setCurrentRow(self.current_page if self.current_page<4 else -1)
+        self.nav.setCurrentRow(self.navigation_pages.index(self.current_page) if self.current_page in self.navigation_pages else -1)
         for key,attr in (('model','model'),('effort','effort'),('service_tier','mode')):
             if self.current_page in (0,2):choose(getattr(self,attr),self.page_filters[self.current_page].get(key,''))
         self.restoring=False
@@ -657,11 +664,50 @@ class Dashboard(TrayWindow):
         self.render();self.save_preferences()
 
     def open_settings(self):self.show_window();self.change_page(4)
+    def open_updates(self):
+        self.open_settings();self.settings_page.reveal('about',self.update_panel)
+
+    def open_tray_notification(self):
+        if getattr(self,'_tray_notification_kind','')=='update':self.open_updates()
+        else:self.open_notification_details()
+
+    def show_tray_notification(self,kind,title,message,icon):
+        self._tray_notification_kind=kind
+        self.tray.showMessage(title,message,icon,6000)
+
+    def bind_update_monitor(self,monitor):
+        self.update_monitor=monitor
+        self.update_panel.bind_monitor(monitor)
+        monitor.available.connect(self.update_discovered)
+        self.auto_update.toggled.connect(monitor.set_enabled)
+        self.notification_master.toggled.connect(lambda enabled:monitor.publish() if enabled else None)
+
+    def update_discovered(self,release):
+        self.update_available.setVisible(bool(release))
+        self.update_panel.discovery.setVisible(bool(release))
+        if not release:return
+        from .i18n import formatted
+        tag=release['tag_name'];version=tag.lstrip('v')
+        self.update_panel.discovery.setText(formatted('새 버전 {version} 사용 가능. 업데이트 확인 후 설치할 수 있습니다.',version=version))
+        monitor=self.update_monitor
+        from .app_update import version_parts
+        try:already_notified=version_parts(self.settings.value('updates/notifiedVersion',''))>=version_parts(version)
+        except (ValueError,TypeError):already_notified=False
+        if monitor.enabled and self.notification_master.isChecked() and not already_notified:
+            self.settings.setValue('updates/notifiedVersion',version);self.settings.sync()
+            self.show_tray_notification('update','Codexon: '+tr('업데이트 가능'),
+                formatted('새 버전 {version} 사용 가능. 업데이트 확인 후 설치할 수 있습니다.',version=version),QSystemTrayIcon.Information)
+
     def open_notification_details(self):
         self.open_settings();self.notification_details.toggle.setChecked(True);self.settings_page.reveal('notifications',self.notification_details)
 
     def query(self):
-        start,end=self.bounds();page=self.current_page
+        page=self.current_page
+        if page==5:
+            panel=self.performance_panel
+            return dict(page=5,start=0,end=self.snapshot['ts']+.000001,now=self.snapshot['ts'],period='all',presentation=True,
+                        time_range=panel.time_range,plot_width=max(64,self.width()-96),granularity=panel.granularity)
+        start,end=self.bounds()
         conditions={}
         for key,node in (('input_band',self.band),('cache_band',self.cache_band)):
             value=node.currentData()
@@ -697,7 +743,7 @@ class Dashboard(TrayWindow):
         if automatic and (not self.isVisible() or self.isMinimized()):
             self._display_dirty=True;return
         custom=self.period.currentData()=='custom';self.date_start.setVisible(custom);self.date_end.setVisible(custom)
-        if self.current_page>=3:
+        if self.current_page in (3,4):
             if self.current_page==3:self.quota_panel.refresh_status()
             else:self.render_diagnostics()
             return
@@ -752,6 +798,13 @@ class Dashboard(TrayWindow):
         if q['page'] in (0,2):names += [q.get(k) for k in ('model','effort','service_tier') if q.get(k)]
         return Verbatim(' · '.join(tr(x) for x in names if x))
 
+    def receive_collection_status(self,result):
+        if 'collection_issue' not in result:return
+        self.collection_issue=result['collection_issue']
+        overlay=getattr(self,'overlay',None)
+        if overlay:overlay.receive_collection_status(result)
+        self.render_diagnostics()
+
     def receive(self,value):
         if value.get('data_revision')!=self.snapshot.get('data_revision'):
             self.client_cache.clear()
@@ -763,7 +816,9 @@ class Dashboard(TrayWindow):
         for service in getattr(self,'quota_services',{}).values():
             service.supply_local(value.get('quota_by_home',{}).get(service.home))
         overlay=getattr(self,'overlay',None)
-        if overlay:overlay.receive_snapshot(value)
+        if overlay:
+            overlay.receive_collection_status({'collection_issue':getattr(self,'collection_issue','')})
+            overlay.receive_snapshot(value)
         self.refresh_choices();index=value.get('index',{})
         self.index_status.setText('수집 중' if index.get('loading') else '수집 확인 필요' if value.get('errors') else '로컬 기록 수집 중')
         self.show_confirmed_events(self.confirmed_notifications.cache(value.get('cache_candidates',value['sessions'])))
@@ -787,6 +842,13 @@ class Dashboard(TrayWindow):
         if automatic and (not self.isVisible() or self.isMinimized()):
             self.analysis_pending=False;self._display_dirty=True;return
         self.analysis_pending=False;self.pending_timer.stop();self.pending_label.hide();self.pages.show()
+        if query['page']==5:
+            self.view_result=result;self.performance_panel.apply(result['performance'])
+            restored=getattr(self,'_restore_positions',None)
+            if restored:
+                position=restored.get('scrolls',{}).get('5',restored.get('scrolls',{}).get(5,0))
+                self.scrollers[5].verticalPosition.setValue(position);self._restore_positions=None
+            return
         self.view_result=result;self.applied_key=result['key'];self.analysis=result['analysis'];self.lookup=result['lookup']
         self.table.live_update=automatic
         self.parent_table.live_update=automatic
@@ -843,6 +905,7 @@ class Dashboard(TrayWindow):
     def resizeEvent(self,event):
         super().resizeEvent(event)
         if hasattr(self,'detail_scroll'):self.layout_record_detail()
+        if getattr(self,'current_page',0)==5 and hasattr(self,'performance_panel'):self.performance_panel.resize_timer.start()
     def showEvent(self,event):
         super().showEvent(event)
         self.sync_report_demand()
@@ -1548,6 +1611,7 @@ class Dashboard(TrayWindow):
     def render_diagnostics(self):
         if not hasattr(self,'diagnostics'):return
         index=self.snapshot.get('index',{});errors=self.snapshot.get('usage_errors',self.snapshot.get('errors',[]))
+        if getattr(self,'collection_issue',''):errors=[*errors,self.collection_issue]
         complete=self.snapshot.get('usage_collection_complete',self.snapshot.get('usage_complete',index.get('usage_complete',False)))
         last=self.snapshot.get('last_usage_collection_success',self.snapshot.get('last_usage_success'))
         self.diagnostic_summary.setText('사용량 수집 · '+('확인 필요' if errors else '정상' if complete else '수집 중')+'<br>마지막 성공 수집 · '+date_time(last)+'<br>모델 관측 · '+('확인 필요' if self.snapshot.get('model_errors') else '수신 대기' if not self.snapshot['sessions'] else '기록 확인')+'<br>한도 조회 · '+(self.quota_issue or ('수신 대기' if not getattr(self,'live_quota',None) else '정상')))
@@ -1646,6 +1710,12 @@ class Dashboard(TrayWindow):
         from .update_panel import UpdatePanel
         self.update_panel=UpdatePanel(self.observer_panel.manager,self)
         self.update_panel.heading.hide()
+        self.auto_update=Switch()
+        self.auto_update.setChecked(self.settings.value('updates/automatic',True,type=bool))
+        self.auto_update.toggled.connect(lambda value:self.settings.setValue('updates/automatic',value))
+        self.settings_page.add_row('about','업데이트 자동 확인',
+            '앱 실행 중 6시간 간격으로 새 버전을 확인합니다. 설치 파일은 자동으로 다운로드하지 않습니다.',
+            self.auto_update,section='업데이트',aliases='automatic update')
         self.settings_page.add_widget('about',self.update_panel,section='업데이트',title='업데이트 확인',target=self.update_panel.button,aliases='정보 문제 해결 update')
         self.recovery_button=Button('Codex 연결 복구 열기')
         self.recovery_button.clicked.connect(self.update_panel.open_recovery)
@@ -1684,7 +1754,7 @@ class Dashboard(TrayWindow):
 
     def show_confirmed_events(self,events):
         for event in events:
-            count=f" · {event['count']}건" if event['count']>1 else ''
+            count=f" / {event['count']}건" if event['count']>1 else ''
             if self.notification_master.isChecked():
                 if event['kind']=='cache_miss':
                     overlay=getattr(self,'overlay',None)
@@ -1693,8 +1763,8 @@ class Dashboard(TrayWindow):
                         continue
                     if overlay and overlay.can_present(event.get('home'),event.get('sid')):
                         continue
-                self.tray.showMessage('Codexon · '+tr(event['title']),
-                    event['detail'].split('\n')[0]+count,QSystemTrayIcon.Warning,6000)
+                self.show_tray_notification('details','Codexon: '+tr(event['title']),
+                    event['detail'].split('\n')[0]+count,QSystemTrayIcon.Warning)
         records=[dict(r) for r in self.confirmed_notifications.records]
         if records==getattr(self,'_notification_rows',None):return
         self._notification_rows=records

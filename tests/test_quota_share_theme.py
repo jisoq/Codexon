@@ -22,7 +22,7 @@ def series_fixture():
     for at in times:
         if at in additions:
             name,amount=additions[at];cost+=amount
-            events.append(dict(ts=at-10,model=name,cost=amount,reasoning='high'))
+            events.append(dict(ts=at-10,model=name,cost=amount,reasoning='high',service_tier='Standard'))
         rows.append(dict(at=at,remaining=100-(at-1200)//120,cycle_cost=cost,cycle_value=500,
                          cycle_start=1200,connect=bool(rows),reset_kind=None,label=str(at)))
     intervals=[dict(start=1200,end=2160,separate_models=['separate'],cost_rows=events+[
@@ -32,11 +32,11 @@ def series_fixture():
 
 def test_five_minute_shares_follow_recorded_cost_increments_not_lifetime_totals():
     series,intervals=series_fixture()
-    assert share_at(series,1440)['shares']=={'astra':25,'sol':75}
-    assert share_at(series,1680)['shares']=={'astra':90,'sol':10}
+    assert share_at(series,1440)['shares']=={('astra','Standard'):25,('sol','Standard'):75}
+    assert share_at(series,1680)['shares']=={('astra','Standard'):90,('sol','Standard'):10}
     assert share_at(series,1860)['state']=='zero'
     assert all(math.isclose(sum(b['shares'].values()),100) for b in series['model_share']['bins'].values() if b['state']=='cost')
-    assert 'separate' not in series['model_share']['models']
+    assert not any(name=='separate' for name,mode in series['model_share']['models'])
     # Unpriced evidence must not be silently normalized with known-cost shares.
     intervals[0]['cost_rows'].append(dict(ts=1580,model='astra',cost=None))
     series['model_share']=prepare_model_share(series,intervals)
@@ -52,12 +52,12 @@ def test_model_shares_keep_call_time_across_observation_bucket_boundary():
     series=prepare_series([dict(at=t,remaining=90,cycle_cost=cost,cycle_value=1,
         cycle_start=0,connect=bool(i),reset_kind=None,label=str(t))
         for i,(t,cost) in enumerate(((270,0),(330,10),(390,10)))])
-    intervals=[dict(start=270,end=390,cost_rows=[dict(ts=299,model='a',cost=3),dict(ts=301,model='b',cost=7)])]
+    intervals=[dict(start=270,end=390,cost_rows=[dict(ts=299,model='a',service_tier='Standard',cost=3),dict(ts=301,model='b',service_tier='Standard',cost=7)])]
     series['model_share']=prepare_model_share(series,intervals)
-    assert share_at(series,299)['costs']=={'a':3}
-    assert share_at(series,301)['costs']=={'b':7}
-    assert share_at(series,299)['shares']=={'a':100}
-    assert share_at(series,301)['shares']=={'b':100}
+    assert share_at(series,299)['costs']=={('a','Standard'):3}
+    assert share_at(series,301)['costs']=={('b','Standard'):7}
+    assert share_at(series,299)['shares']=={('a','Standard'):100}
+    assert share_at(series,301)['shares']=={('b','Standard'):100}
 
 @pytest.mark.parametrize('surface,ink,accent',SEEDS)
 def test_accent_bounded_palette_and_shared_roles(surface,ink,accent):
@@ -88,7 +88,7 @@ def test_chart_and_strip_share_cursor_annotations_pin_escape_and_theme(tmp_path,
         plot.showTip(x,chart.strip_box.center().y());QTest.qWait(40)
         assert chart.inspection_x==pytest.approx(x)
         assert plot.detail['at']==1620  # Step value, never the next observation.
-        assert {r['label']:r['value'] for r in plot.detail['share']['items']}=={'astra':'90.0%','sol':'10.0%'}
+        assert {r['label']:r['value'] for r in plot.detail['share']['items']}=={'astra (Standard)':'90.0%','sol (Standard)':'10.0%'}
         from_strip=plot.detail
         plot.showTip(x,chart.box.center().y());QTest.qWait(20)
         assert plot.detail==from_strip
@@ -117,3 +117,60 @@ def test_last_valid_theme_survives_temporarily_missing_file(tmp_path):
     config.write_text('[desktop]\nappearanceTheme="dark"\n[desktop.appearanceDarkChromeTheme]\nsurface="#212121"\nink="#eeffff"\naccent="#80cbc4"\n')
     reader=CodexAppearance(config);original=reader.read(True);config.unlink()
     assert reader.read(True)==original
+
+
+def test_same_model_modes_share_cost_without_repricing():
+    series,intervals=series_fixture()
+    events=intervals[0]['cost_rows']
+    events[0].update(model='astra',service_tier='default',cost=3)
+    events[1].update(model='astra',service_tier='priority',cost=5)
+    events[2].update(model='astra',service_tier='Standard',cost=3)
+    events[3].update(model='astra',service_tier='Fast',cost=7,service_tier_source='parent')
+    series['rows'][1]['cycle_cost']=3
+    series['rows'][6]['cycle_cost']=11
+    series['model_share']=prepare_model_share(series,intervals)
+    assert share_at(series,1680)['shares']=={('astra','Standard'):30,('astra','Fast'):70}
+    assert share_at(series,1680)['total']==10
+    assert series['model_share']['models']==[('astra','Standard'),('astra','Fast')]
+    events[3]['service_tier']='미확인'
+    series['model_share']=prepare_model_share(series,intervals)
+    assert share_at(series,1680)['state']=='unknown'
+    assert not share_at(series,1680)['shares']
+
+
+@pytest.mark.parametrize('dark',[False,True])
+def test_mode_colors_and_long_share_card(tmp_path,dark):
+    from cachemonitor.quota_share import share_color_key
+    app=QApplication.instance() or QApplication([])
+    theme=shared_theme();theme.configure('dark' if dark else 'light')
+    series,_=series_fixture()
+    identities=[(f'model-{i:02}',mode) for i in range(12) for mode in ('Standard','Fast')]
+    series['model_share']['models']=identities
+    for bucket in series['model_share']['bins'].values():
+        if bucket['state']=='cost':bucket['shares']={identity:100/len(identities) for identity in identities}
+    chart=QuotaHistory();chart.money=True;chart.set_series(series)
+    host=mount(chart,520,720)
+    try:
+        plot=render_plot(host,chart)
+        plot.findChild(QObject,'plotHover').setProperty('enabled',False)
+        plot.showTip(chart.x_at_time(1650),chart.strip_box.center().y());QTest.qWait(40)
+        details=plot.detail['share']['items']
+        assert details[0]['label']=='model-00 (Standard)'
+        assert details[1]['label']=='model-00 (Fast)'
+        standard=theme.color(details[0]['swatch']);fast=theme.color(details[1]['swatch'])
+        assert standard==theme.model_color('model-00')
+        assert (oklab(fast)[0]>oklab(standard)[0])==dark
+        assert all(theme.color(item['swatch'])==theme.model_mode_color(item['model'],item['service_tier']) for item in details)
+        theme.register_models(['another-model'])
+        assert theme.color(share_color_key(identities[0]))==standard
+        card=next(item for item in walk(host.quick.quickWindow().contentItem()) if item.objectName()=='quotaShareDetailCard' and item.isVisible())
+        scroll=card.findChild(QObject,'quotaDetailItems')
+        assert scroll.property('contentHeight')>scroll.property('height')
+        assert card.y()>=0 and card.y()+card.height()<=host.quick.height()
+        flick=scroll.property('contentItem')
+        flick.setProperty('contentY',scroll.property('contentHeight')-scroll.property('height'))
+        QTest.qWait(20)
+        assert flick.property('contentY')>0
+        assert host.grab().save(str(tmp_path/f'mode-share-{dark}.png'))
+        assert not host.qml_errors,host.qml_errors
+    finally:dispose(host);theme.configure('light')

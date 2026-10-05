@@ -26,7 +26,7 @@ def test_model_columns_counts_filter_and_refresh(tmp_path):
     view['history'][1].update(requested_model='gpt-6-astra',response_model='gpt-5.6-luna',model_match='불일치',model_evidence='응답 ID 연결',response_status='completed',model_alert_confirmed=True)
     snapshot={'ts':now,'sessions':[view],'errors':[],'unassigned':[],'homes':[]}
     try:
-        window.receive(snapshot);window.nav.setCurrentRow(2)
+        window.receive(snapshot);window.nav.setCurrentRow(window.navigation_pages.index(2))
         window.resize(1800,1000);window.show();QTest.qWait(60)
         assert window.record_view=='projects' and window.table.rowCount()==1, str((window.analysis_errors,window.record_status,window.query(),window.view_result['explorer']))
         click_row(window,window.table,0);click_row(window,window.table,0)
