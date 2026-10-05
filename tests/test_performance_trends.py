@@ -3,6 +3,16 @@ from types import SimpleNamespace
 import pytest
 from cachemonitor.performance_trends import PerformanceTrends,assessment
 
+
+@pytest.fixture(autouse=True)
+def restore_shell_integration():
+    from PySide6.QtWidgets import QApplication
+    app=QApplication.instance() or QApplication([])
+    previous=app.property('cachemonitorDisableShellIntegration')
+    yield
+    app.setProperty('cachemonitorDisableShellIntegration',previous)
+
+
 def row(i,**changes):
     return dict(dict(ts=1000+i,home='test',sid='s',key=str(i),turn='t',model='m',service_tier='Standard',effort='high',
                      cost=1.,input=100,cached=90,output=100,reasoning=50,duration=1.,completion_latency_ms=1000,output_speed=100),**changes)
@@ -219,7 +229,11 @@ def test_dense_workspace_units_and_hover_analysis(tmp_path,shell):
         assert 'cost_total' not in ui.plots
         assert ui.labels['input'].text()=='평균 입력 토큰'
         trend=next(p for p in plot.rows if plot.selected_style(p) and p['baseline'] is not None and p['delta'])
-        item=render_plot(host,plot);xy=plot.xy(trend);item.showTip(xy.x(),xy.y());QTest.qWait(40)
+        item=render_plot(host,plot)
+        # Deliver the hover directly, independent of delayed synthetic click movement.
+        from PySide6.QtCore import QObject
+        item.findChild(QObject,'plotHover').setProperty('enabled',False)
+        xy=plot.xy(trend);item.showTip(xy.x(),xy.y())
         assert ui.inspected[0]['value']==trend['value'] and item.tip==''
         assert ui.details.range_plot.stats==trend['distribution']
         assert ui.details.total_rows[0][1].text()=='총 출력 토큰'
