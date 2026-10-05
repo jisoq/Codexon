@@ -42,6 +42,7 @@ class AppServices:
         self.retries = {}
         self.proxy_source = None
         self.collector_source = None
+        self.collector_pending = None
 
     def deactivate(self):
         self.closing.set()
@@ -81,6 +82,8 @@ class AppServices:
         if self.collection:
             try:
                 self.start_collection()
+                if self.collector_pending:
+                    errors.append('수집 시작 중')
             except (OSError, ValueError, RuntimeError) as exc:
                 errors.append(str(exc))
         result = {}
@@ -94,15 +97,37 @@ class AppServices:
                 self.remember_proxy(result)
         if errors:
             result['collection_issue'] = '\n'.join(errors)
+        elif self.collection:
+            result['collection_issue'] = ''
         return result
 
     def collector_identity(self, channel, snapshot):
+        from .usage_collection import locked
+        lock = channel.companion('.collector.lock')
+        if not locked(lock):
+            self.collector_source = None
+            return None
+        try:
+            source = self._collector_identity(channel, snapshot)
+            if not locked(lock):
+                self.collector_source = None
+                return None
+            return source
+        except (OSError, ValueError, RuntimeError):
+            # The owner may have exited during process inspection. A failed
+            # lock probe must propagate rather than authorize a replacement.
+            if not locked(lock):
+                self.collector_source = None
+                return None
+            raise
+
+    def _collector_identity(self, channel, snapshot):
         source = (snapshot or {}).get('collection') or {}
         if not source.get('pid'):
-            return None
+            raise RuntimeError('수집기 실행 정보 확인 대기')
         process = identity.process_identity(source['pid'])
         if not process:
-            return None
+            raise RuntimeError('수집기 실행 정보가 변경되었습니다.')
         saved = self.collector_source
         if saved and saved['process'] == process and (saved['instance'] == source.get('instance')):
             return saved
@@ -110,8 +135,14 @@ class AppServices:
         homes = [str(Path(command[n + 1]).resolve()) for n, arg in enumerate(command[:-1]) if arg == '--codex-home']
         if '--usage-collector' not in command or not homes or (not set(homes).issubset(set(channel.homes))) or (Path(option(command, '--index-path', '')).resolve() != channel.path) or (Path(option(command, '--evidence-path', str(channel.default_evidence))).resolve() != Path(channel.scope)) or (Path(process['executable']).resolve() != Path(source.get('executable', '')).resolve()):
             raise RuntimeError('다른 수집기의 실행 정보를 보존합니다.')
+        if not identity.same_process(process):
+            raise RuntimeError('수집기 실행 정보가 변경되었습니다.')
         self.collector_source = dict(process=process, instance=source['instance'])
         return self.collector_source
+
+    def launch_collector(self, task, command, snapshot):
+        task.start(command, autostart=False)
+        self.collector_pending = ((snapshot or {}).get('collection', {}).get('instance'), self.clock())
 
     def start_collection(self):
         """Startup/adoption is the only collection migration entry point."""
@@ -144,7 +175,7 @@ class AppServices:
                 if source:
                     task.configure(command, autostart=False)
                 elif not locked(channel.companion('.collector.lock')) and (not task.inspect().get('running')):
-                    task.start(command, autostart=False)
+                    self.launch_collector(task, command, snapshot)
         finally:
             channel.close()
 
@@ -170,12 +201,27 @@ class AppServices:
         try:
             with ProcessLock(channel.companion('.collector-update.lock')):
                 snapshot = channel.read_header()
-                source = self.collector_identity(channel, snapshot)
+                identity_snapshot = snapshot
+                published = False
+                if self.collector_pending:
+                    previous, requested = self.collector_pending
+                    current = (snapshot or {}).get('collection', {}).get('instance')
+                    if not current or current == previous:
+                        if self.clock() - requested < 30:
+                            return '수집 시작 중'
+                        # Continue the normal liveness checks after the grace
+                        # period, but never inspect the previous owner's PID.
+                        identity_snapshot = None
+                    elif time.time() - snapshot['ts'] <= 30:
+                        published = True
+                source = self.collector_identity(channel, identity_snapshot)
+                if published and source:
+                    self.collector_pending = None
                 stopped = read_json(channel.companion('.session.json'))
                 task = ObserverTask(str(channel.path), role='UsageCollector')
                 dead = not source and (not locked(channel.companion('.collector.lock'))) and (not task.inspect().get('running')) and (not (stopped.get('scope') == channel.scope and stopped.get('stopped')))
-                self.retry('collection', dead, lambda: task.start(collector_command(channel), autostart=False))
-                return '수집 결과 갱신 지연' if not snapshot or time.time() - snapshot['ts'] > 30 else ''
+                self.retry('collection', dead, lambda: self.launch_collector(task, collector_command(channel), snapshot))
+                return '수집 결과 갱신 지연' if self.collector_pending or not source or not snapshot or time.time() - snapshot['ts'] > 30 else ''
         finally:
             channel.close()
 

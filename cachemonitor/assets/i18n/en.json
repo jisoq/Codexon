@@ -1938,5 +1938,10 @@
   "{time} 확인값 표시 중": "Showing values confirmed at {time}",
   "사용량 표시 미지원": "Usage display unavailable",
   "이 오버레이는 로컬 세션만 지원하며, 원격 기기의 사용량은 표시하지 않습니다.": "This overlay supports local sessions only. Usage from remote devices is not shown.",
-  "가격 별칭: gpt-daybreak-blue-latest → gpt-5.6-sol": "Price alias: gpt-daybreak-blue-latest → gpt-5.6-sol"
+  "가격 별칭: gpt-daybreak-blue-latest → gpt-5.6-sol": "Price alias: gpt-daybreak-blue-latest → gpt-5.6-sol",
+  "수집 시작 중": "Starting collection",
+  "수집기 실행 정보 확인 대기": "Waiting for collector identity",
+  "사용량 수집을 확인하지 못했습니다. 문제 해결 화면에서 오류를 확인해 주세요.": "Usage collection could not be verified. Check the error in Troubleshooting.",
+  "새 수집 결과가 도착하지 않았습니다. 마지막 수집 상태를 확인해 주세요.": "No new collection results have arrived. Check the last collection status.",
+  "수집기 실행을 요청했습니다. 새 수집 결과를 기다리고 있습니다.": "Collector startup was requested. Waiting for new collection results."
 }
