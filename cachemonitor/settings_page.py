@@ -16,7 +16,7 @@ class SettingsPage(Group):
         '알림 표시':'notifications-enabled','HTTP 전환':'http-fallback',
         '캐시 저하 의심':'cache-drop','모델명 불일치':'model-mismatch','프록시 장애':'proxy-failure',
         '캐시 알림 범위':'cache-scope','최근 알림':'notification-history','현재 버전':'version',
-        '업데이트 확인':'update','연결 복구':'recovery','저장소':'repository',
+        '업데이트 확인':'update','업데이트 자동 확인':'automatic-update','연결 복구':'recovery','저장소':'repository',
         '수집 상태':'collection-status','진단 상세':'diagnostics',
     }
     LEGACY = ('general', 'display', 'display', 'integration', 'notifications', 'about', 'integration')

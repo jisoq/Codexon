@@ -207,6 +207,8 @@ class TrayWindow(QuickHost):
     def begin_quit(self,*,handoff=False,force=False):
         if getattr(self,'_closing',False):return
         self._closing=True
+        monitor=getattr(self,'update_monitor',None)
+        if monitor:monitor.stop()
         if hasattr(self,'save_preferences'):self.save_preferences()
         controller=getattr(self,'service_controller',None)
         if controller:controller.stop()

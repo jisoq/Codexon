@@ -29,6 +29,7 @@ def test_files(*names):
 
 # Components select observable contracts. There is deliberately no always-run core.
 GROUPS = {
+    "performance_trends": test_files("performance_trends"),
     'retirement': test_files('retired_cache'),
     'settings': test_files('settings'),
     'app_lifetime': test_files('app_services', 'observer_panel', 'windows_startup', 'proxy_update'),
@@ -66,7 +67,7 @@ GROUPS = {
     'proxy_lifecycle': test_files('managed_proxy', 'proxy_update', 'proxy_supervisor', 'connection_recovery'),
     'observer': test_files('observer_control', 'observer_panel', 'observer_task_errors'),
     'install': test_files('install_activation', 'install_management', 'install_dispatch', 'install_cleanup', 'legacy_release', 'windows_startup'),
-    'update': test_files('app_update'),
+    'update': test_files('app_update','update_monitor'),
     'runtime': test_files('windows_startup') + (
         'tests/test_verify_changes.py::test_isolated_source_smoke_renders_parent_cost',),
     'translation': ('tests/test_public_release.py::test_english_token_labels_do_not_change_stored_values',),
@@ -77,6 +78,7 @@ GROUPS = {
 
 # First match wins: QML and shared helpers must not fall through to a broad UI gate.
 RULES = (
+    ("cachemonitor/performance_*.py", ("performance_trends",)),
     ('cachemonitor/retired_cache.py', ('retirement','proxy_lifecycle','install')),
     ('cachemonitor/usage_archive.py', ('retirement','data','quota_store')),
     ('cachemonitor/cache_health.py', ('cache','notifications')),
@@ -189,6 +191,7 @@ RULES = (
     ('cachemonitor/install*.py', ('install',)),
     ('cachemonitor/app_update.py', ('update', 'install')),
     ('cachemonitor/update_panel.py', ('update',)),
+    ('cachemonitor/update_monitor.py', ('update',)),
     ('cachemonitor/app.py', ('runtime', 'install', 'observer')),
     ('cachemonitor/version.py', ('runtime', 'proxy_lifecycle', 'update')),
     ('cachemonitor/__init__.py', ('runtime',)),

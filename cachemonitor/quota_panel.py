@@ -18,6 +18,7 @@ from .quota_cycles import quota_statistics, quota_value_history
 from .quota_tracking import ResetTracker, RESET_NAMES, OBSERVATION_FRESHNESS
 from .charts import Plot
 from .lazy_table import LazyTable
+from .quota_share import share_label, share_color_key
 from .theme import shared_theme
 from .ui_details import Details
 
@@ -386,7 +387,7 @@ class QuotaPanel(Group):
             self.model_legend.structureChanged.emit()
             for node in old:node.deleteLater()
             for name in models:
-                label=Text(name);label.put(fontSize=12,color='ink',swatch='model:'+name)
+                label=Text(share_label(name));label.put(fontSize=12,color='ink',swatch=share_color_key(name),wrap=True)
                 self.model_legend.addWidget(label)
             for name in ('━ 비용 증가 없음','▧ 미확인'):
                 label=Text(name);label.put(fontSize=12,color='muted');self.model_legend.addWidget(label)

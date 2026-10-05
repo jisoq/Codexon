@@ -119,7 +119,7 @@ def test_quick_pages_keep_scroll_and_render_model_evidence(tmp_path):
     source['history'][-3].update(requested_model='gpt-6-astra',response_model=None)
     snapshot={'ts':now,'sessions':[source],'homes':[],'errors':[],'unassigned':[]}
     try:
-        window.receive(snapshot);window.nav.setCurrentRow(2);window.show();QTest.qWait(100)
+        window.receive(snapshot);window.nav.setCurrentRow(window.navigation_pages.index(2));window.show();QTest.qWait(100)
         from cachemonitor.dashboard import choose
         window.record_view='calls';window.render_explorer();QTest.qWait(40)
         window.extra_column_controls['response_model'].setChecked(True);QTest.qWait(40)
@@ -134,7 +134,7 @@ def test_quick_pages_keep_scroll_and_render_model_evidence(tmp_path):
         assert table.property('contentY')>before
         wheel(window,window.table,120);QTest.qWait(20)
         assert table.property('contentY')==before
-        for page in (0,1,3,2):window.nav.setCurrentRow(page);QTest.qWait(40)
+        for page in (0,1,3,2):window.nav.setCurrentRow(window.navigation_pages.index(page));QTest.qWait(40)
         assert table_view(window,window.table).property('contentY')==before
         window.receive(snapshot);QTest.qWait(40)
         assert table_view(window,window.table).property('contentY')==before

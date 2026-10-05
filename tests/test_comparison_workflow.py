@@ -55,7 +55,7 @@ def test_subscription_rates_and_historical_models_render(tmp_path, language):
         output.mkdir(parents=True,exist_ok=True)
         assert dialog.host.grab().save(str(output/f'rates-{language}.png'))
         dialog.reject()
-        window.nav.setCurrentRow(3);QTest.qWait(50)
+        window.nav.setCurrentRow(window.navigation_pages.index(3));QTest.qWait(50)
         assert window.grab().save(str(output/f'quota-{language}.png'))
     finally:
         if window:
@@ -79,7 +79,7 @@ def many_efforts():
 
 
 def test_home_preserves_filters_and_back_restores_exact_call(dashboard):
-    w=dashboard;w.nav.setCurrentRow(2);click_row(w,w.table,1);click_row(w,w.table,0);click_row(w,w.table,1);click_row(w,w.table,1)
+    w=dashboard;w.nav.setCurrentRow(w.navigation_pages.index(2));click_row(w,w.table,1);click_row(w,w.table,0);click_row(w,w.table,1);click_row(w,w.table,1)
     before=w.capture_state();assert w.selected_call
     click(w,control(w,w.home_button))
     assert w.record_view=='projects' and w.selected_session is None and w.selected_call is None and w.selected_turn is None

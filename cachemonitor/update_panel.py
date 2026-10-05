@@ -44,6 +44,8 @@ class UpdatePanel(Group):
         self.manager=manager
         self.owner=parent
         self.operation=None
+        self.monitor=None
+        self.metadata_pending=False
         self.proxy_update={}
         self.pending_plan=None
         self.confirming=False
@@ -51,6 +53,7 @@ class UpdatePanel(Group):
         self.operation_error=False
         self.last_success=None
         layout=Column(self);layout.setContentsMargins(0,8,0,16);layout.setSpacing(10)
+        self.discovery=Text('');self.discovery.setWordWrap(True);self.discovery.hide();layout.addWidget(self.discovery)
         self.offer=None
         self.heading=Text('업데이트');self.heading.put(fontSize=18,bold=True);layout.addWidget(self.heading)
         self.button=Button('업데이트 확인')
@@ -78,7 +81,7 @@ class UpdatePanel(Group):
 
     def start(self):
         from .proxy_update import BUSY
-        if self.operation or self.confirming:return
+        if self.operation or self.confirming or self.metadata_pending:return
         self.button.setEnabled(False)
         action=None
         if self.proxy_update.get('phase') in BUSY:
@@ -98,6 +101,26 @@ class UpdatePanel(Group):
             self.status.setText('업데이트 확인 중…')
             for state in (self.app_state,self.proxy_state):
                 state.setText('확인 중');state.put(color='muted')
+        if self.checking and self.monitor:
+            self.metadata_pending=True
+            self.monitor.check_manually()
+            return
+        self.launch_operation(action)
+
+    def bind_monitor(self,monitor):
+        self.monitor=monitor
+        monitor.manual_finished.connect(self.metadata_received)
+
+    def metadata_received(self,result):
+        if not self.metadata_pending:return
+        self.metadata_pending=False
+        if self.closing():return
+        if isinstance(result,Exception):
+            self.receive_result(result);self.finished();return
+        from .app_update import check_update
+        self.launch_operation(lambda:check_update(self.status_progress,self.manager,release=result))
+
+    def launch_operation(self,action):
         self.operation=UpdateOperation(self,action,self.manager)
         self.operation.progress.connect(self.status.setText)
         self.operation.result.connect(self.receive_result)
@@ -177,12 +200,12 @@ class UpdatePanel(Group):
                 proxy=tr(plan.get('reason','앱 업데이트 후 프록시 확인')))
             self.execute.setText('업데이트 설치' if plan['kind']=='app' else '프록시 재시작')
             self.execute.setVisible(plan['kind'] in ('app','proxy'))
-            self.status.setText(plan.get('reason','설치할 새 버전이 없습니다.'))
+            self.status.setText(plan.get('reason','업데이트 가능' if plan['kind']=='app' else '설치할 새 버전이 없습니다.'))
         self.button.setEnabled(True)
         self.execute.setEnabled(True)
 
     def request_install(self):
-        if self.operation or self.confirming or not self.offer:return
+        if self.operation or self.confirming or self.metadata_pending or not self.offer:return
         self.confirming=True
         self.button.setEnabled(False)
         self.confirm_install(self.offer)
@@ -192,7 +215,7 @@ class UpdatePanel(Group):
 
     def proxy_status(self,result):
         from .proxy_update import BUSY
-        if self.operation or self.confirming:return
+        if self.operation or self.confirming or self.metadata_pending:return
         update=result.get('update') or {}
         self.proxy_update=update
         self.button.setText('업데이트 취소' if update.get('phase') in BUSY else '업데이트 확인')

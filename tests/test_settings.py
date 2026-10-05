@@ -44,7 +44,7 @@ def test_search_navigation_and_preserved_preferences(tmp_path,monkeypatch,langua
         assert values==[option.isChecked() for option in window.notification_options.values()]
         assert not hasattr(window,'cache_panel')
         assert not hasattr(window,'cache_master')
-        assert window.nav.count()==4
+        assert window.nav.count()==5
         calls=[];monkeypatch.setattr('cachemonitor.update_panel.open_recovery',lambda *args:calls.append(args))
         page.reveal('troubleshooting');click(window,render_plot(window,window.recovery_button));assert len(calls)==1
         page.search.setText('cache');page.navigation.choose(page.navigation.currentRow())

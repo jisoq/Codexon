@@ -2,7 +2,7 @@
 from bisect import bisect_left, bisect_right
 from collections import defaultdict
 import math
-from .pricing import ALIASES
+from .pricing import ALIASES, request_tier
 
 BUCKET_SECONDS=300
 
@@ -17,8 +17,9 @@ def prepare_model_share(series, intervals):
             if ALIASES.get(name,name) in separate or not interval['start']<event['ts']<=interval['end']:continue
             index=bisect_left(times,event['ts'])
             if index>=len(rows) or rows[index]['at']>interval['end']:continue
+            name=(name,request_tier(event))
             cost=event.get('cost');names.add(name)
-            if cost is None or not math.isfinite(cost) or cost<0:unknown.add(index)
+            if name[1] not in ('Standard','Fast') or cost is None or not math.isfinite(cost) or cost<0:unknown.add(index)
             else:additions[index][math.floor(event['ts']/BUCKET_SECONDS)][name]+=cost
         for at in interval.get('pending_usage_times',[]):
             index=bisect_left(times,at)
@@ -54,7 +55,15 @@ def prepare_model_share(series, intervals):
         item['total']=sum(item['costs'].values())
         item['state']='unknown' if item['unknown'] else 'cost' if item['total']>0 else 'zero'
         item['shares']={name:cost/item['total']*100 for name,cost in item['costs'].items() if cost>0} if item['state']=='cost' else {}
-    return dict(bins=bins,spans=spans,models=sorted(names))
+    return dict(bins=bins,spans=spans,models=sorted(names,key=lambda item:(item[0],{'Standard':0,'Fast':1}.get(item[1],2))))
 
 def share_at(series, at):
     return series.get('model_share',{}).get('bins',{}).get(math.floor(at/BUCKET_SECONDS))
+
+
+def share_label(identity):
+    return f"{identity[0]} ({identity[1]})"
+
+
+def share_color_key(identity):
+    return f"model-mode:{identity[1]}:{identity[0]}"

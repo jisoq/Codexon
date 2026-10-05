@@ -185,6 +185,11 @@ class AnalysisEngine:
         return (self.revision,q['page'],freeze(q))
 
     def page_query(self,q):
+        if q['page']==5:
+            from .performance_trends import PerformanceTrends
+            if not hasattr(self,'performance'):self.performance=PerformanceTrends()
+            data=self.performance.query(self,q)
+            return dict(key=self.query_key(q),revision=self.revision,performance=data,valid_until=data['valid_until'],analysis={'response_count':sum(len(p['points']) for p in data['panels'])})
         if not q.get('presentation'):return public_records(self.query(q))
         from .dashboard_views import project, refresh_bounds
         from .analysis_worker import expiry

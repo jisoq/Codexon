@@ -91,7 +91,7 @@ def test_process_queries_latest_selection_cache_and_clean_shutdown(tmp_path):
         while time.monotonic()<limit:
             app.processEvents();QTest.qWait(40)
             if w.analysis_errors: raise AssertionError(str(w.analysis_errors))
-            if not w.analysis_pending and w.view_result is not None and w.applied_key[1]==w.nav.currentRow(): return
+            if not w.analysis_pending and w.view_result is not None and w.applied_key[1]==w.current_page: return
             QTest.qWait(10)
         raise AssertionError(str(w.analysis_errors))
     try:
@@ -102,7 +102,7 @@ def test_process_queries_latest_selection_cache_and_clean_shutdown(tmp_path):
         w.nav.setCurrentRow(1)
         w.source.setCurrentIndex(w.source.findData('subagent'))
         w.source.setCurrentIndex(0)
-        w.nav.setCurrentRow(2); settle()
+        w.nav.setCurrentRow(w.navigation_pages.index(2)); settle()
         assert w.record_view=='projects' and w.table.rowCount()==1 and w.selected_session is None
         assert w.worker.process.pid is not None
         assert not w.analysis_errors

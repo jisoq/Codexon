@@ -1,7 +1,8 @@
 """Role-based shared palette; Codex preferences are only ever read."""
 from PySide6.QtCore import QObject, Property, Signal, Slot, Qt
 from PySide6.QtGui import QGuiApplication, QFontDatabase, QColor
-from .token_colors import ui_palette, readable, model_palette, color_distance
+from .token_colors import ui_palette, readable, model_palette, color_distance, oklab, lch
+from math import hypot, degrees, atan2
 from .overlay_appearance import CodexAppearance, default_appearance
 
 def contrast_color(color, background, minimum=3):
@@ -51,6 +52,14 @@ class Theme(QObject):
         self.register_models([name])
         return self._model_colors[name]
 
+    def model_mode_color(self,name,mode):
+        base=self.model_color(name)
+        if mode=="Standard":return base
+        if mode!="Fast":return self._palette["muted"]
+        lightness,a,b=oklab(base)
+        return lch(max(0,min(1,lightness+(.14 if self.dark else -.14))),
+                   hypot(a,b),degrees(atan2(b,a)))
+
     def model_pattern(self,name):
         color=self.model_color(name)
         if any(other!=name and color_distance(color,value)<.04 for other,value in self._model_colors.items()):
@@ -59,6 +68,9 @@ class Theme(QObject):
 
     @Slot(str, result=str)
     def color(self, value):
+        if value.startswith('model-mode:'):
+            _,mode,name=value.split(':',2)
+            return self.model_mode_color(name,mode)
         if value.startswith('model:'):return self.model_color(value[6:])
         if value in self._palette:return self._palette[value]
         if value=='transparent':return value

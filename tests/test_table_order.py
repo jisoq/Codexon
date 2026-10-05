@@ -27,7 +27,7 @@ def test_sequential_time_tables_keep_order_cost_sort_and_selected_call(tmp_path)
         return dict(ts=now,sessions=views,homes=['h'],errors=[],unassigned=[],index={'loading':False})
     window=Dashboard([],start_worker=False,live_limits=False,settings=QSettings(str(tmp_path/'order.ini'),QSettings.IniFormat))
     try:
-        window.receive(snapshot());window.resize(1800,1000);window.show();window.nav.setCurrentRow(2);QTest.qWait(50)
+        window.receive(snapshot());window.resize(1800,1000);window.show();window.nav.setCurrentRow(window.navigation_pages.index(2));QTest.qWait(50)
         window.activate_record(0)
         assert window.record_view=='sessions'
         assert [r['sid'] for r in window.record_rows]==['new','old']
@@ -58,7 +58,7 @@ def test_restored_selection_uses_absolute_index_in_paged_records(tmp_path):
         session.add_usage(now-400+i,str(i),dict(input_tokens=100,output_tokens=10),'gpt-6-astra')
     try:
         window.receive(dict(ts=now,sessions=[session.view(now)],homes=[],errors=[],unassigned=[],index={'loading':False}))
-        window.nav.setCurrentRow(2);window.selected_session=None;window.selected_turn=None;window.record_view='calls'
+        window.nav.setCurrentRow(window.navigation_pages.index(2));window.selected_session=None;window.selected_turn=None;window.record_view='calls'
         window.use_history_table();window.table.first_visible=180;window.table.last_visible=190;window.render_explorer()
         assert window.record_rows.start>0
         window.table.select_row(185);state=window.capture_state();key=window.table.row_key(window.record_rows[185])

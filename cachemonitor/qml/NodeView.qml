@@ -504,7 +504,7 @@ Item {
                 active: !!view.s.quotaDetail
                 sourceComponent: Component { QuotaDetails { plot: quotaDetailLoader.parent } }
             }
-            TapHandler { onTapped: eventPoint => { plot.forceActiveFocus(); plot.activateAt(eventPoint.position.x,eventPoint.position.y) } }
+            TapHandler { enabled: view.s.clickEnabled !== false; onTapped: eventPoint => { plot.forceActiveFocus(); plot.activateAt(eventPoint.position.x,eventPoint.position.y) } }
             Keys.onPressed: event => { plot.key(event.key); event.accepted = true }
         }
     }

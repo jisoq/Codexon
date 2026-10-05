@@ -46,7 +46,7 @@ def dashboard(tmp_path):
 
 
 def test_sequential_drilldown_and_full_call_detail(dashboard,tmp_path):
-    w=dashboard;w.nav.setCurrentRow(2);QTest.qWait(40)
+    w=dashboard;w.nav.setCurrentRow(w.navigation_pages.index(2));QTest.qWait(40)
     click_row(w,w.table,0);assert w.record_view=='sessions'
     click_row(w,w.table,0);assert w.record_view=='requests'
     click_row(w,w.table,0);assert w.record_view=='calls'
@@ -86,7 +86,7 @@ def test_request_statistics_in_current_level_and_filtered_scope(dashboard,unlink
                     if all_unpriced:row['output']=None
                     if unlinked:row['turn']=None
         w.receive(value)
-    w.nav.setCurrentRow(2)
+    w.nav.setCurrentRow(w.navigation_pages.index(2))
 
     w.activate_record(0);w.activate_record(0)
     def check(node,rows):
@@ -124,7 +124,7 @@ def test_overlay_context_clears_blocking_filters_and_back_restores(dashboard):
 
 
 def test_quota_and_settings_have_independent_scope(dashboard):
-    w=dashboard;w.nav.setCurrentRow(3)
+    w=dashboard;w.nav.setCurrentRow(w.navigation_pages.index(3))
     assert not w.common_filters.isVisible() and not any(n.isVisible() for n in (w.model,w.effort,w.mode))
     click(w,control(w,w.settings_button));assert w.current_page==4
     w.settings_page.navigation.setCurrentRow(0)
@@ -141,7 +141,7 @@ def test_quota_and_settings_have_independent_scope(dashboard):
 
 
 def test_preferences_restore_observed_dimensions_before_snapshot(dashboard,tmp_path):
-    w=dashboard;w.nav.setCurrentRow(2);choose(w.project,'V:/work/project-1')
+    w=dashboard;w.nav.setCurrentRow(w.navigation_pages.index(2));choose(w.project,'V:/work/project-1')
     choose(w.model,'gpt-6-astra');choose(w.effort,'high');choose(w.mode,'Standard');w.filter_changed()
     w.save_preferences();state=w.settings.value('dashboard/state')
     settings=QSettings(str(tmp_path/'restored.ini'),QSettings.IniFormat);settings.setValue('dashboard/state',state)
@@ -159,7 +159,7 @@ def test_preferences_restore_observed_dimensions_before_snapshot(dashboard,tmp_p
 
 @pytest.mark.parametrize('within_session',[False,True])
 def test_call_filter_is_accessible_from_normal_record_views(dashboard,within_session,tmp_path):
-    w=dashboard;w.resize(1150,900);w.nav.setCurrentRow(2);QTest.qWait(30)
+    w=dashboard;w.resize(1150,900);w.nav.setCurrentRow(w.navigation_pages.index(2));QTest.qWait(30)
     if not within_session:
         w.selected_session=None;w.record_view='calls';w.render_explorer()
     if within_session:w.activate_record(0);w.activate_record(0)
@@ -182,7 +182,7 @@ def test_call_filter_is_accessible_from_normal_record_views(dashboard,within_ses
 
 
 def test_call_detail_back_restores_same_call_list_before_request_list(dashboard):
-    w=dashboard;w.resize(1150,900);w.nav.setCurrentRow(2);QTest.qWait(30)
+    w=dashboard;w.resize(1150,900);w.nav.setCurrentRow(w.navigation_pages.index(2));QTest.qWait(30)
     click_row(w,w.table,0)
     click_row(w,w.table,0);click_row(w,w.table,0)
     before=[r['key'] for r in w.record_rows];turn=w.selected_turn;session=w.selected_session
