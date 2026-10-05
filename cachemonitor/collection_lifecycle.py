@@ -30,11 +30,18 @@ def startup_snapshot(channel):
                 Path(snapshot.get('index',{}).get('path','')).resolve()!=legacy_index_location() or
                 not snapshot.get('homes') or not set(snapshot['homes']).issubset(channel.homes) or
                 not source.get('instance') or not source.get('pid') or not source.get('executable')):raise
-        process=identity.process_identity(source['pid'])
-        if process:
-            command=identity.process_command(process['pid'])
-            # The remaining identity checks are also required by AppServices.
-            if '--default-index' not in command or not identity.same_process(process):raise
+        from .usage_collection import locked
+        lock=channel.companion('.collector.lock')
+        if not locked(lock):return snapshot,True
+        try:
+            process=identity.process_identity(source['pid'])
+            if process:
+                command=identity.process_command(process['pid'])
+                # The remaining identity checks are also required by AppServices.
+                if '--default-index' not in command or not identity.same_process(process):raise
+        except (OSError,RuntimeError):
+            if not locked(lock):return snapshot,True
+            raise
         return snapshot,True
 
 

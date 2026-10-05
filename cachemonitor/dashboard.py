@@ -220,6 +220,7 @@ class Dashboard(TrayWindow):
         self.service_controller=ServiceController(self.app_services,self)
         self.observer_panel.services=self.app_services if manage_observer else None
         self.service_controller.result.connect(self.observer_panel.display)
+        self.service_controller.result.connect(self.receive_collection_status)
         if manage_observer or self.app_services.collection:
             QTimer.singleShot(0,self.service_controller.start)
 
@@ -752,6 +753,13 @@ class Dashboard(TrayWindow):
         if q['page'] in (0,2):names += [q.get(k) for k in ('model','effort','service_tier') if q.get(k)]
         return Verbatim(' · '.join(tr(x) for x in names if x))
 
+    def receive_collection_status(self,result):
+        if 'collection_issue' not in result:return
+        self.collection_issue=result['collection_issue']
+        overlay=getattr(self,'overlay',None)
+        if overlay:overlay.receive_collection_status(result)
+        self.render_diagnostics()
+
     def receive(self,value):
         if value.get('data_revision')!=self.snapshot.get('data_revision'):
             self.client_cache.clear()
@@ -763,7 +771,9 @@ class Dashboard(TrayWindow):
         for service in getattr(self,'quota_services',{}).values():
             service.supply_local(value.get('quota_by_home',{}).get(service.home))
         overlay=getattr(self,'overlay',None)
-        if overlay:overlay.receive_snapshot(value)
+        if overlay:
+            overlay.receive_collection_status({'collection_issue':getattr(self,'collection_issue','')})
+            overlay.receive_snapshot(value)
         self.refresh_choices();index=value.get('index',{})
         self.index_status.setText('수집 중' if index.get('loading') else '수집 확인 필요' if value.get('errors') else '로컬 기록 수집 중')
         self.show_confirmed_events(self.confirmed_notifications.cache(value.get('cache_candidates',value['sessions'])))
@@ -1548,6 +1558,7 @@ class Dashboard(TrayWindow):
     def render_diagnostics(self):
         if not hasattr(self,'diagnostics'):return
         index=self.snapshot.get('index',{});errors=self.snapshot.get('usage_errors',self.snapshot.get('errors',[]))
+        if getattr(self,'collection_issue',''):errors=[*errors,self.collection_issue]
         complete=self.snapshot.get('usage_collection_complete',self.snapshot.get('usage_complete',index.get('usage_complete',False)))
         last=self.snapshot.get('last_usage_collection_success',self.snapshot.get('last_usage_success'))
         self.diagnostic_summary.setText('사용량 수집 · '+('확인 필요' if errors else '정상' if complete else '수집 중')+'<br>마지막 성공 수집 · '+date_time(last)+'<br>모델 관측 · '+('확인 필요' if self.snapshot.get('model_errors') else '수신 대기' if not self.snapshot['sessions'] else '기록 확인')+'<br>한도 조회 · '+(self.quota_issue or ('수신 대기' if not getattr(self,'live_quota',None) else '정상')))

@@ -37,8 +37,10 @@ def test_collection_error_does_not_advance_last_confirmed_time(monkeypatch):
     OverlayController.receive_snapshot(state,{'errors':['collection failed']})
     assert state.snapshot_wall_time==100.
     assert state.errors==['collection failed']
-    OverlayController.receive_snapshot(state,{'errors':[]})
-    assert state.snapshot_wall_time==200.
+    OverlayController.receive_snapshot(state,{'errors':[],'ts':150.,'last_usage_collection_success':140.})
+    assert state.snapshot_wall_time==140.
+    OverlayController.receive_snapshot(state,{'errors':[],'ts':150.,'last_usage_collection_success':140.})
+    assert state.snapshot_wall_time==140.  # Re-reading old results is not new collection.
 
 
 @pytest.fixture

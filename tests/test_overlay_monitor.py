@@ -89,7 +89,7 @@ def test_waiting_cards_and_old_values_are_distinct(monkeypatch):
     from test_overlay_presentation import summary
     app=QApplication.instance() or QApplication([])
     m=OverlayContent()
-    for data,note,heading in ((None,'기록 확인 중','기록 확인 중'),(None,'호출 기록 없음','호출 기록 대기'),(summary(count=0),'','호출 기록 대기')):
+    for data,note,heading in ((None,'기록 확인 중','기록 확인 중'),(None,'호출 기록 없음','호출 기록 대기'),(summary(count=0),'','호출 기록 대기'),(None,'수집 오류','수집 오류'),(None,'수집 지연','수집 지연'),(None,'수집 시작 중','수집 시작 중')):
         m.set_content(data,note)
         assert m.notice_card()[0]==heading and not m.monitor_links()
         assert '0호출' not in m.state['accessible'] and '미확인' not in m.state['accessible']

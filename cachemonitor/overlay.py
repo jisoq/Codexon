@@ -106,6 +106,7 @@ class OverlayController(QObject):
         self.session_lookup = {}
         self.loading = True
         self.errors = []
+        self.collection_issue = ''
         self.issue = ''
         self.dark = system_dark()
         self.reduced_motion=False
@@ -482,7 +483,13 @@ class OverlayController(QObject):
         self.snapshot_at = time.monotonic()
         self.loading = snapshot.get('index', {}).get('loading', False)
         self.errors = snapshot.get('errors', [])
-        if not self.errors:self.snapshot_wall_time = time.time()
+        if not self.errors:
+            self.snapshot_wall_time = snapshot.get('last_usage_collection_success') or snapshot.get('ts')
+        self.refresh()
+
+    def receive_collection_status(self, result):
+        if 'collection_issue' not in result:return
+        self.collection_issue = result['collection_issue']
         self.refresh()
 
     def content(self):
@@ -492,13 +499,17 @@ class OverlayController(QObject):
         if selection.host != 'local':
             return None, '원격 작업 · 로컬 기록 없음'
         matches = self.session_lookup.get(selection.thread_id,[])
+        issue = self.collection_issue
+        note = ('수집 시작 중' if issue == '수집 시작 중' else
+                '수집 지연' if issue == '수집 결과 갱신 지연' else
+                '수집 오류' if issue or self.errors else
+                '수집 지연' if time.monotonic()-self.snapshot_at > 10 else '')
         if len(matches) != 1:
-            return None, '기록 확인 중' if self.loading else '호출 기록 없음' if not matches else '현재 세션 식별 불가'
-        note = ('수집 오류' if self.errors else '수집 지연' if time.monotonic()-self.snapshot_at > 10
-                else '기록 확인 중' if self.loading else '')
+            return None, note or ('기록 확인 중' if self.loading else '호출 기록 없음' if not matches else '현재 세션 식별 불가')
+        note = note or ('기록 확인 중' if self.loading else '')
         data={**matches[0], '_collection': {
             'last_confirmed_at': self.snapshot_wall_time,
-            'errors': list(self.errors), 'loading': self.loading,
+            'errors': [*self.errors, *([issue] if issue else [])], 'loading': self.loading,
             'delayed': time.monotonic()-self.snapshot_at > 10,
         }}
         return data, note

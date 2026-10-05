@@ -121,7 +121,10 @@ def test_broken_default_snapshot_is_replaced_and_restart_keeps_usage(default_hom
     client=CollectionClient([default_home]);process={'pid':os.getpid(),'executable':before['collection']['executable'],'created':1}
     live=[alive]
     if not alive:old.close()
-    monkeypatch.setattr(services.identity,'process_identity',lambda pid:process if live[0] else None)
+    def identify(pid):
+        if not live[0]:raise PermissionError('recycled PID access denied')
+        return process
+    monkeypatch.setattr(services.identity,'process_identity',identify)
     monkeypatch.setattr(services.identity,'same_process',lambda _:live[0])
     monkeypatch.setattr(services.identity,'process_command',lambda _:collector_command(client.channel))
     monkeypatch.setattr(ObserverTask,'inspect',lambda self:{'running':0})
