@@ -57,11 +57,11 @@ def test_confirmed_alerts_reach_tray_and_click_opens_evidence(tmp_path,monkeypat
         reader.poll();view=source.view(now)
         view['history']=reader.enrich(tmp_path,view['history'])
         window.receive(dict(ts=now,sessions=[view],homes=[],errors=[],unassigned=[]))
-        assert sent==['Codexon · 모델명 불일치 확인']
+        assert sent==['Codexon: 모델명 불일치 확인']
         state=dict(configured=True,probe_state='refused',phase='recovery_required')
         for stamp in (100,115,130):
             clock[0]=stamp;window.observer_panel.display(state)
-        assert sent[-1]=='Codexon · 로컬 프록시 연결 거부'
+        assert sent[-1]=='Codexon: 로컬 프록시 연결 거부'
         window.tray.messageClicked.emit();app.processEvents()
         assert window.current_page==4 and window.nav.currentRow()==-1
         assert window.notification_details.toggle.isChecked()
