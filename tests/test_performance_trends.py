@@ -151,7 +151,7 @@ def test_qt_panel_hover_analysis_and_passive_click(tmp_path):
 
 def test_reasoning_tabs_share_trend_axis_and_keep_other_charts(tmp_path):
     from datetime import datetime
-    from PySide6.QtCore import QSettings,QPointF
+    from PySide6.QtCore import QSettings,QPointF,QObject
     from PySide6.QtWidgets import QApplication
     from cachemonitor.charts import dynamic_bounds
     from cachemonitor.performance_panel import PerformancePanel
@@ -168,7 +168,10 @@ def test_reasoning_tabs_share_trend_axis_and_keep_other_charts(tmp_path):
     try:
         assert 'reasoning' in ui.plots and not any(k.startswith('reasoning:') for k in ui.plots)
         assert set(ui.reasoning_buttons)=={'low','medium','high','ultra'}
-        chart=ui.plots['reasoning'];render_plot(host,chart)
+        chart=ui.plots['reasoning'];item=render_plot(host,chart)
+        # Scrolling to the tabs can deliver ambient pointer events to the chart.
+        # This check owns the selected interval; hover has separate coverage.
+        item.findChild(QObject,'plotHover').setProperty('enabled',False)
         expected=dynamic_bounds([150,1500,15000]);assert chart.bounds==expected
         other_bounds={k:p.bounds for k,p in ui.plots.items() if k!='reasoning'}
         point=chart.rows[-1];ui.show_interval(point,'reasoning')
