@@ -706,7 +706,7 @@ class Dashboard(TrayWindow):
         if page==5:
             panel=self.performance_panel
             return dict(page=5,start=0,end=self.snapshot['ts']+.000001,now=self.snapshot['ts'],period='all',presentation=True,
-                        time_range=panel.time_range,plot_width=max(64,self.width()-96),granularity=panel.granularity)
+                        time_range=panel.query_range(self.snapshot['ts'],self.snapshot.get('data_revision',self.snapshot['ts'])),plot_width=max(64,self.width()-96),granularity=panel.granularity)
         start,end=self.bounds()
         conditions={}
         for key,node in (('input_band',self.band),('cache_band',self.cache_band)):
@@ -813,6 +813,7 @@ class Dashboard(TrayWindow):
             value={**value,'sessions':[s['source'] for s in self.engine.sessions.values()],
                    'internal_review_calls':sum(len(s['prepared']['history']) for s in self.engine.internal_sessions.values())}
         self.snapshot=value
+        self.performance_panel.receive_collection_time(value['ts'])
         for service in getattr(self,'quota_services',{}).values():
             service.supply_local(value.get('quota_by_home',{}).get(service.home))
         overlay=getattr(self,'overlay',None)
