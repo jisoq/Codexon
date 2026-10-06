@@ -1,6 +1,7 @@
 from .tooltips import TEXT as TIPS
 """Current reported allowance and auditable weekly local-call conversion."""
 from datetime import datetime
+from decimal import Decimal
 import math
 import os
 from pathlib import Path
@@ -21,6 +22,7 @@ from .lazy_table import LazyTable
 from .quota_share import share_label, share_color_key
 from .theme import shared_theme
 from .ui_details import Details
+from .i18n import formatted
 
 
 from .quota_view import clock, history_rows, prepare_quota_view, prepare_series, observation_label
@@ -115,31 +117,51 @@ class QuotaPanel(Group):
         heading.addWidget(title,1)
         self.sample_summary=Text();self.sample_summary.put(fontSize=12,color='muted')
         heading.addWidget(self.sample_summary)
-        layout.addLayout(heading)
+        remaining_card=Group();remaining_card.put(background='surface',radius=6,border='border')
+        remaining_layout=Column(remaining_card);remaining_layout.setContentsMargins(20,16,20,16);remaining_layout.setSpacing(16)
+        remaining_layout.addLayout(heading)
+        layout.addWidget(remaining_card)
         self.status=Text()
         self.status.put(color='error',fontSize=13,wrap=False);self.status.setFixedHeight(24)
         heading.addWidget(self.status,1)
-        current=self.current_row=Row();current.put(collapseBelow=720);current.setSpacing(16)
-        limits=Group();limits_layout=Row(limits);limits_layout.put(collapseBelow=420);limits_layout.setSpacing(16)
-        current.addWidget(limits,2)
+        current=self.current_row=Row();current.put(collapseBelow=1,columns=2);current.setSpacing(16)
         self.current={}
-        for mode,name in (('weekly','주간'),('five_hour','5시간')):
-            card=Group();card.put(background='surface',radius=6)
-            column=Column(card);column.setContentsMargins(20,16,20,16);column.setSpacing(10)
-            label=Text(name);label.put(fontSize=14,color='muted')
-            value=Text('—');value.put(fontSize=36,bold=True,noElide=True)
+        for mode,name in (('five_hour','5시간'),('weekly','주간')):
+            card=Group()
+            row=Row(card);row.setSpacing(16)
+            label=Text(name);label.put(fontSize=14,color='muted');label.setFixedWidth(60)
+            value=Text('—');value.put(fontSize=36,bold=True,noElide=True);value.setFixedWidth(130)
             bar=QuotaBar()
             evidence=Text();evidence.put(fontSize=13,color='muted',wrap=True)
-            for node in (label,value,bar,evidence):column.addWidget(node)
-            limits_layout.addWidget(card,1)
+            detail=Column();detail.setSpacing(8);detail.addWidget(bar);detail.addWidget(evidence)
+            row.addWidget(label);row.addWidget(value);row.addLayout(detail,1)
+            remaining_layout.addWidget(card)
             self.current[mode]={'card':card,'value':value,'bar':bar,'evidence':evidence}
-        self.reset_card=Group();self.reset_card.put(background='surface',radius=6)
+        self.credit_card=Group();self.credit_card.put(background='surface',radius=6,border='border')
+        credit_layout=Column(self.credit_card);credit_layout.setContentsMargins(20,16,20,16);credit_layout.setSpacing(10)
+        credit_title=Text('크레딧 잔액');credit_title.put(fontSize=14,color='muted')
+        self.credit_balance=Text('—');self.credit_balance.put(fontSize=28,bold=True,noElide=True)
+        self.credit_note=Text();self.credit_note.put(fontSize=13,color='muted',wrap=True)
+        credit_expiry=Text('만료일 정보 미제공');credit_expiry.put(fontSize=13,color='muted',wrap=True)
+        for node in (credit_title,self.credit_balance,self.credit_note,credit_expiry):credit_layout.addWidget(node)
+        credit_layout.addStretch()
+        current.addWidget(self.credit_card,1)
+        self.reset_card=Group();self.reset_card.put(background='surface',radius=6,border='border')
         reset_layout=Column(self.reset_card);reset_layout.setContentsMargins(20,16,20,16);reset_layout.setSpacing(10)
-        reset_title=Text('Banked reset · 사용 초기화권');reset_title.put(fontSize=14,color='muted',wrap=True)
-        self.reset_count=Text('—');self.reset_count.put(fontSize=36,bold=True,noElide=True)
+        reset_title=Text('사용 초기화권');reset_title.put(fontSize=14,color='muted',wrap=True)
+        self.reset_count=Text('—');self.reset_count.put(fontSize=28,bold=True,noElide=True)
         self.reset_note=Text();self.reset_note.put(fontSize=13,color='muted',wrap=True)
-        self.reset_details=Details('상세 정보',compact=True)
-        for node in (reset_title,self.reset_count,self.reset_note,self.reset_details):reset_layout.addWidget(node)
+        for node in (reset_title,self.reset_count,self.reset_note):reset_layout.addWidget(node)
+        self.reset_rows=Row();self.reset_rows.setSpacing(12)
+        self.reset_cells=[]
+        for name in ('지급','만료','상태'):
+            column=Column();column.setSpacing(8)
+            label=Text(name);label.put(fontSize=12,color='muted')
+            body=Text();body.put(fontSize=12,wrap=True)
+            column.addWidget(label);column.addWidget(body)
+            self.reset_rows.addLayout(column,1);self.reset_cells.append(body)
+        reset_layout.addLayout(self.reset_rows)
+        self.reset_zone=Text('현지 시간');self.reset_zone.put(fontSize=11,color='muted');reset_layout.addWidget(self.reset_zone)
         current.addWidget(self.reset_card,1)
         layout.addLayout(current)
         self.current_empty=Text('한도를 조회하고 있습니다')
@@ -304,32 +326,65 @@ class QuotaPanel(Group):
         quota=self.quota
         resets=reset_credit_display(quota,now)
         self.reset_count.setText(resets['count']);self.reset_note.setText(resets['note'])
-        self.reset_details.set_sections(resets['sections']);self.reset_details.setVisible(bool(resets['sections']))
+        if resets['count']!='—':
+            self.reset_count.setText(formatted('{count}개',count=f"{quota['reset_credits']['available_count']:,}"))
+        observed=(quota or {}).get('observed_at',0)
+        fresh=bool(observed and 0<=now-observed<90 and (quota or {}).get('source')=='live')
+        credits=(quota or {}).get('credits') or {}
+        balance=credits.get('balance')
+        self.credit_balance.setText('∞' if fresh and credits.get('unlimited') else
+                                   f'{Decimal(balance):,f}' if fresh and balance is not None else '—')
+        self.credit_balance.setToolTip('제한 없음' if fresh and credits.get('unlimited') else '크레딧 잔액')
+        self.credit_note.setText(('보유 크레딧 없음' if balance is not None and Decimal(balance)==0 else '사용 가능')
+                                 if fresh and (balance is not None or credits.get('unlimited')) else
+                                 '조회 갱신 대기' if credits else '크레딧 정보 미제공')
+        rows=((quota or {}).get('reset_credits') or {}).get('credits') or []
+        rows=sorted(rows,key=lambda row:row.get('expires_at') or float('inf')) if fresh else []
+        self.reset_rows.setVisible(bool(rows));self.reset_zone.setVisible(bool(rows))
+        values=[[],[],[]]
+        for row in rows:
+            for i,key in enumerate(('granted_at','expires_at')):
+                stamp=row.get(key)
+                values[i].append(datetime.fromtimestamp(stamp).strftime('%m/%d\n%H:%M') if stamp else '정보 미제공\n—')
+            status={'available':'사용 가능','redeemed':'사용 완료','consumed':'사용 완료','expired':'만료됨'}.get(row.get('status'),'상태 미제공')
+            values[2].append(status+'\n ')
+        for cell,lines in zip(self.reset_cells,values):cell.setText('\n\n'.join(lines))
+        years=sorted({datetime.fromtimestamp(row[key]).year for row in rows for key in ('granted_at','expires_at') if row.get(key)})
+        self.reset_zone.setText(formatted('{years}년, 현지 시간',years=', '.join(map(str,years))))
+        if (rows and all(row.get('reset_type')=='codexRateLimits' for row in rows)
+                and len([row for row in rows if row.get('status')=='available'])==((quota or {}).get('reset_credits') or {}).get('available_count')
+                and all(not row.get('expires_at') or row['expires_at']>now for row in rows if row.get('status')=='available')):
+            self.reset_note.setText('Codex 사용한도 전체 초기화')
         available=set((quota or {}).get('windows',{})) | set((quota or {}).get('unlimited_windows',[])) | set((quota or {}).get('window_conflicts',[]))
-        self.current_row.setVisible(bool(available or quota))
-        self.reset_card.setVisible(bool(quota))
+        self.current_row.setVisible(True)
         self.current_empty.setVisible(not available and not self.issue)
         tracking=self.report.get('tracking')
         observed=(quota or {}).get('observed_at')
         state='수집 중' if tracking and tracking.get('enabled') else '수집 중지' if tracking else ''
         updated=('방금 갱신' if now-observed<60 else f'{int(max(0,now-observed)//60)}분 전 갱신') if observed else ''
-        self.sample_summary.setText(' · '.join(s for s in (state,updated) if s))
+        self.sample_summary.setText(' / '.join(s for s in (state,updated) if s))
         for mode,card in self.current.items():
             # Missing windows are not a numeric limit, an error, or unlimited.
-            card['card'].setVisible(mode in available)
+            card['card'].setVisible(True)
             display=quota_display(quota,mode,now)
             remaining=display['remaining']
             card['value'].setText(f'{remaining:.1f}%' if remaining is not None else
-                                  display['state'] if display['state'] in ('제한 없음','관측 충돌','초기화 후 확인 중') else '—')
+                                  '∞' if display['state']=='제한 없음' else '—')
+            card['value'].setToolTip(display['tooltip'])
             card['bar'].set_value(remaining)
+            card['bar'].setVisible(remaining is not None)
             window=(quota or {}).get('windows',{}).get(mode,{})
             evidence=[]
             reset=window.get('resets_at')
             if reset:
                 seconds=max(0,reset-now)
                 days=int(seconds//86400);hours=int(seconds%86400//3600);minutes=int(seconds%3600//60)
-                duration=(f'{days}일 {hours}시간' if days else f'{hours}시간 {minutes}분' if hours else f'{minutes}분' if minutes else '1분 미만')
-                evidence.append(f'정기 초기화까지 {duration} · {clock(reset)}' if reset>now else '다음 정기 초기화 시각 갱신 중')
+                duration=(formatted('{days}일 {hours}시간',days=days,hours=hours) if days else
+                          formatted('{hours}시간 {minutes}분',hours=hours,minutes=minutes) if hours else
+                          formatted('{minutes}분',minutes=minutes) if minutes else formatted('1분 미만'))
+                evidence.append(f'정기 초기화까지 {duration}\n{clock(reset)}' if reset>now else '다음 정기 초기화 시각 갱신 중')
+            if display['state']=='제한 없음':evidence.append('Pro 요금제' if (quota or {}).get('plan_type')=='pro' else '제한 없음')
+            elif remaining is None:evidence.append(display['state'])
             if remaining is None and mode in (quota or {}).get('windows',{}) and display['state']=='미확인':
                 evidence.append('최근 한도 조회가 갱신되지 않았습니다')
             card['evidence'].setText('\n'.join(evidence))

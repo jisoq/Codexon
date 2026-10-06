@@ -156,12 +156,12 @@ def test_quota_home_switch_clears_values_and_rejects_late_old_home_results(tmp_p
     panel.home_choice.setCurrentIndex(1)
     assert switched==[b] and panel.quota is None
     assert panel.current['weekly']['value'].text()=='—'
-    assert not panel.current['weekly']['card'].isVisible()
+    assert panel.current['weekly']['card'].isVisible()
     assert panel.result.text().endswith('—') and not panel.intervals.isVisible()
     assert not panel.receive(value)
     assert panel.quota is None and panel.report['home']==b
     panel.receive({'report':{'home':b,'cycles':[],'manual_reset_pending':True,'index_loading':True}})
-    assert not panel.current['weekly']['card'].isVisible()
+    assert panel.current['weekly']['card'].isVisible()
     assert panel.current['weekly']['bar'].remaining is None
     panel.receive({'report':{'home':b,'cycles':[],'error':True,'index_loading':False},'issue':'원장 오류'})
     assert panel.status.text()=='원장 오류' and panel.status.isVisible()
