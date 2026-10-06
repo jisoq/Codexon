@@ -1,7 +1,8 @@
 import time
 import pytest
 from cachemonitor.banked_resets import normalize_reset_credits,reset_credit_display
-from cachemonitor.quota_live import normalize_limits,AccountClient
+from cachemonitor.quota_live import normalize_limits,normalize_credits,AccountClient
+from cachemonitor.quota import quota_display
 
 
 def raw_credit(**extra):
@@ -29,3 +30,22 @@ def test_zero_count_details_unavailable_and_stale_are_distinct():
     stale=reset_credit_display(quota({'availableCount':2,'credits':[]}),now+90)
     assert stale['count']=='—' and '마지막 확인 2개' in stale['note']
     assert reset_credit_display({'source':'local'},now)['count']=='—'
+
+
+def test_live_pro_policy_preserves_reported_limits_and_unknown_states():
+    now=time.time()
+    raw={'planType':'pro','primary':{'usedPercent':36,'windowDurationMins':10080,'resetsAt':now+600},
+         'secondary':None,'credits':{'balance':'62500.125','hasCredits':True,'unlimited':False}}
+    quota=normalize_limits({'rateLimits':raw},now,'account')
+    assert quota['credits']['balance']=='62500.125'
+    assert quota_display(quota,'five_hour',now)['text']=='∞'
+    assert quota_display(quota,'five_hour',now+90)['text']=='?'
+    for secondary,expected in (({},'?'),({'usedPercent':18,'windowDurationMins':300,'resetsAt':now+300},'82')):
+        quota=normalize_limits({'rateLimits':dict(raw,secondary=secondary)},now,'account')
+        assert quota_display(quota,'five_hour',now)['text']==expected
+    quota=normalize_limits({'rateLimits':dict(raw,planType='plus')},now,'account')
+    assert quota_display(quota,'five_hour',now)['text']=='?'
+    assert normalize_credits({'balance':'0'})['balance']=='0'
+    for invalid in ('NaN','Infinity','-1','bad',True,None):
+        assert normalize_credits({'balance':invalid})['balance'] is None
+    assert normalize_credits(None) is None

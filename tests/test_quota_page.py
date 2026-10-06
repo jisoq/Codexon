@@ -111,6 +111,46 @@ def test_model_filter_combines_request_modes_without_assigning_account_usage():
     assert intervals[0]['cost']==10
 
 
+@pytest.mark.parametrize('width,language,dark',[(1120,'ko',False),(520,'ko',False),(1120,'en',True),(520,'en',True)])
+def test_current_allowance_rows_and_credit_siblings(tmp_path,width,language,dark):
+    from PySide6.QtCore import QPointF
+    from cachemonitor.i18n import set_language
+    from cachemonitor.quota_live import normalize_limits
+    app=QApplication.instance() or QApplication([])
+    set_language(language);shared_theme().configure('dark' if dark else 'light')
+    now=time.time()
+    quota=normalize_limits({'rateLimits':{'planType':'pro','secondary':None,
+        'primary':{'usedPercent':36,'windowDurationMins':10080,'resetsAt':now+600},
+        'credits':{'balance':'62500','hasCredits':True,'unlimited':False}},
+        'rateLimitResetCredits':{'availableCount':2,'credits':[
+            {'status':'available','resetType':'codexRateLimits','grantedAt':now-86400,'expiresAt':now+86400},
+            {'status':'available','resetType':'codexRateLimits','grantedAt':now-43200,'expiresAt':now+172800}]}},now,'synthetic')
+    panel=QuotaPanel(QSettings(str(tmp_path/'credits.ini'),QSettings.IniFormat))
+    panel.receive({'quota':quota,'report':{'cycles':[]}})
+    scroll=Scroll();scroll.put(fillViewport=True);scroll.setWidget(panel)
+    host=mount(scroll,width,900)
+    try:
+        QTest.qWait(80)
+        def position(node):return control(host,node).mapToScene(QPointF(0,0))
+        assert position(panel.current['five_hour']['card']).y()<position(panel.current['weekly']['card']).y()
+        assert position(panel.credit_card).y()>position(panel.current['weekly']['card']).y()
+        assert abs(position(panel.credit_card).y()-position(panel.reset_card).y())<2
+        assert position(panel.credit_card).x()<position(panel.reset_card).x()
+        assert abs(control(host,panel.credit_card).width()-control(host,panel.reset_card).width())<2
+        assert panel.current['five_hour']['value'].text()=='∞'
+        assert not panel.current['five_hour']['bar'].isVisible()
+        assert panel.credit_balance.text()=='62,500'
+        assert panel.reset_count.text()==('2개' if language=='ko' else '2 resets')
+        assert panel.reset_rows.isVisible()
+        assert host.grab().save(str(tmp_path/f'allowance-{width}-{language}.png'))
+        panel.receive({'quota':dict(quota,observed_at=now-100)})
+        assert panel.credit_balance.text()=='—'
+        assert panel.current['five_hour']['value'].text()=='—'
+        assert not panel.reset_rows.isVisible()
+        assert not host.qml_errors
+    finally:dispose(host);set_language('ko');shared_theme().configure('light')
+
+
 @pytest.mark.parametrize('width,dark',[(520,False),(1120,True)])
 def test_waiting_state_becomes_observed_zero_and_keeps_history_during_lookup_failure(tmp_path,width,dark):
     from test_quota_value_history import interval, report_for
