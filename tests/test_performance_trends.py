@@ -149,6 +149,151 @@ def test_qt_panel_hover_analysis_and_passive_click(tmp_path):
         assert host.quick.grabFramebuffer().save(str(tmp_path/'performance.png'))
     finally:dispose(host)
 
+def test_reasoning_tabs_share_trend_axis_and_keep_other_charts(tmp_path):
+    from datetime import datetime
+    from PySide6.QtCore import QSettings,QPointF
+    from PySide6.QtWidgets import QApplication
+    from cachemonitor.charts import dynamic_bounds
+    from cachemonitor.performance_panel import PerformancePanel
+    from cachemonitor.quick_qa import mount,dispose,render_plot,control,click,scene_view
+    app=QApplication.instance() or QApplication([])
+    base=datetime(2026,10,1).timestamp();rows=[]
+    for day in range(3):
+        for effort,values in (('low',(100,200)),('medium',(None,None)),('high',(1000,2000)),('ultra',(10000,20000))):
+            for value in values:
+                rows.append(row(len(rows),ts=base+day*86400+3600+len(rows),effort=effort,reasoning=value))
+    source=engine(rows);projector=PerformanceTrends();data=projector.query(source,query(now=base+3*86400))
+    owner=SimpleNamespace(settings=QSettings(str(tmp_path/'reasoning.ini'),QSettings.IniFormat),render=lambda:None)
+    ui=PerformancePanel(owner);ui.apply(data);host=mount(ui,1440,940)
+    try:
+        assert 'reasoning' in ui.plots and not any(k.startswith('reasoning:') for k in ui.plots)
+        assert set(ui.reasoning_buttons)=={'low','medium','high','ultra'}
+        chart=ui.plots['reasoning'];render_plot(host,chart)
+        expected=dynamic_bounds([150,1500,15000]);assert chart.bounds==expected
+        other_bounds={k:p.bounds for k,p in ui.plots.items() if k!='reasoning'}
+        point=chart.rows[-1];ui.show_interval(point,'reasoning')
+        render_plot(host,ui.reasoning_tabs)
+        for effort,value in (('low',150),('ultra',15000),('high',1500)):
+            click(host,control(host,ui.reasoning_buttons[effort]))
+            assert ui.plots['reasoning'] is chart and chart.bounds==expected
+            assert {p['value'] for p in chart.rows}=={value}
+            assert ui.reasoning_buttons[effort].isChecked() and sum(b.isChecked() for b in ui.reasoning_buttons.values())==1
+            assert ui.inspected[1]=='reasoning' and ui.inspected[0]['effort']==effort
+            assert ui.inspected[0]['ts']==point['ts'] and ui.inspected[0]['value']==value
+            assert ui.details.identity.text().endswith('/ '+effort)
+            assert ui.time_range is None and other_bounds=={k:p.bounds for k,p in ui.plots.items() if k!='reasoning'}
+            click(host,control(host,ui.reasoning_buttons[effort]))
+            assert ui.reasoning_buttons[effort].isChecked() and chart.bounds==expected
+        click(host,control(host,ui.reasoning_buttons['medium']))
+        assert not chart.rows and chart.bounds==expected and ui.inspected is None
+        click(host,control(host,ui.reasoning_buttons['ultra']))
+        assert PerformancePanel(owner).reasoning_effort=='ultra'
+        assert ui.legend_scroll.parent() is ui.chart_scroll.parent().parent() is ui.inspector.parent()
+        left=scene_view(host,ui.legend_scroll);center=scene_view(host,ui.chart_scroll);right=scene_view(host,ui.inspector)
+        x=lambda item:item.mapToScene(QPointF(0,0)).x()
+        assert x(left)+left.width()<=x(center) and x(center)+center.width()<=x(right)
+        click(host,control(host,ui.legend_button));assert not ui.legend_scroll.isVisible()
+        click(host,control(host,ui.legend_button));assert ui.legend_scroll.isVisible()
+        assert host.quick.grabFramebuffer().save(str(tmp_path/'reasoning-tabs.png'))
+        # A changed visible period recalculates the common scale, rather than retaining a global maximum.
+        narrower=projector.query(source,query(now=base+3*86400,time_range=[base,base+86400]))
+        ui.apply(narrower);assert chart.bounds==expected and ui.reasoning_effort=='ultra'
+        rows[1]['reasoning']=None
+        for r in rows:
+            if r['effort']=='ultra':r['reasoning']=300
+        source.revision+=1
+        ui.apply(projector.query(source,query(now=base+3*86400)))
+        assert chart.bounds==dynamic_bounds([150,100,1500,300]) and ui.reasoning_effort=='ultra'
+        assert not host.qml_errors
+    finally:dispose(host)
+
+
+def test_time_navigator_presets_live_updates_and_date_ranges(tmp_path):
+    from datetime import datetime
+    from PySide6.QtCore import QSettings,QMetaObject,Q_ARG,Qt,QPointF
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QApplication
+    from cachemonitor.performance_panel import PerformancePanel
+    from cachemonitor.quick_qa import mount,dispose,control,click,render_plot,scene_view
+    app=QApplication.instance() or QApplication([])
+    base=datetime(2026,1,1).timestamp();day=86400;now=base+100*day
+    source=engine([row(i,ts=base+i*day) for i in range(100)]);projector=PerformanceTrends()
+    owner=SimpleNamespace(settings=QSettings(str(tmp_path/'navigation.ini'),QSettings.IniFormat),snapshot={'ts':now})
+    ui=PerformancePanel(owner)
+    def refresh():
+        owner.snapshot={'ts':now}
+        ui.apply(projector.query(source,query(now=now,plot_width=900,time_range=ui.query_range(now,source.revision))))
+    owner.render=refresh;refresh();host=mount(ui,1440,940)
+    try:
+        # The navigator stays visible when the graph viewport scrolls at either width.
+        from cachemonitor.presentation import Scroll
+        ancestor=ui.navigator
+        while ancestor is not None:
+            assert not isinstance(ancestor,Scroll)
+            ancestor=ancestor.parent()
+        for width,height in ((1440,940),(1000,760)):
+            host.resize(width,height)
+            render_plot(host,ui.plots['cost'])
+            top_y=scene_view(host,ui.navigator).mapToScene(QPointF(0,0)).y()
+            render_plot(host,ui.plots['count'])
+            navigator=scene_view(host,ui.navigator)
+            assert navigator.mapToScene(QPointF(0,0)).y()==pytest.approx(top_y)
+            assert 0<=top_y and top_y+navigator.height()<=host.quick.height()
+        host.resize(1440,940);QTest.qWait(30)
+        click(host,control(host,ui.period_buttons['7d']))
+        assert ui.range==pytest.approx((now-7*day,now)) and ui.follow_latest
+        assert ui.period_buttons['7d'].isChecked()
+        # Idle polling does not move the range or force a complete projection rebuild.
+        assert ui.query_range(now+10,source.revision)==list(ui.range)
+        item=control(host,ui.navigator)
+        def gesture(name,x=None):
+            args=() if x is None else (Q_ARG('QVariant',float(x)),)
+            assert QMetaObject.invokeMethod(item,name,Qt.DirectConnection,*args)
+            QTest.qWait(30)
+        def x(fraction):return 16+item.property('railWidth')*fraction
+        # Invoke the real gesture handlers without moving the user's cursor.
+        gesture('beginGesture',x(.93));gesture('updateGesture',x(.70));gesture('finishGesture')
+        assert ui.range==pytest.approx((base+70*day,now)) and ui.follow_latest
+        gesture('beginGesture',x(1));gesture('updateGesture',x(.85));gesture('finishGesture')
+        assert ui.range==pytest.approx((base+70*day,base+85*day)) and not ui.follow_latest
+        gesture('beginGesture',x(.775));gesture('updateGesture',x(.675));gesture('finishGesture')
+        assert ui.range==pytest.approx((base+60*day,base+75*day))
+        frozen=list(ui.range)
+        gesture('beginGesture',x(.675));gesture('updateGesture',x(.5));gesture('cancelGesture')
+        assert ui.time_range==frozen
+        now+=3601;source.sessions['s']['prepared']['history'].append(row(100,ts=now-1));source.revision+=1;refresh()
+        assert ui.range==tuple(frozen) and not any(p['ts']==now-1 for p in ui.specs['cost']['points'])
+        click(host,control(host,ui.latest_button))
+        assert ui.range==pytest.approx((now-15*day,now)) and ui.follow_latest
+        assert any(p['ts']==now-1 for p in ui.specs['cost']['points'])
+        now+=3601;source.sessions['s']['prepared']['history'].append(row(101,ts=now-1));source.revision+=1;refresh()
+        assert ui.follow_latest and ui.range==pytest.approx((now-15*day,now))
+        assert any(p['ts']==now-1 for p in ui.specs['cost']['points'])
+        item.forceActiveFocus();QTest.keyClick(host.quick,Qt.Key_Left);QTest.qWait(30)
+        assert not ui.follow_latest
+        QTest.keyClick(host.quick,Qt.Key_End);QTest.qWait(30);assert ui.follow_latest and ui.range[1]==now
+        click(host,control(host,ui.follow_button));assert not ui.follow_latest
+        click(host,control(host,ui.follow_button));assert ui.follow_latest
+        click(host,control(host,ui.period))
+        ui.date_start.edit('2026-02-01');ui.date_end.edit('2026-02-07')
+        click(host,control(host,ui.date_apply))
+        assert ui.range==(datetime(2026,2,1).timestamp(),datetime(2026,2,8).timestamp())
+        assert not ui.date_editor.isVisible() and not ui.follow_latest
+        click(host,control(host,ui.period));before=ui.range;ui.date_start.edit('2026-03-01')
+        click(host,control(host,ui.date_apply));assert ui.range==before and ui.date_error.text()
+        ui.date_start.edit('1900-01-01');ui.date_end.edit(datetime.fromtimestamp(now).strftime('%Y-%m-%d'))
+        click(host,control(host,ui.date_apply))
+        assert ui.range==ui.full and not ui.follow_latest
+        ui.date_editor.hide();click(host,control(host,ui.period_buttons['all']))
+        assert ui.time_range is None and ui.follow_latest and ui.range==ui.full
+        ui.set_window(base,base+day);ui.zoom(2)
+        assert ui.range[1]-ui.range[0]==2*day
+        ui.reset()
+        assert host.quick.grabFramebuffer().save(str(tmp_path/'navigation.png'))
+        assert not host.qml_errors
+    finally:dispose(host)
+
+
 def test_dashboard_tab_worker_contract_and_navigation(tmp_path):
     from PySide6.QtCore import QSettings
     from PySide6.QtWidgets import QApplication
