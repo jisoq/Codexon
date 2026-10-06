@@ -122,15 +122,19 @@ Codex 배경·글자·강조색과 UI 글꼴을 읽고 유효한 지정 글꼴�
 원본 기록 대조·렌더링·Windows 입력 검증과 설치된 실행 파일 검증은 서로 구별한다.
 별도 한도 원장의 저장 오류가 실제 호출 수집을 중단시키지 않는다. 원장 오류는 진단 정보로 남기며 원장이나 원본 관측을 자동 삭제·복구하지 않는다.
 
-사용량 원본 수집은 별도의 `--usage-collector` 백그라운드 프로세스 하나가 수행한다.
-GUI 분석 프로세스와 캐시 작업기는 `usage_collection.py`의 소비자로서 같은 수집 결과만 읽는다.
-GUI를 닫아도 전담 수집기는 유지되며, 장애 복구는 작업 스케줄러와 소비자의 전담 프로세스 재시작 요청으로 처리한다.
-GUI나 캐시 작업기가 원본 수집을 승계하지 않는다. 파일 잠금은 전담 수집기 중복 실행만 막는다.
+사용량 원본 수집과 `UsageIndex`는 `usage_collection.py`의 `CollectorService`가 전담한다.
+GUI 분석 프로세스는 같은 파일의 읽기 전용 `CollectionClient`를 통해 수집 결과를 받으며, 소비자 조회는 수집기를 시작하거나 재시작하지 않는다.
+서비스 시작, 기존 프로세스 인계, 제한된 장애 재시작과 종료는 `AppServices`가 관리한다. 창을 트레이로 숨길 때는 수집을 유지하고 앱을 종료할 때는 수집기도 종료한다.
+예약 작업과 종료 동작의 공통 기준은 [서비스 수명주기](../CONTRIBUTING.md#usage-collection)를 따른다. 제거된 캐시 작업기를 소비자나 복구 경로로 다시 추가하지 않는다.
+
 여러 Codex 홈의 구독은 전담 수집기에 합쳐 전달하고, 각 소비자에게는 요청한 홈의 결과만 반환한다.
 공유 결과가 30초 이상 갱신되지 않으면 확인값을 보존하면서 지연을 표시한다.
 원본 색인을 읽는 주체도 전담 수집기로 한정한다. 이전 직접 수집기와 작업기 색인 호환 경로는 유지하지 않는다.
 
+변경 검사는 [개발 환경](../CONTRIBUTING.md#development-environment)과 [변경 범위별 검증](verification.md)에 따라 선택한다. 아래 `$devPython`은 개발 환경 절에서 선택한 인터프리터다.
+
+추가 화면 확인이 필요하면 사용자에게 표시하지 않는 Windows 데스크톱에서 합성 데이터로 오버레이를 렌더링한다. 이 명령은 모델 요청을 보내지 않는다.
+
 ```powershell
-.\.venv\Scripts\python.exe -m pytest -q
-.\.venv\Scripts\python.exe -B tools/verify_session_overlay.py --output artifacts/overlay-preview
+& $devPython tools/run_ui_checks.py -- $devPython -B tools/verify_session_overlay.py --output artifacts/overlay-preview
 ```

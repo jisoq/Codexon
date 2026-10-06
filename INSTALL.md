@@ -77,9 +77,9 @@ The overlay uses the running Codex process and its current task route, without a
 
 ## 5. Optional request/response model monitoring
 
-Ordinary installation does not require changing Codex's connection. If the user requests model mismatch monitoring, explain its concrete setup effects: the app backs up the prior `config.toml`, changes the Codex connection to a local proxy, and registers the independent managed proxy and scheduled recovery checks. The current activation flow also sends a **real model request** to test the connection; it can consume usage. Keep the installed folder while any proxy, updater or recovery component uses it.
+Ordinary installation does not require changing Codex's connection. If the user requests model mismatch monitoring, explain its concrete setup effects: the app starts the local proxy, checks its local readiness, backs up the prior `config.toml`, and changes the Codex connection to that proxy. Activation sends no model request. Its readiness check confirms the local service, not an upstream model response. Keep the installed folder while any proxy, updater or recovery component uses it.
 
-Use **Settings → Proxy** for the activation workflow only when those effects are within the user's authorization. Do not enable it as an installation smoke test. In particular, neither `--enable-model-observer` nor `--test-model-observer` is a read-only installation check. If the request excludes model calls, leave activation pending and explain why.
+Use **Settings → Proxy** for the activation workflow only when those effects are within the user's authorization. Do not enable it as an installation smoke test. `--enable-model-observer` starts a local service and changes the connection configuration, so it is not a read-only installation check. A request that excludes model calls can still authorize activation; a request that excludes configuration changes cannot. Use `--model-observer-status` for read-only installation checks.
 
 After an authorized activation, restart Codex only when its current work can safely end. Never force-cancel a request, automatically resend one, or terminate Codex to finish setup. Confirm the proxy status, and verify comparison evidence from the user's next normal completed call. An active proxy does not prove a particular call was observed. Comparison uses recorded request/response model names; it does not expose hidden backend routing.
 
@@ -102,7 +102,7 @@ For a custom home, include `--codex-home` and its quoted path in this argument l
 
 ## 6. Source environment (development)
 
-Use a fresh checkout and a dedicated virtual environment on Windows x64. The repository's build/CI baseline is **64-bit Python 3.12.10**. Git and that Python installation are source-path prerequisites only. Check existing tools first; install missing prerequisites from their official distribution within the requested setup scope. Do not silently substitute another Python minor version or loosen dependency pins when installation fails.
+For a new source setup, use a fresh checkout and a dedicated virtual environment on Windows x64. For an existing checkout, follow [development environment selection](CONTRIBUTING.md#development-environment) to reuse and check its interpreter before creating another environment. The repository's build/CI baseline is **64-bit Python 3.12.10**. Git and that Python installation are source-path prerequisites only. Check existing tools first; install missing prerequisites from their official distribution within the requested setup scope. Do not silently substitute another Python minor version or loosen dependency pins when installation fails.
 
 ```powershell
 $ErrorActionPreference = 'Stop'
@@ -124,11 +124,11 @@ if ($LASTEXITCODE -ne 0) { throw 'Dependency consistency check failed.' }
 if ($LASTEXITCODE -ne 0) { throw 'Application entry point failed.' }
 & $python tools/verify_changes.py --plan
 if ($LASTEXITCODE -ne 0) { throw 'Verification planning failed.' }
-& $python tools/verify_changes.py
+& $python tools/run_ui_checks.py -- $python tools/verify_changes.py
 if ($LASTEXITCODE -ne 0) { throw 'Repository verification failed; inspect artifacts/verification.' }
 ```
 
-Use the environment's Python directly; activation and a machine-wide execution-policy change are unnecessary. A fresh checkout has no verification baseline, so the selector runs the full suite. Record `git rev-parse HEAD` with the result. For an existing checkout, read `AGENTS.md`, inspect local changes, and never reset or clean away the user's work.
+Use the environment's Python directly; activation and a machine-wide execution-policy change are unnecessary. Use that same interpreter for the hidden-desktop wrapper and its child command so UI checks do not interrupt the user's desktop or fall back to another Python environment. A fresh checkout has no verification baseline, so the selector runs the full suite. Record `git rev-parse HEAD` with the result. For an existing checkout, read `AGENTS.md`, inspect local changes, and never reset or clean away the user's work.
 
 Before the normal launch, check the runtime and real Qt Quick interactions with synthetic records:
 
@@ -139,7 +139,7 @@ New-Item -ItemType Directory -Path $sourceCheckDir | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'Source runtime verification failed.' }
 & $python -c "import sys; from pathlib import Path; from tools.verify_changes import fixture_home; fixture_home(Path(sys.argv[1]))" $sourceCheckDir
 if ($LASTEXITCODE -ne 0) { throw 'Synthetic fixture creation failed.' }
-& $python run.py --codex-home (Join-Path $sourceCheckDir 'codex') --index-path (Join-Path $sourceCheckDir 'index.sqlite') --smoke (Join-Path $sourceCheckDir 'smoke.png') --smoke-depth core
+& $python tools/run_ui_checks.py -- $python run.py --codex-home (Join-Path $sourceCheckDir 'codex') --index-path (Join-Path $sourceCheckDir 'index.sqlite') --smoke (Join-Path $sourceCheckDir 'smoke.png') --smoke-depth core
 if ($LASTEXITCODE -ne 0) { throw 'Isolated UI verification failed.' }
 $sourceSmoke = Get-Content -LiteralPath (Join-Path $sourceCheckDir 'smoke.json') -Raw | ConvertFrom-Json
 if ($null -eq $sourceSmoke.errors -or @($sourceSmoke.errors).Count -ne 0 -or
@@ -149,13 +149,15 @@ if ($null -eq $sourceSmoke.errors -or @($sourceSmoke.errors).Count -ne 0 -or
 
 Inspect the generated PNGs. This check uses isolated settings, home, and index; it makes no model or live quota requests and does not manage the production proxy. Use the provided fixture helper: an empty directory alone does not supply the Codex databases expected by the smoke check. Then launch the interactive app with `& $python run.py` (or `pythonw.exe` for a persistent shortcut) and complete section 4 against the user's actual home.
 
-Building a frozen executable is optional for source use. If requested, follow [CONTRIBUTING.md](CONTRIBUTING.md) and [verification](docs/verification.md), build from clean committed source into unique output/work folders, and run `tools/verify_changes.py --package-exe <built-Codexon.exe>`. That package check also uses synthetic parent/child sessions to check cost aggregation. Validate the installer payload with `tools/package_release.py --product <product-directory> --validate-only`. Do not publish a release merely to complete a local setup.
+Building a frozen executable is optional for source use. If requested, follow [CONTRIBUTING.md](CONTRIBUTING.md) and [verification](docs/verification.md), build from clean committed source into unique output/work folders, and run `& $python tools/run_ui_checks.py -- $python tools/verify_changes.py --package-exe <built-Codexon.exe>`. That package check also uses synthetic parent/child sessions to check cost aggregation. Validate the installer payload with `tools/package_release.py --product <product-directory> --validate-only`. Do not publish a release merely to complete a local setup.
 
 ## 7. Updates, recovery, and completion report
 
-Subsequent updates use **Settings → About and troubleshooting → Check and install updates**, the single update entry point for the app and proxy. Do not start an update as part of an installation check. For a requested migration from an existing legacy portable copy, ask the user to run Setup and wait for completion as in section 1, then verify the displayed app version and connection update status. Preserve the old directory while any GUI, proxy, updater, or rollback journal refers to it. Do not delete it just because the new dashboard opened. A new managed proxy runs its own lifecycle without a separate resident watcher; older proxies retain their existing supervisor until a safe update.
+Subsequent updates use **Settings → About and troubleshooting → Check and install updates**, the single update entry point for the app and proxy. Do not start an update as part of an installation check. For a requested migration from an existing legacy portable copy, ask the user to run Setup and wait for completion as in section 1, then verify the displayed app version and connection update status. Preserve the old directory while any GUI, proxy, updater, or rollback journal refers to it. Do not delete it just because the new dashboard opened.
 
-Verify that **Start → Codexon 연결 복구** opens the independent recovery tool, then close it without restoring settings as a test. It works without the dashboard, proxy or internet. While monitoring is enabled, scheduled checks run briefly at login and every minute; they notify only after repeated confirmed local faults and never reroute traffic or send model requests. Check their registration and configured paths when monitoring is enabled. A queued update can be cancelled through the same update control, but do not cancel it during inspection.
+The running app owns ordinary collector and proxy startup, recovery and shutdown; see the [service lifecycle](CONTRIBUTING.md#usage-collection). With a system tray available, closing the dashboard hides it and keeps those services running. **Exit** in the tray starts service shutdown and restores the saved direct connection; pending responses can delay completion. Reopening the app resumes its saved connection choice. Ordinary services have no independent login, periodic or automatic-restart triggers.
+
+Verify that **Start → Codexon 연결 복구** opens the independent recovery tool, then close it without restoring settings as a test. It works without the dashboard, proxy or internet. While the app is running, it checks local connection state and reports repeated confirmed faults without sending model requests. Installation and app startup retire legacy independent connection-check tasks. Normal app exit leaves no independent periodic checker; after an app crash, reopen the app or use the Start-menu recovery tool. A queued update can be cancelled through the same update control, but do not cancel it during inspection.
 
 If a connection actually fails and recovery is within the user's request, use the independent Start-menu recovery tool. For automated explicit recovery, `CodexonRecovery.exe --restore --codex-home <home> --report <fresh-report.json>` uses the same implementation; `--status` only inspects. For a custom evidence directory or isolated port, also pass `--data-dir` and `--proxy-url`. Verify that configuration restoration succeeded; restart Codex only when safe. Report configuration restoration separately from actual Codex communication. Never delete the complete configuration or account home. Windows uninstall restores the managed route and defers removal while payload components are in use. See the [user guide](docs/user-guide.md) ([한국어](docs/user-guide.ko.md)).
 
