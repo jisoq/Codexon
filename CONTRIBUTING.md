@@ -1,14 +1,75 @@
 # Contributing
 
-Codexon is a Windows application built with Python 3.12.10 and PySide6/Qt Quick. Use a fresh clone and a dedicated environment:
+Codexon is a Windows application built with Python 3.12.10 and PySide6/Qt Quick. `Codexon` is the product name; `cachemonitor` is the Python package and part of existing data paths. Proxy activation uses the internal `observer` name. Preserve those package and storage names.
+
+## Find the implementation
+
+Start with the row that matches the task, then follow its imports or callers. Source lives in `cachemonitor/`, not `src/`.
+
+| Task | Starting points | Reference |
+|---|---|---|
+| Entry modes and application startup | [run.py](run.py), [app.py](cachemonitor/app.py) | [Development environment](#development-environment) |
+| Collection, IPC and service lifetime | [usage_collection.py](cachemonitor/usage_collection.py), [app_services.py](cachemonitor/app_services.py), [app_shutdown.py](cachemonitor/app_shutdown.py) | [Usage collection](#usage-collection) |
+| Proxy activation, relay and update | [observer_control.py](cachemonitor/observer_control.py), [model_proxy.py](cachemonitor/model_proxy.py), [proxy_update.py](cachemonitor/proxy_update.py) | [Model observation](docs/model-observer.md) |
+| Stored usage, analysis and request modes | [index.py](cachemonitor/index.py), [analysis_engine.py](cachemonitor/analysis_engine.py), [request_modes.py](cachemonitor/request_modes.py), [pricing.py](cachemonitor/pricing.py) | [User guide](docs/user-guide.md) |
+| Dashboard models, QML and charts | [dashboard.py](cachemonitor/dashboard.py), [presentation.py](cachemonitor/presentation.py), [quick_runtime.py](cachemonitor/quick_runtime.py), [qml/](cachemonitor/qml/), [charts.py](cachemonitor/charts.py) | [Qt Quick](docs/qt-quick.md) |
+| Session overlay | [overlay_tracking.py](cachemonitor/overlay_tracking.py), [overlay_data.py](cachemonitor/overlay_data.py), [overlay_view.py](cachemonitor/overlay_view.py) | [Overlay implementation map](docs/session-overlay.md#구현-위치와-검증) |
+| Performance trends and benchmarks | [performance_trends.py](cachemonitor/performance_trends.py), [performance_panel.py](cachemonitor/performance_panel.py), [performance_probe.py](cachemonitor/performance_probe.py) | [Resource comparison](docs/verification.md#리소스-비교) |
+| Verification and packaging | [verify_changes.py](tools/verify_changes.py) (`RULES` and `GROUPS`), [Build-Product.ps1](tools/Build-Product.ps1), [windows.yml](.github/workflows/windows.yml) | [Verification](docs/verification.md), [Releases](#releases) |
+
+Discover filenames before guessing module names. In PowerShell, pass directories to `rg` and use `-g` for filename patterns:
+
+```powershell
+rg --files cachemonitor tools tests -g '*proxy*' -g '*observer*'
+rg -n -g '*observer*.py' 'def check_ready|def enable' cachemonitor
+```
+
+Keep normal code searches within `cachemonitor`, `tools`, or `tests`. Search `artifacts/verification/<run>/` only when inspecting that run's evidence. Read the matching function or section instead of dumping large files and generated artifacts together.
+
+## Development environment
+
+For an existing checkout, inspect local changes and available environments first:
+
+```powershell
+git status --short
+Get-ChildItem -Force -Directory -Filter '.venv*' | ForEach-Object {
+    Get-Item -LiteralPath (Join-Path $_.FullName 'Scripts/python.exe') -ErrorAction SilentlyContinue
+}
+```
+
+Reuse a suitable existing environment. This checkout uses `.venv-overlay`; other checkouts may use `.venv`. Set `$devPython` to the chosen executable's absolute path, for example:
+
+```powershell
+$devPython = (Resolve-Path '.venv-overlay/Scripts/python.exe').Path
+```
+
+For a fresh clone without a suitable environment, create one and install the locked dependencies:
 
 ```powershell
 py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements-release.lock
-.\.venv\Scripts\python.exe run.py
-.\.venv\Scripts\python.exe tools/verify_changes.py --plan
-.\.venv\Scripts\python.exe tools/run_ui_checks.py -- .\.venv\Scripts\python.exe tools/verify_changes.py
-.\build.ps1 -DistPath dist-releases/<version> -WorkPath build/release-<version> -PythonPath .venv/Scripts/python.exe
+$devPython = (Resolve-Path '.venv/Scripts/python.exe').Path
+```
+
+Validate the selected interpreter before running checks. Use it for both the UI wrapper and its child process; do not fall back to an unrelated `python` on PATH when imports fail. Repair missing dependencies from `requirements-release.lock` in the selected environment before continuing.
+
+```powershell
+$env:PYTHONUTF8 = '1'
+$env:PYTHONIOENCODING = 'utf-8'
+& $devPython -c "import sys, PySide6, pytest, tomlkit, aiohttp; print(sys.executable); print(sys.version); print('Qt', PySide6.__version__)"
+if ($LASTEXITCODE -ne 0) { throw 'Development environment imports failed.' }
+& $devPython -m pip check
+if ($LASTEXITCODE -ne 0) { throw 'Development environment dependencies are inconsistent.' }
+& $devPython tools/verify_changes.py --plan
+if ($LASTEXITCODE -ne 0) { throw 'Verification planning failed.' }
+& $devPython tools/run_ui_checks.py -- $devPython tools/verify_changes.py
+if ($LASTEXITCODE -ne 0) { throw 'Selected verification failed.' }
+```
+
+Run the development app with `& $devPython run.py`. For an authorized build, pass the same interpreter explicitly:
+
+```powershell
+.\build.ps1 -DistPath dist-releases/<version> -WorkPath build/release-<version> -PythonPath $devPython
 ```
 
 The selector runs only checks related to changed behavior; small UI edits do not require backend or installation checks. Reuse existing coverage and add tests only for a material gap. Use `--full` for broad shared changes or release verification. Unmapped code needs an explicit check mapping before incremental verification can succeed.
@@ -27,15 +88,19 @@ Use `-Isolated` and a separate output directory for installation QA. The QA inst
 
 `CollectorService` is the sole owner of source collection and `UsageIndex`. The GUI consumes read-only `CollectionClient` snapshots. `AppServices` alone owns ordinary service startup, adoption, bounded restart, and shutdown. Quota services receive local quota observations from those same snapshots. Keep one IPC format and one collection path; retired worker readers, direct scanners and their compatibility branches must be removed with their callers. Move still-relevant tests onto the supported path instead of retaining unused production code for old tests. Add compatibility behavior only for an explicitly supported migration requirement.
 
+Hiding the window to the tray keeps the application and its services running. Normal application exit coordinates proxy and collector shutdown through `AppServices`; proxy shutdown waits for existing traffic to drain. Read-only consumers do not restart the collector. Ordinary service tasks have no login, periodic, or automatic restart triggers. The `ProxyUpdate` watchdog is a separate update-recovery mechanism. GUI login startup remains a user setting.
+
+Proxy activation checks the owned local relay before applying the connection configuration. This readiness check sends no model request and does not prove upstream model communication. The separate [live probe](tools/probe_model_proxy.py) sends a real model request and consumes usage. Routine fault monitoring runs while the application is running, including in the tray; no independent periodic connection checker runs after application exit. See [verification](docs/verification.md) for lifecycle checks and [the user guide](docs/user-guide.md) for recovery.
+
 ## Releases
 
-PRs are optional. Push changes directly to `main`; push CI checks the affected behavior. To release, set a new `VERSION` in `cachemonitor/version.py`, push it, then run:
+PRs are optional. Push changes directly to `main`; push CI checks the affected behavior. To release, set a new `VERSION` in `cachemonitor/version.py` and write the matching `docs/releases/<VERSION>.md` in the existing release-note format. The filename has no `v` prefix. The top-level `releases/v*.md` files are historical notes, not the current publication input. Push the version and its notes together, then run:
 
 ```powershell
 gh workflow run windows.yml --ref main -f publish=true
 ```
 
-This runs the full source, package, installation and proxy checks, builds the production installer from that same verified package, and publishes the installer, checksums and third-party sources. The release tag is `v<VERSION>` and points to the commit selected when the workflow started. Existing tags are not overwritten. Running the workflow without `publish=true` performs full verification only.
+Before installing dependencies or building, publication checks that the release notes exist and contain text. This runs the full source, package, installation and proxy checks, builds the production installer from that same verified package, and publishes the installer, checksums and third-party sources. The release tag is `v<VERSION>` and points to the commit selected when the workflow started. Existing tags are not overwritten. Running the workflow without `publish=true` performs full verification only.
 
 Release publication depends on successful CI, rather than requiring CI before a direct push to `main`. Keep force pushes and branch deletion disabled. See [verification](docs/verification.md) for the checks and evidence.
 

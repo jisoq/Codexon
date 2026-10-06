@@ -37,6 +37,13 @@ jobs:
           if ($env:GITHUB_REF -ne 'refs/heads/main') { throw 'Publish releases from main.' }
           $version = python -c 'from cachemonitor.version import VERSION; print(VERSION)'
           if ($LASTEXITCODE -ne 0) { throw 'Cannot read the release version.' }
+          $notesPath = "docs/releases/$version.md"
+          if (-not (Test-Path -LiteralPath $notesPath -PathType Leaf)) {
+            throw "Release notes are required: $notesPath"
+          }
+          if ([string]::IsNullOrWhiteSpace((Get-Content -LiteralPath $notesPath -Raw))) {
+            throw "Release notes are empty: $notesPath"
+          }
           $tag = "v$version"
           git show-ref --verify --quiet "refs/tags/$tag"
           if ($LASTEXITCODE -eq 0) { throw "Tag $tag already exists. Increment VERSION before releasing." }
