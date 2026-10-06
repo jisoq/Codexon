@@ -126,6 +126,7 @@ RULES = (
     ('cachemonitor/quota.py', ('quota_store', 'quota_math')),
     ('cachemonitor/history_*.py', ('dashboard', 'cost')),
     ('cachemonitor/qml/HistoryWorkspace.qml', ('dashboard',)),
+    ('cachemonitor/qml/PerformanceNavigator.qml', ('performance_trends',)),
     ('cachemonitor/dashboard.py', ('dashboard', 'details', 'cost', 'speed')),
     ('cachemonitor/ui_details.py', ('details',)),
     ('cachemonitor/table_model.py', ('table',)),
