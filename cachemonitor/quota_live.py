@@ -8,9 +8,24 @@ import shutil
 import subprocess
 import threading
 import time
+from decimal import Decimal, InvalidOperation
 
 from .quota import clean_limits
 from .banked_resets import normalize_reset_credits
+
+
+def normalize_credits(value):
+    """Keep a reported balance exact; missing or invalid balances stay unknown."""
+    if not isinstance(value, dict):
+        return None
+    balance = value.get('balance')
+    try:
+        number = Decimal(balance) if isinstance(balance, str) else None
+        balance = format(number, 'f') if number is not None and number.is_finite() and number >= 0 else None
+    except InvalidOperation:
+        balance = None
+    return {'balance': balance, 'unlimited': value.get('unlimited') is True,
+            'has_credits': value.get('hasCredits') if type(value.get('hasCredits')) is bool else None}
 
 
 def locate_codex():
@@ -42,10 +57,21 @@ def normalize_limits(result, observed, account):
     clean = clean_limits(converted)
     if clean is None:
         raise ValueError('사용 가능한 한도 창이 없습니다')
+    # Current Pro policy has no five-hour cap. Apply only to a successful live
+    # response with a valid weekly window and an explicitly absent second window.
+    # Reported five-hour limits, malformed windows and local records take precedence.
+    if (clean['plan_type'] == 'pro' and 'weekly' in clean['windows']
+            and not clean['has_five_hour'] and not clean['window_conflicts']
+            and any(name in raw and raw[name] is None for name in ('primary', 'secondary'))
+            and all(raw.get(name) is None or (isinstance(raw[name], dict)
+                    and raw[name].get('windowDurationMins') == 10080)
+                    for name in ('primary', 'secondary'))):
+        clean['unlimited_windows'] = ['five_hour']
     separate = sorted({b['normalModelSlug'] for key, b in (buckets or {}).items()
                        if key != 'codex' and isinstance(b, dict) and b.get('normalModelSlug')})
     return {**clean, 'observed_at': observed, 'source': 'live', 'max_age': 90,
             'account': account, 'bucket': 'codex', 'separate_models': separate,
+            'credits': normalize_credits(raw.get('credits')),
             'reset_credits':normalize_reset_credits(result.get('rateLimitResetCredits'))}
 
 
