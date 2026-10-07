@@ -1,7 +1,7 @@
 """Worker-owned, bounded historical performance projections."""
 from collections import defaultdict, deque
 from math import isfinite
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from datetime import datetime, timedelta
 from time import mktime
 from statistics import median
@@ -13,6 +13,23 @@ METRICS = (('cost','평균 호출 비용','cost'),
 
 def valid(value):
     return type(value) in (int,float) and isfinite(value) and value >= 0
+
+
+def box_statistics(ordered):
+    """Exact quartiles/counts, with bounded representative outlier marks."""
+    q1,q3=sorted_quantile(ordered,.25),sorted_quantile(ordered,.75)
+    if not ordered:return dict(q1=None,q3=None,whisker_low=None,whisker_high=None,outliers=[],outlier_count=0)
+    spread=q3-q1
+    left=bisect_left(ordered,q1-1.5*spread);right=bisect_right(ordered,q3+1.5*spread)
+    count=left+len(ordered)-right
+    # Preserve both tails without sending every call through the UI snapshot.
+    marks=[]
+    for start,end in ((0,left),(right,len(ordered))):
+        size=end-start
+        indices=range(size) if size<=64 else (round(i*(size-1)/63) for i in range(64))
+        marks.extend(ordered[start+i] for i in indices)
+    return dict(q1=q1,q3=q3,whisker_low=ordered[left],whisker_high=ordered[right-1],
+                outliers=sorted(set(marks)),outlier_count=count)
 
 
 def calendar_edges(start,end,unit):
@@ -149,7 +166,7 @@ class PerformanceTrends:
                     distribution=dict(median=sorted_quantile(ordered,.5),
                         p10=sorted_quantile(ordered,.1) if len(ordered)>=10 else None,
                         p90=sorted_quantile(ordered,.9) if len(ordered)>=10 else None,
-                        minimum=min(ordered,default=None),maximum=max(ordered,default=None))
+                        minimum=min(ordered,default=None),maximum=max(ordered,default=None),**box_statistics(ordered))
                     series=lines[(model,mode)]
                     complete=a>=start and z<=min(now,end)
                     previous=series[-1] if series else None

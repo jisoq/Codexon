@@ -1941,7 +1941,7 @@
   "가격 별칭: gpt-daybreak-blue-latest → gpt-5.6-sol": "Price alias: gpt-daybreak-blue-latest → gpt-5.6-sol",
   "업데이트 자동 확인": "Check for updates automatically",
   "앱 실행 중 6시간 간격으로 새 버전을 확인합니다. 설치 파일은 자동으로 다운로드하지 않습니다.": "Check for new versions every 6 hours while the app is running. Installers are not downloaded automatically.",
-  "새 버전 {version} 사용 가능. 업데이트 확인 후 설치할 수 있습니다.": "Version {version} is available. Check for updates to review and install it.",
+  "새 버전 {version} 사용 가능. 설정에서 바로 설치할 수 있습니다.": "Version {version} is available. Install it directly from Settings.",
   "수집 시작 중": "Starting collection",
   "수집기 실행 정보 확인 대기": "Waiting for collector identity",
   "사용량 수집을 확인하지 못했습니다. 문제 해결 화면에서 오류를 확인해 주세요.": "Usage collection could not be verified. Check the error in Troubleshooting.",
@@ -2058,5 +2058,18 @@
   "{years}년, 현지 시간": "{years}, local time",
   "{days}일 {hours}시간": "{days} days {hours} hours",
   "{hours}시간 {minutes}분": "{hours} hours {minutes} minutes",
-  "{minutes}분": "{minutes} minutes"
+  "{minutes}분": "{minutes} minutes",
+  "표본 4개 미만: 분포 해석 주의": "Fewer than 4 samples: interpret the distribution with care",
+  "일별 호출 비용 분포": "Daily call cost distribution",
+  "일별 출력 속도 분포": "Daily output speed distribution",
+  "일별 호출 소요시간 분포": "Daily call duration distribution",
+  "일별 세션 캐시 적중률 분포": "Daily session cache hit rate distribution",
+  "일별 추론 토큰 분포": "Daily reasoning token distribution",
+  "일별 입력 토큰 분포": "Daily input token distribution",
+  "아래 수염": "Lower whisker",
+  "위 수염": "Upper whisker",
+  "수염 밖 관측값": "Observations beyond whiskers",
+  "분위수: 정렬한 표본 사이 선형 보간": "Quantiles: linear interpolation between sorted samples",
+  "상자: 중앙 50%   굵은 선: 중앙값   수염: 1.5×IQR 범위 내 실제 값   점: 수염 밖 관측값": "Box: central 50%   Thick line: median   Whiskers: observations within 1.5×IQR fences   Dots: observations beyond whiskers",
+  "IQR = Q3 − Q1. 수염 밖 관측값이 많으면 대표값을 표시합니다. 호출 수는 일별 합계입니다.": "IQR = Q3 − Q1. Dense observations beyond whiskers use representative marks. Call counts remain daily totals."
 }

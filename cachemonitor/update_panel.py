@@ -48,6 +48,8 @@ class UpdatePanel(Group):
         self.metadata_pending=False
         self.proxy_update={}
         self.pending_plan=None
+        self.discovered_offer=None
+        self.prepare_confirmation=False
         self.confirming=False
         self.checking=False
         self.operation_error=False
@@ -108,8 +110,28 @@ class UpdatePanel(Group):
         self.launch_operation(action)
 
     def bind_monitor(self,monitor):
+        if self.monitor:
+            self.monitor.manual_finished.disconnect(self.metadata_received)
+            self.monitor.available.disconnect(self.release_discovered)
         self.monitor=monitor
         monitor.manual_finished.connect(self.metadata_received)
+        monitor.available.connect(self.release_discovered)
+
+    def release_discovered(self,release):
+        if self.operation or self.confirming or self.metadata_pending or self.closing():return
+        if not release:
+            if self.offer is not None and self.offer is self.discovered_offer:
+                self.offer=None;self.discovered_offer=None;self.execute.hide()
+                self.app_state.setText('확인 전');self.app_state.put(color='muted')
+                self.status.setText('');self.checked.setText('')
+            return
+        if self.offer and self.offer.get('release')==release:return
+        # Metadata alone can offer installation. Local services are inspected only
+        # after the user clicks Install, and the same release reaches confirmation.
+        self.discovered_offer=dict(kind='app',release=release,connections=None)
+        self.show_plan(self.discovered_offer,checked_at=self.monitor.timestamp('lastSuccess'))
+        self.operation_error=False;self.error_detail.hide()
+        self.status.put(color='ink')
 
     def metadata_received(self,result):
         if not self.metadata_pending:return
@@ -181,31 +203,47 @@ class UpdatePanel(Group):
             return
         self.status.setText('업데이트를 취소했습니다.')
         self.button.setEnabled(True)
+        self.execute.setEnabled(True)
 
     def finished(self):
         operation=self.operation;self.operation=None
         if operation:operation.deleteLater()
         plan=self.pending_plan;self.pending_plan=None
         if plan:
-            from datetime import datetime
-            from .version import VERSION
-            self.offer=plan
-            self.app_state.setText('↻ '+tr('업데이트 가능') if plan['kind']=='app' else '✓ '+tr('최신 버전'))
-            self.app_state.put(color='warning' if plan['kind']=='app' else 'success')
-            self.proxy_state.setText(tr(plan.get('reason','앱 업데이트 후 프록시 확인')))
-            self.proxy_state.put(color='warning' if plan['kind']=='proxy' else 'muted')
-            self.checked.setText(tr('최근 확인')+' '+datetime.now().strftime('%H:%M'))
-            self.last_success=dict(time=datetime.now().strftime('%Y-%m-%d %H:%M'),
-                app=tr('업데이트 가능' if plan['kind']=='app' else '최신 버전'),
-                proxy=tr(plan.get('reason','앱 업데이트 후 프록시 확인')))
-            self.execute.setText('업데이트 설치' if plan['kind']=='app' else '프록시 재시작')
-            self.execute.setVisible(plan['kind'] in ('app','proxy'))
-            self.status.setText(plan.get('reason','업데이트 가능' if plan['kind']=='app' else '설치할 새 버전이 없습니다.'))
+            self.show_plan(plan)
+        if self.prepare_confirmation:
+            self.prepare_confirmation=False
+            if plan and plan['kind'] in ('app','proxy') and not self.closing():
+                self.confirming=True;self.confirm_install(plan)
+                return
         self.button.setEnabled(True)
         self.execute.setEnabled(True)
 
+    def show_plan(self,plan,*,checked_at=None):
+        from datetime import datetime
+        checked=datetime.fromtimestamp(checked_at) if checked_at else datetime.now()
+        self.offer=plan
+        self.app_state.setText('↻ '+tr('업데이트 가능') if plan['kind']=='app' else '✓ '+tr('최신 버전'))
+        self.app_state.put(color='warning' if plan['kind']=='app' else 'success')
+        self.proxy_state.setText(tr(plan.get('reason','앱 업데이트 후 프록시 확인')))
+        self.proxy_state.put(color='warning' if plan['kind']=='proxy' else 'muted')
+        self.checked.setText(tr('최근 확인')+' '+checked.strftime('%Y-%m-%d %H:%M'))
+        self.last_success=dict(time=checked.strftime('%Y-%m-%d %H:%M'),
+            app=tr('업데이트 가능' if plan['kind']=='app' else '최신 버전'),
+            proxy=tr(plan.get('reason','앱 업데이트 후 프록시 확인')))
+        self.execute.setText('업데이트 설치' if plan['kind']=='app' else '프록시 재시작')
+        self.execute.setVisible(plan['kind'] in ('app','proxy'))
+        self.status.setText(plan.get('reason','업데이트 가능' if plan['kind']=='app' else '설치할 새 버전이 없습니다.'))
+
     def request_install(self):
         if self.operation or self.confirming or self.metadata_pending or not self.offer:return
+        if self.offer is self.discovered_offer:
+            from .app_update import check_update
+            release=self.offer['release']
+            self.prepare_confirmation=True
+            self.run_operation(lambda:check_update(self.status_progress,self.manager,release=release))
+            self.checking=True
+            return
         self.confirming=True
         self.button.setEnabled(False)
         self.confirm_install(self.offer)
