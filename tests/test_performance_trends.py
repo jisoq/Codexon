@@ -43,6 +43,82 @@ def test_metrics_equal_session_weight_speed_and_missing():
     assert panel(data,'reasoning:high')['n']==13
     assert 'cost_total' not in {p['key'] for p in data['panels']}
     assert panel(data,'cost')['lines'][0]['points'][0]['coverage']==(13,14)
+    stats=cache['lines'][0]['points'][0]['distribution']
+    assert (stats['q1'],stats['median'],stats['q3'])==(30,50,70)
+
+
+def test_box_statistics_exact_quartiles_whiskers_and_bounded_outliers():
+    from cachemonitor.performance_trends import box_statistics
+    stats=box_statistics([1,2,3,4,5,100])
+    assert (stats['q1'],stats['q3'],stats['whisker_low'],stats['whisker_high'])==(2.25,4.75,1,5)
+    assert stats['outliers']==[100] and stats['outlier_count']==1
+    assert box_statistics([])['q1'] is None
+    for values in ([7],[7]*20):
+        stats=box_statistics(values)
+        assert stats['q1']==stats['q3']==stats['whisker_low']==stats['whisker_high']==7
+        assert not stats['outliers'] and stats['outlier_count']==0
+    stats=box_statistics([0]*10000+list(range(1,2001)))
+    assert stats['outlier_count']==2000 and len(stats['outliers'])<=128
+    assert stats['outliers'][0]==1 and stats['outliers'][-1]==2000
+
+
+@pytest.mark.parametrize('language',['ko','en'])
+def test_single_model_daily_boxes_selection_inspection_and_shared_axis(tmp_path,language):
+    from datetime import datetime
+    from PySide6.QtCore import QSettings,QObject,Qt
+    from cachemonitor.performance_panel import PerformancePanel
+    from cachemonitor.quick_qa import mount,dispose,render_plot,click
+    from cachemonitor.i18n import set_language
+    set_language(language)
+    base=datetime(2026,10,1).timestamp();rows=[]
+    for day in (0,2):
+        for model in ('m','other'):
+            for mode in ('Standard','Fast'):
+                for effort in ('low','high'):
+                    for value in ([1,2,3,4,5,100] if day==0 else [7]):
+                        scale=(1000 if model=='other' else 2 if mode=='Fast' else 1)
+                        rows.append(row(len(rows),ts=base+day*86400+3600+len(rows),model=model,service_tier=mode,
+                                        effort=effort,cost=value*scale,reasoning=value*scale*(10 if effort=='high' else 1)))
+    rows.append(row(len(rows),ts=base+3600,cost=None,reasoning=None))
+    source=engine(rows);projector=PerformanceTrends()
+    owner=SimpleNamespace(settings=QSettings(str(tmp_path/'boxes.ini'),QSettings.IniFormat))
+    ui=PerformancePanel(owner)
+    def refresh():ui.apply(projector.query(source,query(now=base+3*86400,time_range=ui.time_range,granularity=ui.granularity)))
+    owner.render=refresh;refresh();host=mount(ui,1440,940)
+    try:
+        ui.choose_granularity('week');assert ui.granularity=='week'
+        ui.model_choice.choose(ui.model_choice.findData('m'))
+        plot=ui.plots['cost'];assert ui.granularity=='day' and plot.boxplot
+        assert not ui.granularity_buttons['week'].isEnabled() and not ui.granularity_buttons['month'].isEnabled()
+        assert {p['model'] for p in plot.rows}=={'m'} and len(plot.rows)==4
+        assert not ui.plots['count'].boxplot and ui.plots['session_cache'].boxplot
+        assert plot.bounds[1]<1000 and plot.bounds[1]>200 and not plot.strip
+        item=render_plot(host,plot);item.findChild(QObject,'plotHover').setProperty('enabled',False)
+        standard=next(p for p in plot.rows if p['service_tier']=='Standard' and p['calls']>1)
+        fast=next(p for p in plot.rows if p['service_tier']=='Fast' and p['calls']>1)
+        assert plot.xy(standard).x()<plot.xy(fast).x()
+        click(host,item,plot.xy(standard).x(),plot.xy(standard).y())
+        assert ui.inspected==(standard,'cost') and ui.details.value.text()=='3.5'
+        assert not ui.details.comparison.isVisible() and ui.details.box_text.isVisible()
+        assert ui.details.sample_values['missing'].text()=='1'
+        assert plot.nearest(plot.x(base+86400+4000),plot.y(3)) is None
+        from PySide6.QtGui import QFontMetrics
+        labels=[text for _,text,_ in plot.time_labels(QFontMetrics(plot.font()))]
+        assert all(':' not in text for text in labels) and '10/02' in labels
+        render_plot(host,ui.labels['cost'])
+        assert host.quick.grabFramebuffer().save(str(tmp_path/('daily-boxes-both-'+language+'.png')))
+        ui.choose_mode('Standard');assert {p['service_tier'] for p in plot.rows}=={'Standard'}
+        assert plot.bounds[1]<200
+        reasoning=ui.plots['reasoning'];bounds=reasoning.bounds
+        ui.choose_reasoning_effort('low');assert reasoning.bounds==bounds
+        ui.choose_reasoning_effort('high');assert reasoning.bounds==bounds
+        plot.key(Qt.Key_Right)
+        assert ui.inspected[1]=='cost'
+        assert host.quick.grabFramebuffer().save(str(tmp_path/('daily-boxes-'+language+'.png')))
+        assert not host.qml_errors
+        ui.add_model('other');assert not plot.boxplot and ui.granularity_buttons['week'].isEnabled()
+        ui.choose_granularity('week');assert ui.granularity=='week'
+    finally:dispose(host);set_language('ko')
 
 def test_bounded_outliers_and_corrections():
     rows=[row(i,ts=1000+i*.001) for i in range(2000)]
@@ -115,9 +191,16 @@ def test_million_calls_keep_anomalies_and_bounded_frames(tmp_path):
             began=time.perf_counter();chart.nearest(xy.x(),xy.y());selection.append((time.perf_counter()-began)*1000)
             began=time.perf_counter();chart.update();app.processEvents();host.quick.grabFramebuffer();frames.append((time.perf_counter()-began)*1000)
         report=dict(calls=count,points=len(points),preparation_seconds=elapsed,selection_p95_ms=sorted(selection)[23],frame_p95_ms=sorted(frames)[23])
+        ui.solo('m');render_plot(host,chart);box_frames=[]
+        assert chart.boxplot and chart.bounds[1]>100
+        assert sum(p['distribution']['outlier_count'] for p in chart.rows)==1
+        for _ in range(25):
+            began=time.perf_counter();chart.update();app.processEvents();host.quick.grabFramebuffer();box_frames.append((time.perf_counter()-began)*1000)
+        report['box_frame_p95_ms']=sorted(box_frames)[23]
         (tmp_path/'benchmark.json').write_text(json.dumps(report,indent=2),encoding='utf-8')
         assert report['selection_p95_ms']<50,report
         assert report['frame_p95_ms']<100,report
+        assert report['box_frame_p95_ms']<100,report
         assert not host.qml_errors
     finally:dispose(host)
 
@@ -372,6 +455,13 @@ def test_dense_workspace_units_and_hover_analysis(tmp_path,shell):
         assert abs(plot.y(plot.bounds[1])-plot.y(plot.bounds[0]))>=290
         from cachemonitor.theme import shared_theme
         assert shared_theme().model_mode_color(models[0],'Standard')!=shared_theme().model_mode_color(models[0],'Fast')
+        assert plot.boxplot and not plot.strip
+        assert {p['model'] for p in plot.rows}=={models[0]}
+        assert all(plot.bounds[0]<=p['distribution']['minimum']<=p['distribution']['maximum']<=plot.bounds[1] for p in plot.rows)
+        assert not ui.granularity_buttons['week'].isEnabled()
+        assert host.quick.grabFramebuffer().save(str(tmp_path/'daily-boxes-dense.png'))
+        # Multiple-model comparison retains the original trend/causal-outlier flow.
+        ui.add_model(models[1]);assert not plot.boxplot
         assert plot.bounds[1]<plot.data['high']*.6
         assert all(p['kind']=='trend' for p in plot.rows)
         assert 'cost_total' not in ui.plots
@@ -438,7 +528,8 @@ def test_interval_analysis_distribution_totals_missing_and_weighted_speed():
     rows=[row(i,cost=float(i)) for i in range(10)]+[row(10,cost=None)]
     point=panel(PerformanceTrends().query(engine(rows),query()),'cost')['lines'][0]['points'][0]
     assert point['coverage']==(10,11)
-    assert point['distribution']==dict(median=4.5,p10=.9,p90=8.1,minimum=0.,maximum=9.)
+    assert point['distribution']==dict(median=4.5,p10=.9,p90=8.1,minimum=0.,maximum=9.,
+        q1=2.25,q3=6.75,whisker_low=0.,whisker_high=9.,outliers=[],outlier_count=0)
     assert point['totals']=={'sum':45.} and point['sessions']==1
     rows=[row(0,output=100,completion_latency_ms=1000,output_speed=100),
           row(1,output=200,completion_latency_ms=4000,output_speed=50),row(2,output_speed=None)]

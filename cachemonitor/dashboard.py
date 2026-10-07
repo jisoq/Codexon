@@ -688,7 +688,7 @@ class Dashboard(TrayWindow):
         if not release:return
         from .i18n import formatted
         tag=release['tag_name'];version=tag.lstrip('v')
-        self.update_panel.discovery.setText(formatted('새 버전 {version} 사용 가능. 업데이트 확인 후 설치할 수 있습니다.',version=version))
+        self.update_panel.discovery.setText(formatted('새 버전 {version} 사용 가능. 설정에서 바로 설치할 수 있습니다.',version=version))
         monitor=self.update_monitor
         from .app_update import version_parts
         try:already_notified=version_parts(self.settings.value('updates/notifiedVersion',''))>=version_parts(version)
@@ -696,7 +696,7 @@ class Dashboard(TrayWindow):
         if monitor.enabled and self.notification_master.isChecked() and not already_notified:
             self.settings.setValue('updates/notifiedVersion',version);self.settings.sync()
             self.show_tray_notification('update','Codexon: '+tr('업데이트 가능'),
-                formatted('새 버전 {version} 사용 가능. 업데이트 확인 후 설치할 수 있습니다.',version=version),QSystemTrayIcon.Information)
+                formatted('새 버전 {version} 사용 가능. 설정에서 바로 설치할 수 있습니다.',version=version),QSystemTrayIcon.Information)
 
     def open_notification_details(self):
         self.open_settings();self.notification_details.toggle.setChecked(True);self.settings_page.reveal('notifications',self.notification_details)
