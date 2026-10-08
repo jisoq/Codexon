@@ -567,6 +567,17 @@ def test_dense_workspace_units_and_hover_analysis(tmp_path,shell):
         for unit in ('week','month','day'):
             # Resolve pending scroll/layout changes before taking click coordinates.
             click(host,render_plot(host,ui.granularity_buttons[unit]))
+            if ui.granularity!=unit or projector.view['granularity']!=unit:
+                from pathlib import Path
+                from PySide6.QtCore import QPointF
+                from cachemonitor.quick_qa import scene_view
+                folder=Path('artifacts/verification/performance-unit-failure');folder.mkdir(parents=True,exist_ok=True)
+                host.quick.grabFramebuffer().save(str(folder/'scene.png'))
+                states={}
+                for key,node in ui.granularity_buttons.items():
+                    item=control(host,node);point=item.mapToScene(QPointF(item.width()/2,item.height()/2))
+                    states[key]=dict(x=point.x(),y=point.y(),width=item.width(),height=item.height(),visible=item.isVisible(),enabled=item.isEnabled(),checked=item.property('checked'))
+                print('UNIT FAILURE',dict(wanted=unit,actual=ui.granularity,states=states,window=[host.width(),host.height()],quick=[host.quick.width(),host.quick.height()],modal=str(app.activeModalWidget()),qml=host.qml_errors))
             assert ui.granularity==unit and projector.view['granularity']==unit
             assert ui.granularity_buttons[unit].isChecked()
             assert PerformancePanel(owner).granularity==unit
