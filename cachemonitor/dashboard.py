@@ -31,7 +31,7 @@ from .notifications import ConfirmedNotifications
 from .ui_details import Details, strong, recorded, record_issues, price_reason, observed_transport, model_comparison
 from .theme import shared_theme
 from .version import VERSION
-from .i18n import tr, Verbatim
+from .i18n import tr, Verbatim, formatted
 from .workload import call_count
 from .history_navigation import HistoryNavigation, HistoryWorkspace, HistoryTree
 
@@ -133,6 +133,7 @@ class Dashboard(TrayWindow):
         self.quitting=False;self.worker=None;self.engine=AnalysisEngine();self.async_mode=start_worker
         self.analysis=analyze([]);self.analysis_pending=False;self.analysis_errors=[];self.analysis_error_history=[]
         self.client_cache=BoundedCache(6,160000);self.request_id=0;self.view_result=None;self.applied_key=None
+        self.display_identity=None;self.pending_retained=False
         self.lookup={'sessions':{},'turns':{},'session_turns':{}};self.page_frames={}
         self.started_at=time.time();self.alerted={};self.confirmed_notifications=ConfirmedNotifications()
         self.current_page=0;self.restoring=True;self.back_stack=[];self.temporary_context=None;self.navigation_signature=None
@@ -145,8 +146,10 @@ class Dashboard(TrayWindow):
         self.record_request=0;self.record_status='';self.aggregate_records=[];self.aggregate_selection=None
         self.interaction_time=0;self.deferred_result=None;self.defer_timer=QTimer(self)
         self.defer_timer.setSingleShot(True);self.defer_timer.timeout.connect(self.apply_deferred)
-        self.pending_timer=QTimer(self);self.pending_timer.setSingleShot(True);self.pending_timer.setInterval(250)
+        self.pending_timer=QTimer(self);self.pending_timer.setSingleShot(True);self.pending_timer.setInterval(150)
         self.pending_timer.timeout.connect(self.show_analysis_pending)
+        self.slow_timer=QTimer(self);self.slow_timer.setSingleShot(True);self.slow_timer.setInterval(5000)
+        self.slow_timer.timeout.connect(self.show_analysis_slow)
         QApplication.instance().installEventFilter(self)
         shared_theme().configure(self.settings.value('ui/theme',self.settings.value('overlay/theme','codex')))
         self.setWindowTitle('Codexon');self.setWindowIcon(tray_icon());self.resize(1440,940)
@@ -178,6 +181,7 @@ class Dashboard(TrayWindow):
         self.history_path=Row();self.history_path.setSpacing(4);self.navigation_row.addWidget(self.history_path,1)
         self.heading=label(TITLES[0],'heading');header.addWidget(self.heading);header.addStretch()
         self.pending_label=label('','muted');self.pending_label.setFixedHeight(36);self.pending_label.setMaximumWidth(280);header.addWidget(self.pending_label)
+        self.retry_button=Button('다시 시도');self.retry_button.clicked.connect(self.retry_analysis);self.retry_button.hide();header.addWidget(self.retry_button)
         self.price_button=Button('API 가격표');self.price_button.clicked.connect(self.show_prices);header.addWidget(self.price_button);layout.addLayout(header)
         self.common_filters=Row();self.common_filters.put(flow=True,spacing=8)
         self.home=combo([('모든 Codex 홈','')]+[(Verbatim(h),h) for h in homes]);self.home.setMinimumWidth(205)
@@ -194,6 +198,16 @@ class Dashboard(TrayWindow):
             node.setFixedWidth(width)
         self.scope_note=label('수집 중','muted');self.scope_note.put(fontSize=12);self.scope_note.setFixedHeight(18);layout.addWidget(self.scope_note)
         self.pages=Stack();self.pages.put(deferPages=True);layout.addWidget(self.pages,1);self.scrollers={}
+        self.analysis_notice=Group();self.analysis_notice.setObjectName('analysis-notice');self.analysis_notice.hide()
+        notice_layout=Column(self.analysis_notice);notice_layout.addStretch()
+        self.analysis_notice_body=Group();notice_layout.addWidget(self.analysis_notice_body);notice_layout.addStretch()
+        notice_body=Column(self.analysis_notice_body);notice_body.setSpacing(12)
+        self.analysis_notice_title=label('','section',True);self.analysis_notice_title.setAlignment(Qt.AlignHCenter)
+        self.analysis_notice_detail=label('','muted',True);self.analysis_notice_detail.setAlignment(Qt.AlignHCenter)
+        notice_body.addWidget(self.analysis_notice_title);notice_body.addWidget(self.analysis_notice_detail)
+        notice_actions=Row();notice_actions.addStretch()
+        self.notice_retry=Button('다시 시도');self.notice_retry.clicked.connect(self.retry_analysis);notice_actions.addWidget(self.notice_retry);notice_actions.addStretch()
+        notice_body.addLayout(notice_actions);layout.addWidget(self.analysis_notice,1)
         self.build_overview();self.build_compare();self.build_explorer()
         from .quota_panel import QuotaPanel
         self.quota_panel=QuotaPanel(self.settings);quota_scroll=Scroll();quota_scroll.put(fillViewport=True)
@@ -659,7 +673,8 @@ class Dashboard(TrayWindow):
         self.sync_history_filters()
         self.common_filters.setVisible(index<3);self.scope_note.setVisible(index<3)
         for node in (self.model,self.effort,self.mode):node.setVisible(index in (0,2))
-        self.price_button.setVisible(index!=4);self.pending_timer.stop();self.pending_label.hide();self.pages.show()
+        self.request_id+=1;self.analysis_pending=False;self.deferred_result=None;self.defer_timer.stop()
+        self.price_button.setVisible(index!=4);self.clear_analysis_notice()
         self.update_navigation()
         self.render();self.save_preferences()
 
@@ -773,20 +788,66 @@ class Dashboard(TrayWindow):
                 from .dashboard_views import refresh_bounds
                 value=refresh_bounds(cached[0],q)
                 if self.view_result is value and automatic:
-                    self.analysis_pending=False
+                    self.finish_analysis_loading(value,q)
                     return
                 self.apply_result(value,q,automatic)
                 return
             self.analysis_pending=True
-            if not automatic:
-                self.pending_timer.start()
+            self.begin_analysis_loading(q)
             if self.worker:self.worker.request(self.request_id,q,logical)
         else:
             self.apply_result(self.engine.page_query(q),q,automatic)
 
+    def query_identity(self,query):
+        """User-selected scope, independent of a new snapshot or table viewport."""
+        ignored={'now','loading','table_windows','plot_width'}
+        if query['period']!='custom':ignored.update(('start','end'))
+        identity={k:v for k,v in query.items() if k not in ignored}
+        if query['page']==5 and self.performance_panel.follow_latest:
+            identity['time_range']=('latest',self.performance_panel.window_span)
+        return json.dumps(identity,sort_keys=True)
+
+    def clear_analysis_notice(self):
+        self.pending_timer.stop();self.slow_timer.stop();self.pending_label.hide();self.retry_button.hide()
+        self.analysis_notice.hide();self.pages.show();self.scope_note.setVisible(self.current_page<3)
+
+    def begin_analysis_loading(self,query):
+        self.clear_analysis_notice()
+        self.pending_retained=self.display_identity==self.query_identity(query)
+        if not self.pending_retained:
+            # Suppress empty charts immediately; delay only the loading text.
+            self.pages.hide();self.scope_note.hide();self.analysis_notice.show();self.analysis_notice_body.hide()
+        self.pending_timer.start();self.slow_timer.start()
+
+    def show_analysis_notice(self,title,detail,retry=False):
+        self.pages.hide();self.scope_note.hide();self.analysis_notice.show();self.analysis_notice_body.show()
+        self.analysis_notice_title.setText(title);self.analysis_notice_detail.setText(detail)
+        self.notice_retry.setVisible(retry)
+
     def show_analysis_pending(self):
-        if self.analysis_pending:
-            self.pending_label.setText('계산 중');self.pending_label.setToolTip('');self.pending_label.show()
+        if not self.analysis_pending or self.current_page in (3,4):return
+        if self.pending_retained:
+            self.pending_label.setText('최신 기록 반영 중');self.pending_label.setToolTip('');self.pending_label.show()
+        else:
+            self.show_analysis_notice(formatted('{page} 불러오는 중',page=tr(TITLES[self.current_page])),
+                                      '조회 결과를 준비하고 있습니다.')
+
+    def show_analysis_slow(self):
+        if not self.analysis_pending or self.current_page in (3,4):return
+        if self.pending_retained:
+            self.pending_label.setText('최신 기록 반영 중 / 계산 계속 진행 중')
+        else:
+            self.analysis_notice_detail.setText('계산이 계속 진행 중입니다. 다른 탭을 이용할 수 있습니다.')
+
+    def finish_analysis_loading(self,result,query):
+        self.analysis_pending=False;self.clear_analysis_notice()
+        if self.snapshot.get('index',{}).get('loading') and not result['analysis']['response_count']:
+            self.display_identity=None
+            self.show_analysis_notice('사용 기록 수집 중','기록을 읽고 있습니다. 수집이 끝나면 자동으로 표시됩니다.')
+        else:self.display_identity=self.query_identity(query)
+
+    def retry_analysis(self):
+        self.client_cache.clear();self.render()
 
     def scope_text(self,q):
         if self.temporary_context and q['page']==2:
@@ -842,13 +903,14 @@ class Dashboard(TrayWindow):
         if query['page']!=self.current_page:return
         if automatic and (not self.isVisible() or self.isMinimized()):
             self.analysis_pending=False;self._display_dirty=True;return
-        self.analysis_pending=False;self.pending_timer.stop();self.pending_label.hide();self.pages.show()
+        self.finish_analysis_loading(result,query)
         if query['page']==5:
             self.view_result=result;self.performance_panel.apply(result['performance'])
             restored=getattr(self,'_restore_positions',None)
             if restored:
                 position=restored.get('scrolls',{}).get('5',restored.get('scrolls',{}).get(5,0))
                 self.scrollers[5].verticalPosition.setValue(position);self._restore_positions=None
+            self.refresh_after_analysis()
             return
         self.view_result=result;self.applied_key=result['key'];self.analysis=result['analysis'];self.lookup=result['lookup']
         self.table.live_update=automatic
@@ -884,14 +946,22 @@ class Dashboard(TrayWindow):
                 wanted=tuple(selected) if isinstance(selected,(list,tuple)) else selected
                 self.table.select_row(next((i for i,row in enumerate(self.record_rows,getattr(self.record_rows,'start',0)) if self.table.row_key(row)==wanted),-1))
         self.save_preferences()
+        # Comparison setup may resolve default targets while applying the result.
+        if self.display_identity is not None:self.display_identity=self.query_identity(self.query())
+        self.refresh_after_analysis()
+
+    def refresh_after_analysis(self):
         if getattr(self,'_refresh_after_pending',False):
             self._refresh_after_pending=False;QTimer.singleShot(0,lambda:self.render(automatic=True))
 
     def analysis_failed(self,error):
         self.client_cache.clear();self.pending_logical=None
-        self.pending_timer.stop()
+        self.request_id+=1;self.deferred_result=None;self.defer_timer.stop();self.clear_analysis_notice()
         self.analysis_pending=False;self.analysis_errors=[error];self.analysis_error_history=(self.analysis_error_history+[error])[-10:]
-        self.pending_label.setText('갱신 실패 · 이전 결과 표시' if self.view_result else '계산 실패 · 수집 상태 확인');self.pending_label.setToolTip('');self.pending_label.show();self.pages.show()
+        if self.current_page not in (3,4):
+            if self.display_identity==self.query_identity(self.query()):
+                self.pending_label.setText('갱신 실패 / 이전 결과 표시');self.pending_label.setToolTip('');self.pending_label.show();self.retry_button.show()
+            else:self.show_analysis_notice('기록을 불러오지 못했습니다','잠시 후 다시 시도해 주세요.',retry=True)
         self.render_diagnostics()
 
     def eventFilter(self,watched,event):

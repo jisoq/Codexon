@@ -245,10 +245,33 @@ def test_dynamic_axes_fit_values_and_ignore_missing():
     assert dynamic_bounds([0])[0]<0<dynamic_bounds([0])[1]
     assert dynamic_bounds([0,1])[0]<0
     from cachemonitor.quota_panel import remaining_axis
-    assert remaining_axis([dict(remaining=0)])[0]<0
+    assert remaining_axis([dict(remaining=0)])[0]==0
     assert remaining_axis([dict(remaining=100)])[1]>100
     assert remaining_axis([dict(remaining=None)])[0:2]==(0,1)
     assert comparison_axis([{'value':98},{'value':99}], 'cache_ratio')[0]>90
+
+
+@pytest.mark.parametrize('cumulative',[False,True])
+def test_quota_axes_never_pad_below_zero_and_zero_points_remain_selectable(cumulative):
+    app=QApplication.instance() or QApplication([])
+    rows=[dict(at=1000+i*60,remaining=i,cycle_cost=i*4,cycle_value=i*100,completed_cost=i*2,
+               connect=bool(i),reset_kind=None,label=str(i)) for i in range(4)]
+    series=prepare_series(rows);series['cumulative']=cumulative
+    chart=QuotaHistory();chart.money=True;chart.set_series(series)
+    host=mount(chart,1120,440)
+    try:
+        render_plot(host,chart)
+        assert chart.height()==440
+        for key in ('remaining','cycle_cost','cycle_value','completed_cost'):
+            low,high=chart.bounds(key)
+            assert low==0 and high>low
+            for i in range(len(rows)):
+                point=chart.point(i,key)
+                if point is not None:
+                    assert chart.box.contains(point)
+                    assert chart.index_at(point.x(),point.y())==i
+        assert not host.qml_errors
+    finally:dispose(host)
 
 
 def test_cumulative_and_cost_axes_do_not_force_zero():
@@ -266,4 +289,32 @@ def test_cumulative_and_cost_axes_do_not_force_zero():
         for i in range(4):
             for key in ('remaining','cycle_cost','cycle_value'):
                 assert chart.box.contains(chart.point(i,key))
+    finally:dispose(host)
+
+
+def test_live_cost_correction_refreshes_hover_without_pointer_movement():
+    from PySide6.QtCore import QObject
+    app=QApplication.instance() or QApplication([])
+    rows=[dict(at=1000+i*60,remaining=90-i,cycle_cost=i*10,cycle_value=1000+i*50,
+               connect=bool(i),reset_kind=None,label=f'Observation {i}') for i in range(4)]
+    chart=QuotaHistory();chart.money=True;chart.set_rows(rows)
+    host=mount(chart,1120,450)
+    try:
+        plot=render_plot(host,chart)
+        plot.findChild(QObject,'plotHover').setProperty('enabled',False)
+        plot.showTip(chart.x_at(2),chart.box.center().y())
+        assert not plot.detailPinned and plot.detail['items'][1]['value']=='$20.00'
+        app.processEvents();host.quick.grabFramebuffer()
+        values=[item for item in walk(host.quick.quickWindow().contentItem())
+                if item.objectName()=='quotaDetailValue' and item.isVisible()]
+        # Moving within one observation should reposition the existing card.
+        plot.showTip(chart.x_at(2)+1,chart.box.center().y())
+        app.processEvents();host.quick.grabFramebuffer()
+        assert values==[item for item in walk(host.quick.quickWindow().contentItem())
+                        if item.objectName()=='quotaDetailValue' and item.isVisible()]
+        corrected=[dict(r) for r in rows];corrected[2]['cycle_cost']=23
+        chart.set_rows(corrected);app.processEvents();host.quick.grabFramebuffer()
+        assert plot.detail['at']==rows[2]['at']
+        assert plot.detail['items'][1]['value']=='$23.00'
+        assert not plot.detailPinned and not host.qml_errors
     finally:dispose(host)

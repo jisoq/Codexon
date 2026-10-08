@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 import time
 
-from PySide6.QtCore import Qt, QTimer, Signal, QRectF, QPointF
+from PySide6.QtCore import Qt, QTimer, Signal, QRectF, QPointF, QDateTime, QTimeZone
 from PySide6.QtGui import QColor, QPen, QPolygonF
 from .presentation import Button, Choice, Column, Group, Row, Text, Toggle
 from .table_model import Cell, Header, Table
@@ -31,9 +31,20 @@ def home_key(value):
     return os.path.normcase(str(Path(value).resolve())) if value else None
 
 
+def reset_time(stamp, zone):
+    return QDateTime.fromSecsSinceEpoch(int(stamp),zone) if stamp else None
+
+
+def reset_zone_label(zone):
+    name=bytes(zone.id()).decode('utf-8')
+    if name=='Asia/Seoul':return 'KST (UTC+09:00)'
+    if name in ('UTC','Etc/UTC','Etc/GMT'):return 'UTC'
+    return name.replace('_',' ')
+
+
 def remaining_axis(rows):
-    from .charts import dynamic_bounds
-    low,high=dynamic_bounds(r.get('remaining') for r in rows)
+    from .quota_chart import quota_bounds
+    low,high=quota_bounds(r.get('remaining') for r in rows)
     return low,high,(high-low)/4
 
 
@@ -129,7 +140,8 @@ class QuotaPanel(Group):
         self.status=Text()
         self.status.put(color='error',fontSize=13,wrap=False);self.status.setFixedHeight(24)
         heading.addWidget(self.status,1)
-        current=self.current_row=Row();current.put(collapseBelow=1,columns=2);current.setSpacing(16)
+        self.current_row=Group();self.current_row.put(background='surface',radius=6,border='border')
+        current=Column(self.current_row);current.setContentsMargins(18,12,18,10);current.setSpacing(12)
         self.current={}
         for mode,name in (('five_hour','5시간'),('weekly','주간')):
             card=Group()
@@ -142,33 +154,43 @@ class QuotaPanel(Group):
             row.addWidget(label);row.addWidget(value);row.addLayout(detail,1)
             remaining_layout.addWidget(card)
             self.current[mode]={'card':card,'value':value,'bar':bar,'evidence':evidence}
-        self.credit_card=Group();self.credit_card.put(background='surface',radius=6,border='border')
-        credit_layout=Column(self.credit_card);credit_layout.setContentsMargins(20,16,20,16);credit_layout.setSpacing(10)
-        credit_title=Text('크레딧 잔액');credit_title.put(fontSize=14,color='muted')
-        self.credit_balance=Text('—');self.credit_balance.put(fontSize=28,bold=True,noElide=True)
-        self.credit_note=Text();self.credit_note.put(fontSize=13,color='muted',wrap=True)
-        credit_expiry=Text('만료일 정보 미제공');credit_expiry.put(fontSize=13,color='muted',wrap=True)
-        for node in (credit_title,self.credit_balance,self.credit_note,credit_expiry):credit_layout.addWidget(node)
-        credit_layout.addStretch()
-        current.addWidget(self.credit_card,1)
-        self.reset_card=Group();self.reset_card.put(background='surface',radius=6,border='border')
-        reset_layout=Column(self.reset_card);reset_layout.setContentsMargins(20,16,20,16);reset_layout.setSpacing(10)
-        reset_title=Text('사용 초기화권');reset_title.put(fontSize=14,color='muted',wrap=True)
-        self.reset_count=Text('—');self.reset_count.put(fontSize=28,bold=True,noElide=True)
+        self.credit_card=Group();self.credit_card.put(style='preferenceRow')
+        credit_layout=Row(self.credit_card);credit_layout.setContentsMargins(0,0,0,12);credit_layout.setSpacing(14)
+        credit_title=Text('크레딧 잔액');credit_title.put(fontSize=13,color='muted')
+        self.credit_balance=Text('—');self.credit_balance.put(fontSize=23,bold=True,noElide=True)
+        self.credit_note=Text();self.credit_note.put(fontSize=12,color='muted',wrap=True)
+        credit_expiry=Text('만료일 정보 미제공');credit_expiry.put(fontSize=12,color='muted',wrap=True)
+        credit_expiry.setAlignment(Qt.AlignRight)
+        for node in (credit_title,self.credit_balance,self.credit_note):credit_layout.addWidget(node)
+        credit_layout.addWidget(credit_expiry,1)
+        current.addWidget(self.credit_card)
+        self.reset_card=Group()
+        reset_layout=Column(self.reset_card);reset_layout.setSpacing(8)
+        reset_heading=Row();reset_heading.setSpacing(10)
+        reset_title=Text('사용 초기화권');reset_title.put(fontSize=14,bold=True)
+        self.reset_count=Text('—');self.reset_count.put(fontSize=18,bold=True,noElide=True)
+        reset_heading.addWidget(reset_title);reset_heading.addWidget(self.reset_count);reset_heading.addStretch()
+        self.reset_grants=Button('지급 정보 보기');self.reset_grants.put(role='quiet',fontSize=12)
+        self.reset_grants.setCheckable(True);self.reset_grants.setFixedHeight(28)
+        self.reset_grants.toggled.connect(self.render_reset_rows)
+        reset_heading.addWidget(self.reset_grants);reset_layout.addLayout(reset_heading)
+        self.reset_zone=Text();self.reset_zone.put(fontSize=11,color='muted',wrap=True);reset_layout.addWidget(self.reset_zone)
         self.reset_note=Text();self.reset_note.put(fontSize=13,color='muted',wrap=True)
-        for node in (reset_title,self.reset_count,self.reset_note):reset_layout.addWidget(node)
-        self.reset_rows=Row();self.reset_rows.setSpacing(12)
-        self.reset_cells=[]
-        for name in ('지급','만료','상태'):
-            column=Column();column.setSpacing(8)
-            label=Text(name);label.put(fontSize=12,color='muted')
-            body=Text();body.put(fontSize=12,wrap=True)
-            column.addWidget(label);column.addWidget(body)
-            self.reset_rows.addLayout(column,1);self.reset_cells.append(body)
+        reset_layout.addWidget(self.reset_note)
+        self.reset_rows=Row();self.reset_rows.setSpacing(8)
+        self.reset_primary=Row();self.reset_primary.put(collapseBelow=1,columns=3);self.reset_primary.setSpacing(12)
+        self.reset_rows.addLayout(self.reset_primary,1)
+        self.reset_more=Button();self.reset_more.put(role='quiet',fontSize=12)
+        self.reset_more.setFixedWidth(64);self.reset_more.setFixedHeight(28);self.reset_more.setCheckable(True)
+        self.reset_more.toggled.connect(self.render_reset_rows)
+        self.reset_rows.addWidget(self.reset_more)
         reset_layout.addLayout(self.reset_rows)
-        self.reset_zone=Text('현지 시간');self.reset_zone.put(fontSize=11,color='muted');reset_layout.addWidget(self.reset_zone)
-        current.addWidget(self.reset_card,1)
-        layout.addLayout(current)
+        self.reset_extra=Row();self.reset_extra.put(collapseBelow=1,columns=3);self.reset_extra.setSpacing(12)
+        reset_layout.addLayout(self.reset_extra)
+        self._reset_rows=[];self.reset_items=[]
+        self.render_reset_rows()
+        current.addWidget(self.reset_card)
+        layout.addWidget(self.current_row)
         self.current_empty=Text('한도를 조회하고 있습니다')
         self.current_empty.put(color='muted',fontSize=14)
         layout.addWidget(self.current_empty)
@@ -321,6 +343,52 @@ class QuotaPanel(Group):
         else:self.render(automatic=True)
         return True
 
+    def render_reset_rows(self,*_):
+        rows=self._reset_rows
+        zone=QTimeZone.systemTimeZone()
+        self.reset_rows.setVisible(bool(rows));self.reset_zone.setVisible(bool(rows))
+        self.reset_grants.setVisible(bool(rows))
+        self.reset_grants.setText('지급 정보 접기' if self.reset_grants.isChecked() else '지급 정보 보기')
+        remaining=max(0,len(rows)-3)
+        self.reset_more.setVisible(remaining>0)
+        self.reset_more.setText('접기' if self.reset_more.isChecked() else formatted('+{count}개',count=f'{remaining:,}'))
+        self.reset_more.setAccessibleName('추가 초기화권 접기' if self.reset_more.isChecked() else
+                                         formatted('추가 초기화권 {count}개 보기',count=f'{remaining:,}'))
+        self.reset_extra.setVisible(remaining>0 and self.reset_more.isChecked())
+        while len(self.reset_items)<max(3,len(rows)):
+            card=Group();card.put(background='secondary',radius=4)
+            column=Column(card);column.setContentsMargins(8,6,8,6);column.setSpacing(3)
+            label=Text();label.put(fontSize=11,color='muted')
+            expiry=Text();expiry.put(fontSize=18,bold=True,noElide=True)
+            granted=Text();granted.put(fontSize=11,color='muted',wrap=True)
+            status=Text();status.put(fontSize=11,color='muted',wrap=True)
+            for node in (label,expiry,granted,status):column.addWidget(node)
+            target=self.reset_primary if len(self.reset_items)<3 else self.reset_extra
+            target.addWidget(card,1)
+            self.reset_items.append(dict(card=card,column=column,label=label,expiry=expiry,granted=granted,status=status))
+        years=set()
+        for index,item in enumerate(self.reset_items):
+            exists=index<len(rows)
+            item['card'].setVisible(index<3 or exists)
+            item['card'].put(background='secondary' if exists else 'transparent')
+            item['column'].setVisible(exists)
+            if not exists:continue
+            row=rows[index]
+            expiry=reset_time(row.get('expires_at'),zone);granted=reset_time(row.get('granted_at'),zone)
+            for value in (expiry,granted):
+                if value:years.add(value.date().year())
+            item['label'].setText('가장 빠른 만료' if index==0 and row.get('status')=='available' and expiry else '만료')
+            item['expiry'].setText(expiry.toString('MM/dd HH:mm') if expiry else '정보 미제공')
+            item['expiry'].setToolTip(expiry.toString('yyyy/MM/dd HH:mm tttt') if expiry else '만료일 정보 미제공')
+            item['granted'].setText(formatted('지급 {date}',date=granted.toString('MM/dd HH:mm') if granted else '—'))
+            item['granted'].setVisible(self.reset_grants.isChecked())
+            status={'available':'','redeemed':'사용 완료','consumed':'사용 완료','expired':'만료됨'}.get(row.get('status'),'상태 미제공')
+            item['status'].setText(status);item['status'].setVisible(bool(status))
+        zone_name=reset_zone_label(zone)
+        self.reset_zone.setText(formatted('{years}년, {zone}',years=', '.join(map(str,sorted(years))),zone=zone_name)
+                                if years else zone_name)
+        self.reset_zone.setToolTip(bytes(zone.id()).decode('utf-8'))
+
     def refresh_status(self):
         if getattr(self,'_render_dirty',False):
             self._render_dirty=False;self.render(automatic=True);return
@@ -330,7 +398,7 @@ class QuotaPanel(Group):
         now=time.time()
         quota=self.quota
         resets=reset_credit_display(quota,now)
-        self.reset_count.setText(resets['count']);self.reset_note.setText(resets['note'])
+        self.reset_count.setText(resets['count'])
         if resets['count']!='—':
             self.reset_count.setText(formatted('{count}개',count=f"{quota['reset_credits']['available_count']:,}"))
         observed=(quota or {}).get('observed_at',0)
@@ -340,26 +408,17 @@ class QuotaPanel(Group):
         self.credit_balance.setText('∞' if fresh and credits.get('unlimited') else
                                    format_credit_balance(balance) if fresh and balance is not None else '—')
         self.credit_balance.setToolTip('제한 없음' if fresh and credits.get('unlimited') else '크레딧 잔액')
-        self.credit_note.setText(('보유 크레딧 없음' if balance is not None and Decimal(balance)==0 else '사용 가능')
+        self.credit_note.setText(('보유 크레딧 없음' if balance is not None and Decimal(balance)==0 else '')
                                  if fresh and (balance is not None or credits.get('unlimited')) else
                                  '조회 갱신 대기' if credits else '크레딧 정보 미제공')
+        self.credit_note.setVisible(bool(self.credit_note.text()))
         rows=((quota or {}).get('reset_credits') or {}).get('credits') or []
-        rows=sorted(rows,key=lambda row:row.get('expires_at') or float('inf')) if fresh else []
-        self.reset_rows.setVisible(bool(rows));self.reset_zone.setVisible(bool(rows))
-        values=[[],[],[]]
-        for row in rows:
-            for i,key in enumerate(('granted_at','expires_at')):
-                stamp=row.get(key)
-                values[i].append(datetime.fromtimestamp(stamp).strftime('%m/%d\n%H:%M') if stamp else '정보 미제공\n—')
-            status={'available':'사용 가능','redeemed':'사용 완료','consumed':'사용 완료','expired':'만료됨'}.get(row.get('status'),'상태 미제공')
-            values[2].append(status+'\n ')
-        for cell,lines in zip(self.reset_cells,values):cell.setText('\n\n'.join(lines))
-        years=sorted({datetime.fromtimestamp(row[key]).year for row in rows for key in ('granted_at','expires_at') if row.get(key)})
-        self.reset_zone.setText(formatted('{years}년, 현지 시간',years=', '.join(map(str,years))))
-        if (rows and all(row.get('reset_type')=='codexRateLimits' for row in rows)
-                and len([row for row in rows if row.get('status')=='available'])==((quota or {}).get('reset_credits') or {}).get('available_count')
-                and all(not row.get('expires_at') or row['expires_at']>now for row in rows if row.get('status')=='available')):
-            self.reset_note.setText('Codex 사용한도 전체 초기화')
+        self._reset_rows=sorted(rows,key=lambda row:row.get('expires_at') or float('inf')) if fresh else []
+        note='\n'.join(line for line in resets['note'].splitlines()
+                       if not line.startswith(('가장 빠른 만료 ','확인된 만료 ')))
+        self.reset_note.setText(note.replace(chr(183),' / '));self.reset_note.setVisible(bool(note))
+        if len(self._reset_rows)<=3:self.reset_more.setChecked(False)
+        self.render_reset_rows()
         available=set((quota or {}).get('windows',{})) | set((quota or {}).get('unlimited_windows',[])) | set((quota or {}).get('window_conflicts',[]))
         self.current_row.setVisible(True)
         self.current_empty.setVisible(not available and not self.issue)
@@ -415,13 +474,14 @@ class QuotaPanel(Group):
             self._view=self.report.get('view') or prepare_quota_view(self.report)
             self._value_report=self.report
             selected=self.cycle_choice.currentData() if had_periods else None
-            self.cycle_choice.blockSignals(True);self.cycle_choice.clear()
-            self.cycle_choice.addItem('전체','all')
-            for period in self._view['periods']:
-                self.cycle_choice.addItem(period['label'],period['start'])
-            index=self.cycle_choice.findData(selected)
-            self.cycle_choice.setCurrentIndex(index if index>=0 else self.cycle_choice.count()-1)
-            self.cycle_choice.blockSignals(False)
+            choices=[('전체','all')]+[(p['label'],p['start']) for p in self._view['periods']]
+            if [(self.cycle_choice.itemText(i),self.cycle_choice.itemData(i))
+                    for i in range(self.cycle_choice.count())]!=choices:
+                self.cycle_choice.blockSignals(True);self.cycle_choice.clear()
+                for label,start in choices:self.cycle_choice.addItem(label,start)
+                index=self.cycle_choice.findData(selected)
+                self.cycle_choice.setCurrentIndex(index if index>=0 else self.cycle_choice.count()-1)
+                self.cycle_choice.blockSignals(False)
         index=self.cycle_choice.currentIndex()
         all_cycles=index==0
         lifetime=self._view['lifetime']

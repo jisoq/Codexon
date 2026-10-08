@@ -108,6 +108,8 @@ Release publication depends on successful CI, rather than requiring CI before a 
 
 All numerical graph axes must automatically fit the finite values currently displayed, with readable padding. Do not force a zero origin or a fixed percentage/currency range. Recompute after filters or data changes; ignore missing values rather than treating them as zero, and handle empty or constant series without a degenerate range. Axis labels, marks and inspection coordinates must use the same bounds. Normalized 100% composition strips and progress indicators retain their semantic denominator; they are not absolute-value graph axes.
 
+Usage-limit charts clamp the padded lower bound to zero while keeping positive automatic lower bounds. Their main chart height is 440 logical pixels, with 100 additional pixels only when the model-share strip is present.
+
 ## Validation and operational evidence
 
 Classify CI failures from logs as product defects, check defects, or workflow configuration defects. Reproduce and fix the affected execution path before rerunning CI; retries or longer timeouts alone do not establish a fix. In PowerShell, explicitly type conditional argument arrays before splatting, for example `[string[]]$checkArgs = if ($full) { @('--full') } else { @('--base', $base) }`. Verify both single-argument and multiple-argument branches for check planning and execution.

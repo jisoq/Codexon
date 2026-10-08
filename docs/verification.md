@@ -27,7 +27,11 @@ PR은 선택 사항이며 `main`에 직접 push할 수 있습니다. 배포할 �
 설치형 배포는 `tools/Build-Installer.ps1`로 만듭니다. `-Isolated`로 빌드한 QA 설치기는 별도 설치 ID·레지스트리·바로 가기를 사용하고 운영 프록시 전환과 본체 자동 실행을 생략합니다. `tools/verify_installation.py --installer <QA 설치기> --output <새 검사 폴더>`로 신규 설치·재설치·실행 경로 전환·사용 중 제거 보류·제거를 검증합니다. `tools/verify_recovery.py --executable <CodexonRecovery.exe> --output <새 검사 폴더>`는 복구 EXE만 분리해 실제 창과 버튼을 확인합니다. 표시되고 활성화된 버튼에 Tk 표준 `<<Invoke>>` 이벤트를 한 번 전달하고, 설정 복원·인증 보존·결과 화면 캡처를 검사합니다. 물리 커서는 움직이지 않습니다. 이전 연결 점검 예약 작업은 격리 홈·포트에서 등록한 뒤 설치·첫 실행에서 제거되는지 확인합니다. 일반 서비스에는 로그인·반복·자동 재시작 트리거가 없어야 합니다.
 
 
-Windows UI 검사는 `python tools/run_ui_checks.py -- python tools/verify_changes.py`로 실행합니다. 사용자에게 표시하지 않는 임시 Windows 데스크톱에서 실제 Qt 창과 키보드 처리를 검사하며, 사용자 데스크톱으로 전환하거나 물리 커서를 움직이지 않습니다. 전체 검사가 필요한 때만 `--full`을 덧붙입니다. 작은 화면·배율은 해당 화면의 기존 크기 변경 검사로 확인하며 동일한 UI 검사를 다른 렌더러에서 일괄 반복하지 않습니다. 렌더러나 배율 관련 문제가 있으면 해당 조건만 추가 확인합니다. 창 크기는 요청값과 실제값을 구분합니다.
+Windows UI 검사는 `python tools/run_ui_checks.py -- python tools/verify_changes.py`로 실행합니다. 사용자에게 표시하지 않는 임시 Windows 데스크톱에서 실제 Qt 창과 키보드 처리를 검사합니다. 사용자 데스크톱으로 전환하거나 물리 커서를 움직이지 않습니다. 실행기는 Windows API로 데스크톱을 지정하고 실제 자식 프로세스의 격리 상태를 회귀 검사합니다. Python `subprocess.STARTUPINFO`에 `lpDesktop` 속성을 추가하는 방식은 적용되지 않으므로 사용하지 않습니다.
+
+창 표시 검사는 기본 모드에서 실행합니다. 복사 검사는 `--isolate-clipboard` 옵션으로 별도 비대화형 윈도우 스테이션에서 실행합니다. 이 환경은 사용자 클립보드와 분리되지만 Windows의 창 표시 판정도 달라집니다. 선택기는 `CLIPBOARD_TESTS`에 등록된 복사 검사를 자동으로 분리하며 전체 검사에서도 빠짐없이 실행합니다. 어느 환경에서든 실패하면 성공 기준점을 갱신하지 않습니다.
+
+전체 검사가 필요한 때만 `--full`을 덧붙입니다. 작은 화면과 배율은 해당 화면의 기존 크기 변경 검사로 확인합니다. 동일한 UI 검사를 다른 렌더러에서 일괄 반복하지 않습니다. 렌더러나 배율 관련 문제가 있으면 해당 조건만 추가 확인합니다. 창 크기는 요청값과 실제값을 구분합니다.
 
 QA 설치기 식별은 파일 이름이 아닌 EXE의 ProductName `Codexon QA`로 검사합니다. `tools/prepare_bad_runtime.py`로 만든 실패용 페이로드도 반드시 `-Isolated`로 컴파일하고, `verify_installation.py --broken-installer <실패용 QA 설치기>`에 전달합니다. 첫 설치 실패 후 제거, 업데이트 실행 검사 실패, 설치 기록 저장 실패 시 레지스트리·바로 가기·설치 기록 복원까지 확인합니다. 운영 Setup은 QA 도구로 실행할 수 없습니다.
 

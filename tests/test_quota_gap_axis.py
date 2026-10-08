@@ -13,6 +13,26 @@ def rows():
             for i,at in enumerate((1000,1060,1120,35200,35260,35320,35500,35560,35620))]
 
 
+def test_equal_series_keeps_raster_but_adopts_new_data_and_changed_values_repaint():
+    import copy
+    from cachemonitor.quota_view import prepare_series
+    app=QApplication.instance() or QApplication([])
+    chart=QuotaHistory();chart.set_rows(rows());host=mount(chart,1120,440)
+    try:
+        render_plot(host,chart);picture=chart._picture
+        incoming=copy.deepcopy(chart.series)
+        chart.set_series(incoming);app.processEvents();host.quick.grabFramebuffer()
+        assert chart._picture is picture and chart.series is incoming
+        assert chart.rows is incoming['rows']
+        assert chart.gap_lefts.series is incoming and chart.gap_rights.series is incoming
+        assert chart.index_at(chart.x_at(4),chart.box.center().y())==4
+        changed=rows();changed[4]['remaining']=42
+        chart.set_series(prepare_series(changed));app.processEvents();host.quick.grabFramebuffer()
+        assert chart._picture is not picture and chart.rows[4]['remaining']==42
+        assert not host.qml_errors
+    finally:dispose(host)
+
+
 @pytest.mark.parametrize('width,dark',[(1120,False),(520,False),(1120,True)])
 def test_fixed_width_gaps_exact_original_selection_and_duration(tmp_path,width,dark):
     app=QApplication.instance() or QApplication([])

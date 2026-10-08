@@ -171,7 +171,7 @@ Item {
                 elide: view.s.wrap || view.s.noElide ? Text.ElideNone : Text.ElideRight
                 font.family: view.s.fontFamily || appTheme.family; font.pixelSize: view.s.fontSize; font.bold: view.s.bold
                 color: appTheme.palette && appTheme.color(view.s.color)
-                horizontalAlignment: view.s.alignment & Qt.AlignRight ? Text.AlignRight : Text.AlignLeft
+                horizontalAlignment: view.s.alignment & Qt.AlignRight ? Text.AlignRight : view.s.alignment & Qt.AlignHCenter ? Text.AlignHCenter : Text.AlignLeft
                 linkColor: (appTheme.palette && appTheme.color("accent"))
                 verticalAlignment: Text.AlignVCenter
                 Accessible.name: view.s.accessible || text
