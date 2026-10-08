@@ -516,7 +516,7 @@ def test_dense_workspace_units_and_hover_analysis(tmp_path,shell):
         from cachemonitor.dashboard import Dashboard
         app.setProperty('cachemonitorDisableShellIntegration',True)
         owner=Dashboard([],start_worker=False,live_limits=False,settings=owner.settings)
-        owner.resize(1440,940);owner.show();owner.change_page(5);QTest.qWait(200)
+        owner.resize(1028,749);owner.show();owner.change_page(5);QTest.qWait(200)
         owner.open_record=calls.append;ui=owner.performance_panel;host=owner
     else:ui=PerformancePanel(owner)
     def refresh():
