@@ -112,7 +112,7 @@ def test_model_filter_combines_request_modes_without_assigning_account_usage():
 
 
 @pytest.mark.parametrize('width,language,dark',[(1120,'ko',False),(520,'ko',False),(1120,'en',True),(520,'en',True)])
-def test_current_allowance_rows_and_credit_siblings(tmp_path,width,language,dark):
+def test_current_allowance_and_compact_reset_summary(tmp_path,width,language,dark):
     from PySide6.QtCore import QPointF
     from cachemonitor.i18n import set_language
     from cachemonitor.quota_live import normalize_limits
@@ -122,9 +122,9 @@ def test_current_allowance_rows_and_credit_siblings(tmp_path,width,language,dark
     quota=normalize_limits({'rateLimits':{'planType':'pro','secondary':None,
         'primary':{'usedPercent':36,'windowDurationMins':10080,'resetsAt':now+600},
         'credits':{'balance':'62500.0000000000','hasCredits':True,'unlimited':False}},
-        'rateLimitResetCredits':{'availableCount':2,'credits':[
-            {'status':'available','resetType':'codexRateLimits','grantedAt':now-86400,'expiresAt':now+86400},
-            {'status':'available','resetType':'codexRateLimits','grantedAt':now-43200,'expiresAt':now+172800}]}},now,'synthetic')
+        'rateLimitResetCredits':{'availableCount':12,'credits':[
+            {'status':'available','resetType':'codexRateLimits','grantedAt':now-86400,'expiresAt':now+i*86400}
+            for i in range(12,0,-1)]}},now,'synthetic')
     panel=QuotaPanel(QSettings(str(tmp_path/'credits.ini'),QSettings.IniFormat))
     panel.receive({'quota':quota,'report':{'cycles':[]}})
     scroll=Scroll();scroll.put(fillViewport=True);scroll.setWidget(panel)
@@ -134,21 +134,74 @@ def test_current_allowance_rows_and_credit_siblings(tmp_path,width,language,dark
         def position(node):return control(host,node).mapToScene(QPointF(0,0))
         assert position(panel.current['five_hour']['card']).y()<position(panel.current['weekly']['card']).y()
         assert position(panel.credit_card).y()>position(panel.current['weekly']['card']).y()
-        assert abs(position(panel.credit_card).y()-position(panel.reset_card).y())<2
-        assert position(panel.credit_card).x()<position(panel.reset_card).x()
-        assert abs(control(host,panel.credit_card).width()-control(host,panel.reset_card).width())<2
+        assert position(panel.credit_card).y()<position(panel.reset_card).y()
         assert panel.current['five_hour']['value'].text()=='∞'
         assert not panel.current['five_hour']['bar'].isVisible()
         assert panel.credit_balance.text()=='62,500'
-        assert panel.reset_count.text()==('2개' if language=='ko' else '2 resets')
+        assert panel.reset_count.text()==('12개' if language=='ko' else '12 resets')
         assert panel.reset_rows.isVisible()
+        assert not panel.reset_extra.isVisible() and not panel.reset_grants.isChecked()
+        assert panel.reset_more.text()==('+9개' if language=='ko' else '+9')
+        assert not panel.credit_note.isVisible() and not panel.reset_note.isVisible()
+        assert not any(item['granted'].isVisible() for item in panel.reset_items)
+        assert not any(item['status'].isVisible() for item in panel.reset_items)
+        from cachemonitor.quota_panel import reset_time
+        from PySide6.QtCore import QTimeZone
+        assert [item['expiry'].text() for item in panel.reset_items[:3]]==[
+            reset_time(now+i*86400,QTimeZone.systemTimeZone()).toString('MM/dd HH:mm') for i in (1,2,3)]
+        first_three=[control(host,item['card']) for item in panel.reset_items[:3]]
+        assert max(item.mapToScene(QPointF(0,0)).y() for item in first_three)-min(item.mapToScene(QPointF(0,0)).y() for item in first_three)<2
+        more=control(host,panel.reset_more)
+        assert position(panel.reset_more).y()<position(panel.reset_items[0]['card']).y()+first_three[0].height()
+        for item in panel.reset_items[:3]:
+            label=control(host,item['expiry'])
+            texts=[child for child in walk(label) if child.metaObject().indexOfProperty('contentWidth')>=0 and child.isVisible()]
+            assert texts and all(t.property('contentWidth')<=t.width()+1 for t in texts)
+        compact_height=control(host,panel.current_row).height()
         assert host.grab().save(str(tmp_path/f'allowance-{width}-{language}.png'))
+        click(host,more)
+        assert panel.reset_extra.isVisible()
+        click(host,control(host,panel.reset_grants))
+        assert all(item['granted'].isVisible() for item in panel.reset_items)
+        panel.receive({'quota':quota});QTest.qWait(30)
+        assert panel.reset_more.isChecked() and panel.reset_grants.isChecked()
+        assert host.grab().save(str(tmp_path/f'resets-expanded-{width}-{language}.png'))
+        click(host,control(host,panel.reset_more))
+        click(host,control(host,panel.reset_grants))
+        assert abs(control(host,panel.current_row).height()-compact_height)<2
+        for count in (3,2,1):
+            short=dict(quota,reset_credits=dict(available_count=count,
+                credits=quota['reset_credits']['credits'][-count:]))
+            panel.receive({'quota':short});QTest.qWait(20)
+            assert not panel.reset_more.isVisible() and not panel.reset_extra.isVisible()
+            assert sum(item['column'].isVisible() for item in panel.reset_items)==count
+            assert abs(control(host,panel.current_row).height()-compact_height)<2
         panel.receive({'quota':dict(quota,observed_at=now-100)})
         assert panel.credit_balance.text()=='—'
         assert panel.current['five_hour']['value'].text()=='—'
         assert not panel.reset_rows.isVisible()
+        assert not panel.reset_more.isChecked() and not panel.reset_grants.isVisible()
         assert not host.qml_errors
     finally:dispose(host);set_language('ko');shared_theme().configure('light')
+
+
+def test_reset_dates_follow_system_timezone_on_refresh(tmp_path,monkeypatch):
+    from datetime import datetime
+    from PySide6.QtCore import QTimeZone
+    from cachemonitor.quota_panel import reset_zone_label
+    app=QApplication.instance() or QApplication([])
+    now=time.time()
+    stamp=datetime.fromisoformat('2026-10-23T05:23:00+09:00').timestamp()
+    panel=QuotaPanel(QSettings(str(tmp_path/'reset-timezone.ini'),QSettings.IniFormat))
+    panel.receive({'quota':dict(source='live',observed_at=now,reset_credits=dict(available_count=1,
+        credits=[dict(status='available',expires_at=stamp,granted_at=stamp-86400)]))})
+    for name,expected in [('Asia/Seoul','10/23 05:23'),('UTC','10/22 20:23'),('America/New_York','10/22 16:23')]:
+        zone=QTimeZone(name.encode())
+        monkeypatch.setattr(QTimeZone,'systemTimeZone',lambda z=zone:z)
+        panel.refresh_status()
+        assert panel.reset_items[0]['expiry'].text()==expected
+        assert reset_zone_label(zone) in panel.reset_zone.text()
+        assert panel.reset_zone.toolTip()==name
 
 
 @pytest.mark.parametrize('width,dark',[(520,False),(1120,True)])

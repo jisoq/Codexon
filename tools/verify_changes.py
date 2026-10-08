@@ -74,6 +74,7 @@ GROUPS = {
     'payload': ('tests/test_public_release.py::test_public_payload_rejects_local_paths_and_unneeded_qt',),
     'selector': test_files('verify_changes'),
     'qa_ipc': test_files('qa_ipc'),
+    'ui_runner': test_files('ui_check_runner', 'completed_layout'),
 }
 
 # First match wins: QML and shared helpers must not fall through to a broad UI gate.
@@ -212,7 +213,7 @@ RULES = (
     ('cachemonitor/qa.py', ('runtime',)),
     ('tools/verify_changes.py', ('selector',)),
     ('.github/workflows/windows.yml', ('selector',)),
-    ('tools/run_ui_checks.py', ('runtime', 'overlay_controls')),
+    ('tools/run_ui_checks.py', ('ui_runner', 'runtime', 'overlay_controls')),
     ('tools/demo_speed_overlay.py', ('speed',)),
     ('tools/*proxy*.py', ('relay', 'proxy_lifecycle')),
     ('tools/*overlay*.py', ('overlay_controls', 'overlay_render')),
@@ -442,6 +443,27 @@ def package_check(executable, report_dir):
                 duration_seconds=report.get('duration_seconds'), session_rollup=rollup)
 
 
+CLIPBOARD_TESTS = test_files('completed_layout')
+
+
+def pytest_commands(tests):
+    """Keep native visibility checks and real clipboard checks on suitable desktops."""
+    clipboard = [test for test in tests if test.split('::')[0] in CLIPBOARD_TESTS]
+    native = [test for test in tests if test not in clipboard]
+    if native == ['tests']:
+        # Full verification still executes the clipboard files, in the second process.
+        native += [f'--ignore={path}' for path in CLIPBOARD_TESTS]
+        clipboard = list(CLIPBOARD_TESTS)
+    pytest = [sys.executable, '-B', '-m', 'pytest', '-q', '--tb=short', '--durations=10']
+    runner = [sys.executable, str(ROOT / 'tools/run_ui_checks.py')]
+    result = []
+    for name, targets, options in (('native', native, []),
+                                    ('clipboard', clipboard, ['--isolate-clipboard'])):
+        if targets:
+            result.append((name, [*runner, *options, '--', *pytest, *targets]))
+    return result
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--plan', action='store_true', help='Show checks without running them')
@@ -479,17 +501,29 @@ def main(argv=None):
     report = dict(public,logs=[],package=None)
     if plan['tests']:
         started = time.monotonic()
-        command = [sys.executable, '-B', '-m', 'pytest', '-q', '--tb=short', '--durations=10', *plan['tests']]
-        result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
+        runs = []
+        outputs = []
+        for name, command in pytest_commands(plan['tests']):
+            run_started = time.monotonic()
+            result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
+            output = result.stdout + '\n' + result.stderr
+            run_log = folder / f'pytest-{name}.log'
+            run_log.write_text(output, encoding='utf-8')
+            report['logs'].append(str(run_log))
+            outputs.append(f'[{name}]\n{output}')
+            runs.append(dict(environment=name, exit_code=result.returncode,
+                             seconds=round(time.monotonic()-run_started, 2),
+                             summary=result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ''))
         log = folder / 'pytest.log'
-        log.write_text(result.stdout+'\n'+result.stderr,encoding='utf-8')
+        log.write_text('\n'.join(outputs),encoding='utf-8')
         report['logs'].append(str(log))
-        report['pytest'] = dict(exit_code=result.returncode, seconds=round(time.monotonic()-started,2),
-                                summary=result.stdout.strip().splitlines()[-1] if result.stdout.strip() else '')
-        if result.returncode:
+        exit_code = next((run['exit_code'] for run in runs if run['exit_code']), 0)
+        report['pytest'] = dict(exit_code=exit_code, seconds=round(time.monotonic()-started,2),
+                               summary=' | '.join(run['summary'] for run in runs), runs=runs)
+        if exit_code:
             (folder/'report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
             print(json.dumps(dict(result='failed',**report['pytest'],log=str(log)),ensure_ascii=False))
-            return result.returncode
+            return exit_code
     if args.package_exe:
         try:
             report['package'] = package_check(args.package_exe,folder)

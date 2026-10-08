@@ -5,7 +5,7 @@ import json
 import subprocess
 import sys
 
-from tools.verify_changes import ROOT, GROUPS, changed_files, fixture_home, select_tests
+from tools.verify_changes import ROOT, GROUPS, changed_files, fixture_home, pytest_commands, select_tests
 
 
 def test_small_ui_changes_select_their_consumer_without_backend_or_package_checks():
@@ -31,6 +31,8 @@ def test_small_ui_changes_select_their_consumer_without_backend_or_package_check
 
 
 def test_calculation_protocol_and_unknown_changes_have_explicit_gates():
+    runner = select_tests({'tools/run_ui_checks.py'})
+    assert {'tests/test_ui_check_runner.py', 'tests/test_completed_layout.py'} <= set(runner['tests'])
     for source in ('cachemonitor/cache_execution.py','cachemonitor/cache_capture.py','cachemonitor/model_proxy.py',
                    'cachemonitor/cache_scheduler.py','cachemonitor/cache_control.py','cachemonitor/cache_hooks.py','cachemonitor/cache_operating.py'):
         chosen=select_tests({source})
@@ -53,6 +55,21 @@ def test_calculation_protocol_and_unknown_changes_have_explicit_gates():
     for source in ('tests/conftest.py', 'requirements-release.lock'):
         assert select_tests({source})['full']
     assert select_tests(None)['full']
+
+
+def test_clipboard_checks_are_routed_without_omitting_selected_or_full_checks():
+    clipboard = 'tests/test_completed_layout.py::test_detail_last_wrapped_line_is_visible_and_selectable[1120-760]'
+    native = 'tests/test_windows_startup.py'
+    commands = dict(pytest_commands((native, clipboard)))
+    assert native in commands['native'] and clipboard not in commands['native']
+    assert clipboard in commands['clipboard'] and native not in commands['clipboard']
+    assert '--isolate-clipboard' in commands['clipboard']
+    assert '--isolate-clipboard' not in commands['native']
+    full = dict(pytest_commands(('tests',)))
+    assert 'tests' in full['native']
+    for ignored in (arg.removeprefix('--ignore=') for arg in full['native'] if arg.startswith('--ignore=')):
+        assert ignored in full['clipboard']
+    assert dict(pytest_commands((clipboard,))).keys() == {'clipboard'}
 
 
 def test_changed_and_deleted_fixture_modules_select_existing_transitive_consumers(tmp_path):
@@ -111,6 +128,25 @@ def test_unmapped_and_package_only_runs_do_not_advance_source_baseline(tmp_path,
     assert verify.main(['--package-only', '--package-exe', 'synthetic.exe']) == 0
     assert json.loads(capsys.readouterr().out)['pytest'] is None
     assert baseline.read_bytes() == original
+
+
+def test_clipboard_failure_keeps_the_verified_baseline_unchanged(tmp_path, monkeypatch, capsys):
+    import tools.verify_changes as verify
+    baseline = tmp_path / 'last-success.json'
+    original = '{"files": {}}'
+    baseline.write_text(original, encoding='utf-8')
+    monkeypatch.setattr(verify, 'BASELINE', baseline)
+    monkeypatch.setattr(verify, 'REPORTS', tmp_path / 'reports')
+    monkeypatch.setattr(verify, 'file_hashes', lambda: {'tools/run_ui_checks.py': 'changed'})
+    def run(command, **kwargs):
+        failed = '--isolate-clipboard' in command
+        return subprocess.CompletedProcess(command, int(failed), '1 failed' if failed else '1 passed', '')
+    monkeypatch.setattr(verify.subprocess, 'run', run)
+    assert verify.main([]) == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report['result'] == 'failed'
+    assert baseline.read_text(encoding='utf-8') == original
+    assert [run['exit_code'] for run in report['runs']] == [0, 1]
 
 
 def test_isolated_source_smoke_renders_parent_cost(tmp_path):

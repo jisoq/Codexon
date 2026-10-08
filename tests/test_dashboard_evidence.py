@@ -28,6 +28,99 @@ def dashboard(tmp_path):
         settings=QSettings(str(tmp_path/'settings.ini'),QSettings.IniFormat))
 
 
+def deliver_pending(window):
+    query=window.pending_query
+    window.analysis_ready(dict(id=window.request_id,logical=window.pending_logical,
+        result=window.engine.page_query(query),valid_until=float('inf')))
+
+
+@pytest.mark.parametrize('language',['ko','en'])
+def test_tab_loading_hides_empty_content_and_ignores_stale_result(tmp_path,language):
+    from PySide6.QtTest import QTest
+    from cachemonitor.i18n import set_language
+    from cachemonitor.quick_qa import control
+    set_language(language);window=dashboard(tmp_path)
+    try:
+        window.receive(sample());window.show();window.render();window.async_mode=True
+        window.change_page(1)
+        old_id,old_query,old_logical=window.request_id,window.pending_query,window.pending_logical
+        assert window.analysis_pending and not window.pages.isVisible()
+        assert window.analysis_notice.isVisible() and not window.analysis_notice_body.isVisible()
+        QTest.qWait(200)
+        title=control(window,window.analysis_notice_title)
+        assert title.isVisible()
+        assert ('Loading' if language=='en' else '불러오는 중') in window.analysis_notice_title.state['text']
+        assert window.grab().save(str(tmp_path/f'tab-loading-{language}.png'))
+        window.show_analysis_slow()
+        assert '다른 탭' in window.analysis_notice_detail.text()
+        window.change_page(2)
+        window.analysis_ready(dict(id=old_id,logical=old_logical,
+            result=window.engine.page_query(old_query),valid_until=float('inf')))
+        assert window.analysis_pending and not window.pages.isVisible()
+        deliver_pending(window)
+        assert window.pages.isVisible() and not window.analysis_notice.isVisible()
+        window.render()  # A valid cache hit never enters the loading state.
+        assert not window.analysis_pending and not window.pending_timer.isActive()
+        window.change_page(5)
+        assert not window.pages.isVisible()
+        window.change_page(3)
+        window.show_analysis_pending();window.show_analysis_slow()
+        assert window.pages.isVisible() and not window.analysis_notice.isVisible()
+        assert not window.pending_label.isVisible()
+        assert not window.qml_errors
+    finally:window.quit_app();set_language('ko')
+
+
+def test_refresh_preserves_only_matching_results_and_failure_can_retry(tmp_path):
+    from PySide6.QtTest import QTest
+    from cachemonitor.quick_qa import control,click
+    window=dashboard(tmp_path)
+    try:
+        window.receive(sample());window.show();window.render();window.async_mode=True
+        window.client_cache.clear();window.render();window.show_analysis_pending()
+        assert window.pages.isVisible() and window.pending_label.text()=='최신 기록 반영 중'
+        window.analysis_failed('synthetic failure')
+        assert window.pages.isVisible() and window.retry_button.isVisible()
+        click(window,control(window,window.retry_button))
+        assert window.analysis_pending
+        deliver_pending(window)
+        assert not window.retry_button.isVisible()
+        choose(window.period,'all');window.render()
+        assert window.analysis_pending and not window.pages.isVisible()
+        window.analysis_failed('changed-filter failure');QTest.qWait(40)
+        assert not window.pages.isVisible() and window.notice_retry.isVisible()
+        assert window.analysis_notice_title.text()=='기록을 불러오지 못했습니다'
+        assert window.grab().save(str(tmp_path/'tab-loading-failed.png'))
+        click(window,control(window,window.notice_retry))
+        assert window.analysis_pending and not window.pages.isVisible()
+        deliver_pending(window)
+        assert window.pages.isVisible() and not window.analysis_notice.isVisible()
+        assert not window.qml_errors
+    finally:window.quit_app()
+
+
+def test_empty_result_waits_for_collection_before_showing_empty_charts(tmp_path):
+    from PySide6.QtTest import QTest
+    window=dashboard(tmp_path)
+    try:
+        window.show();window.async_mode=True
+        window.snapshot['index']={'loading':True}
+        window.render();deliver_pending(window)
+        assert not window.analysis_pending and not window.pages.isVisible()
+        assert window.analysis_notice_title.text()=='사용 기록 수집 중'
+        window.snapshot['index']['loading']=False
+        window.render();deliver_pending(window)
+        assert window.pages.isVisible() and not window.analysis_notice.isVisible()
+        assert window.timeline.empty_text=='사용 기록 없음'
+        assert window.analysis['response_count']==0
+        window.change_page(5);window._refresh_after_pending=True
+        calls=[];window.render=lambda *args,**kwargs:calls.append(kwargs)
+        deliver_pending(window);QTest.qWait(20)
+        assert calls==[{'automatic':True}]
+        assert not window.qml_errors
+    finally:window.quit_app()
+
+
 def test_real_conflict_is_visible_but_missing_wire_evidence_is_not_an_error(tmp_path):
     window=dashboard(tmp_path)
     try:

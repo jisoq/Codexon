@@ -18,6 +18,7 @@ class QuickPlot(QQuickPaintedItem):
     sourceChanged=Signal()
     tipChanged=Signal()
     detailChanged=Signal()
+    detailPositionChanged=Signal()
     def __init__(self,parent=None):
         super().__init__(parent);self._source=None;self._tip='';self._hover=None;self._hover_index=-1
         self._detail={};self._detail_pinned=False;self._detail_x=0;self._detail_y=0
@@ -51,14 +52,19 @@ class QuickPlot(QQuickPaintedItem):
     def detail(self):return self._detail
     @Property(bool,notify=detailChanged)
     def detailPinned(self):return self._detail_pinned
-    @Property(float,notify=detailChanged)
+    @Property(float,notify=detailPositionChanged)
     def detailX(self):return self._detail_x
-    @Property(float,notify=detailChanged)
+    @Property(float,notify=detailPositionChanged)
     def detailY(self):return self._detail_y
     def set_detail(self,value,x,y,pinned=False):
+        moved=(x,y)!=(self._detail_x,self._detail_y)
+        # Inspection time moves the cursor only; QML consumes the visible fields.
+        changed=(pinned!=self._detail_pinned or self._detail.keys()!=value.keys() or
+                 any(self._detail.get(key)!=item for key,item in value.items() if key!='inspection_at'))
         self._detail=value;self._detail_x=x;self._detail_y=y;self._detail_pinned=pinned
         if self._source and hasattr(self._source,'set_inspection'):self._source.set_inspection(value,x,y)
-        self.detailChanged.emit()
+        if changed:self.detailChanged.emit()
+        if moved:self.detailPositionChanged.emit()
     @Slot()
     def dismissDetail(self):self.set_detail({},0,0)
     def invalidate(self):
@@ -88,7 +94,7 @@ class QuickPlot(QQuickPaintedItem):
                 self._source._painter=LocalizedPainter(painter)
                 self._source.paint(painter)
             if hasattr(self._source,'paint_overlay'):self._source.paint_overlay(painter)
-            if self._detail_pinned and hasattr(self._source,'refresh_detail'):
+            if self._detail and hasattr(self._source,'refresh_detail'):
                 current=self._source.refresh_detail(self._detail)
                 if current!=self._detail:
                     self._detail=current;self.detailChanged.emit()

@@ -92,6 +92,9 @@ def main():
     configure_font_rendering()
     configure_high_dpi()
     app = QApplication(sys.argv[:1])
+    # Python quota work shares this process with Qt callbacks. Shorter handoffs
+    # reduce repeated GIL waits accumulating across a single UI frame.
+    sys.setswitchinterval(min(sys.getswitchinterval(), .001))
     startup_settings=(QSettings(str(Path(args.index_path).parent/'handoff-settings.ini'),QSettings.IniFormat)
                       if args.verify_handoff else QSettings('CacheMonitor','CacheMonitor'))
     display_language=os.environ.get('CODEXON_LANGUAGE') or startup_settings.value('ui/language','ko')

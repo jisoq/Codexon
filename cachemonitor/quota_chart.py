@@ -12,6 +12,13 @@ from .token_colors import color_distance
 from .i18n import LocalizedPainter, tr
 
 
+def quota_bounds(values):
+    """Fit quota values without a negative padded lower bound."""
+    low,high=dynamic_bounds(values)
+    low=max(0.,low)
+    return low,max(high,low+1e-6)
+
+
 class GapPixels:
     """Lazy monotone coordinates: resizing never scans every historical gap."""
     def __init__(self,series,left,scale,width,end=False):
@@ -25,9 +32,10 @@ class GapPixels:
 
 class QuotaHistory(Plot):
     gap_selected=Signal(str)
+    repaintRequested=Signal()
     def __init__(self):
         super().__init__()
-        self.setFixedHeight(340)
+        self.setFixedHeight(440)
         self.empty_text='수집된 잔여량이 없습니다'
         self.hidden_series=set()
         self.money=False;self.reference=None;self.series=prepare_series([])
@@ -49,9 +57,17 @@ class QuotaHistory(Plot):
 
     def set_series(self,series):
         if self.series is series:return
+        if (self._cache_key is not None and len(self.rows)==len(series['rows'])
+                and self.rows[-1:]==series['rows'][-1:] and self.series==series):
+            # Adopt the new input without retaining another copy of its history.
+            # Equal content preserves the existing raster and exact time lookup.
+            self.series=series;self.rows=series['rows']
+            self._cache_key=(self._cache_key[0],id(series),*self._cache_key[2:])
+            self.gap_lefts.series=series;self.gap_rights.series=series
+            return
         self.series=series;self.rows=series['rows'];self.cursor=min(self.cursor,max(0,len(self.rows)-1))
         share=series.get('model_share')
-        self.setFixedHeight(440 if share else 340)
+        self.setFixedHeight(540 if share else 440)
         shared_theme().register_models([name for name,mode in share['models']] if share else [])
         self._cache_key=None;self.update()
 
@@ -113,7 +129,7 @@ class QuotaHistory(Plot):
         p.setRenderHint(QPainter.Antialiasing)
         cumulative=self.series.get('cumulative',False)
         if cumulative:
-            low,high=dynamic_bounds((self.series['low'],self.series['high']))
+            low,high=quota_bounds((self.series['low'],self.series['high']))
             self.axis=(low,high,(high-low)/4)
         else:self.axis=remaining_axis([{'remaining':self.series['low']},{'remaining':self.series['high']}])
         value_low=self.series['value_minimum'] if self.visible('cycle_value') else None
@@ -121,9 +137,9 @@ class QuotaHistory(Plot):
         if self.reference is not None and self.visible('reference'):
             value_low=self.reference if value_low is None else min(value_low,self.reference)
             value_high=max(value_high,self.reference)
-        self.value_floor,self.ceiling=dynamic_bounds((value_low,value_high) if value_low is not None else ())
-        self.cost_floor,self.cost_ceiling=dynamic_bounds((self.series['cost_minimum'],self.series['cost_maximum']) if self.series['cost_minimum'] is not None else ())
-        self.completed_floor,self.completed_ceiling=dynamic_bounds((self.series['completed_minimum'],self.series['completed_maximum']) if self.series['completed_minimum'] is not None else ())
+        self.value_floor,self.ceiling=quota_bounds((value_low,value_high) if value_low is not None else ())
+        self.cost_floor,self.cost_ceiling=quota_bounds((self.series['cost_minimum'],self.series['cost_maximum']) if self.series['cost_minimum'] is not None else ())
+        self.completed_floor,self.completed_ceiling=quota_bounds((self.series['completed_minimum'],self.series['completed_maximum']) if self.series['completed_minimum'] is not None else ())
         completed_width=max(82,p.fontMetrics().horizontalAdvance(usd(self.completed_ceiling))+14)
         remaining_title='누적 소모\n%p' if cumulative else '잔여량\n%'
         remaining_labels=[f'{self.axis[1]:g}'+('%p' if cumulative else '%'),*tr(remaining_title).splitlines()]
@@ -191,28 +207,33 @@ class QuotaHistory(Plot):
         if not self.curves() and not (self.visible('reference') and self.reference is not None):
             p.setPen(QColor(palette['muted']));p.drawText(box,Qt.AlignCenter,'표시할 선을 범례에서 선택하세요')
         indices=self.series['samples'][256 if box.width()<600 else 768]
-        xs=[self.x_at(index) for index in indices]
+        active=self.series['active_times'];gaps=self.series['gap_indices']
+        left,right=box.left(),box.right();time_scale=self.time_scale;gap_width=self.gap_width
+        xs=[min(right,left+active[i]*time_scale+bisect_right(gaps,i)*gap_width) for i in indices]
+        rows=self.rows;breaks=self.series['breaks'];completed=self.series['completed_costs']
         for key,color,style in self.curves():
             low,high=self.bounds(key)
             scale=box.height()/(high-low);bottom=box.bottom()
             previous=None;previous_x=None;previous_index=None
-            path=QPainterPath()
+            path=QPainterPath();move=path.moveTo;line=path.lineTo
+            missing=self.series['missing'].get(key)
             p.setPen(QPen(QColor(palette[color]),2,style))
             # One native path avoids thousands of temporary Qt line/point
             # wrappers each time a refreshed series invalidates the image.
             for index,x in zip(indices,xs):
-                value=self.value_at(index,key)
+                value=completed[index] if key=='completed_cost' else rows[index].get(key)
                 y=bottom-(value-low)*scale if value is not None else None
                 if y is not None:
-                    if previous is not None and self.connects(previous_index,index,key):
-                        path.moveTo(previous_x,previous);path.lineTo(x,previous)
-                        path.moveTo(x,previous);path.lineTo(x,y)
+                    if (previous is not None and breaks[previous_index]==breaks[index]
+                            and (missing is None or missing[previous_index]==missing[index])):
+                        if previous_x!=x:move(previous_x,previous);line(x,previous)
+                        if previous!=y:move(x,previous);line(x,y)
                 previous,previous_x,previous_index=y,x,index
                 # A completed amount belongs to its whole plateau, up to the
                 # next boundary, even when that next plateau is still pending.
-                if key=='completed_cost' and y is not None and index+1<len(self.rows):
-                    if (self.value_at(index+1,key) is None and self.series['breaks'][index]==self.series['breaks'][index+1]
-                            and self.series['missing'][key][index+1]==self.series['missing'][key][index]+1):
+                if key=='completed_cost' and y is not None and index+1<len(rows):
+                    if (completed[index+1] is None and breaks[index]==breaks[index+1]
+                            and missing[index+1]==missing[index]+1):
                         path.moveTo(x,y);path.lineTo(self.x_at(index+1),y)
             p.setBrush(Qt.NoBrush);p.drawPath(path)
         if count and self.gap_width:
@@ -273,8 +294,17 @@ class QuotaHistory(Plot):
         p.fillRect(area,QColor(palette['track']))
         p.fillRect(area,QBrush(QColor(palette['muted']),Qt.BDiagPattern))
         p.save();p.setClipRect(area);p.setRenderHint(QPainter.Antialiasing,False)
+        # Resolve each model's style once per image, not once per time span.
+        theme=shared_theme()
+        styles=[]
+        for name in share['models']:
+            color=QColor(theme.color(share_color_key(name)));pattern=theme.model_pattern(name[0])
+            styles.append((name,color,QBrush(QColor(palette['surface']),pattern) if pattern else None))
+        last_end=None;last_right=None
         for start,end,bucket in share['spans']:
-            item=share['bins'][bucket];x=self.x_at_time(start);right=self.x_at_time(end)
+            item=share['bins'][bucket]
+            x=last_right if start==last_end else self.x_at_time(start)
+            right=self.x_at_time(end);last_end,last_right=end,right
             width=right-x
             if width<=0:continue
             rect=QRectF(x,area.top(),width,area.height())
@@ -283,18 +313,17 @@ class QuotaHistory(Plot):
                 p.fillRect(rect,QBrush(QColor(palette['muted']),Qt.BDiagPattern));continue
             if item['state']=='zero':continue
             y=area.bottom()
-            for name in share['models']:
+            for name,color,pattern in styles:
                 height=area.height()*item['shares'].get(name,0)/100
                 if height<=0:continue
-                y-=height;p.fillRect(QRectF(x,y,width,height),QColor(shared_theme().color(share_color_key(name))))
-                pattern=shared_theme().model_pattern(name[0])
-                if pattern:p.fillRect(QRectF(x,y,width,height),QBrush(QColor(palette['surface']),pattern))
+                y-=height;p.fillRect(QRectF(x,y,width,height),color)
+                if pattern:p.fillRect(QRectF(x,y,width,height),pattern)
         p.restore()
 
     def set_inspection(self,detail,x,y):
         self.inspection_x=x if detail else None
         self.inspection_at=detail.get('inspection_at',detail.get('at')) if detail else None
-        self.update()
+        self.repaintRequested.emit()
 
     def paint(self,painter):
         p=self.base();palette=shared_theme().palette;p.fillRect(self.rect(),QColor(palette['surface']))
