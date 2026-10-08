@@ -578,14 +578,13 @@ class PerformancePanel(Group):
         self.latest_button.setToolTip('현재 기간 길이를 유지하며 최신 기록으로 이동하고 자동 추적을 켭니다.')
         self.collection_time=caption('',11);self.collection_time.put(wrap=False);status.addWidget(self.collection_time)
         separator=Group();separator.put(background='border');separator.setFixedHeight(1);footer.addWidget(separator)
-        navigation=Row();navigation.put(flow=True,spacing=6);center.addLayout(navigation)
-        self.aggregation=Row();self.aggregation.setSpacing(6);navigation.addLayout(self.aggregation)
+        self.aggregation=Row();self.aggregation.put(flow=True,spacing=6);center.addLayout(self.aggregation)
         label=caption('집계 단위',12);label.put(wrap=False);self.aggregation.addWidget(label);self.granularity_buttons={}
         for title,unit in (('일별','day'),('주별','week'),('월별','month')):
             b=button(title,lambda u=unit:self.choose_granularity(u));b.setCheckable(True);b.put(selectionTab=True,flat=True)
             self.aggregation.addWidget(b);self.granularity_buttons[unit]=b
         self.granularity_buttons['week'].setToolTip('월요일 시작')
-        self.window_note=caption('계산 폭 자동',12);self.window_note.put(wrap=False);navigation.addWidget(self.window_note)
+        self.window_note=caption('계산 폭 자동',12);self.window_note.put(wrap=False);center.addWidget(self.window_note)
         self.window_note.setToolTip('조회 기간과 화면 너비에 맞춰 자동으로 계산합니다.')
         self.chart_scroll=Scroll();self.chart_scroll.put(fillViewport=True);self.chart_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         charts=Group();self.chart_body=Column(charts);self.chart_body.setSpacing(8);self.chart_scroll.setWidget(charts);center.addWidget(self.chart_scroll,1)
