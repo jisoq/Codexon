@@ -87,6 +87,7 @@ class QuickPlot(QQuickPaintedItem):
             else:
                 self._source._painter=LocalizedPainter(painter)
                 self._source.paint(painter)
+            if hasattr(self._source,'paint_overlay'):self._source.paint_overlay(painter)
             if self._detail_pinned and hasattr(self._source,'refresh_detail'):
                 current=self._source.refresh_detail(self._detail)
                 if current!=self._detail:
