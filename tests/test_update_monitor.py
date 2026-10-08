@@ -204,7 +204,7 @@ def test_production_gate_excludes_source_qa_and_other_installations(tmp_path,mon
 def test_dashboard_badge_notification_routes_mute_and_explicit_check(endpoint,tmp_path,monkeypatch,language):
     from cachemonitor.dashboard import Dashboard
     from cachemonitor.i18n import set_language
-    from cachemonitor.quick_qa import control,click,walk
+    from cachemonitor.quick_qa import control,click,walk,render_plot
     e=endpoint;set_language(language)
     previous=e.app.property('cachemonitorDisableShellIntegration');e.app.setProperty('cachemonitorDisableShellIntegration',True)
     window=Dashboard([],start_worker=False,settings=e.settings,live_limits=False,manage_observer=False,
@@ -229,14 +229,14 @@ def test_dashboard_badge_notification_routes_mute_and_explicit_check(endpoint,tm
         panel=window.update_panel
         assert panel.execute.isVisible() and panel.execute.isEnabled()
         assert panel.offer['release']==release() and not status_calls and not e.requests
-        click(window,control(window,panel.execute))
+        click(window,render_plot(window,panel.execute))
         settle(lambda:panel.confirming)
         assert status_calls==[True] and not e.requests and not installs
         assert panel.offer['release']==release() and 'install' in panel.offer
         click(panel.dialog.host,control(panel.dialog.host,panel.dialog.cancel))
         settle(lambda:not panel.confirming)
         assert panel.execute.isEnabled() and not installs
-        click(window,control(window,panel.execute))
+        click(window,render_plot(window,panel.execute))
         settle(lambda:panel.confirming)
         click(panel.dialog.host,control(panel.dialog.host,panel.dialog.confirm))
         settle(lambda:panel.operation is None and not panel.confirming)

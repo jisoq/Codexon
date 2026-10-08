@@ -565,7 +565,8 @@ def test_dense_workspace_units_and_hover_analysis(tmp_path,shell):
         assert str(cell['count'])==ui.details.value.text()
         assert not calls
         for unit in ('week','month','day'):
-            click(host,control(host,ui.granularity_buttons[unit]));QTest.qWait(50)
+            # Resolve pending scroll/layout changes before taking click coordinates.
+            click(host,render_plot(host,ui.granularity_buttons[unit]))
             assert ui.granularity==unit and projector.view['granularity']==unit
             assert ui.granularity_buttons[unit].isChecked()
             assert PerformancePanel(owner).granularity==unit
