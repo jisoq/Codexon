@@ -1,15 +1,15 @@
-"""Calendar performance trends with a persistent interval analysis panel."""
+"""Calendar trends and adaptive distributions with shared mode inspection."""
 import json
 from datetime import datetime, timedelta
 from bisect import bisect_left, bisect_right
 from math import ceil, log1p, isfinite
 from time import mktime
-from PySide6.QtCore import Qt, QPointF, QRectF, QTimer, QDate, Slot
-from PySide6.QtGui import QColor, QPen, QPolygonF, QPainter, QBrush
+from PySide6.QtCore import Qt, QPointF, QRectF, QTimer, QDate, Slot, Signal
+from PySide6.QtGui import QColor, QPen, QPolygonF, QPainter, QPainterPath
 from .charts import AnalyticalPlot, Plot, dynamic_bounds, value_text
 from .presentation import Node, Group, Column, Row, Button, Text, Choice, Input, DateInput, Scroll
 from .theme import shared_theme
-from .i18n import tr, Verbatim
+from .i18n import tr, Verbatim, formatted
 
 
 def clear(container):
@@ -21,6 +21,12 @@ def axis_number(value):
     if abs(value)>=1000000:return f'{value/1000000:.1f}M'
     if abs(value)>=10000:return f'{value/1000:.1f}k'
     return f'{value:,.4f}'.rstrip('0').rstrip('.') if abs(value)<.01 else f'{value:,.2f}'.rstrip('0').rstrip('.')
+
+
+def trend_bounds(values):
+    """Anchor nonnegative performance metrics at zero and pad their maximum."""
+    maximum=max((v for v in values if v is not None and isfinite(v)),default=0.)
+    return 0.,maximum*1.12 if maximum>0 else 1.
 
 
 def time_ticks(start,end,width):
@@ -83,9 +89,25 @@ def aggregation_text(unit):
               '세션 동일 비중 평균' if unit=='cache_ratio' else '구간 호출 수' if unit=='count' else '호출당 평균')
 
 
+def plot_values(data,selected,single,outer=False):
+    values=[]
+    for line in data['lines']:
+        if single and not selected(line):continue
+        for point in line['points']:
+            values.append(point['value'])
+            if single and data.get('rolling'):
+                stats=point['distribution']
+                if point.get('band_valid'):values.extend((stats['q1'],stats['q3']))
+                if outer and point.get('outer_valid'):values.extend((stats['p10'],stats['p90']))
+    if single and data.get('raw_visible'):
+        values.extend(p['value'] for p in data['points'] if selected(p))
+    return values
+
+
 def interval_dates(start,end):
     first,last=datetime.fromtimestamp(start),datetime.fromtimestamp(end)
-    return first.strftime('%Y.%m.%d %H:%M')+'\n→ '+last.strftime('%m.%d %H:%M' if first.year==last.year else '%Y.%m.%d %H:%M')
+    clock='%H:%M:%S' if end-start<3600 else '%H:%M'
+    return first.strftime('%Y.%m.%d '+clock)+'\n→ '+last.strftime(('%m.%d ' if first.year==last.year else '%Y.%m.%d ')+clock)
 
 
 def series_pen(color,mode,width=3.2):
@@ -96,22 +118,22 @@ def series_pen(color,mode,width=3.2):
 
 def series_mark(p,xy,mode,size=3):
     if mode=='Fast':
-        p.drawPolygon(QPolygonF([QPointF(xy.x(),xy.y()-size-1),QPointF(xy.x()+size+1,xy.y()),QPointF(xy.x(),xy.y()+size+1),QPointF(xy.x()-size-1,xy.y())]))
+        p.drawPolygon(QPolygonF([QPointF(xy.x(),xy.y()-size-1),QPointF(xy.x()+size+1,xy.y()+size),QPointF(xy.x()-size-1,xy.y()+size)]))
     else:p.drawEllipse(xy,size,size)
 
 
 class SeriesLegend(Plot):
-    def __init__(self,model,mode,active,boxplot=False):
-        super().__init__();self.model=model;self.mode=mode;self.active=active;self.boxplot=boxplot
+    def __init__(self,model,mode,active,bands=False):
+        super().__init__();self.model=model;self.mode=mode;self.active=active;self.bands=bands
         self.setFixedSize(48,26);self.setFocusPolicy(Qt.NoFocus)
         shared_theme().changed.connect(self.update)
 
     def paint(self,painter):
         p=self._painter;p.setRenderHint(QPainter.Antialiasing)
         color=QColor(shared_theme().model_mode_color(self.model,self.mode));color.setAlphaF(1 if self.active else .2)
-        if self.boxplot:
-            p.setPen(series_pen(color,self.mode,1.5));p.setBrush(QBrush(color,Qt.BDiagPattern) if self.mode=='Fast' else Qt.NoBrush)
-            p.drawLine(QPointF(4,13),QPointF(44,13));p.drawRect(QRectF(14,5,20,16));return
+        if self.bands:
+            shade=QColor(color);shade.setAlphaF(.16 if self.active else .03)
+            p.fillRect(QRectF(3,5,42,16),shade)
         p.setPen(series_pen(color,self.mode));p.drawLine(QPointF(3,13),QPointF(45,13))
         p.setPen(QPen(color,1.5));p.setBrush(QColor(shared_theme().palette['surface']))
         series_mark(p,QPointF(24,13),self.mode)
@@ -170,9 +192,13 @@ class IntervalDetails(Group):
         self.distribution_title=caption('개별 호출 분포',13,'ink',True);stats.addWidget(self.distribution_title)
         middle=Row();middle.setSpacing(8);stats.addLayout(middle)
         middle.addWidget(caption('중앙값',12),1);self.median=caption('',18,'ink',True);self.median.put(wrap=False);middle.addWidget(self.median)
+        mean_row=Row();mean_row.setSpacing(8);stats.addLayout(mean_row)
+        self.mean_label=caption('평균',12);mean_row.addWidget(self.mean_label,1)
+        self.mean=caption('',18,'ink',True);self.mean.put(wrap=False);mean_row.addWidget(self.mean)
         self.range_plot=DistributionRange();stats.addWidget(self.range_plot)
         self.range_text=caption('',12);stats.addWidget(self.range_text)
-        self.box_text=caption('',12);stats.addWidget(self.box_text);self.box_text.hide()
+        self.band_text=caption('',12);stats.addWidget(self.band_text);self.band_text.hide()
+        self.mode_comparison=caption('',12);body.addWidget(self.mode_comparison);self.mode_comparison.hide()
         separator=Group();separator.put(background='border');separator.setFixedHeight(1);body.addWidget(separator)
         body.addWidget(caption('계산 근거',13,'ink',True))
         self.formula=caption('',11);body.addWidget(self.formula)
@@ -186,6 +212,7 @@ class IntervalDetails(Group):
     def clear(self):
         self.title.setText(tr('구간 분석'));self.identity.setText('');self.value.setText('—');self.unit.setText('')
         self.period.setText('');self.hint.show();self.comparison.hide();self.distribution.hide()
+        self.mode_comparison.hide();self.band_text.hide()
         for value in self.sample_values.values():value.setText('—');value.put(color='ink')
         for note in self.sample_notes.values():note.setText('')
         self.formula.setText('')
@@ -196,11 +223,11 @@ class IntervalDetails(Group):
             row.setVisible(index<len(rows))
             if index<len(rows):label.setText(tr(rows[index][0]));value.setText(Verbatim(rows[index][1]))
 
-    def set_point(self,point,spec,boxplot=False):
+    def set_point(self,point,spec,bands=False):
         unit=spec['unit'];fmt=lambda value:tr(value_text(value,unit))
         self.hint.hide();self.title.setText(tr(spec['title']))
         self.identity.setText(Verbatim(point['model']+' / '+point['service_tier']+(' / '+point['effort'] if point.get('effort') else '')))
-        self.value.setText(Verbatim(axis_number(point['value'])));self.unit.setText(Verbatim(metric_unit(unit)))
+        self.value.setText(Verbatim(axis_number(point['value']) if point['value'] is not None else '—'));self.unit.setText(Verbatim(metric_unit(unit)))
         period=interval_dates(point['start'],point['end'])
         if not point['complete']:period+='  /  '+tr(point['status'])
         self.period.setText(Verbatim(period));self.comparison.show()
@@ -223,6 +250,8 @@ class IntervalDetails(Group):
         stats=point['distribution'];self.distribution.setVisible(unit!='count')
         self.distribution_title.setText(tr('세션별 적중률 분포' if unit=='cache_ratio' else '개별 호출 분포'))
         self.median.setText(Verbatim(fmt(stats['median'])));self.range_plot.set_stats(stats)
+        self.mean_label.setText(tr('시간 가중평균' if unit=='output_speed' else '평균'))
+        self.mean.setText(Verbatim(fmt(point.get('mean',point['value']))))
         self.range_text.setText(Verbatim(tr('중앙 80% 범위')+'\n'+fmt(stats['p10'])+' — '+fmt(stats['p90'])) if stats['p10'] is not None else tr('분포 범위 표시: 표본 10개 이상'))
         totals=point['totals'];self.formula.setText(Verbatim(aggregation_text(unit)))
         if unit=='output_speed':rows=[('총 출력 토큰',f"{totals['output']:,}"),('총 소요시간',tr(value_text(totals['seconds'],'duration')))]
@@ -230,18 +259,37 @@ class IntervalDetails(Group):
         elif unit=='count':rows=[('구간 호출 수',f"{point['calls']:,}")]
         else:rows=[('유효 표본 합계',fmt(totals.get('sum')))]
         self.set_totals(rows)
-        self.box_text.setVisible(boxplot)
-        if boxplot:
-            self.value.setText(Verbatim(axis_number(stats['median'])));self.comparison.hide()
-            self.title.setText(tr(spec['title'])+' / '+tr('중앙값'))
-            self.range_text.setText(Verbatim('Q1  '+fmt(stats['q1'])+'\nQ3  '+fmt(stats['q3'])))
-            self.box_text.setText(Verbatim(tr('아래 수염')+'  '+fmt(stats['whisker_low'])+'\n'+tr('위 수염')+'  '+fmt(stats['whisker_high'])+'\n'+tr('수염 밖 관측값')+f"  {stats['outlier_count']:,}"))
-            if point['coverage'][0]<4:self.box_text.setText(Verbatim(self.box_text.text()+'\n'+tr('표본 4개 미만: 분포 해석 주의')))
-            self.formula.setText(tr('세션별 적중률 분포' if unit=='cache_ratio' else '개별 호출 분포')+'\n'+tr('분위수: 정렬한 표본 사이 선형 보간'))
-            self.range_plot.set_stats(dict(stats,p10=stats['q1'],p90=stats['q3']))
+        self.band_text.setVisible(bands)
+        self.mode_comparison.hide()
+        if bands:
+            self.comparison.hide()
+            self.range_text.setText(Verbatim(tr('중앙 50% 범위')+'\n'+fmt(stats['q1'])+' — '+fmt(stats['q3'])) if point['band_valid'] else tr('중앙 50% 표시: 표본 10개 이상'))
+            self.band_text.setText(Verbatim(tr('중앙 80% 범위')+'\n'+fmt(stats['p10'])+' — '+fmt(stats['p90'])) if point['outer_valid'] else tr('중앙 80% 표시: 표본 30개 이상'))
+            if unit=='duration':
+                self.formula.setText(tr('대표선: 호출 소요시간 중앙값'))
+                if stats['p90'] is not None:self.band_text.setText(Verbatim(self.band_text.text()+'\nP90  '+fmt(stats['p90'])))
+            self.range_plot.set_stats(dict(stats,p10=stats['q1'] if point['band_valid'] else None,p90=stats['q3'] if point['band_valid'] else None))
+            if point['value'] is None and point['complete']:self.period.setText(Verbatim(period+' / '+tr(point['status'])))
+
+    def set_modes(self,points,unit):
+        self.mode_comparison.setVisible(bool(points))
+        fmt=lambda value:tr(value_text(value,unit))
+        lines=[tr('같은 시각 모드 비교')]
+        for point in points:
+            value=fmt(point['value']) if point['value'] is not None else tr(point['status'])
+            lines.append(point['service_tier']+'  '+value+' / '+tr('표본')+f" {point['coverage'][0]:,}")
+            if unit!='count':lines.append(tr('시간 가중평균' if unit=='output_speed' else '평균')+' '+fmt(point.get('mean'))+' / '+tr('중앙값')+' '+fmt(point['distribution']['median']))
+        if len(points)==2 and all(p['value'] is not None for p in points):
+            by_mode={p['service_tier']:p for p in points}
+            if 'Standard' in by_mode and 'Fast' in by_mode:
+                standard=by_mode['Standard']['value'];fast=by_mode['Fast']['value']
+                if unit=='cache_ratio':lines.append(tr('Fast 대표값 차이')+f' {fast-standard:+.1f}%p')
+                elif standard>0:lines.append(tr('Fast 대표값 차이')+f' {(fast/standard-1)*100:+.1f}%')
+        self.mode_comparison.setText(Verbatim('\n'.join(lines)))
 
 
 class PerformancePlot(AnalyticalPlot):
+    repaintRequested=Signal()
     def __init__(self,panel):
         super().__init__();self.panel=panel;self.data={};self.times=[];self.strip=[]
         self.setFixedHeight(390);self.bounds=(0,1);self.shared_bounds=False
@@ -249,16 +297,19 @@ class PerformancePlot(AnalyticalPlot):
         self.setAccessibleName('성능 추이 / 방향키로 시각 확인')
 
     @property
-    def boxplot(self):return self.panel.single_model() and self.data.get('unit')!='count'
+    def rolling(self):return self.panel.single_model() and self.data.get('rolling',False)
+
+    @property
+    def bands(self):return self.rolling and self.data.get('unit')!='count'
 
     def set_data(self,data,bounds=None):
         self.data=data;self.metric=data['unit']
-        self.put(clickEnabled=self.boxplot)
-        self.set_rows(sorted((point for line in data['lines'] for point in line['points'] if point['value'] is not None
+        self.put(clickEnabled=self.rolling)
+        self.set_rows(sorted((point for line in data['lines'] for point in line['points'] if (point['value'] is not None or self.bands)
                              and (not self.panel.single_model() or self.selected_style(point))),key=lambda p:(p['ts'],p['service_tier'])))
         self.shared_bounds=bounds is not None
-        values=[v for point in self.rows for v in (point['distribution']['minimum'],point['distribution']['maximum'])] if self.boxplot else [p['value'] for p in self.rows]
-        self.times=[p['ts'] for p in self.rows];self.bounds=bounds if bounds is not None else dynamic_bounds(values);self.rebuild_strip()
+        values=plot_values(data,self.selected_style,self.panel.single_model(),self.panel.show_outer)
+        self.times=[p['ts'] for p in self.rows];self.bounds=bounds if bounds is not None else trend_bounds(values);self.rebuild_strip()
 
     def selected_style(self,p):
         return p['model'] not in ('미확인','codex-auto-review') and self.panel.is_model_selected(p['model']) and self.panel.modes.get(p['service_tier'],False)
@@ -276,32 +327,42 @@ class PerformancePlot(AnalyticalPlot):
 
     def strip_top(self):return self.height()-62
 
-    def box_geometry(self,point):
-        modes=[m for m in ('Standard','Fast') if self.panel.modes.get(m)]
-        span=max(1,self.x(point['end'])-self.x(point['start']))
-        offset=min(16,span*.22) if len(modes)==2 else 0
-        x=self.x(point['ts'])+(offset if point['service_tier']=='Fast' else -offset)
-        width=max(1,min(20,span/(max(1,len(modes))*2.5)))
-        return max(76+width/2,min(self.width()-20-width/2,x)),width
-
     def xy(self,p):
-        return QPointF(self.box_geometry(p)[0],self.y(p['distribution']['median'])) if self.boxplot else QPointF(self.x(p['ts']),self.y(p['value']))
+        return QPointF(self.x(p['ts']),self.y(p['value'] if p['value'] is not None else self.bounds[0]))
 
-    def paint_boxes(self,p):
-        for point in self.rows:
-            s=point['distribution'];x,width=self.box_geometry(point);color=self.ink(point);mode=point['service_tier']
-            p.setPen(QPen(color,1.5));p.drawLine(QPointF(x,self.y(s['whisker_low'])),QPointF(x,self.y(s['whisker_high'])))
-            for v in (s['whisker_low'],s['whisker_high']):p.drawLine(QPointF(x-width*.35,self.y(v)),QPointF(x+width*.35,self.y(v)))
-            shade=QColor(color);shade.setAlphaF(.18)
-            p.setBrush(QBrush(color,Qt.BDiagPattern) if mode=='Fast' else QBrush(shade));p.setPen(series_pen(color,mode,1.5))
-            p.drawRect(QRectF(x-width/2,self.y(s['q3']),width,max(1,self.y(s['q1'])-self.y(s['q3']))))
-            p.setPen(QPen(color,2.5));p.drawLine(QPointF(x-width/2-1,self.y(s['median'])),QPointF(x+width/2+1,self.y(s['median'])))
-            p.setBrush(self.color('surface'));p.setPen(QPen(color,1.2))
-            for value in s['outliers']:p.drawEllipse(QPointF(x,self.y(value)),2.5,2.5)
+    def paint_bands(self,p):
+        for line in self.data['lines']:
+            if not self.selected_style(line):continue
+            bands=[('q1','q3','band_valid',.16)]
+            if self.panel.show_outer:bands.insert(0,('p10','p90','outer_valid',.055))
+            for low,high,valid_key,alpha in bands:
+                previous=None
+                for point in line['points']:
+                    if not point.get(valid_key):previous=None;continue
+                    if previous and point['bucket']==previous['bucket']+1:
+                        a,b=previous['distribution'],point['distribution'];x1,x2=self.x(previous['ts']),self.x(point['ts'])
+                        p.setPen(Qt.NoPen);p.setBrush(self.ink(line,alpha))
+                        p.drawPolygon(QPolygonF([QPointF(x1,self.y(a[low])),QPointF(x1,self.y(a[high])),
+                                                QPointF(x2,self.y(b[high])),QPointF(x2,self.y(b[low]))]))
+                        if low=='q1':
+                            p.setPen(series_pen(self.ink(line,.55),line['service_tier'],1))
+                            for edge in (low,high):p.drawLine(QPointF(x1,self.y(a[edge])),QPointF(x2,self.y(b[edge])))
+                    previous=point
+
+    def matching_points(self,stamp):
+        points=[]
+        for line in self.data.get('lines',[]):
+            if not self.selected_style(line) or not line['points']:continue
+            sequence=line['points']
+            # Both modes use the same sampling grid. Inspection snaps to a real calculation.
+            times=[p['ts'] for p in sequence];index=bisect_left(times,stamp)
+            point=min(sequence[max(0,index-1):index+1],key=lambda p:abs(p['ts']-stamp))
+            points.append(point)
+        return sorted(points,key=lambda p:(p['model'],p['service_tier']!='Standard'))
 
     def rebuild_strip(self):
         cells={};a,z=self.panel.range
-        for point in ([] if self.boxplot else self.data.get('points',[])):
+        for point in ([] if self.rolling else self.data.get('points',[])):
             if not point.get('count') or not self.selected_style(point):continue
             index=min(79,max(0,int((point['ts']-a)/(z-a)*80)))
             cell=cells.setdefault((index,point['direction']),dict(index=index,direction=point['direction'],count=0))
@@ -309,24 +370,13 @@ class PerformancePlot(AnalyticalPlot):
         self.strip=list(cells.values());self.update()
 
     def strip_cell(self,x,y):
-        if self.boxplot:return None
+        if self.rolling:return None
         if not self.strip_top()<=y<=self.strip_top()+20:return None
         index=int((x-76)/max(1,self.width()-96)*80)
         direction=1 if y<self.strip_top()+10 else -1
         return next((c for c in self.strip if c['index']==index and c['direction']==direction),None)
 
     def time_labels(self,metrics):
-        if self.boxplot:
-            from .performance_trends import calendar_edges
-            start,end=self.panel.range;edges=calendar_edges(start,end,'day');labels=[]
-            for a,z in zip(edges,edges[1:]):
-                if a>=end:continue
-                stamp=(max(a,start)+min(z,end))/2
-                text=datetime.fromtimestamp(a).strftime('%m/%d\n%Y' if not labels else '%m/%d')
-                width=max(metrics.horizontalAdvance(line) for line in text.split('\n'))+4
-                rect=QRectF(max(76,min(self.width()-20-width,self.x(stamp)-width/2)),self.height()-36,width,36)
-                if not labels or rect.left()>=labels[-1][2].right()+12:labels.append((stamp,text,rect))
-            return labels
         ticks,step=time_ticks(*self.panel.range,max(1,self.width()-96))
         labels=[]
         for stamp in ticks:
@@ -354,22 +404,33 @@ class PerformancePlot(AnalyticalPlot):
             y=self.y(lo+(hi-lo)*f);p.drawLine(QPointF(76,y),QPointF(self.width()-20,y))
             p.setPen(self.color('muted'));p.drawText(QRectF(0,y-10,66,20),Qt.AlignRight|Qt.AlignVCenter,axis_number(lo+(hi-lo)*f))
             p.setPen(QPen(self.color('grid'),1))
-        if self.boxplot:self.paint_boxes(p)
-        for line in ([] if self.boxplot else sorted(self.data.get('lines',[]),key=self.selected_style)):
+        p.save();p.setClipRect(QRectF(73,25,max(1,self.width()-90),self.height()-94))
+        if self.bands:
+            self.paint_bands(p)
+            if self.data.get('raw_visible'):
+                for point in self.data['points']:
+                    if not self.selected_style(point):continue
+                    p.setPen(Qt.NoPen);p.setBrush(self.ink(point,.35));series_mark(p,self.xy(point),point['service_tier'],2)
+        for line in sorted(self.data.get('lines',[]),key=self.selected_style):
             if self.panel.single_model() and not self.selected_style(line):continue
-            points=line['points'];previous=None
+            points=line['points'];previous=None;path=QPainterPath()
             color=self.ink(line);mode=line['service_tier']
-            p.setPen(series_pen(color,mode))
+            p.setPen(series_pen(color,mode));p.setBrush(Qt.NoBrush)
             for point in points:
                 if point['value'] is None:previous=None;continue
                 xy=self.xy(point)
-                if previous and point['bucket']==previous[0]+1:p.drawLine(previous[1],xy)
-                previous=(point['bucket'],xy)
+                if previous is not None and point['bucket']==previous+1:path.lineTo(xy)
+                else:path.moveTo(xy)
+                previous=point['bucket']
+            # One path preserves dash phase across short rolling segments.
+            p.drawPath(path)
             p.setPen(QPen(color,1.5));p.setBrush(self.color('surface'))
-            for point in points:
-                if point['value'] is not None:series_mark(p,self.xy(point),mode)
+            for index,point in enumerate(points):
+                isolated=(index==0 or points[index-1]['value'] is None) and (index==len(points)-1 or points[index+1]['value'] is None)
+                if point['value'] is not None and (not self.bands or isolated):series_mark(p,self.xy(point),mode)
+        p.restore()
         strip=self.strip_top()
-        if not self.boxplot:
+        if not self.rolling:
             p.setPen(self.color('muted'));p.drawText(QRectF(0,strip-1,66,22),Qt.AlignRight|Qt.AlignVCenter,tr('이탈'))
             p.fillRect(QRectF(76,strip,self.width()-96,20),self.color('panel'))
         maximum=max((cell['count'] for cell in self.strip),default=1)
@@ -377,21 +438,31 @@ class PerformancePlot(AnalyticalPlot):
             color=self.color('warning' if cell['direction']>0 else 'accent');color.setAlphaF(.25+.65*log1p(cell['count'])/log1p(maximum))
             w=(self.width()-96)/80
             p.fillRect(QRectF(76+cell['index']*w,strip if cell['direction']>0 else strip+11,max(1,w-1),8),color)
-        stamp=self.panel.inspection_time
-        if stamp is not None and self.panel.range[0]<=stamp<=self.panel.range[1]:
-            p.setPen(QPen(self.color('muted'),1,Qt.DashLine));p.drawLine(QPointF(self.x(stamp),15),QPointF(self.x(stamp),strip+20))
         p.setPen(self.color('muted'))
         for stamp,text,rect in self.time_labels(p.fontMetrics()):
             p.drawLine(QPointF(self.x(stamp),strip+21),QPointF(self.x(stamp),strip+25))
             p.drawText(rect,Qt.AlignHCenter|Qt.AlignTop,text)
 
+    def paint_overlay(self,p):
+        if not self.rows and not self.shared_bounds:return
+        stamp=self.panel.inspection_time
+        if stamp is not None and self.panel.range[0]<=stamp<=self.panel.range[1]:
+            p.setRenderHint(QPainter.Antialiasing)
+            p.setPen(QPen(self.color('muted'),1,Qt.DashLine))
+            p.drawLine(QPointF(self.x(stamp),15),QPointF(self.x(stamp),self.strip_top()+20))
+            if self.rolling:
+                for point in self.matching_points(stamp):
+                    if point['value'] is None:continue
+                    p.setPen(QPen(self.ink(point),1.5));p.setBrush(self.color('surface'))
+                    series_mark(p,self.xy(point),point['service_tier'],4)
+
     def nearest(self,x,y):
         if not self.rows:return None
-        if self.boxplot:
-            # Do not substitute a neighbouring date when this date has no samples.
-            candidates=[point for point in self.rows if self.x(point['start'])<=x<=self.x(point['end'])]
-            return min(candidates,key=lambda point:abs(self.xy(point).x()-x),default=None)
         a,z=self.panel.range;t=a+(x-76)/max(1,self.width()-96)*(z-a)
+        if self.rolling:
+            points=self.matching_points(t)
+            valid=[point for point in points if point['value'] is not None]
+            return min(valid or points,key=lambda point:abs(self.xy(point).y()-y),default=None)
         tolerance=(z-a)*10/max(1,self.width()-96)
         left=bisect_left(self.times,t-tolerance);right=bisect_right(self.times,t+tolerance)
         candidates=self.rows[left:right]
@@ -411,7 +482,7 @@ class PerformancePlot(AnalyticalPlot):
         return ''
 
     def activate_at(self,x,y):
-        if self.boxplot:self.tip_at(x,y)
+        if self.rolling:self.tip_at(x,y)
 
     def key(self,key):
         if key in (Qt.Key_Plus,Qt.Key_Equal):self.panel.zoom(.5)
@@ -451,63 +522,78 @@ class PerformancePanel(Group):
         try:saved=json.loads(dashboard.settings.value('performance/selection','{}'))
         except (ValueError,TypeError):saved={}
         self.granularity=saved.get('granularity','day')
-        if self.granularity not in ('day','week','month'):self.granularity='day'
+        if self.granularity not in ('auto','day','week','month'):self.granularity='day'
         self.reasoning_effort=saved.get('reasoning_effort','high');self.reasoning_specs={};self.reasoning_buttons={}
         self.models=saved.get('models',{});self.modes=saved.get('modes',{'Standard':True,'Fast':True})
-        if self.single_model():self.granularity='day'
+        self.show_outer=False
+        if self.single_model():self.granularity='auto'
+        elif self.granularity=='auto':self.granularity='day'
         if not any(self.modes.values()):self.modes={'Standard':True,'Fast':True}
         self.resize_timer=QTimer(self);self.resize_timer.setSingleShot(True);self.resize_timer.setInterval(180);self.resize_timer.timeout.connect(self.request)
-        self.body=Column(self);self.body.setSpacing(8)
-        toolbar=Row();toolbar.put(flow=True,spacing=8);self.body.addLayout(toolbar)
-        self.model_choice=Choice();self.model_choice.setFixedWidth(230);self.model_choice.currentIndexChanged.connect(self.choose_model);toolbar.addWidget(self.model_choice)
-        self.add_button=button('+ 비교 추가',self.toggle_picker);toolbar.addWidget(self.add_button)
-        self.mode_buttons={}
-        for title,mode in (('전체 모드','all'),('Standard','Standard'),('Fast','Fast')):
-            b=button(title,lambda m=mode:self.choose_mode(m));b.setCheckable(True);b.put(selectionTab=True,flat=True);toolbar.addWidget(b);self.mode_buttons[mode]=b
-        self.legend_button=button('범례',self.toggle_legend);self.legend_button.setCheckable(True);self.legend_button.setChecked(True);toolbar.addWidget(self.legend_button)
-        self.picker=Group();self.picker.hide();pick=Column(self.picker);self.body.addWidget(self.picker)
-        self.search=Input();self.search.setPlaceholderText('비교할 모델 검색');self.search.textChanged.connect(self.search_models);pick.addWidget(self.search)
+        self.body=Column(self);self.body.setSpacing(16)
+        content=Row();content.setSpacing(20);self.body.addLayout(content,1)
+        self.legend_scroll=Scroll();self.legend_scroll.setFixedWidth(252);self.legend_scroll.put(fillViewport=True)
+        self.legend_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff);content.addWidget(self.legend_scroll)
+        left=Group();left.put(background='secondary',radius=6)
+        left_body=Column(left);left_body.setContentsMargins(16,16,16,16);left_body.setSpacing(12)
+        left_body.addWidget(caption('비교 대상',16,'ink',True));left_body.addWidget(caption('모델',12))
+        self.model_choice=Choice();self.model_choice.setFixedWidth(220);self.model_choice.setAccessibleName('모델 선택')
+        self.model_choice.currentIndexChanged.connect(self.choose_model);left_body.addWidget(self.model_choice)
+        self.add_button=button('+ 모델 추가',self.toggle_picker);self.add_button.setFixedWidth(220);left_body.addWidget(self.add_button)
+        self.picker=Group();self.picker.hide();pick=Column(self.picker);left_body.addWidget(self.picker)
+        self.search=Input();self.search.setFixedWidth(220);self.search.setPlaceholderText('비교할 모델 검색')
+        self.search.textChanged.connect(self.search_models);pick.addWidget(self.search)
         self.search_results=Row();self.search_results.put(flow=True,spacing=6);pick.addLayout(self.search_results)
-        navigation=Row();navigation.put(flow=True,spacing=6);self.body.addLayout(navigation)
-        aggregation=Row();aggregation.setSpacing(6);navigation.addLayout(aggregation)
-        label=caption('집계 단위',12);label.put(wrap=False);aggregation.addWidget(label)
-        self.granularity_buttons={}
-        for title,unit in (('일별','day'),('주별','week'),('월별','month')):
-            b=button(title,lambda u=unit:self.choose_granularity(u));b.setCheckable(True);b.put(selectionTab=True,flat=True)
-            aggregation.addWidget(b);self.granularity_buttons[unit]=b
-        self.granularity_buttons['week'].setToolTip('월요일 시작')
-        periods=Row();periods.setSpacing(6);navigation.addLayout(periods)
-        label=caption('조회 기간',12);label.put(wrap=False);periods.addWidget(label);self.period_buttons={}
-        for title,preset in (('최근 7일','7d'),('최근 30일','30d'),('전체','all')):
+        left_body.addWidget(caption('실행 모드',12));modes=Row();modes.setSpacing(4);left_body.addLayout(modes)
+        self.mode_buttons={}
+        for title,mode,width in (('전체','all',60),('Standard','Standard',94),('Fast','Fast',58)):
+            b=button(title,lambda m=mode:self.choose_mode(m));b.setCheckable(True);b.setFixedWidth(width)
+            modes.addWidget(b);self.mode_buttons[mode]=b
+        separator=Group();separator.put(background='border');separator.setFixedHeight(1);left_body.addWidget(separator)
+        left_body.addWidget(caption('선택 모델과 범례',12));self.legend=Column();self.legend.setSpacing(16)
+        left_body.addLayout(self.legend);left_body.addStretch()
+        separator=Group();separator.put(background='border');separator.setFixedHeight(1);left_body.addWidget(separator)
+        left_body.addWidget(caption('그래프 읽는 법',12,'ink',True));self.chart_help=caption('',12);left_body.addWidget(self.chart_help)
+        self.legend_scroll.setWidget(left)
+        center=Column();center.setSpacing(10);content.addLayout(center,1)
+        periods=Row();periods.put(flow=True,spacing=4);center.addLayout(periods)
+        label=caption('조회 기간',13,'ink',True);label.put(wrap=False);label.setMinimumWidth(64);periods.addWidget(label)
+        self.period_buttons={}
+        for title,preset,width in (('최근 7일','7d',92),('최근 30일','30d',100),('전체','all',64)):
             b=button(title,lambda p=preset:self.choose_period(p));b.setCheckable(True);b.put(selectionTab=True,flat=True)
-            periods.addWidget(b);self.period_buttons[preset]=b
-        self.period=button('',self.toggle_dates);self.period.setAccessibleName('조회 기간 변경');navigation.addWidget(self.period)
-        self.date_editor=Group();self.date_editor.hide();self.body.addWidget(self.date_editor)
+            b.setMinimumWidth(width);periods.addWidget(b);self.period_buttons[preset]=b
+        self.period=button('',self.toggle_dates);self.period.setAccessibleName('조회 기간 변경');center.addWidget(self.period)
+        self.date_editor=Group();self.date_editor.hide();center.addWidget(self.date_editor)
         dates=Row();dates.put(flow=True,spacing=6);Column(self.date_editor).addLayout(dates)
         dates.addWidget(caption('시작일',12));self.date_start=DateInput();dates.addWidget(self.date_start)
         dates.addWidget(caption('종료일',12));self.date_end=DateInput();dates.addWidget(self.date_end)
         self.date_apply=button('기간 적용',self.apply_dates);dates.addWidget(self.date_apply);dates.addWidget(button('닫기',self.date_editor.hide))
         self.date_error=caption('',12,'warning');dates.addWidget(self.date_error)
-        self.chart_help=caption('',12);self.body.addWidget(self.chart_help)
-        content=Row();content.setSpacing(20);self.body.addLayout(content,1)
-        self.legend_scroll=Scroll();self.legend_scroll.setFixedWidth(240);self.legend_scroll.put(fillViewport=True)
-        self.legend_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff);content.addWidget(self.legend_scroll)
-        legend_panel=Group();legend_panel.setObjectName('panel');legend_body=Column(legend_panel);legend_body.setContentsMargins(12,16,12,16);legend_body.setSpacing(14)
-        legend_body.addWidget(caption('범례',14,'ink',True));self.legend=Column();self.legend.setSpacing(16);legend_body.addLayout(self.legend);legend_body.addStretch()
-        self.legend_scroll.setWidget(legend_panel)
-        center=Column();center.setSpacing(4);content.addLayout(center,1)
-        self.chart_scroll=Scroll();self.chart_scroll.put(fillViewport=True);self.chart_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        charts=Group();self.chart_body=Column(charts);self.chart_body.setSpacing(8);self.chart_scroll.setWidget(charts);center.addWidget(self.chart_scroll,1)
         self.timeline_footer=Group();footer=Column(self.timeline_footer);footer.setSpacing(4);center.addWidget(self.timeline_footer)
-        separator=Group();separator.put(background='border');separator.setFixedHeight(1);footer.addWidget(separator)
         self.navigator=TimeNavigator(self);footer.addWidget(self.navigator)
         status=Row();status.put(flow=True,spacing=6);footer.addLayout(status)
-        self.follow_button=button('최신 따라가기',self.toggle_follow);self.follow_button.setCheckable(True);status.addWidget(self.follow_button)
-        self.latest_button=button('최신 이동',self.move_latest);status.addWidget(self.latest_button)
+        self.follow_button=button('최신 자동 추적',self.toggle_follow);self.follow_button.setCheckable(True);status.addWidget(self.follow_button)
+        self.follow_button.setToolTip('새 기록이 들어오면 조회 기간을 최신 시각으로 이동합니다.')
+        self.latest_button=button('최신으로 이동',self.move_latest);status.addWidget(self.latest_button)
+        self.latest_button.setToolTip('현재 기간 길이를 유지하며 최신 기록으로 이동하고 자동 추적을 켭니다.')
         self.collection_time=caption('',11);self.collection_time.put(wrap=False);status.addWidget(self.collection_time)
-        self.inspector=Scroll();self.inspector.setFixedWidth(310);self.inspector.put(fillViewport=True)
-        self.inspector.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff);content.addWidget(self.inspector)
-        self.details=IntervalDetails();self.inspector.setWidget(self.details)
+        separator=Group();separator.put(background='border');separator.setFixedHeight(1);footer.addWidget(separator)
+        navigation=Row();navigation.put(flow=True,spacing=6);center.addLayout(navigation)
+        self.aggregation=Row();self.aggregation.setSpacing(6);navigation.addLayout(self.aggregation)
+        label=caption('집계 단위',12);label.put(wrap=False);self.aggregation.addWidget(label);self.granularity_buttons={}
+        for title,unit in (('일별','day'),('주별','week'),('월별','month')):
+            b=button(title,lambda u=unit:self.choose_granularity(u));b.setCheckable(True);b.put(selectionTab=True,flat=True)
+            self.aggregation.addWidget(b);self.granularity_buttons[unit]=b
+        self.granularity_buttons['week'].setToolTip('월요일 시작')
+        self.window_note=caption('계산 폭 자동',12);self.window_note.put(wrap=False);navigation.addWidget(self.window_note)
+        self.window_note.setToolTip('조회 기간과 화면 너비에 맞춰 자동으로 계산합니다.')
+        self.chart_scroll=Scroll();self.chart_scroll.put(fillViewport=True);self.chart_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        charts=Group();self.chart_body=Column(charts);self.chart_body.setSpacing(8);self.chart_scroll.setWidget(charts);center.addWidget(self.chart_scroll,1)
+        right=Column();right.setFixedWidth(292);right.setSpacing(10);content.addLayout(right)
+        right.addWidget(caption('구간 분석',16,'ink',True))
+        self.inspector=Scroll();self.inspector.setFixedWidth(292);self.inspector.put(fillViewport=True)
+        self.inspector.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff);right.addWidget(self.inspector,1)
+        self.details=IntervalDetails();self.details.put(border='transparent',radius=0);self.inspector.setWidget(self.details)
         self.sync_selection()
         self.sync_navigation()
 
@@ -515,18 +601,35 @@ class PerformancePanel(Group):
     def single_model(self):return bool(self.models) and sum(bool(self.models.get(m)) for m in (self.available or self.models))==1
     def request(self):self.dashboard.render()
     def persist(self):self.dashboard.settings.setValue('performance/selection',json.dumps(dict(models=self.models,modes=self.modes,granularity=self.granularity,reasoning_effort=self.reasoning_effort)))
-    def toggle_legend(self):self.legend_scroll.setVisible(self.legend_button.isChecked())
     def choose_granularity(self,unit):
-        if self.single_model() and unit!='day':return
+        if self.single_model() or unit not in self.granularity_buttons:return
         if unit==self.granularity:
             self.granularity_buttons[unit].setChecked(True);return
         self.granularity=unit;self.inspect(None);self.persist();self.sync_selection();self.request()
+    def selection_is_current(self):
+        selected=[m for m in self.available if self.is_model_selected(m)]
+        single=self.single_model()
+        if getattr(self,'legend_entries',None)!=[(m,t) for m in selected for t in ('Standard','Fast')]:return False
+        legends=self.legend.findChildren(SeriesLegend)
+        if len(legends)!=len(selected)*2:return False
+        if any(mark.active!=self.modes.get(mark.mode,False) or mark.bands!=single for mark in legends):return False
+        if any(b.isChecked()!=(u==self.granularity) or b.isEnabled()==single for u,b in self.granularity_buttons.items()):return False
+        mode='all' if all(self.modes.get(t,False) for t in ('Standard','Fast')) else 'Fast' if self.modes.get('Fast') else 'Standard'
+        if any(b.isChecked()!=(k==mode) for k,b in self.mode_buttons.items()):return False
+        expected=['all']+(['compare'] if 1<len(selected)<len(self.available) else [])+self.available
+        if [self.model_choice.itemData(i) for i in range(self.model_choice.count())]!=expected:return False
+        key=selected[0] if single else 'all' if len(selected)==len(self.available) else 'compare'
+        return self.model_choice.currentData()==key
+
     def sync_selection(self):
+        # Range results already refresh plot data; unchanged selection UI stays mounted.
+        if self.selection_is_current():return
+        single=self.single_model()
+        self.aggregation.setVisible(not single);self.window_note.setVisible(single)
         for unit,b in self.granularity_buttons.items():
-            b.setChecked(unit==self.granularity);b.setEnabled(not self.single_model() or unit=='day')
-        self.chart_help.setText('상자: 중앙 50%   굵은 선: 중앙값   수염: 1.5×IQR 범위 내 실제 값   점: 수염 밖 관측값' if self.single_model() else
-                               '선: 구간별 추이   Y축: 추세선 범위   아래 띠: 개별 이상치')
-        self.chart_help.setToolTip('IQR = Q3 − Q1. 수염 밖 관측값이 많으면 대표값을 표시합니다. 호출 수는 일별 합계입니다.')
+            b.setChecked(unit==self.granularity);b.setEnabled(not single)
+        self.chart_help.setText('대표선: 지표별 평균 또는 중앙값\n분포 띠: 중앙 50% 표본 범위\nStandard: 실선과 원\nFast: 파선과 삼각형\n확대하면 개별 호출을 확인할 수 있습니다.' if single else '대표선: 집계 구간별 추이\n아래 띠: 개별 이상치\nStandard: 실선과 원\nFast: 파선과 삼각형')
+        self.chart_help.setToolTip('출력 속도는 시간 가중평균, 소요시간은 중앙값, 나머지는 평균입니다. 소요시간 중앙값은 표본 5개 이상에서 표시합니다. 띠는 신뢰구간이 아닌 표본 분포입니다. 호출 수는 겹치지 않는 구간 합계입니다.' if single else '')
         mode='all' if all(self.modes.get(m,False) for m in ('Standard','Fast')) else 'Fast' if self.modes.get('Fast') else 'Standard'
         for key,b in self.mode_buttons.items():b.setChecked(key==mode)
         clear(self.legend);self.legend_entries=[]
@@ -567,8 +670,9 @@ class PerformancePanel(Group):
         (self.models if model else self.modes)[key]=checked;self.selection_changed()
     def selection_changed(self):
         previous=self.inspected;self.inspect(None)
-        regroup=self.single_model() and self.granularity!='day'
-        if regroup:self.granularity='day'
+        desired='auto' if self.single_model() else 'day' if self.granularity=='auto' else self.granularity
+        regroup=desired!=self.granularity
+        self.granularity=desired
         self.persist();self.sync_selection()
         if regroup:self.inspect(None);self.request();return
         self.refresh_plots();self.refresh_inspection(previous)
@@ -576,8 +680,10 @@ class PerformancePanel(Group):
         self.picker.setVisible(not self.picker.isVisible());self.search.setText('');self.search_models()
     def search_models(self,*_):
         clear(self.search_results);query=self.search.text().casefold()
-        for model in self.available:
-            if query in model.casefold():self.search_results.addWidget(button(Verbatim(model),lambda m=model:self.add_model(m)))
+        matches=[m for m in self.available if query in m.casefold() and not self.is_model_selected(m)]
+        for model in matches:
+            node=button(Verbatim(model),lambda m=model:self.add_model(m));node.setFixedWidth(220);self.search_results.addWidget(node)
+        if not matches:self.search_results.addWidget(caption('추가할 모델이 없습니다.',12))
     def add_model(self,model):
         if all(self.is_model_selected(m) for m in self.available):self.models={m:m==model for m in self.available}
         else:self.models[model]=True
@@ -670,14 +776,18 @@ class PerformancePanel(Group):
     def show_interval(self,point,key):
         if self.inspected==(point,key):return
         self.inspected=(point,key);self.inspect(point['ts'])
-        spec=dict(self.specs[key],title=self.labels[key].text()) if self.plots[key].boxplot else self.specs[key]
-        self.details.set_point(point,spec,self.plots[key].boxplot)
+        plot=self.plots[key]
+        spec=dict(self.specs[key],title=self.labels[key].text()) if plot.bands else self.specs[key]
+        self.details.set_point(point,spec,plot.bands)
+        if plot.rolling:
+            self.details.comparison.hide();self.details.set_modes(plot.matching_points(point['ts']),spec['unit'])
 
     def refresh_inspection(self,previous=None,only=None):
         keys=[only] if only else list(self.plots)
         if previous and previous[1] in keys:keys.remove(previous[1]);keys.insert(0,previous[1])
         for key in keys:
-            plot=self.plots[key];points=[p for p in plot.rows if plot.selected_style(p)]
+            plot=self.plots[key];points=[p for p in plot.rows if plot.selected_style(p) and p['value'] is not None]
+            if not points:points=[p for p in plot.rows if plot.selected_style(p) and p['coverage'][0]]
             if points:
                 matching=[p for p in points if previous and p['model']==previous[0]['model'] and p['service_tier']==previous[0]['service_tier']]
                 point=min(matching,key=lambda p:abs(p['ts']-previous[0]['ts'])) if matching else points[-1]
@@ -688,7 +798,7 @@ class PerformancePanel(Group):
         if stamp is None:self.inspected=None;self.details.clear()
         if stamp==self.inspection_time:return
         self.inspection_time=stamp
-        for plot in self.plots.values():plot.update()
+        for plot in self.plots.values():plot.repaintRequested.emit()
 
     def reasoning_spec(self):
         return dict(self.reasoning_specs[self.reasoning_effort],key='reasoning',title='평균 추론 토큰')
@@ -708,12 +818,11 @@ class PerformancePanel(Group):
 
     def refresh_plots(self):
         if not self.plots:return
-        points=[point for spec in self.reasoning_specs.values() for line in spec['lines'] for point in line['points']
-                if not self.single_model() or self.is_model_selected(point['model']) and self.modes.get(point['service_tier'],False)]
-        values=[v for point in points for v in (point['distribution']['minimum'],point['distribution']['maximum'])] if self.single_model() else [p['value'] for p in points]
-        self.reasoning_bounds=dynamic_bounds(values)
-        titles={'cost':'일별 호출 비용 분포','output_speed':'일별 출력 속도 분포','duration':'일별 호출 소요시간 분포',
-                'session_cache':'일별 세션 캐시 적중률 분포','reasoning':'일별 추론 토큰 분포','input':'일별 입력 토큰 분포'}
+        selected=lambda point:self.is_model_selected(point['model']) and self.modes.get(point['service_tier'],False)
+        values=[v for spec in self.reasoning_specs.values() for v in plot_values(spec,selected,self.single_model(),self.show_outer)]
+        self.reasoning_bounds=trend_bounds(values)
+        titles={'cost':'평균 호출 비용과 분포','output_speed':'출력 속도 시간 가중평균과 분포','duration':'호출 소요시간 중앙값과 분포',
+                'session_cache':'세션 평균 캐시 적중률과 분포','reasoning':'평균 추론 토큰과 분포','input':'평균 입력 토큰과 분포'}
         for key,spec in list(self.specs.items()):
             self.labels[key].setText(titles.get(key,spec['title']) if self.single_model() else spec['title'])
             if key=='reasoning':
@@ -723,8 +832,8 @@ class PerformancePanel(Group):
                 label='유효 구간' if key=='count' else '유효 세션 표본' if key=='session_cache' else '유효 호출'
                 self.notes[key].setText(Verbatim(tr(label)+f" {spec['n']:,} / {spec['N']:,}"))
             if self.single_model():
-                rows=self.plots[key].rows
-                n=sum(p['coverage'][0] for p in rows);total=sum(p['coverage'][1] for line in spec['lines'] if self.plots[key].selected_style(line) for p in line['points'])
+                lines=[line for line in spec['lines'] if self.plots[key].selected_style(line)]
+                n=sum(line.get('coverage',(0,0))[0] for line in lines);total=sum(line.get('coverage',(0,0))[1] for line in lines)
                 label='호출 수' if key=='count' else '유효 세션 표본' if key=='session_cache' else '유효 호출'
                 self.notes[key].setText(Verbatim(tr(label)+f' {n:,} / {total:,}'+(' / '+tr('공통 Y축') if key=='reasoning' else '')))
 
@@ -732,6 +841,11 @@ class PerformancePanel(Group):
         previous=self.inspected
         self.inspect(None)
         self.range=(data['start'],data['end']);self.full=data['full'];self.available=[m for m in data['models'] if m not in ('미확인','codex-auto-review')]
+        if data.get('window_seconds'):
+            seconds=data['window_seconds'];unit='초' if seconds<60 else '분' if seconds<3600 else '시간' if seconds<86400 else '일'
+            value=seconds/(1 if unit=='초' else 60 if unit=='분' else 3600 if unit=='시간' else 86400)
+            templates={'초':'공통 계산 폭 {value}초','분':'공통 계산 폭 {value}분','시간':'공통 계산 폭 {value}시간','일':'공통 계산 폭 {value}일'}
+            self.window_note.setText(formatted(templates[unit],value=axis_number(value)))
         self.navigation_ready=True
         self.sync_navigation()
         collected=getattr(self.dashboard,'snapshot',{}).get('ts',self.full[1])

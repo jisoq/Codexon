@@ -29,9 +29,13 @@ class QuickPlot(QQuickPaintedItem):
     @source.setter
     def source(self,value):
         if self._source is value:return
-        if self._source:self._source.changed.disconnect(self.invalidate)
+        if self._source:
+            self._source.changed.disconnect(self.invalidate)
+            if hasattr(self._source,'repaintRequested'):self._source.repaintRequested.disconnect(self.update)
         self._source=value
-        if value:value.changed.connect(self.invalidate)
+        if value:
+            value.changed.connect(self.invalidate)
+            if hasattr(value,'repaintRequested'):value.repaintRequested.connect(self.update)
         self.sourceChanged.emit();self.invalidate()
     @Property(str,notify=tipChanged)
     def tip(self):return self._tip
