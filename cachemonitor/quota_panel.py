@@ -89,6 +89,11 @@ class QuotaBar(Plot):
 from .quota_chart import QuotaHistory
 
 
+def format_credit_balance(balance):
+    text=format(Decimal(balance),',f')
+    return text.rstrip('0').rstrip('.') if '.' in text else text
+
+
 class QuotaPanel(Group):
     home_selected=Signal(str)
 
@@ -333,7 +338,7 @@ class QuotaPanel(Group):
         credits=(quota or {}).get('credits') or {}
         balance=credits.get('balance')
         self.credit_balance.setText('∞' if fresh and credits.get('unlimited') else
-                                   f'{Decimal(balance):,f}' if fresh and balance is not None else '—')
+                                   format_credit_balance(balance) if fresh and balance is not None else '—')
         self.credit_balance.setToolTip('제한 없음' if fresh and credits.get('unlimited') else '크레딧 잔액')
         self.credit_note.setText(('보유 크레딧 없음' if balance is not None and Decimal(balance)==0 else '사용 가능')
                                  if fresh and (balance is not None or credits.get('unlimited')) else

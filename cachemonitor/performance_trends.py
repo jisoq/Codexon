@@ -1,6 +1,6 @@
 """Worker-owned, bounded historical performance projections."""
 from collections import defaultdict, deque
-from math import isfinite
+from math import ceil, isfinite
 from bisect import bisect_left, bisect_right
 from datetime import datetime, timedelta
 from time import mktime
@@ -10,6 +10,77 @@ from .analytics import effort_key, sorted_quantile
 METRICS = (('cost','평균 호출 비용','cost'),
            ('output_speed','출력 속도','output_speed'), ('duration','평균 호출 소요시간','duration'),
            ('session_cache','세션 평균 캐시 적중률','cache_ratio'))
+
+MIN_CENTER = 5
+MIN_BAND = 10
+MIN_OUTER_BAND = 30
+
+
+def rolling_window(span):
+    """One common duration for every model/mode, independent of sample density."""
+    target=max(1.,span/24)
+    steps=(1,2,5,10,15,30,60,120,300,600,900,1800,3600,7200,10800,21600,43200,
+           86400,172800,345600,604800,1209600,2592000)
+    return next((step for step in steps if step>=target),ceil(target/2592000)*2592000)
+
+
+def metric_population(items,metric):
+    """Values and their denominators; session cache samples retain equal session weight."""
+    if metric=='count':
+        return [],len(items),dict(sum=len(items))
+    if metric=='session_cache':
+        sessions=defaultdict(lambda:[0,0,0])
+        for row in items:
+            totals=sessions[(row['home'],row['sid'])]
+            if (valid(row.get('input')) and valid(row.get('cached')) and row['cached']<=row['input']
+                    and not row.get('input_conflict')):
+                totals[0]+=row['input'];totals[1]+=row['cached'];totals[2]+=1
+        eligible=[t for t in sessions.values() if t[0]>0]
+        values=[100*t[1]/t[0] for t in eligible]
+        return values,len(sessions),dict(input=sum(t[0] for t in eligible),cached=sum(t[1] for t in eligible),
+                                        valid_calls=sum(t[2] for t in eligible))
+    field='reasoning' if metric.startswith('reasoning:') else metric
+    measured=[r for r in items if valid(r.get(field))]
+    values=[r[field] for r in measured]
+    totals=dict(sum=sum(values))
+    if metric=='output_speed':
+        # Use exactly the same eligible calls for numerator, denominator, and distribution.
+        measured=[r for r in measured if valid(r.get('output')) and valid(r.get('completion_latency_ms'))
+                  and r['completion_latency_ms']>0]
+        values=[r[field] for r in measured]
+        totals=dict(output=sum(r['output'] for r in measured),seconds=sum(r['completion_latency_ms']/1000 for r in measured))
+    return values,len(items),totals
+
+
+def distribution_statistics(values):
+    ordered=sorted(values)
+    return dict(median=sorted_quantile(ordered,.5),q1=sorted_quantile(ordered,.25),q3=sorted_quantile(ordered,.75),
+                p10=sorted_quantile(ordered,.1) if len(ordered)>=MIN_OUTER_BAND else None,
+                p90=sorted_quantile(ordered,.9) if len(ordered)>=MIN_OUTER_BAND else None,
+                minimum=ordered[0] if ordered else None,maximum=ordered[-1] if ordered else None)
+
+
+def representative_mean(values,totals,metric):
+    if metric=='count':return totals['sum']
+    if metric=='output_speed':return totals['output']/totals['seconds'] if totals['seconds'] else None
+    return sum(values)/len(values) if values else None
+
+
+def bounded_observations(items,metric,start,end,width):
+    """Preserve extrema and endpoints per screen column without changing statistics."""
+    if metric in ('session_cache','count') or end-start>3600:return []
+    field='reasoning' if metric.startswith('reasoning:') else metric
+    cells={}
+    for row in items:
+        value=row.get(field)
+        if not valid(value):continue
+        if metric=='output_speed' and not (valid(row.get('output')) and valid(row.get('completion_latency_ms')) and row['completion_latency_ms']>0):continue
+        column=min(width-1,int((row['ts']-start)/(end-start)*width))
+        point=dict(ts=row['ts'],value=value,model=row.get('model') or '미확인',service_tier=row.get('service_tier') or '미확인')
+        cell=cells.setdefault(column,[point,point,point,point]);cell[3]=point
+        if value<cell[1]['value']:cell[1]=point
+        if value>cell[2]['value']:cell[2]=point
+    return sorted((p for cell in cells.values() for p in {id(p):p for p in cell}.values()),key=lambda p:p['ts'])
 
 def valid(value):
     return type(value) in (int,float) and isfinite(value) and value >= 0
@@ -69,7 +140,7 @@ class PerformanceTrends:
     def query(self,engine,q):
         width=max(64,min(1024,int(q.get('plot_width',768))))
         unit=q.get('granularity','day')
-        if unit not in ('day','week','month'):unit='day'
+        if unit not in ('auto','day','week','month'):unit='day'
         key=(engine.revision,tuple(q.get('time_range') or ()),width,unit)
         now=q['now']
         if key!=self.signature or now>=self.deadline:
@@ -83,6 +154,9 @@ class PerformanceTrends:
         full=(first,max(now,rows[-1]['ts'] if rows else now,first+1))
         start,end=q.get('time_range') or full
         if end<=start:start,end=full
+        if granularity=='auto':
+            self.build_rolling(rows,q,width,start,end,full)
+            return
         rows=[r for r in rows if r['ts']<=end]
         edges=calendar_edges(min(first,start),end,granularity)
         self.deadline=calendar_edges(now,now,granularity)[-1]
@@ -194,3 +268,64 @@ class PerformanceTrends:
                                lines=[dict(model=m,service_tier=t,points=v) for (m,t),v in lines.items()]))
         self.view=dict(panels=panels,start=start,end=end,full=full,granularity=granularity,models=sorted({r.get('model') or '미확인' for r in rows}),
                        calls=len(rows),valid_until=self.deadline)
+
+    def build_rolling(self,history,q,width,start,end,full):
+        """Project exact overlapping populations once in the worker, never in paint/hover."""
+        now=q['now'];span=end-start;window=rolling_window(span)
+        step=max(window/4,span/max(16,width//6));steps=max(1,ceil(span/step))
+        centers=[start+span*i/steps for i in range(steps+1)]
+        rows=[r for r in history if start<=r['ts']<=end]
+        groups=defaultdict(list)
+        for row in rows:groups[(row.get('model') or '미확인',row.get('service_tier') or '미확인')].append(row)
+        efforts=sorted({r.get('effort') or '미확인' for r in history if r['ts']<=end},key=effort_key)
+        specs=list(METRICS)+[('reasoning:'+e,'평균 추론 토큰 / '+e,'reasoning') for e in efforts]+[('input','평균 입력 토큰','input'),('count','호출 수','count')]
+        panels=[]
+        for metric,title,unit in specs:
+            lines=[];samples=[];bounds=[];n=0;N=0
+            if metric=='duration':title='호출 소요시간 중앙값'
+            for (model,mode),group in groups.items():
+                own=[r for r in group if not metric.startswith('reasoning:') or (r.get('effort') or '미확인')==metric.split(':',1)[1]]
+                if not own:continue
+                times=[r['ts'] for r in own]
+                population,total,_=metric_population(own,metric)
+                eligible=len(own) if metric=='count' else len(population)
+                n+=eligible;N+=total;bounds.extend(population)
+                samples.extend(bounded_observations(own,metric,start,end,width))
+                points=[]
+                # Counts are disjoint bins; they are never added across overlapping windows.
+                intervals=[(start+i*window,min(end,start+(i+1)*window)) for i in range(ceil(span/window))] if metric=='count' else None
+                for index,stamp in enumerate(centers if intervals is None else [(a+b)/2 for a,b in intervals]):
+                    a,b=(max(start,stamp-window/2),min(end,stamp+window/2)) if intervals is None else intervals[index]
+                    right=bisect_right(times,b) if b==end else bisect_left(times,b)
+                    items=own[bisect_left(times,a):right]
+                    values,total,totals=metric_population(items,metric)
+                    stats=distribution_statistics(values);mean=representative_mean(values,totals,metric)
+                    eligible=len(items) if metric=='count' else len(values)
+                    # A populated broad window must not bridge an empty local neighborhood.
+                    support_left=bisect_left(times,max(start,stamp-window/6))
+                    support_right=bisect_right(times,min(end,stamp+window/6))
+                    local=own[support_left:support_right]
+                    local_values,_,_=metric_population(local,metric)
+                    support=metric=='count' or bool(local_values)
+                    representative=stats['median'] if metric=='duration' else mean
+                    minimum=MIN_CENTER if metric=='duration' else 1
+                    value=representative if metric=='count' or support and eligible>=minimum else None
+                    complete=a==stamp-window/2 and b==stamp+window/2 and b<=now if intervals is None else b-a==window and b<=now
+                    status='기록 공백' if not support else '표본 부족' if eligible<minimum and metric!='count' else '일부 구간' if not complete else '이동 계산 구간'
+                    points.append(dict(kind='rolling' if intervals is None else 'trend',ts=stamp,value=value,mean=mean,
+                        representative=representative,statistic='median' if metric=='duration' else 'time_weighted_mean' if metric=='output_speed' else 'count' if metric=='count' else 'mean',
+                        bucket=index,start=a,end=b,complete=complete,model=model,service_tier=mode,
+                        effort=metric.split(':',1)[1] if metric.startswith('reasoning:') else '',coverage=(eligible,total),
+                        distribution=stats,totals=totals,calls=len(items),sessions=len({(r['home'],r['sid']) for r in items}),
+                        band_valid=metric!='count' and support and eligible>=MIN_BAND,outer_valid=metric!='count' and support and eligible>=MIN_OUTER_BAND,
+                        support=support,baseline=None,delta=None,baseline_count=0,direction=0,status=status,
+                        previous_start=None,previous_end=None))
+                lines.append(dict(model=model,service_tier=mode,points=points,coverage=(len(own) if metric=='count' else len(population),
+                    len(own) if metric=='count' else len({(r['home'],r['sid']) for r in own}) if metric=='session_cache' else len(own))))
+            panels.append(dict(key=metric,title=title,unit=unit,n=n,N=N,points=sorted(samples,key=lambda p:p['ts']),
+                low=min(bounds,default=0),high=max(bounds,default=1),lines=lines,rolling=True,window_seconds=window,
+                raw_visible=span<=3600 and metric not in ('session_cache','count')))
+        # No model calls are triggered. Idle refresh is bounded, including a partial live window.
+        self.deadline=now+max(1,min(60,step))
+        self.view=dict(panels=panels,start=start,end=end,full=full,granularity='auto',window_seconds=window,
+            models=sorted({r.get('model') or '미확인' for r in history if r['ts']<=end}),calls=len(rows),valid_until=self.deadline)

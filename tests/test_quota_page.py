@@ -121,7 +121,7 @@ def test_current_allowance_rows_and_credit_siblings(tmp_path,width,language,dark
     now=time.time()
     quota=normalize_limits({'rateLimits':{'planType':'pro','secondary':None,
         'primary':{'usedPercent':36,'windowDurationMins':10080,'resetsAt':now+600},
-        'credits':{'balance':'62500','hasCredits':True,'unlimited':False}},
+        'credits':{'balance':'62500.0000000000','hasCredits':True,'unlimited':False}},
         'rateLimitResetCredits':{'availableCount':2,'credits':[
             {'status':'available','resetType':'codexRateLimits','grantedAt':now-86400,'expiresAt':now+86400},
             {'status':'available','resetType':'codexRateLimits','grantedAt':now-43200,'expiresAt':now+172800}]}},now,'synthetic')
@@ -275,3 +275,12 @@ def test_legend_visibility_survives_refresh_and_updates_pinned_details(quota_pag
         assert [c[0] for c in chart.curves()]==['remaining']
         assert not host.qml_errors
     finally:dispose(host);shared_theme().configure('light')
+
+
+@pytest.mark.parametrize('raw,expected', [('62500.0000000000','62,500'),('1234.5600000','1,234.56'),('0.000120000','0.00012'),('0.000000','0'),('1000','1,000')])
+def test_credit_balance_drops_only_trailing_fractional_zeros(raw,expected):
+    from cachemonitor.quota_panel import format_credit_balance
+    from cachemonitor.quota_live import normalize_credits
+    credits=normalize_credits({'balance':raw})
+    assert format_credit_balance(credits['balance'])==expected
+    assert credits['balance']==raw
