@@ -75,6 +75,7 @@ GROUPS = {
     'selector': test_files('verify_changes'),
     'qa_ipc': test_files('qa_ipc'),
     'ui_runner': test_files('ui_check_runner', 'completed_layout'),
+    'release': test_files('release_pipeline', 'prepare_sources'),
 }
 
 # First match wins: QML and shared helpers must not fall through to a broad UI gate.
@@ -214,7 +215,10 @@ RULES = (
     ('cachemonitor/quick_qa.py', ('runtime', 'shared_ui', 'overlay_controls')),
     ('cachemonitor/qa.py', ('runtime',)),
     ('tools/verify_changes.py', ('selector',)),
-    ('.github/workflows/windows.yml', ('selector',)),
+    ('.github/workflows/windows.yml', ('selector', 'release')),
+    ('tools/release_*.py', ('release',)),
+    ('tools/verify_release_tools.py', ('release', 'selector')),
+    ('third-party-sources.lock.json', ('release', 'payload')),
     ('tools/run_ui_checks.py', ('ui_runner', 'runtime', 'overlay_controls')),
     ('tools/demo_speed_overlay.py', ('speed',)),
     ('tools/*proxy*.py', ('relay', 'proxy_lifecycle')),
@@ -238,7 +242,7 @@ RULES = (
     ('tools/prepare_bad_runtime.py', ('install',)),
     ('tools/collect_notices.py', ('payload',)),
     ('tools/package_release.py', ('payload',)),
-    ('tools/prepare_sources.py', ('payload',)),
+    ('tools/prepare_sources.py', ('payload', 'release')),
     ('tools/Build-*.ps1', ('install', 'runtime', 'payload')),
     ('tools/configure-app-task.ps1', ('install',)),
     ('recovery_main.py', ('install',)),
@@ -251,27 +255,34 @@ RULES = (
 
 # These changes need frozen executable/install checks in addition to source tests.
 PACKAGE_PATTERNS = (
-    'cachemonitor/retired_cache.py','cachemonitor/usage_archive.py','tools/verify_retired_worker.py',
+    'cachemonitor/retired_cache.py','cachemonitor/usage_archive.py',
     'requirements*', 'build*.ps1', '*.spec', 'installer/*', 'recovery_main.py', 'icons/*.ico',
     'tools/verify_msix_installation.ps1', 'tools/run_native_checks.py',
     'run.py', 'start.ps1', 'tools/Build-*.ps1', 'tools/*install*.py', 'tools/prepare_bad_runtime.py',
     'tools/package_release.py', 'tools/collect_notices.py', 'tools/prepare_sources.py',
-    'tools/verify_recovery.py', 'tools/verify_gui_handoff.py', 'tools/configure-app-task.ps1',
+    'tools/configure-app-task.ps1', 'third-party-sources.lock.json', 'SOURCE-OFFER.md',
     'cachemonitor/install*.py', 'cachemonitor/app.py', 'cachemonitor/app_update.py', 'cachemonitor/app_restart.py',
     'cachemonitor/version.py', 'cachemonitor/runtime_check.py', 'cachemonitor/launch_context.py',
     'cachemonitor/windows_integration.py', 'cachemonitor/shell_shortcut.py',
     'tools/prepare_legacy_release.py',
 )
 PROXY_PATTERNS = (
-    'cachemonitor/retired_cache.py','tools/verify_retired_worker.py',
+    'cachemonitor/retired_cache.py',
     'cachemonitor/model_proxy.py', 'cachemonitor/proxy*.py', 'cachemonitor/managed_proxy.py',
     'cachemonitor/observer_control.py', 'cachemonitor/observer_state.py', 'cachemonitor/observer_task.py',
     'cachemonitor/connection_recovery.py', 'cachemonitor/evidence_writer.py',
-    'cachemonitor/version.py', 'tools/*proxy*.py', 'requirements*', 'build*.ps1', '*.spec',
+    'cachemonitor/version.py', 'requirements*', 'build*.ps1', '*.spec',
     'tools/Build-*.ps1', 'cachemonitor/install*.py', 'installer/*',
     'tools/prepare_legacy_release.py',
 )
 FULL_PATTERNS = ('tests/conftest.py', 'pytest.ini', 'pyproject.toml', 'requirements*')
+QA_SMOKES = {
+    'tools/verify_proxy_update.py': 'proxy_update',
+    'tools/verify_app_services.py': 'app_services',
+    'tools/verify_retired_worker.py': 'retired_worker',
+    'tools/verify_gui_handoff.py': 'gui_handoff',
+    'tools/verify_recovery.py': 'recovery',
+}
 DOC_PATTERNS = ('docs/*', 'releases/*', '*.md', '*.txt', 'LICENSE*', '.gitignore',
                 '.gitattributes', '.github/ISSUE_TEMPLATE/*')
 
@@ -383,7 +394,8 @@ def select_tests(changed, *, root=None, deleted=()):
     return dict(full=full, tests=tuple(sorted(selected)),
                 reasons={test: reasons[test] for test in sorted(selected)},
                 groups=tuple(sorted(groups)), unmapped=tuple(sorted(unmapped)),
-                package_impact=package, proxy_impact=proxy)
+                package_impact=package, proxy_impact=proxy,
+                qa_smokes=sorted({QA_SMOKES[path] for path in paths if path in QA_SMOKES}))
 
 
 def fixture_home(folder):
@@ -475,6 +487,7 @@ def main(argv=None):
                   full=plan['full'], unmapped=plan['unmapped'],
                   groups=plan['groups'], tests=plan['tests'], reasons=plan['reasons'],
                   package_impact=plan['package_impact'], proxy_impact=plan['proxy_impact'],
+                  qa_smokes=plan['qa_smokes'],
                   package_exe=str(args.package_exe) if args.package_exe else None)
     if args.plan:
         print(json.dumps(public,ensure_ascii=False,indent=2))

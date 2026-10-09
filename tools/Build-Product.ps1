@@ -60,7 +60,8 @@ try {
     if (!$checked.StartsWith([IO.Path]::GetFullPath($stagingRoot) + '\',[StringComparison]::OrdinalIgnoreCase)) { throw 'Unsafe staged output' }
     Copy-Item -LiteralPath (Join-Path $sourceRoot 'LICENSE') -Destination (Join-Path $stagedProduct 'LICENSE')
     Copy-Item -LiteralPath (Join-Path $sourceRoot 'THIRD-PARTY-NOTICES.md') -Destination (Join-Path $stagedProduct 'THIRD-PARTY-NOTICES.md')
-    Copy-Item -LiteralPath (Join-Path $sourceRoot 'SOURCE-OFFER.md') -Destination (Join-Path $stagedProduct 'SOURCE-OFFER.md')
+    & $PythonPath (Join-Path $sourceRoot 'tools/prepare_sources.py') --write-offer (Join-Path $stagedProduct 'SOURCE-OFFER.md')
+    if ($LASTEXITCODE -ne 0) { throw 'Corresponding source metadata does not match the bundled libraries.' }
     foreach ($guide in @(@('README.md','USER-GUIDE.md'), @('README.ko.md','USER-GUIDE.ko.md'))) {
         $content = [IO.File]::ReadAllText((Join-Path $sourceRoot $guide[0])).Replace('(README.md)','(USER-GUIDE.md)').Replace('(README.ko.md)','(USER-GUIDE.ko.md)')
         [IO.File]::WriteAllText((Join-Path $stagedProduct $guide[1]), $content, [Text.UTF8Encoding]::new($false))

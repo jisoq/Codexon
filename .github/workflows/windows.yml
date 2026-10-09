@@ -6,20 +6,45 @@ on:
   workflow_dispatch:
     inputs:
       publish:
-        description: Publish the verified main commit as a release
+        description: Publish the verified main commit, reusing its successful build
         type: boolean
         default: false
 permissions:
   contents: read
+  actions: read
+# A release request waits for the push check of this exact commit.
+concurrency:
+  group: windows-${{ github.ref }}-${{ github.sha }}
+  cancel-in-progress: false
 env:
   PYTHONUTF8: '1'
   PYTHONIOENCODING: utf-8
 jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      verify: ${{ steps.release.outputs.verify }}
+      candidate: ${{ steps.release.outputs.candidate }}
+      reuse_run: ${{ steps.release.outputs.reuse_run }}
+      published: ${{ steps.release.outputs.published }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12.10'
+      - name: Resolve the exact commit's verified release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUEST_PUBLISH: ${{ inputs.publish || false }}
+        run: python tools/release_pipeline.py plan --publish "$REQUEST_PUBLISH"
   verify:
+    needs: resolve
+    if: needs.resolve.outputs.verify == 'true'
     runs-on: windows-latest
     timeout-minutes: 40
-    outputs:
-      release_tag: ${{ steps.release.outputs.tag }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -29,27 +54,6 @@ jobs:
           python-version: '3.12.10'
           cache: pip
           cache-dependency-path: requirements-release.lock
-      - name: Select release from the checked out commit
-        if: inputs.publish
-        id: release
-        shell: pwsh
-        run: |
-          if ($env:GITHUB_REF -ne 'refs/heads/main') { throw 'Publish releases from main.' }
-          $version = python -c 'from cachemonitor.version import VERSION; print(VERSION)'
-          if ($LASTEXITCODE -ne 0) { throw 'Cannot read the release version.' }
-          $notesPath = "docs/releases/$version.md"
-          if (-not (Test-Path -LiteralPath $notesPath -PathType Leaf)) {
-            throw "Release notes are required: $notesPath"
-          }
-          if ([string]::IsNullOrWhiteSpace((Get-Content -LiteralPath $notesPath -Raw))) {
-            throw "Release notes are empty: $notesPath"
-          }
-          $tag = "v$version"
-          git show-ref --verify --quiet "refs/tags/$tag"
-          if ($LASTEXITCODE -eq 0) { throw "Tag $tag already exists. Increment VERSION before releasing." }
-          if ($LASTEXITCODE -ne 1) { throw 'Cannot check the release tag.' }
-          "tag=$tag" | Add-Content $env:GITHUB_OUTPUT
-          exit 0
       - name: Install locked dependencies
         run: python -m pip install -r requirements-release.lock
       - name: Plan checks against the actual change base
@@ -59,19 +63,30 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           PR_BASE: ${{ github.event.pull_request.base.sha }}
           PUSH_BASE: ${{ github.event.before }}
+          RELEASE_CANDIDATE: ${{ needs.resolve.outputs.candidate }}
         run: |
           $base = if ($env:EVENT_NAME -eq 'pull_request') { $env:PR_BASE } else { $env:PUSH_BASE }
-          $all = $env:EVENT_NAME -eq 'workflow_dispatch' -or -not $base -or $base -match '^0+$'
+          $all = $env:RELEASE_CANDIDATE -eq 'true' -or $env:EVENT_NAME -eq 'workflow_dispatch' -or -not $base -or $base -match '^0+$'
           [string[]]$checkArgs = if ($all) { @('--full') } else { @('--base', $base) }
           $raw = python tools/verify_changes.py --plan @checkArgs
           if ($LASTEXITCODE -ne 0) { throw ($raw -join "`n") }
           $plan = ($raw -join "`n") | ConvertFrom-Json
           New-Item -ItemType Directory -Path artifacts/verification -Force | Out-Null
           $raw | Set-Content -Encoding utf8 artifacts/verification/plan.json
+          $package = $all -or $plan.package_impact
+          $proxy = $all -or $plan.proxy_impact
+          $reuse = $false
+          if (-not $package -and $plan.qa_smokes.Count) {
+            $reuseResult = python tools/verify_release_tools.py --can-reuse
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot check packaged input identity.' }
+            $reuse = ($reuseResult | ConvertFrom-Json).reuse
+            if (-not $reuse) { $package = $true; $proxy = $true }
+          }
           "VERIFY_BASE=$base" | Add-Content $env:GITHUB_ENV
           "VERIFY_FULL=$all" | Add-Content $env:GITHUB_ENV
-          "package=$($all -or $plan.package_impact)".ToLowerInvariant() | Add-Content $env:GITHUB_OUTPUT
-          "proxy=$($all -or $plan.proxy_impact)".ToLowerInvariant() | Add-Content $env:GITHUB_OUTPUT
+          "package=$package".ToLowerInvariant() | Add-Content $env:GITHUB_OUTPUT
+          "proxy=$proxy".ToLowerInvariant() | Add-Content $env:GITHUB_OUTPUT
+          "qa_reuse=$reuse".ToLowerInvariant() | Add-Content $env:GITHUB_OUTPUT
           "dependencies=$($all -or [bool]($plan.changed -match '^requirements'))".ToLowerInvariant() | Add-Content $env:GITHUB_OUTPUT
           $raw
       - name: Check changed dependencies for vulnerabilities
@@ -86,6 +101,9 @@ jobs:
           [string[]]$checkArgs = if ($env:VERIFY_FULL -eq 'True') { @('--full') } else { @('--base', $env:VERIFY_BASE) }
           python tools/run_ui_checks.py -- python tools/verify_changes.py @checkArgs
           exit $LASTEXITCODE
+      - name: Check changed QA tools with the matching published binary
+        if: steps.plan.outputs.qa_reuse == 'true'
+        run: python tools/run_ui_checks.py -- python tools/verify_release_tools.py --plan artifacts/verification/plan.json
       - name: Check overlay native scaling
         shell: pwsh
         run: |
@@ -114,31 +132,20 @@ jobs:
         run: |
           $compiler = Get-ChildItem "${env:ProgramFiles(x86)}\Inno Setup*\ISCC.exe" | Select-Object -First 1
           if (-not $compiler) { throw 'Inno Setup compiler is required on this Windows runner' }
-          .\tools\Build-Installer.ps1 -ProductDir dist-ci/Codexon -OutputDir dist-ci/qa-setup -Compiler $compiler.FullName -Isolated
+          .\tools\Build-Installer.ps1 -ProductDir dist-ci/Codexon -OutputDir dist-ci/qa-isolated -Compiler $compiler.FullName -Isolated
           python tools/prepare_bad_runtime.py --product dist-ci/Codexon --output dist-ci/bad-runtime
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           .\tools\Build-Installer.ps1 -ProductDir dist-ci/bad-runtime -OutputDir dist-ci/qa-bad-runtime -Compiler $compiler.FullName -Isolated
       - name: Check installation, update and removal
         if: steps.plan.outputs.package == 'true'
-        run: python tools/run_native_checks.py --output artifacts/verification/native-installation -- python tools/run_ui_checks.py -- python tools/verify_installation.py --installer dist-ci/qa-setup/Codexon-Setup.exe --broken-installer dist-ci/qa-bad-runtime/Codexon-Setup.exe --output artifacts/verification/installation
+        run: python tools/run_native_checks.py --output artifacts/verification/native-installation -- python tools/run_ui_checks.py -- python tools/verify_installation.py --installer dist-ci/qa-isolated/Codexon-Setup.exe --broken-installer dist-ci/qa-bad-runtime/Codexon-Setup.exe --output artifacts/verification/installation
       - name: Check installation from an MSIX process
         if: steps.plan.outputs.package == 'true'
         shell: powershell
-        run: .\tools\verify_msix_installation.ps1 -Installer dist-ci/qa-setup/Codexon-Setup.exe -BrokenInstaller dist-ci/qa-bad-runtime/Codexon-Setup.exe -Output artifacts/verification/msix-installation -Python ((Get-Command python).Source)
+        run: .\tools\verify_msix_installation.ps1 -Installer dist-ci/qa-isolated/Codexon-Setup.exe -BrokenInstaller dist-ci/qa-bad-runtime/Codexon-Setup.exe -Output artifacts/verification/msix-installation -Python ((Get-Command python).Source)
       - name: Check frozen runtime and Qt Quick interaction
         if: steps.plan.outputs.package == 'true'
         run: python tools/run_ui_checks.py -- python tools/verify_changes.py --package-only --package-exe dist-ci/Codexon/Codexon.exe
-      - name: Build previous release and check observation proxy with idle connections
-        if: steps.plan.outputs.proxy == 'true'
-        shell: pwsh
-        run: |
-          git worktree add --detach ../codexon-previous v2026.09.25.6
-          & ../codexon-previous/build.ps1 -DistPath ../codexon-previous-dist -WorkPath ../codexon-previous-build -PythonPath ((Get-Command python).Source)
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python tools/verify_proxy_update.py --old-exe ../codexon-previous-dist/Codexon/Codexon.exe --new-exe dist-ci/Codexon/Codexon.exe --idle-connections 100 --output artifacts/verification/proxy-update
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Check packaged app exit, service resume and collector migration
-        if: steps.plan.outputs.proxy == 'true'
-        run: python tools/run_ui_checks.py -- python tools/verify_app_services.py --executable dist-ci/Codexon/Codexon.exe --legacy-collector-exe ../codexon-previous-dist/Codexon/Codexon.exe --output artifacts/verification/app-services
       - name: Check migration from the actual published installer
         if: steps.plan.outputs.proxy == 'true'
         shell: pwsh
@@ -166,29 +173,22 @@ jobs:
       - name: Check installer payload contents
         if: steps.plan.outputs.package == 'true'
         run: python tools/package_release.py --product dist-ci/Codexon --validate-only
-      - name: Prepare release assets from the verified package
-        if: inputs.publish
+      - name: Seal the fully verified release candidate
+        if: needs.resolve.outputs.candidate == 'true'
         shell: pwsh
-        env:
-          RELEASE_TAG: ${{ steps.release.outputs.tag }}
         run: |
-          $manifest = Get-Content dist-ci/Codexon/build-manifest.json -Raw | ConvertFrom-Json
-          if ($manifest.commit -ne $env:GITHUB_SHA -or "v$($manifest.version)" -ne $env:RELEASE_TAG) {
-            throw 'The verified package does not match the release commit and version.'
-          }
           $compiler = Get-ChildItem "${env:ProgramFiles(x86)}\Inno Setup*\ISCC.exe" | Select-Object -First 1
           if (-not $compiler) { throw 'Inno Setup compiler is required on this Windows runner' }
           .\tools\Build-Installer.ps1 -ProductDir dist-ci/Codexon -OutputDir dist-ci/release -Compiler $compiler.FullName
-          python tools/prepare_sources.py --output dist-ci/release
-          if ($LASTEXITCODE -ne 0) { throw 'Third-party source preparation failed.' }
-          Copy-Item dist-ci/Codexon/build-manifest.json dist-ci/release/build-manifest.json
-          Copy-Item "docs/releases/$($env:RELEASE_TAG.Substring(1)).md" dist-ci/release/RELEASE_NOTES.md
-      - name: Upload verified release assets
-        if: inputs.publish
+          python tools/release_pipeline.py seal --folder dist-ci/release --product dist-ci/Codexon
+          exit $LASTEXITCODE
+      - name: Retain the verified installer for later publication
+        if: needs.resolve.outputs.candidate == 'true'
         uses: actions/upload-artifact@v7
         with:
-          name: release-assets
+          name: verified-release-${{ github.sha }}
           path: dist-ci/release/
+          retention-days: 30
           if-no-files-found: error
           compression-level: 0
       - name: Upload redacted synthetic verification evidence
@@ -202,32 +202,22 @@ jobs:
             !artifacts/verification/**/*.lock
           if-no-files-found: ignore
   publish:
-    needs: verify
-    if: github.event_name == 'workflow_dispatch' && inputs.publish && github.ref == 'refs/heads/main'
+    needs: [resolve, verify]
+    if: always() && inputs.publish && needs.resolve.result == 'success' && needs.resolve.outputs.published != 'true' && (needs.verify.result == 'success' || needs.resolve.outputs.reuse_run != '')
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: read
     concurrency:
       group: publish-release
       cancel-in-progress: false
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
-          name: release-assets
-          path: release
-      - name: Publish the verified assets
-        working-directory: release
+          python-version: '3.12.10'
+      - name: Publish the existing verified installer
         env:
           GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
-        run: |
-          sha256sum --check *.sha256
-          test "$(jq -r .commit build-manifest.json)" = "$GITHUB_SHA"
-          test "v$(jq -r .version build-manifest.json)" = "$RELEASE_TAG"
-          printf '\n\nSource: %s. Full verification: %s/%s/actions/runs/%s\n' "$GITHUB_SHA" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" >> RELEASE_NOTES.md
-          gh release create "$RELEASE_TAG" Codexon-Setup.exe Codexon-Setup.exe.sha256 \
-            Codexon-third-party-source-*.zip Codexon-third-party-source-*.zip.sha256 \
-            --target "$GITHUB_SHA" --title "Codexon ${RELEASE_TAG#v}" --draft \
-            --notes-file RELEASE_NOTES.md
-          gh release edit "$RELEASE_TAG" --draft=false --latest
+          VERIFIED_RUN: ${{ needs.resolve.outputs.reuse_run || github.run_id }}
+        run: python tools/release_pipeline.py publish --verified-run "$VERIFIED_RUN"
