@@ -155,6 +155,9 @@ def main():
         else:
             raise AssertionError(('Previous proxy connections did not become observable', m.health_state, observed))
         previous = dict(version=health['version'], instance=health['instance'], process=old_identity, role='observer')
+        # Releases without connection classification need a real client exit.
+        # Classified idle peers must still update without user intervention.
+        requires_exit = options.unclassified_connection or (observed.get('websocket_states') is None and observed['active_connections'] > 0)
         if options.unclassified_connection:peers.interrupt()
         ProxyUpdate(m).publish('queued', source_instance=health['instance'], cancel_requested=False)
         updater_args = []
@@ -176,7 +179,7 @@ def main():
         exit_guidance=False
         while time.monotonic() < deadline:
             state = read_json(m.directory / 'proxy-update.json')
-            if options.unclassified_connection and not exit_guidance and state.get('required_action')=='close_client':
+            if requires_exit and not exit_guidance and state.get('required_action')=='close_client':
                 assert state['unknown_connections']>=1 and same_process(old_identity)
                 assert not m.health(timeout=3).get('draining')
                 exit_guidance=True;peers.disconnect()
@@ -191,7 +194,7 @@ def main():
             print(json.dumps(result))
             return
         assert state.get('phase') == ('failed' if options.exercise_rollback else 'complete'), state
-        if options.unclassified_connection:assert exit_guidance,'Unknown connection did not produce exit guidance'
+        if requires_exit:assert exit_guidance,'Unclassified connections did not produce exit guidance'
         if options.interrupt_after_drain:
             assert marker.exists()
         until = time.monotonic() + 5
@@ -229,6 +232,9 @@ def main():
         assert health['active_connections'] == 0, health
         result = {'phase': state['phase'], 'previous': previous, 'rollback_verified': options.exercise_rollback, 'updater_restart_verified': options.interrupt_after_drain, 'current': {**{k: health.get(k) for k in ('version', 'role', 'executable', 'instance', 'pid')}, 'executable': str(expected_executable), 'role': 'observer'}, 'idle_connections_opened': options.idle_connections, 'idle_connections_retired_before_update': options.idle_connections-observed['active_connections'], 'idle_connections_drained': observed['active_connections'], 'configuration_preserved': True, 'instance_replaced': True, 'new_executable_verified': True}
         result['connection_exit_guidance_verified']=exit_guidance
+        if exit_guidance:
+            result['client_connections_closed']=result['idle_connections_drained']
+            result['idle_connections_drained']=0
         (root / 'result.json').write_text(json.dumps(result, indent=2))
         print(json.dumps(result))
     finally:
