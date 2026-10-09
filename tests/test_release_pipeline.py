@@ -144,19 +144,15 @@ def test_reusing_a_public_binary_requires_unchanged_packaged_inputs(root, monkey
 
 
 def test_workflow_serializes_same_commit_and_publishes_the_retained_artifact():
-    import yaml
-    workflow = yaml.load((pipeline.ROOT/'.github/workflows/windows.yml').read_text(), Loader=yaml.BaseLoader)
-    assert 'github.sha' in workflow['concurrency']['group']
-    assert workflow['concurrency']['cancel-in-progress'] == 'false'
-    assert 'resolve' in workflow['jobs']['verify']['needs']
-    publish = workflow['jobs']['publish']
-    assert publish['needs'] == ['resolve', 'verify']
-    assert any('release_pipeline.py publish' in step.get('run', '') for step in publish['steps'])
-    assert not any('build.ps1' in step.get('run', '') for step in publish['steps'])
-    verify = workflow['jobs']['verify']['steps']
-    assert any(step.get('with', {}).get('name', '').startswith('verified-release-') for step in verify)
-    assert not any('git worktree add' in step.get('run', '') for step in verify)
-    assert any('verify_release_tools.py --plan' in step.get('run', '') for step in verify)
+    workflow = (pipeline.ROOT/'.github/workflows/windows.yml').read_text()
+    assert 'group: windows-${{ github.ref }}-${{ github.sha }}\n  cancel-in-progress: false' in workflow
+    assert 'verify:\n    needs: resolve' in workflow
+    verify, publish = workflow.split('\n  publish:\n')
+    assert 'needs: [resolve, verify]' in publish
+    assert 'release_pipeline.py publish' in publish and 'build.ps1' not in publish
+    assert 'name: verified-release-${{ github.sha }}' in verify
+    assert 'git worktree add' not in verify
+    assert 'verify_release_tools.py --plan' in verify
 
 
 def test_publication_uses_verified_artifact_and_only_uploads_installer_files(root, monkeypatch):
@@ -215,3 +211,25 @@ def test_current_run_requires_successful_verify_job(root):
             pytest.fail('Verification has not completed')
     with pytest.raises(ValueError, match='has not passed'):
         pipeline.publish(PendingGitHub(), SHA, '10', '10', root/'download', root)
+
+
+def test_failed_and_nonancestor_runs_cannot_hide_unverified_changes(root, monkeypatch):
+    passed = run_record()
+    passed.update(id=8, head_sha='b' * 40)
+    failed = {**passed, 'id': 11, 'head_sha': 'c' * 40, 'conclusion': 'failure'}
+    foreign = {**passed, 'id': 10, 'head_sha': 'd' * 40}
+    github = FakeGitHub([failed, foreign, passed])
+    checked = []
+    def ancestry(command, **kwargs):
+        checked.append(command[3])
+        return SimpleNamespace(returncode=0 if command[3] == 'b' * 40 else 1)
+    monkeypatch.setattr(pipeline.subprocess, 'run', ancestry)
+    assert pipeline.verified_base(github, SHA, root) == 'b' * 40
+    assert checked == ['d' * 40, 'b' * 40]
+
+
+def test_missing_verified_baseline_requests_full_checks(root):
+    assert pipeline.verified_base(FakeGitHub(), SHA, root) == ''
+    workflow = (pipeline.ROOT/'.github/workflows/windows.yml').read_text()
+    assert 'PUSH_BASE: ${{ needs.resolve.outputs.base }}' in workflow
+    assert '-not $base' in workflow

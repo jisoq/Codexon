@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,6 +42,23 @@ def reusable_run(github, sha, current_run):
     return ''
 
 
+def verified_base(github, sha, root=ROOT):
+    # A failed or cancelled push is not a verification baseline for its follow-up.
+    runs = github.api('actions/workflows/windows.yml/runs?branch=main&status=success&per_page=100')['workflow_runs']
+    for run in sorted(runs, key=lambda r: r['id'], reverse=True):
+        base = run.get('head_sha', '')
+        if (base == sha or not re.fullmatch(r'[0-9a-f]{40}', base)
+                or not trusted(run, base, github.repository) or run.get('status') != 'completed'
+                or run.get('conclusion') != 'success'):
+            continue
+        result = subprocess.run(['git', 'merge-base', '--is-ancestor', base, sha], cwd=root, capture_output=True)
+        if result.returncode == 0:
+            return base
+        if result.returncode not in (1, 128):
+            raise RuntimeError('Cannot establish the last verified ancestor')
+    return ''
+
+
 def tag_commit(github, tag):
     value = github.api('git/ref/tags/' + tag, missing=True)
     if value is None:
@@ -71,7 +89,8 @@ def plan(github, sha, current_run, event, ref, publish, root=ROOT):
     candidate = on_main and has_notes and (existing is None or bool(release and release['draft']))
     reuse = reusable_run(github, sha, current_run) if on_main and not published else ''
     return dict(version=current, release_tag=tag, candidate=candidate, published=published,
-                reuse_run=reuse, verify=not (reuse or published))
+                reuse_run=reuse, verify=not (reuse or published),
+                base=verified_base(github, sha, root) if on_main and not (reuse or published) else '')
 
 
 def check_installer(folder):
