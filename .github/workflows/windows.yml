@@ -27,6 +27,7 @@ jobs:
       candidate: ${{ steps.release.outputs.candidate }}
       reuse_run: ${{ steps.release.outputs.reuse_run }}
       published: ${{ steps.release.outputs.published }}
+      base: ${{ steps.release.outputs.base }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -62,7 +63,7 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           PR_BASE: ${{ github.event.pull_request.base.sha }}
-          PUSH_BASE: ${{ github.event.before }}
+          PUSH_BASE: ${{ needs.resolve.outputs.base }}
           RELEASE_CANDIDATE: ${{ needs.resolve.outputs.candidate }}
         run: |
           $base = if ($env:EVENT_NAME -eq 'pull_request') { $env:PR_BASE } else { $env:PUSH_BASE }
