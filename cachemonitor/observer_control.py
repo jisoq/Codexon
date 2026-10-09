@@ -448,11 +448,17 @@ class ObserverManager:
                 self.task.configure(self.supervisor_command(upstream),autostart=False)
             return self.status()
         if self.health_state!='refused':return self.status()
+        previous=self.runtime().get('instance')
         self.task.start(self.supervisor_command(upstream),autostart=False)
         for _ in range(80):
             if self.cancelled.is_set():break
             runtime=self.runtime()
-            if runtime.get('phase') in ('ready','active'):
+            health=self.health(timeout=.5)
+            if (runtime.get('phase') in ('ready','active') and runtime.get('instance')!=previous
+                    and health and health.get('status')=='ok' and not health.get('draining')
+                    and health.get('lifecycle')=='managed' and health.get('version')==PROXY_VERSION
+                    and health.get('pid')==runtime.get('pid')
+                    and health.get('control_id')==runtime.get('instance')):
                 # Removing the old registration does not terminate its running instance.
                 self.legacy_task.remove()
                 return self.status()

@@ -32,6 +32,36 @@ def validated(control):
     control.write_state({'home':home_key(control.home),'proof_at':time.time(),'proof_instance':'test','enabled':False})
 
 
+@pytest.mark.parametrize('fresh', [False, True])
+def test_restart_requires_fresh_runtime_and_matching_live_health(tmp_path, monkeypatch, fresh):
+    from types import SimpleNamespace
+    control,_=manager(tmp_path,monkeypatch)
+    control.config_path.write_text(f'openai_base_url="{control.url}"\n')
+    control.write_state(dict(home=home_key(control.home),enabled=True,upstream='chatgpt'))
+    runtime=dict(phase='active',instance='old',pid=123)
+    probes=[];started=[];removed=[]
+    def health(**kwargs):
+        probes.append(True)
+        control.health_state='refused'
+        if started and fresh and len(probes)>=4:
+            runtime.update(instance='new',pid=456)
+            return dict(status='ok',version=PROXY_VERSION,lifecycle='managed',control_id='new',pid=456)
+        return None
+    control.task=SimpleNamespace(start=lambda *a,**kw:started.append(True))
+    control.legacy_task=SimpleNamespace(remove=lambda:removed.append(True))
+    monkeypatch.setattr(control,'runtime',lambda:runtime.copy())
+    monkeypatch.setattr(control,'health',health)
+    monkeypatch.setattr(control,'status',lambda:dict(running=fresh))
+    monkeypatch.setattr('cachemonitor.observer_control.time.sleep',lambda _:None)
+    if fresh:
+        assert control.attach_supervisor()['running']
+        assert removed==[True]
+    else:
+        with pytest.raises(RuntimeError):control.attach_supervisor()
+        assert not removed
+    assert started==[True] and len(probes)>=4
+
+
 def test_enable_disable_preserves_comments_unrelated_edits_and_startup(tmp_path,monkeypatch):
     control,registry=manager(tmp_path,monkeypatch)
     before='# Personal settings\nmodel = "gpt-6-astra"\n\n[features]\nalpha = true\n'

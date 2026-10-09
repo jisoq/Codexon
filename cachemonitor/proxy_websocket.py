@@ -28,6 +28,51 @@ class LocalCapacity(Exception):
     pass
 
 
+class WebSocketClose:
+    """One close owner shared by retirement, peer close and request cancellation."""
+    def __init__(self, downstream, upstream, transports, diagnostic, timeout):
+        self.peers = (downstream, upstream)
+        self.transports = transports
+        self.diagnostic = diagnostic
+        self.timeout = timeout
+        self.readers = []
+        self.task = None
+
+    async def close(self, code=1011, message=b''):
+        if self.task is None:
+            self.task = asyncio.create_task(self.run(code, message))
+        try:
+            await asyncio.shield(self.task)
+        except asyncio.CancelledError:
+            # A cancelled handler still owns its connections until close finishes.
+            await asyncio.shield(self.task)
+            raise
+
+    async def run(self, code, message):
+        closing=[]
+        try:
+            async with asyncio.timeout(self.timeout):
+                for reader in self.readers:
+                    if not reader.done():
+                        reader.cancel()
+                await asyncio.gather(*self.readers, return_exceptions=True)
+                closing=[asyncio.create_task(peer.close(code=code, message=message)) for peer in self.peers]
+                try:
+                    await asyncio.gather(*closing)
+                finally:
+                    for task in closing:
+                        if not task.done():task.cancel()
+                    await asyncio.gather(*closing, return_exceptions=True)
+        except (Exception, asyncio.CancelledError) as error:
+            self.diagnostic['cleanup_error_type'] = type(error).__name__
+            for transport in self.transports:
+                if transport is not None:
+                    try:transport.abort()
+                    except Exception:pass  # Continue releasing the other owned transport.
+            if isinstance(error, asyncio.CancelledError):
+                raise
+
+
 class Activity:
     def __init__(self, clock=time.monotonic, known=True):
         self.clock = clock

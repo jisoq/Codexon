@@ -1,4 +1,5 @@
 import asyncio
+import pytest
 from aiohttp import ClientSession, TCPConnector, web
 from cachemonitor.model_evidence import EvidenceStore
 from cachemonitor.model_proxy import create_app
@@ -168,7 +169,8 @@ def test_accumulated_connections_retire_and_reconnect_without_pool_wait(tmp_path
                     assert health['websocket_connections']['occupied']<=33
                     assert health['websocket_connections']['retired']['idle_limit']>=108
                     assert health['relay_errors']==0
-                    assert health['selector_sockets']<512
+                    if health['selector_sockets'] is not None:assert health['selector_sockets']<512
+                    assert health['event_loop']==type(asyncio.get_running_loop()).__name__
                 finally:
                     await asyncio.gather(*(ws.close() for ws in sockets))
                 for _ in range(100):
@@ -210,7 +212,77 @@ def test_100_busy_connections_have_bounded_local_failure_and_http_is_independent
                     assert health['websocket_states']['responding']==100
                     assert health['websocket_connections']['occupied']==100
                     assert health['websocket_connections']['capacity_waiting']==0
-                    assert health['relay_errors']==0 and health['selector_sockets']<512
+                    assert health['relay_errors']==0
+                    if health['selector_sockets'] is not None:assert health['selector_sockets']<512
                 finally:await asyncio.gather(*(ws.close() for ws in sockets))
+        finally:store.close()
+    run_proxy_test(run())
+
+
+@pytest.mark.parametrize('ending', ['retire', 'client_abort', 'upstream_abort'])
+def test_connection_close_races_preserve_other_response_and_release_slots(tmp_path, ending):
+    from dataclasses import replace
+    from cachemonitor.proxy_websocket import POLICY
+    from cachemonitor.proxy_runtime import ProxyDiagnostics
+    import json
+    async def run():
+        now=[0.];finish=asyncio.Event();requests=[]
+        payload='final-frame-'*20000
+        async def upstream(request):
+            ws=web.WebSocketResponse();await ws.prepare(request)
+            message=await ws.receive_json();requests.append(message['id'])
+            await ws.send_json({'type':'response.created','response':{'id':message['id']}})
+            if message['id']=='protected':await finish.wait()
+            elif ending=='upstream_abort':
+                request.transport.abort();return ws
+            elif ending=='client_abort':
+                async for _ in ws:pass
+                return ws
+            await ws.send_json({'type':'response.completed','response':{'id':message['id'],'output':payload}})
+            async for _ in ws:pass
+            return ws
+        app=web.Application();app.router.add_get('/responses',upstream)
+        store=EvidenceStore(tmp_path/'e.sqlite');diagnostic=ProxyDiagnostics(tmp_path)
+        policy=replace(POLICY,check_seconds=.01,close_seconds=.5,lifetime_seconds=1)
+        try:
+            async with server(app) as url,server(create_app(store,tmp_path,url,clock=lambda:now[0],
+                    policy=policy,runtime_diagnostics=diagnostic)) as proxy,ClientSession() as client:
+                async with client.ws_connect(proxy+'/responses') as protected:
+                    await protected.send_json({'type':'response.create','id':'protected','input':'PRIVATE_BODY'})
+                    assert (await protected.receive_json())['type']=='response.created'
+                    async def churn(i):
+                        async with client.ws_connect(proxy+'/responses',headers={'session_id':'PRIVATE_SESSION',
+                                                      'Authorization':'Bearer PRIVATE_TOKEN'}) as ws:
+                            # The lifetime expires during this response, never before admission.
+                            await ws.send_json({'type':'response.create','id':str(i)})
+                            assert (await ws.receive_json())['type']=='response.created'
+                            if ending=='client_abort':ws._response.connection.transport.abort()
+                            elif ending=='upstream_abort':await ws.receive()
+                            else:
+                                now[0]+=2
+                                assert (await ws.receive_json())['response']['output']==payload
+                                assert (await asyncio.wait_for(ws.receive(),2)).type==web.WSMsgType.CLOSE
+                    for batch in range(4):await asyncio.gather(*(churn(batch*4+i) for i in range(4)))
+                    for _ in range(100):
+                        health=await (await client.get(proxy+'/health')).json()
+                        if health['active_connections']==1:break
+                        await asyncio.sleep(.01)
+                    assert health['active_connections']==1
+                    assert health['websocket_states']['responding']==1
+                    assert health['websocket_connections']['occupied']==1
+                    diagnostic.fail(RuntimeError('PRIVATE_ERROR'),'test_snapshot')
+                    report=diagnostic.path.read_text()
+                    assert all(value not in report for value in ('PRIVATE_BODY','PRIVATE_SESSION','PRIVATE_TOKEN','PRIVATE_ERROR'))
+                    saved=json.loads(report)
+                    assert saved['snapshot']['active_relays'][0]['connection']
+                    assert saved['events'] and len(saved['events'])<=64
+                    finish.set()
+                    assert (await protected.receive_json())['response']['output']==payload
+                for _ in range(100):
+                    health=await (await client.get(proxy+'/health')).json()
+                    if health['active_connections']==0:break
+                    await asyncio.sleep(.01)
+                assert health['active_connections']==0 and health['websocket_connections']['occupied']==0
+                assert sorted(requests)==sorted(['protected',*map(str,range(16))])
         finally:store.close()
     run_proxy_test(run())

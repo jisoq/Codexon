@@ -1,4 +1,4 @@
-"""Lifecycle inside the relay process. Windows owns crash restart; no child relay."""
+"""Relay lifetime and receipts; AppServices owns bounded crash recovery."""
 from __future__ import annotations
 
 import asyncio
@@ -19,17 +19,18 @@ class ManagedProxy:
         self.instance = uuid.uuid4().hex
         self.control = manager.directory / ('proxy-control-' + self.instance + '.json')
         self.started = time.monotonic()
+        self.acquired = False
 
     def allowed(self):
         state = self.manager.state()
         return bool(state.get('enabled') or state.get('pending') or
                     state.get('phase') in ('starting', 'prepared', 'validated'))
 
-    def publish(self, health, phase):
+    def publish(self, health, phase, **details):
         value = dict(home=home_key(self.manager.home), url=self.manager.url,
                      version=PROXY_VERSION, pid=os.getpid(), worker_pid=os.getpid(),
                      worker_version=PROXY_VERSION, instance=self.instance, lifecycle='managed',
-                     phase=phase, updated_at=time.time(), control_file=str(self.control))
+                     phase=phase, updated_at=time.time(), control_file=str(self.control), **details)
         try:
             atomic_write(self.manager.runtime_path, json.dumps(value).encode())
         except OSError:
@@ -52,25 +53,40 @@ class ManagedProxy:
             health['observation_enabled'] = False
         self.publish(health, 'draining' if health['draining'] else 'active' if configured else 'ready')
 
-    async def serve(self, store, endpoint, context, port,identity=None):
+    def failed(self, failure):
+        if self.acquired:
+            atomic_write(self.control, json.dumps(dict(action='failed', id=self.instance,
+                         failure_id=failure['id'], storage_flushed=failure.get('storage_flushed', False))).encode())
+            self.publish({}, 'failed', failure_id=failure['id'])
+
+    async def serve(self, store, endpoint, context, port,identity=None,diagnostics=None):
         from aiohttp import web
         from .model_proxy import create_app
         # Same lifetime lock as the legacy supervisor permits safe update/migration.
         with ProcessLock(self.manager.directory / 'proxy-supervisor.lock'):
+            self.acquired = True
             if not self.allowed():
                 return
             atomic_write(self.control, json.dumps({'action':'run','id':self.instance}).encode())
             stop = asyncio.Event()
             app = create_app(store, self.manager.home, endpoint, ssl_context=context,
                              control_file=self.control, control_id=self.instance,
-                             stop_event=stop, managed=self,runtime_identity=identity)
+                             stop_event=stop, managed=self,runtime_identity=identity,runtime_diagnostics=diagnostics)
             runner = web.AppRunner(app, access_log=None)
             try:
                 await runner.setup()
                 await web.TCPSite(runner, '127.0.0.1', port).start()
                 await stop.wait()
+            except Exception as error:
+                if diagnostics is None:raise
+                diagnostics.fail(error, 'serve')
             finally:
-                await runner.cleanup()
-                if await asyncio.to_thread(store.close) is False:raise RuntimeError('관측 저장 종료 미완료')
-                atomic_write(self.control,json.dumps(dict(action='stopped',id=self.instance,storage_flushed=True)).encode())
-                self.publish({}, 'stopped')
+                try:
+                    await runner.cleanup()
+                    if await asyncio.to_thread(store.close) is False:raise RuntimeError('Observation storage did not flush')
+                    if diagnostics is None or diagnostics.failure is None:
+                        atomic_write(self.control,json.dumps(dict(action='stopped',id=self.instance,storage_flushed=True)).encode())
+                        self.publish({}, 'stopped')
+                except Exception as error:
+                    if diagnostics is None:raise
+                    diagnostics.fail(error, 'serve_cleanup')
