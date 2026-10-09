@@ -30,14 +30,20 @@ def trusted(run, sha, repository):
             and run.get('head_repository', {}).get('full_name') == repository)
 
 
+def verification_passed(github, run_id):
+    jobs = github.api(f'actions/runs/{run_id}/jobs')['jobs']
+    return any(j['name'] == 'verify' and j['conclusion'] == 'success' for j in jobs)
+
+
 def reusable_run(github, sha, current_run):
     runs = github.api(f'actions/workflows/windows.yml/runs?head_sha={sha}&per_page=100')['workflow_runs']
     for run in sorted(runs, key=lambda r: r['id'], reverse=True):
         if (str(run['id']) == str(current_run) or not trusted(run, sha, github.repository)
-                or run.get('status') != 'completed' or run.get('conclusion') != 'success'):
+                or run.get('status') != 'completed'):
             continue
         artifacts = github.api(f'actions/runs/{run["id"]}/artifacts')['artifacts']
-        if any(a['name'] == f'verified-release-{sha}' and not a['expired'] for a in artifacts):
+        if (any(a['name'] == f'verified-release-{sha}' and not a['expired'] for a in artifacts)
+                and verification_passed(github, run['id'])):
             return str(run['id'])
     return ''
 
@@ -138,7 +144,8 @@ def validate_artifact(folder, sha, run_id, root=ROOT):
     manifest = json.loads((folder/'build-manifest.json').read_text(encoding='utf-8-sig'))
     if manifest['commit'] != sha or manifest['version'] != version(root):
         raise ValueError('Release manifest does not match this commit')
-    if (folder/'RELEASE_NOTES.md').read_bytes() != (root/f'docs/releases/{version(root)}.md').read_bytes():
+    if ((folder/'RELEASE_NOTES.md').read_text(encoding='utf-8-sig')
+            != (root/f'docs/releases/{version(root)}.md').read_text(encoding='utf-8-sig')):
         raise ValueError('Release notes differ from the checked-out commit')
     check_installer(folder)
     return receipt
@@ -149,10 +156,9 @@ def publish(github, sha, verified_run, current_run, folder, root=ROOT):
     if not trusted(run, sha, github.repository):
         raise ValueError('Untrusted verification run')
     if str(verified_run) == str(current_run):
-        jobs = github.api(f'actions/runs/{verified_run}/jobs')['jobs']
-        if not any(j['name'] == 'verify' and j['conclusion'] == 'success' for j in jobs):
+        if not verification_passed(github, verified_run):
             raise ValueError('Current verification job has not passed')
-    elif run.get('status') != 'completed' or run.get('conclusion') != 'success':
+    elif run.get('status') != 'completed' or not verification_passed(github, verified_run):
         raise ValueError('Previous verification run did not pass')
     github.command('run', 'download', verified_run, '--name', f'verified-release-{sha}', '--dir', folder)
     receipt = validate_artifact(folder, sha, verified_run, root)
