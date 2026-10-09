@@ -12,7 +12,10 @@ Follow [CONTRIBUTING.md](CONTRIBUTING.md) for development, architecture, graph a
 
 ## Release Notes
 
-- Check for existing public release notes and follow their language, structure, and writing style.
+- Use [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/) for changelogs and release notes. This structure takes precedence over the format of older release notes. Preserve the project's existing language and writing style.
+- Use `## [<version>] - YYYY-MM-DD` for version entries, with the heading linked to the comparison against the previous public release. Collect ongoing changes under `## [Unreleased]`; a versioned release draft may use its target version and planned date, which must be confirmed before publication. Preserve the project's existing version numbering.
+- Group changes under the exact headings `### Added`, `### Changed`, `### Deprecated`, `### Removed`, `### Fixed`, and `### Security`, in that order. Include only categories with relevant changes; do not add empty headings.
+- Keep Korean and English descriptions equivalent in scope, conditions, and limitations. Place each translation with its corresponding entry under the same change category. Keep installation instructions and download references below the change categories.
 - Focus on what users can now do, which inconveniences have been reduced, and how existing behavior has changed. Do not list commits or modified files.
 - Group related changes by the user experience they affect. Include internal refactoring, test improvements, and implementation details only when they directly affect users.
 - Give each item a short, specific title and a concrete description of the change. Do not rely solely on vague phrases such as "improved stability" or "optimized performance."

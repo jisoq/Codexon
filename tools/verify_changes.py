@@ -43,7 +43,7 @@ GROUPS = {
     'quota_store': test_files('quota', 'quota_tracking', 'quota_tracking_integration',
                              'quota_integrity', 'quota_accumulation', 'quota_value_history'),
     'quota_math': test_files('quota_attribution', 'quota_cycles', 'quota_resets', 'banked_resets'),
-    'quota_poll': test_files('quota_polling', 'quota_live', 'overlay_collection_resilience'),
+    'quota_poll': test_files('quota_polling', 'overlay_collection_resilience'),
     'quota_ui': test_files('quota_page', 'quota_detail_card', 'quota_gap_axis', 'quota_share_theme'),
     'quota_chart': test_files('quota_gap_axis', 'quota_chart_performance', 'quota_page'),
     'dashboard': test_files('ui', 'comparison_workflow', 'dashboard_evidence', 'ui_value_fixes'),
@@ -121,7 +121,7 @@ RULES = (
     # A diff against a supported old revision can still contain this deleted reader.
     ('cachemonitor/quota_reader.py', ('quota_poll', 'quota_store')),
     ('cachemonitor/quota_polling.py', ('quota_poll',)),
-    ('cachemonitor/quota_live.py', ('quota_poll', 'quota_store', 'quota_math')),
+    ('cachemonitor/quota_live.py', ('quota_poll', 'quota_store')),
     ('cachemonitor/quota_diagnostics.py', ('quota_math',)),
     ('cachemonitor/quota_tracking*.py', ('quota_store', 'quota_math')),
     ('cachemonitor/quota.py', ('quota_store', 'quota_math')),
