@@ -1,14 +1,17 @@
-"""Read-only account RPC. No model calls, login changes, or reset redemption."""
+"""Read-only usage with an existing access token; never own the login lifecycle."""
+import base64
 import hashlib
 import json
 import os
 from pathlib import Path
-import queue
-import shutil
-import subprocess
+import ssl
 import threading
 import time
+import tomllib
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
+
+import httpx
 
 from .quota import clean_limits
 from .banked_resets import normalize_reset_credits
@@ -26,21 +29,6 @@ def normalize_credits(value):
         balance = None
     return {'balance': balance, 'unlimited': value.get('unlimited') is True,
             'has_credits': value.get('hasCredits') if type(value.get('hasCredits')) is bool else None}
-
-
-def locate_codex():
-    candidates = []
-    direct = shutil.which('codex.exe')
-    if direct:
-        candidates.append(Path(direct))
-    root = Path(os.environ.get('LOCALAPPDATA', Path.home())) / 'OpenAI' / 'Codex' / 'bin'
-    candidates.extend(root.glob('*/codex.exe'))
-    npm = Path(os.environ.get('APPDATA', Path.home())) / 'npm' / 'node_modules' / '@openai'
-    candidates.extend(npm.glob('codex*/**/codex.exe'))
-    candidates = [p for p in candidates if p.is_file()]
-    if not candidates:
-        raise RuntimeError('Codex 실행 파일을 찾을 수 없습니다. 로컬 기록으로 확인합니다.')
-    return str(max(candidates, key=lambda p: p.stat().st_mtime))
 
 
 def normalize_limits(result, observed, account):
@@ -75,103 +63,149 @@ def normalize_limits(result, observed, account):
             'reset_credits':normalize_reset_credits(result.get('rateLimitResetCredits'))}
 
 
+def token_claims(token):
+    try:
+        part=token.split('.')[1]
+        value=json.loads(base64.urlsafe_b64decode(part+'='*(-len(part)%4)))
+        return value if isinstance(value,dict) else {}
+    except (ValueError,IndexError,TypeError):
+        return {}
+
+
+def saved_access(home):
+    """Read credentials without copying, renewing or writing them anywhere."""
+    try:
+        config=Path(home)/'config.toml'
+        settings=tomllib.loads(config.read_text(encoding='utf-8')) if config.exists() else {}
+        if settings.get('cli_auth_credentials_store') not in (None,'file'):
+            raise RuntimeError('현재 로그인 저장 방식에서는 로컬 관측 기록을 사용합니다.')
+        if settings.get('chatgpt_base_url') not in (None,'https://chatgpt.com/backend-api','https://chatgpt.com/backend-api/'):
+            raise RuntimeError('사용자 지정 인증 서버에서는 로컬 관측 기록을 사용합니다.')
+        raw=(Path(home)/'auth.json').read_bytes()
+        auth=json.loads(raw)
+        tokens=auth.get('tokens') or {}
+        access=tokens.get('access_token')
+        account=tokens.get('account_id')
+        if auth.get('auth_mode') not in (None,'chatgpt','chatgptAuthTokens') or not all(
+                isinstance(v,str) and v for v in (access,account)):
+            raise ValueError()
+        claims=token_claims(access)
+        expiry=claims.get('exp')
+        if type(expiry) in (int,float) and expiry<=time.time()+15:
+            raise RuntimeError('로그인 토큰 갱신 대기: ChatGPT 앱에서 로그인 상태를 확인하세요.')
+        identity=token_claims(tokens.get('id_token') or '').get('email') or account
+        key=hashlib.sha256(str(identity).encode()).hexdigest()
+        return access,account,key,hashlib.sha256(raw).digest()
+    except (OSError,ValueError,AttributeError,TypeError):
+        raise RuntimeError('읽을 수 있는 로그인 정보가 없습니다. 로컬 관측 기록을 사용합니다.') from None
+
+
+def normalize_usage(value, observed, account):
+    """Translate the usage endpoint into the existing quota normalization contract."""
+    if not isinstance(value,dict) or not isinstance(value.get('rate_limit'),dict):
+        raise ValueError('사용 가능한 한도 정보가 없습니다')
+    def window(raw):
+        if raw is None:return None
+        if not isinstance(raw,dict):return {}
+        seconds=raw.get('limit_window_seconds')
+        return dict(usedPercent=raw.get('used_percent'),resetsAt=raw.get('reset_at'),
+                    windowDurationMins=seconds/60 if type(seconds) in (int,float) else None)
+    limits=value['rate_limit']
+    credits=value.get('credits')
+    primary=dict(limitId='codex',planType=value.get('plan_type'),
+                 primary=window(limits.get('primary_window')),secondary=window(limits.get('secondary_window')),
+                 credits={**credits,'hasCredits':credits.get('has_credits')} if isinstance(credits,dict) else None)
+    # An absent field is unknown, not an explicitly absent limit.
+    for name in ('primary','secondary'):
+        if name+'_window' not in limits:primary.pop(name)
+    buckets={'codex':primary}
+    for item in value.get('additional_rate_limits') or []:
+        if isinstance(item,dict) and item.get('metered_feature')!='codex':
+            buckets[str(item.get('metered_feature'))]=dict(normalModelSlug=item.get('normal_model_slug'))
+    resets=value.get('rate_limit_reset_credits')
+    if isinstance(resets,dict):
+        def timestamp(value):
+            if not isinstance(value,str):return value
+            try:
+                dt=datetime.fromisoformat(value.replace('Z','+00:00'))
+                return dt.timestamp() if dt.tzinfo is not None else None
+            except ValueError:return None
+        resets={'availableCount':resets.get('available_count'),'credits':resets.get('credits')}
+        if isinstance(resets['credits'],list):
+            resets['credits']=[{**row,'resetType':'codexRateLimits' if row.get('reset_type')=='codex_rate_limits' else row.get('reset_type'),
+                               'grantedAt':timestamp(row.get('granted_at')),'expiresAt':timestamp(row.get('expires_at'))}
+                              for row in resets['credits'] if isinstance(row,dict)]
+    return normalize_limits(dict(rateLimitsByLimitId=buckets,rateLimitResetCredits=resets),observed,account)
+
+
 class AccountClient:
-    ALLOWED = {'initialize', 'account/read', 'account/rateLimits/read'}
+    USAGE_URL = 'https://chatgpt.com/backend-api/wham/usage'
+    RESET_DETAILS_URL = 'https://chatgpt.com/backend-api/wham/rate-limit-reset-credits'
     _quota_cache = {}
     _quota_lock = threading.Lock()
 
-    def __init__(self, home):
+    def __init__(self, home, *, transport=None):
         self.home = str(home)
-        self.process = None
-        self.sequence = 0
-        self.messages = queue.Queue()
+        self.client = None
+        self.transport = transport
         self.after = 0
         self.cache_seconds = 30
 
-    def start(self):
-        env = os.environ.copy()
-        env['CODEX_HOME'] = self.home
-        self.process = subprocess.Popen([locate_codex(), 'app-server'], env=env,
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            text=True, encoding='utf-8', creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
-        messages = self.messages = queue.Queue()
-        stream = self.process.stdout
-        def read():
-            try:
-                for line in stream:
-                    try:
-                        value = json.loads(line)
-                        if 'id' in value:
-                            messages.put(value)
-                    except (ValueError, TypeError):
-                        continue
-            finally:
-                messages.put({'disconnected': True})
-        threading.Thread(target=read, daemon=True).start()
-        self.rpc('initialize', {'clientInfo': {'name': 'cachemonitor', 'version': '1.0'}})
-        self.process.stdin.write('{"method":"initialized"}\n')
-        self.process.stdin.flush()
-
-    def rpc(self, method, params=None):
-        if method not in self.ALLOWED:
-            raise ValueError('Read-only RPC only')
-        self.sequence += 1
-        message = {'id': self.sequence, 'method': method}
-        if params is not None:
-            message['params'] = params
-        self.process.stdin.write(json.dumps(message) + '\n')
-        self.process.stdin.flush()
-        end = time.monotonic() + 12
-        while time.monotonic() < end:
-            try:
-                value = self.messages.get(timeout=max(.01, end - time.monotonic()))
-            except queue.Empty:
-                raise TimeoutError('한도 조회 시간 초과') from None
-            if value.get('disconnected'):
-                raise ConnectionError('Codex 한도 조회 연결이 종료됐습니다')
-            if value.get('id') == self.sequence:
-                if 'error' in value:
-                    # Never store arbitrary server error payloads or auth data.
-                    raise RuntimeError(f'Codex 한도 조회 실패 ({value["error"].get("code", "unknown")})')
-                return value.get('result') or {}
-        raise TimeoutError('한도 조회 시간 초과')
+    def read(self, url, headers):
+        # Only these two GET destinations receive the cached access token.
+        if url not in (self.USAGE_URL,self.RESET_DETAILS_URL):raise ValueError('Unsupported usage URL')
+        with self.client.stream('GET',url,headers=headers) as response:
+            if response.status_code in (401,403):
+                raise RuntimeError('한도 조회 인증 만료: ChatGPT 앱의 로그인 갱신을 기다립니다.')
+            if response.status_code!=200:
+                raise RuntimeError(f'한도 조회 실패 (HTTP {response.status_code})')
+            parts=[];size=0
+            for chunk in response.iter_bytes():
+                size+=len(chunk)
+                if size>1024*1024:raise ValueError('Usage response too large')
+                parts.append(chunk)
+            return json.loads(b''.join(parts))
 
     def fetch(self):
         try:
-            if self.process is None or self.process.poll() is not None:
-                self.start()
-            account = self.rpc('account/read', {'refreshToken': False}).get('account') or {}
-            identity = account.get('email') or account.get('id')
-            if not identity:
-                raise RuntimeError('로그인된 Codex 계정 확인 필요')
-            key = hashlib.sha256(str(identity).encode()).hexdigest()
+            access,account,key,signature=saved_access(self.home)
             with self._quota_lock:
-                cached = self._quota_cache.get(key)
+                cache_key=(key,account)
+                cached = self._quota_cache.get(cache_key)
                 if cached and time.monotonic()-cached[0]<self.cache_seconds and cached[1]['requested_at']>=self.after:
                     return dict(cached[1])
+                if self.client is None:
+                    ca=os.environ.get('CODEX_CA_CERTIFICATE') or os.environ.get('SSL_CERT_FILE')
+                    self.client=httpx.Client(timeout=httpx.Timeout(12,connect=5),follow_redirects=False,
+                                             verify=ssl.create_default_context(cafile=ca),transport=self.transport)
                 requested_at = time.time()
                 requested_monotonic = time.monotonic()
-                result = self.rpc('account/rateLimits/read')
+                headers={'Authorization':'Bearer '+access,'ChatGPT-Account-Id':account}
+                result=self.read(self.USAGE_URL,headers)
+                if not isinstance(result,dict):raise ValueError('Invalid usage response')
+                if result.get('account_id') not in (None,account):raise ValueError('Usage account mismatch')
+                resets=result.get('rate_limit_reset_credits')
+                if isinstance(resets,dict):
+                    try:details=self.read(self.RESET_DETAILS_URL,headers)
+                    except (httpx.HTTPError,RuntimeError,ValueError):details=None
+                    if isinstance(details,dict) and isinstance(details.get('credits'),list):
+                        resets['credits']=details['credits']
                 received_at = time.time()
                 elapsed = time.monotonic() - requested_monotonic
-                after = self.rpc('account/read', {'refreshToken': False}).get('account') or {}
-                if (after.get('email') or after.get('id')) != identity:
-                    raise RuntimeError('한도 조회 중 계정 변경: 다시 확인합니다')
-                quota = {**normalize_limits(result, received_at, key),
+                if saved_access(self.home)[3]!=signature:
+                    raise RuntimeError('한도 조회 중 로그인 변경: 다시 확인합니다')
+                quota = {**normalize_usage(result, received_at, key),
                          'requested_at': requested_at, 'elapsed': elapsed}
-                self._quota_cache[key] = (time.monotonic(), quota)
+                self._quota_cache[cache_key] = (time.monotonic(), quota)
                 return quota
+        except (httpx.HTTPError,ValueError):
+            self.close()
+            raise RuntimeError('한도 조회 응답을 확인하지 못했습니다. 로컬 관측 기록을 사용합니다.') from None
         except Exception:
             self.close()
             raise
 
     def close(self):
-        if self.process:
-            if self.process.poll() is None:
-                self.process.terminate()
-                try: self.process.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    self.process.kill(); self.process.wait(timeout=3)
-            for stream in (self.process.stdin, self.process.stdout):
-                if stream: stream.close()
-            self.process = None
+        if self.client:
+            self.client.close()
+            self.client = None

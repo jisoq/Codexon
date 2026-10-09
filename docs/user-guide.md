@@ -6,7 +6,9 @@ Amounts estimate subscription value using Standard base token rates and a 2.5x F
 
 Codexon reads local Codex session records and usage metadata. Its usage index stores the fields needed for tokens, cache, model, time, status, and session analysis. It does not need conversation text to calculate these views. The index still contains local paths and identifiers. The separate quota ledger and model-observation data retain observed history. The dashboard may display your project and task names.
 
-When you enable the optional proxy, Codexon backs up the **entire prior** Codex `config.toml` in `%USERPROFILE%\.cachemonitor\model-observer\backups`. That backup can contain sensitive values from your configuration. The proxy relays Codex requests. Live limits are read through the installed Codex `app-server` account RPC; analysis of past usage is based on local records. Codexon is not an offline-only product.
+When you enable the optional proxy, Codexon backs up the **entire prior** Codex `config.toml` in `%USERPROFILE%\.cachemonitor\model-observer\backups`. That backup can contain sensitive values from your configuration. The proxy relays Codex requests. Live limits use the existing login access token for GET requests to OpenAI's usage endpoints; analysis of past usage is based on local records. Codexon is not an offline-only product.
+
+Quota reads never refresh tokens, modify authentication files, or launch another `codex.exe`. Live reads currently support credentials stored in `auth.json` under the selected Codex home. Expired or rejected credentials fall back to existing local observations. OS credential-store and memory-only login modes also use local observations. Renew your login in the ChatGPT app.
 
 ## Session overlay and Codex updates
 
