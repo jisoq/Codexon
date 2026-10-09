@@ -1,0 +1,40 @@
+{
+  "version": "6.11.2",
+  "sources": [
+    {
+      "name": "qtbase-everywhere-src-6.11.2.tar.xz",
+      "sha256": "5b2e00eccaf5a4d8c14134ffa0ea8dfd0a35ae1ffc7f8d87fa4305a1ed23cf22",
+      "source": "https://download.qt.io/official_releases/qt/6.11/6.11.2/submodules/qtbase-everywhere-src-6.11.2.tar.xz",
+      "bytes": 50582668
+    },
+    {
+      "name": "qtdeclarative-everywhere-src-6.11.2.tar.xz",
+      "sha256": "215b7b70517e380123eabc6b92243f3c47b6f016a91d126057dbe53551c6b430",
+      "source": "https://download.qt.io/official_releases/qt/6.11/6.11.2/submodules/qtdeclarative-everywhere-src-6.11.2.tar.xz",
+      "bytes": 38780392
+    },
+    {
+      "name": "qtsvg-everywhere-src-6.11.2.tar.xz",
+      "sha256": "d594337feca84c26fb67fe87b85e6a5c12fda404b611d905f9d138210c311876",
+      "source": "https://download.qt.io/official_releases/qt/6.11/6.11.2/submodules/qtsvg-everywhere-src-6.11.2.tar.xz",
+      "bytes": 2341860
+    },
+    {
+      "name": "qtshadertools-everywhere-src-6.11.2.tar.xz",
+      "sha256": "805046b8b7757665586890b375940047e874ae3ab00adb6d3f2b38fc6b200b1c",
+      "source": "https://download.qt.io/official_releases/qt/6.11/6.11.2/submodules/qtshadertools-everywhere-src-6.11.2.tar.xz",
+      "bytes": 1216816
+    },
+    {
+      "name": "pyside-setup-everywhere-src-6.11.2.tar.xz",
+      "sha256": "cba47efbaad1bedd529725cbc14e21f156c7a19366f07b3edfbb076ffd7afdf8",
+      "source": "https://download.qt.io/official_releases/QtForPython/pyside6/PySide6-6.11.2-src/pyside-setup-everywhere-src-6.11.2.tar.xz",
+      "bytes": 18053248
+    }
+  ],
+  "existing_mirror": {
+    "source_key": "c0b6c354d97ace4e3dafd2922160cb6842a166276c9a6edf52d2847196809035",
+    "tag": "v2026.10.10.1",
+    "sha256": "73c6e610a0d0d9e72e9e4d605d3515657f8d94179e2d757ceaf6e7065f41ee85"
+  }
+}
