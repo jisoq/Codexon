@@ -17,17 +17,21 @@ def run_proxy_test(coro):
 
 
 @pytest.mark.parametrize('force',[False,True])
-def test_managed_shutdown_finishes_inflight_websocket_without_replay(tmp_path,force):
+@pytest.mark.parametrize('interrupt',[False,True])
+def test_managed_shutdown_finishes_inflight_websocket_without_replay(tmp_path,force,interrupt):
     async def run():
         token='own-worker';control=tmp_path/('proxy-control-'+token+'.json')
         control.write_text(json.dumps({'id':token,'action':'run'}))
-        stop=asyncio.Event();finish=asyncio.Event();received=[]
+        stop=asyncio.Event();finish=asyncio.Event();interrupted=asyncio.Event();received=[]
         async def upstream(request):
             ws=web.WebSocketResponse();await ws.prepare(request)
             message=await ws.receive_json();received.append(message)
             await ws.send_json({'type':'response.created','response':{'id':'one','model':'m'}})
+            if interrupt:
+                assert (await ws.receive_json())['type']=='response.interrupt'
+                interrupted.set()
             await finish.wait()
-            await ws.send_json({'type':'response.completed','response':{'id':'one','model':'m','output':'KEEP_FINAL'}})
+            await ws.send_json({'type':'response.completed','response':{'id':'one','model':'m','output':'KEEP_FINAL','usage':{'input_tokens':7,'output_tokens':3}}})
             async for _ in ws:pass
             return ws
         app=web.Application();app.router.add_get('/responses',upstream)
@@ -38,6 +42,11 @@ def test_managed_shutdown_finishes_inflight_websocket_without_replay(tmp_path,fo
                 async with client.ws_connect(proxy+'/responses') as ws:
                     await ws.send_json({'type':'response.create','model':'m','input':'keep'})
                     assert (await ws.receive_json())['type']=='response.created'
+                    if interrupt:
+                        await ws.send_json({'type':'response.interrupt'})
+                        await asyncio.wait_for(interrupted.wait(),3)
+                        health=await (await client.get(proxy+'/health')).json()
+                        assert health['websocket_states']['unknown']==0 and health['websocket_states']['responding']==1
                     control.write_text(json.dumps({'id':token,'action':'drain'}))
                     await asyncio.sleep(.3)
                     health=await (await client.get(proxy+'/health')).json()
@@ -49,10 +58,12 @@ def test_managed_shutdown_finishes_inflight_websocket_without_replay(tmp_path,fo
                         assert len(received)==1
                         finish.set();return
                     finish.set()
-                    assert (await ws.receive_json())['response']['output']=='KEEP_FINAL'
+                    final=(await ws.receive_json())['response']
+                    assert final['output']=='KEEP_FINAL' and final['usage']=={'input_tokens':7,'output_tokens':3}
                     await asyncio.wait_for(ws.receive(),3)
                 await asyncio.wait_for(stop.wait(),3)
                 assert len(received)==1
+                assert store.db.execute("select response_model from model_observations where response_id='one' and status='completed'").fetchone()==('m',)
         finally:store.close()
     run_proxy_test(run())
 

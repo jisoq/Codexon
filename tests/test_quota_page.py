@@ -282,7 +282,7 @@ def test_cycle_selector_changes_graph_preserves_lifetime_and_selection_on_refres
         assert panel.history.series is panel._view['overall']
         assert panel.history.series['cumulative']
         assert len(panel.history.curves())==4
-        assert panel.remaining_legend.text()=='━ 누적 소모량 · %p'
+        assert panel.remaining_legend.text()=='━ 누적 소모량 (%p)'
         # The last cycle has a complete 99 -> 98 boundary, even though its
         # opening idle observation is hidden from the display.
         assert panel.history.series['completed_costs']==[None]*6+[pytest.approx(.0105),None]

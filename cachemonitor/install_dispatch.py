@@ -32,7 +32,7 @@ def native_install(args):
     if args.prepare_uninstall:
         # A one-file recovery executable has both a bootloader and Python process.
         for pid in (os.getpid(),os.getppid()):command+=['--install-caller-pid',str(pid)]
-    for key in ('product_dir','language'):
+    for key in ('product_dir','language','update_id'):
         value=getattr(args,key,None)
         if value:command+=['--'+key.replace('_','-'),str(value)]
     for key in ('prepare_uninstall','isolated_install','no_launch'):

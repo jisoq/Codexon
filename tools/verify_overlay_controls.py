@@ -26,7 +26,7 @@ def main():
     app=QApplication([]);load_bundled_fonts();app.setQuitOnLastWindowClosed(False)
     host=QWidget();host.setWindowTitle('Cache Monitor overlay controls verification')
     layout=QVBoxLayout(host)
-    layout.addWidget(QLabel('Owned test surface · controls and input pass-through'))
+    layout.addWidget(QLabel('Owned test surface, controls and input pass-through'))
     button=QPushButton('Click-through target');layout.addWidget(button,1)
     button.setSizePolicy(QSizePolicy.Expanding,QSizePolicy.Expanding)
     host.resize(1000,760);host.show()

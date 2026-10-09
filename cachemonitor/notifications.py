@@ -48,7 +48,7 @@ class ConfirmedNotifications:
                 if len(self.http_seen)>10000:
                     _,old=self.http_seen.popitem(last=False);self.http_floor=max(self.http_floor,old)
                 if not self.http_enabled or stamp<=self.http_since:continue
-                item=self.record('http_fallback','HTTP 전환',f"{session.get('title') or session['id']} · HTTP 전환 기록 확인")
+                item=self.record('http_fallback','HTTP 전환',f"{session.get('title') or session['id']}, HTTP 전환 기록 확인")
                 from .overlay_navigation import NavigationTarget
                 item.update(home=session['home'],sid=session['id'],observation_at=stamp,
                     target=NavigationTarget(session['home'],session['id'],view='calls',filters=('http',),
@@ -61,7 +61,7 @@ class ConfirmedNotifications:
         for row in candidates:
             if not row.get('model_alert_confirmed'):
                 previous=self.model_records.get((row['home'],row.get('key')))
-                if previous:previous['resolution']='관측 정정 · 해당 응답의 확정 조건 해제'
+                if previous:previous['resolution']='관측 정정: 해당 응답의 확정 조건 해제'
                 continue
             scope=(row['home'],row['sid'])
             session=sessions.setdefault(scope,dict(home=row['home'],id=row['sid'],title=row['title'],history=[]))
@@ -93,14 +93,14 @@ class ConfirmedNotifications:
                 incident=health.get('incident')
                 previous=self.cache_incidents.get(scope)
                 if previous and incident is None:
-                    previous['resolution']='기록 정정 · 이상 판정 해제'
+                    previous['resolution']='기록 정정: 이상 판정 해제'
                 if previous and incident and previous.get('incident_id')==incident['id']:
-                    previous.update(count=incident['count'],detail=f"{session['title']} · {health['reason']}")
+                    previous.update(count=incident['count'],detail=f"{session['title']}, {health['reason']}")
                     if incident.get('resolved'):
                         previous['resolution']='회복 확인'
                     continue
                 if incident and not incident.get('resolved') and self.cache_enabled and incident['ts']>max(self.cache_since,self.cache_floor):
-                    item=self.record('cache_miss',incident['state'],f"{session['title']} · {health['reason']} · 잠정 규칙")
+                    item=self.record('cache_miss',incident['state'],f"{session['title']}, {health['reason']}, 잠정 규칙")
                     item.update(home=scope[0],sid=scope[1],count=incident['count'],incident_id=incident['id'],
                                 call_id=incident['latest_key'],response_id=incident['latest_key'])
                     from .overlay_navigation import NavigationTarget
@@ -153,7 +153,7 @@ class ConfirmedNotifications:
                 if not self.model_enabled:continue
                 requested,responded=row['requested_model'],row['response_model']
                 group=(*scope,requested,responded)
-                detail=(f"{session['title']} · 요청: {requested} → 응답: {responded}\n"
+                detail=(f"{session['title']}, 요청: {requested} → 응답: {responded}\n"
                         f"응답 ID: {row['key']}\n완료 응답의 모델명 문자열 차이입니다. 실제 실행 모델 변경을 뜻하지 않습니다.")
                 if group in self.groups:
                     item=self.groups[group][1]

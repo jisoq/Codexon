@@ -90,7 +90,7 @@ class OverlayShadow(QuickHost):
     def __init__(self):
         super().__init__(None,Qt.Tool|Qt.FramelessWindowHint|Qt.WindowStaysOnTopHint|
                          Qt.WindowDoesNotAcceptFocus|Qt.WindowTransparentForInput)
-        self.setWindowTitle('Cache Monitor · Shadow')
+        self.setWindowTitle('Cache Monitor - Shadow')
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.setAttribute(Qt.WA_TransparentForMouseEvents)

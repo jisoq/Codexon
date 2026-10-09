@@ -71,68 +71,49 @@ def test_intentional_off_is_distinct_from_failed_activation(tmp_path):
     panel=ObserverPanel(tmp_path/'home',tmp_path/'data',active=False)
     try:
         panel.display({'configured':True,'phase':'active','runtime':{'phase':'ready'}})
-        panel.connection_details.toggle.setChecked(True)
+        assert panel.status_label.text()=='실행 중'
+        from PySide6.QtGui import QColor
+        assert 80<QColor(panel.status_label.state['color']).hue()<160
         off={'configured':False,'phase':'off','registration':{'autostart':False}}
         panel.display(off)
-        assert panel.status_label.text()=='프록시 사용 안 함'
-        assert panel.runtime_values['guard'].text()=='프록시 사용 안 함'
-        assert not panel.connection_details.content.isVisible()
-        panel.connection_details.toggle.setChecked(True)
-        panel.display(off)
-        assert panel.connection_details.content.isVisible()  # Polls preserve an explicit expansion.
+        assert panel.status_label.text()=='꺼짐'
+        assert QColor(panel.status_label.state['color']).saturation()==0
+        assert not hasattr(panel,'connection_details')
         panel.display({'error':'synthetic failure','observer_status':{**off,'phase':'failed'}})
         assert panel.status_label.text()=='켜지 못했습니다'
-        assert panel.runtime_values['guard'].text()=='실행 상태 확인 필요'
         assert panel.error_detail.isVisible()
         panel.display({'error':'synthetic settings failure','observer_status':off})
         assert panel.status_label.text()=='프록시 설정 변경 실패'
         panel.display(off)
         assert not panel.error_detail.isVisible()
-        assert panel.status_label.text()=='프록시 사용 안 함'
+        assert panel.status_label.text()=='꺼짐'
     finally:panel.stop();panel.deleteLater();app.processEvents()
 
-def test_unified_update_check_then_explicit_install_and_cancel(tmp_path,monkeypatch):
-    from cachemonitor.quick_qa import mount,control,click,dispose
-    from cachemonitor.fonts import load_bundled_fonts
-    from PySide6.QtGui import QFont
-    app=QApplication.instance() or QApplication([])
-    load_bundled_fonts();app.setFont(QFont('Pretendard JP',10))
+def test_update_recheck_cannot_skip_connection_exit(tmp_path,monkeypatch):
     from cachemonitor.update_panel import UpdatePanel
     from cachemonitor.observer_control import ObserverManager
-    panel=UpdatePanel(ObserverManager(tmp_path/'home',tmp_path/'data'))
-    calls=[]
-    initial={'configured':True,'phase':'active','version_mismatch':True,'health':{'version':'old'}}
-    waiting={**initial,'update':{'phase':'waiting','message':'진행 중 응답 및 캐시 작업 정산 대기'}}
-    monkeypatch.setattr('cachemonitor.app_update.check_update',lambda progress,manager:dict(kind='proxy',manager=manager))
-    monkeypatch.setattr('cachemonitor.app_update.update',lambda progress,manager,**kw:(calls.append('update') or '설치 시작'))
-    monkeypatch.setattr('cachemonitor.update_panel.open_recovery',lambda *args:calls.append('recovery'))
-    panel.manager.cancel_update=lambda:(calls.append('cancel') or initial)
-    panel.proxy_status(initial);host=mount(panel,680,650)
-    def finish():
-        for _ in range(200):
-            app.processEvents();QTest.qWait(10)
-            if panel.operation is None:return
-        raise AssertionError('update not finished')
+    from cachemonitor.update_state import scope_for
+    app=QApplication.instance() or QApplication([])
+    manager=ObserverManager(tmp_path/'home',tmp_path/'data')
+    panel=UpdatePanel(manager);journal=panel.journal
+    record=journal.begin('proxy','2026.10.09.1',scope=scope_for(manager));operation=record['operation_id']
+    journal.proxy_result(operation,dict(phase='waiting',required_action='close_client',unknown_connections=1))
+    calls=[];manager.cancel_update=lambda:calls.append('cancel') or {}
+    manager.status=lambda:{'configured':True,'update':dict(phase='waiting',required_action='close_client',unknown_connections=1)}
     try:
-        click(host,control(host,panel.button));finish()
-        assert calls==[] and panel.offer and not panel.confirming
-        QTest.qWait(30)
-        click(host,control(host,panel.execute))
-        assert panel.confirming
-        dialog=panel.dialog
-        click(dialog.host,control(dialog.host,dialog.confirm));finish()
-        assert calls==['update']
-        panel.proxy_status(waiting)
-        assert panel.button.text()=='업데이트 취소'
-        QTest.qWait(100)
-        assert host.grab().save(str(tmp_path/'update-panel.png'))
-        import os
-        if os.environ.get('CACHEMONITOR_UPDATE_CAPTURE'):
-            assert host.grab().save(os.environ['CACHEMONITOR_UPDATE_CAPTURE'])
-        click(host,control(host,panel.button));finish()
-        assert calls==['update','cancel']
-        panel.proxy_status({**initial,'update':{'phase':'switching','message':'업데이트 중'}})
-        assert panel.button.isEnabled()
-        panel.proxy_status({'configured':True,'phase':'active','update':{'phase':'complete','message':'업데이트 완료'}})
-        assert panel.button.isEnabled()
-    finally:dispose(host)
+        panel.refresh()
+        assert panel.recheck.isVisible() and panel.later.isVisible() and not panel.button.isVisible()
+        assert panel.button.text()=='업데이트 확인'
+        panel.recheck.clicked.emit()
+        for _ in range(100):
+            app.processEvents();QTest.qWait(5)
+            if panel.operation is None:break
+        assert journal.read()['phase']=='needs_exit' and not calls
+        panel.cancel_update(True)
+        assert calls==['cancel'] and journal.read()['defer_requested']
+        journal.proxy_result(operation,dict(phase='cancelled'))
+        panel.refresh();assert panel.execute.isVisible()
+        journal.change(operation,phase='switching',proxy={'cutover_started':True})
+        panel.refresh();panel.cancel_update(False)
+        assert calls==['cancel'] and not panel.later.isVisible() and not panel.cancel.isVisible()
+    finally:panel.deleteLater();app.processEvents()

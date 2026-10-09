@@ -41,7 +41,7 @@ def quota_display(quota,mode,now):
     checked=datetime.fromtimestamp(observed).strftime('%m/%d %H:%M') if observed else '미확인'
     source = {'live': '계정 조회', 'local': '로컬 기록'}.get(quota.get('source'))
     if source:
-        checked += ' · ' + source
+        checked += ', ' + source
     window=quota.get('windows',{}).get(mode)
     reset=(window or {}).get('resets_at')
     if quota.get('reset_pending') or (reset is not None and now>=reset and (not observed or observed<reset)):
@@ -50,7 +50,7 @@ def quota_display(quota,mode,now):
     max_age=quota.get('max_age',90 if quota.get('source')=='live' else 120)
     stale=(now-observed>=max_age if quota.get('source')=='live' else now-observed>max_age) if observed else True
     if stale or observed>now+1:
-        return {'text':'?','tooltip':f'{label} 미확인 · 갱신 지연\n마지막 확인 {checked}',
+        return {'text':'?','tooltip':f'{label} 미확인, 갱신 지연\n마지막 확인 {checked}',
                 'remaining':None,'state':'미확인'}
     if window is None:
         if mode in quota.get('window_conflicts',[]):
@@ -59,16 +59,16 @@ def quota_display(quota,mode,now):
         if mode in quota.get('unlimited_windows',[]):
             return {'text':'∞','tooltip':f'{label} 제한 없음\n확인 {checked}',
                     'remaining':None,'state':'제한 없음'}
-        return {'text':'?','tooltip':f'{label} 미확인 · 정보 없음\n마지막 확인 {checked}',
+        return {'text':'?','tooltip':f'{label} 미확인, 정보 없음\n마지막 확인 {checked}',
                 'remaining':None,'state':'미확인'}
     used=window.get('used_percent')
     if type(used) not in (int,float) or not math.isfinite(used) or not 0<=used<=100:
-        return {'text':'?','tooltip':f'{label} 미확인 · 유효하지 않은 사용률',
+        return {'text':'?','tooltip':f'{label} 미확인, 유효하지 않은 사용률',
                 'remaining':None,'state':'미확인'}
     remaining=100-window['used_percent']
     reset_text=datetime.fromtimestamp(reset).strftime('%m/%d %H:%M') if reset else '미확인'
     return {'text':str(math.floor(remaining+1e-9)),
-            'tooltip':f'{label} 잔여 {remaining:g}%\n리셋 {reset_text} · 확인 {checked}',
+            'tooltip':f'{label} 잔여 {remaining:g}%\n리셋 {reset_text}, 확인 {checked}',
             'remaining':remaining,'state':'확인'}
 
 

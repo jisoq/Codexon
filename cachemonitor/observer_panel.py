@@ -1,9 +1,8 @@
 """One proxy switch; preparation, verification and recovery stay in the controller."""
 from PySide6.QtCore import Qt,QThread, QSignalBlocker, Signal
-from .presentation import Button, Column, Form, Group, Row, Text
+from .presentation import Button, Column, Group, Row, Text
 from .controls import Switch
 from .observer_control import ObserverManager
-from .ui_details import Details
 
 
 class ObserverOperation(QThread):
@@ -22,6 +21,7 @@ class ObserverOperation(QThread):
 
 class ObserverPanel(Group):
     status_observed=Signal(dict)
+    progress_requested=Signal()
     def __init__(self,home,directory=None,active=False,parent=None,manager=None):
         super().__init__(parent)
         self.manager=manager or ObserverManager(home,directory)
@@ -29,40 +29,47 @@ class ObserverPanel(Group):
         self.operation=None;self.active=active;self.enabled=False
         self.pending=None;self.last_result={};self.operation_name=''
         self.inactive=False
-        layout=Column(self);layout.setContentsMargins(0,0,0,10);layout.setSpacing(16)
-        row=Row();copy=Column()
+        layout=Column(self);layout.setContentsMargins(0,12,0,12);layout.setSpacing(4)
+        row=Row();row.put(collapseBelow=620,minHeight=36);row.setSpacing(8);copy=Column();copy.setSpacing(4)
         title=Text('프록시 사용');title.setStyleSheet('font-weight: 500;');copy.addWidget(title)
-        description=Text('요청 모델과 응답 모델 비교. 켜기 전 로컬 준비 상태 확인.')
+        description=Text('Codex 연결을 통해 응답의 사용량을 관측합니다.')
         self.description=description
-        description.setWordWrap(True);description.setStyleSheet('color: muted; font-size: 12px;')
-        copy.addWidget(description);row.addLayout(copy,1)
-        self.toggle=Switch();self.toggle.setAccessibleName('프록시 사용');row.addWidget(self.toggle)
+        description.setWordWrap(True);description.put(color='muted',fontSize=13)
+        copy.addWidget(description);row.addLayout(copy,2)
+        controls=Row();controls.setSpacing(8)
+        self.toggle=Switch();self.toggle.setAccessibleName('프록시 사용');controls.addWidget(self.toggle)
+        self.status_label=Text('꺼짐');self.status_label.put(fontSize=13);controls.addWidget(self.status_label)
+        self.progress_link=Button('진행 보기');self.progress_link.put(iconName='right',role='quiet')
+        self.progress_link.setFixedSize(32,32);self.progress_link.setAccessibleName('업데이트 진행 보기')
+        self.progress_link.setToolTip('업데이트 진행 보기');self.progress_link.hide()
+        self.progress_link.clicked.connect(self.progress_requested)
+        controls.addWidget(self.progress_link);controls.addStretch();row.addLayout(controls,1)
         layout.addLayout(row)
-        self.status_label=Text('꺼짐');self.status_label.setWordWrap(False)
-        self.status_label.setStyleSheet('font-size: 15px; font-weight: 600; padding: 12px 0;')
-        layout.addWidget(self.status_label)
-        self.error_detail=Details('오류 상세',Text(),compact=True)
-        self.error_detail.body.setTextFormat(Qt.PlainText)
+        self.error_detail=Text();self.error_detail.setWordWrap(True);self.error_detail.put(color='error',fontSize=13)
         self.error_detail.hide();layout.addWidget(self.error_detail)
-        # Updating is owned by Settings > About, together with the desktop app.
-        self.update_status=Text();self.update_status.setWordWrap(True);self.update_status.hide()
-        layout.addWidget(self.update_status)
-        details=Form();details.setVerticalSpacing(12);details.setHorizontalSpacing(24)
-        self.runtime_values={}
-        for key,title in (('guard','연결 관리'),('startup','로그인 시 실행'),('version','버전'),('path','실행 파일')):
-            name=Text(title);name.setStyleSheet('color: muted;')
-            value=Text('확인 중');value.setWordWrap(True);value.setTextFormat(Qt.PlainText)
-            value.setTextInteractionFlags(Qt.TextSelectableByMouse)
-            self.runtime_values[key]=value;details.addRow(name,value)
-        self.connection_details=Details('연결 정보',details);layout.addWidget(self.connection_details)
         self.restart_label=Text();self.restart_label.setWordWrap(False);self.restart_label.setFixedHeight(24)
         self.restart_label.setStyleSheet('color: warning;');layout.addWidget(self.restart_label)
         self.toggle.toggled.connect(self.request)
+        from .theme import shared_theme
+        shared_theme().changed.connect(self.refresh_color)
+        self.refresh_color()
         self.update_controls()
 
     def busy(self):return self.operation is not None
     def update_controls(self):
-        self.toggle.setEnabled(self.active)
+        phase=(self.last_result.get('update') or {}).get('phase')
+        update=self.last_result.get('update') or {}
+        critical=update.get('cutover_started') and phase in ('queued','waiting','switching','stopping','starting','verifying','rollback')
+        self.toggle.setEnabled(self.active and not critical and phase not in ('switching','stopping','starting','verifying','rollback'))
+
+    def refresh_color(self):
+        from .theme import shared_theme
+        theme=shared_theme()
+        color=('#77D69B' if theme.dark else '#16803D') if self.enabled else ('#AAAAAA' if theme.dark else '#666666')
+        if (self.last_result.get('update') or {}).get('phase') not in (None,'off','complete','cancelled'):
+            color='#F1BD63' if theme.dark else '#8A5500'
+        if self.error_detail.isVisible():color='#EA9A92' if theme.dark else '#A3261B'
+        self.status_label.put(color=theme.readableText(color,'surface'))
 
     def request(self,enabled):
         if not self.active:return
@@ -98,18 +105,17 @@ class ObserverPanel(Group):
         error=result.get('error');state=result.get('observer_status',{}) if error else result
         self.last_result=state;self.enabled=state.get('configured',False)
         update=state.get('update') or {};phase_update=update.get('phase')
-        self.update_status.setText(update.get('message',''))
-        self.update_status.setVisible(bool(update.get('message')))
+        self.progress_link.setVisible(phase_update not in (None,'off','complete','cancelled'))
         self.update_controls()
         if self.pending is None:
             with QSignalBlocker(self.toggle):self.toggle.setChecked(self.enabled)
         phase=state.get('phase','off')
-        text={'off':'꺼짐','starting':'로컬 프록시 준비 확인 중…','prepared':'꺼짐',
-              'validated':'꺼짐 , 로컬 프록시 준비 완료','active':'켜짐','draining':'꺼짐 , 기존 연결 마무리 중',
+        text={'off':'꺼짐','starting':'시작 중…','prepared':'꺼짐',
+              'validated':'꺼짐','active':'실행 중','draining':'연결 마무리 중',
               'faulted':'보호 정지','failed':'켜지 못했습니다','recovery_failed':'보호 정지 , 설정 복구 필요',
-              'recovery_required':'연결 확인 필요 , 문제 해결에서 연결 복구'}.get(phase,phase)
+              'recovery_required':'복구 필요'}.get(phase,phase)
         if error and not state:
-            text='연결 설정 확인 실패 , 문제 해결에서 연결 복구'
+            text='복구 필요'
         elif state.get('configured') and state.get('probe_state'):
             from .connection_recovery import assess
             assessed=assess(state)
@@ -120,36 +126,18 @@ class ObserverPanel(Group):
         if incident.get('recovery_error'):reason=(reason+'\n' if reason else '')+'설정 복구 실패: '+incident['recovery_error']
         inactive=not self.enabled and phase in ('off','prepared','validated') and not reason and not state.get('registration_issue')
         if inactive:
-            text='프록시 사용 안 함'+(' , 로컬 프록시 준비 완료' if phase=='validated' else '')
-            if not self.inactive:self.connection_details.toggle.setChecked(False)
+            text='꺼짐'
         elif error and phase in ('off','prepared','validated') and state:
             text='프록시 설정 변경 실패'
         self.inactive=inactive
+        if phase_update in ('queued','waiting','interrupted','failed'):text='업데이트 적용 대기'
+        elif phase_update in ('switching','stopping','starting','verifying','rollback'):text='연결 적용 중'
         self.status_label.setText(text)
-        self.error_detail.body.setText(str(reason or ''))
+        self.error_detail.setText(str(reason or ''))
         self.error_detail.setVisible(bool(reason))
-        self.status_label.setStyleSheet('font-size: 15px; font-weight: 600; padding: 12px 0; color: '
-            +('error' if error or phase in ('faulted','failed','recovery_failed','recovery_required') else 'success' if self.enabled else 'muted')+';')
-        health=state.get('health') or {};runtime=state.get('runtime') or {};registration=state.get('registration')
-        version=health.get('version') or '실행 안 됨'
-        versions=f"앱 {state.get('app_version','—')} , 프록시 {version}"
-        if state.get('proxy_update_available'):
-            versions+=' → '+state.get('target_proxy_version','새 버전')+' 업데이트 가능'
-        elif state.get('version_mismatch'):
-            versions+='\n앱 정보에서 업데이트'+(' , 현재 연결 유지 중' if self.enabled else ' , 프록시 사용 꺼짐')
-        elif health and version!=state.get('app_version'):
-            versions+=' , 호환됨'
-        self.runtime_values['version'].setText(versions)
-        self.runtime_values['guard'].setText(('프록시 내부 관리' if health.get('lifecycle')=='managed' else '이전 독립 감시') if runtime.get('phase') in ('ready','active','draining') else '실행 상태 확인 필요')
-        if health and not health.get('control_id') and runtime.get('phase') in ('ready','active','draining'):
-            self.runtime_values['guard'].setText('작동 중 , 이전 프록시는 연결 장애만 감시')
-        if inactive:self.runtime_values['guard'].setText('프록시 사용 안 함')
-        startup=('켜짐 , 독립 실행' if registration.get('autostart') else 'Codexon과 함께 실행 , 일반 설정의 자동 시작을 따름') if registration is not None else '확인 중'
-        if state.get('registration_issue'):startup='확인 필요: '+state['registration_issue']
-        self.runtime_values['startup'].setText(startup)
-        self.runtime_values['path'].setText(str(state.get('running_proxy_path') or ('실행 경로 미확인' if health else '실행 안 됨')))
+        self.refresh_color()
         restart=bool(state.get('restart_required')) and phase_update!='complete'
-        self.restart_label.setText('연결 변경 적용: Codex 재시작' if restart else '')
+        self.restart_label.setText('변경을 적용하려면 연결한 앱을 다시 여세요.' if restart else '')
         self.restart_label.setVisible(restart)
         self.status_observed.emit(state)
 

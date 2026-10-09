@@ -78,6 +78,9 @@ def test_english_token_labels_do_not_change_stored_values():
         assert tr('2 / 2호출') == '2 / 2 calls'
         assert tr('모양') == 'Appearance'
         assert tr('알림') == 'Notifications'
+        assert tr('유효 1,234요청, 포함 5,678호출') == '1,234 eligible requests, 5,678 included calls'
+        assert tr('유효 1,234 / 대상 5,678, 입력 90,000') == 'Valid 1,234 of 5,678, input 90,000'
+        assert tr('관측 1,234호출, 56세션') == '1,234 observed calls, 56 sessions'
     finally:
         set_language('ko')
 

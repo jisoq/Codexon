@@ -24,7 +24,7 @@ CALCULATIONS = {
     '평균 호출 비용':'세션 비용 ÷ 호출 수',
     '캐시 적중률':'세션 캐시 읽기 합계 ÷ 입력 합계 × 100',
     'Total':'세션 총 토큰 합계',
-    'Total · 확인분':'확인된 세션 토큰 합계',
+    'Total (확인분)':'확인된 세션 토큰 합계',
     '일반 입력':'입력 − 캐시 읽기 − 캐시 쓰기',
     '추론 외':'출력 − 추론 토큰',
     '입력 미분류':'입력 중 구성 항목을 확인하지 못한 토큰',
@@ -110,7 +110,7 @@ def collection_error_label(error):
     if any(marker in lower for marker in ('permissionerror','permission denied','access is denied','winerror 5','액세스가 거부','접근이 거부')):
         return '기록 접근 실패'
     brief=raw.strip()
-    if len(brief)<=40 and re.fullmatch(r'(?:기록|수집|관측)[가-힣0-9 ·()]*?(?:오류|실패|지연|누락|손상|거부|없음|중)',brief):
+    if len(brief)<=40 and re.fullmatch(r'(?:기록|수집|관측)[가-힣0-9,: ()]*?(?:오류|실패|지연|누락|손상|거부|없음|중)',brief):
         return brief
     return '기록 읽기 실패'
 
@@ -206,7 +206,7 @@ class Drawing:
     def tokens(self,x,y,width=348,title='토큰'):
         c=(self.model.data or {}).get('token_composition',{})
         self.text(title,x,y,width*.5,20,12,weight=500)
-        self.text(('Total · 확인분 ' if c.get('partial') else 'Total ')+amount(c.get('total') if c.get('known') else None),x+width*.5,y,width*.5,20,12,right=True)
+        self.text(('Total (확인분) ' if c.get('partial') else 'Total ')+amount(c.get('total') if c.get('known') else None),x+width*.5,y,width*.5,20,12,right=True)
         narrow=width<300;column=width if narrow else (width-16)/2;top=y+28
         groups=[('입력','input_parts','input_total'),('출력','output_parts','output_total')]
         for index,(label,key,total_key) in enumerate(groups):
@@ -291,7 +291,7 @@ class OverlayContent(Node):
             return self.note, {'수집 오류':'사용량 수집을 확인하지 못했습니다. 문제 해결 화면에서 오류를 확인해 주세요.',
                                '수집 지연':'새 수집 결과가 도착하지 않았습니다. 마지막 수집 상태를 확인해 주세요.',
                                '수집 시작 중':'수집기 실행을 요청했습니다. 새 수집 결과를 기다리고 있습니다.'}[self.note]
-        if self.note in ('기록 확인 중','세션 기록 확인 중','기록 수집 중 · 잠정값'):
+        if self.note in ('기록 확인 중','세션 기록 확인 중','기록 수집 중 (잠정값)'):
             return '기록 확인 중','세션 기록을 읽고 있습니다. 확인된 사용량이 준비되면 표시합니다.'
         if self.note=='호출 기록 없음' or not self.note and (self.data or {}).get('calls')==0:
             return '호출 기록 대기','아직 수집된 호출이 없습니다. 호출 기록이 수집되면 사용량을 표시합니다.'
@@ -317,7 +317,7 @@ class OverlayContent(Node):
         self.sync_details();self.update()
     def set_content(self,data,note='',dark=True,appearance=None):
         appearance=appearance or default_appearance(dark)
-        checking=note in ('기록 확인 중','세션 기록 확인 중','기록 수집 중 · 잠정값')
+        checking=note in ('기록 확인 중','세션 기록 확인 중','기록 수집 중 (잠정값)')
         if data and checking:data={key:data[key] for key in ('id','home','title') if key in data}
         if note.startswith('원격 작업') or note=='현재 세션 식별 불가':data=None
         def visible(value):
@@ -408,7 +408,7 @@ class OverlayContent(Node):
 
     def context(self):
         d=self.data or {};row=self.rows()[-1] if self.rows() else d.get('latest') or {}
-        secondary=' · '.join(str(v) for v in (row.get('effort'),row.get('mode'),observed_transport(row)) if recorded(v))
+        secondary=', '.join(str(v) for v in (row.get('effort'),row.get('mode'),observed_transport(row)) if recorded(v))
         return model_comparison(row),secondary
     def context_rows(self):
         value=self.context()[0]
@@ -430,7 +430,7 @@ class OverlayContent(Node):
     def states(self):
         d=self.data or {};result=[]
         if self.note:
-            value={'기록 수집 중 · 잠정값':'기록 확인 중','세션 기록 확인 중':'기록 확인 중','원격 작업 · 이 PC에 사용량 기록 없음':'원격 작업 · 로컬 기록 없음'}.get(self.note,self.note)
+            value={'기록 수집 중 (잠정값)':'기록 확인 중','세션 기록 확인 중':'기록 확인 중','원격 작업: 이 PC에 사용량 기록 없음':'원격 작업: 로컬 기록 없음'}.get(self.note,self.note)
             result.append((value,'error' if '오류' in value else 'secondary'))
         if d.get('own_calls',d.get('calls'))==0:
             result.append(('자체 호출 없음' if d.get('descendants') and d.get('calls') else '호출 기록 없음','secondary'))
@@ -471,10 +471,10 @@ class OverlayContent(Node):
         if d.get('descendants'):
             values.append(f"자체 {money(d.get('own_cost'),False)} + 하위 {money(d.get('child_cost'),False)}")
         if d.get('maintenance_calls'):
-            values.append(f"캐시 유지 {d['maintenance_calls']}회 포함 · {money(d.get('maintenance_cost'),False)} · 미확인 {d.get('maintenance_missing',0)}회")
+            values.append(f"캐시 유지 {d['maintenance_calls']}회 포함, {money(d.get('maintenance_cost'),False)}, 미확인 {d.get('maintenance_missing',0)}회")
         if d.get('assumed'):values.append(f"Standard 가정 {d['assumed']}호출")
         if d.get('coverage_gap'):values.append('이전 기록 누락')
-        return ' · '.join(values)
+        return ', '.join(values)
     def cost_note_height(self):return 0
     def status_height(self):return 16*(1+bool(self.states()))
     def composition_full_height(self):
@@ -511,7 +511,7 @@ class OverlayContent(Node):
             values.append(title+' '+fmt(comp.get(section+'_total')))
             values.extend(p['label']+' '+(fmt(p['tokens']) if p.get('known',True) else '미확인') for p in comp.get(section+'_parts',[]))
         misses=d.get('cache_misses',{})
-        if misses.get('count'):values.append(f"{'자체 ' if d.get('descendants') else ''}캐시 미적중 {misses['count']}회 · 해당 입력 {amount(misses.get('input'),True)}토큰")
+        if misses.get('count'):values.append(f"{'자체 ' if d.get('descendants') else ''}캐시 미적중 {misses['count']}회, 해당 입력 {amount(misses.get('input'),True)}토큰")
         values.append(self.freshness_text())
         self.setAccessibleName(Verbatim(values[0]+'\n'+tr('\n'.join(filter(None,values[1:])))))
     def detail_items(self):
@@ -547,20 +547,20 @@ class OverlayContent(Node):
         def tokens(value):return amount(value,True)+(' 토큰' if value is not None else '')
         if self.speed_alert().get('active'):
             health=self.speed_alert()
-            text('세션 근거 · 출력 속도 저하',color='warning',weight=600,size=13,height=24)
+            text('세션 근거: 출력 속도 저하',color='warning',weight=600,size=13,height=24)
             pair('최근 평균',value_text(health['recent_speed'],'output_speed'),numeric=True)
             pair('평소 기준',value_text(health['baseline_speed'],'output_speed'),numeric=True)
             pair('속도 감소',percent(health['drop_percent']),color='warning',numeric=True)
             text('세션 재생성을 권장합니다.',weight=600)
             text('재생성 후 속도 회복은 보장되지 않습니다.',color='secondary')
-            text('같은 모델·추론 강도·요청 등급·통신 방식과 유사한 토큰량·캐시율을 비교합니다.',color='secondary')
+            text('같은 모델, 추론 강도, 요청 등급, 통신 방식과 유사한 토큰량, 캐시율을 비교합니다.',color='secondary')
             pair('기준 표본',str(health['baseline_count']),numeric=True)
             pair('최근 표본',str(health['recent_count']),numeric=True)
             text('현재 세션의 이전 호출 기준' if health['baseline_source']=='session' else '같은 환경의 다른 세션 기준',color='secondary')
             y+=16
         text('최근 호출',color='secondary',weight=600);y+=8
         if row:
-            text(f"{timestamp(row.get('ts'))} · {row.get('ordinal','—')}호출",color='secondary');y+=8;half=(w-12)/2
+            text(f"{timestamp(row.get('ts'))}, {row.get('ordinal','—')}호출",color='secondary');y+=8;half=(w-12)/2
             text('캐시',width=half,color='secondary',at=y);items[-1][8]['formula']='선택 호출 캐시 읽기 ÷ 입력 × 100'
             text('비용',x=half+12,width=half,color='secondary',at=y);items[-1][8]['formula']='선택 호출 구독 가치 환산액';y+=18
             text(percent(row.get('cache_rate',row.get('rate'))),width=half,size=20,color='warning' if row.get('cache_warning') else 'cached_text',weight=600,height=28,at=y,kind='metric')
@@ -602,7 +602,7 @@ class OverlayContent(Node):
         for state,color in self.states():
             if state!='수집 오류' or not collection_errors:text(state,color=color)
         if '지연' in self.note:pair('마지막 확인',timestamp(d.get('_collection',{}).get('last_confirmed_at')))
-        for label,count in collection_errors.items():text(label+(f' · {count}건' if count>1 else ''),color='error')
+        for label,count in collection_errors.items():text(label+(f', {count}건' if count>1 else ''),color='error')
         misses=d.get('cache_misses',{});degraded=d.get('cache_degradation',{});y+=8
         observed=d.get('calls') is not None
         pair('자체 캐시 읽기 0' if d.get('descendants') else '캐시 읽기 0',f"{misses.get('count',0):,}회" if observed else '—',numeric=True)
@@ -612,7 +612,7 @@ class OverlayContent(Node):
         if degraded.get('count'):
             pair('자체 캐시 저하 의심' if d.get('descendants') else '세션 저하 의심',f"{degraded['count']:,}회",numeric=True)
             for event in degraded.get('events',[]):
-                y+=8;text(timestamp(event.get('ts'))+' · '+str(event.get('count',1))+'호출',color='secondary');items[-1][8]['target']=navigation_target(d,'incident',event=event)
+                y+=8;text(timestamp(event.get('ts'))+', '+str(event.get('count',1))+'호출',color='secondary');items[-1][8]['target']=navigation_target(d,'incident',event=event)
                 if event.get('resolved'):pair('회복 확인',timestamp(event.get('ended_at')))
                 segment=event.get('segment',())
                 for label,value in zip(('비교 모델','비교 모드','캐시 정책'),segment):
@@ -624,16 +624,16 @@ class OverlayContent(Node):
                 if baseline:pair('기준 호출',', '.join(str(call['ordinal']) for call in baseline)+'호출',numeric=True)
                 elif event.get('baseline_keys'):pair('기준 호출 ID',', '.join(map(str,event['baseline_keys'])))
                 for call in event.get('comparison_calls',[]):
-                    text(f"{timestamp(call.get('ts'))} · {call['ordinal']}호출",color='secondary')
+                    text(f"{timestamp(call.get('ts'))}, {call['ordinal']}호출",color='secondary')
                     pair('캐시 읽기',tokens(call.get('cached')),numeric=True)
                     pair('캐시 적중률',percent(call.get('cache_rate')),numeric=True,formula='해당 호출 캐시 읽기 ÷ 입력 × 100')
         y+=16
         if self.compact:
             height=(28+sum(54+24*max(1,len(c.get(k,[]))) for k in ('input_parts','output_parts'))) if w<300 else self.composition_full_height()
             text('토큰',height=height,kind='tokens');y+=12
-        token_label='Total · 확인분' if c.get('partial') else 'Total'
+        token_label='Total (확인분)' if c.get('partial') else 'Total'
         pair(token_label,tokens(c.get('total') if c.get('known',d and d.get('calls')) else None),numeric=True)
-        for part in c.get('parts',[]):pair(part['label'],tokens(part['tokens'])+' · '+percent(part['share']*100),numeric=True,
+        for part in c.get('parts',[]):pair(part['label'],tokens(part['tokens'])+', '+percent(part['share']*100),numeric=True,
             formula='세션 '+part['label']+' 토큰 합계 ÷ Total × 100')
         for key,label in [('input_unknown','입력 미분류'),('output_unknown','출력 미분류')]:
             if c.get('counts',{}).get(key):pair(label,tokens(c['counts'][key]),numeric=True)
@@ -683,7 +683,7 @@ class SessionOverlay(QuickHost):
     WIDTH,HEIGHT=OverlayContent.WIDTH,OverlayContent.HEIGHT
     def __init__(self):
         super().__init__(None,Qt.Tool|Qt.FramelessWindowHint|Qt.WindowStaysOnTopHint|Qt.WindowDoesNotAcceptFocus|Qt.WindowTransparentForInput)
-        self.setWindowTitle('Cache Monitor · 세션 오버레이');self.setAttribute(Qt.WA_TranslucentBackground);self.setAttribute(Qt.WA_ShowWithoutActivating);self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setWindowTitle('Cache Monitor - 세션 오버레이');self.setAttribute(Qt.WA_TranslucentBackground);self.setAttribute(Qt.WA_ShowWithoutActivating);self.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.content_model=OverlayContent();self.set_scene(self.content_model,'OverlayScene.qml',transparent=True,deferred=True,shared=True);self.resize(self.panel_width(),self.panel_height())
         self.content_model.changed.connect(lambda:self.setAccessibleName(self.content_model.state.get('accessible','')))
     @property

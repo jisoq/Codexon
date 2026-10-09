@@ -36,7 +36,7 @@ def probe():
     root=Group();window.setCentralWidget(root)
     font=QFont('Pretendard JP');font.setPixelSize(14);window.setFont(font)
     layout=Column(root)
-    layout.addWidget(Text('배율 확인 · Standard / Fast · 150% → 100%'))
+    layout.addWidget(Text('배율 확인, Standard / Fast, 150% → 100%'))
     window.resize(400,200);window.show();app.processEvents()
     results=[]
     for screen in app.screens()+[app.primaryScreen()]:

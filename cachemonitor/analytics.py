@@ -18,7 +18,7 @@ INPUT_BANDS=((0,10000,'10k 미만'),(10000,50000,'10–50k'),(50000,100000,'50�
              (100000,200000,'100–200k'),(200000,272001,'200–272k'),(272001,float('inf'),'272k 초과'))
 CACHE_BANDS=(('zero','0%'),((0,25),'0% 초과–25% 미만'),((25,50),'25–50% 미만'),
              ((50,75),'50–75% 미만'),((75,100),'75–100% 미만'),('full','100%'))
-COMPONENT_LABELS=('일반 입력','캐시 읽기','캐시 쓰기','비캐시 입력 미분류','출력·추론 포함')
+COMPONENT_LABELS=('일반 입력','캐시 읽기','캐시 쓰기','비캐시 입력 미분류','출력(추론 포함)')
 
 
 def effort_key(value):
@@ -44,7 +44,7 @@ def project_choices(sessions):
         labels[key]=session.get('project_name') or ntpath.basename(session.get('cwd','').rstrip('/\\')) or '프로젝트 없는 작업'
         if session.get('cwd'):paths[key].add(session['cwd'])
     duplicates=Counter(labels.values())
-    labels={key:name if duplicates[name]==1 else f'{name} · {hashlib.sha256(key.encode()).hexdigest()[:6]}'
+    labels={key:name if duplicates[name]==1 else f'{name}, {hashlib.sha256(key.encode()).hexdigest()[:6]}'
             for key,name in labels.items()}
     return {'projects':sorted(labels,key=lambda key:(labels[key].casefold(),key)),
             'project_labels':labels,'project_paths':{key:sorted(value) for key,value in paths.items()}}

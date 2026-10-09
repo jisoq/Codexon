@@ -389,7 +389,7 @@ def test_exit_inventory_uses_exact_home_and_session(tmp_path):
     text=exit_message(check,dict(sessions=[dict(home=str(manager.home),id='a',title='My chat'),
         dict(home=str(tmp_path/'other'),id='b',title='Wrong home')]))
     assert check.count==4 and 'My chat' in text and 'Wrong home' not in text
-    assert 'b · 연결 1개' in text and '세션 확인 불가' in text
+    assert 'b, 연결 1개' in text and '세션 확인 불가' in text
     manager.health=lambda **kw:None;manager.health_state='unknown'
     unknown=ExitConnectionCheck(manager,None);unknown.run();assert unknown.count is None
     manager.health_state='refused'

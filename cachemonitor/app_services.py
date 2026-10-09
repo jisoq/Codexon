@@ -270,7 +270,16 @@ class AppServices:
         from .proxy_drain import ProxyDrain
         m = self.manager
         m.cleanup_legacy_check()
+        # The updater must finish verification or rollback before shutdown makes
+        # the shared service state suspended. Never cancel halfway through swap.
+        self.progress('업데이트 적용 또는 복원 완료를 기다립니다.')
+        self.wait(lambda:not (read_json(m.directory/'proxy-update.json').get('cutover_started')
+                             and read_json(m.directory/'proxy-update.json').get('phase') in BUSY),
+                  '업데이트 적용 또는 복원이 진행 중입니다. 완료 후 다시 종료하세요.')
         with ProcessLock(m.control_lock, timeout=30):
+            update=read_json(m.directory/'proxy-update.json')
+            if update.get('cutover_started') and update.get('phase') in BUSY:
+                raise RuntimeError('업데이트 적용 또는 복원이 진행 중입니다. 완료 후 다시 종료하세요.')
             previous = read_json(session_path(m))
             if previous and previous.get('scope') != self.target.scope:
                 raise RuntimeError('다른 연결의 종료 기록을 보존합니다.')

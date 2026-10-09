@@ -36,10 +36,10 @@ def record_issues(row):
                       ('output_conflict','출력 토큰 구성 충돌')):
         if row.get(key):issues.append(title)
     if row.get('model_alert_confirmed'):issues.append('요청 모델과 응답 모델이 다릅니다.')
-    if row.get('observation_missing'):issues.append('요청·응답 관측 기록 저장 실패 · 모델 응답 대조에 사용할 수 없습니다.')
+    if row.get('observation_missing'):issues.append('요청과 응답 관측 기록을 저장하지 못했습니다. 모델 응답 대조에 사용할 수 없습니다.')
     if row.get('transport_source')=='conflict':issues.append('통신 방식 기록이 서로 다릅니다.')
     missing=[name for key,name in (('input','입력'),('output','출력')) if row.get(key) is None]
-    if missing:issues.append('로컬 사용 기록에 '+'·'.join(missing)+' 토큰 수가 없어 합계·환산에서 제외됩니다.')
+    if missing:issues.append('로컬 사용 기록에 '+', '.join(missing)+' 토큰 수가 없어 합계와 환산에서 제외됩니다.')
     return list(dict.fromkeys(issues))
 
 

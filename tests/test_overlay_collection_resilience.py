@@ -47,7 +47,7 @@ def test_quota_storage_failure_keeps_publishing_real_calls(monkeypatch,tmp_path,
     assert quota_paths==[analysis_worker.ledger_path(tmp_path/'index.sqlite')]
     assert len(snapshots)==1 and snapshots[0]['kind']=='snapshot'
     snapshot=snapshots[0]['value']
-    assert snapshot['ledger_error']=='한도 기록 확인 지연 · 자동 재시도 중'
+    assert snapshot['ledger_error']=='한도 기록 확인 지연: 자동 재시도 중'
     assert not snapshot['errors']
     overlay=snapshot['overlay_sessions'][0]
     assert overlay['calls']==len(original['history']) and overlay['latest_key']==original['history'][-1]['key']

@@ -46,9 +46,9 @@ def session_lineage(payload, thread_id):
 def transport_label(row):
     kind = row.get('transport')
     source = row.get('transport_source', 'log_time' if kind in ('WebSocket', 'HTTP/SSE') else 'unknown')
-    if source == 'conflict': return '미확인 · 관측 충돌'
+    if source == 'conflict': return '미확인 (관측 충돌)'
     if kind not in ('WebSocket', 'HTTP/SSE'): return '미확인'
-    return kind + ('' if source == 'response_id' else ' · 추정')
+    return kind + ('' if source == 'response_id' else ' (추정)')
 
 
 def token_number(value):
@@ -448,7 +448,7 @@ class Session:
             result=dict(old)
             result['remaining']=max(0,WINDOW-(now-self._last_recent_ts)) if self._last_recent_ts is not None else None
             if self.running:
-                result['status']='진행 기록' if now-self.activity<WINDOW else '진행 기록 · 갱신 지연'
+                result['status']='진행 기록' if now-self.activity<WINDOW else '진행 기록 (갱신 지연)'
             return result
         history = old['history'] if same else [x.values() for x in self.requests]
         requests = [x for x in self.requests if x.ts >= now - WINDOW]
@@ -464,9 +464,9 @@ class Session:
         cache_misses=old['cache_misses'] if same else classify(history)
         warning = ""
         if latest and latest.kind == "HTTP/SSE" and any(t.evidence == "HTTP 전환 기록" for t in self.transports if t.process == latest.process):
-            warning = "HTTP 전환" + (" · 캐시 미적중" if warning else "")
+            warning = "HTTP 전환" + (", 캐시 미적중" if warning else "")
         if self.running:
-            status = "진행 기록" if now - self.activity < WINDOW else "진행 기록 · 갱신 지연"
+            status = "진행 기록" if now - self.activity < WINDOW else "진행 기록 (갱신 지연)"
         else:
             status = "관찰 중"
         today = day_start(now)

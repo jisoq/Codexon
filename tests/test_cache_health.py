@@ -63,7 +63,7 @@ def test_channel_routing_requires_confirmed_selected_scope_and_avoids_duplicates
     w.overlay=SimpleNamespace(can_present=lambda *_:state['visible'],selected_scope=lambda *_:state['selected'],
                               selection_confirmed=lambda:state['confirmed'],stop=lambda:None)
     sent=[];monkeypatch.setattr(w.tray,'showMessage',lambda *args:sent.append(args))
-    event=dict(kind='cache_miss',title='캐시 저하 의심',detail='2회 · 근거',home='h',sid='s',count=2)
+    event=dict(kind='cache_miss',title='캐시 저하 의심',detail='2회, 근거',home='h',sid='s',count=2)
     try:
         w.notification_master.setChecked(True)
         w.show_confirmed_events([event]);assert not sent

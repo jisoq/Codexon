@@ -1,4 +1,4 @@
-"""Run Windows UI checks on a hidden desktop, optionally isolating the clipboard."""
+"""Run Windows UI checks on a hidden desktop."""
 import argparse
 from contextlib import contextmanager, ExitStack
 import ctypes
@@ -36,7 +36,6 @@ def windows_api():
     user = ctypes.WinDLL('user32', use_last_error=True)
     kernel = ctypes.WinDLL('kernel32', use_last_error=True)
     signatures = (
-        (user, 'CreateWindowStationW', [W.LPCWSTR, W.DWORD, W.DWORD, ctypes.c_void_p], W.HANDLE),
         (user, 'OpenWindowStationW', [W.LPCWSTR, W.BOOL, W.DWORD], W.HANDLE),
         (user, 'GetProcessWindowStation', [], W.HANDLE),
         (user, 'SetProcessWindowStation', [W.HANDLE], W.BOOL),
@@ -75,21 +74,15 @@ def checked(result):
 
 
 @contextmanager
-def isolated_desktop(user, isolate_clipboard=False):
+def isolated_desktop(user):
     previous = checked(user.GetProcessWindowStation())
-    # An unnamed call reuses the service logon station, whose clipboard may be
-    # inaccessible. Create an owned station with a distinct clipboard instead.
-    # This needs a Windows token allowed to create window stations (as in CI).
-    station = checked(user.CreateWindowStationW('CodexonQAClipboard-' + uuid.uuid4().hex, 0, 0x37F, None) if isolate_clipboard
-                      else user.OpenWindowStationW('WinSta0', False, 0x37F))
+    station = checked(user.OpenWindowStationW('WinSta0', False, 0x37F))
     desktop = None
     try:
         name = ctypes.create_unicode_buffer(256)
         needed = W.DWORD()
         checked(user.GetUserObjectInformationW(station, 2, name, ctypes.sizeof(name),
                                               ctypes.byref(needed)))
-        if isolate_clipboard and name.value.lower() == 'winsta0':
-            raise RuntimeError('UI checks must not use the interactive clipboard')
         checked(user.SetProcessWindowStation(station))
         desktop_name = 'CodexonQA-' + uuid.uuid4().hex
         desktop = checked(user.CreateDesktopW(desktop_name, None, None, 0, 0x10000000, None))
@@ -163,8 +156,6 @@ def run_on_desktop(kernel, desktop, command, env):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--scale')
-    parser.add_argument('--isolate-clipboard', action='store_true',
-                        help='Use a noninteractive station for clipboard checks; native visibility needs the default mode')
     parser.add_argument('command', nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command
@@ -176,7 +167,7 @@ def main():
     if args.scale:
         env['QT_SCALE_FACTOR'] = args.scale
     user, kernel = windows_api()
-    with isolated_desktop(user, args.isolate_clipboard) as desktop:
+    with isolated_desktop(user) as desktop:
         return run_on_desktop(kernel, desktop, command, env)
 
 

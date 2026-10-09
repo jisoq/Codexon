@@ -1,15 +1,15 @@
-VERSION = '2026.10.09.1'
+VERSION = '2026.10.10.1'
 
 # The independently running proxy changes only when its own implementation or
 # compatibility contract changes. Earlier releases since 2026.09.21.9 contain
 # the same proxy implementation but reported the desktop app version.
-PROXY_VERSION = '2026.10.09.1'
+PROXY_VERSION = '2026.10.10.1'
 _LEGACY_PROXY_MIN = (2026, 9, 21, 9)
 _LEGACY_PROXY_MAX = (2026, 9, 23, 2)
 
 
 def proxy_compatible(version):
-    if version in ('2026.10.01.1', '2026.10.01.2'):return True
+    if version in ('2026.10.01.1', '2026.10.01.2', '2026.10.09.1'):return True
     if version in (PROXY_VERSION, '2026.09.26.1', '2026.09.25.11', '2026.09.25.10', '2026.09.25.9', '2026.09.25.8', '2026.09.25.7', '2026.09.25.6', '2026.09.25.5', '2026.09.25.4', '2026.09.25.3', '2026.09.24.6', '2026.09.23.3', '2026.09.23.7', '2026.09.23.9'):
         return True
     if not isinstance(version, str):

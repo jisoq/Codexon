@@ -1,4 +1,4 @@
-"""The UI runner must actually isolate windows and clipboard operations."""
+"""The UI runner must actually isolate windows and child processes."""
 import json
 import os
 from pathlib import Path
@@ -12,9 +12,9 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 
-@pytest.mark.parametrize('isolate_clipboard,exit_code', [(False, 0), (True, 0), (True, 37)])
-def test_runner_isolates_qt_and_descendants_and_preserves_process_io(tmp_path, isolate_clipboard, exit_code):
-    probe = tmp_path / '한글 경로 clipboard probe.py'
+@pytest.mark.parametrize('exit_code', [0, 37])
+def test_runner_isolates_qt_and_descendants_and_preserves_process_io(tmp_path, exit_code):
+    probe = tmp_path / '한글 경로 window probe.py'
     probe.write_text(textwrap.dedent('''
         import ctypes
         from ctypes import wintypes as W
@@ -36,9 +36,7 @@ def test_runner_isolates_qt_and_descendants_and_preserves_process_io(tmp_path, i
             return result.value
         station = name(user.GetProcessWindowStation())
         desktop = name(user.GetThreadDesktop(kernel.GetCurrentThreadId()))
-        # Verify isolation before touching Qt or the clipboard.
-        isolate_clipboard = os.environ['CODEXON_RUNNER_CLIPBOARD'] == '1'
-        assert (station.lower() != 'winsta0') == isolate_clipboard, station
+        assert station.lower() == 'winsta0', station
         assert desktop.startswith('CodexonQA-'), desktop
         if sys.argv[1] == '--leaf':
             print(json.dumps(dict(station=station, desktop=desktop)))
@@ -49,40 +47,31 @@ def test_runner_isolates_qt_and_descendants_and_preserves_process_io(tmp_path, i
         editor = QLineEdit(sys.argv[1])
         editor.show()
         app.processEvents()
-        copied = None
-        if isolate_clipboard:
-            editor.selectAll()
-            editor.copy()
-            copied = app.clipboard().text()
-            assert copied == sys.argv[1]
-        else:
-            user.IsWindowVisible.argtypes = [W.HWND]
-            user.IsWindowVisible.restype = W.BOOL
-            assert user.IsWindowVisible(int(editor.winId()))
+        user.IsWindowVisible.argtypes = [W.HWND]
+        user.IsWindowVisible.restype = W.BOOL
+        assert user.IsWindowVisible(int(editor.winId()))
         child = subprocess.run([sys.executable, __file__, '--leaf'],
                                capture_output=True, text=True, check=True)
         print(json.dumps(dict(station=station, desktop=desktop, child=json.loads(child.stdout),
-                              copied=copied, stdin=sys.stdin.read(),
+                              stdin=sys.stdin.read(),
                               scale=os.environ.get('QT_SCALE_FACTOR'),
                               env=os.environ['CODEXON_RUNNER_TEST'], cwd=os.getcwd())))
         print('runner stderr preserved', file=sys.stderr)
         sys.exit(int(sys.argv[2]))
     '''), encoding='utf-8')
-    payload = '한글 복사 "quoted" \\path with spaces\\'
+    payload = '한글 인수 "quoted" \\path with spaces\\'
     env = dict(os.environ, PYTHONUTF8='1', PYTHONIOENCODING='utf-8',
-               CODEXON_RUNNER_TEST='환경 전달', CODEXON_RUNNER_CLIPBOARD=str(int(isolate_clipboard)))
-    options = ['--isolate-clipboard'] if isolate_clipboard else []
+               CODEXON_RUNNER_TEST='환경 전달')
     result = subprocess.run(
-        [sys.executable, str(ROOT / 'tools/run_ui_checks.py'), *options, '--scale', '1.25', '--',
+        [sys.executable, str(ROOT / 'tools/run_ui_checks.py'), '--scale', '1.25', '--',
          sys.executable, str(probe), payload, str(exit_code)],
         input='stdin 전달\n', capture_output=True, text=True, encoding='utf-8',
         cwd=tmp_path, env=env, timeout=30)
     assert result.returncode == exit_code, result.stderr
     observed = json.loads(result.stdout)
-    assert (observed['station'].lower() != 'winsta0') == isolate_clipboard
+    assert observed['station'].lower() == 'winsta0'
     assert observed['desktop'].startswith('CodexonQA-')
     assert observed['child'] == {key: observed[key] for key in ('station', 'desktop')}
-    assert observed['copied'] == (payload if isolate_clipboard else None)
     assert observed['stdin'] == 'stdin 전달\n'
     assert observed['scale'] == '1.25'
     assert observed['env'] == '환경 전달'

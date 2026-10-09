@@ -71,7 +71,8 @@ def test_native_ping_pong_close_and_no_unsolicited_requests(tmp_path):
     run_proxy_test(run())
 
 
-def test_policy_clock_and_request_accounting():
+@pytest.mark.parametrize('cancel_type',['response.cancel','response.interrupt'])
+def test_policy_clock_and_request_accounting(cancel_type):
     from cachemonitor.proxy_websocket import Activity,WebSocketBudget,POLICY
     async def run():
         now=[0.];closed=[]
@@ -95,7 +96,8 @@ def test_policy_clock_and_request_accounting():
         for lane in ('a','b','b'):
             msg={'type':'response.create','stream_id':lane};a.begin(msg,True);a.delivered(msg,True)
         now[0]+=3600;budget.reap();assert not a.closing
-        cancel={'type':'response.cancel','stream_id':'a'};a.begin(cancel,True);a.delivered(cancel,True)
+        cancel={'type':cancel_type,'stream_id':'a'};a.begin(cancel,True);a.delivered(cancel,True)
+        assert not a.unknown and a.busy
         error={'type':'error','stream_id':'a'};a.begin(error,False);a.delivered(error,False)
         assert len(a.pending['a'])==1
         assert a.busy

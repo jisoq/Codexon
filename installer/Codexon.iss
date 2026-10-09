@@ -106,7 +106,7 @@ begin
     { Never forward the loader's /SL5 or other internal parameters. }
     if (Lower='/silent') or (Lower='/verysilent') or (Lower='/suppressmsgboxes') or
        (Lower='/norestart') or (Lower='/sp-') or (Lower='/log') or
-       (Pos('/log=',Lower)=1) or (Pos('/dir=',Lower)=1) then begin
+       (Pos('/log=',Lower)=1) or (Pos('/dir=',Lower)=1) or (Pos('/updateid=',Lower)=1) then begin
       SetArrayLength(Lines,Count+4);
       Lines[Count+3] := 'arg'+IntToStr(Count)+'='+Arg;
       Count := Count+1;
@@ -149,11 +149,18 @@ begin
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
-var ExitCode: Integer; Args: String;
+var ExitCode, I: Integer; Args, UpdateId: String;
 begin
   if CurStep = ssPostInstall then begin
     Args := '--native-install --install-root "' + ExpandConstant('{app}') + '" --product-dir "' + ProductPath('') +
       '" --report "' + ExpandConstant('{app}\install-result.json') + '"{#ExtraArgs}';
+    UpdateId := ExpandConstant('{param:UPDATEID|}');
+    if UpdateId <> '' then begin
+      if Length(UpdateId) <> 32 then RaiseException('Invalid update identifier');
+      for I := 1 to Length(UpdateId) do
+        if Pos(UpdateId[I], '0123456789abcdef') = 0 then RaiseException('Invalid update identifier');
+      Args := Args + ' --update-id ' + UpdateId;
+    end;
     if ActiveLanguage = 'english' then Args := Args + ' --language en'
     else Args := Args + ' --language ko';
     if not Exec(RecoveryDir('') + '\CodexonRecovery.exe', Args, '', SW_HIDE, ewWaitUntilTerminated, ExitCode) or (ExitCode <> 0) then begin

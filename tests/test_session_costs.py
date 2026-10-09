@@ -156,8 +156,7 @@ def test_real_session_table_shows_parent_without_own_calls_and_click_keeps_break
         assert window.selected_session==('fixture','parent')
         assert '자체 ' in window.session_scope.text() and ' + 하위 ' in window.session_scope.text()
         assert '산정' not in window.session_scope.text()
-        window.render_diagnostics()
-        assert '자동 승인 검토 · 1호출' in window.diagnostics.toPlainText()
+        assert window.snapshot['internal_review_calls']==1
         assert window.grab().save(str(tmp_path/'parent-cost.png'))
     finally:
         window.quitting=True;window.tick.stop();window.tray.hide();window.observer_panel.stop();window.close()

@@ -8,7 +8,7 @@ from cachemonitor.ui_details import Details
 def test_details_keyboard_toggle_preserves_expansion_and_escapes_data():
     app=QApplication.instance() or QApplication([])
     details=Details('계산 근거')
-    details.set_sections([('관측 범위','<unknown-model> · 50개')])
+    details.set_sections([('관측 범위','<unknown-model>, 50개')])
     host=mount(details,500,300)
     app.processEvents()
     assert not details.content.isVisible()
@@ -16,7 +16,7 @@ def test_details_keyboard_toggle_preserves_expansion_and_escapes_data():
     QTest.keyClick(host.quick,Qt.Key_Space)
     assert details.content.isVisible()
     assert '&lt;unknown-model&gt;' in details.body.text()
-    details.set_sections([('관측 범위','<updated> · 51개')])
+    details.set_sections([('관측 범위','<updated>, 51개')])
     assert details.content.isVisible() and '51개' in details.body.text()
     QTest.keyClick(host.quick,Qt.Key_Space)
     assert not details.content.isVisible()

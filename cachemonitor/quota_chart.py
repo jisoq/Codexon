@@ -117,7 +117,7 @@ class QuotaHistory(Plot):
         seconds=max(0,round(times[right]-times[right-1]))
         hours,rest=divmod(seconds,3600);minutes,seconds=divmod(rest,60)
         duration=(f'{hours}시간 {minutes}분' if hours else f'{minutes}분 {seconds}초' if minutes else f'{seconds}초')
-        return f'수집 공백 {duration} · {clock(times[right-1],True)} → {clock(times[right],True)}'
+        return f'수집 공백 {duration}, {clock(times[right-1],True)} → {clock(times[right],True)}'
 
     def static_image(self):
         from .quota_panel import remaining_axis
@@ -263,7 +263,7 @@ class QuotaHistory(Plot):
             x=rect.center().x()
             p.setPen(QPen(QColor(palette['muted']),1,Qt.DashLine));p.drawLine(QPointF(x,box.top()),QPointF(x,box.bottom()))
             p.setPen(QColor(palette['ink']));p.drawText(rect,Qt.AlignCenter,'◆')
-            self._cache_hits.append((rect,{},reset['label']+' · '+clock(reset['at'],True)))
+            self._cache_hits.append((rect,{},reset['label']+', '+clock(reset['at'],True)))
         p.setPen(QColor(palette['muted']))
         p.drawText(QRectF(box.left(),box.bottom()+10,box.width()/2,20),Qt.AlignLeft,clock(self.rows[0]['at']))
         p.drawText(QRectF(box.center().x(),box.bottom()+10,box.width()/2,20),Qt.AlignRight,clock(self.rows[-1]['at']))
@@ -347,11 +347,11 @@ class QuotaHistory(Plot):
 
     def tip_at(self,x,y):
         for rect,reset in getattr(self,'reset_hits',[]):
-            if rect.contains(QPointF(x,y)):return reset['label']+' · '+clock(reset['at'],True)
+            if rect.contains(QPointF(x,y)):return reset['label']+', '+clock(reset['at'],True)
         gap=self.gap_at(x,y)
         if gap is not None:return self.gap_label(gap)
         index=self.index_at(x,y)
-        return ' · '.join([self.detail_for(index)['title']]+[item['label']+' '+item['value'] for item in self.detail_for(index)['items']]) if index is not None and self.hidden_series else observation_label(self.rows[index],self.money) if index is not None else ''
+        return ', '.join([self.detail_for(index)['title']]+[item['label']+' '+item['value'] for item in self.detail_for(index)['items']]) if index is not None and self.hidden_series else observation_label(self.rows[index],self.money) if index is not None else ''
 
     def detail_at(self,x,y):
         if self.strip_box.contains(QPointF(x,y)):y=self.box.center().y()
@@ -363,7 +363,7 @@ class QuotaHistory(Plot):
         gap=self.gap_at(x,y)
         if gap is not None:
             index=self.series['gap_indices'][gap]
-            return dict(title=self.gap_label(gap).split(' · ')[0],at=self.rows[index-1]['at'],gap_end=self.rows[index]['at'],items=[
+            return dict(title=self.gap_label(gap).split(', ')[0],at=self.rows[index-1]['at'],gap_end=self.rows[index]['at'],items=[
                 dict(label='마지막 관측',value=clock(self.rows[index-1]['at'],True),color='ink'),
                 dict(label='관측 재개',value=clock(self.rows[index]['at'],True),color='ink')],
                 note='')
@@ -378,7 +378,7 @@ class QuotaHistory(Plot):
         item=share_at(self.series,at)
         details=[];note='미확인'
         if item:
-            note={'unknown':'미확인 · 모델 비용과 차트 증가분의 대응을 확인할 수 없습니다',
+            note={'unknown':'미확인, 모델 비용과 차트 증가분의 대응을 확인할 수 없습니다',
                   'zero':'확인된 비용 증가 없음','cost':''}[item['state']]
             details=[dict(label=share_label(name),value=f"{item['shares'].get(name,0):.1f}%",model=name[0],
                           service_tier=name[1],swatch=share_color_key(name),color='ink') for name in share['models']] if item['state']=='cost' else []
@@ -398,7 +398,7 @@ class QuotaHistory(Plot):
             items.append(dict(label='완료 구간별 구독 가치 환산액',value=usd(amount),color='completed'))
         colors={'cached':'remaining','output':'cycle_cost','written':'cycle_value','completed':'completed_cost'}
         items=[item for item in items if self.visible(colors[item['color']])]
-        if row['reset_kind']:note=(' · '.join(row.get('markers',[])) or '사용량 리셋')+' · 새 주기'
+        if row['reset_kind']:note=(', '.join(row.get('markers',[])) or '사용량 리셋')+', 새 주기'
         elif not previous:note=''
         elif not row['connect']:note='' if self.series.get('active_only') else '공백 이후 첫 관측'
         elif self.visible('cycle_cost') and row.get('cycle_cost') is None:note='금액 확인 중'

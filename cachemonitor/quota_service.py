@@ -140,8 +140,8 @@ class QuotaService(QThread):
                         polling.finish(time.monotonic(), True, direct, time.time())
                     except Exception as exc:
                         record_failure(self.path, 'account lookup', exc)
-                        lookup_issue = ('Codex 한도 조회 지연 · 자동 재시도 중' if isinstance(exc, (TimeoutError, ConnectionError))
-                                        else 'Codex 한도 조회 실패 · 자동 재시도 중')
+                        lookup_issue = ('Codex 한도 조회 지연: 자동 재시도 중' if isinstance(exc, (TimeoutError, ConnectionError))
+                                        else 'Codex 한도 조회 실패: 자동 재시도 중')
                         if self.tracking_enabled:
                             pending.append(('failure', time.time()))
                         polling.finish(time.monotonic(), False)
@@ -178,7 +178,7 @@ class QuotaService(QThread):
                         storage_failed(exc)
                         publish = True
                 latest = select_current_quota(direct, local, time.time())
-                issue = ' · '.join(v for v in (lookup_issue, database_issue) if v)
+                issue = ', '.join(v for v in (lookup_issue, database_issue) if v)
                 if publish or issue != emitted_issue:
                     value={'home':self.home,'quota':latest,'issue':issue}
                     if self.reports_enabled:

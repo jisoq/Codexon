@@ -30,9 +30,9 @@ def record_failure(path, stage, error):
 def storage_issue(error):
     code = getattr(error, 'sqlite_errorcode', 0) or 0
     if code & 255 in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
-        return '한도 기록 저장 지연 · 자동 재시도 중'
+        return '한도 기록 저장 지연: 자동 재시도 중'
     if code & 255 in (sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB):
-        return '한도 기록 DB를 읽을 수 없습니다 · 기존 기록 보존 중'
+        return '한도 기록 DB를 읽을 수 없습니다. 기존 기록은 보존 중입니다.'
     if code & 255 == sqlite3.SQLITE_FULL:
-        return '한도 기록 저장 공간 부족 · 여유 공간 확보 필요'
-    return '한도 기록 확인 지연 · 자동 재시도 중'
+        return '한도 기록 저장 공간 부족: 여유 공간 확보 필요'
+    return '한도 기록 확인 지연: 자동 재시도 중'

@@ -237,7 +237,7 @@ class QuotaPanel(Group):
         self.legend_toggles={}
         for name,color in (('━ 잔여량 / %','cached'),('━ 누적 구독 가치 환산액 / USD','output'),
                            ('━ 완료 구간별 구독 가치 환산액 / USD','completed'),
-                           ('┄ 주간 동등 가치 · USD','written'),('╌ 전체 누적 기준 · USD','accent')):
+                           ('┄ 주간 동등 가치 (USD)','written'),('╌ 전체 누적 기준 (USD)','accent')):
             key={'cached':'remaining','output':'cycle_cost','completed':'completed_cost','written':'cycle_value','accent':'reference'}[color]
             legend=Toggle(name);legend.setChecked(True)
             legend.toggled.connect(lambda visible,k=key:self.history.set_series_visible(k,visible))
@@ -497,7 +497,7 @@ class QuotaPanel(Group):
         self.history.money=weekly;self.history.reference=self.lifetime_value
         self.history.empty_text='표시할 사용 기록이 없습니다' if weekly else '수집된 잔여량이 없습니다'
         self.chart_title.setText('전체 사용량 추이' if weekly and all_cycles else '선택 주기의 사용량 추이' if weekly else '5시간 잔여량 추이')
-        self.remaining_legend.setText('━ 누적 소모량 · %p' if weekly and all_cycles else '━ 잔여량 · %')
+        self.remaining_legend.setText('━ 누적 소모량 (%p)' if weekly and all_cycles else '━ 잔여량 (%)')
         self.reset_legend.setVisible(weekly and all_cycles)
         self.history.set_series(series)
         models=series.get('model_share',{}).get('models',[])
@@ -526,7 +526,7 @@ class QuotaPanel(Group):
         if period:
             self.cycle_value.setText(f"누적 소모량 {period['delta']:g}%p" if all_cycles else '선택 주기 '+usd(period['value']))
             self.cycle_basis.setText(f"주간 100%p 기준 / 누적 환산액 {usd(period['cost'])} / 소모 {period['delta']:g}%p"
-                                    ' · '+('산정 ' if period['priced_calls']<period['calls'] else '')+call_count(period['priced_calls'],period['calls'])+'호출')
+                                    ', '+('산정 ' if period['priced_calls']<period['calls'] else '')+call_count(period['priced_calls'],period['calls'])+'호출')
         else:
             self.cycle_value.setText('선택 주기 —');self.cycle_basis.setText('관측된 사용량 리셋 주기가 없습니다')
         self.cycle_choice.setVisible(weekly and any_history and bool(self._view['periods']))
@@ -558,8 +558,8 @@ class QuotaPanel(Group):
         self.result.setText(usd(self.lifetime_value))
         self.lifetime_basis.setText(
             f"주간 100%p 기준 / 누적 환산액 {usd(lifetime['cost'])} / 소모 {lifetime['delta']:g}%p"
-            ' · '+('산정 ' if lifetime['observed_priced_calls']<lifetime['observed_calls'] else '')+call_count(lifetime['observed_priced_calls'],lifetime['observed_calls'])+'호출'+
-            '\n관측 기반 추정 · 수집 공백 제외' if lifetime['total'] else '계산에 필요한 관측을 기다리고 있습니다')
+            ', '+('산정 ' if lifetime['observed_priced_calls']<lifetime['observed_calls'] else '')+call_count(lifetime['observed_priced_calls'],lifetime['observed_calls'])+'호출'+
+            '\n관측 기반 추정, 수집 공백 제외' if lifetime['total'] else '계산에 필요한 관측을 기다리고 있습니다')
         self.render_history()
         days=self.period.currentData()
         prepared=self._view.get('summaries',{})
@@ -589,7 +589,7 @@ class QuotaPanel(Group):
                                            f'{priced:,}/{calls:,}호출의 비용 확인' if priced<calls else '')
         self.conversion_empty.setVisible(bool(self.conversion_empty.text()))
         self.details.setVisible(bool(model_intervals))
-        self.details.toggle.setText(f"구간별 내역 · {len(model_intervals):,}개")
+        self.details.toggle.setText(f"구간별 내역: {len(model_intervals):,}개")
         has_unknown=any(row.get('unknown_mode_calls') for row in summary['intervals'])
         self.mode_assumption.setVisible(has_unknown and selected_model is None)
         assumed=summary['assumed_per_percent']
@@ -623,7 +623,7 @@ class QuotaPanel(Group):
         pages=max(1,math.ceil(len(rows)/self.page_size))
         self.paging.setVisible(pages>1)
         self.page_index=min(self.page_index,pages-1)
-        self.page_status.setText(f'{self.page_index+1} / {pages}페이지 · {len(rows):,}구간')
+        self.page_status.setText(f'{self.page_index+1} / {pages}페이지, {len(rows):,}구간')
         self.previous_page.setEnabled(self.page_index>0);self.next_page.setEnabled(self.page_index+1<pages)
         rows=rows[self.page_index*self.page_size:(self.page_index+1)*self.page_size]
         self.intervals.live_update=automatic
@@ -666,18 +666,18 @@ class QuotaPanel(Group):
             self.interval_detail.hide()
             self.table.setRowCount(0);self.table.hide();return
         self.interval_detail.show()
-        reasons=' · '.join(interval.get('assumptions',[]) if interval.get('forward_tracking') else interval['excluded'])
+        reasons=', '.join(interval.get('assumptions',[]) if interval.get('forward_tracking') else interval['excluded'])
         excluded=sum(r['calls'] for r in interval['models'] if r['separate'])
         detail=f"{clock(interval['start'],True)} → {clock(interval['end'],True)}"
-        if interval.get('reason') in RESET_NAMES:detail+=' · '+RESET_NAMES[interval['reason']]+'로 종료'
-        if excluded:detail+=f" · 별도 한도 {excluded}호출 제외"
+        if interval.get('reason') in RESET_NAMES:detail+=', '+RESET_NAMES[interval['reason']]+'로 종료'
+        if excluded:detail+=f", 별도 한도 {excluded}호출 제외"
         if reasons:detail+='\n'+reasons
         self.interval_detail.setText(detail)
         selected_model=self.model_choice.currentData()
         models=[row for row in interval['models'] if row['model']==selected_model and not row['separate']] if selected_model else interval['models']
         self.table.setVisible(bool(models));self.table.setRowCount(len(models))
         for i,model in enumerate(models):
-            values=[model['model']+(' · '+model['service_tier'] if model['service_tier']!='미확인' else ''),f"{model['calls']:,}",f"{model['priced']:,}",usd(model['cost']),'별도 한도 · 제외' if model['separate'] else '일반 주간']
+            values=[model['model']+(', '+model['service_tier'] if model['service_tier']!='미확인' else ''),f"{model['calls']:,}",f"{model['priced']:,}",usd(model['cost']),'별도 한도 (제외)' if model['separate'] else '일반 주간']
             for j,value in enumerate(values):
                 cell=Cell(value);cell.setTextAlignment((Qt.AlignLeft if j in (0,4) else Qt.AlignRight)|Qt.AlignVCenter);self.table.setItem(i,j,cell)
         self.table.setFixedHeight(80+len(models)*40)

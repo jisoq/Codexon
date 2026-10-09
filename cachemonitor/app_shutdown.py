@@ -108,7 +108,7 @@ def exit_message(check,snapshot):
     for item in check.health.get('connection_sessions',[]):
         sid=item.get('session_id','')
         title=' '.join(str(titles.get(sid,sid) or tr('세션 확인 불가')).split())
-        text+='\n• '+tr('{title} · 연결 {count}개').format(title=title,count=item['connections'])
+        text+='\n• '+tr('{title}, 연결 {count}개').format(title=title,count=item['connections'])
     text+='\n\n'+tr('안전 종료는 응답 완료를 기다립니다. 강제 종료는 진행 중 연결과 캐시 요청을 끊고 기록 저장 후 종료합니다.')
     if not check.health.get('supports_force_shutdown'):
         text+='\n'+tr('강제 종료를 지원하려면 연결 구성요소를 업데이트하세요.')

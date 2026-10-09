@@ -59,7 +59,7 @@ def assess(status):
         return dict(code='direct', confirmed=False, can_recover=True, status=status,
                     title='Codexon 프록시 연결이 해제되어 있습니다',
                     detail='Codex가 이전 연결을 사용 중이라면 작업을 마친 뒤 완전히 종료하고 다시 여세요.' if restart
-                    else '다른 연결·로그인·서버 문제는 이 도구의 확인 범위에 포함되지 않습니다.')
+                    else '다른 연결, 로그인, 서버 문제는 이 도구의 확인 범위에 포함되지 않습니다.')
     update = status.get('update') or {}
     from .proxy_update import BUSY
     if update.get('phase') in BUSY:
@@ -181,6 +181,7 @@ def main(argv=None):
     parser.add_argument('--report', type=Path)
     parser.add_argument('--install-root', type=Path)
     parser.add_argument('--product-dir', type=Path)
+    parser.add_argument('--update-id')
     parser.add_argument('--prepare-uninstall', action='store_true')
     parser.add_argument('--isolated-install', action='store_true')
     parser.add_argument('--no-launch', action='store_true')
@@ -205,8 +206,12 @@ def main(argv=None):
             else:
                 result=finish(args.install_root,args.product_dir,Path(sys.executable),
                               isolated=args.isolated_install,launch=not args.no_launch,
-                              language=args.language or 'ko')
-        except Exception as exc:result=dict(error=str(exc))
+                              language=args.language or 'ko',update_id=args.update_id)
+        except Exception as exc:
+            result=dict(error=str(exc))
+            if args.update_id:
+                from .update_state import UpdateState,valid_id
+                if valid_id(args.update_id):UpdateState(args.install_root).fail(args.update_id,str(exc))
         if args.report:atomic_write(args.report,json.dumps(result,ensure_ascii=False,indent=2).encode())
         return 1 if result.get('error') else 0
     if args.uri:

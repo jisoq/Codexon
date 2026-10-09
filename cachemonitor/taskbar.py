@@ -247,7 +247,7 @@ class TaskbarQuota(QuickHost):
         self.monitor_name = settings.value('taskbar/monitor', '', type=str)
         self.activation_hint = activation_hint
         from .i18n import tr
-        self.setWindowTitle('Codexon · '+tr('작업표시줄 잔여량'))
+        self.setWindowTitle('Codexon - '+tr('작업표시줄 잔여량'))
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setCursor(Qt.PointingHandCursor if activation_hint else Qt.ArrowCursor)
@@ -286,12 +286,12 @@ class TaskbarQuota(QuickHost):
         choices = [('', '주 모니터 자동 선택', True)]
         for screen in screens:
             size, ratio = screen.size(), screen.devicePixelRatio()
-            label = (f'{screen_id(screen)} · {round(size.width() * ratio)} × '
+            label = (f'{screen_id(screen)}, {round(size.width() * ratio)} × '
                      f'{round(size.height() * ratio)}'
-                     + (' · 주 모니터' if screen == QApplication.primaryScreen() else ''))
+                     + (', 주 모니터' if screen == QApplication.primaryScreen() else ''))
             choices.append((screen_id(screen), label, True))
         if self.monitor_name and self.monitor_name not in {screen_id(s) for s in screens}:
-            choices.append((self.monitor_name, f'{self.monitor_name} · 연결 끊김 (주 모니터에 임시 표시)', False))
+            choices.append((self.monitor_name, f'{self.monitor_name}, 연결 끊김 (주 모니터에 임시 표시)', False))
         for name, label, enabled in choices:
             action = self.monitor_menu.addAction(label)
             action.setCheckable(True)

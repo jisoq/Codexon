@@ -91,7 +91,7 @@ def deployment(executable):
     manifest=read_json(executable.parent/'build-manifest.json')
     sha=digest(executable)
     if manifest.get('product')!='Codexon' or manifest.get('sha256')!=sha or not manifest.get('commit'):
-        raise RuntimeError('배포 파일 무결성 확인 실패 · 기존 프록시를 유지합니다.')
+        raise RuntimeError('배포 파일 무결성 확인에 실패했습니다. 기존 프록시를 유지합니다.')
     return dict(executable=str(executable),sha256=sha,commit=manifest['commit'])
 
 

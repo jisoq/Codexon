@@ -51,7 +51,7 @@ def history_rows(report, mode, start=None, end=None):
         row['markers']=[RESET_NAMES[row['reset_kind']]] if row['reset_kind'] else []
         row['connect']=bool(continuous and rows)
         row['tracking_continuous']=same_tracking
-        row['label']=f"{clock(row['at'],True)} · 잔여 {row['remaining']:g}%"+(' · '+row['markers'][0] if row['markers'] else '')
+        row['label']=f"{clock(row['at'],True)}, 잔여 {row['remaining']:g}%"+(', '+row['markers'][0] if row['markers'] else '')
         if start is None or record['at']>=start:rows.append(row)
         previous=row
     return rows
@@ -61,11 +61,11 @@ def observation_label(row, money=False):
     from .pricing import usd
     label=row['label']
     if 'reported_remaining' in row:
-        label=f"{clock(row['at'],True)} · 누적 소모 {row['remaining']:g}%p"
+        label=f"{clock(row['at'],True)}, 누적 소모 {row['remaining']:g}%p"
     if money:
         label+=(f" / 누적 환산액 {usd(row.get('cycle_cost'))}"
                 f" / 주간 동등 가치 {usd(row.get('cycle_value'))}")
-        if row.get('value_held'):label+=' · 마지막 확인값'
+        if row.get('value_held'):label+=', 마지막 확인값'
     return label
 
 
@@ -205,7 +205,7 @@ def prepare_quota_view(report):
         offset_cost+=period['cost'] or 0;offset_delta+=period['delta']
         state='진행 중' if period['current'] else '종료'
         origin=RESET_NAMES.get(period['reset_kind'],'관측 시작')
-        period['label']=(f"{clock(period['start'])} → {clock(period['end'])} · {origin} · {state} · {usd(period['value'])}")
+        period['label']=(f"{clock(period['start'])} → {clock(period['end'])}, {origin}, {state}, {usd(period['value'])}")
     lifetime=quota_statistics(report,include_mode_assumptions=True)
     now=report.get('at')
     summaries={None:lifetime}

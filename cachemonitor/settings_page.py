@@ -8,21 +8,22 @@ from .i18n import tr
 
 class SettingsPage(Group):
     restartRequested = Signal()
-    IDS = ('general', 'display', 'notifications', 'integration', 'troubleshooting', 'about')
-    TITLES = ('일반', '화면 표시', '알림', 'Codex 연동', '문제 해결', '앱 정보')
+    IDS = ('general', 'display', 'notifications', 'integration', 'about')
+    TITLES = ('일반', '화면 표시', '알림', 'Codex 연결', '앱 정보')
     ENTRY_IDS = {
         '언어':'language','시스템 시간대':'timezone','위치':'overlay-position',
         '프록시 사용':'proxy',
         '알림 표시':'notifications-enabled','HTTP 전환':'http-fallback',
         '캐시 저하 의심':'cache-drop','모델명 불일치':'model-mismatch','프록시 장애':'proxy-failure',
-        '캐시 알림 범위':'cache-scope','최근 알림':'notification-history','현재 버전':'version',
-        '업데이트 확인':'update','업데이트 자동 확인':'automatic-update','연결 복구':'recovery','저장소':'repository',
+        '캐시 알림 범위':'cache-scope','최근 알림':'notification-history','현재 버전':'version','제작자':'creator',
+        '업데이트 확인':'update','업데이트 자동 확인':'automatic-update','연결 복구':'recovery','저장소':'repository','사용 안내':'guide',
         '수집 상태':'collection-status','진단 상세':'diagnostics',
     }
     LEGACY = ('general', 'display', 'display', 'integration', 'notifications', 'about', 'integration')
 
     @classmethod
     def category_id(cls, value):
+        if isinstance(value,str):value={'troubleshooting':'integration','updates':'about','usage':'general','connection':'integration'}.get(value,value)
         if value in cls.IDS:return value
         try:return cls.LEGACY[int(value)] if 0 <= int(value) < len(cls.LEGACY) else 'general'
         except (ValueError, TypeError):return 'general'
@@ -38,7 +39,7 @@ class SettingsPage(Group):
         search_shell.addLayout(search_row,1);search_shell.addStretch();root.addLayout(search_shell)
         shell=Row();shell.setSpacing(24);root.addLayout(shell,1)
         self.navigation=Navigation();self.navigation.setObjectName('settingsNavigation')
-        self.navigation.addItems(self.TITLES);self.navigation.setFixedWidth(160)
+        self.navigation.addItems(self.TITLES);self.navigation.setFixedWidth(200)
         self.stack=Stack();self.stack.put(deferPages=True);self.stack.setMaximumWidth(840);shell.addWidget(self.navigation);shell.addWidget(self.stack,1);shell.addStretch()
         self.layouts={};self.scrollers={}
         for category,title in zip(self.IDS,self.TITLES):
@@ -54,11 +55,10 @@ class SettingsPage(Group):
         self.reveal(self.category_id(parent.settings.value('settings/category','general')))
         self.add_row('general', 'Windows 로그인 시 시작', 'Windows에 로그인하면 Codexon이 트레이에서 실행됩니다.', self.toggle('startup'), section='시작')
         tracking=self.toggle('weekly_tracking')
-        self.add_row('general', '주간 환산 모니터링', '주간 사용 한도와 사용량을 함께 기록해 한도 소모 추이를 확인합니다.', tracking, section='사용량')
         tracking.setChecked(parent.settings.value('quota/trackingEnabled',True,type=bool))
         tracking.toggled.connect(parent.set_quota_tracking_enabled)
         self.add_row('display', '테마', '', self.choice('theme'), section='모양')
-        self.add_row('display', '잔여량 표시', '', self.choice('quota'), section='잔여량')
+        self.add_row('display', '잔여량 표시', '', self.choice('quota'), section='모양')
         language_choice=self.choice('language')
         language_controls=Group();language_layout=Row(language_controls);language_layout.setContentsMargins(0,0,0,0);language_layout.setSpacing(8);language_layout.put(flow=True)
         restart=Button('Codexon 재시작')
@@ -84,14 +84,13 @@ class SettingsPage(Group):
             zone='UTC'+offset[:3]+':'+offset[3:]
         else:
             zone=time.tzname[0]
-        timezone=Text(tr('시스템 시간대')+': '+zone);timezone.setWordWrap(True)
-        self.add_widget('general', timezone,section='언어',title='시스템 시간대')
+        timezone=Text(zone);timezone.setWordWrap(True)
+        self.add_row('general', '시스템 시간대', '', timezone,section='언어')
+        self.add_row('general', '주간 환산 모니터링', '주간 사용 한도와 사용량을 함께 기록해 한도 소모 추이를 확인합니다.', tracking, section='사용량',aliases='usage records collection diagnostics 수집 상태 수집 상세')
         self.add_row('display', '작업표시줄 위젯', '마우스로 끌어 작업표시줄 안에서 위치를 조절할 수 있습니다.', self.toggle('widget'), section='작업표시줄 위젯')
-        self.add_row('display', '표시할 모니터', '선택한 모니터의 연결이 끊기면 주 모니터에 표시합니다.', self.choice('monitor'), section='작업표시줄 위젯')
+        self.add_row('display', '표시할 모니터', '선택한 모니터의 연결이 끊기면 주 모니터에 표시합니다.', self.choice('monitor'), section='작업표시줄 위젯',depth=1)
         self.add_row('display', '세션 오버레이', 'Codex 작업 중 현재 세션의 비용과 토큰 사용량을 작은 창에서 확인할 수 있습니다.', self.toggle('overlay'), section='세션 오버레이')
-        self.controls['reset_position']=Button('위치 초기화')
-        self.add_row('display', '위치', '오버레이 위치를 기본 위치로 되돌립니다.', self.controls['reset_position'], section='세션 오버레이')
-        for key in ('startup', 'quota', 'widget', 'monitor', 'overlay', 'reset_position', 'theme'):
+        for key in ('startup', 'quota', 'widget', 'monitor', 'overlay', 'theme'):
             self.controls[key].setEnabled(False)
 
     def refresh_restart(self):
@@ -120,15 +119,14 @@ class SettingsPage(Group):
     def add_widget(self, category, widget, section=None, title=None, description='', target=None, aliases=''):
         category=self.category_id(category)
         section=section or {'general':'앱 설정','display':'화면 설정','notifications':'알림 설정',
-            'integration':'연결과 캐시','troubleshooting':'상태 확인','about':'제품 정보'}[category]
+            'integration':'연결','about':'제품 정보'}[category]
         key=(category,section)
         if key not in self.sections:
             group=Column();group.setSpacing(0)
             if any(existing_category==category for existing_category,_ in self.sections):
                 divider=Group();divider.setFixedHeight(1);divider.put(background='border')
                 group.addWidget(divider)
-            heading=Text(section);heading.put(fontSize=15,bold=True,color='muted');heading.setContentsMargins(0,20,0,8)
-            group.addWidget(heading);self.sections[key]=group
+            self.sections[key]=group
             layout=self.layouts[category];layout.insertWidget(layout.count()-1,group)
         self.sections[key].addWidget(widget)
         if title:
@@ -137,19 +135,41 @@ class SettingsPage(Group):
             self.entries.append(dict(id=entry_id,category=category,section=section,title=title,description=description,
                 widget=widget,target=target or widget,aliases=aliases))
 
-    def add_row(self, category, title, description, control, section=None, aliases=''):
+    def add_row(self, category, title, description, control, section=None, aliases='',depth=0):
         row=Group();row.setObjectName('settingRow')
-        outer=Column(row);outer.setContentsMargins(0,16,0,16)
-        layout=Row();layout.put(collapseBelow=360 if control.kind=='switch' else 620);layout.setSpacing(12);outer.addLayout(layout)
-        copy=Column();copy.setSpacing(5)
-        name=Text(title);name.setWordWrap(True);name.put(bold=True);copy.addWidget(name)
+        outer=Column(row);outer.setContentsMargins(0,0 if depth else 12,0,12)
+        layout=Row();layout.put(collapseBelow=620,minHeight=36);layout.setSpacing(8);outer.addLayout(layout)
+        copy=Column();copy.setSpacing(4);copy.setContentsMargins(24*depth,0,0,0)
+        name=Text(title);name.setWordWrap(True);name.put(bold=not depth,fontSize=13 if depth else 14);copy.addWidget(name)
         if description:
             detail=Text(description);detail.setWordWrap(True);detail.put(color='muted',fontSize=13);copy.addWidget(detail)
         layout.addLayout(copy,2)
-        holder=Row();holder.addStretch();holder.addWidget(control);layout.addLayout(holder,1)
+        holder=Row();holder.addWidget(control);holder.addStretch();layout.addLayout(holder,1)
         control.setAccessibleName(title)
         self.add_widget(category,row,section,title,description,control,aliases)
         return row
+
+    def update_attention(self, needed):
+        index=self.IDS.index('about')
+        self.navigation.setItemText(index,tr('앱 정보')+('  '+tr('확인 필요') if needed else ''))
+        self.navigation.update()
+
+    @staticmethod
+    def shortcut(title, action, icon='external'):
+        control=Button(title);control.put(iconName=icon,role='quiet')
+        control.setFixedSize(32,32);control.setAccessibleName(title);control.setToolTip(title)
+        control.clicked.connect(action)
+        return control
+
+    @staticmethod
+    def version_link(version):
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+        control=Button(version);control.put(role='quiet')
+        control.setAccessibleName(tr('변경 내역')+' '+version)
+        control.setToolTip(tr('변경 내역')+' '+version)
+        control.clicked.connect(lambda:QDesktopServices.openUrl(QUrl('https://github.com/jisoq/Codexon/releases/tag/v'+version)))
+        return control
 
     def current_category(self):return self.IDS[max(0,self.navigation.currentRow())]
 
@@ -219,6 +239,7 @@ class SettingsPage(Group):
     def bind_tray(self, owner):
         self.bind_action('startup', owner.startup)
         self.bind_action('widget', owner.taskbar_action)
+        owner.taskbar_action.changed.connect(self.sync_monitor_enabled)
         self.bind_choices('quota', owner.quota_actions)
         self.taskbar = owner.taskbar_quota
         self.refresh_monitors()
@@ -234,11 +255,11 @@ class SettingsPage(Group):
             control.clear()
             for value, action in self.taskbar.monitor_actions.items(): control.addItem(action.text(), value)
             control.setCurrentIndex(control.findData(self.taskbar.monitor_name))
-        control.setEnabled(True)
+        self.sync_monitor_enabled()
 
-    def bind_overlay(self, controller):
-        self.controls['reset_position'].clicked.connect(controller.reset_position)
-        self.controls['reset_position'].setEnabled(True)
+    def sync_monitor_enabled(self):
+        control=self.controls['widget']
+        self.controls['monitor'].setEnabled(control.isEnabled() and control.isChecked())
 
     def reveal(self, category, widget=None):
         category=self.category_id(category);self.search.setText('')

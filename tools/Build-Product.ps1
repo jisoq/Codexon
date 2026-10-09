@@ -61,8 +61,10 @@ try {
     Copy-Item -LiteralPath (Join-Path $sourceRoot 'LICENSE') -Destination (Join-Path $stagedProduct 'LICENSE')
     Copy-Item -LiteralPath (Join-Path $sourceRoot 'THIRD-PARTY-NOTICES.md') -Destination (Join-Path $stagedProduct 'THIRD-PARTY-NOTICES.md')
     Copy-Item -LiteralPath (Join-Path $sourceRoot 'SOURCE-OFFER.md') -Destination (Join-Path $stagedProduct 'SOURCE-OFFER.md')
-    Copy-Item -LiteralPath (Join-Path $sourceRoot 'docs/user-guide.md') -Destination (Join-Path $stagedProduct 'USER-GUIDE.md')
-    Copy-Item -LiteralPath (Join-Path $sourceRoot 'docs/user-guide.ko.md') -Destination (Join-Path $stagedProduct 'USER-GUIDE.ko.md')
+    foreach ($guide in @(@('README.md','USER-GUIDE.md'), @('README.ko.md','USER-GUIDE.ko.md'))) {
+        $content = [IO.File]::ReadAllText((Join-Path $sourceRoot $guide[0])).Replace('(README.md)','(USER-GUIDE.md)').Replace('(README.ko.md)','(USER-GUIDE.ko.md)')
+        [IO.File]::WriteAllText((Join-Path $stagedProduct $guide[1]), $content, [Text.UTF8Encoding]::new($false))
+    }
     Copy-Item -LiteralPath (Join-Path $sourceRoot 'LICENSES') -Destination (Join-Path $stagedProduct 'LICENSES') -Recurse
     $pythonBase = (& $PythonPath -c 'import sys; print(sys.base_prefix)').Trim()
     $recoveryNotices = Join-Path $stagedProduct 'LICENSES/recovery'

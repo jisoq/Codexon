@@ -281,9 +281,8 @@ def test_settings_is_the_single_persisted_overlay_control(tmp_path):
         restored = OverlayController(settings, native_enabled=False)
         assert restored.anchor == (.2,.3)
         restored.stop()
-        window.settings_page.controls['reset_position'].activate()
-        assert controller.position == 'bottom-right'
-        assert controller.anchor is None
+        assert 'reset_position' not in window.settings_page.controls
+        assert controller.anchor == (.2,.3)
         assert 'collapsed' not in window.settings_page.controls and 'opacity' not in window.settings_page.controls
         controller.actions.view.collapsePanel()
         assert controller.collapsed

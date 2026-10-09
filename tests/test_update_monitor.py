@@ -230,24 +230,16 @@ def test_dashboard_badge_notification_routes_mute_and_explicit_check(endpoint,tm
         assert panel.execute.isVisible() and panel.execute.isEnabled()
         assert panel.offer['release']==release() and not status_calls and not e.requests
         click(window,render_plot(window,panel.execute))
-        settle(lambda:panel.confirming)
-        assert status_calls==[True] and not e.requests and not installs
-        assert panel.offer['release']==release() and 'install' in panel.offer
-        click(panel.dialog.host,control(panel.dialog.host,panel.dialog.cancel))
-        settle(lambda:not panel.confirming)
-        assert panel.execute.isEnabled() and not installs
-        click(window,render_plot(window,panel.execute))
-        settle(lambda:panel.confirming)
-        click(panel.dialog.host,control(panel.dialog.host,panel.dialog.confirm))
-        settle(lambda:panel.operation is None and not panel.confirming)
-        assert len(installs)==1 and installs[0]['release']==release() and not e.requests
+        settle(lambda:panel.operation is None and bool(installs))
+        assert status_calls==[True] and not e.requests
+        assert len(installs)==1 and installs[0]['release']==release()
         status_calls.clear()
         window.open_settings();window.tray.messageClicked.emit()
         assert window.settings_page.current_category()=='about'
         window.show_tray_notification('details','Proxy failure','Details',QSystemTrayIcon.Warning)
         window.tray.messageClicked.emit()
         assert window.settings_page.current_category()=='notifications'
-        assert window.notification_details.toggle.isChecked()
+        assert window.notification_log.isVisible()
         # Start auto transport, then join it through the real UpdatePanel.
         e.now=monitor.timestamp('nextCheck');monitor.due();settle(lambda:len(e.requests)==1)
         assert not status_calls
@@ -263,7 +255,7 @@ def test_dashboard_badge_notification_routes_mute_and_explicit_check(endpoint,tm
         settle(lambda:not window.update_panel.metadata_pending and window.update_panel.operation is None)
         assert window.update_panel.offer['kind']=='app' and status_calls==[True]
         from cachemonitor.i18n import tr
-        settle(lambda:any(item.isVisible() and item.property('text')==tr('업데이트 가능')
+        settle(lambda:any(item.isVisible() and item.property('text')==tr('교체할 때 연결이 잠시 중단됩니다.')
                           for item in walk(control(window,window.update_panel.status))))
         assert len(messages)==2
         monitor.publish();assert window.update_panel.offer['kind']=='app'
@@ -302,21 +294,16 @@ def test_cached_offer_install_prepares_selected_release_without_network(endpoint
     try:
         monitor.start()
         assert panel.offer['release']==cached and panel.execute.isVisible() and not calls
-        from datetime import datetime
-        assert datetime.fromtimestamp(e.now).strftime('%Y-%m-%d %H:%M') in panel.checked.text()
+        assert not panel.button.isVisible()
         panel.request_install();panel.request_install()
         settle(lambda:panel.operation is None)
-        assert not e.requests and not installs and not panel.prepare_confirmation
+        assert not e.requests
         if installed:
-            assert calls==['installed','status'] and panel.confirming
-            assert panel.offer['connections']==4
-            monitor.cache=release('v2099.02.01.1');monitor.publish()
-            assert panel.offer['release']==cached
-            click(panel.dialog.host,control(panel.dialog.host,panel.dialog.confirm))
-            settle(lambda:panel.operation is None and not panel.confirming)
+            assert calls==['installed','status']
             assert len(installs)==1 and installs[0]['release']==cached
+            assert installs[0]['connections']==4
         else:
-            assert calls==['installed'] and not panel.confirming
+            assert calls==['installed'] and not installs
             assert panel.operation_error and panel.offer is None and not panel.execute.isVisible()
             assert panel.button.isEnabled() and '설치형 Codexon' in panel.status.text()
     finally:
