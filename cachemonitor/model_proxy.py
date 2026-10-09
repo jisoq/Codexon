@@ -20,7 +20,7 @@ from .model_evidence import EvidenceStore, default_path, identifier, home_key
 from .version import PROXY_VERSION
 from .proxy_observation import DecodedObservation, SelectedJSON, ResponseMetadata, message_metadata
 from .proxy_http import HTTPRelayPool
-from .proxy_websocket import POLICY, Activity, WebSocketBudget, LocalCapacity
+from .proxy_websocket import POLICY, Activity, WebSocketBudget, WebSocketClose, LocalCapacity
 from .observer_state import read_json
 from .evidence_writer import EvidenceWriter
 
@@ -36,7 +36,7 @@ class ClientDisconnected(ConnectionError):
 
 
 def proxy_loop():
-    return asyncio.SelectorEventLoop() if os.name=='nt' else asyncio.new_event_loop()
+    return asyncio.ProactorEventLoop() if os.name=='nt' else asyncio.new_event_loop()
 
 
 def headers_without_hop(headers, websocket=False):
@@ -149,7 +149,7 @@ class Tracker:
 
 def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *, diagnostics=None,ssl_context=None,
                control_file=None, control_id='', stop_event=None, managed=None,
-               runtime_identity=None, policy=POLICY, clock=time.monotonic):
+               runtime_identity=None, policy=POLICY, clock=time.monotonic, runtime_diagnostics=None):
     base=URL(upstream)
     if (base.scheme not in ('http','https') or not base.host or base.user is not None
             or base.query_string or base.fragment):
@@ -177,6 +177,17 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
 
     def public(diagnostic):
         return {k:v for k,v in diagnostic.items() if not k.startswith('_')}
+
+    if runtime_diagnostics is not None:
+        fields=('connection','transport','responses_endpoint','method','phase','started_at',
+                'request_bytes','response_bytes','request_frames','response_frames','outcome',
+                'error_type','retirement_reason','close_side','close_code','cleanup_error_type')
+        def snapshot():
+            return dict(active_connections=len(active_relays), websocket_states=budget.status()['states'],
+                        active_relays=[{k:d[k] for k in fields if k in d}
+                                       for d in list(active_relays.values())[-32:]],
+                        recent_relays=[{k:d[k] for k in fields if k in d} for d in recent_relays])
+        runtime_diagnostics.snapshot=snapshot
 
     def apply_control():
         command=read_json(control_file) if control_file else {}
@@ -246,6 +257,7 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
                 'websocket_states':inventory['states'],'websocket_connections':inventory,
                 'http_connections':sum(d['transport']=='HTTP/SSE' for d in active_relays.values()),
                 'selector_sockets':len(selector.get_map()) if hasattr(selector,'get_map') else None,
+                'event_loop':type(asyncio.get_running_loop()).__name__,
                 'http_pool':dict(clients=len(getattr(app[HTTP_CLIENT],'clients',())),waiting=getattr(app[HTTP_CLIENT],'waiting',0)),
                 'active_connections':len(active_relays),
                 'connection_sessions':[dict(session_id=sid,connections=count) for sid,count in
@@ -271,10 +283,17 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
                     'request_encoding':identifier(request.headers.get('Content-Encoding','')),
                     'request_bytes':0,'response_bytes':0,'request_frames':0,'response_frames':0}
         relay_id=uuid.uuid4().hex
+        diagnostic['connection']=relay_id
         diagnostic['_session_id']=identifier(request.headers.get('session_id',''))
         active_relays[relay_id]=diagnostic
         relay_controls[relay_id]=(asyncio.current_task(),request.transport)
         phase='upstream_connect'
+        def set_phase(value):
+            nonlocal phase
+            phase=value
+            diagnostic['phase']=value
+            if runtime_diagnostics is not None:runtime_diagnostics.event(relay_id,value)
+        set_phase(phase)
         response=None
         request_observer=None
         response_observer=None
@@ -298,21 +317,13 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
                     await downstream.prepare(request)
                     diagnostic['_activity_at']=time.monotonic()
                     sockets[relay_id]=(downstream,tracker,observe)
-                    relay_tasks=[]
-                    handler=asyncio.current_task()
                     upstream_transport=getattr(upstream_ws._response.connection,'transport',None)
+                    closer=WebSocketClose(downstream,upstream_ws,(request.transport,upstream_transport),
+                                          diagnostic,policy.close_seconds)
                     async def retire(reason):
                         diagnostic['retirement_reason']=reason
-                        try:
-                            async with asyncio.timeout(policy.close_seconds):
-                                await asyncio.gather(downstream.close(code=1001,message=b'Local connection renewal'),
-                                                     upstream_ws.close(code=1001,message=b'Local connection renewal'))
-                        except (TimeoutError,ConnectionError):pass
-                        finally:
-                            if request.transport:request.transport.abort()
-                            if upstream_transport:upstream_transport.abort()
-                            for task in relay_tasks:task.cancel()
-                            if not handler.done():handler.cancel()
+                        set_phase('retiring')
+                        await closer.close(code=1001,message=b'Local connection renewal')
                     budget.connected(relay_id,retire)
 
 
@@ -324,7 +335,7 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
                                 if not activity.begin(obj,outbound):return 1001
                                 diagnostic['_activity_at']=time.monotonic()
                                 diagnostic['forwarding']=diagnostic.get('forwarding',0)+1
-                                phase='upstream_write' if outbound else 'downstream_write'
+                                set_phase('upstream_write' if outbound else 'downstream_write')
                                 diagnostic['request_frames' if outbound else 'response_frames']+=1
                                 diagnostic['last_client_frame_at' if outbound else 'last_upstream_frame_at']=time.time()
                                 diagnostic['request_bytes' if outbound else 'response_bytes']+=len(msg.data.encode('utf-8') if isinstance(msg.data,str) else msg.data)
@@ -358,27 +369,22 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
 
                     tasks=[asyncio.create_task(relay(downstream,upstream_ws,True)),
                            asyncio.create_task(relay(upstream_ws,downstream,False))]
-                    relay_tasks.extend(tasks)
+                    closer.readers=tasks
+                    set_phase('websocket_relay')
                     try:
                         done,pending=await asyncio.wait(tasks,return_when=asyncio.FIRST_COMPLETED)
                         for task in done: task.result()
-                        # Stop the idle opposite reader before close(). aiohttp otherwise
-                        # wakes that reader with a synthetic CLOSING message; on Windows this
-                        # can close the transport before buffered final frames reach the peer.
-                        for task in pending: task.cancel()
-                        await asyncio.gather(*pending,return_exceptions=True)
                         code=(upstream_ws.close_code if tasks[1] in done else downstream.close_code) or 1000
                         health['last_close_side']='upstream' if tasks[1] in done else 'client'
                         diagnostic['close_side']=health['last_close_side']
                         diagnostic['close_code']=code
                         if code in (1005,1006,1015): code=1011
-                        await downstream.close(code=code)
-                        await upstream_ws.close(code=code)
-                        phase='complete'
+                        set_phase('websocket_close')
+                        await closer.close(code=code)
+                        set_phase('complete')
                         health['internal_failure_streak']=0
                     finally:
-                        for task in tasks: task.cancel()
-                        await asyncio.gather(*tasks,return_exceptions=True)
+                        await closer.close()
                     return downstream
             capture=observe and request.method=='POST'
             if capture:
@@ -388,9 +394,9 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
                 nonlocal phase
                 try:
                     async for chunk in request.content.iter_chunked(65536):
-                        phase='request_read';diagnostic['request_bytes']+=len(chunk)
+                        set_phase('request_read');diagnostic['request_bytes']+=len(chunk)
                         if request_observer is not None:request_observer.feed(chunk)
-                        phase='upstream_write'
+                        set_phase('upstream_write')
                         yield chunk
                 finally:
                     if request_observer is not None:
@@ -400,7 +406,7 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
             body=upload() if request.can_read_body else None
             if capture and body is None:tracker.request({})
             health['forwarded_http_requests']+=1
-            phase='upstream_headers'
+            set_phase('upstream_headers')
             # Construct Request directly: no client-default headers or cookie merge.
             outgoing=httpx.Request(request.method,str(url),
                 headers=[(k.encode('ascii'),v.encode('utf-8','surrogateescape')) for k,v in headers.items()],content=body)
@@ -415,27 +421,27 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
                                                          for k,v in response.headers.raw))
             request[RELAY_HEADERS]={name.lower() for name in relay_headers}
             downstream=web.StreamResponse(status=response.status_code,reason=response.reason_phrase,headers=relay_headers)
-            phase='downstream_headers'
+            set_phase('downstream_headers')
             await downstream.prepare(request)
             if capture:
                 response_observer=DecodedObservation(ResponseMetadata(tracker.response),response.headers.get('Content-Encoding',''))
-            phase='upstream_read'
+            set_phase('upstream_read')
             # Do not specify chunk_size: HTTPX otherwise coalesces small SSE frames
             # until that many bytes arrive, delaying or deadlocking a live stream.
             async for chunk in response.aiter_raw():
                 diagnostic['response_bytes']+=len(chunk)
                 if response_observer is not None:response_observer.feed(chunk)
-                phase='downstream_write'
+                set_phase('downstream_write')
                 await downstream.write(chunk)
-                phase='upstream_read'
+                set_phase('upstream_read')
             lease.complete=True
             if response_observer is not None:
                 response_observer.finish()
                 diagnostic['response_observation']=response_observer.error or response_observer.consumer.error or 'parsed'
             tracker.finish('http_error' if response.status_code>=400 else 'unparsed')
-            phase='downstream_eof'
+            set_phase('downstream_eof')
             await downstream.write_eof()
-            phase='complete'
+            set_phase('complete')
             health['internal_failure_streak']=0
             return downstream
         except asyncio.CancelledError:
@@ -527,51 +533,64 @@ def main():
     args=parser.parse_args()
     if args.evidence_path.resolve().is_relative_to(Path(args.codex_home).resolve()):
         parser.error('Evidence must be stored outside the Codex home')
-    store=EvidenceWriter(args.evidence_path)
-    endpoint={'chatgpt':'https://chatgpt.com/backend-api/codex','openai':'https://api.openai.com/v1'}[args.upstream]
-    if args.upstream_url:endpoint=args.upstream_url
-    context=ssl.create_default_context(cafile=str(args.upstream_ca)) if args.upstream_ca else None
-    from .proxy_identity import runtime_identity
-    identity=runtime_identity(args.codex_home,args.evidence_path,role='observer',upstream=endpoint)
-    identity['listen_url']=f'http://127.0.0.1:{args.port}'
+    if args.control_file and (args.control_file.resolve().parent != args.evidence_path.resolve().parent
+            or args.control_file.name != 'proxy-control-'+args.control_id+'.json'):
+        parser.error('Control file must belong to the observer data directory')
+    from .proxy_runtime import ProxyDiagnostics, run_loop
+    diagnostic=ProxyDiagnostics(args.evidence_path.parent)
+    store=None
+    managed=None
     try:
+        store=EvidenceWriter(args.evidence_path)
+        endpoint={'chatgpt':'https://chatgpt.com/backend-api/codex','openai':'https://api.openai.com/v1'}[args.upstream]
+        if args.upstream_url:endpoint=args.upstream_url
+        context=ssl.create_default_context(cafile=str(args.upstream_ca)) if args.upstream_ca else None
+        from .proxy_identity import runtime_identity
+        identity=runtime_identity(args.codex_home,args.evidence_path,role='observer',upstream=endpoint)
+        identity['listen_url']=f'http://127.0.0.1:{args.port}'
         if args.managed:
             from .observer_control import ObserverManager
             from .managed_proxy import ManagedProxy
             manager=ObserverManager(args.codex_home,args.evidence_path.parent,url=f'http://127.0.0.1:{args.port}')
             manager.evidence=args.evidence_path.resolve()
-            loop=proxy_loop()
-            try:loop.run_until_complete(ManagedProxy(manager).serve(store,endpoint,context,args.port,identity=identity))
-            finally:loop.close()
-        elif args.control_file:
-            if (args.control_file.resolve().parent != args.evidence_path.resolve().parent
-                    or args.control_file.name != 'proxy-control-'+args.control_id+'.json'):
-                parser.error('Control file must belong to the observer data directory')
+            managed=ManagedProxy(manager)
+            run_loop(lambda:managed.serve(store,endpoint,context,args.port,identity=identity,diagnostics=diagnostic),
+                     diagnostic,proxy_loop)
+        else:
             async def serve():
                 stop=asyncio.Event()
                 app=create_app(store,args.codex_home,endpoint,ssl_context=context,control_file=args.control_file,
-                               control_id=args.control_id,stop_event=stop,runtime_identity=identity)
+                               control_id=args.control_id,stop_event=stop,runtime_identity=identity,
+                               runtime_diagnostics=diagnostic)
                 runner=web.AppRunner(app,access_log=None)
                 await runner.setup()
                 try:
                     await web.TCPSite(runner,'127.0.0.1',args.port).start()
                     await stop.wait()
                 finally:await runner.cleanup()
-            loop=proxy_loop()
-            try:loop.run_until_complete(serve())
-            finally:loop.close()
-        else:
-            web.run_app(create_app(store,args.codex_home,endpoint,ssl_context=context),host='127.0.0.1',port=args.port,
-                        access_log=None,print=None,loop=proxy_loop())
+            run_loop(serve,diagnostic,proxy_loop)
+    except Exception as error:
+        diagnostic.fail(error,'startup')
     finally:
-        if not store.close():
-            raise SystemExit('관측 저장 종료 미완료 / 저장 대기 또는 누락 기록 확인 필요')
-        if args.control_file:
+        flushed=False
+        if store is not None:
+            try:
+                flushed=store.close()
+                if not flushed:raise RuntimeError('Observation storage did not flush')
+            except Exception as error:diagnostic.fail(error,'storage_close')
+        diagnostic.save(storage_flushed=flushed)
+        if managed and diagnostic.failure:
+            try:managed.failed(diagnostic.failure)
+            except Exception as error:diagnostic.fail(error,'failure_receipt')
+        if args.control_file and not args.managed:
             from .observer_control import atomic_write
             import json
-            atomic_write(args.evidence_path.parent/('proxy-control-'+args.control_id+'.json'),
-                json.dumps(dict(action='stopped',id=args.control_id,storage_flushed=True)).encode())
+            try:
+                atomic_write(args.control_file,json.dumps(dict(action='failed' if diagnostic.failure else 'stopped',
+                             id=args.control_id,storage_flushed=flushed)).encode())
+            except Exception as error:diagnostic.fail(error,'control_receipt')
+    return 1 if diagnostic.failure else 0
 
 
 if __name__=='__main__':
-    main()
+    raise SystemExit(main())
