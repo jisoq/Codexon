@@ -25,7 +25,11 @@ class FakeGitHub:
         self.expired = expired
         self.tag = None
         self.released = None
+        self.verification = None
     def api(self, path, **kwargs):
+        if path.endswith('/jobs'):
+            return {'jobs': [dict(name='verify', conclusion=self.verification or
+                                 next((r['conclusion'] for r in self.runs if str(r['id']) == path.split('/')[2]), 'success'))]}
         if path.startswith('git/ref'):
             return {'object': {'type': 'commit', 'sha': self.tag}} if self.tag else None
         if '/artifacts' in path:
@@ -105,6 +109,15 @@ def test_verified_artifact_preserves_the_installer_without_rebuilding(root):
     before = (folder/'Codexon-Setup.exe').read_bytes()
     assert pipeline.validate_artifact(folder, SHA, '10', root)['coverage'] == 'full'
     assert (folder/'Codexon-Setup.exe').read_bytes() == before
+
+
+def test_windows_artifact_notes_match_linux_checkout_line_endings(root):
+    notes = root/'docs/releases/2026.10.11.1.md'
+    original = notes.read_bytes().replace(b'\r\n', b'\n')
+    notes.write_bytes(original.replace(b'\n', b'\r\n'))
+    folder = prepared_artifact(root)
+    notes.write_bytes(original)
+    assert pipeline.validate_artifact(folder, SHA, '10', root)['coverage'] == 'full'
 
 
 @pytest.mark.parametrize('changed', ['Codexon-Setup.exe', 'RELEASE_NOTES.md', 'commit', 'run_id', 'coverage', 'source_key'])
@@ -190,6 +203,8 @@ def test_publication_uses_verified_artifact_and_only_uploads_installer_files(roo
 def test_failed_run_cannot_reach_download_or_publication(root, monkeypatch):
     class FailedGitHub(FakeGitHub):
         def api(self, path, **kwargs):
+            if path.endswith('/jobs'):
+                return {'jobs': [dict(name='verify', conclusion='failure')]}
             record = run_record()
             record['conclusion'] = 'failure'
             return record
@@ -233,3 +248,12 @@ def test_missing_verified_baseline_requests_full_checks(root):
     workflow = (pipeline.ROOT/'.github/workflows/windows.yml').read_text()
     assert 'PUSH_BASE: ${{ needs.resolve.outputs.base }}' in workflow
     assert '-not $base' in workflow
+
+
+def test_publish_failure_does_not_discard_successfully_verified_installer(root):
+    record = run_record()
+    record['conclusion'] = 'failure'
+    github = FakeGitHub([record])
+    github.verification = 'success'
+    result = pipeline.plan(github, SHA, '20', 'workflow_dispatch', 'refs/heads/main', True, root)
+    assert result['reuse_run'] == '10' and not result['verify']
