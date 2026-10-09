@@ -1,6 +1,7 @@
 import time
+import pytest
 from cachemonitor.banked_resets import normalize_reset_credits,reset_credit_display
-from cachemonitor.quota_live import normalize_limits,normalize_credits
+from cachemonitor.quota_live import normalize_limits,normalize_credits,AccountClient
 from cachemonitor.quota import quota_display
 
 
@@ -9,7 +10,7 @@ def raw_credit(**extra):
                 resetType='codexRateLimits',grantedAt=1700000000,expiresAt=1900000000,**extra)
 
 
-def test_server_count_wins_over_partial_details():
+def test_server_count_wins_over_partial_details_and_no_redemption_rpc():
     now=time.time()
     raw={'rateLimits':{'limitId':'codex','primary':{'usedPercent':82,'windowDurationMins':10080,'resetsAt':now+600}},
          'rateLimitResetCredits':{'availableCount':3,'credits':[raw_credit()]}}
@@ -17,6 +18,7 @@ def test_server_count_wins_over_partial_details():
     display=reset_credit_display(quota,now)
     assert display['count']=='3개' and len(display['sections'])==1
     assert '상세 1개 제공' in display['note']
+    with pytest.raises(ValueError):AccountClient('.').rpc('account/rateLimitResetCredit/consume')
 
 
 def test_zero_count_details_unavailable_and_stale_are_distinct():
