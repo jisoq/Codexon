@@ -47,14 +47,14 @@ def tr(value):
     match = re.fullmatch(r'산정\s*(\d+)\s*/\s*관측\s*(\d+)', value)
     if match:
         return f'Calculated {match[1]} of {match[2]} observed'
-    match = re.fullmatch(r'유효\s*([\d,]+)요청\s*·\s*포함\s*([\d,]+)호출', value)
+    match = re.fullmatch(r'유효\s*([\d,]+)요청\s*,\s*포함\s*([\d,]+)호출', value)
     if match:
-        return f'{match[1]} eligible requests · {match[2]} included calls'
-    match = re.fullmatch(r'유효\s*([\d,]+)\s*/\s*대상\s*([\d,]+)\s*·\s*입력\s*([\d,]+)', value)
+        return f'{match[1]} eligible requests, {match[2]} included calls'
+    match = re.fullmatch(r'유효\s*([\d,]+)\s*/\s*대상\s*([\d,]+)\s*,\s*입력\s*([\d,]+)', value)
     if match:
-        return f'Valid {match[1]} of {match[2]} · input {match[3]}'
-    value = re.sub(r'관측\s*([\d,]+)호출\s*·\s*([\d,]+)세션',
-                   lambda match: f'{match[1]} observed calls · {match[2]} sessions', value)
+        return f'Valid {match[1]} of {match[2]}, input {match[3]}'
+    value = re.sub(r'관측\s*([\d,]+)호출\s*,\s*([\d,]+)세션',
+                   lambda match: f'{match[1]} observed calls, {match[2]} sessions', value)
     # Numeric units are not standalone catalog keys. Preserve the displayed
     # number and translate before the word-fragment fallback.
     value = re.sub(r'(\d[\d,.]*)초', r'\1 s', value)

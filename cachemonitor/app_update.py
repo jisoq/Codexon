@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import time
 import urllib.request
 from urllib.parse import urlsplit
@@ -77,11 +78,12 @@ def validated_release(value):
         raise ValueError('배포 정보 형식을 확인하지 못했습니다.') from exc
 
 
-def launch_installer(output,root):
+def launch_installer(output,root,operation_id=None):
     from .observer_task import ObserverTask
     # The installer outlives the old GUI's task/job during the handoff.
-    ObserverTask(str(root),role='Installer').start([str(output),'/SILENT','/SUPPRESSMSGBOXES','/NORESTART',
-                                                  '/LOG='+str(output.parent/'setup.log')])
+    command=[str(output),'/SILENT','/SUPPRESSMSGBOXES','/NORESTART','/LOG='+str(output.parent/'setup.log')]
+    if operation_id:command.append('/UPDATEID='+operation_id)
+    ObserverTask(str(root),role='Installer').start(command)
 
 
 def inspect_proxy(manager):
@@ -122,7 +124,7 @@ def check_update(progress=lambda _:None, manager=None, *, release=None):
     release_asset(release)
     try:status=manager.status() if manager is not None else {}
     except Exception:status={}
-    return dict(kind='app',release=release,install=install,connections=connection_count(status))
+    return dict(kind='app',release=release,install=install,manager=manager,connections=connection_count(status),connection_enabled=status.get('configured'))
 
 
 def connection_count(status):
@@ -135,17 +137,52 @@ def update(progress=lambda _:None, manager=None, *, plan=None):
     # release between confirmation and installation.
     plan=check_update(progress,manager) if plan is None else plan
     if plan['kind']=='none':return '설치할 새 버전이 없습니다.'
-    if plan['kind']=='proxy':
-        current=inspect_proxy(plan['manager'])
-        if current['state']=='current':return '모두 최신 상태'
-        if current['state']!='required' or current.get('instance')!=plan.get('proxy',{}).get('instance') or current['reason']!=plan.get('reason'):
-            return '상태 변경 감지: 업데이트 확인 필요'
-        from .install_management import activate_proxy
-        state=activate_proxy(plan['manager'])
-        return '설치할 새 버전이 없습니다. '+(state.get('message') or '')
-    release,install=plan['release'],plan['install']
+    from .update_state import state_for,scope_for
+    from .observer_state import ProcessLock
+    from .install_management import connection_manager
+    manager=plan.get('manager') or manager or connection_manager()
+    install=plan.get('install') or installed()
+    if getattr(sys,'frozen',False) and install and Path(install.get('AppPath','')).resolve()!=Path(sys.executable).resolve():
+        raise RuntimeError('시작 메뉴에서 새 Codexon을 열어 업데이트를 계속하세요.')
+    journal=state_for(manager,install)
+    # Cross-window and cross-process single flight, including download and launch.
+    journal.root.mkdir(parents=True,exist_ok=True)
+    with ProcessLock(journal.root/'app-update-worker.lock'):
+        if plan['kind']=='proxy':
+            current=inspect_proxy(manager)
+            if current['state']=='current':return '모두 최신 상태'
+            if current['state']!='required' or current.get('instance')!=plan.get('proxy',{}).get('instance'):
+                raise RuntimeError('연결 상태가 바뀌었습니다. 업데이트를 다시 확인하세요.')
+        record=journal.begin(plan['kind'],plan['release']['tag_name'].lstrip('v') if plan['kind']=='app' else VERSION,
+                             scope=scope_for(manager),release=plan.get('release'))
+        operation_id=record['operation_id']
+        try:
+            if plan['kind']=='proxy':
+                from .install_management import activate_proxy
+                result=activate_proxy(manager,operation_id=operation_id,update_root=journal.root)
+                journal.proxy_result(operation_id,result)
+            else:
+                download_and_install(plan['release'],install,progress,journal,operation_id)
+        except UpdateCancelled:
+            journal.change(operation_id,phase='cancelled',message='업데이트를 취소했습니다.')
+        except Exception as exc:
+            journal.fail(operation_id,str(exc))
+            raise
+        return journal.read()
+
+
+class UpdateCancelled(Exception):
+    pass
+
+
+def download_and_install(release,install,progress,journal,operation_id):
+    def allowed():
+        if journal.cancelled(operation_id):raise UpdateCancelled()
+    allowed()
+    journal.change(operation_id,phase='downloading')
     asset,checksum=release_asset(release)
     text=read_url(checksum['browser_download_url'],1024).decode('ascii').strip()
+    allowed()
     match=re.fullmatch(r'([a-fA-F0-9]{64})\s+\*?Codexon-Setup\.exe',text)
     if not match:raise ValueError('설치 파일 검증 정보가 올바르지 않습니다.')
     expected=match[1].lower()
@@ -160,6 +197,7 @@ def update(progress=lambda _:None, manager=None, *, plan=None):
     try:
         with urllib.request.urlopen(urllib.request.Request(asset['browser_download_url'],headers=HEADERS),timeout=20) as response, partial.open('xb') as file:
             while chunk:=response.read(1024*1024):
+                allowed()
                 total+=len(chunk)
                 if total>size or time.monotonic()>deadline:raise ValueError('다운로드가 완료되지 않았습니다.')
                 file.write(chunk);digest.update(chunk)
@@ -168,7 +206,72 @@ def update(progress=lambda _:None, manager=None, *, plan=None):
         partial.replace(output)
     finally:
         partial.unlink(missing_ok=True)
+    allowed()
+    if not journal.install_ready(operation_id,output,expected):raise UpdateCancelled()
     progress('새 버전 설치 중…')
-    # The GUI confirms installation before entering this operation.
-    launch_installer(output,install['InstallRoot'])
-    return '업데이트 설치를 시작했습니다. 연결이 끝나면 프록시도 적용됩니다.'
+    launch_installer(output,install['InstallRoot'],operation_id)
+
+
+def retry_proxy(manager,journal):
+    """Resume only the outstanding connection stage of the same operation."""
+    from .install_management import activate_proxy
+    from .update_state import scope_for
+    from .observer_state import ProcessLock
+    with ProcessLock(journal.root/'app-update-worker.lock'):
+        record=journal.read();operation_id=record.get('operation_id')
+        if not operation_id or record.get('phase') not in ('partial','failed','deferred','interrupted'):
+            raise RuntimeError('다시 적용할 연결 작업이 없습니다.')
+        if record.get('scope')!=scope_for(manager):raise RuntimeError('다른 연결의 업데이트 기록을 보존합니다.')
+        if record.get('app',{}).get('state') not in ('verified','current'):
+            raise RuntimeError('앱 설치가 완료되지 않았습니다. 업데이트를 다시 확인하세요.')
+        if getattr(sys,'frozen',False) and record.get('app',{}).get('state')=='verified' and Path(record['app']['executable']).resolve()!=Path(sys.executable).resolve():
+            raise RuntimeError('시작 메뉴에서 새 Codexon을 열어 업데이트를 계속하세요.')
+        journal.change(operation_id,phase='waiting',cancel_requested=False,defer_requested=False)
+        try:
+            result=activate_proxy(manager,operation_id=operation_id,update_root=journal.root)
+            journal.proxy_result(operation_id,result)
+        except Exception as exc:
+            journal.fail(operation_id,str(exc));raise
+        return journal.read()
+
+
+def reconcile_update(journal,manager=None):
+    """An expired timer is not failure; prove the owning process/task has ended."""
+    from .proxy_identity import same_process
+    from .observer_task import ObserverTask
+    record=journal.read();phase=record.get('phase')
+    previous=record.get('proxy',{})
+    if manager and phase in ('waiting','needs_exit') and previous.get('source_instance') and not previous.get('operation_id'):
+        from .proxy_update import BUSY
+        from .update_state import scope_for
+        if record.get('scope')!=scope_for(manager):return record
+        current=manager.update_status()
+        if current.get('source_instance')!=previous['source_instance'] or current.get('operation_id'):return record
+        if current.get('phase') in BUSY:
+            health=manager.health(timeout=3) or {};unknown=(health.get('websocket_states') or {}).get('unknown',0)
+            current={**current,'required_action':'close_client' if unknown else None,'unknown_connections':unknown,
+                     'responding':(health.get('websocket_states') or {}).get('responding',0)+health.get('http_connections',0)}
+            journal.proxy_result(record['operation_id'],current)
+        elif current.get('phase') in ('complete','failed','cancelled','interrupted'):
+            if record.get('cancel_requested'):
+                journal.proxy_result(record['operation_id'],dict(phase='cancelled'))
+            else:
+                # A worker from the previous app may only have applied its own
+                # old deployment. Queue the new target and let it prove readiness.
+                from .install_management import activate_proxy
+                try:
+                    result=activate_proxy(manager,operation_id=record['operation_id'],update_root=journal.root)
+                    journal.proxy_result(record['operation_id'],result)
+                except Exception as exc:journal.fail(record['operation_id'],str(exc))
+        return journal.read()
+    if time.time()-record.get('updated_at',0)<90:return record
+    try:
+        if phase in ('preparing','downloading'):
+            if not record.get('owner') or same_process(record['owner']):return record
+            journal.change(record['operation_id'],phase='interrupted',message='업데이트 준비가 중단되었습니다. 다시 확인하세요.')
+        elif phase=='installing':
+            task=ObserverTask(str(journal.root),role='Installer').inspect()
+            if task.get('registered') and (task.get('running') or task.get('state') in (2,4)):return record
+            journal.fail(record['operation_id'],'설치 완료를 확인하지 못했습니다. 업데이트를 다시 확인하세요.')
+    except (OSError,RuntimeError):return record
+    return journal.read()

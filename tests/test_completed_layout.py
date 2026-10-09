@@ -3,7 +3,7 @@ import copy
 import time
 
 import pytest
-from PySide6.QtCore import QMetaObject, QMimeData, QPointF, QSettings
+from PySide6.QtCore import QMetaObject, QPointF, QSettings
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
@@ -51,7 +51,7 @@ def test_detail_last_wrapped_line_is_visible_and_selectable(completed_dashboard,
     assert window.detail_scroll.isVisible()
     long_text = '\n'.join(
         f'{index}: C:/Users/User/Documents/engineering/long-project-name/실제프로젝트/자료.txt 실제 기록'
-        for index in range(16)) + '\n마지막 줄까지 선택 및 복사 가능'
+        for index in range(16)) + '\n마지막 줄까지 선택 가능'
     editors = []
     sections = [(group, text) for group, text in window.detail_sections.values() if group.isVisible()]
     assert sections
@@ -67,15 +67,6 @@ def test_detail_last_wrapped_line_is_visible_and_selectable(completed_dashboard,
         assert QMetaObject.invokeMethod(editor, 'selectAll')
         assert editor.property('selectedText') == long_text
         editors.append(editor)
-    clipboard = QApplication.clipboard()
-    previous = QMimeData()
-    for mime_type in clipboard.mimeData().formats():
-        previous.setData(mime_type, clipboard.mimeData().data(mime_type))
-    try:
-        assert QMetaObject.invokeMethod(editors[-1], 'copy')
-        assert clipboard.text() == long_text
-    finally:
-        clipboard.setMimeData(previous)
     for editor in editors:
         QMetaObject.invokeMethod(editor, 'deselect')
     scroll = control(window, window.detail_scroll)

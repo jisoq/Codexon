@@ -157,7 +157,6 @@ def test_hidden_dashboard_defers_all_page_refreshes(tmp_path,monkeypatch,shown_b
         w.tick.stop()
         calls=[]
         monkeypatch.setattr(w.quota_panel,'refresh_status',lambda:calls.append('quota'))
-        monkeypatch.setattr(w,'render_diagnostics',lambda:calls.append('diagnostics'))
         for page in range(5):
             w.current_page=page;w._display_dirty=False
             w.render(automatic=True);w.check_stale()

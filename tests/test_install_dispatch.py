@@ -32,12 +32,13 @@ def test_native_activation_requires_its_own_completed_receipt(tmp_path,monkeypat
             assert command[command.index('--report')+1]==str(self.report)
             assert '--native-install' in command and '--no-launch' in command and '--isolated-install' in command
             assert command[command.index('--language')+1]=='en'
+            assert command[command.index('--update-id')+1]=='a'*32
             if result is not None:self.report.write_text(json.dumps(result))
         def inspect(self):return dict(running=0,state=3,last_result=1 if result and result.get('error') else 0)
         def remove(self):calls.append('removed')
     monkeypatch.setattr(dispatch,'ObserverTask',Task)
     args=SimpleNamespace(install_root=tmp_path/'installed',product_dir=tmp_path/'new',language='en',
-                         no_launch=True,isolated_install=True,prepare_uninstall=False)
+                         no_launch=True,isolated_install=True,prepare_uninstall=False,update_id='a'*32)
     if result is None:
         with pytest.raises(RuntimeError,match='결과 없이'):dispatch.native_install(args)
     else:assert dispatch.native_install(args)==result

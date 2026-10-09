@@ -19,13 +19,15 @@ def main():
     from cachemonitor.overlay import install_overlay
     from cachemonitor.i18n import set_language
     from cachemonitor.theme import shared_theme
+    from cachemonitor.version import VERSION
     app=QApplication([]);load_bundled_fonts();app.setProperty('cachemonitorDisableShellIntegration',True)
     report={'model_requests':0,'captures':[]}
     for language in ('ko','en'):
         set_language(language)
-        with tempfile.TemporaryDirectory(prefix='codexon-settings-') as folder:
+        with tempfile.TemporaryDirectory(prefix='settings-',dir=args.output.resolve()) as folder:
             settings=QSettings(str(Path(folder)/'preferences.ini'),QSettings.IniFormat)
-            window=Dashboard([],start_worker=False,settings=settings,live_limits=False,manage_observer=False)
+            window=Dashboard([str(Path(folder)/'home')],start_worker=False,settings=settings,live_limits=False,manage_observer=False,
+                             index_path=str(Path(folder)/'index.sqlite'),quota_path=str(Path(folder)/'quota.sqlite'),collection_autostart=False)
             from cachemonitor.analysis_worker import AnalysisBridge
             window.worker=AnalysisBridge([],static_snapshot={})
             overlay=install_overlay(window,native_enabled=False)
@@ -49,6 +51,32 @@ def main():
                             path=args.output/f'{language}-{theme}-{width}-{category}.png'
                             assert window.grab().save(str(path))
                             report['captures'].append({'path':str(path),'actual_size':[window.width(),window.height()]})
+                        if width==1440:
+                            panel=window.update_panel;window.settings_page.reveal('about')
+                            record=panel.journal.begin('proxy',VERSION,replace=True)
+                            for phase,proxy in (
+                                ('waiting',dict(responding=2)),
+                                ('needs_exit',dict(unknown_connections=1,required_action='close_client')),
+                                ('verifying',dict(cutover_started=True)),
+                                ('partial',dict(restored=True)),
+                                ('complete',{}),
+                            ):
+                                panel.offer=None;panel.journal.change(record['operation_id'],phase=phase,
+                                    app=dict(state='verified'),proxy=proxy)
+                                panel.refresh();app.processEvents();QTest.qWait(60)
+                                if phase=='needs_exit':
+                                    assert panel.recheck.isVisible() and panel.later.isVisible()
+                                    assert not panel.button.isVisible() and not panel.execute.isVisible()
+                                if phase=='verifying':assert not any(node.isVisible() for node in (panel.cancel,panel.later,panel.execute,panel.button))
+                                assert not window.qml_errors,window.qml_errors
+                                path=args.output/f'{language}-{theme}-{width}-update-{phase}.png'
+                                assert window.grab().save(str(path));report['captures'].append({'path':str(path)})
+                            next_version=VERSION.rsplit('.',1)[0]+'.'+str(int(VERSION.rsplit('.',1)[1])+1)
+                            panel.show_plan(dict(kind='app',release=dict(tag_name='v'+next_version)))
+                            assert panel.execute.isVisible() and not panel.button.isVisible()
+                            QTest.qWait(60)
+                            path=args.output/f'{language}-{theme}-{width}-update-offered.png'
+                            assert window.grab().save(str(path));report['captures'].append({'path':str(path)})
             finally:
                 overlay.stop();window.quit_app();app.processEvents()
     set_language('ko')

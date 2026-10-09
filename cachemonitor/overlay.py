@@ -270,7 +270,7 @@ class OverlayController(QObject):
                if self.quota and (mode in self.quota.get('windows',{}) or mode in self.quota.get('unlimited_windows',[]))]
         displays=[quota_display(self.quota,m,time.time()) for m,_ in modes]
         if not displays:return ('',self.quota_issue)
-        text='계정 · '+' · '.join(label+' '+('—' if d['text']=='?' else d['text'])+
+        text='계정: '+', '.join(label+' '+('—' if d['text']=='?' else d['text'])+
             ('%' if d['remaining'] is not None else '') for (_,label),d in zip(modes,displays))
         tips=' '.join(d['tooltip'] for d in displays)
         state=('초기화 후 확인 중' if any(d.get('state')=='초기화 후 확인 중' for d in displays) or '리셋권' in self.quota_issue
@@ -497,7 +497,7 @@ class OverlayController(QObject):
         if not selection or not selection.thread_id:
             return None, '기록 확인 중'
         if selection.host != 'local':
-            return None, '원격 작업 · 로컬 기록 없음'
+            return None, '원격 작업: 로컬 기록 없음'
         matches = self.session_lookup.get(selection.thread_id,[])
         issue = self.collection_issue
         note = ('수집 시작 중' if issue == '수집 시작 중' else
@@ -798,7 +798,6 @@ def install_overlay(window, native_enabled=True):
         theme_actions[mode] = theme
     if hasattr(window, 'settings_page'):
         window.settings_page.bind_action('overlay', action)
-        window.settings_page.bind_overlay(controller)
         window.settings_page.bind_choices('theme', theme_actions)
     else:
         menu.insertAction(before,action)

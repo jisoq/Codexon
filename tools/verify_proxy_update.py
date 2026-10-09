@@ -75,6 +75,15 @@ class IdleConnections:
         self.thread.join(15)
         assert not self.thread.is_alive()
 
+    def interrupt(self):
+        asyncio.run_coroutine_threadsafe(self.sockets[0].send_json({'type':'response.interrupt'}),self.loop).result(5)
+
+    def disconnect(self):
+        async def close_peers():
+            await asyncio.gather(*(ws.close() for ws in self.sockets))
+            await asyncio.gather(*self.readers,return_exceptions=True)
+        asyncio.run_coroutine_threadsafe(close_peers(),self.loop).result(10)
+
 def idle_observation(health, requested):
     """Account for every opened peer, including the released idle-limit policy."""
     if not health:
@@ -97,7 +106,9 @@ def main():
     parser.add_argument('--expect-unsupported', action='store_true')
     parser.add_argument('--exercise-rollback', action='store_true')
     parser.add_argument('--interrupt-after-drain', action='store_true')
+    parser.add_argument('--unclassified-connection',action='store_true')
     options = parser.parse_args()
+    if options.unclassified_connection and options.idle_connections<1:parser.error('An open connection is required')
     if options.port in (8768, 8771) or not 1024 <= options.port <= 65535:
         parser.error('운영 프록시 포트를 제외한 테스트 전용 포트를 지정하세요.')
     old = options.old_exe.resolve()
@@ -144,25 +155,31 @@ def main():
         else:
             raise AssertionError(('Previous proxy connections did not become observable', m.health_state, observed))
         previous = dict(version=health['version'], instance=health['instance'], process=old_identity, role='observer')
+        if options.unclassified_connection:peers.interrupt()
         ProxyUpdate(m).publish('queued', source_instance=health['instance'], cancel_requested=False)
         updater_args = []
         if options.interrupt_after_drain:
             fixture = root / 'interrupted_updater.py'
             marker = root / 'updater-interrupted'
             constructor = f'ObserverManager({str(home)!r},{str(m.directory)!r},url={m.url!r})'
-            fixture.write_text('import sys\nfrom pathlib import Path\nsys.path.insert(0,' + repr(str(Path(__file__).resolve().parents[1])) + ')\nfrom cachemonitor.observer_control import ObserverManager\nfrom cachemonitor.proxy_update import ProxyUpdate\nsys.executable=' + repr(str(new)) + '\nupdater=ProxyUpdate(' + constructor + ')\noriginal=updater.drain\nmarker=Path(' + repr(str(marker)) + ")\ndef drain(source):\n    original(source)\n    if not marker.exists():\n        marker.write_text('old process exited')\n        raise SystemExit(75)\nupdater.drain=drain\nupdater.run()\n", encoding='utf-8')
+            fixture.write_text('import sys\nfrom pathlib import Path\nsys.path.insert(0,' + repr(str(Path(__file__).resolve().parents[1])) + ')\nfrom cachemonitor.observer_control import ObserverManager\nfrom cachemonitor.proxy_update import ProxyUpdate\nsys.executable=' + repr(str(new)) + '\nupdater=ProxyUpdate(' + constructor + ')\nupdater.manager.evidence=Path(' + repr(str(m.evidence)) + ')\noriginal=updater.drain\nmarker=Path(' + repr(str(marker)) + ")\ndef drain(source):\n    original(source)\n    if not marker.exists():\n        marker.write_text('old process exited')\n        raise SystemExit(75)\nupdater.drain=drain\nupdater.run()\n", encoding='utf-8')
             updater.start([sys.executable, str(fixture)])
             updater.start([sys.executable, str(fixture)])
         elif options.exercise_rollback:
             fixture = root / 'verification_failure.py'
             constructor = f'ObserverManager({str(home)!r},{str(m.directory)!r},url={m.url!r})'
-            fixture.write_text('import sys\nfrom pathlib import Path\nsys.path.insert(0,' + repr(str(Path(__file__).resolve().parents[1])) + ')\nfrom cachemonitor.observer_control import ObserverManager\nfrom cachemonitor.proxy_update import ProxyUpdate,PROXY_VERSION\nsys.executable=' + repr(str(new)) + '\nupdater=ProxyUpdate(' + constructor + ")\noriginal=updater.ready\ninjected=False\ndef ready(*args,**kwargs):\n    global injected\n    result=original(*args,**kwargs)\n    if not injected and args[2]==PROXY_VERSION:\n        injected=True\n        updater.publish('verifying',rejected_instance=result['instance'])\n        raise RuntimeError('Isolated verification failure injection')\n    return result\nupdater.ready=ready\nupdater.run()\n", encoding='utf-8')
+            fixture.write_text('import sys\nfrom pathlib import Path\nsys.path.insert(0,' + repr(str(Path(__file__).resolve().parents[1])) + ')\nfrom cachemonitor.observer_control import ObserverManager\nfrom cachemonitor.proxy_update import ProxyUpdate,PROXY_VERSION\nsys.executable=' + repr(str(new)) + '\nupdater=ProxyUpdate(' + constructor + ")\nupdater.manager.evidence=Path(" + repr(str(m.evidence)) + ")\noriginal=updater.ready\ninjected=False\ndef ready(*args,**kwargs):\n    global injected\n    result=original(*args,**kwargs)\n    if not injected and args[2]==PROXY_VERSION:\n        injected=True\n        updater.publish('verifying',rejected_instance=result['instance'])\n        raise RuntimeError('Isolated verification failure injection')\n    return result\nupdater.ready=ready\nupdater.run()\n", encoding='utf-8')
             updater.start([sys.executable, str(fixture)])
         else:
             updater.start([str(new), '--proxy-update', *args, *updater_args])
         deadline = time.monotonic() + (150 if options.interrupt_after_drain else 75)
+        exit_guidance=False
         while time.monotonic() < deadline:
             state = read_json(m.directory / 'proxy-update.json')
+            if options.unclassified_connection and not exit_guidance and state.get('required_action')=='close_client':
+                assert state['unknown_connections']>=1 and same_process(old_identity)
+                assert not m.health(timeout=3).get('draining')
+                exit_guidance=True;peers.disconnect()
             if state.get('phase') in ('complete', 'failed'):
                 break
             time.sleep(0.5)
@@ -174,6 +191,7 @@ def main():
             print(json.dumps(result))
             return
         assert state.get('phase') == ('failed' if options.exercise_rollback else 'complete'), state
+        if options.unclassified_connection:assert exit_guidance,'Unknown connection did not produce exit guidance'
         if options.interrupt_after_drain:
             assert marker.exists()
         until = time.monotonic() + 5
@@ -210,6 +228,7 @@ def main():
         assert m.config_path.read_bytes() == before
         assert health['active_connections'] == 0, health
         result = {'phase': state['phase'], 'previous': previous, 'rollback_verified': options.exercise_rollback, 'updater_restart_verified': options.interrupt_after_drain, 'current': {**{k: health.get(k) for k in ('version', 'role', 'executable', 'instance', 'pid')}, 'executable': str(expected_executable), 'role': 'observer'}, 'idle_connections_opened': options.idle_connections, 'idle_connections_retired_before_update': options.idle_connections-observed['active_connections'], 'idle_connections_drained': observed['active_connections'], 'configuration_preserved': True, 'instance_replaced': True, 'new_executable_verified': True}
+        result['connection_exit_guidance_verified']=exit_guidance
         (root / 'result.json').write_text(json.dumps(result, indent=2))
         print(json.dumps(result))
     finally:

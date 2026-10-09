@@ -97,7 +97,7 @@ def test_unpriced_call_excludes_only_its_bracketing_observation_edge(tmp_path):
         assert summary['valid']==2 and summary['delta']==7 and summary['calls']==2
         bad=[c for c in summary['intervals'] if c['excluded']]
         assert len(bad)==1 and (bad[0]['start'],bad[0]['end'])==(200,300)
-        assert '필수 토큰·단가 누락' in bad[0]['excluded']
+        assert '필수 토큰 또는 단가 누락' in bad[0]['excluded']
     finally:ledger.close()
 
 

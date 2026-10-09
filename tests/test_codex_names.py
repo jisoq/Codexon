@@ -88,7 +88,7 @@ def test_duplicate_project_names_do_not_merge_or_filter_each_other(tmp_path):
         choices=project_choices([first,second])
         assert len(choices['projects'])==2
         assert len(set(choices['project_labels'].values()))==2
-        assert all(name.startswith('구김평가 · ') for name in choices['project_labels'].values())
+        assert all(name.startswith('구김평가, ') for name in choices['project_labels'].values())
         analysis=analyze([first,second])
         overview=overview_view(analysis,0,10030)
         assert len(overview['sources'])==2 and len({row['label'] for row in overview['sources']})==2

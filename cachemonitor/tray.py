@@ -79,7 +79,7 @@ class TrayWindow(QuickHost):
             self._quota_icon_signature=signature
             self.tray.setIcon(tray_icon(error=error,warning=warning,text=display['text']))
         tip=display['tooltip']
-        if error: tip+='\n수집·분석 상태 확인 필요'
+        if error: tip+='\n수집과 분석 상태 확인 필요'
         if len(self.snapshot.get('homes',[]))>1: tip+='\n한도 기준: 첫 번째 Codex 홈'
         if getattr(self,'quota_issue',''): tip+='\n'+self.quota_issue
         if self.taskbar_quota.enabled and self.taskbar_quota.embedding_error:
@@ -209,6 +209,11 @@ class TrayWindow(QuickHost):
         self._closing=True
         monitor=getattr(self,'update_monitor',None)
         if monitor:monitor.stop()
+        update=getattr(self,'update_panel',None)
+        if update:
+            update.timer.stop()
+            if update.journal and update.journal.read().get('phase') in ('preparing','downloading'):
+                update.journal.cancel()
         if hasattr(self,'save_preferences'):self.save_preferences()
         controller=getattr(self,'service_controller',None)
         if controller:controller.stop()
@@ -225,6 +230,7 @@ class TrayWindow(QuickHost):
         managed=getattr(self,'manage_observer',False)
         collection=bool(getattr(self,'app_services',None) and self.app_services.collection)
         if handoff or not (managed or collection):
+            if update and update.operation:update.operation.wait()
             if controller and controller.operation:controller.operation.wait()
             if self.worker:self.worker.wait()
             self.finish_quit();return

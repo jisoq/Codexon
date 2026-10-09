@@ -75,7 +75,7 @@ def footer(m, include_call=True):
     if not include_call:note=''
     active=data.get('active_requests',int(data.get('request',{}).get('state')=='진행'))
     alert=m.speed_alert().get('active')
-    text=m.status_text().replace(' · ',': ') or ('출력 속도 저하: 근거 보기' if alert else '') or note or (f'진행 중: {active}개' if active else '')
+    text=m.status_text() or ('출력 속도 저하: 근거 보기' if alert else '') or note or (f'진행 중: {active}개' if active else '')
     return text,'warning' if alert or note else 'secondary'
 
 

@@ -104,7 +104,7 @@ Item {
             HoverHandler { id: hover;cursorShape:root.viewState.navigationColumn !== undefined && column !== root.viewState.navigationColumn ? Qt.ArrowCursor : Qt.PointingHandCursor;onHoveredChanged: { if(hovered) root.hoveredRow=row;else if(root.hoveredRow===row) root.hoveredRow=-1 } }
             UiToolTip { objectName: "cell-overflow-tip"; visible: hover.hovered && cellLabel.truncated; text: display }
             TapHandler { onTapped: { table.forceActiveFocus(); table.keyboardColumn=column; root.node.click(row,column) } }
-            Accessible.role: Accessible.Cell; Accessible.name: display; Accessible.description: (cacheZero ? appLanguage.text("캐시 읽기 0 · ") : "") + tooltip
+            Accessible.role: Accessible.Cell; Accessible.name: display; Accessible.description: (cacheZero ? appLanguage.text("캐시 읽기 0: ") : "") + tooltip
         }
         Keys.onPressed: event => {
             let row = root.viewState.selected

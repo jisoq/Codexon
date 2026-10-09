@@ -62,7 +62,7 @@ def test_english_overlay_translates_visible_text_before_detail_layout(monkeypatc
         assert tr(Verbatim('세션 2회 40.56초'))=='세션 2회 40.56초'
     finally:
         w.close();set_language('ko');app.processEvents()
-    assert tr('40.56초 · 2회')=='40.56초 · 2회'
+    assert tr('40.56초, 2회')=='40.56초, 2회'
 
 
 def test_call_selection_is_by_identifier_and_never_changes_monitor():
@@ -144,7 +144,7 @@ def test_collection_errors_show_concise_observed_states_without_paths_or_traceba
     try:
         data=summary();data['_collection']={'errors':errors.copy()};w.set_content(data,'수집 오류');m=w.content_model
         values=[''.join(item[0]) if isinstance(item[0],list) else item[0] for item in m.detail_items()]
-        for expected in ('기록 손상 · 2건','기록 접근 실패','기록 읽기 실패','기록 수집 지연'):assert values.count(expected)==1
+        for expected in ('기록 손상, 2건','기록 접근 실패','기록 읽기 실패','기록 수집 지연'):assert values.count(expected)==1
         assert '수집 오류' not in values and m.status_text()=='수집 오류 +4'
         visible='\n'.join(values)+m.detailBody.state['accessible']
         for diagnostic in ('Traceback','C:\\private','/private/backend.py','PermissionError','sqlite3','RuntimeError'):assert diagnostic not in visible

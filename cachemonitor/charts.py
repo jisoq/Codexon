@@ -149,7 +149,7 @@ class UsageTrend(AnalyticalPlot):
             if self.samples:
                 sample_bottom=self.height()-10
                 p.fillRect(QRectF(x-min(32,step*.6)/2,sample_bottom-48*n/maxn,min(32,step*.6),48*n/maxn),self.color('muted'))
-            self.remember(QRectF(x-step/2,0,step,self.height()),row,f"{row.get('label','')} · {value_text(value,self.metric)} · 유효 {n:,} / 대상 {row.get('N',row.get('calls',n)):,}")
+            self.remember(QRectF(x-step/2,0,step,self.height()),row,f"{row.get('label','')}, {value_text(value,self.metric)}, 유효 {n:,} / 대상 {row.get('N',row.get('calls',n)):,}")
         if self.samples:
             p.setPen(self.color('muted'));p.drawText(QRectF(0,self.height()-60,left-10,50),Qt.AlignRight|Qt.AlignVCenter,'표본 수\n'+f'{maxn:,}')
 
@@ -169,12 +169,12 @@ class SourceBars(AnalyticalPlot):
             if value is not None:p.fillRect(QRectF(left,y+step/2-5,span*(value-low)/(peak-low),10),QColor(shared_theme().color(row.get('color',COLORS[i%8]))))
             p.setPen(self.color('ink'));share=row.get('share')
             p.drawText(QRectF(right+8,y,162,step/2),Qt.AlignRight|Qt.AlignVCenter,
-                       f"{usd(value)} · {share*100:.1f}%" if share is not None else usd(value))
+                       f"{usd(value)}, {share*100:.1f}%" if share is not None else usd(value))
             p.setPen(self.color('muted'));font=p.font();small=font;small.setPixelSize(12);p.setFont(small)
             priced,calls=row.get('known',row.get('n',0)),row.get('calls',row.get('N',0))
             sample=call_count(priced,calls)+'호출'
             p.drawText(QRectF(right+8,y+step/2,162,step/2),Qt.AlignRight|Qt.AlignVCenter,sample);font.setPixelSize(14);p.setFont(font)
-            self.remember(QRectF(0,y,self.width(),step),row,f"{row.get('label','')} · {usd(value)} · "+('산정 ' if priced<calls else '')+sample)
+            self.remember(QRectF(0,y,self.width(),step),row,f"{row.get('label','')}, {usd(value)}, "+('산정 ' if priced<calls else '')+sample)
 
 def comparison_axis(rows, metric, view='distribution'):
     """Shared linear bounds cover every visible mark, excluding hidden outliers."""
@@ -214,7 +214,7 @@ class ComparisonChart(AnalyticalPlot):
             if row.get('value') is not None:self.mark(p,x(row['value']),y,color_index)
             p.setPen(self.color('ink'))
             text=value_text(row.get('value'),self.metric)
-            if row.get('suppressed'):text='— · 표본 10개 미만'
+            if row.get('suppressed'):text='—, 표본 10개 미만'
             elif row.get('value') is None and self.metric=='duration':text='시간 관측 없음'
             p.drawText(QRectF(right+12,y-27 if self.view=='difference' else y-22,195,22),Qt.AlignVCenter,text)
             p.setPen(self.color('muted'))
@@ -222,9 +222,9 @@ class ComparisonChart(AnalyticalPlot):
                 delta=row.get('delta');relative=row.get('relative')
                 diff=f'{delta:+.1f}%p' if self.metric=='cache_ratio' and delta is not None else value_text(delta,self.metric)
                 relative_text=f'{relative:+.1f}%' if relative is not None else '—'
-                p.drawText(QRectF(right+12,y-5,195,22),Qt.AlignVCenter,f'기준 대비 {diff} · {relative_text}')
+                p.drawText(QRectF(right+12,y-5,195,22),Qt.AlignVCenter,f'기준 대비 {diff}, {relative_text}')
             p.drawText(QRectF(right+12,y+17 if self.view=='difference' else y,195,24),Qt.AlignVCenter,f"유효 {row.get('n',0):,} / 대상 {row.get('N',0):,}")
-            self.remember(QRectF(0,y-step/2,self.width(),step),row,f"{row.get('id')} · {text} · 유효 {row.get('n',0):,} / 대상 {row.get('N',0):,}")
+            self.remember(QRectF(0,y-step/2,self.width(),step),row,f"{row.get('id')}, {text}, 유효 {row.get('n',0):,} / 대상 {row.get('N',0):,}")
         p.setPen(self.color('muted'));p.drawText(QRectF(left,self.height()-24,80,24),Qt.AlignLeft,value_text(low,self.metric))
         p.drawText(QRectF(right-140,self.height()-24,140,24),Qt.AlignRight,value_text(peak,self.metric))
     def paint_scatter(self,p):
@@ -232,7 +232,7 @@ class ComparisonChart(AnalyticalPlot):
         size=(self.width(),self.height())
         samples=cache[1] if cache and cache[0]==size else [r for r in self.rows if r.get('x') is not None and r.get('y') is not None]
         if not samples:
-            p.setPen(self.color('muted'));p.drawText(self.rect(),Qt.AlignCenter,'환산액·시간 교집합 표본 없음');return
+            p.setPen(self.color('muted'));p.drawText(self.rect(),Qt.AlignCenter,'환산액과 시간이 모두 확인된 표본 없음');return
         left,top,w,h=88,28,max(20,self.width()-112),self.height()-80
         xmin,xmax=dynamic_bounds(r['x'] for r in samples);ymin,ymax=dynamic_bounds(r['y'] for r in samples)
         for f in (0,.5,1):
@@ -249,7 +249,7 @@ class ComparisonChart(AnalyticalPlot):
             self._scatter_geometry=(size,samples,points,cells)
         for x,y,row in points:
                 self.mark(p,x,y,row.get('target_index',0),3)
-                self.remember(QRectF(x-5,y-5,10,10),row,f"{row.get('id','')} · {value_text(row['x'],'completion_latency_ms')} · {usd(row['y'])} · 표본 1")
+                self.remember(QRectF(x-5,y-5,10,10),row,f"{row.get('id','')}, {value_text(row['x'],'completion_latency_ms')}, {usd(row['y'])}, 표본 1")
         for (gx,gy),rows in cells.items():
             rect=QRectF(left+gx*6,top+gy*6,6,6);shade=self.color('accent');shade.setAlpha(min(255,80+len(rows)*12));p.fillRect(rect,shade)
             self.remember(rect,{'records':rows,'kind':'scatter_cell'},f'{len(rows):,}개 실제 표본')
@@ -270,7 +270,7 @@ class TokenComposition(AnalyticalPlot):
     def paint(self,painter):
         p=self.base();p.setPen(self.color('ink'))
         title='입력' if self.side=='input' else '출력'
-        p.drawText(QRectF(0,0,self.width(),24),Qt.AlignLeft,title+' · '+('미확인' if self.total is None else f'{self.total:,} 토큰'))
+        p.drawText(QRectF(0,0,self.width(),24),Qt.AlignLeft,title+', '+('미확인' if self.total is None else f'{self.total:,} 토큰'))
         p.fillRect(QRectF(0,30,self.width(),14),self.color('secondary'));x=0
         for i,row in enumerate(self.rows):
             amount=row['total'];width=self.width()*amount/self.total if self.total else 0
@@ -278,4 +278,4 @@ class TokenComposition(AnalyticalPlot):
             y=52+i*26;p.fillRect(QRectF(0,y+8,8,8),self.color(row['color']));p.setPen(self.color('ink'))
             p.drawText(QRectF(16,y,self.width()*.43,24),Qt.AlignLeft|Qt.AlignVCenter,row['label'])
             percentage=f'{100*amount/self.total:.1f}%' if self.total else '해당 없음' if self.total==0 else '미확인'
-            p.drawText(QRectF(self.width()*.4,y,self.width()*.6,24),Qt.AlignRight|Qt.AlignVCenter,f'{amount:,} · {percentage}')
+            p.drawText(QRectF(self.width()*.4,y,self.width()*.6,24),Qt.AlignRight|Qt.AlignVCenter,f'{amount:,}, {percentage}')

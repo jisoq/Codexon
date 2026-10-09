@@ -19,7 +19,7 @@ Item {
     UiButton {
         id: openNavigation
         visible: root.narrow && !root.detailed
-        text: appLanguage.text("프로젝트 · 세션")
+        text: appLanguage.text("프로젝트와 세션")
         onClicked: root.navigationOpen = !root.navigationOpen
     }
     NodeChild {

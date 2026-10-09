@@ -18,7 +18,7 @@ def sample(mode='slow'):
     from cachemonitor.overlay_data import OverlaySummaries
     speeds=[100]*10 + ([] if mode=='normal' else [35]*3) + ([100]*2 if mode=='recovered' else [])
     now=time.time()
-    s=Session('speed-demo','synthetic-speed-demo',title='더미 · 속도 안내 미리보기')
+    s=Session('speed-demo','synthetic-speed-demo',title='더미, 속도 안내 미리보기')
     for i in range(len(speeds)):
         s.add_usage(now-3000+i*100,f'demo-{i}',dict(input_tokens=80000,cached_input_tokens=72000,
                     cache_write_input_tokens=0,output_tokens=2000,reasoning_output_tokens=500),
@@ -48,15 +48,15 @@ def main():
     settings=QSettings(str(Path(temporary.name)/'settings.ini'),QSettings.IniFormat)
     settings.setValue('ui/theme','dark')
     controller=OverlayController(settings,native_enabled=False)
-    host=QWidget();host.setWindowTitle('Codexon · 속도 저하 더미 오버레이')
+    host=QWidget();host.setWindowTitle('Codexon - 속도 저하 더미 오버레이')
     layout=QVBoxLayout(host)
-    label=QLabel('더미 데이터 · 기준 100 → 최근 35 tok/s\n오버레이의 ⓘ를 클릭하면 상세 안내가 열립니다.')
+    label=QLabel('더미 데이터, 기준 100 → 최근 35 tok/s\n오버레이의 ⓘ를 클릭하면 상세 안내가 열립니다.')
     label.setWordWrap(True);layout.addWidget(label)
     data=sample()
     def update(mode):
         nonlocal data
         data=sample(mode)
-        label.setText({'slow':'더미 · 속도 저하 65% · ⓘ를 클릭해 상세 안내 확인',
+        label.setText({'slow':'더미, 속도 저하 65%, ⓘ를 클릭해 상세 안내 확인',
                        'normal':'', 'recovered':''}[mode])
         poll()
     for title,mode in [('저하 상황','slow'),('정상 상황','normal'),('회복 상황','recovered')]:

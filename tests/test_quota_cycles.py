@@ -85,7 +85,7 @@ def test_reset_jitter_natural_manual_account_and_regression_boundaries(tmp_path)
         assert len(groups)==5
         assert groups[1]['reason']=='예정 리셋 확인'
         assert groups[1]['boundary']==1001
-        assert groups[2]['reason']=='한도 시각 변경 · 관측 구간 분리'
+        assert groups[2]['reason']=='한도 시각 변경: 관측 구간 분리'
         assert all('수동 리셋' not in g['reason'] for g in groups)
         assert groups[3]['discontinuous']
         assert groups[4]['reason']=='계정 변경'

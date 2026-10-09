@@ -61,7 +61,8 @@ class Manager:
         self.health_state='healthy' if self.version else 'refused'
         if not self.version:return None
         return dict(version=self.version,pid=123,control_id=self.control,instance=self.instance,
-            status='ok',draining=self.draining,active_connections=self.connections)
+            status='ok',draining=self.draining,active_connections=self.connections,
+            websocket_states={'responding':self.requests,'idle':self.connections-self.requests,'unknown':0})
 
 
 @pytest.fixture(params=[False],ids=['observer'])
@@ -106,11 +107,25 @@ def test_unclassified_connection_waits_without_blocking_ingress(setup,monkeypatc
         if pending[0]:
             assert not m.draining and not m.task.starts
             assert not (m.directory/('proxy-control-'+m.control+'.json')).exists()
+            assert read_json(u.path)['required_action']=='close_client'
+            assert read_json(u.path)['unknown_connections']==1
             pending[0]=False
         wait(n)
     monkeypatch.setattr(m,'health',observed);u.sleep=finish
     u.run()
     assert read_json(u.path)['phase']=='complete' and len(m.task.starts)==1
+
+
+def test_cancel_after_swap_started_finishes_verified_rollback(setup,monkeypatch):
+    m,u=setup;m.fail_new=True
+    start=m.task.start
+    def cancelled_start(*args,**kwargs):
+        start(*args,**kwargs)
+        u.publish(read_json(u.path)['phase'],cancel_requested=True)
+    monkeypatch.setattr(m.task,'start',cancelled_start)
+    u.run()
+    assert m.version=='old' and read_json(u.path)['restored']
+    assert read_json(u.path)['phase']=='failed'
 
 
 @pytest.mark.parametrize('recovered',['idle','unknown','other-instance'])

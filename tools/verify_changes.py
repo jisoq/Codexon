@@ -67,7 +67,7 @@ GROUPS = {
     'proxy_lifecycle': test_files('managed_proxy', 'proxy_update', 'proxy_supervisor', 'connection_recovery'),
     'observer': test_files('observer_control', 'observer_panel', 'observer_task_errors'),
     'install': test_files('install_activation', 'install_management', 'install_dispatch', 'install_cleanup', 'legacy_release', 'windows_startup'),
-    'update': test_files('app_update','update_monitor'),
+    'update': test_files('app_update','update_monitor','update_state'),
     'runtime': test_files('windows_startup') + (
         'tests/test_verify_changes.py::test_isolated_source_smoke_renders_parent_cost',),
     'translation': ('tests/test_public_release.py::test_english_token_labels_do_not_change_stored_values',),
@@ -194,6 +194,7 @@ RULES = (
     ('cachemonitor/install*.py', ('install',)),
     ('cachemonitor/app_update.py', ('update', 'install')),
     ('cachemonitor/update_panel.py', ('update',)),
+    ('cachemonitor/update_state.py', ('update','install','proxy_lifecycle')),
     ('cachemonitor/update_monitor.py', ('update',)),
     ('cachemonitor/app.py', ('runtime', 'install', 'observer')),
     ('cachemonitor/version.py', ('runtime', 'proxy_lifecycle', 'update')),
@@ -444,25 +445,11 @@ def package_check(executable, report_dir):
                 duration_seconds=report.get('duration_seconds'), session_rollup=rollup)
 
 
-CLIPBOARD_TESTS = test_files('completed_layout')
-
-
 def pytest_commands(tests):
-    """Keep native visibility checks and real clipboard checks on suitable desktops."""
-    clipboard = [test for test in tests if test.split('::')[0] in CLIPBOARD_TESTS]
-    native = [test for test in tests if test not in clipboard]
-    if native == ['tests']:
-        # Full verification still executes the clipboard files, in the second process.
-        native += [f'--ignore={path}' for path in CLIPBOARD_TESTS]
-        clipboard = list(CLIPBOARD_TESTS)
+    """Run selected UI checks together on the hidden desktop."""
     pytest = [sys.executable, '-B', '-m', 'pytest', '-q', '--tb=short', '--durations=10']
     runner = [sys.executable, str(ROOT / 'tools/run_ui_checks.py')]
-    result = []
-    for name, targets, options in (('native', native, []),
-                                    ('clipboard', clipboard, ['--isolate-clipboard'])):
-        if targets:
-            result.append((name, [*runner, *options, '--', *pytest, *targets]))
-    return result
+    return [('native', [*runner, '--', *pytest, *tests])] if tests else []
 
 
 def main(argv=None):

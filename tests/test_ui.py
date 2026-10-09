@@ -224,8 +224,8 @@ def test_event_navigation_retains_conditions_and_exact_evidence_phases(dashboard
     evidence=w.detail_sections['evidence'][1].text()
     assert '기준 캐시 적중률  90.0%' in evidence
     assert '기준 캐시 읽기 평균  900' in evidence
-    assert '기준 호출 · 0, 1, 2, 3, 4' in evidence
-    assert '발생 호출 · 5, 6' in evidence and '회복 호출 · 7, 8' in evidence
+    assert '기준 호출: 0, 1, 2, 3, 4' in evidence
+    assert '발생 호출: 5, 6' in evidence and '회복 호출: 7, 8' in evidence
     assert '읽는 중' not in w.record_message.text()
     assert not w.input_composition.isVisible() and not w.output_composition.isVisible()
     assert not w.detail_sections['usage'][0].isVisible() and not w.detail_sections['pricing'][0].isVisible()

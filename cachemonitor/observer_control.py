@@ -377,11 +377,15 @@ class ObserverManager:
 
     def turn_off(self):
         with ProcessLock(self.control_lock):
+            from .proxy_update import BUSY
+            update=read_json(self.directory/'proxy-update.json')
+            if update.get('cutover_started') and update.get('phase') in BUSY:
+                raise RuntimeError('업데이트 적용 또는 복원 완료 후 프록시를 끄세요.')
             from .app_services import disable_resume
             disable_resume(self)
             return self.recover_direct()
 
-    def update_proxy(self):
+    def update_proxy(self, *, operation_id=None, update_root=None):
         from .proxy_update import ProxyUpdate, BUSY
         with ProcessLock(self.control_lock):
             updater=ProxyUpdate(self)
@@ -393,6 +397,8 @@ class ObserverManager:
             prior=read_json(updater.path)
             recovering=bool(prior.get('source')) and not prior.get('restored') and prior.get('phase') in (*BUSY,'failed')
             health=self.health(timeout=3)
+            if health and prior.get('phase')=='failed' and health.get('instance')==(prior.get('source') or {}).get('instance') and not health.get('draining'):
+                recovering=False
             if (not health and not recovering) or not updater.target.enabled():
                 raise RuntimeError('실행 중인 프록시가 없습니다.')
             if not getattr(sys,'frozen',False):
@@ -402,11 +408,14 @@ class ObserverManager:
             if not recovering:
                 atomic_write(updater.path,b'{}')
                 updater.publish('queued',source_instance=health['instance'],cancel_requested=False,
+                                operation_id=operation_id,update_root=str(update_root) if update_root else None,
                                 scope=updater.target.scope,
                                 message='프록시 업데이트 예약 중…')
+            elif operation_id:
+                updater.publish(prior['phase'],operation_id=operation_id,update_root=str(update_root),cancel_requested=False)
             try:task.start(command,autostart=False)
             except Exception:
-                updater.publish('failed',message='업데이트 예약 실패 · 기존 연결 유지 중');raise
+                updater.publish('failed',message='업데이트 예약 실패: 기존 연결 유지 중');raise
         return self.status()
 
     def cancel_update(self):
@@ -414,7 +423,7 @@ class ObserverManager:
         with ProcessLock(self.control_lock):
             updater=ProxyUpdate(self)
             phase=read_json(updater.path).get('phase')
-            if phase in BUSY:
+            if phase in ('queued','waiting') and not read_json(updater.path).get('cutover_started'):
                 updater.publish(phase,cancel_requested=True,message='예약 취소 중…')
         return self.status()
 

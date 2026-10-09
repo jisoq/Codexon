@@ -24,7 +24,7 @@ PRICE_SNAPSHOT = json.dumps({'rates': {k: asdict(v) for k, v in RATES.items()},
 PRICE_ID = hashlib.sha256(PRICE_SNAPSHOT.encode()).hexdigest()[:16]
 RESET_TOLERANCE = 120
 MAX_OBSERVATION_GAP = 30 * 60
-DISCONTINUITY = '사용률 불연속: 감소·충돌 후 복귀량은 신규 소모로 계산하지 않음'
+DISCONTINUITY = '사용률 불연속: 감소, 충돌 후 복귀량은 신규 소모로 계산하지 않음'
 
 
 def ledger_path(index_path=None):
@@ -94,7 +94,7 @@ def split_cycles(observations, manual_resets=()):
         obs = group['observations']
         tail = [r for r in group.get('rejected',[]) if not obs or r['at'] > obs[-1]['at']]
         if tail and obs:
-            groups.append({'id':'uncertain:'+tail[0]['id'], 'reason':'사용률 불연속 · 끝점 미확정',
+            groups.append({'id':'uncertain:'+tail[0]['id'], 'reason':'사용률 불연속 (끝점 미확정)',
                            'boundary':obs[-1]['at'], 'observations':[obs[-1],tail[-1]],
                            'rejected':tail, 'discontinuous':True})
 
@@ -104,7 +104,7 @@ def split_cycles(observations, manual_resets=()):
         if kind == 0:
             close_tail()
             epochs.clear()  # Explicit replenishment may keep the same reset timestamp.
-            append_group(item, '리셋권 사용 · 사용자 기록', manual_reset=item)
+            append_group(item, '리셋권 사용, 사용자 기록', manual_reset=item)
             groups[-1]['id']='manual:'+item['id']
             continue
         if not groups:
@@ -127,13 +127,13 @@ def split_cycles(observations, manual_resets=()):
         if item['account']!=previous['account']:
             reason='계정 변경'
         elif any(item.get(k)!=previous.get(k) for k in ('plan','bucket','separate')):
-            reason='요금제·한도 변경'
+            reason='요금제 또는 한도 변경'
         elif item['minutes']!=previous['minutes']:
-            reason='한도 창 변경 · 경계 미확인'
+            reason='한도 창 변경 (경계 미확인)'
         elif item['reset'] and previous['reset'] and abs(item['reset']-previous['reset'])>RESET_TOLERANCE:
             shift=item['reset']-previous['reset']
             natural=item['at']>=previous['reset']-RESET_TOLERANCE and abs(shift-item['minutes']*60)<=RESET_TOLERANCE
-            reason='예정 리셋 확인' if natural else '한도 시각 변경 · 관측 구간 분리'
+            reason='예정 리셋 확인' if natural else '한도 시각 변경: 관측 구간 분리'
             if natural:boundary=previous['reset']
         elif item['used'] < previous['used']:
             group['rejected'].append(item)
@@ -167,11 +167,11 @@ def estimate(cost, delta, n, blocked=()):
 
 def partition_coverage(groups, issues):
     """Cut only observation edges intersecting an evidenced counter discrepancy."""
-    gaps = [r for r in issues if r['reason'].startswith(('누계 차액 증가','로컬 호출 없는 한도 증가','필수 토큰·단가 누락','요청 모드 미확인'))
+    gaps = [r for r in issues if r['reason'].startswith(('누계 차액 증가','로컬 호출 없는 한도 증가','필수 토큰 또는 단가 누락','요청 모드 미확인'))
             and r['start'] is not None and r['end'] is not None]
     indexed={}
     for gap in gaps:
-        reason=('누계 차액 증가: 호출 비용 누락·누계 보정 미해결'
+        reason=('누계 차액 증가: 호출 비용 누락, 누계 보정 미해결'
                 if gap['reason'].startswith('누계') else gap['reason'])
         indexed.setdefault(reason,[]).append(gap)
     for reason,items in indexed.items():
@@ -208,7 +208,7 @@ def partition_coverage(groups, issues):
             part['boundary']=start
             part['rejected']=[r for r in group.get('rejected',[]) if start<r['at']<=end]
             if index:part.pop('manual_reset',None)
-            if part['coverage_blocked']:part['reason']='비용·소모 대응 미확인 구간'
+            if part['coverage_blocked']:part['reason']='비용, 소모 대응 미확인 구간'
             elif index:part['reason']='대응 미확인 경계 이후 관측'
             result.append(part)
     return result
@@ -306,7 +306,7 @@ def quota_statistics(report, start=None, end=None, include_mode_assumptions=Fals
             '수집 대기' if waiting else '가정 필요' if assumption_only else
             '누적 대기' if insufficient else '제외')
         if cycle.get('forward_tracking'):
-            status = ' · '.join(cycle.get('assumptions', []))
+            status = ', '.join(cycle.get('assumptions', []))
         intervals.append({**cycle, 'per_percent':result['per_percent'],
             'excluded':result['reasons'], 'sensitivity':result['sensitivity'], 'status':status,
             'assumed_per_percent':assumption['per_percent'] if assumption_only else None,
@@ -799,10 +799,10 @@ class QuotaLedger:
                     for gap in session.get('coverage_gaps', []):
                         self.db.execute('insert or replace into coverage_issues values(?,?,?,?,?)',
                                         (home, session.get('id',''),gap['start'],gap['end'],
-                                         f"누계 차액 증가 {gap['tokens']}토큰 · {gap['start']}"))
+                                         f"누계 차액 증가 {gap['tokens']}토큰, {gap['start']}"))
                 if usage_errors:
                     self.db.execute('insert or replace into coverage_issues values(?,?,?,?,?)',
-                                    (home, '', None, None, '로컬 호출 기록 읽기 실패: '+' · '.join(usage_errors)))
+                                    (home, '', None, None, '로컬 호출 기록 읽기 실패: '+', '.join(usage_errors)))
                 signatures[home]=signature
                 self._coverage_signatures=signatures
             unclassified = sum(bool(s.get('unclassified')) for s in snapshot['sessions'] if s['home'] == home)
@@ -910,7 +910,7 @@ class QuotaLedger:
                 for row in calls[bisect_right(call_times,start):bisect_right(call_times,end)]:
                     if row['cost'] is None and start<row['ts']<=end and ALIASES.get(row['model'],row['model']) not in separate:
                         issues.append({'start':row['ts'],'end':row['ts'],
-                            'reason':'요청 모드 미확인' if row['service_tier']=='미확인' and token_cost({**dict(row),'service_tier':'Standard'})['cost'] is not None else '필수 토큰·단가 누락'})
+                            'reason':'요청 모드 미확인' if row['service_tier']=='미확인' and token_cost({**dict(row),'service_tier':'Standard'})['cost'] is not None else '필수 토큰 또는 단가 누락'})
             # A rise after a confirmed unchanged endpoint with no intervening
             # calls is unresolved attribution, irrespective of tick size.
             obs=group['observations']
@@ -1018,7 +1018,7 @@ class QuotaLedger:
             if group.get('boundary_pending'):
                 blocked.append('요청 진행 중 경계: 비용 분리 불가')
             if tracking is not None and not tracking['complete'] and group.get('provisional'):
-                blocked.append('로컬 작업·비용 집계 대기')
+                blocked.append('로컬 작업, 비용 집계 대기')
             if tracking is not None and any(r['start'] < end and (r['end'] is None or r['end'] > start)
                     for r in tracking.get('pending_responses', [])):
                 blocked.append('완료 요청의 비용 기록 수집 대기')
@@ -1034,7 +1034,7 @@ class QuotaLedger:
                 blocked.append('계정 식별 미확인')
             if any(r.get('plan') not in ('free','plus','pro','team','business','enterprise','edu')
                    or r.get('bucket') != 'codex' for r in matched):
-                blocked.append('요금제·한도 정보 미확인')
+                blocked.append('요금제 또는 한도 정보 미확인')
             if any(r['reset'] and r['at'] >= r['reset'] for r in matched):
                 blocked.append('관측 시점에 만료된 한도')
             if any(not r['reset'] for r in matched):
@@ -1061,13 +1061,13 @@ class QuotaLedger:
             if pending:
                 blocked.append('한도 시점까지 호출 수집 대기')
             if group.get('rejected') and not group.get('discontinuous'):
-                assumptions.append(f"상충·역행 관측 {len(group['rejected'])}건을 끝점에서 제외 · 순소모 사용")
+                assumptions.append(f"상충, 역행 관측 {len(group['rejected'])}건을 끝점에서 제외, 순소모 사용")
             for issue in issues:
-                if issue['reason'].startswith(('누계 차액 증가','로컬 호출 없는 한도 증가','필수 토큰·단가 누락','요청 모드 미확인')):
+                if issue['reason'].startswith(('누계 차액 증가','로컬 호출 없는 한도 증가','필수 토큰 또는 단가 누락','요청 모드 미확인')):
                     continue
                 elif not issue['reason'].startswith('진행 중'):
                     if (issue['start'] is None or issue['start'] <= end) and (issue['end'] is None or issue['end'] > start):
-                        assumptions.append('누계·수집 근거 일부 미확인: 기간 전체 누락으로 단정하지 않음')
+                        assumptions.append('누계, 수집 근거 일부 미확인: 기간 전체 누락으로 단정하지 않음')
             if not issues and state and state['unclassified']:
                 assumptions.append('미분류 차액 있음: 구간별 증가 여부 확인 필요')
             if live and i == len(groups)-1 and (tracking is None or group.get('provisional')):

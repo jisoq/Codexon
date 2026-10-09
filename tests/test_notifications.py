@@ -64,7 +64,7 @@ def test_confirmed_alerts_reach_tray_and_click_opens_evidence(tmp_path,monkeypat
         assert sent[-1]=='Codexon: 로컬 프록시 연결 거부'
         window.tray.messageClicked.emit();app.processEvents()
         assert window.current_page==4 and window.nav.currentRow()==-1
-        assert window.notification_details.toggle.isChecked()
+        assert window.settings_page.current_category()=='notifications' and window.notification_log.isVisible()
         rows=window.notification_log.model().rows
         assert '요청: asked → 응답: reported' in rows[1]['detail']
         assert '응답 ID: r' in rows[1]['detail']

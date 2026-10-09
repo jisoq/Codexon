@@ -81,7 +81,7 @@ class CodexNames:
 
     def resolve(self, meta):
         tid = meta['id']
-        title = label(meta.get('name')) or label(meta.get('title')) or label(meta.get('agent_nickname')) or f'작업 {tid[:8]}·{tid[-6:]}'
+        title = label(meta.get('name')) or label(meta.get('title')) or label(meta.get('agent_nickname')) or f'작업 {tid[:8]}, {tid[-6:]}'
         cwd = meta.get('cwd') or ''
         result = {'display_title': title}
         identity = meta.get('project_id')

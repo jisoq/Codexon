@@ -43,8 +43,8 @@ def summary(rows):
     rows = list(rows)
     counts = Counter(r.get('model_match', UNKNOWN) for r in rows)
     known = counts['일치'] + counts['불일치']
-    return (f"모델 검증 {known:,}/{len(rows):,}건 · 일치 {counts['일치']:,} · "
-            f"불일치 {counts['불일치']:,} · 확인 불가 {len(rows)-known:,}")
+    return (f"모델 검증 {known:,}/{len(rows):,}건, 일치 {counts['일치']:,}, "
+            f"불일치 {counts['불일치']:,}, 확인 불가 {len(rows)-known:,}")
 
 
 class EvidenceStore:
@@ -206,7 +206,7 @@ class EvidenceReader:
                     'transport': next(iter(transports)) if exact else '미확인',
                     'transport_source': 'response_id' if exact else 'conflict',
                     'transport_ts': max(evidence, key=lambda e: e['seq'])['ts'],
-                    'transport_evidence': '프록시 관측 · 응답 ID 일치' if exact else '동일 응답 ID의 연결 방식 관측 충돌',
+                    'transport_evidence': '프록시 관측, 응답 ID 일치' if exact else '동일 응답 ID의 연결 방식 관측 충돌',
                     'transport_endpoint': '', 'transport_turn': '',
                 }
             timing={}

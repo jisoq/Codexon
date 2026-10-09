@@ -123,8 +123,8 @@ class Activity:
             if typ in ('response.create', 'response.steer'):
                 self.pending[lane].append(obj.get('event_id', ''))
                 self.idle_since = None
-            elif typ == 'response.cancel':self.cancelling.add(lane)
-            elif typ not in ('response.cancel', 'ping', 'pong', 'ack', 'session.update'):
+            elif typ in ('response.cancel','response.interrupt'):self.cancelling.add(lane)
+            elif typ not in ('ping', 'pong', 'ack', 'session.update'):
                 self.unclassified(typ, True)
         return True
 

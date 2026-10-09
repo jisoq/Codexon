@@ -26,15 +26,27 @@ class ProxyDrain:
             if current and current['instance'] != source['instance']:
                 raise RuntimeError('종료 확인 중 다른 인스턴스가 발견되었습니다.')
             if current and (not drain_sent):
-                if (current.get('websocket_states') or {}).get('unknown') and (not self.force_requested()):
-                    self.publish('waiting', message='진행 여부를 판정할 수 없는 기존 연결의 종료 대기 / 통신 유지 중')
+                states=current.get('websocket_states')
+                unknown=(states or {}).get('unknown',0)
+                if states is None:unknown=current.get('active_connections',0)
+                if unknown and (not self.force_requested()):
+                    self.publish('waiting', required_action='close_client',unknown_connections=unknown,
+                                 responding=(states or {}).get('responding',0),
+                                 message='연결한 앱을 정상 종료하세요. Codexon은 켜 두세요. 연결 종료를 확인하면 자동으로 계속합니다.')
+                    self.sleep(1)
+                    continue
+                responding=(states or {}).get('responding',0)+current.get('http_connections',0)
+                if responding and not self.force_requested():
+                    self.publish('waiting',required_action=None,unknown_connections=0,responding=responding,
+                                 message='진행 중인 응답이 끝나기를 기다립니다. 새 작업은 업데이트 완료 후 시작하세요.')
                     self.sleep(1)
                     continue
                 control_id = current.get('control_id', '')
                 if not re.fullmatch('[0-9a-f]{32}', control_id):
                     raise RuntimeError('실행 중인 구버전에 안전 종료 제어가 없습니다. 기존 응답을 보존했습니다.')
                 self.before_drain(source)
-                self.publish('waiting', message='진행 중 응답 정산 대기')
+                self.publish('switching',required_action=None,responding=0,unknown_connections=0,
+                             message='연결을 마무리하고 기록을 저장합니다.')
                 if len(source.get('processes', [])) > 1:
                     with ProcessLock(m.control_lock, timeout=5):
                         self.allowed()
@@ -62,5 +74,9 @@ class ProxyDrain:
                 if self.clock() >= exit_deadline:
                     raise RuntimeError('기존 프로세스 종료 확인 시간 초과 / 중복 기동하지 않았습니다.')
             else:
-                self.publish('waiting', message='진행 중 응답 정산 대기')
+                unknown=(states or {}).get('unknown',0)
+                self.publish('waiting' if unknown else 'switching',required_action='close_client' if unknown else None,
+                             unknown_connections=unknown,
+                             responding=(states or {}).get('responding',0)+(current or {}).get('http_connections',0),
+                             message='마지막 응답 전달과 기록 저장을 기다립니다.')
             self.sleep(1)

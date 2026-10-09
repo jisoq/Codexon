@@ -78,7 +78,7 @@ class CacheHealth:
                 self.state='회복 확인';self.reason='동일 조건의 유효 호출 2회 회복'
                 self.baseline.clear();self.baseline.extend(self.recovery_rows);self.candidate_rows=[]
             else:
-                self.state='캐시 저하 의심';self.reason=f"저하 호출 {event['count']}회 · 기준 {len(event['baseline_keys'])}호출"
+                self.state='캐시 저하 의심';self.reason=f"저하 호출 {event['count']}회, 기준 {len(event['baseline_keys'])}호출"
         elif bad:
             self.candidate_rows.append(row)
             if len(self.candidate_rows)>=2:
@@ -89,8 +89,8 @@ class CacheHealth:
                     baseline_keys=[r['key'] for r in base],occurrence_keys=[r['key'] for r in self.candidate_rows],
                     recovery_keys=[],state='캐시 저하 의심',resolved=False)
                 self.events.append(self.incident)
-                self.state='캐시 저하 의심';self.reason=f'저하 호출 {len(self.candidate_rows)}회 · 기준 {len(base)}호출'
-            else:self.state='판정 보류';self.reason='연속 저하 1회 · 다음 유효 관측 필요'
+                self.state='캐시 저하 의심';self.reason=f'저하 호출 {len(self.candidate_rows)}회, 기준 {len(base)}호출'
+            else:self.state='판정 보류';self.reason='연속 저하 1회: 다음 유효 관측 필요'
         else:
             self.candidate_rows=[]
             self.state='캐시 읽기 0' if row['cached']==0 else '판정 보류'

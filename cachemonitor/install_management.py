@@ -81,7 +81,7 @@ def register(root, product, recovery, *, isolated=False):
             raise
 
 
-def activate_proxy(manager):
+def activate_proxy(manager, *, operation_id=None, update_root=None):
     from .retired_cache import retire
     retire(manager)
     manager.cleanup_legacy_check()
@@ -91,14 +91,31 @@ def activate_proxy(manager):
         return dict(phase='off', message='프록시 사용 꺼짐')
     health = status.get('health') or {}
     if health:
-        return manager.update_proxy().get('update') or {}
+        kwargs=dict(operation_id=operation_id,update_root=update_root) if operation_id else {}
+        return manager.update_proxy(**kwargs).get('update') or {}
     if status.get('probe_state')=='refused' and manager.state().get('enabled'):
         manager.attach_supervisor()
-        return dict(phase='complete', message='연결 구성요소 시작 완료')
+        from .proxy_target import ProxyTarget
+        from .proxy_identity import deployment
+        from .version import PROXY_VERSION
+        target=ProxyTarget(manager);distribution=deployment(sys.executable)
+        deadline=time.monotonic()+30;consecutive=0;last=None
+        while time.monotonic()<deadline:
+            health=manager.health(timeout=1)
+            if health:
+                source=target.capture(health);command=target.replacement(source)
+                valid=target.ready(health,{**source,'instance':''},command,PROXY_VERSION,distribution)
+                consecutive=consecutive+1 if valid and last==health['instance'] else 1 if valid else 0
+                last=health['instance']
+                if consecutive>=3:return dict(phase='complete',message='연결 구성요소 실행 확인 완료',result=dict(
+                    version=health['version'],instance=last,executable=health.get('executable'),sha256=distribution['sha256']))
+            else:consecutive=0
+            time.sleep(1)
+        raise RuntimeError('새 연결 구성요소의 실행 상태를 확인하지 못했습니다.')
     return dict(phase='recovery_required', message='시작 메뉴의 Codexon 연결 복구를 실행해 주세요.')
 
 
-def finish(root, product, recovery, *, isolated=False, launch=True, language='ko'):
+def finish(root, product, recovery, *, isolated=False, launch=True, language='ko',update_id=None):
     root = Path(root).resolve()
     product = contained(product, root/'versions')
     recovery = contained(recovery, root/'maintenance')
@@ -108,6 +125,12 @@ def finish(root, product, recovery, *, isolated=False, launch=True, language='ko
         raise RuntimeError('설치 파일 검증에 실패했습니다. 이전 버전을 유지합니다.')
     if hashlib.sha256(recovery.read_bytes()).hexdigest()!=manifest.get('recovery_sha256'):
         raise RuntimeError('복구 도구 검증에 실패했습니다. 이전 버전을 유지합니다.')
+    from .update_state import UpdateState,valid_id
+    journal=UpdateState(root)
+    if update_id:
+        request=journal.read()
+        if not valid_id(update_id) or request.get('operation_id')!=update_id or request.get('target_version')!=manifest['version']:
+            raise RuntimeError('요청한 업데이트와 설치 파일이 다릅니다. 이전 설치를 유지합니다.')
     with ProcessLock(root/'install.lock',timeout=10):
         report = root/('runtime-'+uuid.uuid4().hex+'.json')
         check = subprocess.run([str(exe),'--verify-runtime',str(report)],timeout=45,
@@ -154,17 +177,21 @@ def finish(root, product, recovery, *, isolated=False, launch=True, language='ko
         try:queue(root)
         except (OSError,ValueError,RuntimeError) as exc:receipt['cleanup_warning']=str(exc)
         if not isolated:
+            update_id=journal.installed(update_id,product,manifest)
             from .observer_task import retire_desktop_startups
             try:retire_desktop_startups(root)
             except RuntimeError as exc:receipt['startup_warning']=str(exc)
             result_path = root/'connection-update.json'
             try:
-                result = subprocess.run([str(exe),'--complete-install','--control-report',str(result_path)],
+                command=[str(exe),'--complete-install','--control-report',str(result_path)]
+                if update_id:command+=['--update-id',update_id,'--update-root',str(root)]
+                result = subprocess.run(command,
                                         timeout=60,creationflags=subprocess.CREATE_NO_WINDOW)
                 receipt['connection'] = read_json(result_path)
                 if result.returncode:raise RuntimeError('Connection update did not complete')
             except (OSError,RuntimeError,subprocess.TimeoutExpired):
                 receipt['connection'] = dict(phase='recovery_required',message='연결 복구를 실행해 주세요.')
+                if update_id:journal.proxy_result(update_id,receipt['connection'])
             if launch:
                 from .app_services import suspended
                 if suspended(connection_manager()):
@@ -275,9 +302,23 @@ def complete_main():
     from .connection_recovery import target
     parser=argparse.ArgumentParser()
     parser.add_argument('--control-report',type=Path,required=True)
+    parser.add_argument('--update-id')
+    parser.add_argument('--update-root',type=Path)
     args=parser.parse_args()
+    from .update_state import UpdateState,valid_id,scope_for
+    journal=UpdateState(args.update_root) if args.update_root and valid_id(args.update_id) else None
     try:
-        result=activate_proxy(connection_manager())
+        manager=connection_manager()
+        if journal:
+            record=journal.read()
+            if record.get('operation_id')!=args.update_id:raise RuntimeError('이전 업데이트 결과를 현재 작업에 적용하지 않습니다.')
+            scope=record.get('scope')
+            if scope:
+                manager=target(Path(scope['home']),Path(scope['evidence']).parent,scope['url'])
+                manager.evidence=Path(scope['evidence'])
+            else:journal.change(args.update_id,scope=scope_for(manager))
+        result=activate_proxy(manager,operation_id=args.update_id,update_root=args.update_root)
     except Exception as exc:result=dict(phase='recovery_required',error=str(exc))
+    if journal:journal.proxy_result(args.update_id,result)
     atomic_write(args.control_report,json.dumps(result,ensure_ascii=False).encode())
     return 1 if result.get('error') else 0

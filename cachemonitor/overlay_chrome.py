@@ -66,7 +66,7 @@ class OverlayChrome(QuickHost):
         self.press = None
         self.moved = False
         names = {'header': '세션 제목 이동', 'toolbar': '투명도', 'icon': '복원', 'actions': '세션 조작'}
-        self.setWindowTitle('Cache Monitor · ' + names[kind])
+        self.setWindowTitle('Cache Monitor - ' + names[kind])
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.setFocusPolicy(Qt.NoFocus)
@@ -277,7 +277,7 @@ class OverlayDetail(QuickHost):
 
     def __init__(self, content):
         super().__init__(None, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
-        self.setWindowTitle('Cache Monitor · 호출 상세')
+        self.setWindowTitle('Cache Monitor - 호출 상세')
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.setFocusPolicy(Qt.NoFocus)
@@ -312,7 +312,7 @@ class OverlayLinks(QuickHost):
     interaction_started=Signal()
     def __init__(self,content):
         super().__init__(None,Qt.Tool|Qt.FramelessWindowHint|Qt.WindowStaysOnTopHint)
-        self.setWindowTitle('Cache Monitor · 기록 링크');self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setWindowTitle('Cache Monitor - 기록 링크');self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.view=NavigationModel(content);self.wheel_forwarder=None
         content.changed.connect(self.sync)

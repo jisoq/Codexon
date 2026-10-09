@@ -36,10 +36,28 @@ class ProxyUpdate:
             data = read_json(self.path)
             data.update(phase=phase, updated_at=time.time(), target_version=PROXY_VERSION, **extra)
             atomic_write(self.path, json.dumps(data, ensure_ascii=False).encode())
+        if data.get('operation_id') and data.get('update_root'):
+            from .update_state import UpdateState
+            UpdateState(data['update_root']).proxy_result(data['operation_id'],data)
 
     def allowed(self):
-        if read_json(self.path).get('cancel_requested') or not self.target.enabled():
+        data=read_json(self.path)
+        if data.get('cutover_started'):return
+        if data.get('operation_id') and data.get('update_root'):
+            from .update_state import UpdateState
+            if UpdateState(data['update_root']).cancelled(data['operation_id']):raise UpdateCancelled()
+        if data.get('cancel_requested') or not self.target.enabled():
             raise UpdateCancelled()
+
+    def begin_switch(self, source=None):
+        with ProcessLock(self.manager.control_lock,timeout=5):
+            self.allowed()
+            data=read_json(self.path)
+            if data.get('operation_id') and data.get('update_root') and not data.get('cutover_started'):
+                from .update_state import UpdateState
+                if not UpdateState(data['update_root']).begin_switch(data['operation_id']):raise UpdateCancelled()
+            self.publish('switching',cutover_started=True,required_action=None,
+                         message='기존 연결을 마무리하고 교체합니다.')
 
     def preflight(self):
         from .proxy_identity import deployment
@@ -51,7 +69,7 @@ class ProxyUpdate:
         value=read_json(report)
         if (result.returncode or value.get('version')!=VERSION
                 or value.get('proxy_version')!=PROXY_VERSION or value.get('errors')!=[]):
-            raise RuntimeError('새 배포본 실행 검사 실패 · 기존 프록시를 유지합니다.')
+            raise RuntimeError('새 배포본 실행 검사에 실패했습니다. 기존 프록시를 유지합니다.')
         return distribution
 
     def ready(self, source, command, version, distribution=None):
@@ -65,16 +83,17 @@ class ProxyUpdate:
             last_instance=instance
             if consecutive>=3:return health
             self.sleep(1)
-        raise RuntimeError('실제 버전·역할·경로·준비 완료 확인 실패')
+        raise RuntimeError('실제 버전, 역할, 경로, 준비 완료 확인 실패')
 
     def drain(self, source):
         from .proxy_drain import ProxyDrain
         return ProxyDrain(self.manager,self.target,allowed=self.allowed,publish=self.publish,
+                          before_drain=self.begin_switch,
                           clock=self.clock,sleep=self.sleep).run(source)
 
     def start(self,command,source):
         self.allowed()
-        if not self.target.stopped(source):raise RuntimeError('기존 프로세스·포트·실행 잠금이 남아 있습니다.')
+        if not self.target.stopped(source):raise RuntimeError('기존 프로세스, 포트, 실행 잠금이 남아 있습니다.')
         # Recheck the user's off/cancel action while holding the same control lock.
         with ProcessLock(self.manager.control_lock,timeout=5):
             self.allowed()
@@ -115,7 +134,7 @@ class ProxyUpdate:
         self.publish('rollback',message='이전 실행 명령으로 재기동 중')
         self.start(source['command'],source)
         self.ready(source,source['command'],source['version'])
-        self.publish('failed',message='업데이트 실패 · 이전 버전 복구 확인 완료',restored=True)
+        self.publish('failed',message='업데이트 실패: 이전 버전 복구 확인 완료',restored=True)
 
     def run(self):
         try:return self.replace()
@@ -178,10 +197,11 @@ class ProxyUpdate:
                     if current:self.drain(source)
                     elif not self.target.stopped(source):self.drain(source)
                     self.allowed()
+                    self.begin_switch()
                     self.publish('starting',message='새 프록시 기동 중')
                     try:
                         self.start(command,source)
-                        self.publish('verifying',message='새 버전·역할·실행 경로 확인 중')
+                        self.publish('verifying',message='새 버전, 역할, 실행 경로 확인 중')
                         ready=self.ready(source,command,PROXY_VERSION,distribution)
                         self.publish('complete',message='프록시 업데이트 완료',result=dict(
                             version=ready['version'],instance=ready['instance'],pid=ready['pid'],
