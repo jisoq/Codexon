@@ -93,12 +93,17 @@ def test_missing_and_cyclic_parents_remain_reachable():
 
 
 def test_empty_search_actions_restore_rows_and_preserve_route(dashboard,tmp_path):
+    import time
     from PySide6.QtTest import QTest
     from cachemonitor.dashboard import choose
     from cachemonitor.quick_qa import click,control,walk
     w=dashboard;w.change_page(2);w.activate_record(0);w.activate_record(0);w.activate_record(0)
     route=(w.history_navigation.project,w.selected_session,w.selected_turn,w.record_view)
-    choose(w.mode,'Fast');w.filter_changed();w.search.setText('없는 작업 12345');QTest.qWait(150)
+    choose(w.mode,'Fast');w.filter_changed();w.search.setText('없는 작업 12345')
+    deadline=time.monotonic()+3
+    while w.search_timer.isActive() or w.record_rows:
+        assert time.monotonic()<deadline, 'Search did not finish rendering its empty result'
+        QTest.qWait(10)
     assert not w.record_rows
     title=next(item for item in walk(control(w,w.table)) if item.objectName()=='table-empty-title')
     assert title.property('text')=='검색 조건에 맞는 기록 없음'

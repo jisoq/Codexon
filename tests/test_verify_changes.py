@@ -128,3 +128,24 @@ def test_isolated_source_smoke_renders_parent_cost(tmp_path):
     assert report['session_rollup']['descendants']==1
     assert report['session_rollup']['cost']>report['session_rollup']['own']
     assert report['model_requests']==report['live_quota_requests']==0
+
+
+def test_environment_failure_stops_before_tests_and_preserves_baseline(tmp_path,monkeypatch,capsys):
+    import tools.verify_changes as verify
+    import tools.check_environment as environment
+    baseline=tmp_path/'last-success.json'
+    baseline.write_text(json.dumps({'files':{'cachemonitor/dashboard.py':'old'}}),encoding='utf-8')
+    original=baseline.read_bytes()
+    monkeypatch.setattr(verify,'BASELINE',baseline)
+    monkeypatch.setattr(verify,'REPORTS',tmp_path/'reports')
+    monkeypatch.setattr(verify,'file_hashes',lambda:{'cachemonitor/dashboard.py':'changed'})
+    problem=dict(kind='unlocked_import',module='yaml',file='tests/test_release_pipeline.py',line=1)
+    monkeypatch.setattr(environment,'check_environment',lambda:dict(errors=[problem]))
+    def unexpected(*args,**kwargs):raise AssertionError('Tests must not run after failed preflight')
+    monkeypatch.setattr(verify.subprocess,'run',unexpected)
+    assert verify.main([])==2
+    result=json.loads(capsys.readouterr().out)
+    assert result['result']=='environment_failed' and result['errors']==[problem]
+    assert baseline.read_bytes()==original
+    report=json.loads(__import__('pathlib').Path(result['report']).read_text(encoding='utf-8'))
+    assert 'pytest' not in report and report['environment']['errors']==[problem]

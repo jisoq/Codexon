@@ -114,7 +114,8 @@ def explorer(engine,result,selection):
     elif view=='sessions':
         records=[r for k,r in hierarchy['items'].items() if r['project_id']==project and k not in hierarchy['parent']]
     elif view=='children':records=[hierarchy['items'][k] for k in hierarchy['children'].get(scope,[])]
-    if view=='requests':
+    request_ordinal=None
+    if scope and (view=='requests' or turn):
         full=engine.sessions.get(scope,{}).get('whole_turns',{})
         all_turns=engine.sessions.get(scope,{}).get('prepared',{}).get('turn_records',{})
         ids=set(all_turns)|{k[2] for k in full}
@@ -122,7 +123,8 @@ def explorer(engine,result,selection):
             start=all_turns.get(t,{}).get('started_at')
             return (start if start is not None else min((r['ts'] for r in full.get((*scope,t),[])),default=float('inf')),t)
         numbers={t:i+1 for i,t in enumerate(sorted(ids,key=position))}
-        records=[dict(r,ordinal=numbers.get(r.get('turn')),ts=position(r.get('turn'))[0]) for r in records]
+        request_ordinal=numbers.get(turn)
+        if view=='requests':records=[dict(r,ordinal=numbers.get(r.get('turn')),ts=position(r.get('turn'))[0]) for r in records]
     records=ordered(records,sort)
     tree_key=(cache_key,tuple(sorted(selection.get('expanded',[]))))
     cached_tree=getattr(engine,'_history_tree',None)
@@ -144,7 +146,7 @@ def explorer(engine,result,selection):
     selected_identity=selection.get('call_identity')
     detail=engine.record(*selected_identity) if selected_identity else None
     event_keys={str(k) for field in ('baseline_keys','occurrence_keys','recovery_keys') for k in (event or {}).get(field,[])}
-    return dict(path=path,view=view,session=scope,turn=turn,metadata=session,group={k:v for k,v in hierarchy['rollups'].get(scope,{}).items() if k!='members'},project=project,summary=summary,child_count=len(hierarchy['children'].get(scope,[])),
+    return dict(path=path,view=view,session=scope,turn=turn,request_ordinal=request_ordinal,metadata=session,group={k:v for k,v in hierarchy['rollups'].get(scope,{}).items() if k!='members'},project=project,summary=summary,child_count=len(hierarchy['children'].get(scope,[])),
         records=records,parents=parents,parent_kind=parent_kind,partial_parents=any(r.get('known',0)<r.get('calls',0) for r in parents) if parent_kind=='sessions' else False,available=available,detail=detail,
         detail_in_scope=bool(detail and any(identity(r)==identity(detail) for r in records)),
         event=event,event_rows=[r for r in scope_rows if (r['home'],r['sid'])==scope and str(identity(r)[2]) in event_keys])

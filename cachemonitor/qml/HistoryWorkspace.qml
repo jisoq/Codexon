@@ -11,14 +11,14 @@ Item {
     property string routeToken: node.state.routeToken || ""
     onRouteTokenChanged: navigationOpen = false
     readonly property real navigationWidth: narrow ? 0 : 248
-    readonly property real sideWidth: wide ? 400 : 0
+    readonly property real sideWidth: wide && detailed ? 520 : 0
     readonly property real mainX: navigationWidth ? navigationWidth + 16 : 0
     readonly property real mainWidth: width - mainX - (sideWidth ? sideWidth + 16 : 0)
     onWidthChanged: node.setAvailableWidth(width)
     Component.onCompleted: node.setAvailableWidth(width)
     UiButton {
         id: openNavigation
-        visible: root.narrow && !root.detailed
+        visible: root.narrow
         text: appLanguage.text("프로젝트와 세션")
         onClicked: root.navigationOpen = !root.navigationOpen
     }
@@ -31,23 +31,15 @@ Item {
         Rectangle { anchors.fill: parent; color: appTheme.palette.surface; z: -1 }
     }
     NodeChild {
-        node: root.node.nodes[2]
-        x: root.wide ? root.width - 400 : root.mainX
-        y: root.narrow ? 42 : 0
-        width: root.wide ? 400 : root.mainWidth
-        height: root.wide ? root.height : 72
-        visible: !root.detailed
-    }
-    NodeChild {
         node: root.node.nodes[1]
-        x: root.mainX; y: root.detailed || root.wide ? 0 : (root.narrow ? 122 : 80)
+        x: root.mainX; y: root.narrow ? 42 : 0
         width: root.mainWidth; height: root.height - y
         visible: !root.detailed || root.wide
     }
     NodeChild {
-        node: root.node.nodes[3]
-        x: root.wide ? root.width - 400 : root.mainX; y: 0
-        width: root.wide ? 400 : root.mainWidth; height: root.height
+        node: root.node.nodes[2]
+        x: root.wide ? root.width - root.sideWidth : root.mainX; y: root.narrow ? 42 : 0
+        width: root.wide ? root.sideWidth : root.mainWidth; height: root.height-y
         visible: root.detailed
     }
 }

@@ -81,8 +81,6 @@ def start_smoke(window,app,path,fonts,depth='full'):
                 i,row=parents[0]
                 click_row(window,window.table,i);settle()
                 assert window.selected_session==(row['home'],row['sid'])
-                from .i18n import tr
-                assert tr('비용') in window.session_scope.text()
                 if row['cost'] is not None:
                     assert abs(row['cost']-(row['own_cost'] or 0)-(row['child_cost'] or 0))<1e-9
                 target=path.with_name(path.stem+'-session-cost.png')

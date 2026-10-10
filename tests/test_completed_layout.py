@@ -10,6 +10,7 @@ from PySide6.QtWidgets import QApplication
 from cachemonitor.core import Session
 from cachemonitor.dashboard import Dashboard
 from cachemonitor.quick_qa import control, walk
+from cachemonitor.ui_details import Details
 
 
 def _snapshot():
@@ -56,6 +57,8 @@ def test_detail_last_wrapped_line_is_visible_and_selectable(completed_dashboard,
     sections = [(group, text) for group, text in window.detail_sections.values() if group.isVisible()]
     assert sections
     for group, text in sections:
+        # Detail disclosures must be expanded before testing their selectable text.
+        if isinstance(group, Details):group.toggle.setChecked(True)
         text.setText(long_text)
     QTest.qWait(100)
     for group, text in sections:

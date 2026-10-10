@@ -263,7 +263,10 @@ def test_connection_close_races_preserve_other_response_and_release_slots(tmp_pa
                             else:
                                 now[0]+=2
                                 assert (await ws.receive_json())['response']['output']==payload
-                                assert (await asyncio.wait_for(ws.receive(),2)).type==web.WSMsgType.CLOSE
+                                terminal=await asyncio.wait_for(ws.receive(),2)
+                                # Concurrent cleanup can consume the close frame before receive resumes.
+                                assert terminal.type in (web.WSMsgType.CLOSE,web.WSMsgType.CLOSED)
+                                assert ws.closed and ws.close_code==1001 and ws.exception() is None
                     for batch in range(4):await asyncio.gather(*(churn(batch*4+i) for i in range(4)))
                     for _ in range(100):
                         health=await (await client.get(proxy+'/health')).json()

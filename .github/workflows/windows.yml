@@ -57,6 +57,8 @@ jobs:
           cache-dependency-path: requirements-release.lock
       - name: Install locked dependencies
         run: python -m pip install -r requirements-release.lock
+      - name: Check source and test environment before running checks
+        run: python tools/check_environment.py
       - name: Plan checks against the actual change base
         id: plan
         shell: pwsh
