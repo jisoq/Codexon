@@ -66,6 +66,10 @@ These figures describe time added by the proxy, not total response time or model
 
 ## Updates and recovery
 
+On Windows, Codexon registers the GUI with Windows Error Reporting for user-approved restart after a crash or hang. A restart opens the dashboard with CPU rendering and the same data locations, without adding a watchdog process. Normal exit and installer handoff remove the registration. This does not change login startup preferences.
+
+Windows only offers this restart after at least 60 seconds of runtime, and system policy can suppress the error dialog. It does not guarantee unattended recovery or recover a process terminated through Task Manager. You can also launch `Codexon.exe --software-rendering` manually. CPU rendering can change performance and some visual effects. A GUI crash leaves the independently running collector and proxy available; exiting Codexon normally still stops its managed services.
+
 Use **Settings → About → Check for updates**. For connection problems, open **Codexon Connection Recovery** from Start. You can also open recovery from Settings → Codex connection.
 
 ## Local data and removal

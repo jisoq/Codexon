@@ -16,6 +16,7 @@ pytestmark = pytest.mark.skipif(sys.platform != 'win32', reason='Windows taskbar
 
 @pytest.mark.parametrize('dark',[False,True])
 def test_taskbar_text_uses_taskbar_theme_when_app_theme_disagrees(tmp_path,monkeypatch,dark):
+    from PySide6.QtQuick import QQuickItem
     from cachemonitor import taskbar
     from cachemonitor.theme import shared_theme
     from cachemonitor.token_colors import contrast_ratio,ui_palette
@@ -25,11 +26,27 @@ def test_taskbar_text_uses_taskbar_theme_when_app_theme_disagrees(tmp_path,monke
     monkeypatch.setattr(taskbar,'dark_taskbar',lambda:dark)
     indicator=TaskbarQuota(QSettings(str(tmp_path/'taskbar.ini'),QSettings.IniFormat))
     try:
+        indicator.resize(100,36)
+        indicator.show()
         background=ui_palette(default_appearance(dark))['surface']
-        for remaining in (80,5):
-            indicator.set_display(dict(text=str(remaining),remaining=remaining),'weekly','fixture')
+        for remaining in (80,5,9.99,10,0,None):
+            text='?' if remaining is None else str(remaining)
+            indicator.set_display(dict(text=text,remaining=remaining),'weekly','fixture')
+            expected=('#ff6b6b' if dark else '#b42318') if remaining is not None and remaining<10 else indicator.view.state['foreground']
+            assert indicator.view.state['valueColor']==expected
             assert contrast_ratio(indicator.view.state['foreground'],background)>=4.5
             assert contrast_ratio(indicator.view.state['valueColor'],background)>=4.5
+            deadline=time.monotonic()+3
+            while True:
+                app.processEvents()
+                values=[item for item in indicator.quick.rootObject().findChildren(QQuickItem)
+                        if item.property('text')==indicator.value.text()]
+                if values and values[0].width()>0 and values[0].property('color').name()==expected:
+                    break
+                assert time.monotonic()<deadline, 'Taskbar value did not render'
+                QTest.qWait(10)
+            assert not indicator.quick.grabFramebuffer().isNull()
+        assert not indicator.qml_errors
     finally:indicator.close();indicator.destroy()
 
 

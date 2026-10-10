@@ -24,7 +24,8 @@ def start_smoke(window,app,path,fonts,depth='full'):
         if window.snapshot.get('index',{}).get('loading',False) or window.analysis_pending:
             if time.monotonic()-started<180:QTimer.singleShot(250,finish);return
         errors=[]
-        report={'framework':'PySide6 / Qt Quick','depth':depth,'errors':errors,'fonts':fonts,'screens':[]}
+        report={'framework':'PySide6 / Qt Quick','depth':depth,'errors':errors,'fonts':fonts,'screens':[],
+                'renderer':str(window.quick.quickWindow().rendererInterface().graphicsApi())}
         try:
             assert not window.snapshot.get('usage_errors',window.snapshot.get('errors',[])),window.snapshot.get('errors')
             assert not window.quota_service or not window.quota_service.live,'Smoke must disable live allowance RPC'

@@ -353,6 +353,7 @@ def test_quit_waits_responsively_and_handoff_does_not_stop_services(tmp_path,mon
     from PySide6.QtTest import QTest
     from cachemonitor.dashboard import Dashboard
     app=QApplication.instance() or QApplication([])
+    previous_shell=app.property('cachemonitorDisableShellIntegration')
     app.setProperty('cachemonitorDisableShellIntegration',True)
     release=threading.Event();entered=threading.Event();finished=[]
     def stop(self,**kwargs):entered.set();assert release.wait(10)
@@ -378,6 +379,7 @@ def test_quit_waits_responsively_and_handoff_does_not_stop_services(tmp_path,mon
         release.set()
         if getattr(window,'shutdown_operation',None):window.shutdown_operation.wait()
         window.quitting=True;window.close();window.deleteLater();app.processEvents()
+        app.setProperty('cachemonitorDisableShellIntegration',previous_shell)
 
 
 def test_exit_inventory_uses_exact_home_and_session(tmp_path):

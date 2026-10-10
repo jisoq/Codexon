@@ -335,7 +335,8 @@ class TaskbarQuota(QuickHost):
         from .overlay_appearance import default_appearance
         dark = dark_taskbar()
         palette=ui_palette(default_appearance(dark))
-        theme = (dark, self._warning, self.devicePixelRatioF(),palette['ink'],palette['warning'])
+        warning_color = '#ff6b6b' if dark else '#b42318'
+        theme = (dark, self._warning, self.devicePixelRatioF(),palette['ink'],warning_color)
         if theme == self._theme:
             return
         self._theme = theme

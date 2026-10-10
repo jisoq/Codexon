@@ -165,7 +165,8 @@ def main():
                 with window.worker.lock:queue_sizes.append(len(window.worker.commands)+int(window.worker.pending is not None))
             def navigate(page):
                 item=control(window,window.nav)
-                delegate=next(x for x in walk(item) if x.property('index')==page and x.metaObject().indexOfProperty('modelData')>=0)
+                row=window.navigation_pages.index(page)
+                delegate=next(x for x in walk(item) if x.property('index')==row and x.metaObject().indexOfProperty('modelData')>=0)
                 point=delegate.mapToScene(QPointF(delegate.width()/2,delegate.height()/2))
                 QTest.mouseClick(window.quick,Qt.LeftButton,pos=point.toPoint())
             def type_search(clear=False):
@@ -203,6 +204,7 @@ def main():
             overlay.show();QTest.qWait(50)
             window.quick.grabFramebuffer()
             samples.clear();last[0]=time.perf_counter();probe.start(10)
+            cpu_started=time.process_time();work_started=time.perf_counter()
             for page in (1,2,0):sample('page_first',lambda page=page:navigate(page))
             for iteration in range(args.samples):
                 for page in (1,2,0):sample('page_revisit',lambda page=page:navigate(page))
@@ -256,17 +258,24 @@ def main():
                 samples['hover_dispatch'].append((time.perf_counter()-started)*1000)
             for i in range(30):sample('resize',lambda i=i:window.resize(1480+i%2*20,1000))
             probe.stop()
+            cpu_seconds=time.process_time()-cpu_started;work_seconds=time.perf_counter()-work_started
             report=dict(sessions=len(sessions),calls=sum(len(s['history']) for s in sessions),live=args.live,
                 scale=args.scale,renderer=str(window.quick.quickWindow().rendererInterface().graphicsApi()),dpr=window.devicePixelRatioF(),
                 measurement='Qt input delivery through settled view; scroll render synchronization through afterRendering, excluding framebuffer readback; physical presentation latency unavailable on hidden desktop',
                 timings={k:summary(v) for k,v in samples.items()},event_loop_intervals=summary(heartbeat),
                 scroll_render_work=summary(frame_gaps),qml_errors=len(window.qml_errors),
-                memory_private_bytes=memory,pending_commands_max=max(queue_sizes,default=0))
+                memory_private_bytes=memory,pending_commands_max=max(queue_sizes,default=0),
+                gui_cpu_seconds=cpu_seconds,workload_seconds=work_seconds,
+                gui_cpu_one_core_percent=100*cpu_seconds/work_seconds)
             if profiler:
                 import io,pstats
                 stream=io.StringIO();pstats.Stats(profiler,stream=stream).sort_stats('cumulative').print_stats(25)
                 report['profile']=stream.getvalue()
             target=Path(args.output);target.parent.mkdir(parents=True,exist_ok=True)
+            for width,height in ((1120,760),(1440,940)):
+                window.resize(width,height);settle()
+                window.grab().save(str(target.with_name(target.stem+f'-{width}.png')))
+            overlay.grab().save(str(target.with_name(target.stem+'-overlay.png')))
             target.write_text(json.dumps(report,indent=2),encoding='utf-8')
             import sys
             if sys.stdout:print(json.dumps(report),flush=True)
