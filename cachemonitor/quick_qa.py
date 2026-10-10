@@ -68,6 +68,8 @@ def click_row(host,node,row,column=0):
     import time
     render_plot(host,node)
     table=table_view(host,node)
+    if node.state.get('freezeFirstColumn') and column==0:
+        table=next(item for item in walk(control(host,node)) if item.objectName()=='frozen-column')
     node.scrollTo(node.model().index(row,column))
     # Find the actual delegate, including rows which were virtualized previously.
     deadline=time.monotonic()+2

@@ -94,7 +94,7 @@ def interaction_probe(window,app,settle):
                 'max_ms':round(max(values)*1000,3)}
     window.model.setCurrentIndex(0)
     window.selected_session=None;window.selected_turn=None;window.selected_call=None
-    window.selected_event=None;window.temporary_context=None;window.history_navigation.project='';window.record_view='projects'
+    window.selected_event=None;window.temporary_context=None;window.history_navigation.project='';window.record_view='sessions'
     window.search.clear();window.nav.setCurrentRow(2);window.render();settle()
     if not window.record_rows:return {'excluded':'프로젝트 기록 없음'}
     window.activate_record(0);settle()

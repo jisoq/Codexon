@@ -103,7 +103,7 @@ def test_process_queries_latest_selection_cache_and_clean_shutdown(tmp_path):
         w.source.setCurrentIndex(w.source.findData('subagent'))
         w.source.setCurrentIndex(0)
         w.nav.setCurrentRow(w.navigation_pages.index(2)); settle()
-        assert w.record_view=='projects' and w.table.rowCount()==1 and w.selected_session is None
+        assert w.record_view=='sessions' and w.table.rowCount()==1 and w.selected_session is None
         assert w.worker.process.pid is not None
         assert not w.analysis_errors
         count=w.worker_metrics['view_builds']
@@ -218,7 +218,7 @@ def test_dashboard_projection_bounds_rows_and_preserves_drilldown():
     projected=engine.page_query(q)['explorer']
     assert projected['records']['total']==5600
     assert projected['records']['start']==500 and len(projected['records']['rows'])==128
-    assert len(projected['parents']['rows'])==64
+    assert len(projected['parents']['rows'])==1 and 'sid' not in projected['parents']['rows'][0]
     assert all('calls' not in row or not isinstance(row['calls'],list) for row in projected['records']['rows'])
     q['explorer']['search']='Session 42'
     found=engine.page_query(q)['explorer']

@@ -16,18 +16,10 @@ Flow {
             spacing: 4; height: 36
             TextMetrics { id: metrics; text: crumb.caption; font.family: appTheme.family; font.pixelSize: 14 }
             Text { visible: crumb.index > 0; width: 12; height: 36; text: "›"; verticalAlignment: Text.AlignVCenter; font.pixelSize: 18; color: appTheme.palette.muted }
-            UiButton {
-                visible: !crumb.modelData.current
-                width: Math.min(360, Math.max(0, root.width - 20), metrics.width + 36)
-                text: crumb.caption; flat: true
-                onClicked: root.node.activate(crumb.index)
-                UiToolTip { visible: parent.hovered && metrics.width + 36 > parent.width; text: crumb.caption }
-            }
             Text {
-                visible: crumb.modelData.current
                 width: Math.min(360, Math.max(0, root.width - 20), metrics.width + 12); height: 36
                 text: crumb.caption; elide: Text.ElideRight; textFormat: Text.PlainText
-                font.family: appTheme.family; font.pixelSize: 14; font.weight: Font.DemiBold
+                font.family: appTheme.family; font.pixelSize: 14; font.weight: crumb.modelData.current ? Font.DemiBold : Font.Normal
                 verticalAlignment: Text.AlignVCenter; color: appTheme.palette.ink
                 HoverHandler { id: currentHover }
                 UiToolTip { visible: currentHover.hovered && parent.truncated; text: crumb.caption }

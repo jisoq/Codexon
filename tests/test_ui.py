@@ -47,7 +47,7 @@ def dashboard(tmp_path):
 
 def test_sequential_drilldown_and_full_call_detail(dashboard,tmp_path):
     w=dashboard;w.nav.setCurrentRow(w.navigation_pages.index(2));QTest.qWait(40)
-    click_row(w,w.table,0);assert w.record_view=='sessions'
+    assert w.record_view=='sessions'
     click_row(w,w.table,0);assert w.record_view=='requests'
     click_row(w,w.table,0);assert w.record_view=='calls'
     click_row(w,w.table,0);assert w.selected_call and w.detail_scroll.isVisible()
@@ -65,8 +65,7 @@ def test_sequential_drilldown_and_full_call_detail(dashboard,tmp_path):
     render_plot(w,w.output_composition)
     assert w.grab().save(str(tmp_path/'dashboard-token-hierarchy.png'))
     w.resize(1800,1000);QTest.qWait(50)
-    wide=w.records_body.available_width>=1800
-    assert w.table.isVisible()==wide
+    assert not w.table.isVisible()
     assert w.detail_scroll.state['width']==-1
     old=w.selected_call;w.receive(copy.deepcopy(w.snapshot));assert w.selected_call==old
     w.close_record_detail();assert w.table.isVisible()
@@ -88,7 +87,7 @@ def test_request_statistics_in_current_level_and_filtered_scope(dashboard,unlink
         w.receive(value)
     w.nav.setCurrentRow(w.navigation_pages.index(2))
 
-    w.activate_record(0);w.activate_record(0)
+    w.activate_record(0)
     def check(node,rows):
         assert '소요시간' in node.model().headers
         for index,row in enumerate(rows):
@@ -106,7 +105,7 @@ def test_request_statistics_in_current_level_and_filtered_scope(dashboard,unlink
         assert (missing['call_mean'] is None)==all_unpriced
         if mode and not unlinked:
             assert missing['responses']==1 and missing['total_responses']==2
-        assert w.parent_kind=='tree'
+        assert w.parent_kind=='projects'
         assert all('turn' not in r for r in w.parent_rows)
     assert not w.qml_errors
 
@@ -151,7 +150,7 @@ def test_preferences_restore_observed_dimensions_before_snapshot(dashboard,tmp_p
         assert second.model.currentData()=='gpt-6-astra' and second.effort.currentData()=='high'
         assert second.project.currentData()==project_key('V:/work/project-1')
         assert second.project.currentText()=='project-1'
-        assert second.record_view=='projects' and second.selected_session is None
+        assert second.record_view=='sessions' and second.selected_session is None
         second.show();QTest.qWait(20)
         assert second.analysis['response_count']==24
     finally:second.quitting=True;second.tick.stop();second.tray.hide();second.observer_panel.stop();second.close()
@@ -162,7 +161,7 @@ def test_call_filter_is_accessible_from_normal_record_views(dashboard,within_ses
     w=dashboard;w.resize(1150,900);w.nav.setCurrentRow(w.navigation_pages.index(2));QTest.qWait(30)
     if not within_session:
         w.selected_session=None;w.record_view='calls';w.render_explorer()
-    if within_session:w.activate_record(0);w.activate_record(0)
+    if within_session:w.activate_record(0)
     scope=w.selected_session
     assert w.record_view==('requests' if within_session else 'calls')
     assert w.record_filters.isVisible()
@@ -184,7 +183,7 @@ def test_call_filter_is_accessible_from_normal_record_views(dashboard,within_ses
 def test_call_detail_back_restores_same_call_list_before_request_list(dashboard):
     w=dashboard;w.resize(1150,900);w.nav.setCurrentRow(w.navigation_pages.index(2));QTest.qWait(30)
     click_row(w,w.table,0)
-    click_row(w,w.table,0);click_row(w,w.table,0)
+    click_row(w,w.table,0)
     before=[r['key'] for r in w.record_rows];turn=w.selected_turn;session=w.selected_session
     click_row(w,w.table,0)
     assert w.selected_call and not w.table.isVisible()

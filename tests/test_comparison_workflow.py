@@ -78,13 +78,11 @@ def many_efforts():
     return source,efforts
 
 
-def test_home_preserves_filters_and_back_restores_exact_call(dashboard):
-    w=dashboard;w.nav.setCurrentRow(w.navigation_pages.index(2));click_row(w,w.table,1);click_row(w,w.table,0);click_row(w,w.table,1);click_row(w,w.table,1)
+def test_project_selection_preserves_filters_and_back_restores_exact_call(dashboard):
+    w=dashboard;w.nav.setCurrentRow(w.navigation_pages.index(2));click_row(w,w.parent_table,1);click_row(w,w.table,0);click_row(w,w.table,1);click_row(w,w.table,1)
     before=w.capture_state();assert w.selected_call
-    route=control(w,w.history_path)
-    root=next(item for item in walk(route) if item.objectName()=='history-crumb-0')
-    click(w,next(item for item in walk(root) if item.inherits('QQuickAbstractButton')))
-    assert w.record_view=='projects' and w.selected_session is None and w.selected_call is None and w.selected_turn is None
+    click_row(w,w.parent_table,0)
+    assert w.record_view=='sessions' and w.selected_session is None and w.selected_call is None and w.selected_turn is None
     assert w.period.currentData()==before['common']['period']
     click(w,control(w,w.back_button))
     assert w.selected_call==before['selected_call'] and w.selected_turn==before['selected_turn']
