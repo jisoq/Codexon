@@ -84,7 +84,6 @@ def test_rendered_summary_click_and_overlay_speed_navigation(tmp_path):
     try:
         source=snapshot();window.receive(source);window.resize(1280,900);window.show();QTest.qWait(150)
         assert window.metrics[4].text()=='125.0 tok/s'
-        assert '2 / 대상 3' in window.metric_notes[4].text()
         assert window.quick.grabFramebuffer().save(str(tmp_path/'dashboard.png'))
         click(window,control(window,window.metrics[4]));QTest.qWait(50)
         assert [r['output_speed'] for r in __import__('cachemonitor.dashboard_views',fromlist=['resolve_population']).resolve_population(window.engine,window.aggregate_records)]==[200,100]

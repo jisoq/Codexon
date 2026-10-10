@@ -295,7 +295,12 @@ def test_pending_detail_reveal_yields_to_user_wheel_and_close(dashboard):
     wheel(w,w.detail_scroll,120)
     assert scroll.property('revealTarget') is None
     QTest.qWait(60)
-    assert viewport.property('contentY')<before and not detail_heading_in_view(w,'evidence')
+    after_wheel=viewport.property('contentY')
+    assert after_wheel<before
+    # A compact detail can already show the evidence heading. Cancellation
+    # means that a pending reveal must not scroll again after the user's wheel.
+    QTest.qWait(80)
+    assert viewport.property('contentY')==pytest.approx(after_wheel)
     w.detail_scroll.ensureWidgetVisible(w.detail_sections['evidence'][0])
     assert scroll.property('revealTarget') is not None
     w.close_record_detail()

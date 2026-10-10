@@ -46,7 +46,7 @@ GROUPS = {
     'quota_poll': test_files('quota_polling', 'overlay_collection_resilience'),
     'quota_ui': test_files('quota_page', 'quota_detail_card', 'quota_gap_axis', 'quota_share_theme'),
     'quota_chart': test_files('quota_gap_axis', 'quota_chart_performance', 'quota_page'),
-    'dashboard': test_files('ui', 'comparison_workflow', 'dashboard_evidence', 'ui_value_fixes'),
+    'dashboard': test_files('ui', 'comparison_workflow', 'dashboard_evidence', 'ui_value_fixes', 'history_explorer', 'dashboard_readability'),
     'details': test_files('ui_details', 'call_transport', 'model_ui'),
     'table': test_files('table_order', 'performance'),
     'shared_ui': test_files('quick_ui', 'display_scaling'),
@@ -72,7 +72,7 @@ GROUPS = {
         'tests/test_verify_changes.py::test_isolated_source_smoke_renders_parent_cost',),
     'translation': ('tests/test_public_release.py::test_english_token_labels_do_not_change_stored_values',),
     'payload': ('tests/test_public_release.py::test_public_payload_rejects_local_paths_and_unneeded_qt',),
-    'selector': test_files('verify_changes'),
+    'selector': test_files('verify_changes', 'check_environment'),
     'qa_ipc': test_files('qa_ipc'),
     'ui_runner': test_files('ui_check_runner', 'completed_layout'),
     'release': test_files('release_pipeline', 'prepare_sources'),
@@ -130,6 +130,9 @@ RULES = (
     ('cachemonitor/qml/HistoryWorkspace.qml', ('dashboard',)),
     ('cachemonitor/qml/PerformanceNavigator.qml', ('performance_trends',)),
     ('cachemonitor/dashboard.py', ('dashboard', 'details', 'cost', 'speed')),
+    ('cachemonitor/dashboard_presentation.py', ('dashboard', 'details')),
+    ('cachemonitor/qml/Breadcrumbs.qml', ('dashboard',)),
+    ('cachemonitor/qml/RecordFields.qml', ('dashboard', 'details')),
     ('cachemonitor/ui_details.py', ('details',)),
     ('cachemonitor/table_model.py', ('table',)),
     ('cachemonitor/lazy_table.py', ('table',)),
@@ -220,6 +223,7 @@ RULES = (
     ('tools/verify_release_tools.py', ('release', 'selector')),
     ('third-party-sources.lock.json', ('release', 'payload')),
     ('tools/run_ui_checks.py', ('ui_runner', 'runtime', 'overlay_controls')),
+    ('tools/check_environment.py', ('selector',)),
     ('tools/demo_speed_overlay.py', ('speed',)),
     ('tools/*proxy*.py', ('relay', 'proxy_lifecycle')),
     ('tools/*overlay*.py', ('overlay_controls', 'overlay_render')),
@@ -501,6 +505,15 @@ def main(argv=None):
     folder.mkdir(exist_ok=False)
     report = dict(public,logs=[],package=None)
     if plan['tests']:
+        from tools.check_environment import check_environment
+        environment=check_environment()
+        report['environment']=environment
+        if environment['errors']:
+            (folder/'report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+            print(json.dumps(dict(result='environment_failed',**environment,
+                                  action='Use a dedicated environment installed from requirements-release.lock.',
+                                  report=str(folder/'report.json')),ensure_ascii=False,indent=2))
+            return 2
         started = time.monotonic()
         runs = []
         outputs = []
@@ -523,6 +536,8 @@ def main(argv=None):
                                summary=' | '.join(run['summary'] for run in runs), runs=runs)
         if exit_code:
             (folder/'report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+            # Show the actual failure in the job log, without an artifact download.
+            print('\n'.join(log.read_text(encoding='utf-8').splitlines()[-100:]))
             print(json.dumps(dict(result='failed',**report['pytest'],log=str(log)),ensure_ascii=False))
             return exit_code
     if args.package_exe:

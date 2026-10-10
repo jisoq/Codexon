@@ -6,6 +6,11 @@ Item {
     id: root
     required property var node
     readonly property var viewState: node.state
+    readonly property bool readableColumns: !!viewState.readableColumns
+    readonly property real cellPadding: readableColumns ? 12 : 9
+    function columnAlignment(column) {
+        return (root.viewState.leftColumns || [0]).indexOf(root.node.logicalColumn(column)) >= 0 ? Text.AlignLeft : Text.AlignRight
+    }
     property int hoveredRow: -1
     implicitWidth: 250; implicitHeight: root.viewState.inline ? 70 + node.rowModel.rowCount() * root.viewState.rowHeight : 200
     function showDetails() {
@@ -20,7 +25,9 @@ Item {
         delegate: Rectangle {
             required property var display; required property int column; implicitWidth: 150; implicitHeight: 40
             color: (appTheme.palette && appTheme.color("secondary"))
-            Text { id: headerLabel; anchors.fill: parent; anchors.margins: 9; text: appLanguage.text(display); elide: Text.ElideRight; verticalAlignment: Text.AlignVCenter; color: (appTheme.palette && appTheme.color("muted")); font.pixelSize: 14; font.weight: Font.Medium; font.family: appTheme.family }
+            Text { id: headerLabel; objectName: "table-header-label"; property int textAlignment: horizontalAlignment; anchors.fill: parent; anchors.topMargin: 9; anchors.bottomMargin: 9; anchors.leftMargin: root.cellPadding; anchors.rightMargin: root.cellPadding; text: appLanguage.text(display); elide: Text.ElideRight; horizontalAlignment: root.readableColumns ? root.columnAlignment(column) : Text.AlignLeft; verticalAlignment: Text.AlignVCenter; color: (appTheme.palette && appTheme.color(root.readableColumns ? "ink" : "muted")); font.pixelSize: 14; font.weight: root.readableColumns ? Font.DemiBold : Font.Medium; font.family: appTheme.family }
+            Rectangle { anchors.right: parent.right; width: 1; height: parent.height; visible: root.readableColumns; color: appTheme.palette.border }
+            Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; visible: root.readableColumns; color: appTheme.palette.border }
             HoverHandler { id: headerHover }
             UiToolTip {
                 property string explanation: (root.viewState.headerTips || {})[column] || ""
@@ -91,16 +98,17 @@ Item {
             required property real cellBar
             required property int alignment
             property bool exactValue: (root.viewState.noElideColumns || []).indexOf(root.node.logicalColumn(column)) >= 0
-            implicitWidth: exactValue ? Math.max(70,cellLabel.implicitWidth+18) : 150
+            implicitWidth: exactValue ? Math.max(70,cellLabel.implicitWidth+2*root.cellPadding) : 150
             implicitHeight: root.viewState.rowHeight
             color: root.viewState.selected === row ? (appTheme.palette && appTheme.color("secondary")) : cacheZero ? (root.hoveredRow === row ? (appTheme.palette && appTheme.color("warning_hover")) : (appTheme.palette && appTheme.color("warning_surface"))) : cellBackground || (root.hoveredRow === row ? (appTheme.palette && appTheme.color("secondary")) : (appTheme.palette && appTheme.color("surface")))
             Rectangle { anchors.left: parent.left; anchors.right: parent.right; anchors.bottom: parent.bottom; height: 1; visible: !root.viewState.treeNavigation; color: (appTheme.palette && appTheme.color("border")) }
             Rectangle { visible: root.viewState.selected === row && column === 0; width: 2; height: parent.height; color: appTheme.palette.accent }
             Rectangle { objectName: "cell-data-bar"; visible: !!root.viewState.dataBars && cellBar >= 0; anchors.left: parent.left; anchors.leftMargin: 6; anchors.verticalCenter: parent.verticalCenter; width: Math.min(140,Math.max(0,parent.width-12))*Math.max(0,cellBar); height: 14; radius: 2; color: appTheme.palette.accent; opacity: .16 }
-            Text { id: cellLabel; objectName: "cell-label"; anchors.fill: parent; anchors.leftMargin: 9; anchors.rightMargin: 9; text: verbatim ? display : appLanguage.text(display); wrapMode: !exactValue && root.viewState.rowHeight > 40 ? Text.Wrap : Text.NoWrap; elide: exactValue ? Text.ElideNone : Text.ElideRight; horizontalAlignment: alignment & Qt.AlignRight ? Qt.AlignRight : Qt.AlignLeft; verticalAlignment: Text.AlignVCenter; font.pixelSize: 14; font.family: appTheme.family; font.features: { "tnum": 1 }; color: (appTheme.palette && appTheme.color("ink")) }
+            Text { id: cellLabel; objectName: "cell-label"; property int textAlignment: horizontalAlignment; anchors.fill: parent; anchors.leftMargin: root.cellPadding; anchors.rightMargin: root.cellPadding; text: verbatim ? display : appLanguage.text(display); wrapMode: !exactValue && root.viewState.rowHeight > 40 ? Text.Wrap : Text.NoWrap; elide: exactValue ? Text.ElideNone : Text.ElideRight; horizontalAlignment: alignment & Qt.AlignRight ? Qt.AlignRight : Qt.AlignLeft; verticalAlignment: Text.AlignVCenter; font.pixelSize: 14; font.family: appTheme.family; font.features: { "tnum": 1 }; color: (appTheme.palette && appTheme.color("ink")) }
             Rectangle { anchors.fill: parent; color: (appTheme.palette && appTheme.color("accent")); opacity: changedCell * .18 }
             Rectangle { objectName: "cache-zero-marker"; visible: cacheZero && column === 0; anchors.left: parent.left; anchors.top: parent.top; anchors.bottom: parent.bottom; width: 3; color: (appTheme.palette && appTheme.color("warning")) }
             Rectangle { objectName:"row-hover-feedback";anchors.fill:parent;color:appTheme.palette.accent;opacity:root.hoveredRow===row ? .08 : 0 }
+            Rectangle { objectName: "column-divider"; anchors.right: parent.right; width: 1; height: parent.height; visible: root.readableColumns && !root.viewState.treeNavigation; color: appTheme.palette.border; opacity: .55 }
             HoverHandler { id: hover;cursorShape:root.viewState.navigationColumn !== undefined && column !== root.viewState.navigationColumn ? Qt.ArrowCursor : Qt.PointingHandCursor;onHoveredChanged: { if(hovered) root.hoveredRow=row;else if(root.hoveredRow===row) root.hoveredRow=-1 } }
             UiToolTip { objectName: "cell-overflow-tip"; visible: hover.hovered && cellLabel.truncated; text: display }
             TapHandler { onTapped: { table.forceActiveFocus(); table.keyboardColumn=column; root.node.click(row,column) } }
