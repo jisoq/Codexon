@@ -206,6 +206,8 @@ class TrayWindow(QuickHost):
 
     def begin_quit(self,*,handoff=False,force=False):
         if getattr(self,'_closing',False):return
+        from .graphics_recovery import set_restart_enabled
+        set_restart_enabled(False)
         self._closing=True
         monitor=getattr(self,'update_monitor',None)
         if monitor:monitor.stop()
@@ -255,6 +257,8 @@ class TrayWindow(QuickHost):
         self.shutdown_dialog.deleteLater()
         if error:
             self._closing=False
+            from .graphics_recovery import set_restart_enabled
+            set_restart_enabled(True)
             QMessageBox.warning(self,tr('안전한 종료 확인 필요'),
                 tr('종료를 완료하지 못했습니다. 종료를 다시 누르면 재시도합니다.')+'\n'+error)
             return

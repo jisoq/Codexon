@@ -38,6 +38,8 @@ def main():
     parser.add_argument('--managed-services',action='store_true',help=argparse.SUPPRESS)
     parser.add_argument("--codex-home", action="append", help="Repeat to monitor multiple local Codex homes")
     parser.add_argument("--hidden", action="store_true")
+    parser.add_argument('--software-rendering', action='store_true',
+                        help='Render the GUI on the CPU to avoid the GPU graphics path')
     parser.add_argument("--index-path", help="Override the app-owned usage index for isolated verification")
     parser.add_argument('--evidence-path',help='Use the matching observer evidence database')
     parser.add_argument('--quota-path',help='Keep quota history independent of the usage index location')
@@ -89,6 +91,9 @@ def main():
             return 0 if not snapshot["errors"] else 1
         finally:
             monitor.close();cleanup()
+    if args.software_rendering:
+        from .graphics_recovery import use_software_renderer
+        use_software_renderer()
     configure_font_rendering()
     configure_high_dpi()
     app = QApplication(sys.argv[:1])
@@ -144,6 +149,11 @@ def main():
     if not isolated:save_homes(homes)
     if not isolated and not args.verify_handoff:
         save_homes(homes);save_connection_paths(args.index_path,args.evidence_path,args.quota_path)
+        from .graphics_recovery import WindowsRestart, restart_arguments
+        app._windows_restart = WindowsRestart(restart_arguments(homes,index_path=args.index_path,
+            evidence_path=args.evidence_path,quota_path=args.quota_path))
+        app._windows_restart.arm()
+        app.aboutToQuit.connect(app._windows_restart.disarm)
     if (args.smoke or args.verify_handoff) and not args.verify_services:
         from .usage_collection import isolated_collector
         collector_cleanup=isolated_collector(homes,args.index_path,args.evidence_path)

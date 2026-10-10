@@ -4,6 +4,7 @@ import ast
 import json
 import subprocess
 import sys
+import pytest
 
 from tools.verify_changes import ROOT, GROUPS, changed_files, fixture_home, pytest_commands, select_tests
 
@@ -115,12 +116,14 @@ def test_unmapped_and_package_only_runs_do_not_advance_source_baseline(tmp_path,
     assert baseline.read_bytes() == original
 
 
-def test_isolated_source_smoke_renders_parent_cost(tmp_path):
+@pytest.mark.parametrize('software', [False, True])
+def test_isolated_source_smoke_renders_parent_cost(tmp_path, software):
     home = fixture_home(tmp_path)
     image = tmp_path/'smoke.png'
     result = subprocess.run([sys.executable,'-B',str(ROOT/'run.py'),
                              '--codex-home',str(home),'--index-path',str(tmp_path/'index.sqlite'),
-                             '--smoke',str(image),'--smoke-depth','core'],
+                             '--smoke',str(image),'--smoke-depth','core',
+                             *(['--software-rendering'] if software else [])],
                             cwd=ROOT,capture_output=True,text=True,timeout=120)
     report = json.loads(image.with_suffix('.json').read_text(encoding='utf-8'))
     assert result.returncode==0, report.get('errors') or result.stderr
@@ -128,6 +131,7 @@ def test_isolated_source_smoke_renders_parent_cost(tmp_path):
     assert report['session_rollup']['descendants']==1
     assert report['session_rollup']['cost']>report['session_rollup']['own']
     assert report['model_requests']==report['live_quota_requests']==0
+    if software:assert report['renderer']=='GraphicsApi.Software'
 
 
 def test_environment_failure_stops_before_tests_and_preserves_baseline(tmp_path,monkeypatch,capsys):
