@@ -82,7 +82,7 @@ def explorer(engine,result,selection):
     parents=[]
     scope=tuple(selection['session']) if selection.get('session') else None
     turn=selection.get('turn');view=selection.get('view','requests')
-    if view=='requests' and not scope:view='projects'
+    if view=='requests' and not scope:view='sessions'
     rows=[r for r in filtered if (r['home'],r['sid'])==scope] if scope and view!='sessions' else filtered
     if matching is not None:rows=[r for r in rows if (r['home'],r['sid']) in matching]
     if turn:rows=[r for r in rows if (not r.get('turn') if turn=='__unlinked__' else r.get('turn')==turn)]
@@ -101,7 +101,7 @@ def explorer(engine,result,selection):
             records.extend(dict(r,_outside=True) for r in result['lookup']['whole_turns'].get((*scope,turn),[]) if identity(r) not in keys)
     parent_kind='requests' if view=='calls' and scope else 'sessions'
 
-    from .history_projection import prepare, tree, total
+    from .history_projection import prepare, session_tree, total
     cache_key=(result['key'],search,tuple(filters),repr(ctx.get('population')),repr(ctx.get('records')))
     cached=getattr(engine,'_history_prepared',None)
     hierarchy=cached[1] if cached and cached[0]==cache_key else prepare(result,filtered,search,include_empty=not filters)
@@ -110,9 +110,12 @@ def explorer(engine,result,selection):
     if session:
         from .analytics import project_identity
         project=project_identity(session)
+    navigation=sorted(hierarchy['projects'],key=lambda r:r['title'].casefold())
+    if not project and view=='sessions' and navigation:project=navigation[0]['project_id']
     if view=='projects':records=hierarchy['projects']
     elif view=='sessions':
-        records=[r for k,r in hierarchy['items'].items() if r['project_id']==project and k not in hierarchy['parent']]
+        records=session_tree(hierarchy,project,set(selection.get('expanded',[])),lambda rows:ordered(rows,sort),
+                             bool(search),set(selection.get('search_collapsed',[])))
     elif view=='children':records=[hierarchy['items'][k] for k in hierarchy['children'].get(scope,[])]
     request_ordinal=None
     if scope and (view=='requests' or turn):
@@ -125,12 +128,8 @@ def explorer(engine,result,selection):
         numbers={t:i+1 for i,t in enumerate(sorted(ids,key=position))}
         request_ordinal=numbers.get(turn)
         if view=='requests':records=[dict(r,ordinal=numbers.get(r.get('turn')),ts=position(r.get('turn'))[0]) for r in records]
-    records=ordered(records,sort)
-    tree_key=(cache_key,tuple(sorted(selection.get('expanded',[]))))
-    cached_tree=getattr(engine,'_history_tree',None)
-    navigation=cached_tree[1] if cached_tree and cached_tree[0]==tree_key else tree(hierarchy,set(selection.get('expanded',[])))
-    engine._history_tree=(tree_key,navigation)
-    parents=navigation;parent_kind='tree'
+    if view!='sessions':records=ordered(records,sort)
+    parents=navigation;parent_kind='projects'
     if scope:summary=total(rows)
     elif project:summary=next((r for r in hierarchy['projects'] if r['project_id']==project),{})
     else:summary=hierarchy['summary']

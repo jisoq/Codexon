@@ -9,11 +9,9 @@ from cachemonitor.history_projection import node_key
 
 def test_project_first_and_selection_does_not_navigate(dashboard):
     w=dashboard;w.change_page(2)
-    assert w.record_view=='projects' and w.selected_session is None
-    assert len(w.record_rows)==3
-    w.table.cellClicked.emit(0,2)
-    assert w.record_view=='projects'
-    w.activate_record(0)
+    assert w.record_view=='sessions' and w.selected_session is None
+    assert len(w.parent_rows)==3 and all('sid' not in row for row in w.parent_rows)
+    w.table.selectRow(0)
     assert w.record_view=='sessions' and w.selected_session is None
     w.activate_record(0)
     assert w.record_view=='requests' and w.selected_session
@@ -26,7 +24,7 @@ def test_project_first_and_selection_does_not_navigate(dashboard):
     w.go_back()
     assert w.record_view=='calls' and not w.selected_call
     w.go_home()
-    assert w.record_view=='projects' and not w.selected_session
+    assert w.record_view=='sessions' and not w.selected_session
 
 
 def test_tree_window_and_reuse():
@@ -38,12 +36,12 @@ def test_tree_window_and_reuse():
     project=first['records']['rows'][0]
     assert project['roots']==800
     before=dict(engine.metrics)
-    q['explorer']['expanded']=[project['key']]
-    q['table_windows']={'parents':{'start':40,'size':128}}
+    q['explorer'].update(view='sessions',project=project['project_id'])
+    q['table_windows']={'records':{'start':40,'size':128}}
     expanded=engine.page_query(q)['explorer']
-    assert expanded['parents']['total']==801
-    assert len(expanded['parents']['rows'])==128
-    assert all('members' not in row for row in expanded['parents']['rows'])
+    assert expanded['parents']['total']==1
+    assert expanded['records']['total']==800 and len(expanded['records']['rows'])==128
+    assert all('members' not in row for row in expanded['records']['rows'])
     assert engine.metrics['priced_calls']==before['priced_calls']
     assert engine.metrics['part_builds']==before['part_builds']
 
@@ -58,10 +56,9 @@ def test_parent_total_and_child_route():
     rows=engine.page_query(q)['explorer']['records']['rows']
     assert len(rows)==1 and rows[0]['sid']=='parent'
     assert rows[0]['cost']==project['cost']
-    q['explorer'].update(view='children',session=[source['home'],'parent'])
+    q['explorer']['expanded']=[node_key('session',source['home'],'parent')]
     child_view=engine.page_query(q)['explorer']
-    assert child_view['child_count']==1
-    assert child_view['records']['rows'][0]['sid']=='child'
+    assert [(r['sid'],r['depth']) for r in child_view['records']['rows']]==[('parent',0),('child',1)]
 
 
 def test_filtered_request_metrics_and_zero_call_boundary():
@@ -92,12 +89,72 @@ def test_missing_and_cyclic_parents_remain_reachable():
     assert sum(r['calls'] for r in roots)==project['calls']
 
 
+def test_search_and_sort_keep_one_session_hierarchy():
+    source=history()
+    records=[dict(source,id='parent',title='Parent'),
+             dict(source,id='child',title='Child',parent_thread_id='parent'),
+             dict(source,id='nested',title='Needle',parent_thread_id='child'),
+             dict(source,id='other',title='Other')]
+    engine=AnalysisEngine();engine.ingest(records)
+    parent_key=node_key('session',source['home'],'parent')
+    child_key=node_key('session',source['home'],'child')
+    q=query(page=2,presentation=True,explorer=dict(view='sessions',expanded=[parent_key,child_key],sort='cost_desc'))
+    data=engine.page_query(q)['explorer']
+    rows=data['records']['rows']
+    assert [(r['sid'],r['depth']) for r in rows]==[('parent',0),('child',1),('nested',2),('other',0)]
+    assert rows[2]['guides']==[False] and rows[2]['last']
+    assert len(data['parents']['rows'])==1 and 'sid' not in data['parents']['rows'][0]
+    q['explorer'].update(expanded=[],search='Needle')
+    data=engine.page_query(q)['explorer']
+    assert [r['sid'] for r in data['records']['rows']]==['parent','child','nested']
+    q['explorer']['search_collapsed']=[child_key]
+    assert [r['sid'] for r in engine.page_query(q)['explorer']['records']['rows']]==['parent','child']
+
+
+def test_rendered_disclosure_and_back_restore_hierarchy(dashboard,tmp_path):
+    import time
+    from PySide6.QtCore import Qt, QPointF
+    from PySide6.QtTest import QTest
+    from cachemonitor.quick_qa import click,control,walk,click_row,table_view
+    w=dashboard;value=copy.deepcopy(snapshot());source=value['sessions'][0]
+    child=copy.deepcopy(source);child.update(id='child',title='Child',parent_thread_id=source['id'])
+    nested=copy.deepcopy(source);nested.update(id='nested',title='Needle',parent_thread_id='child')
+    value['sessions']=[source,child,nested,*value['sessions'][1:]]
+    w.receive(value);w.resize(1120,850);w.change_page(2)
+    def wait_for(check):
+        deadline=time.monotonic()+3
+        while not check():
+            assert time.monotonic()<deadline
+            QTest.qWait(10)
+    def arrow(row):
+        return next(item for item in walk(control(w,w.table)) if item.objectName()==f'session-disclosure-{row}' and item.isVisible())
+    wait_for(lambda: any(item.objectName()=='session-disclosure-0' and item.isVisible() for item in walk(control(w,w.table))))
+    click(w,arrow(0));assert w.record_view=='sessions' and not w.selected_session
+    wait_for(lambda: len(w.record_rows)==2)
+    click(w,arrow(1));wait_for(lambda: len(w.record_rows)==3)
+    assert [r['depth'] for r in w.record_rows]==[0,1,2]
+    assert all('sid' not in r for r in w.parent_rows)
+    table=table_view(w,w.table)
+    first=next(item for item in walk(control(w,w.table)) if item.objectName()=='frozen-column')
+    left=first.mapToScene(QPointF()).x();table.setProperty('contentX',80);QTest.qWait(30)
+    assert first.mapToScene(QPointF()).x()==left
+    scroll_x=w.table.horizontalScrollBar().value()
+    click_row(w,w.table,2);assert w.selected_session[1]=='nested' and w.record_view=='requests'
+    w.go_back();wait_for(lambda: w.record_view=='sessions' and len(w.record_rows)==3)
+    wait_for(lambda: abs(table_view(w,w.table).property('contentX')-scroll_x)<1)
+    w.table.selectRow(0);table_view(w,w.table).forceActiveFocus();QTest.keyClick(w.quick,Qt.Key_Left)
+    wait_for(lambda: len(w.record_rows)==1)
+    QTest.keyClick(w.quick,Qt.Key_Right);wait_for(lambda: len(w.record_rows)==3)
+    assert w.quick.grabFramebuffer().save(str(tmp_path/'hierarchy.png'))
+    assert not w.qml_errors
+
+
 def test_empty_search_actions_restore_rows_and_preserve_route(dashboard,tmp_path):
     import time
     from PySide6.QtTest import QTest
     from cachemonitor.dashboard import choose
     from cachemonitor.quick_qa import click,control,walk
-    w=dashboard;w.change_page(2);w.activate_record(0);w.activate_record(0);w.activate_record(0)
+    w=dashboard;w.change_page(2);w.activate_record(0);w.activate_record(0)
     route=(w.history_navigation.project,w.selected_session,w.selected_turn,w.record_view)
     choose(w.mode,'Fast');w.filter_changed();w.search.setText('없는 작업 12345')
     deadline=time.monotonic()+3

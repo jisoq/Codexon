@@ -28,8 +28,8 @@ def test_model_columns_counts_filter_and_refresh(tmp_path):
     try:
         window.receive(snapshot);window.nav.setCurrentRow(window.navigation_pages.index(2))
         window.resize(1800,1000);window.show();QTest.qWait(60)
-        assert window.record_view=='projects' and window.table.rowCount()==1, str((window.analysis_errors,window.record_status,window.query(),window.view_result['explorer']))
-        click_row(window,window.table,0);click_row(window,window.table,0)
+        assert window.record_view=='sessions' and window.table.rowCount()==1, str((window.analysis_errors,window.record_status,window.query(),window.view_result['explorer']))
+        click_row(window,window.table,0)
         assert window.record_view=='requests' and window.table.rowCount()==1
         click_row(window,window.table,0)
         assert window.record_view=='calls' and window.table.rowCount()==3

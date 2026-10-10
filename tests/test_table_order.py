@@ -28,7 +28,6 @@ def test_sequential_time_tables_keep_order_cost_sort_and_selected_call(tmp_path)
     window=Dashboard([],start_worker=False,live_limits=False,settings=QSettings(str(tmp_path/'order.ini'),QSettings.IniFormat))
     try:
         window.receive(snapshot());window.resize(1800,1000);window.show();window.nav.setCurrentRow(window.navigation_pages.index(2));QTest.qWait(50)
-        window.activate_record(0)
         assert window.record_view=='sessions'
         assert [r['sid'] for r in window.record_rows]==['new','old']
         click_row(window,window.table,0)

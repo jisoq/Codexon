@@ -142,7 +142,6 @@ def test_real_session_table_shows_parent_without_own_calls_and_click_keeps_break
         settings=QSettings(str(tmp_path/'dashboard.ini'), QSettings.IniFormat), static_snapshot=snapshot)
     try:
         window.show();window.change_page(2);app.processEvents()
-        window.activate_record(0)
         records = list(window.record_rows)
         group = next(r for r in records if r['sid']=='parent')
         own_child = window.engine.query(window.query())['session_costs'][('fixture','child')]

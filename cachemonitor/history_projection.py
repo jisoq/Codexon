@@ -71,7 +71,8 @@ def prepare(result, rows, search, include_empty=True):
             source=s.get('source',''),requests=requests,input=tokens['input'],output=tokens['output'],
             ts=g['latest_ts'],context=k not in matching)
     project_rows=[]
-    for pid,keys in project_sessions.items():
+    for pid in projects:
+        keys=project_sessions[pid]
         project_rows.append(dict(total(byproject[pid]),key=node_key('project',pid),project_id=pid,title=projects[pid],
             roots=sum(k not in parent for k in keys),children=sum(k in parent for k in keys),
             requests=sum(request_counts[k] for k in keys if k in matching)))
@@ -79,16 +80,20 @@ def prepare(result, rows, search, include_empty=True):
         selected=selected,summary=total(selected))
 
 
-def tree(data, expanded):
+def session_tree(data, project, expanded, order, searching=False, collapsed=()):
+    """Flatten expanded sibling groups without losing their ancestry or sort order."""
     result=[]
-    def append_session(key,depth):
+    def siblings(keys):
+        return order([data['items'][key] for key in keys])
+    def append_session(row,depth=0,guides=(),last=True):
+        key=(row['home'],row['sid'])
         row=data['items'][key];kids=data['children'].get(key,[])
-        result.append(dict(row,depth=depth,expandable=bool(kids),expanded=row['key'] in expanded))
-        if row['key'] in expanded:
-            for child in kids:append_session(child,depth+1)
-    for project in sorted(data['projects'],key=lambda r:r['title'].casefold()):
-        result.append(dict(project,depth=0,expandable=True,expanded=project['key'] in expanded))
-        if project['key'] in expanded:
-            for key,row in data['items'].items():
-                if row['project_id']==project['project_id'] and key not in data['parent']:append_session(key,1)
+        opened=row['key'] not in collapsed if searching else row['key'] in expanded
+        result.append(dict(row,depth=depth,guides=list(guides),last=last,expandable=bool(kids),expanded=opened))
+        if opened:
+            children=siblings(kids)
+            for i,child in enumerate(children):
+                append_session(child,depth+1,(*guides,not last) if depth else (),i==len(children)-1)
+    roots=[key for key,row in data['items'].items() if row['project_id']==project and key not in data['parent']]
+    for row in siblings(roots):append_session(row)
     return result

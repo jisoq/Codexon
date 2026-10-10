@@ -40,13 +40,12 @@ def test_approved_pages_render_with_stable_routes_and_aligned_fields(tmp_path, l
             else:assert not window.scope_note.isVisible()
             assert window.quick.grabFramebuffer().save(str(tmp_path/f'page-{page}.png'))
         assert not window.home_button.isVisible()
-        assert window.history_path.entries[0]['action']=='root'
-        window.activate_record(0);window.activate_record(0);QTest.qWait(70)
+        assert window.history_path.entries[0]['project_id']==window.history_navigation.project
+        window.activate_record(0);QTest.qWait(70)
         assert window.record_view=='requests'
-        assert not any(tab.isVisible() for tab in window.record_tabs)
         table=control(window,window.table)
-        headers=[item for item in walk(table) if item.objectName()=='table-header-label']
-        labels=[item for item in walk(table) if item.objectName()=='cell-label']
+        headers=[item for item in walk(table) if item.objectName()=='table-header-label' and item.isVisible() and item.parentItem().width()>0]
+        labels=[item for item in walk(table) if item.objectName()=='cell-label' and item.isVisible() and item.parentItem().width()>0]
         assert headers and labels
         for header in headers:
             col=header.parentItem().property('column')
