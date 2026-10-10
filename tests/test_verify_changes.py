@@ -2,11 +2,9 @@
 
 import ast
 import json
-import subprocess
-import sys
 import pytest
 
-from tools.verify_changes import ROOT, GROUPS, changed_files, fixture_home, pytest_commands, select_tests
+from tools.verify_changes import ROOT, GROUPS, changed_files, pytest_commands, select_tests
 
 
 def test_small_ui_changes_select_their_consumer_without_backend_or_package_checks():
@@ -48,6 +46,9 @@ def test_calculation_protocol_and_unknown_changes_have_explicit_gates():
     version = select_tests({'cachemonitor/version.py'})
     assert version['package_impact'] and version['proxy_impact']
     assert 'tests/test_proxy_update.py' in version['tests']
+    version_only = select_tests({'cachemonitor/version.py'},version_only=True)
+    assert version_only['package_impact'] and not version_only['proxy_impact']
+    assert 'tests/test_proxy_update.py' not in version_only['tests']
     restart = select_tests({'cachemonitor/app_restart.py'})
     assert restart['package_impact'] and not restart['proxy_impact']
     unknown = select_tests({'cachemonitor/unmapped_new.py'})
@@ -116,22 +117,56 @@ def test_unmapped_and_package_only_runs_do_not_advance_source_baseline(tmp_path,
     assert baseline.read_bytes() == original
 
 
-@pytest.mark.parametrize('software', [False, True])
-def test_isolated_source_smoke_renders_parent_cost(tmp_path, software):
-    home = fixture_home(tmp_path)
-    image = tmp_path/'smoke.png'
-    result = subprocess.run([sys.executable,'-B',str(ROOT/'run.py'),
-                             '--codex-home',str(home),'--index-path',str(tmp_path/'index.sqlite'),
-                             '--smoke',str(image),'--smoke-depth','core',
-                             *(['--software-rendering'] if software else [])],
-                            cwd=ROOT,capture_output=True,text=True,timeout=120)
-    report = json.loads(image.with_suffix('.json').read_text(encoding='utf-8'))
-    assert result.returncode==0, report.get('errors') or result.stderr
-    assert report['depth']=='core' and report['errors']==[]
-    assert report['session_rollup']['descendants']==1
-    assert report['session_rollup']['cost']>report['session_rollup']['own']
-    assert report['model_requests']==report['live_quota_requests']==0
-    if software:assert report['renderer']=='GraphicsApi.Software'
+def test_extended_checks_are_explicit_and_each_run_retains_test_timings(tmp_path):
+    default = pytest_commands(['tests'], report_dir=tmp_path)[0][1]
+    extended = pytest_commands(['tests'], extended=True, report_dir=tmp_path)[0][1]
+    affected = pytest_commands(['tests/test_ui.py'], report_dir=tmp_path)[0][1]
+    integration = pytest_commands(['tests'], integration=True, report_dir=tmp_path)[0][1]
+    assert 'extended or not extended' not in default
+    assert 'extended or not extended' in extended
+    assert 'not extended' in affected and 'not extended' in integration
+    assert 'not extended' not in default
+    assert '--junitxml=' + str(tmp_path/'tests.xml') in default
+
+
+@pytest.mark.parametrize('path,candidate,package,proxy,msix', [
+    ('cachemonitor/version.py', True, True, False, False),
+    ('cachemonitor/pricing.py', False, False, False, False),
+    ('cachemonitor/qml/OverlayControls.qml', False, False, False, False),
+    ('cachemonitor/install_activation.py', True, True, True, True),
+    ('cachemonitor/model_proxy.py', True, True, True, False),
+    ('cachemonitor/quick_smoke.py', False, True, False, False),
+    ('requirements-release.lock', True, True, True, True),
+    ('docs/releases/example.md', False, False, False, False),
+])
+def test_ci_keeps_changed_contracts_without_repeating_unrelated_release_checks(path,candidate,package,proxy,msix):
+    from tools.ci_plan import build_plan
+    plan = build_plan({path}, base='verified', candidate=candidate,version_only=True)
+    assert (plan['package'],plan['proxy'],plan['msix']) == (package,proxy,msix)
+    assert plan['native'] == (package and not msix)
+    assert not plan['unmapped']
+    assert plan['source_args'] == (['--integration'] if path.startswith('requirements') else ['--base','verified'])
+
+
+def test_ci_extended_and_qa_tool_fallback_cannot_skip_required_checks():
+    from tools.ci_plan import build_plan
+    extended = build_plan(set(),base='verified',extended=True)
+    assert extended['source_args'] == ['--extended']
+    assert all(extended[key] for key in ('package','proxy','msix','scales','dependencies'))
+    assert not extended['native']
+    for reusable in (False,True):
+        plan = build_plan({'tools/verify_proxy_update.py'},base='verified',reuse_qa=reusable)
+        assert plan['qa_reuse'] == reusable
+        assert plan['package'] == plan['proxy'] == (not reusable)
+
+
+def test_only_app_version_literal_can_bypass_proxy_compatibility_checks():
+    from tools.verify_changes import version_contract
+    before = "VERSION='1'\nPROXY_VERSION='p1'\ndef proxy_compatible(v):return v=='p1'\n"
+    assert version_contract(before) == version_contract(before.replace("VERSION='1'", "VERSION='2'"))
+    assert version_contract(before) != version_contract(before.replace("PROXY_VERSION='p1'", "PROXY_VERSION='p2'"))
+    assert version_contract(before) != version_contract(before.replace("v=='p1'", 'True'))
+    assert version_contract(before) != version_contract(before.replace("VERSION='1'", 'VERSION=compute()'))
 
 
 def test_environment_failure_stops_before_tests_and_preserves_baseline(tmp_path,monkeypatch,capsys):

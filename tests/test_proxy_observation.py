@@ -8,10 +8,15 @@ import zstandard
 from cachemonitor.proxy_observation import DecodedObservation, SelectedJSON, message_metadata
 
 
-@pytest.mark.parametrize('encoding,compress',[('gzip',gzip.compress),('deflate',zlib.compress),
-                                             ('zstd',zstandard.ZstdCompressor().compress)])
-def test_large_compressed_request_extracts_only_metadata_after_input(encoding,compress):
-    raw=json.dumps({'input':['PRIVATE'*2500000],'model':'requested','service_tier':'priority','stream':True}).encode()
+@pytest.mark.parametrize('encoding,compress,size',[
+    ('gzip',gzip.compress,25000),('deflate',zlib.compress,25000),
+    ('zstd',zstandard.ZstdCompressor().compress,25000),
+    pytest.param('gzip',gzip.compress,2500000,marks=pytest.mark.extended,id='large-body'),
+])
+def test_compressed_request_extracts_only_metadata_after_input(encoding,compress,size):
+    # Chunk boundaries and ignored private fields need kilobytes, not megabytes
+    # for every codec. Keep one large-body stress case outside the default suite.
+    raw=json.dumps({'input':['PRIVATE'*size],'model':'requested','service_tier':'priority','stream':True}).encode()
     payload=compress(raw)
     observation=DecodedObservation(SelectedJSON(),encoding)
     for i in range(0,len(payload),7):observation.feed(payload[i:i+7])

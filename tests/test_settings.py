@@ -13,6 +13,7 @@ def test_legacy_categories(old,new):
     assert SettingsPage.category_id(old)==new
 
 @pytest.mark.parametrize('language',['ko','en'])
+@pytest.mark.integration
 def test_search_navigation_and_preserved_preferences(tmp_path,monkeypatch,language):
     app=QApplication.instance() or QApplication([])
     previous=app.property('cachemonitorDisableShellIntegration');app.setProperty('cachemonitorDisableShellIntegration',True)

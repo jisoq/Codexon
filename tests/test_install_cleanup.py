@@ -227,6 +227,7 @@ def test_task_scope_uses_windows_path_case_but_exact_ownership_hash():
 
 
 @pytest.mark.skipif(os.name!='nt',reason='Windows Task Scheduler')
+@pytest.mark.integration
 def test_real_task_retarget_preserves_disabled_state_and_arguments(tmp_path):
     owner=ObserverTask(str(tmp_path/'index.sqlite'),role='UsageCollector')
     command=[str(tmp_path/'old'/'Codexon.exe'),'--usage-collector','--index-path',str(tmp_path/'index.sqlite')]

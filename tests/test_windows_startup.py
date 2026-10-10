@@ -6,6 +6,8 @@ import sys
 
 import pytest
 
+pytestmark = pytest.mark.integration
+
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows startup visibility regression")
 def test_hidden_startup_double_click_really_shows_native_window(tmp_path):

@@ -27,6 +27,7 @@ def default_home(tmp_path,monkeypatch):
     return fixture_home(tmp_path)[0]
 
 
+@pytest.mark.integration
 def test_default_cli_publishes_usage_and_preserves_shared_evidence(default_home):
     from cachemonitor.model_evidence import default_path
     client=CollectionClient([default_home]);child=None

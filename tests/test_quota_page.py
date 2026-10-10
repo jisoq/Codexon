@@ -42,7 +42,8 @@ def quota_page(tmp_path):
     ledger.close()
 
 
-@pytest.mark.parametrize('width,height,dark', [(1120,1000,False),(520,900,False),(1120,1000,True)])
+@pytest.mark.integration
+@pytest.mark.parametrize('width,height,dark', [(1120,1000,False),pytest.param(520,900,False,marks=pytest.mark.essential),(1120,1000,True)])
 def test_responsive_page_chart_and_single_details_path(quota_page,tmp_path,width,height,dark):
     app,panel,scroll=quota_page
     if dark:shared_theme().configure('dark')
@@ -112,6 +113,7 @@ def test_model_filter_combines_request_modes_without_assigning_account_usage():
 
 
 @pytest.mark.parametrize('width,language,dark',[(1120,'ko',False),(520,'ko',False),(1120,'en',True),(520,'en',True)])
+@pytest.mark.integration
 def test_current_allowance_and_compact_reset_summary(tmp_path,width,language,dark):
     from PySide6.QtCore import QPointF
     from cachemonitor.i18n import set_language
@@ -205,6 +207,7 @@ def test_reset_dates_follow_system_timezone_on_refresh(tmp_path,monkeypatch):
 
 
 @pytest.mark.parametrize('width,dark',[(520,False),(1120,True)])
+@pytest.mark.integration
 def test_waiting_state_becomes_observed_zero_and_keeps_history_during_lookup_failure(tmp_path,width,dark):
     from test_quota_value_history import interval, report_for
     app=QApplication.instance() or QApplication([])
@@ -253,6 +256,7 @@ def test_waiting_state_becomes_observed_zero_and_keeps_history_during_lookup_fai
     finally:dispose(host);shared_theme().configure('light')
 
 
+@pytest.mark.integration
 def test_cycle_selector_changes_graph_preserves_lifetime_and_selection_on_refresh(quota_page,tmp_path):
     app,panel,scroll=quota_page
     host=mount(scroll,1120,1000)
@@ -298,6 +302,7 @@ def test_cycle_selector_changes_graph_preserves_lifetime_and_selection_on_refres
 
 
 @pytest.mark.parametrize('width,dark',[(520,False),(1120,True)])
+@pytest.mark.integration
 def test_legend_visibility_survives_refresh_and_updates_pinned_details(quota_page,width,dark):
     app,panel,scroll=quota_page
     shared_theme().configure('dark' if dark else 'light')

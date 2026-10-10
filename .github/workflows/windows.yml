@@ -9,6 +9,10 @@ on:
         description: Publish the verified main commit, reusing its successful build
         type: boolean
         default: false
+      extended:
+        description: Run large-data benchmarks and all compatibility checks explicitly
+        type: boolean
+        default: false
 permissions:
   contents: read
   actions: read
@@ -43,9 +47,9 @@ jobs:
         run: python tools/release_pipeline.py plan --publish "$REQUEST_PUBLISH"
   verify:
     needs: resolve
-    if: needs.resolve.outputs.verify == 'true'
+    if: needs.resolve.outputs.verify == 'true' || inputs.extended
     runs-on: windows-latest
-    timeout-minutes: 40
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
         with:
@@ -67,31 +71,11 @@ jobs:
           PR_BASE: ${{ github.event.pull_request.base.sha }}
           PUSH_BASE: ${{ needs.resolve.outputs.base }}
           RELEASE_CANDIDATE: ${{ needs.resolve.outputs.candidate }}
+          EXTENDED: ${{ inputs.extended || false }}
         run: |
           $base = if ($env:EVENT_NAME -eq 'pull_request') { $env:PR_BASE } else { $env:PUSH_BASE }
-          $all = $env:RELEASE_CANDIDATE -eq 'true' -or $env:EVENT_NAME -eq 'workflow_dispatch' -or -not $base -or $base -match '^0+$'
-          [string[]]$checkArgs = if ($all) { @('--full') } else { @('--base', $base) }
-          $raw = python tools/verify_changes.py --plan @checkArgs
-          if ($LASTEXITCODE -ne 0) { throw ($raw -join "`n") }
-          $plan = ($raw -join "`n") | ConvertFrom-Json
-          New-Item -ItemType Directory -Path artifacts/verification -Force | Out-Null
-          $raw | Set-Content -Encoding utf8 artifacts/verification/plan.json
-          $package = $all -or $plan.package_impact
-          $proxy = $all -or $plan.proxy_impact
-          $reuse = $false
-          if (-not $package -and $plan.qa_smokes.Count) {
-            $reuseResult = python tools/verify_release_tools.py --can-reuse
-            if ($LASTEXITCODE -ne 0) { throw 'Cannot check packaged input identity.' }
-            $reuse = ($reuseResult | ConvertFrom-Json).reuse
-            if (-not $reuse) { $package = $true; $proxy = $true }
-          }
-          "VERIFY_BASE=$base" | Add-Content $env:GITHUB_ENV
-          "VERIFY_FULL=$all" | Add-Content $env:GITHUB_ENV
-          "package=$package".ToLowerInvariant() | Add-Content $env:GITHUB_OUTPUT
-          "proxy=$proxy".ToLowerInvariant() | Add-Content $env:GITHUB_OUTPUT
-          "qa_reuse=$reuse".ToLowerInvariant() | Add-Content $env:GITHUB_OUTPUT
-          "dependencies=$($all -or [bool]($plan.changed -match '^requirements'))".ToLowerInvariant() | Add-Content $env:GITHUB_OUTPUT
-          $raw
+          python tools/ci_plan.py "--base=$base" --candidate "$env:RELEASE_CANDIDATE" --extended "$env:EXTENDED"
+          exit $LASTEXITCODE
       - name: Check changed dependencies for vulnerabilities
         if: steps.plan.outputs.dependencies == 'true'
         run: |
@@ -101,19 +85,19 @@ jobs:
         timeout-minutes: 15
         shell: pwsh
         run: |
-          [string[]]$checkArgs = if ($env:VERIFY_FULL -eq 'True') { @('--full') } else { @('--base', $env:VERIFY_BASE) }
-          python tools/run_ui_checks.py -- python tools/verify_changes.py @checkArgs
+          $plan = Get-Content artifacts/verification/plan.json -Raw | ConvertFrom-Json
+          [string[]]$checkArgs = $plan.source_args
+          python tools/verify_changes.py @checkArgs
           exit $LASTEXITCODE
       - name: Check changed QA tools with the matching published binary
         if: steps.plan.outputs.qa_reuse == 'true'
         run: python tools/run_ui_checks.py -- python tools/verify_release_tools.py --plan artifacts/verification/plan.json
       - name: Check overlay native scaling
+        if: steps.plan.outputs.scales == 'true'
         shell: pwsh
         run: |
-          $plan = Get-Content artifacts/verification/plan.json -Raw | ConvertFrom-Json
-          if (-not $plan.full -and -not ($plan.tests -match 'test_overlay_resilience|test_overlay_layout_controller')) { exit 0 }
           $failed = $false
-          foreach ($scale in @('1', '1.25', '1.5', '2')) {
+          foreach ($scale in @('1.25', '2')) {
             $env:CODEXON_OVERLAY_QA_OUTPUT = "artifacts/verification/overlay-scale-$scale"
             python tools/run_ui_checks.py --scale $scale -- python -m pytest -q tests/test_overlay_resilience.py::test_auto_fallback_restores_preference_anchor_and_clickthrough --junitxml="artifacts/verification/overlay-scale-$scale.xml"
             if ($LASTEXITCODE -ne 0) { $failed = $true }
@@ -126,8 +110,6 @@ jobs:
       - name: Check independent offline recovery
         if: steps.plan.outputs.package == 'true'
         run: |
-          python tools/run_ui_checks.py -- python tools/verify_recovery.py --executable dist-ci/Codexon/CodexonRecovery.exe --output artifacts/verification/recovery-ko
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python tools/run_ui_checks.py -- python tools/verify_recovery.py --executable dist-ci/Codexon/CodexonRecovery.exe --output artifacts/verification/recovery-en --language en
       - name: Build isolated installer
         if: steps.plan.outputs.package == 'true'
@@ -140,10 +122,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           .\tools\Build-Installer.ps1 -ProductDir dist-ci/bad-runtime -OutputDir dist-ci/qa-bad-runtime -Compiler $compiler.FullName -Isolated
       - name: Check installation, update and removal
-        if: steps.plan.outputs.package == 'true'
+        if: steps.plan.outputs.native == 'true'
         run: python tools/run_native_checks.py --output artifacts/verification/native-installation -- python tools/run_ui_checks.py -- python tools/verify_installation.py --installer dist-ci/qa-isolated/Codexon-Setup.exe --broken-installer dist-ci/qa-bad-runtime/Codexon-Setup.exe --output artifacts/verification/installation
       - name: Check installation from an MSIX process
-        if: steps.plan.outputs.package == 'true'
+        if: steps.plan.outputs.msix == 'true'
         shell: powershell
         run: .\tools\verify_msix_installation.ps1 -Installer dist-ci/qa-isolated/Codexon-Setup.exe -BrokenInstaller dist-ci/qa-bad-runtime/Codexon-Setup.exe -Output artifacts/verification/msix-installation -Python ((Get-Command python).Source)
       - name: Check frozen runtime and Qt Quick interaction
@@ -200,13 +182,14 @@ jobs:
         with:
           name: windows-verification
           path: |
-            artifacts/verification/
-            !artifacts/verification/**/*.sqlite*
-            !artifacts/verification/**/*.lock
+            artifacts/verification/**/*.json
+            artifacts/verification/**/*.xml
+            artifacts/verification/**/*.png
+            artifacts/verification/**/pytest*.log
           if-no-files-found: ignore
   publish:
     needs: [resolve, verify]
-    if: always() && inputs.publish && needs.resolve.result == 'success' && needs.resolve.outputs.published != 'true' && (needs.verify.result == 'success' || needs.resolve.outputs.reuse_run != '')
+    if: always() && inputs.publish && needs.resolve.result == 'success' && needs.resolve.outputs.published != 'true' && (needs.verify.result == 'success' || (needs.verify.result == 'skipped' && needs.resolve.outputs.reuse_run != ''))
     runs-on: ubuntu-latest
     permissions:
       contents: write

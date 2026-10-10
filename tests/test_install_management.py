@@ -67,6 +67,7 @@ def test_uninstall_stops_only_collector_after_other_components_exit(tmp_path,mon
     assert index.read_bytes()==b'preserve records'
 
 
+@pytest.mark.integration
 def test_uninstall_removes_idle_owned_collector_task_only(tmp_path,monkeypatch):
     import sys
     if sys.platform!='win32':pytest.skip('Windows task definitions')

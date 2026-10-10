@@ -219,6 +219,7 @@ def _collect_in_process(home,path,version=None):
     finally:service.close()
 
 
+@pytest.mark.integration
 def test_consumer_close_does_not_own_service_and_app_restarts_dead_collector(tmp_path,monkeypatch):
     import json,multiprocessing as mp,time
     from cachemonitor.usage_collection import CollectionClient
@@ -271,6 +272,7 @@ def test_consumer_close_does_not_own_service_and_app_restarts_dead_collector(tmp
             process.join(3)
 
 
+@pytest.mark.integration
 def test_fresh_old_collector_is_replaced_cooperatively(tmp_path,monkeypatch):
     import multiprocessing as mp,time
     from cachemonitor.usage_collection import CollectionClient,VERSION
@@ -314,6 +316,7 @@ def test_fresh_old_collector_is_replaced_cooperatively(tmp_path,monkeypatch):
 
 
 @pytest.mark.parametrize('borrowed',[False,True])
+@pytest.mark.integration
 def test_snapshot_command_cleans_only_its_own_collector(tmp_path,borrowed):
     import json,subprocess,sys
     from pathlib import Path

@@ -3,6 +3,8 @@ import copy
 import time
 
 import pytest
+
+pytestmark = pytest.mark.integration
 from PySide6.QtCore import QMetaObject, QPointF, QSettings
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication

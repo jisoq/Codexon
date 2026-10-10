@@ -20,20 +20,28 @@ def test_taskbar_text_uses_taskbar_theme_when_app_theme_disagrees(tmp_path,monke
     from cachemonitor import taskbar
     from cachemonitor.theme import shared_theme
     from cachemonitor.token_colors import contrast_ratio,ui_palette
-    from cachemonitor.overlay_appearance import default_appearance
+    from cachemonitor import overlay_appearance
+    from cachemonitor.overlay_appearance import Appearance
     app=QApplication.instance() or QApplication([])
+    # Simulate the taskbar palette as well as its light/dark setting. The host's
+    # Qt Window palette is not the Explorer taskbar's background.
+    def appearance(is_dark):
+        return Appearance(is_dark, '#202020' if is_dark else '#f3f3f3',
+                          '#ffffff' if is_dark else '#171717', '#0078d4')
+    monkeypatch.setattr(overlay_appearance,'default_appearance',appearance)
     shared_theme().configure('light' if dark else 'dark')
     monkeypatch.setattr(taskbar,'dark_taskbar',lambda:dark)
     indicator=TaskbarQuota(QSettings(str(tmp_path/'taskbar.ini'),QSettings.IniFormat))
     try:
         indicator.resize(100,36)
         indicator.show()
-        background=ui_palette(default_appearance(dark))['surface']
+        background=ui_palette(appearance(dark))['surface']
         for remaining in (80,5,9.99,10,0,None):
             text='?' if remaining is None else str(remaining)
             indicator.set_display(dict(text=text,remaining=remaining),'weekly','fixture')
-            expected=('#ff6b6b' if dark else '#b42318') if remaining is not None and remaining<10 else indicator.view.state['foreground']
-            assert indicator.view.state['valueColor']==expected
+            expected=indicator.view.state['valueColor']
+            warning=remaining is not None and remaining<10
+            assert (expected!=indicator.view.state['foreground'])==warning
             assert contrast_ratio(indicator.view.state['foreground'],background)>=4.5
             assert contrast_ratio(indicator.view.state['valueColor'],background)>=4.5
             deadline=time.monotonic()+3

@@ -69,8 +69,7 @@ GROUPS = {
     'observer': test_files('observer_control', 'observer_panel', 'observer_task_errors'),
     'install': test_files('install_activation', 'install_management', 'install_dispatch', 'install_cleanup', 'legacy_release', 'windows_startup'),
     'update': test_files('app_update','update_monitor','update_state'),
-    'runtime': test_files('windows_startup') + (
-        'tests/test_verify_changes.py::test_isolated_source_smoke_renders_parent_cost',),
+    'runtime': test_files('windows_startup', 'graphics_recovery'),
     'translation': ('tests/test_public_release.py::test_english_token_labels_do_not_change_stored_values',),
     'payload': ('tests/test_public_release.py::test_public_payload_rejects_local_paths_and_unneeded_qt',),
     'selector': test_files('verify_changes', 'check_environment'),
@@ -220,6 +219,7 @@ RULES = (
     ('cachemonitor/quick_qa.py', ('runtime', 'shared_ui', 'overlay_controls')),
     ('cachemonitor/qa.py', ('runtime',)),
     ('tools/verify_changes.py', ('selector',)),
+    ('tools/ci_plan.py', ('selector', 'release')),
     ('.github/workflows/windows.yml', ('selector', 'release')),
     ('tools/release_*.py', ('release',)),
     ('tools/verify_release_tools.py', ('release', 'selector')),
@@ -269,6 +269,7 @@ PACKAGE_PATTERNS = (
     'tools/configure-app-task.ps1', 'third-party-sources.lock.json', 'SOURCE-OFFER.md',
     'cachemonitor/install*.py', 'cachemonitor/app.py', 'cachemonitor/app_update.py', 'cachemonitor/app_restart.py',
     'cachemonitor/version.py', 'cachemonitor/runtime_check.py', 'cachemonitor/launch_context.py',
+    'cachemonitor/quick_smoke.py',
     'cachemonitor/windows_integration.py', 'cachemonitor/shell_shortcut.py',
     'tools/prepare_legacy_release.py',
 )
@@ -327,6 +328,28 @@ def changed_files(current, baseline=None, base_ref=None):
     return {path for path in before.keys() | current.keys() if before.get(path) != current.get(path)}
 
 
+def version_contract(source=None):
+    """Fingerprint executable version/compatibility code except the app version literal."""
+    source = source if source is not None else (ROOT/'cachemonitor/version.py').read_text(encoding='utf-8')
+    tree = ast.parse(source)
+    for node in tree.body:
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name) and node.targets[0].id == 'VERSION'
+                and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)):
+            node.value = ast.Constant(value='app-version')
+    return hashlib.sha256(ast.dump(tree).encode()).hexdigest()
+
+
+def release_version_only(*, base_ref=None, baseline=None):
+    if base_ref:
+        try:
+            before = git_bytes('show', f'{base_ref}:cachemonitor/version.py').decode('utf-8-sig')
+            return version_contract(before) == version_contract()
+        except (subprocess.CalledProcessError, SyntaxError, UnicodeError):
+            return False
+    return bool(baseline and baseline.get('version_contract') == version_contract())
+
+
 def test_dependents(changed, root):
     """Include consumers of shared test fixtures, including imports inside functions."""
     dependencies = {}
@@ -353,13 +376,14 @@ def test_dependents(changed, root):
             and (root / path).is_file()}
 
 
-def select_tests(changed, *, root=None, deleted=()):
+def select_tests(changed, *, root=None, deleted=(), version_only=False):
     """Map changes to contracts; unmapped code is an actionable selection error."""
     root = root or ROOT
     first_run = changed is None
     paths = set(changed or ())
     full = first_run or any(matches(path, FULL_PATTERNS) for path in paths)
-    proxy = first_run or any(matches(path, PROXY_PATTERNS) for path in paths)
+    proxy = first_run or any(matches(path, PROXY_PATTERNS) for path in paths
+                            if not (version_only and path == 'cachemonitor/version.py'))
     package = proxy or first_run or any(matches(path, PACKAGE_PATTERNS) for path in paths)
     selected, groups, unmapped = set(), set(), set()
     reasons = {}
@@ -377,6 +401,8 @@ def select_tests(changed, *, root=None, deleted=()):
         if path in test_changes or matches(path, FULL_PATTERNS):
             continue
         matched = next((scopes for pattern, scopes in RULES if fnmatch.fnmatchcase(path, pattern)), None)
+        if version_only and path == 'cachemonitor/version.py':
+            matched = ('payload', 'update')
         if matched is not None:
             groups.update(matched)
             for group in matched:
@@ -463,9 +489,17 @@ def package_check(executable, report_dir):
                 duration_seconds=report.get('duration_seconds'), session_rollup=rollup)
 
 
-def pytest_commands(tests):
+def pytest_commands(tests, *, integration=False, extended=False, report_dir=None):
     """Run selected UI checks together on the hidden desktop."""
-    pytest = [sys.executable, '-B', '-m', 'pytest', '-q', '--tb=short', '--durations=10']
+    pytest = [sys.executable, '-B', '-m', 'pytest', '-q', '--tb=short', '--maxfail=1', '--durations=10']
+    if extended:
+        pytest += ['-m', 'extended or not extended']
+    elif integration or tuple(tests) != ('tests',):
+        # Scoped work runs the affected integrations, not only the fast sweep.
+        pytest += ['-m', 'not extended']
+    if report_dir is not None:
+        pytest += ['--junitxml=' + str(report_dir / 'tests.xml'),
+                   '-o', 'cache_dir=' + str(REPORTS / 'pytest-cache')]
     runner = [sys.executable, str(ROOT / 'tools/run_ui_checks.py')]
     return [('native', [*runner, '--', *pytest, *tests])] if tests else []
 
@@ -474,22 +508,27 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--plan', action='store_true', help='Show checks without running them')
     parser.add_argument('--base', help='Git ref to compare when intentionally establishing a new baseline')
-    parser.add_argument('--full', action='store_true', help='Run the whole test suite')
+    parser.add_argument('--full', action='store_true', help='Run all essential regression checks')
+    parser.add_argument('--integration', action='store_true', help='Run all integration checks too (implies --full)')
+    parser.add_argument('--extended', action='store_true', help='Also run large-data benchmarks (implies --full)')
     parser.add_argument('--package-exe', type=Path, help='Check a built executable with isolated records')
     parser.add_argument('--package-only', action='store_true', help='Check only the executable after source checks')
     args = parser.parse_args(argv)
-    if args.package_only and (not args.package_exe or args.full):
-        parser.error('--package-only requires --package-exe and cannot be combined with --full')
+    if args.package_only and (not args.package_exe or args.full or args.integration or args.extended):
+        parser.error('--package-only requires --package-exe and cannot be combined with a source-suite option')
     current = file_hashes()
+    current_contract = version_contract()
     baseline = json.loads(BASELINE.read_text(encoding='utf-8')) if BASELINE.is_file() else None
     changed = changed_files(current, baseline, args.base)
-    plan = select_tests(changed,deleted=set(changed or ())-current.keys())
-    if args.full:
+    plan = select_tests(changed,deleted=set(changed or ())-current.keys(),
+                        version_only=release_version_only(base_ref=args.base, baseline=baseline))
+    if args.full or args.integration or args.extended:
         plan = {**plan, 'full':True, 'tests':('tests',), 'groups':('full',),
                 'reasons':{'tests':['사용자가 전체 검사를 지정함']}, 'unmapped':()}
     if args.package_only:
         plan = {**plan, 'full':False, 'tests':(), 'groups':(), 'reasons':{}, 'unmapped':()}
     public = dict(changed=sorted(changed) if changed is not None else None,
+                  suite='extended' if args.extended else 'integration' if args.integration else 'essential' if plan['full'] else 'affected',
                   full=plan['full'], unmapped=plan['unmapped'],
                   groups=plan['groups'], tests=plan['tests'], reasons=plan['reasons'],
                   package_impact=plan['package_impact'], proxy_impact=plan['proxy_impact'],
@@ -519,7 +558,8 @@ def main(argv=None):
         started = time.monotonic()
         runs = []
         outputs = []
-        for name, command in pytest_commands(plan['tests']):
+        for name, command in pytest_commands(plan['tests'], integration=args.integration,
+                                             extended=args.extended, report_dir=folder):
             run_started = time.monotonic()
             result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
             output = result.stdout + '\n' + result.stderr
@@ -552,7 +592,8 @@ def main(argv=None):
             return 1
     (folder/'report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
     if not args.package_only:
-        BASELINE.write_text(json.dumps(dict(version=1,files=current,report=str(folder/'report.json')),
+        BASELINE.write_text(json.dumps(dict(version=1,files=current,report=str(folder/'report.json'),
+                                           version_contract=current_contract),
                                        ensure_ascii=False,indent=2),encoding='utf-8')
     print(json.dumps(dict(result='passed',changed=len(changed) if changed is not None else None,
                           groups=plan['groups'],pytest=report.get('pytest'),package=report['package'],

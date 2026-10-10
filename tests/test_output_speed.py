@@ -62,6 +62,7 @@ def test_filtered_dashboard_and_overlay_share_call_values_without_previous_fallb
     assert OverlaySummaries().collect(engine)[0]['latest']['output_speed'] is None
 
 
+@pytest.mark.integration
 def test_rendered_summary_click_and_overlay_speed_navigation(tmp_path):
     from PySide6.QtCore import QSettings, Qt
     from PySide6.QtTest import QTest

@@ -9,6 +9,8 @@ from cachemonitor.dashboard import Dashboard, choose
 from cachemonitor.core import Session
 from cachemonitor.ui_details import price_reason, record_issues
 
+pytestmark = pytest.mark.integration
+
 
 def sample():
     now=time.time()
@@ -35,6 +37,7 @@ def deliver_pending(window):
 
 
 @pytest.mark.parametrize('language',['ko','en'])
+@pytest.mark.essential
 def test_tab_loading_hides_empty_content_and_ignores_stale_result(tmp_path,language):
     from PySide6.QtTest import QTest
     from cachemonitor.i18n import set_language

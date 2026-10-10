@@ -1,5 +1,7 @@
 """View transitions use the same native anchor and one control per action."""
 import pytest
+
+pytestmark = pytest.mark.integration
 from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QApplication
 

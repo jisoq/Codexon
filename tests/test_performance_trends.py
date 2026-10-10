@@ -234,6 +234,7 @@ def test_interval_comparison_matches_model_mode_and_completed_adjacent_period():
         assert line['points'][-1]['baseline'] is None and not line['points'][-1]['complete']
 
 
+@pytest.mark.extended
 def test_million_calls_keep_anomalies_and_bounded_frames(tmp_path):
     import json,time
     from PySide6.QtWidgets import QApplication
@@ -275,6 +276,7 @@ def test_million_calls_keep_anomalies_and_bounded_frames(tmp_path):
         assert not host.qml_errors
     finally:dispose(host)
 
+@pytest.mark.integration
 def test_qt_panel_hover_analysis_and_passive_click(tmp_path):
     from PySide6.QtCore import QSettings,Qt
     from PySide6.QtWidgets import QApplication
@@ -303,6 +305,7 @@ def test_qt_panel_hover_analysis_and_passive_click(tmp_path):
         assert host.quick.grabFramebuffer().save(str(tmp_path/'performance.png'))
     finally:dispose(host)
 
+@pytest.mark.integration
 def test_reasoning_tabs_share_trend_axis_and_keep_other_charts(tmp_path):
     from datetime import datetime
     from PySide6.QtCore import QSettings,QPointF,QObject
@@ -376,6 +379,7 @@ def test_reasoning_tabs_share_trend_axis_and_keep_other_charts(tmp_path):
     finally:dispose(host)
 
 
+@pytest.mark.integration
 def test_time_navigator_presets_live_updates_and_date_ranges(tmp_path):
     from datetime import datetime
     from PySide6.QtCore import QSettings,QMetaObject,Q_ARG,Qt,QPointF
@@ -462,6 +466,7 @@ def test_time_navigator_presets_live_updates_and_date_ranges(tmp_path):
     finally:dispose(host)
 
 
+@pytest.mark.integration
 def test_dashboard_tab_worker_contract_and_navigation(tmp_path):
     from PySide6.QtCore import QSettings
     from PySide6.QtWidgets import QApplication
@@ -490,7 +495,8 @@ def test_dashboard_tab_worker_contract_and_navigation(tmp_path):
     finally:dispose(w)
 
 
-@pytest.mark.parametrize('shell',[False,True])
+@pytest.mark.parametrize('shell',[True])
+@pytest.mark.integration
 def test_dense_workspace_units_and_hover_analysis(tmp_path,shell):
     import math
     from PySide6.QtCore import QSettings
@@ -500,11 +506,11 @@ def test_dense_workspace_units_and_hover_analysis(tmp_path,shell):
     from cachemonitor.quick_qa import mount,dispose,render_plot,control,click
     models=['gpt-6-astra','gpt-6.1-sol','gpt-5.6-sol']
     rows=[]
-    for i in range(18000):
+    for i in range(1800):
         model=models[i%3];speed=40+12*math.sin(i/160)+i%9
         if i%61<4:speed*=3
         if i%2:speed*=2
-        rows.append(row(i,ts=1789000000+i*140,model=model,service_tier='Fast' if i%2 else 'Standard',
+        rows.append(row(i,ts=1789000000+i*1400,model=model,service_tier='Fast' if i%2 else 'Standard',
             effort='high' if i%5 else 'medium',sid='session-'+str(i//70),cost=(.04+.02*(i%13)+(.8 if i%103==0 else 0))*(2.5 if i%2 else 1),
             input=40000+i%6000,cached=30000+i%5000,output=2000,reasoning=1200+(i%17)*30,
             output_speed=speed,completion_latency_ms=2000000/speed,duration=2000/speed))

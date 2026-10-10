@@ -107,7 +107,7 @@ def prepared_artifact(root):
 def test_verified_artifact_preserves_the_installer_without_rebuilding(root):
     folder = prepared_artifact(root)
     before = (folder/'Codexon-Setup.exe').read_bytes()
-    assert pipeline.validate_artifact(folder, SHA, '10', root)['coverage'] == 'full'
+    assert pipeline.validate_artifact(folder, SHA, '10', root)['coverage'] == 'affected-regression-v1'
     assert (folder/'Codexon-Setup.exe').read_bytes() == before
 
 
@@ -117,7 +117,7 @@ def test_windows_artifact_notes_match_linux_checkout_line_endings(root):
     notes.write_bytes(original.replace(b'\n', b'\r\n'))
     folder = prepared_artifact(root)
     notes.write_bytes(original)
-    assert pipeline.validate_artifact(folder, SHA, '10', root)['coverage'] == 'full'
+    assert pipeline.validate_artifact(folder, SHA, '10', root)['coverage'] == 'affected-regression-v1'
 
 
 @pytest.mark.parametrize('changed', ['Codexon-Setup.exe', 'RELEASE_NOTES.md', 'commit', 'run_id', 'coverage', 'source_key'])
@@ -245,9 +245,10 @@ def test_failed_and_nonancestor_runs_cannot_hide_unverified_changes(root, monkey
 
 def test_missing_verified_baseline_requests_full_checks(root):
     assert pipeline.verified_base(FakeGitHub(), SHA, root) == ''
-    workflow = (pipeline.ROOT/'.github/workflows/windows.yml').read_text()
-    assert 'PUSH_BASE: ${{ needs.resolve.outputs.base }}' in workflow
-    assert '-not $base' in workflow
+    from tools.ci_plan import build_plan
+    checks = build_plan(None, candidate=True)
+    assert checks['source_args'] == ['--integration']
+    assert checks['package'] and checks['proxy'] and checks['msix']
 
 
 def test_publish_failure_does_not_discard_successfully_verified_installer(root):

@@ -7,6 +7,7 @@ from cachemonitor.analysis_engine import AnalysisEngine
 from cachemonitor.history_projection import node_key
 
 
+@pytest.mark.integration
 def test_project_first_and_selection_does_not_navigate(dashboard):
     w=dashboard;w.change_page(2)
     assert w.record_view=='sessions' and w.selected_session is None
@@ -111,6 +112,7 @@ def test_search_and_sort_keep_one_session_hierarchy():
     assert [r['sid'] for r in engine.page_query(q)['explorer']['records']['rows']]==['parent','child']
 
 
+@pytest.mark.integration
 def test_rendered_disclosure_and_back_restore_hierarchy(dashboard,tmp_path):
     import time
     from PySide6.QtCore import Qt, QPointF
@@ -149,6 +151,7 @@ def test_rendered_disclosure_and_back_restore_hierarchy(dashboard,tmp_path):
     assert not w.qml_errors
 
 
+@pytest.mark.integration
 def test_empty_search_actions_restore_rows_and_preserve_route(dashboard,tmp_path):
     import time
     from PySide6.QtTest import QTest
@@ -182,6 +185,7 @@ def test_empty_search_actions_restore_rows_and_preserve_route(dashboard,tmp_path
 
 
 @pytest.mark.parametrize('loading',[False,True])
+@pytest.mark.integration
 def test_source_empty_history_distinguishes_collection(dashboard,loading,tmp_path):
     from PySide6.QtTest import QTest
     from cachemonitor.quick_qa import control,walk
@@ -198,6 +202,7 @@ def test_source_empty_history_distinguishes_collection(dashboard,loading,tmp_pat
     assert not w.qml_errors
 
 
+@pytest.mark.integration
 def test_reset_empty_history_filters_preserves_overlay_context(dashboard):
     from cachemonitor.overlay_navigation import NavigationTarget
     w=dashboard;w.navigate(NavigationTarget('fixture','s0',view='calls',request_id='t0'))

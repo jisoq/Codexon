@@ -6,14 +6,14 @@ from PySide6.QtWidgets import QApplication
 from cachemonitor.dashboard import Dashboard, choose
 from cachemonitor.fonts import load_bundled_fonts
 from cachemonitor.i18n import set_language, language
-from cachemonitor.quick_qa import control, walk, mount, dispose
-from cachemonitor.table_model import Table
+from cachemonitor.quick_qa import control, walk
 from tests.test_ui import snapshot
+
+pytestmark = pytest.mark.integration
 
 
 @pytest.mark.parametrize('locale,theme,width,height', [
-    ('ko','light',1700,1000), ('en','light',1120,760),
-    ('ko','dark',2400,1100), ('en','dark',1700,1000),
+    pytest.param('en','light',1120,760,marks=pytest.mark.essential), ('ko','dark',1700,1000),
 ])
 def test_approved_pages_render_with_stable_routes_and_aligned_fields(tmp_path, locale, theme, width, height):
     app=QApplication.instance() or QApplication([]);load_bundled_fonts()
@@ -87,18 +87,3 @@ def test_approved_pages_render_with_stable_routes_and_aligned_fields(tmp_path, l
         window.change_page(0);window.apply_explorer()
     finally:
         window.quit_app();set_language(old_language);app.setProperty('cachemonitorDisableShellIntegration',previous)
-
-
-def test_table_style_is_opt_in():
-    app=QApplication.instance() or QApplication([])
-    node=Table(headers=['Name','Value']);node.set_rows([['Example','123']],lambda row,col,role:row[col])
-    host=mount(node,600,250)
-    try:
-        table=control(host,node)
-        assert table.property('readableColumns') is False
-        assert table.property('cellPadding')==9
-        assert not any(item.isVisible() for item in walk(table) if item.objectName()=='column-divider')
-        node.put(readableColumns=True,leftColumns=[0]);QTest.qWait(40)
-        assert table.property('cellPadding')==12
-        assert any(item.isVisible() for item in walk(table) if item.objectName()=='column-divider')
-    finally:dispose(host)

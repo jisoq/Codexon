@@ -16,6 +16,7 @@ from cachemonitor.model_evidence import home_key
 
 
 
+@pytest.mark.integration
 def test_managed_relay_is_one_process_and_explicit_off_drains_without_supervisor(tmp_path):
     import socket
     with socket.socket() as socket_:
@@ -55,6 +56,7 @@ def test_managed_relay_is_one_process_and_explicit_off_drains_without_supervisor
 
 
 @pytest.mark.skipif(sys.platform != 'win32', reason='Winsock invalid descriptor regression')
+@pytest.mark.integration
 def test_invalid_selector_socket_exits_and_app_recovers_same_address(tmp_path, monkeypatch):
     """Inject the actual select(WSAENOTSOCK), not a request-handler exception."""
     import socket
@@ -167,6 +169,7 @@ def test_fatal_report_preserves_original_failure_and_redacts_messages(tmp_path):
     assert read_json(tmp_path/'proxy-failure.previous.json')['id'] == report['id']
 
 
+@pytest.mark.integration
 def test_background_proxy_bind_failure_exits_without_uncaught_traceback(tmp_path):
     import socket
     with socket.socket() as occupied:

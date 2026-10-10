@@ -185,6 +185,7 @@ def test_accumulated_connections_retire_and_reconnect_without_pool_wait(tmp_path
     run_proxy_test(run())
 
 
+@pytest.mark.integration
 def test_100_busy_connections_have_bounded_local_failure_and_http_is_independent(tmp_path):
     import time
     from aiohttp import WSServerHandshakeError

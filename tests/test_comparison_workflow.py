@@ -2,6 +2,8 @@
 import copy
 import pytest
 
+pytestmark = pytest.mark.integration
+
 from cachemonitor.quick_qa import control, click, click_row, walk
 from test_ui import dashboard, snapshot
 

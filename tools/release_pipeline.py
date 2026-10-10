@@ -123,7 +123,7 @@ def seal(folder, product, sha, run_id, root=ROOT):
     shutil.copyfile(product/'build-manifest.json', folder/'build-manifest.json')
     shutil.copyfile(root/f'docs/releases/{manifest["version"]}.md', folder/'RELEASE_NOTES.md')
     receipt = dict(schema=1, commit=sha, version=manifest['version'], run_id=str(run_id),
-                   coverage='full', source_key=reference['key'],
+                   coverage='affected-regression-v1', source_key=reference['key'],
                    files={name: digest(folder/name) for name in FILES})
     (folder/'verification.json').write_text(json.dumps(receipt, indent=2) + '\n', encoding='utf-8')
     return receipt
@@ -133,7 +133,7 @@ def validate_artifact(folder, sha, run_id, root=ROOT):
     receipt = json.loads((folder/'verification.json').read_text(encoding='utf-8'))
     if (receipt.get('schema') != 1 or receipt.get('commit') != sha
             or receipt.get('version') != version(root) or receipt.get('run_id') != str(run_id)
-            or receipt.get('coverage') != 'full'
+            or receipt.get('coverage') not in ('full', 'affected-regression-v1')
             or receipt.get('source_key') != describe(load_lock(root))['key']):
         raise ValueError('Artifact verification receipt does not match this release')
     if set(receipt['files']) != set(FILES):
@@ -170,7 +170,7 @@ def publish(github, sha, verified_run, current_run, folder, root=ROOT):
     notes = (folder/'RELEASE_NOTES.md').read_text(encoding='utf-8')
     notes += (f'\n\nThird-party source / 서드파티 소스: [Qt/PySide6 {reference["version"]}]({reference["url"]})'
               f' ([SHA-256]({reference["url"]}.sha256)).\n\n'
-              f'Source: {sha}. Full verification: https://github.com/{github.repository}/actions/runs/{verified_run}\n')
+              f'Source: {sha}. Release verification: https://github.com/{github.repository}/actions/runs/{verified_run}\n')
     notes_path = folder/'publication-notes.md'
     notes_path.write_text(notes, encoding='utf-8')
     assets = [folder/'Codexon-Setup.exe', folder/'Codexon-Setup.exe.sha256']

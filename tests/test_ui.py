@@ -12,6 +12,8 @@ from cachemonitor.analytics import project_key
 from cachemonitor.overlay_navigation import NavigationTarget
 from cachemonitor.quick_qa import control, click, click_row
 
+pytestmark = pytest.mark.integration
+
 
 def snapshot(now=None):
     now=now or time.time();sessions=[]
@@ -45,6 +47,7 @@ def dashboard(tmp_path):
     app.setProperty('cachemonitorDisableShellIntegration',previous)
 
 
+@pytest.mark.essential
 def test_sequential_drilldown_and_full_call_detail(dashboard,tmp_path):
     w=dashboard;w.nav.setCurrentRow(w.navigation_pages.index(2));QTest.qWait(40)
     assert w.record_view=='sessions'
