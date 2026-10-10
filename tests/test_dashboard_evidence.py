@@ -46,8 +46,21 @@ def test_tab_loading_hides_empty_content_and_ignores_stale_result(tmp_path,langu
         old_id,old_query,old_logical=window.request_id,window.pending_query,window.pending_logical
         assert window.analysis_pending and not window.pages.isVisible()
         assert window.analysis_notice.isVisible() and not window.analysis_notice_body.isVisible()
-        QTest.qWait(200)
-        title=control(window,window.analysis_notice_title)
+        # Timer expiry and QML visibility propagation are separate event-loop
+        # turns. Await the rendered state instead of assuming 200 ms is enough.
+        deadline=time.monotonic()+5
+        title=None
+        while time.monotonic()<deadline:
+            QApplication.processEvents()
+            try:title=control(window,window.analysis_notice_title)
+            except AssertionError:pass
+            if title is not None and title.isVisible() and title.width()>0 and title.height()>0:break
+            QTest.qWait(10)
+        if title is None or not title.isVisible():
+            from pathlib import Path
+            evidence=Path('artifacts/verification/dashboard-loading');evidence.mkdir(parents=True,exist_ok=True)
+            window.grab().save(str(evidence/f'failed-{language}.png'))
+        assert title is not None
         assert title.isVisible()
         assert ('Loading' if language=='en' else '불러오는 중') in window.analysis_notice_title.state['text']
         assert window.grab().save(str(tmp_path/f'tab-loading-{language}.png'))
