@@ -492,28 +492,34 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
             # A failed upstream close must not leave a phantom active relay or
             # prevent pool release. Closing is best-effort after forwarding ends.
             try:
-                if response is not None:await response.aclose()
-            except Exception as exc:diagnostic['cleanup_error_type']=type(exc).__name__
-            finally:
                 try:
-                    if lease is not None:await connection.__aexit__(None,None,None)
+                    if response is not None:await response.aclose()
                 except Exception as exc:diagnostic['cleanup_error_type']=type(exc).__name__
-            if response_observer is not None:
-                response_observer.finish()
-                diagnostic['response_observation']=response_observer.error or response_observer.consumer.error or 'parsed'
-            if any(diagnostic.get(name) not in (None,'parsed') for name in ('request_observation','response_observation')):
-                health['observation_skips']+=1
-            tracker.finish()
-            diagnostic.update(phase=phase,elapsed_ms=round((time.monotonic()-started)*1000,3),finished_at=time.time())
-            diagnostic.setdefault('outcome','finished')
-            active_relays.pop(relay_id,None)
-            sockets.pop(relay_id,None)
-            relay_controls.pop(relay_id,None)
-            if is_ws:budget.release(relay_id)
-            recent_relays.append(public(diagnostic))
-            if diagnostics is not None:
-                try:diagnostics(public(diagnostic))
-                except Exception:pass  # Optional diagnostics must never change transport behavior.
+                finally:
+                    try:
+                        if lease is not None:await connection.__aexit__(None,None,None)
+                    except Exception as exc:diagnostic['cleanup_error_type']=type(exc).__name__
+            finally:
+                # Cancellation during either asynchronous close still releases
+                # accounting, and propagates after this synchronous finalization.
+                try:
+                    if response_observer is not None:
+                        response_observer.finish()
+                        diagnostic['response_observation']=response_observer.error or response_observer.consumer.error or 'parsed'
+                    if any(diagnostic.get(name) not in (None,'parsed') for name in ('request_observation','response_observation')):
+                        health['observation_skips']+=1
+                    tracker.finish()
+                finally:
+                    diagnostic.update(phase=phase,elapsed_ms=round((time.monotonic()-started)*1000,3),finished_at=time.time())
+                    diagnostic.setdefault('outcome','finished')
+                    active_relays.pop(relay_id,None)
+                    sockets.pop(relay_id,None)
+                    relay_controls.pop(relay_id,None)
+                    if is_ws:budget.release(relay_id)
+                    recent_relays.append(public(diagnostic))
+                    if diagnostics is not None:
+                        try:diagnostics(public(diagnostic))
+                        except Exception:pass  # Optional diagnostics must never change transport behavior.
 
     app.router.add_route('*','/{tail:.*}',handle)
     return app

@@ -411,6 +411,76 @@ def test_disconnect_while_waiting_for_upstream_cancels_work(tmp_path):
     run_proxy_test(run())
 
 
+@pytest.mark.parametrize('cancel_at', ['response_close', 'pool_release'])
+def test_cancellation_during_http_cleanup_releases_active_relay(tmp_path, monkeypatch, cancel_at):
+    from aiohttp import ClientTimeout
+    from types import SimpleNamespace
+    import cachemonitor.model_proxy as module
+
+    async def run():
+        cleanup_started = asyncio.Event()
+        handler_done = asyncio.Event()
+        pool_released = asyncio.Event()
+        cleanup_task = None
+
+        async def block_cleanup():
+            nonlocal cleanup_task
+            cleanup_task = asyncio.current_task()
+            cleanup_task.add_done_callback(lambda _: handler_done.set())
+            cleanup_started.set()
+            await asyncio.Future()
+
+        class Response:
+            status_code = 200
+            reason_phrase = 'OK'
+            http_version = 'HTTP/1.1'
+            headers = SimpleNamespace(get=lambda *args: '', raw=[])
+
+            async def aiter_raw(self):
+                yield b'complete'
+
+            async def aclose(self):
+                if cancel_at == 'response_close':
+                    await block_cleanup()
+
+        class Pool:
+            def __init__(self, *args):
+                pass
+
+            @asynccontextmanager
+            async def lease(self):
+                async def send(*args, **kwargs):
+                    return Response()
+                try:
+                    yield SimpleNamespace(client=SimpleNamespace(send=send), complete=False)
+                finally:
+                    try:
+                        if cancel_at == 'pool_release':
+                            await block_cleanup()
+                    finally:
+                        pool_released.set()
+
+            async def close(self):
+                pass
+
+        monkeypatch.setattr(module, 'HTTPRelayPool', Pool)
+        store = EvidenceStore(tmp_path / 'e.sqlite')
+        try:
+            async with server(create_app(store, tmp_path, 'http://127.0.0.1:1')) as proxy, ClientSession(timeout=ClientTimeout(total=3)) as client:
+                assert await (await client.get(proxy + '/models')).read() == b'complete'
+                await asyncio.wait_for(cleanup_started.wait(), 2)
+                cleanup_task.cancel()
+                await asyncio.wait_for(handler_done.wait(), 2)
+                assert pool_released.is_set()
+                health = await (await client.get(proxy + '/health')).json()
+                assert health['http_connections'] == 0
+                assert health['active_connections'] == 0
+        finally:
+            store.close()
+
+    run_proxy_test(run())
+
+
 def test_no_default_content_type_is_added_and_sse_still_observed(tmp_path):
     async def run():
         store=EvidenceStore(tmp_path/'e.sqlite')
