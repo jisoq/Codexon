@@ -62,6 +62,105 @@ def test_shared_local_quota_keeps_its_age_during_account_failure(tmp_path,monkey
     assert all(r['quota']['observed_at']==1000 for r in reports)
 
 
+@pytest.mark.parametrize('outage',[False,True],ids=['slow-lookup','ledger-outage'])
+def test_local_ingress_preserves_distinct_samples_and_tracking_boundaries(tmp_path,monkeypatch,outage):
+    clock=[1000.]
+    monkeypatch.setattr(module,'time',SimpleNamespace(time=lambda:clock[0],monotonic=lambda:clock[0]))
+    service=None
+    def inputs():
+        def local(at):
+            clock[0]=at
+            return dict(observed_at=at,windows={'weekly':dict(used_percent=at-1000,resets_at=20000,window_minutes=10080)})
+        assert service.supply_local(local(1001))
+        assert service.supply_local(local(1002))
+        clock[0]=1003;assert service.set_tracking_enabled(False)
+        disabled=local(1004);assert service.supply_local(disabled)
+        clock[0]=1005;assert service.set_tracking_enabled(True)
+        assert service.supply_local(disabled)  # Re-delivery cannot turn an OFF sample into recorded history.
+        assert service.supply_local(local(1006))
+        assert service.local_observations.qsize()==1
+    class Client:
+        def __init__(self,*args):pass
+        def close(self):pass
+        def fetch(self):
+            inputs()  # Input arrives before this lookup returns to the service loop.
+            return dict(source='live',account='test',requested_at=1000,observed_at=clock[0],
+                windows={'weekly':dict(used_percent=10,resets_at=20000,window_minutes=10080)})
+    class Wake:
+        def clear(self):pass
+        def set(self):pass
+        def wait(self,seconds):clock[0]+=seconds
+    monkeypatch.setattr(module,'AccountClient',Client)
+    service=module.QuotaService(tmp_path/'home',tmp_path/'index.sqlite',live=not outage,reports_enabled=False)
+    service.wake=Wake()
+    if outage:
+        inputs()
+        def unavailable(*args):raise sqlite3.OperationalError('synthetic outage')
+        monkeypatch.setattr(module,'QuotaLedger',unavailable)
+    service.isInterruptionRequested=lambda:clock[0]>=1007
+    service.run()
+    if outage:
+        monkeypatch.setattr(module,'QuotaLedger',QuotaLedger)
+        service=module.QuotaService(tmp_path/'home',tmp_path/'index.sqlite',live=False,reports_enabled=False)
+        service.wake=Wake();service.isInterruptionRequested=lambda:clock[0]>=1008
+        service.run()
+    with sqlite3.connect(service.path) as db:
+        assert [row[0] for row in db.execute("select at from observations where source='local' order by at")]==[1001,1002,1006]
+        assert list(db.execute('select at,enabled from tracking_controls order by at'))==[(1000,1),(1003,0),(1005,1)]
+    assert service.ingress_closed and not service.supply_local(dict(observed_at=1009))
+    assert not service.set_tracking_enabled(False)
+
+
+def test_rejected_tracking_change_keeps_state_and_accepted_control_timestamps(tmp_path,monkeypatch):
+    from cachemonitor.quota_backlog import ObservationBacklog
+    clock=[1000.]
+    monkeypatch.setattr(module,'time',SimpleNamespace(time=lambda:clock[0],monotonic=lambda:clock[0]))
+    monkeypatch.setattr(ObservationBacklog,'MAX_ITEMS',1)
+    monkeypatch.setattr(ObservationBacklog,'CONTROL_RESERVE',1)
+    service=module.QuotaService(tmp_path/'home',tmp_path/'index.sqlite',live=False,reports_enabled=False)
+    clock[0]=1001
+    assert service.set_tracking_enabled(False)
+    clock[0]=1002
+    assert not service.set_tracking_enabled(True)
+    assert not service.tracking_enabled and service.control_issue
+    assert service.backlog.unsaved is None
+    service.stop()
+    restored=ObservationBacklog(service.path,service.home)
+    try:
+        first=restored.first();assert first[1:]==('control',[True,1000])
+        restored.acknowledge(first[0])
+        second=restored.first();assert second[1:]==('control',[False,1001])
+        restored.acknowledge(second[0])
+        assert restored.first() is None
+    finally:restored.close()
+
+
+def test_rejected_live_observation_remains_visible_and_stops_new_reads(tmp_path,monkeypatch):
+    clock=[1000.];reads=[];updates=[]
+    monkeypatch.setattr(module,'time',SimpleNamespace(time=lambda:clock[0],monotonic=lambda:clock[0]))
+    class Client:
+        def __init__(self,*args):pass
+        def close(self):pass
+        def fetch(self):
+            reads.append(clock[0])
+            return dict(source='live',account='test',requested_at=clock[0],observed_at=clock[0],
+                oversized='x'*module.ObservationBacklog.MAX_ITEM_BYTES,
+                windows={'weekly':dict(used_percent=10,resets_at=20000,window_minutes=10080)})
+    class Wake:
+        def clear(self):pass
+        def set(self):pass
+        def wait(self,seconds):clock[0]+=seconds
+    monkeypatch.setattr(module,'AccountClient',Client)
+    service=module.QuotaService(tmp_path/'home',tmp_path/'index.sqlite',reports_enabled=False)
+    service.wake=Wake();service.updated.connect(updates.append)
+    service.isInterruptionRequested=lambda:clock[0]>=1120
+    service.run()
+    assert reads==[1000]
+    assert service.observation_issue and all(value['issue'] for value in updates)
+    with sqlite3.connect(service.path) as db:
+        assert db.execute('select count(*) from observations').fetchone()[0]==0
+
+
 def test_activity_is_coalesced_without_postponing_or_overriding_backoff():
     p=QuotaPolling()
     p.activity(('start',),True,0)
@@ -81,6 +180,87 @@ def test_activity_is_coalesced_without_postponing_or_overriding_backoff():
     assert p.next_read==409
     p.finish(410,True)
     assert p.next_read==425 and p.failures==0
+
+
+def test_storage_outage_capacity_stops_reads_and_restart_recovers_every_sample(tmp_path,monkeypatch):
+    from cachemonitor.quota_backlog import ObservationBacklog
+    from cachemonitor import quota_tracking_store
+    clock=[1000.]
+    fake_time=SimpleNamespace(time=lambda:clock[0],monotonic=lambda:clock[0])
+    monkeypatch.setattr(module,'time',fake_time)
+    monkeypatch.setattr(quota_tracking_store,'time',fake_time)
+    monkeypatch.setattr(ObservationBacklog,'MAX_ITEMS',4)
+    reads=[];updates=[]
+    class Client:
+        def __init__(self,*args):pass
+        def close(self):pass
+        def fetch(self):
+            reads.append(clock[0])
+            return dict(source='live',account='test',bucket='codex',plan_type='pro',
+                requested_at=clock[0],observed_at=clock[0],elapsed=0,
+                windows={'weekly':dict(used_percent=20+len(reads),resets_at=20000,window_minutes=10080)})
+    def unavailable(*args):
+        error=sqlite3.OperationalError('full')
+        error.sqlite_errorcode=sqlite3.SQLITE_FULL
+        raise error
+    class Wake:
+        def clear(self):pass
+        def set(self):pass
+        def wait(self,seconds):clock[0]+=seconds
+    def run(until):
+        service=module.QuotaService(tmp_path/'home',tmp_path/'index.sqlite',reports_enabled=False)
+        service.wake=Wake()
+        service.isInterruptionRequested=lambda:clock[0]>=until
+        service.updated.connect(updates.append)
+        service.run()
+        return service
+    monkeypatch.setattr(module,'AccountClient',Client)
+    monkeypatch.setattr(module,'QuotaLedger',unavailable)
+    service=run(1300)
+    assert reads==[1000,1060,1120]
+    assert any('새 조회를 중지' in value['issue'] for value in updates)
+    monkeypatch.setattr(module,'QuotaLedger',QuotaLedger)
+    run(1310)
+    with sqlite3.connect(service.path) as db:
+        recovered=[row[0] for row in db.execute('select received from tracking_observations order by received')]
+        assert recovered==reads and len(recovered)==len(set(recovered))
+        assert db.execute('select started from tracking_config').fetchone()[0]==1000
+    assert reads[-1]>=1300 and updates[-1]['issue']==''
+
+
+def test_committed_observation_replay_after_interrupted_ack_is_idempotent(tmp_path,monkeypatch):
+    from cachemonitor.quota_backlog import ObservationBacklog
+    clock=[1000.]
+    fake_time=SimpleNamespace(time=lambda:clock[0],monotonic=lambda:clock[0])
+    monkeypatch.setattr(module,'time',fake_time)
+    quota=dict(source='live',account='test',requested_at=1000,observed_at=1000,
+        windows={'weekly':dict(used_percent=25,resets_at=20000,window_minutes=10080)})
+    class Client:
+        def __init__(self,*args):pass
+        def close(self):pass
+        def fetch(self):return quota
+    class Wake:
+        def clear(self):pass
+        def set(self):pass
+        def wait(self,seconds):clock[0]+=seconds
+    monkeypatch.setattr(module,'AccountClient',Client)
+    original=ObservationBacklog.acknowledge
+    interrupted=[]
+    def acknowledge(self,sequence):
+        if self.first()[1]=='quota' and not interrupted:
+            interrupted.append(True)
+            raise sqlite3.OperationalError('interrupted acknowledgement')
+        original(self,sequence)
+    monkeypatch.setattr(ObservationBacklog,'acknowledge',acknowledge)
+    for until in (1001,1003):
+        service=module.QuotaService(tmp_path/'home',tmp_path/'index.sqlite',reports_enabled=False)
+        service.wake=Wake();service.isInterruptionRequested=lambda:clock[0]>=until
+        service.run()
+    with sqlite3.connect(service.path) as db:
+        assert db.execute('select count(*) from tracking_observations').fetchone()[0]==1
+    backlog=ObservationBacklog(service.path,service.home)
+    try:assert backlog.first() is None
+    finally:backlog.close()
 
 
 def test_hidden_reports_keep_recording_and_resume_with_current_history(tmp_path,monkeypatch):
@@ -266,6 +446,42 @@ def test_exclusion_edits_refresh_locally_and_restore_without_changing_live_quota
         assert reopened.db.execute('select count(*) from calls').fetchone()[0]==2
         assert reopened.db.execute('select count(*) from quota_exclusions where restored_at is not null').fetchone()[0]==1
     finally:reopened.close()
+
+
+@pytest.mark.parametrize('operation,tracking_change',[('exclude',False),('restore',False),('exclude',True)])
+def test_completed_edit_report_restarts_history_refresh_interval(tmp_path,monkeypatch,operation,tracking_change):
+    clock=[1000.];requests=[];completed=[]
+    monkeypatch.setattr(module,'time',SimpleNamespace(time=lambda:clock[0],monotonic=lambda:clock[0]))
+    class Worker:
+        def __init__(self,path,home,on_result):self.on_result=on_result;self.sequence=0
+        def request(self,kind,**payload):
+            self.sequence+=1;requests.append((kind,clock[0]))
+            result=dict(kind=kind,id=self.sequence,report={'at':clock[0]})
+            if kind in ('exclude','restore'):
+                clock[0]+=6  # Completion passes the previous ordinary refresh deadline.
+                if tracking_change:service.set_tracking_enabled(True)
+                result.update(saved=True,exclusion_result=dict(operation=kind,ok=True,id='edited'))
+            self.on_result(result)
+            return self.sequence
+        def close(self):pass
+    monkeypatch.setattr(module,'QuotaWorker',Worker)
+    service=module.QuotaService(tmp_path/'home',tmp_path/'index.sqlite',live=False,tracking_enabled=False)
+    service.updated.connect(lambda value:completed.append(clock[0]) if value.get('exclusion_result') else None)
+    class Wake:
+        def clear(self):pass
+        def set(self):pass
+        def wait(self,seconds):
+            clock[0]+=seconds
+            if clock[0]==1004:
+                if operation=='exclude':service.request_exclusion(1,2)
+                else:service.restore_exclusion('edited')
+    service.wake=Wake()
+    service.isInterruptionRequested=lambda:clock[0]>=1018
+    service.run()
+    assert len(completed)==1
+    expected=[('report',1000.),(operation,1004.)]
+    if tracking_change:expected.append(('report',completed[0]))
+    assert requests==[*expected,('report',completed[0]+5)]
 
 
 @pytest.mark.parametrize('failure_stage',['startup','lock','report','lookup'])

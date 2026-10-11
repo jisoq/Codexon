@@ -23,9 +23,6 @@ def configure_quota_layout(panel):
     panel.manage_button=Button('제외 관리');panel.manage_button.put(fontSize=12,height=30)
     actions.addWidget(panel.manage_button)
     build_exclusion_dialog(panel)
-    impact=panel.exclusions.impact_details
-    impact.toggle.hide();impact.toggle.setChecked(True)
-    impact.changed.connect(lambda: impact.content.setVisible(True))
     for node in (panel.summary_heading,panel.history_controls,panel.result,panel.cycle_value,panel.lifetime_basis,panel.cycle_basis,panel.conversion):
         detach(node)
     summary_card=Group();summary_card.put(background='secondary',border='border',radius=12)
@@ -115,7 +112,6 @@ def build_exclusion_dialog(panel):
         panel.history_heading.setText(formatted('제외 내역 {count}',count=len(records)))
         panel.exclusion_history_empty.setVisible(not records)
         editor.history.setVisible(bool(records))
-        editor.impact_details.toggle.setChecked(True)
         panel.history.put(manageExclusions=editable)
     panel.sync_dialog=sync
     def open_dialog(*_):

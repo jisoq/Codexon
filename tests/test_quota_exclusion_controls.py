@@ -21,47 +21,86 @@ def wait_until(app, condition):
     assert condition()
 
 
-def test_slow_preview_keeps_ui_responsive_and_applies_only_latest_range(monkeypatch):
-    from functools import partial
-    import multiprocessing as mp
-    from PySide6.QtCore import QTimer
-    from cachemonitor import quota_worker
+@pytest.mark.parametrize('compact', [False, True])
+def test_editing_range_and_reason_needs_no_computation(monkeypatch, compact):
+    from unittest.mock import Mock
+    from cachemonitor import quota_exclusions, quota_worker
     from cachemonitor.quota_exclusion_controls import QuotaExclusions
     from cachemonitor.quota_view import prepare_quota_view
-    from test_quota_worker import delayed_preview_process
+    app=QApplication.instance() or QApplication([])
+    report=sample_report();report['view']=prepare_quota_view(report)
+    worker=Mock()
+    if compact:
+        report=quota_worker.compact_report(report, 1)
+        report['_worker']=worker
+    create_worker=Mock(side_effect=AssertionError('Editing must not start a worker'))
+    preview=Mock(side_effect=AssertionError('Editing must not calculate totals'))
+    monkeypatch.setattr(quota_worker,'QuotaWorker',create_worker)
+    monkeypatch.setattr(quota_exclusions,'preview_exclusion',preview)
+    editor=QuotaExclusions()
+    editor.set_context(report,report['view']['periods'][0])
+    requests=[];editor.requested.connect(requests.append)
+    try:
+        editor.select_range(100,110)
+        assert editor.apply.isEnabled()
+        editor.select_range(110,120)
+        editor.select_range(110,130)
+        editor.reason.setText('keep this reason')
+        # A refreshed report must preserve the edit without restarting work.
+        refreshed={**report}
+        editor.set_context(refreshed,refreshed['view']['periods'][0])
+        app.processEvents()
+        assert editor.reason.text()=='keep this reason'
+        assert editor.apply.isEnabled()
+        editor.reason.setText('edited reason')
+        assert editor.apply.isEnabled()
+        editor.submit()
+        assert requests==[dict(start=110,end=130,reason='edited reason')]
+        assert not editor.apply.isEnabled()
+        editor.submit()
+        assert len(requests)==1
+        worker.request.assert_not_called()
+        create_worker.assert_not_called()
+        preview.assert_not_called()
+        editor.set_pending(False)
+        editor.cancel_edit()
+        assert not editor.apply.isEnabled()
+        editor.submit()
+        assert len(requests)==1
+    finally:
+        editor.deleteLater()
+
+
+def test_range_validation_blocks_invalid_and_already_excluded_selections():
+    from cachemonitor.quota_exclusion_controls import QuotaExclusions
+    from cachemonitor.quota_view import prepare_quota_view
     app=QApplication.instance() or QApplication([])
     report=sample_report();report['view']=prepare_quota_view(report)
     editor=QuotaExclusions()
     editor.set_context(report,report['view']['periods'][0])
-    context=mp.get_context('spawn')
-    entered,release=context.Event(),context.Event()
-    calls=context.Queue();ticks=[]
-    original=quota_worker.QuotaWorker
-    monkeypatch.setattr(quota_worker,'QuotaWorker',lambda:original(process_target=partial(
-        delayed_preview_process,entered=entered,release=release,calls=calls)))
+    requests=[];editor.requested.connect(requests.append)
     try:
-        editor.select_range(100,110)
-        wait_until(app,entered.is_set)
-        QTimer.singleShot(0,lambda:ticks.append(True))
-        editor.select_range(110,120)
+        editor.select_range(110,110)
+        assert not editor.apply.isEnabled() and editor.selection_error.isVisible()
         editor.select_range(110,130)
-        editor.reason.setText('keep this reason')
-        wait_until(app,lambda:bool(ticks))
-        assert not editor.apply.isEnabled() and editor._preview is None
-        release.set()
-        wait_until(app,lambda:editor._preview is not None)
-        assert [calls.get(timeout=2),calls.get(timeout=2)]==[(100,110),(110,130)]
-        assert editor._preview['removed']['cost']==300
-        assert editor.reason.text()=='keep this reason'
+        assert editor.apply.isEnabled() and not editor.selection_error.isVisible()
+        editor.end.setCurrentIndex(0)
+        assert not editor.apply.isEnabled()
+        editor.select_range(110,130)
+        # Adjacent exclusions jointly cover this selection after a report refresh.
+        changed={**report,'exclusions':[exclusion(110,120),exclusion(120,130)]}
+        editor.set_context(changed,changed['view']['periods'][0])
+        assert not editor.apply.isEnabled() and editor.selection_error.isVisible()
+        editor.submit()
+        assert not requests
+        editor.select_range(100,130)
         assert editor.apply.isEnabled()
-        editor.cancel_edit()
-        assert editor._preview_request is None
+        editor.set_context({**report,'account':''},report['view']['periods'][0])
+        assert not editor.apply.isEnabled()
+        editor.submit()
+        assert not requests
     finally:
-        release.set()
-        wait_until(app,lambda:editor._preview_task is None)
-        if editor._owned_worker:editor._owned_worker.close()
-        calls.close();calls.join_thread()
-        editor.deleteLater()
+        editor.deleteLater();app.processEvents()
 
 
 @pytest.mark.integration
@@ -89,15 +128,14 @@ def test_compact_exclusion_reason_restore_and_all_cycles(tmp_path, width, dark):
         chart.beginRangeSelection(chart.x_at(1), y)
         chart.selectionRelease(chart.x_at(3), y)
         assert editor.start.currentData() == 110 and editor.end.currentData() == 130
-        wait_until(app, lambda: editor._preview is not None)
-        assert editor._preview['removed']['cost'] == 300
-        assert editor.impact_details.content.isVisible()
+        assert editor.apply.isEnabled()
         modal=panel.dialog.host
         assert modal is not None
         render_plot(modal, editor.reason)
         field = control(modal, editor.reason)
         field.forceActiveFocus(); QTest.keyClicks(modal.quick, 'benchmark run')
         assert editor.reason.text() == 'benchmark run'
+        assert editor.apply.isEnabled()
         assert field.property('maximumLength') == 200
         for node in (editor.start, editor.end, editor.reason, editor.apply, editor.cancel):
             item = control(modal, node)
@@ -151,15 +189,18 @@ def test_failed_save_retains_range_and_reason_until_retry(tmp_path):
     panel.receive({'home':'h', 'report':sample_report()})
     editor = panel.exclusions
     editor.select_range(110, 130); editor.reason.setText('테스트 실행')
-    wait_until(app, lambda: editor._preview is not None)
+    assert editor.apply.isEnabled()
     editor.submit()
     panel.receive({'home':'h', 'report':sample_report(),
                    'exclusion_result':dict(operation='exclude', ok=False, error='저장 실패')})
-    wait_until(app, lambda: editor._preview is not None)
     assert editor.isVisible() and editor.apply.isEnabled()
     assert editor.reason.text() == '테스트 실행'
     assert (editor.start.currentData(), editor.end.currentData()) == (110, 130)
     assert editor.message.text() == '저장 실패'
+    requests=[];panel.exclusion_requested.connect(requests.append)
+    editor.reason.setText('수정한 사유')
+    editor.submit()
+    assert requests==[dict(start=110,end=130,reason='수정한 사유')]
 
 
 def test_full_exclusion_is_a_zero_result_and_reason_is_never_translated(tmp_path):

@@ -34,8 +34,10 @@ def main():
             CREATE TABLE IF NOT EXISTS observation_context(id TEXT PRIMARY KEY,plan TEXT,bucket TEXT);''')
         source=sqlite3.connect(args.rebuild_index.resolve().as_uri()+'?mode=ro',uri=True)
         events=defaultdict(list)
-        for home,tid,data in source.execute('select home,tid,data from events order by home,tid,ts,path,pos'):
-            events[(home,tid)].append(json.loads(data))
+        for home,tid,path,pos,data in source.execute('select home,tid,path,pos,data from events order by home,tid,ts,path,pos'):
+            event=json.loads(data)
+            event.setdefault('event_id',f'{Path(path).name}:{pos}')
+            events[(home,tid)].append(event)
         source.close()
         views=[]
         for (home,tid),records in events.items():

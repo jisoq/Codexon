@@ -188,6 +188,42 @@ def test_restore_rejects_other_current_account(tmp_path):
         ledger.close()
 
 
+@pytest.mark.parametrize('tracked',[False,True])
+def test_edit_validation_preserves_boundaries_without_reading_call_history(tmp_path,tracked):
+    from cachemonitor.quota_view import history_rows
+    from test_quota_tracking_integration import _committed_quota_fixture
+    ledger=QuotaLedger(tmp_path/'edit-context.sqlite')
+    try:
+        if tracked:
+            _committed_quota_fixture(ledger)
+        else:
+            for at,used in [(100,10),(130,11),(160,12)]:observe(ledger,at,used)
+            sync(ledger,[115,145])
+        original=ledger.report('h',1000)
+        rows=history_rows(original,'weekly')
+        start,end=rows[0]['at'],rows[-1]['at']
+        expected=preview_exclusion(original,start,end)['after']
+        statements=[]
+        ledger.db.set_trace_callback(statements.append)
+        record=ledger.exclude_interval('h',start,end)
+        ledger.db.set_trace_callback(None)
+        assert not any('select' in sql.lower() and any(table in sql.lower() for table in
+            ('from calls','join calls','from tracking_wire','from tracking_call_boundaries'))
+            for sql in statements)
+        revised=quota_statistics(ledger.report('h',1000))
+        assert {key:revised[key] for key in expected}==expected
+        statements.clear()
+        ledger.db.set_trace_callback(statements.append)
+        assert ledger.restore_exclusion('h',record['id'])
+        ledger.db.set_trace_callback(None)
+        assert not any('select' in sql.lower() and any(table in sql.lower() for table in
+            ('from calls','join calls','from tracking_wire','from tracking_call_boundaries'))
+            for sql in statements)
+        assert quota_statistics(ledger.report('h',1000))==quota_statistics(original)
+    finally:
+        ledger.close()
+
+
 @pytest.mark.parametrize('operation',['exclude','restore'])
 def test_slow_edit_validation_does_not_hold_observation_writer_lock(tmp_path,monkeypatch,operation):
     from threading import Event, Thread
@@ -205,8 +241,8 @@ def test_slow_edit_validation_does_not_hold_observation_writer_lock(tmp_path,mon
         except Exception as error:errors.append(error)
         finally:done.set()
     thread=Thread(target=writer)
-    def slow_report(home):
-        result=original(home)
+    def slow_report(home,**options):
+        result=original(home,**options)
         reports.append(result)
         if len(reports)==1:
             thread.start()
@@ -259,6 +295,8 @@ def test_rebuild_copies_active_and_restored_exclusion_records(tmp_path):
         ledger.restore_exclusion('h',old['id'])
         ledger.exclude_interval('h',130,160,'keep me')
         expected = [tuple(r) for r in ledger.db.execute('select * from quota_exclusions order by start')]
+        expected_history = ledger.report('h',200)['history']
+        expected_refs = [tuple(r) for r in ledger.db.execute('select * from weekly_window_refs order by window_id')]
     finally:
         ledger.close()
     with sqlite3.connect(index) as db:
@@ -267,5 +305,12 @@ def test_rebuild_copies_active_and_restored_exclusion_records(tmp_path):
     result = rebuild(source,index,destination)
     with sqlite3.connect(destination) as db:
         actual = db.execute('select * from quota_exclusions order by start').fetchall()
+        assert db.execute('select * from weekly_window_refs order by window_id').fetchall() == expected_refs
+    repaired = QuotaLedger(destination)
+    try:
+        assert repaired.report('h',200)['history'] == expected_history
+    finally:
+        repaired.close()
     assert actual == expected
     assert result['result']['quota_exclusions'] == 2
+    assert result['result']['weekly_window_refs'] == len(expected_refs) == 3

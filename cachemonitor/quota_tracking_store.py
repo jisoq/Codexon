@@ -32,6 +32,64 @@ def initialize(db):
             seen REAL, start REAL, end REAL, kind TEXT, status TEXT, response TEXT);
         CREATE INDEX IF NOT EXISTS tracking_activity_seen ON tracking_activity_versions(home,seen);
     ''')
+    _initialize_activity_revisions(db)
+
+
+def _initialize_activity_revisions(db):
+    statements = ['''CREATE TABLE IF NOT EXISTS tracking_activity_revisions(
+        home TEXT, kind TEXT, revision INTEGER NOT NULL, PRIMARY KEY(home,kind));''']
+    for kind, table in (('task', 'tracking_tasks'), ('wire', 'tracking_wire')):
+        def bump(home, condition=''):
+            return f'''INSERT INTO tracking_activity_revisions(home,kind,revision)
+                SELECT {home},'{kind}',1 WHERE {condition or '1'}
+                ON CONFLICT(home,kind) DO UPDATE SET revision=revision+1;'''
+        statements.extend((
+            f'''CREATE INDEX IF NOT EXISTS {table}_open ON {table}(home,start) WHERE end IS NULL;''',
+            f'''CREATE TRIGGER IF NOT EXISTS {table}_activity_insert AFTER INSERT ON {table}
+                BEGIN {bump('NEW.home')} END;''',
+            f'''CREATE TRIGGER IF NOT EXISTS {table}_activity_delete AFTER DELETE ON {table}
+                BEGIN {bump('OLD.home')} END;''',
+            f'''CREATE TRIGGER IF NOT EXISTS {table}_activity_update AFTER UPDATE OF home,start,end ON {table}
+                WHEN OLD.home IS NOT NEW.home OR OLD.start IS NOT NEW.start OR OLD.end IS NOT NEW.end
+                BEGIN {bump('OLD.home')} {bump('NEW.home', 'NEW.home IS NOT OLD.home')} END;'''))
+    db.executescript('\n'.join(statements))
+
+
+class ActivitySummary:
+    """Cache one home's lifetime aggregates; evaluate recent activity at each read."""
+    def __init__(self):
+        self.db = self.home = None
+        self.cached = {}
+
+    def read(self, db, home, since):
+        if db is not self.db or home != self.home:
+            self.db, self.home = db, home
+            self.cached.clear()
+        own_transaction = not db.in_transaction
+        if own_transaction:
+            db.execute('BEGIN')
+        try:
+            revisions = dict(db.execute(
+                'select kind,revision from tracking_activity_revisions where home=?', (home,)))
+            result = []
+            for kind, table in (('task', 'tracking_tasks'), ('wire', 'tracking_wire')):
+                revision = revisions.get(kind, 0)
+                cached = self.cached.get(kind)
+                if cached is None or cached[0] != revision:
+                    summary = tuple(db.execute(
+                        f'select count(*),max(start),max(end) from {table} where home=?', (home,)).fetchone())
+                    # Never retain uncommitted revisions: rollback can reuse their numbers.
+                    if own_transaction:
+                        self.cached[kind] = revision, summary
+                else:
+                    summary = cached[1]
+                recent = db.execute(f'select count(*) from {table} where home=? and end is null and start>=?',
+                                    (home, since)).fetchone()[0] if summary[1] is not None or summary[2] is not None else None
+                result.extend((*summary, recent))
+            return tuple(result)
+        finally:
+            if own_transaction:
+                db.rollback()
 
 
 def enable(db, home, at=None, enabled=True):
@@ -68,7 +126,8 @@ def sync_activity(db, snapshot, cache=None):
         previous = db.execute('select * from tracking_health where home=?', (home,)).fetchone()
         if previous and snapshot['ts']-previous['at'] > 15:
             db.execute('insert or replace into tracking_gaps values(?,?,?)', (home, previous['at'], snapshot['ts']))
-        db.execute('insert or replace into tracking_health values(?,?,?)', (home, snapshot['ts'], int(complete)))
+        db.execute('''insert into tracking_health values(?,?,?) on conflict(home) do update set
+            at=excluded.at,complete=excluded.complete''', (home, snapshot['ts'], int(complete)))
         for session in snapshot.get('sessions', []):
             if session['home'] != home:
                 continue
@@ -102,7 +161,7 @@ def sync_activity(db, snapshot, cache=None):
             cache[cache_key]=dict(request)
             start = request.get('request_observed_at') or request['ts']
             end = request.get('completed_observed_at')
-            terminal = request['status'] in ('completed','failed','incomplete','disconnected','http_error','unparsed')
+            terminal = request['status'] in ('completed','failed','incomplete','disconnected','http_error','unparsed','cancelled')
             if start < enabled[0] and end is None:
                 continue  # Pre-activation pending records do not prove a request is still running.
             # Older observers only timestamp successful completion. Preserve
@@ -151,7 +210,7 @@ def failed_observation(db, home, at):
         db.commit()
 
 
-def build(db, home, now):
+def build(db, home, now, *, context_only=False):
     config = db.execute('select started from tracking_config where home=?', (home,)).fetchone()
     if not config:
         return None
@@ -166,6 +225,9 @@ def build(db, home, now):
     latest = db.execute('select data from tracking_observations where home=? and requested>=? and received<=? order by received desc,seq desc limit 1',
                         (home, started, now)).fetchone()
     account = json.loads(latest[0]).get('account') if latest else None
+    controls = list(db.execute('select at,enabled from tracking_controls where home=? and at>=? and at<=? order by at', (home, started, now)))
+    if context_only:
+        return dict(account=account, controls=[dict(r) for r in controls])
     homes = [home]
     if account:
         for candidate in db.execute('select home,started from tracking_config where home<>?', (home,)):
@@ -175,7 +237,6 @@ def build(db, home, now):
                 homes.append(candidate['home'])
     slots = ','.join('?' for _ in homes)
     state = TrackingState(started)
-    controls = list(db.execute('select at,enabled from tracking_controls where home=? and at>=? and at<=? order by at', (home, started, now)))
     timeline = [(r['at'], 0, r['at'], bool(r['enabled'])) for r in controls]
     raw = {}
     for row in db.execute('select * from tracking_observations where home=? and requested>=? and received<=? order by received,seq', (home, started, now)):

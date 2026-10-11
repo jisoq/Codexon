@@ -20,6 +20,10 @@ from .usage_paths import index_location
 from .native_backend import get_native
 
 
+FILE_READ_BUDGET = 16 * 1024 * 1024
+MAX_SOURCE_WORK = 32
+
+
 def _event_lines(source, digest, limit=16 * 1024 * 1024):
     """Retain complete-line offsets and the existing per-file byte budget."""
     native = get_native()
@@ -149,6 +153,8 @@ class UsageIndex:
         self.new_events = defaultdict(list)
         self.rebuild_required = set()
         self.source_hashes = {}
+        # Only unfinished files own live hash state; overflow waits in the file queue.
+        self.source_work = {}
         self.view_signatures = {}
         self.history_signatures = {}
         self.session_revisions = {}
@@ -160,6 +166,8 @@ class UsageIndex:
         self.names = {}
         self.lineage = {key:{field:meta[field] for field in LINEAGE_FIELDS if field in meta}
                         for key,meta in self.metadata.items() if meta.get('parent_thread_id')}
+        from .usage_archive import ArchiveSessions
+        self.archive = ArchiveSessions(self.db)
 
     def observe_quota(self,home,limits,observed):
         if limits is None or not observed: return
@@ -230,6 +238,8 @@ class UsageIndex:
                     if resolved not in paths:
                         # A filename is not proof of ownership; session_meta supplies the ID.
                         paths[resolved] = (home, None)
+        # Replacing the discovery queue also releases owners that can no longer run.
+        self.source_work={path:state for path,state in self.source_work.items() if path in paths}
         self.files = [(path, *value) for path, value in sorted(paths.items())]
         self.queue = deque(self.files)
         if self.tier_backfill:
@@ -241,15 +251,57 @@ class UsageIndex:
         self.done_files = 0
         self.last_discovery = now
 
+    def validate_cached_prefix(self, source, offset, path, home, tid, state, budget):
+        """Check one prefix slice; None means more validation remains."""
+        start=state['offset']
+        if not start:
+            try:
+                header=json.loads(source.readline(2*1024*1024))
+                if header.get('type')=='session_meta':
+                    payload=header.get('payload') or {}
+                    if (payload.get('id') or tid)!=tid:return False
+                    if session_lineage(payload,tid)!=self.lineage.get((str(home),tid),{}):return False
+            except (ValueError,TypeError,AttributeError):
+                pass
+        source.seek(start)
+        rows=self.db.execute('select pos,data from events where path=? and pos>=? and pos<? order by pos',(path,start,offset))
+        expected=next(rows,None)
+        try:
+            for pos,line in _event_lines(source,state['digest'],min(budget,offset-start)):
+                try:
+                    clean=sanitized(json.loads(line))
+                    if clean is None:continue
+                    # Let the ordinary scanner retain malformed-source warnings.
+                    stamp(clean['timestamp'])
+                    clean['event_id']=f'{Path(path).name}:{pos}'
+                except (ValueError,TypeError,AttributeError):
+                    return False
+                if expected is None or expected[0]!=pos:return False
+                try:stored=json.loads(expected[1])
+                except (ValueError,TypeError):return False
+                if not isinstance(stored,dict):return False
+                stored.setdefault('event_id',clean['event_id'])
+                if stored!=clean:return False
+                expected=next(rows,None)
+            if source.tell()<=start or expected is not None and expected[0]<source.tell():return False
+            return True if source.tell()==offset and expected is None else None
+        finally:
+            self.bytes_read+=source.tell()-start
+            state['offset']=source.tell()
+            rows.close()
+
     def scan_file(self, path, home, tid):
         p = Path(path)
         try:
             st = p.stat()
         except FileNotFoundError:
             # Historical paths can move to archived_sessions; discovery covers that location.
+            self.source_work.pop(path,None)
             return None
         old = self.db.execute('select tid,offset,size,mtime,inode from files where path=?', (path,)).fetchone()
-        if old and old[1] == st.st_size and old[2] == st.st_size and old[3] == st.st_mtime_ns:
+        if (old and old[1] == st.st_size and old[2] == st.st_size
+                and old[3] == st.st_mtime_ns and old[4] == str(st.st_ino)):
+            self.source_work.pop(path,None)
             return (str(home), old[0]) if self.initial else None
         offset = old[1] if old else 0
         if old:
@@ -258,22 +310,54 @@ class UsageIndex:
                 self.db.execute('delete from events where path=?', (path,))
                 self.rebuild_required.add((str(home),tid))
                 offset = 0
+                self.source_work.pop(path,None)
+        signature=(st.st_size,st.st_mtime_ns,str(st.st_ino))
+        state=self.source_work.get(path)
+        if state is not None and state['signature']!=signature:
+            self.source_work.pop(path,None);state=None
+        if state is None:
+            if len(self.source_work)>=MAX_SOURCE_WORK:
+                self.queue.append((path,home,tid))
+                return None
+            state=dict(signature=signature,offset=0,target=offset,digest=hashlib.sha256(),
+                       verified=not offset,known=self.source_hashes.get(path))
+            self.source_work[path]=state
         with p.open('rb') as f:
-            digest=hashlib.sha256()
-            if offset:
+            budget=FILE_READ_BUDGET
+            if not state['verified']:
                 # An increased length alone does not prove append-only: editors can
                 # correct old bytes and append in the same write. Verify the consumed
-                # prefix before reusing parsed state. Only digests stay in memory.
-                remaining=offset
-                while remaining:
-                    block=f.read(min(1024*1024,remaining))
-                    if not block:break
-                    digest.update(block);remaining-=len(block);self.bytes_read+=len(block)
-                if remaining or self.source_hashes.get(path)!=(offset,digest.hexdigest()):
+                # prefix before reusing parsed state. A restart recovers its digest
+                # by comparing sanitized records, without rewriting cached history.
+                known=state['known'];before=self.bytes_read
+                if known is None:
+                    unchanged=self.validate_cached_prefix(f,state['target'],path,home,tid,state,budget)
+                else:
+                    f.seek(state['offset'])
+                    remaining=min(budget,state['target']-state['offset'])
+                    while remaining:
+                        block=f.read(min(1024*1024,remaining))
+                        if not block:break
+                        state['digest'].update(block);remaining-=len(block);self.bytes_read+=len(block)
+                    state['offset']=f.tell()
+                    if state['offset']==state['target']:
+                        unchanged=known==(state['target'],state['digest'].hexdigest())
+                    else:
+                        unchanged=False if remaining else None
+                budget-=self.bytes_read-before
+                if unchanged is None:
+                    self.queue.append((path,home,tid))
+                    return None
+                if not unchanged:
                     self.db.execute('delete from events where path=?',(path,))
-                    self.rebuild_required.add((str(home),tid));offset=0;digest=hashlib.sha256()
-                f.seek(0)
+                    self.rebuild_required.add((str(home),tid));state.update(offset=0,digest=hashlib.sha256())
+                state['verified']=True
+                if budget<=0:
+                    self.queue.append((path,home,tid))
+                    return None
+            offset=state['offset'];digest=state['digest']
             if offset == 0:
+                f.seek(0)
                 head = f.readline()
                 try:
                     meta = json.loads(head)
@@ -297,20 +381,22 @@ class UsageIndex:
                 except (ValueError, TypeError, KeyError):
                     pass
             if not tid:
+                self.source_work.pop(path,None)
                 return None
             f.seek(offset)
             # Bound work per file so a large active session cannot block other files.
             start_offset = offset
-            for pos, line in _event_lines(f, digest):
+            for pos, line in _event_lines(f, digest,budget):
                 try:
                     clean = sanitized(json.loads(line))
                     if clean:
+                        encoded=json.dumps(clean,ensure_ascii=False)
                         # Source event identity survives an archive-directory move;
-                        # equal times/token values never collapse distinct events.
+                        # persisted path/pos reconstruct it without duplicating it.
                         clean['event_id']=f'{p.name}:{pos}'
                         self.new_events[(str(home),tid)].append(((stamp(clean['timestamp']),path,pos),clean))
                         self.db.execute('insert or replace into events values(?,?,?,?,?,?)',
-                            (path, pos, str(home), tid, stamp(clean['timestamp']), json.dumps(clean, ensure_ascii=False)))
+                            (path, pos, str(home), tid, stamp(clean['timestamp']), encoded))
                         self.observe_quota(home,clean['payload'].get('rate_limits'),stamp(clean['timestamp']))
                 except (ValueError, TypeError, AttributeError):
                     self.errors.append(f'일부 기록 형식 확인 필요: {tid[:8]}')
@@ -318,10 +404,13 @@ class UsageIndex:
             consumed = offset - start_offset
             self.bytes_read += consumed
             self.source_hashes[path]=(offset,digest.hexdigest())
+            state['offset']=offset
         self.db.execute('insert or replace into files values(?,?,?,?,?,?,?)',
                         (path, str(home), tid, offset, st.st_size, st.st_mtime_ns, str(st.st_ino)))
-        if offset < st.st_size and consumed >= 16 * 1024 * 1024:
+        if offset < st.st_size and consumed >= budget:
             self.queue.append((path, home, tid))
+        else:
+            self.source_work.pop(path,None)
         return str(home), tid
 
     def rebuild(self, key, now):
@@ -402,6 +491,7 @@ class UsageIndex:
                 if key:
                     changed.add(key)
             except (OSError, sqlite3.Error) as exc:
+                self.source_work.pop(args[0],None)
                 self.errors.append(f'기록 읽기: {Path(args[0]).name}: {exc}')
             self.done_files += 1
         self.db.commit()
@@ -468,8 +558,7 @@ class UsageIndex:
             view['usage_revision']=self.session_revisions[key]
             views.append(view)
         self.version += bool(changed)
-        from .usage_archive import sessions as archived_sessions
-        views.extend(archived_sessions(self.db,now,{str(h) for h in self.homes}))
+        views.extend(self.archive.views(now,{str(h) for h in self.homes}))
         return {'ts': now, 'sessions': sorted(views, key=lambda s: s['activity'], reverse=True),
                 'request_activity': list(self.model_evidence.activity_records.values()),
                 'usage_collection_complete':usage_complete,'last_usage_collection_success':self.last_usage_success,
@@ -484,5 +573,7 @@ class UsageIndex:
                           'path': str(self.path)}}
 
     def close(self):
+        self.source_work.clear()
+        self.archive.clear()
         self.model_evidence.close()
         self.db.close()

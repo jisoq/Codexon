@@ -122,7 +122,7 @@ def process_main(connection,homes,index_path,static_snapshot=None,model_evidence
                 # missing data or replacing/repairing the user's quota history.
                 if ledger_issue:snapshot={**snapshot,'ledger_error':ledger_issue}
                 publish()
-                next_poll=time.monotonic()+(.1 if snapshot['index']['loading'] else 2)
+                next_poll=time.monotonic()+(.1 if snapshot['index']['loading'] else 3)
             if pending is not None and snapshot is not None:
                 request=pending; pending=None
                 try:

@@ -21,6 +21,131 @@ def observe(ledger, at, remaining, home='h'):
     tracking.observe(ledger.db,home,q)
 
 
+def _committed_quota_fixture(ledger):
+    tracking.enable(ledger.db,'h',100)
+    activity(ledger,101,{})
+    observe(ledger,102,70)
+    activity(ledger,109,{'one':dict(started_at=103,ended_at=108)},[107])
+    observe(ledger,110,69)
+    activity(ledger,111,{'one':dict(started_at=103,ended_at=108)},[107])
+
+
+def _advance_quota_fixture(ledger):
+    observe(ledger,120,68)
+    activity(ledger,131,{'one':dict(started_at=103,ended_at=108),
+                         'two':dict(started_at=123,ended_at=126)},[107,125])
+
+
+def _quota_process_waiting_for_termination(path, connection, partial):
+    ledger=QuotaLedger(path)
+    _committed_quota_fixture(ledger)
+    expected=ledger.report('h',112)
+    if partial:
+        class DeferredCommit:
+            def __init__(self,db):self.db=db
+            def __getattr__(self,name):return getattr(self.db,name)
+            def commit(self):pass
+        ledger.db=DeferredCommit(ledger.db)
+        _advance_quota_fixture(ledger)
+        assert ledger.db.in_transaction
+    connection.send(expected)
+    connection.recv()  # The parent kills this process without closing the ledger.
+
+
+@pytest.mark.parametrize('partial',[False,True],ids=['committed','uncommitted'])
+def test_forced_termination_preserves_quota_and_rolls_back_partial_coverage(tmp_path,partial):
+    import multiprocessing as mp
+    context=mp.get_context('spawn')
+    receiving,sending=context.Pipe()
+    path=tmp_path/'killed.sqlite'
+    process=context.Process(target=_quota_process_waiting_for_termination,
+                            args=(path,sending,partial))
+    process.start();sending.close()
+    try:
+        assert receiving.poll(15),'quota child did not reach its durable or staged boundary'
+        expected=receiving.recv()
+    finally:
+        process.kill();process.join(10);receiving.close()
+    assert not process.is_alive() and process.exitcode!=0
+    ledger=QuotaLedger(path)
+    reference=QuotaLedger(tmp_path/'reference.sqlite')
+    try:
+        assert ledger.db.execute('pragma integrity_check').fetchone()[0]=='ok'
+        assert ledger.report('h',112)==expected
+        assert tuple(ledger.db.execute('select at,complete from tracking_health').fetchone())==(111,1)
+        assert tuple(ledger.db.execute('select at,complete_at from state').fetchone())==(111,111)
+        assert ledger.db.execute('select count(*) from tracking_gaps').fetchone()[0]==0
+        for table,count in [('observations',2),('window_observations',0),('weekly_window_refs',2),
+                            ('tracking_observations',2),('tracking_tasks',1),('calls',1)]:
+            assert ledger.db.execute(f'select count(*) from {table}').fetchone()[0]==count
+        assert ledger.db.execute('''select count(*) from weekly_window_refs r
+            left join observations o on o.id=r.observation_id where o.id is null''').fetchone()[0]==0
+        _advance_quota_fixture(ledger)
+        _committed_quota_fixture(reference);_advance_quota_fixture(reference)
+        assert ledger.report('h',132)==reference.report('h',132)
+        assert tuple(ledger.db.execute('select at,complete_at from state').fetchone())==(131,131)
+        assert tuple(ledger.db.execute('select start,end from tracking_gaps').fetchone())==(111,131)
+    finally:
+        ledger.close();reference.close()
+
+
+def test_duplicate_heartbeat_does_not_dirty_storage_and_new_health_survives_reopen(tmp_path):
+    import sqlite3
+    path=tmp_path/'ledger.sqlite';ledger=QuotaLedger(path)
+    watcher=sqlite3.connect(path)
+    tracking.enable(ledger.db,'h',100)
+    engine=SimpleNamespace(sessions={})
+    snapshot=dict(homes=['h'],sessions=[],ts=101,usage_collection_complete=True,
+                  index=dict(loading=False,usage_complete=True))
+    try:
+        ledger.sync(engine,snapshot)
+        version=watcher.execute('pragma data_version').fetchone()[0]
+        ledger.sync(engine,snapshot)
+        assert watcher.execute('pragma data_version').fetchone()[0]==version
+        ledger.sync(engine,{**snapshot,'ts':103,'usage_collection_complete':False,
+                           'index':dict(loading=True,usage_complete=False)})
+        assert tuple(watcher.execute('select at,complete from tracking_health').fetchone())==(103,0)
+        assert tuple(watcher.execute('select at,loading,complete_at from state').fetchone())==(103,1,101)
+        ledger.close();ledger=QuotaLedger(path)
+        ledger.sync(engine,{**snapshot,'ts':120})
+        assert tuple(watcher.execute('select at,complete from tracking_health').fetchone())==(120,1)
+        assert tuple(watcher.execute('select at,loading,complete_at from state').fetchone())==(120,0,120)
+        assert tuple(watcher.execute('select start,end from tracking_gaps').fetchone())==(103,120)
+    finally:
+        watcher.close();ledger.close()
+
+
+def test_recovery_snapshot_cannot_rewind_durable_quota_activity_or_coverage(tmp_path):
+    ledger=QuotaLedger(tmp_path/'ledger.sqlite')
+    reference=QuotaLedger(tmp_path/'reference.sqlite')
+    empty=QuotaLedger(tmp_path/'empty.sqlite')
+    try:
+        _committed_quota_fixture(ledger)
+        expected=ledger.report('h',112)
+        engine=SimpleNamespace(sessions={('h','s'):{'revision':200,'prepared':{'history':[]}}})
+        fallback=dict(homes=['h'],ts=105,collection_recovery=True,
+            usage_collection_complete=False,index=dict(loading=True,usage_complete=False),
+            usage_errors=['cached diagnostic'],sessions=[dict(home='h',id='s',
+                turn_records={'one':dict(started_at=103,ended_at=None)})])
+        for at in (105,111):
+            ledger.sync(engine,{**fallback,'ts':at})
+            assert ledger.report('h',112)==expected
+            assert tuple(ledger.db.execute('select at,complete from tracking_health').fetchone())==(111,1)
+            assert tuple(ledger.db.execute('select at,complete_at from state').fetchone())==(111,111)
+            assert ledger.db.execute('select end from tracking_tasks').fetchone()[0]==108
+        _advance_quota_fixture(ledger)
+        _committed_quota_fixture(reference);_advance_quota_fixture(reference)
+        assert ledger.report('h',132)==reference.report('h',132)
+        assert tuple(ledger.db.execute('select start,end from tracking_gaps').fetchone())==(111,131)
+        # A cache can still initialize a ledger that has no newer durable evidence.
+        tracking.enable(empty.db,'h',100)
+        empty.sync(engine,fallback)
+        assert tuple(empty.db.execute('select at,complete_at from state').fetchone())==(105,None)
+        assert tuple(empty.db.execute('select start,end from tracking_tasks').fetchone())==(103,None)
+    finally:
+        ledger.close();reference.close();empty.close()
+
+
 def test_forward_continuous_account_consumption_and_cost_survive_reopen(tmp_path):
     path=tmp_path/'ledger.sqlite'
     ledger=QuotaLedger(path)

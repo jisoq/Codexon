@@ -88,7 +88,7 @@ class EvidenceStore:
                         (home_key(home), identifier(attempt), float(ts),
                          transport if transport in ('WebSocket', 'HTTP/SSE') else '',
                          identifier(response_id), identifier(requested_model), identifier(response_model),
-                         status if status in ('pending', 'created', 'completed', 'failed', 'incomplete',
+                         status if status in ('pending', 'created', 'completed', 'failed', 'incomplete', 'cancelled',
                                               'disconnected', 'http_error', 'unparsed') else '', int(bool(conflict)),
                          identifier(requested_service_tier), identifier(response_service_tier)))
         values=(int(bool(observation_missing)),request_observed_at,generation_observed_at,completed_observed_at,

@@ -560,6 +560,9 @@ class QuotaLedger:
                 bucket TEXT NOT NULL, window TEXT NOT NULL, used REAL,
                 reset REAL, minutes INTEGER, separate TEXT);
             CREATE INDEX IF NOT EXISTS window_observations_home_at ON window_observations(home,at);
+            CREATE TABLE IF NOT EXISTS weekly_window_refs(
+                window_id TEXT PRIMARY KEY, observation_id TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS weekly_window_refs_observation ON weekly_window_refs(observation_id);
             CREATE TABLE IF NOT EXISTS coverage_issues(
                 home TEXT, sid TEXT, start REAL, end REAL, reason TEXT,
                 PRIMARY KEY(home,sid,reason));
@@ -683,7 +686,10 @@ class QuotaLedger:
                                             (home,identifier,sid,parsed['turn'],data));changed=True
                 if changed:self.rebuild_mode_evidence(home)
                 self.mode_offsets[home]=latest
-                self.db.execute('insert or replace into mode_scan values(?,?,?)',(home,latest,self.mode_backfill.get(home,0)))
+                self.db.execute('''insert into mode_scan values(?,?,?) on conflict(home) do update set
+                    latest=excluded.latest,before_id=excluded.before_id
+                    where mode_scan.latest is not excluded.latest or mode_scan.before_id is not excluded.before_id''',
+                    (home,latest,self.mode_backfill.get(home,0)))
             except sqlite3.Error:pass
         self.db.commit()
         previous=getattr(self,'_enriched_sessions',{})
@@ -742,11 +748,16 @@ class QuotaLedger:
         snapshot['sessions']=sessions
 
     def observe(self, home, quota, commit=True):
+        weekly_ref=None
         for name, observed_window in (quota or {}).get('windows', {}).items():
             if name not in ('weekly','five_hour') or not quota.get('observed_at'):
                 continue
             key=hashlib.sha256(json.dumps([home,quota['observed_at'],quota.get('source'),
                 quota.get('account'),quota.get('plan_type'),quota.get('bucket'),name,observed_window],sort_keys=True).encode()).hexdigest()
+            if (name=='weekly' and 'used_percent' in observed_window and 'window_minutes' in observed_window
+                    and home is not None and quota.get('source','local') is not None and quota.get('account','') is not None):
+                weekly_ref=key
+                continue
             self.db.execute('insert or ignore into window_observations values(?,?,?,?,?,?,?,?,?,?,?,?)',
                 (key,home,quota['observed_at'],quota.get('source','local'),quota.get('account',''),
                  quota.get('plan_type') or '',quota.get('bucket') or ('codex' if quota.get('source')=='live' else ''),
@@ -754,7 +765,7 @@ class QuotaLedger:
                  observed_window.get('window_minutes'),json.dumps(quota.get('separate_models',[]))))
         window = (quota or {}).get('windows', {}).get('weekly')
         at = (quota or {}).get('observed_at')
-        if not window or not at:
+        if not window or not at or 'used_percent' not in window or 'window_minutes' not in window:
             if commit:self.db.commit()
             return
         source = quota.get('source', 'local')
@@ -765,17 +776,39 @@ class QuotaLedger:
              window.get('resets_at'), window['window_minutes'], json.dumps(quota.get('separate_models', []))))
         self.db.execute('''insert into observation_context values(?,?,?) on conflict(id) do update set
                         plan=case when observation_context.plan='' then excluded.plan else observation_context.plan end,
-                        bucket=case when observation_context.bucket='' then excluded.bucket else observation_context.bucket end''',
+                        bucket=case when observation_context.bucket='' then excluded.bucket else observation_context.bucket end
+                        where (observation_context.plan='' and excluded.plan<>'')
+                           or (observation_context.bucket='' and excluded.bucket<>'')''',
                         (key, quota.get('plan_type') or '', quota.get('bucket') or
                          ('codex' if source == 'live' else '')))
+        if weekly_ref is not None:
+            # The display ID has a different identity from the canonical observation.
+            # Retain its first payload, including when only separate_models changes.
+            self.db.execute('''insert or ignore into weekly_window_refs(window_id,observation_id)
+                select ?,id from observations where id=? and not exists
+                (select 1 from window_observations where id=?)''',(weekly_ref,key,weekly_ref))
         if commit: self.db.commit()
 
     def sync(self, engine, snapshot):
         """Use the existing deduplicated analytical rows; don't parse conversations twice."""
         from .quota_tracking_store import sync_activity
+        recovered_homes=set()
+        if snapshot.get('collection_recovery'):
+            # A durable collection cache can predate this ledger's last live
+            # heartbeat. Do not replay its old tasks, calls, or coverage over
+            # newer evidence, including evidence committed by another writer.
+            if not self.db.in_transaction:self.db.execute('BEGIN IMMEDIATE')
+            for home in snapshot.get('homes',[]):
+                latest=self.db.execute('''select max(at) from (
+                    select at from state where home=? union all
+                    select at from tracking_health where home=?)''',(home,home)).fetchone()[0]
+                if latest is not None and latest>=snapshot['ts']:recovered_homes.add(home)
+            if recovered_homes:
+                snapshot={**snapshot,'homes':[home for home in snapshot['homes'] if home not in recovered_homes]}
         if not hasattr(self,'_tracking_sync_cache'):self._tracking_sync_cache={}
         sync_activity(self.db, snapshot,self._tracking_sync_cache)
         for key, session in {**engine.sessions,**getattr(engine,'internal_sessions',{})}.items():
+            if key[0] in recovered_homes:continue
             revision = session['revision']
             if self.revisions.get(key) == revision:
                 continue
@@ -854,7 +887,9 @@ class QuotaLedger:
             if complete:
                 stamp=index.get('usage_complete_at') or index.get('last_usage_success') or snapshot.get('last_usage_collection_success') or snapshot['ts']
                 watermark=max(watermark or 0,stamp)
-            self.db.execute('insert or replace into state(home,at,loading,unclassified,complete_at) values(?,?,?,?,?)',
+            self.db.execute('''insert into state(home,at,loading,unclassified,complete_at) values(?,?,?,?,?)
+                on conflict(home) do update set at=excluded.at,loading=excluded.loading,
+                unclassified=excluded.unclassified,complete_at=excluded.complete_at''',
                 (home,snapshot['ts'],loading,unclassified,watermark))
         self.db.commit()
 
@@ -909,7 +944,7 @@ class QuotaLedger:
             self.db.execute('BEGIN')
             try:
                 revision=self.db.execute('PRAGMA data_version').fetchone()[0]
-                prepared=prepare(self._report(home))
+                prepared=prepare(self._report(home,exclusion_only=True))
             finally:
                 self.db.rollback()
             with self.db:
@@ -927,7 +962,7 @@ class QuotaLedger:
         finally:
             if own_transaction:self.db.rollback()
 
-    def _report(self, home, now=None):
+    def _report(self, home, now=None, *, exclusion_only=False):
         now = time.time() if now is None else now
         tables = {r[0] for r in self.db.execute("select name from sqlite_master where type='table'")}
         config=self.db.execute('select started from tracking_config where home=?',(home,)).fetchone() if 'tracking_config' in tables else None
@@ -939,10 +974,34 @@ class QuotaLedger:
         observations = [r for r in raw if type(r['used']) in (int,float)
                         and math.isfinite(r['used']) and 0 <= r['used'] <= 100
                         and r['minutes']==10080]
+        from .quota_tracking_store import build
+        tracking = build(self.db, home, now, context_only=exclusion_only)
+        current_account = (tracking.get('account') if tracking is not None else None) or next((r['account'] for r in reversed(observations) if r['account']), '')
+        history = ([dict(r) for r in self.db.execute('select * from window_observations where home=? and at>=? and at<=? order by at,id',(home,cutoff,now))]
+                   if 'window_observations' in tables else [])
+        if 'weekly_window_refs' in tables:
+            raw_by_id={r['id']:r for r in raw}
+            referenced=[{**raw_by_id[observation_id],'id':window_id,'window':'weekly'}
+                for window_id,observation_id in self.db.execute('''select r.window_id,r.observation_id
+                    from observations o join weekly_window_refs r on r.observation_id=o.id
+                    where o.home=? and o.at>=? and o.at<=?''',(home,cutoff,now))]
+            referenced_ids={r['id'] for r in referenced}
+            history=[r for r in history if r['id'] not in referenced_ids]+referenced
+        # Existing ledgers retain their weekly observations without rewriting raw evidence.
+        known={(r['at'],r['source'],r['account'],r['used'],r['reset']) for r in history if r['window']=='weekly'}
+        history += [{**r,'window':'weekly'} for r in raw
+                    if (r['at'],r['source'],r['account'],r['used'],r['reset']) not in known]
+        context = dict(home=home,account=current_account,history=sorted(history,key=lambda r:(r['at'],r['id'])),
+            exclusions=([dict(r) for r in self.db.execute(
+                'select * from quota_exclusions where home=? and account=? and restored_at is null order by start,created_at,id',
+                (home,current_account))] if 'quota_exclusions' in tables else []),
+            tracking=({k:v for k,v in tracking.items() if k!='groups'} if tracking is not None else None))
+        # Editing needs observed boundaries and account ownership, not call costs.
+        # Keep this inside the same snapshot/revision check as the full report.
+        if exclusion_only:
+            return context
         manual_resets = [dict(r) for r in self.db.execute(
             'select * from manual_resets where home=? and at<=? order by at,id', (home,now))]
-        from .quota_tracking_store import build
-        tracking = build(self.db, home, now)
         scope = tracking['homes'] if tracking is not None else [home]
         slots = ','.join('?' for _ in scope)
         if tracking is not None:
@@ -1212,17 +1271,10 @@ class QuotaLedger:
                 'manual_reset_id':marker['id'] if marker else None, 'reset_pending':False,
                 'observation_gap':bool(group.get('gap')),
                 'unclassified_sessions': state['unclassified'] if state else None})
-        current_account = (tracking.get('account') if tracking is not None else None) or next((r['account'] for r in reversed(observations) if r['account']), '')
         relevant_resets = [r for r in manual_resets if not current_account or not r['account'] or r['account']==current_account]
         last_reset = relevant_resets[-1] if relevant_resets else None
         pending = any(r.get('reset_pending') and r['manual_reset_id']==last_reset['id'] for r in result) if last_reset else False
         if tracking is not None:pending=False
-        history = ([dict(r) for r in self.db.execute('select * from window_observations where home=? and at>=? and at<=? order by at,id',(home,cutoff,now))]
-                   if 'window_observations' in tables else [])
-        # Existing ledgers retain their weekly observations without rewriting raw evidence.
-        known={(r['at'],r['source'],r['account'],r['used'],r['reset']) for r in history if r['window']=='weekly'}
-        history += [{**r,'window':'weekly'} for r in raw
-                    if (r['at'],r['source'],r['account'],r['used'],r['reset']) not in known]
         request_windows=[]
         if tracking is not None:
             by_response={}
@@ -1233,11 +1285,7 @@ class QuotaLedger:
                     by_response[row['response']]=dict(uid=row['response'],start=row['start'],end=row['end'])
             request_windows=list(by_response.values())
         return {**({'request_windows':request_windows} if tracking is not None else {}),
-                'home':home,'account':current_account,'history':sorted(history,key=lambda r:(r['at'],r['id'])),
-                'exclusions':([dict(r) for r in self.db.execute(
-                    'select * from quota_exclusions where home=? and account=? and restored_at is null order by start,created_at,id',
-                    (home,current_account))] if 'quota_exclusions' in tables else []),
-                'tracking':({k:v for k,v in tracking.items() if k!='groups'} if tracking is not None else None),
+                **context,
                 'manual_resets':manual_resets,'cycles': list(reversed(result)), 'price_id': PRICE_ID, 'index_at': state['at'] if state else None,
                 'index_loading': bool(state['loading']) if state else True,
                 'index_complete_at':completed_at, 'at': now,

@@ -242,3 +242,33 @@ def test_collection_watermark_preserves_valid_intervals_during_rescan_and_source
         assert completed['index_complete_at']==320
         assert quota_statistics(completed)['delta']==8
     finally:ledger.close()
+
+
+def test_unchanged_mode_scan_does_not_dirty_ledger_after_reopen_or_hide_other_writers(tmp_path):
+    import sqlite3
+    home=str(tmp_path)
+    source=sqlite3.connect(tmp_path/'logs_2.sqlite')
+    source.execute('create table logs(id integer primary key,thread_id text,target text,feedback_log_body text)')
+    source.execute('insert into logs values(1,?,?,?)',('s','codex_core::session::handlers','unrelated log'))
+    source.commit()
+    path=tmp_path/'ledger.sqlite';ledger=QuotaLedger(path)
+    watcher=sqlite3.connect(path)
+    snapshot={'homes':[home],'sessions':[]}
+    try:
+        ledger.enrich_modes(snapshot)
+        version=watcher.execute('pragma data_version').fetchone()[0]
+        ledger.enrich_modes(snapshot)
+        assert watcher.execute('pragma data_version').fetchone()[0]==version
+        ledger.close();ledger=QuotaLedger(path)
+        version=watcher.execute('pragma data_version').fetchone()[0]
+        ledger.enrich_modes(snapshot)
+        assert watcher.execute('pragma data_version').fetchone()[0]==version
+
+        source.execute('insert into logs values(2,?,?,?)',('s','codex_core::session::handlers','another log'))
+        source.commit();ledger.enrich_modes(snapshot)
+        assert tuple(watcher.execute('select latest,before_id from mode_scan where home=?',(home,)).fetchone())==(2,0)
+        watcher.execute('update mode_scan set latest=1 where home=?',(home,));watcher.commit()
+        ledger.enrich_modes(snapshot)
+        assert watcher.execute('select latest from mode_scan where home=?',(home,)).fetchone()[0]==2
+    finally:
+        watcher.close();ledger.close();source.close()

@@ -7,6 +7,26 @@ from test_index import finish
 from test_core import fixture_home
 
 
+def test_cancelled_response_releases_tracking_and_replay_keeps_next_request(tmp_path):
+    from cachemonitor.model_proxy import Tracker
+    store=EvidenceStore(tmp_path/'cancelled.sqlite')
+    tracker=Tracker(store, 'home', 'WebSocket', dict(requests=0,responses=0))
+    try:
+        for index in range(20):
+            tracker.request({'model':'asked'})
+            tracker.response({'type':'response.cancelled','response':{'id':f'cancel-{index}'}})
+        assert not tracker.active and not tracker.timings
+        rows=store.db.execute("select status,completed_observed_at from model_observations where status<>'pending'").fetchall()
+        assert len(rows)==20 and all(row[0]=='cancelled' and row[1] for row in rows)
+        tracker.request({'model':'next'})
+        tracker.response({'type':'response.cancelled','response':{'id':'cancel-19'}})
+        assert sum(map(len,tracker.pending.values()))==1
+        tracker.response({'type':'response.completed','response':{'id':'next'}})
+        assert not tracker.active and not tracker.timings
+        assert tracker.completed['next']['requested_model']=='next'
+    finally:store.close()
+
+
 def test_default_index_joins_shared_evidence_but_explicit_qa_index_is_isolated(tmp_path,monkeypatch):
     from cachemonitor.model_evidence import default_path
     home,_=fixture_home(tmp_path)

@@ -14,6 +14,7 @@ from . import quota_tracking_store as tracking_store
 from .quota_polling import QuotaPolling
 from .quota_diagnostics import record_failure, storage_issue
 from .quota_worker import QuotaWorker
+from .quota_backlog import ObservationBacklog
 
 
 class QuotaService(QThread):
@@ -30,8 +31,17 @@ class QuotaService(QThread):
         self.wake = threading.Event()
         self.tracking_enabled=tracking_enabled
         self.tracking_after=time.time()
-        self.tracking_changes=queue.SimpleQueue()
-        self.local_observations=queue.SimpleQueue()
+        self.ingress_lock=threading.Lock()
+        self.ingress_closed=False
+        self.tracking_revision=0
+        self.local_observed_at=None
+        self.observation_issue=''
+        self.control_issue=''
+        self.backlog=ObservationBacklog(self.path,self.home)
+        if not self.backlog.append('control',(self.tracking_enabled,self.tracking_after)):
+            self.control_issue=self.backlog.issue or '추적 설정을 저장하지 못했습니다. 설정을 다시 적용하세요.'
+        self.backlog_closed=False
+        self.local_observations=queue.Queue(maxsize=1)
         self.exclusion_changes=queue.SimpleQueue()
         self.reports_enabled=reports_enabled
         self.worker_results=queue.SimpleQueue()
@@ -49,16 +59,38 @@ class QuotaService(QThread):
             self.wake.set()
 
     def supply_local(self, quota):
-        """Receive the collector's observation without changing its timestamp."""
-        self.local_observations.put(quota)
+        """Persist each new observation before replacing the displayed gauge."""
+        with self.ingress_lock:
+            if self.ingress_closed:return False
+            if not quota or (self.local_observed_at is not None and quota['observed_at']<=self.local_observed_at):
+                return True
+            local={**quota,'source':'local','max_age':120}
+            if self.tracking_enabled and not self.backlog.append('local',local):
+                self.observation_issue=self.backlog.issue or '한도 관측을 저장하지 못했습니다. 앱을 다시 열어 재시도하세요.'
+                self.wake.set()
+                return False
+            self.local_observed_at=quota['observed_at']
+            try:self.local_observations.get_nowait()
+            except queue.Empty:pass
+            self.local_observations.put_nowait(local)
         self.wake.set()
+        return True
 
     def set_tracking_enabled(self, enabled):
-        self.tracking_enabled=bool(enabled)
-        at=time.time()
-        if enabled:self.tracking_after=at
-        self.tracking_changes.put((bool(enabled),at))
+        with self.ingress_lock:
+            if self.ingress_closed:return False
+            enabled=bool(enabled)
+            at=time.time()
+            if not self.backlog.append('control',(enabled,at)):
+                self.control_issue=self.backlog.issue or '추적 설정을 저장하지 못했습니다. 설정을 다시 적용하세요.'
+                self.wake.set()
+                return False
+            self.control_issue=''
+            self.tracking_enabled=enabled
+            if enabled:self.tracking_after=at
+            self.tracking_revision+=1
         self.wake.set()
+        return True
 
     def request_exclusion(self, start, end, reason=''):
         """Queue edits for the ledger thread without requesting account data."""
@@ -76,8 +108,9 @@ class QuotaService(QThread):
         self.client = client
         latest = direct = local = None
         polling = QuotaPolling()
-        pending = deque()
-        controls = deque()
+        pending = self.backlog
+        tracking_revision=self.tracking_revision
+        activity_summary = tracking_store.ActivitySummary()
         exclusions = deque()
         next_storage = next_report = next_history = 0
         next_aggregate = 0
@@ -90,6 +123,25 @@ class QuotaService(QThread):
         report = None
         stage = 'initialize'
         was_reporting=self.reports_enabled
+
+        def save_pending():
+            # Bound recovery work independently of the retained backlog. An ack
+            # follows committed effects; replay after an interrupted ack is safe.
+            deadline = time.monotonic()+.05
+            for _ in range(pending.BATCH_SIZE):
+                entry = pending.first()
+                if entry is None:break
+                sequence, kind, value = entry
+                if kind == 'control':
+                    enabled, at = value
+                    tracking_store.enable(ledger.db, self.home, at=at, enabled=enabled)
+                elif kind == 'failure':
+                    tracking_store.failed_observation(ledger.db, self.home, value)
+                else:
+                    ledger.observe(self.home, value)
+                    if kind == 'quota':tracking_store.observe(ledger.db, self.home, value)
+                pending.acknowledge(sequence)
+                if time.monotonic() >= deadline:break
 
         def fail_exclusions(permanent=False):
             """A failed user edit stops retrying; committed edits are never replayed."""
@@ -126,11 +178,13 @@ class QuotaService(QThread):
                 if self.reports_enabled!=was_reporting:
                     was_reporting=self.reports_enabled
                     if was_reporting:next_report=next_history=0
-                while not self.tracking_changes.empty():
-                    change = self.tracking_changes.get_nowait()
-                    controls.append(change)
+                with self.ingress_lock:
+                    current_tracking_revision=self.tracking_revision
+                    tracking_enabled=self.tracking_enabled
+                if tracking_revision!=current_tracking_revision:
+                    tracking_revision=current_tracking_revision
                     next_report = next_history = 0
-                    if change[0] and not polling.failures:
+                    if tracking_enabled and not polling.failures:
                         polling.next_read = min(polling.next_read, time.monotonic())
                 while not self.exclusion_changes.empty():
                     exclusions.append(self.exclusion_changes.get_nowait())
@@ -166,6 +220,8 @@ class QuotaService(QThread):
                         aggregation_issue='';aggregate_failures=0;next_aggregate=0
                         report_ready=True
                         if kind!='report':
+                            # Preserve an immediate refresh requested by changed settings.
+                            if next_history:next_history=time.monotonic()+5
                             exclusions.popleft()
                             exclusion_results.append(computed['exclusion_result'])
                             edit_request=None
@@ -179,27 +235,18 @@ class QuotaService(QThread):
                         stage = 'open ledger'
                         if ledger is None:
                             ledger = QuotaLedger(self.path)
-                            # Apply queued controls at their actual timestamps first.
-                            if not controls:
-                                tracking_store.enable(ledger.db, self.home, at=self.tracking_after,
-                                                      enabled=self.tracking_enabled)
                             next_report = next_history = 0
-                        stage = 'tracking controls'
-                        while controls:
-                            enabled, at = controls[0]
-                            tracking_store.enable(ledger.db, self.home, at=at, enabled=enabled)
-                            controls.popleft()
-                        self.tracking_after = max(self.tracking_after, ledger.db.execute(
+                        stage = 'recover observations'
+                        save_pending()
+                        control = ledger.db.execute(
                             'select at from tracking_controls where home=? order by at desc limit 1',
-                            (self.home,)).fetchone()[0])
+                            (self.home,)).fetchone()
+                        if control:self.tracking_after = max(self.tracking_after, control[0])
                         stage = 'activity'
                         # Old interrupted tasks can lack an end forever. Use recent
                         # activity for polling speed without altering their history.
-                        activity = ledger.db.execute('select count(*),max(start),max(end),sum(end is null and start>=?) '
-                            'from tracking_tasks where home=?', (now-300, self.home)).fetchone()
-                        wire = ledger.db.execute('select count(*),max(start),max(end),sum(end is null and start>=?) '
-                            'from tracking_wire where home=?', (now-300, self.home)).fetchone()
-                        signature = tuple(activity)+tuple(wire)
+                        signature = activity_summary.read(ledger.db, self.home, now-300)
+                        activity, wire = signature[:4], signature[4:]
                         if self.tracking_enabled:
                             if signature != polling.signature:
                                 next_report = 0
@@ -210,42 +257,40 @@ class QuotaService(QThread):
                             self.tracking_after) if value is not None)
                     except Exception as exc:
                         storage_failed(exc)
-                if self.live and polling.ready(time.monotonic()):
+                with self.ingress_lock:
+                    tracking_at_request=self.tracking_enabled
+                    can_observe = not (self.observation_issue or self.control_issue) and (not tracking_at_request or pending.available())
+                if self.live and can_observe and polling.ready(time.monotonic()):
                     try:
                         direct = client.fetch()
-                        if self.tracking_enabled:
-                            pending.append(('quota', direct))
+                        if tracking_at_request:
+                            with self.ingress_lock:
+                                if not pending.append('quota', direct):
+                                    self.observation_issue=pending.issue or '한도 관측을 저장하지 못했습니다. 앱을 다시 열어 재시도하세요.'
                         lookup_issue = ''
                         polling.finish(time.monotonic(), True, direct, time.time())
                     except Exception as exc:
                         record_failure(self.path, 'account lookup', exc)
                         lookup_issue = ('Codex 한도 조회 지연: 자동 재시도 중' if isinstance(exc, (TimeoutError, ConnectionError))
                                         else 'Codex 한도 조회 실패: 자동 재시도 중')
-                        if self.tracking_enabled:
-                            pending.append(('failure', time.time()))
+                        if tracking_at_request:
+                            with self.ingress_lock:
+                                if not pending.append('failure', time.time()):
+                                    self.observation_issue=pending.issue or '한도 조회 실패 기록을 저장하지 못했습니다. 앱을 다시 열어 재시도하세요.'
                         polling.finish(time.monotonic(), False)
                     next_report = 0
-                while not self.local_observations.empty():
-                    quota = self.local_observations.get()
+                while True:
+                    try:quota = self.local_observations.get_nowait()
+                    except queue.Empty:break
                     if quota and (local is None or quota['observed_at'] > local['observed_at']):
                         local = {**quota, 'source': 'local', 'max_age': 120}
-                        if self.tracking_enabled:
-                            pending.append(('local', local))
                         next_report = 0
                 publish = (self.reports_enabled and (report is None or time.monotonic()>=next_history)
                            or time.monotonic()>=next_report or report_ready)
                 if ledger is not None:
                     try:
                         stage = 'save observations'
-                        while pending:
-                            kind, value = pending[0]
-                            if kind == 'failure':
-                                tracking_store.failed_observation(ledger.db, self.home, value)
-                            else:
-                                ledger.observe(self.home, value)
-                                if kind == 'quota':
-                                    tracking_store.observe(ledger.db, self.home, value)
-                            pending.popleft()
+                        save_pending()
                         database_issue = ''
                         storage_failures = 0
                     except Exception as exc:
@@ -269,7 +314,8 @@ class QuotaService(QThread):
                         report_request=self.report_worker.request('report')
                         next_history=time.monotonic()+5
                 latest = select_current_quota(direct, local, time.time())
-                issue = ', '.join(v for v in (lookup_issue, database_issue, aggregation_issue) if v)
+                issue = ', '.join(dict.fromkeys(v for v in (lookup_issue, database_issue, aggregation_issue,
+                    pending.issue, self.observation_issue, self.control_issue) if v))
                 if publish or issue != emitted_issue or exclusion_results:
                     value={'home':self.home,'quota':latest,'issue':issue}
                     if self.reports_enabled or exclusion_results:
@@ -283,12 +329,20 @@ class QuotaService(QThread):
                     next_report = time.monotonic()+5
                 self.wake.wait(1)
         finally:
+            with self.ingress_lock:self.ingress_closed=True
             self.report_worker.close()
             client.close()
             if ledger:
                 ledger.close()
+            with self.ingress_lock:
+                saved=pending.close()
+                self.backlog_closed=True
+            if not saved:
+                record_failure(self.path, 'pending observations shutdown', OSError('uncommitted quota observation'))
+                self.updated.emit({'home':self.home,'quota':latest,'issue':pending.issue})
 
     def stop(self):
+        with self.ingress_lock:self.ingress_closed=True
         self.requestInterruption()
         self.wake.set()
         client = getattr(self,'client',None)
@@ -297,3 +351,7 @@ class QuotaService(QThread):
             try: process.terminate()
             except OSError: pass
         self.wait()
+        with self.ingress_lock:
+            if not self.backlog_closed:
+                self.backlog.close()
+                self.backlog_closed=True

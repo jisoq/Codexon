@@ -375,7 +375,8 @@ def test_implicit_and_explicit_effective_evidence_share_scope(tmp_path,monkeypat
         service.channel.publish(empty_snapshot([str(home)],service.channel.path,100),service.epoch,1)
         assert client.channel.scope==service.channel.scope
         assert client.poll(100)['errors']==[]
-        assert service.channel.db.execute('SELECT count(*) FROM consumers').fetchone()[0]==1
+        assert service.channel.live.requested_homes(100)==[str(home)]
+        assert service.channel.db.execute('SELECT count(*) FROM consumers').fetchone()[0]==0
     finally:client.close();service.close()
 
 
@@ -430,6 +431,107 @@ def test_collection_reuses_history_and_atomically_replaces_current_sessions(tmp_
     finally:reader.close();writer.close()
 
 
+def test_collection_activity_reordering_preserves_bodies_and_cached_records(tmp_path):
+    import json,zlib
+    from cachemonitor.usage_collection import CollectionChannel,empty_snapshot
+    path=tmp_path/'index.sqlite';writer=CollectionChannel([],path);reader=CollectionChannel([],path)
+    original=empty_snapshot([],path,100.)
+    original['request_activity']=[dict(home='h',attempt=key,status='started') for key in ('a','b')]
+    try:
+        writer.publish(original,'epoch',1);first=reader.read(shared=True)
+        before=writer.db.execute('SELECT attempt,revision,payload FROM activity ORDER BY attempt').fetchall()
+        writer.db.executescript('''
+            CREATE TRIGGER keep_activity_body BEFORE UPDATE OF payload,revision ON activity
+              BEGIN SELECT RAISE(ABORT,'unchanged activity body was updated'); END;
+            CREATE TRIGGER keep_activity_row BEFORE INSERT ON activity
+              BEGIN SELECT RAISE(ABORT,'unchanged activity row was replaced'); END;
+            CREATE TRIGGER keep_activity_key BEFORE DELETE ON activity
+              BEGIN SELECT RAISE(ABORT,'unchanged activity row was deleted'); END;
+        ''')
+        reordered=copy.deepcopy(original);reordered['ts']=101.;reordered['request_activity'].reverse()
+        writer.publish(reordered,'epoch',2);second=reader.read(shared=True)
+        assert second==reordered
+        assert second['request_activity'][0] is first['request_activity'][1]
+        assert second['request_activity'][1] is first['request_activity'][0]
+        assert writer.db.execute('SELECT attempt,revision,payload FROM activity ORDER BY attempt').fetchall()==before
+        header=json.loads(zlib.decompress(writer.db.execute('SELECT payload FROM snapshot').fetchone()[0]))
+        assert header['activity_revision']==2
+        unchanged=copy.deepcopy(reordered);unchanged['ts']=102.;writer.publish(unchanged,'epoch',3)
+        assert reader.read()==unchanged
+        assert writer.activity_revision==2
+    finally:reader.close();writer.close()
+
+
+def test_collection_activity_restart_reuses_matching_rows_and_repairs_corrupt_payload(tmp_path):
+    from cachemonitor.usage_collection import CollectionChannel,empty_snapshot
+    path=tmp_path/'index.sqlite';writer=CollectionChannel([],path);reader=CollectionChannel([],path)
+    original=empty_snapshot([],path,100.)
+    original['request_activity']=[dict(home='h',attempt=key,status='started') for key in ('a','b','c','removed')]
+    try:
+        writer.publish(original,'first',100);assert reader.read()==original
+        before=writer.db.execute("SELECT revision,payload FROM activity WHERE attempt='a'").fetchone()
+        with writer.db:writer.db.execute("UPDATE activity SET payload=? WHERE attempt='c'",(b'broken-zlib',))
+        writer.close();writer=CollectionChannel([],path)
+        writer.db.executescript('''
+            CREATE TRIGGER keep_activity_body BEFORE UPDATE OF payload,revision ON activity WHEN OLD.attempt='a'
+              BEGIN SELECT RAISE(ABORT,'matching activity body was updated'); END;
+            CREATE TRIGGER keep_activity_row BEFORE INSERT ON activity WHEN NEW.attempt='a'
+              BEGIN SELECT RAISE(ABORT,'matching activity row was replaced'); END;
+            CREATE TRIGGER keep_activity_key BEFORE DELETE ON activity WHEN OLD.attempt='a'
+              BEGIN SELECT RAISE(ABORT,'matching activity row was deleted'); END;
+        ''')
+        restarted=copy.deepcopy(original);restarted['ts']=103.
+        restarted['request_activity']=[dict(home='h',attempt='b',status='completed'),
+            original['request_activity'][0],original['request_activity'][2],dict(home='h',attempt='new',status='started')]
+        writer.publish(restarted,'second',1)
+        assert reader.read()==restarted
+        assert writer.db.execute("SELECT revision,payload FROM activity WHERE attempt='a'").fetchone()==before
+        assert {key for key, in writer.db.execute('SELECT attempt FROM activity')}=={'a','b','c','new'}
+        assert all(revision>before[0] for revision, in writer.db.execute("SELECT revision FROM activity WHERE attempt<>'a'"))
+        # A consumer can miss deletion and re-addition. The restarted sequence
+        # must not collide with the retained body's old row revision.
+        writer.db.executescript('DROP TRIGGER keep_activity_body; DROP TRIGGER keep_activity_row; DROP TRIGGER keep_activity_key;')
+        without=copy.deepcopy(restarted);without['ts']=104.
+        without['request_activity']=[row for row in without['request_activity'] if row['attempt']!='a']
+        writer.publish(without,'second',2)
+        restored=copy.deepcopy(restarted);restored['ts']=105.;restored['request_activity'][1]['status']='failed'
+        writer.publish(restored,'second',100)
+        assert reader.read()==restored
+        fresh=CollectionChannel([],path)
+        try:assert fresh.read()==restored
+        finally:fresh.close()
+    finally:reader.close();writer.close()
+
+
+@pytest.mark.parametrize('restart',[False,True])
+def test_collection_activity_transaction_failure_preserves_prior_publication(tmp_path,restart):
+    from cachemonitor.usage_collection import CollectionChannel,empty_snapshot
+    path=tmp_path/'index.sqlite';writer=CollectionChannel([],path);reader=CollectionChannel([],path)
+    original=empty_snapshot([],path,100.)
+    original['request_activity']=[dict(home='h',attempt=key,status='started') for key in ('a','b','c')]
+    try:
+        writer.publish(original,'first',10);assert reader.read()==original
+        before=writer.db.execute('SELECT * FROM activity ORDER BY attempt').fetchall()
+        if restart:writer.close();writer=CollectionChannel([],path)
+        prior_cache=writer.published_activity.copy()
+        writer.db.execute("CREATE TRIGGER interrupt_snapshot BEFORE INSERT ON snapshot BEGIN SELECT RAISE(ABORT,'interrupted activity publication'); END")
+        changed=copy.deepcopy(original);changed['ts']=101.
+        changed['request_activity']=[dict(home='h',attempt='c',status='completed'),original['request_activity'][0]]
+        epoch='second' if restart else 'first';sequence=1 if restart else 11
+        with pytest.raises(sqlite3.IntegrityError,match='interrupted activity publication'):
+            writer.publish(changed,epoch,sequence)
+        assert writer.published_activity==prior_cache
+        assert writer.db.execute('SELECT * FROM activity ORDER BY attempt').fetchall()==before
+        assert reader.read()==original
+        writer.db.execute('DROP TRIGGER interrupt_snapshot')
+        writer.publish(changed,epoch,sequence)
+        assert reader.read()==changed
+        fresh=CollectionChannel([],path)
+        try:assert fresh.read()==changed
+        finally:fresh.close()
+    finally:reader.close();writer.close()
+
+
 def test_collection_interrupted_transaction_preserves_published_revision(tmp_path):
     import copy,sqlite3
     from cachemonitor.usage_collection import CollectionChannel,empty_snapshot
@@ -441,6 +543,8 @@ def test_collection_interrupted_transaction_preserves_published_revision(tmp_pat
         updated=copy.deepcopy(original);updated['sessions'][0]['history'][0]['output']=2
         db=writer.db
         class Interrupted:
+            @property
+            def in_transaction(self):return db.in_transaction
             def __enter__(self):return db.__enter__()
             def __exit__(self,*args):return db.__exit__(*args)
             def executemany(self,*args):return db.executemany(*args)
@@ -455,3 +559,174 @@ def test_collection_interrupted_transaction_preserves_published_revision(tmp_pat
     finally:
         if 'db' in locals():writer.db=db
         reader.close();writer.close()
+
+
+def test_idle_collection_preserves_fresh_clocks_without_rewriting_the_large_header(tmp_path):
+    import hashlib,json,zlib
+    from cachemonitor.usage_collection import CollectionChannel,empty_snapshot
+    path=tmp_path/'index.sqlite';writer=CollectionChannel([],path);reader=CollectionChannel([],path)
+    snapshot=empty_snapshot([],path,9.5)
+    snapshot.update(usage_collection_complete=True,last_usage_collection_success=9.5,
+        unassigned=[{'turn':hashlib.sha256(str(i).encode()).hexdigest()} for i in range(2000)])
+    snapshot['index'].update(loading=False,done=350,files=350,bytes_read=1048576,version=3,
+        usage_complete=True,last_usage_success=9.5)
+    try:
+        writer.db.execute('PRAGMA wal_autocheckpoint=0')
+        writer.publish(snapshot,'running',1000)
+        before=reader.read()
+        payload_size=writer.db.execute('SELECT length(payload) FROM snapshot WHERE id=1').fetchone()[0]
+        wal=writer.snapshot_path.with_name(writer.snapshot_path.name+'-wal')
+        initial_size=wal.stat().st_size
+        for sequence,(now,success) in enumerate(((10.125,10.),(99.999,99.999),(100.125,None),
+                                                (1000.000001,999.5),(100000.125,100000.125)),1001):
+            snapshot.update(ts=now,last_usage_collection_success=success)
+            snapshot['index']['last_usage_success']=success
+            writer.publish(snapshot,'running',sequence)
+            assert reader.read()==snapshot
+            assert reader.read_header()['ts']==now
+            # Released readers only need the existing six columns and zlib JSON.
+            row=writer.db.execute('SELECT * FROM snapshot WHERE id=1').fetchone()
+            legacy_header=json.loads(zlib.decompress(row[5]))
+            assert row[3:5]==(sequence,now)
+            assert legacy_header['ts']==now and legacy_header['last_usage_collection_success']==success
+            assert legacy_header['index']==snapshot['index']
+            assert legacy_header['collection_schema']==2
+        assert before['ts']==9.5 and before['last_usage_collection_success']==9.5
+        # All five fresh publications together write less than one full header.
+        assert wal.stat().st_size-initial_size<payload_size
+        # SQLite may change the record width for an integral observed time;
+        # freshness must remain exact across that full-record rewrite too.
+        snapshot.update(ts=100001.,last_usage_collection_success=100001.)
+        snapshot['index']['last_usage_success']=100001.
+        writer.publish(snapshot,'running',1006)
+        assert reader.read()==snapshot
+    finally:reader.close();writer.close()
+
+
+def test_interrupted_collection_clock_write_rolls_back_the_complete_snapshot(tmp_path):
+    from cachemonitor.usage_collection import CollectionChannel,empty_snapshot
+    path=tmp_path/'index.sqlite';writer=CollectionChannel([],path);reader=CollectionChannel([],path)
+    original=empty_snapshot([],path,100.)
+    try:
+        writer.publish(original,'running',1000)
+        updated={**original,'ts':101.,'last_usage_collection_success':101.}
+        db=writer.db
+        class InterruptedBlob:
+            def __enter__(self):self.blob=db.blobopen('snapshot','payload',1);return self
+            def __exit__(self,*args):self.blob.close()
+            def seek(self,offset):self.blob.seek(offset)
+            def write(self,data):
+                self.blob.write(data[:len(data)//2])
+                raise sqlite3.OperationalError('interrupted clock publication')
+        class Interrupted:
+            @property
+            def in_transaction(self):return db.in_transaction
+            def __enter__(self):return db.__enter__()
+            def __exit__(self,*args):return db.__exit__(*args)
+            def executemany(self,*args):return db.executemany(*args)
+            def execute(self,*args):return db.execute(*args)
+            def blobopen(self,*args):return InterruptedBlob()
+        writer.db=Interrupted()
+        with pytest.raises(sqlite3.OperationalError):writer.publish(updated,'running',1001)
+        writer.db=db
+        assert reader.read()==original
+        assert db.execute('SELECT sequence,observed FROM snapshot WHERE id=1').fetchone()==(1000,100.)
+        writer.publish(updated,'running',1002)
+        assert reader.read()==updated
+    finally:
+        if 'db' in locals():writer.db=db
+        reader.close();writer.close()
+
+
+def test_collection_reader_sees_committed_snapshot_during_tail_publication(tmp_path):
+    from cachemonitor.usage_collection import CollectionChannel,empty_snapshot
+    path=tmp_path/'index.sqlite';writer=CollectionChannel([],path);observer=CollectionChannel([],path)
+    original=empty_snapshot([],path,100.)
+    original['sessions']=[dict(home='h',id='s',history=[dict(key='one',output=1)])]
+    seen=[]
+    try:
+        writer.publish(original,'running',1000)
+        writer.db.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchall()
+        updated={**original,'ts':101.,'last_usage_collection_success':101.,
+                 'index':{**original['index'],'last_usage_success':101.}}
+        db=writer.db
+        class ObservedBlob:
+            def __enter__(self):self.blob=db.blobopen('snapshot','payload',1);return self
+            def __exit__(self,*args):self.blob.close()
+            def seek(self,offset):self.blob.seek(offset)
+            def write(self,data):
+                self.blob.write(data)
+                # This observer has no cached header: it decodes the committed row.
+                seen.append(observer.read())
+        class Observed:
+            @property
+            def in_transaction(self):return db.in_transaction
+            def __enter__(self):return db.__enter__()
+            def __exit__(self,*args):return db.__exit__(*args)
+            def executemany(self,*args):return db.executemany(*args)
+            def execute(self,*args):return db.execute(*args)
+            def blobopen(self,*args):return ObservedBlob()
+        writer.db=Observed()
+        writer.publish(updated,'running',1001)
+        writer.db=db
+        assert seen==[original]
+        assert observer.read()==updated
+    finally:
+        if 'db' in locals():writer.db=db
+        observer.close();writer.close()
+
+
+def test_idle_collector_keeps_nested_freshness_without_republishing_log_history(tmp_path):
+    import hashlib
+    from cachemonitor.usage_collection import CollectionClient,CollectorService
+    from test_core import fixture_home
+    home,_=fixture_home(tmp_path);path=tmp_path/'index.sqlite';now=1800000000.125
+    with sqlite3.connect(home/'logs_2.sqlite') as db:
+        db.executemany('INSERT INTO logs VALUES(?,?,?,?,?,?,?)',
+            [(i+2,int(now),0,'feedback_tags','',hashlib.sha256(str(i).encode()).hexdigest(),
+              'request{transport="responses_websocket" api.path="/responses"}: auth_header_attached=true')
+             for i in range(2000)])
+    service=CollectorService([home],path);reader=CollectionClient([home],path)
+    try:
+        service.channel.db.execute('PRAGMA wal_autocheckpoint=0')
+        service.poll(now);initial=service.poll(now+2)
+        assert initial['usage_collection_complete'] and len(initial['unassigned'])==2000
+        payload_size=service.channel.db.execute('SELECT length(payload) FROM snapshot WHERE id=1').fetchone()[0]
+        wal=service.channel.snapshot_path.with_name(service.channel.snapshot_path.name+'-wal')
+        initial_size=wal.stat().st_size
+        for tick in range(2,7):
+            current=now+tick*2;produced=service.poll(current)
+            assert produced['last_usage_collection_success']==current
+            assert produced['index']['last_usage_success']==current
+            assert reader.poll(current)==produced
+        assert wal.stat().st_size-initial_size<payload_size
+    finally:reader.close();service.close()
+
+
+@pytest.mark.parametrize('replacement',['old_writer','damaged_payload','damaged_tail','short_payload'])
+def test_collection_clock_update_recovers_a_replaced_payload(tmp_path,replacement):
+    from contextlib import closing
+    import hashlib,json,zlib
+    from cachemonitor.usage_collection import CollectionChannel,empty_snapshot
+    path=tmp_path/'index.sqlite';writer=CollectionChannel([],path);reader=CollectionChannel([],path)
+    snapshot=empty_snapshot([],path,100.)
+    snapshot['unassigned']=[{'turn':hashlib.sha256(str(i).encode()).hexdigest()} for i in range(1000)]
+    try:
+        writer.publish(snapshot,'running',1000)
+        stored=writer.db.execute('SELECT payload FROM snapshot WHERE id=1').fetchone()[0]
+        writer.db.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchall()
+        if replacement=='old_writer':payload=zlib.compress(json.dumps(snapshot).encode())
+        elif replacement=='damaged_payload':payload=b'bad'+stored[3:]
+        elif replacement=='short_payload':payload=stored[:-1]
+        else:
+            payload=bytearray(stored);payload[len(writer.published_header.prefix)]^=1;payload=bytes(payload)
+        # A separate writer retains the metadata and the released INSERT contract.
+        with closing(sqlite3.connect(writer.snapshot_path)) as external:
+            with external:
+                external.execute('INSERT OR REPLACE INTO snapshot VALUES(1,?,?,?,?,?)',
+                    (writer.scope,'running',1000,100.,payload))
+            assert external.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()[0]==0
+        snapshot['ts']=101.
+        writer.publish(snapshot,'running',1001)
+        assert reader.read()==snapshot
+    finally:reader.close();writer.close()

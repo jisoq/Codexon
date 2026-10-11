@@ -19,7 +19,8 @@ def rebuild(source,index_path,destination):
     new=QuotaLedger(destination)
     recovered={}
     # Rowid ranges isolate damaged pages without trusting damaged secondary indexes.
-    for table in ('observations','observation_context','window_observations','manual_resets','quota_exclusions'):
+    for table in ('observations','observation_context','window_observations','weekly_window_refs',
+                  'manual_resets','quota_exclusions'):
         total=0;lost=[]
         try:maximum=old.execute('select max(rowid) from '+table).fetchone()[0] or 0
         except sqlite3.DatabaseError:

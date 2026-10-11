@@ -1,13 +1,12 @@
 """Compact, reversible exclusion editing for one observed weekly period."""
 from bisect import bisect_left
 
-from PySide6.QtCore import QTimer, Signal, Slot
+from PySide6.QtCore import Signal
 
 from .i18n import Verbatim, formatted
 from .presentation import Button, Choice, Column, Group, Input, Row, Text
-from .pricing import usd
+from .quota_exclusions import active_exclusions, exclusion_ranges
 from .quota_view import clock
-from .ui_details import Details
 
 
 class _ReasonInput(Input):
@@ -23,23 +22,13 @@ class QuotaExclusions(Group):
     def __init__(self):
         super().__init__()
         self.report = {}
-        self._report_revision = 0
         self.period = None
         self._weekly = True
         self._context = None
         self._times = []
         self._choice_key = None
-        self._preview = None
-        self._preview_key = None
-        self._preview_request = None
-        self._preview_task = None
-        self._preview_worker = None
-        self._owned_worker = None
-        self._preview_prepared = None
-        self._preview_timer = QTimer(self)
-        self._preview_timer.setSingleShot(True)
-        self._preview_timer.setInterval(120)
-        self._preview_timer.timeout.connect(self._start_preview)
+        self._selection = None
+        self._excluded_ranges = []
         self._pending = False
         self._restores = []
         self.toggle = Button('구간 제외')
@@ -65,7 +54,7 @@ class QuotaExclusions(Group):
             choice.setAccessibleName('제외 '+label+' 관측')
             row.addWidget(choice)
             bounds.addLayout(row)
-            choice.currentIndexChanged.connect(self.update_preview)
+            choice.currentIndexChanged.connect(self.update_selection)
         layout.addLayout(bounds)
         reason_row = Row(); reason_row.put(flow=False); reason_row.setSpacing(8)
         field = Row(); field.setSpacing(8)
@@ -85,12 +74,9 @@ class QuotaExclusions(Group):
         self.apply.clicked.connect(self.submit)
         self.cancel.clicked.connect(self.cancel_edit)
         layout.addLayout(reason_row)
-        self.impact = Text(); self.impact.put(fontSize=12, color='muted', wrap=True)
-        layout.addWidget(self.impact)
-        self.impact_details = Details('집계 변화', compact=True)
-        self.impact_details.toggle.put(fontSize=12, color='muted')
-        self.impact_details.body.put(fontSize=12, color='muted')
-        layout.addWidget(self.impact_details)
+        self.selection_error = Text(); self.selection_error.put(fontSize=12, color='muted', wrap=True)
+        self.selection_error.hide()
+        layout.addWidget(self.selection_error)
 
         self.history = Group()
         self.history_layout = Column(self.history)
@@ -100,9 +86,8 @@ class QuotaExclusions(Group):
         self.message.hide(); self.history.hide(); self.hide()
 
     def set_context(self, report, period, weekly=True, cursor=0):
-        if report is not self.report:
-            self._report_revision += 1
         self.report, self.period = report, period
+        self._excluded_ranges = exclusion_ranges(active_exclusions(report))
         self._weekly = weekly
         key = (report.get('home'), period.get('start') if period else None, weekly)
         if key != self._context:
@@ -125,10 +110,10 @@ class QuotaExclusions(Group):
         self.render_history()
         if self.toggle.isChecked():
             self.populate_choices()
-            self.update_preview()
+            self.update_selection()
         else:
-            self._preview_request = None
-            self._preview_timer.stop()
+            self._selection = None
+            self.apply.setEnabled(False)
             self.selection_changed.emit(None, None, False)
 
     def populate_choices(self):
@@ -153,10 +138,10 @@ class QuotaExclusions(Group):
         self.setVisible(expanded)
         if expanded:
             self.populate_choices()
-            self.update_preview()
+            self.update_selection()
         else:
-            self._preview_request = None
-            self._preview_timer.stop()
+            self._selection = None
+            self.apply.setEnabled(False)
             self.selection_changed.emit(None, None, False)
 
     def select_range(self, start, end):
@@ -167,99 +152,28 @@ class QuotaExclusions(Group):
         for choice, at in ((self.start, min(start, end)), (self.end, max(start, end))):
             index = min(bisect_left(self._times, at), len(self._times)-1)
             choice.blockSignals(True); choice.setCurrentIndex(index); choice.blockSignals(False)
-        self.update_preview()
+        self.update_selection()
 
-    def update_preview(self, *_):
+    def update_selection(self, *_):
         start, end = self.start.currentData(), self.end.currentData()
-        key = (self._report_revision, self._context, start, end)
-        if key == self._preview_key and self._preview is not None:
-            self.selection_changed.emit(start, end, True)
-            return
-        self._preview_request = None
-        self._preview = None
+        self._selection = None
         self.apply.setEnabled(False)
-        self.impact_details.hide()
+        self.selection_error.hide()
         if not self.toggle.isChecked():
             return
         self.selection_changed.emit(start, end, True)
+        error = None
         if start is None or end is None or end <= start:
-            self.impact.setText('종료 시각을 시작보다 뒤로 선택하세요.')
+            error = '종료 시각을 시작보다 뒤로 선택하세요.'
+        elif not self.report.get('account'):
+            error = '계정을 확인한 뒤 구간을 제외하세요.'
+        elif any(lo <= start and hi >= end for lo, hi in self._excluded_ranges):
+            error = '이미 제외한 구간입니다.'
+        if error:
+            self.selection_error.setText(error)
+            self.selection_error.show()
             return
-        self._preview_request = (key, self.report, start, end)
-        self.impact.setText('계산 중...')
-        self._preview_timer.start()
-
-    @Slot()
-    def _start_preview(self):
-        if self._preview_task is not None or self._preview_request is None or not self.toggle.isChecked():
-            return
-        self._preview_timer.stop()
-        key, report, start, end = self._preview_request
-        worker = report.get('_worker')
-        if worker is None:
-            if self._owned_worker is None:
-                from .quota_worker import QuotaWorker
-                self._owned_worker = QuotaWorker()
-                self.destroyed.connect(lambda *_ , worker=self._owned_worker: worker.close())
-            worker = self._owned_worker
-        if worker is not self._preview_worker:
-            if self._preview_worker is not None:
-                self._preview_worker.result.disconnect(self._receive_worker_preview)
-            self._preview_worker = worker
-            worker.result.connect(self._receive_worker_preview)
-        revision = report.get('worker_revision')
-        if revision is None:
-            if self._preview_prepared is not None and self._preview_prepared[0] is report:
-                revision = self._preview_prepared[1]
-            else:
-                identifier = worker.request('prepare', key=key,
-                    snapshot={name:value for name,value in report.items() if name not in ('view','_worker')})
-                self._preview_task = ('prepare', identifier, key)
-                return
-        identifier = worker.request('preview', key=key, revision=revision, start=start, end=end)
-        self._preview_task = ('preview', identifier, key)
-
-    @Slot(object)
-    def _receive_worker_preview(self, result):
-        task = self._preview_task
-        if (task is None or self.sender() is not self._preview_worker
-                or (result['kind'], result['id'], result['key']) != task):
-            return
-        self._preview_task = None
-        key = result['key']
-        if result['kind'] == 'prepare' and not result.get('error'):
-            if self._preview_request is not None and key == self._preview_request[0]:
-                self._preview_prepared = (self.report, result['report']['worker_revision'])
-            self._start_preview()
-            return
-        self._receive_preview(key, result.get('value'), result.get('error'))
-
-    @Slot(object, object, object)
-    def _receive_preview(self, key, preview, error):
-        self._preview_task = None
-        if (self._preview_request is None or key != self._preview_request[0]
-                or not self.toggle.isChecked()):
-            self._start_preview()
-            return
-        if error is not None:
-            self.impact.setText(error)
-            return
-        self._preview_key = key
-        self._preview = preview
-        start, end = self.start.currentData(), self.end.currentData()
-        removed = preview['removed']
-        self.impact.setText(formatted('새로 제외: {delta}%p / {cost}', delta=f"{removed['delta']:g}", cost=usd(removed['cost'])))
-        if (preview['start'], preview['end']) != (start, end):
-            self.impact.setText(formatted('{summary} / 적용 구간 {start} ~ {end}', summary=self.impact.text(), start=clock(preview['start'], True), end=clock(preview['end'], True)))
-            self.selection_changed.emit(preview['start'], preview['end'], True)
-        def value(stats):
-            return usd(stats['cost']/stats['delta']*100 if stats['delta']>0 else None)
-        sections = []
-        if 'period_before' in preview:
-            sections.append(('주간 예상 가치', value(preview['period_before'])+' → '+value(preview['period_after'])))
-        sections.append(('누적 예상 가치', value(preview['before'])+' → '+value(preview['after'])))
-        self.impact_details.set_sections(sections)
-        self.impact_details.show()
+        self._selection = (start, end)
         self.apply.setEnabled(not self._pending)
 
     def cancel_edit(self):
@@ -267,9 +181,10 @@ class QuotaExclusions(Group):
         self.reason.setText('')
 
     def submit(self):
-        if self._pending or self._preview is None or not self.apply.isEnabled():
+        if self._pending or self._selection is None or not self.apply.isEnabled():
             return
-        payload = dict(start=self._preview['start'], end=self._preview['end'], reason=self.reason.text().strip()[:200])
+        start, end = self._selection
+        payload = dict(start=start, end=end, reason=self.reason.text().strip()[:200])
         self.set_pending(True)
         self.requested.emit(payload)
 
@@ -283,7 +198,7 @@ class QuotaExclusions(Group):
         self._pending = pending
         for node in (self.start, self.end, self.reason, self.apply, self.cancel, self.toggle, *self._restores):
             node.setEnabled(not pending)
-        self.apply.setEnabled(not pending and self._preview is not None)
+        self.apply.setEnabled(not pending and self._selection is not None)
         self.message.setText('저장 중...' if pending else '')
         self.message.setVisible(pending)
 
@@ -291,7 +206,6 @@ class QuotaExclusions(Group):
         self.set_pending(False)
         if (result.get('ok') or result.get('saved')) and result.get('operation') == 'exclude':
             self.cancel_edit()
-            self.impact_details.toggle.setChecked(False)
         if result.get('ok'):
             self.message.setText('선택 구간을 제외하고 재집계했습니다.' if result.get('operation') == 'exclude' else '해당 제외 내역을 해제하고 재집계했습니다.')
         else:

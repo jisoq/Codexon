@@ -124,12 +124,12 @@ class Tracker:
             record.update(generation_observed_at=time.time(),generation_latency_ms=(time.monotonic()-began)*1000)
         if state=='completed' and began is not None:
             record.update(completed_observed_at=time.time(),completion_latency_ms=(time.monotonic()-began)*1000)
-        if state in ('created','completed','failed','incomplete'):
-            if state in ('failed','incomplete'):
+        if state in ('created','completed','failed','incomplete','cancelled'):
+            if state in ('failed','incomplete','cancelled'):
                 record['completed_observed_at']=time.time()
             record['status']=state
             self.save(record)
-        if state in ('completed','failed','incomplete'):
+        if state in ('completed','failed','incomplete','cancelled'):
             self.health['internal_failure_streak']=0
             self.active.pop(rid,None)
             self.timings.pop(record['attempt'],None)
