@@ -285,7 +285,17 @@ def test_session_chart_display_and_metric_restore_across_sessions(dashboard,tmp_
         assert item.isVisible() and box.width()>0 and box.height()>0
         assert scene.contains(box), f'History chart control outside viewport: {box}, {scene}'
     summary=next(node for node in w.record_current.findChildren(Details) if node.body is w.history_summary)
-    summary_top=control(w,summary.toggle).mapToScene(QPointF()).y()
+    # Wrapped inspector text changes height after the chart's first painted frame.
+    # Wait for the rendered layout contract, retaining the same overlap assertion.
+    import time
+    from PySide6.QtTest import QTest
+    deadline=time.monotonic()+3
+    while True:
+        summary_top=control(w,summary.toggle).mapToScene(QPointF()).y()
+        bottoms=[control(w,node).mapToScene(QPointF(0,control(w,node).height())).y()
+                 for node in (w.history_inspector,w.history_detail_button)]
+        if max(bottoms)<=summary_top or time.monotonic()>=deadline:break
+        QTest.qWait(20);w.quick.grabFramebuffer()
     for node in (w.history_inspector,w.history_detail_button):
         item=control(w,node)
         assert item.mapToScene(QPointF(0,item.height())).y()<=summary_top
