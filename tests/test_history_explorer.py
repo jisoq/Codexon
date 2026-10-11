@@ -241,22 +241,23 @@ def test_chart_controls_stay_clear_when_switching_between_requests_and_all_calls
                    for second in rectangles[index+1:])
         assert max(rect.bottom() for rect in rectangles)<=plot.mapToScene(QPointF()).y()
         assert w.quick.grabFramebuffer().save(str(tmp_path/f'history-{kind}-chart-{width}.png'))
-        click(w,control(w,w.history_view_buttons['table']));render_plot(w,w.table)
+        click(w,render_plot(w,w.history_view_buttons['table']));render_plot(w,w.table)
         assert control(w,w.table).isVisible() and not control(w,w.history_chart_panel).isVisible()
         assert any(item.isVisible() for item in walk(control(w,w.table))
                    if item.objectName()=='table-header-label')
         assert w.selected_session==session and w.record_view==kind
-        click(w,control(w,w.history_view_buttons['chart']));render_plot(w,w.history_chart)
+        click(w,render_plot(w,w.history_view_buttons['chart']));render_plot(w,w.history_chart)
         assert not control(w,w.history_table_stack).isVisible()
     assert not w.qml_errors
 
 
 @pytest.mark.integration
-def test_session_chart_display_and_metric_restore_across_sessions(dashboard,tmp_path):
+@pytest.mark.parametrize('size',[(1120,760),(1000,680)])
+def test_session_chart_display_and_metric_restore_across_sessions(dashboard,tmp_path,size):
     from PySide6.QtCore import QPointF,QRectF
     from cachemonitor.quick_qa import click,control,render_plot
     from cachemonitor.ui_details import Details
-    w=dashboard;w.resize(1120,760);w.change_page(2)
+    w=dashboard;w.resize(*size);w.change_page(2)
     assert w.history_display=='table' and render_plot(w,w.table).isVisible()
     assert not control(w,w.history_chart_panel).isVisible()
     w.activate_record(0)
@@ -276,11 +277,10 @@ def test_session_chart_display_and_metric_restore_across_sessions(dashboard,tmp_
     assert w.history_chart.bounds_for('input')[1]>w.history_chart.bounds_for('output')[1]
     # Real control bounds must remain reachable in the compact dashboard.
     scene=QRectF(w.quick.rect())
-    for item in (chart,control(w,w.history_metric),control(w,w.history_view_buttons['table']),
-                 control(w,w.history_axis),control(w,w.history_zoom),control(w,w.history_reset_zoom),
-                 control(w,w.session_scope),
-                 control(w,w.history_all_calls_button),control(w,w.history_chart_note),
-                 control(w,w.history_inspector),control(w,w.history_detail_button)):
+    for node in (w.history_chart,w.history_metric,w.history_view_buttons['table'],
+                 w.history_axis,w.history_zoom,w.history_reset_zoom,w.session_scope,
+                 w.history_all_calls_button,w.history_chart_note,w.history_inspector,w.history_detail_button):
+        item=render_plot(w,node)
         box=QRectF(item.mapToScene(QPointF()),item.size())
         assert item.isVisible() and box.width()>0 and box.height()>0
         assert scene.contains(box), f'History chart control outside viewport: {box}, {scene}'
@@ -307,7 +307,7 @@ def test_session_chart_display_and_metric_restore_across_sessions(dashboard,tmp_
             pytest.fail(json.dumps(evidence,ensure_ascii=False))
     w.history_axis.setCurrentIndex(w.history_axis.findData('time'))
     state=w.capture_state()
-    click(w,control(w,w.history_view_buttons['table']))
+    click(w,render_plot(w,w.history_view_buttons['table']))
     assert render_plot(w,w.table).isVisible() and not control(w,w.history_chart_panel).isVisible()
     w.history_metric.setCurrentIndex(w.history_metric.findData('cost'))
     w.restore_state(state)
@@ -316,7 +316,7 @@ def test_session_chart_display_and_metric_restore_across_sessions(dashboard,tmp_
     assert w.history_axis.currentData()=='time'
     click(w,render_plot(w,w.history_all_calls_button));render_plot(w,w.history_chart)
     assert w.record_view=='calls' and w.selected_turn is None
-    up=control(w,w.history_up_button)
+    up=render_plot(w,w.history_up_button)
     assert up.isVisible() and scene.contains(QRectF(up.mapToScene(QPointF()),up.size()))
     click(w,up);render_plot(w,w.history_chart)
     assert w.record_view=='requests' and w.history_metric.findData('output_speed')<0

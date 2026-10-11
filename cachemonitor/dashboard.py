@@ -473,7 +473,9 @@ class Dashboard(TrayWindow):
             parent_table.cellClicked.connect(self.activate_record_parent);parent_table.cellActivated.connect(lambda index,*_:self.activate_record_parent(index,1))
         self.parent_table=self.session_parent_table
         self.records_body.addWidget(self.record_parent)
-        self.record_current=Group();current_layout=Column(self.record_current)
+        self.record_current=Scroll();self.record_current.put(fillViewport=True)
+        self.record_current.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        current_body=Group();self.record_current.setWidget(current_body);current_layout=Column(current_body)
         current_header=Row();current_header.put(flow=True,spacing=12)
         self.record_current_title=label('요청','section');self.record_current_title.hide()
         self.history_view_controls=Row();self.history_view_controls.setSpacing(0);self.history_view_buttons={}
