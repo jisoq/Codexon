@@ -288,7 +288,23 @@ def test_session_chart_display_and_metric_restore_across_sessions(dashboard,tmp_
     summary_top=control(w,summary.toggle).mapToScene(QPointF()).y()
     for node in (w.history_inspector,w.history_detail_button):
         item=control(w,node)
-        assert item.mapToScene(QPointF(0,item.height())).y()<=summary_top
+        bottom=item.mapToScene(QPointF(0,item.height())).y()
+        if bottom>summary_top:
+            import json
+            from pathlib import Path
+            folder=Path(__file__).resolve().parents[1]/'artifacts/verification/history-layout'
+            folder.mkdir(parents=True,exist_ok=True)
+            w.quick.grabFramebuffer().save(str(folder/'overlap.png'))
+            parents=[];parent=item
+            while parent:
+                parents.append(dict(type=parent.metaObject().className(),width=parent.width(),height=parent.height(),
+                                    implicit=parent.implicitHeight(),y=parent.mapToScene(QPointF()).y()))
+                parent=parent.parentItem()
+            evidence=dict(window=[w.width(),w.height()],scene=[w.quick.width(),w.quick.height()],
+                          inspector=w.history_inspector.text(),note=w.history_chart_note.text(),
+                          summary_top=summary_top,parents=parents)
+            (folder/'geometry.json').write_text(json.dumps(evidence,ensure_ascii=False,indent=2),encoding='utf-8')
+            pytest.fail(json.dumps(evidence,ensure_ascii=False))
     w.history_axis.setCurrentIndex(w.history_axis.findData('time'))
     state=w.capture_state()
     click(w,control(w,w.history_view_buttons['table']))
