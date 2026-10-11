@@ -75,11 +75,15 @@ Rectangle {
                 width: itemScroll.availableWidth
                 spacing: 5
                 Repeater {
-                    model: card.detailData.items || []
+                    // Keep the rows alive while inspecting another observation.
+                    // A new QVariantList model otherwise rebuilds every delegate.
+                    model: (card.detailData.items || []).length
                     delegate: RowLayout {
-                        required property var modelData
+                        required property int index
+                        readonly property var modelData: (card.detailData.items || [])[index] || {}
                         Layout.fillWidth: true
                         spacing: 10
+                        Layout.leftMargin: modelData.subordinate ? 14 : 0
                         Rectangle {
                             visible: !!modelData.model
                             Layout.preferredWidth: visible ? 10 : 0
@@ -95,8 +99,8 @@ Rectangle {
                         Text {
                             objectName: "quotaDetailValue"
                             text: modelData.value
-                            font.family: appTheme.family; font.pixelSize: 15; font.bold: true
-                            color: appTheme.palette.ink
+                            font.family: appTheme.family; font.pixelSize: modelData.subordinate ? 13 : 15; font.bold: !modelData.subordinate
+                            color: modelData.subordinate ? appTheme.palette.muted : appTheme.palette.ink
                             wrapMode: Text.Wrap; horizontalAlignment: Text.AlignRight
                             Layout.maximumWidth: card.availableWidth * 0.57
                         }

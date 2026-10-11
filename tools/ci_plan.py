@@ -47,6 +47,7 @@ def build_plan(changed, *, base='', candidate=False, extended=False, reuse_qa=Fa
     args = ['--extended'] if extended else ['--integration'] if full else ['--base', base]
     return dict(impact, full=full, tests=('tests',) if full else impact['tests'],
                 source_args=args, package=bool(package), proxy=bool(proxy),
+                rust=bool(package or impact['tests']),
                 msix=bool(msix), native=bool(package and not msix), qa_reuse=qa_reuse,
                 scales=extended or unknown or any(matches(p, SCALE_PATTERNS) for p in paths),
                 dependencies=candidate or extended or unknown or any(p.startswith('requirements') for p in paths),
@@ -75,7 +76,7 @@ def main():
     (folder/'plan.json').write_text(json.dumps(plan, indent=2, ensure_ascii=False), encoding='utf-8')
     if os.environ.get('GITHUB_OUTPUT'):
         with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
-            for key in ('package', 'proxy', 'native', 'msix', 'scales', 'dependencies', 'qa_reuse'):
+            for key in ('package', 'proxy', 'native', 'msix', 'scales', 'dependencies', 'qa_reuse', 'rust'):
                 print(f'{key}={str(plan[key]).lower()}', file=output)
     print(json.dumps(plan, indent=2, ensure_ascii=False))
 

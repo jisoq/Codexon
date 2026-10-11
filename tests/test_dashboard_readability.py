@@ -6,7 +6,7 @@ from PySide6.QtWidgets import QApplication
 from cachemonitor.dashboard import Dashboard, choose
 from cachemonitor.fonts import load_bundled_fonts
 from cachemonitor.i18n import set_language, language
-from cachemonitor.quick_qa import control, walk
+from cachemonitor.quick_qa import control, walk, click, render_plot
 from tests.test_ui import snapshot
 
 pytestmark = pytest.mark.integration
@@ -31,11 +31,14 @@ def test_approved_pages_render_with_stable_routes_and_aligned_fields(tmp_path, l
             assert len(views)==1
             assert control(window,window.period).isVisible()
             if page==0:
+                click(window,render_plot(window,window.efficiency_details.toggle))
                 for caption in window.metric_captions:
-                    item=control(window,caption)
+                    item=render_plot(window,caption)
                     rendered=next(child for child in walk(item) if child.isVisible() and child.metaObject().indexOfProperty('truncated')>=0)
                     assert not rendered.property('truncated')
                     assert item.height()>=rendered.property('contentHeight')
+                click(window,render_plot(window,window.efficiency_details.toggle))
+                window.scrollers[0].verticalPosition.setValue(0)
             if page in (0,1):assert window.common_filters._nodes==list(window.common_fields.values())
             else:assert not window.scope_note.isVisible()
             assert window.quick.grabFramebuffer().save(str(tmp_path/f'page-{page}.png'))

@@ -1,0 +1,245 @@
+"""Process isolation, bounded delivery, and durable exclusion acknowledgements."""
+from functools import partial
+import multiprocessing as mp
+import os
+import pickle
+import queue
+import sqlite3
+import time
+
+from PySide6.QtCore import QTimer
+from PySide6.QtWidgets import QApplication
+
+from cachemonitor.quota_worker import QuotaComputation, QuotaWorker
+from test_quota_exclusions import sample_report
+
+
+def wait_until(condition, timeout=10, app=None):
+    deadline=time.monotonic()+timeout
+    while not condition() and time.monotonic()<deadline:
+        if app is not None:app.processEvents()
+        else:time.sleep(.005)
+    assert condition()
+
+
+def controlled_process(connection,path,home,entered,release):
+    try:
+        while True:
+            request=connection.recv()
+            if request['kind']=='stop':return
+            if request.get('key')=='crash':os._exit(21)
+            if request.get('key') in ('slow','write','delayed-write'):
+                if request['key']!='delayed-write':
+                    connection.send(dict(kind='phase',value='writing' if request['key']=='write' else 'reading'))
+                entered.set()
+                # A CPU-bound calculation in this interpreter cannot take the
+                # parent's GIL or block its Qt event queue.
+                value=0
+                deadline=time.monotonic()+20
+                while not release.is_set() and time.monotonic()<deadline:
+                    for index in range(10000):value=(value+index)%1000003
+                if request['key']=='delayed-write':
+                    connection.send(dict(kind='phase',value='writing'))
+            connection.send({key:request.get(key) for key in ('kind','id','key')} |
+                            dict(value=dict(pid=os.getpid(),key=request.get('key'))))
+    except (EOFError,BrokenPipeError,OSError):
+        pass
+    finally:connection.close()
+
+
+def delayed_preview_process(connection,path,home,entered,release,calls,blocked_kind='preview'):
+    computation=QuotaComputation(path,home)
+    first=True
+    try:
+        while True:
+            request=connection.recv()
+            if request['kind']=='stop':return
+            if request['kind']==blocked_kind:
+                if calls is not None:calls.put((request.get('start'),request.get('end')))
+                if first:
+                    first=False
+                    entered.set()
+                    deadline=time.monotonic()+15
+                    value=0
+                    while not release.is_set() and time.monotonic()<deadline:
+                        for index in range(10000):value=(value+index)%1000003
+            connection.send(computation.execute(request))
+    except (EOFError,BrokenPipeError,OSError):pass
+    finally:
+        computation.close()
+        connection.close()
+
+
+def incomplete_process(connection,path,home,entered,release,crash=False):
+    from cachemonitor.quota_transport import frames
+    try:
+        request=connection.recv()
+        result={key:request.get(key) for key in ('kind','id','key')} | dict(
+            report={'rows':[{'at':index,'value':index/10} for index in range(5000)]})
+        payloads=iter(frames(result))
+        connection.send_bytes(next(payloads))
+        entered.set()
+        if crash:os._exit(21)
+        release.wait(10)
+        for payload in payloads:connection.send_bytes(payload)
+    except (EOFError,BrokenPipeError,OSError):pass
+    finally:connection.close()
+
+
+def test_cpu_bound_child_keeps_gui_timers_running_and_coalesces_latest_query():
+    app=QApplication.instance() or QApplication([])
+    context=mp.get_context('spawn')
+    entered,release=context.Event(),context.Event()
+    results=[];ticks=[]
+    worker=QuotaWorker(on_result=results.append,
+        process_target=partial(controlled_process,entered=entered,release=release))
+    try:
+        worker.request('query',key='slow')
+        wait_until(entered.is_set,app=app)
+        worker.request('query',key='superseded')
+        final=worker.request('query',key='latest')
+        QTimer.singleShot(0,lambda:ticks.append(True))
+        wait_until(lambda:bool(ticks),app=app)
+        assert results==[] and worker.process.pid!=os.getpid()
+        release.set()
+        wait_until(lambda:bool(results),app=app)
+        assert [(r['id'],r['value']['key']) for r in results]==[(final,'latest')]
+    finally:
+        release.set();worker.close()
+    assert not worker.process.is_alive()
+
+
+def test_failed_process_is_replaced_without_replaying_uncertain_edit():
+    context=mp.get_context('spawn')
+    results=[]
+    worker=QuotaWorker(on_result=results.append,process_target=partial(controlled_process,
+        entered=context.Event(),release=context.Event()))
+    try:
+        edit=worker.request('exclude',key='crash',start=1,end=2)
+        wait_until(lambda:bool(results))
+        assert results[0]['id']==edit and results[0]['uncertain'] and results[0]['permanent']
+        old_pid=worker.process.pid
+        latest=worker.request('report',key='recovered')
+        wait_until(lambda:len(results)==2)
+        assert results[1]['id']==latest and results[1]['value']['pid']!=old_pid
+    finally:worker.close()
+
+
+def test_shutdown_interrupts_only_reading_and_does_not_kill_committing_child():
+    context=mp.get_context('spawn')
+    for kind,key in (('report','slow'),('exclude','write'),('exclude','delayed-write')):
+        entered,release=context.Event(),context.Event()
+        worker=QuotaWorker(process_target=partial(controlled_process,entered=entered,release=release))
+        try:
+            worker.request(kind,key=key)
+            wait_until(entered.is_set)
+            if key in ('write','delayed-write'):
+                assert not worker.close(timeout=.03)
+                assert worker.process.is_alive()
+                release.set()
+                wait_until(lambda:not worker.thread.is_alive())
+            else:
+                start=time.monotonic()
+                assert worker.close()
+                assert time.monotonic()-start<2.5
+            assert not worker.process.is_alive()
+        finally:
+            if worker.process is not None and worker.process.is_alive():release.set()
+            worker.close()
+
+
+def test_incomplete_graph_is_never_published_and_shutdown_cancels_transfer():
+    context=mp.get_context('spawn')
+    for crash in (False,True):
+        entered,release=context.Event(),context.Event();results=[]
+        worker=QuotaWorker(on_result=results.append,process_target=partial(incomplete_process,
+            entered=entered,release=release,crash=crash))
+        try:
+            worker.request('report')
+            wait_until(entered.is_set)
+            if crash:
+                wait_until(lambda:bool(results))
+                assert results[0].get('error') and 'report' not in results[0]
+            else:
+                assert results==[]
+                assert worker.close()
+                assert results==[] and not worker.process.is_alive()
+        finally:
+            if worker.process is not None and worker.process.is_alive():release.set()
+            worker.close()
+
+
+def test_real_child_prepares_compact_report_and_reuses_raw_evidence_for_preview():
+    responses=queue.Queue()
+    worker=QuotaWorker(on_result=responses.put)
+    source=sample_report()
+    try:
+        worker.request('prepare',snapshot=source)
+        prepared=responses.get(timeout=15)
+        assert not prepared.get('error'),prepared
+        report=prepared['report']
+        assert not any(field in report for field in ('cycles','history','request_windows','tracking'))
+        assert report['view']['lifetime']['intervals']==[]
+        assert report['view']['lifetime']['cost']==312
+        assert report['view']['overall']['_content_digest']
+        assert len(report['view']['default_query']['rows'])<=25
+        worker.request('preview',revision=report['worker_revision'],start=110,end=130)
+        preview=responses.get(timeout=15)
+        assert preview['value']['removed']==dict(cost=300,delta=10,calls=2)
+        assert source['exclusions']==[]
+        worker.request('query',revision=report['worker_revision'],query={'start':100,'end':110})
+        query=responses.get(timeout=15)
+        assert not query.get('error'),query
+        assert query['value']['statistics']['delta']==1
+    finally:worker.close()
+
+
+def test_slow_accounting_does_not_delay_observation_storage(tmp_path,monkeypatch):
+    from cachemonitor import quota_service
+    app=QApplication.instance() or QApplication([])
+    context=mp.get_context('spawn')
+    entered,release=context.Event(),context.Event()
+    monkeypatch.setattr(quota_service,'QuotaWorker',lambda *args,**kwargs:QuotaWorker(*args,**kwargs,
+        process_target=partial(delayed_preview_process,entered=entered,release=release,
+                               calls=None,blocked_kind='report')))
+    service=quota_service.QuotaService(tmp_path/'home',tmp_path/'index.sqlite',live=False)
+    received=[];ticks=[]
+    service.updated.connect(received.append)
+    at=time.time()
+    def observation(offset):
+        return dict(observed_at=at+offset,account='a',plan_type='pro',bucket='codex',windows={
+            'weekly':dict(used_percent=10+offset,resets_at=at+604800,window_minutes=10080)})
+    def stored():
+        with sqlite3.connect(service.path) as db:
+            return db.execute('select count(*) from observations').fetchone()[0]
+    try:
+        service.supply_local(observation(0));service.start()
+        wait_until(entered.is_set,app=app)
+        assert stored()==1
+        service.supply_local(observation(1))
+        QTimer.singleShot(0,lambda:ticks.append(True))
+        wait_until(lambda:stored()==2 and bool(ticks),app=app)
+        assert not any(value.get('report',{}).get('worker_revision') for value in received)
+        release.set()
+        wait_until(lambda:any(value.get('report',{}).get('worker_revision') for value in received),app=app)
+    finally:
+        release.set();service.stop()
+    assert not service.report_worker.process.is_alive()
+
+
+def test_compact_report_drops_call_graph_bytes_and_can_still_query_them():
+    source=sample_report()
+    # Irrelevant per-call metadata deliberately makes raw evidence large. It is
+    # not a chart field and must never cross the presentation boundary.
+    for cycle in source['cycles']:
+        for row in cycle.get('cost_rows',[]):row['synthetic_metadata']='x'*100000
+    engine=QuotaComputation()
+    try:
+        prepared=engine.execute(dict(kind='prepare',id=1,key=None,snapshot=source))
+        assert not prepared.get('error'),prepared
+        raw=next(iter(engine.reports.values()))
+        packed=pickle.dumps(prepared['report'],protocol=5)
+        assert len(packed)<len(pickle.dumps(raw,protocol=5))/2
+        assert b'synthetic_metadata' not in packed
+        assert prepared['report']['view']['lifetime']['cost']==312
+    finally:engine.close()

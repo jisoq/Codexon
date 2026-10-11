@@ -36,6 +36,7 @@ def test_metrics_equal_session_weight_speed_and_missing():
     rows=[row(i) for i in range(12)]+[row(15,sid='other',input=10,cached=1,output=200,completion_latency_ms=2000,output_speed=100)]
     rows.append(row(16,cost=None,reasoning=None,output_speed=None,duration=None,input=None,cached=None))
     data=PerformanceTrends().query(engine(rows),query())
+    assert [p['key'] for p in data['panels']]==['duration','output_speed','cost','session_cache','input','reasoning:high','count']
     cache=panel(data,'session_cache')
     assert cache['lines'][0]['points'][0]['value']==50
     assert panel(data,'output_speed')['lines'][0]['points'][0]['value']==100
@@ -73,6 +74,7 @@ def test_rolling_representatives_valid_populations_and_common_windows():
         rows.append(row(len(rows),ts=2800,service_tier=mode,cost=None,duration=None,output_speed=999,
                         completion_latency_ms=0,input=None,cached=None,sid='missing'))
     data=PerformanceTrends().query(engine(rows),query(now=4600,time_range=[1000,4600],granularity='auto',plot_width=768))
+    assert [p['key'] for p in data['panels']]==['duration','output_speed','cost','session_cache','input','reasoning:high','count']
     def at(key):return next(p for p in panel(data,key)['lines'][0]['points'] if p['ts']==2800)
     assert data['window_seconds']==300
     assert at('cost')['value']==10 and at('cost')['distribution']['median']==1
@@ -284,13 +286,19 @@ def test_qt_panel_hover_analysis_and_passive_click(tmp_path):
     from cachemonitor.quick_qa import mount,dispose,render_plot,click
     app=QApplication.instance() or QApplication([])
     owner=SimpleNamespace(settings=QSettings(str(tmp_path/'settings.ini'),QSettings.IniFormat),render=lambda:None,open_record=lambda r:None)
-    ui=PerformancePanel(owner);data=PerformanceTrends().query(engine([row(i) for i in range(20)]),query())
+    rows=[row(i,key=f'{model}-{i}',model=model,cost=cost) for model,cost in (('m',1.),('other',2.),('outside',1000.)) for i in range(20)]
+    ui=PerformancePanel(owner);data=PerformanceTrends().query(engine(rows),query())
     ui.apply(data);host=mount(ui,1000,800)
     try:
-        chart=ui.plots['cost'];render_plot(host,chart);before=chart.bounds
-        ui.highlight('m',False,True);app.processEvents();host.quick.grabFramebuffer()
-        assert chart.bounds==before
-        item=render_plot(host,chart);point=chart.rows[0];xy=chart.xy(point)
+        assert next(iter(ui.plots))=='duration'
+        chart=ui.plots['cost'];render_plot(host,chart)
+        assert chart.bounds==pytest.approx((0,1120))
+        ui.remove_model('outside');app.processEvents();host.quick.grabFramebuffer()
+        assert chart.bounds==pytest.approx((0,2.24))
+        assert {p['model'] for p in chart.rows}=={'m','other','outside'}
+        item=render_plot(host,chart);point=next(p for p in chart.rows if p['model']=='m');xy=chart.xy(point)
+        outside=next(p for p in chart.rows if p['model']=='outside')
+        assert chart.ink(outside).alphaF()<chart.ink(point).alphaF()
         assert ui.inspector.isVisible()
         item.showTip(xy.x(),xy.y())
         assert item.tip=='' and ui.inspected==(point,'cost')
@@ -623,6 +631,46 @@ def test_calendar_units_leap_months_and_cache_invalidation():
     points=panel(data,'count')['lines'][0]['points']
     assert [p['value'] for p in points]==[1,1]
     assert points[0]['end']==points[1]['start']==stamp('2026-10-05')
+
+
+@pytest.mark.parametrize('unit,dates',[
+    ('day',('2026-01-05','2026-01-06','2026-01-07')),
+    ('week',('2026-01-05','2026-01-12','2026-01-19')),
+    ('month',('2026-01-01','2026-02-01','2026-03-01')),
+])
+def test_calendar_duration_uses_median_for_representative_and_previous_comparison(unit,dates):
+    from datetime import datetime
+    first,second,end=[datetime.fromisoformat(t).timestamp() for t in dates]
+    rows=[]
+    for model in ('m','other'):
+        for ts,values in ((first,(1,2,99)),(second,(3,6,111,None))):
+            rows.extend([row(len(rows)+i,ts=ts+i,model=model,duration=value) for i,value in enumerate(values)])
+    data=PerformanceTrends().query(engine(rows),query(now=end,time_range=[first,end],granularity=unit))
+    for line in panel(data,'duration')['lines']:
+        before,after=line['points']
+        assert [before['value'],after['value']]==[2,6]
+        assert [before['mean'],after['mean']]==[34,40]
+        assert before['baseline'] is None
+        assert after['complete'] and after['baseline']==2 and after['delta']==4
+        assert after['coverage']==(3,4) and after['distribution']['median']==6
+    assert all(r['duration']==value for r,value in zip(rows,[1,2,99,3,6,111,None]*2))
+
+
+def test_multi_model_axis_follows_selection_without_dropping_faint_context():
+    from cachemonitor.performance_panel import PerformancePlot
+    rows=[row(0,model='a',cost=1),row(1,model='b',cost=2),row(2,model='outside',cost=1000),
+          row(3,model='a',service_tier='Fast',cost=10000)]
+    data=panel(PerformanceTrends().query(engine(rows),query()),'cost')
+    selected={'a','b'};modes={'Standard':True,'Fast':False}
+    owner=SimpleNamespace(single_model=lambda:False,is_model_selected=selected.__contains__,
+                          modes=modes,show_outer=False,range=(1000,2000))
+    plot=PerformancePlot(owner);plot.set_data(data)
+    assert plot.bounds==pytest.approx((0,2.24))
+    assert {p['model'] for p in plot.rows}=={'a','b','outside'}
+    outside=next(p for p in plot.rows if p['model']=='outside')
+    assert plot.ink(outside).alphaF()<=.101
+    modes['Fast']=True;plot.set_data(data)
+    assert plot.bounds==pytest.approx((0,11200))
 
 
 def test_interval_analysis_distribution_totals_missing_and_weighted_speed():

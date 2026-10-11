@@ -63,8 +63,8 @@ class UpdatePanel(Group):
         self.recheck=Button('종료 여부 다시 확인');self.recheck.clicked.connect(self.recheck_connections);actions.addWidget(self.recheck);self.recheck.hide()
         actions.addStretch();controls.addLayout(actions)
         secondary=Row();secondary.setSpacing(8)
-        self.cancel=Button('취소');self.cancel.clicked.connect(lambda:self.cancel_update(False));secondary.addWidget(self.cancel);self.cancel.hide()
-        self.later=Button('나중에 적용');self.later.clicked.connect(lambda:self.cancel_update(True));secondary.addWidget(self.later);self.later.hide()
+        self.cancel=Button('취소');self.cancel.put(role='quiet');self.cancel.clicked.connect(lambda:self.cancel_update(False));secondary.addWidget(self.cancel);self.cancel.hide()
+        self.later=Button('나중에 적용');self.later.put(role='quiet');self.later.clicked.connect(lambda:self.cancel_update(True));secondary.addWidget(self.later);self.later.hide()
         secondary.addStretch();controls.addLayout(secondary);row.addLayout(controls,1);layout.addLayout(row)
         self.timer=QTimer(self);self.timer.setInterval(1000);self.timer.timeout.connect(self.refresh);self.timer.start()
         from .theme import shared_theme

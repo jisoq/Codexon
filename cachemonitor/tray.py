@@ -1,5 +1,6 @@
 from __future__ import annotations
 from PySide6.QtGui import QAction, QActionGroup, QCursor
+from PySide6.QtCore import QThread
 import os, sys
 from pathlib import Path
 from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
@@ -10,6 +11,14 @@ from .i18n import tr
 from .app_shutdown import ExitConnectionCheck, ExitConfirmation, ShutdownProgress
 from .taskbar import TaskbarQuota
 import time
+
+
+class ChatGPTDiscovery(QThread):
+    """Resolve the installed app away from the settings event loop."""
+    def run(self):
+        from .chatgpt_startup import discover_chatgpt
+        try:self.result=discover_chatgpt()
+        except Exception as error:self.result=error
 
 
 class TrayWindow(QuickHost):
@@ -42,6 +51,13 @@ class TrayWindow(QuickHost):
         self.startup = QAction(tr("Windows 로그인 시 시작"), self, checkable=True)
         self.startup.setChecked(self.startup_enabled())
         self.startup.triggered.connect(self.set_startup)
+        from .chatgpt_startup import ENABLED_KEY
+        self.chatgpt_discovery=None
+        self.chatgpt_startup=QAction(tr('Windows 로그인 시 ChatGPT 실행'),self,checkable=True)
+        self.chatgpt_startup.setChecked(self.settings.value(ENABLED_KEY,False,type=bool))
+        self.chatgpt_startup.triggered.connect(self.set_chatgpt_startup)
+        self.startup.changed.connect(self.sync_chatgpt_startup_enabled)
+        self.sync_chatgpt_startup_enabled()
         menu.addAction(self.startup)
         menu.addAction(tr("종료"), self.quit_app)
         if hasattr(self, 'settings_page'):
@@ -133,18 +149,26 @@ class TrayWindow(QuickHost):
         except OSError:
             return False
 
-    def set_startup(self, enabled):
+    def set_startup(self, enabled, *, preserve_existing=False):
         if os.name != "nt":
-            return
+            return False
         import subprocess
         import winreg
         try:
             with winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run") as key:
                 if enabled:
+                    if preserve_existing:
+                        try:existing=winreg.QueryValueEx(key,'CacheMonitor')[0]
+                        except FileNotFoundError:existing=''
+                        if existing:
+                            from .launch_context import command_arguments
+                            if '--windows-startup' not in command_arguments(existing):
+                                winreg.SetValueEx(key,'CacheMonitor',0,winreg.REG_SZ,existing+' --windows-startup')
+                            return True
                     if getattr(sys, "frozen", False):
-                        command = [sys.executable, "--hidden"]
+                        command = [sys.executable, "--hidden", "--windows-startup"]
                     else:
-                        command = [str(Path(sys.executable).with_name("pythonw.exe")), str(Path(__file__).resolve().parents[1] / "run.py"), "--hidden"]
+                        command = [str(Path(sys.executable).with_name("pythonw.exe")), str(Path(__file__).resolve().parents[1] / "run.py"), "--hidden", "--windows-startup"]
                     for home in self.snapshot["homes"]:
                         command.extend(["--codex-home", home])
                     winreg.SetValueEx(key, "CacheMonitor", 0, winreg.REG_SZ, subprocess.list2cmdline(command))
@@ -154,8 +178,54 @@ class TrayWindow(QuickHost):
                     except FileNotFoundError:
                         pass
         except OSError as exc:
-            QMessageBox.warning(self, "자동 시작 설정 실패", str(exc))
+            QMessageBox.warning(self, tr("자동 시작 설정 실패"), str(exc))
             self.startup.setChecked(self.startup_enabled())
+            return False
+        return True
+
+    def sync_chatgpt_startup_enabled(self):
+        if self.chatgpt_discovery is not None and not self.startup.isChecked():
+            from .chatgpt_startup import ENABLED_KEY
+            self.chatgpt_discovery.cancelled=True
+            self.chatgpt_discovery.requestInterruption()
+            self.chatgpt_startup.setChecked(self.settings.value(ENABLED_KEY,False,type=bool))
+        self.chatgpt_startup.setEnabled(os.name=='nt' and self.startup.isChecked() and self.chatgpt_discovery is None)
+
+    def set_chatgpt_startup(self, enabled):
+        from .chatgpt_startup import ENABLED_KEY,APP_ID_KEY
+        if not enabled:
+            self.settings.setValue(ENABLED_KEY,False)
+            self.settings.remove(APP_ID_KEY)
+            self.settings.sync()
+            return
+        if self.chatgpt_discovery is not None:return
+        self.chatgpt_discovery=ChatGPTDiscovery(self)
+        self.chatgpt_discovery.cancelled=False
+        self.chatgpt_discovery.finished.connect(self.chatgpt_discovered)
+        self.sync_chatgpt_startup_enabled()
+        self.chatgpt_discovery.start()
+
+    def chatgpt_discovered(self):
+        from .chatgpt_startup import ENABLED_KEY,APP_ID_KEY
+        operation=self.chatgpt_discovery;self.chatgpt_discovery=None
+        result=operation.result;cancelled=operation.cancelled;operation.deleteLater()
+        if getattr(self,'_closing',False):return
+        if cancelled:
+            self.sync_chatgpt_startup_enabled()
+            return
+        available=isinstance(result,str) and bool(result)
+        enabled=available
+        if enabled and self.startup.isChecked():
+            enabled=self.set_startup(True,preserve_existing=True)
+        self.settings.setValue(ENABLED_KEY,enabled)
+        if enabled:self.settings.setValue(APP_ID_KEY,result)
+        else:self.settings.remove(APP_ID_KEY)
+        self.settings.sync()
+        self.chatgpt_startup.setChecked(enabled)
+        self.sync_chatgpt_startup_enabled()
+        if not available:
+            QMessageBox.warning(self,tr('ChatGPT 자동 시작 설정 실패'),
+                tr('ChatGPT 설치를 확인하지 못했습니다. 설치 상태를 확인한 뒤 다시 켜세요.'))
 
     def quit_app(self,checked=False,*,handoff=False):
         if getattr(self,'_closing',False):return
@@ -231,7 +301,9 @@ class TrayWindow(QuickHost):
             self.worker.requestInterruption()
         managed=getattr(self,'manage_observer',False)
         collection=bool(getattr(self,'app_services',None) and self.app_services.collection)
+        discovery=getattr(self,'chatgpt_discovery',None)
         if handoff or not (managed or collection):
+            if discovery:discovery.wait()
             if update and update.operation:update.operation.wait()
             if controller and controller.operation:controller.operation.wait()
             if self.worker:self.worker.wait()
@@ -241,7 +313,7 @@ class TrayWindow(QuickHost):
         self.shutdown_dialog.show()
         update=getattr(self,'update_panel',None)
         workers=[self.worker,panel.operation if panel else None,update.operation if update else None,
-                 controller.operation if controller else None]
+                 controller.operation if controller else None,discovery]
         self.shutdown_operation=ShutdownOperation(self.app_services,workers,self)
         self.shutdown_dialog.force.clicked.connect(self.shutdown_operation.request_force)
         if force:

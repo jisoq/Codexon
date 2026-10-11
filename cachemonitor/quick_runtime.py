@@ -14,6 +14,44 @@ from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout
 from .presentation import Group, Column, Button, Row
 
 
+class QuickPlotOverlay(QQuickPaintedItem):
+    def __init__(self, plot):
+        super().__init__(plot)
+        self.plot = plot
+        self.paint_count = 0
+        self.setObjectName('plotInteractionLayer')
+        self.setAntialiasing(True)
+        self.setAcceptedMouseButtons(Qt.NoButton)
+        self.setAcceptHoverEvents(False)
+        plot.widthChanged.connect(self.sync_geometry)
+        plot.heightChanged.connect(self.sync_geometry)
+        self.sync_geometry()
+
+    def sync_geometry(self):
+        self.setWidth(self.plot.width())
+        self.setHeight(self.plot.height())
+        self.update()
+
+    def paint(self, painter):
+        source = self.plot.source
+        if source is None or not hasattr(source, 'paint_overlay'):
+            return
+        if not self.plot._static_paint_count:
+            return
+        from .i18n import LocalizedPainter
+        self.paint_count += 1
+        source._paint_width = int(self.width())
+        source._paint_height = int(self.height())
+        source._focused = self.plot.hasActiveFocus()
+        source._painter = LocalizedPainter(painter)
+        try:
+            source.paint_overlay(painter)
+        finally:
+            source._painter = None
+
+
+
+
 class QuickPlot(QQuickPaintedItem):
     sourceChanged=Signal()
     tipChanged=Signal()
@@ -24,6 +62,7 @@ class QuickPlot(QQuickPaintedItem):
         self._detail={};self._detail_pinned=False;self._detail_x=0;self._detail_y=0
         self.setAntialiasing(True)
         self._static_image=None;self._static_key=None
+        self._static_paint_count=0;self._interaction_layer=QuickPlotOverlay(self)
         self.activeFocusChanged.connect(self.invalidate)
     @Property(QObject,notify=sourceChanged)
     def source(self):return self._source
@@ -32,11 +71,11 @@ class QuickPlot(QQuickPaintedItem):
         if self._source is value:return
         if self._source:
             self._source.changed.disconnect(self.invalidate)
-            if hasattr(self._source,'repaintRequested'):self._source.repaintRequested.disconnect(self.update)
+            if hasattr(self._source,'repaintRequested'):self._source.repaintRequested.disconnect(self.request_overlay)
         self._source=value
         if value:
             value.changed.connect(self.invalidate)
-            if hasattr(value,'repaintRequested'):value.repaintRequested.connect(self.update)
+            if hasattr(value,'repaintRequested'):value.repaintRequested.connect(self.request_overlay)
         self.sourceChanged.emit();self.invalidate()
     @Property(str,notify=tipChanged)
     def tip(self):return self._tip
@@ -67,11 +106,16 @@ class QuickPlot(QQuickPaintedItem):
         if moved:self.detailPositionChanged.emit()
     @Slot()
     def dismissDetail(self):self.set_detail({},0,0)
+    def request_overlay(self):
+        if self._source and hasattr(self._source,"paint_overlay"):self._interaction_layer.update()
+        else:self.update()
+
     def invalidate(self):
         self._static_image=None
         self.update()
 
     def paint(self,painter):
+        self._static_paint_count+=1
         if self._source:
             from .i18n import LocalizedPainter
             self._source._paint_width=int(self.width());self._source._paint_height=int(self.height())
@@ -93,7 +137,7 @@ class QuickPlot(QQuickPaintedItem):
             else:
                 self._source._painter=LocalizedPainter(painter)
                 self._source.paint(painter)
-            if hasattr(self._source,'paint_overlay'):self._source.paint_overlay(painter)
+            if hasattr(self._source,'paint_overlay'):self._interaction_layer.update()
             if self._detail and hasattr(self._source,'refresh_detail'):
                 current=self._source.refresh_detail(self._detail)
                 if current!=self._detail:

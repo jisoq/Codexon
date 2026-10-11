@@ -33,8 +33,8 @@ class SettingsPage(Group):
         self.owner=parent;self.controls={};self.entries=[];self.sections={}
         root=Column(self);root.setContentsMargins(0,0,0,0);root.setSpacing(18)
         search_shell=Row();search_row=Row();search_row.setMaximumWidth(1024);self.search=Input();self.search.setPlaceholderText('설정 검색')
-        self.search.setAccessibleName('설정 검색');self.search.put(clearOnEscape=True)
-        clear=Button('검색 지우기');self.clear_search=clear;clear.clicked.connect(lambda:self.search.setText(''))
+        self.search.setAccessibleName('설정 검색');self.search.put(clearOnEscape=True,searchIcon=True)
+        clear=Button('검색 지우기');clear.put(role='quiet');self.clear_search=clear;clear.clicked.connect(lambda:self.search.setText(''))
         search_row.addWidget(self.search,1);search_row.addWidget(clear)
         search_shell.addLayout(search_row,1);search_shell.addStretch();root.addLayout(search_shell)
         shell=Row();shell.setSpacing(24);root.addLayout(shell,1)
@@ -54,6 +54,8 @@ class SettingsPage(Group):
         self.search.textChanged.connect(self.filter_settings)
         self.reveal(self.category_id(parent.settings.value('settings/category','general')))
         self.add_row('general', 'Windows 로그인 시 시작', 'Windows에 로그인하면 Codexon이 트레이에서 실행됩니다.', self.toggle('startup'), section='시작')
+        self.add_row('general', 'Windows 로그인 시 ChatGPT 실행', 'Codexon 연결 준비가 끝나면 바로 실행합니다.', self.toggle('chatgpt_startup'), section='시작',depth=1)
+        self.chatgpt_startup_entry=self.entries[-1]
         tracking=self.toggle('weekly_tracking')
         tracking.setChecked(parent.settings.value('quota/trackingEnabled',True,type=bool))
         tracking.toggled.connect(parent.set_quota_tracking_enabled)
@@ -61,7 +63,7 @@ class SettingsPage(Group):
         self.add_row('display', '잔여량 표시', '', self.choice('quota'), section='모양')
         language_choice=self.choice('language')
         language_controls=Group();language_layout=Row(language_controls);language_layout.setContentsMargins(0,0,0,0);language_layout.setSpacing(8);language_layout.put(flow=True)
-        restart=Button('Codexon 재시작')
+        restart=Button('Codexon 재시작');restart.put(role='primary')
         restart.setToolTip('Codexon 재시작');restart.setAccessibleName('Codexon 재시작')
         self.controls['restart']=restart
         language_layout.addWidget(language_choice);language_layout.addWidget(restart)
@@ -90,7 +92,7 @@ class SettingsPage(Group):
         self.add_row('display', '작업표시줄 위젯', '마우스로 끌어 작업표시줄 안에서 위치를 조절할 수 있습니다.', self.toggle('widget'), section='작업표시줄 위젯')
         self.add_row('display', '표시할 모니터', '선택한 모니터의 연결이 끊기면 주 모니터에 표시합니다.', self.choice('monitor'), section='작업표시줄 위젯',depth=1)
         self.add_row('display', '세션 오버레이', 'Codex 작업 중 현재 세션의 비용과 토큰 사용량을 작은 창에서 확인할 수 있습니다.', self.toggle('overlay'), section='세션 오버레이')
-        for key in ('startup', 'quota', 'widget', 'monitor', 'overlay', 'theme'):
+        for key in ('startup', 'chatgpt_startup', 'quota', 'widget', 'monitor', 'overlay', 'theme'):
             self.controls[key].setEnabled(False)
 
     def refresh_restart(self):
@@ -147,6 +149,7 @@ class SettingsPage(Group):
         holder=Row();holder.addWidget(control);holder.addStretch();layout.addLayout(holder,1)
         control.setAccessibleName(title)
         self.add_widget(category,row,section,title,description,control,aliases)
+        if description:self.entries[-1]['detail']=detail
         return row
 
     def update_attention(self, needed):
@@ -199,7 +202,7 @@ class SettingsPage(Group):
             if not all(word in haystack for word in words):continue
             group=Column();group.setSpacing(6);group.setContentsMargins(0,10,0,14)
             path=Text(tr(title)+' / '+tr(entry['section']));path.put(color='muted',fontSize=12);group.addWidget(path)
-            button=Button(entry['title']);button.put(activateOnReturn=True);button.clicked.connect(lambda key=entry['id']:self.reveal_item(key));group.addWidget(button)
+            button=Button(entry['title']);button.put(activateOnReturn=True,role='quiet',leadingIcon='right');button.clicked.connect(lambda key=entry['id']:self.reveal_item(key));group.addWidget(button)
             if entry['description']:
                 description=Text(entry['description']);description.setWordWrap(True);description.put(color='muted');group.addWidget(description)
             self.result_body.addWidget(group)
@@ -238,6 +241,9 @@ class SettingsPage(Group):
 
     def bind_tray(self, owner):
         self.bind_action('startup', owner.startup)
+        self.bind_action('chatgpt_startup', owner.chatgpt_startup)
+        owner.startup.changed.connect(self.sync_chatgpt_startup)
+        self.sync_chatgpt_startup()
         self.bind_action('widget', owner.taskbar_action)
         owner.taskbar_action.changed.connect(self.sync_monitor_enabled)
         self.bind_choices('quota', owner.quota_actions)
@@ -247,6 +253,12 @@ class SettingsPage(Group):
             lambda index: self.taskbar.set_monitor(self.controls['monitor'].itemData(index)) if index >= 0 else None)
         QApplication.instance().screenAdded.connect(self.refresh_monitors)
         QApplication.instance().screenRemoved.connect(self.refresh_monitors)
+
+    def sync_chatgpt_startup(self):
+        description=('Codexon 연결 준비가 끝나면 바로 실행합니다.' if self.owner.startup.isChecked()
+                     else 'Codexon 자동 시작을 켜면 사용할 수 있습니다.')
+        self.chatgpt_startup_entry['description']=description
+        self.chatgpt_startup_entry['detail'].setText(description)
 
     def refresh_monitors(self, *_):
         self.taskbar.refresh_monitor_menu()

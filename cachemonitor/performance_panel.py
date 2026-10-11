@@ -85,14 +85,15 @@ def metric_unit(unit):
 
 
 def aggregation_text(unit):
-    return tr('총 출력 토큰 ÷ 총 소요시간' if unit=='output_speed' else
+    return tr('총 출력 토큰 ÷ 전체 응답시간 합계' if unit=='output_speed' else
+              '호출 소요시간 중앙값' if unit=='duration' else
               '세션 동일 비중 평균' if unit=='cache_ratio' else '구간 호출 수' if unit=='count' else '호출당 평균')
 
 
 def plot_values(data,selected,single,outer=False):
     values=[]
     for line in data['lines']:
-        if single and not selected(line):continue
+        if not selected(line):continue
         for point in line['points']:
             values.append(point['value'])
             if single and data.get('rolling'):
@@ -254,7 +255,7 @@ class IntervalDetails(Group):
         self.mean.setText(Verbatim(fmt(point.get('mean',point['value']))))
         self.range_text.setText(Verbatim(tr('중앙 80% 범위')+'\n'+fmt(stats['p10'])+' — '+fmt(stats['p90'])) if stats['p10'] is not None else tr('분포 범위 표시: 표본 10개 이상'))
         totals=point['totals'];self.formula.setText(Verbatim(aggregation_text(unit)))
-        if unit=='output_speed':rows=[('총 출력 토큰',f"{totals['output']:,}"),('총 소요시간',tr(value_text(totals['seconds'],'duration')))]
+        if unit=='output_speed':rows=[('총 출력 토큰',f"{totals['output']:,}"),('전체 응답시간 합계',tr(value_text(totals['seconds'],'duration')))]
         elif unit=='cache_ratio':rows=[('유효 입력 토큰',f"{totals['input']:,}"),('캐시 입력 토큰',f"{totals['cached']:,}"),('유효 호출',f"{totals['valid_calls']:,} / {point['calls']:,}")]
         elif unit=='count':rows=[('구간 호출 수',f"{point['calls']:,}")]
         else:rows=[('유효 표본 합계',fmt(totals.get('sum')))]
@@ -541,13 +542,13 @@ class PerformancePanel(Group):
         self.model_choice.currentIndexChanged.connect(self.choose_model);left_body.addWidget(self.model_choice)
         self.add_button=button('+ 모델 추가',self.toggle_picker);self.add_button.setFixedWidth(220);left_body.addWidget(self.add_button)
         self.picker=Group();self.picker.hide();pick=Column(self.picker);left_body.addWidget(self.picker)
-        self.search=Input();self.search.setFixedWidth(220);self.search.setPlaceholderText('비교할 모델 검색')
+        self.search=Input();self.search.put(searchIcon=True);self.search.setFixedWidth(220);self.search.setPlaceholderText('비교할 모델 검색')
         self.search.textChanged.connect(self.search_models);pick.addWidget(self.search)
         self.search_results=Row();self.search_results.put(flow=True,spacing=6);pick.addLayout(self.search_results)
         left_body.addWidget(caption('실행 모드',12));modes=Row();modes.setSpacing(4);left_body.addLayout(modes)
         self.mode_buttons={}
         for title,mode,width in (('전체','all',60),('Standard','Standard',94),('Fast','Fast',58)):
-            b=button(title,lambda m=mode:self.choose_mode(m));b.setCheckable(True);b.setFixedWidth(width)
+            b=button(title,lambda m=mode:self.choose_mode(m));b.setCheckable(True);b.put(selectionTab=True);b.setFixedWidth(width)
             modes.addWidget(b);self.mode_buttons[mode]=b
         separator=Group();separator.put(background='border');separator.setFixedHeight(1);left_body.addWidget(separator)
         left_body.addWidget(caption('선택 모델과 범례',12));self.legend=Column();self.legend.setSpacing(16)
@@ -556,6 +557,8 @@ class PerformancePanel(Group):
         left_body.addWidget(caption('그래프 읽는 법',12,'ink',True));self.chart_help=caption('',12);left_body.addWidget(self.chart_help)
         self.legend_scroll.setWidget(left)
         center=Column();center.setSpacing(10);content.addLayout(center,1)
+        self.scope=caption('조회 범위: 전체 프로젝트 / 모든 Codex 홈',12);center.addWidget(self.scope)
+        self.scope.setToolTip('이 탭의 조회 기간, 모델, 실행 모드를 적용합니다.')
         periods=Row();periods.put(flow=True,spacing=4);center.addLayout(periods)
         label=caption('조회 기간',13,'ink',True);label.put(wrap=False);label.setMinimumWidth(64);periods.addWidget(label)
         self.period_buttons={}
@@ -628,7 +631,7 @@ class PerformancePanel(Group):
         for unit,b in self.granularity_buttons.items():
             b.setChecked(unit==self.granularity);b.setEnabled(not single)
         self.chart_help.setText('대표선: 지표별 평균 또는 중앙값\n분포 띠: 중앙 50% 표본 범위\nStandard: 실선과 원\nFast: 파선과 삼각형\n확대하면 개별 호출을 확인할 수 있습니다.' if single else '대표선: 집계 구간별 추이\n아래 띠: 개별 이상치\nStandard: 실선과 원\nFast: 파선과 삼각형')
-        self.chart_help.setToolTip('출력 속도는 시간 가중평균, 소요시간은 중앙값, 나머지는 평균입니다. 소요시간 중앙값은 표본 5개 이상에서 표시합니다. 띠는 신뢰구간이 아닌 표본 분포입니다. 호출 수는 겹치지 않는 구간 합계입니다.' if single else '')
+        self.chart_help.setToolTip('소요시간은 중앙값, 출력 속도는 전체 응답시간 기준 시간 가중평균입니다. 이동 구간의 소요시간 중앙값은 표본 5개 이상에서 표시합니다. 띠는 표본 분포입니다. 호출 수는 겹치지 않는 구간 합계입니다.' if single else '소요시간은 중앙값, 출력 속도는 전체 응답시간 기준 시간 가중평균입니다. Y축 범위는 선택한 모델과 실행 모드를 기준으로 표시합니다.')
         mode='all' if all(self.modes.get(m,False) for m in ('Standard','Fast')) else 'Fast' if self.modes.get('Fast') else 'Standard'
         for key,b in self.mode_buttons.items():b.setChecked(key==mode)
         clear(self.legend);self.legend_entries=[]
@@ -817,13 +820,14 @@ class PerformancePanel(Group):
 
     def refresh_plots(self):
         if not self.plots:return
-        selected=lambda point:self.is_model_selected(point['model']) and self.modes.get(point['service_tier'],False)
+        selected=lambda point:point['model'] not in ('미확인','codex-auto-review') and self.is_model_selected(point['model']) and self.modes.get(point['service_tier'],False)
         values=[v for spec in self.reasoning_specs.values() for v in plot_values(spec,selected,self.single_model(),self.show_outer)]
         self.reasoning_bounds=trend_bounds(values)
-        titles={'cost':'평균 호출 비용과 분포','output_speed':'출력 속도 시간 가중평균과 분포','duration':'호출 소요시간 중앙값과 분포',
+        titles={'cost':'호출당 평균 환산액과 분포','output_speed':'전체 응답 기준 출력 속도와 분포','duration':'호출 소요시간 중앙값과 분포',
                 'session_cache':'세션 평균 캐시 적중률과 분포','reasoning':'평균 추론 토큰과 분포','input':'평균 입력 토큰과 분포'}
         for key,spec in list(self.specs.items()):
             self.labels[key].setText(titles.get(key,spec['title']) if self.single_model() else spec['title'])
+            if key=='output_speed':self.labels[key].setToolTip('추론을 포함한 출력 토큰 합계를 전체 응답시간 합계로 나눈 값입니다. 병렬 호출도 각 호출의 응답시간을 합산합니다.')
             if key=='reasoning':
                 self.set_reasoning_data();spec=self.specs[key]
             else:

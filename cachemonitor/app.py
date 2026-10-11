@@ -23,6 +23,35 @@ class Dashboard(UsageDashboard):
         super().__init__(homes, start_worker=start_worker, **kwargs)
 
 
+def login_launcher(settings, *, windows_startup=False, isolated=False):
+    """Snapshot the opt-in on the GUI thread; workers never access QSettings."""
+    from .chatgpt_startup import ENABLED_KEY, APP_ID_KEY, launch_chatgpt
+    if (os.name != 'nt' or not windows_startup or isolated
+            or not settings.value(ENABLED_KEY, False, type=bool)):
+        return None
+    app_id = settings.value(APP_ID_KEY, '', type=str)
+    from .app_services import LoginLaunch
+    return LoginLaunch(lambda: launch_chatgpt(app_id))
+
+
+def request_login_startup(window, *, initial=False, isolated=False):
+    if getattr(window, '_login_startup_handled', False):
+        return
+    window._login_startup_handled = True
+    launch = login_launcher(window.settings, windows_startup=True, isolated=isolated)
+    if launch is None or not window.startup.isChecked():
+        return
+    def cancel_disabled():
+        if not window.startup.isChecked() or not window.chatgpt_startup.isChecked():
+            launch.cancel()
+    window.startup.changed.connect(cancel_disabled)
+    window.chatgpt_startup.changed.connect(cancel_disabled)
+    if initial:
+        window.app_services.login_launch = launch
+    else:
+        window.service_controller.request_login_launch(launch)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Read-only Codex cache monitor")
     parser.add_argument('--version',action='version',version=VERSION)
@@ -38,6 +67,7 @@ def main():
     parser.add_argument('--managed-services',action='store_true',help=argparse.SUPPRESS)
     parser.add_argument("--codex-home", action="append", help="Repeat to monitor multiple local Codex homes")
     parser.add_argument("--hidden", action="store_true")
+    parser.add_argument('--windows-startup', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--software-rendering', action='store_true',
                         help='Render the GUI on the CPU to avoid the GPU graphics path')
     parser.add_argument("--index-path", help="Override the app-owned usage index for isolated verification")
@@ -124,7 +154,7 @@ def main():
         client = QLocalSocket()
         client.connectToServer(server_name)
         if client.waitForConnected(400):
-            client.write(b"update-exit" if args.replace_gui else b"show")
+            client.write(b"update-exit" if args.replace_gui else b"windows-startup" if args.windows_startup else b"show")
             client.waitForBytesWritten(400)
             if not args.replace_gui:return 0
             if not client.waitForReadyRead(3000) or bytes(client.readAll())!=b'ready-to-exit':
@@ -161,6 +191,12 @@ def main():
     window = Dashboard(homes,index_path=args.index_path,model_evidence_path=args.evidence_path,quota_path=args.quota_path,
         collection_autostart=not (args.smoke or args.verify_handoff) or args.verify_services,
         live_limits=not (args.smoke or args.verify_handoff),manage_observer=args.verify_services or (not (args.smoke or args.verify_handoff) and not isolated), **({'settings':smoke_settings} if smoke_settings else {}))
+    if args.windows_startup and not args.replace_gui:
+        request_login_startup(window, initial=True, isolated=bool(isolated or args.smoke or args.verify_handoff))
+    def report_login_launch(result):
+        if result.get('chatgpt_startup_error'):
+            window.tray.showMessage(tr('ChatGPT 자동 실행'), tr(result['chatgpt_startup_error']), QSystemTrayIcon.Warning)
+    window.service_controller.result.connect(report_login_launch)
     from .overlay import install_overlay
     install_overlay(window, native_enabled=not (args.smoke or args.verify_handoff))
     def restart():
@@ -188,7 +224,9 @@ def main():
         def receive():
             if not client.bytesAvailable():return
             command=bytes(client.readAll())
-            if command==b'update-exit':
+            if command==b'windows-startup':
+                request_login_startup(window, isolated=bool(isolated or args.smoke or args.verify_handoff))
+            elif command==b'update-exit':
                 if window.observer_panel.busy() or getattr(window,'_closing',False):
                     client.write(b'busy');client.flush()
                 else:

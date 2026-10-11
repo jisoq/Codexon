@@ -7,6 +7,7 @@ import ast
 import fnmatch
 import hashlib
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -29,9 +30,12 @@ def test_files(*names):
 
 # Components select observable contracts. There is deliberately no always-run core.
 GROUPS = {
+    'native_cpu': test_files('native_cpu', 'native_trends', 'native_usage', 'native_quota_series', 'native_index', 'native_analysis', 'build_native'),
+    'notices': test_files('collect_notices'),
     "performance_trends": test_files("performance_trends"),
     'retirement': test_files('retired_cache'),
     'settings': test_files('settings'),
+    'chatgpt_startup': test_files('chatgpt_startup'),
     'app_lifetime': test_files('app_services', 'observer_panel', 'windows_startup', 'proxy_update'),
     'graphics_recovery': test_files('graphics_recovery', 'window_recovery', 'quick_ui', 'overlay_shadow'),
     'data': test_files('core', 'index', 'data_contract', 'subagent_collection', 'request_tier_snapshots', 'collection_defaults'),
@@ -42,12 +46,12 @@ GROUPS = {
     'names': test_files('codex_names'),
     'modes': test_files('request_modes', 'request_tier_snapshots', 'mode_costs'),
     'quota_store': test_files('quota', 'quota_tracking', 'quota_tracking_integration',
-                             'quota_integrity', 'quota_accumulation', 'quota_value_history'),
+                             'quota_integrity', 'quota_accumulation', 'quota_value_history', 'quota_exclusions'),
     'quota_math': test_files('quota_attribution', 'quota_cycles', 'quota_resets', 'banked_resets'),
-    'quota_poll': test_files('quota_polling', 'overlay_collection_resilience'),
-    'quota_ui': test_files('quota_page', 'quota_detail_card', 'quota_gap_axis', 'quota_share_theme'),
-    'quota_chart': test_files('quota_gap_axis', 'quota_chart_performance', 'quota_page'),
-    'dashboard': test_files('ui', 'comparison_workflow', 'dashboard_evidence', 'ui_value_fixes', 'history_explorer', 'dashboard_readability'),
+    'quota_poll': test_files('quota_polling', 'quota_worker', 'quota_transport', 'overlay_collection_resilience'),
+    'quota_ui': test_files('quota_page', 'quota_detail_card', 'quota_gap_axis', 'quota_share_theme', 'quota_exclusion_controls', 'quota_sidebar', 'quota_query'),
+    'quota_chart': test_files('quota_gap_axis', 'quota_chart_performance', 'quota_page', 'quota_chart_exclusions'),
+    'dashboard': test_files('ui', 'comparison_workflow', 'dashboard_evidence', 'ui_value_fixes', 'history_explorer', 'history_timeline', 'history_timeline_data', 'dashboard_readability'),
     'details': test_files('ui_details', 'call_transport', 'model_ui'),
     'table': test_files('table_order', 'performance'),
     'shared_ui': test_files('quick_ui', 'display_scaling'),
@@ -80,6 +84,12 @@ GROUPS = {
 
 # First match wins: QML and shared helpers must not fall through to a broad UI gate.
 RULES = (
+    ('native/*', ('native_cpu', 'data', 'analysis', 'performance_trends', 'evidence', 'quota_math', 'quota_chart', 'notices')),
+    ('rust-toolchain.toml', ('native_cpu',)),
+    ('cachemonitor/native_backend.py', ('native_cpu', 'data', 'analysis', 'performance_trends', 'evidence', 'quota_math')),
+    ('tools/build_native.py', ('native_cpu', 'payload')),
+    ('tools/benchmark_cpu.py', ('native_cpu',)),
+    ('cachemonitor/performance_trends.py', ('performance_trends', 'native_cpu')),
     ("cachemonitor/performance_*.py", ("performance_trends",)),
     ('cachemonitor/retired_cache.py', ('retirement','proxy_lifecycle','install')),
     ('cachemonitor/usage_archive.py', ('retirement','data','quota_store')),
@@ -97,11 +107,11 @@ RULES = (
     ('cachemonitor/proxy_target.py', ('proxy_lifecycle','install')),
     ('cachemonitor/session_costs.py', ('cost', 'overlay_data')),
     ('cachemonitor/workload.py', ('cost', 'analysis', 'overlay_data')),
-    ('cachemonitor/core.py', ('data', 'analysis', 'cost', 'quota_store', 'modes', 'cache', 'speed')),
-    ('cachemonitor/index.py', ('data', 'evidence', 'quota_store')),
+    ('cachemonitor/core.py', ('data', 'analysis', 'cost', 'quota_store', 'modes', 'cache', 'speed', 'native_cpu')),
+    ('cachemonitor/index.py', ('data', 'evidence', 'quota_store', 'native_cpu')),
     ('cachemonitor/analytics.py', ('analysis', 'cost', 'cache', 'speed', 'quota_math')),
     ('cachemonitor/dashboard_views.py', ('analysis', 'dashboard', 'details', 'cost')),
-    ('cachemonitor/analysis_engine.py', ('analysis', 'cost', 'cache', 'overlay_data')),
+    ('cachemonitor/analysis_engine.py', ('analysis', 'cost', 'cache', 'overlay_data', 'native_cpu')),
     ('cachemonitor/analysis_records.py', ('analysis', 'cost', 'cache', 'overlay_data', 'dashboard', 'details')),
     ('cachemonitor/analysis_worker.py', ('analysis', 'quota_poll', 'overlay_tracking', 'notifications')),
     ('cachemonitor/usage_collection.py', ('data', 'quota_poll', 'overlay_tracking', 'retirement')),
@@ -113,12 +123,18 @@ RULES = (
     ('cachemonitor/codex_names.py', ('names', 'overlay_tracking')),
     ('cachemonitor/quota_chart.py', ('quota_chart',)),
     ('cachemonitor/quota_share.py', ('quota_ui', 'quota_math')),
-    ('cachemonitor/quota_attribution.py', ('quota_math', 'quota_store')),
-    ('cachemonitor/quota_cycles.py', ('quota_math', 'quota_store', 'modes')),
+    ('cachemonitor/quota_attribution.py', ('quota_math', 'quota_store', 'native_cpu')),
+    ('cachemonitor/quota_cycles.py', ('quota_math', 'quota_store', 'modes', 'native_cpu')),
     ('cachemonitor/banked_resets.py', ('quota_math', 'quota_ui')),
-    ('cachemonitor/quota_view.py', ('quota_ui', 'quota_chart')),
+    ('cachemonitor/quota_view.py', ('quota_ui', 'quota_chart', 'native_cpu')),
     ('cachemonitor/quota_panel.py', ('quota_ui',)),
+    ('cachemonitor/quota_layout.py', ('quota_ui',)),
+    ('cachemonitor/quota_sidebar.py', ('quota_ui', 'dashboard')),
+    ('cachemonitor/quota_exclusion_controls.py', ('quota_ui',)),
+    ('cachemonitor/quota_exclusions.py', ('quota_store', 'quota_math', 'quota_ui')),
     ('cachemonitor/quota_service.py', ('quota_poll', 'quota_store')),
+    ('cachemonitor/quota_worker.py', ('quota_poll', 'quota_ui', 'quota_store')),
+    ('cachemonitor/quota_transport.py', ('quota_poll',)),
     # A diff against a supported old revision can still contain this deleted reader.
     ('cachemonitor/quota_reader.py', ('quota_poll', 'quota_store')),
     ('cachemonitor/quota_polling.py', ('quota_poll',)),
@@ -185,7 +201,7 @@ RULES = (
     ('cachemonitor/model_proxy.py', ('relay', 'retirement')),
     ('cachemonitor/proxy_websocket.py', ('relay', 'retirement')),
     ('cachemonitor/proxy_http.py', ('relay',)),
-    ('cachemonitor/proxy_observation.py', ('relay', 'evidence')),
+    ('cachemonitor/proxy_observation.py', ('relay', 'evidence', 'native_cpu')),
     ('cachemonitor/proxy_update.py', ('proxy_lifecycle',)),
     ('cachemonitor/proxy_supervisor.py', ('proxy_lifecycle',)),
     ('cachemonitor/managed_proxy.py', ('proxy_lifecycle',)),
@@ -205,6 +221,7 @@ RULES = (
     ('cachemonitor/version.py', ('runtime', 'proxy_lifecycle', 'update')),
     ('cachemonitor/__init__.py', ('runtime',)),
     ('cachemonitor/app_services.py', ('app_lifetime',)),
+    ('cachemonitor/chatgpt_startup.py', ('chatgpt_startup', 'app_lifetime', 'settings')),
     ('cachemonitor/collection_lifecycle.py', ('app_lifetime','quota_poll')),
     ('tools/verify_app_services.py', ('app_lifetime','qa_ipc')),
     ('cachemonitor/app_shutdown.py', ('app_lifetime',)),
@@ -246,7 +263,7 @@ RULES = (
     ('tools/verify_gui_handoff.py', ('install',)),
     ('tools/installer_identity.py', ('install',)),
     ('tools/prepare_bad_runtime.py', ('install',)),
-    ('tools/collect_notices.py', ('payload',)),
+    ('tools/collect_notices.py', ('payload', 'notices')),
     ('tools/package_release.py', ('payload',)),
     ('tools/prepare_sources.py', ('payload', 'release')),
     ('tools/Build-*.ps1', ('install', 'runtime', 'payload')),
@@ -261,6 +278,7 @@ RULES = (
 
 # These changes need frozen executable/install checks in addition to source tests.
 PACKAGE_PATTERNS = (
+    'native/*', 'rust-toolchain.toml', 'cachemonitor/native_backend.py', 'tools/build_native.py',
     'cachemonitor/retired_cache.py','cachemonitor/usage_archive.py',
     'requirements*', 'build*.ps1', '*.spec', 'installer/*', 'recovery_main.py', 'icons/*.ico',
     'tools/verify_msix_installation.ps1', 'tools/run_native_checks.py',
@@ -472,7 +490,8 @@ def package_check(executable, report_dir):
     value = json.loads(runtime.read_text(encoding='utf-8')) if runtime.exists() else {}
     from cachemonitor.version import VERSION, PROXY_VERSION
     if (check.returncode or value.get('errors') != [] or value.get('version') != VERSION
-            or value.get('proxy_version') != PROXY_VERSION):
+            or value.get('proxy_version') != PROXY_VERSION
+            or value.get('native', {}).get('abi_version') != 1):
         raise RuntimeError('배포 실행 파일 런타임 확인 실패: '+check.stderr[-1000:])
     with tempfile.TemporaryDirectory(prefix='cachemonitor-package-qa-') as temp:
         folder = Path(temp);home = fixture_home(folder)
@@ -555,6 +574,17 @@ def main(argv=None):
                                   action='Use a dedicated environment installed from requirements-release.lock.',
                                   report=str(folder/'report.json')),ensure_ascii=False,indent=2))
             return 2
+        from tools.build_native import checked_extension, extension_path
+        if extension_path().is_file() or os.environ.get('CODEXON_CPU_BACKEND') == 'rust':
+            try:
+                report['native'] = {'extension': str(checked_extension()), 'abi_version': 1}
+            except (RuntimeError, OSError, subprocess.CalledProcessError) as error:
+                report['native_error'] = str(error)
+                (folder/'report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+                print(json.dumps(dict(result='native_failed',error=str(error),
+                                      action='Run tools/build_native.py with this Python environment before verifying.',
+                                      report=str(folder/'report.json')),ensure_ascii=False,indent=2))
+                return 2
         started = time.monotonic()
         runs = []
         outputs = []

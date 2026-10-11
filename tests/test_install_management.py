@@ -96,6 +96,44 @@ def test_login_startup_preserves_custom_home_and_disabled_or_unrelated_values():
     assert 'old folder' not in changed
     for unrelated in ('', '"C:\\pythonw.exe" run.py --hidden'):
         assert install.startup_replacement(unrelated,Path('C:/new/Codexon.exe'))==unrelated
+
+
+def test_chatgpt_startup_migrates_existing_command_without_losing_paths(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+    from cachemonitor.tray import TrayWindow
+    command='"D:\\custom folder\\Codexon.exe" --hidden --codex-home "E:\\my --windows-startup home" --index-path "E:\\data\\index.sqlite"'
+    stored={'command':command}
+    class Key:
+        def __enter__(self):return self
+        def __exit__(self,*args):pass
+    registry=SimpleNamespace(HKEY_CURRENT_USER=1,REG_SZ=1,CreateKey=lambda *args:Key(),
+        QueryValueEx=lambda *args:(stored['command'],1),
+        SetValueEx=lambda *args:stored.update(command=args[-1]))
+    monkeypatch.setitem(sys.modules,'winreg',registry)
+    assert TrayWindow.set_startup(SimpleNamespace(),True,preserve_existing=True)
+    assert stored['command']==command+' --windows-startup'
+    assert TrayWindow.set_startup(SimpleNamespace(),True,preserve_existing=True)
+    assert stored['command']==command+' --windows-startup'
+
+
+def test_login_startup_command_carries_marker_and_custom_homes(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+    from cachemonitor.tray import TrayWindow
+    stored={}
+    class Key:
+        def __enter__(self):return self
+        def __exit__(self,*args):pass
+    registry=SimpleNamespace(HKEY_CURRENT_USER=1,REG_SZ=1,CreateKey=lambda *args:Key(),
+        SetValueEx=lambda *args:stored.update(command=args[-1]))
+    monkeypatch.setitem(sys.modules,'winreg',registry)
+    owner=SimpleNamespace(snapshot={'homes':['E:\\my home','F:\\other home']})
+    assert TrayWindow.set_startup(owner,True)
+    assert '--windows-startup' in stored['command']
+    assert '--codex-home "E:\\my home" --codex-home "F:\\other home"' in stored['command']
+
+
 def test_connection_launch_paths_survive_home_update(tmp_path):
     from cachemonitor.launch_context import save_connection_paths,connection_paths,save_homes,resolve_homes
     path=tmp_path/'launch.json'

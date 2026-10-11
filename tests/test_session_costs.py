@@ -122,7 +122,8 @@ def test_real_session_table_shows_parent_without_own_calls_and_click_keeps_break
     from PySide6.QtCore import QSettings
     from PySide6.QtWidgets import QApplication
     from cachemonitor.dashboard import Dashboard
-    from cachemonitor.quick_qa import click_row
+    from cachemonitor.quick_qa import click_row, control
+    from cachemonitor.pricing import usd
 
     now = time.time()
     parent = Session('parent', 'fixture', title='부모 작업').view(now)
@@ -153,8 +154,13 @@ def test_real_session_table_shows_parent_without_own_calls_and_click_keeps_break
         index = next(i for i,r in enumerate(window.record_rows) if r['sid']=='parent')
         click_row(window, window.table, index);app.processEvents()
         assert window.selected_session==('fixture','parent')
-        assert '자체 ' in window.session_scope.text() and ' + 하위 ' in window.session_scope.text()
-        assert '산정' not in window.session_scope.text()
+        selected=window.view_result['explorer']
+        assert selected['summary']['calls']==0 and not window.record_rows
+        assert selected['group']['own_cost']==0 and selected['group']['calls']==1
+        assert selected['group']['child_cost']==own_child['cost']
+        assert control(window,window.session_scope).isVisible()
+        assert usd(own_child['cost']) in window.session_scope.text()
+        assert usd(0) in window.history_summary.text() and usd(own_child['cost']) in window.history_summary.text()
         assert window.snapshot['internal_review_calls']==1
         assert window.grab().save(str(tmp_path/'parent-cost.png'))
     finally:

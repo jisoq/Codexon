@@ -147,3 +147,79 @@ def test_quick_pages_keep_scroll_and_render_model_evidence(tmp_path):
         assert not window.qml_errors,window.qml_errors
     finally:
         window.quit_app();app.setProperty('cachemonitorDisableShellIntegration',previous)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize('mode',['light','dark'])
+def test_common_control_roles_keep_keyboard_selection_and_disabled_behavior(tmp_path,mode):
+    from PySide6.QtCore import QObject
+    from cachemonitor.presentation import Button,Column,Input,Row,Text
+    from cachemonitor.quick_qa import click
+    from cachemonitor.theme import shared_theme
+    app=QApplication.instance() or QApplication([])
+    theme=shared_theme();previous=theme.appearance;theme.configure(mode)
+    body=Column();body.setContentsMargins(24,24,24,24);body.setSpacing(16)
+    title=Text('공통 컨트롤 확인');title.put(fontSize=20,bold=True);body.addWidget(title)
+    body.addWidget(Text('동작'))
+    actions=Row();body.addLayout(actions)
+    execute=Button('실행');execute.put(leadingIcon='check',activateOnReturn=True)
+    disabled=Button('사용 불가');disabled.setEnabled(False)
+    actions.addWidget(execute);actions.addWidget(disabled);actions.addStretch()
+    body.addWidget(Text('보기'))
+    tabs=Row();body.addLayout(tabs);table=Button('표');chart=Button('차트')
+    def select_tab(selected):
+        for node in (table,chart):node.setChecked(node is selected)
+    for node in (table,chart):
+        node.setCheckable(True);node.put(selectionTab=True)
+        node.clicked.connect(lambda selected=node:select_tab(selected));tabs.addWidget(node)
+    tabs.addStretch();table.setChecked(True)
+    body.addWidget(Text('조회 조건'))
+    fields=Row();body.addLayout(fields)
+    choice=Choice();choice.setFixedWidth(180)
+    for text,value in (('모든 실행 모드','all'),('Standard','standard'),('Fast','fast')):choice.addItem(text,value)
+    search=Input();search.setPlaceholderText('세션 검색');search.put(searchIcon=True)
+    fields.addWidget(choice);fields.addWidget(search,1);body.addStretch()
+    activations=[];execute.clicked.connect(lambda:activations.append('run'))
+    disabled.clicked.connect(lambda:activations.append('disabled'))
+    host=mount(body,680,400)
+    def until(condition):
+        deadline=time.monotonic()+2
+        while not condition() and time.monotonic()<deadline:QTest.qWait(10)
+        assert condition()
+    try:
+        run_item,disabled_item,table_item,chart_item,choice_item,search_item=[
+            control(host,node) for node in (execute,disabled,table,chart,choice,search)]
+        assert all(item.isVisible() and item.width()>0 and item.height()>0
+                   for item in (run_item,disabled_item,table_item,chart_item,choice_item,search_item))
+        run_item.forceActiveFocus(Qt.TabFocusReason)
+        QTest.keyClick(host.quick,Qt.Key_Return);QTest.keyClick(host.quick,Qt.Key_Space)
+        assert activations==['run','run']
+        execute.setEnabled(False);until(lambda:not run_item.isEnabled())
+        QTest.keyClick(host.quick,Qt.Key_Return);QTest.keyClick(host.quick,Qt.Key_Space)
+        click(host,disabled_item)
+        assert activations==['run','run']
+        execute.setEnabled(True);until(run_item.isEnabled);run_item.forceActiveFocus(Qt.TabFocusReason)
+        for item in (table_item,chart_item,choice_item,search_item):
+            QTest.keyClick(host.quick,Qt.Key_Tab)
+            until(lambda item=item:bool(item.property('activeFocus')))
+            assert item.isVisible()
+        chart_item.forceActiveFocus(Qt.TabFocusReason);QTest.keyClick(host.quick,Qt.Key_Space)
+        assert chart.isChecked() and not table.isChecked()
+        click(host,table_item)
+        assert table.isChecked() and not chart.isChecked()
+        click(host,choice_item);popup=choice_item.findChild(QObject,'choice-popup')
+        until(lambda:bool(popup.property('visible')))
+        assert host.quick.grabFramebuffer().save(str(tmp_path/f'common-controls-{mode}-popup.png'))
+        QTest.keyClick(host.quick,Qt.Key_Down);QTest.keyClick(host.quick,Qt.Key_Return)
+        until(lambda:choice.currentData()=='standard' and not popup.property('visible'))
+        choice.setEnabled(False);until(lambda:not choice_item.isEnabled());click(host,choice_item)
+        assert not popup.property('visible') and choice.currentData()=='standard'
+        choice.setEnabled(True);click(host,search_item);QTest.keyClicks(host.quick,'session-17')
+        until(lambda:search.text()=='session-17')
+        search.setEnabled(False);until(lambda:not search_item.isEnabled());QTest.keyClicks(host.quick,'ignored')
+        assert search.text()=='session-17'
+        search.setEnabled(True);until(search_item.isEnabled);search_item.forceActiveFocus(Qt.TabFocusReason)
+        assert host.quick.grabFramebuffer().save(str(tmp_path/f'common-controls-{mode}.png'))
+        assert not host.qml_errors,host.qml_errors
+    finally:
+        dispose(host);theme.configure(appearance=previous)

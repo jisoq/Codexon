@@ -27,7 +27,8 @@ def prepare_model_share(series, intervals):
     bins={};spans=[]
     for index in range(1,len(rows)):
         previous,row=rows[index-1:index+1]
-        if not row['connect'] or row.get('reset_kind') or row.get('cycle_start')!=previous.get('cycle_start'):continue
+        if (not row['connect'] or row.get('user_excluded') or row.get('reset_kind')
+                or row.get('cycle_start')!=previous.get('cycle_start')):continue
         start,end=previous['at'],row['at']
         first=math.floor(start/BUCKET_SECONDS);last=math.floor(end/BUCKET_SECONDS)
         for bucket in range(first,last+1):

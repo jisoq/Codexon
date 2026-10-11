@@ -151,18 +151,17 @@ def test_quota_home_switch_clears_values_and_rejects_late_old_home_results(tmp_p
     panel.set_homes([a,b])
     value={'quota':quota(now,30,now+1000),'report':{'home':a,'cycles':[],'at':now,'index_loading':False}}
     assert panel.receive(value)
-    assert panel.current['weekly']['value'].text()=='70.0%'
+    assert panel.quota is value['quota']
     switched=[];panel.home_selected.connect(switched.append)
     panel.home_choice.setCurrentIndex(1)
     assert switched==[b] and panel.quota is None
-    assert panel.current['weekly']['value'].text()=='—'
-    assert panel.current['weekly']['card'].isVisible()
+    assert panel.history_waiting.isVisible() and not panel.history.rows
     assert panel.result.text().endswith('—') and not panel.intervals.isVisible()
     assert not panel.receive(value)
     assert panel.quota is None and panel.report['home']==b
     panel.receive({'report':{'home':b,'cycles':[],'manual_reset_pending':True,'index_loading':True}})
-    assert panel.current['weekly']['card'].isVisible()
-    assert panel.current['weekly']['bar'].remaining is None
+    assert panel.history_waiting.isVisible() and not panel.history_controls.isVisible()
+    assert not panel.conversion.isVisible()
     panel.receive({'report':{'home':b,'cycles':[],'error':True,'index_loading':False},'issue':'원장 오류'})
     assert panel.status.text()=='원장 오류' and panel.status.isVisible()
     assert '확인 불가' not in panel.result.text()

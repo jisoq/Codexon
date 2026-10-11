@@ -17,6 +17,36 @@ from .codex_names import CodexNames, task_select
 from .quota import clean_limits
 from .model_evidence import EvidenceReader, default_path as evidence_path, FIELDS as MODEL_FIELDS
 from .usage_paths import index_location
+from .native_backend import get_native
+
+
+def _event_lines(source, digest, limit=16 * 1024 * 1024):
+    """Retain complete-line offsets and the existing per-file byte budget."""
+    native = get_native()
+    if native is not None:
+        start = source.tell()
+        block = source.read(limit)
+        # The Python reader also finishes a line that crosses the byte budget.
+        if len(block) == limit and not block.endswith(b'\n'):
+            block += source.readline()
+        consumed, selected = native.scan_event_lines(block)
+        digest.update(memoryview(block)[:consumed])
+        source.seek(start + consumed)
+        for begin, end in selected:
+            yield start + begin, block[begin:end]
+        return
+    consumed = 0
+    while consumed < limit:
+        position = source.tell()
+        line = source.readline()
+        if not line or not line.endswith(b'\n'):
+            source.seek(position)
+            break
+        consumed += len(line)
+        digest.update(line)
+        if any(marker in line[:250] for marker in
+               (b'"turn_context"', b'"token_usage_record"', b'"event_msg"', b'"compacted"')):
+            yield position, line
 
 
 def usage_only(value):
@@ -269,30 +299,23 @@ class UsageIndex:
             if not tid:
                 return None
             f.seek(offset)
-            consumed = 0
             # Bound work per file so a large active session cannot block other files.
-            while consumed < 16 * 1024 * 1024:
-                pos = f.tell()
-                line = f.readline()
-                if not line or not line.endswith(b'\n'):
-                    f.seek(pos)
-                    break
-                consumed += len(line)
-                digest.update(line)
-                if any(t in line[:250] for t in (b'"turn_context"', b'"token_usage_record"', b'"event_msg"', b'"compacted"')):
-                    try:
-                        clean = sanitized(json.loads(line))
-                        if clean:
-                            # Source event identity survives an archive-directory move;
-                            # equal times/token values never collapse distinct events.
-                            clean['event_id']=f'{p.name}:{pos}'
-                            self.new_events[(str(home),tid)].append(((stamp(clean['timestamp']),path,pos),clean))
-                            self.db.execute('insert or replace into events values(?,?,?,?,?,?)',
-                                (path, pos, str(home), tid, stamp(clean['timestamp']), json.dumps(clean, ensure_ascii=False)))
-                            self.observe_quota(home,clean['payload'].get('rate_limits'),stamp(clean['timestamp']))
-                    except (ValueError, TypeError, AttributeError):
-                        self.errors.append(f'일부 기록 형식 확인 필요: {tid[:8]}')
+            start_offset = offset
+            for pos, line in _event_lines(f, digest):
+                try:
+                    clean = sanitized(json.loads(line))
+                    if clean:
+                        # Source event identity survives an archive-directory move;
+                        # equal times/token values never collapse distinct events.
+                        clean['event_id']=f'{p.name}:{pos}'
+                        self.new_events[(str(home),tid)].append(((stamp(clean['timestamp']),path,pos),clean))
+                        self.db.execute('insert or replace into events values(?,?,?,?,?,?)',
+                            (path, pos, str(home), tid, stamp(clean['timestamp']), json.dumps(clean, ensure_ascii=False)))
+                        self.observe_quota(home,clean['payload'].get('rate_limits'),stamp(clean['timestamp']))
+                except (ValueError, TypeError, AttributeError):
+                    self.errors.append(f'일부 기록 형식 확인 필요: {tid[:8]}')
             offset = f.tell()
+            consumed = offset - start_offset
             self.bytes_read += consumed
             self.source_hashes[path]=(offset,digest.hexdigest())
         self.db.execute('insert or replace into files values(?,?,?,?,?,?,?)',

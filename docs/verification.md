@@ -17,6 +17,22 @@ Plain `pytest` uses the fast essential profile. The `integration` marker identif
 
 The default suite retains compact dashboard/quota rendering, rendered loading and stale-result handling, overlay controls, real protocol exchanges, accounting/history invariants, and installation rollback tests. Do not replace those contracts with exact labels, private call sequences, or screenshots without assertions.
 
+## Native CPU kernels
+
+Source builds require rustup and Microsoft C++ Build Tools for x64. `rust-toolchain.toml` pins the Rust compiler, and `native/Cargo.lock` pins native dependencies. Run these commands with the dedicated Python environment:
+
+```powershell
+python tools/build_native.py --test
+python tools/verify_changes.py
+python tools/benchmark_cpu.py --rows 20000 --samples 5 --min-cpu-ms 250 --output artifacts/verification/cpu-comparison.json
+```
+
+The first native build may download the pinned toolchain and crates. Add `--offline` to `build_native.py` after they are cached. The build helper checks the extension's import and ABI in a fresh Python process. `build_native.py --check`, source verification, and release packaging reject a present extension whose source or binary hash changed. Documentation-only verification does not load or build Rust.
+
+`CODEXON_CPU_BACKEND=python` selects the retained Python reference. `rust` requires the compiled extension, while the default `auto` permits an absent extension in source checkouts. Unsupported numeric ranges and Python objects can still use the reference implementation to preserve accounting semantics. CI builds the extension and selects `rust`; packaged runtime checks require it. Rebuild after changing native sources.
+
+The benchmark compares both backends on identical synthetic inputs, including Python/Rust conversion overhead. It reports median CPU milliseconds per call using `process_time_ns`, elapsed milliseconds using `perf_counter_ns`, repeated samples, result parity, and source/binary hashes. CPU reduction is `100 * (1 - Rust CPU time / Python CPU time)`. It excludes network and disk latency, GUI rendering, production data, and monitoring waits. These results describe the measured kernels and pipelines, not whole-application CPU usage or every possible Python bottleneck. Keep the machine otherwise idle and avoid concurrent builds or tests during measurement.
+
 ## CI and releases
 
 `tools/ci_plan.py` is the policy for `.github/workflows/windows.yml`:

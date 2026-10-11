@@ -78,8 +78,9 @@ def test_changed_and_deleted_fixture_modules_select_existing_transitive_consumer
 
 
 def test_current_code_is_mapped_and_selected_tests_still_exist():
-    paths = {p.relative_to(ROOT).as_posix() for folder in ('cachemonitor', 'tools')
-             for p in (ROOT/folder).rglob('*') if p.suffix in ('.py', '.qml', '.ps1')}
+    paths = {p.relative_to(ROOT).as_posix() for folder in ('cachemonitor', 'tools', 'native/src')
+             for p in (ROOT/folder).rglob('*') if p.suffix in ('.py', '.qml', '.ps1', '.rs')}
+    paths.update(('native/Cargo.toml', 'native/Cargo.lock', 'rust-toolchain.toml'))
     plan = select_tests(paths)
     assert not plan['unmapped'], plan['unmapped']
     for target in {test for tests in GROUPS.values() for test in tests}:
@@ -160,6 +161,19 @@ def test_ci_extended_and_qa_tool_fallback_cannot_skip_required_checks():
         assert plan['package'] == plan['proxy'] == (not reusable)
 
 
+def test_rust_changes_require_native_parity_and_packaging_without_proxy_migration():
+    from tools.ci_plan import build_plan
+    for path in ('native/src/lib.rs', 'native/Cargo.lock', 'native/Cargo.toml',
+                 'rust-toolchain.toml', 'cachemonitor/native_backend.py', 'tools/build_native.py'):
+        plan = build_plan({path}, base='verified')
+        assert plan['rust'] and plan['package'] and plan['native'], path
+        assert not plan['full'] and not plan['proxy'] and not plan['msix'], path
+        assert not plan['unmapped'], path
+        assert {'tests/test_native_cpu.py', 'tests/test_build_native.py'} <= set(plan['tests']), path
+    assert build_plan({'cachemonitor/pricing.py'}, base='verified')['rust']
+    assert not build_plan({'README.md'}, base='verified')['rust']
+
+
 def test_only_app_version_literal_can_bypass_proxy_compatibility_checks():
     from tools.verify_changes import version_contract
     before = "VERSION='1'\nPROXY_VERSION='p1'\ndef proxy_compatible(v):return v=='p1'\n"
@@ -188,3 +202,26 @@ def test_environment_failure_stops_before_tests_and_preserves_baseline(tmp_path,
     assert baseline.read_bytes()==original
     report=json.loads(__import__('pathlib').Path(result['report']).read_text(encoding='utf-8'))
     assert 'pytest' not in report and report['environment']['errors']==[problem]
+
+
+def test_stale_native_extension_stops_before_tests_and_preserves_baseline(tmp_path,monkeypatch,capsys):
+    import tools.verify_changes as verify
+    import tools.check_environment as environment
+    import tools.build_native as native
+    baseline=tmp_path/'last-success.json'
+    baseline.write_text(json.dumps({'files':{'cachemonitor/core.py':'old'}}),encoding='utf-8')
+    original=baseline.read_bytes()
+    binary=tmp_path/'_cpu_native.pyd';binary.write_bytes(b'old build')
+    monkeypatch.setattr(verify,'BASELINE',baseline)
+    monkeypatch.setattr(verify,'REPORTS',tmp_path/'reports')
+    monkeypatch.setattr(verify,'file_hashes',lambda:{'cachemonitor/core.py':'changed'})
+    monkeypatch.setattr(environment,'check_environment',lambda:dict(errors=[]))
+    monkeypatch.setattr(native,'extension_path',lambda:binary)
+    def stale():raise RuntimeError('Rust extension is stale or changed')
+    monkeypatch.setattr(native,'checked_extension',stale)
+    def unexpected(*args,**kwargs):raise AssertionError('Tests must not run with a stale extension')
+    monkeypatch.setattr(verify.subprocess,'run',unexpected)
+    assert verify.main([])==2
+    result=json.loads(capsys.readouterr().out)
+    assert result['result']=='native_failed'
+    assert baseline.read_bytes()==original

@@ -4,6 +4,7 @@ import math
 from bisect import bisect_left
 from .quota_tracking import ResetTracker, RESET_NAMES, OBSERVATION_FRESHNESS
 from .quota_cycles import quota_statistics, quota_value_history
+from .native_backend import get_native
 
 def clock(ts, full=False):
     return datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S' if full else '%m/%d %H:%M') if ts else '—'
@@ -77,6 +78,16 @@ def completed_percent_costs(rows):
     with unchanged allowance and cost does not discard the observed plateau.
     This runs during preparation so detail selection stays constant-time.
     """
+    if any(r.get('user_excluded') for r in rows):
+        return _completed_percent_costs_python(rows)
+    native=get_native()
+    if native is not None:
+        try:return native.completed_percent_costs(rows)
+        except OverflowError:pass  # Keep exact integer differences beyond f64.
+    return _completed_percent_costs_python(rows)
+
+
+def _completed_percent_costs_python(rows):
     # Summing interval costs in a different order can move the same USD value
     # by a few floating-point bits. This is not a decrease or new gap activity.
     def same_cost(a,b):
@@ -89,6 +100,13 @@ def completed_percent_costs(rows):
         remaining=row.get('reported_remaining',row['remaining'])
         cost=row.get('period_cost',row.get('cycle_cost'))
         known=(cost is not None and math.isfinite(cost) and cost>=0)
+        if row.get('user_excluded'):
+            start=index
+            valid=(known and row.get('user_exclusion_end',False) and float(remaining).is_integer()
+                   and previous is not None
+                   and remaining<previous.get('reported_remaining',previous['remaining']))
+            previous=row
+            continue
         boundary=(previous is None or row.get('reset_kind') or
                   any(row.get(key)!=previous.get(key) for key in ('cycle_start','account')))
         if boundary:
@@ -116,6 +134,32 @@ def completed_percent_costs(rows):
 
 def prepare_series(rows):
     """Bound drawing size while retaining extrema and exact selectable records."""
+    native=get_native()
+    if native is not None:
+        prepared=rows
+        if any(r.get('user_excluded') for r in rows) and not all('completed_cost' in r for r in rows):
+            amounts=completed_percent_costs(rows)
+            prepared=[{**r,'completed_cost':r.get('completed_cost',amount)} for r,amount in zip(rows,amounts)]
+        try:return _preserve_exclusion_boundaries(dict(native.quota_series(prepared),rows=rows))
+        except OverflowError:pass  # Preserve arbitrary-size integer accounting.
+    return _preserve_exclusion_boundaries(_prepare_series_python(rows))
+
+
+def _preserve_exclusion_boundaries(series):
+    rows=series['rows']
+    boundaries=set()
+    for index,row in enumerate(rows):
+        if row.get('user_excluded') and (not index or not rows[index-1].get('user_excluded')):
+            boundaries.update((max(0,index-1),index))
+        if row.get('user_exclusion_end'):
+            boundaries.update((index,min(len(rows)-1,index+1)))
+    if boundaries:
+        for budget,sample in series['samples'].items():
+            series['samples'][budget]=sorted(set(sample)|boundaries)
+    return series
+
+
+def _prepare_series_python(rows):
     times=[];breaks=[];gaps=0;maximum=0;low=float('inf');high=0;cost_maximum=0;value_maximum=0
     value_minimum=None
     calculated=completed_percent_costs(rows)
@@ -180,7 +224,11 @@ def prepare_series(rows):
 def prepare_quota_view(report):
     from .pricing import usd
     from .quota_share import prepare_model_share
-    rows,periods=quota_value_history(report,history_rows(report,'weekly'))
+    from .quota_exclusions import active_exclusions
+    from .quota_attribution import RequestWindows
+    exclusions=active_exclusions(report)
+    requests=RequestWindows(report.get('request_windows',[])) if report.get('tracking') is not None else None
+    rows,periods=quota_value_history(report,history_rows(report,'weekly'),_requests=requests)
     completed=completed_percent_costs(rows)
     for row,amount in zip(rows,completed):row['completed_cost']=amount
     times=[r['at'] for r in rows]
@@ -199,14 +247,14 @@ def prepare_quota_view(report):
                             if offset_delta+row['confirmed_delta']>0 else None})
         period['series']=prepare_series(own)
         period['series']['model_share']=prepare_model_share(period['series'],period['cost_intervals'])
+        period['series']['exclusions']=[r for r in exclusions if r['start']<period['end'] and r['end']>period['start']]
         period['series']['active_only']=True
         if period['reset_kind']:
             resets.append(dict(at=period['start'],label=RESET_NAMES[period['reset_kind']],number=i+1))
         offset_cost+=period['cost'] or 0;offset_delta+=period['delta']
         state='진행 중' if period['current'] else '종료'
-        origin=RESET_NAMES.get(period['reset_kind'],'관측 시작')
-        period['label']=(f"{clock(period['start'])} → {clock(period['end'])}, {origin}, {state}, {usd(period['value'])}")
-    lifetime=quota_statistics(report,include_mode_assumptions=True)
+        period['label']=(f"{clock(period['start'])} → {clock(period['end'])}: {usd(period['value'])} ({state})")
+    lifetime=quota_statistics(report,include_mode_assumptions=True,_requests=requests)
     now=report.get('at')
     summaries={None:lifetime}
     if now is not None:
@@ -214,12 +262,66 @@ def prepare_quota_view(report):
         for days in (7,30,90):
             start=now-days*86400
             summaries[days]=(lifetime if start<=earliest else
-                             quota_statistics(report,start,include_mode_assumptions=True))
+                             quota_statistics(report,start,include_mode_assumptions=True,_requests=requests))
     all_series=prepare_series(overall)
     all_series['model_share']=prepare_model_share(all_series,[interval for period in periods for interval in period.pop('cost_intervals')])
-    all_series.update(active_only=True,cumulative=True,resets=resets)
-    return dict(periods=periods,overall=all_series,lifetime=lifetime,summaries=summaries,
+    all_series.update(active_only=True,cumulative=True,resets=resets,exclusions=exclusions)
+    available_models=sorted({model['model'] for interval in lifetime.get('intervals',[]) for model in interval['models']
+                             if model.get('model') and not model.get('separate')})
+    return dict(periods=sorted(periods,key=lambda period:period['start'],reverse=True),overall=all_series,lifetime=lifetime,summaries=summaries,available_models=available_models,
                 five_hour=prepare_series(history_rows(report,'five_hour')))
+
+
+def model_cost_intervals(intervals, selected_model):
+    """Keep account consumption separate from one model's known API cost."""
+    if selected_model is None:
+        return intervals
+    result=[]
+    for interval in intervals:
+        models=[row for row in interval['models']
+                if row.get('model')==selected_model and not row.get('separate')]
+        if not models:
+            continue
+        known=[row['cost'] for row in models if row['cost'] is not None]
+        cost=sum(known) if known else None
+        whole=interval['cost']
+        calls=sum(row['calls'] for row in models)
+        priced=sum(row.get('priced',row['calls']) for row in models)
+        total_calls=interval.get('calls',sum(row['calls'] for row in interval['models'] if not row.get('separate')))
+        complete=priced==calls and interval.get('priced_calls',total_calls)>=total_calls
+        result.append({**interval, 'model_filter':selected_model, 'model_cost':cost,
+                       'model_share':cost/whole*100 if complete and cost is not None and whole is not None and whole>0 else None,
+                       'model_calls':calls, 'model_priced':priced})
+    return result
+
+
+def prepare_quota_query(report, query):
+    """Compute filter totals and one display page in the aggregation process."""
+    view=report.get('view') or prepare_quota_view(report)
+    days=query.get('days');start=query.get('start');end=query.get('end')
+    model=query.get('model');mode=query.get('mode','all')
+    prepared=view.get('summaries',{})
+    summary=(prepared[days] if days in prepared and end is None and (days is not None or start is None)
+             else quota_statistics(report,start,end,True))
+    intervals=model_cost_intervals(summary['intervals'],model)
+    known=[row['model_cost'] for row in intervals if row['model_cost'] is not None] if model is not None else []
+    totals=dict(count=len(intervals),calls=sum(row['model_calls'] for row in intervals) if model is not None else 0,
+                priced=sum(row['model_priced'] for row in intervals) if model is not None else 0,
+                cost=sum(known) if known else None)
+    rows=([row for row in intervals if not row['excluded']] if mode=='used' else
+          [row for row in intervals if row['excluded'] or row.get('assumptions')] if mode=='excluded' else intervals)
+    partial=any(row['model_priced']<row['model_calls'] if model is not None else
+                row.get('priced_calls',row['calls'])<row['calls'] for row in rows)
+    page_size=max(1,min(100,int(query.get('page_size',25))))
+    pages=max(1,math.ceil(len(rows)/page_size));page=max(0,min(int(query.get('page',0)),pages-1))
+    # Raw evidence stays in the worker. The GUI receives only fields used by
+    # the visible table and its model details, never all call/end-point graphs.
+    visible=[{key:value for key,value in row.items() if key not in ('cost_rows','endpoints')}
+             for row in rows[page*page_size:(page+1)*page_size]]
+    selected=next((row for row in visible if row['id']==query.get('selected_id')),visible[0] if visible else None)
+    return dict(statistics={**summary,'intervals':visible},model_totals=totals,
+                has_unknown=any(row.get('unknown_mode_calls') for row in summary['intervals']),
+                partial=partial,total_rows=len(rows),page=page,pages=pages,rows=visible,selected_interval=selected)
 
 
 __all__ = ('clock','history_rows','observation_label','prepare_series','prepare_quota_view')

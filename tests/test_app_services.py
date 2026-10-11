@@ -66,6 +66,201 @@ from cachemonitor.observer_state import read_json
 from cachemonitor.proxy_target import ProxyTarget
 
 
+@pytest.fixture
+def login_services(tmp_path, monkeypatch):
+    from cachemonitor.model_evidence import home_key
+    from cachemonitor import retired_cache, install_cleanup
+    manager = ObserverManager(tmp_path/'home', tmp_path/'data', url='http://127.0.0.1:18989')
+    manager.set_url(manager.url)
+    manager.write_state(dict(home=home_key(manager.home), enabled=True, pending=False, phase='active'))
+    events = []
+    health = dict(instance='login', status='ok', version=services_version(), observation_enabled=True)
+    status = dict(phase='active', configured=True, health=health)
+    monkeypatch.setattr(retired_cache, 'retire', lambda _: None)
+    monkeypatch.setattr(install_cleanup, 'after_services', lambda _: events.append('cleanup'))
+    monkeypatch.setattr(manager, 'cleanup_legacy_check', lambda: None)
+    monkeypatch.setattr(manager, 'adopt_registrations', lambda: None)
+    monkeypatch.setattr(ProxyTarget, 'capture', lambda self, value: {})
+    def resume():
+        events.append('route')
+        return status
+    monkeypatch.setattr(manager, 'resume', resume)
+    owner = services.AppServices(manager, [], login_launch=lambda: events.append('launch') or 'started')
+    monkeypatch.setattr(owner, 'start_collection', lambda: events.append('collection'))
+    return owner, manager, status, events
+
+
+def test_login_launch_runs_after_route_before_collection_and_only_once(login_services):
+    owner, manager, status, events = login_services
+    assert owner.execute('start')['chatgpt_startup'] == 'started'
+    assert events == ['route', 'launch', 'collection', 'cleanup']
+    owner.execute('start')
+    assert events.count('launch') == 1
+    assert events[-3:] == ['collection', 'route', 'cleanup']
+
+
+def test_login_without_proxy_does_not_wait_for_service_probes(login_services):
+    owner, manager, status, events = login_services
+    manager.set_url(None)
+    manager.write_state({**manager.state(), 'enabled':False, 'phase':'off'})
+    assert owner.execute('start')['chatgpt_startup'] == 'started'
+    assert events == ['launch', 'collection', 'route', 'cleanup']
+
+
+def test_login_waits_for_suspended_route_to_be_restored(login_services, monkeypatch):
+    owner, manager, status, events = login_services
+    manager.set_url(None)
+    manager.write_state({**manager.state(), 'enabled':False})
+    journal = dict(scope=owner.target.scope, phase='stopped', resume=True)
+    services.atomic_write(services.session_path(manager), json.dumps(journal).encode())
+    def resume():
+        assert not events
+        manager.set_url(manager.url)
+        manager.write_state({**manager.state(), 'enabled':True})
+        services.atomic_write(services.session_path(manager), json.dumps({**journal, 'phase':'active'}).encode())
+        events.append('route')
+        return status
+    monkeypatch.setattr(manager, 'resume', resume)
+    owner.execute('start')
+    assert events[:3] == ['route', 'launch', 'collection']
+
+
+@pytest.mark.parametrize('issue', ['missing', 'draining', 'observation_off', 'wrong_route', 'update'])
+def test_login_never_launches_before_required_connection_is_ready(login_services, issue):
+    owner, manager, status, events = login_services
+    if issue == 'missing': status['health'] = None
+    elif issue == 'draining': status['health']['draining'] = True
+    elif issue == 'observation_off': status['health']['observation_enabled'] = False
+    elif issue == 'wrong_route': manager.set_url(None)
+    elif issue == 'update': status['update'] = {'phase':'switching'}
+    result = owner.execute('start')
+    assert result['chatgpt_startup_error']
+    assert events == ['route', 'collection']
+    assert owner.login_launch is None
+
+
+def test_login_failure_preserves_collection_and_does_not_retry_activation(login_services, monkeypatch):
+    owner, manager, status, events = login_services
+    def fail():
+        events.append('launch')
+        raise OSError('missing app')
+    owner.login_launch = fail
+    assert owner.execute('start')['chatgpt_startup_error'] == 'missing app'
+    owner.execute('start')
+    assert events.count('launch') == 1
+    assert events.count('collection') == 2
+
+
+def test_login_service_failure_or_shutdown_never_opens_app(login_services, monkeypatch):
+    owner, manager, status, events = login_services
+    def fail(): raise RuntimeError('failed readiness')
+    monkeypatch.setattr(manager, 'resume', fail)
+    result = owner.execute('start')
+    assert result['chatgpt_startup_error'] == 'failed readiness'
+    assert events == ['collection']
+    owner.login_launch = lambda: events.append('unexpected launch')
+    owner.deactivate()
+    assert owner.execute('start') == {}
+    assert events == ['collection']
+
+
+def test_only_enabled_login_launch_uses_saved_app_identifier(tmp_path, monkeypatch):
+    from PySide6.QtCore import QSettings
+    from cachemonitor import app, chatgpt_startup
+    settings = QSettings(str(tmp_path/'startup.ini'), QSettings.IniFormat)
+    assert app.login_launcher(settings, windows_startup=True) is None
+    settings.setValue(chatgpt_startup.ENABLED_KEY, True)
+    settings.setValue(chatgpt_startup.APP_ID_KEY, 'registered-app')
+    calls = []
+    monkeypatch.setattr(chatgpt_startup, 'launch_chatgpt', lambda app_id: calls.append(app_id))
+    assert app.login_launcher(settings) is None
+    assert app.login_launcher(settings, windows_startup=True, isolated=True) is None
+    launch = app.login_launcher(settings, windows_startup=True)
+    settings.setValue(chatgpt_startup.APP_ID_KEY, 'changed-later')
+    launch()
+    assert calls == ['registered-app']
+
+
+def test_login_cancelled_during_connection_recovery_keeps_collection(login_services, monkeypatch):
+    owner, manager, status, events = login_services
+    launch = services.LoginLaunch(lambda: events.append('launch'))
+    owner.login_launch = launch
+    def resume():
+        events.append('route')
+        launch.cancel()
+        return status
+    monkeypatch.setattr(manager, 'resume', resume)
+    result = owner.execute('start')
+    assert result['chatgpt_startup'] == 'cancelled'
+    assert events == ['route', 'collection', 'cleanup']
+    assert not result.get('chatgpt_startup_error')
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize('already_started', [False, True])
+def test_login_message_runs_once_without_losing_initial_service_start(login_services, tmp_path, monkeypatch, already_started):
+    import threading
+    import time
+    from PySide6.QtCore import QSettings
+    from PySide6.QtGui import QAction
+    from PySide6.QtWidgets import QApplication, QWidget
+    from PySide6.QtTest import QTest
+    from cachemonitor import app, chatgpt_startup
+    from cachemonitor.app_shutdown import ServiceController
+    qt = QApplication.instance() or QApplication([])
+    owner, manager, status, events = login_services
+    owner.login_launch = None
+    owner.active = already_started
+    entered, release = threading.Event(), threading.Event()
+    def poll():
+        entered.set()
+        assert release.wait(5)
+        events.append('poll')
+        return status
+    monkeypatch.setattr(owner, 'poll', poll)
+    monkeypatch.setattr(chatgpt_startup, 'launch_chatgpt', lambda _: events.append('launch') or 'started')
+    window = QWidget()
+    window.settings = QSettings(str(tmp_path/'queued-login.ini'), QSettings.IniFormat)
+    window.settings.setValue(chatgpt_startup.ENABLED_KEY, True)
+    window.settings.setValue(chatgpt_startup.APP_ID_KEY, 'registered-app')
+    for name in ('startup', 'chatgpt_startup'):
+        action = QAction(window);action.setCheckable(True);action.setChecked(True)
+        setattr(window, name, action)
+    controller = ServiceController(owner, window)
+    window.service_controller = controller
+    results = []
+    controller.result.connect(results.append)
+    def wait_until(predicate):
+        deadline = time.monotonic()+5
+        while not predicate():
+            assert time.monotonic()<deadline, 'Login service operation did not complete'
+            QTest.qWait(10)
+    try:
+        if already_started:
+            controller.invoke('ensure')
+            wait_until(entered.is_set)
+        app.request_login_startup(window)
+        app.request_login_startup(window)
+        if already_started:
+            assert 'launch' not in events
+            release.set()
+        else:
+            # The login IPC can arrive before the dashboard's 0ms startup timer.
+            controller.start()
+        wait_until(lambda: any(result.get('chatgpt_startup')=='started' for result in results) and controller.operation is None)
+        assert owner.active
+        assert events.count('launch') == 1
+        assert events.count('collection') == (0 if already_started else 1)
+        if already_started:assert events.index('poll')<events.index('launch')
+        app.request_login_startup(window)
+        assert controller.operation is None
+    finally:
+        release.set();controller.stop()
+        if controller.operation:
+            assert controller.operation.wait(5000)
+        window.deleteLater();qt.processEvents()
+
+
 @pytest.mark.parametrize('name',['custom index.collection.sqlite','custom index.sqlite.codexon-collection.sqlite'])
 @pytest.mark.parametrize('schema',[1,2])
 def test_package_collector_reader_restores_both_released_ipc_formats(tmp_path,monkeypatch,name,schema):

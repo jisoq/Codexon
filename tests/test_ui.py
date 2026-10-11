@@ -48,6 +48,40 @@ def dashboard(tmp_path):
 
 
 @pytest.mark.essential
+@pytest.mark.parametrize('finite_update',[False,True])
+def test_quota_sidebar_updates_outside_cost_page_and_fits_compact_window(dashboard,tmp_path,finite_update):
+    from PySide6.QtCore import QPointF
+    w=dashboard;now=time.time();w.resize(1000,680)
+    quota=dict(source='live',observed_at=now,plan_type='pro',unlimited_windows=['five_hour'],
+        windows={'weekly':dict(used_percent=77,window_minutes=10080,resets_at=now+3600)},
+        credits={'balance':'62500'},reset_credits={'available_count':2,'credits':[
+            dict(status='available',expires_at=now+86400),dict(status='available',expires_at=now+172800)]})
+    w.receive_quota({'home':'fixture','quota':quota})
+    assert w.current_page==0 and w.quota_panel._render_dirty
+    assert w.quota_sidebar.quota==quota
+    w.change_page(4)
+    updated={**quota,'windows':{'weekly':dict(quota['windows']['weekly'],used_percent=81)}}
+    if finite_update:
+        updated['unlimited_windows']=[]
+        updated['windows']['five_hour']=dict(used_percent=20,window_minutes=300,resets_at=now+7200)
+        w.update_available.show()
+    w.receive_quota({'home':'fixture','quota':updated})
+    assert w.quota_sidebar.quota==updated
+    assert w.quota_sidebar.weekly.text()=='19.0%'
+    QTest.qWait(80)
+    for node in (w.quota_sidebar,w.settings_button,w.index_status):
+        item=control(w,node);position=item.mapToScene(QPointF(0,0))
+        assert item.isVisible() and item.width()>0 and item.height()>0
+        assert 0<=position.y()<position.y()+item.height()<=w.quick.height()+1
+    assert w.grab().save(str(tmp_path/'sidebar-compact-settings.png'))
+    w.receive_quota({'home':'another-home','quota':quota})
+    assert w.quota_sidebar.quota==updated
+    w.change_page(3);QTest.qWait(50)
+    assert not w.quota_panel._render_dirty
+    assert not w.qml_errors
+
+
+@pytest.mark.essential
 def test_sequential_drilldown_and_full_call_detail(dashboard,tmp_path):
     w=dashboard;w.nav.setCurrentRow(w.navigation_pages.index(2));QTest.qWait(40)
     assert w.record_view=='sessions'

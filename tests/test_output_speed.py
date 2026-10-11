@@ -71,7 +71,7 @@ def test_rendered_summary_click_and_overlay_speed_navigation(tmp_path):
     from cachemonitor.overlay_view import SessionOverlay
     from cachemonitor.overlay_chrome import OverlayLinks, named_item
     from cachemonitor.overlay_appearance import default_appearance
-    from cachemonitor.quick_qa import click, control, walk
+    from cachemonitor.quick_qa import click, control, render_plot, walk
     from cachemonitor.i18n import set_language
     from cachemonitor.i18n import tr
     from cachemonitor.overlay_view import font
@@ -85,8 +85,11 @@ def test_rendered_summary_click_and_overlay_speed_navigation(tmp_path):
     try:
         source=snapshot();window.receive(source);window.resize(1280,900);window.show();QTest.qWait(150)
         assert window.metrics[4].text()=='125.0 tok/s'
+        click(window,render_plot(window,window.efficiency_details.toggle))
+        speed_control=render_plot(window,window.metrics[4])
+        assert speed_control.isVisible()
         assert window.quick.grabFramebuffer().save(str(tmp_path/'dashboard.png'))
-        click(window,control(window,window.metrics[4]));QTest.qWait(50)
+        click(window,speed_control)
         assert [r['output_speed'] for r in __import__('cachemonitor.dashboard_views',fromlist=['resolve_population']).resolve_population(window.engine,window.aggregate_records)]==[200,100]
         assert '125.0 tok/s' in window.overview_detail['text'].text()
         engine=AnalysisEngine();engine.ingest(source['sessions']);data=OverlaySummaries().collect(engine)[0]
@@ -120,8 +123,8 @@ def test_rendered_summary_click_and_overlay_speed_navigation(tmp_path):
         assert window.response_cell(data['latest'],index,Qt.DisplayRole)=='100.0 tok/s'
         window.nav.setCurrentRow(0);window.resize(1000,720);QTest.qWait(60)
         window.scrollers[0].verticalPosition.setValue(0);QTest.qWait(50)
-        speed_control=control(window,window.metrics[4])
-        assert speed_control.width()>0
+        speed_control=render_plot(window,window.metrics[4])
+        assert speed_control.isVisible() and speed_control.width()>0
         for metric in window.metrics:
             text_items=[item for item in walk(control(window,metric)) if item.metaObject().indexOfProperty('truncated')>=0]
             assert text_items and all(not item.property('truncated') for item in text_items)

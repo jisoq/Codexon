@@ -4,6 +4,7 @@ from collections import Counter
 from .analytics import cache_rows, observation_flags, stats
 from .pricing import mode_assumptions, request_tier, sum_cost
 from .analysis_records import record_items
+from .history_timeline_data import project_timeline
 
 
 def identity(row):
@@ -28,7 +29,7 @@ def ordered(rows,sort):
     return sorted(rows,key=lambda r:(r.get(key) is None,-r[key] if descending and isinstance(r.get(key),(int,float)) else r.get(key,0)))
 
 
-def request_rows(turns,rows,scope,include_empty=True):
+def request_rows(turns,rows,scope,include_empty=True,unlinked_total=None):
     from .core import summarize, METRICS
     groups={}
     for r in rows:groups.setdefault(r.get('turn'),[]).append(r)
@@ -47,8 +48,15 @@ def request_rows(turns,rows,scope,include_empty=True):
         row['call_mean']=stats(items,'cost')['mean'];result.append(row)
     unlinked=groups.get(None,[])+groups.get('',[])
     if unlinked and scope:
-        result.append(dict(home=scope[0],sid=scope[1],turn='__unlinked__',state=f'요청 미연결 {len(unlinked):,}호출',
-            responses=len(unlinked),cost=sum_cost(unlinked)['cost'],call_mean=stats(unlinked,'cost')['mean'],ts=max(r['ts'] for r in unlinked)))
+        values=summarize(unlinked)
+        for key in METRICS:
+            if values['missing'][key]:values[key]=None
+        valid=cache_rows(unlinked);inputs=sum(r['input'] for r in valid)
+        values['rate']=100*sum(r['cached'] for r in valid)/inputs if inputs and len(valid)==len(unlinked) else None
+        result.append(dict(values,**sum_cost(unlinked,strict=True),home=scope[0],sid=scope[1],
+            turn='__unlinked__',state=f'요청 미연결 {len(unlinked):,}호출',complete=False,duration=None,
+            responses=len(unlinked),total_responses=len(unlinked) if unlinked_total is None else unlinked_total,
+            call_mean=stats(unlinked,'cost')['mean'],ts=max(r['ts'] for r in unlinked)))
     return result
 
 
@@ -93,12 +101,18 @@ def explorer(engine,result,selection):
         phases={str(k):name for field,name in (('baseline_keys','기준'),('occurrence_keys','발생'),('recovery_keys','회복')) for k in (event or {}).get(field,[])}
         rows=[dict(r,_incident_phase=phases[str(identity(r)[2])]) for r in rows if str(identity(r)[2]) in phases]
     turns=result['lookup']['session_turns'].get(scope,[])
-    if view=='requests':records=request_rows(turns,rows,scope,include_empty=not filters)
+    if view=='requests':
+        whole=engine.sessions.get(scope,{}).get('prepared',{}).get('history',[])
+        records=request_rows(turns,rows,scope,
+            include_empty=not filters and (matching is None or scope in matching),
+            unlinked_total=sum(not r.get('turn') for r in whole))
     else:
         records=list(rows)
         if selection.get('outside') and turn and scope:
             keys={identity(r) for r in records}
             records.extend(dict(r,_outside=True) for r in result['lookup']['whole_turns'].get((*scope,turn),[]) if identity(r) not in keys)
+    call_rows=rows if view=='requests' else records if view=='calls' else []
+    call_identities=frozenset(identity(row) for row in call_rows)
     parent_kind='requests' if view=='calls' and scope else 'sessions'
 
     from .history_projection import prepare, session_tree, total
@@ -127,8 +141,10 @@ def explorer(engine,result,selection):
             return (start if start is not None else min((r['ts'] for r in full.get((*scope,t),[])),default=float('inf')),t)
         numbers={t:i+1 for i,t in enumerate(sorted(ids,key=position))}
         request_ordinal=numbers.get(turn)
-        if view=='requests':records=[dict(r,ordinal=numbers.get(r.get('turn')),ts=position(r.get('turn'))[0]) for r in records]
+        if view=='requests':records=[dict(r,ordinal=numbers.get(r.get('turn')),
+            ts=r.get('ts') if r.get('turn')=='__unlinked__' else position(r.get('turn'))[0]) for r in records]
     if view!='sessions':records=ordered(records,sort)
+    timeline=project_timeline(records,kind=view) if selection.get('timeline') and scope and view in ('requests','calls') else None
     parents=navigation;parent_kind='projects'
     if scope:summary=total(rows)
     elif project:summary=next((r for r in hierarchy['projects'] if r['project_id']==project),{})
@@ -147,7 +163,7 @@ def explorer(engine,result,selection):
     event_keys={str(k) for field in ('baseline_keys','occurrence_keys','recovery_keys') for k in (event or {}).get(field,[])}
     return dict(path=path,view=view,session=scope,turn=turn,request_ordinal=request_ordinal,metadata=session,group={k:v for k,v in hierarchy['rollups'].get(scope,{}).items() if k!='members'},project=project,summary=summary,child_count=len(hierarchy['children'].get(scope,[])),
         records=records,parents=parents,parent_kind=parent_kind,partial_parents=any(r.get('known',0)<r.get('calls',0) for r in parents) if parent_kind=='sessions' else False,available=available,detail=detail,
-        detail_in_scope=bool(detail and any(identity(r)==identity(detail) for r in records)),
+        timeline=timeline,_call_identities=call_identities,detail_in_scope=bool(detail and identity(detail) in call_identities),
         event=event,event_rows=[r for r in scope_rows if (r['home'],r['sid'])==scope and str(identity(r)[2]) in event_keys])
 
 
@@ -214,7 +230,8 @@ def project(engine,q):
         data=cached[1] if cached and cached[0]==key else explorer(engine,result,selection)
         engine._explorer_projection=(key,data)
         detail=engine.record(*selection['call_identity']) if selection.get('call_identity') else None
-        data={**data,'detail':detail,'detail_in_scope':bool(detail and any(identity(r)==identity(detail) for r in data['records']))}
+        data={**{key:value for key,value in data.items() if key!='_call_identities'},
+              'detail':detail,'detail_in_scope':bool(detail and identity(detail) in data['_call_identities'])}
         ranges=q.get('table_windows',{})
         view['explorer']={**data,'records':window(data['records'],ranges.get('records',{})),
             'parents':window(data['parents'],ranges.get('parents',{}))}
@@ -226,6 +243,12 @@ def project(engine,q):
         # Only displayed series belong on the wire. Full model/session groupings
         # remain in the engine for drill-down through population references.
         view['overview']=compact(query,{k:v for k,v in overview.items() if k not in ('models','sessions','attention')},('overview',))
+        totals={'calls':len(responses)}
+        for key in ('input','output'):
+            known=[r[key] for r in responses if r.get(key) is not None]
+            totals[key]=sum(known) if len(known)==len(responses) else None
+            totals[key+'_known']=len(known)
+        view['overview']['usage_totals']=totals
         view['overview']['attention']={k:{'count':len(v),'population':reference(query,['overview','attention',k])} for k,v in overview['attention'].items()}
         completed=[t for t in turns if t['complete']];priced=[r for r in responses if r.get('cost') is not None]
         selections=[priced,priced,[t for t in completed if t['cost'] is not None],cache_rows(responses),[r for r in responses if r.get('output_speed') is not None]]

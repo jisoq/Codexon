@@ -57,7 +57,7 @@ def install_fixture_quota(window,folder,snapshot):
         for offset,weekly,five in ((900,24,10),(600,25,12),(300,27,15),(60,30,19)):
             ledger.observe('fixture',quota(now-offset,weekly,five))
         ledger.sync(window.engine,snapshot)
-        window.quota_panel.receive(dict(quota=quota(now,30,19),report=ledger.report('fixture',now)))
+        window.receive_quota(dict(home='fixture',quota=quota(now,30,19),report=ledger.report('fixture',now)))
     finally:ledger.close()
 
 
@@ -133,8 +133,8 @@ def main():
                             window.restore_state(state);settle()
                             report['interactions'].append(dict(size=width,theme=theme,sequential_records=True,keyboard_detail=True))
                         elif page==3:
-                            panel=window.quota_panel;panel.window.setCurrentIndex(1)
-                            capture(prefix+'-quota-five-hour');panel.window.setCurrentIndex(0)
+                            panel=window.quota_panel
+                            capture(prefix+'-quota-weekly-cost')
                             if panel.intervals.rowCount():panel.intervals.selectRow(0)
                             panel.mode_assumption.setChecked(True)
                             scroller=control(window,window.scrollers[3]);flick=scroller.property('contentItem')

@@ -43,6 +43,8 @@ Archive-Directory $stagingRoot (Join-Path $sourceRoot '.staging') 'previous-stag
 Archive-Directory (Join-Path $workRoot $Product) $workRoot 'previous-build'
 Push-Location $sourceRoot
 try {
+    & $PythonPath (Join-Path $sourceRoot 'tools/build_native.py')
+    if ($LASTEXITCODE -ne 0) { throw 'The required Rust extension did not build or pass its import check.' }
     & $PythonPath -m PyInstaller --noconfirm --clean --distpath $stagingRoot --workpath $workRoot ($Product + '.spec')
     if ($LASTEXITCODE -ne 0) { throw 'Build failed; the previous distribution remains in place.' }
     $stagedProduct = Join-Path $stagingRoot $Product

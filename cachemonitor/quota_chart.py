@@ -1,7 +1,7 @@
-"""Four matching series/axes with bounded rendering and exact time selection."""
+"""Aligned metric rows with bounded rendering and exact time selection."""
 from bisect import bisect_left, bisect_right
-from math import ceil, floor, log10
-from PySide6.QtCore import Qt, QRectF, QPointF, Signal
+from math import ceil
+from PySide6.QtCore import Qt, QRectF, QPointF, Signal, Slot
 from PySide6.QtGui import QColor, QPen, QImage, QPainter, QPainterPath
 from .charts import Plot, dynamic_bounds
 from .theme import shared_theme
@@ -32,7 +32,9 @@ class GapPixels:
 
 class QuotaHistory(Plot):
     gap_selected=Signal(str)
+    range_selected=Signal(float,float)
     repaintRequested=Signal()
+    legendChanged=Signal(object)
     def __init__(self):
         super().__init__()
         self.setFixedHeight(440)
@@ -41,7 +43,8 @@ class QuotaHistory(Plot):
         self.money=False;self.reference=None;self.series=prepare_series([])
         self.put(quotaDetail=True)
         self._cache_key=None;self.box=QRectF()
-        self.strip_box=QRectF();self.inspection_x=None
+        self.strip_box=QRectF();self.inspection_x=None;self.inspection_at=None
+        self.row_boxes={};self.row_headers={};self.exclusion_selection=None;self._selection_anchor=None
         self.gap_lefts=[];self.gap_rights=[];self.gap_width=24
         self.setAccessibleName('잔여량과 구독 가치 / 방향키로 시각 선택')
         shared_theme().changed.connect(self.update)
@@ -53,36 +56,48 @@ class QuotaHistory(Plot):
         self.update()
 
     def visible(self,key):
+        if key=='reference':return self.visible('cycle_value') and key not in self.hidden_series
         return key not in self.hidden_series and (key=='remaining' or self.money)
 
     def set_series(self,series):
         if self.series is series:return
+        previous_digest=self.series.get('_content_digest');digest=series.get('_content_digest')
         if (self._cache_key is not None and len(self.rows)==len(series['rows'])
-                and self.rows[-1:]==series['rows'][-1:] and self.series==series):
+                and self.rows[-1:]==series['rows'][-1:] and
+                (previous_digest==digest if previous_digest is not None and digest is not None else self.series==series)):
             # Adopt the new input without retaining another copy of its history.
-            # Equal content preserves the existing raster and exact time lookup.
+            # Worker digests avoid comparing the full history on the GUI thread.
+            # Raw callers retain the existing exact-content comparison.
             self.series=series;self.rows=series['rows']
+            self.legendChanged.emit(self.legend_values())
             self._cache_key=(self._cache_key[0],id(series),*self._cache_key[2:])
             self.gap_lefts.series=series;self.gap_rights.series=series
             return
         self.series=series;self.rows=series['rows'];self.cursor=min(self.cursor,max(0,len(self.rows)-1))
         share=series.get('model_share')
-        self.setFixedHeight(540 if share else 440)
+        self.setFixedHeight((630 if self.money else 300)+(100 if share else 0))
         shared_theme().register_models([name for name,mode in share['models']] if share else [])
-        self._cache_key=None;self.update()
+        self._cache_key=None;self._selection_anchor=None;self.exclusion_selection=None
+        self.legendChanged.emit(self.legend_values());self.update()
 
     def set_rows(self,rows):self.set_series(prepare_series(rows))
 
     def connects(self,a,b,key):
+        missing=self.series['missing'].get(key)
         return (self.series['breaks'][a]==self.series['breaks'][b] and
-                (key=='remaining' or self.series['missing'][key][a]==self.series['missing'][key][b]))
+                (key=='remaining' and not self.series.get('cumulative') or
+                 ((missing is None or missing[a]==missing[b]) and not self.excluded_between(a,b))))
+
+    def excluded_between(self,a,b):
+        start,end=self.rows[a]['at'],self.rows[b]['at']
+        return any(item['start']<end and item['end']>start for item in self.series.get('exclusions',[]))
 
     def point(self,index,key):
         value=self.value_at(index,key)
         if value is None:return None
         low,high=self.bounds(key)
-        return QPointF(self.x_at(index),
-                       self.box.bottom()-self.box.height()*(value-low)/(high-low))
+        box=self.row_boxes.get(key,self.box)
+        return QPointF(self.x_at(index),box.bottom()-box.height()*(value-low)/(high-low))
 
     def bounds(self,key):
         if key=='remaining':return self.axis[:2]
@@ -93,14 +108,21 @@ class QuotaHistory(Plot):
     def value_at(self,index,key):
         return self.series['completed_costs'][index] if key=='completed_cost' else self.rows[index].get(key)
 
+    def metric_definitions(self):
+        return [('cycle_value','accent','주간 예상 가치','USD / 100%p'),
+                ('remaining','written','누적 사용량' if self.series.get('cumulative') else '남은 사용량',
+                 '%p' if self.series.get('cumulative') else '%'),
+                ('cycle_cost','output','누적 측정 환산액','USD')]
+
+    def displayed_metrics(self):
+        return [item for item in self.metric_definitions() if self.visible(item[0]) or
+                (item[0]=='cycle_value' and self.reference is not None and self.visible('reference'))]
+
     def curves(self):
-        curves=[('remaining','cached',Qt.SolidLine)]+([
-            ('cycle_cost','output',Qt.SolidLine),('cycle_value','written',Qt.DashDotLine),
-            ('completed_cost','completed',Qt.SolidLine)] if self.money else [])
-        curves=[c for c in curves if self.visible(c[0])]
+        curves=[(key,color,Qt.SolidLine) for key,color,_,_ in self.metric_definitions() if self.visible(key)]
         palette=shared_theme().palette
         if any(color_distance(palette[a[1]],palette[b[1]])<.04 for i,a in enumerate(curves) for b in curves[i+1:]):
-            return [(key,color,style) for (key,color,_),style in zip(curves,(Qt.SolidLine,Qt.DashLine,Qt.DashDotLine,Qt.DotLine))]
+            return [(key,color,style) for (key,color,_),style in zip(curves,(Qt.SolidLine,Qt.DashLine,Qt.DashDotLine))]
         return curves
 
     def x_at(self,index):
@@ -140,24 +162,26 @@ class QuotaHistory(Plot):
         self.value_floor,self.ceiling=quota_bounds((value_low,value_high) if value_low is not None else ())
         self.cost_floor,self.cost_ceiling=quota_bounds((self.series['cost_minimum'],self.series['cost_maximum']) if self.series['cost_minimum'] is not None else ())
         self.completed_floor,self.completed_ceiling=quota_bounds((self.series['completed_minimum'],self.series['completed_maximum']) if self.series['completed_minimum'] is not None else ())
-        completed_width=max(82,p.fontMetrics().horizontalAdvance(usd(self.completed_ceiling))+14)
-        remaining_title='누적 소모\n%p' if cumulative else '잔여량\n%'
-        remaining_labels=[f'{self.axis[1]:g}'+('%p' if cumulative else '%'),*tr(remaining_title).splitlines()]
-        remaining_width=max(60,max(p.fontMetrics().horizontalAdvance(label) for label in remaining_labels)+14)
-        cost_width=max(82,p.fontMetrics().horizontalAdvance(usd(self.cost_ceiling))+14)
-        value_width=max(92,p.fontMetrics().horizontalAdvance(usd(self.ceiling))+14)
-        remaining_width=remaining_width if self.visible('remaining') else 0
-        completed_width=completed_width if self.visible('completed_cost') else 0
-        cost_width=cost_width if self.visible('cycle_cost') else 0
-        value_width=value_width if self.visible('cycle_value') or self.visible('reference') else 0
-        right=cost_width+value_width if self.money else 18
-        left=remaining_width+(completed_width if self.money else 0)
+        metrics=self.displayed_metrics()
+        labels=[]
+        for key,_,_,_ in metrics:
+            low,high=self.bounds(key)
+            labels.extend(self.metric_text(key,value) for value in (low,high))
+        left=max(66,max((p.fontMetrics().horizontalAdvance(label) for label in labels),default=50)+14)
         extra=100 if self.series.get('model_share') else 0
-        self.box=box=QRectF(left,58,max(1,self.width()-left-right),self.height()-98-extra)
+        content_bottom=self.height()-38-extra
+        lane_height=(content_bottom-30)/max(1,len(metrics))
+        self.row_boxes={};self.row_headers={}
+        for row,(key,color,title,unit) in enumerate(metrics):
+            top=30+row*lane_height
+            self.row_headers[key]=QRectF(8,top,self.width()-24,26)
+            header_space=10
+            self.row_boxes[key]=QRectF(left,top+header_space,max(1,self.width()-left-16),max(1,lane_height-header_space-13))
+        boxes=list(self.row_boxes.values())
+        self.box=box=QRectF(left,boxes[0].top() if boxes else 66,max(1,self.width()-left-16),
+                           boxes[-1].bottom()-boxes[0].top() if boxes else max(1,content_bottom-66))
         self.strip_box=QRectF(box.left(),box.bottom()+65,box.width(),34) if extra else QRectF()
         gap_indices=self.series['gap_indices'];count=len(gap_indices)
-        # Keep all gaps equally narrow; cap their total footprint only when
-        # an exceptionally dense set cannot fit at the normal 24 px width.
         self.gap_width=0 if self.series.get('active_only') else min(24,box.width()*.4/count) if count else 24
         self.time_scale=(box.width()-self.gap_width*count)/max(1,self.series['active_times'][-1])
         self.gap_lefts=GapPixels(self.series,box.left(),self.time_scale,self.gap_width)
@@ -165,46 +189,34 @@ class QuotaHistory(Plot):
         visible_gaps=range(0,count,max(1,ceil(1/self.gap_width))) if self.gap_width else range(0)
         self.reset_hits=[]
         if cumulative:
-            boundaries=[]
             for reset in self.series.get('resets',[]):
                 index=min(bisect_left(self.series['times'],reset['at']),len(self.rows)-1)
-                boundaries.append((self.x_at(index),reset))
-            edges=[box.left()]+[x for x,_ in boundaries]+[box.right()]
-            for i,(left,right_edge) in enumerate(zip(edges,edges[1:])):
-                if i%2:
-                    color=QColor(palette['secondary']);color.setAlpha(110)
-                    p.fillRect(QRectF(left,box.top(),max(0,right_edge-left),box.height()),color)
-            for x,reset in boundaries:
-                self.reset_hits.append((QRectF(x-8,7,16,24),reset))
-        low,high,step=self.axis
-        ticks=[low+step*i for i in range(5)]
-        for value in ticks:
-            y=box.bottom()-box.height()*(value-low)/(high-low)
-            p.setPen(QPen(QColor(palette['border']),1));p.drawLine(QPointF(box.left(),y),QPointF(box.right(),y))
-            if remaining_width:p.setPen(QColor(palette['cached']));p.drawText(QRectF(box.left()-remaining_width,y-9,remaining_width-7,18),Qt.AlignRight|Qt.AlignVCenter,f'{value:g}'+('%p' if cumulative else '%'))
-        if remaining_width:
-            p.setPen(QPen(QColor(palette['cached']),1))
-            p.drawLine(QPointF(box.left(),box.top()),QPointF(box.left(),box.bottom()))
-            p.drawText(QRectF(box.left()-remaining_width,0,remaining_width-7,54),Qt.AlignRight|Qt.AlignVCenter|Qt.TextWordWrap,
-                       remaining_title)
-        if self.money:
-            for x,width,axis_low,ceiling,color,title,on_left in (
-                    (box.left()-remaining_width,completed_width,self.completed_floor,self.completed_ceiling,'completed','완료 구간\nUSD',True),
-                    (box.right(),cost_width,self.cost_floor,self.cost_ceiling,'output','누적 환산액\nUSD',False),
-                    (box.right()+cost_width,value_width,self.value_floor,self.ceiling,'written','주간 동등\nUSD / 100%p',False)):
-                if not width:continue
-                text_x=x-width if on_left else x+7
-                alignment=Qt.AlignRight if on_left else Qt.AlignLeft
-                p.setPen(QPen(QColor(palette[color]),1));p.drawLine(QPointF(x,box.top()),QPointF(x,box.bottom()))
-                p.drawText(QRectF(text_x,0,width-7,54),alignment|Qt.AlignVCenter|Qt.TextWordWrap,title)
-                for fraction in (0,.5,1):
-                    y=box.bottom()-box.height()*fraction
-                    p.drawText(QRectF(text_x,y-9,width-7,18),alignment|Qt.AlignVCenter,usd(axis_low+(ceiling-axis_low)*fraction))
-            if self.reference is not None and self.visible('reference'):
-                y=box.bottom()-box.height()*(self.reference-self.value_floor)/(self.ceiling-self.value_floor)
+                self.reset_hits.append((QRectF(self.x_at(index)-8,4,16,22),reset))
+        for key,color,title,unit in metrics:
+            area=self.row_boxes[key];header=self.row_headers[key]
+            low,high=self.bounds(key)
+            for fraction in (0,.5,1):
+                y=area.bottom()-area.height()*fraction
+                grid=QColor(palette['border']);grid.setAlpha(115)
+                p.setPen(QPen(grid,1));p.drawLine(QPointF(area.left(),y),QPointF(area.right(),y))
+                p.setPen(QColor(palette['muted']))
+                p.drawText(QRectF(0,y-9,area.left()-9,18),Qt.AlignRight|Qt.AlignVCenter,
+                           self.metric_text(key,low+(high-low)*fraction))
+            for item in self.series.get('exclusions',[]):
+                x=self.x_at_time(item['start']);right=self.x_at_time(item['end'])
+                shade=QColor(palette['muted']);shade.setAlpha(16)
+                excluded=QRectF(x,area.top(),max(0,right-x),area.height())
+                p.fillRect(excluded,shade)
+                p.save();p.setClipRect(excluded)
+                hatch=QColor(palette['muted']);hatch.setAlpha(28);p.setPen(QPen(hatch,1))
+                for offset in range(int(x-area.height()),int(right),12):
+                    p.drawLine(QPointF(offset,area.bottom()),QPointF(offset+area.height(),area.top()))
+                p.restore()
+            if key=='cycle_value' and self.reference is not None and self.visible('reference'):
+                y=area.bottom()-area.height()*(self.reference-low)/(high-low)
                 p.setPen(QPen(QColor(palette['accent']),1,Qt.DashLine))
-                p.drawLine(QPointF(box.left(),y),QPointF(box.right(),y))
-        if not self.curves() and not (self.visible('reference') and self.reference is not None):
+                p.drawLine(QPointF(area.left(),y),QPointF(area.right(),y))
+        if not metrics:
             p.setPen(QColor(palette['muted']));p.drawText(box,Qt.AlignCenter,'표시할 선을 범례에서 선택하세요')
         indices=self.series['samples'][256 if box.width()<600 else 768]
         active=self.series['active_times'];gaps=self.series['gap_indices']
@@ -212,63 +224,64 @@ class QuotaHistory(Plot):
         xs=[min(right,left+active[i]*time_scale+bisect_right(gaps,i)*gap_width) for i in indices]
         rows=self.rows;breaks=self.series['breaks'];completed=self.series['completed_costs']
         for key,color,style in self.curves():
-            low,high=self.bounds(key)
-            scale=box.height()/(high-low);bottom=box.bottom()
+            area=self.row_boxes[key];low,high=self.bounds(key)
+            scale=area.height()/(high-low);bottom=area.bottom()
             previous=None;previous_x=None;previous_index=None
             path=QPainterPath();move=path.moveTo;line=path.lineTo
             missing=self.series['missing'].get(key)
             p.setPen(QPen(QColor(palette[color]),2,style))
-            # One native path avoids thousands of temporary Qt line/point
-            # wrappers each time a refreshed series invalidates the image.
             for index,x in zip(indices,xs):
                 value=completed[index] if key=='completed_cost' else rows[index].get(key)
                 y=bottom-(value-low)*scale if value is not None else None
-                if y is not None:
-                    if (previous is not None and breaks[previous_index]==breaks[index]
-                            and (missing is None or missing[previous_index]==missing[index])):
-                        if previous_x!=x:move(previous_x,previous);line(x,previous)
-                        if previous!=y:move(x,previous);line(x,y)
+                if y is not None and previous is not None and self.connects(previous_index,index,key):
+                    # Completed intervals remain horizontal, with no invented
+                    # slope or vertical transition between independent amounts.
+                    if previous_x!=x:
+                        start,end=previous_x,x
+                        if key=='completed_cost':
+                            if not previous_index or rows[previous_index].get('remaining')!=rows[previous_index-1].get('remaining'):start+=1.5
+                            if rows[index].get('remaining')!=rows[previous_index].get('remaining'):end-=1.5
+                        if end>start:move(start,previous);line(end,previous)
+                    if key!='completed_cost' and previous!=y:move(x,previous);line(x,y)
                 previous,previous_x,previous_index=y,x,index
-                # A completed amount belongs to its whole plateau, up to the
-                # next boundary, even when that next plateau is still pending.
                 if key=='completed_cost' and y is not None and index+1<len(rows):
                     if (completed[index+1] is None and breaks[index]==breaks[index+1]
-                            and missing[index+1]==missing[index]+1):
-                        path.moveTo(x,y);path.lineTo(self.x_at(index+1),y)
+                            and missing[index+1]==missing[index]+1 and not self.excluded_between(index,index+1)):
+                        start=x+1.5 if not index or rows[index].get('remaining')!=rows[index-1].get('remaining') else x
+                        end=self.x_at(index+1)-1.5
+                        if end>start:move(start,y);line(end,y)
             p.setBrush(Qt.NoBrush);p.drawPath(path)
         if count and self.gap_width:
             p.setPen(QColor(palette['muted']))
-            p.drawText(QRectF(box.left(),8,box.width(),20),Qt.AlignLeft,'// 수집 공백')
-            for k in visible_gaps:
-                left=self.gap_lefts[k]
-                strip=QRectF(left,box.top(),self.gap_width,box.height())
-                p.fillRect(strip,QColor(palette['surface']))
-                p.save();p.setClipRect(strip)
-                p.setPen(QPen(QColor(palette['border']),1))
-                for y in range(int(box.top()-self.gap_width),int(box.bottom()+self.gap_width),9):
-                    p.drawLine(QPointF(left,y+self.gap_width),QPointF(left+self.gap_width,y))
-                p.restore()
-                if self.gap_width>=12:
-                    p.setPen(QColor(palette['muted']))
-                    p.drawText(QRectF(left-2,box.bottom()-10,self.gap_width+4,20),Qt.AlignCenter,'//')
-        # Exact selection, gap detection and tooltips use the time index below.
-        # The shared hover adapter only needs a clickable plot surface; rebuilding
-        # thousands of sampled rectangles and formatted labels blocks repaint.
+            p.drawText(QRectF(box.left(),4,box.width(),22),Qt.AlignLeft,'// 수집 공백')
+            for area in boxes:
+                for k in visible_gaps:
+                    left=self.gap_lefts[k];strip=QRectF(left,area.top(),self.gap_width,area.height())
+                    p.fillRect(strip,QColor(palette['surface']));p.save();p.setClipRect(strip)
+                    p.setPen(QPen(QColor(palette['border']),1))
+                    for y in range(int(area.top()-self.gap_width),int(area.bottom()+self.gap_width),9):
+                        p.drawLine(QPointF(left,y+self.gap_width),QPointF(left+self.gap_width,y))
+                    p.restore()
         self._cache_hits=[(QRectF(box),{},'')]
         for pos,index in enumerate(indices):
-            x=xs[pos];row=self.rows[index]
-            if row['reset_kind']:
-                p.setPen(QPen(QColor(palette['muted']),1,Qt.DotLine));p.drawLine(QPointF(x,box.top()),QPointF(x,box.bottom()))
+            if rows[index]['reset_kind']:
+                x=xs[pos];p.setPen(QPen(QColor(palette['muted']),1,Qt.DotLine))
+                for area in boxes:p.drawLine(QPointF(x,area.top()),QPointF(x,area.bottom()))
         for rect,reset in self.reset_hits:
-            x=rect.center().x()
-            p.setPen(QPen(QColor(palette['muted']),1,Qt.DashLine));p.drawLine(QPointF(x,box.top()),QPointF(x,box.bottom()))
+            x=rect.center().x();p.setPen(QPen(QColor(palette['muted']),1,Qt.DashLine))
+            for area in boxes:p.drawLine(QPointF(x,area.top()),QPointF(x,area.bottom()))
             p.setPen(QColor(palette['ink']));p.drawText(rect,Qt.AlignCenter,'◆')
             self._cache_hits.append((rect,{},reset['label']+', '+clock(reset['at'],True)))
         p.setPen(QColor(palette['muted']))
-        p.drawText(QRectF(box.left(),box.bottom()+10,box.width()/2,20),Qt.AlignLeft,clock(self.rows[0]['at']))
-        p.drawText(QRectF(box.center().x(),box.bottom()+10,box.width()/2,20),Qt.AlignRight,clock(self.rows[-1]['at']))
+        p.drawText(QRectF(box.left(),box.bottom()+10,box.width()/2,20),Qt.AlignLeft,clock(rows[0]['at']))
+        p.drawText(QRectF(box.center().x(),box.bottom()+10,box.width()/2,20),Qt.AlignRight,clock(rows[-1]['at']))
         self.draw_model_share(p,palette)
         p.end();return pic
+
+    def metric_text(self,key,value):
+        if value is None:return '—'
+        if key=='remaining':return f'{value:g}'+('%p' if self.series.get('cumulative') else '%')
+        return usd(value)
 
     def x_at_time(self,at):
         times=self.series['times'];index=bisect_left(times,at)
@@ -323,7 +336,52 @@ class QuotaHistory(Plot):
     def set_inspection(self,detail,x,y):
         self.inspection_x=x if detail else None
         self.inspection_at=detail.get('inspection_at',detail.get('at')) if detail else None
+        self.legendChanged.emit(self.legend_values())
         self.repaintRequested.emit()
+
+    def set_exclusion_selection(self,start=None,end=None,enabled=False):
+        self.exclusion_selection=(float(start),float(end)) if enabled and start is not None and end is not None else None
+        if not enabled:self._selection_anchor=None
+        self.put(exclusionSelecting=bool(enabled))
+        self.repaintRequested.emit()
+
+    def nearest_index(self,x):
+        """Snap to an actual record, including either side of a compressed gap."""
+        x=max(self.box.left(),min(self.box.right(),x))
+        gap=self.gap_at(x,self.box.center().y())
+        if gap is not None:
+            right=self.series['gap_indices'][gap]
+            return right-1 if x-self.x_at(right-1)<=self.x_at(right)-x else right
+        at=self.time_at_x(x);times=self.series['times'];right=bisect_left(times,at)
+        if right==0:return 0
+        if right>=len(times):return len(times)-1
+        return right-1 if at-times[right-1]<=times[right]-at else right
+
+    @Slot(float,float)
+    def selectionPress(self,x,y):
+        if not self.state.get('exclusionSelecting') or not self.rows or not self.box.contains(QPointF(x,y)):return
+        self._selection_anchor=self.nearest_index(x)
+        self.selectionMove(x,y)
+
+    @Slot(float,float)
+    def selectionMove(self,x,y):
+        if self._selection_anchor is None:return
+        a,b=sorted((self._selection_anchor,self.nearest_index(x)))
+        start,end=self.rows[a]['at'],self.rows[b]['at']
+        if self.exclusion_selection==(start,end):return
+        self.exclusion_selection=(start,end)
+        self.repaintRequested.emit()
+
+    @Slot(float,float)
+    def selectionRelease(self,x,y):
+        if self._selection_anchor is None:return
+        self.selectionMove(x,y);self._selection_anchor=None
+        # Recalculate only after the gesture settles, never for every pixel.
+        self.range_selected.emit(*self.exclusion_selection)
+
+    @Slot()
+    def selectionCancel(self):
+        self._selection_anchor=None
 
     def paint(self,painter):
         p=self.base();palette=shared_theme().palette;p.fillRect(self.rect(),QColor(palette['surface']))
@@ -332,10 +390,6 @@ class QuotaHistory(Plot):
         key=(frozenset(self.hidden_series),id(self.series),self.width(),self.height(),self.money,self.reference,tuple(palette.items()),shared_theme().family,self._painter.device().devicePixelRatioF())
         if key!=self._cache_key:self._picture=self.static_image();self._cache_key=key
         p.drawImage(0,0,self._picture);self.hits=self._cache_hits
-        if self.inspection_x is None:return
-        x=max(self.box.left(),min(self.box.right(),self.x_at_time(self.inspection_at) if self.inspection_at is not None else self.inspection_x))
-        p.setPen(QPen(QColor(palette['muted']),1,Qt.DotLine))
-        p.drawLine(QPointF(x,self.box.top()),QPointF(x,self.strip_box.bottom() if not self.strip_box.isNull() else self.box.bottom()))
 
     def index_at(self,x,y):
         if not self.rows or not (self.box.contains(QPointF(x,y)) or self.strip_box.contains(QPointF(x,y))):return None
@@ -346,6 +400,7 @@ class QuotaHistory(Plot):
         return max(0,min(bisect_right(times,at+1e-6)-1,len(times)-1))
 
     def tip_at(self,x,y):
+        if not self.geometry_ready():return ''
         for rect,reset in getattr(self,'reset_hits',[]):
             if rect.contains(QPointF(x,y)):return reset['label']+', '+clock(reset['at'],True)
         gap=self.gap_at(x,y)
@@ -354,6 +409,7 @@ class QuotaHistory(Plot):
         return ', '.join([self.detail_for(index)['title']]+[item['label']+' '+item['value'] for item in self.detail_for(index)['items']]) if index is not None and self.hidden_series else observation_label(self.rows[index],self.money) if index is not None else ''
 
     def detail_at(self,x,y):
+        if not self.geometry_ready():return {}
         if self.strip_box.contains(QPointF(x,y)):y=self.box.center().y()
         for rect,reset in getattr(self,'reset_hits',[]):
             if rect.contains(QPointF(x,y)):
@@ -390,20 +446,20 @@ class QuotaHistory(Plot):
     def detail_for(self,index):
         row=self.rows[index];previous=self.rows[index-1] if index else None
         cumulative=self.series.get('cumulative',False)
-        items=[dict(label='누적 소모량' if cumulative else '잔여량',value=f"{row['remaining']:g}"+('%p' if cumulative else '%'),color='cached')]
-        if self.money:
-            items += [dict(label='누적 구독 가치 환산액',value=usd(row.get('cycle_cost')),color='output'),
-                      dict(label='주간 동등 가치',value=usd(row.get('cycle_value')),color='written')]
-            amount=self.series['completed_costs'][index]
-            items.append(dict(label='완료 구간별 구독 가치 환산액',value=usd(amount),color='completed'))
-        colors={'cached':'remaining','output':'cycle_cost','written':'cycle_value','completed':'completed_cost'}
-        items=[item for item in items if self.visible(colors[item['color']])]
-        if row['reset_kind']:note=(', '.join(row.get('markers',[])) or '사용량 리셋')+', 새 주기'
+        items=[dict(metric=key,label=title,value=self.metric_text(key,self.value_at(index,key)),color=color)
+               for key,color,title,_ in self.metric_definitions() if self.visible(key)]
+        if row.get('user_excluded'):
+            note='집계에서 제외한 구간입니다'
+            for item in items:
+                if item['metric']!='remaining' or cumulative:item['value']=tr('집계 제외')
+        elif row['reset_kind']:note=(', '.join(row.get('markers',[])) or '사용량 리셋')+', 새 주기'
         elif not previous:note=''
         elif not row['connect']:note='' if self.series.get('active_only') else '공백 이후 첫 관측'
         elif self.visible('cycle_cost') and row.get('cycle_cost') is None:note='금액 확인 중'
         elif self.visible('cycle_value') and row.get('cycle_value') is None:note='동등 가치 계산 대기'
         else:note=''
+        if self.visible('cycle_value') and self.reference is not None:
+            items.insert(1,dict(metric='reference',label='누적 예상 가치',value=usd(self.reference),color='muted',subordinate=True))
         return self.with_share(dict(title=clock(row['at'],True),at=row['at'],items=items,note=note),row['at'])
 
     def refresh_detail(self,detail):
@@ -419,18 +475,70 @@ class QuotaHistory(Plot):
         return self.detail_at((self.gap_lefts[gap]+self.gap_rights[gap])/2,self.box.center().y())
 
     def activate_at(self,x,y):
+        if not self.geometry_ready():return None
         gap=self.gap_at(x,y)
         if gap is not None:
             label=self.gap_label(gap);self.setAccessibleName(label);self.gap_selected.emit(label);return
         index=self.index_at(x,y)
         if index is not None:
-            self.cursor=index;self.update();self.selected.emit(self.rows[index])
+            self.cursor=index;self.repaintRequested.emit();self.selected.emit(self.rows[index])
             self.setAccessibleName(observation_label(self.rows[index],self.money))
 
     def key(self,key):
         if not self.rows:return
         if key==Qt.Key_Home:self.cursor=0
         elif key==Qt.Key_End:self.cursor=len(self.rows)-1
-        else:super().key(key)
-        self.update();self.setAccessibleName(observation_label(self.rows[self.cursor],self.money))
+        elif key in (Qt.Key_Left,Qt.Key_Up,Qt.Key_Right,Qt.Key_Down):
+            self.cursor=(self.cursor+(-1 if key in (Qt.Key_Left,Qt.Key_Up) else 1))%len(self.rows)
+        elif key in (Qt.Key_Return,Qt.Key_Space):self.selected.emit(self.rows[self.cursor])
+        self.repaintRequested.emit();self.setAccessibleName(observation_label(self.rows[self.cursor],self.money))
         if key in (Qt.Key_Home,Qt.Key_End,Qt.Key_Left,Qt.Key_Right,Qt.Key_Up,Qt.Key_Down):self.selected.emit(self.rows[self.cursor])
+
+    def paint_overlay(self,painter):
+        if not self.rows or self._cache_key is None:return
+        p=self._painter;palette=shared_theme().palette
+        p.setRenderHint(QPainter.Antialiasing);p.setRenderHint(QPainter.TextAntialiasing)
+        font=self.font();font.setPixelSize(14);p.setFont(font)
+        if self.exclusion_selection is not None:
+            start,end=self.exclusion_selection;x=self.x_at_time(start);right=self.x_at_time(end)
+            shade=QColor(palette['accent']);shade.setAlpha(28)
+            for area in self.row_boxes.values():
+                p.fillRect(QRectF(x,area.top(),max(0,right-x),area.height()),shade)
+        inspected=self.inspection_x is not None
+        index=max(0,min(bisect_right(self.series['times'],self.inspection_at)-1,len(self.rows)-1)) if inspected and self.inspection_at is not None else len(self.rows)-1
+        font=p.font();font.setPixelSize(13);p.setFont(font)
+        p.setPen(QColor(palette['muted']))
+        p.drawText(QRectF(self.box.center().x(),4,self.box.width()/2,22),Qt.AlignRight,clock(self.rows[index]['at'],True))
+        if inspected:
+            x=max(self.box.left(),min(self.box.right(),self.x_at_time(self.inspection_at) if self.inspection_at is not None else self.inspection_x))
+            p.setPen(QPen(QColor(palette['muted']),1,Qt.DotLine))
+            for area in self.row_boxes.values():p.drawLine(QPointF(x,area.top()),QPointF(x,area.bottom()))
+            if not self.strip_box.isNull():p.drawLine(QPointF(x,self.strip_box.top()),QPointF(x,self.strip_box.bottom()))
+        for key,color,_,_ in self.displayed_metrics():
+            excluded=self.rows[index].get('user_excluded') and (key!='remaining' or self.series.get('cumulative'))
+            value='집계 제외' if excluded else self.metric_text(key,self.value_at(index,key))
+            if inspected and not excluded:
+                point=self.point(index,key)
+                if point is not None:
+                    point.setX(x);p.setPen(QPen(QColor(palette['surface']),1.5));p.setBrush(QColor(palette[color]));p.drawEllipse(point,3.5,3.5)
+        p.setBrush(Qt.NoBrush)
+
+    def legend_values(self):
+        if not self.rows:return {key:'—' for key,_,_,_ in self.metric_definitions()}
+        inspected=self.inspection_x is not None and self.inspection_at is not None
+        index=max(0,min(bisect_right(self.series['times'],self.inspection_at)-1,len(self.rows)-1)) if inspected else len(self.rows)-1
+        return {key:tr('집계 제외') if self.rows[index].get('user_excluded') and (key!='remaining' or self.series.get('cumulative'))
+                else self.metric_text(key,self.value_at(index,key)) for key,_,_,_ in self.metric_definitions()}
+
+    def geometry_ready(self):
+        return self._cache_key is not None and self._cache_key[1]==id(self.series)
+
+    @Slot(float,float)
+    def beginRangeSelection(self,x,y):
+        if not self.geometry_ready():return
+        self.put(exclusionSelecting=True)
+        self.selectionPress(x,y)
+
+    @Slot()
+    def cancelRangeSelection(self):
+        self.selectionCancel();self.set_exclusion_selection(None,None,False)

@@ -29,7 +29,16 @@ class ServiceController(QObject):
 
     def start(self):
         if self.closed:return
-        self.timer.start();self.invoke('start')
+        self.timer.start()
+        if not self.services.active:self.invoke('start')
+
+    def request_login_launch(self, launch):
+        if self.closed:
+            launch.cancel()
+            return
+        self.services.login_launch = launch
+        if self.services.active:self.invoke('login')
+        else:self.start()
 
     def poll(self):
         panel=getattr(self.parent(),'observer_panel',None)
@@ -46,6 +55,8 @@ class ServiceController(QObject):
     def finished(self):
         operation=self.operation;self.operation=None
         operation.deleteLater()
+        if self.services.login_launch is not None and not self.closed:
+            self.invoke('login' if self.services.active else 'start')
 
     def stop(self):
         self.closed=True;self.timer.stop();self.services.deactivate()

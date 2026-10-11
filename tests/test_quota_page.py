@@ -53,44 +53,38 @@ def test_responsive_page_chart_and_single_details_path(quota_page,tmp_path,width
         remaining=[row['remaining'] for row in panel.history.rows]
         assert 0<panel.history.axis[0]<min(remaining)
         assert panel.history.axis[1]>max(remaining)
-        assert panel.basis.text()=='9%p'
-        assert '정기 초기화' in panel.cycle_choice.currentText()
+        assert '9%' in panel.summary_text.text()
         assert all(r['local_observed'] for r in panel.history.rows)
         assert panel.cycle_choice.count()==4
-        assert not panel.details.content.isVisible()
-        # Select the exact observation; between records the chart now reports
-        # the step value at the cursor, rather than a future nearest record.
+        assert panel.cycle_choice.currentData()==max(p['start'] for p in panel._view['periods'])
+        assert list(panel.legend_toggles)==['cycle_value','remaining','cycle_cost']
+        assert list(panel.history.row_boxes)==['cycle_value','remaining','cycle_cost']
+        assert panel.conversion not in panel.layout()._nodes
+        assert panel.history.series is panel._view['periods'][0]['series']
         row=panel.history.rows[-1]
         plot.activateAt(panel.history.x_at(len(panel.history.rows)-1),panel.history.box.center().y())
-        assert plot.detail['title'] in row['label']
-        plot.forceActiveFocus();QTest.keyClick(host.quick,Qt.Key_Right);QTest.qWait(30)
-        assert plot.detail['title'] in panel.history.rows[0]['label']
-        for node in (panel.basis,panel.cost_value,panel.result):
-            item=control(host,node)
-            texts=[child for child in walk(item) if child.metaObject().indexOfProperty('truncated')>=0 and child.isVisible()]
-            assert texts and all(not t.property('truncated') for t in texts)
+        assert plot.detail['at']==row['at']
+        assert plot.detail['items'][1]['metric']=='reference'
+        assert plot.detail['items'][1]['subordinate']
         assert host.grab().save(str(tmp_path/f'quota-{width}-{"dark" if dark else "light"}.png'))
-        scroll.ensureWidgetVisible(panel.details.toggle);QTest.qWait(80)
-        click(host,control(host,panel.details.toggle))
-        assert panel.details.content.isVisible()
-        click_row(host,panel.intervals,1)
-        assert panel.selected_id==panel.intervals.model().rows[1]['id']
-        assert '정기 초기화로 종료' in panel.interval_detail.text()
-        assert panel.table.rowCount()>0
-        scroll.ensureWidgetVisible(panel.interval_detail);QTest.qWait(80)
-        assert host.grab().save(str(tmp_path/f'quota-detail-{width}-{"dark" if dark else "light"}.png'))
-        before=panel.selected_id
-        panel.render(automatic=True);QTest.qWait(40)
-        assert panel.selected_id==before and panel.details.content.isVisible()
-        # Change the chart through its rendered control.
-        scroll.ensureWidgetVisible(panel.window);QTest.qWait(80)
-        choice=control(host,panel.window);choice.forceActiveFocus();QTest.keyClick(host.quick,Qt.Key_Down);QTest.qWait(40)
-        assert panel.window.currentData()=='five_hour'
-        assert not any(r['markers'] for r in panel.history.rows)
-        assert panel.history.axis[1]<100
-        assert [key for key,_,_ in panel.history.curves()]==['remaining']
-        assert len(panel.history.detail_for(0)['items'])==1
-        assert panel.basis.text()=='9%p'
+        panel.open_dialog();app.processEvents()
+        assert panel.dialog.host is not None
+        modal=panel.dialog.host
+        assert not modal.qml_errors
+        assert control(modal,panel.exclusions.start).width()>0
+        panel.select_graph.clicked.emit()
+        app.processEvents()
+        assert panel.dialog.host is None
+        plot=render_plot(host,panel.history)
+        start,end=panel.history.series['times'][0],panel.history.series['times'][-1]
+        panel.history.beginRangeSelection(panel.history.x_at(0),panel.history.box.center().y())
+        panel.history.selectionRelease(panel.history.x_at(len(panel.history.rows)-1),panel.history.box.center().y())
+        app.processEvents()
+        assert panel.dialog.host is not None
+        assert panel.exclusions.start.currentData()==start and panel.exclusions.end.currentData()==end
+        assert panel.dialog.host.grab().save(str(tmp_path/f'quota-modal-{width}.png'))
+        panel.dialog.reject();app.processEvents()
+        assert panel.history.state['manageExclusions']
         assert not host.qml_errors
     finally:
         dispose(host);shared_theme().configure('light')
@@ -110,100 +104,6 @@ def test_model_filter_combines_request_modes_without_assigning_account_usage():
     assert selected[0]['model_share']==50
     assert selected[0]['delta']==4
     assert intervals[0]['cost']==10
-
-
-@pytest.mark.parametrize('width,language,dark',[(1120,'ko',False),(520,'ko',False),(1120,'en',True),(520,'en',True)])
-@pytest.mark.integration
-def test_current_allowance_and_compact_reset_summary(tmp_path,width,language,dark):
-    from PySide6.QtCore import QPointF
-    from cachemonitor.i18n import set_language
-    from cachemonitor.quota_live import normalize_limits
-    app=QApplication.instance() or QApplication([])
-    set_language(language);shared_theme().configure('dark' if dark else 'light')
-    now=time.time()
-    quota=normalize_limits({'rateLimits':{'planType':'pro','secondary':None,
-        'primary':{'usedPercent':36,'windowDurationMins':10080,'resetsAt':now+600},
-        'credits':{'balance':'62500.0000000000','hasCredits':True,'unlimited':False}},
-        'rateLimitResetCredits':{'availableCount':12,'credits':[
-            {'status':'available','resetType':'codexRateLimits','grantedAt':now-86400,'expiresAt':now+i*86400}
-            for i in range(12,0,-1)]}},now,'synthetic')
-    panel=QuotaPanel(QSettings(str(tmp_path/'credits.ini'),QSettings.IniFormat))
-    panel.receive({'quota':quota,'report':{'cycles':[]}})
-    scroll=Scroll();scroll.put(fillViewport=True);scroll.setWidget(panel)
-    host=mount(scroll,width,900)
-    try:
-        QTest.qWait(80)
-        def position(node):return control(host,node).mapToScene(QPointF(0,0))
-        assert position(panel.current['five_hour']['card']).y()<position(panel.current['weekly']['card']).y()
-        assert position(panel.credit_card).y()>position(panel.current['weekly']['card']).y()
-        assert position(panel.credit_card).y()<position(panel.reset_card).y()
-        assert panel.current['five_hour']['value'].text()=='∞'
-        assert not panel.current['five_hour']['bar'].isVisible()
-        assert panel.credit_balance.text()=='62,500'
-        assert panel.reset_count.text()==('12개' if language=='ko' else '12 resets')
-        assert panel.reset_rows.isVisible()
-        assert not panel.reset_extra.isVisible() and not panel.reset_grants.isChecked()
-        assert panel.reset_more.text()==('+9개' if language=='ko' else '+9')
-        assert not panel.credit_note.isVisible() and not panel.reset_note.isVisible()
-        assert not any(item['granted'].isVisible() for item in panel.reset_items)
-        assert not any(item['status'].isVisible() for item in panel.reset_items)
-        from cachemonitor.quota_panel import reset_time
-        from PySide6.QtCore import QTimeZone
-        assert [item['expiry'].text() for item in panel.reset_items[:3]]==[
-            reset_time(now+i*86400,QTimeZone.systemTimeZone()).toString('MM/dd HH:mm') for i in (1,2,3)]
-        first_three=[control(host,item['card']) for item in panel.reset_items[:3]]
-        assert max(item.mapToScene(QPointF(0,0)).y() for item in first_three)-min(item.mapToScene(QPointF(0,0)).y() for item in first_three)<2
-        more=control(host,panel.reset_more)
-        assert position(panel.reset_more).y()<position(panel.reset_items[0]['card']).y()+first_three[0].height()
-        for item in panel.reset_items[:3]:
-            label=control(host,item['expiry'])
-            texts=[child for child in walk(label) if child.metaObject().indexOfProperty('contentWidth')>=0 and child.isVisible()]
-            assert texts and all(t.property('contentWidth')<=t.width()+1 for t in texts)
-        compact_height=control(host,panel.current_row).height()
-        assert host.grab().save(str(tmp_path/f'allowance-{width}-{language}.png'))
-        click(host,more)
-        assert panel.reset_extra.isVisible()
-        click(host,control(host,panel.reset_grants))
-        assert all(item['granted'].isVisible() for item in panel.reset_items)
-        panel.receive({'quota':quota});QTest.qWait(30)
-        assert panel.reset_more.isChecked() and panel.reset_grants.isChecked()
-        assert host.grab().save(str(tmp_path/f'resets-expanded-{width}-{language}.png'))
-        click(host,control(host,panel.reset_more))
-        click(host,control(host,panel.reset_grants))
-        assert abs(control(host,panel.current_row).height()-compact_height)<2
-        for count in (3,2,1):
-            short=dict(quota,reset_credits=dict(available_count=count,
-                credits=quota['reset_credits']['credits'][-count:]))
-            panel.receive({'quota':short});QTest.qWait(20)
-            assert not panel.reset_more.isVisible() and not panel.reset_extra.isVisible()
-            assert sum(item['column'].isVisible() for item in panel.reset_items)==count
-            assert abs(control(host,panel.current_row).height()-compact_height)<2
-        panel.receive({'quota':dict(quota,observed_at=now-100)})
-        assert panel.credit_balance.text()=='—'
-        assert panel.current['five_hour']['value'].text()=='—'
-        assert not panel.reset_rows.isVisible()
-        assert not panel.reset_more.isChecked() and not panel.reset_grants.isVisible()
-        assert not host.qml_errors
-    finally:dispose(host);set_language('ko');shared_theme().configure('light')
-
-
-def test_reset_dates_follow_system_timezone_on_refresh(tmp_path,monkeypatch):
-    from datetime import datetime
-    from PySide6.QtCore import QTimeZone
-    from cachemonitor.quota_panel import reset_zone_label
-    app=QApplication.instance() or QApplication([])
-    now=time.time()
-    stamp=datetime.fromisoformat('2026-10-23T05:23:00+09:00').timestamp()
-    panel=QuotaPanel(QSettings(str(tmp_path/'reset-timezone.ini'),QSettings.IniFormat))
-    panel.receive({'quota':dict(source='live',observed_at=now,reset_credits=dict(available_count=1,
-        credits=[dict(status='available',expires_at=stamp,granted_at=stamp-86400)]))})
-    for name,expected in [('Asia/Seoul','10/23 05:23'),('UTC','10/22 20:23'),('America/New_York','10/22 16:23')]:
-        zone=QTimeZone(name.encode())
-        monkeypatch.setattr(QTimeZone,'systemTimeZone',lambda z=zone:z)
-        panel.refresh_status()
-        assert panel.reset_items[0]['expiry'].text()==expected
-        assert reset_zone_label(zone) in panel.reset_zone.text()
-        assert panel.reset_zone.toolTip()==name
 
 
 @pytest.mark.parametrize('width,dark',[(520,False),(1120,True)])
@@ -226,16 +126,14 @@ def test_waiting_state_becomes_observed_zero_and_keeps_history_during_lookup_fai
         assert not panel.history.isVisible() and not panel.history_controls.isVisible()
         assert not panel.history_legend.isVisible() and not panel.conversion.isVisible()
         assert host.grab().save(str(tmp_path/f'한도수집대기_{width}.png'))
-        # A five-hour observation remains reachable before weekly usage exists.
+        # Five-hour allowances belong to the sidebar and cannot stand in
+        # for the weekly cost evidence this page is waiting for.
         panel.receive({'report':{'cycles':[],'history':[
             dict(at=100,used=0,window='five_hour',source='live')]}})
         QTest.qWait(40)
-        assert panel.history_controls.isVisible() and panel.history_empty.isVisible()
-        choice=control(host,panel.window);choice.forceActiveFocus()
-        QTest.keyClick(host.quick,Qt.Key_Down);QTest.qWait(40)
-        assert panel.history.isVisible() and panel.history.rows[0]['remaining']==100
+        assert not panel.history_controls.isVisible() and not panel.history_empty.isVisible()
+        assert not panel.history.isVisible() and not panel.history.rows
         assert panel.history_waiting.isVisible()
-        QTest.keyClick(host.quick,Qt.Key_Up);QTest.qWait(40)
         # A confirmed zero interval must not be mistaken for missing evidence.
         cycle=interval([(100,80),(130,80)],[(115,0)])
         report=report_for([cycle])
@@ -265,7 +163,7 @@ def test_cycle_selector_changes_graph_preserves_lifetime_and_selection_on_refres
         lifetime=panel.result.text()
         scroll.ensureWidgetVisible(panel.cycle_choice);QTest.qWait(40)
         choice=control(host,panel.cycle_choice);choice.forceActiveFocus()
-        QTest.keyClick(host.quick,Qt.Key_Up);QTest.qWait(40)
+        QTest.keyClick(host.quick,Qt.Key_Down);QTest.qWait(40)
         assert panel.cycle_choice.currentIndex()==2
         period=panel._view['periods'][1]
         assert panel.history.rows is period['series']['rows']
@@ -279,14 +177,13 @@ def test_cycle_selector_changes_graph_preserves_lifetime_and_selection_on_refres
         assert panel.result.text()==lifetime
         panel.set_history_period(time.time(),None)
         assert panel.result.text()==lifetime and panel.history.rows is period['series']['rows']
-        # The all-cycles entry keeps the fourth USD series while the percent
-        # axis changes to cumulative consumption. Check the real Quick scene.
+        # All cycles retain the three metrics and switch the percent axis to cumulative usage.
         panel.cycle_choice.setCurrentIndex(0)
         plot=render_plot(host,panel.history)
         assert panel.history.series is panel._view['overall']
         assert panel.history.series['cumulative']
-        assert len(panel.history.curves())==4
-        assert panel.remaining_legend.text()=='━ 누적 소모량 (%p)'
+        assert len(panel.history.curves())==3
+        assert '누적 사용량' in panel.remaining_legend.text() and '%p' in panel.remaining_legend.text()
         # The last cycle has a complete 99 -> 98 boundary, even though its
         # opening idle observation is hidden from the display.
         assert panel.history.series['completed_costs']==[None]*6+[pytest.approx(.0105),None]
@@ -294,8 +191,8 @@ def test_cycle_selector_changes_graph_preserves_lifetime_and_selection_on_refres
         plot.activateAt(panel.history.x_at(index),panel.history.box.center().y())
         QTest.qWait(30)
         from cachemonitor.pricing import usd
-        assert plot.detail['items'][0]['label']=='누적 소모량'
-        assert plot.detail['items'][3]['value']==usd(panel.history.series['completed_costs'][index])
+        assert next(item['label'] for item in plot.detail['items'] if item['metric']=='remaining')=='누적 사용량'
+        assert all(item['metric']!='completed_cost' for item in plot.detail['items'])
         assert host.grab().save(str(tmp_path/'quota-all-cycles.png'))
         assert not host.qml_errors
     finally:dispose(host)
@@ -303,7 +200,7 @@ def test_cycle_selector_changes_graph_preserves_lifetime_and_selection_on_refres
 
 @pytest.mark.parametrize('width,dark',[(520,False),(1120,True)])
 @pytest.mark.integration
-def test_legend_visibility_survives_refresh_and_updates_pinned_details(quota_page,width,dark):
+def test_legend_visibility_survives_refresh_and_updates_pinned_details(quota_page,tmp_path,width,dark):
     app,panel,scroll=quota_page
     shared_theme().configure('dark' if dark else 'light')
     host=mount(scroll,width,1000)
@@ -313,10 +210,16 @@ def test_legend_visibility_survives_refresh_and_updates_pinned_details(quota_pag
         series=chart.series
         plot.activateAt(chart.x_at(0),chart.box.center().y())
         toggle=panel.legend_toggles['cycle_cost']
-        click(host,render_plot(host,toggle));render_plot(host,chart)
+        legend=render_plot(host,toggle)
+        captions=[item for item in walk(legend) if item.isVisible() and item.metaObject().indexOfProperty('truncated')>=0]
+        assert captions and all(not item.property('truncated') for item in captions)
+        assert host.grab().save(str(tmp_path/f'legend-enabled-{width}.png'))
+        click(host,legend);render_plot(host,chart)
         assert chart.series is series
         assert not chart.visible('cycle_cost')
-        assert all(i['label']!='누적 구독 가치 환산액' for i in plot.detail['items'])
+        assert all(i['color']!='output' for i in plot.detail['items'])
+        render_plot(host,toggle)
+        assert host.grab().save(str(tmp_path/f'legend-hidden-{width}.png'))
         panel.render(automatic=True)
         assert not chart.visible('cycle_cost') and not toggle.isChecked()
         render_plot(host,toggle).forceActiveFocus();QTest.keyClick(host.quick,Qt.Key_Space)
@@ -326,9 +229,8 @@ def test_legend_visibility_survives_refresh_and_updates_pinned_details(quota_pag
         render_plot(host,chart)
         assert chart.curves()==[] and chart.box.width()>width*.7
         assert not chart.detail_for(0)['items']
-        panel.window.setCurrentIndex(1);render_plot(host,chart)
         assert panel.remaining_legend.isVisible()
-        assert not panel.legend_toggles['cycle_cost'].isVisible()
+        assert panel.legend_toggles['cycle_cost'].isVisible()
         panel.remaining_legend.setChecked(True);render_plot(host,chart)
         assert [c[0] for c in chart.curves()]==['remaining']
         assert not host.qml_errors
@@ -337,8 +239,26 @@ def test_legend_visibility_survives_refresh_and_updates_pinned_details(quota_pag
 
 @pytest.mark.parametrize('raw,expected', [('62500.0000000000','62,500'),('1234.5600000','1,234.56'),('0.000120000','0.00012'),('0.000000','0'),('1000','1,000')])
 def test_credit_balance_drops_only_trailing_fractional_zeros(raw,expected):
-    from cachemonitor.quota_panel import format_credit_balance
+    from cachemonitor.quota_sidebar import format_credit_balance
     from cachemonitor.quota_live import normalize_credits
     credits=normalize_credits({'balance':raw})
     assert format_credit_balance(credits['balance'])==expected
     assert credits['balance']==raw
+
+
+def test_current_quota_refresh_keeps_history_until_report_or_issue_changes(quota_page,monkeypatch):
+    _,panel,_=quota_page
+    rendered=[]
+    original=panel.render
+    def render(*args,**kwargs):
+        rendered.append(panel.report)
+        original(*args,**kwargs)
+    monkeypatch.setattr(panel,'render',render)
+    panel.history.cursor=0
+    quota={**panel.quota,'observed_at':panel.quota['observed_at']+1}
+    assert panel.receive(dict(home='h',quota=quota,report=panel.report))
+    assert panel.quota is quota and panel.history.cursor==0 and not rendered
+    assert panel.receive(dict(home='h',quota=quota,report=panel.report,issue='조회 지연'))
+    assert len(rendered)==1 and panel.status.text()=='조회 지연'
+    assert panel.receive(dict(home='h',quota=quota,report=dict(panel.report),issue='조회 지연'))
+    assert len(rendered)==2

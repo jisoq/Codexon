@@ -3,6 +3,9 @@
 import os
 import sys
 from pathlib import Path
+sys.path.insert(0, str(Path(SPECPATH).resolve()))
+from tools.build_native import checked_extension
+native_extension = checked_extension(Path(SPECPATH))
 if sys.platform == 'win32':
     os.environ['PATH'] = os.pathsep.join((str(Path(sys.executable).parent), sys.base_prefix,
         str(Path(os.environ['SystemRoot']) / 'System32'), os.environ['SystemRoot']))
@@ -13,7 +16,7 @@ if sys.platform == 'win32':
 a = Analysis(
     ['run.py'],
     pathex=[],
-    binaries=[],
+    binaries=[(str(native_extension), 'cachemonitor')],
     datas=[('cachemonitor/assets', 'cachemonitor/assets'), ('cachemonitor/qml', 'cachemonitor/qml')],
     hiddenimports=[],
     hookspath=[],
@@ -32,6 +35,7 @@ a = Analysis(
 if sys.platform == 'win32':
     roots = [Path(p).resolve() for p in (sys.prefix, sys.base_prefix, os.environ['SystemRoot'])]
     foreign = [source for _, source, kind in a.binaries if kind == 'BINARY'
+               and Path(source).resolve() != native_extension
                and not any(Path(source).resolve().is_relative_to(root) for root in roots)]
     if foreign:
         raise RuntimeError('Native dependencies escaped the build environment: ' + repr(foreign))

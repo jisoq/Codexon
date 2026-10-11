@@ -33,6 +33,38 @@ def test_equal_series_keeps_raster_but_adopts_new_data_and_changed_values_repain
     finally:dispose(host)
 
 
+def test_worker_digest_adopts_equal_history_without_scanning_and_repaints_changes():
+    import copy
+    import hashlib
+    import pickle
+    from cachemonitor.quota_view import prepare_series
+
+    class PreparedSeries(dict):
+        def __eq__(self,other):
+            raise AssertionError('A prepared worker history must not be scanned on the GUI thread')
+
+    def prepared(values):
+        series=prepare_series(values)
+        digest=hashlib.sha256(pickle.dumps(series,protocol=5)).hexdigest()
+        return PreparedSeries(series,_content_digest=digest)
+
+    app=QApplication.instance() or QApplication([])
+    chart=QuotaHistory();chart.set_series(prepared(rows()));host=mount(chart,1120,440)
+    try:
+        render_plot(host,chart);picture=chart._picture
+        incoming=PreparedSeries(copy.deepcopy(dict(chart.series)))
+        chart.set_series(incoming);app.processEvents();host.quick.grabFramebuffer()
+        assert chart._picture is picture and chart.series is incoming
+        assert chart.rows is incoming['rows']
+        assert chart.gap_lefts.series is incoming and chart.gap_rights.series is incoming
+        assert chart.index_at(chart.x_at(4),chart.box.center().y())==4
+        changed=rows();changed[4]['remaining']=42
+        chart.set_series(prepared(changed));app.processEvents();host.quick.grabFramebuffer()
+        assert chart._picture is not picture and chart.rows[4]['remaining']==42
+        assert not host.qml_errors
+    finally:dispose(host)
+
+
 @pytest.mark.parametrize('width,dark',[(1120,False),(520,False),(1120,True)])
 def test_fixed_width_gaps_exact_original_selection_and_duration(tmp_path,width,dark):
     app=QApplication.instance() or QApplication([])
@@ -41,6 +73,7 @@ def test_fixed_width_gaps_exact_original_selection_and_duration(tmp_path,width,d
     host=mount(chart,width,380)
     try:
         plot=render_plot(host,chart)
+        interaction_y=chart.row_boxes['remaining'].center().y()
         assert chart.gap_width==24
         assert chart.gap_rights[0]-chart.gap_lefts[0]==24
         assert chart.gap_rights[1]-chart.gap_lefts[1]==24
@@ -50,19 +83,19 @@ def test_fixed_width_gaps_exact_original_selection_and_duration(tmp_path,width,d
         assert chart.x_at(5)-chart.x_at(3)==pytest.approx(unit)
         assert chart.x_at(8)==pytest.approx(chart.box.right())
         for i in range(9):
-            assert chart.index_at(chart.x_at(i),chart.box.center().y())==i
+            assert chart.index_at(chart.x_at(i),interaction_y)==i
         gap_x=(chart.gap_lefts[0]+chart.gap_rights[0])/2
-        assert chart.index_at(gap_x,chart.box.center().y()) is None
-        assert '9시간 28분' in chart.tip_at(gap_x,chart.box.center().y())
+        assert chart.index_at(gap_x,interaction_y) is None
+        assert '9시간 28분' in chart.tip_at(gap_x,interaction_y)
         selected=[];chart.gap_selected.connect(selected.append)
         before=chart.cursor
-        click(host,plot,gap_x,chart.box.center().y())
+        click(host,plot,gap_x,interaction_y)
         assert selected and '9시간 28분' in selected[-1] and chart.cursor==before
-        plot.showTip(gap_x,chart.box.center().y())
+        plot.showTip(gap_x,interaction_y)
         assert '9시간 28분' in plot.tip
         plot.forceActiveFocus();QTest.keyClick(host.quick,Qt.Key_Escape)
         assert not plot.detail
-        click(host,plot,chart.x_at(4),chart.box.center().y())
+        click(host,plot,chart.x_at(4),interaction_y)
         assert chart.cursor==4
         plot.forceActiveFocus();QTest.keyClick(host.quick,Qt.Key_Left);QTest.keyClick(host.quick,Qt.Key_Left)
         assert chart.cursor==2

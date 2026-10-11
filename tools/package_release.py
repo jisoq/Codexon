@@ -9,7 +9,7 @@ import zipfile
 from pathlib import Path
 
 REQUIRED = {'Codexon.exe', 'CodexonRecovery.exe', 'build-manifest.json', 'LICENSE',
-            'THIRD-PARTY-NOTICES.md', 'BUNDLED-PYTHON.md', 'BUNDLED-QT.md', 'SOURCE-OFFER.md',
+            'THIRD-PARTY-NOTICES.md', 'BUNDLED-PYTHON.md', 'BUNDLED-QT.md', 'BUNDLED-RUST.md', 'SOURCE-OFFER.md',
             'USER-GUIDE.md', 'USER-GUIDE.ko.md'}
 MANIFEST_KEYS = {'product', 'version', 'commit', 'architecture', 'executable', 'sha256', 'recovery_sha256'}
 FORBIDDEN_NAMES = {'.env', 'config.toml', 'auth.json','codexonhook.exe'}
@@ -24,6 +24,8 @@ def payload(folder: Path):
     paths = sorted(path for path in folder.rglob('*') if path.is_file())
     if not REQUIRED <= {path.name for path in paths if path.parent == folder}:
         raise ValueError('Distribution is missing a required top-level file')
+    if not (folder/'_internal/cachemonitor/_cpu_native.pyd').is_file():
+        raise ValueError('Distribution is missing the required Rust CPU extension')
     for path in paths:
         if path.is_symlink():
             raise ValueError(f'Symlink in distribution: {path}')

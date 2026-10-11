@@ -9,6 +9,43 @@ from cachemonitor.quota_view import prepare_series, prepare_quota_view
 from cachemonitor.i18n import set_language
 
 
+def detail_value(detail,metric):
+    return next(item['value'] for item in detail['items'] if item['metric']==metric)
+
+
+def test_hover_and_selection_update_only_interaction_layer(qtbot):
+    from PySide6.QtCore import QObject
+    app=QApplication.instance() or QApplication([])
+    chart=QuotaHistory();chart.money=True
+    chart.set_rows(observations([(100,0),(99,5),(98,12)]))
+    host=mount(chart,560,760)
+    try:
+        plot=render_plot(host,chart)
+        plot.findChild(QObject,'plotHover').setProperty('enabled',False)
+        qtbot.waitUntil(lambda:plot._interaction_layer.paint_count>0)
+        plot.showTip(chart.x_at(0),chart.box.center().y())
+        render_plot(host,chart)
+        static=plot._static_paint_count;overlay=plot._interaction_layer.paint_count
+        plot.showTip(chart.x_at(1),chart.box.center().y())
+        qtbot.waitUntil(lambda:plot._interaction_layer.paint_count>overlay)
+        assert plot._static_paint_count==static
+        assert chart.legend_values()['cycle_cost']=='$5.00'
+        chart.set_exclusion_selection(1000,1010,True)
+        render_plot(host,chart)
+        static=plot._static_paint_count;overlay=plot._interaction_layer.paint_count
+        chart.selectionPress(chart.x_at(0),chart.box.center().y())
+        chart.selectionMove(chart.x_at(2),chart.box.center().y())
+        qtbot.waitUntil(lambda:plot._interaction_layer.paint_count>overlay)
+        assert plot._static_paint_count==static
+        chart.set_rows(observations([(100,0),(99,3)]))
+        assert not chart.detail_at(200,200) and not chart.tip_at(200,200)
+        assert chart.exclusion_selection is None and chart._selection_anchor is None
+        render_plot(host,chart)
+        assert chart.geometry_ready()
+        assert not host.qml_errors
+    finally:dispose(host)
+
+
 def test_zero_usage_bar_uses_its_padded_axis_position(tmp_path):
     from cachemonitor.charts import UsageTrend
     from PySide6.QtGui import QColor
@@ -34,7 +71,7 @@ def test_zero_usage_bar_uses_its_padded_axis_position(tmp_path):
 
 
 @pytest.mark.parametrize('width,dark,language',[(520,False,'ko'),(1120,True,'ko'),(520,True,'en')])
-def test_four_matching_axes_detail_pin_escape_and_gap_card(tmp_path,width,dark,language):
+def test_three_matching_axes_detail_pin_escape_and_gap_card(tmp_path,width,dark,language):
     app=QApplication.instance() or QApplication([])
     shared_theme().configure('dark' if dark else 'light')
     set_language(language)
@@ -52,39 +89,24 @@ def test_four_matching_axes_detail_pin_escape_and_gap_card(tmp_path,width,dark,l
         assert chart.completed_floor==pytest.approx(9.9)
         assert chart.completed_ceiling==pytest.approx(10.1)
         assert chart.box.width()>150
-        # The rendered axes and labels use the same palette as their curves.
-        picture=chart._picture;ratio=picture.devicePixelRatio()
-        from PySide6.QtGui import QColor
-        for token,left,right in (
-                ('completed',0,chart.box.left()-60),('cached',chart.box.left()-60,chart.box.left()),
-                ('output',chart.box.right(),chart.box.right()+82),('written',chart.box.right()+82,chart.width())):
-            expected=QColor(shared_theme().palette[token])
-            # Text glyphs are antialiased on a transparent QPicture surface.
-            # Compare their actual RGB color at strongly covered pixels; a
-            # Korean glyph need not contain a fully opaque pixel. Converting
-            # premultiplied channels back to RGB can round by 1-2 levels,
-            # as in the zero-usage marker check above.
-            assert any(picture.pixelColor(x,y).alpha()>=240 and
-                       max(abs(a-b) for a,b in zip(picture.pixelColor(x,y).getRgb()[:3],expected.getRgb()[:3]))<=2
-                       for x in range(round(left*ratio),round(right*ratio))
-                       for y in range(round(54*ratio))),token
-        assert chart.point(1,'completed_cost') is not None
-        assert chart.point(2,'completed_cost') is None
+        assert list(chart.row_boxes)==['cycle_value','remaining','cycle_cost']
+        for key,_,_,_ in chart.metric_definitions():
+            assert chart.row_boxes[key].left()==chart.box.left()
+            assert chart.row_boxes[key].right()==chart.box.right()
         assert chart._picture.save(str(tmp_path/f'axes-{width}-{dark}-{language}.png'))
         assert 0<chart.value_floor<1000
         assert chart.ceiling>1200
         assert chart.ceiling-chart.value_floor<400
         # Ten dollars now span their own cost scale, not the much larger weekly value scale.
-        assert chart.point(0,'cycle_cost').y()-chart.point(1,'cycle_cost').y()>chart.box.height()*.25
+        assert chart.point(0,'cycle_cost').y()-chart.point(1,'cycle_cost').y()>chart.row_boxes['cycle_cost'].height()*.25
         x=chart.x_at(1);y=chart.box.center().y()
         plot.showTip(x,y)
-        assert [item['label'] for item in plot.detail['items']]==['잔여량','누적 구독 가치 환산액','주간 동등 가치','완료 구간별 구독 가치 환산액']
-        assert [item['value'] for item in plot.detail['items']]==['89%','$10.00','$1,050.00','$10.00']
-        assert plot.detail['items'][3]['color']=='completed'
+        assert [item['color'] for item in plot.detail['items']]==['accent','muted','written','output']
+        assert [item['value'] for item in plot.detail['items']]==['$1,050.00','$1,200.00','89%','$10.00']
         assert not plot.detailPinned
         plot.clearHover();assert not plot.detail
         plot.activateAt(x,y);plot.clearHover();QTest.qWait(30)
-        assert plot.detailPinned and plot.detail['items'][2]['value']=='$1,050.00'
+        assert plot.detailPinned and detail_value(plot.detail,'cycle_value')=='$1,050.00'
         cards=[item for item in walk(host.quick.quickWindow().contentItem())
                if item.objectName()=='quotaDetailCard' and item.isVisible()]
         assert len(cards)==1
@@ -95,23 +117,20 @@ def test_four_matching_axes_detail_pin_escape_and_gap_card(tmp_path,width,dark,l
         assert position.y()+card.height()<=host.quick.height()
         values=[item for item in walk(card) if item.objectName()=='quotaDetailValue']
         assert len(values)==4
-        assert all(item.property('font')==values[0].property('font') for item in values)
-        completed=values[3]
-        assert completed.isVisible() and completed.property('text')=='$10.00'
+        reference_index=next(i for i,item in enumerate(plot.detail['items']) if item['metric']=='reference')
+        assert plot.detail['items'][reference_index]['subordinate']
+        assert values[reference_index].property('text')=='$1,200.00'
+        assert not values[reference_index].property('font').bold()
+        assert values[0].property('font').bold()
         assert not plot.detail['note']
         assert host.grab().save(str(tmp_path/f'compact-card-{width}-{dark}-{language}.png'))
         # A late cost correction updates a pinned record without selecting another time.
         corrected=[dict(r) for r in rows];corrected[1]['cycle_cost']=12
         chart.set_rows(corrected);QTest.qWait(40);host.quick.grabFramebuffer()
-        assert plot.detail['items'][1]['value']=='$12.00'
-        assert plot.detail['items'][3]['value']=='$8.00'
-        completed=[item for item in walk(card) if item.objectName()=='quotaDetailValue'][3]
-        assert completed.property('text')=='$8.00'
+        assert detail_value(plot.detail,'cycle_cost')=='$12.00'
         assert plot.detail['at']==rows[1]['at']
         plot.key(Qt.Key_End);QTest.qWait(30)
-        assert plot.detail['items'][0]['value']=='87%'
-        completed=[item for item in walk(card) if item.objectName()=='quotaDetailValue'][3]
-        assert plot.detail['items'][3]['value']=='—' and completed.isVisible() and completed.property('text')=='—'
+        assert detail_value(plot.detail,'remaining')=='87%'
         assert host.grab().save(str(tmp_path/f'current-card-{width}-{dark}-{language}.png'))
         plot.key(Qt.Key_Escape)
         assert not plot.detail
@@ -123,10 +142,53 @@ def test_four_matching_axes_detail_pin_escape_and_gap_card(tmp_path,width,dark,l
     finally:dispose(host);shared_theme().configure('light');set_language('ko')
 
 
+def test_hover_reuses_detail_rows_while_values_change(tmp_path):
+    """Inspecting another point must not destroy and rebuild the detail card."""
+    from PySide6.QtCore import QObject
+    app=QApplication.instance() or QApplication([])
+    chart=QuotaHistory();chart.money=True
+    chart.set_rows(observations([(100,0),(99,5),(98,12)]))
+    host=mount(chart,520,760)
+    try:
+        plot=render_plot(host,chart)
+        plot.findChild(QObject,'plotHover').setProperty('enabled',False)
+        plot.showTip(chart.x_at(0),chart.box.center().y())
+        app.processEvents();host.quick.grabFramebuffer()
+        card=next(item for item in walk(host.quick.quickWindow().contentItem())
+                  if item.objectName()=='quotaDetailCard' and item.isVisible())
+        values=[item for item in walk(card) if item.objectName()=='quotaDetailValue']
+        for index in (1,2,0):
+            plot.showTip(chart.x_at(index),chart.box.center().y())
+            app.processEvents();host.quick.grabFramebuffer()
+            current=[item for item in walk(card) if item.objectName()=='quotaDetailValue']
+            assert current==values
+            assert [item.property('text') for item in current]==[item['value'] for item in plot.detail['items']]
+        assert not host.qml_errors
+    finally:dispose(host)
+
+
 def observations(points):
     return [dict(at=1000+i*10,remaining=remaining,cycle_cost=cost,cycle_value=1000,
                  connect=bool(i),reset_kind=None,label=str(i))
             for i,(remaining,cost) in enumerate(points)]
+
+
+def test_detail_order_matches_graph_rows_after_hiding_and_restoring_a_metric(tmp_path):
+    app=QApplication.instance() or QApplication([])
+    chart=QuotaHistory();chart.money=True;chart.set_rows(observations([(90,0),(89,5),(88,8)]))
+    host=mount(chart,560,640)
+    try:
+        plot=render_plot(host,chart)
+        plot.activateAt(chart.x_at(1),chart.box.center().y())
+        expected=['cycle_value','remaining','cycle_cost']
+        for visible,order in ((True,expected),(False,[key for key in expected if key!='cycle_cost']),(True,expected)):
+            chart.set_series_visible('cycle_cost',visible)
+            render_plot(host,chart)
+            assert [item['metric'] for item in plot.detail['items']]==order
+            assert list(chart.row_boxes)==order
+        assert host.grab().save(str(tmp_path/'matching-detail-order-560.png'))
+        assert not host.qml_errors
+    finally:dispose(host)
 
 
 def test_completed_amount_covers_entire_plateau_and_waits_for_next_percent():
@@ -160,8 +222,8 @@ def test_completed_recorded_cost_survives_running_calls_and_unchanged_idle_gap()
     chart=QuotaHistory();chart.money=True;chart.set_rows(rows)
     assert chart.series['completed_costs']==[None,12,12,12,None,None]
     detail=chart.detail_for(2)
-    assert detail['items'][3]['value']=='$12.00'
-    assert [r['label'] for r in detail['items']]==['잔여량','누적 구독 가치 환산액','주간 동등 가치','완료 구간별 구독 가치 환산액']
+    assert all(item['metric']!='completed_cost' for item in detail['items'])
+    assert [r['color'] for r in detail['items']]==['accent','written','output']
     assert detail['note']==''
     # Turning tracking off or an unexplained cost increase still breaks evidence.
     rows[3]['tracking_continuous']=False
@@ -176,7 +238,7 @@ def test_period_and_all_cycles_keep_the_same_completed_amounts(tmp_path):
         interval([(100,100),(130,99),(160,99),(190,98)],[(115,5),(145,2),(175,5)]),
         interval([(220,100),(250,99),(280,98)],[(235,3),(265,4)])])
     view=prepare_quota_view(report)
-    assert [p['series']['completed_costs'] for p in view['periods']]==[[5,7,7,None],[3,4,None]]
+    assert [p['series']['completed_costs'] for p in view['periods']]==[[3,4,None],[5,7,7,None]]
     assert view['overall']['completed_costs']==[5,7,7,None,3,4,None]
     app=QApplication.instance() or QApplication([])
     chart=QuotaHistory();chart.money=True
@@ -184,15 +246,15 @@ def test_period_and_all_cycles_keep_the_same_completed_amounts(tmp_path):
     host=mount(chart,1120,450)
     try:
         for name,series,index,expected in (
-                ('first',view['periods'][0]['series'],1,'$7.00'),
-                ('second',view['periods'][1]['series'],1,'$4.00'),
-                ('all',view['overall'],5,'$4.00')):
+                ('first',view['periods'][1]['series'],1,7),
+                ('second',view['periods'][0]['series'],1,4),
+                ('all',view['overall'],5,4)):
             chart.set_series(series)
             plot=render_plot(host,chart)
             plot.activateAt(chart.x_at(index),chart.box.center().y());QTest.qWait(30)
-            assert plot.detail['items'][3]['value']==expected
-            assert chart.point(index,'completed_cost') is not None
-            assert plot.detail['items'][0]['label']==('누적 소모량' if name=='all' else '잔여량')
+            assert series['completed_costs'][index]==expected
+            assert all(item['metric']!='completed_cost' for item in plot.detail['items'])
+            assert detail_value(plot.detail,'remaining').endswith('%p' if name=='all' else '%')
             assert host.grab().save(str(tmp_path/f'completed-{name}.png'))
         assert not host.qml_errors
     finally:dispose(host)
@@ -303,7 +365,7 @@ def test_live_cost_correction_refreshes_hover_without_pointer_movement():
         plot=render_plot(host,chart)
         plot.findChild(QObject,'plotHover').setProperty('enabled',False)
         plot.showTip(chart.x_at(2),chart.box.center().y())
-        assert not plot.detailPinned and plot.detail['items'][1]['value']=='$20.00'
+        assert not plot.detailPinned and detail_value(plot.detail,'cycle_cost')=='$20.00'
         app.processEvents();host.quick.grabFramebuffer()
         values=[item for item in walk(host.quick.quickWindow().contentItem())
                 if item.objectName()=='quotaDetailValue' and item.isVisible()]
@@ -315,6 +377,6 @@ def test_live_cost_correction_refreshes_hover_without_pointer_movement():
         corrected=[dict(r) for r in rows];corrected[2]['cycle_cost']=23
         chart.set_rows(corrected);app.processEvents();host.quick.grabFramebuffer()
         assert plot.detail['at']==rows[2]['at']
-        assert plot.detail['items'][1]['value']=='$23.00'
+        assert detail_value(plot.detail,'cycle_cost')=='$23.00'
         assert not plot.detailPinned and not host.qml_errors
     finally:dispose(host)

@@ -1,45 +1,29 @@
 from .tooltips import TEXT as TIPS
-"""Current reported allowance and auditable weekly local-call conversion."""
+"""Auditable weekly cycle cost tracking from local calls."""
 from datetime import datetime
-from decimal import Decimal
 import math
 import os
 from pathlib import Path
 import time
 
-from PySide6.QtCore import Qt, QTimer, Signal, QRectF, QPointF, QDateTime, QTimeZone
-from PySide6.QtGui import QColor, QPen, QPolygonF
+from PySide6.QtCore import Qt, Signal, Slot
 from .presentation import Button, Choice, Column, Group, Row, Text, Toggle
 from .table_model import Cell, Header, Table
 from .pricing import usd
 from .workload import call_count
-from .quota import quota_display
-from .banked_resets import reset_credit_display
 from .quota_cycles import quota_statistics, quota_value_history
-from .quota_tracking import ResetTracker, RESET_NAMES, OBSERVATION_FRESHNESS
-from .charts import Plot
+from .quota_tracking import RESET_NAMES
 from .lazy_table import LazyTable
 from .quota_share import share_label, share_color_key
-from .theme import shared_theme
+from .quota_exclusion_controls import QuotaExclusions
 from .ui_details import Details
 from .i18n import formatted
 
 
-from .quota_view import clock, history_rows, prepare_quota_view, prepare_series, observation_label
+from .quota_view import clock, history_rows, prepare_quota_view, prepare_series, observation_label, model_cost_intervals
 
 def home_key(value):
     return os.path.normcase(str(Path(value).resolve())) if value else None
-
-
-def reset_time(stamp, zone):
-    return QDateTime.fromSecsSinceEpoch(int(stamp),zone) if stamp else None
-
-
-def reset_zone_label(zone):
-    name=bytes(zone.id()).decode('utf-8')
-    if name=='Asia/Seoul':return 'KST (UTC+09:00)'
-    if name in ('UTC','Etc/UTC','Etc/GMT'):return 'UTC'
-    return name.replace('_',' ')
 
 
 def remaining_axis(rows):
@@ -48,65 +32,13 @@ def remaining_axis(rows):
     return low,high,(high-low)/4
 
 
-def model_cost_intervals(intervals, selected_model):
-    """Keep account consumption separate from one model's known API cost."""
-    if selected_model is None:
-        return intervals
-    result=[]
-    for interval in intervals:
-        models=[row for row in interval['models']
-                if row.get('model')==selected_model and not row.get('separate')]
-        if not models:
-            continue
-        known=[row['cost'] for row in models if row['cost'] is not None]
-        cost=sum(known) if known else None
-        whole=interval['cost']
-        calls=sum(row['calls'] for row in models)
-        priced=sum(row.get('priced',row['calls']) for row in models)
-        total_calls=interval.get('calls',sum(row['calls'] for row in interval['models'] if not row.get('separate')))
-        complete=priced==calls and interval.get('priced_calls',total_calls)>=total_calls
-        result.append({**interval,
-                       'model_filter':selected_model,
-                       'model_cost':cost,
-                       'model_share':cost/whole*100 if complete and cost is not None and whole is not None and whole>0 else None,
-                       'model_calls':calls,
-                       'model_priced':priced})
-    return result
-
-
-class QuotaBar(Plot):
-    def __init__(self):
-        super().__init__()
-        self.setFixedHeight(8)
-        self.setFocusPolicy(Qt.NoFocus)
-        self.empty_text=''
-        self.remaining=None
-        shared_theme().changed.connect(self.update)
-
-    def set_value(self,value):
-        self.remaining=value
-        self.update()
-
-    def paint(self,painter):
-        palette=shared_theme().palette
-        p=self.base()
-        p.fillRect(self.rect(),QColor(palette['surface']))
-        rect=QRectF(0,0,self.width(),6)
-        p.fillRect(rect,QColor(palette['secondary']))
-        if self.remaining is not None:
-            p.fillRect(QRectF(0,0,self.width()*self.remaining/100,6),QColor(palette['accent']))
-
-
 from .quota_chart import QuotaHistory
-
-
-def format_credit_balance(balance):
-    text=format(Decimal(balance),',f')
-    return text.rstrip('0').rstrip('.') if '.' in text else text
 
 
 class QuotaPanel(Group):
     home_selected=Signal(str)
+    exclusion_requested=Signal(object)
+    exclusion_restore_requested=Signal(str)
 
     def __init__(self,settings):
         super().__init__()
@@ -121,6 +53,10 @@ class QuotaPanel(Group):
         self.page_index=0
         self.page_size=25
         self.expected_home=None
+        self._query_worker=None
+        self._query_cache={}
+        self._query_pending=None
+        self._prepared_query=None
         layout=Column(self)
         layout.setContentsMargins(0,0,0,0)
         layout.setSpacing(20)
@@ -128,72 +64,8 @@ class QuotaPanel(Group):
         self.home_choice.hide()
         self.home_choice.currentIndexChanged.connect(self.choose_home)
         layout.addWidget(self.home_choice)
-        heading=Row();heading.setSpacing(12);heading.setMinimumHeight(24)
-        title=Text('현재 잔여량');title.put(fontSize=18,bold=True)
-        heading.addWidget(title,1)
-        self.sample_summary=Text();self.sample_summary.put(fontSize=12,color='muted')
-        heading.addWidget(self.sample_summary)
-        remaining_card=Group();remaining_card.put(background='surface',radius=6,border='border')
-        remaining_layout=Column(remaining_card);remaining_layout.setContentsMargins(20,16,20,16);remaining_layout.setSpacing(16)
-        remaining_layout.addLayout(heading)
-        layout.addWidget(remaining_card)
-        self.status=Text()
-        self.status.put(color='error',fontSize=13,wrap=False);self.status.setFixedHeight(24)
-        heading.addWidget(self.status,1)
-        self.current_row=Group();self.current_row.put(background='surface',radius=6,border='border')
-        current=Column(self.current_row);current.setContentsMargins(18,12,18,10);current.setSpacing(12)
-        self.current={}
-        for mode,name in (('five_hour','5시간'),('weekly','주간')):
-            card=Group()
-            row=Row(card);row.setSpacing(16)
-            label=Text(name);label.put(fontSize=14,color='muted');label.setFixedWidth(60)
-            value=Text('—');value.put(fontSize=36,bold=True,noElide=True);value.setFixedWidth(130)
-            bar=QuotaBar()
-            evidence=Text();evidence.put(fontSize=13,color='muted',wrap=True)
-            detail=Column();detail.setSpacing(8);detail.addWidget(bar);detail.addWidget(evidence)
-            row.addWidget(label);row.addWidget(value);row.addLayout(detail,1)
-            remaining_layout.addWidget(card)
-            self.current[mode]={'card':card,'value':value,'bar':bar,'evidence':evidence}
-        self.credit_card=Group();self.credit_card.put(style='preferenceRow')
-        credit_layout=Row(self.credit_card);credit_layout.setContentsMargins(0,0,0,12);credit_layout.setSpacing(14)
-        credit_title=Text('크레딧 잔액');credit_title.put(fontSize=13,color='muted')
-        self.credit_balance=Text('—');self.credit_balance.put(fontSize=23,bold=True,noElide=True)
-        self.credit_note=Text();self.credit_note.put(fontSize=12,color='muted',wrap=True)
-        credit_expiry=Text('만료일 정보 미제공');credit_expiry.put(fontSize=12,color='muted',wrap=True)
-        credit_expiry.setAlignment(Qt.AlignRight)
-        for node in (credit_title,self.credit_balance,self.credit_note):credit_layout.addWidget(node)
-        credit_layout.addWidget(credit_expiry,1)
-        current.addWidget(self.credit_card)
-        self.reset_card=Group()
-        reset_layout=Column(self.reset_card);reset_layout.setSpacing(8)
-        reset_heading=Row();reset_heading.setSpacing(10)
-        reset_title=Text('사용 초기화권');reset_title.put(fontSize=14,bold=True)
-        self.reset_count=Text('—');self.reset_count.put(fontSize=18,bold=True,noElide=True)
-        reset_heading.addWidget(reset_title);reset_heading.addWidget(self.reset_count);reset_heading.addStretch()
-        self.reset_grants=Button('지급 정보 보기');self.reset_grants.put(role='quiet',fontSize=12)
-        self.reset_grants.setCheckable(True);self.reset_grants.setFixedHeight(28)
-        self.reset_grants.toggled.connect(self.render_reset_rows)
-        reset_heading.addWidget(self.reset_grants);reset_layout.addLayout(reset_heading)
-        self.reset_zone=Text();self.reset_zone.put(fontSize=11,color='muted',wrap=True);reset_layout.addWidget(self.reset_zone)
-        self.reset_note=Text();self.reset_note.put(fontSize=13,color='muted',wrap=True)
-        reset_layout.addWidget(self.reset_note)
-        self.reset_rows=Row();self.reset_rows.setSpacing(8)
-        self.reset_primary=Row();self.reset_primary.put(collapseBelow=1,columns=3);self.reset_primary.setSpacing(12)
-        self.reset_rows.addLayout(self.reset_primary,1)
-        self.reset_more=Button();self.reset_more.put(role='quiet',fontSize=12)
-        self.reset_more.setFixedWidth(64);self.reset_more.setFixedHeight(28);self.reset_more.setCheckable(True)
-        self.reset_more.toggled.connect(self.render_reset_rows)
-        self.reset_rows.addWidget(self.reset_more)
-        reset_layout.addLayout(self.reset_rows)
-        self.reset_extra=Row();self.reset_extra.put(collapseBelow=1,columns=3);self.reset_extra.setSpacing(12)
-        reset_layout.addLayout(self.reset_extra)
-        self._reset_rows=[];self.reset_items=[]
-        self.render_reset_rows()
-        current.addWidget(self.reset_card)
-        layout.addWidget(self.current_row)
-        self.current_empty=Text('한도를 조회하고 있습니다')
-        self.current_empty.put(color='muted',fontSize=14)
-        layout.addWidget(self.current_empty)
+        self.status=Text();self.status.put(color='error',fontSize=13,wrap=True)
+        self.status.hide();layout.addWidget(self.status)
         scope=Row();scope.put(flow=True);scope.setSpacing(12)
         scope.addWidget(Text('상세 내역 조회 기간'))
         self.period=Choice()
@@ -213,38 +85,47 @@ class QuotaPanel(Group):
         waiting_note.put(fontSize=14,color='muted',wrap=True)
         waiting_layout.addWidget(waiting_title);waiting_layout.addWidget(waiting_note)
         chart_layout.addWidget(self.history_waiting)
-        headline=self.summary_heading=Text('주간 사용량 구독 가치 / 전체 누적');headline.put(fontSize=15,bold=True)
+        headline=self.summary_heading=Text('전체 기록과 모델 기준 100% 환산 추정액');headline.put(fontSize=15,bold=True)
         chart_layout.addWidget(headline)
-        self.result=Text();self.result.setToolTip(TIPS["quota_total"]);self.result.put(fontSize=34,bold=True,noElide=True)
+        self.result=Text();self.result.setToolTip(TIPS["quota_total"]);self.result.put(fontSize=22,bold=True,noElide=True)
         chart_layout.addWidget(self.result)
         self.lifetime_basis=Text();self.lifetime_basis.put(fontSize=12,color='muted',wrap=True)
         chart_layout.addWidget(self.lifetime_basis)
         controls=self.history_controls=Row();controls.setSpacing(12)
         self.chart_title=chart_title=Text('선택 주기의 사용량 추이');chart_title.put(fontSize=18,bold=True)
         controls.addWidget(chart_title,1)
-        self.window=Choice();self.window.addItem('주간','weekly');self.window.addItem('5시간','five_hour')
-        self.window.setAccessibleName('한도 이력 종류');controls.addWidget(self.window)
         chart_layout.addLayout(controls)
         self.cycle_choice=Choice();self.cycle_choice.setAccessibleName('사용량 리셋 주기 선택')
-        chart_layout.addWidget(self.cycle_choice)
+        self.exclusions=QuotaExclusions()
+        self.exclusions.requested.connect(self.exclusion_requested.emit)
+        self.exclusions.restore_requested.connect(self.exclusion_restore_requested.emit)
+        cycle_controls=Row();cycle_controls.put(flow=True);cycle_controls.setSpacing(8)
+        cycle_controls.addWidget(self.cycle_choice,1)
+        for button in (self.exclusions.toggle,self.exclusions.history_toggle):
+            button.put(fontSize=12,height=30,flat=True)
+            cycle_controls.addWidget(button)
+        chart_layout.addLayout(cycle_controls)
         self.cycle_value=Text();self.cycle_value.setToolTip(TIPS["quota_cycle"]);self.cycle_value.put(fontSize=22,bold=True,wrap=True)
         chart_layout.addWidget(self.cycle_value)
         self.cycle_basis=Text();self.cycle_basis.put(fontSize=12,color='muted',wrap=True)
         chart_layout.addWidget(self.cycle_basis)
         self.history=QuotaHistory()
         self.history.selected.connect(self.select_observation)
-        self.history_legend=Row();self.history_legend.put(flow=True,alignRight=True);self.history_legend.setSpacing(16)
+        self.history.range_selected.connect(self.exclusions.select_range)
+        self.exclusions.selection_changed.connect(self.history.set_exclusion_selection)
+        chart_layout.addWidget(self.exclusions)
+        self.history_legend=Row();self.history_legend.put(flow=True);self.history_legend.setSpacing(16)
         self.legend_toggles={}
-        for name,color in (('━ 잔여량 / %','cached'),('━ 누적 구독 가치 환산액 / USD','output'),
-                           ('━ 완료 구간별 구독 가치 환산액 / USD','completed'),
-                           ('┄ 주간 동등 가치 (USD)','written'),('╌ 전체 누적 기준 (USD)','accent')):
-            key={'cached':'remaining','output':'cycle_cost','completed':'completed_cost','written':'cycle_value','accent':'reference'}[color]
-            legend=Toggle(name);legend.setChecked(True)
+        for key,name,color in (('cycle_value','주간 예상 가치','accent'),
+                               ('remaining','남은 사용량','written'),
+                               ('cycle_cost','누적 측정 환산액','output')):
+            legend=Button(name);legend.setCheckable(True);legend.setChecked(True)
             legend.toggled.connect(lambda visible,k=key:self.history.set_series_visible(k,visible))
             self.legend_toggles[key]=legend
-            if key in ("completed_cost","cycle_value","reference"):legend.setToolTip(TIPS[{"completed_cost":"interval","cycle_value":"quota_cycle","reference":"quota_total"}[key]])
-            legend.put(fontSize=12,color=color);self.history_legend.addWidget(legend)
-            if name.startswith('━ 잔여량'):self.remaining_legend=legend
+            if key=="cycle_value":legend.setToolTip(TIPS["quota_cycle"])
+            legend.put(fontSize=12,flat=True,legendColor=color,legendDashed=key=='reference',activateOnReturn=True)
+            self.history_legend.addWidget(legend)
+            if key=='remaining':self.remaining_legend=legend
         self.reset_legend=Text('◆ 사용량 리셋');self.reset_legend.put(fontSize=12,color='muted')
         self.history_legend.addWidget(self.reset_legend)
         chart_layout.addLayout(self.history_legend)
@@ -253,6 +134,8 @@ class QuotaPanel(Group):
         chart_layout.addWidget(self.history_empty)
         self.model_legend=Row();self.model_legend.put(flow=True);self.model_legend.setSpacing(16)
         chart_layout.addLayout(self.model_legend)
+        chart_layout.addWidget(self.exclusions.history)
+        chart_layout.addWidget(self.exclusions.message)
         self.cycle_choice.currentIndexChanged.connect(self.render_history)
         layout.addWidget(chart)
         self.conversion=Group();self.conversion.put(background='surface',radius=6)
@@ -306,12 +189,13 @@ class QuotaPanel(Group):
         detail_layout.addWidget(self.table)
         self.interval_filter.currentIndexChanged.connect(self.change_interval_filter)
         self.intervals.itemSelectionChanged.connect(self.select_interval)
-        self.window.currentIndexChanged.connect(self.render_history)
         self.period.currentIndexChanged.connect(self.change_period)
         self.model_choice.currentIndexChanged.connect(self.change_model)
         self.mode_assumption.toggled.connect(self.render)
         layout.addStretch()
         self.render()
+        from .quota_layout import configure_quota_layout
+        configure_quota_layout(self)
 
     def set_homes(self,homes):
         selected=self.home_choice.currentData() or self.report.get('home')
@@ -337,121 +221,26 @@ class QuotaPanel(Group):
         if self.expected_home and (home_key(incoming_home)!=self.expected_home):
             return False
         if incoming_home:self.expected_home=home_key(incoming_home)
+        previous_report,previous_issue,previous_quota=self.report,self.issue,self.quota
         self.quota=value.get('quota');self.issue=value.get('issue','')
         if 'report' in value:self.report=value['report'] or {'cycles':[]}
-        if getattr(self,'defer_render',False):self._render_dirty=True
-        else:self.render(automatic=True)
+        if value.get('exclusion_result'):
+            self.exclusions.receive_result(value['exclusion_result'])
+            if value['exclusion_result'].get('ok') and getattr(self,'dialog',None) and self.dialog.host:self.dialog.reject()
+        if getattr(self,'defer_render',False):
+            if (self.report is not previous_report or self.issue!=previous_issue
+                    or self.quota is not previous_quota or value.get('exclusion_result')):
+                self._render_dirty=True
+            return True
+        if (self.report is previous_report and self.issue==previous_issue
+                and not value.get('exclusion_result') and not getattr(self,'_render_dirty',False)):
+            return True
+        self.render(automatic=True)
         return True
-
-    def render_reset_rows(self,*_):
-        rows=self._reset_rows
-        zone=QTimeZone.systemTimeZone()
-        self.reset_rows.setVisible(bool(rows));self.reset_zone.setVisible(bool(rows))
-        self.reset_grants.setVisible(bool(rows))
-        self.reset_grants.setText('지급 정보 접기' if self.reset_grants.isChecked() else '지급 정보 보기')
-        remaining=max(0,len(rows)-3)
-        self.reset_more.setVisible(remaining>0)
-        self.reset_more.setText('접기' if self.reset_more.isChecked() else formatted('+{count}개',count=f'{remaining:,}'))
-        self.reset_more.setAccessibleName('추가 초기화권 접기' if self.reset_more.isChecked() else
-                                         formatted('추가 초기화권 {count}개 보기',count=f'{remaining:,}'))
-        self.reset_extra.setVisible(remaining>0 and self.reset_more.isChecked())
-        while len(self.reset_items)<max(3,len(rows)):
-            card=Group();card.put(background='secondary',radius=4)
-            column=Column(card);column.setContentsMargins(8,6,8,6);column.setSpacing(3)
-            label=Text();label.put(fontSize=11,color='muted')
-            expiry=Text();expiry.put(fontSize=18,bold=True,noElide=True)
-            granted=Text();granted.put(fontSize=11,color='muted',wrap=True)
-            status=Text();status.put(fontSize=11,color='muted',wrap=True)
-            for node in (label,expiry,granted,status):column.addWidget(node)
-            target=self.reset_primary if len(self.reset_items)<3 else self.reset_extra
-            target.addWidget(card,1)
-            self.reset_items.append(dict(card=card,column=column,label=label,expiry=expiry,granted=granted,status=status))
-        years=set()
-        for index,item in enumerate(self.reset_items):
-            exists=index<len(rows)
-            item['card'].setVisible(index<3 or exists)
-            item['card'].put(background='secondary' if exists else 'transparent')
-            item['column'].setVisible(exists)
-            if not exists:continue
-            row=rows[index]
-            expiry=reset_time(row.get('expires_at'),zone);granted=reset_time(row.get('granted_at'),zone)
-            for value in (expiry,granted):
-                if value:years.add(value.date().year())
-            item['label'].setText('가장 빠른 만료' if index==0 and row.get('status')=='available' and expiry else '만료')
-            item['expiry'].setText(expiry.toString('MM/dd HH:mm') if expiry else '정보 미제공')
-            item['expiry'].setToolTip(expiry.toString('yyyy/MM/dd HH:mm tttt') if expiry else '만료일 정보 미제공')
-            item['granted'].setText(formatted('지급 {date}',date=granted.toString('MM/dd HH:mm') if granted else '—'))
-            item['granted'].setVisible(self.reset_grants.isChecked())
-            status={'available':'','redeemed':'사용 완료','consumed':'사용 완료','expired':'만료됨'}.get(row.get('status'),'상태 미제공')
-            item['status'].setText(status);item['status'].setVisible(bool(status))
-        zone_name=reset_zone_label(zone)
-        self.reset_zone.setText(formatted('{years}년, {zone}',years=', '.join(map(str,sorted(years))),zone=zone_name)
-                                if years else zone_name)
-        self.reset_zone.setToolTip(bytes(zone.id()).decode('utf-8'))
 
     def refresh_status(self):
         if getattr(self,'_render_dirty',False):
-            self._render_dirty=False;self.render(automatic=True);return
-        home=self.report.get('home')
-        self.status.setText(self.issue)
-        self.status.setVisible(bool(self.issue))
-        now=time.time()
-        quota=self.quota
-        resets=reset_credit_display(quota,now)
-        self.reset_count.setText(resets['count'])
-        if resets['count']!='—':
-            self.reset_count.setText(formatted('{count}개',count=f"{quota['reset_credits']['available_count']:,}"))
-        observed=(quota or {}).get('observed_at',0)
-        fresh=bool(observed and 0<=now-observed<90 and (quota or {}).get('source')=='live')
-        credits=(quota or {}).get('credits') or {}
-        balance=credits.get('balance')
-        self.credit_balance.setText('∞' if fresh and credits.get('unlimited') else
-                                   format_credit_balance(balance) if fresh and balance is not None else '—')
-        self.credit_balance.setToolTip('제한 없음' if fresh and credits.get('unlimited') else '크레딧 잔액')
-        self.credit_note.setText(('보유 크레딧 없음' if balance is not None and Decimal(balance)==0 else '')
-                                 if fresh and (balance is not None or credits.get('unlimited')) else
-                                 '조회 갱신 대기' if credits else '크레딧 정보 미제공')
-        self.credit_note.setVisible(bool(self.credit_note.text()))
-        rows=((quota or {}).get('reset_credits') or {}).get('credits') or []
-        self._reset_rows=sorted(rows,key=lambda row:row.get('expires_at') or float('inf')) if fresh else []
-        note='\n'.join(line for line in resets['note'].splitlines()
-                       if not line.startswith(('가장 빠른 만료 ','확인된 만료 ')))
-        self.reset_note.setText(note.replace(chr(183),' / '));self.reset_note.setVisible(bool(note))
-        if len(self._reset_rows)<=3:self.reset_more.setChecked(False)
-        self.render_reset_rows()
-        available=set((quota or {}).get('windows',{})) | set((quota or {}).get('unlimited_windows',[])) | set((quota or {}).get('window_conflicts',[]))
-        self.current_row.setVisible(True)
-        self.current_empty.setVisible(not available and not self.issue)
-        tracking=self.report.get('tracking')
-        observed=(quota or {}).get('observed_at')
-        state='수집 중' if tracking and tracking.get('enabled') else '수집 중지' if tracking else ''
-        updated=('방금 갱신' if now-observed<60 else f'{int(max(0,now-observed)//60)}분 전 갱신') if observed else ''
-        self.sample_summary.setText(' / '.join(s for s in (state,updated) if s))
-        for mode,card in self.current.items():
-            # Missing windows are not a numeric limit, an error, or unlimited.
-            card['card'].setVisible(True)
-            display=quota_display(quota,mode,now)
-            remaining=display['remaining']
-            card['value'].setText(f'{remaining:.1f}%' if remaining is not None else
-                                  '∞' if display['state']=='제한 없음' else '—')
-            card['value'].setToolTip(display['tooltip'])
-            card['bar'].set_value(remaining)
-            card['bar'].setVisible(remaining is not None)
-            window=(quota or {}).get('windows',{}).get(mode,{})
-            evidence=[]
-            reset=window.get('resets_at')
-            if reset:
-                seconds=max(0,reset-now)
-                days=int(seconds//86400);hours=int(seconds%86400//3600);minutes=int(seconds%3600//60)
-                duration=(formatted('{days}일 {hours}시간',days=days,hours=hours) if days else
-                          formatted('{hours}시간 {minutes}분',hours=hours,minutes=minutes) if hours else
-                          formatted('{minutes}분',minutes=minutes) if minutes else formatted('1분 미만'))
-                evidence.append(f'정기 초기화까지 {duration}\n{clock(reset)}' if reset>now else '다음 정기 초기화 시각 갱신 중')
-            if display['state']=='제한 없음':evidence.append('Pro 요금제' if (quota or {}).get('plan_type')=='pro' else '제한 없음')
-            elif remaining is None:evidence.append(display['state'])
-            if remaining is None and mode in (quota or {}).get('windows',{}) and display['state']=='미확인':
-                evidence.append('최근 한도 조회가 갱신되지 않았습니다')
-            card['evidence'].setText('\n'.join(evidence))
+            self._render_dirty=False;self.render(automatic=True)
 
     def change_period(self,*_):
         days=self.period.currentData()
@@ -468,7 +257,6 @@ class QuotaPanel(Group):
 
     def render_history(self,*_):
         from bisect import bisect_left
-        weekly=self.window.currentData()=='weekly'
         if getattr(self,'_value_report',None) is not self.report:
             had_periods=bool(getattr(self,'_view',{}).get('periods'))
             self._view=self.report.get('view') or prepare_quota_view(self.report)
@@ -480,8 +268,11 @@ class QuotaPanel(Group):
                 self.cycle_choice.blockSignals(True);self.cycle_choice.clear()
                 for label,start in choices:self.cycle_choice.addItem(label,start)
                 index=self.cycle_choice.findData(selected)
-                self.cycle_choice.setCurrentIndex(index if index>=0 else self.cycle_choice.count()-1)
+                self.cycle_choice.setCurrentIndex(index if index>=0 else min(1,self.cycle_choice.count()-1))
                 self.cycle_choice.blockSignals(False)
+            periods={period['start']:period for period in self._view['periods']}
+            self.cycle_choice._items=[dict(item,ink='accent' if periods.get(item['value'],{}).get('current') else 'ink') for item in self.cycle_choice._items]
+            self.cycle_choice.put(items=list(self.cycle_choice._items))
         index=self.cycle_choice.currentIndex()
         all_cycles=index==0
         lifetime=self._view['lifetime']
@@ -489,17 +280,18 @@ class QuotaPanel(Group):
                      priced_calls=lifetime['observed_priced_calls'],calls=lifetime['observed_calls'],
                      value=lifetime['per_percent']*100 if lifetime['per_percent'] is not None else None)
                 if all_cycles else self._view['periods'][index-1] if index>0 else None)
-        series=(period['series'] if period else prepare_series([])) if weekly else self._view['five_hour']
+        series=period['series'] if period else prepare_series([])
         old=self.history.rows[self.history.cursor]['at'] if self.history.rows else None
-        same=getattr(self,'_selected_cycle',None)==(weekly,period['start'] if period else None)
+        same=getattr(self,'_selected_cycle',None)==(period['start'] if period else None)
         follow=not self.history.rows or self.history.cursor==len(self.history.rows)-1
-        self._selected_cycle=(weekly,period['start'] if period else None)
-        self.history.money=weekly;self.history.reference=self.lifetime_value
-        self.history.empty_text='표시할 사용 기록이 없습니다' if weekly else '수집된 잔여량이 없습니다'
-        self.chart_title.setText('전체 사용량 추이' if weekly and all_cycles else '선택 주기의 사용량 추이' if weekly else '5시간 잔여량 추이')
-        self.remaining_legend.setText('━ 누적 소모량 (%p)' if weekly and all_cycles else '━ 잔여량 (%)')
-        self.reset_legend.setVisible(weekly and all_cycles)
+        self._selected_cycle=(period['start'] if period else None)
+        self.history.money=True;self.history.reference=self.lifetime_value
+        self.history.empty_text='표시할 사용 기록이 없습니다'
+        self.chart_title.setText('전체 사용량 추이' if all_cycles else '선택 주기의 사용량 추이')
+        self.remaining_legend.setText('누적 사용량 (%p)' if all_cycles else '남은 사용량 (%)')
+        self.reset_legend.setVisible(all_cycles)
         self.history.set_series(series)
+        self.history.legendChanged.emit(self.history.legend_values())
         models=series.get('model_share',{}).get('models',[])
         if getattr(self,'_legend_models',None)!=models:
             self._legend_models=list(models)
@@ -511,9 +303,9 @@ class QuotaPanel(Group):
                 self.model_legend.addWidget(label)
             for name in ('━ 비용 증가 없음','▧ 미확인'):
                 label=Text(name);label.put(fontSize=12,color='muted');self.model_legend.addWidget(label)
-        self.model_legend.setVisible(weekly and bool(self.history.rows))
+        self.model_legend.setVisible(bool(self.history.rows))
         rows=self.history.rows
-        any_history=bool(self._view['overall']['rows'] or self._view['five_hour']['rows'] or
+        any_history=bool(self._view['overall']['rows'] or
                          any(item['series']['rows'] for item in self._view['periods']))
         self.history_controls.setVisible(any_history)
         self.history_legend.setVisible(bool(rows))
@@ -522,31 +314,87 @@ class QuotaPanel(Group):
         self.history_empty.setVisible(any_history and not rows)
         self.history.cursor=(len(rows)-1 if rows and (follow or not same) else
                              min(bisect_left(series['times'],old),len(rows)-1) if rows and old is not None else 0)
+        self.exclusions.set_context(self.report,period,True,cursor=self.history.cursor)
+        if hasattr(self,'sync_dialog'):self.sync_dialog()
         if rows:self.select_observation(rows[self.history.cursor])
         if period:
-            self.cycle_value.setText(f"누적 소모량 {period['delta']:g}%p" if all_cycles else '선택 주기 '+usd(period['value']))
+            self.cycle_value.setText(f"누적 소모량 {period['delta']:g}%p" if all_cycles else '선택 주기 100% 환산 추정액 '+usd(period['value']))
             self.cycle_basis.setText(f"주간 100%p 기준 / 누적 환산액 {usd(period['cost'])} / 소모 {period['delta']:g}%p"
                                     ', '+('산정 ' if period['priced_calls']<period['calls'] else '')+call_count(period['priced_calls'],period['calls'])+'호출')
         else:
             self.cycle_value.setText('선택 주기 —');self.cycle_basis.setText('관측된 사용량 리셋 주기가 없습니다')
-        self.cycle_choice.setVisible(weekly and any_history and bool(self._view['periods']))
-        for node in (self.cycle_value,self.cycle_basis):node.setVisible(weekly and bool(lifetime['total']))
-
-        for key,toggle in self.legend_toggles.items():toggle.setVisible(weekly or key=='remaining')
+        self.cycle_choice.setVisible(any_history and bool(self._view['periods']))
+        for node in (self.cycle_value,self.cycle_basis):node.setVisible(bool(lifetime['total'] or self.report.get('exclusions')))
 
     def select_observation(self,row):
         self.history.setAccessibleName(observation_label(row,self.history.money))
 
+    def _query_parameters(self):
+        model=self.model_choice.currentData()
+        return dict(days=self.period.currentData(),start=self.period_start,end=self.period_end,
+                    model=model,mode=self.interval_filter.currentData() if model is None else 'all',
+                    page=self.page_index,page_size=self.page_size)
+
+    def _query_key(self):
+        return (id(self.report.get('_worker')),self.report.get('worker_revision'),
+                *self._query_parameters().values())
+
+    def _cache_query(self, key, value):
+        self._query_cache[key]=value
+        while len(self._query_cache)>8:self._query_cache.pop(next(iter(self._query_cache)))
+
+    def _prepared_statistics(self):
+        """Request display-ready totals without doing aggregation on the GUI."""
+        worker=self.report.get('_worker');key=self._query_key()
+        if worker is not self._query_worker:
+            if self._query_worker is not None:
+                try:self._query_worker.result.disconnect(self._receive_query)
+                except (RuntimeError,TypeError):pass
+            self._query_worker=worker;self._query_pending=None;self._query_cache={}
+            if worker is not None:worker.result.connect(self._receive_query)
+        query=self._query_parameters()
+        if (query['days'] is None and query['start'] is None and query['end'] is None
+                and query['model'] is None and query['mode']=='all' and query['page']==0):
+            default=self._view.get('default_query')
+            if default is not None:self._cache_query(key,default)
+        if key in self._query_cache:
+            self._query_pending=None
+            self._prepared_query=(key,self._query_cache[key])
+            return self._prepared_query[1]
+        if worker is not None and self._query_pending!=key:
+            self._query_pending=key
+            worker.request('query',key=key,revision=self.report['worker_revision'],query=query)
+        return None
+
+    @Slot(object)
+    def _receive_query(self, message):
+        key=message.get('key')
+        if message.get('kind')!='query' or key!=self._query_pending:return
+        self._query_pending=None
+        if key!=self._query_key():return
+        if message.get('error'):
+            self.status.setText(message.get('issue') or message['error']);self.status.show()
+            return
+        self._cache_query(key,message['value'])
+        if getattr(self,'defer_render',False):self._render_dirty=True
+        else:self.render(automatic=True)
+
     def render(self,*_,automatic=False):
         self.refresh_status()
+        if 'view' not in self.report:
+            self.report={**self.report,'view':prepare_quota_view(self.report)}
+        self.status.setText(self.issue or ('한도 기록을 읽지 못했습니다. 마지막 저장값을 확인해 주세요.' if self.report.get('error') else ''))
+        self.status.setVisible(bool(self.status.text()))
         self.lifetime_statistics=(self.report.get('view') or {}).get('lifetime') or quota_statistics(self.report)
         lifetime=self.lifetime_statistics
-        has_usage=bool(lifetime['total'])
+        has_usage=bool(lifetime['total'] or self.report.get('exclusions'))
         self.history_waiting.setVisible(not has_usage)
         for node in (self.summary_heading,self.result,self.lifetime_basis,self.conversion):node.setVisible(has_usage)
         selected_model=self.model_choice.currentData()
-        available=sorted({model['model'] for row in lifetime['intervals'] for model in row['models']
-                          if model.get('model') and not model.get('separate')})
+        available=self.report['view'].get('available_models')
+        if available is None:
+            available=sorted({model['model'] for row in lifetime['intervals'] for model in row['models']
+                              if model.get('model') and not model.get('separate')})
         if getattr(self,'_available_models',None)!=available:
             self._available_models=available
             self.model_choice.blockSignals(True)
@@ -561,14 +409,20 @@ class QuotaPanel(Group):
             ', '+('산정 ' if lifetime['observed_priced_calls']<lifetime['observed_calls'] else '')+call_count(lifetime['observed_priced_calls'],lifetime['observed_calls'])+'호출'+
             '\n관측 기반 추정, 수집 공백 제외' if lifetime['total'] else '계산에 필요한 관측을 기다리고 있습니다')
         self.render_history()
+        if hasattr(self,'update_summary'):self.update_summary()
+        if self.model_choice.currentData() is not None:self.interval_filter.hide()
         days=self.period.currentData()
         prepared=self._view.get('summaries',{})
-        summary=self.statistics=(prepared[days] if days in prepared and self.period_end is None and
-                                  (days is not None or self.period_start is None) else
-                                  quota_statistics(self.report,self.period_start,self.period_end,self.mode_assumption.isChecked()))
+        query=self._prepared_statistics() if 'worker_revision' in self.report else None
+        if 'worker_revision' in self.report and query is None:return
+        summary=self.statistics=(query['statistics'] if query is not None else
+                                 prepared[days] if days in prepared and self.period_end is None and
+                                 (days is not None or self.period_start is None) else
+                                 quota_statistics(self.report,self.period_start,self.period_end,self.mode_assumption.isChecked()))
         value=summary['per_percent']
         selected_model=self.model_choice.currentData()
-        model_intervals=model_cost_intervals(summary['intervals'],selected_model)
+        model_intervals=query['rows'] if query is not None else model_cost_intervals(summary['intervals'],selected_model)
+        interval_count=query['model_totals']['count'] if query is not None else len(model_intervals)
         if selected_model is None:
             self.basis_label.setText('소모량');self.basis.setToolTip(TIPS['quota_used'])
             self.cost_label.setText('구독 가치 환산액')
@@ -578,26 +432,23 @@ class QuotaPanel(Group):
                                            '소모량이 누적되면 주간할당량 가치를 표시합니다' if value is None else '')
         else:
             self.basis_label.setText('선택 모델 호출 수');self.basis.setToolTip('')
-            calls=sum(row['model_calls'] for row in model_intervals)
-            priced=sum(row['model_priced'] for row in model_intervals)
+            calls=query['model_totals']['calls'] if query is not None else sum(row['model_calls'] for row in model_intervals)
+            priced=query['model_totals']['priced'] if query is not None else sum(row['model_priced'] for row in model_intervals)
             self.cost_label.setText('확인된 구독 가치 환산액' if priced<calls else '구독 가치 환산액')
             self.basis.setText(f"{calls:,}회")
-            known=[row['model_cost'] for row in model_intervals if row['model_cost'] is not None]
+            known=([query['model_totals']['cost']] if query['model_totals']['cost'] is not None else []) if query is not None else [row['model_cost'] for row in model_intervals if row['model_cost'] is not None]
             self.cost_value.setText(usd(sum(known)) if known else '—')
-            self.conversion_empty.setText('선택 기간에 이 모델의 관측된 호출이 없습니다' if not model_intervals else
+            self.conversion_empty.setText('선택 기간에 이 모델의 관측된 호출이 없습니다' if not interval_count else
                                            '선택 모델의 구독 가치 환산액을 확인할 수 없습니다' if not known else
                                            f'{priced:,}/{calls:,}호출의 비용 확인' if priced<calls else '')
         self.conversion_empty.setVisible(bool(self.conversion_empty.text()))
-        self.details.setVisible(bool(model_intervals))
-        self.details.toggle.setText(f"구간별 내역: {len(model_intervals):,}개")
-        has_unknown=any(row.get('unknown_mode_calls') for row in summary['intervals'])
+        self.details.setVisible(bool(interval_count))
+        self.details.toggle.setText(f"구간별 내역: {interval_count:,}개")
+        has_unknown=query['has_unknown'] if query is not None else any(row.get('unknown_mode_calls') for row in summary['intervals'])
         self.mode_assumption.setVisible(has_unknown and selected_model is None)
         assumed=summary['assumed_per_percent']
         self.assumption_value.setVisible(has_unknown and selected_model is None and self.mode_assumption.isChecked())
         self.assumption_value.setText(f"Standard 단가 가정 {usd(assumed*100)} / 주간 100%p" if assumed is not None else 'Standard 단가를 적용할 비용 자료가 없습니다')
-        if self.report.get('error'):
-            self.status.setText(self.issue or '한도 기록을 읽지 못했습니다. 마지막 저장값을 확인해 주세요.')
-            self.status.show()
         self.render_intervals(automatic=automatic)
 
     def change_interval_filter(self,*_):
@@ -606,11 +457,18 @@ class QuotaPanel(Group):
 
     def render_intervals(self,*_,automatic=False):
         selected_model=self.model_choice.currentData()
-        mode=self.interval_filter.currentData();rows=model_cost_intervals(self.statistics['intervals'],selected_model)
-        if mode=='used':rows=[r for r in rows if not r['excluded']]
-        elif mode=='excluded':rows=[r for r in rows if r['excluded'] or r.get('assumptions')]
+        query=None
+        if 'worker_revision' in self.report:
+            if self._prepared_query is None or self._prepared_query[0]!=self._query_key():
+                self.render(automatic=automatic);return
+            query=self._prepared_query[1]
+        mode=self.interval_filter.currentData()
+        rows=query['rows'] if query is not None else model_cost_intervals(self.statistics['intervals'],selected_model)
+        if query is None:
+            if mode=='used':rows=[r for r in rows if not r['excluded']]
+            elif mode=='excluded':rows=[r for r in rows if r['excluded'] or r.get('assumptions')]
         self.filtered_intervals=rows
-        partial=any(r['model_priced']<r['model_calls'] if selected_model else r.get('priced_calls',r['calls'])<r['calls'] for r in rows)
+        partial=query['partial'] if query is not None else any(r['model_priced']<r['model_calls'] if selected_model else r.get('priced_calls',r['calls'])<r['calls'] for r in rows)
         self.intervals.setHorizontalHeaderLabels(
             ['기간','계정 소모량','선택 모델 환산액','구간 구독 가치 환산액 비중','산정 / 모델 호출' if partial else '호출 수'] if selected_model else
             ['기간','소모량','구독 가치 환산액','주간할당량 가치','산정 / 전체 호출' if partial else '호출 수'])
@@ -620,12 +478,13 @@ class QuotaPanel(Group):
         self.interval_empty.setText('선택 조건에 맞는 구간 0개' if self.statistics['total'] else '')
         self.interval_empty.setVisible(bool(self.statistics['total']) and not rows)
         self.interval_filter.setVisible(bool(self.statistics['total']) and selected_model is None)
-        pages=max(1,math.ceil(len(rows)/self.page_size))
+        total_rows=query['total_rows'] if query is not None else len(rows)
+        pages=query['pages'] if query is not None else max(1,math.ceil(len(rows)/self.page_size))
         self.paging.setVisible(pages>1)
         self.page_index=min(self.page_index,pages-1)
-        self.page_status.setText(f'{self.page_index+1} / {pages}페이지, {len(rows):,}구간')
+        self.page_status.setText(f'{self.page_index+1} / {pages}페이지, {total_rows:,}구간')
         self.previous_page.setEnabled(self.page_index>0);self.next_page.setEnabled(self.page_index+1<pages)
-        rows=rows[self.page_index*self.page_size:(self.page_index+1)*self.page_size]
+        if query is None:rows=rows[self.page_index*self.page_size:(self.page_index+1)*self.page_size]
         self.intervals.live_update=automatic
         self.intervals.set_rows(rows,self.format_interval)
         self.intervals.setFixedHeight(max(100,80+len(rows)*40))

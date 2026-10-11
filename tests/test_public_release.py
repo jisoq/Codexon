@@ -116,7 +116,7 @@ def test_public_payload_rejects_local_paths_and_unneeded_qt(tmp_path):
     folder = tmp_path/'.codex'/'Codexon';folder.mkdir(parents=True)
     exe = folder/'Codexon.exe';exe.write_bytes(b'synthetic executable')
     recovery=folder/'CodexonRecovery.exe';recovery.write_bytes(b'synthetic recovery')
-    for name in ('LICENSE', 'THIRD-PARTY-NOTICES.md', 'BUNDLED-PYTHON.md', 'BUNDLED-QT.md',
+    for name in ('LICENSE', 'THIRD-PARTY-NOTICES.md', 'BUNDLED-PYTHON.md', 'BUNDLED-QT.md', 'BUNDLED-RUST.md',
                  'SOURCE-OFFER.md', 'USER-GUIDE.md', 'USER-GUIDE.ko.md'):
         (folder/name).write_text('Synthetic release test', encoding='utf-8')
     manifest = {'product':'Codexon','version':'2026.09.23.6','commit':'a'*40,
@@ -125,8 +125,12 @@ def test_public_payload_rejects_local_paths_and_unneeded_qt(tmp_path):
                 'recovery_sha256':hashlib.sha256(recovery.read_bytes()).hexdigest()}
     file = folder/'build-manifest.json'
     file.write_text(json.dumps(manifest), encoding='utf-8')
-    assert payload(folder)[2] == manifest
+    with pytest.raises(ValueError, match='Rust CPU extension'):
+        payload(folder)
     internal = folder/'_internal';internal.mkdir()
+    native = internal/'cachemonitor/_cpu_native.pyd';native.parent.mkdir()
+    native.write_bytes(b'synthetic native payload')
+    assert payload(folder)[2] == manifest
     (internal/'base_library.zip').write_bytes(b'python standard library archive')
     assert payload(folder)[2] == manifest
     (internal/'diagnostics.zip').write_bytes(b'not an app dependency')

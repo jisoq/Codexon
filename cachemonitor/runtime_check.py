@@ -21,7 +21,7 @@ def modules():
     for handle in handles[:needed.value//ctypes.sizeof(W.HMODULE)]:
         path=ctypes.create_unicode_buffer(32768)
         if psapi.GetModuleFileNameExW(process,handle,path,len(path)):
-            if any(word in Path(path.value).name.lower() for word in ('qt','pyside','shiboken','msvcp','vcruntime','mactype','python','icu')):paths.append(path.value)
+            if any(word in Path(path.value).name.lower() for word in ('qt','pyside','shiboken','msvcp','vcruntime','mactype','python','icu','_cpu_native')):paths.append(path.value)
     return paths
 
 
@@ -29,6 +29,13 @@ def main(output):
     from .version import VERSION, PROXY_VERSION
     report={'executable':sys.executable,'version':VERSION,'proxy_version':PROXY_VERSION,
             'before':modules(),'errors':[]}
+    try:
+        from . import _cpu_native
+        if _cpu_native.ABI_VERSION != 1:
+            raise RuntimeError('Native CPU extension ABI mismatch')
+        report['native']={'abi_version':_cpu_native.ABI_VERSION,'module':_cpu_native.__file__}
+    except Exception:
+        report['errors'].append(traceback.format_exc())
     try:
         from PySide6 import QtCore,QtGui,QtWidgets,QtQml,QtQuick,QtQuickWidgets
         report.update(pyside=QtCore.__version__,qt=QtCore.qVersion())

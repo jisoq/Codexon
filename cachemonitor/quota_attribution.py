@@ -1,6 +1,7 @@
 """Pair completed local requests with observed allowance, without rewriting it."""
 from bisect import bisect_left, bisect_right
 import math
+from .native_backend import get_native
 
 
 class RequestWindows:
@@ -17,8 +18,17 @@ class RequestWindows:
         self.ends=sorted(spans,key=lambda span:span[1])
         self.start_times=[span[0] for span in self.starts]
         self.end_times=[span[1] for span in self.ends]
+        self._native = None
+        native = get_native()
+        if native is not None and len(spans) >= 128:
+            try:
+                self._native = native.RequestWindows(spans)
+            except (ValueError, OverflowError):
+                pass
 
     def overlapping(self,start,end):
+        if self._native is not None and all(type(t) in (int,float) and math.isfinite(t) and abs(t)<=2**53-1 for t in (start,end)):
+            return iter(self._native.overlapping(start,end))
         hi=bisect_right(self.start_times,end)
         lo=bisect_left(self.end_times,start)
         if hi<=len(self.ends)-lo:
@@ -34,7 +44,7 @@ def merged_ranges(ranges):
     return result
 
 
-def local_request_intervals(cycle, requests, clip):
+def local_request_intervals(cycle, requests, clip, prepare_clip=None):
     """Use one pre-request observation and up to two post-completion observations.
 
     The extra post-completion sample accommodates the normal delayed quota
@@ -100,8 +110,9 @@ def local_request_intervals(cycle, requests, clip):
     output=[]
     source={**cycle,'cost_rows':selected,'pending_usage_times':[],'pending_usage_calls':0,
             'mode_standard_cost':None,'unknown_mode_calls':0}
+    clipper = prepare_clip(source) if prepare_clip else lambda lo,hi: clip(source,lo,hi)
     for lo,hi in ranges:
-        part=clip(source,times[lo],times[hi])
+        part=clipper(times[lo],times[hi])
         if part is not None and part['priced_calls']:
             part.update(id=f"{cycle['id']}:local:{times[lo]}",local_attributed=True,
                         provisional=hi==len(times)-1 and bool(cycle.get('provisional')))

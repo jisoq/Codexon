@@ -96,7 +96,7 @@ def test_hidden_idle_boundary_keeps_completed_cost(monkeypatch):
     rows=[dict(at=at,remaining=remaining,cycle_cost=cost,cycle_delta=100-remaining,cycle_value=1000,confirmed_cost=cost,confirmed_delta=100-remaining,local_observed=visible,local_range=region,connect=i>0,tracking_continuous=True,cycle_start=100,reset_kind=None,account='a',label=str(at))
           for i,(at,remaining,cost,visible,region) in enumerate([(100,76,0,True,0),(110,75,2,True,0),(120,75,10,True,0),(130,74,10,False,0),(140,74,10,True,1),(150,73,22,True,1)])]
     period=dict(start=100,end=150,current=True,reset_kind=None,cost=22,delta=3,value=22/3*100,cost_intervals=[])
-    monkeypatch.setattr(quota_view,'quota_value_history',lambda *args:(rows,[dict(period)]))
+    monkeypatch.setattr(quota_view,'quota_value_history',lambda *args,**kwargs:(rows,[dict(period)]))
     monkeypatch.setattr(quota_view,'history_rows',lambda *args:[])
     monkeypatch.setattr(quota_view,'quota_statistics',lambda *args,**kw:{})
     view=quota_view.prepare_quota_view({})

@@ -5,6 +5,7 @@ import zlib
 from ijson.backends import yajl2_c as json_stream
 from ijson.common import JSONError
 import zstandard
+from .native_backend import get_native
 
 
 MAX_OBSERVATION = 128 * 1024 * 1024
@@ -50,6 +51,17 @@ class SelectedJSON:
 
 
 def message_metadata(data):
+    native = get_native()
+    if native is not None and type(data) in (bytes, str):
+        try:
+            return native.message_metadata(data)
+        except ValueError:
+            # Keep the established validator for unusual numeric JSON inputs.
+            pass
+    return _python_message_metadata(data)
+
+
+def _python_message_metadata(data):
     parser=SelectedJSON()
     for offset in range(0,len(data),CHUNK):
         piece=data[offset:offset+CHUNK]

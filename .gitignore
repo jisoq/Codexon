@@ -24,3 +24,8 @@ artifacts/
 
 _archive/
 .staging/
+native/target/
+cachemonitor/_cpu_native*.pyd
+cachemonitor/_cpu_native*.so
+cachemonitor/_cpu_native.build.json
+cachemonitor/_cpu_native*.tmp

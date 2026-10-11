@@ -137,7 +137,7 @@ class ObserverPanel(Group):
         self.error_detail.setVisible(bool(reason))
         self.refresh_color()
         restart=bool(state.get('restart_required')) and phase_update!='complete'
-        self.restart_label.setText('변경을 적용하려면 연결한 앱을 다시 여세요.' if restart else '')
+        self.restart_label.setText('변경을 적용하려면 Codex 앱을 다시 여세요.' if restart else '')
         self.restart_label.setVisible(restart)
         self.status_observed.emit(state)
 

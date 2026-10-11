@@ -10,6 +10,7 @@ from .model_evidence import FIELDS as MODEL_FIELDS
 from .pricing import token_cost, sum_cost, pricing_signature, request_tier, display_tier, unknown_mode_calls
 from .workload import internal_review
 from .analysis_records import compact_record, public_record, public_records
+from .native_backend import get_native
 
 
 class BoundedCache:
@@ -36,9 +37,46 @@ class BoundedCache:
             if predicate(key):self.weight-=self.data.pop(key)[1]
 
 
+ROW_SIGNATURE_FIELDS = ('key','ts','turn','model','effort','input','cached','written','output','reasoning','total','service_tier',
+    'reported_total','total_discrepancy','input_conflict','output_conflict','purpose','compaction_epoch') + TRANSPORT_FIELDS + MODEL_FIELDS
+
+
 def row_signature(row):
-    return tuple(row.get(k) for k in ('key','ts','turn','model','effort','input','cached','written','output','reasoning','total','service_tier',
-        'reported_total','total_discrepancy','input_conflict','output_conflict','purpose','compaction_epoch') + TRANSPORT_FIELDS + MODEL_FIELDS)
+    return tuple(row.get(key) for key in ROW_SIGNATURE_FIELDS)
+
+
+def row_signatures(rows):
+    rows = list(rows)
+    native = get_native()
+    if native is not None:
+        result = native.row_signatures(rows, ROW_SIGNATURE_FIELDS)
+        if result is not None:
+            return result
+    return tuple(row_signature(row) for row in rows)
+
+
+def _owned_histories_python(sessions):
+    owners = {}
+    for source in sorted(sessions, key=lambda session: (session['home'], session['id'])):
+        for row in source['history']:
+            owners.setdefault(call_identity(source['home'], source['id'], row.get('key')),
+                              (source['home'], source['id']))
+    result = []
+    for source in sessions:
+        key = (source['home'], source['id'])
+        result.append([row for row in source['history']
+                       if owners[call_identity(source['home'], source['id'], row.get('key'))] == key])
+    return result
+
+
+def owned_histories(sessions):
+    native = get_native()
+    if native is not None:
+        order = sorted(range(len(sessions)), key=lambda index: (sessions[index]['home'], sessions[index]['id']))
+        result = native.owned_histories(list(sessions), order)
+        if result is not None:
+            return result
+    return _owned_histories_python(sessions)
 
 
 class AnalysisEngine:
@@ -70,24 +108,20 @@ class AnalysisEngine:
             for s in sessions:previous_sessions[(s['home'],s['id'])]['source']=s
             return False
         self._ingest_key=fast
-        owners={}
-        for source in sorted(sessions,key=lambda s:(s['home'],s['id'])):
-            for row in source['history']:
-                owners.setdefault(call_identity(source['home'],source['id'],row.get('key')),(source['home'],source['id']))
+        owned_sources = owned_histories(sessions)
         price_signature=pricing_signature()
         reprice=price_signature!=self.pricing_signature
         self.pricing_signature=price_signature
         changed=False
         updated=OrderedDict()
-        for source in sessions:
+        for source, owned_history in zip(sessions, owned_sources):
             key=(source['home'],source['id'])
             old=previous_sessions.get(key)
             revision=source.get('usage_revision')
-            owned_history=[r for r in source['history'] if owners[call_identity(source['home'],source['id'],r.get('key'))]==key]
             metadata=tuple(source.get(k) for k in ('title','cwd','project','project_name','source','archived','collection_complete','pending','parent_thread_id','agent_path','agent_nickname','spawn_depth'))+(tuple(source.get('request_state',{}).items()),
                 tuple(r.get('key') for r in owned_history),
                 repr(source.get('turn_records',{})),repr(source.get('coverage_gaps',[])))
-            fingerprint=(metadata,revision if revision is not None else tuple(row_signature(r) for r in source['history']),
+            fingerprint=(metadata,revision if revision is not None else row_signatures(source['history']),
                          tuple(sorted(source.get('turn_states',{}).items())),tuple(sorted((source.get('unclassified') or {}).items())))
             if old and old['fingerprint']==fingerprint and not reprice:
                 # Diagnostics change independently of usage/metadata caches.
@@ -107,10 +141,10 @@ class AnalysisEngine:
             miss_keys={e['key'] for e in misses['events']}
             records={}
             history=[]
-            for i,r in enumerate(sorted(owned_history,key=lambda row:row['ts'])):
+            ordered_history = sorted(owned_history,key=lambda row:row['ts'])
+            for i, (r, signature) in enumerate(zip(ordered_history, row_signatures(ordered_history))):
                 identity=r.get('key') or (r.get('turn'),r['ts'],i)
                 if identity in records:continue
-                signature=row_signature(r)
                 state=source.get('turn_states',{}).get(r.get('turn'),'미확인')
                 cached=previous.get(identity)
                 is_miss=r.get('key') in miss_keys

@@ -28,9 +28,23 @@ def disable_resume(manager):
         value['resume'] = False
         atomic_write(path, json.dumps(value).encode())
 
+
+class LoginLaunch:
+    """A login request can be cancelled on the GUI thread during route recovery."""
+    def __init__(self, launch):
+        self.launch = launch
+        self.cancelled = threading.Event()
+
+    def cancel(self):
+        self.cancelled.set()
+
+    def __call__(self):
+        return 'cancelled' if self.cancelled.is_set() else self.launch()
+
+
 class AppServices:
 
-    def __init__(self, manager, homes, index=None, evidence=None, *, progress=lambda text: None, clock=time.monotonic, sleep=time.sleep, collection=True):
+    def __init__(self, manager, homes, index=None, evidence=None, *, progress=lambda text: None, clock=time.monotonic, sleep=time.sleep, collection=True, login_launch=None):
         self.manager, self.homes = (manager, homes)
         self.index, self.evidence = (index, evidence)
         self.target = ProxyTarget(manager) if manager else None
@@ -43,6 +57,7 @@ class AppServices:
         self.proxy_source = None
         self.collector_source = None
         self.collector_pending = None
+        self.login_launch = login_launch
 
     def deactivate(self):
         self.closing.set()
@@ -53,6 +68,8 @@ class AppServices:
         with self.operation_lock:
             if self.closing.is_set():
                 return {}
+            if operation == 'login':
+                return self.launch_login()
             if operation in ('start', 'ensure'):
                 result = self.start() if operation == 'start' else self.poll()
                 if not result.get('collection_issue') and (not result.get('error')):
@@ -79,13 +96,75 @@ class AppServices:
     def start(self):
         self.active = True
         errors = []
-        if self.collection:
+        login_pending = self.login_launch is not None
+        result = self.launch_login() if login_pending else {}
+        if self.collection and not self.closing.is_set():
             try:
                 self.start_collection()
                 if self.collector_pending:
                     errors.append('수집 시작 중')
             except (OSError, ValueError, RuntimeError) as exc:
                 errors.append(str(exc))
+        if not login_pending:
+            result.update(self.start_proxy())
+        elif not result.get('health') and not result.get('error'):
+            # Direct mode launches before any optional service probes.
+            try:
+                result.update(self.start_proxy())
+            except (OSError, ValueError, RuntimeError) as exc:
+                result['error'] = str(exc)
+        if errors:
+            result['collection_issue'] = '\n'.join(errors)
+        elif self.collection:
+            result['collection_issue'] = ''
+        return result
+
+    def launch_login(self):
+        result = {}
+        launch, self.login_launch = self.login_launch, None
+        if launch and not self.closing.is_set():
+            # The login app needs the route, not the collector or installation cleanup.
+            route_ready = False
+            try:
+                if not self.direct_login_ready():
+                    result = self.start_proxy()
+                    if not self.login_ready(result):
+                        raise RuntimeError('Codexon 연결 준비를 확인하지 못해 ChatGPT 자동 실행을 보류했습니다.')
+                route_ready = True
+                if not self.closing.is_set():
+                    result['chatgpt_startup'] = launch()
+            except (OSError, ValueError, RuntimeError) as exc:
+                if not (isinstance(launch, LoginLaunch) and launch.cancelled.is_set()):
+                    result['chatgpt_startup_error'] = str(exc)
+                if not route_ready:
+                    result['error'] = str(exc)
+        return result
+
+    def direct_login_ready(self):
+        m = self.manager
+        if not m or suspended(m):
+            return False
+        state = m.state()
+        from .proxy_update import BUSY
+        return (m.config()[1].get('openai_base_url') != m.url
+                and not state.get('enabled') and not state.get('pending')
+                and state.get('phase') not in ('faulted', 'failed', 'recovery_failed')
+                and read_json(m.directory/'proxy-update.json').get('phase') not in BUSY)
+
+    def login_ready(self, result):
+        m = self.manager
+        if not m or self.closing.is_set():
+            return False
+        if self.direct_login_ready():
+            return True
+        from .proxy_update import BUSY
+        return (not suspended(m) and m.config()[1].get('openai_base_url') == m.url
+                and m.state().get('enabled') and not m.state().get('pending')
+                and result.get('phase') == 'active' and not result.get('service_issue')
+                and (result.get('update') or {}).get('phase') not in BUSY
+                and m.local_ready(result.get('health')))
+
+    def start_proxy(self):
         result = {}
         if self.manager and (not self.closing.is_set()):
             from .retired_cache import retire
@@ -95,10 +174,6 @@ class AppServices:
             if not self.closing.is_set():
                 result = self.manager.resume()
                 self.remember_proxy(result)
-        if errors:
-            result['collection_issue'] = '\n'.join(errors)
-        elif self.collection:
-            result['collection_issue'] = ''
         return result
 
     def collector_identity(self, channel, snapshot):

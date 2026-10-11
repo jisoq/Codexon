@@ -214,12 +214,12 @@ def partition_coverage(groups, issues):
     return result
 
 
-def _clip_quota_interval(cycle, start=None, end=None):
-    endpoints=[r for r in cycle.get('endpoints',[]) if
+def _clip_quota_interval(cycle, start=None, end=None, *, selection=None):
+    endpoints=selection[0] if selection is not None else [r for r in cycle.get('endpoints',[]) if
                (start is None or r[0]>=start) and (end is None or r[0]<=end)]
     if len(endpoints)<2:return None
     lo,hi=endpoints[0][0],endpoints[-1][0]
-    candidates=[r for r in cycle.get('cost_rows',[]) if lo<r['ts']<=hi]
+    candidates=selection[1] if selection is not None else [r for r in cycle.get('cost_rows',[]) if lo<r['ts']<=hi]
     rows=[r for r in candidates if r.get('request_start') is None or r['request_start']>=lo]
     models=[]
     for model in cycle['models']:
@@ -243,6 +243,20 @@ def _clip_quota_interval(cycle, start=None, end=None):
             'mode_standard_cost':sum(alternatives) if alternatives and all(c is not None for c in alternatives) else None}
 
 
+def _quota_clipper(cycle):
+    """Build one native time index for the many local intervals in a cycle."""
+    from .native_backend import get_native
+    native = get_native()
+    if native is not None and len(cycle.get('endpoints',[])) >= 128:
+        try:
+            index = native.QuotaClipIndex(cycle.get('endpoints',[]), cycle.get('cost_rows',[]))
+        except (ValueError, OverflowError):
+            pass
+        else:
+            return lambda start,end: _clip_quota_interval(cycle,start,end,selection=index.select(start,end))
+    return lambda start,end: _clip_quota_interval(cycle,start,end)
+
+
 def _continuous_quota_intervals(cycles):
     """Exclude unobserved edges and their costs, retaining both observed sides."""
     from .quota_tracking import OBSERVATION_FRESHNESS
@@ -262,29 +276,31 @@ def _continuous_quota_intervals(cycles):
                            'observation_gaps_excluded':True}
 
 
-def quota_statistics(report, start=None, end=None, include_mode_assumptions=False):
+def quota_statistics(report, start=None, end=None, include_mode_assumptions=False, *, _requests=None):
     """Use complete disjoint intervals; preserve the base result under assumptions."""
     from .analytics import quantile
+    from .quota_exclusions import retained_intervals
     intervals = []
     current_account = report.get('account') or next(
         (c.get('account') for c in report.get('cycles', []) if c.get('account')), '')
     scoped=[]
-    for cycle in _continuous_quota_intervals(report.get('cycles', [])):
+    for cycle in retained_intervals(_continuous_quota_intervals(report.get('cycles', [])), report, _clip_quota_interval):
         if (start is not None and cycle.get('start',0)<start) or (end is not None and cycle.get('end',float('inf'))>end):
             cycle=_clip_quota_interval(cycle,start,end)
             if cycle is None:continue
         scoped.append(cycle)
+    user_removed_all = bool(report.get('cycles')) and bool(report.get('exclusions')) and not scoped
     attribution=dict(idle_delta=0,pending_delta=0,unmatched_calls=0,pending_windows=0)
     account_delta=sum(max(0,c['delta']) for c in scoped if not current_account or c.get('account')==current_account)
     if report.get('tracking') is not None:
         from .quota_attribution import local_request_intervals, RequestWindows
-        requests=RequestWindows(report.get('request_windows',[]))
+        requests=_requests if _requests is not None else RequestWindows(report.get('request_windows',[]))
         local=[]
         for cycle in scoped:
             if current_account and cycle.get('account')!=current_account:continue
             points=cycle.get('endpoints',[])
             overlapping=requests.overlapping(points[0][0],points[-1][0]) if points else ()
-            parts,diagnostics=local_request_intervals(cycle,overlapping,_clip_quota_interval)
+            parts,diagnostics=local_request_intervals(cycle,overlapping,_clip_quota_interval,_quota_clipper)
             local.extend(parts)
             for key in attribution:attribution[key]+=diagnostics[key]
         scoped=local
@@ -322,7 +338,7 @@ def quota_statistics(report, start=None, end=None, include_mode_assumptions=Fals
         # subtotal remains useful with its priced/total count, but absent costs
         # must not turn into zero dollars.
         known_costs = [r['cost'] for r in observed if r['cost'] is not None]
-        total_cost = sum(known_costs) if known_costs else 0 if not observed and report['tracking'].get('complete') else None
+        total_cost = sum(known_costs) if known_costs else 0 if not observed and (report['tracking'].get('complete') or user_removed_all) else None
         if not observed and attribution['pending_windows']:total_cost=None
         total_delta = sum(max(0,r['delta']) for r in observed)
     values = [r['per_percent'] for r in valid if r['per_percent'] is not None]
@@ -359,7 +375,7 @@ def quota_statistics(report, start=None, end=None, include_mode_assumptions=Fals
         'account_delta':account_delta,'attribution':attribution}
 
 
-def quota_value_history(report, rows):
+def quota_value_history(report, rows, *, _requests=None):
     """Align monetary evidence to the chart's *observed* reset boundaries.
 
     Reset classification belongs to history_rows/ResetTracker. Storage intervals
@@ -380,19 +396,28 @@ def quota_value_history(report, rows):
         group['rows'].append(row)
         previous = row
 
+    from .quota_exclusions import active_exclusions
+    exclusions = active_exclusions(report, account)
     result, periods = [], []
     cycles = report.get('cycles', [])
     forward = report.get('tracking') is not None
+    if forward and _requests is None:
+        from .quota_attribution import RequestWindows
+        _requests=RequestWindows(report.get('request_windows',[]))
     for index, group in enumerate(groups):
         start = group['start']
         end = (math.nextafter(groups[index+1]['start'], -math.inf)
                if index+1 < len(groups) else rows[-1]['at'])
         own = [c for c in cycles if c['end'] >= start and c['start'] <= end]
-        summary = quota_statistics({**report, 'account': account, 'cycles': own}, start, end)
+        summary = quota_statistics({**report, 'account': account, 'cycles': own}, start, end, _requests=_requests)
         intervals = [c for c in summary['intervals']
                      if not account or not c.get('account') or c['account'] == account]
         ranges=sorted((c['start'],c['end']) for c in intervals)
-        range_position=0
+        display_ranges = ranges
+        if exclusions:
+            original = quota_statistics({**report, 'account': account, 'cycles': own, 'exclusions': []}, start, end, _requests=_requests)
+            display_ranges = sorted((c['start'], c['end']) for c in original['intervals'])
+        display_position=0
         running_starts=[];running_ends=[]
         for c in intervals:
             if not c.get('local_attributed'):continue
@@ -443,9 +468,10 @@ def quota_value_history(report, rows):
         confirmed_cost = confirmed_delta = 0
         last_ratio = None
         for row in group['rows']:
-            while range_position<len(ranges) and ranges[range_position][1]<row['at']:range_position+=1
+            while display_position<len(display_ranges) and display_ranges[display_position][1]<row['at']:display_position+=1
             local_observed=(report.get('tracking') is None or
-                            range_position<len(ranges) and ranges[range_position][0]<=row['at']<=ranges[range_position][1])
+                            display_position<len(display_ranges) and display_ranges[display_position][0]<=row['at']<=display_ranges[display_position][1])
+            excluded = [r for r in exclusions if r['start'] < row['at'] <= r['end']]
             while position < len(events) and events[position][0] <= row['at']:
                 _, amount, consumed, confirmed = events[position]
                 cost += amount
@@ -454,6 +480,8 @@ def quota_value_history(report, rows):
                 position += 1
             matches = not account or row.get('account') == account
             value = max(0, cost) if known and matches else None
+            if exclusions and matches and not intervals and summary['cost'] == 0:
+                value = 0.0
             if row['reset_kind'] and matches:
                 value = 0.0
             ratio = value/delta*100 if value is not None and delta > 0 else None
@@ -467,14 +495,18 @@ def quota_value_history(report, rows):
             result.append({**row, 'cycle_start': start, 'cycle_cost': value,
                            'cycle_value': ratio, 'cycle_delta':delta,
                            'confirmed_cost':confirmed_cost, 'confirmed_delta':confirmed_delta, 'value_held':value_held,
-                           'local_observed':local_observed,'local_range':range_position,'value_pending':value_pending,
+                           'local_observed':local_observed,'local_range':display_position,'value_pending':value_pending,
+                           'user_excluded':bool(excluded),
+                           'user_exclusion_end':bool(excluded) and all(r['end']==row['at'] for r in excluded),
+                           'exclusion_ids':[r.get('id') for r in excluded],
+                           'exclusion_reasons':[r.get('reason', '') for r in excluded],
                            'cycle_partial': group['partial']})
         if any(not account or r.get('account') == account for r in group['rows']):
             value = summary['per_percent']
             periods.append({'start': start, 'end': group['rows'][-1]['at'],
                             'reset_kind': group['reset_kind'], 'partial': group['partial'],
                             'current': index == len(groups)-1,
-                            'cost': summary['cost'] if summary['total'] else
+                            'cost': summary['cost'] if summary['total'] or exclusions else
                                     0 if group['reset_kind'] else None,
                             'delta': summary['delta'],
                             'priced_calls': summary['observed_priced_calls'],
@@ -531,6 +563,14 @@ class QuotaLedger:
             CREATE TABLE IF NOT EXISTS coverage_issues(
                 home TEXT, sid TEXT, start REAL, end REAL, reason TEXT,
                 PRIMARY KEY(home,sid,reason));
+            CREATE TABLE IF NOT EXISTS quota_exclusions(
+                id TEXT PRIMARY KEY, home TEXT NOT NULL, account TEXT NOT NULL,
+                start REAL NOT NULL, end REAL NOT NULL, reason TEXT NOT NULL,
+                period_start REAL NOT NULL, period_end REAL NOT NULL,
+                created_at REAL NOT NULL, restored_at REAL,
+                CHECK(start < end));
+            CREATE INDEX IF NOT EXISTS quota_exclusions_scope
+                ON quota_exclusions(home,account,start,end);
         ''')
         self.db.execute('begin immediate')
         if 'complete_at' not in {r[1] for r in self.db.execute('pragma table_info(state)')}:
@@ -832,6 +872,53 @@ class QuotaLedger:
                     self.observe(home, {**quota, 'observed_at': at, 'source': 'history'},commit=False)
         self.db.commit()
 
+    def preview_exclusion(self, home, start, end, reason=''):
+        from .quota_exclusions import preview_exclusion
+        return preview_exclusion(self.report(home), start, end, reason)
+
+    def exclude_interval(self, home, start, end, reason=''):
+        from uuid import uuid4
+        from .quota_exclusions import validate_exclusion
+        def save(preview):
+            record = {key: preview[key] for key in
+                      ('home', 'account', 'start', 'end', 'reason', 'period_start', 'period_end')}
+            record.update(id=uuid4().hex, created_at=time.time(), restored_at=None)
+            self.db.execute('''insert into quota_exclusions
+                (id,home,account,start,end,reason,period_start,period_end,created_at,restored_at)
+                values(:id,:home,:account,:start,:end,:reason,:period_start,:period_end,:created_at,:restored_at)''', record)
+            return record
+        return self._edit_with_report(home,
+            lambda report:validate_exclusion(report,start,end,reason),save)
+
+    def restore_exclusion(self, home, exclusion_id):
+        def restore(account):
+            record = self.db.execute('select * from quota_exclusions where id=? and home=? and account=?',
+                                     (exclusion_id, home, account)).fetchone()
+            if record is None:
+                raise ValueError('현재 계정의 제외 내역을 찾을 수 없습니다.')
+            if record['restored_at'] is not None:
+                return False
+            self.db.execute('update quota_exclusions set restored_at=? where id=?',
+                            (time.time(), exclusion_id))
+            return True
+        return self._edit_with_report(home,lambda report:report['account'],restore)
+
+    def _edit_with_report(self, home, prepare, apply):
+        """Validate a stable read snapshot before briefly acquiring the writer lock."""
+        for _ in range(3):
+            self.db.execute('BEGIN')
+            try:
+                revision=self.db.execute('PRAGMA data_version').fetchone()[0]
+                prepared=prepare(self._report(home))
+            finally:
+                self.db.rollback()
+            with self.db:
+                self.db.execute('BEGIN IMMEDIATE')
+                if self.db.execute('PRAGMA data_version').fetchone()[0]!=revision:
+                    continue
+                return apply(prepared)
+        raise sqlite3.OperationalError('사용한도 기록이 계속 갱신되어 저장하지 못했습니다. 다시 시도하세요.')
+
     def report(self, home, now=None):
         own_transaction = not self.db.in_transaction
         if own_transaction:self.db.execute('BEGIN')
@@ -900,7 +987,7 @@ class QuotaLedger:
         time_cache={}
         for group in groups:
             if group.get('gap') or group.get('discontinuous'):continue
-            separate=set().union(*(set(json.loads(r['separate'])) for r in group['observations']))
+            separate=set().union(*(json.loads(value) for value in {r['separate'] for r in group['observations']}))
             key=frozenset(separate)
             if key not in time_cache:
                 time_cache[key]=[r['ts'] for r in calls if ALIASES.get(r['model'],r['model']) not in separate]
@@ -992,7 +1079,7 @@ class QuotaLedger:
             else:pending=True
             first, last = matched[0], matched[-1]
             start, end = first['at'], last['at']
-            separate = set().union(*(set(json.loads(r['separate'])) for r in matched))
+            separate = set().union(*(json.loads(value) for value in {r['separate'] for r in matched}))
             models = model_rows(start,end,separate)
             uncertain_gap = bool(next_group and next_group['reason']!='예정 리셋 확인'
                                  and not next_group.get('manual_reset'))
@@ -1147,6 +1234,9 @@ class QuotaLedger:
             request_windows=list(by_response.values())
         return {**({'request_windows':request_windows} if tracking is not None else {}),
                 'home':home,'account':current_account,'history':sorted(history,key=lambda r:(r['at'],r['id'])),
+                'exclusions':([dict(r) for r in self.db.execute(
+                    'select * from quota_exclusions where home=? and account=? and restored_at is null order by start,created_at,id',
+                    (home,current_account))] if 'quota_exclusions' in tables else []),
                 'tracking':({k:v for k,v in tracking.items() if k!='groups'} if tracking is not None else None),
                 'manual_resets':manual_resets,'cycles': list(reversed(result)), 'price_id': PRICE_ID, 'index_at': state['at'] if state else None,
                 'index_loading': bool(state['loading']) if state else True,

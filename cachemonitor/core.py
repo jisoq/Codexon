@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from .native_backend import get_native
+
 WINDOW = 30 * 60
 SESSION_WINDOW = 24 * 60 * 60
 TRANSPORT_FIELDS = ("transport", "transport_ts", "transport_evidence", "transport_endpoint", "transport_turn", "transport_source")
@@ -103,7 +105,7 @@ def token_parts(row):
     return {'input':inp,'output':out}
 
 
-def summarize(rows):
+def _summarize_python(rows):
     rows = list(rows)
     result = {"count": len(rows), "missing": {}}
     for key in METRICS:
@@ -116,12 +118,34 @@ def summarize(rows):
     return result
 
 
-def group_usage(rows):
+def summarize(rows):
+    rows = list(rows)
+    native = get_native()
+    if native is not None:
+        result = native.summarize_usage(rows)
+        if result is not None:
+            return result
+    return _summarize_python(rows)
+
+
+def _group_usage_python(rows):
     groups = {}
     for row in rows:
         groups.setdefault((row.get("model") or "미확인", row.get("effort") or "미확인"), []).append(row)
-    return sorted(({"model": model, "effort": effort, **summarize(items)} for (model, effort), items in groups.items()),
+    return sorted(({"model": model, "effort": effort, **_summarize_python(items)} for (model, effort), items in groups.items()),
                   key=lambda r: r["total"] or 0, reverse=True)
+
+
+def group_usage(rows):
+    rows = list(rows)
+    native = get_native()
+    if native is not None:
+        result = native.group_usage(rows)
+        if result is not None:
+            return result
+    return _group_usage_python(rows)
+
+
 def combined_usage_groups(sessions, scope):
     buckets = {}
     for session in sessions:
@@ -424,6 +448,10 @@ class Session:
                            if t.ts <= request.ts and
                            (not request.turn or not t.turn or request.turn == t.turn)),
                           key=lambda t: t.ts, default=None)
+        return self._transport_details(observation)
+
+    @staticmethod
+    def _transport_details(observation):
         return {
             "transport": observation.kind if observation and observation.kind in ("WebSocket", "HTTP/SSE") else "미확인",
             "transport_source": "log_time" if observation and observation.kind in ("WebSocket", "HTTP/SSE") else "unknown",
@@ -432,6 +460,17 @@ class Session:
             "transport_endpoint": observation.endpoint if observation else "",
             "transport_turn": observation.turn if observation else "",
         }
+
+    def transport_details_many(self, requests):
+        requests = list(requests)
+        native = get_native()
+        if native is not None and self.transports:
+            transports = list(self.transports)
+            matches = native.transport_matches(requests, transports)
+            if matches is not None:
+                return [self._transport_details(transports[index] if index is not None else None)
+                        for index in matches]
+        return [self.transport_details(request) for request in requests]
 
     def transport_at(self, request):
         return self.transport_details(request)["transport"]
@@ -453,7 +492,9 @@ class Session:
         history = old['history'] if same else [x.values() for x in self.requests]
         requests = [x for x in self.requests if x.ts >= now - WINDOW]
         last = requests[-1] if requests else None
-        connection_history = old['history'] if same else [{**x.values(), **self.transport_details(x)} for x in self.requests]
+        connection_history = old['history'] if same else [
+            {**request.values(), **detail}
+            for request, detail in zip(self.requests, self.transport_details_many(self.requests))]
         matched = {(r["transport_ts"], r["transport"], r["transport_turn"]) for r in connection_history}
         latest = self.transports[-1] if self.transports else None
         known = [x for x in requests if x.input is not None and x.cached is not None]
@@ -495,7 +536,8 @@ class Session:
             "input": last.input if last else None, "cached": last.cached if last else None,
             "remaining": remaining, "warning": warning, "pending": self.pending,
             "cache_misses": cache_misses,
-            "requests": [{**vars(x), "rate": x.rate, **self.transport_details(x)} for x in requests],
+            "requests": [{**vars(request), "rate": request.rate, **detail}
+                         for request, detail in zip(requests, self.transport_details_many(requests))],
             "history": connection_history,
             "unmatched_transports": [vars(t) for t in self.transports if (t.ts, t.kind, t.turn) not in matched],
             "totals": totals, "groups": groups, "unclassified": unclassified,

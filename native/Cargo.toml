@@ -1,0 +1,21 @@
+[package]
+name = "codexon-cpu"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.83"
+publish = false
+
+[lib]
+name = "_cpu_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "=0.27.2", features = ["extension-module", "abi3-py312"] }
+serde = "=1.0.228"
+serde_json = "=1.0.151"
+memchr = "=2.8.3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+

@@ -37,7 +37,7 @@ Item {
         case "spacer": return spacerComponent
         case "text": return textComponent
         case "textarea": return textAreaComponent
-        case "button": return buttonComponent
+        case "button": return s.metricReset ? metricResetComponent : buttonComponent
         case "toggle": return toggleComponent
         case "switch": return switchComponent
         case "choice": return choiceComponent
@@ -216,15 +216,51 @@ Item {
             }
         }
     }
+
+    Component {
+        id: metricResetComponent
+        Button {
+            id: metricControl
+            implicitWidth: 144; implicitHeight: 26
+            padding: 0; hoverEnabled: true
+            Accessible.name: view.s.accessible
+            HoverHandler { cursorShape: Qt.PointingHandCursor }
+            contentItem: Item {
+                implicitHeight: 26
+                Text {
+                    objectName: "reset-label"
+                    anchors.left: parent.left; anchors.verticalCenter: parent.verticalCenter
+                    text: appLanguage.text("초기화권"); color: appTheme.palette.muted
+                    font.family: appTheme.family; font.pixelSize: 12
+                }
+                Text {
+                    objectName: "reset-value"
+                    anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
+                    text: view.node.textValue; color: appTheme.palette.ink
+                    font.family: appTheme.family; font.pixelSize: 20; font.bold: true
+                }
+            }
+            background: Rectangle {
+                radius: 4; color: metricControl.hovered ? appTheme.palette.secondary : "transparent"
+                border.width: metricControl.activeFocus ? 1 : 0; border.color: appTheme.palette.accent
+            }
+            onClicked: view.node.activate()
+            UiToolTip { visible: metricControl.hovered; text: view.s.tooltip }
+        }
+    }
     Component {
         id: buttonComponent
         UiButton {
             role: view.s.role || "secondary"
             text: view.node.textValue; checkable: view.s.checkable; checked: view.s.checked
-            font.pixelSize: view.s.fontSize; font.bold: view.s.bold
+            font.pixelSize: view.s.fontSize
+            font.weight: view.s.bold || (!quiet && !legend && !selectionTab) || (selectionTab && checked) ? Font.DemiBold : Font.Normal
             disclosure: !!view.s.disclosure
             iconName: view.s.iconName || ""
+            leadingIcon: view.s.leadingIcon || ""
             selectionTab: !!view.s.selectionTab
+            legendColor: view.s.legendColor || ""
+            legendDashed: !!view.s.legendDashed
             flat: !!view.s.flat
             Component.onCompleted: if (view.s.defaultFocus) forceActiveFocus()
             Keys.onReturnPressed: event => { if (view.s.activateOnReturn) view.node.activate(); else event.accepted = false }
@@ -255,6 +291,7 @@ Item {
         id: choiceComponent
         UiChoice {
             model: view.s.items; textRole: "text"; currentIndex: view.s.index
+            wrapSelectedText: !!view.s.wrap
             wheelEnabled: true
             implicitWidth: 180
             onActivated: index => view.node.choose(index)
@@ -296,6 +333,9 @@ Item {
         id: inputComponent
         UiInput {
             text: view.node.textValue; placeholderText: view.s.placeholder
+            searchIcon: !!view.s.searchIcon
+            maximumLength: view.s.maxLength === undefined ? 32767 : view.s.maxLength
+            font.pixelSize: view.s.fontSize || 14
             Accessible.name: view.s.accessible || placeholderText
             Keys.onEscapePressed: event => { if (view.s.clearOnEscape) { view.node.edit(""); event.accepted = true } else event.accepted = false }
             onTextEdited: view.node.edit(text)
@@ -412,6 +452,7 @@ Item {
                     required property var modelData
                     required property int index
                     node: modelData
+                    visible: index === view.s.index && modelData.state.visible
                     loadRequested: !view.s.deferPages || index === view.s.index
                     Layout.fillWidth: true; Layout.fillHeight: true
                 }
@@ -502,14 +543,26 @@ Item {
                 color: Qt.alpha(appTheme.color("accent"),0.10)
                 border.color: Qt.alpha(appTheme.color("accent"),0.6); border.width: 1
             }
-            HoverHandler { id: plotHover; objectName: "plotHover"; cursorShape: plot.hoverIndex >= 0 ? Qt.PointingHandCursor : Qt.ArrowCursor; onPointChanged: plot.showTip(point.position.x, point.position.y); onHoveredChanged: if (!hovered) plot.clearHover() }
+            HoverHandler { id: plotHover; objectName: "plotHover"; enabled: !view.s.exclusionSelecting; cursorShape: plot.hoverIndex >= 0 ? Qt.PointingHandCursor : Qt.ArrowCursor; onPointChanged: plot.showTip(point.position.x, point.position.y); onHoveredChanged: if (!hovered) plot.clearHover() }
             UiToolTip { visible: !view.s.quotaDetail && plotHover.hovered && plot.tip.length > 0; text: plot.tip }
             Loader {
                 id: quotaDetailLoader
                 active: !!view.s.quotaDetail
                 sourceComponent: Component { QuotaDetails { plot: quotaDetailLoader.parent } }
             }
-            TapHandler { enabled: view.s.clickEnabled !== false; onTapped: eventPoint => { plot.forceActiveFocus(); plot.activateAt(eventPoint.position.x,eventPoint.position.y) } }
+            TapHandler { enabled: view.s.clickEnabled !== false && !view.s.exclusionSelecting; onTapped: eventPoint => { plot.forceActiveFocus(); plot.activateAt(eventPoint.position.x,eventPoint.position.y) } }
+            MouseArea {
+                objectName: "quotaRangeSelection"
+                anchors.fill: parent
+                enabled: !!view.s.exclusionSelecting || !!view.s.manageExclusions
+                cursorShape: Qt.CrossCursor
+                preventStealing: true
+                property real startX: 0
+                onPressed: mouse => { startX=mouse.x; plot.forceActiveFocus(); plot.dismissDetail(); if (view.s.manageExclusions) view.node.beginRangeSelection(mouse.x,mouse.y); else view.node.selectionPress(mouse.x,mouse.y) }
+                onPositionChanged: mouse => { if (pressed) view.node.selectionMove(mouse.x,mouse.y) }
+                onReleased: mouse => { if (view.s.manageExclusions && Math.abs(mouse.x-startX)<10) { view.node.cancelRangeSelection(); plot.activateAt(mouse.x,mouse.y); } else view.node.selectionRelease(mouse.x,mouse.y); }
+                onCanceled: { if (view.s.manageExclusions) view.node.cancelRangeSelection(); else view.node.selectionCancel(); }
+            }
             Keys.onPressed: event => { plot.key(event.key); event.accepted = true }
         }
     }

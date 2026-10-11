@@ -100,3 +100,63 @@ def test_comparison_detail_home_back_and_refresh_preserve_context(dashboard):
     w.receive(copy.deepcopy(w.snapshot))
     assert w.comparison_selection==selected and w.scrollers[1].verticalPosition.value()==before
     assert not w.qml_errors
+
+
+def test_duration_available_defaults_after_cache_and_restores_saved_statistic(dashboard):
+    w=dashboard
+    assert w.comparison_metric.findData('duration')>=0
+    w.change_page(1)
+    w.comparison_metric.setCurrentIndex(w.comparison_metric.findData('cache_ratio'))
+    assert w.query()['method']=='weighted'
+    w.comparison_metric.setCurrentIndex(w.comparison_metric.findData('duration'))
+    assert w.query()['method']=='median'
+    w.method.setCurrentIndex(w.method.findData('p90'))
+    response=w.capture_state()
+    w.unit.setCurrentIndex(w.unit.findData('turn'))
+    turn=w.capture_state()
+    for state,unit in ((response,'response'),(turn,'turn')):
+        w.comparison_metric.setCurrentIndex(w.comparison_metric.findData('cost'))
+        w.restore_state(state,initial=True);w.change_page(1)
+        assert (w.query()['unit'],w.query()['metric'],w.query()['method'])==(unit,'duration','p90')
+        w.method.setCurrentIndex(w.method.findData('mean'))
+        assert w.query()['method']=='mean'
+    assert not w.qml_errors
+
+
+def test_usage_card_drilldown_ignores_history_filters_and_restores_latest_scope(dashboard):
+    from cachemonitor.analytics import project_identity
+    from cachemonitor.dashboard import choose,identity
+    w=dashboard;first,other=[project_identity(s) for s in w.snapshot['sessions'][:2]]
+    choose(w.project,other);choose(w.period,'all');w.filter_changed()
+    w.change_page(2)
+    choose(w.period,'30m');w.filter_changed()
+    w.call_filter_controls['cache_zero'].setChecked(True)
+    w.selected_session=('fixture','s1');w.selected_event='stale-event';w.record_view='calls'
+    w.nav.setCurrentRow(w.navigation_pages.index(0))
+    choose(w.project,first);choose(w.period,'7d');w.filter_changed()
+    expected={identity(r) for r in w.engine.query(w.query())['analysis']['responses']}
+    assert len(expected)==16
+    click(w,control(w,w.usage_metrics['calls'][0]))
+    assert w.current_page==2 and w.record_view=='calls'
+    assert not w.selected_event and not any(n.isChecked() for n in w.call_filter_controls.values())
+    assert {identity(r) for r in w.record_rows}==expected
+    w.nav.setCurrentRow(w.navigation_pages.index(0))
+    assert w.project.currentData()==first and w.period.currentData()=='7d'
+    assert {identity(r) for r in w.engine.query(w.query())['analysis']['responses']}==expected
+    assert not w.qml_errors
+
+
+def test_saved_project_scope_remains_explicit_after_project_disappears(dashboard):
+    from cachemonitor.analytics import project_identity
+    from cachemonitor.dashboard import choose
+    w=dashboard;first,other=[project_identity(s) for s in w.snapshot['sessions'][:2]]
+    choose(w.project,first);choose(w.period,'7d');w.filter_changed()
+    w.change_page(1);choose(w.project,other);w.filter_changed()
+    source=copy.deepcopy(w.snapshot)
+    source['sessions']=[s for s in source['sessions'] if project_identity(s)!=first]
+    w.receive(source)
+    assert first not in w.filter_values['project']
+    w.nav.setCurrentRow(w.navigation_pages.index(0))
+    assert w.project.currentData()==first and w.query()['project']==first
+    assert w.analysis['response_count']==0
+    assert not w.qml_errors

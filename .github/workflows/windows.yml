@@ -50,6 +50,8 @@ jobs:
     if: needs.resolve.outputs.verify == 'true' || inputs.extended
     runs-on: windows-latest
     timeout-minutes: 25
+    env:
+      CODEXON_CPU_BACKEND: rust
     steps:
       - uses: actions/checkout@v7
         with:
@@ -76,6 +78,9 @@ jobs:
           $base = if ($env:EVENT_NAME -eq 'pull_request') { $env:PR_BASE } else { $env:PUSH_BASE }
           python tools/ci_plan.py "--base=$base" --candidate "$env:RELEASE_CANDIDATE" --extended "$env:EXTENDED"
           exit $LASTEXITCODE
+      - name: Build and test the locked Rust extension
+        if: steps.plan.outputs.rust == 'true'
+        run: python tools/build_native.py --test
       - name: Check changed dependencies for vulnerabilities
         if: steps.plan.outputs.dependencies == 'true'
         run: |
