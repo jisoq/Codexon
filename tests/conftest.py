@@ -23,6 +23,9 @@ def pytest_addoption(parser):
 
 
 def pytest_configure(config):
+    from cachemonitor.fonts import configure_font_rendering, configure_high_dpi
+    configure_font_rendering()
+    configure_high_dpi()
     config.addinivalue_line('markers', 'live_taskbar: requires a disposable Windows desktop')
 
 
