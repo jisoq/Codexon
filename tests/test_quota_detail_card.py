@@ -13,7 +13,8 @@ def detail_value(detail,metric):
     return next(item['value'] for item in detail['items'] if item['metric']==metric)
 
 
-def test_hover_and_selection_update_only_interaction_layer(qtbot):
+def test_hover_and_selection_update_only_interaction_layer():
+    import time
     from PySide6.QtCore import QObject
     app=QApplication.instance() or QApplication([])
     chart=QuotaHistory();chart.money=True
@@ -22,12 +23,17 @@ def test_hover_and_selection_update_only_interaction_layer(qtbot):
     try:
         plot=render_plot(host,chart)
         plot.findChild(QObject,'plotHover').setProperty('enabled',False)
-        qtbot.waitUntil(lambda:plot._interaction_layer.paint_count>0)
+        def wait_for_paint(previous):
+            deadline=time.monotonic()+3
+            while plot._interaction_layer.paint_count<=previous:
+                assert time.monotonic()<deadline, 'Interaction layer did not repaint'
+                QTest.qWait(10)
+        wait_for_paint(0)
         plot.showTip(chart.x_at(0),chart.box.center().y())
         render_plot(host,chart)
         static=plot._static_paint_count;overlay=plot._interaction_layer.paint_count
         plot.showTip(chart.x_at(1),chart.box.center().y())
-        qtbot.waitUntil(lambda:plot._interaction_layer.paint_count>overlay)
+        wait_for_paint(overlay)
         assert plot._static_paint_count==static
         assert chart.legend_values()['cycle_cost']=='$5.00'
         chart.set_exclusion_selection(1000,1010,True)
@@ -35,7 +41,7 @@ def test_hover_and_selection_update_only_interaction_layer(qtbot):
         static=plot._static_paint_count;overlay=plot._interaction_layer.paint_count
         chart.selectionPress(chart.x_at(0),chart.box.center().y())
         chart.selectionMove(chart.x_at(2),chart.box.center().y())
-        qtbot.waitUntil(lambda:plot._interaction_layer.paint_count>overlay)
+        wait_for_paint(overlay)
         assert plot._static_paint_count==static
         chart.set_rows(observations([(100,0),(99,3)]))
         assert not chart.detail_at(200,200) and not chart.tip_at(200,200)
