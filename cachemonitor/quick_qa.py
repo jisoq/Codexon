@@ -11,10 +11,10 @@ def walk(item):
 
 
 def scene_view(host,node):
-    matches=[item for item in walk(host.quick.rootObject())
-             if item.property('node') is node and item.metaObject().indexOfProperty('sourceComponent')>=0]
-    if not matches:raise AssertionError(f'Presentation node not rendered: {node.objectName()} ({node.kind})')
-    return matches[0]
+    for item in walk(host.quick.rootObject()):
+        if item.property('node') is node and item.metaObject().indexOfProperty('sourceComponent')>=0:
+            return item
+    raise AssertionError(f'Presentation node not rendered: {node.objectName()} ({node.kind})')
 
 
 def control(host,node):
