@@ -4,7 +4,7 @@ FocusScope {
     id: root
     required property var node
     property var s: node ? node.state : ({})
-    implicitHeight: 56
+    implicitHeight: 40
     activeFocusOnTab: true
     Accessible.role: Accessible.Slider
     Accessible.name: appLanguage.text("시간 탐색기")
@@ -88,12 +88,14 @@ FocusScope {
         }
     }
     Text {
+        visible: root.height >= 56
         anchors.left: parent.left; anchors.leftMargin: 16; y: 37
         width: (parent.width - 32) / 2; text: root.s.oldestLabel || ""
         font.family: appTheme.family; font.pixelSize: 12; color: appTheme.palette.muted
         elide: Text.ElideRight
     }
     Text {
+        visible: root.height >= 56
         anchors.right: parent.right; anchors.rightMargin: 16; y: 37
         width: (parent.width - 32) / 2; text: root.s.latestLabel || ""
         font.family: appTheme.family; font.pixelSize: 12; color: appTheme.palette.muted

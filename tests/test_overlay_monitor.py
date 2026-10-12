@@ -103,6 +103,38 @@ def test_waiting_cards_and_old_values_are_distinct(monkeypatch):
     m.set_content(data);assert not m.freshness_text() and m.monitor_links()
 
 
+@pytest.mark.parametrize('language',['ko','en'])
+def test_fresh_collection_time_updates_open_details_without_rebuilding_evidence(monkeypatch,language):
+    from copy import deepcopy
+    from PySide6.QtWidgets import QApplication
+    from cachemonitor.i18n import set_language
+    from cachemonitor.overlay_view import OverlayContent,timestamp
+    from test_overlay_presentation import summary
+    app=QApplication.instance() or QApplication([])
+    monkeypatch.setattr('cachemonitor.overlay_view.time.time',lambda:1000)
+    set_language(language)
+    try:
+        content=OverlayContent();data=summary(count=16,misses=16)
+        data['_collection']={'last_confirmed_at':950}
+        content.set_content(data,'수집 지연');content.set_layout(detail=True)
+        before=deepcopy(content._detail_items);accessible=content.detailBody.state['accessible']
+        assert timestamp(950) in accessible
+        def unexpected_rebuild():raise AssertionError('Collection time rebuilt all session evidence')
+        monkeypatch.setattr(content,'detail_items',unexpected_rebuild)
+        updated={**data,'_collection':{'last_confirmed_at':953}}
+        content.set_content(updated,'수집 지연')
+        after=content.detailBody.state['accessible']
+        assert after==accessible.replace(timestamp(950),timestamp(953))
+        assert content.freshness_text()==OverlayContent.collection_age(data,'수집 지연')
+        assert sum(old!=new for old,new in zip(before,content._detail_items))==1
+        changes=[];content.detailBody.changed.connect(lambda:changes.append(True))
+        content.set_content(updated,'수집 지연');assert not changes
+        content.set_layout(detail=False);changes.clear()
+        content.set_content({**data,'_collection':{'last_confirmed_at':956}},'수집 지연')
+        assert not changes and not content._detail_items
+    finally:set_language('ko')
+
+
 def test_child_call_navigation_and_scope_switch_guard():
     from types import SimpleNamespace
     from cachemonitor.overlay_navigation import navigation_target

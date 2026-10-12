@@ -67,6 +67,7 @@ class QuotaSidebar(Group):
         super().__init__()
         self.setObjectName('quota-sidebar');self.put(background='secondary',radius=10)
         self.quota=None;self.issue='';self.reset_dialog=None;self.reset_items=[]
+        self.lookup_failed=False;self.failure_note=''
         self._reset_rows=[];self._reset_note='';self._dialog_signature=None
         body=Column(self);body.setContentsMargins(12,12,12,12);body.setSpacing(7)
         heading=Row();heading.setSpacing(4)
@@ -99,6 +100,11 @@ class QuotaSidebar(Group):
 
     def receive(self,value):
         self.quota=value.get('quota');self.issue=value.get('issue','')
+        from .app_errors import detect
+        facts=(value.get('quota_faults') or {}).get('lookup') or {}
+        self.lookup_failed=bool(facts.get('lookup_failed'))
+        fault=detect('quota',facts,time.time())
+        self.failure_note=fault.explanation+'\n'+fault.guidance if fault else ''
         self.refresh_status()
 
     def refresh_status(self):
@@ -110,7 +116,10 @@ class QuotaSidebar(Group):
                    'enterprise':'Enterprise','edu':'Edu'}.get(plan,'')
         self.plan.setText(plan_text);self.plan.setToolTip(plan_text);self.plan.setVisible(bool(plan_text))
         for mode,card in self.current.items():
-            display=quota_display(self.quota,mode,now);remaining=display['remaining']
+            display=quota_display(self.quota,mode,now)
+            if self.lookup_failed:
+                display={**display,'remaining':None,'state':'최신 잔여량 미확인','tooltip':self.failure_note}
+            remaining=display['remaining']
             card['value'].setText(f'{remaining:.1f}%' if remaining is not None else
                                   '∞' if display['state']=='제한 없음' else '—')
             card['value'].setToolTip(display['tooltip'])
@@ -174,13 +183,14 @@ class QuotaSidebar(Group):
         self.expiry.setText(summary);self.expiry.setToolTip(self._reset_note)
         self.reset_button.setToolTip(self._reset_note)
         age=now-observed if observed else None
-        status=('조회 갱신 대기' if self.issue or age is None or age<0 else
+        status=('최신 잔여량 미확인' if self.lookup_failed else
+                '조회 갱신 대기' if self.issue or age is None or age<0 else
                 '갱신 지연' if age>=90 else '방금 갱신' if age<60 else
                 formatted('{minutes}분 전 갱신',minutes=int(age//60)))
         self.status.setText(status)
         stamp=reset_time(observed,zone)
         checked=formatted('마지막 확인 {date}',date=stamp.toString('yyyy/MM/dd HH:mm')) if stamp else ''
-        self.status.setToolTip('\n'.join(part for part in (self.issue,checked) if part).replace(chr(183),' / '))
+        self.status.setToolTip('\n'.join(part for part in (self.failure_note or self.issue,checked) if part).replace(chr(183),' / '))
         if self.reset_dialog:
             signature=(repr(self._reset_rows),self._reset_note,str(count_text),bytes(zone.id()))
             if signature!=self._dialog_signature:self._render_details(signature,count_text,zone)

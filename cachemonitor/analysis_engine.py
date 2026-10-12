@@ -79,6 +79,13 @@ def owned_histories(sessions):
     return _owned_histories_python(sessions)
 
 
+def request_signature(source):
+    revision=source.get('request_revision')
+    if revision is not None:return revision
+    return tuple(repr(source.get(key)) for key in
+        ('request_state','turn_records','coverage_gaps','turn_states','unclassified'))
+
+
 class AnalysisEngine:
     def __init__(self):
         self.sessions=OrderedDict()
@@ -92,7 +99,42 @@ class AnalysisEngine:
         self.generation=0
         self.pricing_signature=None
         self.timestamps=[]
+        self.ownership_sources={}
+        self.ownership_candidates=defaultdict(set)
+        self.owned_rows={}
+        self.ownership_versions={}
         self.metrics={'priced_calls':0,'session_rebuilds':0,'part_builds':0,'view_builds':0,'cache_hits':0}
+
+    def update_ownership(self,sessions):
+        sources={(s['home'],s['id']):s for s in sessions}
+        affected=set();touched=set()
+        for key in self.ownership_sources.keys()-sources.keys():
+            _,identities,_=self.ownership_sources.pop(key)
+            for identity in identities:
+                self.ownership_candidates[identity].discard(key);touched.add(identity)
+            self.owned_rows.pop(key,None);self.ownership_versions.pop(key,None)
+        for key,source in sources.items():
+            token=source.get('usage_revision')
+            if token is None:token=row_signatures(source['history'])
+            old=self.ownership_sources.get(key)
+            if old is not None and old[0]==token:continue
+            identities={call_identity(*key,row.get('key')) for row in source['history']}
+            for identity in old[1] if old else ():
+                self.ownership_candidates[identity].discard(key);touched.add(identity)
+            for identity in identities:
+                self.ownership_candidates[identity].add(key);touched.add(identity)
+            self.ownership_sources[key]=(token,identities,source['history'])
+            affected.add(key)
+        for identity in touched:
+            candidates=self.ownership_candidates[identity]
+            affected.update(candidates)
+            if not candidates:del self.ownership_candidates[identity]
+        for key in affected:
+            rows=self.ownership_sources[key][2]
+            self.owned_rows[key]=[row for row in rows
+                if min(self.ownership_candidates[call_identity(*key,row.get('key'))])==key]
+            self.ownership_versions[key]=self.ownership_versions.get(key,0)+1
+        return [self.owned_rows[key] for key in sources]
 
     def ingest(self,sessions):
         previous_sessions={**self.sessions,**self.internal_sessions}
@@ -101,14 +143,13 @@ class AnalysisEngine:
         # callers retain the full fingerprint path.
         fast=tuple(((s['home'],s['id']),s.get('usage_revision'),
                     tuple(s.get(k) for k in ('title','cwd','project','project_name','source','archived','collection_complete','pending','parent_thread_id','agent_path','agent_nickname','spawn_depth')),
-                    repr(s.get('request_state',{})),repr(s.get('turn_records',{})),
-                    repr(s.get('coverage_gaps',[])),repr(s.get('turn_states',{})),repr(s.get('unclassified')))
+                    request_signature(s))
                    for s in sessions) if all(s.get('usage_revision') is not None for s in sessions) else None
         if fast is not None and fast==getattr(self,'_ingest_key',None) and price_signature==self.pricing_signature:
             for s in sessions:previous_sessions[(s['home'],s['id'])]['source']=s
             return False
         self._ingest_key=fast
-        owned_sources = owned_histories(sessions)
+        owned_sources = self.update_ownership(sessions)
         price_signature=pricing_signature()
         reprice=price_signature!=self.pricing_signature
         self.pricing_signature=price_signature
@@ -118,11 +159,10 @@ class AnalysisEngine:
             key=(source['home'],source['id'])
             old=previous_sessions.get(key)
             revision=source.get('usage_revision')
-            metadata=tuple(source.get(k) for k in ('title','cwd','project','project_name','source','archived','collection_complete','pending','parent_thread_id','agent_path','agent_nickname','spawn_depth'))+(tuple(source.get('request_state',{}).items()),
-                tuple(r.get('key') for r in owned_history),
-                repr(source.get('turn_records',{})),repr(source.get('coverage_gaps',[])))
+            metadata=tuple(source.get(k) for k in ('title','cwd','project','project_name','source','archived','collection_complete','pending','parent_thread_id','agent_path','agent_nickname','spawn_depth'))+(
+                request_signature(source),self.ownership_versions[key])
             fingerprint=(metadata,revision if revision is not None else row_signatures(source['history']),
-                         tuple(sorted(source.get('turn_states',{}).items())),tuple(sorted((source.get('unclassified') or {}).items())))
+                         request_signature(source))
             if old and old['fingerprint']==fingerprint and not reprice:
                 # Diagnostics change independently of usage/metadata caches.
                 old['source']=source
@@ -133,6 +173,8 @@ class AnalysisEngine:
             if old and not reprice and old['fingerprint'][1:]==fingerprint[1:]:
                 before=old['fingerprint'][0]
                 if before[:6]+before[7:]==metadata[:6]+metadata[7:]:
+                    # Completeness changes query flags, not observed calls or
+                    # requests. Keep their revision for downstream consumers.
                     updated[key]={**old,'source':source,'prepared':{**old['prepared'],'collection_complete':source.get('collection_complete')},
                         'fingerprint':fingerprint,'revision':self.generation}
                     continue
@@ -174,7 +216,8 @@ class AnalysisEngine:
             boundaries=sorted(value for turn in source.get('turn_records',{}).values()
                               for value in (turn.get('started_at'),turn.get('ended_at')) if value is not None)
             updated[key]={'source':source,'prepared':prepared,'records':records,'fingerprint':fingerprint,
-                          'revision':self.generation,'timestamps':sorted(r['ts'] for r in history),'boundaries':boundaries,'whole_turns':dict(whole_turns)}
+                          'revision':self.generation,'content_revision':self.generation,
+                          'timestamps':sorted(r['ts'] for r in history),'boundaries':boundaries,'whole_turns':dict(whole_turns)}
             self.metrics['session_rebuilds']+=1
         if set(updated)!=set(previous_sessions): changed=True
         self.internal_sessions=OrderedDict((key,state) for key,state in updated.items() if internal_review(state['prepared']))

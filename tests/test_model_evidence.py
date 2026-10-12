@@ -7,6 +7,123 @@ from test_index import finish
 from test_core import fixture_home
 
 
+def test_old_evidence_remains_queryable_after_bounded_memory_eviction(tmp_path,monkeypatch):
+    store=EvidenceStore(tmp_path/'evidence.sqlite');reader=EvidenceReader(store.path)
+    monkeypatch.setattr(reader,'MAX_RECORDS',16)
+    try:
+        for n in range(128):store.write(tmp_path/'home',f'a{n}',n,'WebSocket',f'r{n}','requested','actual','completed')
+        reader.poll()
+        assert len(reader.activity_records)<=16
+        assert sum(len(records) for records in reader.records.values())<=16
+        row=reader.enrich(tmp_path/'home',[{'key':'r0'}],'old')[0]
+        assert row['requested_model']=='requested' and row['response_model']=='actual'
+        store.write(tmp_path/'home','a0',200,'WebSocket','r0','corrected','corrected','completed')
+        reader.poll()
+        assert len(reader.changed_activity)==1
+        assert reader.enrich(tmp_path/'home',[{'key':'r0'}],'old')[0]['requested_model']=='corrected'
+    finally:reader.close();store.close()
+
+
+def test_many_attempts_keep_all_conflict_decisions_with_bounded_join_memory(tmp_path,monkeypatch):
+    from cachemonitor.model_evidence import home_key
+    store=EvidenceStore(tmp_path/'evidence.sqlite');reader=EvidenceReader(store.path);home=tmp_path/'home'
+    try:
+        for n in range(257):
+            store.write(home,f'a{n}',n,'HTTP/SSE' if n==128 else 'WebSocket','same',
+                'different' if n==128 else 'requested','actual','completed',
+                requested_service_tier='priority' if n==129 else 'default',observation_missing=n==127)
+        reader.poll();rows=[{'key':'same'}]
+        original=reader.evidence_rows
+        selected=list(original(home_key(home),rows))[0][1]
+        assert len(selected)<=32
+        actual=reader.enrich(home,rows,'bounded')
+        full=[dict(row) for row in reader.db.execute('SELECT * FROM model_observations')]
+        monkeypatch.setattr(reader,'evidence_rows',lambda home,rows:((row,full) for row in rows))
+        assert reader.enrich(home,rows,'reference')==actual
+    finally:reader.close();store.close()
+
+
+def test_reader_drains_available_batches_without_waiting_between_polls(tmp_path, monkeypatch):
+    store=EvidenceStore(tmp_path/'evidence.sqlite');reader=EvidenceReader(store.path)
+    monkeypatch.setattr(reader,'READ_BATCH',2)
+    try:
+        for n in range(7):store.write(tmp_path/'home',f'a{n}',n,'WebSocket',f'r{n}',status='completed')
+        reader.poll()
+        assert len(reader.records)==7 and not reader.catching_up
+        monkeypatch.setattr(reader,'READ_SECONDS',0)
+        for n in range(7,12):store.write(tmp_path/'home',f'a{n}',n,'WebSocket',f'r{n}',status='completed')
+        reader.poll()
+        assert reader.catching_up and len(reader.records)==9
+        monkeypatch.setattr(reader,'READ_SECONDS',10)
+        reader.poll()
+        assert not reader.catching_up and len(reader.records)==12
+    finally:reader.close();store.close()
+
+
+def test_partial_observation_read_advances_publication_revision_and_recovers(tmp_path,monkeypatch):
+    import sqlite3
+    store=EvidenceStore(tmp_path/'evidence.sqlite');reader=EvidenceReader(store.path);home=tmp_path/'home'
+    try:
+        store.write(home,'first',1,'WebSocket','first',status='completed');reader.poll()
+        before=reader.revision;db=reader.db
+        for n in range(2,4):store.write(home,f'a{n}',n,'WebSocket',f'r{n}',status='completed')
+        monkeypatch.setattr(reader,'READ_BATCH',1)
+        class Interrupted:
+            def __init__(self):self.batches=0
+            def execute(self,sql,*args):
+                if 'seq>? AND seq<=?' in sql:
+                    self.batches+=1
+                    if self.batches==2:raise sqlite3.OperationalError('interrupted observation read')
+                return db.execute(sql,*args)
+            def close(self):db.close()
+        reader.db=Interrupted();reader.poll()
+        assert reader.error and reader.catching_up and reader.revision>before
+        assert len(reader.activity_records)==2
+        reader.db=db;reader.poll()
+        assert not reader.error and not reader.catching_up
+        assert len(reader.activity_records)==3
+    finally:reader.close();store.close()
+
+
+def test_replaced_observation_sequence_discards_previous_evidence(tmp_path):
+    store=EvidenceStore(tmp_path/'evidence.sqlite');reader=EvidenceReader(store.path)
+    home=tmp_path/'home'
+    try:
+        store.write(home,'old',1,'WebSocket','old-response','old-model','old-model','completed')
+        reader.poll();generation=reader.generation
+        reader.enrich(home,[{'key':'old-response'}],'session')
+        store.db.execute('DELETE FROM model_observations')
+        store.db.execute("DELETE FROM sqlite_sequence WHERE name='model_observations'")
+        store.db.commit()
+        # A replacement may already have a higher high-water mark than the old reader.
+        store.write(home,'new',2,'WebSocket','new-response','new-model','new-model','completed')
+        store.write(home,'next',3,'WebSocket','next-response',status='created')
+        reader.poll()
+        assert reader.generation>generation and reader.offset==2
+        assert not reader.enrich(home,[{'key':'old-response'}],'session')[0]['wire_observed']
+        assert reader.enrich(home,[{'key':'new-response'}],'session')[0]['requested_model']=='new-model'
+        assert all(attempt!='old' for _,attempt in reader.activity_records)
+    finally:reader.close();store.close()
+
+
+def test_join_cache_releases_dependencies_when_invalidated_history_changes(tmp_path):
+    from cachemonitor.model_evidence import home_key
+    store=EvidenceStore(tmp_path/'evidence.sqlite');reader=EvidenceReader(store.path);home=tmp_path/'home'
+    try:
+        for n in range(12):
+            rows=[{'key':'shared'},{'key':f'current-{n}'}]
+            reader.enrich(home,rows,'session')
+            store.write(home,f'a{n}',n,'WebSocket','shared',status='completed');reader.poll()
+            reader.enrich(home,rows,'session')
+            assert set(reader.dependencies)=={(home_key(home),row['key']) for row in rows}
+            assert reader.cache_rows==2 and len(reader.cache_dependencies)==1
+        reader.MAX_CACHE_ROWS=3
+        large=[{'key':f'large-{n}'} for n in range(4)]
+        assert len(reader.enrich(home,large,'session'))==4
+        assert not reader.cache and not reader.dependencies and reader.cache_rows==0
+    finally:reader.close();store.close()
+
+
 def test_cancelled_response_releases_tracking_and_replay_keeps_next_request(tmp_path):
     from cachemonitor.model_proxy import Tracker
     store=EvidenceStore(tmp_path/'cancelled.sqlite')

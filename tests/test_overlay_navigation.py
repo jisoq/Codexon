@@ -126,8 +126,7 @@ def test_unique_entries_selection_and_captured_call(layout_controller):
     c.activate_detail()
     assert c.expanded and m.selected()['id']==data['recent'][0]['id']
     assert not m.detail_links()
-    formulas=[r[0] for r in m._detail_items]
-    assert '계산 기준' in formulas
+    assert m.state['detailTooltips']
     c.escape();assert not c.expanded
 
 
@@ -150,6 +149,69 @@ def test_passive_metrics_and_inline_header_regions(layout_controller):
         assert close.x()+close.width() < c.actions_geometry[0]-c.monitor_geometry[0]
     assert named_item(c.detail.quick.rootObject(),'closeDetail') is not None
     assert not any(control.qml_errors for control in c.chrome)
+
+
+def test_detail_formulas_hover_over_values_and_follow_scrolling(layout_controller):
+    import time
+    from PySide6.QtCore import QObject,QPointF
+    from PySide6.QtTest import QTest
+    from cachemonitor.i18n import tr
+    from cachemonitor.overlay_chrome import named_item
+    from cachemonitor.overlay_tracking import Selection
+    from test_overlay_presentation import summary
+    c=layout_controller;m=c.widget.content_model;data=summary(count=3)
+    c.receive_snapshot({'overlay_sessions':[data]})
+    c.receive_target({'target':{'hwnd':1},'selection':Selection(data['id'])})
+    c.expanded=True
+
+    def wait_for(condition):
+        deadline=time.monotonic()+3
+        while not condition():
+            assert time.monotonic()<deadline, str(dict(
+                target_visible=target.isVisible(),target_rect=target.mapRectToScene(target.boundingRect()),
+                quick_visible=c.detail.quick.isVisible(),tip_visible=tooltip.property('visible'),
+                handlers=[(child.metaObject().className(),child.property('hovered')) for child in target.children()]))
+            QTest.qWait(10)
+
+    def hover(target,x,y):
+        point=target.mapToScene(QPointF(target.width()*x,target.height()*y)).toPoint()
+        assert c.detail.quick.rect().contains(point)
+        QTest.mouseMove(c.detail.quick.quickWindow(),point)
+
+    for bounds in ((0,0,1300,1000),(0,0,550,1000)):
+        c.native.bounds=bounds;c.refresh()
+        root=c.detail.quick.rootObject();scroll=named_item(root,'detailScroll')
+        scroll.setProperty('contentY',0)
+        tip_data=m.state['detailTooltips'][0]
+        target=named_item(root,'detailFormulaTarget-'+tip_data['id'])
+        tooltip=target.findChild(QObject,'detailFormulaTip-'+tip_data['id'])
+        selected=m.selected_id
+        hover(target,.2,.2)
+        wait_for(lambda:tooltip.property('opened'))
+        assert tooltip.property('text')==tr(tip_data['tooltip'])
+        hover(target,.8,.8)
+        assert tooltip.property('opened') and m.selected_id==selected
+
+        session_tip=next(tip for tip in m.state['detailTooltips']
+                         if tip['tooltip'].startswith('세션 캐시 읽기 토큰 합계'))
+        maximum=scroll.property('contentHeight')-scroll.height()
+        scroll.setProperty('contentY',min(maximum,session_tip['y']*m.appearance.scale))
+        wait_for(lambda:not tooltip.property('visible'))
+        target=named_item(root,'detailFormulaTarget-'+session_tip['id'])
+        tooltip=target.findChild(QObject,'detailFormulaTip-'+session_tip['id'])
+        hover(target,.9,.7)
+        wait_for(lambda:tooltip.property('opened'))
+        assert tooltip.property('text')==tr(session_tip['tooltip'])
+        assert m.selected_id==selected
+
+        heading=named_item(root,'openDashboard')
+        point=heading.mapToScene(heading.boundingRect().center()).toPoint()
+        QTest.mouseMove(c.detail.quick.quickWindow(),point)
+        wait_for(lambda:not tooltip.property('visible'))
+        assert not c.detail.qml_errors
+
+    c.toggle_expanded()
+    assert not m.state['detailTooltips']
 
 
 def test_header_pointer_and_graph_pin_values(layout_controller,monkeypatch):

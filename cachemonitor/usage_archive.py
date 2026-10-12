@@ -29,7 +29,7 @@ def _views(groups,now):
     for key,session,revision in groups:
         view=session.view(now,use_cache=True)
         view.update(source='imported',collection_complete=True,archived=False,purpose=key[2],
-            usage_revision=revision)
+            usage_revision=revision,request_revision=revision)
         result.append(view)
     return result
 

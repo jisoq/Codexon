@@ -14,6 +14,10 @@ Item {
     required property var node
     property bool horizontalParent: false
     property var s: node ? node.state : ({})
+    property var buttonText: undefined
+    property var labelText: undefined
+    property string buttonIcon: s.iconName || ""
+    property string toolTipText: s.tooltip || ""
     visible: !!node && s.visible
     enabled: !!node && s.enabled
     implicitWidth: item ? item.implicitWidth : 0
@@ -29,6 +33,10 @@ Item {
     Layout.fillHeight: s.height < 0 && (s.stretch > 0 || !!s.expandY || (horizontalParent && ["group","row","column","scroll","plot"].includes(s.kind)) || ["stack", "tabs", "split"].includes(s.kind))
     Component.onCompleted: content.setSource("NodeView.qml", {
         node: Qt.binding(function() { return child.node }),
-        horizontalParent: Qt.binding(function() { return child.horizontalParent })
+        horizontalParent: Qt.binding(function() { return child.horizontalParent }),
+        buttonText: Qt.binding(function() { return child.buttonText }),
+        labelText: Qt.binding(function() { return child.labelText }),
+        buttonIcon: Qt.binding(function() { return child.buttonIcon }),
+        toolTipText: Qt.binding(function() { return child.toolTipText })
     })
 }

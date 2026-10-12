@@ -48,7 +48,8 @@ class ServiceController(QObject):
     def invoke(self,name):
         if self.closed or self.operation:return
         self.operation=ServiceOperation(self.services,name,self)
-        self.operation.result.connect(self.result)
+        self.operation.result.connect(lambda value,operation=name:
+            self.result.emit({**value,'background_operation':operation}))
         self.operation.finished.connect(self.finished)
         self.operation.start()
 

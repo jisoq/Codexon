@@ -75,6 +75,12 @@ def normalize_limits(result, observed, account):
             'reset_credits':normalize_reset_credits(result.get('rateLimitResetCredits'))}
 
 
+class QuotaLookupError(RuntimeError):
+    def __init__(self,code,message):
+        self.code=code
+        super().__init__(message)
+
+
 class AccountClient:
     ALLOWED = {'initialize', 'account/read', 'account/rateLimits/read'}
     _quota_cache = {}
@@ -132,7 +138,7 @@ class AccountClient:
             if value.get('id') == self.sequence:
                 if 'error' in value:
                     # Never store arbitrary server error payloads or auth data.
-                    raise RuntimeError(f'Codex 한도 조회 실패 ({value["error"].get("code", "unknown")})')
+                    raise QuotaLookupError('rpc_error',f'Codex 한도 조회 실패 ({value["error"].get("code", "unknown")})')
                 return value.get('result') or {}
         raise TimeoutError('한도 조회 시간 초과')
 
@@ -143,7 +149,7 @@ class AccountClient:
             account = self.rpc('account/read', {'refreshToken': False}).get('account') or {}
             identity = account.get('email') or account.get('id')
             if not identity:
-                raise RuntimeError('로그인된 Codex 계정 확인 필요')
+                raise QuotaLookupError('account_missing','로그인된 Codex 계정 확인 필요')
             key = hashlib.sha256(str(identity).encode()).hexdigest()
             with self._quota_lock:
                 cached = self._quota_cache.get(key)

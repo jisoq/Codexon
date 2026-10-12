@@ -133,9 +133,12 @@ def sync_activity(db, snapshot, cache=None):
                 continue
             cache_key=('turns',home,session['id'])
             records=session.get('turn_records', {})
-            if cache.get(cache_key)==records:
+            token=('revision',session['request_revision']) if session.get('request_revision') is not None else records
+            if cache.get(cache_key)==token:
                 continue
-            cache[cache_key]={key:dict(value) for key,value in records.items()}
+            if session.get('request_revision') is not None:cache[cache_key]=token
+            elif len(records)<=4096:cache[cache_key]={key:dict(value) for key,value in records.items()}
+            while len(cache)>4096:cache.pop(next(iter(cache)))
             for turn, record in session.get('turn_records', {}).items():
                 start, end = record.get('started_at'), record.get('ended_at')
                 if start is None or (end is not None and end < enabled[0]):
@@ -159,6 +162,7 @@ def sync_activity(db, snapshot, cache=None):
             if cache.get(cache_key)==request:
                 continue
             cache[cache_key]=dict(request)
+            while len(cache)>4096:cache.pop(next(iter(cache)))
             start = request.get('request_observed_at') or request['ts']
             end = request.get('completed_observed_at')
             terminal = request['status'] in ('completed','failed','incomplete','disconnected','http_error','unparsed','cancelled')
@@ -170,9 +174,11 @@ def sync_activity(db, snapshot, cache=None):
                 end = snapshot['ts']
             if end is not None and end < enabled[0]:
                 continue
-            old = db.execute('select end from tracking_wire where home=? and identity=?', (home,request['attempt'])).fetchone()
+            old = db.execute('select * from tracking_wire where home=? and identity=?', (home,request['attempt'])).fetchone()
             if old and old['end'] is not None and not request.get('completed_observed_at'):
                 end = old['end']
+            if old is not None and (old['response'],old['start'],old['end'],old['status'])==(
+                request.get('response_id',''),start,end,request['status']):continue
             db.execute('insert or replace into tracking_wire values(?,?,?,?,?,?)',
                 (home,request['attempt'],request.get('response_id',''),start,end,request['status']))
             db.execute('insert into tracking_activity_versions(home,identity,seen,start,end,kind,status,response) values(?,?,?,?,?,?,?,?)',

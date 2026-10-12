@@ -260,7 +260,7 @@ class OverlaySummaries:
         for key, state in engine.sessions.items():
             source=state.get('source',state['prepared'])
             coverage_gaps=source.get('coverage_gaps',())
-            revision = (state['revision'],bool(coverage_gaps))
+            revision = (state.get('content_revision',state['revision']),bool(coverage_gaps))
             previous = self.cache.get(key)
             summary = previous[1] if previous and previous[0] == revision else summarize_session(
                 dict(state['prepared'],coverage_gaps=coverage_gaps),

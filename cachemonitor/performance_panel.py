@@ -1,4 +1,4 @@
-"""Calendar trends and adaptive distributions with shared mode inspection."""
+"""Adaptive distributions with shared model and mode inspection."""
 import json
 from datetime import datetime, timedelta
 from bisect import bisect_left, bisect_right
@@ -90,17 +90,17 @@ def aggregation_text(unit):
               '세션 동일 비중 평균' if unit=='cache_ratio' else '구간 호출 수' if unit=='count' else '호출당 평균')
 
 
-def plot_values(data,selected,single,outer=False):
+def plot_values(data,selected,outer=False):
     values=[]
     for line in data['lines']:
         if not selected(line):continue
         for point in line['points']:
             values.append(point['value'])
-            if single and data.get('rolling'):
+            if data.get('rolling'):
                 stats=point['distribution']
                 if point.get('band_valid'):values.extend((stats['q1'],stats['q3']))
                 if outer and point.get('outer_valid'):values.extend((stats['p10'],stats['p90']))
-    if single and data.get('raw_visible'):
+    if data.get('raw_visible'):
         values.extend(p['value'] for p in data['points'] if selected(p))
     return values
 
@@ -275,17 +275,21 @@ class IntervalDetails(Group):
     def set_modes(self,points,unit):
         self.mode_comparison.setVisible(bool(points))
         fmt=lambda value:tr(value_text(value,unit))
-        lines=[tr('같은 시각 모드 비교')]
-        for point in points:
-            value=fmt(point['value']) if point['value'] is not None else tr(point['status'])
-            lines.append(point['service_tier']+'  '+value+' / '+tr('표본')+f" {point['coverage'][0]:,}")
-            if unit!='count':lines.append(tr('시간 가중평균' if unit=='output_speed' else '평균')+' '+fmt(point.get('mean'))+' / '+tr('중앙값')+' '+fmt(point['distribution']['median']))
-        if len(points)==2 and all(p['value'] is not None for p in points):
-            by_mode={p['service_tier']:p for p in points}
-            if 'Standard' in by_mode and 'Fast' in by_mode:
+        grouped={}
+        for point in points:grouped.setdefault(point['model'],[]).append(point)
+        multiple=len(grouped)>1
+        lines=[tr('모델 비교' if multiple else '같은 시각 모드 비교')]
+        for model,entries in grouped.items():
+            prefix=model+' / ' if multiple else ''
+            for point in entries:
+                value=fmt(point['value']) if point['value'] is not None else tr(point['status'])
+                lines.append(prefix+point['service_tier']+'  '+value+' / '+tr('표본')+f" {point['coverage'][0]:,}")
+                if unit!='count':lines.append(tr('시간 가중평균' if unit=='output_speed' else '평균')+' '+fmt(point.get('mean'))+' / '+tr('중앙값')+' '+fmt(point['distribution']['median']))
+            by_mode={p['service_tier']:p for p in entries}
+            if all(mode in by_mode and by_mode[mode]['value'] is not None for mode in ('Standard','Fast')):
                 standard=by_mode['Standard']['value'];fast=by_mode['Fast']['value']
-                if unit=='cache_ratio':lines.append(tr('Fast 대표값 차이')+f' {fast-standard:+.1f}%p')
-                elif standard>0:lines.append(tr('Fast 대표값 차이')+f' {(fast/standard-1)*100:+.1f}%')
+                if unit=='cache_ratio':lines.append(prefix+tr('Fast 대표값 차이')+f' {fast-standard:+.1f}%p')
+                elif standard>0:lines.append(prefix+tr('Fast 대표값 차이')+f' {(fast/standard-1)*100:+.1f}%')
         self.mode_comparison.setText(Verbatim('\n'.join(lines)))
 
 
@@ -298,7 +302,7 @@ class PerformancePlot(AnalyticalPlot):
         self.setAccessibleName('성능 추이 / 방향키로 시각 확인')
 
     @property
-    def rolling(self):return self.panel.single_model() and self.data.get('rolling',False)
+    def rolling(self):return self.data.get('rolling',False)
 
     @property
     def bands(self):return self.rolling and self.data.get('unit')!='count'
@@ -307,9 +311,9 @@ class PerformancePlot(AnalyticalPlot):
         self.data=data;self.metric=data['unit']
         self.put(clickEnabled=self.rolling)
         self.set_rows(sorted((point for line in data['lines'] for point in line['points'] if (point['value'] is not None or self.bands)
-                             and (not self.panel.single_model() or self.selected_style(point))),key=lambda p:(p['ts'],p['service_tier'])))
+                             and self.selected_style(point)),key=lambda p:(p['ts'],p['service_tier'])))
         self.shared_bounds=bounds is not None
-        values=plot_values(data,self.selected_style,self.panel.single_model(),self.panel.show_outer)
+        values=plot_values(data,self.selected_style,self.panel.show_outer)
         self.times=[p['ts'] for p in self.rows];self.bounds=bounds if bounds is not None else trend_bounds(values);self.rebuild_strip()
 
     def selected_style(self,p):
@@ -413,7 +417,7 @@ class PerformancePlot(AnalyticalPlot):
                     if not self.selected_style(point):continue
                     p.setPen(Qt.NoPen);p.setBrush(self.ink(point,.35));series_mark(p,self.xy(point),point['service_tier'],2)
         for line in sorted(self.data.get('lines',[]),key=self.selected_style):
-            if self.panel.single_model() and not self.selected_style(line):continue
+            if not self.selected_style(line):continue
             points=line['points'];previous=None;path=QPainterPath()
             color=self.ink(line);mode=line['service_tier']
             p.setPen(series_pen(color,mode));p.setBrush(Qt.NoBrush)
@@ -497,7 +501,7 @@ class TimeNavigator(Node):
     kind='plot'
 
     def __init__(self,panel):
-        super().__init__();self.panel=panel;self.setFixedHeight(56)
+        super().__init__();self.panel=panel;self.setFixedHeight(40)
         self.put(timeNavigation=True,fullStart=0.,fullEnd=1.,start=0.,end=1.,oldestLabel='',latestLabel='')
 
     @Slot(float,float)
@@ -522,13 +526,10 @@ class PerformancePanel(Group):
         self.plots={};self.inspection_time=None;self.inspected=None;self.available=[];self.updating=False
         try:saved=json.loads(dashboard.settings.value('performance/selection','{}'))
         except (ValueError,TypeError):saved={}
-        self.granularity=saved.get('granularity','day')
-        if self.granularity not in ('auto','day','week','month'):self.granularity='day'
+        self.granularity='auto'
         self.reasoning_effort=saved.get('reasoning_effort','high');self.reasoning_specs={};self.reasoning_buttons={}
         self.models=saved.get('models',{});self.modes=saved.get('modes',{'Standard':True,'Fast':True})
         self.show_outer=False
-        if self.single_model():self.granularity='auto'
-        elif self.granularity=='auto':self.granularity='day'
         if not any(self.modes.values()):self.modes={'Standard':True,'Fast':True}
         self.resize_timer=QTimer(self);self.resize_timer.setSingleShot(True);self.resize_timer.setInterval(180);self.resize_timer.timeout.connect(self.request)
         self.body=Column(self);self.body.setSpacing(16)
@@ -565,28 +566,22 @@ class PerformancePanel(Group):
         for title,preset,width in (('최근 7일','7d',92),('최근 30일','30d',100),('전체','all',64)):
             b=button(title,lambda p=preset:self.choose_period(p));b.setCheckable(True);b.put(selectionTab=True,flat=True)
             b.setMinimumWidth(width);periods.addWidget(b);self.period_buttons[preset]=b
-        self.period=button('',self.toggle_dates);self.period.setAccessibleName('조회 기간 변경');center.addWidget(self.period)
-        self.date_editor=Group();self.date_editor.hide();center.addWidget(self.date_editor)
+        self.period=button('',self.toggle_dates);self.period.setAccessibleName('조회 기간 변경')
+        self.date_editor=Group();self.date_editor.hide()
         dates=Row();dates.put(flow=True,spacing=6);Column(self.date_editor).addLayout(dates)
         dates.addWidget(caption('시작일',12));self.date_start=DateInput();dates.addWidget(self.date_start)
         dates.addWidget(caption('종료일',12));self.date_end=DateInput();dates.addWidget(self.date_end)
         self.date_apply=button('기간 적용',self.apply_dates);dates.addWidget(self.date_apply);dates.addWidget(button('닫기',self.date_editor.hide))
         self.date_error=caption('',12,'warning');dates.addWidget(self.date_error)
         self.timeline_footer=Group();footer=Column(self.timeline_footer);footer.setSpacing(4);center.addWidget(self.timeline_footer)
-        self.navigator=TimeNavigator(self);footer.addWidget(self.navigator)
-        status=Row();status.put(flow=True,spacing=6);footer.addLayout(status)
-        self.follow_button=button('최신 자동 추적',self.toggle_follow);self.follow_button.setCheckable(True);status.addWidget(self.follow_button)
-        self.follow_button.setToolTip('새 기록이 들어오면 조회 기간을 최신 시각으로 이동합니다.')
-        self.latest_button=button('최신으로 이동',self.move_latest);status.addWidget(self.latest_button)
-        self.latest_button.setToolTip('현재 기간 길이를 유지하며 최신 기록으로 이동하고 자동 추적을 켭니다.')
-        self.collection_time=caption('',11);self.collection_time.put(wrap=False);status.addWidget(self.collection_time)
+        self.period_controls=Group();self.period_controls.put(periodControls=True);self.period_controls.setFixedHeight(40)
+        footer.addWidget(self.period_controls);self.period_controls.append(self.period)
+        self.navigator=TimeNavigator(self);self.period_controls.append(self.navigator)
+        self.follow_button=button('새 기록 따라가기',self.toggle_follow);self.follow_button.setCheckable(True);self.period_controls.append(self.follow_button)
+        self.follow_button.setToolTip('켜면 최신 구간으로 이동하고 새 기록을 따라갑니다. 끄면 선택한 기간을 유지합니다.')
+        self.collection_time=caption('',11);self.collection_time.put(wrap=False);self.period_controls.append(self.collection_time)
         separator=Group();separator.put(background='border');separator.setFixedHeight(1);footer.addWidget(separator)
-        self.aggregation=Row();self.aggregation.put(flow=True,spacing=6);center.addLayout(self.aggregation)
-        label=caption('집계 단위',12);label.put(wrap=False);self.aggregation.addWidget(label);self.granularity_buttons={}
-        for title,unit in (('일별','day'),('주별','week'),('월별','month')):
-            b=button(title,lambda u=unit:self.choose_granularity(u));b.setCheckable(True);b.put(selectionTab=True,flat=True)
-            self.aggregation.addWidget(b);self.granularity_buttons[unit]=b
-        self.granularity_buttons['week'].setToolTip('월요일 시작')
+        center.addWidget(self.date_editor)
         self.window_note=caption('계산 폭 자동',12);self.window_note.put(wrap=False);center.addWidget(self.window_note)
         self.window_note.setToolTip('조회 기간과 화면 너비에 맞춰 자동으로 계산합니다.')
         self.chart_scroll=Scroll();self.chart_scroll.put(fillViewport=True);self.chart_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -602,20 +597,14 @@ class PerformancePanel(Group):
     def is_model_selected(self,model):return not self.models or bool(self.models.get(model,False))
     def single_model(self):return bool(self.models) and sum(bool(self.models.get(m)) for m in (self.available or self.models))==1
     def request(self):self.dashboard.render()
-    def persist(self):self.dashboard.settings.setValue('performance/selection',json.dumps(dict(models=self.models,modes=self.modes,granularity=self.granularity,reasoning_effort=self.reasoning_effort)))
-    def choose_granularity(self,unit):
-        if self.single_model() or unit not in self.granularity_buttons:return
-        if unit==self.granularity:
-            self.granularity_buttons[unit].setChecked(True);return
-        self.granularity=unit;self.inspect(None);self.persist();self.sync_selection();self.request()
+    def persist(self):self.dashboard.settings.setValue('performance/selection',json.dumps(dict(models=self.models,modes=self.modes,reasoning_effort=self.reasoning_effort)))
     def selection_is_current(self):
         selected=[m for m in self.available if self.is_model_selected(m)]
         single=self.single_model()
         if getattr(self,'legend_entries',None)!=[(m,t) for m in selected for t in ('Standard','Fast')]:return False
         legends=self.legend.findChildren(SeriesLegend)
         if len(legends)!=len(selected)*2:return False
-        if any(mark.active!=self.modes.get(mark.mode,False) or mark.bands!=single for mark in legends):return False
-        if any(b.isChecked()!=(u==self.granularity) or b.isEnabled()==single for u,b in self.granularity_buttons.items()):return False
+        if any(mark.active!=self.modes.get(mark.mode,False) or not mark.bands for mark in legends):return False
         mode='all' if all(self.modes.get(t,False) for t in ('Standard','Fast')) else 'Fast' if self.modes.get('Fast') else 'Standard'
         if any(b.isChecked()!=(k==mode) for k,b in self.mode_buttons.items()):return False
         expected=['all']+(['compare'] if 1<len(selected)<len(self.available) else [])+self.available
@@ -626,12 +615,9 @@ class PerformancePanel(Group):
     def sync_selection(self):
         # Range results already refresh plot data; unchanged selection UI stays mounted.
         if self.selection_is_current():return
-        single=self.single_model()
-        self.aggregation.setVisible(not single);self.window_note.setVisible(single)
-        for unit,b in self.granularity_buttons.items():
-            b.setChecked(unit==self.granularity);b.setEnabled(not single)
-        self.chart_help.setText('대표선: 지표별 평균 또는 중앙값\n분포 띠: 중앙 50% 표본 범위\nStandard: 실선과 원\nFast: 파선과 삼각형\n확대하면 개별 호출을 확인할 수 있습니다.' if single else '대표선: 집계 구간별 추이\n아래 띠: 개별 이상치\nStandard: 실선과 원\nFast: 파선과 삼각형')
-        self.chart_help.setToolTip('소요시간은 중앙값, 출력 속도는 전체 응답시간 기준 시간 가중평균입니다. 이동 구간의 소요시간 중앙값은 표본 5개 이상에서 표시합니다. 띠는 표본 분포입니다. 호출 수는 겹치지 않는 구간 합계입니다.' if single else '소요시간은 중앙값, 출력 속도는 전체 응답시간 기준 시간 가중평균입니다. Y축 범위는 선택한 모델과 실행 모드를 기준으로 표시합니다.')
+        self.window_note.show()
+        self.chart_help.setText('대표선: 지표별 평균 또는 중앙값\n분포 띠: 중앙 50% 표본 범위\nStandard: 실선과 원\nFast: 파선과 삼각형\n확대하면 개별 호출을 확인할 수 있습니다.')
+        self.chart_help.setToolTip('소요시간은 중앙값, 출력 속도는 전체 응답시간 기준 시간 가중평균입니다. 이동 구간의 소요시간 중앙값은 표본 5개 이상에서 표시합니다. 띠는 표본 분포입니다. 호출 수는 겹치지 않는 구간 합계입니다.')
         mode='all' if all(self.modes.get(m,False) for m in ('Standard','Fast')) else 'Fast' if self.modes.get('Fast') else 'Standard'
         for key,b in self.mode_buttons.items():b.setChecked(key==mode)
         clear(self.legend);self.legend_entries=[]
@@ -643,7 +629,7 @@ class PerformancePanel(Group):
             for mode in ('Standard','Fast'):
                 active=self.modes.get(mode,False)
                 entry=Row();entry.setSpacing(4);modes.addLayout(entry)
-                entry.addWidget(SeriesLegend(model,mode,active,self.single_model()))
+                entry.addWidget(SeriesLegend(model,mode,active,True))
                 label=caption(Verbatim(mode),12,'ink' if active else 'muted');label.put(wrap=False);entry.addWidget(label)
                 self.legend_entries.append((model,mode))
             # Selected models can be removed without clearing other comparisons.
@@ -672,11 +658,7 @@ class PerformancePanel(Group):
         (self.models if model else self.modes)[key]=checked;self.selection_changed()
     def selection_changed(self):
         previous=self.inspected;self.inspect(None)
-        desired='auto' if self.single_model() else 'day' if self.granularity=='auto' else self.granularity
-        regroup=desired!=self.granularity
-        self.granularity=desired
         self.persist();self.sync_selection()
-        if regroup:self.inspect(None);self.request();return
         self.refresh_plots();self.refresh_inspection(previous)
     def toggle_picker(self):
         self.picker.setVisible(not self.picker.isVisible());self.search.setText('');self.search_models()
@@ -695,7 +677,6 @@ class PerformancePanel(Group):
         self.navigator.setEnabled(self.navigation_ready);self.period.setEnabled(self.navigation_ready);self.follow_button.setEnabled(self.navigation_ready)
         self.follow_button.setChecked(self.follow_latest)
         start,end=self.time_range or self.range
-        self.latest_button.setEnabled(self.navigation_ready and (not self.follow_latest or end<self.full[1]-.001))
         if not self.navigation_ready:self.period.setText('조회 기간');return
         fmt='%Y.%m.%d %H:%M:%S' if end-start<86400 else '%Y.%m.%d %H:%M'
         label=datetime.fromtimestamp(start).strftime(fmt)+' — '+datetime.fromtimestamp(end).strftime(fmt)
@@ -821,12 +802,12 @@ class PerformancePanel(Group):
     def refresh_plots(self):
         if not self.plots:return
         selected=lambda point:point['model'] not in ('미확인','codex-auto-review') and self.is_model_selected(point['model']) and self.modes.get(point['service_tier'],False)
-        values=[v for spec in self.reasoning_specs.values() for v in plot_values(spec,selected,self.single_model(),self.show_outer)]
+        values=[v for spec in self.reasoning_specs.values() for v in plot_values(spec,selected,self.show_outer)]
         self.reasoning_bounds=trend_bounds(values)
         titles={'cost':'호출당 평균 환산액과 분포','output_speed':'전체 응답 기준 출력 속도와 분포','duration':'호출 소요시간 중앙값과 분포',
                 'session_cache':'세션 평균 캐시 적중률과 분포','reasoning':'평균 추론 토큰과 분포','input':'평균 입력 토큰과 분포'}
         for key,spec in list(self.specs.items()):
-            self.labels[key].setText(titles.get(key,spec['title']) if self.single_model() else spec['title'])
+            self.labels[key].setText(titles.get(key,spec['title']))
             if key=='output_speed':self.labels[key].setToolTip('추론을 포함한 출력 토큰 합계를 전체 응답시간 합계로 나눈 값입니다. 병렬 호출도 각 호출의 응답시간을 합산합니다.')
             if key=='reasoning':
                 self.set_reasoning_data();spec=self.specs[key]
@@ -834,11 +815,10 @@ class PerformancePanel(Group):
                 self.plots[key].set_data(spec)
                 label='유효 구간' if key=='count' else '유효 세션 표본' if key=='session_cache' else '유효 호출'
                 self.notes[key].setText(Verbatim(tr(label)+f" {spec['n']:,} / {spec['N']:,}"))
-            if self.single_model():
-                lines=[line for line in spec['lines'] if self.plots[key].selected_style(line)]
-                n=sum(line.get('coverage',(0,0))[0] for line in lines);total=sum(line.get('coverage',(0,0))[1] for line in lines)
-                label='호출 수' if key=='count' else '유효 세션 표본' if key=='session_cache' else '유효 호출'
-                self.notes[key].setText(Verbatim(tr(label)+f' {n:,} / {total:,}'+(' / '+tr('공통 Y축') if key=='reasoning' else '')))
+            lines=[line for line in spec['lines'] if self.plots[key].selected_style(line)]
+            n=sum(line.get('coverage',(0,0))[0] for line in lines);total=sum(line.get('coverage',(0,0))[1] for line in lines)
+            label='호출 수' if key=='count' else '유효 세션 표본' if key=='session_cache' else '유효 호출'
+            self.notes[key].setText(Verbatim(tr(label)+f' {n:,} / {total:,}'+(' / '+tr('공통 Y축') if key=='reasoning' else '')))
 
     def apply(self,data):
         previous=self.inspected

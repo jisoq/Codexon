@@ -89,6 +89,28 @@ def test_intentional_off_is_distinct_from_failed_activation(tmp_path):
         assert panel.status_label.text()=='꺼짐'
     finally:panel.stop();panel.deleteLater();app.processEvents()
 
+def test_background_recovery_clears_only_background_operation_failure(tmp_path):
+    from cachemonitor.app_errors import ErrorState
+    app=QApplication.instance() or QApplication([])
+    panel=ObserverPanel(tmp_path/'home',tmp_path/'data')
+    errors=ErrorState()
+    panel.status_observed.connect(lambda value:errors.update('connection.operation','connection',value,
+        healthy=value.get('operation_healthy',False)))
+    healthy=dict(configured=False,phase='off',probe_state='refused')
+    try:
+        panel.display(dict(error='temporary failure',observer_status=healthy,background_operation='start'))
+        assert errors.grouped()['connection'].code=='configuration'
+        panel.display(dict(background_operation='ensure'))
+        assert 'connection' in errors.grouped()
+        panel.display(dict(healthy,background_operation='ensure'))
+        assert 'connection' not in errors.grouped()
+        # A failed user request cannot be declared successful by a healthy poll.
+        panel.display(dict(error='setting failed',observer_status=healthy))
+        panel.display(dict(healthy,background_operation='ensure'))
+        assert 'connection' in errors.grouped()
+    finally:panel.deleteLater();app.processEvents()
+
+
 def test_update_recheck_cannot_skip_connection_exit(tmp_path,monkeypatch):
     from cachemonitor.update_panel import UpdatePanel
     from cachemonitor.observer_control import ObserverManager

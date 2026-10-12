@@ -12,7 +12,8 @@ Button {
     property string legendColor: ""
     property bool legendDashed: false
     readonly property bool legend: legendColor.length > 0
-    readonly property bool textButton: quiet || selectionTab || legend
+    readonly property bool navigationAction: role === "navigation"
+    readonly property bool textButton: quiet || selectionTab || legend || navigationAction
     readonly property color neutralInk: appTheme.palette.ink
     readonly property color actionFill: Qt.tint(appTheme.palette.surface, Qt.rgba(neutralInk.r, neutralInk.g, neutralInk.b, .09))
     readonly property color contentInk: !enabled ? appTheme.palette.unknown : legend ? appTheme.readableText(checked ? legendColor : "muted", "surface") : role === "primary" && !textButton ? appTheme.readableText("surface", "accent") : checked ? appTheme.palette.accent : appTheme.palette.ink
@@ -32,7 +33,7 @@ Button {
             id: caption; anchors.fill:parent; visible: !control.iconName.length
             text: control.text; font: control.font; leftPadding: control.legend ? 26 : control.disclosure ? 18 : control.leadingIcon.length ? 24 : 0
             color: control.contentInk
-            horizontalAlignment: control.disclosure || control.legend ? Text.AlignLeft : Text.AlignHCenter; verticalAlignment: Text.AlignVCenter
+            horizontalAlignment: control.disclosure || control.legend || control.navigationAction ? Text.AlignLeft : Text.AlignHCenter; verticalAlignment: Text.AlignVCenter
             elide: Text.ElideRight
             Item {
                 visible: control.disclosure; anchors.left: parent.left; anchors.verticalCenter: parent.verticalCenter
@@ -57,9 +58,14 @@ Button {
     }
     background: Rectangle {
         radius: control.selectionTab ? 0 : 5
-        color: control.textButton ? "transparent" : control.role === "primary" ? appTheme.palette.accent : control.actionFill
+        Rectangle {
+            anchors.fill: parent; anchors.margins: -4; radius: parent.radius + 4
+            color: "transparent"; border.color: appTheme.palette.accent; border.width: 2
+            visible: control.enabled && control.activeFocus && control.role === "primary"
+        }
+        color: control.navigationAction && control.checked ? appTheme.palette.secondary : control.textButton ? "transparent" : control.role === "primary" ? appTheme.palette.accent : control.actionFill
         border.color: appTheme.palette.accent
-        border.width: control.enabled && control.activeFocus && !control.legend ? (control.selectionTab ? 1 : 2) : 0
+        border.width: control.enabled && control.activeFocus && !control.legend && control.role !== "primary" ? (control.selectionTab ? 1 : 2) : 0
         Rectangle { objectName:"hover-feedback";anchors.fill:parent;radius:parent.radius;color:appTheme.palette.accent;opacity:!control.enabled || control.legend ? 0 : control.down ? .16 : control.hovered ? .09 : 0 }
         Rectangle { visible:control.legend && (control.activeFocus || control.hovered);anchors.bottom:parent.bottom;anchors.left:parent.left;anchors.right:parent.right;height:control.activeFocus ? 2 : 1;color:appTheme.palette.accent }
         Rectangle { visible:control.selectionTab && control.checked;anchors.bottom:parent.bottom;anchors.left:parent.left;anchors.right:parent.right;height:2;color:appTheme.palette.accent }

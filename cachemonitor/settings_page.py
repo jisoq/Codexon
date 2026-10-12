@@ -18,6 +18,7 @@ class SettingsPage(Group):
         '캐시 알림 범위':'cache-scope','최근 알림':'notification-history','현재 버전':'version','제작자':'creator',
         '업데이트 확인':'update','업데이트 자동 확인':'automatic-update','연결 복구':'recovery','저장소':'repository','사용 안내':'guide',
         '수집 상태':'collection-status','진단 상세':'diagnostics',
+        '현재 오류':'current-errors',
     }
     LEGACY = ('general', 'display', 'display', 'integration', 'notifications', 'about', 'integration')
 
@@ -30,16 +31,17 @@ class SettingsPage(Group):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.owner=parent;self.controls={};self.entries=[];self.sections={}
+        self.owner=parent;self.controls={};self.entries=[];self.sections={};self._search_return=None
         root=Column(self);root.setContentsMargins(0,0,0,0);root.setSpacing(18)
         search_shell=Row();search_row=Row();search_row.setMaximumWidth(1024);self.search=Input();self.search.setPlaceholderText('설정 검색')
-        self.search.setAccessibleName('설정 검색');self.search.put(clearOnEscape=True,searchIcon=True)
-        clear=Button('검색 지우기');clear.put(role='quiet');self.clear_search=clear;clear.clicked.connect(lambda:self.search.setText(''))
-        search_row.addWidget(self.search,1);search_row.addWidget(clear)
+        self.search.setAccessibleName('설정 검색');self.search.put(clearOnEscape=True,searchIcon=True,clearButton=True)
+        search_row.addWidget(self.search,1)
         search_shell.addLayout(search_row,1);search_shell.addStretch();root.addLayout(search_shell)
+        self.search_back=Button('검색 결과로 돌아가기');self.search_back.put(role='quiet',leadingIcon='back')
+        self.search_back.hide();self.search_back.clicked.connect(self.return_to_search);root.addWidget(self.search_back)
         shell=Row();shell.setSpacing(24);root.addLayout(shell,1)
         self.navigation=Navigation();self.navigation.setObjectName('settingsNavigation')
-        self.navigation.addItems(self.TITLES);self.navigation.setFixedWidth(200)
+        self.navigation.addItems(self.TITLES);self.navigation.setFixedWidth(144 if parent.width()<1200 else 200)
         self.stack=Stack();self.stack.put(deferPages=True);self.stack.setMaximumWidth(840);shell.addWidget(self.navigation);shell.addWidget(self.stack,1);shell.addStretch()
         self.layouts={};self.scrollers={}
         for category,title in zip(self.IDS,self.TITLES):
@@ -139,8 +141,8 @@ class SettingsPage(Group):
 
     def add_row(self, category, title, description, control, section=None, aliases='',depth=0):
         row=Group();row.setObjectName('settingRow')
-        outer=Column(row);outer.setContentsMargins(0,0 if depth else 12,0,12)
-        layout=Row();layout.put(collapseBelow=620,minHeight=36);layout.setSpacing(8);outer.addLayout(layout)
+        outer=Column(row);outer.setContentsMargins(0,8 if depth else 16,0,16)
+        layout=Row();layout.put(collapseBelow=1 if isinstance(control,Switch) else 620,minHeight=36);layout.setSpacing(8);outer.addLayout(layout)
         copy=Column();copy.setSpacing(4);copy.setContentsMargins(24*depth,0,0,0)
         name=Text(title);name.setWordWrap(True);name.put(bold=not depth,fontSize=13 if depth else 14);copy.addWidget(name)
         if description:
@@ -189,6 +191,7 @@ class SettingsPage(Group):
                 if key in self.scrollers:self.scrollers[key].verticalPosition.setValue(value)
 
     def filter_settings(self,query):
+        self._search_return=None;self.search_back.hide()
         for node in self.result_body._nodes:node.deleteLater()
         self.result_body._nodes=[];self.result_body.structureChanged.emit()
         words=query.casefold().split()
@@ -215,8 +218,19 @@ class SettingsPage(Group):
         target=entry['target']
         if isinstance(entry['widget'],Details):
             entry['widget'].toggle.setChecked(True);target=entry['widget'].toggle
+        query=self.search.text();position=self.results.verticalPosition.value()
         self.reveal(entry['category'],entry['widget'])
+        if query:
+            with QSignalBlocker(self.search):self.search.setText(query)
+            self._search_return=(query,position);self.search_back.show()
         QTimer.singleShot(0,lambda:target.focusRequested.emit())
+
+    def return_to_search(self):
+        if self._search_return is None:return
+        query,position=self._search_return
+        self.filter_settings(query)
+        QTimer.singleShot(0,lambda:self.results.verticalPosition.setValue(position))
+        self.search.focusRequested.emit()
 
     def bind_action(self, key, action):
         control = self.controls[key]

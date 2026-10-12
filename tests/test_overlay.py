@@ -17,6 +17,27 @@ A = '11111111-1111-1111-1111-111111111111'
 B = '22222222-2222-2222-2222-222222222222'
 
 
+def test_overlay_banner_identifies_each_trigger_without_changing_stale_threshold(monkeypatch):
+    from types import SimpleNamespace
+    from cachemonitor.overlay_view import OverlayContent
+    monkeypatch.setattr('cachemonitor.overlay.time.monotonic',lambda:100.)
+    controller=SimpleNamespace(target_state={'selection':SimpleNamespace(thread_id=A,host='local')},
+        session_lookup={A:[dict(id=A,calls=2)]},collection_issue='',collection_fault={},errors=[],loading=False,
+        snapshot_at=89.,snapshot_wall_time=1000.,refresh=lambda:None)
+    labels=[]
+    for issue,errors,reason in (('',[],'analysis_delay'),('', ['read failure'],'source_error'),
+                               ('status failure',[],'service_error'),('수집 결과 갱신 지연',[],'service_delay')):
+        controller.collection_issue=issue;controller.errors=errors
+        data,note=OverlayController.content(controller)
+        assert data['calls']==2 and data['_collection']['reason']==reason
+        labels.append(OverlayContent.collection_age(data,note))
+    assert len(set(labels))==4
+    assert '11' in labels[0]
+    controller.collection_issue='';controller.errors=[];controller.snapshot_at=90.
+    data,note=OverlayController.content(controller)
+    assert note=='' and not OverlayContent.collection_age(data,note)
+
+
 def test_missing_session_retains_service_error_and_clears_on_recovery():
     from types import SimpleNamespace
     import time

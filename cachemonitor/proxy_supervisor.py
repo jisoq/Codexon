@@ -22,7 +22,9 @@ class Protection:
         self.count = 0
 
     def observe(self, health, probe_state, exited=False):
-        if exited: return '프록시 프로세스가 예기치 않게 종료됐습니다.'
+        if exited:
+            self.problem='exit'
+            return '프록시 프로세스가 예기치 않게 종료됐습니다.'
         problem = probe_state if probe_state in ('refused', 'identity_mismatch') else None
         if health and health.get('storage_failure_streak', 0) >= 3: problem = 'storage'
         if health and health.get('internal_failure_streak', 0) >= 3: problem = 'internal'
@@ -112,7 +114,8 @@ class Supervisor:
             with ProcessLock(self.manager.control_lock):
                 state = self.manager.state()
                 if not state.get('enabled'):return False
-                incident = {'id': uuid.uuid4().hex, 'at': time.time(), 'reason': reason}
+                incident = {'id': uuid.uuid4().hex, 'at': time.time(), 'reason': reason,
+                            'kind':'observation' if self.protection.problem=='storage' else 'connection'}
                 try:
                     self.manager.recover_direct()
                     state = self.manager.state()

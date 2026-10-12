@@ -301,7 +301,21 @@ class OverlayContent(Node):
     def collection_age(data,note):
         if not data or note not in ('수집 지연','수집 오류'):return ''
         from .i18n import formatted
-        at=data.get('_collection',{}).get('last_confirmed_at')
+        collection=data.get('_collection',{});reason=collection.get('reason')
+        if reason=='analysis_delay':
+            return formatted('분석 결과 수신 지연: {seconds}초 (기준 10초)',seconds=int(collection.get('received_age',0)))
+        if reason=='source_error':
+            return formatted('수집 결과에 오류 {count}건 / 이전 값 표시',count=collection.get('source_error_count',0))
+        if reason=='service_delay':
+            facts=collection.get('service_fault',{})
+            if facts.get('snapshot_missing'):return tr('수집 상태 점검: 수집 결과 없음')
+            if facts.get('owner_unknown'):return tr('수집 상태 점검: 수집기 식별 대기')
+            if facts.get('handoff_pending'):return tr('수집 상태 점검: 새 수집기 시작 대기')
+            if facts.get('snapshot_stale'):return tr('수집 상태 점검: 30초 넘게 갱신되지 않음')
+            return tr('수집 상태 점검: 갱신 지연')
+        if reason=='service_error':
+            return formatted('수집 상태 확인 오류: {issue}',issue=tr(collection.get('service_issue','')))
+        at=collection.get('last_confirmed_at')
         if not at:return tr('이전 확인값 표시 중: 확인 시각 없음')
         seconds=max(0,int(time.time()-at))
         if seconds<60:return tr('1분 이내 확인값 표시 중')
@@ -324,7 +338,9 @@ class OverlayContent(Node):
             return {k:v for k,v in (value or {}).items() if k!='_collection'} | {'_errors':(value or {}).get('_collection',{}).get('errors',[])}
         freshness=self.collection_age(data,note)
         if (visible(data),note,appearance,freshness)==(visible(self.data),self.note,self.appearance,self._freshness_label):
-            self.data=data;return
+            self.data=data
+            if self.detail_open:self.refresh_collection_detail()
+            return
         old=(self.data or {}).get('id'),(self.data or {}).get('home');new=(data or {}).get('id'),(data or {}).get('home')
         old_call=self.call_id(self.rows()[-1]) if self.rows() else None
         if old!=new:
@@ -378,13 +394,45 @@ class OverlayContent(Node):
         return (self.data or {}).get('speed_health', {}) if not self.note else {}
     def sync_details(self):
         items=self.detail_items() if self.detail_open else [];self._detail_items=items;height=max((r[2]+r[4] for r in items),default=16)
+        tooltips=[];self._detail_confirmed=None;accessible_offset=0
+        for index,item in enumerate(items):
+            style=item[8]
+            text=''.join(item[0]) if isinstance(item[0],list) else item[0]
+            if style.get('collectionTime'):
+                self._detail_confirmed=(index,accessible_offset,len(text),(self.data or {}).get('_collection',{}).get('last_confirmed_at'))
+            accessible_offset+=len(text)+1
+            if not style.get('formula'):continue
+            x,y,width,tip_height=style['formula_bounds']
+            tooltips.append(dict(id=str(index),x=x,y=y,width=width,height=tip_height,tooltip=style['formula']))
         colors=palette(self.appearance)
         self.put(detailBodyHeight=round(height*self.appearance.scale),detailWidth=self.detail_width,detailTitle='호출 상세',detailCloseX=INLINE_CLOSE_X,
                  overlayFamily=self.appearance.family,overlaySurface=colors['surface'].name(),overlayBorder=colors['border'].name(),
                  overlayWarning=colors['warning'].name(),
-                 detailHasSelection=bool(self.selected()),detailGraphAccessible='선택 호출 상세',detailSelected=str(self.selected_id or ''))
+                 detailHasSelection=bool(self.selected()),detailGraphAccessible='선택 호출 상세',detailSelected=str(self.selected_id or ''),detailTooltips=tooltips)
         if self.detail_open:self._body.update()
         self._body.setAccessibleName('\n'.join(''.join(r[0]) if isinstance(r[0],list) else r[0] for r in items))
+    def refresh_collection_detail(self):
+        # Keep one index, two text offsets and a stamp; refresh only the 14-character
+        # time field. The required accessible body is replaced without replaying
+        # session-wide cache evidence. Closing/rebuilding details clears this state.
+        cached=self._detail_confirmed
+        if cached is None:return
+        index,start,length,previous=cached
+        stamp=(self.data or {}).get('_collection',{}).get('last_confirmed_at')
+        if stamp==previous:return
+        item=self._detail_items[index];value=tr(timestamp(stamp))
+        self._detail_confirmed=(index,start,length,stamp)
+        if ''.join(item[0])==value:return
+        metrics=QFontMetrics(font(self.appearance.family,item[5],item[7]));lines=[];line=''
+        for char in value:
+            if line and metrics.horizontalAdvance(line+char)>item[3]:lines.append(line);line=''
+            line+=char
+        lines.append(line)
+        if len(lines)*18!=item[4]:self.sync_details();return
+        self._detail_items[index]=(lines,*item[1:])
+        accessible=self._body._state['accessible']
+        self._detail_confirmed=(index,start,len(value),stamp)
+        self._body.setAccessibleName(accessible[:start]+value+accessible[start+length:])
     def monitor_links(self):
         from .overlay_monitor import links
         return links(self)
@@ -530,20 +578,20 @@ class OverlayContent(Node):
             if at is None:y+=height
         def pair(label,value,color='ink',numeric=False,formula=None,child=False):
             nonlocal y
-            first=len(items)
+            first=len(items);top=y
             formula=formula or CALCULATIONS.get(label)
             value=tr(str(value))
             metrics=QFontMetrics(font(self.appearance.family,11))
             if numeric and metrics.horizontalAdvance(str(value))>w-92:
-                text(label,color='secondary');items[first][8]['formula']=formula
-                text(value,right=True);y+=4;return
+                text(label,color='secondary');text(value,right=True)
+                items[first][8].update(formula=formula,formula_bounds=(0,top,w,y-top));y+=4;return
             text(label,x=8 if child else 0,width=80 if child else 88,color='secondary',at=y,
                  weight=600 if label in ('입력','출력') else 400);metrics=QFontMetrics(font(self.appearance.family,11));lines=[];line=''
-            items[first][8]['formula']=formula
             for char in str(value):
                 if line and metrics.horizontalAdvance(line+char)>w-92:lines.append(line);line=''
                 line+=char
-            lines.append(line);items.append((lines,92,y,w-92,len(lines)*18,11,color,400,dict(right=numeric)));y+=len(lines)*18+4
+            lines.append(line);items.append((lines,92,y,w-92,len(lines)*18,11,color,400,dict(right=numeric)))
+            items[first][8].update(formula=formula,formula_bounds=(0,top,w,len(lines)*18));y+=len(lines)*18+4
         def tokens(value):return amount(value,True)+(' 토큰' if value is not None else '')
         if self.speed_alert().get('active'):
             health=self.speed_alert()
@@ -561,8 +609,8 @@ class OverlayContent(Node):
         text('최근 호출',color='secondary',weight=600);y+=8
         if row:
             text(f"{timestamp(row.get('ts'))}, {row.get('ordinal','—')}호출",color='secondary');y+=8;half=(w-12)/2
-            text('캐시',width=half,color='secondary',at=y);items[-1][8]['formula']='선택 호출 캐시 읽기 ÷ 입력 × 100'
-            text('비용',x=half+12,width=half,color='secondary',at=y);items[-1][8]['formula']='선택 호출 구독 가치 환산액';y+=18
+            text('캐시',width=half,color='secondary',at=y);items[-1][8].update(formula='선택 호출 캐시 읽기 ÷ 입력 × 100',formula_bounds=(0,y,half,46))
+            text('비용',x=half+12,width=half,color='secondary',at=y);items[-1][8].update(formula='선택 호출 구독 가치 환산액',formula_bounds=(half+12,y,half,46));y+=18
             text(percent(row.get('cache_rate',row.get('rate'))),width=half,size=20,color='warning' if row.get('cache_warning') else 'cached_text',weight=600,height=28,at=y,kind='metric')
             text(fitted_money(row.get('cost'),half,20,self.appearance.family),x=half+12,width=half,size=20,weight=600,height=28,at=y,kind='metric');y+=40
             pair('정확한 비용',money(row.get('cost'),False),numeric=True,formula='선택 호출 구독 가치 환산액')
@@ -601,7 +649,9 @@ class OverlayContent(Node):
             label=collection_error_label(error);collection_errors[label]=collection_errors.get(label,0)+1
         for state,color in self.states():
             if state!='수집 오류' or not collection_errors:text(state,color=color)
-        if '지연' in self.note:pair('마지막 확인',timestamp(d.get('_collection',{}).get('last_confirmed_at')))
+        if '지연' in self.note:
+            pair('마지막 확인',timestamp(d.get('_collection',{}).get('last_confirmed_at')))
+            items[-1][8]['collectionTime']=True
         for label,count in collection_errors.items():text(label+(f', {count}건' if count>1 else ''),color='error')
         misses=d.get('cache_misses',{});degraded=d.get('cache_degradation',{});y+=8
         observed=d.get('calls') is not None
@@ -637,10 +687,6 @@ class OverlayContent(Node):
             formula='세션 '+part['label']+' 토큰 합계 ÷ Total × 100')
         for key,label in [('input_unknown','입력 미분류'),('output_unknown','출력 미분류')]:
             if c.get('counts',{}).get(key):pair(label,tokens(c['counts'][key]),numeric=True)
-        formulas=list(dict.fromkeys(item[8]['formula'] for item in items if item[8].get('formula')))
-        if formulas:
-            y+=16;text('계산 기준',weight=600);y+=8
-            for formula in formulas:text(formula,color='secondary');y+=6
         return items
     def headline_metrics(self):
         """One row shared by painting, hit targets and layout verification."""

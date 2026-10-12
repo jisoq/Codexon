@@ -10,6 +10,10 @@ Item {
     Loader { id: content; anchors.fill: parent }
     required property var node
     property var s: node ? node.state : ({})
+    property var buttonText: undefined
+    property var labelText: undefined
+    property string buttonIcon: s.iconName || ""
+    property string toolTipText: s.tooltip || ""
     Connections { target: view.node; function onFocusRequested() { if (view.item) view.item.forceActiveFocus(Qt.TabFocusReason) } }
     property bool horizontalParent: false
     activeFocusOnTab: s.kind === "plot"
@@ -33,7 +37,7 @@ Item {
         switch(s.kind) {
         case "row": return s.flow ? flowComponent : s.minColumnWidth ? adaptiveGridComponent : s.collapseBelow ? responsiveComponent : rowComponent
         case "column": return columnComponent
-        case "group": return groupComponent
+        case "group": return s.periodControls ? periodControlsComponent : groupComponent
         case "spacer": return spacerComponent
         case "text": return textComponent
         case "textarea": return textAreaComponent
@@ -62,6 +66,7 @@ Item {
     Component { id: breadcrumbsComponent; Breadcrumbs { node: view.node } }
     Component { id: recordFieldsComponent; RecordFields { node: view.node } }
     Component { id: timeNavigationComponent; PerformanceNavigator { node: view.node } }
+    Component { id: periodControlsComponent; PerformanceControls { node: view.node } }
     Component {
         id: groupComponent
         Rectangle {
@@ -170,7 +175,7 @@ Item {
                 anchors.leftMargin: view.s.margins[0] + (view.s.swatch ? 18 : 0); anchors.rightMargin: view.s.margins[2]
                 anchors.topMargin: view.s.margins[1]; anchors.bottomMargin: view.s.margins[3]
                 visible: !view.s.selectable
-                text: view.node.textValue; textFormat: view.s.rich || view.s.externalLinks ? Text.RichText : Text.PlainText
+                text: view.labelText === undefined ? view.node.textValue : view.labelText; textFormat: view.s.rich || view.s.externalLinks ? Text.RichText : Text.PlainText
                 wrapMode: view.s.wrap ? Text.Wrap : Text.NoWrap
                 elide: view.s.wrap || view.s.noElide ? Text.ElideNone : Text.ElideRight
                 font.family: view.s.fontFamily || appTheme.family; font.pixelSize: view.s.fontSize; font.bold: view.s.bold
@@ -252,11 +257,11 @@ Item {
         id: buttonComponent
         UiButton {
             role: view.s.role || "secondary"
-            text: view.node.textValue; checkable: view.s.checkable; checked: view.s.checked
+            text: view.buttonText === undefined ? view.node.textValue : view.buttonText; checkable: view.s.checkable; checked: view.s.checked
             font.pixelSize: view.s.fontSize
             font.weight: view.s.bold || (!quiet && !legend && !selectionTab) || (selectionTab && checked) ? Font.DemiBold : Font.Normal
             disclosure: !!view.s.disclosure
-            iconName: view.s.iconName || ""
+            iconName: view.buttonIcon
             leadingIcon: view.s.leadingIcon || ""
             selectionTab: !!view.s.selectionTab
             legendColor: view.s.legendColor || ""
@@ -266,8 +271,8 @@ Item {
             Keys.onReturnPressed: event => { if (view.s.activateOnReturn) view.node.activate(); else event.accepted = false }
             Keys.onEnterPressed: event => { if (view.s.activateOnReturn) view.node.activate(); else event.accepted = false }
             onClicked: view.node.activate()
-            Accessible.name: view.s.accessible || text
-            UiToolTip { visible: parent.hovered && view.s.tooltip.length > 0; text: view.s.tooltip }
+            Accessible.name: view.s.accessible || view.node.textValue
+            UiToolTip { visible: parent.hovered && view.toolTipText.length > 0; text: view.toolTipText }
         }
     }
     Component {
@@ -292,7 +297,7 @@ Item {
         UiChoice {
             model: view.s.items; textRole: "text"; currentIndex: view.s.index
             wrapSelectedText: !!view.s.wrap
-            wheelEnabled: true
+            wheelEnabled: false
             implicitWidth: 180
             onActivated: index => view.node.choose(index)
             Accessible.name: view.s.accessible
@@ -334,6 +339,9 @@ Item {
         UiInput {
             text: view.node.textValue; placeholderText: view.s.placeholder
             searchIcon: !!view.s.searchIcon
+            clearButton: !!view.s.clearButton
+            clearText: appLanguage.text(view.s.clearText || "검색 지우기")
+            onClearRequested: view.node.edit("")
             maximumLength: view.s.maxLength === undefined ? 32767 : view.s.maxLength
             font.pixelSize: view.s.fontSize || 14
             Accessible.name: view.s.accessible || placeholderText

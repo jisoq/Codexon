@@ -102,6 +102,29 @@ Rectangle {
             Accessible.role: Accessible.StaticText
             Accessible.name: source.state.accessible || ""
         }
+        Repeater {
+            model: root.s.detailTooltips || []
+            delegate: Item {
+                id: formulaTarget
+                required property var modelData
+                objectName: "detailFormulaTarget-" + modelData.id
+                x: modelData.x * root.unitScale; y: modelData.y * root.unitScale
+                width: modelData.width * root.unitScale; height: modelData.height * root.unitScale
+                visible: y + height > bodyScroll.contentY && y < bodyScroll.contentY + bodyScroll.height
+                HoverHandler {
+                    id: formulaHover
+                    enabled: !bodyScroll.moving
+                    cursorShape: Qt.PointingHandCursor
+                }
+                UiToolTip {
+                    objectName: "detailFormulaTip-" + formulaTarget.modelData.id
+                    visible: formulaHover.hovered && !bodyScroll.moving
+                    text: appLanguage.text(formulaTarget.modelData.tooltip)
+                }
+                Accessible.role: Accessible.StaticText
+                Accessible.name: appLanguage.text(modelData.tooltip)
+            }
+        }
         ScrollBar.vertical: ScrollBar {
             objectName: "detailScrollBar"
             parent: root

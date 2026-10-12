@@ -16,6 +16,286 @@ def finish(index, now=10010):
     raise AssertionError('index did not finish')
 
 
+def test_large_unfinished_event_obeys_read_budget_and_resumes_without_idle_rereads(tmp_path):
+    from cachemonitor.index import FILE_READ_BUDGET
+    home,path=fixture_home(tmp_path);index=UsageIndex([home],tmp_path/'index.sqlite')
+    try:
+        finish(index)
+        record=usage('large',time=10011)
+        prefix=json.dumps({k:v for k,v in record.items() if k!='payload'})[:-1]+',"payload":{"ignored":"'
+        with path.open('ab') as stream:
+            stream.write(prefix.encode())
+            for _ in range(32):stream.write(b'x'*(1024*1024))
+        reads=[]
+        for _ in range(8):
+            before=index.bytes_read;index.scan_file(str(path),home,TID)
+            reads.append(index.bytes_read-before)
+            if str(path) in index.partial_work:break
+        assert max(reads)<=FILE_READ_BUDGET
+        assert sum(reads)>=32*1024*1024
+        before=index.bytes_read
+        for _ in range(3):index.scan_file(str(path),home,TID)
+        assert index.bytes_read==before
+        with path.open('ab') as stream:
+            stream.write(('",'+json.dumps(record['payload'])[1:]+'}\n').encode())
+        result=finish(index,10012)
+        assert [r['key'] for r in analyze(result['sessions'])['responses']]==['r1','large']
+        assert not result['errors']
+    finally:index.close()
+
+
+def test_large_restart_replay_yields_between_event_batches(tmp_path,monkeypatch):
+    import cachemonitor.index as implementation
+    home,path=fixture_home(tmp_path);cache=tmp_path/'index.sqlite'
+    with path.open('a',encoding='utf8') as stream:
+        for n in range(24):stream.write(json.dumps(usage(f'r{n+2}',time=10001+n))+'\n')
+    index=UsageIndex([home],cache)
+    try:expected=analyze(finish(index,10030)['sessions'])['totals']
+    finally:index.close()
+    index=UsageIndex([home],cache);clock=[0.];consumed=[]
+    monkeypatch.setattr(implementation,'REBUILD_BATCH',4)
+    monkeypatch.setattr(implementation.time,'monotonic',lambda:clock[0])
+    original=implementation.Session.consume
+    def consume(session,event,now):
+        original(session,event,now);consumed.append(event);clock[0]+=.12
+    monkeypatch.setattr(implementation.Session,'consume',consume)
+    try:
+        partial=index.poll(10030)
+        assert partial['index']['loading'] and not partial['usage_collection_complete']
+        assert len(consumed)==4
+        actual=finish(index,10030)
+        assert actual['usage_collection_complete']
+        assert analyze(actual['sessions'])['totals']==expected
+        assert len(consumed)==25
+    finally:index.close()
+
+
+def test_restart_restores_retained_usage_after_source_removal_without_crossing_home_scope(tmp_path):
+    folders=[tmp_path/'selected',tmp_path/'other']
+    for folder in folders:folder.mkdir()
+    selected,path=fixture_home(folders[0]);other,_=fixture_home(folders[1])
+    cache=tmp_path/'index.sqlite'
+    index=UsageIndex([selected,other],cache)
+    try:
+        before=finish(index)
+        expected=next(session for session in before['sessions'] if session['home']==str(selected.resolve()))
+        retained=list(index.db.execute('SELECT path,pos,home,tid,ts,data FROM events ORDER BY path,pos'))
+    finally:index.close()
+    path.unlink()
+    index=UsageIndex([selected],cache)
+    try:
+        restored=finish(index,10030)
+        assert {(session['home'],session['id']) for session in restored['sessions']}=={(str(selected.resolve()),TID)}
+        actual=restored['sessions'][0]
+        assert [(row['key'],row['ts'],row['total']) for row in actual['history']]==[
+            (row['key'],row['ts'],row['total']) for row in expected['history']]
+        assert actual['activity']==expected['activity']
+        assert restored['usage_collection_complete']
+        assert list(index.db.execute('SELECT path,pos,home,tid,ts,data FROM events ORDER BY path,pos'))==retained
+    finally:index.close()
+
+
+def test_retained_restart_recovery_uses_poll_budget_once_and_reports_partial_loading(tmp_path,monkeypatch):
+    import cachemonitor.index as implementation
+    home,path=fixture_home(tmp_path);paths=[path]
+    for number in (1,2):
+        tid=f'8765432{number}-abcd-abcd-abcd-123456789012'
+        source=home/f'old-{number}.jsonl'
+        source.write_text(json.dumps(usage(f'old-{number}',tid=tid))+'\n',encoding='utf8')
+        paths.append(source)
+        with sqlite3.connect(home/'state_5.sqlite') as db:
+            db.execute('INSERT INTO threads VALUES(?,?,?,?,?,?,?,?)',
+                       (tid,str(source),10000,'old','old','test','openai','project'))
+    cache=tmp_path/'index.sqlite';index=UsageIndex([home],cache)
+    try:assert len(analyze(finish(index)['sessions'])['responses'])==3
+    finally:index.close()
+    for source in paths:source.unlink()
+    index=UsageIndex([home],cache);clock=[0.];rebuilt=[];rebuild=index.rebuild
+    monkeypatch.setattr(implementation.time,'monotonic',lambda:clock[0])
+    def measured(key,now):
+        rebuild(key,now);rebuilt.append(key);clock[0]+=.41
+    monkeypatch.setattr(index,'rebuild',measured)
+    try:
+        partial=index.poll(10030)
+        assert len(rebuilt)==1 and partial['index']['loading']
+        assert not partial['usage_collection_complete']
+        complete=finish(index,10030)
+        assert len(analyze(complete['sessions'])['responses'])==3
+        assert len(rebuilt)==len(set(rebuilt))==3
+        assert complete['usage_collection_complete']
+        index.poll(10031)
+        assert len(rebuilt)==3
+    finally:index.close()
+
+
+def test_restart_validates_rewritten_active_source_before_retained_recovery(tmp_path):
+    home,path=fixture_home(tmp_path);cache=tmp_path/'index.sqlite'
+    index=UsageIndex([home],cache)
+    try:assert [row['key'] for row in analyze(finish(index)['sessions'])['responses']]==['r1']
+    finally:index.close()
+    path.write_text(json.dumps(usage('corrected',time=10015,input=20000,cached=10000))+'\n',encoding='utf8')
+    index=UsageIndex([home],cache)
+    try:
+        restored=finish(index,10030)
+        assert [row['key'] for row in analyze(restored['sessions'])['responses']]==['corrected']
+        assert len(restored['sessions'])==1
+    finally:index.close()
+
+
+def test_retained_recovery_progresses_when_source_scans_exhaust_each_poll_and_discovery_is_due(tmp_path,monkeypatch):
+    import cachemonitor.index as implementation
+    home,_=fixture_home(tmp_path);cache=tmp_path/'index.sqlite'
+    tid='87654321-abcd-abcd-abcd-123456789012';removed=home/'retained.jsonl'
+    removed.write_text(json.dumps(usage('retained-only',tid=tid))+'\n',encoding='utf8')
+    with sqlite3.connect(home/'state_5.sqlite') as db:
+        db.execute('INSERT INTO threads VALUES(?,?,?,?,?,?,?,?)',
+                   (tid,str(removed),10000,'old','old','test','openai','project'))
+    index=UsageIndex([home],cache)
+    try:finish(index)
+    finally:index.close()
+    removed.unlink();index=UsageIndex([home],cache)
+    clock=[0.];scans=[];discoveries=[];scan=index.scan_file;discover=index.discover
+    monkeypatch.setattr(implementation.time,'monotonic',lambda:clock[0])
+    def expensive_scan(*args):
+        value=scan(*args);scans.append(args[0]);clock[0]+=.41;return value
+    def discovery(now):discoveries.append(now);return discover(now)
+    monkeypatch.setattr(index,'scan_file',expensive_scan)
+    monkeypatch.setattr(index,'discover',discovery)
+    try:
+        index.poll(10030);index.poll(10030)
+        key=(str(home.resolve()),tid)
+        assert key not in index.loaded and index.cached_restore
+        progress=index.poll(10041)
+        assert discoveries==[10030,10041]
+        assert key in index.loaded
+        assert any(row['key']=='retained-only' for session in progress['sessions'] for row in session['history'])
+        complete=finish(index,10041)
+        assert complete['usage_collection_complete']
+        assert len(analyze(complete['sessions'])['responses'])==2
+    finally:index.close()
+
+
+def test_owned_publication_tokens_cover_metadata_evidence_and_window_expiry(tmp_path):
+    from cachemonitor.core import WINDOW
+    from cachemonitor.model_evidence import EvidenceStore
+    from cachemonitor.usage_collection import LiveCollection
+    home,_=fixture_home(tmp_path);evidence=EvidenceStore(tmp_path/'evidence.sqlite')
+    index=UsageIndex([home],tmp_path/'index.sqlite',evidence.path)
+    live=LiveCollection('', '')
+    try:
+        first=finish(index);key=(str(home.resolve()),TID)
+        original=index.collection_changes.sessions[key]
+        candidate=live.prepare(first,'owner',1,changes=index.collection_changes);live.publish(candidate)
+        unchanged=index.poll(10011)
+        assert index.collection_changes.sessions[key]==original
+        current=live.prepare(unchanged,'owner',2,changes=index.collection_changes)
+        assert current['sessions'][key] is candidate['sessions'][key]
+        # Metadata not used by the analysis revision must still reach publication.
+        index.metadata[key]['project_id']='new-project'
+        metadata=index.poll(10012)
+        assert index.collection_changes.sessions[key]!=original
+        updated=live.prepare(metadata,'owner',3,changes=index.collection_changes)
+        assert updated['sessions'][key] is not candidate['sessions'][key]
+        previous=index.collection_changes.sessions[key]
+        response=metadata['sessions'][0]['history'][0]['key']
+        evidence.write(home,'attempt',10012,'WebSocket',response,'asked','responded','completed')
+        joined=index.poll(10013)
+        assert index.collection_changes.sessions[key]!=previous
+        assert joined['sessions'][0]['history'][0]['requested_model']=='asked'
+        previous=index.collection_changes.sessions[key]
+        expired=index.poll(10014+WINDOW)
+        assert not expired['sessions'][0]['requests']
+        assert index.collection_changes.sessions[key]!=previous
+        assert len(index.publication_rows)==len(expired['sessions'])
+    finally:index.close();evidence.close()
+
+
+def test_publication_owner_does_not_retain_a_closed_index(tmp_path):
+    import gc
+    import weakref
+    from cachemonitor.usage_collection import LiveCollection
+    home,_=fixture_home(tmp_path);index=UsageIndex([home],tmp_path/'index.sqlite')
+    live=LiveCollection('', '')
+    try:
+        snapshot=finish(index)
+        live.publish(live.prepare(snapshot,'owner',1,changes=index.collection_changes))
+    finally:index.close()
+    reference=weakref.ref(index)
+    del index
+    gc.collect()
+    assert reference() is None and live.current['sessions']
+
+
+def test_prefix_validation_priority_is_bounded_and_preserves_rewrite_detection(tmp_path,monkeypatch):
+    import cachemonitor.index as implementation
+    monkeypatch.setattr(implementation,'FILE_READ_BUDGET',1024)
+    home,path=fixture_home(tmp_path)
+    with path.open('ab') as stream:stream.write((b'x'*255+b'\n')*24)
+    index=UsageIndex([home],tmp_path/'index.sqlite')
+    try:
+        finish(index)
+        with path.open('ab') as stream:stream.write((json.dumps(usage('after',time=10011))+'\n').encode())
+        target=(str(path),home,TID);waiting=('waiting.jsonl',home,TID)
+        index.queue.append(waiting);index.prefix_priority=2048
+        assert index.scan_file(*target) is None
+        assert index.queue.popleft()==target
+        assert index.scan_file(*target) is None
+        assert index.queue.popleft()==target
+        assert index.scan_file(*target) is None
+        assert index.queue.popleft()==waiting and index.queue.popleft()==target
+        path.write_bytes(path.read_bytes().replace(b'r1',b'r9')+b'\n')
+        result=finish(index,10012)
+        assert [row['key'] for row in result['sessions'][0]['history']]==['r9','after']
+    finally:index.close()
+
+
+def test_growing_file_finishes_restarted_known_prefix_and_reads_new_usage(tmp_path,monkeypatch):
+    import cachemonitor.index as implementation
+    monkeypatch.setattr(implementation,'FILE_READ_BUDGET',1024)
+    home,path=fixture_home(tmp_path)
+    with path.open('ab') as stream:stream.write((b'x'*255+b'\n')*24)
+    index=UsageIndex([home],tmp_path/'index.sqlite')
+    try:
+        finish(index)
+        with path.open('ab') as stream:stream.write((json.dumps(usage('after',time=10011))+'\n').encode())
+        target=(str(path),home,TID)
+        assert index.scan_file(*target) is None
+        # Another append arrives before the remaining prefix slice is checked.
+        with path.open('ab') as stream:stream.write(b'\n')
+        index.prefix_priority=implementation.PREFIX_PRIORITY_BUDGET
+        before=index.bytes_read
+        assert index.scan_file(*target)==(str(home),TID)
+        assert index.bytes_read-before <= implementation.PREFIX_PRIORITY_BUDGET+1024
+        index.rebuild((str(home),TID),10012)
+        assert [row['key'] for row in index.monitor.sessions[(str(home),TID)].view(10012)['history']]==['r1','after']
+    finally:index.close()
+
+
+def test_new_thread_and_late_rollout_path_wake_discovery_without_repeated_idle_scans(tmp_path,monkeypatch):
+    home,_=fixture_home(tmp_path);index=UsageIndex([home],tmp_path/'index.sqlite')
+    try:
+        finish(index,10010);scans=[];discover=index.discover
+        def observed(now):scans.append(now);return discover(now)
+        monkeypatch.setattr(index,'discover',observed)
+        index.poll(10011)
+        assert not scans
+        sid='new-session';path=home/'new.jsonl';value=usage('new',time=10011)
+        value['payload']['thread_id']=sid
+        path.write_text(json.dumps(value)+'\n',encoding='utf-8')
+        with sqlite3.connect(home/'state_5.sqlite') as db:
+            db.execute('INSERT INTO threads VALUES(?,?,?,?,?,?,?,?)',(sid,'',10011,'new','','test','openai','project'))
+        index.poll(10012)
+        assert scans==[10012]
+        with sqlite3.connect(home/'state_5.sqlite') as db:
+            db.execute('UPDATE threads SET rollout_path=? WHERE id=?',(str(path),sid))
+        result=index.poll(10013)
+        assert scans==[10012,10013]
+        assert next(s for s in result['sessions'] if s['id']==sid)['history'][0]['key']=='new'
+        index.poll(10014)
+        assert scans==[10012,10013]
+    finally:index.close()
+
+
 def test_top_level_compaction_is_indexed_and_backfilled_without_private_payload(tmp_path):
     home,path=fixture_home(tmp_path);cache=tmp_path/'index.sqlite'
     with path.open('a',encoding='utf-8') as stream:

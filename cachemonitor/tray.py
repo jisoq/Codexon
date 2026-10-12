@@ -1,6 +1,6 @@
 from __future__ import annotations
 from PySide6.QtGui import QAction, QActionGroup, QCursor
-from PySide6.QtCore import QThread
+from PySide6.QtCore import QThread, Qt
 import os, sys
 from pathlib import Path
 from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
@@ -8,7 +8,7 @@ from .quick_runtime import QuickHost
 from .quota import quota_display
 from .icons import notification_icon, tray_icon
 from .theme import shared_theme
-from .i18n import tr
+from .i18n import tr, formatted
 from .app_shutdown import ExitConnectionCheck, ExitConfirmation, ShutdownProgress
 from .taskbar import TaskbarQuota
 import time
@@ -88,17 +88,26 @@ class TrayWindow(QuickHost):
     def refresh_tray(self):
         quota=getattr(self,'live_quota',self.snapshot.get('quota_by_home',{}).get(self.observer_home))
         display=quota_display(quota,getattr(self,'quota_mode','weekly'),time.time())
-        error=bool(self.snapshot.get('errors')) or bool(getattr(self,'analysis_errors',[]))
+        from .app_errors import strongest
+        registry=getattr(self,'error_state',None)
+        faults=registry.grouped() if registry is not None else {}
+        principal=strongest(faults.values())
+        if registry is None:error=bool(self.snapshot.get('errors')) or bool(getattr(self,'analysis_errors',[]))
+        else:error=bool(principal and principal.severity=='error')
         warning=any(s.get('warning') for s in self.snapshot.get('sessions',[]))
         if display['remaining'] is not None and display['remaining']<10: warning=True
+        if principal and principal.severity=='warning':warning=True
         signature=(shared_theme().dark,error,warning)
         if signature!=getattr(self,'_tray_icon_signature',None):
             self._tray_icon_signature=signature
             self.tray.setIcon(notification_icon(error=error,warning=warning))
         tip=display['tooltip']
-        if error: tip+='\n수집과 분석 상태 확인 필요'
+        if principal:
+            tip=tip.split('\n',1)[0]+'\n'+tr(principal.title)+'\n'+tr(principal.explanation)
+            if len(faults)>1:tip+='\n'+formatted('추가 오류 {count}개',count=len(faults)-1)
+        elif error:tip+='\n수집과 분석 상태 확인 필요'
         if len(self.snapshot.get('homes',[]))>1: tip+='\n한도 기준: 첫 번째 Codex 홈'
-        if getattr(self,'quota_issue',''): tip+='\n'+self.quota_issue
+        if registry is None and getattr(self,'quota_issue',''):tip+='\n'+self.quota_issue
         if self.taskbar_quota.enabled and self.taskbar_quota.embedding_error:
             tip+='\n'+self.taskbar_quota.embedding_error
         self.tray.setToolTip(tr(tip))
@@ -111,16 +120,18 @@ class TrayWindow(QuickHost):
             QMessageBox.information(self, "트레이를 사용할 수 없습니다", "현재 환경에는 시스템 트레이가 없어 창을 유지합니다.")
 
     def show_window(self):
-        self.showNormal()
+        maximized=bool(self.windowState() & Qt.WindowMaximized)
+        if maximized:self.showMaximized()
+        else:self.showNormal()
         if sys.platform == "win32":
             import ctypes
             user32 = ctypes.WinDLL("user32", use_last_error=True)
             user32.ShowWindow.argtypes = (ctypes.c_void_p, ctypes.c_int)
             user32.ShowWindow.restype = ctypes.c_int
             # STARTUPINFO(SW_HIDE) can hide the first native show even when Qt reports visible.
-            user32.ShowWindow(int(self.winId()), 9)  # SW_RESTORE
+            user32.ShowWindow(int(self.winId()), 3 if maximized else 9)
             from .windows_integration import recover_dashboard_position
-            recover_dashboard_position(int(self.winId()))
+            if not maximized:recover_dashboard_position(int(self.winId()))
         self.raise_()
         self.activateWindow()
 

@@ -110,13 +110,19 @@ def main():
         from .usage_collection import isolated_collector
         monitor = CollectionClient(homes,args.index_path,args.evidence_path)
         cleanup=lambda:None
+        activities={}
         try:
             cleanup=isolated_collector(homes,args.index_path,args.evidence_path,reuse=True)
             for _ in range(1000):
                 snapshot = monitor.poll()
+                if snapshot.get('activity_stream'):
+                    for record in snapshot.get('request_activity',[]):
+                        activities[(record['home'],record['attempt'])]=record
+                    monitor.channel.acknowledge_activity(snapshot)
                 if not snapshot["index"]["loading"] or snapshot['errors']:
                     break
                 time.sleep(.1)
+            if snapshot.get('activity_stream'):snapshot['request_activity']=list(activities.values())
             print(json.dumps(snapshot, ensure_ascii=False, indent=2))
             return 0 if not snapshot["errors"] else 1
         finally:

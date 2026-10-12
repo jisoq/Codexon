@@ -33,6 +33,7 @@ class UpdateOperation(QThread):
 
 class UpdatePanel(Group):
     attention_changed=Signal(bool)
+    fault_changed=Signal(object)
 
     def __init__(self,manager,parent=None):
         super().__init__(parent)
@@ -148,10 +149,14 @@ class UpdatePanel(Group):
             self.auto_start=False;self.operation_error=True;self.offer=None
             self.status.setText(failure_message(result,self.checking));self.status.setToolTip(str(result));self.status.put(color=self.status_color(True))
             self.execute.hide();self.version.hide();self.components.hide();self.button.show()
+            self.fault_changed.emit(dict(checking_failed=bool(self.checking),
+                phase=None if self.checking else 'failed',operation_error=True))
         elif isinstance(result,dict) and 'operation_id' in result:
             self.record=result;self.offer=None
         elif isinstance(result,dict) and ('configured' in result or 'health' in result):self.proxy_status(result)
-        elif isinstance(result,dict):self.pending_plan=result
+        elif isinstance(result,dict):
+            self.pending_plan=result
+            if self.checking and self.monitor is None:self.fault_changed.emit(dict(check_healthy=True))
         else:self.status.setText(str(result))
 
     def finished(self):
@@ -229,6 +234,11 @@ class UpdatePanel(Group):
         active=phase in ACTIVE
         critical=phase in CRITICAL or (active and proxy.get('cutover_started'))
         attention=phase in ('needs_exit','partial','failed','interrupted','deferred')
+        fault=dict(phase=phase,proxy=dict(phase=proxy.get('phase')),app=dict(state=record.get('app',{}).get('state')),
+            cancel_requested=record.get('cancel_requested',False),
+            status_healthy=phase in ('complete','cancelled'))
+        if fault!=getattr(self,'_reported_fault',None):
+            self._reported_fault=fault;self.fault_changed.emit(fault)
         self.attention_changed.emit(attention)
         if self.metadata_pending or (self.operation and self.checking):return
         self.recheck.setVisible(phase=='needs_exit')
@@ -260,7 +270,7 @@ class UpdatePanel(Group):
         elif phase=='downloading':message='설치 파일을 다운로드하고 검증합니다. 현재 설치본은 유지됩니다.'
         elif phase=='installing':message='새 앱을 설치하고 실행 상태를 확인합니다.'
         elif phase=='verifying':message='새 연결 구성요소의 실행을 확인합니다.'
-        elif phase=='complete':message='ChatGPT 앱을 재시작해 응답을 확인하세요.'
+        elif phase=='complete':message='업데이트 적용을 마쳤습니다.'
         elif phase in ('switching','stopping','starting'):message='Codexon을 켜 둔 채 기다리세요.'
         elif phase in ('partial','failed') and proxy.get('restored'):
             self.heading.setText('업데이트 실패 / 이전 프록시 복원')

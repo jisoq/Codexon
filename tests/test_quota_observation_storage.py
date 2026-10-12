@@ -123,9 +123,12 @@ def test_replayed_observation_is_noop_and_context_only_fills_missing_fields(tmp_
         assert ledger.db.total_changes==changes and version()==before
         ledger.db.execute("update observation_context set plan='',bucket='existing'");ledger.db.commit()
         changes=ledger.db.total_changes;before=version()
+        revision=ledger.db.execute('select value from report_revision where id=1').fetchone()[0]
         ledger.observe('h',quota)
         assert tuple(ledger.db.execute('select plan,bucket from observation_context').fetchone())==('pro','existing')
-        assert ledger.db.total_changes==changes+1 and version()!=before
+        # One corrected context row and one durable report invalidation.
+        assert ledger.db.total_changes==changes+2 and version()!=before
+        assert ledger.db.execute('select value from report_revision where id=1').fetchone()[0]==revision+1
         changes=ledger.db.total_changes;before=version()
         ledger.observe('h',quota)
         assert ledger.db.total_changes==changes and version()==before

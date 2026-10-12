@@ -28,6 +28,7 @@ class ObserverPanel(Group):
         self.services=None
         self.operation=None;self.active=active;self.enabled=False
         self.pending=None;self.last_result={};self.operation_name=''
+        self.background_failure=False
         self.inactive=False
         layout=Column(self);layout.setContentsMargins(0,12,0,12);layout.setSpacing(4)
         row=Row();row.put(collapseBelow=620,minHeight=36);row.setSpacing(8);copy=Column();copy.setSpacing(4)
@@ -105,6 +106,14 @@ class ObserverPanel(Group):
 
     def display(self,result):
         error=result.get('error');state=result.get('observer_status',{}) if error else result
+        background=bool(result.get('background_operation'))
+        recovered=False
+        if error:
+            self.background_failure=background
+        elif background and self.background_failure and 'configured' in state:
+            from .connection_recovery import assess
+            recovered=assess(state)['code'] in ('direct','responding')
+            if recovered:self.background_failure=False
         self.last_result=state;self.enabled=state.get('configured',False)
         update=state.get('update') or {};phase_update=update.get('phase')
         self.progress_link.setVisible(phase_update not in (None,'off','complete','cancelled'))
@@ -149,7 +158,8 @@ class ObserverPanel(Group):
         if failed:
             self.error_detail.hide()
             self.restart_label.setToolTip(str(reason or ''))
-        self.status_observed.emit(state)
+        self.status_observed.emit({**state,'operation_failed':bool(error),
+            'operation_healthy':not error and (recovered or not background and bool(self.operation))})
 
     def stop(self):
         self.active=False;self.pending=None;self.manager.cancelled.set()

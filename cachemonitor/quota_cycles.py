@@ -544,6 +544,7 @@ class QuotaLedger:
                 cached INTEGER, written INTEGER, output INTEGER, reasoning INTEGER,
                 cost REAL, price_id TEXT, signature TEXT, PRIMARY KEY(home,uid));
             CREATE INDEX IF NOT EXISTS calls_home_ts ON calls(home,ts);
+            CREATE INDEX IF NOT EXISTS calls_home_sid ON calls(home,sid);
             CREATE TABLE IF NOT EXISTS prices(id TEXT PRIMARY KEY, data TEXT);
             CREATE TABLE IF NOT EXISTS state(home TEXT PRIMARY KEY, at REAL, loading INTEGER, unclassified INTEGER);
             CREATE TABLE IF NOT EXISTS modes(home TEXT, sid TEXT, turn TEXT, mode TEXT,
@@ -574,6 +575,8 @@ class QuotaLedger:
                 CHECK(start < end));
             CREATE INDEX IF NOT EXISTS quota_exclusions_scope
                 ON quota_exclusions(home,account,start,end);
+            CREATE TABLE IF NOT EXISTS collection_activity_cursor(
+                id INTEGER PRIMARY KEY CHECK(id=1),source TEXT NOT NULL,revision INTEGER NOT NULL);
         ''')
         self.db.execute('begin immediate')
         if 'complete_at' not in {r[1] for r in self.db.execute('pragma table_info(state)')}:
@@ -610,6 +613,29 @@ class QuotaLedger:
         self.mode_evidence = {}
         for home in {r[0] for r in self.db.execute('select distinct home from mode_events')}:
             self.rebuild_mode_evidence(home)
+        self.db.commit()
+
+        self._initialize_report_revision()
+
+    def _initialize_report_revision(self):
+        # One durable scalar, updated by all writers including older app
+        # connections. Heartbeats have separate freshness handling below.
+        self.db.execute('CREATE TABLE IF NOT EXISTS report_revision(id INTEGER PRIMARY KEY,value INTEGER NOT NULL)')
+        self.db.execute('INSERT OR IGNORE INTO report_revision VALUES(1,0)')
+        tables=('observations','observation_context','window_observations','weekly_window_refs',
+                'calls','manual_resets','coverage_issues','quota_exclusions','state',
+                'tracking_config','tracking_policies','tracking_controls','tracking_tasks',
+                'tracking_observations','tracking_gaps','tracking_wire','tracking_health',
+                'tracking_call_boundaries','tracking_activity_versions')
+        for table in tables:
+            columns=[r[1] for r in self.db.execute(f'PRAGMA table_info({table})')]
+            if not columns:continue
+            ignored={'at','complete_at'} if table=='state' else {'at'} if table=='tracking_health' else set()
+            condition=' OR '.join(f'old."{column}" IS NOT new."{column}"' for column in columns if column not in ignored)
+            for operation in ('INSERT','UPDATE','DELETE'):
+                when=f' WHEN {condition}' if operation=='UPDATE' else ''
+                self.db.execute(f'CREATE TRIGGER IF NOT EXISTS report_{table}_{operation.lower()} '
+                    f'AFTER {operation} ON {table}{when} BEGIN UPDATE report_revision SET value=value+1 WHERE id=1; END')
         self.db.commit()
 
     def rebuild_mode_evidence(self,home):
@@ -809,7 +835,7 @@ class QuotaLedger:
         sync_activity(self.db, snapshot,self._tracking_sync_cache)
         for key, session in {**engine.sessions,**getattr(engine,'internal_sessions',{})}.items():
             if key[0] in recovered_homes:continue
-            revision = session['revision']
+            revision = session.get('content_revision',session['revision'])
             if self.revisions.get(key) == revision:
                 continue
             home, sid = key
@@ -891,7 +917,14 @@ class QuotaLedger:
                 on conflict(home) do update set at=excluded.at,loading=excluded.loading,
                 unclassified=excluded.unclassified,complete_at=excluded.complete_at''',
                 (home,snapshot['ts'],loading,unclassified,watermark))
+        cursor=snapshot.get('activity_cursor')
+        if cursor:self.db.execute('INSERT INTO collection_activity_cursor VALUES(1,?,?) ON CONFLICT(id) DO UPDATE SET '
+            'source=excluded.source,revision=excluded.revision WHERE source IS NOT excluded.source OR revision IS NOT excluded.revision',tuple(cursor))
         self.db.commit()
+
+    def activity_cursor(self):
+        row=self.db.execute('SELECT source,revision FROM collection_activity_cursor WHERE id=1').fetchone()
+        return tuple(row) if row else None
 
     def import_observations(self, index_path, home):
         """Recover already-sanitized local observations, without modifying the usage index."""
@@ -955,10 +988,41 @@ class QuotaLedger:
         raise sqlite3.OperationalError('사용한도 기록이 계속 갱신되어 저장하지 못했습니다. 다시 시도하세요.')
 
     def report(self, home, now=None):
+        now=time.time() if now is None else now
         own_transaction = not self.db.in_transaction
         if own_transaction:self.db.execute('BEGIN')
         try:
-            return self._report(home,now)
+            revision=self.db.execute('SELECT value FROM report_revision WHERE id=1').fetchone()[0]
+            cached=getattr(self,'_report_cache',None) if own_transaction else None
+            if cached and cached['home']==home and cached['revision']==revision and cached['at']<=now<cached['until']:
+                report=cached['report'];scope=(report.get('tracking') or {}).get('homes') or [home]
+                slots=','.join('?' for _ in scope)
+                states=list(self.db.execute(f'SELECT * FROM state WHERE home IN ({slots})',scope))
+                state=next((r for r in states if r['home']==home),None)
+                complete_at=min((r['complete_at'] for r in states),default=None) if len(states)==len(scope) and all(r['complete_at'] is not None for r in states) else None
+                health=list(self.db.execute(f'SELECT * FROM tracking_health WHERE home IN ({slots})',scope))
+                healthy=len(health)==len(scope) and all(r['complete'] and now-r['at']<=15 for r in health)
+                before=report.get('index_complete_at')
+                crossed=bisect_right(cached['ends'],complete_at if complete_at is not None else float('-inf'))!=bisect_right(cached['ends'],before if before is not None else float('-inf'))
+                if not crossed and (not report.get('tracking') or healthy==report['tracking']['complete']):
+                    return {**report,'at':now,'index_at':state['at'] if state else None,'index_complete_at':complete_at,
+                        'cycles':[{**cycle,'cycle_end':now} if position==0 and cycle['cycle_end']==cached['at'] else cycle
+                                  for position,cycle in enumerate(report['cycles'])]}
+            report=self._report(home,now)
+            self._report_generation=getattr(self,'_report_generation',0)+1
+            if own_transaction:
+                future=[]
+                for table,columns in (('observations',('at',)),('window_observations',('at',)),
+                    ('manual_resets',('at',)),('calls',('ts',)),('tracking_controls',('at',)),
+                    ('tracking_observations',('received',)),('tracking_tasks',('start','end')),
+                    ('tracking_wire',('start','end'))):
+                    for column in columns:
+                        boundary=self.db.execute(f'SELECT min({column}) FROM {table} WHERE {column}>?',(now,)).fetchone()[0]
+                        if boundary is not None:future.append(boundary)
+                self._report_cache=dict(home=home,revision=revision,at=now,until=min(future,default=float('inf')),
+                    ends=sorted({c['end'] for c in report['cycles']}|{r['at'] for r in report['history']}),report=dict(report))
+            else:self._report_cache=None
+            return report
         finally:
             if own_transaction:self.db.rollback()
 

@@ -60,7 +60,10 @@ class Tracker:
         try:
             accepted=self.store.write(self.home, transport=self.transport, **record)
             if accepted is False:record['observation_missing']=True
-            self.health['storage_failure_streak'] = 0
+            if hasattr(self.store,'status'):
+                self.health.update(self.store.status())
+            else:
+                self.health['storage_failure_streak'] = 0
         except (sqlite3.Error, OSError):
             # Observation failure must not trigger model-request retries.
             self.health['storage_errors'] += 1
@@ -203,6 +206,7 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
             last_tick=0
             while True:
                 if managed and time.monotonic()-last_tick>=1:
+                    if hasattr(store,'status'):health.update(store.status())
                     await asyncio.to_thread(managed.tick,health)
                     last_tick=time.monotonic()
                 apply_control()

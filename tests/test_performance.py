@@ -16,6 +16,105 @@ def query(page=1,**kwargs):
             'unit':'response','method':'mean','metric':'cost','band':None,'granularity':'auto',**kwargs}
 
 
+@pytest.mark.parametrize('session_count',[20,200])
+def test_versioned_append_visits_only_changed_session_ownership(monkeypatch,session_count):
+    import cachemonitor.analysis_engine as implementation
+    sources=[]
+    for n in range(session_count):
+        source=history();source.update(id=f's{n}',usage_revision=1,request_revision=1)
+        source['history']=[{**source['history'][0],'key':f'r{n}-{i}','ts':i} for i in range(100)]
+        sources.append(source)
+    engine=AnalysisEngine();engine.ingest(sources)
+    calls=[];original=implementation.call_identity
+    monkeypatch.setattr(implementation,'call_identity',lambda *args:(calls.append(args),original(*args))[1])
+    assert not engine.ingest(sources) and not calls
+    changed=copy.deepcopy(sources[0]);changed['usage_revision']=2
+    changed['history'].append({**changed['history'][-1],'key':'added','ts':101})
+    engine.ingest([changed,*sources[1:]])
+    assert len(calls)<=2*len(changed['history'])
+    assert len(engine.sessions[(changed['home'],changed['id'])]['prepared']['history'])==101
+    changed=copy.deepcopy(changed);changed['request_revision']=2
+    changed['turn_records']={'request':{'started_at':99,'ended_at':102}}
+    assert engine.ingest([changed,*sources[1:]])
+    assert engine.sessions[(changed['home'],changed['id'])]['prepared']['turn_records']==changed['turn_records']
+
+
+def test_filter_choices_reuse_unchanged_histories_and_remove_corrected_values(monkeypatch):
+    import cachemonitor.analysis_delivery as delivery
+    from cachemonitor.analytics import observed_choices
+    engine=AnalysisEngine();publisher=delivery.SnapshotPublisher()
+    sources=[history(),history()]
+    sources[1]['id']='other'
+    for row in sources[1]['history']:row['key']='other-'+row['key']
+    engine.ingest(sources)
+    def expected():
+        return observed_choices([r for state in engine.sessions.values() for r in state['prepared']['history']])
+    original=delivery.observed_choices;visited=[]
+    monkeypatch.setattr(delivery,'observed_choices',lambda rows:(visited.append(len(rows)),original(rows))[1])
+    first=publisher.observed_choices(engine)
+    assert {k:first[k] for k in expected()}==expected()
+    visited.clear();sources[1]['history'][0]['model']='gpt-5.6-luna';engine.ingest(sources)
+    second=publisher.observed_choices(engine)
+    assert {k:second[k] for k in expected()}==expected()
+    assert sum(visited)==len(sources[1]['history'])
+    engine.ingest(sources[:1]);third=publisher.observed_choices(engine)
+    assert {k:third[k] for k in expected()}==expected()
+    assert len(publisher.choices)==1
+
+
+def test_superseded_record_and_population_requests_do_not_compute_obsolete_results(monkeypatch):
+    from cachemonitor import analysis_worker, dashboard_views
+    source=history();bridge=analysis_worker.AnalysisBridge([])
+    selected=(source['home'],source['id'],source['history'][-1]['key'])
+    for request in range(50):
+        bridge.request_record(request,selected)
+        bridge.request_population(request,request)
+    assert len(bridge.commands)==2
+    # Already transmitted requests need replacement inside the child too.
+    commands=[dict(kind='population',id=n,population=n) for n in range(49)]
+    commands+=list(bridge.commands);sent=[];computed=[]
+    monkeypatch.setattr(dashboard_views,'population_summary',lambda engine,population,assumptions:
+                        (computed.append(population),{'population':population})[1])
+    class Connection:
+        def poll(self,*args):
+            if args:raise EOFError
+            return bool(commands)
+        def recv(self):return commands.pop(0)
+        def send(self,value):sent.append(value)
+        def close(self):pass
+    snapshot=dict(ts=110,sessions=[source],homes=[],errors=[],unassigned=[],index={'loading':False})
+    analysis_worker.process_main(Connection(),[],None,static_snapshot=snapshot)
+    records=[value for value in sent if value['kind']=='record']
+    populations=[value for value in sent if value['kind']=='population']
+    assert [value['id'] for value in records]==[49]
+    assert records[0]['row']['key']==selected[-1]
+    assert [value['id'] for value in populations]==[49] and computed==[49]
+
+
+def test_detail_coalescing_keeps_snapshot_and_freeze_command_order(monkeypatch):
+    from cachemonitor import analysis_worker,dashboard_views
+    source=history();replacement=copy.deepcopy(source);replacement['title']='changed'
+    def snapshot(value):return dict(ts=110,sessions=[value],homes=[],errors=[],unassigned=[],index={'loading':False})
+    commands=[dict(kind='population',id=n,population=n) for n in (1,2)]
+    commands.append(dict(kind='replace',snapshot=snapshot(replacement)))
+    commands.extend(dict(kind='population',id=n,population=n) for n in (3,4))
+    commands.append(dict(kind='freeze'));sent=[];computed=[]
+    def compute(engine,population,assumptions):
+        title=next(iter(engine.sessions.values()))['prepared']['title']
+        computed.append((population,title));return {}
+    monkeypatch.setattr(dashboard_views,'population_summary',compute)
+    class Connection:
+        def poll(self,*args):
+            if args:raise EOFError
+            return bool(commands)
+        def recv(self):return commands.pop(0)
+        def send(self,value):sent.append(value)
+        def close(self):pass
+    analysis_worker.process_main(Connection(),[],None,static_snapshot=snapshot(source))
+    assert computed==[(2,source['title']),(4,'changed')]
+    assert [value['id'] for value in sent if value['kind']=='population']==[2,4]
+
+
 def test_unchanged_updates_new_calls_corrections_and_metadata_invalidate_precisely():
     source=history(); engine=AnalysisEngine()
     assert engine.ingest([source])

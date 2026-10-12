@@ -115,7 +115,7 @@ def test_rolling_zoom_count_boundaries_thresholds_and_empty_range():
 
 
 @pytest.mark.parametrize('language',['ko','en'])
-def test_single_model_rolling_bands_selection_inspection_and_shared_axis(tmp_path,language):
+def test_rolling_bands_model_selection_inspection_and_shared_axis(tmp_path,language):
     from datetime import datetime
     from PySide6.QtCore import QSettings,QObject,Qt
     from cachemonitor.performance_panel import PerformancePanel,SeriesLegend,plot_values
@@ -139,15 +139,14 @@ def test_single_model_rolling_bands_selection_inspection_and_shared_axis(tmp_pat
     def refresh():ui.apply(projector.query(source,query(now=base+6*3600,plot_width=900,time_range=ui.time_range,granularity=ui.granularity)))
     owner.render=refresh;refresh();host=mount(ui,1440,940)
     try:
-        ui.choose_granularity('week');assert ui.granularity=='week'
+        assert ui.granularity=='auto'
         ui.model_choice.choose(ui.model_choice.findData('m'))
         plot=ui.plots['cost'];assert ui.granularity=='auto' and plot.bands
-        assert not ui.granularity_buttons['week'].isEnabled() and not ui.granularity_buttons['month'].isEnabled()
         assert {p['model'] for p in plot.rows}=={'m'}
         assert not ui.plots['count'].bands and ui.plots['session_cache'].bands
         assert plot.bounds[1]<200 and not plot.strip
         assert plot.data['window_seconds']==900 and not plot.data['raw_visible']
-        assert all(v is None or 0<=v<=plot.bounds[1] for v in plot_values(plot.data,plot.selected_style,True))
+        assert all(v is None or 0<=v<=plot.bounds[1] for v in plot_values(plot.data,plot.selected_style))
         assert all(p.bounds[0]==0 for p in ui.plots.values())
         item=render_plot(host,plot)
         for node in ui.plots.values():control(host,node).findChild(QObject,'plotHover').setProperty('enabled',False)
@@ -184,8 +183,20 @@ def test_single_model_rolling_bands_selection_inspection_and_shared_axis(tmp_pat
         assert ui.inspected[1]=='cost'
         assert host.quick.grabFramebuffer().save(str(tmp_path/('rolling-bands-'+language+'.png')))
         assert not host.qml_errors
-        ui.add_model('other');assert not plot.bands and ui.granularity_buttons['week'].isEnabled()
-        ui.choose_granularity('week');assert ui.granularity=='week'
+        solo_bounds=plot.bounds;window=plot.data['window_seconds']
+        ui.add_model('other')
+        assert ui.granularity=='auto' and plot.bands and not plot.strip
+        assert {p['model'] for p in plot.rows}=={'m','other'}
+        assert {p['service_tier'] for p in plot.rows}=={'Standard'}
+        assert plot.data['window_seconds']==window and plot.bounds[1]>solo_bounds[1]
+        matching=plot.matching_points(standard['ts'])
+        assert len(matching)==2 and len({p['ts'] for p in matching})==1
+        ui.show_interval(matching[0],'cost')
+        assert not ui.details.comparison.isVisible() and ui.details.band_text.isVisible()
+        assert all(model in ui.details.mode_comparison.text() for model in ('m','other'))
+        assert all(mark.bands for mark in ui.legend.findChildren(SeriesLegend))
+        ui.remove_model('other')
+        assert plot.bounds==solo_bounds and {p['model'] for p in plot.rows}=={'m'}
     finally:dispose(host);set_language('ko')
 
 def test_bounded_outliers_and_corrections():
@@ -279,7 +290,7 @@ def test_million_calls_keep_anomalies_and_bounded_frames(tmp_path):
     finally:dispose(host)
 
 @pytest.mark.integration
-def test_qt_panel_hover_analysis_and_passive_click(tmp_path):
+def test_qt_panel_rolling_hover_analysis_and_click(tmp_path):
     from PySide6.QtCore import QSettings,Qt
     from PySide6.QtWidgets import QApplication
     from cachemonitor.performance_panel import PerformancePanel
@@ -287,7 +298,7 @@ def test_qt_panel_hover_analysis_and_passive_click(tmp_path):
     app=QApplication.instance() or QApplication([])
     owner=SimpleNamespace(settings=QSettings(str(tmp_path/'settings.ini'),QSettings.IniFormat),render=lambda:None,open_record=lambda r:None)
     rows=[row(i,key=f'{model}-{i}',model=model,cost=cost) for model,cost in (('m',1.),('other',2.),('outside',1000.)) for i in range(20)]
-    ui=PerformancePanel(owner);data=PerformanceTrends().query(engine(rows),query())
+    ui=PerformancePanel(owner);data=PerformanceTrends().query(engine(rows),query(granularity='auto'))
     ui.apply(data);host=mount(ui,1000,800)
     try:
         assert next(iter(ui.plots))=='duration'
@@ -295,10 +306,9 @@ def test_qt_panel_hover_analysis_and_passive_click(tmp_path):
         assert chart.bounds==pytest.approx((0,1120))
         ui.remove_model('outside');app.processEvents();host.quick.grabFramebuffer()
         assert chart.bounds==pytest.approx((0,2.24))
-        assert {p['model'] for p in chart.rows}=={'m','other','outside'}
-        item=render_plot(host,chart);point=next(p for p in chart.rows if p['model']=='m');xy=chart.xy(point)
-        outside=next(p for p in chart.rows if p['model']=='outside')
-        assert chart.ink(outside).alphaF()<chart.ink(point).alphaF()
+        assert {p['model'] for p in chart.rows}=={'m','other'}
+        assert chart.rolling and chart.bands and not chart.strip
+        item=render_plot(host,chart);point=next(p for p in chart.rows if p['model']=='m' and p['value'] is not None);xy=chart.xy(point)
         assert ui.inspector.isVisible()
         item.showTip(xy.x(),xy.y())
         assert item.tip=='' and ui.inspected==(point,'cost')
@@ -326,7 +336,7 @@ def test_reasoning_tabs_share_trend_axis_and_keep_other_charts(tmp_path):
         for effort,values in (('low',(100,200)),('medium',(None,None)),('high',(1000,2000)),('ultra',(10000,20000))):
             for value in values:
                 rows.append(row(len(rows),ts=base+day*86400+3600+len(rows),effort=effort,reasoning=value))
-    source=engine(rows);projector=PerformanceTrends();data=projector.query(source,query(now=base+3*86400))
+    source=engine(rows);projector=PerformanceTrends();data=projector.query(source,query(now=base+3*86400,granularity='auto',plot_width=900))
     owner=SimpleNamespace(settings=QSettings(str(tmp_path/'reasoning.ini'),QSettings.IniFormat),render=lambda:None)
     ui=PerformancePanel(owner);ui.apply(data);host=mount(ui,1440,940)
     try:
@@ -345,12 +355,12 @@ def test_reasoning_tabs_share_trend_axis_and_keep_other_charts(tmp_path):
         second_frame=host.quick.grabFramebuffer()
         assert item._static_image is cached
         assert first_frame!=second_frame
-        point=chart.rows[-1];ui.show_interval(point,'reasoning')
+        point=next(p for p in reversed(chart.rows) if p['value'] is not None);ui.show_interval(point,'reasoning')
         render_plot(host,ui.reasoning_tabs)
         for effort,value in (('low',150),('ultra',15000),('high',1500)):
             click(host,control(host,ui.reasoning_buttons[effort]))
             assert ui.plots['reasoning'] is chart and chart.bounds==expected
-            assert {p['value'] for p in chart.rows}=={value}
+            assert {p['value'] for p in chart.rows if p['value'] is not None}=={value}
             assert ui.reasoning_buttons[effort].isChecked() and sum(b.isChecked() for b in ui.reasoning_buttons.values())==1
             assert ui.inspected[1]=='reasoning' and ui.inspected[0]['effort']==effort
             assert ui.inspected[0]['ts']==point['ts'] and ui.inspected[0]['value']==value
@@ -359,7 +369,7 @@ def test_reasoning_tabs_share_trend_axis_and_keep_other_charts(tmp_path):
             click(host,control(host,ui.reasoning_buttons[effort]))
             assert ui.reasoning_buttons[effort].isChecked() and chart.bounds==expected
         click(host,control(host,ui.reasoning_buttons['medium']))
-        assert not chart.rows and chart.bounds==expected and ui.inspected is None
+        assert all(p['value'] is None for p in chart.rows) and chart.bounds==expected and ui.inspected is None
         click(host,control(host,ui.reasoning_buttons['ultra']))
         assert PerformancePanel(owner).reasoning_effort=='ultra'
         assert ui.legend_scroll.parent() is ui.chart_scroll.parent().parent() is ui.inspector.parent().parent()
@@ -370,10 +380,10 @@ def test_reasoning_tabs_share_trend_axis_and_keep_other_charts(tmp_path):
         guide=scene_view(host,ui.chart_help);legend=scene_view(host,ui.legend)
         assert guide.mapToScene(QPointF(0,0)).y()>legend.mapToScene(QPointF(0,legend.height())).y()
         date=scene_view(host,ui.period);navigator=scene_view(host,ui.navigator)
-        assert 0<=navigator.mapToScene(QPointF(0,0)).y()-date.mapToScene(QPointF(0,date.height())).y()<=16
+        assert abs(navigator.mapToScene(QPointF(0,navigator.height()/2)).y()-date.mapToScene(QPointF(0,date.height()/2)).y())<2
         assert host.quick.grabFramebuffer().save(str(tmp_path/'reasoning-tabs.png'))
         # A changed visible period recalculates the common scale, rather than retaining a global maximum.
-        narrower=projector.query(source,query(now=base+3*86400,time_range=[base,base+86400]))
+        narrower=projector.query(source,query(now=base+3*86400,time_range=[base,base+86400],granularity='auto',plot_width=900))
         legend_nodes=list(ui.legend._nodes)
         ui.apply(narrower);assert chart.bounds==expected and ui.reasoning_effort=='ultra'
         assert ui.legend._nodes==legend_nodes
@@ -381,7 +391,7 @@ def test_reasoning_tabs_share_trend_axis_and_keep_other_charts(tmp_path):
         for r in rows:
             if r['effort']=='ultra':r['reasoning']=300
         source.revision+=1
-        ui.apply(projector.query(source,query(now=base+3*86400)))
+        ui.apply(projector.query(source,query(now=base+3*86400,granularity='auto',plot_width=900)))
         assert chart.bounds[0]==0 and 1500<chart.bounds[1]<1800 and ui.reasoning_effort=='ultra'
         assert not host.qml_errors
     finally:dispose(host)
@@ -419,6 +429,15 @@ def test_time_navigator_presets_live_updates_and_date_ranges(tmp_path):
             navigator=scene_view(host,ui.navigator)
             assert navigator.mapToScene(QPointF(0,0)).y()==pytest.approx(top_y)
             assert 0<=top_y and top_y+navigator.height()<=host.quick.height()
+            bar=control(host,ui.period_controls)
+            nodes=(ui.period,ui.navigator,ui.follow_button)
+            views=[scene_view(host,node) for node in nodes]
+            centers=[v.mapToScene(QPointF(0,v.height()/2)).y() for v in views]
+            assert max(centers)-min(centers)<2
+            for view in views:
+                point=view.mapToItem(bar,QPointF(0,0))
+                assert point.x()>=0 and point.x()+view.width()<=bar.width()+1
+            assert navigator.width()>=32
         host.resize(1440,940);QTest.qWait(30)
         click(host,control(host,ui.period_buttons['7d']))
         assert ui.range==pytest.approx((now-7*day,now)) and ui.follow_latest
@@ -443,7 +462,7 @@ def test_time_navigator_presets_live_updates_and_date_ranges(tmp_path):
         assert ui.time_range==frozen
         now+=3601;source.sessions['s']['prepared']['history'].append(row(100,ts=now-1));source.revision+=1;refresh()
         assert ui.range==tuple(frozen) and not any(p['ts']==now-1 for p in ui.specs['cost']['points'])
-        click(host,control(host,ui.latest_button))
+        click(host,control(host,ui.follow_button))
         assert ui.range==pytest.approx((now-15*day,now)) and ui.follow_latest
         assert any(p['ts']==now-1 for p in ui.specs['cost']['points'])
         now+=3601;source.sessions['s']['prepared']['history'].append(row(101,ts=now-1));source.revision+=1;refresh()
@@ -487,6 +506,7 @@ def test_dashboard_tab_worker_contract_and_navigation(tmp_path):
     try:
         session=Session('s','synthetic',title='Synthetic',cwd='C:/sample')
         session.add_usage(1800000000,'r',dict(input_tokens=100,cached_input_tokens=90,cache_write_input_tokens=0,output_tokens=50,reasoning_output_tokens=10),'gpt-6-astra','t','high','Standard')
+        session.add_usage(1800000001,'r2',dict(input_tokens=100,cached_input_tokens=90,cache_write_input_tokens=0,output_tokens=50,reasoning_output_tokens=10),'gpt-6.1-sol','t2','high','Standard')
         w.receive(dict(ts=1800001000,sessions=[session.view(1800001000)],homes=['synthetic'],errors=[],unassigned=[]))
         assert w.navigation_pages==(0,1,5,2,3)
         w.nav.setCurrentRow(2)
@@ -495,17 +515,17 @@ def test_dashboard_tab_worker_contract_and_navigation(tmp_path):
         q=w.query();result=w.engine.page_query(q)
         w.request_id=123;w.pending_automatic=False;w.pending_query=q
         w.analysis_ready(dict(id=123,logical='performance',result=result,valid_until=result['valid_until']))
-        assert q['granularity']=='day'
-        w.performance_panel.choose_granularity('month')
-        assert w.query()['granularity']=='month'
-        assert w.engine.page_query(w.query())['performance']['granularity']=='month'
+        assert q['granularity']=='auto'
+        w.performance_panel.solo('gpt-6-astra');w.performance_panel.add_model('gpt-6.1-sol')
+        assert w.query()['granularity']=='auto'
+        assert w.engine.page_query(w.query())['performance']['granularity']=='auto'
         w.change_page(4);assert w.current_page==4
     finally:dispose(w)
 
 
 @pytest.mark.parametrize('shell',[True])
 @pytest.mark.integration
-def test_dense_workspace_units_and_hover_analysis(tmp_path,shell):
+def test_dense_workspace_model_comparison_and_hover_analysis(tmp_path,shell):
     import math
     from PySide6.QtCore import QSettings
     from PySide6.QtWidgets import QApplication
@@ -523,7 +543,7 @@ def test_dense_workspace_units_and_hover_analysis(tmp_path,shell):
             input=40000+i%6000,cached=30000+i%5000,output=2000,reasoning=1200+(i%17)*30,
             output_speed=speed,completion_latency_ms=2000000/speed,duration=2000/speed))
     projector=PerformanceTrends();source=engine(rows)
-    data=projector.query(source,query(now=rows[-1]['ts']+100,plot_width=900))
+    data=projector.query(source,query(now=rows[-1]['ts']+100,plot_width=900,granularity='auto'))
     app=QApplication.instance() or QApplication([])
     calls=[];owner=SimpleNamespace(settings=QSettings(str(tmp_path/'dense.ini'),QSettings.IniFormat),open_record=calls.append)
     if shell:
@@ -554,52 +574,33 @@ def test_dense_workspace_units_and_hover_analysis(tmp_path,shell):
         assert plot.bands and not plot.strip
         assert {p['model'] for p in plot.rows}=={models[0]}
         from cachemonitor.performance_panel import plot_values
-        assert all(v is None or plot.bounds[0]<=v<=plot.bounds[1] for v in plot_values(plot.data,plot.selected_style,True))
-        assert not ui.granularity_buttons['week'].isEnabled()
+        assert all(v is None or plot.bounds[0]<=v<=plot.bounds[1] for v in plot_values(plot.data,plot.selected_style))
         assert host.quick.grabFramebuffer().save(str(tmp_path/'rolling-bands-dense.png'))
-        # Multiple-model comparison retains the original trend/causal-outlier flow.
-        ui.add_model(models[1]);assert not plot.bands
+        ui.add_model(models[1]);assert plot.bands and not plot.strip
+        assert {p['model'] for p in plot.rows}==set(models[:2])
         assert plot.bounds[1]<plot.data['high']*.6
-        assert all(p['kind']=='trend' for p in plot.rows)
+        assert all(p['kind']=='rolling' for p in plot.rows)
         assert 'cost_total' not in ui.plots
-        assert ui.labels['input'].text()=='평균 입력 토큰'
-        trend=next(p for p in plot.rows if plot.selected_style(p) and p['baseline'] is not None and p['delta'])
+        assert all(v is None or plot.bounds[0]<=v<=plot.bounds[1] for v in plot_values(plot.data,plot.selected_style))
+        trend=next(p for p in plot.rows if p['value'] is not None and p['band_valid'])
         item=render_plot(host,plot)
         # Deliver the hover directly, independent of delayed synthetic click movement.
         from PySide6.QtCore import QObject
         item.findChild(QObject,'plotHover').setProperty('enabled',False)
         xy=plot.xy(trend);item.showTip(xy.x(),xy.y())
         assert ui.inspected[0]['value']==trend['value'] and item.tip==''
-        assert ui.details.range_plot.stats==trend['distribution']
+        stats=trend['distribution']
+        assert ui.details.range_plot.stats==dict(stats,p10=stats['q1'],p90=stats['q3'])
         assert ui.details.total_rows[0][1].text()=='총 출력 토큰'
+        assert not ui.details.comparison.isVisible() and ui.details.band_text.isVisible()
+        assert all(model in ui.details.mode_comparison.text() for model in models[:2])
         assert host.quick.grabFramebuffer().save(str(tmp_path/'hover-analysis.png'))
-        assert len(plot.strip)<=160 and any(c['count']>1 for c in plot.strip)
-        cell=max(plot.strip,key=lambda c:c['count']);x=76+(cell['index']+.5)*(plot.width()-96)/80
-        assert plot.tip_at(x,plot.strip_top()+(3 if cell['direction']>0 else 14))==''
-        assert str(cell['count'])==ui.details.value.text()
         assert not calls
-        for unit in ('week','month','day'):
-            # Resolve pending scroll/layout changes before taking click coordinates.
-            click(host,render_plot(host,ui.granularity_buttons[unit]))
-            if ui.granularity!=unit or projector.view['granularity']!=unit:
-                from pathlib import Path
-                from PySide6.QtCore import QPointF
-                from cachemonitor.quick_qa import scene_view
-                folder=Path('artifacts/verification/performance-unit-failure');folder.mkdir(parents=True,exist_ok=True)
-                host.quick.grabFramebuffer().save(str(folder/'scene.png'))
-                states={}
-                for key,node in ui.granularity_buttons.items():
-                    item=control(host,node);point=item.mapToScene(QPointF(item.width()/2,item.height()/2))
-                    states[key]=dict(x=point.x(),y=point.y(),width=item.width(),height=item.height(),visible=item.isVisible(),enabled=item.isEnabled(),checked=item.property('checked'))
-                print('UNIT FAILURE',dict(wanted=unit,actual=ui.granularity,states=states,window=[host.width(),host.height()],quick=[host.quick.width(),host.quick.height()],modal=str(app.activeModalWidget()),qml=host.qml_errors))
-            assert ui.granularity==unit and projector.view['granularity']==unit
-            assert ui.granularity_buttons[unit].isChecked()
-            assert PerformancePanel(owner).granularity==unit
         restored=PerformancePanel(owner)
-        assert restored.granularity=='day'
+        assert restored.granularity=='auto' and restored.models==ui.models and restored.modes==ui.modes
         host.resize(1000,760);render_plot(host,ui.plots['cost'])
         assert ui.inspector.isVisible()
-        assert host.quick.grabFramebuffer().save(str(tmp_path/'daily-compact.png'))
+        assert host.quick.grabFramebuffer().save(str(tmp_path/'rolling-compact.png'))
         render_plot(host,ui.plots['input'])
         ui.chart_scroll.verticalPosition.setValue(max(0,ui.chart_scroll.verticalPosition.value()-30));QTest.qWait(40)
         assert host.quick.grabFramebuffer().save(str(tmp_path/'input-title.png'))
@@ -656,21 +657,63 @@ def test_calendar_duration_uses_median_for_representative_and_previous_compariso
     assert all(r['duration']==value for r,value in zip(rows,[1,2,99,3,6,111,None]*2))
 
 
-def test_multi_model_axis_follows_selection_without_dropping_faint_context():
+def test_multi_model_rolling_axis_includes_selected_bands_and_filters_models_and_modes():
     from cachemonitor.performance_panel import PerformancePlot
-    rows=[row(0,model='a',cost=1),row(1,model='b',cost=2),row(2,model='outside',cost=1000),
-          row(3,model='a',service_tier='Fast',cost=10000)]
-    data=panel(PerformanceTrends().query(engine(rows),query()),'cost')
+    rows=[]
+    for model,mode in (('a','Standard'),('b','Standard'),('outside','Standard'),('a','Fast')):
+        for i in range(20):
+            cost=(0 if i%10<7 else 10) if (model,mode)==('a','Standard') else 2 if model=='b' else 10000 if mode=='Fast' else 1000
+            rows.append(row(len(rows),ts=11800,model=model,service_tier=mode,cost=cost))
+    data=panel(PerformanceTrends().query(engine(rows),query(now=22600,time_range=[1000,22600],granularity='auto')),'cost')
     selected={'a','b'};modes={'Standard':True,'Fast':False}
-    owner=SimpleNamespace(single_model=lambda:False,is_model_selected=selected.__contains__,
-                          modes=modes,show_outer=False,range=(1000,2000))
+    owner=SimpleNamespace(is_model_selected=selected.__contains__,modes=modes,show_outer=False,range=(1000,22600))
     plot=PerformancePlot(owner);plot.set_data(data)
-    assert plot.bounds==pytest.approx((0,2.24))
-    assert {p['model'] for p in plot.rows}=={'a','b','outside'}
-    outside=next(p for p in plot.rows if p['model']=='outside')
-    assert plot.ink(outside).alphaF()<=.101
+    assert plot.bands and not data['raw_visible'] and not plot.strip
+    assert plot.bounds==pytest.approx((0,11.2))
+    assert {p['model'] for p in plot.rows}=={'a','b'} and {p['service_tier'] for p in plot.rows}=={'Standard'}
+    point=next(p for p in plot.rows if p['model']=='a' and p['band_valid'])
+    assert point['value']==3 and point['distribution']['q3']==10
+    selected.remove('a');plot.set_data(data)
+    assert plot.bounds==pytest.approx((0,2.24)) and {p['model'] for p in plot.rows}=={'b'}
+    selected.add('a')
     modes['Fast']=True;plot.set_data(data)
     assert plot.bounds==pytest.approx((0,11200))
+
+
+def test_legacy_calendar_setting_restores_auto_and_preserves_selection(tmp_path):
+    import json
+    from PySide6.QtCore import QSettings
+    from cachemonitor.performance_panel import PerformancePanel
+    settings=QSettings(str(tmp_path/'legacy-selection.ini'),QSettings.IniFormat)
+    saved=dict(granularity='week',models={'a':True,'b':True,'outside':False},
+               modes={'Standard':False,'Fast':True},reasoning_effort='low')
+    settings.setValue('performance/selection',json.dumps(saved))
+    owner=SimpleNamespace(settings=settings,render=lambda:None)
+    ui=PerformancePanel(owner)
+    assert ui.granularity=='auto' and ui.models==saved['models'] and ui.modes==saved['modes']
+    assert ui.reasoning_effort=='low'
+    ui.persist();restored=PerformancePanel(owner)
+    assert restored.granularity=='auto' and restored.models==saved['models'] and restored.modes==saved['modes']
+    assert restored.reasoning_effort=='low'
+
+
+def test_model_comparison_computes_mode_deltas_only_within_each_model():
+    from cachemonitor.performance_panel import IntervalDetails
+    def point(model,mode,value):
+        return dict(model=model,service_tier=mode,value=value,mean=value,status='표본 부족',
+                    coverage=(10,10),distribution=dict(median=value))
+    details=IntervalDetails();a=point('a','Standard',10);b=point('b','Fast',100)
+    details.set_modes([a,b],'cost')
+    text=details.mode_comparison.text()
+    assert 'a / Standard' in text and 'b / Fast' in text and '+900.0%' not in text
+    a_fast=point('a','Fast',20);b_standard=point('b','Standard',25)
+    details.set_modes([a,a_fast,b_standard,b],'cost')
+    lines=details.mode_comparison.text().splitlines()
+    assert any(line.startswith('a / ') and '+100.0%' in line for line in lines)
+    assert any(line.startswith('b / ') and '+300.0%' in line for line in lines)
+    b['value']=None;details.set_modes([a,a_fast,b_standard,b],'cost')
+    text=details.mode_comparison.text()
+    assert '+100.0%' in text and '+300.0%' not in text
 
 
 def test_interval_analysis_distribution_totals_missing_and_weighted_speed():

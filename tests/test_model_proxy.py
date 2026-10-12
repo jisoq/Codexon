@@ -16,6 +16,50 @@ def run_proxy_test(coro):
     with asyncio.Runner(loop_factory=proxy_loop) as runner:return runner.run(coro)
 
 
+def test_managed_tick_uses_async_storage_failures_without_health_request(tmp_path,monkeypatch):
+    import sqlite3
+    import threading
+    import time
+    from types import SimpleNamespace
+    from cachemonitor.evidence_writer import EvidenceWriter
+    from cachemonitor.managed_proxy import ManagedProxy
+    from cachemonitor.model_proxy import Tracker
+
+    def unavailable_store(path):
+        raise sqlite3.OperationalError('locked')
+
+    writer=EvidenceWriter(tmp_path/'unavailable.sqlite',store_factory=unavailable_store)
+    try:
+        for number in range(3):writer.write('home',attempt=str(number),ts=time.time())
+        deadline=time.monotonic()+3
+        while writer.status()['storage_failure_streak']<3 and time.monotonic()<deadline:
+            writer.stopping.wait(.005)
+        assert writer.status()['storage_failure_streak']==3
+        health=dict(requests=0,responses=0,storage_errors=0,storage_failure_streak=0)
+        Tracker(writer,'home','WebSocket',health).request(dict(model='m'))
+        assert health['storage_failure_streak']>=3
+
+        async def run():
+            disabled=threading.Event();observed=[]
+            manager=SimpleNamespace(directory=tmp_path,url='http://127.0.0.1:8768',
+                state=lambda:dict(enabled=True),
+                config=lambda:(None,dict(openai_base_url='http://127.0.0.1:8768')))
+            managed=ManagedProxy(manager)
+            def capture(status,phase):
+                if not status['observation_enabled']:
+                    observed.append(dict(status));disabled.set()
+            monkeypatch.setattr(managed,'publish',capture)
+            runner=web.AppRunner(create_app(writer,'home',managed=managed),access_log=None)
+            try:
+                await runner.setup()
+                assert await asyncio.wait_for(asyncio.to_thread(disabled.wait,3),4)
+                assert observed[0]['storage_failure_streak']>=3
+                assert not observed[0]['draining']
+            finally:await runner.cleanup()
+        run_proxy_test(run())
+    finally:writer.close()
+
+
 @pytest.mark.parametrize('force',[False,True])
 @pytest.mark.parametrize('interrupt',[False,True])
 def test_managed_shutdown_finishes_inflight_websocket_without_replay(tmp_path,force,interrupt):

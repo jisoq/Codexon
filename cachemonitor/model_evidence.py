@@ -5,7 +5,10 @@ import os
 import re
 import sqlite3
 import math
-from collections import Counter
+import time
+import hashlib
+import json
+from collections import Counter, OrderedDict
 from pathlib import Path
 
 FIELDS = ('requested_model', 'response_model', 'model_match', 'model_evidence', 'response_status',
@@ -65,6 +68,7 @@ class EvidenceStore:
                 response_id TEXT NOT NULL, requested_model TEXT NOT NULL,
                 response_model TEXT NOT NULL, status TEXT NOT NULL, conflict INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS observation_gaps(start REAL NOT NULL, end REAL NOT NULL);
+            CREATE INDEX IF NOT EXISTS evidence_response ON model_observations(home,response_id,attempt,seq);
         ''')
         columns={row[1] for row in self.db.execute('pragma table_info(model_observations)')}
         for column in ('requested_service_tier','response_service_tier','cache_policy'):
@@ -108,22 +112,116 @@ class EvidenceStore:
         self.db.close()
 
 
+class EvidenceSummary:
+    """Bounded witnesses for the join's any/all, conflict and timing decisions."""
+    FIELDS=('requested_model','response_model','requested_service_tier','response_service_tier',
+            'cache_policy','transport','wire_service_tier_present')
+    def __init__(self):
+        self.records={};self.values={field:set() for field in self.FIELDS}
+        self.flags=set();self.first=[];self.earliest=None;self.latest=None
+
+    def add(self,record,missing):
+        keep=False
+        for field,values in self.values.items():
+            value=record.get(field)
+            if field in ('requested_model','response_model','requested_service_tier','response_service_tier') and not value:continue
+            if field=='transport' and value not in ('WebSocket','HTTP/SSE'):continue
+            if field=='wire_service_tier_present' and value is None:continue
+            if field=='cache_policy':value=value or None
+            if value not in values and len(values)<2:values.add(value);keep=True
+        flags=(bool(missing),bool(record['conflict']),record['status']=='completed',
+               bool(record['requested_model'] and record['response_model']),
+               bool(record['status']=='completed' and record['requested_model'] and record['response_model']),
+               bool(record['status']=='completed' and record['requested_model'] and record['response_model'] and record.get('response_service_tier')))
+        for position,value in enumerate(flags):
+            if (position,value) not in self.flags:self.flags.add((position,value));keep=True
+        if len(self.first)<2:self.first.append(record)
+        if self.earliest is None or record['ts']<self.earliest['ts']:self.earliest=record
+        if self.latest is None or record['seq']>self.latest['seq']:self.latest=record
+        if keep:self.records[record['seq']]=record
+
+    def rows(self):
+        return list({**self.records,**{r['seq']:r for r in [*self.first,self.earliest,self.latest] if r is not None}}.values())
+
+
 class EvidenceReader:
     """Incremental read-only join, scoped to Codex home and exact response ID."""
+    MAX_CACHE_SESSIONS = 2048
+    MAX_CACHE_ROWS = 160000
+    READ_BATCH = 5000
+    READ_SECONDS = .4
+    MAX_RECORDS = 4096
+    MAX_POLL_ROWS = 5000
+
     def __init__(self, path):
         self.path = Path(path)
         self.db = None
         self.offset = 0
         self.records = {}
-        self.activity_records = {}
+        self.activity_records = OrderedDict()
+        self.changed_activity = {}
         self.revision = 0
         self.error = ''
-        self.cache = {}
+        self.cache = OrderedDict()
         self.dependencies = {}
+        self.cache_dependencies = {}
+        self.cache_rows = 0
         self.gaps = []
+        self.generation = 0
+        self.identity = None
+        self.anchor = None
+        self.catching_up = False
+        self.highwater=0
+        self.source_marker=''
+
+    def _evict(self, key):
+        cached = self.cache.pop(key, None)
+        if cached is not None:
+            self.cache_rows -= len(cached[0])
+        for response in self.cache_dependencies.pop(key, ()):
+            dependents = self.dependencies.get(response)
+            if dependents is not None:
+                dependents.discard(key)
+                if not dependents:
+                    self.dependencies.pop(response, None)
+
+    def _reset(self):
+        if self.db is not None:
+            self.db.close()
+        self.db = None
+        self.offset = 0
+        self.records.clear()
+        self.activity_records.clear()
+        self.changed_activity.clear()
+        self.cache.clear()
+        self.dependencies.clear()
+        self.cache_dependencies.clear()
+        self.cache_rows = 0
+        self.gaps = []
+        self.anchor = None
+        self.catching_up = False
+        self.highwater=0
+        self.source_marker=''
+        self.generation += 1
+        self.revision += 1
 
     def poll(self):
+        self.changed_activity={}
         self.error = ''
+        try:
+            stat = self.path.stat()
+        except FileNotFoundError:
+            if self.db is not None:
+                self._reset()
+            self.identity = None
+            return
+        except OSError:
+            self.error = '모델 관측 기록을 읽을 수 없습니다'
+            return
+        identity = (stat.st_dev, stat.st_ino)
+        if self.identity is not None and self.identity != identity:
+            self._reset()
+        self.identity = identity
         if self.db is None:
             if not self.path.exists():
                 return
@@ -134,40 +232,96 @@ class EvidenceReader:
             except sqlite3.Error:
                 self.error = '모델 관측 기록을 읽을 수 없습니다'
                 return
+        changed = False
         try:
+            highwater = self.db.execute('SELECT coalesce(max(seq),0) FROM model_observations').fetchone()[0]
+            self.highwater=highwater
+            if not self.source_marker and highwater:
+                first=self.db.execute('SELECT * FROM model_observations ORDER BY seq LIMIT 1').fetchone()
+                self.source_marker=hashlib.sha256(json.dumps(dict(first),sort_keys=True).encode()).hexdigest()
+            anchor = self.db.execute('SELECT * FROM model_observations WHERE seq=?',
+                                     (self.offset,)).fetchone() if self.offset else None
+            if self.offset and (highwater < self.offset or anchor is None or dict(anchor) != self.anchor):
+                self._reset()
+                return self.poll()
             if self.db.execute("select 1 from sqlite_master where name='observation_gaps'").fetchone():
                 gaps=[tuple(r) for r in self.db.execute('SELECT start,end FROM observation_gaps')]
                 if gaps!=self.gaps:
-                    self.gaps=gaps; self.cache.clear(); self.revision+=1
-            rows = self.db.execute('SELECT * FROM model_observations WHERE seq>? ORDER BY seq LIMIT 5000',
-                                   (self.offset,)).fetchall()
+                    self.gaps=gaps
+                    for key in list(self.cache):self._evict(key)
+                    self.revision+=1
+            deadline = time.monotonic() + self.READ_SECONDS
+            read_count=0
+            while self.offset < highwater and read_count<self.MAX_POLL_ROWS:
+                rows = self.db.execute('SELECT * FROM model_observations WHERE seq>? AND seq<=? '
+                                       'ORDER BY seq LIMIT ?',
+                                       (self.offset, highwater, min(self.READ_BATCH,self.MAX_POLL_ROWS-read_count))).fetchall()
+                if not rows:break
+                read_count+=len(rows)
+                for row in rows:
+                    self.offset = row['seq']
+                    # Replace values so already published observations remain immutable.
+                    record = dict(row)
+                    activity_key=(row['home'],row['attempt'])
+                    old=self.activity_records.pop(activity_key,None)
+                    if old and old['response_id']!=row['response_id']:self._forget_record(old)
+                    self.activity_records[activity_key] = record
+                    self.changed_activity[activity_key] = record
+                    if row['response_id']:
+                        key = (row['home'], row['response_id'])
+                        self.records.setdefault(key, {})[row['attempt']] = record
+                        for cache_key in tuple(self.dependencies.get(key, ())):
+                            self._evict(cache_key)
+                    while len(self.activity_records)>self.MAX_RECORDS:
+                        _,expired=self.activity_records.popitem(last=False)
+                        self._forget_record(expired)
+                    self.anchor = record
+                changed = True
+                if time.monotonic() >= deadline:break
+            self.catching_up = self.offset < highwater
         except sqlite3.Error:
+            if changed:self.catching_up = self.offset < highwater
             self.error = '모델 관측 기록을 읽을 수 없습니다'
             return
-        for row in rows:
-            self.offset = row['seq']
-            # Both indexes read the same observation. Later events replace the
-            # dict rather than mutate it, preserving previously returned values.
-            record = dict(row)
-            self.activity_records[(row['home'], row['attempt'])] = record
-            if row['response_id']:
-                key = (row['home'], row['response_id'])
-                self.records.setdefault(key, {})[row['attempt']] = record
-                # Invalidate only joined histories containing this exact response.
-                for cache_key in self.dependencies.pop(key,set()):
-                    self.cache.pop(cache_key,None)
-        if rows:
-            self.revision += 1
+        finally:
+            # Completed batches are authoritative even if a later read fails.
+            if changed:self.revision += 1
+
+    def _forget_record(self,record):
+        key=(record['home'],record['response_id'])
+        values=self.records.get(key)
+        if values is not None:
+            values.pop(record['attempt'],None)
+            if not values:self.records.pop(key,None)
+
+    def evidence_rows(self,home,rows):
+        # Batch exact indexed lookups; never turn one old-session view into one
+        # database round trip per response. History remains authoritative on disk.
+        for start in range(0,len(rows),128):
+            batch=rows[start:start+128];evidence={}
+            if self.db is not None:
+                responses=tuple(dict.fromkeys(row['key'] for row in batch))
+                slots=','.join('?' for _ in responses)
+                for record in self.db.execute('SELECT m.* FROM model_observations m '
+                    'JOIN (SELECT max(seq) seq FROM model_observations '
+                    f'WHERE home=? AND response_id IN ({slots}) AND seq<=? GROUP BY response_id,attempt) latest '
+                    'ON m.seq=latest.seq',(home,*responses,self.offset)):
+                    value=dict(record)
+                    missing=value.get('observation_missing') or any(a<=value['ts']<=b for a,b in self.gaps)
+                    summary=evidence.get(record['response_id'])
+                    if summary is None:summary=evidence[record['response_id']]=EvidenceSummary()
+                    summary.add(value,missing)
+            for row in batch:yield row,evidence[row['key']].rows() if row['key'] in evidence else []
 
     def enrich(self, home, rows, session_id=None):
         key = home_key(home)
         cache_key=(key,session_id if session_id is not None else id(rows))
         cached = self.cache.get(cache_key)
         if cached is not None and cached[0] is rows:
+            self.cache.move_to_end(cache_key)
             return cached[1]
         result = []
-        for row in rows:
-            evidence = list(self.records.get((key, row['key']), {}).values())
+        for row,evidence in self.evidence_rows(key,rows):
             missing=any(e.get('observation_missing') or any(a<=e['ts']<=b for a,b in self.gaps) for e in evidence)
             req = {e['requested_model'] for e in evidence if e['requested_model']}
             res = {e['response_model'] for e in evidence if e['response_model']}
@@ -233,20 +387,20 @@ class EvidenceReader:
                            'response_status':max(evidence,key=lambda e:e['seq'])['status'] if evidence else '',
                            'model_alert_confirmed':alert_confirmed,
                            'model_observation_ts':min(e['ts'] for e in evidence) if evidence else None})
-        # Keep only the current snapshot of each session, not every historical list.
-        if len(self.cache)>2048:
-            self.cache.clear()
-            self.dependencies.clear()
-        if cached:
-            for row in cached[0]:
-                dependents=self.dependencies.get((key,row['key']),set())
-                dependents.discard(cache_key)
-                if not dependents:self.dependencies.pop((key,row['key']),None)
-        self.cache[cache_key] = (rows,result)
-        for row in rows:
-            self.dependencies.setdefault((key,row['key']),set()).add(cache_key)
+        self._evict(cache_key)
+        if len(rows) <= self.MAX_CACHE_ROWS:
+            while self.cache and (len(self.cache) >= self.MAX_CACHE_SESSIONS or
+                                  self.cache_rows + len(rows) > self.MAX_CACHE_ROWS):
+                self._evict(next(iter(self.cache)))
+            self.cache[cache_key] = (rows,result)
+            self.cache_rows += len(rows)
+            responses = {(key,row['key']) for row in rows}
+            self.cache_dependencies[cache_key] = responses
+            for response in responses:
+                self.dependencies.setdefault(response,set()).add(cache_key)
         return result
 
     def close(self):
         if self.db is not None:
             self.db.close()
+            self.db = None

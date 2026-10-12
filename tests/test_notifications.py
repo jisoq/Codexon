@@ -61,16 +61,16 @@ def test_confirmed_alerts_reach_tray_and_click_opens_evidence(tmp_path,monkeypat
         state=dict(configured=True,probe_state='refused',phase='recovery_required')
         for stamp in (100,115,130):
             clock[0]=stamp;window.observer_panel.display(state)
-        assert sent[-1]=='Codexon: 로컬 프록시 연결 거부'
+        assert sent[-1]=='Codex 연결 오류 발생'
         window.tray.messageClicked.emit();app.processEvents()
         assert window.current_page==4 and window.nav.currentRow()==-1
         assert window.settings_page.current_category()=='notifications' and window.notification_log.isVisible()
         rows=window.notification_log.model().rows
         assert '요청: asked → 응답: reported' in rows[1]['detail']
         assert '응답 ID: r' in rows[1]['detail']
-        assert '3회 거부' in rows[0]['detail']
+        assert rows[0]['error_kind']=='connection' and rows[0]['error_code']=='refused'
         window.observer_panel.display(dict(configured=True,probe_state='healthy',phase='active'))
-        assert len(sent)==2 and rows[0]['resolution']=='정상 식별 응답 확인'
+        assert len(sent)==2 and window.notification_log.model().rows[0]['resolution']=='정상 식별 응답 확인'
         window.open_notification_record(1)
         assert window.current_page==2 and window.selected_call=='r'
         assert window.selected_call_scope==(str(tmp_path),'task')

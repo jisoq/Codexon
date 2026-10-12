@@ -97,6 +97,8 @@ def record_summary(rows):
 
 
 class Dashboard(TrayWindow):
+    NAVIGATION_LIMIT=64
+
     @property
     def record_view(self):return self.history_navigation.view
     @record_view.setter
@@ -138,7 +140,11 @@ class Dashboard(TrayWindow):
         self.display_identity=None;self.pending_retained=False
         self.lookup={'sessions':{},'turns':{},'session_turns':{}};self.page_frames={}
         self.started_at=time.time();self.alerted={};self.confirmed_notifications=ConfirmedNotifications()
-        self.current_page=0;self.restoring=True;self.back_stack=[];self.temporary_context=None;self.navigation_signature=None
+        from .app_errors import ErrorState
+        self.error_state=ErrorState(history=self.confirmed_notifications.records)
+        self._error_revision=-1;self.collection_starting=False;self.collection_stopped=False;self._observation_counters=None
+        self.collection_snapshot_at=None
+        self.current_page=0;self.restoring=True;self.back_stack=[];self.forward_stack=[];self.temporary_context=None;self.navigation_signature=None
         self.page_filters={0:{'model':'','effort':'','service_tier':''},2:{'model':'','effort':'','service_tier':''}}
         self.targets=[];self.comparison_edited=False;self.baseline='A';self.filter_values={}
         self.history_navigation=HistoryNavigation()
@@ -175,8 +181,10 @@ class Dashboard(TrayWindow):
         from .quota_sidebar import QuotaSidebar
         footer=Group();footer_layout=Column(footer);footer_layout.setSpacing(8)
         self.quota_sidebar=QuotaSidebar();footer_layout.addWidget(self.quota_sidebar)
-        self.settings_button=Button('설정');self.settings_button.put(flat=True);self.settings_button.clicked.connect(self.open_settings)
+        self.settings_button=Button('설정');self.settings_button.put(role='navigation');self.settings_button.clicked.connect(self.open_settings)
         footer_layout.addWidget(self.settings_button);self.index_status=label('수집 중','muted',True);self.index_status.put(fontSize=12);footer_layout.addWidget(self.index_status)
+        self.error_button=Button();self.error_button.put(role='quiet',wrap=True,fontSize=12)
+        self.error_button.hide();self.error_button.clicked.connect(self.open_errors);footer_layout.addWidget(self.error_button)
         side_layout.addWidget(footer)
         self.sidebar_layout=side_layout;self.sidebar_footer_layout=footer_layout;self.layout_sidebar()
         shell.addWidget(side)
@@ -223,6 +231,9 @@ class Dashboard(TrayWindow):
         self.build_overview();self.build_compare();self.build_explorer()
         from .quota_panel import QuotaPanel
         self.quota_panel=QuotaPanel(self.settings);quota_scroll=Scroll();quota_scroll.put(fillViewport=True)
+        self.quota_panel.centralized_errors=True
+        self.quota_panel.fault_changed.connect(lambda facts:self.observe_error('quota.query','quota',facts,
+            healthy=bool(facts.get('query_healthy')),resolution='사용 한도 분석 결과 갱신 확인'))
         quota_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff);quota_scroll.setWidget(self.quota_panel);self.pages.addWidget(quota_scroll)
         self.scrollers[3]=quota_scroll;self.build_settings()
         from .performance_panel import PerformancePanel
@@ -240,7 +251,7 @@ class Dashboard(TrayWindow):
             if homes and static_snapshot is None:self.start_quota_service(homes[0])
             self.worker=AnalysisBridge(homes,index_path,static_snapshot,model_evidence_path,quota_path)
             self.worker.snapshot.connect(self.receive);self.worker.result.connect(self.analysis_ready)
-            self.worker.failure.connect(self.analysis_failed);self.worker.record.connect(self.record_ready);self.worker.population.connect(self.population_ready);self.worker.start();self.render()
+            self.worker.fault.connect(self.analysis_failed);self.worker.record.connect(self.record_ready);self.worker.population.connect(self.population_ready);self.worker.start();self.render()
         elif static_snapshot is not None:self.receive(static_snapshot)
         self.setCentralWidget(root)
         if hasattr(self.quota_panel,'set_homes'):self.quota_panel.set_homes(homes)
@@ -323,6 +334,23 @@ class Dashboard(TrayWindow):
         if self.quota_panel.receive(value) is False:return
         self.quota_sidebar.receive(value)
         self.live_quota=value.get('quota');self.quota_issue=value.get('issue','');self.refresh_tray()
+        facts=value.get('quota_faults')
+        if isinstance(facts,dict):
+            lookup=facts.get('lookup') or {};storage=facts.get('storage') or {};calculation=facts.get('calculation') or {}
+            self.observe_error('quota.live','quota',lookup,healthy=not lookup.get('lookup_failed'))
+            self.observe_error('quota.ledger','quota',storage,healthy=not storage.get('storage_failed'))
+            self.observe_error('quota.calculation','quota',calculation,
+                healthy=not calculation.get('calculation_failed') and not calculation.get('uncertain'))
+        edited=value.get('exclusion_result')
+        if edited:
+            self._quota_edit_waiting_for_report=bool(not edited.get('ok') and edited.get('saved') and not edited.get('uncertain'))
+            self.observe_error('quota.edit','quota',dict(calculation_failed=not edited.get('ok'),
+                saved=bool(edited.get('saved')),uncertain=bool(edited.get('uncertain'))),healthy=bool(edited.get('ok')))
+        elif (getattr(self,'_quota_edit_waiting_for_report',False) and value.get('report_refreshed')
+                and isinstance(facts,dict) and not (facts.get('calculation') or {}).get('calculation_failed')
+                and not (facts.get('calculation') or {}).get('uncertain')):
+            self._quota_edit_waiting_for_report=False
+            self.error_state.clear('quota.edit',resolution='저장된 변경의 재집계 완료 확인');self.refresh_errors()
 
     def sync_report_demand(self):
         visible=self.isVisible() and not self.isMinimized()
@@ -646,19 +674,33 @@ class Dashboard(TrayWindow):
         if encoded!=getattr(self,'_saved_state',None):
             self.settings.setValue('dashboard/state',encoded);self._saved_state=encoded
 
-    def push_state(self):
+    def remember_navigation(self,stack):
         state=self.capture_state()
-        if not self.back_stack or self.back_stack[-1]!=state:self.back_stack.append(state)
+        if not stack or stack[-1]!=state:stack.append(state)
+        del stack[:-self.NAVIGATION_LIMIT]
+
+    def push_state(self):
+        self.forward_stack.clear()
+        self.remember_navigation(self.back_stack)
         self.back_button.setEnabled(True)
 
     def go_back(self):
-        if self.current_page==1 and self.comparison_detail['group'].isVisible():
+        comparison_detail=self.current_page==1 and self.comparison_detail['group'].isVisible()
+        if comparison_detail or self.back_stack or self.selected_call or self.selected_turn or self.selected_session:
+            self.remember_navigation(self.forward_stack)
+        if comparison_detail:
             self.close_aggregate(self.comparison_detail['group']);return
         if self.back_stack:
             state=self.back_stack.pop();self.navigation_signature=None;self.restore_state(state)
         elif self.selected_call:self.close_record_detail()
         elif self.selected_turn:self.selected_turn=None;self.record_view='requests';self.render_explorer()
         elif self.selected_session:self.selected_session=None;self.record_view='sessions';self.render_explorer()
+        self.update_navigation()
+
+    def go_forward(self):
+        if not self.forward_stack:return
+        self.remember_navigation(self.back_stack)
+        state=self.forward_stack.pop();self.navigation_signature=None;self.restore_state(state)
         self.update_navigation()
 
     def close_aggregate(self,group):
@@ -775,7 +817,8 @@ class Dashboard(TrayWindow):
 
     def change_page(self,index):
         if self.restoring:return
-        if self.current_page!=index:self.save_page_scope()
+        if self.current_page!=index:
+            self.save_page_scope();self.forward_stack.clear()
         scope=self.page_scopes.get(index) if self.current_page!=index else None
         if self.current_page in (0,2):
             self.page_filters[self.current_page]={key:getattr(self,attr).currentData() for key,attr in (('model','model'),('effort','effort'),('service_tier','mode'))}
@@ -789,6 +832,7 @@ class Dashboard(TrayWindow):
                 choose(node,value)
             self.date_start.setText(scope['dates'][0]);self.date_end.setText(scope['dates'][1]);self.archive.setChecked(scope['archive'])
         self.nav.setCurrentRow(self.navigation_pages.index(self.current_page) if self.current_page in self.navigation_pages else -1)
+        self.settings_button.put(checked=self.current_page==4)
         for key,attr in (('model','model'),('effort','effort'),('service_tier','mode')):
             if self.current_page in (0,2):choose(getattr(self,attr),self.page_filters[self.current_page].get(key,''))
         self.restoring=False
@@ -803,11 +847,72 @@ class Dashboard(TrayWindow):
         self.render();self.save_preferences()
 
     def open_settings(self):self.show_window();self.change_page(4)
+
+    def open_errors(self):
+        self.open_settings();self.settings_page.reveal('notifications',self.error_panel)
+
+    def perform_error_action(self,kind,page):
+        if kind=='analysis':
+            if self.worker is not None and not self.worker.isRunning():
+                self.worker.restart_count=0;self.worker.start()
+            self.client_cache.clear();self.change_page(getattr(self,'_analysis_error_page',0))
+        elif kind=='collection':
+            self.open_settings();self.settings_page.reveal('general')
+            self.service_controller.invoke('ensure')
+        elif page=='quota':
+            self.show_window();self.change_page(3)
+        elif page=='integration':
+            self.open_settings();self.settings_page.reveal('integration',self.recovery_button)
+        elif page=='about':self.open_updates()
+
+    def observe_error(self,source,kind,facts,*,healthy=False,resolution='정상 동작 확인'):
+        fault=self.error_state.update(source,kind,facts,healthy=healthy,resolution=resolution)
+        self.refresh_errors()
+        if fault and self.notification_master.isChecked():
+            if kind in ('connection','observation') and not self.notification_options['프록시 장애'].isChecked():return
+            self.show_tray_notification('app_error',tr(fault.title),
+                tr(fault.explanation)+'\n'+tr(fault.guidance),QSystemTrayIcon.Warning)
+
+    def refresh_errors(self):
+        if self._error_revision!=self.error_state.revision:
+            self._error_revision=self.error_state.revision
+            faults=self.error_state.grouped();self.error_panel.apply(faults)
+            self.error_button.setVisible(bool(faults));self.index_status.setVisible(not faults)
+            if faults:
+                self.error_button.setText(next(iter(faults.values())).title if len(faults)==1 else
+                    formatted('오류 {count}개 발생',count=len(faults)))
+                self.error_button.setToolTip('\n'.join(tr(fault.title) for fault in faults.values()))
+                from .app_errors import strongest
+                principal=strongest(faults.values()) or next(iter(faults.values()))
+                self.error_button.put(color=principal.severity)
+        self.refresh_notification_log()
+        if hasattr(self,'tray'):self.refresh_tray()
+
+    def refresh_notification_log(self):
+        records=[dict(record) for record in self.confirmed_notifications.records]
+        if records==getattr(self,'_notification_rows',None):return
+        self._notification_rows=records
+        self.notification_log.set_rows(records,lambda event,column,role:
+            [date_time(event['at']),event['title'],str(event['count']),
+             ' '.join((event.get('resolution') or event['detail']).splitlines())][column])
+        self.notification_log.setFixedHeight(70+max(1,len(records))*self.notification_log.state['rowHeight'])
+
+    def receive_update_error(self,facts):
+        checking=bool(facts.get('checking_failed') or facts.get('check_healthy'))
+        operation=bool(facts.get('operation_error') or facts.get('operation_healthy'))
+        self.observe_error('update.check' if checking else 'update.operation' if operation else 'update.status','update',facts,
+            healthy=bool(facts.get('check_healthy') or facts.get('operation_healthy') or facts.get('status_healthy')),
+            resolution='업데이트 정상 동작 확인')
+        if facts.get('status_healthy'):
+            self.error_state.clear('update.operation',resolution='업데이트 취소 확인' if facts.get('phase')=='cancelled' else '업데이트 완료 확인')
+            self.refresh_errors()
+
     def open_updates(self):
         self.open_settings();self.settings_page.reveal('about',self.update_panel)
 
     def open_tray_notification(self):
-        if getattr(self,'_tray_notification_kind','')=='update':self.open_updates()
+        if getattr(self,'_tray_notification_kind','')=='app_error':self.open_errors()
+        elif getattr(self,'_tray_notification_kind','')=='update':self.open_updates()
         else:self.open_notification_details()
 
     def show_tray_notification(self,kind,title,message,icon):
@@ -818,6 +923,7 @@ class Dashboard(TrayWindow):
         self.update_monitor=monitor
         self.update_panel.bind_monitor(monitor)
         monitor.available.connect(self.update_discovered)
+        monitor.fault_changed.connect(self.receive_update_error)
         self.auto_update.toggled.connect(monitor.set_enabled)
         self.notification_master.toggled.connect(lambda enabled:monitor.publish() if enabled else None)
 
@@ -976,6 +1082,8 @@ class Dashboard(TrayWindow):
         else:self.display_identity=self.query_identity(query)
 
     def retry_analysis(self):
+        if self.worker is not None and not self.worker.isRunning():
+            self.worker.restart_count=0;self.worker.start()
         self.client_cache.clear();self.render()
 
     def scope_text(self,q):
@@ -992,6 +1100,14 @@ class Dashboard(TrayWindow):
         return Verbatim(', '.join(tr(x) for x in names if x))
 
     def receive_collection_status(self,result):
+        if isinstance(result.get('collection_snapshot_at'),(int,float)):
+            self.collection_snapshot_at=result['collection_snapshot_at']
+        if isinstance(result.get('collection_fault'),dict):
+            facts=result['collection_fault'];self.collection_starting=bool(facts.get('starting'))
+            self.collection_stopped=bool(facts.get('expected_stop'))
+            self.observe_error('collection.service','collection',facts,
+                healthy=bool(result.get('collection_healthy')) or bool(facts.get('expected_stop')),
+                resolution='수집기 종료 확인' if facts.get('expected_stop') else '수집기 실행 확인')
         if 'collection_issue' not in result:return
         self.collection_issue=result['collection_issue']
         overlay=getattr(self,'overlay',None)
@@ -1005,6 +1121,18 @@ class Dashboard(TrayWindow):
             value={**value,'sessions':[s['source'] for s in self.engine.sessions.values()],
                    'internal_review_calls':sum(len(s['prepared']['history']) for s in self.engine.internal_sessions.values())}
         self.snapshot=value
+        self.error_state.clear('analysis.process',resolution='분석기 실행 확인')
+        if isinstance(value.get('collection_fault'),dict):
+            self.observe_error('collection.source','collection',value['collection_fault'],
+                healthy=bool(value.get('usage_collection_complete')),resolution='사용 기록 수집 재개 확인')
+        elif value.get('usage_errors'):
+            self.observe_error('collection.source','collection',dict(read_failed=True))
+        if 'observation_read_failed' in value:
+            self.observe_error('observation.read','observation',dict(read_failed=bool(value['observation_read_failed'])),
+                healthy=not value['observation_read_failed'],resolution='관측 기록 읽기 확인')
+        if value.get('ledger_status_known'):
+            self.observe_error('quota.analysis','quota',value.get('ledger_fault') or {},
+                healthy=not value.get('ledger_error'),resolution='사용 한도 기록 갱신 확인')
         self.performance_panel.receive_collection_time(value['ts'])
         for service in getattr(self,'quota_services',{}).values():
             service.supply_local(value.get('quota_by_home',{}).get(service.home))
@@ -1022,6 +1150,9 @@ class Dashboard(TrayWindow):
     def analysis_ready(self,message):
         result=message['result']
         if message['id']!=self.request_id:return
+        self.error_state.clear('analysis.query',resolution='분석 결과 갱신 확인')
+        self.error_state.clear('analysis.process',resolution='분석기 실행 확인')
+        self.refresh_errors()
         self.client_cache.put(message['logical'],(result,message['valid_until']),result['analysis']['response_count']+1)
         self.analysis_errors.clear();self.worker_metrics=message.get('metrics',{})
         if self.pending_automatic and time.monotonic()-self.interaction_time<.15:
@@ -1087,16 +1218,26 @@ class Dashboard(TrayWindow):
             self._refresh_after_pending=False;QTimer.singleShot(0,lambda:self.render(automatic=True))
 
     def analysis_failed(self,error):
+        facts=dict(error) if isinstance(error,dict) else dict(query_failed=True,request_id=self.request_id)
+        if facts.get('query_failed') and facts.get('request_id')!=self.request_id:return
+        facts.update(current_request_id=self.request_id,retained=self.display_identity==self.query_identity(self.query()))
+        if self.current_page in (0,1,2,5):self._analysis_error_page=self.current_page
+        self.observe_error('analysis.query' if facts.get('query_failed') else 'analysis.process','analysis',facts)
         self.client_cache.clear();self.pending_logical=None
         self.request_id+=1;self.deferred_result=None;self.defer_timer.stop();self.clear_analysis_notice()
-        self.analysis_pending=False;self.analysis_errors=[error];self.analysis_error_history=(self.analysis_error_history+[error])[-10:]
+        self.analysis_pending=False;self.analysis_errors=[facts];self.analysis_error_history=(self.analysis_error_history+[facts])[-10:]
         if self.current_page not in (3,4):
-            if self.display_identity==self.query_identity(self.query()):
-                self.pending_label.setText('갱신 실패 / 이전 결과 표시');self.pending_label.setToolTip('');self.pending_label.show();self.retry_button.show()
-            else:self.show_analysis_notice('기록을 불러오지 못했습니다','잠시 후 다시 시도해 주세요.',retry=True)
+            if not facts['retained']:
+                self.pages.hide();self.scope_note.hide()
 
     def eventFilter(self,watched,event):
         if event.type() in (QEvent.Wheel,QEvent.MouseButtonPress,QEvent.KeyPress):self.interaction_time=time.monotonic()
+        if (event.type() in (QEvent.MouseButtonPress,QEvent.MouseButtonRelease,QEvent.MouseButtonDblClick)
+            and isinstance(watched,QWidget) and watched.window() is self
+            and event.button() in (Qt.BackButton,Qt.ForwardButton)):
+            if event.type()==QEvent.MouseButtonRelease:
+                (self.go_back if event.button()==Qt.BackButton else self.go_forward)()
+            event.accept();return True
         if event.type()==QEvent.KeyPress and event.key()==Qt.Key_Escape and watched is self.quick and self.current_page==2 and self.detail_scroll.isVisible():
             self.close_record_detail();return True
         return super().eventFilter(watched,event)
@@ -1107,6 +1248,7 @@ class Dashboard(TrayWindow):
     def resizeEvent(self,event):
         super().resizeEvent(event)
         if hasattr(self,'sidebar_layout'):self.layout_sidebar()
+        if hasattr(self,'settings_page'):self.settings_page.navigation.setFixedWidth(144 if self.width()<1200 else 200)
         if hasattr(self,'detail_scroll'):self.layout_record_detail()
         if getattr(self,'current_page',0)==5 and hasattr(self,'performance_panel'):self.performance_panel.resize_timer.start()
     def showEvent(self,event):
@@ -1126,6 +1268,13 @@ class Dashboard(TrayWindow):
     def closeEvent(self,event):
         self.settings.setValue('dashboard/geometry',self.saveGeometry());self.save_preferences();super().closeEvent(event)
     def check_stale(self):
+        if not self.quitting:
+            observed=max((stamp for stamp in (self.snapshot.get('ts'),self.collection_snapshot_at)
+                          if stamp is not None),default=None)
+            self.observe_error('collection.freshness','collection',
+                dict(snapshot_at=observed,starting=self.collection_starting,expected_stop=self.collection_stopped),
+                healthy=self.collection_stopped or self.collection_starting or observed is not None and time.time()-observed<=30,
+                resolution='수집기 종료 확인' if self.collection_stopped else '새 수집 결과 확인')
         self.refresh_tray()
         if self.isVisible() and not self.isMinimized():
             self.quota_sidebar.refresh_status()
@@ -1538,7 +1687,7 @@ class Dashboard(TrayWindow):
             state=self.back_stack[index]
             if (state.get('page')==2 and state.get('record_view')=='requests'
                 and tuple(state.get('selected_session') or ())==self.selected_session and not state.get('selected_call')):
-                self.back_stack=self.back_stack[:index];self.restore_state(state);return
+                self.forward_stack.clear();self.back_stack=self.back_stack[:index];self.restore_state(state);return
         if self.record_view=='requests':
             self.close_record_detail();return
         self.push_state();self.selected_turn=self.selected_call=self.selected_event=None
@@ -2001,7 +2150,7 @@ class Dashboard(TrayWindow):
             if not self.settings.contains(setting):self.settings.setValue(setting,enabled)
             option.toggled.connect(lambda value,key=setting:self.settings.setValue(key,value))
             self.notification_options[kind]=option
-            self.settings_page.add_row('notifications', kind, '', option,section='전체 알림',depth=1,aliases=description)
+            self.settings_page.add_row('notifications', kind, {'HTTP 전환': '연결 문제로 통신 방식이 전환되면 알립니다.', '캐시 저하 의심': '캐시 미적중이 반복되거나 읽기량이 감소하면 알립니다. 판단 기준은 잠정값입니다.', '모델명 불일치': '완료된 응답에서 요청 모델과 응답 모델이 다르면 알립니다.', '프록시 장애': '복구가 필요한 장애와 자동 보호 정지를 알립니다. 일시적인 지연은 제외합니다.'}[kind], option,section='전체 알림',depth=1,aliases=description)
             if key=='cache_drop':
                 self.cache_scope=Choice()
                 self.cache_scope.addItem('전체 세션','all');self.cache_scope.addItem('현재 선택 세션','selected')
@@ -2020,10 +2169,13 @@ class Dashboard(TrayWindow):
             self.notification_options[kind].toggled.connect(handler)
         self.observer_panel.status_observed.connect(self.receive_proxy_status)
         self.notification_log=table(['시각','알림','건수','확인 근거'],readable=False)
-        self.notification_log.setMinimumHeight(140);self.notification_log.setMaximumHeight(280)
-        self.notification_log.put(leftColumns=[0,1,3],emptyText='이번 실행에서 발생한 알림 없음')
-        for column,width in enumerate((175,160,70,430)):self.notification_log.setColumnWidth(column,width)
+        self.notification_log.setFixedHeight(102)
+        self.notification_log.put(inline=True,rowHeight=32,columnStretchWeights=[0,1,0,2],leftColumns=[0,1,3],emptyText='이번 실행에서 발생한 알림 없음')
+        for column,width in enumerate((175,130,48,110)):self.notification_log.setColumnWidth(column,width)
         self.notification_log.cellClicked.connect(self.open_notification_record);self.notification_log.cellActivated.connect(self.open_notification_record)
+        from .error_panel import ErrorPanel
+        self.error_panel=ErrorPanel();self.error_panel.action_requested.connect(self.perform_error_action)
+        self.settings_page.add_widget('notifications',self.error_panel,section='현재 오류',title='현재 오류',aliases='errors current status')
         self.settings_page.add_widget('notifications', self.notification_log,section='최근 알림',title='최근 알림',aliases='notification history')
         def sync_notification_controls(*_):
             for option in self.notification_options.values():option.setEnabled(self.notification_master.isChecked())
@@ -2049,6 +2201,7 @@ class Dashboard(TrayWindow):
         self.observer_panel.status_observed.connect(self.update_panel.proxy_status)
         self.observer_panel.progress_requested.connect(self.open_updates)
         self.update_panel.attention_changed.connect(self.update_attention)
+        self.update_panel.fault_changed.connect(self.receive_update_error)
         self.settings_page.add_row('about','제작자','',Text('jisoq'),section='제작자')
         from .i18n import language
         guide='README.ko.md' if language()=='ko' else 'README.md'
@@ -2061,7 +2214,7 @@ class Dashboard(TrayWindow):
         self.settings_page.update_attention(needed)
         if not needed or not self.notification_master.isChecked():return
         record=self.update_panel.record
-        if record.get('phase') not in ('needs_exit','partial','failed','interrupted'):return
+        if record.get('phase')!='needs_exit':return
         marker=str(record.get('operation_id',''))+':'+record['phase']
         if self.settings.value('updates/actionNotified','')==marker:return
         self.settings.setValue('updates/actionNotified',marker)
@@ -2069,12 +2222,40 @@ class Dashboard(TrayWindow):
             tr('설정의 앱 정보에서 다음 작업을 확인하세요.'),QSystemTrayIcon.Warning)
 
     def receive_proxy_status(self,result):
+        from .connection_recovery import assess
+        status={**result,'configured':bool(result.get('configured'))}
+        assessed=assess(status)
+        events=self.confirmed_notifications.proxy(status,store=False)
+        self.observe_error('connection.status','connection',
+            {**status,'notification_confirmed':bool(events)},
+            healthy='configured' in result and assessed['code'] in ('direct','responding'),
+            resolution='프록시 사용 해제' if assessed['code']=='direct' else '정상 식별 응답 확인')
+        self.observe_error('connection.operation','connection',dict(operation_failed=bool(result.get('operation_failed'))),
+            healthy=bool(status.get('operation_healthy')),resolution='연결 설정 적용 확인')
+        health=status.get('health')
+        if isinstance(health,dict) and health:
+            counters=(health.get('instance'),health.get('observation_dropped',0),health.get('storage_written',0))
+            previous=self._observation_counters
+            same_instance=previous is not None and previous[0]==counters[0]
+            previous_dropped=previous[1] if same_instance else counters[1]
+            written=bool(previous and (counters[2]>previous[2] if same_instance else counters[2]>0))
+            self._observation_counters=counters
+            self.observe_error('observation.health','observation',dict(health=health,previous_dropped=previous_dropped),
+                healthy=bool(written and counters[1]==previous_dropped and health.get('storage_failure_streak',0)==0
+                    and health.get('observation_enabled') is not False),resolution='관측 기록 저장 재개 확인')
+        elif status.get('configured') is False and status.get('phase') in ('off','faulted','prepared','validated'):
+            self.error_state.clear('observation.health',resolution='모델 관측 종료 확인')
         incident=result.get('incident') or {}
-        if incident.get('id') and incident['id'] != self.settings.value('notifications/lastProtectionId',''):
+        if incident.get('id') and result.get('phase') in ('faulted','recovery_failed'):
+            fresh=incident['id']!=self.settings.value('notifications/lastProtectionId','')
             self.settings.setValue('notifications/lastProtectionId',incident['id'])
-            event=self.confirmed_notifications.record('protection','프록시 보호 정지',incident.get('reason','설정에서 확인하세요.'))
-            self.show_confirmed_events([event] if self.notification_options['프록시 장애'].isChecked() else [])
-        self.show_confirmed_events(self.confirmed_notifications.proxy(result))
+            kind='observation' if incident.get('kind')=='observation' and not incident.get('recovery_error') else 'connection'
+            self.observe_error(kind+'.protection',kind,{**status,'protection_stopped':True,
+                'notification_confirmed':fresh})
+        elif not incident and status.get('phase') in ('off','prepared','validated','active'):
+            for kind in ('connection','observation'):
+                self.error_state.clear(kind+'.protection',resolution='연결 설정 변경 확인')
+        self.refresh_errors()
 
     def show_confirmed_events(self,events):
         for event in events:
@@ -2089,14 +2270,12 @@ class Dashboard(TrayWindow):
                         continue
                 self.show_tray_notification('details','Codexon: '+tr(event['title']),
                     event['detail'].split('\n')[0]+count,QSystemTrayIcon.Warning)
-        records=[dict(r) for r in self.confirmed_notifications.records]
-        if records==getattr(self,'_notification_rows',None):return
-        self._notification_rows=records
-        self.notification_log.set_rows(list(self.confirmed_notifications.records),lambda e,c,role:
-            [date_time(e['at']),e['title'],str(e['count']),e.get('resolution') or e['detail']][c])
+        self.refresh_notification_log()
 
     def open_notification_record(self,index,*_):
         if not 0<=index<len(self.notification_log.model().rows):return
         event=self.notification_log.model().rows[index]
-        if event.get('target'):self.navigate(event['target'])
+        if event.get('kind')=='app_error':
+            self.open_errors();self.error_panel.show_record(event)
+        elif event.get('target'):self.navigate(event['target'])
         else:self.settings_page.reveal('integration',self.recovery_button)

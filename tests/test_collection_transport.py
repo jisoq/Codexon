@@ -9,7 +9,7 @@ import time
 import pytest
 
 from cachemonitor import collection_transport
-from cachemonitor.usage_collection import CollectionChannel, CollectionClient, empty_snapshot
+from cachemonitor.usage_collection import CollectionChanges, CollectionChannel, CollectionClient, empty_snapshot
 
 
 def snapshot(channel, at=100.):
@@ -19,6 +19,224 @@ def snapshot(channel, at=100.):
     value['sessions']=[dict(home=channel.homes[0],id='session',history=[dict(key='one',output=3)],
                             remaining=10.,collection_complete=True,status='idle')]
     return value
+
+
+def wait_until(predicate,seconds=2):
+    deadline=time.monotonic()+seconds
+    while not predicate():
+        assert time.monotonic()<deadline
+        threading.Event().wait(.005)
+
+
+@pytest.mark.parametrize('live',[False,True])
+def test_activity_stream_is_bounded_replays_until_saved_and_recovers_old_history(tmp_path,live):
+    writer=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite')
+    reader=CollectionChannel(writer.homes,writer.path)
+    if live:writer.start_live()
+    try:
+        value=snapshot(writer)
+        value.update(activity_stream=True,activity_source='source',activity_source_offset=1200,
+            request_activity=[dict(home=writer.homes[0],attempt=str(n),seq=n,status='completed') for n in range(1200)])
+        writer.publish(value,'epoch',1)
+        first=reader.read(shared=True)
+        assert len(first['request_activity'])==512 and first['activity_more']
+        if live:
+            metadata,_=writer.live.request(dict(path=str(writer.path),scope=writer.scope,protocol=3))
+            assert not metadata['ready']  # A legacy reader uses the durable full snapshot.
+        assert reader.read(shared=True)['request_activity']==first['request_activity']
+        reader.acknowledge_activity(first);second=reader.read(shared=True)
+        assert len(second['request_activity'])==512
+        reader.acknowledge_activity(second);third=reader.read(shared=True)
+        assert len(third['request_activity'])==176 and not third['activity_more']
+        reader.acknowledge_activity(third)
+        assert reader.read(shared=True)['request_activity']==[]
+        updated={**value,'activity_source_offset':1201,'request_activity':[
+            dict(home=writer.homes[0],attempt='0',seq=1201,status='failed')]}
+        writer.publish(updated,'epoch',2)
+        assert reader.read(shared=True)['request_activity']==updated['request_activity']
+        assert not writer.published_activity and not reader.activity_cache and not reader.live_activity_cache
+        # A later consumer can recover all attempts, including old evicted rows.
+        reader.close();reader=CollectionChannel(writer.homes,writer.path)
+        seen=[]
+        for _ in range(3):
+            page=reader.read(shared=True);seen.extend(page['request_activity']);reader.acknowledge_activity(page)
+        assert len(seen)==1200 and next(row for row in seen if row['attempt']=='0')['status']=='failed'
+        cursor=reader.activity_ack
+        reader.close();reader=CollectionChannel(writer.homes,writer.path);reader.activity_ack=cursor
+        writer.publish(updated,'replacement-owner',1)
+        assert reader.read(shared=True)['request_activity']==[]
+    finally:reader.close();writer.close()
+
+
+def test_notifications_coalesce_publish_reclaim_epoch_and_stop(tmp_path):
+    writer=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite')
+    reader=CollectionClient(writer.homes,writer.path)
+    writer.start_live()
+    try:
+        value=snapshot(writer);writer.publish(value,'epoch',1)
+        reader.poll();wake=reader.notification_connection();first=reader.waiter
+        wait_until(lambda:bool(writer.live.waiters))
+        # Loading/other reads cannot create a second wait or pending message.
+        for _ in range(20):reader.notification_connection()
+        writer.publish(value,'epoch',2)
+        assert wake.poll(1)
+        for sequence in range(3,22):writer.publish(value,'epoch',sequence)
+        # A timer may have read the publication before its notification arrives.
+        reader.poll()
+        assert wake.poll(1) and reader.consume_notification() is False
+        reader.notification_connection()
+        writer.publish(value,'epoch',22)
+        assert wake.poll(1) and reader.consume_notification()
+        assert not wake.poll()
+        reader.poll();assert reader.channel.live_publication==('epoch',22)
+        reader.notification_connection();assert reader.waiter is first
+        wait_until(lambda:bool(writer.live.waiters))
+        writer.publish(value,'replacement',1)
+        assert wake.poll(1) and reader.consume_notification()
+        reader.poll();new=reader.notification_connection()
+        assert reader.waiter is not first and not first.thread.is_alive()
+        wait_until(lambda:bool(writer.live.waiters))
+        latest=reader.waiter
+        reader.stop_notifications()
+        wait_until(lambda:not writer.live.waiters)
+        assert not latest.thread.is_alive() and reader.waiter is None
+        assert new.closed
+    finally:reader.close();writer.close()
+
+
+def test_notification_failure_releases_socket_and_allows_polling_recovery(tmp_path):
+    writer=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite')
+    reader=CollectionClient(writer.homes,writer.path)
+    writer.start_live()
+    try:
+        value=snapshot(writer);writer.publish(value,'epoch',1)
+        reader.poll();wake=reader.notification_connection();worker=reader.waiter
+        wait_until(lambda:bool(writer.live.waiters))
+        writer.close()
+        assert wake.poll(2) and not reader.consume_notification()
+        assert reader.poll()['sessions']==value['sessions']
+        assert reader.notification_connection() is None
+        reader.close();assert not worker.thread.is_alive()
+    finally:reader.close();writer.close()
+
+
+def test_analyzer_publication_wakes_before_timer_and_freeze_reclaims_waiter(tmp_path):
+    import multiprocessing as mp
+    from cachemonitor.analysis_worker import process_main
+    from test_overlay import source
+    writer=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite')
+    writer.start_live()
+    context=mp.get_context('spawn');parent,child=context.Pipe()
+    process=context.Process(target=process_main,args=(child,writer.homes,writer.path),
+        kwargs={'quota_path':tmp_path/'quota.sqlite'})
+    try:
+        value=snapshot(writer,time.time());session=source();session['home']=writer.homes[0]
+        value['sessions']=[session];writer.publish(value,'epoch',1)
+        process.start();child.close()
+        assert parent.poll(15)
+        first=parent.recv();assert first['kind']=='snapshot'
+        wait_until(lambda:bool(writer.live.waiters))
+        changed=copy.deepcopy(value);changed['ts']+=.25
+        started=time.perf_counter();writer.publish(changed,'epoch',2)
+        assert parent.poll(1)
+        second=parent.recv();assert second['kind']=='snapshot'
+        assert second['value']['ts']==changed['ts']
+        assert time.perf_counter()-started<1
+        wait_until(lambda:bool(writer.live.waiters))
+        parent.send({'kind':'freeze'})
+        wait_until(lambda:not writer.live.waiters)
+        parent.send({'kind':'stop'});process.join(3)
+        assert not process.is_alive() and process.exitcode==0
+    finally:
+        if process.pid and process.is_alive():
+            parent.send({'kind':'stop'});process.join(3)
+            if process.is_alive():process.terminate();process.join()
+        parent.close();child.close();writer.close()
+
+
+def test_quiet_notifications_preserve_staleness_and_ledger_retry_deadlines(monkeypatch,tmp_path):
+    from types import SimpleNamespace
+    from cachemonitor import analysis_worker
+    clock=[100.];reads=[];opens=[];sent=[]
+    monkeypatch.setattr(analysis_worker,'time',SimpleNamespace(monotonic=lambda:clock[0],time=lambda:clock[0]))
+    notification=object()
+    def wait(connections,timeout):clock[0]+=timeout;return []
+    monkeypatch.setattr(analysis_worker,'wait',wait)
+    class Collector:
+        path=tmp_path/'index.sqlite'
+        def __init__(self,*args):pass
+        def poll(self):
+            reads.append(clock[0])
+            return dict(ts=100.,sessions=[],homes=[],errors=[],unassigned=[],index={'loading':False})
+        def notification_connection(self):return notification
+        def close(self):pass
+    class Ledger:
+        def __init__(self,*args):
+            opens.append(clock[0])
+            if len(opens)==1:raise sqlite3.OperationalError('locked')
+        def enrich_modes(self,*args):pass
+        def sync(self,*args):pass
+        def import_observations(self,*args):pass
+        def close(self):pass
+    class Connection:
+        def poll(self,*args):return len(reads)>=5
+        def recv(self):return {'kind':'stop'}
+        def send(self,value):sent.append(value)
+        def close(self):pass
+    monkeypatch.setattr(analysis_worker,'CollectionClient',Collector)
+    monkeypatch.setattr(analysis_worker,'QuotaLedger',Ledger)
+    analysis_worker.process_main(Connection(),[],tmp_path/'index.sqlite')
+    assert opens==[100.,105.]
+    assert 130.<reads[-1]<130.1
+    assert len(sent)==5 and all(value['kind']=='snapshot' for value in sent)
+
+
+def test_new_session_loading_does_not_reprocess_existing_call_history(tmp_path):
+    from cachemonitor.analysis_engine import AnalysisEngine
+    from cachemonitor.analysis_delivery import SnapshotPublisher, SnapshotReceiver
+    from cachemonitor.core import Session
+    from cachemonitor.overlay_data import OverlaySummaries
+    from cachemonitor.quota_cycles import QuotaLedger
+    ledger=QuotaLedger(tmp_path/'quota.sqlite')
+    engine=AnalysisEngine();overlays=OverlaySummaries();publisher=SnapshotPublisher();receiver=SnapshotReceiver()
+    def session(sid,count):
+        source=Session(sid,'home',title=sid)
+        for i in range(count):
+            source.add_usage(90.+i/10,sid+str(i),dict(input_tokens=100,cached_input_tokens=80,
+                cache_write_input_tokens=0,output_tokens=20,reasoning_output_tokens=5),
+                'gpt-6-astra',sid+'-turn','high',service_tier='Standard')
+        return dict(source.view(200.),usage_revision=1,collection_complete=True,
+            turn_records={sid+'-turn':dict(started_at=89.,ended_at=110.,state='완료')})
+    value=dict(ts=200.,sessions=[session('old',128)],homes=['home'],errors=[],index=dict(loading=False))
+    def deliver():
+        engine.ingest(value['sessions']);ledger.sync(engine,value)
+        return receiver.receive(publisher.publish(value,engine,overlays.collect(engine)))
+    try:
+        first=deliver();before=ledger.db.total_changes
+        query=dict(page=0,start=0,end=300,sid='old')
+        assert engine.query(query)['analysis']['turns'][0]['complete']
+        value.update(ts=201.,index=dict(loading=True))
+        value['sessions']=[dict(s,collection_complete=False) for s in value['sessions']]+[session('new',1)]
+        next_value=deliver()
+        assert ledger.db.total_changes-before<16
+        assert overlays.speed_health.metrics['scanned_rows']==1
+        assert next(s for s in next_value['overlay_sessions'] if s['id']=='old')==first['overlay_sessions'][0]
+        assert next(s for s in next_value['overlay_sessions'] if s['id']=='new')['calls']==1
+        assert engine.sessions[('home','old')]['prepared']['collection_complete'] is False
+        assert not engine.query(query)['analysis']['turns'][0]['complete']
+        before=ledger.db.total_changes
+        value.update(ts=202.,index=dict(loading=False))
+        value['sessions']=[dict(s,collection_complete=True) for s in value['sessions']]
+        recovered=deliver()
+        assert ledger.db.total_changes-before<16
+        assert overlays.speed_health.metrics['scanned_rows']==0
+        assert all(s['collection_complete'] for s in recovered['sessions'])
+        assert engine.query(query)['analysis']['turns'][0]['complete']
+        corrected=copy.deepcopy(value['sessions'][-1]);corrected['usage_revision']=2
+        corrected['history'][0]['output']=30;value['sessions'][-1]=corrected
+        deliver()
+        assert ledger.db.execute('select output from calls where uid=?',('new0',)).fetchone()[0]==30
+    finally:ledger.close()
 
 
 def test_live_idle_preserves_exact_freshness_heavy_identity_and_zero_sql_writes(tmp_path):
@@ -88,6 +306,135 @@ def test_live_delta_encodes_and_decodes_only_changed_rows(tmp_path,monkeypatch,u
         assert [row.get('id',row.get('attempt')) for row in decoded]==['session','active']
         assert received['sessions'][1]['history'] is original['sessions'][1]['history']
         assert received['request_activity'][0] is original['request_activity'][0]
+    finally:reader.close();writer.close()
+
+
+def test_trusted_collection_tokens_validate_only_changed_rows_and_preserve_order(tmp_path,monkeypatch):
+    from cachemonitor import usage_collection
+    writer=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite')
+    reader=CollectionChannel(writer.homes,writer.path);writer.start_live()
+    owner=object();home=writer.homes[0]
+    first=snapshot(writer)
+    first['sessions'][0]['groups']={'today':[dict(tokens=3)]}
+    first['sessions'].append(dict(home=home,id='retained',history=[dict(key=str(i),output=i) for i in range(300)]))
+    first['request_activity']=[dict(home=home,attempt=str(i),status='started') for i in range(100)]
+    session_tokens={(home,s['id']):1 for s in first['sessions']}
+    activity_tokens={(home,r['attempt']):1 for r in first['request_activity']}
+    def tokens():return CollectionChanges(owner,dict(session_tokens),dict(activity_tokens))
+    checked=[];fingerprint=usage_collection.publication_fingerprint
+    def count(value):
+        if isinstance(value,dict) and ('history' in value or 'attempt' in value):checked.append(value)
+        return fingerprint(value)
+    monkeypatch.setattr(usage_collection,'publication_fingerprint',count)
+    try:
+        writer.publish(first,'epoch',1,changes=tokens());initial=reader.read(shared=True)
+        first['sessions'][0]['groups']['today'][0]['tokens']=4
+        assert reader.read()['sessions'][0]['groups']['today'][0]['tokens']==3
+        checked.clear()
+        idle={**first,'ts':103.}
+        writer.publish(idle,'epoch',2,changes=tokens())
+        assert not checked and reader.read()==idle
+        changed={**idle,'ts':106.,'sessions':list(idle['sessions']),
+                 'request_activity':list(reversed(idle['request_activity']))}
+        changed['sessions'][0]=copy.deepcopy(changed['sessions'][0])
+        changed['sessions'][0]['history'][0]['output']=4
+        changed['request_activity'][0]={**changed['request_activity'][0],'status':'completed'}
+        session_tokens[(home,'session')]=2;activity_tokens[(home,'99')]=2
+        writer.publish(changed,'epoch',3,changes=tokens());received=reader.read(shared=True)
+        assert received==changed
+        assert len(checked)==2
+        assert received['sessions'][1]['history'] is initial['sessions'][1]['history']
+        # Retire rows while a consumer misses an intermediate publication.
+        removed={**changed,'ts':109.,'sessions':changed['sessions'][:1],
+                 'request_activity':changed['request_activity'][:2]}
+        writer.publish(removed,'epoch',4,changes=tokens())
+        latest={**removed,'ts':112.,'request_activity':list(reversed(removed['request_activity']))}
+        writer.publish(latest,'epoch',5,changes=tokens());assert reader.read()==latest
+        assert len(writer.live.current['session_tokens'])==1
+        assert len(writer.live.current['activity_tokens'])==2
+        assert not any(key.startswith('change_') or key.endswith('_tokens') for key in received)
+    finally:reader.close();writer.close()
+
+
+@pytest.mark.parametrize('reset',['owner','epoch'])
+def test_trusted_collection_token_reuse_requires_same_owner_and_epoch(tmp_path,reset):
+    writer=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite')
+    reader=CollectionChannel(writer.homes,writer.path);writer.start_live()
+    owner=object();home=writer.homes[0]
+    try:
+        first=snapshot(writer)
+        first['request_activity']=[dict(home=home,attempt='active',status='pending')]
+        changes=CollectionChanges(owner,{(home,'session'):1},{(home,'active'):1},activity_revision=1)
+        writer.publish(first,'epoch',1,changes=changes);assert reader.read()==first
+        changed=copy.deepcopy(first);changed['ts']=103.;changed['sessions'][0]['history'][0]['output']=4
+        changed['request_activity'][0]['status']='completed'
+        next_owner=object() if reset=='owner' else owner
+        epoch='replacement' if reset=='epoch' else 'epoch'
+        writer.publish(changed,epoch,2,changes=CollectionChanges(
+            next_owner,{(home,'session'):1},{(home,'active'):1},activity_revision=1))
+        assert reader.read()==changed
+    finally:reader.close();writer.close()
+
+
+def test_unchanged_trusted_activity_revision_reuses_history_without_visiting_records(tmp_path):
+    writer=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite')
+    reader=CollectionChannel(writer.homes,writer.path);writer.start_live()
+    owner=object();home=writer.homes[0]
+    class UnchangedRecords(list):
+        def __iter__(self):raise AssertionError('Unchanged activity records were visited')
+    try:
+        first=snapshot(writer)
+        first['request_activity']=[dict(home=home,attempt=key,status='pending') for key in ('old','active')]
+        changes=CollectionChanges(owner,{(home,'session'):1},
+                                  {(home,key):1 for key in ('old','active')},activity_revision=(0,1))
+        writer.publish(first,'epoch',1,changes=changes);assert reader.read()==first
+        idle={**first,'ts':103.,'request_activity':UnchangedRecords(first['request_activity'])}
+        writer.publish(idle,'epoch',2,changes=changes)
+        expected={**first,'ts':103.};assert reader.read()==expected
+        latest={**first,'ts':106.,'request_activity':[dict(home=home,attempt='active',status='completed')]}
+        updated=CollectionChanges(owner,{(home,'session'):1},{(home,'active'):2},activity_revision=(0,2))
+        writer.publish(latest,'epoch',3,changes=updated)
+        assert reader.read()==latest
+        # Trusted revisions remain private, while durable recovery retains the result.
+        writer.live_server.close();writer.live_server=None;writer.live=None
+        recovered=CollectionChannel(writer.homes,writer.path)
+        try:assert recovered.read()==latest
+        finally:recovered.close()
+    finally:reader.close();writer.close()
+
+
+def test_untrusted_in_place_correction_with_same_revision_is_not_hidden_by_tokens(tmp_path):
+    writer=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite')
+    reader=CollectionChannel(writer.homes,writer.path);writer.start_live()
+    home=writer.homes[0]
+    try:
+        first=snapshot(writer);first['sessions'][0]['usage_revision']=1
+        writer.publish(first,'epoch',1,changes=CollectionChanges(object(),{(home,'session'):1},{}))
+        original=reader.read(shared=True)
+        first['sessions'][0]['history'][0]['output']=9
+        writer.publish(first,'epoch',2)
+        assert reader.read()==first
+        assert original['sessions'][0]['history'][0]['output']==3
+    finally:reader.close();writer.close()
+
+
+def test_failed_trusted_checkpoint_retries_changed_row_without_advancing_tokens(tmp_path):
+    writer=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite')
+    reader=CollectionChannel(writer.homes,writer.path);writer.start_live()
+    owner=object();home=writer.homes[0]
+    try:
+        first=snapshot(writer)
+        writer.publish(first,'epoch',1,changes=CollectionChanges(owner,{(home,'session'):1},{}))
+        assert reader.read()==first
+        changed=copy.deepcopy(first);changed['ts']=103.;changed['sessions'][0]['history'][0]['output']=4
+        changes=CollectionChanges(owner,{(home,'session'):2},{})
+        writer.db.execute("CREATE TRIGGER interrupt_snapshot BEFORE INSERT ON snapshot BEGIN SELECT RAISE(ABORT,'interrupted'); END")
+        with pytest.raises(sqlite3.IntegrityError,match='interrupted'):
+            writer.publish(changed,'epoch',2,changes=changes)
+        assert reader.read()==first
+        writer.db.execute('DROP TRIGGER interrupt_snapshot')
+        writer.publish(changed,'epoch',3,changes=changes)
+        assert reader.read()==changed
     finally:reader.close();writer.close()
 
 
@@ -265,3 +612,65 @@ def test_live_lease_expiry_and_case_insensitive_path(tmp_path,monkeypatch):
         assert live.requested_homes(159.)==channel.homes
         assert live.requested_homes(161.)==[]
     finally:channel.close()
+
+
+def test_response_signature_preserves_protocol_without_copying_large_body():
+    import hmac
+    import tracemalloc
+    token=b't'*32;nonce=b'n'*32;metadata=b'{"ready":true}';body=b'x'*(8*1024*1024)
+    expected=hmac.digest(token,nonce+metadata+body,'sha256')
+    tracemalloc.start()
+    try:
+        actual=collection_transport._signature(token,nonce,metadata,body)
+        _,peak=tracemalloc.get_traced_memory()
+    finally:tracemalloc.stop()
+    assert actual==expected
+    assert peak<1024*1024
+
+
+def test_live_server_close_releases_stalled_handshake_socket_and_worker(tmp_path):
+    server=collection_transport.LiveServer(tmp_path/'endpoint.json',lambda request:({},b''))
+    try:
+        with socket.create_connection(('127.0.0.1',server.endpoint['port']),timeout=3) as client:
+            assert len(collection_transport._receive(client,32,time.monotonic()+3))==32
+            with server.connection_lock:workers=tuple(server.handlers)
+            assert workers
+            server.close()
+            assert client.recv(1)==b''
+            assert all(not worker.is_alive() for worker in workers)
+            assert not server.connections and not server.handlers
+    finally:server.close()
+
+
+def test_live_server_close_keeps_blocked_callbacks_owned_until_completion(tmp_path,monkeypatch):
+    import hmac
+    import struct
+    monkeypatch.setattr(collection_transport,'TIMEOUT',.2)
+    entered=threading.Event();release=threading.Event();lock=threading.Lock();count=[0]
+    def callback(request):
+        with lock:
+            count[0]+=1
+            if count[0]==2:entered.set()
+        assert release.wait(3)
+        return {},b''
+    server=collection_transport.LiveServer(tmp_path/'endpoint.json',callback)
+    clients=[];workers=()
+    try:
+        for _ in range(2):
+            client=socket.create_connection(('127.0.0.1',server.endpoint['port']),timeout=3)
+            clients.append(client)
+            nonce=collection_transport._receive(client,32,time.monotonic()+3)
+            encoded=b'{}'
+            client.sendall(hmac.digest(server.token,nonce+encoded,'sha256')+struct.pack('!Q',len(encoded))+encoded)
+        assert entered.wait(3)
+        with server.connection_lock:workers=tuple(server.handlers)
+        start=time.monotonic();server.close()
+        assert time.monotonic()-start<1.
+        assert len(server.handlers)==len(workers)==2
+        assert all(client.recv(1)==b'' for client in clients)
+    finally:
+        release.set()
+        for worker in workers:worker.join(3)
+        for client in clients:client.close()
+        server.close()
+    assert not server.connections and not server.handlers

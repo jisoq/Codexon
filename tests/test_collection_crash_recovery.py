@@ -34,10 +34,10 @@ def _controlled_collector(home, path, control):
             elif command == 'before_publication':
                 publish = service.channel.publish
 
-                def pause_publication(*args):
+                def pause_publication(*args, **kwargs):
                     control.send('paused')
                     control.recv()
-                    return publish(*args)
+                    return publish(*args, **kwargs)
 
                 service.channel.publish = pause_publication
             service.poll()

@@ -22,6 +22,7 @@ def test_quota_storage_failure_keeps_publishing_real_calls(monkeypatch,tmp_path,
             return dict(ts=200,sessions=[copy.deepcopy(session)],homes=[session['home']],
                         errors=[],unassigned=[],index={'loading':False})
         def close(self):pass
+        def notification_connection(self):return None
     class Ledger:
         def __init__(self,*args):
             quota_paths.append(args[0])
@@ -58,7 +59,7 @@ def test_quota_storage_failure_keeps_publishing_real_calls(monkeypatch,tmp_path,
 def test_usage_ledger_retries_after_transient_failure(monkeypatch,tmp_path):
     from types import SimpleNamespace
     clock=[100.0]
-    monkeypatch.setattr(analysis_worker,'time',SimpleNamespace(monotonic=lambda:clock[0]))
+    monkeypatch.setattr(analysis_worker,'time',SimpleNamespace(monotonic=lambda:clock[0],time=lambda:clock[0]))
     snapshots=[]
     writes=[]
     opens=[]
@@ -71,6 +72,7 @@ def test_usage_ledger_retries_after_transient_failure(monkeypatch,tmp_path):
         def poll(self):return dict(ts=clock[0],sessions=[copy.deepcopy(session)],homes=[session['home']],
             errors=[],unassigned=[],index={'loading':False})
         def close(self):pass
+        def notification_connection(self):return None
     class Ledger:
         def __init__(self,*args):self.db=self;opens.append(clock[0]);paths.append(args[0])
         def enrich_modes(self,*args):pass
@@ -123,7 +125,10 @@ def test_service_collects_large_record_once_for_gui_and_worker(tmp_path,monkeypa
         monkeypatch.setattr(UsageIndex,'scan_file',no_scan)
         for client in (gui,worker):
             snapshot=client.poll(10010)
-            assert snapshot==json.loads(json.dumps(produced))
+            transport={'activity_cursor','activity_highwater','activity_more'}
+            assert {k:v for k,v in snapshot.items() if k not in transport}==json.loads(json.dumps(produced))
+            assert snapshot['activity_cursor'][1]==snapshot['activity_highwater']==0
+            assert not snapshot['activity_more']
             assert {r['key'] for s in snapshot['sessions'] for r in s['history']}=={'first','last'}
             assert not hasattr(client,'index') and not hasattr(client,'collector')
             snapshot['sessions'].clear()
@@ -323,6 +328,11 @@ def test_snapshot_command_cleans_only_its_own_collector(tmp_path,borrowed):
     from cachemonitor.usage_collection import locked,CollectorService
     from test_core import fixture_home
     home,_=fixture_home(tmp_path);path=tmp_path/'index.sqlite'
+    from cachemonitor.model_evidence import EvidenceStore
+    store=EvidenceStore(tmp_path/'model-evidence.sqlite')
+    try:
+        for number in range(513):store.write(home,f'attempt-{number}',10000,'WebSocket',f'response-{number}',status='completed')
+    finally:store.close()
     bootstrap="""import sys,runpy
 from cachemonitor.observer_task import ObserverTask
 def forbidden(*args,**kwargs): raise AssertionError('Snapshot must not access Task Scheduler')
@@ -337,6 +347,7 @@ runpy.run_path(sys.argv[0],run_name='__main__')
             '--snapshot','--codex-home',str(home),'--index-path',str(path)],capture_output=True,text=True,encoding='utf-8',timeout=40)
         assert result.returncode==0,result.stderr
         assert json.loads(result.stdout)['sessions']
+        assert len(json.loads(result.stdout)['request_activity'])==513
         assert locked(path.with_name(path.name+'.codexon-collector.lock'))==borrowed
         if service:assert not service.stopping()
         if service:assert service.epoch==epoch
@@ -698,7 +709,8 @@ def test_idle_collector_keeps_nested_freshness_without_republishing_log_history(
             current=now+tick*2;produced=service.poll(current)
             assert produced['last_usage_collection_success']==current
             assert produced['index']['last_usage_success']==current
-            assert reader.poll(current)==produced
+            received=reader.poll(current)
+            assert {k:v for k,v in received.items() if k not in ('activity_cursor','activity_highwater','activity_more')}==produced
         assert wal.stat().st_size-initial_size<payload_size
     finally:reader.close();service.close()
 

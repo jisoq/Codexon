@@ -107,6 +107,7 @@ class OverlayController(QObject):
         self.loading = True
         self.errors = []
         self.collection_issue = ''
+        self.collection_fault = {}
         self.issue = ''
         self.dark = system_dark()
         self.reduced_motion=False
@@ -488,6 +489,7 @@ class OverlayController(QObject):
         self.refresh()
 
     def receive_collection_status(self, result):
+        if isinstance(result.get('collection_fault'),dict):self.collection_fault=dict(result['collection_fault'])
         if 'collection_issue' not in result:return
         self.collection_issue = result['collection_issue']
         self.refresh()
@@ -500,6 +502,9 @@ class OverlayController(QObject):
             return None, '원격 작업: 로컬 기록 없음'
         matches = self.session_lookup.get(selection.thread_id,[])
         issue = self.collection_issue
+        received_age=max(0,time.monotonic()-self.snapshot_at)
+        reason=('service_delay' if issue=='수집 결과 갱신 지연' else 'service_error' if issue else
+                'source_error' if self.errors else 'analysis_delay' if received_age>10 else '')
         note = ('수집 시작 중' if issue == '수집 시작 중' else
                 '수집 지연' if issue == '수집 결과 갱신 지연' else
                 '수집 오류' if issue or self.errors else
@@ -510,7 +515,9 @@ class OverlayController(QObject):
         data={**matches[0], '_collection': {
             'last_confirmed_at': self.snapshot_wall_time,
             'errors': [*self.errors, *([issue] if issue else [])], 'loading': self.loading,
-            'delayed': time.monotonic()-self.snapshot_at > 10,
+            'delayed': received_age > 10, 'reason':reason,'received_age':received_age,
+            'service_issue':issue,'service_fault':getattr(self,'collection_fault',{}),
+            'source_error_count':len(self.errors),
         }}
         return data, note
 

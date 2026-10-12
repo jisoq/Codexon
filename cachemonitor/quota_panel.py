@@ -39,6 +39,7 @@ class QuotaPanel(Group):
     home_selected=Signal(str)
     exclusion_requested=Signal(object)
     exclusion_restore_requested=Signal(str)
+    fault_changed=Signal(dict)
 
     def __init__(self,settings):
         super().__init__()
@@ -360,6 +361,8 @@ class QuotaPanel(Group):
         if key in self._query_cache:
             self._query_pending=None
             self._prepared_query=(key,self._query_cache[key])
+            if getattr(self,'_query_failed',False):
+                self._query_failed=False;self.fault_changed.emit(dict(query_healthy=True))
             return self._prepared_query[1]
         if worker is not None and self._query_pending!=key:
             self._query_pending=key
@@ -373,8 +376,12 @@ class QuotaPanel(Group):
         self._query_pending=None
         if key!=self._query_key():return
         if message.get('error'):
-            self.status.setText(message.get('issue') or message['error']);self.status.show()
+            self._query_failed=True
+            self.fault_changed.emit(dict(calculation_failed=True))
+            if not getattr(self,'centralized_errors',False):
+                self.status.setText(message.get('issue') or message['error']);self.status.show()
             return
+        self._query_failed=False;self.fault_changed.emit(dict(query_healthy=True))
         self._cache_query(key,message['value'])
         if getattr(self,'defer_render',False):self._render_dirty=True
         else:self.render(automatic=True)
@@ -384,7 +391,7 @@ class QuotaPanel(Group):
         if 'view' not in self.report:
             self.report={**self.report,'view':prepare_quota_view(self.report)}
         self.status.setText(self.issue or ('한도 기록을 읽지 못했습니다. 마지막 저장값을 확인해 주세요.' if self.report.get('error') else ''))
-        self.status.setVisible(bool(self.status.text()))
+        self.status.setVisible(bool(self.status.text()) and not getattr(self,'centralized_errors',False))
         self.lifetime_statistics=(self.report.get('view') or {}).get('lifetime') or quota_statistics(self.report)
         lifetime=self.lifetime_statistics
         has_usage=bool(lifetime['total'] or self.report.get('exclusions'))

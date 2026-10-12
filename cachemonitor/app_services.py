@@ -57,6 +57,9 @@ class AppServices:
         self.proxy_source = None
         self.collector_source = None
         self.collector_pending = None
+        self.collection_fault = {}
+        self.collection_healthy = False
+        self.collection_snapshot_at = None
         self.login_launch = login_launch
 
     def deactivate(self):
@@ -94,6 +97,8 @@ class AppServices:
             self.proxy_source = self.target.capture(health)
 
     def start(self):
+        from .usage_collection import CollectionPending
+        from .app_errors import exception_facts
         self.active = True
         errors = []
         login_pending = self.login_launch is not None
@@ -101,9 +106,15 @@ class AppServices:
         if self.collection and not self.closing.is_set():
             try:
                 self.start_collection()
+                self.collection_fault=dict(starting=bool(self.collector_pending))
+                self.collection_healthy=bool(self.collector_source and not self.collector_pending)
                 if self.collector_pending:
                     errors.append('수집 시작 중')
+            except CollectionPending as exc:
+                self.collection_fault=dict(status_pending=True)
+                errors.append(str(exc))
             except (OSError, ValueError, RuntimeError) as exc:
+                self.collection_fault=dict(start_failed=True,**exception_facts(exc))
                 errors.append(str(exc))
         if not login_pending:
             result.update(self.start_proxy())
@@ -117,6 +128,9 @@ class AppServices:
             result['collection_issue'] = '\n'.join(errors)
         elif self.collection:
             result['collection_issue'] = ''
+        if self.collection:
+            result.update(collection_fault=dict(self.collection_fault),collection_healthy=self.collection_healthy,
+                          collection_snapshot_at=self.collection_snapshot_at)
         return result
 
     def launch_login(self):
@@ -197,21 +211,22 @@ class AppServices:
             raise
 
     def _collector_identity(self, channel, snapshot):
+        from .usage_collection import CollectionPending
         source = (snapshot or {}).get('collection') or {}
         if not source.get('pid'):
-            raise RuntimeError('수집기 실행 정보 확인 대기')
+            raise CollectionPending('수집기 실행 정보 확인 대기')
         process = identity.process_identity(source['pid'])
         if not process:
-            raise RuntimeError('수집기 실행 정보가 변경되었습니다.')
+            raise CollectionPending('수집기 실행 정보가 변경되었습니다.')
         saved = self.collector_source
         if saved and saved['process'] == process and (saved['instance'] == source.get('instance')):
             return saved
         command = identity.process_command(process['pid'])
         homes = [str(Path(command[n + 1]).resolve()) for n, arg in enumerate(command[:-1]) if arg == '--codex-home']
         if '--usage-collector' not in command or not homes or (not set(homes).issubset(set(channel.homes))) or (Path(option(command, '--index-path', '')).resolve() != channel.path) or (Path(option(command, '--evidence-path', str(channel.default_evidence))).resolve() != Path(channel.scope)) or (Path(process['executable']).resolve() != Path(source.get('executable', '')).resolve()):
-            raise RuntimeError('다른 수집기의 실행 정보를 보존합니다.')
+            raise CollectionPending('다른 수집기의 실행 정보를 보존합니다.')
         if not identity.same_process(process):
-            raise RuntimeError('수집기 실행 정보가 변경되었습니다.')
+            raise CollectionPending('수집기 실행 정보가 변경되었습니다.')
         self.collector_source = dict(process=process, instance=source['instance'])
         return self.collector_source
 
@@ -270,9 +285,11 @@ class AppServices:
         start()
 
     def poll_collection(self):
+        from hashlib import sha256
         from .usage_collection import CollectionChannel, collector_command, locked
         from .observer_task import ObserverTask
         channel = CollectionChannel(self.homes, self.index, self.evidence)
+        self.collection_fault={};self.collection_healthy=False
         try:
             with ProcessLock(channel.companion('.collector-update.lock')):
                 snapshot = channel.read_header()
@@ -283,6 +300,7 @@ class AppServices:
                     current = (snapshot or {}).get('collection', {}).get('instance')
                     if not current or current == previous:
                         if self.clock() - requested < 30:
+                            self.collection_fault=dict(starting=True)
                             return '수집 시작 중'
                         # Continue the normal liveness checks after the grace
                         # period, but never inspect the previous owner's PID.
@@ -290,12 +308,34 @@ class AppServices:
                     elif time.time() - snapshot['ts'] <= 30:
                         published = True
                 source = self.collector_identity(channel, identity_snapshot)
+                if source and snapshot and not self.collector_pending:
+                    self.collection_snapshot_at=snapshot['ts']
                 if published and source:
                     self.collector_pending = None
                 stopped = read_json(channel.companion('.session.json'))
                 task = ObserverTask(str(channel.path), role='UsageCollector')
                 dead = not source and (not locked(channel.companion('.collector.lock'))) and (not task.inspect().get('running')) and (not (stopped.get('scope') == channel.scope and stopped.get('stopped')))
-                self.retry('collection', dead, lambda: self.launch_collector(task, collector_command(channel), snapshot))
+                try:self.retry('collection', dead, lambda: self.launch_collector(task, collector_command(channel), snapshot))
+                except (OSError,ValueError,RuntimeError):
+                    self.collection_fault=dict(start_failed=True,
+                        retry_exhausted=self.retries.get('collection',{}).get('count',0)>=3)
+                    raise
+                self.collection_healthy=bool(source and snapshot and not self.collector_pending and time.time()-snapshot['ts']<=30)
+                if dead:
+                    grace=self.collector_pending and self.clock()-self.collector_pending[1]<30
+                    self.collection_fault=dict(runtime_failed=True,
+                        retry_exhausted=self.retries.get('collection',{}).get('count',0)>=3 and not grace)
+                marker=read_json(channel.companion('.collector-error.json'))
+                if (marker.get('scope')==sha256(channel.scope.encode('utf-8')).hexdigest()
+                    and isinstance(marker.get('at'),(int,float)) and marker['at']>(snapshot or {}).get('ts',0)
+                    and isinstance(marker.get('facts'),dict) and marker['facts']):
+                    self.collection_fault.update(marker['facts'])
+                if stopped.get('scope')==channel.scope and stopped.get('stopped'):
+                    self.collection_fault=dict(expected_stop=True)
+                if self.collector_pending:self.collection_fault['handoff_pending']=True
+                if not source:self.collection_fault['owner_unknown']=True
+                if not snapshot:self.collection_fault['snapshot_missing']=True
+                elif time.time()-snapshot['ts']>30:self.collection_fault['snapshot_stale']=True
                 return '수집 결과 갱신 지연' if self.collector_pending or not source or not snapshot or time.time() - snapshot['ts'] > 30 else ''
         finally:
             channel.close()
@@ -306,10 +346,21 @@ class AppServices:
         from .proxy_update import BUSY
         result = self.status()
         if self.collection:
+            from .usage_collection import CollectionPending
+            from .app_errors import exception_facts
             try:
                 result['collection_issue'] = self.poll_collection()
+            except CollectionPending as exc:
+                self.collection_fault=dict(status_pending=True)
+                self.collection_healthy=False
+                result['collection_issue']=str(exc)
             except (OSError, ValueError, RuntimeError) as exc:
+                self.collection_fault=({**self.collection_fault,**exception_facts(exc)} if self.collection_fault.get('start_failed')
+                    else dict(status_failed=True,**exception_facts(exc)))
+                self.collection_healthy=False
                 result['collection_issue'] = str(exc)
+            result.update(collection_fault=dict(self.collection_fault),collection_healthy=self.collection_healthy,
+                          collection_snapshot_at=self.collection_snapshot_at)
         if self.manager:
             self.remember_proxy(result)
             m = self.manager

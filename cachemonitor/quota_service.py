@@ -119,7 +119,8 @@ class QuotaService(QThread):
         edit_active = False
         storage_failures = 0
         lookup_issue = database_issue = aggregation_issue = ''
-        emitted_issue = None
+        lookup_reason='';database_fault={};calculation_fault={}
+        emitted_issue = None;emitted_faults=None
         report = None
         stage = 'initialize'
         was_reporting=self.reports_enabled
@@ -156,9 +157,14 @@ class QuotaService(QThread):
                 edit_request=None
 
         def storage_failed(exc):
-            nonlocal ledger, database_issue, next_storage, storage_failures
+            nonlocal ledger, database_issue, next_storage, storage_failures, database_fault
             record_failure(self.path, stage, exc)
             database_issue = storage_issue(exc)
+            from .app_errors import exception_facts
+            sqlite_code=(getattr(exc,'sqlite_errorcode',0) or 0)&255
+            database_fault=dict(storage_failed=True,
+                temporary=sqlite_code in (sqlite3.SQLITE_BUSY,sqlite3.SQLITE_LOCKED),
+                **exception_facts(exc))
             storage_failures += 1
             next_storage = time.monotonic()+min(60, 5*2**min(storage_failures-1, 4))
             if ledger is not None:
@@ -202,6 +208,8 @@ class QuotaService(QThread):
                     else:
                         edit_active=False
                     if computed.get('error'):
+                        calculation_fault=dict(calculation_failed=True,saved=bool(computed.get('saved')),
+                            uncertain=bool(computed.get('uncertain')))
                         aggregate_failures+=1
                         aggregation_issue=computed.get('issue') or '사용한도 계산 지연: 마지막 결과를 유지합니다.'
                         next_aggregate=time.monotonic()+min(60,5*2**min(aggregate_failures-1,4))
@@ -218,6 +226,7 @@ class QuotaService(QThread):
                     else:
                         report={**computed['report'],'_worker':self.report_worker}
                         aggregation_issue='';aggregate_failures=0;next_aggregate=0
+                        calculation_fault={}
                         report_ready=True
                         if kind!='report':
                             # Preserve an immediate refresh requested by changed settings.
@@ -268,9 +277,11 @@ class QuotaService(QThread):
                                 if not pending.append('quota', direct):
                                     self.observation_issue=pending.issue or '한도 관측을 저장하지 못했습니다. 앱을 다시 열어 재시도하세요.'
                         lookup_issue = ''
+                        lookup_reason=''
                         polling.finish(time.monotonic(), True, direct, time.time())
                     except Exception as exc:
                         record_failure(self.path, 'account lookup', exc)
+                        lookup_reason=getattr(exc,'code','timeout' if isinstance(exc,TimeoutError) else 'lookup')
                         lookup_issue = ('Codex 한도 조회 지연: 자동 재시도 중' if isinstance(exc, (TimeoutError, ConnectionError))
                                         else 'Codex 한도 조회 실패: 자동 재시도 중')
                         if tracking_at_request:
@@ -292,6 +303,7 @@ class QuotaService(QThread):
                         stage = 'save observations'
                         save_pending()
                         database_issue = ''
+                        database_fault={}
                         storage_failures = 0
                     except Exception as exc:
                         storage_failed(exc)
@@ -316,8 +328,11 @@ class QuotaService(QThread):
                 latest = select_current_quota(direct, local, time.time())
                 issue = ', '.join(dict.fromkeys(v for v in (lookup_issue, database_issue, aggregation_issue,
                     pending.issue, self.observation_issue, self.control_issue) if v))
-                if publish or issue != emitted_issue or exclusion_results:
-                    value={'home':self.home,'quota':latest,'issue':issue}
+                faults=dict(lookup=dict(lookup_failed=bool(lookup_issue),reason=lookup_reason),
+                    storage=database_fault or dict(storage_failed=bool(pending.issue or self.observation_issue or self.control_issue)),
+                    calculation=dict(calculation_fault))
+                if publish or issue != emitted_issue or faults!=emitted_faults or exclusion_results:
+                    value={'home':self.home,'quota':latest,'issue':issue,'quota_faults':faults,'report_refreshed':report_ready}
                     if self.reports_enabled or exclusion_results:
                         if report is not None:
                             value['report']=report
@@ -325,7 +340,7 @@ class QuotaService(QThread):
                             value['report']={'home':self.home,'cycles':[],'error':True,'index_loading':False}
                     for result in exclusion_results or [None]:
                         self.updated.emit({**value, 'exclusion_result':result} if result else value)
-                    emitted_issue = issue
+                    emitted_issue = issue;emitted_faults=faults
                     next_report = time.monotonic()+5
                 self.wake.wait(1)
         finally:

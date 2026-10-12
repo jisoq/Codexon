@@ -1,7 +1,7 @@
 """Project-first navigation and bounded, reusable history projections."""
 import copy
 import pytest
-from tests.test_ui import dashboard, snapshot
+from tests.test_ui import dashboard, snapshot, wait_for_rendered
 from tests.test_performance import history, query
 from cachemonitor.analysis_engine import AnalysisEngine
 from cachemonitor.history_projection import node_key
@@ -26,6 +26,59 @@ def test_project_first_and_selection_does_not_navigate(dashboard):
     assert w.record_view=='calls' and not w.selected_call
     w.go_home()
     assert w.record_view=='sessions' and not w.selected_session
+
+
+@pytest.mark.integration
+def test_mouse_history_navigation_restores_detail_and_discards_forward_branch(dashboard):
+    from PySide6.QtCore import Qt, QPointF
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QDialog
+    from cachemonitor.quick_qa import click, click_row, render_plot
+    w=dashboard;w.resize(1120,760);w.change_page(2)
+    click_row(w,w.table,0);click_row(w,w.table,0)
+    w.sort.setCurrentIndex(w.sort.findData('time_asc'))
+    click_row(w,w.table,0)
+    route=(w.selected_session,w.selected_turn,w.selected_call)
+
+    def mouse_navigation(button):
+        item=render_plot(w,w.detail_scroll if w.selected_call else w.table)
+        point=item.mapToScene(QPointF(item.width()/2,item.height()/2)).toPoint()
+        assert w.quick.rect().contains(point)
+        QTest.mouseClick(w.quick,button,pos=point)
+
+    mouse_navigation(Qt.BackButton)
+    wait_for_rendered(lambda: w.record_view=='calls' and not w.selected_call)
+    mouse_navigation(Qt.ForwardButton)
+    wait_for_rendered(lambda: w.selected_call==route[2] and w.detail_scroll.isVisible())
+    assert (w.selected_session,w.selected_turn,w.selected_call)==route
+    assert w.sort.currentData()=='time_asc'
+    assert w.exact_record['key']==route[2]
+
+    click(w,render_plot(w,w.back_button))
+    mouse_navigation(Qt.BackButton)
+    wait_for_rendered(lambda: w.record_view=='requests')
+    mouse_navigation(Qt.ForwardButton)
+    wait_for_rendered(lambda: w.record_view=='calls' and not w.selected_call)
+    mouse_navigation(Qt.ForwardButton)
+    wait_for_rendered(lambda: w.selected_call==route[2])
+    mouse_navigation(Qt.ForwardButton)
+    assert w.selected_call==route[2]
+
+    dialog=QDialog(w);dialog.resize(200,100);dialog.show()
+    try:
+        wait_for_rendered(dialog.isVisible)
+        QTest.mouseClick(dialog,Qt.BackButton,pos=dialog.rect().center())
+        assert (w.selected_session,w.selected_turn,w.selected_call)==route
+    finally:dialog.close()
+
+    mouse_navigation(Qt.BackButton)
+    wait_for_rendered(lambda: not w.selected_call)
+    click_row(w,w.table,1)
+    changed=w.selected_call
+    assert changed and changed!=route[2]
+    mouse_navigation(Qt.ForwardButton)
+    assert w.selected_call==changed and w.exact_record['key']==changed
+    assert not w.qml_errors
 
 
 def test_tree_window_and_reuse():
@@ -333,7 +386,7 @@ def test_session_chart_display_and_metric_restore_across_sessions(dashboard,tmp_
 @pytest.mark.parametrize('request_scope',[False,True])
 @pytest.mark.integration
 def test_session_chart_selection_detail_and_back_preserve_scope(dashboard,request_scope,tmp_path):
-    from PySide6.QtCore import Qt
+    from PySide6.QtCore import Qt, QPointF
     from PySide6.QtTest import QTest
     from cachemonitor.quick_qa import click,control,render_plot
     w=dashboard;w.resize(1120,760);w.change_page(2);w.activate_record(0)
@@ -373,6 +426,19 @@ def test_session_chart_selection_detail_and_back_preserve_scope(dashboard,reques
     assert w.selected_call is None and plot.isVisible()
     assert w.history_display=='chart' and chart.rows==rows
     assert (w.history_navigation.project,w.selected_session,w.selected_turn,w.record_view)==route
+    point=plot.mapToScene(QPointF(plot.width()/2,plot.height()/2)).toPoint()
+    assert w.quick.rect().contains(point)
+    QTest.mouseClick(w.quick,Qt.ForwardButton,pos=point)
+    wait_for_rendered(lambda: w.selected_call==selected['key'] and w.detail_scroll.isVisible())
+    assert w.exact_record['key']==selected['key']
+    assert (w.history_navigation.project,w.selected_session,w.selected_turn,w.record_view)==route
+    detail=render_plot(w,w.detail_scroll)
+    point=detail.mapToScene(QPointF(detail.width()/2,detail.height()/2)).toPoint()
+    assert w.quick.rect().contains(point)
+    QTest.mouseClick(w.quick,Qt.BackButton,pos=point)
+    plot=render_plot(w,chart)
+    assert w.selected_call is None and plot.isVisible()
+    assert w.history_display=='chart' and chart.rows==rows
     assert w.quick.grabFramebuffer().save(str(tmp_path/f'session-chart-back-{request_scope}.png'))
     assert not w.qml_errors
 

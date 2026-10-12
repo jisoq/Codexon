@@ -1,6 +1,7 @@
 """Versioned deltas on the process wire, compatible snapshots inside the GUI."""
 import uuid
-from .analytics import observed_choices, project_choices
+from collections import Counter
+from .analytics import observed_choices, project_choices, effort_key
 
 MODEL_KEYS=('key','ts','model_observation_ts','model_alert_confirmed','requested_model','response_model')
 
@@ -9,6 +10,41 @@ class SnapshotPublisher:
     def __init__(self):
         self.epoch=uuid.uuid4().hex;self.sequence=0
         self.sessions={};self.overlays={};self.states={};self.models={}
+        self.choices={}
+
+    def observed_choices(self, engine):
+        # Keep compact aggregates for one current history per session. Oversized
+        # populations use the full calculation without retaining a second index.
+        if sum(len(state['prepared']['history']) for state in engine.sessions.values()) > 160000:
+            self.choices.clear()
+            rows=[row for state in engine.sessions.values() for row in state['prepared']['history']]
+            return self._choices_for_rows(rows)
+        current={};counts=Counter();transports=set();sources=set();policies=set()
+        for key,state in engine.sessions.items():
+            rows=state['prepared']['history']
+            previous=self.choices.get(key)
+            value=previous[1] if previous is not None and previous[0] is rows else self._choices_for_rows(rows)
+            current[key]=(rows,value)
+            counts.update({(c['model'],c['effort'],c['service_tier']):c['count'] for c in value['combinations']})
+            transports.update(value['transports']);sources.update(value['transport_sources'])
+            policies.update(value['cache_policies'])
+        self.choices=current
+        return dict(models=sorted({key[0] for key in counts}),
+                    efforts=sorted({key[1] for key in counts},key=effort_key),
+                    modes=sorted({key[2] for key in counts}),
+                    combinations=[dict(model=m,effort=e,service_tier=t,count=n)
+                                  for (m,e,t),n in sorted(counts.items())],
+                    transports=sorted(transports),transport_sources=sorted(sources),
+                    cache_policies=sorted(policies))
+
+    @staticmethod
+    def _choices_for_rows(rows):
+        return {**observed_choices(rows),
+                'transports':sorted({r['transport'] for r in rows if r.get('transport') in ('WebSocket','HTTP/SSE')}),
+                'transport_sources':sorted({r['transport_source'] for r in rows
+                    if r.get('transport') in ('WebSocket','HTTP/SSE') and r.get('transport_source') in ('response_id','log_time')}),
+                'cache_policies':sorted({str(r['cache_policy']) for r in rows
+                    if r.get('cache_policy') not in (None,'','unknown','미확인','확인 불가')})}
 
     def publish(self,snapshot,engine,summaries):
         self.sequence+=1
@@ -24,7 +60,7 @@ class SnapshotPublisher:
             light['cache_misses']={k:v for k,v in state['prepared'].get('cache_misses',{}).items() if k!='events'}
             sessions[key]=light
             old=self.states.get(key)
-            if old and old['revision']==state['revision']:continue
+            if old and old.get('content_revision',old['revision'])==state.get('content_revision',state['revision']):continue
             self.models[key]={r.get('model') for r in state['prepared']['history'] if r.get('model')}
             old_records=old['records'] if old else {}
             for identity,(_,row) in state['records'].items():
@@ -48,16 +84,10 @@ class SnapshotPublisher:
         self.models={k:v for k,v in self.models.items() if k in sessions}
         if self.sequence==1 or engine.revision!=getattr(self,'revision',None):
             message['models']=sorted(set().union(*self.models.values()) if self.models else set())
-            rows=[r for state in engine.sessions.values() for r in state['prepared']['history']]
-            message['filter_choices']={**observed_choices(rows),
+            message['filter_choices']={**self.observed_choices(engine),
                 'homes':sorted(set(snapshot.get('homes',[]))|{s['home'] for s in sessions.values()}),
                 **project_choices(sessions.values()),
-                'sources':sorted({s.get('source','unknown') for s in sessions.values()}),
-                'transports':sorted({r['transport'] for r in rows if r.get('transport') in ('WebSocket','HTTP/SSE')}),
-                'transport_sources':sorted({r['transport_source'] for r in rows
-                    if r.get('transport') in ('WebSocket','HTTP/SSE') and r.get('transport_source') in ('response_id','log_time')}),
-                'cache_policies':sorted({str(r['cache_policy']) for r in rows
-                    if r.get('cache_policy') not in (None,'','unknown','미확인','확인 불가')})}
+                'sources':sorted({s.get('source','unknown') for s in sessions.values()})}
         self.sessions=sessions;self.overlays=overlays;self.states=dict(engine.sessions);self.revision=engine.revision
         return message
 

@@ -1,5 +1,6 @@
 """Analyze shared collector snapshots outside Qt's UI thread."""
 import multiprocessing as mp
+from multiprocessing.connection import wait
 import threading
 import time
 import traceback
@@ -68,6 +69,7 @@ def process_main(connection,homes,index_path,static_snapshot=None,model_evidence
         next_poll=0
         pending=None
         ready=None
+        notification=None
         if static_snapshot is not None:
             snapshot=static_snapshot
             engine.ingest(snapshot['sessions'])
@@ -78,32 +80,53 @@ def process_main(connection,homes,index_path,static_snapshot=None,model_evidence
         def publish():
             light=publisher.publish(snapshot,engine,overlays.collect(engine))
             connection.send({'kind':'snapshot','value':light})
+        details={}
+        def send_details(all_pending=True):
+            while details:
+                message=details.pop(next(iter(details)))
+                if message['kind']=='population':
+                    from .dashboard_views import population_summary
+                    connection.send(dict(kind='population',id=message['id'],
+                        summary=population_summary(engine,message['population'],message.get('assumptions'))))
+                else:
+                    connection.send({'kind':'record','id':message['id'],
+                                     'row':engine.record(*message['identity'])})
+                if not all_pending:break
         if snapshot is not None: publish()
         while True:
             while connection.poll():
                 message=connection.recv()
                 if message['kind']=='stop': return
-                if message['kind']=='freeze': frozen=True
+                # One replaceable request per detail consumer, within ordered
+                # snapshot/control segments. Never move work across a barrier.
+                if message['kind'] in ('freeze','replace','sync'):send_details()
+                if message['kind']=='freeze':
+                    frozen=True
+                    if collector:collector.stop_notifications()
+                    notification=None
                 elif message['kind']=='replace':
                     ready=None;snapshot=message['snapshot']; engine.ingest(snapshot['sessions']); publish()
                 elif message['kind']=='query': pending=message;ready=None
                 elif message['kind']=='sync':
                     publisher=SnapshotPublisher()
                     if snapshot is not None:publish()
-                elif message['kind']=='population':
-                    from .dashboard_views import population_summary
-                    connection.send(dict(kind='population',id=message['id'],
-                        summary=population_summary(engine,message['population'],message.get('assumptions'))))
-                elif message['kind']=='record':
-                    connection.send({'kind':'record','id':message['id'],
-                                     'row':engine.record(*message['identity'])})
+                elif message['kind'] in ('population','record'):
+                    details.pop(message['kind'],None)
+                    details[message['kind']]=message
+            send_details(False)
             if ready is not None:
                 connection.send(ready);ready=None
             if not frozen and time.monotonic()>=next_poll and (snapshot is None or pending is None or time.monotonic()>=next_poll+1):
-                snapshot=collector.poll()
                 if ledger is None and time.monotonic()>=ledger_retry:
                     try:ledger=QuotaLedger(quota_path)
                     except sqlite3.Error as error:disable_ledger(error)
+                if ledger is not None and hasattr(ledger,'activity_cursor') and not getattr(ledger,'_activity_bound',False):
+                    try:
+                        cursor=ledger.activity_cursor()
+                        if cursor:collector.channel.activity_ack=cursor
+                        ledger._activity_bound=True
+                    except sqlite3.Error as error:disable_ledger(error)
+                snapshot=collector.poll()
                 if ledger:
                     try:ledger.enrich_modes(snapshot)
                     except sqlite3.Error as error:disable_ledger(error)
@@ -111,6 +134,7 @@ def process_main(connection,homes,index_path,static_snapshot=None,model_evidence
                 if ledger:
                     try:
                         ledger.sync(engine,snapshot)
+                        if snapshot.get('activity_cursor'):collector.channel.acknowledge_activity(snapshot)
                         if not imported and not snapshot['index']['loading']:
                             for home in snapshot['homes']: ledger.import_observations(collector.path,home)
                             imported=True
@@ -120,9 +144,17 @@ def process_main(connection,homes,index_path,static_snapshot=None,model_evidence
                 # The quota ledger is independent of observed per-call usage.
                 # Keep its diagnostics without turning valid session values into
                 # missing data or replacing/repairing the user's quota history.
+                snapshot={**snapshot,'ledger_status_known':True,
+                    'ledger_fault':dict(ledger_failed=bool(ledger_issue))}
                 if ledger_issue:snapshot={**snapshot,'ledger_error':ledger_issue}
                 publish()
-                next_poll=time.monotonic()+(.1 if snapshot['index']['loading'] else 3)
+                notification=collector.notification_connection()
+                delay=.1 if snapshot['index']['loading'] else 3
+                if notification is not None and not snapshot['index']['loading']:
+                    age=time.time()-snapshot['ts']
+                    delay=3 if age>30 else min(10,max(.01,30-age+.01))
+                if ledger is None:delay=min(delay,max(.01,ledger_retry-time.monotonic()))
+                next_poll=time.monotonic()+delay
             if pending is not None and snapshot is not None:
                 request=pending; pending=None
                 try:
@@ -135,8 +167,14 @@ def process_main(connection,homes,index_path,static_snapshot=None,model_evidence
                     connection.send({'kind':'error','id':request['id'],'error':traceback.format_exc(limit=6)})
             # Incoming UI requests wake this wait immediately. Only collection
             # needs a timer; an idle analyzer does not need 50 wakeups a second.
-            delay=1. if frozen else max(0.,min(1.,next_poll-time.monotonic()))
-            connection.poll(delay)
+            if details:continue
+            delay=1. if frozen else max(0.,next_poll-time.monotonic())
+            if notification is None:connection.poll(delay)
+            elif notification in wait([connection,notification],timeout=delay):
+                notice=collector.consume_notification()
+                if notice is True:next_poll=0
+                elif notice is None:next_poll=min(next_poll,time.monotonic()+3)
+                notification=collector.notification_connection() if notice is False else None
     except (EOFError,BrokenPipeError,OSError):
         pass
     except Exception:
@@ -154,6 +192,7 @@ class AnalysisBridge(QThread):
     snapshot=Signal(object)
     result=Signal(object)
     failure=Signal(str)
+    fault=Signal(object)
     record=Signal(object)
     population=Signal(object)
     def __init__(self,homes,index_path=None,static_snapshot=None,model_evidence_path=None,quota_path=None):
@@ -172,19 +211,24 @@ class AnalysisBridge(QThread):
         with self.lock:
             self.pending={'kind':'query','id':request_id,'query':query,'logical':logical}
             self.last_request=self.pending
+    def enqueue_latest(self,command):
+        # Each consumer accepts only its newest request id. Keep one pending
+        # command per kind while the child is busy, including a single snapshot.
+        self.commands[:]=[old for old in self.commands if old['kind']!=command['kind']]
+        self.commands.append(command)
     def freeze_collection(self):
-        with self.lock: self.commands.append({'kind':'freeze'})
+        with self.lock: self.enqueue_latest({'kind':'freeze'})
     def request_record(self,request_id,identity):
         with self.lock:
             self.last_record={'kind':'record','id':request_id,'identity':identity}
-            self.commands.append(self.last_record)
+            self.enqueue_latest(self.last_record)
     def request_population(self,request_id,population,assumptions=None):
-        with self.lock:self.commands.append(dict(kind='population',id=request_id,population=population,assumptions=assumptions))
+        with self.lock:self.enqueue_latest(dict(kind='population',id=request_id,population=population,assumptions=assumptions))
 
     def replace_snapshot(self,snapshot):
         with self.lock:
             self.static_snapshot=snapshot
-            self.commands.append({'kind':'replace','snapshot':snapshot})
+            self.enqueue_latest({'kind':'replace','snapshot':snapshot})
     def run(self):
         while not self.isInterruptionRequested():
             receiver=SnapshotReceiver()
@@ -197,6 +241,7 @@ class AnalysisBridge(QThread):
                 parent.close(); child.close()
                 self.restart_count=3
                 self.failure.emit('분석 프로세스 시작 실패: '+str(error))
+                self.fault.emit(dict(start_failed=True,retrying=False))
                 return
             child.close()
             try:
@@ -221,10 +266,15 @@ class AnalysisBridge(QThread):
                         elif message['kind']=='result': self.result.emit(message)
                         elif message['kind'] in ('error','fatal'):
                             self.failure.emit(message['error'])
+                            self.fault.emit(dict(query_failed=message['kind']=='error',
+                                fatal=message['kind']=='fatal',retrying=message['kind']=='fatal',
+                                request_id=message.get('id')))
                             if message['kind']=='fatal': break
                     if not self.process.is_alive(): break
             except (EOFError,BrokenPipeError,OSError) as error:
-                if not self.isInterruptionRequested(): self.failure.emit(str(error))
+                if not self.isInterruptionRequested():
+                    self.failure.emit(str(error))
+                    self.fault.emit(dict(process_exited=True,retrying=True))
             finally:
                 try: parent.send({'kind':'stop'})
                 except (OSError,EOFError): pass
@@ -241,9 +291,11 @@ class AnalysisBridge(QThread):
             self.restart_count+=1
             if self.restart_count>2:
                 self.failure.emit('분석 프로세스를 시작할 수 없습니다. 앱을 다시 열어 주세요.')
+                self.fault.emit(dict(process_exited=True,retry_exhausted=True))
                 break
             self.failure.emit('분석 프로세스를 다시 시작합니다. 마지막 결과를 유지합니다.')
+            self.fault.emit(dict(process_exited=True,retrying=True))
             with self.lock:
                 self.pending=self.last_request
-                if self.last_record:self.commands.append(self.last_record)
+                if self.last_record:self.enqueue_latest(self.last_record)
             self.msleep(250)

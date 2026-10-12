@@ -24,6 +24,98 @@ def sync(ledger, rows, revision=1, at=300, loading=False):
     ledger.sync(engine, {'homes': ['h'], 'sessions': [{'home': 'h'}], 'ts': at, 'index': {'loading': loading}})
 
 
+@pytest.mark.parametrize('observations',[128,2048])
+def test_report_reuses_history_across_heartbeat_and_invalidates_late_observation(tmp_path,monkeypatch,observations):
+    ledger=QuotaLedger(tmp_path/'quota.sqlite')
+    try:
+        now=observations+200
+        sync(ledger,[row()],at=now)
+        for n in range(observations):ledger.observe('h',quota(100+n,10+n/100,reset=10000))
+        original=ledger._report;builds=[]
+        def build(*args,**kwargs):builds.append(1);return original(*args,**kwargs)
+        monkeypatch.setattr(ledger,'_report',build)
+        first=ledger.report('h',now)
+        steps=[0]
+        ledger.db.set_progress_handler(lambda:(steps.__setitem__(0,steps[0]+100),0)[1],100)
+        same=ledger.report('h',now)
+        ledger.db.set_progress_handler(None,0)
+        assert same==first and len(builds)==1 and steps[0]<1000
+        sync(ledger,[row()],at=now+1)
+        fresh=ledger.report('h',now+1)
+        assert fresh['index_at']==now+1 and len(builds)==1
+        ledger.observe('h',quota(now-1,32,reset=10000))
+        changed=ledger.report('h',now+1)
+        assert len(builds)==2 and changed!=fresh
+        # Cached reads cannot survive rollback with a reused revision number.
+        ledger.db.execute('update observations set used=50 where at=100')
+        ledger.report('h',now+1);ledger.db.rollback()
+        assert ledger.report('h',now+1)==changed
+    finally:ledger.close()
+
+
+def test_cached_report_preserves_coverage_progress_and_future_call_boundaries(tmp_path):
+    ledger=QuotaLedger(tmp_path/'quota.sqlite')
+    calls=[row(f'r{n}',ts=at) for n,at in enumerate((120,220,320,550))]
+    try:
+        sync(ledger,calls,at=150)
+        for at,used in ((100,10),(200,20),(300,30)):ledger.observe('h',quota(at,used))
+        for at,now in ((150,500),(250,501),(350,502),(351,551)):
+            sync(ledger,calls,at=at)
+            assert ledger.report('h',now)==ledger._report('h',now)
+    finally:ledger.close()
+
+
+def test_activity_cursor_commits_with_usage_and_rolls_back_on_save_failure(tmp_path):
+    import sqlite3
+    path=tmp_path/'quota.sqlite';ledger=QuotaLedger(path)
+    def save(revision,output):
+        engine=SimpleNamespace(sessions={('h','s'):{'revision':revision,'prepared':{'history':[row(output=output)]}}})
+        ledger.sync(engine,dict(homes=['h'],sessions=[{'home':'h'}],ts=300,index={'loading':False},
+                               activity_cursor=('source',revision)))
+    try:
+        save(1,2000);raw=ledger.db
+        class FailedCommit:
+            def __getattr__(self,name):return getattr(raw,name)
+            def commit(self):raise sqlite3.OperationalError('injected save failure')
+        ledger.db=FailedCommit()
+        with pytest.raises(sqlite3.OperationalError):save(2,4000)
+        ledger.db=raw;ledger.close();ledger=QuotaLedger(path)
+        assert ledger.activity_cursor()==('source',1)
+        assert ledger.db.execute('SELECT output FROM calls WHERE uid=?',('r1',)).fetchone()[0]==2000
+    finally:ledger.close()
+
+
+def test_session_sync_work_does_not_scale_with_unrelated_call_history(tmp_path):
+    path=tmp_path/'session-sync.sqlite'
+    ledger=QuotaLedger(path)
+    try:
+        sync(ledger,[row()])
+        def unrelated(start, end):
+            ledger.db.executemany('insert into calls select home,?, ?,ts,model,input,cached,written,'
+                'output,reasoning,cost,price_id,signature,service_tier from calls where home=? and uid=?',
+                [(f'other-{i}',f'session-{i}','h','r1') for i in range(start,end)])
+            ledger.db.commit()
+        def measured_sync(revision):
+            steps=[0]
+            def progress():steps[0]+=100;return 0
+            ledger.db.set_progress_handler(progress,100)
+            try:sync(ledger,[row(output=2000+revision)],revision=revision)
+            finally:ledger.db.set_progress_handler(None,0)
+            assert ledger.db.execute('select output from calls where home=? and uid=?',('h','r1')).fetchone()[0]==2000+revision
+            return steps[0]
+        unrelated(0,32)
+        small=measured_sync(2)
+        unrelated(32,4096)
+        ledger.close();ledger=QuotaLedger(path)
+        large=measured_sync(3)
+        # Count SQLite VM work, independent of device speed and cache warmth.
+        assert large<=small*2+1000
+        assert ledger.db.execute('select count(*) from calls').fetchone()[0]==4097
+        sync(ledger,[],revision=4)
+        assert ledger.db.execute('select count(*) from calls').fetchone()[0]==4096
+    finally:ledger.close()
+
+
 def test_standard_report_keeps_unknown_mode_separate_and_unpriced(tmp_path):
     ledger=QuotaLedger(tmp_path/'merged.sqlite')
     try:

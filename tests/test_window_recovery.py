@@ -28,3 +28,36 @@ def test_hidden_and_minimized_dashboard_reopens_after_native_offscreen_move():
             assert rect.right()<info.work.right and rect.bottom()<info.work.bottom
     finally:
         window.hide();window.deleteLater();native.close();app.processEvents()
+
+
+@pytest.mark.skipif(sys.platform!='win32',reason='Actual HWND maximization')
+def test_settings_click_and_reopen_preserve_maximized_dashboard(tmp_path):
+    import time
+    from PySide6.QtCore import QSettings
+    from PySide6.QtTest import QTest
+    from cachemonitor.dashboard import Dashboard
+    from cachemonitor.quick_qa import control,click
+    app=QApplication.instance() or QApplication([])
+    window=Dashboard([],start_worker=False,live_limits=False,
+        settings=QSettings(str(tmp_path/'settings.ini'),QSettings.IniFormat))
+
+    def await_maximized():
+        deadline=time.monotonic()+5
+        while time.monotonic()<deadline:
+            app.processEvents()
+            if window.isVisible() and window.isMaximized() and not window.isMinimized():return
+            QTest.qWait(10)
+        assert window.isVisible() and window.isMaximized() and not window.isMinimized()
+
+    try:
+        window.showMaximized();await_maximized()
+        before=window.frameGeometry()
+        click(window,control(window,window.settings_button))
+        await_maximized()
+        assert window.current_page==4 and window.frameGeometry()==before
+        for hide in (window.hide,window.showMinimized):
+            hide();app.processEvents();window.show_window();await_maximized()
+            assert window.frameGeometry()==before
+        assert not window.qml_errors
+    finally:
+        window.quit_app();app.processEvents()

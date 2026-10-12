@@ -70,6 +70,7 @@ Item {
     TableView {
         id: table; objectName: "dataTable"; anchors.left: parent.left; anchors.right: parent.right; anchors.top: header.bottom; anchors.bottom: footer.top
         anchors.leftMargin: root.frozenWidth
+        interactive: !root.viewState.inline
         clip: true; model: root.node.rowModel; reuseItems: true; animate: false
         columnSpacing: 0; rowSpacing: 0
         columnWidthProvider: column => {
@@ -199,6 +200,30 @@ Item {
             Accessible.role: Accessible.Cell; Accessible.name: display; Accessible.description: (cacheZero ? appLanguage.text("캐시 읽기 0: ") : "") + tooltip
         }
     }
+    function outerScroll() {
+        if (!root.viewState.inline) return null
+        let candidate=root.parent
+        while (candidate) {
+            if (typeof candidate.cancelReveal === "function" && candidate.contentItem && candidate.contentItem.contentY !== undefined) return candidate
+            candidate=candidate.parent
+        }
+        return null
+    }
+    function pageRows() {
+        let scroll=outerScroll()
+        return Math.max(1,Math.floor((scroll ? scroll.availableHeight : table.height)/root.viewState.rowHeight)-1)
+    }
+    function revealRow(row) {
+        let scroll=outerScroll()
+        if (!scroll || row < 0) return
+        scroll.cancelReveal()
+        let top=table.mapToItem(scroll.contentItem.contentItem,0,row*root.viewState.rowHeight).y
+        let bottom=top+root.viewState.rowHeight
+        let y=scroll.contentItem.contentY
+        if (top < y) y=top
+        else if (bottom > y+scroll.availableHeight) y=bottom-scroll.availableHeight
+        scroll.contentItem.contentY=Math.max(0,Math.min(y,scroll.contentHeight-scroll.availableHeight))
+    }
     function handleKey(event) {
             let row = root.viewState.selected
             if (root.hierarchical && (event.key === Qt.Key_Left || event.key === Qt.Key_Right)) {
@@ -206,8 +231,8 @@ Item {
             }
             if (event.key === Qt.Key_Down) row++
             else if (event.key === Qt.Key_Up) row--
-            else if (event.key === Qt.Key_PageDown) row += Math.max(1,Math.floor(table.height/root.viewState.rowHeight)-1)
-            else if (event.key === Qt.Key_PageUp) row -= Math.max(1,Math.floor(table.height/root.viewState.rowHeight)-1)
+            else if (event.key === Qt.Key_PageDown) row += root.pageRows()
+            else if (event.key === Qt.Key_PageUp) row -= root.pageRows()
             else if (event.key === Qt.Key_Left || event.key === Qt.Key_Right) {
                 table.keyboardColumn=Math.max(0,Math.min(table.columns-1,table.keyboardColumn+(event.key===Qt.Key_Left ? -1:1)))
                 if (!root.frozen || table.keyboardColumn>0) table.positionViewAtColumn(table.keyboardColumn,TableView.Contain);event.accepted=true;return
@@ -219,7 +244,7 @@ Item {
             }
             else if (event.key === Qt.Key_Return || event.key === Qt.Key_Space) { root.node.activateRow(row,table.keyboardColumn); event.accepted=true; return }
             else return
-            row=Math.max(0,Math.min(table.rows-1,row)); root.node.selectRow(row); table.positionViewAtRow(row,TableView.Contain); event.accepted=true
+            row=Math.max(0,Math.min(table.rows-1,row)); root.node.selectRow(row); table.positionViewAtRow(row,TableView.Contain); root.revealRow(row); event.accepted=true
     }
     Rectangle {
         id: footer; anchors.left: parent.left; anchors.right: parent.right; anchors.bottom: parent.bottom
@@ -289,7 +314,7 @@ Item {
     Connections {
         target: root.node
         function onGeometryChanged() { table.forceLayout(); if (root.frozen) firstColumn.forceLayout() }
-        function onScrollRequested(row,column) { table.forceLayout(); if (root.frozen && column===0) table.positionViewAtRow(row,TableView.Contain); else table.positionViewAtCell(Qt.point(column,row),TableView.Contain) }
+        function onScrollRequested(row,column) { table.forceLayout(); if (root.frozen && column===0) table.positionViewAtRow(row,TableView.Contain); else table.positionViewAtCell(Qt.point(column,row),TableView.Contain); root.revealRow(row) }
     }
     Connections { target: root.node.verticalPosition; function onChanged() { table.contentY = root.node.verticalPosition.position } }
     Connections { target: root.node.horizontalPosition; function onChanged() { table.contentX = root.node.horizontalPosition.position } }

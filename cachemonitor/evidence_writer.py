@@ -72,6 +72,7 @@ class EvidenceWriter:
 
     def status(self):
         return dict(storage_errors=self.errors,storage_failure_streak=self.failure_streak,
+                    storage_written=self.written,
                     observation_dropped=self.dropped,storage_pending=self.queue.qsize(),
                     observation_gap_pending=self.pending_gap is not None)
 

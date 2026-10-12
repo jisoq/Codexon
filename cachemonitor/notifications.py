@@ -168,7 +168,7 @@ class ConfirmedNotifications:
         self.histories=histories
         return events
 
-    def proxy(self,result):
+    def proxy(self,result,*,store=True):
         from .connection_recovery import assess
         now=self.clock()
         assessed=assess({**result,'configured':result.get('configured',False)})
@@ -194,6 +194,7 @@ class ConfirmedNotifications:
             title='프록시 식별 정보 불일치'
             detail='설정된 모델 관측 서비스와 응답의 식별 정보가 3회 다르게 확인됐습니다. 설정 → 프록시에서 확인하세요.'
         else:title,detail=assessed['title'],assessed['detail']
-        self.incident=self.record('proxy',title,detail)
+        self.incident=(self.record('proxy',title,detail) if store else
+            dict(kind='proxy',title=title,detail=detail,count=1,at=self.wall_clock()))
         self.incident['code']=state
         return [self.incident]

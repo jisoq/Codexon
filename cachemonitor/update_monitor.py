@@ -34,6 +34,7 @@ def production_updates_allowed(*, isolated=False):
 class UpdateMonitor(QObject):
     available = Signal(object)
     manual_finished = Signal(object)
+    fault_changed = Signal(object)
 
     def __init__(self,settings,parent=None,*,clock=time.time,jitter=random.uniform):
         super().__init__(parent)
@@ -168,6 +169,7 @@ class UpdateMonitor(QObject):
         manual=self.manual;self.manual=False
         self.cleanup()
         self.settings.sync();self.schedule()
+        self.fault_changed.emit(dict(checking_failed=isinstance(result,Exception),check_healthy=not isinstance(result,Exception)))
         if not isinstance(result,Exception):self.publish()
         if manual:self.manual_finished.emit(result)
 

@@ -43,6 +43,7 @@ class QuotaComputation:
         self.path, self.home = path, home
         self.ledger_factory = ledger_factory
         self.ledger = None
+        self.ledger_generation = 0
         self.reports = OrderedDict()
         self.committed = {}
 
@@ -50,11 +51,27 @@ class QuotaComputation:
         if self.ledger is None:
             from .quota_cycles import QuotaLedger
             self.ledger = (self.ledger_factory or QuotaLedger)(self.path)
+            self.ledger_generation += 1
         return self.ledger
 
-    def _prepare(self, report):
+    def _prepare(self, report, history_revision=None):
         from .quota_view import prepare_quota_view
-        report['view'] = prepare_quota_view(report)
+        report=dict(report)
+        if history_revision is not None:report['_history_revision']=history_revision
+        previous=next(reversed(self.reports.values()),None) if self.reports else None
+        if (previous and report.get('_history_revision') is not None and
+                previous.get('_history_revision')==report['_history_revision']):
+            from .quota_cycles import quota_statistics
+            from .quota_attribution import RequestWindows
+            view=previous['view'];summaries={None:view['lifetime']}
+            earliest=min((cycle['start'] for cycle in report.get('cycles',[])),default=report['at'])
+            requests=RequestWindows(report.get('request_windows',[]))
+            for days in (7,30,90):
+                start=report['at']-days*86400
+                summaries[days]=(view['lifetime'] if start<=earliest else
+                    quota_statistics(report,start,include_mode_assumptions=True,_requests=requests))
+            report['view']={**view,'summaries':summaries}
+        else:report['view'] = prepare_quota_view(report)
         revision = uuid4().hex
         self.reports[revision] = report
         while len(self.reports) > 2:
@@ -83,7 +100,9 @@ class QuotaComputation:
                     result['saved'] = True
                     result['exclusion_result'] = self.committed[token]
                     phase('reading')
-                result['report'] = self._prepare(ledger.report(self.home))
+                raw=ledger.report(self.home)
+                generation=getattr(ledger,'_report_generation',None)
+                result['report'] = self._prepare(raw,(self.ledger_generation,generation) if generation is not None else None)
             elif kind in ('preview', 'query'):
                 report = self.reports.get(request['revision'])
                 if report is None:
