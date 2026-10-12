@@ -99,7 +99,13 @@ jobs:
       - name: Run selected source checks
         timeout-minutes: 15
         shell: pwsh
+        # Keep synthetic databases and process fixtures on the job's scratch
+        # volume. Preserve real filesystem commits and crash-recovery checks.
+        env:
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
         run: |
+          Write-Host "Source scratch: $env:TEMP"
           $plan = $env:CHECK_PLAN | ConvertFrom-Json
           [string[]]$checkArgs = $plan.source_args
           python tools/verify_changes.py @checkArgs
