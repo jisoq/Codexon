@@ -191,3 +191,25 @@ def test_managed_restart_resolves_saved_homes_with_explicit_index(tmp_path,monke
     monkeypatch.setattr(app,'configure_font_rendering',lambda:(_ for _ in ()).throw(BeforeGUI()))
     with pytest.raises(BeforeGUI):app.main()
     assert calls==[None]
+@pytest.mark.parametrize('reply,expected',[(b'ready-to-exit',True),(b'busy',False),(b'ready-',False)])
+def test_gui_handoff_reads_an_already_buffered_reply(reply,expected):
+    import uuid
+    from PySide6.QtWidgets import QApplication
+    from PySide6.QtNetwork import QLocalServer,QLocalSocket
+    from cachemonitor.app_restart import handoff_ready
+    app=QApplication.instance() or QApplication([])
+    server=QLocalServer();client=QLocalSocket();peer=None
+    try:
+        assert server.listen('codexon-handoff-test-'+uuid.uuid4().hex)
+        client.connectToServer(server.serverName())
+        assert client.waitForConnected(1000)
+        server.waitForNewConnection(1000);peer=server.nextPendingConnection()
+        assert peer is not None
+        peer.write(reply);peer.waitForBytesWritten(1000)
+        assert client.bytesAvailable() or client.waitForReadyRead(1000)
+        assert handoff_ready(client,timeout=20) is expected
+    finally:
+        client.close()
+        if peer is not None:peer.close()
+        server.close()
+

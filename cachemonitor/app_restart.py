@@ -3,6 +3,20 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
+
+
+def handoff_ready(client, timeout=3000):
+    """Read one bounded reply, including bytes received while flushing the request."""
+    deadline=time.monotonic()+timeout/1000
+    reply=b''
+    while time.monotonic()<deadline:
+        if not client.bytesAvailable() and not client.waitForReadyRead(max(1,int((deadline-time.monotonic())*1000))):
+            return False
+        reply+=bytes(client.read(14-len(reply)))
+        if reply==b'ready-to-exit':return True
+        if not b'ready-to-exit'.startswith(reply):return False
+    return False
 
 
 def launch_replacement(homes, *, index_path=None, handoff=None,evidence_path=None,quota_path=None,managed_services=False):

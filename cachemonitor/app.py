@@ -163,7 +163,8 @@ def main():
             client.write(b"update-exit" if args.replace_gui else b"windows-startup" if args.windows_startup else b"show")
             client.waitForBytesWritten(400)
             if not args.replace_gui:return 0
-            if not client.waitForReadyRead(3000) or bytes(client.readAll())!=b'ready-to-exit':
+            from .app_restart import handoff_ready
+            if not handoff_ready(client):
                 QMessageBox.information(None,'Codexon',tr('새 버전이 설치되었습니다. 기존 Codexon을 트레이에서 종료한 뒤 시작 메뉴에서 다시 여세요. Codex 연결은 유지됩니다.'))
                 return 4
             client.waitForDisconnected(15000)
