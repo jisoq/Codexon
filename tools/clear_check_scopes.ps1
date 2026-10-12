@@ -23,6 +23,14 @@ $tasks = @($folder.GetTasks(1) | Where-Object {
 # Open and retain each process handle before recording or terminating it.
 # Match an owned executable or a complete quoted/unquoted scope argument.
 $snapshot = @(Get-CimInstance Win32_Process)
+$ancestors = @{}
+$ancestor = $snapshot | Where-Object ProcessId -eq $PID
+while ($ancestor -and !$ancestors.ContainsKey([int]$ancestor.ProcessId)) {
+    $ancestors[[int]$ancestor.ProcessId] = $true
+    $parent = $snapshot | Where-Object ProcessId -eq $ancestor.ParentProcessId
+    if ($parent -and $parent.CreationDate -gt $ancestor.CreationDate) { break }
+    $ancestor = $parent
+}
 $ownedRecords = @{}
 foreach ($record in @($snapshot | Where-Object {
     $owned = Test-OwnedPath $_.ExecutablePath
@@ -32,7 +40,7 @@ foreach ($record in @($snapshot | Where-Object {
             if ($_.CommandLine -match $pattern) { $owned = $true; break }
         }
     }
-    $owned -and $_.ProcessId -ne $PID
+    $owned -and !$ancestors.ContainsKey([int]$_.ProcessId)
 })) { $ownedRecords[[int]$record.ProcessId] = $record }
 # Capture the entire external tree, including children with no scope argument.
 # Creation order prevents attaching a child to a recycled parent PID.
@@ -41,7 +49,7 @@ do {
     foreach ($record in $snapshot) {
         $parent = $ownedRecords[[int]$record.ParentProcessId]
         if ($parent -and !$ownedRecords.ContainsKey([int]$record.ProcessId) -and
-            $record.CreationDate -ge $parent.CreationDate -and $record.ProcessId -ne $PID) {
+            $record.CreationDate -ge $parent.CreationDate -and !$ancestors.ContainsKey([int]$record.ProcessId)) {
             $ownedRecords[[int]$record.ProcessId] = $record
             $added = $true
         }
@@ -60,6 +68,7 @@ $processes = @($ownedRecords.Values | ForEach-Object {
 })
 $report = @{
     roots = $roots
+    excluded_ancestors = @($ancestors.Keys)
     tasks = @($tasks | ForEach-Object { @{ name=$_.Name; running=$_.GetInstances(0).Count } })
     processes = @($processes | ForEach-Object { @{ pid=$_.Id; started=$_.StartTime.ToUniversalTime().ToString('o'); name=$_.ProcessName } })
 }

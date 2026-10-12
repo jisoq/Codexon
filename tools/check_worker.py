@@ -6,6 +6,7 @@ from pathlib import Path
 import runpy
 import sys
 import threading
+import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -16,14 +17,22 @@ def main():
     # Separate files avoid races between nested runners or Python workers.
     stack = (folder / f'stacks-{os.getpid()}.log').open('w', encoding='utf-8')
     faulthandler.enable(file=stack)
-    faulthandler.dump_traceback_later(60, repeat=True, file=stack)
+    deadline = time.monotonic() + float(os.environ['CODEXON_CHECK_TIMEOUT'])
+    # Prefer a requested Python-thread dump while it holds the GIL. A timed
+    # fallback is needed only if that thread cannot respond at the deadline.
+    # Avoid asynchronous stack walks during otherwise healthy QA execution.
+    def fallback():
+        faulthandler.dump_traceback_later(max(.1, deadline + 1 - time.monotonic()), file=stack)
+    fallback()
     tick = threading.Event()
 
     def requested_stack():
         while not tick.wait(.2):
             if (folder / 'stack-request').exists():
+                faulthandler.cancel_dump_traceback_later()
                 faulthandler.dump_traceback(file=stack, all_threads=True)
                 stack.flush()
+                (folder / f'stack-dumped-{os.getpid()}').touch()
                 return
 
     threading.Thread(target=requested_stack, daemon=True).start()
@@ -52,7 +61,7 @@ def main():
         state.write_text(json.dumps({'pid': os.getpid(), 'phase': 'interpreter_shutdown'}))
         # Keep the watcher and descriptor alive through interpreter shutdown.
         # pytest owns/cancels the global timer during its own session.
-        faulthandler.dump_traceback_later(60, repeat=True, file=stack)
+        fallback()
 
 
 if __name__ == '__main__':

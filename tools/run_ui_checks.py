@@ -182,11 +182,12 @@ def run_on_desktop(kernel, desktop, command, env, *, timeout=720, diagnostics=No
                 (diagnostics / 'stack-request').touch()
                 # The worker's stack watcher polls every 200 ms. This bounded
                 # diagnostic grace is included in the cleanup reserve.
-                kernel.WaitForSingleObject(process.process, 500)
-                if reason == 'descendants_remain':
-                    time.sleep(.25)
+                stack_deadline = time.monotonic() + 2
+                while time.monotonic() < stack_deadline and not any(diagnostics.glob('stack-dumped-*')):
+                    if kernel.WaitForSingleObject(process.process, 100) == 0:
+                        break
             evidence = dict(reason=reason, command=command, pid=process.process_id,
-                            live_pids=live, timeout_seconds=timeout,
+                            live_pids=live, process_exit_code=result.value, timeout_seconds=timeout,
                             seconds=round(time.monotonic() - started, 3))
             if diagnostics:
                 active = diagnostics / 'active-test.json'
@@ -232,6 +233,7 @@ def main():
     diagnostics.mkdir(parents=True, exist_ok=False)
     env = dict(os.environ)
     env['CODEXON_CHECK_DIAGNOSTICS'] = str(diagnostics)
+    env['CODEXON_CHECK_TIMEOUT'] = str(timeout)
     # Bootstrap only understood Python invocations; native programs still get
     # the same Job Object deadline and PID evidence.
     if Path(command[0]).name.lower() in ('python', 'python.exe', 'python3', 'python3.exe'):

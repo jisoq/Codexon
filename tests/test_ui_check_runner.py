@@ -90,6 +90,10 @@ def test_deadline_records_cause_and_cleans_only_owned_tree(tmp_path, mode, expec
         from pathlib import Path
         mode, output = sys.argv[1:]
         if mode == 'normal':
+            from tools.check_processes import register_root
+            # The supervisor also mentions this scope in --diagnostics. It
+            # must never be classified as a leftover test process.
+            register_root(Path(output).parent)
             sys.exit(0)
         child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])
         Path(output).write_text(str(child.pid))
@@ -107,6 +111,9 @@ def test_deadline_records_cause_and_cleans_only_owned_tree(tmp_path, mode, expec
         evidence = json.loads((diagnostics / 'result.json').read_text())
         assert evidence['reason'] == dict(normal='completed', hang='deadline', orphan='descendants_remain')[mode]
         assert evidence['remaining_pids'] == []
+        if mode == 'normal':
+            assert evidence['process_exit_code'] == 0
+            assert evidence['external']['processes'] == []
         assert evidence['seconds'] < 10
         assert unrelated.poll() is None
         if mode != 'normal':
