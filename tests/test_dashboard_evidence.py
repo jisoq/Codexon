@@ -89,7 +89,7 @@ def test_tab_loading_hides_empty_content_and_ignores_stale_result(tmp_path,langu
 
 def test_refresh_preserves_only_matching_results_and_failure_can_retry(tmp_path):
     from PySide6.QtTest import QTest
-    from cachemonitor.quick_qa import control,click
+    from cachemonitor.quick_qa import click,render_plot
     window=dashboard(tmp_path)
     try:
         window.receive(sample());window.show();window.render();window.async_mode=True
@@ -98,8 +98,9 @@ def test_refresh_preserves_only_matching_results_and_failure_can_retry(tmp_path)
         window.analysis_failed('synthetic failure')
         assert window.pages.isVisible() and window.error_button.isVisible()
         assert not window.retry_button.isVisible() and not window.analysis_notice.isVisible()
-        click(window,control(window,window.error_button))
-        click(window,control(window,window.error_panel.action))
+        click(window,render_plot(window,window.error_button))
+        assert window.current_page==4 and window.error_panel.selected=='analysis'
+        click(window,render_plot(window,window.error_panel.action))
         assert window.analysis_pending
         deliver_pending(window)
         assert not window.retry_button.isVisible()
@@ -109,8 +110,9 @@ def test_refresh_preserves_only_matching_results_and_failure_can_retry(tmp_path)
         assert not window.pages.isVisible() and window.error_button.isVisible()
         assert not window.analysis_notice.isVisible()
         assert window.grab().save(str(tmp_path/'tab-loading-failed.png'))
-        click(window,control(window,window.error_button))
-        click(window,control(window,window.error_panel.action))
+        click(window,render_plot(window,window.error_button))
+        assert window.current_page==4 and window.error_panel.selected=='analysis'
+        click(window,render_plot(window,window.error_panel.action))
         assert window.analysis_pending and not window.pages.isVisible()
         deliver_pending(window)
         assert window.pages.isVisible() and not window.analysis_notice.isVisible()
