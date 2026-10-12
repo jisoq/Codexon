@@ -10,6 +10,96 @@ from cachemonitor.observer_state import read_json
 from cachemonitor.model_evidence import home_key
 
 
+@pytest.mark.skipif(sys.platform != 'win32', reason='Windows AcceptEx reset regression')
+def test_aborted_accept_preserves_listener_inflight_response_and_new_connections(tmp_path):
+    import asyncio
+    import socket
+    import struct
+    from aiohttp import ClientSession, ClientTimeout, TCPConnector, web
+    from cachemonitor.model_proxy import create_app
+    from cachemonitor.model_evidence import EvidenceStore
+    from cachemonitor.proxy_runtime import ProxyDiagnostics
+    from test_model_proxy import server, run_proxy_test
+
+    async def run():
+        finish=asyncio.Event();received=[]
+        async def upstream(request):
+            ws=web.WebSocketResponse();await ws.prepare(request)
+            received.append(await ws.receive_json())
+            await ws.send_json(dict(type='response.created',response=dict(id='held',model='fixture')))
+            await asyncio.wait_for(finish.wait(),10)
+            await ws.send_json(dict(type='response.completed',response=dict(id='held',model='fixture',output='KEEP_FINAL')))
+            async for _ in ws:pass
+            return ws
+        origin=web.Application();origin.router.add_get('/responses',upstream)
+        diagnostic=ProxyDiagnostics(tmp_path)
+        store=EvidenceStore(tmp_path/'e.sqlite')
+        try:
+            async with server(origin) as url, server(create_app(store,tmp_path/'home',url,
+                    runtime_diagnostics=diagnostic),diagnostics=diagnostic) as proxy, ClientSession(
+                    connector=TCPConnector(force_close=True),timeout=ClientTimeout(total=3)) as client:
+                async with client.ws_connect(proxy+'/responses') as ws:
+                    await ws.send_json(dict(type='response.create',model='fixture'))
+                    assert (await ws.receive_json())['type']=='response.created'
+                    before=await (await client.get(proxy+'/health')).json()
+                    port=int(proxy.rsplit(':',1)[1]);durations=[]
+                    for _ in range(10):
+                        started=time.monotonic()
+                        # Deliberately finish TCP+RST before the event loop can
+                        # consume AcceptEx. No injected exception or model call.
+                        for _ in range(32):
+                            with socket.socket() as aborted:
+                                aborted.settimeout(1)
+                                aborted.connect(('127.0.0.1',port))
+                                aborted.setsockopt(socket.SOL_SOCKET,socket.SO_LINGER,struct.pack('HH',1,0))
+                        health=await (await client.get(proxy+'/health')).json()
+                        durations.append(time.monotonic()-started)
+                        assert health['instance']==before['instance']
+                        assert health['active_connections']==1
+                    finish.set()
+                    assert diagnostic.listener['retries']>=1
+                    assert diagnostic.failure is None
+                    assert read_json(tmp_path/'proxy-listener.json')['error']['winerror']==64
+                    final=await ws.receive_json()
+                    assert final['response']['output']=='KEEP_FINAL' and len(received)==1
+                    (tmp_path/'accept-recovery.json').write_text(json.dumps(dict(
+                        reconnects=10, listener_retries=diagnostic.listener['retries'],
+                        max_reset_to_new_health_seconds=max(durations), same_instance=True,
+                        inflight_response_preserved=True, upstream_requests=len(received))))
+        finally:
+            finish.set();store.close()
+    run_proxy_test(run())
+
+
+def test_fatal_accept_error_releases_listener_and_reports_failure(tmp_path,monkeypatch):
+    import asyncio
+    import errno
+    import socket
+    from aiohttp import web
+    from cachemonitor.proxy_listener import RelayListener
+    from cachemonitor.proxy_runtime import ProxyDiagnostics
+    from test_model_proxy import run_proxy_test
+
+    async def run():
+        diagnostic=ProxyDiagnostics(tmp_path)
+        async def failed_accept(sock):
+            raise OSError(errno.EBADF,'PRIVATE transport failure')
+        monkeypatch.setattr(asyncio.get_running_loop(),'sock_accept',failed_accept)
+        runner=web.AppRunner(web.Application());await runner.setup()
+        listener=RelayListener(runner,0,diagnostic)
+        try:
+            with pytest.raises(OSError):
+                await asyncio.wait_for(listener.wait(asyncio.Event()),1)
+            assert listener.task.done() and listener.socket.fileno()==-1
+            with socket.socket() as replacement:
+                replacement.bind(('127.0.0.1',listener.port))
+            report=read_json(diagnostic.path)
+            assert report['phase']=='listener' and report['error']['errno']==errno.EBADF
+            assert 'PRIVATE' not in diagnostic.path.read_text()
+        finally:await runner.cleanup()
+    run_proxy_test(run())
+
+
 
 
 

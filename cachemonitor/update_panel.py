@@ -243,25 +243,28 @@ class UpdatePanel(Group):
         self.execute.setText('다시 적용');self.execute.setEnabled(not self.operation)
         self.version.hide()
         headings={'preparing':'업데이트 준비','downloading':'업데이트 준비','installing':'앱 설치 중',
-                  'queued':'작업 마무리 대기','waiting':'작업 마무리 대기','needs_exit':'연결한 앱 종료 필요',
-                  'switching':'교체 중','stopping':'교체 중','starting':'교체 중','verifying':'검증 중',
-                  'rollback':'이전 프록시 복원 중','complete':'업데이트 완료',
+                  'queued':'응답 마무리 대기','waiting':'응답 마무리 대기','needs_exit':'연결한 앱 종료 필요',
+                  'switching':'프록시 교체 중','stopping':'프록시 교체 중','starting':'프록시 교체 중','verifying':'검증 중',
+                  'rollback':'이전 프록시 복원 중','complete':'업데이트 적용 완료',
                   'partial':'앱 설치 완료, 연결 적용 대기','deferred':'연결 적용 대기',
                   'failed':'업데이트 실패','interrupted':'업데이트 중단','cancelled':'업데이트 취소됨'}
         self.heading.setText(headings.get(phase,'업데이트'))
+        self.heading.put(fontSize=14,bold=False,color='muted')
+        self.heading.parent().setSpacing(8)
         message=record.get('message') or proxy.get('message','')
         if phase=='needs_exit':
-            message=formatted('소유자를 확인하지 못한 연결 {count}개가 남아 있습니다. 연결한 앱을 정상 종료하세요. Codexon은 켜 두세요. 연결이 종료되면 자동으로 계속합니다.',count=proxy.get('unknown_connections',0))
+            message='Codexon은 켜 두고, ChatGPT 앱과 Codex CLI는 사용 중이라면 완전히 종료해 주세요.'
         elif phase=='waiting':
             count=proxy.get('responding',0)
-            message=formatted('진행 중인 응답 {count}개가 끝나기를 기다립니다. 새 작업은 업데이트 완료 후 시작하세요.',count=count) if count else tr('연결을 마무리하고 기록을 저장합니다.')
+            message='새 요청을 멈추고 응답이 끝날 때까지 기다리세요.' if count else 'Codexon을 켜 둔 채 기다리세요.'
         elif phase=='downloading':message='설치 파일을 다운로드하고 검증합니다. 현재 설치본은 유지됩니다.'
         elif phase=='installing':message='새 앱을 설치하고 실행 상태를 확인합니다.'
         elif phase=='verifying':message='새 연결 구성요소의 실행을 확인합니다.'
-        elif phase=='complete':message='업데이트를 적용했습니다. 종료했던 앱을 다시 여세요.'
-        elif phase in ('switching','stopping','starting'):message='연결을 잠시 사용할 수 없습니다. 교체가 끝날 때까지 기다리세요.'
-        elif phase in ('partial','failed') and proxy.get('restored'):message='이전 프록시를 복원했습니다. 연결 적용을 다시 시도하세요.'
-        self.status.setText(message);self.status.setVisible(bool(message));self.status.put(color=self.status_color(attention))
-        partial=record.get('app',{}).get('state')=='verified' and phase not in ('complete','partial')
-        self.components.setVisible(partial);self.components.setText('앱 설치 완료 / Codex 연결 적용 대기' if partial else '')
+        elif phase=='complete':message='ChatGPT 앱을 재시작해 응답을 확인하세요.'
+        elif phase in ('switching','stopping','starting'):message='Codexon을 켜 둔 채 기다리세요.'
+        elif phase in ('partial','failed') and proxy.get('restored'):
+            self.heading.setText('업데이트 실패 / 이전 프록시 복원')
+            message='ChatGPT 앱을 다시 여세요.'
+        self.status.setText(message);self.status.setVisible(bool(message));self.status.put(fontSize=16,bold=True,color='ink')
+        self.components.hide()
         if attention and not active and not self.execute.isVisible():self.button.show()

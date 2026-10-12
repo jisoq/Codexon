@@ -208,6 +208,7 @@ RULES = (
     ('cachemonitor/proxy_supervisor.py', ('proxy_lifecycle',)),
     ('cachemonitor/managed_proxy.py', ('proxy_lifecycle',)),
     ('cachemonitor/proxy_runtime.py', ('relay', 'proxy_lifecycle', 'app_lifetime')),
+    ('cachemonitor/proxy_listener.py', ('relay', 'proxy_lifecycle')),
     ('cachemonitor/connection_recovery.py', ('proxy_lifecycle', 'install')),
     ('cachemonitor/observer_panel.py', ('observer',)),
     ('cachemonitor/observer_control.py', ('observer', 'proxy_lifecycle')),

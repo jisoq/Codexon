@@ -258,6 +258,7 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
                 'http_connections':sum(d['transport']=='HTTP/SSE' for d in active_relays.values()),
                 'selector_sockets':len(selector.get_map()) if hasattr(selector,'get_map') else None,
                 'event_loop':type(asyncio.get_running_loop()).__name__,
+                'listener':dict(runtime_diagnostics.listener) if runtime_diagnostics else {},
                 'http_pool':dict(clients=len(getattr(app[HTTP_CLIENT],'clients',())),waiting=getattr(app[HTTP_CLIENT],'waiting',0)),
                 'active_connections':len(active_relays),
                 'connection_sessions':[dict(session_id=sid,connections=count) for sid,count in
@@ -571,8 +572,8 @@ def main():
                 runner=web.AppRunner(app,access_log=None)
                 await runner.setup()
                 try:
-                    await web.TCPSite(runner,'127.0.0.1',args.port).start()
-                    await stop.wait()
+                    from .proxy_listener import RelayListener
+                    await RelayListener(runner,args.port,diagnostic).wait(stop)
                 finally:await runner.cleanup()
             run_loop(serve,diagnostic,proxy_loop)
     except Exception as error:

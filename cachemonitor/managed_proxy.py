@@ -62,6 +62,7 @@ class ManagedProxy:
     async def serve(self, store, endpoint, context, port,identity=None,diagnostics=None):
         from aiohttp import web
         from .model_proxy import create_app
+        from .proxy_listener import RelayListener
         # Same lifetime lock as the legacy supervisor permits safe update/migration.
         with ProcessLock(self.manager.directory / 'proxy-supervisor.lock'):
             self.acquired = True
@@ -75,8 +76,7 @@ class ManagedProxy:
             runner = web.AppRunner(app, access_log=None)
             try:
                 await runner.setup()
-                await web.TCPSite(runner, '127.0.0.1', port).start()
-                await stop.wait()
+                await RelayListener(runner, port, diagnostics).wait(stop)
             except Exception as error:
                 if diagnostics is None:raise
                 diagnostics.fail(error, 'serve')

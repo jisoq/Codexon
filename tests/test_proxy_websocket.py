@@ -253,6 +253,7 @@ def test_connection_close_races_preserve_other_response_and_release_slots(tmp_pa
                 async with client.ws_connect(proxy+'/responses') as protected:
                     await protected.send_json({'type':'response.create','id':'protected','input':'PRIVATE_BODY'})
                     assert (await protected.receive_json())['type']=='response.created'
+                    admitted=asyncio.Barrier(4)
                     async def churn(i):
                         async with client.ws_connect(proxy+'/responses',headers={'session_id':'PRIVATE_SESSION',
                                                       'Authorization':'Bearer PRIVATE_TOKEN'}) as ws:
@@ -262,6 +263,9 @@ def test_connection_close_races_preserve_other_response_and_release_slots(tmp_pa
                             if ending=='client_abort':ws._response.connection.transport.abort()
                             elif ending=='upstream_abort':await ws.receive()
                             else:
+                                # All concurrent requests must reach created before
+                                # advancing their shared synthetic lifetime clock.
+                                await asyncio.wait_for(admitted.wait(),2)
                                 now[0]+=2
                                 assert (await ws.receive_json())['response']['output']==payload
                                 terminal=await asyncio.wait_for(ws.receive(),2)

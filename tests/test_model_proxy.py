@@ -103,14 +103,25 @@ def test_managed_shutdown_keeps_inflight_http_tool_bytes(tmp_path,force):
 
 
 @asynccontextmanager
-async def server(app,ssl_context=None):
+async def server(app,ssl_context=None,diagnostics=None):
+    from cachemonitor.proxy_listener import RelayListener
     runner=web.AppRunner(app,access_log=None)
     await runner.setup()
-    site=web.TCPSite(runner,'127.0.0.1',0,ssl_context=ssl_context)
-    await site.start()
+    stop=asyncio.Event();serving=None
+    if ssl_context is None:
+        site=RelayListener(runner,0,diagnostics)
+        port=site.port
+        serving=asyncio.create_task(site.wait(stop))
+    else:
+        site=web.TCPSite(runner,'127.0.0.1',0,ssl_context=ssl_context)
+        await site.start()
+        port=site._server.sockets[0].getsockname()[1]
     scheme='https' if ssl_context is not None else 'http'
-    try:yield f'{scheme}://127.0.0.1:{site._server.sockets[0].getsockname()[1]}'
-    finally:await runner.cleanup()
+    try:yield f'{scheme}://127.0.0.1:{port}'
+    finally:
+        stop.set()
+        if serving:await serving
+        await runner.cleanup()
 
 
 def test_websocket_interleaved_lanes_preserves_frames_and_secrets(tmp_path):

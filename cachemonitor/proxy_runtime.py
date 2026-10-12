@@ -28,6 +28,21 @@ class ProxyDiagnostics:
         self.snapshot = lambda: {}
         self.failure = None
         self.event_loop = None
+        self.listener = dict(retries=0)
+        self.listener_written_at = None
+
+    def listener_retry(self, error):
+        self.listener = dict(retries=self.listener['retries'] + 1, at=time.time(),
+                             version=PROXY_VERSION, error=error_details(error))
+        now = time.monotonic()
+        if self.listener_written_at is not None and now - self.listener_written_at < 1:
+            return
+        self.listener_written_at = now
+        try:
+            atomic_write(self.path.with_name('proxy-listener.json'),
+                         json.dumps(self.listener, ensure_ascii=True).encode())
+        except OSError:
+            pass
 
     def event(self, connection, phase):
         self.events.append(dict(at=time.time(), connection=connection, phase=phase))

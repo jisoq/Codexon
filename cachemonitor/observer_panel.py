@@ -47,8 +47,10 @@ class ObserverPanel(Group):
         layout.addLayout(row)
         self.error_detail=Text();self.error_detail.setWordWrap(True);self.error_detail.put(color='error',fontSize=13)
         self.error_detail.hide();layout.addWidget(self.error_detail)
-        self.restart_label=Text();self.restart_label.setWordWrap(False);self.restart_label.setFixedHeight(24)
-        self.restart_label.setStyleSheet('color: warning;');layout.addWidget(self.restart_label)
+        self.guidance_heading=Text();self.guidance_heading.put(fontSize=14,color='muted')
+        self.guidance_heading.setWordWrap(True);self.guidance_heading.hide();layout.addWidget(self.guidance_heading)
+        self.restart_label=Text();self.restart_label.setWordWrap(True)
+        self.restart_label.put(fontSize=16,bold=True,color='ink');layout.addWidget(self.restart_label)
         self.toggle.toggled.connect(self.request)
         from .theme import shared_theme
         shared_theme().changed.connect(self.refresh_color)
@@ -137,8 +139,16 @@ class ObserverPanel(Group):
         self.error_detail.setVisible(bool(reason))
         self.refresh_color()
         restart=bool(state.get('restart_required')) and phase_update!='complete'
-        self.restart_label.setText('변경을 적용하려면 Codex 앱을 다시 여세요.' if restart else '')
-        self.restart_label.setVisible(restart)
+        failed=bool(state.get('configured')) and state.get('probe_state') in ('refused','identity_mismatch')
+        self.guidance_heading.setText('프록시 연결 실패' if failed else
+                                     '연결 준비 완료' if self.enabled else '직접 연결 설정 복원 완료')
+        self.guidance_heading.setVisible(failed or restart)
+        self.restart_label.setText('시작 메뉴에서 ‘Codexon 연결 복구’를 실행하세요.' if failed else
+                                   'ChatGPT 앱을 재시작해 응답을 확인하세요.' if restart else '')
+        self.restart_label.setVisible(failed or restart)
+        if failed:
+            self.error_detail.hide()
+            self.restart_label.setToolTip(str(reason or ''))
         self.status_observed.emit(state)
 
     def stop(self):
