@@ -173,12 +173,14 @@ def test_real_child_prepares_compact_report_and_reuses_raw_evidence_for_preview(
     responses=queue.Queue()
     worker=QuotaWorker(on_result=responses.put)
     source=sample_report()
+    source['tracking']['started']=50
     try:
         worker.request('prepare',snapshot=source)
         prepared=responses.get(timeout=15)
         assert not prepared.get('error'),prepared
         report=prepared['report']
         assert not any(field in report for field in ('cycles','history','request_windows','tracking'))
+        assert report['view']['tracking_started']==50
         assert report['view']['lifetime']['intervals']==[]
         assert report['view']['lifetime']['cost']==312
         assert report['view']['overall']['_content_digest']

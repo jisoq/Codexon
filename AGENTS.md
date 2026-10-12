@@ -5,7 +5,7 @@
 - Group changes by user experience, with short, specific titles and concrete descriptions. Include only verified, user-relevant changes. State compatibility changes, known limitations, and required user actions.
 - Keep Korean and English entries equivalent in scope, conditions, and limitations, placed together under the same category.
 - Keep installation and download references below the change categories, in their existing format, and verify they apply to the release.
-- To publish, push the reviewed version and notes to `main`, then run `windows.yml` with `publish=true`. It reuses the exact commit's verified installer, so do not start a separate build.
+- To publish, push the reviewed version and notes to `main`, then run `windows.yml` with `prepare=true` for that commit. After verification succeeds, run it separately with `publish=true`. Publication reuses the exact commit's verified installer and does not start a separate build.
 - Keep source archives at their locked download locations, since releases reuse them. When Qt/PySide6 changes, update `third-party-sources.lock.json` with the matching upstream hashes. Do not duplicate source assets or delete archives referenced by earlier releases.
 
 ## Verification before CI

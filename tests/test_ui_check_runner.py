@@ -77,3 +77,126 @@ def test_runner_isolates_qt_and_descendants_and_preserves_process_io(tmp_path, e
     assert observed['env'] == '환경 전달'
     assert Path(observed['cwd']) == tmp_path
     assert 'runner stderr preserved' in result.stderr
+
+
+@pytest.mark.parametrize('mode,expected', [('normal', 0), ('hang', 124), ('orphan', 1)])
+def test_deadline_records_cause_and_cleans_only_owned_tree(tmp_path, mode, expected):
+    """Exercise the real Windows Job Object, including an inherited stdout handle."""
+    import ctypes
+    from ctypes import wintypes as W
+    probe = tmp_path / 'probe.py'
+    probe.write_text(textwrap.dedent('''
+        import os, subprocess, sys, time
+        from pathlib import Path
+        mode, output = sys.argv[1:]
+        if mode == 'normal':
+            from tools.check_processes import register_root
+            # The supervisor also mentions this scope in --diagnostics. It
+            # must never be classified as a leftover test process.
+            register_root(Path(output).parent)
+            sys.exit(0)
+        child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])
+        Path(output).write_text(str(child.pid))
+        if mode == 'hang':
+            time.sleep(120)
+    '''), encoding='utf-8')
+    diagnostics = tmp_path / 'evidence'
+    unrelated = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])
+    try:
+        result = subprocess.run([sys.executable, str(ROOT / 'tools/run_ui_checks.py'),
+            '--timeout', '3', '--diagnostics', str(diagnostics), '--',
+            sys.executable, str(probe), mode, str(tmp_path / 'child.pid')],
+            capture_output=True, text=True, timeout=20)
+        assert result.returncode == expected, result.stderr
+        evidence = json.loads((diagnostics / 'result.json').read_text())
+        assert evidence['reason'] == dict(normal='completed', hang='deadline', orphan='descendants_remain')[mode]
+        assert evidence['remaining_pids'] == []
+        if mode == 'normal':
+            assert evidence['process_exit_code'] == 0
+            assert evidence['external']['processes'] == []
+        assert evidence['seconds'] < 10
+        assert unrelated.poll() is None
+        if mode != 'normal':
+            pid = int((tmp_path / 'child.pid').read_text())
+            assert pid in evidence['live_pids']
+            api = ctypes.WinDLL('kernel32', use_last_error=True)
+            api.OpenProcess.argtypes, api.OpenProcess.restype = [W.DWORD, W.BOOL, W.DWORD], W.HANDLE
+            api.WaitForSingleObject.argtypes = [W.HANDLE, W.DWORD]
+            api.CloseHandle.argtypes = [W.HANDLE]
+            handle = api.OpenProcess(0x100000, False, pid)
+            if handle:
+                try:
+                    assert api.WaitForSingleObject(handle, 0) == 0
+                finally:
+                    api.CloseHandle(handle)
+        if mode == 'hang':
+            assert 'probe.py' in ''.join(p.read_text() for p in diagnostics.glob('stacks-*.log'))
+    finally:
+        unrelated.terminate()
+        unrelated.wait(timeout=5)
+
+
+def test_pytest_phase_is_visible_before_a_hung_test_exits(tmp_path):
+    probe = tmp_path / 'test_stall.py'
+    probe.write_text('import time\ndef test_wait():\n    time.sleep(120)\n')
+    evidence = tmp_path / 'evidence'
+    log = tmp_path / 'pytest.log'
+    with log.open('w') as output:
+        result = subprocess.run([sys.executable, str(ROOT / 'tools/run_ui_checks.py'),
+            '--timeout', '4', '--diagnostics', str(evidence), '--', sys.executable,
+            '-m', 'pytest', '-p', 'tools.check_progress', '-o', 'addopts=', str(probe)],
+            stdout=output, stderr=subprocess.STDOUT, timeout=20)
+    assert result.returncode == 124, log.read_text()
+    active = json.loads((evidence / 'result.json').read_text())['active_test']
+    assert active['phase'] == 'call' and active['test'].endswith('test_wait')
+    assert active['started'] in log.read_text()
+    assert 'setup' in log.read_text() and 'call' in log.read_text()
+
+
+@pytest.mark.parametrize('mode,expected', [('orphan', 1), ('hang', 124)])
+def test_scheduler_process_is_tracked_by_its_fresh_scope(tmp_path, mode, expected):
+    from cachemonitor.observer_task import ObserverTask
+    from tools.check_processes import clear_scopes
+    ready = tmp_path / 'ready'
+    scope_file = tmp_path / 'scope.txt'
+    leaf_source = ('import time, subprocess, sys\nfrom pathlib import Path\n'
+                   "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])\n"
+                   f'Path({str(ready)!r}).write_text(str(child.pid))\ntime.sleep(120)\n')
+    probe = tmp_path / 'scheduler_probe.py'
+    probe.write_text(textwrap.dedent(f'''
+        import sys, time
+        from pathlib import Path
+        from cachemonitor.observer_task import ObserverTask
+        def test_scheduled_process(tmp_path):
+            scope = tmp_path / 'external'; scope.mkdir()
+            Path({str(scope_file)!r}).write_text(str(scope))
+            leaf = scope / 'leaf.py'; leaf.write_text({leaf_source!r})
+            task = ObserverTask(str(scope), role='RunnerQA')
+            task.start([sys.executable, str(leaf)])
+            deadline = time.monotonic() + 10
+            while not Path({str(ready)!r}).exists():
+                if time.monotonic() >= deadline: raise RuntimeError('Scheduled probe did not start')
+                time.sleep(.05)
+            if {mode!r} == 'hang': time.sleep(120)
+    '''))
+    evidence = tmp_path / 'evidence'
+    try:
+        result = subprocess.run([sys.executable, str(ROOT / 'tools/run_ui_checks.py'),
+            '--timeout', '20', '--diagnostics', str(evidence), '--', sys.executable,
+            '-m', 'pytest', '-p', 'tools.check_progress', '-o', 'addopts=', str(probe)],
+            capture_output=True, text=True, timeout=40)
+        assert result.returncode == expected, result.stdout + result.stderr
+        task = ObserverTask(scope_file.read_text(), role='RunnerQA')
+        report = json.loads((evidence / 'result.json').read_text())
+        assert report['reason'] == ('deadline' if mode == 'hang' else 'external_descendants_remain')
+        assert report['external']['processes']
+        assert int(ready.read_text()) in {process['pid'] for process in report['external']['processes']}
+        assert task.name in {task['name'] for task in report['external']['tasks']}
+        assert not task.inspect()['registered']
+    finally:
+        if scope_file.exists():
+            # Keep a failing regression run safe even if automatic registration
+            # breaks. This fallback runs only after inspecting runner evidence.
+            fallback = tmp_path/'fallback'; fallback.mkdir()
+            (fallback/'owner-scheduler.json').write_text(json.dumps({'root': scope_file.read_text()}))
+            clear_scopes(fallback)

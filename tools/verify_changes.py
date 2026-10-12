@@ -8,6 +8,7 @@ import fnmatch
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -247,9 +248,14 @@ RULES = (
     ('tools/ci_plan.py', ('selector', 'release')),
     ('.github/workflows/windows.yml', ('selector', 'release')),
     ('tools/release_*.py', ('release',)),
+    ('tools/source_receipt.py', ('release',)),
     ('tools/verify_release_tools.py', ('release', 'selector')),
     ('third-party-sources.lock.json', ('release', 'payload')),
     ('tools/run_ui_checks.py', ('ui_runner', 'runtime', 'overlay_controls')),
+    ('tools/check_processes.py', ('ui_runner',)),
+    ('tools/check_worker.py', ('ui_runner',)),
+    ('tools/check_progress.py', ('ui_runner',)),
+    ('tools/clear_check_scopes.ps1', ('ui_runner', 'install')),
     ('tools/check_environment.py', ('selector',)),
     ('tools/demo_speed_overlay.py', ('speed',)),
     ('tools/*proxy*.py', ('relay', 'proxy_lifecycle')),
@@ -516,9 +522,15 @@ def package_check(executable, report_dir):
                 duration_seconds=report.get('duration_seconds'), session_rollup=rollup)
 
 
+CORE_TESTS = frozenset(test_files('pricing', 'data_contract', 'core', 'request_modes'))
+PROCESS_TESTS = frozenset(test_files('ui_check_runner', 'install_management', 'proxy_update', 'app_services'))
+
+
 def pytest_commands(tests, *, integration=False, extended=False, report_dir=None):
-    """Run selected UI checks together on the hidden desktop."""
+    """Run audited core contracts without Qt, then GUI and process checks serially."""
+    selection = tuple(tests)
     pytest = [sys.executable, '-u', '-B', '-m', 'pytest', '-v', '--tb=short', '--maxfail=1', '--durations=10',
+              '-p', 'tools.check_progress',
               '-o', 'faulthandler_timeout=60']
     if extended:
         pytest += ['-m', 'extended or not extended']
@@ -526,18 +538,44 @@ def pytest_commands(tests, *, integration=False, extended=False, report_dir=None
         # Scoped work runs the affected integrations, not only the fast sweep.
         pytest += ['-m', 'not extended']
     if report_dir is not None:
-        pytest += ['--junitxml=' + str(report_dir / 'tests.xml'),
-                   '-o', 'cache_dir=' + str(REPORTS / 'pytest-cache')]
+        pytest += ['-o', 'cache_dir=' + str(REPORTS / 'pytest-cache')]
     runner = [sys.executable, str(ROOT / 'tools/run_ui_checks.py')]
-    return [('native', [*runner, '--', *pytest, *tests])] if tests else []
+    if selection == ('tests',):
+        tests = sorted({path.relative_to(ROOT).as_posix() for pattern in ('test_*.py', '*_test.py')
+                        for path in (ROOT/'tests').rglob(pattern)})
+    groups = {'core': [], 'gui': [], 'installation': []}
+    for test in tests:
+        path = test.split('::')[0]
+        kind = 'core' if path in CORE_TESTS else 'installation' if path in PROCESS_TESTS else 'gui'
+        groups[kind].append(test)
+    commands = []
+    for kind, targets in groups.items():
+        if not targets:
+            continue
+        junit = ['--junitxml=' + str(report_dir / f'tests-{kind}.xml')] if report_dir else []
+        desktop = ['--no-desktop'] if kind == 'core' else []
+        commands.append((kind, [*runner, '--kind', kind, *desktop, '--',
+                                *pytest, '--check-kind', kind, *junit, *targets]))
+    return commands
 
 
 def run_logged(command, path):
     # Persist each test as it runs, including stack dumps on a stalled test.
     # A detached descendant retaining stdout must not hold a capture pipe open.
-    with path.open('w', encoding='utf-8') as output:
-        result=subprocess.run(command, cwd=ROOT, stdout=output, stderr=subprocess.STDOUT)
-    result.stdout=path.read_text(encoding='utf-8',errors='replace')
+    with path.open('w', encoding='utf-8') as output, path.open('r', encoding='utf-8', errors='replace') as reader:
+        process = subprocess.Popen(command, cwd=ROOT, stdout=output, stderr=subprocess.STDOUT,
+                                   env=dict(os.environ, CODEXON_CHECK_LOG=str(path.resolve())))
+        while process.poll() is None:
+            chunk = reader.read(65536)
+            if chunk:
+                print(chunk, end='', flush=True)
+            else:
+                time.sleep(.1)
+        print(reader.read(), end='', flush=True)
+        result = subprocess.CompletedProcess(command, process.returncode)
+    with path.open('rb') as stream:
+        stream.seek(max(0, path.stat().st_size - 1024 * 1024))
+        result.stdout=stream.read().decode('utf-8',errors='replace')
     return result
 
 
@@ -604,21 +642,32 @@ def main(argv=None):
                                       report=str(folder/'report.json')),ensure_ascii=False,indent=2))
                 return 2
         started = time.monotonic()
+        deadline = started + 820  # Leave the Actions 15-minute step time for evidence upload/exit.
         runs = []
-        outputs = []
         for name, command in pytest_commands(plan['tests'], integration=args.integration,
                                              extended=args.extended, report_dir=folder):
+            remaining = deadline - time.monotonic() - 20
+            if remaining <= 0:
+                runs.append(dict(environment=name, exit_code=124, seconds=0, summary='Source budget exhausted'))
+                break
+            budget = min(remaining, {'core':180, 'gui':720, 'installation':540}[name])
+            boundary = command.index('--')
+            command[boundary:boundary] = ['--timeout', str(budget), '--diagnostics', str(folder / f'diagnostics-{name}')]
             run_started = time.monotonic()
             run_log = folder / f'pytest-{name}.log'
             result = run_logged(command, run_log)
             output = result.stdout
             report['logs'].append(str(run_log))
-            outputs.append(f'[{name}]\n{output}')
             runs.append(dict(environment=name, exit_code=result.returncode,
                              seconds=round(time.monotonic()-run_started, 2),
                              summary=result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ''))
+            if result.returncode:
+                break
         log = folder / 'pytest.log'
-        log.write_text('\n'.join(outputs),encoding='utf-8')
+        with log.open('w', encoding='utf-8') as aggregate:
+            for name in report['logs']:
+                with Path(name).open(encoding='utf-8', errors='replace') as source:
+                    shutil.copyfileobj(source, aggregate, length=65536)
         report['logs'].append(str(log))
         exit_code = next((run['exit_code'] for run in runs if run['exit_code']), 0)
         report['pytest'] = dict(exit_code=exit_code, seconds=round(time.monotonic()-started,2),

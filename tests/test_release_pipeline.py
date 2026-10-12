@@ -53,8 +53,8 @@ def root(tmp_path):
 def test_release_request_reuses_exact_successful_main_run(root):
     github = FakeGitHub([run_record()])
     result = pipeline.plan(github, SHA, '20', 'workflow_dispatch', 'refs/heads/main', True, root)
-    assert result['candidate'] and result['reuse_run'] == '10' and not result['verify']
-    assert pipeline.plan(github, SHA, '20', 'push', 'refs/heads/main', False, root)['reuse_run'] == '10'
+    assert not result['candidate'] and result['reuse_run'] == '10' and not result['verify']
+    assert pipeline.plan(github, SHA, '20', 'push', 'refs/heads/main', False, root)['reuse_run'] == ''
 
 
 @pytest.mark.parametrize('changes', [
@@ -68,9 +68,12 @@ def test_wrong_failed_pending_or_current_run_is_not_reused(changes):
     assert pipeline.reusable_run(FakeGitHub([record]), SHA, '20') == ''
 
 
-def test_expired_artifact_requires_verification_again(root):
+def test_expired_artifact_requires_explicit_candidate_preparation(root):
+    with pytest.raises(ValueError, match='prepare=true'):
+        pipeline.plan(FakeGitHub([run_record()], expired=True), SHA, '20', 'workflow_dispatch',
+                      'refs/heads/main', True, root)
     result = pipeline.plan(FakeGitHub([run_record()], expired=True), SHA, '20', 'workflow_dispatch',
-                           'refs/heads/main', True, root)
+                           'refs/heads/main', False, root, prepare=True)
     assert result['verify'] and not result['reuse_run'] and result['candidate']
 
 
@@ -156,16 +159,53 @@ def test_reusing_a_public_binary_requires_unchanged_packaged_inputs(root, monkey
     assert verify_release_tools.can_reuse(root) is expected
 
 
-def test_workflow_serializes_same_commit_and_publishes_the_retained_artifact():
+def test_reused_qa_registers_its_default_scope_before_starting_children(tmp_path, monkeypatch):
+    evidence = tmp_path/'evidence'; evidence.mkdir()
+    plan = tmp_path/'plan.json'
+    plan.write_text(json.dumps({'qa_smokes': ['recovery']}))
+    monkeypatch.setenv('CODEXON_CHECK_DIAGNOSTICS', str(evidence))
+    monkeypatch.setattr(verify_release_tools, 'ROOT', tmp_path)
+    monkeypatch.setattr(verify_release_tools, 'can_reuse', lambda: True)
+    monkeypatch.setattr(verify_release_tools, 'version', lambda: '2026.10.12.1')
+    monkeypatch.setattr(verify_release_tools.sys, 'argv', ['verify_release_tools.py', '--plan', str(plan)])
+    output = tmp_path/'artifacts/verification/changed-release-tools'
+    launched = []
+    def launch(command, **kwargs):
+        assert output.is_dir()
+        assert [json.loads(path.read_text())['root'] for path in evidence.glob('owner-*.json')] == [str(output)]
+        launched.append(command)
+        if '--tag' in command:
+            target = Path(command[command.index('--output') + 1]); target.mkdir()
+            (target/'result.json').write_text(json.dumps({'executable': str(target/'Codexon.exe')}))
+    monkeypatch.setattr(verify_release_tools.subprocess, 'run', launch)
+    verify_release_tools.main()
+    assert len(launched) == 2
+    # Never claim a pre-existing directory, even when it has the default name.
+    with pytest.raises(FileExistsError):
+        verify_release_tools.main()
+    assert len(launched) == 2
+
+
+def test_workflow_preserves_successful_jobs_and_publishes_the_retained_artifact():
     workflow = (pipeline.ROOT/'.github/workflows/windows.yml').read_text()
-    assert 'group: windows-${{ github.ref }}-${{ github.sha }}\n  cancel-in-progress: false' in workflow
-    assert 'verify:\n    needs: resolve' in workflow
+    assert "format('ci-{0}', github.event.pull_request.number || github.ref)" in workflow
+    assert "format('release-{0}-{1}', github.sha, github.run_id)" in workflow
+    assert 'cancel-in-progress: ${{ !(inputs.prepare || inputs.publish) }}' in workflow
+    assert 'needs: [resolve, source, package_build, package_verify]' in workflow
     verify, publish = workflow.split('\n  publish:\n')
     assert 'needs: [resolve, verify]' in publish
     assert 'release_pipeline.py publish' in publish and 'build.ps1' not in publish
     assert 'name: verified-release-${{ github.sha }}' in verify
     assert 'git worktree add' not in verify
     assert 'verify_release_tools.py --plan' in verify
+    build = workflow.split('\n  package_build:\n')[1].split('\n  package_verify:\n')[0]
+    validation = workflow.split('\n  package_verify:\n')[1].split('\n  verify:\n')[0]
+    assert 'build.ps1' in build and 'Build-Installer.ps1' in build
+    assert 'build.ps1' not in validation and 'Build-Installer.ps1' not in validation
+    assert 'actions/download-artifact@' in validation
+    assert 'candidate-${{ github.sha }}-${{ github.run_id }}' in build
+    assert 'candidate-${{ github.sha }}-${{ github.run_id }}' in validation
+    assert 'source-verified-${{ github.sha }}' in workflow
 
 
 def test_publication_uses_verified_artifact_and_only_uploads_installer_files(root, monkeypatch):
@@ -258,3 +298,87 @@ def test_publish_failure_does_not_discard_successfully_verified_installer(root):
     github.verification = 'success'
     result = pipeline.plan(github, SHA, '20', 'workflow_dispatch', 'refs/heads/main', True, root)
     assert result['reuse_run'] == '10' and not result['verify']
+
+
+@pytest.mark.parametrize('branch', ['main', 'codex/verification'])
+@pytest.mark.parametrize('base', ['b' * 40, SHA])
+def test_source_success_survives_install_failure_but_invalid_environment_does_not(root, monkeypatch, branch, base):
+    from tools import source_receipt
+    record = {**run_record(), 'head_sha': base, 'head_branch': branch, 'conclusion': 'failure'}
+    receipt = dict(schema=1, policy=source_receipt.POLICY, commit=base, run_id='10',
+                   environment=source_receipt.environment_key(root), complete=True,
+                   scope=['tests'], args=['--integration'])
+    class SourceGitHub(FakeGitHub):
+        def api(self, path, **kwargs):
+            if path.endswith('/jobs'):
+                return {'jobs':[dict(name='source', conclusion='success'),
+                                dict(name='package_verify', conclusion='failure')]}
+            if path.endswith('/artifacts'):
+                return {'artifacts':[dict(name='source-verified-'+base, expired=False, size_in_bytes=1024)]}
+            return super().api(path, **kwargs)
+        def command(self, *args):
+            (Path(args[-1])/'source-verification.json').write_text(json.dumps(receipt))
+    monkeypatch.setattr(pipeline.subprocess, 'run', lambda *a, **kw: SimpleNamespace(returncode=0))
+    github = SourceGitHub([record])
+    assert pipeline.source_base(github, SHA, root, branch=branch) == base
+    assert pipeline.source_base(github, SHA, root, branch=branch, current_run='10') == ''
+    assert pipeline.plan(github, SHA, '20', 'workflow_dispatch', 'refs/heads/' + branch,
+                         False, root, prepare=True)['source_base'] == base
+    assert pipeline.verified_base(github, SHA, root, branch=branch) == ''
+    assert pipeline.trusted(record, base, github.repository) == (branch == 'main')
+    (root/'requirements-release.lock').write_text('changed environment')
+    assert pipeline.source_base(github, SHA, root, branch=branch) == ''
+
+
+def test_required_skipped_or_missing_job_cannot_pass_final_verdict():
+    plan = dict(verify=True, package=True, qa_reuse=False)
+    results = {name:'success' for name in ('resolve', 'source', 'package_build', 'package_verify')}
+    assert pipeline.final_verdict(plan, results)['result'] == 'success'
+    for state in ('skipped', 'failure', 'cancelled', 'missing'):
+        with pytest.raises(ValueError, match='Required checks'):
+            pipeline.final_verdict(plan, {**results, 'package_verify':state})
+    # Pure source changes require no deployment job, but still require source.
+    assert pipeline.final_verdict({**plan, 'package':False}, {**results, 'package_build':'skipped', 'package_verify':'skipped'})
+    with pytest.raises(ValueError, match='Required checks'):
+        pipeline.final_verdict({**plan, 'package':False}, {'resolve':'success', 'source':'skipped'})
+
+
+def test_candidate_is_reused_only_for_its_exact_commit_run_and_payload(tmp_path):
+    product = tmp_path/'Codexon'; product.mkdir()
+    (product/'build-manifest.json').write_text(json.dumps({'commit':SHA}))
+    binary = product/'Codexon.exe'; binary.write_bytes(b'candidate')
+    pipeline.candidate_receipt(tmp_path, SHA, '10')
+    pipeline.candidate_receipt(tmp_path, SHA, '10', validate=True)
+    with pytest.raises(ValueError, match='another commit'):
+        pipeline.candidate_receipt(tmp_path, 'b'*40, '10', validate=True)
+    with pytest.raises(ValueError, match='changed'):
+        pipeline.candidate_receipt(tmp_path, SHA, '11', validate=True)
+    binary.write_bytes(b'changed')
+    with pytest.raises(ValueError, match='changed'):
+        pipeline.candidate_receipt(tmp_path, SHA, '10', validate=True)
+
+
+def test_failed_deployment_is_not_hidden_by_a_new_source_baseline():
+    from tools.ci_plan import build_plan
+    plan = build_plan({'docs/followup.md'}, base='source-passed',
+                      package_changed={'cachemonitor/install_activation.py', 'docs/followup.md'})
+    assert plan['tests'] == ()
+    assert plan['package'] and plan['proxy'] and plan['msix']
+
+
+def test_notes_do_not_make_an_ordinary_push_a_release_candidate(root):
+    github = FakeGitHub()
+    ordinary = pipeline.plan(github, SHA, '20', 'push', 'refs/heads/main', False, root)
+    assert not ordinary['candidate'] and ordinary['verify']
+    prepared = pipeline.plan(github, SHA, '20', 'workflow_dispatch', 'refs/heads/main', False, root, prepare=True)
+    assert prepared['candidate'] and prepared['verify']
+    from tools.ci_plan import build_plan
+    assert not build_plan({'cachemonitor/pricing.py'}, base='verified')['dependencies']
+    assert build_plan({'cachemonitor/pricing.py'}, base='verified', candidate=True)['dependencies']
+    assert build_plan({'cachemonitor/install_activation.py'}, base='verified')['package']
+    with pytest.raises(ValueError, match='separately'):
+        pipeline.plan(github, SHA, '20', 'workflow_dispatch', 'refs/heads/main', True, root, prepare=True)
+    branch = pipeline.plan(github, SHA, '20', 'workflow_dispatch', 'refs/heads/codex/verification', False, root, prepare=True, exercise_rerun=True)
+    assert branch['candidate'] and branch['verify'] and not branch['published']
+    with pytest.raises(ValueError, match='non-main'):
+        pipeline.plan(github, SHA, '20', 'workflow_dispatch', 'refs/heads/main', False, root, exercise_rerun=True)

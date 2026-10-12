@@ -5,9 +5,15 @@ import ctypes
 from ctypes import wintypes as W
 import msvcrt
 import os
+import json
+from pathlib import Path
 import subprocess
 import sys
+import time
 import uuid
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from tools.check_processes import Job, clear_scopes
 
 
 class StartupInfo(ctypes.Structure):
@@ -58,6 +64,7 @@ def windows_api():
         (kernel, 'WaitForSingleObject', [W.HANDLE, W.DWORD], W.DWORD),
         (kernel, 'GetExitCodeProcess', [W.HANDLE, ctypes.POINTER(W.DWORD)], W.BOOL),
         (kernel, 'TerminateProcess', [W.HANDLE, W.UINT], W.BOOL),
+        (kernel, 'ResumeThread', [W.HANDLE], W.DWORD),
         (kernel, 'CloseHandle', [W.HANDLE], W.BOOL),
     )
     for library, name, arguments, result in signatures:
@@ -95,7 +102,7 @@ def isolated_desktop(user):
         checked(user.CloseWindowStation(station))
 
 
-def run_on_desktop(kernel, desktop, command, env):
+def run_on_desktop(kernel, desktop, command, env, *, timeout=720, diagnostics=None):
     # subprocess.STARTUPINFO does not forward lpDesktop to CreateProcessW.
     # Use the real structure and inherit only the three standard streams.
     startup = StartupInfoEx()
@@ -104,6 +111,8 @@ def run_on_desktop(kernel, desktop, command, env):
     startup.startup.dwFlags = 0x100  # STARTF_USESTDHANDLES
     process = ProcessInfo()
     with ExitStack() as cleanup:
+        job = Job()
+        cleanup.callback(job.close)
         handles = []
         for descriptor in range(3):
             try:
@@ -131,23 +140,73 @@ def run_on_desktop(kernel, desktop, command, env):
         for stream in (sys.stdout, sys.stderr):
             if stream:
                 stream.flush()
-        # CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT
-        checked(kernel.CreateProcessW(None, line, None, None, True, 0x08080400,
+        # Start suspended so no child can escape before Job Object assignment.
+        checked(kernel.CreateProcessW(None, line, None, None, True, 0x08080404,
                                       environment, None, ctypes.byref(startup), ctypes.byref(process)))
         cleanup.callback(kernel.CloseHandle, process.process)
-        checked(kernel.CloseHandle(process.thread))
+        cleanup.callback(kernel.CloseHandle, process.thread)
+        started = time.monotonic()
+        log_check = started
+        reason = 'completed'
         try:
+            job.assign(process.process)
+            if kernel.ResumeThread(process.thread) == 0xFFFFFFFF:
+                raise ctypes.WinError(ctypes.get_last_error())
             while True:
                 status = kernel.WaitForSingleObject(process.process, 100)
                 if status == 0:
                     break
                 if status != 258:  # WAIT_TIMEOUT
                     raise ctypes.WinError(ctypes.get_last_error())
+                if time.monotonic() - started >= timeout:
+                    reason = 'deadline'
+                    break
+                if diagnostics and time.monotonic() - log_check >= 1:
+                    log_check = time.monotonic()
+                    logs = list(diagnostics.glob('*.log'))
+                    if env.get('CODEXON_CHECK_LOG'):
+                        logs.append(Path(env['CODEXON_CHECK_LOG']))
+                    if sum(path.stat().st_size for path in logs if path.exists()) > 64 * 1024 * 1024:
+                        reason = 'diagnostic_budget'
+                        break
             result = W.DWORD()
             checked(kernel.GetExitCodeProcess(process.process, ctypes.byref(result)))
-            return result.value
+            live = job.pids()
+            settled = time.monotonic() + .5
+            while reason == 'completed' and live and time.monotonic() < settled:
+                time.sleep(.02)
+                live = job.pids()
+            if reason == 'completed' and live:
+                reason = 'descendants_remain'
+            if reason != 'completed' and diagnostics:
+                (diagnostics / 'stack-request').touch()
+                # The worker's stack watcher polls every 200 ms. This bounded
+                # diagnostic grace is included in the cleanup reserve.
+                stack_deadline = time.monotonic() + 2
+                while time.monotonic() < stack_deadline and not any(diagnostics.glob('stack-dumped-*')):
+                    if kernel.WaitForSingleObject(process.process, 100) == 0:
+                        break
+            evidence = dict(reason=reason, command=command, pid=process.process_id,
+                            live_pids=live, process_exit_code=result.value, timeout_seconds=timeout,
+                            seconds=round(time.monotonic() - started, 3))
+            if diagnostics:
+                active = diagnostics / 'active-test.json'
+                if active.exists():
+                    evidence['active_test'] = json.loads(active.read_text(encoding='utf-8'))
+                (diagnostics / 'processes.json').write_text(json.dumps(evidence, indent=2), encoding='utf-8')
+            evidence['remaining_pids'] = job.terminate() if live else []
+            # Scheduler and packaged activation can start outside this Job.
+            # The test registers fresh scopes before launching those processes.
+            if diagnostics:
+                evidence['external'] = clear_scopes(diagnostics)
+                if evidence['external'].get('processes') or any(task['running'] for task in evidence['external'].get('tasks', [])):
+                    reason = evidence['reason'] = 'external_descendants_remain' if reason == 'completed' else reason
+            if diagnostics:
+                (diagnostics / 'result.json').write_text(json.dumps(evidence, indent=2), encoding='utf-8')
+            return 124 if reason == 'deadline' else 1 if reason != 'completed' or evidence['remaining_pids'] else result.value
         except BaseException:
-            # Do not leave the direct check process running after an interrupted runner.
+            job.terminate()
+            # Assignment can fail before the suspended process joins the job.
             kernel.TerminateProcess(process.process, 1)
             kernel.WaitForSingleObject(process.process, 5000)
             raise
@@ -156,6 +215,10 @@ def run_on_desktop(kernel, desktop, command, env):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--scale')
+    parser.add_argument('--kind', choices=('gui', 'installation', 'core'), default='gui')
+    parser.add_argument('--timeout', type=float)
+    parser.add_argument('--diagnostics', type=Path)
+    parser.add_argument('--no-desktop', action='store_true')
     parser.add_argument('command', nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command
@@ -163,12 +226,25 @@ def main():
         command = command[1:]
     if not command:
         parser.error('A command is required')
+    timeout = args.timeout if args.timeout is not None else dict(gui=720, installation=540, core=180)[args.kind]
+    if not 0 < timeout <= 840:
+        parser.error('Check budget must be positive and at most 840 seconds')
+    diagnostics = (args.diagnostics or Path(__file__).resolve().parents[1] / 'artifacts/verification' / ('runner-' + uuid.uuid4().hex)).resolve()
+    diagnostics.mkdir(parents=True, exist_ok=False)
     env = dict(os.environ)
+    env['CODEXON_CHECK_DIAGNOSTICS'] = str(diagnostics)
+    env['CODEXON_CHECK_TIMEOUT'] = str(timeout)
+    # Bootstrap only understood Python invocations; native programs still get
+    # the same Job Object deadline and PID evidence.
+    if Path(command[0]).name.lower() in ('python', 'python.exe', 'python3', 'python3.exe'):
+        command = [command[0], '-u', '-B', str(Path(__file__).with_name('check_worker.py')), *command[1:]]
     if args.scale:
         env['QT_SCALE_FACTOR'] = args.scale
     user, kernel = windows_api()
+    if args.no_desktop:
+        return run_on_desktop(kernel, None, command, env, timeout=timeout, diagnostics=diagnostics)
     with isolated_desktop(user) as desktop:
-        return run_on_desktop(kernel, desktop, command, env)
+        return run_on_desktop(kernel, desktop, command, env, timeout=timeout, diagnostics=diagnostics)
 
 
 if __name__ == '__main__':

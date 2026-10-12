@@ -5,6 +5,9 @@ param([Parameter(Mandatory)][string]$Installer,
 $ErrorActionPreference='Stop'
 # This fixture installs a disposable signing certificate only on the CI machine.
 if ($env:GITHUB_ACTIONS -ne 'true') { throw 'Use the existing Codex package for local MSIX checks; the synthetic fixture is CI-only.' }
+# Python can inherit PowerShell 7's module search path. Load the Windows
+# PowerShell certificate provider explicitly before PKI signs the fixture.
+Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1') -ErrorAction Stop
 $root=[IO.Path]::GetFullPath($Output)
 if (Test-Path -LiteralPath $root) { throw 'A fresh QA output directory is required' }
 New-Item -ItemType Directory -Path $root | Out-Null
@@ -70,7 +73,7 @@ public class Launcher {
     $env:CODEXON_QA_PACKAGE_FAMILY=$package.PackageFamilyName
     $env:CODEXON_QA_PACKAGE_LAUNCHER=Join-Path $package.InstallLocation 'Launcher.exe'
     $env:CODEXON_QA_PACKAGE_REPORTS=$reports
-    & $Python -B tools/run_ui_checks.py -- $Python -B tools/verify_installation.py --installer $Installer --broken-installer $BrokenInstaller --output (Join-Path $root 'installation')
+    & $Python -B tools/run_ui_checks.py --kind installation -- $Python -B tools/verify_installation.py --installer $Installer --broken-installer $BrokenInstaller --output (Join-Path $root 'installation')
     if ($LASTEXITCODE) { throw 'MSIX-origin installation checks failed' }
 } finally {
     try {

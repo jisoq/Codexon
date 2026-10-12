@@ -1,6 +1,6 @@
 # Verification
 
-Use a dedicated environment installed from `requirements-release.lock`. `tools/verify_changes.py` checks that environment and runs UI tests on a hidden Windows desktop.
+Use a dedicated environment installed from `requirements-release.lock`. `tools/verify_changes.py` checks that environment, runs audited calculation/data tests without Qt, and runs GUI and process tests serially on a hidden Windows desktop. The core group fails if it imports Qt. No test groups run in parallel.
 
 | Situation | Command | Coverage |
 | --- | --- | --- |
@@ -37,7 +37,12 @@ The benchmark compares both backends on identical synthetic inputs, including Py
 
 `tools/ci_plan.py` is the policy for `.github/workflows/windows.yml`:
 
-- Source checks compare against the last successful main-branch ancestor, or the PR base. A release version or manual dispatch does not discard that baseline. Missing CI baselines and shared test/dependency changes require an integration sweep. Benchmarks remain opt-in.
+- The sequential jobs are `resolve`, `source`, `package_build`, `package_verify`, and the final `verify` gate. Rerun the failed package verification job to reuse its successful source job and retained candidate. Rerunning all jobs deliberately repeats all work. A required skipped, cancelled, missing, or failed job fails the final gate.
+- Source checks use an ancestor's successful `source` job and matching source receipt, even if its later installation check failed. Receipts record coverage, commit, run ID, and the locked environment/runner image. Common configuration, runner, dependency, and image changes invalidate the receipt. Branch dispatches may reuse their own branch's receipts or main receipts; publication trusts only main. PRs may reuse a trusted dispatch receipt from their head branch when it is an ancestor of the tested merge commit, otherwise they use their base commit. Missing CI baselines require an integration sweep. Benchmarks remain opt-in.
+- Deployment impact uses its own fully verified ancestor. Advancing a source baseline never hides a previously failed installation or migration check. The baseline lookup examines at most 100 recent main runs; expired or incompatible receipts fall back to broader checks.
+- Ordinary pushes and PRs use branch/PR cancellation groups. New commits cancel superseded ordinary runs. Explicit release requests use separate run groups and are protected from that cancellation.
+- Prepare a release with `workflow_dispatch`, `prepare=true` on the reviewed main commit. Notes and a new version alone do not request a candidate. Preparation includes dependency auditing. Use `publish=true` separately after preparation succeeds; publication rejects missing or expired verified artifacts instead of building again.
+- `prepare=true` also permits an unpublished branch candidate for pre-merge validation. Its receipt cannot authorize publication. For an explicit recovery exercise on a non-main branch, `exercise_rerun=true` fails the first package validation attempt after downloading and checking the candidate. Rerunning the failed job executes the real package checks with that retained candidate. The exercise is rejected on main and never suppresses a real check failure.
 - Release candidates always build the current commit, check the frozen application, exercise recovery, test install/update/rollback/removal, validate the payload, and seal the exact installer with hashes.
 - The installation lifecycle runs once. Installer or dependency changes select the MSIX-origin path, which also exercises native activation. Other package changes use the native-origin path.
 - Legacy proxy/collector migration runs for relevant implementation, installer, or dependency changes. Only an app `VERSION` literal change can bypass the version file's proxy checks; changes to `PROXY_VERSION` or compatibility code still require them. Changed QA tools use a matching published binary when its packaged inputs are unchanged.
@@ -45,7 +50,11 @@ The benchmark compares both backends on identical synthetic inputs, including Py
 - Manual `extended=true` adds benchmarks and legacy compatibility checks. It still runs only one installation origin.
 - Publication reuses the successful exact-commit installer. A failed verification cannot publish by falling back to an older artifact. Receipts name the `affected-regression-v1` policy; older `full` receipts remain acceptable.
 
-Each source run writes `tests.xml`, test durations, and a JSON report under `artifacts/verification`. CI retains those reports and screenshots, not copies of old executable payloads. Use the failing assertion and those artifacts before retrying.
+Each source run writes `tests-core.xml`, `tests-gui.xml`, `tests-installation.xml` for selected groups, test durations, and a JSON report under `artifacts/verification`. Test setup, call, and teardown start times stream into Actions while file logs remain available. Stack dumps do not by themselves terminate tests.
+
+The source test phase has an internal 820-second deadline, including cleanup reserve, before the unchanged 15-minute Actions limit. Individual defaults are 180 seconds for core, 720 for GUI, and 540 for installation checks; each group is clipped to the remaining source budget with 20 seconds reserved for cleanup. A suspended child joins a kill-on-close Windows Job Object before running. At timeout, evidence records active test/phase, stacks and live PIDs before terminating that job. Fresh scopes identify scheduled or packaged processes outside it; cleanup checks their task markers, process creation times, and descendants. Cleanup failure fails the check.
+
+Diagnostic logs have a 64 MiB per-runner budget; exceeding it fails the check rather than silently dropping evidence. Evidence is retained for seven days. Candidate payloads are capped at 2 GiB per run, bind all files to one commit and workflow run, and are retained for 30 days to cover the Actions rerun window. Source receipts (maximum accepted size 32 KiB) and verified release artifacts are also retained for 30 days. An expired candidate requires an explicit build rerun. A new commit always gets a new candidate; publication continues to use the sealed verified installer.
 
 ## Keeping checks small
 

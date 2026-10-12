@@ -1,10 +1,11 @@
 """Usage summary, unified chart legend and modal exclusion management."""
-from html import escape
+from time import time
 from .presentation import Button, Column, Group, Row, Scroll, Text
 from .quick_runtime import Dialog, QuickHost
-from .i18n import Verbatim, language, formatted, tr
+from .i18n import Verbatim, formatted, tr
 from .pricing import usd
 from .theme import shared_theme
+from .token_colors import mix
 
 def detach(node):
     parent = node.parent()
@@ -25,29 +26,43 @@ def configure_quota_layout(panel):
     build_exclusion_dialog(panel)
     for node in (panel.summary_heading,panel.history_controls,panel.result,panel.cycle_value,panel.lifetime_basis,panel.cycle_basis,panel.conversion):
         detach(node)
-    summary_card=Group();summary_card.put(background='secondary',border='border',radius=12)
-    summary_layout=Column(summary_card);summary_layout.setContentsMargins(24,24,24,24)
-    summary_text=Text();summary_text.put(fontSize=22,wrap=True,rich=True)
-    summary_layout.addWidget(summary_text)
-    panel.layout().insertWidget(0,summary_card)
-    panel.summary_card=summary_card
-    panel.summary_text=summary_text
+    summary=Row();summary.put(collapseBelow=980,columns=2);summary.setSpacing(12)
+    panel.layout().insertWidget(0,summary)
+    panel.summary=summary
+    panel.summary_cards={};panel.summary_values={}
+    metrics=(('elapsed','실측 시간'),('usage','누적 사용량'),
+             ('cost','누적 가치'),('weekly','주간 할당량 가치'))
+    for index,(key,title) in enumerate(metrics):
+        if index%2==0:
+            pair=Row();pair.put(collapseBelow=1,columns=2);pair.setSpacing(12)
+            summary.addWidget(pair,1)
+        card=Group();card.put(background='secondary',radius=12)
+        content=Column(card);content.setContentsMargins(20,20,20,20);content.setSpacing(12)
+        label=Text(title);label.put(fontSize=16,color='muted',wrap=True)
+        number=Text();number.put(fontSize=32,bold=True,color='ink',noElide=True,wrap=True,fitText=True)
+        content.addWidget(label);content.addWidget(number);pair.addWidget(card,1)
+        panel.summary_cards[key]=card;panel.summary_values[key]=number
+    panel.summary_values['elapsed'].setToolTip('측정 시작부터 현재까지의 경과 시간입니다. 측정 중지와 수집 공백을 포함합니다.')
+    panel.summary_values['usage'].setToolTip('관측한 주간 할당량 소모율의 누적 합계입니다. 초기화 전후의 사용량을 합산합니다.')
+    panel.summary_values['weekly'].setToolTip('주간 할당량 100%에 해당하는 추정 가치입니다.')
     def summarize():
         lifetime=panel.lifetime_statistics
-        summary_card.setVisible(bool(lifetime['total'] or panel.report.get('exclusions')))
+        summary.setVisible(bool(lifetime['total'] or panel.report.get('exclusions')))
         palette=shared_theme().palette
-        def emphasize(value):
-            return f'<span style="font-size:32px;font-weight:700;color:{palette["accent"]}">{escape(value)}</span>'
-        usage=emphasize(f"{lifetime['delta']:g}%");cost=emphasize(usd(lifetime['cost']))
-        main=(f"You've used {usage} so far, worth {cost}." if language()=='en' else
-              f'지금까지 {usage}를 사용했으며, {cost} 상당입니다.')
-        basis=(f'(Based on {emphasize(usd(panel.lifetime_value))} for 100% of your weekly allowance.)' if language()=='en' else
-               f'(주간 할당량 100% = {emphasize(usd(panel.lifetime_value))} 기준)')
-        summary_text.setText(Verbatim(main+'<br>'+basis))
+        border=mix(palette['secondary'],palette['accent'],.35)
+        for card in panel.summary_cards.values():card.put(border=border)
+        started=(panel.report.get('tracking') or {}).get('started')
+        if started is None:
+            started=(panel.report.get('view') or {}).get('tracking_started')
+        elapsed=(f'{max(0,time()-started)/3600:,.1f}'.removesuffix('.0')+' hr'
+                 if started is not None else '—')
+        values=dict(elapsed=elapsed,usage=f"{lifetime['delta']:g}%",
+                    cost=usd(lifetime['cost']),weekly=usd(panel.lifetime_value))
+        for key,value in values.items():panel.summary_values[key].setText(Verbatim(value))
     panel.result.textValueChanged.connect(summarize)
     panel.update_summary=summarize
     shared_theme().changed.connect(summarize)
-    summary_text.destroyed.connect(lambda *_: shared_theme().changed.disconnect(summarize))
+    summary.destroyed.connect(lambda *_: shared_theme().changed.disconnect(summarize))
     summarize()
     labels=dict(remaining='남은 사용량',cycle_cost='누적 측정 환산액',
                 cycle_value='주간 예상 가치',reference='누적 예상 가치')

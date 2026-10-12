@@ -2,14 +2,14 @@
 import time
 
 import pytest
-from PySide6.QtCore import QSettings, Qt
+from PySide6.QtCore import QPointF, QSettings, Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from cachemonitor.presentation import Scroll
 from cachemonitor.quota_panel import QuotaPanel, model_cost_intervals
 from cachemonitor.quota_cycles import QuotaLedger
-from cachemonitor.quick_qa import click, control, dispose, mount, render_plot, click_row, walk
+from cachemonitor.quick_qa import click, control, dispose, mount, render_plot, click_row, walk, scene_view
 from cachemonitor.theme import shared_theme
 from test_quota_tracking_integration import activity
 from cachemonitor import quota_tracking_store as tracking
@@ -43,6 +43,36 @@ def quota_page(tmp_path):
 
 
 @pytest.mark.integration
+@pytest.mark.essential
+def test_large_summary_values_fit_compact_cards(quota_page,tmp_path):
+    from cachemonitor.pricing import usd
+    app,panel,scroll=quota_page
+    host=mount(scroll,520,900)
+    try:
+        for amount in (1_000_000,1e30):
+            panel.lifetime_statistics['cost']=amount
+            panel.lifetime_value=amount
+            panel.update_summary()
+            for key in ('cost','weekly'):
+                node=panel.summary_values[key]
+                text=next(item for item in walk(control(host,node))
+                          if item.metaObject().indexOfProperty('contentWidth')>=0)
+                def fits():
+                    return (text.property('text')==usd(amount) and
+                            text.property('contentWidth')<=text.width()+1 and
+                            text.property('contentHeight')<=text.height()+1)
+                deadline=time.monotonic()+2
+                while not fits() and time.monotonic()<deadline:
+                    app.processEvents();QTest.qWait(10)
+                assert node.text()==usd(amount)
+                assert fits()
+                if amount==1_000_000:assert text.property('lineCount')==1
+            assert host.grab().save(str(tmp_path/f'quota-large-{amount}.png'))
+        assert not host.qml_errors
+    finally:dispose(host)
+
+
+@pytest.mark.integration
 @pytest.mark.parametrize('width,height,dark', [(1120,1000,False),pytest.param(520,900,False,marks=pytest.mark.essential),(1120,1000,True)])
 def test_responsive_page_chart_and_single_details_path(quota_page,tmp_path,width,height,dark):
     app,panel,scroll=quota_page
@@ -53,7 +83,21 @@ def test_responsive_page_chart_and_single_details_path(quota_page,tmp_path,width
         remaining=[row['remaining'] for row in panel.history.rows]
         assert 0<panel.history.axis[0]<min(remaining)
         assert panel.history.axis[1]>max(remaining)
-        assert '9%' in panel.summary_text.text()
+        assert panel.summary_values['usage'].text()=='9%'
+        cards=[scene_view(host,node) for node in panel.summary_cards.values()]
+        positions=[card.mapToScene(QPointF()) for card in cards]
+        assert positions[0].y()==pytest.approx(positions[1].y())
+        assert positions[2].y()==pytest.approx(positions[3].y())
+        if width<1000:
+            assert positions[2].y()>positions[0].y()+cards[0].height()
+            assert positions[2].x()==pytest.approx(positions[0].x())
+        else:
+            assert positions[2].y()==pytest.approx(positions[0].y())
+        for card in cards:assert card.width()==pytest.approx(cards[0].width(),abs=1)
+        for node in panel.summary_values.values():
+            text=next(item for item in walk(control(host,node))
+                      if item.metaObject().indexOfProperty('contentWidth')>=0)
+            assert text.property('contentWidth')<=text.width()+1
         assert all(r['local_observed'] for r in panel.history.rows)
         assert panel.cycle_choice.count()==4
         assert panel.cycle_choice.currentData()==max(p['start'] for p in panel._view['periods'])
@@ -246,8 +290,15 @@ def test_credit_balance_drops_only_trailing_fractional_zeros(raw,expected):
     assert credits['balance']==raw
 
 
-def test_current_quota_refresh_keeps_history_until_report_or_issue_changes(quota_page,monkeypatch):
+@pytest.mark.parametrize('compact',[False,True])
+def test_current_quota_refresh_keeps_history_until_report_or_issue_changes(quota_page,monkeypatch,compact):
     _,panel,_=quota_page
+    started=panel.report['tracking']['started']-3600
+    panel.report['tracking']['started']=started
+    if compact:
+        from cachemonitor.quota_worker import compact_report
+        panel.receive(dict(home='h',quota=panel.quota,report=compact_report(panel.report,'test')))
+    monkeypatch.setattr('cachemonitor.quota_layout.time',lambda:started+72*3600)
     rendered=[]
     original=panel.render
     def render(*args,**kwargs):
@@ -258,7 +309,16 @@ def test_current_quota_refresh_keeps_history_until_report_or_issue_changes(quota
     quota={**panel.quota,'observed_at':panel.quota['observed_at']+1}
     assert panel.receive(dict(home='h',quota=quota,report=panel.report))
     assert panel.quota is quota and panel.history.cursor==0 and not rendered
+    assert panel.summary_values['elapsed'].text()=='72 hr'
+    monkeypatch.setattr('cachemonitor.quota_layout.time',lambda:started+72.5*3600)
+    assert panel.receive(dict(home='h',quota=quota,report=panel.report))
+    assert panel.summary_values['elapsed'].text()=='72.5 hr' and not rendered
     assert panel.receive(dict(home='h',quota=quota,report=panel.report,issue='조회 지연'))
     assert len(rendered)==1 and panel.status.text()=='조회 지연'
     assert panel.receive(dict(home='h',quota=quota,report=dict(panel.report),issue='조회 지연'))
     assert len(rendered)==2
+    # A period boundary cannot substitute for an unknown measurement start.
+    panel.report.pop('tracking',None)
+    panel.report['view'].pop('tracking_started',None)
+    panel.update_summary()
+    assert panel.summary_values['elapsed'].text()=='—'

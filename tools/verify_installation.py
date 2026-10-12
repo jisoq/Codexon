@@ -19,6 +19,7 @@ from contextlib import contextmanager
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from cachemonitor.observer_state import read_json
 from tools.installer_identity import require_qa_installer
+from tools.check_processes import register_root
 
 KEY=r'Software\Codexon-QA'
 
@@ -144,6 +145,7 @@ def main():
     if args.broken_installer:require_qa_installer(args.broken_installer)
     if registration():raise RuntimeError('An existing QA installation must be preserved; use a clean QA environment')
     root=args.output.resolve();root.mkdir(parents=True,exist_ok=False)
+    register_root(root)
     # Exercise paths that cannot round-trip through the current ANSI code page.
     download=root/'download \u6e2c\u8a66\U0001f642'
     download.mkdir()
@@ -153,9 +155,11 @@ def main():
     # Keep installed Qt resource paths within Windows' installer path limit.
     # Evidence paths may be descriptive and much longer than the install root.
     install=Path(__file__).resolve().parents[1]/'artifacts'/('qa-'+uuid.uuid4().hex[:8])
+    register_root(install)
     (root/'install-location.json').write_text(json.dumps({'root':str(install)}))
     if args.broken_installer:
         broken=install.with_name(install.name+'-f')
+        register_root(broken)
         assert run([args.broken_installer.resolve(),'/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',
                     f'/DIR={broken}',f'/LOG={root / "failed-first.log"}'])!=0
         assert not registration()
