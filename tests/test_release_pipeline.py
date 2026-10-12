@@ -301,9 +301,9 @@ def test_publish_failure_does_not_discard_successfully_verified_installer(root):
 
 
 @pytest.mark.parametrize('branch', ['main', 'codex/verification'])
-def test_source_success_survives_install_failure_but_invalid_environment_does_not(root, monkeypatch, branch):
+@pytest.mark.parametrize('base', ['b' * 40, SHA])
+def test_source_success_survives_install_failure_but_invalid_environment_does_not(root, monkeypatch, branch, base):
     from tools import source_receipt
-    base = 'b' * 40
     record = {**run_record(), 'head_sha': base, 'head_branch': branch, 'conclusion': 'failure'}
     receipt = dict(schema=1, policy=source_receipt.POLICY, commit=base, run_id='10',
                    environment=source_receipt.environment_key(root), complete=True,
@@ -321,6 +321,9 @@ def test_source_success_survives_install_failure_but_invalid_environment_does_no
     monkeypatch.setattr(pipeline.subprocess, 'run', lambda *a, **kw: SimpleNamespace(returncode=0))
     github = SourceGitHub([record])
     assert pipeline.source_base(github, SHA, root, branch=branch) == base
+    assert pipeline.source_base(github, SHA, root, branch=branch, current_run='10') == ''
+    assert pipeline.plan(github, SHA, '20', 'workflow_dispatch', 'refs/heads/' + branch,
+                         False, root, prepare=True)['source_base'] == base
     assert pipeline.verified_base(github, SHA, root, branch=branch) == ''
     assert pipeline.trusted(record, base, github.repository) == (branch == 'main')
     (root/'requirements-release.lock').write_text('changed environment')

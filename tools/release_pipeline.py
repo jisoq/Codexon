@@ -42,12 +42,13 @@ def verification_passed(github, run_id):
     return any(j['name'] == 'verify' and j['conclusion'] == 'success' for j in jobs)
 
 
-def source_base(github, sha, root=ROOT, *, branch='main'):
+def source_base(github, sha, root=ROOT, *, branch='main', current_run=''):
     # A downstream failure or cancellation must not erase a completed source job.
     runs = github.api(f'actions/workflows/windows.yml/runs?branch={quote(branch, safe="")}&per_page=100')['workflow_runs']
     for run in sorted(runs, key=lambda r: r['id'], reverse=True):
         base = run.get('head_sha', '')
-        if base == sha or not re.fullmatch(r'[0-9a-f]{40}', base) or not trusted_checks(run, base, github.repository, branch):
+        if (str(run['id']) == str(current_run) or not re.fullmatch(r'[0-9a-f]{40}', base)
+                or not trusted_checks(run, base, github.repository, branch)):
             continue
         ancestry = subprocess.run(['git', 'merge-base', '--is-ancestor', base, sha], cwd=root, capture_output=True)
         if ancestry.returncode in (1, 128):
@@ -150,15 +151,15 @@ def plan(github, sha, current_run, event, ref, publish, root=ROOT, *, prepare=Fa
         raise ValueError('Prepare this exact commit with prepare=true before publishing; no verified installer is available')
     source = deployment = ''
     if branch and not (reuse or published):
-        source = source_base(github, sha, root, branch=branch)
+        source = source_base(github, sha, root, branch=branch, current_run=current_run)
         deployment = verified_base(github, sha, root, branch=branch)
         if branch != 'main':
-            source = source or source_base(github, sha, root)
+            source = source or source_base(github, sha, root, current_run=current_run)
             deployment = deployment or verified_base(github, sha, root)
     elif event == 'pull_request' and head_branch:
         # A branch dispatch's tested ancestor also covers a later PR merge tree.
         # Fork jobs themselves never become trusted shared receipts.
-        source = source_base(github, sha, root, branch=head_branch)
+        source = source_base(github, sha, root, branch=head_branch, current_run=current_run)
     return dict(version=current, release_tag=tag, candidate=candidate, published=published,
                 reuse_run=reuse, verify=not (reuse or published),
                 source_base=source, base=deployment)
