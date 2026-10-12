@@ -518,7 +518,8 @@ def package_check(executable, report_dir):
 
 def pytest_commands(tests, *, integration=False, extended=False, report_dir=None):
     """Run selected UI checks together on the hidden desktop."""
-    pytest = [sys.executable, '-B', '-m', 'pytest', '-q', '--tb=short', '--maxfail=1', '--durations=10']
+    pytest = [sys.executable, '-u', '-B', '-m', 'pytest', '-v', '--tb=short', '--maxfail=1', '--durations=10',
+              '-o', 'faulthandler_timeout=60']
     if extended:
         pytest += ['-m', 'extended or not extended']
     elif integration or tuple(tests) != ('tests',):
@@ -529,6 +530,15 @@ def pytest_commands(tests, *, integration=False, extended=False, report_dir=None
                    '-o', 'cache_dir=' + str(REPORTS / 'pytest-cache')]
     runner = [sys.executable, str(ROOT / 'tools/run_ui_checks.py')]
     return [('native', [*runner, '--', *pytest, *tests])] if tests else []
+
+
+def run_logged(command, path):
+    # Persist each test as it runs, including stack dumps on a stalled test.
+    # A detached descendant retaining stdout must not hold a capture pipe open.
+    with path.open('w', encoding='utf-8') as output:
+        result=subprocess.run(command, cwd=ROOT, stdout=output, stderr=subprocess.STDOUT)
+    result.stdout=path.read_text(encoding='utf-8',errors='replace')
+    return result
 
 
 def main(argv=None):
@@ -599,10 +609,9 @@ def main(argv=None):
         for name, command in pytest_commands(plan['tests'], integration=args.integration,
                                              extended=args.extended, report_dir=folder):
             run_started = time.monotonic()
-            result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
-            output = result.stdout + '\n' + result.stderr
             run_log = folder / f'pytest-{name}.log'
-            run_log.write_text(output, encoding='utf-8')
+            result = run_logged(command, run_log)
+            output = result.stdout
             report['logs'].append(str(run_log))
             outputs.append(f'[{name}]\n{output}')
             runs.append(dict(environment=name, exit_code=result.returncode,

@@ -7,6 +7,17 @@ import pytest
 from tools.verify_changes import ROOT, GROUPS, changed_files, pytest_commands, select_tests
 
 
+def test_failed_check_retains_stdout_and_stderr(tmp_path):
+    import sys
+    from tools.verify_changes import run_logged
+    log=tmp_path/'pytest-native.log'
+    result=run_logged([sys.executable,'-u','-c',
+        "import sys; print('started check'); print('failure detail',file=sys.stderr); sys.exit(7)"],log)
+    assert result.returncode==7
+    assert 'started check' in log.read_text(encoding='utf-8')
+    assert 'failure detail' in result.stdout
+
+
 def test_small_ui_changes_select_their_consumer_without_backend_or_package_checks():
     examples = {
         'cachemonitor/qml/OverlayControls.qml': 'tests/test_overlay_controls.py',
