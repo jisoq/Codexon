@@ -43,6 +43,36 @@ def quota_page(tmp_path):
 
 
 @pytest.mark.integration
+@pytest.mark.essential
+def test_large_summary_values_fit_compact_cards(quota_page,tmp_path):
+    from cachemonitor.pricing import usd
+    app,panel,scroll=quota_page
+    host=mount(scroll,520,900)
+    try:
+        for amount in (1_000_000,1e30):
+            panel.lifetime_statistics['cost']=amount
+            panel.lifetime_value=amount
+            panel.update_summary()
+            for key in ('cost','weekly'):
+                node=panel.summary_values[key]
+                text=next(item for item in walk(control(host,node))
+                          if item.metaObject().indexOfProperty('contentWidth')>=0)
+                def fits():
+                    return (text.property('text')==usd(amount) and
+                            text.property('contentWidth')<=text.width()+1 and
+                            text.property('contentHeight')<=text.height()+1)
+                deadline=time.monotonic()+2
+                while not fits() and time.monotonic()<deadline:
+                    app.processEvents();QTest.qWait(10)
+                assert node.text()==usd(amount)
+                assert fits()
+                if amount==1_000_000:assert text.property('lineCount')==1
+            assert host.grab().save(str(tmp_path/f'quota-large-{amount}.png'))
+        assert not host.qml_errors
+    finally:dispose(host)
+
+
+@pytest.mark.integration
 @pytest.mark.parametrize('width,height,dark', [(1120,1000,False),pytest.param(520,900,False,marks=pytest.mark.essential),(1120,1000,True)])
 def test_responsive_page_chart_and_single_details_path(quota_page,tmp_path,width,height,dark):
     app,panel,scroll=quota_page

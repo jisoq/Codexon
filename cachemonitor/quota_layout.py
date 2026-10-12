@@ -39,7 +39,7 @@ def configure_quota_layout(panel):
         card=Group();card.put(background='secondary',radius=12)
         content=Column(card);content.setContentsMargins(20,20,20,20);content.setSpacing(12)
         label=Text(title);label.put(fontSize=16,color='muted',wrap=True)
-        number=Text();number.put(fontSize=32,bold=True,color='ink',noElide=True)
+        number=Text();number.put(fontSize=32,bold=True,color='ink',noElide=True,wrap=True,fitText=True)
         content.addWidget(label);content.addWidget(number);pair.addWidget(card,1)
         panel.summary_cards[key]=card;panel.summary_values[key]=number
     panel.summary_values['elapsed'].setToolTip('측정 시작부터 현재까지의 경과 시간입니다. 측정 중지와 수집 공백을 포함합니다.')

@@ -179,6 +179,8 @@ Item {
                 wrapMode: view.s.wrap ? Text.Wrap : Text.NoWrap
                 elide: view.s.wrap || view.s.noElide ? Text.ElideNone : Text.ElideRight
                 font.family: view.s.fontFamily || appTheme.family; font.pixelSize: view.s.fontSize; font.bold: view.s.bold
+                fontSizeMode: view.s.fitText ? Text.HorizontalFit : Text.FixedSize
+                minimumPixelSize: view.s.fitText ? 16 : 12
                 color: appTheme.palette && appTheme.color(view.s.color)
                 horizontalAlignment: view.s.alignment & Qt.AlignRight ? Text.AlignRight : view.s.alignment & Qt.AlignHCenter ? Text.AlignHCenter : Text.AlignLeft
                 linkColor: (appTheme.palette && appTheme.color("accent"))
