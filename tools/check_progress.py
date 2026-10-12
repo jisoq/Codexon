@@ -7,6 +7,16 @@ from pathlib import Path
 import pytest
 
 
+@pytest.hookimpl(hookwrapper=True)
+def pytest_fixture_setup(fixturedef, request):
+    outcome = yield
+    if fixturedef.argname == 'tmp_path_factory' and os.environ.get('CODEXON_CHECK_DIAGNOSTICS'):
+        from tools.check_processes import register_root
+        # Pytest allocates this session-owned directory before any test starts
+        # a scheduled task. Include both tmp_path and mktemp descendants.
+        register_root(outcome.get_result().getbasetemp())
+
+
 def phase(item, name):
     event = dict(test=item.nodeid, phase=name, started=datetime.now(timezone.utc).isoformat(), pid=os.getpid())
     folder = os.environ.get('CODEXON_CHECK_DIAGNOSTICS')

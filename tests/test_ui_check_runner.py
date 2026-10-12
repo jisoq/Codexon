@@ -153,40 +153,50 @@ def test_pytest_phase_is_visible_before_a_hung_test_exits(tmp_path):
     assert 'setup' in log.read_text() and 'call' in log.read_text()
 
 
-def test_scheduler_process_is_tracked_by_its_fresh_scope(tmp_path):
+@pytest.mark.parametrize('mode,expected', [('orphan', 1), ('hang', 124)])
+def test_scheduler_process_is_tracked_by_its_fresh_scope(tmp_path, mode, expected):
     from cachemonitor.observer_task import ObserverTask
-    scope = tmp_path / 'external'; scope.mkdir()
-    leaf = scope / 'leaf.py'
-    ready = scope / 'ready'
-    leaf.write_text('import time, subprocess, sys\nfrom pathlib import Path\n'
+    from tools.check_processes import clear_scopes
+    ready = tmp_path / 'ready'
+    scope_file = tmp_path / 'scope.txt'
+    leaf_source = ('import time, subprocess, sys\nfrom pathlib import Path\n'
                    "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])\n"
                    f'Path({str(ready)!r}).write_text(str(child.pid))\ntime.sleep(120)\n')
     probe = tmp_path / 'scheduler_probe.py'
     probe.write_text(textwrap.dedent(f'''
         import sys, time
         from pathlib import Path
-        from tools.check_processes import register_root
         from cachemonitor.observer_task import ObserverTask
-        register_root({str(scope)!r})
-        task = ObserverTask({str(scope)!r}, role='RunnerQA')
-        task.start([sys.executable, {str(leaf)!r}])
-        deadline = time.monotonic() + 10
-        while not Path({str(ready)!r}).exists():
-            if time.monotonic() >= deadline: raise RuntimeError('Scheduled probe did not start')
-            time.sleep(.05)
+        def test_scheduled_process(tmp_path):
+            scope = tmp_path / 'external'; scope.mkdir()
+            Path({str(scope_file)!r}).write_text(str(scope))
+            leaf = scope / 'leaf.py'; leaf.write_text({leaf_source!r})
+            task = ObserverTask(str(scope), role='RunnerQA')
+            task.start([sys.executable, str(leaf)])
+            deadline = time.monotonic() + 10
+            while not Path({str(ready)!r}).exists():
+                if time.monotonic() >= deadline: raise RuntimeError('Scheduled probe did not start')
+                time.sleep(.05)
+            if {mode!r} == 'hang': time.sleep(120)
     '''))
     evidence = tmp_path / 'evidence'
-    task = ObserverTask(str(scope), role='RunnerQA')
     try:
         result = subprocess.run([sys.executable, str(ROOT / 'tools/run_ui_checks.py'),
-            '--timeout', '20', '--diagnostics', str(evidence), '--', sys.executable, str(probe)],
+            '--timeout', '20', '--diagnostics', str(evidence), '--', sys.executable,
+            '-m', 'pytest', '-p', 'tools.check_progress', '-o', 'addopts=', str(probe)],
             capture_output=True, text=True, timeout=40)
-        assert result.returncode == 1, result.stderr
+        assert result.returncode == expected, result.stdout + result.stderr
+        task = ObserverTask(scope_file.read_text(), role='RunnerQA')
         report = json.loads((evidence / 'result.json').read_text())
-        assert report['reason'] == 'external_descendants_remain'
+        assert report['reason'] == ('deadline' if mode == 'hang' else 'external_descendants_remain')
         assert report['external']['processes']
         assert int(ready.read_text()) in {process['pid'] for process in report['external']['processes']}
         assert task.name in {task['name'] for task in report['external']['tasks']}
         assert not task.inspect()['registered']
     finally:
-        task.stop(); task.remove()
+        if scope_file.exists():
+            # Keep a failing regression run safe even if automatic registration
+            # breaks. This fallback runs only after inspecting runner evidence.
+            fallback = tmp_path/'fallback'; fallback.mkdir()
+            (fallback/'owner-scheduler.json').write_text(json.dumps({'root': scope_file.read_text()}))
+            clear_scopes(fallback)

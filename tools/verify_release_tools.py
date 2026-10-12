@@ -9,6 +9,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from tools.release_pipeline import version
+from tools.check_processes import register_root
 
 # Reuse is valid only when every packaged input still matches the public tag.
 INPUTS = ('cachemonitor/*', 'icons/*', 'LICENSES/*', 'requirements*', '*.spec', 'build*.ps1',
@@ -59,6 +60,11 @@ def main():
     if not can_reuse():
         raise ValueError('Packaged inputs changed; build the current product before running QA tools')
     names = json.loads(args.plan.read_text(encoding='utf-8-sig'))['qa_smokes']
+    # Claim a fresh scope before downloads or QA children start, including
+    # invocations using the default output instead of an explicit --output.
+    args.output = args.output.resolve()
+    args.output.mkdir(parents=True, exist_ok=False)
+    register_root(args.output)
     def published(tag, destination):
         subprocess.run([sys.executable, str(ROOT/'tools/prepare_legacy_release.py'),
                         '--tag', tag, '--output', str(destination)], check=True, cwd=ROOT)

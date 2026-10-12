@@ -159,6 +159,33 @@ def test_reusing_a_public_binary_requires_unchanged_packaged_inputs(root, monkey
     assert verify_release_tools.can_reuse(root) is expected
 
 
+def test_reused_qa_registers_its_default_scope_before_starting_children(tmp_path, monkeypatch):
+    evidence = tmp_path/'evidence'; evidence.mkdir()
+    plan = tmp_path/'plan.json'
+    plan.write_text(json.dumps({'qa_smokes': ['recovery']}))
+    monkeypatch.setenv('CODEXON_CHECK_DIAGNOSTICS', str(evidence))
+    monkeypatch.setattr(verify_release_tools, 'ROOT', tmp_path)
+    monkeypatch.setattr(verify_release_tools, 'can_reuse', lambda: True)
+    monkeypatch.setattr(verify_release_tools, 'version', lambda: '2026.10.12.1')
+    monkeypatch.setattr(verify_release_tools.sys, 'argv', ['verify_release_tools.py', '--plan', str(plan)])
+    output = tmp_path/'artifacts/verification/changed-release-tools'
+    launched = []
+    def launch(command, **kwargs):
+        assert output.is_dir()
+        assert [json.loads(path.read_text())['root'] for path in evidence.glob('owner-*.json')] == [str(output)]
+        launched.append(command)
+        if '--tag' in command:
+            target = Path(command[command.index('--output') + 1]); target.mkdir()
+            (target/'result.json').write_text(json.dumps({'executable': str(target/'Codexon.exe')}))
+    monkeypatch.setattr(verify_release_tools.subprocess, 'run', launch)
+    verify_release_tools.main()
+    assert len(launched) == 2
+    # Never claim a pre-existing directory, even when it has the default name.
+    with pytest.raises(FileExistsError):
+        verify_release_tools.main()
+    assert len(launched) == 2
+
+
 def test_workflow_preserves_successful_jobs_and_publishes_the_retained_artifact():
     workflow = (pipeline.ROOT/'.github/workflows/windows.yml').read_text()
     assert "format('ci-{0}', github.event.pull_request.number || github.ref)" in workflow

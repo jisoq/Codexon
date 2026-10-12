@@ -76,7 +76,14 @@ $report | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $Evidenc
 try {
     foreach ($task in $tasks) { $task.Stop(0); $folder.DeleteTask($task.Name, 0) }
     foreach ($process in $processes) {
-        if (!$process.HasExited) { $process.Kill() }
+        if (!$process.HasExited) {
+            try { $process.Kill() }
+            catch [ComponentModel.Win32Exception] {
+                # Task.Stop can terminate this process between HasExited and
+                # Kill. Ignore the error only after the retained handle exits.
+                if (!$process.WaitForExit(2000)) { throw }
+            }
+        }
     }
     foreach ($process in $processes) {
         if (!$process.WaitForExit(2000)) { throw 'Owned external process did not exit' }
