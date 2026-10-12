@@ -180,6 +180,12 @@ def test_taskbar_data_visibility_menu_and_persistence(tmp_path, monkeypatch, own
         w.refresh_tray()
         assert indicator.value.text() == '84%'
         assert '84%' in indicator.toolTip()
+        tray_icon_key = w.tray.icon().cacheKey()
+        w.snapshot['quota_by_home'][w.observer_home]['windows']['weekly']['used_percent'] = 17
+        w.refresh_tray()
+        assert indicator.value.text() == '83%'
+        assert '83%' in indicator.toolTip() and '83%' in w.tray.toolTip()
+        assert w.tray.icon().cacheKey() == tray_icon_key
         w.show()
         w.close()
         assert not w.isVisible() and indicator.isVisible()
@@ -196,6 +202,7 @@ def test_taskbar_data_visibility_menu_and_persistence(tmp_path, monkeypatch, own
         w.snapshot['quota_by_home'][w.observer_home]['windows']['weekly']['used_percent'] = 95
         w.refresh_tray()
         assert indicator.value.text() == '5%' and indicator._warning
+        assert w.tray.icon().cacheKey() != tray_icon_key
         w.snapshot['quota_by_home'][w.observer_home]['windows']['weekly']['resets_at'] = now - 1
         w.snapshot['quota_by_home'][w.observer_home]['observed_at'] = now - 2  # No server observation since this reset.
         w.refresh_tray()

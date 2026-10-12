@@ -6,7 +6,8 @@ from pathlib import Path
 from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
 from .quick_runtime import QuickHost
 from .quota import quota_display
-from .icons import tray_icon
+from .icons import notification_icon, tray_icon
+from .theme import shared_theme
 from .i18n import tr
 from .app_shutdown import ExitConnectionCheck, ExitConfirmation, ShutdownProgress
 from .taskbar import TaskbarQuota
@@ -23,7 +24,7 @@ class ChatGPTDiscovery(QThread):
 
 class TrayWindow(QuickHost):
     def setup_tray(self):
-        self.tray = QSystemTrayIcon(tray_icon(), self)
+        self.tray = QSystemTrayIcon(notification_icon(), self)
         menu = QMenu()
         menu.addAction(tr("대시보드 열기"), self.show_window)
         menu.addSeparator()
@@ -90,10 +91,10 @@ class TrayWindow(QuickHost):
         error=bool(self.snapshot.get('errors')) or bool(getattr(self,'analysis_errors',[]))
         warning=any(s.get('warning') for s in self.snapshot.get('sessions',[]))
         if display['remaining'] is not None and display['remaining']<10: warning=True
-        signature=(display['text'],error,warning)
-        if signature!=getattr(self,'_quota_icon_signature',None):
-            self._quota_icon_signature=signature
-            self.tray.setIcon(tray_icon(error=error,warning=warning,text=display['text']))
+        signature=(shared_theme().dark,error,warning)
+        if signature!=getattr(self,'_tray_icon_signature',None):
+            self._tray_icon_signature=signature
+            self.tray.setIcon(notification_icon(error=error,warning=warning))
         tip=display['tooltip']
         if error: tip+='\n수집과 분석 상태 확인 필요'
         if len(self.snapshot.get('homes',[]))>1: tip+='\n한도 기준: 첫 번째 Codex 홈'
