@@ -70,7 +70,7 @@ public class Launcher {
     $env:CODEXON_QA_PACKAGE_FAMILY=$package.PackageFamilyName
     $env:CODEXON_QA_PACKAGE_LAUNCHER=Join-Path $package.InstallLocation 'Launcher.exe'
     $env:CODEXON_QA_PACKAGE_REPORTS=$reports
-    & $Python -B tools/run_ui_checks.py -- $Python -B tools/verify_installation.py --installer $Installer --broken-installer $BrokenInstaller --output (Join-Path $root 'installation')
+    & $Python -B tools/run_ui_checks.py --kind installation -- $Python -B tools/verify_installation.py --installer $Installer --broken-installer $BrokenInstaller --output (Join-Path $root 'installation')
     if ($LASTEXITCODE) { throw 'MSIX-origin installation checks failed' }
 } finally {
     try {

@@ -138,7 +138,13 @@ def test_extended_checks_are_explicit_and_each_run_retains_test_timings(tmp_path
     assert 'extended or not extended' in extended
     assert 'not extended' in affected and 'not extended' in integration
     assert 'not extended' not in default
-    assert '--junitxml=' + str(tmp_path/'tests.xml') in default
+    assert '--junitxml=' + str(tmp_path/'tests-core.xml') in default
+    commands = pytest_commands(['tests'], report_dir=tmp_path)
+    assert [kind for kind, _ in commands] == ['core', 'gui', 'installation']
+    assert '--no-desktop' in commands[0][1]
+    assert all('--no-desktop' not in command for _, command in commands[1:])
+    targets = [part for _, command in commands for part in command if part.startswith('tests/test_')]
+    assert len(targets) == len(set(targets))
 
 
 @pytest.mark.parametrize('path,candidate,package,proxy,msix', [

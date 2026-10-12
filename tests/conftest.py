@@ -18,19 +18,31 @@ def isolate_installed_proxy(monkeypatch):
 
 
 def pytest_addoption(parser):
+    parser.addoption('--check-kind', choices=('core', 'gui', 'installation'), default='gui',
+                     help='Core checks must not load Qt or change native window state')
     parser.addoption('--live-taskbar', action='store_true', default=False,
                      help='Run Explorer integration tests on a disposable Windows desktop only')
 
 
 def pytest_configure(config):
+    config.addinivalue_line('markers', 'live_taskbar: requires a disposable Windows desktop')
+    if config.getoption('--check-kind') == 'core':
+        return
     from cachemonitor.fonts import configure_font_rendering, configure_high_dpi
     configure_font_rendering()
     configure_high_dpi()
-    config.addinivalue_line('markers', 'live_taskbar: requires a disposable Windows desktop')
+
+
+def pytest_sessionfinish(session, exitstatus):
+    if session.config.getoption('--check-kind') == 'core' and any(name.startswith('PySide6') for name in sys.modules):
+        session.config.pluginmanager.getplugin('terminalreporter').write_line('Core checks imported Qt; move this contract to the GUI group.')
+        session.exitstatus = 1
 
 
 @pytest.fixture(autouse=True)
 def isolate_taskbar(request, monkeypatch):
+    if request.config.getoption('--check-kind') == 'core':
+        return
     if request.node.get_closest_marker('live_taskbar'):
         if not request.config.getoption('--live-taskbar'):
             pytest.skip('Live Explorer test excluded; use a disposable Windows desktop')

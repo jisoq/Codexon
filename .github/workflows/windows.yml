@@ -5,6 +5,10 @@ on:
   pull_request:
   workflow_dispatch:
     inputs:
+      prepare:
+        description: Prepare and verify a candidate at this exact branch commit (publication requires main)
+        type: boolean
+        default: false
       publish:
         description: Publish the verified main commit, reusing its successful build
         type: boolean
@@ -13,25 +17,26 @@ on:
         description: Run large-data benchmarks and all compatibility checks explicitly
         type: boolean
         default: false
+      exercise_rerun:
+        description: Exercise package-job recovery with one intentional failure (non-main branches only)
+        type: boolean
+        default: false
 permissions:
   contents: read
   actions: read
-# A release request waits for the push check of this exact commit.
+# Ordinary branch/PR work is replaceable. Explicit release requests have their
+# own run group, so even a pending candidate is protected from a newer push.
 concurrency:
-  group: windows-${{ github.ref }}-${{ github.sha }}
-  cancel-in-progress: false
+  group: windows-${{ (inputs.prepare || inputs.publish) && format('release-{0}-{1}', github.sha, github.run_id) || format('ci-{0}', github.event.pull_request.number || github.ref) }}
+  cancel-in-progress: ${{ !(inputs.prepare || inputs.publish) }}
 env:
   PYTHONUTF8: '1'
   PYTHONIOENCODING: utf-8
 jobs:
   resolve:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     outputs:
-      verify: ${{ steps.release.outputs.verify }}
-      candidate: ${{ steps.release.outputs.candidate }}
-      reuse_run: ${{ steps.release.outputs.reuse_run }}
-      published: ${{ steps.release.outputs.published }}
-      base: ${{ steps.release.outputs.base }}
+      plan: ${{ steps.plan.outputs.plan }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -39,19 +44,37 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12.10'
-      - name: Resolve the exact commit's verified release
+      - name: Resolve source and release verification independently
         id: release
         env:
           GH_TOKEN: ${{ github.token }}
           REQUEST_PUBLISH: ${{ inputs.publish || false }}
-        run: python tools/release_pipeline.py plan --publish "$REQUEST_PUBLISH"
-  verify:
+          REQUEST_PREPARE: ${{ inputs.prepare || false }}
+          EXERCISE_RERUN: ${{ inputs.exercise_rerun || false }}
+        run: python tools/release_pipeline.py plan --publish "$env:REQUEST_PUBLISH" --prepare "$env:REQUEST_PREPARE" --exercise-rerun "$env:EXERCISE_RERUN"
+      - name: Plan source and deployment checks from their own baselines
+        id: plan
+        shell: pwsh
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PACKAGE_BASE: ${{ steps.release.outputs.base }}
+          SOURCE_BASE: ${{ steps.release.outputs.source_base }}
+          RELEASE_CANDIDATE: ${{ steps.release.outputs.candidate }}
+          EXTENDED: ${{ inputs.extended || false }}
+        run: |
+          $packageBase = if ($env:EVENT_NAME -eq 'pull_request') { $env:PR_BASE } else { $env:PACKAGE_BASE }
+          $sourceBase = if ($env:SOURCE_BASE) { $env:SOURCE_BASE } elseif ($env:EVENT_NAME -eq 'pull_request') { $env:PR_BASE } else { '' }
+          python tools/ci_plan.py "--base=$packageBase" "--source-base=$sourceBase" --candidate "$env:RELEASE_CANDIDATE" --extended "$env:EXTENDED" --release-plan artifacts/verification/release-plan.json
+          exit $LASTEXITCODE
+  source:
     needs: resolve
-    if: needs.resolve.outputs.verify == 'true' || inputs.extended
+    if: fromJSON(needs.resolve.outputs.plan).verify
     runs-on: windows-latest
     timeout-minutes: 25
     env:
       CODEXON_CPU_BACKEND: rust
+      CHECK_PLAN: ${{ needs.resolve.outputs.plan }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -65,59 +88,89 @@ jobs:
         run: python -m pip install -r requirements-release.lock
       - name: Check source and test environment before running checks
         run: python tools/check_environment.py
-      - name: Plan checks against the actual change base
-        id: plan
+      - name: Restore the immutable check plan
         shell: pwsh
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          PR_BASE: ${{ github.event.pull_request.base.sha }}
-          PUSH_BASE: ${{ needs.resolve.outputs.base }}
-          RELEASE_CANDIDATE: ${{ needs.resolve.outputs.candidate }}
-          EXTENDED: ${{ inputs.extended || false }}
         run: |
-          $base = if ($env:EVENT_NAME -eq 'pull_request') { $env:PR_BASE } else { $env:PUSH_BASE }
-          python tools/ci_plan.py "--base=$base" --candidate "$env:RELEASE_CANDIDATE" --extended "$env:EXTENDED"
-          exit $LASTEXITCODE
+          New-Item -ItemType Directory -Force artifacts/verification | Out-Null
+          $env:CHECK_PLAN | Set-Content -Encoding utf8 artifacts/verification/plan.json
       - name: Build and test the locked Rust extension
-        if: steps.plan.outputs.rust == 'true'
+        if: fromJSON(needs.resolve.outputs.plan).rust
         run: python tools/build_native.py --test
-      - name: Check changed dependencies for vulnerabilities
-        if: steps.plan.outputs.dependencies == 'true'
-        run: |
-          python -m pip install pip-audit
-          python -m pip_audit -r requirements-release.lock
       - name: Run selected source checks
         timeout-minutes: 15
         shell: pwsh
         run: |
-          $plan = Get-Content artifacts/verification/plan.json -Raw | ConvertFrom-Json
+          $plan = $env:CHECK_PLAN | ConvertFrom-Json
           [string[]]$checkArgs = $plan.source_args
           python tools/verify_changes.py @checkArgs
           exit $LASTEXITCODE
-      - name: Check changed QA tools with the matching published binary
-        if: steps.plan.outputs.qa_reuse == 'true'
-        run: python tools/run_ui_checks.py -- python tools/verify_release_tools.py --plan artifacts/verification/plan.json
       - name: Check overlay native scaling
-        if: steps.plan.outputs.scales == 'true'
+        if: fromJSON(needs.resolve.outputs.plan).scales
+        timeout-minutes: 5
         shell: pwsh
         run: |
           $failed = $false
           foreach ($scale in @('1.25', '2')) {
             $env:CODEXON_OVERLAY_QA_OUTPUT = "artifacts/verification/overlay-scale-$scale"
-            python tools/run_ui_checks.py --scale $scale -- python -m pytest -q tests/test_overlay_resilience.py::test_auto_fallback_restores_preference_anchor_and_clickthrough --junitxml="artifacts/verification/overlay-scale-$scale.xml"
+            python tools/run_ui_checks.py --timeout 120 --scale $scale -- python -m pytest -p tools.check_progress -q tests/test_overlay_resilience.py::test_auto_fallback_restores_preference_anchor_and_clickthrough --junitxml="artifacts/verification/overlay-scale-$scale.xml"
             if ($LASTEXITCODE -ne 0) { $failed = $true }
           }
           if ($failed) { exit 1 }
+      - name: Record successful source coverage before deployment checks
+        run: python tools/release_pipeline.py source-receipt --folder artifacts/source-receipt
+      - uses: actions/upload-artifact@v7
+        with:
+          name: source-verified-${{ github.sha }}
+          path: artifacts/source-receipt/source-verification.json
+          retention-days: 30
+          overwrite: true
+          if-no-files-found: error
+      - name: Upload synthetic verification evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: source-${{ github.run_attempt }}
+          path: |
+            artifacts/verification/**/*.json
+            artifacts/verification/**/*.xml
+            artifacts/verification/**/*.png
+            artifacts/verification/**/*.log
+          retention-days: 7
+          if-no-files-found: ignore
+  package_build:
+    needs: [resolve, source]
+    if: fromJSON(needs.resolve.outputs.plan).package
+    runs-on: windows-latest
+    timeout-minutes: 25
+    env:
+      CHECK_PLAN: ${{ needs.resolve.outputs.plan }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12.10'
+          cache: pip
+          cache-dependency-path: requirements-release.lock
+      - name: Install locked dependencies
+        run: python -m pip install -r requirements-release.lock
+      - name: Check source and test environment before running checks
+        run: python tools/check_environment.py
+      - name: Restore the immutable check plan
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force artifacts/verification | Out-Null
+          $env:CHECK_PLAN | Set-Content -Encoding utf8 artifacts/verification/plan.json
+      - name: Check changed dependencies for vulnerabilities
+        if: fromJSON(needs.resolve.outputs.plan).dependencies
+        run: |
+          python -m pip install pip-audit
+          python -m pip_audit -r requirements-release.lock
       - name: Build Windows package
-        if: steps.plan.outputs.package == 'true'
         shell: pwsh
         run: .\build.ps1 -DistPath dist-ci -WorkPath build-ci -PythonPath ((Get-Command python).Source)
-      - name: Check independent offline recovery
-        if: steps.plan.outputs.package == 'true'
-        run: |
-          python tools/run_ui_checks.py -- python tools/verify_recovery.py --executable dist-ci/Codexon/CodexonRecovery.exe --output artifacts/verification/recovery-en --language en
       - name: Build isolated installer
-        if: steps.plan.outputs.package == 'true'
         shell: pwsh
         run: |
           $compiler = Get-ChildItem "${env:ProgramFiles(x86)}\Inno Setup*\ISCC.exe" | Select-Object -First 1
@@ -126,18 +179,92 @@ jobs:
           python tools/prepare_bad_runtime.py --product dist-ci/Codexon --output dist-ci/bad-runtime
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           .\tools\Build-Installer.ps1 -ProductDir dist-ci/bad-runtime -OutputDir dist-ci/qa-bad-runtime -Compiler $compiler.FullName -Isolated
+      - name: Build release installer before validation
+        if: fromJSON(needs.resolve.outputs.plan).candidate
+        shell: pwsh
+        run: |
+          $compiler = Get-ChildItem "${env:ProgramFiles(x86)}\Inno Setup*\ISCC.exe" | Select-Object -First 1
+          if (-not $compiler) { throw 'Inno Setup compiler is required on this Windows runner' }
+          .\tools\Build-Installer.ps1 -ProductDir dist-ci/Codexon -OutputDir dist-ci/release -Compiler $compiler.FullName
+      - name: Record exact candidate contents
+        run: python tools/release_pipeline.py candidate --folder dist-ci
+      - name: Retain candidate for independent installation reruns
+        uses: actions/upload-artifact@v7
+        with:
+          name: candidate-${{ github.sha }}-${{ github.run_id }}
+          path: dist-ci/
+          retention-days: 30
+          overwrite: true
+          compression-level: 0
+          if-no-files-found: error
+      - name: Upload synthetic verification evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: package-build-${{ github.run_attempt }}
+          path: |
+            artifacts/verification/**/*.json
+            artifacts/verification/**/*.xml
+            artifacts/verification/**/*.png
+            artifacts/verification/**/*.log
+          retention-days: 7
+          if-no-files-found: ignore
+  package_verify:
+    needs: [resolve, source, package_build]
+    if: always() && needs.source.result == 'success' && ((fromJSON(needs.resolve.outputs.plan).package && needs.package_build.result == 'success') || (!fromJSON(needs.resolve.outputs.plan).package && fromJSON(needs.resolve.outputs.plan).qa_reuse))
+    runs-on: windows-latest
+    timeout-minutes: 25
+    env:
+      CHECK_PLAN: ${{ needs.resolve.outputs.plan }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12.10'
+          cache: pip
+          cache-dependency-path: requirements-release.lock
+      - name: Install locked dependencies
+        run: python -m pip install -r requirements-release.lock
+      - name: Check source and test environment before running checks
+        run: python tools/check_environment.py
+      - name: Restore the immutable check plan
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force artifacts/verification | Out-Null
+          $env:CHECK_PLAN | Set-Content -Encoding utf8 artifacts/verification/plan.json
+      - name: Download this run's exact candidate
+        if: fromJSON(needs.resolve.outputs.plan).package
+        uses: actions/download-artifact@v8
+        with:
+          name: candidate-${{ github.sha }}-${{ github.run_id }}
+          path: dist-ci
+      - name: Reject a foreign or modified candidate before execution
+        if: fromJSON(needs.resolve.outputs.plan).package
+        run: python tools/release_pipeline.py check-candidate --folder dist-ci
+      - name: Exercise package-job recovery when explicitly requested
+        if: inputs.exercise_rerun && github.run_attempt == 1
+        run: python tools/run_ui_checks.py --no-desktop --kind installation -- python -c "raise RuntimeError('Requested first-attempt package validation failure')"
+      - name: Check independent offline recovery
+        if: fromJSON(needs.resolve.outputs.plan).package
+        run: |
+          python tools/run_ui_checks.py -- python tools/verify_recovery.py --executable dist-ci/Codexon/CodexonRecovery.exe --output artifacts/verification/recovery-en --language en
+      - name: Check changed QA tools with the matching published binary
+        if: fromJSON(needs.resolve.outputs.plan).qa_reuse
+        run: python tools/run_ui_checks.py -- python tools/verify_release_tools.py --plan artifacts/verification/plan.json
       - name: Check installation, update and removal
-        if: steps.plan.outputs.native == 'true'
-        run: python tools/run_native_checks.py --output artifacts/verification/native-installation -- python tools/run_ui_checks.py -- python tools/verify_installation.py --installer dist-ci/qa-isolated/Codexon-Setup.exe --broken-installer dist-ci/qa-bad-runtime/Codexon-Setup.exe --output artifacts/verification/installation
+        if: fromJSON(needs.resolve.outputs.plan).native
+        run: python tools/run_ui_checks.py --no-desktop --timeout 660 --kind installation -- python tools/run_native_checks.py --output artifacts/verification/native-installation -- python tools/run_ui_checks.py --kind installation -- python tools/verify_installation.py --installer dist-ci/qa-isolated/Codexon-Setup.exe --broken-installer dist-ci/qa-bad-runtime/Codexon-Setup.exe --output artifacts/verification/installation
       - name: Check installation from an MSIX process
-        if: steps.plan.outputs.msix == 'true'
-        shell: powershell
-        run: .\tools\verify_msix_installation.ps1 -Installer dist-ci/qa-isolated/Codexon-Setup.exe -BrokenInstaller dist-ci/qa-bad-runtime/Codexon-Setup.exe -Output artifacts/verification/msix-installation -Python ((Get-Command python).Source)
+        if: fromJSON(needs.resolve.outputs.plan).msix
+        timeout-minutes: 15
+        run: python tools/run_ui_checks.py --no-desktop --timeout 780 --kind installation -- powershell.exe -NoProfile -NonInteractive -File .\tools\verify_msix_installation.ps1 -Installer dist-ci/qa-isolated/Codexon-Setup.exe -BrokenInstaller dist-ci/qa-bad-runtime/Codexon-Setup.exe -Output artifacts/verification/msix-installation -Python ((Get-Command python).Source)
       - name: Check frozen runtime and Qt Quick interaction
-        if: steps.plan.outputs.package == 'true'
+        if: fromJSON(needs.resolve.outputs.plan).package
         run: python tools/run_ui_checks.py -- python tools/verify_changes.py --package-only --package-exe dist-ci/Codexon/Codexon.exe
       - name: Check migration from the actual published installer
-        if: steps.plan.outputs.proxy == 'true'
+        if: fromJSON(needs.resolve.outputs.plan).proxy
         shell: pwsh
         run: |
           python tools/prepare_legacy_release.py --tag v2026.09.25.6 --output artifacts/legacy-published
@@ -145,56 +272,69 @@ jobs:
           $published = Get-Content artifacts/legacy-published/result.json -Raw | ConvertFrom-Json
           python tools/run_ui_checks.py -- python tools/verify_retired_worker.py --old-exe $published.executable --new-exe dist-ci/Codexon/Codexon.exe --output artifacts/verification/published-worker-retirement
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python tools/verify_proxy_update.py --old-exe $published.executable --new-exe dist-ci/Codexon/Codexon.exe --idle-connections 100 --output artifacts/verification/published-proxy-update
+          python tools/run_ui_checks.py --no-desktop --kind installation -- python tools/verify_proxy_update.py --old-exe $published.executable --new-exe dist-ci/Codexon/Codexon.exe --idle-connections 100 --output artifacts/verification/published-proxy-update
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python tools/run_ui_checks.py -- python tools/verify_app_services.py --executable dist-ci/Codexon/Codexon.exe --legacy-collector-exe $published.executable --output artifacts/verification/published-app-services
       - name: Check packaged GUI handoff with multiple custom homes
-        if: steps.plan.outputs.package == 'true'
+        if: fromJSON(needs.resolve.outputs.plan).package
         run: python tools/run_ui_checks.py -- python tools/verify_gui_handoff.py --executable dist-ci/Codexon/Codexon.exe --output artifacts/verification/gui-handoff
       - name: Check proxy replacement with a custom observation filename
-        if: steps.plan.outputs.proxy == 'true'
+        if: fromJSON(needs.resolve.outputs.plan).proxy
         shell: pwsh
         run: |
           python tools/prepare_legacy_release.py --tag v2026.10.01.1 --output artifacts/legacy-custom-path
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $published = Get-Content artifacts/legacy-custom-path/result.json -Raw | ConvertFrom-Json
-          python tools/verify_proxy_update.py --old-exe $published.executable --new-exe dist-ci/Codexon/Codexon.exe --idle-connections 100 --custom-evidence --output artifacts/verification/custom-observation-update
+          python tools/run_ui_checks.py --no-desktop --kind installation -- python tools/verify_proxy_update.py --old-exe $published.executable --new-exe dist-ci/Codexon/Codexon.exe --idle-connections 100 --custom-evidence --output artifacts/verification/custom-observation-update
           exit $LASTEXITCODE
       - name: Check installer payload contents
-        if: steps.plan.outputs.package == 'true'
+        if: fromJSON(needs.resolve.outputs.plan).package
         run: python tools/package_release.py --product dist-ci/Codexon --validate-only
       - name: Seal the fully verified release candidate
-        if: needs.resolve.outputs.candidate == 'true'
+        if: fromJSON(needs.resolve.outputs.plan).candidate
         shell: pwsh
         run: |
-          $compiler = Get-ChildItem "${env:ProgramFiles(x86)}\Inno Setup*\ISCC.exe" | Select-Object -First 1
-          if (-not $compiler) { throw 'Inno Setup compiler is required on this Windows runner' }
-          .\tools\Build-Installer.ps1 -ProductDir dist-ci/Codexon -OutputDir dist-ci/release -Compiler $compiler.FullName
           python tools/release_pipeline.py seal --folder dist-ci/release --product dist-ci/Codexon
           exit $LASTEXITCODE
       - name: Retain the verified installer for later publication
-        if: needs.resolve.outputs.candidate == 'true'
+        if: fromJSON(needs.resolve.outputs.plan).candidate
         uses: actions/upload-artifact@v7
         with:
           name: verified-release-${{ github.sha }}
           path: dist-ci/release/
           retention-days: 30
+          overwrite: true
           if-no-files-found: error
           compression-level: 0
-      - name: Upload redacted synthetic verification evidence
+      - name: Upload synthetic verification evidence
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: windows-verification
+          name: package-verification-${{ github.run_attempt }}
           path: |
             artifacts/verification/**/*.json
             artifacts/verification/**/*.xml
             artifacts/verification/**/*.png
-            artifacts/verification/**/pytest*.log
+            artifacts/verification/**/*.log
+          retention-days: 7
           if-no-files-found: ignore
+  verify:
+    needs: [resolve, source, package_build, package_verify]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12.10'
+      - name: Require every planned check to succeed
+        env:
+          CHECK_RESULTS: ${{ toJSON(needs) }}
+          CHECK_PLAN: ${{ needs.resolve.outputs.plan }}
+        run: python tools/release_pipeline.py verdict
   publish:
     needs: [resolve, verify]
-    if: always() && inputs.publish && needs.resolve.result == 'success' && needs.resolve.outputs.published != 'true' && (needs.verify.result == 'success' || (needs.verify.result == 'skipped' && needs.resolve.outputs.reuse_run != ''))
+    if: always() && inputs.publish && needs.resolve.result == 'success' && needs.verify.result == 'success' && !fromJSON(needs.resolve.outputs.plan).published
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -210,5 +350,5 @@ jobs:
       - name: Publish the existing verified installer
         env:
           GH_TOKEN: ${{ github.token }}
-          VERIFIED_RUN: ${{ needs.resolve.outputs.reuse_run || github.run_id }}
+          VERIFIED_RUN: ${{ fromJSON(needs.resolve.outputs.plan).reuse_run || github.run_id }}
         run: python tools/release_pipeline.py publish --verified-run "$VERIFIED_RUN"

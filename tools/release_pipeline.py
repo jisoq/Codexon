@@ -9,11 +9,14 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
+from urllib.parse import quote
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from tools.prepare_sources import describe, digest, ensure_hosted, load_lock
 from tools.release_github import GitHub
+from tools import source_receipt
 
 WORKFLOW = '.github/workflows/windows.yml'
 FILES = ('Codexon-Setup.exe', 'Codexon-Setup.exe.sha256', 'build-manifest.json', 'RELEASE_NOTES.md')
@@ -24,15 +27,52 @@ def version(root=ROOT):
     return re.search(r"^VERSION\s*=\s*['\"](\d{4}\.\d{2}\.\d{2}\.\d+)['\"]", text, re.M)[1]
 
 
-def trusted(run, sha, repository):
-    return (run.get('head_sha') == sha and run.get('head_branch') == 'main'
+def trusted_checks(run, sha, repository, branch):
+    return (run.get('head_sha') == sha and run.get('head_branch') == branch
             and run.get('event') in ('push', 'workflow_dispatch') and run.get('path') == WORKFLOW
             and run.get('head_repository', {}).get('full_name') == repository)
+
+
+def trusted(run, sha, repository):
+    return trusted_checks(run, sha, repository, 'main')
 
 
 def verification_passed(github, run_id):
     jobs = github.api(f'actions/runs/{run_id}/jobs')['jobs']
     return any(j['name'] == 'verify' and j['conclusion'] == 'success' for j in jobs)
+
+
+def source_base(github, sha, root=ROOT, *, branch='main'):
+    # A downstream failure or cancellation must not erase a completed source job.
+    runs = github.api(f'actions/workflows/windows.yml/runs?branch={quote(branch, safe="")}&per_page=100')['workflow_runs']
+    for run in sorted(runs, key=lambda r: r['id'], reverse=True):
+        base = run.get('head_sha', '')
+        if base == sha or not re.fullmatch(r'[0-9a-f]{40}', base) or not trusted_checks(run, base, github.repository, branch):
+            continue
+        ancestry = subprocess.run(['git', 'merge-base', '--is-ancestor', base, sha], cwd=root, capture_output=True)
+        if ancestry.returncode in (1, 128):
+            continue
+        if ancestry.returncode:
+            raise RuntimeError('Cannot establish the source-verified ancestor')
+        jobs = github.api(f'actions/runs/{run["id"]}/jobs')['jobs']
+        if not any(job['name'] == 'source' and job['conclusion'] == 'success' for job in jobs):
+            continue
+        name = f'source-verified-{base}'
+        artifacts = github.api(f'actions/runs/{run["id"]}/artifacts')['artifacts']
+        if not any(a['name'] == name and not a['expired'] and a.get('size_in_bytes', 65537) <= 65536 for a in artifacts):
+            continue
+        with tempfile.TemporaryDirectory(prefix='codexon-source-receipt-') as temporary:
+            github.command('run', 'download', str(run['id']), '--name', name, '--dir', temporary)
+            path = Path(temporary) / 'source-verification.json'
+            if not path.is_file() or path.stat().st_size > 32768:
+                continue
+            try:
+                receipt = json.loads(path.read_text(encoding='utf-8'))
+            except (ValueError, UnicodeError):
+                continue
+        if source_receipt.valid(receipt, base, run['id'], root):
+            return base
+    return ''
 
 
 def reusable_run(github, sha, current_run):
@@ -48,14 +88,14 @@ def reusable_run(github, sha, current_run):
     return ''
 
 
-def verified_base(github, sha, root=ROOT):
-    # A failed or cancelled push is not a verification baseline for its follow-up.
-    runs = github.api('actions/workflows/windows.yml/runs?branch=main&status=success&per_page=100')['workflow_runs']
+def verified_base(github, sha, root=ROOT, *, branch='main'):
+    # This is deployment coverage, independent of source receipts and publication.
+    runs = github.api(f'actions/workflows/windows.yml/runs?branch={quote(branch, safe="")}&status=completed&per_page=100')['workflow_runs']
     for run in sorted(runs, key=lambda r: r['id'], reverse=True):
         base = run.get('head_sha', '')
         if (base == sha or not re.fullmatch(r'[0-9a-f]{40}', base)
-                or not trusted(run, base, github.repository) or run.get('status') != 'completed'
-                or run.get('conclusion') != 'success'):
+                or not trusted_checks(run, base, github.repository, branch) or run.get('status') != 'completed'
+                or not verification_passed(github, run['id'])):
             continue
         result = subprocess.run(['git', 'merge-base', '--is-ancestor', base, sha], cwd=root, capture_output=True)
         if result.returncode == 0:
@@ -77,26 +117,84 @@ def tag_commit(github, tag):
     return obj['sha']
 
 
-def plan(github, sha, current_run, event, ref, publish, root=ROOT):
+def plan(github, sha, current_run, event, ref, publish, root=ROOT, *, prepare=False, exercise_rerun=False, head_branch=''):
     if not re.fullmatch(r'[0-9a-f]{40}', sha):
         raise ValueError('Invalid release commit')
-    on_main = event in ('push', 'workflow_dispatch') and ref == 'refs/heads/main'
+    branch = ref.removeprefix('refs/heads/') if event in ('push', 'workflow_dispatch') and ref.startswith('refs/heads/') else ''
+    on_main = branch == 'main'
     if publish and not on_main:
         raise ValueError('Publish releases only from main')
+    if prepare and not branch:
+        raise ValueError('Prepare candidates only from an explicit branch commit')
+    if exercise_rerun and (event != 'workflow_dispatch' or not branch or on_main or publish):
+        raise ValueError('Exercise reruns only by explicit dispatch on a non-main branch')
+    if publish and prepare:
+        raise ValueError('Prepare a candidate first, then publish its verified artifact separately')
     current = version(root)
     notes = root/f'docs/releases/{current}.md'
     has_notes = notes.is_file() and bool(notes.read_text(encoding='utf-8').strip())
     tag = 'v' + current
     existing = tag_commit(github, tag) if on_main else None
-    release = github.release(tag) if publish and existing else None
-    if publish and (not has_notes or (existing and existing != sha)):
+    release = github.release(tag) if (publish or prepare) and existing else None
+    if (publish or prepare) and (not has_notes or (existing and existing != sha)):
         raise ValueError('A new version and nonempty matching release notes are required')
     published = bool(release and not release['draft'] and existing == sha)
-    candidate = on_main and has_notes and (existing is None or bool(release and release['draft']))
-    reuse = reusable_run(github, sha, current_run) if on_main and not published else ''
+    candidate = prepare and bool(branch) and has_notes and (existing is None or bool(release and release['draft']))
+    reuse = reusable_run(github, sha, current_run) if (prepare or publish) and on_main and not published else ''
+    if publish and not (reuse or published):
+        raise ValueError('Prepare this exact commit with prepare=true before publishing; no verified installer is available')
+    source = deployment = ''
+    if branch and not (reuse or published):
+        source = source_base(github, sha, root, branch=branch)
+        deployment = verified_base(github, sha, root, branch=branch)
+        if branch != 'main':
+            source = source or source_base(github, sha, root)
+            deployment = deployment or verified_base(github, sha, root)
+    elif event == 'pull_request' and head_branch:
+        # A branch dispatch's tested ancestor also covers a later PR merge tree.
+        # Fork jobs themselves never become trusted shared receipts.
+        source = source_base(github, sha, root, branch=head_branch)
     return dict(version=current, release_tag=tag, candidate=candidate, published=published,
                 reuse_run=reuse, verify=not (reuse or published),
-                base=verified_base(github, sha, root) if on_main and not (reuse or published) else '')
+                source_base=source, base=deployment)
+
+
+def candidate_inventory(folder):
+    paths = sorted(p for p in folder.rglob('*') if p.is_file() and p != folder / 'candidate.json')
+    if sum(path.stat().st_size for path in paths) > 2 * 1024 ** 3:
+        raise ValueError('Candidate exceeds the 2 GiB retained payload budget')
+    return {p.relative_to(folder).as_posix(): digest(p) for p in paths}
+
+
+def candidate_receipt(folder, sha, run_id, *, validate=False):
+    path = folder / 'candidate.json'
+    inventory = candidate_inventory(folder)
+    manifest = json.loads((folder / 'Codexon/build-manifest.json').read_text(encoding='utf-8-sig'))
+    if manifest['commit'] != sha:
+        raise ValueError('Candidate product belongs to another commit')
+    expected = dict(schema=1, commit=sha, run_id=str(run_id), files=inventory)
+    if validate:
+        if json.loads(path.read_text(encoding='utf-8')) != expected:
+            raise ValueError('Candidate payload or commit changed')
+    else:
+        path.write_text(json.dumps(expected, indent=2), encoding='utf-8')
+    return expected
+
+
+def final_verdict(plan, results):
+    required = ['resolve']
+    if plan['verify']:
+        required.append('source')
+        if plan['package']:
+            required.append('package_build')
+        if plan['package'] or plan['qa_reuse']:
+            required.append('package_verify')
+    elif not (plan.get('reuse_run') or plan.get('published')):
+        raise ValueError('No current checks or verified release justify success')
+    failed = {name: results.get(name, 'missing') for name in required if results.get(name) != 'success'}
+    if failed:
+        raise ValueError('Required checks did not succeed: ' + json.dumps(failed))
+    return dict(required=required, result='success')
 
 
 def check_installer(folder):
@@ -200,26 +298,40 @@ def publish(github, sha, verified_run, current_run, folder, root=ROOT):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=('plan', 'seal', 'publish'))
+    parser.add_argument('action', choices=('plan', 'seal', 'publish', 'candidate', 'check-candidate', 'source-receipt', 'verdict'))
     parser.add_argument('--repository', default=os.environ.get('GITHUB_REPOSITORY', 'jisoq/Codexon'))
     parser.add_argument('--sha', default=os.environ.get('GITHUB_SHA', ''))
     parser.add_argument('--run-id', default=os.environ.get('GITHUB_RUN_ID', ''))
     parser.add_argument('--event', default=os.environ.get('GITHUB_EVENT_NAME', ''))
     parser.add_argument('--ref', default=os.environ.get('GITHUB_REF', ''))
     parser.add_argument('--publish', choices=('true', 'false'), default='false')
+    parser.add_argument('--prepare', choices=('true', 'false'), default='false')
+    parser.add_argument('--exercise-rerun', choices=('true', 'false'), default='false')
+    parser.add_argument('--head-branch', default=os.environ.get('GITHUB_HEAD_REF', ''))
     parser.add_argument('--verified-run')
     parser.add_argument('--folder', type=Path, default=ROOT/'artifacts/release')
     parser.add_argument('--product', type=Path)
+    parser.add_argument('--plan', type=Path, default=ROOT/'artifacts/verification/plan.json')
     args = parser.parse_args()
     github = GitHub(args.repository)
     if args.action == 'plan':
-        result = plan(github, args.sha, args.run_id, args.event, args.ref, args.publish == 'true')
+        result = plan(github, args.sha, args.run_id, args.event, args.ref, args.publish == 'true',
+                      prepare=args.prepare == 'true', exercise_rerun=args.exercise_rerun == 'true', head_branch=args.head_branch)
+        args.plan.parent.mkdir(parents=True, exist_ok=True)
+        args.plan.with_name('release-plan.json').write_text(json.dumps(result), encoding='utf-8')
         if os.environ.get('GITHUB_OUTPUT'):
             with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
                 for key, value in result.items():
                     output.write(f'{key}={str(value).lower() if isinstance(value, bool) else value}\n')
     elif args.action == 'seal':
         result = seal(args.folder.resolve(), args.product.resolve(), args.sha, args.run_id)
+    elif args.action in ('candidate', 'check-candidate'):
+        result = candidate_receipt(args.folder.resolve(), args.sha, args.run_id, validate=args.action == 'check-candidate')
+    elif args.action == 'source-receipt':
+        result = source_receipt.write_receipt(args.folder, json.loads(args.plan.read_text(encoding='utf-8')), args.sha, args.run_id, ROOT)
+    elif args.action == 'verdict':
+        needs = json.loads(os.environ['CHECK_RESULTS'])
+        result = final_verdict(json.loads(os.environ['CHECK_PLAN']), {name: job['result'] for name, job in needs.items()})
     else:
         result = publish(github, args.sha, args.verified_run, args.run_id, args.folder.resolve())
     print(json.dumps(result))

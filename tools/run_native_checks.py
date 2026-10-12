@@ -11,6 +11,7 @@ from cachemonitor.observer_task import ObserverTask
 from cachemonitor.observer_state import read_json
 from cachemonitor.observer_control import atomic_write
 from cachemonitor.install_dispatch import packaged_context
+from tools.check_processes import register_root
 
 
 def main():
@@ -29,21 +30,31 @@ def main():
         atomic_write(report,json.dumps({'exit_code':result.returncode,'native':True}).encode())
         return result.returncode
     output.mkdir(parents=True,exist_ok=False)
+    register_root(output)
     task=ObserverTask(str(output),role='NativeQA')
     task.start([sys.executable,'-B',str(Path(__file__).resolve()),'--worker','--output',str(output),'--',*command])
-    deadline=time.monotonic()+1800
-    while time.monotonic()<deadline:
-        state=task.inspect()
-        if not state.get('running') and state.get('state') not in (2,4) and state.get('last_result')!=267011:
-            task.remove();value=read_json(report)
-            if not value or value.get('exit_code')!=state.get('last_result'):
-                raise RuntimeError('Native QA exit and receipt do not agree')
-            for name in ('stdout.log','stderr.log'):
+    deadline=time.monotonic()+600
+    offsets={name:0 for name in ('stdout.log','stderr.log')}
+    try:
+        while time.monotonic()<deadline:
+            state=task.inspect()
+            for name,offset in offsets.items():
                 log=output/name
-                if log.exists():print(log.read_text(encoding='utf-8',errors='replace'),end='',flush=True)
-            print(json.dumps(value));return value['exit_code']
-        time.sleep(1)
-    raise RuntimeError('Native QA still running; task and evidence retained')
+                if log.exists():
+                    with log.open('rb') as stream:
+                        stream.seek(offset);chunk=stream.read(65536);offsets[name]=stream.tell()
+                    print(chunk.decode('utf-8',errors='replace'),end='',flush=True)
+            if not state.get('running') and state.get('state') not in (2,4) and state.get('last_result')!=267011:
+                value=read_json(report)
+                if not value or value.get('exit_code')!=state.get('last_result'):
+                    raise RuntimeError('Native QA exit and receipt do not agree')
+                print(json.dumps(value));return value['exit_code']
+            time.sleep(1)
+        (output/'deadline.json').write_text(json.dumps({'task':task.name,'state':state}))
+        raise RuntimeError('Native QA exceeded its 600 second budget')
+    finally:
+        task.stop()
+        task.remove()
 
 
 if __name__=='__main__':raise SystemExit(main())
