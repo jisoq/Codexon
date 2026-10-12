@@ -331,7 +331,10 @@ def main():
     elif args.action == 'seal':
         result = seal(args.folder.resolve(), args.product.resolve(), args.sha, args.run_id)
     elif args.action in ('candidate', 'check-candidate'):
-        result = candidate_receipt(args.folder.resolve(), args.sha, args.run_id, validate=args.action == 'check-candidate')
+        receipt = candidate_receipt(args.folder.resolve(), args.sha, args.run_id, validate=args.action == 'check-candidate')
+        result = dict(commit=receipt['commit'], run_id=receipt['run_id'],
+                      files_checked=len(receipt['files']),
+                      installer_sha256=receipt['files'].get('qa-isolated/Codexon-Setup.exe'))
     elif args.action == 'source-receipt':
         result = source_receipt.write_receipt(args.folder, json.loads(args.plan.read_text(encoding='utf-8')), args.sha, args.run_id, ROOT)
     elif args.action == 'verdict':

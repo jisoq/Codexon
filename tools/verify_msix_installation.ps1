@@ -5,6 +5,9 @@ param([Parameter(Mandatory)][string]$Installer,
 $ErrorActionPreference='Stop'
 # This fixture installs a disposable signing certificate only on the CI machine.
 if ($env:GITHUB_ACTIONS -ne 'true') { throw 'Use the existing Codex package for local MSIX checks; the synthetic fixture is CI-only.' }
+# Python can inherit PowerShell 7's module search path. Load the Windows
+# PowerShell certificate provider explicitly before PKI signs the fixture.
+Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1') -ErrorAction Stop
 $root=[IO.Path]::GetFullPath($Output)
 if (Test-Path -LiteralPath $root) { throw 'A fresh QA output directory is required' }
 New-Item -ItemType Directory -Path $root | Out-Null
