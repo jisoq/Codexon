@@ -398,6 +398,31 @@ def test_reasoning_tabs_share_trend_axis_and_keep_other_charts(tmp_path):
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize('width',[100,400])
+def test_short_navigator_selection_can_move_without_resizing(width):
+    from PySide6.QtCore import QMetaObject,Q_ARG,Qt
+    from cachemonitor.performance_panel import TimeNavigator
+    from cachemonitor.quick_qa import mount,dispose,render_plot
+    committed=[]
+    node=TimeNavigator(SimpleNamespace(full=(0,100),set_window=lambda a,z:committed.append((a,z))))
+    node.put(fullStart=0.,fullEnd=100.,start=70.,end=85.)
+    host=mount(node,width,40)
+    try:
+        item=render_plot(host,node)
+        def gesture(name,fraction=None):
+            args=() if fraction is None else (Q_ARG('QVariant',16+item.property('railWidth')*fraction),)
+            assert QMetaObject.invokeMethod(item,name,Qt.DirectConnection,*args)
+        gesture('beginGesture',.775);gesture('updateGesture',.675);gesture('finishGesture')
+        assert committed.pop()==pytest.approx((60,75))
+        gesture('beginGesture',.70);gesture('updateGesture',.60);gesture('finishGesture')
+        assert committed.pop()==pytest.approx((60,85))
+        gesture('beginGesture',.85);gesture('updateGesture',.95);gesture('finishGesture')
+        assert committed.pop()==pytest.approx((70,95))
+        assert not host.qml_errors
+    finally:dispose(host)
+
+
+@pytest.mark.integration
 def test_time_navigator_presets_live_updates_and_date_ranges(tmp_path):
     from datetime import datetime
     from PySide6.QtCore import QSettings,QMetaObject,Q_ARG,Qt,QPointF

@@ -23,6 +23,8 @@ FocusScope {
     readonly property real start: dragging ? pendingStart : (s.start || 0)
     readonly property real end: dragging ? pendingEnd : (s.end || 1)
     readonly property real railWidth: Math.max(1, width - 32)
+    // Keep the middle available for panning even when the selection is narrow.
+    readonly property real handleRadius: Math.min(14, Math.max(0, xAt(end) - xAt(start)) / 3)
 
     function xAt(time) { return 16 + railWidth * (time - fullStart) / Math.max(1, fullEnd - fullStart) }
     function timeAt(x) { return fullStart + Math.max(0, Math.min(1, (x - 16) / railWidth)) * (fullEnd - fullStart) }
@@ -33,7 +35,7 @@ FocusScope {
         anchorTime = timeAt(x)
         const leftDistance = Math.abs(x - xAt(originStart))
         const rightDistance = Math.abs(x - xAt(originEnd))
-        if (Math.min(leftDistance, rightDistance) <= 14)
+        if (Math.min(leftDistance, rightDistance) <= handleRadius)
             dragPart = leftDistance <= rightDistance ? "start" : "end"
         else {
             dragPart = "move"
@@ -103,7 +105,7 @@ FocusScope {
     }
     MouseArea {
         anchors.fill: parent; hoverEnabled: true; preventStealing: true
-        cursorShape: pressed || Math.min(Math.abs(mouseX-root.xAt(root.start)),Math.abs(mouseX-root.xAt(root.end))) <= 14 ? Qt.SizeHorCursor : Qt.OpenHandCursor
+        cursorShape: pressed || Math.min(Math.abs(mouseX-root.xAt(root.start)),Math.abs(mouseX-root.xAt(root.end))) <= root.handleRadius ? Qt.SizeHorCursor : Qt.OpenHandCursor
         onPressed: mouse => root.beginGesture(mouse.x)
         onPositionChanged: mouse => { if (pressed) root.updateGesture(mouse.x) }
         onReleased: root.finishGesture()
