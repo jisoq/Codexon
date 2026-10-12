@@ -2,14 +2,14 @@
 import time
 
 import pytest
-from PySide6.QtCore import QSettings, Qt
+from PySide6.QtCore import QPointF, QSettings, Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from cachemonitor.presentation import Scroll
 from cachemonitor.quota_panel import QuotaPanel, model_cost_intervals
 from cachemonitor.quota_cycles import QuotaLedger
-from cachemonitor.quick_qa import click, control, dispose, mount, render_plot, click_row, walk
+from cachemonitor.quick_qa import click, control, dispose, mount, render_plot, click_row, walk, scene_view
 from cachemonitor.theme import shared_theme
 from test_quota_tracking_integration import activity
 from cachemonitor import quota_tracking_store as tracking
@@ -53,7 +53,21 @@ def test_responsive_page_chart_and_single_details_path(quota_page,tmp_path,width
         remaining=[row['remaining'] for row in panel.history.rows]
         assert 0<panel.history.axis[0]<min(remaining)
         assert panel.history.axis[1]>max(remaining)
-        assert '9%' in panel.summary_text.text()
+        assert panel.summary_values['usage'].text()=='9%'
+        cards=[scene_view(host,node) for node in panel.summary_cards.values()]
+        positions=[card.mapToScene(QPointF()) for card in cards]
+        assert positions[0].y()==pytest.approx(positions[1].y())
+        assert positions[2].y()==pytest.approx(positions[3].y())
+        if width<1000:
+            assert positions[2].y()>positions[0].y()+cards[0].height()
+            assert positions[2].x()==pytest.approx(positions[0].x())
+        else:
+            assert positions[2].y()==pytest.approx(positions[0].y())
+        for card in cards:assert card.width()==pytest.approx(cards[0].width(),abs=1)
+        for node in panel.summary_values.values():
+            text=next(item for item in walk(control(host,node))
+                      if item.metaObject().indexOfProperty('contentWidth')>=0)
+            assert text.property('contentWidth')<=text.width()+1
         assert all(r['local_observed'] for r in panel.history.rows)
         assert panel.cycle_choice.count()==4
         assert panel.cycle_choice.currentData()==max(p['start'] for p in panel._view['periods'])
@@ -248,6 +262,8 @@ def test_credit_balance_drops_only_trailing_fractional_zeros(raw,expected):
 
 def test_current_quota_refresh_keeps_history_until_report_or_issue_changes(quota_page,monkeypatch):
     _,panel,_=quota_page
+    started=panel.report['tracking']['started']
+    monkeypatch.setattr('cachemonitor.quota_layout.time',lambda:started+72*3600)
     rendered=[]
     original=panel.render
     def render(*args,**kwargs):
@@ -258,6 +274,10 @@ def test_current_quota_refresh_keeps_history_until_report_or_issue_changes(quota
     quota={**panel.quota,'observed_at':panel.quota['observed_at']+1}
     assert panel.receive(dict(home='h',quota=quota,report=panel.report))
     assert panel.quota is quota and panel.history.cursor==0 and not rendered
+    assert panel.summary_values['elapsed'].text()=='72 hr'
+    monkeypatch.setattr('cachemonitor.quota_layout.time',lambda:started+72.5*3600)
+    assert panel.receive(dict(home='h',quota=quota,report=panel.report))
+    assert panel.summary_values['elapsed'].text()=='72.5 hr' and not rendered
     assert panel.receive(dict(home='h',quota=quota,report=panel.report,issue='조회 지연'))
     assert len(rendered)==1 and panel.status.text()=='조회 지연'
     assert panel.receive(dict(home='h',quota=quota,report=dict(panel.report),issue='조회 지연'))

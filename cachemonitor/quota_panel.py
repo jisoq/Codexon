@@ -235,6 +235,7 @@ class QuotaPanel(Group):
             return True
         if (self.report is previous_report and self.issue==previous_issue
                 and not value.get('exclusion_result') and not getattr(self,'_render_dirty',False)):
+            if hasattr(self,'update_summary'):self.update_summary()
             return True
         self.render(automatic=True)
         return True
