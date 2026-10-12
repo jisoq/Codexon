@@ -290,9 +290,14 @@ def test_credit_balance_drops_only_trailing_fractional_zeros(raw,expected):
     assert credits['balance']==raw
 
 
-def test_current_quota_refresh_keeps_history_until_report_or_issue_changes(quota_page,monkeypatch):
+@pytest.mark.parametrize('compact',[False,True])
+def test_current_quota_refresh_keeps_history_until_report_or_issue_changes(quota_page,monkeypatch,compact):
     _,panel,_=quota_page
-    started=panel.report['tracking']['started']
+    started=panel.report['tracking']['started']-3600
+    panel.report['tracking']['started']=started
+    if compact:
+        from cachemonitor.quota_worker import compact_report
+        panel.receive(dict(home='h',quota=panel.quota,report=compact_report(panel.report,'test')))
     monkeypatch.setattr('cachemonitor.quota_layout.time',lambda:started+72*3600)
     rendered=[]
     original=panel.render
@@ -312,3 +317,8 @@ def test_current_quota_refresh_keeps_history_until_report_or_issue_changes(quota
     assert len(rendered)==1 and panel.status.text()=='조회 지연'
     assert panel.receive(dict(home='h',quota=quota,report=dict(panel.report),issue='조회 지연'))
     assert len(rendered)==2
+    # A period boundary cannot substitute for an unknown measurement start.
+    panel.report.pop('tracking',None)
+    panel.report['view'].pop('tracking_started',None)
+    panel.update_summary()
+    assert panel.summary_values['elapsed'].text()=='—'

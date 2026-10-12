@@ -53,8 +53,7 @@ def configure_quota_layout(panel):
         for card in panel.summary_cards.values():card.put(border=border)
         started=(panel.report.get('tracking') or {}).get('started')
         if started is None:
-            periods=(panel.report.get('view') or {}).get('periods',[])
-            started=periods[-1]['start'] if periods else None
+            started=(panel.report.get('view') or {}).get('tracking_started')
         elapsed=(f'{max(0,time()-started)/3600:,.1f}'.removesuffix('.0')+' hr'
                  if started is not None else '—')
         values=dict(elapsed=elapsed,usage=f"{lifetime['delta']:g}%",

@@ -28,6 +28,7 @@ def compact_report(report, revision):
     def series(value):
         return {**value, '_content_digest': hashlib.sha256(pickle.dumps(value, protocol=5)).hexdigest()}
     prepared_view = {**view, 'lifetime': lifetime, 'summaries': summaries,
+        'tracking_started': (report.get('tracking') or {}).get('started'),
         'default_query': prepare_quota_query(report, {}), 'overall': series(view['overall']),
         'periods': [{**period, 'series': series(period['series'])} for period in view['periods']],
         'five_hour': series(view['five_hour'])}
