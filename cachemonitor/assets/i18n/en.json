@@ -2424,5 +2424,8 @@
   "프록시 연결 실패": "Proxy connection failed",
   "연결 준비 완료": "Connection ready",
   "직접 연결 설정 복원 완료": "Direct connection settings restored",
-  "시작 메뉴에서 ‘Codexon 연결 복구’를 실행하세요.": "Open Codexon Connection Recovery from the Start menu."
+  "시작 메뉴에서 ‘Codexon 연결 복구’를 실행하세요.": "Open Codexon Connection Recovery from the Start menu.",
+  "응답 마무리 대기": "Waiting for responses to finish",
+  "프록시 교체 중": "Replacing the proxy",
+  "업데이트 적용 완료": "Update applied"
 }
