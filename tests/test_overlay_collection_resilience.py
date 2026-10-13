@@ -33,6 +33,10 @@ def test_quota_storage_failure_keeps_publishing_real_calls(monkeypatch,tmp_path,
         def sync(self,*args):
             if failure_stage=='sync':raise sqlite3.DatabaseError('database disk image is malformed')
         def import_observations(self,*args):
+            assert len(snapshots)==1
+            early=snapshots[0]['value']
+            assert early['ledger_status_known'] is False
+            assert early['overlay_sessions'][0]['calls']==len(original['history'])
             if failure_stage=='import':raise sqlite3.DatabaseError('database disk image is malformed')
         def rollback(self):pass
         def close(self):pass
@@ -46,8 +50,11 @@ def test_quota_storage_failure_keeps_publishing_real_calls(monkeypatch,tmp_path,
     analysis_worker.process_main(Connection(),['home'],tmp_path/'index.sqlite')
     assert index_paths==[tmp_path/'index.sqlite']
     assert quota_paths==[analysis_worker.ledger_path(tmp_path/'index.sqlite')]
-    assert len(snapshots)==1 and snapshots[0]['kind']=='snapshot'
-    snapshot=snapshots[0]['value']
+    assert len(snapshots)==(2 if failure_stage=='import' else 1)
+    assert all(message['kind']=='snapshot' for message in snapshots)
+    from cachemonitor.analysis_delivery import SnapshotReceiver
+    receiver=SnapshotReceiver()
+    for message in snapshots:snapshot=receiver.receive(message['value'])
     assert snapshot['ledger_error']=='한도 기록 확인 지연: 자동 재시도 중'
     assert not snapshot['errors']
     overlay=snapshot['overlay_sessions'][0]

@@ -136,6 +136,10 @@ def test_analyzer_publication_wakes_before_timer_and_freeze_reclaims_waiter(tmp_
         process.start();child.close()
         assert parent.poll(15)
         first=parent.recv();assert first['kind']=='snapshot'
+        if not first['value'].get('ledger_status_known'):
+            assert parent.poll(15)
+            first=parent.recv()
+            assert first['kind']=='snapshot' and first['value']['ledger_status_known']
         wait_until(lambda:bool(writer.live.waiters))
         changed=copy.deepcopy(value);changed['ts']+=.25
         started=time.perf_counter();writer.publish(changed,'epoch',2)

@@ -27,6 +27,33 @@ MAX_OBSERVATION_GAP = 30 * 60
 DISCONTINUITY = '사용률 불연속: 감소, 충돌 후 복귀량은 신규 소모로 계산하지 않음'
 
 
+def observation_parts(home, quota):
+    """Prepare identical storage identities for live writes and history replay."""
+    windows=[];weekly_ref=None
+    for name, window in (quota or {}).get('windows', {}).items():
+        if name not in ('weekly','five_hour') or not quota.get('observed_at'):continue
+        key=hashlib.sha256(json.dumps([home,quota['observed_at'],quota.get('source'),
+            quota.get('account'),quota.get('plan_type'),quota.get('bucket'),name,window],sort_keys=True).encode()).hexdigest()
+        if (name=='weekly' and 'used_percent' in window and 'window_minutes' in window
+                and home is not None and quota.get('source','local') is not None and quota.get('account','') is not None):
+            weekly_ref=key
+            continue
+        windows.append((key,home,quota['observed_at'],quota.get('source','local'),quota.get('account',''),
+            quota.get('plan_type') or '',quota.get('bucket') or ('codex' if quota.get('source')=='live' else ''),
+            name,window.get('used_percent'),window.get('resets_at'),window.get('window_minutes'),
+            json.dumps(quota.get('separate_models',[]))))
+    window=(quota or {}).get('windows',{}).get('weekly');at=(quota or {}).get('observed_at')
+    if not window or not at or 'used_percent' not in window or 'window_minutes' not in window:
+        return windows,None,None,weekly_ref
+    source=quota.get('source','local')
+    key=hashlib.sha256(json.dumps([home,at,source,quota.get('account'),quota.get('plan_type'),
+        quota.get('bucket'),quota.get('separate_models',[]),window],sort_keys=True).encode()).hexdigest()
+    observation=(key,home,at,source,quota.get('account',''),window['used_percent'],
+        window.get('resets_at'),window['window_minutes'],json.dumps(quota.get('separate_models',[])))
+    context=(key,quota.get('plan_type') or '',quota.get('bucket') or ('codex' if source=='live' else ''))
+    return windows,observation,context,weekly_ref
+
+
 def ledger_path(index_path=None):
     if index_path:
         index = Path(index_path)
@@ -774,46 +801,28 @@ class QuotaLedger:
         snapshot['sessions']=sessions
 
     def observe(self, home, quota, commit=True):
-        weekly_ref=None
-        for name, observed_window in (quota or {}).get('windows', {}).items():
-            if name not in ('weekly','five_hour') or not quota.get('observed_at'):
-                continue
-            key=hashlib.sha256(json.dumps([home,quota['observed_at'],quota.get('source'),
-                quota.get('account'),quota.get('plan_type'),quota.get('bucket'),name,observed_window],sort_keys=True).encode()).hexdigest()
-            if (name=='weekly' and 'used_percent' in observed_window and 'window_minutes' in observed_window
-                    and home is not None and quota.get('source','local') is not None and quota.get('account','') is not None):
-                weekly_ref=key
-                continue
-            self.db.execute('insert or ignore into window_observations values(?,?,?,?,?,?,?,?,?,?,?,?)',
-                (key,home,quota['observed_at'],quota.get('source','local'),quota.get('account',''),
-                 quota.get('plan_type') or '',quota.get('bucket') or ('codex' if quota.get('source')=='live' else ''),
-                 name,observed_window.get('used_percent'),observed_window.get('resets_at'),
-                 observed_window.get('window_minutes'),json.dumps(quota.get('separate_models',[]))))
-        window = (quota or {}).get('windows', {}).get('weekly')
-        at = (quota or {}).get('observed_at')
-        if not window or not at or 'used_percent' not in window or 'window_minutes' not in window:
-            if commit:self.db.commit()
-            return
-        source = quota.get('source', 'local')
-        key = hashlib.sha256(json.dumps([home, at, source, quota.get('account'),quota.get('plan_type'),
-            quota.get('bucket'),quota.get('separate_models',[]),window], sort_keys=True).encode()).hexdigest()
-        self.db.execute('insert or ignore into observations values(?,?,?,?,?,?,?,?,?)',
-            (key, home, at, source, quota.get('account', ''), window['used_percent'],
-             window.get('resets_at'), window['window_minutes'], json.dumps(quota.get('separate_models', []))))
+        self._observe_parts(observation_parts(home,quota))
+        if commit:self.db.commit()
+
+    def _observe_parts(self,parts):
+        windows,observation,context,weekly_ref=parts
+        for window in windows:
+            self.db.execute('insert or ignore into window_observations values(?,?,?,?,?,?,?,?,?,?,?,?)',window)
+        if observation is None:return
+        key=observation[0]
+        self.db.execute('insert or ignore into observations values(?,?,?,?,?,?,?,?,?)',observation)
         self.db.execute('''insert into observation_context values(?,?,?) on conflict(id) do update set
                         plan=case when observation_context.plan='' then excluded.plan else observation_context.plan end,
                         bucket=case when observation_context.bucket='' then excluded.bucket else observation_context.bucket end
                         where (observation_context.plan='' and excluded.plan<>'')
                            or (observation_context.bucket='' and excluded.bucket<>'')''',
-                        (key, quota.get('plan_type') or '', quota.get('bucket') or
-                         ('codex' if source == 'live' else '')))
+                        context)
         if weekly_ref is not None:
             # The display ID has a different identity from the canonical observation.
             # Retain its first payload, including when only separate_models changes.
             self.db.execute('''insert or ignore into weekly_window_refs(window_id,observation_id)
                 select ?,id from observations where id=? and not exists
                 (select 1 from window_observations where id=?)''',(weekly_ref,key,weekly_ref))
-        if commit: self.db.commit()
 
     def sync(self, engine, snapshot):
         """Use the existing deduplicated analytical rows; don't parse conversations twice."""
@@ -938,11 +947,43 @@ class QuotaLedger:
         from contextlib import closing
         with closing(sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True, timeout=1)) as db:
             rows = db.execute('select ts,data from events where home=? and data like ?', (home, '%"rate_limits"%'))
-            for at, data in rows:
-                quota = json.loads(data).get('payload', {}).get('rate_limits')
+            prepared=[];batch_bytes=0
+            for at,data in rows:
+                size=len(data.encode('utf8'))
+                if prepared and (len(prepared)>=128 or batch_bytes+size>1024*1024):
+                    self._import_observation_parts(prepared);prepared=[];batch_bytes=0
+                quota=json.loads(data).get('payload',{}).get('rate_limits')
                 if quota:
-                    self.observe(home, {**quota, 'observed_at': at, 'source': 'history'},commit=False)
+                    prepared.append(observation_parts(home,{**quota,'observed_at':at,'source':'history'}))
+                    batch_bytes+=size
+                if batch_bytes>=1024*1024:
+                    self._import_observation_parts(prepared);prepared=[];batch_bytes=0
+            self._import_observation_parts(prepared)
         self.db.commit()
+
+    def _import_observation_parts(self,batch):
+        # At most 128 records / 1 MiB of source text, or one oversized record.
+        # Only prepared storage values survive until the bounded lookup completes.
+        window_ids={row[0] for windows,_,_,_ in batch for row in windows}
+        window_ids.update(ref for _,_,_,ref in batch if ref is not None)
+        observation_ids={row[0] for _,row,_,_ in batch if row is not None}
+        refs={ref for _,_,_,ref in batch if ref is not None}
+        def existing(query,keys):
+            if not keys:return []
+            return list(self.db.execute(query.format(','.join('?' for _ in keys)),tuple(keys)))
+        windows={row[0] for row in existing('select id from window_observations where id in ({})',window_ids)}
+        observations={row[0]:row[1:] for row in existing('''select o.id,c.plan,c.bucket from observations o
+            left join observation_context c on c.id=o.id where o.id in ({})''',observation_ids)}
+        references={row[0] for row in existing('select window_id from weekly_window_refs where window_id in ({})',refs)}
+        for parts in batch:
+            rows,observation,context,ref=parts
+            complete=all(row[0] in windows for row in rows)
+            if observation is not None:
+                old=observations.get(observation[0])
+                complete=complete and old is not None and all(
+                    present is not None and (present!='' or expected=='') for present,expected in zip(old,context[1:]))
+            if ref is not None:complete=complete and (ref in references or ref in windows)
+            if not complete:self._observe_parts(parts)
 
     def preview_exclusion(self, home, start, end, reason=''):
         from .quota_exclusions import preview_exclusion

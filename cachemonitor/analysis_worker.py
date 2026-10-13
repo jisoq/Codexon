@@ -151,19 +151,29 @@ def process_main(connection,homes,index_path,static_snapshot=None,model_evidence
                     try:
                         ledger.sync(engine,snapshot)
                         if snapshot.get('activity_cursor'):collector.channel.acknowledge_activity(snapshot)
-                        if not imported and not snapshot['index']['loading']:
-                            for home in snapshot['homes']: ledger.import_observations(collector.path,home)
-                            imported=True
-                        ledger_issue=None
-                        ledger_failures=0
                     except sqlite3.Error as error:disable_ledger(error)
+                completed('quota_sync')
+                if ledger and not imported and not snapshot['index']['loading']:
+                    # Verified session usage is independent of historical quota
+                    # recovery. Leave earlier ledger faults unresolved until it ends.
+                    if snapshot['homes']:
+                        snapshot={**snapshot,'ledger_status_known':False}
+                        publish()
+                        completed('initial_publication')
+                    try:
+                        for home in snapshot['homes']:ledger.import_observations(collector.path,home)
+                        imported=True
+                    except sqlite3.Error as error:disable_ledger(error)
+                    completed('history_import')
+                if ledger:
+                    ledger_issue=None
+                    ledger_failures=0
                 # The quota ledger is independent of observed per-call usage.
                 # Keep its diagnostics without turning valid session values into
                 # missing data or replacing/repairing the user's quota history.
                 snapshot={**snapshot,'ledger_status_known':True,
                     'ledger_fault':dict(ledger_failed=bool(ledger_issue))}
                 if ledger_issue:snapshot={**snapshot,'ledger_error':ledger_issue}
-                completed('quota_sync')
                 publish()
                 completed('publication')
                 record_timing(stages,max(0,time.time()-snapshot['ts']))

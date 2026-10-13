@@ -24,6 +24,52 @@ def sync(ledger, rows, revision=1, at=300, loading=False):
     ledger.sync(engine, {'homes': ['h'], 'sessions': [{'home': 'h'}], 'ts': at, 'index': {'loading': loading}})
 
 
+def test_history_import_reuses_complete_observations_and_repairs_partial_storage(tmp_path):
+    import json
+    import sqlite3
+    source=tmp_path/'index.sqlite';target=tmp_path/'quota.sqlite'
+    records=[quota(100+n,n/100,source='history') for n in range(385)]
+    records[0]['windows']['five_hour']={'used_percent':2,'window_minutes':300}
+    records.append({**records[0],'separate_models':[{'model':'different'}]})
+    records.append({'windows':{'weekly':{'used_percent':5}},'observed_at':700,'source':'history'})
+    def source_rows(values):
+        return [('h',value['observed_at'],json.dumps({'payload':{'rate_limits':value}})) for value in values]
+    with sqlite3.connect(source) as db:
+        db.execute('create table events(home text,ts real,data text)')
+        db.executemany('insert into events values(?,?,?)',source_rows(records))
+    ledger=QuotaLedger(target);reference=QuotaLedger(tmp_path/'reference.sqlite')
+    tables=('observations','observation_context','window_observations','weekly_window_refs')
+    def contents(store):
+        return {table:sorted(tuple(row) for row in store.db.execute('select * from '+table)) for table in tables}
+    try:
+        ledger.import_observations(source,'h')
+        for value in records:reference.observe('h',{**value,'observed_at':float(value['observed_at'])})
+        assert contents(ledger)==contents(reference)
+        ledger.close();ledger=QuotaLedger(target)
+        queries=[];before=ledger.db.total_changes;ledger.db.set_trace_callback(queries.append)
+        ledger.import_observations(source,'h');ledger.db.set_trace_callback(None)
+        assert ledger.db.total_changes==before and len(queries)<len(records)//4
+        # Legacy weekly display rows retain their first payload instead of gaining refs.
+        legacy=reference.db.execute('''select r.window_id,o.home,o.at,o.source,o.account,c.plan,c.bucket,
+            'weekly',o.used,o.reset,o.minutes,o.separate from weekly_window_refs r
+            join observations o on o.id=r.observation_id join observation_context c on c.id=o.id
+            where o.at=100''').fetchone()
+        for store in (ledger,reference):
+            store.db.execute('insert into window_observations values(?,?,?,?,?,?,?,?,?,?,?,?)',tuple(legacy))
+            store.db.execute('delete from weekly_window_refs where window_id=?',(legacy[0],));store.db.commit()
+        # Incomplete older stores still recover context and display references.
+        ledger.db.execute("update observation_context set plan='',bucket=''")
+        ledger.db.execute('delete from weekly_window_refs');ledger.db.commit()
+        ledger.import_observations(source,'h')
+        assert contents(ledger)==contents(reference)
+        late=[quota(90,3,source='history'),quota(102,99,source='history')]
+        with sqlite3.connect(source) as db:db.executemany('insert into events values(?,?,?)',source_rows(late))
+        ledger.import_observations(source,'h')
+        for value in late:reference.observe('h',{**value,'observed_at':float(value['observed_at'])})
+        assert contents(ledger)==contents(reference)
+    finally:ledger.close();reference.close()
+
+
 @pytest.mark.parametrize('observations',[128,2048])
 def test_report_reuses_history_across_heartbeat_and_invalidates_late_observation(tmp_path,monkeypatch,observations):
     ledger=QuotaLedger(tmp_path/'quota.sqlite')
