@@ -50,6 +50,32 @@ def test_overlay_banner_identifies_each_trigger_without_changing_stale_threshold
     assert OverlayController.content(controller)[1]==''
 
 
+def test_verified_session_displays_during_unrelated_restore_without_hiding_faults(monkeypatch):
+    from types import SimpleNamespace
+    from cachemonitor.overlay_view import OverlayContent
+    monkeypatch.setattr('cachemonitor.overlay.time.monotonic',lambda:100.)
+    session=dict(id=A,calls=2,collection_complete=True)
+    controller=SimpleNamespace(target_state={'selection':Selection(A)},session_lookup={A:[session]},
+        collection_issue='',collection_fault={},errors=[],loading=True,
+        snapshot_at=100.,snapshot_wall_time=1000.)
+    data,note=OverlayController.content(controller)
+    assert not note and not data['_collection']['loading']
+    content=OverlayContent();content.set_content(data,note)
+    assert content.data['calls']==2
+    for flag in (False,None):
+        session['collection_complete']=flag
+        data,note=OverlayController.content(controller)
+        content.set_content(data,note)
+        assert data['_collection']['loading'] and 'calls' not in content.data
+    controller.loading=False
+    assert OverlayController.content(controller)[1]==''
+    controller.loading=True;session['collection_complete']=True
+    controller.errors=['read failure']
+    assert OverlayController.content(controller)[1]=='수집 오류'
+    controller.errors=[];controller.collection_stale=True
+    assert OverlayController.content(controller)[1]=='수집 지연'
+
+
 def test_missing_session_retains_service_error_and_clears_on_recovery():
     from types import SimpleNamespace
     import time
@@ -160,6 +186,25 @@ def test_summary_reuses_cache_and_updates_price_corrections_and_title():
     engine.ingest([view]); new = summaries.collect(engine)[0]
     assert new['title'] == '새 제목' and not new['partial'] and new['priced'] == 3
     assert new['cost'] > old['cost']
+
+
+def test_summary_readiness_updates_without_repricing_and_waits_for_descendants():
+    parent=source();parent.update(usage_revision=1,collection_complete=True)
+    child=copy.deepcopy(parent);child.update(id=B,parent_thread_id=A,collection_complete=False)
+    for row in child['history']:row['key']='child-'+row['key']
+    engine=AnalysisEngine();summaries=OverlaySummaries()
+    engine.ingest([parent,child]);first={s['id']:s for s in summaries.collect(engine)}
+    assert not first[A]['collection_complete'] and not first[B]['collection_complete']
+    cached=summaries.cache[(parent['home'],A)][1]
+    child['collection_complete']=True
+    engine.ingest([parent,child]);ready={s['id']:s for s in summaries.collect(engine)}
+    assert ready[A]['collection_complete'] and ready[B]['collection_complete']
+    assert ready[A]['cost']==first[A]['cost'] and ready[A]['calls']==first[A]['calls']
+    assert summaries.cache[(parent['home'],A)][1] is cached
+    assert summaries.collect(engine)[0] is ready[A]
+    child['collection_complete']=False
+    engine.ingest([parent,child]);pending={s['id']:s for s in summaries.collect(engine)}
+    assert not pending[A]['collection_complete'] and not pending[B]['collection_complete']
 
 
 def route(tid=A, window='1', suffix='', *, prefix='/local/'):

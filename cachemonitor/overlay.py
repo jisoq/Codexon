@@ -514,10 +514,11 @@ class OverlayController(QObject):
                 '수집 지연' if time.monotonic()-self.snapshot_at > 10 else '')
         if len(matches) != 1:
             return None, note or ('기록 확인 중' if self.loading else '호출 기록 없음' if not matches else '현재 세션 식별 불가')
-        note = note or ('기록 확인 중' if self.loading else '')
+        loading = self.loading and matches[0].get('collection_complete') is not True
+        note = note or ('기록 확인 중' if loading else '')
         data={**matches[0], '_collection': {
             'last_confirmed_at': self.snapshot_wall_time,
-            'errors': [*self.errors, *([issue] if issue else [])], 'loading': self.loading,
+            'errors': [*self.errors, *([issue] if issue else [])], 'loading': loading,
             'delayed': received_age > 10, 'reason':reason,'received_age':received_age,
             'service_issue':issue,'service_fault':{**getattr(self,'collection_fault',{}),
                 **({'snapshot_stale':True} if getattr(self,'collection_stale',False) else {})},

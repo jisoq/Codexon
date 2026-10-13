@@ -24,6 +24,8 @@ class Fault:
 
     @property
     def title(self):
+        if self.kind == 'collection' and self.code == 'stale':
+            return '수집 결과 갱신 지연'
         return TITLES[self.kind]
 
     def export(self):

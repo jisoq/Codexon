@@ -15,7 +15,7 @@ from pathlib import Path
 from .core import LINEAGE_FIELDS, TRANSPORT_FIELDS, SessionRegistry, Session, readonly, stamp, session_lineage
 from .codex_names import CodexNames, task_select
 from .quota import clean_limits
-from .model_evidence import EvidenceReader, default_path as evidence_path, FIELDS as MODEL_FIELDS
+from .model_evidence import EvidenceReader, default_path as evidence_path, FIELDS as MODEL_FIELDS, home_key
 from .usage_paths import index_location
 from .native_backend import get_native
 
@@ -507,10 +507,16 @@ class UsageIndex:
             def stored_events():
                 cursor=self.db.execute('select data,ts,path,pos from events where home=? and tid=? '
                     'and rowid<=? order by ts,path,pos',(*key,upper))
+                last_path=None
+                last_name=''
                 try:
                     for row in cursor:
                         event=json.loads(row[0])
-                        event.setdefault('event_id',f'{Path(row[2]).name}:{row[3]}')
+                        if 'event_id' not in event:
+                            if row[2]!=last_path:
+                                last_path=row[2]
+                                last_name=Path(last_path).name
+                            event['event_id']=f'{last_name}:{row[3]}'
                         yield tuple(row[1:]),event
                 finally:cursor.close()
         self.rebuild_required.discard(key)
@@ -647,6 +653,34 @@ class UsageIndex:
             if key in self.rebuild_jobs:break
             self.cached_restore.popleft()
 
+    def ready_sessions(self,usage_complete):
+        # A queued source can still establish new ancestry. Once every source
+        # is checked, unrelated retained owners need not hold ready sessions.
+        if self.queue or self.errors or self.model_evidence.catching_up:return set()
+        if usage_complete:
+            return {key for key,s in self.monitor.sessions.items() if not s.pending}
+        pending=({key for key in self.cached_restore if key not in self.loaded}
+                 |set(self.pending_rebuilds)|set(self.rebuild_jobs)|set(self.rebuild_required)
+                 |{key for key,events in self.new_events.items() if events})
+        blocked=set(pending);unknown_homes=set()
+        for key in pending:
+            seen=set()
+            while key not in seen:
+                seen.add(key)
+                meta=self.metadata.get(key)
+                session=self.monitor.sessions.get(key)
+                lineage=self.lineage.get(key)
+                if meta is None and session is None and lineage is None:
+                    unknown_homes.add(key[0]);break
+                parent=(lineage or {}).get('parent_thread_id') or (meta or {}).get('parent_thread_id')
+                if not parent and session is not None:parent=session.parent_thread_id
+                if not parent:
+                    if (meta or {}).get('thread_source')=='subagent':unknown_homes.add(key[0])
+                    break
+                key=(key[0],parent);blocked.add(key)
+        return {key for key,s in self.monitor.sessions.items()
+                if key in self.loaded and key not in blocked and key[0] not in unknown_homes and not s.pending}
+
     def snapshot(self,now,changed,usage_complete,usage_errors):
         for home in self.homes:
             try:
@@ -658,7 +692,11 @@ class UsageIndex:
         if self.model_evidence.catching_up:usage_complete=False
         if self.model_evidence.error:
             self.errors.append(self.model_evidence.error)
+        ready=self.ready_sessions(usage_complete)
         views = []
+        # Resolve each home once per publication, not once per retained session.
+        # The next publication resolves again so changed links are still observed.
+        evidence_homes = {}
         for key, s in self.monitor.sessions.items():
             meta = self.metadata.get(key, {})
             s.metadata_seen = bool(meta)
@@ -668,7 +706,8 @@ class UsageIndex:
             if not s.requests and not s.reported_usage and not s.transports and not s.request_state:
                 continue
             view = dict(s.view(now,use_cache=True))
-            view['history'] = self.model_evidence.enrich(s.home, view['history'],s.id)
+            if s.home not in evidence_homes:evidence_homes[s.home]=home_key(s.home)
+            view['history'] = self.model_evidence.enrich_home(evidence_homes[s.home],view['history'],s.id)
             if not meta.get('project') or not meta.get('project_name'):
                 names=self.names.get(str(s.home))
                 if names:
@@ -683,7 +722,7 @@ class UsageIndex:
             view['source'] = meta.get('thread_source') or 'unknown'
             view['cwd'] = (meta.get('cwd') or view['cwd']).removeprefix('\\\\?\\')
             view['turn_states'] = self.turn_states.get(key, {})
-            view['collection_complete'] = usage_complete and not s.pending
+            view['collection_complete'] = key in ready
             old_history=self.history_signatures.get(key)
             if old_history is not None and old_history[0] is view['history']:
                 history_signature=old_history[1]

@@ -314,7 +314,10 @@ class EvidenceReader:
             for row in batch:yield row,evidence[row['key']].rows() if row['key'] in evidence else []
 
     def enrich(self, home, rows, session_id=None):
-        key = home_key(home)
+        return self.enrich_home(home_key(home),rows,session_id)
+
+    def enrich_home(self, key, rows, session_id=None):
+        """Join rows using a home key already resolved for this publication."""
         cache_key=(key,session_id if session_id is not None else id(rows))
         cached = self.cache.get(cache_key)
         if cached is not None and cached[0] is rows:

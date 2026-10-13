@@ -38,6 +38,20 @@ def test_six_categories_merge_independent_sources_and_require_confirmed_recovery
     assert len(state.history)==50 and len(state.records)<=len(state.SOURCES)
 
 
+def test_collection_delay_history_is_distinct_from_failure_and_recovers():
+    state=ErrorState(clock=lambda:100)
+    state.update('collection.service','collection',dict(snapshot_at=60))
+    delay=state.grouped()['collection']
+    assert delay.code=='stale' and delay.severity=='warning' and not delay.notify
+    assert state.history[0]['title']==delay.title!=TITLES['collection']
+    state.update('collection.service','collection',dict(runtime_failed=True))
+    failure=state.grouped()['collection']
+    assert failure.code=='runtime' and failure.title==TITLES['collection']
+    assert state.history[1]['resolution']=='상태 변경'
+    state.update('collection.service','collection',{},healthy=True)
+    assert 'collection' not in state.grouped() and state.history[0]['resolution']
+
+
 def test_pending_cancelled_old_and_unknown_facts_do_not_create_errors():
     assert detect('collection',dict(starting=True,snapshot_at=10),100) is None
     assert detect('collection',dict(expected_stop=True,runtime_failed=True),100) is None

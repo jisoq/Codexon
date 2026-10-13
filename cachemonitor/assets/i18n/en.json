@@ -2435,6 +2435,7 @@
   "프록시 교체 중": "Replacing the proxy",
   "업데이트 적용 완료": "Update applied",
   "수집기 오류 발생": "Collector error",
+  "수집 결과 갱신 지연": "Collection update delayed",
   "분석 오류 발생": "Analysis error",
   "Codex 연결 오류 발생": "Codex connection error",
   "모델 관측 오류 발생": "Model observation error",

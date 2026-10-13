@@ -221,7 +221,8 @@ def test_new_session_loading_does_not_reprocess_existing_call_history(tmp_path):
         next_value=deliver()
         assert ledger.db.total_changes-before<16
         assert overlays.speed_health.metrics['scanned_rows']==1
-        assert next(s for s in next_value['overlay_sessions'] if s['id']=='old')==first['overlay_sessions'][0]
+        old_overlay=next(s for s in next_value['overlay_sessions'] if s['id']=='old')
+        assert old_overlay==dict(first['overlay_sessions'][0],collection_complete=False)
         assert next(s for s in next_value['overlay_sessions'] if s['id']=='new')['calls']==1
         assert engine.sessions[('home','old')]['prepared']['collection_complete'] is False
         assert not engine.query(query)['analysis']['turns'][0]['complete']
@@ -232,6 +233,7 @@ def test_new_session_loading_does_not_reprocess_existing_call_history(tmp_path):
         assert ledger.db.total_changes-before<16
         assert overlays.speed_health.metrics['scanned_rows']==0
         assert all(s['collection_complete'] for s in recovered['sessions'])
+        assert all(s['collection_complete'] for s in recovered['overlay_sessions'])
         assert engine.query(query)['analysis']['turns'][0]['complete']
         corrected=copy.deepcopy(value['sessions'][-1]);corrected['usage_revision']=2
         corrected['history'][0]['output']=30;value['sessions'][-1]=corrected

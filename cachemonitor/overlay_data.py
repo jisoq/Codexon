@@ -312,9 +312,15 @@ class OverlaySummaries:
         for summary in result:
             key=(summary['home'],summary['id'])
             speed=speeds.get(key,{'active':False})
+            # Readiness changes independently of priced history. Include every
+            # displayed descendant without invalidating the expensive summaries.
+            flags=[engine.sessions[member].get('source',engine.sessions[member]['prepared']).get('collection_complete')
+                   for member in rollups[key]['members']]
+            complete=False if False in flags else True if all(flag is True for flag in flags) else None
             previous=self.presented.get(key)
             value=(previous[2] if previous and previous[0] is summary and previous[1]==speed
-                   else dict(summary,speed_health=speed))
+                   and previous[2].get('collection_complete') is complete
+                   else dict(summary,speed_health=speed,collection_complete=complete))
             presented[key]=(summary,speed,value);output.append(value)
         self.presented=presented
         return output

@@ -95,13 +95,16 @@ def test_restart_restores_retained_usage_after_source_removal_without_crossing_h
     finally:index.close()
 
 
-def test_retained_restart_recovery_uses_poll_budget_once_and_reports_partial_loading(tmp_path,monkeypatch):
+@pytest.mark.parametrize('retained_scope',['unrelated','child','unknown'])
+def test_retained_restart_recovery_uses_poll_budget_once_and_reports_partial_loading(tmp_path,monkeypatch,retained_scope):
     import cachemonitor.index as implementation
     home,path=fixture_home(tmp_path);paths=[path]
     for number in (1,2):
         tid=f'8765432{number}-abcd-abcd-abcd-123456789012'
         source=home/f'old-{number}.jsonl'
-        source.write_text(json.dumps(usage(f'old-{number}',tid=tid))+'\n',encoding='utf8')
+        header=([dict(type='session_meta',payload=dict(id=tid,parent_thread_id=TID))]
+                if retained_scope=='child' and number==1 else [])
+        source.write_text(''.join(json.dumps(row)+'\n' for row in [*header,usage(f'old-{number}',tid=tid)]),encoding='utf8')
         paths.append(source)
         with sqlite3.connect(home/'state_5.sqlite') as db:
             db.execute('INSERT INTO threads VALUES(?,?,?,?,?,?,?,?)',
@@ -110,6 +113,9 @@ def test_retained_restart_recovery_uses_poll_budget_once_and_reports_partial_loa
     try:assert len(analyze(finish(index)['sessions'])['responses'])==3
     finally:index.close()
     for source in paths:source.unlink()
+    if retained_scope=='unknown':
+        with sqlite3.connect(cache) as db:db.execute('DELETE FROM metadata WHERE tid=?',(tid,))
+        with sqlite3.connect(home/'state_5.sqlite') as db:db.execute('DELETE FROM threads WHERE id=?',(tid,))
     index=UsageIndex([home],cache);clock=[0.];rebuilt=[];rebuild=index.rebuild
     monkeypatch.setattr(implementation.time,'monotonic',lambda:clock[0])
     def measured(key,now):
@@ -119,10 +125,12 @@ def test_retained_restart_recovery_uses_poll_budget_once_and_reports_partial_loa
         partial=index.poll(10030)
         assert len(rebuilt)==1 and partial['index']['loading']
         assert not partial['usage_collection_complete']
+        assert partial['sessions'][0]['collection_complete'] is (retained_scope=='unrelated')
         complete=finish(index,10030)
         assert len(analyze(complete['sessions'])['responses'])==3
         assert len(rebuilt)==len(set(rebuilt))==3
         assert complete['usage_collection_complete']
+        assert all(session['collection_complete'] for session in complete['sessions'])
         index.poll(10031)
         assert len(rebuilt)==3
     finally:index.close()
