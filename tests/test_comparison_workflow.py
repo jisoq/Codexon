@@ -104,6 +104,52 @@ def test_home_card_and_comparison_controls_accept_rendered_input(dashboard):
     assert not w.qml_errors
 
 
+def test_home_thumbnails_are_bounded_reused_and_navigation_is_not_duplicated(dashboard):
+    from PySide6.QtCore import QPointF
+    from cachemonitor.theme import shared_theme
+    w=dashboard;w.resize(1000,680);home=w.home_panel
+    def rendered(name):
+        return next(item for item in walk(w.quick.rootObject()) if item.objectName()==name and item.isVisible())
+    assert not home._thumbnails
+    assert control(w,w.nav).property('count')==1
+    click(w,rendered('home-card-1'))
+    wait_for_rendered(lambda:w.current_page==1 and not w.analysis_pending)
+    assert control(w,w.nav).property('count')==5
+    w.metric_panel.change('dimension','model')
+    wait_for_rendered(lambda:w.metric_panel.data['dimension']=='model' and rendered('usage-chart-content').width()>0)
+    w.change_page(0)
+    wait_for_rendered(lambda:home._thumbnail_pending is None and 1 in home._thumbnails)
+    first=home._thumbnails[1]
+    assert 0<first.image().width()<=640 and 0<first.image().height()<=360
+    assert control(w,w.nav).property('count')==1
+    assert rendered('home-thumbnail-1').property('source').toString()==first.url().toString()
+    # Revisiting the same displayed data does not allocate another capture.
+    click(w,rendered('home-card-1'))
+    wait_for_rendered(lambda:not w.analysis_pending and w.metric_panel.data['dimension']=='model')
+    w.change_page(0)
+    assert home._thumbnail_pending is None and home._thumbnails[1] is first
+    for page in (5,2,3):
+        click(w,rendered('home-card-'+str(page)))
+        wait_for_rendered(lambda:w.current_page==page and not w.analysis_pending)
+        w.change_page(0)
+        wait_for_rendered(lambda:home._thumbnail_pending is None and page in home._thumbnails)
+    assert set(home._thumbnails)=={1,2,3,5}
+    assert sum(grab.image().sizeInBytes() for grab in home._thumbnails.values())<=4*640*360*4
+    for page in (1,2,3,5):
+        card=rendered('home-card-'+str(page))
+        assert w.quick.rect().contains(card.mapToScene(QPointF(card.width()-1,card.height()-1)).toPoint())
+    click(w,rendered('home-card-1'));w.metric_panel.change('metric','input')
+    wait_for_rendered(lambda:not w.analysis_pending and w.metric_panel.data['metric']=='input')
+    w.change_page(0)
+    assert home._thumbnail_pending is not None
+    theme=shared_theme();mode='dark' if not theme.dark else 'light'
+    theme.configure(mode)
+    wait_for_rendered(lambda:home._thumbnail_pending is None)
+    assert not home._thumbnails and not home.state['thumbnails']
+    theme.configure('light')
+    assert not w.qml_errors
+
+
 def test_project_selection_preserves_filters_and_back_restores_exact_call(dashboard):
     w=dashboard;w.resize(960,720);w.nav.setCurrentRow(w.navigation_pages.index(2))
     wait_for_rendered(lambda: not control(w,w.record_parent).isVisible())
@@ -137,6 +183,58 @@ def test_metric_modes_and_saved_scope_restore_without_changing_home_totals(dashb
     w.restore_state(saved);assert p.options['metric']=='tps' and p.options['dimension']=='model'
     assert p.options['period']=='7d' and p.options['sort']=='name'
     assert not w.qml_errors
+
+
+def test_model_breakdowns_combine_and_drill_down_in_compact_window(dashboard):
+    from PySide6.QtCore import QPointF
+    w=dashboard;w.resize(1000,680);w.change_page(1);p=w.metric_panel
+    source,_=many_efforts();w.receive(source);p.change('dimension','model')
+    def rendered(name):
+        return next(item for item in walk(w.quick.rootObject()) if item.objectName()==name and item.isVisible())
+    wait_for_rendered(lambda:p.data.get('dimension')=='model' and bool(p.state['rows']))
+    assert [entry['value'] for entry in p.state['dimensions']]==['project','model','source']
+    for field in ('service_tier','effort'):
+        click(w,rendered('usage-breakdown-'+field))
+        wait_for_rendered(lambda:field in p.data.get('breakdowns',[]))
+    assert p.options['breakdowns']==['service_tier','effort']
+    assert p.data['count']==18 and p.data['summary']['value']==216
+    def rows_fit():
+        items=[rendered('usage-row-'+row['key']) for row in p.state['rows']]
+        return all(item.mapToScene(QPointF(0,item.height())).y()<w.quick.height() for item in items)
+    wait_for_rendered(rows_fit)
+    row=p.data['rows'][0];scope=p.capture()
+    assert p.state['rows'][0]['groupStart']
+    click(w,rendered('usage-row-'+row['key']))
+    wait_for_rendered(lambda:p.data.get('dimension')=='source')
+    assert all(p.options['filters'][k]==v for k,v in row['filters'].items())
+    assert p.data['summary']['value']==12
+    p.records();wait_for_rendered(lambda:w.current_page==2 and bool(w.record_rows))
+    assert len(w.record_rows)==12
+    assert all(record[field]==value for record in w.record_rows for field,value in row['filters'].items())
+    w.go_back();wait_for_rendered(lambda:w.current_page==1)
+    w.go_back();wait_for_rendered(lambda:p.data.get('dimension')=='model')
+    assert p.capture()==scope
+    chart_top=rendered('usage-chart').mapToScene(QPointF()).y()
+    p.change('dimension','project')
+    wait_for_rendered(lambda:p.data['dimension']=='project' and rendered('usage-chart').mapToScene(QPointF()).y()==chart_top)
+    p.change('dimension','model')
+    wait_for_rendered(lambda:p.data['dimension']=='model' and rendered('usage-chart').mapToScene(QPointF()).y()==chart_top)
+    assert p.options['breakdowns']==['service_tier','effort']
+    saved=w.capture_state();p.change('breakdown:service_tier','false');w.restore_state(saved)
+    wait_for_rendered(lambda:p.data.get('breakdowns')==['service_tier','effort'])
+    click(w,rendered('usage-breakdown-effort'))
+    wait_for_rendered(lambda:p.data.get('breakdowns')==['service_tier'])
+    assert p.data['count']==2 and p.data['summary']['value']==216
+    assert not w.qml_errors
+
+
+def test_saved_single_setting_dimension_restores_as_model_breakdown(dashboard):
+    dashboard.change_page(1);p=dashboard.metric_panel
+    for field in ('effort','service_tier'):
+        p.restore(dict(dimension=field,filters={'project':'saved-project'},selected=[field,'high' if field=='effort' else 'Fast']))
+        assert p.options['dimension']=='model' and p.options['breakdowns']==[field]
+        assert p.options['filters']=={'project':'saved-project'} and p.options['selected'][0]==field
+    assert {choice['key'] for choice in p.state['choices']} >= {'effort','service_tier'}
 
 
 def test_metric_drilldown_ignores_history_filters_and_restores_latest_scope(dashboard):

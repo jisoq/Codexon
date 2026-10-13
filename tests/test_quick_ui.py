@@ -72,9 +72,11 @@ def test_reasoning_tokens_render_independently_of_cost_and_request_unit(tmp_path
     try:
         window.receive({'ts':now,'sessions':[session.view(now)],'homes':[],'errors':[],'unassigned':[]})
         from cachemonitor.dashboard import choose
-        window.change_page(1);window.metric_panel.change('metric','reasoning');window.metric_panel.change('dimension','effort')
-        window.show();QTest.qWait(100)
-        groups={g['key']:g for g in window.metric_panel.data['rows']}
+        window.change_page(1);window.metric_panel.change('metric','reasoning');window.metric_panel.change('dimension','model')
+        window.metric_panel.change('breakdown:effort','true');window.show()
+        from test_ui import wait_for_rendered
+        wait_for_rendered(lambda:len(window.metric_panel.data['rows'])==2)
+        groups={g['filters']['effort']:g for g in window.metric_panel.data['rows']}
         assert groups['low']['value']==0 and groups['low']['known']==1 and groups['low']['partial']
         assert groups['high']['value']==12000 and groups['high']['known']==2
         assert window.metric_panel.data['summary']['value']==12000

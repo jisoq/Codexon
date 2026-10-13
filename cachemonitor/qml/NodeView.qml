@@ -315,7 +315,7 @@ Item {
         ListView {
             implicitWidth: 166; implicitHeight: contentHeight; clip: true
             spacing: 4
-            model: view.s.items; currentIndex: view.s.index; keyNavigationEnabled: true
+            model: view.s.homeOnly ? view.s.items.slice(0,1) : view.s.items; currentIndex: view.s.index; keyNavigationEnabled: true
             onCurrentIndexChanged: if (activeFocus && currentIndex !== view.s.index) view.node.choose(currentIndex)
             delegate: ItemDelegate {
                 id: navigationItem

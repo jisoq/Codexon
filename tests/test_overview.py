@@ -92,3 +92,53 @@ def test_category_partial_tokens_and_equal_weight_call_tps():
     assert summary(rows,'reasoning')['value']==500
     assert summary([dict(output=0,completion_latency_ms=100,response_status='completed')],'tps')['value']==0
     assert summary([rows[2]],'tps')['value'] is None
+
+
+def test_model_breakdowns_partition_calls_preserve_scope_and_reuse_projection(monkeypatch):
+    from copy import deepcopy
+    from cachemonitor.analysis_engine import AnalysisEngine
+    source=session_view();template=source['history'][0];source['history']=[]
+    specs=[('gpt-6-astra','Standard','high',10),('gpt-6-astra','Standard','high',20),
+           ('gpt-6-astra','Standard','high',None),('gpt-6-astra','Fast','high',40),
+           ('gpt-6-astra','Standard','low',80),('gpt-6-astra',None,None,0),
+           ('gpt-5.6-sol','Standard','high',90)]
+    for index,(model,mode,effort,speed) in enumerate(specs):
+        row=deepcopy(template)
+        row.update(key=f'split-{index}',turn=f'split-{index}',model=model,configured_model=model,service_tier=mode,effort=effort,
+                   output=speed,response_status='completed',completion_latency_ms=1000 if speed is not None else None,
+                   ts=template['ts']+index)
+        source['history'].append(row)
+    engine=AnalysisEngine();engine.ingest([source]);now=ts('2026-02-03T00:00:00')
+    q=dict(page=1,start=0,end=now,now=now,period='all',category_usage=True,presentation=True,
+           include_whole_history=False,usage=dict(dimension='model',metric='calls',size=12))
+    for fields,count in (([],2),(['service_tier'],4),(['effort'],4),(['service_tier','effort'],5)):
+        view=engine.page_query({**q,'usage':{**q['usage'],'breakdowns':fields}})['usage']
+        assert view['count']==count and view['summary']['value']==7
+        assert sum(row['value'] for row in view['rows'])==7
+        assert all(set(row['filters'])=={'model',*fields} for row in view['rows'])
+    unknown=next(row for row in view['rows'] if row['filters'].get('service_tier')=='미확인')
+    assert unknown['filters']['effort']=='미확인' and unknown['value']==1
+    combined={**q,'usage':{**q['usage'],'breakdowns':['effort','service_tier'],'size':2}}
+    original=engine.query
+    monkeypatch.setattr(engine,'query',lambda q:pytest.fail('Paging and search must reuse the same split projection'))
+    first=engine.page_query(combined)['usage'];leaves=[]
+    for page in range(first['page_count']):
+        part=engine.page_query({**combined,'usage':{**combined['usage'],'page':page}})['usage']
+        leaves.extend(part['rows'])
+        assert len(part['rows'])<=2 and part['maximum']==first['maximum']
+    assert len({row['key'] for row in leaves})==5
+    assert [row['group'] for row in leaves]==['gpt-6-astra']*4+['gpt-5.6-sol']
+    searched=engine.page_query({**combined,'usage':{**combined['usage'],'search':'Fast'}})['usage']
+    assert searched['count']==1 and searched['summary']['value']==7
+    monkeypatch.setattr(engine,'query',original)
+    selected=next(row for row in leaves if row['filters']==dict(model='gpt-6-astra',service_tier='Standard',effort='high'))
+    detail=engine.page_query({**q,**selected['filters'],'usage':dict(dimension='source',metric='calls',
+        selected=[value for pair in selected['filters'].items() for value in pair])})['usage']
+    assert detail['summary']['value']==3 and detail['detail']['selection']==selected['filters']
+    assert detail['detail']['first']==template['ts'] and detail['detail']['last']==template['ts']+2
+    missing=engine.page_query({**q,**unknown['filters']})['usage']
+    assert missing['summary']['value']==1
+    speeds=engine.page_query({**combined,'usage':{**combined['usage'],'metric':'tps','size':12}})['usage']
+    high=next(row for row in speeds['rows'] if row['filters']==selected['filters'])
+    assert high['value']==15 and high['known']==2 and high['total']==3
+    assert high['group_value']==30 and speeds['summary']['value']==40

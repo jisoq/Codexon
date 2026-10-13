@@ -523,6 +523,7 @@ class Dashboard(TrayWindow):
             widths=self.table.state['widths'],temporary=copy.deepcopy(self.temporary_context))
 
     def restore_state(self,state,initial=False):
+        if not initial and self.current_page!=state.get('page',0):self.home_panel.remember_page(self.current_page)
         previous=self.restoring;self.restoring=True
         self.history_navigation.restore({} if initial else state.get('history_navigation',{}))
         for key,value in state.get('common',{}).items():
@@ -710,6 +711,7 @@ class Dashboard(TrayWindow):
     def change_page(self,index):
         if self.restoring:return
         if self.current_page!=index:
+            self.home_panel.remember_page(self.current_page)
             self.save_page_scope();self.forward_stack.clear()
         scope=self.page_scopes.get(index) if self.current_page!=index else None
         if self.current_page in (0,2):
@@ -723,6 +725,7 @@ class Dashboard(TrayWindow):
                 if value and node.findData(value)<0:node.addItem(Verbatim(str(value)),value)
                 choose(node,value)
             self.date_start.setText(scope['dates'][0]);self.date_end.setText(scope['dates'][1]);self.archive.setChecked(scope['archive'])
+        self.nav.put(homeOnly=self.current_page==0)
         self.nav.setCurrentRow(self.navigation_pages.index(self.current_page) if self.current_page in self.navigation_pages else -1)
         self.settings_button.put(checked=self.current_page==4)
         for key,attr in (('model','model'),('effort','effort'),('service_tier','mode')):
@@ -1142,6 +1145,7 @@ class Dashboard(TrayWindow):
         if event.type()==QEvent.WindowStateChange:self.sync_report_demand()
 
     def closeEvent(self,event):
+        if self.quitting:self.home_panel.clear_thumbnails(closing=True)
         self.settings.setValue('dashboard/geometry',self.saveGeometry());self.save_preferences();super().closeEvent(event)
     def check_stale(self):
         if not self.quitting:
