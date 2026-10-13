@@ -169,6 +169,7 @@ def test_waiting_state_becomes_observed_zero_and_keeps_history_during_lookup_fai
         assert '0%p' not in text and '$0.0000' not in text
         assert not panel.history.isVisible() and not panel.history_controls.isVisible()
         assert not panel.history_legend.isVisible() and not panel.conversion.isVisible()
+        assert not control(host,panel.manage_button).isVisible()
         assert host.grab().save(str(tmp_path/f'한도수집대기_{width}.png'))
         # Five-hour allowances belong to the sidebar and cannot stand in
         # for the weekly cost evidence this page is waiting for.
@@ -186,6 +187,7 @@ def test_waiting_state_becomes_observed_zero_and_keeps_history_during_lookup_fai
         assert panel.statistics['total'] and panel.basis.text()=='0%p'
         assert panel.cost_value.text()=='$0.0000'
         assert panel.history.isVisible() and panel.history_legend.isVisible()
+        assert control(host,panel.manage_button).isVisible()
         assert not panel.history_waiting.isVisible() and panel.conversion.isVisible()
         assert panel.history.rows
         rows=panel.history.rows

@@ -303,7 +303,7 @@ def _continuous_quota_intervals(cycles):
                            'observation_gaps_excluded':True}
 
 
-def quota_statistics(report, start=None, end=None, include_mode_assumptions=False, *, _requests=None):
+def quota_statistics(report, start=None, end=None, include_mode_assumptions=False, *, _requests=None, _cache=None):
     """Use complete disjoint intervals; preserve the base result under assumptions."""
     from .analytics import quantile
     from .quota_exclusions import retained_intervals
@@ -326,8 +326,24 @@ def quota_statistics(report, start=None, end=None, include_mode_assumptions=Fals
         for cycle in scoped:
             if current_account and cycle.get('account')!=current_account:continue
             points=cycle.get('endpoints',[])
-            overlapping=requests.overlapping(points[0][0],points[-1][0]) if points else ()
-            parts,diagnostics=local_request_intervals(cycle,overlapping,_clip_quota_interval,_quota_clipper)
+            overlapping=list(requests.overlapping(points[0][0],points[-1][0])) if points else []
+            key=signature=cached=None
+            if _cache is not None and 'id' in cycle:
+                key=(cycle['id'],cycle['start'],cycle['end'])
+                signature=({**{k:v for k,v in cycle.items() if k not in ('cost_complete_at','cycle_end')},
+                            'cost_complete_at':min(cycle['cost_complete_at'],cycle['end']) if cycle.get('cost_complete_at') is not None else None},overlapping)
+                cached=_cache.get(key)
+            if cached and cached[0]==signature:
+                parts,diagnostics=cached[1:3]
+                parts=[{**part,**{k:cycle[k] for k in ('cost_complete_at','cycle_end') if k in cycle}} for part in parts]
+            else:
+                parts,diagnostics=local_request_intervals(cycle,overlapping,_clip_quota_interval,_quota_clipper)
+                if key is not None:
+                    weight=len(points)+len(cycle.get('cost_rows',[]))+len(overlapping)
+                    weight+=sum(1+len(part.get('endpoints',[]))+len(part.get('cost_rows',[])) for part in parts)
+                    if weight<=131072:_cache[key]=(signature,parts,diagnostics,weight)
+                    while len(_cache)>256 or sum(item[3] for item in _cache.values())>131072:
+                        _cache.pop(next(iter(_cache)))
             local.extend(parts)
             for key in attribution:attribution[key]+=diagnostics[key]
         scoped=local
@@ -402,7 +418,7 @@ def quota_statistics(report, start=None, end=None, include_mode_assumptions=Fals
         'account_delta':account_delta,'attribution':attribution}
 
 
-def quota_value_history(report, rows, *, _requests=None):
+def quota_value_history(report, rows, *, _requests=None, _cache=None, _statistics_cache=None):
     """Align monetary evidence to the chart's *observed* reset boundaries.
 
     Reset classification belongs to history_rows/ResetTracker. Storage intervals
@@ -431,27 +447,38 @@ def quota_value_history(report, rows, *, _requests=None):
     if forward and _requests is None:
         from .quota_attribution import RequestWindows
         _requests=RequestWindows(report.get('request_windows',[]))
+    previous_cache=dict(_cache) if _cache is not None else {}
+    if _cache is not None:_cache.clear()
     for index, group in enumerate(groups):
         start = group['start']
         end = (math.nextafter(groups[index+1]['start'], -math.inf)
                if index+1 < len(groups) else rows[-1]['at'])
         own = [c for c in cycles if c['end'] >= start and c['start'] <= end]
-        summary = quota_statistics({**report, 'account': account, 'cycles': own}, start, end, _requests=_requests)
+        signature=None
+        if _cache is not None:
+            inputs=[{**{k:v for k,v in c.items() if k not in ('cost_complete_at','cycle_end')},
+                     'cost_complete_at':min(c['cost_complete_at'],c['end']) if c.get('cost_complete_at') is not None else None}
+                    for c in own]
+            signature=(account,forward,group,inputs,end,
+                       [r for r in exclusions if r['start']<end and r['end']>start],
+                       list(_requests.overlapping(start,end)) if _requests is not None else None,
+                       (report.get('tracking') or {}).get('complete'))
+            cached=previous_cache.get(start)
+            if cached and cached[0]==signature:
+                result.extend(cached[1])
+                if cached[2] is not None:periods.append({**cached[2],'current':index==len(groups)-1})
+                _cache[start]=cached
+                continue
+        result_start=len(result);period_start=len(periods)
+        summary = quota_statistics({**report, 'account': account, 'cycles': own}, start, end, _requests=_requests,_cache=_statistics_cache)
         intervals = [c for c in summary['intervals']
                      if not account or not c.get('account') or c['account'] == account]
         ranges=sorted((c['start'],c['end']) for c in intervals)
         display_ranges = ranges
         if exclusions:
-            original = quota_statistics({**report, 'account': account, 'cycles': own, 'exclusions': []}, start, end, _requests=_requests)
+            original = quota_statistics({**report, 'account': account, 'cycles': own, 'exclusions': []}, start, end, _requests=_requests,_cache=_statistics_cache)
             display_ranges = sorted((c['start'], c['end']) for c in original['intervals'])
         display_position=0
-        running_starts=[];running_ends=[]
-        for c in intervals:
-            if not c.get('local_attributed'):continue
-            for r in c.get('cost_rows',[]):
-                if r.get('request_start') is not None and r['request_start']<r['ts']:
-                    running_starts.append(r['request_start']);running_ends.append(r['ts'])
-        running_starts.sort();running_ends.sort()
         events = []
         for interval in intervals:
             endpoints = [(at, used) for at, used in interval.get('endpoints', [])
@@ -478,7 +505,8 @@ def quota_value_history(report, rows, *, _requests=None):
                     position += 1
                 delta = max(0, used-endpoints[0][1])
                 pending = any(t <= at for t in interval.get('pending_usage_times', []))
-                cost = (subtotal if priced else 0 if not position and
+                # Consumption needs a recorded cost; a collection checkpoint is not zero-dollar evidence.
+                cost = (subtotal if priced else 0 if not position and delta == 0 and
                         ((interval['cost_complete_at'] is not None and interval['cost_complete_at'] >= at) if 'cost_complete_at' in interval else interval.get('cost_complete')) and not pending else None)
                 if not forward and (missing or not priced):
                     cost = None
@@ -512,9 +540,8 @@ def quota_value_history(report, rows, *, _requests=None):
             if row['reset_kind'] and matches:
                 value = 0.0
             ratio = value/delta*100 if value is not None and delta > 0 else None
-            value_pending=bisect_right(running_starts,row['at'])>bisect_right(running_ends,row['at'])
-            value_held = (value_pending or ratio is None) and last_ratio is not None and matches
-            if value_pending or ratio is None:
+            value_held = ratio is None and last_ratio is not None and matches
+            if ratio is None:
                 ratio = last_ratio if matches else None
             else:
                 last_ratio = ratio
@@ -522,7 +549,7 @@ def quota_value_history(report, rows, *, _requests=None):
             result.append({**row, 'cycle_start': start, 'cycle_cost': value,
                            'cycle_value': ratio, 'cycle_delta':delta,
                            'confirmed_cost':confirmed_cost, 'confirmed_delta':confirmed_delta, 'value_held':value_held,
-                           'local_observed':local_observed,'local_range':display_position,'value_pending':value_pending,
+                           'local_observed':local_observed,'local_range':display_position,
                            'user_excluded':bool(excluded),
                            'user_exclusion_end':bool(excluded) and all(r['end']==row['at'] for r in excluded),
                            'exclusion_ids':[r.get('id') for r in excluded],
@@ -540,6 +567,8 @@ def quota_value_history(report, rows, *, _requests=None):
                             'calls': summary['observed_calls'],
                             'value': value*100 if value is not None else None})
             periods[-1]['cost_intervals']=intervals
+        if _cache is not None:
+            _cache[start]=(signature,result[result_start:],periods[-1] if len(periods)>period_start else None)
     return result, periods
 
 
@@ -649,6 +678,7 @@ class QuotaLedger:
         # connections. Heartbeats have separate freshness handling below.
         self.db.execute('CREATE TABLE IF NOT EXISTS report_revision(id INTEGER PRIMARY KEY,value INTEGER NOT NULL)')
         self.db.execute('INSERT OR IGNORE INTO report_revision VALUES(1,0)')
+        self.db.execute('CREATE TABLE IF NOT EXISTS report_changes(slot INTEGER PRIMARY KEY,revision INTEGER,table_name TEXT,at REAL)')
         tables=('observations','observation_context','window_observations','weekly_window_refs',
                 'calls','manual_resets','coverage_issues','quota_exclusions','state',
                 'tracking_config','tracking_policies','tracking_controls','tracking_tasks',
@@ -661,9 +691,70 @@ class QuotaLedger:
             condition=' OR '.join(f'old."{column}" IS NOT new."{column}"' for column in columns if column not in ignored)
             for operation in ('INSERT','UPDATE','DELETE'):
                 when=f' WHEN {condition}' if operation=='UPDATE' else ''
-                self.db.execute(f'CREATE TRIGGER IF NOT EXISTS report_{table}_{operation.lower()} '
-                    f'AFTER {operation} ON {table}{when} BEGIN UPDATE report_revision SET value=value+1 WHERE id=1; END')
+                name=f'report_{table}_{operation.lower()}'
+                existing=self.db.execute('SELECT sql FROM sqlite_master WHERE type=\'trigger\' AND name=?',(name,)).fetchone()
+                if existing and 'ON CONFLICT(slot)' in existing[0]:continue
+                self.db.execute(f'DROP TRIGGER IF EXISTS {name}')
+                column={'observations':'at','window_observations':'at','calls':'ts',
+                        'tracking_observations':'received'}.get(table)
+                times=[f'{side}.{column}' for side in (('old','new') if operation=='UPDATE' else ('old',) if operation=='DELETE' else ('new',))] if column else []
+                if table in ('observation_context','weekly_window_refs'):
+                    field='id' if table=='observation_context' else 'observation_id'
+                    times=[f'(SELECT at FROM observations WHERE id={side}.{field})' for side in
+                           (('old','new') if operation=='UPDATE' else ('old',) if operation=='DELETE' else ('new',))]
+                at=('min('+','.join(times)+')' if len(times)>1 else times[0]) if times else 'NULL'
+                # A fixed ring bounds durable change tracking. A lagging reader
+                # reloads authoritative rows if any revision has fallen out.
+                self.db.execute(f'CREATE TRIGGER {name} AFTER {operation} ON {table}{when} BEGIN '
+                    'UPDATE report_revision SET value=value+1 WHERE id=1; '
+                    f"INSERT INTO report_changes SELECT value%1024,value,'{table}',{at} FROM report_revision WHERE id=1 "
+                    'ON CONFLICT(slot) DO UPDATE SET revision=excluded.revision,table_name=excluded.table_name,at=excluded.at; END')
         self.db.commit()
+
+    def _report_rows(self, key, sql, params, tables, time_column=None, clock=False):
+        """Reuse immutable SQL rows; re-read only a changed ordered time suffix."""
+        cache=getattr(self,'_input_cache',None)
+        changes=getattr(self,'_input_changes',None)
+        if cache is None or changes is None:return list(self.db.execute(sql,params))
+        previous=cache.get(key)
+        signature=params[:-1] if clock else params
+        relevant=[at for table,at in changes if table in tables]
+        if previous and previous[0]==signature and not relevant:return previous[1]
+        lower=None
+        if previous and previous[0]==signature and time_column and relevant and all(at is not None for at in relevant):
+            lower=min(relevant)
+        if lower is None:
+            rows=list(self.db.execute(sql,params))
+            weights=[0];suffix=rows
+        else:
+            field=time_column.split('.')[-1]
+            # The cached query is ordered by this timestamp. Late corrections
+            # and deletes replace its entire affected suffix, including ties.
+            left=0;right=len(previous[1])
+            while left<right:
+                mid=(left+right)//2
+                if previous[1][mid][field]<lower:left=mid+1
+                else:right=mid
+            head,order=sql.rsplit(' order by ',1)
+            suffix=list(self.db.execute(head+f' and {time_column}>=? order by '+order,(*params,lower)))
+            rows=previous[1][:left]+suffix;weights=previous[3][:left+1]
+        # Do not evict the earlier queries of every report to admit its later
+        # queries: that turns a working set above budget into perpetual misses.
+        # Oversized inputs remain authoritative SQL reads, without extra scans
+        # merely to estimate data that cannot fit the remaining cache budget.
+        available=64*1024*1024-sum(item[2] for name,item in cache.items() if name!=key)
+        minimum=weights[-1]+len(suffix)*(144+32*len(suffix[0])) if suffix else weights[-1]
+        if minimum>available:
+            cache.pop(key,None)
+            return rows
+        for row in suffix:
+            weights.append(weights[-1]+144+32*len(row)+sum(len(v)*4 if isinstance(v,str) else len(v) if isinstance(v,bytes) else 32 for v in row))
+            if weights[-1]>available:
+                cache.pop(key,None)
+                return rows
+        weight=weights[-1]
+        cache[key]=(signature,rows,weight,weights)
+        return rows
 
     def rebuild_mode_evidence(self,home):
         """Replay sanitized setting events by log order, including backfilled evidence."""
@@ -1053,9 +1144,18 @@ class QuotaLedger:
                     return {**report,'at':now,'index_at':state['at'] if state else None,'index_complete_at':complete_at,
                         'cycles':[{**cycle,'cycle_end':now} if position==0 and cycle['cycle_end']==cached['at'] else cycle
                                   for position,cycle in enumerate(report['cycles'])]}
+            if own_transaction:
+                before=getattr(self,'_input_revision',None)
+                events=(list(self.db.execute('SELECT revision,table_name,at FROM report_changes WHERE revision>? ORDER BY revision',(before,)))
+                        if before is not None and before<=revision else [])
+                valid=(cached and cached['home']==home and cached['at']<=now<cached['until'] and before is not None
+                       and revision-before==len(events))
+                if not valid:self._input_cache={}
+                self._input_changes=[(r['table_name'],r['at']) for r in events] if valid else []
             report=self._report(home,now)
             self._report_generation=getattr(self,'_report_generation',0)+1
             if own_transaction:
+                self._input_revision=revision
                 future=[]
                 for table,columns in (('observations',('at',)),('window_observations',('at',)),
                     ('manual_resets',('at',)),('calls',('ts',)),('tracking_controls',('at',)),
@@ -1066,9 +1166,13 @@ class QuotaLedger:
                         if boundary is not None:future.append(boundary)
                 self._report_cache=dict(home=home,revision=revision,at=now,until=min(future,default=float('inf')),
                     ends=sorted({c['end'] for c in report['cycles']}|{r['at'] for r in report['history']}),report=dict(report))
-            else:self._report_cache=None
+            else:self._report_cache=None;self._input_cache={};self._input_revision=None
             return report
+        except Exception:
+            self._input_cache={};self._input_revision=None
+            raise
         finally:
+            self._input_changes=None
             if own_transaction:self.db.rollback()
 
     def _report(self, home, now=None, *, exclusion_only=False):
@@ -1076,24 +1180,24 @@ class QuotaLedger:
         tables = {r[0] for r in self.db.execute("select name from sqlite_master where type='table'")}
         config=self.db.execute('select started from tracking_config where home=?',(home,)).fetchone() if 'tracking_config' in tables else None
         cutoff=config[0] if config else float('-inf')
-        contexts = ({r['id']:dict(r) for r in self.db.execute('select c.* from observation_context c join observations o on c.id=o.id where o.home=? and o.at>=?',(home,cutoff))}
+        contexts = ({r['id']:dict(r) for r in self._report_rows('contexts','select c.*,o.at from observation_context c join observations o on c.id=o.id where o.home=? and o.at>=? order by o.at,c.id',(home,cutoff),('observation_context','observations'),'o.at')}
                     if 'observation_context' in tables else {})
         raw = [{**dict(row), **{k:contexts.get(row['id'],{}).get(k,'') for k in ('plan','bucket')}}
-               for row in self.db.execute('select * from observations where home=? and at>=? and at<=? order by at,id', (home,cutoff,now))]
+               for row in self._report_rows('observations','select * from observations where home=? and at>=? and at<=? order by at,id', (home,cutoff,now),('observations',),'at',clock=True)]
         observations = [r for r in raw if type(r['used']) in (int,float)
                         and math.isfinite(r['used']) and 0 <= r['used'] <= 100
                         and r['minutes']==10080]
         from .quota_tracking_store import build
-        tracking = build(self.db, home, now, context_only=exclusion_only)
+        tracking = build(self.db, home, now, context_only=exclusion_only, read_rows=self._report_rows)
         current_account = (tracking.get('account') if tracking is not None else None) or next((r['account'] for r in reversed(observations) if r['account']), '')
-        history = ([dict(r) for r in self.db.execute('select * from window_observations where home=? and at>=? and at<=? order by at,id',(home,cutoff,now))]
+        history = ([dict(r) for r in self._report_rows('windows','select * from window_observations where home=? and at>=? and at<=? order by at,id',(home,cutoff,now),('window_observations',),'at',clock=True)]
                    if 'window_observations' in tables else [])
         if 'weekly_window_refs' in tables:
             raw_by_id={r['id']:r for r in raw}
             referenced=[{**raw_by_id[observation_id],'id':window_id,'window':'weekly'}
-                for window_id,observation_id in self.db.execute('''select r.window_id,r.observation_id
+                for window_id,observation_id,_ in self._report_rows('refs','''select r.window_id,r.observation_id,o.at
                     from observations o join weekly_window_refs r on r.observation_id=o.id
-                    where o.home=? and o.at>=? and o.at<=?''',(home,cutoff,now))]
+                    where o.home=? and o.at>=? and o.at<=? order by o.at,r.window_id''',(home,cutoff,now),('observations','weekly_window_refs'),'o.at',clock=True)]
             referenced_ids={r['id'] for r in referenced}
             history=[r for r in history if r['id'] not in referenced_ids]+referenced
         # Existing ledgers retain their weekly observations without rewriting raw evidence.
@@ -1127,8 +1231,8 @@ class QuotaLedger:
                   if 'coverage_issues' in tables else [])
         # The primary key already makes response IDs unique within one home.
         if len(scope)==1:
-            calls=list(self.db.execute('select *,1 as copy_rank from calls where home=? and ts>=? '
-                'and model<>? order by ts,uid',(*scope,cutoff,INTERNAL_REVIEW_MODEL)))
+            calls=self._report_rows('calls','select *,1 as copy_rank from calls where home=? and ts>=? '
+                'and model<>? order by ts,uid',(*scope,cutoff,INTERNAL_REVIEW_MODEL),('calls',),'ts')
         else:
             calls = list(self.db.execute(f'''select * from (
                 select *,row_number() over(partition by uid order by cost is null,home) as copy_rank
@@ -1180,6 +1284,10 @@ class QuotaLedger:
         if not hasattr(self, '_mode_alternatives'):
             self._mode_alternatives = {}
         result = []
+        previous_cycles=(getattr(self,'_cycle_cache',{}) if tracking is not None and
+                         getattr(self,'_input_changes',None) is not None else {})
+        cycle_cache={}
+        self._cycle_rebuilds=0
         def window_calls(start, end):
             rows = calls[bisect_right(call_times,start):bisect_right(call_times,end)]
             if tracking is not None:
@@ -1219,6 +1327,25 @@ class QuotaLedger:
                 group['discontinuous'] = True
             next_group = groups[i+1] if i+1 < len(groups) else None
             cycle_end = next_group['boundary'] if next_group else now
+            # Exact input equality also catches backfilled costs, model changes,
+            # reset-boundary corrections and request completion corrections.
+            # The current time and a completed coverage heartbeat are metadata,
+            # so they do not invalidate a closed accounting interval.
+            signature=None
+            if tracking is not None and obs:
+                lo=group['boundary'];hi=cycle_end
+                coverage=min(completed_at,obs[-1]['at']) if completed_at is not None else None
+                signature=(group,(next_group['boundary'],next_group['reason'],next_group.get('manual_reset')) if next_group else None,
+                           calls[bisect_right(call_times,lo):bisect_right(call_times,hi)],
+                           [r for r in tracking.get('pending_responses',[]) if r['start']<=hi and (r['end'] is None or r['end']>=lo)],
+                           issues,coverage,tracking['complete'],state['unclassified'] if state else None)
+                cached=previous_cycles.get(group['id'])
+                if cached and cached[0]==signature:
+                    cycle={**cached[1],'cost_complete_at':completed_at}
+                    if not next_group and not cycle['uncertain_gap']:cycle['cycle_end']=now
+                    result.append(cycle);cycle_cache[group['id']]=(signature,cycle)
+                    continue
+            self._cycle_rebuilds+=1
             if not obs:
                 result.append({'id':group['id'], 'reason':group['reason'],
                     'start':group['boundary'], 'end':group['boundary'],
@@ -1380,6 +1507,7 @@ class QuotaLedger:
                 'manual_reset_id':marker['id'] if marker else None, 'reset_pending':False,
                 'observation_gap':bool(group.get('gap')),
                 'unclassified_sessions': state['unclassified'] if state else None})
+            if signature is not None:cycle_cache[group['id']]=(signature,result[-1])
         relevant_resets = [r for r in manual_resets if not current_account or not r['account'] or r['account']==current_account]
         last_reset = relevant_resets[-1] if relevant_resets else None
         pending = any(r.get('reset_pending') and r['manual_reset_id']==last_reset['id'] for r in result) if last_reset else False
@@ -1393,6 +1521,7 @@ class QuotaLedger:
                 if old is None or (row['end'] is not None and old['end'] is None):
                     by_response[row['response']]=dict(uid=row['response'],start=row['start'],end=row['end'])
             request_windows=list(by_response.values())
+        if getattr(self,'_input_changes',None) is not None:self._cycle_cache=cycle_cache
         return {**({'request_windows':request_windows} if tracking is not None else {}),
                 **context,
                 'manual_resets':manual_resets,'cycles': list(reversed(result)), 'price_id': PRICE_ID, 'index_at': state['at'] if state else None,
@@ -1403,3 +1532,4 @@ class QuotaLedger:
 
     def close(self):
         self.db.close()
+        self._input_cache={};self._cycle_cache={};self._report_cache=None

@@ -117,3 +117,34 @@ def test_compact_default_refreshes_keep_a_bounded_result_cache(tmp_path):
     assert not worker.requests
     assert panel.cost_value.text()==usd(6)
     app.processEvents()
+
+
+def test_selected_graph_rejects_old_choice_and_reuses_matching_refresh(tmp_path):
+    from cachemonitor.quota_worker import QuotaComputation
+    from cachemonitor.quota_panel import QuotaPanel
+    from test_quota_value_history import sample_report
+    app=QApplication.instance() or QApplication([])
+    engine=QuotaComputation();worker=QueryWorker()
+    compact=engine._prepare(sample_report())
+    panel=QuotaPanel(QSettings(str(tmp_path/'charts.ini'),QSettings.IniFormat))
+    panel.receive(dict(report={**compact,'_worker':worker}))
+    assert panel.history.rows[-1]['at']==280
+    assert panel.manage_button.isVisible()
+    panel.cycle_choice.setCurrentIndex(panel.cycle_choice.findData(100))
+    assert not panel.manage_button.isVisible() and panel.history_empty.isVisible()
+    first=worker.requests[-1]
+    panel.cycle_choice.setCurrentIndex(panel.cycle_choice.findData(160))
+    latest=worker.requests[-1]
+    worker.result.emit(engine.execute(dict(first,id=2)))
+    assert panel.history.rows[-1]['at']==280
+    worker.result.emit(engine.execute(dict(latest,id=3)))
+    assert panel.history.rows[-1]['at']==220
+    assert panel.manage_button.isVisible() and not panel.history_empty.isVisible()
+    digest=panel.history.series['_content_digest']
+    refreshed=engine._prepare(sample_report(),selection=160,known_digest=digest)
+    assert refreshed['view']['chart']['series'] is None
+    pending=len(worker.requests)
+    panel.receive(dict(report={**refreshed,'_worker':worker}))
+    assert len(worker.requests)==pending and panel.history.rows[-1]['at']==220
+    assert panel.cycle_choice.currentData()==160
+    app.processEvents()

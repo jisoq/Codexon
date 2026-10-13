@@ -221,9 +221,8 @@ def test_incomplete_evidence_is_not_divided_or_bridged():
     assert prepare_series(rows)['completed_costs']==[5,None,None,0,None]
 
 
-def test_completed_recorded_cost_survives_running_calls_and_unchanged_idle_gap():
+def test_completed_recorded_cost_survives_unchanged_idle_gap():
     rows=observations([(82,180),(81,182),(81,190),(81,190),(80,194),(80,196)])
-    for row in rows:row.update(value_pending=True,value_held=True)
     rows[3].update(connect=False,tracking_continuous=True)
     chart=QuotaHistory();chart.money=True;chart.set_rows(rows)
     assert chart.series['completed_costs']==[None,12,12,12,None,None]

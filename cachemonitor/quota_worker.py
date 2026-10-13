@@ -17,7 +17,24 @@ def compact_summary(summary):
     return {**summary, 'intervals': []}
 
 
-def compact_report(report, revision):
+def chart_result(view, selection=None, known_digest=None):
+    """Transfer one exact chart, or its identity when the receiver already has it."""
+    periods = view['periods']
+    if selection != 'all' and not any(p['start'] == selection for p in periods):
+        selection = periods[0]['start'] if periods else 'all'
+    if selection=='all' and view['overall'] is None:
+        from .quota_view import prepare_overall
+        view['overall']=prepare_overall(view['_overall_parts'],view['_exclusions'])
+    source = view['overall'] if selection == 'all' else next(p['series'] for p in periods if p['start'] == selection)
+    digest = source.get('_content_digest')
+    if digest is None:
+        digest = hashlib.sha256(pickle.dumps(source, protocol=5)).hexdigest()
+        source['_content_digest'] = digest
+    return dict(selection=selection, digest=digest,
+                series=None if digest == known_digest else source)
+
+
+def compact_report(report, revision, selection=None, known_digest=None):
     from .quota_view import prepare_quota_query
     view = report['view']
     summaries = {}
@@ -25,13 +42,15 @@ def compact_report(report, revision):
     for key, summary in view.get('summaries', {}).items():
         summaries[key] = prepared.setdefault(id(summary), compact_summary(summary))
     lifetime = prepared.get(id(view['lifetime'])) or compact_summary(view['lifetime'])
-    def series(value):
-        return {**value, '_content_digest': hashlib.sha256(pickle.dumps(value, protocol=5)).hexdigest()}
-    prepared_view = {**view, 'lifetime': lifetime, 'summaries': summaries,
+    prepared_view = {key:value for key,value in view.items() if key not in ('overall','periods','five_hour') and not key.startswith('_')}
+    prepared_view.update(lifetime=lifetime, summaries=summaries,
+        has_history=any(p['series']['rows'] for p in view['periods']),
+        chart=chart_result(view, selection, known_digest),
+        periods=[{key:value for key,value in period.items() if key != 'series'} for period in view['periods']],
+        default_query=prepare_quota_query(report, {}))
+    prepared_view.update({
         'tracking_started': (report.get('tracking') or {}).get('started'),
-        'default_query': prepare_quota_query(report, {}), 'overall': series(view['overall']),
-        'periods': [{**period, 'series': series(period['series'])} for period in view['periods']],
-        'five_hour': series(view['five_hour'])}
+    })
     return {**{key: report[key] for key in ('home', 'account', 'at', 'index_loading', 'error', 'exclusions')
                if key in report},
             'worker_revision': revision,
@@ -55,7 +74,7 @@ class QuotaComputation:
             self.ledger_generation += 1
         return self.ledger
 
-    def _prepare(self, report, history_revision=None):
+    def _prepare(self, report, history_revision=None, selection=None, known_digest=None):
         from .quota_view import prepare_quota_view
         report=dict(report)
         if history_revision is not None:report['_history_revision']=history_revision
@@ -72,12 +91,12 @@ class QuotaComputation:
                 summaries[days]=(view['lifetime'] if start<=earliest else
                     quota_statistics(report,start,include_mode_assumptions=True,_requests=requests))
             report['view']={**view,'summaries':summaries}
-        else:report['view'] = prepare_quota_view(report)
+        else:report['view'] = prepare_quota_view(report,previous['view'] if previous else None,deferred=True)
         revision = uuid4().hex
         self.reports[revision] = report
         while len(self.reports) > 2:
             self.reports.popitem(last=False)
-        return compact_report(report, revision)
+        return compact_report(report, revision, selection, known_digest)
 
     def execute(self, request, phase=lambda value: None):
         kind = request['kind']
@@ -103,13 +122,16 @@ class QuotaComputation:
                     phase('reading')
                 raw=ledger.report(self.home)
                 generation=getattr(ledger,'_report_generation',None)
-                result['report'] = self._prepare(raw,(self.ledger_generation,generation) if generation is not None else None)
-            elif kind in ('preview', 'query'):
+                result['report'] = self._prepare(raw,(self.ledger_generation,generation) if generation is not None else None,
+                                                request.get('selection'),request.get('digest'))
+            elif kind in ('preview', 'query', 'chart'):
                 report = self.reports.get(request['revision'])
                 if report is None:
                     result.update(stale=True, error='사용한도 기록이 갱신되었습니다.')
                     return result
-                if kind == 'preview':
+                if kind == 'chart':
+                    result['value'] = chart_result(report['view'], request.get('selection'), request.get('digest'))
+                elif kind == 'preview':
                     from .quota_exclusions import preview_exclusion
                     result['value'] = preview_exclusion(report, request['start'], request['end'])
                 else:
@@ -161,7 +183,7 @@ def process_main(connection, path, home):
 class QuotaWorker(QObject):
     """Only the transport thread serializes requests or receives Python objects."""
     result = Signal(object)
-    COALESCED = frozenset(('report', 'prepare', 'preview', 'query'))
+    COALESCED = frozenset(('report', 'prepare', 'preview', 'query', 'chart'))
     WRITING = frozenset(('pending-write', 'writing'))
 
     def __init__(self, path=None, home=None, *, on_result=None, process_target=None):
@@ -181,12 +203,20 @@ class QuotaWorker(QObject):
         self.process = None
         self.phase = 'idle'
         self.restart_count = 0
+        self.chart_selection = None
+        self.chart_digest = None
+
+    def select_chart(self, selection, digest=None):
+        with self.lock:
+            self.chart_selection, self.chart_digest = selection, digest
 
     def request(self, kind, key=None, **payload):
         with self.lock:
             if self.closing.is_set():
                 return None
             self.sequence += 1
+            if kind in ('report','exclude','restore'):
+                payload.update(selection=self.chart_selection,digest=self.chart_digest)
             request = dict(kind=kind, id=self.sequence, key=key, **payload)
             self._queue(request)
             if self.thread is None:

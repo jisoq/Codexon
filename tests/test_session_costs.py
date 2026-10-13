@@ -159,7 +159,7 @@ def test_real_session_table_shows_parent_without_own_calls_and_click_keeps_break
         assert selected['group']['own_cost']==0 and selected['group']['calls']==1
         assert selected['group']['child_cost']==own_child['cost']
         assert control(window,window.session_scope).isVisible()
-        assert usd(own_child['cost']) in window.session_scope.text()
+        assert usd(selected['summary']['cost']) in window.session_scope.text()
         assert usd(0) in window.history_summary.text() and usd(own_child['cost']) in window.history_summary.text()
         assert window.snapshot['internal_review_calls']==1
         assert window.grab().save(str(tmp_path/'parent-cost.png'))

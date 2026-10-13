@@ -29,18 +29,12 @@ def test_approved_pages_render_with_stable_routes_and_aligned_fields(tmp_path, l
             # A field has exactly one rendered owner after moving between pages.
             views=[item for item in walk(window.quick.rootObject()) if item.property('node') is window.period and item.metaObject().indexOfProperty('sourceComponent')>=0]
             assert len(views)==1
-            assert control(window,window.period).isVisible()
+            assert control(window,window.period).isVisible()==(page==2)
             if page==0:
-                click(window,render_plot(window,window.efficiency_details.toggle))
-                for caption in window.metric_captions:
-                    item=render_plot(window,caption)
-                    rendered=next(child for child in walk(item) if child.isVisible() and child.metaObject().indexOfProperty('truncated')>=0)
-                    assert not rendered.property('truncated')
-                    assert item.height()>=rendered.property('contentHeight')
-                click(window,render_plot(window,window.efficiency_details.toggle))
-                window.scrollers[0].verticalPosition.setValue(0)
-            if page in (0,1):assert window.common_filters._nodes==list(window.common_fields.values())
-            else:assert not window.scope_note.isVisible()
+                assert len(window.home_panel.state['totals'])==4
+                assert window.query()['period']=='all'
+            if page in (0,1):assert not window.common_filters.isVisible()
+            assert not window.scope_note.isVisible()
             assert window.quick.grabFramebuffer().save(str(tmp_path/f'page-{page}.png'))
         assert not window.home_button.isVisible()
         assert window.history_path.entries[0]['project_id']==window.history_navigation.project

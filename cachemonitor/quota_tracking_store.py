@@ -217,7 +217,7 @@ def failed_observation(db, home, at):
         db.commit()
 
 
-def build(db, home, now, *, context_only=False):
+def build(db, home, now, *, context_only=False, read_rows=None):
     config = db.execute('select started from tracking_config where home=?', (home,)).fetchone()
     if not config:
         return None
@@ -246,7 +246,10 @@ def build(db, home, now, *, context_only=False):
     state = TrackingState(started)
     timeline = [(r['at'], 0, r['at'], bool(r['enabled'])) for r in controls]
     raw = {}
-    for row in db.execute('select * from tracking_observations where home=? and requested>=? and received<=? order by received,seq', (home, started, now)):
+    sql='select * from tracking_observations where home=? and requested>=? and received<=? order by received,seq'
+    records=(read_rows('tracking_observations',sql,(home,started,now),('tracking_observations',),'received',clock=True)
+             if read_rows else db.execute(sql,(home,started,now)))
+    for row in records:
         quota = json.loads(row['data'])
         window = quota.get('windows', {}).get('weekly')
         if not window or not quota.get('account') or not window.get('resets_at'):

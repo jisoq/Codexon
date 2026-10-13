@@ -54,14 +54,18 @@ Item {
         case "tabs": return tabsComponent
         case "split": return splitComponent
         case "table": return tableComponent
+        case "usageDashboard": return usageDashboardComponent
         case "historyWorkspace": return historyWorkspaceComponent
+        case "historyFilters": return historyFiltersComponent
         case "breadcrumbs": return breadcrumbsComponent
         case "recordFields": return recordFieldsComponent
         case "plot": return s.timeNavigation ? timeNavigationComponent : plotComponent
         default: return spacerComponent
         }
     }
+    Component { id: usageDashboardComponent; UsageDashboard { node: view.node } }
     Component { id: spacerComponent; Item {} }
+    Component { id: historyFiltersComponent; HistoryFilters { node: view.node } }
     Component { id: historyWorkspaceComponent; HistoryWorkspace { node: view.node } }
     Component { id: breadcrumbsComponent; Breadcrumbs { node: view.node } }
     Component { id: recordFieldsComponent; RecordFields { node: view.node } }

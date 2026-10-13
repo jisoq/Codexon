@@ -183,7 +183,7 @@ def test_real_child_prepares_compact_report_and_reuses_raw_evidence_for_preview(
         assert report['view']['tracking_started']==50
         assert report['view']['lifetime']['intervals']==[]
         assert report['view']['lifetime']['cost']==312
-        assert report['view']['overall']['_content_digest']
+        assert report['view']['chart']['series']['_content_digest']
         assert len(report['view']['default_query']['rows'])<=25
         worker.request('preview',revision=report['worker_revision'],start=110,end=130)
         preview=responses.get(timeout=15)
@@ -245,3 +245,22 @@ def test_compact_report_drops_call_graph_bytes_and_can_still_query_them():
         assert b'synthetic_metadata' not in packed
         assert prepared['report']['view']['lifetime']['cost']==312
     finally:engine.close()
+
+
+def test_chart_delivery_contains_only_selection_and_reuses_unchanged_digest():
+    from test_quota_value_history import sample_report as multiple_periods
+    engine=QuotaComputation()
+    source=multiple_periods()
+    first=engine.execute(dict(kind='prepare',id=1,key=None,snapshot=source))['report']
+    view=first['view'];chart=view['chart']
+    assert chart['selection']==250
+    assert all('series' not in period for period in view['periods'])
+    assert 'overall' not in view and 'five_hour' not in view
+    changed=engine.execute(dict(kind='chart',id=2,key='old',revision=first['worker_revision'],selection=100))['value']
+    assert changed['selection']==100 and changed['series']['rows'][-1]['at']==130
+    same=engine.execute(dict(kind='chart',id=3,key='same',revision=first['worker_revision'],selection=100,digest=changed['digest']))['value']
+    assert same['series'] is None and same['digest']==changed['digest']
+    whole=engine.execute(dict(kind='chart',id=4,key='all',revision=first['worker_revision'],selection='all'))['value']
+    assert whole['series']['cumulative']
+    assert len(whole['series']['rows'])==7
+    assert engine.execute(dict(kind='chart',id=5,key='stale',revision='expired',selection=100))['stale']

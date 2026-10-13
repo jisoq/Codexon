@@ -14,6 +14,13 @@ Item {
     function columnWidth(column) {
         let requested=root.node.visualColumnWidth(column)
         let total=root.viewState.widths.reduce((sum,value) => sum+value,0)
+        let minimums=root.viewState.minimumColumnWidths || []
+        if (minimums.length === root.viewState.widths.length && total > root.width) {
+            let floor=minimums.reduce((sum,value) => sum+value,0)
+            let logical=root.node.logicalColumn(column)
+            let minimum=Math.min(requested,minimums[logical])
+            requested=minimum+(requested-minimum)*Math.max(0,Math.min(1,(root.width-floor)/Math.max(1,total-floor)))
+        }
         let extra=Math.max(0,root.width-total)
         let weights=root.viewState.columnStretchWeights || []
         if (weights.length === root.viewState.widths.length) requested += extra * weights[column] / Math.max(1,weights.reduce((sum,value) => sum+value,0))

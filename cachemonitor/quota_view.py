@@ -221,40 +221,56 @@ def _prepare_series_python(rows):
                 completed_costs=completed,completed_maximum=completed_maximum)
 
 
-def prepare_quota_view(report):
+def prepare_overall(periods, exclusions):
+    from .quota_share import prepare_model_share
+    overall=[];offset_cost=offset_delta=0;resets=[]
+    for i,period in enumerate(periods):
+        for row in period['series']['rows']:
+            cost=offset_cost+(row['cycle_cost'] or 0);delta=offset_delta+row['cycle_delta']
+            overall.append({**row,'reported_remaining':row['remaining'],'remaining':delta,
+                            'period_cost':row['cycle_cost'],'cycle_cost':cost,'cycle_delta':delta,
+                            'cycle_value':(offset_cost+row['confirmed_cost'])/(offset_delta+row['confirmed_delta'])*100
+                            if offset_delta+row['confirmed_delta']>0 else None})
+        if period['reset_kind']:resets.append(dict(at=period['start'],label=RESET_NAMES[period['reset_kind']],number=i+1))
+        offset_cost+=period['cost'] or 0;offset_delta+=period['delta']
+    series=prepare_series(overall)
+    series['model_share']=prepare_model_share(series,[interval for period in periods for interval in period['cost_intervals']])
+    series.update(active_only=True,cumulative=True,resets=resets,exclusions=exclusions)
+    return series
+
+
+def prepare_quota_view(report, previous=None, *, deferred=False):
     from .pricing import usd
     from .quota_share import prepare_model_share
     from .quota_exclusions import active_exclusions
     from .quota_attribution import RequestWindows
     exclusions=active_exclusions(report)
     requests=RequestWindows(report.get('request_windows',[])) if report.get('tracking') is not None else None
-    rows,periods=quota_value_history(report,history_rows(report,'weekly'),_requests=requests)
+    period_cache=dict((previous or {}).get('_period_cache',{}))
+    statistics_cache=dict((previous or {}).get('_statistics_cache',{}))
+    rows,periods=quota_value_history(report,history_rows(report,'weekly'),_requests=requests,_cache=period_cache,_statistics_cache=statistics_cache)
+    prior_periods={p['start']:p for p in (previous or {}).get('periods',[])}
     completed=completed_percent_costs(rows)
     for row,amount in zip(rows,completed):row['completed_cost']=amount
     times=[r['at'] for r in rows]
-    overall=[];offset_cost=offset_delta=0;resets=[]
     for i,period in enumerate(periods):
         lo=bisect_left(times,period['start'])
         hi=bisect_left(times,periods[i+1]['start']) if i+1<len(periods) else len(rows)
         own=[row for row in rows[lo:hi] if row['local_observed']]
         for index,row in enumerate(own):
             if not index or row['local_range']!=own[index-1]['local_range']:row['connect']=False
-            cost=offset_cost+(row['cycle_cost'] or 0);delta=offset_delta+row['cycle_delta']
-            overall.append({**row,'reported_remaining':row['remaining'],'remaining':delta,
-                            'period_cost':row['cycle_cost'],
-                            'cycle_cost':cost,'cycle_delta':delta,
-                            'cycle_value':(offset_cost+row['confirmed_cost'])/(offset_delta+row['confirmed_delta'])*100
-                            if offset_delta+row['confirmed_delta']>0 else None})
-        period['series']=prepare_series(own)
-        period['series']['model_share']=prepare_model_share(period['series'],period['cost_intervals'])
-        period['series']['exclusions']=[r for r in exclusions if r['start']<period['end'] and r['end']>period['start']]
-        period['series']['active_only']=True
-        if period['reset_kind']:
-            resets.append(dict(at=period['start'],label=RESET_NAMES[period['reset_kind']],number=i+1))
-        offset_cost+=period['cost'] or 0;offset_delta+=period['delta']
+        prior=prior_periods.get(period['start'])
+        unchanged=(previous and period_cache.get(period['start']) is previous.get('_period_cache',{}).get(period['start']))
+        if prior and unchanged:
+            period['series']=prior['series']
+        else:
+            period['series']=prepare_series(own)
+            period['series']['model_share']=prepare_model_share(period['series'],period['cost_intervals'])
+            period['series']['exclusions']=[r for r in exclusions if r['start']<period['end'] and r['end']>period['start']]
+            period['series']['active_only']=True
         state='진행 중' if period['current'] else '종료'
         period['label']=(f"{clock(period['start'])} → {clock(period['end'])}: {usd(period['value'])} ({state})")
-    lifetime=quota_statistics(report,include_mode_assumptions=True,_requests=requests)
+    lifetime=quota_statistics(report,include_mode_assumptions=True,_requests=requests,_cache=statistics_cache)
     now=report.get('at')
     summaries={None:lifetime}
     if now is not None:
@@ -262,14 +278,15 @@ def prepare_quota_view(report):
         for days in (7,30,90):
             start=now-days*86400
             summaries[days]=(lifetime if start<=earliest else
-                             quota_statistics(report,start,include_mode_assumptions=True,_requests=requests))
-    all_series=prepare_series(overall)
-    all_series['model_share']=prepare_model_share(all_series,[interval for period in periods for interval in period.pop('cost_intervals')])
-    all_series.update(active_only=True,cumulative=True,resets=resets,exclusions=exclusions)
+                             quota_statistics(report,start,include_mode_assumptions=True,_requests=requests,_cache=statistics_cache))
+    all_series=None if deferred else prepare_overall(periods,exclusions)
+    overall_parts=periods
+    periods=[{k:v for k,v in period.items() if k!='cost_intervals'} for period in periods]
     available_models=sorted({model['model'] for interval in lifetime.get('intervals',[]) for model in interval['models']
                              if model.get('model') and not model.get('separate')})
-    return dict(periods=sorted(periods,key=lambda period:period['start'],reverse=True),overall=all_series,lifetime=lifetime,summaries=summaries,available_models=available_models,
-                five_hour=prepare_series(history_rows(report,'five_hour')))
+    return dict(periods=sorted(periods,key=lambda period:period['start'],reverse=True),overall=all_series,lifetime=lifetime,summaries=summaries,available_models=available_models,_period_cache=period_cache,
+                _overall_parts=overall_parts,_exclusions=exclusions,_statistics_cache=statistics_cache,
+                five_hour=None if deferred else prepare_series(history_rows(report,'five_hour')))
 
 
 def model_cost_intervals(intervals, selected_model):

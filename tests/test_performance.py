@@ -197,10 +197,10 @@ def test_process_queries_latest_selection_cache_and_clean_shutdown(tmp_path):
         settle()
         w.model.setCurrentIndex(0)
         w.nav.setCurrentRow(0); settle()
-        assert w.overview['calls']==7
+        assert w.home_panel.data['totals']['calls']['value']==7
         w.nav.setCurrentRow(1)
-        w.source.setCurrentIndex(w.source.findData('subagent'))
-        w.source.setCurrentIndex(0)
+        w.metric_panel.change('filter:source','subagent')
+        w.metric_panel.change('filter:source','')
         w.nav.setCurrentRow(w.navigation_pages.index(2)); settle()
         assert w.record_view=='sessions' and w.table.rowCount()==1 and w.selected_session is None
         assert w.worker.process.pid is not None

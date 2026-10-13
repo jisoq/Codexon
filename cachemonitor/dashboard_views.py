@@ -278,6 +278,7 @@ def population_summary(engine,population,assumptions=None):
 
 
 def refresh_bounds(value,q):
+    if q.get("category_usage"):return value
     """Refresh partial bucket labels without rebuilding an unchanged population."""
     if q['page']!=0 or q.get('period')=='custom':return value
     from datetime import datetime

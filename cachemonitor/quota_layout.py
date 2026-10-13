@@ -22,6 +22,7 @@ def configure_quota_layout(panel):
                  panel.exclusions.history,panel.exclusions.message):
         detach(node)
     panel.manage_button=Button('제외 관리');panel.manage_button.put(fontSize=12,height=30)
+    panel.manage_button.hide()
     actions.addWidget(panel.manage_button)
     build_exclusion_dialog(panel)
     for node in (panel.summary_heading,panel.history_controls,panel.result,panel.cycle_value,panel.lifetime_basis,panel.cycle_basis,panel.conversion):

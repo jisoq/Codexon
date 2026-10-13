@@ -48,6 +48,32 @@ def test_reset_zeroes_cycle_cost_but_lifetime_is_weighted_and_keeps_every_cycle(
     assert report==original
 
 
+def test_changed_period_reuses_other_graphs_and_matches_uncached_values():
+    from cachemonitor.quota_view import prepare_quota_view, prepare_overall
+    report=sample_report()
+    before=prepare_quota_view(report,deferred=True)
+    changed=deepcopy(report)
+    changed['cycles'][-1]=interval([(250,100),(280,95),(310,90)],[(265,3),(295,7)])
+    changed=report_for(changed['cycles'])
+    after=prepare_quota_view(changed,before,deferred=True)
+    full=prepare_quota_view(changed)
+    assert after['overall'] is None
+    assert after['periods'][1]['series'] is before['periods'][1]['series']
+    assert after['periods'][2]['series'] is before['periods'][2]['series']
+    assert after['periods']==full['periods']
+    assert after['lifetime']==full['lifetime']
+    assert prepare_overall(after['_overall_parts'],after['_exclusions'])==full['overall']
+    # A late correction invalidates that historical period, not its neighbors.
+    corrected=deepcopy(changed)
+    corrected['cycles'][0]=interval([(100,80),(130,60)],[(115,24)])
+    correction=prepare_quota_view(corrected,after,deferred=True)
+    full=prepare_quota_view(corrected)
+    assert correction['periods'][0]['series'] is after['periods'][0]['series']
+    assert correction['periods'][1]['series'] is after['periods'][1]['series']
+    assert correction['periods']==full['periods']
+    assert correction['lifetime']==full['lifetime']
+
+
 def test_gap_excludes_both_cost_and_consumption_without_invalidating_or_splitting_cycle():
     report=report_for([
         interval([(100,80),(130,60)],[(115,12)]),

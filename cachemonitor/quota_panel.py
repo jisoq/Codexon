@@ -58,6 +58,8 @@ class QuotaPanel(Group):
         self._query_cache={}
         self._query_pending=None
         self._prepared_query=None
+        self._chart_pending=None
+        self._chart_value=None
         layout=Column(self)
         layout.setContentsMargins(0,0,0,0)
         layout.setSpacing(20)
@@ -278,11 +280,38 @@ class QuotaPanel(Group):
         index=self.cycle_choice.currentIndex()
         all_cycles=index==0
         lifetime=self._view['lifetime']
-        period=(dict(start='all',series=self._view['overall'],cost=lifetime['cost'],delta=lifetime['delta'],
+        period=(dict(start='all',series=self._view.get('overall'),cost=lifetime['cost'],delta=lifetime['delta'],
                      priced_calls=lifetime['observed_priced_calls'],calls=lifetime['observed_calls'],
                      value=lifetime['per_percent']*100 if lifetime['per_percent'] is not None else None)
                 if all_cycles else self._view['periods'][index-1] if index>0 else None)
-        series=period['series'] if period else prepare_series([])
+        series=period.get('series') if period else prepare_series([])
+        if 'chart' in self._view:
+            self._bind_worker()
+            selection=period['start'] if period else 'all'
+            key=(id(self._query_worker),self.report['worker_revision'],selection)
+            offered=self._view['chart']
+            if offered['selection']==selection and offered.get('series') is not None:
+                self._chart_value=(key,offered['series'])
+            elif (offered['selection']==selection and self._chart_value
+                  and self._chart_value[0][0]==key[0] and self._chart_value[0][2]==selection
+                  and self._chart_value[1].get('_content_digest')==offered['digest']):
+                self._chart_value=(key,self._chart_value[1])
+            if self._chart_value and self._chart_value[0]==key:
+                series=self._chart_value[1];self._chart_pending=None
+                if self._query_worker is not None and hasattr(self._query_worker,'select_chart'):
+                    self._query_worker.select_chart(selection,series.get('_content_digest'))
+            else:
+                if self._query_worker is not None and self._chart_pending!=key:
+                    self._chart_pending=key
+                    if hasattr(self._query_worker,'select_chart'):self._query_worker.select_chart(selection)
+                    self._query_worker.request('chart',key=key,revision=self.report['worker_revision'],selection=selection)
+                self.history.hide();self.history_legend.hide();self.history_empty.setText('계산 중...');self.history_empty.show()
+                self.model_legend.hide()
+                if hasattr(self,'manage_button'):self.manage_button.hide()
+                self.exclusions.set_context(self.report,None,True)
+                if hasattr(self,'sync_dialog'):self.sync_dialog()
+                return
+            period={**period,'series':series} if period else period
         old=self.history.rows[self.history.cursor]['at'] if self.history.rows else None
         same=getattr(self,'_selected_cycle',None)==(period['start'] if period else None)
         follow=not self.history.rows or self.history.cursor==len(self.history.rows)-1
@@ -307,8 +336,8 @@ class QuotaPanel(Group):
                 label=Text(name);label.put(fontSize=12,color='muted');self.model_legend.addWidget(label)
         self.model_legend.setVisible(bool(self.history.rows))
         rows=self.history.rows
-        any_history=bool(self._view['overall']['rows'] or
-                         any(item['series']['rows'] for item in self._view['periods']))
+        any_history=(self._view['has_history'] if 'has_history' in self._view else
+                     bool(self._view['overall']['rows'] or any(item['series']['rows'] for item in self._view['periods'])))
         self.history_controls.setVisible(any_history)
         self.history_legend.setVisible(bool(rows))
         self.history.setVisible(bool(rows))
@@ -326,6 +355,8 @@ class QuotaPanel(Group):
         else:
             self.cycle_value.setText('선택 주기 —');self.cycle_basis.setText('관측된 사용량 리셋 주기가 없습니다')
         self.cycle_choice.setVisible(any_history and bool(self._view['periods']))
+        if hasattr(self,'manage_button'):
+            self.manage_button.setVisible(any_history or bool(self.report.get('exclusions')) and not self.report.get('index_loading'))
         for node in (self.cycle_value,self.cycle_basis):node.setVisible(bool(lifetime['total'] or self.report.get('exclusions')))
 
     def select_observation(self,row):
@@ -345,15 +376,20 @@ class QuotaPanel(Group):
         self._query_cache[key]=value
         while len(self._query_cache)>8:self._query_cache.pop(next(iter(self._query_cache)))
 
-    def _prepared_statistics(self):
-        """Request display-ready totals without doing aggregation on the GUI."""
-        worker=self.report.get('_worker');key=self._query_key()
+    def _bind_worker(self):
+        worker=self.report.get('_worker')
         if worker is not self._query_worker:
             if self._query_worker is not None:
                 try:self._query_worker.result.disconnect(self._receive_query)
                 except (RuntimeError,TypeError):pass
             self._query_worker=worker;self._query_pending=None;self._query_cache={}
+            self._chart_value=None;self._chart_pending=None
             if worker is not None:worker.result.connect(self._receive_query)
+
+    def _prepared_statistics(self):
+        """Request display-ready totals without doing aggregation on the GUI."""
+        self._bind_worker()
+        worker=self._query_worker;key=self._query_key()
         query=self._query_parameters()
         if (query['days'] is None and query['start'] is None and query['end'] is None
                 and query['model'] is None and query['mode']=='all' and query['page']==0):
@@ -373,6 +409,19 @@ class QuotaPanel(Group):
     @Slot(object)
     def _receive_query(self, message):
         key=message.get('key')
+        if message.get('kind')=='chart':
+            current=(id(self._query_worker),self.report.get('worker_revision'),self.cycle_choice.currentData())
+            if key!=self._chart_pending or key!=current:return
+            self._chart_pending=None
+            if message.get('error'):
+                self.fault_changed.emit(dict(calculation_failed=True));return
+            value=message['value']
+            if value['selection']!=key[2] or value.get('series') is None:return
+            self.fault_changed.emit(dict(query_healthy=True))
+            self._chart_value=(key,value['series'])
+            if getattr(self,'defer_render',False):self._render_dirty=True
+            else:self.render_history()
+            return
         if message.get('kind')!='query' or key!=self._query_pending:return
         self._query_pending=None
         if key!=self._query_key():return

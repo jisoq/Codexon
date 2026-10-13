@@ -11,7 +11,8 @@ def walk(item):
 
 
 def scene_view(host,node):
-    for item in walk(host.quick.rootObject()):
+    # Popups live in the window overlay, alongside the presentation root.
+    for item in walk(host.quick.quickWindow().contentItem()):
         if item.property('node') is node and item.metaObject().indexOfProperty('sourceComponent')>=0:
             return item
     raise AssertionError(f'Presentation node not rendered: {node.objectName()} ({node.kind})')

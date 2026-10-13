@@ -34,12 +34,10 @@ def test_subscription_rates_and_historical_models_render(tmp_path, language):
         window=Dashboard(['fixture'],start_worker=False,live_limits=False,
                          settings=QSettings(str(tmp_path/'value.ini'),QSettings.IniFormat),static_snapshot=source)
         window.show();QTest.qWait(80)
-        window.refresh_target_editors()
+        window.change_page(1);window.metric_panel.change("dimension","model")
         assert window.model.findData('gpt-5.5-pro')>=0
         assert window.model.findData('gpt-5.4-mini')>=0
-        assert window.compare_model.findData('gpt-5.5-pro')<0
-        assert window.compare_model.findData('gpt-5.4-mini')<0
-        assert window.compare_model.findData('gpt-5.6')>=0
+        assert {'gpt-5.5-pro','gpt-5.4-mini','gpt-5.6'} <= {r['key'] for r in window.metric_panel.data['rows']}
         priced=next(iter(window.engine.sessions.values()))['prepared']['history']
         for model in ('gpt-5.4-mini','gpt-5.5-pro'):
             record=next(r for r in priced if r['model']==model)
@@ -80,9 +78,36 @@ def many_efforts():
     return source,efforts
 
 
+def test_home_card_and_comparison_controls_accept_rendered_input(dashboard):
+    import time
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QApplication
+    w=dashboard;w.resize(1120,740)
+    def rendered(name):
+        deadline=time.monotonic()+4
+        while time.monotonic()<deadline:
+            QApplication.processEvents()
+            found=[n for n in walk(w.quick.rootObject()) if n.objectName()==name and n.isVisible() and n.width()>0]
+            if found:return found[0]
+            QTest.qWait(5)
+        raise AssertionError(name)
+    click(w,rendered('home-card-1'))
+    assert w.current_page==1
+    choice=rendered('usage-dimension');choice.forceActiveFocus()
+    QTest.keyClick(w.quick,Qt.Key_Down)
+    assert w.metric_panel.options['dimension']=='model'
+    item=w.metric_panel.data['rows'][0]
+    click(w,rendered('usage-row-'+item['key']))
+    assert w.metric_panel.options['filters']['model']==item['key']
+    w.go_back();assert not w.metric_panel.options['selected']
+    assert not w.qml_errors
+
+
 def test_project_selection_preserves_filters_and_back_restores_exact_call(dashboard):
     w=dashboard;w.nav.setCurrentRow(w.navigation_pages.index(2));click_row(w,w.parent_table,1);click_row(w,w.table,0);click_row(w,w.table,1);click_row(w,w.table,1)
     before=w.capture_state();assert w.selected_call
+    click(w,control(w,w.history_projects_button))
     click_row(w,w.parent_table,0)
     assert w.record_view=='sessions' and w.selected_session is None and w.selected_call is None and w.selected_turn is None
     assert w.period.currentData()==before['common']['period']
@@ -92,71 +117,39 @@ def test_project_selection_preserves_filters_and_back_restores_exact_call(dashbo
 
 
 def test_comparison_detail_home_back_and_refresh_preserve_context(dashboard):
-    w=dashboard;w.nav.setCurrentRow(1);w.select_comparison(w.comparison_chart.rows[0])
-    selected=w.comparison_selection.copy();assert w.home_button.isEnabled()
-    w.go_home();assert not w.comparison_detail['group'].isVisible()
-    w.go_back();assert w.comparison_selection==selected and w.comparison_detail['group'].isVisible()
-    before=w.scrollers[1].verticalPosition.value()
-    w.receive(copy.deepcopy(w.snapshot))
-    assert w.comparison_selection==selected and w.scrollers[1].verticalPosition.value()==before
+    w=dashboard;w.change_page(1);p=w.metric_panel
+    p.select(p.data['rows'][0]['key']);selected=p.capture()
+    p.reset();assert not p.options['selected']
+    w.go_back();assert p.options['selected']==selected['selected']
+    w.receive(copy.deepcopy(w.snapshot));assert p.options['selected']==selected['selected']
     assert not w.qml_errors
 
 
-def test_duration_available_defaults_after_cache_and_restores_saved_statistic(dashboard):
-    w=dashboard
-    assert w.comparison_metric.findData('duration')>=0
-    w.change_page(1)
-    w.comparison_metric.setCurrentIndex(w.comparison_metric.findData('cache_ratio'))
-    assert w.query()['method']=='weighted'
-    w.comparison_metric.setCurrentIndex(w.comparison_metric.findData('duration'))
-    assert w.query()['method']=='median'
-    w.method.setCurrentIndex(w.method.findData('p90'))
-    response=w.capture_state()
-    w.unit.setCurrentIndex(w.unit.findData('turn'))
-    turn=w.capture_state()
-    for state,unit in ((response,'response'),(turn,'turn')):
-        w.comparison_metric.setCurrentIndex(w.comparison_metric.findData('cost'))
-        w.restore_state(state,initial=True);w.change_page(1)
-        assert (w.query()['unit'],w.query()['metric'],w.query()['method'])==(unit,'duration','p90')
-        w.method.setCurrentIndex(w.method.findData('mean'))
-        assert w.query()['method']=='mean'
+def test_metric_modes_and_saved_scope_restore_without_changing_home_totals(dashboard):
+    w=dashboard;totals=copy.deepcopy(w.home_panel.state['totals']);w.change_page(1);p=w.metric_panel
+    p.change('period','7d');p.change('metric','tps');p.change('dimension','model');p.change('sort','name')
+    saved=w.capture_state();w.change_page(0)
+    assert w.home_panel.state['totals']==totals and w.query()['start']==0
+    w.restore_state(saved);assert p.options['metric']=='tps' and p.options['dimension']=='model'
+    assert p.options['period']=='7d' and p.options['sort']=='name'
     assert not w.qml_errors
 
 
-def test_usage_card_drilldown_ignores_history_filters_and_restores_latest_scope(dashboard):
-    from cachemonitor.analytics import project_identity
-    from cachemonitor.dashboard import choose,identity
-    w=dashboard;first,other=[project_identity(s) for s in w.snapshot['sessions'][:2]]
-    choose(w.project,other);choose(w.period,'all');w.filter_changed()
-    w.change_page(2)
-    choose(w.period,'30m');w.filter_changed()
-    w.call_filter_controls['cache_zero'].setChecked(True)
-    w.selected_session=('fixture','s1');w.selected_event='stale-event';w.record_view='calls'
-    w.nav.setCurrentRow(w.navigation_pages.index(0))
-    choose(w.project,first);choose(w.period,'7d');w.filter_changed()
-    expected={identity(r) for r in w.engine.query(w.query())['analysis']['responses']}
-    assert len(expected)==16
-    click(w,control(w,w.usage_metrics['calls'][0]))
-    assert w.current_page==2 and w.record_view=='calls'
-    assert not w.selected_event and not any(n.isChecked() for n in w.call_filter_controls.values())
+def test_metric_drilldown_ignores_history_filters_and_restores_latest_scope(dashboard):
+    from cachemonitor.dashboard import identity
+    w=dashboard;w.change_page(2);w.call_filter_controls['cache_zero'].setChecked(True)
+    w.change_page(1);p=w.metric_panel;p.select(p.data['rows'][0]['key']);p.change('period','7d')
+    before=p.capture();expected={identity(r) for r in w.engine.query(w.query())['analysis']['responses']}
+    p.records();assert w.current_page==2 and not any(n.isChecked() for n in w.call_filter_controls.values())
     assert {identity(r) for r in w.record_rows}==expected
-    w.nav.setCurrentRow(w.navigation_pages.index(0))
-    assert w.project.currentData()==first and w.period.currentData()=='7d'
-    assert {identity(r) for r in w.engine.query(w.query())['analysis']['responses']}==expected
+    w.go_back();assert w.current_page==1 and p.capture()==before
     assert not w.qml_errors
 
 
 def test_saved_project_scope_remains_explicit_after_project_disappears(dashboard):
     from cachemonitor.analytics import project_identity
-    from cachemonitor.dashboard import choose
-    w=dashboard;first,other=[project_identity(s) for s in w.snapshot['sessions'][:2]]
-    choose(w.project,first);choose(w.period,'7d');w.filter_changed()
-    w.change_page(1);choose(w.project,other);w.filter_changed()
-    source=copy.deepcopy(w.snapshot)
-    source['sessions']=[s for s in source['sessions'] if project_identity(s)!=first]
+    w=dashboard;w.change_page(1);p=w.metric_panel;key=p.data['rows'][0]['key'];p.select(key)
+    source=copy.deepcopy(w.snapshot);source['sessions']=[s for s in source['sessions'] if project_identity(s)!=key]
     w.receive(source)
-    assert first not in w.filter_values['project']
-    w.nav.setCurrentRow(w.navigation_pages.index(0))
-    assert w.project.currentData()==first and w.query()['project']==first
-    assert w.analysis['response_count']==0
+    assert p.options['filters']['project']==key and p.data['summary']['total']==0
     assert not w.qml_errors

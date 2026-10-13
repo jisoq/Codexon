@@ -148,14 +148,14 @@ def test_request_statistics_in_current_level_and_filtered_scope(dashboard,unlink
 
 
 def test_overlay_context_clears_blocking_filters_and_back_restores(dashboard):
-    w=dashboard;w.nav.setCurrentRow(1);choose(w.band,'0:10000');w.render()
+    w=dashboard;w.nav.setCurrentRow(1);w.metric_panel.change('period','7d');w.render()
     before=w.capture_state()
     target=NavigationTarget('fixture','s1',view='calls',call_id='r1-3',section='pricing')
     w.navigate(target);assert w.current_page==2 and w.selected_call=='r1-3'
     assert w.exact_record['key']=='r1-3' and w.temporary_context['sid']=='s1'
     depth=len(w.back_stack);w.navigate(target);assert len(w.back_stack)==depth
-    w.go_back();assert w.current_page==1 and w.compare_model.currentData()==before['compare_model']
-    assert w.band.currentData()==before['choices']['band'] and w.temporary_context is None
+    w.go_back();assert w.current_page==1 and w.metric_panel.capture()==before['metric_workspace']
+    assert w.temporary_context is None
     assert not w.qml_errors
 
 

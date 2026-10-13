@@ -72,15 +72,12 @@ def test_reasoning_tokens_render_independently_of_cost_and_request_unit(tmp_path
     try:
         window.receive({'ts':now,'sessions':[session.view(now)],'homes':[],'errors':[],'unassigned':[]})
         from cachemonitor.dashboard import choose
-        window.nav.setCurrentRow(1);choose(window.comparison_metric,'reasoning');window.comparison_metric_changed()
+        window.change_page(1);window.metric_panel.change('metric','reasoning');window.metric_panel.change('dimension','effort')
         window.show();QTest.qWait(100)
-        groups={g['effort']:g for g in window.compare_groups}
-        assert groups['low']['value']==0 and groups['low']['n']==1 and groups['low']['missing']==1
-        assert groups['high']['value']==6000 and groups['high']['n']==2
-        assert groups['high']['stats']['p90']==7600
-        assert all(g['mean_budget']['cost'] is None for g in window.compare_groups)
-        choose(window.unit,'turn');window.comparison_metric_changed()
-        assert all(g['n']==0 for g in window.compare_groups)  # no complete request boundaries
+        groups={g['key']:g for g in window.metric_panel.data['rows']}
+        assert groups['low']['value']==0 and groups['low']['known']==1 and groups['low']['partial']
+        assert groups['high']['value']==12000 and groups['high']['known']==2
+        assert window.metric_panel.data['summary']['value']==12000
         assert not window.qml_errors
     finally:
         if host:dispose(host)

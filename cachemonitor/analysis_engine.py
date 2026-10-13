@@ -232,6 +232,7 @@ class AnalysisEngine:
             self.page_results.clear()
             self.parts.discard(lambda key:key[0] not in updated or key[1]!=updated[key[0]]['revision'])
             self.__dict__.pop('_explorer_projection',None)
+            self.__dict__.pop('_category_projection',None)
         return changed
 
     def record(self,home,sid,response_id):
@@ -262,6 +263,11 @@ class AnalysisEngine:
         return (self.revision,q['page'],freeze(q))
 
     def page_query(self,q):
+        if q.get('category_usage'):
+            from .category_usage import project
+            from .analysis_worker import expiry
+            value=public_records(project(self,q));value['valid_until']=expiry(self,q)
+            return value
         if q['page']==5:
             from .performance_trends import PerformanceTrends
             if not hasattr(self,'performance'):self.performance=PerformanceTrends()
@@ -294,9 +300,9 @@ class AnalysisEngine:
         start,end=q['start'],q['end']
         selected=[]; responses=[]; turns=[]; unclassified=[]
         bysession={}; byturn={}; session_turns={}; session_totals={};whole_turns=defaultdict(list);whole_sessions={}
-        model=q.get('model','') if q['page']!=1 else ''
-        effort=q.get('effort','') if q['page']!=1 else ''
-        mode=q.get('service_tier','') if q['page']!=1 else ''
+        model=q.get('model','') if q['page']!=1 or q.get('category_usage') else ''
+        effort=q.get('effort','') if q['page']!=1 or q.get('category_usage') else ''
+        mode=q.get('service_tier','') if q['page']!=1 or q.get('category_usage') else ''
         for session_key,state in self.sessions.items():
             s=state['prepared']
             if not q.get('archived',True) and s.get('archived'): continue
@@ -333,7 +339,7 @@ class AnalysisEngine:
         unit=q.get('unit','response') if q['page']!=0 else 'response'
         units=responses if unit in ('response','call') else [t for t in turns if t['complete']]
         basis=[]
-        if q['page']==1:
+        if q['page']==1 and not q.get('category_usage'):
             groups=defaultdict(list)
             for t in turns:
                 if t['complete'] and t['cost'] is not None: groups[(t['model'],t['effort'],display_tier(t))].append(t)
@@ -356,8 +362,8 @@ class AnalysisEngine:
         if q['page']==2:
             from .session_costs import own_costs, session_costs
             result['session_costs']=session_costs(selected,own_costs(responses))
-        if q['page']==0: result['overview']=overview_view(a,start,end,q.get('metric','cost'),q.get('granularity','auto'),q.get('basis','total'),q.get('group_by','project'),self.stat,self.summary)
-        if q['page']==1: result['comparison']=comparison_view(a,q.get('metric','cost'),q.get('band'),self.stat,q.get('targets'),q.get('baseline','A'),
+        if q['page']==0 and not q.get('category_usage'): result['overview']=overview_view(a,start,end,q.get('metric','cost'),q.get('granularity','auto'),q.get('basis','total'),q.get('group_by','project'),self.stat,self.summary)
+        if q['page']==1 and not q.get('category_usage'): result['comparison']=comparison_view(a,q.get('metric','cost'),q.get('band'),self.stat,q.get('targets'),q.get('baseline','A'),
             unit,q.get('method','mean'),q.get('conditions'),q.get('matrix_by','input'),q.get('comparison_type',''))
         self.results.put(key,result,len(responses)+len(turns)+1)
         return result

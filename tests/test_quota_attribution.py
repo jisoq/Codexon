@@ -96,11 +96,14 @@ def test_all_cycles_accumulate_beyond_100_and_keep_reset_boundaries():
     assert view['periods'][1]['series']['rows'][-1]['remaining']==40
 
 
-def test_inflight_history_does_not_display_an_artificial_zero_dollar_estimate():
-    report=example([(100,100),(130,99),(160,98),(190,97),(220,97)],[('a',110,180,6)])
-    rows,_=quota_value_history(report,history_rows(report,'weekly'))
-    assert rows[1]['cycle_value'] is None and rows[2]['cycle_value'] is None
-    assert rows[-1]['cycle_value']==200
+def test_weekly_value_requires_recorded_cost_but_accepts_zero():
+    from cachemonitor.quota_view import prepare_quota_view
+    for cost in (6,0):
+        report=example([(100,100),(130,99),(160,98),(190,97),(220,97)],[('a',110,180,cost)])
+        view=prepare_quota_view(report)
+        for rows in (view['periods'][0]['series']['rows'],view['overall']['rows']):
+            assert rows[1]['cycle_value'] is None and rows[2]['cycle_value'] is None
+            assert rows[-1]['cycle_value']==cost/3*100
 
 
 def test_new_request_during_optional_settling_sample_preserves_completed_pair():

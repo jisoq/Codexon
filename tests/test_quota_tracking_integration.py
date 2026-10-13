@@ -176,6 +176,52 @@ def test_forward_continuous_account_consumption_and_cost_survive_reopen(tmp_path
     ledger.close()
 
 
+def test_changed_cycle_reuses_closed_accounting_and_matches_full_rebuild(tmp_path):
+    path=tmp_path/'incremental.sqlite'
+    ledger=QuotaLedger(path)
+    try:
+        tracking.enable(ledger.db,'h',100)
+        for at,remaining in ((102,90),(110,80),(120,100),(130,90),(140,100),(150,90)):
+            observe(ledger,at,remaining)
+        activity(ledger,160,{},[107,127,147])
+        first=ledger.report('h',160)
+        assert ledger._cycle_rebuilds==3
+        observe(ledger,152,85)
+        appended=ledger.report('h',161)
+        assert ledger._cycle_rebuilds==1
+        assert appended==ledger._report('h',161)
+        assert appended['cycles'][-1]['cost']==first['cycles'][-1]['cost']
+        ledger.db.execute('UPDATE calls SET cost=cost*2 WHERE ts=107');ledger.db.commit()
+        corrected=ledger.report('h',162)
+        assert ledger._cycle_rebuilds==1
+        assert corrected==ledger._report('h',162)
+        assert corrected['cycles'][-1]['cost']==first['cycles'][-1]['cost']*2
+        # A rolled-back revision may be reused by another transaction.
+        ledger.db.execute('UPDATE calls SET cost=0 WHERE ts=127')
+        ledger.report('h',162);ledger.db.rollback()
+        assert ledger.report('h',162)==corrected
+    finally:ledger.close()
+    reopened=QuotaLedger(path)
+    try:assert reopened.report('h',162)==corrected
+    finally:reopened.close()
+
+
+def test_input_cache_catches_late_deletes_and_recovers_after_change_ring_overflow(tmp_path):
+    ledger=QuotaLedger(tmp_path/'changes.sqlite')
+    try:
+        tracking.enable(ledger.db,'h',100)
+        observe(ledger,102,90);observe(ledger,110,80)
+        activity(ledger,120,{},[107])
+        ledger.report('h',120)
+        ledger.db.execute('DELETE FROM calls WHERE ts=107');ledger.db.commit()
+        assert ledger.report('h',121)==ledger._report('h',121)
+        # More changes than the durable ring must fall back to authoritative SQL.
+        for at in range(122,500):observe(ledger,at,79-(at-122)/100)
+        assert ledger.db.execute('SELECT count(*) FROM report_changes').fetchone()[0]<=1024
+        assert ledger.report('h',501)==ledger._report('h',501)
+    finally:ledger.close()
+
+
 def test_same_account_homes_count_quota_and_replayed_calls_once(tmp_path):
     ledger=QuotaLedger(tmp_path/'multi.sqlite')
     for home in ('h','other'):

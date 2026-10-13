@@ -3,6 +3,35 @@ from dataclasses import dataclass, field
 from PySide6.QtCore import Signal, Slot
 from .presentation import Group
 from .table_model import LazyTable
+from .ui_details import Details
+from .i18n import formatted
+
+
+def history_duration(value):
+    if value is None:return '—'
+    minutes,centiseconds=divmod(round(value*100),6000)
+    seconds=f'{centiseconds/100:.2f}'
+    if minutes>=60:
+        hours,minutes=divmod(minutes,60)
+        return formatted('{hours}시간 {minutes}분 {seconds}초',hours=hours,minutes=minutes,seconds=seconds)
+    if minutes:return formatted('{minutes}분 {seconds}초',minutes=minutes,seconds=seconds)
+    return formatted('{seconds}초',seconds=seconds)
+
+
+class HistoryFilters(Details):
+    def __init__(self,title,content):
+        super().__init__(title,content,compact=True)
+        self.put(kind='historyFilters',expanded=False)
+
+    def set_expanded(self,expanded):
+        super().set_expanded(expanded)
+        self.put(expanded=expanded)
+
+    @Slot()
+    def dismiss(self):
+        self.toggle.setChecked(False)
+        self.toggle.focusRequested.emit()
+
 
 
 class HistoryTable(LazyTable):

@@ -92,7 +92,7 @@ def test_refresh_preserves_only_matching_results_and_failure_can_retry(tmp_path)
     from cachemonitor.quick_qa import click,render_plot
     window=dashboard(tmp_path)
     try:
-        window.receive(sample());window.show();window.render();window.async_mode=True
+        window.receive(sample());window.show();window.change_page(1);window.render();window.async_mode=True
         window.client_cache.clear();window.render();window.show_analysis_pending()
         assert window.pages.isVisible() and window.pending_label.text()=='최신 기록 반영 중'
         window.analysis_failed('synthetic failure')
@@ -104,7 +104,7 @@ def test_refresh_preserves_only_matching_results_and_failure_can_retry(tmp_path)
         assert window.analysis_pending
         deliver_pending(window)
         assert not window.retry_button.isVisible()
-        choose(window.period,'all');window.render()
+        window.metric_panel.change('period','7d')
         assert window.analysis_pending and not window.pages.isVisible()
         window.analysis_failed('changed-filter failure')
         assert not window.pages.isVisible() and window.error_button.isVisible()
@@ -132,7 +132,7 @@ def test_empty_result_waits_for_collection_before_showing_empty_charts(tmp_path)
         window.snapshot['index']['loading']=False
         window.render();deliver_pending(window)
         assert window.pages.isVisible() and not window.analysis_notice.isVisible()
-        assert window.timeline.empty_text=='사용 기록 없음'
+        assert window.home_panel.state['totals'][1]['value']=='0'
         assert window.analysis['response_count']==0
         window.change_page(5);window._refresh_after_pending=True
         calls=[];window.render=lambda *args,**kwargs:calls.append(kwargs)
@@ -225,24 +225,14 @@ def test_unpriced_call_explains_missing_input_without_claiming_collection_error(
 
 def test_open_aggregate_refreshes_values_and_records_without_reveal(tmp_path):
     import copy
-    window=dashboard(tmp_path)
-    window.show()
+    window=dashboard(tmp_path);window.show()
     try:
-        snapshot=sample();window.receive(snapshot);window.open_summary(0)
-        before=window.aggregate_selection['value']
-        reveals=[];window.scrollers[0].revealRequested.connect(reveals.append)
+        snapshot=sample();window.receive(snapshot);window.change_page(1);p=window.metric_panel
+        p.select(p.data['rows'][0]['key']);before=p.data['summary']['value'];selected=p.capture()
         updated=copy.deepcopy(snapshot);updated['ts']+=1
         extra=dict(updated['sessions'][0]['history'][0],key='response-new',ts=updated['ts']-.1)
-        updated['sessions'][0]['history'].append(extra)
-        updated['sessions'][0]['usage_revision']='new'
+        updated['sessions'][0]['history'].append(extra);updated['sessions'][0]['usage_revision']='new'
         window.receive(updated)
-        assert window.aggregate_selection['value']==before*2
-        assert len(__import__('cachemonitor.dashboard_views',fromlist=['resolve_population']).resolve_population(window.engine,window.aggregate_records))==2
-        assert reveals==[]
-        window.select_aggregate(window.source_bars.rows[0]);reveals.clear()
-        updated['ts']+=1
-        updated['sessions'][0]['history'].append(dict(extra,key='response-third',ts=updated['ts']-.1))
-        updated['sessions'][0]['usage_revision']='third';window.receive(updated)
-        assert window.aggregate_selection['total']==before*3
-        assert len(__import__('cachemonitor.dashboard_views',fromlist=['resolve_population']).resolve_population(window.engine,window.aggregate_records))==3 and reveals==[]
+        assert p.data['summary']['value']==before*2 and p.options['selected']==selected['selected']
+        assert len(__import__('cachemonitor.dashboard_views',fromlist=['resolve_population']).resolve_population(window.engine,p.data['population']))==2
     finally:window.quit_app()

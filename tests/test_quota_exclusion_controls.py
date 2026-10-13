@@ -33,6 +33,8 @@ def test_editing_range_and_reason_needs_no_computation(monkeypatch, compact):
     if compact:
         report=quota_worker.compact_report(report, 1)
         report['_worker']=worker
+        # The panel supplies the selected chart to the editor.
+        report['view']['periods'][0]['series']=report['view']['chart']['series']
     create_worker=Mock(side_effect=AssertionError('Editing must not start a worker'))
     preview=Mock(side_effect=AssertionError('Editing must not calculate totals'))
     monkeypatch.setattr(quota_worker,'QuotaWorker',create_worker)

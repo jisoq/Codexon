@@ -55,3 +55,40 @@ def test_completed_request_trend_uses_completion_time_and_missing_means_gap():
     assert [r['known'] for r in view['timeline']]==[0,1,0,0]
     assert [r['N'] for r in view['timeline']]==[0,1,1,0]
     assert view['timeline'][1]['calls']==0  # requests complete independently of call timestamps
+
+
+def test_category_projection_preserves_denominators_history_and_bounded_pages(monkeypatch):
+    from cachemonitor.analysis_engine import AnalysisEngine
+    engine=AnalysisEngine();source=session_view();engine.ingest([source])
+    now=ts('2026-02-03T00:00:00')
+    q=dict(page=1,start=0,end=now,now=now,period='all',category_usage=True,presentation=True,
+           include_whole_history=False,usage=dict(dimension='model',metric='calls',size=2))
+    view=engine.page_query(q)['usage']
+    assert view['summary']['value']==3 and sum(r['value'] for r in view['rows'])==3
+    assert all(sum(c['value'] for c in r['components'])==r['value'] for r in view['rows'])
+    original=engine.query
+    monkeypatch.setattr(engine,'query',lambda q:pytest.fail('Pagination/search must reuse the aggregate projection'))
+    filtered=engine.page_query({**q,'usage':{**q['usage'],'search':'unknown','page':100}})['usage']
+    assert filtered['summary']['value']==3 and filtered['count']==1 and filtered['page']==0
+    monkeypatch.setattr(engine,'query',original)
+    selected={**q,'start':ts('2026-02-02T00:00:00'),'model':'gpt-6-astra',
+              'usage':dict(dimension='source',metric='calls',selected=['model','gpt-6-astra'])}
+    detail=engine.page_query(selected)['usage']
+    assert detail['summary']['value']==1
+    assert detail['detail']['first']==ts('2026-01-30T12:00:00')
+    assert detail['detail']['sessions']==1
+    for label in ('유저','User agent'):
+        found=engine.page_query({**selected,'usage':{**selected['usage'],'search':label}})['usage']
+        assert found['count']==1 and found['summary']==detail['summary']
+
+
+def test_category_partial_tokens_and_equal_weight_call_tps():
+    from cachemonitor.category_usage import summary
+    rows=[dict(output=2000,reasoning=500,completion_latency_ms=10000,response_status='completed'),
+          dict(output=3000,reasoning=None,completion_latency_ms=30000,response_status='completed'),
+          dict(output=None,completion_latency_ms=2000,response_status='completed')]
+    assert summary(rows,'tps')==dict(value=150,known=2,total=3,partial=True)
+    assert summary(rows,'output')['value']==5000 and summary(rows,'output')['partial']
+    assert summary(rows,'reasoning')['value']==500
+    assert summary([dict(output=0,completion_latency_ms=100,response_status='completed')],'tps')['value']==0
+    assert summary([rows[2]],'tps')['value'] is None

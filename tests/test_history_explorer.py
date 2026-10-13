@@ -81,6 +81,68 @@ def test_mouse_history_navigation_restores_detail_and_discards_forward_branch(da
     assert not w.qml_errors
 
 
+@pytest.mark.integration
+def test_history_filter_popup_and_chips_preserve_route_and_list(dashboard,tmp_path):
+    from PySide6.QtCore import QPointF, Qt
+    from PySide6.QtGui import QAccessible
+    from PySide6.QtTest import QTest
+    from cachemonitor.dashboard import choose
+    from cachemonitor.quick_qa import click, control, render_plot, walk
+    w=dashboard;w.resize(1030,740);w.change_page(2);w.activate_record(0);w.activate_record(0)
+    choose(w.model,w.record_rows[0]['model']);w.filter_changed()
+    route=(w.selected_session,w.selected_turn,w.record_view)
+    filtered={row['key'] for row in w.record_rows}
+    body=render_plot(w,w.records_body)
+    geometry=(body.mapToScene(QPointF()),body.size())
+    click(w,control(w,w.record_filters.toggle))
+    try:
+        wait_for_rendered(lambda: any(item.property('node') is w.model and item.isVisible()
+                          for item in walk(w.quick.quickWindow().contentItem())))
+    except AssertionError:
+        w.grab().save(str(tmp_path/'filter-popup.png'))
+        raise
+    assert (body.mapToScene(QPointF()),body.size())==geometry
+    rendered_model=control(w,w.model)
+    QTest.keyClick(w.quick,Qt.Key_Escape)
+    wait_for_rendered(lambda: not w.record_filters.toggle.isChecked())
+    assert control(w,w.record_filters.toggle).hasActiveFocus()
+    w.change_page(3);w.change_page(2)
+    click(w,control(w,w.record_filters.toggle))
+    wait_for_rendered(lambda: control(w,w.model).isVisible())
+    assert control(w,w.model) is rendered_model
+    assert filtered=={row['key'] for row in w.record_rows}
+    assert route==(w.selected_session,w.selected_turn,w.record_view)
+    QTest.keyClick(w.quick,Qt.Key_Escape)
+    wait_for_rendered(lambda: not w.record_filters.toggle.isChecked())
+    click(w,control(w,w.history_filter_chips['model']))
+    wait_for_rendered(lambda: not w.model.currentData())
+    assert filtered<={row['key'] for row in w.record_rows}
+    assert route==(w.selected_session,w.selected_turn,w.record_view)
+    assert not control(w,w.history_filter_chips['model']).isVisible()
+    assert not control(w,w.record_parent).isVisible()
+    click(w,control(w,w.history_projects_button))
+    wait_for_rendered(lambda: control(w,w.record_parent).isVisible())
+    click(w,control(w,w.history_projects_button))
+    wait_for_rendered(lambda: not control(w,w.record_parent).isVisible())
+    accessible=QAccessible.queryAccessibleInterface(control(w,w.sort))
+    assert accessible and accessible.text(QAccessible.Name)
+    assert not w.qml_errors
+
+
+def test_history_duration_preserves_precision_and_missing_values():
+    from cachemonitor.history_navigation import history_duration
+    from cachemonitor.i18n import language,set_language
+    previous=language();set_language('ko')
+    try:
+        assert history_duration(None)=='—'
+        assert history_duration(0)=='0.00초'
+        assert history_duration(2801.32)=='46분 41.32초'
+        assert history_duration(3599.999)=='1시간 0분 0.00초'
+        set_language('en')
+        assert history_duration(3661.25)=='1h 1m 1.25s'
+    finally:set_language(previous)
+
+
 def test_tree_window_and_reuse():
     source=history()
     sessions=[dict(source,id=f's-{i}',home=f'h-{i}') for i in range(800)]
