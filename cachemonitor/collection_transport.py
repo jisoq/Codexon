@@ -71,7 +71,7 @@ def _read_frame(connection, deadline, limit=None):
 
 class LiveServer:
     """One bounded request per connection, without deserializing Python objects."""
-    def __init__(self, path, handler):
+    def __init__(self, path, handler, *, transport=None):
         self.path = Path(path)
         self.handler = handler
         self.token = secrets.token_bytes(32)
@@ -80,12 +80,20 @@ class LiveServer:
         self.connection_lock = threading.Lock()
         self.connections = set()
         self.handlers = set()
-        self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.pipe = (os.name == 'nt') if transport is None else transport == 'pipe'
+        if self.pipe:
+            from .collection_pipe import PipeListener
+            self.listener = PipeListener()
+        else:
+            self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
-            self.listener.bind(('127.0.0.1', 0))
-            self.listener.listen(16)
-            self.listener.settimeout(.2)
-            self.endpoint = dict(port=self.listener.getsockname()[1], token=self.token.hex())
+            if self.pipe:
+                self.endpoint = dict(pipe=self.listener.address, token=self.token.hex())
+            else:
+                self.listener.bind(('127.0.0.1', 0))
+                self.listener.listen(16)
+                self.listener.settimeout(.2)
+                self.endpoint = dict(port=self.listener.getsockname()[1], token=self.token.hex())
             temporary = self.path.with_name(self.path.name + '.' + secrets.token_hex(8))
             try:
                 with temporary.open('x', encoding='utf-8') as stream:
@@ -113,7 +121,10 @@ class LiveServer:
                 connection.close()
                 continue
             try:
-                connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                if self.pipe:
+                    self.listener.prepare()
+                else:
+                    connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 with self.connection_lock:
                     if self.closed.is_set():
                         connection.close()
@@ -174,7 +185,6 @@ class LiveServer:
                 connection.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
-            connection.close()
         current = threading.current_thread()
         for worker in (self.thread, *handlers):
             if worker is not current:
@@ -215,7 +225,6 @@ class RequestCancellation:
             if connection is not None:
                 try: connection.shutdown(socket.SHUT_RDWR)
                 except OSError: pass
-                connection.close()
 
 
 class PublicationWaiter:
@@ -284,20 +293,15 @@ def request(path, value, *, timeout=None, cancel=None):
         try:
             if endpoint is None:
                 endpoint = json.loads(path.read_text(encoding='utf-8'))
-                if (not isinstance(endpoint, dict) or type(endpoint.get('port')) is not int or
-                        not 0 < endpoint['port'] < 65536 or not isinstance(endpoint.get('token'), str)):
+                if not _valid_endpoint(endpoint):
                     return None
                 with _endpoint_lock:
                     _endpoints[key] = endpoint
             token = bytes.fromhex(endpoint['token'])
             if len(token) != 32:
                 return None
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as connection:
+            with _connect(endpoint, deadline, cancel) as connection:
                 if cancel is not None: cancel.attach(connection)
-                connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                _timeout(connection, deadline)
-                connection.settimeout(min(.2, connection.gettimeout()))
-                connection.connect(('127.0.0.1', endpoint['port']))
                 nonce = _receive(connection, 32, deadline)
                 _send(connection, _signature(token, nonce, encoded), deadline)
                 _frame(connection, encoded, deadline)
@@ -317,3 +321,35 @@ def request(path, value, *, timeout=None, cancel=None):
         finally:
             if cancel is not None and 'connection' in locals(): cancel.detach(connection)
     return None
+
+
+def _valid_endpoint(endpoint):
+    if not isinstance(endpoint, dict) or not isinstance(endpoint.get('token'), str):
+        return False
+    if 'pipe' in endpoint:
+        name = endpoint['pipe']
+        prefix = r'\\.\pipe\Codexon-collection-'
+        return (os.name == 'nt' and isinstance(name, str) and name.startswith(prefix)
+                and len(name) == len(prefix) + 32
+                and all(character in '0123456789abcdef' for character in name[len(prefix):]))
+    return type(endpoint.get('port')) is int and 0 < endpoint['port'] < 65536
+
+
+def _connect(endpoint, deadline, cancel=None):
+    if 'pipe' in endpoint:
+        from .collection_pipe import connect
+        return connect(endpoint['pipe'], min(deadline, time.monotonic() + .2), cancel)
+    connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        if cancel is not None:
+            cancel.attach(connection)
+        connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        _timeout(connection, deadline)
+        connection.settimeout(min(.2, connection.gettimeout()))
+        connection.connect(('127.0.0.1', endpoint['port']))
+        return connection
+    except BaseException:
+        connection.close()
+        if cancel is not None:
+            cancel.detach(connection)
+        raise

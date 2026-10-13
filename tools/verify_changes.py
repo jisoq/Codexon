@@ -119,6 +119,7 @@ RULES = (
     ('cachemonitor/analysis_worker.py', ('analysis', 'quota_poll', 'overlay_tracking', 'notifications')),
     ('cachemonitor/usage_collection.py', ('data', 'quota_poll', 'overlay_tracking', 'retirement')),
     ('cachemonitor/collection_transport.py', ('data', 'quota_poll', 'app_lifetime')),
+    ('cachemonitor/collection_pipe.py', ('data', 'quota_poll', 'app_lifetime')),
     ('cachemonitor/usage_paths.py', ('data', 'quota_poll', 'evidence')),
     ('cachemonitor/analysis_delivery.py', ('analysis', 'overlay_tracking')),
     ('cachemonitor/pricing.py', ('cost', 'quota_store', 'quota_math')),

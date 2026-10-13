@@ -1,6 +1,7 @@
 """Live collection preserves precision while checkpoints store substantive changes."""
 import copy
 import json
+import os
 import socket
 import sqlite3
 import threading
@@ -649,10 +650,11 @@ def test_response_signature_preserves_protocol_without_copying_large_body():
     assert peak<1024*1024
 
 
-def test_live_server_close_releases_stalled_handshake_socket_and_worker(tmp_path):
+def test_live_server_close_releases_stalled_handshake_and_worker(tmp_path):
     server=collection_transport.LiveServer(tmp_path/'endpoint.json',lambda request:({},b''))
     try:
-        with socket.create_connection(('127.0.0.1',server.endpoint['port']),timeout=3) as client:
+        with collection_transport._connect(server.endpoint,time.monotonic()+3) as client:
+            client.settimeout(3)
             assert len(collection_transport._receive(client,32,time.monotonic()+3))==32
             with server.connection_lock:workers=tuple(server.handlers)
             assert workers
@@ -678,11 +680,14 @@ def test_live_server_close_keeps_blocked_callbacks_owned_until_completion(tmp_pa
     clients=[];workers=()
     try:
         for _ in range(2):
-            client=socket.create_connection(('127.0.0.1',server.endpoint['port']),timeout=3)
+            client=collection_transport._connect(server.endpoint,time.monotonic()+3)
+            client.settimeout(3)
             clients.append(client)
             nonce=collection_transport._receive(client,32,time.monotonic()+3)
             encoded=b'{}'
-            client.sendall(hmac.digest(server.token,nonce+encoded,'sha256')+struct.pack('!Q',len(encoded))+encoded)
+            collection_transport._send(client,
+                hmac.digest(server.token,nonce+encoded,'sha256')+struct.pack('!Q',len(encoded))+encoded,
+                time.monotonic()+3)
         assert entered.wait(3)
         with server.connection_lock:workers=tuple(server.handlers)
         start=time.monotonic();server.close()
@@ -695,3 +700,87 @@ def test_live_server_close_keeps_blocked_callbacks_owned_until_completion(tmp_pa
         for client in clients:client.close()
         server.close()
     assert not server.connections and not server.handlers
+
+
+@pytest.mark.skipif(os.name!='nt',reason='Windows collection uses private named pipes')
+def test_pipe_requests_and_watch_cancellation_do_not_use_tcp_or_retain_handles(tmp_path,monkeypatch):
+    import ctypes
+    from ctypes import wintypes
+    kernel=ctypes.WinDLL('kernel32',use_last_error=True)
+    kernel.GetCurrentProcess.restype=wintypes.HANDLE
+    kernel.GetProcessHandleCount.argtypes=[wintypes.HANDLE,ctypes.POINTER(wintypes.DWORD)]
+    def handles():
+        count=wintypes.DWORD()
+        assert kernel.GetProcessHandleCount(kernel.GetCurrentProcess(),ctypes.byref(count))
+        return count.value
+    def no_tcp(*args,**kwargs):raise AssertionError('A collection pipe must not allocate a TCP socket')
+    monkeypatch.setattr(socket,'socket',no_tcp)
+    path=tmp_path/'pipe.json';entered=threading.Event();release=threading.Event()
+    body=b'x'*(2*1024*1024+17)
+    def callback(value):
+        if value.get('watch'):
+            entered.set()
+            assert release.wait(2)
+        return {'ok':True},body if value.get('large') else b''
+    server=collection_transport.LiveServer(path,callback)
+    try:
+        assert 'pipe' in server.endpoint and 'port' not in server.endpoint
+        assert collection_transport.request(path,{'large':True})==({'ok':True},body)
+        wait_until(lambda:not server.handlers)
+        baseline=handles()
+        for _ in range(12):
+            # A peer can leave before sending its authentication or request.
+            collection_transport._connect(server.endpoint,time.monotonic()+1).close()
+            for _ in range(3):assert collection_transport.request(path,{})==({'ok':True},b'')
+            entered.clear();release.clear()
+            cancel=collection_transport.RequestCancellation();result=[]
+            worker=threading.Thread(target=lambda:result.append(
+                collection_transport.request(path,{'watch':1},timeout=12,cancel=cancel)))
+            worker.start()
+            try:
+                assert entered.wait(2)
+                cancel.close();worker.join(1)
+                assert not worker.is_alive() and result==[None]
+            finally:
+                release.set();worker.join(2)
+            wait_until(lambda:not server.handlers)
+        assert handles()<=baseline+2
+    finally:release.set();server.close()
+    assert not server.thread.is_alive() and not server.handlers and not server.connections
+
+
+@pytest.mark.skipif(os.name!='nt',reason='Windows collection uses private named pipes')
+def test_pipe_stalled_response_obeys_deadline_and_legacy_tcp_endpoint_is_readable(tmp_path):
+    path=tmp_path/'endpoint.json';release=threading.Event();entered=threading.Event()
+    def callback(value):
+        entered.set();release.wait(2)
+        return {'ok':True},b''
+    server=collection_transport.LiveServer(path,callback)
+    started=time.monotonic()
+    try:
+        assert collection_transport.request(path,{},timeout=.15) is None
+        assert entered.is_set() and time.monotonic()-started<1
+    finally:release.set();server.close()
+    legacy=collection_transport.LiveServer(path,lambda value:({'legacy':True},b'ok'),transport='tcp')
+    try:assert collection_transport.request(path,{})==({'legacy':True},b'ok')
+    finally:legacy.close()
+
+
+@pytest.mark.skipif(os.name!='nt',reason='Windows collection uses private named pipes')
+def test_pipe_capacity_rejects_extra_clients_and_recovers_after_disconnect(tmp_path):
+    path=tmp_path/'endpoint.json'
+    server=collection_transport.LiveServer(path,lambda value:({'ok':True},b''))
+    clients=[]
+    try:
+        for _ in range(16):
+            client=collection_transport._connect(server.endpoint,time.monotonic()+1)
+            clients.append(client)
+            assert len(collection_transport._receive(client,32,time.monotonic()+1))==32
+        assert collection_transport.request(path,{},timeout=.1) is None
+        clients.pop().close()
+        wait_until(lambda:len(server.connections)==15)
+        assert collection_transport.request(path,{})==({'ok':True},b'')
+    finally:
+        for client in clients:client.close()
+        server.close()
+    assert not server.thread.is_alive() and not server.handlers

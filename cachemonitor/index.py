@@ -311,14 +311,18 @@ class UsageIndex:
             self.source_work.pop(path,None)
             return None
         old = self.db.execute('select tid,offset,size,mtime,inode from files where path=?', (path,)).fetchone()
-        if (old and old[1] == st.st_size and old[2] == st.st_size
+        if (old and path not in self.source_work and old[1] == st.st_size and old[2] == st.st_size
                 and old[3] == st.st_mtime_ns and old[4] == str(st.st_ino)):
             self.source_work.pop(path,None)
             return (str(home), old[0]) if self.initial else None
         offset = old[1] if old else 0
         if old:
             tid = old[0]
-            if str(st.st_ino) != old[4] or st.st_size < offset or (st.st_size == offset and st.st_mtime_ns != old[3]):
+            # A pending verification has a durable sentinel, while its live
+            # owner still knows which source signature its current pass saw.
+            mtime=(self.source_work[path]['signature'][1]
+                   if old[3]==-1 and path in self.source_work else old[3])
+            if str(st.st_ino) != old[4] or st.st_size < offset or (st.st_size == offset and st.st_mtime_ns != mtime):
                 self.db.execute('delete from events where path=?', (path,))
                 self.rebuild_required.add((str(home),tid))
                 offset = 0
@@ -329,21 +333,26 @@ class UsageIndex:
         if partial is not None:self.partial_work.pop(path,None)
         state=self.source_work.get(path)
         restarted = state is not None and state['signature'] != signature
-        if state is not None and state['signature']!=signature:
-            self.source_work.pop(path,None);state=None
+        if restarted:
+            prior=state['signature']
+            if signature[2]==prior[2] and signature[0]>prior[0]:
+                # Growth cannot prove append-only. Finish this fixed pass, but
+                # require another pass before reporting collection complete.
+                state['signature']=signature;state['recheck']=True
+            else:
+                self.source_work.pop(path,None);state=None
         if state is None:
             if len(self.source_work)>=MAX_SOURCE_WORK:
                 self.queue.append((path,home,tid))
                 return None
             state=dict(signature=signature,offset=0,target=offset,digest=hashlib.sha256(),
-                       verified=not offset,known=self.source_hashes.get(path))
+                       verified=not offset,known=self.source_hashes.get(path),scan_target=st.st_size)
             self.source_work[path]=state
         with p.open('rb') as f:
             budget=FILE_READ_BUDGET
-            # A growing source can invalidate a sliced prefix on every visit.
-            # Finish a known prefix in one bounded pass after such a restart,
-            # then leave a separate ordinary slice for the new records. The
-            # extra verification is at most 64 MiB per poll; buffers stay 1 MiB.
+            # Finish small known prefixes promptly after growth. Larger ones
+            # retain their fixed target and progress across bounded slices.
+            # Extra verification is at most 64 MiB per poll; buffers stay 1 MiB.
             inline_prefix = (restarted and not state['verified'] and state['known'] is not None
                              and state['target'] <= self.prefix_priority)
             validation_budget = self.prefix_priority if inline_prefix else budget
@@ -378,6 +387,11 @@ class UsageIndex:
                     self.db.execute('delete from events where path=?',(path,))
                     self.rebuild_required.add((str(home),tid));state.update(offset=0,digest=hashlib.sha256())
                     state.pop('reader',None)
+                resume=state.pop('resume_reader',None)
+                if unchanged and resume is not None:
+                    # The pass also verified the unfinished line's bytes. Keep
+                    # its bounded parser, including progress beyond the last LF.
+                    state.update(offset=resume.committed,digest=resume.committed_digest.copy(),reader=resume)
                 state['verified']=True
                 if budget<=0:
                     self.queue_prefix(path,home,tid,self.bytes_read-before)
@@ -426,9 +440,24 @@ class UsageIndex:
             digest=state['digest']
             self.source_hashes[path]=(offset,digest.hexdigest())
             state['offset']=offset
+        # Keep the recheck obligation across a crash after tentative rows are
+        # committed. Only a clean pass may persist the real source signature.
+        mtime=-1 if state.get('recheck') else st.st_mtime_ns
         self.db.execute('insert or replace into files values(?,?,?,?,?,?,?)',
-                        (path, str(home), tid, offset, st.st_size, st.st_mtime_ns, str(st.st_ino)))
-        if offset < st.st_size and consumed >= budget:
+                        (path, str(home), tid, offset, st.st_size, mtime, str(st.st_ino)))
+        reader=state.get('reader')
+        read_offset=reader.read_offset if reader is not None else offset
+        if state.get('recheck') and (read_offset>=state['scan_target'] or consumed<budget):
+            # Publish tentative progress, then validate it without chasing a
+            # moving EOF. A rewrite behind this pass is caught by the next one;
+            # the queued obligation keeps usage_complete false until then.
+            partial=reader if reader is not None and read_offset>offset else None
+            self.source_work[path]=dict(signature=signature,offset=0,target=read_offset,
+                digest=hashlib.sha256(),verified=not read_offset,
+                known=(read_offset,(reader.digest if partial else digest).hexdigest()),
+                scan_target=st.st_size,**({'resume_reader':partial} if partial else {}))
+            self.queue.append((path,home,tid))
+        elif offset < st.st_size and consumed >= budget:
             self.queue.append((path, home, tid))
         else:
             self.source_work.pop(path,None)
@@ -442,7 +471,7 @@ class UsageIndex:
     def queue_prefix(self,path,home,tid,consumed):
         # Finish ordinary large prefixes before a growing file changes again.
         # Priority is limited per poll; remaining files still share the scan's
-        # existing deadline. Source changes continue to restart verification.
+        # existing deadline. Changed prefixes still require a clean pass.
         args=(path,home,tid)
         if 0 < consumed <= self.prefix_priority:
             self.prefix_priority -= consumed

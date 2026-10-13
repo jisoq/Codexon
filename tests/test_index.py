@@ -271,6 +271,49 @@ def test_growing_file_finishes_restarted_known_prefix_and_reads_new_usage(tmp_pa
     finally:index.close()
 
 
+@pytest.mark.parametrize('restart',(False,True))
+def test_continuous_append_beyond_priority_budget_progresses_and_rechecks_rewrites(tmp_path,monkeypatch,restart):
+    import cachemonitor.index as implementation
+    monkeypatch.setattr(implementation,'FILE_READ_BUDGET',1024)
+    monkeypatch.setattr(implementation,'PREFIX_PRIORITY_BUDGET',4096)
+    home,path=fixture_home(tmp_path)
+    with path.open('ab') as stream:stream.write((b'x'*255+b'\n')*32)
+    cache=tmp_path/'index.sqlite';index=UsageIndex([home],cache)
+    try:
+        finish(index)
+        with path.open('ab') as stream:stream.write((json.dumps(usage('after',time=10011))+'\n').encode())
+        target=(str(path),home,TID)
+        index.prefix_priority=implementation.PREFIX_PRIORITY_BUDGET
+        before=index.bytes_read
+        assert index.scan_file(*target) is None
+        assert index.bytes_read-before==1024
+        # Change an already visited part of this pass, then keep appending so
+        # the completed hash alone cannot prove that the prefix is current.
+        path.write_bytes(path.read_bytes().replace(b'r1',b'r9')+b'\n')
+        seen=False
+        for _ in range(24):
+            with path.open('ab') as stream:stream.write(b'\n')
+            index.prefix_priority=implementation.PREFIX_PRIORITY_BUDGET
+            before=index.bytes_read
+            changed=index.scan_file(*index.queue.popleft())
+            assert index.bytes_read-before<=implementation.PREFIX_PRIORITY_BUDGET+1024
+            assert len(index.queue)==1 and len(index.source_work)==1
+            if changed:
+                index.rebuild(changed,10012)
+                seen=any(row['key']=='after' for row in index.monitor.sessions[(str(home),TID)].view(10012)['history'])
+            if seen:break
+        assert seen
+        # Pending verification must survive both the live queue and restart
+        # after the tentative rows and file metadata have been committed.
+        if restart:
+            index.db.commit();index.close();index=UsageIndex([home],cache)
+        result=finish(index,10012)
+        assert result['usage_collection_complete'] and not result['index']['loading']
+        assert [row['key'] for row in result['sessions'][0]['history']]==['r9','after']
+        assert not index.source_work
+    finally:index.close()
+
+
 def test_new_thread_and_late_rollout_path_wake_discovery_without_repeated_idle_scans(tmp_path,monkeypatch):
     home,_=fixture_home(tmp_path);index=UsageIndex([home],tmp_path/'index.sqlite')
     try:
