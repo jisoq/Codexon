@@ -5,7 +5,7 @@ import pytest
 pytestmark = pytest.mark.integration
 
 from cachemonitor.quick_qa import control, click, click_row, walk
-from test_ui import dashboard, snapshot
+from test_ui import dashboard, snapshot, wait_for_rendered
 
 
 @pytest.mark.parametrize('language', ['ko', 'en'])
@@ -105,9 +105,13 @@ def test_home_card_and_comparison_controls_accept_rendered_input(dashboard):
 
 
 def test_project_selection_preserves_filters_and_back_restores_exact_call(dashboard):
-    w=dashboard;w.nav.setCurrentRow(w.navigation_pages.index(2));click_row(w,w.parent_table,1);click_row(w,w.table,0);click_row(w,w.table,1);click_row(w,w.table,1)
-    before=w.capture_state();assert w.selected_call
+    w=dashboard;w.resize(960,720);w.nav.setCurrentRow(w.navigation_pages.index(2))
+    wait_for_rendered(lambda: not control(w,w.record_parent).isVisible())
     click(w,control(w,w.history_projects_button))
+    wait_for_rendered(lambda: control(w,w.record_parent).isVisible())
+    click_row(w,w.parent_table,1);click_row(w,w.table,0);click_row(w,w.table,1);click_row(w,w.table,1)
+    before=w.capture_state();assert w.selected_call
+    if not w.history_projects_button.isChecked():click(w,control(w,w.history_projects_button))
     click_row(w,w.parent_table,0)
     assert w.record_view=='sessions' and w.selected_session is None and w.selected_call is None and w.selected_turn is None
     assert w.period.currentData()==before['common']['period']
