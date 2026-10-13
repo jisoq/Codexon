@@ -645,8 +645,12 @@ class CollectionClient:
         if snapshot is not None and not self.channel.last_read_live:
             snapshot={**snapshot,'collection_recovery':True}
         if snapshot is None:snapshot=empty_snapshot(self.channel.homes,self.path,now)
-        elif now-snapshot['ts']>30:
-            snapshot['errors']=list(dict.fromkeys([*snapshot.get('errors',[]),'수집 결과 갱신 지연']))
+        # Freshness belongs to this read, not the shared source snapshot or its
+        # error list. A late read must not contaminate a later cache recovery.
+        snapshot={**snapshot}
+        snapshot.pop('collection_stale',None)
+        if now-snapshot['ts']>30:
+            snapshot['collection_stale']=True
             snapshot['usage_collection_complete']=False
             snapshot['index']={**snapshot['index'],'usage_complete':False}
         homes=set(self.channel.homes)
@@ -703,17 +707,23 @@ class CollectorService:
 
     def poll(self,now=None):
         from .index import UsageIndex
+        started=time.monotonic()
         now=now or time.time();homes=self.channel.requested_homes(now)
         if self.index and homes!=[str(h) for h in self.index.homes]:
             self.index.close();self.index=None;self.epoch=uuid.uuid4().hex
         if self.index is None:self.index=UsageIndex(homes,self.channel.index_path,self.channel.evidence)
         snapshot=self.index.poll(now)
+        collected=time.monotonic()
         changes=getattr(self.index,'collection_changes',None)
         snapshot={**snapshot,'sessions':[dict(s,usage_revision=f'{self.epoch}:{s.get("usage_revision")}',
             **({'request_revision':f'{self.epoch}:{s["request_revision"]}'} if s.get('request_revision') is not None else {})) for s in snapshot['sessions']],
             'collection':dict(pid=os.getpid(),instance=self.instance,version=VERSION,
                 executable=self.executable)}
         self.sequence+=1;self.channel.publish(snapshot,self.epoch,self.sequence,changes=changes);self.last=snapshot
+        from .quota_diagnostics import record_slow_cycle
+        self.last_slow_report=record_slow_cycle(self.channel.path.with_suffix('.collector.sqlite'),
+            dict(source_collection=collected-started,publication=time.monotonic()-collected),
+            0,getattr(self,'last_slow_report',float('-inf')))
         return snapshot
 
     def close(self):

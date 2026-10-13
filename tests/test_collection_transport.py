@@ -501,7 +501,7 @@ def test_unrelated_session_change_does_not_rescan_subagent_quota_history(tmp_pat
         statements=[];ledger.db.set_trace_callback(statements.append)
         ledger.sync(engine,received);ledger.db.set_trace_callback(None)
         rescanned={key[1] for key,session in engine.sessions.items() if session['revision']!=revisions[key]}
-        lookups=[sql for sql in statements if sql.startswith('select uid,signature,service_tier,sid,cost,price_id from calls where')]
+        lookups=[sql for sql in statements if sql.lstrip().startswith('select ') and 'from calls ' in sql and 'sid=' in sql]
         assert rescanned=={'other'}
         assert len(lookups)==1
         after={row['uid']:dict(row) for row in ledger.db.execute('select * from calls')}
@@ -572,6 +572,27 @@ def test_recovery_prefers_latest_genuine_snapshot_without_freshening(tmp_path,la
         latest=copy.deepcopy(recent);latest['ts']=105.;latest['sessions'][0]['history'][0]['output']=5
         writer.publish(latest,later_epoch,3)
         assert client.poll(116.)['sessions'][0]['history'][0]['output']==5
+    finally:client.close();writer.close()
+
+
+def test_stale_client_read_preserves_source_errors_and_shared_freshness(tmp_path):
+    writer=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite');writer.start_live()
+    client=CollectionClient(writer.homes,writer.path)
+    try:
+        first=snapshot(writer);writer.publish(first,'epoch',1)
+        stale=client.poll(131.)
+        assert stale['collection_stale'] and not stale['usage_collection_complete']
+        assert not stale['errors'] and not stale['usage_errors']
+        assert client.channel.live_cached['usage_collection_complete']
+        assert not client.channel.live_cached.get('collection_stale')
+        failed={**first,'ts':140.,'errors':['source read failed'],'usage_errors':['source read failed']}
+        writer.publish(failed,'epoch',2)
+        stale=client.poll(171.)
+        assert stale['collection_stale'] and stale['errors']==failed['errors']
+        latest={**first,'ts':172.};writer.publish(latest,'epoch',3)
+        recovered=client.poll(172.)
+        assert not recovered.get('collection_stale') and not recovered['errors']
+        assert recovered['usage_collection_complete']
     finally:client.close();writer.close()
 
 

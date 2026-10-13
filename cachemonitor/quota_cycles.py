@@ -840,7 +840,9 @@ class QuotaLedger:
                 continue
             home, sid = key
             current_uids = set()
-            stored={r['uid']:r for r in self.db.execute('select uid,signature,service_tier,sid,cost,price_id from calls where home=? and sid=?',(home,sid))}
+            stored={r['uid']:r for r in self.db.execute('''select c.uid,c.signature,c.service_tier,c.sid,c.cost,c.price_id,
+                b.uid as boundary_uid,b.started from calls c left join tracking_call_boundaries b
+                on b.home=c.home and b.uid=c.uid where c.home=? and c.sid=?''',(home,sid))}
             previous_usage = {}
             turns = session['prepared'].get('turn_records', {})
             for row in sorted(session['prepared']['history'], key=lambda value: value['ts']):
@@ -855,10 +857,12 @@ class QuotaLedger:
                     requested = previous_usage.get(turn, turns.get(turn, {}).get('started_at'))
                 if turn:
                     previous_usage[turn] = row['ts']
-                self.db.execute('insert or replace into tracking_call_boundaries values(?,?,?)',
-                                (home, uid, requested))
-                signature = json.dumps([row.get(k) for k in ('ts', 'model', 'service_tier', *TOKEN_FIELDS)], separators=(',', ':'))
                 old = stored.get(uid)
+                if old is None or old['boundary_uid'] is None or old['started'] != requested:
+                    self.db.execute('''insert into tracking_call_boundaries values(?,?,?)
+                        on conflict(home,uid) do update set started=excluded.started
+                        where tracking_call_boundaries.started is not excluded.started''',(home,uid,requested))
+                signature = json.dumps([row.get(k) for k in ('ts', 'model', 'service_tier', *TOKEN_FIELDS)], separators=(',', ':'))
                 if old is None:old=self.db.execute('select signature,service_tier,sid,cost,price_id from calls where home=? and uid=?',(home,uid)).fetchone()
                 if old and old['signature'] == signature and old['price_id']==PRICE_ID:
                     if old['sid']!=sid:

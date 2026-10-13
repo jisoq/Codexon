@@ -151,7 +151,8 @@ def sync_activity(db, snapshot, cache=None):
                     db.execute('insert into tracking_activity_versions(home,identity,seen,start,end,kind,status,response) values(?,?,?,?,?,?,?,?)',
                         (home,identity,snapshot['ts'],start,end,'task','',''))
                 db.execute('insert into tracking_tasks values(?,?,?,?) on conflict(home,identity) '
-                           'do update set start=excluded.start,end=excluded.end',
+                           'do update set start=excluded.start,end=excluded.end '
+                           'where tracking_tasks.start is not excluded.start or tracking_tasks.end is not excluded.end',
                            (home, session['id'] + ':' + turn, start, end))
         for request in snapshot.get('request_activity', []):
             if os.path.normcase(request['home']) != os.path.normcase(home):

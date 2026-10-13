@@ -484,7 +484,8 @@ class OverlayController(QObject):
         self.snapshot_at = time.monotonic()
         self.loading = snapshot.get('index', {}).get('loading', False)
         self.errors = snapshot.get('errors', [])
-        if not self.errors:
+        self.collection_stale = bool(snapshot.get('collection_stale'))
+        if not self.errors and not self.collection_stale:
             self.snapshot_wall_time = snapshot.get('last_usage_collection_success') or snapshot.get('ts')
         self.refresh()
 
@@ -502,6 +503,8 @@ class OverlayController(QObject):
             return None, '원격 작업: 로컬 기록 없음'
         matches = self.session_lookup.get(selection.thread_id,[])
         issue = self.collection_issue
+        if not issue and not self.errors and getattr(self,'collection_stale',False):
+            issue='수집 결과 갱신 지연'
         received_age=max(0,time.monotonic()-self.snapshot_at)
         reason=('service_delay' if issue=='수집 결과 갱신 지연' else 'service_error' if issue else
                 'source_error' if self.errors else 'analysis_delay' if received_age>10 else '')
@@ -516,7 +519,8 @@ class OverlayController(QObject):
             'last_confirmed_at': self.snapshot_wall_time,
             'errors': [*self.errors, *([issue] if issue else [])], 'loading': self.loading,
             'delayed': received_age > 10, 'reason':reason,'received_age':received_age,
-            'service_issue':issue,'service_fault':getattr(self,'collection_fault',{}),
+            'service_issue':issue,'service_fault':{**getattr(self,'collection_fault',{}),
+                **({'snapshot_stale':True} if getattr(self,'collection_stale',False) else {})},
             'source_error_count':len(self.errors),
         }}
         return data, note

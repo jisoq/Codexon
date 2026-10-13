@@ -100,7 +100,7 @@ def test_forced_kill_replays_source_once_and_reconnects_existing_client(tmp_path
         assert not child.is_alive() and child.exitcode != 0
         # No shutdown handler runs. An old durable snapshot must not become fresh.
         stale = client.poll(time.time() + 31)
-        assert not stale['usage_collection_complete'] and stale['errors']
+        assert not stale['usage_collection_complete'] and stale['collection_stale']
         resumed, resumed_control = launch()
         recovered = client.poll()
         assert not recovered.get('collection_recovery')

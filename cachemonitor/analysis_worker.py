@@ -5,6 +5,7 @@ import threading
 import time
 import traceback
 import sqlite3
+from pathlib import Path
 from datetime import datetime, timedelta
 from bisect import bisect_left
 from PySide6.QtCore import QThread, Signal
@@ -47,6 +48,12 @@ def process_main(connection,homes,index_path,static_snapshot=None,model_evidence
     ledger_retry=0
     ledger_failures=0
     imported=False
+    last_slow_report=float('-inf')
+    diagnostic_path=Path(quota_path).with_suffix('.analysis.sqlite')
+    def record_timing(stages,source_age=0):
+        nonlocal last_slow_report
+        from .quota_diagnostics import record_slow_cycle
+        last_slow_report=record_slow_cycle(diagnostic_path,stages,source_age,last_slow_report)
     def disable_ledger(error):
         nonlocal ledger,ledger_issue,ledger_retry,ledger_failures
         from .quota_diagnostics import record_failure, storage_issue
@@ -83,6 +90,7 @@ def process_main(connection,homes,index_path,static_snapshot=None,model_evidence
         details={}
         def send_details(all_pending=True):
             while details:
+                detail_started=time.monotonic()
                 message=details.pop(next(iter(details)))
                 if message['kind']=='population':
                     from .dashboard_views import population_summary
@@ -91,6 +99,7 @@ def process_main(connection,homes,index_path,static_snapshot=None,model_evidence
                 else:
                     connection.send({'kind':'record','id':message['id'],
                                      'row':engine.record(*message['identity'])})
+                record_timing({'detail':time.monotonic()-detail_started})
                 if not all_pending:break
         if snapshot is not None: publish()
         while True:
@@ -126,11 +135,18 @@ def process_main(connection,homes,index_path,static_snapshot=None,model_evidence
                         if cursor:collector.channel.activity_ack=cursor
                         ledger._activity_bound=True
                     except sqlite3.Error as error:disable_ledger(error)
+                stages={};stage_started=time.monotonic()
+                def completed(stage):
+                    nonlocal stage_started
+                    at=time.monotonic();stages[stage]=at-stage_started;stage_started=at
                 snapshot=collector.poll()
+                completed('collection_read')
                 if ledger:
                     try:ledger.enrich_modes(snapshot)
                     except sqlite3.Error as error:disable_ledger(error)
+                completed('mode_evidence')
                 engine.ingest(snapshot['sessions'])
+                completed('analysis')
                 if ledger:
                     try:
                         ledger.sync(engine,snapshot)
@@ -147,7 +163,10 @@ def process_main(connection,homes,index_path,static_snapshot=None,model_evidence
                 snapshot={**snapshot,'ledger_status_known':True,
                     'ledger_fault':dict(ledger_failed=bool(ledger_issue))}
                 if ledger_issue:snapshot={**snapshot,'ledger_error':ledger_issue}
+                completed('quota_sync')
                 publish()
+                completed('publication')
+                record_timing(stages,max(0,time.time()-snapshot['ts']))
                 notification=collector.notification_connection()
                 delay=.1 if snapshot['index']['loading'] else 3
                 if notification is not None and not snapshot['index']['loading']:
@@ -157,6 +176,7 @@ def process_main(connection,homes,index_path,static_snapshot=None,model_evidence
                 next_poll=time.monotonic()+delay
             if pending is not None and snapshot is not None:
                 request=pending; pending=None
+                query_started=time.monotonic()
                 try:
                     result=engine.page_query(request['query'])
                     ready={'kind':'result','id':request['id'],'logical':request['logical'],
@@ -165,6 +185,8 @@ def process_main(connection,homes,index_path,static_snapshot=None,model_evidence
                     continue
                 except Exception:
                     connection.send({'kind':'error','id':request['id'],'error':traceback.format_exc(limit=6)})
+                finally:
+                    record_timing({'query':time.monotonic()-query_started})
             # Incoming UI requests wake this wait immediately. Only collection
             # needs a timer; an idle analyzer does not need 50 wakeups a second.
             if details:continue

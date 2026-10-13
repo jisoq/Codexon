@@ -36,6 +36,18 @@ def test_overlay_banner_identifies_each_trigger_without_changing_stale_threshold
     controller.collection_issue='';controller.errors=[];controller.snapshot_at=90.
     data,note=OverlayController.content(controller)
     assert note=='' and not OverlayContent.collection_age(data,note)
+    OverlayController.receive_snapshot(controller,dict(overlay_sessions=[dict(id=A,calls=2)],
+        errors=[],collection_stale=True,ts=1001.))
+    data,note=OverlayController.content(controller)
+    assert note=='수집 지연' and data['_collection']['source_error_count']==0
+    assert data['_collection']['service_fault']['snapshot_stale']
+    assert controller.snapshot_wall_time==1000.
+    OverlayController.receive_snapshot(controller,dict(overlay_sessions=[dict(id=A,calls=2)],
+        errors=['read failure'],collection_stale=True,ts=1002.))
+    data,note=OverlayController.content(controller)
+    assert note=='수집 오류' and data['_collection']['reason']=='source_error'
+    OverlayController.receive_snapshot(controller,dict(overlay_sessions=[dict(id=A,calls=2)],errors=[],ts=1003.))
+    assert OverlayController.content(controller)[1]==''
 
 
 def test_missing_session_retains_service_error_and_clears_on_recovery():

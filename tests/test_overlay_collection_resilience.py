@@ -150,7 +150,7 @@ def test_missing_or_stalled_service_is_read_only_for_consumers(tmp_path,monkeypa
     monkeypatch.setattr(ObserverTask,'start',lambda self,command,autostart:starts.append((self.role,command)))
     try:
         snapshot=gui.poll(10045)
-        assert snapshot['sessions'] and snapshot['errors']
+        assert snapshot['sessions'] and snapshot['collection_stale'] and not snapshot['errors']
         assert not snapshot['usage_collection_complete'] and snapshot['ts']==10010
         assert starts==[]
         gui.poll(10046);assert starts==[]
@@ -263,7 +263,7 @@ def test_consumer_close_does_not_own_service_and_app_restarts_dead_collector(tmp
         owner.poll_collection();assert len(processes)==1
         clock[0]=60;owner.poll_collection()
         stale=gui.poll(time.time()+31)
-        assert stale['errors'] and not hasattr(gui,'index')
+        assert stale['collection_stale'] and not hasattr(gui,'index')
         until=time.monotonic()+10
         while time.monotonic()<until:
             restarted=gui.poll()

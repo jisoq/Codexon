@@ -116,6 +116,52 @@ def test_session_sync_work_does_not_scale_with_unrelated_call_history(tmp_path):
     finally:ledger.close()
 
 
+def test_restart_and_append_do_not_rewrite_unchanged_call_boundaries(tmp_path):
+    path=tmp_path/'boundaries.sqlite';ledger=QuotaLedger(path)
+    calls=[row(f'r{i}',ts=150+i,request_ts=100+i) for i in range(64)]
+    calls[0]['request_ts']=None
+    try:sync(ledger,calls)
+    finally:ledger.close()
+    ledger=QuotaLedger(path)
+    try:
+        ledger.db.executescript('''create temp table boundary_writes(uid text);
+            create temp trigger changed_boundary after update on tracking_call_boundaries
+            begin insert into boundary_writes values(new.uid); end;
+            create temp trigger inserted_boundary after insert on tracking_call_boundaries
+            begin insert into boundary_writes values(new.uid); end;''')
+        sync(ledger,calls)
+        assert ledger.db.execute('select count(*) from boundary_writes').fetchone()[0]==0
+        calls.append(row('new',ts=220,request_ts=210))
+        calls[0]={**calls[0],'request_ts':90}
+        calls[1]={**calls[1],'request_ts':None}
+        sync(ledger,calls,revision=2)
+        assert {r[0] for r in ledger.db.execute('select uid from boundary_writes')}=={'new','r0','r1'}
+        assert ledger.db.execute("select started from tracking_call_boundaries where uid='r0'").fetchone()[0]==90
+        assert ledger.db.execute("select started from tracking_call_boundaries where uid='r1'").fetchone()[0] is None
+    finally:ledger.close()
+
+
+def test_slow_cycle_diagnostics_are_quiet_normally_and_rate_limited(monkeypatch,tmp_path):
+    import json
+    from cachemonitor import quota_diagnostics as diagnostics
+    clock=[100.];records=[]
+    monkeypatch.setattr(diagnostics.time,'monotonic',lambda:clock[0])
+    monkeypatch.setattr(diagnostics,'_logger',lambda path:SimpleNamespace(warning=records.append))
+    last=float('-inf');path=tmp_path/'analysis.sqlite'
+    assert diagnostics.record_slow_cycle(path,{'analysis':1.},2.,last)==last
+    last=diagnostics.record_slow_cycle(path,{'analysis':11.},12.,last)
+    assert json.loads(records[0])['stage_seconds']=={'analysis':11.}
+    clock[0]+=59
+    assert diagnostics.record_slow_cycle(path,{'analysis':15.},40.,last)==last
+    assert len(records)==1
+    clock[0]+=1
+    last=diagnostics.record_slow_cycle(path,{'analysis':1.},31.,last)
+    assert len(records)==2 and json.loads(records[1])['source_age_seconds']==31.
+    def full_disk(path):raise OSError('full')
+    monkeypatch.setattr(diagnostics,'_logger',full_disk);clock[0]+=60
+    assert diagnostics.record_slow_cycle(path,{'analysis':11.},12.,last)==clock[0]
+
+
 def test_standard_report_keeps_unknown_mode_separate_and_unpriced(tmp_path):
     ledger=QuotaLedger(tmp_path/'merged.sqlite')
     try:
