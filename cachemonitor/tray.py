@@ -95,7 +95,6 @@ class TrayWindow(QuickHost):
         if registry is None:error=bool(self.snapshot.get('errors')) or bool(getattr(self,'analysis_errors',[]))
         else:error=bool(principal and principal.severity=='error')
         warning=any(s.get('warning') for s in self.snapshot.get('sessions',[]))
-        if display['remaining'] is not None and display['remaining']<10: warning=True
         if principal and principal.severity=='warning':warning=True
         signature=(shared_theme().dark,error,warning)
         if signature!=getattr(self,'_tray_icon_signature',None):

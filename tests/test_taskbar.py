@@ -202,7 +202,7 @@ def test_taskbar_data_visibility_menu_and_persistence(tmp_path, monkeypatch, own
         w.snapshot['quota_by_home'][w.observer_home]['windows']['weekly']['used_percent'] = 95
         w.refresh_tray()
         assert indicator.value.text() == '5%' and indicator._warning
-        assert w.tray.icon().cacheKey() != tray_icon_key
+        assert w.tray.icon().cacheKey() == tray_icon_key
         w.snapshot['quota_by_home'][w.observer_home]['windows']['weekly']['resets_at'] = now - 1
         w.snapshot['quota_by_home'][w.observer_home]['observed_at'] = now - 2  # No server observation since this reset.
         w.refresh_tray()
