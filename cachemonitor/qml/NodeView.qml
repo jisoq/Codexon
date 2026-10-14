@@ -376,8 +376,12 @@ Item {
             Component.onCompleted: Qt.callLater(function() {
                 scroll.contentItem.contentY = view.node.verticalPosition.position
                 scroll.restoringPosition = false
+                scroll.revealTarget = view.node.pendingReveal
             })
-            function cancelReveal() { revealTarget=null; revealGeometry="" }
+            function cancelReveal() {
+                if (revealTarget !== null) view.node.clearReveal()
+                revealTarget=null; revealGeometry=""
+            }
             onVisibleChanged: if (!visible) cancelReveal()
             Keys.onPressed: event => {
                 if ([Qt.Key_Up,Qt.Key_Down,Qt.Key_Left,Qt.Key_Right,Qt.Key_PageUp,Qt.Key_PageDown,Qt.Key_Home,Qt.Key_End].includes(event.key)) cancelReveal()
@@ -469,6 +473,7 @@ Item {
                     node: modelData
                     visible: index === view.s.index && modelData.state.visible
                     loadRequested: !view.s.deferPages || index === view.s.index
+                    asynchronousLoad: !!view.s.deferPages && index !== 0
                     Layout.fillWidth: true; Layout.fillHeight: true
                 }
             }

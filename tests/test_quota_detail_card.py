@@ -13,6 +13,16 @@ def detail_value(detail,metric):
     return next(item['value'] for item in detail['items'] if item['metric']==metric)
 
 
+def test_cycle_average_remains_available_when_latest_observation_is_excluded():
+    app=QApplication.instance() or QApplication([])
+    chart=QuotaHistory();chart.money=True;chart.reference=500
+    rows=observations([(100,0),(99,5),(98,12)])
+    rows[-1]['user_excluded']=True
+    chart.set_rows(rows)
+    assert chart.legend_values()['cycle_value']=='$500.00'
+    assert chart.legend_values()['remaining']=='98%'
+
+
 def test_hover_and_selection_update_only_interaction_layer():
     import time
     from PySide6.QtCore import QObject
@@ -35,7 +45,8 @@ def test_hover_and_selection_update_only_interaction_layer():
         plot.showTip(chart.x_at(1),chart.box.center().y())
         wait_for_paint(overlay)
         assert plot._static_paint_count==static
-        assert chart.legend_values()['cycle_cost']=='$5.00'
+        assert chart.legend_values()['cycle_cost']=='$12.00'
+        assert detail_value(plot.detail,'cycle_cost')=='$5.00'
         chart.set_exclusion_selection(1000,1010,True)
         render_plot(host,chart)
         static=plot._static_paint_count;overlay=plot._interaction_layer.paint_count

@@ -24,7 +24,7 @@ def test_approved_pages_render_with_stable_routes_and_aligned_fields(tmp_path, l
     try:
         window.resize(width,height);window.show();QTest.qWait(90)
         for page in (0,1,2,0,2):
-            window.change_page(page);QTest.qWait(70)
+            window.change_page(page);control(window,window.pages)
             assert not window.qml_errors
             # A field has exactly one rendered owner after moving between pages.
             views=[item for item in walk(window.quick.rootObject()) if item.property('node') is window.period and item.metaObject().indexOfProperty('sourceComponent')>=0]

@@ -27,7 +27,8 @@ def retained_intervals(cycles, report, clip):
     for cycle in cycles:
         account = cycle.get('account', '')
         if account not in by_account:
-            by_account[account] = exclusion_ranges(active_exclusions(report, account))
+            by_account[account] = exclusion_ranges([*active_exclusions(report, account),
+                *(r for r in report.get('cycle_clears',[]) if r['account']==account)])
         ranges = by_account[account]
         if not any(lo < cycle['end'] and hi > cycle['start'] for lo, hi in ranges):
             yield cycle

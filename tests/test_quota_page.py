@@ -218,6 +218,14 @@ def test_cycle_selector_changes_graph_preserves_lifetime_and_selection_on_refres
         plot.forceActiveFocus();QTest.keyClick(host.quick,Qt.Key_Home)
         assert panel.history.cursor==0 and '임의 초기화' in plot.detail['note']
         selected=panel.cycle_choice.currentData()
+        final_values=panel.history.legend_values()
+        expected=next(p['value'] for p in panel._view['periods'] if p['start']==selected)
+        from cachemonitor.pricing import usd
+        assert final_values['cycle_value']==usd(expected)
+        assert next(item['value'] for item in plot.detail['items'] if item['metric']=='reference')==usd(expected)
+        plot.activateAt(panel.history.x_at(len(panel.history.rows)-1),panel.history.box.center().y())
+        assert panel.history.legend_values()==final_values
+        plot.activateAt(panel.history.x_at(0),panel.history.box.center().y())
         panel.render(automatic=True);QTest.qWait(40)
         assert panel.cycle_choice.currentData()==selected and panel.history.cursor==0
         assert panel.result.text()==lifetime
@@ -352,7 +360,11 @@ def test_monitoring_pause_persists_and_restores_readable_page(quota_page,tmp_pat
         assert window.grab().save(str(tmp_path/'monitoring-paused.png'))
         window.change_page(0)
         assert not window.quota_pause_button.isVisible()
-        assert window.quota_sidebar.monitoring_paused
+        from copy import deepcopy
+        updated=deepcopy(fixture.quota)
+        updated['windows']['weekly']['used_percent']=45
+        window.receive_quota(dict(home='h',quota=updated,report=fixture.report))
+        assert window.quota_sidebar.weekly.text()!=before
         reopened=Dashboard([],start_worker=False,settings=settings)
         reopened.resize(1120,740);reopened.show();reopened.change_page(3)
         assert reopened.quota_paused and reopened.quota_pause_badge.isVisible()

@@ -666,7 +666,7 @@ class OverlayController(QObject):
         mode='compact' if reduced else 'monitor'
         inline=False
         geometry=monitor
-        if self.collapsed or monitor is None:
+        if self.collapsed or content.is_remote or monitor is None:
             mode='icon'
             geometry=monitor_box(32*scale,32*scale)
         elif self.expanded and not content.notice_card():

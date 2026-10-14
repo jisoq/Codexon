@@ -40,6 +40,39 @@ def quota(at, used, reset=1000, source='live', account='a', separate=()):
             'separate_models': list(separate)}
 
 
+def test_clear_current_cycle_survives_reopen_and_preserves_previous_cycle(tmp_path,monkeypatch):
+    from cachemonitor.quota_view import prepare_quota_view
+    path=tmp_path/'clear.sqlite'
+    ledger=QuotaLedger(path)
+    try:
+        for at,used in ((100,0),(130,10),(200,0),(230,10)):
+            ledger.observe('h',quota(at,used))
+        sync(ledger,[row(ts=115),row(key='r2',ts=215)],at=235)
+        before=prepare_quota_view(ledger.report('h',235))
+        monkeypatch.setattr('cachemonitor.quota_cycles.time.time',lambda:240)
+        ledger.clear_current_cycle('h',200,'a')
+        after=prepare_quota_view(ledger.report('h',240))
+        assert after['periods'][0]['cost']==0
+        assert after['periods'][0]['value'] is None
+        assert [r['at'] for r in after['periods'][0]['series']['rows']]==[240]
+        assert after['periods'][0]['series']['rows'][0]['remaining']==90
+        assert after['periods'][1]['cost']==before['periods'][1]['cost']
+        with pytest.raises(ValueError):ledger.clear_current_cycle('h',200,'a')
+        monkeypatch.setattr('cachemonitor.quota_cycles.time.time',lambda:250)
+        ledger.clear_current_cycle('h',240,'a')
+        assert ledger.db.execute('select count(*) from quota_cycle_clears').fetchone()[0]==1
+    finally:ledger.close()
+    ledger=QuotaLedger(path)
+    try:
+        assert prepare_quota_view(ledger.report('h',250))['periods'][0]['start']==250
+        ledger.observe('h',quota(260,12));ledger.observe('h',quota(290,14))
+        sync(ledger,[row(ts=115),row(key='r2',ts=215),row(key='r3',ts=275)],revision=2,at=295)
+        resumed=prepare_quota_view(ledger.report('h',295))
+        assert resumed['periods'][0]['delta']==2
+        assert resumed['periods'][0]['cost']>0
+    finally:ledger.close()
+
+
 def row(key='r1', ts=150, model='gpt-6-astra', **values):
     return {'service_tier':'Standard','key': key, 'ts': ts, 'model': model, 'input': 100000, 'cached': 20000,
             'written': 10000, 'output': 2000, 'reasoning': 500, **values}

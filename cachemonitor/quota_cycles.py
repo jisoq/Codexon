@@ -524,7 +524,7 @@ def quota_value_history(report, rows, *, _requests=None, _cache=None, _statistic
         last_ratio = None
         for row in group['rows']:
             while display_position<len(display_ranges) and display_ranges[display_position][1]<row['at']:display_position+=1
-            local_observed=(report.get('tracking') is None or
+            local_observed=(row.get('measurement_reset') or report.get('tracking') is None or
                             display_position<len(display_ranges) and display_ranges[display_position][0]<=row['at']<=display_ranges[display_position][1])
             excluded = [r for r in exclusions if r['start'] < row['at'] <= r['end']]
             while position < len(events) and events[position][0] <= row['at']:
@@ -683,6 +683,10 @@ class QuotaLedger:
             self.rebuild_mode_evidence(home)
         self.db.commit()
 
+        self.db.execute('''create table if not exists quota_cycle_clears(
+            home text, account text, start real, end real, baseline text,
+            primary key(home,account,start))''')
+        self.db.commit()
         self._initialize_report_revision()
 
     def _initialize_report_revision(self):
@@ -692,7 +696,7 @@ class QuotaLedger:
         self.db.execute('INSERT OR IGNORE INTO report_revision VALUES(1,0)')
         self.db.execute('CREATE TABLE IF NOT EXISTS report_changes(slot INTEGER PRIMARY KEY,revision INTEGER,table_name TEXT,at REAL)')
         tables=('observations','observation_context','window_observations','weekly_window_refs',
-                'calls','manual_resets','coverage_issues','quota_exclusions','state',
+                'calls','manual_resets','coverage_issues','quota_exclusions','quota_cycle_clears','state',
                 'tracking_config','tracking_policies','tracking_controls','tracking_tasks',
                 'tracking_observations','tracking_gaps','tracking_wire','tracking_health',
                 'tracking_call_boundaries','tracking_activity_versions')
@@ -1119,6 +1123,23 @@ class QuotaLedger:
             return True
         return self._edit_with_report(home,lambda report:report['account'],restore)
 
+    def clear_current_cycle(self, home, start, account):
+        from .quota_view import history_rows
+        def prepare(report):
+            rows=history_rows(report,'weekly')
+            current=next((row for row in reversed(rows) if row.get('reset_kind')),rows[0] if rows else None)
+            if not account or report['account']!=account or current is None or current['at']!=start:
+                raise ValueError('현재 주기가 변경되었습니다. 기록을 확인한 뒤 다시 시도하세요.')
+            at=time.time()
+            original=next((r['start'] for r in report.get('cycle_clears',[]) if r['end']==start),start)
+            baseline={k:rows[-1].get(k) for k in ('used','reset','source','account','window')}
+            return dict(home=home,account=account,start=original,end=at,baseline=json.dumps(baseline))
+        def save(record):
+            self.db.execute('''insert into quota_cycle_clears values(:home,:account,:start,:end,:baseline)
+                on conflict(home,account,start) do update set end=excluded.end,baseline=excluded.baseline''',record)
+            return record
+        return self._edit_with_report(home,prepare,save)
+
     def _edit_with_report(self, home, prepare, apply):
         """Validate a stable read snapshot before briefly acquiring the writer lock."""
         for _ in range(3):
@@ -1220,6 +1241,9 @@ class QuotaLedger:
         history += [{**r,'window':'weekly'} for r in raw
                     if (r['at'],r['source'],r['account'],r['used'],r['reset']) not in known]
         context = dict(home=home,account=current_account,history=sorted(history,key=lambda r:(r['at'],r['id'])),
+            cycle_clears=[dict(r) for r in self.db.execute(
+                'select * from quota_cycle_clears where home=? and account=? and end<=? order by start',
+                (home,current_account,now))],
             exclusions=([dict(r) for r in self.db.execute(
                 'select * from quota_exclusions where home=? and account=? and restored_at is null order by start,created_at,id',
                 (home,current_account))] if 'quota_exclusions' in tables else []),

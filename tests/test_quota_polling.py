@@ -600,7 +600,7 @@ def test_polling_recovers_and_preserves_history(tmp_path,monkeypatch,failure_sta
 
 
 @pytest.mark.parametrize('scenario',['restart-paused','pause-in-flight','rapid-resume'])
-def test_pause_blocks_ingress_and_waits_without_polling_then_resumes_fresh(tmp_path,monkeypatch,scenario):
+def test_pause_keeps_allowance_fresh_without_recording_excluded_interval(tmp_path,monkeypatch,scenario):
     import threading
     initially_paused=scenario=='restart-paused'
     clock=[1000.];reads=[];waits=[];updates=[];closed=[]
@@ -612,7 +612,7 @@ def test_pause_blocks_ingress_and_waits_without_polling_then_resumes_fresh(tmp_p
         def fetch(self):
             assert not self.cancelled.is_set()
             at=clock[0];reads.append(at)
-            if at==1000:
+            if at==1000 and not initially_paused:
                 clock[0]=1001
                 assert service.set_paused(True)
                 if scenario=='rapid-resume':
@@ -631,10 +631,14 @@ def test_pause_blocks_ingress_and_waits_without_polling_then_resumes_fresh(tmp_p
             waits.append(seconds)
             if scenario=='rapid-resume':done[0]=True;return
             if len(waits)==1:
-                assert seconds is None and service.paused and closed
+                assert seconds == 1 and service.paused
+                assert updates[-1]['quota']['observed_at']==clock[0]
                 assert service.backlog.first() is None
-                assert service.supply_local(dict(observed_at=1500,windows={}))
-                assert service.backlog.first() is None and service.local_observations.empty()
+                assert service.supply_local(dict(observed_at=1050,windows={}))
+                assert service.backlog.first() is None and not service.local_observations.empty()
+                clock[0]=1060
+            elif len(waits)==2:
+                assert updates[-1]['quota']['observed_at']==1060
                 clock[0]=2000
                 assert service.set_paused(False)
                 assert service.supply_local(dict(observed_at=1500,windows={}))
@@ -643,7 +647,7 @@ def test_pause_blocks_ingress_and_waits_without_polling_then_resumes_fresh(tmp_p
     service.wake=Wake();service.isInterruptionRequested=lambda:done[0]
     service.run()
     resumed_at=1002 if scenario=='rapid-resume' else 2000
-    assert reads==([resumed_at] if initially_paused else [1000,resumed_at])
+    assert reads==([1000,1002] if scenario=='rapid-resume' else [1000,1060,2000] if initially_paused else [1000,1001,1060,2000])
     assert not any(value['issue'] for value in updates)
     assert updates[-1]['quota']['observed_at']==resumed_at and not updates[-1]['paused']
     with sqlite3.connect(service.path) as db:

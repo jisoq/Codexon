@@ -262,6 +262,7 @@ class Dashboard(TrayWindow):
         if hasattr(self.quota_panel,'home_selected'):self.quota_panel.home_selected.connect(self.start_quota_service)
         self.quota_panel.exclusion_requested.connect(self.exclude_quota_interval)
         self.quota_panel.exclusion_restore_requested.connect(self.restore_quota_exclusion)
+        self.quota_panel.cycle_clear_requested.connect(self.clear_quota_cycle)
         from .app_services import AppServices
         from .app_shutdown import ServiceController
         self.app_services=AppServices(self.observer_panel.manager if manage_observer else None,
@@ -357,6 +358,10 @@ class Dashboard(TrayWindow):
     def restore_quota_exclusion(self, exclusion_id):
         if self.quota_service:
             self.quota_service.restore_exclusion(exclusion_id)
+
+    def clear_quota_cycle(self, value):
+        if self.quota_service:
+            self.quota_service.clear_current_cycle(value['start'],value['account'])
 
     def receive_quota(self,value):
         if 'paused' in value:

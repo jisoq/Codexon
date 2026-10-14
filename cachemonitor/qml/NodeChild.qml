@@ -5,10 +5,13 @@ Item {
     id: child
     property alias item: content.item
     property bool loadRequested: true
+    property bool asynchronousLoad: false
     property bool retained: false
     Loader {
         id: content; anchors.fill: parent
         active: child.loadRequested || child.retained
+        asynchronous: child.asynchronousLoad
+        visible: status === Loader.Ready
         onLoaded: child.retained = true
     }
     required property var node

@@ -116,6 +116,7 @@ def test_home_thumbnails_are_bounded_reused_and_navigation_is_not_duplicated(das
     wait_for_rendered(lambda:w.current_page==1 and not w.analysis_pending)
     assert control(w,w.nav).property('count')==5
     w.metric_panel.change('dimension','model')
+    control(w,w.metric_panel)
     wait_for_rendered(lambda:w.metric_panel.data['dimension']=='model' and rendered('usage-chart-content').width()>0)
     w.change_page(0)
     wait_for_rendered(lambda:home._thumbnail_pending is None and 1 in home._thumbnails)
@@ -131,6 +132,8 @@ def test_home_thumbnails_are_bounded_reused_and_navigation_is_not_duplicated(das
     for page in (5,2,3):
         click(w,rendered('home-card-'+str(page)))
         wait_for_rendered(lambda:w.current_page==page and not w.analysis_pending)
+        control(w,w.pages)
+        assert not w.quick.grabFramebuffer().isNull()
         w.change_page(0)
         wait_for_rendered(lambda:home._thumbnail_pending is None and page in home._thumbnails)
     assert set(home._thumbnails)=={1,2,3,5}
@@ -189,6 +192,7 @@ def test_model_breakdowns_combine_and_drill_down_in_compact_window(dashboard):
     from PySide6.QtCore import QPointF
     w=dashboard;w.resize(1000,680);w.change_page(1);p=w.metric_panel
     source,_=many_efforts();w.receive(source);p.change('dimension','model')
+    control(w,p)
     def rendered(name):
         return next(item for item in walk(w.quick.rootObject()) if item.objectName()==name and item.isVisible())
     wait_for_rendered(lambda:p.data.get('dimension')=='model' and bool(p.state['rows']))

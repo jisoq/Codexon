@@ -13,11 +13,12 @@ Item {
     function t(text) { return appLanguage.text(text) }
     function selected(items,value) { for(let i=0;i<items.length;i++) if(items[i].value===value)return i;return 0 }
     component Copy: Text {
+        id: copyText
         property string tip: ""
         color: appTheme.palette.ink; font.family: appTheme.family; font.pixelSize: 14
         wrapMode: Text.Wrap; verticalAlignment: Text.AlignVCenter
         HoverHandler { id: hover }
-        UiToolTip { visible: hover.hovered && parent.tip.length>0; text: parent.tip }
+        UiToolTip { visible: hover.hovered && copyText.tip.length>0; text: copyText.tip }
     }
     component Field: ColumnLayout {
         property string caption

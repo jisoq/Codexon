@@ -1,7 +1,8 @@
 """Immutable chart preparation, run by the quota reader outside the UI thread."""
 from datetime import datetime
+import json
 import math
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 from .quota_tracking import ResetTracker, RESET_NAMES, OBSERVATION_FRESHNESS
 from .quota_cycles import quota_statistics, quota_value_history
 from .native_backend import get_native
@@ -21,7 +22,18 @@ def history_rows(report, mode, start=None, end=None):
     by_time={}
     account=report.get('account')
     identified=account and any(r.get('account')==account and r['window']==mode for r in report.get('history',[]))
-    for record in report.get('history',[]):
+    history=report.get('history',[])
+    clears=report.get('cycle_clears',[]) if mode=='weekly' else []
+    if clears:
+        clears=sorted((c for c in clears if c['account']==account),key=lambda c:c['start'])
+        starts=[c['start'] for c in clears]
+        def retained(record):
+            index=bisect_right(starts,record['at'])-1
+            return index<0 or record.get('account')!=account or record['at']>clears[index]['end']
+        history=[r for r in history if retained(r)]
+        history += [{**json.loads(c['baseline']),'at':c['end'],'id':'clear:'+str(c['end']),
+                     'measurement_reset':True} for c in clears]
+    for record in history:
         if identified and record.get('account')!=account:continue
         if record['window']!=mode:
             continue
@@ -49,6 +61,10 @@ def history_rows(report, mode, start=None, end=None):
         row['remaining']=100-record['used']
         row['reset_kind']=(detector.observe(row['remaining'],record['at'],record.get('reset'),same_tracking)
                            if mode=='weekly' else None)
+        if record.get('measurement_reset'):
+            row['reset_kind']='measurement_reset';continuous=False
+        elif previous and previous.get('measurement_reset'):
+            continuous=False
         row['markers']=[RESET_NAMES[row['reset_kind']]] if row['reset_kind'] else []
         row['connect']=bool(continuous and rows)
         row['tracking_continuous']=same_tracking

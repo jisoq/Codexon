@@ -39,6 +39,7 @@ class QuotaPanel(Group):
     home_selected=Signal(str)
     exclusion_requested=Signal(object)
     exclusion_restore_requested=Signal(str)
+    cycle_clear_requested=Signal(object)
     fault_changed=Signal(dict)
 
     def __init__(self,settings):
@@ -237,7 +238,13 @@ class QuotaPanel(Group):
         self.quota=value.get('quota');self.issue=value.get('issue','')
         if 'report' in value:self.report=value['report'] or {'cycles':[]}
         if value.get('exclusion_result'):
-            self.exclusions.receive_result(value['exclusion_result'])
+            result=value['exclusion_result']
+            if result.get('operation')=='clear_cycle':
+                self._cycle_clear_pending=False
+                if result.get('ok'):
+                    self.cycle_choice.setCurrentIndex(1)
+                else:self.issue=result.get('error','초기화하지 못했습니다. 다시 시도하세요.')
+            else:self.exclusions.receive_result(result)
             if value['exclusion_result'].get('ok') and getattr(self,'dialog',None) and self.dialog.host:self.dialog.reject()
         if getattr(self,'defer_render',False):
             if (self.report is not previous_report or self.issue!=previous_issue
@@ -325,7 +332,8 @@ class QuotaPanel(Group):
         same=getattr(self,'_selected_cycle',None)==(period['start'] if period else None)
         follow=not self.history.rows or self.history.cursor==len(self.history.rows)-1
         self._selected_cycle=(period['start'] if period else None)
-        self.history.money=True;self.history.reference=self.lifetime_value
+        self.history.money=True
+        self.history.reference=self.lifetime_value if all_cycles else period['value'] if period else None
         self.history.empty_text='표시할 사용 기록이 없습니다'
         self.chart_title.setText('전체 사용량 추이' if all_cycles else '선택 주기의 사용량 추이')
         self.remaining_legend.setText('누적 사용량 (%p)' if all_cycles else '남은 사용량 (%)')
@@ -366,6 +374,8 @@ class QuotaPanel(Group):
         self.cycle_choice.setVisible(any_history and bool(self._view['periods']))
         if hasattr(self,'manage_button'):
             self.manage_button.setVisible(any_history or bool(self.report.get('exclusions')) and not self.report.get('index_loading'))
+        if hasattr(self,'clear_cycle_button'):
+            self.clear_cycle_button.setEnabled(bool(self._view['periods']) and bool(self.report.get('account')) and not getattr(self,'_cycle_clear_pending',False))
         for node in (self.cycle_value,self.cycle_basis):node.setVisible(bool(lifetime['total'] or self.report.get('exclusions')))
         if hasattr(self,'summary'):
             from .quota_layout import refresh_monitoring_style
@@ -456,7 +466,7 @@ class QuotaPanel(Group):
         self.status.setVisible(bool(self.status.text()) and not getattr(self,'centralized_errors',False))
         self.lifetime_statistics=(self.report.get('view') or {}).get('lifetime') or quota_statistics(self.report)
         lifetime=self.lifetime_statistics
-        has_usage=bool(lifetime['total'] or self.report.get('exclusions'))
+        has_usage=bool(lifetime['total'] or self.report.get('exclusions') or self.report.get('cycle_clears'))
         self.history_waiting.setVisible(not has_usage)
         for node in (self.summary_heading,self.result,self.lifetime_basis,self.conversion):node.setVisible(has_usage)
         selected_model=self.model_choice.currentData()

@@ -24,6 +24,23 @@ def configure_quota_layout(panel):
     panel.manage_button=Button('제외 관리');panel.manage_button.put(fontSize=12,height=30)
     panel.manage_button.hide()
     actions.addWidget(panel.manage_button)
+    panel.clear_cycle_button=Button('현재 주기 초기화');panel.clear_cycle_button.put(fontSize=12,height=30)
+    panel.clear_cycle_button.setEnabled(bool(panel._view['periods']) and bool(panel.report.get('account')))
+    actions.addWidget(panel.clear_cycle_button)
+    def clear_cycle():
+        from .quick_runtime import Confirmation
+        current=next((p for p in panel._view['periods'] if p.get('current')),None)
+        if current is None:return
+        request=dict(start=current['start'],account=panel.report.get('account',''))
+        dialog=Confirmation('현재 주기 초기화','현재 주기의 측정 기록을 지우고 지금부터 다시 측정합니다. 이전 주기 기록은 유지됩니다.',panel)
+        panel.clear_cycle_dialog=dialog
+        dialog.confirm.setText('초기화')
+        def finish(result):
+            if not result:return
+            panel._cycle_clear_pending=True;panel.clear_cycle_button.setEnabled(False)
+            panel.cycle_clear_requested.emit(request)
+        dialog.finished.connect(finish);dialog.open()
+    panel.clear_cycle_button.clicked.connect(clear_cycle)
     build_exclusion_dialog(panel)
     for node in (panel.summary_heading,panel.history_controls,panel.result,panel.cycle_value,panel.lifetime_basis,panel.cycle_basis,panel.conversion):
         detach(node)
@@ -72,7 +89,9 @@ def configure_quota_layout(panel):
         return '누적 사용량' if key=='remaining' and panel.history.series.get('cumulative') else labels[key]
     def legend_values(values):
         for key,button in panel.legend_toggles.items():
-            button.setText(formatted('{label}  {value}',label=tr(label_for(key)),value=values.get(key,'—')))
+            pattern=('{label}  {value}' if panel.history.series.get('cumulative') else
+                     '{label} (평균: {value})' if key=='cycle_value' else '{label} (최근: {value})')
+            button.setText(formatted(pattern,label=tr(label_for(key)),value=values.get(key,'—')))
     panel.history.legendChanged.connect(legend_values)
     legend_values(panel.history.legend_values())
     order=('cycle_value','remaining','cycle_cost')
@@ -238,4 +257,3 @@ def refresh_monitoring_controls(window):
     # Retain the paused appearance until the first resumed lookup completes.
     display_paused=paused or pending
     window.quota_panel.set_monitoring_paused(display_paused,window.quota_paused_at)
-    window.quota_sidebar.set_monitoring_paused(display_paused,window.quota_paused_at)

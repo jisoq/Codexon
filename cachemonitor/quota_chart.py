@@ -473,7 +473,7 @@ class QuotaHistory(Plot):
         elif self.visible('cycle_value') and row.get('cycle_value') is None:note='동등 가치 계산 대기'
         else:note=''
         if self.visible('cycle_value') and self.reference is not None:
-            items.insert(1,dict(metric='reference',label='누적 예상 가치',value=usd(self.reference),color='muted',subordinate=True))
+            items.insert(1,dict(metric='reference',label='누적 예상 가치' if cumulative else '현 주기 평균',value=usd(self.reference),color='muted',subordinate=True))
         return self.with_share(dict(title=clock(row['at'],True),at=row['at'],items=items,note=note),row['at'])
 
     def refresh_detail(self,detail):
@@ -541,10 +541,11 @@ class QuotaHistory(Plot):
 
     def legend_values(self):
         if not self.rows:return {key:'—' for key,_,_,_ in self.metric_definitions()}
-        inspected=self.inspection_x is not None and self.inspection_at is not None
+        cumulative=self.series.get('cumulative',False)
+        inspected=cumulative and self.inspection_x is not None and self.inspection_at is not None
         index=max(0,min(bisect_right(self.series['times'],self.inspection_at)-1,len(self.rows)-1)) if inspected else len(self.rows)-1
-        return {key:tr('집계 제외') if self.rows[index].get('user_excluded') and (key!='remaining' or self.series.get('cumulative'))
-                else self.metric_text(key,self.value_at(index,key)) for key,_,_,_ in self.metric_definitions()}
+        return {key:tr('집계 제외') if self.rows[index].get('user_excluded') and (key!='remaining' or cumulative) and (key!='cycle_value' or cumulative)
+                else self.metric_text(key,self.reference if key=='cycle_value' and not cumulative else self.value_at(index,key)) for key,_,_,_ in self.metric_definitions()}
 
     def geometry_ready(self):
         return self._cache_key is not None and self._cache_key[1]==id(self.series)

@@ -6,12 +6,26 @@ application control and view inside the host is rendered by Qt Quick.
 from pathlib import Path
 from PySide6.QtCore import QObject, Property, Signal, Slot, QUrl, Qt, QTimer, QRectF
 from PySide6.QtGui import QFont, QPainter, QColor, QPen, QImage
-from PySide6.QtQml import qmlRegisterType, QQmlEngine, QQmlContext, QQmlComponent
+from PySide6.QtQml import qmlRegisterType, QQmlEngine, QQmlContext, QQmlComponent, QQmlIncubationController
 from PySide6.QtQuick import QQuickPaintedItem
 from PySide6.QtQuickWidgets import QQuickWidget
 from PySide6.QtQuickControls2 import QQuickStyle
 from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout
 from .presentation import Group, Column, Button, Row
+
+
+class PageIncubation(QQmlIncubationController):
+    """Create deferred pages in short UI turns, with no idle polling."""
+    def __init__(self, parent):
+        super().__init__()
+        self.timer = QTimer(parent)
+        self.timer.setInterval(0)
+        self.timer.timeout.connect(lambda: self.incubateFor(2))
+
+    def incubatingObjectCountChanged(self, count):
+        if count:
+            if not self.timer.isActive():self.timer.start()
+        else:self.timer.stop()
 
 
 class QuickPlotOverlay(QQuickPaintedItem):
@@ -235,6 +249,9 @@ class QuickHost(QWidget):
         node=self.presentation
         self._quick=QQuickWidget(shared_engine(),self) if shared else QQuickWidget(self)
         engine=self.quick.engine()
+        if not shared and engine.incubationController() is None:
+            self._page_incubation=PageIncubation(self.quick)
+            engine.setIncubationController(self._page_incubation)
         self.quick.setResizeMode(QQuickWidget.SizeRootObjectToView)
         from .theme import shared_theme
         from .i18n import Translator

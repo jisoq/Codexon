@@ -19,6 +19,11 @@ def scene_view(host,node):
 
 
 def control(host,node):
+    import time
+    incubation=getattr(host,'_page_incubation',None)
+    deadline=time.monotonic()+5
+    while incubation and incubation.incubatingObjectCount() and time.monotonic()<deadline:
+        QTest.qWait(1)
     view=scene_view(host,node)
     return view.property('item')
 
@@ -48,6 +53,7 @@ def render_plot(host,node):
     """Bring the plot into its real scroll view and wait for a painted frame."""
     from .presentation import Scroll
     import time
+    control(host,node)
     parent=node.parent();scrolls=[]
     while parent:
         if isinstance(parent,Scroll):

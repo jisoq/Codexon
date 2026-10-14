@@ -277,8 +277,11 @@ class Tabs(Stack):
 
 
 class Scroll(Node):
+    pendingRevealChanged=Signal()
     def __init__(self,parent=None):
         super().__init__(parent); self._position=ScrollPosition(self)
+        self._pending_reveal=None
+        self._position.requested.connect(self.clearReveal)
     @Property(QObject,constant=True)
     def verticalPosition(self): return self._position
     kind='scroll'
@@ -286,7 +289,14 @@ class Scroll(Node):
     def setWidgetResizable(self,value):self.put(resizable=bool(value))
     def setVerticalScrollBarPolicy(self,value):self.put(verticalScroll=value!=Qt.ScrollBarAlwaysOff)
     def setHorizontalScrollBarPolicy(self,value):self.put(horizontalScroll=value!=Qt.ScrollBarAlwaysOff)
-    def ensureWidgetVisible(self,node):self.revealRequested.emit(node)
+    @Property(QObject,notify=pendingRevealChanged)
+    def pendingReveal(self):return self._pending_reveal
+    @Slot()
+    def clearReveal(self):
+        if self._pending_reveal is not None:
+            self._pending_reveal=None;self.pendingRevealChanged.emit();self.revealRequested.emit(None)
+    def ensureWidgetVisible(self,node):
+        self._pending_reveal=node;self.pendingRevealChanged.emit();self.revealRequested.emit(node)
 
 
 class Split(Node):

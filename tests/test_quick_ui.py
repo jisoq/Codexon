@@ -23,7 +23,16 @@ def test_deferred_pages_apply_pending_state_and_keep_loaded_scroll():
         with pytest.raises(AssertionError,match='Presentation node not rendered'):
             scene_view(host,page)
         title.setText('Updated before visit')
-        pages.setCurrentIndex(1);QTest.qWait(80)
+        pages.setCurrentIndex(1)
+        # Switching tabs returns before constructing the unseen page.
+        with pytest.raises(AssertionError,match='Presentation node not rendered'):
+            scene_view(host,page)
+        deadline=time.monotonic()+3
+        while time.monotonic()<deadline:
+            app.processEvents()
+            if host._page_incubation.incubatingObjectCount()==0:break
+            QTest.qWait(1)
+        assert not host._page_incubation.timer.isActive()
         item=control(host,page)
         assert any(child.property('text')=='Updated before visit' for child in walk(control(host,title)))
         assert item.property('contentItem').property('contentY')==320

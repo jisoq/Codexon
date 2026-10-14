@@ -4,7 +4,7 @@ from typing import Optional
 
 
 OBSERVATION_FRESHNESS = 120
-RESET_NAMES = {'scheduled_reset': '정기 초기화', 'arbitrary_reset': '임의 초기화'}
+RESET_NAMES = {'scheduled_reset': '정기 초기화', 'arbitrary_reset': '임의 초기화', 'measurement_reset':'측정 초기화'}
 
 
 @dataclass

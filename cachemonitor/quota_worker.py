@@ -51,7 +51,7 @@ def compact_report(report, revision, selection=None, known_digest=None):
     prepared_view.update({
         'tracking_started': (report.get('tracking') or {}).get('started'),
     })
-    return {**{key: report[key] for key in ('home', 'account', 'at', 'index_loading', 'error', 'exclusions')
+    return {**{key: report[key] for key in ('home', 'account', 'at', 'index_loading', 'error', 'exclusions', 'cycle_clears')
                if key in report},
             'worker_revision': revision,
             'view': prepared_view}
@@ -108,15 +108,18 @@ class QuotaComputation:
         try:
             if kind == 'prepare':
                 result['report'] = self._prepare(request['snapshot'])
-            elif kind in ('report', 'exclude', 'restore'):
+            elif kind in ('report', 'exclude', 'restore', 'clear_cycle'):
                 ledger = self._ledger()
-                if kind in ('exclude', 'restore'):
+                if kind in ('exclude', 'restore', 'clear_cycle'):
                     token = request['id']
                     if token not in self.committed:
                         phase('writing')
                         if kind == 'exclude':
                             record = ledger.exclude_interval(self.home, request['start'], request['end'], request.get('reason', ''))
                             identifier = record['id']
+                        elif kind=='clear_cycle':
+                            record=ledger.clear_current_cycle(self.home,request['start'],request['account'])
+                            identifier=str(record['end'])
                         else:
                             identifier = request['exclusion_id']
                             ledger.restore_exclusion(self.home, identifier)
@@ -225,7 +228,7 @@ class QuotaWorker(QObject):
             if self.closing.is_set():
                 return None
             self.sequence += 1
-            if kind in ('report','exclude','restore'):
+            if kind in ('report','exclude','restore','clear_cycle'):
                 payload.update(selection=self.chart_selection,digest=self.chart_digest)
             request = dict(kind=kind, id=self.sequence, key=key, **payload)
             self._queue(request)
@@ -310,7 +313,7 @@ class QuotaWorker(QObject):
                             child.close()
                     # Protect the commit before the child can publish its first
                     # phase message. Closing immediately after send is common.
-                    self.phase = 'pending-write' if active['kind'] in ('exclude','restore') else 'reading'
+                    self.phase = 'pending-write' if active['kind'] in ('exclude','restore','clear_cycle') else 'reading'
                     connection.send(active)
                     while True:
                         if active['kind']=='report' and active['id']<=self.cancel_report_before:
@@ -342,7 +345,7 @@ class QuotaWorker(QObject):
                     if active is not None:
                         self._deliver({key: active.get(key) for key in ('kind', 'id', 'key')} | dict(
                             error=str(error) or type(error).__name__, issue='사용한도 계산 지연: 마지막 결과를 유지합니다.',
-                            permanent=active['kind'] in ('exclude', 'restore'), uncertain=active['kind'] in ('exclude', 'restore')))
+                            permanent=active['kind'] in ('exclude', 'restore','clear_cycle'), uncertain=active['kind'] in ('exclude', 'restore','clear_cycle')))
                     active = None
                     if connection is not None:
                         connection.close()
