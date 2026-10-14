@@ -4,6 +4,7 @@ import threading
 import time
 import queue
 import sqlite3
+import json
 from collections import deque
 
 from PySide6.QtCore import QThread, Signal
@@ -23,7 +24,7 @@ class QuotaService(QThread):
     updated = Signal(object)
     EXCLUSION_TIMEOUT = 30
 
-    def __init__(self, home, index_path=None, live=True, tracking_enabled=True,quota_path=None,reports_enabled=True):
+    def __init__(self, home, index_path=None, live=True, tracking_enabled=True,quota_path=None,reports_enabled=True,paused=False,paused_at=None):
         super().__init__()
         self.home = str(Path(home).resolve())
         self.path = Path(quota_path) if quota_path else ledger_path(index_path)
@@ -31,6 +32,10 @@ class QuotaService(QThread):
         self.wake = threading.Event()
         self.tracking_enabled=tracking_enabled
         self.tracking_after=time.time()
+        self.paused=bool(paused)
+        self.paused_at=paused_at if paused else None
+        self.monitoring_after=0
+        self.monitoring_revision=0
         self.ingress_lock=threading.Lock()
         self.ingress_closed=False
         self.tracking_revision=0
@@ -38,7 +43,7 @@ class QuotaService(QThread):
         self.observation_issue=''
         self.control_issue=''
         self.backlog=ObservationBacklog(self.path,self.home)
-        if not self.backlog.append('control',(self.tracking_enabled,self.tracking_after)):
+        if not self.backlog.append('control',(self.tracking_enabled and not self.paused,self.tracking_after)):
             self.control_issue=self.backlog.issue or '추적 설정을 저장하지 못했습니다. 설정을 다시 적용하세요.'
         self.backlog_closed=False
         self.local_observations=queue.Queue(maxsize=1)
@@ -62,6 +67,8 @@ class QuotaService(QThread):
         """Persist each new observation before replacing the displayed gauge."""
         with self.ingress_lock:
             if self.ingress_closed:return False
+            if self.paused:return True
+            if quota and quota['observed_at']<self.monitoring_after:return True
             if not quota or (self.local_observed_at is not None and quota['observed_at']<=self.local_observed_at):
                 return True
             local={**quota,'source':'local','max_age':120}
@@ -81,7 +88,7 @@ class QuotaService(QThread):
             if self.ingress_closed:return False
             enabled=bool(enabled)
             at=time.time()
-            if not self.backlog.append('control',(enabled,at)):
+            if not self.backlog.append('control',(enabled and not self.paused,at)):
                 self.control_issue=self.backlog.issue or '추적 설정을 저장하지 못했습니다. 설정을 다시 적용하세요.'
                 self.wake.set()
                 return False
@@ -89,6 +96,24 @@ class QuotaService(QThread):
             self.tracking_enabled=enabled
             if enabled:self.tracking_after=at
             self.tracking_revision+=1
+        self.wake.set()
+        return True
+
+    def set_paused(self, paused):
+        paused=bool(paused)
+        with self.ingress_lock:
+            if self.ingress_closed:return False
+            if paused==self.paused:return True
+            at=time.time()
+            if not self.backlog.append('control',(self.tracking_enabled and not paused,at)):
+                self.control_issue=self.backlog.issue or '모니터링 상태를 저장하지 못했습니다. 다시 시도하세요.'
+                self.wake.set();return False
+            self.control_issue=''
+            self.paused=paused;self.paused_at=at if paused else None
+            self.monitoring_revision+=1
+            if not paused:self.monitoring_after=self.tracking_after=at
+        client=getattr(self,'client',None)
+        if paused and client and hasattr(client,'cancel'):client.cancel()
         self.wake.set()
         return True
 
@@ -124,6 +149,8 @@ class QuotaService(QThread):
         report = None
         stage = 'initialize'
         was_reporting=self.reports_enabled
+        monitoring_revision=-1
+        paused_report_due=self.paused
 
         def save_pending():
             # Bound recovery work independently of the retained backlog. An ack
@@ -181,9 +208,28 @@ class QuotaService(QThread):
         try:
             while not self.isInterruptionRequested():
                 self.wake.clear()
+                with self.ingress_lock:
+                    paused=self.paused
+                    revision=self.monitoring_revision
+                monitoring_changed=revision!=monitoring_revision
+                if monitoring_changed:
+                    monitoring_revision=revision
+                    if hasattr(self.report_worker,'set_paused'):self.report_worker.set_paused(paused)
+                    if paused:
+                        client.close()
+                        paused_report_due=True
+                        lookup_issue=lookup_reason=''
+                    else:
+                        if hasattr(client,'cancelled'):client.cancelled.clear()
+                        if revision>0:
+                            direct=local=None
+                            polling=QuotaPolling()
+                    next_storage=next_report=next_history=0
                 if self.reports_enabled!=was_reporting:
                     was_reporting=self.reports_enabled
-                    if was_reporting:next_report=next_history=0
+                    if was_reporting:
+                        next_report=next_history=0
+                        if paused and report is None:paused_report_due=True
                 with self.ingress_lock:
                     current_tracking_revision=self.tracking_revision
                     tracking_enabled=self.tracking_enabled
@@ -207,6 +253,7 @@ class QuotaService(QThread):
                         continue
                     else:
                         edit_active=False
+                    if computed.get('cancelled'):continue
                     if computed.get('error'):
                         calculation_fault=dict(calculation_failed=True,saved=bool(computed.get('saved')),
                             uncertain=bool(computed.get('uncertain')))
@@ -236,7 +283,7 @@ class QuotaService(QThread):
                             edit_request=None
                 fail_exclusions()
                 now = time.time()
-                if polling.tick(time.monotonic(), now):
+                if not paused and polling.tick(time.monotonic(), now):
                     client.close()
                     next_storage = next_report = next_history = 0
                 if time.monotonic() >= next_storage:
@@ -247,6 +294,9 @@ class QuotaService(QThread):
                             next_report = next_history = 0
                         stage = 'recover observations'
                         save_pending()
+                        if paused and latest is None:
+                            saved=ledger.db.execute('select data from tracking_observations where home=? order by received desc limit 1',(self.home,)).fetchone()
+                            if saved:latest=json.loads(saved[0])
                         control = ledger.db.execute(
                             'select at from tracking_controls where home=? order by at desc limit 1',
                             (self.home,)).fetchone()
@@ -254,7 +304,7 @@ class QuotaService(QThread):
                         stage = 'activity'
                         # Old interrupted tasks can lack an end forever. Use recent
                         # activity for polling speed without altering their history.
-                        signature = activity_summary.read(ledger.db, self.home, now-300)
+                        signature = activity_summary.read(ledger.db, self.home, now-300) if not paused else (None,None,None,0,None,None,None,0)
                         activity, wire = signature[:4], signature[4:]
                         if self.tracking_enabled:
                             if signature != polling.signature:
@@ -269,17 +319,20 @@ class QuotaService(QThread):
                 with self.ingress_lock:
                     tracking_at_request=self.tracking_enabled
                     can_observe = not (self.observation_issue or self.control_issue) and (not tracking_at_request or pending.available())
-                if self.live and can_observe and polling.ready(time.monotonic()):
+                if self.live and not self.paused and can_observe and polling.ready(time.monotonic()):
                     try:
-                        direct = client.fetch()
-                        if tracking_at_request:
-                            with self.ingress_lock:
+                        fetched = client.fetch()
+                        with self.ingress_lock:
+                            if self.paused or self.monitoring_revision!=revision:continue
+                            direct=fetched
+                            if tracking_at_request:
                                 if not pending.append('quota', direct):
                                     self.observation_issue=pending.issue or '한도 관측을 저장하지 못했습니다. 앱을 다시 열어 재시도하세요.'
                         lookup_issue = ''
                         lookup_reason=''
                         polling.finish(time.monotonic(), True, direct, time.time())
                     except Exception as exc:
+                        if self.paused or self.monitoring_revision!=revision:continue
                         record_failure(self.path, 'account lookup', exc)
                         lookup_reason=getattr(exc,'code','timeout' if isinstance(exc,TimeoutError) else 'lookup')
                         lookup_issue = ('Codex 한도 조회 지연: 자동 재시도 중' if isinstance(exc, (TimeoutError, ConnectionError))
@@ -296,8 +349,9 @@ class QuotaService(QThread):
                     if quota and (local is None or quota['observed_at'] > local['observed_at']):
                         local = {**quota, 'source': 'local', 'max_age': 120}
                         next_report = 0
-                publish = (self.reports_enabled and (report is None or time.monotonic()>=next_history)
-                           or time.monotonic()>=next_report or report_ready)
+                publish = (monitoring_changed or report_ready or not paused and
+                           (self.reports_enabled and (report is None or time.monotonic()>=next_history)
+                            or time.monotonic()>=next_report))
                 if ledger is not None:
                     try:
                         stage = 'save observations'
@@ -322,17 +376,19 @@ class QuotaService(QThread):
                             self.report_worker.retry(edit_request)
                         edit_active=True
                     elif (self.reports_enabled and report_request is None and not exclusions
-                          and (report is None or time.monotonic()>=next_history)):
+                          and (paused_report_due if paused else report is None or time.monotonic()>=next_history)):
                         report_request=self.report_worker.request('report')
+                        paused_report_due=False
                         next_history=time.monotonic()+5
-                latest = select_current_quota(direct, local, time.time())
+                if not paused:latest = select_current_quota(direct, local, time.time())
                 issue = ', '.join(dict.fromkeys(v for v in (lookup_issue, database_issue, aggregation_issue,
                     pending.issue, self.observation_issue, self.control_issue) if v))
                 faults=dict(lookup=dict(lookup_failed=bool(lookup_issue),reason=lookup_reason),
                     storage=database_fault or dict(storage_failed=bool(pending.issue or self.observation_issue or self.control_issue)),
                     calculation=dict(calculation_fault))
                 if publish or issue != emitted_issue or faults!=emitted_faults or exclusion_results:
-                    value={'home':self.home,'quota':latest,'issue':issue,'quota_faults':faults,'report_refreshed':report_ready}
+                    value={'home':self.home,'quota':latest,'issue':issue,'quota_faults':faults,'report_refreshed':report_ready,
+                           'paused':paused,'paused_at':self.paused_at,'monitoring_revision':revision}
                     if self.reports_enabled or exclusion_results:
                         if report is not None:
                             value['report']=report
@@ -342,7 +398,11 @@ class QuotaService(QThread):
                         self.updated.emit({**value, 'exclusion_result':result} if result else value)
                     emitted_issue = issue;emitted_faults=faults
                     next_report = time.monotonic()+5
-                self.wake.wait(1)
+                if paused and not exclusions and report_request is None and not database_issue and pending.first() is None:
+                    if ledger:ledger.close();ledger=None
+                    if self.isInterruptionRequested():break
+                    self.wake.wait()
+                else:self.wake.wait(1)
         finally:
             with self.ingress_lock:self.ingress_closed=True
             self.report_worker.close()

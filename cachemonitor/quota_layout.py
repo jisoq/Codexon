@@ -51,11 +51,12 @@ def configure_quota_layout(panel):
         summary.setVisible(bool(lifetime['total'] or panel.report.get('exclusions')))
         palette=shared_theme().palette
         border=mix(palette['secondary'],palette['accent'],.35)
-        for card in panel.summary_cards.values():card.put(border=border)
+        for card in panel.summary_cards.values():card.put(border='transparent' if panel.monitoring_paused else border)
         started=(panel.report.get('tracking') or {}).get('started')
         if started is None:
             started=(panel.report.get('view') or {}).get('tracking_started')
-        elapsed=(f'{max(0,time()-started)/3600:,.1f}'.removesuffix('.0')+' hr'
+        now=panel.monitoring_paused_at if panel.monitoring_paused and panel.monitoring_paused_at else time()
+        elapsed=(f'{max(0,now-started)/3600:,.1f}'.removesuffix('.0')+' hr'
                  if started is not None else '—')
         values=dict(elapsed=elapsed,usage=f"{lifetime['delta']:g}%",
                     cost=usd(lifetime['cost']),weekly=usd(panel.lifetime_value))
@@ -172,3 +173,69 @@ def reveal_chart(panel):
     while node is not None:
         if isinstance(node,Scroll):node.ensureWidgetVisible(panel.history);return
         node=node.parent()
+
+
+def refresh_monitoring_style(panel):
+    from .quota_chart import monitoring_palette
+    paused=panel.monitoring_paused
+    opacity=.42 if paused else 1
+    note=getattr(panel,'monitoring_note',None)
+    for node in panel.layout()._nodes:
+        if node is not note:node.put(opacity=opacity)
+    periods={period['start']:period for period in getattr(panel,'_view',{}).get('periods',[])}
+    items=[]
+    for item in panel.cycle_choice._items:
+        period=periods.get(item['value'])
+        text=period['label'] if period else item['text']
+        items.append(dict(item,text=text.replace(' (진행 중)','') if paused else text,
+            ink='ink' if paused or not period or not period.get('current') else 'accent'))
+    panel.cycle_choice._items=items;panel.cycle_choice.put(items=list(items))
+    palette=monitoring_palette(paused)
+    for key,color in (('cycle_value','accent'),('remaining','written'),('cycle_cost','output')):
+        panel.legend_toggles[key].put(legendColor=palette[color] if paused else color)
+
+
+def configure_monitoring_controls(window):
+    header=window.heading.parent()
+    badge=window.quota_pause_badge=Group();badge.put(background='secondary',radius=5)
+    row=Row(badge);row.setContentsMargins(9,5,9,5);row.setSpacing(7)
+    icon=Group();icon.setFixedWidth(10);icon.setFixedHeight(12)
+    bars=Row(icon);bars.setSpacing(3)
+    for _ in range(2):
+        bar=Group();bar.setFixedWidth(3);bar.setFixedHeight(12);bar.put(background='muted',radius=1);bars.addWidget(bar)
+    row.addWidget(icon)
+    window.quota_pause_status=Text('일시정지');window.quota_pause_status.put(fontSize=12,color='muted')
+    row.addWidget(window.quota_pause_status)
+    header.insertWidget(header._nodes.index(window.heading)+1,badge)
+    button=window.quota_pause_button=Button('일시정지')
+    button.clicked.connect(lambda:window.set_quota_paused(not window.quota_paused))
+    header.insertWidget(header._nodes.index(window.price_button),button)
+    note=window.quota_panel.monitoring_note=Text();note.put(fontSize=13,color='muted',wrap=True)
+    window.quota_panel.layout().insertWidget(0,note)
+    shared_theme().changed.connect(window.refresh_quota_monitoring)
+    refresh_monitoring_controls(window)
+
+
+def refresh_monitoring_controls(window):
+    from datetime import datetime
+    from .i18n import language
+    paused=window.quota_paused
+    pending=window.quota_pause_pending
+    page=window.current_page==3
+    button=window.quota_pause_button
+    button.setVisible(page);button.setEnabled(not pending)
+    pause_action=Verbatim('Pause') if language()=='en' else '일시정지'
+    button.setText('재개 중...' if pending and not paused else '일시정지 중...' if pending else '모니터링 재개' if paused else pause_action)
+    button.setAccessibleName('이 기기의 구독 모니터링 재개' if paused else '이 기기의 구독 모니터링 일시정지')
+    window.quota_pause_badge.setVisible(page and (paused or pending))
+    window.quota_pause_status.setText('연결 중' if pending and not paused else '일시정지')
+    note=window.quota_panel.monitoring_note;note.setVisible(paused or pending)
+    if pending and not paused:note.setText('현재 잔여량을 확인하고 있습니다.')
+    elif paused:
+        stamp=datetime.fromtimestamp(window.quota_paused_at).strftime('%H:%M') if window.quota_paused_at else '—'
+        note.setText(formatted('{time}에 멈춤. 저장된 기록을 보고 있습니다.',time=stamp))
+    window.price_button.put(opacity=.42 if page and (paused or pending) else 1)
+    # Retain the paused appearance until the first resumed lookup completes.
+    display_paused=paused or pending
+    window.quota_panel.set_monitoring_paused(display_paused,window.quota_paused_at)
+    window.quota_sidebar.set_monitoring_paused(display_paused,window.quota_paused_at)

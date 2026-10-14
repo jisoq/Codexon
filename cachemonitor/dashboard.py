@@ -131,6 +131,9 @@ class Dashboard(TrayWindow):
         self.observer_home=homes[0] if homes else str(Path.home()/'.codex')
         self.observer_directory=Path(model_evidence_path).parent if model_evidence_path else Path(index_path).parent if index_path else None
         self.manage_observer=manage_observer;self.quota_service=None;self.quota_issue=''
+        self.quota_paused=self.settings.value('quota/paused',False,type=bool)
+        self.quota_paused_at=self.settings.value('quota/pausedAt',0,type=float) or None
+        self.quota_pause_pending=False
         self.index_path=index_path;self.live_limits=live_limits
         self.model_evidence_path=model_evidence_path
         self.snapshot={'ts':time.time(),'sessions':[],'homes':homes,'unassigned':[],'errors':[]}
@@ -245,6 +248,8 @@ class Dashboard(TrayWindow):
         for node in (self.home,self.period,self.project,self.source,self.model,self.effort,self.mode):node.currentIndexChanged.connect(self.filter_changed)
         for node in (self.date_start,self.date_end):node.dateChanged.connect(self.filter_changed)
         self.archive.toggled.connect(self.filter_changed)
+        from .quota_layout import configure_monitoring_controls
+        configure_monitoring_controls(self)
         self.restore_preferences();self.restoring=False;self.change_page(self.current_page)
         if start_worker:
             if homes and static_snapshot is None:self.start_quota_service(homes[0])
@@ -299,13 +304,15 @@ class Dashboard(TrayWindow):
         for candidate in self.snapshot.get('homes',[home]):
             if candidate not in services:
                 service=QuotaService(candidate,self.index_path,live=self.live_limits,quota_path=self.quota_path,
-                    tracking_enabled=self.settings.value('quota/trackingEnabled',True,type=bool),reports_enabled=False)
+                    tracking_enabled=self.settings.value('quota/trackingEnabled',True,type=bool),reports_enabled=False,
+                    paused=self.quota_paused,paused_at=self.quota_paused_at)
                 services[candidate]=service
                 service.updated.connect(lambda value,expected=service: self.receive_quota(value) if self.quota_service is expected else None)
                 service.start()
         if home not in services:
             services[home]=QuotaService(home,self.index_path,live=self.live_limits,quota_path=self.quota_path,
-                tracking_enabled=self.settings.value('quota/trackingEnabled',True,type=bool),reports_enabled=False)
+                tracking_enabled=self.settings.value('quota/trackingEnabled',True,type=bool),reports_enabled=False,
+                paused=self.quota_paused,paused_at=self.quota_paused_at)
             services[home].updated.connect(lambda value,expected=services[home]:self.receive_quota(value) if self.quota_service is expected else None)
             services[home].start()
         services[home].supply_local(self.snapshot.get('quota_by_home',{}).get(services[home].home))
@@ -320,6 +327,29 @@ class Dashboard(TrayWindow):
         for service in getattr(self,'quota_services',{}).values():
             service.set_tracking_enabled(enabled)
 
+    def refresh_quota_monitoring(self):
+        from .quota_layout import refresh_monitoring_controls
+        refresh_monitoring_controls(self)
+
+    def set_quota_paused(self,paused):
+        paused=bool(paused)
+        if paused==self.quota_paused or self.quota_pause_pending:return
+        changed=[]
+        for service in getattr(self,'quota_services',{}).values():
+            if not service.set_paused(paused):
+                for applied in changed:applied.set_paused(self.quota_paused)
+                self.quota_panel.monitoring_note.setText('모니터링 상태를 저장하지 못했습니다. 다시 시도하세요.')
+                self.quota_panel.monitoring_note.show()
+                return
+            changed.append(service)
+        self.quota_paused=paused
+        if paused:self.quota_paused_at=time.time()
+        self.settings.setValue('quota/paused',paused)
+        self.settings.setValue('quota/pausedAt',self.quota_paused_at or 0)
+        self.settings.sync()
+        self.quota_pause_pending=bool(self.quota_service and self.quota_service.isRunning())
+        self.refresh_quota_monitoring()
+
     def exclude_quota_interval(self, value):
         if self.quota_service:
             self.quota_service.request_exclusion(value['start'], value['end'], value.get('reason', ''))
@@ -329,6 +359,12 @@ class Dashboard(TrayWindow):
             self.quota_service.restore_exclusion(exclusion_id)
 
     def receive_quota(self,value):
+        if 'paused' in value:
+            if value['paused']!=self.quota_paused:return
+            if self.quota_service and value.get('monitoring_revision')!=self.quota_service.monitoring_revision:return
+            if self.quota_pause_pending:
+                self.quota_pause_pending=False
+                self.refresh_quota_monitoring()
         self.quota_panel.defer_render=self.current_page!=3 or not self.isVisible() or self.isMinimized()
         if self.quota_panel.receive(value) is False:return
         self.quota_sidebar.receive(value)
@@ -738,6 +774,7 @@ class Dashboard(TrayWindow):
         for node in (self.model,self.effort,self.mode):node.setVisible(index in (0,2))
         self.request_id+=1;self.analysis_pending=False;self.deferred_result=None;self.defer_timer.stop()
         self.price_button.setVisible(index!=4);self.clear_analysis_notice()
+        if hasattr(self,'quota_pause_button'):self.refresh_quota_monitoring()
         self.update_navigation()
         self.render();self.save_preferences()
 
@@ -949,20 +986,20 @@ class Dashboard(TrayWindow):
             self.pending_label.setText('최신 기록 반영 중');self.pending_label.setToolTip('');self.pending_label.show()
         else:
             self.show_analysis_notice(formatted('{page} 불러오는 중',page=tr(TITLES[self.current_page])),
-                                      '조회 결과를 준비하고 있습니다.')
+                                      '선택한 조건에 맞는 사용 기록을 조회하고 있습니다.')
 
     def show_analysis_slow(self):
         if not self.analysis_pending or self.current_page in (3,4):return
         if self.pending_retained:
-            self.pending_label.setText('최신 기록 반영 중 / 계산 계속 진행 중')
+            self.pending_label.setText('최신 기록 분석 결과 대기 중')
         else:
-            self.analysis_notice_detail.setText('계산이 계속 진행 중입니다. 다른 탭을 이용할 수 있습니다.')
+            self.analysis_notice_detail.setText('분석 결과를 기다리고 있습니다.\n다른 탭을 이용할 수 있습니다.')
 
     def finish_analysis_loading(self,result,query):
         self.analysis_pending=False;self.clear_analysis_notice()
         if self.snapshot.get('index',{}).get('loading') and not result['analysis']['response_count']:
             self.display_identity=None
-            self.show_analysis_notice('사용 기록 수집 중','기록을 읽고 있습니다. 수집이 끝나면 자동으로 표시됩니다.')
+            self.show_analysis_notice('사용 기록 수집 중','Codex 사용 기록을 읽고 있습니다.')
         else:self.display_identity=self.query_identity(query)
 
     def retry_analysis(self):
@@ -1419,11 +1456,11 @@ class Dashboard(TrayWindow):
         if data['records']['total']:return '','',False,False
         ctx=self.temporary_context or {}
         if self.snapshot.get('index',{}).get('loading'):
-            return '사용 기록 수집 중','기록을 읽고 있습니다. 수집이 끝나면 자동으로 표시됩니다.',False,False
+            return '사용 기록 수집 중','Codex 사용 기록을 읽고 있습니다.',False,False
         if ctx.get('sid') and data['metadata'] is None:
             return '대상 기록을 찾을 수 없음','',False,False
         if not self.snapshot['sessions']:
-            return '사용 기록 없음','Codex 작업 기록이 수집되면 여기에 표시됩니다.',False,False
+            return '사용 기록 없음','아직 수집된 사용 기록이 없습니다.\nCodex에서 작업한 뒤 다시 확인하세요.',False,False
         search=bool(self.search.text().strip());filters=self.history_filters_active()
         if search or filters:
             title='검색 조건에 맞는 기록 없음' if search else '조건에 맞는 기록 없음'
@@ -1827,7 +1864,7 @@ class Dashboard(TrayWindow):
         self.auto_update.setChecked(self.settings.value('updates/automatic',True,type=bool))
         self.auto_update.toggled.connect(lambda value:self.settings.setValue('updates/automatic',value))
         self.settings_page.add_row('about','업데이트 자동 확인',
-            '앱 실행 중 6시간 간격으로 새 버전을 확인합니다. 설치 파일은 자동으로 다운로드하지 않습니다.',
+            '앱 실행 중 6시간 간격으로 새 버전을 확인합니다.',
             self.auto_update,section='버전',aliases='automatic update',depth=1)
         self.settings_page.add_widget('about',self.update_panel,section='업데이트',title='업데이트 확인',target=self.update_panel.button,aliases='정보 문제 해결 update')
         self.recovery_button=SettingsPage.shortcut('연결 복구',self.update_panel.open_recovery)

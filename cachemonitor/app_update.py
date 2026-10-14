@@ -112,7 +112,7 @@ def check_update(progress=lambda _:None, manager=None, *, release=None):
     install=installed()
     if not install:
         raise RuntimeError('설치형 Codexon에서 업데이트할 수 있습니다. 설치 프로그램을 한 번 실행해 주세요.')
-    progress('업데이트 확인 중…')
+    progress('새 버전이 있는지 확인하고 있습니다.')
     release=validated_release(json.loads(read_url(RELEASE_URL)) if release is None else release)
     if version_parts(release['tag_name'])<=version_parts(VERSION):
         from .install_management import connection_manager
@@ -192,7 +192,7 @@ def download_and_install(release,install,progress,journal,operation_id):
     directory.mkdir(parents=True)
     partial=directory/'Codexon-Setup.partial'
     output=directory/'Codexon-Setup.exe'
-    progress('새 버전 다운로드 중…')
+    progress('설치 파일을 다운로드하고 있습니다.')
     digest=hashlib.sha256();total=0;deadline=time.monotonic()+600
     try:
         with urllib.request.urlopen(urllib.request.Request(asset['browser_download_url'],headers=HEADERS),timeout=20) as response, partial.open('xb') as file:
@@ -208,7 +208,7 @@ def download_and_install(release,install,progress,journal,operation_id):
         partial.unlink(missing_ok=True)
     allowed()
     if not journal.install_ready(operation_id,output,expected):raise UpdateCancelled()
-    progress('새 버전 설치 중…')
+    progress('새 버전을 설치하고 있습니다.')
     launch_installer(output,install['InstallRoot'],operation_id)
 
 

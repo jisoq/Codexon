@@ -303,7 +303,7 @@ def _continuous_quota_intervals(cycles):
                            'observation_gaps_excluded':True}
 
 
-def quota_statistics(report, start=None, end=None, include_mode_assumptions=False, *, _requests=None, _cache=None):
+def quota_statistics(report, start=None, end=None, include_mode_assumptions=False, *, _requests=None, _cache=None, _cache_readonly=False):
     """Use complete disjoint intervals; preserve the base result under assumptions."""
     from .analytics import quantile
     from .quota_exclusions import retained_intervals
@@ -338,7 +338,7 @@ def quota_statistics(report, start=None, end=None, include_mode_assumptions=Fals
                 parts=[{**part,**{k:cycle[k] for k in ('cost_complete_at','cycle_end') if k in cycle}} for part in parts]
             else:
                 parts,diagnostics=local_request_intervals(cycle,overlapping,_clip_quota_interval,_quota_clipper)
-                if key is not None:
+                if key is not None and not _cache_readonly:
                     weight=len(points)+len(cycle.get('cost_rows',[]))+len(overlapping)
                     weight+=sum(1+len(part.get('endpoints',[]))+len(part.get('cost_rows',[])) for part in parts)
                     if weight<=131072:_cache[key]=(signature,parts,diagnostics,weight)
@@ -574,6 +574,10 @@ def quota_value_history(report, rows, *, _requests=None, _cache=None, _statistic
 
 class QuotaLedger:
     CACHE_KIB=4096
+    FUTURE_COLUMNS=(('observations',('at',)),('window_observations',('at',)),
+        ('manual_resets',('at',)),('calls',('ts',)),('tracking_controls',('at',)),
+        ('tracking_observations',('received',)),('tracking_tasks',('start','end')),
+        ('tracking_wire',('start','end')))
     def __init__(self, path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -634,6 +638,14 @@ class QuotaLedger:
             CREATE TABLE IF NOT EXISTS collection_activity_cursor(
                 id INTEGER PRIMARY KEY CHECK(id=1),source TEXT NOT NULL,revision INTEGER NOT NULL);
         ''')
+        # Account observations can join a new home at a future timestamp.
+        # Other boundaries use existing home/time indexes where available.
+        for name,table,columns in (
+                ('tracking_observations_future_received','tracking_observations','received'),
+                ('tracking_tasks_home_end','tracking_tasks','home,end'),
+                ('tracking_wire_home_start','tracking_wire','home,start'),
+                ('tracking_wire_home_end','tracking_wire','home,end')):
+            self.db.execute(f'CREATE INDEX IF NOT EXISTS {name} ON {table}({columns})')
         self.db.execute('begin immediate')
         if 'complete_at' not in {r[1] for r in self.db.execute('pragma table_info(state)')}:
             self.db.execute('alter table state add column complete_at REAL')
@@ -1157,12 +1169,15 @@ class QuotaLedger:
             if own_transaction:
                 self._input_revision=revision
                 future=[]
-                for table,columns in (('observations',('at',)),('window_observations',('at',)),
-                    ('manual_resets',('at',)),('calls',('ts',)),('tracking_controls',('at',)),
-                    ('tracking_observations',('received',)),('tracking_tasks',('start','end')),
-                    ('tracking_wire',('start','end'))):
+                scope=(report.get('tracking') or {}).get('homes') or [home]
+                slots=','.join('?' for _ in scope)
+                for table,columns in self.FUTURE_COLUMNS:
                     for column in columns:
-                        boundary=self.db.execute(f'SELECT min({column}) FROM {table} WHERE {column}>?',(now,)).fetchone()[0]
+                        # A future observation can change account membership;
+                        # keep that boundary global, even for currently unrelated homes.
+                        condition='' if table=='tracking_observations' else f'home IN ({slots}) AND '
+                        params=(now,) if not condition else (*scope,now)
+                        boundary=self.db.execute(f'SELECT min({column}) FROM {table} WHERE {condition}{column}>?',params).fetchone()[0]
                         if boundary is not None:future.append(boundary)
                 self._report_cache=dict(home=home,revision=revision,at=now,until=min(future,default=float('inf')),
                     ends=sorted({c['end'] for c in report['cycles']}|{r['at'] for r in report['history']}),report=dict(report))

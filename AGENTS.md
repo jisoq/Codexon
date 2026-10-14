@@ -2,8 +2,10 @@
 
 - Follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/); it overrides older release-note formats. Keep the project's existing language, style, and version numbering.
 - Link each version heading to its comparison with the previous public release. Verify the target version and planned date before publishing.
-- Group changes by user experience, with short, specific titles and concrete descriptions. Include only verified, user-relevant changes. State compatibility changes, known limitations, and required user actions.
-- Keep Korean and English entries equivalent in scope, conditions, and limitations, placed together under the same category.
+- Group verified, user-relevant changes under the applicable Keep a Changelog categories (`Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`, `Security`); omit empty categories.
+- Write each change as one short, single-line bullet describing the user-visible result. Omit detailed implementation explanations, internal identifiers, and technical limits unless essential to a user action or limitation. For example, write "캐시 한도를 최적화했습니다." instead of explaining serialization and buffer sizes.
+- Write the complete Korean section first, then a Markdown horizontal rule (`---`), then the complete English section. Do not alternate Korean and English within individual entries or categories. Keep both sections equivalent in scope, conditions, limitations, and category order.
+- Retain compatibility changes, known limitations, and required user actions as concise, single-line bullets.
 - Keep installation and download references below the change categories, in their existing format, and verify they apply to the release.
 - To publish, push the reviewed version and notes to `main`, then run `windows.yml` with `prepare=true` for that commit. After verification succeeds, run it separately with `publish=true`. Publication reuses the exact commit's verified installer and does not start a separate build.
 - Keep source archives at their locked download locations, since releases reuse them. When Qt/PySide6 changes, update `third-party-sources.lock.json` with the matching upstream hashes. Do not duplicate source assets or delete archives referenced by earlier releases.

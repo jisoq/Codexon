@@ -46,6 +46,7 @@ class QuotaBar(Plot):
     def __init__(self):
         super().__init__()
         self.setFixedHeight(6);self.setFocusPolicy(Qt.NoFocus)
+        self.monitoring_paused=False
         self.empty_text='';self.remaining=None
         shared_theme().changed.connect(self.update)
 
@@ -58,7 +59,7 @@ class QuotaBar(Plot):
         p.fillRect(self.rect(),QColor(palette['secondary']))
         p.fillRect(QRectF(0,0,self.width(),6),QColor(palette['border']))
         if self.remaining is not None:
-            p.fillRect(QRectF(0,0,self.width()*self.remaining/100,6),QColor(palette['accent']))
+            p.fillRect(QRectF(0,0,self.width()*self.remaining/100,6),QColor(palette['muted' if self.monitoring_paused else 'accent']))
 
 
 class QuotaSidebar(Group):
@@ -68,6 +69,7 @@ class QuotaSidebar(Group):
         self.setObjectName('quota-sidebar');self.put(background='secondary',radius=10)
         self.quota=None;self.issue='';self.reset_dialog=None;self.reset_items=[]
         self.lookup_failed=False;self.failure_note=''
+        self.monitoring_paused=False;self.monitoring_paused_at=None;self._paused_rendered=False
         self._reset_rows=[];self._reset_note='';self._dialog_signature=None
         body=Column(self);body.setContentsMargins(12,12,12,12);body.setSpacing(7)
         heading=Row();heading.setSpacing(4)
@@ -99,6 +101,7 @@ class QuotaSidebar(Group):
         self.refresh_status()
 
     def receive(self,value):
+        self._paused_rendered=False
         self.quota=value.get('quota');self.issue=value.get('issue','')
         from .app_errors import detect
         facts=(value.get('quota_faults') or {}).get('lookup') or {}
@@ -107,8 +110,19 @@ class QuotaSidebar(Group):
         self.failure_note=fault.explanation+'\n'+fault.guidance if fault else ''
         self.refresh_status()
 
+    def set_monitoring_paused(self,paused,at=None):
+        if (self.monitoring_paused,self.monitoring_paused_at)==(bool(paused),at):return
+        self.monitoring_paused=bool(paused);self.monitoring_paused_at=at;self._paused_rendered=False
+        for node in self.layout()._nodes:
+            if node is not self.status:node.put(opacity=.42 if paused else 1)
+        for card in self.current.values():
+            card['bar'].monitoring_paused=bool(paused);card['bar'].update()
+        self.refresh_status()
+
     def refresh_status(self):
-        now=time.time();quota=self.quota or {};zone=QTimeZone.systemTimeZone()
+        if self.monitoring_paused and self._paused_rendered:return
+        quota=self.quota or {};zone=QTimeZone.systemTimeZone()
+        now=quota.get('observed_at',time.time()) if self.monitoring_paused else time.time()
         observed=quota.get('observed_at',0)
         fresh=bool(observed and 0<=now-observed<90 and quota.get('source')=='live')
         plan=quota.get('plan_type')
@@ -191,6 +205,13 @@ class QuotaSidebar(Group):
         stamp=reset_time(observed,zone)
         checked=formatted('마지막 확인 {date}',date=stamp.toString('yyyy/MM/dd HH:mm')) if stamp else ''
         self.status.setToolTip('\n'.join(part for part in (self.failure_note or self.issue,checked) if part).replace(chr(183),' / '))
+        if self.monitoring_paused:
+            stamp=reset_time(observed,zone)
+            self.status.setText(formatted('일시정지 / {time} 기준',time=stamp.toString('HH:mm') if stamp else '—'))
+            for card in self.current.values():
+                card['evidence'].setText('정지 전 잔여량');card['evidence'].show()
+                card['value'].setToolTip('일시정지 전 마지막으로 확인한 잔여량입니다.')
+            self._paused_rendered=True
         if self.reset_dialog:
             signature=(repr(self._reset_rows),self._reset_note,str(count_text),bytes(zone.id()))
             if signature!=self._dialog_signature:self._render_details(signature,count_text,zone)
@@ -211,6 +232,7 @@ class QuotaSidebar(Group):
         close=Button('닫기');close.clicked.connect(dialog.reject);outer.addWidget(close)
         self.details_close=close
         dialog.finished.connect(self._details_closed)
+        self._paused_rendered=False
         self.refresh_status();dialog.open()
 
     def _details_closed(self,*_):

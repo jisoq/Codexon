@@ -324,3 +324,45 @@ def test_current_quota_refresh_keeps_history_until_report_or_issue_changes(quota
     panel.report['view'].pop('tracking_started',None)
     panel.update_summary()
     assert panel.summary_values['elapsed'].text()=='—'
+
+
+@pytest.mark.integration
+@pytest.mark.essential
+def test_monitoring_pause_persists_and_restores_readable_page(quota_page,tmp_path):
+    from cachemonitor.dashboard import Dashboard
+    app,fixture,_=quota_page
+    previous=app.property('cachemonitorDisableShellIntegration')
+    app.setProperty('cachemonitorDisableShellIntegration',True)
+    settings=QSettings(str(tmp_path/'pause.ini'),QSettings.IniFormat)
+    settings.setValue('updates/automatic',False)
+    settings.setValue('overlay/enabled',False)
+    settings.setValue('taskbar/enabled',False)
+    window=Dashboard([],start_worker=False,settings=settings)
+    reopened=None
+    try:
+        window.resize(1120,740);window.show();window.change_page(3)
+        window.receive_quota(dict(home='h',quota=fixture.quota,report=fixture.report))
+        before=window.quota_sidebar.weekly.text()
+        click(window,control(window,window.quota_pause_button))
+        assert settings.value('quota/paused',False,type=bool)
+        assert window.quota_pause_badge.isVisible()
+        assert scene_view(window,window.quota_panel.summary).opacity()<1
+        assert window.quota_sidebar.weekly.text()==before
+        assert window.quota_panel.history.isEnabled()
+        assert window.grab().save(str(tmp_path/'monitoring-paused.png'))
+        window.change_page(0)
+        assert not window.quota_pause_button.isVisible()
+        assert window.quota_sidebar.monitoring_paused
+        reopened=Dashboard([],start_worker=False,settings=settings)
+        reopened.resize(1120,740);reopened.show();reopened.change_page(3)
+        assert reopened.quota_paused and reopened.quota_pause_badge.isVisible()
+        click(reopened,control(reopened,reopened.quota_pause_button))
+        assert not settings.value('quota/paused',True,type=bool)
+        assert not reopened.quota_pause_badge.isVisible()
+        assert scene_view(reopened,reopened.quota_panel.summary).opacity()==1
+        assert not window.qml_errors and not reopened.qml_errors
+    finally:
+        for candidate in (reopened,window):
+            if candidate is not None:
+                candidate.tick.stop();candidate.update_panel.timer.stop();candidate.tray.hide();dispose(candidate)
+        app.setProperty('cachemonitorDisableShellIntegration',previous)

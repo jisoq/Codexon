@@ -107,6 +107,7 @@ def test_policy_clock_and_request_accounting(cancel_type):
         assert a.busy  # replay terminal must not consume queued lane b
         msg={'type':'response.completed','stream_id':'b','response':{'id':'3'}}
         a.begin(msg,False);a.delivered(msg,False);budget.reap()
+        assert not a.pending
         assert a.closing;await budget.close();assert closed[-1]==('lanes','lifetime')
         a=await add('unknown')
         msg={'type':'future.request'};a.begin(msg,True);a.delivered(msg,True)
@@ -116,6 +117,25 @@ def test_policy_clock_and_request_accounting(cancel_type):
         assert vars(POLICY)==dict(budget=100,idle_limit=32,idle_seconds=300,lifetime_seconds=1800,
             pressure_start=90,pressure_target=80,check_seconds=1,close_seconds=5,capacity_seconds=5,waiters=16)
     run_proxy_test(run())
+
+
+def test_completed_and_unmatched_lanes_leave_no_empty_queues():
+    from cachemonitor.proxy_websocket import Activity
+    from cachemonitor.model_proxy import Tracker
+    activity=Activity();tracker=Tracker(None,'h','WebSocket',dict(requests=0,responses=0,observation_enabled=False))
+    for lane in map(str,range(32)):
+        for _ in range(2):
+            msg=dict(type='response.create',stream_id=lane)
+            activity.begin(msg,True);activity.delivered(msg,True);tracker.request(msg)
+        for n in range(2):
+            msg=dict(type='response.completed',stream_id=lane,response=dict(id=f'{lane}-{n}'))
+            activity.begin(msg,False);activity.delivered(msg,False);tracker.response(msg)
+            assert sum(map(len,activity.pending.values()))==1-n
+            assert sum(map(len,tracker.pending.values()))==1-n
+    for msg in (dict(type='error',stream_id='absent'),
+                dict(type='response.completed',stream_id='absent',response=dict(id='unmatched'))):
+        activity.begin(msg,False);activity.delivered(msg,False);tracker.response(msg)
+    assert not activity.pending and not tracker.pending and not activity.busy
 
 
 def test_idle_limit_pressure_and_all_busy_capacity():

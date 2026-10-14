@@ -380,7 +380,7 @@ class AppServices:
         return value
 
     def publish(self, phase, **value):
-        self.progress(value.get('message', '관련 프로세스 종료 확인 중…'))
+        self.progress(value.get('message', '관련 프로세스가 종료됐는지 확인하고 있습니다.'))
 
     def wait(self, done, message, seconds=30):
         deadline = self.clock() + seconds
@@ -398,7 +398,7 @@ class AppServices:
         m.cleanup_legacy_check()
         # The updater must finish verification or rollback before shutdown makes
         # the shared service state suspended. Never cancel halfway through swap.
-        self.progress('업데이트 적용 또는 복원 완료를 기다립니다.')
+        self.progress('업데이트 적용 또는 복원이 끝나기를 기다리고 있습니다.')
         self.wait(lambda:not (read_json(m.directory/'proxy-update.json').get('cutover_started')
                              and read_json(m.directory/'proxy-update.json').get('phase') in BUSY),
                   '업데이트 적용 또는 복원이 진행 중입니다. 완료 후 다시 종료하세요.')
@@ -417,12 +417,12 @@ class AppServices:
                 self.save(phase='closing')
             updater = ProxyUpdate(m)
             if read_json(updater.path).get('phase') in BUSY:
-                updater.publish(read_json(updater.path)['phase'], cancel_requested=True, message='앱 종료에 따라 교체 중지 중…')
+                updater.publish(read_json(updater.path)['phase'], cancel_requested=True, message='앱을 종료하기 위해 프록시 교체를 중지하고 있습니다.')
             update_task = ObserverTask(home_key(m.home), role='ProxyUpdate')
             update_task.suspend()
             for task in (m.task, m.legacy_task):
                 task.suspend()
-        self.progress('진행 중 설정 작업 마무리 중…')
+        self.progress('진행 중인 연결 설정 작업이 끝나기를 기다리고 있습니다.')
         self.wait(lambda: identity.locks_free([m.directory / 'proxy-update.lock']) and (not update_task.inspect().get('running')), '업데이트 프로세스 종료 확인 지연')
         with ProcessLock(m.control_lock, timeout=30):
             update_task.suspend()
@@ -487,7 +487,7 @@ class AppServices:
                 if process:
                     channel.db.execute('INSERT OR REPLACE INTO control VALUES(?,?)', (collection['instance'], 'stop'))
                     channel.db.commit()
-                    self.progress('수집 기록 저장과 프로세스 종료 확인 중…')
+                    self.progress('수집 기록 저장과 수집기 종료를 확인하고 있습니다.')
                     self.wait(lambda: not identity.same_process(process) and (not locked(lock)), '수집 기록 저장 또는 수집기 종료 확인 지연')
                 self.wait(lambda: not task.inspect().get('running'), '수집기 작업 종료 확인 지연')
         finally:

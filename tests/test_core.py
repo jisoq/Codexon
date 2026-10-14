@@ -51,6 +51,24 @@ def fixture_home(tmp_path):
     return home, path
 
 
+def test_unassigned_diagnostics_expire_and_bound_count_and_encoded_bytes():
+    from cachemonitor.core import SessionRegistry,WINDOW
+    registry=SessionRegistry();registry.MAX_UNASSIGNED=3;registry.MAX_UNASSIGNED_BYTES=200
+    for n in range(5):registry.add_unassigned(dict(ts=100+n,home='h'))
+    assert len(registry.unassigned)==3 and registry.unassigned_dropped==2
+    registry.add_unassigned(dict(ts=105,home='h',endpoint='x'*100))
+    assert len(json.dumps(list(registry.unassigned)).encode())<=200
+    assert registry.unassigned[-1]['ts']==105
+    registry.add_unassigned(dict(ts=106,endpoint='x'*300))
+    assert all(r['ts']!=106 for r in registry.unassigned)
+    # Home reads need not arrive in timestamp order.
+    registry.add_unassigned(dict(ts=90,home='other'))
+    registry.trim_unassigned(100+WINDOW)
+    assert all(r['ts']>=100 for r in registry.unassigned)
+    registry.trim_unassigned(106+WINDOW)
+    assert not registry.unassigned and registry.unassigned_bytes==2
+
+
 def test_two_concurrent_sessions_have_independent_fallback(tmp_path):
     home, path = fixture_home(tmp_path)
     other = "87654321-abcd-abcd-abcd-123456789012"

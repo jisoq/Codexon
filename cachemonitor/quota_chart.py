@@ -8,8 +8,8 @@ from .theme import shared_theme
 from .pricing import usd
 from .quota_view import clock, prepare_series, observation_label
 from .quota_share import share_at, share_label, share_color_key
-from .token_colors import color_distance
-from .i18n import LocalizedPainter, tr
+from .token_colors import color_distance, mix
+from .i18n import LocalizedPainter, tr, formatted
 
 
 def quota_bounds(values):
@@ -30,6 +30,14 @@ class GapPixels:
         return self.left+self.series['active_times'][row]*self.scale+(index+int(self.end))*self.width
 
 
+def monitoring_palette(paused=False):
+    palette=dict(shared_theme().palette)
+    if paused:
+        for key in ('accent','written','output'):
+            palette[key]=shared_theme().readableText(mix(palette[key],palette['muted'],.68),'surface')
+    return palette
+
+
 class QuotaHistory(Plot):
     gap_selected=Signal(str)
     range_selected=Signal(float,float)
@@ -40,6 +48,7 @@ class QuotaHistory(Plot):
         self.setFixedHeight(440)
         self.empty_text='수집된 잔여량이 없습니다'
         self.hidden_series=set()
+        self.monitoring_paused=False
         self.money=False;self.reference=None;self.series=prepare_series([])
         self.put(quotaDetail=True)
         self._cache_key=None;self.box=QRectF()
@@ -54,6 +63,11 @@ class QuotaHistory(Plot):
         else:self.hidden_series.add(key)
         self._cache_key=None
         self.update()
+
+    def set_monitoring_paused(self,paused):
+        if self.monitoring_paused==bool(paused):return
+        self.monitoring_paused=bool(paused)
+        self._cache_key=None;self.update()
 
     def visible(self,key):
         if key=='reference':return self.visible('cycle_value') and key not in self.hidden_series
@@ -143,7 +157,7 @@ class QuotaHistory(Plot):
 
     def static_image(self):
         from .quota_panel import remaining_axis
-        palette=shared_theme().palette
+        palette=monitoring_palette(self.monitoring_paused)
         ratio=self._painter.device().devicePixelRatioF()
         pic=QImage(round(self.width()*ratio),round(self.height()*ratio),QImage.Format_ARGB32_Premultiplied)
         pic.setDevicePixelRatio(ratio);pic.fill(Qt.transparent);p=LocalizedPainter(QPainter(pic))
@@ -508,7 +522,9 @@ class QuotaHistory(Plot):
         index=max(0,min(bisect_right(self.series['times'],self.inspection_at)-1,len(self.rows)-1)) if inspected and self.inspection_at is not None else len(self.rows)-1
         font=p.font();font.setPixelSize(13);p.setFont(font)
         p.setPen(QColor(palette['muted']))
-        p.drawText(QRectF(self.box.center().x(),4,self.box.width()/2,22),Qt.AlignRight,clock(self.rows[index]['at'],True))
+        stamp=(formatted('마지막 관측 {time}',time=clock(self.rows[index]['at']))
+               if self.monitoring_paused and not inspected else clock(self.rows[index]['at'],True))
+        p.drawText(QRectF(self.box.center().x(),4,self.box.width()/2,22),Qt.AlignRight,stamp)
         if inspected:
             x=max(self.box.left(),min(self.box.right(),self.x_at_time(self.inspection_at) if self.inspection_at is not None else self.inspection_x))
             p.setPen(QPen(QColor(palette['muted']),1,Qt.DotLine))

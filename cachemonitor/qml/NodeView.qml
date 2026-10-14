@@ -20,6 +20,7 @@ Item {
     onActiveFocusChanged: if (activeFocus && s.kind === "plot" && item) item.forceActiveFocus()
     visible: !!node && s.visible
     enabled: !!node && s.enabled
+    opacity: s.opacity === undefined ? 1 : s.opacity
     objectName: node ? node.objectName : ""
     implicitWidth: Math.max(s.minWidth || 0, s.width >= 0 ? s.width : (item ? item.implicitWidth : 0))
     implicitHeight: Math.max(s.minHeight || 0, s.height >= 0 ? s.height : (item ? item.implicitHeight : 0))

@@ -124,15 +124,37 @@ def test_join_cache_releases_dependencies_when_invalidated_history_changes(tmp_p
     finally:reader.close();store.close()
 
 
+def test_full_join_cache_survives_sequential_scan_and_late_evidence(tmp_path):
+    from cachemonitor.model_evidence import home_key
+    store=EvidenceStore(tmp_path/'scan.sqlite');reader=EvidenceReader(store.path)
+    reader.MAX_CACHE_SESSIONS=2;home=tmp_path/'home'
+    rows=[[{'key':f'r{n}'}] for n in range(3)]
+    try:
+        reader.poll()
+        first=[reader.enrich(home,row,str(n)) for n,row in enumerate(rows)]
+        queries=[];reader.db.set_trace_callback(lambda sql:queries.append(sql) if sql.startswith('SELECT m.*') else None)
+        second=[reader.enrich(home,row,str(n)) for n,row in enumerate(rows)]
+        assert len(queries)==1 and first==second
+        assert all(first[n] is second[n] for n in (0,1))
+        store.write(home,'late',10,'WebSocket','r0','corrected','corrected','completed');reader.poll()
+        assert reader.enrich(home,rows[0],'0')[0]['requested_model']=='corrected'
+        reader.retain_sessions({(home_key(home),'2')})
+        reader.enrich(home,rows[2],'2')
+        assert set(reader.cache)=={(home_key(home),'2')}
+        assert reader.cache_rows==1 and set(reader.dependencies)=={(home_key(home),'r2')}
+    finally:reader.close();store.close()
+
+
 def test_cancelled_response_releases_tracking_and_replay_keeps_next_request(tmp_path):
     from cachemonitor.model_proxy import Tracker
     store=EvidenceStore(tmp_path/'cancelled.sqlite')
     tracker=Tracker(store, 'home', 'WebSocket', dict(requests=0,responses=0))
     try:
         for index in range(20):
-            tracker.request({'model':'asked'})
-            tracker.response({'type':'response.cancelled','response':{'id':f'cancel-{index}'}})
+            tracker.request({'model':'asked','stream_id':str(index)})
+            tracker.response({'type':'response.cancelled','stream_id':str(index),'response':{'id':f'cancel-{index}'}})
         assert not tracker.active and not tracker.timings
+        assert not tracker.pending
         rows=store.db.execute("select status,completed_observed_at from model_observations where status<>'pending'").fetchall()
         assert len(rows)==20 and all(row[0]=='cancelled' and row[1] for row in rows)
         tracker.request({'model':'next'})

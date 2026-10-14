@@ -263,15 +263,18 @@ class UpdatePanel(Group):
         self.heading.parent().setSpacing(8)
         message=record.get('message') or proxy.get('message','')
         if phase=='needs_exit':
-            message='Codexon은 켜 두고, ChatGPT 앱과 Codex CLI는 사용 중이라면 완전히 종료해 주세요.'
+            message='연결한 앱이 종료되기를 기다리고 있습니다.\n사용 중인 ChatGPT 앱과 Codex CLI를 종료하세요.\nCodexon은 켜 두세요.'
         elif phase=='waiting':
             count=proxy.get('responding',0)
-            message='새 요청을 멈추고 응답이 끝날 때까지 기다리세요.' if count else 'Codexon을 켜 둔 채 기다리세요.'
-        elif phase=='downloading':message='설치 파일을 다운로드하고 검증합니다. 현재 설치본은 유지됩니다.'
-        elif phase=='installing':message='새 앱을 설치하고 실행 상태를 확인합니다.'
-        elif phase=='verifying':message='새 연결 구성요소의 실행을 확인합니다.'
+            message=('진행 중인 응답이 끝나기를 기다리고 있습니다.\n새 요청은 업데이트 완료 후 보내세요.' if count else
+                     '기존 연결의 응답 전달과 기록 저장이 끝나기를 기다리고 있습니다.')
+        elif phase=='downloading':message='설치 파일을 다운로드하고 무결성을 확인하고 있습니다.'
+        elif phase=='installing':message='새 버전을 설치하고 실행 상태를 확인하고 있습니다.'
+        elif phase=='verifying':message='새 프록시가 정상적으로 실행됐는지 확인하고 있습니다.'
         elif phase=='complete':message='업데이트 적용을 마쳤습니다.'
-        elif phase in ('switching','stopping','starting'):message='Codexon을 켜 둔 채 기다리세요.'
+        elif phase=='switching':message='기존 연결을 마무리하고 프록시를 교체하고 있습니다.'
+        elif phase=='stopping':message='기존 프록시가 종료되기를 기다리고 있습니다.'
+        elif phase=='starting':message='새 프록시를 실행하고 있습니다.'
         elif phase in ('partial','failed') and proxy.get('restored'):
             self.heading.setText('업데이트 실패 / 이전 프록시 복원')
             message='ChatGPT 앱을 다시 여세요.'

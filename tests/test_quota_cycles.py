@@ -8,6 +8,32 @@ from cachemonitor.quota_cycles import QuotaLedger, estimate, split_cycles, quota
 from cachemonitor.quota_panel import QuotaPanel
 
 
+def test_future_boundary_lookup_skips_past_calls_from_other_homes(tmp_path):
+    ledger=QuotaLedger(tmp_path/'future.sqlite')
+    try:
+        with ledger.db:
+            ledger.db.executemany('insert into calls(home,uid,ts) values(?,?,?)',
+                                 [('other',str(n),n) for n in range(200)]+[('other','future',700)])
+            ledger.db.execute('insert into tracking_observations(home,requested,received,data) values(?,?,?,?)',
+                              ('other',699,700,'{}'))
+        steps=[]
+        ledger.db.set_progress_handler(lambda:(steps.append(1) or 0),1)
+        boundary=ledger.db.execute('SELECT min(ts) FROM calls WHERE home IN (?) AND ts>?',('home',500)).fetchone()[0]
+        ledger.db.set_progress_handler(None,0)
+        assert boundary is None and len(steps)<200
+        for table,columns in ledger.FUTURE_COLUMNS:
+            for column in columns:
+                condition='' if table=='tracking_observations' else 'home IN (?) AND '
+                params=(500,) if not condition else ('home',500)
+                plan=ledger.db.execute(f'EXPLAIN QUERY PLAN SELECT min({column}) FROM {table} WHERE {condition}{column}>?',params).fetchall()
+                assert any(f'{column}>?' in row[3] for row in plan)
+        ledger.report('home',now=500)
+        assert ledger._report_cache['until']==700
+        ledger.report('home',now=701)
+        assert ledger._report_cache['until']==float('inf')
+    finally:ledger.close()
+
+
 def quota(at, used, reset=1000, source='live', account='a', separate=()):
     return {'windows': {'weekly': {'used_percent': used, 'resets_at': reset, 'window_minutes': 10080}},
             'plan_type': 'pro', 'observed_at': at, 'source': source, 'account': account,

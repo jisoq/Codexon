@@ -138,7 +138,10 @@ class Activity:
             terminal = typ in ('response.completed', 'response.failed', 'response.incomplete', 'response.cancelled')
             if rid and rid not in self.completed:
                 if rid not in self.active:
-                    if self.pending[lane]: self.pending[lane].popleft()
+                    pending=self.pending.get(lane)
+                    if pending:
+                        pending.popleft()
+                        if not pending:self.pending.pop(lane,None)
                     self.active[rid] = lane
                 if terminal:
                     ended_lane=self.active.pop(rid, None)
@@ -146,10 +149,11 @@ class Activity:
                     self.completed[rid] = True
                     if len(self.completed) > 2048: self.completed.popitem(last=False)
             elif typ == 'error':
+                pending=self.pending.get(lane)
                 if lane in self.cancelling:pass
-                elif len(self.pending[lane]) == 1 and lane not in self.active.values():
-                    self.pending[lane].popleft()
-                elif self.pending[lane] or self.active: self.unclassified(typ, False)
+                elif pending and len(pending) == 1 and lane not in self.active.values():
+                    self.pending.pop(lane)
+                elif pending or self.active: self.unclassified(typ, False)
             elif not isinstance(typ,str) or not typ or not (typ.startswith(('response.', 'session.', 'rate_limits.', 'usage.', 'status.'))
                                   or typ in ('ping', 'pong', 'ack', 'usage', 'status', *SERVER_NOTIFICATIONS)):
                 self.unclassified(typ, False)

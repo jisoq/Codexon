@@ -141,7 +141,9 @@ class ObserverPanel(Group):
         elif error and phase in ('off','prepared','validated') and state:
             text='프록시 설정 변경 실패'
         self.inactive=inactive
-        if phase_update in ('queued','waiting','interrupted','failed'):text='업데이트 적용 대기'
+        if phase_update in ('queued','waiting'):text='업데이트 적용 대기'
+        elif phase_update=='interrupted':text='업데이트 중단'
+        elif phase_update=='failed':text='업데이트 실패'
         elif phase_update in ('switching','stopping','starting','verifying','rollback'):text='연결 적용 중'
         self.status_label.setText(text)
         self.error_detail.setText(str(reason or ''))

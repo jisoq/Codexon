@@ -185,6 +185,14 @@ class EvidenceReader:
                 if not dependents:
                     self.dependencies.pop(response, None)
 
+    def retain_sessions(self, keys):
+        missing=set(self.cache)
+        if not missing:return
+        for key in keys:
+            missing.discard(key)
+            if not missing:break
+        for key in missing:self._evict(key)
+
     def _reset(self):
         if self.db is not None:
             self.db.close()
@@ -392,9 +400,10 @@ class EvidenceReader:
                            'model_observation_ts':min(e['ts'] for e in evidence) if evidence else None})
         self._evict(cache_key)
         if len(rows) <= self.MAX_CACHE_ROWS:
-            while self.cache and (len(self.cache) >= self.MAX_CACHE_SESSIONS or
-                                  self.cache_rows + len(rows) > self.MAX_CACHE_ROWS):
-                self._evict(next(iter(self.cache)))
+            # A full sequential publication must not evict its own next hits.
+            # Uncached histories remain queryable without replacing resident ones.
+            if (len(self.cache) >= self.MAX_CACHE_SESSIONS or
+                    self.cache_rows + len(rows) > self.MAX_CACHE_ROWS):return result
             self.cache[cache_key] = (rows,result)
             self.cache_rows += len(rows)
             responses = {(key,row['key']) for row in rows}

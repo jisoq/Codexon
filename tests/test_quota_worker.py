@@ -264,3 +264,70 @@ def test_chart_delivery_contains_only_selection_and_reuses_unchanged_digest():
     assert whole['series']['cumulative']
     assert len(whole['series']['rows'])==7
     assert engine.execute(dict(kind='chart',id=5,key='stale',revision='expired',selection=100))['stale']
+
+
+def test_unchanged_report_reuses_attribution_and_moves_rolling_boundary(monkeypatch):
+    from cachemonitor import quota_attribution
+    from cachemonitor.quota_cycles import quota_statistics
+    from test_quota_attribution import example
+    from test_quota_value_history import report_for
+    now=10*86400;cutoff=now-7*86400
+    pieces=[example([(start,100),(start+30,99),(start+60,98)],[(str(start),start+5,start+40,2)])
+            for start in (100,cutoff-10,now-300,now-200,now-100)]
+    source=report_for([cycle for part in pieces for cycle in part['cycles']])
+    source.update(at=now,request_windows=[row for part in pieces for row in part['request_windows']])
+    engine=QuotaComputation();calls=[];original=quota_attribution.local_request_intervals
+    def counted(*args):calls.append(1);return original(*args)
+    monkeypatch.setattr(quota_attribution,'local_request_intervals',counted)
+    try:
+        engine._prepare(source,history_revision=1)
+        for offset in (5,65):
+            current={**source,'at':now+offset};calls.clear()
+            engine._prepare(current,history_revision=1)
+            assert len(calls)<=1
+            view=next(reversed(engine.reports.values()))['view']
+            for days in (7,30,90):
+                assert view['summaries'][days]==quota_statistics(current,current['at']-days*86400,include_mode_assumptions=True)
+    finally:engine.close()
+
+
+def test_unchanged_report_above_cache_capacity_keeps_reusable_closed_intervals(monkeypatch):
+    from cachemonitor import quota_attribution
+    from cachemonitor.quota_cycles import quota_statistics
+    from test_quota_attribution import example
+    from test_quota_value_history import report_for
+    now=10*86400
+    starts=[100]+[now-30000+n*90 for n in range(261)]
+    parts=[example([(s,100),(s+30,99),(s+60,98)],[(str(s),s+5,s+40,2)]) for s in starts]
+    source=report_for([c for p in parts for c in p['cycles']])
+    source.update(at=now,request_windows=[r for p in parts for r in p['request_windows']])
+    engine=QuotaComputation();original=quota_attribution.local_request_intervals;calls=[]
+    def counted(*args):calls.append(1);return original(*args)
+    try:
+        engine._prepare(source,history_revision=1)
+        monkeypatch.setattr(quota_attribution,'local_request_intervals',counted)
+        current={**source,'at':now+5};engine._prepare(current,history_revision=1)
+        assert len(calls)<20
+        view=next(reversed(engine.reports.values()))['view']
+        assert len(view['_statistics_cache'])<=256
+        assert view['summaries'][7]==quota_statistics(current,current['at']-7*86400,include_mode_assumptions=True)
+    finally:engine.close()
+
+
+def test_pause_cancels_automatic_calculation_but_keeps_manual_queries_available():
+    context=mp.get_context('spawn');entered=context.Event();release=context.Event();results=[]
+    worker=QuotaWorker(on_result=results.append,
+        process_target=partial(controlled_process,entered=entered,release=release))
+    try:
+        request=worker.request('report',key='slow')
+        wait_until(entered.is_set)
+        process=worker.process
+        worker.set_paused(True)
+        wait_until(lambda:any(item.get('cancelled') for item in results))
+        assert results[-1]['id']==request and not process.is_alive()
+        manual=worker.request('query',key='saved-records')
+        wait_until(lambda:any(item['id']==manual for item in results))
+        assert results[-1]['value']['key']=='saved-records'
+        assert worker.restart_count==0
+    finally:
+        release.set();assert worker.close()

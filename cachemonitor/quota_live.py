@@ -81,6 +81,13 @@ class QuotaLookupError(RuntimeError):
         super().__init__(message)
 
 
+class QuotaLookupTimeout(TimeoutError):
+    def __init__(self, method, elapsed):
+        self.rpc_method=method
+        self.elapsed_seconds=elapsed
+        super().__init__('한도 조회 시간 초과')
+
+
 class AccountClient:
     ALLOWED = {'initialize', 'account/read', 'account/rateLimits/read'}
     _quota_cache = {}
@@ -93,13 +100,27 @@ class AccountClient:
         self.messages = queue.Queue()
         self.after = 0
         self.cache_seconds = 30
+        self.cancelled = threading.Event()
+
+    def cancel(self):
+        self.cancelled.set()
+        process = self.process
+        if process and process.poll() is None:
+            try:process.terminate()
+            except OSError:pass
+
+    def check_cancelled(self):
+        if self.cancelled.is_set():raise ConnectionError('Account lookup cancelled')
 
     def start(self):
+        self.check_cancelled()
         env = os.environ.copy()
         env['CODEX_HOME'] = self.home
         self.process = subprocess.Popen([locate_codex(), 'app-server'], env=env,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             text=True, encoding='utf-8', creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        if self.cancelled.is_set():
+            self.cancel();self.check_cancelled()
         messages = self.messages = queue.Queue()
         stream = self.process.stdout
         def read():
@@ -119,6 +140,7 @@ class AccountClient:
         self.process.stdin.flush()
 
     def rpc(self, method, params=None):
+        self.check_cancelled()
         if method not in self.ALLOWED:
             raise ValueError('Read-only RPC only')
         self.sequence += 1
@@ -127,12 +149,13 @@ class AccountClient:
             message['params'] = params
         self.process.stdin.write(json.dumps(message) + '\n')
         self.process.stdin.flush()
-        end = time.monotonic() + 12
+        started = time.monotonic()
+        end = started + 12
         while time.monotonic() < end:
             try:
                 value = self.messages.get(timeout=max(.01, end - time.monotonic()))
             except queue.Empty:
-                raise TimeoutError('한도 조회 시간 초과') from None
+                raise QuotaLookupTimeout(method,time.monotonic()-started) from None
             if value.get('disconnected'):
                 raise ConnectionError('Codex 한도 조회 연결이 종료됐습니다')
             if value.get('id') == self.sequence:
@@ -140,10 +163,11 @@ class AccountClient:
                     # Never store arbitrary server error payloads or auth data.
                     raise QuotaLookupError('rpc_error',f'Codex 한도 조회 실패 ({value["error"].get("code", "unknown")})')
                 return value.get('result') or {}
-        raise TimeoutError('한도 조회 시간 초과')
+        raise QuotaLookupTimeout(method,time.monotonic()-started)
 
     def fetch(self):
         try:
+            self.check_cancelled()
             if self.process is None or self.process.poll() is not None:
                 self.start()
             account = self.rpc('account/read', {'refreshToken': False}).get('account') or {}
@@ -152,6 +176,7 @@ class AccountClient:
                 raise QuotaLookupError('account_missing','로그인된 Codex 계정 확인 필요')
             key = hashlib.sha256(str(identity).encode()).hexdigest()
             with self._quota_lock:
+                self.check_cancelled()
                 cached = self._quota_cache.get(key)
                 if cached and time.monotonic()-cached[0]<self.cache_seconds and cached[1]['requested_at']>=self.after:
                     return dict(cached[1])

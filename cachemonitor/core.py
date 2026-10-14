@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 from collections import deque
@@ -564,11 +565,39 @@ class Session:
 
 class SessionRegistry:
     """Sessions and transport observations shared by the usage index."""
+    MAX_UNASSIGNED = 4096
+    MAX_UNASSIGNED_BYTES = 1024 * 1024
+
     def __init__(self):
         self.sessions = {}
         self.cursors = {}
         self.title_requests = {}
         self.unassigned = deque()
+        self._unassigned_sizes = deque()
+        self.unassigned_bytes = 2  # JSON array brackets, including separators below.
+        self.unassigned_dropped = 0
+
+    def trim_unassigned(self, now):
+        retained=deque();sizes=deque()
+        for row,size in zip(self.unassigned,self._unassigned_sizes):
+            if row['ts']>=now-WINDOW:
+                retained.append(row);sizes.append(size)
+            else:self.unassigned_bytes-=size
+        self.unassigned=retained;self._unassigned_sizes=sizes
+
+    def add_unassigned(self, row):
+        # Conservative encoded-size budget, including array separators.
+        # Reject oversized text before allocating an escaped JSON copy.
+        if sum(len(value) for value in row.values() if isinstance(value,str))>self.MAX_UNASSIGNED_BYTES:
+            self.unassigned_dropped+=1;return
+        size=len(json.dumps(row).encode('utf-8'))+2
+        if size+2>self.MAX_UNASSIGNED_BYTES:
+            self.unassigned_dropped+=1;return
+        while self.unassigned and (len(self.unassigned)>=self.MAX_UNASSIGNED or
+                                  self.unassigned_bytes+size>self.MAX_UNASSIGNED_BYTES):
+            self.unassigned.popleft();self.unassigned_bytes-=self._unassigned_sizes.popleft()
+            self.unassigned_dropped+=1
+        self.unassigned.append(row);self._unassigned_sizes.append(size);self.unassigned_bytes+=size
 
     def session(self, home, tid):
         key = (str(home), tid)
@@ -612,5 +641,5 @@ class SessionRegistry:
                     s.transports.append(transport)
                     s.activity = max(s.activity, transport.ts)
                 else:
-                    self.unassigned.append({"home": str(home), **vars(transport)})
+                    self.add_unassigned({"home": str(home), **vars(transport)})
             self.cursors[str(home)] = high

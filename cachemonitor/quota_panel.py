@@ -48,6 +48,8 @@ class QuotaPanel(Group):
         self.statistics=quota_statistics(self.report)
         self.quota=None
         self.issue=''
+        self.monitoring_paused=False
+        self.monitoring_paused_at=None
         self.selected_id=None
         self.period_start=None
         self.period_end=None
@@ -84,7 +86,7 @@ class QuotaPanel(Group):
         self.history_waiting=Group()
         waiting_layout=Column(self.history_waiting);waiting_layout.setSpacing(8)
         waiting_title=Text('사용량 기록 수집 대기');waiting_title.put(fontSize=18,bold=True)
-        waiting_note=Text('로컬 작업의 사용량이 수집되면 소모량과 구독 가치 환산액을 표시합니다.')
+        waiting_note=Text('소모량과 구독 가치 환산액을 계산할 사용 기록을 기다리고 있습니다.')
         waiting_note.put(fontSize=14,color='muted',wrap=True)
         waiting_layout.addWidget(waiting_title);waiting_layout.addWidget(waiting_note)
         chart_layout.addWidget(self.history_waiting)
@@ -199,6 +201,13 @@ class QuotaPanel(Group):
         self.render()
         from .quota_layout import configure_quota_layout
         configure_quota_layout(self)
+
+    def set_monitoring_paused(self,paused,at=None):
+        self.monitoring_paused=bool(paused);self.monitoring_paused_at=at
+        self.history.set_monitoring_paused(paused)
+        from .quota_layout import refresh_monitoring_style
+        refresh_monitoring_style(self)
+        if hasattr(self,'update_summary'):self.update_summary()
 
     def set_homes(self,homes):
         selected=self.home_choice.currentData() or self.report.get('home')
@@ -358,6 +367,9 @@ class QuotaPanel(Group):
         if hasattr(self,'manage_button'):
             self.manage_button.setVisible(any_history or bool(self.report.get('exclusions')) and not self.report.get('index_loading'))
         for node in (self.cycle_value,self.cycle_basis):node.setVisible(bool(lifetime['total'] or self.report.get('exclusions')))
+        if hasattr(self,'summary'):
+            from .quota_layout import refresh_monitoring_style
+            refresh_monitoring_style(self)
 
     def select_observation(self,row):
         self.history.setAccessibleName(observation_label(row,self.history.money))
@@ -464,7 +476,7 @@ class QuotaPanel(Group):
         self.lifetime_basis.setText(
             f"주간 100%p 기준 / 누적 환산액 {usd(lifetime['cost'])} / 소모 {lifetime['delta']:g}%p"
             ', '+('산정 ' if lifetime['observed_priced_calls']<lifetime['observed_calls'] else '')+call_count(lifetime['observed_priced_calls'],lifetime['observed_calls'])+'호출'+
-            '\n관측 기반 추정, 수집 공백 제외' if lifetime['total'] else '계산에 필요한 관측을 기다리고 있습니다')
+            '\n관측 기반 추정, 수집 공백 제외' if lifetime['total'] else '주간 할당량 가치를 계산할 사용량 기록을 기다리고 있습니다.')
         self.render_history()
         if hasattr(self,'update_summary'):self.update_summary()
         if self.model_choice.currentData() is not None:self.interval_filter.hide()
@@ -486,7 +498,7 @@ class QuotaPanel(Group):
             self.basis.setText(f"{summary['observed_delta']:g}%p" if summary['total'] else '—')
             self.cost_value.setText(usd(summary['observed_cost']) if summary['total'] else '—')
             self.conversion_empty.setText('환산할 로컬 사용 기록이 없습니다' if not summary['total'] else
-                                           '소모량이 누적되면 주간할당량 가치를 표시합니다' if value is None else '')
+                                           '주간 할당량 가치를 계산할 소모량이 아직 부족합니다.' if value is None else '')
         else:
             self.basis_label.setText('선택 모델 호출 수');self.basis.setToolTip('')
             calls=query['model_totals']['calls'] if query is not None else sum(row['model_calls'] for row in model_intervals)

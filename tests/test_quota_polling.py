@@ -33,6 +33,46 @@ def deterministic_accounting_worker(monkeypatch):
     monkeypatch.setattr(module,'QuotaWorker',InlineWorker)
 
 
+@pytest.mark.parametrize('failed_method',['account/read','account/rateLimits/read'])
+def test_rpc_timeout_records_safe_stage_and_next_fetch_reconnects(tmp_path,monkeypatch,failed_method):
+    import io
+    import json
+    import queue
+    from cachemonitor import quota_live
+    from cachemonitor.quota_diagnostics import record_failure
+    clock=[1000.];request=[None];failed=[False];streams=[]
+    monkeypatch.setattr(quota_live,'time',SimpleNamespace(monotonic=lambda:clock[0],time=lambda:clock[0]))
+    monkeypatch.setattr(AccountClient,'_quota_cache',{})
+    class Input(io.StringIO):
+        def write(self,text):request[0]=json.loads(text);return len(text)
+    class Messages:
+        def get(self,timeout):
+            value=request[0]
+            if value['method']==failed_method and not failed[0]:
+                failed[0]=True;clock[0]+=timeout;raise queue.Empty
+            result=({'account':{'email':'private@example.invalid'}} if value['method']=='account/read' else
+                    {'rateLimits':{'planType':'pro','primary':{'usedPercent':10,'windowDurationMins':10080,'resetsAt':2000}}})
+            return dict(id=value['id'],result=result)
+    client=AccountClient(tmp_path)
+    def start():
+        stdin=Input();streams.append(stdin)
+        client.process=SimpleNamespace(stdin=stdin,stdout=None,poll=lambda:None,
+                                       terminate=lambda:None,wait=lambda timeout:None)
+        client.messages=Messages()
+    monkeypatch.setattr(client,'start',start)
+    try:
+        with pytest.raises(TimeoutError) as caught:client.fetch()
+        assert client.process is None and streams[0].closed
+        assert caught.value.rpc_method==failed_method and caught.value.elapsed_seconds==12
+        record_failure(tmp_path/'quota.sqlite','account lookup',caught.value)
+        log=(tmp_path/'quota.diagnostics.log').read_text(encoding='utf-8')
+        assert failed_method in log and 'private@example.invalid' not in log
+        assert client.fetch()['windows']['weekly']['used_percent']==10
+        assert len(streams)==2
+    finally:client.close()
+    assert all(stream.closed for stream in streams)
+
+
 def test_shared_local_quota_keeps_its_age_during_account_failure(tmp_path,monkeypatch):
     clock=[1000.0]
     monkeypatch.setattr(module,'time',SimpleNamespace(time=lambda:clock[0],monotonic=lambda:clock[0]))
@@ -557,3 +597,56 @@ def test_polling_recovers_and_preserves_history(tmp_path,monkeypatch,failure_sta
         failed=next(r for r in reports if r['issue'])
         previous=reports[reports.index(failed)-1]['report']
         assert failed['report'] is previous and previous['worker_revision'] and 'view' in previous
+
+
+@pytest.mark.parametrize('scenario',['restart-paused','pause-in-flight','rapid-resume'])
+def test_pause_blocks_ingress_and_waits_without_polling_then_resumes_fresh(tmp_path,monkeypatch,scenario):
+    import threading
+    initially_paused=scenario=='restart-paused'
+    clock=[1000.];reads=[];waits=[];updates=[];closed=[]
+    monkeypatch.setattr(module,'time',SimpleNamespace(time=lambda:clock[0],monotonic=lambda:clock[0]))
+    class Client:
+        def __init__(self,*args):self.cancelled=threading.Event()
+        def cancel(self):self.cancelled.set()
+        def close(self):closed.append(clock[0])
+        def fetch(self):
+            assert not self.cancelled.is_set()
+            at=clock[0];reads.append(at)
+            if at==1000:
+                clock[0]=1001
+                assert service.set_paused(True)
+                if scenario=='rapid-resume':
+                    clock[0]=1002
+                    assert service.set_paused(False)
+            return dict(source='live',account='test',requested_at=at,observed_at=at,
+                windows={'weekly':dict(used_percent=10,resets_at=20000,window_minutes=10080)})
+    monkeypatch.setattr(module,'AccountClient',Client)
+    service=module.QuotaService(tmp_path/'home',tmp_path/'index.sqlite',reports_enabled=False,paused=initially_paused,paused_at=900)
+    service.updated.connect(updates.append)
+    done=[False]
+    class Wake:
+        def clear(self):pass
+        def set(self):pass
+        def wait(self,seconds=None):
+            waits.append(seconds)
+            if scenario=='rapid-resume':done[0]=True;return
+            if len(waits)==1:
+                assert seconds is None and service.paused and closed
+                assert service.backlog.first() is None
+                assert service.supply_local(dict(observed_at=1500,windows={}))
+                assert service.backlog.first() is None and service.local_observations.empty()
+                clock[0]=2000
+                assert service.set_paused(False)
+                assert service.supply_local(dict(observed_at=1500,windows={}))
+                assert service.local_observations.empty()
+            else:done[0]=True
+    service.wake=Wake();service.isInterruptionRequested=lambda:done[0]
+    service.run()
+    resumed_at=1002 if scenario=='rapid-resume' else 2000
+    assert reads==([resumed_at] if initially_paused else [1000,resumed_at])
+    assert not any(value['issue'] for value in updates)
+    assert updates[-1]['quota']['observed_at']==resumed_at and not updates[-1]['paused']
+    with sqlite3.connect(service.path) as db:
+        assert [row[0] for row in db.execute('select at from observations')]==[resumed_at]
+        controls=list(db.execute('select at,enabled from tracking_controls order by at'))
+        assert controls==([(1000,0),(resumed_at,1)] if initially_paused else [(1000,1),(1001,0),(resumed_at,1)])

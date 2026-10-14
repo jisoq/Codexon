@@ -153,7 +153,7 @@ class ShutdownProgress(QDialog):
         self.setWindowTitle(tr('Codexon 종료 중'));self.setWindowModality(Qt.ApplicationModal)
         self.setWindowFlag(Qt.WindowCloseButtonHint,False)
         layout=QVBoxLayout(self)
-        self.label=QLabel(tr('관련 작업 마무리 중…'));layout.addWidget(self.label)
+        self.label=QLabel(tr('앱 종료를 준비하고 있습니다.'));layout.addWidget(self.label)
         progress=QProgressBar();progress.setRange(0,0);layout.addWidget(progress)
         warning=QLabel(tr('강제 종료하면 진행 중인 응답이 중단됩니다.'));layout.addWidget(warning)
         self.force=QPushButton(tr('강제 종료'));self.force.setEnabled(supported)

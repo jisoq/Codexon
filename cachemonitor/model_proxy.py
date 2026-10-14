@@ -90,8 +90,10 @@ class Tracker:
         rid = identifier(response.get('id'))
         lane = identifier(obj.get('stream_id'))
         if not rid:
-            if typ=='error' and self.pending[lane]:
-                record=self.pending[lane].popleft()
+            pending=self.pending.get(lane)
+            if typ=='error' and pending:
+                record=pending.popleft()
+                if not pending:self.pending.pop(lane,None)
                 record['status']='failed'; self.save(record)
                 self.timings.pop(record['attempt'],None)
             return
@@ -104,8 +106,10 @@ class Tracker:
                 self.save(record)
             return
         if rid not in self.active:
-            if self.pending[lane]:
-                self.active[rid]=self.pending[lane].popleft()
+            pending=self.pending.get(lane)
+            if pending:
+                self.active[rid]=pending.popleft()
+                if not pending:self.pending.pop(lane,None)
             else:
                 # No exact request association: record response-only evidence, never guess.
                 self.active[rid]=dict(attempt=str(uuid.uuid4()),ts=time.time(),requested_model='',

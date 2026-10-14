@@ -57,7 +57,7 @@ class ProxyUpdate:
                 from .update_state import UpdateState
                 if not UpdateState(data['update_root']).begin_switch(data['operation_id']):raise UpdateCancelled()
             self.publish('switching',cutover_started=True,required_action=None,
-                         message='기존 연결을 마무리하고 교체합니다.')
+                         message='기존 연결을 마무리하고 프록시를 교체하고 있습니다.')
 
     def preflight(self):
         from .proxy_identity import deployment
@@ -115,7 +115,7 @@ class ProxyUpdate:
             from .proxy_identity import digest
             if digest(source['command'][0])!=source['executable_sha256']:
                 raise RuntimeError('복구 실행 파일 무결성 확인 실패')
-        self.publish('rollback',message='이전 역할과 설정으로 복구 중')
+        self.publish('rollback',message='이전 프록시와 연결 설정을 복원하고 있습니다.')
         current=m.health(timeout=3)
         if current:
             if current['instance']!=source['instance']:
@@ -131,7 +131,7 @@ class ProxyUpdate:
             self.drain(owned)
             # All new processes must exit before restoring the original command.
             if not self.target.stopped(owned):raise RuntimeError('새 프로세스 종료 확인 실패')
-        self.publish('rollback',message='이전 실행 명령으로 재기동 중')
+        self.publish('rollback',message='이전 프록시를 다시 실행하고 있습니다.')
         self.start(source['command'],source)
         self.ready(source,source['command'],source['version'])
         self.publish('failed',message='업데이트 실패: 이전 버전 복구 확인 완료',restored=True)
@@ -181,7 +181,7 @@ class ProxyUpdate:
                         if not source.get('control_id'):
                             raise RuntimeError('실행 중인 구버전에 안전 종료 제어가 없습니다. 기존 응답을 보존했습니다.')
                         self.publish('waiting',source=source,command=command,distribution=distribution,
-                                     scope=self.target.scope,message='연결 교체 준비 중')
+                                     scope=self.target.scope,message='프록시 교체를 준비하고 있습니다.')
                     data=read_json(self.path)
                     if data.get('phase')=='rollback':
                         self.rollback(data);return
@@ -198,10 +198,10 @@ class ProxyUpdate:
                     elif not self.target.stopped(source):self.drain(source)
                     self.allowed()
                     self.begin_switch()
-                    self.publish('starting',message='새 프록시 기동 중')
+                    self.publish('starting',message='새 프록시를 실행하고 있습니다.')
                     try:
                         self.start(command,source)
-                        self.publish('verifying',message='새 버전, 역할, 실행 경로 확인 중')
+                        self.publish('verifying',message='새 프록시의 버전과 실행 상태를 확인하고 있습니다.')
                         ready=self.ready(source,command,PROXY_VERSION,distribution)
                         self.publish('complete',message='프록시 업데이트 완료',result=dict(
                             version=ready['version'],instance=ready['instance'],pid=ready['pid'],

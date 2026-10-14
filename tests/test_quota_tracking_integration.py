@@ -222,6 +222,21 @@ def test_input_cache_catches_late_deletes_and_recovers_after_change_ring_overflo
     finally:ledger.close()
 
 
+def test_cached_report_discovers_future_account_membership_in_another_home(tmp_path):
+    ledger=QuotaLedger(tmp_path/'future-membership.sqlite')
+    try:
+        for home in ('h','other'):tracking.enable(ledger.db,home,100)
+        observe(ledger,110,80)
+        observe(ledger,200,79,home='other')
+        ledger.db.commit()
+        before=ledger.report('h',now=150)
+        assert before['tracking']['homes']==['h']
+        after=ledger.report('h',now=201)
+        assert set(after['tracking']['homes'])=={'h','other'}
+        assert after==ledger._report('h',now=201)
+    finally:ledger.close()
+
+
 def test_same_account_homes_count_quota_and_replayed_calls_once(tmp_path):
     ledger=QuotaLedger(tmp_path/'multi.sqlite')
     for home in ('h','other'):

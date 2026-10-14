@@ -292,9 +292,9 @@ class OverlayContent(Node):
                                '수집 지연':'새 수집 결과가 도착하지 않았습니다. 마지막 수집 상태를 확인해 주세요.',
                                '수집 시작 중':'수집기 실행을 요청했습니다. 새 수집 결과를 기다리고 있습니다.'}[self.note]
         if self.note in ('기록 확인 중','세션 기록 확인 중','기록 수집 중 (잠정값)'):
-            return '기록 확인 중','세션 기록을 읽고 있습니다. 확인된 사용량이 준비되면 표시합니다.'
+            return '기록 확인 중','세션 기록에서 호출별 사용량을 읽고 있습니다.'
         if self.note=='호출 기록 없음' or not self.note and (self.data or {}).get('calls')==0:
-            return '호출 기록 대기','아직 수집된 호출이 없습니다. 호출 기록이 수집되면 사용량을 표시합니다.'
+            return '호출 기록 대기','이 세션의 첫 호출 기록을 기다리고 있습니다.'
         return None
     def freshness_text(self):return self._freshness_label
     @staticmethod

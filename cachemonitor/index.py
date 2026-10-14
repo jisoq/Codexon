@@ -682,6 +682,7 @@ class UsageIndex:
                 if key in self.loaded and key not in blocked and key[0] not in unknown_homes and not s.pending}
 
     def snapshot(self,now,changed,usage_complete,usage_errors):
+        self.monitor.trim_unassigned(now)
         for home in self.homes:
             try:
                 self.monitor.read_logs(home, now)
@@ -696,7 +697,8 @@ class UsageIndex:
         views = []
         # Resolve each home once per publication, not once per retained session.
         # The next publication resolves again so changed links are still observed.
-        evidence_homes = {}
+        evidence_homes = {home:home_key(home) for home in dict.fromkeys(home for home,_ in self.monitor.sessions)}
+        self.model_evidence.retain_sessions((evidence_homes[home],sid) for home,sid in self.monitor.sessions)
         for key, s in self.monitor.sessions.items():
             meta = self.metadata.get(key, {})
             s.metadata_seen = bool(meta)
@@ -706,7 +708,6 @@ class UsageIndex:
             if not s.requests and not s.reported_usage and not s.transports and not s.request_state:
                 continue
             view = dict(s.view(now,use_cache=True))
-            if s.home not in evidence_homes:evidence_homes[s.home]=home_key(s.home)
             view['history'] = self.model_evidence.enrich_home(evidence_homes[s.home],view['history'],s.id)
             if not meta.get('project') or not meta.get('project_name'):
                 names=self.names.get(str(s.home))
@@ -767,6 +768,7 @@ class UsageIndex:
                 'observation_read_failed':bool(self.model_evidence.error),
                 'homes': [str(h) for h in self.homes], 'errors': list(dict.fromkeys(self.errors)),
                 'unassigned': list(self.monitor.unassigned),
+                'unassigned_dropped': self.monitor.unassigned_dropped,
                 'excluded_title_sessions': sum(s.excluded_title for s in self.monitor.sessions.values()),
                 'quota_by_home':dict(self.quota_by_home),
                 'index': {'loading': bool(self.queue or self.cached_restore or self.pending_rebuilds or self.rebuild_jobs or self.model_evidence.catching_up), 'done': min(self.done_files, len(self.files)),

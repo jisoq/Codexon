@@ -36,9 +36,13 @@ def record_failure(path, stage, error):
     try:
         frames = [{'file': Path(f.filename).name, 'line': f.lineno, 'function': f.name}
                   for f in traceback.extract_tb(error.__traceback__)[-8:]]
+        timing={}
+        method=getattr(error,'rpc_method',None)
+        if method in ('initialize','account/read','account/rateLimits/read'):
+            timing=dict(rpc_method=method,elapsed_seconds=round(error.elapsed_seconds,3))
         _logger(path).warning(json.dumps(dict(stage=stage, error=type(error).__name__,
             sqlite_code=getattr(error, 'sqlite_errorcode', None),
-            sqlite_name=getattr(error, 'sqlite_errorname', None), frames=frames)))
+            sqlite_name=getattr(error, 'sqlite_errorname', None), frames=frames,**timing)))
     except OSError:
         pass  # Logging must never prevent recovery (e.g. a full disk).
 

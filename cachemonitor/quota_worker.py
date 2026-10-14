@@ -84,13 +84,17 @@ class QuotaComputation:
             from .quota_cycles import quota_statistics
             from .quota_attribution import RequestWindows
             view=previous['view'];summaries={None:view['lifetime']}
+            # Unchanged history only reads the bounded cache; a rolling-window
+            # scan must not evict later hits to admit earlier misses.
+            statistics_cache=view.get('_statistics_cache',{})
             earliest=min((cycle['start'] for cycle in report.get('cycles',[])),default=report['at'])
             requests=RequestWindows(report.get('request_windows',[]))
             for days in (7,30,90):
                 start=report['at']-days*86400
                 summaries[days]=(view['lifetime'] if start<=earliest else
-                    quota_statistics(report,start,include_mode_assumptions=True,_requests=requests))
-            report['view']={**view,'summaries':summaries}
+                    quota_statistics(report,start,include_mode_assumptions=True,_requests=requests,
+                                     _cache=statistics_cache,_cache_readonly=True))
+            report['view']={**view,'summaries':summaries,'_statistics_cache':statistics_cache}
         else:report['view'] = prepare_quota_view(report,previous['view'] if previous else None,deferred=True)
         revision = uuid4().hex
         self.reports[revision] = report
@@ -202,9 +206,15 @@ class QuotaWorker(QObject):
         self.thread = None
         self.process = None
         self.phase = 'idle'
+        self.cancel_report_before = 0
         self.restart_count = 0
         self.chart_selection = None
         self.chart_digest = None
+
+    def set_paused(self, paused):
+        with self.lock:
+            if paused:self.cancel_report_before = self.sequence
+        self.wake.set()
 
     def select_chart(self, selection, digest=None):
         with self.lock:
@@ -263,13 +273,28 @@ class QuotaWorker(QObject):
     def _run(self):
         connection = None
         active = None
+        def release():
+            nonlocal connection
+            if connection is not None:
+                try:connection.send({'kind':'stop'})
+                except (EOFError,BrokenPipeError,OSError):pass
+                connection.close();connection=None
+            process=self.process
+            if process is not None and process.pid is not None:
+                process.join(.2)
+                if process.is_alive():process.terminate();process.join(.5)
+            self.process=None
         try:
             while not self.closing.is_set():
                 if active is None:
                     active = self._next()
                 if active is None:
-                    self.wake.wait(.05)
+                    self.wake.wait()
                     self.wake.clear()
+                    continue
+                if active['kind']=='report' and active['id']<=self.cancel_report_before:
+                    self._deliver({key:active.get(key) for key in ('kind','id','key')} | dict(cancelled=True))
+                    active=None
                     continue
                 try:
                     if connection is None:
@@ -288,9 +313,15 @@ class QuotaWorker(QObject):
                     self.phase = 'pending-write' if active['kind'] in ('exclude','restore') else 'reading'
                     connection.send(active)
                     while True:
+                        if active['kind']=='report' and active['id']<=self.cancel_report_before:
+                            release();self.phase='idle'
+                            self._deliver({key:active.get(key) for key in ('kind','id','key')} | dict(cancelled=True))
+                            active=None
+                            break
                         if connection.poll(.02):
                             result = receive_result(connection,
-                                lambda:self.closing.is_set() and self.phase not in self.WRITING)
+                                lambda:(self.closing.is_set() and self.phase not in self.WRITING) or
+                                (active['kind']=='report' and active['id']<=self.cancel_report_before))
                             if result['kind'] == 'phase':
                                 self.phase = result['value']
                                 continue
@@ -303,7 +334,10 @@ class QuotaWorker(QObject):
                         if self.closing.is_set() and self.phase not in self.WRITING:
                             return
                 except TransferCancelled:
-                    return
+                    if self.closing.is_set():return
+                    release();self.phase='idle'
+                    self._deliver({key:active.get(key) for key in ('kind','id','key')} | dict(cancelled=True))
+                    active=None
                 except (EOFError, BrokenPipeError, OSError, RuntimeError) as error:
                     if active is not None:
                         self._deliver({key: active.get(key) for key in ('kind', 'id', 'key')} | dict(
