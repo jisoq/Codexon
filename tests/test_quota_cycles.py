@@ -50,16 +50,16 @@ def test_clear_current_cycle_survives_reopen_and_preserves_previous_cycle(tmp_pa
         sync(ledger,[row(ts=115),row(key='r2',ts=215)],at=235)
         before=prepare_quota_view(ledger.report('h',235))
         monkeypatch.setattr('cachemonitor.quota_cycles.time.time',lambda:240)
-        ledger.clear_current_cycle('h',200,'a')
+        ledger.clear_selected_cycle('h',200,'a')
         after=prepare_quota_view(ledger.report('h',240))
         assert after['periods'][0]['cost']==0
         assert after['periods'][0]['value'] is None
         assert [r['at'] for r in after['periods'][0]['series']['rows']]==[240]
         assert after['periods'][0]['series']['rows'][0]['remaining']==90
         assert after['periods'][1]['cost']==before['periods'][1]['cost']
-        with pytest.raises(ValueError):ledger.clear_current_cycle('h',200,'a')
+        with pytest.raises(ValueError):ledger.clear_selected_cycle('h',200,'a')
         monkeypatch.setattr('cachemonitor.quota_cycles.time.time',lambda:250)
-        ledger.clear_current_cycle('h',240,'a')
+        ledger.clear_selected_cycle('h',240,'a')
         assert ledger.db.execute('select count(*) from quota_cycle_clears').fetchone()[0]==1
     finally:ledger.close()
     ledger=QuotaLedger(path)
@@ -70,6 +70,42 @@ def test_clear_current_cycle_survives_reopen_and_preserves_previous_cycle(tmp_pa
         resumed=prepare_quota_view(ledger.report('h',295))
         assert resumed['periods'][0]['delta']==2
         assert resumed['periods'][0]['cost']>0
+    finally:ledger.close()
+
+
+def test_delete_selected_cycle_preserves_neighbors_and_survives_reopen(tmp_path,monkeypatch):
+    from cachemonitor.quota_view import prepare_quota_view
+    path=tmp_path/'delete.sqlite'
+    ledger=QuotaLedger(path)
+    monkeypatch.setattr('cachemonitor.quota_cycles.time.time',lambda:340)
+    try:
+        for at,used in ((100,0),(130,10),(200,0),(230,10),(300,0),(330,10)):
+            ledger.observe('h',quota(at,used))
+        sync(ledger,[row(key=str(at),ts=at) for at in (115,215,315)],at=335)
+        before=prepare_quota_view(ledger.report('h',340))
+        # A stale reset confirmation must never turn into a deletion.
+        with pytest.raises(ValueError):ledger.clear_selected_cycle('h',200,'a')
+        with pytest.raises(ValueError):ledger.clear_selected_cycle('h',300,'a',delete=True)
+        with pytest.raises(ValueError):ledger.clear_selected_cycle('h',200,'other',delete=True)
+        ledger.clear_selected_cycle('h',200,'a',delete=True)
+        with pytest.raises(ValueError):ledger.clear_selected_cycle('h',200,'a',delete=True)
+    finally:ledger.close()
+    ledger=QuotaLedger(path)
+    try:
+        after=prepare_quota_view(ledger.report('h',340))
+        assert [p['start'] for p in after['periods']]==[300,100]
+        for period,original in zip(after['periods'],(before['periods'][0],before['periods'][2])):
+            for key in ('start','end','cost','delta','value','current'):
+                assert period[key]==original[key]
+        assert after['lifetime']['cost']==pytest.approx(before['lifetime']['cost']-before['periods'][1]['cost'])
+        ledger.clear_selected_cycle('h',300,'a')
+        assert prepare_quota_view(ledger.report('h',340))['periods'][0]['start']==340
+        # A previously reset cycle can later be deleted without resurrecting it.
+        ledger.observe('h',quota(370,12));ledger.observe('h',quota(400,0))
+        monkeypatch.setattr('cachemonitor.quota_cycles.time.time',lambda:410)
+        ledger.clear_selected_cycle('h',340,'a',delete=True)
+        assert [p['start'] for p in prepare_quota_view(ledger.report('h',410))['periods']]==[400,100]
+        assert ledger.db.execute('select count(*) from quota_cycle_clears').fetchone()[0]==2
     finally:ledger.close()
 
 

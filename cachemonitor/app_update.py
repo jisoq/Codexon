@@ -175,6 +175,50 @@ class UpdateCancelled(Exception):
     pass
 
 
+def prune_downloads(root, keep=2):
+    """Bound installer copies, preserving live installers and unknown files.
+
+    Run at update boundaries, never on a timer. Keep one inactive installer
+    before the next download; referenced installers remain protected until exit.
+    Each downloaded installer retains the existing 2 GB transfer limit.
+    """
+    from .install_cleanup import safe_path, referenced, remove_tree
+    from .install_management import processes_under
+    from .observer_state import ProcessLock, read_json
+    root=Path(root).absolute()
+    directory=root/'downloads'
+    if not directory.exists():return []
+    names={'Codexon-Setup.exe','Codexon-Setup.partial','setup.log','setup.log.native.log'}
+    removed=[]
+    try:
+        with ProcessLock(root/'install.lock'):
+            safe_path(root,directory)
+            candidates=[]
+            for position,path in enumerate(directory.iterdir()):
+                if position>=256:break  # Bound a legacy cache inspection per update.
+                if not re.fullmatch('[0-9a-f]{32}',path.name):continue
+                try:
+                    safe_path(root,path)
+                    if not path.is_dir():continue
+                    files=list(path.iterdir())
+                    if any(p.name not in names or not p.is_file() for p in files):continue
+                    for file in files:safe_path(root,file)
+                    candidates.append((max((p.stat().st_mtime for p in files),default=path.stat().st_mtime),path))
+                except (OSError,ValueError):continue
+            candidates.sort(key=lambda item:item[0],reverse=True)
+            if len(candidates)<=keep:return []
+            processes=processes_under(root)
+            active=read_json(root/'app-update.json')
+            protected=active.get('installer','') if active.get('phase') not in ('complete','cancelled','failed') else ''
+            for _,path in candidates[keep:]:
+                if referenced(path,protected) or any(referenced(path,p.get('ExecutablePath','')) or
+                        referenced(path,p.get('CommandLine','')) for p in processes):continue
+                try:remove_tree(root,path);removed.append(str(path))
+                except (OSError,ValueError):continue
+    except (OSError,ValueError,RuntimeError):pass  # Cleanup must not prevent an update.
+    return removed
+
+
 def download_and_install(release,install,progress,journal,operation_id):
     def allowed():
         if journal.cancelled(operation_id):raise UpdateCancelled()
@@ -188,6 +232,7 @@ def download_and_install(release,install,progress,journal,operation_id):
     expected=match[1].lower()
     size=asset.get('size')
     if type(size) is not int or not 0<size<2_000_000_000:raise ValueError('설치 파일 크기가 올바르지 않습니다.')
+    prune_downloads(install['InstallRoot'],keep=1)
     directory=Path(install['InstallRoot'])/'downloads'/uuid.uuid4().hex
     directory.mkdir(parents=True)
     partial=directory/'Codexon-Setup.partial'

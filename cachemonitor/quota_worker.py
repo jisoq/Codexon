@@ -118,12 +118,14 @@ class QuotaComputation:
                             record = ledger.exclude_interval(self.home, request['start'], request['end'], request.get('reason', ''))
                             identifier = record['id']
                         elif kind=='clear_cycle':
-                            record=ledger.clear_current_cycle(self.home,request['start'],request['account'])
+                            record=ledger.clear_selected_cycle(self.home,request['start'],request['account'],
+                                                               delete=request.get('delete',False))
                             identifier=str(record['end'])
                         else:
                             identifier = request['exclusion_id']
                             ledger.restore_exclusion(self.home, identifier)
                         self.committed[token] = dict(operation=kind, ok=True, id=identifier)
+                        if kind=='clear_cycle':self.committed[token]['deleted']=request.get('delete',False)
                     result['saved'] = True
                     result['exclusion_result'] = self.committed[token]
                     phase('reading')

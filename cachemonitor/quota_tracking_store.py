@@ -27,10 +27,9 @@ def initialize(db):
             PRIMARY KEY(home,start));
         CREATE TABLE IF NOT EXISTS tracking_wire(home TEXT, identity TEXT, response TEXT,
             start REAL, end REAL, status TEXT, PRIMARY KEY(home,identity));
-        CREATE TABLE IF NOT EXISTS tracking_activity_versions(
-            seq INTEGER PRIMARY KEY AUTOINCREMENT, home TEXT, identity TEXT,
-            seen REAL, start REAL, end REAL, kind TEXT, status TEXT, response TEXT);
-        CREATE INDEX IF NOT EXISTS tracking_activity_seen ON tracking_activity_versions(home,seen);
+        -- Current activity and its revision counters are authoritative. The old
+        -- append-only journal has no reader and must not grow with every refresh.
+        DROP TABLE IF EXISTS tracking_activity_versions;
     ''')
     _initialize_activity_revisions(db)
 
@@ -146,10 +145,6 @@ def sync_activity(db, snapshot, cache=None):
                 if start < enabled[0] and end is None:
                     continue
                 identity=session['id'] + ':' + turn
-                old=db.execute('select start,end from tracking_tasks where home=? and identity=?',(home,identity)).fetchone()
-                if old is None or tuple(old)!=(start,end):
-                    db.execute('insert into tracking_activity_versions(home,identity,seen,start,end,kind,status,response) values(?,?,?,?,?,?,?,?)',
-                        (home,identity,snapshot['ts'],start,end,'task','',''))
                 db.execute('insert into tracking_tasks values(?,?,?,?) on conflict(home,identity) '
                            'do update set start=excluded.start,end=excluded.end '
                            'where tracking_tasks.start is not excluded.start or tracking_tasks.end is not excluded.end',
@@ -182,8 +177,6 @@ def sync_activity(db, snapshot, cache=None):
                 request.get('response_id',''),start,end,request['status']):continue
             db.execute('insert or replace into tracking_wire values(?,?,?,?,?,?)',
                 (home,request['attempt'],request.get('response_id',''),start,end,request['status']))
-            db.execute('insert into tracking_activity_versions(home,identity,seen,start,end,kind,status,response) values(?,?,?,?,?,?,?,?)',
-                (home,request['attempt'],snapshot['ts'],start,end,'wire',request['status'],request.get('response_id','')))
 
 
 def observe(db, home, quota):
@@ -206,7 +199,8 @@ def observe(db, home, quota):
         db.commit()
         return
     db.execute('insert into tracking_observations(home,requested,received,data) values(?,?,?,?)',
-               (home, quota.get('requested_at', quota['observed_at']), quota['observed_at'], json.dumps(quota)))
+               (home, quota.get('requested_at', quota['observed_at']), quota['observed_at'],
+                json.dumps(quota,separators=(',',':'))))
     db.commit()
 
 

@@ -36,6 +36,34 @@ def _advance_quota_fixture(ledger):
                          'two':dict(started_at=123,ended_at=126)},[107,125])
 
 
+def test_activity_journal_retirement_preserves_measurements_and_current_activity(tmp_path):
+    path=tmp_path/'ledger.sqlite'
+    ledger=QuotaLedger(path)
+    _committed_quota_fixture(ledger)
+    ledger.db.execute('insert into tracking_wire values(?,?,?,?,?,?)',('h','wire','response',103,108,'completed'))
+    ledger.db.executescript('''
+        CREATE TABLE tracking_activity_versions(seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            home TEXT,identity TEXT,seen REAL,start REAL,end REAL,kind TEXT,status TEXT,response TEXT);
+        CREATE INDEX tracking_activity_seen ON tracking_activity_versions(home,seen);
+        INSERT INTO tracking_activity_versions(home,identity,seen,start,end,kind,status,response)
+            VALUES('h','wire',104,103,NULL,'wire','pending',''),
+                  ('h','wire',109,103,108,'wire','completed','response');
+    ''')
+    expected=ledger.report('h',112)
+    summary=tracking.ActivitySummary().read(ledger.db,'h',100)
+    ledger.close()
+    ledger=QuotaLedger(path)
+    try:
+        assert ledger.report('h',112)==expected
+        assert tracking.ActivitySummary().read(ledger.db,'h',100)==summary
+        assert ledger.db.execute("select 1 from sqlite_master where name='tracking_activity_versions'").fetchone() is None
+        _advance_quota_fixture(ledger)
+        assert ledger.db.execute('select count(*) from tracking_tasks').fetchone()[0]==2
+        assert tuple(ledger.db.execute('select start,end,status from tracking_wire').fetchone())==(103,108,'completed')
+        assert ledger.db.execute('pragma integrity_check').fetchone()[0]=='ok'
+    finally:ledger.close()
+
+
 def _quota_process_waiting_for_termination(path, connection, partial):
     ledger=QuotaLedger(path)
     _committed_quota_fixture(ledger)

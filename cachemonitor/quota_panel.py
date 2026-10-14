@@ -242,8 +242,12 @@ class QuotaPanel(Group):
             if result.get('operation')=='clear_cycle':
                 self._cycle_clear_pending=False
                 if result.get('ok'):
-                    self.cycle_choice.setCurrentIndex(1)
-                else:self.issue=result.get('error','초기화하지 못했습니다. 다시 시도하세요.')
+                    message='선택한 주기를 삭제했습니다.' if result.get('deleted') else '선택한 주기를 초기화했습니다.'
+                else:
+                    message=result.get('error','선택한 주기를 처리하지 못했습니다. 다시 시도하세요.')
+                    self.issue=message
+                if hasattr(self,'cycle_clear_message'):
+                    self.cycle_clear_message.setText(message);self.cycle_clear_message.show()
             else:self.exclusions.receive_result(result)
             if value['exclusion_result'].get('ok') and getattr(self,'dialog',None) and self.dialog.host:self.dialog.reject()
         if getattr(self,'defer_render',False):
@@ -375,7 +379,8 @@ class QuotaPanel(Group):
         if hasattr(self,'manage_button'):
             self.manage_button.setVisible(any_history or bool(self.report.get('exclusions')) and not self.report.get('index_loading'))
         if hasattr(self,'clear_cycle_button'):
-            self.clear_cycle_button.setEnabled(bool(self._view['periods']) and bool(self.report.get('account')) and not getattr(self,'_cycle_clear_pending',False))
+            self.clear_cycle_button.setText('선택 주기 삭제' if period and not all_cycles and not period['current'] else '선택 주기 초기화')
+            self.clear_cycle_button.setEnabled(bool(period) and not all_cycles and bool(self.report.get('account')) and not getattr(self,'_cycle_clear_pending',False))
         for node in (self.cycle_value,self.cycle_basis):node.setVisible(bool(lifetime['total'] or self.report.get('exclusions')))
         if hasattr(self,'summary'):
             from .quota_layout import refresh_monitoring_style

@@ -44,6 +44,49 @@ def quota_page(tmp_path):
 
 @pytest.mark.integration
 @pytest.mark.essential
+def test_selected_cycle_action_confirmation_and_completion(quota_page,tmp_path):
+    from copy import deepcopy
+    app,panel,scroll=quota_page
+    host=mount(scroll,520,900)
+    requests=[];panel.cycle_clear_requested.connect(requests.append)
+    try:
+        latest=panel._view['periods'][0]
+        previous=panel._view['periods'][1]
+        panel.cycle_choice.setCurrentIndex(2)
+        button=render_plot(host,panel.clear_cycle_button)
+        choice=control(host,panel.cycle_choice)
+        assert choice.mapToScene(QPointF()).x()+choice.width()<=button.mapToScene(QPointF()).x()
+        assert button.mapToScene(QPointF()).x()+button.width()<=host.quick.width()
+        click(host,button)
+        dialog=panel.clear_cycle_dialog
+        click(dialog.host,render_plot(dialog.host,dialog.cancel))
+        assert not requests
+        click(host,render_plot(host,panel.clear_cycle_button))
+        dialog=panel.clear_cycle_dialog
+        click(dialog.host,render_plot(dialog.host,dialog.confirm))
+        assert requests==[dict(start=previous['start'],account='a',delete=True)]
+        assert not panel.clear_cycle_button.isEnabled()
+        changed=deepcopy(panel.report);changed.pop('view',None)
+        changed['cycle_clears']=[dict(home='h',account='a',start=previous['start'],end=latest['start'],baseline='null')]
+        panel.receive(dict(home='h',report=changed,exclusion_result=dict(operation='clear_cycle',ok=True,deleted=True)))
+        assert panel.cycle_choice.findData(previous['start'])==-1
+        assert panel.cycle_clear_message.isVisible()
+        assert panel.cycle_choice.currentData()==latest['start']
+        click(host,render_plot(host,panel.clear_cycle_button))
+        dialog=panel.clear_cycle_dialog
+        click(dialog.host,render_plot(dialog.host,dialog.confirm))
+        assert requests[-1]==dict(start=latest['start'],account='a',delete=False)
+        panel.receive(dict(home='h',report=changed,exclusion_result=dict(operation='clear_cycle',ok=False,error='test failure')))
+        assert panel.cycle_clear_message.isVisible() and panel.clear_cycle_button.isEnabled()
+        panel.cycle_choice.setCurrentIndex(0)
+        assert not panel.clear_cycle_button.isEnabled()
+        assert host.grab().save(str(tmp_path/'selected-cycle-action.png'))
+        assert not host.qml_errors
+    finally:dispose(host)
+
+
+@pytest.mark.integration
+@pytest.mark.essential
 def test_large_summary_values_fit_compact_cards(quota_page,tmp_path):
     from cachemonitor.pricing import usd
     app,panel,scroll=quota_page

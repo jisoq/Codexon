@@ -361,7 +361,7 @@ class Dashboard(TrayWindow):
 
     def clear_quota_cycle(self, value):
         if self.quota_service:
-            self.quota_service.clear_current_cycle(value['start'],value['account'])
+            self.quota_service.clear_selected_cycle(value['start'],value['account'],delete=value['delete'])
 
     def receive_quota(self,value):
         if 'paused' in value:

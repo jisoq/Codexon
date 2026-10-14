@@ -461,6 +461,7 @@ def quota_value_history(report, rows, *, _requests=None, _cache=None, _statistic
                     for c in own]
             signature=(account,forward,group,inputs,end,
                        [r for r in exclusions if r['start']<end and r['end']>start],
+                       [r for r in report.get('cycle_clears',[]) if r['start']<end and r['end']>start],
                        list(_requests.overlapping(start,end)) if _requests is not None else None,
                        (report.get('tracking') or {}).get('complete'))
             cached=previous_cache.get(start)
@@ -699,7 +700,7 @@ class QuotaLedger:
                 'calls','manual_resets','coverage_issues','quota_exclusions','quota_cycle_clears','state',
                 'tracking_config','tracking_policies','tracking_controls','tracking_tasks',
                 'tracking_observations','tracking_gaps','tracking_wire','tracking_health',
-                'tracking_call_boundaries','tracking_activity_versions')
+                'tracking_call_boundaries')
         for table in tables:
             columns=[r[1] for r in self.db.execute(f'PRAGMA table_info({table})')]
             if not columns:continue
@@ -1123,16 +1124,18 @@ class QuotaLedger:
             return True
         return self._edit_with_report(home,lambda report:report['account'],restore)
 
-    def clear_current_cycle(self, home, start, account):
+    def clear_selected_cycle(self, home, start, account, *, delete=False):
         from .quota_view import history_rows
         def prepare(report):
             rows=history_rows(report,'weekly')
-            current=next((row for row in reversed(rows) if row.get('reset_kind')),rows[0] if rows else None)
-            if not account or report['account']!=account or current is None or current['at']!=start:
-                raise ValueError('현재 주기가 변경되었습니다. 기록을 확인한 뒤 다시 시도하세요.')
-            at=time.time()
-            original=next((r['start'] for r in report.get('cycle_clears',[]) if r['end']==start),start)
-            baseline={k:rows[-1].get(k) for k in ('used','reset','source','account','window')}
+            starts=[row['at'] for i,row in enumerate(rows) if i==0 or row.get('reset_kind')]
+            if (not account or report['account']!=account or start not in starts
+                    or delete != (start!=starts[-1])):
+                raise ValueError('선택한 주기가 변경되었습니다. 기록을 확인한 뒤 다시 시도하세요.')
+            original=next((r['start'] for r in report.get('cycle_clears',[])
+                           if r['end']==start and r['baseline']!='null'),start)
+            at=starts[starts.index(start)+1] if delete else time.time()
+            baseline=None if delete else {k:rows[-1].get(k) for k in ('used','reset','source','account','window')}
             return dict(home=home,account=account,start=original,end=at,baseline=json.dumps(baseline))
         def save(record):
             self.db.execute('''insert into quota_cycle_clears values(:home,:account,:start,:end,:baseline)

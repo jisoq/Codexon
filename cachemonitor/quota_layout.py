@@ -23,24 +23,37 @@ def configure_quota_layout(panel):
         detach(node)
     panel.manage_button=Button('제외 관리');panel.manage_button.put(fontSize=12,height=30)
     panel.manage_button.hide()
-    actions.addWidget(panel.manage_button)
-    panel.clear_cycle_button=Button('현재 주기 초기화');panel.clear_cycle_button.put(fontSize=12,height=30)
-    panel.clear_cycle_button.setEnabled(bool(panel._view['periods']) and bool(panel.report.get('account')))
+    panel.clear_cycle_button=Button('선택 주기 초기화');panel.clear_cycle_button.put(fontSize=12,height=30)
+    panel.clear_cycle_button.setEnabled(False)
     actions.addWidget(panel.clear_cycle_button)
+    actions.addWidget(panel.manage_button)
+    panel.cycle_clear_message=Text();panel.cycle_clear_message.put(fontSize=12,wrap=True)
+    panel.cycle_clear_message.hide()
+    chart_layout=actions.parent()
+    chart_layout.insertWidget(chart_layout._nodes.index(actions)+1,panel.cycle_clear_message)
     def clear_cycle():
         from .quick_runtime import Confirmation
-        current=next((p for p in panel._view['periods'] if p.get('current')),None)
-        if current is None:return
-        request=dict(start=current['start'],account=panel.report.get('account',''))
-        dialog=Confirmation('현재 주기 초기화','현재 주기의 측정 기록을 지우고 지금부터 다시 측정합니다. 이전 주기 기록은 유지됩니다.',panel)
+        from .quota_view import clock
+        selected=next((p for p in panel._view['periods'] if p['start']==panel.cycle_choice.currentData()),None)
+        if selected is None or not panel.report.get('account') or getattr(panel,'_cycle_clear_pending',False):return
+        delete=not selected['current']
+        request=dict(start=selected['start'],account=panel.report['account'],delete=delete)
+        home=panel.report.get('home')
+        title='선택 주기 삭제' if delete else '선택 주기 초기화'
+        message=('선택한 주기와 측정 기록을 삭제합니다. 이 작업은 되돌릴 수 없습니다.' if delete else
+                 '선택한 주기의 측정 기록을 지우고 지금부터 다시 측정합니다. 이전 주기 기록은 유지됩니다.')
+        dialog=Confirmation(title,formatted('{start} → {end}\n\n{message}',
+            start=clock(selected['start'],True),end=clock(selected['end'],True),message=tr(message)),panel)
         panel.clear_cycle_dialog=dialog
-        dialog.confirm.setText('초기화')
+        dialog.confirm.setText('삭제' if delete else '초기화')
         def finish(result):
-            if not result:return
+            if not result or home!=panel.report.get('home') or request['account']!=panel.report.get('account'):return
             panel._cycle_clear_pending=True;panel.clear_cycle_button.setEnabled(False)
+            panel.cycle_clear_message.hide()
             panel.cycle_clear_requested.emit(request)
         dialog.finished.connect(finish);dialog.open()
     panel.clear_cycle_button.clicked.connect(clear_cycle)
+    panel.render_history()
     build_exclusion_dialog(panel)
     for node in (panel.summary_heading,panel.history_controls,panel.result,panel.cycle_value,panel.lifetime_basis,panel.cycle_basis,panel.conversion):
         detach(node)

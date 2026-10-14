@@ -23,7 +23,9 @@ def history_rows(report, mode, start=None, end=None):
     account=report.get('account')
     identified=account and any(r.get('account')==account and r['window']==mode for r in report.get('history',[]))
     history=report.get('history',[])
-    clears=report.get('cycle_clears',[]) if mode=='weekly' else []
+    edits=[c for c in report.get('cycle_clears',[]) if c['account']==account] if mode=='weekly' else []
+    deletes=sorted((c for c in edits if c['baseline']=='null'),key=lambda c:c['start'])
+    clears=[c for c in edits if c['baseline']!='null']
     if clears:
         clears=sorted((c for c in clears if c['account']==account),key=lambda c:c['start'])
         starts=[c['start'] for c in clears]
@@ -71,6 +73,21 @@ def history_rows(report, mode, start=None, end=None):
         row['label']=f"{clock(row['at'],True)}, 잔여 {row['remaining']:g}%"+(', '+row['markers'][0] if row['markers'] else '')
         if start is None or record['at']>=start:rows.append(row)
         previous=row
+    if deletes:
+        # Classify resets before hiding deleted observations, so surviving cycles
+        # retain their original boundaries even across a removed middle cycle.
+        starts=[c['start'] for c in deletes]
+        kept=[];removed=False
+        for row in rows:
+            index=bisect_right(starts,row['at'])-1
+            if index>=0 and row['at']<deletes[index]['end']:
+                removed=True
+                continue
+            if removed:
+                row={**row,'connect':False,'tracking_continuous':False}
+                removed=False
+            kept.append(row)
+        rows=kept
     return rows
 
 

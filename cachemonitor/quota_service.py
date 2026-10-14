@@ -123,8 +123,8 @@ class QuotaService(QThread):
         self.exclusion_changes.put(('restore', (exclusion_id,), time.monotonic()+self.EXCLUSION_TIMEOUT))
         self.wake.set()
 
-    def clear_current_cycle(self, start, account):
-        self.exclusion_changes.put(('clear_cycle',(start,account),time.monotonic()+self.EXCLUSION_TIMEOUT))
+    def clear_selected_cycle(self, start, account, *, delete=False):
+        self.exclusion_changes.put(('clear_cycle',(start,account,delete),time.monotonic()+self.EXCLUSION_TIMEOUT))
         self.wake.set()
 
     def run(self):
@@ -369,7 +369,7 @@ class QuotaService(QThread):
                         if edit_request is None:
                             operation,arguments,_=exclusions[0]
                             payload=(dict(start=arguments[0],end=arguments[1],reason=arguments[2])
-                                     if operation=='exclude' else dict(start=arguments[0],account=arguments[1])
+                                     if operation=='exclude' else dict(start=arguments[0],account=arguments[1],delete=arguments[2])
                                      if operation=='clear_cycle' else dict(exclusion_id=arguments[0]))
                             identifier=self.report_worker.request(operation,**payload)
                             edit_request=dict(kind=operation,id=identifier,key=None,**payload)

@@ -36,6 +36,27 @@ def test_failed_download_never_launches_installer(tmp_path,monkeypatch):
     assert not list(tmp_path.rglob('*.exe')) and not list(tmp_path.rglob('*.partial'))
 
 
+def test_download_cache_keeps_recent_active_and_unknown_files(tmp_path,monkeypatch):
+    import os
+    from cachemonitor import install_management
+    folders=[]
+    for number in range(5):
+        folder=tmp_path/'downloads'/f'{number:032x}';folder.mkdir(parents=True)
+        setup=folder/'Codexon-Setup.exe';setup.write_bytes(b'installer')
+        os.utime(setup,(100+number,100+number));folders.append(folder)
+    private=tmp_path/'downloads'/('f'*32);private.mkdir()
+    (private/'records.sqlite').write_bytes(b'preserve')
+    monkeypatch.setattr(install_management,'processes_under',lambda root:[
+        dict(ExecutablePath=str(folders[0]/'Codexon-Setup.exe'),CommandLine='')])
+    (tmp_path/'app-update.json').write_text(json.dumps(dict(phase='waiting',installer=str(folders[1]/'Codexon-Setup.exe'))))
+    assert app_update.prune_downloads(tmp_path)==[str(folders[2])]
+    assert all(folder.exists() for folder in (folders[0],folders[1],folders[3],folders[4],private))
+    monkeypatch.setattr(install_management,'processes_under',lambda root:[])
+    (tmp_path/'app-update.json').write_text(json.dumps(dict(phase='complete')))
+    assert set(app_update.prune_downloads(tmp_path))=={str(folders[0]),str(folders[1])}
+    assert (private/'records.sqlite').read_bytes()==b'preserve'
+
+
 def test_verified_release_launches_one_installer_and_preserves_settings(tmp_path,monkeypatch):
     import io
     monkeypatch.setattr(app_update,'VERSION','2026.09.23.9')
