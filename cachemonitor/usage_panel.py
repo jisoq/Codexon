@@ -20,6 +20,7 @@ def value_text(value, metric):
     if metric=='cost':return f'${value:,.2f}'
     if metric=='tps':return f'{value:,.1f}'
     if metric=='calls':return f'{round(value):,}'
+    if value>=1e9:return f'{value/1e9:.2f}B'
     return f'{value/1e6:.2f}M' if value>=1e6 else f'{value/1000:.1f}k' if value>=1000 else f'{value:,}'
 
 
