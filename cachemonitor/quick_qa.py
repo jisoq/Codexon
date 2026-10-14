@@ -21,11 +21,17 @@ def scene_view(host,node):
 def control(host,node):
     import time
     incubation=getattr(host,'_page_incubation',None)
-    deadline=time.monotonic()+5
-    while incubation and incubation.incubatingObjectCount() and time.monotonic()<deadline:
-        QTest.qWait(1)
-    view=scene_view(host,node)
-    return view.property('item')
+    deadline=time.monotonic()+10
+    while True:
+        try:
+            view=scene_view(host,node)
+            item=view.property('item')
+            if item is not None and (incubation is None or not incubation.incubatingObjectCount()):return item
+        except AssertionError:
+            pass
+        if time.monotonic()>=deadline:
+            raise AssertionError(f'Control did not finish rendering: {node.objectName()} ({node.kind}); QML errors: {host.qml_errors}')
+        QTest.qWait(10)
 
 
 def click(host,item,x=None,y=None):
