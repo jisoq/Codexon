@@ -102,6 +102,21 @@ def test_shutdown_failure_rearms_restart(monkeypatch):
         app._windows_restart = previous
 
 
+def test_qml_cache_retains_recent_bytecode_and_foreign_files(tmp_path):
+    from cachemonitor.quick_runtime import trim_qml_cache
+    cache=tmp_path/'qmlcache';cache.mkdir()
+    old=cache/('a'*40+'.qmlc');recent=cache/('b'*40+'.qmlc')
+    old.write_bytes(b'old');recent.write_bytes(b'recent')
+    os.utime(old,(100,100));os.utime(recent,(200,200))
+    foreign=cache/'settings.json';foreign.write_bytes(b'preserve')
+    pending=cache/('c'*40+'.qmlc.tmp');pending.write_bytes(b'pending writer')
+    trim_qml_cache(cache,budget=6)
+    assert not old.exists() and recent.read_bytes()==b'recent'
+    assert foreign.read_bytes()==b'preserve' and pending.read_bytes()==b'pending writer'
+    trim_qml_cache(cache,budget=6)
+    assert recent.read_bytes()==b'recent'
+
+
 def test_software_renderer_uses_cpu_even_with_inherited_d3d_override(tmp_path):
     code = '''
 from cachemonitor.graphics_recovery import use_software_renderer

@@ -3,6 +3,7 @@ from collections import OrderedDict
 import hashlib
 import json
 import math
+import pickle
 from pathlib import Path
 import shutil
 import sqlite3
@@ -132,22 +133,26 @@ class PayloadReader:
         self.contexts = OrderedDict()
         self.context_bytes = 0
 
-    def _template(self, identifier):
+    def _parts(self, identifier):
         cached = self.contexts.get(identifier)
         if cached is not None:
             self.contexts.move_to_end(identifier)
-            return cached[0]
+            return pickle.loads(cached[0])
         stored = self.db.execute('SELECT data FROM tracking_payload_contexts WHERE id=?', (identifier,)).fetchone()
         if not stored:
             raise ValueError('Missing quota payload context')
-        template = _unpack_template(stored[0])
-        weight = len(template) + 192  # ASCII string, mapping entry and scalar key.
-        self.contexts[identifier] = (template, weight)
+        parts = json.loads(_unpack_template(stored[0]))
+        # Only locally parsed JSON is pickled, never bytes read from storage.
+        # Unpacking provides an independent deep copy without parsing the same
+        # JSON keys and values for every observation in a historical replay.
+        prepared = pickle.dumps(parts, protocol=5)
+        weight = len(prepared) + 192  # Immutable bytes, mapping entry and scalar key.
+        self.contexts[identifier] = (prepared, weight)
         self.context_bytes += weight
         while self.context_bytes > CONTEXT_CACHE_BYTES or len(self.contexts) > CONTEXT_CACHE_ENTRIES:
             _, (_, removed) = self.contexts.popitem(last=False)
             self.context_bytes -= removed
-        return template
+        return parts
 
     def decode(self, row):
         data = row['data']
@@ -155,7 +160,7 @@ class PayloadReader:
             return json.loads(data)
         if len(data) > MAX_PAYLOAD_BYTES:
             raise ValueError('Oversized quota observation payload')
-        parts = json.loads(self._template(row['payload_context']))
+        parts = self._parts(row['payload_context'])
         value, changing = parts['data'], json.loads(data[2:])
         if not isinstance(changing, list) or len(parts['slots']) != len(changing):
             raise ValueError('Invalid quota observation payload')

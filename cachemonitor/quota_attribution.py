@@ -7,17 +7,9 @@ from .native_backend import get_native
 class RequestWindows:
     """Index real request bounds once, without changing their attribution rules."""
     def __init__(self,requests):
-        spans=[]
-        for row in requests:
-            start,end=row.get('start'),row.get('end')
-            if start is None:start=end
-            if type(start) not in (int,float) or not math.isfinite(start):continue
-            if end is not None and (type(end) not in (int,float) or not math.isfinite(end) or end<start):continue
-            spans.append((start,float('inf') if end is None else end,row))
-        self.starts=sorted(spans,key=lambda span:span[0])
-        self.ends=sorted(spans,key=lambda span:span[1])
-        self.start_times=[span[0] for span in self.starts]
-        self.end_times=[span[1] for span in self.ends]
+        from .quota_cycles import _PackedRows
+        self.source=requests if isinstance(requests,_PackedRows) else None
+        spans=list(self._spans(requests))
         self._native = None
         native = get_native()
         if native is not None and len(spans) >= 128:
@@ -25,15 +17,43 @@ class RequestWindows:
                 self._native = native.RequestWindows(spans)
             except (ValueError, OverflowError):
                 pass
+        packed_native=self.source is not None and self._native is not None
+        self.starts=self.ends=self.start_times=self.end_times=None
+        if not packed_native:
+            self.starts,self.ends,self.start_times,self.end_times=self._python_index(spans)
+        # Packed evidence stays with its existing owner. The lookup retains
+        # integer locations, not a second decoded copy of every request.
+        self.cache_bytes=(len(spans)*(128 if packed_native else 256)
+                          +sum(len(block)+64 for block in self.source.blocks)
+                          +len(self.source.ends)*36 if self.source is not None else float('inf'))
+
+    def _spans(self, requests):
+        for index,row in enumerate(requests):
+            start,end=row.get('start'),row.get('end')
+            if start is None:start=end
+            if type(start) not in (int,float) or not math.isfinite(start):continue
+            if end is not None and (type(end) not in (int,float) or not math.isfinite(end) or end<start):continue
+            yield (start,float('inf') if end is None else end,index if self.source is not None else row)
+
+    @staticmethod
+    def _python_index(spans):
+        starts=sorted(spans,key=lambda span:span[0])
+        ends=sorted(spans,key=lambda span:span[1])
+        return starts,ends,[span[0] for span in starts],[span[1] for span in ends]
 
     def overlapping(self,start,end):
         if self._native is not None and all(type(t) in (int,float) and math.isfinite(t) and abs(t)<=2**53-1 for t in (start,end)):
-            return iter(self._native.overlapping(start,end))
-        hi=bisect_right(self.start_times,end)
-        lo=bisect_left(self.end_times,start)
-        if hi<=len(self.ends)-lo:
-            return (row for _,until,row in self.starts[:hi] if until>=start)
-        return (row for since,_,row in self.ends[lo:] if since<=end)
+            found=self._native.overlapping(start,end)
+        else:
+            # Unusual query bounds retain Python precision, without a second
+            # permanently retained index beside the ordinary native path.
+            starts,ends,start_times,end_times=(self._python_index(list(self._spans(self.source)))
+                if self.starts is None else (self.starts,self.ends,self.start_times,self.end_times))
+            hi=bisect_right(start_times,end)
+            lo=bisect_left(end_times,start)
+            found=((row for _,until,row in starts[:hi] if until>=start) if hi<=len(ends)-lo else
+                   (row for since,_,row in ends[lo:] if since<=end))
+        return (self.source[index] for index in found) if self.source is not None else iter(found)
 
 
 def merged_ranges(ranges):

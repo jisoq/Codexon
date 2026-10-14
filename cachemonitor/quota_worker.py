@@ -1,5 +1,5 @@
 """Quota accounting in a spawned process, with bounded, coalesced delivery."""
-from collections import OrderedDict, deque
+from collections import Counter, OrderedDict, deque
 import multiprocessing as mp
 import hashlib
 import pickle
@@ -54,6 +54,7 @@ def chart_result(view, selection=None, known_digest=None):
 def compact_report(report, revision, selection=None, known_digest=None):
     from .quota_view import prepare_quota_query
     view = report['view']
+    if '_default_query' not in view:view['_default_query']=prepare_quota_query(report,{})
     summaries = {}
     prepared = {}
     for key, summary in view.get('summaries', {}).items():
@@ -64,7 +65,7 @@ def compact_report(report, revision, selection=None, known_digest=None):
         has_history=any(p.get('_has_history') if p['series'] is None else p['series']['rows'] for p in view['periods']),
         chart=chart_result(view, selection, known_digest),
         periods=[{key:value for key,value in period.items() if key != 'series' and not key.startswith('_')} for period in view['periods']],
-        default_query=prepare_quota_query(report, {}))
+        default_query=view['_default_query'])
     prepared_view.update({
         'tracking_started': (report.get('tracking') or {}).get('started'),
     })
@@ -76,6 +77,7 @@ def compact_report(report, revision, selection=None, known_digest=None):
 
 class QuotaComputation:
     """Own database connections and raw reports only inside the child process."""
+    REQUEST_LOOKUP_BYTES=64*1024*1024
     def __init__(self, path=None, home=None, ledger_factory=None):
         self.path, self.home = path, home
         self.ledger_factory = ledger_factory
@@ -83,6 +85,7 @@ class QuotaComputation:
         self.ledger_generation = 0
         self.reports = OrderedDict()
         self.committed = {}
+        self.request_lookup = None
 
     def _ledger(self):
         if self.ledger is None:
@@ -92,27 +95,71 @@ class QuotaComputation:
         return self.ledger
 
     def _prepare(self, report, history_revision=None, selection=None, known_digest=None):
-        from .quota_view import prepare_quota_view
+        from .quota_view import prepare_quota_view, summary_deadline
         report=dict(report)
         if history_revision is not None:report['_history_revision']=history_revision
         previous=next(reversed(self.reports.values()),None) if self.reports else None
+        requests=None
+        if report.get('tracking') is not None:
+            from .quota_attribution import RequestWindows
+            source=report.get('request_windows',[])
+            if self.request_lookup is not None and self.request_lookup.source is source:
+                requests=self.request_lookup
+            else:
+                self.request_lookup=None
+                requests=RequestWindows(source)
+                if requests.cache_bytes<=self.REQUEST_LOOKUP_BYTES:self.request_lookup=requests
+        else:self.request_lookup=None
         if (previous and report.get('_history_revision') is not None and
                 previous.get('_history_revision')==report['_history_revision']):
             from .quota_cycles import quota_statistics
-            from .quota_attribution import RequestWindows
-            view=previous['view'];summaries={None:view['lifetime']}
+            view=previous['view'];summaries={None:view['lifetime']};summary_until=dict(view.get('_summary_until',{}))
             # Unchanged history only reads the bounded cache; a rolling-window
             # scan must not evict later hits to admit earlier misses.
             statistics_cache=view.get('_statistics_cache',{})
+            before_cycles=previous.get('cycles',[]);after_cycles=report.get('cycles',[])
+            def metadata_key(cycle):
+                return cycle.get('cycle_start'),cycle.get('account'),cycle.get('cycle_end')
+            owners=Counter(metadata_key(cycle) for cycle in before_cycles)
+            metadata_updates={} if len(before_cycles)==len(after_cycles) else None
+            for before,after in zip(before_cycles,after_cycles):
+                if metadata_updates is None:break
+                if before.get('id')!=after.get('id') or before.get('cost_complete_at')!=after.get('cost_complete_at'):
+                    metadata_updates=None;break
+                if before.get('cycle_end')!=after.get('cycle_end'):
+                    key=metadata_key(before)
+                    if owners[key]!=1:metadata_updates=None;break
+                    metadata_updates[key]=after.get('cycle_end')
             earliest=min((cycle['start'] for cycle in report.get('cycles',[])),default=report['at'])
-            requests=RequestWindows(report.get('request_windows',[]))
+            refreshed={}
+            def refresh_metadata(summary):
+                if not metadata_updates:return summary
+                key=id(summary)
+                if key not in refreshed:
+                    refreshed[key]={**summary,'intervals':[
+                        {**row,'cycle_end':metadata_updates[metadata_key(row)]} if metadata_key(row) in metadata_updates else row
+                        for row in summary['intervals']]}
+                return refreshed[key]
+            lifetime=(refresh_metadata(view['lifetime']) if metadata_updates is not None else
+                      quota_statistics(report,include_mode_assumptions=True,_requests=requests,
+                                       _cache=statistics_cache,_cache_readonly=True))
+            summaries[None]=lifetime
             for days in (7,30,90):
                 start=report['at']-days*86400
-                summaries[days]=(view['lifetime'] if start<=earliest else
-                    quota_statistics(report,start,include_mode_assumptions=True,_requests=requests,
-                                     _cache=statistics_cache,_cache_readonly=True))
-            report['view']={**view,'summaries':summaries,'_statistics_cache':statistics_cache}
-        else:report['view'] = prepare_quota_view(report,previous['view'] if previous else None,deferred=True)
+                if metadata_updates is not None and previous['at']<=report['at']<=summary_until.get(days,float('-inf')):
+                    summary=view['summaries'][days]
+                    # Clipped and attributed intervals preserve these parent
+                    # fields. Refresh only the moving end, retaining every
+                    # statistic and the unchanged interval objects.
+                    summaries[days]=refresh_metadata(summary)
+                else:
+                    summaries[days]=(lifetime if start<=earliest else
+                        quota_statistics(report,start,include_mode_assumptions=True,_requests=requests,
+                                         _cache=statistics_cache,_cache_readonly=True))
+                    summary_until[days]=summary_deadline(report,start)+days*86400
+            report['view']={**view,'lifetime':lifetime,'summaries':summaries,'_statistics_cache':statistics_cache,'_summary_until':summary_until}
+            if lifetime is not view['lifetime']:report['view'].pop('_default_query',None)
+        else:report['view'] = prepare_quota_view(report,previous['view'] if previous else None,deferred=True,_requests=requests)
         revision = uuid4().hex
         self.reports[revision] = report
         while len(self.reports) > 2:
@@ -162,7 +209,9 @@ class QuotaComputation:
                     result['value'] = preview_exclusion(report, request['start'], request['end'])
                 else:
                     from .quota_view import prepare_quota_query
-                    result['value'] = prepare_quota_query(report, request['query'])
+                    lookup=self.request_lookup
+                    if lookup is not None and lookup.source is not report.get('request_windows'):lookup=None
+                    result['value'] = prepare_quota_query(report, request['query'],_requests=lookup)
             else:
                 raise ValueError('Unknown quota request: ' + str(kind))
         except Exception as error:
@@ -184,6 +233,7 @@ class QuotaComputation:
         return result
 
     def close(self):
+        self.request_lookup = None
         if self.ledger is not None:
             self.ledger.close()
             self.ledger = None

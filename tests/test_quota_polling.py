@@ -73,6 +73,49 @@ def test_rpc_timeout_records_safe_stage_and_next_fetch_reconnects(tmp_path,monke
     assert all(stream.closed for stream in streams)
 
 
+def test_account_cache_eviction_fetches_exact_values_without_retaining_oversized_results(tmp_path,monkeypatch):
+    monkeypatch.setattr(AccountClient,'_quota_cache',{})
+    monkeypatch.setattr(AccountClient,'CACHE_ACCOUNTS',2)
+    client=AccountClient(tmp_path)
+    client.process=SimpleNamespace(poll=lambda:None)
+    account=[0];calls=[]
+    def rpc(method,params=None):
+        calls.append(method)
+        if method=='account/read':return {'account':{'id':str(account[0])}}
+        return {'rateLimits':{'planType':'pro','primary':{
+            'usedPercent':12.345,'windowDurationMins':10080,'resetsAt':2000}}}
+    monkeypatch.setattr(client,'rpc',rpc)
+    for number in range(3):
+        account[0]=number
+        assert client.fetch()['windows']['weekly']['used_percent']==12.345
+    assert len(client._quota_cache)==2
+    calls.clear();client.fetch()
+    assert calls==['account/read']
+    account[0]=0;calls.clear();client.fetch()
+    assert calls==['account/read','account/rateLimits/read','account/read']
+    monkeypatch.setattr(AccountClient,'CACHE_BYTES',1)
+    account[0]=3
+    assert client.fetch()['windows']['weekly']['used_percent']==12.345
+    assert client._quota_cache=={}
+
+
+def test_hidden_report_cancels_computation_without_pausing_observation_ingress(tmp_path,monkeypatch):
+    service=module.QuotaService(tmp_path/'home',tmp_path/'index.sqlite',live=False)
+    cancellations=[]
+    monkeypatch.setattr(service.report_worker,'set_paused',cancellations.append,raising=False)
+    try:
+        service.set_reports_enabled(False)
+        service.set_reports_enabled(False)
+        assert cancellations==[True] and service.tracking_enabled and not service.paused
+        at=module.time.time()+1
+        assert service.supply_local({'observed_at':at,'windows':{}})
+        assert service.local_observations.get_nowait()['observed_at']==at
+        service.set_reports_enabled(True)
+        assert service.reports_enabled and not service.paused
+    finally:
+        service.stop();service.report_worker.close()
+
+
 def test_shared_local_quota_keeps_its_age_during_account_failure(tmp_path,monkeypatch):
     clock=[1000.0]
     monkeypatch.setattr(module,'time',SimpleNamespace(time=lambda:clock[0],monotonic=lambda:clock[0]))

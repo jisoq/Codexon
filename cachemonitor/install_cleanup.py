@@ -258,5 +258,8 @@ def after_services(services):
                 if not source or Path(source['process']['executable']).resolve()!=exe.resolve():return
                 if not snapshot or time.time()-snapshot.get('ts',0)>30:return
             finally:channel.close()
+        # A protected old process or file cannot be fixed by rewriting this
+        # journal on every healthy status poll. Preserve the deferred receipt
+        # and retry at the next GUI launch, including after an inspection error.
+        services.cleanup_attempted=True
         services.cleanup_report=cleanup(root,exe,services)
-        services.cleanup_attempted=not any(item.get('status')=='deferred' for item in services.cleanup_report.get('items',[]))

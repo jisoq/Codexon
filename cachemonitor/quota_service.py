@@ -61,6 +61,8 @@ class QuotaService(QThread):
         enabled=bool(enabled)
         if enabled!=self.reports_enabled:
             self.reports_enabled=enabled
+            if not enabled and hasattr(self.report_worker,'set_paused'):
+                self.report_worker.set_paused(True)
             self.wake.set()
 
     def supply_local(self, quota):

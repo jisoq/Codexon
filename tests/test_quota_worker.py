@@ -292,13 +292,18 @@ def test_unchanged_report_reuses_attribution_and_moves_rolling_boundary(monkeypa
     monkeypatch.setattr(quota_attribution,'local_request_intervals',counted)
     try:
         engine._prepare(source,history_revision=1)
-        for offset in (5,65):
+        for offset in (5,20,21,65,-1):
             current={**source,'at':now+offset};calls.clear()
             engine._prepare(current,history_revision=1)
             assert len(calls)<=1
             view=next(reversed(engine.reports.values()))['view']
             for days in (7,30,90):
                 assert view['summaries'][days]==quota_statistics(current,current['at']-days*86400,include_mode_assumptions=True)
+        current={**source,'at':now+5,'cycles':[{**cycle,'cycle_end':now+5} for cycle in source['cycles']]}
+        engine._prepare(current,history_revision=1)
+        view=next(reversed(engine.reports.values()))['view']
+        assert view['summaries'][7]==quota_statistics(current,current['at']-7*86400,include_mode_assumptions=True)
+        assert view['lifetime']==quota_statistics(current,include_mode_assumptions=True)
     finally:engine.close()
 
 

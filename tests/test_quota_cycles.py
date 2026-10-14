@@ -201,7 +201,7 @@ def sync(ledger, rows, revision=1, at=300, loading=False):
 
 
 @pytest.mark.parametrize('packed',[False,True])
-def test_history_import_reuses_complete_observations_and_repairs_partial_storage(tmp_path,packed):
+def test_history_import_reuses_complete_observations_and_repairs_partial_storage(tmp_path,packed,monkeypatch):
     import json
     import sqlite3
     from cachemonitor.event_store import EventStore,pack_event
@@ -228,7 +228,9 @@ def test_history_import_reuses_complete_observations_and_repairs_partial_storage
     def contents(store):
         return {table:sorted(tuple(row) for row in store.db.execute('select * from '+table)) for table in tables}
     try:
+        cache_limit=ledger.db.execute('PRAGMA cache_size').fetchone()[0]
         ledger.import_observations(source,'h')
+        assert ledger.db.execute('PRAGMA cache_size').fetchone()[0]==cache_limit
         for value in records:reference.observe('h',{**value,'observed_at':float(value['observed_at'])})
         assert contents(ledger)==contents(reference)
         ledger.close();ledger=QuotaLedger(target)
@@ -253,6 +255,11 @@ def test_history_import_reuses_complete_observations_and_repairs_partial_storage
         ledger.import_observations(source,'h')
         for value in late:reference.observe('h',{**value,'observed_at':float(value['observed_at'])})
         assert contents(ledger)==contents(reference)
+        def failed_import(batch):raise sqlite3.OperationalError('interrupted import')
+        monkeypatch.setattr(ledger,'_import_observation_parts',failed_import)
+        with pytest.raises(sqlite3.OperationalError,match='interrupted import'):
+            ledger.import_observations(source,'h')
+        assert ledger.db.execute('PRAGMA cache_size').fetchone()[0]==cache_limit
     finally:ledger.close();reference.close()
 
 

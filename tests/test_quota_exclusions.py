@@ -207,6 +207,7 @@ def test_edit_validation_preserves_boundaries_without_reading_call_history(tmp_p
         ledger.db.set_trace_callback(statements.append)
         record=ledger.exclude_interval('h',start,end)
         ledger.db.set_trace_callback(None)
+        assert not any('select' in sql.lower() and 'from window_observations' in sql.lower() for sql in statements)
         assert not any('select' in sql.lower() and any(table in sql.lower() for table in
             ('from calls','join calls','from tracking_wire','from tracking_call_boundaries'))
             for sql in statements)

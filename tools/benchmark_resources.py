@@ -129,12 +129,20 @@ def gui(args):
             for companion in (overlay.widget, overlay.shadow, *overlay.chrome):
                 companion.show()
             settle(); stages['all_scenes'] = resources()
+            window.hide()
+            for companion in (overlay.widget, overlay.shadow, *overlay.chrome):companion.hide()
+            settle(); stages['hidden_return'] = resources()
+            window.show()
+            settle(); stages['reopened'] = resources()
             return dict(kind='gui', renderer=str(window.quick.quickWindow().rendererInterface().graphicsApi()),
                         dpr=window.devicePixelRatioF(), stages=stages,
                         qml_errors=sum(len(w.qml_errors) for w in
                                        (window, window.taskbar_quota, overlay.widget, overlay.shadow, *overlay.chrome)))
         finally:
             overlay.stop(); window.quit_app(); settle()
+            from cachemonitor.quick_runtime import release_quick_scenes
+            release_quick_scenes();settle()
+            stages['closed'] = resources()
 
 
 def main():

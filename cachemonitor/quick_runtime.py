@@ -4,7 +4,11 @@ QWidget is used only as the Windows native host (tray/window ownership). Every
 application control and view inside the host is rendered by Qt Quick.
 """
 from pathlib import Path
-from PySide6.QtCore import QObject, Property, Signal, Slot, QUrl, Qt, QTimer, QRectF
+import os
+import re
+import stat
+import sys
+from PySide6.QtCore import QObject, Property, Signal, Slot, QUrl, Qt, QTimer, QRectF, QStandardPaths
 from PySide6.QtGui import QFont, QPainter, QColor, QPen, QImage
 from PySide6.QtQml import qmlRegisterType, QQmlEngine, QQmlContext, QQmlComponent, QQmlIncubationController
 from PySide6.QtQuick import QQuickPaintedItem
@@ -201,11 +205,43 @@ def register_types():
         _registered=True
 
 
+def trim_qml_cache(path, budget=8*1024*1024):
+    """Keep recent regenerable Qt bytecode; never traverse links or other files.
+
+    The complete measured GUI writes less than 1 MiB. This target leaves room
+    for both installed versions and several recompilations. Locked mappings
+    remain until a later launch; cleanup never blocks or starts a timer.
+    """
+    path=Path(path)
+    candidates=[];total=0
+    try:
+        for parent in (path,*path.parents):
+            if parent.is_symlink() or parent.is_junction():return
+        with os.scandir(path) as entries:
+            for position,entry in enumerate(entries):
+                if position>=16384:return  # Bound startup enumeration and metadata.
+                if not re.fullmatch(r'[0-9a-f]{40}\.(qmlc|jsc|mjsc)',entry.name):continue
+                info=entry.stat(follow_symlinks=False)
+                if not stat.S_ISREG(info.st_mode) or getattr(info,'st_file_attributes',0)&0x400:continue
+                total+=info.st_size
+                candidates.append((info.st_mtime_ns,info.st_size,Path(entry.path)))
+        for modified,size,file in sorted(candidates):
+            if total<=budget:break
+            try:
+                current=file.stat(follow_symlinks=False)
+                if (current.st_mtime_ns,current.st_size)!=(modified,size) or getattr(current,'st_file_attributes',0)&0x400:continue
+                file.unlink();total-=size
+            except OSError:pass  # Another process may still map the bytecode.
+    except OSError:pass
+
+
 def shared_engine():
     """Share compiled QML and type data, while each scene owns its context."""
     app=QApplication.instance()
     engine=getattr(app,'_codexon_qml_engine',None)
     if engine is None:
+        if getattr(sys,'frozen',False) and app.applicationName()=='Codexon' and not os.environ.get('QML_DISK_CACHE_PATH'):
+            trim_qml_cache(Path(QStandardPaths.writableLocation(QStandardPaths.CacheLocation))/'qmlcache')
         engine=QQmlEngine(app)
         app._codexon_qml_engine=engine
         import atexit

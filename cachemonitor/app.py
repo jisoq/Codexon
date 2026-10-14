@@ -185,7 +185,7 @@ def main():
         if args.index_path is None:args.index_path=str(Path(smoke_directory.name)/'index.sqlite')
     if not isolated:save_homes(homes)
     if not isolated and not args.verify_handoff:
-        save_homes(homes);save_connection_paths(args.index_path,args.evidence_path,args.quota_path)
+        save_connection_paths(args.index_path,args.evidence_path,args.quota_path)
         from .graphics_recovery import WindowsRestart, restart_arguments
         app._windows_restart = WindowsRestart(restart_arguments(homes,index_path=args.index_path,
             evidence_path=args.evidence_path,quota_path=args.quota_path))

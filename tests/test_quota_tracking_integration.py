@@ -239,6 +239,19 @@ def test_changed_cycle_reuses_closed_accounting_and_matches_full_rebuild(tmp_pat
     finally:reopened.close()
 
 
+def test_packed_interval_boundaries_preserve_values_and_isolate_neighbor_corrections():
+    from cachemonitor.quota_cycles import _PackedRows
+    rows=[dict(uid=str(i),at=float(i),cost=i/100) for i in range(1025)]
+    packed=_PackedRows(rows)
+    for interval in (slice(2,1025),slice(510,514),slice(512,1024),slice(-5,None),slice(None,None,-1)):
+        assert packed[interval]==rows[interval]
+    changed=[dict(row) for row in rows]
+    changed[510]['cost']=99
+    corrected=_PackedRows(changed)
+    assert packed.signature(512,900)==corrected.signature(512,900)
+    assert packed.signature(508,512)!=corrected.signature(508,512)
+
+
 @pytest.mark.parametrize('cache_budget,packed',[(64*1024*1024,False),(1024,False),(64*1024*1024,True),(1,True)])
 def test_input_cache_catches_late_deletes_and_recovers_after_change_ring_overflow(tmp_path,monkeypatch,cache_budget,packed):
     monkeypatch.setattr(QuotaLedger,'INPUT_CACHE_BYTES',cache_budget)
@@ -310,7 +323,8 @@ def test_cached_report_discovers_future_account_membership_in_another_home(tmp_p
     finally:ledger.close()
 
 
-def test_packed_history_rechecks_both_times_of_legacy_window_references(tmp_path):
+def test_packed_history_rechecks_both_times_of_legacy_window_references(tmp_path,monkeypatch):
+    monkeypatch.setattr('cachemonitor.quota_cycles.hash',lambda value:0,raising=False)
     ledger=QuotaLedger(tmp_path/'linked-history.sqlite',pack_history=True)
     try:
         tracking.enable(ledger.db,'h',100)

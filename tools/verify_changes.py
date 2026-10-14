@@ -188,7 +188,7 @@ RULES = (
     ('cachemonitor/qml/Node*.qml', ('shared_ui', 'dashboard', 'details', 'quota_ui', 'settings', 'overlay_render')),
     ('cachemonitor/qml/Main.qml', ('shared_ui', 'window')),
     ('cachemonitor/qml/PaintedScene.qml', ('shared_ui', 'overlay_render', 'quota_ui')),
-    ('cachemonitor/quick_runtime.py', ('shared_ui', 'overlay_controls', 'overlay_render', 'overlay_navigation', 'overlay_windows', 'quota_ui', 'taskbar', 'window', 'translation')),
+    ('cachemonitor/quick_runtime.py', ('shared_ui', 'overlay_controls', 'overlay_render', 'overlay_navigation', 'overlay_windows', 'quota_ui', 'taskbar', 'window', 'translation', 'graphics_recovery')),
     ('tools/benchmark_resources.py', ('quota_math', 'quota_store', 'shared_ui')),
     ('cachemonitor/controls.py', ('shared_ui',)),
     ('cachemonitor/presentation.py', ('shared_ui', 'dashboard', 'overlay_render')),

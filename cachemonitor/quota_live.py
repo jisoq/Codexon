@@ -6,6 +6,7 @@ from pathlib import Path
 import queue
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from decimal import Decimal, InvalidOperation
@@ -90,6 +91,8 @@ class QuotaLookupTimeout(TimeoutError):
 
 class AccountClient:
     ALLOWED = {'initialize', 'account/read', 'account/rateLimits/read'}
+    CACHE_ACCOUNTS = 64
+    CACHE_BYTES = 256*1024
     _quota_cache = {}
     _quota_lock = threading.Lock()
 
@@ -111,6 +114,17 @@ class AccountClient:
 
     def check_cancelled(self):
         if self.cancelled.is_set():raise ConnectionError('Account lookup cancelled')
+
+    def _remember(self, key, quota):
+        def weight(value):
+            if isinstance(value,dict):return sys.getsizeof(value)+sum(weight(k)+weight(v) for k,v in value.items())
+            if isinstance(value,list):return sys.getsizeof(value)+sum(map(weight,value))
+            return sys.getsizeof(value)
+        size=weight(quota)+sys.getsizeof(key)+128
+        self._quota_cache.pop(key,None)
+        if size<=self.CACHE_BYTES:self._quota_cache[key]=(time.monotonic(),quota,size)
+        while len(self._quota_cache)>self.CACHE_ACCOUNTS or sum(entry[2] for entry in self._quota_cache.values())>self.CACHE_BYTES:
+            self._quota_cache.pop(next(iter(self._quota_cache)))
 
     def start(self):
         self.check_cancelled()
@@ -179,6 +193,7 @@ class AccountClient:
                 self.check_cancelled()
                 cached = self._quota_cache.get(key)
                 if cached and time.monotonic()-cached[0]<self.cache_seconds and cached[1]['requested_at']>=self.after:
+                    self._quota_cache.pop(key);self._quota_cache[key]=cached
                     return dict(cached[1])
                 requested_at = time.time()
                 requested_monotonic = time.monotonic()
@@ -190,7 +205,7 @@ class AccountClient:
                     raise RuntimeError('한도 조회 중 계정 변경: 다시 확인합니다')
                 quota = {**normalize_limits(result, received_at, key),
                          'requested_at': requested_at, 'elapsed': elapsed}
-                self._quota_cache[key] = (time.monotonic(), quota)
+                self._remember(key,quota)
                 return quota
         except Exception:
             self.close()

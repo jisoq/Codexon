@@ -209,7 +209,8 @@ def test_service_readiness_and_rollback_gate_cleanup_once(installation,monkeypat
     services.manager=SimpleNamespace(directory=directory,control_lock=directory/'control.lock',health=lambda **kw:{'status':'ok'})
     services.target=SimpleNamespace(enabled=lambda:True,
         capture=lambda h:dict(instance='new',command=[str(exe)]),ready=lambda *args:ready)
-    calls=[];monkeypatch.setattr(cleanup,'cleanup',lambda *args:calls.append(args) or {})
+    calls=[];monkeypatch.setattr(cleanup,'cleanup',lambda *args:calls.append(args) or
+        dict(items=[dict(status='deferred',reason='process-running')]))
     cleanup.after_services(services);cleanup.after_services(services)
     assert len(calls)==expected
 

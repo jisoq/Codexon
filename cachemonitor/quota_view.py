@@ -392,12 +392,24 @@ def prepare_overall(periods, exclusions, *, packed=False):
     return series
 
 
-def prepare_quota_view(report, previous=None, *, deferred=False):
+def summary_deadline(report, start):
+    """A moving lower bound changes totals only after a retained endpoint."""
+    until=float('inf')
+    for cycle in report.get('cycles',[]):
+        boundary=cycle.get('start')
+        if boundary is not None and boundary>=start:until=min(until,boundary)
+        points=cycle.get('endpoints',[])
+        position=bisect_left(points,start,key=lambda point:point[0])
+        if position<len(points):until=min(until,points[position][0])
+    return until
+
+
+def prepare_quota_view(report, previous=None, *, deferred=False, _requests=None):
     from .pricing import usd
     from .quota_exclusions import active_exclusions
     from .quota_attribution import RequestWindows
     exclusions=active_exclusions(report)
-    requests=RequestWindows(report.get('request_windows',[])) if report.get('tracking') is not None else None
+    requests=(_requests if _requests is not None else RequestWindows(report.get('request_windows',[]))) if report.get('tracking') is not None else None
     period_cache=dict((previous or {}).get('_period_cache',{}))
     statistics_cache=dict((previous or {}).get('_statistics_cache',{}))
     prior_periods={p['start']:p for p in (previous or {}).get('periods',[])}
@@ -440,13 +452,14 @@ def prepare_quota_view(report, previous=None, *, deferred=False):
         period['label']=(f"{clock(period['start'])} → {clock(period['end'])}: {usd(period['value'])} ({state})")
     lifetime=quota_statistics(report,include_mode_assumptions=True,_requests=requests,_cache=statistics_cache)
     now=report.get('at')
-    summaries={None:lifetime}
+    summaries={None:lifetime};summary_until={}
     if now is not None:
         earliest=min((cycle['start'] for cycle in report.get('cycles',[])),default=now)
         for days in (7,30,90):
             start=now-days*86400
             summaries[days]=(lifetime if start<=earliest else
                              quota_statistics(report,start,include_mode_assumptions=True,_requests=requests,_cache=statistics_cache))
+            summary_until[days]=summary_deadline(report,start)+days*86400
     all_series=None if deferred else prepare_overall(periods,exclusions)
     overall_parts=periods
     periods=[{k:v for k,v in period.items() if k!='cost_intervals'} for period in periods]
@@ -454,7 +467,7 @@ def prepare_quota_view(report, previous=None, *, deferred=False):
                              if model.get('model') and not model.get('separate')})
     return dict(periods=sorted(periods,key=lambda period:period['start'],reverse=True),overall=all_series,lifetime=lifetime,summaries=summaries,available_models=available_models,_period_cache=period_cache,
                 _overall_parts=overall_parts,_exclusions=exclusions,_statistics_cache=statistics_cache,_history_groups=history_groups,
-                _series_cache=(previous or {}).get('_series_cache',{}),
+                _series_cache=(previous or {}).get('_series_cache',{}),_summary_until=summary_until,
                 five_hour=None if deferred else prepare_series(history_rows(report,'five_hour')))
 
 
@@ -481,14 +494,14 @@ def model_cost_intervals(intervals, selected_model):
     return result
 
 
-def prepare_quota_query(report, query):
+def prepare_quota_query(report, query, *, _requests=None):
     """Compute filter totals and one display page in the aggregation process."""
     view=report.get('view') or prepare_quota_view(report)
     days=query.get('days');start=query.get('start');end=query.get('end')
     model=query.get('model');mode=query.get('mode','all')
     prepared=view.get('summaries',{})
     summary=(prepared[days] if days in prepared and end is None and (days is not None or start is None)
-             else quota_statistics(report,start,end,True))
+             else quota_statistics(report,start,end,True,_requests=_requests))
     intervals=model_cost_intervals(summary['intervals'],model)
     known=[row['model_cost'] for row in intervals if row['model_cost'] is not None] if model is not None else []
     totals=dict(count=len(intervals),calls=sum(row['model_calls'] for row in intervals) if model is not None else 0,

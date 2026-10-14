@@ -54,14 +54,17 @@ def test_native_backend_missing_and_invalid_selection(monkeypatch):
 
 
 def test_request_windows_overlap_order_and_open_ends(native, monkeypatch):
+    from cachemonitor.quota_cycles import _PackedRows
     rows = [dict(uid=str(i), start=i//3, end=None if i%11==0 else i//3+4) for i in range(400)]
     rows[:0] = [dict(uid='positive-zero',start=0.0,end=5),dict(uid='negative-zero',start=-0.0,end=5)]
     rows += [dict(start=True,end=3),dict(start=math.nan,end=4),dict(start=4,end=2)]
     monkeypatch.setenv('CODEXON_CPU_BACKEND','python'); reference = RequestWindows(rows)
     monkeypatch.setenv('CODEXON_CPU_BACKEND','rust'); actual = RequestWindows(rows)
+    packed = RequestWindows(_PackedRows(rows))
     assert actual._native is not None
-    for start,end in ((0,0),(0,10),(40,50),(130,150),(-10,-1),(5,5),(200,201)):
+    for start,end in ((0,0),(0,10),(40,50),(130,150),(-10,-1),(5,5),(200,201),(-math.inf,math.inf),(0,2**54)):
         assert list(actual.overlapping(start,end)) == list(reference.overlapping(start,end))
+        assert list(packed.overlapping(start,end)) == list(reference.overlapping(start,end))
     # Force the end-sorted branch with signed-zero ties and an earlier ending.
     rows = [dict(uid='positive-zero',start=-10,end=0.0),dict(uid='negative-zero',start=-10,end=-0.0)]
     rows += [dict(uid=str(i),start=-10,end=i-1) for i in range(130)]

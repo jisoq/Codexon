@@ -135,16 +135,50 @@ class _PackedRows:
             yield from pickle.loads(zlib.decompress(block))
 
     def __getitem__(self, index):
-        if isinstance(index,slice):return [self[i] for i in range(*index.indices(self.count))]
+        if isinstance(index,slice):
+            start,stop,step=index.indices(self.count)
+            if step!=1:return [self[i] for i in range(start,stop,step)]
+            if start>=stop:return []
+            result=[]
+            for block in range(bisect_right(self.ends,start),bisect_left(self.ends,stop)+1):
+                base=self.ends[block-1] if block else 0
+                result.extend(self._block(block)[max(0,start-base):stop-base])
+            return result
         index=operator.index(index)
         if index<0:index+=self.count
         if not 0<=index<self.count:raise IndexError(index)
         block=bisect_right(self.ends,index)
+        return self._block(block)[index-(self.ends[block-1] if block else 0)]
+
+    def _block(self, block):
         rows=self._cache.pop(block,None)
         if rows is None:rows=pickle.loads(zlib.decompress(self.blocks[block]))
         self._cache[block]=rows
         while len(self._cache)>2:self._cache.pop(next(iter(self._cache)))
-        return rows[index-(self.ends[block-1] if block else 0)]
+        return rows
+
+    def signature(self, start=0, stop=None):
+        """Compare immutable packed inputs without decoding unchanged history.
+
+        Only boundary blocks need decoding. Exclude their neighboring rows so
+        a correction in another interval does not invalidate this interval.
+        """
+        stop=self.count if stop is None else stop
+        digest=hashlib.sha256()
+        if start<stop:
+            first=bisect_right(self.ends,start)
+            base=self.ends[first-1] if first else 0
+            digest.update(pickle.dumps((start-base,stop-start),protocol=5))
+            for index in range(first,bisect_left(self.ends,stop)+1):
+                base=self.ends[index-1] if index else 0
+                if start<=base and stop>=self.ends[index]:
+                    payload=self.blocks[index]
+                else:
+                    payload=json.dumps(self._block(index)[max(0,start-base):stop-base],
+                                       sort_keys=True,separators=(',',':')).encode()
+                digest.update(len(payload).to_bytes(8,'little'))
+                digest.update(payload)
+        return digest.digest()
 
     def __eq__(self, other):
         if self is other:return True
@@ -749,6 +783,7 @@ def quota_value_history(report, rows, *, _requests=None, _cache=None, _statistic
 class QuotaLedger:
     CACHE_KIB=4096
     HISTORY_CACHE_KIB=128*1024
+    IMPORT_CACHE_KIB=64*1024
     INPUT_CACHE_BYTES=64*1024*1024
     REQUEST_CACHE_BYTES=64*1024*1024
     REQUEST_SORT_ROWS=32768
@@ -1328,22 +1363,28 @@ class QuotaLedger:
             return
         from contextlib import closing
         from .event_store import quota_events, unpack_event
-        with closing(sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True, timeout=1)) as db:
-            rows = quota_events(db,home)
-            prepared=[];batch_bytes=0
-            for at,data in rows:
-                data=unpack_event(data)
-                size=len(data.encode('utf8'))
-                if prepared and (len(prepared)>=128 or batch_bytes+size>1024*1024):
-                    self._import_observation_parts(prepared);prepared=[];batch_bytes=0
-                quota=json.loads(data).get('payload',{}).get('rate_limits')
-                if quota:
-                    prepared.append(observation_parts(home,{**quota,'observed_at':at,'source':'history'}))
-                    batch_bytes+=size
-                if batch_bytes>=1024*1024:
-                    self._import_observation_parts(prepared);prepared=[];batch_bytes=0
-            self._import_observation_parts(prepared)
-        self.db.commit()
+        previous_limit=self.db.execute('PRAGMA cache_size').fetchone()[0]
+        self.db.execute(f'PRAGMA cache_size=-{self.IMPORT_CACHE_KIB}')
+        try:
+            with closing(sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True, timeout=1)) as db:
+                rows = quota_events(db,home)
+                prepared=[];batch_bytes=0
+                for at,data in rows:
+                    data=unpack_event(data)
+                    size=len(data.encode('utf8'))
+                    if prepared and (len(prepared)>=128 or batch_bytes+size>1024*1024):
+                        self._import_observation_parts(prepared);prepared=[];batch_bytes=0
+                    quota=json.loads(data).get('payload',{}).get('rate_limits')
+                    if quota:
+                        prepared.append(observation_parts(home,{**quota,'observed_at':at,'source':'history'}))
+                        batch_bytes+=size
+                    if batch_bytes>=1024*1024:
+                        self._import_observation_parts(prepared);prepared=[];batch_bytes=0
+                self._import_observation_parts(prepared)
+            self.db.commit()
+        finally:
+            self.db.execute(f'PRAGMA cache_size={previous_limit}')
+            self.db.execute('PRAGMA shrink_memory')
 
     def _import_observation_parts(self,batch):
         # At most 128 records / 1 MiB of source text, or one oversized record.
@@ -1533,7 +1574,7 @@ class QuotaLedger:
             # reads while consuming less than the discarded row copies at scale.
             previous_limit=self.db.execute('PRAGMA cache_size').fetchone()[0]
             self.db.execute(f'PRAGMA cache_size=-{self.HISTORY_CACHE_KIB}')
-            source=self._history_source_rows(home,cutoff,now)
+            source=self._history_source_rows(home,cutoff,now,filter_references=prefix is None)
             try:
                 rows=(compact(row) for row in source)
                 packed=prefix.with_suffix(cutoff,rows) if prefix is not None else _PackedHistory(rows)
@@ -1581,14 +1622,40 @@ class QuotaLedger:
             return packed
         return list(merge(history,referenced,unreferenced,key=lambda r:(r['at'],r['id'])))
 
-    def _history_source_rows(self, home, cutoff, now):
+    def _history_source_rows(self, home, cutoff, now, *, filter_references=True):
         # A legacy window can share an ID with a reference at a different time.
         # Match the same source range as the ordinary reader before suppressing it.
         referenced='''SELECT 1 FROM weekly_window_refs f JOIN observations p ON p.id=f.observation_id
             WHERE f.window_id=w.id AND p.home=? AND p.at>=? AND p.at<=?'''
         params=(home,cutoff,now,home,cutoff,now)
-        windows=self.db.execute(f'''SELECT w.* FROM window_observations w
-            WHERE w.home=? AND w.at>=? AND w.at<=? AND NOT EXISTS ({referenced}) ORDER BY w.at,w.id''',params)
+        bits=None
+        if filter_references:
+            count=self.db.execute('SELECT count(*) FROM window_observations WHERE home=? AND at>=? AND at<=?',params[:3]).fetchone()[0]
+            references=self.db.execute('SELECT count(*) FROM weekly_window_refs').fetchone()[0] if count else 0
+            if count and count*4>=references:
+                # Two-bit membership rejects impossible reference IDs before
+                # random B-tree probes. Positive results still run the exact
+                # original query, including home and time, so collisions cannot
+                # suppress evidence. At most 8 MiB, with no persistent state.
+                size=min(8*1024*1024,max(1024,1 << max(0,(max(1,references)*2-1).bit_length())))
+                bits=bytearray(size);mask=size*8-1
+                def positions(value):
+                    value=hash(value)
+                    return value&mask,(value>>32)&mask
+                for (identifier,) in self.db.execute('SELECT window_id FROM weekly_window_refs'):
+                    for value in positions(identifier):bits[value>>3]|=1 << (value&7)
+        if bits is None:
+            windows=self.db.execute(f'''SELECT w.* FROM window_observations w
+                WHERE w.home=? AND w.at>=? AND w.at<=? AND NOT EXISTS ({referenced}) ORDER BY w.at,w.id''',params)
+            window_rows=windows
+        else:
+            windows=self.db.execute('SELECT * FROM window_observations WHERE home=? AND at>=? AND at<=? ORDER BY at,id',params[:3])
+            def unreferenced():
+                for row in windows:
+                    possible=all(bits[value>>3] & (1 << (value&7)) for value in positions(row['id']))
+                    if not possible or not self.db.execute(referenced.replace('w.id','?'),(row['id'],*params[:3])).fetchone():
+                        yield row
+            window_rows=unreferenced()
         observations=None
         try:
             observations=self.db.execute(f'''SELECT COALESCE(r.window_id,o.id) AS id,o.home,o.at,o.source,o.account,
@@ -1606,7 +1673,7 @@ class QuotaLedger:
                         AND p.account IS o.account AND p.used IS o.used AND p.reset IS o.reset
                         AND f.window_id IS NOT NULL)))
                 ORDER BY o.at,COALESCE(r.window_id,o.id),r.window_id IS NULL,o.id''',params)
-            yield from merge(windows,observations,key=lambda row:(row['at'],row['id']))
+            yield from merge(window_rows,observations,key=lambda row:(row['at'],row['id']))
         finally:
             windows.close()
             if observations is not None:observations.close()
@@ -1698,6 +1765,16 @@ class QuotaLedger:
 
     def _report(self, home, now=None, *, exclusion_only=False):
         now = time.time() if now is None else now
+        if exclusion_only:
+            cached=getattr(self,'_report_cache',None)
+            if cached and cached['home']==home and cached['at']<=now<cached['until']:
+                revision=self.db.execute('SELECT value FROM report_revision WHERE id=1').fetchone()[0]
+                if revision==cached['revision']:
+                    # Edit validation needs the same immutable observed fields.
+                    # The enclosing snapshot and later data_version check still
+                    # reject a concurrent writer before applying the edit.
+                    return {key:cached['report'][key] for key in
+                            ('home','account','cycle_clears','exclusions','tracking','history')}
         tables = {r[0] for r in self.db.execute("select name from sqlite_master where type='table'")}
         config=self.db.execute('select started from tracking_config where home=?',(home,)).fetchone() if 'tracking_config' in tables else None
         cutoff=config[0] if config else float('-inf')
@@ -1746,7 +1823,7 @@ class QuotaLedger:
                   if 'coverage_issues' in tables else [])
         calls,call_times,request_windows=self._report_calls(scope,cutoff,tracking is not None)
         time_cache={}
-        for group in groups:
+        for group in groups if tracking is None else ():
             if group.get('gap') or group.get('discontinuous'):continue
             separate=set().union(*(json.loads(value) for value in {r['separate'] for r in group['observations']}))
             key=frozenset(separate)
@@ -1811,7 +1888,6 @@ class QuotaLedger:
                      'separate': ALIASES.get(row['model'],row['model']) in separate} for row in rows]
         for i, group in enumerate(groups):
             obs = group['observations']
-            if isinstance(obs,_PackedRows):obs=list(obs)
             marker = group.get('manual_reset')
             if not obs and not marker and group.get('rejected'):
                 obs = [group['rejected'][0],group['rejected'][-1]]
@@ -1826,19 +1902,21 @@ class QuotaLedger:
             if tracking is not None and obs:
                 lo=group['boundary'];hi=cycle_end
                 coverage=min(completed_at,obs[-1]['at']) if completed_at is not None else None
-                signature=({**group,'observations':obs},(next_group['boundary'],next_group['reason'],next_group.get('manual_reset')) if next_group else None,
-                           calls[bisect_right(call_times,lo):bisect_right(call_times,hi)],
+                left,right=bisect_right(call_times,lo),bisect_right(call_times,hi)
+                signature=({**group,'observations':obs.signature() if isinstance(obs,_PackedRows) else obs},(next_group['boundary'],next_group['reason'],next_group.get('manual_reset')) if next_group else None,
+                           calls.signature(left,right) if isinstance(calls,_PackedRows) else calls[left:right],
                            [r for r in tracking.get('pending_responses',[]) if r['start']<=hi and (r['end'] is None or r['end']>=lo)],
                            issues,coverage,tracking['complete'],state['unclassified'] if state else None)
                 # Retain a content identity, not a second owner of every raw
                 # observation and call after the accounting result is built.
-                signature=hashlib.sha256(json.dumps(signature,sort_keys=True,separators=(',',':')).encode()).digest()
+                signature=hashlib.sha256(pickle.dumps(signature,protocol=5)).digest()
                 cached=previous_cycles.get(group['id'])
                 if cached and cached[0]==signature:
                     cycle={**cached[1],'cost_complete_at':completed_at}
                     if not next_group and not cycle['uncertain_gap']:cycle['cycle_end']=now
                     result.append(cycle);cycle_cache[group['id']]=(signature,cycle)
                     continue
+            if isinstance(obs,_PackedRows):obs=list(obs)
             self._cycle_rebuilds+=1
             if not obs:
                 result.append({'id':group['id'], 'reason':group['reason'],
