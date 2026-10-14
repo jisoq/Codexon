@@ -8,6 +8,7 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from cachemonitor.quota_cycles import QuotaLedger, quota_statistics
+from cachemonitor.event_store import event_owners,unpack_event
 
 
 def main():
@@ -34,10 +35,11 @@ def main():
             CREATE TABLE IF NOT EXISTS observation_context(id TEXT PRIMARY KEY,plan TEXT,bucket TEXT);''')
         source=sqlite3.connect(args.rebuild_index.resolve().as_uri()+'?mode=ro',uri=True)
         events=defaultdict(list)
-        for home,tid,path,pos,data in source.execute('select home,tid,path,pos,data from events order by home,tid,ts,path,pos'):
-            event=json.loads(data)
-            event.setdefault('event_id',f'{Path(path).name}:{pos}')
-            events[(home,tid)].append(event)
+        for home,tid in event_owners(source):
+            for path,pos,data in source.execute('select path,pos,data from events where home IS ? and tid IS ? order by ts,path,pos',(home,tid)):
+                event=json.loads(unpack_event(data))
+                event.setdefault('event_id',f'{Path(path).name}:{pos}')
+                events[(home,tid)].append(event)
         source.close()
         views=[]
         for (home,tid),records in events.items():

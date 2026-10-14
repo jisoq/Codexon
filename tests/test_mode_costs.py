@@ -128,6 +128,95 @@ def test_unknown_price_migration_retains_original_mode_and_excludes_base_amount(
     finally:restored.close()
 
 
+@pytest.mark.parametrize('calculation_changed',[False,True])
+def test_verification_metadata_reuses_calculations_but_rate_changes_reprice(tmp_path,calculation_changed):
+    import json
+    from cachemonitor.quota_cycles import PRICE_ID,PRICE_SNAPSHOT
+    source=history();engine=AnalysisEngine();engine.ingest([source])
+    snapshot=dict(homes=['h'],sessions=[source],ts=1000010,index={'loading':False})
+    path=tmp_path/'verified-prices.sqlite';ledger=QuotaLedger(path)
+    ledger.sync(engine,snapshot)
+    prices=json.loads(PRICE_SNAPSHOT)
+    prices.update(verified='earlier',model_verified='earlier',rate_verified={},multiplier_verified='earlier')
+    if calculation_changed:prices['rates']['gpt-6-astra']['input']+=1
+    original_snapshot=json.dumps(prices,sort_keys=True)
+    ledger.db.execute('insert into prices values(?,?)',('earlier-verification',original_snapshot))
+    ledger.db.execute("update calls set price_id='earlier-verification'")
+    ledger.db.execute("insert into cost_archive values('h','retained','prior','[1]',null,'Fast',10.125)")
+    ledger.db.commit()
+    original=[tuple(row) for row in ledger.db.execute('select * from calls order by uid')]
+    retained=[tuple(row) for row in ledger.db.execute('select * from cost_archive')]
+    ledger.close()
+    for _ in range(2):
+        restored=QuotaLedger(path)
+        try:
+            restored.sync(engine,snapshot)
+            current=[tuple(row) for row in restored.db.execute('select * from calls order by uid')]
+            assert [row[:11]+row[12:] for row in current]==[row[:11]+row[12:] for row in original]
+            assert all(row[11]==(PRICE_ID if calculation_changed else 'earlier-verification') for row in current)
+            archive=[tuple(row) for row in restored.db.execute('select * from cost_archive')]
+            assert all(row in archive for row in retained)
+            assert len(archive)==len(retained)+(len(original) if calculation_changed else 0)
+            assert restored.db.execute("select data from prices where id='earlier-verification'").fetchone()[0]==original_snapshot
+            assert restored.db.execute('pragma integrity_check').fetchone()[0]=='ok'
+        finally:restored.close()
+
+
+def _interrupt_price_recalculation(path,control):
+    from cachemonitor import quota_cycles
+    calculate=quota_cycles.token_cost
+    seen=0
+    def interrupt(row):
+        nonlocal seen
+        seen+=1
+        if seen==2:
+            control.send('repricing');control.recv()
+        return calculate(row)
+    quota_cycles.token_cost=interrupt
+    try:
+        ledger=QuotaLedger(path);ledger.close()
+    finally:control.close()
+
+
+def test_price_recalculation_recovers_after_termination(tmp_path):
+    import multiprocessing as mp
+    import sqlite3
+    from contextlib import closing
+    from cachemonitor.quota_cycles import PRICE_ID
+    source=history();engine=AnalysisEngine();engine.ingest([source])
+    path=tmp_path/'interrupted-price.sqlite';ledger=QuotaLedger(path)
+    ledger.sync(engine,dict(homes=['h'],sessions=[source],ts=1000010,index={'loading':False}))
+    ledger.db.execute("update calls set cost=.81,price_id='retained-old-policy'")
+    ledger.db.commit()
+    original=[tuple(row) for row in ledger.db.execute('select * from calls order by uid')]
+    ledger.close()
+    context=mp.get_context('spawn');parent,pipe=context.Pipe()
+    child=context.Process(target=_interrupt_price_recalculation,args=(str(path),pipe))
+    child.start();pipe.close()
+    try:
+        assert parent.poll(15),f'repricing did not start; exit={child.exitcode}'
+        assert parent.recv()=='repricing'
+        with closing(sqlite3.connect(path)) as db:
+            assert db.execute('select * from calls order by uid').fetchall()==original
+            assert db.execute('select count(*) from cost_archive').fetchone()[0]==0
+        child.kill();child.join(10)
+        assert not child.is_alive() and child.exitcode!=0
+        restored=QuotaLedger(path)
+        try:
+            current=list(restored.db.execute('select * from calls order by uid'))
+            assert len(current)==len(original) and all(row['price_id']==PRICE_ID for row in current)
+            assert [row['cost'] for row in current[:5]]==pytest.approx([.405,.405,1.0125,.405,1.0125])
+            assert current[5]['cost'] is None
+            archive=list(restored.db.execute('select * from cost_archive'))
+            assert len(archive)==len(original) and all(row['cost']==.81 for row in archive)
+            assert [tuple(row)[:10] for row in current]==[row[:10] for row in original]
+            assert restored.db.execute('pragma integrity_check').fetchone()[0]=='ok'
+        finally:restored.close()
+    finally:
+        if child.is_alive():child.kill()
+        child.join(10);parent.close()
+
+
 def test_imported_usage_reprices_without_recreating_retired_permissions(tmp_path):
     import json
     import sqlite3

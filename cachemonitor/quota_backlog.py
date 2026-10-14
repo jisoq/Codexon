@@ -1,10 +1,21 @@
 """Bounded, replayable quota observations owned by one home's quota service."""
 import hashlib
 import json
+import os
 from functools import wraps
 from pathlib import Path
 import sqlite3
 import threading
+
+
+def local_wal(path):
+    """WAL needs local shared-memory locking; retain rollback on remote drives."""
+    if os.name!='nt':return False
+    import ctypes
+    kernel=ctypes.WinDLL('kernel32',use_last_error=True)
+    kernel.GetDriveTypeW.argtypes=[ctypes.c_wchar_p]
+    kernel.GetDriveTypeW.restype=ctypes.c_uint
+    return kernel.GetDriveTypeW(str(path.resolve().anchor)) in (2,3,6)
 
 
 def synchronized(method):
@@ -17,12 +28,14 @@ def synchronized(method):
 
 class ObservationBacklog:
     # Keep distinct observations. At capacity, stop their producer instead of
-    # deleting history. SQLite reuses freed pages; its rollback journal is also
-    # bounded by the 16 MiB database ceiling. Only one failed write stays in RAM.
+    # deleting history. Local WAL resets normally retain 128 KiB; a pinned reader
+    # stops further writes at 2 MiB plus the transaction that crossed that limit.
+    # Remote drives retain rollback journaling. Only one failed write stays in RAM.
     MAX_ITEMS = 4096
     MAX_BYTES = 8 * 1024 * 1024
     MAX_ITEM_BYTES = 64 * 1024
     MAX_PAGES = 4096
+    MAX_WAL_BYTES = 2 * 1024 * 1024
     BATCH_SIZE = 32
     CONTROL_RESERVE = 32
 
@@ -30,6 +43,8 @@ class ObservationBacklog:
         path = Path(ledger_path)
         identity = hashlib.sha256(str(home).encode()).hexdigest()[:16]
         self.path = path.with_name(path.name + '.pending-' + identity + '.sqlite')
+        self.wal_path = self.path.with_name(self.path.name+'-wal')
+        self.wal = False
         self.db = None
         self.unsaved = None
         self.issue = ''
@@ -42,8 +57,12 @@ class ObservationBacklog:
             db = sqlite3.connect(self.path, timeout=.02, check_same_thread=False)
             try:
                 db.execute('pragma page_size=4096')
-                db.execute('pragma journal_mode=delete')
+                mode='wal' if local_wal(self.path) else 'delete'
+                self.wal=db.execute('pragma journal_mode='+mode).fetchone()[0]=='wal'
                 db.execute('pragma synchronous=full')
+                if self.wal:
+                    db.execute('pragma wal_autocheckpoint=32')
+                    db.execute('pragma journal_size_limit=131072')
                 db.execute(f'pragma max_page_count={self.MAX_PAGES}')
                 db.execute('create table if not exists pending('
                            'seq integer primary key autoincrement, kind text not null, data blob not null)')
@@ -60,9 +79,20 @@ class ObservationBacklog:
             self.db = db
         return self.db
 
+    def journal_room(self,db):
+        if not self.wal:return
+        try:size=self.wal_path.stat().st_size
+        except FileNotFoundError:return
+        if size<=self.MAX_WAL_BYTES:return
+        # journal_size_limit only applies after reset. A reader that pins old
+        # pages must apply backpressure instead of growing an unbounded WAL.
+        if db.execute('pragma wal_checkpoint(truncate)').fetchone()[0]:
+            raise sqlite3.OperationalError('quota observation checkpoint is waiting for a reader')
+
     def _store(self, kind, encoded):
         db = self.connection()
         try:
+            self.journal_room(db)
             db.execute('begin immediate')
             count, size = db.execute('select items,bytes from budget where id=1').fetchone()
             reserve = self.CONTROL_RESERVE if kind == 'control' else 0
@@ -93,7 +123,9 @@ class ObservationBacklog:
         if not self.flush():
             return False
         try:
-            count, size = self.connection().execute(
+            db=self.connection()
+            self.journal_room(db)
+            count, size = db.execute(
                 'select items,bytes from budget where id=1').fetchone()
             # Reserve room for one maximum-size response before making a request.
             if count >= self.MAX_ITEMS or size + self.MAX_ITEM_BYTES > self.MAX_BYTES:
@@ -137,7 +169,9 @@ class ObservationBacklog:
         if sequence is None:
             self.unsaved = None
         else:
-            with self.connection() as db:
+            db=self.connection()
+            self.journal_room(db)
+            with db:
                 db.execute('delete from pending where seq=?', (sequence,))
 
     @synchronized

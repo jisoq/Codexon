@@ -1,6 +1,5 @@
 """Rebuild a separate ledger; never replace or modify the supplied evidence."""
 import argparse
-from collections import defaultdict
 import json
 from pathlib import Path
 import sqlite3
@@ -9,7 +8,6 @@ import time
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from cachemonitor.quota_cycles import QuotaLedger
 from cachemonitor.index import UsageIndex
-from cachemonitor.core import SessionRegistry
 from cachemonitor.analysis_engine import AnalysisEngine
 
 
@@ -37,13 +35,9 @@ def rebuild(source,index_path,destination):
         for lo in range(1,maximum+1,256):read(lo,min(lo+255,maximum))
         recovered[table]={'read':total,'unreadable_rowids':len(lost)}
     new.db.commit();old.close()
-    index=UsageIndex.__new__(UsageIndex)
-    index.db=sqlite3.connect(index_path.resolve().as_uri()+'?mode=ro',uri=True)
-    index.metadata={(h,s):json.loads(d) for h,s,d in index.db.execute('select home,tid,data from metadata')}
-    index.monitor=SessionRegistry();index.loaded=set();index.turn_states={}
-    index.new_events=defaultdict(list);index.event_tails={};index.rebuild_required=set()
+    index=UsageIndex.for_replay(index_path)
     now=time.time()
-    for key in index.db.execute('select distinct home,tid from events').fetchall():index.rebuild(key,now)
+    for key in index.event_store.owners().fetchall():index.rebuild(key,now)
     sessions=[s.view(now) for s in index.monitor.sessions.values() if s.requests and not s.excluded_title]
     homes=sorted({s['home'] for s in sessions})
     snapshot={'sessions':sessions,'homes':homes,'ts':now,'index':{'loading':False}}
@@ -52,7 +46,7 @@ def rebuild(source,index_path,destination):
     for home in homes:new.import_observations(index_path,home)
     assert new.db.execute('pragma integrity_check').fetchone()[0]=='ok'
     counts={table:new.db.execute('select count(*) from '+table).fetchone()[0] for table in recovered}
-    new.close();index.db.close()
+    new.close();index.close()
     return {'recovered':recovered,'result':counts,'sessions':len(sessions)}
 
 

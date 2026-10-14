@@ -2,9 +2,15 @@
 from datetime import datetime
 import json
 import math
+import pickle
+import zlib
+import hashlib
+import sys
 from bisect import bisect_left, bisect_right
+from heapq import merge
+from itertools import groupby
 from .quota_tracking import ResetTracker, RESET_NAMES, OBSERVATION_FRESHNESS
-from .quota_cycles import quota_statistics, quota_value_history
+from .quota_cycles import _PackedHistory, _PackedRows, quota_statistics, quota_value_history
 from .native_backend import get_native
 
 def clock(ts, full=False):
@@ -12,19 +18,29 @@ def clock(ts, full=False):
 
 
 def history_rows(report, mode, start=None, end=None):
+    return list(_history_rows(report,mode,start,end))
+
+
+def _history_rows(report, mode, start=None, end=None, *, labels=True, _resume=None, _checkpoint=None):
     """Show remaining allowance and only actual full-recovery events."""
-    rows=[]
+    count=0;removed=False
     previous=None
     detector=ResetTracker()
-    controls=iter(sorted((report.get('tracking') or {}).get('controls',[]),key=lambda r:r['at']))
-    control=next(controls,None)
+    controls=sorted((report.get('tracking') or {}).get('controls',[]),key=lambda r:r['at'])
+    control_position=0
     enabled=True
-    by_time={}
     account=report.get('account')
     identified=account and any(r.get('account')==account and r['window']==mode for r in report.get('history',[]))
     history=report.get('history',[])
+    ordered=isinstance(history,_PackedHistory)
+    resume_at=None
+    if _resume is not None:
+        resume_at,(count,removed,previous,state,control_position,enabled)=_resume
+        detector=ResetTracker(*state)
+        history=history.iter_from(resume_at)
     edits=[c for c in report.get('cycle_clears',[]) if c['account']==account] if mode=='weekly' else []
     deletes=sorted((c for c in edits if c['baseline']=='null'),key=lambda c:c['start'])
+    delete_starts=[c['start'] for c in deletes]
     clears=[c for c in edits if c['baseline']!='null']
     if clears:
         clears=sorted((c for c in clears if c['account']==account),key=lambda c:c['start'])
@@ -32,24 +48,38 @@ def history_rows(report, mode, start=None, end=None):
         def retained(record):
             index=bisect_right(starts,record['at'])-1
             return index<0 or record.get('account')!=account or record['at']>clears[index]['end']
-        history=[r for r in history if retained(r)]
-        history += [{**json.loads(c['baseline']),'at':c['end'],'id':'clear:'+str(c['end']),
-                     'measurement_reset':True} for c in clears]
-    for record in history:
-        if identified and record.get('account')!=account:continue
-        if record['window']!=mode:
-            continue
-        # Source metadata must not create duplicate points or event noise.
-        rank={'live':2,'local':1,'history':0}
-        other=by_time.get(record['at'])
-        if other is None or rank.get(record.get('source'),0)>=rank.get(other.get('source'),0):
-            by_time[record['at']]=record
-    for record in sorted(by_time.values(),key=lambda r:r['at']):
+        baselines=[{**json.loads(c['baseline']),'at':c['end'],'id':'clear:'+str(c['end']),
+                    'measurement_reset':True} for c in clears if resume_at is None or c['end']>=resume_at]
+        history=(merge(filter(retained,history),sorted(baselines,key=lambda r:r['at']),key=lambda r:r['at'])
+                 if ordered else [r for r in history if retained(r)]+baselines)
+    candidates=(r for r in history if r['window']==mode and (not identified or r.get('account')==account))
+    rank={'live':2,'local':1,'history':0}
+    def preferred():
+        if ordered:
+            # Packed worker history already has timestamp order. Hold only
+            # the preferred source at one timestamp, not another full copy.
+            for _,records in groupby(candidates,key=lambda r:r['at']):
+                best=None
+                for record in records:
+                    if best is None or rank.get(record.get('source'),0)>=rank.get(best.get('source'),0):best=record
+                yield best
+        else:
+            by_time={}
+            for record in candidates:
+                other=by_time.get(record['at'])
+                if other is None or rank.get(record.get('source'),0)>=rank.get(other.get('source'),0):
+                    by_time[record['at']]=record
+            yield from sorted(by_time.values(),key=lambda r:r['at'])
+    emitted=False
+    for record in preferred():
+        if _checkpoint is not None:
+            before=(count,removed,previous,(detector.remaining,detector.at,detector.scheduled_at,
+                    detector.consumed_at,detector.recovering),control_position,enabled)
         interrupted=False
-        while control is not None and control['at']<=record['at']:
+        while control_position<len(controls) and controls[control_position]['at']<=record['at']:
             interrupted=True
-            enabled=bool(control['enabled'])
-            control=next(controls,None)
+            enabled=bool(controls[control_position]['enabled'])
+            control_position+=1
         if type(record.get('used')) not in (int,float) or not math.isfinite(record['used']) or not 0<=record['used']<=100:
             previous=None
             continue
@@ -68,27 +98,92 @@ def history_rows(report, mode, start=None, end=None):
         elif previous and previous.get('measurement_reset'):
             continuous=False
         row['markers']=[RESET_NAMES[row['reset_kind']]] if row['reset_kind'] else []
-        row['connect']=bool(continuous and rows)
+        row['connect']=bool(continuous and count)
         row['tracking_continuous']=same_tracking
-        row['label']=f"{clock(row['at'],True)}, 잔여 {row['remaining']:g}%"+(', '+row['markers'][0] if row['markers'] else '')
-        if start is None or record['at']>=start:rows.append(row)
+        row['label']=_history_label(row) if labels else None
         previous=row
-    if deletes:
-        # Classify resets before hiding deleted observations, so surviving cycles
-        # retain their original boundaries even across a removed middle cycle.
-        starts=[c['start'] for c in deletes]
-        kept=[];removed=False
-        for row in rows:
-            index=bisect_right(starts,row['at'])-1
+        if start is not None and record['at']<start:continue
+        count+=1
+        if deletes:
+            # Classify resets before hiding deleted observations, so surviving
+            # cycles keep their boundaries across a removed middle cycle.
+            index=bisect_right(delete_starts,row['at'])-1
             if index>=0 and row['at']<deletes[index]['end']:
                 removed=True
                 continue
             if removed:
                 row={**row,'connect':False,'tracking_continuous':False}
                 removed=False
-            kept.append(row)
-        rows=kept
-    return rows
+        if _checkpoint is not None and (not emitted or row['reset_kind']):
+            _checkpoint['value']=(record['at'],before)
+        emitted=True
+        yield row
+
+
+HISTORY_GROUP_CACHE_BYTES=4*1024*1024
+HISTORY_GROUP_CACHE_COUNT=4096
+
+
+def _history_groups(report, previous):
+    """Reuse classified closed periods without another retained row copy."""
+    history=report.get('history')
+    if not isinstance(history,_PackedHistory):return None,None
+    context=hashlib.sha256(pickle.dumps((report.get('account'),
+        (report.get('tracking') or {}).get('controls',[]),report.get('cycle_clears',[]),
+        any(r.get('account')==report.get('account') and r['window']=='weekly' for r in history)),protocol=5)).digest()
+    prior=(previous or {}).get('_history_groups')
+    old=prior if prior and prior['context']==context and prior['groups'] is not None else None
+    reuse=0
+    if old:
+        if old['source'] is history:reuse=len(old['groups'])
+        else:
+            common=0
+            for before,after in zip(old['source'].blocks,history.blocks):
+                if before is not after:break
+                common+=1
+            if common:
+                # A timestamp can straddle blocks. Replay its period and the
+                # formerly current period so resets and duplicate ranks stay exact.
+                changed_at=old['source'].time_ends[common-1]
+                starts=[entry[0] for entry in old['groups']]
+                reuse=max(0,min(len(starts)-1,bisect_left(starts,changed_at)-1))
+    cache=dict(context=context,source=history,groups=[],weight=0)
+    def remember(entry):
+        if cache['groups'] is None:return
+        weight=sys.getsizeof(entry)+sum(sys.getsizeof(value) for value in entry)+128
+        if len(cache['groups'])>=HISTORY_GROUP_CACHE_COUNT or cache['weight']+weight>HISTORY_GROUP_CACHE_BYTES:
+            cache['groups']=None;cache['weight']=0
+        else:cache['groups'].append(entry);cache['weight']+=weight
+    def saved(entry):
+        return dict(start=entry[0],reset_kind=entry[1],partial=entry[2],rows=None,
+            _last_at=entry[3],_signature=entry[5],
+            _load=lambda:_history_rows(report,'weekly',end=entry[3],labels=False,_resume=pickle.loads(entry[4])))
+    def source():
+        if old:
+            for entry in old['groups'][:reuse]:
+                remember(entry)
+                yield saved(entry)
+            if old['source'] is history:return
+        resume=(pickle.loads(old['groups'][reuse][4]) if old and reuse else None)
+        checkpoint={};group=None;state=None
+        def finished(group,state):
+            digest=hashlib.sha256(pickle.dumps(group,protocol=5)).digest()
+            entry=(group['start'],group['reset_kind'],group['partial'],group['rows'][-1]['at'],
+                   pickle.dumps(state,protocol=5),digest)
+            remember(entry)
+            return {**group,'_last_at':entry[3],'_signature':digest}
+        for row in _history_rows(report,'weekly',labels=False,_resume=resume,_checkpoint=checkpoint):
+            if group is None or row['reset_kind']:
+                if group is not None:yield finished(group,state)
+                group=dict(start=row['at'],reset_kind=row['reset_kind'],partial=not bool(row['reset_kind']),rows=[])
+                state=checkpoint['value']
+            group['rows'].append(row)
+        if group is not None:yield finished(group,state)
+    return source(),cache
+
+
+def _history_label(row):
+    return f"{clock(row['at'],True)}, 잔여 {row['remaining']:g}%"+(', '+row['markers'][0] if row['markers'] else '')
 
 
 def observation_label(row, money=False):
@@ -254,18 +349,43 @@ def _prepare_series_python(rows):
                 completed_costs=completed,completed_maximum=completed_maximum)
 
 
-def prepare_overall(periods, exclusions):
+def _period_rows(period):
+    if period['series'] is not None:return period['series']['rows']
+    # Payloads are produced in this process, never loaded from external input.
+    rows=pickle.loads(zlib.decompress(period['_series_payload']))
+    for row in rows:row['label']=_history_label(row)
+    return rows
+
+
+def _period_series(rows, intervals, exclusions):
     from .quota_share import prepare_model_share
-    overall=[];offset_cost=offset_delta=0;resets=[]
-    for i,period in enumerate(periods):
-        for row in period['series']['rows']:
-            cost=offset_cost+(row['cycle_cost'] or 0);delta=offset_delta+row['cycle_delta']
-            overall.append({**row,'reported_remaining':row['remaining'],'remaining':delta,
+    series=prepare_series(rows)
+    series['model_share']=prepare_model_share(series,intervals)
+    series.update(exclusions=exclusions,active_only=True)
+    return series
+
+
+def period_series(period):
+    """Prepare one chart from losslessly packed rows when it is requested."""
+    if period['series'] is not None:return period['series']
+    return _period_series(_period_rows(period),period['_series_intervals'],period['_series_exclusions'])
+
+
+def prepare_overall(periods, exclusions, *, packed=False):
+    from .quota_share import prepare_model_share
+    resets=[]
+    def rows():
+        offset_cost=offset_delta=0
+        for i,period in enumerate(periods):
+            for row in _period_rows(period):
+                cost=offset_cost+(row['cycle_cost'] or 0);delta=offset_delta+row['cycle_delta']
+                yield {**row,'reported_remaining':row['remaining'],'remaining':delta,
                             'period_cost':row['cycle_cost'],'cycle_cost':cost,'cycle_delta':delta,
                             'cycle_value':(offset_cost+row['confirmed_cost'])/(offset_delta+row['confirmed_delta'])*100
-                            if offset_delta+row['confirmed_delta']>0 else None})
-        if period['reset_kind']:resets.append(dict(at=period['start'],label=RESET_NAMES[period['reset_kind']],number=i+1))
-        offset_cost+=period['cost'] or 0;offset_delta+=period['delta']
+                            if offset_delta+row['confirmed_delta']>0 else None}
+            if period['reset_kind']:resets.append(dict(at=period['start'],label=RESET_NAMES[period['reset_kind']],number=i+1))
+            offset_cost+=period['cost'] or 0;offset_delta+=period['delta']
+    overall=_PackedRows(rows()) if packed else list(rows())
     series=prepare_series(overall)
     series['model_share']=prepare_model_share(series,[interval for period in periods for interval in period['cost_intervals']])
     series.update(active_only=True,cumulative=True,resets=resets,exclusions=exclusions)
@@ -274,33 +394,48 @@ def prepare_overall(periods, exclusions):
 
 def prepare_quota_view(report, previous=None, *, deferred=False):
     from .pricing import usd
-    from .quota_share import prepare_model_share
     from .quota_exclusions import active_exclusions
     from .quota_attribution import RequestWindows
     exclusions=active_exclusions(report)
     requests=RequestWindows(report.get('request_windows',[])) if report.get('tracking') is not None else None
     period_cache=dict((previous or {}).get('_period_cache',{}))
     statistics_cache=dict((previous or {}).get('_statistics_cache',{}))
-    rows,periods=quota_value_history(report,history_rows(report,'weekly'),_requests=requests,_cache=period_cache,_statistics_cache=statistics_cache)
     prior_periods={p['start']:p for p in (previous or {}).get('periods',[])}
-    completed=completed_percent_costs(rows)
-    for row,amount in zip(rows,completed):row['completed_cost']=amount
-    times=[r['at'] for r in rows]
-    for i,period in enumerate(periods):
-        lo=bisect_left(times,period['start'])
-        hi=bisect_left(times,periods[i+1]['start']) if i+1<len(periods) else len(rows)
-        own=[row for row in rows[lo:hi] if row['local_observed']]
+    def prepare_period(rows,period,unchanged):
+        if period is None:return
+        prior=prior_periods.get(period['start'])
+        if unchanged:
+            prior=prior or period
+            period.update({k:prior[k] for k in ('series','_series_payload','_series_intervals',
+                '_series_exclusions','_series_signature','_has_history') if k in prior})
+            return
+        completed=completed_percent_costs(rows)
+        for row,amount in zip(rows,completed):row['completed_cost']=amount
+        own=[row for row in rows if row['local_observed']]
         for index,row in enumerate(own):
             if not index or row['local_range']!=own[index-1]['local_range']:row['connect']=False
-        prior=prior_periods.get(period['start'])
-        unchanged=(previous and period_cache.get(period['start']) is previous.get('_period_cache',{}).get(period['start']))
-        if prior and unchanged:
-            period['series']=prior['series']
+        own_exclusions=[r for r in exclusions if r['start']<period['end'] and r['end']>period['start']]
+        if deferred:
+            period.update(series=None,_series_payload=zlib.compress(pickle.dumps(own,protocol=5),1),
+                _series_intervals=period['cost_intervals'],_series_exclusions=own_exclusions,
+                _series_signature=period_cache[period['start']][0],_has_history=bool(own))
         else:
-            period['series']=prepare_series(own)
-            period['series']['model_share']=prepare_model_share(period['series'],period['cost_intervals'])
-            period['series']['exclusions']=[r for r in exclusions if r['start']<period['end'] and r['end']>period['start']]
-            period['series']['active_only']=True
+            period['series']=_period_series(own,period['cost_intervals'],own_exclusions)
+    groups,history_groups=_history_groups(report,previous) if deferred else (None,None)
+    source=None if groups is not None else _history_rows(report,'weekly',labels=False) if deferred else history_rows(report,'weekly')
+    rows,periods=quota_value_history(report,source,_requests=requests,_cache=period_cache,
+        _statistics_cache=statistics_cache,_period_sink=prepare_period if deferred else None,_groups=groups)
+    if not deferred:
+        times=[r['at'] for r in rows]
+        for i,period in enumerate(periods):
+            lo=bisect_left(times,period['start'])
+            hi=bisect_left(times,periods[i+1]['start']) if i+1<len(periods) else len(rows)
+            unchanged=bool(previous and period_cache.get(period['start']) is previous.get('_period_cache',{}).get(period['start']))
+            prepare_period(rows[lo:hi],period,unchanged)
+            if period['series'] is None:period['series']=period_series(period)
+            for key in ('_series_payload','_series_intervals','_series_exclusions','_series_signature','_has_history'):
+                period.pop(key,None)
+    for period in periods:
         state='진행 중' if period['current'] else '종료'
         period['label']=(f"{clock(period['start'])} → {clock(period['end'])}: {usd(period['value'])} ({state})")
     lifetime=quota_statistics(report,include_mode_assumptions=True,_requests=requests,_cache=statistics_cache)
@@ -318,7 +453,8 @@ def prepare_quota_view(report, previous=None, *, deferred=False):
     available_models=sorted({model['model'] for interval in lifetime.get('intervals',[]) for model in interval['models']
                              if model.get('model') and not model.get('separate')})
     return dict(periods=sorted(periods,key=lambda period:period['start'],reverse=True),overall=all_series,lifetime=lifetime,summaries=summaries,available_models=available_models,_period_cache=period_cache,
-                _overall_parts=overall_parts,_exclusions=exclusions,_statistics_cache=statistics_cache,
+                _overall_parts=overall_parts,_exclusions=exclusions,_statistics_cache=statistics_cache,_history_groups=history_groups,
+                _series_cache=(previous or {}).get('_series_cache',{}),
                 five_hour=None if deferred else prepare_series(history_rows(report,'five_hour')))
 
 

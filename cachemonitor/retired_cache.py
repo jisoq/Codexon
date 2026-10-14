@@ -11,6 +11,7 @@ from .observer_state import ProcessLock,read_json
 from .observer_task import ObserverTask
 from .proxy_target import option
 from . import proxy_identity as identity
+from .event_store import index_tables_valid
 
 FLAGS=('--cache-worker','--cache-observe-only')
 MARKER='codexon-cache-control'
@@ -127,7 +128,7 @@ def import_usage(source,index):
     index.parent.mkdir(parents=True,exist_ok=True)
     with closing(sqlite3.connect(index)) as db:
         tables={x[0] for x in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        if tables-{'files','events','metadata','usage_archive'}:raise ValueError('Unexpected usage database')
+        if not index_tables_valid(tables):raise ValueError('Unexpected usage database')
         db.execute('CREATE TABLE IF NOT EXISTS usage_archive(home TEXT,response_id TEXT,data TEXT,PRIMARY KEY(home,response_id))')
         for r in rows:
             row=dict(r);usage=json.loads(row.get('usage') or '{}')

@@ -193,6 +193,14 @@ def test_real_child_prepares_compact_report_and_reuses_raw_evidence_for_preview(
         query=responses.get(timeout=15)
         assert not query.get('error'),query
         assert query['value']['statistics']['delta']==1
+        worker.request('chart',revision=report['worker_revision'],selection='all')
+        whole=responses.get(timeout=15)
+        assert not whole.get('error'),whole
+        from cachemonitor.quota_cycles import _PackedRows
+        from cachemonitor.quota_view import prepare_quota_view
+        series=whole['value']['series']
+        assert isinstance(series['rows'],_PackedRows)
+        assert {k:v for k,v in series.items() if not k.startswith('_')}==prepare_quota_view(source)['overall']
     finally:worker.close()
 
 
@@ -263,6 +271,9 @@ def test_chart_delivery_contains_only_selection_and_reuses_unchanged_digest():
     whole=engine.execute(dict(kind='chart',id=4,key='all',revision=first['worker_revision'],selection='all'))['value']
     assert whole['series']['cumulative']
     assert len(whole['series']['rows'])==7
+    from cachemonitor.quota_view import prepare_quota_view
+    expected=prepare_quota_view(source)['overall']
+    assert {k:v for k,v in whole['series'].items() if not k.startswith('_')}==expected
     assert engine.execute(dict(kind='chart',id=5,key='stale',revision='expired',selection=100))['stale']
 
 

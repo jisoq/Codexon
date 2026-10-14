@@ -20,16 +20,33 @@ def compact_summary(summary):
 def chart_result(view, selection=None, known_digest=None):
     """Transfer one exact chart, or its identity when the receiver already has it."""
     periods = view['periods']
+    digest=None
     if selection != 'all' and not any(p['start'] == selection for p in periods):
         selection = periods[0]['start'] if periods else 'all'
     if selection=='all' and view['overall'] is None:
         from .quota_view import prepare_overall
-        view['overall']=prepare_overall(view['_overall_parts'],view['_exclusions'])
-    source = view['overall'] if selection == 'all' else next(p['series'] for p in periods if p['start'] == selection)
-    digest = source.get('_content_digest')
+        view['overall']=prepare_overall(view['_overall_parts'],view['_exclusions'],packed=True)
+    if selection=='all':source=view['overall']
+    else:
+        from .quota_view import period_series
+        period=next(p for p in periods if p['start']==selection)
+        if period['series'] is not None:source=period['series']
+        else:
+            # Two selected charts stay expanded. Other periods retain only
+            # lossless packed input rows, without unused rendering/model shares.
+            cache=view.setdefault('_series_cache',{})
+            key=(selection,period['_series_signature'])
+            source=cache.pop(key,None)
+            if source is None:source=period_series(period)
+            cache[key]=source
+            while len(cache)>2:cache.pop(next(iter(cache)))
+            # Rebuilt charts can share equal objects differently. Their checked
+            # input signature remains stable across expansion and eviction.
+            digest=period['_series_signature'].hex()
+    if digest is None:digest=source.get('_content_digest')
     if digest is None:
         digest = hashlib.sha256(pickle.dumps(source, protocol=5)).hexdigest()
-        source['_content_digest'] = digest
+    source['_content_digest'] = digest
     return dict(selection=selection, digest=digest,
                 series=None if digest == known_digest else source)
 
@@ -44,9 +61,9 @@ def compact_report(report, revision, selection=None, known_digest=None):
     lifetime = prepared.get(id(view['lifetime'])) or compact_summary(view['lifetime'])
     prepared_view = {key:value for key,value in view.items() if key not in ('overall','periods','five_hour') and not key.startswith('_')}
     prepared_view.update(lifetime=lifetime, summaries=summaries,
-        has_history=any(p['series']['rows'] for p in view['periods']),
+        has_history=any(p.get('_has_history') if p['series'] is None else p['series']['rows'] for p in view['periods']),
         chart=chart_result(view, selection, known_digest),
-        periods=[{key:value for key,value in period.items() if key != 'series'} for period in view['periods']],
+        periods=[{key:value for key,value in period.items() if key != 'series' and not key.startswith('_')} for period in view['periods']],
         default_query=prepare_quota_query(report, {}))
     prepared_view.update({
         'tracking_started': (report.get('tracking') or {}).get('started'),
@@ -70,7 +87,7 @@ class QuotaComputation:
     def _ledger(self):
         if self.ledger is None:
             from .quota_cycles import QuotaLedger
-            self.ledger = (self.ledger_factory or QuotaLedger)(self.path)
+            self.ledger = self.ledger_factory(self.path) if self.ledger_factory else QuotaLedger(self.path,pack_history=True)
             self.ledger_generation += 1
         return self.ledger
 

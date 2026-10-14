@@ -18,6 +18,7 @@ from .quota import clean_limits
 from .model_evidence import EvidenceReader, default_path as evidence_path, FIELDS as MODEL_FIELDS, home_key
 from .usage_paths import index_location
 from .native_backend import get_native
+from .event_store import EventStore, index_tables_valid, pack_event, unpack_event
 
 
 FILE_READ_BUDGET = 16 * 1024 * 1024
@@ -97,6 +98,7 @@ def sanitized(event):
 
 class UsageIndex:
     def __init__(self, homes, path=None, model_evidence_path=None):
+        self.read_only=False
         self.homes = [Path(h).resolve() for h in homes]
         self.path = index_location(path)
         if any(self.path.resolve().is_relative_to(h) for h in self.homes):
@@ -104,20 +106,17 @@ class UsageIndex:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(self.path)
         tables = {r[0] for r in self.db.execute("select name from sqlite_master where type='table'")}
-        if tables - {'files','events','metadata','usage_archive'}:
+        if not index_tables_valid(tables):
             self.db.close()
             raise ValueError('다른 데이터베이스를 앱 색인으로 사용할 수 없습니다')
         self.db.executescript('''
             PRAGMA journal_mode=WAL;
             CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY, home TEXT, tid TEXT,
                 offset INTEGER, size INTEGER, mtime INTEGER, inode TEXT);
-            CREATE TABLE IF NOT EXISTS events(path TEXT, pos INTEGER, home TEXT, tid TEXT,
-                ts REAL, data TEXT, PRIMARY KEY(path,pos));
-            CREATE INDEX IF NOT EXISTS events_session ON events(home,tid,ts,path,pos);
             CREATE TABLE IF NOT EXISTS metadata(home TEXT, tid TEXT, data TEXT, PRIMARY KEY(home,tid));
         ''')
-        if [r[2] for r in self.db.execute('PRAGMA index_info(events_session)')]!=['home','tid','ts','path','pos']:
-            self.db.execute('DROP INDEX events_session')
+        if 'events' in tables and [r[2] for r in self.db.execute('PRAGMA index_info(events_session)')]!=['home','tid','ts','path','pos']:
+            self.db.execute('DROP INDEX IF EXISTS events_session')
             self.db.execute('CREATE INDEX events_session ON events(home,tid,ts,path,pos)')
             self.db.commit()
         self.db.execute('CREATE TABLE IF NOT EXISTS usage_archive(home TEXT,response_id TEXT,data TEXT,PRIMARY KEY(home,response_id))')
@@ -128,8 +127,32 @@ class UsageIndex:
             self.db.execute('update files set offset=0')
             self.db.execute('pragma user_version=4')
             self.db.commit()
+        try:
+            self.event_store=EventStore(self.db,self.path)
+            self.event_store.migrate(time.monotonic()+.025)
+            self._initialize_runtime(model_evidence_path,custom_index=path is not None)
+        except BaseException:
+            self.db.close();raise
+
+    @classmethod
+    def for_replay(cls, path):
+        """Read either event format for diagnostics without migrating evidence."""
+        self=cls.__new__(cls)
+        self.path=Path(path).resolve();self.homes=[];self.read_only=True;self.tier_backfill=False
+        self.db=sqlite3.connect(self.path.as_uri()+'?mode=ro',uri=True)
+        try:
+            tables={r[0] for r in self.db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if not index_tables_valid(tables):raise ValueError('사용량 색인의 형식을 확인하지 못했습니다')
+            self.event_store=EventStore(self.db,self.path,read_only=True)
+            self._initialize_runtime(None,custom_index=True,all_metadata=True)
+            return self
+        except BaseException:
+            self.db.close();raise
+
+    def _initialize_runtime(self, model_evidence_path, *, custom_index, all_metadata=False):
         self.monitor = SessionRegistry()
-        self.metadata = {(r[0],r[1]):json.loads(r[2]) for r in self.db.execute('select home,tid,data from metadata') if r[0] in {str(h) for h in self.homes}}
+        selected_homes={str(h) for h in self.homes}
+        self.metadata = {(r[0],r[1]):json.loads(r[2]) for r in self.db.execute('select home,tid,data from metadata') if all_metadata or r[0] in selected_homes}
         self.files = []
         self.queue = deque()
         self.last_discovery = 0
@@ -138,9 +161,7 @@ class UsageIndex:
         # Retained sanitized events outlive source files. Restore their owners
         # once, after current sources have completed their ordinary validation.
         homes_key=tuple(dict.fromkeys(str(home) for home in self.homes))
-        self.cached_restore=deque(self.db.execute(
-            'SELECT DISTINCT home,tid FROM events WHERE home IN ('+
-            ','.join('?' for _ in homes_key)+') ORDER BY home,tid',homes_key)) if homes_key else deque()
+        self.cached_restore=deque(self.event_store.owners(homes_key)) if homes_key else deque()
         self.bytes_read = 0
         self.errors = []
         self.collection_fault = {}
@@ -171,7 +192,7 @@ class UsageIndex:
         self.activity_rows = []
         self.activity_tokens = {}
         self.model_evidence = EvidenceReader(model_evidence_path if model_evidence_path is not None else
-                                            self.path.with_name('model-evidence.sqlite') if path is not None else evidence_path())
+                                            self.path.with_name('model-evidence.sqlite') if custom_index else evidence_path())
         self.quota_by_home = {}
         self.quota_seeded = False
         self.last_usage_success = None
@@ -179,7 +200,8 @@ class UsageIndex:
         self.lineage = {key:{field:meta[field] for field in LINEAGE_FIELDS if field in meta}
                         for key,meta in self.metadata.items() if meta.get('parent_thread_id')}
         from .usage_archive import ArchiveSessions
-        self.archive = ArchiveSessions(self.db)
+        self.archive = (ArchiveSessions(self.db) if self.db.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='usage_archive' AND type='table'").fetchone() else None)
 
     def observe_quota(self,home,limits,observed):
         if limits is None or not observed: return
@@ -247,6 +269,9 @@ class UsageIndex:
                 self.collection_fault['read_failed']=True
             for folder in ('sessions', 'archived_sessions'):
                 for path in (home / folder).rglob('*.jsonl'):
+                    # Catalog entries were already resolved in this discovery.
+                    # An exact match needs no second filesystem resolution.
+                    if str(path).removeprefix('\\\\?\\') in paths:continue
                     resolved = str(path.resolve()).removeprefix('\\\\?\\')
                     if resolved not in paths:
                         # A filename is not proof of ownership; session_meta supplies the ID.
@@ -288,7 +313,7 @@ class UsageIndex:
                 except (ValueError,TypeError,AttributeError):
                     return False
                 if expected is None or expected[0]!=pos:return False
-                try:stored=json.loads(expected[1])
+                try:stored=json.loads(unpack_event(expected[1]))
                 except (ValueError,TypeError):return False
                 if not isinstance(stored,dict):return False
                 stored.setdefault('event_id',clean['event_id'])
@@ -429,7 +454,7 @@ class UsageIndex:
                         clean['event_id']=f'{p.name}:{pos}'
                         self.new_events[(str(home),tid)].append(((stamp(clean['timestamp']),path,pos),clean))
                         self.db.execute('insert or replace into events values(?,?,?,?,?,?)',
-                            (path, pos, str(home), tid, stamp(clean['timestamp']), encoded))
+                            (path, pos, str(home), tid, stamp(clean['timestamp']), pack_event(encoded)))
                         self.observe_quota(home,clean['payload'].get('rate_limits'),stamp(clean['timestamp']))
                 except (ValueError, TypeError, AttributeError):
                     self.errors.append(f'일부 기록 형식 확인 필요: {str(tid or p.name)[:8]}')
@@ -503,15 +528,15 @@ class UsageIndex:
             if additions:self.event_tails[key]=additions[-1][0]
         else:
             s=Session(key[1],key[0])
-            upper=self.db.execute('select coalesce(max(rowid),0) from events').fetchone()[0]
+            upper=self.event_store.upper()
             def stored_events():
-                cursor=self.db.execute('select data,ts,path,pos from events where home=? and tid=? '
+                cursor=self.db.execute('select data,ts,path,pos from '+self.event_store.replay_table+' where home=? and tid=? '
                     'and rowid<=? order by ts,path,pos',(*key,upper))
                 last_path=None
                 last_name=''
                 try:
                     for row in cursor:
-                        event=json.loads(row[0])
+                        event=json.loads(unpack_event(row[0]))
                         if 'event_id' not in event:
                             if row[2]!=last_path:
                                 last_path=row[2]
@@ -586,6 +611,7 @@ class UsageIndex:
         return tuple(result)
 
     def poll(self, now=None):
+        if self.read_only:raise ValueError('읽기 전용 색인에서는 원본 수집을 실행할 수 없습니다')
         now = now or time.time()
         self.errors = []
         self.collection_fault = {}
@@ -639,6 +665,8 @@ class UsageIndex:
         if not self.queue:
             self.initial = False
             self.restore_cached(now,deadline)
+        if not self.rebuild_jobs and time.monotonic()<deadline:
+            self.event_store.migrate(deadline)
         usage_errors=list(self.errors)
         usage_complete=not self.queue and not self.cached_restore and not self.pending_rebuilds and not self.rebuild_jobs and not usage_errors
         if usage_complete:self.last_usage_success=now
@@ -748,7 +776,7 @@ class UsageIndex:
             view['usage_revision']=self.session_revisions[key]
             views.append(view)
         self.version += bool(changed)
-        views.extend(self.archive.views(now,{str(h) for h in self.homes}))
+        if self.archive is not None:views.extend(self.archive.views(now,{str(h) for h in self.homes}))
         activity_revision = (self.model_evidence.generation,self.model_evidence.revision)
         if activity_revision != self.activity_publication:
             self.activity_rows = list(self.model_evidence.changed_activity.values())
@@ -824,6 +852,6 @@ class UsageIndex:
         self.activity_tokens = {}
         self.source_work.clear()
         self.partial_work.clear()
-        self.archive.clear()
+        if self.archive is not None:self.archive.clear()
         self.model_evidence.close()
         self.db.close()

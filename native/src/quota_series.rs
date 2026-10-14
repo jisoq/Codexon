@@ -1,6 +1,6 @@
 //! Numeric quota chart preparation. Returned indices retain exact source rows.
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyInt, PyList};
+use pyo3::types::{PyDict, PyInt};
 use std::collections::{BTreeSet, HashMap};
 
 struct Row {
@@ -155,11 +155,12 @@ fn calculate(rows: &[Row]) -> Series {
     series
 }
 
-fn parse_rows(py: Python<'_>, rows: &Bound<'_, PyList>, series: bool) -> PyResult<Vec<Row>> {
-    let mut prepared = Vec::with_capacity(rows.len());
+fn parse_rows(py: Python<'_>, rows: &Bound<'_, PyAny>, series: bool) -> PyResult<Vec<Row>> {
+    let mut prepared = Vec::with_capacity(rows.len()?);
     let mut previous: Option<Bound<'_, PyDict>> = None;
     let mut integer_budget = 0.0;
-    for item in rows.iter() {
+    for item in rows.try_iter()? {
+        let item = item?;
         let row = item.cast::<PyDict>()?;
         let reset = flag(row, "reset_kind")?;
         let boundary = match &previous {
@@ -180,13 +181,13 @@ fn parse_rows(py: Python<'_>, rows: &Bound<'_, PyList>, series: bool) -> PyResul
 }
 
 #[pyfunction]
-fn completed_percent_costs(py: Python<'_>, rows: &Bound<'_, PyList>) -> PyResult<Vec<Option<f64>>> {
+fn completed_percent_costs(py: Python<'_>, rows: &Bound<'_, PyAny>) -> PyResult<Vec<Option<f64>>> {
     let prepared = parse_rows(py, rows, false)?;
     Ok(py.detach(move || calculate_completed(&prepared)))
 }
 
 #[pyfunction]
-fn quota_series(py: Python<'_>, rows: &Bound<'_, PyList>) -> PyResult<Py<PyDict>> {
+fn quota_series(py: Python<'_>, rows: &Bound<'_, PyAny>) -> PyResult<Py<PyDict>> {
     let prepared = parse_rows(py, rows, true)?;
     let series = py.detach(move || calculate(&prepared));
     let output = PyDict::new(py);

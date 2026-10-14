@@ -53,7 +53,7 @@ def retained_intervals(cycles, report, clip):
 
 def validate_exclusion(report, start, end, reason=''):
     """Validate bounds against current evidence without rebuilding accounting."""
-    from .quota_view import history_rows
+    from .quota_view import _history_rows
 
     if (type(start) not in (int, float) or type(end) not in (int, float)
             or not math.isfinite(start) or not math.isfinite(end) or start >= end):
@@ -63,15 +63,17 @@ def validate_exclusion(report, start, end, reason=''):
     account = report.get('account') or ''
     if not account:
         raise ValueError('계정을 확인한 뒤 구간을 제외하세요.')
-    rows = history_rows(report, 'weekly')
-    periods = []
-    for row in rows:
+    period=bounds=None;has_start=has_end=False
+    for row in _history_rows(report,'weekly',labels=False):
         if row.get('account') != account:
             continue
-        if not periods or row.get('reset_kind'):
-            periods.append([])
-        periods[-1].append(row['at'])
-    period = next((p for p in periods if start in p and end in p), None)
+        if bounds is None or row.get('reset_kind'):
+            if has_start and has_end:
+                period=bounds;break
+            bounds=[row['at'],row['at']];has_start=has_end=False
+        bounds[1]=row['at']
+        has_start|=row['at']==start;has_end|=row['at']==end
+    if period is None and has_start and has_end:period=bounds
     if period is None:
         raise ValueError('한 주기 안에서 기록된 시작과 종료 시각을 선택하세요.')
     existing = active_exclusions(report)

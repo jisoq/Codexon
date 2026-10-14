@@ -204,9 +204,10 @@ def test_forward_continuous_account_consumption_and_cost_survive_reopen(tmp_path
     ledger.close()
 
 
-def test_changed_cycle_reuses_closed_accounting_and_matches_full_rebuild(tmp_path):
+@pytest.mark.parametrize('packed',(False,True))
+def test_changed_cycle_reuses_closed_accounting_and_matches_full_rebuild(tmp_path,packed):
     path=tmp_path/'incremental.sqlite'
-    ledger=QuotaLedger(path)
+    ledger=QuotaLedger(path,pack_history=packed)
     try:
         tracking.enable(ledger.db,'h',100)
         for at,remaining in ((102,90),(110,80),(120,100),(130,90),(140,100),(150,90)):
@@ -214,14 +215,18 @@ def test_changed_cycle_reuses_closed_accounting_and_matches_full_rebuild(tmp_pat
         activity(ledger,160,{},[107,127,147])
         first=ledger.report('h',160)
         assert ledger._cycle_rebuilds==3
+        prepared=getattr(ledger,'_request_inputs',None)
+        if packed:assert prepared and prepared[-1]<=ledger.REQUEST_CACHE_BYTES
         observe(ledger,152,85)
         appended=ledger.report('h',161)
         assert ledger._cycle_rebuilds==1
+        if packed:assert ledger._request_inputs is prepared
         assert appended==ledger._report('h',161)
         assert appended['cycles'][-1]['cost']==first['cycles'][-1]['cost']
         ledger.db.execute('UPDATE calls SET cost=cost*2 WHERE ts=107');ledger.db.commit()
         corrected=ledger.report('h',162)
         assert ledger._cycle_rebuilds==1
+        if packed:assert ledger._request_inputs is not prepared
         assert corrected==ledger._report('h',162)
         assert corrected['cycles'][-1]['cost']==first['cycles'][-1]['cost']*2
         # A rolled-back revision may be reused by another transaction.
@@ -234,8 +239,12 @@ def test_changed_cycle_reuses_closed_accounting_and_matches_full_rebuild(tmp_pat
     finally:reopened.close()
 
 
-def test_input_cache_catches_late_deletes_and_recovers_after_change_ring_overflow(tmp_path):
-    ledger=QuotaLedger(tmp_path/'changes.sqlite')
+@pytest.mark.parametrize('cache_budget,packed',[(64*1024*1024,False),(1024,False),(64*1024*1024,True),(1,True)])
+def test_input_cache_catches_late_deletes_and_recovers_after_change_ring_overflow(tmp_path,monkeypatch,cache_budget,packed):
+    monkeypatch.setattr(QuotaLedger,'INPUT_CACHE_BYTES',cache_budget)
+    monkeypatch.setattr(QuotaLedger,'REQUEST_CACHE_BYTES',cache_budget)
+    monkeypatch.setattr(tracking,'REPLAY_CACHE_BYTES',cache_budget)
+    ledger=QuotaLedger(tmp_path/'changes.sqlite',pack_history=packed)
     try:
         tracking.enable(ledger.db,'h',100)
         observe(ledger,102,90);observe(ledger,110,80)
@@ -250,8 +259,44 @@ def test_input_cache_catches_late_deletes_and_recovers_after_change_ring_overflo
     finally:ledger.close()
 
 
+def test_tracking_resume_preserves_reset_recovery_and_rechecks_old_edits(tmp_path,monkeypatch):
+    import json
+    ledger=QuotaLedger(tmp_path/'tracking-resume.sqlite',pack_history=True)
+    replayed=[];original=tracking.TrackingState.observe
+    def observe_state(state,value):
+        replayed.append(value.sequence)
+        return original(state,value)
+    monkeypatch.setattr(tracking.TrackingState,'observe',observe_state)
+    def check(now,expected_replay):
+        replayed.clear()
+        actual=ledger.report('h',now)
+        assert len(replayed)==expected_replay
+        assert actual==ledger._report('h',now)
+        return actual
+    try:
+        tracking.enable(ledger.db,'h',100);activity(ledger,101,{})
+        for at,remaining in ((102,70),(104,65),(110,80),(112,85)):observe(ledger,at,remaining)
+        first=check(113,4)
+        # Recovery can raise the same reset's baseline across report refreshes.
+        observe(ledger,114,90)
+        recovered=check(115,1)
+        assert len(recovered['cycles'])==len(first['cycles'])
+        assert recovered['cycles'][0]['start']==114.1
+        observe(ledger,116,89);check(117,1)
+        tracking.enable(ledger.db,'h',120,False);check(121,6)
+        tracking.enable(ledger.db,'h',122,True);observe(ledger,124,88);check(125,7)
+        row=ledger.db.execute('SELECT * FROM tracking_observations ORDER BY received LIMIT 1').fetchone()
+        quota=tracking.quota_payloads.PayloadReader(ledger.db).decode(row);quota['windows']['weekly']['used_percent']=40
+        ledger.db.execute('UPDATE tracking_observations SET data=? WHERE seq=?',(json.dumps(quota),row['seq']))
+        ledger.db.execute('UPDATE observations SET used=40 WHERE at=102.1');ledger.db.commit()
+        check(126,7)
+        ledger.db.execute('DELETE FROM tracking_observations WHERE seq=?',(row['seq'],));ledger.db.commit()
+        check(127,6)
+    finally:ledger.close()
+
+
 def test_cached_report_discovers_future_account_membership_in_another_home(tmp_path):
-    ledger=QuotaLedger(tmp_path/'future-membership.sqlite')
+    ledger=QuotaLedger(tmp_path/'future-membership.sqlite',pack_history=True)
     try:
         for home in ('h','other'):tracking.enable(ledger.db,home,100)
         observe(ledger,110,80)
@@ -262,6 +307,103 @@ def test_cached_report_discovers_future_account_membership_in_another_home(tmp_p
         after=ledger.report('h',now=201)
         assert set(after['tracking']['homes'])=={'h','other'}
         assert after==ledger._report('h',now=201)
+    finally:ledger.close()
+
+
+def test_packed_history_rechecks_both_times_of_legacy_window_references(tmp_path):
+    ledger=QuotaLedger(tmp_path/'linked-history.sqlite',pack_history=True)
+    try:
+        tracking.enable(ledger.db,'h',100)
+        observe(ledger,102,90);observe(ledger,110,80);activity(ledger,111,{})
+        reference=ledger.db.execute('''SELECT r.window_id,r.observation_id FROM weekly_window_refs r
+            JOIN observations o ON o.id=r.observation_id ORDER BY o.at DESC LIMIT 1''').fetchone()
+        ledger.db.execute('INSERT INTO window_observations VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+            (reference['window_id'],'h',101,'history','a','pro','codex','weekly',20,1000000,10080,'[]'))
+        ledger.db.commit()
+        assert 101 not in [r['at'] for r in ledger.report('h',120)['history']]
+        ledger.db.execute('DELETE FROM weekly_window_refs WHERE window_id=?',(reference['window_id'],));ledger.db.commit()
+        deleted=ledger.report('h',121)
+        assert 101 in [r['at'] for r in deleted['history']]
+        assert deleted==ledger._report('h',121)
+        ledger.db.execute('INSERT INTO weekly_window_refs VALUES(?,?)',tuple(reference));ledger.db.commit()
+        restored=ledger.report('h',122)
+        assert 101 not in [r['at'] for r in restored['history']]
+        assert restored==ledger._report('h',122)
+        ledger.db.execute('UPDATE observations SET at=125 WHERE id=?',(reference['observation_id'],));ledger.db.commit()
+        future=ledger.report('h',123)
+        assert 101 in [r['at'] for r in future['history']]
+        assert future==ledger._report('h',123)
+        assert ledger.report('h',126)==ledger._report('h',126)
+    finally:ledger.close()
+
+
+def test_streamed_request_join_preserves_completion_order_and_wire_precedence(tmp_path):
+    ledger=QuotaLedger(tmp_path/'request-joins.sqlite')
+    try:
+        for home,uid,at,cost in [('a','r1',100,1),('b','r1',100,2),('a','r2',200,3),
+                                 ('a','r3',300,4),('a','r4',400,None),('b','r4',400,5),
+                                 ('a','r5',500,6),('a','r6',500,7)]:
+            ledger.db.execute('''INSERT INTO calls(home,uid,sid,ts,model,input,cached,written,output,reasoning,
+                cost,price_id,signature,service_tier) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                (home,uid,'session',at,'test',1,0,0,1,0,cost,'price','signature','Standard'))
+        ledger.db.executemany('INSERT INTO tracking_wire VALUES(?,?,?,?,?,?)',[
+            ('a','01','r2',190,240,'completed'),('a','02','r2',40,50,'completed'),
+            ('a','03','r3',None,None,'created'),('a','04','r3',195,210,'completed'),
+            ('a','05','r2',None,None,'failed'),('a','06','r1',90,210,'completed'),
+            ('a','07','r6',None,None,'created'),('a','08','',400,401,'completed'),
+            ('b','01','r4',390,420,'completed'),('b','02','r1',95,205,'completed')])
+        ledger.db.executemany('INSERT INTO tracking_call_boundaries VALUES(?,?,?)',
+                             [('a','r2',175),('a','r5',450),('a','r6',480)])
+        ledger.db.commit()
+        ledger._input_cache={};ledger._input_changes=[]
+        for scope in (['a'],['a','b']):
+            expected=[('r2','a',50,3,190,190),('r1','a',205 if len(scope)>1 else 210,1,90,90),
+                      ('r3','a',210,4,195,195),
+                      ('r4','b',420,5,390,390) if len(scope)>1 else ('r4','a',400,None,None,None),
+                      ('r5','a',500,6,450,None),('r6','a',500,7,None,None)]
+            windows=[dict(uid='r3',start=195,end=210),dict(uid='r6',start=None,end=None),
+                     dict(uid='r2',start=40,end=50),dict(uid='r1',start=90,end=210)]
+            if len(scope)>1:windows.append(dict(uid='r4',start=390,end=420))
+            for packed in (False,True):
+                ledger._pack_history=packed
+                calls,times,actual_windows=ledger._report_calls(scope,0,True)
+                assert [tuple(row[k] for k in ('uid','home','ts','cost','request_start','local_request_start'))
+                        for row in calls]==expected
+                assert list(times)==[row[2] for row in expected]
+                assert list(actual_windows)==windows
+            # Filtering occurs before completion correction, including a late
+            # completion that moves a retained call before the requested cutoff.
+            calls,_,_=ledger._report_calls(scope,150,True)
+            assert [row['uid'] for row in calls]==['r2','r3','r4','r5','r6']
+    finally:ledger.close()
+
+
+def test_streamed_history_preserves_legacy_duplicates_nulls_and_reference_scope(tmp_path):
+    ledger=QuotaLedger(tmp_path/'history-sources.sqlite')
+    try:
+        observations=[('o100','h',100,10,1000),('o101','h',101,None,None),
+            ('o102a','h',102,15,1000),('o102b','h',102,15,1000),
+            ('o102ref','h',102,30,1000),('o103','h',103,20,1000),
+            ('o103unreferenced','h',103,20,1000),('other','other',105,25,1000)]
+        ledger.db.executemany('INSERT INTO observations VALUES(?,?,?,?,?,?,?,?,?)',
+            [(name,home,at,'history','a',used,reset,10080,'[]') for name,home,at,used,reset in observations])
+        ledger.db.execute('INSERT INTO observation_context VALUES(?,?,?)',('o102ref','pro','codex'))
+        ledger.db.executemany('INSERT INTO weekly_window_refs VALUES(?,?)',
+            [('o102a','o102ref'),('ref103','o103'),('ref103b','o103'),('other-ref','other')])
+        ledger.db.executemany('INSERT INTO window_observations VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',[
+            ('w100','h',100,'history','a','pro','codex','weekly',10,1000,10080,'[]'),
+            ('w101','h',101,'history','a','','','weekly',None,None,10080,'[]'),
+            ('ref103','h',104,'history','a','pro','codex','five_hour',7,500,300,'[]')])
+        ledger.db.commit()
+        tables={row[0] for row in ledger.db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        for start,end,count in ((90,110,7),(104,110,1),(100,103,7),(102,102,3)):
+            ledger._pack_history=False
+            expected=ledger._report_history('h',start,end,tables)
+            ledger._pack_history=True
+            actual=list(ledger._report_history('h',start,end,tables))
+            assert actual==expected and len(actual)==count
+            assert ledger.db.execute('PRAGMA cache_size').fetchone()[0]==-ledger.CACHE_KIB
+            if start==102:assert [row['used'] for row in actual if row['id']=='o102a']==[30,15]
     finally:ledger.close()
 
 

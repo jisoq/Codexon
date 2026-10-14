@@ -8,6 +8,87 @@ from cachemonitor.quota_cycles import QuotaLedger, estimate, split_cycles, quota
 from cachemonitor.quota_panel import QuotaPanel
 
 
+def _interrupt_archive_compaction(path, control, point):
+    QuotaLedger.ARCHIVE_COMPACTION_ROWS=2
+    ledger=QuotaLedger(path)
+    def interrupt(sql):
+        target='UPDATE cost_archive_progress' if point=='copy' else 'DROP TABLE cost_archive'
+        if sql.startswith(target):
+            control.send('uncommitted')
+            control.recv()
+    ledger.db.set_trace_callback(interrupt)
+    try:
+        while ledger._archive_compaction_pending:
+            ledger._compact_cost_archive()
+    finally:
+        ledger.close();control.close()
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize('point',['copy','swap'])
+def test_price_history_compaction_survives_kill_and_concurrent_append(tmp_path,monkeypatch,point):
+    import multiprocessing as mp
+    import sqlite3
+    path=tmp_path/'archive.sqlite'
+    rows=[('h',f'r{i}','old',f'[ {i}, "model" ]',i+.25,'Fast',100+i+.125) for i in range(5)]
+    with sqlite3.connect(path) as db:
+        db.execute('create table cost_archive(home text,uid text,price_id text,signature text,cost real,service_tier text,at real,primary key(home,uid,price_id,signature))')
+        db.executemany('insert into cost_archive values(?,?,?,?,?,?,?)',rows)
+    context=mp.get_context('spawn');parent,pipe=context.Pipe()
+    child=context.Process(target=_interrupt_archive_compaction,args=(str(path),pipe,point))
+    child.start();pipe.close()
+    try:
+        assert parent.poll(15),f'archive copy did not reach interruption; exit={child.exitcode}'
+        assert parent.recv()=='uncommitted'
+        with sqlite3.connect(path) as db:
+            assert db.execute('select * from cost_archive order by uid').fetchall()==rows
+        child.kill();child.join(10)
+        assert not child.is_alive() and child.exitcode!=0
+        # An old writer can append while a new process resumes the copy.
+        extra=('h','r5','old','[5]',8.75,'Slow',122.375)
+        with sqlite3.connect(path) as db:
+            db.execute('insert into cost_archive values(?,?,?,?,?,?,?)',extra)
+        rows.append(extra)
+        monkeypatch.setattr(QuotaLedger,'ARCHIVE_COMPACTION_ROWS',2)
+        ledger=QuotaLedger(path)
+        try:
+            for _ in range(4):ledger._compact_cost_archive()
+            assert not ledger._archive_compaction_pending
+            assert [tuple(r) for r in ledger.db.execute('select * from cost_archive order by uid')]==rows
+            assert ledger.db.execute('pragma integrity_check').fetchone()[0]=='ok'
+            assert not ledger.db.execute("select name from sqlite_master where name in ('cost_archive_progress','cost_archive_packing')").fetchall()
+            with ledger.db:ledger.db.execute('insert or ignore into cost_archive values(?,?,?,?,?,?,?)',extra)
+            assert ledger.db.execute('select count(*) from cost_archive').fetchone()[0]==len(rows)
+        finally:ledger.close()
+    finally:
+        if child.is_alive():child.kill()
+        child.join(10);parent.close()
+
+
+def test_price_history_compaction_defers_for_new_records_when_space_is_low(tmp_path,monkeypatch):
+    import sqlite3
+    import shutil
+    path=tmp_path/'low-space.sqlite'
+    with sqlite3.connect(path) as db:
+        db.execute('create table cost_archive(home text,uid text,price_id text,signature text,cost real,service_tier text,at real,primary key(home,uid,price_id,signature))')
+        db.execute("insert into cost_archive values('h','r1','old','[1]',1.25,'Fast',100.125)")
+    free=[0]
+    monkeypatch.setattr(shutil,'disk_usage',lambda path:SimpleNamespace(free=free[0]))
+    ledger=QuotaLedger(path)
+    try:
+        assert ledger._archive_compaction_pending
+        assert not ledger.db.execute("select name from sqlite_master where name='cost_archive_packing'").fetchone()
+        ledger.observe('h',quota(100,10))
+        with ledger.db:ledger.db.execute("insert into cost_archive values('h','r2','old','[2]',2.5,'Slow',101.25)")
+        expected=[tuple(r) for r in ledger.db.execute('select * from cost_archive order by uid')]
+        free[0]=1024**3
+        ledger._compact_cost_archive()
+        assert not ledger._archive_compaction_pending
+        assert [tuple(r) for r in ledger.db.execute('select * from cost_archive order by uid')]==expected
+        assert len(ledger.report('h',200)['history'])==1
+    finally:ledger.close()
+
+
 def test_future_boundary_lookup_skips_past_calls_from_other_homes(tmp_path):
     ledger=QuotaLedger(tmp_path/'future.sqlite')
     try:
@@ -119,19 +200,29 @@ def sync(ledger, rows, revision=1, at=300, loading=False):
     ledger.sync(engine, {'homes': ['h'], 'sessions': [{'home': 'h'}], 'ts': at, 'index': {'loading': loading}})
 
 
-def test_history_import_reuses_complete_observations_and_repairs_partial_storage(tmp_path):
+@pytest.mark.parametrize('packed',[False,True])
+def test_history_import_reuses_complete_observations_and_repairs_partial_storage(tmp_path,packed):
     import json
     import sqlite3
+    from cachemonitor.event_store import EventStore,pack_event
     source=tmp_path/'index.sqlite';target=tmp_path/'quota.sqlite'
     records=[quota(100+n,n/100,source='history') for n in range(385)]
     records[0]['windows']['five_hour']={'used_percent':2,'window_minutes':300}
     records.append({**records[0],'separate_models':[{'model':'different'}]})
     records.append({'windows':{'weekly':{'used_percent':5}},'observed_at':700,'source':'history'})
+    position=0
     def source_rows(values):
-        return [('h',value['observed_at'],json.dumps({'payload':{'rate_limits':value}})) for value in values]
+        nonlocal position
+        rows=[('h',value['observed_at'],json.dumps({'payload':{'rate_limits':value}})) for value in values]
+        if not packed:return rows
+        result=[('retained',position+i,home,'session',at,pack_event(data)) for i,(home,at,data) in enumerate(rows)]
+        position+=len(rows)
+        return result
+    insert='insert into events values('+','.join('?' for _ in range(6 if packed else 3))+')'
     with sqlite3.connect(source) as db:
-        db.execute('create table events(home text,ts real,data text)')
-        db.executemany('insert into events values(?,?,?)',source_rows(records))
+        if packed:EventStore(db,source)
+        else:db.execute('create table events(home text,ts real,data text)')
+        db.executemany(insert,source_rows(records))
     ledger=QuotaLedger(target);reference=QuotaLedger(tmp_path/'reference.sqlite')
     tables=('observations','observation_context','window_observations','weekly_window_refs')
     def contents(store):
@@ -158,7 +249,7 @@ def test_history_import_reuses_complete_observations_and_repairs_partial_storage
         ledger.import_observations(source,'h')
         assert contents(ledger)==contents(reference)
         late=[quota(90,3,source='history'),quota(102,99,source='history')]
-        with sqlite3.connect(source) as db:db.executemany('insert into events values(?,?,?)',source_rows(late))
+        with sqlite3.connect(source) as db:db.executemany(insert,source_rows(late))
         ledger.import_observations(source,'h')
         for value in late:reference.observe('h',{**value,'observed_at':float(value['observed_at'])})
         assert contents(ledger)==contents(reference)
@@ -167,7 +258,7 @@ def test_history_import_reuses_complete_observations_and_repairs_partial_storage
 
 @pytest.mark.parametrize('observations',[128,2048])
 def test_report_reuses_history_across_heartbeat_and_invalidates_late_observation(tmp_path,monkeypatch,observations):
-    ledger=QuotaLedger(tmp_path/'quota.sqlite')
+    ledger=QuotaLedger(tmp_path/'quota.sqlite',pack_history=observations==2048)
     try:
         now=observations+200
         sync(ledger,[row()],at=now)
@@ -187,6 +278,10 @@ def test_report_reuses_history_across_heartbeat_and_invalidates_late_observation
         ledger.observe('h',quota(now-1,32,reset=10000))
         changed=ledger.report('h',now+1)
         assert len(builds)==2 and changed!=fresh
+        if observations==2048:
+            ledger.observe('h',quota(100+observations//2,25,reset=10000))
+            changed=ledger.report('h',now+1)
+            assert changed==original('h',now+1)
         # Cached reads cannot survive rollback with a reused revision number.
         ledger.db.execute('update observations set used=50 where at=100')
         ledger.report('h',now+1);ledger.db.rollback()

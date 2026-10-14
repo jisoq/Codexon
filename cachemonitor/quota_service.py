@@ -4,7 +4,6 @@ import threading
 import time
 import queue
 import sqlite3
-import json
 from collections import deque
 
 from PySide6.QtCore import QThread, Signal
@@ -16,6 +15,7 @@ from .quota_polling import QuotaPolling
 from .quota_diagnostics import record_failure, storage_issue
 from .quota_worker import QuotaWorker
 from .quota_backlog import ObservationBacklog
+from .quota_payloads import PayloadReader
 
 
 class QuotaService(QThread):
@@ -167,8 +167,9 @@ class QuotaService(QThread):
                 elif kind == 'failure':
                     tracking_store.failed_observation(ledger.db, self.home, value)
                 else:
-                    ledger.observe(self.home, value)
-                    if kind == 'quota':tracking_store.observe(ledger.db, self.home, value)
+                    with ledger.db:
+                        ledger.observe(self.home, value,commit=False)
+                        if kind == 'quota':tracking_store.observe(ledger.db, self.home, value)
                 pending.acknowledge(sequence)
                 if time.monotonic() >= deadline:break
 
@@ -295,8 +296,8 @@ class QuotaService(QThread):
                         stage = 'recover observations'
                         save_pending()
                         if paused and latest is None:
-                            saved=ledger.db.execute('select data from tracking_observations where home=? order by received desc limit 1',(self.home,)).fetchone()
-                            if saved:latest=json.loads(saved[0])
+                            saved=ledger.db.execute('select * from tracking_observations where home=? order by received desc limit 1',(self.home,)).fetchone()
+                            if saved:latest=PayloadReader(ledger.db).decode(saved)
                         control = ledger.db.execute(
                             'select at from tracking_controls where home=? order by at desc limit 1',
                             (self.home,)).fetchone()
@@ -318,8 +319,10 @@ class QuotaService(QThread):
                         storage_failed(exc)
                 with self.ingress_lock:
                     tracking_at_request=self.tracking_enabled and not self.paused
-                    can_observe = not (self.observation_issue or self.control_issue) and (not tracking_at_request or pending.available())
-                if self.live and can_observe and polling.ready(time.monotonic()):
+                    can_observe = (self.live and polling.ready(time.monotonic())
+                        and not (self.observation_issue or self.control_issue)
+                        and (not tracking_at_request or pending.available()))
+                if can_observe:
                     try:
                         fetched = client.fetch()
                         with self.ingress_lock:

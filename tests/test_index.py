@@ -4,8 +4,72 @@ from pathlib import Path
 import pytest
 
 from cachemonitor.index import UsageIndex
+from cachemonitor.event_store import EventStore, pack_event, unpack_event
 from cachemonitor.analytics import analyze
 from test_core import event, usage, fixture_home, TID
+
+
+def _interrupted_event_migration(path, control, point):
+    import cachemonitor.event_store as storage
+    storage.MIGRATION_ROWS=2
+    db=sqlite3.connect(path);db.execute('PRAGMA journal_mode=WAL')
+    store=EventStore(db,path)
+    def stop(sql):
+        if (point=='copy' and sql.startswith('DELETE FROM events_legacy WHERE rowid=') or
+                point=='finish' and sql=='DROP TABLE events_legacy'):
+            control.send(point);control.recv()
+    db.set_trace_callback(stop)
+    try:
+        while store.pending:
+            store.migrate()
+            if point=='committed':break
+        if point=='committed':control.send(point);control.recv()
+    finally:db.close();control.close()
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize('point',['copy','committed','finish'])
+def test_event_packing_recovers_after_kill_and_preserves_replacement_order(tmp_path,monkeypatch,point):
+    import multiprocessing as mp
+    from contextlib import closing
+    from types import SimpleNamespace
+    import cachemonitor.event_store as storage
+    path=tmp_path/'legacy.sqlite'
+    rows=[('retained',n,'home','session',100+n+.125,json.dumps({'seq':n,'text':'기록'*128},ensure_ascii=False)) for n in range(6)]
+    with closing(sqlite3.connect(path)) as db,db:
+        db.execute('CREATE TABLE events(path TEXT,pos INTEGER,home TEXT,tid TEXT,ts REAL,data TEXT,PRIMARY KEY(path,pos))')
+        db.executemany('INSERT INTO events VALUES(?,?,?,?,?,?)',rows)
+    context=mp.get_context('spawn');parent,pipe=context.Pipe()
+    child=context.Process(target=_interrupted_event_migration,args=(str(path),pipe,point))
+    child.start();pipe.close()
+    try:
+        assert parent.poll(15),f'event migration did not reach interruption; exit={child.exitcode}'
+        assert parent.recv()==point
+        child.kill();child.join(10)
+        assert not child.is_alive() and child.exitcode!=0
+        with closing(sqlite3.connect(path)) as db:
+            store=EventStore(db,path);before=store.upper()
+            actual=lambda:[(*r[:5],unpack_event(r[5])) for r in db.execute('SELECT * FROM events ORDER BY path,pos')]
+            assert actual()==rows
+            replacement=('retained',3,'other','other-session',150.75,rows[3][-1])
+            extra=('retained',99,'home','session',199.25,rows[0][-1])
+            with db:
+                for row in (replacement,extra):db.execute('INSERT OR REPLACE INTO events VALUES(?,?,?,?,?,?)',(*row[:5],pack_event(row[5])))
+            rows[3]=replacement;rows.append(extra)
+            assert store.upper()>before
+            assert db.execute('SELECT count(*) FROM event_rows WHERE rowid<=?',(before,)).fetchone()[0]==5
+            with monkeypatch.context() as patch:
+                patch.setattr(storage.shutil,'disk_usage',lambda path:SimpleNamespace(free=0))
+                assert store.migrate()==0 and actual()==rows
+            monkeypatch.setattr(storage,'MIGRATION_ROWS',2)
+            for _ in range(5):store.migrate()
+            assert not store.legacy and not store.pending
+            assert actual()==rows
+            assert list(store.owners(['home','other']))==[('home','session'),('other','other-session')]
+            assert db.execute('PRAGMA integrity_check').fetchone()[0]=='ok'
+    finally:
+        if child.is_alive():child.kill()
+        child.join(10);parent.close()
 
 
 def finish(index, now=10010):
@@ -14,6 +78,38 @@ def finish(index, now=10010):
         if not result['index']['loading']:
             return result
     raise AssertionError('index did not finish')
+
+
+@pytest.mark.parametrize('legacy',[False,True])
+def test_stored_replay_preserves_source_and_supports_both_event_formats(tmp_path,legacy):
+    from contextlib import closing
+    home,log=fixture_home(tmp_path);path=tmp_path/'index.sqlite'
+    fields=('home','sid','key','ts','model','service_tier','input','cached','written','output','reasoning','cost')
+    def values(sessions):return [tuple(row.get(key) for key in fields) for row in analyze(sessions)['responses']]
+    index=UsageIndex([home],path)
+    try:expected=values(finish(index)['sessions'])
+    finally:index.close()
+    if legacy:
+        destination=tmp_path/'legacy.sqlite'
+        with closing(sqlite3.connect(path)) as source,closing(sqlite3.connect(destination)) as target,target:
+            for name in ('files','metadata','usage_archive'):
+                target.execute(source.execute('SELECT sql FROM sqlite_master WHERE name=?',(name,)).fetchone()[0])
+                rows=source.execute('SELECT * FROM '+name).fetchall()
+                if rows:target.executemany('INSERT INTO '+name+' VALUES('+','.join('?' for _ in rows[0])+')',rows)
+            target.execute('CREATE TABLE events(path TEXT,pos INTEGER,home TEXT,tid TEXT,ts REAL,data TEXT,PRIMARY KEY(path,pos))')
+            target.executemany('INSERT INTO events VALUES(?,?,?,?,?,?)',
+                [(*row[:5],unpack_event(row[5])) for row in source.execute('SELECT * FROM events')])
+        path=destination
+    log.unlink();before=path.read_bytes()
+    reader=UsageIndex.for_replay(path)
+    try:
+        for key in reader.event_store.owners().fetchall():reader.rebuild(key,10010)
+        assert values([session.view(10010) for session in reader.monitor.sessions.values()])==expected
+        with pytest.raises(sqlite3.OperationalError,match='readonly'):
+            reader.db.execute("UPDATE metadata SET data='{}'")
+        with pytest.raises(ValueError,match='읽기 전용'):reader.poll(10010)
+    finally:reader.close()
+    assert path.read_bytes()==before
 
 
 def test_large_unfinished_event_obeys_read_budget_and_resumes_without_idle_rereads(tmp_path):
@@ -355,14 +451,16 @@ def test_top_level_compaction_is_indexed_and_backfilled_without_private_payload(
     for legacy in (False,True):
         if legacy:
             with sqlite3.connect(cache) as db:
-                db.execute("DELETE FROM events WHERE data LIKE '%compacted%'")
+                for name,pos,data in db.execute('SELECT path,pos,data FROM events').fetchall():
+                    if json.loads(unpack_event(data)).get('type')=='compacted':
+                        db.execute('DELETE FROM events WHERE path=? AND pos=?',(name,pos))
                 db.execute('PRAGMA user_version=3')
         index=UsageIndex([home],cache)
         try:
             value=finish(index)
             history=analyze(value['sessions'])['responses']
             assert next(r for r in history if r['key']=='after')['compaction_epoch']==1
-            stored=''.join(r[0] for r in index.db.execute('SELECT data FROM events'))
+            stored=''.join(unpack_event(r[0]) for r in index.db.execute('SELECT data FROM events'))
             assert 'compacted' in stored and 'PRIVATE_COMPACTION_TEXT' not in stored
         finally:index.close()
 
@@ -399,7 +497,7 @@ def test_split_history_dedup_effort_restart_and_private_content(tmp_path):
     assert index.bytes_read==before
     index.close()
     db=sqlite3.connect(cache)
-    assert 'PRIVATE_PROMPT_SENTINEL' not in ''.join(row[0] for row in db.execute('select data from events'))
+    assert 'PRIVATE_PROMPT_SENTINEL' not in ''.join(unpack_event(row[0]) for row in db.execute('select data from events'))
     db.close()
     index=UsageIndex([home],cache)
     restored=finish(index)
@@ -677,7 +775,7 @@ def test_restart_rewrite_plus_append_revalidates_cached_prefix(tmp_path):
 
 def test_restart_append_recovers_malformed_cached_records(tmp_path):
     home,path=fixture_home(tmp_path);cache=tmp_path/'index.sqlite'
-    for number,corrupted in enumerate(('{','[]')):
+    for number,corrupted in enumerate(('{','[]',pack_event(json.dumps({'value':'x'*1024}))[:-1])):
         index=UsageIndex([home],cache)
         try:
             finish(index)
@@ -799,5 +897,5 @@ def test_explicit_record_tier_survives_sanitizing_index_and_restart(tmp_path):
             rows=analyze(snapshot['sessions'])['responses']
             assert len(rows)==1 and rows[0]['service_tier']=='Fast'
             assert rows[0]['cost']==pytest.approx(1.0125)
-            assert not any('must-not-persist' in r[0] for r in index.db.execute('select data from events'))
+            assert not any('must-not-persist' in unpack_event(r[0]) for r in index.db.execute('select data from events'))
         finally:index.close()

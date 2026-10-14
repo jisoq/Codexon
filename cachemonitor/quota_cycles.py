@@ -1,13 +1,20 @@
 """Persistent quota observations and local response costs, with matched-window estimates."""
 from dataclasses import asdict
+from array import array
 from bisect import bisect_left, bisect_right
+from collections import OrderedDict
+from itertools import chain, groupby
+from heapq import merge
 import hashlib
 import json
 import math
 import os
+import operator
+import pickle
 from pathlib import Path
 import sqlite3
 import time
+import zlib
 
 from .pricing import (ALIASES, RATES, FAST_RATES, VERIFIED, RATE_VERIFIED, MODEL_VERIFIED,
                       MULTIPLIER_VERIFIED, SUBSCRIPTION_FAST_MULTIPLIERS, PRICE_POLICY, token_cost, request_tier)
@@ -22,9 +29,157 @@ PRICE_SNAPSHOT = json.dumps({'rates': {k: asdict(v) for k, v in RATES.items()},
                              'rate_verified': RATE_VERIFIED,
                              'policy':PRICE_POLICY, 'aliases': ALIASES, 'verified': VERIFIED}, sort_keys=True)
 PRICE_ID = hashlib.sha256(PRICE_SNAPSHOT.encode()).hexdigest()[:16]
+
+
+class _PriceEquivalence:
+    """Reuse a stored calculation when only its verification metadata changed."""
+    METADATA = {'verified', 'model_verified', 'rate_verified', 'multiplier_verified'}
+    SNAPSHOT_BYTES = 256 * 1024
+    CACHE_BYTES = 64 * 1024
+    CACHE_ENTRIES = 64
+
+    def __init__(self, db, identifier, snapshot):
+        self.db = db
+        self.identifier = identifier
+        self.signature = self._signature(snapshot)
+        self.cache = OrderedDict()
+        self.cache_bytes = 0
+
+    @classmethod
+    def _signature(cls, snapshot):
+        try:
+            value = json.loads(snapshot)
+            if not isinstance(value, dict) or not isinstance(value.get('policy'), str):
+                return None
+            if not all(isinstance(value.get(key), dict) for key in
+                       ('rates', 'fast_rates', 'subscription_fast_multipliers', 'aliases')):
+                return None
+            # Unknown future fields remain significant. Only these four display
+            # verification fields are absent from token_cost's arithmetic.
+            data = {key: item for key, item in value.items() if key not in cls.METADATA}
+            return hashlib.sha256(json.dumps(data, sort_keys=True, separators=(',', ':')).encode()).digest()
+        except (TypeError, ValueError):
+            return None
+
+    def __call__(self, identifier):
+        if identifier == self.identifier:
+            return True
+        cached = self.cache.get(identifier)
+        if cached is not None:
+            self.cache.move_to_end(identifier)
+            return cached[0]
+        row = self.db.execute('SELECT data FROM prices WHERE id=? AND length(CAST(data AS BLOB))<=?',
+                              (identifier, self.SNAPSHOT_BYTES)).fetchone()
+        same = self.signature is not None and row is not None and self._signature(row[0]) == self.signature
+        weight = 128 + len(str(identifier)) * 4
+        if weight <= self.CACHE_BYTES:
+            self.cache[identifier] = (same, weight)
+            self.cache_bytes += weight
+            while len(self.cache) > self.CACHE_ENTRIES or self.cache_bytes > self.CACHE_BYTES:
+                _, (_, removed) = self.cache.popitem(last=False)
+                self.cache_bytes -= removed
+        return same
+
+
 RESET_TOLERANCE = 120
 MAX_OBSERVATION_GAP = 30 * 60
 DISCONTINUITY = '사용률 불연속: 감소, 충돌 후 복귀량은 신규 소모로 계산하지 않음'
+
+
+class _HistoryFields:
+    """Produce ordinary dictionaries sharing one fixed set of field names.
+
+    All history rows have these twelve fields. Instance dictionaries share
+    their keys in the pinned Python runtime, including after the short-lived
+    instance is released. Consumers still receive mutable, JSON-ready dicts.
+    """
+    def __init__(self, row, window, identifier=None):
+        self.id=row['id'] if identifier is None else identifier
+        self.home=row['home'];self.at=row['at'];self.source=row['source']
+        self.account=row['account'];self.plan=row['plan'];self.bucket=row['bucket']
+        self.window=window;self.used=row['used'];self.reset=row['reset']
+        self.minutes=row['minutes'];self.separate=row['separate']
+
+
+class _PackedRows:
+    """Lossless internal rows with two decoded blocks for indexed selection."""
+    def __init__(self, rows, *, timestamps=False):
+        self.blocks=[];self.ends=[];self.times=array('d');self.time_ends=array('d')
+        self._timestamped=timestamps;self.count=0;self._cache={}
+        batch=[];weight=0
+        for row in rows:
+            size=512+sum(len(v)*4 for v in row.values() if isinstance(v,str))
+            if batch and (len(batch)>=512 or weight+size>2*1024*1024):
+                self._pack(batch)
+                batch=[];weight=0
+            batch.append(row);weight+=size;self.count+=1
+            if timestamps and (not self.times or self.times[-1]!=row['at']):self.times.append(row['at'])
+        if batch:self._pack(batch)
+
+    def _pack(self, batch):
+        pending=[batch]
+        while pending:
+            rows=pending.pop();payload=zlib.compress(pickle.dumps(rows,protocol=5),1)
+            if len(payload)>64*1024 and len(rows)>1:
+                middle=len(rows)//2;pending.extend((rows[middle:],rows[:middle]))
+            else:
+                self.blocks.append(payload)
+                self.ends.append((self.ends[-1] if self.ends else 0)+len(rows))
+                if self._timestamped:self.time_ends.append(rows[-1]['at'])
+
+    def __len__(self):return self.count
+
+    def __iter__(self):
+        # Only this process creates these payloads; no disk/network pickle input.
+        for block in self.blocks:
+            yield from pickle.loads(zlib.decompress(block))
+
+    def __getitem__(self, index):
+        if isinstance(index,slice):return [self[i] for i in range(*index.indices(self.count))]
+        index=operator.index(index)
+        if index<0:index+=self.count
+        if not 0<=index<self.count:raise IndexError(index)
+        block=bisect_right(self.ends,index)
+        rows=self._cache.pop(block,None)
+        if rows is None:rows=pickle.loads(zlib.decompress(self.blocks[block]))
+        self._cache[block]=rows
+        while len(self._cache)>2:self._cache.pop(next(iter(self._cache)))
+        return rows[index-(self.ends[block-1] if block else 0)]
+
+    def __eq__(self, other):
+        if self is other:return True
+        try:return len(self)==len(other) and all(a==b for a,b in zip(self,other))
+        except TypeError:return NotImplemented
+
+    def __getstate__(self):
+        return {key:value for key,value in vars(self).items() if key!='_cache'}
+
+    def __setstate__(self, state):
+        vars(self).update(state);self._cache={}
+
+
+class _PackedHistory(_PackedRows):
+    """Worker-owned timestamp-ordered evidence with compact boundary lookup."""
+    def __init__(self, rows):super().__init__(rows,timestamps=True)
+
+    def iter_from(self, at):
+        for block in self.blocks[bisect_left(self.time_ends,at):]:
+            for row in pickle.loads(zlib.decompress(block)):
+                if row['at']>=at:yield row
+
+    def with_suffix(self, at, rows):
+        """Share unchanged blocks and replace every record at or after at."""
+        block=bisect_left(self.time_ends,at)
+        retained=(r for r in pickle.loads(zlib.decompress(self.blocks[block])) if r['at']<at) if block<len(self.blocks) else ()
+        tail=_PackedHistory(chain(retained,rows))
+        count=self.ends[block-1] if block else 0
+        result=_PackedHistory(())
+        result.blocks=self.blocks[:block]+tail.blocks
+        result.ends=self.ends[:block]+[count+end for end in tail.ends]
+        result.count=count+tail.count
+        result.time_ends=self.time_ends[:block]+tail.time_ends
+        result.times=self.times[:bisect_left(self.times,at)]+tail.times[bisect_left(tail.times,at):]
+        return result
 
 
 def observation_parts(home, quota):
@@ -418,26 +573,32 @@ def quota_statistics(report, start=None, end=None, include_mode_assumptions=Fals
         'account_delta':account_delta,'attribution':attribution}
 
 
-def quota_value_history(report, rows, *, _requests=None, _cache=None, _statistics_cache=None):
+def quota_value_history(report, rows, *, _requests=None, _cache=None, _statistics_cache=None, _period_sink=None, _groups=None):
     """Align monetary evidence to the chart's *observed* reset boundaries.
 
     Reset classification belongs to history_rows/ResetTracker. Storage intervals
     are accounting segments, not necessarily whole allowance cycles. Preserve
     those segments and the existing estimator, aggregating them only for display.
     """
-    if not rows:
+    if not rows and _groups is None:
         return [], []
     account = report.get('account') or next(
         (c.get('account') for c in report.get('cycles', []) if c.get('account')), '')
-    groups = []
-    previous = None
-    for row in rows:
-        if not groups or row['reset_kind']:
-            groups.append({'start': row['at'], 'reset_kind': row['reset_kind'],
-                           'partial': not bool(row['reset_kind']), 'rows': []})
-        group = groups[-1]
-        group['rows'].append(row)
-        previous = row
+    def groups():
+        group=None
+        for row in rows:
+            if group is None or row['reset_kind']:
+                if group is not None:yield group
+                group={'start':row['at'],'reset_kind':row['reset_kind'],
+                       'partial':not bool(row['reset_kind']),'rows':[]}
+            group['rows'].append(row)
+        if group is not None:yield group
+    def neighbors():
+        source=iter(groups() if _groups is None else _groups);group=next(source,None)
+        while group is not None:
+            following=next(source,None)
+            yield group,following
+            group=following
 
     from .quota_exclusions import active_exclusions
     exclusions = active_exclusions(report, account)
@@ -449,27 +610,32 @@ def quota_value_history(report, rows, *, _requests=None, _cache=None, _statistic
         _requests=RequestWindows(report.get('request_windows',[]))
     previous_cache=dict(_cache) if _cache is not None else {}
     if _cache is not None:_cache.clear()
-    for index, group in enumerate(groups):
+    for group,following in neighbors():
         start = group['start']
-        end = (math.nextafter(groups[index+1]['start'], -math.inf)
-               if index+1 < len(groups) else rows[-1]['at'])
+        end = (math.nextafter(following['start'],-math.inf) if following is not None else
+               group['_last_at'] if '_last_at' in group else group['rows'][-1]['at'])
         own = [c for c in cycles if c['end'] >= start and c['start'] <= end]
         signature=None
         if _cache is not None:
             inputs=[{**{k:v for k,v in c.items() if k not in ('cost_complete_at','cycle_end')},
                      'cost_complete_at':min(c['cost_complete_at'],c['end']) if c.get('cost_complete_at') is not None else None}
                     for c in own]
-            signature=(account,forward,group,inputs,end,
+            signature=(account,forward,group.get('_signature',group),inputs,end,
                        [r for r in exclusions if r['start']<end and r['end']>start],
                        [r for r in report.get('cycle_clears',[]) if r['start']<end and r['end']>start],
                        list(_requests.overlapping(start,end)) if _requests is not None else None,
                        (report.get('tracking') or {}).get('complete'))
+            signature=hashlib.sha256(pickle.dumps(signature,protocol=5)).digest()
             cached=previous_cache.get(start)
-            if cached and cached[0]==signature:
-                result.extend(cached[1])
-                if cached[2] is not None:periods.append({**cached[2],'current':index==len(groups)-1})
+            if cached and cached[0]==signature and (_period_sink is not None or cached[1] is not None):
+                prepared=cached[1]
+                period={**cached[2],'current':following is None} if cached[2] is not None else None
+                if period is not None:periods.append(period)
+                if _period_sink is None:result.extend(prepared)
+                else:_period_sink(prepared,period,True)
                 _cache[start]=cached
                 continue
+        if group.get('rows') is None:group={**group,'rows':list(group['_load']())}
         result_start=len(result);period_start=len(periods)
         summary = quota_statistics({**report, 'account': account, 'cycles': own}, start, end, _requests=_requests,_cache=_statistics_cache)
         intervals = [c for c in summary['intervals']
@@ -560,7 +726,7 @@ def quota_value_history(report, rows, *, _requests=None, _cache=None, _statistic
             value = summary['per_percent']
             periods.append({'start': start, 'end': group['rows'][-1]['at'],
                             'reset_kind': group['reset_kind'], 'partial': group['partial'],
-                            'current': index == len(groups)-1,
+                            'current': following is None,
                             'cost': summary['cost'] if summary['total'] or exclusions else
                                     0 if group['reset_kind'] else None,
                             'delta': summary['delta'],
@@ -569,17 +735,30 @@ def quota_value_history(report, rows, *, _requests=None, _cache=None, _statistic
                             'value': value*100 if value is not None else None})
             periods[-1]['cost_intervals']=intervals
         if _cache is not None:
-            _cache[start]=(signature,result[result_start:],periods[-1] if len(periods)>period_start else None)
+            prepared=result[result_start:]
+            # The deferred sink already owns an exact packed chart. Retaining
+            # another packed copy of its input rows wastes space and encoding.
+            _cache[start]=(signature,None if _period_sink else prepared,
+                           periods[-1] if len(periods)>period_start else None)
+        if _period_sink is not None:
+            _period_sink(result[result_start:],periods[-1] if len(periods)>period_start else None,False)
+            del result[result_start:]
     return result, periods
 
 
 class QuotaLedger:
     CACHE_KIB=4096
+    HISTORY_CACHE_KIB=128*1024
+    INPUT_CACHE_BYTES=64*1024*1024
+    REQUEST_CACHE_BYTES=64*1024*1024
+    REQUEST_SORT_ROWS=32768
+    ARCHIVE_COMPACTION_ROWS=512
     FUTURE_COLUMNS=(('observations',('at',)),('window_observations',('at',)),
         ('manual_resets',('at',)),('calls',('ts',)),('tracking_controls',('at',)),
         ('tracking_observations',('received',)),('tracking_tasks',('start','end')),
         ('tracking_wire',('start','end')))
-    def __init__(self, path):
+    def __init__(self, path, *, pack_history=False):
+        self._pack_history=pack_history
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(self.path, timeout=8)
@@ -658,7 +837,7 @@ class QuotaLedger:
         self.revisions = {}
         self.mode_offsets = {}
         self.mode_backfill = {}
-        self.db.execute('create table if not exists cost_archive(home text,uid text,price_id text,signature text,cost real,service_tier text,at real,primary key(home,uid,price_id,signature))')
+        self.db.execute('create table if not exists cost_archive(home text,uid text,price_id text,signature text,cost real,service_tier text,at real,primary key(home,uid,price_id,signature)) without rowid')
         self.db.execute('create table if not exists mode_scan(home text primary key, latest integer, before_id integer)')
         has_mode_events=bool(self.db.execute("select 1 from sqlite_master where type='table' and name='mode_events'").fetchone())
         self.db.execute('''create table if not exists mode_events(
@@ -671,11 +850,19 @@ class QuotaLedger:
                 if latest<0:continue
                 self.mode_offsets[home]=latest
                 self.mode_backfill[home]=before
-        for old in self.db.execute('select * from calls where price_id!=?',(PRICE_ID,)).fetchall():
-            self.db.execute('insert or ignore into cost_archive values(?,?,?,?,?,?,?)',
-                (old['home'],old['uid'],old['price_id'],old['signature'],old['cost'],old['service_tier'],time.time()))
-            self.db.execute('update calls set cost=?,price_id=? where home=? and uid=?',
-                (token_cost(dict(old))['cost'],PRICE_ID,old['home'],old['uid']))
+        self._price_equivalent = _PriceEquivalence(self.db, PRICE_ID, PRICE_SNAPSHOT)
+        self.db.create_function('codexon_price_equivalent', 1, self._price_equivalent)
+        # Filter before constructing Python rows. Acquire write ownership before
+        # streaming actual repricing so another writer cannot invalidate a read
+        # snapshot halfway through upgrading it to a write transaction.
+        stale='price_id!=? and not codexon_price_equivalent(price_id)'
+        if self.db.execute('select 1 from calls where '+stale+' limit 1', (PRICE_ID,)).fetchone():
+            if not self.db.in_transaction:self.db.execute('BEGIN IMMEDIATE')
+            for old in self.db.execute('select * from calls where '+stale, (PRICE_ID,)):
+                self.db.execute('insert or ignore into cost_archive values(?,?,?,?,?,?,?)',
+                    (old['home'],old['uid'],old['price_id'],old['signature'],old['cost'],old['service_tier'],time.time()))
+                self.db.execute('update calls set cost=?,price_id=? where home=? and uid=?',
+                    (token_cost(dict(old))['cost'],PRICE_ID,old['home'],old['uid']))
         self.db.commit()
         self.modes = {(r['home'],r['sid'],r['turn']):r['mode'] for r in self.db.execute('select * from modes')}
         self.mode_revisions = {}
@@ -689,6 +876,62 @@ class QuotaLedger:
             primary key(home,account,start))''')
         self.db.commit()
         self._initialize_report_revision()
+        self._archive_compaction_pending=True
+        self._compact_cost_archive()
+        from .quota_payloads import PayloadMigration
+        self._payload_migration=PayloadMigration(self.db,self.path)
+        self._payload_migration.step()
+
+    def _compact_cost_archive(self):
+        """Resume a bounded copy of the append-only price history.
+
+        Its large primary key used to be stored twice. Readers and older
+        writers keep the same SQL contract after the atomic table replacement.
+        Keep the original authoritative until all rows, including concurrent
+        appends, have been copied. Free pages are reused by SQLite; this does
+        not schedule a blocking VACUUM in the collection loop.
+        """
+        if not getattr(self,'_archive_compaction_pending',False):return
+        try:
+            self.db.execute('BEGIN IMMEDIATE')
+            schema=self.db.execute("SELECT sql FROM sqlite_master WHERE name='cost_archive'").fetchone()[0]
+            if 'without rowid' in schema.lower():
+                self.db.rollback();self._archive_compaction_pending=False;return
+            # Leave room for an additional database-sized staging copy and WAL.
+            # Low-space maintenance yields to new usage records and retries on
+            # a later synchronization; it never consumes the last free pages.
+            from shutil import disk_usage
+            if disk_usage(self.path.parent).free<self.path.stat().st_size+16*1024*1024:
+                self.db.rollback();return
+            self.db.execute('''CREATE TABLE IF NOT EXISTS cost_archive_packing(
+                home text,uid text,price_id text,signature text,cost real,service_tier text,at real,
+                primary key(home,uid,price_id,signature)) WITHOUT ROWID''')
+            self.db.execute('CREATE TABLE IF NOT EXISTS cost_archive_progress(id INTEGER PRIMARY KEY CHECK(id=1),last_rowid INTEGER)')
+            self.db.execute('INSERT OR IGNORE INTO cost_archive_progress VALUES(1,NULL)')
+            cursor=self.db.execute('SELECT last_rowid FROM cost_archive_progress WHERE id=1').fetchone()[0]
+            condition='' if cursor is None else ' WHERE rowid>?'
+            params=() if cursor is None else (cursor,)
+            rows=self.db.execute('SELECT rowid,* FROM cost_archive'+condition+' ORDER BY rowid LIMIT ?',
+                                 (*params,self.ARCHIVE_COMPACTION_ROWS)).fetchall()
+            self.db.executemany('INSERT INTO cost_archive_packing VALUES(?,?,?,?,?,?,?)',(tuple(row)[1:] for row in rows))
+            if rows:
+                self.db.execute('UPDATE cost_archive_progress SET last_rowid=? WHERE id=1',(rows[-1][0],))
+            if len(rows)<self.ARCHIVE_COMPACTION_ROWS:
+                original=self.db.execute('SELECT count(*) FROM cost_archive').fetchone()[0]
+                copied=self.db.execute('SELECT count(*) FROM cost_archive_packing').fetchone()[0]
+                if original!=copied:raise sqlite3.IntegrityError('Price history copy is incomplete')
+                self.db.execute('DROP TABLE cost_archive')
+                self.db.execute('ALTER TABLE cost_archive_packing RENAME TO cost_archive')
+                self.db.execute('DROP TABLE cost_archive_progress')
+                self._archive_compaction_pending=False
+            self.db.commit()
+        except (sqlite3.Error,OSError) as error:
+            self.db.rollback()
+            # Optional maintenance must not prevent accounting or observation.
+            # The next process can resume from the last committed batch.
+            self._archive_compaction_pending=False
+            from .quota_diagnostics import record_failure
+            record_failure(self.path,'cost_archive_compaction',error)
 
     def _initialize_report_revision(self):
         # One durable scalar, updated by all writers including older app
@@ -707,10 +950,18 @@ class QuotaLedger:
             ignored={'at','complete_at'} if table=='state' else {'at'} if table=='tracking_health' else set()
             condition=' OR '.join(f'old."{column}" IS NOT new."{column}"' for column in columns if column not in ignored)
             for operation in ('INSERT','UPDATE','DELETE'):
-                when=f' WHEN {condition}' if operation=='UPDATE' else ''
+                conditions=[f'({condition})'] if operation=='UPDATE' else []
+                if table=='tracking_observations':
+                    conditions.append('(SELECT active FROM tracking_payload_migration WHERE id=1)=0')
+                when=' WHEN '+' AND '.join(conditions) if conditions else ''
                 name=f'report_{table}_{operation.lower()}'
                 existing=self.db.execute('SELECT sql FROM sqlite_master WHERE type=\'trigger\' AND name=?',(name,)).fetchone()
-                if existing and 'ON CONFLICT(slot)' in existing[0]:continue
+                linked=table in ('observations','window_observations','weekly_window_refs')
+                payload=table=='tracking_observations'
+                if (existing and 'ON CONFLICT(slot)' in existing[0] and
+                        (not linked or 'min(changed_at)' in existing[0]) and
+                        (not payload or 'tracking_payload_migration' in existing[0] and
+                         (operation!='UPDATE' or 'old."payload_context"' in existing[0]))):continue
                 self.db.execute(f'DROP TRIGGER IF EXISTS {name}')
                 column={'observations':'at','window_observations':'at','calls':'ts',
                         'tracking_observations':'received'}.get(table)
@@ -720,6 +971,21 @@ class QuotaLedger:
                     times=[f'(SELECT at FROM observations WHERE id={side}.{field})' for side in
                            (('old','new') if operation=='UPDATE' else ('old',) if operation=='DELETE' else ('new',))]
                 at=('min('+','.join(times)+')' if len(times)>1 else times[0]) if times else 'NULL'
+                if linked:
+                    # Legacy window rows may share an ID but differ in time.
+                    # Invalidate both sides when a reference appears or moves.
+                    linked_times=[]
+                    for side in (('old','new') if operation=='UPDATE' else ('old',) if operation=='DELETE' else ('new',)):
+                        if table=='observations':
+                            linked_times.extend((f'SELECT {side}.at AS changed_at',
+                                f'SELECT w.at FROM weekly_window_refs r JOIN window_observations w ON w.id=r.window_id WHERE r.observation_id={side}.id'))
+                        elif table=='window_observations':
+                            linked_times.extend((f'SELECT {side}.at AS changed_at',
+                                f'SELECT o.at FROM weekly_window_refs r JOIN observations o ON o.id=r.observation_id WHERE r.window_id={side}.id'))
+                        else:
+                            linked_times.extend((f'SELECT at AS changed_at FROM observations WHERE id={side}.observation_id',
+                                f'SELECT at FROM window_observations WHERE id={side}.window_id'))
+                    at='(SELECT min(changed_at) FROM ('+' UNION ALL '.join(linked_times)+'))'
                 # A fixed ring bounds durable change tracking. A lagging reader
                 # reloads authoritative rows if any revision has fallen out.
                 self.db.execute(f'CREATE TRIGGER {name} AFTER {operation} ON {table}{when} BEGIN '
@@ -732,7 +998,7 @@ class QuotaLedger:
         """Reuse immutable SQL rows; re-read only a changed ordered time suffix."""
         cache=getattr(self,'_input_cache',None)
         changes=getattr(self,'_input_changes',None)
-        if cache is None or changes is None:return list(self.db.execute(sql,params))
+        if cache is None or changes is None:return self.db.execute(sql,params)
         previous=cache.get(key)
         signature=params[:-1] if clock else params
         relevant=[at for table,at in changes if table in tables]
@@ -741,8 +1007,8 @@ class QuotaLedger:
         if previous and previous[0]==signature and time_column and relevant and all(at is not None for at in relevant):
             lower=min(relevant)
         if lower is None:
-            rows=list(self.db.execute(sql,params))
-            weights=[0];suffix=rows
+            rows=[];weights=[0]
+            suffix=self.db.execute(sql,params)
         else:
             field=time_column.split('.')[-1]
             # The cached query is ordered by this timestamp. Late corrections
@@ -753,22 +1019,22 @@ class QuotaLedger:
                 if previous[1][mid][field]<lower:left=mid+1
                 else:right=mid
             head,order=sql.rsplit(' order by ',1)
-            suffix=list(self.db.execute(head+f' and {time_column}>=? order by '+order,(*params,lower)))
-            rows=previous[1][:left]+suffix;weights=previous[3][:left+1]
+            suffix=self.db.execute(head+f' and {time_column}>=? order by '+order,(*params,lower))
+            rows=previous[1][:left];weights=previous[3][:left+1]
         # Do not evict the earlier queries of every report to admit its later
         # queries: that turns a working set above budget into perpetual misses.
-        # Oversized inputs remain authoritative SQL reads, without extra scans
-        # merely to estimate data that cannot fit the remaining cache budget.
-        available=64*1024*1024-sum(item[2] for name,item in cache.items() if name!=key)
-        minimum=weights[-1]+len(suffix)*(144+32*len(suffix[0])) if suffix else weights[-1]
-        if minimum>available:
+        # Stream oversized results to their consumer. Keeping an entire SQL
+        # result beside its decoded history can double a large report's peak.
+        available=self.INPUT_CACHE_BYTES-sum(item[2] for name,item in cache.items() if name!=key)
+        if weights[-1]>available:
             cache.pop(key,None)
-            return rows
+            return chain(rows,suffix)
         for row in suffix:
-            weights.append(weights[-1]+144+32*len(row)+sum(len(v)*4 if isinstance(v,str) else len(v) if isinstance(v,bytes) else 32 for v in row))
-            if weights[-1]>available:
+            weight=weights[-1]+144+32*len(row)+sum(len(v)*4 if isinstance(v,str) else len(v) if isinstance(v,bytes) else 32 for v in row)
+            if weight>available:
                 cache.pop(key,None)
-                return rows
+                return chain(rows,(row,),suffix)
+            rows.append(row);weights.append(weight)
         weight=weights[-1]
         cache[key]=(signature,rows,weight,weights)
         return rows
@@ -847,10 +1113,16 @@ class QuotaLedger:
                                             (home,identifier,sid,parsed['turn'],data));changed=True
                 if changed:self.rebuild_mode_evidence(home)
                 self.mode_offsets[home]=latest
-                self.db.execute('''insert into mode_scan values(?,?,?) on conflict(home) do update set
-                    latest=excluded.latest,before_id=excluded.before_id
-                    where mode_scan.latest is not excluded.latest or mode_scan.before_id is not excluded.before_id''',
-                    (home,latest,self.mode_backfill.get(home,0)))
+                checkpoint=(latest,self.mode_backfill.get(home,0))
+                saved=self.db.execute('select latest,before_id from mode_scan where home=?',(home,)).fetchone()
+                # A conditional UPSERT still opens a write transaction when
+                # nothing changed. Read the durable cursor before taking that
+                # lock; do not trust the in-memory scan cursor after failures.
+                if saved is None or tuple(saved)!=checkpoint:
+                    self.db.execute('''insert into mode_scan values(?,?,?) on conflict(home) do update set
+                        latest=excluded.latest,before_id=excluded.before_id
+                        where mode_scan.latest is not excluded.latest or mode_scan.before_id is not excluded.before_id''',
+                        (home,*checkpoint))
             except sqlite3.Error:pass
         self.db.commit()
         previous=getattr(self,'_enriched_sessions',{})
@@ -981,7 +1253,7 @@ class QuotaLedger:
                         where tracking_call_boundaries.started is not excluded.started''',(home,uid,requested))
                 signature = json.dumps([row.get(k) for k in ('ts', 'model', 'service_tier', *TOKEN_FIELDS)], separators=(',', ':'))
                 if old is None:old=self.db.execute('select signature,service_tier,sid,cost,price_id from calls where home=? and uid=?',(home,uid)).fetchone()
-                if old and old['signature'] == signature and old['price_id']==PRICE_ID:
+                if old and old['signature'] == signature and self._price_equivalent(old['price_id']):
                     if old['sid']!=sid:
                         self.db.execute('update calls set sid=? where home=? and uid=?',(sid,home,uid))
                     continue
@@ -1042,6 +1314,8 @@ class QuotaLedger:
         if cursor:self.db.execute('INSERT INTO collection_activity_cursor VALUES(1,?,?) ON CONFLICT(id) DO UPDATE SET '
             'source=excluded.source,revision=excluded.revision WHERE source IS NOT excluded.source OR revision IS NOT excluded.revision',tuple(cursor))
         self.db.commit()
+        self._compact_cost_archive()
+        self._payload_migration.step()
 
     def activity_cursor(self):
         row=self.db.execute('SELECT source,revision FROM collection_activity_cursor WHERE id=1').fetchone()
@@ -1053,10 +1327,12 @@ class QuotaLedger:
         if not path.exists():
             return
         from contextlib import closing
+        from .event_store import quota_events, unpack_event
         with closing(sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True, timeout=1)) as db:
-            rows = db.execute('select ts,data from events where home=? and data like ?', (home, '%"rate_limits"%'))
+            rows = quota_events(db,home)
             prepared=[];batch_bytes=0
             for at,data in rows:
+                data=unpack_event(data)
                 size=len(data.encode('utf8'))
                 if prepared and (len(prepared)>=128 or batch_bytes+size>1024*1024):
                     self._import_observation_parts(prepared);prepared=[];batch_bytes=0
@@ -1125,17 +1401,18 @@ class QuotaLedger:
         return self._edit_with_report(home,lambda report:report['account'],restore)
 
     def clear_selected_cycle(self, home, start, account, *, delete=False):
-        from .quota_view import history_rows
+        from .quota_view import _history_rows
         def prepare(report):
-            rows=history_rows(report,'weekly')
-            starts=[row['at'] for i,row in enumerate(rows) if i==0 or row.get('reset_kind')]
+            starts=[];last=None
+            for last in _history_rows(report,'weekly',labels=False):
+                if not starts or last.get('reset_kind'):starts.append(last['at'])
             if (not account or report['account']!=account or start not in starts
                     or delete != (start!=starts[-1])):
                 raise ValueError('선택한 주기가 변경되었습니다. 기록을 확인한 뒤 다시 시도하세요.')
             original=next((r['start'] for r in report.get('cycle_clears',[])
                            if r['end']==start and r['baseline']!='null'),start)
             at=starts[starts.index(start)+1] if delete else time.time()
-            baseline=None if delete else {k:rows[-1].get(k) for k in ('used','reset','source','account','window')}
+            baseline=None if delete else {k:last.get(k) for k in ('used','reset','source','account','window')}
             return dict(home=home,account=account,start=original,end=at,baseline=json.dumps(baseline))
         def save(record):
             self.db.execute('''insert into quota_cycle_clears values(:home,:account,:start,:end,:baseline)
@@ -1186,7 +1463,7 @@ class QuotaLedger:
                         if before is not None and before<=revision else [])
                 valid=(cached and cached['home']==home and cached['at']<=now<cached['until'] and before is not None
                        and revision-before==len(events))
-                if not valid:self._input_cache={}
+                if not valid:self._input_cache={};self._request_inputs=None;self._history_inputs=None;self._tracking_inputs={}
                 self._input_changes=[(r['table_name'],r['at']) for r in events] if valid else []
             report=self._report(home,now)
             self._report_generation=getattr(self,'_report_generation',0)+1
@@ -1203,47 +1480,239 @@ class QuotaLedger:
                         params=(now,) if not condition else (*scope,now)
                         boundary=self.db.execute(f'SELECT min({column}) FROM {table} WHERE {condition}{column}>?',params).fetchone()[0]
                         if boundary is not None:future.append(boundary)
+                history=report['history'];cycle_ends=sorted({c['end'] for c in report['cycles']})
+                ends=(array('d',(at for at,_ in groupby(merge(history.times,cycle_ends))))
+                      if isinstance(history,_PackedHistory) else sorted(set(cycle_ends)|{r['at'] for r in history}))
                 self._report_cache=dict(home=home,revision=revision,at=now,until=min(future,default=float('inf')),
-                    ends=sorted({c['end'] for c in report['cycles']}|{r['at'] for r in report['history']}),report=dict(report))
-            else:self._report_cache=None;self._input_cache={};self._input_revision=None
+                    ends=ends,report=dict(report))
+            else:self._report_cache=None;self._input_cache={};self._input_revision=None;self._request_inputs=None;self._history_inputs=None;self._tracking_inputs={}
             return report
         except Exception:
-            self._input_cache={};self._input_revision=None
+            self._input_cache={};self._input_revision=None;self._request_inputs=None;self._history_inputs=None;self._tracking_inputs={}
             raise
         finally:
             self._input_changes=None
             if own_transaction:self.db.rollback()
+
+    def _observations(self, home, cutoff, now):
+        # Join the small metadata fields while streaming. A separate context
+        # dictionary duplicates every observation identifier in long histories.
+        return self._report_rows('observations',
+            "select o.*,coalesce(c.plan,'') as plan,coalesce(c.bucket,'') as bucket "
+            'from observations o left join observation_context c on c.id=o.id '
+            'where o.home=? and o.at>=? and o.at<=? order by o.at,o.id',
+            (home,cutoff,now),('observations','observation_context'),'o.at',clock=True)
+
+    def _report_history(self, home, cutoff, now, tables):
+        changes=getattr(self,'_input_changes',None)
+        cacheable=getattr(self,'_pack_history',False) and changes is not None
+        key=(home,cutoff)
+        previous=getattr(self,'_history_inputs',None) if cacheable else None
+        prefix=None
+        if previous and previous[0]==key:
+            relevant=[at for table,at in changes if table in
+                      ('observations','observation_context','window_observations','weekly_window_refs')]
+            if not relevant:return previous[1]
+            if all(at is not None for at in relevant):
+                prefix=previous[1];cutoff=max(cutoff,min(relevant))
+        metadata={};metadata_bytes=0
+        def compact(row, window=None, identifier=None):
+            nonlocal metadata_bytes
+            value=vars(_HistoryFields(row,row['window'] if window is None else window,identifier))
+            for key in ('home','source','account','plan','bucket','window','separate'):
+                text=value.get(key)
+                if not isinstance(text,str):continue
+                shared=metadata.get(text)
+                if shared is not None:value[key]=shared
+                elif len(metadata)<1024 and metadata_bytes+80+len(text)*4<=1024*1024:
+                    metadata[text]=text;metadata_bytes+=80+len(text)*4
+            return value
+        if getattr(self,'_pack_history',False) and {'window_observations','weekly_window_refs'}<=tables:
+            # Two ordered cursors replace the full decoded history lists. The
+            # larger page cache is temporary: it avoids repeated reference/index
+            # reads while consuming less than the discarded row copies at scale.
+            previous_limit=self.db.execute('PRAGMA cache_size').fetchone()[0]
+            self.db.execute(f'PRAGMA cache_size=-{self.HISTORY_CACHE_KIB}')
+            source=self._history_source_rows(home,cutoff,now)
+            try:
+                rows=(compact(row) for row in source)
+                packed=prefix.with_suffix(cutoff,rows) if prefix is not None else _PackedHistory(rows)
+            finally:
+                source.close()
+                self.db.execute(f'PRAGMA cache_size={previous_limit}')
+                self.db.execute('PRAGMA shrink_memory')
+            if cacheable:self._history_inputs=(key,packed)
+            return packed
+        history = ([compact(r) for r in self._report_rows('windows','select * from window_observations where home=? and at>=? and at<=? order by at,id',(home,cutoff,now),('window_observations',),'at',clock=True)]
+                   if 'window_observations' in tables else [])
+        referenced=[]
+        if 'weekly_window_refs' in tables:
+            unreferenced=[]
+            for row in self._report_rows('refs', '''select o.*,r.window_id,
+                    coalesce(c.plan,'') as plan,coalesce(c.bucket,'') as bucket
+                    from observations o left join weekly_window_refs r on r.observation_id=o.id
+                    left join observation_context c on c.id=o.id
+                    where o.home=? and o.at>=? and o.at<=? order by o.at,r.window_id,o.id''',
+                    (home,cutoff,now),('observations','weekly_window_refs','observation_context'),'o.at',clock=True):
+                window_id=row['window_id'];value=compact(row,'weekly',window_id)
+                if window_id is None:unreferenced.append(value)
+                else:
+                    referenced.append(value)
+            referenced_ids={r['id'] for r in referenced}
+            history=[r for r in history if r['id'] not in referenced_ids]
+            del referenced_ids
+        else:
+            unreferenced=[compact(r,'weekly') for r in self._observations(home,cutoff,now)]
+        # Existing ledgers retain their weekly observations without rewriting raw evidence.
+        if unreferenced:
+            known={(r['at'],r['source'],r['account'],r['used'],r['reset']) for r in chain(history,referenced) if r['window']=='weekly'}
+            unreferenced=[r for r in unreferenced if (r['at'],r['source'],r['account'],r['used'],r['reset']) not in known]
+        # Each input is already ordered. Merge without retaining a second key
+        # tuple for every observation during a whole-history sort.
+        if getattr(self,'_pack_history',False):
+            # These lists belong to this call. Release consumed dictionaries
+            # while packing rather than retaining the complete decoded copy.
+            def consume(rows):
+                rows.reverse()
+                while rows:yield rows.pop()
+            rows=merge(*(consume(rows) for rows in (history,referenced,unreferenced)),key=lambda r:(r['at'],r['id']))
+            packed=prefix.with_suffix(cutoff,rows) if prefix is not None else _PackedHistory(rows)
+            if cacheable:self._history_inputs=(key,packed)
+            return packed
+        return list(merge(history,referenced,unreferenced,key=lambda r:(r['at'],r['id'])))
+
+    def _history_source_rows(self, home, cutoff, now):
+        # A legacy window can share an ID with a reference at a different time.
+        # Match the same source range as the ordinary reader before suppressing it.
+        referenced='''SELECT 1 FROM weekly_window_refs f JOIN observations p ON p.id=f.observation_id
+            WHERE f.window_id=w.id AND p.home=? AND p.at>=? AND p.at<=?'''
+        params=(home,cutoff,now,home,cutoff,now)
+        windows=self.db.execute(f'''SELECT w.* FROM window_observations w
+            WHERE w.home=? AND w.at>=? AND w.at<=? AND NOT EXISTS ({referenced}) ORDER BY w.at,w.id''',params)
+        observations=None
+        try:
+            observations=self.db.execute(f'''SELECT COALESCE(r.window_id,o.id) AS id,o.home,o.at,o.source,o.account,
+                COALESCE(c.plan,'') AS plan,COALESCE(c.bucket,'') AS bucket,'weekly' AS window,
+                o.used,o.reset,o.minutes,o.separate
+                FROM observations o LEFT JOIN weekly_window_refs r ON r.observation_id=o.id
+                LEFT JOIN observation_context c ON c.id=o.id
+                WHERE o.home=? AND o.at>=? AND o.at<=? AND (r.window_id IS NOT NULL OR (
+                    NOT EXISTS (SELECT 1 FROM window_observations w WHERE w.home=o.home
+                        AND w.window='weekly' AND w.at=o.at AND w.source IS o.source
+                        AND w.account IS o.account AND w.used IS o.used AND w.reset IS o.reset
+                        AND NOT EXISTS ({referenced}))
+                    AND NOT EXISTS (SELECT 1 FROM observations p JOIN weekly_window_refs f ON f.observation_id=p.id
+                        WHERE p.home=o.home AND p.at=o.at AND p.source IS o.source
+                        AND p.account IS o.account AND p.used IS o.used AND p.reset IS o.reset
+                        AND f.window_id IS NOT NULL)))
+                ORDER BY o.at,COALESCE(r.window_id,o.id),r.window_id IS NULL,o.id''',params)
+            yield from merge(windows,observations,key=lambda row:(row['at'],row['id']))
+        finally:
+            windows.close()
+            if observations is not None:observations.close()
+
+    def _report_calls(self, scope, cutoff, forward):
+        """Reuse immutable request joins while only quota observations change."""
+        packed=forward and getattr(self,'_pack_history',False)
+        changes=getattr(self,'_input_changes',None)
+        cacheable=packed and changes is not None
+        key=(tuple(scope),cutoff)
+        previous=getattr(self,'_request_inputs',None) if cacheable else None
+        if (previous and previous[0]==key and not any(table in
+                ('calls','tracking_wire','tracking_call_boundaries') for table,_ in changes)):
+            return previous[1:4]
+        if cacheable:self._request_inputs=None
+        slots=','.join('?' for _ in scope)
+        # The primary key already makes response IDs unique within one home.
+        columns='home,uid,ts,model,'+','.join(TOKEN_FIELDS)+',cost,price_id,service_tier'
+        if len(scope)==1:
+            calls=self._report_rows('calls',f'select {columns} from calls where home=? and ts>=? '
+                'and model<>? order by ts,uid',(*scope,cutoff,INTERNAL_REVIEW_MODEL),('calls',),'ts')
+        else:
+            calls=self.db.execute(f'''select {columns} from (
+                select *,row_number() over(partition by uid order by cost is null,home) as copy_rank
+                from calls where home in ({slots}) and ts>=? and model<>?) where copy_rank=1 order by ts''',
+                (*scope,cutoff,INTERNAL_REVIEW_MODEL))
+        request_windows=[]
+        if forward:
+            completed={};exact_starts={home:{} for home in scope};by_response={}
+            for row in self.db.execute(f"select * from tracking_wire where home in ({slots}) and response<>''",scope):
+                if row['status']=='completed' and row['end'] is not None:
+                    completed[row['response']]=min(completed.get(row['response'],row['end']),row['end'])
+                exact_starts[row['home']][row['response']]=row['start']
+                if row['status'] not in ('created','completed'):continue
+                old=by_response.get(row['response'])
+                if old is None or (row['end'] is not None and old[1] is None):
+                    by_response[row['response']]=(row['start'],row['end'])
+            # Keep only fallback boundaries. Exact wire starts already own the
+            # ordinary case, including an explicitly missing start.
+            boundaries={home:{} for home in scope}
+            for row in self.db.execute(f'select * from tracking_call_boundaries where home in ({slots})',scope):
+                if row['uid'] not in exact_starts[row['home']]:boundaries[row['home']][row['uid']]=row['started']
+            windows=(dict(uid=uid,start=span[0],end=span[1]) for uid,span in by_response.items())
+            request_windows=_PackedRows(windows) if packed else list(windows)
+            del windows,by_response
+            # Preserve completion correction and the original stable tie order
+            # without retaining all decoded call dictionaries beside the join.
+            times=array('d');ordered=True
+            def corrected(source):
+                nonlocal ordered
+                last=None
+                for row in source:
+                    value={**dict(row),'ts':completed.get(row['uid'],row['ts']),
+                        'request_start':exact_starts[row['home']].get(row['uid'],boundaries[row['home']].get(row['uid'])),
+                        'local_request_start':exact_starts[row['home']].get(row['uid'])}
+                    if packed:
+                        if last is not None and value['ts']<last:ordered=False
+                        last=value['ts'];times.append(last)
+                    yield value
+            if packed and isinstance(calls,list) and len(calls)<=self.REQUEST_SORT_ROWS:
+                # This SQL input already fits the bounded input cache. A small
+                # dictionary buffer borrows its values and avoids packing twice
+                # when exact completion timestamps change the source order.
+                staged=sorted(corrected(calls),key=lambda row:row['ts'])
+                times=array('d',(row['ts'] for row in staged));ordered=True
+                staged.reverse()
+                def consume():
+                    while staged:yield staged.pop()
+                calls=_PackedRows(consume())
+            else:
+                calls=_PackedRows(corrected(calls)) if packed else sorted(corrected(calls),key=lambda row:row['ts'])
+            del completed,boundaries,exact_starts
+            if packed and not ordered:
+                source=calls
+                order=sorted(range(len(source)),key=lambda i:source[i]['ts'])
+                times=array('d')
+                def reordered():
+                    for i in order:
+                        row=source[i];times.append(row['ts']);yield row
+                calls=_PackedRows(reordered())
+                del source,order
+        else:calls=list(calls)
+        if not packed:return calls,[row['ts'] for row in calls],request_windows
+        weight=len(times)*8+sum(sum(len(block)+64 for block in rows.blocks)+len(rows.ends)*36
+                               for rows in (calls,request_windows))
+        if cacheable and weight<=self.REQUEST_CACHE_BYTES:
+            self._request_inputs=(key,calls,times,request_windows,weight)
+        return calls,times,request_windows
 
     def _report(self, home, now=None, *, exclusion_only=False):
         now = time.time() if now is None else now
         tables = {r[0] for r in self.db.execute("select name from sqlite_master where type='table'")}
         config=self.db.execute('select started from tracking_config where home=?',(home,)).fetchone() if 'tracking_config' in tables else None
         cutoff=config[0] if config else float('-inf')
-        contexts = ({r['id']:dict(r) for r in self._report_rows('contexts','select c.*,o.at from observation_context c join observations o on c.id=o.id where o.home=? and o.at>=? order by o.at,c.id',(home,cutoff),('observation_context','observations'),'o.at')}
-                    if 'observation_context' in tables else {})
-        raw = [{**dict(row), **{k:contexts.get(row['id'],{}).get(k,'') for k in ('plan','bucket')}}
-               for row in self._report_rows('observations','select * from observations where home=? and at>=? and at<=? order by at,id', (home,cutoff,now),('observations',),'at',clock=True)]
-        observations = [r for r in raw if type(r['used']) in (int,float)
-                        and math.isfinite(r['used']) and 0 <= r['used'] <= 100
-                        and r['minutes']==10080]
         from .quota_tracking_store import build
-        tracking = build(self.db, home, now, context_only=exclusion_only, read_rows=self._report_rows)
-        current_account = (tracking.get('account') if tracking is not None else None) or next((r['account'] for r in reversed(observations) if r['account']), '')
-        history = ([dict(r) for r in self._report_rows('windows','select * from window_observations where home=? and at>=? and at<=? order by at,id',(home,cutoff,now),('window_observations',),'at',clock=True)]
-                   if 'window_observations' in tables else [])
-        if 'weekly_window_refs' in tables:
-            raw_by_id={r['id']:r for r in raw}
-            referenced=[{**raw_by_id[observation_id],'id':window_id,'window':'weekly'}
-                for window_id,observation_id,_ in self._report_rows('refs','''select r.window_id,r.observation_id,o.at
-                    from observations o join weekly_window_refs r on r.observation_id=o.id
-                    where o.home=? and o.at>=? and o.at<=? order by o.at,r.window_id''',(home,cutoff,now),('observations','weekly_window_refs'),'o.at',clock=True)]
-            referenced_ids={r['id'] for r in referenced}
-            history=[r for r in history if r['id'] not in referenced_ids]+referenced
-        # Existing ledgers retain their weekly observations without rewriting raw evidence.
-        known={(r['at'],r['source'],r['account'],r['used'],r['reset']) for r in history if r['window']=='weekly'}
-        history += [{**r,'window':'weekly'} for r in raw
-                    if (r['at'],r['source'],r['account'],r['used'],r['reset']) not in known]
-        context = dict(home=home,account=current_account,history=sorted(history,key=lambda r:(r['at'],r['id'])),
+        tracking = build(self.db, home, now, context_only=exclusion_only, read_rows=self._report_rows,
+                         pack_groups=getattr(self,'_pack_history',False),
+                         replay_cache=getattr(self,'_tracking_inputs',None) if getattr(self,'_input_changes',None) is not None else None,
+                         changes=getattr(self,'_input_changes',None))
+        current_account = tracking.get('account') if tracking is not None else None
+        if not current_account:
+            latest=self.db.execute("select account from observations where home=? and at>=? and at<=? "
+                "and typeof(used) in ('integer','real') and used between 0 and 100 "
+                "and minutes=10080 and account<>'' order by at desc,id desc limit 1",(home,cutoff,now)).fetchone()
+            current_account=latest[0] if latest else ''
+        context = dict(home=home,account=current_account,
             cycle_clears=[dict(r) for r in self.db.execute(
                 'select * from quota_cycle_clears where home=? and account=? and end<=? order by start',
                 (home,current_account,now))],
@@ -1254,6 +1723,7 @@ class QuotaLedger:
         # Editing needs observed boundaries and account ownership, not call costs.
         # Keep this inside the same snapshot/revision check as the full report.
         if exclusion_only:
+            context['history']=self._report_history(home,cutoff,now,tables)
             return context
         manual_resets = [dict(r) for r in self.db.execute(
             'select * from manual_resets where home=? and at<=? order by at,id', (home,now))]
@@ -1262,6 +1732,9 @@ class QuotaLedger:
         if tracking is not None:
             groups = tracking['groups']
         else:
+            observations=[dict(r) for r in self._observations(home,cutoff,now)
+                          if type(r['used']) in (int,float) and math.isfinite(r['used'])
+                          and 0<=r['used']<=100 and r['minutes']==10080]
             groups = split_cycles(observations, manual_resets)
             if groups:groups[-1]['provisional']=True
         state = self.db.execute('select * from state where home=?', (home,)).fetchone()
@@ -1271,33 +1744,7 @@ class QuotaLedger:
             completed_at=min((r[0] for r in marks),default=None) if len(marks)==len(scope) and all(r[0] is not None for r in marks) else None
         issues = ([dict(r) for r in self.db.execute(f'select * from coverage_issues where home in ({slots})',scope)]
                   if 'coverage_issues' in tables else [])
-        # The primary key already makes response IDs unique within one home.
-        if len(scope)==1:
-            calls=self._report_rows('calls','select *,1 as copy_rank from calls where home=? and ts>=? '
-                'and model<>? order by ts,uid',(*scope,cutoff,INTERNAL_REVIEW_MODEL),('calls',),'ts')
-        else:
-            calls = list(self.db.execute(f'''select * from (
-                select *,row_number() over(partition by uid order by cost is null,home) as copy_rank
-                from calls where home in ({slots}) and ts>=? and model<>?) where copy_rank=1 order by ts''',(*scope,cutoff,INTERNAL_REVIEW_MODEL)))
-        if tracking is not None:
-            wire=list(self.db.execute(f"select * from tracking_wire where home in ({slots}) and response<>''",scope))
-            completed={}
-            for row in wire:
-                if row['status']=='completed' and row['end'] is not None:
-                    completed[row['response']]=min(completed.get(row['response'],row['end']),row['end'])
-            # A usage record may arrive after the final quota lookup. Exact
-            # response identity assigns its cost to the observed completion,
-            # without rewriting the underlying usage timestamp.
-            boundaries={(r['home'],r['uid']):r['started'] for r in self.db.execute(
-                f'select * from tracking_call_boundaries where home in ({slots})',scope)}
-            exact_starts={}
-            for r in wire:
-                boundaries[(r['home'],r['response'])]=r['start']
-                exact_starts[(r['home'],r['response'])]=r['start']
-            calls=sorted(({**dict(r),'ts':completed.get(r['uid'],r['ts']),
-                           'request_start':boundaries.get((r['home'],r['uid'])),
-                           'local_request_start':exact_starts.get((r['home'],r['uid']))} for r in calls),key=lambda r:r['ts'])
-        call_times=[r['ts'] for r in calls]
+        calls,call_times,request_windows=self._report_calls(scope,cutoff,tracking is not None)
         time_cache={}
         for group in groups:
             if group.get('gap') or group.get('discontinuous'):continue
@@ -1308,6 +1755,7 @@ class QuotaLedger:
             times=time_cache[key]
             if group['observations']:
                 start,end=group['observations'][0]['at'],group['observations'][-1]['at']
+                if isinstance(group['observations'],_PackedRows):group['observations']._cache.clear()
                 for row in calls[bisect_right(call_times,start):bisect_right(call_times,end)]:
                     if row['cost'] is None and start<row['ts']<=end and ALIASES.get(row['model'],row['model']) not in separate:
                         issues.append({'start':row['ts'],'end':row['ts'],
@@ -1363,6 +1811,7 @@ class QuotaLedger:
                      'separate': ALIASES.get(row['model'],row['model']) in separate} for row in rows]
         for i, group in enumerate(groups):
             obs = group['observations']
+            if isinstance(obs,_PackedRows):obs=list(obs)
             marker = group.get('manual_reset')
             if not obs and not marker and group.get('rejected'):
                 obs = [group['rejected'][0],group['rejected'][-1]]
@@ -1377,10 +1826,13 @@ class QuotaLedger:
             if tracking is not None and obs:
                 lo=group['boundary'];hi=cycle_end
                 coverage=min(completed_at,obs[-1]['at']) if completed_at is not None else None
-                signature=(group,(next_group['boundary'],next_group['reason'],next_group.get('manual_reset')) if next_group else None,
+                signature=({**group,'observations':obs},(next_group['boundary'],next_group['reason'],next_group.get('manual_reset')) if next_group else None,
                            calls[bisect_right(call_times,lo):bisect_right(call_times,hi)],
                            [r for r in tracking.get('pending_responses',[]) if r['start']<=hi and (r['end'] is None or r['end']>=lo)],
                            issues,coverage,tracking['complete'],state['unclassified'] if state else None)
+                # Retain a content identity, not a second owner of every raw
+                # observation and call after the accounting result is built.
+                signature=hashlib.sha256(json.dumps(signature,sort_keys=True,separators=(',',':')).encode()).digest()
                 cached=previous_cycles.get(group['id'])
                 if cached and cached[0]==signature:
                     cycle={**cached[1],'cost_complete_at':completed_at}
@@ -1473,8 +1925,10 @@ class QuotaLedger:
                 for row in (r for r in calls[bisect_right(call_times,start):bisect_right(call_times,end)] if r['service_tier']=='미확인'):
                     if ALIASES.get(row['model'],row['model']) in separate:
                         continue
-                    key=(home,row['uid'],row['signature'],row['price_id'])
+                    key=(row['model'],*[row[k] for k in TOKEN_FIELDS],row['price_id'])
                     if key not in self._mode_alternatives:
+                        if len(self._mode_alternatives)>=4096:
+                            self._mode_alternatives.pop(next(iter(self._mode_alternatives)))
                         self._mode_alternatives[key]=token_cost({**dict(row),'service_tier':'Standard'})['cost']
                     alternative=self._mode_alternatives[key]
                     if alternative is not None:
@@ -1554,16 +2008,15 @@ class QuotaLedger:
         last_reset = relevant_resets[-1] if relevant_resets else None
         pending = any(r.get('reset_pending') and r['manual_reset_id']==last_reset['id'] for r in result) if last_reset else False
         if tracking is not None:pending=False
-        request_windows=[]
-        if tracking is not None:
-            by_response={}
-            for row in wire:
-                if row['status'] not in ('created','completed'):continue
-                old=by_response.get(row['response'])
-                if old is None or (row['end'] is not None and old['end'] is None):
-                    by_response[row['response']]=dict(uid=row['response'],start=row['start'],end=row['end'])
-            request_windows=list(by_response.values())
         if getattr(self,'_input_changes',None) is not None:self._cycle_cache=cycle_cache
+        # Raw tracking rows and corrected call dictionaries have no consumer
+        # after accounting. Release them before loading chart history.
+        if tracking is not None:
+            tracking.pop('groups',None)
+        else:
+            del observations
+        groups.clear();del calls
+        context['history']=self._report_history(home,cutoff,now,tables)
         return {**({'request_windows':request_windows} if tracking is not None else {}),
                 **context,
                 'manual_resets':manual_resets,'cycles': list(reversed(result)), 'price_id': PRICE_ID, 'index_at': state['at'] if state else None,
@@ -1574,4 +2027,4 @@ class QuotaLedger:
 
     def close(self):
         self.db.close()
-        self._input_cache={};self._cycle_cache={};self._report_cache=None
+        self._input_cache={};self._cycle_cache={};self._report_cache=None;self._request_inputs=None;self._history_inputs=None;self._tracking_inputs={}

@@ -51,6 +51,22 @@ def test_rows_alias_inline_values_and_forward_container_references():
     assert actual['rows'][0] is actual['rows'][-1]
 
 
+def test_packed_rows_cross_frames_without_expanding_the_display_history():
+    import random
+    from cachemonitor.quota_cycles import _PackedRows
+    randomizer=random.Random(8451)
+    rows=[dict(at=i,remaining=80,label=randomizer.randbytes(512).hex()) for i in range(1100)]
+    packed=_PackedRows(rows)
+    actual,payloads=roundtrip(dict(rows=packed,again=packed))
+    restored=actual['rows']
+    assert isinstance(restored,_PackedRows) and restored is actual['again']
+    assert not restored._cache and restored==rows
+    assert len(payloads)>3 and all(len(block)<=64*1024 for block in restored.blocks)
+    for index in (0,512,-1):assert restored[index]==rows[index]
+    assert restored[510:514]==rows[510:514] and len(restored._cache)<=2
+    with pytest.raises(EOFError):receive_result(MemoryConnection(payloads[:-1]))
+
+
 def test_list_and_dict_cycles_keep_identity_and_dictionary_order():
     rows = list(range(300))
     rows.append(rows)

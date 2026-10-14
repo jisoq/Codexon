@@ -55,7 +55,8 @@ def resources():
 # Keep canonical values independent of Python container sharing and pickle IDs.
 def canonical(value):
     if isinstance(value, dict):
-        return {str(k): canonical(v) for k, v in value.items()}
+        # Compare public results across cache representations and eviction.
+        return {str(k): canonical(v) for k, v in value.items() if not str(k).startswith('_')}
     if isinstance(value, (list, tuple)):
         return [canonical(v) for v in value]
     return value

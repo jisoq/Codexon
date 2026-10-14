@@ -9,21 +9,24 @@ BUCKET_SECONDS=300
 def prepare_model_share(series, intervals):
     rows=series['rows'];times=series['times']
     if not rows:return dict(bins={},spans=[],models=[])
-    additions=defaultdict(lambda:defaultdict(lambda:defaultdict(float)));unknown=set();names=set()
+    additions=[];unknown=set();names={}
     for interval in intervals:
         separate=set(interval.get('separate_models',[]))
         for event in interval.get('cost_rows',[]):
             name=event['model']
             if ALIASES.get(name,name) in separate or not interval['start']<event['ts']<=interval['end']:continue
             index=bisect_left(times,event['ts'])
-            if index>=len(rows) or rows[index]['at']>interval['end']:continue
-            name=(name,request_tier(event))
-            cost=event.get('cost');names.add(name)
+            if index>=len(times) or times[index]>interval['end']:continue
+            identity=(name,request_tier(event));name=names.setdefault(identity,identity)
+            cost=event.get('cost')
             if name[1] not in ('Standard','Fast') or cost is None or not math.isfinite(cost) or cost<0:unknown.add(index)
-            else:additions[index][math.floor(event['ts']/BUCKET_SECONDS)][name]+=cost
+            else:additions.append((index,math.floor(event['ts']/BUCKET_SECONDS),name,cost))
         for at in interval.get('pending_usage_times',[]):
             index=bisect_left(times,at)
             if index<len(rows):unknown.add(index)
+    # Consume equal-index contributions in their original summation order.
+    # Retain one flat entry per event, not three nested maps per request.
+    additions.sort(key=lambda event:event[0]);additions.reverse()
     bins={};spans=[]
     for index in range(1,len(rows)):
         previous,row=rows[index-1:index+1]
@@ -41,7 +44,10 @@ def prepare_model_share(series, intervals):
         item=bins.setdefault(bucket,dict(costs={},unknown=False))
         before=previous.get('period_cost',previous.get('cycle_cost'))
         after=row.get('period_cost',row.get('cycle_cost'))
-        values=additions[index]
+        while additions and additions[-1][0]<index:additions.pop()
+        values=defaultdict(lambda:defaultdict(float))
+        while additions and additions[-1][0]==index:
+            _,event_bucket,name,cost=additions.pop();values[event_bucket][name]+=cost
         verified=(before is not None and after is not None and
                   math.isclose(after-before,sum(sum(costs.values()) for costs in values.values()),rel_tol=0,abs_tol=1e-7))
         item['unknown']|=not verified or index in unknown

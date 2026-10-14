@@ -86,22 +86,22 @@ class EvidenceStore:
               observation_missing=False,request_observed_at=None,generation_observed_at=None,completed_observed_at=None,
               generation_latency_ms=None,completion_latency_ms=None,cache_policy='',wire_service_tier_present=None):
         # An explicit allowlist: no headers, URLs, prompts, outputs or exception text.
+        timings=(int(bool(observation_missing)),request_observed_at,generation_observed_at,completed_observed_at,
+                 generation_latency_ms,completion_latency_ms)
+        timings=tuple(v if isinstance(v,(int,float)) and math.isfinite(v) and v>=0 else None for v in timings)
+        present=int(wire_service_tier_present) if type(wire_service_tier_present) is bool else None
         self.db.execute('''INSERT INTO model_observations
             (home,attempt,ts,transport,response_id,requested_model,response_model,status,conflict,
-             requested_service_tier,response_service_tier) VALUES(?,?,?,?,?,?,?,?,?,?,?)''',
+             requested_service_tier,response_service_tier,observation_missing,request_observed_at,
+             generation_observed_at,completed_observed_at,generation_latency_ms,completion_latency_ms,
+             cache_policy,wire_service_tier_present) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
                         (home_key(home), identifier(attempt), float(ts),
                          transport if transport in ('WebSocket', 'HTTP/SSE') else '',
                          identifier(response_id), identifier(requested_model), identifier(response_model),
                          status if status in ('pending', 'created', 'completed', 'failed', 'incomplete', 'cancelled',
                                               'disconnected', 'http_error', 'unparsed') else '', int(bool(conflict)),
-                         identifier(requested_service_tier), identifier(response_service_tier)))
-        values=(int(bool(observation_missing)),request_observed_at,generation_observed_at,completed_observed_at,
-                generation_latency_ms,completion_latency_ms)
-        values=tuple(v if isinstance(v,(int,float)) and math.isfinite(v) and v>=0 else None for v in values)
-        self.db.execute('UPDATE model_observations SET '+','.join(k+'=?' for k in TIMING_FIELDS)+
-                        ',cache_policy=? WHERE seq=last_insert_rowid()',(*values,identifier(cache_policy)))
-        present=int(wire_service_tier_present) if type(wire_service_tier_present) is bool else None
-        self.db.execute('UPDATE model_observations SET wire_service_tier_present=? WHERE seq=last_insert_rowid()',(present,))
+                         identifier(requested_service_tier), identifier(response_service_tier),
+                         *timings,identifier(cache_policy),present))
         self.db.commit()
 
     def gap(self,start,end):

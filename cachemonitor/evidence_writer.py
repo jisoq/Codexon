@@ -50,11 +50,16 @@ class EvidenceWriter:
         store=None
         try:
             while not self.stopping.is_set() or not self.queue.empty():
-                try:record=self.queue.get(timeout=.05)
+                # New records wake Queue.get immediately. Healthy idle storage
+                # has no polling duty; only an unsaved gap needs a retry clock.
+                try:record=self.queue.get(timeout=1 if self.pending_gap else None)
                 except Empty:
                     if store and self.pending_gap:
                         try:self.flush_gap(store)
                         except (sqlite3.Error,OSError):pass
+                    continue
+                if record is None:
+                    self.queue.task_done()
                     continue
                 try:
                     if store is None:store=self.factory(self.path)
@@ -77,5 +82,9 @@ class EvidenceWriter:
                     observation_gap_pending=self.pending_gap is not None)
 
     def close(self,timeout=5):
-        self.closed=True; self.stopping.set(); self.thread.join(timeout)
+        if not self.closed:
+            self.closed=True; self.stopping.set()
+            try:self.queue.put_nowait(None)
+            except Full:pass  # A full queue already keeps the draining writer awake.
+        self.thread.join(timeout)
         return not self.thread.is_alive() and self.pending_gap is None

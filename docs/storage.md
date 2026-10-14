@@ -1,9 +1,15 @@
 # Storage and long-term retention
 
-The retention requirement is to preserve all usage records and per-call detail.
-Space optimization must not sample observations, round timestamps, discard old
-calls, or replace detailed history with totals. The underlying Codex recordings
-are external inputs, not files this application may clean up.
+Existing usage records and per-call detail must remain intact. Lossless storage
+changes must preserve every recorded field and timestamp. The current resource
+audit also permits explicitly budgeted changes to future collection cadence or
+precision, after measuring their accounting impact. That permission does not
+authorize deleting or sampling previously stored observations. The underlying
+Codex recordings are external inputs, not files this application may clean up.
+
+The broader CPU, memory, I/O and network investigation is tracked in
+[the resource audit](resource-audit.md). Its remaining acceptance gates are
+explicit; the earlier storage cleanup is not completion of that investigation.
 
 ## Writers and ownership
 
@@ -31,6 +37,26 @@ Default database locations are resolved by `usage_paths.index_location`,
 `quota_cycles.ledger_path`, and `model_evidence.default_path`. Saved overrides in
 `launch_context.connection_paths` take precedence. Inventory actual resolved
 paths, including packaged-app redirection, before maintaining files.
+
+## Retained event storage
+
+The usage index stores source paths and session owners once and references
+their identifiers from each event. Eligible JSON payloads use lossless zlib
+compression when it saves at least 10%; other payloads retain their original
+content. Decoding preserves the exact JSON text and limits expanded payloads
+to 2 MiB. Ordering, source-position replacement and quota import remain intact.
+
+Existing events convert in small transactions while both formats remain
+readable. The old rows disappear only when their replacements commit. A
+restart resumes conversion, and low disk space or a pinned journal reader
+defers optional maintenance. Audit and repair readers can open either format
+read-only. Earlier application binaries cannot open the converted schema.
+
+Conversion makes freed pages reusable but does not automatically shrink the
+database file. The measured 66.1% full-index file reduction includes a separate
+VACUUM on an isolated copy. Conversion and compaction both write data and need
+temporary space; their costs are listed in [the resource audit](resource-audit.md).
+These source changes have not replaced the installed executable or production index.
 
 ## Measurement on 2026-10-14
 
@@ -74,7 +100,8 @@ Retaining every record cannot provide a constant total storage ceiling. Separate
 usage-dependent history from bounded caches and per-update artifacts. Never
 introduce a history TTL to satisfy a cache budget.
 
-For a workload illustration, seven complete local dates, October 7-13, contained
+For a workload illustration before the event-format change, seven complete
+local dates, October 7-13, contained
 29,184 index events and 37,332 model-evidence observations. The contemporary
 databases used approximately 1,334 bytes per index event and 310 bytes per model
 observation, including their current indexes and database overhead. Multiplying
@@ -92,32 +119,103 @@ The 5-second minimum would reach about 5.02 GiB/year if sustained continuously.
 These are cadence scenarios for one monitored stream, excluding table/index
 overhead and other accounting records, not measurements of actual uptime.
 
-Quota JSON now omits formatting whitespace while preserving all fields and
-timestamps. In the observed data, compact serialization reduced encoded JSON
-from 33,495,998 to 31,388,223 bytes. This is a payload measurement, not a promise
-of equal filesystem savings; existing rows are not rewritten on every startup.
+The earlier compact-JSON change reduced encoded payloads from 33,495,998 to
+31,388,223 bytes on its input. New observations now additionally share compressed
+account/window/credit metadata and refer to matching requested/received columns.
+All fields, exact timestamps and numeric types remain recoverable. Legacy JSON
+is still read directly; small or oversized payloads remain in that format when
+normalization would not save space or would exceed the 256 KiB encoding budget.
+Template reuse is limited to 64 entries within a 1 MiB accounted cache budget.
+
+For the same 1,000 actual observations, integrated ledger growth falls from
+2,109,440 to 987,136 bytes. Actual file writes including the final checkpoint
+fall from 75,184,504 to 71,707,064 bytes, a separate 4.6% reduction. CPU and elapsed
+ranges overlap across two samples per version. Complete field hashes and
+termination tests preserve the original data and committed new observations.
+Including durable backlog receipt and acknowledgment, writes fall from
+97,681,784 to 94,204,344 bytes per 1,000 observations in alternating repeats.
+Short windows can cost more while introducing their first shared context.
+The format-only five-store comparison writes 478,016 / 486,256 bytes idle and
+2,365,040 / 2,373,280 bytes active with raw / shared quota payloads. Its final
+checkpoints add 131,072 / 139,264 and 462,848 / 471,040 bytes respectively.
+Each pair starts with one new context. The additional 16,432 bytes, including
+checkpoint, belong entirely to that context's first table and index pages.
+The active fixture preserves source modification times so initial indexing order
+and page layout match. These are controlled writer measurements; full application
+I/O includes other processes, IPC and network activity.
+
+The actual median-day cohort also contains 302 local observations, 355 imported
+history observations and 68 archived corrections, beyond its 725 live polls.
+Replaying those populations reduces ledger growth from 2,138,112 to 1,191,936
+bytes, preserving all fields. Combined with the measured request/attempt
+coefficients, that usage component projects 2,940,412 bytes/day or about
+1.07 GB/year. This is a scenario using the same workload every day, not a
+measured daily growth rate or a complete installation footprint. Actual rate or
+calculation-policy changes can revisit all retained calls and must be budgeted separately.
+See [resource audit](resource-audit.md) for populations, the heavy-use case,
+three-year projections and excluded owners.
+
+Price verification dates and display metadata now preserve the existing
+calculation when rates, multipliers, aliases and policy are unchanged. The full
+new price snapshot is still recorded, and each call retains its original price
+identifier. No previous calculation or observation is deleted. In the controlled
+10,000-call case, a verification-only update adds 8,192 bytes instead of
+2,924,544 bytes and creates no per-call archive versions. Actual calculation
+changes retain the original repricing and archival behavior. Missing or
+incomplete historical snapshots also reprice conservatively. Equivalence
+lookups are bounded to 64 entries and 64 KiB of accounted storage per ledger.
+
+Existing rows now convert in resumable transactions at initialization and after
+collection synchronization. Each pass scans at most 512 records, prepares at
+most 1 MiB of accounted row data and uses a 25 ms preparation deadline. It
+yields under low space, writer contention or a pinned oversized WAL. Oversized,
+invalid or unprofitable legacy payloads remain intact. Equivalent row replacement
+preserves sequence numbers and does not invalidate historical report caches.
+
+On the full fixed quota copy, conversion releases 35,471,360 bytes of reusable
+database pages without removing any record. It takes 2.465 seconds across 137
+batches in the exclusive measurement and writes 296,489,400 bytes once. The
+longest batch is 33.97 ms. Termination at four transaction boundaries preserves
+all committed records, keeps report revisions unchanged and resumes successfully.
+
+The main file stays approximately 246.7 MB while SQLite can reuse its freed
+pages. Separate offline VACUUM reduces the copy to 208,510,976 bytes, but writes
+another 627,041,424 bytes. That filesystem-shrink operation is not automatic.
+Older binaries cannot decode the new BLOB payloads, so coordinated upgrade and
+rollback must respect the activation boundary. Activation rollback happens
+before the replacement GUI opens these databases. A real installed-binary to
+current-source GUI handoff preserves all records on a small two-home fixture;
+final frozen-package and managed-service checks remain. Retired usage imports
+now accept both partially and fully converted event stores without changing
+their existing events. An arbitrary older binary cannot read the converted
+stores. The installed executable and actual history remain unchanged. The
+cadence estimates above describe legacy raw JSON, not the new total growth.
 
 ## Long-term alternative: lossless cold history
 
-Monthly cold archives are a design alternative, not a currently implemented
-retention or query policy. A suitable implementation would:
+Whole-file cold archives were evaluated on a fixed 246,681,600-byte quota copy.
+Zlib level 1 produced 58,471,870 bytes and restored the exact original file in
+0.607 seconds. Restoration wrote 246,681,600 temporary bytes before a detail
+query could run. An already available indexed query took about 0.005 seconds.
+These are controlled single runs, not cold-disk or whole-application timings.
 
-1. Keep recent detailed records online and move closed, immutable ranges into
-   compressed SQLite archives. Preserve every row, identifier, timestamp, price
-   policy and cross-boundary reference.
-2. Verify row counts, content hashes and SQLite integrity before committing an
-   archive manifest or removing the corresponding online rows. A failed or
-   interrupted archive leaves its source usable.
-3. Limit each uncompressed archive chunk to 256 MiB and the extracted read cache
-   to two chunks (512 MiB). Process archives sequentially for all-history queries.
-   These limits bound temporary work, not the user's retained history.
-4. Load older detail on demand and retain a searchable catalog. Full-history
-   totals must include archived records rather than silently restricting scope.
-5. Report additional first-access/decompression latency separately from storage
-   savings. Archive creation needs explicit low-space handling and a resumable
-   checkpoint before it is suitable for background operation.
+Correcting one old request in an already extracted chunk took 24,680 write
+bytes for the database edit. Preserving the old archive, staging its replacement,
+recompressing, validating and publishing it raised total writes to 305,179,694
+bytes and elapsed time to 2.322 seconds. Killing an unpublished compressor left
+the old catalog unchanged; the truncated candidate was rejected. All experiments
+used private copies, and no production records were archived or removed.
 
-This preserves accuracy and record completeness while reducing cold-storage
-cost. It requires coordinated changes to the index, evidence join, quota reader
-and history queries; compressing or deleting one database independently is not
-an implementation of that architecture.
+Decision: do not enable whole-file or monthly archives as the runtime policy.
+Current reports still replay all history, so compression alone adds restoration
+and rewrite work without fixing that CPU cost. The next design must read closed
+detail on demand and keep full-history totals correct. Independently readable
+chunks, late corrections, cross-period references and all participating readers
+must be evaluated together before selecting an archive format.
+
+The trial kept chunks below 256 MiB and two extracted copies below 512 MiB,
+but correction staging raised decoded/staged storage to 740,110,336 bytes.
+Archives, candidates and small receipts brought the complete trial to
+913,756,385 bytes. A read-cache limit therefore does not bound publication space.
+Total preserved history can keep growing; active memory and temporary work
+need separate limits. See [resource audit](resource-audit.md) for measurements.

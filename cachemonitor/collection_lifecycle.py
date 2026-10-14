@@ -11,6 +11,7 @@ import tempfile
 from .proxy_target import option
 from . import proxy_identity as identity
 from .usage_paths import index_location,legacy_index_location
+from .event_store import index_tables_valid
 
 
 def startup_snapshot(channel):
@@ -62,7 +63,7 @@ def migrate_default_index(channel):
     try:
         with closing(sqlite3.connect(source.as_uri()+'?mode=ro',uri=True)) as old:
             tables={row[0] for row in old.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-            if not {'files','events','metadata'}.issubset(tables) or tables-{'files','events','metadata','usage_archive'}:
+            if not index_tables_valid(tables,require_core=True):
                 raise RuntimeError('이전 사용량 색인의 형식을 확인하지 못했습니다. 원본을 보존합니다.')
             with closing(sqlite3.connect(temporary)) as new:
                 old.backup(new)

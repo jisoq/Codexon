@@ -40,11 +40,17 @@ def test_enrichment_requires_same_home_session_and_turn_and_persists(tmp_path):
     ledger=QuotaLedger(tmp_path/'ledger.sqlite')
     first=snapshot();ledger.enrich_modes(first)
     assert [s['history'][0]['service_tier'] for s in first['sessions']]==['Fast','미확인','미확인']
+    statements=[];ledger.db.set_trace_callback(statements.append)
     second=snapshot();ledger.enrich_modes(second)
+    ledger.db.set_trace_callback(None)
+    assert not any(sql.startswith('BEGIN') for sql in statements)
     assert [s['usage_revision'] for s in first['sessions']]==[s['usage_revision'] for s in second['sessions']]
     ledger.close()
     ledger=QuotaLedger(tmp_path/'ledger.sqlite')
+    statements=[];ledger.db.set_trace_callback(statements.append)
     restored=snapshot();ledger.enrich_modes(restored)
+    ledger.db.set_trace_callback(None)
+    assert not any(sql.startswith('BEGIN') for sql in statements)
     assert restored['sessions'][0]['history'][0]['service_tier']=='Fast'
     ledger.close()
 

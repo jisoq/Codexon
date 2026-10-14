@@ -1,9 +1,8 @@
 """Compare optimized results with a supplied pre-change analytics module on an index snapshot."""
-import argparse,importlib.util,json,math,sqlite3,sys,time
+import argparse,importlib.util,json,math,sys,time
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from cachemonitor.index import UsageIndex
-from cachemonitor.core import SessionRegistry
 from cachemonitor.analysis_engine import AnalysisEngine
 from cachemonitor.analytics import comparison_view,overview_view
 
@@ -15,12 +14,9 @@ def main():
     args=parser.parse_args()
     spec=importlib.util.spec_from_file_location('cachemonitor._reference',args.reference)
     reference=importlib.util.module_from_spec(spec); spec.loader.exec_module(reference)
-    idx=UsageIndex.__new__(UsageIndex)
-    idx.db=sqlite3.connect(Path(args.index).resolve().as_uri()+'?mode=ro',uri=True)
-    idx.metadata={(r[0],r[1]):json.loads(r[2]) for r in idx.db.execute('select home,tid,data from metadata')}
-    idx.monitor=SessionRegistry(); idx.loaded=set(); idx.turn_states={}
+    idx=UsageIndex.for_replay(args.index)
     now=time.time()
-    for key in idx.db.execute('select distinct home,tid from events').fetchall(): idx.rebuild(key,now)
+    for key in idx.event_store.owners().fetchall(): idx.rebuild(key,now)
     sessions=[]
     for key,s in idx.monitor.sessions.items():
         if s.excluded_title or not s.requests: continue
@@ -28,7 +24,7 @@ def main():
         v.update(title=m.get('name') or m.get('title') or s.title,archived=bool(m.get('archived')),
                  source=m.get('thread_source') or 'unknown',turn_states=idx.turn_states.get(key,{}))
         sessions.append(v)
-    idx.db.close()
+    idx.close()
     engine=AnalysisEngine(); engine.ingest(sessions)
     compared=0; max_error=0
     def equal(a,b,path='root'):

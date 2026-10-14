@@ -47,6 +47,29 @@ def test_conflicting_usage_stops_retirement_without_overwrite(tmp_path):
     assert old.exists()
 
 
+@pytest.mark.parametrize('conversion_complete',[False,True])
+def test_historical_usage_import_preserves_compressed_index(tmp_path,conversion_complete):
+    from cachemonitor.event_store import EventStore,unpack_event
+    old=tmp_path/'cache-control.sqlite';legacy_db(old);index=tmp_path/'index.sqlite'
+    event=('retained',1,'home','thread',1.25,json.dumps({'preserved':'기록'*128}))
+    with closing(sqlite3.connect(index)) as db,db:
+        db.execute('CREATE TABLE events(path TEXT,pos INTEGER,home TEXT,tid TEXT,ts REAL,data TEXT,PRIMARY KEY(path,pos))')
+        db.execute('INSERT INTO events VALUES(?,?,?,?,?,?)',event)
+    with closing(sqlite3.connect(index)) as db:
+        store=EventStore(db,index)
+        if conversion_complete:assert store.migrate()==1 and not store.pending
+    assert import_usage(old,index)==1 and import_usage(old,index)==1
+    with closing(sqlite3.connect(index)) as db:
+        row=db.execute('SELECT path,pos,home,tid,ts,data FROM event_rows').fetchone()
+        assert (*row[:5],unpack_event(row[5]))==event
+        saved=json.loads(db.execute('SELECT data FROM usage_archive').fetchone()[0])
+        assert saved['key']=='response' and saved['input']==100 and saved['cached']==80
+        assert db.execute('PRAGMA integrity_check').fetchone()[0]=='ok'
+        db.execute('CREATE TABLE unrelated(value TEXT)');db.commit()
+    with pytest.raises(ValueError,match='Unexpected usage database'):import_usage(old,index)
+    assert old.exists()
+
+
 def test_receipt_free_release_requires_clean_exit_and_durable_settlement(tmp_path):
     from cachemonitor.retired_cache import verify_legacy_settlement
     old=tmp_path/'cache-control.sqlite';legacy_db(old)

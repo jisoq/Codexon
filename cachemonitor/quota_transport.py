@@ -1,14 +1,15 @@
 """Transfer quota graphs in bounded frames without losing shared row identities.
 
-The payload is built-in display data, not arbitrary Python objects. Compound
-lists and dictionaries use stable placeholders. Small, bounded subtrees stay
-inline, so an observation row does not need a separate transport frame.
+The payload uses built-in display fields and an explicit packed-row container.
+Lists, dictionaries and packed rows use stable placeholders. Small, bounded
+subtrees stay inline, so an observation row needs no separate transport frame.
 """
 from collections import deque
 from io import BytesIO
 import gc
 import pickle
 import time
+from .quota_cycles import _PackedRows
 
 
 MAGIC = 'codexon-quota-frames-1'
@@ -93,6 +94,15 @@ class _GraphPickler(pickle.Pickler):
 
     def persistent_id(self, value):
         kind = type(value)
+        if kind is _PackedRows:
+            identity=id(value)
+            reference=self.references.get(identity)
+            if reference is None:
+                reference=('packed_rows',len(self.references),len(value.blocks))
+                self.references[identity]=reference
+                self.pending.append(dict(reference=reference,source=value,
+                    entries=iter(zip(value.ends,value.blocks)),offset=0))
+            return reference
         if kind not in (dict, list):
             if kind not in (tuple, str, bytes, int, float, bool, type(None)):
                 raise TransferError('Unsupported quota display value: ' + kind.__name__)
@@ -182,14 +192,15 @@ class _GraphUnpickler(pickle.Unpickler):
 
     def persistent_load(self, reference):
         if (type(reference) is not tuple or len(reference) != 3
-                or reference[0] not in ('dict', 'list')
+                or reference[0] not in ('dict', 'list', 'packed_rows')
                 or type(reference[1]) is not int or reference[1] < 0
                 or type(reference[2]) is not int or reference[2] < 0):
             raise TransferError('Invalid quota display reference')
         kind, identifier, count = reference
         existing = self.references.get(identifier)
         if existing is None:
-            existing = dict(kind=kind, count=count, received=0, value={} if kind == 'dict' else [])
+            value={} if kind=='dict' else _PackedRows(()) if kind=='packed_rows' else []
+            existing = dict(kind=kind, count=count, received=0, value=value)
             self.references[identifier] = existing
             if not count:
                 self.completed += 1
@@ -240,11 +251,20 @@ def receive_result(connection, cancelled=lambda: False, *, statistics=None):
                         raise TransferError('Out-of-order quota display data')
                     if target['kind'] == 'dict':
                         target['value'].update(items)
+                    elif target['kind']=='packed_rows':
+                        rows=target['value']
+                        for item in items:
+                            if (type(item) is not tuple or len(item)!=2 or type(item[0]) is not int
+                                    or item[0]<=rows.count or type(item[1]) is not bytes):
+                                raise TransferError('Invalid packed quota rows')
+                            end,block_bytes=item
+                            rows.ends.append(end);rows.blocks.append(block_bytes);rows.count=end
                     else:
                         target['value'].extend(items)
                     target['received'] += len(items)
                     if target['received'] == target['count']:
-                        if len(target['value']) != target['count']:
+                        actual=(len(target['value'].blocks) if target['kind']=='packed_rows' else len(target['value']))
+                        if actual != target['count']:
                             raise TransferError('Incomplete quota display data')
                         unpickler.completed += 1
             elif kind == 'done' and started:

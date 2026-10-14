@@ -47,6 +47,17 @@ def test_native_quota_series_matches_reference(native, monkeypatch, count):
     actual = prepare_series(rows)
     assert actual == expected
     assert actual['rows'] is rows
+    if count==1537:
+        import pickle
+        from cachemonitor.quota_cycles import _PackedRows
+        packed=_PackedRows(rows)
+        assert prepare_series(packed)==expected
+        for index in (0,512,1024,1536,-1):assert packed[index]==rows[index]
+        assert packed[510:514]==rows[510:514]
+        assert len(packed._cache)<=2
+        restored=pickle.loads(pickle.dumps(packed))
+        assert not restored._cache and restored==rows
+        assert prepare_series(restored)==expected
 
 
 def test_native_completed_costs_hold_idle_plateau_and_preserve_account_boundary(native, monkeypatch):
@@ -59,6 +70,8 @@ def test_native_completed_costs_hold_idle_plateau_and_preserve_account_boundary(
     expected = prepare_series(rows)
     monkeypatch.setenv('CODEXON_CPU_BACKEND', 'rust')
     assert prepare_series(rows) == expected
+    from cachemonitor.quota_cycles import _PackedRows
+    assert prepare_series(_PackedRows(rows)) == expected
     assert expected['completed_costs'] == [2, 2, 1, 1, None, None]
 
 

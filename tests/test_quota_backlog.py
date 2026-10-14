@@ -1,6 +1,83 @@
 import sqlite3
+import pytest
 
 from cachemonitor.quota_backlog import ObservationBacklog
+
+
+def _commit_backlog_then_wait(path,control):
+    backlog=ObservationBacklog(path,'home')
+    for at in (1,2,3):assert backlog.append('quota',{'observed_at':at})
+    backlog.acknowledge(backlog.first()[0])
+    control.send('committed')
+    control.recv()
+
+
+@pytest.mark.integration
+def test_committed_backlog_survives_forced_termination(tmp_path):
+    import multiprocessing as mp
+    path=tmp_path/'killed.sqlite'
+    context=mp.get_context('spawn');parent,pipe=context.Pipe()
+    child=context.Process(target=_commit_backlog_then_wait,args=(str(path),pipe))
+    child.start();pipe.close()
+    try:
+        assert parent.poll(15),f'backlog did not commit; exit={child.exitcode}'
+        assert parent.recv()=='committed'
+        child.kill();child.join(10)
+        assert not child.is_alive() and child.exitcode!=0
+        restored=ObservationBacklog(path,'home')
+        try:
+            for at in (2,3):
+                item=restored.first();assert item[1:]==('quota',{'observed_at':at})
+                restored.acknowledge(item[0])
+            assert restored.first() is None
+            assert restored.db.execute('pragma integrity_check').fetchone()[0]=='ok'
+        finally:restored.close()
+    finally:
+        if child.is_alive():child.kill()
+        child.join(10);parent.close()
+
+
+def test_pinned_reader_bounds_journal_and_recovery_preserves_ingress(tmp_path,monkeypatch):
+    monkeypatch.setattr('cachemonitor.quota_backlog.local_wal',lambda path:True)
+    backlog=ObservationBacklog(tmp_path/'pinned.sqlite','home')
+    backlog.MAX_WAL_BYTES=64*1024
+    db=backlog.connection();db.execute('pragma wal_checkpoint(truncate)')
+    assert backlog.append('quota',{'observed_at':0})
+    reader=sqlite3.connect(backlog.path)
+    reader.execute('begin');reader.execute('select * from pending').fetchall()
+    accepted=[0]
+    try:
+        for at in range(1,100):
+            if not backlog.available():break
+            assert backlog.append('quota',{'observed_at':at});accepted.append(at)
+        else:pytest.fail('pinned reader did not apply journal backpressure')
+        size=backlog.wal_path.stat().st_size
+        assert size<backlog.MAX_WAL_BYTES+backlog.MAX_ITEM_BYTES
+        # An observation already in flight still gets the existing one-item RAM
+        # reserve; no later acquisition is allowed until recovery.
+        assert backlog.append('quota',{'observed_at':100})
+        assert backlog.unsaved is not None and not backlog.available()
+        assert backlog.wal_path.stat().st_size==size
+        reader.rollback();reader.close();reader=None
+        assert backlog.available()
+        for at in accepted+[100]:
+            item=backlog.first();assert item[1:]==('quota',{'observed_at':at})
+            backlog.acknowledge(item[0])
+        assert backlog.first() is None and backlog.unsaved is None
+    finally:
+        if reader:reader.close()
+        backlog.close()
+
+
+def test_remote_storage_keeps_rollback_recovery(tmp_path,monkeypatch):
+    monkeypatch.setattr('cachemonitor.quota_backlog.local_wal',lambda path:False)
+    backlog=ObservationBacklog(tmp_path/'remote.sqlite','home')
+    try:
+        assert backlog.append('quota',{'observed_at':1})
+        assert backlog.db.execute('pragma journal_mode').fetchone()[0]=='delete'
+        assert backlog.close()
+        assert backlog.first()[1:]==('quota',{'observed_at':1})
+    finally:backlog.close()
 
 
 def test_capacity_preserves_order_and_reopens_without_losing_distinct_observations(tmp_path):

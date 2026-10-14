@@ -4,6 +4,7 @@ import sqlite3
 from cachemonitor.analytics import analyze
 from cachemonitor.core import Session, session_lineage
 from cachemonitor.index import UsageIndex, sanitized
+from cachemonitor.event_store import unpack_event
 from cachemonitor.pricing import request_tier
 from test_core import TID, event, fixture_home
 from test_index import finish
@@ -72,7 +73,7 @@ def test_child_calls_use_own_applied_settings_and_keep_old_unknown_on_append_res
         child_current=next(r for r in analysis['responses'] if r['key']=='new-child-response')
         assert child_current['sid']==CHILD and child_current['cost'] is not None
         persisted=''.join(row[0] for row in index.db.execute('select data from metadata'))
-        persisted+=''.join(row[0] for row in index.db.execute('select data from events'))
+        persisted+=''.join(unpack_event(row[0]) for row in index.db.execute('select data from events'))
         assert 'PRIVATE_SENTINEL' not in persisted
     finally:index.close()
     index=UsageIndex([home],cache)

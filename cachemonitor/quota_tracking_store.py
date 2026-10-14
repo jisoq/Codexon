@@ -2,8 +2,11 @@
 import json
 import time
 import os
+from dataclasses import replace
+from . import quota_payloads
 
 POLICY_VERSION = "continuous-account-v2"
+REPLAY_CACHE_BYTES = 64*1024*1024
 from .quota_tracking import Observation, TrackingState
 
 
@@ -31,6 +34,7 @@ def initialize(db):
         -- append-only journal has no reader and must not grow with every refresh.
         DROP TABLE IF EXISTS tracking_activity_versions;
     ''')
+    quota_payloads.initialize(db)
     _initialize_activity_revisions(db)
 
 
@@ -198,9 +202,9 @@ def observe(db, home, quota):
                    (home,min(requested,quota['observed_at']),max(requested,quota['observed_at'])))
         db.commit()
         return
-    db.execute('insert into tracking_observations(home,requested,received,data) values(?,?,?,?)',
-               (home, quota.get('requested_at', quota['observed_at']), quota['observed_at'],
-                json.dumps(quota,separators=(',',':'))))
+    data, context = quota_payloads.encode(db, quota, requested, quota['observed_at'])
+    db.execute('insert into tracking_observations(home,requested,received,data,payload_context) values(?,?,?,?,?)',
+               (home, requested, quota['observed_at'], data, context))
     db.commit()
 
 
@@ -211,7 +215,8 @@ def failed_observation(db, home, at):
         db.commit()
 
 
-def build(db, home, now, *, context_only=False, read_rows=None):
+def build(db, home, now, *, context_only=False, read_rows=None, pack_groups=False,
+          replay_cache=None, changes=None):
     config = db.execute('select started from tracking_config where home=?', (home,)).fetchone()
     if not config:
         return None
@@ -223,63 +228,116 @@ def build(db, home, now, *, context_only=False, read_rows=None):
                     ownership_gaps=[],phase='off',started=None,policy=POLICY_VERSION,
                     complete=False,lookup_failed=False,last_observed_at=None,pending_responses=[])
     started = policy[0]
-    latest = db.execute('select data from tracking_observations where home=? and requested>=? and received<=? order by received desc,seq desc limit 1',
+    payloads = quota_payloads.PayloadReader(db)
+    latest = db.execute('select * from tracking_observations where home=? and requested>=? and received<=? order by received desc,seq desc limit 1',
                         (home, started, now)).fetchone()
-    account = json.loads(latest[0]).get('account') if latest else None
+    account = payloads.decode(latest).get('account') if latest else None
     controls = list(db.execute('select at,enabled from tracking_controls where home=? and at>=? and at<=? order by at', (home, started, now)))
     if context_only:
         return dict(account=account, controls=[dict(r) for r in controls])
     homes = [home]
     if account:
         for candidate in db.execute('select home,started from tracking_config where home<>?', (home,)):
-            other = db.execute('select data from tracking_observations where home=? and requested>=? and received<=? order by received desc,seq desc limit 1',
+            other = db.execute('select * from tracking_observations where home=? and requested>=? and received<=? order by received desc,seq desc limit 1',
                                (candidate['home'], candidate['started'], now)).fetchone()
-            if other and json.loads(other[0]).get('account') == account:
+            if other and payloads.decode(other).get('account') == account:
                 homes.append(candidate['home'])
     slots = ','.join('?' for _ in homes)
-    state = TrackingState(started)
-    timeline = [(r['at'], 0, r['at'], bool(r['enabled'])) for r in controls]
-    raw = {}
+    if not pack_groups:replay_cache=None
+    cached=replay_cache.get('checkpoint') if pack_groups and replay_cache is not None and changes is not None else None
+    if replay_cache is not None:replay_cache.clear()
+    if cached and (cached['key']!=(home,started) or now<cached['at'] or
+        any(table in ('tracking_config','tracking_policies','tracking_controls') or
+            table=='tracking_observations' and (at is None or at<=cached['at']) for table,at in changes)):
+        cached=None
+    if cached:
+        state=replace(cached['state'],observations=list(cached['state'].observations),
+                      closed=[],resets=replace(cached['state'].resets))
+        raw=dict(cached['raw']);groups=[dict(group) for group in cached['groups']]
+        last_observed_at=cached['last_observed_at']
+        monitoring=cached['monitoring'];enabled_at=cached['enabled_at']
+    else:
+        state = TrackingState(started)
+        raw = {};groups=[];last_observed_at=None
+        monitoring=False;enabled_at=started
+    control_rows=iter(row for row in controls if not cached or row['at']>cached['at'])
+    control=next(control_rows,None)
+    if pack_groups:
+        from .quota_cycles import _PackedRows
+
+    def finish_groups():
+        # A closed segment cannot consume future observations. Transfer its
+        # display rows now instead of retaining every Observation and a second
+        # full timeline until the end of a multi-year replay.
+        closed=state.closed;state.closed=[]
+        for interval in closed:
+            first=interval['start']
+            rows=[raw.pop(value.sequence) for value in interval['observations']]
+            groups.append(dict(id='forward:'+str(first.sequence),observations=_PackedRows(rows) if pack_groups else rows,
+                boundary=first.received_at,reason=interval['reason'],rejected=[],
+                provisional=False,finished_at=None,boundary_pending=False,boundary_uncertain=False))
+
+    def apply_controls(until):
+        nonlocal control,monitoring,enabled_at
+        while control is not None and control['at']<=until:
+            enabled=bool(control['enabled'])
+            if not enabled:
+                state.close('monitoring_off');finish_groups()
+            elif not monitoring:enabled_at=control['at']
+            monitoring=enabled;control=next(control_rows,None)
+
     sql='select * from tracking_observations where home=? and requested>=? and received<=? order by received,seq'
-    records=(read_rows('tracking_observations',sql,(home,started,now),('tracking_observations',),'received',clock=True)
-             if read_rows else db.execute(sql,(home,started,now)))
+    if cached:
+        records=db.execute(sql.replace(' order by',' and received>? order by'),(home,started,now,cached['at']))
+    else:
+        # A checkpoint owns the replay cursor. Keeping a second raw-row cache
+        # here would miss appends consumed only through the checkpoint path.
+        records=(read_rows('tracking_observations',sql,(home,started,now),('tracking_observations',),'received',clock=True)
+                 if read_rows and replay_cache is None else db.execute(sql,(home,started,now)))
+    previous_separate=object()
     for row in records:
-        quota = json.loads(row['data'])
+        # SQL already orders observations. Controls sort before observations
+        # at the same instant, exactly as in the former combined timeline.
+        apply_controls(row['received'])
+        quota = payloads.decode(row)
         window = quota.get('windows', {}).get('weekly')
         if not window or not quota.get('account') or not window.get('resets_at'):
             continue
+        separate=quota.get('separate_models', [])
+        if separate!=previous_separate:
+            separate_epoch=tuple(sorted(separate));separate_text=json.dumps(separate)
+            previous_separate=separate
         epoch = (quota['account'], quota.get('plan_type'), quota.get('bucket'),
-                 window['resets_at'], tuple(sorted(quota.get('separate_models', []))))
+                 window['resets_at'], separate_epoch)
         value = Observation(row['seq'], row['requested'], row['received'], 100-window['used_percent'], epoch,
                             resets_at=window['resets_at'])
+        last_observed_at=row['received']
+        if not monitoring or value.requested_at<enabled_at:continue
         raw[row['seq']] = dict(id='tracking:'+str(row['seq']), at=row['received'],
             used=window['used_percent'], reset=window['resets_at'], minutes=10080,
             account=quota['account'], plan=quota.get('plan_type',''), bucket=quota.get('bucket',''),
-            separate=json.dumps(quota.get('separate_models', [])), source=quota.get('source','live'))
-        timeline.append((row['received'], 1, row['seq'], value))
-    monitoring = False
-    enabled_at = started
-    for at, kind, identity, value in sorted(timeline, key=lambda x: (x[0], x[1], x[2])):
-        if kind == 0:
-            if not value:
-                state.close('monitoring_off')
-            elif not monitoring:
-                enabled_at = at
-            monitoring = value
-        elif monitoring and value.requested_at >= enabled_at:
-            state.observe(value)
-    intervals = list(state.closed)
+            separate=separate_text, source=quota.get('source','live'))
+        previous=state.observations
+        if not state.observe(value):raw.pop(value.sequence)
+        elif previous is not state.observations:
+            # Reset recovery can replace a provisional baseline without closing
+            # it. Those discarded display candidates no longer have a consumer.
+            raw={value.sequence:raw[value.sequence]}
+        finish_groups()
+    apply_controls(now)
+    if pack_groups and replay_cache is not None and changes is not None:
+        # Keep only immutable closed rows and a bounded copy of the unfinished
+        # state. Closing it for display must not discard reset-recovery state
+        # needed by the next observation. Old edits invalidate this checkpoint.
+        weight=sum(512+128*len(group['observations'].blocks)+sum(map(len,group['observations'].blocks)) for group in groups)
+        weight+=sum(768+sum(4*len(v) for v in row.values() if isinstance(v,str)) for row in raw.values())
+        if weight<=REPLAY_CACHE_BYTES:
+            checkpoint=replace(state,observations=list(state.observations),closed=[],resets=replace(state.resets))
+            replay_cache['checkpoint']=dict(key=(home,started),at=now,state=checkpoint,raw=dict(raw),
+                groups=tuple(groups),last_observed_at=last_observed_at,monitoring=monitoring,
+                enabled_at=enabled_at,weight=weight)
     if state.baseline and state.endpoint:
-        intervals.append(dict(start=state.baseline, end=state.endpoint, reason='on',
-                              finished_at=None, boundary_uncertain=False, observations=list(state.observations)))
-    groups = []
-    for interval in intervals:
-        first, last = interval['start'], interval['end']
-        rows = [raw[observation.sequence] for observation in interval['observations']]
-        groups.append(dict(id='forward:'+str(first.sequence), observations=rows,
-            boundary=first.received_at, reason=interval['reason'], rejected=[],
-            provisional=False, finished_at=None, boundary_pending=False,
-            boundary_uncertain=False))
+        state.close('on');finish_groups()
     health_rows = list(db.execute(f'select * from tracking_health where home in ({slots})', homes))
     complete = len(health_rows) == len(homes) and all(h['complete'] and now-h['at'] <= 15 for h in health_rows)
     lookup_failed = bool(db.execute('select 1 from tracking_gaps where home=? and start>=? and end is null', (home, started)).fetchone())
@@ -292,5 +350,5 @@ def build(db, home, now, *, context_only=False, read_rows=None):
                 ownership_gaps=[], phase='on' if monitoring else 'off',
                 started=started, policy=POLICY_VERSION, complete=complete,
                 lookup_failed=lookup_failed,
-                last_observed_at=max((r['at'] for r in raw.values()), default=None),
+                last_observed_at=last_observed_at,
                 pending_responses=pending_responses)
