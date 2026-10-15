@@ -64,7 +64,7 @@ def validate_exclusion(report, start, end, reason=''):
     if not account:
         raise ValueError('계정을 확인한 뒤 구간을 제외하세요.')
     period=bounds=None;has_start=has_end=False
-    for row in _history_rows(report,'weekly',labels=False):
+    for row in _history_rows(report,'weekly',labels=False,_resume=report.get('_history_resume')):
         if row.get('account') != account:
             continue
         if bounds is None or row.get('reset_kind'):

@@ -147,20 +147,6 @@ def group_usage(rows):
     return _group_usage_python(rows)
 
 
-def combined_usage_groups(sessions, scope):
-    buckets = {}
-    for session in sessions:
-        for group in session["groups"][scope]:
-            buckets.setdefault((group["model"], group["effort"]), []).append(group)
-    result = []
-    for (model, effort), groups in buckets.items():
-        merged = summarize(groups)
-        merged["count"] = sum(g["count"] for g in groups) if all(g["count"] is not None for g in groups) else None
-        merged["missing"] = {key: sum(g.get("missing", {}).get(key, 0) for g in groups) for key in METRICS}
-        result.append({"model": model, "effort": effort, **merged})
-    return sorted(result, key=lambda g: g["total"] or 0, reverse=True)
-
-
 TITLE_HANDLER = "codex_core::session::handlers"
 TITLE_PROMPT = "You are a helpful assistant. You will be presented with a user prompt, and your job is to provide a short title for a task that will be created from that prompt."
 
@@ -511,17 +497,15 @@ class Session:
             status = "진행 기록" if now - self.activity < WINDOW else "진행 기록 (갱신 지연)"
         else:
             status = "관찰 중"
-        today = day_start(now)
-        subsets = {"session": history, "today": [r for r in history if r["ts"] >= today],
-                   "30m": [r for r in history if r["ts"] >= now - WINDOW]}
-        totals = {key: old['totals'][key] if same and key=='session' else summarize(rows) for key, rows in subsets.items()}
-        groups = {key: old['groups'][key] if same and key=='session' else group_usage(rows) for key, rows in subsets.items()}
-        unclassified = None
-        observed_total = totals["session"]["total"] or 0
-        if self.reported_usage.get("total", 0) is not None and self.reported_usage.get("total", 0) > observed_total:
-            unclassified = {key: self.reported_usage[key] - totals["session"][key]
-                            if self.reported_usage.get(key) is not None and totals["session"][key] is not None
-                            and self.reported_usage[key] >= totals["session"][key] else None for key in METRICS}
+        # Screen aggregates belong to the selected query, not every source
+        # session's publication. Only unresolved source evidence needs a total.
+        unclassified = old['unclassified'] if same else None
+        if not same and self.reported_usage.get("total") is not None:
+            observed = summarize(history)
+            if self.reported_usage["total"] > (observed["total"] or 0):
+                unclassified = {key: self.reported_usage[key] - observed[key]
+                                if self.reported_usage.get(key) is not None and observed[key] is not None
+                                and self.reported_usage[key] >= observed[key] else None for key in METRICS}
         result = {
             "id": self.id, "home": self.home, "title": self.title or f"세션 {self.id[:8]}",
             "model": self.model, "provider": self.provider, "cwd": self.cwd,
@@ -541,7 +525,7 @@ class Session:
                          for request, detail in zip(requests, self.transport_details_many(requests))],
             "history": connection_history,
             "unmatched_transports": [vars(t) for t in self.transports if (t.ts, t.kind, t.turn) not in matched],
-            "totals": totals, "groups": groups, "unclassified": unclassified,
+            "unclassified": unclassified,
             "coverage_gaps": list(self.coverage_gaps), "coverage_initial":self.coverage_initial,
             "coverage_available":self.coverage_last is not None,
             "transports": [vars(x) for x in self.transports],

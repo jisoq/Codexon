@@ -901,7 +901,7 @@ class QuotaLedger:
     REQUEST_SORT_ROWS=32768
     SYNC_BATCH_ROWS=128
     ARCHIVE_COMPACTION_ROWS=512
-    READER_SCHEMA_VERSION=1
+    READER_SCHEMA_VERSION=2
     FUTURE_COLUMNS=(('observations',('at',)),('window_observations',('at',)),
         ('manual_resets',('at',)),('calls',('ts',)),('tracking_controls',('at',)),
         ('tracking_observations',('received',)),('tracking_tasks',('start','end')),
@@ -1036,6 +1036,8 @@ class QuotaLedger:
         self._initialize_report_revision()
         from .quota_projection import initialize as initialize_projection
         initialize_projection(self.db)
+        from .quota_archive import initialize as initialize_archive
+        initialize_archive(self.db)
         self.db.execute('CREATE TABLE IF NOT EXISTS quota_reader_ready(id INTEGER PRIMARY KEY CHECK(id=1),version INTEGER,price_id TEXT)')
         ready=self.db.execute('SELECT version,price_id FROM quota_reader_ready WHERE id=1').fetchone()
         if ready is None or tuple(ready)!=(self.READER_SCHEMA_VERSION,PRICE_ID):
@@ -1125,12 +1127,17 @@ class QuotaLedger:
                 payload=table=='tracking_observations'
                 if (existing and 'ON CONFLICT(slot)' in existing[0] and
                         (not linked or 'min(changed_at)' in existing[0]) and
+                        (table not in ('tracking_wire','tracking_call_boundaries','tracking_controls') or 'archive_bounds_v1' in existing[0]) and
                         (not payload or 'tracking_payload_migration' in existing[0] and
                          (operation!='UPDATE' or 'old."payload_context"' in existing[0]))):continue
                 self.db.execute(f'DROP TRIGGER IF EXISTS {name}')
                 column={'observations':'at','window_observations':'at','calls':'ts',
-                        'tracking_observations':'received'}.get(table)
+                        'tracking_observations':'received','tracking_wire':'start',
+                        'tracking_call_boundaries':'started','tracking_controls':'at'}.get(table)
                 times=[f'{side}.{column}' for side in (('old','new') if operation=='UPDATE' else ('old',) if operation=='DELETE' else ('new',))] if column else []
+                if table=='tracking_call_boundaries':
+                    times=[f'(COALESCE({side}.started,(SELECT ts FROM calls WHERE home={side}.home AND uid={side}.uid)))'
+                           for side in (('old','new') if operation=='UPDATE' else ('old',) if operation=='DELETE' else ('new',))]
                 if table in ('observation_context','weekly_window_refs'):
                     field='id' if table=='observation_context' else 'observation_id'
                     times=[f'(SELECT at FROM observations WHERE id={side}.{field})' for side in
@@ -1153,7 +1160,7 @@ class QuotaLedger:
                     at='(SELECT min(changed_at) FROM ('+' UNION ALL '.join(linked_times)+'))'
                 # A fixed ring bounds durable change tracking. A lagging reader
                 # reloads authoritative rows if any revision has fallen out.
-                self.db.execute(f'CREATE TRIGGER {name} AFTER {operation} ON {table}{when} BEGIN '
+                self.db.execute(f'CREATE TRIGGER {name} AFTER {operation} ON {table}{when} BEGIN /* archive_bounds_v1 */ '
                     'UPDATE report_revision SET value=value+1 WHERE id=1; '
                     f"INSERT INTO report_changes SELECT value%1024,value,'{table}',{at} FROM report_revision WHERE id=1 "
                     'ON CONFLICT(slot) DO UPDATE SET revision=excluded.revision,table_name=excluded.table_name,at=excluded.at; END')
@@ -1403,10 +1410,10 @@ class QuotaLedger:
                 # One statement journals each touched page once per bounded
                 # batch. Row triggers and the surrounding transaction remain.
                 for prefix,rows,suffix in (
+                    ('insert or replace into calls',call_batch,''),
                     ('insert into tracking_call_boundaries',boundary_batch,
                      ' on conflict(home,uid) do update set started=excluded.started '
-                     'where tracking_call_boundaries.started is not excluded.started'),
-                    ('insert or replace into calls',call_batch,'')):
+                     'where tracking_call_boundaries.started is not excluded.started')):
                     if rows:
                         values=','.join('('+','.join('?' for _ in row)+')' for row in rows)
                         self.db.execute(prefix+' values '+values+suffix,tuple(value for row in rows for value in row))
@@ -1688,7 +1695,7 @@ class QuotaLedger:
             'where o.home=? and o.at>=? and o.at<=? order by o.at,o.id',
             (home,cutoff,now),('observations','observation_context'),'o.at',clock=True)
 
-    def current_report(self,home,now=None):
+    def current_report(self,home,now=None,*,retain_projection=False):
         """Read one valid projected prefix and only its subsequent observations."""
         from .quota_projection import load
         from .quota_tracking_store import build
@@ -1709,6 +1716,11 @@ class QuotaLedger:
             self._tracking_inputs={'checkpoint':projected['tracking']}
             result=self._report(home,now,from_at=projected['start'])
             result.update(_history_resume=projected['resume'],history_pending=True)
+            if retain_projection:
+                result.update(_projection_tracking=dict(self._tracking_inputs),
+                    _projection_revision=self.db.execute('SELECT value FROM report_revision WHERE id=1').fetchone()[0],
+                    _projection_start=projected['start'],
+                    _cycle_versions={key:value[0] for key,value in self._cycle_cache.items()})
             return result
         finally:
             self.db.rollback()

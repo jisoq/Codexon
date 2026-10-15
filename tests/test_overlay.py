@@ -53,6 +53,7 @@ def test_overlay_banner_identifies_each_trigger_without_changing_stale_threshold
 def test_verified_session_displays_during_unrelated_restore_without_hiding_faults(monkeypatch):
     from types import SimpleNamespace
     from cachemonitor.overlay_view import OverlayContent
+    app=QApplication.instance() or QApplication([])
     monkeypatch.setattr('cachemonitor.overlay.time.monotonic',lambda:100.)
     session=dict(id=A,calls=2,collection_complete=True)
     controller=SimpleNamespace(target_state={'selection':Selection(A)},session_lookup={A:[session]},

@@ -1,6 +1,7 @@
 """Non-temporal projections of the engine's owned calls. No source collection."""
 from collections import defaultdict
 import json
+from math import fsum
 from .analytics import output_speed
 from .pricing import request_tier
 from .translation_catalog import CATALOG
@@ -25,9 +26,40 @@ def summary(rows, metric):
     return dict(value=value, known=len(known), total=len(rows), partial=len(known) != len(rows))
 
 
+def call_totals(engine,q):
+    """One compact range aggregate per owner; never retain a second call population."""
+    fields=METRICS[1:-1]
+    counts=0;sessions=0;parts=[]
+    filters=tuple(q.get(k,'') for k in ('model','effort','service_tier'))
+    for state,lo,hi in engine.call_ranges(q):
+        signature=(state.get('content_revision',state['revision']),lo,hi,filters)
+        cached=state.get('call_totals')
+        if cached and cached[0]==signature:
+            part=cached[1]
+        else:
+            values=[0]*len(fields);known=[0]*len(fields);count=0
+            for row in engine.range_calls(state,lo,hi,q):
+                count+=1
+                for i,field in enumerate(fields):
+                    value=row.get(field)
+                    if value is not None:values[i]+=value;known[i]+=1
+            part=(count,tuple(values),tuple(known))
+            state['call_totals']=(signature,part)
+        counts+=part[0];sessions+=bool(part[0]);parts.append(part)
+    totals={'calls':dict(value=counts,known=counts,total=counts,partial=False)}
+    for i,field in enumerate(fields):
+        known=sum(part[2][i] for part in parts)
+        values=(part[1][i] for part in parts)
+        value=(fsum(values) if field=='cost' else sum(values)) if known or not counts else None
+        totals[field]=dict(value=value,known=known,total=counts,partial=known!=counts)
+    return dict(key=engine.query_key(q),revision=engine.revision,lookup={},
+                analysis=dict(response_count=counts,session_count=sessions),usage=dict(totals=totals))
+
+
 def project(engine, q):
     # Display choices never invalidate the population or its aggregation.
     scope = {k:v for k,v in q.items() if k not in ('usage', 'presentation')}
+    if q['page']==0:return call_totals(engine,scope)
     options = q.get('usage', {})
     dimension = options.get('dimension', 'project')
     if dimension not in DIMENSIONS:dimension = 'project'
@@ -37,23 +69,17 @@ def project(engine, q):
     selected = options.get('selected', [])
     selection = dict(zip(selected[::2], selected[1::2])) if len(selected)%2 == 0 else {}
     selection = {key:value for key,value in selection.items() if key in (*DIMENSIONS,*BREAKDOWNS)}
-    signature=(engine.query_key(scope),dimension,metric,tuple(selection.items()),breakdowns)
+    stable={k:v for k,v in scope.items() if k not in ('now','loading') and (q.get('period')=='custom' or k not in ('start','end'))}
+    signature=(engine.query_key(stable,calls_only=True),dimension,metric,tuple(selection.items()),breakdowns)
     cached=getattr(engine,'_category_projection',None)
-    if q['page']==1 and cached and cached[0]==signature:
-        common=cached[1]['common'];rows=None;result={'key':signature[0]}
+    if cached and cached[0]==signature and q.get('now',q['end'])<cached[2]:
+        data=cached[1]
+        common=dict(data['common'],key=engine.query_key(scope),revision=engine.revision)
     else:
-        result = engine.query(scope)
-        rows = result['analysis']['responses']
-        common = dict(key=result['key'], revision=engine.revision, lookup={},
+        rows=[r for state,lo,hi in engine.call_ranges(scope) for r in engine.range_calls(state,lo,hi,scope)]
+        common = dict(key=engine.query_key(scope), revision=engine.revision, lookup={},
                       analysis=dict(response_count=len(rows), session_count=len({(r['home'],r['sid']) for r in rows})))
-    if q['page'] == 0:
-        return dict(common, usage=dict(totals={k:summary(rows,k) for k in METRICS if k != 'tps'}))
-    cross = 'source' if dimension == 'model' else 'model'
-    signature = (result['key'], dimension, metric, tuple(selection.items()), breakdowns)
-    cached = getattr(engine, '_category_projection', None)
-    if cached and cached[0] == signature:
-        data = cached[1]
-    else:
+        cross = 'source' if dimension == 'model' else 'model'
         buckets = defaultdict(list)
         for r in rows:buckets[category(r,dimension)].append(r)
         weights=defaultdict(float)
@@ -103,7 +129,10 @@ def project(engine, q):
                         projects=len({r['project'] for r in rows if category(r,'project')!='미확인'}),
                         unknown_projects=sum(category(r,'project')=='미확인' for r in rows))
         data=dict(common=common,categories=categories,summary=summary(rows,metric),dimension=dimension,metric=metric,cross=cross,detail=detail,breakdowns=list(breakdowns))
-        engine._category_projection=(signature,data) if len(categories)<=160000 else None
+        from .analysis_worker import expiry
+        from .analysis_engine import retained_bytes
+        cached=(signature,data,expiry(engine,q))
+        engine._category_projection=cached if retained_bytes(cached,16*1024*1024)<=16*1024*1024 else None
     categories=data['categories']
     search=options.get('search','').casefold()
     names={'user':'유저 에이전트','subagent':'하위 에이전트','unknown':'미확인'}

@@ -85,17 +85,18 @@ class SnapshotPublisher:
         message.update(protocol=1,epoch=self.epoch,sequence=self.sequence,reset=self.sequence==1,
                        sessions=[s for k,s in sessions.items() if self.sessions.get(k)!=s],
                        overlay_sessions=[s for k,s in overlays.items() if self.overlays.get(k)!=s],
-                       removed=removed,data_revision=engine.revision,
+                       removed=removed,data_revision=engine.revision,call_revision=engine.call_revision,
                        model_candidates=models,cache_candidates=cache,
                        internal_review_calls=sum(len(s['prepared']['history']) for s in engine.internal_sessions.values()))
         self.models={k:v for k,v in self.models.items() if k in sessions}
-        if self.sequence==1 or engine.revision!=getattr(self,'revision',None):
+        if self.sequence==1 or engine.call_revision!=getattr(self,'call_revision',None):
             message['models']=sorted(set().union(*self.models.values()) if self.models else set())
             message['filter_choices']={**self.observed_choices(engine),
                 'homes':sorted(set(snapshot.get('homes',[]))|{s['home'] for s in sessions.values()}),
                 **project_choices(sessions.values()),
                 'sources':sorted({s.get('source','unknown') for s in sessions.values()})}
         self.sessions=sessions;self.overlays=overlays;self.states=dict(engine.sessions);self.revision=engine.revision
+        self.call_revision=engine.call_revision
         return message
 
 

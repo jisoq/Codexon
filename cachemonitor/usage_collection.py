@@ -105,6 +105,8 @@ class LiveCollection:
         prior_activities=previous.get('activity_tokens',{}) if same_owner else {}
         session_tokens={};activity_tokens={}
         sessions={};activities={};manifest=[];activity_manifest=[]
+        prior_entries=previous['entries'] if same_epoch else {}
+        entries={};state_revisions={};meaningful_changed=not same_epoch
         def row(value,old,token,prior,key):
             if token is not None and old is not None and prior.get(key)==token:
                 return old
@@ -119,8 +121,20 @@ class LiveCollection:
             if token is not None:session_tokens[key]=token
             saved=row(heavy,previous['sessions'].get(key) if same_epoch else None,token,prior_sessions,key)
             sessions[key]=saved
-            manifest.append(dict(home=key[0],sid=key[1],revision=saved[0],
-                                 state={key:value for key,value in session.items() if key in self.volatile}))
+            state={field:value for field,value in session.items() if field in self.volatile}
+            old=prior_entries.get(key)
+            if old is not None and old['revision']==saved[0] and old['state']==state:
+                entry=old;state_revisions[key]=previous['state_revisions'][key]
+            else:
+                if (old is None or old['revision']!=saved[0] or
+                        {k:v for k,v in old['state'].items() if k!='remaining'}!=
+                        {k:v for k,v in state.items() if k!='remaining'}):meaningful_changed=True
+                # Source-owned nested values can change after this publication.
+                # Freeze only changed envelopes; unchanged entries are immutable.
+                entry=dict(home=key[0],sid=key[1],revision=saved[0],
+                           state=json.loads(json.dumps(state,ensure_ascii=False)))
+                state_revisions[key]=sequence
+            entries[key]=entry;manifest.append(entry)
         activities_present='request_activity' in snapshot and not snapshot.get('activity_stream')
         activity_revision=changes.activity_revision if trusted else None
         same_activity=(same_owner and activity_revision is not None and
@@ -138,28 +152,24 @@ class LiveCollection:
                 activities[key]=saved
                 activity_manifest.append(dict(home=key[0],attempt=key[1],revision=saved[0]))
         meaningful_index={key:value for key,value in snapshot.get('index',{}).items() if key not in self.counters}
-        meaningful_manifest=[{**entry,'state':{key:value for key,value in entry['state'].items() if key!='remaining'}}
-                             for entry in manifest]
+        membership_changed=(not same_epoch or list(sessions)!=list(previous['sessions']) or
+                            list(activities)!=list(previous['activities']) or
+                            activities_present!=previous['activities_present'])
+        membership_revision=sequence if membership_changed else previous['membership_revision']
+        meaningful_revision=sequence if meaningful_changed or membership_changed else previous['meaningful_revision']
         header={key:value for key,value in snapshot.items() if key not in ('sessions','request_activity')}
         stable={key:value for key,value in header.items() if key not in ('ts','last_usage_collection_success','index')}
         old_manifest=previous['envelope']['activities'] if same_epoch else None
         if same_epoch and (activity_manifest is old_manifest or activity_manifest==old_manifest):
             activity_digest=previous['activity_digest']
         else:activity_digest=publication_fingerprint(activity_manifest)
-        durable=publication_fingerprint((epoch,stable,meaningful_index,meaningful_manifest,activity_digest,
+        durable=publication_fingerprint((epoch,stable,meaningful_index,meaningful_revision,activity_digest,
                                          activities_present))
-        # Serialize mutable envelopes before publication so a later source poll
-        # cannot change an in-flight response or the durable comparison key.
-        if trusted:
-            # Activity entries contain only newly allocated scalar metadata.
-            # Copy mutable source values, without serializing the full retained
-            # activity manifest merely to make another identical list.
-            envelope=json.loads(json.dumps(dict(header=header,sessions=manifest),ensure_ascii=False))
-            envelope['activities']=activity_manifest if activities_present else None
-        else:
-            envelope=json.loads(json.dumps(dict(header=header,sessions=manifest,
-                activities=activity_manifest if activities_present else None),ensure_ascii=False))
+        envelope=dict(header=json.loads(json.dumps(header,ensure_ascii=False)),sessions=manifest,
+                      activities=activity_manifest if activities_present else None)
         return dict(sessions=sessions,activities=activities,envelope=envelope,header=envelope['header'],
+                    entries=entries,state_revisions=state_revisions,membership_revision=membership_revision,
+                    meaningful_revision=meaningful_revision,
                     durable=durable,publication=(epoch,sequence),
                     change_owner=changes.owner if trusted else None,
                     session_tokens=session_tokens,activity_tokens=activity_tokens,
@@ -208,7 +218,8 @@ class LiveCollection:
         if current is None:return dict(ready=False),b''
         if value.get('header_only'):return dict(ready=True,header=current['header']),b''
         # Older clients can still use the unchanged durable SQLite schema.
-        if value.get('protocol')!=3:return dict(ready=False),b''
+        protocol=value.get('protocol')
+        if protocol not in (3,4):return dict(ready=False),b''
         if current['header'].get('activity_stream') and not value.get('activity_stream'):
             return dict(ready=False),b''
         known=value.get('publication')
@@ -216,18 +227,23 @@ class LiveCollection:
                known[0]==current['publication'][0] and type(known[1]) is int and
                0<known[1]<=current['publication'][1] else -1)
         chunks=[]
+        full=protocol==3 or since<current['membership_revision']
         def manifest(entries,rows,id_key):
             result=[]
             for entry in entries:
-                payload=rows[(entry['home'],entry[id_key])][2] if entry['revision']>since else b''
+                key=(entry['home'],entry[id_key])
+                changed=current['state_revisions'][key] if id_key=='sid' else entry['revision']
+                if not full and changed<=since:continue
+                payload=rows[key][2] if entry['revision']>since else b''
                 result.append({**entry,'size':len(payload)})
                 if payload:chunks.append(payload)
             return result
         sessions=manifest(current['envelope']['sessions'],current['sessions'],'sid')
         activities=current['envelope']['activities']
         if activities is not None:activities=manifest(activities,current['activities'],'attempt')
-        return dict(ready=True,protocol=3,publication=current['publication'],header=current['header'],
-                    sessions=sessions,activities=activities),b''.join(chunks)
+        return dict(ready=True,protocol=protocol,publication=current['publication'],header=current['header'],
+                    sessions=sessions,activities=activities,
+                    **(dict(full=full) if protocol==4 else {})),b''.join(chunks)
 
 
 def locked(path):
@@ -456,10 +472,12 @@ class CollectionChannel:
 
     def _read_live(self,metadata,body):
         same_epoch=self.live_publication and self.live_publication[0]==metadata['publication'][0]
+        delta=metadata.get('protocol')==4 and not metadata['full']
+        if delta and not same_epoch:raise CollectionScopeError('수집 결과의 이전 publication이 없습니다.')
         offset=0
         def rows(entries,previous,id_key):
             nonlocal offset
-            current={};result=[]
+            current=(dict(previous) if entries else previous) if delta else {}
             for entry in entries:
                 key=(entry['home'],entry[id_key]);revision=entry['revision'];size=entry['size']
                 if type(size) is not int or size<0 or offset+size>len(body):
@@ -469,15 +487,14 @@ class CollectionChannel:
                     value=json.loads(zlib.decompress(memoryview(body)[offset:offset+size]));offset+=size
                 elif old is not None and old[0]==revision:value=old[1]
                 else:raise CollectionScopeError('수집 결과의 본문 revision이 일치하지 않습니다.')
-                current[key]=(revision,value);result.append(value)
-            return current,result
-        sessions,heavy=rows(metadata['sessions'],self.live_session_cache if same_epoch else {},'sid')
-        result={**metadata['header'],'sessions':[{**session,**entry['state']}
-                for session,entry in zip(heavy,metadata['sessions'],strict=True)]}
+                current[key]=((revision,value,{**value,**entry['state']}) if id_key=='sid' else (revision,value))
+            return current
+        sessions=rows(metadata['sessions'],self.live_session_cache if same_epoch else {},'sid')
+        result={**metadata['header'],'sessions':[row[2] for row in sessions.values()]}
         activities={}
         if metadata['activities'] is not None:
-            activities,result['request_activity']=rows(metadata['activities'],
-                self.live_activity_cache if same_epoch else {},'attempt')
+            activities=rows(metadata['activities'],self.live_activity_cache if same_epoch else {},'attempt')
+            result['request_activity']=[row[1] for row in activities.values()]
         if offset!=len(body):raise CollectionScopeError('수집 결과의 본문 길이가 일치하지 않습니다.')
         return result,sessions,activities
 
@@ -485,12 +502,16 @@ class CollectionChannel:
         # __new__ read-only diagnostic channels intentionally remain SQLite-only.
         self.last_read_live=False
         if hasattr(self,'client'):
-            response=self.live_request(header_only=header_only,protocol=3,publication=self.live_publication,activity_stream=True)
+            response=self.live_request(header_only=header_only,protocol=4,publication=self.live_publication,activity_stream=True)
+            if response is not None and response[0].get('ready') is False:
+                # A retiring collector can still publish fresh protocol-3 data
+                # while its replacement waits for the source ownership lock.
+                response=self.live_request(header_only=header_only,protocol=3,publication=self.live_publication,activity_stream=True)
             if response is not None:
                 metadata,body=response
                 if metadata.get('error'):
                     raise CollectionScopeError('사용량 색인에 다른 관측 DB가 연결되어 있습니다. 별도 색인 경로를 사용하세요.')
-                if metadata.get('ready') and (header_only or metadata.get('protocol')==3):
+                if metadata.get('ready') and (header_only or metadata.get('protocol') in (3,4)):
                     if header_only:result=metadata['header']
                     else:result,sessions,activities=self._read_live(metadata,body)
                     source=result.get('index',{}).get('path')
@@ -501,6 +522,10 @@ class CollectionChannel:
                         result=self.activity_page(result,metadata['publication'][0])
                         self.live_session_cache=sessions;self.live_activity_cache=activities
                         self.live_publication=tuple(metadata['publication']);self.live_cached=result
+                        # Recovery and live delivery are alternate owners of one
+                        # snapshot, not independent retained history populations.
+                        self.session_cache={};self.activity_cache={};self.activity_identity=None
+                        self.cached=None;self.identity=None
                     return result if shared or header_only else deepcopy(result)
         with closing(sqlite3.connect(self.snapshot_path.as_uri()+'?mode=ro',uri=True)) as db:
             db.execute('BEGIN')
@@ -512,6 +537,12 @@ class CollectionChannel:
                     raise CollectionScopeError('사용량 색인에 다른 관측 DB가 연결되어 있습니다. 별도 색인 경로를 사용하세요.')
                 return None
             identity=(row[1],row[2])
+            publication=getattr(self,'live_publication',None)
+            if (getattr(self,'live_cached',None) is not None and publication and
+                    publication[0]==identity[0] and publication[1]>=identity[1]):
+                # A disconnected collector cannot make an older checkpoint
+                # newer. Avoid decoding that checkpoint merely to discard it.
+                return self.recovered_snapshot(None,identity,shared=shared,header_only=header_only)
             if identity!=self.identity:
                 payload=db.execute('SELECT payload FROM snapshot WHERE id=1').fetchone()[0]
                 header=json.loads(zlib.decompress(payload))
@@ -558,6 +589,8 @@ class CollectionChannel:
             self.cached=header;self.identity=identity
         # Shared records are read-only; each poll owns its envelope and list.
         result=self.activity_page(result,identity[0])
+        self.live_cached=None;self.live_publication=None
+        self.live_session_cache={};self.live_activity_cache={}
         return self.recovered_snapshot(result,identity,shared=shared,header_only=False)
 
     def recovered_snapshot(self,result,identity,*,shared,header_only):
@@ -580,6 +613,9 @@ class CollectionChannel:
         if self.db:
             try:self.db.execute('DELETE FROM consumers WHERE id=?',(self.client,));self.db.commit()
             finally:self.db.close();self.db=None
+        self.session_cache={};self.activity_cache={};self.activity_identity=None
+        self.live_session_cache={};self.live_activity_cache={}
+        self.cached=None;self.identity=None;self.live_cached=None;self.live_publication=None
 
 
 def empty_snapshot(homes,path,now):

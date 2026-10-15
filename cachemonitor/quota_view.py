@@ -440,6 +440,7 @@ def _period_series(rows, intervals, exclusions,*,display=False):
 
 def period_series(period,*,display=False):
     """Prepare exact detail and model shares only for the requested chart."""
+    if period.get('_archive') is not None:return period['_archive'].series(period['start'],display=display)
     if period['series'] is not None:return display_series(period['series']) if display else period['series']
     return _period_series(_period_rows(period,labels=not display),period['_series_intervals'],period['_series_exclusions'],display=display)
 

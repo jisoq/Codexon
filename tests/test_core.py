@@ -2,7 +2,7 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 
-from cachemonitor.core import Session
+from cachemonitor.core import Session, summarize
 from cachemonitor.index import UsageIndex
 
 
@@ -103,13 +103,10 @@ def test_effort_accounting_and_unclassified_lifetime():
                               "cached_input_tokens": 800 + index * 80, "output_tokens": 200 + index * 20,
                               "reasoning_output_tokens": 150 + index * 15}), 10002)
     v = session.view(10002)
-    assert v["totals"]["session"]["total"] == 240
-    assert v["totals"]["30m"]["total"] == 240
-    assert v["totals"]["30m"]["reasoning"] == 30
-    assert {g["effort"] for g in v["groups"]["30m"]} == {"low", "high"}
-    assert sum(g["total"] for g in v["groups"]["session"]) == 240
+    assert summarize(v['history'])['total'] == 240
+    assert summarize(v['history'])['reasoning'] == 30
+    assert {r['effort'] for r in v['history']} == {'low', 'high'}
     assert v["unclassified"]["total"] == 1080
-    assert all(g['count']==1 for g in v['groups']['session'])
 
 
 def test_title_helper_excluded_but_regular_luna_preserved(tmp_path):
@@ -131,7 +128,7 @@ def test_title_helper_excluded_but_regular_luna_preserved(tmp_path):
     view = monitor.poll(10002)
     assert view["excluded_title_sessions"] == 1
     assert [s["id"] for s in view["sessions"]] == [TID]
-    assert view["sessions"][0]["totals"]["session"]["total"] == 10010
+    assert summarize(view['sessions'][0]['history'])['total'] == 10010
     monitor.close()
     monitor = UsageIndex([home],tmp_path/"index.sqlite")
     assert monitor.poll(10002)["excluded_title_sessions"] == 1

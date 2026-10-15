@@ -7,6 +7,7 @@ from pathlib import Path
 import sqlite3
 import sys
 import threading
+import time
 from uuid import uuid4
 
 from PySide6.QtCore import QObject, Signal
@@ -110,6 +111,7 @@ class QuotaComputation:
         self.reports = OrderedDict()
         self.committed = {}
         self.request_lookup = None
+        self.archive = None
 
     def _ledger(self,*,writable=False):
         # Prepared readers use an rw connection for disposable projections and
@@ -124,7 +126,7 @@ class QuotaComputation:
             self.ledger_generation += 1
         return self.ledger
 
-    def _prepare(self, report, history_revision=None, selection=None, known_digest=None):
+    def _prepare(self, report, history_revision=None, selection=None, known_digest=None,archive=None):
         from .quota_view import prepare_quota_view, summary_deadline
         report=dict(report)
         if history_revision is not None:report['_history_revision']=history_revision
@@ -199,19 +201,25 @@ class QuotaComputation:
         else:report['view'] = prepare_quota_view(report,previous['view'] if previous else None,deferred=True,_requests=requests())
         if report['view'].get('_prepared_statistics') is not None:
             report['_prepared_statistics']=report['view']['_prepared_statistics']
+        if archive is not None:report=archive.compose(report)
         revision = uuid4().hex
         self.reports[revision] = report
         while len(self.reports) > 2:
             self.reports.popitem(last=False)
-        if self.ledger is not None and history_revision is not None:
+        if self.ledger is not None and (history_revision is not None or archive is not None):
             from .quota_projection import save
             # Derived checkpoints are optional. A cache write failure must not
             # discard a valid report or affect authoritative ledger commits.
             try:save(self.ledger,report,report['view'])
             except (OSError,sqlite3.Error):pass
+            if self.ledger_factory is None:
+                from .quota_archive import save as save_archive
+                try:save_archive(self.ledger,report,report['view'])
+                except (OSError,sqlite3.Error,ValueError):pass
         return compact_report(report, revision, selection, known_digest)
 
     def execute(self, request, phase=lambda value: None, publish=None):
+        from .quota_archive import ArchiveUnavailable
         kind = request['kind']
         result = {key: request.get(key) for key in ('kind', 'id', 'key')}
         try:
@@ -238,9 +246,21 @@ class QuotaComputation:
                     result['saved'] = True
                     result['exclusion_result'] = self.committed[token]
                     phase('reading')
+                current=None
+                if kind=='report' and self.ledger_factory is None:
+                    from .quota_archive import load as load_archive
+                    self.archive=load_archive(ledger,self.home,time.time(),self.archive)
+                    if self.archive is not None:
+                        current=ledger.current_report(self.home,retain_projection=True)
+                        valid=ledger.db.execute('SELECT valid FROM quota_archive_heads WHERE epoch=?',(self.archive.epoch,)).fetchone()
+                        if (current is not None and valid and valid[0] and current.get('account')==self.archive.account and
+                                current.get('_projection_start')<=self.archive.cutoff):
+                            result['report']=self._prepare(current,selection=request.get('selection'),
+                                known_digest=request.get('digest'),archive=self.archive)
+                            return result
                 if (kind=='report' and publish is not None and not self.reports
                         and request.get('selection') is None and hasattr(ledger,'current_report')):
-                    current=ledger.current_report(self.home)
+                    if current is None:current=ledger.current_report(self.home)
                     if current is not None:
                         publish({**result,'partial':True,'report':self._prepare(current)})
                 raw=ledger.report(self.home)
@@ -256,6 +276,8 @@ class QuotaComputation:
                     result['value'] = chart_result(report['view'], request.get('selection'), request.get('digest'))
                 elif kind == 'preview':
                     from .quota_exclusions import preview_exclusion
+                    if report.get('_archive_prefix') is not None:
+                        report=report['_archive_prefix'].history_for(report,request['start'])
                     result['value'] = preview_exclusion(report, request['start'], request['end'])
                 else:
                     from .quota_view import prepare_quota_query
@@ -264,6 +286,14 @@ class QuotaComputation:
                     result['value'] = prepare_quota_query(report, request['query'],_requests=lookup)
             else:
                 raise ValueError('Unknown quota request: ' + str(kind))
+        except ArchiveUnavailable as error:
+            self.archive=None
+            if self.ledger is not None:
+                try:
+                    self.ledger.db.execute('UPDATE quota_archive_heads SET valid=0 WHERE epoch=?',(error.epoch,))
+                    self.ledger.db.commit()
+                except sqlite3.Error:self.ledger.db.rollback()
+            result.update(stale=True,error='사용한도 기록이 갱신되었습니다.',permanent=False)
         except Exception as error:
             from .quota_diagnostics import record_failure, storage_issue
             if self.path:
@@ -284,6 +314,8 @@ class QuotaComputation:
 
     def close(self):
         self.request_lookup = None
+        self.archive=None
+        self.reports.clear()
         if self.ledger is not None:
             self.ledger.close()
             self.ledger = None

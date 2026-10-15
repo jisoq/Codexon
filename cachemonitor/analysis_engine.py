@@ -6,11 +6,10 @@ import sys
 from .analytics import analyze, comparison_view, overview_view, stats, effort_key, prepare_row, project_matches, observed_choices, call_identity, annotate_incidents, session_summary
 from .cache_misses import classify
 from .cache_health import CacheHealth
-from .core import TRANSPORT_FIELDS, summarize, METRICS
-from .model_evidence import FIELDS as MODEL_FIELDS
+from .core import summarize, METRICS
 from .pricing import token_cost, sum_cost, pricing_signature, request_tier, display_tier, unknown_mode_calls
 from .workload import internal_review
-from .analysis_records import compact_record, public_record, public_records
+from .analysis_records import ROW_SIGNATURE_FIELDS, compact_record, public_record, public_records
 from .native_backend import get_native
 
 
@@ -50,10 +49,6 @@ def retained_bytes(value,limit):
             pending.extend(item.keys());pending.extend(item.values())
         elif isinstance(item,(list,tuple,set,frozenset)):pending.extend(item)
     return size
-
-
-ROW_SIGNATURE_FIELDS = ('key','ts','turn','model','effort','input','cached','written','output','reasoning','total','service_tier',
-    'reported_total','total_discrepancy','input_conflict','output_conflict','purpose','compaction_epoch') + TRANSPORT_FIELDS + MODEL_FIELDS
 
 
 def row_signature(row):
@@ -113,6 +108,7 @@ class AnalysisEngine:
         # of how many historical calls contributed to its exact totals.
         self.page_results=BoundedCache(8,16*1024*1024)
         self.revision=0
+        self.call_revision=0
         self.generation=0
         self.pricing_signature=None
         self.ownership_sources={}
@@ -169,7 +165,7 @@ class AnalysisEngine:
         price_signature=pricing_signature()
         reprice=price_signature!=self.pricing_signature
         self.pricing_signature=price_signature
-        changed=False
+        changed=False;calls_changed=False
         updated=OrderedDict()
         for source, owned_history in zip(sessions, owned_sources):
             key=(source['home'],source['id'])
@@ -194,6 +190,7 @@ class AnalysisEngine:
                     updated[key]={**old,'source':source,'prepared':{**old['prepared'],'collection_complete':source.get('collection_complete')},
                         'fingerprint':fingerprint,'revision':self.generation}
                     continue
+            calls_changed=True
             previous=old['records'] if old and not reprice else {}
             misses=classify(owned_history)
             miss_keys={e['key'] for e in misses['events']}
@@ -235,10 +232,10 @@ class AnalysisEngine:
                           'revision':self.generation,'content_revision':self.generation,
                           'timestamps':sorted(r['ts'] for r in history),'boundaries':boundaries,'whole_turns':dict(whole_turns)}
             self.metrics['session_rebuilds']+=1
-        if set(updated)!=set(previous_sessions): changed=True
+        if set(updated)!=set(previous_sessions): changed=True;calls_changed=True
         self.internal_sessions=OrderedDict((key,state) for key,state in updated.items() if internal_review(state['prepared']))
         work=OrderedDict((key,state) for key,state in updated.items() if key not in self.internal_sessions)
-        if set(work)!=set(self.sessions):changed=True
+        if set(work)!=set(self.sessions):changed=True;calls_changed=True
         self.sessions=work
         if changed:
             self.revision+=1
@@ -248,7 +245,9 @@ class AnalysisEngine:
             self.parts.discard(lambda key:key[0] not in updated or key[1]!=updated[key[0]]['revision'])
             self.__dict__.pop('_explorer_projection',None)
             self.__dict__.pop('_history_prepared',None)
-            self.__dict__.pop('_category_projection',None)
+            if calls_changed:
+                self.call_revision+=1
+                self.__dict__.pop('_category_projection',None)
         return changed
 
     def record(self,home,sid,response_id):
@@ -270,13 +269,34 @@ class AnalysisEngine:
         value=session_summary(rows);self.summaries.put(key,(tuple(rows),value),len(rows)+1)
         return value
 
-    def query_key(self,q):
+    def query_key(self,q,*,calls_only=False):
         def freeze(value):
             if isinstance(value,dict):return tuple((k,freeze(v)) for k,v in sorted(value.items()))
             if isinstance(value,(list,tuple)):return tuple(map(freeze,value))
             return value
         # Request boundaries and partial buckets can change without call membership.
-        return (self.revision,q['page'],freeze(q))
+        return (self.call_revision if calls_only else self.revision,q['page'],freeze(q))
+
+    def call_ranges(self,q):
+        """Select observed calls without preparing request completion or comparisons."""
+        for state in self.sessions.values():
+            s=state['prepared']
+            if not q.get('archived',True) and s.get('archived'):continue
+            if q.get('source') and s.get('source','unknown')!=q['source']:continue
+            if q.get('home') and s['home']!=q['home']:continue
+            if q.get('sid') and s['id']!=q['sid']:continue
+            if q.get('project') and not project_matches(s,q['project']):continue
+            yield state,bisect_left(state['timestamps'],q['start']),bisect_left(state['timestamps'],q['end'])
+
+    @staticmethod
+    def range_calls(state,lo,hi,q):
+        model,effort,mode=(q.get(k,'') for k in ('model','effort','service_tier'))
+        history=state['prepared']['history']
+        rows=(history[i] for i in range(lo,hi))
+        if not any((model,effort,mode)):return rows
+        return (r for r in rows if (not model or (r.get('model') or '미확인')==model)
+                and (not effort or (r.get('effort') or '미확인')==effort)
+                and (not mode or display_tier(r)==mode))
 
     def page_query(self,q):
         if q.get('category_usage'):

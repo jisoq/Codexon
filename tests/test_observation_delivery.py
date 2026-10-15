@@ -28,8 +28,17 @@ def test_delta_heartbeat_correction_deletion_restart_and_old_results():
     idle=publisher.publish(snapshot(s),engine,summaries.collect(engine))
     assert not idle['sessions'] and not idle['overlay_sessions'] and not idle['model_candidates'] and not idle['cache_candidates']
     assert receiver.receive(idle)['sessions']==full['sessions']
+    s=dict(s,collection_complete=False);engine.ingest([s])
+    readiness=publisher.publish(snapshot(s),engine,summaries.collect(engine))
+    assert 'filter_choices' not in readiness and 'models' not in readiness
+    current=receiver.receive(readiness)
+    assert current['sessions'][0]['collection_complete'] is False
+    assert current['filter_choices']==full['filter_choices']
+    assert current['data_revision']!=full['data_revision']
+    assert current['call_revision']==full['call_revision']
     s=copy.deepcopy(s);s['history'][-1].update(requested_model='asked',response_model='reported',model_alert_confirmed=True,model_observation_ts=103)
     engine.ingest([s]);changed=publisher.publish(snapshot(s),engine,summaries.collect(engine))
+    assert changed['call_revision']>current['call_revision']
     assert changed['model_candidates'][0]['key']=='r2'
     assert receiver.receive(changed)['overlay_sessions'][0]['model_mismatch']
     engine.ingest([])

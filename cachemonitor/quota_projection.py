@@ -86,7 +86,7 @@ def save(ledger,report,view):
     """Publish a bounded checkpoint only if concurrent edits preserve its prefix."""
     history=view.get('_history_groups') or {}
     latest=history.get('last') or (history['groups'][-1] if history.get('groups') else None)
-    inputs=getattr(ledger,'_tracking_inputs',{})
+    inputs=report.get('_projection_tracking',getattr(ledger,'_tracking_inputs',{}))
     checkpoint=inputs.get('checkpoint') or inputs.get('current_checkpoint')
     if latest is None or checkpoint is None or report.get('history_pending'):return False
     home,at=report['home'],report['at'];start=latest[0]
@@ -114,7 +114,7 @@ def save(ledger,report,view):
         raw.extend(chunk.encode('ascii'))
     payload=zlib.compress(raw,1)
     if len(payload)>MAX_BYTES:return False
-    revision=getattr(ledger,'_input_revision',None)
+    revision=report.get('_projection_revision',getattr(ledger,'_input_revision',None))
     if revision is None:return False
     timeout=db.execute('PRAGMA busy_timeout').fetchone()[0]
     db.execute('PRAGMA busy_timeout=0')

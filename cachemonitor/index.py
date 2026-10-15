@@ -12,10 +12,11 @@ from collections import defaultdict, OrderedDict
 from collections import deque
 from pathlib import Path
 
-from .core import LINEAGE_FIELDS, TRANSPORT_FIELDS, SessionRegistry, Session, readonly, stamp, session_lineage
+from .core import LINEAGE_FIELDS, SessionRegistry, Session, readonly, stamp, session_lineage
+from .analysis_records import ROW_SIGNATURE_FIELDS
 from .codex_names import CodexNames, task_select
 from .quota import clean_limits
-from .model_evidence import EvidenceReader, default_path as evidence_path, FIELDS as MODEL_FIELDS, home_key
+from .model_evidence import EvidenceReader, default_path as evidence_path, home_key
 from .usage_paths import index_location
 from .native_backend import get_native
 from .event_store import EventStore, index_tables_valid, pack_event, unpack_event
@@ -755,8 +756,7 @@ class UsageIndex:
             if old_history is not None and old_history[0] is view['history']:
                 history_signature=old_history[1]
             else:
-                fields=('key','ts','turn','model','effort','input','cached','written','output','reasoning','total','service_tier') + TRANSPORT_FIELDS + MODEL_FIELDS
-                history_signature=tuple(tuple(r.get(field) for field in fields) for r in view['history'])
+                history_signature=tuple(tuple(r.get(field) for field in ROW_SIGNATURE_FIELDS) for r in view['history'])
                 self.history_signatures[key]=(view['history'],history_signature)
             request_values=tuple(view.get(field) for field in
                 ('request_state','turn_records','turn_states','coverage_gaps','unclassified'))

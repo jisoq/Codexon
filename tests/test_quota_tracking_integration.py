@@ -62,6 +62,82 @@ def test_projected_current_period_survives_restart_and_invalidates_old_edits(tmp
     finally:worker.close()
 
 
+def test_closed_period_projection_keeps_exact_queries_and_detail_after_restart(tmp_path,monkeypatch):
+    from cachemonitor.quota_worker import QuotaComputation,chart_result
+    from cachemonitor.quota_view import prepare_quota_query
+    from cachemonitor.quota_archive import load
+    from cachemonitor.quota_exclusions import preview_exclusion
+    path=tmp_path/'archive.sqlite'
+    clock=[170.]
+    monkeypatch.setattr('cachemonitor.quota_worker.time.time',lambda:clock[0])
+    worker=QuotaComputation(path,'h');ledger=worker._ledger(writable=True)
+    queries=({},dict(start=104.,end=135.),dict(model='gpt-6-astra'),dict(days=7),dict(mode='excluded'))
+    try:
+        tracking.enable(ledger.db,'h',100)
+        for at,remaining in ((102,70),(110,69),(120,100),(130,99),(140,98),(150,100),(160,99)):
+            observe(ledger,at,remaining)
+        calls=[107,127,157]
+        wire=[dict(home='h',identity=str(at),response=str(at),start=at-2,end=at,status='completed') for at in calls]
+        activity(ledger,161,{},calls,wire=wire)
+        raw=ledger.report('h',clock[0])
+        reply=worker._prepare(raw,(worker.ledger_generation,ledger._report_generation))
+        full=worker.reports[reply['worker_revision']]
+        expected=[prepare_quota_query(full,q) for q in queries]
+        selected=next(p['start'] for p in full['view']['periods'] if not p['current'])
+        chart=chart_result(full['view'],selected)
+        preview=preview_exclusion(full,120.1,140.1)
+        assert load(ledger,'h',clock[0]) is not None
+        worker.close();worker=QuotaComputation(path,'h');ledger=worker._ledger()
+        def no_replay(*a,**kw):pytest.fail('closed observations replayed after restart')
+        with monkeypatch.context() as patch:
+            patch.setattr(ledger,'report',no_replay)
+            result=worker.execute(dict(kind='report',id='r',key='k'),publish=lambda value:None)
+        assert 'error' not in result
+        prepared=worker.reports[result['report']['worker_revision']]
+        assert not prepared.get('history_pending')
+        for query,value in zip(queries,expected):assert prepare_quota_query(prepared,query)==value
+        actual=chart_result(prepared['view'],selected)
+        assert actual['digest']==chart['digest']
+        assert actual['series']==chart['series']
+        actual_preview=worker.execute(dict(kind='preview',id='p',key='k',revision=result['report']['worker_revision'],start=120.1,end=140.1))
+        assert actual_preview.get('value')==preview
+        # A new call without wire timing affects the current suffix, not every
+        # completed period. A correction to an old cost invalidates the prefix.
+        writer=QuotaLedger(path)
+        try:
+            clock[0]=180.;observe(writer,175,98)
+            activity(writer,176,{},[*calls,173],wire=wire)
+            assert load(ledger,'h',clock[0]) is not None
+            expected_raw=writer.report('h',clock[0])
+            with monkeypatch.context() as patch:
+                patch.setattr(ledger,'report',no_replay)
+                result=worker.execute(dict(kind='report',id='r2',key='k'),publish=lambda value:None)
+            assert 'error' not in result
+            actual=worker.reports[result['report']['worker_revision']]
+            assert actual['view']['lifetime']['cost']==quota_statistics(expected_raw,include_mode_assumptions=True)['cost']
+            clock[0]=210.
+            observe(writer,190,100);observe(writer,200,99)
+            activity(writer,201,{},[*calls,173,197],wire=wire)
+            expected_raw=writer.report('h',clock[0])
+            assert load(ledger,'h',clock[0]) is not None,[tuple(row) for row in ledger.db.execute('SELECT table_name,at FROM report_changes ORDER BY revision DESC LIMIT 15')]
+            assert ledger.current_report('h',clock[0]) is not None
+            with monkeypatch.context() as patch:
+                patch.setattr(ledger,'report',no_replay)
+                result=worker.execute(dict(kind='report',id='r3',key='k'),publish=lambda value:None)
+            assert 'error' not in result
+            actual=worker.reports[result['report']['worker_revision']]
+            assert actual['view']['lifetime']['cost']==quota_statistics(expected_raw,include_mode_assumptions=True)['cost']
+            assert load(ledger,'h',clock[0]).cutoff==190.1
+            assert ledger.db.execute('SELECT count(*) FROM quota_archive_heads').fetchone()[0]==2
+            # The previous view's exact detail remains available after advancing
+            # the prefix, without retaining its source rows in the reader.
+            assert chart_result(prepared['view'],selected)['series']==chart['series']
+            writer.db.execute("UPDATE calls SET cost=cost+1 WHERE uid='107'");writer.db.commit()
+            assert load(ledger,'h',clock[0]) is None
+        finally:writer.close()
+    finally:worker.close()
+
+
 def test_current_projection_does_not_require_full_history_cache_admission(tmp_path,monkeypatch):
     from cachemonitor import quota_view
     from cachemonitor.quota_worker import QuotaComputation,chart_result

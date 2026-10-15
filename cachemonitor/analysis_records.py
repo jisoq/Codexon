@@ -1,4 +1,12 @@
 """Store each call fact once; restore display aliases at view boundaries."""
+from .core import TRANSPORT_FIELDS
+from .model_evidence import FIELDS as MODEL_FIELDS
+
+
+# Collector revisions must cover every fact consumed by the analyzer, including
+# evidence flags whose sanitized token values can remain unchanged.
+ROW_SIGNATURE_FIELDS = ('key','ts','turn','model','effort','input','cached','written','output','reasoning','total','service_tier',
+    'reported_total','total_discrepancy','input_conflict','output_conflict','purpose','compaction_epoch') + TRANSPORT_FIELDS + MODEL_FIELDS
 
 
 def aliases(row):

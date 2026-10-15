@@ -18,7 +18,7 @@ from .table_model import Cell, Header, Table, LazyTable
 from .quick_runtime import Dialog, DialogButtons
 from .tray import TrayWindow, tray_icon
 from .analytics import analyze, stats, session_summary, cache_rows, observation_flags, project_choices, project_key, effort_key
-from .analysis_engine import AnalysisEngine, BoundedCache
+from .analysis_engine import AnalysisEngine, BoundedCache, retained_bytes
 from .analysis_worker import AnalysisBridge
 from .core import day_start, summarize, transport_label
 from .pricing import (usd, RATES, ALIASES, VERIFIED, MULTIPLIER_VERIFIED, MODEL_VERIFIED,
@@ -139,7 +139,7 @@ class Dashboard(TrayWindow):
         self.snapshot={'ts':time.time(),'sessions':[],'homes':homes,'unassigned':[],'errors':[]}
         self.quitting=False;self.worker=None;self.engine=AnalysisEngine();self.async_mode=start_worker
         self.analysis=analyze([]);self.analysis_pending=False;self.analysis_errors=[];self.analysis_error_history=[]
-        self.client_cache=BoundedCache(6,160000);self.request_id=0;self.view_result=None;self.applied_key=None
+        self.client_cache=BoundedCache(6,8*1024*1024);self.request_id=0;self.view_result=None;self.applied_key=None
         self.display_identity=None;self.pending_retained=False
         self.lookup={'sessions':{},'turns':{},'session_turns':{}};self.page_frames={}
         self.started_at=time.time();self.alerted={};self.confirmed_notifications=ConfirmedNotifications()
@@ -937,7 +937,11 @@ class Dashboard(TrayWindow):
             # Retain exact overview bucket endpoints; record/comparison populations
             # are reusable until the worker's next call or request boundary.
             key_query={k:v for k,v in q.items() if k!='now' and (q['period']=='custom' or k not in ('start','end'))}
-            logical=(self.snapshot.get('data_revision',0),json.dumps(key_query,sort_keys=True))
+            revision=self.snapshot.get('data_revision',0)
+            if q.get('category_usage'):
+                key_query.pop('loading',None)
+                revision=self.snapshot.get('call_revision',revision)
+            logical=(self.snapshot.get('epoch'),revision,json.dumps(key_query,sort_keys=True))
             if automatic and self.analysis_pending:
                 self._refresh_after_pending=getattr(self,'pending_logical',None)!=logical
                 return
@@ -1040,7 +1044,7 @@ class Dashboard(TrayWindow):
         if overlay:overlay.receive_collection_status(result)
 
     def receive(self,value):
-        if value.get('data_revision')!=self.snapshot.get('data_revision'):
+        if value.get('epoch')!=self.snapshot.get('epoch'):
             self.client_cache.clear()
         if not self.async_mode:
             self.engine.ingest(value['sessions'])
@@ -1079,7 +1083,9 @@ class Dashboard(TrayWindow):
         self.error_state.clear('analysis.query',resolution='분석 결과 갱신 확인')
         self.error_state.clear('analysis.process',resolution='분석기 실행 확인')
         self.refresh_errors()
-        self.client_cache.put(message['logical'],(result,message['valid_until']),result['analysis']['response_count']+1)
+        cached=(result,message['valid_until'])
+        self.client_cache.put(message['logical'],cached,
+                              retained_bytes((message['logical'],cached),self.client_cache.rows))
         self.analysis_errors.clear();self.worker_metrics=message.get('metrics',{})
         if self.pending_automatic and time.monotonic()-self.interaction_time<.15:
             self.deferred_result=(message['id'],message['result'],self.pending_query)

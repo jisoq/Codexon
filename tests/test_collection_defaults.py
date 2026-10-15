@@ -217,14 +217,14 @@ def test_broken_default_snapshot_is_replaced_and_restart_keeps_usage(default_hom
         owner.start_collection()
         after=client.poll(10003)
         assert after['sessions'] and not after['usage_errors']
-        assert after['sessions'][0]['totals']==before['sessions'][0]['totals']
+        assert after['sessions'][0]['history']==before['sessions'][0]['history']
         assert operations==(['configure','start'] if alive else ['start'])
         current[-1].close();current.clear()
         with monkeypatch.context() as patch:
             patch.setattr(services.identity,'process_identity',lambda _:process)
             restarted=CollectorService([default_home])
         current.append(restarted);restarted.poll(10004)
-        assert client.poll(10004)['sessions'][0]['totals']==after['sessions'][0]['totals']
+        assert client.poll(10004)['sessions'][0]['history']==after['sessions'][0]['history']
     finally:
         client.close()
         if old.channel.db:old.close()

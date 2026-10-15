@@ -66,11 +66,14 @@ def test_category_projection_preserves_denominators_history_and_bounded_pages(mo
     view=engine.page_query(q)['usage']
     assert view['summary']['value']==3 and sum(r['value'] for r in view['rows'])==3
     assert all(sum(c['value'] for c in r['components'])==r['value'] for r in view['rows'])
-    original=engine.query
-    monkeypatch.setattr(engine,'query',lambda q:pytest.fail('Pagination/search must reuse the aggregate projection'))
+    original=engine.call_ranges
+    monkeypatch.setattr(engine,'call_ranges',lambda q:pytest.fail('Pagination/search must reuse the aggregate projection'))
     filtered=engine.page_query({**q,'usage':{**q['usage'],'search':'unknown','page':100}})['usage']
     assert filtered['summary']['value']==3 and filtered['count']==1 and filtered['page']==0
-    monkeypatch.setattr(engine,'query',original)
+    source=dict(source,collection_complete=False);engine.ingest([source])
+    refreshed=engine.page_query({**q,'now':now+2,'end':now+2,'loading':True})['usage']
+    assert refreshed['summary']==view['summary'] and refreshed['rows']==view['rows']
+    monkeypatch.setattr(engine,'call_ranges',original)
     selected={**q,'start':ts('2026-02-02T00:00:00'),'model':'gpt-6-astra',
               'usage':dict(dimension='source',metric='calls',selected=['model','gpt-6-astra'])}
     detail=engine.page_query(selected)['usage']
@@ -80,6 +83,10 @@ def test_category_projection_preserves_denominators_history_and_bounded_pages(mo
     for label in ('유저','User agent'):
         found=engine.page_query({**selected,'usage':{**selected['usage'],'search':label}})['usage']
         assert found['count']==1 and found['summary']==detail['summary']
+    source={**source,'history':[*source['history'],dict(source['history'][0],key='future',ts=now+10)]}
+    engine.ingest([source])
+    assert engine.page_query(q)['usage']['summary']['value']==3
+    assert engine.page_query({**q,'now':now+11,'end':now+11})['usage']['summary']['value']==4
 
 
 def test_category_partial_tokens_and_equal_weight_call_tps():
@@ -92,6 +99,46 @@ def test_category_partial_tokens_and_equal_weight_call_tps():
     assert summary(rows,'reasoning')['value']==500
     assert summary([dict(output=0,completion_latency_ms=100,response_status='completed')],'tps')['value']==0
     assert summary([rows[2]],'tps')['value'] is None
+
+
+def test_call_totals_reuse_unchanged_ranges_and_preserve_request_completeness(monkeypatch):
+    from copy import deepcopy
+    from cachemonitor.analysis_engine import AnalysisEngine
+    from cachemonitor.category_usage import METRICS,summary
+    first=session_view();first['collection_complete']=True
+    other=deepcopy(first);other['home']='other'
+    sources=[first,other];engine=AnalysisEngine();engine.ingest(sources)
+    now=ts('2026-02-03T00:00:00')
+    q=dict(page=0,start=0,end=now,now=now,period='all',category_usage=True,presentation=True)
+    visited=[];original=engine.range_calls
+    def read_range(state,lo,hi,q):
+        for row in original(state,lo,hi,q):visited.append(row['key']);yield row
+    monkeypatch.setattr(engine,'range_calls',read_range)
+    def check(query):
+        value=engine.page_query(query)
+        rows=analyze(sources,start=query['start'],end=query['end'],model=query.get('model',''))['responses']
+        for field in METRICS[:-1]:
+            expected=summary(rows,field);actual=value['usage']['totals'][field]
+            assert actual=={**expected,'value':pytest.approx(expected['value']) if expected['value'] is not None else None}
+        assert value['analysis']['response_count']==len(rows)
+        return value
+    with monkeypatch.context() as patch:
+        patch.setattr(engine,'query',lambda q:pytest.fail('Call totals must not build request analysis'))
+        before=check(q);assert len(visited)==6
+        sources=[dict(s,collection_complete=False) for s in sources]
+        engine.ingest(sources);visited.clear()
+        assert check(q)['usage']==before['usage'] and not visited
+        sources[0]=deepcopy(sources[0])
+        sources[0]['history'][0]['input']+=100
+        sources[0]['history'].pop()
+        engine.ingest(sources);visited.clear();check(q)
+        assert len(visited)==2
+        check({**q,'start':ts('2026-02-01T00:00:00'),'model':'unknown'})
+    requests=engine.query(dict(q,page=2,category_usage=False,unit='turn'))['analysis']['turns']
+    assert requests and not any(r['complete'] for r in requests)
+    sources=[dict(s,collection_complete=True) for s in sources];engine.ingest(sources)
+    requests=engine.query(dict(q,page=2,category_usage=False,unit='turn'))['analysis']['turns']
+    assert [r['complete'] for r in requests]==[r['complete'] for r in analyze(sources)['turns']]
 
 
 def test_model_breakdowns_partition_calls_preserve_scope_and_reuse_projection(monkeypatch):

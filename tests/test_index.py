@@ -541,6 +541,29 @@ def test_append_reuses_session_but_rewrite_plus_growth_rebuilds(tmp_path):
     finally:index.close()
 
 
+def test_usage_revision_preserves_corrections_to_sanitized_token_evidence(tmp_path):
+    from cachemonitor.analysis_engine import AnalysisEngine
+    home,path=fixture_home(tmp_path)
+    item=usage();item['payload'].update(model='gpt-6-astra',service_tier='standard')
+    item['payload']['usage']['cache_write_input_tokens']=20000
+    path.write_text(json.dumps(item)+'\n',encoding='utf8')
+    index=UsageIndex([home],tmp_path/'index.sqlite');engine=AnalysisEngine()
+    try:
+        before=finish(index)['sessions'];engine.ingest(before)
+        assert before[0]['history'][0]['written'] is None
+        assert before[0]['history'][0]['input_conflict']
+        item['payload']['usage']['cache_write_input_tokens']=None
+        path.write_text(json.dumps(item)+'\n',encoding='utf8')
+        after=finish(index,10020)['sessions']
+        assert after[0]['history'][0]['written'] is None
+        assert not after[0]['history'][0]['input_conflict']
+        assert engine.ingest(after)
+        row=engine.record(after[0]['home'],after[0]['id'],'r1')
+        assert row['input_conflict'] is False
+        assert row['cost']==analyze(after)['responses'][0]['cost']
+    finally:index.close()
+
+
 @pytest.mark.parametrize('blocks',(8,16))
 def test_unchanged_catchup_reads_each_byte_once(tmp_path,monkeypatch,blocks):
     import cachemonitor.index as implementation
@@ -648,18 +671,18 @@ def test_imported_history_reuses_unchanged_records_and_refreshes_time_windows(tm
         assert len(queries)==1
         assert second['history'] is first['history'] is expired['history']
         assert second['remaining']==first['remaining']-1
-        assert first['totals']['30m']['total']==120 and expired['totals']['30m']['total']==0
+        assert len(first['requests'])==1 and expired['requests']==[]
         assert first['usage_revision']==expired['usage_revision']
         row['input']=200
         index.db.execute('UPDATE usage_archive SET data=?',(json.dumps(row),));index.db.commit()
         changed=index.archive.views(10011,{str(home)})[0]
-        assert len(queries)==2 and changed['totals']['session']['total']==220
+        assert len(queries)==2 and changed['history'][0]['total']==220
         assert changed['usage_revision']!=first['usage_revision']
         with sqlite3.connect(index.path) as other:
             row['input']=300
             other.execute('UPDATE usage_archive SET data=?',(json.dumps(row),))
         changed=index.archive.views(10011,{str(home)})[0]
-        assert len(queries)==3 and changed['totals']['session']['total']==320
+        assert len(queries)==3 and changed['history'][0]['total']==320
         index.db.execute('DELETE FROM usage_archive')
         assert index.archive.views(10011,{str(home)})==[] and len(queries)==4
     finally:index.close()
@@ -691,14 +714,14 @@ def test_imported_history_rollback_cannot_reuse_uncommitted_revision(tmp_path):
     try:
         index.db.execute('INSERT INTO usage_archive VALUES(?,?,?)',(str(home),'archived',json.dumps(row)))
         index.db.commit()
-        assert index.archive.views(10010,{str(home)})[0]['totals']['session']['total']==120
+        assert index.archive.views(10010,{str(home)})[0]['history'][0]['total']==120
         row['input']=200
         index.db.execute('UPDATE usage_archive SET data=?',(json.dumps(row),))
-        assert index.archive.views(10010,{str(home)})[0]['totals']['session']['total']==220
+        assert index.archive.views(10010,{str(home)})[0]['history'][0]['total']==220
         index.db.rollback()
         row['input']=300
         index.db.execute('UPDATE usage_archive SET data=?',(json.dumps(row),));index.db.commit()
-        assert index.archive.views(10010,{str(home)})[0]['totals']['session']['total']==320
+        assert index.archive.views(10010,{str(home)})[0]['history'][0]['total']==320
     finally:index.close()
 
 

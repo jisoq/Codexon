@@ -469,6 +469,46 @@ def test_live_delta_converges_after_missed_publications_and_epoch_change(tmp_pat
     finally:reader.close();writer.close()
 
 
+def test_live_manifest_transmits_only_changed_sessions_and_preserves_order(tmp_path):
+    writer=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite')
+    reader=CollectionChannel(writer.homes,writer.path);writer.start_live()
+    try:
+        value=snapshot(writer)
+        value['sessions'].extend(dict(home=writer.homes[0],id=str(n),history=[dict(key=str(n))]) for n in range(100))
+        writer.publish(value,'epoch',1)
+        first=reader.read(shared=True)
+        cursor=reader.live_publication
+        value={**value,'ts':101.};writer.publish(value,'epoch',2)
+        message,body=reader.live_request(protocol=4,publication=cursor)
+        assert message['sessions']==[] and not message['full'] and body==b''
+        assert len(json.dumps(message).encode())<2048
+        assert reader.read()==value
+        cursor=reader.live_publication
+        changed=copy.deepcopy(value)
+        changed['sessions'][0]['history'][0]['output']=9
+        writer.publish(changed,'epoch',3)
+        changed['sessions'][1]['collection_complete']=False
+        writer.publish(changed,'epoch',4)
+        message,body=reader.live_request(protocol=4,publication=cursor)
+        assert not message['full'] and [entry['sid'] for entry in message['sessions']]==['session','0']
+        assert message['sessions'][0]['size']>0 and message['sessions'][1]['size']==0
+        delivered=reader.read(shared=True)
+        assert delivered==changed
+        assert delivered['sessions'][2] is first['sessions'][2]
+        cursor=reader.live_publication
+        changed['sessions'].reverse();writer.publish(changed,'epoch',5)
+        message,body=reader.live_request(protocol=4,publication=cursor)
+        assert message['full'] and body==b''
+        assert reader.read()==changed
+        # The previous protocol remains readable during an upgrade handoff.
+        message,body=reader.live_request(protocol=3,publication=reader.live_publication)
+        assert len(message['sessions'])==len(changed['sessions']) and body==b''
+        current_handler=writer.live_server.handler
+        writer.live_server.handler=lambda request:(dict(ready=False),b'') if request.get('protocol')==4 else current_handler(request)
+        assert reader.read()==changed and reader.last_read_live
+    finally:reader.close();writer.close()
+
+
 @pytest.mark.parametrize('live',[False,True],ids=['sqlite','live'])
 def test_unrelated_session_change_does_not_rescan_subagent_quota_history(tmp_path,live):
     from cachemonitor.analysis_engine import AnalysisEngine
@@ -559,7 +599,7 @@ def test_failed_checkpoint_does_not_advance_live_snapshot(tmp_path):
 
 
 @pytest.mark.parametrize('later_epoch',['epoch','new-epoch'])
-def test_recovery_prefers_latest_genuine_snapshot_without_freshening(tmp_path,later_epoch):
+def test_recovery_prefers_latest_genuine_snapshot_without_freshening(tmp_path,monkeypatch,later_epoch):
     writer=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite');writer.start_live()
     client=CollectionClient(writer.homes,writer.path)
     try:
@@ -568,7 +608,10 @@ def test_recovery_prefers_latest_genuine_snapshot_without_freshening(tmp_path,la
         recent['index']['last_usage_success']=110.;writer.publish(recent,'epoch',2)
         assert client.poll(110.)==recent
         writer.live_server.close();writer.live_server=None;writer.live=None
-        recovered=client.poll(111.)
+        with monkeypatch.context() as patch:
+            patch.setattr('cachemonitor.usage_collection.zlib.decompress',
+                          lambda *a,**k:pytest.fail('older recovery snapshot decoded'))
+            recovered=client.poll(111.)
         assert recovered['ts']==110. and recovered['collection_recovery']
         fresh_client=CollectionClient(writer.homes,writer.path)
         try:
@@ -580,6 +623,34 @@ def test_recovery_prefers_latest_genuine_snapshot_without_freshening(tmp_path,la
         writer.publish(latest,later_epoch,3)
         assert client.poll(116.)['sessions'][0]['history'][0]['output']==5
     finally:client.close();writer.close()
+
+
+def test_recovery_and_live_delivery_release_superseded_history(tmp_path):
+    writer=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite')
+    reader=CollectionChannel(writer.homes,writer.path)
+    try:
+        value=snapshot(writer);writer.publish(value,'epoch',1)
+        durable=reader.read(shared=True)
+        assert reader.session_cache and not reader.live_session_cache
+        writer.start_live();writer.publish(value,'epoch',2)
+        live=reader.read(shared=True)
+        assert live==durable and reader.last_read_live
+        assert not reader.session_cache and reader.cached is None
+        assert reader.live_session_cache
+        writer.live_server.close();writer.live_server=None;writer.live=None
+        changed=copy.deepcopy(value);changed['sessions'][0]['history'][0]['output']=9
+        writer.publish(changed,'replacement',1)
+        assert reader.read(shared=True)==changed
+        assert reader.session_cache and not reader.live_session_cache and reader.live_cached is None
+        writer.start_live();writer.publish(changed,'replacement',2)
+        assert reader.read(shared=True)==changed and reader.last_read_live
+        assert not reader.session_cache
+        # Existing users of a snapshot retain its immutable evidence after a
+        # transport handoff, and closing releases only the channel's ownership.
+        reader.close()
+        assert not reader.live_session_cache and reader.live_cached is None
+        assert live['sessions'][0]['history'][0]['output']==3
+    finally:reader.close();writer.close()
 
 
 def test_stale_client_read_preserves_source_errors_and_shared_freshness(tmp_path):

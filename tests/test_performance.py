@@ -243,6 +243,38 @@ def test_process_queries_latest_selection_cache_and_clean_shutdown(tmp_path):
         w.tray.hide(); w.close()
 
 
+def test_large_population_projection_reuses_calls_across_readiness_but_not_revision_or_restart(tmp_path):
+    from PySide6.QtCore import QSettings
+    from PySide6.QtWidgets import QApplication
+    from cachemonitor.dashboard import Dashboard
+    app=QApplication.instance() or QApplication([])
+    w=Dashboard([],start_worker=False,live_limits=False,
+                settings=QSettings(str(tmp_path/'projection-cache.ini'),QSettings.IniFormat))
+    snapshot=dict(ts=110,sessions=[history()],homes=[],errors=[],unassigned=[],
+                  epoch='first',data_revision=1,call_revision=1,index=dict(loading=False))
+    try:
+        w.receive(snapshot);w.show();app.processEvents();w.async_mode=True;w.render()
+        def deliver(count):
+            result=w.engine.page_query(w.pending_query)
+            result['analysis']['response_count']=count
+            # A compact protocol fixture represents a large population with
+            # missing older metrics, without allocating its underlying calls.
+            for key,item in result['usage']['totals'].items():
+                if key=='calls':item.update(value=count,known=count,total=count,partial=False)
+                else:item.update(total=count,partial=True)
+            w.analysis_ready(dict(id=w.request_id,logical=w.pending_logical,result=result,valid_until=1000))
+        deliver(300000);assert not w.analysis_pending
+        w.receive(dict(snapshot,ts=111,data_revision=2,index=dict(loading=True)))
+        assert not w.analysis_pending and w.home_panel.data['totals']['calls']['value']==300000
+        changed=dict(snapshot,ts=112,data_revision=3,call_revision=2)
+        w.receive(changed);assert w.analysis_pending
+        deliver(300001);assert not w.analysis_pending
+        w.receive(dict(snapshot,ts=113,epoch='restarted'))
+        assert w.analysis_pending
+    finally:
+        w.quitting=True;w.tick.stop();w.tray.hide();w.close()
+
+
 @pytest.mark.parametrize('shown_before',[False,True])
 def test_hidden_dashboard_defers_all_page_refreshes(tmp_path,monkeypatch,shown_before):
     from PySide6.QtCore import QSettings
