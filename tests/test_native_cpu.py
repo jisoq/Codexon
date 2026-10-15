@@ -8,7 +8,7 @@ import pytest
 from cachemonitor.native_backend import get_native
 from cachemonitor.proxy_observation import message_metadata, _python_message_metadata
 from cachemonitor.quota_attribution import RequestWindows, local_request_intervals
-from cachemonitor.quota_cycles import _clip_quota_interval, _quota_clipper
+from cachemonitor.quota_cycles import _clip_quota_interval, _quota_clipper, _continuous_quota_intervals
 
 
 @pytest.fixture
@@ -91,6 +91,13 @@ def test_quota_sparse_local_intervals_keep_accounting_and_boundaries(native, mon
     index=native.QuotaClipIndex(cycle['endpoints'],cycle['cost_rows'])
     for start,end in ((100,190),(130,190),(99,20000),(101,102),(500,500)):
         assert _clip_quota_interval(cycle,start,end,selection=index.select(start,end)) == _clip_quota_interval(cycle,start,end)
+    points=cycle['endpoints'];cycle={**cycle,'endpoints':points[:200]+points[400:]}
+    expected=[{**_clip_quota_interval(cycle,lo,hi),
+               'id':f"cycle:observed:{lo}",'observation_gaps_excluded':True}
+              for lo,hi in ((points[0][0],points[199][0]),(points[400][0],points[-1][0]))]
+    for backend in ('python','rust'):
+        monkeypatch.setenv('CODEXON_CPU_BACKEND',backend)
+        assert list(_continuous_quota_intervals([cycle]))==expected
 
 
 def test_quota_index_keeps_original_duplicate_and_unsorted_order(native):

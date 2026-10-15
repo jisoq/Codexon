@@ -99,17 +99,22 @@ class QuotaComputation:
         report=dict(report)
         if history_revision is not None:report['_history_revision']=history_revision
         previous=next(reversed(self.reports.values()),None) if self.reports else None
-        requests=None
-        if report.get('tracking') is not None:
+        source=report.get('request_windows',[])
+        if (report.get('tracking') is None or
+                (self.request_lookup is not None and self.request_lookup.source is not source)):
+            self.request_lookup=None
+        prepared_requests=None
+        def requests():
+            nonlocal prepared_requests
+            if report.get('tracking') is None:return None
+            if prepared_requests is not None:return prepared_requests
             from .quota_attribution import RequestWindows
-            source=report.get('request_windows',[])
             if self.request_lookup is not None and self.request_lookup.source is source:
-                requests=self.request_lookup
+                prepared_requests=self.request_lookup
             else:
-                self.request_lookup=None
-                requests=RequestWindows(source)
-                if requests.cache_bytes<=self.REQUEST_LOOKUP_BYTES:self.request_lookup=requests
-        else:self.request_lookup=None
+                prepared_requests=RequestWindows(source)
+                if prepared_requests.cache_bytes<=self.REQUEST_LOOKUP_BYTES:self.request_lookup=prepared_requests
+            return prepared_requests
         if (previous and report.get('_history_revision') is not None and
                 previous.get('_history_revision')==report['_history_revision']):
             from .quota_cycles import quota_statistics
@@ -141,7 +146,7 @@ class QuotaComputation:
                         for row in summary['intervals']]}
                 return refreshed[key]
             lifetime=(refresh_metadata(view['lifetime']) if metadata_updates is not None else
-                      quota_statistics(report,include_mode_assumptions=True,_requests=requests,
+                      quota_statistics(report,include_mode_assumptions=True,_requests=requests(),
                                        _cache=statistics_cache,_cache_readonly=True))
             summaries[None]=lifetime
             for days in (7,30,90):
@@ -154,12 +159,12 @@ class QuotaComputation:
                     summaries[days]=refresh_metadata(summary)
                 else:
                     summaries[days]=(lifetime if start<=earliest else
-                        quota_statistics(report,start,include_mode_assumptions=True,_requests=requests,
+                        quota_statistics(report,start,include_mode_assumptions=True,_requests=requests(),
                                          _cache=statistics_cache,_cache_readonly=True))
                     summary_until[days]=summary_deadline(report,start)+days*86400
             report['view']={**view,'lifetime':lifetime,'summaries':summaries,'_statistics_cache':statistics_cache,'_summary_until':summary_until}
             if lifetime is not view['lifetime']:report['view'].pop('_default_query',None)
-        else:report['view'] = prepare_quota_view(report,previous['view'] if previous else None,deferred=True,_requests=requests)
+        else:report['view'] = prepare_quota_view(report,previous['view'] if previous else None,deferred=True,_requests=requests())
         revision = uuid4().hex
         self.reports[revision] = report
         while len(self.reports) > 2:

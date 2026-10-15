@@ -6,7 +6,6 @@ from pathlib import Path
 import sqlite3
 import time
 import zlib
-import tempfile
 
 from .proxy_target import option
 from . import proxy_identity as identity
@@ -58,9 +57,33 @@ def migrate_default_index(channel):
                  source.with_name(source.name+'.codexon-collector.lock')):
         if lock.exists() and locked(lock):
             raise RuntimeError('이전 수집기의 기록 저장과 종료 대기')
-    descriptor,name=tempfile.mkstemp(prefix=destination.name+'.migration-',suffix='.tmp',dir=destination.parent)
-    os.close(descriptor);temporary=Path(name)
+    # The collector lock also owns this one staging slot. A durable receipt
+    # distinguishes a previous interrupted copy from an unrelated user's file.
+    # Keep unrecognized old UUID copies; their ownership is not recoverable here.
+    temporary=destination.with_name(destination.name+'.migration-stage.tmp')
+    receipt=destination.with_name(destination.name+'.migration-stage.json')
+    expected=dict(version=1,source=str(source.resolve()),destination=str(destination.resolve()),
+                  temporary=str(temporary))
+    candidates=[temporary,*[Path(str(temporary)+suffix) for suffix in ('-journal','-wal','-shm')]]
+    def unlinked(path):
+        try:info=path.lstat()
+        except FileNotFoundError:return True
+        return not path.is_symlink() and not (getattr(info,'st_file_attributes',0)&0x400)
+    if not all(unlinked(path) for path in (*candidates,receipt)):
+        raise RuntimeError('이전 사용량 색인의 임시 경로 소유권을 확인하지 못했습니다.')
+    if receipt.exists() or any(path.exists() for path in candidates):
+        try:
+            owned=receipt.stat().st_size<=4096 and json.loads(receipt.read_bytes())==expected
+        except (OSError,ValueError):owned=False
+        if not owned:raise RuntimeError('이전 사용량 색인의 임시 파일 소유권을 확인하지 못했습니다.')
+        for path in candidates:path.unlink(missing_ok=True)
+        receipt.unlink()
+    # Create exclusively: no existing staging path is overwritten. A partial
+    # receipt fails closed on the next attempt instead of creating another copy.
+    with receipt.open('xb') as handle:
+        handle.write(json.dumps(expected).encode('utf-8'));handle.flush();os.fsync(handle.fileno())
     try:
+        with temporary.open('xb'):pass
         with closing(sqlite3.connect(source.as_uri()+'?mode=ro',uri=True)) as old:
             tables={row[0] for row in old.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             if not index_tables_valid(tables,require_core=True):
@@ -75,7 +98,9 @@ def migrate_default_index(channel):
         try:os.link(temporary,destination)
         except FileExistsError:return False
         return True
-    finally:temporary.unlink(missing_ok=True)
+    finally:
+        for path in candidates:path.unlink(missing_ok=True)
+        receipt.unlink(missing_ok=True)
 
 
 def retire_legacy(channel,*,clock=time.monotonic,sleep=time.sleep):

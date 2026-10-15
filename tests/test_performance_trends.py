@@ -586,9 +586,11 @@ def test_dense_workspace_model_comparison_and_hover_analysis(tmp_path,shell):
     try:
         ui.model_choice.choose(ui.model_choice.findData(models[0]));QTest.qWait(60)
         assert [m for m in ui.available if ui.models.get(m,True)]==[models[0]]
-        click(host,control(host,ui.add_button));ui.search.setText('6.1');QTest.qWait(50)
+        click(host,render_plot(host,ui.add_button));ui.search.setText('6.1')
         assert len(ui.search_results._nodes)==1
-        click(host,control(host,ui.search_results._nodes[0]));assert ui.models[models[1]]
+        click(host,render_plot(host,ui.search_results._nodes[0]))
+        if not ui.models[models[1]]:host.quick.grabFramebuffer().save(str(tmp_path/'model-choice-failed.png'))
+        assert ui.models[models[1]]
         click(host,control(host,ui.mode_buttons['Fast']));assert ui.modes=={'Standard':False,'Fast':True}
         ui.solo(models[0]);ui.choose_mode('all')
         plot=ui.plots['output_speed'];render_plot(host,plot)

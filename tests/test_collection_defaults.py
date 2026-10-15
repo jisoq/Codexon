@@ -109,6 +109,67 @@ def test_failed_migration_preserves_original_and_releases_collector_lock(default
     assert not locked(index_location().with_name(index_location().name+'.codexon-collector.lock'))
 
 
+def _interrupt_index_copy(home,control):
+    class Interrupted(sqlite3.Connection):
+        def backup(self,target):
+            def copied(status,remaining,total):
+                if remaining:
+                    control.send('copy transaction');control.recv()
+            return super().backup(target,pages=1,progress=copied)
+    original=sqlite3.connect
+    def connect(*args,**kwargs):return original(*args,**kwargs,factory=Interrupted)
+    sqlite3.connect=connect
+    service=CollectorService([home])
+    service.close()
+
+
+@pytest.mark.integration
+def test_interrupted_default_migration_reuses_one_owned_slot(default_home):
+    import hashlib
+    import multiprocessing as mp
+    old=UsageIndex([default_home],legacy_index_location())
+    payload=json.dumps({'retained':'x'*524288})
+    try:
+        old.poll(10002)
+        old.db.execute('INSERT INTO metadata VALUES(?,?,?)',('retained','copy-proof',payload))
+        old.db.commit()
+    finally:old.close()
+    source=legacy_index_location();original=hashlib.sha256(source.read_bytes()).digest()
+    destination=index_location();stage=destination.with_name(destination.name+'.migration-stage.tmp')
+    receipt=destination.with_name(destination.name+'.migration-stage.json')
+    for _ in range(3):
+        context=mp.get_context('spawn');parent,pipe=context.Pipe()
+        child=context.Process(target=_interrupt_index_copy,args=(str(default_home),pipe))
+        child.start();pipe.close()
+        try:
+            assert parent.poll(20),f'copy did not start; exit={child.exitcode}'
+            assert parent.recv()=='copy transaction'
+            child.kill();child.join(10)
+            assert not child.is_alive() and child.exitcode!=0
+            assert stage.exists() and receipt.exists() and not destination.exists()
+            assert list(destination.parent.glob('*.migration-*.tmp'))==[stage]
+            assert hashlib.sha256(source.read_bytes()).digest()==original
+        finally:
+            if child.is_alive():child.kill()
+            child.join(10);parent.close()
+    resumed=CollectorService([default_home])
+    try:
+        assert resumed.poll(10003)['sessions']
+        assert resumed.index.db.execute("SELECT data FROM metadata WHERE home='retained' AND tid='copy-proof'").fetchone()[0]==payload
+        assert resumed.index.db.execute('PRAGMA integrity_check').fetchone()[0]=='ok'
+        assert not stage.exists() and not receipt.exists()
+        assert hashlib.sha256(source.read_bytes()).digest()==original
+    finally:resumed.close()
+
+
+def test_default_migration_preserves_unowned_staging_file(default_home):
+    old=UsageIndex([default_home],legacy_index_location());old.close()
+    destination=index_location();destination.parent.mkdir(parents=True,exist_ok=True)
+    stage=destination.with_name(destination.name+'.migration-stage.tmp');stage.write_bytes(b'unowned')
+    with pytest.raises(RuntimeError,match='소유권'):CollectorService([default_home])
+    assert stage.read_bytes()==b'unowned' and not destination.exists()
+
+
 @pytest.mark.parametrize('alive',[False,True])
 def test_broken_default_snapshot_is_replaced_and_restart_keeps_usage(default_home,monkeypatch,alive):
     from cachemonitor import app_services as services

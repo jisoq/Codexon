@@ -316,13 +316,19 @@ def test_unchanged_report_above_cache_capacity_keeps_reusable_closed_intervals(m
     starts=[100]+[now-30000+n*90 for n in range(261)]
     parts=[example([(s,100),(s+30,99),(s+60,98)],[(str(s),s+5,s+40,2)]) for s in starts]
     source=report_for([c for p in parts for c in p['cycles']])
-    source.update(at=now,request_windows=[r for p in parts for r in p['request_windows']])
+    class CountedRequests(list):
+        scans=0
+        def __iter__(self):self.scans+=1;return super().__iter__()
+    requests=CountedRequests(r for p in parts for r in p['request_windows'])
+    source.update(at=now,request_windows=requests)
     engine=QuotaComputation();original=quota_attribution.local_request_intervals;calls=[]
     def counted(*args):calls.append(1);return original(*args)
     try:
         engine._prepare(source,history_revision=1)
+        scans=requests.scans
         monkeypatch.setattr(quota_attribution,'local_request_intervals',counted)
         current={**source,'at':now+5};engine._prepare(current,history_revision=1)
+        assert requests.scans==scans
         assert len(calls)<20
         view=next(reversed(engine.reports.values()))['view']
         assert len(view['_statistics_cache'])<=256

@@ -479,16 +479,18 @@ def _continuous_quota_intervals(cycles):
     for cycle in cycles:
         runs=[]
         for endpoint in cycle.get('endpoints',[]):
-            if not runs or endpoint[0]-runs[-1][-1][0]>OBSERVATION_FRESHNESS:
-                runs.append([])
-            runs[-1].append(endpoint)
+            at=endpoint[0]
+            if not runs or at-runs[-1][1]>OBSERVATION_FRESHNESS:
+                runs.append([at,at])
+            else:runs[-1][1]=at
         if len(runs)<=1:
             yield cycle
         else:
-            for run in runs:
-                clipped=_clip_quota_interval(cycle,run[0][0],run[-1][0])
+            clip=_quota_clipper(cycle)
+            for lo,hi in runs:
+                clipped=clip(lo,hi)
                 if clipped is not None:
-                    yield {**clipped,'id':f"{cycle['id']}:observed:{run[0][0]}",
+                    yield {**clipped,'id':f"{cycle['id']}:observed:{lo}",
                            'observation_gaps_excluded':True}
 
 

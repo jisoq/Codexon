@@ -83,7 +83,7 @@ def main():
     from PySide6.QtWidgets import QApplication
     from PySide6.QtTest import QTest
     from .dashboard import Dashboard
-    from .quick_qa import control,walk,wheel,render_plot,table_view
+    from .quick_qa import control,walk,wheel,render_plot,table_view,click
     from .overlay_view import SessionOverlay
     from .analysis_engine import AnalysisEngine
     from .overlay_data import OverlaySummaries
@@ -146,7 +146,7 @@ def main():
                 live_limits=False,collection_autostart=False)
             window.resize(1480,1000);window.show()
             def pending():
-                return window.analysis_pending or window.deferred_result or window.search_timer.isActive() or window.range_timer.isActive() or window.pending_population
+                return window.analysis_pending or window.deferred_result or window.search_timer.isActive() or window.range_timer.isActive()
             def settle():
                 deadline=time.perf_counter()+60
                 while True:
@@ -164,21 +164,32 @@ def main():
                 memory.append(dict(gui=private_bytes(os.getpid()),worker=private_bytes(window.worker.process.pid)))
                 with window.worker.lock:queue_sizes.append(len(window.worker.commands)+int(window.worker.pending is not None))
             def navigate(page):
-                item=control(window,window.nav)
-                row=window.navigation_pages.index(page)
-                delegate=next(x for x in walk(item) if x.property('index')==row and x.metaObject().indexOfProperty('modelData')>=0)
+                if window.current_page==0 and page!=0:
+                    delegate=next(x for x in walk(window.quick.rootObject())
+                                  if x.objectName()==f'home-card-{page}' and x.isVisible())
+                else:
+                    item=control(window,window.nav)
+                    row=window.navigation_pages.index(page)
+                    delegate=next(x for x in walk(item) if x.property('index')==row and x.metaObject().indexOfProperty('modelData')>=0)
                 point=delegate.mapToScene(QPointF(delegate.width()/2,delegate.height()/2))
                 QTest.mouseClick(window.quick,Qt.LeftButton,pos=point.toPoint())
+                assert window.current_page==page
             def type_search(clear=False):
                 control(window,window.search).forceActiveFocus()
                 QTest.keyClick(window.quick,Qt.Key_A,Qt.ControlModifier)
                 QTest.keyClick(window.quick,Qt.Key_Backspace)
                 if not clear:QTest.keyClicks(window.quick,'no-matching-replay-session')
             def choose_model(index):
+                if not window.record_filters.toggle.isChecked():
+                    click(window,control(window,window.record_filters.toggle))
                 control(window,window.model).forceActiveFocus()
                 QTest.keyClick(window.quick,Qt.Key_Home)
                 for _ in range(index):QTest.keyClick(window.quick,Qt.Key_Down)
                 QTest.keyClick(window.quick,Qt.Key_Escape)
+                deadline=time.perf_counter()+2
+                while window.record_filters.toggle.isChecked():
+                    if time.perf_counter()>deadline:raise TimeoutError('History filter close')
+                    QTest.qWait(1)
                 assert window.model.currentIndex()==index
             def pulse():
                 now=time.perf_counter();heartbeat.append((now-last[0])*1000);last[0]=now
@@ -213,18 +224,21 @@ def main():
                 if window.model.count()>1:
                     sample('filter',lambda:choose_model(1));sample('filter',lambda:choose_model(0))
                 resources()
-            def select_parent(iteration):
-                table_view(window,window.parent_table).forceActiveFocus()
+            def select_session(iteration):
+                table_view(window,window.table).forceActiveFocus()
                 QTest.keyClick(window.quick,Qt.Key_Home)
-                for _ in range(iteration%min(8,window.parent_table.rowCount())):QTest.keyClick(window.quick,Qt.Key_Down)
+                for _ in range(iteration%min(8,window.table.rowCount())):QTest.keyClick(window.quick,Qt.Key_Down)
                 QTest.keyClick(window.quick,Qt.Key_Return)
             def back():
                 item=control(window,window.back_button)
                 point=item.mapToScene(QPointF(item.width()/2,item.height()/2))
                 QTest.mouseClick(window.quick,Qt.LeftButton,pos=point.toPoint())
             for i in range(args.samples):
-                if not window.parent_table.rowCount():break
-                sample('selection',lambda i=i:select_parent(i));sample('selection_back',back)
+                if not window.table.rowCount():break
+                sample('selection',lambda i=i:select_session(i))
+                assert window.selected_session is not None
+                sample('selection_back',back)
+                assert window.record_view=='sessions' and window.selected_session is None
                 resources()
             # Unseen model/period combinations exercise actual query work rather than cache hits.
             def new_filter(iteration):
@@ -232,12 +246,13 @@ def main():
                 QTest.keyClick(window.quick,Qt.Key_Home)
                 for _ in range(iteration%5):QTest.keyClick(window.quick,Qt.Key_Down)
                 QTest.keyClick(window.quick,Qt.Key_Escape)
+                settle()  # A new period hides the old controls until its result arrives.
                 choose_model((iteration//5)%max(1,window.model.count()))
             for i in range(args.samples):sample('filter_new',lambda i=i:new_filter(i))
             # Restore the broad population for scrolling.
             control(window,window.period).forceActiveFocus();QTest.keyClick(window.quick,Qt.Key_Home)
-            for _ in range(4):QTest.keyClick(window.quick,Qt.Key_Down)
-            QTest.keyClick(window.quick,Qt.Key_Escape);choose_model(0);settle()
+            for _ in range(window.period.findData('all')):QTest.keyClick(window.quick,Qt.Key_Down)
+            QTest.keyClick(window.quick,Qt.Key_Escape);settle();choose_model(0);settle()
             # Render-completion cadence while actual wheel events are delivered.
             navigate(2);settle();window.selected_session=None;window.selected_turn=None;window.record_view='calls';window.render_explorer();settle()
             tracking[0]=True;last_frame[0]=None
@@ -249,7 +264,9 @@ def main():
                 while time.perf_counter()<deadline:app.processEvents();QTest.qWait(1)
             tracking[0]=False;settle()
             # Cursor-independent hover dispatch through the rendered chart scene.
-            navigate(0);settle();plot=render_plot(window,window.timeline)
+            navigate(1);settle();control(window,window.metric_panel)
+            plot=next(item for item in walk(window.quick.rootObject())
+                      if item.objectName()=='usage-chart-content' and item.isVisible())
             for i in range(max(30,args.samples)):
                 point=plot.mapToScene(QPointF(100+i%20*8,80+i%5*12))
                 started=time.perf_counter()
@@ -280,6 +297,20 @@ def main():
             import sys
             if sys.stdout:print(json.dumps(report),flush=True)
             return 0
+        except Exception:
+            import traceback
+            target=Path(args.output);target.parent.mkdir(parents=True,exist_ok=True)
+            failure=dict(error=traceback.format_exc())
+            if window is not None:
+                failure.update(page=window.current_page,view=window.record_view,
+                    selected_session=bool(window.selected_session),rows=len(window.record_rows),
+                    first_rows=[dict(has_session=bool(row.get('sid')),placeholder=bool(row.get('_placeholder')))
+                                for row in list(window.record_rows[:3])],
+                    model=window.model.currentData(),period=window.period.currentData(),
+                    pending=window.analysis_pending,filters_open=window.record_filters.toggle.isChecked())
+                window.grab().save(str(target.with_suffix('.failed.png')))
+            target.with_suffix('.failed.json').write_text(json.dumps(failure,indent=2),encoding='utf-8')
+            raise
         finally:
             for cls,name,method in instrumented:setattr(cls,name,method)
             Dashboard.apply_result=original_apply
