@@ -39,6 +39,33 @@ def test_versioned_append_visits_only_changed_session_ownership(monkeypatch,sess
     assert engine.sessions[(changed['home'],changed['id'])]['prepared']['turn_records']==changed['turn_records']
 
 
+def test_collector_restart_reuses_verified_facts_and_preserves_real_corrections():
+    source=history();source.update(usage_revision='first:1',request_revision='first:1',collection_complete=True)
+    engine=AnalysisEngine();engine.ingest([source]);first=engine.query(query())
+    counts={key:value for key,value in engine.metrics.items() if key!='cache_hits'};call_revision=engine.call_revision
+    source=copy.deepcopy(source);source.update(usage_revision='second:1',request_revision='second:1')
+    assert not engine.ingest([source])
+    assert engine.query(query()) is first
+    assert {key:engine.metrics[key] for key in counts}==counts
+    # Readiness remains visible without rebuilding verified calls or requests.
+    source=copy.deepcopy(source);source.update(usage_revision='third:1',request_revision='third:1',collection_complete=False)
+    assert engine.ingest([source])
+    assert engine.call_revision==call_revision and {key:engine.metrics[key] for key in counts}==counts
+    assert not engine.sessions[(source['home'],source['id'])]['prepared']['collection_complete']
+    source=copy.deepcopy(source);source['collection_complete']=True
+    assert engine.ingest([source]) and engine.call_revision==call_revision
+    # Producers may mutate dictionaries in place. Compare captured facts, not
+    # the previous source dictionary that could already contain the correction.
+    source['usage_revision']='third:2';source['history'][0]['output']+=100
+    source['history'][0]['total']+=100
+    assert engine.ingest([source]) and engine.call_revision>call_revision
+    assert engine.query(query())['analysis']['totals']['cost']==pytest.approx(analyze([source])['totals']['cost'])
+    source['request_revision']='third:2';source['turn_states']['open']='완료'
+    source['turn_records']['open']={'started_at':102,'ended_at':102.5,'state':'완료'}
+    assert engine.ingest([source])
+    assert engine.query(query())['comparison']['completed']==4
+
+
 def test_filter_choices_reuse_unchanged_histories_and_remove_corrected_values(monkeypatch):
     import cachemonitor.analysis_delivery as delivery
     from cachemonitor.analytics import observed_choices

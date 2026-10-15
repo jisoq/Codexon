@@ -504,7 +504,7 @@ def test_live_manifest_transmits_only_changed_sessions_and_preserves_order(tmp_p
         message,body=reader.live_request(protocol=3,publication=reader.live_publication)
         assert len(message['sessions'])==len(changed['sessions']) and body==b''
         current_handler=writer.live_server.handler
-        writer.live_server.handler=lambda request:(dict(ready=False),b'') if request.get('protocol')==4 else current_handler(request)
+        writer.live_server.handler=lambda request:(dict(ready=False),b'') if request.get('protocol') in (4,5) else current_handler(request)
         assert reader.read()==changed and reader.last_read_live
     finally:reader.close();writer.close()
 
@@ -625,16 +625,37 @@ def test_recovery_prefers_latest_genuine_snapshot_without_freshening(tmp_path,mo
     finally:client.close();writer.close()
 
 
-def test_recovery_and_live_delivery_release_superseded_history(tmp_path):
+@pytest.mark.parametrize('legacy',[False,True])
+def test_recovery_and_live_delivery_release_superseded_history(tmp_path,monkeypatch,legacy):
+    import zlib
+    from cachemonitor import usage_collection
     writer=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite')
     reader=CollectionChannel(writer.homes,writer.path)
     try:
-        value=snapshot(writer);writer.publish(value,'epoch',1)
+        value=snapshot(writer)
+        value['sessions'][0].update(usage_revision='epoch:1',request_revision='epoch:1')
+        writer.publish(value,'epoch',1)
+        if legacy:
+            header=json.loads(zlib.decompress(writer.db.execute('SELECT payload FROM snapshot WHERE id=1').fetchone()[0]))
+            entry=header['session_manifest'][0];entry.pop('body_digest')
+            payload=writer.db.execute('SELECT payload FROM sessions').fetchone()[0]
+            heavy=json.loads(zlib.decompress(payload))
+            for field in ('usage_revision','request_revision'):heavy[field]=entry['state'].pop(field)
+            with writer.db:
+                writer.db.execute('UPDATE sessions SET payload=?',(zlib.compress(json.dumps(heavy).encode()),))
+                writer.db.execute('UPDATE snapshot SET payload=?',(zlib.compress(json.dumps(header).encode()),))
         durable=reader.read(shared=True)
+        assert durable['sessions']==value['sessions']
         assert reader.session_cache and not reader.live_session_cache
         writer.start_live();writer.publish(value,'epoch',2)
-        live=reader.read(shared=True)
+        metadata,body=reader.live_request(protocol=5,checkpoint=reader.identity)
+        assert metadata['protocol']==5
+        if not legacy:assert metadata['sessions'][0]['size']==0 and body==b''
+        with monkeypatch.context() as patch:
+            patch.setattr(usage_collection.zlib,'decompress',lambda *a,**kw:pytest.fail('unchanged session decoded'))
+            live=reader.read(shared=True)
         assert live==durable and reader.last_read_live
+        assert live['sessions'][0]['history'] is durable['sessions'][0]['history']
         assert not reader.session_cache and reader.cached is None
         assert reader.live_session_cache
         writer.live_server.close();writer.live_server=None;writer.live=None
@@ -650,6 +671,80 @@ def test_recovery_and_live_delivery_release_superseded_history(tmp_path):
         reader.close()
         assert not reader.live_session_cache and reader.live_cached is None
         assert live['sessions'][0]['history'][0]['output']==3
+    finally:reader.close();writer.close()
+
+
+def test_new_epoch_reuses_body_but_rejects_inconsistent_content_digest(tmp_path,monkeypatch):
+    from cachemonitor import usage_collection
+    writer=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite');writer.start_live()
+    reader=CollectionChannel(writer.homes,writer.path)
+    try:
+        value=snapshot(writer);value['sessions'][0].update(usage_revision='first:1',request_revision='first:1')
+        value['sessions'][0]['turn_records']={'z':{'started_at':2},'a':{'started_at':1}}
+        writer.publish(value,'first',1)
+        with monkeypatch.context() as patch:
+            patch.setattr(reader,'live_request',lambda **kw:None)
+            initial=reader.read(shared=True)
+        assert not reader.last_read_live
+        assert reader.read(shared=True)==initial and reader.last_read_live
+        state_only=copy.deepcopy(value);state_only['sessions'][0]['usage_revision']='first:2'
+        writer.publish(state_only,'first',2)
+        metadata,body=reader.live_request(protocol=4,publication=reader.live_publication)
+        assert metadata['sessions'][0]['size']==0 and body==b''
+        assert reader.read(shared=True)==state_only
+        changed=copy.deepcopy(value);changed['sessions'][0].update(usage_revision='second:1',request_revision='second:1')
+        writer.publish(changed,'second',1)
+        with monkeypatch.context() as patch:
+            patch.setattr(usage_collection.zlib,'decompress',lambda *a,**kw:pytest.fail('unchanged session decoded'))
+            received=reader.read(shared=True)
+        assert received==changed and received['sessions'][0]['history'] is initial['sessions'][0]['history']
+        assert list(received['sessions'][0]['turn_records'])==list(value['sessions'][0]['turn_records'])
+        metadata,body=reader.live_request(protocol=4)
+        metadata['sessions'][0]['body_digest']='0'*64
+        with monkeypatch.context() as patch:
+            patch.setattr(reader,'live_request',lambda **kw:(metadata,body))
+            with pytest.raises(usage_collection.CollectionScopeError):reader.read(shared=True)
+        assert reader.live_cached['sessions'][0]['history'] is initial['sessions'][0]['history']
+    finally:reader.close();writer.close()
+
+
+def test_restart_reuses_committed_bodies_until_catalog_finishes_and_repairs_corruption(tmp_path):
+    writer=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite')
+    reader=CollectionChannel(writer.homes,writer.path)
+    try:
+        value=snapshot(writer);value['sessions'][0].update(usage_revision='first:1',request_revision='first:1')
+        value['sessions'].append({**value['sessions'][0],'id':'second'})
+        writer.publish(value,'first',17)
+        saved=list(writer.db.execute('SELECT home,sid,revision,payload FROM sessions ORDER BY sid'))
+        writer.close();writer=CollectionChannel(reader.homes,reader.path)
+        partial={**value,'index':{**value['index'],'loading':True},
+            'sessions':[dict(value['sessions'][0],usage_revision='second:1',request_revision='second:1')]}
+        writer.publish(partial,'second',1)
+        assert reader.read(shared=True)==partial
+        assert list(writer.db.execute('SELECT home,sid,revision,payload FROM sessions ORDER BY sid'))==saved
+        full={**value,'sessions':[dict(s,usage_revision='second:1',request_revision='second:1') for s in value['sessions']]}
+        writer.publish(full,'second',2)
+        assert reader.read(shared=True)==full
+        assert list(writer.db.execute('SELECT home,sid,revision,payload FROM sessions ORDER BY sid'))==saved
+        # Reused checkpoint revisions can exceed the restarted sequence. Real
+        # corrections must stay visible when that sequence catches up.
+        corrected=copy.deepcopy(full)
+        for sequence,output in ((17,4),(18,5)):
+            corrected['sessions'][0]['history'][0]['output']=output
+            writer.publish(corrected,'second',sequence)
+            assert reader.read(shared=True)==corrected
+        # A restarted writer checks bytes rather than trusting a digest alone.
+        writer.db.execute("UPDATE sessions SET payload=? WHERE sid='session'",(b'corrupted',));writer.db.commit()
+        writer.close();writer=CollectionChannel(reader.homes,reader.path)
+        writer.publish(full,'third',1)
+        assert reader.read(shared=True)==full
+        writer.publish({**full,'sessions':full['sessions'][:1]},'third',2)
+        assert [row[0] for row in writer.db.execute('SELECT sid FROM sessions')]==['session']
+        writer.db.execute('UPDATE snapshot SET payload=?',(b'corrupted',));writer.db.commit()
+        writer.start_live()
+        assert writer.live.recovery is None
+        writer.publish(full,'fourth',1)
+        assert reader.read(shared=True)==full
     finally:reader.close();writer.close()
 
 

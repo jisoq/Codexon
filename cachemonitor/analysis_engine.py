@@ -2,6 +2,7 @@
 from bisect import bisect_left
 from collections import OrderedDict, defaultdict
 from datetime import datetime
+import hashlib
 import sys
 from .analytics import analyze, comparison_view, overview_view, stats, effort_key, prepare_row, project_matches, observed_choices, call_identity, annotate_incidents, session_summary
 from .cache_misses import classify
@@ -96,6 +97,32 @@ def request_signature(source):
         ('request_state','turn_records','coverage_gaps','turn_states','unclassified'))
 
 
+def _request_facts(source):
+    # A fixed-size value captures mutable request metadata without retaining a
+    # second graph. Only changed session revisions need this verification.
+    digest=hashlib.sha256()
+    for key in ('request_state','turn_records','coverage_gaps','turn_states','unclassified'):
+        digest.update(repr(source.get(key)).encode());digest.update(b'\0')
+    return digest.digest()
+
+
+def _same_calls(state,rows):
+    history=state['prepared']['history']
+    if len(rows)!=len(history):return False
+    for i,row in enumerate(rows):
+        identity=row.get('key') or (row.get('turn'),row['ts'],i)
+        previous=state['records'].get(identity)
+        if previous is None or previous[1] is not history[i] or previous[0][0]!=row_signature(row):return False
+    return True
+
+
+def _adopt_source(state,source,*,refresh=False):
+    if refresh or state['source']['history'] is not source['history']:
+        state['prepared']={**source,**{key:state['prepared'][key] for key in
+            ('history','_prepared','cache_misses','cache_health')}}
+    state['source']=source
+
+
 class AnalysisEngine:
     def __init__(self):
         self.sessions=OrderedDict()
@@ -163,7 +190,7 @@ class AnalysisEngine:
                     request_signature(s))
                    for s in sessions) if all(s.get('usage_revision') is not None for s in sessions) else None
         if fast is not None and fast==getattr(self,'_ingest_key',None) and price_signature==self.pricing_signature:
-            for s in sessions:previous_sessions[(s['home'],s['id'])]['source']=s
+            for s in sessions:_adopt_source(previous_sessions[(s['home'],s['id'])],s)
             return False
         self._ingest_key=fast
         owned_sources = self.update_ownership(sessions)
@@ -182,19 +209,27 @@ class AnalysisEngine:
                          request_signature(source))
             if old and old['fingerprint']==fingerprint and not reprice:
                 # Diagnostics change independently of usage/metadata caches.
-                old['source']=source
+                _adopt_source(old,source)
                 updated[key]=old
                 continue
+            facts=None
+            if old and not reprice:
+                before=old['fingerprint'][0]
+                if before[:6]+before[7:-2]==metadata[:6]+metadata[7:-2]:
+                    same=old['fingerprint'][1:]==fingerprint[1:] and before[-1]==metadata[-1]
+                    if not same and _same_calls(old,owned_history):
+                        facts=_request_facts(source);same=facts==old['request_facts']
+                    if same:
+                        # A new producer epoch is not a data correction. Keep
+                        # downstream aggregates and queries when captured facts
+                        # match; completeness still changes visible query flags.
+                        state={**old,'fingerprint':fingerprint}
+                        if before[6]!=metadata[6]:
+                            changed=True;self.generation+=1;state['revision']=self.generation
+                        _adopt_source(state,source,refresh=True);updated[key]=state
+                        continue
             changed=True
             self.generation+=1
-            if old and not reprice and old['fingerprint'][1:]==fingerprint[1:]:
-                before=old['fingerprint'][0]
-                if before[:6]+before[7:]==metadata[:6]+metadata[7:]:
-                    # Completeness changes query flags, not observed calls or
-                    # requests. Keep their revision for downstream consumers.
-                    updated[key]={**old,'source':source,'prepared':{**old['prepared'],'collection_complete':source.get('collection_complete')},
-                        'fingerprint':fingerprint,'revision':self.generation}
-                    continue
             calls_changed=True
             previous=old['records'] if old and not reprice else {}
             misses=classify(owned_history)
@@ -234,6 +269,7 @@ class AnalysisEngine:
             boundaries=sorted(value for turn in source.get('turn_records',{}).values()
                               for value in (turn.get('started_at'),turn.get('ended_at')) if value is not None)
             updated[key]={'source':source,'prepared':prepared,'records':records,'fingerprint':fingerprint,
+                          'request_facts':facts if facts is not None else _request_facts(source),
                           'revision':self.generation,'content_revision':self.generation,
                           'timestamps':sorted(r['ts'] for r in history),'boundaries':boundaries,'whole_turns':dict(whole_turns)}
             self.metrics['session_rebuilds']+=1

@@ -88,12 +88,13 @@ class CollectionChanges:
 
 class LiveCollection:
     """Retain one snapshot; send changed rows without retaining a replay queue."""
-    volatile={'remaining','totals','groups','collection_complete','status'}
+    volatile={'remaining','totals','groups','collection_complete','status','usage_revision','request_revision'}
     counters={'done','files','bytes_read','version','last_usage_success','usage_complete_at'}
 
-    def __init__(self,path,scope):
+    def __init__(self,path,scope,*,recovery=None):
         self.path=str(path);self.scope=scope;self.lock=threading.Lock()
         self.leases={};self.current=None
+        self.recovery=recovery
         self.changed=threading.Condition(self.lock);self.closed=False;self.waiters=set()
 
     def prepare(self,snapshot,epoch,sequence,*,changes=None):
@@ -113,7 +114,7 @@ class LiveCollection:
             fingerprint=publication_fingerprint(value)
             if old is not None and old[1]==fingerprint:return old
             payload=zlib.compress(json.dumps(value,ensure_ascii=False,separators=(',',':')).encode(),1)
-            return sequence,fingerprint,payload
+            return sequence,fingerprint,payload,sha256(payload).hexdigest()
         for session in snapshot['sessions']:
             key=(session['home'],session['id'])
             heavy={key:value for key,value in session.items() if key not in self.volatile}
@@ -131,7 +132,7 @@ class LiveCollection:
                         {k:v for k,v in state.items() if k!='remaining'}):meaningful_changed=True
                 # Source-owned nested values can change after this publication.
                 # Freeze only changed envelopes; unchanged entries are immutable.
-                entry=dict(home=key[0],sid=key[1],revision=saved[0],
+                entry=dict(home=key[0],sid=key[1],revision=saved[0],body_digest=saved[3],
                            state=json.loads(json.dumps(state,ensure_ascii=False)))
                 state_revisions[key]=sequence
             entries[key]=entry;manifest.append(entry)
@@ -182,7 +183,7 @@ class LiveCollection:
 
     def close(self):
         with self.changed:
-            self.closed=True;self.changed.notify_all()
+            self.closed=True;self.recovery=None;self.changed.notify_all()
 
     def requested_homes(self,now):
         with self.lock:
@@ -202,6 +203,7 @@ class LiveCollection:
                     self.leases.pop(client,None);self.changed.notify_all()
                 else:self.leases[client]=(homes,time.time())
             current=self.current
+            recovery=self.recovery
             if value.get('watch')==1:
                 from .collection_transport import NOTIFICATION_WAIT
                 if not isinstance(client,str) or not client or client in self.waiters or len(self.waiters)>=4:
@@ -219,10 +221,13 @@ class LiveCollection:
         if value.get('header_only'):return dict(ready=True,header=current['header']),b''
         # Older clients can still use the unchanged durable SQLite schema.
         protocol=value.get('protocol')
-        if protocol not in (3,4):return dict(ready=False),b''
+        if protocol not in (3,4,5):return dict(ready=False),b''
         if current['header'].get('activity_stream') and not value.get('activity_stream'):
             return dict(ready=False),b''
         known=value.get('publication')
+        checkpoint=value.get('checkpoint') or known
+        recovered=(recovery[1] if protocol==5 and recovery is not None and
+                   isinstance(checkpoint,(list,tuple)) and tuple(checkpoint)==recovery[0] else {})
         since=(known[1] if isinstance(known,(list,tuple)) and len(known)==2 and
                known[0]==current['publication'][0] and type(known[1]) is int and
                0<known[1]<=current['publication'][1] else -1)
@@ -235,6 +240,7 @@ class LiveCollection:
                 changed=current['state_revisions'][key] if id_key=='sid' else entry['revision']
                 if not full and changed<=since:continue
                 payload=rows[key][2] if entry['revision']>since else b''
+                if id_key=='sid' and key in recovered and recovered[key]==entry.get('body_digest'):payload=b''
                 result.append({**entry,'size':len(payload)})
                 if payload:chunks.append(payload)
             return result
@@ -243,7 +249,7 @@ class LiveCollection:
         if activities is not None:activities=manifest(activities,current['activities'],'attempt')
         return dict(ready=True,protocol=protocol,publication=current['publication'],header=current['header'],
                     sessions=sessions,activities=activities,
-                    **(dict(full=full) if protocol==4 else {})),b''.join(chunks)
+                    **(dict(full=full) if protocol in (4,5) else {})),b''.join(chunks)
 
 
 def locked(path):
@@ -289,9 +295,34 @@ class CollectionChannel:
     def scope_key(self,evidence):
         return os.path.normcase(str(Path(evidence or self.default_evidence).resolve()))
 
+    def _recovery_catalog(self):
+        budget=4*1024*1024
+        try:
+            saved=self.db.execute('''SELECT scope,epoch,sequence,CASE WHEN length(payload)<=? THEN payload END
+                FROM snapshot WHERE id=1''',(budget,)).fetchone()
+            if not saved or saved[0]!=self.scope or saved[3] is None:return None
+            decoder=zlib.decompressobj();decoded=decoder.decompress(saved[3],budget+1)
+            if len(decoded)>budget or not decoder.eof:return None
+            header=json.loads(decoded)
+            if not isinstance(header,dict) or not isinstance(header.get('session_manifest'),list):return None
+            bodies={};weight=0
+            # One small immutable checkpoint catalog, not a payload replay queue.
+            # Entries beyond the budget are transmitted normally.
+            for entry in header.get('session_manifest',[]):
+                if not isinstance(entry,dict):continue
+                digest=entry.get('body_digest')
+                if not isinstance(digest,str) or len(digest)!=64:continue
+                key=(entry.get('home'),entry.get('sid'))
+                if not all(isinstance(part,str) for part in key):continue
+                weight+=320+sum(len(part.encode()) for part in (*key,digest))
+                if weight>budget:break
+                bodies[key]=digest
+            return ((saved[1],saved[2]),bodies) if bodies else None
+        except (sqlite3.Error,ValueError,TypeError,RecursionError,zlib.error):return None
+
     def start_live(self):
         from .collection_transport import LiveServer
-        self.live=LiveCollection(self.path,self.scope)
+        self.live=LiveCollection(self.path,self.scope,recovery=self._recovery_catalog())
         try:self.live_server=LiveServer(self.companion('.collection-live.json'),self.live.request)
         except BaseException:self.live=None;raise
 
@@ -359,7 +390,7 @@ class CollectionChannel:
         if candidate is not None and self.live.current is not None and candidate['durable']==self.live.current['durable']:
             self.live.publish(candidate)
             return
-        volatile={'remaining','totals','groups','collection_complete','status'}
+        volatile=LiveCollection.volatile
         previous=self.published if getattr(self,'publish_epoch',None)==epoch else {}
         current={};manifest=[];writes=[]
         for session in snapshot['sessions']:
@@ -370,19 +401,40 @@ class CollectionChannel:
             old=previous.get(key)
             if old is not None and fingerprint==old[1]:
                 revision=old[0];current[key]=old
+                body_digest=old[2]
             else:
-                revision=sequence
+                # Reused checkpoint revisions can be ahead of this epoch.
+                # Every correction must advance the stored body's identity.
+                revision=max(sequence,old[0]+1) if old is not None else sequence
                 payload=(prepared[2] if prepared is not None else
                          zlib.compress(json.dumps(heavy,ensure_ascii=False,separators=(',',':')).encode('utf-8'),1))
+                body_digest=prepared[3] if prepared is not None else sha256(payload).hexdigest()
                 writes.append((*key,revision,payload))
-                current[key]=(revision,fingerprint)
-            manifest.append(dict(home=key[0],sid=key[1],revision=revision,
+                current[key]=(revision,fingerprint,body_digest)
+            manifest.append(dict(home=key[0],sid=key[1],revision=revision,body_digest=body_digest,
                 state={k:v for k,v in session.items() if k in volatile}))
         header={k:v for k,v in snapshot.items() if k not in ('sessions','request_activity')}
         header.update(collection_schema=2,session_manifest=manifest)
         old_header=getattr(self,'published_header',None) if previous is self.published else None
         with self.db:
             if not self.db.in_transaction:self.db.execute('BEGIN IMMEDIATE')
+            # Only the complete catalog proves which derived bodies disappeared.
+            # Keep unloaded checkpoint bodies during restart, and compare their
+            # actual committed bytes before reusing them under the writer lock.
+            retained=(set(self.db.execute('SELECT home,sid FROM sessions')) if previous is not self.published
+                      else getattr(self,'retained_session_keys',set()))
+            if writes:
+                entries={(entry['home'],entry['sid']):entry for entry in manifest}
+                changed=[]
+                for home,sid,revision,payload in writes:
+                    key=(home,sid)
+                    saved=(self.db.execute('SELECT revision FROM sessions WHERE home=? AND sid=? AND payload=?',
+                        (home,sid,payload)).fetchone() if key not in previous else None)
+                    if saved is None or type(saved[0]) is not int:changed.append((home,sid,revision,payload))
+                    else:
+                        current[key]=(saved[0],current[key][1],current[key][2])
+                        entries[key]['revision']=saved[0]
+                writes=changed
             if snapshot.get('activity_stream'):
                 prior_source=getattr(self,'published_activity_source',None)
                 prior_limit=getattr(self,'published_activity_limit',0)
@@ -413,10 +465,14 @@ class CollectionChannel:
                     candidate['activities'] if candidate is not None else None)
                 if 'request_activity' in snapshot:header['activity_revision']=activity_revision
             encoded_header=SnapshotHeader(header,old_header)
-            if previous is not self.published:
-                self.db.execute('DELETE FROM sessions')
             self.db.executemany('INSERT OR REPLACE INTO sessions VALUES(?,?,?,?)',writes)
-            self.db.executemany('DELETE FROM sessions WHERE home=? AND sid=?',self.published.keys()-current.keys())
+            removed=previous.keys()-current.keys()
+            if snapshot.get('index',{}).get('loading'):
+                retained=retained-current.keys()
+            else:
+                removed|=retained-current.keys()
+                retained=set()
+            self.db.executemany('DELETE FROM sessions WHERE home=? AND sid=?',removed)
             updated=False
             if (old_header is not None and encoded_header.prefix is old_header.prefix and
                     len(encoded_header.payload)==len(old_header.payload)):
@@ -436,6 +492,7 @@ class CollectionChannel:
                 self.db.execute('INSERT OR REPLACE INTO snapshot VALUES(1,?,?,?,?,?)',
                     (self.scope,epoch,sequence,snapshot['ts'],encoded_header.payload))
         self.published=current;self.publish_epoch=epoch
+        self.retained_session_keys=retained
         self.published_header=encoded_header;self.publish_sequence=sequence
         self.published_activity=activities;self.activity_revision=activity_revision
         self.activity_row_revision=activity_row_revision
@@ -470,9 +527,33 @@ class CollectionChannel:
         cursor=snapshot.get('activity_cursor')
         if cursor:self.activity_ack=tuple(cursor)
 
+    def _cached_body(self,key,digest):
+        if not digest:return None
+        for cache,index in ((getattr(self,'live_session_cache',{}),3),(self.session_cache,2)):
+            old=cache.get(key)
+            if old is not None and len(old)>index and old[index]==digest:return old[1]
+        return None
+
+    def _decode_body(self,key,payload,digest):
+        if digest is not None:
+            if not isinstance(digest,str) or sha256(payload).hexdigest()!=digest:
+                raise CollectionScopeError('수집 결과의 본문 검증값이 일치하지 않습니다.')
+            cached=self._cached_body(key,digest)
+            if cached is not None:return cached,digest,{}
+        value=json.loads(zlib.decompress(payload))
+        # Legacy schema-2 bodies stored producer tokens inside the body. Move
+        # them to the envelope while deriving the same stable identity once.
+        revisions={field:value.pop(field) for field in ('usage_revision','request_revision') if field in value}
+        if digest is None:
+            encoded=zlib.compress(json.dumps(value,ensure_ascii=False,separators=(',',':')).encode(),1)
+            digest=sha256(encoded).hexdigest()
+        elif revisions:
+            raise CollectionScopeError('수집 결과의 본문 형식이 일치하지 않습니다.')
+        return value,digest,revisions
+
     def _read_live(self,metadata,body):
         same_epoch=self.live_publication and self.live_publication[0]==metadata['publication'][0]
-        delta=metadata.get('protocol')==4 and not metadata['full']
+        delta=metadata.get('protocol') in (4,5) and not metadata['full']
         if delta and not same_epoch:raise CollectionScopeError('수집 결과의 이전 publication이 없습니다.')
         offset=0
         def rows(entries,previous,id_key):
@@ -483,11 +564,24 @@ class CollectionChannel:
                 if type(size) is not int or size<0 or offset+size>len(body):
                     raise CollectionScopeError('수집 결과의 본문 길이가 일치하지 않습니다.')
                 old=previous.get(key)
+                digest=entry.get('body_digest');revisions={}
                 if size:
-                    value=json.loads(zlib.decompress(memoryview(body)[offset:offset+size]));offset+=size
-                elif old is not None and old[0]==revision:value=old[1]
+                    payload=memoryview(body)[offset:offset+size];offset+=size
+                    if id_key=='sid':value,digest,revisions=self._decode_body(key,payload,digest)
+                    else:value=json.loads(zlib.decompress(payload))
+                elif old is not None and old[0]==revision:
+                    value=old[1]
+                    if id_key=='sid':
+                        if digest is not None and digest!=old[3]:
+                            raise CollectionScopeError('수집 결과의 본문 revision이 일치하지 않습니다.')
+                        if digest is None:
+                            revisions={field:old[2][field] for field in ('usage_revision','request_revision') if field in old[2]}
+                            digest=old[3]
+                elif id_key=='sid' and metadata.get('protocol')==5 and digest:
+                    value=self._cached_body(key,digest)
+                    if value is None:raise CollectionScopeError('수집 결과의 이전 본문이 없습니다.')
                 else:raise CollectionScopeError('수집 결과의 본문 revision이 일치하지 않습니다.')
-                current[key]=((revision,value,{**value,**entry['state']}) if id_key=='sid' else (revision,value))
+                current[key]=((revision,value,{**value,**revisions,**entry['state']},digest) if id_key=='sid' else (revision,value))
             return current
         sessions=rows(metadata['sessions'],self.live_session_cache if same_epoch else {},'sid')
         result={**metadata['header'],'sessions':[row[2] for row in sessions.values()]}
@@ -502,7 +596,11 @@ class CollectionChannel:
         # __new__ read-only diagnostic channels intentionally remain SQLite-only.
         self.last_read_live=False
         if hasattr(self,'client'):
-            response=self.live_request(header_only=header_only,protocol=4,publication=self.live_publication,activity_stream=True)
+            # A durable checkpoint proves body ownership, not a live delta base.
+            response=self.live_request(header_only=header_only,protocol=5,publication=self.live_publication,
+                                       checkpoint=self.identity,activity_stream=True)
+            if response is not None and response[0].get('ready') is False:
+                response=self.live_request(header_only=header_only,protocol=4,publication=self.live_publication,activity_stream=True)
             if response is not None and response[0].get('ready') is False:
                 # A retiring collector can still publish fresh protocol-3 data
                 # while its replacement waits for the source ownership lock.
@@ -511,7 +609,7 @@ class CollectionChannel:
                 metadata,body=response
                 if metadata.get('error'):
                     raise CollectionScopeError('사용량 색인에 다른 관측 DB가 연결되어 있습니다. 별도 색인 경로를 사용하세요.')
-                if metadata.get('ready') and (header_only or metadata.get('protocol') in (3,4)):
+                if metadata.get('ready') and (header_only or metadata.get('protocol') in (3,4,5)):
                     if header_only:result=metadata['header']
                     else:result,sessions,activities=self._read_live(metadata,body)
                     source=result.get('index',{}).get('path')
@@ -561,12 +659,12 @@ class CollectionChannel:
                 for entry in header['session_manifest']:
                     key=(entry['home'],entry['sid']);revision=entry['revision']
                     old=previous.get(key)
-                    if old is not None and old[0]==revision:heavy=old[1]
+                    if old is not None and old[0]==revision:heavy,digest,revisions=old[1:]
                     else:
                         stored=db.execute('SELECT revision,payload FROM sessions WHERE home=? AND sid=?',key).fetchone()
                         if stored is None or stored[0]!=revision:raise CollectionScopeError('수집 결과의 세션 revision이 일치하지 않습니다.')
-                        heavy=json.loads(zlib.decompress(stored[1]))
-                    current[key]=(revision,heavy);sessions.append({**heavy,**entry['state']})
+                        heavy,digest,revisions=self._decode_body(key,stored[1],entry.get('body_digest'))
+                    current[key]=(revision,heavy,digest,revisions);sessions.append({**heavy,**revisions,**entry['state']})
                 result={k:v for k,v in header.items() if k not in ('collection_schema','session_manifest')}
                 result['sessions']=sessions
                 self.session_cache=current
@@ -616,6 +714,7 @@ class CollectionChannel:
         self.session_cache={};self.activity_cache={};self.activity_identity=None
         self.live_session_cache={};self.live_activity_cache={}
         self.cached=None;self.identity=None;self.live_cached=None;self.live_publication=None
+        self.retained_session_keys=set()
 
 
 def empty_snapshot(homes,path,now):
