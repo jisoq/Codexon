@@ -22,7 +22,7 @@ def test_delta_heartbeat_correction_deletion_restart_and_old_results():
     s=source();engine.ingest([s])
     first=publisher.publish(snapshot(s),engine,summaries.collect(engine))
     full=receiver.receive(first)
-    assert 'history' not in full['sessions'][0]
+    assert not {'history','turn_records','unmatched_transports'}&full['sessions'][0].keys()
     assert full['overlay_sessions'][0]['cache_misses']['events']==[]
     assert receiver.receive(first) is None
     idle=publisher.publish(snapshot(s),engine,summaries.collect(engine))
@@ -41,6 +41,14 @@ def test_delta_heartbeat_correction_deletion_restart_and_old_results():
     assert changed['call_revision']>current['call_revision']
     assert changed['model_candidates'][0]['key']=='r2'
     assert receiver.receive(changed)['overlay_sessions'][0]['model_mismatch']
+    s=copy.deepcopy(s);s['history'][-1]['model_alert_confirmed']=False
+    engine.ingest([s]);resolved=publisher.publish(snapshot(s),engine,summaries.collect(engine))
+    assert resolved['model_candidates'][0]['key']=='r2'
+    assert resolved['model_candidates'][0]['model_alert_confirmed'] is False
+    receiver.receive(resolved)
+    stable=publisher.publish(snapshot(s),engine,summaries.collect(engine))
+    assert not stable['model_candidates']
+    receiver.receive(stable)
     engine.ingest([])
     deleted=publisher.publish(dict(ts=time.time(),sessions=[]),engine,summaries.collect(engine))
     assert not receiver.receive(deleted)['sessions']
@@ -51,6 +59,26 @@ def test_delta_heartbeat_correction_deletion_restart_and_old_results():
     assert receiver.receive(first) is None
     gap=copy.deepcopy(reset);gap.update(reset=False,sequence=4)
     with pytest.raises(ValueError):receiver.receive(gap)
+
+
+@pytest.mark.parametrize('revision',('recovery:1','live:1'))
+def test_replacement_snapshot_releases_previous_raw_history(revision):
+    import weakref
+    class Observed(dict):pass
+    engine=AnalysisEngine();summaries=OverlaySummaries();publisher=SnapshotPublisher()
+    original=source();original['usage_revision']='recovery:1'
+    original['history']=[Observed(row) for row in original['history']]
+    retired=weakref.ref(original['history'][0])
+    engine.ingest([original]);publisher.publish(snapshot(original),engine,summaries.collect(engine))
+    replacement=copy.deepcopy(original);replacement['usage_revision']=revision
+    del original
+    engine.ingest([replacement])
+    # Publication only needs change identities; deduplication only needs the
+    # current source. Neither owns a retired raw population during next-view work.
+    assert retired() is None
+    value=publisher.publish(snapshot(replacement),engine,summaries.collect(engine))
+    assert not value['model_candidates']
+    assert value['overlay_sessions']==[]
 
 
 def test_writer_copies_bounds_memory_marks_gaps_and_flushes_on_owner_thread(tmp_path):

@@ -30,7 +30,9 @@ def _history_rows(report, mode, start=None, end=None, *, labels=True, _resume=No
     control_position=0
     enabled=True
     account=report.get('account')
-    identified=account and any(r.get('account')==account and r['window']==mode for r in report.get('history',[]))
+    identified=report.get('_history_identified')
+    if identified is None:
+        identified=account and any(r.get('account')==account and r['window']==mode for r in report.get('history',[]))
     history=report.get('history',[])
     ordered=isinstance(history,_PackedHistory)
     resume_at=None

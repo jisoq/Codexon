@@ -113,7 +113,7 @@ class AnalysisEngine:
         self.pricing_signature=None
         self.ownership_sources={}
         self.ownership_candidates=defaultdict(set)
-        self.owned_rows={}
+        self.owned_positions={}
         self.ownership_versions={}
         self.metrics={'priced_calls':0,'session_rebuilds':0,'part_builds':0,'view_builds':0,'cache_hits':0}
 
@@ -121,10 +121,10 @@ class AnalysisEngine:
         sources={(s['home'],s['id']):s for s in sessions}
         affected=set();touched=set()
         for key in self.ownership_sources.keys()-sources.keys():
-            _,identities,_=self.ownership_sources.pop(key)
+            _,identities=self.ownership_sources.pop(key)
             for identity in identities:
                 self.ownership_candidates[identity].discard(key);touched.add(identity)
-            self.owned_rows.pop(key,None);self.ownership_versions.pop(key,None)
+            self.owned_positions.pop(key,None);self.ownership_versions.pop(key,None)
         for key,source in sources.items():
             token=source.get('usage_revision')
             if token is None:token=row_signatures(source['history'])
@@ -135,18 +135,23 @@ class AnalysisEngine:
                 self.ownership_candidates[identity].discard(key);touched.add(identity)
             for identity in identities:
                 self.ownership_candidates[identity].add(key);touched.add(identity)
-            self.ownership_sources[key]=(token,identities,source['history'])
+            self.ownership_sources[key]=(token,identities)
             affected.add(key)
         for identity in touched:
             candidates=self.ownership_candidates[identity]
             affected.update(candidates)
             if not candidates:del self.ownership_candidates[identity]
         for key in affected:
-            rows=self.ownership_sources[key][2]
-            self.owned_rows[key]=[row for row in rows
-                if min(self.ownership_candidates[call_identity(*key,row.get('key'))])==key]
+            rows=sources[key]['history']
+            positions=tuple(i for i,row in enumerate(rows)
+                if min(self.ownership_candidates[call_identity(*key,row.get('key'))])==key)
+            self.owned_positions[key]=None if len(positions)==len(rows) else positions
             self.ownership_versions[key]=self.ownership_versions.get(key,0)+1
-        return [self.owned_rows[key] for key in sources]
+        # Equal revisions can arrive through independently decoded recovery and
+        # live snapshots. Positions refer to the current source without owning
+        # another raw population; whole-owner histories need no index array.
+        return [source['history'] if self.owned_positions[key] is None else
+                [source['history'][i] for i in self.owned_positions[key]] for key,source in sources.items()]
 
     def ingest(self,sessions):
         previous_sessions={**self.sessions,**self.internal_sessions}

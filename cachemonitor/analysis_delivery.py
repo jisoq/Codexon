@@ -11,7 +11,7 @@ class SnapshotPublisher:
     CHOICE_CACHE_ENTRIES=4096
     def __init__(self):
         self.epoch=uuid.uuid4().hex;self.sequence=0
-        self.sessions={};self.overlays={};self.states={};self.models={}
+        self.sessions={};self.overlays={};self.revisions={};self.models={};self.model_alerts={}
         self.choices={}
 
     def observed_choices(self, engine):
@@ -61,22 +61,30 @@ class SnapshotPublisher:
             key=(source['home'],source['id'])
             if key not in engine.sessions:continue
             state=engine.sessions[key]
-            light={k:v for k,v in source.items() if k not in ('history','requests','groups','totals','cache_misses','turn_states','transports','coverage_gaps')}
+            light={k:v for k,v in source.items() if k not in ('history','requests','groups','totals','cache_misses',
+                'turn_records','turn_states','transports','unmatched_transports','coverage_gaps')}
             # Sliding-window countdown is derived from activity, not repeatedly shipped.
             light.pop('remaining',None)
             light['cache_misses']={k:v for k,v in state['prepared'].get('cache_misses',{}).items() if k!='events'}
             sessions[key]=light
-            old=self.states.get(key)
-            if old and old.get('content_revision',old['revision'])==state.get('content_revision',state['revision']):continue
+            revision=state.get('content_revision',state['revision'])
+            if self.revisions.get(key)==revision:continue
+            self.revisions[key]=revision
             self.models[key]={r.get('model') for r in state['prepared']['history'] if r.get('model')}
-            old_records=old['records'] if old else {}
+            old_alerts=self.model_alerts.get(key,{})
+            alerts={}
             for identity,(_,row) in state['records'].items():
-                prev=old_records.get(identity)
-                if prev and prev[1] is row:continue
-                if not prev or any(prev[1].get(k)!=row.get(k) for k in MODEL_KEYS):
-                    if row.get('model_alert_confirmed') or prev and prev[1].get('model_alert_confirmed'):
-                        models.append(dict(home=source['home'],sid=source['id'],title=source['title'],
-                                           **{k:row.get(k) for k in MODEL_KEYS}))
+                prev=old_alerts.get(identity)
+                if not row.get('model_alert_confirmed') and prev is None:continue
+                signature=tuple(row.get(k) for k in MODEL_KEYS)
+                if row.get('model_alert_confirmed'):alerts[identity]=signature
+                if signature!=prev:
+                    models.append(dict(home=source['home'],sid=source['id'],title=source['title'],
+                                       **dict(zip(MODEL_KEYS,signature))))
+            # Only confirmed alert identities are needed to detect corrections
+            # and resolution. Keeping the old engine state retains raw history
+            # throughout the next collection, analysis and publication cycle.
+            self.model_alerts[key]=alerts
             health=overlays[key].get('cache_health',{})
             cache.append(dict(home=source['home'],id=source['id'],title=source['title'],cache_health=health,
                               cache_misses=overlays[key]['cache_misses']))
@@ -89,13 +97,15 @@ class SnapshotPublisher:
                        model_candidates=models,cache_candidates=cache,
                        internal_review_calls=sum(len(s['prepared']['history']) for s in engine.internal_sessions.values()))
         self.models={k:v for k,v in self.models.items() if k in sessions}
+        self.revisions={k:v for k,v in self.revisions.items() if k in sessions}
+        self.model_alerts={k:v for k,v in self.model_alerts.items() if k in sessions}
         if self.sequence==1 or engine.call_revision!=getattr(self,'call_revision',None):
             message['models']=sorted(set().union(*self.models.values()) if self.models else set())
             message['filter_choices']={**self.observed_choices(engine),
                 'homes':sorted(set(snapshot.get('homes',[]))|{s['home'] for s in sessions.values()}),
                 **project_choices(sessions.values()),
                 'sources':sorted({s.get('source','unknown') for s in sessions.values()})}
-        self.sessions=sessions;self.overlays=overlays;self.states=dict(engine.sessions);self.revision=engine.revision
+        self.sessions=sessions;self.overlays=overlays;self.revision=engine.revision
         self.call_revision=engine.call_revision
         return message
 

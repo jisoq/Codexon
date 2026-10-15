@@ -126,6 +126,17 @@ class QuotaComputation:
             self.ledger_generation += 1
         return self.ledger
 
+    def _archived_current(self,ledger,now):
+        from .quota_archive import load
+        self.archive=load(ledger,self.home,now,self.archive)
+        if self.archive is None:return None
+        current=ledger.current_report(self.home,now,retain_projection=True)
+        valid=ledger.db.execute('SELECT valid FROM quota_archive_heads WHERE epoch=?',(self.archive.epoch,)).fetchone()
+        if (current is None or not valid or not valid[0] or current.get('account')!=self.archive.account or
+                current.get('_projection_start')>self.archive.cutoff):return None
+        ledger.release_report_cache()
+        return current
+
     def _prepare(self, report, history_revision=None, selection=None, known_digest=None,archive=None):
         from .quota_view import prepare_quota_view, summary_deadline
         report=dict(report)
@@ -133,6 +144,8 @@ class QuotaComputation:
         if self.ledger is not None and history_revision==(self.ledger_generation,getattr(self.ledger,'_report_generation',None)):
             report['_cycle_versions']={key:value[0] for key,value in getattr(self.ledger,'_cycle_cache',{}).items()}
         previous=next(reversed(self.reports.values()),None) if self.reports else None
+        if archive is not None and previous and not previous.get('_archive_prefix'):
+            previous=None
         source=report.get('request_windows',[])
         if (report.get('tracking') is None or
                 (self.request_lookup is not None and self.request_lookup.source is not source)):
@@ -202,20 +215,29 @@ class QuotaComputation:
         if report['view'].get('_prepared_statistics') is not None:
             report['_prepared_statistics']=report['view']['_prepared_statistics']
         if archive is not None:report=archive.compose(report)
-        revision = uuid4().hex
-        self.reports[revision] = report
-        while len(self.reports) > 2:
-            self.reports.popitem(last=False)
         if self.ledger is not None and (history_revision is not None or archive is not None):
             from .quota_projection import save
             # Derived checkpoints are optional. A cache write failure must not
             # discard a valid report or affect authoritative ledger commits.
-            try:save(self.ledger,report,report['view'])
-            except (OSError,sqlite3.Error):pass
+            saved=False
             if self.ledger_factory is None:
                 from .quota_archive import save as save_archive
-                try:save_archive(self.ledger,report,report['view'])
-                except (OSError,sqlite3.Error,ValueError):pass
+                try:saved=save_archive(self.ledger,report,report['view'])
+                except (OSError,sqlite3.Error,ValueError):saved=False
+            start=next((p['start'] for p in report['view']['periods'] if p['current']),None)
+            # Publish the closed prefix before advancing its replay checkpoint.
+            # A rejected write can keep reading the previous prefix plus tail.
+            if archive is None or saved or start is not None and archive.cutoff>=start:
+                try:save(self.ledger,report,report['view'])
+                except (OSError,sqlite3.Error):pass
+            if saved and archive is None:
+                current=self._archived_current(self.ledger,report['at'])
+                if current is not None:
+                    return self._prepare(current,selection=selection,known_digest=known_digest,archive=self.archive)
+        revision = uuid4().hex
+        self.reports[revision] = report
+        while len(self.reports) > 2:
+            self.reports.popitem(last=False)
         return compact_report(report, revision, selection, known_digest)
 
     def execute(self, request, phase=lambda value: None, publish=None):
@@ -248,16 +270,11 @@ class QuotaComputation:
                     phase('reading')
                 current=None
                 if kind=='report' and self.ledger_factory is None:
-                    from .quota_archive import load as load_archive
-                    self.archive=load_archive(ledger,self.home,time.time(),self.archive)
-                    if self.archive is not None:
-                        current=ledger.current_report(self.home,retain_projection=True)
-                        valid=ledger.db.execute('SELECT valid FROM quota_archive_heads WHERE epoch=?',(self.archive.epoch,)).fetchone()
-                        if (current is not None and valid and valid[0] and current.get('account')==self.archive.account and
-                                current.get('_projection_start')<=self.archive.cutoff):
-                            result['report']=self._prepare(current,selection=request.get('selection'),
-                                known_digest=request.get('digest'),archive=self.archive)
-                            return result
+                    current=self._archived_current(ledger,time.time())
+                    if current is not None:
+                        result['report']=self._prepare(current,selection=request.get('selection'),
+                            known_digest=request.get('digest'),archive=self.archive)
+                        return result
                 if (kind=='report' and publish is not None and not self.reports
                         and request.get('selection') is None and hasattr(ledger,'current_report')):
                     if current is None:current=ledger.current_report(self.home)

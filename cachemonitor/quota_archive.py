@@ -13,7 +13,7 @@ import sqlite3
 from uuid import uuid4
 import zlib
 
-VERSION=1
+VERSION=2
 MAX_BYTES=64*1024*1024
 MAX_PACKET_BYTES=8*1024*1024
 MAX_DECODED_BYTES=32*1024*1024
@@ -82,12 +82,14 @@ def initialize(db):
     db.executescript('''
         CREATE TABLE IF NOT EXISTS quota_archive_heads(
             epoch TEXT PRIMARY KEY,home TEXT,account TEXT,version INTEGER,
-            cutoff REAL,at REAL,price TEXT,valid INTEGER,payload BLOB);
+            cutoff REAL,at REAL,price TEXT,valid INTEGER,payload BLOB,digest TEXT);
         CREATE INDEX IF NOT EXISTS quota_archive_home ON quota_archive_heads(home);
         CREATE TABLE IF NOT EXISTS quota_archive_entries(
             epoch TEXT,kind TEXT,key TEXT,digest TEXT,PRIMARY KEY(epoch,kind,key));
         CREATE TABLE IF NOT EXISTS quota_archive_blobs(digest TEXT PRIMARY KEY,payload BLOB);
     ''')
+    if 'digest' not in {row[1] for row in db.execute('PRAGMA table_info(quota_archive_heads)')}:
+        db.execute('ALTER TABLE quota_archive_heads ADD COLUMN digest TEXT')
     # The bounded change ring is also a notification stream. Dirty prefixes
     # remain dirty after the ring wraps or the reader exits.
     for operation in ('INSERT','UPDATE'):
@@ -145,6 +147,8 @@ class ArchiveStatistics:
                 source={**report,'cycles':[packet['cycle']]}
                 value=_scope_value(_quota_scope(source,start,end,RequestWindows(packet['requests'])))
             parts,attribution,delta,observed=value
+            if saved is not None:
+                parts=[{**row,'cost_complete_at':report.get('index_complete_at')} for row in parts]
             rows.extend(parts);diagnostics.extend(attribution);deltas.extend(delta);count+=observed
         return rows,diagnostics,deltas,count
 
@@ -176,24 +180,39 @@ class Archive:
         return value
 
     def series(self,start,*,display=False):
-        from .quota_cycles import _PackedHistory
         from .quota_view import _PeriodHistory,period_series
         value=self.packet('period',start)
-        source=value['source'];source['report']['history']=_PackedHistory(source['report']['history'])
+        source=value['source'];source['report']['history']=self.history(source)
         restored=_PeriodHistory.__new__(_PeriodHistory)
         restored.report=source['report'];restored.end=source['end']
         restored.checkpoint=pickle.dumps(source['checkpoint'],protocol=5)
         times,flags,kind=source['classification']
         restored.classification=(times,bytes.fromhex(flags),kind)
         period=value['period'];period['_series_detail']['source']=restored
+        period['_series_intervals']=period['_series_detail']['intervals']
         return period_series(period,display=display)
 
+    def history(self,source):
+        # Original observations already have a range index. Keep only their
+        # replay checkpoint here, not a second persistent copy of every row.
+        # Validate and read in one short snapshot so selected detail cannot mix
+        # a displayed version with a corrected historical source.
+        db=self.ledger.db;own=not db.in_transaction
+        if own:db.execute('BEGIN')
+        try:
+            row=db.execute('SELECT valid FROM quota_archive_heads WHERE epoch=?',(self.epoch,)).fetchone()
+            if row is None or not row[0]:raise ArchiveUnavailable(self.epoch)
+            tables={row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            return self.ledger._report_history(self.head['policy']['home'],source['checkpoint'][0],source['end'],tables)
+        finally:
+            if own:db.rollback()
+
     def history_for(self,report,start):
-        from .quota_cycles import _PackedHistory
         period=next((p for p in self.head['periods'] if p['start']<=start<=p['end']),None)
         if period is None:return report
         source=self.packet('period',period['start'])['source']
-        return {**report,'history':_PackedHistory(source['report']['history']),
+        return {**report,'history':self.history(source),
+                '_history_identified':source['report']['_history_identified'],
                 '_history_resume':source['checkpoint']}
 
     def compose(self,report):
@@ -201,7 +220,8 @@ class Archive:
         from .quota_cycles import quota_statistics
         from .quota_view import summary_deadline
         view=report['view'];current_ids={cycle['id'] for cycle in report['cycles']}
-        cycles=[*report['cycles'],*(item['cycle'] for item in self.head['cycles'] if item['cycle']['id'] not in current_ids)]
+        cycles=[*report['cycles'],*({**item['cycle'],'cost_complete_at':report.get('index_complete_at')}
+            for item in self.head['cycles'] if item['cycle']['id'] not in current_ids)]
         current=view.get('_prepared_statistics')
         result={**report,'cycles':cycles,'history_pending':False,'_archive_prefix':self,
                 '_prepared_statistics':ArchiveStatistics(self,current,current_ids)}
@@ -226,11 +246,18 @@ class Archive:
 
 def load(ledger,home,now,previous=None):
     from .quota_cycles import PRICE_ID
-    row=ledger.db.execute('SELECT * FROM quota_archive_heads WHERE home=? ORDER BY rowid DESC LIMIT 1',(home,)).fetchone()
+    row=ledger.db.execute('''SELECT epoch,home,account,version,cutoff,at,price,valid,digest
+        FROM quota_archive_heads WHERE home=? ORDER BY rowid DESC LIMIT 1''',(home,)).fetchone()
     if row is None or not row['valid'] or row['version']!=VERSION or row['price']!=PRICE_ID or row['at']>now:return None
     if previous is not None and previous.epoch==row['epoch']:return previous
-    try:return Archive(ledger,row,decode(row['payload']))
-    except (ValueError,TypeError,KeyError,RecursionError,zlib.error):return None
+    payload=ledger.db.execute('SELECT CASE WHEN length(payload)<=? THEN payload END FROM quota_archive_heads WHERE epoch=?',
+                             (MAX_PACKET_BYTES,row['epoch'])).fetchone()
+    payload=payload[0] if payload is not None else None
+    if payload is None or hashlib.sha256(payload).hexdigest()!=row['digest']:
+        ledger._archive_invalid=row['epoch'];return None
+    try:return Archive(ledger,row,decode(payload))
+    except (ValueError,TypeError,KeyError,RecursionError,zlib.error):
+        ledger._archive_invalid=row['epoch'];return None
 
 
 def save(ledger,report,view):
@@ -242,12 +269,14 @@ def save(ledger,report,view):
     current=next((period for period in periods if period['current']),None)
     if current is None:return False
     cutoff=current['start'];home=report['home']
-    old=ledger.db.execute('SELECT cutoff,valid FROM quota_archive_heads WHERE home=? ORDER BY rowid DESC LIMIT 1',(home,)).fetchone()
-    if old and old['valid'] and old['cutoff']==cutoff:return False
+    old=ledger.db.execute('SELECT epoch,cutoff,valid,version,price FROM quota_archive_heads WHERE home=? ORDER BY rowid DESC LIMIT 1',(home,)).fetchone()
+    if (old and old['valid'] and old['cutoff']==cutoff and old['version']==VERSION and old['price']==PRICE_ID and
+            getattr(ledger,'_archive_invalid',None)!=old['epoch']):return False
     prepared=view.get('_prepared_statistics')
     if prepared is None or not hasattr(prepared,'entries'):return False
     revision=report.get('_projection_revision',getattr(ledger,'_input_revision',None))
-    if revision is None or ledger.db.in_transaction:return False
+    coverage=report.get('_projection_coverage')
+    if revision is None or coverage is None or ledger.db.in_transaction:return False
     closed=[cycle for cycle in report['cycles'] if cycle['end']<cutoff]
     if any(cycle.get('cost_complete_at') is None or cycle['cost_complete_at']<cycle['end'] for cycle in closed):return False
     windows=RequestWindows(report.get('request_windows',[]))
@@ -287,15 +316,17 @@ def save(ledger,report,view):
                     head['periods'].append(next(p for p in prefix.head['periods'] if p['start']==period['start']))
                     reuse('period',period['start']);continue
                 detail=period.get('_series_detail');source=detail.get('source') if detail else None
-                if source is None or len(source.report['history'])>MAX_ROWS:return False
+                if source is None:return False
                 times,flags,kind=source.classification
-                raw=dict(report={**source.report,'history':list(source.report['history'])},end=source.end,
+                account=source.report.get('account')
+                raw=dict(report={**{key:value for key,value in source.report.items() if key!='history'},
+                    '_history_identified':bool(account and any(row.get('account')==account and row['window']=='weekly' for row in source.report['history']))},end=source.end,
                     checkpoint=pickle.loads(source.checkpoint),classification=(list(times),flags.hex(),kind))
                 header={key:value for key,value in period.items() if key!='series' and not key.startswith('_')}
                 header.update(_series_signature=period['_series_signature'].hex(),_has_history=period['_has_history'])
                 head['periods'].append(header)
                 value={**header,'series':None,'_series_detail':{key:value for key,value in detail.items() if key!='source'},
-                       '_series_intervals':period['_series_intervals'],'_series_exclusions':period['_series_exclusions']}
+                       '_series_exclusions':period['_series_exclusions']}
                 packet('period',period['start'],dict(period=value,source=raw))
             payload=encode(head);total+=len(payload)
             if total>MAX_BYTES:return False
@@ -304,13 +335,19 @@ def save(ledger,report,view):
         db.execute('PRAGMA busy_timeout=0')
         try:
             db.execute('BEGIN IMMEDIATE')
+            slots=','.join('?' for _ in coverage)
+            states={row['home']:(row['unclassified'],row['complete_at']) for row in
+                    db.execute(f'SELECT home,unclassified,complete_at FROM state WHERE home IN ({slots})',tuple(coverage))}
+            if states.keys()!=coverage.keys() or any(
+                    states[home][0]!=before[0] or before[1] is not None and
+                    (states[home][1] is None or states[home][1]<before[1]) for home,before in coverage.items()):return False
             latest=db.execute('SELECT value FROM report_revision WHERE id=1').fetchone()[0]
             if latest!=revision:
                 changes=list(db.execute('SELECT table_name,at FROM report_changes WHERE revision>?',(revision,)))
                 if latest-revision!=len(changes) or any(table not in IGNORED_CHANGES and (at is None or at<=cutoff) for table,at in changes):return False
             epoch=uuid4().hex
-            db.execute('INSERT INTO quota_archive_heads VALUES(?,?,?,?,?,?,?,1,?)',
-                       (epoch,home,report.get('account'),VERSION,cutoff,report['at'],PRICE_ID,payload))
+            db.execute('INSERT INTO quota_archive_heads VALUES(?,?,?,?,?,?,?,1,?,?)',
+                       (epoch,home,report.get('account'),VERSION,cutoff,report['at'],PRICE_ID,payload,hashlib.sha256(payload).hexdigest()))
             for kind,key,digest,body in stage.execute('SELECT * FROM packets'):
                 if body is not None:db.execute('INSERT OR IGNORE INTO quota_archive_blobs VALUES(?,?)',(digest,body))
                 elif not db.execute('SELECT 1 FROM quota_archive_blobs WHERE digest=?',(digest,)).fetchone():return False
@@ -321,7 +358,7 @@ def save(ledger,report,view):
                        '(SELECT home FROM quota_archive_heads GROUP BY home ORDER BY max(rowid) DESC LIMIT ?)',(MAX_HOMES,))
             db.execute('DELETE FROM quota_archive_entries WHERE epoch NOT IN (SELECT epoch FROM quota_archive_heads)')
             db.execute('DELETE FROM quota_archive_blobs WHERE digest NOT IN (SELECT digest FROM quota_archive_entries)')
-            db.commit();return True
+            db.commit();ledger._archive_invalid=None;return True
         finally:
             if db.in_transaction:db.rollback()
             db.execute(f'PRAGMA busy_timeout={timeout}')

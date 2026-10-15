@@ -64,7 +64,7 @@ def test_projected_current_period_survives_restart_and_invalidates_old_edits(tmp
 
 def test_closed_period_projection_keeps_exact_queries_and_detail_after_restart(tmp_path,monkeypatch):
     from cachemonitor.quota_worker import QuotaComputation,chart_result
-    from cachemonitor.quota_view import prepare_quota_query
+    from cachemonitor.quota_view import prepare_quota_query,prepare_quota_view
     from cachemonitor.quota_archive import load
     from cachemonitor.quota_exclusions import preview_exclusion
     path=tmp_path/'archive.sqlite'
@@ -80,8 +80,9 @@ def test_closed_period_projection_keeps_exact_queries_and_detail_after_restart(t
         wire=[dict(home='h',identity=str(at),response=str(at),start=at-2,end=at,status='completed') for at in calls]
         activity(ledger,161,{},calls,wire=wire)
         raw=ledger.report('h',clock[0])
+        raw['_cycle_versions']={key:value[0] for key,value in ledger._cycle_cache.items()}
+        full={**raw,'view':prepare_quota_view(raw,deferred=True)}
         reply=worker._prepare(raw,(worker.ledger_generation,ledger._report_generation))
-        full=worker.reports[reply['worker_revision']]
         expected=[prepare_quota_query(full,q) for q in queries]
         selected=next(p['start'] for p in full['view']['periods'] if not p['current'])
         chart=chart_result(full['view'],selected)
@@ -115,12 +116,21 @@ def test_closed_period_projection_keeps_exact_queries_and_detail_after_restart(t
             assert 'error' not in result
             actual=worker.reports[result['report']['worker_revision']]
             assert actual['view']['lifetime']['cost']==quota_statistics(expected_raw,include_mode_assumptions=True)['cost']
+            expected_view={**expected_raw,'view':prepare_quota_view(expected_raw,deferred=True)}
+            assert prepare_quota_query(actual,{})==prepare_quota_query(expected_view,{})
             clock[0]=210.
             observe(writer,190,100);observe(writer,200,99)
             activity(writer,201,{},[*calls,173,197],wire=wire)
             expected_raw=writer.report('h',clock[0])
             assert load(ledger,'h',clock[0]) is not None,[tuple(row) for row in ledger.db.execute('SELECT table_name,at FROM report_changes ORDER BY revision DESC LIMIT 15')]
-            assert ledger.current_report('h',clock[0]) is not None
+            # A rejected new prefix must leave the matching replay checkpoint
+            # usable. The next poll must not silently fall back to all history.
+            with monkeypatch.context() as patch:
+                patch.setattr('cachemonitor.quota_archive.MAX_BYTES',1)
+                patch.setattr(ledger,'report',no_replay)
+                for request_id in ('bounded-first','bounded-repeat'):
+                    bounded=worker.execute(dict(kind='report',id=request_id,key='k'))
+                    assert 'error' not in bounded
             with monkeypatch.context() as patch:
                 patch.setattr(ledger,'report',no_replay)
                 result=worker.execute(dict(kind='report',id='r3',key='k'),publish=lambda value:None)
@@ -134,8 +144,78 @@ def test_closed_period_projection_keeps_exact_queries_and_detail_after_restart(t
             assert chart_result(prepared['view'],selected)['series']==chart['series']
             writer.db.execute("UPDATE calls SET cost=cost+1 WHERE uid='107'");writer.db.commit()
             assert load(ledger,'h',clock[0]) is None
+            stale=worker.execute(dict(kind='chart',id='stale',key='k',revision=result['report']['worker_revision'],
+                selection=min(p['start'] for p in actual['view']['periods'])))
+            assert stale.get('stale') and not stale.get('permanent')
         finally:writer.close()
     finally:worker.close()
+
+
+def test_closed_projection_rejects_coverage_change_during_save(tmp_path,monkeypatch):
+    from cachemonitor import quota_archive
+    from cachemonitor.quota_view import prepare_quota_view
+    path=tmp_path/'coverage-race.sqlite'
+    reader=QuotaLedger(path,pack_history=True,weekly_history_only=True)
+    writer=QuotaLedger(path)
+    try:
+        tracking.enable(writer.db,'h',100)
+        for at,remaining in ((102,70),(110,69),(120,100),(130,99)):
+            observe(writer,at,remaining)
+        activity(writer,140,{},[107,127])
+        raw=reader.report('h',140)
+        raw['_cycle_versions']={key:value[0] for key,value in reader._cycle_cache.items()}
+        view=prepare_quota_view(raw,deferred=True)
+        original=quota_archive.encode;changed=[]
+        def encode(value):
+            if not changed:
+                writer.db.execute("UPDATE state SET unclassified=1 WHERE home='h'")
+                writer.db.commit();changed.append(True)
+            return original(value)
+        monkeypatch.setattr(quota_archive,'encode',encode)
+        assert not quota_archive.save(reader,raw,view)
+        assert changed
+        assert quota_archive.load(reader,'h',140) is None
+        assert writer.db.execute('SELECT count(*) FROM calls').fetchone()[0]==2
+    finally:
+        writer.close();reader.close()
+
+
+def test_closed_projection_write_failure_preserves_previous_version_and_repairs_bad_head(tmp_path):
+    import sqlite3
+    from cachemonitor import quota_archive
+    from cachemonitor.quota_view import prepare_quota_view
+    path=tmp_path/'archive-write.sqlite'
+    ledger=QuotaLedger(path,pack_history=True,weekly_history_only=True)
+    try:
+        tracking.enable(ledger.db,'h',100)
+        for at,remaining in ((102,70),(110,69),(120,100),(130,99)):
+            observe(ledger,at,remaining)
+        activity(ledger,140,{},[107,127])
+        def prepare(at):
+            raw=ledger.report('h',at)
+            raw['_cycle_versions']={key:value[0] for key,value in ledger._cycle_cache.items()}
+            return raw,prepare_quota_view(raw,deferred=True)
+        assert quota_archive.save(ledger,*prepare(140))
+        previous=quota_archive.load(ledger,'h',140)
+        observe(ledger,150,100);observe(ledger,160,99)
+        activity(ledger,170,{},[107,127,157])
+        raw,view=prepare(170)
+        ledger.db.set_authorizer(lambda action,table,*args:
+            sqlite3.SQLITE_DENY if action==sqlite3.SQLITE_INSERT and table=='quota_archive_entries' else sqlite3.SQLITE_OK)
+        try:
+            with pytest.raises(sqlite3.DatabaseError):quota_archive.save(ledger,raw,view)
+        finally:ledger.db.set_authorizer(None)
+        ledger.close();ledger=QuotaLedger(path,pack_history=True,weekly_history_only=True,reader=True)
+        assert quota_archive.load(ledger,'h',170).epoch==previous.epoch
+        assert ledger.db.execute('SELECT count(*) FROM quota_archive_heads').fetchone()[0]==1
+        assert ledger.db.execute('SELECT count(*) FROM calls').fetchone()[0]==3
+        assert quota_archive.save(ledger,*prepare(170))
+        latest=quota_archive.load(ledger,'h',170)
+        ledger.db.execute('UPDATE quota_archive_heads SET payload=? WHERE epoch=?',(b'corrupted',latest.epoch));ledger.db.commit()
+        assert quota_archive.load(ledger,'h',170) is None
+        assert quota_archive.save(ledger,*prepare(170))
+        assert quota_archive.load(ledger,'h',170) is not None
+    finally:ledger.close()
 
 
 def test_current_projection_does_not_require_full_history_cache_admission(tmp_path,monkeypatch):
@@ -406,7 +486,10 @@ def test_worker_reuses_unchanged_statistics_and_rechecks_requests_and_exclusions
     from cachemonitor import quota_attribution, quota_cycles
     from cachemonitor.quota_view import prepare_quota_view, period_series
     from cachemonitor.quota_worker import QuotaComputation
-    worker=QuotaComputation(tmp_path/'statistics.sqlite','h')
+    # Keep the full-report fallback's reuse contract independent of the closed
+    # projection. Its restart, range queries and exact detail are checked above.
+    worker=QuotaComputation(tmp_path/'statistics.sqlite','h',
+        ledger_factory=lambda path:QuotaLedger(path,pack_history=True,weekly_history_only=True))
     ledger=worker._ledger(writable=True);attributed=[]
     original=quota_attribution.local_request_intervals
     def counted(cycle,*args,**kwargs):

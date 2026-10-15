@@ -901,7 +901,7 @@ class QuotaLedger:
     REQUEST_SORT_ROWS=32768
     SYNC_BATCH_ROWS=128
     ARCHIVE_COMPACTION_ROWS=512
-    READER_SCHEMA_VERSION=2
+    READER_SCHEMA_VERSION=3
     FUTURE_COLUMNS=(('observations',('at',)),('window_observations',('at',)),
         ('manual_resets',('at',)),('calls',('ts',)),('tracking_controls',('at',)),
         ('tracking_observations',('received',)),('tracking_tasks',('start','end')),
@@ -1647,6 +1647,7 @@ class QuotaLedger:
                 crossed=bisect_right(cached['ends'],complete_at if complete_at is not None else float('-inf'))!=bisect_right(cached['ends'],before if before is not None else float('-inf'))
                 if not crossed and (not report.get('tracking') or healthy==report['tracking']['complete']):
                     return {**report,'at':now,'index_at':state['at'] if state else None,'index_complete_at':complete_at,
+                        '_projection_coverage':{r['home']:(r['unclassified'],r['complete_at']) for r in states},
                         'cycles':[{**cycle,'cycle_end':now} if position==0 and cycle['cycle_end']==cached['at'] else cycle
                                   for position,cycle in enumerate(report['cycles'])]}
             if own_transaction:
@@ -2036,11 +2037,11 @@ class QuotaLedger:
                           and 0<=r['used']<=100 and r['minutes']==10080]
             groups = split_cycles(observations, manual_resets)
             if groups:groups[-1]['provisional']=True
-        state = self.db.execute('select * from state where home=?', (home,)).fetchone()
+        states=list(self.db.execute(f'select * from state where home in ({slots})',scope))
+        state=next((row for row in states if row['home']==home),None)
         completed_at=(state['complete_at'] if 'complete_at' in state.keys() else state['at'] if not state['loading'] else None) if state else None
         if tracking is not None:
-            marks=list(self.db.execute(f'select complete_at from state where home in ({slots})',scope))
-            completed_at=min((r[0] for r in marks),default=None) if len(marks)==len(scope) and all(r[0] is not None for r in marks) else None
+            completed_at=min((r['complete_at'] for r in states),default=None) if len(states)==len(scope) and all(r['complete_at'] is not None for r in states) else None
         issues = ([dict(r) for r in self.db.execute(f'select * from coverage_issues where home in ({slots})',scope)]
                   if 'coverage_issues' in tables else [])
         call_start=min((group['observations'][0]['at'] for group in groups if group['observations']),default=from_at) if from_at is not None else None
@@ -2322,10 +2323,16 @@ class QuotaLedger:
                 **context,
                 'manual_resets':manual_resets,'cycles': list(reversed(result)), 'price_id': PRICE_ID, 'index_at': state['at'] if state else None,
                 'index_loading': bool(state['loading']) if state else True,
+                '_projection_coverage':{r['home']:(r['unclassified'],r['complete_at']) for r in states},
                 'index_complete_at':completed_at, 'at': now,
                 'last_manual_reset':last_reset, 'manual_reset_count':len(relevant_resets),
                 'manual_reset_pending':pending}
 
+    def release_report_cache(self):
+        """Hand retained raw history back after a bounded projection takes over."""
+        self._input_cache={};self._cycle_cache={};self._report_cache=None;self._request_inputs=None;self._history_inputs=None;self._tracking_inputs={}
+        self._input_revision=None;self._input_changes=None
+
     def close(self):
         self.db.close()
-        self._input_cache={};self._cycle_cache={};self._report_cache=None;self._request_inputs=None;self._history_inputs=None;self._tracking_inputs={}
+        self.release_report_cache()
