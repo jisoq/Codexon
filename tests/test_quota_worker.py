@@ -24,10 +24,27 @@ def wait_until(condition, timeout=10, app=None):
 
 def public_series(series):
     expanded={k:v for k,v in series.items() if not k.startswith('_')}
+    if 'model_share' not in expanded:return expanded
     share=expanded['model_share']
     expanded['model_share']={k:v for k,v in share.items() if k!='bucket_ids' and not k.startswith('_')}
     if 'bucket_ids' in share:expanded['model_share']['bins']=dict(zip(share['bucket_ids'],share['bins']))
     return expanded
+
+
+def assert_display_series(actual,expected):
+    from cachemonitor.quota_chart import QuotaHistory
+    from cachemonitor.quota_view import observation_label
+    app=QApplication.instance() or QApplication([])
+    before,after=public_series(expected),public_series(actual)
+    before_rows,after_rows=before.pop('rows'),after.pop('rows')
+    assert before==after
+    assert len(before_rows)==len(after_rows)
+    old,new=QuotaHistory(),QuotaHistory();old.money=new.money=True
+    old.set_series(expected);new.set_series(actual)
+    for index,(left,right) in enumerate(zip(before_rows,after_rows)):
+        assert observation_label(left,True)==observation_label(right,True)
+        assert old.detail_for(index)==new.detail_for(index)
+    old.deleteLater();new.deleteLater();app.processEvents()
 
 
 def controlled_process(connection,path,home,entered,release):
@@ -36,9 +53,11 @@ def controlled_process(connection,path,home,entered,release):
             request=connection.recv()
             if request['kind']=='stop':return
             if request.get('key')=='crash':os._exit(21)
-            if request.get('key') in ('slow','write','delayed-write'):
+            if request.get('key') in ('slow','write','delayed-write','progressive'):
                 if request['key']!='delayed-write':
                     connection.send(dict(kind='phase',value='writing' if request['key']=='write' else 'reading'))
+                if request['key']=='progressive':
+                    connection.send({key:request.get(key) for key in ('kind','id','key')} | dict(partial=True,report={}))
                 entered.set()
                 # A CPU-bound calculation in this interpreter cannot take the
                 # parent's GIL or block its Qt event queue.
@@ -53,6 +72,21 @@ def controlled_process(connection,path,home,entered,release):
     except (EOFError,BrokenPipeError,OSError):
         pass
     finally:connection.close()
+
+
+def test_partial_report_keeps_the_request_active_until_complete():
+    context=mp.get_context('spawn');entered,release=context.Event(),context.Event();results=[]
+    worker=QuotaWorker(on_result=results.append,process_target=partial(controlled_process,entered=entered,release=release))
+    try:
+        identifier=worker.request('report',key='progressive')
+        wait_until(lambda:len(results)==1)
+        assert results[0]['partial'] and results[0]['id']==identifier
+        assert worker.phase=='reading'
+        following=worker.request('query',key='following')
+        release.set();wait_until(lambda:len(results)==3)
+        assert [result['id'] for result in results]==[identifier,identifier,following]
+        assert not results[1].get('partial')
+    finally:release.set();worker.close()
 
 
 def delayed_preview_process(connection,path,home,entered,release,calls,blocked_kind='preview'):
@@ -230,11 +264,10 @@ def test_real_child_prepares_compact_report_and_reuses_raw_evidence_for_preview(
         worker.request('chart',revision=report['worker_revision'],selection='all')
         whole=responses.get(timeout=15)
         assert not whole.get('error'),whole
-        from cachemonitor.quota_cycles import _PackedRows
         from cachemonitor.quota_view import prepare_quota_view
         series=whole['value']['series']
-        assert isinstance(series['rows'],_PackedRows)
-        assert public_series(series)==prepare_quota_view(source)['overall']
+        assert len(series['rows'])==len(report['view']['periods'])
+        assert_display_series(series,prepare_quota_view(source)['overall'])
     finally:worker.close()
 
 
@@ -289,7 +322,7 @@ def test_compact_report_drops_call_graph_bytes_and_can_still_query_them():
     finally:engine.close()
 
 
-def test_chart_delivery_contains_only_selection_and_reuses_unchanged_digest():
+def test_chart_delivery_contains_only_selection_and_reuses_unchanged_digest(monkeypatch):
     from test_quota_value_history import sample_report as multiple_periods
     engine=QuotaComputation()
     source=multiple_periods()
@@ -302,12 +335,17 @@ def test_chart_delivery_contains_only_selection_and_reuses_unchanged_digest():
     assert changed['selection']==100 and changed['series']['rows'][-1]['at']==130
     same=engine.execute(dict(kind='chart',id=3,key='same',revision=first['worker_revision'],selection=100,digest=changed['digest']))['value']
     assert same['series'] is None and same['digest']==changed['digest']
-    whole=engine.execute(dict(kind='chart',id=4,key='all',revision=first['worker_revision'],selection='all'))['value']
-    assert whole['series']['cumulative']
-    assert len(whole['series']['rows'])==7
+    from cachemonitor import quota_view,quota_share
+    def no_detail(*args,**kwargs):raise AssertionError('Overview expanded detailed observations')
+    with monkeypatch.context() as patch:
+        patch.setattr(quota_view,'_period_rows',no_detail)
+        patch.setattr(quota_share,'prepare_model_share',no_detail)
+        whole=engine.execute(dict(kind='chart',id=4,key='all',revision=first['worker_revision'],selection='all'))['value']
+    assert whole['series']['cycle_summary']
+    assert len(whole['series']['rows'])==3
     from cachemonitor.quota_view import prepare_quota_view
     expected=prepare_quota_view(source)['overall']
-    assert public_series(whole['series'])==expected
+    assert_display_series(whole['series'],expected)
     assert engine.execute(dict(kind='chart',id=5,key='stale',revision='expired',selection=100))['stale']
 
 

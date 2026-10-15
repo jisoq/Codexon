@@ -216,7 +216,7 @@ def failed_observation(db, home, at):
 
 
 def build(db, home, now, *, context_only=False, read_rows=None, pack_groups=False,
-          replay_cache=None, changes=None):
+          replay_cache=None, changes=None, request_from=None):
     config = db.execute('select started from tracking_config where home=?', (home,)).fetchone()
     if not config:
         return None
@@ -329,22 +329,42 @@ def build(db, home, now, *, context_only=False, read_rows=None, pack_groups=Fals
         # Keep only immutable closed rows and a bounded copy of the unfinished
         # state. Closing it for display must not discard reset-recovery state
         # needed by the next observation. Old edits invalidate this checkpoint.
-        weight=sum(512+128*len(group['observations'].blocks)+sum(map(len,group['observations'].blocks)) for group in groups)
-        weight+=sum(768+sum(4*len(v) for v in row.values() if isinstance(v,str)) for row in raw.values())
+        weights=[512+128*len(group['observations'].blocks)+sum(map(len,group['observations'].blocks)) for group in groups]
+        raw_weight=sum(768+sum(4*len(v) for v in row.values() if isinstance(v,str)) for row in raw.values())
+        weight=sum(weights)+raw_weight
         if weight<=REPLAY_CACHE_BYTES:
             checkpoint=replace(state,observations=list(state.observations),closed=[],resets=replace(state.resets))
             replay_cache['checkpoint']=dict(key=(home,started),at=now,state=checkpoint,raw=dict(raw),
                 groups=tuple(groups),last_observed_at=last_observed_at,monitoring=monitoring,
                 enabled_at=enabled_at,weight=weight)
+        elif raw_weight<=REPLAY_CACHE_BYTES:
+            # A display checkpoint must not depend on admitting the entire
+            # historical replay cache. Retain a bounded recent tail instead.
+            tail=[];weight=raw_weight;retained_after=None
+            for group,size in zip(reversed(groups),reversed(weights)):
+                if weight+size>REPLAY_CACHE_BYTES:
+                    retained_after=group['observations'][-1]['at'];break
+                tail.append(group);weight+=size
+            checkpoint=replace(state,observations=list(state.observations),closed=[],resets=replace(state.resets))
+            replay_cache['current_checkpoint']=dict(key=(home,started),at=now,state=checkpoint,raw=dict(raw),
+                groups=tuple(reversed(tail)),last_observed_at=last_observed_at,monitoring=monitoring,
+                enabled_at=enabled_at,weight=weight,retained_after=retained_after)
     if state.baseline and state.endpoint:
         state.close('on');finish_groups()
     health_rows = list(db.execute(f'select * from tracking_health where home in ({slots})', homes))
     complete = len(health_rows) == len(homes) and all(h['complete'] and now-h['at'] <= 15 for h in health_rows)
     lookup_failed = bool(db.execute('select 1 from tracking_gaps where home=? and start>=? and end is null', (home, started)).fetchone())
+    pending_source='tracking_wire w';pending_params=()
+    if request_from is not None:
+        request_from=min((group['observations'][0]['at'] for group in groups if group['observations']),default=request_from)
+        pending_source=f'''(SELECT rowid AS identity FROM tracking_wire WHERE home IN ({slots}) AND end IS NULL
+            UNION SELECT rowid FROM tracking_wire WHERE home IN ({slots}) AND end>=?) pending
+            CROSS JOIN tracking_wire w ON w.rowid=pending.identity'''
+        pending_params=(*homes,*homes,request_from)
     pending_responses=[dict(r) for r in db.execute(
-        f"select w.* from tracking_wire w where w.home in ({slots}) and w.start>=? and w.response<>'' "
-        f'and not exists(select 1 from calls c where c.home in ({slots}) and c.uid=w.response)',
-        (*homes,started,*homes))]
+        f"SELECT w.* FROM {pending_source} WHERE w.home IN ({slots}) AND w.start>=? AND w.response<>'' "
+        f'AND NOT EXISTS(SELECT 1 FROM calls c WHERE c.home IN ({slots}) AND c.uid=w.response)',
+        (*pending_params,*homes,started,*homes))]
     return dict(groups=groups, homes=homes, enabled=monitoring, account=account,
                 controls=[dict(r) for r in controls],
                 ownership_gaps=[], phase='on' if monitoring else 'off',

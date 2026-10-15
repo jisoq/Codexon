@@ -146,8 +146,6 @@ class EvidenceSummary:
 
 class EvidenceReader:
     """Incremental read-only join, scoped to Codex home and exact response ID."""
-    MAX_CACHE_SESSIONS = 2048
-    MAX_CACHE_ROWS = 160000
     READ_BATCH = 5000
     READ_SECONDS = .4
     MAX_RECORDS = 4096
@@ -161,11 +159,10 @@ class EvidenceReader:
         self.activity_records = OrderedDict()
         self.changed_activity = {}
         self.revision = 0
+        self.previous_revision = 0
+        self.join_epoch = 0
+        self.changed_responses = {}
         self.error = ''
-        self.cache = OrderedDict()
-        self.dependencies = {}
-        self.cache_dependencies = {}
-        self.cache_rows = 0
         self.gaps = []
         self.generation = 0
         self.identity = None
@@ -173,25 +170,6 @@ class EvidenceReader:
         self.catching_up = False
         self.highwater=0
         self.source_marker=''
-
-    def _evict(self, key):
-        cached = self.cache.pop(key, None)
-        if cached is not None:
-            self.cache_rows -= len(cached[0])
-        for response in self.cache_dependencies.pop(key, ()):
-            dependents = self.dependencies.get(response)
-            if dependents is not None:
-                dependents.discard(key)
-                if not dependents:
-                    self.dependencies.pop(response, None)
-
-    def retain_sessions(self, keys):
-        missing=set(self.cache)
-        if not missing:return
-        for key in keys:
-            missing.discard(key)
-            if not missing:break
-        for key in missing:self._evict(key)
 
     def _reset(self):
         if self.db is not None:
@@ -201,10 +179,7 @@ class EvidenceReader:
         self.records.clear()
         self.activity_records.clear()
         self.changed_activity.clear()
-        self.cache.clear()
-        self.dependencies.clear()
-        self.cache_dependencies.clear()
-        self.cache_rows = 0
+        self.changed_responses.clear()
         self.gaps = []
         self.anchor = None
         self.catching_up = False
@@ -212,8 +187,11 @@ class EvidenceReader:
         self.source_marker=''
         self.generation += 1
         self.revision += 1
+        self.join_epoch += 1
 
     def poll(self):
+        self.previous_revision = self.revision
+        self.changed_responses = {}
         self.changed_activity={}
         self.error = ''
         try:
@@ -256,8 +234,8 @@ class EvidenceReader:
                 gaps=[tuple(r) for r in self.db.execute('SELECT start,end FROM observation_gaps')]
                 if gaps!=self.gaps:
                     self.gaps=gaps
-                    for key in list(self.cache):self._evict(key)
                     self.revision+=1
+                    self.join_epoch+=1
             deadline = time.monotonic() + self.READ_SECONDS
             read_count=0
             while self.offset < highwater and read_count<self.MAX_POLL_ROWS:
@@ -277,9 +255,8 @@ class EvidenceReader:
                     self.changed_activity[activity_key] = record
                     if row['response_id']:
                         key = (row['home'], row['response_id'])
+                        self.changed_responses.setdefault(row['home'],set()).add(row['response_id'])
                         self.records.setdefault(key, {})[row['attempt']] = record
-                        for cache_key in tuple(self.dependencies.get(key, ())):
-                            self._evict(cache_key)
                     while len(self.activity_records)>self.MAX_RECORDS:
                         _,expired=self.activity_records.popitem(last=False)
                         self._forget_record(expired)
@@ -321,16 +298,29 @@ class EvidenceReader:
                     summary.add(value,missing)
             for row in batch:yield row,evidence[row['key']].rows() if row['key'] in evidence else []
 
-    def enrich(self, home, rows, session_id=None):
-        return self.enrich_home(home_key(home),rows,session_id)
+    def enrich(self, home, rows):
+        return self.enrich_home(home_key(home),rows)
 
-    def enrich_home(self, key, rows, session_id=None):
+    def enrich_owned(self, key, rows, owner):
+        """Reuse the collector's retained view without a second history cache.
+
+        The owner already retains request keys and the published joined rows.
+        Only the current bounded observation batch needs invalidation metadata.
+        A skipped batch, source replacement or changed gaps requires a fresh join.
+        """
+        previous=getattr(owner,'_evidence_join',None)
+        changed=self.changed_responses.get(key)
+        if (previous is not None and previous[0] is self and previous[1] is rows
+                and previous[2]==self.join_epoch
+                and (previous[3]==self.revision or previous[3]==self.previous_revision
+                     and (not changed or changed.isdisjoint(owner.keys)))):
+            result=previous[4]
+        else:result=self.enrich_home(key,rows)
+        owner._evidence_join=(self,rows,self.join_epoch,self.revision,result)
+        return result
+
+    def enrich_home(self, key, rows):
         """Join rows using a home key already resolved for this publication."""
-        cache_key=(key,session_id if session_id is not None else id(rows))
-        cached = self.cache.get(cache_key)
-        if cached is not None and cached[0] is rows:
-            self.cache.move_to_end(cache_key)
-            return cached[1]
         result = []
         for row,evidence in self.evidence_rows(key,rows):
             missing=any(e.get('observation_missing') or any(a<=e['ts']<=b for a,b in self.gaps) for e in evidence)
@@ -398,18 +388,6 @@ class EvidenceReader:
                            'response_status':max(evidence,key=lambda e:e['seq'])['status'] if evidence else '',
                            'model_alert_confirmed':alert_confirmed,
                            'model_observation_ts':min(e['ts'] for e in evidence) if evidence else None})
-        self._evict(cache_key)
-        if len(rows) <= self.MAX_CACHE_ROWS:
-            # A full sequential publication must not evict its own next hits.
-            # Uncached histories remain queryable without replacing resident ones.
-            if (len(self.cache) >= self.MAX_CACHE_SESSIONS or
-                    self.cache_rows + len(rows) > self.MAX_CACHE_ROWS):return result
-            self.cache[cache_key] = (rows,result)
-            self.cache_rows += len(rows)
-            responses = {(key,row['key']) for row in rows}
-            self.cache_dependencies[cache_key] = responses
-            for response in responses:
-                self.dependencies.setdefault(response,set()).add(cache_key)
         return result
 
     def close(self):

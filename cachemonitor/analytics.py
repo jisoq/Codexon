@@ -246,7 +246,7 @@ def request_record(key,items,whole,session,start,end):
 
 
 def analyze(sessions,start=0,end=float('inf'),model='',source='',archived=True,
-            unit='response',method='mean',input_band=None,with_comparisons=True,service_tier='',effort='',home='',project='',sid=''):
+            unit='response',method='mean',input_band=None,with_comparisons=True,service_tier='',effort='',home='',project='',sid='',_range_index=None):
     selected=[s for s in sessions if not internal_review(s) and (archived or not s.get('archived')) and (not source or s.get('source','unknown')==source)
               and (not home or s['home']==home) and (not sid or s['id']==sid) and (not project or project_matches(s,project))]
     responses=[];whole_turns=defaultdict(list);groups=defaultdict(list);session_map={}
@@ -260,12 +260,18 @@ def analyze(sessions,start=0,end=float('inf'),model='',source='',archived=True,
             s={**s,'history':annotate_incidents(prepared,health),'cache_health':health,'cache_misses':misses,'_prepared':True}
             selected[index]=s
         session_map[(s['home'],s['id'])]=s
-        for ordinal,r in enumerate(sorted(s['history'],key=lambda row:row['ts']),1):
-            identity=call_identity(s['home'],s['id'],r.get('key'))
-            if identity in seen:continue
-            seen.add(identity)
+        indexed=_range_index is not None and s.get('_prepared') and len(selected)==1
+        if indexed:
+            (lo,hi),whole_turns=_range_index
+            candidates=s['history'] if lo==0 and hi==len(s['history']) else s['history'][lo:hi]
+        else:candidates=sorted(s['history'],key=lambda row:row['ts'])
+        for r in candidates:
+            if not indexed:
+                identity=call_identity(s['home'],s['id'],r.get('key'))
+                if identity in seen:continue
+                seen.add(identity)
             row=r
-            if row.get('turn'):whole_turns[(s['home'],s['id'],row['turn'])].append(row)
+            if not indexed and row.get('turn'):whole_turns[(s['home'],s['id'],row['turn'])].append(row)
             if start<=row['ts']<end and (not model or (row.get('model') or '미확인')==model) and (not effort or (row.get('effort') or '미확인')==effort) and (not service_tier or display_tier(row)==service_tier):
                 responses.append(row)
                 if row.get('turn'):groups[(s['home'],s['id'],row['turn'])].append(row)

@@ -21,22 +21,18 @@ def expiry(engine,q):
     now=q.get('now',q['end'])
     candidates=[float('inf')]
     duration=1800 if q.get('period')=='30m' else None
-    if duration:
-        i=bisect_left(engine.timestamps,q['start'])
-        if i<len(engine.timestamps): candidates.append(engine.timestamps[i]+duration+0.002)
-        for state in engine.sessions.values():
-            for request in state['prepared'].get('turn_records',{}).values():
-                for stamp in (request.get('started_at'),request.get('ended_at')):
-                    if stamp is not None and stamp>=q['start']:candidates.append(stamp+duration+.002)
     if q.get('period') in ('today','7d','30d') or q['page']==0:
         candidates.append(_local_timestamp(datetime.combine(datetime.fromtimestamp(now).date()+timedelta(days=1),datetime.min.time())))
-    i=bisect_left(engine.timestamps,q['end'])
-    if q.get('period')!='custom' and i<len(engine.timestamps): candidates.append(engine.timestamps[i]+0.002)
-    if q.get('period')!='custom':
-        for state in engine.sessions.values():
-            boundaries=state.get('boundaries',())
-            i=bisect_left(boundaries,q['end'])
-            if i<len(boundaries):candidates.append(boundaries[i]+.002)
+    # Expiry needs only the next boundary, not a separately sorted global
+    # timeline rebuilt whenever any session changes.
+    for state in engine.sessions.values():
+        for times in (state['timestamps'],state.get('boundaries',())):
+            if duration:
+                i=bisect_left(times,q['start'])
+                if i<len(times):candidates.append(times[i]+duration+.002)
+            if q.get('period')!='custom':
+                i=bisect_left(times,q['end'])
+                if i<len(times):candidates.append(times[i]+.002)
     return min(candidates)
 
 

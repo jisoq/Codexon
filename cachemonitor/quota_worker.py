@@ -45,20 +45,22 @@ def chart_result(view, selection=None, known_digest=None):
     if selection != 'all' and not any(p['start'] == selection for p in periods):
         selection = periods[0]['start'] if periods else 'all'
     if selection=='all' and view['overall'] is None:
-        from .quota_view import prepare_overall
-        view['overall']=prepare_overall(view['_overall_parts'],view['_exclusions'],packed=True)
-    if selection=='all':source=view['overall']
+        from .quota_view import prepare_period_summary
+        view['overall']=prepare_period_summary(periods)
+    if selection=='all':
+        from .quota_view import display_series
+        source=display_series(view['overall'])
     else:
         from .quota_view import period_series
         period=next(p for p in periods if p['start']==selection)
-        if period['series'] is not None:source=period['series']
+        if period['series'] is not None:source=period_series(period,display=True)
         else:
             # Two selected charts stay expanded. Other periods retain only
             # lossless packed input rows, without unused rendering/model shares.
             cache=view.setdefault('_series_cache',{})
             key=(selection,period['_series_signature'])
             source=cache.pop(key,None)
-            if source is None:source=period_series(period)
+            if source is None:source=period_series(period,display=True)
             cache[key]=source
             while len(cache)>2:cache.pop(next(iter(cache)))
             # Rebuilt charts can share equal objects differently. Their checked
@@ -91,7 +93,7 @@ def compact_report(report, revision, selection=None, known_digest=None):
     prepared_view.update({
         'tracking_started': (report.get('tracking') or {}).get('started'),
     })
-    return {**{key: report[key] for key in ('home', 'account', 'at', 'index_loading', 'error', 'exclusions', 'cycle_clears')
+    return {**{key: report[key] for key in ('home', 'account', 'at', 'index_loading', 'error', 'exclusions', 'cycle_clears','history_pending')
                if key in report},
             'worker_revision': revision,
             'view': prepared_view}
@@ -109,13 +111,16 @@ class QuotaComputation:
         self.committed = {}
         self.request_lookup = None
 
-    def _ledger(self):
+    def _ledger(self,*,writable=False):
+        # Prepared readers use an rw connection for disposable projections and
+        # explicit edits. Keep their replay state instead of reopening the
+        # ledger and repeating writer maintenance when the user edits a cycle.
         if self.ledger is None:
             from .quota_cycles import QuotaLedger
             # This worker serves weekly accounting, charts and edits. The full
             # ledger API retains both windows for other readers and recovery.
             self.ledger = self.ledger_factory(self.path) if self.ledger_factory else QuotaLedger(
-                self.path,pack_history=True,weekly_history_only=True)
+                self.path,pack_history=True,weekly_history_only=True,reader=not writable)
             self.ledger_generation += 1
         return self.ledger
 
@@ -123,6 +128,8 @@ class QuotaComputation:
         from .quota_view import prepare_quota_view, summary_deadline
         report=dict(report)
         if history_revision is not None:report['_history_revision']=history_revision
+        if self.ledger is not None and history_revision==(self.ledger_generation,getattr(self.ledger,'_report_generation',None)):
+            report['_cycle_versions']={key:value[0] for key,value in getattr(self.ledger,'_cycle_cache',{}).items()}
         previous=next(reversed(self.reports.values()),None) if self.reports else None
         source=report.get('request_windows',[])
         if (report.get('tracking') is None or
@@ -190,20 +197,28 @@ class QuotaComputation:
             report['view']={**view,'lifetime':lifetime,'summaries':summaries,'_statistics_cache':statistics_cache,'_summary_until':summary_until}
             if lifetime is not view['lifetime']:report['view'].pop('_default_query',None)
         else:report['view'] = prepare_quota_view(report,previous['view'] if previous else None,deferred=True,_requests=requests())
+        if report['view'].get('_prepared_statistics') is not None:
+            report['_prepared_statistics']=report['view']['_prepared_statistics']
         revision = uuid4().hex
         self.reports[revision] = report
         while len(self.reports) > 2:
             self.reports.popitem(last=False)
+        if self.ledger is not None and history_revision is not None:
+            from .quota_projection import save
+            # Derived checkpoints are optional. A cache write failure must not
+            # discard a valid report or affect authoritative ledger commits.
+            try:save(self.ledger,report,report['view'])
+            except (OSError,sqlite3.Error):pass
         return compact_report(report, revision, selection, known_digest)
 
-    def execute(self, request, phase=lambda value: None):
+    def execute(self, request, phase=lambda value: None, publish=None):
         kind = request['kind']
         result = {key: request.get(key) for key in ('kind', 'id', 'key')}
         try:
             if kind == 'prepare':
                 result['report'] = self._prepare(request['snapshot'])
             elif kind in ('report', 'exclude', 'restore', 'clear_cycle'):
-                ledger = self._ledger()
+                ledger = self._ledger(writable=kind!='report')
                 if kind in ('exclude', 'restore', 'clear_cycle'):
                     token = request['id']
                     if token not in self.committed:
@@ -223,6 +238,11 @@ class QuotaComputation:
                     result['saved'] = True
                     result['exclusion_result'] = self.committed[token]
                     phase('reading')
+                if (kind=='report' and publish is not None and not self.reports
+                        and request.get('selection') is None and hasattr(ledger,'current_report')):
+                    current=ledger.current_report(self.home)
+                    if current is not None:
+                        publish({**result,'partial':True,'report':self._prepare(current)})
                 raw=ledger.report(self.home)
                 generation=getattr(ledger,'_report_generation',None)
                 result['report'] = self._prepare(raw,(self.ledger_generation,generation) if generation is not None else None,
@@ -278,7 +298,7 @@ def process_main(connection, path, home):
                 return
             def phase(value):
                 connection.send(dict(kind='phase', value=value))
-            send_result(connection, computation.execute(request, phase))
+            send_result(connection, computation.execute(request, phase,lambda result:send_result(connection,result)))
     except (EOFError, BrokenPipeError, OSError):
         pass
     finally:
@@ -426,6 +446,9 @@ class QuotaWorker(QObject):
                                 (active['kind']=='report' and active['id']<=self.cancel_report_before))
                             if result['kind'] == 'phase':
                                 self.phase = result['value']
+                                continue
+                            if result.get('partial'):
+                                self._deliver(result)
                                 continue
                             self.phase = 'idle'
                             self._deliver(result)

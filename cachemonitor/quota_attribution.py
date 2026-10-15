@@ -41,7 +41,7 @@ class RequestWindows:
         ends=sorted(spans,key=lambda span:span[1])
         return starts,ends,[span[0] for span in starts],[span[1] for span in ends]
 
-    def overlapping(self,start,end):
+    def _overlapping(self,start,end):
         if self._native is not None and all(type(t) in (int,float) and math.isfinite(t) and abs(t)<=2**53-1 for t in (start,end)):
             found=self._native.overlapping(start,end)
         else:
@@ -53,7 +53,27 @@ class RequestWindows:
             lo=bisect_left(end_times,start)
             found=((row for _,until,row in starts[:hi] if until>=start) if hi<=len(ends)-lo else
                    (row for since,_,row in ends[lo:] if since<=end))
+        return found
+
+    def overlapping(self,start,end):
+        found=self._overlapping(start,end)
         return (self.source[index] for index in found) if self.source is not None else iter(found)
+
+    def signature(self,start,end):
+        """Identify only overlapping evidence without expanding its interior blocks."""
+        import hashlib
+        import pickle
+        found=self._overlapping(start,end)
+        if self.source is None:
+            return hashlib.sha256(pickle.dumps(list(found),protocol=5)).digest()
+        indices=sorted(found);digest=hashlib.sha256();first=last=None
+        for index in indices:
+            if last is not None and index!=last+1:
+                digest.update(self.source.signature(first,last+1));first=None
+            if first is None:first=index
+            last=index
+        if first is not None:digest.update(self.source.signature(first,last+1))
+        return digest.digest()
 
 
 def merged_ranges(ranges):

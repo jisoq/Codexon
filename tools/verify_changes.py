@@ -134,6 +134,7 @@ RULES = (
     ('cachemonitor/quota_share.py', ('quota_ui', 'quota_math')),
     ('cachemonitor/quota_attribution.py', ('quota_math', 'quota_store', 'native_cpu')),
     ('cachemonitor/quota_cycles.py', ('quota_math', 'quota_store', 'modes', 'native_cpu')),
+    ('cachemonitor/quota_projection.py', ('quota_store', 'quota_poll', 'quota_ui')),
     ('cachemonitor/banked_resets.py', ('quota_math', 'quota_ui')),
     ('cachemonitor/quota_view.py', ('quota_ui', 'quota_chart', 'native_cpu')),
     ('cachemonitor/quota_panel.py', ('quota_ui',)),

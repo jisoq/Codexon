@@ -162,6 +162,28 @@ def test_tree_window_and_reuse():
     assert engine.metrics['part_builds']==before['part_builds']
 
 
+def test_call_viewport_keeps_exact_order_and_reuses_totals_above_population_cache():
+    from cachemonitor.dashboard_views import ordered, row_key
+    source=history()
+    engine=AnalysisEngine()
+    engine.results.rows=1  # Exercise a population larger than the result cache with a small fixture.
+    engine.ingest([dict(source,id=f's-{i}',home=f'h-{i}') for i in range(12)])
+    q=query(page=2,presentation=True,explorer=dict(view='calls',sort='ts_desc'),
+        table_windows={'records':dict(start=0,size=64)})
+    raw=engine.query({k:v for k,v in q.items() if k not in ('explorer','table_windows','presentation')})
+    expected=ordered(raw['analysis']['responses'],'ts_desc')
+    first=engine.page_query(q);builds=engine.metrics['view_builds']
+    assert [row_key(r) for r in first['explorer']['records']['rows']]==[row_key(r) for r in expected[:64]]
+    scrolled=engine.page_query({**q,'table_windows':{'records':dict(start=20,size=64)}})
+    assert [row_key(r) for r in scrolled['explorer']['records']['rows']]==[row_key(r) for r in expected[20:84]]
+    assert scrolled['explorer']['summary']==first['explorer']['summary']
+    assert engine.metrics['view_builds']==builds
+    anchor=list(row_key(expected[30]))
+    anchored=engine.page_query({**q,'table_windows':{'records':dict(size=64,anchor=anchor,anchor_offset=2)}})
+    assert anchored['explorer']['records']['start']==28
+    assert row_key(anchored['explorer']['records']['rows'][2])==tuple(anchor)
+
+
 def test_parent_total_and_child_route():
     source=history();parent=dict(source,id='parent',history=[],title='Parent')
     child=dict(source,id='child',parent_thread_id='parent',title='Child')

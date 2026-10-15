@@ -189,7 +189,7 @@ def test_metric_modes_and_saved_scope_restore_without_changing_home_totals(dashb
 
 
 def test_model_breakdowns_combine_and_drill_down_in_compact_window(dashboard):
-    from PySide6.QtCore import QPointF
+    from PySide6.QtCore import QObject,QPointF
     w=dashboard;w.resize(1000,680);w.change_page(1);p=w.metric_panel
     source,_=many_efforts();w.receive(source);p.change('dimension','model')
     control(w,p)
@@ -206,6 +206,8 @@ def test_model_breakdowns_combine_and_drill_down_in_compact_window(dashboard):
         items=[rendered('usage-row-'+row['key']) for row in p.state['rows']]
         return all(item.mapToScene(QPointF(0,item.height())).y()<w.quick.height() for item in items)
     wait_for_rendered(rows_fit)
+    chart=rendered('usage-chart');resize_timer=chart.findChild(QObject,'usage-resize')
+    wait_for_rendered(lambda:not resize_timer.property('running'))
     row=p.data['rows'][0];scope=p.capture()
     assert p.state['rows'][0]['groupStart']
     click(w,rendered('usage-row-'+row['key']))

@@ -726,7 +726,6 @@ class UsageIndex:
         # Resolve each home once per publication, not once per retained session.
         # The next publication resolves again so changed links are still observed.
         evidence_homes = {home:home_key(home) for home in dict.fromkeys(home for home,_ in self.monitor.sessions)}
-        self.model_evidence.retain_sessions((evidence_homes[home],sid) for home,sid in self.monitor.sessions)
         for key, s in self.monitor.sessions.items():
             meta = self.metadata.get(key, {})
             s.metadata_seen = bool(meta)
@@ -736,7 +735,7 @@ class UsageIndex:
             if not s.requests and not s.reported_usage and not s.transports and not s.request_state:
                 continue
             view = dict(s.view(now,use_cache=True))
-            view['history'] = self.model_evidence.enrich_home(evidence_homes[s.home],view['history'],s.id)
+            view['history'] = self.model_evidence.enrich_owned(evidence_homes[s.home],view['history'],s)
             if not meta.get('project') or not meta.get('project_name'):
                 names=self.names.get(str(s.home))
                 if names:

@@ -27,6 +27,14 @@ def configure_quota_layout(panel):
     panel.clear_cycle_button.setEnabled(False)
     actions.addWidget(panel.clear_cycle_button)
     actions.addWidget(panel.manage_button)
+    panel.summary_context=Row();panel.summary_context.put(collapseBelow=600,columns=1)
+    panel.summary_note=Text('주기마다 한 점으로 표시합니다. 점을 누르면 해당 주기의 상세 차트를 엽니다.')
+    panel.summary_note.put(wrap=True,fontSize=13,color='muted')
+    panel.summary_back=Button('전체 보기');panel.summary_back.put(fontSize=13,height=32)
+    panel.summary_back.clicked.connect(panel.return_to_summary)
+    panel.summary_context.addWidget(panel.summary_note,1);panel.summary_context.addWidget(panel.summary_back)
+    legend_parent=panel.history_legend.parent()
+    legend_parent.insertWidget(legend_parent._nodes.index(panel.history_legend),panel.summary_context)
     panel.cycle_clear_message=Text();panel.cycle_clear_message.put(fontSize=12,wrap=True)
     panel.cycle_clear_message.hide()
     chart_layout=actions.parent()
@@ -90,6 +98,9 @@ def configure_quota_layout(panel):
                  if started is not None else '—')
         values=dict(elapsed=elapsed,usage=f"{lifetime['delta']:g}%",
                     cost=usd(lifetime['cost']),weekly=usd(panel.lifetime_value))
+        if panel.report.get('history_pending'):
+            for key in ('usage','cost','weekly'):
+                values[key]=tr('확인 불가' if panel.report.get('history_failed') else '계산 중')
         for key,value in values.items():panel.summary_values[key].setText(Verbatim(value))
     panel.result.textValueChanged.connect(summarize)
     panel.update_summary=summarize
@@ -99,10 +110,12 @@ def configure_quota_layout(panel):
     labels=dict(remaining='남은 사용량',cycle_cost='누적 측정 환산액',
                 cycle_value='주간 예상 가치',reference='누적 예상 가치')
     def label_for(key):
-        return '누적 사용량' if key=='remaining' and panel.history.series.get('cumulative') else labels[key]
+        if panel.history.series.get('cycle_summary'):
+            return dict(remaining='주기 소모량',cycle_cost='주기 환산액').get(key,labels[key])
+        return labels[key]
     def legend_values(values):
         for key,button in panel.legend_toggles.items():
-            pattern=('{label}  {value}' if panel.history.series.get('cumulative') else
+            pattern=('{label}  {value}' if panel.history.series.get('cycle_summary') else
                      '{label} (평균: {value})' if key=='cycle_value' else '{label} (최근: {value})')
             button.setText(formatted(pattern,label=tr(label_for(key)),value=values.get(key,'—')))
     panel.history.legendChanged.connect(legend_values)

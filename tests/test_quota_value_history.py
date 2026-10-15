@@ -51,7 +51,7 @@ def test_reset_zeroes_cycle_cost_but_lifetime_is_weighted_and_keeps_every_cycle(
 @pytest.mark.parametrize('packed',(False,True))
 def test_changed_period_reuses_other_graphs_and_matches_uncached_values(monkeypatch,packed):
     from cachemonitor.quota_cycles import _PackedHistory
-    from cachemonitor.quota_view import prepare_quota_view, prepare_overall, period_series
+    from cachemonitor.quota_view import prepare_quota_view, prepare_period_summary, period_series
     from cachemonitor.quota_worker import chart_result
     from cachemonitor import quota_share, quota_cycles
     shares=[];prepare_share=quota_share.prepare_model_share
@@ -88,9 +88,7 @@ def test_changed_period_reuses_other_graphs_and_matches_uncached_values(monkeypa
     unchanged(before,after,1);unchanged(before,after,2)
     assert materialized(after)==full['periods']
     assert after['lifetime']==full['lifetime']
-    assert prepare_overall(after['_overall_parts'],after['_exclusions'])==full['overall']
-    from test_quota_worker import public_series
-    assert public_series(prepare_overall(after['_overall_parts'],after['_exclusions'],packed=True))==full['overall']
+    assert prepare_period_summary(after['periods'])==full['overall']
     digests={p['start']:chart_result(after,p['start'])['digest'] for p in after['periods']}
     assert len(after['_series_cache'])<=2
     for start,digest in digests.items():
@@ -138,7 +136,7 @@ def test_packed_history_resume_keeps_appends_corrections_and_cycle_edits_exact(m
         fresh=quota_view.prepare_quota_view(report)
         assert actual==fresh['periods']
         assert result['lifetime']==fresh['lifetime']
-        assert quota_view.prepare_overall(result['_overall_parts'],result['_exclusions'])==fresh['overall']
+        assert quota_view.prepare_period_summary(result['periods'])==fresh['overall']
         return result,visited
     # The unchanged prefix crosses packed-block boundaries and two resets.
     appended={**source,'cycles':[*source['cycles'][:-1],interval(points[-1]+[(1401,60)],[(1011,2)])],
@@ -220,5 +218,5 @@ def test_hidden_idle_boundary_keeps_completed_cost(monkeypatch):
     monkeypatch.setattr(quota_view,'quota_statistics',lambda *args,**kw:{})
     view=quota_view.prepare_quota_view({})
     assert view['periods'][0]['series']['completed_costs']==[None,8,8,12,None]
-    assert view['overall']['completed_costs']==[None,8,8,12,None]
+    assert view['overall']['completed_costs']==[None]
     assert not view['periods'][0]['series']['rows'][3]['connect']

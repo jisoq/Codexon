@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 import time
 
-from PySide6.QtCore import Qt, Signal, Slot
+from PySide6.QtCore import Qt, QTimer, Signal, Slot
 from .presentation import Button, Choice, Column, Group, Row, Text, Toggle
 from .table_model import Cell, Header, Table
 from .pricing import usd
@@ -63,6 +63,7 @@ class QuotaPanel(Group):
         self._prepared_query=None
         self._chart_pending=None
         self._chart_value=None
+        self._summary_opened=None;self._summary_restore=None
         layout=Column(self)
         layout.setContentsMargins(0,0,0,0)
         layout.setSpacing(20)
@@ -117,6 +118,7 @@ class QuotaPanel(Group):
         chart_layout.addWidget(self.cycle_basis)
         self.history=QuotaHistory()
         self.history.selected.connect(self.select_observation)
+        self.history.cycle_activated.connect(self.open_summary_cycle)
         self.history.range_selected.connect(self.exclusions.select_range)
         self.exclusions.selection_changed.connect(self.history.set_exclusion_selection)
         chart_layout.addWidget(self.exclusions)
@@ -132,8 +134,6 @@ class QuotaPanel(Group):
             legend.put(fontSize=12,flat=True,legendColor=color,legendDashed=key=='reference',activateOnReturn=True)
             self.history_legend.addWidget(legend)
             if key=='remaining':self.remaining_legend=legend
-        self.reset_legend=Text('◆ 사용량 리셋');self.reset_legend.put(fontSize=12,color='muted')
-        self.history_legend.addWidget(self.reset_legend)
         chart_layout.addLayout(self.history_legend)
         chart_layout.addWidget(self.history)
         self.history_empty=Text();self.history_empty.put(fontSize=14,color='muted',wrap=True)
@@ -279,6 +279,21 @@ class QuotaPanel(Group):
         self.period_start,self.period_end=start,end
         self.render()
 
+    def open_summary_cycle(self,start):
+        report=self.report
+        def select():
+            if self.report is not report:return
+            index=self.cycle_choice.findData(start)
+            if index<1:return
+            self._summary_opened=start
+            self.cycle_choice.setCurrentIndex(index)
+        # Finish the chart's pointer event before replacing its selected data.
+        QTimer.singleShot(0,select)
+
+    def return_to_summary(self):
+        self._summary_restore=self._summary_opened
+        self.cycle_choice.setCurrentIndex(0)
+
     def render_history(self,*_):
         from bisect import bisect_left
         if getattr(self,'_value_report',None) is not self.report:
@@ -327,6 +342,7 @@ class QuotaPanel(Group):
                     self._query_worker.request('chart',key=key,revision=self.report['worker_revision'],selection=selection)
                 self.history.hide();self.history_legend.hide();self.history_empty.setText('계산 중...');self.history_empty.show()
                 self.model_legend.hide()
+                if hasattr(self,'summary_context'):self.summary_context.hide()
                 if hasattr(self,'manage_button'):self.manage_button.hide()
                 self.exclusions.set_context(self.report,None,True)
                 if hasattr(self,'sync_dialog'):self.sync_dialog()
@@ -337,11 +353,10 @@ class QuotaPanel(Group):
         follow=not self.history.rows or self.history.cursor==len(self.history.rows)-1
         self._selected_cycle=(period['start'] if period else None)
         self.history.money=True
-        self.history.reference=self.lifetime_value if all_cycles else period['value'] if period else None
+        self.history.reference=None if all_cycles else period['value'] if period else None
         self.history.empty_text='표시할 사용 기록이 없습니다'
-        self.chart_title.setText('전체 사용량 추이' if all_cycles else '선택 주기의 사용량 추이')
-        self.remaining_legend.setText('누적 사용량 (%p)' if all_cycles else '남은 사용량 (%)')
-        self.reset_legend.setVisible(all_cycles)
+        self.chart_title.setText('주기별 사용량 추이' if all_cycles else '선택 주기의 사용량 추이')
+        self.remaining_legend.setText('주기 소모량 (%p)' if all_cycles else '남은 사용량 (%)')
         self.history.set_series(series)
         self.history.legendChanged.emit(self.history.legend_values())
         models=series.get('model_share',{}).get('models',[])
@@ -355,7 +370,7 @@ class QuotaPanel(Group):
                 self.model_legend.addWidget(label)
             for name in ('━ 비용 증가 없음','▧ 미확인'):
                 label=Text(name);label.put(fontSize=12,color='muted');self.model_legend.addWidget(label)
-        self.model_legend.setVisible(bool(self.history.rows))
+        self.model_legend.setVisible(bool(self.history.rows) and not all_cycles)
         rows=self.history.rows
         any_history=(self._view['has_history'] if 'has_history' in self._view else
                      bool(self._view['overall']['rows'] or any(item['series']['rows'] for item in self._view['periods'])))
@@ -366,6 +381,14 @@ class QuotaPanel(Group):
         self.history_empty.setVisible(any_history and not rows)
         self.history.cursor=(len(rows)-1 if rows and (follow or not same) else
                              min(bisect_left(series['times'],old),len(rows)-1) if rows and old is not None else 0)
+        if all_cycles and rows and self._summary_restore is not None:
+            self.history.cursor=next((i for i,row in enumerate(rows) if row['cycle_start']==self._summary_restore),len(rows)-1)
+            self._summary_restore=None
+            self.history.repaintRequested.emit()
+        if hasattr(self,'summary_context'):
+            self.summary_context.setVisible(bool(rows))
+            self.summary_note.setVisible(all_cycles)
+            self.summary_back.setVisible(not all_cycles and not self.report.get('history_pending'))
         self.exclusions.set_context(self.report,period,True,cursor=self.history.cursor)
         if hasattr(self,'sync_dialog'):self.sync_dialog()
         if rows:self.select_observation(rows[self.history.cursor])
@@ -494,6 +517,18 @@ class QuotaPanel(Group):
             '\n관측 기반 추정, 수집 공백 제외' if lifetime['total'] else '주간 할당량 가치를 계산할 사용량 기록을 기다리고 있습니다.')
         self.render_history()
         if hasattr(self,'update_summary'):self.update_summary()
+        pending=self.report.get('history_pending',False)
+        for name in ('cycle_choice','period','model_choice','manage_button'):
+            node=getattr(self,name,None)
+            if node is not None:node.setEnabled(not pending)
+        if pending:
+            self.status.setText('전체 이력을 읽지 못했습니다. 현재 주기는 계속 확인할 수 있습니다.' if self.report.get('history_failed') else
+                                '현재 주기를 표시했습니다. 전체 이력을 계산하고 있습니다.')
+            self.status.put(color='error' if self.report.get('history_failed') else 'muted');self.status.show()
+            self.conversion.hide()
+            if hasattr(self,'clear_cycle_button'):self.clear_cycle_button.setEnabled(False)
+            return
+        self.status.put(color='error')
         if self.model_choice.currentData() is not None:self.interval_filter.hide()
         days=self.period.currentData()
         prepared=self._view.get('summaries',{})

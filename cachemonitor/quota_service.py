@@ -251,13 +251,15 @@ class QuotaService(QThread):
                     kind=computed['kind']
                     if kind=='report':
                         if computed['id']!=report_request:continue
-                        report_request=None
+                        if not computed.get('partial'):report_request=None
                     elif edit_request is None or computed['id']!=edit_request['id']:
                         continue
                     else:
                         edit_active=False
                     if computed.get('cancelled'):continue
                     if computed.get('error'):
+                        if report is not None and report.get('history_pending'):
+                            report={**report,'history_failed':True}
                         calculation_fault=dict(calculation_failed=True,saved=bool(computed.get('saved')),
                             uncertain=bool(computed.get('uncertain')))
                         aggregate_failures+=1

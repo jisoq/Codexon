@@ -44,6 +44,27 @@ def quota_page(tmp_path):
 
 @pytest.mark.integration
 @pytest.mark.essential
+def test_current_chart_remains_usable_until_full_history_finishes(quota_page):
+    app,panel,scroll=quota_page
+    host=mount(scroll,1000,680)
+    full=panel.report
+    try:
+        for failed in (False,True):
+            panel.receive(dict(home='h',report={**full,'history_pending':True,'history_failed':failed}))
+            assert not panel.cycle_choice.isEnabled() and not panel.manage_button.isEnabled()
+            assert all(panel.summary_values[key].text() in ('계산 중','확인 불가') for key in ('usage','cost','weekly'))
+            plot=render_plot(host,panel.history);click(host,plot,x=plot.width()*.6,y=plot.height()*.5)
+            QTest.keyClick(host.quick,Qt.Key_Home)
+            assert panel.history.cursor==0 and panel.history.rows
+        panel.receive(dict(home='h',report=full))
+        assert panel.cycle_choice.isEnabled() and panel.manage_button.isEnabled()
+        assert panel.summary_values['cost'].text() not in ('계산 중','확인 불가')
+        assert not host.qml_errors
+    finally:dispose(host)
+
+
+@pytest.mark.integration
+@pytest.mark.essential
 def test_selected_cycle_action_confirmation_and_completion(quota_page,tmp_path):
     from copy import deepcopy
     app,panel,scroll=quota_page
@@ -244,9 +265,10 @@ def test_waiting_state_becomes_observed_zero_and_keeps_history_during_lookup_fai
 
 
 @pytest.mark.integration
-def test_cycle_selector_changes_graph_preserves_lifetime_and_selection_on_refresh(quota_page,tmp_path):
+@pytest.mark.parametrize('width',[520,1120])
+def test_cycle_selector_changes_graph_preserves_lifetime_and_selection_on_refresh(quota_page,tmp_path,width):
     app,panel,scroll=quota_page
-    host=mount(scroll,1120,1000)
+    host=mount(scroll,width,1000)
     try:
         assert panel.history.money and panel.cycle_choice.count()==4
         lifetime=panel.result.text()
@@ -274,23 +296,34 @@ def test_cycle_selector_changes_graph_preserves_lifetime_and_selection_on_refres
         assert panel.result.text()==lifetime
         panel.set_history_period(time.time(),None)
         assert panel.result.text()==lifetime and panel.history.rows is period['series']['rows']
-        # All cycles retain the three metrics and switch the percent axis to cumulative usage.
+        # The overview has one exact aggregate per cycle, and opens its detail.
         panel.cycle_choice.setCurrentIndex(0)
         plot=render_plot(host,panel.history)
         assert panel.history.series is panel._view['overall']
-        assert panel.history.series['cumulative']
+        assert panel.history.series['cycle_summary']
         assert len(panel.history.curves())==3
-        assert '누적 사용량' in panel.remaining_legend.text() and '%p' in panel.remaining_legend.text()
-        # The last cycle has a complete 99 -> 98 boundary, even though its
-        # opening idle observation is hidden from the display.
-        assert panel.history.series['completed_costs']==[None]*6+[pytest.approx(.0105),None]
-        index=0
-        plot.activateAt(panel.history.x_at(index),panel.history.box.center().y())
-        QTest.qWait(30)
-        from cachemonitor.pricing import usd
-        assert next(item['label'] for item in plot.detail['items'] if item['metric']=='remaining')=='누적 사용량'
-        assert all(item['metric']!='completed_cost' for item in plot.detail['items'])
+        assert '주기 소모량' in panel.remaining_legend.text() and '%p' in panel.remaining_legend.text()
+        assert len(panel.history.rows)==len(panel._view['periods'])==3
+        assert panel.history.series['completed_costs']==[None]*3
+        expected=panel.history.rows[0]['cycle_start']
         assert host.grab().save(str(tmp_path/'quota-all-cycles.png'))
+        point=panel.history.point(0,'remaining')
+        click(host,plot,point.x(),point.y())
+        deadline=time.monotonic()+3
+        while panel.cycle_choice.currentData()=='all' and time.monotonic()<deadline:QTest.qWait(5)
+        assert panel.cycle_choice.currentData()==expected
+        chosen=next(p for p in panel._view['periods'] if p['start']==expected)
+        assert panel.history.rows is chosen['series']['rows']
+        click(host,render_plot(host,panel.summary_back))
+        assert panel.cycle_choice.currentData()=='all'
+        assert panel.history.rows[panel.history.cursor]['cycle_start']==expected
+        plot=render_plot(host,panel.history);plot.forceActiveFocus()
+        QTest.keyClick(host.quick,Qt.Key_End)
+        expected=panel.history.rows[-1]['cycle_start']
+        QTest.keyClick(host.quick,Qt.Key_Return)
+        deadline=time.monotonic()+3
+        while panel.cycle_choice.currentData()=='all' and time.monotonic()<deadline:QTest.qWait(5)
+        assert panel.cycle_choice.currentData()==expected
         assert not host.qml_errors
     finally:dispose(host)
 

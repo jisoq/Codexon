@@ -51,23 +51,22 @@ def test_compact_rows_share_time_and_drag_snaps_to_original_observations(tmp_pat
     finally:dispose(host)
 
 
-@pytest.mark.parametrize('cumulative',[False,True])
-def test_exclusions_break_analysis_curves_without_erasing_real_remaining(tmp_path,cumulative):
+def test_exclusions_break_analysis_curves_without_erasing_real_remaining(tmp_path):
     app=QApplication.instance() or QApplication([])
     rows=observations()
     for i in (2,3):rows[i]['user_excluded']=True
-    series=prepare_series(rows);series['cumulative']=cumulative
+    series=prepare_series(rows)
     series['exclusions']=[dict(start=1060,end=1180,reason='test',id=1)]
     chart=QuotaHistory();chart.money=True;chart.set_series(series)
     host=mount(chart,560,650)
     try:
         render_plot(host,chart)
         assert not chart.connects(1,3,'cycle_cost')
-        assert chart.connects(1,3,'remaining') is (not cumulative)
+        assert chart.connects(1,3,'remaining')
         assert chart.connects(3,4,'cycle_cost')
         assert len(chart.gap_lefts)==0
         detail=chart.detail_for(2)
-        assert next(item['value'] for item in detail['items'] if item['metric']=='remaining')==('집계 제외' if cumulative else '88%')
+        assert next(item['value'] for item in detail['items'] if item['metric']=='remaining')=='88%'
         assert all(item['value']=='집계 제외' for item in detail['items'] if item['metric']!='remaining')
         picture=chart._picture;ratio=picture.devicePixelRatio()
         def curve_present(key,token):
@@ -78,7 +77,7 @@ def test_exclusions_break_analysis_curves_without_erasing_real_remaining(tmp_pat
                        for px in range(round(x*ratio)-2,round(x*ratio)+3)
                        for py in range(round(point.y()*ratio)-2,round(point.y()*ratio)+3))
         assert not curve_present('cycle_cost','output')
-        assert curve_present('remaining','written') is (not cumulative)
-        assert host.grab().save(str(tmp_path/f'exclusion-lanes-{cumulative}.png'))
+        assert curve_present('remaining','written')
+        assert host.grab().save(str(tmp_path/'exclusion-lanes.png'))
         assert not host.qml_errors
     finally:dispose(host)

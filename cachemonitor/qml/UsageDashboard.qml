@@ -206,7 +206,7 @@ Item {
             objectName:'usage-chart'
             Layout.fillWidth:true;Layout.fillHeight:true;Layout.minimumHeight:148
             onHeightChanged:if(!root.s.home)resize.restart()
-            Timer {id:resize;interval:100;onTriggered:root.node.change('size',String(Math.floor((chart.height-36)/54)))}
+            Timer {id:resize;objectName:'usage-resize';interval:100;onTriggered:root.node.change('size',String(Math.floor((chart.height-36)/54)))}
             Column {
                 objectName:'usage-chart-content'
                 anchors.left:parent.left;anchors.right:parent.right;anchors.top:parent.top;spacing:0

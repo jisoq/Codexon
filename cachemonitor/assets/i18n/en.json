@@ -2659,5 +2659,15 @@
   "정지 전 잔여량": "Allowance before pausing",
   "일시정지 전 마지막으로 확인한 잔여량입니다.": "Last allowance checked before pausing.",
   "마지막 관측 {time}": "Last observation {time}",
-  "모니터링 상태를 저장하지 못했습니다. 다시 시도하세요.": "Could not save monitoring state. Try again."
+  "모니터링 상태를 저장하지 못했습니다. 다시 시도하세요.": "Could not save monitoring state. Try again.",
+  "주기별 사용량 추이": "Usage by cycle",
+  "주기 소모량": "Cycle usage",
+  "주기 환산액": "Cycle value",
+  "전체 보기": "All cycles",
+  "주기마다 한 점으로 표시합니다. 점을 누르면 해당 주기의 상세 차트를 엽니다.": "Each point summarizes one cycle. Select a point to open its detailed chart.",
+  "진행 중: 최신 집계": "In progress: latest totals",
+  "종료된 주기 집계": "Completed cycle totals",
+  "클릭 또는 Enter로 상세 보기": "Click or press Enter for details",
+  "전체 이력을 읽지 못했습니다. 현재 주기는 계속 확인할 수 있습니다.": "Could not load the full history. The current cycle remains available.",
+  "현재 주기를 표시했습니다. 전체 이력을 계산하고 있습니다.": "The current cycle is ready. Full-history totals are being calculated."
 }

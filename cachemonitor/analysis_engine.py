@@ -2,6 +2,7 @@
 from bisect import bisect_left
 from collections import OrderedDict, defaultdict
 from datetime import datetime
+import sys
 from .analytics import analyze, comparison_view, overview_view, stats, effort_key, prepare_row, project_matches, observed_choices, call_identity, annotate_incidents, session_summary
 from .cache_misses import classify
 from .cache_health import CacheHealth
@@ -35,6 +36,20 @@ class BoundedCache:
     def discard(self,predicate):
         for key in tuple(self.data):
             if predicate(key):self.weight-=self.data.pop(key)[1]
+
+
+def retained_bytes(value,limit):
+    """Count a bounded projection, stopping before admitting an oversized value."""
+    pending=[value];seen=set();size=0
+    while pending:
+        item=pending.pop();identity=id(item)
+        if identity in seen:continue
+        seen.add(identity);size+=sys.getsizeof(item)
+        if size>limit:return size
+        if isinstance(item,dict):
+            pending.extend(item.keys());pending.extend(item.values())
+        elif isinstance(item,(list,tuple,set,frozenset)):pending.extend(item)
+    return size
 
 
 ROW_SIGNATURE_FIELDS = ('key','ts','turn','model','effort','input','cached','written','output','reasoning','total','service_tier',
@@ -94,11 +109,12 @@ class AnalysisEngine:
         self.results=BoundedCache(6,160000)
         self.statistics=BoundedCache(2048,160000)
         self.summaries=BoundedCache(64,160000)
-        self.page_results=BoundedCache(8,160000)
+        # Cache the delivered projection by its retained bytes, independently
+        # of how many historical calls contributed to its exact totals.
+        self.page_results=BoundedCache(8,16*1024*1024)
         self.revision=0
         self.generation=0
         self.pricing_signature=None
-        self.timestamps=[]
         self.ownership_sources={}
         self.ownership_candidates=defaultdict(set)
         self.owned_rows={}
@@ -226,12 +242,12 @@ class AnalysisEngine:
         self.sessions=work
         if changed:
             self.revision+=1
-            self.timestamps=sorted(r['ts'] for s in work.values() for r in s['prepared']['history'])
             # Old result objects may remain on screen, but cannot answer a newer revision.
             self.results.clear()
             self.page_results.clear()
             self.parts.discard(lambda key:key[0] not in updated or key[1]!=updated[key[0]]['revision'])
             self.__dict__.pop('_explorer_projection',None)
+            self.__dict__.pop('_history_prepared',None)
             self.__dict__.pop('_category_projection',None)
         return changed
 
@@ -287,7 +303,8 @@ class AnalysisEngine:
             unit=value['overview']['granularity']
             deadline=min(deadline,_local_timestamp(_next_bucket(_bucket_start(q['end'],unit),unit)))
         value['valid_until']=deadline
-        self.page_results.put(key,(value,deadline),value['analysis']['response_count']+1)
+        cached=(value,deadline)
+        self.page_results.put(key,cached,retained_bytes((key,cached),self.page_results.rows))
         return value
 
     def query(self,q):
@@ -320,8 +337,9 @@ class AnalysisEngine:
             recent=state.get("recent_part")
             part=recent[1] if recent and recent[0]==part_key else self.parts.get(part_key)
             if part is None:
-                part=analyze([s],start,end,model,with_comparisons=False,service_tier=mode,effort=effort)
-                part['_sorted_responses']=sorted(part['responses'],key=lambda r:r['ts'])
+                part=analyze([s],start,end,model,with_comparisons=False,service_tier=mode,effort=effort,
+                             _range_index=(interval,state['whole_turns']))
+                part['_sorted_responses']=part['responses']
                 part['_sorted_turns']=sorted(part['turns'],key=lambda t:t['ts'],reverse=True)
                 lookup=defaultdict(list)
                 for row in part['_sorted_responses']:

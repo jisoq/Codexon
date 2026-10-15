@@ -81,18 +81,18 @@ def test_gap_does_not_allow_a_request_to_bridge_unobserved_consumption():
     assert summary['delta']==0 and summary['per_percent'] is None
 
 
-def test_all_cycles_accumulate_beyond_100_and_keep_reset_boundaries():
+def test_overview_has_one_exact_aggregate_per_cycle_and_retains_lifetime_totals():
     from cachemonitor.quota_view import prepare_quota_view
     first=example([(100,100),(130,80),(160,60),(190,40)],[('a',110,180,30)])
     second=example([(220,100),(250,80),(280,60),(310,40)],[('b',230,300,60)])
     report=report_for(first['cycles']+second['cycles'])
     report['request_windows']=first['request_windows']+second['request_windows']
     view=prepare_quota_view(report);rows=view['overall']['rows']
-    assert len(view['periods'])==2 and len(view['overall']['resets'])==1
-    assert view['overall']['resets'][0]['at']==220
-    assert rows[-1]['remaining']==120 and rows[-1]['cycle_cost']==90
-    assert rows[-1]['cycle_value']==75
-    assert all(a['remaining']<=b['remaining'] and a['cycle_cost']<=b['cycle_cost'] for a,b in zip(rows,rows[1:]))
+    assert len(view['periods'])==len(rows)==2
+    assert [(row['cycle_start'],row['at']) for row in rows]==[(100,190),(220,310)]
+    assert [(row['remaining'],row['cycle_cost'],row['cycle_value']) for row in rows]==[(60,30,50),(60,60,100)]
+    assert view['lifetime']['delta']==120 and view['lifetime']['cost']==90
+    assert not rows[0]['current'] and rows[1]['current']
     assert view['periods'][1]['series']['rows'][-1]['remaining']==40
 
 
@@ -101,9 +101,10 @@ def test_weekly_value_requires_recorded_cost_but_accepts_zero():
     for cost in (6,0):
         report=example([(100,100),(130,99),(160,98),(190,97),(220,97)],[('a',110,180,cost)])
         view=prepare_quota_view(report)
-        for rows in (view['periods'][0]['series']['rows'],view['overall']['rows']):
-            assert rows[1]['cycle_value'] is None and rows[2]['cycle_value'] is None
-            assert rows[-1]['cycle_value']==cost/3*100
+        rows=view['periods'][0]['series']['rows']
+        assert rows[1]['cycle_value'] is None and rows[2]['cycle_value'] is None
+        assert rows[-1]['cycle_value']==cost/3*100
+        assert view['overall']['rows'][0]['cycle_value']==cost/3*100
 
 
 def test_new_request_during_optional_settling_sample_preserves_completed_pair():

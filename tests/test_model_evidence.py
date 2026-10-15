@@ -15,12 +15,12 @@ def test_old_evidence_remains_queryable_after_bounded_memory_eviction(tmp_path,m
         reader.poll()
         assert len(reader.activity_records)<=16
         assert sum(len(records) for records in reader.records.values())<=16
-        row=reader.enrich(tmp_path/'home',[{'key':'r0'}],'old')[0]
+        row=reader.enrich(tmp_path/'home',[{'key':'r0'}])[0]
         assert row['requested_model']=='requested' and row['response_model']=='actual'
         store.write(tmp_path/'home','a0',200,'WebSocket','r0','corrected','corrected','completed')
         reader.poll()
         assert len(reader.changed_activity)==1
-        assert reader.enrich(tmp_path/'home',[{'key':'r0'}],'old')[0]['requested_model']=='corrected'
+        assert reader.enrich(tmp_path/'home',[{'key':'r0'}])[0]['requested_model']=='corrected'
     finally:reader.close();store.close()
 
 
@@ -36,10 +36,10 @@ def test_many_attempts_keep_all_conflict_decisions_with_bounded_join_memory(tmp_
         original=reader.evidence_rows
         selected=list(original(home_key(home),rows))[0][1]
         assert len(selected)<=32
-        actual=reader.enrich(home,rows,'bounded')
+        actual=reader.enrich(home,rows)
         full=[dict(row) for row in reader.db.execute('SELECT * FROM model_observations')]
         monkeypatch.setattr(reader,'evidence_rows',lambda home,rows:((row,full) for row in rows))
-        assert reader.enrich(home,rows,'reference')==actual
+        assert reader.enrich(home,rows)==actual
     finally:reader.close();store.close()
 
 
@@ -86,12 +86,14 @@ def test_partial_observation_read_advances_publication_revision_and_recovers(tmp
 
 
 def test_replaced_observation_sequence_discards_previous_evidence(tmp_path):
+    from types import SimpleNamespace
+    from cachemonitor.model_evidence import home_key
     store=EvidenceStore(tmp_path/'evidence.sqlite');reader=EvidenceReader(store.path)
-    home=tmp_path/'home'
+    home=tmp_path/'home';rows=[{'key':'old-response'}];owner=SimpleNamespace(keys={'old-response'})
     try:
         store.write(home,'old',1,'WebSocket','old-response','old-model','old-model','completed')
         reader.poll();generation=reader.generation
-        reader.enrich(home,[{'key':'old-response'}],'session')
+        assert reader.enrich_owned(home_key(home),rows,owner)[0]['wire_observed']
         store.db.execute('DELETE FROM model_observations')
         store.db.execute("DELETE FROM sqlite_sequence WHERE name='model_observations'")
         store.db.commit()
@@ -100,48 +102,46 @@ def test_replaced_observation_sequence_discards_previous_evidence(tmp_path):
         store.write(home,'next',3,'WebSocket','next-response',status='created')
         reader.poll()
         assert reader.generation>generation and reader.offset==2
-        assert not reader.enrich(home,[{'key':'old-response'}],'session')[0]['wire_observed']
-        assert reader.enrich(home,[{'key':'new-response'}],'session')[0]['requested_model']=='new-model'
+        assert not reader.enrich_owned(home_key(home),rows,owner)[0]['wire_observed']
+        assert reader.enrich(home,[{'key':'new-response'}])[0]['requested_model']=='new-model'
         assert all(attempt!='old' for _,attempt in reader.activity_records)
     finally:reader.close();store.close()
 
 
-def test_join_cache_releases_dependencies_when_invalidated_history_changes(tmp_path):
+def test_owned_join_replaces_changed_source_history(tmp_path):
+    from types import SimpleNamespace
     from cachemonitor.model_evidence import home_key
     store=EvidenceStore(tmp_path/'evidence.sqlite');reader=EvidenceReader(store.path);home=tmp_path/'home'
+    owner=SimpleNamespace(keys=set())
     try:
         for n in range(12):
             rows=[{'key':'shared'},{'key':f'current-{n}'}]
-            reader.enrich(home,rows,'session')
+            owner.keys={row['key'] for row in rows}
+            reader.enrich_owned(home_key(home),rows,owner)
             store.write(home,f'a{n}',n,'WebSocket','shared',status='completed');reader.poll()
-            reader.enrich(home,rows,'session')
-            assert set(reader.dependencies)=={(home_key(home),row['key']) for row in rows}
-            assert reader.cache_rows==2 and len(reader.cache_dependencies)==1
-        reader.MAX_CACHE_ROWS=3
-        large=[{'key':f'large-{n}'} for n in range(4)]
-        assert len(reader.enrich(home,large,'session'))==4
-        assert not reader.cache and not reader.dependencies and reader.cache_rows==0
+            joined=reader.enrich_owned(home_key(home),rows,owner)
+            assert [row['key'] for row in joined]==['shared',f'current-{n}']
+            assert joined[0]['response_status']=='completed' and joined[1]['response_status']==''
     finally:reader.close();store.close()
 
 
-def test_full_join_cache_survives_sequential_scan_and_late_evidence(tmp_path):
+def test_owned_join_reuses_sessions_and_refreshes_only_late_evidence(tmp_path):
+    from types import SimpleNamespace
     from cachemonitor.model_evidence import home_key
     store=EvidenceStore(tmp_path/'scan.sqlite');reader=EvidenceReader(store.path)
-    reader.MAX_CACHE_SESSIONS=2;home=tmp_path/'home'
+    home=tmp_path/'home';key=home_key(home)
     rows=[[{'key':f'r{n}'}] for n in range(3)]
+    owners=[SimpleNamespace(keys={f'r{n}'}) for n in range(3)]
     try:
         reader.poll()
-        first=[reader.enrich(home,row,str(n)) for n,row in enumerate(rows)]
+        first=[reader.enrich_owned(key,row,owner) for row,owner in zip(rows,owners)]
         queries=[];reader.db.set_trace_callback(lambda sql:queries.append(sql) if sql.startswith('SELECT m.*') else None)
-        second=[reader.enrich(home,row,str(n)) for n,row in enumerate(rows)]
-        assert len(queries)==1 and first==second
-        assert all(first[n] is second[n] for n in (0,1))
+        second=[reader.enrich_owned(key,row,owner) for row,owner in zip(rows,owners)]
+        assert not queries and all(a is b for a,b in zip(first,second))
         store.write(home,'late',10,'WebSocket','r0','corrected','corrected','completed');reader.poll()
-        assert reader.enrich(home,rows[0],'0')[0]['requested_model']=='corrected'
-        reader.retain_sessions({(home_key(home),'2')})
-        reader.enrich(home,rows[2],'2')
-        assert set(reader.cache)=={(home_key(home),'2')}
-        assert reader.cache_rows==1 and set(reader.dependencies)=={(home_key(home),'r2')}
+        third=[reader.enrich_owned(key,row,owner) for row,owner in zip(rows,owners)]
+        assert len(queries)==1 and third[0][0]['requested_model']=='corrected'
+        assert all(third[n] is second[n] for n in (1,2))
     finally:reader.close();store.close()
 
 
@@ -189,6 +189,12 @@ def test_late_evidence_refreshes_index_and_analysis_without_changing_usage(tmp_p
     try:
         first=finish(index)['sessions']
         assert first[0]['history'][0]['model_match']=='확인 불가'
+        queries=[]
+        index.model_evidence.db.set_trace_callback(lambda sql:queries.append(sql) if sql.startswith('SELECT m.*') else None)
+        assert finish(index)['sessions'][0]['history'] is first[0]['history']
+        store.write(home,'unrelated',10000,'WebSocket','other-response','other','other','completed')
+        assert finish(index)['sessions'][0]['history'] is first[0]['history']
+        assert not queries
         engine.ingest(first)
         before=first[0]['history'][0]
         store.write(home,'attempt',10000,'WebSocket',before['key'],'gpt-6-astra','gpt-5.6-luna','completed')
@@ -211,6 +217,23 @@ def test_late_evidence_refreshes_index_and_analysis_without_changing_usage(tmp_p
     restored=UsageIndex([home],tmp_path/'index.sqlite')
     try: assert finish(restored)['sessions'][0]['history'][0]['model_match']=='불일치'
     finally:restored.close()
+
+
+def test_owned_evidence_join_refreshes_after_skipped_batches_and_gaps(tmp_path):
+    from types import SimpleNamespace
+    from cachemonitor.model_evidence import home_key
+    store=EvidenceStore(tmp_path/'owned.sqlite');reader=EvidenceReader(store.path)
+    home=tmp_path/'home';key=home_key(home);rows=[{'key':'r'}];owner=SimpleNamespace(keys={'r'})
+    try:
+        reader.poll();first=reader.enrich_owned(key,rows,owner)
+        store.write(home,'late',10,'WebSocket','r','corrected','corrected','completed');reader.poll()
+        reader.poll()  # The owner missed the batch carrying its changed response.
+        second=reader.enrich_owned(key,rows,owner)
+        assert first[0]['requested_model']=='' and second[0]['requested_model']=='corrected'
+        store.gap(9,11);reader.poll()
+        third=reader.enrich_owned(key,rows,owner)
+        assert third[0]['observation_missing'] and not second[0]['observation_missing']
+    finally:reader.close();store.close()
 
 
 def test_transport_wire_evidence_priority_conflict_scope_and_missing_model(tmp_path):

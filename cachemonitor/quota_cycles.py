@@ -202,6 +202,18 @@ class _PackedHistory(_PackedRows):
             for row in pickle.loads(zlib.decompress(block)):
                 if row['at']>=at:yield row
 
+    def range_blocks(self,start,end):
+        """Retain just the immutable blocks needed to replay one display period."""
+        first=bisect_left(self.time_ends,start)
+        last=min(len(self.blocks),bisect_right(self.time_ends,end)+1)
+        base=self.ends[first-1] if first else 0
+        result=_PackedHistory(())
+        result.blocks=self.blocks[first:last]
+        result.ends=[value-base for value in self.ends[first:last]]
+        result.count=result.ends[-1] if result.ends else 0
+        result.time_ends=self.time_ends[first:last]
+        return result
+
     def with_suffix(self, at, rows):
         """Share unchanged blocks and replace every record at or after at."""
         block=bisect_left(self.time_ends,at)
@@ -495,50 +507,124 @@ def _continuous_quota_intervals(cycles):
                            'observation_gaps_excluded':True}
 
 
-def quota_statistics(report, start=None, end=None, include_mode_assumptions=False, *, _requests=None, _cache=None, _cache_readonly=False):
-    """Use complete disjoint intervals; preserve the base result under assumptions."""
-    from .analytics import quantile
+def _quota_scope(report, start, end, requests, cache=None, cache_readonly=False):
+    """Select observed intervals before calculating their exact request attribution."""
     from .quota_exclusions import retained_intervals
-    intervals = []
     current_account = report.get('account') or next(
         (c.get('account') for c in report.get('cycles', []) if c.get('account')), '')
     scoped=[]
-    for cycle in retained_intervals(_continuous_quota_intervals(report.get('cycles', [])), report, _clip_quota_interval):
+    cycles=(cycle for cycle in report.get('cycles',[]) if
+            (start is None or cycle['end']>=start) and (end is None or cycle['start']<=end))
+    for cycle in retained_intervals(_continuous_quota_intervals(cycles), report, _clip_quota_interval):
         if (start is not None and cycle.get('start',0)<start) or (end is not None and cycle.get('end',float('inf'))>end):
             cycle=_clip_quota_interval(cycle,start,end)
             if cycle is None:continue
         scoped.append(cycle)
-    user_removed_all = bool(report.get('cycles')) and bool(report.get('exclusions')) and not scoped
-    attribution=dict(idle_delta=0,pending_delta=0,unmatched_calls=0,pending_windows=0)
-    account_delta=sum(max(0,c['delta']) for c in scoped if not current_account or c.get('account')==current_account)
+    observed_count=len(scoped)
+    attribution=[]
+    account_delta=[max(0,c['delta']) for c in scoped if not current_account or c.get('account')==current_account]
     if report.get('tracking') is not None:
         from .quota_attribution import local_request_intervals, RequestWindows
-        requests=_requests if _requests is not None else RequestWindows(report.get('request_windows',[]))
+        requests=requests if requests is not None else RequestWindows(report.get('request_windows',[]))
         local=[]
         for cycle in scoped:
             if current_account and cycle.get('account')!=current_account:continue
             points=cycle.get('endpoints',[])
             overlapping=list(requests.overlapping(points[0][0],points[-1][0])) if points else []
             key=signature=cached=None
-            if _cache is not None and 'id' in cycle:
+            if cache is not None and 'id' in cycle:
                 key=(cycle['id'],cycle['start'],cycle['end'])
                 signature=({**{k:v for k,v in cycle.items() if k not in ('cost_complete_at','cycle_end')},
                             'cost_complete_at':min(cycle['cost_complete_at'],cycle['end']) if cycle.get('cost_complete_at') is not None else None},overlapping)
-                cached=_cache.get(key)
+                cached=cache.get(key)
             if cached and cached[0]==signature:
                 parts,diagnostics=cached[1:3]
                 parts=[{**part,**{k:cycle[k] for k in ('cost_complete_at','cycle_end') if k in cycle}} for part in parts]
             else:
                 parts,diagnostics=local_request_intervals(cycle,overlapping,_clip_quota_interval,_quota_clipper)
-                if key is not None and not _cache_readonly:
+                if key is not None and not cache_readonly:
                     weight=len(points)+len(cycle.get('cost_rows',[]))+len(overlapping)
                     weight+=sum(1+len(part.get('endpoints',[]))+len(part.get('cost_rows',[])) for part in parts)
-                    if weight<=131072:_cache[key]=(signature,parts,diagnostics,weight)
-                    while len(_cache)>256 or sum(item[3] for item in _cache.values())>131072:
-                        _cache.pop(next(iter(_cache)))
+                    if weight<=131072:cache[key]=(signature,parts,diagnostics,weight)
+                    while len(cache)>256 or sum(item[3] for item in cache.values())>131072:
+                        cache.pop(next(iter(cache)))
             local.extend(parts)
-            for key in attribution:attribution[key]+=diagnostics[key]
+            attribution.append(diagnostics)
         scoped=local
+    return scoped,attribution,account_delta,observed_count
+
+
+class _PreparedQuotaStatistics:
+    """Reuse complete accounting intervals across summaries and changed reports.
+
+    Only ledger-issued immutable cycle versions enable this path. Arbitrary
+    mutable report dictionaries retain the ordinary calculation path. Entries
+    share the endpoint/call objects already owned by report outputs; the extra
+    lists and interval dictionaries are conservatively budgeted at 64 MiB.
+    """
+    MAX_BYTES=64*1024*1024
+    MAX_CYCLES=4096
+
+    def __init__(self,report,requests,previous=None):
+        from .quota_exclusions import active_exclusions
+        self.entries={};self.weight=0
+        self.policy=(report.get('exclusions'),report.get('cycle_clears'),report.get('account'))
+        versions=report.get('_cycle_versions',{})
+        context=(report.get('account'),report.get('tracking') is not None)
+        old=previous.entries if previous is not None else {}
+        for cycle in report.get('cycles',[]):
+            version=versions.get(cycle.get('id'))
+            if version is None:continue
+            minimum=256+16*(len(cycle.get('endpoints',[]))+len(cycle.get('cost_rows',[])))
+            if len(self.entries)>=self.MAX_CYCLES or self.weight+minimum>self.MAX_BYTES:continue
+            start,end=cycle['start'],cycle['end']
+            exclusions=[r for r in active_exclusions(report,cycle.get('account','')) if r['start']<end and r['end']>start]
+            clears=[r for r in report.get('cycle_clears',[]) if r['account']==cycle.get('account','') and r['start']<end and r['end']>start]
+            signature=(context,version,exclusions,clears,requests.signature(start,end) if requests is not None else None)
+            signature=hashlib.sha256(pickle.dumps(signature,protocol=5)).digest()
+            prior=old.get(cycle['id'])
+            if prior and prior[0]==signature:
+                value=prior[1];weight=prior[2]
+            else:
+                value=_quota_scope({**report,'cycles':[cycle]},None,None,requests)
+                weight=256+sum(2048+16*(len(row.get('endpoints',[]))+len(row.get('cost_rows',[]))) for row in value[0])
+            if len(self.entries)<self.MAX_CYCLES and self.weight+weight<=self.MAX_BYTES:
+                self.entries[cycle['id']]=(signature,value,weight)
+                self.weight+=weight
+
+    def scope(self,report,start,end,requests,cache,cache_readonly):
+        if self.policy!=(report.get('exclusions'),report.get('cycle_clears'),report.get('account')):
+            return _quota_scope(report,start,end,requests,cache,cache_readonly)
+        rows=[];diagnostics=[];delta=[];count=0
+        for cycle in report.get('cycles',[]):
+            if (start is not None and cycle['end']<start) or (end is not None and cycle['start']>end):continue
+            cached=self.entries.get(cycle.get('id'))
+            whole=(start is None or start<=cycle['start']) and (end is None or end>=cycle['end'])
+            value=(cached[1] if cached and whole else
+                   _quota_scope({**report,'cycles':[cycle]},start,end,requests,cache,cache_readonly))
+            parts,attribution,account_delta,observed_count=value
+            if cached and whole:
+                metadata={key:cycle[key] for key in ('cost_complete_at','cycle_end') if key in cycle}
+                parts=[{**part,**metadata} if any(part.get(key)!=value for key,value in metadata.items()) else part for part in parts]
+            rows.extend(parts);delta.extend(account_delta);count+=observed_count
+            diagnostics.extend(attribution)
+        return rows,diagnostics,delta,count
+
+
+def quota_statistics(report, start=None, end=None, include_mode_assumptions=False, *, _requests=None, _cache=None, _cache_readonly=False):
+    """Use complete disjoint intervals; preserve the base result under assumptions."""
+    from .analytics import quantile
+    intervals=[]
+    current_account=report.get('account') or next(
+        (c.get('account') for c in report.get('cycles',[]) if c.get('account')), '')
+    prepared=report.get('_prepared_statistics')
+    scoped,diagnostics,deltas,count=(prepared.scope(report,start,end,_requests,_cache,_cache_readonly)
+        if prepared is not None else _quota_scope(report,start,end,_requests,_cache,_cache_readonly))
+    attribution=dict(idle_delta=0,pending_delta=0,unmatched_calls=0,pending_windows=0)
+    for values in diagnostics:
+        for key in attribution:attribution[key]+=values[key]
+    account_delta=sum(deltas)
+    user_removed_all=bool(report.get('cycles')) and bool(report.get('exclusions')) and not count
     for cycle in scoped:
         blockers = list(cycle['blocked'])
         if current_account and cycle.get('account') and cycle['account'] != current_account:
@@ -737,13 +823,17 @@ def quota_value_history(report, rows, *, _requests=None, _cache=None, _statistic
         own = [c for c in cycles if c['end'] >= start and c['start'] <= end]
         signature=None
         if _cache is not None:
-            inputs=[{**{k:v for k,v in c.items() if k not in ('cost_complete_at','cycle_end')},
-                     'cost_complete_at':min(c['cost_complete_at'],c['end']) if c.get('cost_complete_at') is not None else None}
-                    for c in own]
+            prepared_statistics=report.get('_prepared_statistics')
+            versions=prepared_statistics.entries if prepared_statistics is not None else {}
+            versioned=all(c.get('id') in versions for c in own)
+            inputs=([(c['id'],versions[c['id']][0]) for c in own] if versioned else
+                    [{**{k:v for k,v in c.items() if k not in ('cost_complete_at','cycle_end')},
+                      'cost_complete_at':min(c['cost_complete_at'],c['end']) if c.get('cost_complete_at') is not None else None}
+                     for c in own])
             signature=(account,forward,group.get('_signature',group),inputs,end,
                        [r for r in exclusions if r['start']<end and r['end']>start],
                        [r for r in report.get('cycle_clears',[]) if r['start']<end and r['end']>start],
-                       list(_requests.overlapping(start,end)) if _requests is not None else None,
+                       (_requests.signature(start,end) if versioned else list(_requests.overlapping(start,end))) if _requests is not None else None,
                        (report.get('tracking') or {}).get('complete'))
             signature=hashlib.sha256(pickle.dumps(signature,protocol=5)).digest()
             cached=previous_cache.get(start)
@@ -755,7 +845,8 @@ def quota_value_history(report, rows, *, _requests=None, _cache=None, _statistic
                 else:_period_sink(prepared,period,True)
                 _cache[start]=cached
                 continue
-        if group.get('rows') is None:group={**group,'rows':list(group['_load']())}
+        if group.get('rows') is None and not (_defer_rows and '_source' in group):
+            group={**group,'rows':list(group['_load']())}
         result_start=len(result);period_start=len(periods)
         summary = quota_statistics({**report, 'account': account, 'cycles': own}, start, end, _requests=_requests,_cache=_statistics_cache)
         intervals = [c for c in summary['intervals']
@@ -766,15 +857,16 @@ def quota_value_history(report, rows, *, _requests=None, _cache=None, _statistic
             original = quota_statistics({**report, 'account': account, 'cycles': own, 'exclusions': []}, start, end, _requests=_requests,_cache=_statistics_cache)
             display_ranges = sorted((c['start'], c['end']) for c in original['intervals'])
         if _defer_rows:
-            prepared=dict(source=_PackedRows(group['rows']),
+            prepared=dict(source=group['_source'] if '_source' in group else _PackedRows(group['rows']),
                 start=start,partial=group['partial'],cost=summary['cost'],intervals=intervals,
                 display_ranges=display_ranges,exclusions=exclusions,account=account,forward=forward)
         else:
             prepared=_quota_value_rows(group,summary,intervals,display_ranges,exclusions,account,forward)
             result.extend(prepared)
-        if any(not account or r.get('account') == account for r in group['rows']):
+        present=group['_matches_account'] if '_matches_account' in group else any(not account or r.get('account')==account for r in group['rows'])
+        if present:
             value = summary['per_percent']
-            periods.append({'start': start, 'end': group['rows'][-1]['at'],
+            periods.append({'start': start, 'end': group['_last_at'] if '_last_at' in group else group['rows'][-1]['at'],
                             'reset_kind': group['reset_kind'], 'partial': group['partial'],
                             'current': following is None,
                             'cost': summary['cost'] if summary['total'] or exclusions else
@@ -785,8 +877,10 @@ def quota_value_history(report, rows, *, _requests=None, _cache=None, _statistic
                             'value': value*100 if value is not None else None})
             periods[-1]['cost_intervals']=intervals
             if _defer_rows:
+                times=group.get('_times')
                 periods[-1]['_has_history']=bool(not forward or group['reset_kind']=='measurement_reset' or
-                    any(left<=row['at']<=right for row in group['rows'] for left,right in display_ranges))
+                    (any((position:=bisect_left(times,left))<len(times) and times[position]<=right for left,right in display_ranges)
+                     if times is not None else any(left<=row['at']<=right for row in group['rows'] for left,right in display_ranges)))
         if _cache is not None:
             # The deferred sink owns packed classified inputs and the exact
             # interval references. No additional decoded rows are retained.
@@ -807,19 +901,27 @@ class QuotaLedger:
     REQUEST_SORT_ROWS=32768
     SYNC_BATCH_ROWS=128
     ARCHIVE_COMPACTION_ROWS=512
+    READER_SCHEMA_VERSION=1
     FUTURE_COLUMNS=(('observations',('at',)),('window_observations',('at',)),
         ('manual_resets',('at',)),('calls',('ts',)),('tracking_controls',('at',)),
         ('tracking_observations',('received',)),('tracking_tasks',('start','end')),
         ('tracking_wire',('start','end')))
-    def __init__(self, path, *, pack_history=False, weekly_history_only=False):
+    def __init__(self, path, *, pack_history=False, weekly_history_only=False, reader=False):
         self._pack_history=pack_history
         self._weekly_history_only=weekly_history_only
+        self.reader=reader
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(self.path, timeout=8)
+        if not reader:self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.db = (sqlite3.connect(self.path.resolve().as_uri()+'?mode=rw',uri=True,timeout=8) if reader else
+                   sqlite3.connect(self.path,timeout=8))
         try:
             self.db.execute(f'PRAGMA cache_size=-{self.CACHE_KIB}')
-            self._initialize()
+            if reader:
+                self.db.row_factory=sqlite3.Row
+                ready=self.db.execute('SELECT version,price_id FROM quota_reader_ready WHERE id=1').fetchone()
+                if ready is None or tuple(ready)!=(self.READER_SCHEMA_VERSION,PRICE_ID):
+                    raise sqlite3.OperationalError('사용한도 저장소를 준비하고 있습니다.')
+            else:self._initialize()
         except Exception:
             self.db.close()
             raise
@@ -879,6 +981,7 @@ class QuotaLedger:
                 ('tracking_observations_future_received','tracking_observations','received'),
                 ('tracking_tasks_home_end','tracking_tasks','home,end'),
                 ('tracking_wire_home_start','tracking_wire','home,start'),
+                ('tracking_wire_home_response','tracking_wire','home,response'),
                 ('tracking_wire_home_end','tracking_wire','home,end')):
             self.db.execute(f'CREATE INDEX IF NOT EXISTS {name} ON {table}({columns})')
         self.db.execute('begin immediate')
@@ -931,6 +1034,13 @@ class QuotaLedger:
             primary key(home,account,start))''')
         self.db.commit()
         self._initialize_report_revision()
+        from .quota_projection import initialize as initialize_projection
+        initialize_projection(self.db)
+        self.db.execute('CREATE TABLE IF NOT EXISTS quota_reader_ready(id INTEGER PRIMARY KEY CHECK(id=1),version INTEGER,price_id TEXT)')
+        ready=self.db.execute('SELECT version,price_id FROM quota_reader_ready WHERE id=1').fetchone()
+        if ready is None or tuple(ready)!=(self.READER_SCHEMA_VERSION,PRICE_ID):
+            self.db.execute('INSERT OR REPLACE INTO quota_reader_ready VALUES(1,?,?)',(self.READER_SCHEMA_VERSION,PRICE_ID))
+        self.db.commit()
         self._archive_compaction_pending=True
         self._compact_cost_archive()
         from .quota_payloads import PayloadMigration
@@ -1578,6 +1688,34 @@ class QuotaLedger:
             'where o.home=? and o.at>=? and o.at<=? order by o.at,o.id',
             (home,cutoff,now),('observations','observation_context'),'o.at',clock=True)
 
+    def current_report(self,home,now=None):
+        """Read one valid projected prefix and only its subsequent observations."""
+        from .quota_projection import load
+        from .quota_tracking_store import build
+        now=time.time() if now is None else now
+        if self.db.in_transaction:return None
+        saved={key:getattr(self,key,None) for key in
+            ('_input_changes','_input_cache','_tracking_inputs','_request_inputs','_history_inputs','_cycle_cache')}
+        self.db.execute('BEGIN')
+        try:
+            projected=load(self.db,home,now)
+            if projected is None:return None
+            if projected.get('invalid'):
+                self._projection_invalid=home
+                return None
+            context=build(self.db,home,now,context_only=True)
+            if context is None or context.get('account')!=projected['account']:return None
+            self._input_changes=[];self._input_cache={};self._request_inputs=None;self._history_inputs=None;self._cycle_cache={}
+            self._tracking_inputs={'checkpoint':projected['tracking']}
+            result=self._report(home,now,from_at=projected['start'])
+            result.update(_history_resume=projected['resume'],history_pending=True)
+            return result
+        finally:
+            self.db.rollback()
+            for key,value in saved.items():
+                if value is None:self.__dict__.pop(key,None)
+                else:setattr(self,key,value)
+
     def _report_history(self, home, cutoff, now, tables):
         changes=getattr(self,'_input_changes',None)
         cacheable=getattr(self,'_pack_history',False) and changes is not None
@@ -1715,12 +1853,12 @@ class QuotaLedger:
             windows.close()
             if observations is not None:observations.close()
 
-    def _report_calls(self, scope, cutoff, forward):
+    def _report_calls(self, scope, cutoff, forward, from_at=None):
         """Reuse immutable request joins while only quota observations change."""
         packed=forward and getattr(self,'_pack_history',False)
         changes=getattr(self,'_input_changes',None)
         cacheable=packed and changes is not None
-        key=(tuple(scope),cutoff)
+        key=(tuple(scope),cutoff,from_at)
         previous=getattr(self,'_request_inputs',None) if cacheable else None
         if (previous and previous[0]==key and not any(table in
                 ('calls','tracking_wire','tracking_call_boundaries') for table,_ in changes)):
@@ -1729,7 +1867,22 @@ class QuotaLedger:
         slots=','.join('?' for _ in scope)
         # The primary key already makes response IDs unique within one home.
         columns='home,uid,ts,model,'+','.join(TOKEN_FIELDS)+',cost,price_id,service_tier'
-        if len(scope)==1:
+        selected=None;selected_params=()
+        if from_at is not None and forward:
+            candidates=f'''SELECT uid FROM calls WHERE home IN ({slots}) AND ts>=?
+                UNION SELECT response FROM tracking_wire WHERE home IN ({slots}) AND status='completed' AND end>=?'''
+            source=f'({candidates}) chosen CROSS JOIN calls c ON c.uid=chosen.uid'
+            condition=f'c.home IN ({slots}) AND c.ts>=? AND c.model<>?'
+            selected=f'SELECT c.uid FROM {source} WHERE {condition}'
+            selected_params=(*scope,from_at,*scope,from_at,*scope,cutoff,INTERNAL_REVIEW_MODEL)
+            if len(scope)==1:
+                calls=self.db.execute('SELECT '+','.join('c.'+column for column in columns.split(','))+
+                    f' FROM {source} WHERE {condition} ORDER BY c.ts,c.uid',selected_params)
+            else:
+                calls=self.db.execute(f'''SELECT {columns} FROM (SELECT c.*,
+                    row_number() over(partition by c.uid order by c.cost IS NULL,c.home) AS copy_rank
+                    FROM {source} WHERE {condition}) WHERE copy_rank=1 ORDER BY ts''',selected_params)
+        elif len(scope)==1:
             calls=self._report_rows('calls',f'select {columns} from calls where home=? and ts>=? '
                 'and model<>? order by ts,uid',(*scope,cutoff,INTERNAL_REVIEW_MODEL),('calls',),'ts')
         else:
@@ -1742,7 +1895,19 @@ class QuotaLedger:
             reuse_windows=bool(previous and previous[0]==key and
                                not any(table=='tracking_wire' for table,_ in changes))
             completed={};exact_starts={home:{} for home in scope};by_response=None if reuse_windows else {}
-            for row in self.db.execute(f"select * from tracking_wire where home in ({slots}) and response<>''",scope):
+            wire_source='tracking_wire w';wire_params=()
+            if selected is not None:
+                # Include every version of a relevant response so duplicate
+                # completion and exact-start precedence remain unchanged.
+                wire_candidates=f'''SELECT uid AS response FROM ({selected})
+                    UNION SELECT response FROM tracking_wire WHERE home IN ({slots}) AND end IS NULL
+                    UNION SELECT response FROM tracking_wire WHERE home IN ({slots}) AND end>=?
+                    UNION SELECT response FROM tracking_wire WHERE home IN ({slots}) AND start>=?'''
+                wire_source=f'({wire_candidates}) chosen CROSS JOIN tracking_wire w ON w.response=chosen.response'
+                wire_params=(*selected_params,*scope,*scope,from_at,*scope,from_at)
+            # The ordinary home/end index supplied this precedence before
+            # range queries gained a response index. Keep it explicit.
+            for row in self.db.execute(f"SELECT w.* FROM {wire_source} WHERE w.home IN ({slots}) AND w.response<>'' ORDER BY w.home,w.end,w.rowid",(*wire_params,*scope)):
                 if row['status']=='completed' and row['end'] is not None:
                     completed[row['response']]=min(completed.get(row['response'],row['end']),row['end'])
                 exact_starts[row['home']][row['response']]=row['start']
@@ -1753,7 +1918,9 @@ class QuotaLedger:
             # Keep only fallback boundaries. Exact wire starts already own the
             # ordinary case, including an explicitly missing start.
             boundaries={home:{} for home in scope}
-            for row in self.db.execute(f'select * from tracking_call_boundaries where home in ({slots})',scope):
+            boundary_condition=f' AND uid IN ({selected})' if selected is not None else ''
+            for row in self.db.execute(f'select * from tracking_call_boundaries where home in ({slots})'+boundary_condition,
+                                       (*scope,*selected_params) if selected is not None else scope):
                 if row['uid'] not in exact_starts[row['home']]:boundaries[row['home']][row['uid']]=row['started']
             if reuse_windows:
                 request_windows=previous[3]
@@ -1806,7 +1973,7 @@ class QuotaLedger:
             self._request_inputs=(key,calls,times,request_windows,weight)
         return calls,times,request_windows
 
-    def _report(self, home, now=None, *, exclusion_only=False):
+    def _report(self, home, now=None, *, exclusion_only=False, from_at=None):
         now = time.time() if now is None else now
         if exclusion_only:
             cached=getattr(self,'_report_cache',None)
@@ -1825,7 +1992,7 @@ class QuotaLedger:
         tracking = build(self.db, home, now, context_only=exclusion_only, read_rows=self._report_rows,
                          pack_groups=getattr(self,'_pack_history',False),
                          replay_cache=getattr(self,'_tracking_inputs',None) if getattr(self,'_input_changes',None) is not None else None,
-                         changes=getattr(self,'_input_changes',None))
+                         changes=getattr(self,'_input_changes',None),request_from=from_at)
         current_account = tracking.get('account') if tracking is not None else None
         if not current_account:
             latest=self.db.execute("select account from observations where home=? and at>=? and at<=? "
@@ -1864,7 +2031,8 @@ class QuotaLedger:
             completed_at=min((r[0] for r in marks),default=None) if len(marks)==len(scope) and all(r[0] is not None for r in marks) else None
         issues = ([dict(r) for r in self.db.execute(f'select * from coverage_issues where home in ({slots})',scope)]
                   if 'coverage_issues' in tables else [])
-        calls,call_times,request_windows=self._report_calls(scope,cutoff,tracking is not None)
+        call_start=min((group['observations'][0]['at'] for group in groups if group['observations']),default=from_at) if from_at is not None else None
+        calls,call_times,request_windows=self._report_calls(scope,cutoff,tracking is not None,call_start)
         time_cache={}
         for group in groups if tracking is None else ():
             if group.get('gap') or group.get('discontinuous'):continue
@@ -2137,7 +2305,7 @@ class QuotaLedger:
         else:
             del observations
         groups.clear();del calls
-        context['history']=self._report_history(home,cutoff,now,tables)
+        context['history']=self._report_history(home,max(cutoff,from_at) if from_at is not None else cutoff,now,tables)
         return {**({'request_windows':request_windows} if tracking is not None else {}),
                 **context,
                 'manual_resets':manual_resets,'cycles': list(reversed(result)), 'price_id': PRICE_ID, 'index_at': state['at'] if state else None,

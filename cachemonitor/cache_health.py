@@ -41,8 +41,7 @@ class CacheHealth:
             recent.append(row)
         valid=[r for r in recent if self.valid(r)]
         total=sum(r['input'] for r in valid)
-        from .cache_audit import observations
-        return dict(state=self.state,reason=self.reason,incident=deepcopy(self.incident),audit=observations(rows[-101:])[-100:],
+        return dict(state=self.state,reason=self.reason,incident=deepcopy(self.incident),
                     incidents=len(self.events),events=deepcopy(self.events),
                     recent_rate=sum(r['cached'] for r in valid)/total*100 if total else None,
                     valid=len(valid),sample=len(recent),partial=len(valid)!=len(recent),provisional=True)

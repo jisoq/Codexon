@@ -39,6 +39,7 @@ def monitoring_palette(paused=False):
 
 
 class QuotaHistory(Plot):
+    cycle_activated=Signal(float)
     gap_selected=Signal(str)
     range_selected=Signal(float,float)
     repaintRequested=Signal()
@@ -99,7 +100,7 @@ class QuotaHistory(Plot):
     def connects(self,a,b,key):
         missing=self.series['missing'].get(key)
         return (self.series['breaks'][a]==self.series['breaks'][b] and
-                (key=='remaining' and not self.series.get('cumulative') or
+                (key=='remaining' and not self.series.get('cycle_summary') or
                  ((missing is None or missing[a]==missing[b]) and not self.excluded_between(a,b))))
 
     def excluded_between(self,a,b):
@@ -124,9 +125,9 @@ class QuotaHistory(Plot):
 
     def metric_definitions(self):
         return [('cycle_value','accent','주간 예상 가치','USD / 100%p'),
-                ('remaining','written','누적 사용량' if self.series.get('cumulative') else '남은 사용량',
-                 '%p' if self.series.get('cumulative') else '%'),
-                ('cycle_cost','output','누적 측정 환산액','USD')]
+                ('remaining','written','주기 소모량' if self.series.get('cycle_summary') else '남은 사용량',
+                 '%p' if self.series.get('cycle_summary') else '%'),
+                ('cycle_cost','output','주기 환산액' if self.series.get('cycle_summary') else '누적 측정 환산액','USD')]
 
     def displayed_metrics(self):
         return [item for item in self.metric_definitions() if self.visible(item[0]) or
@@ -163,8 +164,8 @@ class QuotaHistory(Plot):
         pic.setDevicePixelRatio(ratio);pic.fill(Qt.transparent);p=LocalizedPainter(QPainter(pic))
         p.setFont(self.font());font=p.font();font.setPixelSize(13);p.setFont(font)
         p.setRenderHint(QPainter.Antialiasing)
-        cumulative=self.series.get('cumulative',False)
-        if cumulative:
+        summary=self.series.get('cycle_summary',False)
+        if summary:
             low,high=quota_bounds((self.series['low'],self.series['high']))
             self.axis=(low,high,(high-low)/4)
         else:self.axis=remaining_axis([{'remaining':self.series['low']},{'remaining':self.series['high']}])
@@ -201,11 +202,6 @@ class QuotaHistory(Plot):
         self.gap_lefts=GapPixels(self.series,box.left(),self.time_scale,self.gap_width)
         self.gap_rights=GapPixels(self.series,box.left(),self.time_scale,self.gap_width,True)
         visible_gaps=range(0,count,max(1,ceil(1/self.gap_width))) if self.gap_width else range(0)
-        self.reset_hits=[]
-        if cumulative:
-            for reset in self.series.get('resets',[]):
-                index=min(bisect_left(self.series['times'],reset['at']),len(self.rows)-1)
-                self.reset_hits.append((QRectF(self.x_at(index)-8,4,16,22),reset))
         for key,color,title,unit in metrics:
             area=self.row_boxes[key];header=self.row_headers[key]
             low,high=self.bounds(key)
@@ -255,15 +251,17 @@ class QuotaHistory(Plot):
                 value=completed[index] if key=='completed_cost' else paint_row(index).get(key)
                 y=bottom-(value-low)*scale if value is not None else None
                 if y is not None and previous is not None and self.connects(previous_index,index,key):
+                    if summary:
+                        move(previous_x,previous);line(x,y)
                     # Completed intervals remain horizontal, with no invented
                     # slope or vertical transition between independent amounts.
-                    if previous_x!=x:
+                    elif previous_x!=x:
                         start,end=previous_x,x
                         if key=='completed_cost':
                             if not previous_index or paint_row(previous_index).get('remaining')!=previous_remaining(previous_index):start+=1.5
                             if paint_row(index).get('remaining')!=paint_row(previous_index).get('remaining'):end-=1.5
                         if end>start:move(start,previous);line(end,previous)
-                    if key!='completed_cost' and previous!=y:move(x,previous);line(x,y)
+                    if not summary and key!='completed_cost' and previous!=y:move(x,previous);line(x,y)
                 previous,previous_x,previous_index=y,x,index
                 if key=='completed_cost' and y is not None and index+1<len(rows):
                     if (completed[index+1] is None and breaks[index]==breaks[index+1]
@@ -272,6 +270,13 @@ class QuotaHistory(Plot):
                         end=self.x_at(index+1)-1.5
                         if end>start:move(start,y);line(end,y)
             p.setBrush(Qt.NoBrush);p.drawPath(path)
+            if summary:
+                for index,x in zip(indices,xs):
+                    value=rows[index].get(key)
+                    if value is None:continue
+                    p.setBrush(QColor(palette['surface'] if rows[index].get('current') else palette[color]))
+                    p.drawEllipse(QPointF(x,bottom-(value-low)*scale),4,4)
+                p.setBrush(Qt.NoBrush)
         if count and self.gap_width:
             p.setPen(QColor(palette['muted']))
             p.drawText(QRectF(box.left(),4,box.width(),22),Qt.AlignLeft,'// 수집 공백')
@@ -288,11 +293,6 @@ class QuotaHistory(Plot):
             if paint_row(index)['reset_kind']:
                 x=xs[pos];p.setPen(QPen(QColor(palette['muted']),1,Qt.DotLine))
                 for area in boxes:p.drawLine(QPointF(x,area.top()),QPointF(x,area.bottom()))
-        for rect,reset in self.reset_hits:
-            x=rect.center().x();p.setPen(QPen(QColor(palette['muted']),1,Qt.DashLine))
-            for area in boxes:p.drawLine(QPointF(x,area.top()),QPointF(x,area.bottom()))
-            p.setPen(QColor(palette['ink']));p.drawText(rect,Qt.AlignCenter,'◆')
-            self._cache_hits.append((rect,{},reset['label']+', '+clock(reset['at'],True)))
         p.setPen(QColor(palette['muted']))
         p.drawText(QRectF(box.left(),box.bottom()+10,box.width()/2,20),Qt.AlignLeft,clock(rows[0]['at']))
         p.drawText(QRectF(box.center().x(),box.bottom()+10,box.width()/2,20),Qt.AlignRight,clock(rows[-1]['at']))
@@ -301,7 +301,7 @@ class QuotaHistory(Plot):
 
     def metric_text(self,key,value):
         if value is None:return '—'
-        if key=='remaining':return f'{value:g}'+('%p' if self.series.get('cumulative') else '%')
+        if key=='remaining':return f'{value:g}'+('%p' if self.series.get('cycle_summary') else '%')
         return usd(value)
 
     def x_at_time(self,at):
@@ -415,6 +415,7 @@ class QuotaHistory(Plot):
 
     def index_at(self,x,y):
         if not self.rows or not (self.box.contains(QPointF(x,y)) or self.strip_box.contains(QPointF(x,y))):return None
+        if self.series.get('cycle_summary'):return self.nearest_index(x)
         if self.gap_at(x,self.box.center().y()) is not None:return None
         gaps=bisect_right(self.gap_rights,x+1e-7)
         times=self.series['times']
@@ -423,8 +424,6 @@ class QuotaHistory(Plot):
 
     def tip_at(self,x,y):
         if not self.geometry_ready():return ''
-        for rect,reset in getattr(self,'reset_hits',[]):
-            if rect.contains(QPointF(x,y)):return reset['label']+', '+clock(reset['at'],True)
         gap=self.gap_at(x,y)
         if gap is not None:return self.gap_label(gap)
         index=self.index_at(x,y)
@@ -433,11 +432,6 @@ class QuotaHistory(Plot):
     def detail_at(self,x,y):
         if not self.geometry_ready():return {}
         if self.strip_box.contains(QPointF(x,y)):y=self.box.center().y()
-        for rect,reset in getattr(self,'reset_hits',[]):
-            if rect.contains(QPointF(x,y)):
-                return dict(title=reset['label'],at=reset['at'],reset_at=reset['at'],items=[
-                    dict(label='시각',value=clock(reset['at'],True),color='ink'),
-                    dict(label='주기',value=str(reset['number']),color='ink')],note='')
         gap=self.gap_at(x,y)
         if gap is not None:
             index=self.series['gap_indices'][gap]
@@ -467,27 +461,28 @@ class QuotaHistory(Plot):
 
     def detail_for(self,index):
         row=self.rows[index];previous=self.rows[index-1] if index else None
-        cumulative=self.series.get('cumulative',False)
+        summary=self.series.get('cycle_summary',False)
         items=[dict(metric=key,label=title,value=self.metric_text(key,self.value_at(index,key)),color=color)
                for key,color,title,_ in self.metric_definitions() if self.visible(key)]
         if row.get('user_excluded'):
             note='집계에서 제외한 구간입니다'
             for item in items:
-                if item['metric']!='remaining' or cumulative:item['value']=tr('집계 제외')
+                if item['metric']!='remaining' or summary:item['value']=tr('집계 제외')
         elif row['reset_kind']:note=(', '.join(row.get('markers',[])) or '사용량 리셋')+', 새 주기'
         elif not previous:note=''
         elif not row['connect']:note='' if self.series.get('active_only') else '공백 이후 첫 관측'
         elif self.visible('cycle_cost') and row.get('cycle_cost') is None:note='금액 확인 중'
         elif self.visible('cycle_value') and row.get('cycle_value') is None:note='동등 가치 계산 대기'
         else:note=''
+        if summary:
+            return dict(title=clock(row.get('cycle_start',row['at']))+' → '+clock(row['at']),at=row['at'],items=items,
+                        note=('진행 중: 최신 집계' if row.get('current') else '종료된 주기 집계')+' / 클릭 또는 Enter로 상세 보기')
         if self.visible('cycle_value') and self.reference is not None:
-            items.insert(1,dict(metric='reference',label='누적 예상 가치' if cumulative else '현 주기 평균',value=usd(self.reference),color='muted',subordinate=True))
+            items.insert(1,dict(metric='reference',label='현 주기 평균',value=usd(self.reference),color='muted',subordinate=True))
         return self.with_share(dict(title=clock(row['at'],True),at=row['at'],items=items,note=note),row['at'])
 
     def refresh_detail(self,detail):
         if not detail or not self.rows:return {}
-        if 'reset_at' in detail:
-            return detail if any(r['at']==detail['reset_at'] for r in self.series.get('resets',[])) else {}
         at=detail.get('gap_end',detail.get('at'))
         index=bisect_left(self.series['times'],at)
         if index>=len(self.rows) or self.rows[index]['at']!=at:return {}
@@ -505,9 +500,12 @@ class QuotaHistory(Plot):
         if index is not None:
             self.cursor=index;self.repaintRequested.emit();self.selected.emit(self.rows[index])
             self.setAccessibleName(observation_label(self.rows[index],self.money))
+            if self.series.get('cycle_summary'):self.cycle_activated.emit(self.rows[index]['cycle_start'])
 
     def key(self,key):
         if not self.rows:return
+        if self.series.get('cycle_summary') and key in (Qt.Key_Return,Qt.Key_Enter,Qt.Key_Space):
+            self.cycle_activated.emit(self.rows[self.cursor]['cycle_start']);return
         if key==Qt.Key_Home:self.cursor=0
         elif key==Qt.Key_End:self.cursor=len(self.rows)-1
         elif key in (Qt.Key_Left,Qt.Key_Up,Qt.Key_Right,Qt.Key_Down):
@@ -539,7 +537,7 @@ class QuotaHistory(Plot):
             for area in self.row_boxes.values():p.drawLine(QPointF(x,area.top()),QPointF(x,area.bottom()))
             if not self.strip_box.isNull():p.drawLine(QPointF(x,self.strip_box.top()),QPointF(x,self.strip_box.bottom()))
         for key,color,_,_ in self.displayed_metrics():
-            excluded=self.rows[index].get('user_excluded') and (key!='remaining' or self.series.get('cumulative'))
+            excluded=self.rows[index].get('user_excluded') and (key!='remaining' or self.series.get('cycle_summary'))
             value='집계 제외' if excluded else self.metric_text(key,self.value_at(index,key))
             if inspected and not excluded:
                 point=self.point(index,key)
@@ -549,11 +547,11 @@ class QuotaHistory(Plot):
 
     def legend_values(self):
         if not self.rows:return {key:'—' for key,_,_,_ in self.metric_definitions()}
-        cumulative=self.series.get('cumulative',False)
-        inspected=cumulative and self.inspection_x is not None and self.inspection_at is not None
+        summary=self.series.get('cycle_summary',False)
+        inspected=summary and self.inspection_x is not None and self.inspection_at is not None
         index=max(0,min(bisect_right(self.series['times'],self.inspection_at)-1,len(self.rows)-1)) if inspected else len(self.rows)-1
-        return {key:tr('집계 제외') if self.rows[index].get('user_excluded') and (key!='remaining' or cumulative) and (key!='cycle_value' or cumulative)
-                else self.metric_text(key,self.reference if key=='cycle_value' and not cumulative else self.value_at(index,key)) for key,_,_,_ in self.metric_definitions()}
+        return {key:tr('집계 제외') if self.rows[index].get('user_excluded') and (key!='remaining' or summary) and (key!='cycle_value' or summary)
+                else self.metric_text(key,self.reference if key=='cycle_value' and not summary else self.value_at(index,key)) for key,_,_,_ in self.metric_definitions()}
 
     def geometry_ready(self):
         return self._cache_key is not None and self._cache_key[1]==id(self.series)

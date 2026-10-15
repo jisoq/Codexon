@@ -1,5 +1,8 @@
 """Worker-owned dashboard projections. Historical records never cross the view wire."""
 from collections import Counter
+from bisect import bisect_left
+from heapq import merge, nsmallest, nlargest
+from itertools import islice
 
 from .analytics import cache_rows, observation_flags, stats
 from .pricing import mode_assumptions, request_tier, sum_cost
@@ -27,6 +30,41 @@ def matches(row,key):
 def ordered(rows,sort):
     key='cost' if sort.startswith('cost') else 'ts';descending=sort.endswith('desc')
     return sorted(rows,key=lambda r:(r.get(key) is None,-r[key] if descending and isinstance(r.get(key),(int,float)) else r.get(key,0)))
+
+
+class _OrderedRows:
+    """Select a viewport from existing session order or a bounded end selection."""
+    def __init__(self,rows,sort,chunks=None):
+        self.rows=rows;self.sort=sort;self.chunks=chunks
+        field='cost' if sort.startswith('cost') else 'ts';descending=sort.endswith('desc')
+        self.key=lambda r:(r.get(field) is None,-r[field] if descending and isinstance(r.get(field),(int,float)) else r.get(field,0))
+
+    def window(self,request):
+        total=len(self.rows);start=max(0,min(int(request.get('start',0)),max(0,total-1)))
+        size=max(64,min(512,int(request.get('size',128))))
+        anchor=request.get('anchor')
+        if anchor:
+            found=next(((i,row) for i,row in enumerate(self.rows) if list(row_key(row))==anchor),None)
+            if found is not None:
+                position,row=found;key=self.key(row)
+                rank=sum(self.key(value)<key or (self.key(value)==key and i<position) for i,value in enumerate(self.rows))
+                start=max(0,rank-int(request.get('anchor_offset',0)))
+        if self.chunks is not None and self.sort.startswith('ts'):
+            def newest(rows):
+                end=len(rows)
+                while end:
+                    begin=end-1;at=rows[begin]['ts']
+                    while begin and rows[begin-1]['ts']==at:begin-=1
+                    for index in range(begin,end):yield rows[index]
+                    end=begin
+            sources=(newest(rows) if self.sort.endswith('desc') else iter(rows) for rows in self.chunks)
+            selected=list(islice(merge(*sources,key=self.key),start,start+size))
+        elif start+size<=4096:
+            selected=nsmallest(start+size,self.rows,key=self.key)[start:]
+        elif 0<=total-start<=4096:
+            selected=[row for _,row in reversed(nlargest(total-start,enumerate(self.rows),key=lambda pair:(self.key(pair[1]),pair[0])))][:size]
+        else:selected=ordered(self.rows,self.sort)[start:start+size]
+        return dict(start=start,total=total,rows=selected)
 
 
 def request_rows(turns,rows,scope,include_empty=True,unlinked_total=None):
@@ -61,6 +99,7 @@ def request_rows(turns,rows,scope,include_empty=True,unlinked_total=None):
 
 
 def window(rows,request):
+    if isinstance(rows,_OrderedRows):return rows.window(request)
     start=max(0,min(int(request.get('start',0)),max(0,len(rows)-1)))
     size=max(64,min(512,int(request.get('size',128))))
     anchor=request.get('anchor')
@@ -107,12 +146,14 @@ def explorer(engine,result,selection):
             include_empty=not filters and (matching is None or scope in matching),
             unlinked_total=sum(not r.get('turn') for r in whole))
     else:
-        records=list(rows)
+        records=rows
         if selection.get('outside') and turn and scope:
+            records=list(rows)
             keys={identity(r) for r in records}
             records.extend(dict(r,_outside=True) for r in result['lookup']['whole_turns'].get((*scope,turn),[]) if identity(r) not in keys)
     call_rows=rows if view=='requests' else records if view=='calls' else []
-    call_identities=frozenset(identity(row) for row in call_rows)
+    call_lookup=result['lookup']['sessions'] if view=='calls' and records is scope_rows else None
+    call_identities=frozenset(identity(row) for row in call_rows) if call_lookup is None else None
     parent_kind='requests' if view=='calls' and scope else 'sessions'
 
     from .history_projection import prepare, session_tree, total
@@ -143,7 +184,10 @@ def explorer(engine,result,selection):
         request_ordinal=numbers.get(turn)
         if view=='requests':records=[dict(r,ordinal=numbers.get(r.get('turn')),
             ts=r.get('ts') if r.get('turn')=='__unlinked__' else position(r.get('turn'))[0]) for r in records]
-    if view!='sessions':records=ordered(records,sort)
+    available=available_fields(records)
+    if view=='calls' and not selection.get('timeline'):
+        records=_OrderedRows(records,sort,tuple(call_lookup.values()) if call_lookup is not None else None)
+    elif view!='sessions':records=ordered(records,sort)
     timeline=project_timeline(records,kind=view) if selection.get('timeline') and scope and view in ('requests','calls') else None
     parents=navigation;parent_kind='projects'
     if scope:summary=total(rows)
@@ -157,14 +201,36 @@ def explorer(engine,result,selection):
     while cursor in hierarchy['items']:
         item=hierarchy['items'][cursor];chain.append({k:item[k] for k in ('title','home','sid','project_id')});cursor=hierarchy['parent'].get(cursor)
     path.extend(reversed(chain))
-    available=available_fields(records)
     selected_identity=selection.get('call_identity')
     detail=engine.record(*selected_identity) if selected_identity else None
     event_keys={str(k) for field in ('baseline_keys','occurrence_keys','recovery_keys') for k in (event or {}).get(field,[])}
     return dict(path=path,view=view,session=scope,turn=turn,request_ordinal=request_ordinal,metadata=session,group={k:v for k,v in hierarchy['rollups'].get(scope,{}).items() if k!='members'},project=project,summary=summary,child_count=len(hierarchy['children'].get(scope,[])),
         records=records,parents=parents,parent_kind=parent_kind,partial_parents=any(r.get('known',0)<r.get('calls',0) for r in parents) if parent_kind=='sessions' else False,available=available,detail=detail,
-        timeline=timeline,_call_identities=call_identities,detail_in_scope=bool(detail and identity(detail) in call_identities),
+        timeline=timeline,_call_identities=call_identities,_call_lookup=call_lookup,detail_in_scope=detail_in_scope(detail,call_identities,call_lookup),
         event=event,event_rows=[r for r in scope_rows if (r['home'],r['sid'])==scope and str(identity(r)[2]) in event_keys])
+
+
+def detail_in_scope(detail,identities,lookup):
+    if not detail:return False
+    if lookup is None:return identity(detail) in identities
+    rows=lookup.get((detail['home'],detail['sid']),[])
+    position=bisect_left(rows,detail['ts'],key=lambda row:row['ts'])
+    for index in range(position,len(rows)):
+        row=rows[index]
+        if row['ts']!=detail['ts']:break
+        if identity(row)==identity(detail):return True
+    return False
+
+
+def explorer_window(engine,q,data,view):
+    selection=q.get('explorer',{})
+    detail=engine.record(*selection['call_identity']) if selection.get('call_identity') else None
+    projected={key:value for key,value in data.items() if key not in ('_call_identities','_call_lookup')}
+    ranges=q.get('table_windows',{})
+    projected.update(detail=detail,detail_in_scope=detail_in_scope(detail,data['_call_identities'],data['_call_lookup']),
+        records=window(data['records'],ranges.get('records',{})),parents=window(data['parents'],ranges.get('parents',{})))
+    return {**view,'explorer':projected,
+        'analysis':{**view['analysis'],'sessions':[data['metadata']] if data['metadata'] else [],'responses':data['event_rows']}}
 
 
 def reference(query,path):
@@ -219,7 +285,13 @@ def project(engine,q):
     query={k:v for k,v in q.items() if k not in ('explorer','table_windows','presentation','compare_model','result_view')}
     # The displayed hierarchy computes its own project-restricted lineage.
     # General query callers still receive their ordinary session cost rollups.
-    if q['page']==2:query['_session_costs']=False
+    if q['page']==2:
+        query['_session_costs']=False
+        selection=q.get('explorer',{})
+        stable={k:v for k,v in query.items() if k!='now' and (q.get('period')=='custom' or k not in ('start','end'))}
+        key=(engine.query_key(stable),engine.query_key({'page':2,**{k:v for k,v in selection.items() if k!='call_identity'}}))
+        cached=getattr(engine,'_explorer_projection',None)
+        if cached and cached[0]==key and q['now']<cached[3]:return explorer_window(engine,q,cached[1],cached[2])
     result=engine.query(query);a=result['analysis'];responses=a['responses'];turns=a['turns']
     view=dict(key=result['key'],revision=result['revision'],filter_choices=result['filter_choices'],
         analysis={k:v for k,v in a.items() if k not in ('sessions','responses','turns','units','groups')},lookup={})
@@ -227,20 +299,10 @@ def project(engine,q):
     if q['page']==2:
         # Range movement reuses the prepared population; the GUI receives only
         # the requested window. Search/sort/selection never run on the GUI thread.
-        selection=q.get('explorer',{})
-        key=(result['key'],engine.query_key({'page':2,**{k:v for k,v in selection.items() if k!='call_identity'}}))
-        cached=getattr(engine,'_explorer_projection',None)
-        data=cached[1] if cached and cached[0]==key else explorer(engine,result,selection)
-        engine._explorer_projection=(key,data)
-        detail=engine.record(*selection['call_identity']) if selection.get('call_identity') else None
-        data={**{key:value for key,value in data.items() if key!='_call_identities'},
-              'detail':detail,'detail_in_scope':bool(detail and identity(detail) in data['_call_identities'])}
-        ranges=q.get('table_windows',{})
-        view['explorer']={**data,'records':window(data['records'],ranges.get('records',{})),
-            'parents':window(data['parents'],ranges.get('parents',{}))}
-        view['analysis']['sessions']=[data['metadata']] if data['metadata'] else []
-        view['analysis']['responses']=data['event_rows']
-        return view
+        data=explorer(engine,result,selection)
+        from .analysis_worker import expiry
+        engine._explorer_projection=(key,data,view,expiry(engine,q))
+        return explorer_window(engine,q,data,view)
     if q['page']==0:
         overview=result['overview']
         # Only displayed series belong on the wire. Full model/session groupings

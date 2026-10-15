@@ -248,14 +248,14 @@ def test_completed_recorded_cost_survives_unchanged_idle_gap():
     assert prepare_series(rows)['completed_costs'][1] is None
 
 
-def test_period_and_all_cycles_keep_the_same_completed_amounts(tmp_path):
+def test_period_detail_keeps_completed_amounts_and_overview_uses_period_totals(tmp_path):
     from test_quota_value_history import interval, report_for
     report=report_for([
         interval([(100,100),(130,99),(160,99),(190,98)],[(115,5),(145,2),(175,5)]),
         interval([(220,100),(250,99),(280,98)],[(235,3),(265,4)])])
     view=prepare_quota_view(report)
     assert [p['series']['completed_costs'] for p in view['periods']]==[[3,4,None],[5,7,7,None]]
-    assert view['overall']['completed_costs']==[5,7,7,None,3,4,None]
+    assert view['overall']['completed_costs']==[None,None]
     app=QApplication.instance() or QApplication([])
     chart=QuotaHistory();chart.money=True
     chart.set_series(view['periods'][0]['series'])
@@ -264,7 +264,7 @@ def test_period_and_all_cycles_keep_the_same_completed_amounts(tmp_path):
         for name,series,index,expected in (
                 ('first',view['periods'][1]['series'],1,7),
                 ('second',view['periods'][0]['series'],1,4),
-                ('all',view['overall'],5,4)):
+                ('all',view['overall'],1,None)):
             chart.set_series(series)
             plot=render_plot(host,chart)
             plot.activateAt(chart.x_at(index),chart.box.center().y());QTest.qWait(30)
@@ -329,12 +329,12 @@ def test_dynamic_axes_fit_values_and_ignore_missing():
     assert comparison_axis([{'value':98},{'value':99}], 'cache_ratio')[0]>90
 
 
-@pytest.mark.parametrize('cumulative',[False,True])
-def test_quota_axes_never_pad_below_zero_and_zero_points_remain_selectable(cumulative):
+@pytest.mark.parametrize('summary',[False,True])
+def test_quota_axes_never_pad_below_zero_and_zero_points_remain_selectable(summary):
     app=QApplication.instance() or QApplication([])
     rows=[dict(at=1000+i*60,remaining=i,cycle_cost=i*4,cycle_value=i*100,completed_cost=i*2,
                connect=bool(i),reset_kind=None,label=str(i)) for i in range(4)]
-    series=prepare_series(rows);series['cumulative']=cumulative
+    series=prepare_series(rows);series['cycle_summary']=summary
     chart=QuotaHistory();chart.money=True;chart.set_series(series)
     host=mount(chart,1120,440)
     try:
@@ -352,11 +352,11 @@ def test_quota_axes_never_pad_below_zero_and_zero_points_remain_selectable(cumul
     finally:dispose(host)
 
 
-def test_cumulative_and_cost_axes_do_not_force_zero():
+def test_summary_and_cost_axes_do_not_force_zero():
     app=QApplication.instance() or QApplication([])
     rows=[dict(at=1000+i*60,remaining=900+i,cycle_cost=500+i,cycle_value=1000+i,
                connect=bool(i),reset_kind=None,label=str(i)) for i in range(4)]
-    series=prepare_series(rows);series['cumulative']=True
+    series=prepare_series(rows);series['cycle_summary']=True
     chart=QuotaHistory();chart.money=True;chart.set_series(series)
     host=mount(chart,1120,450)
     try:

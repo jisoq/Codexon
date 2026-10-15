@@ -21,6 +21,93 @@ def observe(ledger, at, remaining, home='h'):
     tracking.observe(ledger.db,home,q)
 
 
+def test_projected_current_period_survives_restart_and_invalidates_old_edits(tmp_path):
+    from cachemonitor.quota_view import prepare_quota_view
+    from cachemonitor.quota_worker import QuotaComputation,chart_result
+    path=tmp_path/'projected.sqlite'
+    worker=QuotaComputation(path,'h');ledger=worker._ledger(writable=True)
+    def publish(at):
+        raw=ledger.report('h',at)
+        return worker._prepare(raw,(worker.ledger_generation,ledger._report_generation))
+    def rows(report):
+        return list(chart_result(prepare_quota_view(report,deferred=True))['series']['rows'])
+    try:
+        tracking.enable(ledger.db,'h',100)
+        for at,remaining in ((102,70),(110,69),(120,99),(125,100),(130,99),(140,98)):
+            observe(ledger,at,remaining)
+        activity(ledger,141,{},[107,117,137],wire=[
+            dict(home='h',identity='corrected',response='117',start=126,end=129,status='completed'),
+            dict(home='h',identity='latest',response='137',start=132,end=137,status='completed')])
+        assert ledger.current_report('h',142) is None
+        expected=publish(142)['view']['chart']['series']['rows']
+        assert ledger.db.execute('select valid from quota_current_projection').fetchone()[0]==1
+        worker.close();worker=QuotaComputation(path,'h');ledger=worker._ledger()
+        current=ledger.current_report('h',142)
+        assert current['history_pending'] and min(r['at'] for r in current['history'])==120.1
+        assert rows(current)==list(expected)
+        # Ordinary append and cost correction do not replay the immutable
+        # observation prefix. They still use current authoritative call values.
+        observe(ledger,150,97)
+        ledger.db.execute("update calls set cost=cost+1 where uid='137'");ledger.db.commit()
+        assert rows(ledger.current_report('h',152))==rows(ledger.report('h',152))
+        ledger.db.execute('delete from tracking_observations where received=110.1');ledger.db.commit()
+        assert ledger.current_report('h',153) is None
+        publish(153)
+        assert rows(ledger.current_report('h',154))==rows(ledger.report('h',154))
+        ledger.db.execute("update quota_current_projection set payload=x'00'");ledger.db.commit()
+        assert ledger.current_report('h',154) is None
+        assert ledger.report('h',154)['history']
+        publish(154)
+        assert ledger.current_report('h',155) is not None
+    finally:worker.close()
+
+
+def test_current_projection_does_not_require_full_history_cache_admission(tmp_path,monkeypatch):
+    from cachemonitor import quota_view
+    from cachemonitor.quota_worker import QuotaComputation,chart_result
+    monkeypatch.setattr(quota_view,'HISTORY_GROUP_CACHE_BYTES',1)
+    monkeypatch.setattr(tracking,'REPLAY_CACHE_BYTES',8192)
+    worker=QuotaComputation(tmp_path/'bounded.sqlite','h');ledger=worker._ledger(writable=True)
+    try:
+        tracking.enable(ledger.db,'h',100)
+        calls=[];wire=[]
+        for index in range(20):
+            at=200+index*20
+            observe(ledger,at,100);observe(ledger,at+10,99)
+            calls.append(at+5);wire.append(dict(home='h',identity=str(at),response=str(at+5),start=at+1,end=at+5,status='completed'))
+        activity(ledger,at+11,{},calls,wire=wire)
+        raw=ledger.report('h',at+12)
+        expected=worker._prepare(raw,(worker.ledger_generation,ledger._report_generation))['view']['chart']['series']['rows']
+        current=ledger.current_report('h',at+12)
+        assert current is not None
+        actual=chart_result(quota_view.prepare_quota_view(current,deferred=True))['series']['rows']
+        assert list(actual)==list(expected)
+        assert len(current['history'])<len(raw['history'])
+    finally:worker.close()
+
+
+def test_report_worker_edit_reuses_prepared_ledger_without_maintenance(tmp_path,monkeypatch):
+    from cachemonitor import quota_cycles
+    from cachemonitor.quota_worker import QuotaComputation
+    path=tmp_path/'prepared-edit.sqlite';ledger=QuotaLedger(path)
+    tracking.enable(ledger.db,'h',100)
+    for at,remaining in ((102,70),(110,69),(120,99),(125,100),(130,99),(140,98)):
+        observe(ledger,at,remaining)
+    activity(ledger,141,{},[107,117,137]);ledger.close()
+    monkeypatch.setattr(quota_cycles.time,'time',lambda:142)
+    def unexpected_maintenance(self):raise AssertionError('An explicit edit must not repeat initialization')
+    monkeypatch.setattr(QuotaLedger,'_initialize',unexpected_maintenance)
+    worker=QuotaComputation(path,'h')
+    try:
+        report=worker.execute(dict(kind='report',id=1))['report']
+        start=min(period['start'] for period in report['view']['periods'])
+        result=worker.execute(dict(kind='clear_cycle',id=2,start=start,account='a',delete=True))
+        assert result.get('saved') and not result.get('error')
+        assert len(result['report']['view']['periods'])==len(report['view']['periods'])-1
+        assert worker.ledger.db.execute('select count(*) from tracking_observations').fetchone()[0]==6
+    finally:worker.close()
+
+
 def _committed_quota_fixture(ledger):
     tracking.enable(ledger.db,'h',100)
     activity(ledger,101,{})
@@ -237,6 +324,48 @@ def test_changed_cycle_reuses_closed_accounting_and_matches_full_rebuild(tmp_pat
     reopened=QuotaLedger(path)
     try:assert reopened.report('h',162)==corrected
     finally:reopened.close()
+
+
+def test_worker_reuses_unchanged_statistics_and_rechecks_requests_and_exclusions(tmp_path,monkeypatch):
+    from cachemonitor import quota_attribution, quota_cycles
+    from cachemonitor.quota_view import prepare_quota_view, period_series
+    from cachemonitor.quota_worker import QuotaComputation
+    worker=QuotaComputation(tmp_path/'statistics.sqlite','h')
+    ledger=worker._ledger(writable=True);attributed=[]
+    original=quota_attribution.local_request_intervals
+    def counted(cycle,*args,**kwargs):
+        attributed.append(cycle['start'])
+        return original(cycle,*args,**kwargs)
+    monkeypatch.setattr(quota_attribution,'local_request_intervals',counted)
+    def check(now):
+        raw=ledger.report('h',now);attributed.clear()
+        worker._prepare(raw,(worker.ledger_generation,ledger._report_generation))
+        count=len(attributed)
+        view=next(reversed(worker.reports.values()))['view']
+        reference=prepare_quota_view(raw)
+        assert view['lifetime']==reference['lifetime']
+        assert view['summaries']==reference['summaries']
+        assert [period_series(p) for p in view['periods']]==[p['series'] for p in reference['periods']]
+        return count
+    try:
+        tracking.enable(ledger.db,'h',100)
+        for at,remaining in ((102,90),(110,80),(120,100),(130,90),(140,100),(150,90)):
+            observe(ledger,at,remaining)
+        activity(ledger,160,{},[107,127,147])
+        assert check(160)==3
+        observe(ledger,152,85)
+        assert check(161)==1
+        ledger.db.execute('UPDATE calls SET cost=cost*2 WHERE ts=107');ledger.db.commit()
+        assert check(162)==1
+        ledger.db.execute('INSERT INTO tracking_wire VALUES(?,?,?,?,?,?)',('h','late','late',125,148,'completed'))
+        ledger.db.commit();check(163)
+        monkeypatch.setattr(quota_cycles.time,'time',lambda:164)
+        excluded=ledger.exclude_interval('h',120.1,130.1)
+        check(164)
+        ledger.restore_exclusion('h',excluded['id']);check(165)
+        monkeypatch.setattr(quota_cycles._PreparedQuotaStatistics,'MAX_BYTES',1)
+        observe(ledger,154,80);check(166)
+    finally:worker.close()
 
 
 def test_packed_interval_boundaries_preserve_values_and_isolate_neighbor_corrections():

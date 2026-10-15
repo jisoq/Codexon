@@ -7,28 +7,35 @@ MODEL_KEYS=('key','ts','model_observation_ts','model_alert_confirmed','requested
 
 
 class SnapshotPublisher:
+    CHOICE_CACHE_BYTES=4*1024*1024
+    CHOICE_CACHE_ENTRIES=4096
     def __init__(self):
         self.epoch=uuid.uuid4().hex;self.sequence=0
         self.sessions={};self.overlays={};self.states={};self.models={}
         self.choices={}
 
     def observed_choices(self, engine):
-        # Keep compact aggregates for one current history per session. Oversized
-        # populations use the full calculation without retaining a second index.
-        if sum(len(state['prepared']['history']) for state in engine.sessions.values()) > 160000:
-            self.choices.clear()
-            rows=[row for state in engine.sessions.values() for row in state['prepared']['history']]
-            return self._choices_for_rows(rows)
-        current={};counts=Counter();transports=set();sources=set();policies=set()
+        # Reuse the small choice summaries, independently of retained history
+        # length. A new observation must not force unrelated sessions through
+        # a population-wide fallback. Cache revisions rather than owning rows.
+        from .analysis_engine import retained_bytes
+        current={};weight=0;counts=Counter();transports=set();sources=set();policies=set()
         for key,state in engine.sessions.items():
             rows=state['prepared']['history']
             previous=self.choices.get(key)
-            value=previous[1] if previous is not None and previous[0] is rows else self._choices_for_rows(rows)
-            current[key]=(rows,value)
+            revision=state.get('content_revision',state['revision'])
+            if previous is not None and previous[0]==revision:
+                value,size=previous[1:]
+            else:
+                value=self._choices_for_rows(rows)
+                size=retained_bytes((key,revision,value),self.CHOICE_CACHE_BYTES)+128
+            if len(current)<self.CHOICE_CACHE_ENTRIES and weight+size<=self.CHOICE_CACHE_BYTES:
+                current[key]=(revision,value,size);weight+=size
             counts.update({(c['model'],c['effort'],c['service_tier']):c['count'] for c in value['combinations']})
             transports.update(value['transports']);sources.update(value['transport_sources'])
             policies.update(value['cache_policies'])
         self.choices=current
+        self.choice_cache_bytes=weight
         return dict(models=sorted({key[0] for key in counts}),
                     efforts=sorted({key[1] for key in counts},key=effort_key),
                     modes=sorted({key[2] for key in counts}),
