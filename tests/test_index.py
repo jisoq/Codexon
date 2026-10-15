@@ -80,6 +80,76 @@ def finish(index, now=10010):
     raise AssertionError('index did not finish')
 
 
+def test_discovery_refreshes_grouped_paths_after_directory_link_changes(tmp_path,monkeypatch):
+    import os
+    import cachemonitor.index as module
+    home,_=fixture_home(tmp_path)
+    first=tmp_path/'first';second=tmp_path/'second'
+    first.mkdir();second.mkdir()
+    for directory in (first,second):
+        for n in range(8):(directory/f'{n}.jsonl').write_text('{}\n')
+    link=tmp_path/'linked'
+    def point_to(directory):
+        if os.name=='nt':
+            import _winapi
+            _winapi.CreateJunction(str(directory),str(link))
+        else:link.symlink_to(directory,target_is_directory=True)
+    point_to(first)
+    with sqlite3.connect(home/'state_5.sqlite') as db:
+        db.executemany('INSERT INTO threads(id,rollout_path) VALUES(?,?)',
+            [(f'catalog-{n}',str(link/f'{n}.jsonl')) for n in range(8)]
+            +[('missing',str(link/'missing.jsonl')),('alternate-case',str(link/'0.JSONL'))])
+    index=UsageIndex([home],tmp_path/'index.sqlite')
+    try:
+        def check(now):
+            index.discover(now)
+            with sqlite3.connect(home/'state_5.sqlite') as db:
+                expected={str(Path(raw).resolve()).removeprefix('\\\\?\\'):tid
+                          for tid,raw in db.execute('SELECT id,rollout_path FROM threads')}
+            assert {path:tid for path,_,tid in index.files}==expected
+        check(10010)
+        if os.name=='nt':link.rmdir()
+        else:link.unlink()
+        point_to(second)
+        check(10020)
+        monkeypatch.setattr(module,'DISCOVERY_PATH_BUDGET',0)
+        check(10030)
+    finally:index.close()
+
+
+def test_replay_tokens_follow_source_transactions_replacements_and_repairs(tmp_path):
+    path=tmp_path/'tokens.sqlite';db=sqlite3.connect(path)
+    try:
+        db.execute('CREATE TABLE metadata(home TEXT,tid TEXT,data TEXT,PRIMARY KEY(home,tid))')
+        store=EventStore(db,path);epoch=store.enable_replay_tokens()
+        row=('file',1,'home','first',1.,pack_event('{}'))
+        with db:db.execute('INSERT INTO events VALUES(?,?,?,?,?,?)',row)
+        first=store.owner_replay_token('home','first')
+        db.execute('UPDATE events SET data=?',(pack_event('{"changed":true}'),))
+        assert store.owner_replay_token('home','first')!=first
+        db.rollback();assert store.owner_replay_token('home','first')==first
+        with db:db.execute('INSERT OR REPLACE INTO events VALUES(?,?,?,?,?,?)',('file',1,'home','second',1.,row[-1]))
+        assert store.owner_replay_token('home','first')!=first
+        second=store.owner_replay_token('home','second')
+        with db:db.execute('UPDATE event_paths SET path=?',('renamed',))
+        assert store.owner_replay_token('home','second')!=second
+        second=store.owner_replay_token('home','second')
+        with db:db.execute('DELETE FROM events')
+        assert store.owner_replay_token('home','second')!=second
+        token=store.owner_replay_token('home','second')
+        store=EventStore(db,path)
+        assert store.enable_replay_tokens()==epoch and store.owner_replay_token('home','second')==token
+        # Repair invalidates checkpoints even if the missed edit left row counts unchanged.
+        db.execute('DROP TRIGGER event_replay_update');db.commit()
+        repairer=EventStore(db,path)
+        assert repairer.enable_replay_tokens()!=epoch
+        assert store.owner_replay_token('home','second')!=token
+        replay=UsageIndex.for_replay(path)
+        try:assert replay.event_store.enable_replay_tokens() is None and replay.db.total_changes==0
+        finally:replay.close()
+    finally:db.close()
+
+
 @pytest.mark.parametrize('legacy',[False,True])
 def test_stored_replay_preserves_source_and_supports_both_event_formats(tmp_path,legacy):
     from contextlib import closing

@@ -169,11 +169,17 @@ def summarize_session(session,health=None):
     # Keep classifier evidence available after the graph's 24-call window rolls
     # forward. These are observed rows, never reconstructed from session totals.
     evidence_rows={}
-    for ordinal,row in enumerate(rows,1):
-        if row.get('key') is None:continue
-        inp,cached=token_number(row.get('input')),token_number(row.get('cached'))
-        evidence_rows[row['key']]=dict(key=row['key'],ordinal=ordinal,ts=row.get('ts'),
-            input=inp,cached=cached,cache_rate=cached/inp*100 if inp and cached is not None and cached<=inp else None)
+    evidence_keys=set()
+    for event in degradation:
+        evidence_keys.update(event.get('baseline_keys',()))
+        evidence_keys.update(event.get('occurrence_keys',event.get('keys',(event.get('first_key'),event.get('latest_key')))))
+        evidence_keys.update(event.get('recovery_keys',()))
+    if evidence_keys:
+        for ordinal,row in enumerate(rows,1):
+            if row.get('key') is None or row['key'] not in evidence_keys:continue
+            inp,cached=token_number(row.get('input')),token_number(row.get('cached'))
+            evidence_rows[row['key']]=dict(key=row['key'],ordinal=ordinal,ts=row.get('ts'),
+                input=inp,cached=cached,cache_rate=cached/inp*100 if inp and cached is not None and cached<=inp else None)
     for event in degradation:
         event['baseline_calls']=[deepcopy(evidence_rows[key]) for key in event.get('baseline_keys',()) if key in evidence_rows]
         keys=event.get('occurrence_keys',event.get('keys',(event.get('first_key'),event.get('latest_key'))))
@@ -249,7 +255,6 @@ def summarize_session(session,health=None):
 class OverlaySummaries:
     def __init__(self):
         self.cache = {}
-        self.health = {}
         self.rollups = {}
         self.speed_health = SpeedHealth()
         self.presented = {}
@@ -264,10 +269,9 @@ class OverlaySummaries:
             previous = self.cache.get(key)
             summary = previous[1] if previous and previous[0] == revision else summarize_session(
                 dict(state['prepared'],coverage_gaps=coverage_gaps),
-                self.health.setdefault(key,OverlayCacheHealth()).update(state['prepared']['history']))
+                state['prepared'].get('cache_health'))
             updated[key] = (revision, summary)
         self.cache = updated
-        self.health={key:self.health[key] for key in updated}
         own = {key:dict(cost=summary['cost'], calls=summary['calls'],
                         priced=summary['priced'], gap=summary['coverage_gap'])
                for key,(_,summary) in updated.items()}

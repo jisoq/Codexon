@@ -5,6 +5,7 @@ import json
 import hashlib
 import os
 import sqlite3
+import stat
 import time
 from itertools import islice
 from bisect import bisect_right
@@ -26,6 +27,39 @@ FILE_READ_BUDGET = 16 * 1024 * 1024
 MAX_SOURCE_WORK = 32
 PREFIX_PRIORITY_BUDGET = 64 * 1024 * 1024
 REBUILD_BATCH = 256
+DISCOVERY_PATH_BUDGET = 8 * 1024 * 1024
+
+
+def _resolved_catalog_paths(rows):
+    """Resolve shared parents once per discovery, with bounded temporary state.
+
+    Only enumerated regular files use the shared result. Missing names, aliases
+    and reparse points keep the ordinary per-path resolver in the caller.
+    This map never replaces scan_file's source identity or prefix validation.
+    """
+    groups={};budget=DISCOVERY_PATH_BUDGET
+    for row in rows:
+        raw=row[0]
+        if not isinstance(raw,str) or not raw:continue
+        # Allow for Python containers, directory keys and resolved path strings.
+        weight=512+4*len(raw)
+        if weight>budget:break
+        budget-=weight
+        parent,name=os.path.split(raw)
+        groups.setdefault(parent,{})[name]=raw
+    resolved={}
+    for parent,wanted in groups.items():
+        if len(wanted)<8:continue
+        try:
+            directory=Path(parent).resolve()
+            with os.scandir(directory) as entries:
+                for entry in islice(entries,max(256,4*len(wanted))):
+                    raw=wanted.get(entry.name)
+                    if raw is None or not entry.is_file(follow_symlinks=False):continue
+                    if os.name=='nt' and entry.stat(follow_symlinks=False).st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT:continue
+                    resolved[raw]=str(directory/entry.name).removeprefix('\\\\?\\')
+        except (OSError,RuntimeError):pass
+    return resolved
 
 
 def _event_lines(source, digest, limit=16 * 1024 * 1024, state=None):
@@ -244,6 +278,9 @@ class UsageIndex:
                     cols = {r[1] for r in db.execute('pragma table_info(threads)')}
                     names = CodexNames(home, db)
                     self.names[str(home)] = names
+                    catalog=db.execute('SELECT rollout_path FROM threads')
+                    try:resolved=_resolved_catalog_paths(catalog)
+                    finally:catalog.close()
                     for row in db.execute('select ' + task_select(cols) + ' from threads'):
                         meta = dict(row)
                         key = (str(home), row['id'])
@@ -264,7 +301,9 @@ class UsageIndex:
                             self.metadata[key] = meta
                             self.db.execute('insert or replace into metadata values(?,?,?)',(*key,json.dumps(meta,ensure_ascii=False)))
                         if row['rollout_path']:
-                            paths[str(Path(row['rollout_path']).resolve()).removeprefix('\\\\?\\')] = (home, row['id'])
+                            source=resolved.get(row['rollout_path'])
+                            if source is None:source=str(Path(row['rollout_path']).resolve()).removeprefix('\\\\?\\')
+                            paths[source] = (home, row['id'])
             except (OSError, sqlite3.Error) as exc:
                 self.errors.append(f'{home.name} / 세션 목록: {exc}')
                 self.collection_fault['read_failed']=True

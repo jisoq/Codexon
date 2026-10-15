@@ -3,6 +3,7 @@ from pathlib import Path
 import shutil
 import sqlite3
 import time
+import uuid
 import zlib
 
 
@@ -71,7 +72,7 @@ def _quota_sql(value):
 
 class EventStore:
     def __init__(self, db, path, *, read_only=False):
-        self.db=db;self.path=Path(path)
+        self.db=db;self.path=Path(path);self.read_only=read_only;self.replay_epoch=None
         self.replay_table='event_rows'
         tables={r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         if 'event_store_state' in tables:
@@ -105,6 +106,73 @@ class EventStore:
             except BaseException:
                 db.rollback();raise
         self.pending=self.legacy and not read_only
+
+    def enable_replay_tokens(self):
+        """Opt into durable owner invalidation before publishing replay checkpoints.
+
+        Counters share the source transaction, including deletes and in-place
+        corrections. Extra columns preserve older readers of the event schema.
+        Until a checkpoint consumer enables this, ordinary indexing pays no
+        extra writes. Legacy migration must finish before checkpoints are used.
+        """
+        if self.read_only or self.legacy:return None
+        if self.db.in_transaction:raise RuntimeError('Replay tokens require a committed source state')
+        changes={
+            'replace':'''BEFORE INSERT ON event_records BEGIN
+                UPDATE event_sessions SET replay_revision=replay_revision+1 WHERE id IN
+                    (SELECT session_id FROM event_records
+                     WHERE (path_id=NEW.path_id AND pos=NEW.pos) OR seq=NEW.seq); END''',
+            'insert':'''AFTER INSERT ON event_records BEGIN
+                UPDATE event_sessions SET replay_revision=replay_revision+1 WHERE id=NEW.session_id; END''',
+            'update':'''AFTER UPDATE OF path_id,pos,session_id,ts,data,quota ON event_records
+                WHEN OLD.path_id IS NOT NEW.path_id OR OLD.pos IS NOT NEW.pos OR OLD.session_id IS NOT NEW.session_id
+                    OR OLD.ts IS NOT NEW.ts OR OLD.data IS NOT NEW.data OR OLD.quota IS NOT NEW.quota BEGIN
+                UPDATE event_sessions SET replay_revision=replay_revision+1 WHERE id IN (OLD.session_id,NEW.session_id); END''',
+            'delete':'''AFTER DELETE ON event_records BEGIN
+                UPDATE event_sessions SET replay_revision=replay_revision+1 WHERE id=OLD.session_id; END''',
+            'path':'''AFTER UPDATE OF id,path ON event_paths WHEN OLD.id IS NOT NEW.id OR OLD.path IS NOT NEW.path BEGIN
+                UPDATE event_sessions SET replay_revision=replay_revision+1 WHERE id IN
+                    (SELECT session_id FROM event_records WHERE path_id IN (OLD.id,NEW.id)); END''',
+            'path_delete':'''BEFORE DELETE ON event_paths BEGIN
+                UPDATE event_sessions SET replay_revision=replay_revision+1 WHERE id IN
+                    (SELECT session_id FROM event_records WHERE path_id=OLD.id); END''',
+            'owner':'''AFTER UPDATE OF id,home,tid ON event_sessions
+                WHEN OLD.id IS NOT NEW.id OR OLD.home IS NOT NEW.home OR OLD.tid IS NOT NEW.tid BEGIN
+                UPDATE event_sessions SET replay_revision=replay_revision+1 WHERE id=NEW.id; END''',
+        }
+        triggers={'event_replay_'+key:'CREATE TRIGGER event_replay_'+key+' '+sql for key,sql in changes.items()}
+        actual={name:sql for name,sql in self.db.execute("SELECT name,sql FROM sqlite_master WHERE type='trigger'")}
+        columns={row[1] for row in self.db.execute('PRAGMA table_info(event_store_state)')}
+        owners={row[1] for row in self.db.execute('PRAGMA table_info(event_sessions)')}
+        if ('replay_epoch' in columns and 'replay_revision' in owners
+                and all(actual.get(name)==sql for name,sql in triggers.items())):
+            epoch=self.db.execute('SELECT replay_epoch FROM event_store_state WHERE id=1').fetchone()[0]
+            if isinstance(epoch,str) and len(epoch)==32:
+                self.replay_epoch=epoch;return epoch
+        self.db.execute('BEGIN IMMEDIATE')
+        try:
+            if 'replay_epoch' not in columns:self.db.execute('ALTER TABLE event_store_state ADD COLUMN replay_epoch TEXT')
+            if 'replay_revision' not in owners:self.db.execute('ALTER TABLE event_sessions ADD COLUMN replay_revision INTEGER NOT NULL DEFAULT 0')
+            # A repaired/missing trigger could have missed source changes. Rotate
+            # the epoch instead of treating old checkpoints as current.
+            epoch=uuid.uuid4().hex
+            self.db.execute('UPDATE event_store_state SET replay_epoch=? WHERE id=1',(epoch,))
+            for name,sql in triggers.items():
+                self.db.execute('DROP TRIGGER IF EXISTS '+name);self.db.execute(sql)
+            self.db.commit()
+        except BaseException:
+            self.db.rollback();raise
+        self.replay_epoch=epoch
+        return epoch
+
+    def owner_replay_token(self, home, tid):
+        if self.replay_epoch is None:return None
+        row=self.db.execute('SELECT state.replay_epoch,owner.id,owner.replay_revision '
+            'FROM event_sessions owner CROSS JOIN event_store_state state '
+            'WHERE state.id=1 AND owner.home IS ? AND owner.tid IS ?',(home,tid)).fetchone()
+        if (row is None or not isinstance(row[0],str) or len(row[0])!=32
+                or type(row[2]) is not int or row[2]<0):return None
+        return tuple(row)
 
     def upper(self):
         if self.replay_table=='events':
