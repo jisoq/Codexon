@@ -112,9 +112,13 @@ def test_failed_migration_preserves_original_and_releases_collector_lock(default
 def _interrupt_index_copy(home,control):
     class Interrupted(sqlite3.Connection):
         def backup(self,target):
+            # Force destination spill with a small fixture, so termination
+            # interrupts actual file writes rather than an in-memory copy.
+            target.execute('PRAGMA cache_size=-64')
             def copied(status,remaining,total):
-                if remaining:
-                    control.send('copy transaction');control.recv()
+                if 0<remaining<=total//2:
+                    stage=index_location().with_name(index_location().name+'.migration-stage.tmp')
+                    control.send(('copy transaction',stage.stat().st_size));control.recv()
             return super().backup(target,pages=1,progress=copied)
     original=sqlite3.connect
     def connect(*args,**kwargs):return original(*args,**kwargs,factory=Interrupted)
@@ -144,7 +148,8 @@ def test_interrupted_default_migration_reuses_one_owned_slot(default_home):
         child.start();pipe.close()
         try:
             assert parent.poll(20),f'copy did not start; exit={child.exitcode}'
-            assert parent.recv()=='copy transaction'
+            phase,written=parent.recv()
+            assert phase=='copy transaction' and written>0
             child.kill();child.join(10)
             assert not child.is_alive() and child.exitcode!=0
             assert stage.exists() and receipt.exists() and not destination.exists()

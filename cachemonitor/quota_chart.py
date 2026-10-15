@@ -103,7 +103,7 @@ class QuotaHistory(Plot):
                  ((missing is None or missing[a]==missing[b]) and not self.excluded_between(a,b))))
 
     def excluded_between(self,a,b):
-        start,end=self.rows[a]['at'],self.rows[b]['at']
+        start,end=self.series['times'][a],self.series['times'][b]
         return any(item['start']<end and item['end']>start for item in self.series.get('exclusions',[]))
 
     def point(self,index,key):
@@ -237,6 +237,13 @@ class QuotaHistory(Plot):
         left,right=box.left(),box.right();time_scale=self.time_scale;gap_width=self.gap_width
         xs=[min(right,left+active[i]*time_scale+bisect_right(gaps,i)*gap_width) for i in indices]
         rows=self.rows;breaks=self.series['breaks'];completed=self.series['completed_costs']
+        prepared=self.series.get('_paint_rows',{})
+        def paint_row(index):
+            value=prepared.get(index)
+            return rows[index] if value is None else value
+        def previous_remaining(index):
+            value=prepared.get(index)
+            return rows[index-1].get('remaining') if value is None else value['_previous_remaining']
         for key,color,style in self.curves():
             area=self.row_boxes[key];low,high=self.bounds(key)
             scale=area.height()/(high-low);bottom=area.bottom()
@@ -245,7 +252,7 @@ class QuotaHistory(Plot):
             missing=self.series['missing'].get(key)
             p.setPen(QPen(QColor(palette[color]),2,style))
             for index,x in zip(indices,xs):
-                value=completed[index] if key=='completed_cost' else rows[index].get(key)
+                value=completed[index] if key=='completed_cost' else paint_row(index).get(key)
                 y=bottom-(value-low)*scale if value is not None else None
                 if y is not None and previous is not None and self.connects(previous_index,index,key):
                     # Completed intervals remain horizontal, with no invented
@@ -253,15 +260,15 @@ class QuotaHistory(Plot):
                     if previous_x!=x:
                         start,end=previous_x,x
                         if key=='completed_cost':
-                            if not previous_index or rows[previous_index].get('remaining')!=rows[previous_index-1].get('remaining'):start+=1.5
-                            if rows[index].get('remaining')!=rows[previous_index].get('remaining'):end-=1.5
+                            if not previous_index or paint_row(previous_index).get('remaining')!=previous_remaining(previous_index):start+=1.5
+                            if paint_row(index).get('remaining')!=paint_row(previous_index).get('remaining'):end-=1.5
                         if end>start:move(start,previous);line(end,previous)
                     if key!='completed_cost' and previous!=y:move(x,previous);line(x,y)
                 previous,previous_x,previous_index=y,x,index
                 if key=='completed_cost' and y is not None and index+1<len(rows):
                     if (completed[index+1] is None and breaks[index]==breaks[index+1]
                             and missing[index+1]==missing[index]+1 and not self.excluded_between(index,index+1)):
-                        start=x+1.5 if not index or rows[index].get('remaining')!=rows[index-1].get('remaining') else x
+                        start=x+1.5 if not index or paint_row(index).get('remaining')!=previous_remaining(index) else x
                         end=self.x_at(index+1)-1.5
                         if end>start:move(start,y);line(end,y)
             p.setBrush(Qt.NoBrush);p.drawPath(path)
@@ -278,7 +285,7 @@ class QuotaHistory(Plot):
                     p.restore()
         self._cache_hits=[(QRectF(box),{},'')]
         for pos,index in enumerate(indices):
-            if rows[index]['reset_kind']:
+            if paint_row(index)['reset_kind']:
                 x=xs[pos];p.setPen(QPen(QColor(palette['muted']),1,Qt.DotLine))
                 for area in boxes:p.drawLine(QPointF(x,area.top()),QPointF(x,area.bottom()))
         for rect,reset in self.reset_hits:
@@ -310,6 +317,7 @@ class QuotaHistory(Plot):
 
     def draw_model_share(self,p,palette):
         from PySide6.QtGui import QBrush
+        from .quota_share import paint_spans,share_bin
         share=self.series.get('model_share')
         if not share:return
         area=self.strip_box
@@ -328,8 +336,8 @@ class QuotaHistory(Plot):
             color=QColor(theme.color(share_color_key(name)));pattern=theme.model_pattern(name[0])
             styles.append((name,color,QBrush(QColor(palette['surface']),pattern) if pattern else None))
         last_end=None;last_right=None
-        for start,end,bucket in share['spans']:
-            item=share['bins'][bucket]
+        for start,end,bucket in paint_spans(share):
+            item=share_bin(share,bucket)
             x=last_right if start==last_end else self.x_at_time(start)
             right=self.x_at_time(end);last_end,last_right=end,right
             width=right-x

@@ -22,6 +22,14 @@ def wait_until(condition, timeout=10, app=None):
     assert condition()
 
 
+def public_series(series):
+    expanded={k:v for k,v in series.items() if not k.startswith('_')}
+    share=expanded['model_share']
+    expanded['model_share']={k:v for k,v in share.items() if k!='bucket_ids' and not k.startswith('_')}
+    if 'bucket_ids' in share:expanded['model_share']['bins']=dict(zip(share['bucket_ids'],share['bins']))
+    return expanded
+
+
 def controlled_process(connection,path,home,entered,release):
     try:
         while True:
@@ -84,6 +92,32 @@ def incomplete_process(connection,path,home,entered,release,crash=False):
         for payload in payloads:connection.send_bytes(payload)
     except (EOFError,BrokenPipeError,OSError):pass
     finally:connection.close()
+
+
+def scalar_chart_process(connection,path,home):
+    from cachemonitor.quota_transport import send_result
+    try:
+        request=connection.recv()
+        send_result(connection,{key:request.get(key) for key in ('kind','id','key')} |
+                    dict(value={name:[i/10 for i in range(100000)] for name in ('times','values','costs')}))
+        connection.recv()
+    except (EOFError,BrokenPipeError,OSError):pass
+    finally:connection.close()
+
+
+def test_chart_arrays_finish_while_the_gui_event_loop_is_active():
+    app=QApplication.instance() or QApplication([])
+    received=[];ticks=[];timer=QTimer()
+    timer.timeout.connect(lambda:ticks.append(True));timer.start(10)
+    worker=QuotaWorker(process_target=scalar_chart_process)
+    worker.result.connect(received.append)
+    try:
+        worker.request('chart',key='complete-array')
+        wait_until(lambda:bool(received),timeout=10,app=app)
+        assert ticks and not received[0].get('error')
+        expected=[i/10 for i in range(100000)]
+        assert received[0]['value']==dict(times=expected,values=expected,costs=expected)
+    finally:timer.stop();worker.close()
 
 
 def test_cpu_bound_child_keeps_gui_timers_running_and_coalesces_latest_query():
@@ -200,7 +234,7 @@ def test_real_child_prepares_compact_report_and_reuses_raw_evidence_for_preview(
         from cachemonitor.quota_view import prepare_quota_view
         series=whole['value']['series']
         assert isinstance(series['rows'],_PackedRows)
-        assert {k:v for k,v in series.items() if not k.startswith('_')}==prepare_quota_view(source)['overall']
+        assert public_series(series)==prepare_quota_view(source)['overall']
     finally:worker.close()
 
 
@@ -273,7 +307,7 @@ def test_chart_delivery_contains_only_selection_and_reuses_unchanged_digest():
     assert len(whole['series']['rows'])==7
     from cachemonitor.quota_view import prepare_quota_view
     expected=prepare_quota_view(source)['overall']
-    assert {k:v for k,v in whole['series'].items() if not k.startswith('_')}==expected
+    assert public_series(whole['series'])==expected
     assert engine.execute(dict(kind='chart',id=5,key='stale',revision='expired',selection=100))['stale']
 
 

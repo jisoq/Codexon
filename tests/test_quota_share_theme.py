@@ -59,6 +59,42 @@ def test_model_shares_keep_call_time_across_observation_bucket_boundary():
     assert share_at(series,299)['shares']=={('a','Standard'):100}
     assert share_at(series,301)['shares']=={('b','Standard'):100}
 
+
+def test_identical_share_paint_keeps_cost_bins_and_does_not_bridge_gaps():
+    from copy import deepcopy
+    from cachemonitor.quota_share import paint_spans
+    a=('a','Standard');b=('b','Fast')
+    share=dict(bins={
+        0:dict(state='cost',shares={a:100},total=1),
+        1:dict(state='cost',shares={a:100},total=2),
+        2:dict(state='cost',shares={a:50,b:50},total=3),
+        3:dict(state='zero',shares={},total=0),
+        5:dict(state='zero',shares={},total=0),
+        6:dict(state='unknown',shares={},total=4),
+        7:dict(state='unknown',shares={},total=5)},
+        spans=[(i*300,(i+1)*300,i) for i in (0,1,2,3,5,6,7)])
+    before=deepcopy(share)
+    assert list(paint_spans(share))==[(0,600,0),(600,900,2),(900,1200,3),(1500,1800,5),(1800,2400,6)]
+    assert share==before
+    assert share_at({'model_share':share},100)['total']==1
+    assert share_at({'model_share':share},400)['total']==2
+
+
+def test_packed_share_paint_matches_full_bins():
+    app=QApplication.instance() or QApplication([])
+    series,intervals=series_fixture()
+    chart=QuotaHistory();chart.money=True;chart.set_series(series)
+    host=mount(chart,520,720)
+    try:
+        render_plot(host,chart);before=chart._picture.copy()
+        packed={**series,'model_share':prepare_model_share(series,intervals,packed=True)}
+        chart.set_series(packed);render_plot(host,chart)
+        assert chart._picture==before
+        for at in (1440,1680,1860):assert share_at(packed,at)==share_at(series,at)
+        assert not host.qml_errors
+    finally:dispose(host)
+
+
 @pytest.mark.parametrize('surface,ink,accent',SEEDS)
 def test_accent_bounded_palette_and_shared_roles(surface,ink,accent):
     appearance=Appearance(dark=surface in ('#212121','#101c2c'),surface=surface,ink=ink,accent=accent)

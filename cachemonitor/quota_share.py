@@ -6,7 +6,7 @@ from .pricing import ALIASES, request_tier
 
 BUCKET_SECONDS=300
 
-def prepare_model_share(series, intervals):
+def prepare_model_share(series, intervals, *, packed=False):
     rows=series['rows'];times=series['times']
     if not rows:return dict(bins={},spans=[],models=[])
     additions=[];unknown=set();names={}
@@ -62,10 +62,48 @@ def prepare_model_share(series, intervals):
         item['total']=sum(item['costs'].values())
         item['state']='unknown' if item['unknown'] else 'cost' if item['total']>0 else 'zero'
         item['shares']={name:cost/item['total']*100 for name,cost in item['costs'].items() if cost>0} if item['state']=='cost' else {}
-    return dict(bins=bins,spans=spans,models=sorted(names,key=lambda item:(item[0],{'Standard':0,'Fast':1}.get(item[1],2))))
+    result=dict(bins=bins,spans=spans,models=sorted(names,key=lambda item:(item[0],{'Standard':0,'Fast':1}.get(item[1],2))))
+    if packed:
+        import sys
+        from .quota_cycles import _PackedRows
+        # Cache identical paint only when its exact coalesced representation fits
+        # a small budget. Highly variable history keeps the streaming fallback.
+        prepared=[];weight=64
+        for span in paint_spans(result):
+            weight+=sys.getsizeof(span)+sum(sys.getsizeof(value) for value in span)+16
+            if len(prepared)>=8192 or weight>2*1024*1024:break
+            prepared.append(span)
+        else:result['_paint_spans']=prepared
+        keys=sorted(bins)
+        result.update(bucket_ids=keys,bins=_PackedRows(bins[key] for key in keys),spans=_PackedRows(spans))
+    return result
+
+
+def share_bin(share, bucket):
+    bins=share.get('bins',{})
+    if isinstance(bins,dict):return bins.get(bucket)
+    keys=share['bucket_ids'];index=bisect_left(keys,bucket)
+    return bins[index] if index<len(keys) and keys[index]==bucket else None
 
 def share_at(series, at):
-    return series.get('model_share',{}).get('bins',{}).get(math.floor(at/BUCKET_SECONDS))
+    return share_bin(series.get('model_share',{}),math.floor(at/BUCKET_SECONDS))
+
+
+def paint_spans(share):
+    """Merge contiguous identical paint, retaining every five-minute lookup bin."""
+    if '_paint_spans' in share:
+        yield from share['_paint_spans']
+        return
+    pending=previous=None
+    for start,end,bucket in share['spans']:
+        item=share_bin(share,bucket)
+        style=(item['state'],item.get('shares') if item['state'] not in ('unknown','zero') else None)
+        if pending is not None and pending[1]==start and style==previous:
+            pending=(pending[0],end,pending[2])
+        else:
+            if pending is not None:yield pending
+            pending=(start,end,bucket);previous=style
+    if pending is not None:yield pending
 
 
 def share_label(identity):

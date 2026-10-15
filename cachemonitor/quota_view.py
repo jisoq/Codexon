@@ -387,7 +387,7 @@ def prepare_overall(periods, exclusions, *, packed=False):
             offset_cost+=period['cost'] or 0;offset_delta+=period['delta']
     overall=_PackedRows(rows()) if packed else list(rows())
     series=prepare_series(overall)
-    series['model_share']=prepare_model_share(series,[interval for period in periods for interval in period['cost_intervals']])
+    series['model_share']=prepare_model_share(series,[interval for period in periods for interval in period['cost_intervals']],packed=packed)
     series.update(active_only=True,cumulative=True,resets=resets,exclusions=exclusions)
     return series
 

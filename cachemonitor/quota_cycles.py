@@ -108,7 +108,8 @@ class _PackedRows:
         self._timestamped=timestamps;self.count=0;self._cache={}
         batch=[];weight=0
         for row in rows:
-            size=512+sum(len(v)*4 for v in row.values() if isinstance(v,str))
+            values=row.values() if isinstance(row,dict) else row
+            size=512+sum(len(v)*4 for v in values if isinstance(v,str))
             if batch and (len(batch)>=512 or weight+size>2*1024*1024):
                 self._pack(batch)
                 batch=[];weight=0

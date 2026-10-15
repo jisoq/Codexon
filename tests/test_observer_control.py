@@ -169,3 +169,55 @@ def test_apply_requires_recent_test_for_same_service(tmp_path,monkeypatch,instan
     with pytest.raises(RuntimeError):control.enable()
     assert control.config_path.read_text()=='model = "safe"\n'
     assert registry['value']=='previous startup command'
+
+
+def _interrupted_atomic_write(path,control):
+    import os
+    from pathlib import Path
+    from cachemonitor.observer_control import atomic_write
+    original=Path.write_bytes
+    def write(file,data):
+        if '.codexon-atomic-' not in file.name:return original(file,data)
+        with file.open('wb') as target:
+            written=target.write(data[:len(data)//2]);target.flush();os.fsync(target.fileno())
+            control.send((str(file),written));control.recv()
+            target.write(data[len(data)//2:])
+    Path.write_bytes=write
+    atomic_write(path,b'new configuration'*8192)
+
+
+@pytest.mark.integration
+def test_atomic_write_recovers_only_dead_owned_partial_files(tmp_path):
+    import multiprocessing as mp
+    from pathlib import Path
+    from cachemonitor.observer_control import atomic_write
+    path=tmp_path/'config.toml';path.write_bytes(b'original configuration')
+    unknown=tmp_path/('config.toml.'+'a'*32+'.tmp');unknown.write_bytes(b'unknown old owner')
+    context=mp.get_context('spawn')
+    for _ in range(3):
+        parent,pipe=context.Pipe()
+        child=context.Process(target=_interrupted_atomic_write,args=(str(path),pipe))
+        child.start();pipe.close()
+        try:
+            assert parent.poll(15),child.exitcode
+            temporary,written=parent.recv();temporary=Path(temporary)
+            assert written>0 and temporary.stat().st_size==written
+            assert len(list(tmp_path.glob('*.codexon-atomic-*.tmp')))==1
+            # A concurrent writer must not delete the paused writer's file.
+            atomic_write(tmp_path/'other.json',b'complete')
+            assert temporary.exists()
+            child.kill();child.join(10)
+            assert not child.is_alive() and child.exitcode!=0
+            assert path.read_bytes()==b'original configuration'
+        finally:
+            if child.is_alive():child.kill()
+            child.join(10);parent.close()
+    resumed=context.Process(target=atomic_write,args=(str(path),b'completed configuration'))
+    resumed.start();resumed.join(15)
+    try:
+        assert not resumed.is_alive() and resumed.exitcode==0
+        assert path.read_bytes()==b'completed configuration'
+        assert not list(tmp_path.glob('*.codexon-atomic-*.tmp'))
+        assert unknown.read_bytes()==b'unknown old owner'
+    finally:
+        if resumed.is_alive():resumed.kill();resumed.join(10)

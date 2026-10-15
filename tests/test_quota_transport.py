@@ -82,6 +82,25 @@ def test_list_and_dict_cycles_keep_identity_and_dictionary_order():
     assert list(actual['mapping']) == list(mapping)
 
 
+def test_packed_model_shares_keep_every_bin_and_span_across_transfer():
+    from cachemonitor.quota_view import prepare_series
+    from cachemonitor.quota_share import prepare_model_share,share_at,paint_spans
+    rows=[dict(at=i*300,remaining=90,cycle_cost=i,cycle_value=1,
+               cycle_start=0,connect=bool(i),reset_kind=None,label=str(i)) for i in range(1100)]
+    intervals=[dict(start=0,end=rows[-1]['at'],cost_rows=[
+        dict(ts=i*300-1,model='a' if i%2 else 'b',service_tier='Standard',cost=1)
+        for i in range(1,len(rows))])]
+    series=prepare_series(rows)
+    plain=prepare_model_share(series,intervals)
+    actual,_=roundtrip(prepare_model_share(series,intervals,packed=True))
+    assert actual['models']==plain['models']
+    assert list(actual['spans'])==plain['spans']
+    assert dict(zip(actual['bucket_ids'],actual['bins']))==plain['bins']
+    assert list(paint_spans(actual))==list(paint_spans(plain))
+    for at in (-1,299,300,511*300,512*300,rows[-1]['at']+300):
+        assert share_at({'model_share':actual},at)==share_at({'model_share':plain},at)
+
+
 def test_many_nested_small_containers_do_not_form_one_large_root_frame():
     source = {'periods': [{'rows': [{'at': i * 127 + j, 'remaining': 50.5,
                                    'label': 'observed row'} for j in range(127)]}

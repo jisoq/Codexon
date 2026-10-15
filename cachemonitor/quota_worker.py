@@ -5,6 +5,7 @@ import hashlib
 import pickle
 from pathlib import Path
 import sqlite3
+import sys
 import threading
 from uuid import uuid4
 
@@ -15,6 +16,26 @@ from .quota_transport import TransferCancelled, receive_result, send_result
 def compact_summary(summary):
     """Keep display fields, without duplicating the underlying call graph."""
     return {**summary, 'intervals': []}
+
+
+def prepare_paint_rows(series):
+    """Keep a bounded scalar projection for painting, beside exact packed rows."""
+    from heapq import merge
+    from itertools import groupby
+    from .quota_cycles import _PackedRows
+    if '_paint_rows' in series or not isinstance(series['rows'],_PackedRows):return
+    fields=('remaining','cycle_value','cycle_cost','reset_kind')
+    selected={};weight=0
+    for index,_ in groupby(merge(*series['samples'].values())):
+        if len(selected)>=8192:break
+        original=series['rows'][index]
+        row={key:original[key] for key in fields if key in original}
+        row['_previous_remaining']=series['rows'][index-1].get('remaining') if index else None
+        if any(type(value) not in (int,float,str,bool,type(None)) for value in row.values()):continue
+        size=sys.getsizeof(row)+sys.getsizeof(index)+sum(sys.getsizeof(value) for value in row.values())+96
+        if weight+size>4*1024*1024:break
+        selected[index]=row;weight+=size
+    series['_paint_rows']=selected
 
 
 def chart_result(view, selection=None, known_digest=None):
@@ -43,6 +64,7 @@ def chart_result(view, selection=None, known_digest=None):
             # Rebuilt charts can share equal objects differently. Their checked
             # input signature remains stable across expansion and eviction.
             digest=period['_series_signature'].hex()
+    prepare_paint_rows(source)
     if digest is None:digest=source.get('_content_digest')
     if digest is None:
         digest = hashlib.sha256(pickle.dumps(source, protocol=5)).hexdigest()

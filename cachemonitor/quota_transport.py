@@ -14,11 +14,13 @@ from .quota_cycles import _PackedRows
 
 MAGIC = 'codexon-quota-frames-1'
 MAX_FRAME_BYTES = 256 * 1024
-TARGET_FRAME_BYTES = 64 * 1024
+TARGET_FRAME_BYTES = 192 * 1024
 INLINE_BYTES = 8 * 1024
 INLINE_ITEMS = 64
 BATCH_ITEMS = 128
+SCALAR_BATCH_ITEMS = 24576
 BATCH_CONTAINERS = 64
+DECODE_YIELD_SECONDS = .004
 _MISSING = object()
 
 
@@ -142,9 +144,10 @@ def frames(value):
     held = _MISSING
     while active is not None or pickler.pending:
         records = []
-        remaining = BATCH_ITEMS
+        remaining = SCALAR_BATCH_ITEMS
+        containers_remaining = BATCH_ITEMS
         weight = 64
-        while remaining and len(records) < BATCH_CONTAINERS:
+        while remaining and containers_remaining and len(records) < BATCH_CONTAINERS:
             if active is None:
                 if not pickler.pending:
                     break
@@ -152,7 +155,7 @@ def frames(value):
             reference = active['reference']
             start = active['offset']
             items = []
-            while remaining:
+            while remaining and containers_remaining:
                 try:
                     item = held if held is not _MISSING else next(active['entries'])
                 except StopIteration:
@@ -169,6 +172,11 @@ def frames(value):
                 items.append(item)
                 weight += item_weight
                 remaining -= 1
+                # Numeric chart arrays need no new tracked containers. Keep
+                # their frames useful while retaining the old allocation bound
+                # for rows, nested values and forward references.
+                if any(type(part) not in (str,bytes,int,float,bool,type(None)) for part in values):
+                    containers_remaining -= 1
                 active['offset'] += 1
             if items:
                 records.append((reference[1], start, tuple(items)))
@@ -210,11 +218,12 @@ class _GraphUnpickler(pickle.Unpickler):
 
 
 def receive_result(connection, cancelled=lambda: False, *, statistics=None):
-    """Publish only complete graphs, yielding the GIL after every decoded frame."""
+    """Publish complete graphs, with bounded frames and a short decode time slice."""
     stream = BytesIO()
     unpickler = _GraphUnpickler(stream)
     root = None
     started = False
+    yielded = time.perf_counter()
     try:
         while True:
             while not connection.poll(.02):
@@ -278,6 +287,13 @@ def receive_result(connection, cancelled=lambda: False, *, statistics=None):
                 statistics.setdefault('frame_bytes', []).append(len(payload))
             if complete:
                 return root
-            time.sleep(0)
+            # Yielding on every tiny scalar frame lets an active GUI repeatedly
+            # take a full interpreter time slice between a few decoded numbers.
+            # Cancellation still runs at every frame boundary; only scheduling
+            # yields are due after four milliseconds and occur at the next
+            # bounded frame boundary.
+            if time.perf_counter()-yielded >= DECODE_YIELD_SECONDS:
+                time.sleep(0)
+                yielded = time.perf_counter()
     except (pickle.UnpicklingError, ValueError, TypeError, IndexError, KeyError) as error:
         raise TransferError('Cannot decode quota display data: ' + str(error)) from error

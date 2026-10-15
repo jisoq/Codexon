@@ -23,6 +23,46 @@ from .observer_state import ProcessLock, read_json
 
 URL = 'http://127.0.0.1:8768'
 STARTUP_NAME = 'CacheMonitorModelProxy'
+_atomic_cleanup_seen = {}
+_atomic_cleanup_lock = threading.Lock()
+
+
+def _cleanup_atomic_files(directory):
+    """One bounded directory scan per process; only dead, named owners qualify."""
+    try:
+        directory=directory.absolute()
+        identity=hashlib.sha256(os.fsencode(directory)).digest()
+        with _atomic_cleanup_lock:
+            if identity in _atomic_cleanup_seen:return
+            _atomic_cleanup_seen[identity]=True
+            while len(_atomic_cleanup_seen)>64:_atomic_cleanup_seen.pop(next(iter(_atomic_cleanup_seen)))
+        if any(parent.is_symlink() or parent.is_junction() for parent in (directory,*directory.parents)):return
+        owners={}
+        with os.scandir(directory) as entries:
+            for number,entry in enumerate(entries):
+                if number>=4096:break
+                prefix,marker,suffix=entry.name.rpartition('.codexon-atomic-')
+                if not marker or not prefix or not suffix.endswith('.tmp'):continue
+                parts=suffix[:-4].split('-')
+                if (len(parts)!=2 or not parts[0].isdigit() or not 1<=len(parts[0])<=10
+                        or len(parts[1])!=32 or any(c not in '0123456789abcdef' for c in parts[1])):continue
+                pid=int(parts[0])
+                if not 1<=pid<=0xffffffff or str(pid)!=parts[0] or pid==os.getpid():continue
+                try:
+                    if not entry.is_file(follow_symlinks=False):continue
+                    if getattr(entry.stat(follow_symlinks=False),'st_file_attributes',0)&0x400:continue
+                    if pid not in owners:
+                        if len(owners)>=64:break
+                        owners[pid]=True
+                        if os.name=='nt':
+                            from .proxy_identity import process_identity
+                            owners[pid]=process_identity(pid) is not None
+                        else:
+                            try:os.kill(pid,0);owners[pid]=True
+                            except ProcessLookupError:owners[pid]=False
+                    if not owners[pid]:Path(entry.path).unlink(missing_ok=True)
+                except (OSError,ValueError):pass
+    except OSError:pass
 
 
 class LocalHealthOnly(urllib.request.HTTPRedirectHandler):
@@ -47,7 +87,8 @@ def startup_value(value=...):
 def atomic_write(path, data):
     path=Path(path)
     path.parent.mkdir(parents=True,exist_ok=True)
-    temporary=path.with_name(path.name+'.'+uuid.uuid4().hex+'.tmp')
+    _cleanup_atomic_files(path.parent)
+    temporary=path.with_name(path.name+'.codexon-atomic-'+str(os.getpid())+'-'+uuid.uuid4().hex+'.tmp')
     try:
         temporary.write_bytes(data)
         for attempt in range(6):

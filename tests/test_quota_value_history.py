@@ -55,9 +55,9 @@ def test_changed_period_reuses_other_graphs_and_matches_uncached_values(monkeypa
     from cachemonitor.quota_worker import chart_result
     from cachemonitor import quota_share
     shares=[];prepare_share=quota_share.prepare_model_share
-    def prepared(series,intervals):
+    def prepared(series,intervals,**options):
         shares.append(True)
-        return prepare_share(series,intervals)
+        return prepare_share(series,intervals,**options)
     monkeypatch.setattr(quota_share,'prepare_model_share',prepared)
     def view(report,previous=None):
         if packed:report={**report,'history':_PackedHistory(sorted(report['history'],key=lambda r:r['at']))}
@@ -81,7 +81,8 @@ def test_changed_period_reuses_other_graphs_and_matches_uncached_values(monkeypa
     assert materialized(after)==full['periods']
     assert after['lifetime']==full['lifetime']
     assert prepare_overall(after['_overall_parts'],after['_exclusions'])==full['overall']
-    assert prepare_overall(after['_overall_parts'],after['_exclusions'],packed=True)==full['overall']
+    from test_quota_worker import public_series
+    assert public_series(prepare_overall(after['_overall_parts'],after['_exclusions'],packed=True))==full['overall']
     digests={p['start']:chart_result(after,p['start'])['digest'] for p in after['periods']}
     assert len(after['_series_cache'])<=2
     for start,digest in digests.items():

@@ -55,5 +55,20 @@ def test_observations_keep_exact_selection_and_bounded_rendering(tmp_path,count)
             assert result['frame_p95_ms']<100
             assert result['hover_p95_ms']<50
             assert result['new_series_frame_max_ms']<200,result
+        else:
+            from cachemonitor.quota_cycles import _PackedRows
+            from cachemonitor.quota_worker import prepare_paint_rows
+            before=chart._picture.copy()
+            packed={**series,'rows':_PackedRows(rows)}
+            prepare_paint_rows(packed)
+            assert packed['_paint_rows']
+            for index,row in packed['_paint_rows'].items():
+                assert all(row[key]==rows[index][key] for key in ('remaining','cycle_value','cycle_cost','reset_kind'))
+                assert row['_previous_remaining']==(rows[index-1]['remaining'] if index else None)
+            chart.set_series(packed);chart._cache_key=None
+            render_plot(host,chart)
+            assert chart._picture==before
+            chart.activate_at(chart.x_at(spike),chart.box.center().y())
+            assert chart.cursor==spike and chart.rows[spike]==rows[spike]
         assert not host.qml_errors
     finally:dispose(host)
