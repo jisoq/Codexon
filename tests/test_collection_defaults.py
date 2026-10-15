@@ -133,6 +133,7 @@ def test_interrupted_default_migration_reuses_one_owned_slot(default_home):
         old.poll(10002)
         old.db.execute('INSERT INTO metadata VALUES(?,?,?)',('retained','copy-proof',payload))
         old.db.commit()
+        original_events=old.db.execute('SELECT * FROM events ORDER BY path,pos').fetchall()
     finally:old.close()
     source=legacy_index_location();original=hashlib.sha256(source.read_bytes()).digest()
     destination=index_location();stage=destination.with_name(destination.name+'.migration-stage.tmp')
@@ -155,6 +156,7 @@ def test_interrupted_default_migration_reuses_one_owned_slot(default_home):
     resumed=CollectorService([default_home])
     try:
         assert resumed.poll(10003)['sessions']
+        assert resumed.index.db.execute('SELECT * FROM events ORDER BY path,pos').fetchall()==original_events
         assert resumed.index.db.execute("SELECT data FROM metadata WHERE home='retained' AND tid='copy-proof'").fetchone()[0]==payload
         assert resumed.index.db.execute('PRAGMA integrity_check').fetchone()[0]=='ok'
         assert not stage.exists() and not receipt.exists()
