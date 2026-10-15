@@ -8,6 +8,9 @@ def aliases(row):
                 cache_degradation=bool(row.get('cache_incident_id')))
 
 
+_ALIAS_KEYS=frozenset(aliases({}))
+
+
 def compact_record(row):
     """Retain differing prices and flags; remove only exact duplicate values."""
     redundant={key for key,value in aliases(row).items()
@@ -15,12 +18,25 @@ def compact_record(row):
     return {key:value for key,value in row.items() if key not in redundant} if redundant else row
 
 
-def record_items(row):
-    yield from row.items()
-    if 'session_ordinal' in row and 'cost' in row and 'key' in row:
+def record_items(row,exclude=None):
+    if exclude:
+        for key in row.keys()-exclude:yield key,row[key]
+    else:yield from row.items()
+    if ('session_ordinal' in row and 'cost' in row and 'key' in row
+            and (not exclude or not _ALIAS_KEYS<=exclude)):
         for key,value in aliases(row).items():
-            if key not in row:
+            if key not in row and (not exclude or key not in exclude):
                 yield key,value
+
+
+def available_fields(rows):
+    """Find populated filter fields without revisiting already known columns."""
+    available=set()
+    for row in rows:
+        for key,value in record_items(row,available):
+            if value not in (None,'','미확인','확인 불가') and not isinstance(value,(dict,list)):
+                available.add(key)
+    return sorted(available)
 
 
 def public_record(row):

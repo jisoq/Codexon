@@ -53,8 +53,13 @@ def test_changed_period_reuses_other_graphs_and_matches_uncached_values(monkeypa
     from cachemonitor.quota_cycles import _PackedHistory
     from cachemonitor.quota_view import prepare_quota_view, prepare_overall, period_series
     from cachemonitor.quota_worker import chart_result
-    from cachemonitor import quota_share
+    from cachemonitor import quota_share, quota_cycles
     shares=[];prepare_share=quota_share.prepare_model_share
+    details=[];prepare_details=quota_cycles._quota_value_rows
+    def detail_rows(group,*args):
+        details.append(group['start'])
+        return prepare_details(group,*args)
+    monkeypatch.setattr(quota_cycles,'_quota_value_rows',detail_rows)
     def prepared(series,intervals,**options):
         shares.append(True)
         return prepare_share(series,intervals,**options)
@@ -71,6 +76,9 @@ def test_changed_period_reuses_other_graphs_and_matches_uncached_values(monkeypa
     report=sample_report()
     before=view(report)
     assert not shares  # Unselected charts do not calculate display-only shares.
+    assert not details  # Opening summaries does not derive every historical chart.
+    chart_result(before,before['periods'][0]['start'])
+    assert details==[before['periods'][0]['start']]
     changed=deepcopy(report)
     changed['cycles'][-1]=interval([(250,100),(280,95),(310,90)],[(265,3),(295,7)])
     changed=report_for(changed['cycles'])

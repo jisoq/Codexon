@@ -3,7 +3,6 @@ from datetime import datetime
 import json
 import math
 import pickle
-import zlib
 import hashlib
 import sys
 from bisect import bisect_left, bisect_right
@@ -262,15 +261,24 @@ def _completed_percent_costs_python(rows):
 
 def prepare_series(rows):
     """Bound drawing size while retaining extrema and exact selectable records."""
+    excluded=boundaries=False
+    for row in rows:
+        boundaries|=bool(row.get('user_exclusion_end'))
+        if row.get('user_excluded'):
+            excluded=boundaries=True
+            break
     native=get_native()
     if native is not None:
         prepared=rows
-        if any(r.get('user_excluded') for r in rows) and not all('completed_cost' in r for r in rows):
+        if excluded and not all('completed_cost' in r for r in rows):
             amounts=completed_percent_costs(rows)
             prepared=[{**r,'completed_cost':r.get('completed_cost',amount)} for r,amount in zip(rows,amounts)]
-        try:return _preserve_exclusion_boundaries(dict(native.quota_series(prepared),rows=rows))
+        try:
+            series=dict(native.quota_series(prepared),rows=rows)
+            return _preserve_exclusion_boundaries(series) if boundaries else series
         except OverflowError:pass  # Preserve arbitrary-size integer accounting.
-    return _preserve_exclusion_boundaries(_prepare_series_python(rows))
+    series=_prepare_series_python(rows)
+    return _preserve_exclusion_boundaries(series) if boundaries else series
 
 
 def _preserve_exclusion_boundaries(series):
@@ -351,10 +359,22 @@ def _prepare_series_python(rows):
 
 def _period_rows(period):
     if period['series'] is not None:return period['series']['rows']
-    # Payloads are produced in this process, never loaded from external input.
-    rows=pickle.loads(zlib.decompress(period['_series_payload']))
+    from .quota_cycles import _quota_value_rows
+    detail=period['_series_detail']
+    group=dict(rows=list(detail['source']),start=detail['start'],partial=detail['partial'])
+    rows=_completed_period_rows(_quota_value_rows(group,{'cost':detail['cost']},
+        detail['intervals'],detail['display_ranges'],detail['exclusions'],detail['account'],detail['forward']))
     for row in rows:row['label']=_history_label(row)
     return rows
+
+
+def _completed_period_rows(rows):
+    completed=completed_percent_costs(rows)
+    for row,amount in zip(rows,completed):row['completed_cost']=amount
+    own=[row for row in rows if row['local_observed']]
+    for index,row in enumerate(own):
+        if not index or row['local_range']!=own[index-1]['local_range']:row['connect']=False
+    return own
 
 
 def _period_series(rows, intervals, exclusions):
@@ -366,7 +386,7 @@ def _period_series(rows, intervals, exclusions):
 
 
 def period_series(period):
-    """Prepare one chart from losslessly packed rows when it is requested."""
+    """Prepare exact detail and model shares only for the requested chart."""
     if period['series'] is not None:return period['series']
     return _period_series(_period_rows(period),period['_series_intervals'],period['_series_exclusions'])
 
@@ -418,25 +438,22 @@ def prepare_quota_view(report, previous=None, *, deferred=False, _requests=None)
         prior=prior_periods.get(period['start'])
         if unchanged:
             prior=prior or period
-            period.update({k:prior[k] for k in ('series','_series_payload','_series_intervals',
+            period.update({k:prior[k] for k in ('series','_series_detail','_series_intervals',
                 '_series_exclusions','_series_signature','_has_history') if k in prior})
             return
-        completed=completed_percent_costs(rows)
-        for row,amount in zip(rows,completed):row['completed_cost']=amount
-        own=[row for row in rows if row['local_observed']]
-        for index,row in enumerate(own):
-            if not index or row['local_range']!=own[index-1]['local_range']:row['connect']=False
+        if isinstance(rows,dict):
+            period.update(series=None,_series_detail=rows,
+                _series_intervals=period['cost_intervals'],
+                _series_exclusions=[r for r in exclusions if r['start']<period['end'] and r['end']>period['start']],
+                _series_signature=period_cache[period['start']][0])
+            return
+        own=_completed_period_rows(rows)
         own_exclusions=[r for r in exclusions if r['start']<period['end'] and r['end']>period['start']]
-        if deferred:
-            period.update(series=None,_series_payload=zlib.compress(pickle.dumps(own,protocol=5),1),
-                _series_intervals=period['cost_intervals'],_series_exclusions=own_exclusions,
-                _series_signature=period_cache[period['start']][0],_has_history=bool(own))
-        else:
-            period['series']=_period_series(own,period['cost_intervals'],own_exclusions)
+        period['series']=_period_series(own,period['cost_intervals'],own_exclusions)
     groups,history_groups=_history_groups(report,previous) if deferred else (None,None)
     source=None if groups is not None else _history_rows(report,'weekly',labels=False) if deferred else history_rows(report,'weekly')
     rows,periods=quota_value_history(report,source,_requests=requests,_cache=period_cache,
-        _statistics_cache=statistics_cache,_period_sink=prepare_period if deferred else None,_groups=groups)
+        _statistics_cache=statistics_cache,_period_sink=prepare_period if deferred else None,_groups=groups,_defer_rows=deferred)
     if not deferred:
         times=[r['at'] for r in rows]
         for i,period in enumerate(periods):
@@ -445,7 +462,7 @@ def prepare_quota_view(report, previous=None, *, deferred=False, _requests=None)
             unchanged=bool(previous and period_cache.get(period['start']) is previous.get('_period_cache',{}).get(period['start']))
             prepare_period(rows[lo:hi],period,unchanged)
             if period['series'] is None:period['series']=period_series(period)
-            for key in ('_series_payload','_series_intervals','_series_exclusions','_series_signature','_has_history'):
+            for key in ('_series_detail','_series_intervals','_series_exclusions','_series_signature','_has_history'):
                 period.pop(key,None)
     for period in periods:
         state='진행 중' if period['current'] else '종료'

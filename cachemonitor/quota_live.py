@@ -130,7 +130,9 @@ class AccountClient:
         self.check_cancelled()
         env = os.environ.copy()
         env['CODEX_HOME'] = self.home
-        self.process = subprocess.Popen([locate_codex(), 'app-server'], env=env,
+        # Account RPCs do not need plugin discovery or background downloads.
+        command=[locate_codex(),'app-server','-c','features.plugins=false','-c','features.remote_plugin=false']
+        self.process = subprocess.Popen(command, env=env,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             text=True, encoding='utf-8', creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
         if self.cancelled.is_set():

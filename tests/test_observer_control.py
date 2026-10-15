@@ -171,7 +171,7 @@ def test_apply_requires_recent_test_for_same_service(tmp_path,monkeypatch,instan
     assert registry['value']=='previous startup command'
 
 
-def _interrupted_atomic_write(path,control):
+def _interrupted_atomic_write(path,control,publisher):
     import os
     from pathlib import Path
     from cachemonitor.observer_control import atomic_write
@@ -183,11 +183,16 @@ def _interrupted_atomic_write(path,control):
             control.send((str(file),written));control.recv()
             target.write(data[len(data)//2:])
     Path.write_bytes=write
-    atomic_write(path,b'new configuration'*8192)
+    if publisher=='collection_endpoint':
+        from cachemonitor.collection_transport import LiveServer
+        server=LiveServer(path,lambda request:({},b''))
+        server.close()
+    else:atomic_write(path,b'new configuration'*8192)
 
 
 @pytest.mark.integration
-def test_atomic_write_recovers_only_dead_owned_partial_files(tmp_path):
+@pytest.mark.parametrize('publisher',['configuration','collection_endpoint'])
+def test_atomic_write_recovers_only_dead_owned_partial_files(tmp_path,publisher):
     import multiprocessing as mp
     from pathlib import Path
     from cachemonitor.observer_control import atomic_write
@@ -196,7 +201,7 @@ def test_atomic_write_recovers_only_dead_owned_partial_files(tmp_path):
     context=mp.get_context('spawn')
     for _ in range(3):
         parent,pipe=context.Pipe()
-        child=context.Process(target=_interrupted_atomic_write,args=(str(path),pipe))
+        child=context.Process(target=_interrupted_atomic_write,args=(str(path),pipe,publisher))
         child.start();pipe.close()
         try:
             assert parent.poll(15),child.exitcode

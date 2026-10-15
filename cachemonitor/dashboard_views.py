@@ -3,7 +3,7 @@ from collections import Counter
 
 from .analytics import cache_rows, observation_flags, stats
 from .pricing import mode_assumptions, request_tier, sum_cost
-from .analysis_records import record_items
+from .analysis_records import available_fields
 from .history_timeline_data import project_timeline
 
 
@@ -157,7 +157,7 @@ def explorer(engine,result,selection):
     while cursor in hierarchy['items']:
         item=hierarchy['items'][cursor];chain.append({k:item[k] for k in ('title','home','sid','project_id')});cursor=hierarchy['parent'].get(cursor)
     path.extend(reversed(chain))
-    available=sorted({key for row in records for key,value in record_items(row) if value not in (None,'','미확인','확인 불가') and not isinstance(value,(dict,list))})
+    available=available_fields(records)
     selected_identity=selection.get('call_identity')
     detail=engine.record(*selected_identity) if selected_identity else None
     event_keys={str(k) for field in ('baseline_keys','occurrence_keys','recovery_keys') for k in (event or {}).get(field,[])}
@@ -217,6 +217,9 @@ def compact(query,value,path=()):
 
 def project(engine,q):
     query={k:v for k,v in q.items() if k not in ('explorer','table_windows','presentation','compare_model','result_view')}
+    # The displayed hierarchy computes its own project-restricted lineage.
+    # General query callers still receive their ordinary session cost rollups.
+    if q['page']==2:query['_session_costs']=False
     result=engine.query(query);a=result['analysis'];responses=a['responses'];turns=a['turns']
     view=dict(key=result['key'],revision=result['revision'],filter_choices=result['filter_choices'],
         analysis={k:v for k,v in a.items() if k not in ('sessions','responses','turns','units','groups')},lookup={})

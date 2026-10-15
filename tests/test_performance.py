@@ -296,6 +296,17 @@ def test_live_revisions_release_obsolete_views_without_rebuilding_unchanged_sess
     assert engine.page_query(query(page=2,presentation=True)) is latest
 
 
+def test_filter_fields_include_later_values_and_exact_display_aliases():
+    from cachemonitor.analysis_records import available_fields
+    rows=[dict(session_ordinal=1,key='first',cost=None,model=None,turn='',
+               optional='미확인',details={}),
+          dict(session_ordinal=2,key='second',cost=0,model='known',turn='request',
+               optional=False,price_model='distinct',details=[])]
+    assert available_fields(rows)==['analysis_model','cache_degradation','call_id','cost',
+        'key','long_context','model','optional','price_assumed','price_model','request_id',
+        'session_ordinal','turn']
+
+
 def test_dashboard_projection_bounds_rows_and_preserves_drilldown():
     import pickle
     from cachemonitor.dashboard_views import resolve_population

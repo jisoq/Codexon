@@ -69,6 +69,32 @@ def test_existing_weekly_rows_remain_unchanged_across_reopen_and_new_observation
     finally:ledger.close()
 
 
+def test_weekly_report_projection_preserves_full_stored_history(tmp_path):
+    path=tmp_path/'windows.sqlite'
+    ledger=QuotaLedger(path)
+    try:
+        for at in (100,110,120):
+            value=observation(at,at/10)
+            value['windows']['five_hour']=dict(used_percent=at/5,resets_at=2000,window_minutes=300)
+            legacy_observe(ledger,'h',value) if at==100 else ledger.observe('h',value)
+        full=ledger.report('h',200)
+        expected=[row for row in full['history'] if row['window']=='weekly']
+        stored={table:[tuple(row) for row in ledger.db.execute('select * from '+table+' order by 1')]
+                for table in ('observations','observation_context','window_observations','weekly_window_refs')}
+        projected=QuotaLedger(path,pack_history=True,weekly_history_only=True)
+        try:
+            report=projected.report('h',200)
+            assert list(report['history'])==expected
+            assert report['cycles']==full['cycles']
+            assert history_rows(report,'weekly')==history_rows(full,'weekly')
+        finally:projected.close()
+        assert len(full['history'])==6
+        assert ledger.report('h',200)['history']==full['history']
+        assert stored=={table:[tuple(row) for row in ledger.db.execute('select * from '+table+' order by 1')]
+                        for table in stored}
+    finally:ledger.close()
+
+
 def test_invalid_raw_values_and_incomplete_windows_remain_recoverable(tmp_path):
     ledger=QuotaLedger(tmp_path/'raw.sqlite');legacy=QuotaLedger(tmp_path/'legacy.sqlite')
     try:

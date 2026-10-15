@@ -359,7 +359,7 @@ class AnalysisEngine:
                 'whole_turns':dict(whole_turns)},
                 'revision':self.revision}
         result['filter_choices']=observed_choices(responses)
-        if q['page']==2:
+        if q['page']==2 and q.get('_session_costs',True):
             from .session_costs import own_costs, session_costs
             result['session_costs']=session_costs(selected,own_costs(responses))
         if q['page']==0 and not q.get('category_usage'): result['overview']=overview_view(a,start,end,q.get('metric','cost'),q.get('granularity','auto'),q.get('basis','total'),q.get('group_by','project'),self.stat,self.summary)

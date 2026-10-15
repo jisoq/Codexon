@@ -35,7 +35,7 @@ from .i18n import tr, Verbatim, formatted
 from .workload import call_count
 from .history_navigation import HistoryNavigation, HistoryWorkspace, HistoryTable, HistoryFilters, history_duration
 from .history_timeline import SessionTimeline
-from .dashboard_presentation import Breadcrumbs, RecordFields, labeled_control, move_control
+from .dashboard_presentation import Breadcrumbs, RecordFields, labeled_control, move_controls
 
 STYLE = ''
 TITLES = ('Home','지표 비교','세션 기록','구독 모니터링','설정','성능 추이')
@@ -1279,11 +1279,9 @@ class Dashboard(TrayWindow):
         # Hidden filters keep their rendered owner when leaving for quota or
         # settings. Reparenting recreates every sibling QML delegate repeatedly.
         if self.current_page in (0,1,2):
-            for node,field in self.common_fields.items():
-                destination=(self.history_period_fields if node in (self.period,self.date_start,self.date_end) else self.history_query_fields) if history and node is not self.project else self.common_filters
-                move_control(field,destination)
-            if not history and self.common_filters._nodes!=list(self.common_fields.values()):
-                self.common_filters._nodes=list(self.common_fields.values());self.common_filters.structureChanged.emit()
+            moves=((field,(self.history_period_fields if node in (self.period,self.date_start,self.date_end) else self.history_query_fields)
+                    if history and node is not self.project else self.common_filters) for node,field in self.common_fields.items())
+            move_controls(moves,orders=() if history else ((self.common_filters,list(self.common_fields.values())),))
         for node in (self.home,self.source,self.archive,self.model,self.effort,self.mode):
             node.setVisible(self.current_page<3 and (node not in (self.model,self.effort,self.mode) or self.current_page in (0,2)))
         self.home.setVisible(self.current_page<3 and len(self.snapshot['homes'])>1)

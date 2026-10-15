@@ -385,6 +385,20 @@ def test_streamed_request_join_preserves_completion_order_and_wire_precedence(tm
                         for row in calls]==expected
                 assert list(times)==[row[2] for row in expected]
                 assert list(actual_windows)==windows
+            # A cost correction changes accounting but not request lifetimes.
+            ledger.db.execute("UPDATE calls SET cost=11 WHERE home='a' AND uid='r1'");ledger.db.commit()
+            ledger._input_changes=[('calls',100)]
+            calls,_,same_windows=ledger._report_calls(scope,0,True)
+            assert next(row['cost'] for row in calls if row['uid']=='r1')==11
+            assert same_windows is actual_windows and list(same_windows)==windows
+            ledger.db.execute("UPDATE tracking_wire SET start=60,end=70 WHERE home='a' AND identity='02'");ledger.db.commit()
+            ledger._input_changes=[('tracking_wire',40)]
+            calls,_,changed_windows=ledger._report_calls(scope,0,True)
+            assert next(row['ts'] for row in calls if row['uid']=='r2')==70
+            assert next(row for row in changed_windows if row['uid']=='r2')==dict(uid='r2',start=60,end=70)
+            ledger.db.execute("UPDATE calls SET cost=1 WHERE home='a' AND uid='r1'")
+            ledger.db.execute("UPDATE tracking_wire SET start=40,end=50 WHERE home='a' AND identity='02'");ledger.db.commit()
+            ledger._input_changes=[('calls',100),('tracking_wire',40)]
             # Filtering occurs before completion correction, including a late
             # completion that moves a retained call before the requested cutoff.
             calls,_,_=ledger._report_calls(scope,150,True)

@@ -112,7 +112,10 @@ class QuotaComputation:
     def _ledger(self):
         if self.ledger is None:
             from .quota_cycles import QuotaLedger
-            self.ledger = self.ledger_factory(self.path) if self.ledger_factory else QuotaLedger(self.path,pack_history=True)
+            # This worker serves weekly accounting, charts and edits. The full
+            # ledger API retains both windows for other readers and recovery.
+            self.ledger = self.ledger_factory(self.path) if self.ledger_factory else QuotaLedger(
+                self.path,pack_history=True,weekly_history_only=True)
             self.ledger_generation += 1
         return self.ledger
 

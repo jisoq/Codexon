@@ -9,14 +9,16 @@ def node_key(kind, *parts):
     return json.dumps([kind,*parts],ensure_ascii=False,separators=(',',':'))
 
 
+def token_total(rows,key):
+    values=[r[key] for r in rows if r.get(key) is not None]
+    return sum(values) if len(values)==len(rows) and rows else None
+
+
 def total(rows):
     priced=[r['cost'] for r in rows if r.get('cost') is not None]
     valid=cache_rows(rows);inputs=sum(r['input'] for r in valid)
-    def tokens(key):
-        values=[r[key] for r in rows if r.get(key) is not None]
-        return sum(values) if len(values)==len(rows) and rows else None
     return dict(cost=sum(priced) if priced else None,partial=len(priced)<len(rows),
-        calls=len(rows),known=len(priced),input=tokens('input'),output=tokens('output'),
+        calls=len(rows),known=len(priced),input=token_total(rows,'input'),output=token_total(rows,'output'),
         cache_ratio=100*sum(r['cached'] for r in valid)/inputs if inputs else None,
         ts=max((r['ts'] for r in rows),default=None))
 
@@ -57,7 +59,10 @@ def prepare(result, rows, search, include_empty=True):
     for k in indexed:
         visible_turns={r.get('turn') for r in bysession[k]}
         request_counts[k]=sum(t.get('turn') in visible_turns or (include_empty and not t.get('calls')) for t in turns.get(k,[]))
-    own_summaries={k:total(bysession[k]) for k in indexed}
+    # Cost, cache and time already belong to rollups. Only token completeness
+    # remains to be combined across this hierarchy's member sessions.
+    own_summaries={k:dict(calls=len(bysession[k]),input=token_total(bysession[k],'input'),
+                          output=token_total(bysession[k],'output')) for k in indexed}
     for k,s in indexed.items():
         if k not in visible:continue
         pid=project_identity(s);g=rollups[k]

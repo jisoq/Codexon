@@ -1,6 +1,7 @@
 """Five-minute model shares of the recorded increases on the quota cost curve."""
 from bisect import bisect_left, bisect_right
 from collections import defaultdict
+from itertools import pairwise
 import math
 from .pricing import ALIASES, request_tier
 
@@ -28,8 +29,7 @@ def prepare_model_share(series, intervals, *, packed=False):
     # Retain one flat entry per event, not three nested maps per request.
     additions.sort(key=lambda event:event[0]);additions.reverse()
     bins={};spans=[]
-    for index in range(1,len(rows)):
-        previous,row=rows[index-1:index+1]
+    for index,(previous,row) in enumerate(pairwise(rows),1):
         if (not row['connect'] or row.get('user_excluded') or row.get('reset_kind')
                 or row.get('cycle_start')!=previous.get('cycle_start')):continue
         start,end=previous['at'],row['at']

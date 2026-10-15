@@ -94,13 +94,8 @@ class LiveServer:
                 self.listener.listen(16)
                 self.listener.settimeout(.2)
                 self.endpoint = dict(port=self.listener.getsockname()[1], token=self.token.hex())
-            temporary = self.path.with_name(self.path.name + '.' + secrets.token_hex(8))
-            try:
-                with temporary.open('x', encoding='utf-8') as stream:
-                    json.dump(self.endpoint, stream)
-                os.replace(temporary, self.path)
-            finally:
-                temporary.unlink(missing_ok=True)
+            from .observer_control import atomic_write
+            atomic_write(self.path,json.dumps(self.endpoint).encode('utf-8'))
             with _endpoint_lock:
                 _endpoints[str(self.path)] = self.endpoint
             self.thread = threading.Thread(target=self._serve, name='collection-live', daemon=True)

@@ -610,7 +610,90 @@ def quota_statistics(report, start=None, end=None, include_mode_assumptions=Fals
         'account_delta':account_delta,'attribution':attribution}
 
 
-def quota_value_history(report, rows, *, _requests=None, _cache=None, _statistics_cache=None, _period_sink=None, _groups=None):
+def _quota_value_rows(group, summary, intervals, display_ranges, exclusions, account, forward):
+    """Derive exact chart rows only for a requested allowance period."""
+    result=[];start=group['start']
+    display_position=0
+    events = []
+    for interval in intervals:
+        endpoints = [(at, used) for at, used in interval.get('endpoints', [])
+                     if interval['start'] <= at <= interval['end']]
+        # Older reports without granular evidence can expose only their
+        # measured endpoint, never a fabricated interpolation.
+        if not endpoints:
+            endpoints = [(interval['end'], interval.get('used_end') or 0)]
+        costs = sorted(((r['ts'], r['cost']) for r in interval.get('cost_rows', [])
+                       if interval['start'] < r['ts'] <= interval['end'] and
+                       ALIASES.get(r['model'], r['model']) not in interval['separate_models']), key=lambda r:r[0])
+        position = 0
+        subtotal = 0.0
+        priced = missing = 0
+        old_cost = old_delta = old_known = 0
+        for at, used in endpoints:
+            while position < len(costs) and costs[position][0] <= at:
+                value = costs[position][1]
+                if value is None:
+                    missing += 1
+                else:
+                    subtotal += value
+                    priced += 1
+                position += 1
+            delta = max(0, used-endpoints[0][1])
+            pending = any(t <= at for t in interval.get('pending_usage_times', []))
+            # Consumption needs a recorded cost; a collection checkpoint is not zero-dollar evidence.
+            cost = (subtotal if priced else 0 if not position and delta == 0 and
+                    ((interval['cost_complete_at'] is not None and interval['cost_complete_at'] >= at) if 'cost_complete_at' in interval else interval.get('cost_complete')) and not pending else None)
+            if not forward and (missing or not priced):
+                cost = None
+            if at == interval['end']:
+                cost, delta = interval['cost'], max(0, interval['delta'])
+            valid = forward or not estimate(cost, delta, 1, interval['blocked'])['reasons']
+            known = int(valid and cost is not None)
+            value = cost if known else 0
+            consumed = delta if valid else 0
+            events.append((at, value-old_cost, consumed-old_delta, known-old_known))
+            old_cost, old_delta, old_known = value, consumed, known
+    events.sort(key=lambda r: r[0])
+    cost = delta = known = position = 0
+    confirmed_cost = confirmed_delta = 0
+    last_ratio = None
+    for row in group['rows']:
+        while display_position<len(display_ranges) and display_ranges[display_position][1]<row['at']:display_position+=1
+        local_observed=(row.get('measurement_reset') or not forward or
+                        display_position<len(display_ranges) and display_ranges[display_position][0]<=row['at']<=display_ranges[display_position][1])
+        excluded = [r for r in exclusions if r['start'] < row['at'] <= r['end']]
+        while position < len(events) and events[position][0] <= row['at']:
+            _, amount, consumed, confirmed = events[position]
+            cost += amount
+            delta += consumed
+            known += confirmed
+            position += 1
+        matches = not account or row.get('account') == account
+        value = max(0, cost) if known and matches else None
+        if exclusions and matches and not intervals and summary['cost'] == 0:
+            value = 0.0
+        if row['reset_kind'] and matches:
+            value = 0.0
+        ratio = value/delta*100 if value is not None and delta > 0 else None
+        value_held = ratio is None and last_ratio is not None and matches
+        if ratio is None:
+            ratio = last_ratio if matches else None
+        else:
+            last_ratio = ratio
+            confirmed_cost, confirmed_delta = value, delta
+        result.append({**row, 'cycle_start': start, 'cycle_cost': value,
+                       'cycle_value': ratio, 'cycle_delta':delta,
+                       'confirmed_cost':confirmed_cost, 'confirmed_delta':confirmed_delta, 'value_held':value_held,
+                       'local_observed':local_observed,'local_range':display_position,
+                       'user_excluded':bool(excluded),
+                       'user_exclusion_end':bool(excluded) and all(r['end']==row['at'] for r in excluded),
+                       'exclusion_ids':[r.get('id') for r in excluded],
+                       'exclusion_reasons':[r.get('reason', '') for r in excluded],
+                       'cycle_partial': group['partial']})
+    return result
+
+
+def quota_value_history(report, rows, *, _requests=None, _cache=None, _statistics_cache=None, _period_sink=None, _groups=None, _defer_rows=False):
     """Align monetary evidence to the chart's *observed* reset boundaries.
 
     Reset classification belongs to history_rows/ResetTracker. Storage intervals
@@ -682,83 +765,13 @@ def quota_value_history(report, rows, *, _requests=None, _cache=None, _statistic
         if exclusions:
             original = quota_statistics({**report, 'account': account, 'cycles': own, 'exclusions': []}, start, end, _requests=_requests,_cache=_statistics_cache)
             display_ranges = sorted((c['start'], c['end']) for c in original['intervals'])
-        display_position=0
-        events = []
-        for interval in intervals:
-            endpoints = [(at, used) for at, used in interval.get('endpoints', [])
-                         if interval['start'] <= at <= interval['end']]
-            # Older reports without granular evidence can expose only their
-            # measured endpoint, never a fabricated interpolation.
-            if not endpoints:
-                endpoints = [(interval['end'], interval.get('used_end') or 0)]
-            costs = sorted(((r['ts'], r['cost']) for r in interval.get('cost_rows', [])
-                           if interval['start'] < r['ts'] <= interval['end'] and
-                           ALIASES.get(r['model'], r['model']) not in interval['separate_models']), key=lambda r:r[0])
-            position = 0
-            subtotal = 0.0
-            priced = missing = 0
-            old_cost = old_delta = old_known = 0
-            for at, used in endpoints:
-                while position < len(costs) and costs[position][0] <= at:
-                    value = costs[position][1]
-                    if value is None:
-                        missing += 1
-                    else:
-                        subtotal += value
-                        priced += 1
-                    position += 1
-                delta = max(0, used-endpoints[0][1])
-                pending = any(t <= at for t in interval.get('pending_usage_times', []))
-                # Consumption needs a recorded cost; a collection checkpoint is not zero-dollar evidence.
-                cost = (subtotal if priced else 0 if not position and delta == 0 and
-                        ((interval['cost_complete_at'] is not None and interval['cost_complete_at'] >= at) if 'cost_complete_at' in interval else interval.get('cost_complete')) and not pending else None)
-                if not forward and (missing or not priced):
-                    cost = None
-                if at == interval['end']:
-                    cost, delta = interval['cost'], max(0, interval['delta'])
-                valid = forward or not estimate(cost, delta, 1, interval['blocked'])['reasons']
-                known = int(valid and cost is not None)
-                value = cost if known else 0
-                consumed = delta if valid else 0
-                events.append((at, value-old_cost, consumed-old_delta, known-old_known))
-                old_cost, old_delta, old_known = value, consumed, known
-        events.sort(key=lambda r: r[0])
-        cost = delta = known = position = 0
-        confirmed_cost = confirmed_delta = 0
-        last_ratio = None
-        for row in group['rows']:
-            while display_position<len(display_ranges) and display_ranges[display_position][1]<row['at']:display_position+=1
-            local_observed=(row.get('measurement_reset') or report.get('tracking') is None or
-                            display_position<len(display_ranges) and display_ranges[display_position][0]<=row['at']<=display_ranges[display_position][1])
-            excluded = [r for r in exclusions if r['start'] < row['at'] <= r['end']]
-            while position < len(events) and events[position][0] <= row['at']:
-                _, amount, consumed, confirmed = events[position]
-                cost += amount
-                delta += consumed
-                known += confirmed
-                position += 1
-            matches = not account or row.get('account') == account
-            value = max(0, cost) if known and matches else None
-            if exclusions and matches and not intervals and summary['cost'] == 0:
-                value = 0.0
-            if row['reset_kind'] and matches:
-                value = 0.0
-            ratio = value/delta*100 if value is not None and delta > 0 else None
-            value_held = ratio is None and last_ratio is not None and matches
-            if ratio is None:
-                ratio = last_ratio if matches else None
-            else:
-                last_ratio = ratio
-                confirmed_cost, confirmed_delta = value, delta
-            result.append({**row, 'cycle_start': start, 'cycle_cost': value,
-                           'cycle_value': ratio, 'cycle_delta':delta,
-                           'confirmed_cost':confirmed_cost, 'confirmed_delta':confirmed_delta, 'value_held':value_held,
-                           'local_observed':local_observed,'local_range':display_position,
-                           'user_excluded':bool(excluded),
-                           'user_exclusion_end':bool(excluded) and all(r['end']==row['at'] for r in excluded),
-                           'exclusion_ids':[r.get('id') for r in excluded],
-                           'exclusion_reasons':[r.get('reason', '') for r in excluded],
-                           'cycle_partial': group['partial']})
+        if _defer_rows:
+            prepared=dict(source=_PackedRows(group['rows']),
+                start=start,partial=group['partial'],cost=summary['cost'],intervals=intervals,
+                display_ranges=display_ranges,exclusions=exclusions,account=account,forward=forward)
+        else:
+            prepared=_quota_value_rows(group,summary,intervals,display_ranges,exclusions,account,forward)
+            result.extend(prepared)
         if any(not account or r.get('account') == account for r in group['rows']):
             value = summary['per_percent']
             periods.append({'start': start, 'end': group['rows'][-1]['at'],
@@ -771,14 +784,16 @@ def quota_value_history(report, rows, *, _requests=None, _cache=None, _statistic
                             'calls': summary['observed_calls'],
                             'value': value*100 if value is not None else None})
             periods[-1]['cost_intervals']=intervals
+            if _defer_rows:
+                periods[-1]['_has_history']=bool(not forward or group['reset_kind']=='measurement_reset' or
+                    any(left<=row['at']<=right for row in group['rows'] for left,right in display_ranges))
         if _cache is not None:
-            prepared=result[result_start:]
-            # The deferred sink already owns an exact packed chart. Retaining
-            # another packed copy of its input rows wastes space and encoding.
+            # The deferred sink owns packed classified inputs and the exact
+            # interval references. No additional decoded rows are retained.
             _cache[start]=(signature,None if _period_sink else prepared,
                            periods[-1] if len(periods)>period_start else None)
         if _period_sink is not None:
-            _period_sink(result[result_start:],periods[-1] if len(periods)>period_start else None,False)
+            _period_sink(prepared,periods[-1] if len(periods)>period_start else None,False)
             del result[result_start:]
     return result, periods
 
@@ -790,13 +805,15 @@ class QuotaLedger:
     INPUT_CACHE_BYTES=64*1024*1024
     REQUEST_CACHE_BYTES=64*1024*1024
     REQUEST_SORT_ROWS=32768
+    SYNC_BATCH_ROWS=128
     ARCHIVE_COMPACTION_ROWS=512
     FUTURE_COLUMNS=(('observations',('at',)),('window_observations',('at',)),
         ('manual_resets',('at',)),('calls',('ts',)),('tracking_controls',('at',)),
         ('tracking_observations',('received',)),('tracking_tasks',('start','end')),
         ('tracking_wire',('start','end')))
-    def __init__(self, path, *, pack_history=False):
+    def __init__(self, path, *, pack_history=False, weekly_history_only=False):
         self._pack_history=pack_history
+        self._weekly_history_only=weekly_history_only
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(self.path, timeout=8)
@@ -1271,10 +1288,25 @@ class QuotaLedger:
                 b.uid as boundary_uid,b.started from calls c left join tracking_call_boundaries b
                 on b.home=c.home and b.uid=c.uid where c.home=? and c.sid=?''',(home,sid))}
             previous_usage = {}
+            call_batch=[];boundary_batch=[];pending_uids=set()
+            def flush_calls():
+                # One statement journals each touched page once per bounded
+                # batch. Row triggers and the surrounding transaction remain.
+                for prefix,rows,suffix in (
+                    ('insert into tracking_call_boundaries',boundary_batch,
+                     ' on conflict(home,uid) do update set started=excluded.started '
+                     'where tracking_call_boundaries.started is not excluded.started'),
+                    ('insert or replace into calls',call_batch,'')):
+                    if rows:
+                        values=','.join('('+','.join('?' for _ in row)+')' for row in rows)
+                        self.db.execute(prefix+' values '+values+suffix,tuple(value for row in rows for value in row))
+                        rows.clear()
+                pending_uids.clear()
             turns = session['prepared'].get('turn_records', {})
             for row in sorted(session['prepared']['history'], key=lambda value: value['ts']):
                 response = str(row['key'])
                 uid = sid + ':' + response if response.startswith(('legacy:', 'record:')) else response
+                if uid in pending_uids or len(pending_uids)>=self.SYNC_BATCH_ROWS:flush_calls()
                 current_uids.add(uid)
                 turn = row.get('turn')
                 requested = row.get('request_observed_at') or row.get('request_ts')
@@ -1286,9 +1318,7 @@ class QuotaLedger:
                     previous_usage[turn] = row['ts']
                 old = stored.get(uid)
                 if old is None or old['boundary_uid'] is None or old['started'] != requested:
-                    self.db.execute('''insert into tracking_call_boundaries values(?,?,?)
-                        on conflict(home,uid) do update set started=excluded.started
-                        where tracking_call_boundaries.started is not excluded.started''',(home,uid,requested))
+                    boundary_batch.append((home,uid,requested));pending_uids.add(uid)
                 signature = json.dumps([row.get(k) for k in ('ts', 'model', 'service_tier', *TOKEN_FIELDS)], separators=(',', ':'))
                 if old is None:old=self.db.execute('select signature,service_tier,sid,cost,price_id from calls where home=? and uid=?',(home,uid)).fetchone()
                 if old and old['signature'] == signature and self._price_equivalent(old['price_id']):
@@ -1299,9 +1329,10 @@ class QuotaLedger:
                     self.db.execute('insert or ignore into cost_archive values(?,?,?,?,?,?,?)',
                         (home,uid,old['price_id'],old['signature'],old['cost'],old['service_tier'],time.time()))
                 cost = token_cost(row)['cost']
-                self.db.execute('insert or replace into calls values(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
-                    (home, uid, sid, row['ts'], row.get('model') or '미확인',
+                call_batch.append((home, uid, sid, row['ts'], row.get('model') or '미확인',
                      *[row.get(k) for k in TOKEN_FIELDS], cost, PRICE_ID, signature,row.get('service_tier','미확인')))
+                pending_uids.add(uid)
+            flush_calls()
             self.revisions[key] = revision
             old_uids = set(stored)
             self.db.executemany('delete from calls where home=? and sid=? and uid=?',
@@ -1577,7 +1608,8 @@ class QuotaLedger:
             # reads while consuming less than the discarded row copies at scale.
             previous_limit=self.db.execute('PRAGMA cache_size').fetchone()[0]
             self.db.execute(f'PRAGMA cache_size=-{self.HISTORY_CACHE_KIB}')
-            source=self._history_source_rows(home,cutoff,now,filter_references=prefix is None)
+            source=self._history_source_rows(home,cutoff,now,filter_references=prefix is None,
+                                            weekly_only=getattr(self,'_weekly_history_only',False))
             try:
                 rows=(compact(row) for row in source)
                 packed=prefix.with_suffix(cutoff,rows) if prefix is not None else _PackedHistory(rows)
@@ -1587,7 +1619,8 @@ class QuotaLedger:
                 self.db.execute('PRAGMA shrink_memory')
             if cacheable:self._history_inputs=(key,packed)
             return packed
-        history = ([compact(r) for r in self._report_rows('windows','select * from window_observations where home=? and at>=? and at<=? order by at,id',(home,cutoff,now),('window_observations',),'at',clock=True)]
+        window_clause=" and window='weekly'" if getattr(self,'_weekly_history_only',False) else ''
+        history = ([compact(r) for r in self._report_rows('windows','select * from window_observations where home=? and at>=? and at<=?'+window_clause+' order by at,id',(home,cutoff,now),('window_observations',),'at',clock=True)]
                    if 'window_observations' in tables else [])
         referenced=[]
         if 'weekly_window_refs' in tables:
@@ -1625,15 +1658,16 @@ class QuotaLedger:
             return packed
         return list(merge(history,referenced,unreferenced,key=lambda r:(r['at'],r['id'])))
 
-    def _history_source_rows(self, home, cutoff, now, *, filter_references=True):
+    def _history_source_rows(self, home, cutoff, now, *, filter_references=True, weekly_only=False):
         # A legacy window can share an ID with a reference at a different time.
         # Match the same source range as the ordinary reader before suppressing it.
         referenced='''SELECT 1 FROM weekly_window_refs f JOIN observations p ON p.id=f.observation_id
             WHERE f.window_id=w.id AND p.home=? AND p.at>=? AND p.at<=?'''
         params=(home,cutoff,now,home,cutoff,now)
+        window_clause=" AND window='weekly'" if weekly_only else ''
         bits=None
         if filter_references:
-            count=self.db.execute('SELECT count(*) FROM window_observations WHERE home=? AND at>=? AND at<=?',params[:3]).fetchone()[0]
+            count=self.db.execute('SELECT count(*) FROM window_observations WHERE home=? AND at>=? AND at<=?'+window_clause,params[:3]).fetchone()[0]
             references=self.db.execute('SELECT count(*) FROM weekly_window_refs').fetchone()[0] if count else 0
             if count and count*4>=references:
                 # Two-bit membership rejects impossible reference IDs before
@@ -1649,10 +1683,10 @@ class QuotaLedger:
                     for value in positions(identifier):bits[value>>3]|=1 << (value&7)
         if bits is None:
             windows=self.db.execute(f'''SELECT w.* FROM window_observations w
-                WHERE w.home=? AND w.at>=? AND w.at<=? AND NOT EXISTS ({referenced}) ORDER BY w.at,w.id''',params)
+                WHERE w.home=? AND w.at>=? AND w.at<=?{window_clause} AND NOT EXISTS ({referenced}) ORDER BY w.at,w.id''',params)
             window_rows=windows
         else:
-            windows=self.db.execute('SELECT * FROM window_observations WHERE home=? AND at>=? AND at<=? ORDER BY at,id',params[:3])
+            windows=self.db.execute('SELECT * FROM window_observations WHERE home=? AND at>=? AND at<=?'+window_clause+' ORDER BY at,id',params[:3])
             def unreferenced():
                 for row in windows:
                     possible=all(bits[value>>3] & (1 << (value&7)) for value in positions(row['id']))
@@ -1705,12 +1739,14 @@ class QuotaLedger:
                 (*scope,cutoff,INTERNAL_REVIEW_MODEL))
         request_windows=[]
         if forward:
-            completed={};exact_starts={home:{} for home in scope};by_response={}
+            reuse_windows=bool(previous and previous[0]==key and
+                               not any(table=='tracking_wire' for table,_ in changes))
+            completed={};exact_starts={home:{} for home in scope};by_response=None if reuse_windows else {}
             for row in self.db.execute(f"select * from tracking_wire where home in ({slots}) and response<>''",scope):
                 if row['status']=='completed' and row['end'] is not None:
                     completed[row['response']]=min(completed.get(row['response'],row['end']),row['end'])
                 exact_starts[row['home']][row['response']]=row['start']
-                if row['status'] not in ('created','completed'):continue
+                if by_response is None or row['status'] not in ('created','completed'):continue
                 old=by_response.get(row['response'])
                 if old is None or (row['end'] is not None and old[1] is None):
                     by_response[row['response']]=(row['start'],row['end'])
@@ -1719,9 +1755,13 @@ class QuotaLedger:
             boundaries={home:{} for home in scope}
             for row in self.db.execute(f'select * from tracking_call_boundaries where home in ({slots})',scope):
                 if row['uid'] not in exact_starts[row['home']]:boundaries[row['home']][row['uid']]=row['started']
-            windows=(dict(uid=uid,start=span[0],end=span[1]) for uid,span in by_response.items())
-            request_windows=_PackedRows(windows) if packed else list(windows)
-            del windows,by_response
+            if reuse_windows:
+                request_windows=previous[3]
+            else:
+                windows=(dict(uid=uid,start=span[0],end=span[1]) for uid,span in by_response.items())
+                request_windows=_PackedRows(windows) if packed else list(windows)
+                del windows
+            del by_response
             # Preserve completion correction and the original stable tie order
             # without retaining all decoded call dictionaries beside the join.
             times=array('d');ordered=True

@@ -24,16 +24,21 @@ def labeled_control(title, control):
     return field
 
 
-def move_control(node, destination):
-    """Move one presentation node without leaving a second rendered owner."""
-    previous = node.parent()
-    if previous is destination:
-        return
-    if isinstance(previous, Group) or hasattr(previous, '_nodes'):
-        if node in previous._nodes:
-            previous._nodes.remove(node)
-            previous.structureChanged.emit()
-    destination.addWidget(node)
+def move_controls(moves, *, orders=()):
+    """Publish each affected group's final controls once after reparenting."""
+    sources={};destinations={}
+    for node,destination in moves:
+        previous=node.parent()
+        if previous is destination:continue
+        if hasattr(previous,'_nodes') and node in previous._nodes:
+            previous._nodes.remove(node);sources[previous]=None
+        node.setParent(destination);node.put(stretch=0)
+        destination._nodes.append(node);destinations[destination]=None
+    for owner,nodes in orders:
+        if owner._nodes!=nodes:
+            owner._nodes=list(nodes);destinations[owner]=None
+    for owner in dict.fromkeys((*sources,*destinations)):
+        owner.structureChanged.emit()
 
 
 class Breadcrumbs(Group):

@@ -312,7 +312,8 @@ def test_activity_cursor_commits_with_usage_and_rolls_back_on_save_failure(tmp_p
     import sqlite3
     path=tmp_path/'quota.sqlite';ledger=QuotaLedger(path)
     def save(revision,output):
-        engine=SimpleNamespace(sessions={('h','s'):{'revision':revision,'prepared':{'history':[row(output=output)]}}})
+        calls=[row(f'r{i}',ts=150+i,output=output) for i in range(300)]
+        engine=SimpleNamespace(sessions={('h','s'):{'revision':revision,'prepared':{'history':calls}}})
         ledger.sync(engine,dict(homes=['h'],sessions=[{'home':'h'}],ts=300,index={'loading':False},
                                activity_cursor=('source',revision)))
     try:
@@ -324,7 +325,7 @@ def test_activity_cursor_commits_with_usage_and_rolls_back_on_save_failure(tmp_p
         with pytest.raises(sqlite3.OperationalError):save(2,4000)
         ledger.db=raw;ledger.close();ledger=QuotaLedger(path)
         assert ledger.activity_cursor()==('source',1)
-        assert ledger.db.execute('SELECT output FROM calls WHERE uid=?',('r1',)).fetchone()[0]==2000
+        assert tuple(ledger.db.execute('SELECT count(*),min(output),max(output) FROM calls').fetchone())==(300,2000,2000)
     finally:ledger.close()
 
 
@@ -361,7 +362,7 @@ def test_session_sync_work_does_not_scale_with_unrelated_call_history(tmp_path):
 
 def test_restart_and_append_do_not_rewrite_unchanged_call_boundaries(tmp_path):
     path=tmp_path/'boundaries.sqlite';ledger=QuotaLedger(path)
-    calls=[row(f'r{i}',ts=150+i,request_ts=100+i) for i in range(64)]
+    calls=[row(f'r{i}',ts=150+i,request_ts=100+i) for i in range(300)]
     calls[0]['request_ts']=None
     try:sync(ledger,calls)
     finally:ledger.close()
