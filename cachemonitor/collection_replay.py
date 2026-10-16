@@ -25,6 +25,7 @@ INDEX_BUDGET = 128 * 1024 * 1024
 PROOF_ROWS = 65536
 COMMIT_BYTES = 2 * 1024 * 1024
 COMMIT_SECONDS = 5
+CAPTURE_SECONDS = .05
 
 
 def encoded(value):
@@ -106,6 +107,9 @@ class CollectionReplay:
         self.pending_admissions = set()
         self.pending_bytes = 0
         self.admission_started = None
+        self.capture_snapshot = None
+        self.capture_position = 0
+        self.capture_pending = False
         self.wal_path = channel.companion('.collection-replay.sqlite-wal')
 
     def source_proof(self, key):
@@ -289,7 +293,8 @@ class CollectionReplay:
 
     def capture(self, snapshot, now):
         if not self.writable:
-            return
+            self.capture_pending = False
+            return False
         try:
             # Proofs have no role in acknowledging source or public writes.
             # Commit bounded admission batches, not every display publication.
@@ -300,19 +305,23 @@ class CollectionReplay:
                         return
                 finally:
                     self.db.execute('PRAGMA busy_timeout=100')
-            self._capture(snapshot, now)
+            self.capture_pending = self._capture(snapshot, now)
             if self.pending_admissions and (self.pending_bytes >= COMMIT_BYTES
                     or time.monotonic() - self.admission_started >= COMMIT_SECONDS):
                 self.commit_admissions()
         except sqlite3.Error:
             self.writable = False
-            self.db.rollback()
+            try:self.db.rollback()
+            except sqlite3.Error:pass
             # A rolled-back response index cannot invalidate these live bodies.
             # Rebuild them through the ordinary path before confirming again.
             self.invalidated.update(self.pending_admissions)
             self.pending_admissions.clear()
             self.pending_bytes = 0
             self.admission_started = None
+            self.capture_pending = False
+        if not self.capture_pending:self.capture_snapshot = None
+        return self.capture_pending
 
     def commit_admissions(self):
         self.db.commit()
@@ -322,14 +331,20 @@ class CollectionReplay:
 
     def _capture(self, snapshot, now):
         if not self.writable or not self.enabled or not self.started or self.restore_job is not None:
-            return
-        deadline = time.monotonic() + .05
+            return False
+        deadline = time.monotonic() + CAPTURE_SECONDS
         current = self.channel.live.current if self.channel.live is not None else None
         if current is None:
-            return
-        for view in snapshot['sessions']:
+            return False
+        if self.capture_snapshot is not snapshot:
+            self.capture_snapshot = snapshot
+            self.capture_position = 0
+        views = snapshot['sessions']
+        for position in range(self.capture_position, len(views)):
             if time.monotonic() >= deadline:
                 break
+            self.capture_position = position + 1
+            view = views[position]
             key = view['home'], view['id']
             session = self.index.monitor.sessions.get(key)
             if (session is None or hasattr(session, '_replay_body') or not view.get('collection_complete')
@@ -371,13 +386,17 @@ class CollectionReplay:
             removed, added = previous - current_keys, current_keys - previous
             self.db.executemany('DELETE FROM responses WHERE owner=? AND key=?', ((owner, response) for response in removed))
             self.db.executemany('INSERT INTO responses VALUES(?,?)', ((owner, response) for response in added))
-            self._retire(key, EncodedSession(header, prepared[2], prepared[1], prepared[3]), state)
+            body = EncodedSession(header, prepared[2], prepared[1], prepared[3])
+            self._retire(key, body, state)
+            views[position] = body
             self.pending_admissions.add(key)
             self.pending_bytes += len(proof) + len(packed) + 128 + 64 * (len(removed) + len(added))
             if self.pending_bytes >= COMMIT_BYTES:
                 break
+        return self.capture_position < len(views)
 
     def close(self):
+        self.capture_snapshot = None
         if self.restore_job is not None:
             self.restore_job.close()
             self.restore_job = None

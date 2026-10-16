@@ -100,6 +100,7 @@ def test_custom_index_does_not_import_default_history(default_home,tmp_path):
 
 
 def test_closed_collection_reuses_bodies_and_replays_only_changed_owners(tmp_path,monkeypatch):
+    from cachemonitor import collection_replay
     from cachemonitor.model_evidence import EvidenceStore
     from cachemonitor.usage_collection import CollectionChannel
     from test_core import TID,usage
@@ -130,7 +131,15 @@ def test_closed_collection_reuses_bodies_and_replays_only_changed_owners(tmp_pat
                 for row in value['sessions']}
     service=CollectorService([home],target,evidence)
     try:
-        first=collect(service,20000)
+        with monkeypatch.context() as patch:
+            patch.setattr(collection_replay,'CAPTURE_SECONDS',0)
+            first=collect(service,20000)
+        sequence=service.sequence
+        with monkeypatch.context() as patch:
+            patch.setattr(service.index,'poll',lambda *a:pytest.fail('maintenance recollected sources'))
+            deadline=time.monotonic()+5
+            while service.maintain():assert time.monotonic()<deadline
+        assert service.sequence==sequence
         assert service.index.replay.db.execute('SELECT count(*) FROM owners').fetchone()[0]==2
         assert all(not session.requests for session in service.index.monitor.sessions.values())
     finally:service.close()

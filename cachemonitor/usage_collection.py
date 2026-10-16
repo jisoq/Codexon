@@ -835,6 +835,7 @@ class CollectorService:
         except BaseException:
             self.lock.__exit__(None,None,None);self.channel.close();raise
         self.index=None;self.epoch=uuid.uuid4().hex;self.instance=uuid.uuid4().hex;self.sequence=0;self.last=None
+        self.replay_snapshot=None
         self.executable=str(Path(sys.executable).resolve())
         if os.name=='nt':
             from .proxy_identity import process_identity
@@ -852,6 +853,10 @@ class CollectorService:
     def poll(self,now=None,*,detailed=True):
         from .index import UsageIndex
         started=time.monotonic()
+        # The next source poll supersedes unfinished admission candidates.
+        # Release its view before rebuilding any changed owner.
+        self.replay_snapshot=None
+        if self.index and self.index.replay:self.index.replay.capture_snapshot=None
         now=now or time.time();homes=self.channel.requested_homes(now)
         if self.index and homes!=[str(h) for h in self.index.homes]:
             self.index.close();self.index=None;self.epoch=uuid.uuid4().hex
@@ -865,20 +870,15 @@ class CollectorService:
         collected=time.monotonic()
         changes=getattr(self.index,'collection_changes',None)
         from .collection_replay import EncodedSession
-        def with_epoch(session):
-            state=dict(usage_revision=f'{self.epoch}:{session.get("usage_revision")}')
-            if session.get('request_revision') is not None:state['request_revision']=f'{self.epoch}:{session["request_revision"]}'
-            return session.with_state(**state) if isinstance(session,EncodedSession) else dict(session,**state)
-        snapshot={**snapshot,'sessions':[with_epoch(s) for s in snapshot['sessions']],
+        snapshot={**snapshot,'sessions':[self.with_epoch(s) for s in snapshot['sessions']],
             'collection':dict(pid=os.getpid(),instance=self.instance,version=VERSION,
                 executable=self.executable)}
         self.sequence+=1;self.channel.publish(snapshot,self.epoch,self.sequence,changes=changes)
-        if self.index.replay is not None:self.index.replay.capture(source_snapshot,now)
+        if self.index.replay is not None and self.index.replay.capture(source_snapshot,now):
+            self.replay_snapshot=source_snapshot
         published_sessions=snapshot['sessions']
-        snapshot['sessions']=[with_epoch(self.index.monitor.sessions[(s['home'],s['id'])]._replay_body)
-            if not isinstance(s,EncodedSession) and hasattr(self.index.monitor.sessions.get((s['home'],s['id'])),'_replay_body')
-            else s for s in snapshot['sessions']]
         self.last=snapshot
+        self.compact_last()
         from .quota_diagnostics import record_slow_cycle
         self.last_slow_report=record_slow_cycle(self.channel.path.with_suffix('.collector.sqlite'),
             dict(source_collection=collected-started,publication=time.monotonic()-collected),
@@ -890,8 +890,29 @@ class CollectorService:
                 if isinstance(s,EncodedSession) else s for s in published_sessions]}
         return snapshot
 
+    def with_epoch(self,session):
+        from .collection_replay import EncodedSession
+        state=dict(usage_revision=f'{self.epoch}:{session.get("usage_revision")}')
+        if session.get('request_revision') is not None:state['request_revision']=f'{self.epoch}:{session["request_revision"]}'
+        return session.with_state(**state) if isinstance(session,EncodedSession) else dict(session,**state)
+
+    def compact_last(self):
+        from .collection_replay import EncodedSession
+        self.last['sessions']=[self.with_epoch(self.index.monitor.sessions[(s['home'],s['id'])]._replay_body)
+            if not isinstance(s,EncodedSession) and hasattr(self.index.monitor.sessions.get((s['home'],s['id'])),'_replay_body')
+            else s for s in self.last['sessions']]
+
+    def maintain(self):
+        """Admit committed bodies between collection deadlines, without a new poll."""
+        if self.replay_snapshot is None:return False
+        pending=self.index.replay.capture(self.replay_snapshot,self.replay_snapshot['ts'])
+        self.compact_last()
+        if not pending:self.replay_snapshot=None
+        return pending
+
     def close(self):
         try:
+            self.replay_snapshot=None;self.last=None
             if self.index:self.index.close();self.index=None
             self.channel.close()
         finally:self.lock.__exit__(None,None,None)
@@ -930,7 +951,11 @@ def main():
                     instance=service.instance,at=snapshot['ts'],facts={})).encode('utf-8'))
                 except OSError:pass
                 first=False
-            time.sleep(.1 if snapshot['index']['loading'] else 3)
+            deadline=time.monotonic()+(.1 if snapshot['index']['loading'] else 3)
+            while time.monotonic()<deadline:
+                if not service.maintain():
+                    time.sleep(max(0,deadline-time.monotonic()))
+                    break
     except Exception as error:
         facts=dict(getattr(service.index,'collection_fault',{}) or {})
         publish_collector_fault(fault_path,service.channel.scope,service.instance,error,facts=facts)
