@@ -132,7 +132,8 @@ def test_home_thumbnails_are_bounded_reused_and_navigation_is_not_duplicated(das
     for page in (5,2,3):
         click(w,rendered('home-card-'+str(page)))
         wait_for_rendered(lambda:w.current_page==page and not w.analysis_pending)
-        control(w,w.pages)
+        # The stack exists before its selected lazy page can be captured.
+        assert control(w,w.pages.widget(page)).isVisible()
         assert not w.quick.grabFramebuffer().isNull()
         w.change_page(0)
         wait_for_rendered(lambda:home._thumbnail_pending is None and page in home._thumbnails)
