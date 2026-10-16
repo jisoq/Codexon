@@ -625,6 +625,63 @@ def test_recovery_prefers_latest_genuine_snapshot_without_freshening(tmp_path,mo
     finally:client.close();writer.close()
 
 
+def test_durable_catalog_selects_only_requested_bodies_without_advancing_full_reader(tmp_path,monkeypatch):
+    writer=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite')
+    reader=CollectionChannel(writer.homes,writer.path)
+    try:
+        value=snapshot(writer);home=writer.homes[0]
+        value['sessions'].append(dict(home=home,id='unselected',history=[dict(key='two',output=7)]))
+        writer.publish(value,'epoch',1)
+        key=(home,'session');other=(home,'unselected')
+        payload=writer.db.execute('SELECT payload FROM sessions WHERE home=? AND sid=?',other).fetchone()[0]
+        with writer.db:writer.db.execute('UPDATE sessions SET payload=? WHERE home=? AND sid=?',(b'invalid',*other))
+        decoded=[];decode=reader._decode_body
+        def tracked(owner,*args):
+            decoded.append(owner)
+            return decode(owner,*args)
+        monkeypatch.setattr(reader,'_decode_body',tracked)
+        catalog=reader.read_catalog()
+        assert not decoded and set(catalog['owners'])=={key,other}
+        assert 'sessions' not in catalog['header'] and 'session_manifest' not in catalog['header']
+        selected=reader.read_owners([key],catalog=catalog)
+        assert selected['catalog']['publication']==('epoch',1)
+        assert selected['sessions']==value['sessions'][:1] and decoded==[key]
+        assert reader.identity is None and reader.cached is None and not reader.session_cache
+        # A selective read must not claim to own all checkpoint bodies on the
+        # next full read, and full reads continue sharing unchanged evidence.
+        with writer.db:writer.db.execute('UPDATE sessions SET payload=? WHERE home=? AND sid=?',(payload,*other))
+        decoded.clear();full=reader.read(shared=True)
+        assert full==value and decoded==[key,other]
+        decoded.clear();again=reader.read(shared=True)
+        assert not decoded and again['sessions'][0]['history'] is full['sessions'][0]['history']
+    finally:reader.close();writer.close()
+
+
+def test_durable_owner_read_pins_catalog_and_body_to_one_transaction(tmp_path,monkeypatch):
+    from cachemonitor.usage_collection import CollectionPending
+    writer=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite')
+    reader=CollectionChannel(writer.homes,writer.path)
+    try:
+        value=snapshot(writer);writer.publish(value,'epoch',1)
+        key=(writer.homes[0],'session');catalog=reader.read_catalog()
+        changed=copy.deepcopy(value);changed['sessions'][0]['history'][0]['output']=9
+        load=reader._durable_sessions
+        def publish_during_read(db,entries,previous):
+            writer.publish(changed,'epoch',2)
+            yield from load(db,entries,previous)
+        with monkeypatch.context() as patch:
+            patch.setattr(reader,'_durable_sessions',publish_during_read)
+            selected=reader.read_owners([key],catalog=catalog)
+        assert selected['sessions']==value['sessions']
+        assert selected['catalog']['publication']==('epoch',1)
+        with monkeypatch.context() as patch:
+            patch.setattr(reader,'_decode_body',lambda *a,**kw:pytest.fail('stale catalog decoded a body'))
+            with pytest.raises(CollectionPending):reader.read_owners([key],catalog=catalog)
+        selected=reader.read_owners([key])
+        assert selected['catalog']['publication']==('epoch',2) and selected['sessions']==changed['sessions']
+    finally:reader.close();writer.close()
+
+
 @pytest.mark.parametrize('legacy',[False,True])
 def test_recovery_and_live_delivery_release_superseded_history(tmp_path,monkeypatch,legacy):
     import zlib
@@ -644,6 +701,10 @@ def test_recovery_and_live_delivery_release_superseded_history(tmp_path,monkeypa
             with writer.db:
                 writer.db.execute('UPDATE sessions SET payload=?',(zlib.compress(json.dumps(heavy).encode()),))
                 writer.db.execute('UPDATE snapshot SET payload=?',(zlib.compress(json.dumps(header).encode()),))
+        catalog=reader.read_catalog()
+        selected=reader.read_owners([(writer.homes[0],'session')],catalog=catalog)
+        assert selected['sessions']==value['sessions']
+        assert reader.identity is None and not reader.session_cache
         durable=reader.read(shared=True)
         assert durable['sessions']==value['sessions']
         assert reader.session_cache and not reader.live_session_cache

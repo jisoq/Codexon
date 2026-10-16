@@ -25,10 +25,10 @@ def test_managed_tick_uses_async_storage_failures_without_health_request(tmp_pat
     from cachemonitor.managed_proxy import ManagedProxy
     from cachemonitor.model_proxy import Tracker
 
-    def unavailable_store(path):
-        raise sqlite3.OperationalError('locked')
+    class UnavailableStore(EvidenceStore):
+        def write(self,**record):raise sqlite3.OperationalError('locked')
 
-    writer=EvidenceWriter(tmp_path/'unavailable.sqlite',store_factory=unavailable_store)
+    writer=EvidenceWriter(tmp_path/'unavailable.sqlite',store_factory=UnavailableStore)
     try:
         for number in range(3):writer.write('home',attempt=str(number),ts=time.time())
         deadline=time.monotonic()+3
@@ -58,6 +58,60 @@ def test_managed_tick_uses_async_storage_failures_without_health_request(tmp_pat
             finally:await runner.cleanup()
         run_proxy_test(run())
     finally:writer.close()
+
+
+@pytest.mark.parametrize('preparation',['success','failure','pending'])
+def test_proxy_prepares_storage_and_preserves_transport_recovery(tmp_path,monkeypatch,preparation):
+    import sqlite3
+    import threading
+    import time
+    from types import SimpleNamespace
+    from cachemonitor.evidence_writer import EvidenceWriter
+    entered=threading.Event();release=threading.Event();reported=threading.Event();recovered=threading.Event()
+    attempts=[];states=[]
+    class PreparingStore(EvidenceStore):
+        def __init__(self,path):
+            attempts.append(path)
+            entered.set();assert release.wait(5)
+            if preparation=='failure' and len(attempts)==1:raise sqlite3.OperationalError('schema migration failed')
+            super().__init__(path)
+    writer=EvidenceWriter(tmp_path/'startup.sqlite',store_factory=PreparingStore)
+    if preparation=='pending':
+        original=writer.prepare
+        monkeypatch.setattr(writer,'prepare',lambda:original(timeout=0))
+    def tick(health):
+        states.append(dict(health));reported.set()
+        if health['storage_written']==1 and not health['storage_initializing'] and not health['storage_failure_streak']:
+            recovered.set()
+    async def run():
+        runner=web.AppRunner(create_app(writer,'home',managed=SimpleNamespace(tick=tick)),access_log=None)
+        setup=asyncio.create_task(runner.setup())
+        try:
+            assert await asyncio.wait_for(asyncio.to_thread(entered.wait,3),4)
+            if preparation!='pending':
+                assert not setup.done() and runner.server is None
+                release.set()
+            await asyncio.wait_for(setup,4)
+            assert runner.server is not None
+            assert writer.written==writer.dropped==0
+            assert await asyncio.wait_for(asyncio.to_thread(reported.wait,3),4)
+            assert states[0]['observation_enabled'] and not states[0]['draining']
+            assert states[0]['storage_failure_streak']==int(preparation=='failure')
+            assert states[0]['storage_initializing']==(preparation=='pending')
+            assert writer.write('home',attempt='ready',ts=time.time(),transport='WebSocket',response_id='ready',
+                                requested_model='captured',status='completed')
+            release.set()
+            assert await asyncio.wait_for(asyncio.to_thread(recovered.wait,3),4)
+            assert writer.written==1 and writer.dropped==0
+            assert len(attempts)==(2 if preparation=='failure' else 1)
+            with sqlite3.connect(writer.path) as db:
+                assert db.execute("SELECT requested_model FROM model_observations WHERE attempt='ready'").fetchone()==('captured',)
+        finally:
+            release.set()
+            if not setup.done():await asyncio.wait_for(asyncio.gather(setup,return_exceptions=True),5)
+            await runner.cleanup()
+    try:run_proxy_test(run())
+    finally:release.set();assert writer.close()
 
 
 @pytest.mark.parametrize('force',[False,True])

@@ -145,6 +145,85 @@ def test_owned_join_reuses_sessions_and_refreshes_only_late_evidence(tmp_path):
     finally:reader.close();store.close()
 
 
+def test_corrections_refresh_latest_activity_without_replacing_it_with_older_rows(tmp_path):
+    from cachemonitor.model_evidence import home_key, CORRECTION_FIELDS
+    store=EvidenceStore(tmp_path/'corrections.sqlite');reader=EvidenceReader(store.path);home=tmp_path/'home'
+    key=(home_key(home),'attempt')
+    try:
+        store.write(home,'attempt',1,'WebSocket','r1',status='created')
+        store.write(home,'attempt',2,'WebSocket','r1',status='completed')
+        store.write(home,'outside',3,'WebSocket','outside',status='completed')
+        reader.poll();generation=reader.generation;published=reader.activity_records[key]
+        store.db.execute("UPDATE model_observations SET status='failed',completed_observed_at=2.5 WHERE seq=2")
+        store.write(home,'next',4,'WebSocket','next',status='completed')
+        reader.poll()
+        assert reader.generation==generation and published['status']=='completed'
+        assert reader.changed_activity[key]['status']=='failed'
+        assert reader.changed_activity[key]['completed_observed_at']==2.5
+        assert reader.records[(key[0],'r1')]['attempt'] is reader.activity_records[key]
+        assert not set(CORRECTION_FIELDS)&reader.activity_records[key].keys()
+        store.db.execute("UPDATE model_observations SET status='incomplete' WHERE seq=1");store.db.commit()
+        reader.poll()
+        assert key not in reader.changed_activity and reader.activity_records[key]['status']=='failed'
+        # Older producers retain their table allowlist and named INSERT contract.
+        assert {row[0] for row in store.db.execute("SELECT name FROM sqlite_master WHERE type='table'")}=={
+            'model_observations','observation_gaps','sqlite_sequence'}
+        before=store.db.total_changes
+        store.write(home,'legacy',5,'WebSocket','legacy',status='completed')
+        assert store.db.total_changes-before==1
+    finally:reader.close();store.close()
+
+
+def test_correction_window_and_structural_edits_replay_activity_without_stale_keys(tmp_path,monkeypatch):
+    from cachemonitor import model_evidence
+    from cachemonitor.model_evidence import home_key
+    monkeypatch.setattr(model_evidence,'CORRECTION_ROWS',3)
+    store=EvidenceStore(tmp_path/'bounded.sqlite');reader=EvidenceReader(store.path);home=tmp_path/'home';key=home_key(home)
+    try:
+        for n in range(8):store.write(home,f'a{n}',n,'WebSocket',f'r{n}',status='completed')
+        reader.poll();generation=reader.generation
+        for seq in range(1,5):store.db.execute("UPDATE model_observations SET requested_model='corrected' WHERE seq=?",(seq,))
+        store.db.commit();reader.poll()
+        assert reader.generation>generation
+        assert store.db.execute('SELECT count(*) FROM model_observations WHERE correction_revision>0').fetchone()[0]<=3
+        assert all(reader.activity_records[(key,f'a{n}')]['requested_model']=='corrected' for n in range(4))
+        store.db.execute("UPDATE model_observations SET home='other-home',response_id='moved' WHERE seq=2")
+        store.db.commit();reader.poll()
+        assert (key,'a1') not in reader.activity_records and ('other-home','a1') in reader.activity_records
+        store.db.execute('DELETE FROM model_observations WHERE seq=3');store.db.commit();reader.poll()
+        assert (key,'a2') not in reader.activity_records
+        store.db.execute("UPDATE model_observations SET attempt='moved-attempt' WHERE seq=5")
+        store.db.commit();reader.poll()
+        assert (key,'a4') not in reader.activity_records and (key,'moved-attempt') in reader.activity_records
+        store.db.execute("UPDATE model_observations SET requested_model='latest-stamp' WHERE seq=4")
+        store.db.commit();reader.poll();previous=reader.correction_revision
+        store.db.execute('PRAGMA recursive_triggers=OFF')
+        store.db.execute('INSERT OR REPLACE INTO model_observations '
+            '(seq,home,attempt,ts,transport,response_id,requested_model,response_model,status,conflict) '
+            "VALUES(4,?,'replacement',4,'WebSocket','replacement','new','new','completed',0)",(key,))
+        store.db.commit();reader.poll()
+        assert reader.correction_revision>previous and (key,'a3') not in reader.activity_records
+        assert reader.activity_records[(key,'replacement')]['requested_model']=='new'
+        # Raw row restoration must not reinstall a deleted source's seed.
+        saved=store.db.execute('SELECT * FROM model_observations ORDER BY seq').fetchall()
+        columns=[row[1] for row in store.db.execute('PRAGMA table_info(model_observations)')]
+        changed=list(saved[0]);changed[columns.index('requested_model')]='restored'
+        saved[0]=tuple(changed);epoch=reader.correction_epoch;generation=reader.generation
+        store.db.execute('DELETE FROM model_observations')
+        store.db.executemany('INSERT INTO model_observations VALUES('+','.join('?' for _ in columns)+')',saved)
+        store.write(home,'restored-next',9,'WebSocket','restored-next',status='completed');reader.poll()
+        assert reader.correction_epoch!=epoch and reader.generation>generation
+        assert reader.activity_records[(key,'a0')]['requested_model']=='restored'
+        store.db.execute("UPDATE model_observations SET requested_model='first-stamp' WHERE seq=1")
+        store.db.execute("UPDATE model_observations SET requested_model='highest-stamp' WHERE seq=2")
+        store.db.commit();reader.poll();epoch=reader.correction_epoch
+        store.db.execute('UPDATE OR REPLACE model_observations SET seq=2 WHERE seq=1')
+        store.db.commit();reader.poll()
+        assert reader.correction_epoch!=epoch and ('other-home','a1') not in reader.activity_records
+        assert reader.activity_records[(key,'a0')]['seq']==2
+    finally:reader.close();store.close()
+
+
 def test_cancelled_response_releases_tracking_and_replay_keeps_next_request(tmp_path):
     from cachemonitor.model_proxy import Tracker
     store=EvidenceStore(tmp_path/'cancelled.sqlite')

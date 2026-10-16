@@ -20,6 +20,54 @@ FIELDS += TIMING_FIELDS + ('cache_policy','cache_policy_conflict')
 FIELDS += ('model_conflict','mode_conflict','timing_valid','analysis_model','model_source','configured_model')
 FIELDS += ('request_mode_source','request_mode_action','configured_service_tier','wire_service_tier_present','wire_observed')
 UNKNOWN = '확인 불가'
+CORRECTION_ROWS = 4096
+CORRECTION_KEY_BYTES = 4096
+CORRECTION_FIELDS = ('correction_revision', 'correction_reset', 'correction_epoch')
+CORRECTION_INDEX = ('CREATE INDEX evidence_corrections ON model_observations(correction_revision) '
+                    'WHERE correction_revision>0')
+ATTEMPT_INDEX = 'CREATE INDEX evidence_attempt ON model_observations(home,attempt,seq)'
+
+
+def observation_record(row):
+    return {key:value for key,value in dict(row).items() if key not in CORRECTION_FIELDS}
+
+
+def correction_stamp(target, reset='0'):
+    latest='FROM model_observations WHERE correction_revision>0 ORDER BY correction_revision DESC LIMIT 1'
+    revision=f'coalesce((SELECT correction_revision {latest}),0)+1'
+    floor=f'coalesce((SELECT correction_reset {latest}),0)'
+    epoch=f"CASE WHEN {reset} THEN lower(hex(randomblob(16))) ELSE coalesce(nullif((SELECT correction_epoch {latest}),''),lower(hex(randomblob(16)))) END"
+    return f'''UPDATE model_observations SET correction_revision={revision},
+        correction_epoch={epoch},
+        correction_reset=max({floor},({revision})-{CORRECTION_ROWS},CASE WHEN {reset} THEN {revision} ELSE 0 END)
+        WHERE seq={target};
+        UPDATE model_observations SET correction_revision=0,correction_reset=0,correction_epoch=''
+        WHERE correction_revision>0 AND correction_revision<=({revision})-1-{CORRECTION_ROWS};'''
+
+
+def correction_triggers(columns):
+    fields=','.join(sorted(set(columns)-set(CORRECTION_FIELDS)))
+    survivor='(SELECT max(seq) FROM model_observations WHERE seq<>OLD.seq)'
+    replacement='(SELECT max(seq) FROM model_observations WHERE seq<>NEW.seq)'
+    changes={
+        'update':f'''AFTER UPDATE OF {fields} ON model_observations BEGIN
+            {correction_stamp('NEW.seq','OLD.seq IS NOT NEW.seq OR OLD.home IS NOT NEW.home OR OLD.response_id IS NOT NEW.response_id OR OLD.attempt IS NOT NEW.attempt')} END''',
+        'delete':f'''BEFORE DELETE ON model_observations BEGIN
+            {correction_stamp(survivor,'1')} END''',
+        'replace':f'''BEFORE INSERT ON model_observations WHEN EXISTS
+            (SELECT 1 FROM model_observations WHERE seq=NEW.seq) BEGIN
+            {correction_stamp(replacement,'1')} END''',
+        'insert':f'''AFTER INSERT ON model_observations WHEN NEW.correction_revision<>0 OR NEW.correction_reset<>0
+            OR NEW.correction_epoch<>'' OR NEW.seq<(SELECT max(seq) FROM model_observations)
+            OR NOT EXISTS(SELECT 1 FROM model_observations WHERE seq<>NEW.seq) BEGIN
+            UPDATE model_observations SET correction_revision=0,correction_reset=0,correction_epoch=''
+                WHERE seq=NEW.seq AND (correction_revision<>0 OR correction_reset<>0 OR correction_epoch<>'');
+            UPDATE model_observations SET correction_revision=1,correction_epoch=lower(hex(randomblob(16)))
+                WHERE seq=NEW.seq AND NOT EXISTS(SELECT 1 FROM model_observations WHERE seq<>NEW.seq);
+            {correction_stamp('CASE WHEN NEW.seq<(SELECT max(seq) FROM model_observations) THEN NEW.seq END')} END''',
+    }
+    return {'evidence_correction_'+name:'CREATE TRIGGER evidence_correction_'+name+' '+sql
+            for name,sql in changes.items()}
 
 
 def default_path():
@@ -56,9 +104,13 @@ class EvidenceStore:
         self.path = path
         path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(path, timeout=.2)
+        try:self._initialize()
+        except BaseException:
+            self.db.close();raise
+
+    def _initialize(self):
         tables = {r[0] for r in self.db.execute("select name from sqlite_master where type='table'")}
         if tables - {'model_observations', 'observation_gaps', 'sqlite_sequence'}:
-            self.db.close()
             raise ValueError('모델 관측 전용 데이터베이스가 아닙니다')
         self.db.executescript('''
             PRAGMA journal_mode=WAL;
@@ -79,7 +131,41 @@ class EvidenceStore:
                 self.db.execute(f'alter table model_observations add column {column} REAL')
         if 'wire_service_tier_present' not in columns:
             self.db.execute('alter table model_observations add column wire_service_tier_present INTEGER')
+        self._enable_corrections()
         self.db.commit()
+
+    def _enable_corrections(self):
+        # Additive columns preserve older named-column writers and their table
+        # allowlist. Normal appends have zero stamps and no partial-index entry.
+        columns={row[1] for row in self.db.execute('PRAGMA table_info(model_observations)')}
+        expected=correction_triggers(columns)
+        actual=dict(self.db.execute("SELECT name,sql FROM sqlite_master WHERE type IN ('trigger','index')"))
+        indexes={'evidence_corrections':CORRECTION_INDEX,'evidence_attempt':ATTEMPT_INDEX}
+        if set(CORRECTION_FIELDS)<=columns and all(actual.get(name)==sql for name,sql in (expected|indexes).items()):return
+        self.db.execute('BEGIN IMMEDIATE')
+        try:
+            # Another producer may have completed the upgrade while we waited.
+            columns={row[1] for row in self.db.execute('PRAGMA table_info(model_observations)')}
+            actual=dict(self.db.execute("SELECT name,sql FROM sqlite_master WHERE type IN ('trigger','index')"))
+            repair=False
+            for column in CORRECTION_FIELDS:
+                if column not in columns:
+                    definition="TEXT NOT NULL DEFAULT ''" if column=='correction_epoch' else 'INTEGER NOT NULL DEFAULT 0'
+                    self.db.execute(f'ALTER TABLE model_observations ADD COLUMN {column} {definition}')
+                    repair=True
+            for name,sql in indexes.items():
+                if actual.get(name)!=sql:
+                    self.db.execute('DROP INDEX IF EXISTS '+name);self.db.execute(sql);repair=True
+            for name,sql in correction_triggers(columns).items():
+                if actual.get(name)!=sql:
+                    self.db.execute('DROP TRIGGER IF EXISTS '+name);self.db.execute(sql);repair=True
+            if repair:
+                # A missing trigger may have missed edits before this writer opened.
+                for statement in correction_stamp('(SELECT max(seq) FROM model_observations)','1').split(';'):
+                    if statement.strip():self.db.execute(statement)
+            self.db.commit()
+        except BaseException:
+            self.db.rollback();raise
 
     def write(self, home, attempt, ts, transport, response_id='', requested_model='',
               response_model='', status='', conflict=False,requested_service_tier='',response_service_tier='',
@@ -193,6 +279,11 @@ class EvidenceReader:
         self.catching_up = False
         self.highwater=0
         self.source_marker=''
+        self.source_version=None
+        self.correction_schema=None
+        self.correction_tracked=False
+        self.correction_revision=0
+        self.correction_epoch=None
 
     def _reset(self):
         if self.db is not None:
@@ -208,6 +299,11 @@ class EvidenceReader:
         self.catching_up = False
         self.highwater=0
         self.source_marker=''
+        self.source_version=None
+        self.correction_schema=None
+        self.correction_tracked=False
+        self.correction_revision=0
+        self.correction_epoch=None
         self.generation += 1
         self.revision += 1
         self.join_epoch += 1
@@ -243,14 +339,18 @@ class EvidenceReader:
                 return
         changed = False
         try:
+            changed=self._poll_corrections()
+            if changed is None:
+                self._reset()
+                return self.poll()
             highwater = self.db.execute('SELECT coalesce(max(seq),0) FROM model_observations').fetchone()[0]
             self.highwater=highwater
             if not self.source_marker and highwater:
                 first=self.db.execute('SELECT * FROM model_observations ORDER BY seq LIMIT 1').fetchone()
-                self.source_marker=hashlib.sha256(json.dumps(dict(first),sort_keys=True).encode()).hexdigest()
+                self.source_marker=hashlib.sha256(json.dumps(observation_record(first),sort_keys=True).encode()).hexdigest()
             anchor = self.db.execute('SELECT * FROM model_observations WHERE seq=?',
                                      (self.offset,)).fetchone() if self.offset else None
-            if self.offset and (highwater < self.offset or anchor is None or dict(anchor) != self.anchor):
+            if self.offset and (highwater < self.offset or anchor is None or observation_record(anchor) != self.anchor):
                 self._reset()
                 return self.poll()
             if self.db.execute("select 1 from sqlite_master where name='observation_gaps'").fetchone():
@@ -270,19 +370,8 @@ class EvidenceReader:
                 for row in rows:
                     self.offset = row['seq']
                     # Replace values so already published observations remain immutable.
-                    record = dict(row)
-                    activity_key=(row['home'],row['attempt'])
-                    old=self.activity_records.pop(activity_key,None)
-                    if old and old['response_id']!=row['response_id']:self._forget_record(old)
-                    self.activity_records[activity_key] = record
-                    self.changed_activity[activity_key] = record
-                    if row['response_id']:
-                        key = (row['home'], row['response_id'])
-                        self.changed_responses.setdefault(row['home'],set()).add(row['response_id'])
-                        self.records.setdefault(key, {})[row['attempt']] = record
-                    while len(self.activity_records)>self.MAX_RECORDS:
-                        _,expired=self.activity_records.popitem(last=False)
-                        self._forget_record(expired)
+                    record = observation_record(row)
+                    self._remember_record(record)
                     self.anchor = record
                 changed = True
                 if time.monotonic() >= deadline:break
@@ -294,6 +383,81 @@ class EvidenceReader:
         finally:
             # Completed batches are authoritative even if a later read fails.
             if changed:self.revision += 1
+
+    def _poll_corrections(self):
+        version=self.db.execute('PRAGMA data_version').fetchone()[0]
+        schema=self.db.execute('PRAGMA schema_version').fetchone()[0]
+        changed=False
+        if schema!=self.correction_schema:
+            columns={row[1] for row in self.db.execute('PRAGMA table_info(model_observations)')}
+            actual=dict(self.db.execute("SELECT name,sql FROM sqlite_master WHERE type IN ('trigger','index')"))
+            self.correction_tracked=(set(CORRECTION_FIELDS)<=columns
+                and actual.get('evidence_corrections')==CORRECTION_INDEX
+                and actual.get('evidence_attempt')==ATTEMPT_INDEX
+                and all(actual.get(name)==sql for name,sql in correction_triggers(columns).items()))
+            if self.source_version is not None and self.offset:
+                return None
+            self.correction_schema=schema
+        if self.correction_tracked:
+            latest=self.db.execute('SELECT correction_revision,correction_reset,correction_epoch FROM model_observations '
+                'WHERE correction_revision>0 ORDER BY correction_revision DESC LIMIT 1').fetchone()
+            revision,floor,epoch=tuple(latest) if latest else (0,0,None)
+            if self.source_version is not None and self.offset and (epoch!=self.correction_epoch
+                    or revision<self.correction_revision or floor>self.correction_revision):
+                return None
+            if revision>self.correction_revision:
+                # The indexed stamps retain only a bounded correction window.
+                # Oversized external keys invalidate globally instead of being
+                # copied into the collector's transient changed-key catalog.
+                attempts=set()
+                for home,response,attempt in self.db.execute('SELECT CASE WHEN length(CAST(home AS BLOB))+'
+                    'length(CAST(response_id AS BLOB))+length(CAST(attempt AS BLOB))<=? THEN home END,CASE WHEN '
+                    'length(CAST(response_id AS BLOB))<=? THEN response_id END,CASE WHEN '
+                    'length(CAST(attempt AS BLOB))<=? THEN attempt END FROM model_observations '
+                    'WHERE correction_revision>0 AND correction_revision>? AND correction_revision<=?',
+                    (CORRECTION_KEY_BYTES,CORRECTION_KEY_BYTES,CORRECTION_KEY_BYTES,self.correction_revision,revision)):
+                    if home is None:
+                        if self.source_version is not None and self.offset:return None
+                        continue
+                    if response:self.changed_responses.setdefault(home,set()).add(response)
+                    attempts.add((home,attempt))
+                self._refresh_activity(attempts)
+                changed=True
+            self.correction_revision=revision
+            self.correction_epoch=epoch
+        elif self.source_version is not None and self.offset and version!=self.source_version:
+            # Legacy/read-only sources cannot identify old edits. Do not assume
+            # an increased append high-water mark excludes a simultaneous edit.
+            return None
+        self.source_version=version
+        return changed
+
+    def _refresh_activity(self, attempts):
+        attempts=list(attempts)
+        for start in range(0,len(attempts),128):
+            batch=attempts[start:start+128]
+            slots=','.join('(?,?)' for _ in batch)
+            for row in self.db.execute(f'WITH changed(home,attempt) AS (VALUES {slots}) '
+                'SELECT m.* FROM changed c JOIN model_observations m ON m.seq='
+                '(SELECT max(seq) FROM model_observations WHERE home=c.home AND attempt=c.attempt AND seq<=?)',
+                (*[value for key in batch for value in key],self.offset)):
+                record=observation_record(row)
+                if self.activity_records.get((record['home'],record['attempt']))!=record:
+                    self._remember_record(record)
+
+    def _remember_record(self, record):
+        activity_key=(record['home'],record['attempt'])
+        old=self.activity_records.pop(activity_key,None)
+        if old and old['response_id']!=record['response_id']:self._forget_record(old)
+        self.activity_records[activity_key]=record
+        self.changed_activity[activity_key]=record
+        if record['response_id']:
+            key=(record['home'],record['response_id'])
+            self.changed_responses.setdefault(record['home'],set()).add(record['response_id'])
+            self.records.setdefault(key,{})[record['attempt']]=record
+        while len(self.activity_records)>self.MAX_RECORDS:
+            _,expired=self.activity_records.popitem(last=False)
+            self._forget_record(expired)
 
     def _forget_record(self,record):
         key=(record['home'],record['response_id'])
@@ -314,7 +478,7 @@ class EvidenceReader:
                     'JOIN (SELECT max(seq) seq FROM model_observations '
                     f'WHERE home=? AND response_id IN ({slots}) AND seq<=? GROUP BY response_id,attempt) latest '
                     'ON m.seq=latest.seq',(home,*responses,self.offset)):
-                    value=dict(record)
+                    value=observation_record(record)
                     if proof is not None:proof.observe(value)
                     missing=value.get('observation_missing') or any(a<=value['ts']<=b for a,b in self.gaps)
                     summary=evidence.get(record['response_id'])

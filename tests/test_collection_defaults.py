@@ -111,8 +111,9 @@ def test_closed_collection_reuses_bodies_and_replays_only_changed_owners(tmp_pat
         db.execute('INSERT INTO threads(id,rollout_path,name) VALUES(?,?,?)',(other,str(second),'Second'))
     evidence=tmp_path/'evidence.sqlite';store=EvidenceStore(evidence)
     store.write(home,'attempt',10000,'WebSocket','r1','model-a','model-a','completed')
+    store.write(home,'unrelated',10001,'WebSocket','outside','model-a','model-a','completed')
     store.close()
-    target=tmp_path/'index.sqlite';rebuilt=[]
+    target=tmp_path/'index.sqlite';rebuilt=[];latest_activity={}
     original=UsageIndex.rebuild_steps
     def replay(index,key,now):
         rebuilt.append(key[1])
@@ -127,6 +128,7 @@ def test_closed_collection_reuses_bodies_and_replays_only_changed_owners(tmp_pat
         reader=CollectionChannel([home],target,evidence)
         try:value=reader.read(shared=True)
         finally:reader.close()
+        latest_activity.clear();latest_activity.update((row['attempt'],row) for row in value['request_activity'])
         return {row['id']:{k:v for k,v in row.items() if k not in ('usage_revision','request_revision')}
                 for row in value['sessions']}
     service=CollectorService([home],target,evidence)
@@ -146,6 +148,21 @@ def test_closed_collection_reuses_bodies_and_replays_only_changed_owners(tmp_pat
     rebuilt.clear();service=CollectorService([home],target,evidence)
     try:
         assert collect(service,20001)==first and not rebuilt
+        # Correct an old row while another observation advances the sequence.
+        store=EvidenceStore(evidence)
+        try:
+            store.db.execute("UPDATE model_observations SET requested_model='runtime-model' WHERE response_id='r1'")
+            store.write(home,'appended',10002,'WebSocket','outside-new','model-a','model-a','completed')
+            store.write(home,'appended-next',10003,'WebSocket','outside-next','model-a','model-a','completed')
+        finally:store.close()
+        with monkeypatch.context() as patch:
+            patch.setattr(service.index.model_evidence,'MAX_POLL_ROWS',1)
+            corrected=collect(service,20002)
+        assert set(rebuilt)=={TID}
+        assert corrected[TID]['history'][0]['model']=='runtime-model'
+        assert latest_activity['attempt']['requested_model']=='runtime-model'
+        assert corrected[other]==first[other]
+        first[TID]=corrected[TID];rebuilt.clear()
         with sqlite3.connect(home/'state_5.sqlite') as db:
             db.execute('UPDATE threads SET name=? WHERE id=?',('Renamed',other))
         renamed=collect(service,20012)
@@ -190,6 +207,36 @@ def test_closed_collection_reuses_bodies_and_replays_only_changed_owners(tmp_pat
     try:
         assert collect(service,24003)==changed
         assert TID in rebuilt
+        replay=service.index.replay
+        replay.commit_admissions()
+        removed_owner=replay.db.execute('SELECT id FROM owners WHERE home=? AND sid=?',(str(home),other)).fetchone()[0]
+        second.write_text('',encoding='utf8')
+        original_poll=service.index.poll
+        def unfinished(now):
+            snapshot=original_poll(now)
+            return {**snapshot,'usage_collection_complete':False,'index':{**snapshot['index'],'loading':True}}
+        with monkeypatch.context() as patch:
+            patch.setattr(service.index,'poll',unfinished)
+            service.poll(24004)
+        assert replay.db.execute('SELECT 1 FROM owners WHERE id=?',(removed_owner,)).fetchone()
+        assert service.channel.db.execute('SELECT 1 FROM sessions WHERE home=? AND sid=?',(str(home),other)).fetchone() is None
+    finally:service.close()
+    # Restart loses the removal delta; complete membership must reclaim the proof.
+    service=CollectorService([home],target,evidence)
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(collection_replay,'CAPTURE_SECONDS',0)
+            remaining=collect(service,24005)
+        assert set(remaining)=={TID} and remaining[TID]==changed[TID]
+        replay=service.index.replay
+        assert replay.db.execute('SELECT 1 FROM owners WHERE id=?',(removed_owner,)).fetchone()
+        source_changes=service.index.db.total_changes;public_changes=service.channel.db.total_changes
+        deadline=time.monotonic()+5
+        while service.maintain():assert time.monotonic()<deadline
+        assert service.index.db.total_changes==source_changes and service.channel.db.total_changes==public_changes
+        assert replay.db.execute('SELECT 1 FROM owners WHERE id=?',(removed_owner,)).fetchone() is None
+        assert replay.db.execute('SELECT 1 FROM responses WHERE owner=?',(removed_owner,)).fetchone() is None
+        assert replay.db.execute('SELECT count(*) FROM owners').fetchone()[0]==1
     finally:service.close()
 
 

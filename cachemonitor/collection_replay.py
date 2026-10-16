@@ -11,7 +11,7 @@ import sqlite3
 import time
 
 from .core import Session, Transport, WINDOW
-from .model_evidence import home_key
+from .model_evidence import home_key, observation_record
 from .version import VERSION
 
 
@@ -26,6 +26,9 @@ PROOF_ROWS = 65536
 COMMIT_BYTES = 2 * 1024 * 1024
 COMMIT_SECONDS = 5
 CAPTURE_SECONDS = .05
+CLEANUP_KEYS = 4096
+CLEANUP_KEY_BUDGET = 16 * 1024 * 1024
+CLEANUP_BATCH = 256
 
 
 def encoded(value):
@@ -49,7 +52,7 @@ class EncodedSession(dict):
 
 
 def observation_digest(record):
-    return sha256(encoded(dict(record))).digest()
+    return sha256(encoded(observation_record(record))).digest()
 
 
 def integrity(proof, header, digest, fingerprint, evidence):
@@ -110,6 +113,14 @@ class CollectionReplay:
         self.capture_snapshot = None
         self.capture_position = 0
         self.capture_pending = False
+        self.cleanup_keys = set()
+        self.cleanup_key_bytes = 0
+        self.cleanup_scan = 0
+        self.cleanup_rows = deque()
+        self.cleanup_active = None
+        self.cleanup_dirty = False
+        self.cleanup_pending = False
+        self.cleanup_homes = {str(home) for home in index.homes}
         self.wal_path = channel.companion('.collection-replay.sqlite-wal')
 
     def source_proof(self, key):
@@ -147,6 +158,18 @@ class CollectionReplay:
         if not self.enabled:
             return
         reader = self.index.model_evidence
+        # Poll deltas live for one reader batch. Preserve invalidation even when
+        # later batches or a read error defer restoration and publication.
+        if self.join_epoch is not None and self.join_epoch != reader.join_epoch:
+            self.invalidated.update(key for key, session in self.index.monitor.sessions.items()
+                                    if hasattr(session, '_replay_body'))
+        elif self.started:
+            for home, keys in reader.changed_responses.items():
+                for key in keys:
+                    self.invalidated.update((row[0], row[1]) for row in self.db.execute(
+                        'SELECT o.home,o.sid FROM responses r JOIN owners o ON o.id=r.owner WHERE r.key=?',
+                        (response_key(home, key),)))
+        self.join_epoch = reader.join_epoch
         version = self.reader_version()
         if version is None:
             return
@@ -173,18 +196,6 @@ class CollectionReplay:
                     self.restore_job = None
                     self.pending.clear()
                     break
-        changed = set()
-        if self.join_epoch is not None and self.join_epoch != reader.join_epoch:
-            changed.update(key for key, session in self.index.monitor.sessions.items()
-                           if hasattr(session, '_replay_body'))
-        elif not initial:
-            for home, keys in reader.changed_responses.items():
-                for key in keys:
-                    changed.update((row[0], row[1]) for row in self.db.execute(
-                        'SELECT o.home,o.sid FROM responses r JOIN owners o ON o.id=r.owner WHERE r.key=?',
-                        (response_key(home, key),)))
-        self.invalidated.update(changed)
-        self.join_epoch = reader.join_epoch
         self.evidence_version = version
 
     def _restore(self, version, now):
@@ -292,9 +303,12 @@ class CollectionReplay:
                 - len(encoded(previous._replay_state)) - len(encoded(dict(previous._replay_body))))
 
     def capture(self, snapshot, now):
+        removed=getattr(self.channel,'removed_sessions',())
+        self.channel.removed_sessions=()
         if not self.writable:
             self.capture_pending = False
             return False
+        self.remember_removed(removed)
         try:
             # Proofs have no role in acknowledging source or public writes.
             # Commit bounded admission batches, not every display publication.
@@ -306,8 +320,9 @@ class CollectionReplay:
                 finally:
                     self.db.execute('PRAGMA busy_timeout=100')
             self.capture_pending = self._capture(snapshot, now)
-            if self.pending_admissions and (self.pending_bytes >= COMMIT_BYTES
-                    or time.monotonic() - self.admission_started >= COMMIT_SECONDS):
+            if (self.pending_admissions or self.cleanup_dirty) and (self.pending_bytes >= COMMIT_BYTES
+                    or time.monotonic() - self.admission_started >= COMMIT_SECONDS
+                    or self.cleanup_dirty and not self.cleanup_pending):
                 self.commit_admissions()
         except sqlite3.Error:
             self.writable = False
@@ -320,6 +335,8 @@ class CollectionReplay:
             self.pending_bytes = 0
             self.admission_started = None
             self.capture_pending = False
+            self.cleanup_keys.clear();self.cleanup_rows.clear();self.cleanup_active=None
+            self.cleanup_key_bytes=0;self.cleanup_dirty=False
         if not self.capture_pending:self.capture_snapshot = None
         return self.capture_pending
 
@@ -328,6 +345,76 @@ class CollectionReplay:
         self.pending_admissions.clear()
         self.pending_bytes = 0
         self.admission_started = None
+        self.cleanup_dirty = False
+
+    def remember_removed(self, removed):
+        # The publisher already computed this delta and committed its deletion.
+        # Overflow schedules one bounded reconciliation, never an unbounded queue.
+        for key in removed:
+            if key in self.cleanup_keys:continue
+            weight=256+4*(len(key[0])+len(key[1]))
+            if len(self.cleanup_keys)>=CLEANUP_KEYS or self.cleanup_key_bytes+weight>CLEANUP_KEY_BUDGET:
+                self.cleanup_keys.clear();self.cleanup_key_bytes=0
+                self.cleanup_rows.clear();self.cleanup_scan=0
+                break
+            self.cleanup_keys.add(key);self.cleanup_key_bytes+=weight
+
+    def cleanup_changed(self, size):
+        self.cleanup_dirty=True;self.pending_bytes+=size
+        if self.admission_started is None:self.admission_started=time.monotonic()
+
+    def cleanup(self, snapshot, current, deadline):
+        # A missing file is not deletion: retained source events can still own a
+        # body. Only complete, error-free membership for selected homes is final.
+        if (not snapshot.get('usage_collection_complete') or snapshot.get('index',{}).get('loading')
+                or snapshot.get('errors') or snapshot.get('usage_errors') or self.pending):
+            return False
+        while time.monotonic()<deadline and self.pending_bytes<COMMIT_BYTES:
+            if self.cleanup_active is not None:
+                owner,home,sid=self.cleanup_active
+            elif self.cleanup_keys:
+                home,sid=self.cleanup_keys.pop()
+                self.cleanup_key_bytes-=256+4*(len(home)+len(sid))
+                row=self.db.execute('SELECT id FROM owners WHERE home=? AND sid=?',(home,sid)).fetchone()
+                if row is None:continue
+                owner=row[0]
+            elif self.cleanup_rows:
+                owner,home,sid=self.cleanup_rows.popleft()
+            elif self.cleanup_scan is not None:
+                # Startup reads only bounded owner metadata once. Later work is
+                # driven by exact removed keys unless that bounded delta overflowed.
+                valid=f"typeof(home)='text' AND typeof(sid)='text' AND length(home)+length(sid)<={HEADER_LIMIT}"
+                rows=self.db.execute(f'SELECT id,CASE WHEN {valid} THEN home END,CASE WHEN {valid} THEN sid END '
+                    'FROM owners WHERE id>? ORDER BY id LIMIT 64',(self.cleanup_scan,)).fetchall()
+                if not rows:
+                    self.cleanup_scan=None
+                    continue
+                self.cleanup_scan=rows[-1][0];self.cleanup_rows.extend(rows)
+                continue
+            else:return False
+            key=home,sid
+            session=self.index.monitor.sessions.get(key)
+            if (home not in self.cleanup_homes or key in current['sessions']
+                    or hasattr(session,'_replay_body')
+                    or self.channel.db.execute('SELECT 1 FROM sessions WHERE home=? AND sid=?',key).fetchone()):
+                self.cleanup_active=None
+                continue
+            if self.cleanup_active is None:
+                # A crash or a returning owner must never restore a body whose
+                # response index has only been partially removed.
+                self.db.execute('UPDATE owners SET proof=NULL,header=NULL,digest=NULL,fingerprint=NULL,'
+                    'evidence=NULL,integrity=NULL WHERE id=?',(owner,))
+                self.cleanup_active=(owner,home,sid)
+                self.cleanup_changed(2*HEADER_LIMIT+256)
+            deleted=self.db.execute('DELETE FROM responses WHERE owner=? AND key IN '
+                '(SELECT key FROM responses WHERE owner=? LIMIT ?)',(owner,owner,CLEANUP_BATCH)).rowcount
+            self.cleanup_changed(64*deleted)
+            if deleted<CLEANUP_BATCH:
+                self.db.execute('DELETE FROM owners WHERE id=?',(owner,))
+                self.cleanup_changed(256)
+                self.invalidated.discard(key);self.pending_admissions.discard(key)
+                self.cleanup_active=None
+        return bool(self.cleanup_active is not None or self.cleanup_keys or self.cleanup_rows or self.cleanup_scan is not None)
 
     def _capture(self, snapshot, now):
         if not self.writable or not self.enabled or not self.started or self.restore_job is not None:
@@ -339,6 +426,8 @@ class CollectionReplay:
         if self.capture_snapshot is not snapshot:
             self.capture_snapshot = snapshot
             self.capture_position = 0
+        self.cleanup_pending=self.cleanup(snapshot,current,deadline)
+        if self.cleanup_pending:return True
         views = snapshot['sessions']
         for position in range(self.capture_position, len(views)):
             if time.monotonic() >= deadline:
@@ -397,6 +486,7 @@ class CollectionReplay:
 
     def close(self):
         self.capture_snapshot = None
+        self.cleanup_keys.clear();self.cleanup_rows.clear();self.cleanup_active=None
         if self.restore_job is not None:
             self.restore_job.close()
             self.restore_job = None

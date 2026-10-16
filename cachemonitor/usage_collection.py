@@ -399,6 +399,7 @@ class CollectionChannel:
         return current,revision,next_revision if writes else highwater
 
     def publish(self,snapshot,epoch,sequence,*,changes=None):
+        self.removed_sessions=()
         if snapshot.get('activity_stream'):
             snapshot={**snapshot,'activity_highwater':getattr(self,'activity_row_revision',0)}
         candidate=self.live.prepare(snapshot,epoch,sequence,changes=changes) if self.live else None
@@ -510,6 +511,7 @@ class CollectionChannel:
                 self.db.execute('INSERT OR REPLACE INTO snapshot VALUES(1,?,?,?,?,?)',
                     (self.scope,epoch,sequence,snapshot['ts'],encoded_header.payload))
         self.published=current;self.publish_epoch=epoch
+        self.removed_sessions=removed
         self.retained_session_keys=retained
         self.published_header=encoded_header;self.publish_sequence=sequence
         self.published_activity=activities;self.activity_revision=activity_revision
@@ -658,6 +660,71 @@ class CollectionChannel:
         self.pending_checkpoint=checkpoint
         self.checkpoint_exclusions=exclusions if checkpoint else set()
 
+    def _durable_header(self,db,identity):
+        if identity!=self.identity:
+            payload=db.execute('SELECT payload FROM snapshot WHERE id=1').fetchone()[0]
+            header=json.loads(zlib.decompress(payload))
+        else:header=self.cached
+        source=header.get('index',{}).get('path')
+        if not source or os.path.normcase(str(Path(source).resolve()))!=os.path.normcase(str(self.path)):
+            raise CollectionScopeError('수집 결과의 사용량 색인 경로가 일치하지 않습니다.')
+        schema=header.get('collection_schema',1)
+        if schema not in (1,2):raise CollectionScopeError('지원하지 않는 수집 형식입니다.')
+        return header,schema
+
+    def _durable_sessions(self,db,entries,previous):
+        """Read only these catalog owners inside the caller's read transaction."""
+        for entry in entries:
+            key=(entry['home'],entry['sid']);revision=entry['revision']
+            old=previous.get(key)
+            if old is not None and old[0]==revision:heavy,digest,revisions=old[1:]
+            else:
+                stored=db.execute('SELECT revision,payload FROM sessions WHERE home=? AND sid=?',key).fetchone()
+                if stored is None or stored[0]!=revision:
+                    raise CollectionScopeError('수집 결과의 세션 revision이 일치하지 않습니다.')
+                heavy,digest,revisions=self._decode_body(key,stored[1],entry.get('body_digest'))
+            yield key,(revision,heavy,digest,revisions),{**heavy,**revisions,**entry['state']}
+
+    def read_catalog(self):
+        """Return durable owner references without decoding their call history."""
+        result=self.read_owners(())
+        return result['catalog'] if result is not None else None
+
+    def read_owners(self,owners,*,catalog=None):
+        """Read selected owners at one durable publication, without retaining them.
+
+        The returned catalog is a body reference, not an analytical summary.
+        A supplied catalog pins the exact publication. A mismatch raises before
+        decoding and never silently substitutes a newer result or retries.
+        This does not advance the ordinary full reader's recovery checkpoint.
+        """
+        keys=set(map(tuple,owners))
+        if catalog is not None and (catalog['scope']!=self.scope or catalog['path']!=str(self.path)):
+            raise CollectionScopeError('수집 목록의 사용량 색인 경로 또는 관측 DB가 일치하지 않습니다.')
+        with closing(sqlite3.connect(self.snapshot_path.as_uri()+'?mode=ro',uri=True)) as db:
+            db.execute('BEGIN')
+            row=db.execute('SELECT scope,epoch,sequence FROM snapshot WHERE id=1').fetchone()
+            if row is None:
+                if catalog is not None:raise CollectionPending('요청한 수집 목록이 더 이상 현재 목록이 아닙니다.')
+                return None
+            if row[0]!=self.scope:
+                if locked(self.companion('.collector.lock')):
+                    raise CollectionScopeError('사용량 색인에 다른 관측 DB가 연결되어 있습니다. 별도 색인 경로를 사용하세요.')
+                return None
+            identity=(row[1],row[2])
+            if catalog is not None and tuple(catalog['publication'])!=identity:
+                raise CollectionPending('요청한 수집 목록이 더 이상 현재 목록이 아닙니다.')
+            header,schema=self._durable_header(db,identity)
+            if schema!=2:raise CollectionPending('선택 읽기를 지원하는 수집 목록을 준비하고 있습니다.')
+            entries=header['session_manifest']
+            selected=[entry for entry in entries if (entry['home'],entry['sid']) in keys]
+            if len(selected)!=len(keys):raise KeyError('요청한 세션이 수집 목록에 없습니다.')
+            result=dict(scope=self.scope,path=str(self.path),publication=identity,
+                header={key:value for key,value in header.items() if key not in ('sessions','session_manifest','collection_schema')},
+                owners={(entry['home'],entry['sid']):entry for entry in entries})
+            sessions=[session for _,_,session in self._durable_sessions(db,selected,{})]
+        return dict(catalog=result,sessions=sessions)
+
     def read(self,*,shared=False,header_only=False):
         # __new__ read-only diagnostic channels intentionally remain SQLite-only.
         self.last_read_live=False
@@ -709,30 +776,15 @@ class CollectionChannel:
                 # A disconnected collector cannot make an older checkpoint
                 # newer. Avoid decoding that checkpoint merely to discard it.
                 return self.recovered_snapshot(None,identity,shared=shared,header_only=header_only)
-            if identity!=self.identity:
-                payload=db.execute('SELECT payload FROM snapshot WHERE id=1').fetchone()[0]
-                header=json.loads(zlib.decompress(payload))
-            else:header=self.cached
-            source=header.get('index',{}).get('path')
-            if not source or os.path.normcase(str(Path(source).resolve()))!=os.path.normcase(str(self.path)):
-                raise CollectionScopeError('수집 결과의 사용량 색인 경로가 일치하지 않습니다.')
-            schema=header.get('collection_schema',1)
-            if schema not in (1,2):raise CollectionScopeError('지원하지 않는 수집 형식입니다.')
+            header,schema=self._durable_header(db,identity)
             if header_only:
                 return self.recovered_snapshot({k:v for k,v in header.items() if k not in ('sessions','session_manifest','collection_schema')},
                                                identity,shared=shared,header_only=True)
             if schema==2:
                 previous=self.session_cache if self.identity and self.identity[0]==row[1] else {}
                 current={};sessions=[]
-                for entry in header['session_manifest']:
-                    key=(entry['home'],entry['sid']);revision=entry['revision']
-                    old=previous.get(key)
-                    if old is not None and old[0]==revision:heavy,digest,revisions=old[1:]
-                    else:
-                        stored=db.execute('SELECT revision,payload FROM sessions WHERE home=? AND sid=?',key).fetchone()
-                        if stored is None or stored[0]!=revision:raise CollectionScopeError('수집 결과의 세션 revision이 일치하지 않습니다.')
-                        heavy,digest,revisions=self._decode_body(key,stored[1],entry.get('body_digest'))
-                    current[key]=(revision,heavy,digest,revisions);sessions.append({**heavy,**revisions,**entry['state']})
+                for key,body,session in self._durable_sessions(db,header['session_manifest'],previous):
+                    current[key]=body;sessions.append(session)
                 result={k:v for k,v in header.items() if k not in ('collection_schema','session_manifest')}
                 result['sessions']=sessions
                 current=self._retain_pending(result,current,live=False)

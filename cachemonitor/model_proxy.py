@@ -182,6 +182,17 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
     recent_relays=deque(maxlen=32)
     budget=WebSocketBudget(policy,clock)
 
+    async def storage_lifecycle(app):
+        if isinstance(store,EvidenceWriter):
+            try:await asyncio.to_thread(store.prepare)
+            except (sqlite3.Error,OSError,ValueError):
+                # Observation is optional. Failed preparation stays visible and
+                # ordinary writes retain their existing retry and gap policy.
+                pass
+            health.update(store.status())
+        yield
+    app.cleanup_ctx.append(storage_lifecycle)
+
     def public(diagnostic):
         return {k:v for k,v in diagnostic.items() if not k.startswith('_')}
 
@@ -209,9 +220,9 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
             nonlocal force_applied
             last_tick=0
             while True:
-                if managed and time.monotonic()-last_tick>=1:
+                if time.monotonic()-last_tick>=1:
                     if hasattr(store,'status'):health.update(store.status())
-                    await asyncio.to_thread(managed.tick,health)
+                    if managed:await asyncio.to_thread(managed.tick,health)
                     last_tick=time.monotonic()
                 apply_control()
                 if health.get('force_stopping') and not force_applied:
@@ -261,7 +272,7 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
             if hasattr(store,'status'):health.update(store.status())
             inventory=budget.status()
             selector=getattr(asyncio.get_running_loop(),'_selector',None)
-            return web.json_response({'status':'degraded' if health['storage_failure_streak'] else 'ok',**health,
+            return web.json_response({'status':'degraded' if health['storage_failure_streak'] or health.get('storage_initializing') else 'ok',**health,
                 'websocket_states':inventory['states'],'websocket_connections':inventory,
                 'http_connections':sum(d['transport']=='HTTP/SSE' for d in active_relays.values()),
                 'selector_sockets':len(selector.get_map()) if hasattr(selector,'get_map') else None,

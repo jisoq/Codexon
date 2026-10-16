@@ -7,6 +7,12 @@ from pathlib import Path
 from .model_evidence import EvidenceStore
 
 
+class _Preparation:
+    def __init__(self):
+        self.done=threading.Event()
+        self.error=None
+
+
 class EvidenceWriter:
     def __init__(self,path,capacity=1024,store_factory=EvidenceStore):
         self.path=Path(path)
@@ -16,6 +22,7 @@ class EvidenceWriter:
         self.pending_gap=None
         self.errors=0; self.dropped=0; self.written=0
         self.failure_streak=0
+        self.preparing=0
         self.closed=False
         self.stopping=threading.Event()
         self.thread=threading.Thread(target=self.run,name='observation-storage',daemon=True)
@@ -37,6 +44,22 @@ class EvidenceWriter:
         except Full:
             self.lost(copy); return False
         return True
+
+    def prepare(self,timeout=30):
+        """Prepare before admission; timeout leaves one owned, bounded queue item."""
+        if self.closed:raise RuntimeError('Observation storage is closed')
+        request=_Preparation();deadline=time.monotonic()+timeout
+        with self.lock:self.preparing+=1
+        try:self.queue.put(request,timeout=timeout)
+        except Full:
+            with self.lock:self.preparing-=1
+            self.errors+=1;self.failure_streak+=1
+            raise TimeoutError('Observation storage initialization did not start') from None
+        if not request.done.wait(max(0,deadline-time.monotonic())):
+            raise TimeoutError('Observation storage initialization did not complete')
+        if request.error is not None:
+            error=request.error;request.error=None
+            raise error
 
     def flush_gap(self,store):
         with self.lock:
@@ -61,6 +84,15 @@ class EvidenceWriter:
                 if record is None:
                     self.queue.task_done()
                     continue
+                if isinstance(record,_Preparation):
+                    try:
+                        if store is None:store=self.factory(self.path)
+                    except (sqlite3.Error,OSError,ValueError) as error:
+                        self.errors+=1;self.failure_streak+=1;record.error=error
+                    finally:
+                        with self.lock:self.preparing-=1
+                        record.done.set();self.queue.task_done()
+                    continue
                 try:
                     if store is None:store=self.factory(self.path)
                     self.flush_gap(store)
@@ -77,7 +109,7 @@ class EvidenceWriter:
 
     def status(self):
         return dict(storage_errors=self.errors,storage_failure_streak=self.failure_streak,
-                    storage_written=self.written,
+                    storage_written=self.written,storage_initializing=bool(self.preparing),
                     observation_dropped=self.dropped,storage_pending=self.queue.qsize(),
                     observation_gap_pending=self.pending_gap is not None)
 
