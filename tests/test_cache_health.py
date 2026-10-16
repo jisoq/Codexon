@@ -51,6 +51,21 @@ def test_backfill_and_correction_replay_global_first_and_incident():
     assert health.update([before]+fixed)['recent_rate']==90
 
 
+def test_repeated_incidents_require_their_own_two_recovery_calls():
+    values=[90]*5+[0]*2+[90]*2+[0]*3+[90]*2
+    history=rows([(100,value) for value in values])
+    health=CacheHealth()
+    state=health.update(history[:-1])
+    assert state['incidents']==2
+    assert state['events'][0]['recovery_keys']==['7','8']
+    assert not state['incident']['resolved']
+    assert state['incident']['recovery_keys']==[]
+    state=health.update(history)
+    assert state['incident']['resolved']
+    assert state['incident']['recovery_keys']==['12','13']
+    assert state['events'][0]['recovery_keys']==['7','8']
+
+
 def test_channel_routing_requires_confirmed_selected_scope_and_avoids_duplicates(tmp_path,monkeypatch):
     from types import SimpleNamespace
     from PySide6.QtCore import QSettings

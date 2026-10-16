@@ -82,6 +82,7 @@ class CacheHealth:
             self.candidate_rows.append(row)
             if len(self.candidate_rows)>=2:
                 self.count+=1
+                self.recovery_rows=[]
                 self.incident=dict(id='cache:'+str(self.candidate_rows[0]['key']),first_key=self.candidate_rows[0]['key'],
                     latest_key=row['key'],ts=self.candidate_rows[0]['ts'],updated_at=row['ts'],
                     count=len(self.candidate_rows),segment=scope,baseline_read=read,baseline_rate=rate,
