@@ -147,10 +147,11 @@ def explorer(engine,result,selection):
             unlinked_total=sum(not r.get('turn') for r in whole))
     else:
         records=rows
-        if selection.get('outside') and turn and scope:
+        if selection.get('outside') and turn and scope and session is not None:
             records=list(rows)
             keys={identity(r) for r in records}
-            records.extend(dict(r,_outside=True) for r in result['lookup']['whole_turns'].get((*scope,turn),[]) if identity(r) not in keys)
+            whole=engine.sessions.get(scope,{}).get('whole_turns',{})
+            records.extend(dict(r,_outside=True) for r in whole.get((*scope,turn),[]) if identity(r) not in keys)
     call_rows=rows if view=='requests' else records if view=='calls' else []
     call_lookup=result['lookup']['sessions'] if view=='calls' and records is scope_rows else None
     call_identities=frozenset(identity(row) for row in call_rows) if call_lookup is None else None
@@ -283,6 +284,9 @@ def compact(query,value,path=()):
 
 def project(engine,q):
     query={k:v for k,v in q.items() if k not in ('explorer','table_windows','presentation','compare_model','result_view')}
+    # The only consumer of out-of-range calls is the selected request. Read
+    # that owner directly instead of merging every owner's history per view.
+    query['include_whole_history']=False
     # The displayed hierarchy computes its own project-restricted lineage.
     # General query callers still receive their ordinary session cost rollups.
     if q['page']==2:

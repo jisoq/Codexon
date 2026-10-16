@@ -77,3 +77,47 @@ def test_ingest_revision_fast_path_and_corrected_historical_usage(backend):
     engine.ingest([dict(pending,_collection_pending=False),corrected])
     assert engine.record('home','a','response')['input']==100
     assert engine.record('home','session','response') is None
+
+
+def test_recent_request_boundaries_match_full_scan_after_corrections(backend):
+    from cachemonitor.analytics import analyze
+
+    class Requests(dict):
+        visited=0
+        def items(self):
+            for item in super().items():
+                self.visited+=1
+                yield item
+
+    session=Session('session','home',title='Boundaries')
+    session.add_usage(100,'response',dict(input_tokens=10,output_tokens=2),
+                      'gpt-6-astra','crossing','high',service_tier='Standard')
+    source=session.view(120)
+    source['turn_records']=Requests({
+        'later':dict(started_at=103,ended_at=108,state='완료'),
+        'old':dict(started_at=1,ended_at=2,state='완료'),
+        'crossing':dict(started_at=90,ended_at=110,state='완료'),
+        'earlier':dict(started_at=100,ended_at=101,state='완료'),
+        'end':dict(started_at=110,state='진행')})
+    outside=Session('past','home',title='Past')
+    outside.add_usage(1,'old-response',dict(input_tokens=10,output_tokens=2),
+                      'gpt-6-astra','old-turn','high',service_tier='Standard')
+    outside=outside.view(120)
+    engine=AnalysisEngine()
+    for iteration in range(3):
+        if iteration==1:source['turn_records']['old']['ended_at']=104
+        if iteration==2:del source['turn_records']['later']
+        source.update(usage_revision=iteration,request_revision=iteration)
+        engine.ingest([source,outside])
+        prepared=engine.sessions[('home','session')]['prepared']
+        for start,end,model in ((100,110,''),(110,111,''),(100,110,'gpt-6-astra')):
+            expected=analyze([prepared],start,end,model,with_comparisons=False)
+            source['turn_records'].visited=0
+            builds=engine.metrics['part_builds']
+            result=engine.query(dict(page=2,start=start,end=end,model=model))
+            actual=result['analysis']
+            for field in ('responses','turns','totals','excluded_turns','turn_count'):
+                assert actual[field]==expected[field]
+            assert source['turn_records'].visited==0
+            assert len(actual['sessions'])==2 and result['lookup']['session_turns'][('home','past')]==[]
+            assert engine.metrics['part_builds']-builds<=1

@@ -113,6 +113,8 @@ def test_timeline_respects_filters_turn_search_and_outside_scope():
     data = engine.page_query(request)['explorer']
     assert [row['ordinal'] for row in data['timeline']['rows']] == [1, 2, 3]
     assert {row['key'] for row in data['timeline']['rows']} == {row['key'] for row in data['records']['rows']}
+    excluded=engine.page_query({**request,'home':'not-selected'})['explorer']
+    assert excluded['timeline']['rows']==[]
     request['explorer'].update(outside=False, search='no matching session')
     assert engine.page_query(request)['explorer']['timeline']['rows'] == []
 

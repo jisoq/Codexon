@@ -1,5 +1,6 @@
 """Incremental, UI-independent analytical state owned by one worker process."""
 from bisect import bisect_left
+from array import array
 from collections import OrderedDict, defaultdict
 from datetime import datetime
 import hashlib
@@ -269,12 +270,17 @@ class AnalysisEngine:
             for row in history:
                 if row.get('turn'):whole_turns[(source['home'],source['id'],row['turn'])].append(row)
             prepared={**source,'history':history,'_prepared':True,'cache_misses':misses,'cache_health':health}
-            boundaries=sorted(value for turn in source.get('turn_records',{}).values()
-                              for value in (turn.get('started_at'),turn.get('ended_at')) if value is not None)
+            turn_ids=tuple(source.get('turn_records',{}))
+            boundary_entries=sorted((value,i) for i,turn in enumerate(source.get('turn_records',{}).values())
+                                    for value in (turn.get('started_at'),turn.get('ended_at')) if value is not None)
+            boundaries=[value for value,_ in boundary_entries]
+            boundary_turns=array('Q',(i for _,i in boundary_entries))
+            del boundary_entries
             updated[key]={'source':source,'prepared':prepared,'records':records,'fingerprint':fingerprint,
                           'request_facts':facts if facts is not None else _request_facts(source),
                           'revision':self.generation,'content_revision':self.generation,
-                          'timestamps':sorted(r['ts'] for r in history),'boundaries':boundaries,'whole_turns':dict(whole_turns)}
+                          'timestamps':sorted(r['ts'] for r in history),'boundaries':boundaries,
+                          'boundary_turns':boundary_turns,'turn_ids':turn_ids,'whole_turns':dict(whole_turns)}
             self.metrics['session_rebuilds']+=1
         if set(updated)!=set(previous_sessions): changed=True;calls_changed=True
         self.internal_sessions=OrderedDict((key,state) for key,state in updated.items() if internal_review(state['prepared']))
@@ -397,12 +403,23 @@ class AnalysisEngine:
             interval=(bisect_left(state['timestamps'],start),bisect_left(state['timestamps'],end))
             boundaries=state['boundaries']
             request_interval=(bisect_left(boundaries,start),bisect_left(boundaries,end))
+            if interval[0]==interval[1] and request_interval[0]==request_interval[1]:
+                # Keep session metadata and unresolved usage above, but do not
+                # construct an empty analytical population for an old owner.
+                state.pop('recent_part',None)
+                session_turns[session_key]=[]
+                continue
             part_key=(session_key,state['revision'],interval,request_interval,model,effort,mode)
             recent=state.get("recent_part")
             part=recent[1] if recent and recent[0]==part_key else self.parts.get(part_key)
             if part is None:
+                # Boundary-only requests use the same time range index as calls.
+                # Original request order, including equal timestamps, is retained.
+                lo,hi=request_interval
+                boundary_turns=() if any((model,effort,mode)) else (
+                    state['turn_ids'][i] for i in sorted(set(state['boundary_turns'][lo:hi])))
                 part=analyze([s],start,end,model,with_comparisons=False,service_tier=mode,effort=effort,
-                             _range_index=(interval,state['whole_turns']))
+                             _range_index=(interval,state['whole_turns']),_boundary_turns=boundary_turns)
                 part['_sorted_responses']=part['responses']
                 part['_sorted_turns']=sorted(part['turns'],key=lambda t:t['ts'],reverse=True)
                 lookup=defaultdict(list)

@@ -246,7 +246,7 @@ def request_record(key,items,whole,session,start,end):
 
 
 def analyze(sessions,start=0,end=float('inf'),model='',source='',archived=True,
-            unit='response',method='mean',input_band=None,with_comparisons=True,service_tier='',effort='',home='',project='',sid='',_range_index=None):
+            unit='response',method='mean',input_band=None,with_comparisons=True,service_tier='',effort='',home='',project='',sid='',_range_index=None,_boundary_turns=None):
     selected=[s for s in sessions if not internal_review(s) and (archived or not s.get('archived')) and (not source or s.get('source','unknown')==source)
               and (not home or s['home']==home) and (not sid or s['id']==sid) and (not project or project_matches(s,project))]
     responses=[];whole_turns=defaultdict(list);groups=defaultdict(list);session_map={}
@@ -277,9 +277,13 @@ def analyze(sessions,start=0,end=float('inf'),model='',source='',archived=True,
                 if row.get('turn'):groups[(s['home'],s['id'],row['turn'])].append(row)
     # Boundary-only and zero-call requests remain visible and contribute to exclusions.
     for sk,s in session_map.items():
+        if any((model,effort,service_tier)):continue
+        if _boundary_turns is not None and len(selected)==1:
+            for turn in _boundary_turns:groups.setdefault((*sk,turn),[])
+            continue
         for turn,meta in s.get('turn_records',{}).items():
             a,b=meta.get('started_at'),meta.get('ended_at')
-            if any(value is not None and start<=value<end for value in (a,b)) and not any((model,effort,service_tier)):
+            if any(value is not None and start<=value<end for value in (a,b)):
                 groups.setdefault((*sk,turn),[])
     turns=[request_record(key,items,whole_turns.get(key,[]),session_map[key[:2]],start,end) for key,items in groups.items()]
     units=responses if unit in ('response','call') else [t for t in turns if t['complete']]
