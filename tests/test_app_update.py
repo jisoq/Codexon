@@ -173,6 +173,7 @@ def test_explicit_start_is_single_flight_and_check_remains_read_only(tmp_path,mo
     from cachemonitor.update_panel import UpdatePanel
     from types import SimpleNamespace
     import threading
+    import time
     app=QApplication.instance() or QApplication([])
     panel=UpdatePanel(None);calls=[];gate=threading.Event()
     plan=dict(kind=kind,release=release(),connections=3)
@@ -180,19 +181,22 @@ def test_explicit_start_is_single_flight_and_check_remains_read_only(tmp_path,mo
     def install(*a,**kw):
         calls.append(kw['plan']);gate.wait(2);return '설치 시작'
     monkeypatch.setattr(app_update,'update',install)
-    def settle():
-        for _ in range(300):
+    def settle(predicate=lambda:panel.operation is None):
+        deadline=time.monotonic()+1.5
+        while time.monotonic()<deadline:
             app.processEvents();QTest.qWait(5)
-            if panel.operation is None:return
-        raise AssertionError('Update check did not finish')
+            if predicate():return
+        raise AssertionError('Update operation did not reach the expected state')
     try:
         panel.start();settle()
         assert not calls and panel.execute.isVisible() and not panel.button.isVisible()
         if closing:panel.owner=SimpleNamespace(_closing=True)
         panel.request_install();panel.request_install();panel.start()
-        QTest.qWait(40)
+        if closing:assert panel.operation is None
+        else:settle(lambda:bool(calls))
         assert calls==([] if closing else [plan])
         gate.set();settle()
+        assert calls==([] if closing else [plan])
     finally:
         gate.set()
         if panel.operation:panel.operation.wait()
