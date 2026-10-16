@@ -133,7 +133,8 @@ class QuotaComputation:
         current=ledger.current_report(self.home,now,retain_projection=True)
         valid=ledger.db.execute('SELECT valid FROM quota_archive_heads WHERE epoch=?',(self.archive.epoch,)).fetchone()
         if (current is None or not valid or not valid[0] or current.get('account')!=self.archive.account or
-                current.get('_projection_start')>self.archive.cutoff):return None
+                current.get('_projection_start')>self.archive.cutoff or
+                sorted((current.get('tracking') or {}).get('homes',[]))!=self.archive.head['policy'].get('homes')):return None
         ledger.release_report_cache()
         return current
 

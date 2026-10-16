@@ -901,7 +901,7 @@ class QuotaLedger:
     REQUEST_SORT_ROWS=32768
     SYNC_BATCH_ROWS=128
     ARCHIVE_COMPACTION_ROWS=512
-    READER_SCHEMA_VERSION=3
+    READER_SCHEMA_VERSION=4
     FUTURE_COLUMNS=(('observations',('at',)),('window_observations',('at',)),
         ('manual_resets',('at',)),('calls',('ts',)),('tracking_controls',('at',)),
         ('tracking_observations',('received',)),('tracking_tasks',('start','end')),
@@ -1879,11 +1879,86 @@ class QuotaLedger:
             windows.close()
             if observations is not None:observations.close()
 
-    def _report_calls(self, scope, cutoff, forward, from_at=None):
+    @staticmethod
+    def _forward_models(rows,separate):
+        grouped={}
+        for row in rows:grouped.setdefault((row['model'],row['service_tier']),[]).append(row)
+        values=[]
+        for (model,tier),own in grouped.items():
+            priced=[r['cost'] for r in own if r['cost'] is not None]
+            values.append(dict(model=model,service_tier=tier,displayed_tier=tier,
+                calls=len(own),priced=len(priced),cost=sum(priced) if priced else None,
+                mean_cost=sum(priced)/len(priced) if priced else None,
+                unknown_mode_calls=len(own) if tier=='미확인' else 0,
+                missing=len(own)-len(priced),prices=','.join(sorted({r['price_id'] for r in own})),
+                separate=ALIASES.get(model,model) in separate,
+                **{k:sum(r[k] for r in own) if all(r[k] is not None for r in own) else None for k in TOKEN_FIELDS}))
+        return sorted(values,key=lambda r:r['cost'] or 0,reverse=True)
+
+    def archive_calls(self,scope,cutoff,start,end,*,row_budget=65536):
+        """Bound changed-period accounting without replaying quota observations."""
+        calls,times,requests=self._report_calls(scope,cutoff,True,start,to_at=end,row_budget=row_budget)
+        slots=','.join('?' for _ in scope)
+        pending=[];weight=0
+        for row in self.db.execute(f'''SELECT w.* FROM (
+                SELECT * FROM tracking_wire WHERE home IN ({slots}) AND end IS NULL AND start<=?
+                UNION ALL SELECT * FROM tracking_wire INDEXED BY tracking_wire_home_end
+                WHERE home IN ({slots}) AND end>=? AND start<=?) w
+            WHERE w.start>=?
+            AND w.response<>'' AND NOT EXISTS(SELECT 1 FROM calls c WHERE c.home IN ({slots}) AND c.uid=w.response)
+            LIMIT ?''',(*scope,end,*scope,start,end,cutoff,*scope,row_budget+1)):
+            weight+=512+sum(64+4*len(value) for value in row if isinstance(value,str))
+            if len(pending)>=row_budget or weight>32*1024*1024:raise ValueError('Quota repair pending request budget')
+            pending.append(dict(row))
+        return calls,times,requests,pending
+
+    def _forward_cycle_costs(self,cycle,calls,times,pending):
+        """Refresh call-derived fields while retaining confirmed quota endpoints."""
+        if not cycle.get('forward_tracking') or not cycle.get('endpoints'):
+            raise ValueError('Quota cycle cannot be repaired without observation replay')
+        start,end=cycle['start'],cycle['end'];separate=set(cycle['separate_models'])
+        def window(left,right):
+            return [row for row in calls[bisect_right(times,left):bisect_right(times,right)]
+                    if row.get('request_start') is None or row['request_start']>=left]
+        rows=window(start,end)
+        models=self._forward_models(rows,separate)
+        cycle_models=self._forward_models(window(cycle['cycle_start'],cycle['cycle_end']),separate)
+        eligible=[row for row in models if not row['separate']]
+        pending_times=[row['end'] for row in pending if row['status']=='completed' and row['end'] is not None
+                       and start<row['end']<=end and row['start']>=start]
+        priced=sum(row['priced'] for row in eligible);missing=sum(row['missing'] for row in eligible)
+        complete=cycle.get('cost_complete_at') is not None and cycle['cost_complete_at']>=end
+        cost=sum(row['cost'] or 0 for row in eligible)
+        if not priced and (eligible or pending_times or not complete):cost=None
+        unknown=sum(row['unknown_mode_calls'] for row in eligible);standard=None
+        if unknown:
+            alternative=sum(row['cost'] or 0 for row in eligible);known=0
+            for row in calls[bisect_right(times,start):bisect_right(times,end)]:
+                if row['service_tier']!='미확인' or ALIASES.get(row['model'],row['model']) in separate:continue
+                value=token_cost({**row,'service_tier':'Standard'})['cost']
+                if value is not None:known+=1;alternative+=value
+            if known==missing:standard=alternative
+        excluded=sum(row.get('request_start') is not None and row['request_start']<start
+                     for row in calls[bisect_right(times,start):bisect_right(times,end)]
+                     if ALIASES.get(row['model'],row['model']) not in separate)
+        assumptions=[]
+        if missing:assumptions.append(f'단가 또는 토큰 자료 없는 {missing}호출은 비용 합계에서 제외')
+        if excluded:assumptions.append(f'관측 시작 전에 진행된 {excluded}호출은 비용 합계에서 제외')
+        assumptions.extend(value for value in cycle.get('assumptions',[]) if value.startswith('로컬 호출 기록 읽기 실패:'))
+        return {**cycle,'models':models,'cycle_models':cycle_models,'cost':cost,
+            'priced_calls':priced,'missing':missing,'all_cost':sum(row['cost'] or 0 for row in models),
+            'pending_usage_times':pending_times,'pending_usage_calls':len(pending_times),
+            'cost_complete':complete,'unknown_mode_calls':unknown,'mode_standard_cost':standard,
+            'boundary_excluded_calls':excluded,'assumptions':list(dict.fromkeys(assumptions)),
+            'cost_rows':[{**{key:row[key] for key in ('uid','ts','model','service_tier','cost',*TOKEN_FIELDS)},
+                          'request_start':row.get('request_start'),'local_request_start':row.get('local_request_start')}
+                         for row in rows]}
+
+    def _report_calls(self, scope, cutoff, forward, from_at=None, *, to_at=None, row_budget=None):
         """Reuse immutable request joins while only quota observations change."""
         packed=forward and getattr(self,'_pack_history',False)
         changes=getattr(self,'_input_changes',None)
-        cacheable=packed and changes is not None
+        cacheable=packed and changes is not None and to_at is None and row_budget is None
         key=(tuple(scope),cutoff,from_at)
         previous=getattr(self,'_request_inputs',None) if cacheable else None
         if (previous and previous[0]==key and not any(table in
@@ -1895,12 +1970,15 @@ class QuotaLedger:
         columns='home,uid,ts,model,'+','.join(TOKEN_FIELDS)+',cost,price_id,service_tier'
         selected=None;selected_params=()
         if from_at is not None and forward:
-            candidates=f'''SELECT uid FROM calls WHERE home IN ({slots}) AND ts>=?
-                UNION SELECT response FROM tracking_wire WHERE home IN ({slots}) AND status='completed' AND end>=?'''
+            upper=' AND ts<=?' if to_at is not None else ''
+            wire_upper=' AND end<=?' if to_at is not None else ''
+            candidates=f'''SELECT uid FROM calls WHERE home IN ({slots}) AND ts>=?{upper}
+                UNION SELECT response FROM tracking_wire WHERE home IN ({slots}) AND status='completed' AND end>=?{wire_upper}'''
             source=f'({candidates}) chosen CROSS JOIN calls c ON c.uid=chosen.uid'
             condition=f'c.home IN ({slots}) AND c.ts>=? AND c.model<>?'
             selected=f'SELECT c.uid FROM {source} WHERE {condition}'
-            selected_params=(*scope,from_at,*scope,from_at,*scope,cutoff,INTERNAL_REVIEW_MODEL)
+            bound=(from_at,to_at) if to_at is not None else (from_at,)
+            selected_params=(*scope,*bound,*scope,*bound,*scope,cutoff,INTERNAL_REVIEW_MODEL)
             if len(scope)==1:
                 calls=self.db.execute('SELECT '+','.join('c.'+column for column in columns.split(','))+
                     f' FROM {source} WHERE {condition} ORDER BY c.ts,c.uid',selected_params)
@@ -1925,15 +2003,30 @@ class QuotaLedger:
             if selected is not None:
                 # Include every version of a relevant response so duplicate
                 # completion and exact-start precedence remain unchanged.
-                wire_candidates=f'''SELECT uid AS response FROM ({selected})
-                    UNION SELECT response FROM tracking_wire WHERE home IN ({slots}) AND end IS NULL
-                    UNION SELECT response FROM tracking_wire WHERE home IN ({slots}) AND end>=?
-                    UNION SELECT response FROM tracking_wire WHERE home IN ({slots}) AND start>=?'''
+                if to_at is None:
+                    wire_candidates=f'''SELECT uid AS response FROM ({selected})
+                        UNION SELECT response FROM tracking_wire WHERE home IN ({slots}) AND end IS NULL
+                        UNION SELECT response FROM tracking_wire WHERE home IN ({slots}) AND end>=?
+                        UNION SELECT response FROM tracking_wire WHERE home IN ({slots}) AND start>=?'''
+                    wire_params=(*selected_params,*scope,*scope,from_at,*scope,from_at)
+                else:
+                    wire_candidates=f'''SELECT uid AS response FROM ({selected})
+                        UNION SELECT response FROM tracking_wire WHERE home IN ({slots}) AND end IS NULL AND start<=?
+                        UNION SELECT response FROM tracking_wire WHERE home IN ({slots}) AND end>=? AND start<=?'''
+                    wire_params=(*selected_params,*scope,to_at,*scope,from_at,to_at)
                 wire_source=f'({wire_candidates}) chosen CROSS JOIN tracking_wire w ON w.response=chosen.response'
-                wire_params=(*selected_params,*scope,*scope,from_at,*scope,from_at)
+            budget_count=0;budget_bytes=0
+            def admit(row):
+                nonlocal budget_count,budget_bytes
+                if row_budget is None:return
+                budget_count+=1
+                budget_bytes+=512+sum(64+4*len(value) for value in row if isinstance(value,str))
+                if budget_count>row_budget or budget_bytes>32*1024*1024:
+                    raise ValueError('Quota repair request budget')
             # The ordinary home/end index supplied this precedence before
             # range queries gained a response index. Keep it explicit.
             for row in self.db.execute(f"SELECT w.* FROM {wire_source} WHERE w.home IN ({slots}) AND w.response<>'' ORDER BY w.home,w.end,w.rowid",(*wire_params,*scope)):
+                if row_budget is not None:admit(row)
                 if row['status']=='completed' and row['end'] is not None:
                     completed[row['response']]=min(completed.get(row['response'],row['end']),row['end'])
                 exact_starts[row['home']][row['response']]=row['start']
@@ -1947,6 +2040,7 @@ class QuotaLedger:
             boundary_condition=f' AND uid IN ({selected})' if selected is not None else ''
             for row in self.db.execute(f'select * from tracking_call_boundaries where home in ({slots})'+boundary_condition,
                                        (*scope,*selected_params) if selected is not None else scope):
+                if row_budget is not None:admit(row)
                 if row['uid'] not in exact_starts[row['home']]:boundaries[row['home']][row['uid']]=row['started']
             if reuse_windows:
                 request_windows=previous[3]
@@ -1962,6 +2056,7 @@ class QuotaLedger:
                 nonlocal ordered
                 last=None
                 for row in source:
+                    if row_budget is not None:admit(row)
                     value={**dict(row),'ts':completed.get(row['uid'],row['ts']),
                         'request_start':exact_starts[row['home']].get(row['uid'],boundaries[row['home']].get(row['uid'])),
                         'local_request_start':exact_starts[row['home']].get(row['uid'])}
@@ -2100,20 +2195,7 @@ class QuotaLedger:
 
         def model_rows(start, end, separate):
             if tracking is not None:
-                grouped={}
-                for row in window_calls(start, end):
-                    grouped.setdefault((row['model'],row['service_tier']),[]).append(row)
-                values=[]
-                for (model,tier), own in grouped.items():
-                    priced=[r['cost'] for r in own if r['cost'] is not None]
-                    values.append(dict(model=model,service_tier=tier,displayed_tier=tier,
-                        calls=len(own),priced=len(priced),cost=sum(priced) if priced else None,
-                        mean_cost=sum(priced)/len(priced) if priced else None,
-                        unknown_mode_calls=len(own) if tier=='미확인' else 0,
-                        missing=len(own)-len(priced),prices=','.join(sorted({r['price_id'] for r in own})),
-                        separate=ALIASES.get(model,model) in separate,
-                        **{k:sum(r[k] for r in own) if all(r[k] is not None for r in own) else None for k in TOKEN_FIELDS}))
-                return sorted(values,key=lambda r:r['cost'] or 0,reverse=True)
+                return self._forward_models(window_calls(start,end),separate)
             fields = ','.join(f'case when count({k})=count(*) then sum({k}) else null end as {k}' for k in TOKEN_FIELDS)
             rows = self.db.execute(f'''select model,
                 service_tier as displayed_tier,
@@ -2168,13 +2250,32 @@ class QuotaLedger:
                     'manual_reset_id':marker['id'], 'reset_pending':True,
                     'unclassified_sessions':state['unclassified'] if state else None})
                 continue
+            if tracking is not None:
+                first,last=obs[0],obs[-1];start,end=first['at'],last['at']
+                separate=set().union(*(json.loads(value) for value in {row['separate'] for row in obs}))
+                uncertain_gap=bool(next_group and next_group['reason']!='예정 리셋 확인' and not next_group.get('manual_reset'))
+                if uncertain_gap or group.get('gap'):cycle_end=last['at']
+                base=dict(id=group['id'],reason=group['reason'],start=start,end=end,reset=last['reset'],
+                    used_start=first['used'],used_end=last['used'],delta=last['used']-first['used'],
+                    observations=len(obs),endpoints=[(row['at'],row['used']) for row in obs],forward_tracking=True,
+                    finished_at=group.get('finished_at'),boundary_uncertain=group.get('boundary_uncertain',False),
+                    cost_complete_at=completed_at,cycle_start=group['boundary'],cycle_end=cycle_end,
+                    uncertain_gap=bool(uncertain_gap or group.get('gap')),separate_models=sorted(separate),blocked=[],
+                    partial=first['used']!=0,live=any(row['source']=='live' for row in obs),pending=False,
+                    assumptions=[issue['reason'] for issue in issues if issue['reason'].startswith('로컬 호출 기록 읽기 실패:')],
+                    provisional=bool(group.get('provisional')) and not group.get('gap') and not group.get('discontinuous'),
+                    source=last['source'],plan=last.get('plan',''),bucket=last.get('bucket',''),
+                    rejected_observations=len(group.get('rejected',[])),discontinuous=bool(group.get('discontinuous')),
+                    account=last['account'],manual_reset_id=marker['id'] if marker else None,reset_pending=False,
+                    observation_gap=bool(group.get('gap')),unclassified_sessions=state['unclassified'] if state else None)
+                result.append(self._forward_cycle_costs(base,calls,call_times,tracking.get('pending_responses',[])))
+                if signature is not None:cycle_cache[group['id']]=(signature,result[-1])
+                continue
             # Never mix legacy/unknown account observations with live-account calibration.
             live = [r for r in obs if r['source'] == 'live']
             matched = obs
             pending = False
-            if tracking is not None:
-                pending = False
-            elif completed_at is not None:
+            if completed_at is not None:
                 collected = [r for r in matched if r['at'] <= completed_at]
                 if len(collected) >= 2:
                     matched = collected
@@ -2193,26 +2294,15 @@ class QuotaLedger:
                 uncertain_gap = True
             cycle_models = model_rows(group['boundary'],cycle_end,separate)
             eligible = [r for r in models if not r['separate']]
-            pending_usage_times = [r['end'] for r in (tracking or {}).get('pending_responses',[])
-                if r['status']=='completed' and r['end'] is not None and start<r['end']<=end and r['start']>=start]
+            pending_usage_times = []
             priced_count = sum(r['priced'] for r in eligible)
             cost_complete = completed_at is not None and completed_at >= end
             cost = sum(r['cost'] or 0 for r in eligible)
-            if tracking is not None and not priced_count and (eligible or pending_usage_times or not cost_complete):
-                cost = None
             missing = sum(r['missing'] for r in eligible)
-            if tracking is None and (not eligible or missing): cost = None
+            if not eligible or missing: cost = None
             blocked = []
-            if tracking is not None and any(gap['start']<row['ts']<=gap['end'] and row['home']==gap['home']
-                    for gap in tracking.get('ownership_gaps',[]) for row in calls[bisect_right(call_times,start):bisect_right(call_times,end)]):
-                blocked.append('로컬 홈 계정 확인 경계: 비용 귀속 미확인')
             if group.get('boundary_pending'):
                 blocked.append('요청 진행 중 경계: 비용 분리 불가')
-            if tracking is not None and not tracking['complete'] and group.get('provisional'):
-                blocked.append('로컬 작업, 비용 집계 대기')
-            if tracking is not None and any(r['start'] < end and (r['end'] is None or r['end'] > start)
-                    for r in tracking.get('pending_responses', [])):
-                blocked.append('완료 요청의 비용 기록 수집 대기')
             assumptions = []
             blocked.extend(sorted(group.get('coverage_reasons',[])))
             if group.get('discontinuous'):
@@ -2263,35 +2353,22 @@ class QuotaLedger:
                         assumptions.append('누계, 수집 근거 일부 미확인: 기간 전체 누락으로 단정하지 않음')
             if not issues and state and state['unclassified']:
                 assumptions.append('미분류 차액 있음: 구간별 증가 여부 확인 필요')
-            if live and i == len(groups)-1 and (tracking is None or group.get('provisional')):
+            if live and i == len(groups)-1:
                 assumptions.append('진행 중 관측 구간: 서버 반영 지연에 따라 갱신됨')
             if completed_at is None or completed_at < end:
                 blocked.append('해당 구간의 토큰 수집 완료 대기')
             if missing > mode_only_missing:
                 blocked.append(f'단가/토큰 미확인 {missing-mode_only_missing}개 호출')
-            if tracking is None and not sum(r['calls'] for r in eligible):
+            if not sum(r['calls'] for r in eligible):
                 blocked.append('대응하는 모델 호출 없음')
             boundary_excluded = 0
-            if tracking is not None:
-                boundary_excluded = sum(r.get('request_start') is not None and r['request_start'] < start
-                    for r in calls[bisect_right(call_times,start):bisect_right(call_times,end)]
-                    if ALIASES.get(r['model'],r['model']) not in separate)
-                blocked = []
-                assumptions = []
-                if missing:
-                    assumptions.append(f'단가 또는 토큰 자료 없는 {missing}호출은 비용 합계에서 제외')
-                if boundary_excluded:
-                    assumptions.append(f'관측 시작 전에 진행된 {boundary_excluded}호출은 비용 합계에서 제외')
-                # Collection errors affect cost coverage, never observed account
-                # consumption. Show only evidenced errors, not polling races.
-                assumptions.extend(r['reason'] for r in issues if r['reason'].startswith('로컬 호출 기록 읽기 실패:'))
             # The denominator is actual account consumption in the same ON window.
             delta = last['used'] - first['used']
             result.append({'id': group['id'], 'reason': group['reason'], 'start': start, 'end': end,
                 'reset': last['reset'], 'used_start': first['used'], 'used_end': last['used'],
                 'delta': delta, 'observations': len(matched), 'models': models, 'cost': cost,
                 'endpoints':[(r['at'],r['used']) for r in matched],
-                'forward_tracking':tracking is not None,
+                'forward_tracking':False,
                 'finished_at':group.get('finished_at'),
                 'boundary_uncertain':group.get('boundary_uncertain',False),
                 'boundary_excluded_calls':boundary_excluded,

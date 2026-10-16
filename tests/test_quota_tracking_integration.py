@@ -13,8 +13,8 @@ def activity(ledger, at, turns, calls=(), home='h', wire=()):
         sessions=[dict(home=home,id='s',turn_records=turns)]))
 
 
-def observe(ledger, at, remaining, home='h'):
-    q=dict(source='live',account='a',plan_type='pro',bucket='codex',requested_at=at,
+def observe(ledger, at, remaining, home='h', account='a'):
+    q=dict(source='live',account=account,plan_type='pro',bucket='codex',requested_at=at,
            observed_at=at+0.1,windows=dict(weekly=dict(used_percent=100-remaining,
            window_minutes=10080,resets_at=1000000)))
     ledger.observe(home,q)
@@ -36,8 +36,8 @@ def test_projected_current_period_survives_restart_and_invalidates_old_edits(tmp
         for at,remaining in ((102,70),(110,69),(120,99),(125,100),(130,99),(140,98)):
             observe(ledger,at,remaining)
         activity(ledger,141,{},[107,117,137],wire=[
-            dict(home='h',identity='corrected',response='117',start=126,end=129,status='completed'),
-            dict(home='h',identity='latest',response='137',start=132,end=137,status='completed')])
+            dict(home='h',attempt='corrected',response_id='117',request_observed_at=126,completed_observed_at=129,status='completed',ts=129),
+            dict(home='h',attempt='latest',response_id='137',request_observed_at=132,completed_observed_at=137,status='completed',ts=137)])
         assert ledger.current_report('h',142) is None
         expected=publish(142)['view']['chart']['series']['rows']
         assert ledger.db.execute('select valid from quota_current_projection').fetchone()[0]==1
@@ -77,7 +77,8 @@ def test_closed_period_projection_keeps_exact_queries_and_detail_after_restart(t
         for at,remaining in ((102,70),(110,69),(120,100),(130,99),(140,98),(150,100),(160,99)):
             observe(ledger,at,remaining)
         calls=[107,127,157]
-        wire=[dict(home='h',identity=str(at),response=str(at),start=at-2,end=at,status='completed') for at in calls]
+        wire=[dict(home='h',attempt=str(at),response_id=str(at),request_observed_at=at-2,
+                   completed_observed_at=at,status='completed',ts=at) for at in calls]
         activity(ledger,161,{},calls,wire=wire)
         raw=ledger.report('h',clock[0])
         raw['_cycle_versions']={key:value[0] for key,value in ledger._cycle_cache.items()}
@@ -103,7 +104,7 @@ def test_closed_period_projection_keeps_exact_queries_and_detail_after_restart(t
         actual_preview=worker.execute(dict(kind='preview',id='p',key='k',revision=result['report']['worker_revision'],start=120.1,end=140.1))
         assert actual_preview.get('value')==preview
         # A new call without wire timing affects the current suffix, not every
-        # completed period. A correction to an old cost invalidates the prefix.
+        # completed period. A corrected old cost replaces its closed packet.
         writer=QuotaLedger(path)
         try:
             clock[0]=180.;observe(writer,175,98)
@@ -143,12 +144,140 @@ def test_closed_period_projection_keeps_exact_queries_and_detail_after_restart(t
             # the prefix, without retaining its source rows in the reader.
             assert chart_result(prepared['view'],selected)['series']==chart['series']
             writer.db.execute("UPDATE calls SET cost=cost+1 WHERE uid='107'");writer.db.commit()
-            assert load(ledger,'h',clock[0]) is None
+            repaired=load(ledger,'h',clock[0])
+            assert repaired is not None
+            current=ledger.current_report('h',clock[0],retain_projection=True)
+            current['view']=prepare_quota_view(current,deferred=True)
+            corrected=repaired.compose(current)
+            raw=writer.report('h',clock[0]);full={**raw,'view':prepare_quota_view(raw,deferred=True)}
+            for query in queries:assert prepare_quota_query(corrected,query)==prepare_quota_query(full,query)
             stale=worker.execute(dict(kind='chart',id='stale',key='k',revision=result['report']['worker_revision'],
                 selection=min(p['start'] for p in actual['view']['periods'])))
             assert stale.get('stale') and not stale.get('permanent')
         finally:writer.close()
     finally:worker.close()
+
+
+def test_closed_cost_repair_reuses_observation_checkpoints_and_unchanged_periods(tmp_path,monkeypatch):
+    from cachemonitor import quota_archive,quota_projection
+    from cachemonitor.quota_view import prepare_quota_view,prepare_quota_query,period_series
+    ledger=QuotaLedger(tmp_path/'changed-period.sqlite',pack_history=True,weekly_history_only=True)
+    def prepare():
+        raw=ledger.report('h',200.)
+        raw['_cycle_versions']={key:value[0] for key,value in ledger._cycle_cache.items()}
+        return {**raw,'view':prepare_quota_view(raw,deferred=True)}
+    try:
+        tracking.enable(ledger.db,'h',100)
+        for at,remaining in ((102,70),(110,69),(120,100),(130,99),(150,100),(160,99),(180,100),(190,99)):
+            observe(ledger,at,remaining)
+        calls=[107,127,157,187]
+        wire=[dict(home='h',attempt=str(at),response_id=str(at),request_observed_at=at-2,
+                   completed_observed_at=at,status='completed',ts=at) for at in calls]
+        activity(ledger,191,{},calls,wire=wire)
+        full=prepare()
+        assert quota_archive.save(ledger,full,full['view']) and quota_projection.save(ledger,full,full['view'])
+        previous=quota_archive.load(ledger,'h',200)
+        before={tuple(row[:2]):row[2] for row in ledger.db.execute('SELECT kind,key,digest FROM quota_archive_entries WHERE epoch=?',(previous.epoch,))}
+        sources={p['start']:previous.packet('period',p['start'])['source'] for p in previous.head['periods']}
+        ledger.db.execute("UPDATE calls SET cost=cost+1 WHERE uid='127'");ledger.db.commit()
+        # Closed observations are never decoded during a call-only repair.
+        original=ledger._report_history
+        def history(home,start,end,tables):
+            assert start>=previous.cutoff
+            return original(home,start,end,tables)
+        with monkeypatch.context() as patch:
+            patch.setattr(ledger,'_report_history',history)
+            repaired=quota_archive.load(ledger,'h',200)
+        assert repaired is not None and repaired.epoch!=previous.epoch
+        changed=[(row[0],row[1]) for row in ledger.db.execute('SELECT kind,key,digest FROM quota_archive_entries WHERE epoch=?',(repaired.epoch,)) if before[(row[0],row[1])]!=row[2]]
+        assert {key for kind,key in changed if kind=='period'}=={'120.1'}
+        assert len([key for kind,key in changed if kind=='cycle'])==1
+        assert all(repaired.packet('period',start)['source']==source for start,source in sources.items())
+        current=ledger.current_report('h',200,retain_projection=True);current['view']=prepare_quota_view(current,deferred=True)
+        actual=repaired.compose(current);expected=prepare()
+        assert prepare_quota_query(actual,{})==prepare_quota_query(expected,{})
+        for period in expected['view']['periods']:
+            selected=next(p for p in actual['view']['periods'] if p['start']==period['start'])
+            assert period_series(selected)==period_series(period)
+        # Exact request starts and completion corrections cross observed periods.
+        ledger.db.execute("UPDATE tracking_wire SET start=155,end=157 WHERE response='127'");ledger.db.commit()
+        repaired=quota_archive.load(ledger,'h',200)
+        assert repaired is not None
+        current=ledger.current_report('h',200,retain_projection=True);current['view']=prepare_quota_view(current,deferred=True)
+        actual=repaired.compose(current);expected=prepare()
+        assert prepare_quota_query(actual,{})==prepare_quota_query(expected,{})
+        for period in expected['view']['periods']:
+            selected=next(p for p in actual['view']['periods'] if p['start']==period['start'])
+            assert period_series(selected)==period_series(period)
+        # Observation corrections retain the conservative full replay contract.
+        ledger.db.execute("UPDATE observations SET used=used+1 WHERE at=130.1");ledger.db.commit()
+        assert quota_archive.load(ledger,'h',200) is None
+    finally:ledger.close()
+
+
+def test_closed_archive_scope_change_rejects_existing_prefix(tmp_path):
+    from cachemonitor.quota_worker import QuotaComputation
+    worker=QuotaComputation(tmp_path/'scope.sqlite','h');ledger=worker._ledger(writable=True)
+    try:
+        tracking.enable(ledger.db,'h',100);tracking.enable(ledger.db,'b',100)
+        for at,remaining in ((102,70),(110,69),(120,100),(130,99),(150,100),(160,99)):
+            observe(ledger,at,remaining)
+        observe(ledger,102,70,home='b',account='other')
+        activity(ledger,170,{},[128],home='b');activity(ledger,170,{},[107,127,157])
+        raw=ledger.report('h',170);worker._prepare(raw,(worker.ledger_generation,ledger._report_generation))
+        assert worker._archived_current(ledger,170) is not None
+        assert worker.archive.head['policy']['homes']==['h']
+        observe(ledger,180,69,home='b')
+        assert worker._archived_current(ledger,181) is None
+        assert sorted(ledger.report('h',181)['tracking']['homes'])==['b','h']
+    finally:worker.close()
+
+
+def test_closed_cost_repair_rejects_late_cross_home_race_and_read_overflow(tmp_path,monkeypatch):
+    from cachemonitor import quota_archive,quota_projection
+    from cachemonitor.quota_view import prepare_quota_view,prepare_quota_query,period_series
+    path=tmp_path/'repair-race.sqlite'
+    ledger=QuotaLedger(path,pack_history=True,weekly_history_only=True);writer=QuotaLedger(path)
+    try:
+        tracking.enable(ledger.db,'h',100);tracking.enable(ledger.db,'b',100)
+        for at,remaining in ((102,70),(110,69),(120,100),(130,99),(150,100),(160,99)):
+            observe(ledger,at,remaining)
+        observe(ledger,102,70,home='b')
+        activity(ledger,170,{},[127],home='b');activity(ledger,170,{},[107,127,157])
+        ledger.db.execute("UPDATE calls SET ts=250,cost=NULL WHERE home='b'");ledger.db.commit()
+        raw=ledger.report('h',170);raw['_cycle_versions']={key:value[0] for key,value in ledger._cycle_cache.items()}
+        view=prepare_quota_view(raw,deferred=True)
+        assert quota_archive.save(ledger,raw,view) and quota_projection.save(ledger,raw,view)
+        previous=quota_archive.load(ledger,'h',170)
+        writer.db.execute("UPDATE calls SET cost=cost+1 WHERE home='h' AND uid='107'");writer.db.commit()
+        save=quota_archive.save
+        def race(reader,report,prepared):
+            writer.db.execute("UPDATE calls SET cost=2 WHERE home='b' AND uid='127'");writer.db.commit()
+            return save(reader,report,prepared)
+        with monkeypatch.context() as patch:
+            patch.setattr(quota_archive,'save',race)
+            assert quota_archive.load(ledger,'h',170) is None
+        assert ledger.db.execute('SELECT count(*) FROM quota_archive_heads').fetchone()[0]==1
+        assert ledger.db.execute('SELECT valid FROM quota_archive_heads WHERE epoch=?',(previous.epoch,)).fetchone()[0]==0
+        read=ledger.archive_calls
+        with monkeypatch.context() as patch:
+            patch.setattr(ledger,'archive_calls',lambda *args,**kw:read(*args,row_budget=1,**kw))
+            assert quota_archive.load(ledger,'h',170) is None
+        with monkeypatch.context() as patch:
+            patch.setattr(quota_archive,'MAX_REPAIR_SQL_STEPS',1)
+            assert quota_archive.load(ledger,'h',170) is None
+        assert not ledger.db.in_transaction
+        repaired=quota_archive.load(ledger,'h',170)
+        assert repaired is not None
+        assert ledger.db.execute('SELECT count(*) FROM quota_archive_repairs').fetchone()[0]==2
+        current=ledger.current_report('h',170,retain_projection=True);current['view']=prepare_quota_view(current,deferred=True)
+        actual=repaired.compose(current);raw=ledger.report('h',170)
+        expected={**raw,'view':prepare_quota_view(raw,deferred=True)}
+        assert prepare_quota_query(actual,{})==prepare_quota_query(expected,{})
+        for period in expected['view']['periods']:
+            selected=next(p for p in actual['view']['periods'] if p['start']==period['start'])
+            assert period_series(selected)==period_series(period)
+    finally:writer.close();ledger.close()
 
 
 def test_closed_projection_rejects_coverage_change_during_save(tmp_path,monkeypatch):
