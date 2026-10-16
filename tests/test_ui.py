@@ -10,7 +10,7 @@ from cachemonitor.dashboard import Dashboard, choose
 from cachemonitor.core import Session
 from cachemonitor.analytics import project_key
 from cachemonitor.overlay_navigation import NavigationTarget
-from cachemonitor.quick_qa import control, click, click_row
+from cachemonitor.quick_qa import control, click, click_row, dispose
 
 pytestmark = pytest.mark.integration
 
@@ -42,9 +42,12 @@ def dashboard(tmp_path):
     settings=QSettings(str(tmp_path/'dashboard.ini'),QSettings.IniFormat);settings.setValue('ui/theme','light')
     window=Dashboard(['fixture'],start_worker=False,settings=settings,static_snapshot=snapshot())
     window.show();QTest.qWait(70)
-    yield window
-    window.quitting=True;window.tick.stop();window.tray.hide();window.observer_panel.stop();window.close()
-    app.setProperty('cachemonitorDisableShellIntegration',previous)
+    try:
+        yield window
+    finally:
+        window.quitting=True;window.tick.stop();window.tray.hide();window.observer_panel.stop()
+        dispose(window)
+        app.setProperty('cachemonitorDisableShellIntegration',previous)
 
 
 @pytest.mark.essential
@@ -190,7 +193,7 @@ def test_preferences_restore_observed_dimensions_before_snapshot(dashboard,tmp_p
         assert second.record_view=='sessions' and second.selected_session is None
         second.show();QTest.qWait(20)
         assert second.analysis['response_count']==24
-    finally:second.quitting=True;second.tick.stop();second.tray.hide();second.observer_panel.stop();second.close()
+    finally:second.quitting=True;second.tick.stop();second.tray.hide();second.observer_panel.stop();dispose(second)
 
 
 @pytest.mark.parametrize('within_session',[False,True])
