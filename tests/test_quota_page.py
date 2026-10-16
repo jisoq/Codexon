@@ -435,6 +435,7 @@ def test_monitoring_pause_persists_and_restores_readable_page(quota_page,tmp_pat
         click(window,control(window,window.quota_pause_button))
         assert settings.value('quota/paused',False,type=bool)
         assert window.quota_pause_badge.isVisible()
+        control(window,window.quota_panel.summary)
         assert scene_view(window,window.quota_panel.summary).opacity()<1
         assert window.quota_sidebar.weekly.text()==before
         assert window.quota_panel.history.isEnabled()
@@ -452,6 +453,7 @@ def test_monitoring_pause_persists_and_restores_readable_page(quota_page,tmp_pat
         click(reopened,control(reopened,reopened.quota_pause_button))
         assert not settings.value('quota/paused',True,type=bool)
         assert not reopened.quota_pause_badge.isVisible()
+        control(reopened,reopened.quota_panel.summary)
         assert scene_view(reopened,reopened.quota_panel.summary).opacity()==1
         assert not window.qml_errors and not reopened.qml_errors
     finally:
