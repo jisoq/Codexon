@@ -473,7 +473,7 @@ class CollectionReplay:
             key = view['home'], view['id']
             session = self.index.monitor.sessions.get(key)
             if (session is None or hasattr(session, '_replay_body') or not view.get('collection_complete')
-                    or session.running or session.pending or view.get('requests') or len(session.transports) > 1
+                    or session.running or session.pending or view.get('remaining') is not None or len(session.transports) > 1
                     or session.activity >= now - WINDOW or key in self.index.rebuild_required):
                 continue
             proof = self.source_proof(key)

@@ -11,32 +11,6 @@ FIELDS = ('cost', 'input', 'cached', 'output', 'reasoning')
 CACHE_BYTES = 16 * 1024 * 1024
 
 
-def build(owner, rows):
-    """Called once while canonical prepared rows already belong to the writer.
-
-    Home's per-owner arithmetic is deliberately +=, including cost. Its final
-    cross-owner cost uses fsum. Overlay headline/valid-cache partials use other
-    populations and arithmetic and cannot substitute for this small proof.
-    """
-    values = [0] * len(FIELDS)
-    known = [0] * len(FIELDS)
-    count = 0
-    minimum = maximum = None
-    for row in rows:
-        count += 1
-        stamp = row['ts']
-        minimum = stamp if minimum is None else min(minimum, stamp)
-        maximum = stamp if maximum is None else max(maximum, stamp)
-        for index, field in enumerate(FIELDS):
-            value = row.get(field)
-            if value is not None:
-                values[index] += value
-                known[index] += 1
-    return dict(format=FORMAT, owner=tuple(owner), fields=FIELDS, count=count,
-        minimum=minimum, maximum=maximum, values=tuple(values),
-        missing=tuple(count-number for number in known))
-
-
 def proof(packet, owner):
     validate_summary(packet, owner)
     value = packet.get('summary', {}).get('home_totals')

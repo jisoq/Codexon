@@ -9,6 +9,29 @@ from hashlib import sha256
 
 MAX_BYTES = 32 * 1024 * 1024
 FORMAT = 1
+APPEND_FORMAT = 1
+
+
+class AppendPredecessorChanged(RuntimeError):
+    """Partial application was refused before any quota/activity mutation."""
+
+
+def require_append(db, transitions):
+    """Hold the write transaction while checking the exact durable predecessor."""
+    if not db.in_transaction:
+        db.execute('BEGIN IMMEDIATE')
+    committed=applied(db,transitions)
+    policies={}
+    for owner,value in transitions.items():
+        if owner[0] not in policies:
+            config=db.execute('SELECT started FROM tracking_config WHERE home=?',(owner[0],)).fetchone()
+            control=db.execute('SELECT enabled,at FROM tracking_controls WHERE home=? ORDER BY at DESC LIMIT 1',
+                               (owner[0],)).fetchone()
+            policies[owner[0]]=(config[0] if config else None,tuple(control) if control else None)
+        if (value.get('format')!=APPEND_FORMAT or
+                type(value.get('count')) is not int or not 0<value['count']<=128 or
+                committed.get(owner)!=value.get('prior_source') or value.get('policy')!=policies[owner[0]]):
+            raise AppendPredecessorChanged('prepared ledger append predecessor changed')
 
 
 def source_stamp(dependencies):

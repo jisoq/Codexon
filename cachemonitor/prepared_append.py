@@ -92,6 +92,7 @@ def _add_totals(total, row):
     total['count'] += 1
     total['minimum'] = row['ts'] if total['minimum'] is None else min(total['minimum'],row['ts'])
     total['maximum'] = row['ts']
+    # Home uses per-owner +=, unlike the compensated overlay totals below.
     for i, field in enumerate(HOME_FIELDS):
         value = row.get(field)
         if value is None:total['home_missing'][i] += 1
@@ -655,6 +656,24 @@ class AppendPlan:
         stage.sections(self.owner,self.sections)
 
 
+def _ledger_append(snapshot,owner,transition,before,prior_dependencies,dependencies):
+    """Only the latest transition is retained; missed predecessors replay fully."""
+    from .quota_prepared_sync import APPEND_FORMAT,source_stamp
+    for turn,_,value in transition['requests']['upserts']:
+        if before.get(turn,{}).get('call_count'):
+            old=snapshot.request(owner,turn)
+            started=old['metadata'].get('started_at') if old is not None else None
+            if started!=value.get('started_at'):
+                return None  # The first old call's quota boundary may change.
+    turns={row['turn'] for row in transition['tail'] if row.get('turn')}
+    selected=turns|{turn for turn,_,_ in transition['requests']['upserts']}
+    return dict(format=APPEND_FORMAT,prior_source=source_stamp(prior_dependencies),
+        source=source_stamp(dependencies),prior_body_digest=transition['prior_body_digest'],
+        prior_count=transition['prior_raw_count'],count=len(transition['tail']),
+        previous_usage={turn:before[turn]['maximum'] for turn in turns
+                        if before.get(turn,{}).get('call_count')},request_keys=tuple(sorted(selected)))
+
+
 def prepare(snapshot,owner,transition,dependencies,*,mode_evidence=None,enrich=None):
     """Read-only admission against one committed predecessor; never publish here.
 
@@ -765,10 +784,18 @@ def prepare(snapshot,owner,transition,dependencies,*,mode_evidence=None,enrich=N
         coverage_bounds=(total['minimum'],total['maximum']))
     updated=dict(checkpoint,source_digest=body,candidate_source_digest=body,raw_count=count+len(rows),
         frontier=(rows[-1]['ts'],rows[-1]['key']),total=total,misses=misses,health=health.save(),request=request,
-        request_count=request_count,header_count=header_count,last_header_order=last_order)
+        request_count=request_count,header_count=header_count,last_header_order=last_order,
+        ledger_append=_ledger_append(snapshot,owner,transition,before,old['dependencies'],dependency))
     try:
-        checkpoint_bytes=len(pack(updated,snapshot.limits,
-            maximum=min(CHECKPOINT_BYTES,snapshot.limits.packet_bytes)))
+        try:
+            checkpoint_bytes=len(pack(updated,snapshot.limits,
+                maximum=min(CHECKPOINT_BYTES,snapshot.limits.packet_bytes)))
+        except CapacityExceeded:
+            # Quota reuse is optional. Its certificate shares the original
+            # owner budget; capacity pressure retains normal full ledger sync.
+            updated['ledger_append']=None
+            checkpoint_bytes=len(pack(updated,snapshot.limits,
+                maximum=min(CHECKPOINT_BYTES,snapshot.limits.packet_bytes)))
         for item in (metadata,dependency,summary,alerts,choices):pack(item,snapshot.limits)
         for _,_,_,_,value in sections:pack(value,snapshot.limits)
     except (CapacityExceeded,TypeError,ValueError) as error:

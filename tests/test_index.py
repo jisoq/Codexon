@@ -384,7 +384,7 @@ def test_owned_publication_tokens_cover_metadata_evidence_and_window_expiry(tmp_
         assert joined['sessions'][0]['history'][0]['requested_model']=='asked'
         previous=index.collection_changes.sessions[key]
         expired=index.poll(10014+WINDOW)
-        assert not expired['sessions'][0]['requests']
+        assert expired['sessions'][0]['remaining'] is None
         assert index.collection_changes.sessions[key]!=previous
         assert len(index.publication_rows)==len(expired['sessions'])
     finally:index.close();evidence.close()
@@ -732,6 +732,7 @@ def test_catchup_digest_capacity_waits_without_losing_files(tmp_path,monkeypatch
 
 def test_imported_history_reuses_unchanged_records_and_refreshes_time_windows(tmp_path):
     from cachemonitor.core import WINDOW
+    from cachemonitor.usage_collection import LiveCollection
     home,_=fixture_home(tmp_path)
     index=UsageIndex([home],tmp_path/'index.sqlite')
     row=dict(sid='old',ts=10000,input=100,output=20,cached=50,written=0,reasoning=0,
@@ -743,12 +744,19 @@ def test_imported_history_reuses_unchanged_records_and_refreshes_time_windows(tm
         first=index.archive.views(10010,{str(home)})[0]
         index.db.execute('INSERT INTO metadata VALUES(?,?,?)',(str(home),'unrelated','{}'))
         second=index.archive.views(10011,{str(home)})[0]
+        boundary=index.archive.views(10000+WINDOW,{str(home)})[0]
         expired=index.archive.views(10000+WINDOW+1,{str(home)})[0]
+        rewound=index.archive.views(10011,{str(home)})[0]
         assert len(queries)==1
         assert second['history'] is first['history'] is expired['history']
         assert second['remaining']==first['remaining']-1
-        assert len(first['requests'])==1 and expired['requests']==[]
+        assert boundary['remaining']==0 and rewound['remaining']==second['remaining']
+        assert first['remaining']>0 and expired['remaining'] is None
         assert first['usage_revision']==expired['usage_revision']
+        live=LiveCollection(index.path,'scope');key=(first['home'],first['id'])
+        initial=live.prepare(dict(ts=10010,sessions=[first]),'owner',1);live.publish(initial)
+        later=live.prepare(dict(ts=10000+WINDOW+1,sessions=[expired]),'owner',2)
+        assert later['sessions'][key] is initial['sessions'][key]
         row['input']=200
         index.db.execute('UPDATE usage_archive SET data=?',(json.dumps(row),));index.db.commit()
         changed=index.archive.views(10011,{str(home)})[0]

@@ -476,17 +476,13 @@ class Session:
             if self.running:
                 result['status']='진행 기록' if now-self.activity<WINDOW else '진행 기록 (갱신 지연)'
             return result
-        requests = [x for x in self.requests if x.ts >= now - WINDOW]
-        last = requests[-1] if requests else None
+        last = next((request for request in reversed(self.requests) if request.ts >= now - WINDOW), None)
         connection_history = old['history'] if same else [
             {**request.values(), **detail}
             for request, detail in zip(self.requests, self.transport_details_many(self.requests))]
         history = connection_history
         matched = {(r["transport_ts"], r["transport"], r["transport_turn"]) for r in connection_history}
         latest = self.transports[-1] if self.transports else None
-        known = [x for x in requests if x.input is not None and x.cached is not None]
-        total = sum(x.input for x in known)
-        cached = sum(x.cached for x in known)
         remaining = max(0, WINDOW - (now - last.ts)) if last else None
         from .cache_misses import classify
         cache_misses=old['cache_misses'] if same else classify(history)
@@ -517,12 +513,8 @@ class Session:
             "transport_ts": latest.ts if latest else None,
             "endpoint": latest.endpoint if latest else "",
             "transport_evidence": latest.evidence if latest else "연결 기록 없음",
-            "rate": last.rate if last else None, "weighted_rate": 100 * cached / total if total else None,
-            "input": last.input if last else None, "cached": last.cached if last else None,
             "remaining": remaining, "warning": warning, "pending": self.pending,
             "cache_misses": cache_misses,
-            "requests": [{**vars(request), "rate": request.rate, **detail}
-                         for request, detail in zip(requests, self.transport_details_many(requests))],
             "history": connection_history,
             "unmatched_transports": [vars(t) for t in self.transports if (t.ts, t.kind, t.turn) not in matched],
             "unclassified": unclassified,
@@ -538,7 +530,7 @@ class Session:
                 next_day=datetime.fromordinal(tomorrow).timestamp()
             except OSError:  # Windows CRT cannot localize some synthetic dates near the epoch.
                 next_day=day_start(now)+86400
-            expiries=[r.ts+WINDOW+0.000001 for r in requests if r.ts+WINDOW>=now]
+            expiries=[last.ts+WINDOW+0.000001] if last else []
             self._view_until=min(expiries+[next_day])
             self._last_recent_ts=last.ts if last else None
             self._view_time=now

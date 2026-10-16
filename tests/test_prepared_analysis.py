@@ -231,7 +231,9 @@ def test_collector_append_uses_tail_and_historical_correction_uses_full_owner(tm
     from cachemonitor.overlay_data import summarize_session
     from cachemonitor.prepared_health import hydrate_health
     from cachemonitor.prepared_ingest import PreparedCohort, read_catalog
+    from cachemonitor.prepared_ledger import PreparedLedger
     from cachemonitor.prepared_summary import hydrate_summary
+    from cachemonitor.quota_cycles import QuotaLedger
     from cachemonitor.usage_collection import CollectorService, CollectionClient
     from test_core import fixture_home, usage, event, TID
 
@@ -250,6 +252,13 @@ def test_collector_append_uses_tail_and_historical_correction_uses_full_owner(tm
     service = CollectorService([home], target)
     client = CollectionClient([home], target)
     owner = (str(home.resolve()), TID)
+    ledger = QuotaLedger(tmp_path/'quota.sqlite')
+    reference_ledger = QuotaLedger(tmp_path/'quota-reference.sqlite')
+    reference = AnalysisEngine()
+    for value in (ledger, reference_ledger):
+        value.db.execute('INSERT INTO tracking_config VALUES(?,?)', (owner[0], base-20))
+        value.db.execute('INSERT INTO tracking_controls VALUES(?,?,?)', (owner[0], base-20, 1))
+        value.db.commit()
     source_reads = []
     stream = client.selected_owner_stream
     def counted_stream(key, **kwargs):
@@ -262,8 +271,10 @@ def test_collector_append_uses_tail_and_historical_correction_uses_full_owner(tm
             value = service.poll(time.time())
             if value['usage_collection_complete'] and not value['index']['loading']:return value['sessions'][0]
             assert time.monotonic()<deadline, value['index']
+    def envelope(source):
+        return dict(sessions=[source], homes=[owner[0]], ts=source['history'][-1]['ts']+1,
+            index=dict(loading=False, usage_complete=True), usage_collection_complete=True, errors=[])
     def verify(store, source):
-        reference = AnalysisEngine()
         reference.ingest([deepcopy(source)])
         prepared = reference.sessions[owner]['prepared']
         with store.read_current() as view:
@@ -274,11 +285,18 @@ def test_collector_append_uses_tail_and_historical_correction_uses_full_owner(tm
             summary.update(hydrate_health(view, owner))
             summary.pop('_health_ref')
             assert summary == summarize_session(prepared, prepared['cache_health'])
+        reference_ledger.sync(reference, envelope(source))
+        for table in ('calls', 'tracking_call_boundaries', 'tracking_tasks'):
+            actual = sorted(tuple(row) for row in ledger.db.execute('SELECT * FROM '+table))
+            expected = sorted(tuple(row) for row in reference_ledger.db.execute('SELECT * FROM '+table))
+            assert actual == expected
     try:
         initial = collect()
         with storage.PreparedStore(tmp_path/'prepared.sqlite') as store:
-            cohort = PreparedCohort(store, client, None)
+            cohort = PreparedCohort(store, client, ledger)
             assert list(cohort.convert(read_catalog(client)))[-1]['ready']
+            adapter = PreparedLedger(ledger, store)
+            list(adapter.sync(envelope(initial)))
             verify(store, initial)
             initial_reads = len(source_reads)
             assert initial_reads>0
@@ -286,11 +304,15 @@ def test_collector_append_uses_tail_and_historical_correction_uses_full_owner(tm
             appended = collect()
             def forbidden(*args, **kwargs):
                 raise AssertionError('Certified append must not retrieve the complete owner')
+            prior_call_reads = adapter.metrics['call_rows']
             with monkeypatch.context() as patch:
                 patch.setattr(client, 'selected_owner_stream', forbidden)
                 patch.setattr(cohort, '_load', forbidden)
+                patch.setattr(adapter, '_owner', forbidden)
                 cohort.apply(read_catalog(client), [owner])
+                list(adapter.sync(envelope(appended)))
             assert cohort.metrics['append_owners']==1 and len(source_reads)==initial_reads
+            assert adapter.metrics['append_owners']==1 and adapter.metrics['call_rows']==prior_call_reads+1
             verify(store, appended)
             # An old edit combined with growth must decline the append proof.
             events[2]['payload']['usage']['input_tokens'] = 21000
@@ -298,9 +320,13 @@ def test_collector_append_uses_tail_and_historical_correction_uses_full_owner(tm
             path.write_text(''.join(json.dumps(item)+'\n' for item in events), encoding='utf-8')
             corrected = collect()
             cohort.apply(read_catalog(client), [owner])
+            list(adapter.sync(envelope(corrected)))
             assert cohort.metrics['append_owners']==1 and len(source_reads)>initial_reads
+            assert adapter.metrics['append_owners']==1
             verify(store, corrected)
     finally:
+        ledger.close()
+        reference_ledger.close()
         client.close()
         service.close()
 

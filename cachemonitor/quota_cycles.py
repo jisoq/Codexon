@@ -1480,9 +1480,19 @@ class QuotaLedger:
                 select ?,id from observations where id=? and not exists
                 (select 1 from window_observations where id=?)''',(weekly_ref,key,weekly_ref))
 
-    def sync(self, engine, snapshot, *, applied_sources=None):
+    def sync(self, engine, snapshot, *, applied_sources=None, append_sources=None):
         """Use the existing deduplicated analytical rows; don't parse conversations twice."""
         from .quota_tracking_store import sync_activity
+        if append_sources:
+            from .quota_prepared_sync import require_append
+            if applied_sources is None or any(applied_sources.get(key)!=value.get('source')
+                    for key,value in append_sources.items()):
+                raise ValueError('partial ledger facts require exact current source certificates')
+            for key,value in append_sources.items():
+                session=engine.sessions.get(key)
+                if session is None or len(session['prepared']['history'])!=value['count']:
+                    raise ValueError('partial ledger facts differ from the certified tail count')
+            require_append(self.db,append_sources)
         pending={(s['home'],s['id']) for s in snapshot.get('sessions',()) if s.get('_collection_pending')}
         if pending:
             # Pending catalog members are a retained read model. They cannot
@@ -1512,10 +1522,17 @@ class QuotaLedger:
                 continue
             home, sid = key
             current_uids = set()
+            appended=(append_sources or {}).get(key)
+            selected='c.home=? AND c.sid=?';arguments=[home,sid]
+            if appended is not None:
+                uids=[sid+':'+str(row['key']) if str(row['key']).startswith(('legacy:','record:')) else str(row['key'])
+                      for row in session['prepared']['history']]
+                selected='c.home=? AND c.uid IN ('+','.join('?' for _ in uids)+')'
+                arguments=[home,*uids]
             stored={r['uid']:r for r in self.db.execute('''select c.uid,c.signature,c.service_tier,c.sid,c.cost,c.price_id,
                 b.uid as boundary_uid,b.started from calls c left join tracking_call_boundaries b
-                on b.home=c.home and b.uid=c.uid where c.home=? and c.sid=?''',(home,sid))}
-            previous_usage = {}
+                on b.home=c.home and b.uid=c.uid where '''+selected,arguments)}
+            previous_usage = dict(appended['previous_usage']) if appended is not None else {}
             call_batch=[];boundary_batch=[];pending_uids=set()
             def flush_calls():
                 # One statement journals each touched page once per bounded
@@ -1564,9 +1581,10 @@ class QuotaLedger:
                 pending_uids.add(uid)
             flush_calls()
             self.revisions[key] = revision
-            old_uids = set(stored)
-            self.db.executemany('delete from calls where home=? and sid=? and uid=?',
-                                [(home,sid,uid) for uid in old_uids-current_uids])
+            if appended is None:
+                old_uids = set(stored)
+                self.db.executemany('delete from calls where home=? and sid=? and uid=?',
+                                    [(home,sid,uid) for uid in old_uids-current_uids])
             if applied_sources is not None:certificates[key]=revision
         for home in snapshot.get('homes', []):
             usage_errors=snapshot.get('usage_errors')

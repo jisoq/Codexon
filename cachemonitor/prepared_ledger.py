@@ -66,6 +66,50 @@ class PreparedLedger:
         active=config is not None and (control is None or bool(control[0]))
         return active,(config[0] if config else None,tuple(control) if control else None)
 
+    def _append(self,key,source,committed,policy,remaining):
+        """Read a bounded tail only after both call and task predecessors match."""
+        from .prepared_append import FORMAT as CHECKPOINT_FORMAT
+        with self.store.read_current(seconds=60) as view:
+            checkpoint=view.derived(*key,'checkpoint')
+            if not isinstance(checkpoint,dict) or checkpoint.get('format')!=CHECKPOINT_FORMAT:return None
+            transition=checkpoint.get('ledger_append')
+            if (not isinstance(transition,dict) or transition.get('format')!=progress.APPEND_FORMAT
+                    or transition.get('prior_source')!=committed
+                    or transition.get('source')!=source['usage_revision']
+                    or self.task_revisions.get(key)!=(transition.get('prior_body_digest'),policy)):
+                return None
+            owner=view.owner(*key)
+            if owner is None or progress.source_stamp(owner['dependencies'])!=source['usage_revision']:
+                return None
+            count=transition.get('count');prior=transition.get('prior_count')
+            selected=transition.get('request_keys',())
+            if (type(count) is not int or not 0<count<=128 or type(prior) is not int or prior<1
+                    or len(selected)>128 or owner['dependencies'].get('call_count')!=prior+count):
+                return None
+            rows=[];boundaries={};size=0;after=None
+            while True:
+                page=view.calls(key,ordinal_start=prior+1,after=after)
+                for row in page.rows:
+                    if len(rows)>=count or row['session_ordinal']!=prior+len(rows)+1:return None
+                    size+=_weight(row,remaining-size)+16
+                    if size>remaining:raise CapacityExceeded('prepared ledger tail exceeds its fact budget')
+                    rows.append(row)
+                if page.complete:break
+                after=page.after
+            if len(rows)!=count:return None
+            if selected:
+                after=None
+                while True:
+                    page=view.requests(key,selected,after=after)
+                    for item in page.rows:
+                        size+=_weight((item['key'],item['metadata']),remaining-size)+96
+                        if size>remaining:raise CapacityExceeded('prepared ledger tail requests exceed their fact budget')
+                        boundaries[item['key']]=item['metadata']
+                    if page.complete:break
+                    after=page.after
+        self.metrics['owner_reads']+=1;self.metrics['call_rows']+=len(rows);self.metrics['request_rows']+=len(boundaries)
+        return dict(history=rows,turn_records=boundaries),size,dict(transition,policy=policy)
+
     def sync(self, envelope, *, removed=()):
         """Yield after bounded commits; caller may ACK only after completion.
 
@@ -87,14 +131,19 @@ class PreparedLedger:
             else:
                 source.pop('request_revision',None)
         retired=tuple(removed)
-        index=0
+        index=0;allow_append=True
         while index<len(waiting):
-            states={};requests={};size=0
+            batch_start=index;states={};requests={};append_sources={};size=0
             while index<len(waiting) and len(requests)<OWNER_BATCH:
                 key=waiting[index]
                 try:
-                    prepared,weight=self._owner(key,FACT_BYTES-size,calls=key in call_waiting,
-                                                requests=key in call_waiting or key in task_waiting)
+                    appended=(self._append(key,sources[key],committed.get(key),policies[key[0]][1],FACT_BYTES-size)
+                              if allow_append and key in call_waiting else None)
+                    if appended is None:
+                        prepared,weight=self._owner(key,FACT_BYTES-size,calls=key in call_waiting,
+                                                    requests=key in call_waiting or key in task_waiting)
+                    else:
+                        prepared,weight,append_sources[key]=appended
                 except CapacityExceeded:
                     if requests:break
                     raise
@@ -107,8 +156,18 @@ class PreparedLedger:
             snapshot=dict(envelope,sessions=sessions)
             if retired:
                 progress.retire(self.ledger.db,retired)
-                retired=()
-            self.ledger.sync(SimpleNamespace(sessions=states,internal_sessions={}),snapshot,applied_sources=selected)
+            try:
+                self.ledger.sync(SimpleNamespace(sessions=states,internal_sessions={}),snapshot,
+                                 applied_sources=selected,append_sources=append_sources)
+            except progress.AppendPredecessorChanged:
+                # The quota guard runs before activity/call mutations. Retry
+                # this invocation through its original full-owner path once.
+                self.ledger.db.rollback()
+                index=batch_start;allow_append=False
+                self.metrics['append_fallbacks']=self.metrics.get('append_fallbacks',0)+len(append_sources)
+                continue
+            retired=()
+            self.metrics['append_owners']=self.metrics.get('append_owners',0)+len(append_sources)
             saved=progress.applied(self.ledger.db,selected)
             if any(saved.get(key)!=stamp for key,stamp in selected.items()):
                 raise ValueError('unconfirmed or older recovery owners were not applied to the ledger')

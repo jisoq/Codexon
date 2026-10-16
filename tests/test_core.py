@@ -34,7 +34,7 @@ def test_legacy_rate_limit_repeat_and_missing_usage():
     session.consume(item, 10001)
     session.consume(item, 10002)
     assert len(session.requests) == 1
-    assert session.view(10002)["rate"] is None
+    assert session.view(10002)["history"][0]["rate"] is None
 
 
 def fixture_home(tmp_path):
