@@ -85,6 +85,23 @@ def test_price_corrections_invalidate_worker_and_ledger_without_reclassifying_un
         assert engine.metrics['priced_calls']==before+1
         assert ledger.db.execute("select cost from calls where uid='0'").fetchone()[0]==pytest.approx(1.0125)
         assert ledger.db.execute("select cost from calls where uid='5'").fetchone()[0] is None
+        # A conflict can change price eligibility without changing tokens,
+        # model or tier. Both directions must reach the durable ledger.
+        for conflict in (True,False):
+            changed=copy.deepcopy(changed)
+            changed['history'][0]['input_conflict']=conflict
+            changed['usage_revision']=(changed.get('usage_revision') or 0)+1
+            engine.ingest([changed])
+            expected=token_cost(changed['history'][0])['cost']
+            assert engine.sessions[('h','s')]['prepared']['history'][0]['cost']==expected
+            ledger.sync(engine,dict(snap,sessions=[changed]))
+            assert ledger.db.execute("select cost from calls where uid='0'").fetchone()[0]==expected
+            if conflict:
+                # Repricing after restart must retain the source conflict.
+                ledger.db.execute("update calls set price_id='earlier-policy' where uid='0'")
+                ledger.db.commit();ledger.close()
+                ledger=QuotaLedger(tmp_path/'ledger.sqlite')
+                assert ledger.db.execute("select cost from calls where uid='0'").fetchone()[0] is None
         q=dict(page=0,start=1000000,end=1000010,service_tier='Standard')
         result=engine.query(q)
         assert result['overview']['calls']==2

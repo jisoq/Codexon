@@ -22,6 +22,20 @@ from .workload import INTERNAL_REVIEW_MODEL
 
 
 TOKEN_FIELDS = ('input', 'cached', 'written', 'output', 'reasoning')
+
+
+def _stored_cost(row):
+    # The ordinary signature stays byte-identical. This optional marker
+    # retains the one pricing guard not represented by calls columns.
+    row=dict(row)
+    signature=row.get('signature')
+    if isinstance(signature,str) and signature.endswith(',{"input_conflict":true}]'):
+        try:values=json.loads(signature)
+        except (ValueError,TypeError):values=None
+        if isinstance(values,list) and len(values)==len(TOKEN_FIELDS)+4 and values[-1]=={'input_conflict':True}:
+            row['input_conflict']=True
+    return token_cost(row)['cost']
+
 PRICE_SNAPSHOT = json.dumps({'rates': {k: asdict(v) for k, v in RATES.items()},
                              'fast_rates': {k:asdict(v) for k,v in FAST_RATES.items()},
                              'subscription_fast_multipliers': SUBSCRIPTION_FAST_MULTIPLIERS,
@@ -1069,7 +1083,7 @@ class QuotaLedger:
                 self.db.execute('insert or ignore into cost_archive values(?,?,?,?,?,?,?)',
                     (old['home'],old['uid'],old['price_id'],old['signature'],old['cost'],old['service_tier'],time.time()))
                 self.db.execute('update calls set cost=?,price_id=? where home=? and uid=?',
-                    (token_cost(dict(old))['cost'],PRICE_ID,old['home'],old['uid']))
+                    (_stored_cost(old),PRICE_ID,old['home'],old['uid']))
         self.db.commit()
         self._mode_dependency_profiles=None
         self._mode_dependency_digests={}
@@ -1531,16 +1545,18 @@ class QuotaLedger:
                 old = stored.get(uid)
                 if old is None or old['boundary_uid'] is None or old['started'] != requested:
                     boundary_batch.append((home,uid,requested));pending_uids.add(uid)
-                signature = json.dumps([row.get(k) for k in ('ts', 'model', 'service_tier', *TOKEN_FIELDS)], separators=(',', ':'))
+                cost = row['cost'] if 'cost' in row else token_cost(row)['cost']
+                price_inputs = [row.get(k) for k in ('ts', 'model', 'service_tier', *TOKEN_FIELDS)]
+                if row.get('input_conflict'):price_inputs.append({'input_conflict':True})
+                signature = json.dumps(price_inputs, separators=(',', ':'))
                 if old is None:old=self.db.execute('select signature,service_tier,sid,cost,price_id from calls where home=? and uid=?',(home,uid)).fetchone()
-                if old and old['signature'] == signature and self._price_equivalent(old['price_id']):
+                if old and old['signature'] == signature and old['cost'] == cost and self._price_equivalent(old['price_id']):
                     if old['sid']!=sid:
                         self.db.execute('update calls set sid=? where home=? and uid=?',(sid,home,uid))
                     continue
                 if old:
                     self.db.execute('insert or ignore into cost_archive values(?,?,?,?,?,?,?)',
                         (home,uid,old['price_id'],old['signature'],old['cost'],old['service_tier'],time.time()))
-                cost = token_cost(row)['cost']
                 call_batch.append((home, uid, sid, row['ts'], row.get('model') or '미확인',
                      *[row.get(k) for k in TOKEN_FIELDS], cost, PRICE_ID, signature,row.get('service_tier','미확인')))
                 pending_uids.add(uid)
