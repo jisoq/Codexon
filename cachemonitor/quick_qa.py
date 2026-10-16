@@ -21,24 +21,35 @@ def scene_view(host,node):
 def control(host,node):
     import time
     from shiboken6 import isValid
+    from .presentation import Stack
     incubation=getattr(host,'_page_incubation',None)
     deadline=time.monotonic()+10
     view=None
     while True:
-        item=None;parents_ready=False
+        item=None;parents_ready=False;model_ready=True
         try:
-            # Keep the discovered view while Qt creates its control. Rewalking
-            # a partial scene on every turn competes with deferred creation.
-            if view is None or not isValid(view) or view.property('node') is not node:
-                view=None
-                view=scene_view(host,node)
-            item=view.property('item')
-            parents_ready=True;parent=view.parentItem()
+            # Follow the small model ancestry before searching a partial scene.
+            # Its deferred page must finish before any contained control can
+            # satisfy the corresponding QML ancestor readiness check below.
+            child=node;parent=child.parent()
             while parent is not None:
-                meta=parent.metaObject()
-                if meta.indexOfProperty('loadRequested')>=0 and meta.indexOfProperty('ready')>=0 and not parent.property('ready'):
-                    parents_ready=False;break
-                parent=parent.parentItem()
+                if (isinstance(parent,Stack) and parent._state.get('kind')=='stack'
+                        and parent._state.get('deferPages') and child in parent.nodes
+                        and not parent.isPageReady(parent.nodes.index(child))):
+                    model_ready=False;break
+                child=parent;parent=parent.parent()
+            if model_ready:
+                # Cache a found view, but follow deletion or model reassignment.
+                if view is None or not isValid(view) or view.property('node') is not node:
+                    view=None
+                    view=scene_view(host,node)
+                item=view.property('item')
+                parents_ready=True;parent=view.parentItem()
+                while parent is not None:
+                    meta=parent.metaObject()
+                    if meta.indexOfProperty('loadRequested')>=0 and meta.indexOfProperty('ready')>=0 and not parent.property('ready'):
+                        parents_ready=False;break
+                    parent=parent.parentItem()
             # Other hidden pages may still be loading. Only this control's
             # enclosing loaders must be ready, including an outer page loader.
             if item is not None and isValid(item) and parents_ready:return item
@@ -47,7 +58,7 @@ def control(host,node):
         if time.monotonic()>=deadline:
             pending=incubation.incubatingObjectCount() if incubation else 0
             raise AssertionError(f'Control did not finish rendering: {node.objectName()} ({node.kind}); '
-                                 f'view={view is not None}, item={item is not None}, parents_ready={parents_ready}, incubating={pending}; '
+                                 f'view={view is not None}, item={item is not None}, model_ready={model_ready}, parents_ready={parents_ready}, incubating={pending}; '
                                  f'QML errors: {host.qml_errors}')
         QTest.qWait(10)
 
