@@ -263,6 +263,162 @@ def test_history_import_reuses_complete_observations_and_repairs_partial_storage
     finally:ledger.close();reference.close()
 
 
+@pytest.mark.parametrize('change',['append','past_correction','owner_replace','sequence_move'])
+def test_observation_recovery_resumes_without_skipping_source_corrections(tmp_path,monkeypatch,change):
+    import json
+    import sqlite3
+    from cachemonitor.event_store import EventStore,pack_event
+    from cachemonitor.quota_history_import import ObservationImport
+    source=tmp_path/'source.sqlite';target=tmp_path/'quota.sqlite'
+    def payload(at,used):
+        return json.dumps({'payload':{'rate_limits':quota(at,used,source='history')}})
+    with sqlite3.connect(source) as db:
+        store=EventStore(db,source);store.enable_replay_tokens()
+        for i in range(8):
+            home='other' if i==1 else 'h'
+            db.execute('insert into events values(?,?,?,?,?,?)',
+                       ('retained',i,home,'a',100+i,pack_event(payload(100+i,i))))
+    monkeypatch.setattr(ObservationImport,'OBSERVATIONS',2)
+    ledger=QuotaLedger(target)
+    try:
+        job=ObservationImport(ledger,source,['h'])
+        assert not job.step()
+        assert not job.source.in_transaction
+        # A complete independent import starts from precisely the already
+        # committed observation history, including facts corrected later.
+        with sqlite3.connect(tmp_path/'reference.sqlite') as reference_db:
+            ledger.db.backup(reference_db)
+        job.close();ledger.close();ledger=QuotaLedger(target)
+        with sqlite3.connect(source) as db:
+            if change=='append':
+                db.execute('insert into events values(?,?,?,?,?,?)',
+                    ('retained',8,'h','a',99,pack_event(payload(99,95))))
+            elif change=='past_correction':
+                data=payload(100,98)
+                db.execute('update events set data=? where home=? and ts=?',
+                           (pack_event(data),'h',100))
+            elif change=='owner_replace':
+                # Replacing an owner loses its revision counter. The formerly
+                # excluded row before the cursor now belongs to this home.
+                db.execute("update or replace event_sessions set home='h' where home='other'")
+            else:
+                db.execute('update event_records set seq=100,data=? where seq=1',
+                           (pack_event(payload(100,97)),))
+        reference=QuotaLedger(tmp_path/'reference.sqlite')
+        try:
+            reference.import_observations(source,'h')
+            job=ObservationImport(ledger,source,['h'])
+            for _ in range(12):
+                if job.step():break
+            assert job.finished
+            assert not job.source.in_transaction
+            tables=('observations','observation_context','window_observations','weekly_window_refs')
+            for table in tables:
+                actual=sorted(tuple(r) for r in ledger.db.execute('select * from '+table))
+                expected=sorted(tuple(r) for r in reference.db.execute('select * from '+table))
+                assert actual==expected,(change,table)
+            job.close()
+            ledger.close();ledger=QuotaLedger(target)
+            unchanged=ObservationImport(ledger,source,['h'])
+            before=ledger.db.total_changes
+            assert unchanged.step() and unchanged.metrics['source_rows']==0
+            assert ledger.db.total_changes==before
+            unchanged.close()
+        finally:reference.close()
+    finally:ledger.close()
+
+
+@pytest.mark.parametrize('legacy',[False,True])
+def test_observation_recovery_preserves_home_isolation_and_legacy_snapshot(tmp_path,monkeypatch,legacy):
+    import json
+    import sqlite3
+    from cachemonitor.event_store import EventStore,pack_event
+    from cachemonitor.quota_history_import import ObservationImport
+    source=tmp_path/'source.sqlite'
+    def payload(at):return json.dumps({'payload':{'rate_limits':quota(at,5)}})
+    with sqlite3.connect(source) as db:
+        db.execute('PRAGMA journal_mode=WAL')
+        if legacy:
+            db.execute('create table events(home text,ts real,data text)')
+            db.executemany('insert into events values(?,?,?)',[('h',100+i,payload(100+i)) for i in range(129)])
+            db.execute('insert into events values(?,?,?)',('other',99,'{"rate_limits":invalid'))
+        else:
+            store=EventStore(db,source);store.enable_replay_tokens()
+            db.execute('insert into events values(?,?,?,?,?,?)',('source',0,'other','s',99,pack_event('{"rate_limits":invalid')))
+            db.execute('insert into events values(?,?,?,?,?,?)',('source',1,'h','s',100,pack_event(payload(100))))
+    ledger=QuotaLedger(tmp_path/'quota.sqlite')
+    try:
+        original=ledger._import_observation_parts;appends=[]
+        def concurrent_append(batch):
+            original(batch)
+            if legacy and not appends:
+                with sqlite3.connect(source) as db:db.execute('insert into events values(?,?,?)',('h',999,payload(999)))
+                appends.append(True)
+        monkeypatch.setattr(ledger,'_import_observation_parts',concurrent_append)
+        job=ObservationImport(ledger,source,['h'])
+        assert job.step()
+        assert ledger.db.execute('select count(*) from observations').fetchone()[0]==(129 if legacy else 1)
+        if legacy:assert appends and job.metrics['compatibility_import']
+        job.close()
+    finally:ledger.close()
+
+
+def test_observation_recovery_detects_reappearing_owner_before_completed_cursor(tmp_path):
+    import json
+    import sqlite3
+    from cachemonitor.event_store import EventStore,pack_event
+    from cachemonitor.quota_history_import import ObservationImport
+    source=tmp_path/'source.sqlite'
+    with sqlite3.connect(source) as db:
+        store=EventStore(db,source);store.enable_replay_tokens()
+        db.execute('insert into events values(?,?,?,?,?,?)',('source',1,'h','s',100,
+            pack_event(json.dumps({'payload':{'rate_limits':quota(100,5)}}))))
+        owner=db.execute('select id from event_sessions').fetchone()[0]
+        db.execute('delete from event_sessions where id=?',(owner,))
+    ledger=QuotaLedger(tmp_path/'quota.sqlite')
+    try:
+        hidden=ObservationImport(ledger,source,['h']);assert hidden.step();hidden.close()
+        assert ledger.db.execute('select count(*) from observations').fetchone()[0]==0
+        with sqlite3.connect(source) as db:
+            db.execute('insert into event_sessions(id,home,tid) values(?,?,?)',(owner,'h','s'))
+        visible=ObservationImport(ledger,source,['h']);assert visible.step();visible.close()
+        assert ledger.db.execute('select count(*) from observations').fetchone()[0]==1
+    finally:ledger.close()
+
+
+def test_observation_recovery_rolls_back_rows_and_progress_together(tmp_path,monkeypatch):
+    import json
+    import sqlite3
+    from cachemonitor.event_store import EventStore,pack_event
+    from cachemonitor.quota_history_import import ObservationImport
+    source=tmp_path/'source.sqlite';target=tmp_path/'quota.sqlite'
+    with sqlite3.connect(source) as db:
+        store=EventStore(db,source);store.enable_replay_tokens()
+        for i in range(4):
+            db.execute('insert into events values(?,?,?,?,?,?)',('source',i,'h','s',100+i,
+                pack_event(json.dumps({'payload':{'rate_limits':quota(100+i,i)}}))))
+    monkeypatch.setattr(ObservationImport,'OBSERVATIONS',2)
+    ledger=QuotaLedger(target)
+    try:
+        job=ObservationImport(ledger,source,['h']);assert not job.step()
+        cursor=ledger.db.execute('select cursor from observation_import_progress').fetchone()[0]
+        original=ledger._import_observation_parts
+        def interrupted(batch):
+            original(batch)
+            raise sqlite3.OperationalError('interrupted before progress commit')
+        monkeypatch.setattr(ledger,'_import_observation_parts',interrupted)
+        with pytest.raises(sqlite3.OperationalError,match='before progress commit'):job.step()
+        assert ledger.db.execute('select count(*) from observations').fetchone()[0]==2
+        assert ledger.db.execute('select cursor from observation_import_progress').fetchone()[0]==cursor
+        assert not job.source.in_transaction
+        job.close();ledger.close();ledger=QuotaLedger(target)
+        resumed=ObservationImport(ledger,source,['h'])
+        assert resumed.step()
+        assert ledger.db.execute('select count(*) from observations').fetchone()[0]==4
+        resumed.close()
+    finally:ledger.close()
+
+
 @pytest.mark.parametrize('observations',[128,2048])
 def test_report_reuses_history_across_heartbeat_and_invalidates_late_observation(tmp_path,monkeypatch,observations):
     ledger=QuotaLedger(tmp_path/'quota.sqlite',pack_history=observations==2048)

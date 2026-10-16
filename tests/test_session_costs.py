@@ -48,6 +48,12 @@ def test_internal_review_is_separate_from_work_models_rollups_and_delivery(tmp_p
     engine.ingest([parent,review])
     summary=next(s for s in overlays.collect(engine) if s['id']=='s')
     assert (summary['calls'],summary['priced'],summary['missing'],summary.get('descendants',0))==(1,1,0,0)
+    # Empty owners classify by their model metadata before any call exists.
+    empty=dict(parent,id='empty',source='cli',history=[],model='codex-auto-review',usage_revision=1)
+    engine.ingest([empty])
+    assert ('home','empty') in engine.internal_sessions
+    engine.ingest([dict(empty,model='gpt-6-astra')])
+    assert ('home','empty') in engine.sessions and not engine.internal_sessions
 
 
 def test_nested_costs_empty_parent_partial_prices_and_home_boundary():
@@ -86,7 +92,7 @@ def test_unknown_cost_and_bad_lineage_never_look_like_confirmed_zero():
     assert result[('h', 'cycle-b')]['cost'] is None
 
 
-def test_overlay_parent_refreshes_for_child_cost_without_recounting_responses():
+def test_overlay_parent_refreshes_for_child_cost_without_recounting_responses(monkeypatch):
     parent = source()
     child = source([dict(input_tokens=100,cached_input_tokens=0,
                          cache_write_input_tokens=10,output_tokens=20,reasoning_output_tokens=5)])
@@ -113,9 +119,55 @@ def test_overlay_parent_refreshes_for_child_cost_without_recounting_responses():
     changed = copy.deepcopy(child)
     changed['history'][0]['output'] *= 2
     engine.ingest([parent, changed])
+    class UnchangedHistory(list):
+        def __iter__(self):raise AssertionError('A child update reread unchanged parent calls')
+    engine.sessions[('home','s')]['prepared']['history']=UnchangedHistory(engine.sessions[('home','s')]['prepared']['history'])
+    # Classifier reuse is covered independently; this contract owns overlay rollups.
+    monkeypatch.setattr(summaries.speed_health,'collect',lambda engine:{})
     second = {(s['home'], s['id']):s for s in summaries.collect(engine)}
     assert second[('home', 's')]['cost'] > first[('home', 's')]['cost']
     assert second[('home', 's')]['own_cost'] == own_parent
+
+
+def test_overlay_rollups_keep_weighted_populations_and_bounded_recent_context():
+    from types import SimpleNamespace
+    from cachemonitor.analytics import output_speed_summary
+    from cachemonitor.overlay_data import token_composition,cost_composition
+    from test_overlay_call_data import row,session
+    parent=session([row(i,home='home',sid='parent',cost=.1,cost_uncached=.01,cost_cached=.02,
+        cost_written=.01,cost_unclassified=.01,cost_output=.05,cost_reasoning=.02,cost_non_reasoning=.03,
+        response_status='completed',completion_latency_ms=100.+i,purpose='maintenance' if i%2 else 'work')
+        for i in range(20)],id='parent',unclassified={'total':12345})
+    child=session([row(30,home='home',sid='child',input=None,cached=None,written=None,cost=None),
+                   row(31,home='home',sid='child',input=10,cached=5,written=20,input_conflict=True,
+                       output_conflict=True,cost=.2,cost_uncached=None,cost_cached=.01,cost_written=.02,
+                       cost_unclassified=.03,cost_output=.14,cost_reasoning=.04,cost_non_reasoning=.10,
+                       response_status='completed',completion_latency_ms=50.,purpose='maintenance')],
+        id='child',parent_thread_id='parent',coverage_gaps=[{'start':1}],unclassified={'total':99999})
+    empty=session([],id='empty',parent_thread_id='parent')
+    states={}
+    for value in (parent,child,empty):
+        value.update(cache_misses={'events':[]},cache_health={'events':[]},collection_complete=True)
+        states[(value['home'],value['id'])]=dict(source=value,prepared=value,revision=1,content_revision=1)
+    summaries=OverlaySummaries();summaries.speed_health=SimpleNamespace(collect=lambda engine:{})
+    result={value['id']:value for value in summaries.collect(SimpleNamespace(sessions=states))}['parent']
+    rows=parent['history']+child['history']
+    assert result['token_composition']==token_composition({'history':rows})
+    assert result['token_composition']['cache_hit_rate']==pytest.approx(100*(20*900+5)/(20*1000+10))
+    assert result['unattached_total']==12345 and result['coverage_gap']
+    expected=output_speed_summary(rows)
+    assert result['output_speed_summary']==pytest.approx(expected)
+    expected=cost_composition(rows)
+    for section in ('input','output'):
+        assert result['cost_composition'][section+'_total']==pytest.approx(expected[section+'_total'])
+        for actual,wanted in zip(result['cost_composition'][section+'_parts'],expected[section+'_parts']):
+            assert actual['key']==wanted['key'] and actual['known']==wanted['known']
+            assert actual['tokens']==pytest.approx(wanted['tokens'])
+            assert actual['share']==pytest.approx(wanted['share'])
+    assert result['maintenance_calls']==11 and result['maintenance_missing']==0
+    assert result['maintenance_cost']==pytest.approx(1.2)
+    assert len(result['recent'])==12 and result['recent'][-1]['sid']=='child'
+    assert result['recent'][-1]['source_title']==child['title']
 
 
 def test_real_session_table_shows_parent_without_own_calls_and_click_keeps_breakdown(tmp_path):

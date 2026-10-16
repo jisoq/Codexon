@@ -107,6 +107,52 @@ def test_usage_ledger_retries_after_transient_failure(monkeypatch,tmp_path):
     assert 'ledger_error' not in snapshots[-1]['value']
 
 
+def test_history_recovery_yields_to_details_and_collection(monkeypatch,tmp_path):
+    from types import SimpleNamespace
+    clock=[100.0];steps=[];polls=[];messages=[];requested=[False]
+    monkeypatch.setattr(analysis_worker,'time',SimpleNamespace(monotonic=lambda:clock[0],time=lambda:clock[0]))
+    session=source()
+    class Index:
+        path='unused'
+        def __init__(self,*args):pass
+        def poll(self):
+            polls.append(clock[0])
+            return dict(ts=clock[0],sessions=[copy.deepcopy(session)],homes=[session['home']],
+                        errors=[],unassigned=[],index={'loading':False})
+        def notification_connection(self):return None
+        def close(self):pass
+    class Ledger:
+        def __init__(self,*args):self.db=self
+        def enrich_modes(self,*args):pass
+        def sync(self,*args):pass
+        def import_observations_step(self,*args):
+            clock[0]+=.5
+            steps.append(clock[0])
+            return len(steps)>=8
+        def import_observations(self,*args):raise AssertionError('blocking recovery path used')
+        def close(self):pass
+    class Connection:
+        def poll(self,timeout=0):
+            clock[0]+=timeout
+            return bool(steps) and (not requested[0] or len(steps)>=8)
+        def recv(self):
+            if not requested[0]:
+                requested[0]=True
+                return dict(kind='record',id=1,identity=(session['home'],session['id'],session['history'][-1]['key']))
+            return {'kind':'stop'}
+        def send(self,value):messages.append((clock[0],value))
+        def close(self):pass
+    monkeypatch.setattr(analysis_worker,'CollectionClient',Index)
+    monkeypatch.setattr(analysis_worker,'QuotaLedger',Ledger)
+    analysis_worker.process_main(Connection(),['h'],tmp_path/'index.sqlite')
+    assert len(polls)>=2
+    detail=next((at,value) for at,value in messages if value['kind']=='record')
+    assert detail[0]<steps[-1] and detail[1]['row']['key']==session['history'][-1]['key']
+    snapshots=[value['value'] for _,value in messages if value['kind']=='snapshot']
+    assert not snapshots[0]['ledger_status_known']
+    assert snapshots[-1]['ledger_status_known'] and not snapshots[-1]['ledger_fault']['ledger_failed']
+
+
 def test_service_collects_large_record_once_for_gui_and_worker(tmp_path,monkeypatch):
     import json
     from cachemonitor.index import UsageIndex

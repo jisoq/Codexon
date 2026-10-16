@@ -190,7 +190,7 @@ class AnalysisEngine:
         # A collector revision covers corrections as well as append. Unversioned
         # callers retain the full fingerprint path.
         fast=tuple(((s['home'],s['id']),s.get('usage_revision'),
-                    tuple(s.get(k) for k in ('title','cwd','project','project_name','source','archived','collection_complete','pending','parent_thread_id','agent_path','agent_nickname','spawn_depth')),
+                    tuple(s.get(k) for k in ('title','cwd','project','project_name','source','archived','collection_complete','pending','parent_thread_id','agent_path','agent_nickname','spawn_depth','model')),
                     request_signature(s),bool(s.get('_collection_pending')))
                    for s in sessions) if all(s.get('usage_revision') is not None for s in sessions) else None
         if fast is not None and fast==getattr(self,'_ingest_key',None) and price_signature==self.pricing_signature:
@@ -207,7 +207,7 @@ class AnalysisEngine:
             key=(source['home'],source['id'])
             old=previous_sessions.get(key)
             revision=source.get('usage_revision')
-            metadata=tuple(source.get(k) for k in ('title','cwd','project','project_name','source','archived','collection_complete','pending','parent_thread_id','agent_path','agent_nickname','spawn_depth'))+(
+            metadata=tuple(source.get(k) for k in ('title','cwd','project','project_name','source','archived','collection_complete','pending','parent_thread_id','agent_path','agent_nickname','spawn_depth','model'))+(
                 request_signature(source),self.ownership_versions[key])
             fingerprint=(metadata,revision if revision is not None else row_signatures(source['history']),
                          request_signature(source))
@@ -236,6 +236,8 @@ class AnalysisEngine:
             self.generation+=1
             calls_changed=True
             previous=old['records'] if old and not reprice else {}
+            prior_history=old['prepared']['history'] if old else ()
+            speed_prefix=old is not None and not reprice
             misses=classify(owned_history)
             miss_keys={e['key'] for e in misses['events']}
             records={}
@@ -248,7 +250,15 @@ class AnalysisEngine:
                 cached=previous.get(identity)
                 is_miss=r.get('key') in miss_keys
                 context=(signature,source['title'],source.get('cwd'),source.get('project'),source.get('project_name'),source.get('source'),state,is_miss,i)
-                if cached and cached[0]==context:
+                same_record=cached is not None and cached[0]==context
+                # Row signatures cover the raw speed inputs. Display metadata,
+                # request state and later cache incident annotations do not.
+                # Reuse this existing check without another history fingerprint.
+                position=len(history)
+                if speed_prefix and position<len(prior_history):
+                    speed_prefix=bool(cached and (same_record or cached[0][0]==signature)
+                                      and cached[1] is prior_history[position])
+                if same_record:
                     row=cached[1]
                 else:
                     price_keys=('model','requested_model','model_conflict','mode_conflict','input','cached','written','output','reasoning','service_tier','input_conflict')
@@ -279,11 +289,14 @@ class AnalysisEngine:
             updated[key]={'source':source,'prepared':prepared,'records':records,'fingerprint':fingerprint,
                           'request_facts':facts if facts is not None else _request_facts(source),
                           'revision':self.generation,'content_revision':self.generation,
+                          'internal_review':internal_review(prepared),
+                          'speed_append_from':((old.get('content_revision',old['revision']),len(prior_history))
+                              if speed_prefix and len(history)>=len(prior_history) else None),
                           'timestamps':sorted(r['ts'] for r in history),'boundaries':boundaries,
                           'boundary_turns':boundary_turns,'turn_ids':turn_ids,'whole_turns':dict(whole_turns)}
             self.metrics['session_rebuilds']+=1
         if set(updated)!=set(previous_sessions): changed=True;calls_changed=True
-        self.internal_sessions=OrderedDict((key,state) for key,state in updated.items() if internal_review(state['prepared']))
+        self.internal_sessions=OrderedDict((key,state) for key,state in updated.items() if state['internal_review'])
         work=OrderedDict((key,state) for key,state in updated.items() if key not in self.internal_sessions)
         if set(work)!=set(self.sessions):changed=True;calls_changed=True
         self.sessions=work

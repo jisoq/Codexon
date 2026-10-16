@@ -27,7 +27,7 @@ def test_only_explicit_structural_tier_and_start_override():
     assert request_mode('service_tier: Some("priority")') is None
 
 
-def test_enrichment_requires_same_home_session_and_turn_and_persists(tmp_path):
+def test_enrichment_requires_same_home_session_and_turn_and_persists(tmp_path,monkeypatch):
     home=str(tmp_path)
     db=sqlite3.connect(tmp_path/'logs_2.sqlite')
     db.execute('create table logs(id integer primary key, thread_id text, target text, feedback_log_body text)')
@@ -38,10 +38,20 @@ def test_enrichment_requires_same_home_session_and_turn_and_persists(tmp_path):
             {'home':home,'id':sid,'usage_revision':1,'history':[{'turn':turn}]}
             for sid,turn in [('s',TURN),('other',TURN),('s','unmatched')]]}
     ledger=QuotaLedger(tmp_path/'ledger.sqlite')
+    absent=ledger.mode_dependency(home,'s')
     first=snapshot();ledger.enrich_modes(first)
+    dependency=ledger.mode_dependency(home,'s')
+    assert dependency!=absent and ledger.mode_dependency(home,'other')==absent
     assert [s['history'][0]['service_tier'] for s in first['sessions']]==['Fast','미확인','미확인']
     statements=[];ledger.db.set_trace_callback(statements.append)
-    second=snapshot();ledger.enrich_modes(second)
+    scans=[];scan=ledger.scan_modes
+    def record_scan(homes):
+        scans.append(tuple(homes));return scan(homes)
+    monkeypatch.setattr(ledger,'scan_modes',record_scan)
+    ledger.scan_modes([home])
+    second=snapshot();ledger.enrich_modes(second,scan=False)
+    assert scans==[(home,)]
+    assert ledger.mode_dependency(home,'s')==dependency
     ledger.db.set_trace_callback(None)
     assert not any(sql.startswith('BEGIN') for sql in statements)
     assert [s['usage_revision'] for s in first['sessions']]==[s['usage_revision'] for s in second['sessions']]
@@ -52,6 +62,7 @@ def test_enrichment_requires_same_home_session_and_turn_and_persists(tmp_path):
     ledger.db.set_trace_callback(None)
     assert not any(sql.startswith('BEGIN') for sql in statements)
     assert restored['sessions'][0]['history'][0]['service_tier']=='Fast'
+    assert ledger.mode_dependency(home,'s')==dependency
     ledger.close()
 
 
@@ -63,7 +74,12 @@ def test_mode_enrichment_reuses_unchanged_rows_and_replays_corrections(tmp_path)
     ledger=QuotaLedger(tmp_path/'ledger.sqlite')
     key=(home,'s','changed')
     try:
+        absent=ledger.mode_dependency(*key[:2])
         ledger.modes[key]='Fast';ledger.mode_revisions[key[:2]]=1
+        fast=ledger.mode_dependency(*key[:2])
+        assert fast!=absent
+        ledger.modes.update({key:'Fast'})
+        assert ledger.mode_dependency(*key[:2])==fast
         identity=ledger.enrich_modes(snapshot)
         enriched=snapshot['sessions'][0]['history']
         assert enriched[0] is raw[0]
@@ -73,10 +89,22 @@ def test_mode_enrichment_reuses_unchanged_rows_and_replays_corrections(tmp_path)
         assert snapshot['sessions'][0]['history'] is enriched
         assert snapshot['sessions'][0]['usage_revision']==(1,1)
         ledger.modes.pop(key);ledger.mode_revisions[key[:2]]=2
+        assert ledger.mode_dependency(*key[:2])==absent
         assert ledger.enrich_modes(snapshot) is not identity
         assert snapshot['sessions'][0]['history'][1] is raw[1]
         assert snapshot['sessions'][0]['usage_revision']==(1,2)
         assert enriched[1]['service_tier']=='Fast'  # Existing views remain stable.
+        evidence=dict(mode='Fast',configured_service_tier='priority',request_mode_action='set',
+            request_mode_source='settings_override',mode_conflict=False)
+        ledger.mode_evidence[key]=evidence
+        explicit=ledger.mode_dependency(*key[:2])
+        assert explicit!=absent
+        ledger.mode_evidence[key]={**evidence,'request_mode_source':'inherited_settings'}
+        assert ledger.mode_dependency(*key[:2])!=explicit
+        ledger.mode_evidence[key]=dict(reversed(tuple(evidence.items())))
+        assert ledger.mode_dependency(*key[:2])==explicit
+        ledger.mode_evidence.clear()
+        assert ledger.mode_dependency(*key[:2])==absent
     finally:ledger.close()
 
 

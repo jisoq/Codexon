@@ -252,9 +252,19 @@ def test_new_session_loading_does_not_reprocess_existing_call_history(tmp_path):
         assert engine.query(query)['analysis']['turns'][0]['complete']
         value.update(ts=201.,index=dict(loading=True))
         value['sessions']=[dict(s,collection_complete=False) for s in value['sessions']]+[session('new',1)]
+        previous_history=engine.sessions[('home','old')]['prepared']['history']
+        class UnchangedHistory(list):
+            def __iter__(self):raise AssertionError('A new owner reread old prepared calls')
+            def __getitem__(self,key):raise AssertionError('A new owner revisited an old prepared call')
+        engine.sessions[('home','old')]['prepared']['history']=UnchangedHistory(previous_history)
         next_value=deliver()
+        engine.sessions[('home','old')]['prepared']['history']=previous_history
         assert ledger.db.total_changes-before<16
-        assert overlays.speed_health.metrics['scanned_rows']==1
+        # The new row is inspected once for admission and once for reduction.
+        # Old input must be untouched during both phases.
+        assert overlays.speed_health.metrics['proof_rows']==1
+        assert overlays.speed_health.metrics['append_scan_rows']==1
+        assert overlays.speed_health.metrics['replay_rows']==0
         old_overlay=next(s for s in next_value['overlay_sessions'] if s['id']=='old')
         assert old_overlay==dict(first['overlay_sessions'][0],collection_complete=False)
         assert next(s for s in next_value['overlay_sessions'] if s['id']=='new')['calls']==1

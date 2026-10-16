@@ -1,7 +1,8 @@
 """Filter-independent, call-scoped overlay data from priced analysis records."""
 from copy import deepcopy
+from heapq import nlargest
 
-from .analytics import stats, population, observation_flags, output_speed, output_speed_summary
+from .analytics import stats, observation_flags, output_speed, output_speed_summary
 from .pricing import request_tier, sum_cost
 from .core import token_number, transport_label, token_parts
 from .cache_misses import classify
@@ -26,12 +27,13 @@ def assumed_cost(row):
     return bool(row.get('price_assumed'))
 
 
-def token_composition(session):
+def token_composition(session,*,_partials=None):
     """Shared disjoint token rules; unattached cumulative gaps stay out."""
     rows=list(session.get('history',()))
     counts=dict.fromkeys(TOKEN_LABELS,0);known=dict.fromkeys(TOKEN_ORDER,False)
     inp_total=out_total=0;partial=False
-    cache=population(rows,'rate')
+    cache_input=cache_read=cache_valid=0
+    input_known=output_known=False;written_known=bool(rows)
     for row in rows:
         parts=token_parts(row);inp,out=parts['input'],parts['output']
         for section,mapping in ((inp,{'ordinary':'uncached','read':'cached','write':'written','unclassified':'input_unknown'}),
@@ -40,20 +42,32 @@ def token_composition(session):
         i,r=token_number(row.get('input')),token_number(row.get('cached'))
         if i is not None:inp_total+=i
         if token_number(row.get('output')) is not None:out_total+=row['output']
+        input_known |= i is not None
+        output_known |= token_number(row.get('output')) is not None
+        if i is not None and r is not None and r<=i:
+            cache_input+=i;cache_read+=r;cache_valid+=1
         partial |= i is None or token_number(row.get('output')) is None
         w,o,q=(token_number(row.get(key)) for key in ('written','output','reasoning'))
+        written_known &= w is not None
         input_valid=i is not None and not row.get('input_conflict') and (r is None or r<=i) and (w is None or w<=i) and (r is None or w is None or r+w<=i)
         output_valid=o is not None and q is not None and q<=o and not row.get('output_conflict')
         known['cached'] |= input_valid and r is not None
         known['written'] |= input_valid and w is not None
         known['uncached'] |= input_valid and r is not None and w is not None
         known['output'] |= output_valid;known['reasoning'] |= output_valid
+    if _partials is not None:_partials.update(cache_input=cache_input,cache_read=cache_read)
+    return _token_view(counts,known,inp_total,out_total,partial,input_known,output_known,
+                       cache_input,cache_read,cache_valid,len(rows),written_known)
+
+
+def _token_view(counts,known,inp_total,out_total,partial,input_known,output_known,
+                cache_input,cache_read,cache_valid,cache_target,written_known):
     total=inp_total+out_total
     def group(keys,denominator):
         return [dict(key=key,label=TOKEN_LABELS[key],tokens=counts[key],known=known.get(key,True),share=counts[key]/denominator if denominator else 0)
                 for key in keys if counts[key] or key not in ('input_unknown','output_unknown')]
-    input_parts=group(('cached','written','uncached','input_unknown'),inp_total) if any(token_number(r.get('input')) is not None for r in rows) else []
-    output_parts=group(('reasoning','output','output_unknown'),out_total) if any(token_number(r.get('output')) is not None for r in rows) else []
+    input_parts=group(('cached','written','uncached','input_unknown'),inp_total) if input_known else []
+    output_parts=group(('reasoning','output','output_unknown'),out_total) if output_known else []
     unknown=counts['input_unknown']+counts['output_unknown'];known['unknown']=bool(unknown)
     displayed={**counts,'unknown':unknown};maximum=max((displayed[k] for k in COMPARISON_ORDER),default=0)
     bars=[dict(key=k,label=TOKEN_LABELS[k],tokens=displayed[k],known=known[k],share=displayed[k]/total if total else 0,
@@ -61,30 +75,80 @@ def token_composition(session):
     return dict(total=total,partial=partial,counts=counts,known=bool(input_parts or output_parts),category_known=known,
         input_parts=input_parts,output_parts=output_parts,input_total=inp_total,output_total=out_total,
         cached=counts['cached'],cached_share=counts['cached']/inp_total if inp_total else 0,
-        cache_hit_rate=cache['value'],cache_hit_partial=bool(cache['missing']),cache_valid=cache['n'],cache_target=cache['N'],
-        written_known=bool(rows) and all(token_number(r.get('written')) is not None for r in rows),
+        cache_hit_rate=100*cache_read/cache_input if cache_input else None,
+        cache_hit_partial=cache_valid<cache_target,cache_valid=cache_valid,cache_target=cache_target,
+        written_known=written_known,
         unknown=unknown,non_cache_total=total-counts['cached'],bar_max=maximum,bars=bars,
         parts=[dict(key=k,label=TOKEN_LABELS[k],tokens=displayed[k],share=displayed[k]/total) for k in TOKEN_ORDER if displayed[k] and total])
+
+
+COST_PARTS=(('input',(('cached','cost_cached'),('written','cost_written'),('uncached','cost_uncached'),('input_unknown','cost_unclassified'))),
+            ('output',(('reasoning','cost_reasoning'),('output','cost_non_reasoning'),('output_unknown',None))))
 
 
 def cost_composition(rows):
     """Disjoint amounts over exactly the headline's priced population."""
     priced=[r for r in rows if r.get('cost') is not None]
-    groups=[]
-    for section,keys in (('input',(('cached','cost_cached'),('written','cost_written'),('uncached','cost_uncached'),('input_unknown','cost_unclassified'))),
-                         ('output',(('reasoning','cost_reasoning'),('output','cost_non_reasoning'),('output_unknown',None)))):
+    sections={}
+    for section,keys in COST_PARTS:
         counts=dict.fromkeys((k for k,_ in keys),0.)
         for row in priced:
             if section=='output' and (row.get('output_conflict') or any(row.get(k) is None for k in ('cost_reasoning','cost_non_reasoning'))):
                 counts['output_unknown']+=row.get('cost_output') or 0
             else:
                 for key,field in keys:counts[key]+=row.get(field) or 0
+        sections[section]=counts
+    return _cost_view(sections,len(priced),len(rows))
+
+
+def _cost_view(sections,priced,calls):
+    result=dict(priced=priced,calls=calls,partial=priced<calls,known=bool(priced))
+    for section,counts in sections.items():
         total=sum(counts.values()) if priced else None
-        groups.append((section,total,[dict(key=k,label=TOKEN_LABELS[k],tokens=v,known=bool(priced),share=v/total if total else 0)
-                                     for k,v in counts.items() if v or not k.endswith('unknown')]))
-    result=dict(priced=len(priced),calls=len(rows),partial=len(priced)<len(rows),known=bool(priced))
-    for section,total,parts in groups:result.update({section+'_total':total,section+'_parts':parts})
+        parts=[dict(key=k,label=TOKEN_LABELS[k],tokens=v,known=bool(priced),share=v/total if total else 0)
+               for k,v in counts.items() if v or not k.endswith('unknown')]
+        result.update({section+'_total':total,section+'_parts':parts})
     return result
+
+
+def _merge_compositions(summaries,partials):
+    tokens=[summary['token_composition'] for summary in summaries]
+    counts={key:sum(value['counts'][key] for value in tokens) for key in TOKEN_LABELS}
+    known={key:any(value['category_known'][key] for value in tokens) for key in TOKEN_ORDER}
+    calls=sum(summary['calls'] for summary in summaries)
+    composition=_token_view(counts,known,sum(value['input_total'] for value in tokens),
+        sum(value['output_total'] for value in tokens),any(value['partial'] for value in tokens),
+        any(value['input_parts'] for value in tokens),any(value['output_parts'] for value in tokens),
+        sum(value['cache_input'] for value in partials),sum(value['cache_read'] for value in partials),
+        sum(value['cache_valid'] for value in tokens),sum(value['cache_target'] for value in tokens),
+        bool(calls) and all(not summary['calls'] or value['written_known'] for summary,value in zip(summaries,tokens)))
+    costs=[summary['cost_composition'] for summary in summaries]
+    sections={section:dict.fromkeys((key for key,_ in fields),0.) for section,fields in COST_PARTS}
+    for cost in costs:
+        for section,counts in sections.items():
+            for part in cost[section+'_parts']:counts[part['key']]+=part['tokens']
+    cost=_cost_view(sections,sum(value['priced'] for value in costs),sum(value['calls'] for value in costs))
+    speeds=[summary['output_speed_summary'] for summary in summaries]
+    output=sum(value['output'] for value in speeds);seconds=sum(value['seconds'] for value in speeds)
+    count=sum(value['n'] for value in speeds);target=sum(value['N'] for value in speeds)
+    speed=dict(value=output/seconds if seconds else None,output=output,seconds=seconds,n=count,N=target,missing=target-count)
+    maintenance_calls=sum(value['maintenance_calls'] for value in partials)
+    maintenance_missing=sum(value['maintenance_missing'] for value in partials)
+    maintenance_cost=(sum(value['maintenance_cost'] for value in partials if value['maintenance_cost'] is not None)
+                      if maintenance_calls>maintenance_missing else None)
+    return dict(token_composition=composition,cost_composition=cost,output_speed_summary=speed,
+        maintenance_calls=maintenance_calls,maintenance_missing=maintenance_missing,maintenance_cost=maintenance_cost)
+
+
+def _recent_members(members,updated):
+    # Preserve stable tie ordering while retaining at most twelve candidates.
+    rows=((member,row) for member in members for row in updated[member][1]['recent'])
+    def order(item):
+        ordinal,(_,row)=item
+        return row['ts'],str(row.get('home')),str(row.get('sid')),str(row['id']),ordinal
+    selected=nlargest(12,enumerate(rows),key=order)
+    return [dict(row,source_title=updated[member][1]['title'])
+            for _,(member,row) in sorted(selected,key=order)]
 
 
 class OverlayCacheHealth(CacheHealth):
@@ -148,7 +212,7 @@ def call_summary(row, ordinal, *, miss=False, degradation=False):
     return result
 
 
-def summarize_session(session,health=None):
+def summarize_session(session,health=None,*,_partials=None):
     rows = sorted(session.get('history', ()), key=lambda row: row['ts'])
     latest = rows[-1] if rows else {}
     call = stats(rows, 'cost')
@@ -207,7 +271,17 @@ def summarize_session(session,health=None):
              'mode':observed_mode(current_latest),'effort':current_latest.get('effort'),
              'usage_at':current_latest.get('ts')}
     mismatches=[r for r in rows if r.get('model_alert_confirmed')]
-    tokens=token_composition(session)
+    tokens=token_composition(session,_partials=_partials)
+    if _partials is not None:
+        _partials.update(maintenance_calls=0,maintenance_missing=0)
+        def maintenance_costs():
+            for row in rows:
+                if row.get('purpose')!='maintenance':continue
+                _partials['maintenance_calls']+=1
+                if row.get('cost') is None:_partials['maintenance_missing']+=1
+                else:yield row['cost']
+        maintenance_cost=sum(maintenance_costs())
+        _partials['maintenance_cost']=(maintenance_cost if _partials['maintenance_calls']>_partials['maintenance_missing'] else None)
     statuses=[]
     if gap:
         statuses.append({'text':'이전 기록 누락','severity':'muted'})
@@ -255,23 +329,29 @@ def summarize_session(session,health=None):
 class OverlaySummaries:
     def __init__(self):
         self.cache = {}
+        self.partials = {}
         self.rollups = {}
         self.speed_health = SpeedHealth()
         self.presented = {}
 
     def collect(self, engine):
         speeds = self.speed_health.collect(engine)
-        updated = {}
+        updated = {};partials={}
         for key, state in engine.sessions.items():
             source=state.get('source',state['prepared'])
             coverage_gaps=source.get('coverage_gaps',())
             revision = (state.get('content_revision',state['revision']),bool(coverage_gaps))
             previous = self.cache.get(key)
-            summary = previous[1] if previous and previous[0] == revision else summarize_session(
-                dict(state['prepared'],coverage_gaps=coverage_gaps),
-                state['prepared'].get('cache_health'))
+            if previous and previous[0]==revision:
+                summary=previous[1];partials[key]=self.partials[key]
+            else:
+                parts={}
+                summary=summarize_session(dict(state['prepared'],coverage_gaps=coverage_gaps),
+                    state['prepared'].get('cache_health'),_partials=parts)
+                partials[key]=parts
             updated[key] = (revision, summary)
         self.cache = updated
+        self.partials = partials
         own = {key:dict(cost=summary['cost'], calls=summary['calls'],
                         priced=summary['priced'], gap=summary['coverage_gap'])
                for key,(_,summary) in updated.items()}
@@ -288,27 +368,23 @@ class OverlaySummaries:
             if previous and previous[0]==signature:
                 value=previous[1]
             else:
-                rows=[row for member in group['members']
-                      for row in engine.sessions[member]['prepared']['history']]
+                own_summaries=[updated[member][1] for member in group['members']]
+                compositions=_merge_compositions(own_summaries,[partials[member] for member in group['members']])
                 value=dict(summary,cost=group['cost'],own_cost=group['own_cost'],
                     child_cost=group['child_cost'],descendants=group['descendants'],
                     own_calls=summary['calls'],own_priced=summary['priced'],
                     calls=group['calls'],priced=group['priced'],
                     missing=group['calls']-group['priced'],partial=group['partial'],
                     mean_cost=group['cost']/group['priced'] if group['priced'] else None,
-                    coverage_gap=group['gap'],token_composition=token_composition({'history':rows}),
+                    coverage_gap=group['gap'],
                     assumed=sum(updated[member][1]['assumed'] for member in group['members']))
-                recent=sorted((dict(r,source_title=updated[member][1]['title']) for member in group['members']
-                               for r in updated[member][1]['recent']),key=lambda r:(r['ts'],str(r.get('home')),str(r.get('sid')),str(r['id'])))[-12:]
+                recent=_recent_members(group['members'],updated)
                 value.update(recent=recent,latest=recent[-1] if recent else {},members=group['members'],
-                             output_speed_summary=output_speed_summary(rows),cost_composition=cost_composition(rows),
-                             active_requests=sum(updated[m][1]['request'].get('state')=='진행' for m in group['members']))
+                             active_requests=sum(updated[m][1]['request'].get('state')=='진행' for m in group['members']),
+                             **compositions)
                 if recent:
                     value.update({k:recent[-1].get(k) for k in ('model','model_setting','response_model','model_mismatch','model_state','effort','mode','response_mode','transport','transport_state','cache_rate')})
                     value.update(latest_cost=recent[-1].get('cost'),latest_ts=recent[-1].get('ts'),latest_key=recent[-1].get('key'))
-                maintenance=[r for r in rows if r.get('purpose')=='maintenance']
-                value.update(maintenance_calls=len(maintenance),maintenance_cost=sum_cost(maintenance)['cost'] if maintenance else None,
-                    maintenance_missing=sum(r.get('cost') is None for r in maintenance))
             merged[key]=(signature,value)
             result.append(value)
         self.rollups=merged

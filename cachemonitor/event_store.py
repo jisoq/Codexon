@@ -107,21 +107,19 @@ class EventStore:
                 db.rollback();raise
         self.pending=self.legacy and not read_only
 
-    def enable_replay_tokens(self):
-        """Opt into durable owner invalidation before publishing replay checkpoints.
-
-        Counters share the source transaction, including deletes and in-place
-        corrections. Extra columns preserve older readers of the event schema.
-        Until a checkpoint consumer enables this, ordinary indexing pays no
-        extra writes. Legacy migration must finish before checkpoints are used.
-        """
-        if self.read_only or self.legacy:return None
-        if self.db.in_transaction:raise RuntimeError('Replay tokens require a committed source state')
+    @staticmethod
+    def replay_triggers():
         changes={
             'owner_delete':'''BEFORE DELETE ON event_sessions BEGIN
                 UPDATE event_store_state SET replay_epoch=lower(hex(randomblob(16))) WHERE id=1; END''',
             'owner_replace':'''BEFORE INSERT ON event_sessions WHEN EXISTS
                 (SELECT 1 FROM event_sessions WHERE id=NEW.id OR home IS NEW.home AND tid IS NEW.tid) BEGIN
+                UPDATE event_store_state SET replay_epoch=lower(hex(randomblob(16))) WHERE id=1; END''',
+            'owner_revive':'''AFTER INSERT ON event_sessions WHEN EXISTS
+                (SELECT 1 FROM event_records WHERE session_id=NEW.id) BEGIN
+                UPDATE event_store_state SET replay_epoch=lower(hex(randomblob(16))) WHERE id=1; END''',
+            'owner_move':'''BEFORE UPDATE OF id,home,tid ON event_sessions
+                WHEN OLD.id IS NOT NEW.id OR OLD.home IS NOT NEW.home OR OLD.tid IS NOT NEW.tid BEGIN
                 UPDATE event_store_state SET replay_epoch=lower(hex(randomblob(16))) WHERE id=1; END''',
             'path_replace':'''BEFORE INSERT ON event_paths BEGIN
                 UPDATE event_sessions SET replay_revision=replay_revision+1 WHERE id IN
@@ -133,10 +131,11 @@ class EventStore:
                      WHERE (path_id=NEW.path_id AND pos=NEW.pos) OR seq=NEW.seq); END''',
             'insert':'''AFTER INSERT ON event_records BEGIN
                 UPDATE event_sessions SET replay_revision=replay_revision+1 WHERE id=NEW.session_id; END''',
-            'update':'''AFTER UPDATE OF path_id,pos,session_id,ts,data,quota ON event_records
-                WHEN OLD.path_id IS NOT NEW.path_id OR OLD.pos IS NOT NEW.pos OR OLD.session_id IS NOT NEW.session_id
+            'update':'''AFTER UPDATE OF seq,path_id,pos,session_id,ts,data,quota ON event_records
+                WHEN OLD.seq IS NOT NEW.seq OR OLD.path_id IS NOT NEW.path_id OR OLD.pos IS NOT NEW.pos OR OLD.session_id IS NOT NEW.session_id
                     OR OLD.ts IS NOT NEW.ts OR OLD.data IS NOT NEW.data OR OLD.quota IS NOT NEW.quota BEGIN
-                UPDATE event_sessions SET replay_revision=replay_revision+1 WHERE id IN (OLD.session_id,NEW.session_id); END''',
+                UPDATE event_sessions SET replay_revision=replay_revision+1+(OLD.seq IS NOT NEW.seq)
+                    WHERE id IN (OLD.session_id,NEW.session_id); END''',
             'delete':'''AFTER DELETE ON event_records BEGIN
                 UPDATE event_sessions SET replay_revision=replay_revision+1 WHERE id=OLD.session_id; END''',
             'path':'''AFTER UPDATE OF id,path ON event_paths WHEN OLD.id IS NOT NEW.id OR OLD.path IS NOT NEW.path BEGIN
@@ -149,7 +148,19 @@ class EventStore:
                 WHEN OLD.id IS NOT NEW.id OR OLD.home IS NOT NEW.home OR OLD.tid IS NOT NEW.tid BEGIN
                 UPDATE event_sessions SET replay_revision=replay_revision+1 WHERE id=NEW.id; END''',
         }
-        triggers={'event_replay_'+key:'CREATE TRIGGER event_replay_'+key+' '+sql for key,sql in changes.items()}
+        return {'event_replay_'+key:'CREATE TRIGGER event_replay_'+key+' '+sql for key,sql in changes.items()}
+
+    def enable_replay_tokens(self):
+        """Opt into durable owner invalidation before publishing replay checkpoints.
+
+        Counters share the source transaction, including deletes and in-place
+        corrections. Moving an event identity counts separately from insertion.
+        Owner identity changes rotate the epoch before replacement can remove
+        another owner's counter. Readers can verify the same trigger contract.
+        """
+        if self.read_only or self.legacy:return None
+        if self.db.in_transaction:raise RuntimeError('Replay tokens require a committed source state')
+        triggers=self.replay_triggers()
         actual={name:sql for name,sql in self.db.execute("SELECT name,sql FROM sqlite_master WHERE type='trigger'")}
         columns={row[1] for row in self.db.execute('PRAGMA table_info(event_store_state)')}
         owners={row[1] for row in self.db.execute('PRAGMA table_info(event_sessions)')}

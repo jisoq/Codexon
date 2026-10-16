@@ -31,6 +31,55 @@ PRICE_SNAPSHOT = json.dumps({'rates': {k: asdict(v) for k, v in RATES.items()},
 PRICE_ID = hashlib.sha256(PRICE_SNAPSHOT.encode()).hexdigest()[:16]
 
 
+class _ModeValues(dict):
+    """Notify once for each actual top-level mode/evidence value change.
+
+    Evidence writers replace complete scalar maps in rebuild_mode_evidence;
+    they do not mutate nested evidence in place.
+    """
+    def __init__(self, changed, values=()):
+        super().__init__(values)
+        self._changed=changed
+
+    def __setitem__(self,key,value):
+        same=key in self and self[key]==value
+        super().__setitem__(key,value)
+        if not same:self._changed(key)
+
+    def __delitem__(self,key):
+        super().__delitem__(key)
+        self._changed(key)
+
+    def pop(self,key,*default):
+        present=key in self
+        value=super().pop(key,*default)
+        if present:self._changed(key)
+        return value
+
+    def popitem(self):
+        key,value=super().popitem()
+        self._changed(key)
+        return key,value
+
+    def clear(self):
+        while self:self.popitem()
+
+    def update(self,*args,**kwargs):
+        for key,value in dict(*args,**kwargs).items():self[key]=value
+
+    def setdefault(self,key,default=None):
+        if key not in self:self[key]=default
+        return self[key]
+
+    def __ior__(self,other):
+        self.update(other)
+        return self
+
+
+_MODE_DEPENDENCY_DOMAIN=b'quota-mode-dependency-v1\0'
+_EMPTY_MODE_DEPENDENCY='mode-v1:'+hashlib.sha256(_MODE_DEPENDENCY_DOMAIN+b'[[],[]]').hexdigest()
+
+
 class _PriceEquivalence:
     """Reuse a stored calculation when only its verification metadata changed."""
     METADATA = {'verified', 'model_verified', 'rate_verified', 'multiplier_verified'}
@@ -1022,9 +1071,12 @@ class QuotaLedger:
                 self.db.execute('update calls set cost=?,price_id=? where home=? and uid=?',
                     (token_cost(dict(old))['cost'],PRICE_ID,old['home'],old['uid']))
         self.db.commit()
-        self.modes = {(r['home'],r['sid'],r['turn']):r['mode'] for r in self.db.execute('select * from modes')}
+        self._mode_dependency_profiles=None
+        self._mode_dependency_digests={}
+        self.modes = _ModeValues(self._mode_dependency_changed,
+            {(r['home'],r['sid'],r['turn']):r['mode'] for r in self.db.execute('select * from modes')})
         self.mode_revisions = {}
-        self.mode_evidence = {}
+        self.mode_evidence = _ModeValues(self._mode_dependency_changed)
         for home in {r[0] for r in self.db.execute('select distinct home from mode_events')}:
             self.rebuild_mode_evidence(home)
         self.db.commit()
@@ -1211,6 +1263,34 @@ class QuotaLedger:
         cache[key]=(signature,rows,weight,weights)
         return rows
 
+    def _mode_dependency_changed(self,key):
+        self._mode_dependency_profiles=None
+        self._mode_dependency_digests.pop(key[:2],None)
+
+    def mode_dependency(self,home,sid):
+        """Stable own-mode dependency; callers add parent/body dependencies.
+
+        Group current modes/evidence once after value changes, then hash only
+        a requested owner whose values changed. Empty owners retain no cache.
+        """
+        if self._mode_dependency_profiles is None:
+            profiles={}
+            for index,values in enumerate((self.modes,self.mode_evidence)):
+                for key,value in values.items():
+                    profiles.setdefault(key[:2],[[],[]])[index].append((key[2],value))
+            self._mode_dependency_profiles=profiles
+        key=(home,sid)
+        profile=self._mode_dependency_profiles.get(key)
+        if profile is None:return _EMPTY_MODE_DEPENDENCY
+        if key not in self._mode_dependency_digests:
+            for values in profile:
+                values.sort(key=lambda entry:json.dumps(entry[0],separators=(',',':')))
+            digest=hashlib.sha256(_MODE_DEPENDENCY_DOMAIN)
+            encoder=json.JSONEncoder(sort_keys=True,separators=(',',':'),allow_nan=False)
+            for part in encoder.iterencode(profile):digest.update(part.encode('utf8'))
+            self._mode_dependency_digests[key]='mode-v1:'+digest.hexdigest()
+        return self._mode_dependency_digests[key]
+
     def rebuild_mode_evidence(self,home):
         """Replay sanitized setting events by log order, including backfilled evidence."""
         inherited={}
@@ -1251,10 +1331,10 @@ class QuotaLedger:
                 session_key=key[:2]
                 self.mode_revisions[session_key]=self.mode_revisions.get(session_key,0)+1
 
-    def enrich_modes(self, snapshot):
+    def scan_modes(self, homes):
         from contextlib import closing
-        from .request_modes import request_mode_observation, mode_parents, ParentModeTimeline
-        for home in snapshot.get('homes',[]):
+        from .request_modes import request_mode_observation
+        for home in homes:
             path=Path(home)/'logs_2.sqlite'
             if not path.exists():continue
             try:
@@ -1297,6 +1377,10 @@ class QuotaLedger:
                         (home,*checkpoint))
             except sqlite3.Error:pass
         self.db.commit()
+
+    def enrich_modes(self, snapshot, scan=True):
+        from .request_modes import mode_parents, ParentModeTimeline
+        if scan:self.scan_modes(snapshot.get('homes',[]))
         previous=getattr(self,'_enriched_sessions',{})
         enriched={};resolved={};timelines={}
         changed=False
@@ -1555,6 +1639,18 @@ class QuotaLedger:
         finally:
             self.db.execute(f'PRAGMA cache_size={previous_limit}')
             self.db.execute('PRAGMA shrink_memory')
+
+    def import_observations_step(self,index_path,homes):
+        """Commit one recovery slice, releasing the source snapshot before return."""
+        from .quota_history_import import ObservationImport
+        scope=(str(Path(index_path).resolve()),frozenset(homes))
+        previous=getattr(self,'_observation_import',None)
+        if previous is None or previous[0]!=scope:
+            if previous is not None:previous[1].close()
+            previous=self._observation_import=(scope,ObservationImport(self,index_path,homes))
+        complete=previous[1].step()
+        if complete:previous[1].close()
+        return complete
 
     def _import_observation_parts(self,batch):
         # At most 128 records / 1 MiB of source text, or one oversized record.
@@ -2430,5 +2526,7 @@ class QuotaLedger:
         self._input_revision=None;self._input_changes=None
 
     def close(self):
+        job=getattr(self,'_observation_import',None)
+        if job is not None:job[1].close()
         self.db.close()
         self.release_report_cache()

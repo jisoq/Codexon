@@ -4,6 +4,11 @@ from types import SimpleNamespace
 import weakref
 
 from cachemonitor.speed_health import classify, SpeedHealth, MAX_BASELINE
+from cachemonitor import speed_health as speed_module
+from cachemonitor.analysis_engine import AnalysisEngine
+import cachemonitor.analysis_engine as analysis_module
+from cachemonitor.core import Session
+from cachemonitor.analytics import call_identity
 
 
 def session(speeds, sid='s', home='h', start=1000, **changes):
@@ -14,7 +19,9 @@ def session(speeds, sid='s', home='h', start=1000, **changes):
                          transport='WebSocket',transport_source='response_id',
                          response_status='completed',timing_valid=True,
                          completion_latency_ms=2000/speed*1000) | changes)
-    return dict(home=home,id=sid,history=rows)
+    source = Session(sid, home, title=sid).view(start)
+    source.update(history=rows, usage_revision=1, collection_complete=True)
+    return source
 
 
 def health(s):return classify([s])[(s['home'],s['id'])]
@@ -74,55 +81,80 @@ def test_correction_and_duplicate_response_do_not_keep_false_evidence():
     assert not health(duplicated)['active']
 
 
-def revision_engine(sessions, previous=None):
-    previous = previous or {}
-    return SimpleNamespace(sessions={(source['home'], source['id']):
-        dict(prepared=source, revision=previous.get((source['home'], source['id']), 0) + 1)
-        for source in sessions})
+def ingest(engine, sources, *changed):
+    for source in changed:
+        source['usage_revision'] += 1
+    engine.ingest(sources)
+
+
+def expected(engine):
+    return classify(s['prepared'] for s in engine.sessions.values())
+
+
+def appended(source, speeds, **changes):
+    start = len(source['history'])
+    for offset, speed in enumerate(speeds):
+        ordinal = start + offset
+        source['history'].append(dict(source['history'][0],
+            key=f"{source['id']}-{ordinal}", ts=1000 + ordinal * 100,
+            completion_latency_ms=2000 / speed * 1000) | changes)
 
 
 def test_incremental_appends_corrections_and_removals_match_complete_replay():
-    tracker = SpeedHealth()
-    current = session([100] * 10)
-    engine = revision_engine([current])
-    assert tracker.collect(engine) == classify([current])
-    for speeds in ([100] * 10 + [35], [100] * 10 + [35] * 3,
-                   [100] * 10 + [35] * 3 + [100, 100]):
-        current = session(speeds)
-        engine = revision_engine([current], {key: state['revision'] for key, state in engine.sessions.items()})
-        assert tracker.collect(engine) == classify([current])
-        assert tracker.metrics['replayed_scopes'] == 0
-    current['history'][2]['completion_latency_ms'] = 20000
-    engine = revision_engine([current])
-    assert tracker.collect(engine) == classify([current])
-    current['history'].pop(1)
-    engine = revision_engine([current], {key: state['revision'] for key, state in engine.sessions.items()})
-    assert tracker.collect(engine) == classify([current])
-    empty = revision_engine([])
-    assert tracker.collect(empty) == {}
+    source = session([100] * 10 + [35] * 2)
+    engine, tracker = AnalysisEngine(), SpeedHealth()
+    ingest(engine, [source])
+    assert tracker.collect(engine) == expected(engine)
+    # This invalid row must reset the two-call streak, even though it is never
+    # retained in a healthy peer pool.
+    appended(source, [35], timing_valid=False)
+    ingest(engine, [source], source)
+    assert tracker.collect(engine) == expected(engine)
+    assert not tracker.results[('h', 's')]['active']
+    assert tracker.metrics['proof_rows'] == 1
+    appended(source, [35])
+    ingest(engine, [source], source)
+    assert tracker.collect(engine) == expected(engine)
+    assert not tracker.results[('h', 's')]['active']
+    assert tracker.metrics['replayed_scopes'] == 0
+    appended(source, [35, 35])
+    ingest(engine, [source], source)
+    assert tracker.collect(engine) == expected(engine)
+    assert tracker.results[('h', 's')]['active']
+    for recovered in range(2):
+        appended(source, [100])
+        ingest(engine, [source], source)
+        assert tracker.collect(engine) == expected(engine)
+        assert tracker.results[('h', 's')]['active'] is (recovered == 0)
+    ingest(engine, [])
+    assert tracker.collect(engine) == {}
     assert tracker.metrics['retained_rows'] == tracker.metrics['baseline_rows'] == tracker.metrics['live_states'] == 0
 
 
 def test_changed_peer_scope_does_not_replay_unrelated_conditions():
     reference = session([100] * 10, 'reference')
     peer = session([35] * 3, 'peer', start=3000)
-    unrelated = session([90] * 500, 'other', model='other')
-    sources = [reference, peer, unrelated]
-    tracker = SpeedHealth()
-    engine = revision_engine(sources)
-    assert tracker.collect(engine) == classify(sources)
-    old_revision = engine.sessions[('h', 'other')]['revision']
+    other = session([90] * 500, 'other', model='other')
+    sources = [reference, peer, other]
+    engine, tracker = AnalysisEngine(), SpeedHealth()
+    ingest(engine, sources)
+    assert tracker.collect(engine) == expected(engine)
+    old_revision = engine.sessions[('h', 'other')]['content_revision']
     reference['history'][5]['completion_latency_ms'] = 100000
-    engine.sessions[('h', 'reference')] = dict(prepared=reference, revision=2)
-    assert tracker.collect(engine) == classify(sources)
-    assert engine.sessions[('h', 'other')]['revision'] == old_revision
-    assert tracker.metrics['scanned_rows'] == 10
-    assert tracker.metrics['processed_rows'] == 13
+    ingest(engine, sources, reference)
+    assert tracker.collect(engine) == expected(engine)
+    assert engine.sessions[('h', 'other')]['content_revision'] == old_revision
+    assert tracker.metrics['proof_rows'] == 10
+    assert tracker.metrics['replay_rows'] == tracker.metrics['processed_rows'] == 13
+    assert tracker.metrics['scanned_rows'] == 23
     assert tracker.metrics['replayed_scopes'] == 1
-    assert tracker.metrics['baseline_rows'] <= MAX_BASELINE * 4 * 2
-    assert tracker.metrics['live_states'] <= len(sources)
-    assert tracker.collect(engine) == classify(sources)
-    assert tracker.metrics['processed_rows'] == tracker.metrics['scanned_rows'] == 0
+    assert tracker.collect(engine) == expected(engine)
+    assert tracker.metrics['scanned_rows'] == tracker.metrics['processed_rows'] == 0
+    reference['history'].pop(2)
+    ingest(engine, sources, reference)
+    assert tracker.collect(engine) == expected(engine)
+    ingest(engine, [peer, other])
+    assert tracker.collect(engine) == expected(engine)
 
 
 def test_incremental_replay_preserves_condition_resets_late_rows_and_dedup_owners():
@@ -132,111 +164,193 @@ def test_incremental_replay_preserves_condition_resets_late_rows_and_dedup_owner
     duplicate['history'] = [deepcopy(source['history'][0])]
     peer = session([35] * 3, 'peer', start=4000)
     sources = [source, duplicate, peer]
-    tracker = SpeedHealth()
-    engine = revision_engine(sources)
-    assert tracker.collect(engine) == classify(sources)
-    # The same response moves to the earlier owner and changes its condition.
+    engine, tracker = AnalysisEngine(), SpeedHealth()
+    ingest(engine, sources)
+    assert tracker.collect(engine) == expected(engine)
+    # Confirmation moves the canonical response away from a pending owner.
     duplicate['history'][0].update(ts=999, model='other')
-    engine.sessions[('h', 'b')] = dict(prepared=duplicate, revision=2)
-    assert tracker.collect(engine) == classify(sources)
-    # A newly observed historical response must precede already consumed peers.
+    source['_collection_pending'] = True
+    ingest(engine, sources, source, duplicate)
+    assert tracker.collect(engine) == expected(engine)
     late = session([100], 'late', start=950)
     sources.append(late)
-    engine.sessions[('h', 'late')] = dict(prepared=late, revision=1)
-    assert tracker.collect(engine) == classify(sources)
+    ingest(engine, sources)
+    assert tracker.collect(engine) == expected(engine)
     assert tracker.metrics['replayed_scopes'] == 1
-    # Removing a winning duplicate restores the surviving response owner.
+    # Removing the winning duplicate restores the remaining response owner.
     sources.remove(duplicate)
-    engine.sessions.pop(('h', 'b'))
-    assert tracker.collect(engine) == classify(sources)
+    ingest(engine, sources)
+    assert tracker.collect(engine) == expected(engine)
     source['history'][-1]['ts'] += 8 * 86400
-    engine.sessions[('h', 'a')] = dict(prepared=source, revision=2)
-    assert tracker.collect(engine) == classify(sources)
+    ingest(engine, sources, source)
+    assert tracker.collect(engine) == expected(engine)
 
 
 def test_capacity_fallback_releases_incremental_state_and_keeps_exact_results(monkeypatch):
-    monkeypatch.setattr('cachemonitor.speed_health.MAX_TRACKED_CALLS', 12)
-    tracker = SpeedHealth()
     source = session([100] * 10)
-    assert tracker.collect(revision_engine([source])) == classify([source])
-    source = session([100] * 10 + [35] * 3)
-    assert tracker.collect(revision_engine([source], {('h', 's'): 1})) == classify([source])
-    assert tracker.metrics['capacity_fallback'] and tracker.metrics['retained_rows'] == 0
-    assert not tracker.calls and not tracker.replays
-    source = session([100] * 10)
-    assert tracker.collect(revision_engine([source], {('h', 's'): 2})) == classify([source])
-    assert tracker.metrics['retained_rows'] == 10
-
+    engine, tracker = AnalysisEngine(), SpeedHealth()
+    ingest(engine, [source])
+    assert tracker.collect(engine) == expected(engine)
+    with monkeypatch.context() as limited:
+        limited.setattr(speed_module, 'MAX_METADATA_BYTES', 1)
+        appended(source, [35, 35, 35])
+        ingest(engine, [source], source)
+        assert tracker.collect(engine) == expected(engine)
+        assert tracker.metrics['capacity_fallback']
+        assert tracker.metrics['retained_rows'] == tracker.metrics['live_states'] == 0
+    appended(source, [100, 100])
+    ingest(engine, [source], source)
+    assert tracker.collect(engine) == expected(engine)
+    assert not tracker.metrics['capacity_fallback']
+    assert tracker.metrics['retained_rows'] > 0
 
 def test_invalid_duplicate_owner_changes_and_metadata_revisions_preserve_peers():
-    reference = session([100] * 8, 'reference')
-    owner = session([], 'owner')
-    owner['history'] = [dict(row, ts=900 + i, timing_valid=False)
-                        for i, row in enumerate(reference['history'][:3])]
+    reference = session([100] * 8, 'z-reference')
+    duplicate = session([], 'a-owner')
+    duplicate['history'] = [dict(row, ts=900 + i, timing_valid=False)
+                            for i, row in enumerate(reference['history'][:3])]
+    # A repeated key within the winner is also removed by AnalysisEngine.
+    duplicate['history'].append(deepcopy(duplicate['history'][0]))
     peer = session([35] * 3, 'peer', start=3000)
-    sources = [reference, owner, peer]
-    engine = revision_engine(sources)
-    tracker = SpeedHealth()
-    assert tracker.collect(engine) == classify(sources)
+    sources = [reference, duplicate, peer]
+    engine, tracker = AnalysisEngine(), SpeedHealth()
+    ingest(engine, sources)
+    keys = [call_identity(*owner, r['key']) for owner, s in engine.sessions.items()
+            for r in s['prepared']['history']]
+    assert len(keys) == len(set(keys))
+    assert tracker.collect(engine) == expected(engine)
     assert not tracker.results[('h', 'peer')]['active']
-    for row in owner['history']:
-        row['timing_valid'] = True
-    engine.sessions[('h', 'owner')] = dict(prepared=owner, revision=2)
-    assert tracker.collect(engine) == classify(sources)
+    duplicate['_collection_pending'] = True
+    ingest(engine, sources, duplicate)
+    assert tracker.collect(engine) == expected(engine)
     assert tracker.results[('h', 'peer')]['active']
     assert tracker.metrics['replayed_scopes'] == 1
-    # A pricing/settings revision leaves observed speed inputs unchanged.
-    reference['history'][0].update(cost=999, configured_model='new-setting')
-    engine.sessions[('h', 'reference')] = dict(prepared=reference, revision=2)
-    assert tracker.collect(engine) == classify(sources)
-    assert tracker.metrics['processed_rows'] == 0
-    # Entering the internal-review population removes that session from this
-    # engine population, restoring the remaining canonical response owners.
-    engine.sessions.pop(('h', 'owner'))
-    sources.remove(owner)
-    assert tracker.collect(engine) == classify(sources)
+    ingest(engine, [reference, peer])
+    assert tracker.collect(engine) == expected(engine)
 
 
-def test_metadata_only_replacement_releases_obsolete_observed_rows():
+def test_metadata_only_replacement_releases_obsolete_observed_rows(monkeypatch):
     class ObservedRow(dict):
         pass
-
-    source = session([100] * 10)
-    source['history'] = [ObservedRow(row) for row in source['history']]
-    obsolete = weakref.ref(source['history'][0])
-    tracker = SpeedHealth()
-    tracker.collect(revision_engine([source]))
-    source['history'] = [dict(row, cost=123) for row in source['history']]
-    assert tracker.collect(revision_engine([source], {('h', 's'): 1})) == classify([source])
+    original_compact = analysis_module.compact_record
+    monkeypatch.setattr(analysis_module, 'compact_record',
+                        lambda row: ObservedRow(original_compact(row)))
+    source = session([100] * 10 + [35] * 3)
+    engine, tracker = AnalysisEngine(), SpeedHealth()
+    ingest(engine, [source])
+    assert tracker.collect(engine) == expected(engine)
+    obsolete = weakref.ref(engine.sessions[('h', 's')]['prepared']['history'][0])
+    # Presentation metadata changes prepared row dictionaries but no speed
+    # inputs. Projected samples must not retain those dictionaries.
+    source['title'] = 'Changed title'
+    ingest(engine, [source])
+    assert tracker.collect(engine) == expected(engine)
     assert tracker.metrics['processed_rows'] == 0
     assert obsolete() is None
 
 
 def test_peer_scope_capacity_falls_back_without_losing_observed_results(monkeypatch):
-    monkeypatch.setattr('cachemonitor.speed_health.MAX_TRACKED_SCOPES', 2)
+    monkeypatch.setattr(speed_module, 'MAX_TRACKED_SCOPES', 2)
     first = session([100] * 10 + [35] * 3, 'first', model='first-model')
     second = session([100] * 10, 'second', model='second-model')
-    tracker = SpeedHealth()
-    assert tracker.collect(revision_engine([first, second])) == classify([first, second])
-    # Replacing a complete condition stays inside the scope budget.
+    engine, tracker = AnalysisEngine(), SpeedHealth()
+    ingest(engine, [first, second])
+    assert tracker.collect(engine) == expected(engine)
     replacement = session([100] * 10, 'second', model='replacement-model')
-    assert tracker.collect(revision_engine([first, replacement], {('h', 'first'): 1, ('h', 'second'): 1})) == classify([first, replacement])
+    ingest(engine, [first, replacement], replacement)
+    assert tracker.collect(engine) == expected(engine)
     assert not tracker.metrics['capacity_fallback']
     third = session([100] * 10, 'third', model='third-model')
-    sources = [first, replacement, third]
-    engine = revision_engine(sources, {('h', 'first'): 1, ('h', 'second'): 2})
-    assert tracker.collect(engine) == classify(sources)
-    assert tracker.results[('h', 'first')]['active']
-    assert tracker.metrics['capacity_fallback'] and tracker.metrics['retained_rows'] == 0
-    assert not tracker.calls and not tracker.replays and not tracker.scope_counts
-    engine.sessions=dict(reversed(list(engine.sessions.items())))
-    assert tracker.collect(engine)==classify(sources)
-    assert tracker.metrics['processed_rows']==tracker.metrics['scanned_rows']==0
-    engine.sessions.pop(('h', 'third'))
-    assert tracker.collect(engine) == classify([first, replacement])
+    ingest(engine, [first, replacement, third])
+    assert tracker.collect(engine) == expected(engine)
+    assert tracker.metrics['capacity_fallback']
+    assert tracker.metrics['retained_rows'] == tracker.metrics['live_states'] == 0
+    ingest(engine, [first, replacement])
+    assert tracker.collect(engine) == expected(engine)
     assert not tracker.metrics['capacity_fallback']
+    ingest(engine, [replacement, first])
+    assert tracker.collect(engine) == expected(engine)
+    assert tracker.metrics['processed_rows'] == tracker.metrics['scanned_rows'] == 0
 
 
+def test_condition_return_resets_active_frozen_baseline():
+    source = session([100] * 10 + [35] * 3)
+    engine, tracker = AnalysisEngine(), SpeedHealth()
+    ingest(engine, [source])
+    assert tracker.collect(engine) == expected(engine)
+    first_incident = tracker.results[('h', 's')]['incident_id']
+    appended(source, [100], model='other')
+    appended(source, [35])
+    ingest(engine, [source], source)
+    assert tracker.collect(engine) == expected(engine)
+    assert not tracker.results[('h', 's')]['active']
+    appended(source, [35, 35])
+    ingest(engine, [source], source)
+    assert tracker.collect(engine) == expected(engine)
+    assert tracker.results[('h', 's')]['incident_id'] != first_incident
+    assert tracker.metrics['replayed_scopes'] == 0
+
+
+def test_old_active_baseline_is_not_evicted_at_seven_days():
+    source = session([100] * 10 + [35] * 11)
+    for i, row in enumerate(source['history'][10:]):
+        row['ts'] = 3000 + i * 86400
+    engine, tracker = AnalysisEngine(), SpeedHealth()
+    ingest(engine, [source])
+    assert tracker.collect(engine) == expected(engine)
+    assert tracker.results[('h', 's')]['active']
+    assert tracker.results[('h', 's')]['baseline_keys'] == [f's-{i}' for i in range(10)]
+    for i in range(2):
+        source['history'].append(dict(source['history'][0],
+            key=f'recovery-{i}', ts=3000 + (11 + i) * 86400))
+        ingest(engine, [source], source)
+        assert tracker.collect(engine) == expected(engine)
+        assert tracker.results[('h', 's')]['active'] is (i == 0)
+
+
+def test_equal_timestamp_late_owner_replays_canonical_peer_order():
+    reference = session([100] * 10, 'reference')
+    peer = session([35] * 3, 'z', start=3000)
+    engine, tracker = AnalysisEngine(), SpeedHealth()
+    ingest(engine, [reference, peer])
+    assert tracker.collect(engine) == expected(engine)
+    # Same timestamp, but canonical owner order places this before z's last
+    # consumed row. It must not be appended after the saved scope frontier.
+    early_owner = session([100], 'a', start=3200)
+    ingest(engine, [reference, peer, early_owner])
+    assert tracker.collect(engine) == expected(engine)
+    assert tracker.metrics['replayed_scopes'] == 1
+
+
+def test_unproven_engine_keeps_standalone_duplicate_semantics():
+    first = session([100] * 10 + [35] * 3)
+    duplicate = session([], 'duplicate')
+    duplicate['history'] = [dict(first['history'][0], ts=0, timing_valid=False)]
+    engine = SimpleNamespace(sessions={('h', s['id']): dict(prepared=s, revision=1)
+                                     for s in (first, duplicate)})
+    tracker = SpeedHealth()
+    assert tracker.collect(engine) == classify([first, duplicate])
+    assert tracker.metrics['fallback_reason'] == 'unproven input owner'
+    assert tracker.metrics['retained_rows'] == tracker.metrics['live_states'] == 0
+    # A fake revision is not trusted to skip the standalone classifier.
+    duplicate['history'][0]['timing_valid'] = True
+    assert tracker.collect(engine) == classify([first, duplicate])
+
+
+def test_skipped_certificate_predecessor_cannot_hide_a_prior_correction():
+    source = session([100] * 10 + [35] * 3)
+    engine, tracker = AnalysisEngine(), SpeedHealth()
+    ingest(engine, [source])
+    assert tracker.collect(engine) == expected(engine)
+    # The tracker misses a revision containing an old-record correction. The
+    # next engine update is an append relative to that intervening revision.
+    source['history'][2]['completion_latency_ms'] = 100000
+    ingest(engine, [source], source)
+    appended(source, [35])
+    ingest(engine, [source], source)
+    assert engine.sessions[('h', 's')]['speed_append_from'] is not None
+    assert tracker.collect(engine) == expected(engine)
+    assert tracker.metrics['replayed_scopes'] == 1
 def test_detail_includes_current_health_without_another_entry():
     from PySide6.QtWidgets import QApplication
     from cachemonitor.overlay_view import OverlayContent

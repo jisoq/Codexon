@@ -5,6 +5,11 @@ order keeps peer baselines causal and makes corrected records deterministic.
 """
 from collections import defaultdict, deque, namedtuple
 from statistics import median
+from dataclasses import dataclass
+from heapq import merge
+from math import isfinite
+from sys import getsizeof
+from weakref import ref
 
 from .analytics import INPUT_BANDS, call_identity, output_speed, output_speed_summary
 from .core import token_number
@@ -15,12 +20,12 @@ MAX_BASELINE = 30
 MAX_AGE = 7 * 86400
 SLOW_CALLS = 3
 RECOVERY_CALLS = 2
-# Provisional 64 MiB metadata allowance. Tracing current metadata measured
-# 24.80 MiB at 43,915 calls / 463 sessions; an earlier all-eligible fixture
-# measured 29.35 MiB at 45,370 calls / 698 sessions. The 80,000-call cap projects
-# about 46-52 MiB for those topologies. Unusual scope counts can cost more.
-MAX_TRACKED_CALLS = 80000
+# Bound retained classifier metadata independently of total prepared history.
 MAX_TRACKED_SCOPES = 4096
+MAX_RETAINED_SAMPLES = 80000
+MAX_METADATA_BYTES = 64 * 1024 * 1024
+# Unusual identities use the exact compatibility path, outside this allowance.
+MAX_TEXT_CHARS = 32768
 
 
 def scope(row):
@@ -123,20 +128,6 @@ def classify(sessions):
     return result
 
 
-class _Event:
-    __slots__ = ('session', 'uid', 'order', 'fingerprint', 'condition', 'row')
-
-    def __init__(self, session, uid, order, fingerprint, condition, row):
-        self.session, self.uid, self.order = session, uid, order
-        self.fingerprint, self.condition, self.row = fingerprint, condition, row
-
-    def get(self, key, default=None):
-        return self.row.get(key, default)
-
-    def __getitem__(self, key):
-        return self.row[key]
-
-
 _Step = namedtuple('_Step', 'event reset')
 
 
@@ -204,195 +195,281 @@ class _ScopeReplay:
             self.last_order = event.order
 
 
-class SpeedHealth:
-    """Advance appended evidence and replay only corrected peer scopes.
+class _Unsupported(Exception):
+    pass
 
-    Current input owns the index lifetime: one fingerprint/event per input row,
-    no copied histories, replay checkpoints, queued revisions or durable state.
-    Each scope keeps at most 120 baseline rows and each session keeps one live
-    streak. Removed input releases its index entries and empty scopes. Above
-    80,000 input rows or 4,096 peer scopes, release this index and use the
-    complete classifier. Limits bound counts; the byte allowance is provisional.
+
+class _Capacity(Exception):
+    pass
+
+
+@dataclass(slots=True)
+class _Proof:
+    revision: object
+    length: int
+    # Condition -> (row count, largest key size). No per-call membership index.
+    buckets: dict
+    condition: object
+    timestamp: object
+
+
+class _Sample(dict):
+    """Only the scalar fields consumed by the established scope reducer."""
+    __slots__ = ('session', 'order', 'condition')
+
+    def __init__(self, owner, ordinal, row, condition):
+        super().__init__(key=row['key'], ts=row['ts'], output=row['output'],
+                         completion_latency_ms=row['completion_latency_ms'],
+                         response_status='completed')
+        self.session = owner
+        self.order = (row['ts'], *owner, ordinal)
+        self.condition = condition
+
+
+def _text(value):
+    if not isinstance(value, str) or len(value) > MAX_TEXT_CHARS:
+        raise _Unsupported('non-string or oversized prepared identity')
+    return getsizeof(value)
+
+
+def _condition_bytes(condition):
+    return getsizeof(condition) + sum(_text(v) for v in condition[:4]) + 96
+
+
+def _proof_bytes(owner, proof):
+    return (1024 + sum(_text(v) for v in owner)
+            + sum(256 + _condition_bytes(c) for c in proof.buckets))
+
+
+class SpeedHealth:
+    """One proof per canonical owner and bounded state per peer condition.
+
+    The engine certifies reuse of an owner's prepared prefix. Ordered appends
+    advance their scopes. Corrections replay current owners
+    that intersect the affected scopes. Unchanged owner histories are not read
+    during ordinary append. No history-sized calls, chosen or fingerprint map
+    survives collect().
     """
     def __init__(self):
         self.signature = None
-        self.results = {}
-        self.sessions = {}
-        self.calls = {}
-        self.chosen = {}
-        self.scope_counts = {}
-        self.by_session = {}
-        self.members = {}
-        self.session_members = {}
-        self.latest = {}
+        self.engine_ref = None
+        self.proofs = {}
         self.replays = {}
+        self.results = {}
         self.metrics = {}
+        self.retention = {}
 
-    @staticmethod
-    def _same(left, right):
-        return (left.event.order == right.event.order and left.reset == right.reset
-                and left.event.fingerprint == right.event.fingerprint)
+    def _metrics(self):
+        self.metrics = dict(scanned_rows=0, proof_rows=0, replay_rows=0,
+            append_scan_rows=0, processed_rows=0, replayed_scopes=0,
+            appended_rows=0, invalid_rows=0, retained_rows=0, baseline_rows=0,
+            live_states=0, proof_owners=len(self.proofs), proof_memberships=0,
+            estimated_metadata_bytes=0, capacity_fallback=False,
+            fallback_reason=None)
+        self.metrics.update(self.retention)
 
-    def _fallback(self, engine, signature, row_count):
-        self.__init__()
-        self.results = classify(state['prepared'] for state in engine.sessions.values())
+    def _fallback(self, engine, signature, reason):
+        # Exact compatibility path. Its transient full-classifier allocation
+        # is the existing contract; it retains no incremental source index.
+        self.proofs.clear()
+        self.replays.clear()
+        self.retention.clear()
+        self.results = classify(s['prepared'] for s in engine.sessions.values())
+        count = sum(len(s['prepared'].get('history', ()))
+                    for s in engine.sessions.values())
+        self.metrics.update(scanned_rows=self.metrics['scanned_rows'] + count,
+            processed_rows=count, retained_rows=0, baseline_rows=0,
+            live_states=0, proof_owners=0, proof_memberships=0,
+            estimated_metadata_bytes=0, capacity_fallback=True,
+            fallback_reason=reason)
         self.signature = signature
-        self.metrics = dict(scanned_rows=row_count, processed_rows=row_count,
-            replayed_scopes=0, appended_rows=0, retained_rows=0, baseline_rows=0,
-            live_states=0, capacity_fallback=True)
         return self.results
 
+    def _proof(self, owner, state, old):
+        history = state['prepared'].get('history', ())
+        prefix = (old is not None
+            and state.get('speed_append_from') == (old.revision, old.length)
+            and len(history) >= old.length)
+        start = old.length if prefix else 0
+        buckets, tail_min = (dict(old.buckets) if prefix else {}), {}
+        previous_ts = old.timestamp if prefix else None
+        condition = old.condition if prefix else None
+        for ordinal in range(start, len(history)):
+            row = history[ordinal]
+            self.metrics['proof_rows'] += 1
+            self.metrics['scanned_rows'] += 1
+            key, timestamp = row.get('key'), row['ts']
+            key_bytes = _text(key)
+            if (not key or type(timestamp) not in (int, float)
+                    or not isfinite(timestamp)
+                    or previous_ts is not None and timestamp < previous_ts):
+                raise _Unsupported('noncanonical prepared order or identity')
+            previous_ts = timestamp
+            condition = scope(row)
+            if condition is not None:
+                _condition_bytes(condition)
+                count, largest = buckets.get(condition, (0, 0))
+                buckets[condition] = (count + 1, max(largest, key_bytes))
+                if len(buckets) > MAX_TRACKED_SCOPES:
+                    raise _Capacity('scope count')
+                tail_min.setdefault((owner[0], condition),
+                                    (timestamp, *owner, ordinal))
+        revision = state.get('content_revision', state['revision'])
+        proof = _Proof(revision, len(history), buckets, condition, previous_ts)
+        return proof, prefix, tail_min
+
+    def _admit(self, proofs):
+        """Conservative bytes and sample slots, before any reducer mutation.
+
+        Shared strings and aliased samples are deliberately counted repeatedly.
+        Frozen baseline IDs, recent/recovery lists, result dictionaries, owner
+        proofs and temporary per-scope owner state are included. The estimate
+        is a provisional allowance, not measured private process memory.
+        """
+        size = 1024 + sum(_proof_bytes(o, p) for o, p in proofs.items())
+        pools = {}
+        samples = pairs = 0
+        for owner, proof in proofs.items():
+            owner_bytes = sum(_text(v) for v in owner) + 56
+            for condition, (count, key_bytes) in proof.buckets.items():
+                pairs += 1
+                # Five rows cover recent three plus two recovery references.
+                current = min(5, count)
+                sample_bytes = 512 + owner_bytes + key_bytes
+                samples += current
+                size += (2048 + 2 * MAX_BASELINE * key_bytes
+                         + current * sample_bytes)
+                bucket = (owner[0], condition)
+                n, largest = pools.get(bucket, (0, 0))
+                pools[bucket] = (n + count, max(largest, sample_bytes))
+                if (pairs > MAX_RETAINED_SAMPLES
+                        or len(pools) > MAX_TRACKED_SCOPES):
+                    raise _Capacity('owner/scope membership or scope count')
+        for count, sample_bytes in pools.values():
+            retained = min(MAX_BASELINE * 4, count)
+            samples += retained
+            size += 2048 + retained * sample_bytes
+        if samples > MAX_RETAINED_SAMPLES or size > MAX_METADATA_BYTES:
+            raise _Capacity('retained sample or metadata allowance')
+        self.metrics.update(proof_owners=len(proofs), proof_memberships=pairs,
+                            estimated_metadata_bytes=size)
+        return pools
+
+    def _steps(self, owner, state, start, previous, selected, metric):
+        history = state['prepared'].get('history', ())
+        prior_condition, prior_ts = previous
+        for ordinal in range(start, len(history)):
+            row = history[ordinal]
+            self.metrics[metric] += 1
+            self.metrics['scanned_rows'] += 1
+            condition, timestamp = scope(row), row['ts']
+            reset = (condition != prior_condition or prior_ts is None
+                     or timestamp - prior_ts > MAX_AGE)
+            prior_condition, prior_ts = condition, timestamp
+            if condition is None:
+                self.metrics['invalid_rows'] += 1
+            elif (owner[0], condition) in selected:
+                yield _Step(_Sample(owner, ordinal, row, condition), reset)
+
+    def _advance(self, streams, appended):
+        for step in merge(*streams, key=lambda item: item.event.order):
+            event = step.event
+            self.replays[(event.session[0], event.condition)].advance((step,))
+            self.metrics['processed_rows'] += 1
+            self.metrics['appended_rows'] += int(appended)
+
+    def _finish(self, proofs):
+        self.results = {}
+        for bucket, replay in self.replays.items():
+            for owner in tuple(replay.states):
+                proof = proofs.get(owner)
+                if proof is None or (owner[0], proof.condition) != bucket:
+                    replay.states.pop(owner, None)
+                    replay.results.pop(owner, None)
+        for owner, proof in proofs.items():
+            replay = self.replays.get((owner[0], proof.condition))
+            self.results[owner] = (replay.results.get(owner, dict(active=False))
+                if replay is not None else dict(active=False))
+        self.metrics.update(
+            baseline_rows=sum(len(r.pool) for r in self.replays.values()),
+            live_states=sum(len(r.states) for r in self.replays.values()),
+            retained_rows=sum(len(r.pool) + sum(len(s.get('recent', ()))
+                + len(s.get('recovery', ())) for s in r.states.values())
+                for r in self.replays.values()))
+        self.retention = {key: self.metrics[key] for key in (
+            'baseline_rows', 'live_states', 'retained_rows', 'proof_owners',
+            'proof_memberships', 'estimated_metadata_bytes')}
+
     def collect(self, engine):
-        # Display/catalog order does not change the classifier's time-ordered
-        # evidence. Partial source restoration can reorder unchanged owners.
-        signature = frozenset((key, state.get('content_revision',state['revision'])) for key, state in engine.sessions.items())
-        self.metrics = dict(scanned_rows=0, processed_rows=0, replayed_scopes=0, appended_rows=0,
-            **{key: self.metrics[key] for key in ('retained_rows', 'baseline_rows', 'live_states', 'capacity_fallback')
-               if key in self.metrics})
+        # The production AnalysisEngine owns deduplication, stable timestamp
+        # order, and content_revision. A fixture with a similarly shaped dict
+        # does not confer that ownership contract.
+        from .analysis_engine import AnalysisEngine
+        signature = frozenset((owner, s.get('content_revision', s['revision']))
+                              for owner, s in engine.sessions.items())
+        if not isinstance(engine, AnalysisEngine):
+            self._metrics()
+            self.engine_ref = None
+            return self._fallback(engine, signature, 'unproven input owner')
+        if self.engine_ref is None or self.engine_ref() is not engine:
+            self.__init__()
+            self.engine_ref = ref(engine)
+        self._metrics()
         if signature == self.signature:
             return self.results
-        row_count = sum(len(state['prepared'].get('history', ())) for state in engine.sessions.values())
-        if row_count > MAX_TRACKED_CALLS:
-            return self._fallback(engine, signature, row_count)
-        touched = set()
-        conditions = {bucket[1]: bucket[1] for bucket in self.members}
-        for key in self.sessions.keys() - engine.sessions.keys():
-            _, entries = self.sessions.pop(key)
-            for event in entries:
-                self.calls[event.uid].remove(event)
-                touched.add(event.uid)
-        for key, state in engine.sessions.items():
-            revision=state.get('content_revision',state['revision'])
-            previous = self.sessions.get(key)
-            if previous and previous[0] == revision:
-                continue
-            old = previous[1] if previous else ()
-            entries = []
-            for ordinal, row in enumerate(state['prepared'].get('history', ())):
-                self.metrics['scanned_rows'] += 1
-                condition = scope(row)
-                if condition is not None:
-                    condition = conditions.setdefault(condition, condition)
-                # These are the classifier's observable inputs, including the
-                # weighted speed's raw numerator and denominator. Invalid calls
-                # still keep identity/time so they reset streaks and deduplicate.
-                fingerprint = (row.get('key'), row['ts'], condition,
-                    output_speed(row), row.get('output'), row.get('completion_latency_ms'))
-                if ordinal < len(old) and old[ordinal].fingerprint == fingerprint:
-                    event = old[ordinal]
-                    # Pools borrow this event too. Refresh the authoritative
-                    # reference without keeping a prior pricing/metadata row.
-                    event.row = row
+        proofs = {}
+        tails = {}
+        dirty = set()
+        try:
+            proof_size = 0
+            for owner, state in engine.sessions.items():
+                old = self.proofs.get(owner)
+                revision = state.get('content_revision', state['revision'])
+                if old is not None and old.revision == revision:
+                    proof = old
                 else:
-                    event = _Event(key, call_identity(*key, row.get('key')),
-                        (row['ts'], *key, ordinal), fingerprint, condition, row)
-                entries.append(event)
-            for event in old:
-                self.calls[event.uid].remove(event)
-                touched.add(event.uid)
-            for event in entries:
-                self.calls.setdefault(event.uid, []).append(event)
-                touched.add(event.uid)
-            self.sessions[key] = (revision, entries)
-        affected = set()
-        changes = []
-        for uid in touched:
-            candidates = self.calls[uid]
-            old = self.chosen.get(uid)
-            new = min(candidates, key=lambda event: event.order) if candidates else None
-            if old is new:
-                continue
-            changes.append((uid, old, new))
-        # Remove departing owners first so replacing conditions at capacity
-        # does not temporarily count both the old and new scope populations.
-        for uid, old, new in changes:
-            if old:
-                self.by_session[old.session].pop(uid)
-                affected.add(old.session)
-                if old.condition is not None:
-                    bucket = (old.session[0], old.condition)
-                    self.scope_counts[bucket] -= 1
-                    if not self.scope_counts[bucket]:
-                        self.scope_counts.pop(bucket)
-        for uid, old, new in changes:
-            if new:
-                self.chosen[uid] = new
-                self.by_session.setdefault(new.session, {})[uid] = new
-                affected.add(new.session)
-                if new.condition is not None:
-                    bucket = (new.session[0], new.condition)
-                    self.scope_counts[bucket] = self.scope_counts.get(bucket, 0) + 1
-                    if len(self.scope_counts) > MAX_TRACKED_SCOPES:
-                        # No new peer-pool objects or replay work were created.
-                        return self._fallback(engine, signature, row_count)
-            else:
-                self.chosen.pop(uid, None)
-                self.calls.pop(uid)
-        pending = {}
-        for key in affected:
-            events = sorted(self.by_session.get(key, {}).values(), key=lambda event: event.order)
-            grouped = defaultdict(list)
-            prior = None
-            for event in events:
-                if event.condition is not None:
-                    reset = prior is None or prior.condition != event.condition or event.order[0] - prior.order[0] > MAX_AGE
-                    grouped[(key[0], event.condition)].append(_Step(event, reset))
-                prior = event
-            old_groups = self.session_members.get(key, {})
-            for bucket in old_groups.keys() | grouped.keys():
-                old, new = old_groups.get(bucket, ()), grouped.get(bucket, ())
-                prefix = len(old) <= len(new) and all(self._same(a, b) for a, b in zip(old, new))
-                if prefix and len(old) == len(new):
-                    grouped[bucket] = old
-                    continue
-                _, added = pending.setdefault(bucket, [False, []])
-                if prefix:
-                    added.extend(new[len(old):])
-                else:
-                    pending[bucket][0] = True
-                members = self.members.setdefault(bucket, {})
-                if new:
-                    members[key] = new
-                else:
-                    members.pop(key, None)
-            self.session_members[key] = grouped
-            previous_bucket = self.latest.get(key)
-            bucket = (key[0], events[-1].condition) if events and events[-1].condition is not None else None
-            self.latest[key] = bucket
-            if previous_bucket != bucket and previous_bucket in self.replays:
-                self.replays[previous_bucket].states.pop(key, None)
-                self.replays[previous_bucket].results.pop(key, None)
-        for bucket, (rebuild, added) in pending.items():
-            members = self.members[bucket]
-            if not members:
-                self.members.pop(bucket)
-                self.replays.pop(bucket, None)
-                continue
-            replay = self.replays.get(bucket)
-            steps = sorted(added, key=lambda step: step.event.order)
-            if (rebuild or replay is None or steps and replay.last_order is not None
-                    and steps[0].event.order <= replay.last_order):
-                steps = sorted((step for records in members.values() for step in records), key=lambda step: step.event.order)
-                replay = _ScopeReplay(bucket[1])
-                self.replays[bucket] = replay
-                self.metrics['replayed_scopes'] += 1
-            else:
-                self.metrics['appended_rows'] += len(steps)
-            replay.advance(steps)
-            self.metrics['processed_rows'] += len(steps)
-            for key in tuple(replay.states):
-                if self.latest.get(key) != bucket:
-                    replay.states.pop(key)
-                    replay.results.pop(key, None)
-        for key in self.by_session.keys() - engine.sessions.keys():
-            self.by_session.pop(key)
-            self.session_members.pop(key, None)
-            self.latest.pop(key, None)
-        self.results = {key: self.replays[bucket].results.get(key, dict(active=False)) if bucket else dict(active=False)
-                        for key in engine.sessions for bucket in (self.latest.get(key),)}
+                    proof, prefix, minima = self._proof(owner, state, old)
+                    if old is not None and not prefix:
+                        dirty.update((owner[0], c) for c in old.buckets)
+                        dirty.update((owner[0], c) for c in proof.buckets)
+                    else:
+                        start = old.length if old is not None else 0
+                        if proof.length > start:
+                            tails[owner] = (start,
+                                (old.condition, old.timestamp) if old else (None, None))
+                        for bucket, order in minima.items():
+                            replay = self.replays.get(bucket)
+                            if (replay is not None and replay.last_order is not None
+                                    and order <= replay.last_order):
+                                dirty.add(bucket)
+                proofs[owner] = proof
+                proof_size += _proof_bytes(owner, proof)
+                if proof_size > MAX_METADATA_BYTES:
+                    raise _Capacity('owner proof allowance')
+            for owner in self.proofs.keys() - proofs.keys():
+                dirty.update((owner[0], c) for c in self.proofs[owner].buckets)
+            pools = self._admit(proofs)
+        except (_Capacity, _Unsupported) as exc:
+            return self._fallback(engine, signature, str(exc))
+        for bucket in self.replays.keys() - pools.keys():
+            self.replays.pop(bucket)
+        dirty.intersection_update(pools)
+        for bucket in pools:
+            if bucket in dirty or bucket not in self.replays:
+                self.replays[bucket] = _ScopeReplay(bucket[1])
+        self.metrics['replayed_scopes'] = len(dirty)
+        if dirty:
+            streams = [self._steps(owner, engine.sessions[owner], 0,
+                (None, None), dirty, 'replay_rows')
+                for owner, proof in proofs.items()
+                if any((owner[0], c) in dirty for c in proof.buckets)]
+            self._advance(streams, appended=False)
+        append_scopes = pools.keys() - dirty
+        streams = [self._steps(owner, engine.sessions[owner], start, previous,
+                   append_scopes, 'append_scan_rows')
+                   for owner, (start, previous) in tails.items()]
+        self._advance(streams, appended=True)
+        self.proofs = proofs
+        self._finish(proofs)
         self.signature = signature
-        self.metrics.update(retained_rows=sum(len(entries) for _, entries in self.sessions.values()),
-                            baseline_rows=sum(len(replay.pool) for replay in self.replays.values()),
-                            live_states=sum(len(replay.states) for replay in self.replays.values()),
-                            capacity_fallback=False)
         return self.results

@@ -45,6 +45,8 @@ def process_main(connection,homes,index_path,static_snapshot=None,model_evidence
     ledger_retry=0
     ledger_failures=0
     imported=False
+    import_started=False
+    next_import=0
     last_slow_report=float('-inf')
     diagnostic_path=Path(quota_path).with_suffix('.analysis.sqlite')
     def record_timing(stages,source_age=0):
@@ -86,6 +88,22 @@ def process_main(connection,homes,index_path,static_snapshot=None,model_evidence
             light=(publisher.heartbeat(snapshot,engine) if heartbeat else
                    publisher.publish(snapshot,engine,overlays.collect(engine)))
             connection.send({'kind':'snapshot','value':light})
+        def import_history():
+            nonlocal imported,next_import,ledger_issue,ledger_failures
+            started=time.monotonic()
+            try:
+                if hasattr(ledger,'import_observations_step'):
+                    imported=ledger.import_observations_step(collector.path,snapshot['homes'])
+                else:
+                    # Compatibility for external ledger adapters.
+                    for home in snapshot['homes']:ledger.import_observations(collector.path,home)
+                    imported=True
+            except sqlite3.Error as error:
+                disable_ledger(error)
+            if ledger and imported:
+                ledger_issue=None;ledger_failures=0
+            next_import=time.monotonic()+.05
+            record_timing({'history_import':time.monotonic()-started})
         details={}
         def send_details(all_pending=True):
             while details:
@@ -165,22 +183,20 @@ def process_main(connection,homes,index_path,static_snapshot=None,model_evidence
                 if ledger and not imported and not snapshot['index']['loading']:
                     # Verified session usage is independent of historical quota
                     # recovery. Leave earlier ledger faults unresolved until it ends.
-                    if snapshot['homes']:
+                    if snapshot['homes'] and not import_started:
                         snapshot={**snapshot,'ledger_status_known':False}
                         publish()
                         completed('initial_publication')
-                    try:
-                        for home in snapshot['homes']:ledger.import_observations(collector.path,home)
-                        imported=True
-                    except sqlite3.Error as error:disable_ledger(error)
+                    import_started=True
+                    import_history()
                     completed('history_import')
-                if ledger:
+                if ledger and imported:
                     ledger_issue=None
                     ledger_failures=0
                 # The quota ledger is independent of observed per-call usage.
                 # Keep its diagnostics without turning valid session values into
                 # missing data or replacing/repairing the user's quota history.
-                snapshot={**snapshot,'ledger_status_known':True,
+                snapshot={**snapshot,'ledger_status_known':imported or ledger is None,
                     'ledger_fault':dict(ledger_failed=bool(ledger_issue))}
                 if ledger_issue:snapshot={**snapshot,'ledger_error':ledger_issue}
                 publish(heartbeat=reusable)
@@ -206,10 +222,21 @@ def process_main(connection,homes,index_path,static_snapshot=None,model_evidence
                     connection.send({'kind':'error','id':request['id'],'error':traceback.format_exc(limit=6)})
                 finally:
                     record_timing({'query':time.monotonic()-query_started})
+            if (not frozen and ledger is not None and not imported and snapshot is not None
+                    and not snapshot['index']['loading'] and time.monotonic()>=next_import):
+                import_history()
+                if imported or ledger is None:
+                    snapshot={**snapshot,'ledger_status_known':True,
+                              'ledger_fault':dict(ledger_failed=bool(ledger_issue))}
+                    if ledger_issue:snapshot={**snapshot,'ledger_error':ledger_issue}
+                    else:snapshot.pop('ledger_error',None)
+                    publish(heartbeat=True)
             # Incoming UI requests wake this wait immediately. Only collection
             # needs a timer; an idle analyzer does not need 50 wakeups a second.
             if details:continue
             delay=1. if frozen else max(0.,next_poll-time.monotonic())
+            if not frozen and ledger is not None and not imported and import_started:
+                delay=min(delay,max(0.,next_import-time.monotonic()))
             if notification is None:connection.poll(delay)
             elif notification in wait([connection,notification],timeout=delay):
                 notice=collector.consume_notification()
