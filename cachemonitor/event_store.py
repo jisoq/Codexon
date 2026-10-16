@@ -118,6 +118,15 @@ class EventStore:
         if self.read_only or self.legacy:return None
         if self.db.in_transaction:raise RuntimeError('Replay tokens require a committed source state')
         changes={
+            'owner_delete':'''BEFORE DELETE ON event_sessions BEGIN
+                UPDATE event_store_state SET replay_epoch=lower(hex(randomblob(16))) WHERE id=1; END''',
+            'owner_replace':'''BEFORE INSERT ON event_sessions WHEN EXISTS
+                (SELECT 1 FROM event_sessions WHERE id=NEW.id OR home IS NEW.home AND tid IS NEW.tid) BEGIN
+                UPDATE event_store_state SET replay_epoch=lower(hex(randomblob(16))) WHERE id=1; END''',
+            'path_replace':'''BEFORE INSERT ON event_paths BEGIN
+                UPDATE event_sessions SET replay_revision=replay_revision+1 WHERE id IN
+                    (SELECT session_id FROM event_records WHERE path_id IN
+                     (SELECT id FROM event_paths WHERE id=NEW.id OR path IS NEW.path)); END''',
             'replace':'''BEFORE INSERT ON event_records BEGIN
                 UPDATE event_sessions SET replay_revision=replay_revision+1 WHERE id IN
                     (SELECT session_id FROM event_records

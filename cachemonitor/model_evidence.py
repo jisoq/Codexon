@@ -144,6 +144,29 @@ class EvidenceSummary:
         return list({**self.records,**{r['seq']:r for r in [*self.first,self.earliest,self.latest] if r is not None}}.values())
 
 
+class EvidenceProof:
+    """Bind a projection to the actual rows used by its canonical wire join."""
+    MAX_ROWS = 65536
+
+    def __init__(self, gaps):
+        self.base = hashlib.sha256(json.dumps(gaps,ensure_ascii=False,sort_keys=True,separators=(',',':')).encode())
+        self.rows = []
+        self.overflow = False
+
+    def observe(self, record):
+        if self.overflow:return
+        if len(self.rows)>=self.MAX_ROWS:
+            self.rows.clear();self.overflow=True;return
+        digest=hashlib.sha256(json.dumps(record,ensure_ascii=False,sort_keys=True,separators=(',',':')).encode()).digest()
+        self.rows.append((record['seq'],digest))
+
+    def digest(self):
+        if self.overflow:return None
+        result=self.base.copy()
+        for _,digest in sorted(self.rows):result.update(digest)
+        return result.digest()
+
+
 class EvidenceReader:
     """Incremental read-only join, scoped to Codex home and exact response ID."""
     READ_BATCH = 5000
@@ -279,7 +302,7 @@ class EvidenceReader:
             values.pop(record['attempt'],None)
             if not values:self.records.pop(key,None)
 
-    def evidence_rows(self,home,rows):
+    def evidence_rows(self,home,rows,proof=None):
         # Batch exact indexed lookups; never turn one old-session view into one
         # database round trip per response. History remains authoritative on disk.
         for start in range(0,len(rows),128):
@@ -292,6 +315,7 @@ class EvidenceReader:
                     f'WHERE home=? AND response_id IN ({slots}) AND seq<=? GROUP BY response_id,attempt) latest '
                     'ON m.seq=latest.seq',(home,*responses,self.offset)):
                     value=dict(record)
+                    if proof is not None:proof.observe(value)
                     missing=value.get('observation_missing') or any(a<=value['ts']<=b for a,b in self.gaps)
                     summary=evidence.get(record['response_id'])
                     if summary is None:summary=evidence[record['response_id']]=EvidenceSummary()
@@ -301,7 +325,7 @@ class EvidenceReader:
     def enrich(self, home, rows):
         return self.enrich_home(home_key(home),rows)
 
-    def enrich_owned(self, key, rows, owner):
+    def enrich_owned(self, key, rows, owner, *, capture_proof=False):
         """Reuse the collector's retained view without a second history cache.
 
         The owner already retains request keys and the published joined rows.
@@ -309,20 +333,28 @@ class EvidenceReader:
         A skipped batch, source replacement or changed gaps requires a fresh join.
         """
         previous=getattr(owner,'_evidence_join',None)
+        proof=getattr(owner,'_evidence_proof',None)
         changed=self.changed_responses.get(key)
         if (previous is not None and previous[0] is self and previous[1] is rows
+                and (not capture_proof or proof is not None and proof[0] is previous[4])
                 and previous[2]==self.join_epoch
                 and (previous[3]==self.revision or previous[3]==self.previous_revision
                      and (not changed or changed.isdisjoint(owner.keys)))):
             result=previous[4]
-        else:result=self.enrich_home(key,rows)
+        else:
+            if capture_proof:
+                proof=EvidenceProof(self.gaps)
+                result=self.enrich_home(key,rows,proof=proof)
+                owner._evidence_proof=(result,proof.digest())
+            else:result=self.enrich_home(key,rows)
         owner._evidence_join=(self,rows,self.join_epoch,self.revision,result)
         return result
 
-    def enrich_home(self, key, rows):
+    def enrich_home(self, key, rows,proof=None):
         """Join rows using a home key already resolved for this publication."""
         result = []
-        for row,evidence in self.evidence_rows(key,rows):
+        source=self.evidence_rows(key,rows) if proof is None else self.evidence_rows(key,rows,proof=proof)
+        for row,evidence in source:
             missing=any(e.get('observation_missing') or any(a<=e['ts']<=b for a,b in self.gaps) for e in evidence)
             req = {e['requested_model'] for e in evidence if e['requested_model']}
             res = {e['response_model'] for e in evidence if e['response_model']}

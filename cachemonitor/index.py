@@ -186,6 +186,7 @@ class UsageIndex:
 
     def _initialize_runtime(self, model_evidence_path, *, custom_index, all_metadata=False):
         self.monitor = SessionRegistry()
+        self.replay = None
         selected_homes={str(h) for h in self.homes}
         self.metadata = {(r[0],r[1]):json.loads(r[2]) for r in self.db.execute('select home,tid,data from metadata') if all_metadata or r[0] in selected_homes}
         self.files = []
@@ -379,7 +380,8 @@ class UsageIndex:
         if (old and path not in self.source_work and old[1] == st.st_size and old[2] == st.st_size
                 and old[3] == st.st_mtime_ns and old[4] == str(st.st_ino)):
             self.source_work.pop(path,None)
-            return (str(home), old[0]) if self.initial else None
+            key=(str(home),old[0])
+            return key if self.initial and key not in self.loaded and not (self.replay and key in self.replay.pending) else None
         offset = old[1] if old else 0
         if old:
             tid = old[0]
@@ -560,6 +562,7 @@ class UsageIndex:
         additions=sorted(self.new_events.pop(key,[]),key=lambda item:item[0])
         previous=self.monitor.sessions.get(key)
         append=bool(previous and key in self.loaded and key not in self.rebuild_required
+                    and not hasattr(previous,'_replay_body')
                     and all(order>self.event_tails.get(key,(float('inf'),'',0)) for order,_ in additions)
                     and (previous.modern or not any(e['type']=='token_usage_record' for _,e in additions)))
         if append:
@@ -584,6 +587,7 @@ class UsageIndex:
                             event['event_id']=f'{last_name}:{row[3]}'
                         yield tuple(row[1:]),event
                 finally:cursor.close()
+        replay_source=self.event_store.owner_replay_token(*key)
         self.rebuild_required.discard(key)
         meta = self.metadata.get(key, {})
         s.metadata_seen = bool(meta)
@@ -631,6 +635,8 @@ class UsageIndex:
         previous = self.monitor.sessions.get(key)
         if previous:
             s.transports = previous.transports
+        s._replay_source=replay_source
+        if self.replay is not None:self.replay.rebuilt(key,previous)
         self.monitor.sessions[key] = s
         self.loaded.add(key)
 
@@ -655,6 +661,9 @@ class UsageIndex:
         now = now or time.time()
         self.errors = []
         self.collection_fault = {}
+        if self.replay is not None:
+            self.model_evidence.poll()
+            self.replay.begin(now)
         catalog=self.catalog_signature() if not self.queue else self.source_catalog
         if not self.queue and (not self.files or now - self.last_discovery >= 10 or catalog!=self.source_catalog):
             self.discover(now)
@@ -684,6 +693,7 @@ class UsageIndex:
             try:
                 key = self.scan_file(*args)
                 if key:
+                    if self.replay is not None:self.replay.pending.discard(key)
                     changed.add(key)
             except (OSError, sqlite3.Error) as exc:
                 self.source_work.pop(args[0],None)
@@ -709,13 +719,14 @@ class UsageIndex:
             self.event_store.migrate(deadline)
         usage_errors=list(self.errors)
         usage_complete=not self.queue and not self.cached_restore and not self.pending_rebuilds and not self.rebuild_jobs and not usage_errors
-        if usage_complete:self.last_usage_success=now
+        if self.replay is not None and self.replay.restore_job is not None:usage_complete=False
         self.rebuild_deadline=None
         return self.snapshot(now,changed,usage_complete,usage_errors)
 
     def restore_cached(self,now,deadline):
         while self.cached_restore and time.monotonic()<deadline:
             key=self.cached_restore[0]
+            if self.replay is not None and key in self.replay.pending:break
             if self.pending_rebuilds:break
             if key not in self.loaded:self.rebuild(key,now)
             if key in self.rebuild_jobs:break
@@ -757,7 +768,7 @@ class UsageIndex:
             except (OSError, sqlite3.Error) as exc:
                 self.errors.append(f'{home.name} / 연결 기록: {exc}')
                 self.collection_fault['read_failed']=True
-        self.model_evidence.poll()
+        if self.replay is None:self.model_evidence.poll()
         if self.model_evidence.catching_up:usage_complete=False
         if self.model_evidence.error:
             self.errors.append(self.model_evidence.error)
@@ -768,6 +779,9 @@ class UsageIndex:
         evidence_homes = {home:home_key(home) for home in dict.fromkeys(home for home,_ in self.monitor.sessions)}
         for key, s in self.monitor.sessions.items():
             meta = self.metadata.get(key, {})
+            if hasattr(s,'_replay_body'):
+                views.append(self.replay.view(key,s,key in ready,now))
+                continue
             s.metadata_seen = bool(meta)
             s.trim(now)
             if s.excluded_title:
@@ -775,7 +789,8 @@ class UsageIndex:
             if not s.requests and not s.reported_usage and not s.transports and not s.request_state:
                 continue
             view = dict(s.view(now,use_cache=True))
-            view['history'] = self.model_evidence.enrich_owned(evidence_homes[s.home],view['history'],s)
+            view['history'] = self.model_evidence.enrich_owned(evidence_homes[s.home],view['history'],s,
+                **({'capture_proof':True} if self.replay is not None else {}))
             if not meta.get('project') or not meta.get('project_name'):
                 names=self.names.get(str(s.home))
                 if names:
@@ -800,7 +815,7 @@ class UsageIndex:
             request_values=tuple(view.get(field) for field in
                 ('request_state','turn_records','turn_states','coverage_gaps','unclassified'))
             prior=self.request_revisions.get(key)
-            request_revision=(prior[1] if prior and all(a is b or a==b for a,b in zip(prior[0],request_values))
+            request_revision=(prior[1] if prior and prior[0] is not None and all(a is b or a==b for a,b in zip(prior[0],request_values))
                               else (prior[1]+1 if prior else 1))
             self.request_revisions[key]=(request_values,request_revision)
             view['request_revision']=request_revision
@@ -814,6 +829,8 @@ class UsageIndex:
             view['usage_revision']=self.session_revisions[key]
             views.append(view)
         self.version += bool(changed)
+        if self.pending_rebuilds:usage_complete=False
+        if usage_complete:self.last_usage_success=now
         if self.archive is not None:views.extend(self.archive.views(now,{str(h) for h in self.homes}))
         activity_revision = (self.model_evidence.generation,self.model_evidence.revision)
         if activity_revision != self.activity_publication:
@@ -835,7 +852,7 @@ class UsageIndex:
                 'homes': [str(h) for h in self.homes], 'errors': list(dict.fromkeys(self.errors)),
                 'unassigned': list(self.monitor.unassigned),
                 'unassigned_dropped': self.monitor.unassigned_dropped,
-                'excluded_title_sessions': sum(s.excluded_title for s in self.monitor.sessions.values()),
+                'excluded_title_sessions': sum(s.excluded_title for s in self.monitor.sessions.values() if not hasattr(s,'_replay_body')),
                 'quota_by_home':dict(self.quota_by_home),
                 'index': {'loading': bool(self.queue or self.cached_restore or self.pending_rebuilds or self.rebuild_jobs or self.model_evidence.catching_up), 'done': min(self.done_files, len(self.files)),
                           'usage_complete':usage_complete,'last_usage_success':self.last_usage_success,
@@ -846,6 +863,7 @@ class UsageIndex:
 
     def track_publication(self, snapshot):
         from .usage_collection import CollectionChanges, LiveCollection, publication_fingerprint
+        from .collection_replay import EncodedSession
         # Session.view owns its cached nested values. It replaces that cache on
         # changes and window expiry; EvidenceReader likewise replaces joined rows.
         # Retain references, not bare ids, so object-id reuse cannot hide a change.
@@ -857,6 +875,9 @@ class UsageIndex:
         tokens = {}
         for view in snapshot['sessions']:
             key = (view['home'],view['id'])
+            if isinstance(view,EncodedSession):
+                tokens[key]=view.digest
+                continue
             base = bases.get(key)
             if base is None:continue
             history = view['history']
@@ -881,6 +902,7 @@ class UsageIndex:
                                                     activity_revision=self.activity_publication)
 
     def close(self):
+        if self.replay is not None:self.replay.close();self.replay=None
         for job in self.rebuild_jobs.values():job.close()
         self.rebuild_jobs.clear();self.pending_rebuilds.clear()
         self.cached_restore.clear()

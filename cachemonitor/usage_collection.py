@@ -115,12 +115,18 @@ class LiveCollection:
             if old is not None and old[1]==fingerprint:return old
             payload=zlib.compress(json.dumps(value,ensure_ascii=False,separators=(',',':')).encode(),1)
             return sequence,fingerprint,payload,sha256(payload).hexdigest()
+        from .collection_replay import EncodedSession
         for session in snapshot['sessions']:
             key=(session['home'],session['id'])
-            heavy={key:value for key,value in session.items() if key not in self.volatile}
             token=changes.sessions.get(key) if trusted else None
             if token is not None:session_tokens[key]=token
-            saved=row(heavy,previous['sessions'].get(key) if same_epoch else None,token,prior_sessions,key)
+            old_body=previous['sessions'].get(key) if same_epoch else None
+            if isinstance(session,EncodedSession):
+                saved=(old_body if old_body is not None and old_body[3]==session.digest else
+                       (sequence,session.fingerprint,session.payload,session.digest))
+            else:
+                heavy={key:value for key,value in session.items() if key not in self.volatile}
+                saved=row(heavy,old_body,token,prior_sessions,key)
             sessions[key]=saved
             state={field:value for field,value in session.items() if field in self.volatile}
             old=prior_entries.get(key)
@@ -393,10 +399,13 @@ class CollectionChannel:
         volatile=LiveCollection.volatile
         previous=self.published if getattr(self,'publish_epoch',None)==epoch else {}
         current={};manifest=[];writes=[]
+        from .collection_replay import EncodedSession
         for session in snapshot['sessions']:
             key=(session['home'],session['id'])
-            heavy={k:v for k,v in session.items() if k not in volatile}
             prepared=candidate['sessions'][key] if candidate is not None else None
+            if prepared is None and isinstance(session,EncodedSession):
+                prepared=(sequence,session.fingerprint,session.payload,session.digest)
+            heavy={k:v for k,v in session.items() if k not in volatile} if prepared is None else None
             fingerprint=prepared[1] if prepared is not None else publication_fingerprint(heavy)
             old=previous.get(key)
             if old is not None and fingerprint==old[1]:
@@ -840,25 +849,45 @@ class CollectorService:
         return (session.get('scope')==self.channel.scope and session.get('stopped') or
                 self.channel.db.execute("SELECT 1 FROM control WHERE instance=? AND action='stop'",(self.instance,)).fetchone() is not None)
 
-    def poll(self,now=None):
+    def poll(self,now=None,*,detailed=True):
         from .index import UsageIndex
         started=time.monotonic()
         now=now or time.time();homes=self.channel.requested_homes(now)
         if self.index and homes!=[str(h) for h in self.index.homes]:
             self.index.close();self.index=None;self.epoch=uuid.uuid4().hex
-        if self.index is None:self.index=UsageIndex(homes,self.channel.index_path,self.channel.evidence)
+        if self.index is None:
+            self.index=UsageIndex(homes,self.channel.index_path,self.channel.evidence)
+            self.index.db.commit()  # Finish schema and TEMP revision setup before replay proofs.
+            from .collection_replay import CollectionReplay
+            self.index.replay=CollectionReplay.open(self.channel,self.index)
         snapshot=self.index.poll(now)
+        source_snapshot=snapshot
         collected=time.monotonic()
         changes=getattr(self.index,'collection_changes',None)
-        snapshot={**snapshot,'sessions':[dict(s,usage_revision=f'{self.epoch}:{s.get("usage_revision")}',
-            **({'request_revision':f'{self.epoch}:{s["request_revision"]}'} if s.get('request_revision') is not None else {})) for s in snapshot['sessions']],
+        from .collection_replay import EncodedSession
+        def with_epoch(session):
+            state=dict(usage_revision=f'{self.epoch}:{session.get("usage_revision")}')
+            if session.get('request_revision') is not None:state['request_revision']=f'{self.epoch}:{session["request_revision"]}'
+            return session.with_state(**state) if isinstance(session,EncodedSession) else dict(session,**state)
+        snapshot={**snapshot,'sessions':[with_epoch(s) for s in snapshot['sessions']],
             'collection':dict(pid=os.getpid(),instance=self.instance,version=VERSION,
                 executable=self.executable)}
-        self.sequence+=1;self.channel.publish(snapshot,self.epoch,self.sequence,changes=changes);self.last=snapshot
+        self.sequence+=1;self.channel.publish(snapshot,self.epoch,self.sequence,changes=changes)
+        if self.index.replay is not None:self.index.replay.capture(source_snapshot,now)
+        published_sessions=snapshot['sessions']
+        snapshot['sessions']=[with_epoch(self.index.monitor.sessions[(s['home'],s['id'])]._replay_body)
+            if not isinstance(s,EncodedSession) and hasattr(self.index.monitor.sessions.get((s['home'],s['id'])),'_replay_body')
+            else s for s in snapshot['sessions']]
+        self.last=snapshot
         from .quota_diagnostics import record_slow_cycle
         self.last_slow_report=record_slow_cycle(self.channel.path.with_suffix('.collector.sqlite'),
             dict(source_collection=collected-started,publication=time.monotonic()-collected),
             0,getattr(self,'last_slow_report',float('-inf')))
+        if detailed:
+            # Diagnostics can explicitly request ordinary public dictionaries.
+            # The service loop and self.last retain only encoded closed bodies.
+            return {**snapshot,'sessions':[dict(json.loads(zlib.decompress(s.payload)),**s)
+                if isinstance(s,EncodedSession) else s for s in published_sessions]}
         return snapshot
 
     def close(self):
@@ -892,7 +921,7 @@ def main():
     first=True
     try:
         while not service.stopping():
-            snapshot=service.poll()
+            snapshot=service.poll(detailed=False)
             if first:
                 # One bounded record is replaced only on failure or a new healthy
                 # service instance. Normal polling adds no marker writes.

@@ -144,6 +144,12 @@ def test_replay_tokens_follow_source_transactions_replacements_and_repairs(tmp_p
         repairer=EventStore(db,path)
         assert repairer.enable_replay_tokens()!=epoch
         assert store.owner_replay_token('home','second')!=token
+        # Reusing a deleted owner's integer id cannot revive an old proof.
+        token=store.owner_replay_token('home','second')
+        with db:
+            db.execute('DELETE FROM event_sessions WHERE id=?',(token[1],))
+            db.execute('INSERT INTO event_sessions(id,home,tid) VALUES(?,?,?)',(token[1],'home','second'))
+        assert store.owner_replay_token('home','second')[0]!=token[0]
         replay=UsageIndex.for_replay(path)
         try:assert replay.event_store.enable_replay_tokens() is None and replay.db.total_changes==0
         finally:replay.close()

@@ -99,6 +99,91 @@ def test_custom_index_does_not_import_default_history(default_home,tmp_path):
     finally:service.close()
 
 
+def test_closed_collection_reuses_bodies_and_replays_only_changed_owners(tmp_path,monkeypatch):
+    from cachemonitor.model_evidence import EvidenceStore
+    from cachemonitor.usage_collection import CollectionChannel
+    from test_core import TID,usage
+    home,path=fixture_home(tmp_path)
+    other='other';second=home/'second.jsonl'
+    second.write_text(json.dumps(usage('second',tid=other))+'\n',encoding='utf8')
+    with sqlite3.connect(home/'state_5.sqlite') as db:
+        db.execute('INSERT INTO threads(id,rollout_path,name) VALUES(?,?,?)',(other,str(second),'Second'))
+    evidence=tmp_path/'evidence.sqlite';store=EvidenceStore(evidence)
+    store.write(home,'attempt',10000,'WebSocket','r1','model-a','model-a','completed')
+    store.close()
+    target=tmp_path/'index.sqlite';rebuilt=[]
+    original=UsageIndex.rebuild_steps
+    def replay(index,key,now):
+        rebuilt.append(key[1])
+        yield from original(index,key,now)
+    monkeypatch.setattr(UsageIndex,'rebuild_steps',replay)
+    def collect(service,now):
+        deadline=time.monotonic()+5
+        while True:
+            value=service.poll(now)
+            if value['usage_collection_complete'] and not value['index']['loading']:break
+            assert time.monotonic()<deadline
+        reader=CollectionChannel([home],target,evidence)
+        try:value=reader.read(shared=True)
+        finally:reader.close()
+        return {row['id']:{k:v for k,v in row.items() if k not in ('usage_revision','request_revision')}
+                for row in value['sessions']}
+    service=CollectorService([home],target,evidence)
+    try:
+        first=collect(service,20000)
+        assert service.index.replay.db.execute('SELECT count(*) FROM owners').fetchone()[0]==2
+        assert all(not session.requests for session in service.index.monitor.sessions.values())
+    finally:service.close()
+    rebuilt.clear();service=CollectorService([home],target,evidence)
+    try:
+        assert collect(service,20001)==first and not rebuilt
+        with sqlite3.connect(home/'state_5.sqlite') as db:
+            db.execute('UPDATE threads SET name=? WHERE id=?',('Renamed',other))
+        renamed=collect(service,20012)
+        assert set(rebuilt)=={other} and renamed[other]['title']=='Renamed'
+        assert renamed[other]['history']==first[other]['history']
+        first[other]=renamed[other];rebuilt.clear()
+        # An active request resumes just its owner, including preserved history.
+        with path.open('a',encoding='utf8') as output:output.write(json.dumps(usage('new',time=20014))+'\n')
+        changed=collect(service,20015)
+        assert set(rebuilt)=={TID} and len(changed[TID]['history'])==2
+        assert changed[other]==first[other]
+    finally:service.close()
+    # A past observation edit with an unchanged maximum sequence is still seen.
+    with sqlite3.connect(evidence) as db:db.execute("UPDATE model_observations SET requested_model='model-b' WHERE response_id='r1'")
+    rebuilt.clear();service=CollectorService([home],target,evidence)
+    try:
+        changed=collect(service,24000)
+        assert set(rebuilt)=={TID}
+        assert next(row for row in changed[TID]['history'] if row['key']=='r1')['model']=='model-b'
+    finally:service.close()
+    # A malformed derived header is ignored without blocking source collection.
+    with sqlite3.connect(service.channel.companion('.collection-replay.sqlite')) as db:
+        db.execute('UPDATE owners SET header=CAST(header AS TEXT) WHERE sid=?',(other,))
+    rebuilt.clear();service=CollectorService([home],target,evidence)
+    try:
+        assert collect(service,24001)==changed and set(rebuilt)=={other}
+    finally:service.close()
+    # Deleted source records and a damaged derived body both use ordinary replay.
+    path.write_text(json.dumps(usage('new',time=20014))+'\n',encoding='utf8')
+    with sqlite3.connect(service.channel.snapshot_path) as db:
+        db.execute('UPDATE sessions SET payload=? WHERE sid=?',(b'corrupt',other))
+    rebuilt.clear();service=CollectorService([home],target,evidence)
+    try:
+        changed=collect(service,24002)
+        assert set(rebuilt)=={TID,other}
+        assert [row['key'] for row in changed[TID]['history']]==['new']
+        assert changed[other]==first[other]
+        # Losing a not-yet-committed derived proof cannot lose public history.
+        service.index.replay.db.rollback()
+    finally:service.close()
+    rebuilt.clear();service=CollectorService([home],target,evidence)
+    try:
+        assert collect(service,24003)==changed
+        assert TID in rebuilt
+    finally:service.close()
+
+
 def test_failed_migration_preserves_original_and_releases_collector_lock(default_home):
     from cachemonitor.usage_collection import locked
     legacy_index_location().parent.mkdir(parents=True)
