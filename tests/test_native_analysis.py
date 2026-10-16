@@ -69,3 +69,11 @@ def test_ingest_revision_fast_path_and_corrected_historical_usage(backend):
     record = engine.record('home', 'session', 'response')
     assert record['input'] == 120 and record['cached'] == 80 and record['total'] == 140
     assert record['call_id'] == 'response' and record['session_ordinal'] == 1
+    pending=dict(source,id='a',collection_complete=False,_collection_pending=True)
+    engine.ingest([pending,corrected])
+    assert engine.record('home','session','response')['input']==120
+    assert engine.record('home','a','response') is None
+    # Once confirmed, the normal deterministic owner rule applies again.
+    engine.ingest([dict(pending,_collection_pending=False),corrected])
+    assert engine.record('home','a','response')['input']==100
+    assert engine.record('home','session','response') is None

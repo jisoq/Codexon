@@ -229,6 +229,9 @@ def test_peer_scope_capacity_falls_back_without_losing_observed_results(monkeypa
     assert tracker.results[('h', 'first')]['active']
     assert tracker.metrics['capacity_fallback'] and tracker.metrics['retained_rows'] == 0
     assert not tracker.calls and not tracker.replays and not tracker.scope_counts
+    engine.sessions=dict(reversed(list(engine.sessions.items())))
+    assert tracker.collect(engine)==classify(sources)
+    assert tracker.metrics['processed_rows']==tracker.metrics['scanned_rows']==0
     engine.sessions.pop(('h', 'third'))
     assert tracker.collect(engine) == classify([first, replacement])
     assert not tracker.metrics['capacity_fallback']

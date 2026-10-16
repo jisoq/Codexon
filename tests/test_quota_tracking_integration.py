@@ -417,6 +417,33 @@ def test_recovery_snapshot_cannot_rewind_durable_quota_activity_or_coverage(tmp_
         ledger.close();reference.close();empty.close()
 
 
+def test_pending_catalog_member_cannot_rewrite_committed_calls_or_tasks(tmp_path):
+    ledger=QuotaLedger(tmp_path/'ledger.sqlite')
+    try:
+        _committed_quota_fixture(ledger)
+        ledger.db.execute('INSERT INTO coverage_issues VALUES(?,?,?,?,?)',('h','s',103,108,'stored uncertainty'))
+        ledger.db.execute('UPDATE state SET unclassified=1 WHERE home=?',('h',))
+        ledger.db.commit()
+        calls=[tuple(row) for row in ledger.db.execute('SELECT * FROM calls')]
+        tasks=[tuple(row) for row in ledger.db.execute('SELECT * FROM tracking_tasks')]
+        coverage=[tuple(row) for row in ledger.db.execute('SELECT * FROM coverage_issues')]
+        engine=SimpleNamespace(sessions={('h','s'):{'revision':200,'prepared':{'history':[]}}})
+        pending=dict(homes=['h'],ts=112,usage_collection_complete=False,
+            index=dict(loading=True,usage_complete=False),sessions=[dict(home='h',id='s',
+                _collection_pending=True,turn_records={'one':dict(started_at=103,ended_at=None)})])
+        ledger.sync(engine,pending)
+        assert [tuple(row) for row in ledger.db.execute('SELECT * FROM calls')]==calls
+        assert [tuple(row) for row in ledger.db.execute('SELECT * FROM tracking_tasks')]==tasks
+        assert [tuple(row) for row in ledger.db.execute('SELECT * FROM coverage_issues')]==coverage
+        assert ledger.db.execute('SELECT unclassified FROM state WHERE home=?',('h',)).fetchone()[0]==1
+        assert tuple(ledger.db.execute('SELECT at,complete FROM tracking_health').fetchone())==(112,0)
+        complete={**pending,'sessions':[],'usage_collection_complete':True,'index':dict(loading=False,usage_complete=True)}
+        ledger.sync(SimpleNamespace(sessions={}),complete)
+        assert not list(ledger.db.execute('SELECT * FROM coverage_issues'))
+        assert ledger.db.execute('SELECT unclassified FROM state WHERE home=?',('h',)).fetchone()[0]==0
+    finally:ledger.close()
+
+
 def test_forward_continuous_account_consumption_and_cost_survive_reopen(tmp_path):
     path=tmp_path/'ledger.sqlite'
     ledger=QuotaLedger(path)

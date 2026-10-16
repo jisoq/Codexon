@@ -234,6 +234,12 @@ class LiveCollection:
         checkpoint=value.get('checkpoint') or known
         recovered=(recovery[1] if protocol==5 and recovery is not None and
                    isinstance(checkpoint,(list,tuple)) and tuple(checkpoint)==recovery[0] else {})
+        exclusions=value.get('checkpoint_exclusions',[])
+        if (not isinstance(exclusions,list) or len(exclusions)>4096 or
+                any(not isinstance(key,(list,tuple)) or len(key)!=2 or
+                    not all(isinstance(part,str) for part in key) for key in exclusions)):
+            recovered={};exclusions=[]
+        exclusions={tuple(key) for key in exclusions}
         since=(known[1] if isinstance(known,(list,tuple)) and len(known)==2 and
                known[0]==current['publication'][0] and type(known[1]) is int and
                0<known[1]<=current['publication'][1] else -1)
@@ -246,7 +252,7 @@ class LiveCollection:
                 changed=current['state_revisions'][key] if id_key=='sid' else entry['revision']
                 if not full and changed<=since:continue
                 payload=rows[key][2] if entry['revision']>since else b''
-                if id_key=='sid' and key in recovered and recovered[key]==entry.get('body_digest'):payload=b''
+                if id_key=='sid' and key not in exclusions and key in recovered and recovered[key]==entry.get('body_digest'):payload=b''
                 result.append({**entry,'size':len(payload)})
                 if payload:chunks.append(payload)
             return result
@@ -255,6 +261,7 @@ class LiveCollection:
         if activities is not None:activities=manifest(activities,current['activities'],'attempt')
         return dict(ready=True,protocol=protocol,publication=current['publication'],header=current['header'],
                     sessions=sessions,activities=activities,
+                    **(dict(checkpoint_filter=True) if protocol==5 else {}),
                     **(dict(full=full) if protocol in (4,5) else {})),b''.join(chunks)
 
 
@@ -294,6 +301,8 @@ class CollectionChannel:
         self.live=None;self.live_server=None
         self.live_cached=None;self.live_publication=None;self.last_read_live=False
         self.live_session_cache={};self.live_activity_cache={}
+        self.retain_pending=False;self.pending_checkpoint=None
+        self.checkpoint_exclusions=set()
 
     def companion(self,suffix):
         return self.path.with_name(self.path.name+'.codexon-'+suffix.lstrip('.'))
@@ -560,6 +569,34 @@ class CollectionChannel:
             raise CollectionScopeError('수집 결과의 본문 형식이 일치하지 않습니다.')
         return value,digest,revisions
 
+    def _retain_pending(self,result,current,*,live):
+        if not getattr(self,'retain_pending',False):return current
+        if not result.get('index',{}).get('loading'):
+            if live and any(row[2].get('_collection_pending') for row in current.values()):
+                # The delta may borrow the current map. Do not mutate it until
+                # all body lengths and activity records have been validated.
+                return {key:row for key,row in current.items() if not row[2].get('_collection_pending')}
+            return current
+        previous=self.live_cached if self.live_cached is not None else self.cached
+        if previous is None:return current
+        from_live=self.live_cached is not None
+        cache=self.live_session_cache if from_live else self.session_cache
+        homes=set(result.get('homes',())) & set(self.homes)
+        for source in previous.get('sessions',()):
+            key=source['home'],source['id']
+            if key in current or key[0] not in homes:continue
+            old=cache.get(key)
+            if old is None:continue
+            # A partial catalog cannot prove deletion. Keep the same decoded
+            # body until validation finishes, and never present it as confirmed.
+            # None prevents an old epoch's numeric revision from matching a
+            # different body in the new epoch; the content digest remains valid.
+            pending={**source,'collection_complete':False,'_collection_pending':True}
+            digest=old[3] if from_live else old[2]
+            current[key]=((None,old[1],pending,digest) if live else (None,old[1],digest,{}))
+            if not live:result['sessions'].append(pending)
+        return current
+
     def _read_live(self,metadata,body):
         same_epoch=self.live_publication and self.live_publication[0]==metadata['publication'][0]
         delta=metadata.get('protocol') in (4,5) and not metadata['full']
@@ -593,7 +630,9 @@ class CollectionChannel:
                 current[key]=((revision,value,{**value,**revisions,**entry['state']},digest) if id_key=='sid' else (revision,value))
             return current
         sessions=rows(metadata['sessions'],self.live_session_cache if same_epoch else {},'sid')
-        result={**metadata['header'],'sessions':[row[2] for row in sessions.values()]}
+        result=dict(metadata['header'])
+        sessions=self._retain_pending(result,sessions,live=True)
+        result['sessions']=[row[2] for row in sessions.values()]
         activities={}
         if metadata['activities'] is not None:
             activities=rows(metadata['activities'],self.live_activity_cache if same_epoch else {},'attempt')
@@ -601,13 +640,32 @@ class CollectionChannel:
         if offset!=len(body):raise CollectionScopeError('수집 결과의 본문 길이가 일치하지 않습니다.')
         return result,sessions,activities
 
+    def _checkpoint_after_live(self,result,sessions,metadata):
+        checkpoint=self.identity or self.pending_checkpoint
+        exclusions=set() if self.identity is not None else self.checkpoint_exclusions
+        if checkpoint and any(s.get('_collection_pending') for s in result['sessions']):
+            previous=self.live_session_cache or self.session_cache
+            digest_index=3 if self.live_session_cache else 2
+            exclusions=exclusions | {key for key,row in previous.items()
+                if key not in sessions or row[digest_index]!=sessions[key][3]}
+            # A changed body no longer proves ownership of its checkpoint bytes.
+            # Older collectors lack selective proof withdrawal, so stop using
+            # the checkpoint with them instead of suppressing a required body.
+            if (len(exclusions)>4096 or sum(64+4*sum(map(len,key)) for key in exclusions)>4*1024*1024
+                    or exclusions and not metadata.get('checkpoint_filter')):
+                checkpoint=None
+        else:checkpoint=None
+        self.pending_checkpoint=checkpoint
+        self.checkpoint_exclusions=exclusions if checkpoint else set()
+
     def read(self,*,shared=False,header_only=False):
         # __new__ read-only diagnostic channels intentionally remain SQLite-only.
         self.last_read_live=False
         if hasattr(self,'client'):
             # A durable checkpoint proves body ownership, not a live delta base.
             response=self.live_request(header_only=header_only,protocol=5,publication=self.live_publication,
-                                       checkpoint=self.identity,activity_stream=True)
+                                       checkpoint=self.identity or self.pending_checkpoint,
+                                       checkpoint_exclusions=list(self.checkpoint_exclusions),activity_stream=True)
             if response is not None and response[0].get('ready') is False:
                 response=self.live_request(header_only=header_only,protocol=4,publication=self.live_publication,activity_stream=True)
             if response is not None and response[0].get('ready') is False:
@@ -627,6 +685,7 @@ class CollectionChannel:
                     self.last_read_live=True
                     if not header_only:
                         result=self.activity_page(result,metadata['publication'][0])
+                        self._checkpoint_after_live(result,sessions,metadata)
                         self.live_session_cache=sessions;self.live_activity_cache=activities
                         self.live_publication=tuple(metadata['publication']);self.live_cached=result
                         # Recovery and live delivery are alternate owners of one
@@ -676,6 +735,7 @@ class CollectionChannel:
                     current[key]=(revision,heavy,digest,revisions);sessions.append({**heavy,**revisions,**entry['state']})
                 result={k:v for k,v in header.items() if k not in ('collection_schema','session_manifest')}
                 result['sessions']=sessions
+                current=self._retain_pending(result,current,live=False)
                 self.session_cache=current
                 if 'activity_revision' in header and not header.get('activity_stream'):
                     activity_identity=(row[1],header['activity_revision'])
@@ -693,9 +753,11 @@ class CollectionChannel:
                     result.pop('activity_revision',None)
             else:
                 result=header
-            self.cached=header;self.identity=identity
+            self.cached={**header,'sessions':result['sessions']};self.identity=identity
         # Shared records are read-only; each poll owns its envelope and list.
         result=self.activity_page(result,identity[0])
+        self.pending_checkpoint=identity if any(s.get('_collection_pending') for s in result['sessions']) else None
+        self.checkpoint_exclusions=set()
         self.live_cached=None;self.live_publication=None
         self.live_session_cache={};self.live_activity_cache={}
         return self.recovered_snapshot(result,identity,shared=shared,header_only=False)
@@ -723,6 +785,8 @@ class CollectionChannel:
         self.session_cache={};self.activity_cache={};self.activity_identity=None
         self.live_session_cache={};self.live_activity_cache={}
         self.cached=None;self.identity=None;self.live_cached=None;self.live_publication=None
+        self.pending_checkpoint=None
+        self.checkpoint_exclusions=set()
         self.retained_session_keys=set()
 
 
@@ -746,6 +810,7 @@ class CollectionClient:
     """GUI/cache clients never instantiate a source index or acquire its lock."""
     def __init__(self,homes,path=None,model_evidence_path=None):
         self.channel=CollectionChannel(homes,path,model_evidence_path)
+        self.channel.retain_pending=True
         self.path=self.channel.path
         self.waiter=None
         self.notification_epoch=None

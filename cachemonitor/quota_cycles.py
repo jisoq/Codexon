@@ -1379,6 +1379,11 @@ class QuotaLedger:
     def sync(self, engine, snapshot):
         """Use the existing deduplicated analytical rows; don't parse conversations twice."""
         from .quota_tracking_store import sync_activity
+        pending={(s['home'],s['id']) for s in snapshot.get('sessions',()) if s.get('_collection_pending')}
+        if pending:
+            # Pending catalog members are a retained read model. They cannot
+            # rewrite newer calls, task completions or coverage in the ledger.
+            snapshot={**snapshot,'sessions':[s for s in snapshot['sessions'] if (s['home'],s['id']) not in pending]}
         recovered_homes=set()
         if snapshot.get('collection_recovery'):
             # A durable collection cache can predate this ledger's last live
@@ -1395,7 +1400,7 @@ class QuotaLedger:
         if not hasattr(self,'_tracking_sync_cache'):self._tracking_sync_cache={}
         sync_activity(self.db, snapshot,self._tracking_sync_cache)
         for key, session in {**engine.sessions,**getattr(engine,'internal_sessions',{})}.items():
-            if key[0] in recovered_homes:continue
+            if key[0] in recovered_homes or key in pending:continue
             revision = session.get('content_revision',session['revision'])
             if self.revisions.get(key) == revision:
                 continue
@@ -1461,10 +1466,17 @@ class QuotaLedger:
                               if '기록 읽기' in error or '세션 목록' in error or '일부 기록 형식' in error]
             signatures=getattr(self,'_coverage_signatures',{})
             relevant=[s for s in snapshot['sessions'] if s['home']==home]
+            pending_sids=frozenset(sid for pending_home,sid in pending if pending_home==home)
             signature=(tuple(usage_errors),tuple((s.get('id',''),repr(s.get('usage_revision')) if s.get('usage_revision') is not None else tuple(r.get('ts') for r in s.get('history',[])),
-                bool(s.get('unclassified')),s.get('coverage_available'),repr(s.get('coverage_gaps',[]))) for s in relevant))
+                bool(s.get('unclassified')),s.get('coverage_available'),repr(s.get('coverage_gaps',[]))) for s in relevant),pending_sids)
             if signatures.get(home)!=signature:
-                self.db.execute('delete from coverage_issues where home=?', (home,))
+                if pending_sids:
+                    # Keep known uncertainty for unvalidated owners. Visit only
+                    # stored issue owners, not every call or every confirmed owner.
+                    owners=self.db.execute('SELECT DISTINCT sid FROM coverage_issues WHERE home=?',(home,)).fetchall()
+                    self.db.executemany('DELETE FROM coverage_issues WHERE home=? AND sid=?',
+                        ((home,row[0]) for row in owners if row[0] not in pending_sids))
+                else:self.db.execute('delete from coverage_issues where home=?', (home,))
                 for session in snapshot['sessions']:
                     if session['home'] != home:
                         continue
@@ -1487,7 +1499,8 @@ class QuotaLedger:
             index=snapshot.get('index',{})
             loading=bool(index.get('loading'))
             complete=index.get('usage_complete',snapshot.get('usage_collection_complete',not loading and not usage_errors))
-            previous=self.db.execute('select complete_at from state where home=?',(home,)).fetchone()
+            previous=self.db.execute('select complete_at,unclassified from state where home=?',(home,)).fetchone()
+            if pending_sids and previous:unclassified=previous['unclassified']
             watermark=previous['complete_at'] if previous else None
             if complete:
                 stamp=index.get('usage_complete_at') or index.get('last_usage_success') or snapshot.get('last_usage_collection_success') or snapshot['ts']

@@ -748,6 +748,77 @@ def test_restart_reuses_committed_bodies_until_catalog_finishes_and_repairs_corr
     finally:reader.close();writer.close()
 
 
+@pytest.mark.parametrize('proof_filter',[True,False])
+def test_partial_restart_keeps_one_body_population_until_confirmed_or_removed(tmp_path,monkeypatch,proof_filter):
+    from cachemonitor import usage_collection
+    writer=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite')
+    reader=CollectionChannel(writer.homes,writer.path);reader.retain_pending=True
+    try:
+        value=snapshot(writer)
+        value['sessions'][0].update(usage_revision='first:1',request_revision='first:1')
+        value['sessions'].append(dict(value['sessions'][0],id='second'))
+        writer.publish(value,'first',7)
+        initial=reader.read(shared=True)
+        histories={s['id']:s['history'] for s in initial['sessions']}
+        writer.close();writer=CollectionChannel(reader.homes,reader.path);writer.start_live()
+        if not proof_filter:
+            handler=writer.live_server.handler
+            def older_collector(request):
+                metadata,body=handler(request)
+                metadata.pop('checkpoint_filter',None)
+                return metadata,body
+            writer.live_server.handler=older_collector
+        partial={**value,'index':{**value['index'],'loading':True},'sessions':value['sessions'][:1]}
+        writer.publish(partial,'second',1)
+        with monkeypatch.context() as patch:
+            patch.setattr(usage_collection.zlib,'decompress',lambda *a,**kw:pytest.fail('unchanged body decoded'))
+            received=reader.read(shared=True)
+        assert len(received['sessions'])==2
+        pending=next(s for s in received['sessions'] if s['id']=='second')
+        assert pending['_collection_pending'] and pending['collection_complete'] is False
+        assert pending['history'] is histories['second']
+        assert not reader.session_cache and reader.pending_checkpoint==('first',7)
+        # A correction can later return to checkpoint bytes. Its old proof
+        # must be withdrawn after the first replacement, even while B is pending.
+        corrected=copy.deepcopy(partial);corrected['sessions'][0]['history'][0]['output']=7
+        writer.publish(corrected,'second',2)
+        assert reader.read(shared=True)['sessions'][0]['history'][0]['output']==7
+        assert bool(reader.pending_checkpoint)==proof_filter
+        writer.publish(partial,'second',3)
+        reverted=reader.read(shared=True)
+        assert reverted['sessions'][0]['history'][0]['output']==3
+        histories['session']=reverted['sessions'][0]['history']
+        # A later partial publication can promote an old body without sending it.
+        writer.publish({**partial,'sessions':value['sessions']},'second',4)
+        metadata,body=reader.live_request(protocol=5,publication=reader.live_publication,checkpoint=reader.pending_checkpoint,
+            checkpoint_exclusions=list(reader.checkpoint_exclusions))
+        if proof_filter:assert not body and all(entry['size']==0 for entry in metadata['sessions'])
+        else:assert body
+        with monkeypatch.context() as patch:
+            patch.setattr(usage_collection.zlib,'decompress',lambda *a,**kw:pytest.fail('promoted body decoded'))
+            promoted=reader.read(shared=True)
+        assert all(not s.get('_collection_pending') and s['history'] is histories[s['id']] for s in promoted['sessions'])
+        # Preserve pending bodies across a newer durable fallback, too.
+        writer.publish(partial,'second',5)
+        reader.read(shared=True)
+        writer.publish({**partial,'index':value['index']},'second',6)
+        metadata,body=reader.live_request(protocol=5,publication=reader.live_publication)
+        assert not metadata['full'] and not metadata['sessions']
+        with pytest.raises(usage_collection.CollectionScopeError):reader._read_live(metadata,body+b'x')
+        assert (writer.homes[0],'second') in reader.live_session_cache
+        writer.publish(partial,'second',7)
+        writer.live_server.close();writer.live_server=None;writer.live=None
+        writer.publish(partial,'third',1)
+        recovered=reader.read(shared=True)
+        assert len(recovered['sessions'])==2 and recovered['sessions'][1]['history'] is histories['second']
+        assert not reader.live_session_cache
+        writer.start_live();writer.publish({**partial,'index':value['index']},'third',2)
+        final=reader.read(shared=True)
+        assert [s['id'] for s in final['sessions']]==['session']
+        assert not reader.pending_checkpoint and len(reader.live_session_cache)==1
+    finally:reader.close();writer.close()
+
+
 def test_stale_client_read_preserves_source_errors_and_shared_freshness(tmp_path):
     writer=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite');writer.start_live()
     client=CollectionClient(writer.homes,writer.path)

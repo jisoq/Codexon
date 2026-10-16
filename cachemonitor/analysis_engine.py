@@ -146,6 +146,8 @@ class AnalysisEngine:
 
     def update_ownership(self,sessions):
         sources={(s['home'],s['id']):s for s in sessions}
+        pending={key for key,source in sources.items() if source.get('_collection_pending')}
+        priority=(lambda key:(key in pending,key)) if pending else None
         affected=set();touched=set()
         for key in self.ownership_sources.keys()-sources.keys():
             _,identities=self.ownership_sources.pop(key)
@@ -155,6 +157,7 @@ class AnalysisEngine:
         for key,source in sources.items():
             token=source.get('usage_revision')
             if token is None:token=row_signatures(source['history'])
+            token=(token,bool(source.get('_collection_pending')))
             old=self.ownership_sources.get(key)
             if old is not None and old[0]==token:continue
             identities={call_identity(*key,row.get('key')) for row in source['history']}
@@ -171,7 +174,7 @@ class AnalysisEngine:
         for key in affected:
             rows=sources[key]['history']
             positions=tuple(i for i,row in enumerate(rows)
-                if min(self.ownership_candidates[call_identity(*key,row.get('key'))])==key)
+                if min(self.ownership_candidates[call_identity(*key,row.get('key'))],key=priority)==key)
             self.owned_positions[key]=None if len(positions)==len(rows) else positions
             self.ownership_versions[key]=self.ownership_versions.get(key,0)+1
         # Equal revisions can arrive through independently decoded recovery and
@@ -187,7 +190,7 @@ class AnalysisEngine:
         # callers retain the full fingerprint path.
         fast=tuple(((s['home'],s['id']),s.get('usage_revision'),
                     tuple(s.get(k) for k in ('title','cwd','project','project_name','source','archived','collection_complete','pending','parent_thread_id','agent_path','agent_nickname','spawn_depth')),
-                    request_signature(s))
+                    request_signature(s),bool(s.get('_collection_pending')))
                    for s in sessions) if all(s.get('usage_revision') is not None for s in sessions) else None
         if fast is not None and fast==getattr(self,'_ingest_key',None) and price_signature==self.pricing_signature:
             for s in sessions:_adopt_source(previous_sessions[(s['home'],s['id'])],s)

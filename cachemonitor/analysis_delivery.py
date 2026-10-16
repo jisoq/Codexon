@@ -62,7 +62,7 @@ class SnapshotPublisher:
             if key not in engine.sessions:continue
             state=engine.sessions[key]
             light={k:v for k,v in source.items() if k not in ('history','requests','groups','totals','cache_misses',
-                'turn_records','turn_states','transports','unmatched_transports','coverage_gaps')}
+                'turn_records','turn_states','transports','unmatched_transports','coverage_gaps','_collection_pending')}
             # Sliding-window countdown is derived from activity, not repeatedly shipped.
             light.pop('remaining',None)
             light['cache_misses']={k:v for k,v in state['prepared'].get('cache_misses',{}).items() if k!='events'}

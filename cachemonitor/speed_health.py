@@ -243,7 +243,9 @@ class SpeedHealth:
         return self.results
 
     def collect(self, engine):
-        signature = tuple((key, state.get('content_revision',state['revision'])) for key, state in engine.sessions.items())
+        # Display/catalog order does not change the classifier's time-ordered
+        # evidence. Partial source restoration can reorder unchanged owners.
+        signature = frozenset((key, state.get('content_revision',state['revision'])) for key, state in engine.sessions.items())
         self.metrics = dict(scanned_rows=0, processed_rows=0, replayed_scopes=0, appended_rows=0,
             **{key: self.metrics[key] for key in ('retained_rows', 'baseline_rows', 'live_states', 'capacity_fallback')
                if key in self.metrics})
