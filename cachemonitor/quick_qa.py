@@ -20,17 +20,35 @@ def scene_view(host,node):
 
 def control(host,node):
     import time
+    from shiboken6 import isValid
     incubation=getattr(host,'_page_incubation',None)
     deadline=time.monotonic()+10
+    view=None
     while True:
+        item=None;parents_ready=False
         try:
-            view=scene_view(host,node)
+            # Keep the discovered view while Qt creates its control. Rewalking
+            # a partial scene on every turn competes with deferred creation.
+            if view is None or not isValid(view) or view.property('node') is not node:
+                view=None
+                view=scene_view(host,node)
             item=view.property('item')
-            if item is not None and (incubation is None or not incubation.incubatingObjectCount()):return item
-        except AssertionError:
-            pass
+            parents_ready=True;parent=view.parentItem()
+            while parent is not None:
+                meta=parent.metaObject()
+                if meta.indexOfProperty('loadRequested')>=0 and meta.indexOfProperty('ready')>=0 and not parent.property('ready'):
+                    parents_ready=False;break
+                parent=parent.parentItem()
+            # Other hidden pages may still be loading. Only this control's
+            # enclosing loaders must be ready, including an outer page loader.
+            if item is not None and isValid(item) and parents_ready:return item
+        except (AssertionError,RuntimeError):
+            view=None
         if time.monotonic()>=deadline:
-            raise AssertionError(f'Control did not finish rendering: {node.objectName()} ({node.kind}); QML errors: {host.qml_errors}')
+            pending=incubation.incubatingObjectCount() if incubation else 0
+            raise AssertionError(f'Control did not finish rendering: {node.objectName()} ({node.kind}); '
+                                 f'view={view is not None}, item={item is not None}, parents_ready={parents_ready}, incubating={pending}; '
+                                 f'QML errors: {host.qml_errors}')
         QTest.qWait(10)
 
 
