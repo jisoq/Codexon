@@ -14,6 +14,7 @@ import time
 import traceback
 
 from .analysis_engine import retained_bytes
+from .analysis_delivery import ANALYSIS_IDLE_WAIT_SECONDS
 from .analysis_query_actor import QueryActor
 from .prepared_ingest import ModeEvidenceUnavailable,PreparedCohort, read_catalog
 from .prepared_ledger import PreparedLedger
@@ -298,7 +299,7 @@ class PreparedWriter:
                             notification=collector.notification_connection(catalog['publication'])
                             age=time.time()-snapshot['ts']
                             delay=.1 if snapshot['index'].get('loading') else (
-                                3 if notification is None or age>30 else min(10,max(.01,30-age+.01)))
+                                3 if notification is None or age>30 else min(ANALYSIS_IDLE_WAIT_SECONDS,max(.01,30-age+.01)))
                             next_poll=time.monotonic()+delay
                     except CollectionCatalogUnavailable:
                         # AppServices owns collector startup and restart. The

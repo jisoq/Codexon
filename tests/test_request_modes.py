@@ -116,6 +116,84 @@ def test_enrichment_requires_same_home_session_and_turn_and_persists(tmp_path,mo
     ledger.close()
 
 
+def test_sparse_mode_scan_bounds_source_work_and_resumes_both_directions(tmp_path,monkeypatch):
+    from pathlib import Path
+    monkeypatch.setattr('cachemonitor.quota_cycles.MODE_SCAN_ROWS',500)
+    homes=[str(tmp_path/name) for name in ('first','second')]
+    for home,mode,count in zip(homes,('priority','default'),(1100,1)):
+        directory=Path(home);directory.mkdir()
+        with sqlite3.connect(directory/'logs_2.sqlite') as source:
+            source.execute('create table logs(id integer primary key,thread_id text,target text,feedback_log_body text)')
+            source.executemany('insert into logs values(?,?,?,?)',
+                ((i,'s','codex_core::session::handlers' if i==1 else 'unrelated',structured_body(mode))
+                 for i in range(1,count+1)))
+    connect=sqlite3.connect;steps=[0]
+    def count_steps():
+        steps[0]+=100
+        return 0
+    def measured_connect(database,*args,**kwargs):
+        connection=connect(database,*args,**kwargs)
+        if 'logs_2.sqlite' in str(database):connection.set_progress_handler(count_steps,100)
+        return connection
+    monkeypatch.setattr(sqlite3,'connect',measured_connect)
+    path=tmp_path/'ledger.sqlite';ledger=QuotaLedger(path)
+    try:
+        ledger.scan_modes(homes)
+        initial_steps=steps[0]
+        # The old evidence lies beyond this cycle's two 500-source-row pages.
+        assert (homes[0],'s',TURN) not in ledger.modes
+        assert ledger.modes[(homes[1],'s',TURN)]=='Standard'
+        assert ledger.mode_offsets[homes[0]]==1100
+        assert ledger.mode_backfill[homes[0]]==101
+    finally:ledger.close()
+    ledger=QuotaLedger(path)
+    try:
+        ledger.scan_modes(homes)
+        assert [ledger.modes[(home,'s',TURN)] for home in homes]==['Fast','Standard']
+        with connect(Path(homes[0])/'logs_2.sqlite') as source:
+            source.executemany('insert into logs values(?,?,?,?)',
+                ((i,'s','unrelated',structured_body('default')) for i in range(1101,1104)))
+        ledger.scan_modes(homes)
+        assert ledger.mode_offsets[homes[0]]==1103
+        assert ledger.mode_backfill[homes[0]]==0
+    finally:ledger.close()
+    ledger=QuotaLedger(path)
+    try:
+        steps[0]=0;ledger.scan_modes(homes)
+        assert steps[0]*10<initial_steps
+        assert ledger.mode_offsets[homes[0]]==1103
+        assert [ledger.modes[(home,'s',TURN)] for home in homes]==['Fast','Standard']
+    finally:ledger.close()
+
+
+def test_mode_scan_body_budget_does_not_skip_forward_or_backfilled_evidence(tmp_path,monkeypatch):
+    monkeypatch.setattr('cachemonitor.quota_cycles.MODE_SCAN_ROWS',20)
+    monkeypatch.setattr('cachemonitor.quota_cycles.MODE_SCAN_MATCHES',2)
+    home=str(tmp_path);source=sqlite3.connect(tmp_path/'logs_2.sqlite')
+    source.execute('create table logs(id integer primary key,thread_id text,target text,feedback_log_body text)')
+    def append(start,end):
+        source.executemany('insert into logs values(?,?,?,?)',
+            ((i,'s','codex_core::session::handlers',structured_body().replace(TURN,f'turn-{i:020}'))
+             for i in range(start,end+1)))
+        source.commit()
+    ledger=QuotaLedger(tmp_path/'ledger.sqlite')
+    def identifiers():
+        return [row[0] for row in ledger.db.execute('select id from mode_events order by id')]
+    try:
+        append(1,9);ledger.scan_modes([home])
+        assert identifiers()==[6,7,8,9]
+        assert ledger.mode_backfill[home]==6
+        for _ in range(3):ledger.scan_modes([home])
+        assert identifiers()==list(range(1,10))
+        append(10,14);ledger.scan_modes([home])
+        assert identifiers()==list(range(1,12))
+        assert ledger.mode_offsets[home]==11
+        for _ in range(2):ledger.scan_modes([home])
+        assert identifiers()==list(range(1,15))
+        assert ledger.mode_offsets[home]==14
+    finally:ledger.close();source.close()
+
+
 def test_mode_enrichment_reuses_unchanged_rows_and_replays_corrections(tmp_path):
     home=str(tmp_path/'home')
     raw=[{'turn':'same','service_tier':'Standard'},

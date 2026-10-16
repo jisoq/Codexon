@@ -2456,7 +2456,7 @@
   "업데이트 오류 발생": "Update error",
   "현재 오류": "Current errors",
   "수집 상태 점검: 갱신 지연": "Collection check: update delayed",
-  "분석 결과 수신 지연: {seconds}초 (기준 10초)": "Analysis delivery delayed: {seconds}s (limit: 10s)",
+  "분석 결과 수신 지연: {seconds}초 (기준 {limit}초)": "Analysis delivery delayed: {seconds}s (limit: {limit}s)",
   "수집 결과에 오류 {count}건 / 이전 값 표시": "Collection result: {count} errors / showing prior values",
   "수집 상태 점검: 수집 결과 없음": "Collection check: no result available",
   "수집 상태 점검: 수집기 식별 대기": "Collection check: awaiting collector identity",

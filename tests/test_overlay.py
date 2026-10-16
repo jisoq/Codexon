@@ -75,13 +75,13 @@ def test_overlay_accepts_inflight_detail_only_when_selected_dependencies_are_unc
     assert controller._overlay_detail['latest']['output']==100
 
 
-def test_overlay_banner_identifies_each_trigger_without_changing_stale_threshold(monkeypatch):
+def test_overlay_banner_allows_idle_delivery_grace_and_identifies_failures(monkeypatch):
     from types import SimpleNamespace
     from cachemonitor.overlay_view import OverlayContent
     monkeypatch.setattr('cachemonitor.overlay.time.monotonic',lambda:100.)
     controller=SimpleNamespace(target_state={'selection':SimpleNamespace(thread_id=A,host='local')},
-        session_lookup={A:[dict(id=A,calls=2)]},collection_issue='',collection_fault={},errors=[],loading=False,
-        snapshot_at=89.,snapshot_wall_time=1000.,refresh=lambda:None)
+        session_lookup={A:[dict(id=A,calls=2,request={'state':'완료'})]},collection_issue='',collection_fault={},errors=[],loading=False,
+        snapshot_at=84.,snapshot_wall_time=1000.,refresh=lambda:None)
     controller.prepared_content=OverlayController.prepared_content.__get__(controller)
     labels=[]
     for issue,errors,reason in (('',[],'analysis_delay'),('', ['read failure'],'source_error'),
@@ -91,10 +91,20 @@ def test_overlay_banner_identifies_each_trigger_without_changing_stale_threshold
         assert data['calls']==2 and data['_collection']['reason']==reason
         labels.append(OverlayContent.collection_age(data,note))
     assert len(set(labels))==4
-    assert '11' in labels[0]
-    controller.collection_issue='';controller.errors=[];controller.snapshot_at=90.
+    assert '16' in labels[0] and '15' in labels[0]
+    controller.collection_issue='';controller.errors=[]
+    for age in (10.01,15.):
+        controller.snapshot_at=100.-age
+        data,note=OverlayController.content(controller)
+        assert note=='' and not OverlayContent.collection_age(data,note)
+        assert not data['_collection']['delayed']
+    controller.snapshot_at=84.99
     data,note=OverlayController.content(controller)
-    assert note=='' and not OverlayContent.collection_age(data,note)
+    assert note=='수집 지연' and data['_collection']['reason']=='analysis_delay'
+    assert data['_collection']['delayed']
+    OverlayController.receive_snapshot(controller,dict(overlay_sessions=[dict(id=A,calls=2)],errors=[],ts=1000.))
+    data,note=OverlayController.content(controller)
+    assert note=='' and not data['_collection']['delayed']
     OverlayController.receive_snapshot(controller,dict(overlay_sessions=[dict(id=A,calls=2)],
         errors=[],collection_stale=True,ts=1001.))
     data,note=OverlayController.content(controller)
@@ -384,7 +394,7 @@ def test_controller_clears_old_numbers_on_unknown_remote_or_duplicate_home(tmp_p
         controller.receive_snapshot({'overlay_sessions': summaries+[dict(summaries[0], home='other')]})
         assert controller.content()[0] is None
         controller.receive_snapshot({'overlay_sessions': summaries})
-        controller.snapshot_at -= 11
+        controller.snapshot_at -= 16
         assert controller.content()[1] == '수집 지연'
         controller.set_enabled(False)
         assert not controller.widget.isVisible()

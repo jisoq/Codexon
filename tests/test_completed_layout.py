@@ -50,8 +50,8 @@ def test_detail_last_wrapped_line_is_visible_and_selectable(completed_dashboard,
     window = completed_dashboard
     window.resize(width, height)
     window.open_record({'home': 'fixture', 'sid': 'layout-0', 'turn': 'turn-0', 'key': 'call-0'})
-    QTest.qWait(100)
     assert window.detail_scroll.isVisible()
+    _settled_detail_viewport(window)
     long_text = '\n'.join(
         f'{index}: C:/Users/User/Documents/engineering/long-project-name/실제프로젝트/자료.txt 실제 기록'
         for index in range(16)) + '\n마지막 줄까지 선택 가능'
@@ -62,7 +62,7 @@ def test_detail_last_wrapped_line_is_visible_and_selectable(completed_dashboard,
         # Detail disclosures must be expanded before testing their selectable text.
         if isinstance(group, Details):group.toggle.setChecked(True)
         text.setText(long_text)
-    QTest.qWait(100)
+    _settled_detail_viewport(window)
     for group, text in sections:
         item = control(window, text)
         editor = next(child for child in walk(item)
@@ -74,12 +74,29 @@ def test_detail_last_wrapped_line_is_visible_and_selectable(completed_dashboard,
         editors.append(editor)
     for editor in editors:
         QMetaObject.invokeMethod(editor, 'deselect')
-    scroll = control(window, window.detail_scroll)
-    viewport = scroll.property('contentItem')
+    viewport = _settled_detail_viewport(window)
     window.detail_scroll.verticalPosition.setValue(viewport.property('contentHeight') - viewport.height())
-    QTest.qWait(60)
+    _settled_detail_viewport(window)
     last = editors[-1]
     bottom = last.mapToItem(viewport, QPointF(0, last.property('contentHeight'))).y()
     assert 0 < bottom <= viewport.height() + 1
     assert window.grab().save(str(tmp_path / f'full-detail-{width}.png'))
     assert not window.qml_errors
+
+
+def _settled_detail_viewport(window):
+    # Lazy controls exist before their enclosing layouts finish polishing.
+    # Measure the scroll range only after consecutive rendered frames agree.
+    scroll = control(window, window.detail_scroll)
+    viewport = scroll.property('contentItem')
+    deadline = time.monotonic() + 3
+    previous = None
+    while time.monotonic() < deadline:
+        QTest.qWait(10)
+        window.quick.grabFramebuffer()
+        geometry = (viewport.width(), viewport.height(), viewport.property('contentHeight'),
+                    viewport.property('contentY'))
+        if geometry == previous and geometry[0] > 0 and geometry[1] > 0:
+            return viewport
+        previous = geometry
+    raise AssertionError(f'Detail scroll layout did not settle: {previous}')

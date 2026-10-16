@@ -14,6 +14,7 @@ from .token_colors import TOKEN_COLORS, ui_palette, readable
 from .i18n import tr, Verbatim
 from .charts import value_text
 from .overlay_monitor import WIDTH, MARGIN, SECTION_WIDTH, TITLE_WIDTH, INLINE_CLOSE_X
+from .analysis_delivery import ANALYSIS_DELAY_SECONDS
 
 LABELS = dict(cached='캐시 읽기', uncached='일반 입력', written='캐시 쓰기', reasoning='추론', output='추론 외', unknown='미분류')
 ORDER = tuple(LABELS)
@@ -303,7 +304,8 @@ class OverlayContent(Node):
         from .i18n import formatted
         collection=data.get('_collection',{});reason=collection.get('reason')
         if reason=='analysis_delay':
-            return formatted('분석 결과 수신 지연: {seconds}초 (기준 10초)',seconds=int(collection.get('received_age',0)))
+            return formatted('분석 결과 수신 지연: {seconds}초 (기준 {limit}초)',
+                             seconds=int(collection.get('received_age',0)),limit=ANALYSIS_DELAY_SECONDS)
         if reason=='source_error':
             return formatted('수집 결과에 오류 {count}건 / 이전 값 표시',count=collection.get('source_error_count',0))
         if reason=='service_delay':

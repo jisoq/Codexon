@@ -22,6 +22,8 @@ from .workload import INTERNAL_REVIEW_MODEL
 
 
 TOKEN_FIELDS = ('input', 'cached', 'written', 'output', 'reasoning')
+MODE_SCAN_ROWS = 10_000
+MODE_SCAN_MATCHES = 500
 
 
 def _stored_cost(row):
@@ -1354,6 +1356,22 @@ class QuotaLedger:
     def scan_modes(self, homes):
         from contextlib import closing
         from .request_modes import request_mode_observation
+        # Bound source work separately from retained bodies so sparse handler
+        # logs can advance without loading unrelated text or skipping evidence.
+        columns=("select id,case when target='codex_core::session::handlers' then thread_id end,"
+                 "case when target='codex_core::session::handlers' then feedback_log_body end from logs")
+        def scan(source,condition='',parameters=(),reverse=False):
+            rows=[];first=last=None
+            order=' desc' if reverse else ''
+            with closing(source.execute(columns+condition+' order by id'+order+' limit ?',
+                                        (*parameters,MODE_SCAN_ROWS))) as cursor:
+                for row in cursor:
+                    if first is None:first=row[0]
+                    last=row[0]
+                    if row[1]:
+                        rows.append(row)
+                        if len(rows)>=MODE_SCAN_MATCHES:break
+            return rows,first,last
         for home in homes:
             path=Path(home)/'logs_2.sqlite'
             if not path.exists():continue
@@ -1363,20 +1381,22 @@ class QuotaLedger:
                     if maximum<self.mode_offsets.get(home,0):
                         self.mode_offsets.pop(home,None);self.mode_backfill.pop(home,None)
                     if home not in self.mode_offsets:
-                        rows=source.execute("select id,thread_id,feedback_log_body from logs where target='codex_core::session::handlers' order by id desc limit 500").fetchall()[::-1]
-                        self.mode_backfill[home]=rows[0][0] if rows else 0
+                        rows,first,last=scan(source,reverse=True)
+                        rows.reverse()
+                        latest=first or 0
+                        self.mode_backfill[home]=last or 0
                     else:
-                        rows=source.execute("select id,thread_id,feedback_log_body from logs where id>? and target='codex_core::session::handlers' order by id limit 500",(self.mode_offsets[home],)).fetchall()
-                    latest=max([r[0] for r in rows]+[self.mode_offsets.get(home,0)])
+                        rows,_,last=scan(source,' where id>?',(self.mode_offsets[home],))
+                        latest=last if last is not None else self.mode_offsets[home]
                     before=self.mode_backfill.get(home,0)
                     if before:
-                        older=source.execute("select id,thread_id,feedback_log_body from logs where id<? and target='codex_core::session::handlers' order by id desc limit 500",(before,)).fetchall()
-                        self.mode_backfill[home]=older[-1][0] if older else 0
+                        older,_,last=scan(source,' where id<?',(before,),reverse=True)
+                        self.mode_backfill[home]=last or 0
                         rows=older[::-1]+rows
                 changed=False
                 for identifier,sid,body in rows:
                     parsed=request_mode_observation(body)
-                    if parsed and sid:
+                    if parsed:
                         data=json.dumps(parsed,sort_keys=True)
                         old=self.db.execute('select data from mode_events where home=? and id=? and sid=? and turn=?',
                                             (home,identifier,sid,parsed['turn'])).fetchone()

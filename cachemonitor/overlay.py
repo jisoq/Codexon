@@ -9,6 +9,7 @@ from .overlay_view import OverlayContent, SessionOverlay, TOKEN_COLORS
 from .overlay_monitor import WIDTH, ACTIONS_X, HEADER_X, HEADER_WIDTH, POPUP_X, INLINE_HEADER_WIDTH
 from .overlay_tracking import overlay_geometry, anchor_for_position
 from .overlay_appearance import CodexAppearance, default_appearance
+from .analysis_delivery import ANALYSIS_DELAY_SECONDS
 
 
 def system_dark():
@@ -589,12 +590,13 @@ class OverlayController(QObject):
         if not issue and not self.errors and getattr(self,'collection_stale',False):
             issue='수집 결과 갱신 지연'
         received_age=max(0,time.monotonic()-self.snapshot_at)
+        delayed=received_age>ANALYSIS_DELAY_SECONDS
         reason=('service_delay' if issue=='수집 결과 갱신 지연' else 'service_error' if issue else
-                'source_error' if self.errors else 'analysis_delay' if received_age>10 else '')
+                'source_error' if self.errors else 'analysis_delay' if delayed else '')
         note = ('수집 시작 중' if issue == '수집 시작 중' else
                 '수집 지연' if issue == '수집 결과 갱신 지연' else
                 '수집 오류' if issue or self.errors else
-                '수집 지연' if time.monotonic()-self.snapshot_at > 10 else '')
+                '수집 지연' if delayed else '')
         if len(matches) != 1:
             return None, note or ('기록 확인 중' if self.loading else '호출 기록 없음' if not matches else '현재 세션 식별 불가')
         loading = self.loading and matches[0].get('collection_complete') is not True
@@ -602,7 +604,7 @@ class OverlayController(QObject):
         data={**matches[0], '_collection': {
             'last_confirmed_at': self.snapshot_wall_time,
             'errors': [*self.errors, *([issue] if issue else [])], 'loading': loading,
-            'delayed': received_age > 10, 'reason':reason,'received_age':received_age,
+            'delayed': delayed, 'reason':reason,'received_age':received_age,
             'service_issue':issue,'service_fault':{**getattr(self,'collection_fault',{}),
                 **({'snapshot_stale':True} if getattr(self,'collection_stale',False) else {})},
             'source_error_count':len(self.errors),

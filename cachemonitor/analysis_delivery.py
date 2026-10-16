@@ -5,6 +5,12 @@ from .analytics import observed_choices, project_choices, effort_key
 
 MODEL_KEYS=('key','ts','model_observation_ts','model_alert_confirmed','requested_model','response_model')
 
+# Allow the writer's quiet wait plus collection, analysis and IPC delivery time.
+# These bounds do not introduce a separate heartbeat or shorten idle polling.
+ANALYSIS_IDLE_WAIT_SECONDS=10
+ANALYSIS_DELIVERY_GRACE_SECONDS=5
+ANALYSIS_DELAY_SECONDS=ANALYSIS_IDLE_WAIT_SECONDS+ANALYSIS_DELIVERY_GRACE_SECONDS
+
 
 class SnapshotPublisher:
     CHOICE_CACHE_BYTES=4*1024*1024
