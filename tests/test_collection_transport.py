@@ -134,12 +134,12 @@ def test_analyzer_publication_wakes_before_timer_and_freeze_reclaims_waiter(tmp_
         value=snapshot(writer,time.time());session=source();session['home']=writer.homes[0]
         value['sessions']=[session];writer.publish(value,'epoch',1)
         process.start();child.close()
-        assert parent.poll(15)
-        first=parent.recv();assert first['kind']=='snapshot'
-        if not first['value'].get('ledger_status_known'):
-            assert parent.poll(15)
-            first=parent.recv()
-            assert first['kind']=='snapshot' and first['value']['ledger_status_known']
+        deadline=time.monotonic()+15
+        while True:
+            remaining=deadline-time.monotonic()
+            assert remaining>0 and parent.poll(remaining)
+            first=parent.recv();assert first['kind']=='snapshot',first
+            if first['value'].get('ledger_status_known'):break
         wait_until(lambda:bool(writer.live.waiters))
         changed=copy.deepcopy(value);changed['ts']+=.25
         started=time.perf_counter();writer.publish(changed,'epoch',2)
@@ -161,60 +161,63 @@ def test_analyzer_publication_wakes_before_timer_and_freeze_reclaims_waiter(tmp_
         parent.close();child.close();writer.close()
 
 
-@pytest.mark.parametrize('trusted',[False,True])
-def test_quiet_notifications_preserve_staleness_and_ledger_retry_deadlines(monkeypatch,tmp_path,trusted):
+def test_quiet_notifications_preserve_staleness_and_ledger_retry_deadlines(monkeypatch,tmp_path):
     from types import SimpleNamespace
-    from cachemonitor import analysis_worker
-    from test_overlay import source
-    clock=[100.];reads=[];opens=[];sent=[];derived=[];modes=[];synced=[];acknowledged=[]
-    session=source()
-    for owner,name in ((analysis_worker.AnalysisEngine,'ingest'),
-                       (analysis_worker.OverlaySummaries,'collect'),(analysis_worker.SnapshotPublisher,'publish')):
-        original=getattr(owner,name)
-        def counted(*args,_original=original,_name=name,**kwargs):
-            derived.append(_name);return _original(*args,**kwargs)
-        monkeypatch.setattr(owner,name,counted)
-    monkeypatch.setattr(analysis_worker,'time',SimpleNamespace(monotonic=lambda:clock[0],time=lambda:clock[0]))
-    notification=object()
-    def wait(connections,timeout):clock[0]+=timeout;return []
-    monkeypatch.setattr(analysis_worker,'wait',wait)
-    class Collector:
-        path=tmp_path/'index.sqlite'
-        analysis_identity=('catalog',1) if trusted else None
-        def __init__(self,*args):
-            self.channel=SimpleNamespace(acknowledge_activity=lambda snapshot:acknowledged.append(snapshot['activity_cursor']))
-        def poll(self):
-            reads.append(clock[0])
-            return dict(ts=100.,sessions=[dict(session,remaining=1000-clock[0])],homes=[],errors=[],
-                unassigned=[],index={'loading':False},activity_cursor=('source',1))
-        def notification_connection(self):return notification
-        def close(self):pass
-    class Ledger:
-        def __init__(self,*args):
+    from cachemonitor import prepared_runtime
+    from test_overlay_collection_resilience import PreparedAnalysis
+    clock=[100.];target=[100.];reads=[];opens=[]
+    original_wait=prepared_runtime.wait
+    original_poll=prepared_runtime.CollectionClient.poll_catalog
+    # Advance only the writer's scheduling clock. All pipes, catalogs, and SQL
+    # operations remain real, and the dispatcher retains its blocking wait.
+    def wait(connections,timeout=None):
+        if timeout is None:return original_wait(connections)
+        ready=original_wait(connections,0)
+        if ready:return ready
+        elapsed=min(timeout,max(0,target[0]-clock[0]))
+        if elapsed>0:
+            clock[0]+=elapsed;return []
+        return original_wait(connections,.01)
+    def poll(client,now=None,**kwargs):
+        reads.append(clock[0])
+        return original_poll(client,now=clock[0],**kwargs)
+    monkeypatch.setattr(prepared_runtime,'time',SimpleNamespace(monotonic=lambda:clock[0],time=lambda:clock[0]))
+    monkeypatch.setattr(prepared_runtime,'wait',wait)
+    monkeypatch.setattr(prepared_runtime.CollectionClient,'poll_catalog',poll)
+    class Ledger(prepared_runtime.QuotaLedger):
+        def __init__(self,*args,**kwargs):
             opens.append(clock[0])
             if len(opens)==1:raise sqlite3.OperationalError('locked')
-            self.identity=object()
-        def enrich_modes(self,*args):modes.append(clock[0]);return self.identity
-        def sync(self,engine,snapshot):
-            assert snapshot['sessions'][0]['remaining']==1000-clock[0]
-            synced.append(clock[0])
-        def import_observations(self,*args):pass
-        def close(self):pass
-    class Connection:
-        def poll(self,*args):return len(reads)>=5
-        def recv(self):return {'kind':'stop'}
-        def send(self,value):sent.append(value)
-        def close(self):pass
-    monkeypatch.setattr(analysis_worker,'CollectionClient',Collector)
-    monkeypatch.setattr(analysis_worker,'QuotaLedger',Ledger)
-    analysis_worker.process_main(Connection(),[],tmp_path/'index.sqlite')
-    assert opens==[100.,105.]
-    assert 130.<reads[-1]<130.1
-    assert len(sent)==5 and all(value['kind']=='snapshot' for value in sent)
-    expected=2 if trusted else 5
-    assert {name:derived.count(name) for name in ('ingest','collect','publish')}==dict.fromkeys(('ingest','collect','publish'),expected)
-    assert modes==synced==reads[1:] and acknowledged==[('source',1)]*4
-    assert all(not message['value']['model_candidates'] and not message['value']['cache_candidates'] for message in sent[2:])
+            super().__init__(*args,**kwargs)
+    monkeypatch.setattr(prepared_runtime,'QuotaLedger',Ledger)
+    with PreparedAnalysis(tmp_path,at=100.) as worker:
+        worker.wait_snapshot(lambda value:value.get('ledger_error'))
+        target[0]=105.
+        recovered=worker.wait_snapshot(lambda value:value.get('ledger_status_known') and not value.get('ledger_error'))
+        assert opens==[100.,105.]
+        token=recovered['prepared_token']
+        target[0]=130.02
+        stale=worker.wait_snapshot(lambda value:value.get('collection_stale'))
+        assert any(130.<at<130.1 for at in reads)
+        assert stale['ts']==100. and stale['prepared_token']==token
+        assert not stale['usage_collection_complete'] and not stale['index']['usage_complete']
+        assert not stale['errors']
+        worker.assert_calls_and_detail()
+
+        fresh_at=clock[0]
+        worker.publish(at=fresh_at,errors=['retained source error'])
+        fresh=worker.wait_snapshot(lambda value:value['ts']==fresh_at and not value.get('collection_stale'))
+        assert fresh['usage_collection_complete'] and fresh['prepared_token']==token
+        worker.channel.close()
+        target[0]=fresh_at+34
+        disconnected=worker.wait_snapshot(lambda value:value.get('collection_stale'))
+        assert disconnected['ts']==fresh_at and disconnected['errors']==['retained source error']
+        assert disconnected['prepared_token']==token and not disconnected['usage_collection_complete']
+        worker.assert_calls_and_detail()
+        query=dict(page=2,start=99,end=200,now=200,period='custom',include_whole_history=False)
+        worker.parent.send(dict(kind='query',id=2,query=query,logical='stale-source'))
+        result=worker.wait_for(lambda value:value.get('id')==2)
+        assert result['kind']=='result' and result['result']['prepared_token']==token
 
 
 def test_new_session_loading_does_not_reprocess_existing_call_history(tmp_path):
@@ -377,18 +380,23 @@ def test_trusted_collection_tokens_validate_only_changed_rows_and_preserve_order
     activity_tokens={(home,r['attempt']):1 for r in first['request_activity']}
     def tokens():return CollectionChanges(owner,dict(session_tokens),dict(activity_tokens))
     checked=[];fingerprint=usage_collection.publication_fingerprint
+    lineage_checked=[];lineage=usage_collection.owner_lineage
+    def lineage_count(value):
+        lineage_checked.append(value['id'])
+        return lineage(value)
     def count(value):
         if isinstance(value,dict) and ('history' in value or 'attempt' in value):checked.append(value)
         return fingerprint(value)
     monkeypatch.setattr(usage_collection,'publication_fingerprint',count)
+    monkeypatch.setattr(usage_collection,'owner_lineage',lineage_count)
     try:
         writer.publish(first,'epoch',1,changes=tokens());initial=reader.read(shared=True)
         first['sessions'][0]['groups']['today'][0]['tokens']=4
         assert reader.read()['sessions'][0]['groups']['today'][0]['tokens']==3
-        checked.clear()
+        checked.clear();lineage_checked.clear()
         idle={**first,'ts':103.}
         writer.publish(idle,'epoch',2,changes=tokens())
-        assert not checked and reader.read()==idle
+        assert not checked and not lineage_checked and reader.read()==idle
         changed={**idle,'ts':106.,'sessions':list(idle['sessions']),
                  'request_activity':list(reversed(idle['request_activity']))}
         changed['sessions'][0]=copy.deepcopy(changed['sessions'][0])
@@ -398,6 +406,7 @@ def test_trusted_collection_tokens_validate_only_changed_rows_and_preserve_order
         writer.publish(changed,'epoch',3,changes=tokens());received=reader.read(shared=True)
         assert received==changed
         assert len(checked)==2
+        assert lineage_checked==['session']
         assert received['sessions'][1]['history'] is initial['sessions'][1]['history']
         # Retire rows while a consumer misses an intermediate publication.
         removed={**changed,'ts':109.,'sessions':changed['sessions'][:1],
@@ -1143,3 +1152,216 @@ def test_pipe_capacity_rejects_extra_clients_and_recovers_after_disconnect(tmp_p
         for client in clients:client.close()
         server.close()
     assert not server.thread.is_alive() and not server.handlers
+
+
+def test_selected_owner_stream_preserves_records_and_pins_the_committed_body(tmp_path,monkeypatch):
+    from cachemonitor import usage_collection as collection, collection_stream
+    writer=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite');writer.start_live()
+    reader=CollectionClient(writer.homes,writer.path)
+    try:
+        value=snapshot(writer);source=value['sessions'][0];key=(source['home'],source['id'])
+        source['history']=[dict(key=str(n),output=n,ratio=.125,large=2**80) for n in range(40)]
+        source.update(title='한글 "quote" \\ suffix',turn_records={'request.with.dot':{'started_at':2.}},
+                      turn_states={'request.with.dot':'completed'},empty=[],unknown=float('nan'),
+                      positive=float('inf'),negative=float('-inf'))
+        writer.publish(value,'epoch',9);catalog=reader.poll_catalog(now=100,include_metadata=True)
+        with monkeypatch.context() as patch:
+            patch.setattr(collection,'SELECTED_BODY_BYTES',1)
+            with pytest.raises(collection.CollectionCatalogUnavailable,match='body_budget'):
+                reader.selected_owners([key],catalog=catalog)
+        patch=monkeypatch.context()
+        with patch as changes:
+            changes.setattr(collection_stream,'CHUNK_BYTES',31)
+            stream=reader.selected_owner_stream(key,catalog=catalog)
+            with stream:
+                records=stream.records();first=next(records)
+                changed=copy.deepcopy(value);changed['sessions'][0]['history'][0]['output']=99
+                writer.publish(changed,'epoch',10)
+                restored={}
+                def add(record):
+                    field,kind,ordinal,member,item=record
+                    if kind=='value':restored[field]=item
+                    elif kind=='start_map':restored[field]={}
+                    elif kind=='start_array':restored[field]=[]
+                    elif kind=='member':restored[field][member]=item
+                    elif kind=='item':
+                        assert len(restored[field])==ordinal
+                        restored[field].append(item)
+                add(first)
+                for record in records:add(record)
+                assert stream.verified and stream.proof['catalog_identity']==('epoch',9)
+            expected={field:item for field,item in source.items() if field not in collection.LiveCollection.volatile}
+            assert json.dumps(restored,ensure_ascii=False)==json.dumps(expected,ensure_ascii=False)
+            assert stream.closed and stream.db is None and stream.blob is None
+        stale=reader.selected_owner_stream(key,catalog=catalog)
+        with pytest.raises(collection.CollectionCatalogUnavailable,match='stale'):
+            with stale:list(stale.records())
+        assert stale.closed and stale.blob is None and not stale.verified
+        assert reader.channel.identity is None and not reader.channel.session_cache
+        assert reader.channel.pending_checkpoint is None and reader.channel.live_publication is None
+    finally:reader.close();writer.close()
+
+
+def test_selected_owner_stream_accepts_identical_body_after_header_commit_only(tmp_path,monkeypatch):
+    from cachemonitor import usage_collection as collection
+    writer=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite');writer.start_live()
+    reader=CollectionClient(writer.homes,writer.path)
+    try:
+        monkeypatch.setattr(collection,'CATALOG_PAGE_ROWS',1)
+        value=snapshot(writer);source=value['sessions'][0];key=(source['home'],source['id'])
+        value['sessions'].append(dict(source,id='second',history=[dict(key='two',output=4)]))
+        writer.publish(value,'epoch',1)
+        catalog=reader.poll_catalog(now=100,include_metadata=True)
+        assert catalog['cursor'] is not None and catalog['membership_complete']
+        checking=copy.deepcopy(value)
+        checking['index'].update(loading=True,usage_complete=False)
+        checking['usage_collection_complete']=False
+        for session in checking['sessions']:session['collection_complete']=False
+        writer.publish(checking,'epoch',2)
+        assert writer.live.current['catalog_identity']==('epoch',2)
+        # Membership pages still cannot mix committed catalogs.
+        with pytest.raises(collection.CollectionCatalogUnavailable,match='stale'):
+            reader.poll_catalog(now=100,cursor=catalog['cursor'])
+        stream=reader.selected_owner_stream(key,catalog=catalog)
+        with stream:records=list(stream.records())
+        assert stream.verified and stream.proof['catalog_identity']==('epoch',1)
+        assert stream.proof['source_digest']==catalog['owners'][key]['body_digest']
+        assert stream.state['collection_complete'] is True
+        assert [row[4] for row in records if row[0]=='history' and row[1]=='item']==source['history']
+        assert stream.closed and stream.db is None and stream.blob is None
+        writer.publish(checking,'replacement-epoch',3)
+        replaced=reader.selected_owner_stream(key,catalog=catalog)
+        with pytest.raises(collection.CollectionCatalogUnavailable,match='stale'):
+            with replaced:pytest.fail('replaced epoch was opened')
+        assert replaced.closed and not replaced.verified
+        assert reader.channel.identity is None and not reader.channel.session_cache
+    finally:reader.close();writer.close()
+
+
+def test_selected_owner_stream_requires_verified_eof_and_releases_its_read_lease(tmp_path):
+    from cachemonitor import usage_collection as collection
+    writer=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite');writer.start_live()
+    reader=CollectionClient(writer.homes,writer.path)
+    try:
+        value=snapshot(writer);writer.publish(value,'epoch',1)
+        catalog=reader.poll_catalog(now=100);key=(writer.homes[0],'session')
+        incomplete=reader.selected_owner_stream(key,catalog=catalog)
+        with pytest.raises(collection.CollectionCatalogUnavailable,match='incomplete_stream'):
+            with incomplete:next(incomplete.records())
+        assert incomplete.closed and incomplete.db is None and incomplete.proof is None
+        cancelled=threading.Event();stream=reader.selected_owner_stream(key,catalog=catalog,cancel=cancelled.is_set)
+        with pytest.raises(collection.CollectionCatalogUnavailable,match='cancelled'):
+            with stream:
+                rows=stream.records();next(rows);cancelled.set();next(rows)
+        assert stream.closed and stream.db is None and stream.proof is None
+        changed=copy.deepcopy(value['sessions'][0]);changed['history'][0]['output']=99
+        changed={field:item for field,item in changed.items() if field not in collection.LiveCollection.volatile}
+        with writer.db:
+            writer.db.execute('UPDATE sessions SET payload=? WHERE home=? AND sid=?',
+                (collection.zlib.compress(json.dumps(changed).encode()),*key))
+        corrupt=reader.selected_owner_stream(key,catalog=catalog)
+        with pytest.raises(collection.CollectionScopeError):
+            with corrupt:list(corrupt.records())
+        assert corrupt.closed and corrupt.db is None and corrupt.proof is None
+        assert reader.channel.pending_checkpoint is None and not reader.channel.session_cache
+    finally:reader.close();writer.close()
+
+
+def test_incomplete_preparation_reads_status_without_transferring_owner_membership(tmp_path,monkeypatch):
+    from cachemonitor import usage_collection as collection
+    from cachemonitor.prepared_ingest import read_catalog
+    writer=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite');writer.start_live()
+    reader=CollectionClient(writer.homes,writer.path)
+    exchanges=[]
+    original=writer.live.catalog_request
+    def request(current,value):
+        response,body=original(current,value)
+        exchanges.append((len(response.get('owners',())),len(json.dumps(response).encode()),len(body)))
+        return response,body
+    monkeypatch.setattr(writer.live,'catalog_request',request)
+    try:
+        sizes=[]
+        for count in (2,200):
+            value=snapshot(writer,time.time())
+            source=value['sessions'][0]
+            value['sessions']=[dict(source,id=str(index),collection_complete=False) for index in range(count)]
+            value['usage_collection_complete']=False
+            value['index'].update(loading=True,usage_complete=False)
+            writer.publish(value,'epoch',count)
+            exchanges.clear()
+            catalog=read_catalog(reader)
+            assert not catalog['membership_complete'] and catalog['owners']=={}
+            assert catalog['header']['index']['loading']
+            assert len(exchanges)==1 and exchanges[0][0]==exchanges[0][2]==0
+            sizes.append(exchanges[0][1])
+        assert abs(sizes[1]-sizes[0])<256
+
+        # An older server may ignore the optional flag. Its incomplete first
+        # page still cannot justify reading or withdrawing the remaining owners.
+        def older(current,value):
+            return request(current,{key:item for key,item in value.items() if key!='defer_incomplete'})
+        with monkeypatch.context() as patch:
+            patch.setattr(writer.live,'catalog_request',older)
+            patch.setattr(collection,'CATALOG_PAGE_ROWS',1)
+            exchanges.clear()
+            assert read_catalog(reader)['owners']=={}
+            assert len(exchanges)==1 and exchanges[0][0]==1
+
+        value['usage_collection_complete']=True
+        value['index'].update(loading=False,usage_complete=True)
+        for source in value['sessions']:source['collection_complete']=True
+        writer.publish(value,'epoch',201)
+        complete=read_catalog(reader)
+        assert complete['membership_complete'] and len(complete['owners'])==200
+        assert reader.channel.identity is None and not reader.channel.session_cache
+    finally:reader.close();writer.close()
+
+
+def test_lineage_catalog_preserves_parent_policy_without_full_metadata_scans(tmp_path,monkeypatch):
+    from cachemonitor import usage_collection as collection
+    from cachemonitor.prepared_ingest import read_catalog,mode_parent_index
+    from cachemonitor.request_modes import mode_parents
+    writer=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite');writer.start_live()
+    reader=CollectionClient(writer.homes,writer.path)
+    exchanges=[];original=writer.live.catalog_request
+    def request(current,value):
+        response,body=original(current,value)
+        exchanges.append((len(response.get('owners',())),len(json.dumps(response).encode()),len(body)))
+        return response,body
+    monkeypatch.setattr(writer.live,'catalog_request',request)
+    monkeypatch.setattr(reader,'selected_owner_stream',lambda *a,**kw:pytest.fail('catalog decoded an owner body'))
+    try:
+        for count in (2,5629):
+            value=snapshot(writer,time.time());source=value['sessions'][0]
+            value['sessions']=[dict(source,id='owner-'+str(index),title='display-'+('x'*1200)) for index in range(count)]
+            value['sessions'][1]['parent_thread_id']=None
+            if count>2:
+                value['sessions'][2]['parent_thread_id']='owner-0'
+                value['sessions'][3]['parent_thread_id']='owner-4'
+                value['sessions'][4]['parent_thread_id']='owner-3'
+            writer.publish(value,'lineage',count)
+            exchanges.clear();catalog=read_catalog(reader)
+            assert len(catalog['owners'])==count and catalog['membership_complete']
+            assert all('owner_metadata' not in entry for entry in catalog['owners'].values())
+            assert catalog['owners'][(writer.homes[0],'owner-0')]['owner_lineage']=={}
+            assert catalog['owners'][(writer.homes[0],'owner-1')]['owner_lineage']=={'parent_thread_id':None}
+            expected={key:(parent['home'],parent['id']) for key,parent in mode_parents(value['sessions']).items()}
+            assert mode_parent_index(catalog)==expected
+            assert all(size<=collection.CATALOG_PAGE_BYTES and body==0 for _,size,body in exchanges)
+            assert writer.live.current['owner_metadata_bytes']<=collection.CATALOG_METADATA_BYTES
+            if count>2:
+                assert any(entry['owner_metadata'] is None for entry in writer.live.current['entries'].values())
+            else:
+                # Older servers ignore the projection; their captured full
+                # metadata still supplies the same lineage without body reads.
+                def older(current,request_value):
+                    response,body=request(current,{key:item for key,item in request_value.items() if key!='metadata_kind'})
+                    response.pop('metadata_kind',None)
+                    return response,body
+                with monkeypatch.context() as patch:
+                    patch.setattr(writer.live,'catalog_request',older)
+                    old=read_catalog(reader)
+                assert {key:entry['owner_lineage'] for key,entry in old['owners'].items()}=={
+                    key:entry['owner_lineage'] for key,entry in catalog['owners'].items()}
+        assert reader.channel.identity is None and not reader.channel.session_cache
+    finally:reader.close();writer.close()

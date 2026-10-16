@@ -62,19 +62,20 @@ def integrity(proof, header, digest, fingerprint, evidence):
 class CollectionReplay:
     """Owned by one CollectorService, never opened by a screen query worker."""
     @classmethod
-    def open(cls, channel, index):
+    def open(cls, channel, index, *, restore_metadata=True):
         result = cls.__new__(cls)
         try:
-            result.__init__(channel, index)
+            result.__init__(channel, index, restore_metadata=restore_metadata)
             return result
         except (sqlite3.Error, ValueError):
             if getattr(result, 'db', None) is not None:
                 result.db.close()
             return None
 
-    def __init__(self, channel, index):
+    def __init__(self, channel, index, *, restore_metadata=True):
         self.channel = channel
         self.index = index
+        self.restore_metadata = restore_metadata
         self.db = sqlite3.connect(channel.companion('.collection-replay.sqlite'), timeout=.1)
         tables = {row[0] for row in self.db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         if tables - {'owners', 'responses'}:
@@ -199,6 +200,8 @@ class CollectionReplay:
         self.evidence_version = version
 
     def _restore(self, version, now):
+        from .collection_stream import encoded_owner_metadata
+        from .usage_collection import CollectionCatalogUnavailable, CollectionScopeError, owner_metadata
         reader = self.index.model_evidence
         proofs = {}
         if reader.db is not None:
@@ -253,9 +256,39 @@ class CollectionReplay:
                     continue
                 if state['header']['activity'] >= now - WINDOW:
                     continue
+                metadata = state['header'].get('_owner_metadata')
+                if self.restore_metadata and (not isinstance(metadata, dict) or metadata.get('home') != home or metadata.get('id') != sid
+                        or owner_metadata(metadata) != metadata):
+                    recovery = encoded_owner_metadata(saved[0], key, digest, max_plain_bytes=BODY_BUDGET)
+                    metadata = None
+                    self.pending.add(key)
+                    try:
+                        while True:
+                            try:next(recovery)
+                            except StopIteration as complete:
+                                metadata = complete.value
+                                break
+                            yield
+                            if self.reader_version() != version:return
+                            if key not in self.pending or proof != self.source_proof(key):break
+                    finally:
+                        recovery.close()
+                        self.pending.discard(key)
+                    if self.reader_version() != version:return
+                    if metadata is None or proof != self.source_proof(key):continue
+                    state['header']['_owner_metadata'] = metadata
+                    header = encoded(state)
+                    if len(header) > HEADER_LIMIT:continue
+                    if self.weight + len(saved[0]) + len(header) > BODY_BUDGET:break
+                    # Repair only the small proof header. The verified body,
+                    # event cursor, and response membership remain identical.
+                    if self.writable and (not self.wal_path.exists() or self.wal_path.stat().st_size <= INDEX_BUDGET):
+                        with self.db:
+                            self.db.execute('UPDATE owners SET header=?,integrity=? WHERE id=? AND integrity=?',
+                                (header, integrity(proof, header, digest, fingerprint, evidence), owner, checksum))
                 body = EncodedSession(state['header'], saved[0], fingerprint, digest)
                 self._retire(key, body, state['session'])
-            except (KeyError, TypeError, ValueError):
+            except (KeyError, TypeError, ValueError, CollectionCatalogUnavailable, CollectionScopeError):
                 continue
         self.index.cached_restore = deque(key for key in self.index.cached_restore if key not in self.index.loaded)
 
@@ -272,6 +305,9 @@ class CollectionReplay:
             if field != 'transports':
                 setattr(session, field, value)
         session.transports = deque(Transport(**value) for value in state['transports'])
+        # The replay header checksum binds session state to this exact body.
+        # Preserve absent versus explicit null without decoding its history.
+        body['_owner_lineage']={field:state[field] for field in ('parent_thread_id',) if field in state}
         session._replay_body = body
         session._replay_state = self.session_state(session)
         session._replay_metadata = self.index.metadata.get(key, {})
@@ -448,6 +484,9 @@ class CollectionReplay:
                 continue
             header = {field: view[field] for field in ('home', 'id', 'activity', 'usage_revision', 'request_revision',
                 'collection_complete', 'status', 'remaining', 'totals', 'groups') if field in view}
+            from .usage_collection import owner_metadata
+            metadata=owner_metadata(view)
+            if metadata is not None:header['_owner_metadata']=metadata
             state = self.session_state(session)
             packed = encoded(dict(format=FORMAT, header=header, session=state))
             if len(packed) > HEADER_LIMIT or self.weight + len(prepared[2]) + len(packed) > BODY_BUDGET:

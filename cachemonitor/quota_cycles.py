@@ -1480,7 +1480,7 @@ class QuotaLedger:
                 select ?,id from observations where id=? and not exists
                 (select 1 from window_observations where id=?)''',(weekly_ref,key,weekly_ref))
 
-    def sync(self, engine, snapshot):
+    def sync(self, engine, snapshot, *, applied_sources=None):
         """Use the existing deduplicated analytical rows; don't parse conversations twice."""
         from .quota_tracking_store import sync_activity
         pending={(s['home'],s['id']) for s in snapshot.get('sessions',()) if s.get('_collection_pending')}
@@ -1503,10 +1503,12 @@ class QuotaLedger:
                 snapshot={**snapshot,'homes':[home for home in snapshot['homes'] if home not in recovered_homes]}
         if not hasattr(self,'_tracking_sync_cache'):self._tracking_sync_cache={}
         sync_activity(self.db, snapshot,self._tracking_sync_cache)
+        certificates={}
         for key, session in {**engine.sessions,**getattr(engine,'internal_sessions',{})}.items():
             if key[0] in recovered_homes or key in pending:continue
-            revision = session.get('content_revision',session['revision'])
-            if self.revisions.get(key) == revision:
+            revision = (applied_sources[key] if applied_sources is not None else
+                        session.get('content_revision',session['revision']))
+            if applied_sources is None and self.revisions.get(key) == revision:
                 continue
             home, sid = key
             current_uids = set()
@@ -1565,6 +1567,7 @@ class QuotaLedger:
             old_uids = set(stored)
             self.db.executemany('delete from calls where home=? and sid=? and uid=?',
                                 [(home,sid,uid) for uid in old_uids-current_uids])
+            if applied_sources is not None:certificates[key]=revision
         for home in snapshot.get('homes', []):
             usage_errors=snapshot.get('usage_errors')
             if usage_errors is None:
@@ -1586,12 +1589,13 @@ class QuotaLedger:
                 for session in snapshot['sessions']:
                     if session['home'] != home:
                         continue
-                    history = session.get('history', [])
-                    times = [r['ts'] for r in history if r.get('ts') is not None]
                     if session.get('unclassified') and not session.get('coverage_available'):
+                        bounds=session.get('_coverage_bounds')
+                        if bounds is None:
+                            times = [r['ts'] for r in session.get('history',[]) if r.get('ts') is not None]
+                            bounds=(min(times) if times else None,max(times) if times else None)
                         self.db.execute('insert or replace into coverage_issues values(?,?,?,?,?)',
-                                        (home,session.get('id',''),min(times) if times else None,
-                                         max(times) if times else None,'참고: 누계 차액의 발생 경계 미확인'))
+                                        (home,session.get('id',''),*bounds,'참고: 누계 차액의 발생 경계 미확인'))
                     for gap in session.get('coverage_gaps', []):
                         self.db.execute('insert or replace into coverage_issues values(?,?,?,?,?)',
                                         (home, session.get('id',''),gap['start'],gap['end'],
@@ -1618,6 +1622,9 @@ class QuotaLedger:
         cursor=snapshot.get('activity_cursor')
         if cursor:self.db.execute('INSERT INTO collection_activity_cursor VALUES(1,?,?) ON CONFLICT(id) DO UPDATE SET '
             'source=excluded.source,revision=excluded.revision WHERE source IS NOT excluded.source OR revision IS NOT excluded.revision',tuple(cursor))
+        if applied_sources is not None:
+            from .quota_prepared_sync import save
+            save(self.db,certificates)
         self.db.commit()
         self._compact_cost_archive()
         self._payload_migration.step()

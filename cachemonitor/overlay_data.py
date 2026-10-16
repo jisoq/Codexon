@@ -212,10 +212,70 @@ def call_summary(row, ordinal, *, miss=False, degradation=False):
     return result
 
 
-def summarize_session(session,health=None,*,_partials=None):
+def _request_view(lifecycle,current,current_latest,gap):
+    return {**lifecycle,'calls':current['calls'],'cost':current['cost'] if current['calls'] else None,
+        'priced':current['priced'],'assumed':current['assumed'],'partial':current['partial'] or gap,
+        'model':current_latest.get('requested_model') or current_latest.get('model'),
+        'model_setting':not bool(current_latest.get('requested_model')),
+        'response_model':current_latest.get('response_model'),
+        'model_mismatch':bool(current_latest.get('model_alert_confirmed')),
+        'mode':observed_mode(current_latest),'effort':current_latest.get('effort'),
+        'usage_at':current_latest.get('ts')}
+
+
+def _summary_view(session,latest,recent,facts,*,request,misses,health,degradation=()):
+    """One presentation finalizer for full and incrementally reduced owner facts."""
+    latest_call=recent[-1] if recent else {}
+    call=facts['cost'];calls=facts['calls'];tokens=facts['tokens']
+    gap=bool(session.get('coverage_gaps'))
+    statuses=[]
+    if gap:
+        statuses.append({'text':'이전 기록 누락','severity':'muted'})
+    if not calls:
+        statuses.append({'text':'호출 기록 없음','severity':'muted'})
+    evidence=[]
+    if call['missing'] or gap:
+        evidence.append(f"산정 {call['n']:,} / {calls:,}호출")
+    assumed=facts['assumed']
+    if assumed:
+        evidence.append(f'Standard 가정 {assumed:,}호출')
+    if gap:
+        evidence.append('이전 기록 누락')
+    if tokens['cache_hit_partial']:
+        evidence.append('확인분 입력 기준')
+    return {'id': session['id'], 'home': session['home'],
+            'title': ' '.join((session.get('title') or '').split()),
+            'model': latest_call.get('model','미확인'), 'model_setting': latest_call.get('model_setting',False),
+            'response_model': latest_call.get('response_model'),
+            'model_mismatch': latest_call.get('model_mismatch',False),
+            'model_state': latest_call.get('model_state','미확인'),
+            'effort': latest_call.get('effort','미확인'), 'mode': latest_call.get('mode','미확인'),
+            'response_mode':latest_call.get('response_mode','미확인'),
+            'transport': latest_call.get('transport','미확인'), 'transport_state':latest_call.get('transport_state','미확인'),
+            'cache_rate': latest_call.get('cache_rate'), 'cache_misses':misses,
+            'cost': call['sum'] if calls else None, 'mean_cost': call['mean'],
+            'latest_cost': latest.get('cost'), 'calls': calls, 'priced': call['n'],
+            'missing': call['missing'], 'partial': bool(call['missing']),
+            'unattached_total':token_number((session.get('unclassified') or {}).get('total')),
+            'assumed': assumed, 'coverage_gap': gap, 'warnings': latest_call.get('warnings',[]),
+            'latest_ts': latest.get('ts'), 'latest_key': latest.get('key'),
+            'latest':latest_call,'request':request,'recent':recent,'cache_health':health,
+            'output_speed_summary':facts['speed'],'cost_composition':facts['cost_composition'],
+            'members':[(session['home'],session['id'])],
+            'model_mismatch_count':facts['mismatch_count'],
+            'observation_missing_count':facts['observation_missing'],
+            'observation_conflict_count':facts['observation_conflict'],
+            'cache_degradation':{'count':facts['degradation_count'],'events':deepcopy(degradation),
+                'current':bool(latest_call.get('cache_degradation'))},
+            'statuses':statuses,'session_evidence':evidence,
+            'model_incident':{'count':facts['mismatch_count'],'key':facts['mismatch_key']},
+            'token_composition': tokens}
+
+
+def summarize_session(session,health=None,*,_partials=None,_facts=None):
     rows = sorted(session.get('history', ()), key=lambda row: row['ts'])
     latest = rows[-1] if rows else {}
-    call = stats(rows, 'cost')
+    call = stats(rows, 'cost') if _facts is None else _facts['cost']
     gap = bool(session.get('coverage_gaps'))
     misses=session.get('cache_misses') or classify(rows)
     misses=deepcopy(misses)
@@ -258,73 +318,35 @@ def summarize_session(session,health=None,*,_partials=None):
     recent=all_calls
     latest_call=recent[-1] if recent else {}
     lifecycle=session.get('request_state') or {}
-    current=[r for r in rows if lifecycle.get('turn') and r.get('turn')==lifecycle['turn']]
-    current_cost=sum_cost(current)
-    current_latest=max(current,key=lambda r:r['ts'],default={})
-    request={**lifecycle,'calls':len(current),'cost':current_cost['cost'] if current else None,
-             'priced':sum(r.get('cost') is not None for r in current),'assumed':sum(assumed_cost(r) for r in current),
-             'partial':any(r.get('cost') is None for r in current) or gap,
-             'model':current_latest.get('requested_model') or current_latest.get('model'),
-             'model_setting':not bool(current_latest.get('requested_model')),
-             'response_model':current_latest.get('response_model'),
-             'model_mismatch':bool(current_latest.get('model_alert_confirmed')),
-             'mode':observed_mode(current_latest),'effort':current_latest.get('effort'),
-             'usage_at':current_latest.get('ts')}
-    mismatches=[r for r in rows if r.get('model_alert_confirmed')]
-    tokens=token_composition(session,_partials=_partials)
-    if _partials is not None:
-        _partials.update(maintenance_calls=0,maintenance_missing=0)
-        def maintenance_costs():
-            for row in rows:
-                if row.get('purpose')!='maintenance':continue
-                _partials['maintenance_calls']+=1
-                if row.get('cost') is None:_partials['maintenance_missing']+=1
-                else:yield row['cost']
-        maintenance_cost=sum(maintenance_costs())
-        _partials['maintenance_cost']=(maintenance_cost if _partials['maintenance_calls']>_partials['maintenance_missing'] else None)
-    statuses=[]
-    if gap:
-        statuses.append({'text':'이전 기록 누락','severity':'muted'})
-    if not rows:
-        statuses.append({'text':'호출 기록 없음','severity':'muted'})
-    evidence=[]
-    if call['missing'] or gap:
-        evidence.append(f"산정 {call['n']:,} / {len(rows):,}호출")
-    assumed=sum(assumed_cost(row) for row in rows)
-    if assumed:
-        evidence.append(f'Standard 가정 {assumed:,}호출')
-    if gap:
-        evidence.append('이전 기록 누락')
-    if tokens['cache_hit_partial']:
-        evidence.append('확인분 입력 기준')
-    return {'id': session['id'], 'home': session['home'],
-            'title': ' '.join((session.get('title') or '').split()),
-            'model': latest_call.get('model','미확인'), 'model_setting': latest_call.get('model_setting',False),
-            'response_model': latest_call.get('response_model'),
-            'model_mismatch': latest_call.get('model_mismatch',False),
-            'model_state': latest_call.get('model_state','미확인'),
-            'effort': latest_call.get('effort','미확인'), 'mode': latest_call.get('mode','미확인'),
-            'response_mode':latest_call.get('response_mode','미확인'),
-            'transport': latest_call.get('transport','미확인'), 'transport_state':latest_call.get('transport_state','미확인'),
-            'cache_rate': latest_call.get('cache_rate'), 'cache_misses':misses,
-            'cost': call['sum'] if rows else None, 'mean_cost': call['mean'],
-            'latest_cost': latest.get('cost'), 'calls': len(rows), 'priced': call['n'],
-            'missing': call['missing'], 'partial': bool(call['missing']),
-            'unattached_total':token_number((session.get('unclassified') or {}).get('total')),
-            'assumed': assumed, 'coverage_gap': gap, 'warnings': latest_call.get('warnings',[]),
-            'latest_ts': latest.get('ts'), 'latest_key': latest.get('key'),
-            'latest':latest_call,'request':request,'recent':recent,'cache_health':health,
-            'output_speed_summary':output_speed_summary(rows),'cost_composition':cost_composition(rows),
-            'members':[(session['home'],session['id'])],
-            'model_mismatch_count':len(mismatches),
-            'observation_missing_count':sum(observation_flags(r)['missing'] for r in rows),
-            'observation_conflict_count':sum(observation_flags(r)['conflict'] for r in rows),
-            'cache_degradation':{'count':len(degradation),'events':deepcopy(degradation),
-                'current':bool(latest_call.get('cache_degradation'))},
-            'statuses':statuses,'session_evidence':evidence,
-            'model_incident':{'count':len(mismatches),'key':mismatches[-1]['key'] if mismatches else None},
-            'token_composition': tokens}
-
+    if _facts is None:
+        current=[r for r in rows if lifecycle.get('turn') and r.get('turn')==lifecycle['turn']]
+        current_cost=sum_cost(current)
+        current_latest=max(current,key=lambda r:r['ts'],default={})
+        mismatches=[r for r in rows if r.get('model_alert_confirmed')]
+        tokens=token_composition(session,_partials=_partials)
+        if _partials is not None:
+            _partials.update(maintenance_calls=0,maintenance_missing=0)
+            def maintenance_costs():
+                for row in rows:
+                    if row.get('purpose')!='maintenance':continue
+                    _partials['maintenance_calls']+=1
+                    if row.get('cost') is None:_partials['maintenance_missing']+=1
+                    else:yield row['cost']
+            maintenance_cost=sum(maintenance_costs())
+            _partials['maintenance_cost']=(maintenance_cost if _partials['maintenance_calls']>_partials['maintenance_missing'] else None)
+        facts=dict(cost=call,calls=len(rows),tokens=tokens,
+            request=dict(calls=len(current),cost=current_cost['cost'],
+                priced=sum(r.get('cost') is not None for r in current),assumed=sum(assumed_cost(r) for r in current),
+                partial=any(r.get('cost') is None for r in current)),request_latest=current_latest,
+            assumed=sum(assumed_cost(row) for row in rows),speed=output_speed_summary(rows),cost_composition=cost_composition(rows),
+            mismatch_count=len(mismatches),mismatch_key=mismatches[-1]['key'] if mismatches else None,
+            observation_missing=sum(observation_flags(r)['missing'] for r in rows),
+            observation_conflict=sum(observation_flags(r)['conflict'] for r in rows),degradation_count=len(degradation))
+    else:
+        facts=_facts
+        if _partials is not None:_partials.update(facts['partials'])
+    request=_request_view(lifecycle,facts['request'],facts['request_latest'],gap)
+    return _summary_view(session,latest,recent,facts,request=request,misses=misses,health=health,degradation=degradation)
 
 class OverlaySummaries:
     def __init__(self):
@@ -350,6 +372,10 @@ class OverlaySummaries:
                     state['prepared'].get('cache_health'),_partials=parts)
                 partials[key]=parts
             updated[key] = (revision, summary)
+        return self.present(engine, updated, partials, speeds)
+
+    def present(self, engine, updated, partials, speeds):
+        """Present prepared own summaries with the same ancestry and readiness rules."""
         self.cache = updated
         self.partials = partials
         own = {key:dict(cost=summary['cost'], calls=summary['calls'],

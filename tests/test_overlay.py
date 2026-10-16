@@ -24,6 +24,7 @@ def test_overlay_banner_identifies_each_trigger_without_changing_stale_threshold
     controller=SimpleNamespace(target_state={'selection':SimpleNamespace(thread_id=A,host='local')},
         session_lookup={A:[dict(id=A,calls=2)]},collection_issue='',collection_fault={},errors=[],loading=False,
         snapshot_at=89.,snapshot_wall_time=1000.,refresh=lambda:None)
+    controller.prepared_content=OverlayController.prepared_content.__get__(controller)
     labels=[]
     for issue,errors,reason in (('',[],'analysis_delay'),('', ['read failure'],'source_error'),
                                ('status failure',[],'service_error'),('수집 결과 갱신 지연',[],'service_delay')):
@@ -59,6 +60,7 @@ def test_verified_session_displays_during_unrelated_restore_without_hiding_fault
     controller=SimpleNamespace(target_state={'selection':Selection(A)},session_lookup={A:[session]},
         collection_issue='',collection_fault={},errors=[],loading=True,
         snapshot_at=100.,snapshot_wall_time=1000.)
+    controller.prepared_content=OverlayController.prepared_content.__get__(controller)
     data,note=OverlayController.content(controller)
     assert not note and not data['_collection']['loading']
     content=OverlayContent();content.set_content(data,note)

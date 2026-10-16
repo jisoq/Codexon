@@ -223,6 +223,9 @@ class UsageIndex:
         self.publication_rows = {}
         self.publication_revision = 0
         self.publication_owner = object()
+        from .collection_append import AppendBudget
+        self.append_budget = AppendBudget()
+        self.append_origins = {}
         self.collection_changes = None
         self.activity_publication = None
         self.activity_rows = []
@@ -565,6 +568,9 @@ class UsageIndex:
                     and not hasattr(previous,'_replay_body')
                     and all(order>self.event_tails.get(key,(float('inf'),'',0)) for order,_ in additions)
                     and (previous.modern or not any(e['type']=='token_usage_record' for _,e in additions)))
+        from .collection_append import begin as begin_append
+        self.append_origins.pop(key, None)
+        append_origin=begin_append(self,key,previous,append,additions)
         if append:
             events=[e for _,e in additions]
             s=previous
@@ -639,6 +645,7 @@ class UsageIndex:
         if self.replay is not None:self.replay.rebuilt(key,previous)
         self.monitor.sessions[key] = s
         self.loaded.add(key)
+        if append_origin is not None:self.append_origins[key]=append_origin
 
     def catalog_signature(self):
         # Three scalar reads per home on an idle-source poll. A new thread or
@@ -863,6 +870,7 @@ class UsageIndex:
 
     def track_publication(self, snapshot):
         from .usage_collection import CollectionChanges, LiveCollection, publication_fingerprint
+        from .collection_append import complete as complete_append
         from .collection_replay import EncodedSession
         # Session.view owns its cached nested values. It replaces that cache on
         # changes and window expiry; EvidenceReader likewise replaces joined rows.
@@ -873,6 +881,7 @@ class UsageIndex:
                       for _,session,_ in self.archive.groups})
         current = {}
         tokens = {}
+        appends = {}
         for view in snapshot['sessions']:
             key = (view['home'],view['id'])
             if isinstance(view,EncodedSession):
@@ -897,15 +906,19 @@ class UsageIndex:
                 token = self.publication_revision
             current[key] = (base,history,fingerprint,token,overrides)
             tokens[key] = token
+            packet=complete_append(self,key,self.append_origins.get(key),view,token)
+            if packet is not None:appends[key]=packet
+        self.append_origins.clear()
         self.publication_rows = current
         self.collection_changes = CollectionChanges(self.publication_owner,tokens,self.activity_tokens,
-                                                    activity_revision=self.activity_publication)
+                                                    activity_revision=self.activity_publication,appends=appends)
 
     def close(self):
         if self.replay is not None:self.replay.close();self.replay=None
         for job in self.rebuild_jobs.values():job.close()
         self.rebuild_jobs.clear();self.pending_rebuilds.clear()
         self.cached_restore.clear()
+        self.append_origins.clear()
         self.publication_rows.clear()
         self.collection_changes = None
         self.activity_rows = []

@@ -141,17 +141,19 @@ def explorer(engine,result,selection):
         rows=[dict(r,_incident_phase=phases[str(identity(r)[2])]) for r in rows if str(identity(r)[2]) in phases]
     turns=result['lookup']['session_turns'].get(scope,[])
     if view=='requests':
-        whole=engine.sessions.get(scope,{}).get('prepared',{}).get('history',[])
+        unlinked=(engine.unlinked_total(scope) if hasattr(engine,'unlinked_total') else
+                  sum(not r.get('turn') for r in engine.sessions.get(scope,{}).get('prepared',{}).get('history',[])))
         records=request_rows(turns,rows,scope,
             include_empty=not filters and (matching is None or scope in matching),
-            unlinked_total=sum(not r.get('turn') for r in whole))
+            unlinked_total=unlinked)
     else:
         records=rows
         if selection.get('outside') and turn and scope and session is not None:
             records=list(rows)
             keys={identity(r) for r in records}
-            whole=engine.sessions.get(scope,{}).get('whole_turns',{})
-            records.extend(dict(r,_outside=True) for r in whole.get((*scope,turn),[]) if identity(r) not in keys)
+            whole=(engine.whole_request_calls(scope,turn) if hasattr(engine,'whole_request_calls') else
+                   engine.sessions.get(scope,{}).get('whole_turns',{}).get((*scope,turn),[]))
+            records.extend(dict(r,_outside=True) for r in whole if identity(r) not in keys)
     call_rows=rows if view=='requests' else records if view=='calls' else []
     call_lookup=result['lookup']['sessions'] if view=='calls' and records is scope_rows else None
     call_identities=frozenset(identity(row) for row in call_rows) if call_lookup is None else None
@@ -175,13 +177,18 @@ def explorer(engine,result,selection):
     elif view=='children':records=[hierarchy['items'][k] for k in hierarchy['children'].get(scope,[])]
     request_ordinal=None
     if scope and (view=='requests' or turn):
-        full=engine.sessions.get(scope,{}).get('whole_turns',{})
-        all_turns=engine.sessions.get(scope,{}).get('prepared',{}).get('turn_records',{})
-        ids=set(all_turns)|{k[2] for k in full}
-        def position(t):
-            start=all_turns.get(t,{}).get('started_at')
-            return (start if start is not None else min((r['ts'] for r in full.get((*scope,t),[])),default=float('inf')),t)
-        numbers={t:i+1 for i,t in enumerate(sorted(ids,key=position))}
+        if hasattr(engine,'request_positions'):
+            positions=engine.request_positions(scope,[r.get('turn') for r in records]+([turn] if turn else []))
+            numbers={key:value[0] for key,value in positions.items()}
+            def position(t):return (positions.get(t,(None,float('inf')))[1],t)
+        else:
+            full=engine.sessions.get(scope,{}).get('whole_turns',{})
+            all_turns=engine.sessions.get(scope,{}).get('prepared',{}).get('turn_records',{})
+            ids=set(all_turns)|{k[2] for k in full}
+            def position(t):
+                start=all_turns.get(t,{}).get('started_at')
+                return (start if start is not None else min((r['ts'] for r in full.get((*scope,t),[])),default=float('inf')),t)
+            numbers={t:i+1 for i,t in enumerate(sorted(ids,key=position))}
         request_ordinal=numbers.get(turn)
         if view=='requests':records=[dict(r,ordinal=numbers.get(r.get('turn')),
             ts=r.get('ts') if r.get('turn')=='__unlinked__' else position(r.get('turn'))[0]) for r in records]
@@ -283,6 +290,8 @@ def compact(query,value,path=()):
 
 
 def project(engine,q):
+    if q['page']==2 and hasattr(engine,'history_project'):
+        return engine.history_project(q)
     query={k:v for k,v in q.items() if k not in ('explorer','table_windows','presentation','compare_model','result_view')}
     # The only consumer of out-of-range calls is the selected request. Read
     # that owner directly instead of merging every owner's history per view.

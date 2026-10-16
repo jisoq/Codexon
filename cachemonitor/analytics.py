@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections import defaultdict, Counter
 from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
 import math
 import ntpath
 import hashlib
@@ -201,7 +202,16 @@ def condition_match(row,conditions,unit='response'):
     return True
 
 
-def request_record(key,items,whole,session,start,end):
+@dataclass(frozen=True)
+class WholeRequestFacts:
+    count: int
+    minimum: float | int | None
+    maximum: float | int | None
+    dimensions: dict
+    first_call: dict | None
+
+
+def request_record(key,items,whole,session,start,end,whole_facts=None):
     metadata=session.get('turn_records',{}).get(key[2],{})
     state=metadata.get('state') or session.get('turn_states',{}).get(key[2],'미확인')
     started,ended=metadata.get('started_at'),metadata.get('ended_at')
@@ -212,27 +222,32 @@ def request_record(key,items,whole,session,start,end):
     if started is not None and ended is not None:
         if ended<started:reasons.append('시간 관측 충돌')
         if not(start<=started and ended<end):reasons.append('기간 일부')
-    if len(items)!=len(whole):
-        reasons.append('기간 일부' if any(not(start<=r['ts']<end) for r in whole) else '조건 일부')
+    whole_count=len(whole) if whole_facts is None else whole_facts.count
+    if len(items)!=whole_count:
+        outside=(any(not(start<=r['ts']<end) for r in whole) if whole_facts is None else
+                 whole_count and (whole_facts.minimum<start or whole_facts.maximum>=end))
+        reasons.append('기간 일부' if outside else '조건 일부')
     if not session.get('collection_complete',not session.get('pending',False)):reasons.append('수집 중')
     if started is not None and ended is not None and any(g['start']<=ended and g['end']>=started for g in session.get('coverage_gaps',[])):
         reasons.append('기록 불완전')
-    dimensions={}
-    for dim in ('model','effort','service_tier'):
-        values={r.get(dim) or '미확인' for r in whole};dimensions[dim]=next(iter(values)) if len(values)==1 else '혼합'
+    dimensions={} if whole_facts is None else whole_facts.dimensions
+    if whole_facts is None:
+        for dim in ('model','effort','service_tier'):
+            values={r.get(dim) or '미확인' for r in whole};dimensions[dim]=next(iter(values)) if len(values)==1 else '혼합'
     values=summarize(items)
     for metric in METRICS:
         if values['missing'][metric]:values[metric]=None
     cost=sum_cost(items,strict=True)
-    if not whole:
+    if not whole_count:
         cost=dict.fromkeys(COST_KEYS)
         for metric in METRICS:values[metric]=None
-    first=min(whole,key=lambda r:r['ts']) if whole and started is not None else None
+    first=((min(whole,key=lambda r:r['ts']) if whole_facts is None else whole_facts.first_call)
+           if whole_count and started is not None else None)
     complete=not reasons
     result={**values,**cost,**dimensions,'home':key[0],'sid':key[1],'turn':key[2],'request_id':key[2],
             'title':session['title'],'project':project_identity(session),'project_name':session.get('project_name') or ntpath.basename(session.get('cwd','').rstrip('/\\')) or '프로젝트 없는 작업','cwd':session.get('cwd',''),
             'source':session.get('source','unknown'),'ts':ended if ended is not None else max((r['ts'] for r in items),default=started or 0),
-            'started_at':started,'ended_at':ended,'responses':len(items),'total_responses':len(whole),'calls':items,'first_call':first,
+            'started_at':started,'ended_at':ended,'responses':len(items),'total_responses':whole_count,'calls':items,'first_call':first,
             'start_input':first.get('input') if first else None,'start_rate':first.get('rate') if first else None,
             'duration':ended-started if complete and started is not None and ended is not None else None,
             'state':state if complete or state!='완료' else reasons[0], 'complete':complete,'exclusions':list(dict.fromkeys(reasons)),
@@ -246,7 +261,7 @@ def request_record(key,items,whole,session,start,end):
 
 
 def analyze(sessions,start=0,end=float('inf'),model='',source='',archived=True,
-            unit='response',method='mean',input_band=None,with_comparisons=True,service_tier='',effort='',home='',project='',sid='',_range_index=None,_boundary_turns=None):
+            unit='response',method='mean',input_band=None,with_comparisons=True,service_tier='',effort='',home='',project='',sid='',_range_index=None,_boundary_turns=None,_whole_facts=None):
     selected=[s for s in sessions if not internal_review(s) and (archived or not s.get('archived')) and (not source or s.get('source','unknown')==source)
               and (not home or s['home']==home) and (not sid or s['id']==sid) and (not project or project_matches(s,project))]
     responses=[];whole_turns=defaultdict(list);groups=defaultdict(list);session_map={}
@@ -285,7 +300,8 @@ def analyze(sessions,start=0,end=float('inf'),model='',source='',archived=True,
             a,b=meta.get('started_at'),meta.get('ended_at')
             if any(value is not None and start<=value<end for value in (a,b)):
                 groups.setdefault((*sk,turn),[])
-    turns=[request_record(key,items,whole_turns.get(key,[]),session_map[key[:2]],start,end) for key,items in groups.items()]
+    turns=[request_record(key,items,whole_turns.get(key,[]),session_map[key[:2]],start,end,
+                          None if _whole_facts is None else _whole_facts[key]) for key,items in groups.items()]
     units=responses if unit in ('response','call') else [t for t in turns if t['complete']]
     if input_band:units=[r for r in units if condition_match(r,{'input_band':input_band},unit)]
     buckets=defaultdict(list)

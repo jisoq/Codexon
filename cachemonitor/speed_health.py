@@ -241,6 +241,35 @@ def _proof_bytes(owner, proof):
             + sum(256 + _condition_bytes(c) for c in proof.buckets))
 
 
+@dataclass(slots=True)
+class _OwnerInput:
+    revision: object
+    length: int
+    append_from: object
+
+
+class _EngineInput:
+    def __init__(self, engine):
+        self.binding=engine
+        self.owners={owner:_OwnerInput(state.get('content_revision',state['revision']),
+            len(state['prepared'].get('history',())),state.get('speed_append_from'))
+            for owner,state in engine.sessions.items()}
+
+    def rows(self,owner,start):
+        history=self.binding.sessions[owner]['prepared'].get('history',())
+        for ordinal in range(start,len(history)):
+            yield ordinal,history[ordinal]
+
+    def ordered(self,starts):
+        def rows(owner,start):
+            for ordinal,row in self.rows(owner,start):yield owner,ordinal,row
+        return merge(*(rows(owner,start) for owner,start in starts.items()),
+                     key=lambda item:(item[2]['ts'],*item[0],item[1]))
+
+    def full_classify(self):
+        return classify(state['prepared'] for state in self.binding.sessions.values())
+
+
 class SpeedHealth:
     """One proof per canonical owner and bounded state per peer condition.
 
@@ -258,6 +287,17 @@ class SpeedHealth:
         self.results = {}
         self.metrics = {}
         self.retention = {}
+        self.checkpoint_token = None
+        self.checkpoint_from_token = None
+        self._changes()
+
+    def _changes(self):
+        # The completed cohort alone is retained. Its predecessor token makes
+        # skipping an unpublished delta detectable by the section writer.
+        self.changed_owners = set()
+        self.changed_scopes = set()
+        self.removed_owners = set()
+        self.removed_scopes = set()
 
     def _metrics(self):
         self.metrics = dict(scanned_rows=0, proof_rows=0, replay_rows=0,
@@ -268,15 +308,14 @@ class SpeedHealth:
             fallback_reason=None)
         self.metrics.update(self.retention)
 
-    def _fallback(self, engine, signature, reason):
+    def _fallback(self, source, signature, reason):
         # Exact compatibility path. Its transient full-classifier allocation
         # is the existing contract; it retains no incremental source index.
         self.proofs.clear()
         self.replays.clear()
         self.retention.clear()
-        self.results = classify(s['prepared'] for s in engine.sessions.values())
-        count = sum(len(s['prepared'].get('history', ()))
-                    for s in engine.sessions.values())
+        self.results = source.full_classify()
+        count = sum(state.length for state in source.owners.values())
         self.metrics.update(scanned_rows=self.metrics['scanned_rows'] + count,
             processed_rows=count, retained_rows=0, baseline_rows=0,
             live_states=0, proof_owners=0, proof_memberships=0,
@@ -285,17 +324,15 @@ class SpeedHealth:
         self.signature = signature
         return self.results
 
-    def _proof(self, owner, state, old):
-        history = state['prepared'].get('history', ())
+    def _proof(self, owner, state, old, source):
         prefix = (old is not None
-            and state.get('speed_append_from') == (old.revision, old.length)
-            and len(history) >= old.length)
+            and state.append_from == (old.revision, old.length)
+            and state.length >= old.length)
         start = old.length if prefix else 0
         buckets, tail_min = (dict(old.buckets) if prefix else {}), {}
         previous_ts = old.timestamp if prefix else None
         condition = old.condition if prefix else None
-        for ordinal in range(start, len(history)):
-            row = history[ordinal]
+        for ordinal, row in source.rows(owner,start):
             self.metrics['proof_rows'] += 1
             self.metrics['scanned_rows'] += 1
             key, timestamp = row.get('key'), row['ts']
@@ -314,8 +351,7 @@ class SpeedHealth:
                     raise _Capacity('scope count')
                 tail_min.setdefault((owner[0], condition),
                                     (timestamp, *owner, ordinal))
-        revision = state.get('content_revision', state['revision'])
-        proof = _Proof(revision, len(history), buckets, condition, previous_ts)
+        proof = _Proof(state.revision, state.length, buckets, condition, previous_ts)
         return proof, prefix, tail_min
 
     def _admit(self, proofs):
@@ -349,32 +385,36 @@ class SpeedHealth:
             retained = min(MAX_BASELINE * 4, count)
             samples += retained
             size += 2048 + retained * sample_bytes
+        # Cohort change/removal sets retain identities only, never calls.
+        size += 256 * (len(proofs) + len(self.proofs) + len(pools) + len(self.replays))
         if samples > MAX_RETAINED_SAMPLES or size > MAX_METADATA_BYTES:
             raise _Capacity('retained sample or metadata allowance')
         self.metrics.update(proof_owners=len(proofs), proof_memberships=pairs,
                             estimated_metadata_bytes=size)
         return pools
 
-    def _steps(self, owner, state, start, previous, selected, metric):
-        history = state['prepared'].get('history', ())
-        prior_condition, prior_ts = previous
-        for ordinal in range(start, len(history)):
-            row = history[ordinal]
+    def _steps(self, source, ranges, selected, metric):
+        prior={owner:previous for owner,(_,previous) in ranges.items()}
+        for owner,ordinal,row in source.ordered({owner:start for owner,(start,_) in ranges.items()}):
             self.metrics[metric] += 1
             self.metrics['scanned_rows'] += 1
             condition, timestamp = scope(row), row['ts']
+            prior_condition, prior_ts = prior[owner]
             reset = (condition != prior_condition or prior_ts is None
                      or timestamp - prior_ts > MAX_AGE)
-            prior_condition, prior_ts = condition, timestamp
+            prior[owner] = condition, timestamp
             if condition is None:
                 self.metrics['invalid_rows'] += 1
             elif (owner[0], condition) in selected:
                 yield _Step(_Sample(owner, ordinal, row, condition), reset)
 
-    def _advance(self, streams, appended):
-        for step in merge(*streams, key=lambda item: item.event.order):
+    def _advance(self, steps, appended):
+        for step in steps:
             event = step.event
-            self.replays[(event.session[0], event.condition)].advance((step,))
+            bucket=(event.session[0], event.condition)
+            self.replays[bucket].advance((step,))
+            self.changed_owners.add(event.session)
+            self.changed_scopes.add(bucket)
             self.metrics['processed_rows'] += 1
             self.metrics['appended_rows'] += int(appended)
 
@@ -401,34 +441,64 @@ class SpeedHealth:
             'proof_memberships', 'estimated_metadata_bytes')}
 
     def collect(self, engine):
-        # The production AnalysisEngine owns deduplication, stable timestamp
-        # order, and content_revision. A fixture with a similarly shaped dict
-        # does not confer that ownership contract.
+        # Only the actual canonical engine owns this preparation contract.
+        # Similarly shaped fixtures retain the exact compatibility path.
         from .analysis_engine import AnalysisEngine
-        signature = frozenset((owner, s.get('content_revision', s['revision']))
-                              for owner, s in engine.sessions.items())
+        source=_EngineInput(engine)
+        signature=frozenset((owner,state.revision) for owner,state in source.owners.items())
         if not isinstance(engine, AnalysisEngine):
             self._metrics()
             self.engine_ref = None
-            return self._fallback(engine, signature, 'unproven input owner')
-        if self.engine_ref is None or self.engine_ref() is not engine:
+            return self._fallback(source, signature, 'unproven input owner')
+        return self._collect(source)
+
+    def collect_prepared(self, source):
+        from .prepared_speed import PreparedSpeedInput
+        if not isinstance(source,PreparedSpeedInput):
+            raise TypeError('prepared speed input requires the actual writer binding')
+        try:
+            with source.read_scope():
+                same_binding=self.engine_ref is not None and self.engine_ref() is source.binding
+                previous=self.checkpoint_token if same_binding else None
+                signature=frozenset((owner,state.revision) for owner,state in source.owners.items())
+                if previous == source.token and signature != self.signature:
+                    raise ValueError('prepared metadata changed within a published token')
+                if previous != source.token:
+                    self._changes()
+                result=self._collect(source)
+                if previous != source.token:
+                    self.checkpoint_from_token=previous
+                    self.checkpoint_token=source.token
+                return result
+        except BaseException:
+            # A cancelled database stream may have partly advanced a peer
+            # reducer. Retry from a durable checkpoint or replay, never from
+            # a partially consumed tail.
             self.__init__()
-            self.engine_ref = ref(engine)
+            raise
+
+    def _collect(self, source):
+        signature=frozenset((owner,state.revision) for owner,state in source.owners.items())
+        if self.engine_ref is None or self.engine_ref() is not source.binding:
+            self.__init__()
+            self.engine_ref = ref(source.binding)
         self._metrics()
         if signature == self.signature:
             return self.results
+        self._changes()
         proofs = {}
         tails = {}
         dirty = set()
         try:
             proof_size = 0
-            for owner, state in engine.sessions.items():
+            for owner, state in source.owners.items():
                 old = self.proofs.get(owner)
-                revision = state.get('content_revision', state['revision'])
+                revision = state.revision
                 if old is not None and old.revision == revision:
                     proof = old
                 else:
-                    proof, prefix, minima = self._proof(owner, state, old)
+                    self.changed_owners.add(owner)
+                    proof, prefix, minima = self._proof(owner, state, old, source)
                     if old is not None and not prefix:
                         dirty.update((owner[0], c) for c in old.buckets)
                         dirty.update((owner[0], c) for c in proof.buckets)
@@ -446,29 +516,27 @@ class SpeedHealth:
                 proof_size += _proof_bytes(owner, proof)
                 if proof_size > MAX_METADATA_BYTES:
                     raise _Capacity('owner proof allowance')
-            for owner in self.proofs.keys() - proofs.keys():
+            self.removed_owners = self.proofs.keys() - proofs.keys()
+            for owner in self.removed_owners:
                 dirty.update((owner[0], c) for c in self.proofs[owner].buckets)
             pools = self._admit(proofs)
         except (_Capacity, _Unsupported) as exc:
-            return self._fallback(engine, signature, str(exc))
-        for bucket in self.replays.keys() - pools.keys():
+            return self._fallback(source, signature, str(exc))
+        self.removed_scopes = self.replays.keys() - pools.keys()
+        for bucket in self.removed_scopes:
             self.replays.pop(bucket)
         dirty.intersection_update(pools)
         for bucket in pools:
             if bucket in dirty or bucket not in self.replays:
+                self.changed_scopes.add(bucket)
                 self.replays[bucket] = _ScopeReplay(bucket[1])
         self.metrics['replayed_scopes'] = len(dirty)
         if dirty:
-            streams = [self._steps(owner, engine.sessions[owner], 0,
-                (None, None), dirty, 'replay_rows')
-                for owner, proof in proofs.items()
-                if any((owner[0], c) in dirty for c in proof.buckets)]
-            self._advance(streams, appended=False)
+            ranges={owner:(0,(None,None)) for owner,proof in proofs.items()
+                    if any((owner[0],c) in dirty for c in proof.buckets)}
+            self._advance(self._steps(source,ranges,dirty,'replay_rows'),appended=False)
         append_scopes = pools.keys() - dirty
-        streams = [self._steps(owner, engine.sessions[owner], start, previous,
-                   append_scopes, 'append_scan_rows')
-                   for owner, (start, previous) in tails.items()]
-        self._advance(streams, appended=True)
+        self._advance(self._steps(source,tails,append_scopes,'append_scan_rows'),appended=True)
         self.proofs = proofs
         self._finish(proofs)
         self.signature = signature

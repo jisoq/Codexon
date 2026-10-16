@@ -36,6 +36,106 @@ def deliver_pending(window):
         result=window.engine.page_query(query),valid_until=float('inf')))
 
 
+def test_displayed_generation_refreshes_stale_detail_without_losing_selection(tmp_path):
+    from cachemonitor.analysis_worker import AnalysisBridge
+    from cachemonitor.quick_qa import control,render_plot
+    window=dashboard(tmp_path)
+    try:
+        window.receive(sample());window.resize(1000,680);window.show();window.tick.stop()
+        window.change_page(2);window.selected_session=('home','task');window.record_view='calls'
+        window.history_display='chart';window.render()
+        chart=render_plot(window,window.history_chart)
+        assert chart.width()>0 and chart.height()>0
+        window.history_chart.selected.emit(window.history_chart.rows[0])
+        detail=control(window,window.detail_scroll)
+        assert detail.width()>0 and detail.height()>0
+        row=window.exact_record
+        assert row is not None
+        selected=(window.selected_session,window.selected_turn,window.selected_call,window.selected_call_scope)
+        first=('prepared-test',1);second=('prepared-test',2);third=('prepared-test',3)
+        window.view_result=dict(window.view_result,prepared_token=first)
+        bridge=AnalysisBridge([],cache_floor=window.confirmed_notifications.cache_floor)
+        window.worker=bridge;window.async_mode=True
+        bridge.stale.connect(window.analysis_stale);bridge.record.connect(window.record_ready)
+        bridge.result.connect(window.analysis_ready)
+        faults=[];bridge.fault.connect(faults.append)
+        window.request_exact_record();old_id=window.record_request;old_query=window.request_id
+        assert bridge.last_record['prepared_token']==first
+        assert bridge.last_record['identity']==('home','task','response')
+        bridge._deliver_result(dict(kind='stale',consumer='record',id=old_id,prepared_token=second))
+        assert bridge.last_record is None and not faults
+        assert window.exact_record is None and not window.detail_scroll.isVisible()
+        assert window.record_status=='' and window.record_message.text()==''
+        assert window.request_id==old_query+1 and bridge.pending['id']==window.request_id
+        assert (window.selected_session,window.selected_turn,window.selected_call,window.selected_call_scope)==selected
+        fresh=dict(window.engine.page_query(window.pending_query),prepared_token=second)
+        bridge._deliver_result(dict(kind='result',id=window.request_id,logical=window.pending_logical,
+            result=fresh,valid_until=float('inf')))
+        assert window.exact_record==row and window.view_result['prepared_token']==second
+        assert control(window,window.detail_scroll).width()>0
+        window.request_exact_record();old_id=window.record_request
+        assert bridge.last_record['prepared_token']==second
+        window.apply_result(dict(fresh,prepared_token=third),window.pending_query)
+        displayed=window.exact_record
+        bridge._deliver_result(dict(kind='record',id=old_id,prepared_token=second,row=dict(row,output=9999)))
+        assert window.exact_record is displayed and window.exact_record['output']!=9999
+        window.request_exact_record();old_query=window.request_id
+        bridge._deliver_result(dict(kind='record',id=window.record_request,prepared_token=second,row=dict(row,output=9999)))
+        assert window.exact_record is None and window.request_id==old_query+1
+        assert window.selected_call=='response' and not faults
+        window.view_result={key:value for key,value in window.view_result.items() if key!='prepared_token'}
+        window.request_exact_record();old_query=window.request_id
+        assert window.record_request_token is None
+        bridge._deliver_result(dict(kind='record',id=window.record_request,prepared_token=third,row=row))
+        assert window.exact_record is None and window.request_id==old_query+1
+    finally:window.quit_app()
+
+
+def test_stale_population_closes_chart_hover_and_notification_floor_stays_current(tmp_path):
+    from cachemonitor.analysis_worker import AnalysisBridge
+    from cachemonitor.charts import UsageTrend
+    from cachemonitor.quick_qa import render_plot
+    window=dashboard(tmp_path)
+    try:
+        snapshot=sample();window.receive(snapshot);window.resize(1000,680);window.show();window.tick.stop()
+        window.change_page(2);window.selected_session=('home','task');window.record_view='calls'
+        window.history_display='chart';window.render()
+        population_chart=UsageTrend();population_chart.setFixedHeight(180)
+        population_chart.set_rows([dict(value=1.,n=1,N=1,label='Selected population')])
+        window.history_chart.hide();window.history_chart_panel.layout().addWidget(population_chart)
+        chart=render_plot(window,population_chart)
+        assert chart.width()>0 and chart.height()>0 and population_chart.hits
+        position=population_chart.hits[0][0].center()
+        chart.showTip(position.x(),position.y())
+        assert chart.tip
+        floor=window.confirmed_notifications.cache_floor
+        bridge=AnalysisBridge([],cache_floor=floor);window.worker=bridge;window.async_mode=True
+        bridge.stale.connect(window.analysis_stale)
+        bridge.set_cache_floor(floor)
+        assert not bridge.commands
+        for increment in range(1,4):bridge.set_cache_floor(floor+increment)
+        assert [value for value in bridge.commands if value['kind']=='cache_floor']==[
+            dict(kind='cache_floor',value=floor+3)]
+        window.confirmed_notifications.cache_floor=floor+4
+        window.receive(snapshot)
+        assert bridge.cache_floor==floor+4
+        assert [value for value in bridge.commands if value['kind']=='cache_floor']==[
+            dict(kind='cache_floor',value=floor+4)]
+        overlay=[];bridge.overlay_detail.connect(overlay.append)
+        summary={'_prepared_token':('prepared-test',2)}
+        bridge.request_overlay_detail(8,summary,health=True)
+        assert bridge.commands[-1]==dict(kind='overlay_detail',id=8,summary=summary,health=True,
+            prepared_token=('prepared-test',2))
+        bridge._deliver_result(dict(kind='stale',consumer='overlay_detail',id=8,prepared_token=('prepared-test',3)))
+        assert len(overlay)==1 and overlay[0]['kind']=='stale'
+        old_query=window.request_id
+        bridge._deliver_result(dict(kind='stale',consumer='population',id=42,prepared_token=('prepared-test',2)))
+        assert not chart.tip and chart.hoverIndex==-1
+        assert window.request_id==old_query+1 and not window.analysis_errors
+        assert window.current_page==2 and window.selected_session==('home','task')
+    finally:window.quit_app()
+
+
 @pytest.mark.parametrize('language',['ko','en'])
 @pytest.mark.essential
 def test_tab_loading_hides_empty_content_and_ignores_stale_result(tmp_path,language):

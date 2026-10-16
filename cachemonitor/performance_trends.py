@@ -149,26 +149,40 @@ class PerformanceTrends:
         return dict(self.view)
 
     def build(self,engine,q,width,granularity):
-        rows=sorted((r for s in engine.sessions.values() for r in s['prepared']['history']
-                     if r.get('purpose')!='maintenance' and (r.get('requested_model') or r.get('model'))!='codex-auto-review' and valid(r.get('ts'))),key=lambda r:r['ts'])
-        now=q['now'];first=rows[0]['ts'] if rows else now
-        full=(first,max(now,rows[-1]['ts'] if rows else now,first+1))
-        start,end=q.get('time_range') or full
-        if end<=start:start,end=full
+        provider=getattr(engine,'performance_input',None)
+        context=provider(q,width,granularity) if provider else None
+        if context is not None and 'prepared_view' in context:
+            self.view=context['prepared_view'];self.deadline=self.view['valid_until']
+            return
+        now=q['now']
+        if context is None:
+            rows=sorted((r for s in engine.sessions.values() for r in s['prepared']['history']
+                         if r.get('purpose')!='maintenance' and (r.get('requested_model') or r.get('model'))!='codex-auto-review' and valid(r.get('ts'))),key=lambda r:r['ts'])
+            first=rows[0]['ts'] if rows else now
+            full=(first,max(now,rows[-1]['ts'] if rows else now,first+1))
+            start,end=q.get('time_range') or full
+            if end<=start:start,end=full
+        else:
+            rows=context['rows'];first=context['first'];full=context['full']
+            start,end=context['start'],context['end']
         if granularity=='auto':
-            self.build_rolling(rows,q,width,start,end,full)
+            self.build_rolling(rows,q,width,start,end,full,context)
             return
         rows=[r for r in rows if r['ts']<=end]
-        edges=calendar_edges(min(first,start),end,granularity)
+        edges=context['edges'] if context is not None else calendar_edges(min(first,start),end,granularity)
         self.deadline=calendar_edges(now,now,granularity)[-1]
-        efforts=sorted({r.get('effort') or '미확인' for r in rows},key=effort_key)
+        efforts=context['efforts'] if context is not None else sorted({r.get('effort') or '미확인' for r in rows},key=effort_key)
         specs=list(METRICS)+[('reasoning:'+e,'평균 추론 토큰 / '+e,'reasoning') for e in efforts]+[('count','호출 수','count')]
         buckets=defaultdict(list);panels=[]
         for r in rows:
             buckets[(bisect_right(edges,r['ts'])-1,r.get('model') or '미확인',r.get('service_tier') or '미확인')].append(r)
-        native=get_native()
+        # The native raw-sample entry point has no causal-seed input. Keep the
+        # existing Python reducer for a bounded range with explicit predecessors.
+        native=get_native() if context is None else None
         for metric,title,unit in specs:
             pools=defaultdict(lambda:deque(maxlen=50));pending={};pixels={};lines=defaultdict(list);n=0;N=0;bounds=[]
+            if context is not None:
+                pools.update((scope,deque(values,maxlen=50)) for scope,values in context['seeds'].get(metric,{}).items())
             native_samples=None
             def add(value,ts,model,mode,effort,record,complete=True,coverage=None):
                 nonlocal n
@@ -191,6 +205,8 @@ class PerformanceTrends:
                 if value<cell['low']['value']:cell['low']=point
                 if value>cell['high']['value']:cell['high']=point
                 if verdict['direction']:cell['anomalies'].append(point)
+            if context is not None:
+                for sample in context['boundary'].get(metric,()):add(*sample)
             if metric not in ('session_cache','count'):
                 field='reasoning' if metric.startswith('reasoning:') else metric
                 if native is not None:
@@ -290,10 +306,11 @@ class PerformanceTrends:
             panels.append(dict(key=metric,title=title,unit=unit,n=n,N=N,points=sorted(samples,key=lambda p:p['ts']),
                                low=min(bounds,default=0),high=max(bounds,default=1),
                                lines=[dict(model=m,service_tier=t,points=v) for (m,t),v in lines.items()]))
-        self.view=dict(panels=panels,start=start,end=end,full=full,granularity=granularity,models=sorted({r.get('model') or '미확인' for r in rows}),
-                       calls=len(rows),valid_until=self.deadline)
+        self.view=dict(panels=panels,start=start,end=end,full=full,granularity=granularity,
+                       models=context['models'] if context is not None else sorted({r.get('model') or '미확인' for r in rows}),
+                       calls=context['calls'] if context is not None else len(rows),valid_until=self.deadline)
 
-    def build_rolling(self,history,q,width,start,end,full):
+    def build_rolling(self,history,q,width,start,end,full,context=None):
         """Project exact overlapping populations once in the worker, never in paint/hover."""
         now=q['now'];span=end-start;window=rolling_window(span)
         step=max(window/4,span/max(16,width//6));steps=max(1,ceil(span/step))
@@ -301,7 +318,7 @@ class PerformanceTrends:
         rows=[r for r in history if start<=r['ts']<=end]
         groups=defaultdict(list)
         for row in rows:groups[(row.get('model') or '미확인',row.get('service_tier') or '미확인')].append(row)
-        efforts=sorted({r.get('effort') or '미확인' for r in history if r['ts']<=end},key=effort_key)
+        efforts=context['efforts'] if context is not None else sorted({r.get('effort') or '미확인' for r in history if r['ts']<=end},key=effort_key)
         specs=list(METRICS)+[('reasoning:'+e,'평균 추론 토큰 / '+e,'reasoning') for e in efforts]+[('count','호출 수','count')]
         panels=[];native=get_native()
         for metric,title,unit in specs:
@@ -372,4 +389,5 @@ class PerformanceTrends:
         # No model calls are triggered. Idle refresh is bounded, including a partial live window.
         self.deadline=now+max(1,min(60,step))
         self.view=dict(panels=panels,start=start,end=end,full=full,granularity='auto',window_seconds=window,
-            models=sorted({r.get('model') or '미확인' for r in history if r['ts']<=end}),calls=len(rows),valid_until=self.deadline)
+            models=context['models'] if context is not None else sorted({r.get('model') or '미확인' for r in history if r['ts']<=end}),
+            calls=len(rows),valid_until=self.deadline)

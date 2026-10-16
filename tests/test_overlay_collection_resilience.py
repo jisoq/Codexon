@@ -1,156 +1,180 @@
 """Optional quota persistence cannot suppress observed session/overlay usage."""
 import copy
+import json
 import sqlite3
+import time
+from multiprocessing import Pipe
+from threading import Event, Thread
 
 import pytest
 
-from cachemonitor import analysis_worker
+from cachemonitor import analysis_worker, prepared_runtime
+from cachemonitor.analysis_delivery import SnapshotReceiver
+from cachemonitor.analysis_engine import AnalysisEngine
+from cachemonitor.usage_collection import CollectionChannel, empty_snapshot
 from test_overlay import source
+
+
+class PreparedAnalysis:
+    """Small normal-runtime fixture with the real transport, store, and reader."""
+    def __init__(self,directory,*,at=None,quota_path=None):
+        self.channel=CollectionChannel([directory/'home'],directory/'index.sqlite')
+        self.channel.start_live()
+        self.session=source()
+        self.session.update(home=self.channel.homes[0],collection_complete=True,usage_revision=1)
+        self.at=time.time() if at is None else at
+        self.quota_path=quota_path or directory/'quota.sqlite'
+        self.parent,self.child=Pipe()
+        self.receiver=SnapshotReceiver();self.snapshot=None;self.error=None;self.sequence=0
+        self.thread=Thread(target=self.run,daemon=True)
+
+    def publish(self,*,at=None,errors=()):
+        self.sequence+=1
+        value=empty_snapshot(self.channel.homes,self.channel.path,self.at if at is None else at)
+        value.update(sessions=[copy.deepcopy(self.session)],usage_collection_complete=True,
+                     last_usage_collection_success=value['ts'],request_activity=[],quota_by_home={},errors=list(errors))
+        value['index'].update(loading=False,usage_complete=True,last_usage_success=value['ts'])
+        self.channel.publish(value,'prepared-test',self.sequence)
+
+    def run(self):
+        try:
+            analysis_worker.process_main(self.child,self.channel.homes,self.channel.path,
+                quota_path=self.quota_path,model_evidence_path=self.channel.default_evidence,cache_floor=0)
+        except BaseException as error:self.error=error
+
+    def wait_for(self,predicate,seconds=10):
+        deadline=time.monotonic()+seconds
+        while True:
+            remaining=deadline-time.monotonic()
+            assert remaining>0 and self.parent.poll(remaining),('analysis reply deadline',self.error)
+            message=self.parent.recv()
+            assert message['kind'] not in ('fatal','error'),message
+            if message['kind']=='snapshot':
+                self.snapshot=self.receiver.receive(message['value'])
+                assert self.snapshot is not None,'snapshot receiver rejected normal publication'
+            if predicate(message):return message
+
+    def wait_snapshot(self,predicate=lambda value:True,seconds=10):
+        if self.snapshot is not None and predicate(self.snapshot):return self.snapshot
+        self.wait_for(lambda message:message['kind']=='snapshot' and predicate(self.snapshot),seconds)
+        return self.snapshot
+
+    def assert_calls_and_detail(self):
+        overlay=self.snapshot['overlay_sessions'][0]
+        history=self.session['history']
+        assert overlay['calls']==len(history) and overlay['latest_key']==history[-1]['key']
+        assert [row['key'] for row in overlay['recent']]==[row['key'] for row in history]
+        reference=AnalysisEngine();reference.ingest([copy.deepcopy(self.session)])
+        identity=(self.session['home'],self.session['id'],history[-1]['key'])
+        self.parent.send(dict(kind='record',id=1,identity=identity,prepared_token=self.snapshot['prepared_token']))
+        message=self.wait_for(lambda value:value.get('id')==1)
+        assert message['kind']=='record' and message['row']==reference.record(*identity)
+
+    def __enter__(self):
+        self.publish();self.thread.start();return self
+
+    def __exit__(self,*exc):
+        try:
+            if self.thread.is_alive():self.parent.send({'kind':'stop'})
+            deadline=time.monotonic()+5
+            while self.thread.is_alive() and time.monotonic()<deadline:
+                try:
+                    if self.parent.poll(.02):self.parent.recv()
+                except EOFError:pass
+                self.thread.join(.02)
+            assert not self.thread.is_alive(),'normal analysis worker did not stop'
+            assert self.error is None,self.error
+        finally:self.parent.close();self.child.close();self.channel.close()
 
 
 @pytest.mark.parametrize('failure_stage',['init','enrich','sync','import'])
 def test_quota_storage_failure_keeps_publishing_real_calls(monkeypatch,tmp_path,failure_stage):
-    session=source()
-    original=copy.deepcopy(session)
-    snapshots=[]
-    index_paths=[]
-    quota_paths=[]
-    class Index:
-        path='unused-index.sqlite'
-        def __init__(self,*args):index_paths.append(args[1])
-        def poll(self):
-            return dict(ts=200,sessions=[copy.deepcopy(session)],homes=[session['home']],
-                        errors=[],unassigned=[],index={'loading':False})
-        def close(self):pass
-        def notification_connection(self):return None
-    class Ledger:
-        def __init__(self,*args):
-            quota_paths.append(args[0])
-            self.db=self
-            if failure_stage=='init':raise sqlite3.DatabaseError('database disk image is malformed')
-        def enrich_modes(self,snapshot):
-            if failure_stage=='enrich':raise sqlite3.DatabaseError('database disk image is malformed')
-        def sync(self,*args):
-            if failure_stage=='sync':raise sqlite3.DatabaseError('database disk image is malformed')
-        def import_observations(self,*args):
-            assert len(snapshots)==1
-            early=snapshots[0]['value']
-            assert early['ledger_status_known'] is False
-            assert early['overlay_sessions'][0]['calls']==len(original['history'])
-            if failure_stage=='import':raise sqlite3.DatabaseError('database disk image is malformed')
-        def rollback(self):pass
-        def close(self):pass
-    class Connection:
-        def poll(self,*args):return bool(snapshots)
-        def recv(self):return {'kind':'stop'}
-        def send(self,value):snapshots.append(value)
-        def close(self):pass
-    monkeypatch.setattr(analysis_worker,'CollectionClient',Index)
-    monkeypatch.setattr(analysis_worker,'QuotaLedger',Ledger)
-    analysis_worker.process_main(Connection(),['home'],tmp_path/'index.sqlite')
-    assert index_paths==[tmp_path/'index.sqlite']
-    assert quota_paths==[analysis_worker.ledger_path(tmp_path/'index.sqlite')]
-    assert len(snapshots)==(2 if failure_stage=='import' else 1)
-    assert all(message['kind']=='snapshot' for message in snapshots)
-    from cachemonitor.analysis_delivery import SnapshotReceiver
-    receiver=SnapshotReceiver()
-    for message in snapshots:snapshot=receiver.receive(message['value'])
-    assert snapshot['ledger_error']=='한도 기록 확인 지연: 자동 재시도 중'
-    assert not snapshot['errors']
-    overlay=snapshot['overlay_sessions'][0]
-    assert overlay['calls']==len(original['history']) and overlay['latest_key']==original['history'][-1]['key']
-    assert [row['key'] for row in overlay['recent']]==[row['key'] for row in original['history']]
-    assert session==original
+    failures=[]
+    def fail(stage):
+        if stage==failure_stage:
+            failures.append(stage)
+            raise sqlite3.OperationalError('optional quota storage unavailable')
+    class Ledger(prepared_runtime.QuotaLedger):
+        def __init__(self,*args,**kwargs):fail('init');super().__init__(*args,**kwargs)
+        def enrich_modes(self,*args,**kwargs):fail('enrich');return super().enrich_modes(*args,**kwargs)
+        def sync(self,*args,**kwargs):fail('sync');return super().sync(*args,**kwargs)
+        def import_observations_step(self,*args,**kwargs):
+            fail('import');return super().import_observations_step(*args,**kwargs)
+    monkeypatch.setattr(prepared_runtime,'QuotaLedger',Ledger)
+    with PreparedAnalysis(tmp_path) as worker:
+        original=copy.deepcopy(worker.session)
+        failed=worker.wait_snapshot(lambda value:value.get('ledger_fault',{}).get('ledger_failed'))
+        assert failed.get('ledger_error') and not failed['errors']
+        worker.assert_calls_and_detail()
+        assert failures==[failure_stage] and worker.session==original
 
 
 def test_usage_ledger_retries_after_transient_failure(monkeypatch,tmp_path):
-    from types import SimpleNamespace
-    clock=[100.0]
-    monkeypatch.setattr(analysis_worker,'time',SimpleNamespace(monotonic=lambda:clock[0],time=lambda:clock[0]))
-    snapshots=[]
-    writes=[]
-    opens=[]
-    paths=[]
+    opens=[];failures=[];armed=Event()
     quota_path=tmp_path/'retained-quota.sqlite'
-    session=source()
-    class Index:
-        path='unused'
-        def __init__(self,*args):pass
-        def poll(self):return dict(ts=clock[0],sessions=[copy.deepcopy(session)],homes=[session['home']],
-            errors=[],unassigned=[],index={'loading':False})
-        def close(self):pass
-        def notification_connection(self):return None
-    class Ledger:
-        def __init__(self,*args):self.db=self;opens.append(clock[0]);paths.append(args[0])
-        def enrich_modes(self,*args):pass
-        def sync(self,*args):
-            writes.append(clock[0])
-            if len(writes)==1:raise sqlite3.OperationalError('locked')
-        def import_observations(self,*args):pass
-        def rollback(self):pass
-        def close(self):pass
-    class Connection:
-        def poll(self,timeout=0):
-            if timeout:clock[0]+=1
-            return len(writes)>=2
-        def recv(self):return {'kind':'stop'}
-        def send(self,value):snapshots.append(value)
-        def close(self):pass
-    monkeypatch.setattr(analysis_worker,'CollectionClient',Index)
-    monkeypatch.setattr(analysis_worker,'QuotaLedger',Ledger)
-    analysis_worker.process_main(Connection(),['h'],tmp_path/'index.sqlite',quota_path=quota_path)
-    assert len(opens)==2 and opens[1]-opens[0]>=5
-    assert paths==[quota_path,quota_path]
+    class Ledger(prepared_runtime.QuotaLedger):
+        def __init__(self,path):
+            opens.append((time.monotonic(),path));super().__init__(path)
+        def sync(self,*args,**kwargs):
+            if armed.is_set() and not failures:
+                failures.append(time.monotonic());raise sqlite3.OperationalError('locked')
+            return super().sync(*args,**kwargs)
+    monkeypatch.setattr(prepared_runtime,'QuotaLedger',Ledger)
+    with PreparedAnalysis(tmp_path,quota_path=quota_path) as worker:
+        worker.wait_snapshot(lambda value:value.get('ledger_status_known'))
+        armed.set()
+        worker.session['history'][-1]['output']+=1
+        worker.session['usage_revision']+=1
+        worker.publish()
+        failed=worker.wait_snapshot(lambda value:value.get('ledger_error'))
+        worker.assert_calls_and_detail()
+        recovered=worker.wait_snapshot(lambda value:value.get('ledger_status_known') and not value.get('ledger_error'))
+        assert not recovered['ledger_fault']['ledger_failed']
+        assert recovered['prepared_token']==failed['prepared_token']
+        assert len(opens)==2 and opens[1][0]-failures[0]>=5
+        assert [path for _,path in opens]==[quota_path,quota_path]
     from cachemonitor.quota_service import QuotaService
     assert QuotaService(tmp_path/'home',tmp_path/'different-index.sqlite',live=False,quota_path=quota_path).path==quota_path
-    assert snapshots[0]['value']['ledger_error']
-    assert 'ledger_error' not in snapshots[-1]['value']
 
 
 def test_history_recovery_yields_to_details_and_collection(monkeypatch,tmp_path):
-    from types import SimpleNamespace
-    clock=[100.0];steps=[];polls=[];messages=[];requested=[False]
-    monkeypatch.setattr(analysis_worker,'time',SimpleNamespace(monotonic=lambda:clock[0],time=lambda:clock[0]))
-    session=source()
-    class Index:
-        path='unused'
-        def __init__(self,*args):pass
-        def poll(self):
-            polls.append(clock[0])
-            return dict(ts=clock[0],sessions=[copy.deepcopy(session)],homes=[session['home']],
-                        errors=[],unassigned=[],index={'loading':False})
-        def notification_connection(self):return None
-        def close(self):pass
-    class Ledger:
-        def __init__(self,*args):self.db=self
-        def enrich_modes(self,*args):pass
-        def sync(self,*args):pass
+    from cachemonitor.event_store import EventStore,pack_event
+    from cachemonitor.quota_history_import import ObservationImport
+    from test_quota_cycles import quota
+    entered=[Event(),Event()];release=[Event(),Event()];steps=[]
+    monkeypatch.setattr(ObservationImport,'OBSERVATIONS',1)
+    class Ledger(prepared_runtime.QuotaLedger):
         def import_observations_step(self,*args):
-            clock[0]+=.5
-            steps.append(clock[0])
-            return len(steps)>=8
-        def import_observations(self,*args):raise AssertionError('blocking recovery path used')
-        def close(self):pass
-    class Connection:
-        def poll(self,timeout=0):
-            clock[0]+=timeout
-            return bool(steps) and (not requested[0] or len(steps)>=8)
-        def recv(self):
-            if not requested[0]:
-                requested[0]=True
-                return dict(kind='record',id=1,identity=(session['home'],session['id'],session['history'][-1]['key']))
-            return {'kind':'stop'}
-        def send(self,value):messages.append((clock[0],value))
-        def close(self):pass
-    monkeypatch.setattr(analysis_worker,'CollectionClient',Index)
-    monkeypatch.setattr(analysis_worker,'QuotaLedger',Ledger)
-    analysis_worker.process_main(Connection(),['h'],tmp_path/'index.sqlite')
-    assert len(polls)>=2
-    detail=next((at,value) for at,value in messages if value['kind']=='record')
-    assert detail[0]<steps[-1] and detail[1]['row']['key']==session['history'][-1]['key']
-    snapshots=[value['value'] for _,value in messages if value['kind']=='snapshot']
-    assert not snapshots[0]['ledger_status_known']
-    assert snapshots[-1]['ledger_status_known'] and not snapshots[-1]['ledger_fault']['ledger_failed']
+            complete=super().import_observations_step(*args)
+            index=len(steps);steps.append(complete)
+            if index<2:
+                entered[index].set()
+                assert release[index].wait(10),'history import gate was not released'
+            return complete
+    monkeypatch.setattr(prepared_runtime,'QuotaLedger',Ledger)
+    worker=PreparedAnalysis(tmp_path)
+    with sqlite3.connect(worker.channel.path) as db:
+        events=EventStore(db,worker.channel.path);events.enable_replay_tokens()
+        for i in range(3):
+            payload=json.dumps({'payload':{'rate_limits':quota(100+i,i)}})
+            db.execute('insert into events values(?,?,?,?,?,?)',
+                ('retained',i,worker.session['home'],worker.session['id'],100+i,pack_event(payload)))
+    with worker:
+        try:
+            first=worker.wait_snapshot()
+            assert not first['ledger_status_known'] and entered[0].wait(3) and steps==[False]
+            worker.assert_calls_and_detail()
+            worker.session['history'][-1]['output']+=1;worker.session['usage_revision']+=1
+            worker.publish();release[0].set()
+            changed=worker.wait_snapshot(lambda value:value['prepared_token']!=first['prepared_token'])
+            assert not changed['ledger_status_known'] and entered[1].wait(3)
+            worker.assert_calls_and_detail()
+            assert steps==[False,False]
+            release[1].set()
+            final=worker.wait_snapshot(lambda value:value.get('ledger_status_known'))
+            assert not final['ledger_fault']['ledger_failed'] and steps[-1] is True
+        finally:
+            for gate in release:gate.set()
 
 
 def test_service_collects_large_record_once_for_gui_and_worker(tmp_path,monkeypatch):

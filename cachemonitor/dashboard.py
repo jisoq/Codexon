@@ -156,6 +156,7 @@ class Dashboard(TrayWindow):
         self.history_display='table';self.history_hovered_call=None
         self.page_scopes={};self._history_chart_restore=None
         self.record_request=0;self.record_status='';self.aggregate_records=[]
+        self.record_request_token=None
         self.interaction_time=0;self.deferred_result=None;self.defer_timer=QTimer(self)
         self.defer_timer.setSingleShot(True);self.defer_timer.timeout.connect(self.apply_deferred)
         self.pending_timer=QTimer(self);self.pending_timer.setSingleShot(True);self.pending_timer.setInterval(150)
@@ -253,8 +254,10 @@ class Dashboard(TrayWindow):
         self.restore_preferences();self.restoring=False;self.change_page(self.current_page)
         if start_worker:
             if homes and static_snapshot is None:self.start_quota_service(homes[0])
-            self.worker=AnalysisBridge(homes,index_path,static_snapshot,model_evidence_path,quota_path)
+            self.worker=AnalysisBridge(homes,index_path,static_snapshot,model_evidence_path,quota_path,
+                                       cache_floor=self.confirmed_notifications.cache_floor)
             self.worker.snapshot.connect(self.receive);self.worker.result.connect(self.analysis_ready)
+            self.worker.stale.connect(self.analysis_stale)
             self.worker.fault.connect(self.analysis_failed);self.worker.record.connect(self.record_ready);self.worker.start();self.render()
         elif static_snapshot is not None:self.receive(static_snapshot)
         self.setCentralWidget(root)
@@ -1073,6 +1076,7 @@ class Dashboard(TrayWindow):
         self.refresh_choices();index=value.get('index',{})
         self.index_status.setText('수집 중' if index.get('loading') else '수집 확인 필요' if value.get('errors') else '로컬 기록 수집 중')
         self.show_confirmed_events(self.confirmed_notifications.cache(value.get('cache_candidates',value['sessions'])))
+        if self.worker:self.worker.set_cache_floor(self.confirmed_notifications.cache_floor)
         self.show_confirmed_events(self.confirmed_notifications.http(value['sessions']))
         self.show_confirmed_events(self.confirmed_notifications.model_candidates(value['model_candidates']) if 'model_candidates' in value else self.confirmed_notifications.models(value['sessions']))
         self.refresh_tray();self.render(automatic=True)
@@ -1091,6 +1095,23 @@ class Dashboard(TrayWindow):
             self.deferred_result=(message['id'],message['result'],self.pending_query)
             self.defer_timer.start(160)
         else:self.apply_result(message['result'],self.pending_query,self.pending_automatic)
+
+    def analysis_stale(self,message):
+        consumer=message.get('consumer')
+        if consumer=='record':
+            if message['id']!=self.record_request:return
+            if self.record_request_token!=(self.view_result or {}).get('prepared_token'):return
+            self.record_request+=1;self.exact_record=None;self.record_status=''
+            self.record_message.setText('');self.detail_scroll.hide()
+        elif consumer=='population':
+            from .quick_runtime import QuickPlot
+            pending=[self.quick.quickWindow().contentItem()]
+            while pending:
+                item=pending.pop()
+                if isinstance(item,QuickPlot):item.clearHover()
+                pending.extend(item.childItems())
+        else:return
+        self.client_cache.clear();self.render()
 
     @batched_updates
     def apply_result(self,result,query,automatic=False):
@@ -1631,11 +1652,15 @@ class Dashboard(TrayWindow):
         scope=self.selected_call_scope or self.selected_session
         if not scope or not self.selected_call:return
         self.record_request+=1;identity_value=(*scope,self.selected_call)
-        if self.async_mode and self.worker:self.worker.request_record(self.record_request,identity_value)
+        self.record_request_token=(self.view_result or {}).get('prepared_token')
+        if self.async_mode and self.worker:self.worker.request_record(self.record_request,identity_value,self.record_request_token)
         else:self.record_ready({'id':self.record_request,'row':self.engine.record(*identity_value)})
 
     def record_ready(self,value):
         if value['id']!=self.record_request:return
+        if self.record_request_token!=(self.view_result or {}).get('prepared_token'):return
+        if value.get('prepared_token')!=self.record_request_token:
+            self.analysis_stale(dict(value,consumer='record'));return
         self.exact_record=value.get('row')
         if self.exact_record:
             self.render_record_detail(self.exact_record)

@@ -1,21 +1,15 @@
 """Analyze shared collector snapshots outside Qt's UI thread."""
 import multiprocessing as mp
-from multiprocessing.connection import wait
 import threading
-import time
 import traceback
-import sqlite3
-from pathlib import Path
 from datetime import datetime, timedelta
 from bisect import bisect_left
 from PySide6.QtCore import QThread, Signal
 from .analysis_engine import AnalysisEngine
 from .analytics import _local_timestamp
-from .usage_collection import CollectionClient
-from .quota_cycles import QuotaLedger, ledger_path
+from .quota_cycles import ledger_path
 from .overlay_data import OverlaySummaries
 from .analysis_delivery import SnapshotPublisher, SnapshotReceiver
-from .pricing import pricing_signature
 
 
 def expiry(engine,q):
@@ -24,6 +18,10 @@ def expiry(engine,q):
     duration=1800 if q.get('period')=='30m' else None
     if q.get('period') in ('today','7d','30d') or q['page']==0:
         candidates.append(_local_timestamp(datetime.combine(datetime.fromtimestamp(now).date()+timedelta(days=1),datetime.min.time())))
+    if hasattr(engine,'boundary_times'):
+        if duration:candidates.extend(value+duration+.002 for value in engine.boundary_times(q['start']))
+        if q.get('period')!='custom':candidates.extend(value+.002 for value in engine.boundary_times(q['end']))
+        return min(candidates)
     # Expiry needs only the next boundary, not a separately sorted global
     # timeline rebuilt whenever any session changes.
     for state in engine.sessions.values():
@@ -37,220 +35,77 @@ def expiry(engine,q):
     return min(candidates)
 
 
-def process_main(connection,homes,index_path,static_snapshot=None,model_evidence_path=None,quota_path=None):
-    quota_path=quota_path or ledger_path(index_path)
-    collector=None
-    ledger=None
-    ledger_issue=None
-    ledger_retry=0
-    ledger_failures=0
-    imported=False
-    import_started=False
-    next_import=0
-    last_slow_report=float('-inf')
-    diagnostic_path=Path(quota_path).with_suffix('.analysis.sqlite')
-    def record_timing(stages,source_age=0):
-        nonlocal last_slow_report
-        from .quota_diagnostics import record_slow_cycle
-        last_slow_report=record_slow_cycle(diagnostic_path,stages,source_age,last_slow_report)
-    def disable_ledger(error):
-        nonlocal ledger,ledger_issue,ledger_retry,ledger_failures
-        from .quota_diagnostics import record_failure, storage_issue
-        record_failure(quota_path, 'usage ledger sync', error)
-        ledger_issue=storage_issue(error)
-        ledger_failures+=1
-        ledger_retry=time.monotonic()+min(60,5*2**min(ledger_failures-1,4))
-        if ledger is not None:
-            try:ledger.db.rollback()
-            except (sqlite3.Error,AttributeError):pass
-            try:ledger.close()
-            except sqlite3.Error:pass
-        ledger=None
+def process_main(connection,homes,index_path,static_snapshot=None,model_evidence_path=None,quota_path=None,cache_floor=None):
+    """Use prepared storage normally; explicit snapshots remain fixture inputs."""
+    if static_snapshot is None:
+        from .prepared_runtime import process_main as prepared_process_main
+        try:
+            replacement=prepared_process_main(connection,homes,index_path,model_evidence_path,
+                                              quota_path or ledger_path(index_path),cache_floor)
+            if replacement is not None:
+                return process_main(connection,homes,index_path,replacement,model_evidence_path,quota_path,cache_floor)
+            return
+        finally:
+            connection.close()
     try:
         engine=AnalysisEngine()
         overlays=OverlaySummaries()
         publisher=SnapshotPublisher()
-        analysis_identity=None
-        snapshot=None
-        frozen=static_snapshot is not None
-        next_poll=0
-        pending=None
-        ready=None
-        notification=None
-        if static_snapshot is not None:
-            snapshot=static_snapshot
-            engine.ingest(snapshot['sessions'])
-        else:
-            collector=CollectionClient(homes,index_path,model_evidence_path)
-            try:ledger=QuotaLedger(quota_path)
-            except sqlite3.Error as error:disable_ledger(error)
-        def publish(heartbeat=False):
-            light=(publisher.heartbeat(snapshot,engine) if heartbeat else
-                   publisher.publish(snapshot,engine,overlays.collect(engine)))
-            connection.send({'kind':'snapshot','value':light})
-        def import_history():
-            nonlocal imported,next_import,ledger_issue,ledger_failures
-            started=time.monotonic()
-            try:
-                if hasattr(ledger,'import_observations_step'):
-                    imported=ledger.import_observations_step(collector.path,snapshot['homes'])
-                else:
-                    # Compatibility for external ledger adapters.
-                    for home in snapshot['homes']:ledger.import_observations(collector.path,home)
-                    imported=True
-            except sqlite3.Error as error:
-                disable_ledger(error)
-            if ledger and imported:
-                ledger_issue=None;ledger_failures=0
-            next_import=time.monotonic()+.05
-            record_timing({'history_import':time.monotonic()-started})
+        snapshot=static_snapshot
+        engine.ingest(snapshot['sessions'])
+        pending=ready=None
         details={}
+
+        def publish():
+            connection.send(dict(kind='snapshot',value=publisher.publish(snapshot,engine,overlays.collect(engine))))
+
         def send_details(all_pending=True):
             while details:
-                detail_started=time.monotonic()
                 message=details.pop(next(iter(details)))
                 if message['kind']=='population':
                     from .dashboard_views import population_summary
                     connection.send(dict(kind='population',id=message['id'],
                         summary=population_summary(engine,message['population'],message.get('assumptions'))))
+                elif message['kind']=='overlay_detail':
+                    connection.send(dict(kind='overlay_detail',id=message['id'],summary=message['summary']))
                 else:
-                    connection.send({'kind':'record','id':message['id'],
-                                     'row':engine.record(*message['identity'])})
-                record_timing({'detail':time.monotonic()-detail_started})
+                    connection.send(dict(kind='record',id=message['id'],row=engine.record(*message['identity'])))
                 if not all_pending:break
-        if snapshot is not None: publish()
+
+        publish()
         while True:
             while connection.poll():
-                message=connection.recv()
-                if message['kind']=='stop': return
-                # One replaceable request per detail consumer, within ordered
-                # snapshot/control segments. Never move work across a barrier.
-                if message['kind'] in ('freeze','replace','sync'):send_details()
-                if message['kind']=='freeze':
-                    frozen=True
-                    if collector:collector.stop_notifications()
-                    notification=None
-                elif message['kind']=='replace':
-                    analysis_identity=None
-                    ready=None;snapshot=message['snapshot']; engine.ingest(snapshot['sessions']); publish()
-                elif message['kind']=='query': pending=message;ready=None
-                elif message['kind']=='sync':
-                    publisher=SnapshotPublisher()
-                    if snapshot is not None:publish()
-                elif message['kind'] in ('population','record'):
-                    details.pop(message['kind'],None)
-                    details[message['kind']]=message
+                message=connection.recv();kind=message['kind']
+                if kind=='stop':return
+                if kind in ('freeze','replace','sync'):send_details()
+                if kind=='replace':
+                    ready=None;snapshot=message['snapshot']
+                    engine.ingest(snapshot['sessions']);publish()
+                elif kind=='query':pending=message;ready=None
+                elif kind=='sync':
+                    publisher=SnapshotPublisher();publish()
+                elif kind in ('population','record','overlay_detail'):
+                    details.pop(kind,None);details[kind]=message
             send_details(False)
             if ready is not None:
                 connection.send(ready);ready=None
-            if not frozen and time.monotonic()>=next_poll and (snapshot is None or pending is None or time.monotonic()>=next_poll+1):
-                if ledger is None and time.monotonic()>=ledger_retry:
-                    try:ledger=QuotaLedger(quota_path)
-                    except sqlite3.Error as error:disable_ledger(error)
-                if ledger is not None and hasattr(ledger,'activity_cursor') and not getattr(ledger,'_activity_bound',False):
-                    try:
-                        cursor=ledger.activity_cursor()
-                        if cursor:collector.channel.activity_ack=cursor
-                        ledger._activity_bound=True
-                    except sqlite3.Error as error:disable_ledger(error)
-                stages={};stage_started=time.monotonic()
-                def completed(stage):
-                    nonlocal stage_started
-                    at=time.monotonic();stages[stage]=at-stage_started;stage_started=at
-                snapshot=collector.poll()
-                completed('collection_read')
-                mode_identity=None
-                if ledger:
-                    try:mode_identity=ledger.enrich_modes(snapshot)
-                    except sqlite3.Error as error:disable_ledger(error)
-                completed('mode_evidence')
-                catalog_identity=getattr(collector,'analysis_identity',None)
-                identity=((catalog_identity,mode_identity,pricing_signature())
-                          if catalog_identity is not None and mode_identity is not None else None)
-                reusable=identity is not None and identity==analysis_identity
-                # The committed catalog covers owner state except remaining,
-                # which publication omits. Envelope clocks and ledger duties
-                # still consume the newly read snapshot on every heartbeat.
-                if not reusable:engine.ingest(snapshot['sessions'])
-                analysis_identity=identity
-                completed('analysis')
-                if ledger:
-                    try:
-                        ledger.sync(engine,snapshot)
-                        if snapshot.get('activity_cursor'):collector.channel.acknowledge_activity(snapshot)
-                    except sqlite3.Error as error:disable_ledger(error)
-                completed('quota_sync')
-                if ledger and not imported and not snapshot['index']['loading']:
-                    # Verified session usage is independent of historical quota
-                    # recovery. Leave earlier ledger faults unresolved until it ends.
-                    if snapshot['homes'] and not import_started:
-                        snapshot={**snapshot,'ledger_status_known':False}
-                        publish()
-                        completed('initial_publication')
-                    import_started=True
-                    import_history()
-                    completed('history_import')
-                if ledger and imported:
-                    ledger_issue=None
-                    ledger_failures=0
-                # The quota ledger is independent of observed per-call usage.
-                # Keep its diagnostics without turning valid session values into
-                # missing data or replacing/repairing the user's quota history.
-                snapshot={**snapshot,'ledger_status_known':imported or ledger is None,
-                    'ledger_fault':dict(ledger_failed=bool(ledger_issue))}
-                if ledger_issue:snapshot={**snapshot,'ledger_error':ledger_issue}
-                publish(heartbeat=reusable)
-                completed('publication')
-                record_timing(stages,max(0,time.time()-snapshot['ts']))
-                notification=collector.notification_connection()
-                delay=.1 if snapshot['index']['loading'] else 3
-                if notification is not None and not snapshot['index']['loading']:
-                    age=time.time()-snapshot['ts']
-                    delay=3 if age>30 else min(10,max(.01,30-age+.01))
-                if ledger is None:delay=min(delay,max(.01,ledger_retry-time.monotonic()))
-                next_poll=time.monotonic()+delay
-            if pending is not None and snapshot is not None:
-                request=pending; pending=None
-                query_started=time.monotonic()
+            if pending is not None:
+                request=pending;pending=None
                 try:
                     result=engine.page_query(request['query'])
-                    ready={'kind':'result','id':request['id'],'logical':request['logical'],
-                           'result':result,'valid_until':result.get('valid_until',expiry(engine,request['query'])),
-                           'metrics':dict(engine.metrics)}
+                    ready=dict(kind='result',id=request['id'],logical=request['logical'],result=result,
+                               valid_until=result['valid_until'] if 'valid_until' in result else expiry(engine,request['query']),
+                               metrics=dict(engine.metrics))
                     continue
                 except Exception:
-                    connection.send({'kind':'error','id':request['id'],'error':traceback.format_exc(limit=6)})
-                finally:
-                    record_timing({'query':time.monotonic()-query_started})
-            if (not frozen and ledger is not None and not imported and snapshot is not None
-                    and not snapshot['index']['loading'] and time.monotonic()>=next_import):
-                import_history()
-                if imported or ledger is None:
-                    snapshot={**snapshot,'ledger_status_known':True,
-                              'ledger_fault':dict(ledger_failed=bool(ledger_issue))}
-                    if ledger_issue:snapshot={**snapshot,'ledger_error':ledger_issue}
-                    else:snapshot.pop('ledger_error',None)
-                    publish(heartbeat=True)
-            # Incoming UI requests wake this wait immediately. Only collection
-            # needs a timer; an idle analyzer does not need 50 wakeups a second.
-            if details:continue
-            delay=1. if frozen else max(0.,next_poll-time.monotonic())
-            if not frozen and ledger is not None and not imported and import_started:
-                delay=min(delay,max(0.,next_import-time.monotonic()))
-            if notification is None:connection.poll(delay)
-            elif notification in wait([connection,notification],timeout=delay):
-                notice=collector.consume_notification()
-                if notice is True:next_poll=0
-                elif notice is None:next_poll=min(next_poll,time.monotonic()+3)
-                notification=collector.notification_connection() if notice is False else None
+                    connection.send(dict(kind='error',id=request['id'],error=traceback.format_exc(limit=6)))
+            if not details:connection.poll(1.)
     except (EOFError,BrokenPipeError,OSError):
         pass
     except Exception:
-        try: connection.send({'kind':'fatal','error':traceback.format_exc(limit=6)})
-        except (OSError,EOFError): pass
+        try:connection.send(dict(kind='fatal',error=traceback.format_exc(limit=6)))
+        except (OSError,EOFError):pass
     finally:
-        if collector: collector.close()
-        if ledger: ledger.close()
         connection.close()
 
 
@@ -263,11 +118,14 @@ class AnalysisBridge(QThread):
     fault=Signal(object)
     record=Signal(object)
     population=Signal(object)
-    def __init__(self,homes,index_path=None,static_snapshot=None,model_evidence_path=None,quota_path=None):
+    overlay_detail=Signal(object)
+    stale=Signal(object)
+    def __init__(self,homes,index_path=None,static_snapshot=None,model_evidence_path=None,quota_path=None,cache_floor=None):
         super().__init__()
         self.homes,self.index_path,self.static_snapshot=homes,index_path,static_snapshot
         self.model_evidence_path=model_evidence_path
         self.quota_path=quota_path
+        self.cache_floor=cache_floor
         self.lock=threading.Lock()
         self.pending=None
         self.commands=[]
@@ -286,23 +144,43 @@ class AnalysisBridge(QThread):
         self.commands.append(command)
     def freeze_collection(self):
         with self.lock: self.enqueue_latest({'kind':'freeze'})
-    def request_record(self,request_id,identity):
+    def set_cache_floor(self,value):
+        with self.lock:
+            if value==self.cache_floor:return
+            self.cache_floor=value
+            self.enqueue_latest({'kind':'cache_floor','value':value})
+    def request_record(self,request_id,identity,prepared_token=None):
         with self.lock:
             self.last_record={'kind':'record','id':request_id,'identity':identity}
+            if prepared_token is not None:self.last_record['prepared_token']=prepared_token
             self.enqueue_latest(self.last_record)
     def request_population(self,request_id,population,assumptions=None):
         with self.lock:self.enqueue_latest(dict(kind='population',id=request_id,population=population,assumptions=assumptions))
+
+    def request_overlay_detail(self,request_id,summary,health=False):
+        with self.lock:self.enqueue_latest(dict(kind='overlay_detail',id=request_id,summary=summary,
+            health=health,prepared_token=summary.get('_prepared_token')))
 
     def replace_snapshot(self,snapshot):
         with self.lock:
             self.static_snapshot=snapshot
             self.enqueue_latest({'kind':'replace','snapshot':snapshot})
+
+    def _deliver_result(self,message):
+        kind=message['kind']
+        consumer=message.get('consumer') if kind=='stale' else kind
+        if consumer=='record':
+            with self.lock:
+                if self.last_record and self.last_record['id']==message['id']:self.last_record=None
+        if consumer=='overlay_detail':self.overlay_detail.emit(message);return
+        {'record':self.record,'population':self.population,'result':self.result,'stale':self.stale}[kind].emit(message)
+
     def run(self):
         while not self.isInterruptionRequested():
             receiver=SnapshotReceiver()
             context=mp.get_context('spawn')
             parent,child=context.Pipe()
-            self.process=context.Process(target=process_main,args=(child,self.homes,self.index_path,self.static_snapshot,self.model_evidence_path,self.quota_path),daemon=True)
+            self.process=context.Process(target=process_main,args=(child,self.homes,self.index_path,self.static_snapshot,self.model_evidence_path,self.quota_path,self.cache_floor),daemon=True)
             try:
                 self.process.start()
             except (OSError,RuntimeError) as error:
@@ -326,12 +204,7 @@ class AnalysisBridge(QThread):
                             except ValueError:
                                 parent.send({'kind':'sync'});receiver=SnapshotReceiver();continue
                             if value is not None:self.snapshot.emit(value)
-                        elif message['kind']=='record':
-                            with self.lock:
-                                if self.last_record and self.last_record['id']==message['id']:self.last_record=None
-                            self.record.emit(message)
-                        elif message['kind']=='population':self.population.emit(message)
-                        elif message['kind']=='result': self.result.emit(message)
+                        elif message['kind'] in ('record','population','overlay_detail','result','stale'):self._deliver_result(message)
                         elif message['kind'] in ('error','fatal'):
                             self.failure.emit(message['error'])
                             self.fault.emit(dict(query_failed=message['kind']=='error',

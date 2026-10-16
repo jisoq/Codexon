@@ -273,11 +273,12 @@ class PublicationWaiter:
         self.sender.close()
 
 
-def request(path, value, *, timeout=None, cancel=None):
+def request(path, value, *, timeout=None, cancel=None, response_limits=None):
     """Reconnect once within one deadline; discovery is cached between requests."""
     path = Path(path)
     key = str(path)
     deadline = time.monotonic() + (TIMEOUT if timeout is None else timeout)
+    metadata_limit,body_limit=response_limits if response_limits is not None else (None,None)
     encoded = _json(value)
     if len(encoded) > REQUEST_LIMIT:
         raise ValueError('Collection request exceeds its limit')
@@ -301,8 +302,8 @@ def request(path, value, *, timeout=None, cancel=None):
                 _send(connection, _signature(token, nonce, encoded), deadline)
                 _frame(connection, encoded, deadline)
                 signature = _receive(connection, 32, deadline)
-                metadata = _read_frame(connection, deadline)
-                body = _read_frame(connection, deadline)
+                metadata = _read_frame(connection, deadline,metadata_limit)
+                body = _read_frame(connection, deadline,body_limit)
                 if not hmac.compare_digest(signature, _signature(token, nonce, metadata, body)):
                     raise ValueError('Collection response authentication failed')
                 return json.loads(metadata), body

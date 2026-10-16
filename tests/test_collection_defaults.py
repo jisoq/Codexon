@@ -99,10 +99,35 @@ def test_custom_index_does_not_import_default_history(default_home,tmp_path):
     finally:service.close()
 
 
+def test_encoded_owner_metadata_yields_and_preserves_scalar_types():
+    from hashlib import sha256
+    import math
+    import zlib
+    from cachemonitor.collection_stream import encoded_owner_metadata
+    from cachemonitor.usage_collection import CollectionCatalogUnavailable,owner_metadata
+    value=dict(home='owned-home',id='owner',activity=-0.0,spawn_depth=10**30,pending=False,
+               history=[dict(key=str(i),output=i) for i in range(1024)])
+    payload=zlib.compress(json.dumps(value).encode())
+    digest=sha256(payload).hexdigest()
+    recovery=encoded_owner_metadata(payload,('owned-home','owner'),digest,max_plain_bytes=1024*1024)
+    yields=0
+    while True:
+        try:assert next(recovery) is None;yields+=1
+        except StopIteration as complete:
+            actual=complete.value;break
+    assert yields>0 and actual==owner_metadata(value)
+    assert type(actual['spawn_depth']) is int and type(actual['pending']) is bool
+    assert type(actual['activity']) is float and math.copysign(1,actual['activity'])==-1
+    with pytest.raises(CollectionScopeError):
+        list(encoded_owner_metadata(payload,('owned-home','owner'),'0'*64,max_plain_bytes=1024*1024))
+    with pytest.raises(CollectionCatalogUnavailable):
+        list(encoded_owner_metadata(payload,('owned-home','owner'),digest,max_plain_bytes=1))
+
+
 def test_closed_collection_reuses_bodies_and_replays_only_changed_owners(tmp_path,monkeypatch):
-    from cachemonitor import collection_replay
+    from cachemonitor import collection_replay,collection_stream
     from cachemonitor.model_evidence import EvidenceStore
-    from cachemonitor.usage_collection import CollectionChannel
+    from cachemonitor.usage_collection import CollectionChannel,owner_metadata,owner_lineage
     from test_core import TID,usage
     home,path=fixture_home(tmp_path)
     other='other';second=home/'second.jsonl'
@@ -145,9 +170,41 @@ def test_closed_collection_reuses_bodies_and_replays_only_changed_owners(tmp_pat
         assert service.index.replay.db.execute('SELECT count(*) FROM owners').fetchone()[0]==2
         assert all(not session.requests for session in service.index.monitor.sessions.values())
     finally:service.close()
+    # A valid older proof has no owner metadata, but its body is still exact.
+    with sqlite3.connect(service.channel.companion('.collection-replay.sqlite')) as db:
+        for owner,proof,header,digest,fingerprint,evidence_proof in db.execute(
+                'SELECT id,proof,header,digest,fingerprint,evidence FROM owners').fetchall():
+            state=json.loads(header);state['header'].pop('_owner_metadata')
+            header=collection_replay.encoded(state)
+            db.execute('UPDATE owners SET header=?,integrity=? WHERE id=?',
+                (header,collection_replay.integrity(proof,header,digest,fingerprint,evidence_proof),owner))
+    upgrades=[];upgrade=collection_stream.encoded_owner_metadata
+    def recover(payload,key,digest,**kwargs):
+        upgrades.append(key)
+        return (yield from upgrade(payload,key,digest,**kwargs))
+    monkeypatch.setattr(collection_stream,'encoded_owner_metadata',recover)
     rebuilt.clear();service=CollectorService([home],target,evidence)
     try:
         assert collect(service,20001)==first and not rebuilt
+        assert not upgrades
+        catalog=service.channel.read_catalog(source='live',include_metadata=True,metadata_kind='lineage')
+        assert {key[1]:entry['owner_lineage'] for key,entry in catalog['owners'].items()}=={
+            sid:owner_lineage(value) for sid,value in first.items()}
+        assert all(entry['owner_metadata'] is None for entry in
+                   service.channel.read_catalog(source='live',include_metadata=True)['owners'].values())
+    finally:service.close()
+    service=CollectorService([home],target,evidence)
+    try:
+        # Direct callers retain the original opt-in full-header repair behavior.
+        opening=collection_replay.CollectionReplay.open
+        with monkeypatch.context() as patch:
+            patch.setattr(collection_replay.CollectionReplay,'open',
+                          lambda channel,index,**kwargs:opening(channel,index))
+            assert collect(service,20001.5)==first and not rebuilt
+        assert {key[1] for key in upgrades}=={TID,other} and len(upgrades)==2
+        catalog=service.channel.read_catalog(source='live',include_metadata=True)
+        assert {key[1]:entry['owner_metadata'] for key,entry in catalog['owners'].items()}=={
+            sid:owner_metadata(value) for sid,value in first.items()}
         # Correct an old row while another observation advances the sequence.
         store=EvidenceStore(evidence)
         try:

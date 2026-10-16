@@ -27,6 +27,72 @@ class CollectionPending(RuntimeError):
     """An intentional handoff or an owner awaiting identification, not a fault."""
 
 
+class CollectionCatalogUnavailable(CollectionPending):
+    def __init__(self,reason):
+        self.reason=reason
+        super().__init__('수집 목록 선택 읽기 대기: '+reason)
+
+
+CATALOG_PROTOCOL=6
+CATALOG_PAGE_ROWS=4096
+CATALOG_PAGE_BYTES=4*1024*1024
+CATALOG_HEADER_BYTES=1024*1024
+CATALOG_OWNER_BYTES=16*1024
+CATALOG_METADATA_BYTES=16*1024*1024
+SELECTED_OWNER_ROWS=16
+SELECTED_BODY_BYTES=4*1024*1024
+SELECTED_JSON_BYTES=8*1024*1024
+SELECTED_OBJECT_BYTES=64*1024*1024
+OWNER_FIELDS=('home','id','title','model','provider','cwd','project','project_id','project_name','project_source',
+              'source','archived','parent_thread_id','agent_path','agent_nickname','spawn_depth','pending','activity')
+# Optional captured compatibility values share the existing metadata/page
+# admission. Countdown-only changes do not change the committed catalog identity.
+CATALOG_STATE=('collection_complete','status','totals','remaining')
+
+
+def _catalog_weight(value,budget):
+    """Bound admitted metadata before making an encoded or copied envelope."""
+    stack=[iter((value,))];weight=0
+    while stack:
+        item=next(stack[-1],stack)
+        if item is stack:stack.pop();continue
+        if isinstance(item,(dict,list,tuple)):
+            weight+=64+32*len(item)
+            stack.append(iter(item.items() if isinstance(item,dict) else item))
+        elif isinstance(item,str):weight+=64+4*len(item)
+        elif item is None or type(item) in (bool,int,float):weight+=32
+        else:raise ValueError('catalog_metadata_type')
+        if weight>budget or len(stack)>32:raise ValueError('catalog_metadata_budget')
+    return weight
+
+
+def owner_metadata(session):
+    """Metadata is bound to an encoded body's existing integrity proof."""
+    from .collection_replay import EncodedSession
+    source=session.get('_owner_metadata') if isinstance(session,EncodedSession) else session
+    if not isinstance(source,dict):return None
+    value={key:source[key] for key in OWNER_FIELDS if key in source}
+    if any(item is not None and type(item) not in (str,int,float,bool) for item in value.values()):return None
+    try:_catalog_weight(value,CATALOG_OWNER_BYTES)
+    except ValueError:return None
+    return value
+
+
+def owner_lineage(session):
+    """Return proven parent presence, or None when its proof is unavailable."""
+    from .collection_replay import EncodedSession
+    if isinstance(session,EncodedSession):
+        source=session.get('_owner_lineage')
+        if source is None:source=session.get('_owner_metadata')
+    else:source=session
+    if not isinstance(source,dict):return None
+    value={key:source[key] for key in ('parent_thread_id',) if key in source}
+    if any(item is not None and type(item) not in (str,int,float,bool) for item in value.values()):return None
+    try:_catalog_weight(value,CATALOG_OWNER_BYTES)
+    except ValueError:return None
+    return value
+
+
 def publish_collector_fault(path,scope,instance,error,*,facts=None):
     from .app_errors import exception_facts
     from .observer_control import atomic_write
@@ -79,11 +145,12 @@ class CollectionChanges:
     corrections as well as appends. An activity revision also covers ordering
     and removal. Callers without those guarantees retain full validation.
     """
-    __slots__=('owner','sessions','activities','activity_revision')
+    __slots__=('owner','sessions','activities','activity_revision','appends')
 
-    def __init__(self,owner,sessions,activities,*,activity_revision=None):
+    def __init__(self,owner,sessions,activities,*,activity_revision=None,appends=None):
         self.owner=owner;self.sessions=sessions;self.activities=activities
         self.activity_revision=activity_revision
+        self.appends=appends or {}
 
 
 class LiveCollection:
@@ -105,9 +172,28 @@ class LiveCollection:
         prior_sessions=previous.get('session_tokens',{}) if same_owner else {}
         prior_activities=previous.get('activity_tokens',{}) if same_owner else {}
         session_tokens={};activity_tokens={}
+        append_bindings={}
         sessions={};activities={};manifest=[];activity_manifest=[]
         prior_entries=previous['entries'] if same_epoch else {}
-        entries={};state_revisions={};meaningful_changed=not same_epoch
+        entries={};state_revisions={};meaningful_changed=not same_epoch;metadata_remaining=CATALOG_METADATA_BYTES
+        # Parent proofs take priority inside the existing shared allowance. The
+        # temporary map shares its values with entries and retains no histories.
+        from .collection_replay import EncodedSession
+        from .collection_append import AppendPacket
+        lineages={}
+        for session in snapshot['sessions']:
+            key=(session['home'],session['id']);old=prior_entries.get(key)
+            token=changes.sessions.get(key) if same_owner else None
+            unchanged=(old is not None and (isinstance(session,EncodedSession) and session.digest==old['body_digest']
+                       or token is not None and token==prior_sessions.get(key)))
+            if unchanged and old.get('owner_lineage') is not None:
+                lineage=old['owner_lineage'];weight=old['owner_lineage_bytes']
+            else:
+                lineage=owner_lineage(session)
+                weight=_catalog_weight(lineage,CATALOG_OWNER_BYTES)+256 if lineage is not None else 0
+            if lineage is None:continue
+            if weight>metadata_remaining:continue
+            metadata_remaining-=weight;lineages[key]=(lineage,weight)
         def row(value,old,token,prior,key):
             if token is not None and old is not None and prior.get(key)==token:
                 return old
@@ -115,7 +201,6 @@ class LiveCollection:
             if old is not None and old[1]==fingerprint:return old
             payload=zlib.compress(json.dumps(value,ensure_ascii=False,separators=(',',':')).encode(),1)
             return sequence,fingerprint,payload,sha256(payload).hexdigest()
-        from .collection_replay import EncodedSession
         for session in snapshot['sessions']:
             key=(session['home'],session['id'])
             token=changes.sessions.get(key) if trusted else None
@@ -128,10 +213,31 @@ class LiveCollection:
                 heavy={key:value for key,value in session.items() if key not in self.volatile}
                 saved=row(heavy,old_body,token,prior_sessions,key)
             sessions[key]=saved
+            packet=changes.appends.get(key) if same_owner else None
+            if (isinstance(packet,AppendPacket) and packet.producer is changes.owner
+                    and packet.key==key and packet.prior_token==prior_sessions.get(key)
+                    and packet.token==token and old_body is not None
+                    and old_body[3]!=saved[3]):
+                append_bindings[key]=dict(packet=packet,epoch=epoch,
+                    prior_body_digest=old_body[3],body_digest=saved[3])
+            elif same_owner and old_body is not None and old_body[3]==saved[3]:
+                retained=previous.get('append_bindings',{}).get(key)
+                if retained is not None and retained['packet'].token==token:
+                    append_bindings[key]=retained
             state={field:value for field,value in session.items() if field in self.volatile}
             old=prior_entries.get(key)
+            lineage,lineage_bytes=lineages.get(key,(None,0))
+            metadata=(old.get('owner_metadata') if old is not None and old['body_digest']==saved[3]
+                      and old.get('owner_metadata') is not None else owner_metadata(session))
+            metadata_bytes=(old['owner_metadata_bytes'] if old is not None and metadata is old.get('owner_metadata')
+                            and 'owner_metadata_bytes' in old else _catalog_weight(metadata,CATALOG_OWNER_BYTES) if metadata is not None else 0)
+            if metadata_bytes>metadata_remaining:metadata=None;metadata_bytes=0
+            metadata_remaining-=metadata_bytes
             if old is not None and old['revision']==saved[0] and old['state']==state:
-                entry=old;state_revisions[key]=previous['state_revisions'][key]
+                entry=(old if old.get('owner_metadata')==metadata and old.get('owner_lineage')==lineage else
+                       {**old,'owner_metadata':metadata,'owner_metadata_bytes':metadata_bytes,
+                        'owner_lineage':lineage,'owner_lineage_bytes':lineage_bytes})
+                state_revisions[key]=previous['state_revisions'][key] if entry is old else sequence
             else:
                 if (old is None or old['revision']!=saved[0] or
                         {k:v for k,v in old['state'].items() if k!='remaining'}!=
@@ -139,7 +245,8 @@ class LiveCollection:
                 # Source-owned nested values can change after this publication.
                 # Freeze only changed envelopes; unchanged entries are immutable.
                 entry=dict(home=key[0],sid=key[1],revision=saved[0],body_digest=saved[3],
-                           state=json.loads(json.dumps(state,ensure_ascii=False)))
+                           state=json.loads(json.dumps(state,ensure_ascii=False)),owner_metadata=metadata,
+                           owner_metadata_bytes=metadata_bytes,owner_lineage=lineage,owner_lineage_bytes=lineage_bytes)
                 state_revisions[key]=sequence
             entries[key]=entry;manifest.append(entry)
         activities_present='request_activity' in snapshot and not snapshot.get('activity_stream')
@@ -180,8 +287,9 @@ class LiveCollection:
                     durable=durable,publication=(epoch,sequence),
                     change_owner=changes.owner if trusted else None,
                     session_tokens=session_tokens,activity_tokens=activity_tokens,
+                    append_bindings=append_bindings,
                     activity_revision=activity_revision,activity_digest=activity_digest,
-                    activities_present=activities_present)
+                    activities_present=activities_present,owner_metadata_bytes=CATALOG_METADATA_BYTES-metadata_remaining)
 
     def publish(self,candidate):
         with self.changed:
@@ -225,6 +333,7 @@ class LiveCollection:
         if value.get('close') or value.get('lease_only'):return dict(ready=current is not None),b''
         if current is None:return dict(ready=False),b''
         if value.get('header_only'):return dict(ready=True,header=current['header']),b''
+        if value.get('protocol')==CATALOG_PROTOCOL:return self.catalog_request(current,value)
         # Older clients can still use the unchanged durable SQLite schema.
         protocol=value.get('protocol')
         if protocol not in (3,4,5):return dict(ready=False),b''
@@ -253,7 +362,8 @@ class LiveCollection:
                 if not full and changed<=since:continue
                 payload=rows[key][2] if entry['revision']>since else b''
                 if id_key=='sid' and key not in exclusions and key in recovered and recovered[key]==entry.get('body_digest'):payload=b''
-                result.append({**entry,'size':len(payload)})
+                result.append({**{field:item for field,item in entry.items()
+                                  if field not in ('owner_metadata','owner_metadata_bytes','owner_lineage','owner_lineage_bytes')},'size':len(payload)})
                 if payload:chunks.append(payload)
             return result
         sessions=manifest(current['envelope']['sessions'],current['sessions'],'sid')
@@ -264,6 +374,96 @@ class LiveCollection:
                     sessions=sessions,activities=activities,
                     **(dict(checkpoint_filter=True) if protocol==5 else {}),
                     **(dict(full=full) if protocol in (4,5) else {})),b''.join(chunks)
+
+    def catalog_request(self,current,value):
+        """Slice the existing immutable manifest; never populate another catalog."""
+        publication=current['publication'];committed=current.get('catalog_identity')
+        base=dict(protocol=CATALOG_PROTOCOL,publication=publication,catalog_identity=committed)
+        def fail(reason):return dict(base,ready=False,error=reason),b''
+        if committed is None:return fail('uncommitted')
+        def valid_identity(identity):
+            return isinstance(identity,(list,tuple)) and len(identity)==2 and isinstance(identity[0],str) and type(identity[1]) is int
+        expected_commit=value.get('catalog_identity')
+        if expected_commit is not None and (not valid_identity(expected_commit) or tuple(expected_commit)!=tuple(committed)):return fail('stale')
+        homes=value.get('homes',[])
+        if not isinstance(homes,list) or any(not isinstance(home,str) for home in homes):return fail('scope')
+        allowed=set(homes);kind=value.get('read')
+        try:
+            header=current['header'];_catalog_weight(header,CATALOG_HEADER_BYTES)
+            complete=bool(header.get('usage_collection_complete') and not header.get('index',{}).get('loading')
+                          and allowed.issubset(header.get('homes',[])))
+            if kind=='catalog':
+                offset=value.get('offset',0)
+                if type(offset) is not int or offset<0 or offset and expected_commit is None:return fail('cursor')
+                include=bool(value.get('include_metadata'));entries=[];home_ids={home:position for position,home in enumerate(homes)}
+                metadata_kind=value.get('metadata_kind','full')
+                if metadata_kind not in ('full','lineage'):return fail('metadata_kind')
+                metadata_field='owner_lineage' if metadata_kind=='lineage' else 'owner_metadata'
+                result=dict(base,ready=True,header=header,selected_homes=homes,membership_complete=complete,
+                            owner_format='refs-v1',include_metadata=include,metadata_kind=metadata_kind,owners=[],next_offset=None)
+                # During source recovery, analysis needs freshness but cannot
+                # use or withdraw incomplete membership. Avoid encoding owners
+                # that the consumer would immediately discard.
+                if value.get('defer_incomplete') and not complete and not offset:
+                    _catalog_weight(result,CATALOG_PAGE_BYTES)
+                    return result,b''
+                manifest=current['envelope']['sessions']
+                if offset>len(manifest):return fail('cursor')
+                remaining=CATALOG_PAGE_BYTES-_catalog_weight(result,CATALOG_PAGE_BYTES);end=offset
+                for position in range(offset,min(len(manifest),offset+CATALOG_PAGE_ROWS)):
+                    entry=manifest[position]
+                    end=position+1
+                    if entry['home'] not in allowed:continue
+                    row=[home_ids[entry['home']],entry['sid'],entry['revision'],entry['body_digest'],
+                         [[index,entry['state'][key]] for index,key in enumerate(CATALOG_STATE) if key in entry['state']],
+                         entry.get(metadata_field) is not None]
+                    if include:row.append(entry.get(metadata_field))
+                    weight=_catalog_weight(row,CATALOG_PAGE_BYTES)+32
+                    if weight>remaining:
+                        if not entries:return fail('catalog_entry_budget')
+                        end=position;break
+                    entries.append(row);remaining-=weight
+                result.update(owners=entries,next_offset=end if end<len(manifest) else None)
+                _catalog_weight(result,CATALOG_PAGE_BYTES)
+                return result,b''
+            if kind=='append':
+                from .collection_append import RESPONSE_BYTES
+                key=value.get('owner');prior=value.get('prior_body_digest')
+                if (expected_commit is None or not isinstance(key,(list,tuple)) or len(key)!=2
+                        or not all(isinstance(part,str) for part in key) or not isinstance(prior,str)
+                        or len(prior)!=64):return fail('request')
+                key=tuple(key)
+                if key[0] not in allowed:return fail('scope')
+                bound=current.get('append_bindings',{}).get(key)
+                if (not complete or bound is None or bound['prior_body_digest']!=prior
+                        or key not in current['entries']
+                        or current['entries'][key]['body_digest']!=bound['body_digest']):
+                    return fail('append_unavailable')
+                packet=bound['packet']
+                binding=dict(owner=list(key),epoch=bound['epoch'],prior_body_digest=prior,
+                    body_digest=bound['body_digest'],prior_token=packet.prior_token,token=packet.token,
+                    size=len(packet.payload),packet_digest=packet.digest)
+                result=dict(base,ready=True,selected_homes=homes,append=binding)
+                if len(packet.payload)+_catalog_weight(result,RESPONSE_BYTES)>RESPONSE_BYTES:
+                    return fail('append_unavailable')
+                return result,packet.payload
+            if kind!='owners' or expected_commit is None:return fail('request')
+            requested=value.get('owners')
+            if (not isinstance(requested,list) or len(requested)>SELECTED_OWNER_ROWS or
+                    any(not isinstance(key,(list,tuple)) or len(key)!=2 or
+                        not all(isinstance(part,str) for part in key) for key in requested)):return fail('request')
+            keys=[tuple(key) for key in requested]
+            if len(set(keys))!=len(keys) or any(key[0] not in allowed for key in keys):return fail('scope')
+            # Validate publication, membership and every byte length before copying
+            # any payload. A request never returns only an unannounced subset.
+            if any(key not in current['entries'] for key in keys):return fail('missing')
+            total=sum(len(current['sessions'][key][2]) for key in keys)
+            if total>SELECTED_BODY_BYTES:return fail('body_budget')
+            entries=[{**current['entries'][key],'size':len(current['sessions'][key][2])} for key in keys]
+            result=dict(base,ready=True,header=header,selected_homes=homes,membership_complete=complete,owners=entries)
+            _catalog_weight(result,CATALOG_PAGE_BYTES)
+            return result,b''.join(current['sessions'][key][2] for key in keys)
+        except ValueError as error:return fail(str(error))
 
 
 def locked(path):
@@ -690,12 +890,68 @@ class CollectionChannel:
                 heavy,digest,revisions=self._decode_body(key,stored[1],entry.get('body_digest'))
             yield key,(revision,heavy,digest,revisions),{**heavy,**revisions,**entry['state']}
 
-    def read_catalog(self):
-        """Return durable owner references without decoding their call history."""
+    def _catalog_request(self,**value):
+        from .collection_transport import request
+        response=request(self.companion('.collection-live.json'),
+            dict(path=str(self.path),scope=self.scope,client=self.client,homes=self.homes,
+                 protocol=CATALOG_PROTOCOL,**value),
+            response_limits=(CATALOG_PAGE_BYTES,0 if value.get('read')=='catalog' else SELECTED_BODY_BYTES))
+        if response is None:raise CollectionCatalogUnavailable('transport')
+        metadata,body=response
+        if metadata.get('error')=='scope':raise CollectionScopeError('수집 목록의 범위가 일치하지 않습니다.')
+        if not metadata.get('ready') or metadata.get('protocol')!=CATALOG_PROTOCOL:
+            raise CollectionCatalogUnavailable(metadata.get('error') or 'unsupported')
+        if tuple(metadata.get('selected_homes',()))!=tuple(self.homes):
+            raise CollectionScopeError('수집 목록의 범위가 일치하지 않습니다.')
+        _catalog_weight(metadata,CATALOG_PAGE_BYTES)
+        self.catalog_live_read=True
+        return metadata,body
+
+    def _catalog_token(self,value):
+        if (value.get('source')!='live' or value.get('scope')!=self.scope or value.get('path')!=str(self.path) or
+                tuple(value.get('selected_homes',()))!=tuple(self.homes)):
+            raise CollectionScopeError('수집 목록의 범위가 일치하지 않습니다.')
+        return dict(catalog_identity=value['catalog_identity'])
+
+    def read_catalog(self,*,source='durable',cursor=None,include_metadata=None,defer_incomplete=False,metadata_kind=None):
+        """Return owner references without decoding their call history."""
+        if source=='live':
+            token=self._catalog_token(cursor) if cursor is not None else {}
+            include=(cursor['include_metadata'] if cursor is not None else False) if include_metadata is None else bool(include_metadata)
+            requested_kind=(cursor.get('metadata_kind','full') if cursor is not None else 'full') if metadata_kind is None else metadata_kind
+            if requested_kind not in ('full','lineage'):raise ValueError('Unsupported catalog metadata kind')
+            metadata,body=self._catalog_request(read='catalog',offset=cursor['offset'] if cursor is not None else 0,
+                                               include_metadata=include,defer_incomplete=bool(defer_incomplete),metadata_kind=requested_kind,**token)
+            if body:raise CollectionScopeError('수집 목록에 예상하지 않은 본문이 있습니다.')
+            publication=tuple(metadata['publication']);committed=tuple(metadata['catalog_identity'])
+            if token and committed!=tuple(token['catalog_identity']):
+                raise CollectionCatalogUnavailable('stale')
+            base=dict(source='live',scope=self.scope,path=str(self.path),selected_homes=list(self.homes),
+                      publication=publication,catalog_identity=committed,include_metadata=include,metadata_kind=requested_kind)
+            returned_kind=metadata.get('metadata_kind','full')
+            if returned_kind not in ('full','lineage') or returned_kind=='lineage' and requested_kind!='lineage':
+                raise CollectionScopeError('Unexpected catalog metadata kind')
+            next_offset=metadata['next_offset']
+            if metadata.get('owner_format')!='refs-v1':raise CollectionCatalogUnavailable('owner_format')
+            owners={}
+            for row in metadata['owners']:
+                if len(row)!=(7 if include else 6):raise CollectionScopeError('수집 목록의 형식이 일치하지 않습니다.')
+                home=self.homes[row[0]]
+                entry=dict(home=home,sid=row[1],revision=row[2],body_digest=row[3],
+                    state={CATALOG_STATE[index]:item for index,item in row[4]},metadata_available=row[5])
+                if include:
+                    if requested_kind=='lineage':
+                        entry['owner_lineage']=owner_lineage(row[6]) if row[6] is not None else None
+                    else:entry['owner_metadata']=row[6]
+                owners[(home,row[1])]=entry
+            return dict(base,header=metadata['header'],membership_complete=metadata['membership_complete'],
+                owners=owners,
+                cursor={**base,'offset':next_offset} if next_offset is not None else None)
+        if source!='durable' or cursor is not None:raise ValueError('Unsupported collection catalog source')
         result=self.read_owners(())
         return result['catalog'] if result is not None else None
 
-    def read_owners(self,owners,*,catalog=None):
+    def read_owners(self,owners,*,catalog=None,encoded=False):
         """Read selected owners at one durable publication, without retaining them.
 
         The returned catalog is a body reference, not an analytical summary.
@@ -703,6 +959,9 @@ class CollectionChannel:
         decoding and never silently substitutes a newer result or retries.
         This does not advance the ordinary full reader's recovery checkpoint.
         """
+        if catalog is not None and catalog.get('source')=='live':
+            return self._read_live_owners(owners,catalog,encoded=encoded)
+        if encoded:raise CollectionCatalogUnavailable('encoded_durable_unsupported')
         keys=set(map(tuple,owners))
         if catalog is not None and (catalog['scope']!=self.scope or catalog['path']!=str(self.path)):
             raise CollectionScopeError('수집 목록의 사용량 색인 경로 또는 관측 DB가 일치하지 않습니다.')
@@ -729,6 +988,92 @@ class CollectionChannel:
                 owners={(entry['home'],entry['sid']):entry for entry in entries})
             sessions=[session for _,_,session in self._durable_sessions(db,selected,{})]
         return dict(catalog=result,sessions=sessions)
+
+    def _read_live_owners(self,owners,catalog,*,encoded):
+        token=self._catalog_token(catalog);keys=[]
+        for key in owners:
+            if len(keys)>=SELECTED_OWNER_ROWS:raise CollectionCatalogUnavailable('owner_count_budget')
+            if not isinstance(key,(list,tuple)) or len(key)!=2 or not all(isinstance(part,str) for part in key):
+                raise CollectionScopeError('수집 목록의 선택 세션이 일치하지 않습니다.')
+            keys.append(tuple(key))
+        metadata,body=self._catalog_request(read='owners',owners=keys,**token)
+        if tuple(metadata['catalog_identity'])!=tuple(token['catalog_identity']):
+            raise CollectionCatalogUnavailable('stale')
+        catalog={**catalog,'publication':tuple(metadata['publication']),'header':metadata['header']}
+        entries=metadata['owners']
+        if [(entry['home'],entry['sid']) for entry in entries]!=keys:
+            raise CollectionScopeError('수집 목록의 선택 세션이 일치하지 않습니다.')
+        packets=[];offset=0
+        for key,entry in zip(keys,entries):
+            size=entry['size'];digest=entry['body_digest']
+            if type(size) is not int or size<=0 or offset+size>len(body):raise CollectionScopeError('수집 본문의 길이가 일치하지 않습니다.')
+            payload=memoryview(body)[offset:offset+size];offset+=size
+            if sha256(payload).hexdigest()!=digest:raise CollectionScopeError('수집 본문의 검증값이 일치하지 않습니다.')
+            known=catalog.get('owners',{}).get(key)
+            if known is not None and known['body_digest']!=digest:raise CollectionCatalogUnavailable('stale')
+            packets.append({**entry,'payload':payload})
+        if offset!=len(body):raise CollectionScopeError('수집 본문의 길이가 일치하지 않습니다.')
+        if encoded:return dict(catalog=catalog,packets=packets)
+        # This compatibility adapter never writes a raw-body cache or checkpoint.
+        # The prepared writer should consume encoded packets with its own staging
+        # admission, especially for owners larger than this decoded-page budget.
+        sessions=[];remaining=SELECTED_JSON_BYTES;objects=SELECTED_OBJECT_BYTES
+        for key,packet in zip(keys,packets):
+            decoder=zlib.decompressobj();raw=decoder.decompress(packet['payload'],remaining+1)
+            if len(raw)>remaining or not decoder.eof or decoder.unused_data:
+                raise CollectionCatalogUnavailable('decoded_body_budget')
+            remaining-=len(raw);value=json.loads(raw)
+            if not isinstance(value,dict) or (value.get('home'),value.get('id'))!=key:
+                raise CollectionScopeError('수집 본문의 세션이 일치하지 않습니다.')
+            try:objects-=_catalog_weight(value,objects)
+            except ValueError:raise CollectionCatalogUnavailable('decoded_object_budget') from None
+            sessions.append({**value,**packet['state']})
+        return dict(catalog=catalog,sessions=sessions)
+
+    def selected_owner_stream(self,key,*,catalog,cancel=None,deadline=None):
+        """Stream one catalog-pinned local body into unpublished staging."""
+        from .collection_stream import SelectedOwnerStream
+        return SelectedOwnerStream(self,key,catalog,cancel=cancel,deadline=deadline)
+
+    def selected_owner_append(self,key,prior_body_digest,*,catalog):
+        """Read one live append proof; a missing predecessor uses the full path."""
+        from .collection_append import FORMAT, RESPONSE_BYTES, TAIL_ROWS, digest
+        token=self._catalog_token(catalog)
+        if (not isinstance(key,(list,tuple)) or len(key)!=2
+                or not all(isinstance(part,str) for part in key)):
+            raise CollectionScopeError('수집 목록의 선택 세션이 일치하지 않습니다.')
+        key=tuple(key);known=catalog.get('owners',{}).get(key)
+        if known is None:return None
+        try:
+            metadata,body=self._catalog_request(read='append',owner=key,
+                prior_body_digest=prior_body_digest,**token)
+        except CollectionCatalogUnavailable as error:
+            if error.reason in ('append_unavailable','request','unsupported','transport'):return None
+            raise
+        binding=metadata.get('append',{})
+        if (tuple(metadata.get('catalog_identity',()))!=tuple(token['catalog_identity'])
+                or binding.get('body_digest')!=known['body_digest']):
+            raise CollectionCatalogUnavailable('stale')
+        if (tuple(binding.get('owner',()))!=key or binding.get('epoch')!=token['catalog_identity'][0]
+                or binding.get('prior_body_digest')!=prior_body_digest or binding.get('size')!=len(body)
+                or len(body)+_catalog_weight(metadata,RESPONSE_BYTES)>RESPONSE_BYTES
+                or sha256(body).hexdigest()!=binding.get('packet_digest')):
+            raise CollectionScopeError('수집 추가 본문의 검증값이 일치하지 않습니다.')
+        try:
+            value=json.loads(body)
+            _catalog_weight(value,RESPONSE_BYTES)
+            tail=value['tail']
+            valid=(value['format']==FORMAT and tuple(value['owner'])==key
+                and value['prior_token']==binding['prior_token'] and value['token']==binding['token']
+                and type(value['prior_raw_count']) is int and value['prior_raw_count']>=0
+                and isinstance(tail,list) and 0<len(tail)<=TAIL_ROWS
+                and value['raw_count']==value['prior_raw_count']+len(tail)
+                and value['tail_digest']==digest(tail))
+        except (KeyError,TypeError,ValueError):valid=False
+        if not valid:raise CollectionScopeError('수집 추가 본문의 형식이 일치하지 않습니다.')
+        return {**value,'epoch':binding['epoch'],'prior_body_digest':prior_body_digest,
+                'body_digest':binding['body_digest'],'catalog_identity':tuple(token['catalog_identity'])}
+
 
     def read(self,*,shared=False,header_only=False):
         # __new__ read-only diagnostic channels intentionally remain SQLite-only.
@@ -842,7 +1187,7 @@ class CollectionChannel:
         if self.live_server:
             self.live.close()
             self.live_server.close();self.live_server=None;self.live=None
-        elif self.last_read_live:self.live_request(close=True)
+        elif self.last_read_live or getattr(self,'catalog_live_read',False):self.live_request(close=True)
         if self.db:
             try:self.db.execute('DELETE FROM consumers WHERE id=?',(self.client,));self.db.commit()
             finally:self.db.close();self.db=None
@@ -878,29 +1223,46 @@ class CollectionClient:
         self.path=self.channel.path
         self.waiter=None
         self.notification_epoch=None
+        self.notification_baseline=None
         self.analysis_identity=None
 
-    def notification_connection(self):
-        if not self.channel.last_read_live:return None
-        epoch=self.channel.live_publication[0]
+    @staticmethod
+    def _notification_identity(publication):
+        if (not isinstance(publication,(tuple,list)) or len(publication)!=2 or
+                not isinstance(publication[0],str) or type(publication[1]) is not int):
+            raise ValueError('notification publication must be an epoch and sequence')
+        return tuple(publication)
+
+    def notification_connection(self,publication=None):
+        """Arm a catalog publication explicitly, or retain the full-reader default."""
+        explicit=publication is not None
+        if not explicit:
+            if not self.channel.last_read_live:return None
+            publication=self.channel.live_publication
+        publication=self._notification_identity(publication)
+        epoch=publication[0]
         if self.waiter is not None and self.notification_epoch!=epoch:self.stop_notifications()
         if self.waiter is None:
             from .collection_transport import PublicationWaiter
             self.waiter=PublicationWaiter(self.channel.companion('.collection-live.json'),
                 dict(path=str(self.path),scope=self.channel.scope,client=self.channel.client,homes=self.channel.homes))
             self.notification_epoch=epoch
-        self.waiter.arm(list(self.channel.live_publication))
+        self.notification_baseline=publication if explicit else None
+        self.waiter.arm(list(publication))
         return self.waiter.receiver
 
-    def consume_notification(self):
+    def consume_notification(self,publication=None):
+        """An explicit latest catalog read suppresses an already-observed wake."""
         notice=self.waiter.consume()
         if notice is None:return None
         observed=tuple(notice.get('publication') or ())
-        current=self.channel.live_publication
+        current=(self._notification_identity(publication) if publication is not None else
+                 self.notification_baseline if self.notification_baseline is not None else self.channel.live_publication)
         if len(observed)!=2 or type(observed[1]) is not int:return None
         return current is None or observed[0]!=current[0] or observed[1]>current[1]
 
     def stop_notifications(self):
+        self.notification_baseline=None
         if self.waiter is not None:
             self.waiter.close();self.waiter=None
             self.notification_epoch=None
@@ -945,6 +1307,32 @@ class CollectionClient:
             self.analysis_identity=(str(self.path),self.channel.scope,tuple(self.channel.homes),
                                     self.channel.catalog_identity)
         return snapshot
+
+    def poll_catalog(self,now=None,*,cursor=None,include_metadata=None,defer_incomplete=False,metadata_kind=None):
+        """One live metadata page; callers stage pages before replacing membership."""
+        now=time.time() if now is None else now
+        catalog=self.channel.read_catalog(source='live',cursor=cursor,include_metadata=include_metadata,
+                                          defer_incomplete=defer_incomplete,metadata_kind=metadata_kind)
+        header={**catalog['header']};homes=set(self.channel.homes)
+        header['quota_by_home']={home:quota for home,quota in header.get('quota_by_home',{}).items() if home in homes}
+        stale=now-header['ts']>30
+        missing=not homes.issubset(header.get('homes',[]))
+        if stale or missing:
+            header['usage_collection_complete']=False
+            header['index']={**header['index'],'usage_complete':False,**({'loading':True} if missing else {})}
+            if stale:header['collection_stale']=True
+        header['homes']=list(self.channel.homes)
+        return {**catalog,'header':header,'membership_complete':catalog['membership_complete'] and not stale and not missing}
+
+    def selected_owners(self,owners,*,catalog,encoded=True):
+        return self.channel.read_owners(owners,catalog=catalog,encoded=encoded)
+
+    def selected_owner_stream(self,key,*,catalog,cancel=None,deadline=None):
+        return self.channel.selected_owner_stream(key,catalog=catalog,cancel=cancel,deadline=deadline)
+
+
+    def selected_owner_append(self,key,prior_body_digest,*,catalog):
+        return self.channel.selected_owner_append(key,prior_body_digest,catalog=catalog)
 
     def close(self):
         self.stop_notifications()
@@ -999,7 +1387,7 @@ class CollectorService:
             self.index=UsageIndex(homes,self.channel.index_path,self.channel.evidence)
             self.index.db.commit()  # Finish schema and TEMP revision setup before replay proofs.
             from .collection_replay import CollectionReplay
-            self.index.replay=CollectionReplay.open(self.channel,self.index)
+            self.index.replay=CollectionReplay.open(self.channel,self.index,restore_metadata=False)
         snapshot=self.index.poll(now)
         source_snapshot=snapshot
         collected=time.monotonic()
@@ -1021,7 +1409,8 @@ class CollectorService:
         if detailed:
             # Diagnostics can explicitly request ordinary public dictionaries.
             # The service loop and self.last retain only encoded closed bodies.
-            return {**snapshot,'sessions':[dict(json.loads(zlib.decompress(s.payload)),**s)
+            return {**snapshot,'sessions':[dict(json.loads(zlib.decompress(s.payload)),
+                **{key:value for key,value in s.items() if key in LiveCollection.volatile})
                 if isinstance(s,EncodedSession) else s for s in published_sessions]}
         return snapshot
 

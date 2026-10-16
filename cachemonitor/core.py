@@ -476,12 +476,12 @@ class Session:
             if self.running:
                 result['status']='진행 기록' if now-self.activity<WINDOW else '진행 기록 (갱신 지연)'
             return result
-        history = old['history'] if same else [x.values() for x in self.requests]
         requests = [x for x in self.requests if x.ts >= now - WINDOW]
         last = requests[-1] if requests else None
         connection_history = old['history'] if same else [
             {**request.values(), **detail}
             for request, detail in zip(self.requests, self.transport_details_many(self.requests))]
+        history = connection_history
         matched = {(r["transport_ts"], r["transport"], r["transport_turn"]) for r in connection_history}
         latest = self.transports[-1] if self.transports else None
         known = [x for x in requests if x.input is not None and x.cached is not None]

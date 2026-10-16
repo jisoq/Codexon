@@ -28,6 +28,8 @@ def summary(rows, metric):
 
 def call_totals(engine,q):
     """One compact range aggregate per owner; never retain a second call population."""
+    if hasattr(engine,'prepared_home_totals'):
+        return engine.prepared_home_totals(q)
     fields=METRICS[1:-1]
     counts=0;sessions=0;parts=[]
     filters=tuple(q.get(k,'') for k in ('model','effort','service_tier'))
@@ -76,59 +78,65 @@ def project(engine, q):
         data=cached[1]
         common=dict(data['common'],key=engine.query_key(scope),revision=engine.revision)
     else:
-        rows=[r for state,lo,hi in engine.call_ranges(scope) for r in engine.range_calls(state,lo,hi,scope)]
-        common = dict(key=engine.query_key(scope), revision=engine.revision, lookup={},
-                      analysis=dict(response_count=len(rows), session_count=len({(r['home'],r['sid']) for r in rows})))
-        cross = 'source' if dimension == 'model' else 'model'
-        buckets = defaultdict(list)
-        for r in rows:buckets[category(r,dimension)].append(r)
-        weights=defaultdict(float)
-        for row in rows:
-            key=category(row,cross)
-            if key!='미확인':weights[key]+=1 if metric=='calls' else (row.get(metric) or 0)
-        visible_keys=sorted(weights,key=lambda key:-weights[key])[:4]
-        categories = []
-        def aggregate(key, label, members, filters, group='', group_value=None):
-            children = defaultdict(list)
-            for r in members:children[category(r,cross)].append(r)
-            components = [dict(key=k, **summary(rs,metric)) for k,rs in children.items()]
-            components.sort(key=lambda c:-(c['value'] or 0))
-            known = [c for c in components if c['key'] != '미확인']
-            # Keep unknown distinct; retain names of folded categories for hover.
-            small = [c for c in known if c['key'] not in visible_keys]
-            shown = sorted((c for c in known if c['key'] in visible_keys),key=lambda c:visible_keys.index(c['key'])) + [c for c in components if c['key'] == '미확인']
-            if small and metric != 'tps':
-                shown.append(dict(key='기타', value=sum(c['value'] for c in small if c['value'] is not None) if any(c['value'] is not None for c in small) else None,
-                                  known=sum(c['known'] for c in small), total=sum(c['total'] for c in small),
-                                  partial=any(c['partial'] for c in small), names=[c['key'] for c in small[:8]]))
-            return dict(key=key,label=label,filters=filters,group=group,group_value=group_value,
-                        components=shown,**summary(members,metric))
-        for key,members in buckets.items():
-            if breakdowns:
-                combinations=defaultdict(list)
-                for row in members:combinations[tuple(category(row,field) for field in breakdowns)].append(row)
-                group_value=summary(members,metric)['value']
-                for values,items in combinations.items():
-                    filters=dict(zip(('model',*breakdowns),(key,*values)))
-                    identifier=json.dumps(list(filters.items()),ensure_ascii=False,separators=(',',':'))
-                    categories.append(aggregate(identifier,' / '.join(values),items,filters,key,group_value))
-            else:
-                categories.append(aggregate(key,members[0].get('project_name',key) if dimension=='project' else key,members,{dimension:key}))
-        detail = None
-        if selection:
-            first=last=None
-            # Only the selected item's history is inspected; no per-category history copies.
-            for state in engine.sessions.values():
-                for r in state['prepared']['history']:
-                    if all(category(r,field)==value for field,value in selection.items()):
-                        ts=r['ts'];first=ts if first is None else min(first,ts);last=ts if last is None else max(last,ts)
-            sessions={(r['home'],r['sid']) for r in rows}
-            sources={source:len({(r['home'],r['sid']) for r in rows if category(r,'source')==source}) for source in ('user','subagent','미확인')}
-            field=next(iter(selection))
-            detail=dict(key=selection[field],dimension=field,selection=selection,first=first,last=last,sessions=len(sessions),sources=sources,
-                        projects=len({r['project'] for r in rows if category(r,'project')!='미확인'}),
-                        unknown_projects=sum(category(r,'project')=='미확인' for r in rows))
-        data=dict(common=common,categories=categories,summary=summary(rows,metric),dimension=dimension,metric=metric,cross=cross,detail=detail,breakdowns=list(breakdowns))
+        if hasattr(engine,'prepared_category_data'):
+            data=engine.prepared_category_data(scope,dimension,metric,breakdowns,selection)
+            common=data['common']
+        else:
+            rows=[r for state,lo,hi in engine.call_ranges(scope) for r in engine.range_calls(state,lo,hi,scope)]
+            common = dict(key=engine.query_key(scope), revision=engine.revision, lookup={},
+                          analysis=dict(response_count=len(rows), session_count=len({(r['home'],r['sid']) for r in rows})))
+            cross = 'source' if dimension == 'model' else 'model'
+            buckets = defaultdict(list)
+            for r in rows:buckets[category(r,dimension)].append(r)
+            weights=defaultdict(float)
+            for row in rows:
+                key=category(row,cross)
+                if key!='미확인':weights[key]+=1 if metric=='calls' else (row.get(metric) or 0)
+            visible_keys=sorted(weights,key=lambda key:-weights[key])[:4]
+            categories = []
+            def aggregate(key, label, members, filters, group='', group_value=None):
+                children = defaultdict(list)
+                for r in members:children[category(r,cross)].append(r)
+                components = [dict(key=k, **summary(rs,metric)) for k,rs in children.items()]
+                components.sort(key=lambda c:-(c['value'] or 0))
+                known = [c for c in components if c['key'] != '미확인']
+                # Keep unknown distinct; retain names of folded categories for hover.
+                small = [c for c in known if c['key'] not in visible_keys]
+                shown = sorted((c for c in known if c['key'] in visible_keys),key=lambda c:visible_keys.index(c['key'])) + [c for c in components if c['key'] == '미확인']
+                if small and metric != 'tps':
+                    shown.append(dict(key='기타', value=sum(c['value'] for c in small if c['value'] is not None) if any(c['value'] is not None for c in small) else None,
+                                      known=sum(c['known'] for c in small), total=sum(c['total'] for c in small),
+                                      partial=any(c['partial'] for c in small), names=[c['key'] for c in small[:8]]))
+                return dict(key=key,label=label,filters=filters,group=group,group_value=group_value,
+                            components=shown,**summary(members,metric))
+            for key,members in buckets.items():
+                if breakdowns:
+                    combinations=defaultdict(list)
+                    for row in members:combinations[tuple(category(row,field) for field in breakdowns)].append(row)
+                    group_value=summary(members,metric)['value']
+                    for values,items in combinations.items():
+                        filters=dict(zip(('model',*breakdowns),(key,*values)))
+                        identifier=json.dumps(list(filters.items()),ensure_ascii=False,separators=(',',':'))
+                        categories.append(aggregate(identifier,' / '.join(values),items,filters,key,group_value))
+                else:
+                    categories.append(aggregate(key,members[0].get('project_name',key) if dimension=='project' else key,members,{dimension:key}))
+            detail = None
+            if selection:
+                first=last=None
+                if hasattr(engine,'category_bounds'):
+                    first,last=engine.category_bounds(selection)
+                else:
+                    for state in engine.sessions.values():
+                        for r in state['prepared']['history']:
+                            if all(category(r,field)==value for field,value in selection.items()):
+                                ts=r['ts'];first=ts if first is None else min(first,ts);last=ts if last is None else max(last,ts)
+                sessions={(r['home'],r['sid']) for r in rows}
+                sources={source:len({(r['home'],r['sid']) for r in rows if category(r,'source')==source}) for source in ('user','subagent','미확인')}
+                field=next(iter(selection))
+                detail=dict(key=selection[field],dimension=field,selection=selection,first=first,last=last,sessions=len(sessions),sources=sources,
+                            projects=len({r['project'] for r in rows if category(r,'project')!='미확인'}),
+                            unknown_projects=sum(category(r,'project')=='미확인' for r in rows))
+            data=dict(common=common,categories=categories,summary=summary(rows,metric),dimension=dimension,metric=metric,cross=cross,detail=detail,breakdowns=list(breakdowns))
         from .analysis_worker import expiry
         from .analysis_engine import retained_bytes
         cached=(signature,data,expiry(engine,q))

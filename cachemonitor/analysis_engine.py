@@ -125,7 +125,8 @@ def _adopt_source(state,source,*,refresh=False):
 
 
 class AnalysisEngine:
-    def __init__(self):
+    def __init__(self, *, health_checkpoint=None):
+        self.health_checkpoint=health_checkpoint
         self.sessions=OrderedDict()
         self.internal_sessions=OrderedDict()
         self.parts=BoundedCache(2048,160000)
@@ -271,7 +272,8 @@ class AnalysisEngine:
                     row.update(cache_miss=is_miss,session_ordinal=i+1)
                 records[identity]=(context,row)
                 history.append(row)
-            health=CacheHealth().update(history)
+            health_tracker=CacheHealth()
+            health=health_tracker.update(history)
             history=[compact_record(row) for row in annotate_incidents(history,health)]
             for row in history:
                 identity=row['key']
@@ -294,6 +296,8 @@ class AnalysisEngine:
                               if speed_prefix and len(history)>=len(prior_history) else None),
                           'timestamps':sorted(r['ts'] for r in history),'boundaries':boundaries,
                           'boundary_turns':boundary_turns,'turn_ids':turn_ids,'whole_turns':dict(whole_turns)}
+            if self.health_checkpoint is not None:
+                updated[key]['health_checkpoint']=self.health_checkpoint(health_tracker,records)
             self.metrics['session_rebuilds']+=1
         if set(updated)!=set(previous_sessions): changed=True;calls_changed=True
         self.internal_sessions=OrderedDict((key,state) for key,state in updated.items() if state['internal_review'])
@@ -390,6 +394,47 @@ class AnalysisEngine:
         self.page_results.put(key,cached,retained_bytes((key,cached),self.page_results.rows))
         return value
 
+    def query_source(self,session_key,state,q):
+        source=state['prepared']
+        if q.get('include_whole_history',True):return source
+        return {k:v for k,v in source.items() if k not in ('turn_records','turn_states','totals','remaining')}
+
+    def whole_query_turns(self,session_key,state):
+        return state['whole_turns']
+
+    def query_part(self,session_key,state,start,end,model,effort,mode):
+        """Shared business part; prepared stores override only its input selection."""
+        s=state['prepared']
+        interval=(bisect_left(state['timestamps'],start),bisect_left(state['timestamps'],end))
+        boundaries=state['boundaries']
+        request_interval=(bisect_left(boundaries,start),bisect_left(boundaries,end))
+        if interval[0]==interval[1] and request_interval[0]==request_interval[1]:
+            state.pop('recent_part',None)
+            return None
+        part_key=(session_key,state['revision'],interval,request_interval,model,effort,mode)
+        recent=state.get('recent_part')
+        part=recent[1] if recent and recent[0]==part_key else self.parts.get(part_key)
+        if part is None:
+            lo,hi=request_interval
+            boundary_turns=() if any((model,effort,mode)) else (
+                state['turn_ids'][i] for i in sorted(set(state['boundary_turns'][lo:hi])))
+            part=analyze([s],start,end,model,with_comparisons=False,service_tier=mode,effort=effort,
+                         _range_index=(interval,state['whole_turns']),_boundary_turns=boundary_turns)
+            self.prepare_part(part)
+            self.parts.put(part_key,part,len(s['history'])+1)
+            self.metrics['part_builds']+=1
+        state['recent_part']=(part_key,part)
+        return part
+
+    @staticmethod
+    def prepare_part(part):
+        part['_sorted_responses']=part['responses']
+        part['_sorted_turns']=sorted(part['turns'],key=lambda t:t['ts'],reverse=True)
+        lookup=defaultdict(list)
+        for row in part['_sorted_responses']:
+            if row.get('turn'):lookup[(row['home'],row['sid'],row['turn'])].append(row)
+        part['_turn_lookup']=dict(lookup)
+
     def query(self,q):
         key=self.query_key(q)
         cached=self.results.get(key)
@@ -410,38 +455,14 @@ class AnalysisEngine:
             if q.get('home') and s['home']!=q['home']:continue
             if q.get('sid') and s['id']!=q['sid']:continue
             if q.get('project') and not project_matches(s,q['project']):continue
+            s=self.query_source(session_key,state,q)
             selected.append({k:v for k,v in s.items() if k not in ('history','requests','groups','_prepared')})
-            if q.get('include_whole_history',True):whole_turns.update(state['whole_turns'])
+            if q.get('include_whole_history',True):whole_turns.update(self.whole_query_turns(session_key,state))
             if s.get('unclassified'): unclassified.append(s['unclassified'])
-            interval=(bisect_left(state['timestamps'],start),bisect_left(state['timestamps'],end))
-            boundaries=state['boundaries']
-            request_interval=(bisect_left(boundaries,start),bisect_left(boundaries,end))
-            if interval[0]==interval[1] and request_interval[0]==request_interval[1]:
-                # Keep session metadata and unresolved usage above, but do not
-                # construct an empty analytical population for an old owner.
-                state.pop('recent_part',None)
+            part=self.query_part(session_key,state,start,end,model,effort,mode)
+            if part is None:
                 session_turns[session_key]=[]
                 continue
-            part_key=(session_key,state['revision'],interval,request_interval,model,effort,mode)
-            recent=state.get("recent_part")
-            part=recent[1] if recent and recent[0]==part_key else self.parts.get(part_key)
-            if part is None:
-                # Boundary-only requests use the same time range index as calls.
-                # Original request order, including equal timestamps, is retained.
-                lo,hi=request_interval
-                boundary_turns=() if any((model,effort,mode)) else (
-                    state['turn_ids'][i] for i in sorted(set(state['boundary_turns'][lo:hi])))
-                part=analyze([s],start,end,model,with_comparisons=False,service_tier=mode,effort=effort,
-                             _range_index=(interval,state['whole_turns']),_boundary_turns=boundary_turns)
-                part['_sorted_responses']=part['responses']
-                part['_sorted_turns']=sorted(part['turns'],key=lambda t:t['ts'],reverse=True)
-                lookup=defaultdict(list)
-                for row in part['_sorted_responses']:
-                    if row.get('turn'): lookup[(row['home'],row['sid'],row['turn'])].append(row)
-                part['_turn_lookup']=dict(lookup)
-                self.parts.put(part_key,part,len(s['history'])+1)
-                self.metrics['part_builds']+=1
-            state['recent_part']=(part_key,part)
             responses.extend(part['responses']); turns.extend(part['turns'])
             if part['responses']:
                 bysession[session_key]=part['_sorted_responses']
