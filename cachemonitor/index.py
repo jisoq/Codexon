@@ -89,6 +89,20 @@ def usage_only(value):
     return result
 
 
+def complete_thread_settings(settings):
+    """Recognize the persisted ThreadSettingsSnapshot, not a partial override."""
+    required={'model','model_provider_id','approval_policy','approvals_reviewer',
+              'permission_profile','cwd','collaboration_mode','disabled_plugin_ids'}
+    collaboration=settings.get('collaboration_mode')
+    return (required.issubset(settings) and
+            all(isinstance(settings.get(key),str) and settings[key] for key in ('model','model_provider_id','cwd')) and
+            isinstance(settings['approval_policy'],(str,dict)) and isinstance(settings['approvals_reviewer'],str) and
+            isinstance(settings['permission_profile'],(str,dict)) and
+            isinstance(settings['disabled_plugin_ids'],list) and isinstance(collaboration,dict) and
+            isinstance(collaboration.get('mode'),str) and isinstance(collaboration.get('settings'),dict) and
+            isinstance(collaboration['settings'].get('model'),str))
+
+
 def sanitized(event):
     """Never persist messages, instructions, tool arguments or credentials."""
     kind, p = event.get('type'), event.get('payload')
@@ -120,10 +134,13 @@ def sanitized(event):
             clean = {'type': typ, 'turn_id': p.get('turn_id')}
         elif typ=='thread_settings_applied':
             settings=p.get('thread_settings')
-            if not isinstance(settings,dict) or 'service_tier' not in settings:return None
-            tier=settings['service_tier']
+            if not isinstance(settings,dict):return None
+            # Complete applied snapshots serialize an unset tier by omitting
+            # the field. Partial overrides and absent snapshots prove no mode.
+            if 'service_tier' not in settings and not complete_thread_settings(settings):return None
+            tier=settings.get('service_tier')
             clean={'type':typ,'thread_id':p.get('thread_id'),'thread_settings':{
-                'service_tier':tier if isinstance(tier,str) else None}}
+                'service_tier':tier if isinstance(tier,str) or tier is None else '미확인'}}
         else:
             return None
     else:
@@ -155,12 +172,12 @@ class UsageIndex:
             self.db.execute('CREATE INDEX events_session ON events(home,tid,ts,path,pos)')
             self.db.commit()
         self.db.execute('CREATE TABLE IF NOT EXISTS usage_archive(home TEXT,response_id TEXT,data TEXT,PRIMARY KEY(home,response_id))')
-        # Recover settings snapshots and top-level compactions omitted by older
-        # scanners. Keep existing events while this incremental backfill proceeds.
-        self.tier_backfill=self.db.execute('pragma user_version').fetchone()[0]<4
+        # Recover complete default-tier snapshots omitted by older scanners.
+        # Keep existing events while this incremental backfill proceeds.
+        self.tier_backfill=self.db.execute('pragma user_version').fetchone()[0]<5
         if self.tier_backfill:
             self.db.execute('update files set offset=0')
-            self.db.execute('pragma user_version=4')
+            self.db.execute('pragma user_version=5')
             self.db.commit()
         try:
             self.event_store=EventStore(self.db,self.path)

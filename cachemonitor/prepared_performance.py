@@ -161,7 +161,9 @@ class _Input:
         self.stats['sort_estimated_bytes'] = max(size, self.stats.get('sort_estimated_bytes', 0))
         if size > self.snapshot.limits.speed_sort_bytes:
             raise CapacityExceeded('performance scalar sort exceeds its admitted temporary payload')
-        sql = self.sql(columns, where,
+        # The ordering cohort drives this join. Seek each owner's time range;
+        # a global-time index would rescan every selected call for every owner.
+        sql = self.sql(columns, where, index='calls_time',
             tail='ORDER BY r.m_ts,ordering.rank,r.m_session_ordinal,r.identity')
         sql = sql.replace('JOIN publications p ', 'JOIN ordering ON ordering.owner=r.owner JOIN publications p ', 1)
         sql = 'WITH ordering(owner,rank) AS MATERIALIZED (VALUES ' + self.ordering + ') ' + sql
@@ -253,6 +255,8 @@ def performance_input(engine, q, width, granularity):
     if end <= start:
         start, end = full
     scopes, calls = source.metadata(end)
+    progress=getattr(engine,'progress',None)
+    if progress:progress('aggregate')
     if granularity == 'auto':
         from .prepared_trends import rolling
         view = rolling(source, q, width, start, end, full, scopes)

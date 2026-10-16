@@ -369,7 +369,8 @@ class AnalysisEngine:
         if q.get('category_usage'):
             from .category_usage import project
             from .analysis_worker import expiry
-            value=public_records(project(self,q));value['valid_until']=expiry(self,q)
+            value=public_records(project(self,q))
+            if 'valid_until' not in value:value['valid_until']=expiry(self,q)
             return value
         if q['page']==5:
             from .performance_trends import PerformanceTrends

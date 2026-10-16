@@ -122,6 +122,8 @@ def project_data(engine, scope, dimension, metric, breakdowns, selection):
     projects=set()
     unknown_projects=0
     budget=_Budget(snapshot.limits.page_objects_bytes)
+    progress=getattr(engine,'progress',None)
+    if progress:progress('aggregate')
     for state,lo,hi in engine.call_ranges(scope):
         after=None
         while True:

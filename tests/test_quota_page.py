@@ -53,11 +53,14 @@ def test_current_chart_remains_usable_until_full_history_finishes(quota_page):
             panel.receive(dict(home='h',report={**full,'history_pending':True,'history_failed':failed}))
             assert not panel.cycle_choice.isEnabled() and not panel.manage_button.isEnabled()
             assert all(panel.summary_values[key].text() in ('계산 중','확인 불가') for key in ('usage','cost','weekly'))
+            assert panel.history_loading.isVisible() is not failed
+            assert panel.history_loading._state['running'] is not failed
             plot=render_plot(host,panel.history);click(host,plot,x=plot.width()*.6,y=plot.height()*.5)
             QTest.keyClick(host.quick,Qt.Key_Home)
             assert panel.history.cursor==0 and panel.history.rows
         panel.receive(dict(home='h',report=full))
         assert panel.cycle_choice.isEnabled() and panel.manage_button.isEnabled()
+        assert not panel.history_loading.isVisible() and not panel.history_loading._state['running']
         assert panel.summary_values['cost'].text() not in ('계산 중','확인 불가')
         assert not host.qml_errors
     finally:dispose(host)
@@ -314,9 +317,11 @@ def test_cycle_selector_changes_graph_preserves_lifetime_and_selection_on_refres
         assert panel.cycle_choice.currentData()==expected
         chosen=next(p for p in panel._view['periods'] if p['start']==expected)
         assert panel.history.rows is chosen['series']['rows']
-        click(host,render_plot(host,panel.summary_back))
+        scroll.ensureWidgetVisible(panel.cycle_choice)
+        choice=control(host,panel.cycle_choice);choice.forceActiveFocus()
+        QTest.keyClick(host.quick,Qt.Key_Home)
         assert panel.cycle_choice.currentData()=='all'
-        assert panel.history.rows[panel.history.cursor]['cycle_start']==expected
+        assert panel.history.series is panel._view['overall']
         plot=render_plot(host,panel.history);plot.forceActiveFocus()
         QTest.keyClick(host.quick,Qt.Key_End)
         expected=panel.history.rows[-1]['cycle_start']

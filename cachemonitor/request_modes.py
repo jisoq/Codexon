@@ -6,6 +6,9 @@ import re
 from .pricing import request_tier
 
 
+MODE_LOG_FORMAT = 2
+
+
 def mode_parents(sessions):
     indexed={(s['home'],s['id']):s for s in sessions}
     parents={key:(key[0],s['parent_thread_id']) for key,s in indexed.items()
@@ -75,9 +78,16 @@ def request_mode_observation(body):
     # Quoted user/tool content is removed before recognizing structural fields.
     shape = re.sub(r'"(?:\\.|[^"\\])*"', replace, body or '')
     submission = re.search(r'Submission sub=Submission\s*\{\s*id:\s*@(\d+)@,\s*op:\s*TurnInput', shape)
-    if not submission:
-        return None
-    turn = strings[int(submission[1])]
+    if submission:
+        turn = strings[int(submission[1])]
+    else:
+        # Codex now logs Submission's fields separately instead of formatting
+        # the enclosing struct. Only that message's own ID identifies the turn.
+        submission = re.search(r'\bSubmission\s+([^{}]*?)\bop=\s*TurnInput\b', shape)
+        identifier = re.search(r'\bsubmission_id=(?:@(\d+)@|([a-zA-Z0-9-]+))(?=\s|$)',
+                               submission[1]) if submission else None
+        if not identifier:return None
+        turn = strings[int(identifier[1])] if identifier[1] is not None else identifier[2]
     if not re.fullmatch(r'[a-zA-Z0-9-]{16,64}', turn):
         return None
     result = {'turn':turn,'action':'unchanged','mode':None,'source':'unchanged','configured_service_tier':None}

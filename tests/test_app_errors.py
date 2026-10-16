@@ -226,6 +226,7 @@ def test_sidebar_errors_remain_visible_across_pages_and_do_not_show_main_banner(
     from PySide6.QtWidgets import QApplication
     from cachemonitor.dashboard import Dashboard
     from cachemonitor.quick_qa import click,control,scene_view
+    from test_ui import wait_for_rendered
     app=QApplication.instance() or QApplication([])
     window=Dashboard([],start_worker=False,live_limits=False,
         settings=QSettings(str(tmp_path/'settings.ini'),QSettings.IniFormat))
@@ -236,7 +237,9 @@ def test_sidebar_errors_remain_visible_across_pages_and_do_not_show_main_banner(
         window.receive_collection_status(dict(collection_fault=dict(start_failed=True,retry_exhausted=True)))
         assert not sent and window.error_button.isVisible()
         for page in (0,2,3,4,5):
-            window.change_page(page);app.processEvents()
+            window.change_page(page)
+            assert window.error_button.isVisible()
+            wait_for_rendered(lambda:window.pages.isPageReady(page) and not window.analysis_notice.isVisible(),timeout=5)
             assert window.error_button.isVisible() and not window.analysis_notice.isVisible()
             view=scene_view(window,window.error_button);point=view.mapToScene(QPointF(0,0))
             assert point.x()<200 and point.y()>window.height()/2 and point.y()+view.height()<=window.height()

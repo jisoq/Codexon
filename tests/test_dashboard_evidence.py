@@ -139,62 +139,86 @@ def test_stale_population_closes_chart_hover_and_notification_floor_stays_curren
 @pytest.mark.parametrize('language',['ko','en'])
 @pytest.mark.essential
 def test_tab_loading_hides_empty_content_and_ignores_stale_result(tmp_path,language):
-    from PySide6.QtTest import QTest
     from cachemonitor.i18n import set_language
-    from cachemonitor.quick_qa import control
+    from cachemonitor.quick_qa import control,walk
+    from test_ui import wait_for_rendered
     set_language(language);window=dashboard(tmp_path)
     try:
-        window.receive(sample());window.show();window.render();window.async_mode=True
+        window.receive(sample());window.resize(1000,680);window.show();window.render();window.async_mode=True
         window.change_page(1)
         old_id,old_query,old_logical=window.request_id,window.pending_query,window.pending_logical
         assert window.analysis_pending and not window.pages.isVisible()
-        assert window.analysis_notice.isVisible() and not window.analysis_notice_body.isVisible()
-        # Timer expiry and QML visibility propagation are separate event-loop
-        # turns. Await the rendered state instead of assuming 200 ms is enough.
-        deadline=time.monotonic()+5
-        title=None
-        while time.monotonic()<deadline:
-            QApplication.processEvents()
-            try:title=control(window,window.analysis_notice_title)
-            except AssertionError:pass
-            if title is not None and title.isVisible() and title.width()>0 and title.height()>0:break
-            QTest.qWait(10)
-        if title is None or not title.isVisible():
-            from pathlib import Path
-            evidence=Path('artifacts/verification/dashboard-loading');evidence.mkdir(parents=True,exist_ok=True)
-            window.grab().save(str(evidence/f'failed-{language}.png'))
-        assert title is not None
-        assert title.isVisible()
-        assert ('Loading' if language=='en' else '불러오는 중') in window.analysis_notice_title.state['text']
-        assert window.grab().save(str(tmp_path/f'tab-loading-{language}.png'))
+        assert window.analysis_notice.isVisible() and window.analysis_notice_body.isVisible()
+        assert window.analysis_progress.state['running']
+        progress=control(window,window.analysis_progress)
+        wait_for_rendered(lambda:progress.isVisible() and progress.width()>0 and progress.height()>0)
+        texts=[item.property('text') for item in walk(progress) if item.property('text')]
+        assert any(('Loading' if language=='en' else '불러오는 중') in text for text in texts)
+        if language=='en':assert not any('\uac00'<=char<='\ud7a3' for text in texts for char in text)
+        first=window.quick.grabFramebuffer()
+        wait_for_rendered(lambda:window.quick.grabFramebuffer()!=first,timeout=3)
+        assert window.quick.grabFramebuffer().save(str(tmp_path/f'tab-loading-{language}.png'))
+        assert window.request_id==old_id
+        window.analysis_progressed(dict(id=old_id,stage='aggregate'))
+        assert window.analysis_stage=='aggregate'
         window.show_analysis_slow()
-        assert '다른 탭' in window.analysis_notice_detail.text()
+        assert window.analysis_stage=='aggregate' and window.analysis_progress.state['slow']
+        window.render();window.render(automatic=True)
+        assert window.request_id==old_id and window.analysis_stage=='aggregate'
         window.change_page(2)
+        window.analysis_progressed(dict(id=old_id,stage='aggregate'))
+        assert window.analysis_stage=='queued'
         window.analysis_ready(dict(id=old_id,logical=old_logical,
             result=window.engine.page_query(old_query),valid_until=float('inf')))
         assert window.analysis_pending and not window.pages.isVisible()
+        assert not window.pages.isPageReady(2)
         deliver_pending(window)
-        assert window.pages.isVisible() and not window.analysis_notice.isVisible()
+        assert not window.analysis_pending and not window.pages.isVisible()
+        assert window.analysis_stage=='present' and window.analysis_notice.isVisible()
+        # A result received before deferred controls are built cannot be retained
+        # as visible content by a new request or its failure.
+        window.client_cache.clear();window.render()
+        assert not window.pending_retained and not window.pages.isVisible()
+        window.analysis_failed('unbuilt-page failure')
+        assert not window.pages.isVisible()
+        window.render();deliver_pending(window)
+        wait_for_rendered(lambda:window.pages.isPageReady(2) and window.pages.isVisible(),timeout=5)
+        assert not window.analysis_notice.isVisible()
         window.render()  # A valid cache hit never enters the loading state.
         assert not window.analysis_pending and not window.pending_timer.isActive()
         window.change_page(5)
         assert not window.pages.isVisible()
-        window.change_page(3)
-        window.show_analysis_pending();window.show_analysis_slow()
-        assert window.pages.isVisible() and not window.analysis_notice.isVisible()
-        assert not window.pending_label.isVisible()
+        deliver_pending(window)
+        assert not window.pages.isVisible() and window.analysis_stage=='present'
+        wait_for_rendered(lambda:window.pages.isPageReady(5) and window.pages.isVisible(),timeout=5)
+        assert not window.analysis_notice.isVisible()
+        for page in (3,4):
+            window.change_page(page)
+            assert not window.pages.isPageReady(page) and not window.pages.isVisible()
+            assert window.analysis_notice.isVisible() and window.analysis_stage=='present'
+            window.show_analysis_pending();window.show_analysis_slow()
+            wait_for_rendered(lambda:window.pages.isPageReady(page) and window.pages.isVisible(),timeout=5)
+            assert not window.analysis_notice.isVisible() and not window.pending_label.isVisible()
         assert not window.qml_errors
     finally:window.quit_app();set_language('ko')
 
 
 def test_refresh_preserves_only_matching_results_and_failure_can_retry(tmp_path):
-    from PySide6.QtTest import QTest
     from cachemonitor.quick_qa import click,render_plot
+    from test_ui import wait_for_rendered
     window=dashboard(tmp_path)
     try:
-        window.receive(sample());window.show();window.change_page(1);window.render();window.async_mode=True
+        window.receive(sample());window.show();window.change_page(1);window.render()
+        wait_for_rendered(lambda:window.pages.isPageReady(1) and window.pages.isVisible(),timeout=5)
+        window.async_mode=True
         window.client_cache.clear();window.render();window.show_analysis_pending()
-        assert window.pages.isVisible() and window.pending_label.text()=='최신 기록 반영 중'
+        assert window.pages.isVisible() and window.refresh_loading.isVisible()
+        assert window.refresh_loading.state['running'] and window.pending_retained
+        previous_id=window.request_id
+        size=window.metric_panel.options['size']
+        window.metric_panel.change('size',str(2 if size>2 else 3))
+        assert window.request_id>previous_id and window.pending_query['usage']['size']!=size
+        assert window.pending_retained and window.pages.isVisible()
         window.analysis_failed('synthetic failure')
         assert window.pages.isVisible() and window.error_button.isVisible()
         assert not window.retry_button.isVisible() and not window.analysis_notice.isVisible()
@@ -215,28 +239,32 @@ def test_refresh_preserves_only_matching_results_and_failure_can_retry(tmp_path)
         click(window,render_plot(window,window.error_panel.action))
         assert window.analysis_pending and not window.pages.isVisible()
         deliver_pending(window)
-        assert window.pages.isVisible() and not window.analysis_notice.isVisible()
+        wait_for_rendered(lambda:window.pages.isVisible(),timeout=5)
+        assert not window.analysis_notice.isVisible()
         assert not window.qml_errors
     finally:window.quit_app()
 
 
 def test_empty_result_waits_for_collection_before_showing_empty_charts(tmp_path):
-    from PySide6.QtTest import QTest
+    from test_ui import wait_for_rendered
     window=dashboard(tmp_path)
     try:
         window.show();window.async_mode=True
         window.snapshot['index']={'loading':True}
         window.render();deliver_pending(window)
         assert not window.analysis_pending and not window.pages.isVisible()
-        assert window.analysis_notice_title.text()=='사용 기록 수집 중'
+        assert window.analysis_progress.isVisible() and window.analysis_progress.state['running']
+        assert window.analysis_stage=='queued'
         window.snapshot['index']['loading']=False
         window.render();deliver_pending(window)
-        assert window.pages.isVisible() and not window.analysis_notice.isVisible()
+        wait_for_rendered(lambda:window.pages.isVisible(),timeout=5)
+        assert not window.analysis_notice.isVisible()
         assert window.home_panel.state['totals'][1]['value']=='0'
         assert window.analysis['response_count']==0
         window.change_page(5);window._refresh_after_pending=True
         calls=[];window.render=lambda *args,**kwargs:calls.append(kwargs)
-        deliver_pending(window);QTest.qWait(20)
+        deliver_pending(window)
+        wait_for_rendered(lambda:bool(calls))
         assert calls==[{'automatic':True}]
         assert not window.qml_errors
     finally:window.quit_app()

@@ -199,6 +199,22 @@ class OverlayController(QObject):
     def overlay_identity(data):
         return data.get('home'),data.get('id'),tuple(data.get('_prepared_token') or ())
 
+    @staticmethod
+    def reusable_overlay_detail(data,cached):
+        revision=data.get('_overlay_revision')
+        return bool(cached and revision and
+                    (data.get('home'),data.get('id'),tuple(revision))==
+                    (cached.get('home'),cached.get('id'),tuple(cached.get('_overlay_revision') or ())))
+
+    @staticmethod
+    def refreshed_overlay_detail(data,cached,health):
+        value=dict(data,recent=cached['recent'],latest=cached['latest'],_recent_refs=False,
+                   _health_detail=bool(health and cached.get('_health_detail')))
+        if value['_health_detail']:
+            value.update({key:cached[key] for key in
+                          ('cache_misses','cache_health','cache_degradation') if key in cached})
+        return value
+
     def prepared_content(self,data):
         """Only the selected visible overlay requests calls or health evidence."""
         if not data.get('_recent_refs'):return data,False
@@ -208,18 +224,19 @@ class OverlayController(QObject):
             return data,False
         cached=self._overlay_detail
         health=bool(self.expanded)
-        if cached and self.overlay_identity(cached)==identity:
-            if not health and cached.get('_health_detail'):
-                cached=dict(cached,**{key:data[key] for key in
-                    ('cache_misses','cache_health','cache_degradation') if key in data},_health_detail=False)
-                self._overlay_detail=cached
+        if cached and (self.overlay_identity(cached)==identity or self.reusable_overlay_detail(data,cached)):
+            cached=self.refreshed_overlay_detail(data,cached,health)
+            self._overlay_detail=cached
             if not health or cached.get('_health_detail'):
-                return dict(cached,_collection=data.get('_collection',{})),False
+                return cached,False
         pending=self.pending_overlay
+        same_pending=bool(pending and (pending[1]==identity or
+            len(pending)>3 and pending[1][:2]==identity[:2] and pending[3] and
+            pending[3]==tuple(data.get('_overlay_revision') or ())))
         if (self.overlay_loader and self._overlay_blocked!=identity and
-                not (pending and pending[1]==identity and (pending[2] or not health))):
+                not (same_pending and (pending[2] or not health))):
             self.overlay_serial+=1;request=f'overlay-detail-{self.overlay_serial}'
-            self.pending_overlay=(request,identity,health)
+            self.pending_overlay=(request,identity,health,tuple(data.get('_overlay_revision') or ()))
             self.overlay_loader(request,data,health=health)
         return None,True
 
@@ -229,7 +246,8 @@ class OverlayController(QObject):
         self.pending_overlay=None
         selection=self.target_state.get('selection')
         matches=self.session_lookup.get(selection.thread_id,[]) if selection else []
-        if len(matches)!=1 or self.overlay_identity(matches[0])!=pending[1]:return
+        if len(matches)!=1:return
+        current=matches[0]
         if value.get('kind')=='stale':
             self._overlay_detail=None;self._overlay_blocked=pending[1]
             self.refresh();return
@@ -237,6 +255,9 @@ class OverlayController(QObject):
         token=tuple(value.get('prepared_token') or ())
         if not detail or token!=pending[1][2] or self.overlay_identity(detail)!=pending[1]:return
         if detail.get('_recent_refs') or (pending[2] and not detail.get('_health_detail')):return
+        if self.overlay_identity(current)!=pending[1]:
+            if not self.reusable_overlay_detail(current,detail):return
+            detail=self.refreshed_overlay_detail(current,detail,pending[2])
         self._overlay_detail=detail;self._overlay_blocked=None
         self.refresh()
         navigation=self._pending_overlay_navigation

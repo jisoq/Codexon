@@ -92,6 +92,7 @@ def process_main(connection,homes,index_path,static_snapshot=None,model_evidence
             if pending is not None:
                 request=pending;pending=None
                 try:
+                    connection.send(dict(kind='progress',id=request['id'],stage='query'))
                     result=engine.page_query(request['query'])
                     ready=dict(kind='result',id=request['id'],logical=request['logical'],result=result,
                                valid_until=result['valid_until'] if 'valid_until' in result else expiry(engine,request['query']),
@@ -114,6 +115,7 @@ class AnalysisBridge(QThread):
     # Avoid recursive QVariantMap conversion of the complete analysis graph.
     snapshot=Signal(object)
     result=Signal(object)
+    progress=Signal(object)
     failure=Signal(str)
     fault=Signal(object)
     record=Signal(object)
@@ -205,6 +207,7 @@ class AnalysisBridge(QThread):
                                 parent.send({'kind':'sync'});receiver=SnapshotReceiver();continue
                             if value is not None:self.snapshot.emit(value)
                         elif message['kind'] in ('record','population','overlay_detail','result','stale'):self._deliver_result(message)
+                        elif message['kind']=='progress':self.progress.emit(message)
                         elif message['kind'] in ('error','fatal'):
                             self.failure.emit(message['error'])
                             self.fault.emit(dict(query_failed=message['kind']=='error',

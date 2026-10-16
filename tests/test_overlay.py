@@ -17,6 +17,64 @@ A = '11111111-1111-1111-1111-111111111111'
 B = '22222222-2222-2222-2222-222222222222'
 
 
+@pytest.mark.parametrize('health',[False,True])
+def test_overlay_reuses_verified_detail_across_unrelated_publications(health):
+    from types import SimpleNamespace
+    requested=[]
+    data=dict(home='home',id=A,_prepared_token=('test',1),_overlay_revision=('test',1),
+              _recent_refs=True,recent=[{'key':'call'}],latest={'key':'call'},
+              cache_health={'count':1},speed_health={'active':False},_collection={'received_age':0})
+    detail=dict(data,recent=[{'key':'call','output':100}],latest={'key':'call','output':100},
+                _recent_refs=False,_health_detail=health,
+                cache_health={'count':1,'events':[{'id':'incident'}]} if health else data['cache_health'])
+    controller=SimpleNamespace(collapsed=False,expanded=health,_overlay_detail=detail,
+        pending_overlay=None,_overlay_blocked=None,overlay_serial=0,
+        overlay_loader=lambda *args,**kwargs:requested.append((args,kwargs)),
+        overlay_identity=OverlayController.overlay_identity,
+        reusable_overlay_detail=OverlayController.reusable_overlay_detail,
+        refreshed_overlay_detail=OverlayController.refreshed_overlay_detail)
+    for generation in range(2,22):
+        current=dict(data,_prepared_token=('test',generation),speed_health={'active':True},
+                     _collection={'received_age':generation})
+        result,pending=OverlayController.prepared_content(controller,current)
+        assert not pending and result['latest']['output']==100
+        assert result['_prepared_token']==current['_prepared_token']
+        assert result['speed_health']==current['speed_health']
+        assert result['_collection']==current['_collection']
+        assert result.get('_health_detail') is health
+    assert requested==[]
+    changed=dict(current,_prepared_token=('test',22),_overlay_revision=('test',22))
+    assert OverlayController.prepared_content(controller,changed)==(None,True)
+    for generation in range(23,43):
+        assert OverlayController.prepared_content(controller,dict(changed,_prepared_token=('test',generation)))==(None,True)
+    assert len(requested)==1
+    controller.target_state={'selection':Selection(A)}
+    controller.session_lookup={A:[changed]}
+    controller.refresh=lambda:None
+    controller._pending_overlay_navigation=None
+    request=controller.pending_overlay[0]
+    # An obsolete completion cannot overwrite the changed selected owner.
+    OverlayController.receive_overlay_detail(controller,dict(id=request,summary=detail,
+        prepared_token=detail['_prepared_token']))
+    assert controller._overlay_detail['_overlay_revision']==('test',1)
+
+
+def test_overlay_accepts_inflight_detail_only_when_selected_dependencies_are_unchanged():
+    from types import SimpleNamespace
+    old=dict(home='home',id=A,_prepared_token=('test',1),_overlay_revision=('test',1),
+             _recent_refs=False,recent=[{'key':'call','output':100}],latest={'key':'call','output':100})
+    current=dict(old,_prepared_token=('test',2),_recent_refs=True,recent=[{'key':'call'}],latest={'key':'call'})
+    controller=SimpleNamespace(pending_overlay=('request',OverlayController.overlay_identity(old),False),
+        target_state={'selection':Selection(A)},session_lookup={A:[current]},
+        _overlay_detail=None,_overlay_blocked=None,_pending_overlay_navigation=None,refresh=lambda:None,
+        overlay_identity=OverlayController.overlay_identity,
+        reusable_overlay_detail=OverlayController.reusable_overlay_detail,
+        refreshed_overlay_detail=OverlayController.refreshed_overlay_detail)
+    OverlayController.receive_overlay_detail(controller,dict(id='request',summary=old,prepared_token=('test',1)))
+    assert controller._overlay_detail['_prepared_token']==('test',2)
+    assert controller._overlay_detail['latest']['output']==100
+
+
 def test_overlay_banner_identifies_each_trigger_without_changing_stale_threshold(monkeypatch):
     from types import SimpleNamespace
     from cachemonitor.overlay_view import OverlayContent

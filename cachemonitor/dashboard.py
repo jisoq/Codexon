@@ -221,6 +221,8 @@ class Dashboard(TrayWindow):
             field=labeled_control(title,node);self.common_fields[node]=field;self.common_filters.addWidget(field)
         self.scope_note=label('수집 중','muted');self.scope_note.put(fontSize=12);self.scope_note.setFixedHeight(18);layout.addWidget(self.scope_note)
         self.pages=Stack();self.pages.put(deferPages=True);layout.addWidget(self.pages,1);self.scrollers={}
+        self.pages.pageReady.connect(self.analysis_page_ready)
+        self._waiting_page=None
         self.analysis_notice=Group();self.analysis_notice.setObjectName('analysis-notice');self.analysis_notice.hide()
         notice_layout=Column(self.analysis_notice);notice_layout.addStretch()
         self.analysis_notice_body=Group();notice_layout.addWidget(self.analysis_notice_body);notice_layout.addStretch()
@@ -228,6 +230,10 @@ class Dashboard(TrayWindow):
         self.analysis_notice_title=label('','section',True);self.analysis_notice_title.setAlignment(Qt.AlignHCenter)
         self.analysis_notice_detail=label('','muted',True);self.analysis_notice_detail.setAlignment(Qt.AlignHCenter)
         notice_body.addWidget(self.analysis_notice_title);notice_body.addWidget(self.analysis_notice_detail)
+        self.analysis_progress=Group();self.analysis_progress.put(kind='progress',stage=0,running=True,compact=False)
+        notice_body.addWidget(self.analysis_progress)
+        self.refresh_loading=Group();self.refresh_loading.put(kind='progress',stage=0,running=False,compact=True)
+        self.refresh_loading.hide();layout.insertWidget(layout.nodes.index(self.pages),self.refresh_loading)
         notice_actions=Row();notice_actions.addStretch()
         self.notice_retry=Button('다시 시도');self.notice_retry.clicked.connect(self.retry_analysis);notice_actions.addWidget(self.notice_retry);notice_actions.addStretch()
         notice_body.addLayout(notice_actions);layout.addWidget(self.analysis_notice,1)
@@ -258,6 +264,9 @@ class Dashboard(TrayWindow):
                                        cache_floor=self.confirmed_notifications.cache_floor)
             self.worker.snapshot.connect(self.receive);self.worker.result.connect(self.analysis_ready)
             self.worker.stale.connect(self.analysis_stale)
+            self.worker.progress.connect(self.analysis_progressed)
+            # The initial page can enter loading before a worker owns its request.
+            self.pending_logical=None
             self.worker.fault.connect(self.analysis_failed);self.worker.record.connect(self.record_ready);self.worker.start();self.render()
         elif static_snapshot is not None:self.receive(static_snapshot)
         self.setCentralWidget(root)
@@ -926,6 +935,10 @@ class Dashboard(TrayWindow):
         custom=self.period.currentData()=='custom';self.date_start.setVisible(custom);self.date_end.setVisible(custom)
         if self.current_page in (3,4):
             if self.current_page==3:self.quota_panel.refresh_status()
+            if not self.pages.isPageReady(self.current_page):
+                self._waiting_page=(self.request_id,self.current_page)
+                self.show_analysis_notice(formatted('{page} 불러오는 중',page=tr(TITLES[self.current_page])), '')
+                self.set_analysis_stage('present')
             return
         q=self.query()
         if automatic and q['page']==2:
@@ -945,9 +958,11 @@ class Dashboard(TrayWindow):
                 key_query.pop('loading',None)
                 revision=self.snapshot.get('call_revision',revision)
             logical=(self.snapshot.get('epoch'),revision,json.dumps(key_query,sort_keys=True))
-            if automatic and self.analysis_pending:
-                self._refresh_after_pending=getattr(self,'pending_logical',None)!=logical
-                return
+            if self.analysis_pending:
+                if automatic:
+                    self._refresh_after_pending=getattr(self,'pending_logical',None)!=logical
+                    return
+                if getattr(self,'pending_logical',None)==logical:return
             self.request_id+=1
             if not automatic:self.deferred_result=None;self.defer_timer.stop()
             self.pending_query=q;self.pending_automatic=automatic;self.pending_logical=logical
@@ -971,53 +986,87 @@ class Dashboard(TrayWindow):
         ignored={'now','loading','table_windows','plot_width'}
         if query['period']!='custom':ignored.update(('start','end'))
         identity={k:v for k,v in query.items() if k not in ignored}
+        if query.get('category_usage'):
+            identity['usage']={k:v for k,v in query['usage'].items() if k!='size'}
         if query['page']==5 and self.performance_panel.follow_latest:
             identity['time_range']=('latest',self.performance_panel.window_span)
         return json.dumps(identity,sort_keys=True)
 
     def clear_analysis_notice(self):
         self.pending_timer.stop();self.slow_timer.stop();self.pending_label.hide();self.retry_button.hide()
+        self._waiting_page=None
+        self.analysis_progress.put(running=False,slow=False);self.analysis_progress.hide()
+        self.refresh_loading.put(running=False,slow=False);self.refresh_loading.hide()
+        self.metric_panel.put(queryPending=False)
         self.analysis_notice.hide();self.pages.show();self.scope_note.hide()
 
     def begin_analysis_loading(self,query):
         self.clear_analysis_notice()
-        self.pending_retained=self.display_identity==self.query_identity(query)
+        self.pending_retained=(self.display_identity==self.query_identity(query)
+                               and self.pages.isPageReady(self.current_page))
+        self.metric_panel.put(queryPending=query['page']==1)
+        self.set_analysis_stage('queued')
         if not self.pending_retained:
-            # Suppress empty charts immediately; delay only the loading text.
-            self.pages.hide();self.scope_note.hide();self.analysis_notice.show();self.analysis_notice_body.hide()
+            self.show_analysis_pending()
         self.pending_timer.start();self.slow_timer.start()
+
+    def set_analysis_stage(self,stage):
+        stages={'queued':(0,'기록 준비','분석에 사용할 기록을 준비하고 있습니다.'),
+                'query':(1,'기록 조회','선택한 조건에 맞는 사용 기록을 읽고 있습니다.'),
+                'aggregate':(2,'지표 계산','조회한 기록으로 지표를 계산하고 있습니다.'),
+                'present':(3,'화면 준비','화면의 구성 요소를 준비하고 있습니다.')}
+        index,title,detail=stages.get(stage,stages['queued'])
+        self.analysis_stage=stage
+        self.analysis_notice_title.hide();self.analysis_notice_detail.hide();self.analysis_progress.show()
+        self.analysis_progress.put(stage=index,title=formatted('{page} 불러오는 중',page=tr(TITLES[self.current_page])),detail=detail,running=True,
+                                   showStages=self.current_page not in (3,4))
+        self.refresh_loading.put(stage=index,title='최신 기록 반영 중',detail=tr(detail)+' '+tr('기존 결과를 유지합니다.'),running=True)
+
+    def analysis_progressed(self,message):
+        if message.get('id')==self.request_id and self.analysis_pending:
+            self.set_analysis_stage(message.get('stage'))
+
+    def analysis_page_ready(self,index):
+        if self._waiting_page!=(self.request_id,index) or index!=self.current_page:return
+        self.clear_analysis_notice()
 
     def show_analysis_notice(self,title,detail,retry=False):
         self.pages.hide();self.scope_note.hide();self.analysis_notice.show();self.analysis_notice_body.show()
+        self.analysis_progress.hide();self.analysis_progress.put(running=False)
+        self.analysis_notice_title.show();self.analysis_notice_detail.show()
         self.analysis_notice_title.setText(title);self.analysis_notice_detail.setText(detail)
         self.notice_retry.setVisible(retry)
 
     def show_analysis_pending(self):
         if not self.analysis_pending or self.current_page in (3,4):return
         if self.pending_retained:
-            self.pending_label.setText('최신 기록 반영 중');self.pending_label.setToolTip('');self.pending_label.show()
+            self.refresh_loading.show()
         else:
             self.show_analysis_notice(formatted('{page} 불러오는 중',page=tr(TITLES[self.current_page])),
-                                      '선택한 조건에 맞는 사용 기록을 조회하고 있습니다.')
+                                      '')
+            self.set_analysis_stage(self.analysis_stage)
 
     def show_analysis_slow(self):
         if not self.analysis_pending or self.current_page in (3,4):return
-        if self.pending_retained:
-            self.pending_label.setText('최신 기록 분석 결과 대기 중')
-        else:
-            self.analysis_notice_detail.setText('분석 결과를 기다리고 있습니다.\n다른 탭을 이용할 수 있습니다.')
+        self.analysis_progress.put(slow=True)
 
     def finish_analysis_loading(self,result,query):
         self.analysis_pending=False;self.clear_analysis_notice()
         if self.snapshot.get('index',{}).get('loading') and not result['analysis']['response_count']:
             self.display_identity=None
             self.show_analysis_notice('사용 기록 수집 중','Codex 사용 기록을 읽고 있습니다.')
-        else:self.display_identity=self.query_identity(query)
+            self.set_analysis_stage('queued')
+        else:
+            self.display_identity=self.query_identity(query)
+            if not self.pages.isPageReady(self.current_page):
+                self._waiting_page=(self.request_id,self.current_page)
+                self.show_analysis_notice(formatted('{page} 불러오는 중',page=tr(TITLES[self.current_page])), '')
+                self.set_analysis_stage('present')
 
     def retry_analysis(self):
         if self.worker is not None and not self.worker.isRunning():
             self.worker.restart_count=0;self.worker.start()
-        self.client_cache.clear();self.render()
+        self.client_cache.clear();self.pending_logical=None;self.render()
 
     def scope_text(self,q):
         if self.temporary_context and q['page']==2:
@@ -1111,20 +1160,21 @@ class Dashboard(TrayWindow):
                 if isinstance(item,QuickPlot):item.clearHover()
                 pending.extend(item.childItems())
         else:return
-        self.client_cache.clear();self.render()
+        self.client_cache.clear();self.pending_logical=None;self.render()
 
     @batched_updates
     def apply_result(self,result,query,automatic=False):
         if query['page']!=self.current_page:return
         if automatic and (not self.isVisible() or self.isMinimized()):
             self.analysis_pending=False;self._display_dirty=True;return
-        self.finish_analysis_loading(result,query)
+        self.set_analysis_stage('present')
         if query['page']==5:
             self.view_result=result;self.performance_panel.apply(result['performance'])
             restored=getattr(self,'_restore_positions',None)
             if restored:
                 position=restored.get('scrolls',{}).get('5',restored.get('scrolls',{}).get(5,0))
                 self.scrollers[5].verticalPosition.setValue(position);self._restore_positions=None
+            self.finish_analysis_loading(result,query)
             self.refresh_after_analysis()
             return
         self.view_result=result;self.applied_key=result['key'];self.analysis=result['analysis'];self.lookup=result['lookup']
@@ -1157,6 +1207,7 @@ class Dashboard(TrayWindow):
                 wanted=tuple(selected) if isinstance(selected,(list,tuple)) else selected
                 self.table.select_row(next((i for i,row in enumerate(self.record_rows,getattr(self.record_rows,'start',0)) if self.table.row_key(row)==wanted),-1))
         self.save_preferences()
+        self.finish_analysis_loading(result,query)
         # Comparison setup may resolve default targets while applying the result.
         if self.display_identity is not None:self.display_identity=self.query_identity(self.query())
         self.refresh_after_analysis()
@@ -1168,7 +1219,9 @@ class Dashboard(TrayWindow):
     def analysis_failed(self,error):
         facts=dict(error) if isinstance(error,dict) else dict(query_failed=True,request_id=self.request_id)
         if facts.get('query_failed') and facts.get('request_id')!=self.request_id:return
-        facts.update(current_request_id=self.request_id,retained=self.display_identity==self.query_identity(self.query()))
+        facts.update(current_request_id=self.request_id,
+                     retained=self.display_identity==self.query_identity(self.query())
+                              and self.pages.isPageReady(self.current_page))
         if self.current_page in (0,1,2,5):self._analysis_error_page=self.current_page
         self.observe_error('analysis.query' if facts.get('query_failed') else 'analysis.process','analysis',facts)
         self.client_cache.clear();self.pending_logical=None

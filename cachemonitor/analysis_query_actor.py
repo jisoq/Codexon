@@ -43,6 +43,8 @@ class QueryActor:
             self.latest[kind] = serial
             self.pending.pop(kind, None)
             self.completed.pop(kind, None)
+            if kind == 'query':
+                self.completed.pop('progress', None)
             self.pending[kind] = (serial, dict(message), token)
             if self.active is not None:
                 active_kind, active_serial, active_message, active_token, cancel = self.active
@@ -64,6 +66,8 @@ class QueryActor:
                 self.latest.pop(item, None)
                 self.pending.pop(item, None)
                 self.completed.pop(item, None)
+                if item == 'query':
+                    self.completed.pop('progress', None)
             if self.active is not None and self.active[0] in kinds:
                 self.active[-1].set()
 
@@ -93,7 +97,8 @@ class QueryActor:
                     cancel = Event()
                     self.active = (kind, serial, message, token, cancel)
                 try:
-                    result = handler(message, token, cancel.is_set)
+                    progress = lambda stage: self._progress(kind, serial, message, cancel, stage)
+                    result = handler(dict(message, _progress=progress), token, cancel.is_set)
                     if retained_bytes(result, RESULT_BYTES) > RESULT_BYTES:
                         raise ValueError('prepared query result exceeds the admitted delivery budget')
                 except Exception:
@@ -104,6 +109,8 @@ class QueryActor:
                         return
                     if cancel.is_set() or self.latest.get(kind) != serial:
                         continue
+                    if kind == 'query':
+                        self.completed.pop('progress', None)
                     # At most one completion per consumer, including an old
                     # completion waiting while the writer commits its current slice.
                     self.completed[kind] = result
@@ -118,6 +125,17 @@ class QueryActor:
                     handler.close()
                 except Exception:
                     self._failed()
+
+    def _progress(self, kind, serial, message, cancel, stage):
+        if kind != 'query':
+            return
+        with self.condition:
+            if self.stopping or cancel.is_set() or self.latest.get(kind) != serial:
+                return
+            self.completed['progress'] = dict(kind='progress', id=message['id'], stage=stage)
+            if not self.signalled:
+                self._signal.send_bytes(b'1')
+                self.signalled = True
 
     def _failed(self):
         failure = traceback.format_exc(limit=6)

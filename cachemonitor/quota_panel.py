@@ -63,7 +63,6 @@ class QuotaPanel(Group):
         self._prepared_query=None
         self._chart_pending=None
         self._chart_value=None
-        self._summary_opened=None;self._summary_restore=None
         layout=Column(self)
         layout.setContentsMargins(0,0,0,0)
         layout.setSpacing(20)
@@ -135,6 +134,9 @@ class QuotaPanel(Group):
             self.history_legend.addWidget(legend)
             if key=='remaining':self.remaining_legend=legend
         chart_layout.addLayout(self.history_legend)
+        self.history_loading=Group();self.history_loading.put(kind='progress',stage=2,
+            title='사용량 계산 중',compact=True,running=False)
+        self.history_loading.hide();chart_layout.addWidget(self.history_loading)
         chart_layout.addWidget(self.history)
         self.history_empty=Text();self.history_empty.put(fontSize=14,color='muted',wrap=True)
         chart_layout.addWidget(self.history_empty)
@@ -148,6 +150,9 @@ class QuotaPanel(Group):
         conversion_layout=Column(self.conversion);conversion_layout.setContentsMargins(20,18,20,18);conversion_layout.setSpacing(16)
         title=Text('관측 내역');title.put(fontSize=18,bold=True);conversion_layout.addWidget(title)
         conversion_layout.addLayout(scope)
+        self.query_loading=Group();self.query_loading.put(kind='progress',stage=2,
+            title='사용량 계산 중',detail='선택한 조건의 사용량을 계산하고 있습니다.',compact=True,running=False)
+        self.query_loading.hide();conversion_layout.addWidget(self.query_loading)
         metrics=Row();metrics.put(collapseBelow=620,columns=2);metrics.setSpacing(20)
         self.basis=Text();self.cost_value=Text();self.basis.setToolTip(TIPS["quota_used"]);self.cost_value.setToolTip(TIPS["cost"])
         for name,value in (('소모량',self.basis),('구독 가치 환산액',self.cost_value)):
@@ -285,17 +290,15 @@ class QuotaPanel(Group):
             if self.report is not report:return
             index=self.cycle_choice.findData(start)
             if index<1:return
-            self._summary_opened=start
             self.cycle_choice.setCurrentIndex(index)
         # Finish the chart's pointer event before replacing its selected data.
         QTimer.singleShot(0,select)
 
-    def return_to_summary(self):
-        self._summary_restore=self._summary_opened
-        self.cycle_choice.setCurrentIndex(0)
-
     def render_history(self,*_):
         from bisect import bisect_left
+        self._set_loading(self.history_loading,
+            bool(self.report.get('history_pending') and not self.report.get('history_failed')),
+            '전체 이력을 계산하고 있습니다. 현재 주기는 계속 확인할 수 있습니다.')
         if getattr(self,'_value_report',None) is not self.report:
             had_periods=bool(getattr(self,'_view',{}).get('periods'))
             self._view=self.report.get('view') or prepare_quota_view(self.report)
@@ -340,8 +343,15 @@ class QuotaPanel(Group):
                     self._chart_pending=key
                     if hasattr(self._query_worker,'select_chart'):self._query_worker.select_chart(selection)
                     self._query_worker.request('chart',key=key,revision=self.report['worker_revision'],selection=selection)
-                self.history.hide();self.history_legend.hide();self.history_empty.setText('계산 중...');self.history_empty.show()
-                self.model_legend.hide()
+                retained=bool(self._chart_value and self._chart_value[0][0]==key[0]
+                    and self._chart_value[0][2]==selection and self.history.rows
+                    and getattr(self,'_selected_cycle',None)==selection)
+                loading=self._query_worker is not None and self._chart_pending==key
+                self._set_loading(self.history_loading,loading,'선택한 주기의 차트를 준비하고 있습니다.')
+                self.history.setVisible(retained);self.history_legend.setVisible(retained)
+                self.model_legend.setVisible(retained and not all_cycles)
+                self.history_empty.setVisible(not loading and not retained)
+                if not loading:self.history_empty.setText('차트를 계산하지 못했습니다.')
                 if hasattr(self,'summary_context'):self.summary_context.hide()
                 if hasattr(self,'manage_button'):self.manage_button.hide()
                 self.exclusions.set_context(self.report,None,True)
@@ -381,14 +391,9 @@ class QuotaPanel(Group):
         self.history_empty.setVisible(any_history and not rows)
         self.history.cursor=(len(rows)-1 if rows and (follow or not same) else
                              min(bisect_left(series['times'],old),len(rows)-1) if rows and old is not None else 0)
-        if all_cycles and rows and self._summary_restore is not None:
-            self.history.cursor=next((i for i,row in enumerate(rows) if row['cycle_start']==self._summary_restore),len(rows)-1)
-            self._summary_restore=None
-            self.history.repaintRequested.emit()
         if hasattr(self,'summary_context'):
-            self.summary_context.setVisible(bool(rows))
+            self.summary_context.setVisible(bool(rows) and all_cycles)
             self.summary_note.setVisible(all_cycles)
-            self.summary_back.setVisible(not all_cycles and not self.report.get('history_pending'))
         self.exclusions.set_context(self.report,period,True,cursor=self.history.cursor)
         if hasattr(self,'sync_dialog'):self.sync_dialog()
         if rows:self.select_observation(rows[self.history.cursor])
@@ -425,6 +430,11 @@ class QuotaPanel(Group):
     def _cache_query(self, key, value):
         self._query_cache[key]=value
         while len(self._query_cache)>8:self._query_cache.pop(next(iter(self._query_cache)))
+
+    @staticmethod
+    def _set_loading(node, active, detail=None):
+        node.put(running=active,**({'detail':detail} if detail is not None else {}))
+        node.setVisible(active)
 
     def _bind_worker(self):
         worker=self.report.get('_worker')
@@ -464,9 +474,14 @@ class QuotaPanel(Group):
             if key!=self._chart_pending or key!=current:return
             self._chart_pending=None
             if message.get('error'):
+                self._set_loading(self.history_loading,False)
+                self.history_empty.setText('차트를 계산하지 못했습니다.')
+                self.history_empty.setVisible(not self.history.isVisible())
                 self.fault_changed.emit(dict(calculation_failed=True));return
             value=message['value']
-            if value['selection']!=key[2] or value.get('series') is None:return
+            if value['selection']!=key[2] or value.get('series') is None:
+                self._set_loading(self.history_loading,False)
+                return
             self.fault_changed.emit(dict(query_healthy=True))
             self._chart_value=(key,value['series'])
             if getattr(self,'defer_render',False):self._render_dirty=True
@@ -475,6 +490,7 @@ class QuotaPanel(Group):
         if message.get('kind')!='query' or key!=self._query_pending:return
         self._query_pending=None
         if key!=self._query_key():return
+        self._set_loading(self.query_loading,False)
         if message.get('error'):
             self._query_failed=True
             self.fault_changed.emit(dict(calculation_failed=True))
@@ -488,6 +504,7 @@ class QuotaPanel(Group):
 
     def render(self,*_,automatic=False):
         self.refresh_status()
+        self._set_loading(self.query_loading,False)
         if 'view' not in self.report:
             self.report={**self.report,'view':prepare_quota_view(self.report)}
         self.status.setText(self.issue or ('한도 기록을 읽지 못했습니다. 마지막 저장값을 확인해 주세요.' if self.report.get('error') else ''))
@@ -495,7 +512,7 @@ class QuotaPanel(Group):
         self.lifetime_statistics=(self.report.get('view') or {}).get('lifetime') or quota_statistics(self.report)
         lifetime=self.lifetime_statistics
         has_usage=bool(lifetime['total'] or self.report.get('exclusions') or self.report.get('cycle_clears'))
-        self.history_waiting.setVisible(not has_usage)
+        self.history_waiting.setVisible(not has_usage and not self.report.get('history_pending'))
         for node in (self.summary_heading,self.result,self.lifetime_basis,self.conversion):node.setVisible(has_usage)
         selected_model=self.model_choice.currentData()
         available=self.report['view'].get('available_models')
@@ -522,9 +539,9 @@ class QuotaPanel(Group):
             node=getattr(self,name,None)
             if node is not None:node.setEnabled(not pending)
         if pending:
-            self.status.setText('전체 이력을 읽지 못했습니다. 현재 주기는 계속 확인할 수 있습니다.' if self.report.get('history_failed') else
-                                '현재 주기를 표시했습니다. 전체 이력을 계산하고 있습니다.')
-            self.status.put(color='error' if self.report.get('history_failed') else 'muted');self.status.show()
+            if self.report.get('history_failed'):
+                self.status.setText('전체 이력을 읽지 못했습니다. 현재 주기는 계속 확인할 수 있습니다.')
+                self.status.put(color='error');self.status.show()
             self.conversion.hide()
             if hasattr(self,'clear_cycle_button'):self.clear_cycle_button.setEnabled(False)
             return
@@ -533,7 +550,9 @@ class QuotaPanel(Group):
         days=self.period.currentData()
         prepared=self._view.get('summaries',{})
         query=self._prepared_statistics() if 'worker_revision' in self.report else None
-        if 'worker_revision' in self.report and query is None:return
+        if 'worker_revision' in self.report and query is None:
+            self._set_loading(self.query_loading,self._query_pending==self._query_key())
+            return
         summary=self.statistics=(query['statistics'] if query is not None else
                                  prepared[days] if days in prepared and self.period_end is None and
                                  (days is not None or self.period_start is None) else

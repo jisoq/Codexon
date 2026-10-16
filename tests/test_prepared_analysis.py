@@ -372,6 +372,17 @@ def test_category_projection_preserves_filtered_totals_without_decoding_call_bod
             with engine.read_scope():
                 project(engine, {**query, 'usage':{**query['usage'], 'sort':'name', 'size':1}})
             assert engine.read_metrics['category_projection_rows'] == reads
+            boundary_reads = []
+            boundaries = engine.boundary_times
+            def count_boundaries(at):
+                boundary_reads.append(at)
+                yield from boundaries(at)
+            monkeypatch.setattr(engine, 'boundary_times', count_boundaries)
+            query = dict(query, period='all')
+            assert engine.page_query(query) == reference.page_query(query)
+            assert boundary_reads == [query['end']]
+            engine.page_query({**query, 'usage':{**query['usage'], 'sort':'name', 'size':1}})
+            assert boundary_reads == [query['end']]
         finally:
             engine.close()
 
@@ -659,3 +670,67 @@ def test_performance_full_range_streams_exact_charts_within_the_object_budget(tm
                 assert engine.read_metrics['trend_scalar_peak_bytes'] <= limits.page_objects_bytes
         finally:
             engine.close()
+
+
+def test_performance_many_owners_complete_within_the_read_work_budget(tmp_path):
+    from cachemonitor.prepared_analysis import PreparedAnalysisEngine
+    from cachemonitor.prepared_performance import _Input
+
+    limits = replace(storage.Limits(), read_seconds=60, read_vm_steps=60_000)
+    with storage.PreparedStore(tmp_path/'many-owners.sqlite') as store:
+        stage = store.begin(('performance', 1))
+        dependency = {name:1 for name in storage.DEPENDENCIES}
+        dependency['source_digest'] = '1'*64
+        for owner in reversed(range(64)):
+            identity = ('home', str(owner))
+            stage.owner(*identity, dict(home='home', id=str(owner), _internal_review=False),
+                        dependency, source_ordinal=owner)
+            stage.calls(identity, [dict(key=str(number), ts=100+number, session_ordinal=number,
+                model='model', input=100, cached=20) for number in range(4)], reconcile=True)
+        token = stage.publish(('performance', 1), ready=True)
+        engine = PreparedAnalysisEngine(store.path, token, limits=limits)
+        try:
+            with engine.read_scope():
+                rows = list(_Input(engine).ordered_rows(100, 104, keys=True))
+            assert [(row['ts'], row['sid']) for row in rows] == [
+                (100+number, str(owner)) for number in range(4) for owner in range(64)]
+        finally:
+            engine.close()
+
+
+def test_query_progress_coalesces_and_discards_replaced_requests():
+    from cachemonitor.analysis_query_actor import QueryActor
+
+    started, release, completed = Event(), Event(), Event()
+    class Handler:
+        def __call__(self, message, token, cancel):
+            message['_progress']('query')
+            message['_progress']('aggregate')
+            if message['id'] == 1:
+                started.set()
+                assert release.wait(5)
+            else:
+                completed.set()
+            return dict(kind='result', id=message['id'])
+
+        def close(self):
+            pass
+
+    actor = QueryActor(Handler)
+    try:
+        actor.submit(dict(kind='query', id=1), None)
+        assert started.wait(5)
+        assert actor.drain() == [dict(kind='progress', id=1, stage='aggregate')]
+        actor.submit(dict(kind='query', id=2), None)
+        release.set()
+        assert completed.wait(5)
+        assert actor.notification.poll(5)
+        messages = actor.drain()
+        assert all(message['id'] == 2 for message in messages)
+        if not any(message['kind'] == 'result' for message in messages):
+            assert actor.notification.poll(5)
+            messages += actor.drain()
+        assert [message for message in messages if message['kind'] == 'result'] == [dict(kind='result', id=2)]
+    finally:
+        release.set()
+        actor.close()

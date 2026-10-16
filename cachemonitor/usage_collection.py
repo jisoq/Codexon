@@ -1463,10 +1463,14 @@ def main():
         publish_collector_fault(fault_path,scope,args.instance,error,facts=dict(start_failed=True))
         return 1
     if args.instance:service.instance=args.instance
-    first=True
+    first=True;changes=None
     try:
+        from .collection_wake import SourceChanges
+        changes=SourceChanges((service.channel.path,service.channel.snapshot_path,evidence))
+        changes.sync(service.channel.homes)
         while not service.stopping():
             snapshot=service.poll(detailed=False)
+            changes.sync(snapshot['homes'])
             if first:
                 # One bounded record is replaced only on failure or a new healthy
                 # service instance. Normal polling adds no marker writes.
@@ -1477,14 +1481,18 @@ def main():
                 first=False
             deadline=time.monotonic()+(.1 if snapshot['index']['loading'] else 3)
             while time.monotonic()<deadline:
+                # Keep the existing replay admission budget before accepting a
+                # source hint; a new poll replaces unfinished capture views.
                 if not service.maintain():
-                    time.sleep(max(0,deadline-time.monotonic()))
+                    changes.wait(deadline)
                     break
     except Exception as error:
         facts=dict(getattr(service.index,'collection_fault',{}) or {})
         publish_collector_fault(fault_path,service.channel.scope,service.instance,error,facts=facts)
         raise
-    finally:service.close()
+    finally:
+        if changes is not None:changes.close()
+        service.close()
 
 
 def isolated_collector(homes,path,evidence=None,*,reuse=False):

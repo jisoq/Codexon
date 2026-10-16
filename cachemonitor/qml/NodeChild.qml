@@ -7,6 +7,7 @@ Item {
     property bool loadRequested: true
     property bool asynchronousLoad: false
     property bool retained: false
+    readonly property bool ready: content.status === Loader.Ready
     Loader {
         id: content; anchors.fill: parent
         active: child.loadRequested || child.retained

@@ -264,6 +264,15 @@ class Navigation(Choice):
 
 class Stack(Node):
     kind='stack'
+    pageReady=Signal(int)
+    def __init__(self,parent=None):
+        super().__init__(parent);self.ready_pages=set()
+    @Slot(int,bool)
+    def reportPageReady(self,index,ready):
+        if ready:
+            self.ready_pages.add(index);self.pageReady.emit(index)
+        else:self.ready_pages.discard(index)
+    def isPageReady(self,index):return index in self.ready_pages
     def setCurrentIndex(self,index):self.put(index=index)
     def currentIndex(self):return self._state['index']
 

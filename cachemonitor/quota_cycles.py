@@ -1064,8 +1064,14 @@ class QuotaLedger:
         self.db.execute('''create table if not exists mode_events(
             home text, id integer, sid text, turn text, data text,
             primary key(home,id,sid,turn))''')
-        if not has_mode_events:
+        from .request_modes import MODE_LOG_FORMAT
+        self.db.execute('CREATE TABLE IF NOT EXISTS mode_scan_format(id INTEGER PRIMARY KEY CHECK(id=1),version INTEGER NOT NULL)')
+        mode_format=self.db.execute('SELECT version FROM mode_scan_format WHERE id=1').fetchone()
+        if not has_mode_events or mode_format is None or mode_format[0]!=MODE_LOG_FORMAT:
+            # Keep verified evidence, and resume the existing bounded reverse
+            # scan once so rows rejected by an older parser can be recovered.
             self.db.execute('update mode_scan set latest=-1,before_id=0')
+            self.db.execute('INSERT OR REPLACE INTO mode_scan_format VALUES(1,?)',(MODE_LOG_FORMAT,))
         if has_mode_events:
             for home,latest,before in self.db.execute('select * from mode_scan'):
                 if latest<0:continue

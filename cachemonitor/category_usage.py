@@ -164,7 +164,7 @@ def project(engine, q):
     start=offsets[page];end=offsets[page+1] if page+1<len(offsets) else len(visible)
     # Only one page and at most six composition segments per item cross the worker wire.
     population=dict(query=scope,path=['analysis','responses'])
-    return dict(common,usage={**{k:v for k,v in data.items() if k not in ('categories','common')},'rows':visible[start:end],
+    return dict(common,valid_until=cached[2],usage={**{k:v for k,v in data.items() if k not in ('categories','common')},'rows':visible[start:end],
                               'count':len(visible),'page':page,'size':size,'maximum':max([r['value'] or 0 for r in categories]+[0]),
                               'page_count':len(offsets),'start_index':start,'end_index':end,
                               'population':population})

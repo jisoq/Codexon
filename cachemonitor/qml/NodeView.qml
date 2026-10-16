@@ -42,6 +42,7 @@ Item {
         case "spacer": return spacerComponent
         case "text": return textComponent
         case "textarea": return textAreaComponent
+        case "progress": return loadingProgressComponent
         case "button": return s.metricReset ? metricResetComponent : buttonComponent
         case "toggle": return toggleComponent
         case "switch": return switchComponent
@@ -64,6 +65,7 @@ Item {
         default: return spacerComponent
         }
     }
+    Component { id: loadingProgressComponent; UiLoading { node: view.node } }
     Component { id: usageDashboardComponent; UsageDashboard { node: view.node } }
     Component { id: spacerComponent; Item {} }
     Component { id: historyFiltersComponent; HistoryFilters { node: view.node } }
@@ -474,6 +476,7 @@ Item {
                     visible: index === view.s.index && modelData.state.visible
                     loadRequested: !view.s.deferPages || index === view.s.index
                     asynchronousLoad: !!view.s.deferPages && index !== 0
+                    onReadyChanged: view.node.reportPageReady(index, ready)
                     Layout.fillWidth: true; Layout.fillHeight: true
                 }
             }

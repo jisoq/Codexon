@@ -11,6 +11,41 @@ def setting(ts,tier='priority',tid=TID):
                  thread_settings={'service_tier':tier,'instructions':'PRIVATE','cwd':'PRIVATE'})
 
 
+def complete_setting(ts,tid=TID):
+    return event('event_msg',ts,type='thread_settings_applied',thread_id=tid,
+        thread_settings=dict(model='gpt-6-astra',model_provider_id='openai',approval_policy='never',
+            approvals_reviewer='user',permission_profile='disabled',cwd='PRIVATE',
+            collaboration_mode={'mode':'default','settings':{'model':'gpt-6-astra','developer_instructions':'PRIVATE'}},
+            disabled_plugin_ids=[]))
+
+
+def test_complete_default_snapshot_prices_future_calls_without_guessing_partial_settings():
+    from cachemonitor.analysis_engine import AnalysisEngine
+    from cachemonitor.overlay_data import OverlaySummaries
+    s=Session(TID,'h')
+    partial=event('event_msg',9999,type='thread_settings_applied',thread_id=TID,
+                  thread_settings={'model':'gpt-6-astra'})
+    assert sanitized(partial) is None
+    records=[event('turn_context',10000,turn_id='unknown',model='gpt-6-astra'),usage('unknown',time=10001),
+             complete_setting(10002),event('turn_context',10003,turn_id='standard',model='gpt-6-astra'),usage('standard',time=10004),
+             setting(10005),event('turn_context',10006,turn_id='fast',model='gpt-6-astra'),usage('fast',time=10007),
+             complete_setting(10008),usage('still-fast',time=10009),
+             event('turn_context',10010,turn_id='cleared',model='gpt-6-astra'),usage('cleared',time=10011)]
+    for record in records:
+        if record['type']=='token_usage_record':
+            record['payload']['usage']['cache_write_input_tokens']=0
+            record['payload']['turn_id']={10001:'unknown',10004:'standard',10007:'fast',10009:'fast',10011:'cleared'}[int(stamp(record['timestamp']))]
+        s.consume(sanitized(record),10012)
+    assert [r.service_tier for r in s.requests]==['미확인','Standard','priority','priority','Standard']
+    assert s.requests[-1].request_mode_source=='applied_settings'
+    assert 'PRIVATE' not in json.dumps(sanitized(complete_setting(10002)))
+    engine=AnalysisEngine();engine.ingest([s.view(10012)])
+    overlay=OverlaySummaries().collect(engine)[0]
+    assert overlay['priced']==4 and overlay['latest']['mode']=='Standard'
+    assert overlay['latest']['cost'] is not None
+    assert sanitized(setting(10012,{}))['payload']['thread_settings']['service_tier']=='미확인'
+
+
 def test_applied_settings_are_historical_scoped_and_do_not_relabel_active_turn():
     s=Session(TID,'h')
     records=[event('turn_context',10000,turn_id='first',model='m'),
@@ -31,7 +66,7 @@ def test_applied_settings_are_historical_scoped_and_do_not_relabel_active_turn()
 def test_old_index_backfills_applied_settings_without_changing_token_counts(tmp_path,monkeypatch):
     home,path=fixture_home(tmp_path)
     records=[json.loads(line) for line in path.read_text().splitlines()]
-    records.extend([setting(10001),event('turn_context',10002,turn_id='tier-turn',model='m'),
+    records.extend([complete_setting(10001),event('turn_context',10002,turn_id='tier-turn',model='gpt-6-astra'),
                     event('token_usage_record',10003,thread_id=TID,turn_id='tier-turn',response_id='tier-r',
                           usage={'input_tokens':100,'output_tokens':10})])
     path.write_text(''.join(json.dumps(row)+'\n' for row in records),encoding='utf-8')
@@ -41,10 +76,11 @@ def test_old_index_backfills_applied_settings_without_changing_token_counts(tmp_
         old=UsageIndex([home],tmp_path/'index.sqlite')
         before=next(r for r in finish(old,10010)['sessions'][0]['history'] if r['key']=='tier-r')
         assert before['service_tier']=='미확인'
-        old.db.execute('pragma user_version=0');old.db.commit();old.close()
+        old.db.execute('pragma user_version=4');old.db.commit();old.close()
     new=UsageIndex([home],tmp_path/'index.sqlite')
     try:
         after=next(r for r in finish(new,10010)['sessions'][0]['history'] if r['key']=='tier-r')
-        assert after['service_tier']=='priority'
+        assert after['service_tier']=='Standard'
         assert (after['input'],after['output'])==(before['input'],before['output'])
+        assert new.db.execute('pragma user_version').fetchone()[0]==5
     finally:new.close()

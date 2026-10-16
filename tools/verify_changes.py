@@ -151,6 +151,7 @@ RULES = (
     ('cachemonitor/usage_collection.py', ('data', 'quota_poll', 'overlay_tracking', 'retirement')),
     ('cachemonitor/collection_replay.py', ('data', 'evidence', 'quota_poll', 'retirement')),
     ('cachemonitor/collection_transport.py', ('data', 'quota_poll', 'app_lifetime')),
+    ('cachemonitor/collection_wake.py', ('data',)),
     ('cachemonitor/collection_stream.py', ('prepared', 'data', 'quota_poll')),
     ('cachemonitor/collection_append.py', ('prepared', 'data', 'quota_poll')),
     ('cachemonitor/collection_pipe.py', ('data', 'quota_poll', 'app_lifetime')),

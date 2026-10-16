@@ -70,6 +70,7 @@ def test_compact_panel_uses_worker_results_and_rejects_stale_filter_response(tmp
     assert panel.cost_value.text()==usd(6)
     panel.model_choice.setCurrentIndex(panel.model_choice.findData('test'))
     old=worker.requests[-1]
+    assert panel.query_loading.isVisible()
     assert not panel.interval_filter.isVisible()
     panel.interval_filter.setCurrentIndex(panel.interval_filter.findData('excluded'))
     assert panel._query_parameters()['mode']=='all'
@@ -80,6 +81,7 @@ def test_compact_panel_uses_worker_results_and_rejects_stale_filter_response(tmp
     assert panel.cost_value.text()==usd(6)
     worker.result.emit(dict(kind='query',key=current['key'],value=prepare_quota_query(report,current['query'])))
     assert panel.cost_value.text()==usd(2)
+    assert not panel.query_loading.isVisible() and not panel.query_loading._state['running']
     assert panel.basis.text()=='1회'
     assert len(panel.intervals.model().rows)==1
     app.processEvents()
@@ -131,7 +133,8 @@ def test_selected_graph_rejects_old_choice_and_reuses_matching_refresh(tmp_path)
     assert panel.history.rows[-1]['at']==280
     assert panel.manage_button.isVisible()
     panel.cycle_choice.setCurrentIndex(panel.cycle_choice.findData(100))
-    assert not panel.manage_button.isVisible() and panel.history_empty.isVisible()
+    assert not panel.manage_button.isVisible() and panel.history_loading.isVisible()
+    assert not panel.history_empty.isVisible()
     first=worker.requests[-1]
     panel.cycle_choice.setCurrentIndex(panel.cycle_choice.findData(160))
     latest=worker.requests[-1]
@@ -140,6 +143,7 @@ def test_selected_graph_rejects_old_choice_and_reuses_matching_refresh(tmp_path)
     worker.result.emit(engine.execute(dict(latest,id=3)))
     assert panel.history.rows[-1]['at']==220
     assert panel.manage_button.isVisible() and not panel.history_empty.isVisible()
+    assert not panel.history_loading.isVisible() and not panel.history_loading._state['running']
     digest=panel.history.series['_content_digest']
     refreshed=engine._prepare(sample_report(),selection=160,known_digest=digest)
     assert refreshed['view']['chart']['series'] is None
@@ -147,4 +151,13 @@ def test_selected_graph_rejects_old_choice_and_reuses_matching_refresh(tmp_path)
     panel.receive(dict(report={**refreshed,'_worker':worker}))
     assert len(worker.requests)==pending and panel.history.rows[-1]['at']==220
     assert panel.cycle_choice.currentData()==160
+    rows=panel.history.rows
+    refreshed=engine._prepare(sample_report())
+    panel.receive(dict(report={**refreshed,'_worker':worker}))
+    request=worker.requests[-1]
+    assert panel.history.isVisible() and panel.history.rows is rows
+    assert panel.history_loading.isVisible() and not panel.history_empty.isVisible()
+    worker.result.emit(dict(kind='chart',key=request['key'],error='unavailable'))
+    assert not panel.history_loading.isVisible() and not panel.history_loading._state['running']
+    assert panel.history.isVisible() and panel.history.rows is rows
     app.processEvents()

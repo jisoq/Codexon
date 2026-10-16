@@ -219,7 +219,9 @@ def test_process_queries_latest_selection_cache_and_clean_shutdown(tmp_path):
             if w.analysis_errors: raise AssertionError(str(w.analysis_errors))
             if not w.analysis_pending and w.view_result is not None and w.applied_key[1]==w.current_page: return
             QTest.qWait(10)
-        raise AssertionError(str(w.analysis_errors))
+        raise AssertionError(dict(errors=w.analysis_errors,pending=w.analysis_pending,
+            request=w.request_id,page=w.current_page,key=w.applied_key,
+            worker_pending=w.worker.pending,worker_alive=bool(w.worker.process and w.worker.process.is_alive())))
     try:
         settle()
         w.model.setCurrentIndex(0)

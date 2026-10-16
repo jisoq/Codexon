@@ -138,7 +138,8 @@ class PreparedPublisher:
             models=sorted({model for key in sessions for model in self.choices[key].get('models',())}))
         _weight((self.owners,self.choices,self.alerts,sessions,overlays,
                  self.overlay.own,self.overlay.partials,self.overlay.presenter.cache,
-                 self.overlay.presenter.rollups,self.overlay.presenter.presented),self.STATE_BYTES)
+                 self.overlay.presenter.rollups,self.overlay.presenter.presented,
+                 self.overlay.detail_revisions),self.STATE_BYTES)
         self.sessions=sessions;self.overlays=overlays;self.internal_count=internal
         self.sent_token=self.token
         self.changed.clear();self.pending_alerts.clear()

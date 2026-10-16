@@ -42,7 +42,13 @@ class SettingsPage(Group):
         shell=Row();shell.setSpacing(24);root.addLayout(shell,1)
         self.navigation=Navigation();self.navigation.setObjectName('settingsNavigation')
         self.navigation.addItems(self.TITLES);self.navigation.setFixedWidth(144 if parent.width()<1200 else 200)
-        self.stack=Stack();self.stack.put(deferPages=True);self.stack.setMaximumWidth(840);shell.addWidget(self.navigation);shell.addWidget(self.stack,1);shell.addStretch()
+        content=Column();content.setMaximumWidth(840)
+        self.page_loading=Group();self.page_loading.put(kind='progress',stage=3,compact=True,
+            title='화면 준비',detail='화면의 구성 요소를 준비하고 있습니다.',running=False)
+        self.page_loading.hide();content.addWidget(self.page_loading)
+        self.stack=Stack();self.stack.put(deferPages=True);content.addWidget(self.stack,1)
+        self.stack.pageReady.connect(self.page_ready)
+        shell.addWidget(self.navigation);shell.addLayout(content,1);shell.addStretch()
         self.layouts={};self.scrollers={}
         for category,title in zip(self.IDS,self.TITLES):
             area=Scroll();area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -180,8 +186,17 @@ class SettingsPage(Group):
 
     def select_category(self,row):
         if row < 0:return
-        self.search.setText('');self.stack.setCurrentIndex(row)
+        self.search.setText('');self.show_page(row)
         self.owner.settings.setValue('settings/category',self.IDS[row])
+
+    def show_page(self,index):
+        self.stack.setCurrentIndex(index)
+        waiting=not self.stack.isPageReady(index)
+        self.page_loading.put(running=waiting);self.page_loading.setVisible(waiting)
+        self.stack.setVisible(not waiting)
+
+    def page_ready(self,index):
+        if index==self.stack.currentIndex():self.show_page(index)
 
     def capture_scrolls(self):return {key:area.verticalPosition.value() for key,area in self.scrollers.items()}
 
@@ -195,8 +210,8 @@ class SettingsPage(Group):
         for node in self.result_body._nodes:node.deleteLater()
         self.result_body._nodes=[];self.result_body.structureChanged.emit()
         words=query.casefold().split()
-        if not words:self.stack.setCurrentIndex(self.navigation.currentRow());return
-        self.stack.setCurrentIndex(len(self.IDS))
+        if not words:self.show_page(self.navigation.currentRow());return
+        self.show_page(len(self.IDS))
         from .translation_catalog import CATALOG
         for entry in sorted(self.entries,key=lambda e:(self.IDS.index(e['category']), list(self.sections).index((e['category'],e['section'])))):
             title=self.TITLES[self.IDS.index(entry['category'])]
@@ -289,6 +304,6 @@ class SettingsPage(Group):
 
     def reveal(self, category, widget=None):
         category=self.category_id(category);self.search.setText('')
-        self.navigation.setCurrentRow(self.IDS.index(category));self.stack.setCurrentIndex(self.IDS.index(category))
+        self.navigation.setCurrentRow(self.IDS.index(category));self.show_page(self.IDS.index(category))
         self.owner.settings.setValue('settings/category',category)
         if widget is not None:self.scrollers[category].ensureWidgetVisible(widget)

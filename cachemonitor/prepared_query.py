@@ -151,11 +151,17 @@ class PreparedQuery:
             if retained_bytes(message['query'],4*1024*1024)>4*1024*1024:
                 raise ValueError('page query exceeds its request budget')
             query=_fresh_query(message['query'],token)
+            progress=message.get('_progress')
+            if progress:progress('query')
             engine=self._engine(token,cancellation,message.get('_prepared_changes',()))
             from .analysis_worker import expiry
-            with engine.read_scope():
-                result=engine.page_query(query)
-                valid_until=result['valid_until'] if 'valid_until' in result else expiry(engine,query)
+            engine.progress=progress
+            try:
+                with engine.read_scope():
+                    result=engine.page_query(query)
+                    valid_until=result['valid_until'] if 'valid_until' in result else expiry(engine,query)
+            finally:
+                engine.progress=None
             result=dict(result,prepared_token=tuple_token(token))
             return dict(kind='result',id=message['id'],logical=message['logical'],result=result,
                         valid_until=valid_until,metrics=dict(engine.metrics),prepared_token=tuple_token(token))

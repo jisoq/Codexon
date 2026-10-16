@@ -13,33 +13,42 @@ from cachemonitor.quick_qa import control, mount, dispose, table_view, click_row
 def test_deferred_pages_apply_pending_state_and_keep_loaded_scroll():
     from cachemonitor.presentation import Stack, Scroll, Column, Text
     from cachemonitor.quick_qa import scene_view
+    from test_ui import wait_for_rendered
     app=QApplication.instance() or QApplication([])
     pages=Stack();pages.put(deferPages=True);pages.addWidget(Text('First page'))
     body=Column();title=Text('Before visit');body.addWidget(title);body.addSpacing(1800)
     page=Scroll();page.setWidget(body);pages.addWidget(page)
+    ready=[];pages.pageReady.connect(ready.append)
     page.verticalPosition.setValue(320)
     host=mount(pages,640,480)
     try:
         with pytest.raises(AssertionError,match='Presentation node not rendered'):
             scene_view(host,page)
+        assert not pages.isPageReady(1)
         title.setText('Updated before visit')
         pages.setCurrentIndex(1)
         # Switching tabs returns before constructing the unseen page.
         with pytest.raises(AssertionError,match='Presentation node not rendered'):
             scene_view(host,page)
+        assert not pages.isPageReady(1)
         deadline=time.monotonic()+3
         while time.monotonic()<deadline:
             app.processEvents()
-            if host._page_incubation.incubatingObjectCount()==0:break
+            if pages.isPageReady(1):break
             QTest.qWait(1)
         assert not host._page_incubation.timer.isActive()
+        assert pages.isPageReady(1) and 1 in ready
         item=control(host,page)
         assert any(child.property('text')=='Updated before visit' for child in walk(control(host,title)))
         assert item.property('contentItem').property('contentY')==320
-        pages.setCurrentIndex(0);QTest.qWait(20)
+        pages.setCurrentIndex(0)
+        first=control(host,pages.widget(0))
+        wait_for_rendered(first.isVisible)
         page.verticalPosition.setValue(520)
-        pages.setCurrentIndex(1);QTest.qWait(40)
+        pages.setCurrentIndex(1)
+        wait_for_rendered(lambda:item.isVisible() and item.property('contentItem').property('contentY')==520)
         assert control(host,page) is item
+        assert pages.isPageReady(1)
         assert item.property('contentItem').property('contentY')==520
         assert not host.qml_errors
     finally:dispose(host)

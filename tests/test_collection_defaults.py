@@ -30,6 +30,11 @@ def default_home(tmp_path,monkeypatch):
 @pytest.mark.integration
 def test_default_cli_publishes_usage_and_preserves_shared_evidence(default_home):
     from cachemonitor.model_evidence import default_path
+    from test_core import usage
+    source=default_home/'sessions'/'rollout.jsonl';source.parent.mkdir()
+    (default_home/'session.jsonl').rename(source)
+    with sqlite3.connect(default_home/'state_5.sqlite') as db:
+        db.execute('UPDATE threads SET rollout_path=?',(str(source),))
     client=CollectionClient([default_home]);child=None
     try:
         command=collector_command(client.channel)
@@ -46,12 +51,50 @@ def test_default_cli_publishes_usage_and_preserves_shared_evidence(default_home)
         assert snapshot['index']['path']==str(index_location())
         assert snapshot['last_usage_collection_success'] and not snapshot['usage_errors']
         assert client.channel.scope==os.path.normcase(str(default_path().resolve()))
+        # A completed call already appended to the rollout must reach the
+        # publication before the normal three-second reconciliation timer.
+        with source.open('a',encoding='utf8') as output:
+            output.write(json.dumps(usage('next-call',time=time.time()))+'\n')
+        deadline=time.monotonic()+(2 if os.name=='nt' else 5)
+        while time.monotonic()<deadline:
+            snapshot=client.poll()
+            if any(row['key']=='next-call' for row in snapshot['sessions'][0]['history']):break
+            assert child.poll() is None
+            time.sleep(.02)
+        assert any(row['key']=='next-call' for row in snapshot['sessions'][0]['history'])
         with sqlite3.connect(client.channel.snapshot_path) as db:
             db.execute('INSERT INTO control VALUES(?,?)',(snapshot['collection']['instance'],'stop'))
         assert child.wait(timeout=10)==0
     finally:
         if child and child.poll() is None:child.terminate();child.wait(timeout=10)
         client.close()
+
+
+@pytest.mark.skipif(os.name!='nt',reason='Windows source notifications')
+def test_source_notifications_wake_only_for_rollouts_and_rearm(tmp_path):
+    from cachemonitor.collection_wake import SourceChanges
+    home=tmp_path/'home';source=home/'sessions';source.mkdir(parents=True)
+    archive=home/'archived_sessions';archive.mkdir()
+    owned=tmp_path/'index.sqlite';changes=SourceChanges((owned,))
+    try:
+        changes.sync([home])
+        assert len(changes.handles)==2
+        owned.write_bytes(b'own publication')
+        assert not changes.wait(time.monotonic()+.05)
+        rollout=source/'rollout.jsonl';rollout.write_text('{}\n',encoding='utf8')
+        assert changes.wait(time.monotonic()+1)
+        with rollout.open('a',encoding='utf8') as output:output.write('{"done":true}\n')
+        assert changes.wait(time.monotonic()+1)
+        rollout.rename(archive/'rollout.jsonl')
+        assert changes.wait(time.monotonic()+1)
+    finally:changes.close()
+    assert not changes.handles
+    # A custom app-owned database inside a source tree disables that root;
+    # the ordinary reconciliation timer remains responsible for its content.
+    changes=SourceChanges((source/'evidence.sqlite',))
+    try:
+        changes.sync([home]);assert set(changes.handles)=={archive.resolve()}
+    finally:changes.close()
 
 
 def test_conflicting_default_cli_path_fails_before_creating_files(default_home,tmp_path):

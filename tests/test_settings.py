@@ -137,6 +137,27 @@ def test_disabling_startup_setting_cancels_waiting_login_launch(startup_settings
 def test_legacy_categories(old,new):
     assert SettingsPage.category_id(old)==new
 
+
+@pytest.mark.integration
+def test_lazy_setting_categories_and_search_show_progress_until_controls_exist(startup_settings_window):
+    window,_=startup_settings_window;page=window.settings_page
+    wait_until(lambda:page.stack.isPageReady(0) and window.pages.isPageReady(4))
+    page.reveal('notifications')
+    assert page.page_loading.isVisible() and page.page_loading.state['running']
+    assert not page.stack.isVisible() and page.navigation.isEnabled() and page.search.isEnabled()
+    wait_until(lambda:page.stack.isPageReady(2) and page.stack.isVisible())
+    assert not page.page_loading.isVisible() and not page.page_loading.state['running']
+    rendered=control(window,page.scrollers['notifications'])
+    assert rendered.isVisible() and rendered.width()>0 and rendered.height()>0
+    page.search.setText('proxy')
+    assert page.page_loading.isVisible() and not page.stack.isVisible()
+    wait_until(lambda:page.stack.isPageReady(len(page.IDS)) and page.stack.isVisible())
+    assert not page.page_loading.isVisible() and page.result_body.count()>0
+    page.search.setText('')
+    assert page.stack.isVisible() and not page.page_loading.isVisible()
+    assert not window.qml_errors
+
+
 @pytest.mark.parametrize('language',['ko','en'])
 @pytest.mark.integration
 def test_search_navigation_and_preserved_preferences(tmp_path,monkeypatch,language):

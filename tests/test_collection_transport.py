@@ -216,7 +216,7 @@ def test_quiet_notifications_preserve_staleness_and_ledger_retry_deadlines(monke
         worker.assert_calls_and_detail()
         query=dict(page=2,start=99,end=200,now=200,period='custom',include_whole_history=False)
         worker.parent.send(dict(kind='query',id=2,query=query,logical='stale-source'))
-        result=worker.wait_for(lambda value:value.get('id')==2)
+        result=worker.wait_for(lambda value:value.get('id')==2 and value.get('kind')=='result')
         assert result['kind']=='result' and result['result']['prepared_token']==token
 
 

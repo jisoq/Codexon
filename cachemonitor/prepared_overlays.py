@@ -20,6 +20,7 @@ class PreparedOverlays:
         self.own = {}
         self.partials = {}
         self.revisions = {}
+        self.detail_revisions = {}
 
     def collect(self, view, owners, changed, removed, speed_results):
         visible = {key: value for key, value in owners.items()
@@ -48,10 +49,20 @@ class PreparedOverlays:
         sessions = {key: dict(source=value['metadata'], prepared=value['metadata'])
                     for key, value in visible.items()}
         updated = {key: (self.revisions[key], self.own[key]) for key in sessions}
+        previous = self.presenter.presented
         result = self.presenter.present(SimpleNamespace(sessions=sessions), updated,
                                         self.partials, speed_results)
         token = (view.publication_token.instance, view.publication_token.generation)
-        return [dict(value, _prepared_token=token, _recent_refs=True) for value in result]
+        revisions = {}
+        for key, current in self.presenter.presented.items():
+            prior = previous.get(key)
+            # A rollup is replaced for any changed member or ancestry. Reuse
+            # its proof without retaining a second descendant dependency list.
+            revisions[key] = (self.detail_revisions[key] if prior and prior[0] is current[0]
+                              else token)
+        self.detail_revisions = revisions
+        return [dict(value, _prepared_token=token, _recent_refs=True,
+                     _overlay_revision=revisions[(value['home'], value['id'])]) for value in result]
 
 
 def hydrate_overlay(snapshot, summary, *, health=False):

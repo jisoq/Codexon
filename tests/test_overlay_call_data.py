@@ -65,3 +65,46 @@ def test_degradation_evidence_retains_observed_calls_outside_recent_graph():
         (6,1000,300,30),(7,1000,300,30)]
     assert all(r['key'] not in {recent['key'] for recent in result['recent']} for r in event['comparison_calls'])
     assert health==original
+
+
+def test_prepared_overlay_detail_revision_tracks_descendants_and_removed_members():
+    from types import SimpleNamespace
+    from cachemonitor.prepared_ingest import prepare_owner
+    from cachemonitor.prepared_health import split_summary
+    from cachemonitor.prepared_overlays import PreparedOverlays
+    from cachemonitor.prepared_summary import summary_for_storage
+
+    sources={name:session([row(i,key=name)],id=name,**metadata) for i,(name,metadata) in enumerate((
+        ('parent',{}),('child',{'parent_thread_id':'parent'}),('other',{})))}
+    owners={};packets={}
+    def replace_owner(name):
+        source=sources[name];key=('home',name)
+        material=prepare_owner(source,owns=lambda *_:True)
+        owners[key]={'metadata':{k:v for k,v in source.items() if k!='history'}}
+        packets[key]=summary_for_storage(split_summary(material['summary'])[0])
+    for name in sources:replace_owner(name)
+    view=SimpleNamespace(publication_token=SimpleNamespace(instance='test',generation=1),
+                         derived=lambda home,sid,kind:packets[(home,sid)])
+    overlays=PreparedOverlays()
+    def collect(changed,removed=()):
+        return {item['id']:item for item in overlays.collect(view,owners,changed,removed,{})}
+    first=collect(None)
+    view.publication_token.generation=2
+    sources['other']['history'][0]['output']+=1;replace_owner('other')
+    second=collect({('home','other')})
+    assert second['parent']['_prepared_token']!=first['parent']['_prepared_token']
+    assert second['parent']['_overlay_revision']==first['parent']['_overlay_revision']
+    assert second['child']['_overlay_revision']==first['child']['_overlay_revision']
+    assert second['other']['_overlay_revision']!=first['other']['_overlay_revision']
+    view.publication_token.generation=3
+    sources['child']['history'][0]['output']+=1;replace_owner('child')
+    third=collect({('home','child')})
+    assert [item['key'] for item in third['parent']['recent']]==[item['key'] for item in second['parent']['recent']]
+    assert third['parent']['_overlay_revision']!=second['parent']['_overlay_revision']
+    assert third['child']['_overlay_revision']!=second['child']['_overlay_revision']
+    view.publication_token.generation=4
+    owners.pop(('home','child'))
+    fourth=collect(set(),{('home','child')})
+    assert fourth['parent']['calls']==1 and 'child' not in fourth
+    assert fourth['parent']['_overlay_revision']!=third['parent']['_overlay_revision']
+    assert set(overlays.detail_revisions)==set(owners)

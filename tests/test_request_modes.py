@@ -27,6 +27,56 @@ def test_only_explicit_structural_tier_and_start_override():
     assert request_mode('service_tier: Some("priority")') is None
 
 
+def structured_body(mode='priority',prompt='',start='None'):
+    operation=body(mode,prompt,start).split('op: ',1)[1].rsplit(' }',1)[0]
+    return (f'Submission thread_id=thread-000000000000 submission_id={TURN} '
+            f'operation=TurnInput parent_turn_id=Some("parent-000000000000") '
+            f'root_turn_id=Some("root-000000000000") op={operation}')
+
+
+def test_structured_submission_fields_keep_exact_turn_and_explicit_mode():
+    assert request_mode(structured_body())==(TURN,'Fast')
+    assert request_mode(structured_body('default'))==(TURN,'Standard')
+    assert request_mode(structured_body(start='Some("default")'))==(TURN,'Standard')
+    assert request_mode(structured_body().replace(f'submission_id={TURN}',f'submission_id="{TURN}"'))==(TURN,'Fast')
+    assert request_mode(structured_body(None)) is None
+    assert request_mode(structured_body(None,prompt=structured_body())) is None
+    assert request_mode(json.dumps(structured_body())) is None
+    assert request_mode(structured_body().replace('submission_id=','other_id=')) is None
+
+
+def test_new_mode_log_format_recovers_previously_scanned_calls_once(tmp_path):
+    from cachemonitor.analysis_engine import AnalysisEngine
+    from cachemonitor.overlay_data import OverlaySummaries
+    home=str(tmp_path)
+    with sqlite3.connect(tmp_path/'logs_2.sqlite') as source:
+        source.execute('create table logs(id integer primary key,thread_id text,target text,feedback_log_body text)')
+        source.execute('insert into logs values(1,?,?,?)',('s','codex_core::session::handlers',structured_body('default')))
+    path=tmp_path/'ledger.sqlite';ledger=QuotaLedger(path)
+    ledger.db.execute('INSERT INTO mode_scan VALUES(?,?,?)',(home,1,0))
+    ledger.db.execute('DROP TABLE mode_scan_format');ledger.db.commit();ledger.close()
+    def snapshot():
+        current=mode_session('s',home=home)
+        current['history'][0]['turn']=TURN
+        return dict(homes=[home],sessions=[current])
+    ledger=QuotaLedger(path)
+    try:
+        value=snapshot();ledger.enrich_modes(value)
+        assert value['sessions'][0]['history'][0]['service_tier']=='Standard'
+        engine=AnalysisEngine();engine.ingest(value['sessions'])
+        overlay=OverlaySummaries().collect(engine)[0]
+        assert overlay['priced']==1 and overlay['cost'] is not None
+        assert len(ledger.db.execute('SELECT * FROM mode_events').fetchall())==1
+    finally:ledger.close()
+    ledger=QuotaLedger(path)
+    try:
+        statements=[];ledger.db.set_trace_callback(statements.append)
+        value=snapshot();ledger.enrich_modes(value)
+        assert value['sessions'][0]['history'][0]['service_tier']=='Standard'
+        assert not any(sql.startswith('BEGIN') for sql in statements)
+    finally:ledger.close()
+
+
 def test_enrichment_requires_same_home_session_and_turn_and_persists(tmp_path,monkeypatch):
     home=str(tmp_path)
     db=sqlite3.connect(tmp_path/'logs_2.sqlite')
