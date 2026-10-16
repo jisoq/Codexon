@@ -146,6 +146,8 @@ def test_analyzer_publication_wakes_before_timer_and_freeze_reclaims_waiter(tmp_
         assert parent.poll(1)
         second=parent.recv();assert second['kind']=='snapshot'
         assert second['value']['ts']==changed['ts']
+        assert not second['value']['sessions'] and not second['value']['overlay_sessions']
+        assert not second['value']['model_candidates'] and not second['value']['cache_candidates']
         assert time.perf_counter()-started<1
         wait_until(lambda:bool(writer.live.waiters))
         parent.send({'kind':'freeze'})
@@ -159,28 +161,43 @@ def test_analyzer_publication_wakes_before_timer_and_freeze_reclaims_waiter(tmp_
         parent.close();child.close();writer.close()
 
 
-def test_quiet_notifications_preserve_staleness_and_ledger_retry_deadlines(monkeypatch,tmp_path):
+@pytest.mark.parametrize('trusted',[False,True])
+def test_quiet_notifications_preserve_staleness_and_ledger_retry_deadlines(monkeypatch,tmp_path,trusted):
     from types import SimpleNamespace
     from cachemonitor import analysis_worker
-    clock=[100.];reads=[];opens=[];sent=[]
+    from test_overlay import source
+    clock=[100.];reads=[];opens=[];sent=[];derived=[];modes=[];synced=[];acknowledged=[]
+    session=source()
+    for owner,name in ((analysis_worker.AnalysisEngine,'ingest'),
+                       (analysis_worker.OverlaySummaries,'collect'),(analysis_worker.SnapshotPublisher,'publish')):
+        original=getattr(owner,name)
+        def counted(*args,_original=original,_name=name,**kwargs):
+            derived.append(_name);return _original(*args,**kwargs)
+        monkeypatch.setattr(owner,name,counted)
     monkeypatch.setattr(analysis_worker,'time',SimpleNamespace(monotonic=lambda:clock[0],time=lambda:clock[0]))
     notification=object()
     def wait(connections,timeout):clock[0]+=timeout;return []
     monkeypatch.setattr(analysis_worker,'wait',wait)
     class Collector:
         path=tmp_path/'index.sqlite'
-        def __init__(self,*args):pass
+        analysis_identity=('catalog',1) if trusted else None
+        def __init__(self,*args):
+            self.channel=SimpleNamespace(acknowledge_activity=lambda snapshot:acknowledged.append(snapshot['activity_cursor']))
         def poll(self):
             reads.append(clock[0])
-            return dict(ts=100.,sessions=[],homes=[],errors=[],unassigned=[],index={'loading':False})
+            return dict(ts=100.,sessions=[dict(session,remaining=1000-clock[0])],homes=[],errors=[],
+                unassigned=[],index={'loading':False},activity_cursor=('source',1))
         def notification_connection(self):return notification
         def close(self):pass
     class Ledger:
         def __init__(self,*args):
             opens.append(clock[0])
             if len(opens)==1:raise sqlite3.OperationalError('locked')
-        def enrich_modes(self,*args):pass
-        def sync(self,*args):pass
+            self.identity=object()
+        def enrich_modes(self,*args):modes.append(clock[0]);return self.identity
+        def sync(self,engine,snapshot):
+            assert snapshot['sessions'][0]['remaining']==1000-clock[0]
+            synced.append(clock[0])
         def import_observations(self,*args):pass
         def close(self):pass
     class Connection:
@@ -194,6 +211,10 @@ def test_quiet_notifications_preserve_staleness_and_ledger_retry_deadlines(monke
     assert opens==[100.,105.]
     assert 130.<reads[-1]<130.1
     assert len(sent)==5 and all(value['kind']=='snapshot' for value in sent)
+    expected=2 if trusted else 5
+    assert {name:derived.count(name) for name in ('ingest','collect','publish')}==dict.fromkeys(('ingest','collect','publish'),expected)
+    assert modes==synced==reads[1:] and acknowledged==[('source',1)]*4
+    assert all(not message['value']['model_candidates'] and not message['value']['cache_candidates'] for message in sent[2:])
 
 
 def test_new_session_loading_does_not_reprocess_existing_call_history(tmp_path):
@@ -218,6 +239,15 @@ def test_new_session_loading_does_not_reprocess_existing_call_history(tmp_path):
         return receiver.receive(publisher.publish(value,engine,overlays.collect(engine)))
     try:
         first=deliver();before=ledger.db.total_changes
+        # A proven heartbeat is exactly the ordinary wire delta, including the
+        # new header, and cannot replay prior model/cache notification candidates.
+        heartbeat=copy.deepcopy(publisher)
+        next_value={**value,'ts':200.5,'ledger_status_known':True,
+                    'sessions':[dict(s,remaining=0) for s in value['sessions']]}
+        expected=publisher.publish(next_value,engine,overlays.collect(engine))
+        actual=heartbeat.heartbeat(next_value,engine)
+        assert actual==expected and not actual['model_candidates'] and not actual['cache_candidates']
+        assert receiver.receive(actual)['ts']==200.5
         query=dict(page=0,start=0,end=300,sid='old')
         assert engine.query(query)['analysis']['turns'][0]['complete']
         value.update(ts=201.,index=dict(loading=True))
@@ -253,6 +283,7 @@ def test_live_idle_preserves_exact_freshness_heavy_identity_and_zero_sql_writes(
     try:
         first=snapshot(writer);writer.publish(first,'epoch',1)
         result=reader.read(shared=True)
+        assert reader.catalog_identity==('epoch',1)
         history=result['sessions'][0]['history']
         changes=writer.db.total_changes
         consumer_changes=reader.db.total_changes
@@ -264,6 +295,7 @@ def test_live_idle_preserves_exact_freshness_heavy_identity_and_zero_sql_writes(
             writer.publish(current,'epoch',sequence)
             received=reader.read(shared=True);reader.subscribe(current['ts'])
             assert received==current and reader.last_read_live
+            assert reader.catalog_identity==('epoch',1)
             assert received['sessions'][0]['history'] is history
         assert writer.db.total_changes==changes
         assert reader.db.total_changes==consumer_changes
@@ -276,6 +308,12 @@ def test_live_idle_preserves_exact_freshness_heavy_identity_and_zero_sql_writes(
             assert header['ts']==current['ts'] and 'sessions' not in header
             assert with_reader.last_read_live
         finally:with_reader.close()
+        handler=writer.live_server.handler
+        def legacy(request):
+            metadata,body=handler(request);metadata.pop('catalog_identity',None)
+            return metadata,body
+        writer.live_server.handler=legacy
+        assert reader.read(shared=True)==current and reader.catalog_identity is None
     finally:reader.close();writer.close()
 
 
@@ -567,7 +605,7 @@ def test_unrelated_session_change_does_not_rescan_subagent_quota_history(tmp_pat
     finally:ledger.close();reader.close();writer.close()
 
 
-@pytest.mark.parametrize('change',['loading','complete','errors','correction'])
+@pytest.mark.parametrize('change',['loading','complete','errors','correction','status'])
 def test_live_substantive_transitions_are_durable(tmp_path,change):
     writer=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite');writer.start_live()
     try:
@@ -576,8 +614,10 @@ def test_live_substantive_transitions_are_durable(tmp_path,change):
         if change=='loading':changed['index']['loading']=True
         elif change=='complete':changed['index']['usage_complete']=False;changed['usage_collection_complete']=False
         elif change=='errors':changed['errors']=['source read failed']
+        elif change=='status':changed['sessions'][0]['status']='active'
         else:changed['sessions'][0]['history'][0]['output']=4
         writer.publish(changed,'epoch',2)
+        assert writer.live.current['catalog_identity']==('epoch',2)
         writer.live_server.close();writer.live_server=None;writer.live=None
         assert writer.read()==changed
     finally:writer.close()
@@ -592,9 +632,11 @@ def test_failed_checkpoint_does_not_advance_live_snapshot(tmp_path):
         changed=copy.deepcopy(first);changed['ts']=103.;changed['sessions'][0]['history'][0]['output']=4
         with pytest.raises(sqlite3.IntegrityError,match='interrupted'):writer.publish(changed,'epoch',2)
         assert reader.read()==first and reader.last_read_live
+        assert reader.catalog_identity==('epoch',1)
         writer.db.execute('DROP TRIGGER interrupt_snapshot')
         writer.live_server.close();writer.live_server=None;writer.live=None
         assert reader.read()==first
+        assert reader.catalog_identity is None
     finally:reader.close();writer.close()
 
 
@@ -837,6 +879,7 @@ def test_partial_restart_keeps_one_body_population_until_confirmed_or_removed(tm
         assert len(received['sessions'])==2
         pending=next(s for s in received['sessions'] if s['id']=='second')
         assert pending['_collection_pending'] and pending['collection_complete'] is False
+        assert reader.catalog_identity is None
         assert pending['history'] is histories['second']
         assert not reader.session_cache and reader.pending_checkpoint==('first',7)
         # A correction can later return to checkpoint bytes. Its old proof
@@ -887,6 +930,7 @@ def test_stale_client_read_preserves_source_errors_and_shared_freshness(tmp_path
         first=snapshot(writer);writer.publish(first,'epoch',1)
         stale=client.poll(131.)
         assert stale['collection_stale'] and not stale['usage_collection_complete']
+        assert client.analysis_identity is None
         assert not stale['errors'] and not stale['usage_errors']
         assert client.channel.live_cached['usage_collection_complete']
         assert not client.channel.live_cached.get('collection_stale')
@@ -898,6 +942,7 @@ def test_stale_client_read_preserves_source_errors_and_shared_freshness(tmp_path
         recovered=client.poll(172.)
         assert not recovered.get('collection_stale') and not recovered['errors']
         assert recovered['usage_collection_complete']
+        assert client.analysis_identity is not None
     finally:client.close();writer.close()
 
 

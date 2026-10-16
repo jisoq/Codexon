@@ -89,13 +89,14 @@ class SnapshotPublisher:
             cache.append(dict(home=source['home'],id=source['id'],title=source['title'],cache_health=health,
                               cache_misses=overlays[key]['cache_misses']))
         removed=list(self.sessions.keys()-sessions.keys())
+        self.internal_review_calls=sum(len(s['prepared']['history']) for s in engine.internal_sessions.values())
         message={k:v for k,v in snapshot.items() if k not in ('sessions','request_activity')}
         message.update(protocol=1,epoch=self.epoch,sequence=self.sequence,reset=self.sequence==1,
                        sessions=[s for k,s in sessions.items() if self.sessions.get(k)!=s],
                        overlay_sessions=[s for k,s in overlays.items() if self.overlays.get(k)!=s],
                        removed=removed,data_revision=engine.revision,call_revision=engine.call_revision,
                        model_candidates=models,cache_candidates=cache,
-                       internal_review_calls=sum(len(s['prepared']['history']) for s in engine.internal_sessions.values()))
+                       internal_review_calls=self.internal_review_calls)
         self.models={k:v for k,v in self.models.items() if k in sessions}
         self.revisions={k:v for k,v in self.revisions.items() if k in sessions}
         self.model_alerts={k:v for k,v in self.model_alerts.items() if k in sessions}
@@ -107,6 +108,19 @@ class SnapshotPublisher:
                 'sources':sorted({s.get('source','unknown') for s in sessions.values()})}
         self.sessions=sessions;self.overlays=overlays;self.revision=engine.revision
         self.call_revision=engine.call_revision
+        return message
+
+    def heartbeat(self,snapshot,engine):
+        """Refresh the envelope after the worker proves unchanged owner content."""
+        if (not self.sequence or self.revision!=engine.revision
+                or self.call_revision!=engine.call_revision):
+            raise ValueError('A heartbeat requires the current analytical publication')
+        self.sequence+=1
+        message={k:v for k,v in snapshot.items() if k not in ('sessions','request_activity')}
+        message.update(protocol=1,epoch=self.epoch,sequence=self.sequence,reset=False,
+            sessions=[],overlay_sessions=[],removed=[],data_revision=engine.revision,
+            call_revision=engine.call_revision,model_candidates=[],cache_candidates=[],
+            internal_review_calls=self.internal_review_calls)
         return message
 
 

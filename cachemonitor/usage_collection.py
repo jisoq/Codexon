@@ -260,6 +260,7 @@ class LiveCollection:
         activities=current['envelope']['activities']
         if activities is not None:activities=manifest(activities,current['activities'],'attempt')
         return dict(ready=True,protocol=protocol,publication=current['publication'],header=current['header'],
+                    catalog_identity=current.get('catalog_identity'),
                     sessions=sessions,activities=activities,
                     **(dict(checkpoint_filter=True) if protocol==5 else {}),
                     **(dict(full=full) if protocol in (4,5) else {})),b''.join(chunks)
@@ -404,6 +405,7 @@ class CollectionChannel:
             snapshot={**snapshot,'activity_highwater':getattr(self,'activity_row_revision',0)}
         candidate=self.live.prepare(snapshot,epoch,sequence,changes=changes) if self.live else None
         if candidate is not None and self.live.current is not None and candidate['durable']==self.live.current['durable']:
+            candidate['catalog_identity']=self.live.current.get('catalog_identity')
             self.live.publish(candidate)
             return
         volatile=LiveCollection.volatile
@@ -520,6 +522,9 @@ class CollectionChannel:
             self.published_activity_source=snapshot.get('activity_source')
             self.published_activity_limit=snapshot.get('activity_source_limit',0)
         if candidate is not None:
+            # The live timestamp may advance without a SQLite write. This token
+            # names only the committed content behind the current envelope.
+            candidate['catalog_identity']=(epoch,sequence)
             self.live.publish(candidate)
 
     def read_header(self):
@@ -728,6 +733,7 @@ class CollectionChannel:
     def read(self,*,shared=False,header_only=False):
         # __new__ read-only diagnostic channels intentionally remain SQLite-only.
         self.last_read_live=False
+        self.catalog_identity=None
         if hasattr(self,'client'):
             # A durable checkpoint proves body ownership, not a live delta base.
             response=self.live_request(header_only=header_only,protocol=5,publication=self.live_publication,
@@ -755,6 +761,12 @@ class CollectionChannel:
                         self._checkpoint_after_live(result,sessions,metadata)
                         self.live_session_cache=sessions;self.live_activity_cache=activities
                         self.live_publication=tuple(metadata['publication']);self.live_cached=result
+                        identity=metadata.get('catalog_identity')
+                        if (isinstance(identity,(tuple,list)) and len(identity)==2
+                                and identity[0]==self.live_publication[0] and type(identity[1]) is int
+                                and 0<identity[1]<=self.live_publication[1]
+                                and not any(s.get('_collection_pending') for s in result['sessions'])):
+                            self.catalog_identity=tuple(identity)
                         # Recovery and live delivery are alternate owners of one
                         # snapshot, not independent retained history populations.
                         self.session_cache={};self.activity_cache={};self.activity_identity=None
@@ -866,6 +878,7 @@ class CollectionClient:
         self.path=self.channel.path
         self.waiter=None
         self.notification_epoch=None
+        self.analysis_identity=None
 
     def notification_connection(self):
         if not self.channel.last_read_live:return None
@@ -895,6 +908,7 @@ class CollectionClient:
 
     def poll(self,now=None):
         now=now or time.time()
+        self.analysis_identity=None
         try:
             snapshot=self.channel.read(shared=True)
             self.channel.subscribe(now)
@@ -926,6 +940,10 @@ class CollectionClient:
                 snapshot['index']={**snapshot['index'],'loading':True,'usage_complete':False}
                 snapshot['usage_collection_complete']=False
         snapshot['homes']=self.channel.homes
+        if (self.channel.last_read_live and self.channel.catalog_identity is not None
+                and snapshot.get('usage_collection_complete') and not snapshot.get('index',{}).get('loading')):
+            self.analysis_identity=(str(self.path),self.channel.scope,tuple(self.channel.homes),
+                                    self.channel.catalog_identity)
         return snapshot
 
     def close(self):

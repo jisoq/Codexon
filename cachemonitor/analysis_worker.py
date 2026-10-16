@@ -15,6 +15,7 @@ from .usage_collection import CollectionClient
 from .quota_cycles import QuotaLedger, ledger_path
 from .overlay_data import OverlaySummaries
 from .analysis_delivery import SnapshotPublisher, SnapshotReceiver
+from .pricing import pricing_signature
 
 
 def expiry(engine,q):
@@ -67,6 +68,7 @@ def process_main(connection,homes,index_path,static_snapshot=None,model_evidence
         engine=AnalysisEngine()
         overlays=OverlaySummaries()
         publisher=SnapshotPublisher()
+        analysis_identity=None
         snapshot=None
         frozen=static_snapshot is not None
         next_poll=0
@@ -80,8 +82,9 @@ def process_main(connection,homes,index_path,static_snapshot=None,model_evidence
             collector=CollectionClient(homes,index_path,model_evidence_path)
             try:ledger=QuotaLedger(quota_path)
             except sqlite3.Error as error:disable_ledger(error)
-        def publish():
-            light=publisher.publish(snapshot,engine,overlays.collect(engine))
+        def publish(heartbeat=False):
+            light=(publisher.heartbeat(snapshot,engine) if heartbeat else
+                   publisher.publish(snapshot,engine,overlays.collect(engine)))
             connection.send({'kind':'snapshot','value':light})
         details={}
         def send_details(all_pending=True):
@@ -110,6 +113,7 @@ def process_main(connection,homes,index_path,static_snapshot=None,model_evidence
                     if collector:collector.stop_notifications()
                     notification=None
                 elif message['kind']=='replace':
+                    analysis_identity=None
                     ready=None;snapshot=message['snapshot']; engine.ingest(snapshot['sessions']); publish()
                 elif message['kind']=='query': pending=message;ready=None
                 elif message['kind']=='sync':
@@ -137,11 +141,20 @@ def process_main(connection,homes,index_path,static_snapshot=None,model_evidence
                     at=time.monotonic();stages[stage]=at-stage_started;stage_started=at
                 snapshot=collector.poll()
                 completed('collection_read')
+                mode_identity=None
                 if ledger:
-                    try:ledger.enrich_modes(snapshot)
+                    try:mode_identity=ledger.enrich_modes(snapshot)
                     except sqlite3.Error as error:disable_ledger(error)
                 completed('mode_evidence')
-                engine.ingest(snapshot['sessions'])
+                catalog_identity=getattr(collector,'analysis_identity',None)
+                identity=((catalog_identity,mode_identity,pricing_signature())
+                          if catalog_identity is not None and mode_identity is not None else None)
+                reusable=identity is not None and identity==analysis_identity
+                # The committed catalog covers owner state except remaining,
+                # which publication omits. Envelope clocks and ledger duties
+                # still consume the newly read snapshot on every heartbeat.
+                if not reusable:engine.ingest(snapshot['sessions'])
+                analysis_identity=identity
                 completed('analysis')
                 if ledger:
                     try:
@@ -170,7 +183,7 @@ def process_main(connection,homes,index_path,static_snapshot=None,model_evidence
                 snapshot={**snapshot,'ledger_status_known':True,
                     'ledger_fault':dict(ledger_failed=bool(ledger_issue))}
                 if ledger_issue:snapshot={**snapshot,'ledger_error':ledger_issue}
-                publish()
+                publish(heartbeat=reusable)
                 completed('publication')
                 record_timing(stages,max(0,time.time()-snapshot['ts']))
                 notification=collector.notification_connection()

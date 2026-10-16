@@ -1299,8 +1299,10 @@ class QuotaLedger:
         self.db.commit()
         previous=getattr(self,'_enriched_sessions',{})
         enriched={};resolved={};timelines={}
+        changed=False
         parents=mode_parents(snapshot['sessions'])
         def resolve(source):
+            nonlocal changed
             if id(source) in resolved:return resolved[id(source)]
             key=(source['home'],source['id'])
             parent=resolve(parents[key]) if key in parents else None
@@ -1340,6 +1342,7 @@ class QuotaLedger:
             session['usage_revision']=(source_revision,revision)
             # Retain the parent history referenced by the dependency identity.
             enriched[key]=(history,revision,rows,source_revision,parent)
+            changed=True
             resolved[id(source)]=session
             return session
         def timeline(session):
@@ -1349,8 +1352,11 @@ class QuotaLedger:
                 timelines[key]=ParentModeTimeline(session,self.modes,timeline(parent) if parent is not None else None)
             return timelines[key]
         sessions=[resolve(source) for source in snapshot['sessions']]
+        if changed or len(enriched)!=len(previous) or not hasattr(self,'_enriched_identity'):
+            self._enriched_identity=object()
         self._enriched_sessions=enriched
         snapshot['sessions']=sessions
+        return self._enriched_identity
 
     def observe(self, home, quota, commit=True):
         self._observe_parts(observation_parts(home,quota))

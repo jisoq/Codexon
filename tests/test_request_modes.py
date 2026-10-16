@@ -64,16 +64,16 @@ def test_mode_enrichment_reuses_unchanged_rows_and_replays_corrections(tmp_path)
     key=(home,'s','changed')
     try:
         ledger.modes[key]='Fast';ledger.mode_revisions[key[:2]]=1
-        ledger.enrich_modes(snapshot)
+        identity=ledger.enrich_modes(snapshot)
         enriched=snapshot['sessions'][0]['history']
         assert enriched[0] is raw[0]
         assert enriched[1] is not raw[1] and enriched[1]['service_tier']=='Fast'
         assert raw[1]['service_tier']=='Standard'
-        ledger.enrich_modes(snapshot)
+        assert ledger.enrich_modes(snapshot) is identity
         assert snapshot['sessions'][0]['history'] is enriched
         assert snapshot['sessions'][0]['usage_revision']==(1,1)
         ledger.modes.pop(key);ledger.mode_revisions[key[:2]]=2
-        ledger.enrich_modes(snapshot)
+        assert ledger.enrich_modes(snapshot) is not identity
         assert snapshot['sessions'][0]['history'][1] is raw[1]
         assert snapshot['sessions'][0]['usage_revision']==(1,2)
         assert enriched[1]['service_tier']=='Fast'  # Existing views remain stable.
