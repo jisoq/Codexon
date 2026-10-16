@@ -206,8 +206,12 @@ def test_model_breakdowns_combine_and_drill_down_in_compact_window(dashboard):
         items=[rendered('usage-row-'+row['key']) for row in p.state['rows']]
         return all(item.mapToScene(QPointF(0,item.height())).y()<w.quick.height() for item in items)
     wait_for_rendered(rows_fit)
-    chart=rendered('usage-chart');resize_timer=chart.findChild(QObject,'usage-resize')
-    wait_for_rendered(lambda:not resize_timer.property('running'))
+    def chart_settled():
+        chart=rendered('usage-chart')
+        resize_timer=chart.findChild(QObject,'usage-resize')
+        capacity=max(2,min(12,int((chart.height()-36)//54)))
+        return resize_timer is not None and not resize_timer.property('running') and p.options['size']==capacity
+    wait_for_rendered(chart_settled)
     row=p.data['rows'][0];scope=p.capture()
     assert p.state['rows'][0]['groupStart']
     click(w,rendered('usage-row-'+row['key']))
@@ -218,7 +222,7 @@ def test_model_breakdowns_combine_and_drill_down_in_compact_window(dashboard):
     assert len(w.record_rows)==12
     assert all(record[field]==value for record in w.record_rows for field,value in row['filters'].items())
     w.go_back();wait_for_rendered(lambda:w.current_page==1)
-    w.go_back();wait_for_rendered(lambda:p.data.get('dimension')=='model')
+    w.go_back();wait_for_rendered(lambda:p.data.get('dimension')=='model' and chart_settled())
     assert p.capture()==scope
     chart_top=rendered('usage-chart').mapToScene(QPointF()).y()
     p.change('dimension','project')
