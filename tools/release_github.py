@@ -20,7 +20,19 @@ class GitHub:
         return json.loads(result.stdout)
 
     def release(self, tag):
-        return self.api('releases/tags/' + tag, missing=True)
+        release = self.api('releases/tags/' + tag, missing=True)
+        if release is not None:
+            return release
+        # The tag endpoint can omit drafts. The authenticated list includes them.
+        page = 1
+        while True:
+            releases = self.api(f'releases?per_page=100&page={page}')
+            for release in releases:
+                if release['tag_name'] == tag:
+                    return release
+            if len(releases) < 100:
+                return None
+            page += 1
 
     def asset_text(self, asset):
         if not 0 < asset['size'] <= 32768:

@@ -8,6 +8,7 @@ import pytest
 from tools import release_pipeline as pipeline
 from tools import prepare_sources
 from tools import verify_release_tools
+from tools.release_github import GitHub
 from tools.verify_changes import select_tests
 
 SHA = 'a' * 40
@@ -208,24 +209,36 @@ def test_workflow_preserves_successful_jobs_and_publishes_the_retained_artifact(
     assert 'source-verified-${{ github.sha }}' in workflow
 
 
-def test_publication_uses_verified_artifact_and_only_uploads_installer_files(root, monkeypatch):
+@pytest.mark.parametrize('existing_draft', [False, True])
+def test_publication_uses_verified_artifact_and_only_uploads_installer_files(root, monkeypatch, existing_draft):
     original = prepared_artifact(root)
     record = run_record()
     class PublishingGitHub(FakeGitHub):
+        release = GitHub.release
         def __init__(self):
             super().__init__()
             self.calls = []
+            if existing_draft:
+                self.released = dict(tag_name='v2026.10.11.1', draft=True, assets=[
+                    dict(name=name, digest='sha256:' + pipeline.digest(original/name))
+                    for name in ('Codexon-Setup.exe', 'Codexon-Setup.exe.sha256')])
         def api(self, path, **kwargs):
             if path == 'actions/runs/10':
                 return record
+            if path.startswith('releases/tags/'):
+                return None  # The tag endpoint cannot find the unpublished draft.
+            if path == 'releases?per_page=100&page=1':
+                return [dict(tag_name='vother', draft=False)] * 100
+            if path == 'releases?per_page=100&page=2':
+                return [self.released] if self.released else []
             return super().api(path, **kwargs)
         def command(self, *args):
             self.calls.append(args)
             if args[:2] == ('run', 'download'):
                 shutil.copytree(original, Path(args[-1]))
             elif args[:2] == ('release', 'create'):
-                self.tag = SHA
-                self.released = dict(draft=True, assets=[
+                assert self.released is None, 'Do not duplicate an existing draft'
+                self.released = dict(tag_name=args[2], draft=True, assets=[
                     dict(name=p.name, digest='sha256:' + pipeline.digest(p)) for p in args[3:5]])
             elif args[:2] == ('release', 'edit'):
                 self.released['draft'] = False
@@ -234,9 +247,11 @@ def test_publication_uses_verified_artifact_and_only_uploads_installer_files(roo
     github = PublishingGitHub()
     result = pipeline.publish(github, SHA, '10', '20', root/'download', root)
     assert result['commit'] == SHA and not github.released['draft']
-    create = next(c for c in github.calls if c[:2] == ('release', 'create'))
-    assert {p.name for p in create[3:5]} == {'Codexon-Setup.exe', 'Codexon-Setup.exe.sha256'}
-    assert not any('third-party-source-' in str(arg) for arg in create)
+    creates = [c for c in github.calls if c[:2] == ('release', 'create')]
+    assert len(creates) == (0 if existing_draft else 1)
+    if creates:
+        assert {p.name for p in creates[0][3:5]} == {'Codexon-Setup.exe', 'Codexon-Setup.exe.sha256'}
+        assert not any('third-party-source-' in str(arg) for arg in creates[0])
     assert reference['url'] in (root/'download/publication-notes.md').read_text(encoding='utf-8')
 
 

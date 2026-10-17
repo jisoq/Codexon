@@ -283,6 +283,8 @@ def publish(github, sha, verified_run, current_run, folder, root=ROOT):
         github.command('release', 'create', tag, *assets, '--target', sha, '--title',
                        f'Codexon {receipt["version"]}', '--draft', '--notes-file', notes_path)
         release = github.release(tag)
+        if release is None:
+            raise ValueError('Created release is not visible; inspect the draft before retrying publication')
     hosted = {a['name']: a for a in release['assets']}
     missing = []
     for path in assets:
