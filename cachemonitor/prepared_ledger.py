@@ -117,6 +117,7 @@ class PreparedLedger:
         owner batch leaves those owners uncommitted and safely replayable.
         """
         sources,certificates=self._sources()
+        self.task_revisions={key:token for key,token in self.task_revisions.items() if key in sources}
         committed=progress.applied(self.ledger.db,sources)
         call_waiting={key for key in sources if committed.get(key)!=certificates[key]}
         policies={home:self._task_policy(home) for home in {key[0] for key in sources}}
@@ -166,7 +167,7 @@ class PreparedLedger:
                 index=batch_start;allow_append=False
                 self.metrics['append_fallbacks']=self.metrics.get('append_fallbacks',0)+len(append_sources)
                 continue
-            retired=()
+            committed_retired=retired;retired=()
             self.metrics['append_owners']=self.metrics.get('append_owners',0)+len(append_sources)
             saved=progress.applied(self.ledger.db,selected)
             if any(saved.get(key)!=stamp for key,stamp in selected.items()):
@@ -177,12 +178,11 @@ class PreparedLedger:
                     self.task_revisions[key]=task_tokens[key]
             self.metrics['applied_owners']+=len(states)
             yield dict(owners=tuple(states),task_owners=tuple(key for key in requests if key in task_waiting),
-                       remaining=len(waiting)-index)
+                       remaining=len(waiting)-index,retired=committed_retired)
         if not waiting:
             # Freshness, coverage and activity still commit on a heartbeat.
             # There are no historical call reads in this path.
             snapshot=dict(envelope,sessions=list(sources.values()))
             if retired:progress.retire(self.ledger.db,retired)
             self.ledger.sync(SimpleNamespace(sessions={},internal_sessions={}),snapshot,applied_sources={})
-            yield dict(owners=(),remaining=0)
-        self.task_revisions={key:token for key,token in self.task_revisions.items() if key in sources}
+            yield dict(owners=(),remaining=0,retired=retired)

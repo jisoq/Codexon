@@ -138,7 +138,8 @@ def test_stale_population_closes_chart_hover_and_notification_floor_stays_curren
 
 @pytest.mark.parametrize('language',['ko','en'])
 @pytest.mark.essential
-def test_tab_loading_hides_empty_content_and_ignores_stale_result(tmp_path,language):
+def test_tab_loading_keeps_controls_and_ignores_stale_result(tmp_path,language):
+    from PySide6.QtTest import QTest
     from cachemonitor.i18n import set_language
     from cachemonitor.quick_qa import control,walk
     from test_ui import wait_for_rendered
@@ -147,73 +148,102 @@ def test_tab_loading_hides_empty_content_and_ignores_stale_result(tmp_path,langu
         window.receive(sample());window.resize(1000,680);window.show();window.render();window.async_mode=True
         window.change_page(1)
         old_id,old_query,old_logical=window.request_id,window.pending_query,window.pending_logical
-        assert window.analysis_pending and not window.pages.isVisible()
-        assert window.analysis_notice.isVisible() and window.analysis_notice_body.isVisible()
-        assert window.analysis_progress.state['running']
-        progress=control(window,window.analysis_progress)
+        assert window.analysis_pending and window.pages.isVisible()
+        assert window.analysis_loading['running'] and not window.analysis_loading['retained']
+        usage=control(window,window.metric_panel)
+        content=next(item for item in walk(usage) if item.objectName()=='usage-chart-content')
+        period=next(item for item in walk(usage) if item.objectName()=='usage-period')
+        progress=next(item for item in walk(usage) if item.objectName()=='analysis-region-loading')
         wait_for_rendered(lambda:progress.isVisible() and progress.width()>0 and progress.height()>0)
+        assert period.isVisible() and period.isEnabled()
+        assert control(window,window.nav).isVisible()
+        assert not content.isVisible() and not content.isEnabled()
         texts=[item.property('text') for item in walk(progress) if item.property('text')]
         assert any(('Loading' if language=='en' else '불러오는 중') in text for text in texts)
         if language=='en':assert not any('\uac00'<=char<='\ud7a3' for text in texts for char in text)
         first=window.quick.grabFramebuffer()
         wait_for_rendered(lambda:window.quick.grabFramebuffer()!=first,timeout=3)
-        assert window.quick.grabFramebuffer().save(str(tmp_path/f'tab-loading-{language}.png'))
+        assert window.quick.grabFramebuffer().save(str(tmp_path/f'partial-loading-{language}.png'))
         assert window.request_id==old_id
         window.analysis_progressed(dict(id=old_id,stage='aggregate'))
         assert window.analysis_stage=='aggregate'
         window.show_analysis_slow()
-        assert window.analysis_stage=='aggregate' and window.analysis_progress.state['slow']
+        assert window.analysis_stage=='aggregate' and window.analysis_loading['slow']
         window.render();window.render(automatic=True)
         assert window.request_id==old_id and window.analysis_stage=='aggregate'
+        period.forceActiveFocus()
+        QTest.keyClick(window.quick,Qt.Key_Home);QTest.keyClick(window.quick,Qt.Key_Down);QTest.keyClick(window.quick,Qt.Key_Escape)
+        assert window.metric_panel.options['period']=='today' and window.request_id>old_id
+        assert window.analysis_pending and not content.isVisible()
         window.change_page(2)
         window.analysis_progressed(dict(id=old_id,stage='aggregate'))
         assert window.analysis_stage=='queued'
         window.analysis_ready(dict(id=old_id,logical=old_logical,
             result=window.engine.page_query(old_query),valid_until=float('inf')))
-        assert window.analysis_pending and not window.pages.isVisible()
+        assert window.analysis_pending and window.pages.isVisible()
         assert not window.pages.isPageReady(2)
         deliver_pending(window)
-        assert not window.analysis_pending and not window.pages.isVisible()
-        assert window.analysis_stage=='present' and window.analysis_notice.isVisible()
-        # A result received before deferred controls are built cannot be retained
-        # as visible content by a new request or its failure.
+        assert not window.analysis_pending and window.pages.isVisible()
+        assert not window.analysis_loading
+        # Lazy scene construction is independent of the data result.
         window.client_cache.clear();window.render()
-        assert not window.pending_retained and not window.pages.isVisible()
+        assert not window.pending_retained and window.pages.isVisible()
         window.analysis_failed('unbuilt-page failure')
-        assert not window.pages.isVisible()
+        assert window.pages.isVisible() and not window.analysis_loading['running']
         window.render();deliver_pending(window)
         wait_for_rendered(lambda:window.pages.isPageReady(2) and window.pages.isVisible(),timeout=5)
-        assert not window.analysis_notice.isVisible()
-        window.render()  # A valid cache hit never enters the loading state.
-        assert not window.analysis_pending and not window.pending_timer.isActive()
+        assert not window.analysis_loading
+        window.render()
+        assert not window.analysis_pending and not window.analysis_loading
         window.change_page(5)
-        assert not window.pages.isVisible()
+        assert window.pages.isVisible() and window.analysis_loading['active']
+        assert control(window,window.performance_panel.model_choice).isVisible()
+        assert not control(window,window.performance_panel.chart_scroll).isVisible()
         deliver_pending(window)
-        assert not window.pages.isVisible() and window.analysis_stage=='present'
-        wait_for_rendered(lambda:window.pages.isPageReady(5) and window.pages.isVisible(),timeout=5)
-        assert not window.analysis_notice.isVisible()
+        wait_for_rendered(lambda:window.pages.isPageReady(5) and control(window,window.performance_panel.chart_scroll).isVisible(),timeout=5)
+        assert not window.analysis_loading
         for page in (3,4):
             window.change_page(page)
-            assert not window.pages.isPageReady(page) and not window.pages.isVisible()
-            assert window.analysis_notice.isVisible() and window.analysis_stage=='present'
+            assert window.pages.isVisible() and not window.analysis_loading
             window.show_analysis_pending();window.show_analysis_slow()
-            wait_for_rendered(lambda:window.pages.isPageReady(page) and window.pages.isVisible(),timeout=5)
-            assert not window.analysis_notice.isVisible() and not window.pending_label.isVisible()
+            wait_for_rendered(lambda:window.pages.isPageReady(page),timeout=5)
+            assert not window.analysis_loading and not window.pending_label.isVisible()
         assert not window.qml_errors
     finally:window.quit_app();set_language('ko')
 
 
 def test_refresh_preserves_only_matching_results_and_failure_can_retry(tmp_path):
-    from cachemonitor.quick_qa import click,render_plot
+    from cachemonitor.quick_qa import click,render_plot,control,walk
     from test_ui import wait_for_rendered
     window=dashboard(tmp_path)
     try:
         window.receive(sample());window.show();window.change_page(1);window.render()
         wait_for_rendered(lambda:window.pages.isPageReady(1) and window.pages.isVisible(),timeout=5)
+        comparison=window.view_result
+        window.change_page(2)
+        wait_for_rendered(lambda:window.pages.isPageReady(2) and window.pages.isVisible(),timeout=5)
         window.async_mode=True
-        window.client_cache.clear();window.render();window.show_analysis_pending()
-        assert window.pages.isVisible() and window.refresh_loading.isVisible()
-        assert window.refresh_loading.state['running'] and window.pending_retained
+        window.snapshot={**window.snapshot,'data_revision':1}
+        window.change_page(1)
+        assert window.analysis_pending and window.pending_retained
+        assert window.pages.isVisible() and window.view_result is comparison
+        deliver_pending(window)
+        window.client_cache.clear();window.render(automatic=True)
+        assert window.analysis_pending and window.pending_retained and window.pages.isVisible()
+        assert not window.analysis_loading and not window.slow_timer.isActive()
+        window.show_analysis_slow()
+        assert not window.analysis_loading
+        automatic_request=window.request_id
+        window.render()
+        assert window.request_id==automatic_request and window.analysis_loading['retained']
+        deliver_pending(window)
+        window.client_cache.clear();window.render()
+        assert window.pages.isVisible() and window.analysis_loading['active']
+        assert window.analysis_loading['running'] and window.analysis_loading['retained'] and window.pending_retained
+        usage=control(window,window.metric_panel)
+        chart=next(item for item in walk(usage) if item.objectName()=='usage-chart-content')
+        period=next(item for item in walk(usage) if item.objectName()=='usage-period')
+        assert chart.isVisible() and period.isVisible() and period.isEnabled()
         previous_id=window.request_id
         size=window.metric_panel.options['size']
         window.metric_panel.change('size',str(2 if size>2 else 3))
@@ -221,7 +251,7 @@ def test_refresh_preserves_only_matching_results_and_failure_can_retry(tmp_path)
         assert window.pending_retained and window.pages.isVisible()
         window.analysis_failed('synthetic failure')
         assert window.pages.isVisible() and window.error_button.isVisible()
-        assert not window.retry_button.isVisible() and not window.analysis_notice.isVisible()
+        assert not window.retry_button.isVisible() and not window.analysis_loading
         click(window,render_plot(window,window.error_button))
         assert window.current_page==4 and window.error_panel.selected=='analysis'
         click(window,render_plot(window,window.error_panel.action))
@@ -229,36 +259,49 @@ def test_refresh_preserves_only_matching_results_and_failure_can_retry(tmp_path)
         deliver_pending(window)
         assert not window.retry_button.isVisible()
         window.metric_panel.change('period','7d')
-        assert window.analysis_pending and not window.pages.isVisible()
+        assert window.analysis_pending and window.pages.isVisible() and not window.analysis_loading['retained']
+        assert not chart.isVisible() and not chart.isEnabled()
+        assert period.isVisible() and period.isEnabled()
         window.analysis_failed('changed-filter failure')
-        assert not window.pages.isVisible() and window.error_button.isVisible()
-        assert not window.analysis_notice.isVisible()
+        assert window.pages.isVisible() and window.error_button.isVisible()
+        assert window.analysis_loading['active'] and not window.analysis_loading['running']
         assert window.grab().save(str(tmp_path/'tab-loading-failed.png'))
         click(window,render_plot(window,window.error_button))
         assert window.current_page==4 and window.error_panel.selected=='analysis'
         click(window,render_plot(window,window.error_panel.action))
-        assert window.analysis_pending and not window.pages.isVisible()
+        assert window.analysis_pending and window.pages.isVisible() and not window.analysis_loading['retained']
         deliver_pending(window)
         wait_for_rendered(lambda:window.pages.isVisible(),timeout=5)
-        assert not window.analysis_notice.isVisible()
+        assert not window.analysis_loading
+        window.receive(dict(sample(),epoch='replacement-worker'))
+        assert window.analysis_pending and not window.pending_retained
+        assert window.pages.isVisible() and not window.analysis_loading['retained']
         assert not window.qml_errors
     finally:window.quit_app()
 
 
 def test_empty_result_waits_for_collection_before_showing_empty_charts(tmp_path):
+    from cachemonitor.quick_qa import control,walk
     from test_ui import wait_for_rendered
     window=dashboard(tmp_path)
     try:
         window.show();window.async_mode=True
         window.snapshot['index']={'loading':True}
         window.render();deliver_pending(window)
-        assert not window.analysis_pending and not window.pages.isVisible()
-        assert window.analysis_progress.isVisible() and window.analysis_progress.state['running']
+        assert not window.analysis_pending and window.pages.isVisible()
+        assert window.analysis_loading['active'] and window.analysis_loading['running']
         assert window.analysis_stage=='queued'
+        home=control(window,window.home_panel)
+        cards=[item for item in walk(home) if item.objectName().startswith('home-card-')]
+        assert len(cards)==4 and all(card.isVisible() and card.isEnabled() for card in cards)
+        wait_for_rendered(lambda:len([item for item in walk(home)
+            if item.objectName()=='analysis-region-loading' and item.isVisible()])==1)
+        assert all(not any(item.objectName()=='analysis-region-loading' for item in walk(card)) for card in cards)
+        assert home.property('masked')
         window.snapshot['index']['loading']=False
         window.render();deliver_pending(window)
         wait_for_rendered(lambda:window.pages.isVisible(),timeout=5)
-        assert not window.analysis_notice.isVisible()
+        assert not window.analysis_loading
         assert window.home_panel.state['totals'][1]['value']=='0'
         assert window.analysis['response_count']==0
         window.change_page(5);window._refresh_after_pending=True

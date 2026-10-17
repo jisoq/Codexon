@@ -197,7 +197,8 @@ def test_mode_scan_body_budget_does_not_skip_forward_or_backfilled_evidence(tmp_
 def test_mode_enrichment_reuses_unchanged_rows_and_replays_corrections(tmp_path):
     home=str(tmp_path/'home')
     raw=[{'turn':'same','service_tier':'Standard'},
-         {'turn':'changed','service_tier':'Standard','service_tier_source':'settings'}]
+         {'turn':'changed','service_tier':'Standard','service_tier_source':'settings',
+          'request_mode_source':'applied_settings','configured_service_tier':'default'}]
     snapshot={'homes':[],'sessions':[{'home':home,'id':'s','usage_revision':1,'history':raw}]}
     ledger=QuotaLedger(tmp_path/'ledger.sqlite')
     key=(home,'s','changed')
@@ -233,6 +234,14 @@ def test_mode_enrichment_reuses_unchanged_rows_and_replays_corrections(tmp_path)
         assert ledger.mode_dependency(*key[:2])==explicit
         ledger.mode_evidence.clear()
         assert ledger.mode_dependency(*key[:2])==absent
+        # A no-change submission is not evidence against the applied setting.
+        ledger.modes[key]='미확인'
+        ledger.mode_evidence[key]=dict(mode='미확인',request_mode_source='unobserved',
+                                      request_mode_action='unchanged',mode_conflict=False)
+        ledger.mode_revisions[key[:2]]=3
+        ledger.enrich_modes(snapshot)
+        assert snapshot['sessions'][0]['history'][1] is raw[1]
+        assert snapshot['sessions'][0]['history'][1]['service_tier']=='Standard'
     finally:ledger.close()
 
 

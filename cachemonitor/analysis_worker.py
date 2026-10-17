@@ -45,6 +45,14 @@ def process_main(connection,homes,index_path,static_snapshot=None,model_evidence
             if replacement is not None:
                 return process_main(connection,homes,index_path,replacement,model_evidence_path,quota_path,cache_floor)
             return
+        except Exception as error:
+            from pathlib import Path
+            from .quota_diagnostics import record_failure
+            record_failure(Path(quota_path or ledger_path(index_path)).with_suffix('.analysis.sqlite'),
+                           'prepared process', error)
+            try:connection.send(dict(kind='fatal',error=traceback.format_exc(limit=6)))
+            except (OSError,EOFError):pass
+            return
         finally:
             connection.close()
     try:
@@ -188,6 +196,10 @@ class AnalysisBridge(QThread):
             except (OSError,RuntimeError) as error:
                 parent.close(); child.close()
                 self.restart_count=3
+                from pathlib import Path
+                from .quota_diagnostics import record_failure
+                record_failure(Path(self.quota_path or ledger_path(self.index_path)).with_suffix('.analysis.sqlite'),
+                               'analysis process start', error)
                 self.failure.emit('분석 프로세스 시작 실패: '+str(error))
                 self.fault.emit(dict(start_failed=True,retrying=False))
                 return

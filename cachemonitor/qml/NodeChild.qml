@@ -15,6 +15,13 @@ Item {
         visible: status === Loader.Ready
         onLoaded: child.retained = true
     }
+    Loader {
+        anchors.fill: parent
+        active: child.loadRequested && child.asynchronousLoad && !child.ready
+        sourceComponent: Component {
+            AnalysisLoading { status: ({active:true, running:true, title:"화면 준비", detail:"화면의 구성 요소를 준비하고 있습니다."}) }
+        }
+    }
     required property var node
     property bool horizontalParent: false
     property var s: node ? node.state : ({})

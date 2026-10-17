@@ -6,6 +6,8 @@ Item {
     id: root
     required property var node
     readonly property var s: node.state
+    readonly property var loading: s.analysisLoading || ({})
+    readonly property bool masked: !!loading.active && !loading.retained
     readonly property var o: s.options
     readonly property bool splitModels: o.dimension==='model' && (o.breakdowns||[]).length>0
     property real now: Date.now()/1000
@@ -39,6 +41,7 @@ Item {
         Rectangle {
             Layout.fillWidth:true; implicitHeight:118; color:appTheme.palette.surface; radius:10;border.color:appTheme.palette.border
             RowLayout {
+                visible: !root.masked
                 anchors.fill:parent;anchors.margins:16;spacing:20
                 Repeater {
                     model: root.s.totals
@@ -56,6 +59,7 @@ Item {
                     }
                 }
             }
+            Loader { anchors.fill:parent;active:root.s.home && !!root.loading.active;sourceComponent:Component { AnalysisLoading { status:root.loading } } }
         }
         GridLayout {
             Layout.fillWidth:true;Layout.fillHeight:true;columns:2;rowSpacing:20;columnSpacing:20
@@ -139,7 +143,7 @@ Item {
             UiInput {visible:root.o.period==='custom';Layout.preferredWidth:118;placeholderText:'YYYY-MM-DD';text:root.o.start;Accessible.name:root.t('시작일');onEditingFinished:root.node.change('start',text)}
             UiInput {visible:root.o.period==='custom';Layout.preferredWidth:118;placeholderText:'YYYY-MM-DD';text:root.o.end;Accessible.name:root.t('종료일');onEditingFinished:root.node.change('end',text)}
             UiButton {text:root.t('조회 조건');Layout.alignment:Qt.AlignBottom;onClicked:root.node.change('filtersOpen','')}
-            Copy {text:root.s.scope;Layout.fillWidth:true;color:appTheme.palette.muted;font.pixelSize:12;Layout.alignment:Qt.AlignBottom;Layout.bottomMargin:10}
+            Copy {text:root.masked?'':root.s.scope;Layout.fillWidth:true;color:appTheme.palette.muted;font.pixelSize:12;Layout.alignment:Qt.AlignBottom;Layout.bottomMargin:10}
             UiButton {text:root.t('새로고침');role:'quiet';Layout.alignment:Qt.AlignBottom;onClicked:root.node.change('metric',root.o.metric)}
         }
         Flow {
@@ -151,7 +155,7 @@ Item {
             visible:root.o.selected.length>0
             UiButton {text:'← '+root.t('뒤로');onClicked:root.node.back()}
             UiButton {text:root.t('지표 비교');role:'quiet';onClicked:root.node.reset()}
-            Copy {text:'/ '+(root.s.selectedLabel||'');color:appTheme.palette.muted}
+            Copy {text:root.masked?'':'/ '+(root.s.selectedLabel||'');color:appTheme.palette.muted}
         }
         RowLayout {
             Layout.fillWidth:true;spacing:20
@@ -167,13 +171,16 @@ Item {
         Rectangle {Layout.fillWidth:true;height:1;color:appTheme.palette.border}
         ColumnLayout {
             visible:root.o.selected.length>0;Layout.fillWidth:true;spacing:12
-            RowLayout {Layout.fillWidth:true;Copy {text:root.s.selectedLabel||'';font.pixelSize:18;font.bold:true;Layout.fillWidth:true}UiButton{text:root.t('세션 기록 열기');onClicked:root.node.records()}}
-            Flow {Layout.fillWidth:true;Layout.preferredHeight:childrenRect.height;spacing:24;Repeater {model:root.s.detail;Column {required property var modelData;spacing:7;Copy{text:modelData.title;font.pixelSize:12;color:appTheme.palette.muted;tip:modelData.tip}Copy{text:modelData.value+(modelData.lastTs?' / '+Math.max(0,Math.floor((root.now-modelData.lastTs)/3600))+root.t('시간 전'):'');tip:modelData.tip}}}}
+            RowLayout {Layout.fillWidth:true;Copy {text:root.masked?'':root.s.selectedLabel||'';font.pixelSize:18;font.bold:true;Layout.fillWidth:true}UiButton{text:root.t('세션 기록 열기');enabled:!root.masked;onClicked:root.node.records()}}
+            Item {
+                Layout.fillWidth:true;Layout.preferredHeight:detailValues.childrenRect.height
+                Flow {id:detailValues;width:parent.width;visible:!root.masked;spacing:24;Repeater {model:root.s.detail;Column {required property var modelData;spacing:7;Copy{text:modelData.title;font.pixelSize:12;color:appTheme.palette.muted;tip:modelData.tip}Copy{text:modelData.value+(modelData.lastTs?' / '+Math.max(0,Math.floor((root.now-modelData.lastTs)/3600))+root.t('시간 전'):'');tip:modelData.tip}}}}
+            }
             Rectangle {Layout.fillWidth:true;height:1;color:appTheme.palette.border}
         }
         RowLayout {
             Layout.fillWidth:true
-            Copy {text:root.s.title;font.pixelSize:18;font.bold:true;Layout.fillWidth:true;tip:root.o.metric==='tps'?root.s.tpsTip:''}
+            Copy {text:root.masked?'':root.s.title;font.pixelSize:18;font.bold:true;Layout.fillWidth:true;tip:!root.masked && root.o.metric==='tps'?root.s.tpsTip:''}
             UiInput {Layout.preferredWidth:165;placeholderText:root.t('항목 검색');text:root.o.search;Accessible.name:root.t('항목 검색');onTextEdited:root.node.change('search',text)}
             UiChoice {Layout.preferredWidth:120;model:[root.t('큰 값부터'),root.t('작은 값부터'),root.t('이름순')];currentIndex:['desc','asc','name'].indexOf(root.o.sort);Accessible.name:root.t('항목 정렬');onActivated:root.node.change('sort',['desc','asc','name'][currentIndex])}
         }
@@ -187,7 +194,7 @@ Item {
                 flickableDirection:Flickable.HorizontalFlick;boundsBehavior:Flickable.StopAtBounds
                 ScrollBar.horizontal:ScrollBar {policy:ScrollBar.AsNeeded}
                 Row {
-                    id:legendItems;height:parent.height;spacing:14
+                    id:legendItems;height:parent.height;spacing:14;visible:!root.masked
                     Copy {visible:root.o.metric==='tps';anchors.verticalCenter:parent.verticalCenter;text:root.t('평균 속도 (tok/s)');color:appTheme.palette.muted;font.pixelSize:12;tip:root.s.tpsTip}
                     Repeater {model:root.s.legend;Row {required property var modelData;anchors.verticalCenter:parent.verticalCenter;spacing:6;Rectangle{width:9;height:9;anchors.verticalCenter:parent.verticalCenter;color:appTheme.color(modelData.color);radius:2}Copy{text:modelData.label;color:appTheme.palette.muted;font.pixelSize:12}}}
                 }
@@ -205,12 +212,13 @@ Item {
             id: chart
             objectName:'usage-chart'
             Layout.fillWidth:true;Layout.fillHeight:true;Layout.minimumHeight:148
-            readonly property bool canResize: visible && !root.s.home && !root.s.queryPending
+            readonly property bool canResize: visible && !root.s.home && !root.s.queryPending && !root.masked
             onHeightChanged:if(canResize)resize.restart()
             onCanResizeChanged:if(canResize)resize.restart();else resize.stop()
             Timer {id:resize;objectName:'usage-resize';interval:100;onTriggered:if(chart.canResize)root.node.change('size',String(Math.floor((chart.height-36)/54)))}
             Column {
                 objectName:'usage-chart-content'
+                visible:!root.masked;enabled:!root.masked
                 anchors.left:parent.left;anchors.right:parent.right;anchors.top:parent.top;spacing:0
                 RowLayout {
                     width:parent.width;height:34;spacing:16
@@ -260,13 +268,14 @@ Item {
                 }
                 Copy {visible:root.s.rows.length===0;width:parent.width;height:100;text:root.t('조건에 맞는 기록 없음');horizontalAlignment:Text.AlignHCenter;color:appTheme.palette.muted}
             }
+            Loader { anchors.fill:parent;active:!root.s.home && !!root.loading.active;sourceComponent:Component { AnalysisLoading { status:root.loading } } }
         }
         RowLayout {
             Layout.fillWidth:true
-            Copy {text:root.s.countLabel;Layout.fillWidth:true;font.pixelSize:12;color:appTheme.palette.muted}
-            UiButton {text:root.t('이전');enabled:!!root.s.previous;onClicked:root.node.change('page','-1')}
-            Copy {text:root.s.pageLabel;font.pixelSize:12;color:appTheme.palette.muted}
-            UiButton {text:root.t('다음');enabled:!!root.s.next;onClicked:root.node.change('page','1')}
+            Copy {text:root.masked?'':root.s.countLabel;Layout.fillWidth:true;font.pixelSize:12;color:appTheme.palette.muted}
+            UiButton {text:root.t('이전');enabled:!root.masked && !!root.s.previous;onClicked:root.node.change('page','-1')}
+            Copy {text:root.masked?'':root.s.pageLabel;font.pixelSize:12;color:appTheme.palette.muted}
+            UiButton {text:root.t('다음');enabled:!root.masked && !!root.s.next;onClicked:root.node.change('page','1')}
         }
     }
 }

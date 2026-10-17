@@ -121,6 +121,7 @@ RULES = (
     ('cachemonitor/category_usage.py', ('analysis', 'dashboard')),
     ('cachemonitor/usage_panel.py', ('dashboard', 'speed')),
     ('cachemonitor/qml/UsageDashboard.qml', ('dashboard', 'shared_ui')),
+    ('cachemonitor/qml/AnalysisLoading.qml', ('dashboard', 'shared_ui', 'details', 'speed')),
     ('cachemonitor/dashboard_views.py', ('analysis', 'dashboard', 'details', 'cost')),
     ('cachemonitor/analysis_engine.py', ('analysis', 'cost', 'cache', 'overlay_data', 'native_cpu')),
     ('cachemonitor/analysis_records.py', ('analysis', 'cost', 'cache', 'overlay_data', 'dashboard', 'details')),

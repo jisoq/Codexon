@@ -1308,6 +1308,10 @@ class QuotaLedger:
             for values in profile:
                 values.sort(key=lambda entry:json.dumps(entry[0],separators=(',',':')))
             digest=hashlib.sha256(_MODE_DEPENDENCY_DOMAIN)
+            # Reprepare only owners that could have replaced applied settings
+            # with an unknown log mode. Known-only dependency hashes stay stable.
+            if any(mode=='미확인' for _,mode in profile[0]):
+                digest.update(b'preserve-applied-settings-v1\0')
             encoder=json.JSONEncoder(sort_keys=True,separators=(',',':'),allow_nan=False)
             for part in encoder.iterencode(profile):digest.update(part.encode('utf8'))
             self._mode_dependency_digests[key]='mode-v1:'+digest.hexdigest()
@@ -1456,7 +1460,10 @@ class QuotaLedger:
                 elif evidence and evidence['request_mode_source']!='unobserved':
                     changes.update(service_tier=evidence['mode'],service_tier_source='settings')
                     changes.update({k:v for k,v in evidence.items() if k!='mode'})
-                elif row.get('service_tier_source')=='settings':changes['service_tier']=explicit or recorded
+                elif row.get('service_tier_source')=='settings':
+                    # An unchanged submission without prior log evidence does
+                    # not contradict a successfully applied settings snapshot.
+                    changes['service_tier']=explicit if explicit and explicit!='미확인' else recorded
                 else:changes['service_tier']=recorded if recorded!='미확인' else explicit or '미확인'
                 # Keep the collector's read-only row when enrichment changes nothing.
                 # The cache retains its original history for later evidence corrections.

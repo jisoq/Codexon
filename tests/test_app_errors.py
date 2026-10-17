@@ -239,8 +239,8 @@ def test_sidebar_errors_remain_visible_across_pages_and_do_not_show_main_banner(
         for page in (0,2,3,4,5):
             window.change_page(page)
             assert window.error_button.isVisible()
-            wait_for_rendered(lambda:window.pages.isPageReady(page) and not window.analysis_notice.isVisible(),timeout=5)
-            assert window.error_button.isVisible() and not window.analysis_notice.isVisible()
+            wait_for_rendered(lambda:window.pages.isPageReady(page) and not window.analysis_loading,timeout=5)
+            assert window.error_button.isVisible() and not window.analysis_loading
             view=scene_view(window,window.error_button);point=view.mapToScene(QPointF(0,0))
             assert point.x()<200 and point.y()>window.height()/2 and point.y()+view.height()<=window.height()
         click(window,control(window,window.error_button))

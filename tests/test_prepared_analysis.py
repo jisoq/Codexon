@@ -63,6 +63,90 @@ def test_publication_is_atomic_and_interrupted_staging_does_not_replace_saved_fa
             assert current.record(*OWNER, 'call-1') is None
 
 
+def test_growing_transport_diagnostics_do_not_overflow_owner_metadata(tmp_path):
+    from copy import deepcopy
+    from cachemonitor.core import Session
+    from cachemonitor.prepared_ingest import prepare_owner, stage_owner
+
+    session = Session(OWNER[1], OWNER[0], title='Session')
+    session.add_usage(100, 'call', dict(input_tokens=100, cached_input_tokens=20,
+                      output_tokens=10), 'gpt-6-astra', service_tier='Standard')
+    source = session.view(101)
+    source['history'][0].update(transport='WebSocket', transport_source='response_id')
+    diagnostics = [dict(ts=100+i, transport='WebSocket', endpoint='/responses',
+                        evidence='observed', turn='request') for i in range(412)]
+    source.update(transports=diagnostics[:282], unmatched_transports=diagnostics[282:])
+    original = deepcopy(source)
+    with pytest.raises(storage.CapacityExceeded):
+        storage.pack({key:source[key] for key in storage.RAW_TRANSPORT_FIELDS})
+    material = prepare_owner(source, owns=lambda *_:True)
+    dependency = {name:1 for name in storage.DEPENDENCIES}
+    dependency['source_digest'] = '1'*64
+    with storage.PreparedStore(tmp_path/'analysis.sqlite') as store:
+        stage = store.begin(('source', 1))
+        stage_owner(stage, material, dependency, 0)
+        stage.publish(('source', 1), ready=True)
+        with store.read_current() as view:
+            saved = view.owner(*OWNER)
+            summary = view.derived(*OWNER, 'summary')
+            assert not storage.RAW_TRANSPORT_FIELDS.intersection(saved['metadata'])
+            row = view.record(*OWNER, 'call')
+            assert row['transport']=='WebSocket' and row['transport_source']=='response_id'
+        # Restaging metadata from an older prepared database also drops only
+        # these diagnostics, retaining its calls and derived summary unchanged.
+        legacy = dict(saved['metadata'], **{key:source[key] for key in storage.RAW_TRANSPORT_FIELDS})
+        stage = store.begin(('source', 2))
+        stage.owner(*OWNER, legacy, saved['dependencies'], source_ordinal=0)
+        stage.publish(('source', 2), ready=True)
+        with store.read_current() as view:
+            assert not storage.RAW_TRANSPORT_FIELDS.intersection(view.owner(*OWNER)['metadata'])
+            assert view.record(*OWNER, 'call')==row
+            assert view.derived(*OWNER, 'summary')==summary
+    assert source==original
+
+
+def test_prepared_failures_keep_sanitized_diagnostics_without_static_fallthrough(tmp_path, monkeypatch):
+    import json
+    from types import SimpleNamespace
+    from cachemonitor import analysis_worker, prepared_runtime
+
+    quota = tmp_path/'quota.sqlite'
+    messages = []
+    def fail(*args, **kwargs):
+        raise ValueError('private request text must never enter the diagnostics log')
+    monkeypatch.setattr(prepared_runtime, 'CollectionClient', fail)
+    writer = object.__new__(prepared_runtime.PreparedWriter)
+    writer.arguments = [], tmp_path/'index.sqlite', tmp_path/'evidence.sqlite', quota
+    writer.output = SimpleNamespace(put=messages.append)
+    writer._run()
+    assert messages.pop()['kind']=='fatal'
+
+    closed = []
+    monkeypatch.setattr(prepared_runtime, 'PreparedWriter',
+        lambda *a:SimpleNamespace(path=tmp_path/'prepared.sqlite', close=lambda:closed.append('writer')))
+    monkeypatch.setattr(prepared_runtime, 'PreparedQuery', fail)
+    monkeypatch.setattr(prepared_runtime, 'QueryActor', lambda factory:factory())
+    def static_engine():
+        pytest.fail('prepared startup failure must not enter static compatibility processing')
+    monkeypatch.setattr(analysis_worker, 'AnalysisEngine', static_engine)
+    connection = SimpleNamespace(send=messages.append, close=lambda:closed.append('connection'))
+    analysis_worker.process_main(connection, [], tmp_path/'index.sqlite', quota_path=quota)
+    assert closed==['writer', 'connection'] and len(messages)==1 and messages[0]['kind']=='fatal'
+    def spawn_fail():
+        raise OSError('private process-start context')
+    context = SimpleNamespace(Pipe=lambda:(connection, connection),
+        Process=lambda **kwargs:SimpleNamespace(start=spawn_fail))
+    monkeypatch.setattr(analysis_worker.mp, 'get_context', lambda *_:context)
+    bridge = analysis_worker.AnalysisBridge([], quota_path=quota)
+    bridge.run()
+    assert bridge.restart_count==3
+    text = quota.with_suffix('.analysis.diagnostics.log').read_text(encoding='utf8')
+    assert 'private request text' not in text and 'private process-start context' not in text
+    records = [json.loads(line[line.index('{'):]) for line in text.splitlines()]
+    assert {record['stage'] for record in records}=={'prepared writer', 'prepared query startup', 'prepared process', 'analysis process start'}
+    assert all(record['error'] in ('ValueError', 'OSError') and record['frames'] for record in records)
+
+
 def test_typed_pages_preserve_missing_fields_overrides_and_exact_numeric_types(tmp_path):
     limits = replace(storage.Limits(), page_rows=2)
     rows = calls()
@@ -554,28 +638,39 @@ def test_known_old_format_regenerates_atomically_and_preserves_other_stores(tmp_
     assert not list(tmp_path.glob('*.backup'))
 
 
-def test_competing_source_update_resumes_candidate_inventory_after_restart(tmp_path, monkeypatch):
+@pytest.mark.parametrize('reorder,capacity_fallback', [(False, False), (True, False), (True, True)])
+def test_competing_source_update_resumes_candidate_inventory_after_restart(tmp_path, monkeypatch, reorder, capacity_fallback):
+    from contextlib import closing
     from copy import deepcopy
     import time
     from cachemonitor.analysis_engine import AnalysisEngine
+    from cachemonitor.analysis_delivery import SnapshotReceiver
     from cachemonitor.analysis_records import public_record
     from cachemonitor.core import Session
-    from cachemonitor.prepared_ingest import PreparedCohort, read_catalog
+    from cachemonitor.prepared_ingest import PreparedCohort, read_catalog, preparation_signature
+    from cachemonitor.prepared_delivery import PreparedPublisher
+    from cachemonitor.prepared_speed_writer import PreparedSpeedWriter, SPEED_CHECKPOINT_NAMESPACE
+    from cachemonitor import speed_health
     from cachemonitor.usage_collection import CollectionChannel, CollectionClient, empty_snapshot
 
     writer = CollectionChannel([tmp_path/'home'], tmp_path/'source.sqlite')
     reader = CollectionClient(writer.homes, writer.path)
     writer.start_live()
     path = tmp_path/'prepared.sqlite'
+    if capacity_fallback:monkeypatch.setattr(speed_health, 'MAX_METADATA_BYTES', 1)
     try:
         sources = []
-        for sid in ('z', 'a'):
+        for sid in (('z', 'a', 'idle') if reorder else ('z', 'a')):
             session = Session(sid, writer.homes[0], title=sid)
             for ordinal, key in enumerate(('shared', sid+'-own')):
                 session.add_usage(100+ordinal, key,
                     dict(input_tokens=100, cached_input_tokens=20, output_tokens=10),
                     'gpt-6-astra', 'request', 'medium', service_tier='Standard')
             sources.append(deepcopy(session.view(110)))
+            if capacity_fallback:
+                for row in sources[-1]['history']:
+                    row.update(output=2000, reasoning=0, transport='WebSocket', transport_source='response_id',
+                               response_status='completed', timing_valid=True, completion_latency_ms=1000)
 
         def publish_sources(sequence):
             now = time.time()
@@ -587,16 +682,19 @@ def test_competing_source_update_resumes_candidate_inventory_after_restart(tmp_p
             return read_catalog(reader)
 
         catalog = publish_sources(1)
-        with storage.PreparedStore(path) as store:
-            coordinator = PreparedCohort(store, reader, None)
+        with storage.PreparedStore(path) as store, closing(PreparedSpeedWriter(
+                store, preparation=preparation_signature())) as speed:
+            coordinator = PreparedCohort(store, reader, None, speed_writer=speed)
             list(coordinator.convert(catalog, cohort_size=1))
-            first, second = tuple(catalog['owners'])
+            first, second = tuple(catalog['owners'])[:2]
+            if reorder:sources.reverse()
             for source in sources:
                 if (source['home'], source['id']) == first:
                     source['history'][1]['output'] += 7
-                else:
+                    source['usage_revision'] = 2
+                elif (source['home'], source['id']) == second:
                     source['history'].append(dict(source['history'][1], key='late-new', ts=103))
-                source['usage_revision'] = 2
+                    source['usage_revision'] = 2
             catalog = publish_sources(2)
             conversion = coordinator.convert(catalog, cohort_size=1)
             assert not next(conversion)['ready']
@@ -605,20 +703,86 @@ def test_competing_source_update_resumes_candidate_inventory_after_restart(tmp_p
                 with pytest.raises(storage.NotReady):
                     prepared.pin(store.token)
 
-        with storage.PreparedStore(path) as store:
-            coordinator = PreparedCohort(store, reader, None)
+        with storage.PreparedStore(path) as store, closing(PreparedSpeedWriter(
+                store, preparation=preparation_signature())) as speed:
+            coordinator = PreparedCohort(store, reader, None, speed_writer=speed)
             assert list(coordinator.convert(catalog, cohort_size=1))[-1]['ready']
             reference = AnalysisEngine()
             reference.ingest(sources)
             with storage.PreparedReader(path) as prepared, prepared.pin(store.token) as view:
+                summaries = {owner:view.derived(*owner, 'summary') for owner in reference.sessions}
                 for owner, state in reference.sessions.items():
                     assert list(view.iter_calls(owner)) == [public_record(row) for row in state['prepared']['history']]
                 assert view.record(*second, 'late-new') is not None
 
             def forbidden(*args, **kwargs):
                 raise AssertionError('unchanged source reread after candidate recovery')
+            source_stream = reader.selected_owner_stream
             monkeypatch.setattr(reader, 'selected_owner_stream', forbidden)
             assert list(coordinator.convert(catalog, cohort_size=1)) == []
+            speeds = deepcopy(coordinator.current_speeds())
+            publisher = PreparedPublisher(0)
+            receiver = SnapshotReceiver()
+            publication = dict(homes=writer.homes)
+            first_publication = receiver.receive(publisher.publish(publication, store, speeds))
+            with store.read_current() as view:
+                checkpoint = view.checkpoint_state(SPEED_CHECKPOINT_NAMESPACE)
+                current_checkpoint = checkpoint is not None and tuple(checkpoint['token']) == (view.token.instance, view.token.generation)
+                assert current_checkpoint != capacity_fallback
+            speed_reads = []
+            speed_rows = storage.Snapshot.iter_speed_rows
+            def observed_speed_rows(*args, **kwargs):
+                speed_reads.append(True)
+                yield from speed_rows(*args, **kwargs)
+            monkeypatch.setattr(storage.Snapshot, 'iter_speed_rows', observed_speed_rows if capacity_fallback else forbidden)
+            sources.reverse()
+            catalog = publish_sources(3)
+            updates = []
+            for update in coordinator.convert(catalog, cohort_size=1):
+                updates.append(update)
+                if not update['ready']:assert not speed_reads
+            assert updates[-1]['ready']
+            assert all(not update['ready'] for update in updates[:-1])
+            assert coordinator.current_speeds() == speeds
+            with storage.PreparedReader(path) as prepared, prepared.pin(store.token) as view:
+                for owner, state in reference.sessions.items():
+                    assert view.owner(*owner)['owner_ordinal'] == catalog['owners'][owner]['source_ordinal']
+                    assert list(view.iter_calls(owner)) == [public_record(row) for row in state['prepared']['history']]
+                    assert view.derived(*owner, 'summary') == summaries[owner]
+            with monkeypatch.context() as order_only:
+                def no_derived_reads(*args, **kwargs):
+                    raise AssertionError('traversal order must not reread unchanged prepared content')
+                order_only.setattr(storage.Snapshot, 'derived', no_derived_reads)
+                publisher.adopt(store, {owner for update in updates for owner in update['changed']})
+                reordered_publication = receiver.receive(publisher.publish(publication, store, speeds))
+            assert reordered_publication['cache_candidates'] == []
+            assert reordered_publication['sessions'] == first_publication['sessions']
+            assert reordered_publication['filter_choices'] == first_publication['filter_choices']
+            def without_token(values):
+                return {(value['home'], value['id']):{key:item for key,item in value.items()
+                        if key!='_prepared_token'} for value in values}
+            assert without_token(reordered_publication['overlay_sessions']) == without_token(first_publication['overlay_sessions'])
+            if reorder and not capacity_fallback:
+                monkeypatch.setattr(reader, 'selected_owner_stream', source_stream)
+                monkeypatch.setattr(storage.Snapshot, 'iter_speed_rows', speed_rows)
+                newcomer = Session('newcomer', writer.homes[0], title='newcomer')
+                newcomer.add_usage(120, 'new-first', dict(input_tokens=100, cached_input_tokens=20, output_tokens=10),
+                                   'gpt-6-astra', 'request', 'medium', service_tier='Standard')
+                sources.insert(0,deepcopy(newcomer.view(120)))
+                captured = publish_sources(4); later=[]; reorder_batch=coordinator._reorder
+                def source_grows_during_reorder(*args, **kwargs):
+                    if not later:
+                        sources[0]['history'].append(dict(sources[0]['history'][0],key='new-later',ts=121))
+                        sources[0]['usage_revision']=2
+                        later.append(publish_sources(5))
+                    return reorder_batch(*args, **kwargs)
+                monkeypatch.setattr(coordinator,'_reorder',source_grows_during_reorder)
+                assert list(coordinator.convert(captured,cohort_size=1))[-1]['ready']
+                with store.read_current() as view:
+                    assert [r['key'] for r in view.iter_calls((writer.homes[0],'newcomer'))] == ['new-first']
+                assert list(coordinator.convert(later[0],cohort_size=1))[-1]['ready']
+                with store.read_current() as view:
+                    assert [r['key'] for r in view.iter_calls((writer.homes[0],'newcomer'))] == ['new-first','new-later']
     finally:
         reader.close()
         writer.close()

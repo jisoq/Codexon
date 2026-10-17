@@ -177,6 +177,55 @@ def test_history_recovery_yields_to_details_and_collection(monkeypatch,tmp_path)
             for gate in release:gate.set()
 
 
+def test_ledger_replay_yields_to_new_calls_between_committed_batches(monkeypatch,tmp_path):
+    from cachemonitor import prepared_ledger
+    entered=Event();release=Event();clients=[];passes=[]
+    monkeypatch.setattr(prepared_ledger,'OWNER_BATCH',1)
+    original_init=prepared_runtime.CollectionClient.__init__
+    def capture(client,*args,**kwargs):
+        original_init(client,*args,**kwargs);clients.append(client)
+    monkeypatch.setattr(prepared_runtime.CollectionClient,'__init__',capture)
+    original_sync=prepared_ledger.PreparedLedger.sync
+    def gated_sync(adapter,*args,**kwargs):
+        number=len(passes);passes.append([])
+        for batch in original_sync(adapter,*args,**kwargs):
+            passes[number].append(batch)
+            if number==0:
+                assert len(passes[number])==1,'older ledger replay blocked a newer call'
+                assert batch['remaining']>0
+                entered.set()
+                assert release.wait(5),'ledger batch gate was not released'
+            yield batch
+    monkeypatch.setattr(prepared_ledger.PreparedLedger,'sync',gated_sync)
+    worker=PreparedAnalysis(tmp_path)
+    background=[]
+    for n in range(2):
+        other=copy.deepcopy(worker.session);other['id']=f'background-{n}'
+        for row in other['history']:row['key']=f"background-{n}-{row['key']}"
+        background.append(other)
+    original_publish=worker.channel.publish
+    def publish(value,*args,**kwargs):
+        return original_publish(dict(value,sessions=value['sessions']+background),*args,**kwargs)
+    monkeypatch.setattr(worker.channel,'publish',publish)
+    with worker:
+        try:
+            first=worker.wait_snapshot()
+            assert not first['ledger_status_known'] and entered.wait(3)
+            worker.session['history'][-1]['output']+=1;worker.session['usage_revision']+=1
+            worker.publish()
+            if clients[0].waiter is not None:
+                assert clients[0].waiter.receiver.poll(3),'new collection did not notify the analyzer'
+            release.set()
+            changed=worker.wait_snapshot(lambda value:value['prepared_token']!=first['prepared_token'])
+            assert not changed['ledger_status_known'] and len(passes[0])==1
+            worker.assert_calls_and_detail()
+            worker.wait_snapshot(lambda value:value.get('ledger_status_known'))
+            assert len(passes)>1 and passes[-1][-1]['remaining']==0
+            with sqlite3.connect(worker.quota_path) as db:
+                assert db.execute('SELECT count(*),sum(output) FROM calls').fetchone()==(9,9001)
+        finally:release.set()
+
+
 def test_service_collects_large_record_once_for_gui_and_worker(tmp_path,monkeypatch):
     import json
     from cachemonitor.index import UsageIndex

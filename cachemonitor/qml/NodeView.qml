@@ -7,17 +7,23 @@ Item {
     id: view
     property alias item: content.item
     property alias sourceComponent: content.sourceComponent
-    Loader { id: content; anchors.fill: parent }
+    readonly property bool analysisMasked: s.kind !== "usageDashboard" && !!s.analysisLoading && !!s.analysisLoading.active && !s.analysisLoading.retained
+    Loader { id: content; anchors.fill: parent; visible: !view.analysisMasked; enabled: !view.analysisMasked }
     required property var node
     property var s: node ? node.state : ({})
+    Loader {
+        anchors.fill: parent
+        active: view.s.kind !== "usageDashboard" && !!view.s.analysisLoading && !!view.s.analysisLoading.active && view.s.analysisLoading.indicator !== false
+        sourceComponent: Component { AnalysisLoading { status: view.s.analysisLoading || ({}) } }
+    }
     property var buttonText: undefined
     property var labelText: undefined
     property string buttonIcon: s.iconName || ""
     property string toolTipText: s.tooltip || ""
     Connections { target: view.node; function onFocusRequested() { if (view.item) view.item.forceActiveFocus(Qt.TabFocusReason) } }
     property bool horizontalParent: false
-    activeFocusOnTab: s.kind === "plot"
-    onActiveFocusChanged: if (activeFocus && s.kind === "plot" && item) item.forceActiveFocus()
+    activeFocusOnTab: s.kind === "plot" && !analysisMasked
+    onActiveFocusChanged: if (activeFocus && s.kind === "plot" && !analysisMasked && item) item.forceActiveFocus()
     visible: !!node && s.visible
     enabled: !!node && s.enabled
     opacity: s.opacity === undefined ? 1 : s.opacity

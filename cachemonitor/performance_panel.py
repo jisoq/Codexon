@@ -613,6 +613,16 @@ class PerformancePanel(Group):
         return self.model_choice.currentData()==key
 
     def sync_selection(self):
+        selected=[m for m in self.available if self.is_model_selected(m)]
+        if getattr(self,'legend_entries',None)==[(m,t) for m in selected for t in ('Standard','Fast')]:
+            # Mode changes only dim existing legend entries. Rebuilding their
+            # layouts recreates the entire rendered model list on every click.
+            mode='all' if all(self.modes.get(t,False) for t in ('Standard','Fast')) else 'Fast' if self.modes.get('Fast') else 'Standard'
+            for key,b in self.mode_buttons.items():b.setChecked(key==mode)
+            for mark in self.legend.findChildren(SeriesLegend):
+                active=self.modes.get(mark.mode,False)
+                if mark.active!=active:
+                    mark.active=active;mark.update();mark.label.put(color='ink' if active else 'muted')
         # Range results already refresh plot data; unchanged selection UI stays mounted.
         if self.selection_is_current():return
         self.window_note.show()
@@ -629,8 +639,8 @@ class PerformancePanel(Group):
             for mode in ('Standard','Fast'):
                 active=self.modes.get(mode,False)
                 entry=Row();entry.setSpacing(4);modes.addLayout(entry)
-                entry.addWidget(SeriesLegend(model,mode,active,True))
-                label=caption(Verbatim(mode),12,'ink' if active else 'muted');label.put(wrap=False);entry.addWidget(label)
+                mark=SeriesLegend(model,mode,active,True);entry.addWidget(mark)
+                label=caption(Verbatim(mode),12,'ink' if active else 'muted');label.put(wrap=False);entry.addWidget(label);mark.label=label
                 self.legend_entries.append((model,mode))
             # Selected models can be removed without clearing other comparisons.
             if len(selected)>1 and len(selected)!=len(self.available):
@@ -824,6 +834,7 @@ class PerformancePanel(Group):
         previous=self.inspected
         self.inspect(None)
         self.range=(data['start'],data['end']);self.full=data['full'];self.available=[m for m in data['models'] if m not in ('미확인','codex-auto-review')]
+        if self.follow_latest and self.time_range is not None:self.time_range=list(self.range)
         if data.get('window_seconds'):
             seconds=data['window_seconds'];unit='초' if seconds<60 else '분' if seconds<3600 else '시간' if seconds<86400 else '일'
             value=seconds/(1 if unit=='초' else 60 if unit=='분' else 3600 if unit=='시간' else 86400)

@@ -525,6 +525,7 @@ def test_dashboard_tab_worker_contract_and_navigation(tmp_path):
     from cachemonitor.dashboard import Dashboard
     from cachemonitor.core import Session
     from cachemonitor.quick_qa import dispose
+    from test_ui import wait_for_rendered
     app=QApplication.instance() or QApplication([])
     app.setProperty('cachemonitorDisableShellIntegration',True)
     w=Dashboard([],start_worker=False,live_limits=False,settings=QSettings(str(tmp_path/'dashboard.ini'),QSettings.IniFormat))
@@ -532,18 +533,45 @@ def test_dashboard_tab_worker_contract_and_navigation(tmp_path):
         session=Session('s','synthetic',title='Synthetic',cwd='C:/sample')
         session.add_usage(1800000000,'r',dict(input_tokens=100,cached_input_tokens=90,cache_write_input_tokens=0,output_tokens=50,reasoning_output_tokens=10),'gpt-6-astra','t','high','Standard')
         session.add_usage(1800000001,'r2',dict(input_tokens=100,cached_input_tokens=90,cache_write_input_tokens=0,output_tokens=50,reasoning_output_tokens=10),'gpt-6.1-sol','t2','high','Standard')
-        w.receive(dict(ts=1800001000,sessions=[session.view(1800001000)],homes=['synthetic'],errors=[],unassigned=[]))
+        w.receive(dict(ts=1800100000,sessions=[session.view(1800100000)],homes=['synthetic'],errors=[],unassigned=[],index={'loading':True}))
         assert w.navigation_pages==(0,1,5,2,3)
         w.nav.setCurrentRow(2)
         assert w.pages.currentIndex()==5 and not w.common_filters.isVisible()
         assert w.performance_panel.plots['cost'].rows
         q=w.query();result=w.engine.page_query(q)
+        # A broad rolling view omits individual dots but still has real calls.
+        assert result['analysis']['response_count']==2
+        assert not w.analysis_loading
         w.request_id=123;w.pending_automatic=False;w.pending_query=q
         w.analysis_ready(dict(id=123,logical='performance',result=result,valid_until=result['valid_until']))
         assert q['granularity']=='auto'
         w.performance_panel.solo('gpt-6-astra');w.performance_panel.add_model('gpt-6.1-sol')
         assert w.query()['granularity']=='auto'
         assert w.engine.page_query(w.query())['performance']['granularity']=='auto'
+        w.show()
+        wait_for_rendered(lambda:w.pages.isPageReady(5) and w.pages.isVisible(),timeout=5)
+        w.async_mode=True;w.client_cache.clear()
+        saved={}
+        for period in ('7d','30d','all'):
+            w.performance_panel.choose_period(period)
+            assert w.analysis_pending
+            value=w.engine.page_query(w.pending_query)
+            saved[period]=value
+            w.analysis_ready(dict(id=w.request_id,logical=w.pending_logical,result=value,valid_until=w.snapshot['ts']+60))
+        w.snapshot={**w.snapshot,'ts':w.snapshot['ts']+1}
+        w.performance_panel.choose_period('7d')
+        assert not w.analysis_pending
+        assert w.performance_panel.range==(saved['7d']['performance']['start'],saved['7d']['performance']['end'])
+        assert w.performance_panel.time_range==list(w.performance_panel.range)
+        # An expired result is visibly retained only for its own selected scope.
+        w.snapshot={**w.snapshot,'ts':w.snapshot['ts']+60}
+        w.performance_panel.choose_period('30d')
+        assert w.analysis_pending and w.pending_retained and w.pages.isVisible()
+        assert w.performance_panel.range==(saved['30d']['performance']['start'],saved['30d']['performance']['end'])
+        w.snapshot={**w.snapshot,'data_revision':1}
+        w.performance_panel.choose_period('7d')
+        assert w.analysis_pending and not w.pending_retained and w.pages.isVisible()
+        assert w.analysis_loading['active'] and not w.analysis_loading['retained']
         w.change_page(4);assert w.current_page==4
     finally:dispose(w)
 

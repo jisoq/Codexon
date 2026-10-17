@@ -14,7 +14,7 @@ from .analysis_engine import AnalysisEngine
 from .analysis_delivery import SnapshotPublisher, MODEL_KEYS
 from .analytics import prepare_row
 from .overlay_data import summarize_session
-from .prepared_store import CapacityExceeded, OWNER_FIELDS, FORBIDDEN_OWNER, pack
+from .prepared_store import CapacityExceeded, OWNER_FIELDS, FORBIDDEN_OWNER, RAW_TRANSPORT_FIELDS, pack
 from .pricing import Rate, pricing_signature
 from .request_modes import mode_parents
 
@@ -333,7 +333,7 @@ def stage_owner(stage, material, dependencies, source_ordinal, *, candidates=Non
     state = material['state']
     source = state['prepared']
     key = (source['home'], source['id'])
-    excluded = FORBIDDEN_OWNER | {'requests','groups','_prepared'}
+    excluded = FORBIDDEN_OWNER | RAW_TRANSPORT_FIELDS | {'requests','groups','_prepared'}
     metadata = {name:value for name,value in source.items() if name not in excluded}
     from .prepared_health import compact_owner_health
     metadata.update(compact_owner_health(source))
@@ -670,6 +670,45 @@ class PreparedCohort:
             self.cache.clear()
             self.cache_bytes = 0
 
+    def _reorder(self, catalog, owners, *, ready, parents):
+        """Change traversal positions without rereading unchanged source facts."""
+        self._check()
+        source = source_identity(catalog)
+        checkpoint = self.speed_writer is not None
+        if checkpoint and not ready:
+            from .prepared_speed_writer import SPEED_CHECKPOINT_NAMESPACE
+            with self.store.read_current(seconds=60) as view:
+                head = view.checkpoint_state(SPEED_CHECKPOINT_NAMESPACE)
+                checkpoint = head is not None and tuple(head['token']) == (view.token.instance, view.token.generation)
+        previous = self._speed_inventory() if checkpoint else None
+        stage = self.store.begin(source)
+        try:
+            with self.store.read_current(seconds=60) as view:
+                for owner in owners:
+                    self._check()
+                    old = view.owner(*owner)
+                    # convert established every dependency and candidate proof.
+                    # Preserve facts, summaries and checkpoints in this stage.
+                    stage.owner(*owner, old['metadata'], old['dependencies'],
+                                source_ordinal=catalog['owners'][owner]['source_ordinal'])
+            if ready and not self._complete(catalog, staged=True, parents=parents):
+                raise ValueError('reordered cohort cannot publish incomplete prepared dependencies')
+            if checkpoint:
+                # Facts are unchanged even when traversal order spans batches.
+                # Carry their checkpoint with each generation so the final
+                # ready publication does not recover all historical calls.
+                self.speed_results = self.speed_writer.prepare(stage, previous, stage.source, previous)
+                token = self.speed_writer.publish(stage, source, ready=ready)
+            else:
+                # Capacity fallback has no reusable checkpoint. Keep its full
+                # recovery at the final ready publication, not every batch.
+                token = stage.publish(source, ready=ready)
+            self.metrics['reordered_owners'] = self.metrics.get('reordered_owners', 0) + len(owners)
+            return dict(token=token, changed=tuple(owners), removed=(), writes=dict(stage.writes))
+        except BaseException:
+            self._abort(stage)
+            raise
+
     def convert(self, catalog, *, cohort_size=16):
         """Yield between bounded durable cohorts; resume from their stored proofs.
 
@@ -686,7 +725,7 @@ class PreparedCohort:
         with self.store.read_current(seconds=60) as view:
             for value in pages(view.inventory):
                 current[value['owner']] = value
-        changed = []
+        changed = []; reordered = []
         for owner,entry in catalog['owners'].items():
             old = current.get(owner)
             wanted = dependencies(entry['body_digest'],
@@ -694,21 +733,49 @@ class PreparedCohort:
                 old['dependencies'].get('ownership') if old else None,state=entry.get('state',{}))
             if (old is None or not old['dependencies'].get('prepared')
                     or old['dependencies'].get('candidate_source_digest') != entry['body_digest']
-                    or old['owner_ordinal'] != entry['source_ordinal']
                     or any(old['dependencies'].get(key) != value for key,value in wanted.items())):
                 changed.append(owner)
+            elif old['owner_ordinal'] != entry['source_ordinal']:
+                reordered.append(owner)
         removed = list(current.keys()-catalog['owners'].keys())
-        if not changed and not removed:
+        if not changed and not removed and not reordered:
             if not self.store.db.execute('SELECT ready FROM meta WHERE singleton=1').fetchone()[0]:
                 token=self.publish_ready(catalog)
                 yield dict(token=token,changed=(),removed=(),writes={},ready=True)
             return
         work = [(False,key) for key in removed] + [(True,key) for key in changed]
-        single = len(work) <= cohort_size
-        for group in _groups(work,cohort_size):
-            result = self.apply(catalog,[key for keep,key in group if keep],
-                                [key for keep,key in group if not keep],ready=single,_parents=parents)
+        if reordered and changed and not removed:
+            # Capture leading new owners before traversal-only
+            # batches. A live new session can grow while those batches commit.
+            # Use the existing source cache allowance, never a second buffer.
+            self.catalog = catalog
+            try:
+                for owner in changed[:cohort_size]:
+                    # Existing owners may use a proven append without reading
+                    # their full source. Do not prefetch that history eagerly.
+                    if owner in current:continue
+                    for member in mode_context(owner,catalog,parents=parents):
+                        if (member,catalog['owners'][member]['body_digest']) in self.cache:continue
+                        available = self.SOURCE_CACHE_BYTES-self.cache_bytes
+                        if available <= 0:raise CapacityExceeded('source capture allowance reached')
+                        self._load(member,replace(self.limits,
+                            owner_source_bytes=min(self.limits.owner_source_bytes,available)))
+            except CapacityExceeded:
+                # Oversized owners retain the ordinary verified read path.
+                pass
+        # Separate order-only work so a single changed source can still use its
+        # append path. Every intermediate cohort stays unavailable as before.
+        single = (not work or not reordered) and len(work) + len(reordered) <= cohort_size
+        for group in _groups(reordered,cohort_size):
+            result = self._reorder(catalog,group,ready=single,parents=parents)
             yield dict(result,ready=single)
-        if not single:
+        completed = 0
+        for group in _groups(work,cohort_size):
+            completed += len(group)
+            ready = completed == len(work)
+            result = self.apply(catalog,[key for keep,key in group if keep],
+                                [key for keep,key in group if not keep],ready=ready,_parents=parents)
+            yield dict(result,ready=ready)
+        if not single and not work:
             token=self.publish_ready(catalog)
             yield dict(token=token,changed=(),removed=(),writes={},ready=True)

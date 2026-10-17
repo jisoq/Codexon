@@ -1,5 +1,6 @@
 """Publish prepared owner deltas without rebuilding or retaining call history."""
 from collections import Counter
+import sys
 import uuid
 
 from .analysis_delivery import MODEL_KEYS
@@ -38,6 +39,7 @@ class PreparedPublisher:
     def adopt(self,store,changed,removed=()):
         if self.token==store.token:
             return
+        content_changed=set()
         with store.read_current(seconds=60) as view:
             if not view.db.execute('SELECT ready FROM meta WHERE singleton=1').fetchone()[0]:
                 raise NotReady('cannot deliver a partial owner conversion')
@@ -53,6 +55,19 @@ class PreparedPublisher:
             for key,entry in current.items():
                 if entry is None:
                     raise NotReady('published change references an absent prepared owner')
+                entry={name:value for name,value in entry.items() if name!='owner'}
+                previous=self.owners.get(key)
+                if previous is not None and (
+                        {name:value for name,value in previous.items() if name!='owner_ordinal'} ==
+                        {name:value for name,value in entry.items() if name!='owner_ordinal'}):
+                    # Traversal order alone does not change any call, summary,
+                    # choice or alert. Retain the verified content references.
+                    difference=sys.getsizeof(entry['owner_ordinal'])-sys.getsizeof(previous['owner_ordinal'])
+                    if self.owner_bytes+difference>self.STATE_BYTES:
+                        raise CapacityExceeded('prepared publication metadata exceeds its retention budget')
+                    self.owner_bytes+=difference;self.owner_weights[key]+=difference
+                    previous['owner_ordinal']=entry['owner_ordinal']
+                    continue
                 old_alerts=self.alerts.get(key,{})
                 new_alerts=view.derived(*key,'model_alerts') or {}
                 choices=view.derived(*key,'choices') or {}
@@ -64,6 +79,7 @@ class PreparedPublisher:
                 self.owners[key]=entry
                 self.choices[key]=choices
                 self.alerts[key]=new_alerts
+                content_changed.add(key)
                 if entry['metadata'].get('_internal_review'):
                     continue
                 # Corrections that resolve a prior confirmed alert still emit
@@ -78,7 +94,7 @@ class PreparedPublisher:
                         signature=tuple(row.get(name) for name in MODEL_KEYS)
                     self.pending_alerts[(key,identity)]=dict(home=key[0],sid=key[1],
                         title=entry['metadata'].get('title',''),**dict(zip(MODEL_KEYS,signature)))
-        self.changed.update(changed)
+        self.changed.update(content_changed)
         self.token=store.token
         _weight((self.owners,self.choices,self.alerts,self.pending_alerts),self.STATE_BYTES)
 

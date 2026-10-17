@@ -54,6 +54,7 @@ LINEAGE = OWNER_FIELDS[7:]
 DEPENDENCIES = ('source_digest', 'pricing', 'mode', 'ownership', 'classifier', 'preparation')
 FORBIDDEN_OWNER = frozenset(('history', 'records', 'timestamps', 'boundaries',
                             'whole_turns', 'turn_records', 'turn_states'))
+RAW_TRANSPORT_FIELDS = frozenset(('transports', 'unmatched_transports'))
 KINDS = ('calls', 'requests', 'candidates', 'headers', 'sections')
 CHECKPOINT_TABLES = ('checkpoint_chunks', 'checkpoint_sections', 'checkpoint_versions',
                      'checkpoint_seen', 'checkpoint_retired', 'checkpoint_heads')
@@ -829,7 +830,10 @@ class Stage:
         digest = dependencies['source_digest']
         if type(digest) is not str or len(digest) != 64 or any(c not in '0123456789abcdef' for c in digest):
             raise TypeError('source_digest must be the canonical source body SHA256')
-        metadata = dict(metadata)
+        # Older prepared owners retained growing source transport diagnostics.
+        # Calls already carry their resolved transport; keep legacy restaging
+        # within the same packet budget without copying those unused arrays.
+        metadata = {name:value for name,value in metadata.items() if name not in RAW_TRANSPORT_FIELDS}
         metadata_packet, dependency_packet = (pack(v, self.limits) for v in (metadata, dependencies))
         key = (home, sid)
         if key not in self.owners and len(self.owners) >= self.limits.owners_per_batch:

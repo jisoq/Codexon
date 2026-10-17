@@ -7,6 +7,7 @@ Item {
     required property var node
     property var s: node.state
     property bool compact: !!s.compact
+    property bool minimal: !!s.minimal
     property var stages: ["기록 준비", "기록 조회", "지표 계산", "화면 준비"]
     implicitWidth: compact ? 500 : 660
     implicitHeight: body.implicitHeight
@@ -17,8 +18,9 @@ Item {
         id: body
         width: Math.min(parent.width, 660)
         anchors.horizontalCenter: parent.horizontalCenter
-        spacing: root.compact ? 8 : 20
+        spacing: root.minimal ? 0 : root.compact ? 8 : 20
         RowLayout {
+            visible: !root.minimal
             Layout.fillWidth: true
             spacing: 12
             Text {
@@ -33,6 +35,7 @@ Item {
             }
         }
         Text {
+            visible: !root.minimal
             text: appLanguage.text(root.s.detail || "")
             font.family: appTheme.family
             font.pixelSize: 14

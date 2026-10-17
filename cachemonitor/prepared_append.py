@@ -19,7 +19,7 @@ from .overlay_data import (COST_PARTS, TOKEN_LABELS, TOKEN_ORDER, _cost_view,
                            _summary_view, _request_view)
 from .prepared_health import FORMAT as HEALTH_FORMAT, FIELDS as HEALTH_FIELDS, _head
 from .prepared_store import (CapacityExceeded, RebuildRequired, OWNER_FIELDS,
-                             FORBIDDEN_OWNER, pack, _size)
+                             FORBIDDEN_OWNER, RAW_TRANSPORT_FIELDS, pack, _size)
 from .prepared_summary import summary_for_storage, recent_references
 from .prepared_sums import _Sum
 
@@ -769,7 +769,7 @@ def prepare(snapshot,owner,transition,dependencies,*,mode_evidence=None,enrich=N
         if row.get('model_alert_confirmed'):latest_mismatch=row['key']
     summary=_compact_summary(source,packet,total,misses,health,request,recent,current_latest,latest_mismatch)
     sections,heads=_sections(snapshot,owner,miss_events,misses,health,rows[-1])
-    excluded=FORBIDDEN_OWNER|{'requests','groups','_prepared'}
+    excluded=FORBIDDEN_OWNER|RAW_TRANSPORT_FIELDS|{'requests','groups','_prepared'}
     metadata={key:value for key,value in source.items() if key not in excluded}
     metadata.update(cache_misses=heads['cache_misses'],cache_health=heads['cache_health'],
         _internal_review=False,usage_revision=(body,dependencies['mode']),request_revision=body)

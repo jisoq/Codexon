@@ -135,6 +135,7 @@ class PreparedWriter:
             maintenance_due=True
             ledger_pending=False
             pending_reset=False
+            catalog_retries=0
 
             def maintain():
                 deadline=time.monotonic()+.02
@@ -186,6 +187,40 @@ class PreparedWriter:
                 delivery_delta=None
                 pending_reset=False
 
+            def sync_ledger():
+                nonlocal notification,ledger_pending,ledger_issue,failures
+                interrupted=False
+                notification=(None if self.frozen.is_set() else
+                              collector.notification_connection(catalog['publication']))
+                poll_at=time.monotonic()+3
+                if ledger is not None:
+                    try:
+                        batches=adapter.sync(snapshot,removed=ledger_removed)
+                        try:
+                            for batch in batches:
+                                ledger_removed.difference_update(batch.get('retired',()))
+                                if self.stopped.is_set():
+                                    raise InterruptedError('prepared ledger interrupted between durable batches')
+                                # A yielded batch is durable. Abandon this inventory
+                                # before new facts arrive; the next sync starts from
+                                # committed proofs, never resumes an old generator.
+                                if not batch['remaining'] or self.frozen.is_set():continue
+                                if notification is not None and notification.poll():
+                                    notice=collector.consume_notification(catalog['publication'])
+                                    interrupted=notice is True
+                                    notification=(collector.notification_connection(catalog['publication'])
+                                                  if notice is False else None)
+                                if notification is None and time.monotonic()>=poll_at:interrupted=True
+                                if interrupted:break
+                        finally:batches.close()
+                        if not interrupted:
+                            if snapshot.get('activity_cursor'):collector.channel.acknowledge_activity(snapshot)
+                            ledger_removed.clear()
+                            if imported:ledger_issue=None;failures=0
+                    except sqlite3.Error as error:disable(error)
+                ledger_pending=interrupted and ledger is not None
+                return interrupted
+
             def import_step():
                 nonlocal imported,next_import,ledger_issue,failures
                 started=time.monotonic()
@@ -207,6 +242,14 @@ class PreparedWriter:
                         collector.stop_notifications();notification=None
                     if 'sync' in commands:
                         publish(reset=True)
+                if (self.frozen.is_set() and ledger_pending and publisher.token==store.token
+                        and store.db.execute('SELECT ready FROM meta WHERE singleton=1').fetchone()[0]):
+                    # Freeze completes accounting for the already captured view.
+                    # It must not adopt a newer source just to finish its ledger.
+                    try:sync_ledger();publish()
+                    except InterruptedError:
+                        if self.stopped.is_set():break
+                        raise
                 incomplete=(bool(pending_changed or pending_removed) or
                     store.token.generation>0 and not store.db.execute(
                         'SELECT ready FROM meta WHERE singleton=1').fetchone()[0]) if self.frozen.is_set() else False
@@ -227,8 +270,10 @@ class PreparedWriter:
                         disable(error)
                 if now>=next_poll:
                     started=time.monotonic()
+                    catalog_received=False
                     try:
                         catalog=read_catalog(collector,cancel=self.stopped.is_set)
+                        catalog_received=True
                         # An incomplete live membership cannot withdraw owners
                         # or replace committed analytical state.
                         if not catalog['membership_complete']:
@@ -281,26 +326,16 @@ class PreparedWriter:
                                 # accounting replay. Its pending status is explicit.
                                 publish()
                             pending_changed.clear();pending_removed.clear()
-                            if ledger is not None:
-                                try:
-                                    for _ in adapter.sync(snapshot,removed=ledger_removed):
-                                        if self.stopped.is_set():
-                                            raise InterruptedError('prepared ledger interrupted between durable batches')
-                                    if snapshot.get('activity_cursor'):
-                                        collector.channel.acknowledge_activity(snapshot)
-                                    ledger_removed.clear()
-                                    if imported:
-                                        ledger_issue=None;failures=0
-                                except sqlite3.Error as error:
-                                    disable(error)
-                            ledger_pending=False
+                            ledger_interrupted=sync_ledger()
                             publish()
                             timing(dict(prepared_update=time.monotonic()-started))
-                            notification=collector.notification_connection(catalog['publication'])
+                            notification=(None if self.frozen.is_set() else
+                                          collector.notification_connection(catalog['publication']))
                             age=time.time()-snapshot['ts']
                             delay=.1 if snapshot['index'].get('loading') else (
                                 3 if notification is None or age>30 else min(ANALYSIS_IDLE_WAIT_SECONDS,max(.01,30-age+.01)))
-                            next_poll=time.monotonic()+delay
+                            next_poll=0 if ledger_interrupted else time.monotonic()+delay
+                            catalog_retries=0
                     except CollectionCatalogUnavailable:
                         # AppServices owns collector startup and restart. The
                         # query writer never starts a duplicate source reader.
@@ -308,7 +343,14 @@ class PreparedWriter:
                             snapshot=dict(snapshot,collection_stale=True,usage_collection_complete=False,
                                           index={**snapshot['index'],'usage_complete':False})
                             publish()
-                        next_poll=time.monotonic()+(3 if snapshot is not None else .1)
+                        # A source changing after its catalog was captured is
+                        # normal live traffic, not a collector outage. Retry
+                        # promptly, with bounded backoff for repeated races.
+                        if catalog_received:
+                            catalog_retries+=1
+                            delay=min(3,.1*2**min(catalog_retries-1,5))
+                        else:delay=3 if snapshot is not None else .1
+                        next_poll=time.monotonic()+delay
                     except ModeEvidenceUnavailable as error:
                         disable(error.__cause__)
                         next_poll=0
@@ -335,7 +377,9 @@ class PreparedWriter:
                     if notice is True:next_poll=0
                     elif notice is None:next_poll=min(next_poll,time.monotonic()+3)
                     notification=collector.notification_connection(catalog['publication']) if notice is False else None
-        except Exception:
+        except Exception as error:
+            from .quota_diagnostics import record_failure
+            record_failure(Path(self.arguments[3]).with_suffix('.analysis.sqlite'), 'prepared writer', error)
             self.output.put(dict(kind='fatal',error=traceback.format_exc(limit=6)))
         finally:
             if collector is not None:collector.close()
@@ -357,7 +401,16 @@ class PreparedWriter:
 def process_main(connection,homes,index_path,model_evidence_path,quota_path,cache_floor=None):
     """Return an explicit replacement snapshot for the static compatibility path."""
     writer=PreparedWriter(homes,index_path,model_evidence_path,quota_path,cache_floor)
-    actor=QueryActor(lambda:PreparedQuery(writer.path))
+    def query_reader():
+        try:return PreparedQuery(writer.path)
+        except Exception as error:
+            from .quota_diagnostics import record_failure
+            record_failure(Path(quota_path).with_suffix('.analysis.sqlite'), 'prepared query startup', error)
+            raise
+    try:actor=QueryActor(query_reader)
+    except BaseException:
+        writer.close()
+        raise
     current=None
     pending={}
     latest_query=None
