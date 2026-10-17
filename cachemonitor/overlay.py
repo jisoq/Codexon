@@ -10,6 +10,7 @@ from .overlay_monitor import WIDTH, ACTIONS_X, HEADER_X, HEADER_WIDTH, POPUP_X, 
 from .overlay_tracking import overlay_geometry, anchor_for_position
 from .overlay_appearance import CodexAppearance, default_appearance
 from .analysis_delivery import ANALYSIS_DELAY_SECONDS
+from .analysis_engine import BoundedCache, retained_bytes
 
 
 def system_dark():
@@ -32,6 +33,7 @@ class OverlayController(QObject):
         self.record_loader=None;self.record_serial=0;self.pending_record=None
         self.overlay_loader=None;self.overlay_serial=0;self.pending_overlay=None
         self._overlay_detail=None;self._overlay_blocked=None
+        self._overlay_cache=BoundedCache(entries=8,rows=8*1024*1024)
         self._pending_overlay_navigation=None
         self.widget = SessionOverlay()
         content=self.widget.content_model;content.settings=settings
@@ -225,6 +227,12 @@ class OverlayController(QObject):
             return data,False
         cached=self._overlay_detail
         health=bool(self.expanded)
+        cache=getattr(self,'_overlay_cache',None)
+        previous=cache.get(identity[:2]) if cache is not None else None
+        if (previous and (self.overlay_identity(previous)==identity or self.reusable_overlay_detail(data,previous))
+                and (not cached or self.overlay_identity(cached)[:2]!=identity[:2]
+                     or health and not cached.get('_health_detail'))):
+            cached=previous
         if cached and (self.overlay_identity(cached)==identity or self.reusable_overlay_detail(data,cached)):
             cached=self.refreshed_overlay_detail(data,cached,health)
             self._overlay_detail=cached
@@ -267,6 +275,14 @@ class OverlayController(QObject):
             if not self.reusable_overlay_detail(current,detail):return
             detail=self.refreshed_overlay_detail(current,detail,pending[2])
         self._overlay_detail=detail;self._overlay_blocked=None
+        cache=getattr(self,'_overlay_cache',None)
+        if cache is not None:
+            key=self.overlay_identity(detail)[:2]
+            previous=cache.get(key)
+            if (not previous or not previous.get('_health_detail') or detail.get('_health_detail')
+                    or not (self.overlay_identity(previous)==self.overlay_identity(detail)
+                            or self.reusable_overlay_detail(detail,previous))):
+                cache.put(key,detail,retained_bytes((key,detail),cache.rows))
         self.refresh()
         navigation=self._pending_overlay_navigation
         if navigation and detail.get('_health_detail'):
@@ -556,7 +572,6 @@ class OverlayController(QObject):
                 or state.get('target')!=self.target_state.get('target')):self.cancel_drag()
         if state.get('selection')!=self.target_state.get('selection'):
             self.close_popup()
-            self.widget.set_content(None,'기록 확인 중',appearance=self.appearance)
         self.target_state = state
         self.observed_at = time.monotonic()
         self.refresh()
@@ -572,6 +587,10 @@ class OverlayController(QObject):
         self.sessions = snapshot.get('overlay_sessions', [])
         self.session_lookup={}
         for s in self.sessions:self.session_lookup.setdefault(s['id'],[]).append(s)
+        cache=getattr(self,'_overlay_cache',None)
+        if cache is not None:
+            scopes={(s.get('home'),s['id']) for s in self.sessions}
+            cache.discard(lambda key:key not in scopes)
         self.snapshot_at = time.monotonic()
         self.loading = snapshot.get('index', {}).get('loading', False)
         self.errors = snapshot.get('errors', [])

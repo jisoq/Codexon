@@ -921,6 +921,66 @@ def test_performance_full_range_streams_exact_charts_within_the_object_budget(tm
             engine.close()
 
 
+def test_selected_performance_windows_preserve_catalog_and_exact_speed_population(tmp_path, monkeypatch):
+    from collections import OrderedDict
+    from datetime import datetime
+    from types import SimpleNamespace
+    from cachemonitor.performance_trends import PerformanceTrends
+    from cachemonitor.prepared_analysis import PreparedAnalysisEngine
+
+    monkeypatch.setenv('CODEXON_CPU_BACKEND', 'python')
+    now=datetime(2026,10,17,12).timestamp();day=86400
+    observations=[(-60,'model','Standard',None,1000),(-45,'other','Standard',10.,1000),
+                  (-20,'model','Standard',0.,1000),(-15,'model','Fast',10.,1000),
+                  (-6,'model','Standard',None,1000),(-5,'model','Standard',10.,1000),
+                  (-3,'model','Standard',10.,0),(-2,'model','Standard',10.,1000),
+                  (-1,'model','Standard',None,1000),(2,'future','Standard',10.,1000),
+                  (-60,'no-speed','Fast',None,1000),(-.5/day,'no-speed','Fast',None,1000)]
+    rows=[dict(home=OWNER[0],sid=OWNER[1],key=f'window-{index}',turn='request',session_ordinal=index,
+               ts=now+offset*day,model=model,service_tier=mode,effort='high',duration=1.,cost=.1,
+               input=100,cached=20,reasoning=5,output=0 if speed==0 else 10,
+               completion_latency_ms=latency,output_speed=speed)
+          for index,(offset,model,mode,speed,latency) in enumerate(observations)]
+    reference=SimpleNamespace(revision=1,sessions=OrderedDict([(OWNER,dict(prepared=dict(history=rows)))]))
+    standard=dict(models=['model'],modes=['Standard'])
+    cases=[('7d',standard,None,(now-7*day,now),5,2),
+           ('30d',standard,None,(now-30*day,now),6,3),
+           ('all',standard,None,(now-20*day,now-2*day),5,3),
+           ('all',dict(models=['model'],modes=['Fast']),None,(now-15*day,now-15*day+1),1,1),
+           ('all',dict(models=[],modes=['Standard']),None,(now-1,now),0,0),
+           ('all',dict(models=None,modes=[]),None,(now-1,now),0,0),
+           ('all',dict(models=['no-speed'],modes=['Fast']),None,(now-1,now),0,0),
+           ('7d',dict(models=['no-speed'],modes=['Fast']),None,(now-7*day,now),1,0),
+           (None,standard,(now-7*day,now-4*day),(now-7*day,now-4*day),2,1),
+           ('7d',dict(models=None,modes=['Standard']),None,(now-7*day,now),5,2)]
+    with storage.PreparedStore(tmp_path/'selected-performance.sqlite') as store:
+        stage=store.begin(('performance',1));dependency={name:1 for name in storage.DEPENDENCIES}
+        dependency['source_digest']='1'*64
+        stage.owner(*OWNER,dict(home=OWNER[0],id=OWNER[1],_internal_review=False),dependency,source_ordinal=0)
+        stage.calls(OWNER,rows,reconcile=True);token=stage.publish(('performance',1),ready=True)
+        engine=PreparedAnalysisEngine(store.path,token)
+        reducer=PerformanceTrends()
+        def forbidden(*args,**kwargs):
+            raise AssertionError('Selected trends must only read scalar call columns')
+        monkeypatch.setattr(storage.Snapshot,'_decode_call',forbidden)
+        try:
+            for period,selection,window,bounds,count,eligible in cases:
+                query=dict(page=5,now=now,plot_width=64,granularity='auto',trend_period=period,
+                           trend_selection=selection,time_range=window)
+                actual=engine.page_query(query)['performance']
+                assert actual==reducer.query(reference,query)
+                assert (actual['start'],actual['end'])==bounds
+                assert actual['models']==['future','model','no-speed','other']
+                assert actual['calls']==count
+                assert engine.read_metrics['trend_selected_rows']==count
+                speed=next(panel for panel in actual['panels'] if panel['key']=='output_speed')
+                assert (speed['n'],speed['N'])==(eligible,count)
+            calendar=dict(query,granularity='day',trend_period='all',trend_selection=standard,time_range=None)
+            assert engine.page_query(calendar)['performance']==reducer.query(reference,calendar)
+        finally:
+            engine.close()
+
+
 def test_performance_many_owners_complete_within_the_read_work_budget(tmp_path):
     from cachemonitor.prepared_analysis import PreparedAnalysisEngine
     from cachemonitor.prepared_performance import _Input

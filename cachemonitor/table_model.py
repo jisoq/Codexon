@@ -132,6 +132,7 @@ class Table(Node):
     itemSelectionChanged=Signal()
     cellClicked=Signal(int,int)
     cellActivated=Signal(int,int)
+    rowHovered=Signal(int)
     scrollRequested=Signal(int,int)
     rangeRequested=Signal()
     def __init__(self,rows=0,columns=0,parent=None,headers=None):
@@ -226,6 +227,9 @@ class Table(Node):
         first=max(0,self.first_visible);last=min(self.rowCount()-1,self.last_visible)
         if first<=last and self.columnCount():
             self._model.dataChanged.emit(self._model.index(first,0),self._model.index(last,self.columnCount()-1),[Qt.UserRole+1])
+    @Slot(int)
+    def hoverRow(self,row):
+        self.rowHovered.emit(row if 0<=row<self.rowCount() else -1)
     @Slot(int)
     def selectRow(self,row):
         if row!=self._selected:self._selected=row;self.put(selected=row);self.itemSelectionChanged.emit()

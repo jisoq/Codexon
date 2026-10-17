@@ -163,4 +163,20 @@ def test_selected_graph_rejects_old_choice_and_reuses_matching_refresh(tmp_path)
     assert not panel.history_loading.isVisible() and not panel.history_loading._state['running']
     assert panel.history.isVisible() and panel.history.rows is rows
     assert refreshes[-1] is False
+    panel.cycle_choice.setCurrentIndex(0)
+    request=worker.requests[-1]
+    assert panel.history_loading.isVisible() and not panel.cycle_table.isVisible()
+    worker.result.emit(engine.execute(dict(request,id=4)))
+    assert panel.cycle_table.isVisible() and panel.cycle_table.rowCount()==len(panel.history.rows)
+    pending=len(worker.requests)
+    panel.hover_cycle(0,'table')
+    assert panel.history.linked_index==0 and panel.cycle_table.state['highlightedRow']==0
+    from cachemonitor.quota_view import prepare_period_summary
+    changed=prepare_period_summary([dict(period,value=(period['value'] or 0)+1) for period in panel._view['periods']])
+    panel.history.set_series(changed)
+    assert panel.history.linked_index==-1 and panel.cycle_table.state['highlightedRow']==-1
+    assert panel._cycle_hover_owner is None
+    assert len(worker.requests)==pending and panel.cycle_choice.currentData()=='all'
+    panel.cycle_choice.setCurrentIndex(panel.cycle_choice.findData(160))
+    assert not panel.cycle_table.isVisible()
     app.processEvents()

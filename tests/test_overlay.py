@@ -18,6 +18,53 @@ B = '22222222-2222-2222-2222-222222222222'
 
 
 @pytest.mark.parametrize('health',[False,True])
+def test_overlay_revisits_reuse_complete_sessions_and_reject_changed_or_removed_ones(health):
+    from types import SimpleNamespace
+    from cachemonitor.analysis_engine import BoundedCache
+    requested=[]
+    controller=SimpleNamespace(collapsed=False,expanded=health,_overlay_detail=None,
+        _overlay_cache=BoundedCache(entries=2,rows=100000),pending_overlay=None,
+        _overlay_blocked=None,overlay_serial=0,_pending_overlay_navigation=None,
+        overlay_loader=lambda *args,**kwargs:requested.append((args,kwargs)),
+        overlay_identity=OverlayController.overlay_identity,
+        reusable_overlay_detail=OverlayController.reusable_overlay_detail,
+        refreshed_overlay_detail=OverlayController.refreshed_overlay_detail,refresh=lambda:None)
+    summaries={sid:dict(home='home',id=sid,_prepared_token=('test',1),_overlay_revision=('test',1),
+        _recent_refs=True,recent=[{'key':sid}],latest={'key':sid}) for sid in (A,B)}
+    def select(sid):
+        controller.target_state={'selection':Selection(sid)}
+        controller.session_lookup={key:[value] for key,value in summaries.items()}
+        return OverlayController.prepared_content(controller,summaries[sid])
+    for sid in (A,B):
+        value,pending=select(sid)
+        assert pending and value is None
+        detail=dict(summaries[sid],_recent_refs=False,_health_detail=health,
+                    recent=[{'key':sid,'output':100}],latest={'key':sid,'output':100})
+        if health:detail['cache_health']={'events':[{'id':sid}]}
+        OverlayController.receive_overlay_detail(controller,dict(id=controller.pending_overlay[0],
+            summary=detail,prepared_token=('test',1)))
+    summaries[A]=dict(summaries[A],_prepared_token=('test',2))
+    controller.expanded=False
+    value,pending=select(A)
+    assert not pending and value['latest']['output']==100 and len(requested)==2
+    if health:
+        controller.expanded=True
+        value,pending=select(A)
+        assert not pending and value['_health_detail'] and value['cache_health']['events']==[{'id':A}]
+        assert len(requested)==2
+    select(B)
+    summaries[A]=dict(summaries[A],_prepared_token=('test',3),_overlay_revision=('test',3))
+    value,pending=select(A)
+    assert pending and value is None and len(requested)==3
+    # Removing an owner retires its retained data even if it later reappears.
+    OverlayController.receive_snapshot(controller,{'overlay_sessions':[summaries[B]]})
+    summaries[A]=dict(summaries[A],_prepared_token=('test',1),_overlay_revision=('test',1))
+    controller.pending_overlay=None
+    value,pending=select(A)
+    assert pending and value is None and len(requested)==4
+
+
+@pytest.mark.parametrize('health',[False,True])
 def test_overlay_reuses_verified_detail_across_unrelated_publications(health):
     from types import SimpleNamespace
     requested=[]

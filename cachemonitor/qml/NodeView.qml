@@ -156,9 +156,26 @@ Item {
     Component {
         id: responsiveComponent
         GridLayout {
+            id: responsiveGrid
             columns: view.width < view.s.collapseBelow ? 1 : (view.s.columns || 2)
             columnSpacing: view.s.spacing; rowSpacing: view.s.spacing
-            Repeater { model: view.node.nodes; NodeChild { required property var modelData; node: modelData; Layout.fillWidth: true; Layout.minimumWidth: 0; Layout.preferredWidth: (modelData.state.stretch || 1) * 100 } }
+            Repeater {
+                model: view.node.nodes
+                NodeChild {
+                    required property var modelData
+                    required property int index
+                    node: modelData
+                    Layout.fillWidth: true; Layout.minimumWidth: 0
+                    Layout.preferredWidth: (modelData.state.stretch || 1) * 100
+                    Rectangle {
+                        visible: !!view.s.dividers && index > 0
+                        anchors.left: parent.left; anchors.top: parent.top
+                        width: responsiveGrid.columns === 1 ? parent.width : 1
+                        height: responsiveGrid.columns === 1 ? 1 : parent.height
+                        color: appTheme.palette.border
+                    }
+                }
+            }
         }
     }
     Component {

@@ -183,6 +183,7 @@ class QuickPlot(QQuickPaintedItem):
     @Slot()
     def clearHover(self):
         self._hover=None;self._hover_index=-1;self._tip="";self.tipChanged.emit()
+        if self._source and hasattr(self._source,'clear_hover'):self._source.clear_hover()
         if not self._detail_pinned:self.dismissDetail()
     @Slot(int)
     def key(self,key):

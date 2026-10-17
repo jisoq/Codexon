@@ -162,6 +162,7 @@ RULES = (
     ('cachemonitor/speed_health.py', ('speed',)),
     ('cachemonitor/codex_names.py', ('names', 'overlay_tracking')),
     ('cachemonitor/quota_chart.py', ('quota_chart',)),
+    ('cachemonitor/quota_cycle_overview.py', ('quota_ui', 'quota_chart')),
     ('cachemonitor/quota_share.py', ('quota_ui', 'quota_math')),
     ('cachemonitor/quota_attribution.py', ('quota_math', 'quota_store', 'native_cpu')),
     ('cachemonitor/quota_cycles.py', ('quota_math', 'quota_store', 'modes', 'native_cpu')),
@@ -364,7 +365,7 @@ QA_SMOKES = {
     'tools/verify_recovery.py': 'recovery',
 }
 DOC_PATTERNS = ('docs/*', 'releases/*', '*.md', '*.txt', 'LICENSE*', '.gitignore',
-                '.gitattributes', '.github/ISSUE_TEMPLATE/*')
+                '.gitattributes', '.github/ISSUE_TEMPLATE/*', '.agents/skills/*/agents/openai.yaml')
 
 
 def matches(path, patterns):

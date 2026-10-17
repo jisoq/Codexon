@@ -30,7 +30,10 @@ Item {
     function columnAlignment(column) {
         return (root.viewState.leftColumns || [0]).indexOf(root.node.logicalColumn(column)) >= 0 ? Text.AlignLeft : Text.AlignRight
     }
-    property int hoveredRow: -1
+    property var hoveredCell: null
+    readonly property int hoveredRow: hoveredCell ? hoveredCell.row : -1
+    onHoveredRowChanged: if (viewState.linkedHover) node.hoverRow(hoveredRow)
+    onVisibleChanged: if (!visible) hoveredCell = null
     implicitWidth: 250; implicitHeight: root.viewState.inline ? 70 + node.rowModel.rowCount() * root.viewState.rowHeight : 200
     function showDetails() {
         if (root.viewState.selected < 0) return
@@ -178,9 +181,10 @@ Item {
             }
             Rectangle { anchors.fill: parent; color: (appTheme.palette && appTheme.color("accent")); opacity: changedCell * .18 }
             Rectangle { objectName: "cache-zero-marker"; visible: cacheZero && column === 0; anchors.left: parent.left; anchors.top: parent.top; anchors.bottom: parent.bottom; width: 3; color: (appTheme.palette && appTheme.color("warning")) }
-            Rectangle { objectName:"row-hover-feedback";anchors.fill:parent;color:appTheme.palette.accent;opacity:root.hoveredRow===row ? .08 : 0 }
+            Rectangle { objectName:"row-hover-feedback";anchors.fill:parent;color:appTheme.palette.accent;opacity:root.hoveredRow===row || root.viewState.highlightedRow===row ? .08 : 0 }
             Rectangle { objectName: "column-divider"; anchors.right: parent.right; width: 1; height: parent.height; visible: root.readableColumns && !root.viewState.treeNavigation; color: appTheme.palette.border; opacity: .55 }
-            HoverHandler { id: hover;cursorShape:root.viewState.navigationColumn !== undefined && column !== root.viewState.navigationColumn ? Qt.ArrowCursor : Qt.PointingHandCursor;onHoveredChanged: { if(hovered) root.hoveredRow=row;else if(root.hoveredRow===row) root.hoveredRow=-1 } }
+            HoverHandler { id: hover;cursorShape:root.viewState.navigationColumn !== undefined && column !== root.viewState.navigationColumn ? Qt.ArrowCursor : Qt.PointingHandCursor;onHoveredChanged: { if(hovered) root.hoveredCell=cell;else if(root.hoveredCell===cell) root.hoveredCell=null } }
+            Component.onDestruction: if (root.hoveredCell===cell) root.hoveredCell=null
             UiToolTip { objectName: "cell-overflow-tip"; visible: hover.hovered && cellLabel.truncated; text: display }
             TapHandler {
                 onTapped: eventPoint => {

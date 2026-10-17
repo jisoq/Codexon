@@ -16,6 +16,7 @@ from .quota_tracking import RESET_NAMES
 from .lazy_table import LazyTable
 from .quota_share import share_label, share_color_key
 from .quota_exclusion_controls import QuotaExclusions
+from .quota_cycle_overview import CycleTable
 from .ui_details import Details
 from .i18n import formatted
 
@@ -125,6 +126,7 @@ class QuotaPanel(Group):
         self.history_legend=Row();self.history_legend.put(flow=True);self.history_legend.setSpacing(16)
         self.legend_toggles={}
         for key,name,color in (('cycle_value','주간 예상 가치','accent'),
+                               ('reference','주간 할당량 가치','accent'),
                                ('remaining','남은 사용량','written'),
                                ('cycle_cost','누적 측정 환산액','output')):
             legend=Button(name);legend.setCheckable(True);legend.setChecked(True)
@@ -139,6 +141,12 @@ class QuotaPanel(Group):
             title='사용량 계산 중',compact=True,running=False)
         self.history_loading.hide();chart_layout.addWidget(self.history_loading)
         chart_layout.addWidget(self.history)
+        self.cycle_table=CycleTable();self.cycle_table.hide();chart_layout.addWidget(self.cycle_table)
+        self.cycle_table.cycle_activated.connect(self.open_summary_cycle)
+        self._cycle_hover_owner=None
+        self.cycle_table.rowHovered.connect(lambda index:self.hover_cycle(index,'table'))
+        self.history.cycle_hovered.connect(lambda index:self.hover_cycle(index,'chart'))
+        self.history.cycle_hover_reset.connect(lambda:self.hover_cycle(-1))
         self.history_empty=Text();self.history_empty.put(fontSize=14,color='muted',wrap=True)
         chart_layout.addWidget(self.history_empty)
         self.model_legend=Row();self.model_legend.put(flow=True);self.model_legend.setSpacing(16)
@@ -318,6 +326,11 @@ class QuotaPanel(Group):
             self.cycle_choice.put(items=list(self.cycle_choice._items))
         index=self.cycle_choice.currentIndex()
         all_cycles=index==0
+        selection=self.cycle_choice.currentData()
+        if getattr(self,'_hover_selection',None)!=selection:
+            self._hover_selection=selection;self.hover_cycle(-1)
+        for key,button in self.legend_toggles.items():
+            button.setVisible(key in ('cycle_value','reference') if all_cycles else key!='reference')
         lifetime=self._view['lifetime']
         period=(dict(start='all',series=self._view.get('overall'),cost=lifetime['cost'],delta=lifetime['delta'],
                      priced_calls=lifetime['observed_priced_calls'],calls=lifetime['observed_calls'],
@@ -350,6 +363,7 @@ class QuotaPanel(Group):
                 loading=self._query_worker is not None and self._chart_pending==key
                 self._set_loading(self.history_loading,loading,'선택한 주기의 차트를 준비하고 있습니다.',retained=retained)
                 self.history.setVisible(retained);self.history_legend.setVisible(retained)
+                self.cycle_table.setVisible(retained and all_cycles)
                 self.model_legend.setVisible(retained and not all_cycles)
                 self.history_empty.setVisible(not loading and not retained)
                 if not loading:self.history_empty.setText('차트를 계산하지 못했습니다.')
@@ -364,11 +378,13 @@ class QuotaPanel(Group):
         follow=not self.history.rows or self.history.cursor==len(self.history.rows)-1
         self._selected_cycle=(period['start'] if period else None)
         self.history.money=True
-        self.history.reference=None if all_cycles else period['value'] if period else None
+        self.history.reference=self.lifetime_value if all_cycles else period['value'] if period else None
         self.history.empty_text='표시할 사용 기록이 없습니다'
         self.chart_title.setText('주기별 사용량 추이' if all_cycles else '선택 주기의 사용량 추이')
         self.remaining_legend.setText('주기 소모량 (%p)' if all_cycles else '남은 사용량 (%)')
         self.history.set_series(series)
+        if all_cycles:self.cycle_table.set_periods(self._view['periods'])
+        self.cycle_table.setVisible(all_cycles and bool(self.history.rows))
         self.history.legendChanged.emit(self.history.legend_values())
         models=series.get('model_share',{}).get('models',[])
         if getattr(self,'_legend_models',None)!=models:
@@ -414,6 +430,12 @@ class QuotaPanel(Group):
         if hasattr(self,'summary'):
             from .quota_layout import refresh_monitoring_style
             refresh_monitoring_style(self)
+
+    def hover_cycle(self,index,source=None):
+        index=index if self.cycle_choice.currentData()=='all' and 0<=index<len(self.history.rows) else -1
+        if index<0 and source is not None and source!=self._cycle_hover_owner:return
+        self._cycle_hover_owner=source if index>=0 else None
+        self.history.set_linked_cycle(index);self.cycle_table.put(highlightedRow=index)
 
     def select_observation(self,row):
         self.history.setAccessibleName(observation_label(row,self.history.money))

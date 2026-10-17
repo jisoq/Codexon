@@ -226,15 +226,18 @@ def test_responsive_page_chart_and_single_details_path(quota_page,tmp_path,width
         assert 0<panel.history.axis[0]<min(remaining)
         assert panel.history.axis[1]>max(remaining)
         assert panel.summary_values['usage'].text()=='9%'
-        cards=[scene_view(host,node) for node in panel.summary_cards.values()]
+        cards=[scene_view(host,panel.summary_cards[key]) for key in ('weekly','usage','cost','elapsed')]
         positions=[card.mapToScene(QPointF()) for card in cards]
         assert positions[0].y()==pytest.approx(positions[1].y())
         assert positions[2].y()==pytest.approx(positions[3].y())
+        for left,right in ((0,1),(2,3)):
+            assert positions[right].x()==pytest.approx(positions[left].x()+cards[left].width(),abs=1)
         if width<1000:
-            assert positions[2].y()>positions[0].y()+cards[0].height()
+            assert positions[2].y()==pytest.approx(positions[0].y()+cards[0].height(),abs=1)
             assert positions[2].x()==pytest.approx(positions[0].x())
         else:
             assert positions[2].y()==pytest.approx(positions[0].y())
+            assert positions[2].x()==pytest.approx(positions[1].x()+cards[1].width(),abs=1)
         for card in cards:assert card.width()==pytest.approx(cards[0].width(),abs=1)
         for node in panel.summary_values.values():
             text=next(item for item in walk(control(host,node))
@@ -243,7 +246,7 @@ def test_responsive_page_chart_and_single_details_path(quota_page,tmp_path,width
         assert all(r['local_observed'] for r in panel.history.rows)
         assert panel.cycle_choice.count()==4
         assert panel.cycle_choice.currentData()==max(p['start'] for p in panel._view['periods'])
-        assert list(panel.legend_toggles)==['cycle_value','remaining','cycle_cost']
+        assert [key for key,button in panel.legend_toggles.items() if button.isVisible()]==['cycle_value','remaining','cycle_cost']
         assert list(panel.history.row_boxes)==['cycle_value','remaining','cycle_cost']
         assert panel.conversion not in panel.layout()._nodes
         assert panel.history.series is panel._view['periods'][0]['series']
@@ -379,19 +382,82 @@ def test_cycle_selector_changes_graph_preserves_lifetime_and_selection_on_refres
         plot=render_plot(host,panel.history)
         assert panel.history.series is panel._view['overall']
         assert panel.history.series['cycle_summary']
-        assert len(panel.history.curves())==3
-        assert '주기 소모량' in panel.remaining_legend.text() and '%p' in panel.remaining_legend.text()
+        assert panel.history.reference==panel.lifetime_value
+        assert panel.history.legend_values()['reference']==panel.summary_values['weekly'].text()
+        reference=panel.legend_toggles['reference']
+        assert reference.isVisible()
+        assert panel.history.value_floor<panel.lifetime_value<panel.history.ceiling
+        with_reference=panel.history._picture.copy()
+        reference.setChecked(False);render_plot(host,panel.history)
+        assert panel.history._picture!=with_reference
+        reference.setChecked(True);render_plot(host,panel.history)
+        assert [key for key,_,_ in panel.history.curves()]==['cycle_value']
+        assert list(panel.history.row_boxes)==['cycle_value']
+        assert panel.cycle_table.isVisible() and panel.cycle_table.rowCount()==3
+        periods=sorted(panel._view['periods'],key=lambda period:period['start'])
+        assert [row['start'] for row in panel.cycle_table.model().rows]==[period['start'] for period in periods]
+        assert periods[0]['end']-periods[0]['start']==pytest.approx(60)
+        assert panel.cycle_table.item(0,3).text()=='1.0 min'
+        for index,period in enumerate(periods):
+            assert panel.cycle_table.item(index,1).text()==f"{period['delta']:g}%p"
+            assert panel.cycle_table.item(index,2).text()==usd(period['cost'])
+        assert panel.legend_toggles['cycle_value'].isVisible()
+        assert not panel.legend_toggles['remaining'].isVisible() and not panel.legend_toggles['cycle_cost'].isVisible()
         assert len(panel.history.rows)==len(panel._view['periods'])==3
         assert panel.history.series['completed_costs']==[None]*3
+        from test_ui import wait_for_rendered
+        table=render_plot(host,panel.cycle_table)
+        chart_view=scene_view(host,panel.history);table_view=scene_view(host,panel.cycle_table)
+        chart_at=chart_view.mapToScene(QPointF());table_at=table_view.mapToScene(QPointF())
+        assert table_at.y()>=chart_at.y()+chart_view.height()
+        assert table_at.x()==pytest.approx(chart_at.x(),abs=1)
+        cells=[item for item in walk(table) if item.metaObject().indexOfProperty('display')>=0
+               and item.property('row')==1 and item.isVisible()]
+        cells.sort(key=lambda item:item.property('column'))
+        assert len(cells)==4
+        for header in (item for item in walk(table) if item.objectName()=='table-header-label'):
+            assert not header.property('truncated')
+        events=[];panel.cycle_choice.currentIndexChanged.connect(events.append)
+        cursor=panel.history.cursor;selected_row=panel.cycle_table.currentRow();picture=panel.history._picture
+        def hover(item,point=None):
+            from PySide6.QtCore import QEvent
+            from PySide6.QtGui import QMouseEvent
+            location=item.mapToScene(point or QPointF(item.width()/2,item.height()/2))
+            assert host.quick.rect().contains(location.toPoint())
+            # Hidden desktops need direct Qt delivery instead of system cursor movement.
+            event=QMouseEvent(QEvent.MouseMove,location,location,Qt.NoButton,Qt.NoButton,Qt.NoModifier)
+            QApplication.sendEvent(host.quick,event);host.quick.grabFramebuffer()
+        hover(plot,panel.history.point(0,'cycle_value'))
+        wait_for_rendered(lambda:panel.history.linked_index==0 and panel.cycle_table.state['highlightedRow']==0)
+        for cell in cells[:2]:
+            hover(cell)
+            wait_for_rendered(lambda:panel.history.linked_index==1 and panel.cycle_table.state['highlightedRow']==1)
+        panel.history.set_series(dict(panel.history.series))
+        assert panel.history.linked_index==1 and panel.cycle_table.state['highlightedRow']==1
+        plot.clearHover()
+        assert panel.history.linked_index==1
+        hover(plot,panel.history.point(2,'cycle_value'))
+        wait_for_rendered(lambda:panel.history.linked_index==2 and panel.cycle_table.state['highlightedRow']==2)
+        panel.cycle_table.hoverRow(-1)
+        assert panel.history.linked_index==2
+        hover(plot,QPointF(5,5))
+        wait_for_rendered(lambda:panel.history.linked_index==-1 and panel.cycle_table.state['highlightedRow']==-1)
+        assert not events and panel.cycle_choice.currentData()=='all'
+        assert panel.history.cursor==cursor and panel.cycle_table.currentRow()==selected_row
+        assert panel.history._picture is picture
+        panel.cycle_choice.currentIndexChanged.disconnect(events.append)
         expected=panel.history.rows[0]['cycle_start']
         assert host.grab().save(str(tmp_path/'quota-all-cycles.png'))
-        point=panel.history.point(0,'remaining')
+        point=panel.history.point(0,'cycle_value')
         click(host,plot,point.x(),point.y())
         deadline=time.monotonic()+3
         while panel.cycle_choice.currentData()=='all' and time.monotonic()<deadline:QTest.qWait(5)
         assert panel.cycle_choice.currentData()==expected
         chosen=next(p for p in panel._view['periods'] if p['start']==expected)
         assert panel.history.rows is chosen['series']['rows']
+        assert len(panel.history.curves())==3 and not panel.cycle_table.isVisible()
+        assert all(button.isVisible() for key,button in panel.legend_toggles.items() if key!='reference')
+        assert not panel.legend_toggles['reference'].isVisible()
         scroll.ensureWidgetVisible(panel.cycle_choice)
         choice=control(host,panel.cycle_choice);choice.forceActiveFocus()
         QTest.keyClick(host.quick,Qt.Key_Home)
@@ -404,6 +470,29 @@ def test_cycle_selector_changes_graph_preserves_lifetime_and_selection_on_refres
         deadline=time.monotonic()+3
         while panel.cycle_choice.currentData()=='all' and time.monotonic()<deadline:QTest.qWait(5)
         assert panel.cycle_choice.currentData()==expected
+        panel.cycle_choice.setCurrentIndex(0)
+        latest=panel._view['periods'][0];week=7*86400
+        periods=[dict(latest,start=latest['start']-i*week,end=latest['end']-i*week,current=i==0)
+                 for i in range(9,-1,-1)]
+        from cachemonitor.quota_view import prepare_period_summary
+        panel.history.set_series(prepare_period_summary(periods));panel.cycle_table.set_periods(periods)
+        table=render_plot(host,panel.cycle_table)
+        table_view=next(item for item in walk(table) if item.objectName()=='dataTable')
+        from PySide6.QtCore import QPoint
+        from PySide6.QtGui import QWheelEvent
+        point=table_view.mapToScene(QPointF(table_view.width()/2,table_view.height()/2))
+        wheel=QWheelEvent(point,host.quick.mapToGlobal(point.toPoint()),QPoint(),QPoint(0,-1200),
+                          Qt.NoButton,Qt.NoModifier,Qt.NoScrollPhase,False)
+        QApplication.sendEvent(host.quick,wheel)
+        wait_for_rendered(lambda:table_view.property('contentY')>0)
+        click_row(host,panel.cycle_table,len(periods)-1)
+        wait_for_rendered(lambda:panel.cycle_choice.currentData()==latest['start'])
+        panel.cycle_choice.setCurrentIndex(0)
+        table=render_plot(host,panel.cycle_table)
+        table_view=next(item for item in walk(table) if item.objectName()=='dataTable')
+        table_view.forceActiveFocus();QTest.keyClick(host.quick,Qt.Key_End)
+        QTest.keyClick(host.quick,Qt.Key_Return)
+        wait_for_rendered(lambda:panel.cycle_choice.currentData()==latest['start'])
         assert not host.qml_errors
     finally:dispose(host)
 

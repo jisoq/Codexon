@@ -134,6 +134,33 @@ def assessment(value, previous, cache=False, complete=True):
                   status='평소 범위 이탈' if abnormal else '평소 범위')
     return result
 
+def trend_selection_key(q):
+    selection=q.get('trend_selection')
+    if selection is None:return None
+    models=selection.get('models')
+    return (None if models is None else tuple(sorted(models)),tuple(sorted(selection.get('modes',()))))
+
+
+def trend_selected(row,selection):
+    models,modes=selection
+    model=row.get('model') or '미확인'
+    return (model not in ('미확인','codex-auto-review') and (models is None or model in models)
+            and (row.get('service_tier') or '미확인') in modes)
+
+
+def trend_range(q,bounds):
+    """Selected output speed owns the all-range; explicit windows keep their extent."""
+    now=q['now'];first,last=bounds
+    full=(now-1,now) if first is None else (first,max(last,first+1))
+    period=q.get('trend_period')
+    window=q.get('time_range')
+    if window is None and period in ('7d','30d'):
+        window=(now-{'7d':7,'30d':30}[period]*86400,now)
+    start,end=window or full
+    if end<=start:start,end=full
+    return start,end,full,first is None and window is None
+
+
 class PerformanceTrends:
     def __init__(self):
         self.signature=None;self.view=None
@@ -142,7 +169,8 @@ class PerformanceTrends:
         width=max(64,min(1024,int(q.get('plot_width',768))))
         unit=q.get('granularity','day')
         if unit not in ('auto','day','week','month'):unit='day'
-        key=(engine.revision,tuple(q.get('time_range') or ()),width,unit)
+        key=(engine.revision,tuple(q.get('time_range') or ()),width,unit,
+             trend_selection_key(q),q.get('trend_period'))
         now=q['now']
         if key!=self.signature or now>=self.deadline:
             self.build(engine,q,width,unit);self.signature=key
@@ -158,15 +186,25 @@ class PerformanceTrends:
         if context is None:
             rows=sorted((r for s in engine.sessions.values() for r in s['prepared']['history']
                          if r.get('purpose')!='maintenance' and (r.get('requested_model') or r.get('model'))!='codex-auto-review' and valid(r.get('ts'))),key=lambda r:r['ts'])
+            selection=trend_selection_key(q)
+            if selection is not None:
+                catalog=sorted({r.get('model') or '미확인' for r in rows})
+                rows=[r for r in rows if trend_selected(r,selection)]
+                speed=[r['ts'] for r in rows if valid(r.get('output_speed')) and valid(r.get('output'))
+                       and valid(r.get('completion_latency_ms')) and r['completion_latency_ms']>0]
+                start,end,full,empty=trend_range(q,(speed[0],speed[-1]) if speed else (None,None))
+                if empty:rows=[]
             first=rows[0]['ts'] if rows else now
-            full=(first,max(now,rows[-1]['ts'] if rows else now,first+1))
-            start,end=q.get('time_range') or full
-            if end<=start:start,end=full
+            if selection is None:
+                full=(first,max(now,rows[-1]['ts'] if rows else now,first+1))
+                start,end=q.get('time_range') or full
+                if end<=start:start,end=full
         else:
             rows=context['rows'];first=context['first'];full=context['full']
             start,end=context['start'],context['end']
         if granularity=='auto':
             self.build_rolling(rows,q,width,start,end,full,context)
+            if context is None and selection is not None:self.view['models']=catalog
             return
         rows=[r for r in rows if r['ts']<=end]
         edges=context['edges'] if context is not None else calendar_edges(min(first,start),end,granularity)
@@ -309,6 +347,7 @@ class PerformanceTrends:
         self.view=dict(panels=panels,start=start,end=end,full=full,granularity=granularity,
                        models=context['models'] if context is not None else sorted({r.get('model') or '미확인' for r in rows}),
                        calls=context['calls'] if context is not None else len(rows),valid_until=self.deadline)
+        if context is None and selection is not None:self.view['models']=catalog
 
     def build_rolling(self,history,q,width,start,end,full,context=None):
         """Project exact overlapping populations once in the worker, never in paint/hover."""

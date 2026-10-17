@@ -30,6 +30,70 @@ def test_long_line_partial_tail_truncation_and_same_path_replacement(tmp_path):
     assert reader.poll(42,1.3).thread_id==B
 
 
+def test_tracker_finishes_backlog_and_observes_appends_without_heartbeat(tmp_path,monkeypatch):
+    from types import SimpleNamespace
+    from PySide6.QtCore import QTimer
+    from cachemonitor import overlay_windows
+    app=QApplication.instance() or QApplication([])
+    root=tmp_path/'Codex'/'Logs'
+    path=logfile(root)
+    path.write_bytes(b'unrelated log entry\n'*100+route(A).encode())
+    monkeypatch.setenv('LOCALAPPDATA',str(tmp_path))
+    monkeypatch.setattr(RouteLog,'READ_LIMIT',256)
+    enumerated=[]
+    targets=[{'hwnd':1,'pid':42}]
+    native_changed=[];drop_on_read=[False];without_target=[False];continued_without_target=[]
+    monkeypatch.setattr(overlay_windows,'WindowsOverlay',lambda:SimpleNamespace(
+        targets=lambda:enumerated.append(1) or list(targets)))
+    monkeypatch.setattr(overlay_windows,'WindowEvents',lambda native,changed:
+        native_changed.append(changed) or SimpleNamespace(targets=set(),close=lambda:None))
+    read=RouteLog.poll
+    def read_then_close_window(self,*args):
+        result=read(self,*args)
+        if drop_on_read[0]:
+            drop_on_read[0]=False;targets.clear();native_changed[0]()
+        return result
+    monkeypatch.setattr(RouteLog,'poll',read_then_close_window)
+    observe=overlay_windows.observe_selection
+    def observe_targets(targets,*args):
+        without_target[0]=not targets
+        return observe(targets,*args)
+    monkeypatch.setattr(overlay_windows,'observe_selection',observe_targets)
+    class SlowHeartbeat(QTimer):
+        def start(self,interval):super().start(60000 if interval==500 else interval)
+        @staticmethod
+        def singleShot(interval,callback):
+            if without_target[0]:continued_without_target.append(1)
+            QTimer.singleShot(interval,callback)
+    monkeypatch.setattr(overlay_windows,'QTimer',SlowHeartbeat)
+    tracker=overlay_windows.SelectionTracker()
+    observed=[];tracker.observed.connect(observed.append)
+    def await_selected(sid):
+        deadline=time.monotonic()+3
+        while time.monotonic()<deadline:
+            app.processEvents()
+            if observed and observed[-1].get('selection')==Selection(sid,window_id='1',route='/local/'+sid):return
+            QTest.qWait(5)
+        assert observed and observed[-1].get('selection') and observed[-1]['selection'].thread_id==sid
+    tracker.start()
+    try:
+        await_selected(A)
+        assert len(enumerated)==1
+        with path.open('ab') as stream:stream.write(route(B).encode())
+        await_selected(B)
+        assert len(enumerated)==1
+        # Losing the unique window while catching up must not reschedule unread
+        # bytes forever: observe_selection no longer consumes that process's log.
+        drop_on_read[0]=True
+        with path.open('ab') as stream:stream.write(b'unrelated log entry\n'*100+route(A).encode())
+        deadline=time.monotonic()+3
+        while time.monotonic()<deadline and observed[-1].get('target') is not None:
+            app.processEvents();QTest.qWait(5)
+        assert observed[-1].get('target') is None
+        assert not continued_without_target
+    finally:tracker.stop()
+
+
 @pytest.mark.skipif(sys.platform!='win32',reason='Owned native Windows windows')
 def test_auto_fallback_restores_preference_anchor_and_clickthrough(tmp_path):
     from cachemonitor.overlay_windows import WindowsOverlay

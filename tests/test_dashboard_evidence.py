@@ -25,9 +25,12 @@ def sample():
 
 def dashboard(tmp_path):
     app=QApplication.instance() or QApplication([])
+    previous=app.property('cachemonitorDisableShellIntegration')
     app.setProperty('cachemonitorDisableShellIntegration',True)
-    return Dashboard([],start_worker=False,live_limits=False,
-        settings=QSettings(str(tmp_path/'settings.ini'),QSettings.IniFormat))
+    try:
+        return Dashboard([],start_worker=False,live_limits=False,
+            settings=QSettings(str(tmp_path/'settings.ini'),QSettings.IniFormat))
+    finally:app.setProperty('cachemonitorDisableShellIntegration',previous)
 
 
 def deliver_pending(window):

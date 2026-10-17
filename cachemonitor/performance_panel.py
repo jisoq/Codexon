@@ -512,7 +512,9 @@ class TimeNavigator(Node):
     @Slot(float,float)
     @Slot(float,float,bool)
     def commit(self,start,end,anchor_latest=False):
-        if anchor_latest:start,end=self.panel.full[1]-(end-start),self.panel.full[1]
+        if anchor_latest:
+            latest=self.panel.navigation_bounds()[1]
+            start,end=latest-(end-start),latest
         self.panel.set_window(start,end)
 
     @Slot(int)
@@ -527,7 +529,8 @@ class TimeNavigator(Node):
 class PerformancePanel(Group):
     def __init__(self,dashboard):
         super().__init__();self.dashboard=dashboard;self.range=(0,1);self.full=(0,1);self.time_range=None
-        self.follow_latest=True;self.window_span=None;self.period_preset='all';self._follow_revision=object();self.navigation_ready=False
+        self.follow_latest=True;self.window_span=7*86400;self.period_preset='7d';self._follow_revision=object();self.navigation_ready=False
+        self._query_now=None
         self.plots={};self.inspection_time=None;self.inspected=None;self.available=[];self.updating=False
         try:saved=json.loads(dashboard.settings.value('performance/selection','{}'))
         except (ValueError,TypeError):saved={}
@@ -675,6 +678,7 @@ class PerformancePanel(Group):
         previous=self.inspected;self.inspect(None)
         self.persist();self.sync_selection()
         self.refresh_plots();self.refresh_inspection(previous)
+        self.request()
     def toggle_picker(self):
         self.picker.setVisible(not self.picker.isVisible());self.search.setText('');self.search_models()
     def search_models(self,*_):
@@ -696,13 +700,24 @@ class PerformancePanel(Group):
         fmt='%Y.%m.%d %H:%M:%S' if end-start<86400 else '%Y.%m.%d %H:%M'
         label=datetime.fromtimestamp(start).strftime(fmt)+' — '+datetime.fromtimestamp(end).strftime(fmt)
         self.period.setText(Verbatim(label));self.period.setToolTip(Verbatim(label))
-        self.navigator.put(fullStart=float(self.full[0]),fullEnd=float(self.full[1]),start=float(start),end=float(end),
-            oldestLabel=datetime.fromtimestamp(self.full[0]).strftime('%Y.%m.%d'),latestLabel=datetime.fromtimestamp(self.full[1]).strftime('%Y.%m.%d'))
+        first,last=self.navigation_bounds()
+        self.navigator.put(fullStart=float(first),fullEnd=float(last),start=float(start),end=float(end),
+            oldestLabel=datetime.fromtimestamp(first).strftime('%Y.%m.%d'),latestLabel=datetime.fromtimestamp(last).strftime('%Y.%m.%d'))
+
+    def latest_time(self):
+        return getattr(self.dashboard,'snapshot',{}).get('ts',self._query_now if self._query_now is not None else self.range[1])
+
+    def navigation_bounds(self):
+        # Speed support determines All, but recent and frozen windows may extend beyond it.
+        start,end=self.time_range or self.range
+        return min(self.full[0],start),max(self.full[1],end,self.latest_time())
 
     def query_range(self,now,revision=None):
-        if self.time_range is not None and self.follow_latest and (revision is None or revision!=self._follow_revision):
-            self._follow_revision=revision;end=max(now,self.full[1]);span=self.window_span or self.time_range[1]-self.time_range[0]
-            self.time_range=[max(self.full[0],end-span),end]
+        self._query_now=now
+        if self.period_preset=='all':return None
+        if self.follow_latest and (self.time_range is None or revision is None or revision!=self._follow_revision):
+            self._follow_revision=revision;span=self.window_span or self.time_range[1]-self.time_range[0]
+            self.time_range=[now-span,now]
         return list(self.time_range) if self.time_range is not None else None
 
     def receive_collection_time(self,stamp):
@@ -711,19 +726,21 @@ class PerformancePanel(Group):
     def choose_period(self,preset):
         self.period_preset=preset;self.follow_latest=True;self.date_editor.hide();self._follow_revision=object()
         self.window_span={'7d':7*86400,'30d':30*86400}.get(preset)
-        self.time_range=[max(self.full[0],self.full[1]-self.window_span),self.full[1]] if self.window_span else None
+        now=self.latest_time()
+        self.time_range=[now-self.window_span,now] if self.window_span else None
         self.inspect(None);self.sync_navigation();self.request()
 
     def set_window(self,start,end,follow=None):
         if not isfinite(start) or not isfinite(end):return
-        start=max(self.full[0],min(self.full[1]-1,start));end=min(self.full[1],max(start+1,end))
+        first,last=self.navigation_bounds()
+        start=max(first,min(last-1,start));end=min(last,max(start+1,end))
         self.time_range=[start,end];self.window_span=end-start;self.period_preset=None
-        self.follow_latest=(abs(end-self.full[1])<.001) if follow is None else follow;self._follow_revision=object()
+        self.follow_latest=(abs(end-last)<.001) if follow is None else follow;self._follow_revision=object()
         self.inspect(None);self.sync_navigation();self.request()
 
     def toggle_follow(self):
         if self.follow_button.isChecked():self.move_latest();return
-        self.follow_latest=False
+        self.follow_latest=False;self.period_preset=None
         if self.time_range is None:self.time_range=list(self.range);self.window_span=self.range[1]-self.range[0]
         self.sync_navigation()
 
@@ -731,7 +748,7 @@ class PerformancePanel(Group):
         self.follow_latest=True;self._follow_revision=object()
         if self.time_range is not None:
             span=self.window_span or self.time_range[1]-self.time_range[0]
-            self.time_range=[max(self.full[0],self.full[1]-span),self.full[1]]
+            now=self.latest_time();self.time_range=[now-span,now]
         self.inspect(None);self.sync_navigation();self.request()
 
     def toggle_dates(self):
@@ -745,21 +762,24 @@ class PerformancePanel(Group):
         first,last=self.date_start.date(),self.date_end.date()
         if not first.isValid() or not last.isValid() or first>last:
             self.date_error.setText('종료일: 시작일 이후 날짜');return
-        minimum=QDate.fromString(datetime.fromtimestamp(self.full[0]).strftime('%Y-%m-%d'),Qt.ISODate)
-        maximum=QDate.fromString(datetime.fromtimestamp(self.full[1]).strftime('%Y-%m-%d'),Qt.ISODate)
+        earliest,latest=self.navigation_bounds()
+        minimum=QDate.fromString(datetime.fromtimestamp(earliest).strftime('%Y-%m-%d'),Qt.ISODate)
+        maximum=QDate.fromString(datetime.fromtimestamp(latest).strftime('%Y-%m-%d'),Qt.ISODate)
         if last<minimum or first>maximum:
             self.date_error.setText('선택 기간 기록 없음');return
-        start=self.full[0] if first<=minimum else datetime.combine(first.toPython(),datetime.min.time()).timestamp()
-        end=self.full[1] if last>=maximum else datetime.combine(last.addDays(1).toPython(),datetime.min.time()).timestamp()
+        start=earliest if first<=minimum else datetime.combine(first.toPython(),datetime.min.time()).timestamp()
+        end=latest if last>=maximum else datetime.combine(last.addDays(1).toPython(),datetime.min.time()).timestamp()
         self.date_editor.hide();self.set_window(start,end,follow=False)
 
     def reset(self):self.choose_period('all')
     def zoom(self,factor):
         a,z=self.range;center=self.inspection_time if self.inspection_time is not None else (a+z)/2
-        width=min(self.full[1]-self.full[0],max(1,(z-a)*factor));start=max(self.full[0],min(self.full[1]-width,center-width/2))
+        first,last=self.navigation_bounds()
+        width=min(last-first,max(1,(z-a)*factor));start=max(first,min(last-width,center-width/2))
         self.set_window(start,start+width)
     def pan(self,direction):
-        a,z=self.range;width=z-a;start=max(self.full[0],min(self.full[1]-width,a+direction*width*.2));self.set_window(start,start+width)
+        first,last=self.navigation_bounds()
+        a,z=self.range;width=z-a;start=max(first,min(last-width,a+direction*width*.2));self.set_window(start,start+width)
     def show_anomalies(self,cell,key):
         self.inspect(None);details=self.details;details.hint.hide();spec=self.specs[key]
         details.title.setText(tr(spec['title'])+' / '+tr('개별 이상치'))

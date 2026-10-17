@@ -6,7 +6,7 @@ from pathlib import Path
 import re
 import time
 
-from PySide6.QtCore import QThread, Signal, QTimer
+from PySide6.QtCore import QFileSystemWatcher, QThread, Signal, QTimer
 from .overlay_tracking import RouteLog
 
 
@@ -229,12 +229,17 @@ class SelectionTracker(QThread):
         previous = None
         dirty=True
         queued=False
-        def changed():
-            nonlocal dirty,queued
-            dirty=True
+        def queue_poll():
+            nonlocal queued
             if not queued:
                 queued=True;QTimer.singleShot(0,poll)
+        def changed():
+            nonlocal dirty
+            dirty=True
+            queue_poll()
         hooks=WindowEvents(native,changed)
+        watcher=QFileSystemWatcher()
+        watcher.fileChanged.connect(queue_poll)
         def poll():
             nonlocal next_targets,targets,previous,dirty,queued
             queued=False
@@ -248,7 +253,16 @@ class SelectionTracker(QThread):
                     hooks.targets={t['hwnd'] for t in targets}
                 result = observe_selection(targets, log, now)
             except (OSError, ValueError) as error:
+                log.pending_bytes=0
                 result = {'target': None, 'selection': None, 'issue': '화면 추적 오류: ' + str(error)}
+            wanted=str(log.path) if len(targets)==1 and log.path else None
+            watched=watcher.files()
+            obsolete=[path for path in watched if path!=wanted]
+            if obsolete:watcher.removePaths(obsolete)
+            if wanted and wanted not in watched:watcher.addPath(wanted)
+            # Finish a bounded backlog without imposing another heartbeat wait.
+            # A partial final line has no unread bytes and waits for a file event.
+            if len(targets)==1 and log.pending_bytes:queue_poll()
             # Heartbeats permit the UI to hide if this worker stalls or exits.
             if event_changed or result != previous or now - getattr(self, '_sent', 0) >= 1:
                 self.observed.emit(result); previous = result; self._sent = now
@@ -258,6 +272,7 @@ class SelectionTracker(QThread):
             if not self.isInterruptionRequested():self.exec()
         finally:
             timer.stop();hooks.close()
+            if watcher.files():watcher.removePaths(watcher.files())
 
     def stop(self):
         self.requestInterruption()

@@ -28,7 +28,7 @@ def configure_quota_layout(panel):
     actions.addWidget(panel.clear_cycle_button)
     actions.addWidget(panel.manage_button)
     panel.summary_context=Row();panel.summary_context.put(collapseBelow=600,columns=1)
-    panel.summary_note=Text('주기마다 한 점으로 표시합니다. 점을 누르면 해당 주기의 상세 차트를 엽니다.')
+    panel.summary_note=Text('주기마다 한 점으로 표시합니다. 점이나 표 행을 누르면 해당 주기의 상세 차트를 엽니다.')
     panel.summary_note.put(wrap=True,fontSize=13,color='muted')
     panel.summary_context.addWidget(panel.summary_note,1)
     legend_parent=panel.history_legend.parent()
@@ -63,17 +63,20 @@ def configure_quota_layout(panel):
     build_exclusion_dialog(panel)
     for node in (panel.summary_heading,panel.history_controls,panel.result,panel.cycle_value,panel.lifetime_basis,panel.cycle_basis,panel.conversion):
         detach(node)
-    summary=Row();summary.put(collapseBelow=980,columns=2);summary.setSpacing(12)
+    summary=Group();summary.put(background='secondary',radius=12)
+    summary_layout=Column(summary);summary_layout.setContentsMargins(0,0,0,0)
+    metrics_row=Row();metrics_row.put(collapseBelow=980,columns=2,dividers=True);metrics_row.setSpacing(0)
+    summary_layout.addWidget(metrics_row)
     panel.layout().insertWidget(0,summary)
     panel.summary=summary
     panel.summary_cards={};panel.summary_values={}
-    metrics=(('elapsed','실측 시간'),('usage','누적 사용량'),
-             ('cost','누적 가치'),('weekly','주간 할당량 가치'))
+    metrics=(('weekly','주간 할당량 가치'),('usage','누적 사용량'),
+             ('cost','누적 가치'),('elapsed','실측 시간'))
     for index,(key,title) in enumerate(metrics):
         if index%2==0:
-            pair=Row();pair.put(collapseBelow=1,columns=2);pair.setSpacing(12)
-            summary.addWidget(pair,1)
-        card=Group();card.put(background='secondary',radius=12)
+            pair=Row();pair.put(collapseBelow=1,columns=2,dividers=True);pair.setSpacing(0)
+            metrics_row.addWidget(pair,1)
+        card=Group()
         content=Column(card);content.setContentsMargins(20,20,20,20);content.setSpacing(12)
         label=Text(title);label.put(fontSize=16,color='muted',wrap=True)
         number=Text();number.put(fontSize=32,bold=True,color='ink',noElide=True,wrap=True,fitText=True)
@@ -87,7 +90,7 @@ def configure_quota_layout(panel):
         summary.setVisible(bool(lifetime['total'] or panel.report.get('exclusions')))
         palette=shared_theme().palette
         border=mix(palette['secondary'],palette['accent'],.35)
-        for card in panel.summary_cards.values():card.put(border='transparent' if panel.monitoring_paused else border)
+        summary.put(border='transparent' if panel.monitoring_paused else border)
         started=(panel.report.get('tracking') or {}).get('started')
         if started is None:
             started=(panel.report.get('view') or {}).get('tracking_started')
@@ -108,6 +111,7 @@ def configure_quota_layout(panel):
     labels=dict(remaining='남은 사용량',cycle_cost='누적 측정 환산액',
                 cycle_value='주간 예상 가치',reference='누적 예상 가치')
     def label_for(key):
+        if key=='reference':return '주간 할당량 가치'
         if panel.history.series.get('cycle_summary'):
             return dict(remaining='주기 소모량',cycle_cost='주기 환산액').get(key,labels[key])
         return labels[key]
@@ -118,7 +122,7 @@ def configure_quota_layout(panel):
             button.setText(formatted(pattern,label=tr(label_for(key)),value=values.get(key,'—')))
     panel.history.legendChanged.connect(legend_values)
     legend_values(panel.history.legend_values())
-    order=('cycle_value','remaining','cycle_cost')
+    order=('cycle_value','reference','remaining','cycle_cost')
     colors={'cycle_value':'accent','remaining':'written','cycle_cost':'output','reference':'accent'}
     for key,button in panel.legend_toggles.items():button.put(legendColor=colors[key])
     panel.legend_toggles['cycle_value'].setToolTip('선택 주기의 사용 기록으로 계산한 주간 예상 가치')

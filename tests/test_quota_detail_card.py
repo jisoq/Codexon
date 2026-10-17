@@ -273,7 +273,10 @@ def test_period_detail_keeps_completed_amounts_and_overview_uses_period_totals(t
             plot.activateAt(chart.x_at(index),chart.box.center().y());QTest.qWait(30)
             assert series['completed_costs'][index]==expected
             assert all(item['metric']!='completed_cost' for item in plot.detail['items'])
-            assert detail_value(plot.detail,'remaining').endswith('%p' if name=='all' else '%')
+            if name=='all':
+                assert [item['metric'] for item in plot.detail['items']]==['cycle_value']
+                assert detail_value(plot.detail,'cycle_value')=='$350.00'
+            else:assert detail_value(plot.detail,'remaining').endswith('%')
             assert host.grab().save(str(tmp_path/f'completed-{name}.png'))
         assert not host.qml_errors
     finally:dispose(host)

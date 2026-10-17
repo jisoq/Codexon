@@ -31,6 +31,7 @@ class RouteLog:
         self.inactive = set()
         self.next_discovery = 0
         self.caught_up = False
+        self.pending_bytes = 0
         self.partial = b''
         self.skipping = False
         self.identity = None
@@ -44,6 +45,7 @@ class RouteLog:
         self.states.clear(); self.inactive.clear()
         self.partial = b''; self.skipping = False
         self.identity = None; self.prefix = b''; self.caught_up = False
+        self.pending_bytes = 0
         self.modified = None
         self.rollover_seeded = False
 
@@ -83,6 +85,7 @@ class RouteLog:
                 elif fields.get('active') == 'true': self.inactive.discard(window)
 
     def poll(self, pid, now):
+        self.pending_bytes = 0
         if self.pid != pid:
             self.pid = pid; self.path = None; self.states.clear(); self.inactive.clear()
             self.offset = 0; self.next_discovery = 0; self.caught_up = False
@@ -120,6 +123,7 @@ class RouteLog:
             # Bound each read; no source-file size can stall the GUI or tracker indefinitely.
             data = file.read(self.READ_LIMIT)
         self.offset += len(data)
+        self.pending_bytes = max(0, size-self.offset)
         self.caught_up = False
         if self.skipping:
             end = data.find(b'\n')

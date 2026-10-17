@@ -886,7 +886,11 @@ class Dashboard(TrayWindow):
         if page==5:
             panel=self.performance_panel
             return dict(page=5,start=0,end=self.snapshot['ts']+.000001,now=self.snapshot['ts'],period='all',presentation=True,
-                        time_range=panel.query_range(self.snapshot['ts'],self.snapshot.get('data_revision',self.snapshot['ts'])),plot_width=max(64,min(1024,self.width()-96)),granularity=panel.granularity)
+                        time_range=panel.query_range(self.snapshot['ts'],self.snapshot.get('data_revision',self.snapshot['ts'])),
+                        trend_period=panel.period_preset,
+                        trend_selection=dict(models=sorted(m for m,enabled in panel.models.items() if enabled) if panel.models else None,
+                                             modes=sorted(m for m,enabled in panel.modes.items() if enabled)),
+                        plot_width=max(64,min(1024,self.width()-96)),granularity=panel.granularity)
         if page==1:return self.metric_panel.query()
         start,end=self.bounds()
         q=dict(page=page,include_whole_history=True,start=start,end=end,home=self.home.currentData(),project=self.project.currentData(),source=self.source.currentData(),

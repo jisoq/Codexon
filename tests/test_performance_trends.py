@@ -411,7 +411,7 @@ def test_short_navigator_selection_can_move_without_resizing(width):
     from cachemonitor.performance_panel import TimeNavigator
     from cachemonitor.quick_qa import mount,dispose,render_plot
     committed=[]
-    node=TimeNavigator(SimpleNamespace(full=(0,100),set_window=lambda a,z:committed.append((a,z))))
+    node=TimeNavigator(SimpleNamespace(navigation_bounds=lambda:(0,100),set_window=lambda a,z:committed.append((a,z))))
     node.put(fullStart=0.,fullEnd=100.,start=70.,end=85.)
     host=mount(node,width,40)
     try:
@@ -427,6 +427,38 @@ def test_short_navigator_selection_can_move_without_resizing(width):
         assert committed.pop()==pytest.approx((70,95))
         assert not host.qml_errors
     finally:dispose(host)
+
+
+def test_initial_trend_window_and_selected_extent_keep_recent_and_frozen_ranges(tmp_path):
+    from PySide6.QtCore import QSettings
+    from cachemonitor.performance_panel import PerformancePanel
+    day=86400;now=100*day;requests=[]
+    owner=SimpleNamespace(settings=QSettings(str(tmp_path/'initial-window.ini'),QSettings.IniFormat),snapshot={'ts':now})
+    ui=PerformancePanel(owner)
+    owner.render=lambda:requests.append((ui.period_preset,ui.query_range(owner.snapshot['ts'],1)))
+    assert ui.period_preset=='7d' and ui.query_range(now,1)==[now-7*day,now]
+    assert requests==[]
+    # The meaningful All extent is much older and narrower than the recent request.
+    first,last=now-40*day,now-39*day
+    data=PerformanceTrends().query(engine([row(i,ts=first+i) for i in range(12)]),
+                                  query(now=now,time_range=ui.time_range,granularity='auto'))
+    data['full']=(first,last);ui.apply(data)
+    assert ui.query_range(now,1)==[now-7*day,now]
+    assert ui.navigation_bounds()==(first,now)
+    ui.choose_period('30d')
+    assert requests==[('30d',[now-30*day,now])]
+    ui.choose_period('all')
+    assert requests[-1]==('all',None)
+    ui.apply(dict(data,start=first,end=last))
+    assert ui.range==(first,last) and ui.time_range is None and ui.query_range(now,1) is None
+    ui.choose_period('7d');ui.apply(data)
+    ui.set_window(now-6*day,now-5*day,follow=False)
+    frozen=list(ui.time_range)
+    ui.apply(dict(data,start=frozen[0],end=frozen[1],full=(now-day,now)))
+    assert ui.query_range(now+day,2)==frozen
+    before=len(requests);ui.choose_mode('Fast')
+    assert len(requests)==before+1 and requests[-1]==(None,frozen)
+    assert ui.time_range==frozen
 
 
 @pytest.mark.integration
@@ -447,6 +479,7 @@ def test_time_navigator_presets_live_updates_and_date_ranges(tmp_path):
         ui.apply(projector.query(source,query(now=now,plot_width=900,time_range=ui.query_range(now,source.revision))))
     owner.render=refresh;refresh();host=mount(ui,1440,940)
     try:
+        assert ui.period_preset=='7d' and ui.range==pytest.approx((now-7*day,now))
         # The navigator stays visible when the graph viewport scrolls at either width.
         from cachemonitor.presentation import Scroll
         ancestor=ui.navigator
@@ -557,6 +590,7 @@ def test_dashboard_tab_worker_contract_and_navigation(tmp_path):
         assert w.engine.page_query(w.query())['performance']['granularity']=='auto'
         w.show()
         wait_for_rendered(lambda:w.pages.isPageReady(4) and w.pages.isVisible(),timeout=5)
+        # Exercise one cold request per preset, then its cached reuse.
         w.async_mode=True;w.client_cache.clear()
         def loading_panels():
             return [item for item in walk(w.quick.quickWindow().contentItem())
@@ -569,6 +603,9 @@ def test_dashboard_tab_worker_contract_and_navigation(tmp_path):
             value=w.engine.page_query(w.pending_query)
             saved[period]=value
             w.analysis_ready(dict(id=w.request_id,logical=w.pending_logical,result=value,valid_until=w.snapshot['ts']+60))
+            w.performance_panel.choose_period(period)
+            assert not w.analysis_pending
+            assert w.performance_panel.range==(value['performance']['start'],value['performance']['end'])
         w.snapshot={**w.snapshot,'ts':w.snapshot['ts']+1}
         w.performance_panel.choose_period('7d')
         assert not w.analysis_pending

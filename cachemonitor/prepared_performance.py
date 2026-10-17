@@ -9,6 +9,7 @@ from collections import defaultdict
 from heapq import heappush, heapreplace
 
 from .analytics import effort_key
+from .performance_trends import trend_range, trend_selected, trend_selection_key
 from .prepared_store import METRICS, CapacityExceeded, NotReady, _restore_scalar, _size, unpack
 
 
@@ -46,12 +47,25 @@ def _sort_charge(keys):
 
 
 class _Input:
-    def __init__(self, engine):
+    def __init__(self, engine, selection=None):
         self.engine, self.snapshot = engine, engine.snapshot
         if self.snapshot is None:
             raise NotReady('performance reads require the visible pinned generation')
         self.limit = self.snapshot.limits.page_objects_bytes
         self.retained = 0
+        self.selection_args = {}
+        self.selection_where = '1'
+        if selection is not None:
+            models,modes=selection
+            clauses=["COALESCE(NULLIF(r.m_model,''),'미확인') NOT IN ('미확인','codex-auto-review')"]
+            for name,values in (('model',models),('service_tier',modes)):
+                if values is None:continue
+                keys=[]
+                for index,value in enumerate(values):
+                    key=f'selected_{name}_{index}';keys.append(':'+key);self.selection_args[key]=value
+                clauses.append(f'r.m_{name} IN ('+','.join(keys)+')' if keys else '0')
+            self.selection_where=' AND '.join(clauses)
+            self._admit(_size((self.selection_where,self.selection_args)))
         self.owners, self.rank = {}, {}
         self.stats = dict(selected_rows=0, predecessor_rows=0, bucket_rows=0,
                           metadata_groups=0, sql_statements=0, body_decodes=0)
@@ -84,7 +98,7 @@ class _Input:
         if self.retained > self.limit:
             raise CapacityExceeded('performance metadata and predecessor budget exceeded')
 
-    def sql(self, columns, where='1', *, index='calls_global_time', tail=''):
+    def sql(self, columns, where='1', *, index='calls_global_time', tail='', selected=True):
         return (f'SELECT {columns} FROM calls r INDEXED BY {index} '
                 'JOIN publications p ON p.id=r.batch '
                 'JOIN owner_heads h ON h.owner=r.owner '
@@ -92,41 +106,50 @@ class _Input:
                 f'WHERE r.deleted=0 AND v.deleted=0 AND {self.snapshot._visible("calls")} '
                 f'AND {_valid("ts")} AND r.m_purpose IS NOT \'maintenance\' '
                 "AND COALESCE(NULLIF(r.m_requested_model,''),r.m_model,'')<>'codex-auto-review' "
-                f'{self.excluded} AND ({where}) {tail}')
+                f'{self.excluded} AND ({self.selection_where if selected else "1"}) AND ({where}) {tail}')
 
     def cursor(self, *args, **kwargs):
         self.stats['sql_statements'] += 1
-        return self.snapshot._cursor(self.sql(*args, **kwargs), self.args)
+        return self.snapshot._cursor(self.sql(*args, **kwargs), dict(self.selection_args,**self.args))
 
-    def bounds(self):
+    def bounds(self, *, speed=False):
         self.args = {}
         result = []
         for order in ('ASC', 'DESC'):
-            with self.cursor('r.m_ts', tail=f'ORDER BY r.m_ts {order} LIMIT 1') as cursor:
+            where=(f'{_valid("output_speed")} AND {_valid("output")} AND '
+                   f'{_valid("completion_latency_ms")} AND r.m_completion_latency_ms>0') if speed else '1'
+            with self.cursor('r.m_ts', where, tail=f'ORDER BY r.m_ts {order} LIMIT 1') as cursor:
                 row = cursor.fetchone()
                 result.append(row[0] if row else None)
         return result
 
-    def metadata(self, end, *, sort_start, sort_keys):
+    def metadata(self, end, *, sort_start, sort_keys, global_catalog=False):
         self.args = dict(start=sort_start, end=end)
         columns = ','.join('r.m_' + name for name in DIMENSIONS)
         tags = ','.join(_tag(name) + ' AS t' + str(i) for i, name in enumerate(DIMENSIONS))
         grouped = columns + ',' + ','.join(_tag(name) for name in DIMENSIONS)
         scopes, count = defaultdict(list), 0
-        charge = 'COALESCE(SUM(CASE WHEN r.m_ts>=:start THEN ' + _sort_charge(sort_keys) + ' ELSE 0 END),0)'
+        self.catalog=set()
+        charge = ('COALESCE(SUM(CASE WHEN r.m_ts>=:start AND r.m_ts<=:end AND (' +
+                  self.selection_where + ') THEN ' + _sort_charge(sort_keys) + ' ELSE 0 END),0)')
+        count_sql='SUM(CASE WHEN r.m_ts<=:end AND ('+self.selection_where+') THEN 1 ELSE 0 END)'
         size = 0
-        with self.cursor(columns + ',' + tags + ',COUNT(*) AS n,' + charge + ' AS sort_bytes', 'r.m_ts<=:end',
+        with self.cursor(columns + ',' + tags + ',' + count_sql + ' AS n,' + charge + ' AS sort_bytes',
+                         '1' if global_catalog else 'r.m_ts<=:end', selected=False,
                          tail='GROUP BY ' + grouped) as cursor:
             for row in cursor:
                 raw = tuple(row['m_' + name] for name in DIMENSIONS)
                 types = tuple(row['t' + str(i)][0] for i in range(3))
                 labels = tuple(_label(_restore_scalar(tag, value)) for tag, value in zip(types, raw))
+                if global_catalog and labels[0] not in self.catalog:
+                    self.catalog.add(labels[0]);self._admit(_size(labels[0])+64)
+                self.stats['metadata_groups'] += 1
+                if global_catalog and not row['n']:continue
                 value = (raw, types)
                 scopes[labels].append(value)
                 self._admit(_size((labels, value)))
                 count += row['n']
                 size += row['sort_bytes']
-                self.stats['metadata_groups'] += 1
         # Metadata already visits these exact scalar rows. Reuse its byte sum
         # for the main window; narrower predecessor queries keep their own guard.
         self.sort_admission = (sort_start, end, sort_keys, size)
@@ -182,7 +205,7 @@ class _Input:
         sql = sql.replace('JOIN publications p ', 'JOIN ordering ON ordering.owner=r.owner JOIN publications p ', 1)
         sql = 'WITH ordering(owner,rank) AS MATERIALIZED (VALUES ' + self.ordering + ') ' + sql
         self.stats['sql_statements'] += 1
-        with self.snapshot._cursor(sql, self.args) as cursor:
+        with self.snapshot._cursor(sql, dict(self.selection_args,**self.args)) as cursor:
             for raw in cursor:
                 self.snapshot._check()
                 row = {name:_value(raw, name) for name in FIELDS if raw['types'][POSITIONS[name]]}
@@ -260,15 +283,27 @@ class _Input:
 
 def performance_input(engine, q, width, granularity):
     """Finish an exact chart from one pinned scalar stream and bounded state."""
-    source = _Input(engine)
-    first, last = source.bounds()
+    selection=trend_selection_key(q)
+    source = _Input(engine,selection)
+    first, last = source.bounds(speed=selection is not None)
     now = q['now']
-    first = now if first is None else first
-    full = (first, max(now, now if last is None else last, first + 1))
-    start, end = q.get('time_range') or full
-    if end <= start:
-        start, end = full
-    scopes, calls = source.metadata(end, sort_start=start, sort_keys=granularity != 'auto')
+    if selection is None:
+        first = now if first is None else first
+        full = (first, max(now, now if last is None else last, first + 1))
+        start, end = q.get('time_range') or full
+        if end <= start:start, end = full
+    else:
+        start,end,full,empty=trend_range(q,(first,last))
+        if empty:source.selection_where='0'
+        # Calendar causal context still begins at the first selected call.
+        if granularity!='auto':first,_=source.bounds()
+        first=now if first is None else first
+    scopes, calls = source.metadata(end, sort_start=start, sort_keys=granularity != 'auto',
+                                   global_catalog=selection is not None)
+    catalog=sorted(source.catalog)
+    if selection is not None:
+        scopes={scope:variants for scope,variants in scopes.items()
+                if trend_selected(dict(zip(DIMENSIONS,scope)),selection)}
     progress=getattr(engine,'progress',None)
     if progress:progress('aggregate')
     if granularity == 'auto':
@@ -277,5 +312,6 @@ def performance_input(engine, q, width, granularity):
     else:
         from .prepared_calendar import calendar
         view = calendar(source, q, width, start, end, first, full, scopes, calls, granularity)
+    if selection is not None:view['models']=catalog
     engine.read_metrics.update(('trend_' + key, value) for key, value in source.stats.items())
     return dict(prepared_view=view)

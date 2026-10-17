@@ -2685,5 +2685,11 @@
   "전체 이력을 계산하고 있습니다. 현재 주기는 계속 확인할 수 있습니다.": "Calculating the full history. You can continue viewing the current cycle.",
   "선택한 조건의 사용량을 계산하고 있습니다.": "Calculating usage for the selected filters.",
   "차트를 계산하지 못했습니다.": "Could not calculate the chart.",
-  "다른 탭을 이용할 수 있습니다.": "You can use other tabs."
+  "다른 탭을 이용할 수 있습니다.": "You can use other tabs.",
+  "주기별 실측 시간과 소모량 및 환산액 / Enter로 상세 열기": "Measured time, consumption, and estimated value by cycle / Press Enter for details",
+  "첫 실측부터 마지막 실측까지의 경과 시간입니다. 수집 공백을 포함합니다.": "Elapsed time from the first to the last measurement, including collection gaps.",
+  "해당 주기에서 관측한 할당량 소모율입니다.": "Observed allowance consumption during this cycle.",
+  "확인된 비용의 소계": "Known cost subtotal",
+  "해당 주기에 측정한 구독 가치 환산액입니다.": "Subscription value measured during this cycle.",
+  "주기마다 한 점으로 표시합니다. 점이나 표 행을 누르면 해당 주기의 상세 차트를 엽니다.": "Each point represents one cycle. Click a point or table row to open that cycle's detailed chart."
 }

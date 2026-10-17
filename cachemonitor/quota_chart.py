@@ -44,6 +44,8 @@ def monitoring_palette(paused=False):
 
 class QuotaHistory(Plot):
     cycle_activated=Signal(float)
+    cycle_hovered=Signal(int)
+    cycle_hover_reset=Signal()
     gap_selected=Signal(str)
     range_selected=Signal(float,float)
     repaintRequested=Signal()
@@ -53,6 +55,7 @@ class QuotaHistory(Plot):
         self.setFixedHeight(440)
         self.empty_text='수집된 잔여량이 없습니다'
         self.hidden_series=set()
+        self.linked_index=-1
         self.monitoring_paused=False
         self.money=False;self.reference=None;self.series=prepare_series([])
         self.put(quotaDetail=True)
@@ -75,7 +78,9 @@ class QuotaHistory(Plot):
         self._cache_key=None;self.update()
 
     def visible(self,key):
-        if key=='reference':return self.visible('cycle_value') and key not in self.hidden_series
+        if key=='reference':
+            return (self.money and key not in self.hidden_series if self.series.get('cycle_summary')
+                    else self.visible('cycle_value'))
         return key not in self.hidden_series and (key=='remaining' or self.money)
 
     def set_series(self,series):
@@ -92,9 +97,10 @@ class QuotaHistory(Plot):
             self._cache_key=(self._cache_key[0],id(series),*self._cache_key[2:])
             self.gap_lefts.series=series;self.gap_rights.series=series
             return
+        self.linked_index=-1;self.cycle_hover_reset.emit()
         self.series=series;self.rows=series['rows'];self.cursor=min(self.cursor,max(0,len(self.rows)-1))
         share=series.get('model_share')
-        self.setFixedHeight((630 if self.money else 300)+(100 if share else 0))
+        self.setFixedHeight((300 if series.get('cycle_summary') else 630 if self.money else 300)+(100 if share else 0))
         shared_theme().register_models([name for name,mode in share['models']] if share else [])
         self._cache_key=None;self._selection_anchor=None;self.exclusion_selection=None
         self.legendChanged.emit(self.legend_values());self.update()
@@ -128,6 +134,7 @@ class QuotaHistory(Plot):
         return self.series['completed_costs'][index] if key=='completed_cost' else self.rows[index].get(key)
 
     def metric_definitions(self):
+        if self.series.get('cycle_summary'):return [('cycle_value','accent','주간 예상 가치','USD / 100%p')]
         return [('cycle_value','accent','주간 예상 가치','USD / 100%p'),
                 ('remaining','written','주기 소모량' if self.series.get('cycle_summary') else '남은 사용량',
                  '%p' if self.series.get('cycle_summary') else '%'),
@@ -435,10 +442,20 @@ class QuotaHistory(Plot):
 
     def tip_at(self,x,y):
         if not self.geometry_ready():return ''
+        if self.series.get('cycle_summary'):
+            index=self.index_at(x,y)
+            self.cycle_hovered.emit(index if index is not None else -1)
         gap=self.gap_at(x,y)
         if gap is not None:return self.gap_label(gap)
         index=self.index_at(x,y)
         return ', '.join([self.detail_for(index)['title']]+[item['label']+' '+item['value'] for item in self.detail_for(index)['items']]) if index is not None and self.hidden_series else observation_label(self.rows[index],self.money) if index is not None else ''
+
+    def clear_hover(self):self.cycle_hovered.emit(-1)
+
+    def set_linked_cycle(self,index):
+        index=index if self.series.get('cycle_summary') and 0<=index<len(self.rows) else -1
+        if index==self.linked_index:return
+        self.linked_index=index;self.repaintRequested.emit()
 
     def detail_at(self,x,y):
         if not self.geometry_ready():return {}
@@ -530,6 +547,11 @@ class QuotaHistory(Plot):
         p=self._painter;palette=shared_theme().palette
         p.setRenderHint(QPainter.Antialiasing);p.setRenderHint(QPainter.TextAntialiasing)
         font=self.font();font.setPixelSize(14);p.setFont(font)
+        if self.series.get('cycle_summary') and 0<=self.linked_index<len(self.rows):
+            point=self.point(self.linked_index,'cycle_value')
+            if point is not None and self.visible('cycle_value'):
+                halo=QColor(palette['accent']);halo.setAlpha(28)
+                p.setPen(Qt.NoPen);p.setBrush(halo);p.drawEllipse(point,9,9)
         if self.exclusion_selection is not None:
             start,end=self.exclusion_selection;x=self.x_at_time(start);right=self.x_at_time(end)
             shade=QColor(palette['accent']);shade.setAlpha(28)
@@ -561,8 +583,10 @@ class QuotaHistory(Plot):
         summary=self.series.get('cycle_summary',False)
         inspected=summary and self.inspection_x is not None and self.inspection_at is not None
         index=max(0,min(bisect_right(self.series['times'],self.inspection_at)-1,len(self.rows)-1)) if inspected else len(self.rows)-1
-        return {key:tr('집계 제외') if self.rows[index].get('user_excluded') and (key!='remaining' or summary) and (key!='cycle_value' or summary)
+        values={key:tr('집계 제외') if self.rows[index].get('user_excluded') and (key!='remaining' or summary) and (key!='cycle_value' or summary)
                 else self.metric_text(key,self.reference if key=='cycle_value' and not summary else self.value_at(index,key)) for key,_,_,_ in self.metric_definitions()}
+        if summary:values['reference']=self.metric_text('reference',self.reference)
+        return values
 
     def geometry_ready(self):
         return self._cache_key is not None and self._cache_key[1]==id(self.series)
