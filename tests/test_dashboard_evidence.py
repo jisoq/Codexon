@@ -161,11 +161,15 @@ def test_tab_loading_keeps_controls_and_ignores_stale_result(tmp_path,language):
         texts=[item.property('text') for item in walk(progress) if item.property('text')]
         assert any(('Loading' if language=='en' else '불러오는 중') in text for text in texts)
         if language=='en':assert not any('\uac00'<=char<='\ud7a3' for text in texts for char in text)
-        first=window.quick.grabFramebuffer()
-        wait_for_rendered(lambda:window.quick.grabFramebuffer()!=first,timeout=3)
+        fill=next(item for item in walk(progress) if item.objectName()=='loading-completed')
+        assert fill.width()==0
+        window.analysis_progressed(dict(id=old_id,stage='query'))
+        wait_for_rendered(lambda:fill.width()>0)
+        reading_width=fill.width()
         assert window.quick.grabFramebuffer().save(str(tmp_path/f'partial-loading-{language}.png'))
         assert window.request_id==old_id
         window.analysis_progressed(dict(id=old_id,stage='aggregate'))
+        wait_for_rendered(lambda:fill.width()>reading_width)
         assert window.analysis_stage=='aggregate'
         window.show_analysis_slow()
         assert window.analysis_stage=='aggregate' and window.analysis_loading['slow']
@@ -207,7 +211,7 @@ def test_tab_loading_keeps_controls_and_ignores_stale_result(tmp_path,language):
             assert window.pages.isVisible() and not window.analysis_loading
             window.show_analysis_pending();window.show_analysis_slow()
             wait_for_rendered(lambda:window.pages.isPageReady(page-1),timeout=5)
-            assert not window.analysis_loading and not window.pending_label.isVisible()
+            assert not window.analysis_loading and not window.refresh_status.isVisible()
         assert not window.qml_errors
     finally:window.quit_app();set_language('ko')
 
@@ -245,9 +249,8 @@ def test_refresh_preserves_only_matching_results_and_failure_can_retry(tmp_path)
         period=next(item for item in walk(usage) if item.objectName()=='usage-period')
         assert chart.isVisible() and period.isVisible() and period.isEnabled()
         previous_id=window.request_id
-        size=window.metric_panel.options['size']
-        window.metric_panel.change('size',str(2 if size>2 else 3))
-        assert window.request_id>previous_id and window.pending_query['usage']['size']!=size
+        window.resize(window.width()+50,window.height()+50)
+        assert window.request_id==previous_id
         assert window.pending_retained and window.pages.isVisible()
         window.analysis_failed('synthetic failure')
         assert window.pages.isVisible() and window.error_button.isVisible()
@@ -276,6 +279,35 @@ def test_refresh_preserves_only_matching_results_and_failure_can_retry(tmp_path)
         window.receive(dict(sample(),epoch='replacement-worker'))
         assert window.analysis_pending and not window.pending_retained
         assert window.pages.isVisible() and not window.analysis_loading['retained']
+        assert not window.qml_errors
+    finally:window.quit_app()
+
+
+def test_refresh_indicator_does_not_cover_existing_chart(tmp_path):
+    from PySide6.QtCore import QPointF
+    from cachemonitor.quick_qa import control,walk
+    from test_ui import wait_for_rendered
+    window=dashboard(tmp_path)
+    try:
+        window.receive(sample());window.resize(1000,680);window.show();window.change_page(5)
+        wait_for_rendered(lambda:window.pages.isPageReady(4))
+        chart=control(window,window.performance_panel.chart_scroll)
+        window.quick.grabFramebuffer()
+        position=chart.mapToScene(QPointF(0,0));size=chart.size()
+        window.async_mode=True;window.client_cache.clear();window.render()
+        assert window.pending_retained
+        def indicators():
+            return [item for item in walk(window.quick.rootObject()) if item.isVisible()
+                    and item.objectName() in ('analysis-region-loading','analysis-refresh-status')]
+        wait_for_rendered(lambda:bool(indicators()))
+        assert len(indicators())==1
+        progress=indicators()[0]
+        assert window.quick.grabFramebuffer().save(str(tmp_path/'refresh-layout.png'))
+        assert chart.isVisible() and chart.isEnabled()
+        assert progress.mapToScene(QPointF(0,progress.height())).y()<chart.mapToScene(QPointF(0,0)).y()
+        assert chart.mapToScene(QPointF(0,0))==position and chart.size()==size
+        deliver_pending(window)
+        wait_for_rendered(lambda:not indicators())
         assert not window.qml_errors
     finally:window.quit_app()
 

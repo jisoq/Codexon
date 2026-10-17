@@ -13,7 +13,7 @@ Item {
     property var s: node ? node.state : ({})
     Loader {
         anchors.fill: parent
-        active: view.s.kind !== "usageDashboard" && !!view.s.analysisLoading && !!view.s.analysisLoading.active && view.s.analysisLoading.indicator !== false
+        active: view.analysisMasked && view.s.analysisLoading.indicator !== false
         sourceComponent: Component { AnalysisLoading { status: view.s.analysisLoading || ({}) } }
     }
     property var buttonText: undefined
@@ -49,6 +49,7 @@ Item {
         case "text": return textComponent
         case "textarea": return textAreaComponent
         case "progress": return loadingProgressComponent
+        case "statusIcon": return statusIconComponent
         case "button": return s.metricReset ? metricResetComponent : buttonComponent
         case "toggle": return toggleComponent
         case "switch": return switchComponent
@@ -72,6 +73,18 @@ Item {
         }
     }
     Component { id: loadingProgressComponent; UiLoading { node: view.node } }
+    Component {
+        id: statusIconComponent
+        Item {
+            implicitWidth: 28; implicitHeight: 28
+            Accessible.role: Accessible.StaticText
+            Accessible.name: view.s.accessible
+            Accessible.description: view.s.tooltip
+            UiIcon { name: view.s.iconName; anchors.centerIn: parent; width: 18; height: 18; ink: appTheme.color("accent") }
+            HoverHandler { id: statusHover }
+            UiToolTip { visible: statusHover.hovered; text: view.s.tooltip }
+        }
+    }
     Component { id: usageDashboardComponent; UsageDashboard { node: view.node } }
     Component { id: spacerComponent; Item {} }
     Component { id: historyFiltersComponent; HistoryFilters { node: view.node } }

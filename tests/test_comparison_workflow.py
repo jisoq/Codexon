@@ -147,6 +147,43 @@ def test_comparison_detail_home_back_and_refresh_preserve_context(dashboard):
     assert not w.qml_errors
 
 
+def test_virtual_comparison_scroll_reuses_aggregate_without_viewport_queries(dashboard,monkeypatch,tmp_path):
+    w=dashboard;w.tick.stop();w.resize(1000,680);w.change_page(1);p=w.metric_panel
+    source=snapshot();template=source['sessions'][0]['history'][0]
+    source['sessions'][0]['history']=[dict(template,key=f'virtual-{i}',model=f'model-{i//8:02}',
+        configured_model=f'model-{i//8:02}',requested_model=f'model-{i//8:02}',
+        effort=f'effort-{i%8}',ts=source['ts']-5) for i in range(160)]
+    source['sessions']=source['sessions'][:1]
+    w.receive(source);p.change('dimension','model');p.change('breakdown:effort','true')
+    usage=control(w,p)
+    view=next(item for item in walk(usage) if item.objectName()=='usage-rows')
+    wait_for_rendered(lambda:view.property('count')==160)
+    assert len(p.data['rows'])==160
+    def rendered_rows():return [item for item in walk(view) if item.objectName().startswith('usage-row-')]
+    wait_for_rendered(lambda:0<len(rendered_rows())<160)
+    assert [row['group'] for row in p.data['rows']]==sorted(row['group'] for row in p.data['rows'])
+    first=p.data['rows'][0]['key'];last=p.data['rows'][-1]['key']
+    calls=w.request_id;projection=w.engine._category_projection
+    with monkeypatch.context() as guarded:
+        guarded.setattr(w,'render',lambda *args,**kwargs:pytest.fail('Scrolling or resizing must not request analysis'))
+        guarded.setattr(w.engine,'query',lambda *args,**kwargs:pytest.fail('Scrolling must not aggregate records'))
+        view.positionViewAtEnd()
+        wait_for_rendered(lambda:any(item.objectName()=='usage-row-'+last for item in rendered_rows()))
+        assert len(rendered_rows())<30
+        old_height=view.height();w.resize(1000,900)
+        wait_for_rendered(lambda:view.height()>old_height)
+        assert w.request_id==calls and w.engine._category_projection is projection
+        assert len(rendered_rows())<40 and len(p.row_model.cache)<=128 and p.row_model.cache_bytes<=4*1024*1024
+        position=view.property('contentY');cached=dict(p.row_model.cache)
+        p.apply(copy.deepcopy(p.data))
+        assert view.property('contentY')==position and p.row_model.cache==cached
+        assert p.row_model.rows is p.data['rows']
+        assert w.quick.grabFramebuffer().save(str(tmp_path/'virtual-comparison.png'))
+        view.positionViewAtBeginning()
+        wait_for_rendered(lambda:any(item.objectName()=='usage-row-'+first for item in rendered_rows()))
+    assert not w.qml_errors
+
+
 def test_metric_modes_and_saved_scope_restore_after_monitoring(dashboard):
     w=dashboard;w.change_page(1);p=w.metric_panel
     p.change('period','7d');p.change('metric','tps');p.change('dimension','model');p.change('sort','name')
@@ -164,25 +201,18 @@ def test_model_breakdowns_combine_and_drill_down_in_compact_window(dashboard):
     control(w,p)
     def rendered(name):
         return next(item for item in walk(w.quick.rootObject()) if item.objectName()==name and item.isVisible())
-    wait_for_rendered(lambda:p.data.get('dimension')=='model' and bool(p.state['rows']))
+    wait_for_rendered(lambda:p.data.get('dimension')=='model' and p.row_model.rowCount()>0)
     assert [entry['value'] for entry in p.state['dimensions']]==['project','model','source']
     for field in ('service_tier','effort'):
         click(w,rendered('usage-breakdown-'+field))
         wait_for_rendered(lambda:field in p.data.get('breakdowns',[]))
     assert p.options['breakdowns']==['service_tier','effort']
     assert p.data['count']==18 and p.data['summary']['value']==216
-    def rows_fit():
-        items=[rendered('usage-row-'+row['key']) for row in p.state['rows']]
-        return all(item.mapToScene(QPointF(0,item.height())).y()<w.quick.height() for item in items)
-    wait_for_rendered(rows_fit)
     def chart_settled():
-        chart=rendered('usage-chart')
-        resize_timer=chart.findChild(QObject,'usage-resize')
-        capacity=max(2,min(12,int((chart.height()-36)//54)))
-        return resize_timer is not None and not resize_timer.property('running') and p.options['size']==capacity
+        return rendered('usage-rows').property('count')==p.data['count']
     wait_for_rendered(chart_settled)
     row=p.data['rows'][0];scope=p.capture()
-    assert p.state['rows'][0]['groupStart']
+    assert p.format_row(0)['groupStart']
     click(w,rendered('usage-row-'+row['key']))
     wait_for_rendered(lambda:p.data.get('dimension')=='source')
     assert all(p.options['filters'][k]==v for k,v in row['filters'].items())

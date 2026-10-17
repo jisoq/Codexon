@@ -114,29 +114,32 @@ Item {
             id: chart
             objectName:'usage-chart'
             Layout.fillWidth:true;Layout.fillHeight:true;Layout.minimumHeight:148
-            readonly property bool canResize: visible && !root.s.queryPending && !root.masked
-            onHeightChanged:if(canResize)resize.restart()
-            onCanResizeChanged:if(canResize)resize.restart();else resize.stop()
-            Timer {id:resize;objectName:'usage-resize';interval:100;onTriggered:if(chart.canResize)root.node.change('size',String(Math.floor((chart.height-36)/54)))}
-            Column {
+            Item {
                 objectName:'usage-chart-content'
                 visible:!root.masked;enabled:!root.masked
-                anchors.left:parent.left;anchors.right:parent.right;anchors.top:parent.top;spacing:0
+                anchors.fill:parent
                 RowLayout {
+                    id: chartHeader
                     width:parent.width;height:34;spacing:16
                     Copy {text:root.t('항목');Layout.preferredWidth:root.splitModels?180:150;font.pixelSize:12;color:appTheme.palette.muted}
                     RowLayout {Layout.fillWidth:true;Copy{text:'0';font.pixelSize:12;color:appTheme.palette.muted}Item{Layout.fillWidth:true}Copy{text:root.s.middle||'';font.pixelSize:12;color:appTheme.palette.muted}Item{Layout.fillWidth:true}Copy{text:root.s.upper||'';font.pixelSize:12;color:appTheme.palette.muted}}
                     Copy {text:root.o.metric==='tps'?root.t('평균 tok/s'):root.s.metricLabel||'';Layout.preferredWidth:110;font.pixelSize:12;horizontalAlignment:Text.AlignRight;color:appTheme.palette.muted;tip:root.o.metric==='tps'?root.s.tpsTip:''}
-                    Copy {text:root.o.metric==='tps'?root.t('유효 호출 / 전체'):root.s.shareLabel||'';Layout.preferredWidth:90;font.pixelSize:12;horizontalAlignment:Text.AlignRight;color:appTheme.palette.muted;tip:root.t('해당 항목의 값 ÷ 선택 범위 전체 값입니다. 검색과 페이지 이동은 분모를 바꾸지 않습니다.')}
+                    Copy {text:root.o.metric==='tps'?root.t('유효 호출 / 전체'):root.s.shareLabel||'';Layout.preferredWidth:90;font.pixelSize:12;horizontalAlignment:Text.AlignRight;color:appTheme.palette.muted;tip:root.t('해당 항목의 값 ÷ 선택 범위 전체 값입니다. 검색과 스크롤은 분모를 바꾸지 않습니다.')}
                     Item {Layout.preferredWidth:20}
                 }
-                Rectangle {width:parent.width;height:1;color:appTheme.palette.border}
-                Repeater {
-                    model:root.s.rows
-                    Column {
+                Rectangle {anchors.top:chartHeader.bottom;width:parent.width;height:1;color:appTheme.palette.border}
+                ListView {
+                    id: rowsView
+                    objectName:'usage-rows'
+                    anchors.fill:parent;anchors.topMargin:35
+                    model:root.node.rowModel
+                    clip:true;reuseItems:true;cacheBuffer:108
+                    boundsBehavior:Flickable.StopAtBounds
+                    ScrollBar.vertical:UiScrollBar {}
+                    delegate: Column {
                         id:groupLine
                         required property var modelData
-                        width:parent.width
+                        width:ListView.view.width
                         Copy {visible:groupLine.modelData.groupStart;width:parent.width;height:28;text:groupLine.modelData.group;font.pixelSize:13;font.bold:true;elide:Text.ElideRight;wrapMode:Text.NoWrap;tip:groupLine.modelData.group}
                         AbstractButton {
                             id: line
@@ -168,16 +171,13 @@ Item {
                         }
                     }
                 }
-                Copy {visible:root.s.rows.length===0;width:parent.width;height:100;text:root.t('조건에 맞는 기록 없음');horizontalAlignment:Text.AlignHCenter;color:appTheme.palette.muted}
+                Copy {visible:rowsView.count===0;anchors.top:chartHeader.bottom;width:parent.width;height:100;text:root.t('조건에 맞는 기록 없음');horizontalAlignment:Text.AlignHCenter;color:appTheme.palette.muted}
             }
-            Loader { anchors.fill:parent;active:!!root.loading.active;sourceComponent:Component { AnalysisLoading { status:root.loading } } }
+            Loader { anchors.fill:parent;active:root.masked;sourceComponent:Component { AnalysisLoading { status:root.loading } } }
         }
         RowLayout {
             Layout.fillWidth:true
             Copy {text:root.masked?'':root.s.countLabel;Layout.fillWidth:true;font.pixelSize:12;color:appTheme.palette.muted}
-            UiButton {text:root.t('이전');enabled:!root.masked && !!root.s.previous;onClicked:root.node.change('page','-1')}
-            Copy {text:root.masked?'':root.s.pageLabel;font.pixelSize:12;color:appTheme.palette.muted}
-            UiButton {text:root.t('다음');enabled:!root.masked && !!root.s.next;onClicked:root.node.change('page','1')}
         }
     }
 }

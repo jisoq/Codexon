@@ -579,8 +579,8 @@ def test_dashboard_tab_worker_contract_and_navigation(tmp_path):
         w.performance_panel.choose_period('30d')
         assert w.analysis_pending and w.pending_retained and w.pages.isVisible()
         assert w.performance_panel.range==(saved['30d']['performance']['start'],saved['30d']['performance']['end'])
-        wait_for_rendered(lambda:bool(loading_panels()))
-        assert len(loading_panels())==1
+        wait_for_rendered(lambda:scene_view(w,w.refresh_status).isVisible())
+        assert not loading_panels()
         assert not scene_view(w,w.performance_panel.inspector).property('analysisMasked')
         w.snapshot={**w.snapshot,'data_revision':1}
         w.performance_panel.choose_period('7d')
@@ -588,6 +588,7 @@ def test_dashboard_tab_worker_contract_and_navigation(tmp_path):
         assert w.analysis_loading['active'] and not w.analysis_loading['retained']
         w.show_analysis_slow()
         wait_for_rendered(lambda:scene_view(w,w.performance_panel.inspector).property('analysisMasked'))
+        assert not scene_view(w,w.refresh_status).isVisible()
         assert len(loading_panels())==1
         assert scene_view(w,w.performance_panel.chart_scroll).property('analysisMasked')
         assert not scene_view(w,w.performance_panel.inspector).property('item').isVisible()

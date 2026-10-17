@@ -7,20 +7,19 @@ Item {
     required property var node
     property var s: node.state
     property bool compact: !!s.compact
-    property bool minimal: !!s.minimal
+    readonly property int completedStages: Math.max(0, Math.min(stages.length, s.stage || 0))
     property var stages: ["기록 준비", "기록 조회", "지표 계산", "화면 준비"]
     implicitWidth: compact ? 500 : 660
     implicitHeight: body.implicitHeight
     Accessible.role: Accessible.ProgressBar
     Accessible.name: appLanguage.text(s.title || "불러오는 중") + ": " + appLanguage.text(s.detail || "")
-    Accessible.description: appLanguage.text("완료 시간은 아직 알 수 없습니다.")
+    Accessible.description: appLanguage.text(root.stages[Math.min(root.completedStages, root.stages.length-1)])
     ColumnLayout {
         id: body
         width: root.compact ? parent.width : Math.min(parent.width, 660)
         anchors.horizontalCenter: parent.horizontalCenter
-        spacing: root.minimal ? 0 : root.compact ? 8 : 20
+        spacing: root.compact ? 8 : 20
         RowLayout {
-            visible: !root.minimal
             Layout.fillWidth: true
             spacing: 12
             Text {
@@ -35,7 +34,6 @@ Item {
             }
         }
         Text {
-            visible: !root.minimal
             text: appLanguage.text(root.s.detail || "")
             font.family: appTheme.family
             font.pixelSize: 14
@@ -46,23 +44,18 @@ Item {
         }
         Rectangle {
             id: track
+            objectName: "loading-track"
             Layout.fillWidth: true
             Layout.preferredHeight: 3
             color: appTheme.palette && appTheme.color("border")
             radius: 1.5
             clip: true
             Rectangle {
-                id: runner
-                width: track.width * 0.24
+                objectName: "loading-completed"
+                width: track.width * root.completedStages / root.stages.length
                 height: track.height
-                radius: 1.5
+                radius: track.radius
                 color: appTheme.palette && appTheme.color("accent")
-                NumberAnimation on x {
-                    from: -runner.width; to: track.width
-                    duration: 1450
-                    loops: Animation.Infinite
-                    running: root.visible && root.s.running !== false
-                }
             }
         }
         GridLayout {

@@ -40,6 +40,7 @@ class QuotaPanel(Group):
     exclusion_restore_requested=Signal(str)
     cycle_clear_requested=Signal(object)
     fault_changed=Signal(dict)
+    refresh_changed=Signal(bool)
 
     def __init__(self,settings):
         super().__init__()
@@ -58,6 +59,7 @@ class QuotaPanel(Group):
         self.expected_home=None
         self._query_worker=None
         self._query_cache={}
+        self._refreshing=set()
         self._query_pending=None
         self._prepared_query=None
         self._chart_pending=None
@@ -346,7 +348,7 @@ class QuotaPanel(Group):
                     and self._chart_value[0][2]==selection and self.history.rows
                     and getattr(self,'_selected_cycle',None)==selection)
                 loading=self._query_worker is not None and self._chart_pending==key
-                self._set_loading(self.history_loading,loading,'선택한 주기의 차트를 준비하고 있습니다.')
+                self._set_loading(self.history_loading,loading,'선택한 주기의 차트를 준비하고 있습니다.',retained=retained)
                 self.history.setVisible(retained);self.history_legend.setVisible(retained)
                 self.model_legend.setVisible(retained and not all_cycles)
                 self.history_empty.setVisible(not loading and not retained)
@@ -430,10 +432,13 @@ class QuotaPanel(Group):
         self._query_cache[key]=value
         while len(self._query_cache)>8:self._query_cache.pop(next(iter(self._query_cache)))
 
-    @staticmethod
-    def _set_loading(node, active, detail=None):
-        node.put(running=active,**({'detail':detail} if detail is not None else {}))
-        node.setVisible(active)
+    def _set_loading(self,node,active,detail=None,*,retained=False):
+        before=bool(self._refreshing)
+        if active and retained:self._refreshing.add(node)
+        else:self._refreshing.discard(node)
+        node.put(running=active,stage=2 if active else 4,**({'detail':detail} if detail is not None else {}))
+        node.setVisible(active and not retained)
+        if before!=bool(self._refreshing):self.refresh_changed.emit(bool(self._refreshing))
 
     def _bind_worker(self):
         worker=self.report.get('_worker')
@@ -550,7 +555,9 @@ class QuotaPanel(Group):
         prepared=self._view.get('summaries',{})
         query=self._prepared_statistics() if 'worker_revision' in self.report else None
         if 'worker_revision' in self.report and query is None:
-            self._set_loading(self.query_loading,self._query_pending==self._query_key())
+            key=self._query_key()
+            retained=bool(self._prepared_query and self._prepared_query[0][0]==key[0] and self._prepared_query[0][2:]==key[2:])
+            self._set_loading(self.query_loading,self._query_pending==key,retained=retained)
             return
         summary=self.statistics=(query['statistics'] if query is not None else
                                  prepared[days] if days in prepared and self.period_end is None and

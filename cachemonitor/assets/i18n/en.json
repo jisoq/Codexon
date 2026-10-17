@@ -2594,7 +2594,7 @@
   "캐시 읽기를 포함한 입력 토큰 합계입니다. 부분값을 다시 더하지 않습니다.": "Total input tokens include cache reads. Do not add the subset again.",
   "추론을 포함한 출력 토큰 합계입니다. 부분값을 다시 더하지 않습니다.": "Total output tokens include reasoning. Do not add the subset again.",
   "각 호출의 출력 토큰을 전체 응답시간(초)으로 나눈 값의 산술평균입니다. 출력에는 추론이, 시간에는 대기와 통신이 포함됩니다. 유효한 완료 호출만 동일 가중으로 평균합니다.": "Arithmetic mean of output tokens divided by full response seconds for each valid completed call. Includes reasoning, waiting and communication. Each call has equal weight.",
-  "해당 항목의 값 ÷ 선택 범위 전체 값입니다. 검색과 페이지 이동은 분모를 바꾸지 않습니다.": "Item value divided by the selected population total. Search and pagination do not change the denominator.",
+  "해당 항목의 값 ÷ 선택 범위 전체 값입니다. 검색과 스크롤은 분모를 바꾸지 않습니다.": "Item value divided by the selected population total. Search and scrolling do not change the denominator.",
   "정렬 기준": "Sort order",
   "프로젝트 목록": "Projects",
   "조회 조건 닫기": "Close filters",

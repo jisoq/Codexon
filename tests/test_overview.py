@@ -57,19 +57,19 @@ def test_completed_request_trend_uses_completion_time_and_missing_means_gap():
     assert view['timeline'][1]['calls']==0  # requests complete independently of call timestamps
 
 
-def test_category_projection_preserves_denominators_history_and_bounded_pages(monkeypatch):
+def test_category_projection_preserves_denominators_history_and_reuses_aggregates(monkeypatch):
     from cachemonitor.analysis_engine import AnalysisEngine
     engine=AnalysisEngine();source=session_view();engine.ingest([source])
     now=ts('2026-02-03T00:00:00')
     q=dict(page=1,start=0,end=now,now=now,period='all',category_usage=True,presentation=True,
-           include_whole_history=False,usage=dict(dimension='model',metric='calls',size=2))
+           include_whole_history=False,usage=dict(dimension='model',metric='calls'))
     view=engine.page_query(q)['usage']
     assert view['summary']['value']==3 and sum(r['value'] for r in view['rows'])==3
     assert all(sum(c['value'] for c in r['components'])==r['value'] for r in view['rows'])
     original=engine.call_ranges
-    monkeypatch.setattr(engine,'call_ranges',lambda q:pytest.fail('Pagination/search must reuse the aggregate projection'))
-    filtered=engine.page_query({**q,'usage':{**q['usage'],'search':'unknown','page':100}})['usage']
-    assert filtered['summary']['value']==3 and filtered['count']==1 and filtered['page']==0
+    monkeypatch.setattr(engine,'call_ranges',lambda q:pytest.fail('Search must reuse the aggregate projection'))
+    filtered=engine.page_query({**q,'usage':{**q['usage'],'search':'unknown'}})['usage']
+    assert filtered['summary']['value']==3 and filtered['count']==1
     source=dict(source,collection_complete=False);engine.ingest([source])
     refreshed=engine.page_query({**q,'now':now+2,'end':now+2,'loading':True})['usage']
     assert refreshed['summary']==view['summary'] and refreshed['rows']==view['rows']
@@ -117,7 +117,7 @@ def test_model_breakdowns_partition_calls_preserve_scope_and_reuse_projection(mo
         source['history'].append(row)
     engine=AnalysisEngine();engine.ingest([source]);now=ts('2026-02-03T00:00:00')
     q=dict(page=1,start=0,end=now,now=now,period='all',category_usage=True,presentation=True,
-           include_whole_history=False,usage=dict(dimension='model',metric='calls',size=12))
+           include_whole_history=False,usage=dict(dimension='model',metric='calls'))
     for fields,count in (([],2),(['service_tier'],4),(['effort'],4),(['service_tier','effort'],5)):
         view=engine.page_query({**q,'usage':{**q['usage'],'breakdowns':fields}})['usage']
         assert view['count']==count and view['summary']['value']==7
@@ -125,14 +125,12 @@ def test_model_breakdowns_partition_calls_preserve_scope_and_reuse_projection(mo
         assert all(set(row['filters'])=={'model',*fields} for row in view['rows'])
     unknown=next(row for row in view['rows'] if row['filters'].get('service_tier')=='미확인')
     assert unknown['filters']['effort']=='미확인' and unknown['value']==1
-    combined={**q,'usage':{**q['usage'],'breakdowns':['effort','service_tier'],'size':2}}
+    combined={**q,'usage':{**q['usage'],'breakdowns':['effort','service_tier']}}
     original=engine.query
-    monkeypatch.setattr(engine,'query',lambda q:pytest.fail('Paging and search must reuse the same split projection'))
-    first=engine.page_query(combined)['usage'];leaves=[]
-    for page in range(first['page_count']):
-        part=engine.page_query({**combined,'usage':{**combined['usage'],'page':page}})['usage']
-        leaves.extend(part['rows'])
-        assert len(part['rows'])<=2 and part['maximum']==first['maximum']
+    monkeypatch.setattr(engine,'query',lambda q:pytest.fail('Search and sorting must reuse the same split projection'))
+    first=engine.page_query(combined)['usage'];leaves=first['rows']
+    sorted_view=engine.page_query({**combined,'usage':{**combined['usage'],'sort':'name'}})['usage']
+    assert len(sorted_view['rows'])==5 and sorted_view['maximum']==first['maximum']
     assert len({row['key'] for row in leaves})==5
     assert [row['group'] for row in leaves]==['gpt-6-astra']*4+['gpt-5.6-sol']
     searched=engine.page_query({**combined,'usage':{**combined['usage'],'search':'Fast'}})['usage']
@@ -145,7 +143,7 @@ def test_model_breakdowns_partition_calls_preserve_scope_and_reuse_projection(mo
     assert detail['detail']['first']==template['ts'] and detail['detail']['last']==template['ts']+2
     missing=engine.page_query({**q,**unknown['filters']})['usage']
     assert missing['summary']['value']==1
-    speeds=engine.page_query({**combined,'usage':{**combined['usage'],'metric':'tps','size':12}})['usage']
+    speeds=engine.page_query({**combined,'usage':{**combined['usage'],'metric':'tps'}})['usage']
     high=next(row for row in speeds['rows'] if row['filters']==selected['filters'])
     assert high['value']==15 and high['known']==2 and high['total']==3
     assert high['group_value']==30 and speeds['summary']['value']==40

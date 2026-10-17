@@ -192,7 +192,7 @@ class SettingsPage(Group):
     def show_page(self,index):
         self.stack.setCurrentIndex(index)
         waiting=not self.stack.isPageReady(index)
-        self.page_loading.put(running=waiting);self.page_loading.setVisible(waiting)
+        self.page_loading.put(running=waiting,stage=3 if waiting else 4);self.page_loading.setVisible(waiting)
         self.stack.setVisible(not waiting)
 
     def page_ready(self,index):

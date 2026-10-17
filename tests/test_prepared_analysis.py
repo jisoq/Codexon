@@ -519,7 +519,7 @@ def test_category_projection_preserves_filtered_totals_without_decoding_call_bod
     dependency = {name:1 for name in storage.DEPENDENCIES}
     dependency['source_digest'] = '1'*64
     query = dict(page=1, start=100, end=110, now=110, period='custom', model='gpt-6-astra',
-        category_usage=True, presentation=True, usage=dict(dimension='project', metric='cost', size=8))
+        category_usage=True, presentation=True, usage=dict(dimension='project', metric='cost'))
     with storage.PreparedStore(tmp_path/'category.sqlite') as store:
         stage = store.begin(('category', 1))
         for ordinal, source in enumerate(sources):
@@ -537,7 +537,7 @@ def test_category_projection_preserves_filtered_totals_without_decoding_call_bod
             assert actual == project(reference, query)
             reads = engine.read_metrics['category_projection_rows']
             with engine.read_scope():
-                project(engine, {**query, 'usage':{**query['usage'], 'sort':'name', 'size':1}})
+                project(engine, {**query, 'usage':{**query['usage'], 'sort':'name'}})
             assert engine.read_metrics['category_projection_rows'] == reads
             boundary_reads = []
             boundaries = engine.boundary_times
@@ -548,7 +548,7 @@ def test_category_projection_preserves_filtered_totals_without_decoding_call_bod
             query = dict(query, period='all')
             assert engine.page_query(query) == reference.page_query(query)
             assert boundary_reads == [query['end']]
-            engine.page_query({**query, 'usage':{**query['usage'], 'sort':'name', 'size':1}})
+            engine.page_query({**query, 'usage':{**query['usage'], 'sort':'name'}})
             assert boundary_reads == [query['end']]
         finally:
             engine.close()

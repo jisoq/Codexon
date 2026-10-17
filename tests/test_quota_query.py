@@ -129,6 +129,7 @@ def test_selected_graph_rejects_old_choice_and_reuses_matching_refresh(tmp_path)
     engine=QuotaComputation();worker=QueryWorker()
     compact=engine._prepare(sample_report())
     panel=QuotaPanel(QSettings(str(tmp_path/'charts.ini'),QSettings.IniFormat))
+    refreshes=[];panel.refresh_changed.connect(refreshes.append)
     panel.receive(dict(report={**compact,'_worker':worker}))
     assert panel.history.rows[-1]['at']==280
     assert panel.manage_button.isVisible()
@@ -156,8 +157,10 @@ def test_selected_graph_rejects_old_choice_and_reuses_matching_refresh(tmp_path)
     panel.receive(dict(report={**refreshed,'_worker':worker}))
     request=worker.requests[-1]
     assert panel.history.isVisible() and panel.history.rows is rows
-    assert panel.history_loading.isVisible() and not panel.history_empty.isVisible()
+    assert not panel.history_loading.isVisible() and not panel.history_empty.isVisible()
+    assert refreshes[-1] is True
     worker.result.emit(dict(kind='chart',key=request['key'],error='unavailable'))
     assert not panel.history_loading.isVisible() and not panel.history_loading._state['running']
     assert panel.history.isVisible() and panel.history.rows is rows
+    assert refreshes[-1] is False
     app.processEvents()

@@ -117,20 +117,8 @@ def project(engine, q):
         visible.sort(key=lambda r:(r['group'].casefold(),r['label'].casefold()) if order=='name' else (rank(r['group_value']),r['group'],rank(r['value']),r['label']))
     else:
         visible.sort(key=lambda r:str(r['label']).casefold() if order=='name' else rank(r['value']))
-    size=max(2,min(12,int(options.get('size',8))))
-    # A model heading takes 28 pixels in addition to each 54-pixel data row.
-    # Pack a bounded page and repeat the heading when a model continues on it.
-    offsets=[0];height=0;previous=None
-    for index,row in enumerate(visible):
-        extra=28 if breakdowns and row['group']!=previous else 0
-        if height and height+54+extra>size*54:
-            offsets.append(index);height=0;extra=28 if breakdowns else 0
-        height+=54+extra;previous=row['group']
-    page=max(0,min(int(options.get('page',0)),len(offsets)-1))
-    start=offsets[page];end=offsets[page+1] if page+1<len(offsets) else len(visible)
-    # Only one page and at most six composition segments per item cross the worker wire.
+    # Deliver aggregate rows once; scrolling stays in the virtual presentation model.
     population=dict(query=scope,path=['analysis','responses'])
-    return dict(common,valid_until=cached[2],usage={**{k:v for k,v in data.items() if k not in ('categories','common')},'rows':visible[start:end],
-                              'count':len(visible),'page':page,'size':size,'maximum':max([r['value'] or 0 for r in categories]+[0]),
-                              'page_count':len(offsets),'start_index':start,'end_index':end,
+    return dict(common,valid_until=cached[2],usage={**{k:v for k,v in data.items() if k not in ('categories','common')},'rows':visible,
+                              'count':len(visible),'maximum':max([r['value'] or 0 for r in categories]+[0]),
                               'population':population})

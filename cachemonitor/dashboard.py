@@ -198,7 +198,9 @@ class Dashboard(TrayWindow):
         self.path_label=label('','muted');self.path_label.put(noElide=False);self.navigation_row.addWidget(self.path_label,1)
         self.history_path=Breadcrumbs();self.history_path.activated.connect(self.activate_history_path);self.navigation_row.addWidget(self.history_path,1)
         self.heading=label(TITLES[self.current_page],'heading');header.addWidget(self.heading);header.addStretch()
-        self.pending_label=label('','muted');self.pending_label.setFixedHeight(36);self.pending_label.setMaximumWidth(280);header.addWidget(self.pending_label)
+        self.refresh_status=Group();self.refresh_status.put(kind='statusIcon',iconName='restart')
+        self.refresh_status.setObjectName('analysis-refresh-status');self.refresh_status.setFixedSize(28,28)
+        self.refresh_status.setAccessibleName('최신 기록 반영 중');self.refresh_status.hide();header.addWidget(self.refresh_status)
         self.retry_button=Button('다시 시도');self.retry_button.clicked.connect(self.retry_analysis);self.retry_button.hide();header.addWidget(self.retry_button)
         self.price_button=Button('API 가격표');self.price_button.put(role='quiet');self.price_button.clicked.connect(self.show_prices);header.addWidget(self.price_button);layout.addLayout(header)
         self.common_filters=Row();self.common_filters.put(flow=True,spacing=8)
@@ -219,11 +221,12 @@ class Dashboard(TrayWindow):
             field=labeled_control(title,node);self.common_fields[node]=field;self.common_filters.addWidget(field)
         self.scope_note=label('수집 중','muted');self.scope_note.put(fontSize=12);self.scope_note.setFixedHeight(18);layout.addWidget(self.scope_note)
         self.pages=Stack();self.pages.put(deferPages=True);layout.addWidget(self.pages,1);self.scrollers={}
-        self.analysis_loading={};self._loading_nodes=[]
+        self.analysis_loading={};self._loading_nodes=[];self._quota_refreshing=False
         self.build_compare();self.build_explorer()
         from .quota_panel import QuotaPanel
         self.quota_panel=QuotaPanel(self.settings);quota_scroll=Scroll();quota_scroll.put(fillViewport=True)
         self.quota_panel.centralized_errors=True
+        self.quota_panel.refresh_changed.connect(self.update_refresh_status)
         self.quota_panel.fault_changed.connect(lambda facts:self.observe_error('quota.query','quota',facts,
             healthy=bool(facts.get('query_healthy')),resolution='사용 한도 분석 결과 갱신 확인'))
         quota_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff);quota_scroll.setWidget(self.quota_panel);self.pages.addWidget(quota_scroll)
@@ -979,14 +982,12 @@ class Dashboard(TrayWindow):
         ignored={'now','loading','table_windows','plot_width'}
         if query['period']!='custom':ignored.update(('start','end'))
         identity={k:v for k,v in query.items() if k not in ignored}
-        if query.get('category_usage'):
-            identity['usage']={k:v for k,v in query['usage'].items() if k!='size'}
         if query['page']==5 and self.performance_panel.follow_latest:
             identity['time_range']=('latest',self.performance_panel.window_span)
         return json.dumps(identity,sort_keys=True)
 
     def clear_analysis_loading(self):
-        self.slow_timer.stop();self.pending_label.hide();self.retry_button.hide()
+        self.slow_timer.stop();self.refresh_status.hide();self.retry_button.hide()
         self.set_analysis_loading({})
         self.metric_panel.put(queryPending=False)
         self.pages.show();self.scope_note.hide()
@@ -997,7 +998,8 @@ class Dashboard(TrayWindow):
             return [(self.performance_panel.chart_scroll,True),(self.performance_panel.inspector,False),
                     (self.performance_panel.window_note,False)]
         if self.current_page==2:
-            return [(node,True) for node in (self.session_parent_table,self.history_table_stack,self.history_chart,self.detail_scroll)]+[
+            current=self.record_current.isVisible()
+            return [(self.session_parent_table,False),(self.history_display_stack,current),(self.detail_scroll,not current)]+[
                 (node,False) for node in (self.session_scope,self.record_message,self.history_summary,self.history_inspector,self.record_detail_title,self.residual_details.body)]
         return []
 
@@ -1007,7 +1009,18 @@ class Dashboard(TrayWindow):
         for node in self._loading_nodes:
             if node not in nodes:node.put(analysisLoading={})
         self._loading_nodes=nodes;self.analysis_loading=state
+        self.update_refresh_status()
         for node,indicator in regions:node.put(analysisLoading=dict(state,indicator=indicator))
+
+    def update_refresh_status(self,quota_refreshing=None):
+        if quota_refreshing is not None:self._quota_refreshing=quota_refreshing
+        state=self.analysis_loading
+        refreshing=self._quota_refreshing if self.current_page==3 else bool(state.get('active') and state.get('retained'))
+        self.refresh_status.setVisible(refreshing)
+        if refreshing:
+            detail=(tr('선택한 조건의 사용량을 계산하고 있습니다.') if self.current_page==3 else
+                    tr('기록 처리에 시간이 걸리고 있습니다. 다른 탭을 이용할 수 있습니다.') if state.get('slow') else state.get('detail',''))
+            self.refresh_status.setToolTip('\n'.join(filter(None,(tr('최신 기록 반영 중'),detail))))
 
     def begin_analysis_loading(self,query):
         self.clear_analysis_loading()
@@ -1025,7 +1038,8 @@ class Dashboard(TrayWindow):
                 'present':'화면의 구성 요소를 준비하고 있습니다.'}
         self.analysis_stage=stage
         if self.analysis_loading:
-            self.set_analysis_loading(dict(self.analysis_loading,detail=tr(stages.get(stage,stages['queued']))))
+            self.set_analysis_loading(dict(self.analysis_loading,stage=list(stages).index(stage) if stage in stages else 0,
+                                           detail=tr(stages.get(stage,stages['queued']))))
 
     def analysis_progressed(self,message):
         if message.get('id')==self.request_id and self.analysis_pending:
@@ -1041,6 +1055,7 @@ class Dashboard(TrayWindow):
             # Normal automatic collection is an enabled state, not a user wait.
             if self.pending_automatic:return
             self.set_analysis_loading(dict(active=True,retained=True,running=True,title=tr('최신 기록 반영 중'),detail=''))
+            self.set_analysis_stage(self.analysis_stage)
         else:
             self.show_analysis_message(formatted('{page} 불러오는 중',page=tr(TITLES[self.current_page])),
                                       '')
