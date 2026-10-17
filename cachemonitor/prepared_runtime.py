@@ -1,8 +1,8 @@
 """Prepared analysis writer and independent, bounded query delivery.
 
 The process connection belongs to the dispatcher. The writer owns collection,
-ledger and prepared-store connections; the reader actor owns its own read-only
-connections. Neither may send on the GUI connection from a background thread.
+ledger and prepared-store connections; the page and detail actors own separate
+read-only connections. None may send on the GUI connection from a background thread.
 """
 from multiprocessing import Pipe
 from multiprocessing.connection import wait
@@ -19,7 +19,7 @@ from .analysis_query_actor import QueryActor
 from .prepared_ingest import ModeEvidenceUnavailable,PreparedCohort, read_catalog
 from .prepared_ledger import PreparedLedger
 from .prepared_query import GenerationJournal,PreparedQuery, token_value, tuple_token
-from .prepared_store import Limits,PreparedStore,WriteDeferred
+from .prepared_store import Limits,PreparedStore,WriteDeferred,ReadCancelled
 from .quota_cycles import QuotaLedger
 from .usage_collection import CollectionClient, CollectionCatalogUnavailable
 
@@ -405,6 +405,7 @@ class PreparedWriter:
                     elif notice is None:next_poll=min(next_poll,time.monotonic()+3)
                     notification=collector.notification_connection(catalog['publication']) if notice is False else None
         except Exception as error:
+            if isinstance(error,(InterruptedError,ReadCancelled)) and self.stopped.is_set():return
             from .quota_diagnostics import record_failure
             record_failure(Path(self.arguments[3]).with_suffix('.analysis.sqlite'), 'prepared writer', error)
             self.output.put(dict(kind='fatal',error=traceback.format_exc(limit=6)))
@@ -436,18 +437,19 @@ def process_main(connection,homes,index_path,model_evidence_path,quota_path,cach
             from .quota_diagnostics import record_failure
             record_failure(Path(quota_path).with_suffix('.analysis.sqlite'), 'prepared query startup', error)
             raise
-    try:actor=QueryActor(query_reader)
-    except BaseException:
-        writer.close()
-        raise
+    actor=detail_actor=None
     current=None
     pending={}
     latest_query=None
     blocked_query_token=None
     journal=GenerationJournal()
     try:
+        actor=QueryActor(query_reader)
+        # Detail handlers open only a selected read scope. They do not create a
+        # page engine or duplicate its caches, and cannot cancel a long chart.
+        detail_actor=QueryActor(query_reader)
         while True:
-            ready=wait([connection,writer.output.receiver,actor.notification])
+            ready=wait([connection,writer.output.receiver,actor.notification,detail_actor.notification])
             if connection in ready:
                 while connection.poll():
                     message=connection.recv();kind=message['kind']
@@ -467,8 +469,9 @@ def process_main(connection,homes,index_path,model_evidence_path,quota_path,cach
                 current=token_value(message.pop('token'))
                 journal.add(message.pop('transition'))
                 connection.send(message)
-            if actor.notification in ready:
-                for message in actor.drain():
+            for completed_actor in (actor,detail_actor):
+                if completed_actor.notification not in ready:continue
+                for message in completed_actor.drain():
                     if message['kind']=='stale' and message['consumer']=='query':
                         if latest_query and latest_query['id']==message['id']:
                             pending['query']=latest_query
@@ -482,8 +485,13 @@ def process_main(connection,homes,index_path,model_evidence_path,quota_path,cach
                     requested=(message.get('prepared_token') if kind=='record' else
                                message['summary'].get('_prepared_token') if kind=='overlay_detail' else None)
                     token=token_value(requested) if requested is not None else current
-                    actor.submit(dict(message,_prepared_changes=journal.values()),token)
+                    consumer=detail_actor if kind in ('record','overlay_detail') else actor
+                    consumer.submit(dict(message,_prepared_changes=journal.values()),token)
                     pending.pop(kind,None)
     finally:
-        try:actor.close()
-        finally:writer.close()
+        try:
+            if detail_actor is not None:detail_actor.close()
+        finally:
+            try:
+                if actor is not None:actor.close()
+            finally:writer.close()

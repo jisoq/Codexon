@@ -119,6 +119,7 @@ class Window:
     def __init__(self, budget, check):
         self.budget, self.check = budget, check
         self.blocks = deque()
+        self.tail_size = 0
 
     def append(self, row, scope):
         # Reserve a complete block's possible capacity growth before mutation.
@@ -128,11 +129,13 @@ class Window:
         amount = 0
         try:
             if not self.blocks or len(self.blocks[-1].owners) >= 256:
-                block = Block();self.blocks.append(block);amount += block.size() + 16
+                block = Block();self.blocks.append(block)
+                self.tail_size = block.size();amount += self.tail_size + 16
             block = self.blocks[-1]
-            before = block.size()
+            before = self.tail_size
             block.append(row, scope)
-            amount += block.size() - before
+            self.tail_size = block.size()
+            amount += self.tail_size - before
         finally:
             self.budget.add(amount - reserve)
 
@@ -186,24 +189,26 @@ class Group:
                 self.budget.add(_size(metric) + _size([0, 0, None, None]) + 96)
                 self.stats[metric] = [0, 0, None, None]
             stats = self.stats[metric]
-            before = _size(stats)
+            # These fixed-length scalar lists do not change capacity. Charge
+            # only their cells' exact size changes, including arbitrary integers.
+            before = sum(map(getsizeof, stats))
             stats[1] += 1
             if _eligible(row, field):
                 value = row[field]
                 stats[0] += 1
                 if stats[2] is None or value < stats[2]:stats[2] = value
                 if stats[3] is None or value > stats[3]:stats[3] = value
-            self.budget.add(_size(stats) - before)
+            self.budget.add(sum(map(getsizeof, stats)) - before)
         owner = row['_owner']
         if owner not in self.sessions:
             self.budget.add(_size(owner) + _size([0, 0, 0]) + 96)
             self.sessions[owner] = [0, 0, 0]
         totals = self.sessions[owner]
-        before = _size(totals)
+        before = sum(map(getsizeof, totals))
         if (valid(row.get('input')) and valid(row.get('cached')) and
                 row['cached'] <= row['input'] and not row.get('input_conflict')):
             totals[0] += row['input'];totals[1] += row['cached'];totals[2] += 1
-        self.budget.add(_size(totals) - before)
+        self.budget.add(sum(map(getsizeof, totals)) - before)
 
     def summary(self, metric):
         if metric == 'count':return self.count, self.count, None, None
@@ -257,9 +262,9 @@ def population(window, group, metric, start, end, inclusive, support_start, supp
                 amount, cached = (block.values[name].at(position) for name in ('input', 'cached'))
                 if amount is None or cached is None or cached > amount or block.conflicts[position]:continue
                 totals = sessions[owner]
-                before = _size(totals)
+                before = sum(map(getsizeof, totals))
                 totals[0] += amount;totals[1] += cached;totals[2] += 1
-                reserve(max(0, _size(totals) - before))
+                reserve(max(0, sum(map(getsizeof, totals)) - before))
                 if amount and support_start <= stamp <= support_end:support = True
                 continue
             value = block.values[field].at(position)

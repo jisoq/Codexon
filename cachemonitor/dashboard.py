@@ -994,7 +994,7 @@ class Dashboard(TrayWindow):
     def analysis_regions(self):
         if self.current_page==1:return [(self.metric_panel,True)]
         if self.current_page==5:
-            return [(self.performance_panel.chart_scroll,True),(self.performance_panel.inspector,True),
+            return [(self.performance_panel.chart_scroll,True),(self.performance_panel.inspector,False),
                     (self.performance_panel.window_note,False)]
         if self.current_page==2:
             return [(node,True) for node in (self.session_parent_table,self.history_table_stack,self.history_chart,self.detail_scroll)]+[

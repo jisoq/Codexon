@@ -38,6 +38,13 @@ def _label(value):
     return value or '미확인'
 
 
+def _sort_charge(keys):
+    charges = ["CASE typeof(r.m_" + name + ") WHEN 'text' THEN length(CAST(r.m_" + name +
+               " AS BLOB)) WHEN 'blob' THEN length(r.m_" + name + ") ELSE 8 END+16" for name in FIELDS]
+    charge = '(256+length(r.types)+length(r.identity)+' + '+'.join(charges) + ')'
+    return '(' + charge + '+length(r.key_value)+COALESCE(length(r.turn_value),0))' if keys else charge
+
+
 class _Input:
     def __init__(self, engine):
         self.engine, self.snapshot = engine, engine.snapshot
@@ -100,13 +107,15 @@ class _Input:
                 result.append(row[0] if row else None)
         return result
 
-    def metadata(self, end):
-        self.args = dict(end=end)
+    def metadata(self, end, *, sort_start, sort_keys):
+        self.args = dict(start=sort_start, end=end)
         columns = ','.join('r.m_' + name for name in DIMENSIONS)
         tags = ','.join(_tag(name) + ' AS t' + str(i) for i, name in enumerate(DIMENSIONS))
         grouped = columns + ',' + ','.join(_tag(name) for name in DIMENSIONS)
         scopes, count = defaultdict(list), 0
-        with self.cursor(columns + ',' + tags + ',COUNT(*) AS n', 'r.m_ts<=:end',
+        charge = 'COALESCE(SUM(CASE WHEN r.m_ts>=:start THEN ' + _sort_charge(sort_keys) + ' ELSE 0 END),0)'
+        size = 0
+        with self.cursor(columns + ',' + tags + ',COUNT(*) AS n,' + charge + ' AS sort_bytes', 'r.m_ts<=:end',
                          tail='GROUP BY ' + grouped) as cursor:
             for row in cursor:
                 raw = tuple(row['m_' + name] for name in DIMENSIONS)
@@ -116,7 +125,12 @@ class _Input:
                 scopes[labels].append(value)
                 self._admit(_size((labels, value)))
                 count += row['n']
+                size += row['sort_bytes']
                 self.stats['metadata_groups'] += 1
+        # Metadata already visits these exact scalar rows. Reuse its byte sum
+        # for the main window; narrower predecessor queries keep their own guard.
+        self.sort_admission = (sort_start, end, sort_keys, size)
+        self._admit(_size(self.sort_admission))
         return scopes, count
 
     def scope(self, raw, types, count=3):
@@ -152,12 +166,12 @@ class _Input:
             where += ' AND (' + ' OR '.join(predicates) + ')'
         columns = 'r.owner,r.types,' + ','.join('r.m_' + name for name in FIELDS)
         if keys:columns += ',r.key_value,r.turn_value'
-        charges = ["CASE typeof(r.m_" + name + ") WHEN 'text' THEN length(CAST(r.m_" + name +
-                   " AS BLOB)) WHEN 'blob' THEN length(r.m_" + name + ") ELSE 8 END+16" for name in FIELDS]
-        charge = '(256+length(r.types)+length(r.identity)+' + '+'.join(charges) + ')'
-        if keys:charge = '(' + charge + '+length(r.key_value)+COALESCE(length(r.turn_value),0))'
-        with self.cursor('COALESCE(SUM(' + charge + '),0)', where) as cursor:
-            size = cursor.fetchone()[0]
+        admitted = getattr(self, 'sort_admission', None)
+        if variants is None and inclusive and admitted is not None and admitted[:3] == (start, end, keys):
+            size = admitted[3]
+        else:
+            with self.cursor('COALESCE(SUM(' + _sort_charge(keys) + '),0)', where) as cursor:
+                size = cursor.fetchone()[0]
         self.stats['sort_estimated_bytes'] = max(size, self.stats.get('sort_estimated_bytes', 0))
         if size > self.snapshot.limits.speed_sort_bytes:
             raise CapacityExceeded('performance scalar sort exceeds its admitted temporary payload')
@@ -254,7 +268,7 @@ def performance_input(engine, q, width, granularity):
     start, end = q.get('time_range') or full
     if end <= start:
         start, end = full
-    scopes, calls = source.metadata(end)
+    scopes, calls = source.metadata(end, sort_start=start, sort_keys=granularity != 'auto')
     progress=getattr(engine,'progress',None)
     if progress:progress('aggregate')
     if granularity == 'auto':

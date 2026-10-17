@@ -860,7 +860,8 @@ class PerformancePanel(Group):
             self.reasoning_tabs=None;self.reasoning_buttons={};self.reasoning_tab_keys=()
             for spec in display:
                 group=Group();body=Column(group);body.setSpacing(0)
-                head=Row();title=caption('',14,'ink',True);note=caption('',12);head.addWidget(title,1);head.addWidget(note);body.addLayout(head)
+                head=Column();head.setSpacing(2);title=caption('',14,'ink',True);note=caption('',12)
+                head.addWidget(title);head.addWidget(note);body.addLayout(head)
                 if spec['key']=='reasoning':
                     self.reasoning_tabs=Row();self.reasoning_tabs.put(flow=True,spacing=4);body.addLayout(self.reasoning_tabs)
                 plot=PerformancePlot(self);body.addWidget(plot);self.chart_body.addWidget(group)

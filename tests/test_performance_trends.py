@@ -291,10 +291,10 @@ def test_million_calls_keep_anomalies_and_bounded_frames(tmp_path):
 
 @pytest.mark.integration
 def test_qt_panel_rolling_hover_analysis_and_click(tmp_path):
-    from PySide6.QtCore import QSettings,Qt
+    from PySide6.QtCore import QSettings,Qt,QPointF
     from PySide6.QtWidgets import QApplication
     from cachemonitor.performance_panel import PerformancePanel
-    from cachemonitor.quick_qa import mount,dispose,render_plot,click
+    from cachemonitor.quick_qa import mount,dispose,render_plot,click,scene_view
     app=QApplication.instance() or QApplication([])
     owner=SimpleNamespace(settings=QSettings(str(tmp_path/'settings.ini'),QSettings.IniFormat),render=lambda:None,open_record=lambda r:None)
     rows=[row(i,key=f'{model}-{i}',model=model,cost=cost) for model,cost in (('m',1.),('other',2.),('outside',1000.)) for i in range(20)]
@@ -319,6 +319,13 @@ def test_qt_panel_rolling_hover_analysis_and_click(tmp_path):
         before=ui.inspected
         click(host,item,xy.x(),xy.y());chart.key(Qt.Key_Return);chart.key(Qt.Key_Space)
         assert ui.inspected==before and ui.time_range is None
+        # The long speed title must retain the chart width in a compact panel.
+        # Sample counts belong below it instead of squeezing it into a column.
+        speed=ui.plots['output_speed'];render_plot(host,speed)
+        title=scene_view(host,ui.labels['output_speed']);note=scene_view(host,ui.notes['output_speed'])
+        plot=scene_view(host,speed)
+        assert title.width()>=plot.width()-1
+        assert note.mapToScene(QPointF(0,0)).y()>=title.mapToScene(QPointF(0,title.height())).y()
         assert not host.qml_errors
         assert host.quick.grabFramebuffer().save(str(tmp_path/'performance.png'))
     finally:dispose(host)
@@ -524,7 +531,7 @@ def test_dashboard_tab_worker_contract_and_navigation(tmp_path):
     from PySide6.QtWidgets import QApplication
     from cachemonitor.dashboard import Dashboard
     from cachemonitor.core import Session
-    from cachemonitor.quick_qa import dispose
+    from cachemonitor.quick_qa import dispose,scene_view,walk
     from test_ui import wait_for_rendered
     app=QApplication.instance() or QApplication([])
     app.setProperty('cachemonitorDisableShellIntegration',True)
@@ -551,6 +558,10 @@ def test_dashboard_tab_worker_contract_and_navigation(tmp_path):
         w.show()
         wait_for_rendered(lambda:w.pages.isPageReady(4) and w.pages.isVisible(),timeout=5)
         w.async_mode=True;w.client_cache.clear()
+        def loading_panels():
+            return [item for item in walk(w.quick.quickWindow().contentItem())
+                    if item.objectName()=='analysis-region-loading' and item.isVisible()
+                    and item.width()>0 and item.height()>0]
         saved={}
         for period in ('7d','30d','all'):
             w.performance_panel.choose_period(period)
@@ -568,10 +579,19 @@ def test_dashboard_tab_worker_contract_and_navigation(tmp_path):
         w.performance_panel.choose_period('30d')
         assert w.analysis_pending and w.pending_retained and w.pages.isVisible()
         assert w.performance_panel.range==(saved['30d']['performance']['start'],saved['30d']['performance']['end'])
+        wait_for_rendered(lambda:bool(loading_panels()))
+        assert len(loading_panels())==1
+        assert not scene_view(w,w.performance_panel.inspector).property('analysisMasked')
         w.snapshot={**w.snapshot,'data_revision':1}
         w.performance_panel.choose_period('7d')
         assert w.analysis_pending and not w.pending_retained and w.pages.isVisible()
         assert w.analysis_loading['active'] and not w.analysis_loading['retained']
+        w.show_analysis_slow()
+        wait_for_rendered(lambda:scene_view(w,w.performance_panel.inspector).property('analysisMasked'))
+        assert len(loading_panels())==1
+        assert scene_view(w,w.performance_panel.chart_scroll).property('analysisMasked')
+        assert not scene_view(w,w.performance_panel.inspector).property('item').isVisible()
+        assert w.quick.grabFramebuffer().save(str(tmp_path/'performance-loading.png'))
         w.change_page(4);assert w.current_page==4
     finally:dispose(w)
 

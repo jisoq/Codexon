@@ -147,6 +147,24 @@ def test_growing_transport_diagnostics_do_not_overflow_owner_metadata(tmp_path):
     assert source==original
 
 
+@pytest.mark.parametrize('stopping',[False,True])
+def test_prepared_shutdown_cancellation_is_not_reported_as_a_failure(tmp_path,monkeypatch,stopping):
+    from types import SimpleNamespace
+    from cachemonitor import prepared_runtime
+
+    messages=[]
+    writer=object.__new__(prepared_runtime.PreparedWriter)
+    writer.arguments=[],tmp_path/'index.sqlite',None,tmp_path/'quota.sqlite'
+    writer.stopped=Event()
+    if stopping:writer.stopped.set()
+    writer.output=SimpleNamespace(put=messages.append)
+    def cancelled(*args,**kwargs):raise storage.ReadCancelled('cancelled work')
+    monkeypatch.setattr(prepared_runtime,'CollectionClient',cancelled)
+    writer._run()
+    assert bool(messages) is not stopping
+    assert (tmp_path/'quota.analysis.diagnostics.log').exists() is not stopping
+
+
 def test_prepared_failures_keep_sanitized_diagnostics_without_static_fallthrough(tmp_path, monkeypatch):
     import json
     from types import SimpleNamespace
@@ -174,6 +192,17 @@ def test_prepared_failures_keep_sanitized_diagnostics_without_static_fallthrough
     connection = SimpleNamespace(send=messages.append, close=lambda:closed.append('connection'))
     analysis_worker.process_main(connection, [], tmp_path/'index.sqlite', quota_path=quota)
     assert closed==['writer', 'connection'] and len(messages)==1 and messages[0]['kind']=='fatal'
+    with monkeypatch.context() as patch:
+        allocations = []
+        def allocate_reader(factory):
+            allocations.append(1)
+            if len(allocations) == 2:raise OSError('detail actor allocation failed')
+            return SimpleNamespace(close=lambda:closed.append('reader'))
+        patch.setattr(prepared_runtime, 'QueryActor', allocate_reader)
+        closed.clear()
+        with pytest.raises(OSError, match='detail actor allocation failed'):
+            prepared_runtime.process_main(connection, [], None, None, quota)
+        assert closed == ['reader', 'writer']
     def spawn_fail():
         raise OSError('private process-start context')
     context = SimpleNamespace(Pipe=lambda:(connection, connection),
@@ -872,3 +901,64 @@ def test_query_progress_coalesces_and_discards_replaced_requests():
     finally:
         release.set()
         actor.close()
+
+
+def test_overlay_detail_completes_without_restarting_pending_page(tmp_path, monkeypatch):
+    from multiprocessing import Pipe
+    from threading import Thread
+    from types import SimpleNamespace
+    import time
+    from cachemonitor import prepared_runtime
+
+    started, release, cancelled, stopped = Event(), Event(), Event(), Event()
+    output = prepared_runtime.Mailbox(stopped)
+    closed = []
+    page_starts = []
+    failures = []
+    writer = SimpleNamespace(path=tmp_path/'prepared.sqlite', output=output,
+                             close=lambda:closed.append('writer'))
+    monkeypatch.setattr(prepared_runtime, 'PreparedWriter', lambda *args:writer)
+    class Handler:
+        def __init__(self, path):pass
+        def __call__(self, message, token, cancel):
+            if message['kind'] == 'query':
+                page_starts.append(message['id']);started.set()
+                deadline = time.monotonic()+5
+                while not release.is_set():
+                    if cancel():cancelled.set();break
+                    assert time.monotonic() < deadline
+                    release.wait(.01)
+                return dict(kind='result', id=message['id'])
+            return dict(kind=message['kind'], id=message['id'])
+        def close(self):closed.append('reader')
+    monkeypatch.setattr(prepared_runtime, 'PreparedQuery', Handler)
+    parent, child = Pipe()
+    def dispatch():
+        try:prepared_runtime.process_main(child, [], None, None, tmp_path/'quota.sqlite')
+        except BaseException as error:failures.append(error)
+    thread = Thread(target=dispatch, daemon=True)
+    thread.start()
+    def receive(kind):
+        deadline = time.monotonic()+5
+        while True:
+            remaining = deadline-time.monotonic()
+            assert remaining > 0 and parent.poll(remaining), f'{kind} did not complete'
+            message = parent.recv()
+            if message['kind'] == kind:return message
+    try:
+        output.put(dict(kind='snapshot', value={}, token=('instance', 1), transition=None))
+        receive('snapshot')
+        parent.send(dict(kind='query', id='page', query={}, logical=()))
+        assert started.wait(5)
+        parent.send(dict(kind='overlay_detail', id='overlay', summary={'_prepared_token':('instance', 1)}))
+        assert receive('overlay_detail')['id'] == 'overlay'
+        assert not cancelled.is_set() and page_starts == ['page']
+        release.set()
+        assert receive('result')['id'] == 'page'
+    finally:
+        release.set()
+        parent.send(dict(kind='stop'))
+        thread.join(5)
+        parent.close();child.close();output.close()
+    assert not thread.is_alive() and not failures
+    assert closed.count('reader') == 2 and closed.count('writer') == 1
