@@ -14,7 +14,7 @@ class Theme(QObject):
         super().__init__(parent)
         self.appearance=default_appearance(False)
         self._palette=ui_palette(self.appearance);self._dark=False
-        self._family='Pretendard JP';self._reader=None;self._models=[];self._model_colors={}
+        self._family='Pretendard JP';self._reader=None;self._models=[];self._model_colors={};self._performance_colors={}
 
     @Slot(str, str, result=str)
     def readableText(self, foreground, background):
@@ -39,6 +39,7 @@ class Theme(QObject):
         if (palette,appearance.dark,appearance.family)!=(self._palette,self._dark,self._family):
             self.appearance=appearance;self._palette=palette;self._dark=appearance.dark;self._family=appearance.family
             self._model_colors=model_palette(appearance,self._models)
+            self._performance_colors.clear()
             self.changed.emit()
 
     def register_models(self,names):
@@ -60,6 +61,19 @@ class Theme(QObject):
         return lch(max(0,min(1,lightness+(.14 if self.dark else -.14))),
                    hypot(a,b),degrees(atan2(b,a)))
 
+    def performance_color(self,name,mode='Standard'):
+        self.register_models([name])
+        key=(name,mode)
+        if key not in self._performance_colors:
+            # Stable model order keeps a family unchanged when selection changes.
+            index=self._models.index(name)
+            hues=(255,55,325,165,15,105,285,205)
+            hue=(hues[index%len(hues)]+(index//len(hues))*23)%360
+            lightness=(.76 if self.dark else .54)+((-.065 if self.dark else .065) if mode=='Fast' else 0)
+            color=lch(lightness,.16,hue)
+            self._performance_colors[key]=readable(color,tuple(self._palette[k] for k in ('surface','panel','secondary')),3)
+        return self._performance_colors[key]
+
     def model_pattern(self,name):
         color=self.model_color(name)
         if any(other!=name and color_distance(color,value)<.04 for other,value in self._model_colors.items()):
@@ -68,6 +82,9 @@ class Theme(QObject):
 
     @Slot(str, result=str)
     def color(self, value):
+        if value.startswith('performance:'):
+            _,mode,name=value.split(':',2)
+            return self.performance_color(name,mode)
         if value.startswith('model-mode:'):
             _,mode,name=value.split(':',2)
             return self.model_mode_color(name,mode)

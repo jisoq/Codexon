@@ -24,6 +24,50 @@ def query(**changes):return dict(dict(now=2000,plot_width=64),**changes)
 
 def panel(view,key):return next(p for p in view['panels'] if p['key']==key)
 
+def test_rendered_series_survive_later_curves_and_keep_isolated_modes(tmp_path):
+    from PySide6.QtCore import QSettings,QObject
+    from PySide6.QtGui import QColor
+    from cachemonitor.performance_panel import PerformancePanel
+    from cachemonitor.quick_qa import mount,dispose,render_plot,control
+    from cachemonitor.theme import shared_theme
+
+    # The later arched series encloses the earlier flat line. A leaked marker
+    # brush would fill that arch and erase valid data from the earlier series.
+    base=1800000000
+    rows=[]
+    for minute in range(61):
+        rows.extend((row(len(rows),ts=base+minute*60,model='alpha',cost=3),
+                     row(len(rows)+1,ts=base+minute*60,model='beta',cost=.5+4.5*(1-abs(minute-30)/30))))
+    rows.extend((row(len(rows),ts=base+1875,model='alpha',service_tier='Fast',cost=1),
+                 row(len(rows)+1,ts=base+1875,model='gamma',cost=6)))
+    data=PerformanceTrends().query(engine(sorted(rows,key=lambda p:p['ts'])),
+        query(now=base+3600,time_range=[base,base+3600],granularity='auto',plot_width=768))
+    owner=SimpleNamespace(settings=QSettings(str(tmp_path/'series.ini'),QSettings.IniFormat),render=lambda:None)
+    ui=PerformancePanel(owner);ui.apply(data);host=mount(ui,1120,760)
+    try:
+        chart=ui.plots['cost'];item=render_plot(host,chart)
+        for node in ui.plots.values():
+            control(host,node).findChild(QObject,'plotHover').setProperty('enabled',False)
+        ui.inspect(None)
+        image=host.quick.grabFramebuffer()
+        assert image.save(str(tmp_path/'series-continuity.png'))
+        scale=image.width()/host.quick.width()
+        def pixel(point):
+            xy=item.mapToScene(chart.xy(point))
+            return image.pixelColor(round(xy.x()*scale),round(xy.y()*scale))
+        def distance(a,b):
+            return sum(abs(a.getRgb()[i]-b.getRgb()[i]) for i in range(3))
+        flat=next(p for p in chart.rows if p['model']=='alpha' and p['service_tier']=='Standard' and p['ts']==base+1500)
+        hollow=next(p for p in chart.rows if p['model']=='alpha' and p['service_tier']=='Fast' and p['value'] is not None)
+        filled=next(p for p in chart.rows if p['model']=='gamma' and p['value'] is not None)
+        background=QColor(shared_theme().palette['surface'])
+        assert distance(pixel(flat),chart.ink(flat))<distance(pixel(flat),background)
+        assert distance(pixel(filled),chart.ink(filled))<distance(pixel(filled),background)
+        assert distance(pixel(hollow),background)<distance(pixel(hollow),chart.ink(hollow))
+        assert not host.qml_errors
+    finally:dispose(host)
+
+
 def test_causal_outliers_and_zero_deviation():
     assert assessment(100,[1]*9)['status']=='비교 기록 부족'
     assert assessment(2,[1]*10)['direction']==1

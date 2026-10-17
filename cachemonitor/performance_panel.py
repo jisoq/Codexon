@@ -112,12 +112,12 @@ def interval_dates(start,end):
 
 
 def series_pen(color,mode,width=3.2):
-    pen=QPen(color,width,Qt.DashLine if mode=='Fast' else Qt.SolidLine)
-    if mode=='Fast':pen.setDashPattern([4,2])
+    pen=QPen(color,width,Qt.SolidLine)
+    pen.setCapStyle(Qt.RoundCap);pen.setJoinStyle(Qt.RoundJoin)
     return pen
 
 
-def series_mark(p,xy,mode,size=3):
+def series_mark(p,xy,mode,size=4):
     if mode=='Fast':
         p.drawPolygon(QPolygonF([QPointF(xy.x(),xy.y()-size-1),QPointF(xy.x()+size+1,xy.y()+size),QPointF(xy.x()-size-1,xy.y()+size)]))
     else:p.drawEllipse(xy,size,size)
@@ -126,18 +126,18 @@ def series_mark(p,xy,mode,size=3):
 class SeriesLegend(Plot):
     def __init__(self,model,mode,active,bands=False):
         super().__init__();self.model=model;self.mode=mode;self.active=active;self.bands=bands
-        self.setFixedSize(48,26);self.setFocusPolicy(Qt.NoFocus)
+        self.setFixedSize(40,26);self.setFocusPolicy(Qt.NoFocus)
         shared_theme().changed.connect(self.update)
 
     def paint(self,painter):
         p=self._painter;p.setRenderHint(QPainter.Antialiasing)
-        color=QColor(shared_theme().model_mode_color(self.model,self.mode));color.setAlphaF(1 if self.active else .2)
+        color=QColor(shared_theme().performance_color(self.model,self.mode));color.setAlphaF(1 if self.active else .2)
         if self.bands:
             shade=QColor(color);shade.setAlphaF(.16 if self.active else .03)
-            p.fillRect(QRectF(3,5,42,16),shade)
-        p.setPen(series_pen(color,self.mode));p.drawLine(QPointF(3,13),QPointF(45,13))
-        p.setPen(QPen(color,1.5));p.setBrush(QColor(shared_theme().palette['surface']))
-        series_mark(p,QPointF(24,13),self.mode)
+            p.fillRect(QRectF(3,5,34,16),shade)
+        p.setPen(series_pen(color,self.mode));p.drawLine(QPointF(3,13),QPointF(37,13))
+        p.setPen(QPen(color,1.5));p.setBrush(QColor(shared_theme().palette['surface']) if self.mode=='Fast' else color)
+        series_mark(p,QPointF(20,13),self.mode)
 
 
 class DistributionRange(AnalyticalPlot):
@@ -326,7 +326,7 @@ class PerformancePlot(AnalyticalPlot):
 
     def ink(self,p,alpha=1):
         selected=self.selected_style(p)
-        color=QColor(shared_theme().model_mode_color(p['model'],p['service_tier']) if selected else self.color('muted'))
+        color=QColor(shared_theme().performance_color(p['model'],p['service_tier']) if selected else self.color('muted'))
         color.setAlphaF(alpha if selected else min(.1,alpha));return color
 
     def x(self,ts):
@@ -343,7 +343,7 @@ class PerformancePlot(AnalyticalPlot):
     def paint_bands(self,p):
         for line in self.data['lines']:
             if not self.selected_style(line):continue
-            bands=[('q1','q3','band_valid',.16)]
+            bands=[('q1','q3','band_valid',.09)]
             if self.panel.show_outer:bands.insert(0,('p10','p90','outer_valid',.055))
             for low,high,valid_key,alpha in bands:
                 previous=None
@@ -355,7 +355,7 @@ class PerformancePlot(AnalyticalPlot):
                         p.drawPolygon(QPolygonF([QPointF(x1,self.y(a[low])),QPointF(x1,self.y(a[high])),
                                                 QPointF(x2,self.y(b[high])),QPointF(x2,self.y(b[low]))]))
                         if low=='q1':
-                            p.setPen(series_pen(self.ink(line,.55),line['service_tier'],1))
+                            p.setPen(series_pen(self.ink(line,.3),line['service_tier'],.8))
                             for edge in (low,high):p.drawLine(QPointF(x1,self.y(a[edge])),QPointF(x2,self.y(b[edge])))
                     previous=point
 
@@ -420,24 +420,41 @@ class PerformancePlot(AnalyticalPlot):
             if self.data.get('raw_visible'):
                 for point in self.data['points']:
                     if not self.selected_style(point):continue
-                    p.setPen(Qt.NoPen);p.setBrush(self.ink(point,.35));series_mark(p,self.xy(point),point['service_tier'],2)
+                    color=self.ink(point,.5)
+                    p.setPen(QPen(color,1.2));p.setBrush(self.color('surface') if point['service_tier']=='Fast' else color)
+                    series_mark(p,self.xy(point),point['service_tier'],2.5)
+        paths=[]
         for line in sorted(self.data.get('lines',[]),key=self.selected_style):
             if not self.selected_style(line):continue
             points=line['points'];previous=None;path=QPainterPath()
-            color=self.ink(line);mode=line['service_tier']
-            p.setPen(series_pen(color,mode));p.setBrush(Qt.NoBrush)
             for point in points:
                 if point['value'] is None:previous=None;continue
                 xy=self.xy(point)
                 if previous is not None and point['bucket']==previous+1:path.lineTo(xy)
                 else:path.moveTo(xy)
                 previous=point['bucket']
-            # One path preserves dash phase across short rolling segments.
-            p.drawPath(path)
-            p.setPen(QPen(color,1.5));p.setBrush(self.color('surface'))
+            paths.append((line,path))
+        # Paint every casing first so later casings cannot erase another series.
+        p.setBrush(Qt.NoBrush)
+        for line,path in paths:
+            p.setPen(series_pen(self.color('surface'),line['service_tier'],5.5));p.drawPath(path)
+        for line,path in paths:
+            points=line['points'];mode=line['service_tier'];color=self.ink(line)
+            # Markers leave a brush behind; paths must never inherit their fill.
+            p.setBrush(Qt.NoBrush)
+            p.setPen(series_pen(color,mode,2.7));p.drawPath(path)
+            p.setPen(QPen(color,1.5));p.setBrush(self.color('surface') if mode=='Fast' else color)
+            last_mark=None
             for index,point in enumerate(points):
-                isolated=(index==0 or points[index-1]['value'] is None) and (index==len(points)-1 or points[index+1]['value'] is None)
-                if point['value'] is not None and (not self.bands or isolated):series_mark(p,self.xy(point),mode)
+                if point['value'] is None:
+                    last_mark=None;continue
+                boundary=(index==0 or points[index-1]['value'] is None or
+                          points[index-1]['bucket']+1!=point['bucket'] or
+                          index==len(points)-1 or points[index+1]['value'] is None or
+                          point['bucket']+1!=points[index+1]['bucket'])
+                x=self.x(point['ts'])
+                if not self.bands or boundary or last_mark is None or x-last_mark>=64:
+                    series_mark(p,self.xy(point),mode);last_mark=x
         p.restore()
         strip=self.strip_top()
         if not self.rolling:
@@ -463,7 +480,7 @@ class PerformancePlot(AnalyticalPlot):
             if self.rolling:
                 for point in self.matching_points(stamp):
                     if point['value'] is None:continue
-                    p.setPen(QPen(self.ink(point),1.5));p.setBrush(self.color('surface'))
+                    p.setPen(QPen(self.ink(point),1.5));p.setBrush(self.color('surface') if point['service_tier']=='Fast' else self.ink(point))
                     series_mark(p,self.xy(point),point['service_tier'],4)
 
     def nearest(self,x,y):
@@ -634,15 +651,18 @@ class PerformancePanel(Group):
         # Range results already refresh plot data; unchanged selection UI stays mounted.
         if self.selection_is_current():return
         self.window_note.show()
-        self.chart_help.setText('대표선: 지표별 평균 또는 중앙값\n분포 띠: 중앙 50% 표본 범위\nStandard: 실선과 원\nFast: 파선과 삼각형\n확대하면 개별 호출을 확인할 수 있습니다.')
+        self.chart_help.setText('색상은 모델, 표식은 실행 모드입니다.\n대표선: 지표별 평균 또는 중앙값\n분포 띠: 중앙 50% 표본 범위\nStandard: 채운 원\nFast: 빈 삼각형\n확대하면 개별 호출을 확인할 수 있습니다.')
         self.chart_help.setToolTip('소요시간은 중앙값, 출력 속도는 전체 응답시간 기준 시간 가중평균입니다. 이동 구간의 소요시간 중앙값은 표본 5개 이상에서 표시합니다. 띠는 표본 분포입니다. 호출 수는 겹치지 않는 구간 합계입니다.')
         mode='all' if all(self.modes.get(m,False) for m in ('Standard','Fast')) else 'Fast' if self.modes.get('Fast') else 'Standard'
         for key,b in self.mode_buttons.items():b.setChecked(key==mode)
         clear(self.legend);self.legend_entries=[]
         selected=[m for m in self.available if self.is_model_selected(m)]
         for model in selected:
-            item=Column();item.setSpacing(4);self.legend.addLayout(item)
-            heading=Row();heading.setSpacing(4);item.addLayout(heading);heading.addWidget(caption(Verbatim(model),13,'ink'),1)
+            card=Group();card.put(background='surface',border='border',radius=7);self.legend.addWidget(card)
+            outer=Row(card);outer.setSpacing(0)
+            rail=Group();rail.put(background='performance:Standard:'+model);rail.setFixedWidth(4);outer.addWidget(rail)
+            item=Column();item.setContentsMargins(9,9,9,9);item.setSpacing(4);outer.addLayout(item,1)
+            heading=Row();heading.setSpacing(4);item.addLayout(heading);heading.addWidget(caption(Verbatim(model),13,'ink',True),1)
             modes=Row();modes.setSpacing(8);item.addLayout(modes)
             for mode in ('Standard','Fast'):
                 active=self.modes.get(mode,False)
