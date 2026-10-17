@@ -14,7 +14,8 @@ def start_smoke(window,app,path,fonts,depth='full'):
 
     def settle():
         deadline=time.monotonic()+30
-        while window.analysis_pending or window.view_result is None or window.search_timer.isActive() or window.range_timer.isActive() or window.deferred_result:
+        while (window.analysis_pending or (window.current_page in (1,2,5) and window.view_result is None)
+               or window.search_timer.isActive() or window.range_timer.isActive() or window.deferred_result):
             app.processEvents();QTest.qWait(20)
             if window.analysis_errors:raise AssertionError(window.analysis_errors)
             if time.monotonic()>deadline:raise AssertionError('Analysis response timed out')
