@@ -290,7 +290,7 @@ def test_refresh_indicator_does_not_cover_existing_chart(tmp_path):
     window=dashboard(tmp_path)
     try:
         window.receive(sample());window.resize(1000,680);window.show();window.change_page(5)
-        wait_for_rendered(lambda:window.pages.isPageReady(4))
+        wait_for_rendered(lambda:window.pages.isPageReady(4),timeout=5)
         chart=control(window,window.performance_panel.chart_scroll)
         window.quick.grabFramebuffer()
         position=chart.mapToScene(QPointF(0,0));size=chart.size()
