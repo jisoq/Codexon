@@ -63,6 +63,48 @@ def test_publication_is_atomic_and_interrupted_staging_does_not_replace_saved_fa
             assert current.record(*OWNER, 'call-1') is None
 
 
+def test_cleanup_waits_for_pinned_reader_without_failing_writer_or_growing_wal(tmp_path):
+    from contextlib import closing
+    import time
+    from cachemonitor.prepared_runtime import PreparedWriter
+    from cachemonitor.prepared_speed_writer import PreparedSpeedWriter
+
+    path = tmp_path/'analysis.sqlite'
+    rows = calls()
+    writer = object.__new__(PreparedWriter)
+    writer.stopped = Event()
+    with (storage.PreparedStore(path) as store, storage.PreparedReader(path) as reader,
+          closing(PreparedSpeedWriter(store, preparation='test')) as speed_writer):
+        first = publish(store, 1, rows)
+        store.db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+        with reader.pin(first) as old:
+            second = publish(store, 2, [dict(rows[0], cost=2.), rows[2]])
+            stage = store.begin(('source', 3))
+            before = store.disk_usage()['wal']
+            # Scale the real admission boundary to this small fixture. Its
+            # pinned reader, queued cleanup and checkpoint result are genuine.
+            store.limits = replace(store.limits, wal_bytes=before+4096, write_reserve_bytes=8192)
+            with pytest.raises(storage.WriteDeferred):
+                store.maintain()
+            assert writer._maintain(store)
+            dependency = {name:1 for name in storage.DEPENDENCIES}
+            dependency['source_digest'] = '3'*64
+            with pytest.raises(storage.WriteDeferred):
+                stage.owner(*OWNER, dict(home=OWNER[0], sid=OWNER[1], title='Uncommitted'), dependency)
+            assert not writer._resume_writes(store, speed_writer)
+            assert store.token == second and store.disk_usage()['wal'] == before
+            assert old.record(*OWNER, 'call-0')['cost'] == 1.
+        assert writer._resume_writes(store, speed_writer)
+        assert store.stage is None and stage.finished
+        deadline = time.monotonic()+5
+        while writer._maintain(store):
+            assert time.monotonic() < deadline
+        assert store.disk_usage()['wal'] <= store.limits.wal_bytes
+        with reader.pin(second) as current:
+            assert current.record(*OWNER, 'call-0')['cost'] == 2.
+            assert current.record(*OWNER, 'call-1') is None
+
+
 def test_growing_transport_diagnostics_do_not_overflow_owner_metadata(tmp_path):
     from copy import deepcopy
     from cachemonitor.core import Session
@@ -315,6 +357,7 @@ def test_collector_append_uses_tail_and_historical_correction_uses_full_owner(tm
     from cachemonitor.overlay_data import summarize_session
     from cachemonitor.prepared_health import hydrate_health
     from cachemonitor.prepared_ingest import PreparedCohort, read_catalog
+    import cachemonitor.prepared_append as append
     from cachemonitor.prepared_ledger import PreparedLedger
     from cachemonitor.prepared_summary import hydrate_summary
     from cachemonitor.quota_cycles import QuotaLedger
@@ -378,7 +421,14 @@ def test_collector_append_uses_tail_and_historical_correction_uses_full_owner(tm
         initial = collect()
         with storage.PreparedStore(tmp_path/'prepared.sqlite') as store:
             cohort = PreparedCohort(store, client, ledger)
-            assert list(cohort.convert(read_catalog(client)))[-1]['ready']
+            # Existing v1 checkpoints retain Home counters. Upgrade their next
+            # certified tail without rebuilding the saved owner or quota data.
+            totals = append._new_totals
+            with monkeypatch.context() as patch:
+                patch.setattr(append, 'FORMAT', ('prepared-owner-append', 1))
+                patch.setattr(append, '_new_totals',
+                    lambda:dict(totals(), home_values=[0]*5, home_missing=[0]*5))
+                assert list(cohort.convert(read_catalog(client)))[-1]['ready']
             adapter = PreparedLedger(ledger, store)
             list(adapter.sync(envelope(initial)))
             verify(store, initial)
@@ -397,6 +447,10 @@ def test_collector_append_uses_tail_and_historical_correction_uses_full_owner(tm
                 list(adapter.sync(envelope(appended)))
             assert cohort.metrics['append_owners']==1 and len(source_reads)==initial_reads
             assert adapter.metrics['append_owners']==1 and adapter.metrics['call_rows']==prior_call_reads+1
+            with store.read_current() as view:
+                checkpoint = view.derived(*owner, 'checkpoint')
+                assert checkpoint['format'] == append.FORMAT
+                assert not {'home_values', 'home_missing'} & checkpoint['total'].keys()
             verify(store, appended)
             # An old edit combined with growth must decline the append proof.
             events[2]['payload']['usage']['input_tokens'] = 21000
@@ -467,86 +521,6 @@ def test_category_projection_preserves_filtered_totals_without_decoding_call_bod
             assert boundary_reads == [query['end']]
             engine.page_query({**query, 'usage':{**query['usage'], 'sort':'name', 'size':1}})
             assert boundary_reads == [query['end']]
-        finally:
-            engine.close()
-
-
-def test_home_totals_use_canonical_summary_and_refresh_changed_bounds(tmp_path, monkeypatch):
-    from copy import deepcopy
-    from cachemonitor.analysis_engine import AnalysisEngine
-    from cachemonitor.core import Session
-    from cachemonitor.prepared_analysis import PreparedAnalysisEngine
-    from cachemonitor.prepared_ingest import PREPARATION, prepare_owner, stage_owner
-
-    sources = []
-    for sid, model in (('selected', 'gpt-6-astra'), ('other', 'gpt-6-sol')):
-        session = Session(sid, 'home', title=sid, cwd='D:/project')
-        for ordinal in range(4):
-            session.add_usage(100+ordinal, f'{sid}-{ordinal}',
-                dict(input_tokens=100+ordinal, cached_input_tokens=20 if ordinal else None,
-                     output_tokens=10), model, 'request', 'medium', service_tier='Standard')
-        source = deepcopy(session.view(110))
-        source['usage_revision'] = 1
-        sources.append(source)
-    reference = AnalysisEngine()
-    reference.ingest(deepcopy(sources))
-    # Ownership excludes this duplicate, so raw coverage cannot prove Home coverage.
-    sources[0]['history'].insert(0, dict(sources[0]['history'][0], key='duplicate', ts=1))
-    dependency = {name:1 for name in storage.DEPENDENCIES}
-    dependency.update(source_digest='1'*64, preparation=PREPARATION)
-    owns = lambda _, row:row['key'] != 'duplicate'
-    projected_rows = []
-    original_projection = storage.Snapshot.projected_calls
-
-    def projection(*args, **kwargs):
-        result = original_projection(*args, **kwargs)
-        projected_rows.extend(1 for _ in result.rows)
-        return result
-
-    def forbidden(*args, **kwargs):
-        raise AssertionError('Home decoded full call bodies')
-
-    query = dict(page=0, start=100, end=110, now=110, period='all',
-                 category_usage=True, presentation=True)
-    with storage.PreparedStore(tmp_path/'home.sqlite') as store:
-        stage = store.begin(('home', 1))
-        for ordinal, source in enumerate(sources):
-            stage_owner(stage, prepare_owner(source, owns=owns), dependency, ordinal)
-        token = stage.publish(('home', 1), ready=True)
-        engine = PreparedAnalysisEngine(store.path, token)
-        try:
-            monkeypatch.setattr(storage.Snapshot, '_decode_call', forbidden)
-            monkeypatch.setattr(storage.Snapshot, 'projected_calls', projection)
-
-            def compare(scope):
-                actual, expected = engine.page_query(scope), reference.page_query(scope)
-                assert actual['analysis'] == expected['analysis']
-                assert storage.pack(actual['usage']) == storage.pack(expected['usage'])
-
-            compare(query)
-            compare({**query, 'end':111, 'now':111})
-            assert not projected_rows
-            partial = {**query, 'start':101.1, 'end':102.2, 'period':'custom', 'model':'gpt-6-astra'}
-            compare(partial)
-            assert projected_rows
-            projected_rows.clear()
-            compare({**partial, 'end':102.8})
-            assert not projected_rows
-
-            changed = deepcopy(sources[0])
-            changed['usage_revision'] = 2
-            changed['history'][2]['input'] += 7
-            changed['history'].append(dict(changed['history'][-1], key='new-call', ts=115))
-            reference.ingest([dict(changed, history=[row for row in changed['history'] if owns(None, row)])])
-            stage = store.begin(('home', 2))
-            updated = {**dependency, 'source_digest':'2'*64}
-            stage_owner(stage, prepare_owner(changed, owns=owns), updated, 0)
-            stage.owner('home', 'other', dict(home='home', id='other'), updated, source_ordinal=1)
-            stage.remove_owner(('home', 'other'))
-            token = stage.publish(('home', 2), ready=True)
-            engine.adopt(token, [('home', 'selected')], [('home', 'other')])
-            compare({**query, 'end':120, 'now':120})
-            assert not projected_rows
         finally:
             engine.close()
 

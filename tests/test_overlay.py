@@ -44,9 +44,11 @@ def test_overlay_reuses_verified_detail_across_unrelated_publications(health):
         assert result.get('_health_detail') is health
     assert requested==[]
     changed=dict(current,_prepared_token=('test',22),_overlay_revision=('test',22))
-    assert OverlayController.prepared_content(controller,changed)==(None,True)
-    for generation in range(23,43):
-        assert OverlayController.prepared_content(controller,dict(changed,_prepared_token=('test',generation)))==(None,True)
+    for generation in range(22,43):
+        retained,pending=OverlayController.prepared_content(controller,dict(changed,_prepared_token=('test',generation)))
+        assert pending and retained['latest']['output']==100
+        assert retained['_overlay_revision']==('test',1)
+        assert retained['_prepared_token']==current['_prepared_token']
     assert len(requested)==1
     controller.target_state={'selection':Selection(A)}
     controller.session_lookup={A:[changed]}

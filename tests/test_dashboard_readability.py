@@ -23,17 +23,14 @@ def test_approved_pages_render_with_stable_routes_and_aligned_fields(tmp_path, l
     window=Dashboard(['fixture'],start_worker=False,live_limits=False,settings=settings,static_snapshot=snapshot())
     try:
         window.resize(width,height);window.show();QTest.qWait(90)
-        for page in (0,1,2,0,2):
-            window.change_page(page);control(window,window.pages.widget(page))
+        for page in (3,1,2,3,2):
+            window.change_page(page);control(window,window.pages.widget(page-1))
             assert not window.qml_errors
             # A field has exactly one rendered owner after moving between pages.
             views=[item for item in walk(window.quick.rootObject()) if item.property('node') is window.period and item.metaObject().indexOfProperty('sourceComponent')>=0]
             assert len(views)==1
             assert control(window,window.period).isVisible()==(page==2)
-            if page==0:
-                assert len(window.home_panel.state['totals'])==4
-                assert window.query()['period']=='all'
-            if page in (0,1):assert not window.common_filters.isVisible()
+            if page in (3,1):assert not window.common_filters.isVisible()
             assert not window.scope_note.isVisible()
             assert window.quick.grabFramebuffer().save(str(tmp_path/f'page-{page}.png'))
         assert not window.home_button.isVisible()
@@ -81,6 +78,6 @@ def test_approved_pages_render_with_stable_routes_and_aligned_fields(tmp_path, l
         assert not window.selected_call
         assert not window.qml_errors
         # Resize callbacks must be harmless after the user has changed tabs.
-        window.change_page(0);window.apply_explorer()
+        window.change_page(3);window.apply_explorer()
     finally:
         window.quit_app();set_language(old_language);app.setProperty('cachemonitorDisableShellIntegration',previous)

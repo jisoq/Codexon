@@ -307,7 +307,7 @@ def prepare_owner(source, *, owns):
             maximum=ts if maximum is None else max(maximum,ts)
         if owns(i,row):history.append(row)
     canonical = dict(source, history=history)
-    from .prepared_append import capture_health, reduce_full, summary_facts, home_totals
+    from .prepared_append import capture_health, reduce_full, summary_facts
     engine = AnalysisEngine(health_checkpoint=capture_health)
     engine.ingest([canonical])
     key = (source['home'], source['id'])
@@ -320,7 +320,7 @@ def prepare_owner(source, *, owns):
     rows = prepared['history']
 
     return dict(state=state, append_state=reduced, raw_count=len(source['history']),
-                summary=dict(own=summary, partials=partials,coverage_bounds=(minimum,maximum),home_totals=home_totals(key,reduced['total'])),
+                summary=dict(own=summary, partials=partials,coverage_bounds=(minimum,maximum)),
                 coverage_bounds=(minimum,maximum),
                 choices=SnapshotPublisher._choices_for_rows(rows),
                 model_alerts={row['key']:tuple(row.get(k) for k in MODEL_KEYS)

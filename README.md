@@ -2,11 +2,11 @@
 
 [한국어](README.ko.md) |  [English](README.md)
 
-**Codexon is a Windows app for analyzing Codex usage and cache behavior, comparing request/response model names. Its overlay keeps usage visible over your Codex window while you work.**
+**Codexon is a Windows app centered on the Codex overlay and subscription monitoring. Compare usage metrics and review performance trends from recorded calls.**
 
 - **Spot a request/response model mismatch directly in the overlay.** Compare the requested and reported model names when investigating routing behavior.
 - See the latest call's tokens, cache rate, and subscription value estimate in an overlay while working in Codex.
-- Explore sessions and individual calls, including confirmed child-agent usage in session totals.
+- Open call records from the overlay or comparison results. Session totals include confirmed child-agent usage.
 - Compare usage across models, reasoning efforts and service tiers, and inspect the calls behind each result.
 - Follow remaining usage limits and reset times. The tray and taskbar widget keep them visible without opening the dashboard.
 
@@ -25,6 +25,8 @@ Use the difference as a clue when investigating routing behavior, then open **Ca
 **Historical example: the September 29 Pro x20 weekly allowance estimate was about $1,300 under the previous conversion policy.**
 
 These amounts use the previous API-rate conversion policy, before the subscription Fast 2.5x change. Calculated from real local records as of **September 29, 2026, 19:49 KST**. Locally observed intervals in the current cycle account for **$246.96** in value under the previous conversion policy and **19 percentage points** of allowance consumed, yielding **$1,299.80** when extrapolated to a full weekly allowance. Account-wide remaining allowance and locally observed consumption cover different scopes; observation gaps are compressed in the chart.
+
+The default screen is subscription monitoring. The main menu contains subscription monitoring, metric comparison, and performance trends. The Home summary and page previews have been removed.
 
 ## Overlay views
 

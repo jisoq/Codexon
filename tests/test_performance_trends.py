@@ -534,9 +534,9 @@ def test_dashboard_tab_worker_contract_and_navigation(tmp_path):
         session.add_usage(1800000000,'r',dict(input_tokens=100,cached_input_tokens=90,cache_write_input_tokens=0,output_tokens=50,reasoning_output_tokens=10),'gpt-6-astra','t','high','Standard')
         session.add_usage(1800000001,'r2',dict(input_tokens=100,cached_input_tokens=90,cache_write_input_tokens=0,output_tokens=50,reasoning_output_tokens=10),'gpt-6.1-sol','t2','high','Standard')
         w.receive(dict(ts=1800100000,sessions=[session.view(1800100000)],homes=['synthetic'],errors=[],unassigned=[],index={'loading':True}))
-        assert w.navigation_pages==(0,1,5,2,3)
+        assert w.navigation_pages==(3,1,5)
         w.nav.setCurrentRow(2)
-        assert w.pages.currentIndex()==5 and not w.common_filters.isVisible()
+        assert w.current_page==5 and not w.common_filters.isVisible()
         assert w.performance_panel.plots['cost'].rows
         q=w.query();result=w.engine.page_query(q)
         # A broad rolling view omits individual dots but still has real calls.
@@ -549,7 +549,7 @@ def test_dashboard_tab_worker_contract_and_navigation(tmp_path):
         assert w.query()['granularity']=='auto'
         assert w.engine.page_query(w.query())['performance']['granularity']=='auto'
         w.show()
-        wait_for_rendered(lambda:w.pages.isPageReady(5) and w.pages.isVisible(),timeout=5)
+        wait_for_rendered(lambda:w.pages.isPageReady(4) and w.pages.isVisible(),timeout=5)
         w.async_mode=True;w.client_cache.clear()
         saved={}
         for period in ('7d','30d','all'):

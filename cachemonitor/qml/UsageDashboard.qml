@@ -11,7 +11,7 @@ Item {
     readonly property var o: s.options
     readonly property bool splitModels: o.dimension==='model' && (o.breakdowns||[]).length>0
     property real now: Date.now()/1000
-    Timer {interval:60000;repeat:true;running:root.visible && !root.s.home && root.o.selected.length>0;onTriggered:root.now=Date.now()/1000}
+    Timer {interval:60000;repeat:true;running:root.visible && root.o.selected.length>0;onTriggered:root.now=Date.now()/1000}
     function t(text) { return appLanguage.text(text) }
     function selected(items,value) { for(let i=0;i<items.length;i++) if(items[i].value===value)return i;return 0 }
     component Copy: Text {
@@ -37,106 +37,8 @@ Item {
         }
     }
     ColumnLayout {
-        anchors.fill: parent; spacing: 20; visible: root.s.home
-        Rectangle {
-            Layout.fillWidth:true; implicitHeight:118; color:appTheme.palette.surface; radius:10;border.color:appTheme.palette.border
-            RowLayout {
-                visible: !root.masked
-                anchors.fill:parent;anchors.margins:16;spacing:20
-                Repeater {
-                    model: root.s.totals
-                    ColumnLayout {
-                        required property var modelData
-                        Layout.fillWidth:true;Layout.preferredWidth:1;spacing:8
-                        Copy { text:modelData.title;color:appTheme.palette.muted;font.pixelSize:13;tip:modelData.tip }
-                        RowLayout {
-                            spacing:5
-                            Copy { text:modelData.value;font.pixelSize:28;font.bold:true;tip:modelData.tip }
-                            Copy { text:modelData.unit;font.pixelSize:12;color:appTheme.palette.muted }
-                            Copy { visible:modelData.partial;text:root.t('확인분');font.pixelSize:11;color:appTheme.palette.muted;tip:modelData.tip }
-                        }
-                        Copy { text:modelData.sub;font.pixelSize:12;color:appTheme.palette.muted;tip:modelData.subTip;Layout.minimumHeight:16 }
-                    }
-                }
-            }
-            Loader { anchors.fill:parent;active:root.s.home && !!root.loading.active;sourceComponent:Component { AnalysisLoading { status:root.loading } } }
-        }
-        GridLayout {
-            Layout.fillWidth:true;Layout.fillHeight:true;columns:2;rowSpacing:20;columnSpacing:20
-            Repeater {
-                model:root.s.cards
-                AbstractButton {
-                    id: card
-                    objectName: "home-card-"+modelData.page
-                    required property var modelData
-                    readonly property string thumbnail:(root.s.thumbnails||{})[String(modelData.page)]||''
-                    Layout.fillWidth:true;Layout.fillHeight:true;Layout.preferredWidth:1;Layout.preferredHeight:1;Layout.minimumHeight:205
-                    hoverEnabled:true;activeFocusOnTab:true;Accessible.name:root.t(modelData.title)+', '+root.t(modelData.description)
-                    onClicked:root.node.navigate(modelData.page)
-                    background:Rectangle {radius:10;color:card.hovered?appTheme.palette.secondary:appTheme.palette.surface;border.color:card.activeFocus||card.hovered?appTheme.palette.accent:appTheme.palette.border}
-                    contentItem:ColumnLayout {
-                        anchors.fill:parent;anchors.margins:16;spacing:12
-                        RowLayout {
-                            Layout.fillWidth:true;spacing:12
-                            Rectangle {
-                            Layout.preferredWidth:32;Layout.preferredHeight:32;radius:7;color:appTheme.palette.secondary
-                            Canvas {
-                                anchors.centerIn:parent;width:26;height:26
-                                property color ink:appTheme.palette.accent
-                                onInkChanged:requestPaint()
-                                onPaint:{let c=getContext('2d');c.reset();c.strokeStyle=ink;c.lineWidth=1.7;c.beginPath();
-                                    if(card.modelData.icon==='compare'){c.moveTo(4,6);c.lineTo(23,6);c.moveTo(4,13);c.lineTo(17,13);c.moveTo(4,20);c.lineTo(11,20)}
-                                    else if(card.modelData.icon==='trend'){c.moveTo(3,3);c.lineTo(3,23);c.lineTo(24,23);c.moveTo(6,18);c.lineTo(11,11);c.lineTo(16,15);c.lineTo(23,5)}
-                                    else if(card.modelData.icon==='records'){c.rect(5,2,17,22);for(let y=7;y<22;y+=5){c.moveTo(9,y);c.lineTo(18,y)}}
-                                    else{c.arc(13,13,10,.7,5.6);c.moveTo(13,13);c.lineTo(19,7)}c.stroke()}
-                            }
-                            }
-                            Copy {text:root.t(card.modelData.title);font.pixelSize:20;font.bold:true;Layout.fillWidth:true;wrapMode:Text.NoWrap;elide:Text.ElideRight;tip:root.t(card.modelData.description)}
-                            Copy {text:'→';font.pixelSize:20;color:appTheme.palette.muted}
-                        }
-                        Rectangle {
-                            Layout.fillWidth:true;Layout.fillHeight:true;Layout.minimumHeight:110
-                            color:appTheme.palette.secondary;radius:6;clip:true
-                            Image {
-                                objectName:'home-thumbnail-'+card.modelData.page
-                                anchors.fill:parent;anchors.margins:10;anchors.bottomMargin:26
-                                source:card.thumbnail;cache:false
-                                fillMode:sourceSize.width/sourceSize.height>=width/height?Image.PreserveAspectFit:Image.PreserveAspectCrop
-                                verticalAlignment:Image.AlignTop
-                                visible:source.toString().length>0
-                            }
-                            Canvas {
-                                anchors.fill:parent;anchors.margins:18;anchors.bottomMargin:32
-                                visible:!card.thumbnail
-                                property color ink:appTheme.palette.muted
-                                property color accent:appTheme.palette.accent
-                                onInkChanged:requestPaint()
-                                onAccentChanged:requestPaint()
-                                onWidthChanged:requestPaint()
-                                onHeightChanged:requestPaint()
-                                onPaint:{let c=getContext('2d');c.reset();let w=width,h=height;c.strokeStyle=ink;c.fillStyle=ink;c.globalAlpha=.16;c.lineWidth=1;
-                                    for(let i=1;i<4;i++){c.beginPath();c.moveTo(0,h*i/4);c.lineTo(w,h*i/4);c.stroke()}
-                                    c.globalAlpha=.5;
-                                    if(card.modelData.icon==='compare'){
-                                        let lengths=[.86,.65,.42];for(let i=0;i<3;i++){c.fillStyle=i===0?accent:ink;c.fillRect(0,h*(.12+i*.28),w*lengths[i],Math.max(6,h*.12))}
-                                    }else if(card.modelData.icon==='records'){
-                                        for(let i=0;i<4;i++){let y=h*(.08+i*.23);c.fillRect(0,y,w*.08,h*.08);c.fillRect(w*.13,y,w*(i%2?.44:.55),h*.08);c.fillRect(w*.8,y,w*.17,h*.08)}
-                                    }else{
-                                        let points=card.modelData.icon==='trend'?[.8,.63,.7,.37,.43,.2,.3,.12]:[.15,.23,.3,.43,.55,.62,.76,.82];
-                                        c.strokeStyle=accent;c.lineWidth=2;c.beginPath();for(let i=0;i<points.length;i++){let x=w*i/(points.length-1),y=h*points[i];if(i)c.lineTo(x,y);else c.moveTo(x,y)}c.stroke();
-                                    }
-                                }
-                            }
-                            Copy {anchors.right:parent.right;anchors.bottom:parent.bottom;anchors.margins:8;text:root.t(card.thumbnail?'최근 화면':'기본 미리보기');font.pixelSize:11;color:appTheme.palette.muted}
-                        }
-                    }
-                }
-            }
-        }
-    }
-    ColumnLayout {
         id: compare
-        anchors.fill:parent;visible:!root.s.home;spacing:14
+        anchors.fill:parent;spacing:14
         RowLayout {
             Layout.fillWidth:true;spacing:12
             Field {caption:root.t('조회 기간');field:'period';value:root.o.period;Layout.preferredWidth:150;Layout.maximumWidth:150;entries:[{text:root.t('전체 기록'),value:'all'},{text:root.t('오늘'),value:'today'},{text:root.t('최근 7일'),value:'7d'},{text:root.t('최근 30일'),value:'30d'},{text:root.t('직접 지정'),value:'custom'}]}
@@ -212,7 +114,7 @@ Item {
             id: chart
             objectName:'usage-chart'
             Layout.fillWidth:true;Layout.fillHeight:true;Layout.minimumHeight:148
-            readonly property bool canResize: visible && !root.s.home && !root.s.queryPending && !root.masked
+            readonly property bool canResize: visible && !root.s.queryPending && !root.masked
             onHeightChanged:if(canResize)resize.restart()
             onCanResizeChanged:if(canResize)resize.restart();else resize.stop()
             Timer {id:resize;objectName:'usage-resize';interval:100;onTriggered:if(chart.canResize)root.node.change('size',String(Math.floor((chart.height-36)/54)))}
@@ -268,7 +170,7 @@ Item {
                 }
                 Copy {visible:root.s.rows.length===0;width:parent.width;height:100;text:root.t('조건에 맞는 기록 없음');horizontalAlignment:Text.AlignHCenter;color:appTheme.palette.muted}
             }
-            Loader { anchors.fill:parent;active:!root.s.home && !!root.loading.active;sourceComponent:Component { AnalysisLoading { status:root.loading } } }
+            Loader { anchors.fill:parent;active:!!root.loading.active;sourceComponent:Component { AnalysisLoading { status:root.loading } } }
         }
         RowLayout {
             Layout.fillWidth:true

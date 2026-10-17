@@ -99,25 +99,22 @@ def main():
                 if state['kind'] in ('button','choice','input','switch','toggle') and item.height()<34:
                     report['layout_errors'].append(dict(view=name,kind=state['kind'],text=state['text'],height=item.height()))
         try:
-            assert window.nav.count()==4 and window.quota_service is None
+            assert window.nav.count()==3 and window.quota_service is None
             window.setAttribute(Qt.WA_ShowWithoutActivating);window.show()
             for theme in ('light','dark','codex'):
                 window.settings.setValue('ui/theme',theme)
                 shared_theme().configure(theme)
                 for width,height in ((1120,760),(1440,940)):
                     window.resize(width,height);prefix=f'{theme}-{width}'
-                    for page,name in enumerate(('overview','comparison','sessions','quota','settings')):
+                    for page,name in ((3,'quota'),(1,'comparison'),(5,'performance'),(2,'calls'),(4,'settings')):
                         if page==4:window.open_settings()
-                        else:window.nav.setCurrentRow(page)
+                        else:window.change_page(page)
                         capture(prefix+'-'+name);check_layout(prefix+'-'+name)
                         if theme!='codex':assert shared_theme().dark==(theme=='dark')
                         if page==1:
-                            window.select_compare_type('mode');settle();capture(prefix+'-fast-comparison')
-                            window.select_compare_type('effort');settle()
+                            window.metric_panel.change('dimension','model');settle();capture(prefix+'-model-comparison')
                         if page==2:
                             state=window.capture_state()
-                            assert window.record_view=='projects' and window.table.rowCount()==3
-                            click_row(window,window.table,0);settle()
                             assert window.record_view=='sessions' and window.table.rowCount()==10
                             click_row(window,window.table,0);settle();assert window.record_view=='requests'
                             capture(prefix+'-requests')

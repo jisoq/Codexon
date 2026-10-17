@@ -440,7 +440,7 @@ def test_monitoring_pause_persists_and_restores_readable_page(quota_page,tmp_pat
         assert window.quota_sidebar.weekly.text()==before
         assert window.quota_panel.history.isEnabled()
         assert window.grab().save(str(tmp_path/'monitoring-paused.png'))
-        window.change_page(0)
+        window.change_page(1)
         assert not window.quota_pause_button.isVisible()
         from copy import deepcopy
         updated=deepcopy(fixture.quota)

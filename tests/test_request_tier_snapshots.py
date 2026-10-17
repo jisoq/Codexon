@@ -63,6 +63,31 @@ def test_applied_settings_are_historical_scoped_and_do_not_relabel_active_turn()
     assert 'PRIVATE' not in json.dumps(sanitized(setting(10001)))
 
 
+def test_turn_context_pairs_with_applied_snapshot_at_the_same_timestamp():
+    from cachemonitor.analysis_engine import AnalysisEngine
+    from cachemonitor.overlay_data import OverlaySummaries
+    s=Session(TID,'h')
+    records=[event('turn_context',10000,turn_id='first',model='gpt-6-astra'),
+             setting(10000,'default'),usage('first',time=10001),
+             event('turn_context',10002,turn_id='fast',model='gpt-6-astra'),
+             setting(10002),usage('fast',time=10003),
+             setting(10004,None),usage('still-fast',time=10005),
+             event('turn_context',10006,turn_id='override',model='gpt-6-astra',service_tier='priority'),
+             complete_setting(10006),usage('override',time=10007)]
+    for record in records:
+        if record['type']=='token_usage_record':
+            record['payload']['turn_id']={10001:'first',10003:'fast',10005:'fast',10007:'override'}[int(stamp(record['timestamp']))]
+            record['payload']['usage']['cache_write_input_tokens']=0
+        s.consume(sanitized(record),10008)
+    assert [r.service_tier for r in s.requests]==['default','priority','priority','priority']
+    assert s.requests[0].request_mode_source=='applied_settings'
+    assert s.requests[-1].request_mode_source=='turn_context'
+    engine=AnalysisEngine();engine.ingest([s.view(10008)])
+    overlay=OverlaySummaries().collect(engine)[0]
+    assert overlay['priced']==4 and overlay['latest']['mode']=='Fast'
+    assert overlay['cost'] is not None
+
+
 def test_old_index_backfills_applied_settings_without_changing_token_counts(tmp_path,monkeypatch):
     home,path=fixture_home(tmp_path)
     records=[json.loads(line) for line in path.read_text().splitlines()]

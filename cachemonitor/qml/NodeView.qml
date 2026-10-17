@@ -271,6 +271,7 @@ Item {
     Component {
         id: buttonComponent
         UiButton {
+            id: buttonControl
             role: view.s.role || "secondary"
             text: view.buttonText === undefined ? view.node.textValue : view.buttonText; checkable: view.s.checkable; checked: view.s.checked
             font.pixelSize: view.s.fontSize
@@ -287,24 +288,26 @@ Item {
             Keys.onEnterPressed: event => { if (view.s.activateOnReturn) view.node.activate(); else event.accepted = false }
             onClicked: view.node.activate()
             Accessible.name: view.s.accessible || view.node.textValue
-            UiToolTip { visible: parent.hovered && view.toolTipText.length > 0; text: view.toolTipText }
+            UiToolTip { visible: buttonControl.hovered && view.toolTipText.length > 0; text: view.toolTipText }
         }
     }
     Component {
         id: toggleComponent
         UiCheckBox {
+            id: toggleControl
             textColor: appTheme.color(view.s.color || "ink")
             text: view.node.textValue; checked: view.s.checked; onClicked: view.node.activate()
             Accessible.name: view.s.accessible || text
-            UiToolTip { visible: parent.hovered && view.s.tooltip.length > 0; text: view.s.tooltip }
+            UiToolTip { visible: toggleControl.hovered && view.s.tooltip.length > 0; text: view.s.tooltip }
         }
     }
     Component {
         id: switchComponent
         UiSwitch {
+            id: switchControl
             checked: view.s.checked; onClicked: view.node.activate()
             Accessible.name: view.s.accessible
-            UiToolTip { visible: parent.hovered && view.s.tooltip.length > 0; text: view.s.tooltip }
+            UiToolTip { visible: switchControl.hovered && view.s.tooltip.length > 0; text: view.s.tooltip }
         }
     }
     Component {
@@ -324,7 +327,7 @@ Item {
         ListView {
             implicitWidth: 166; implicitHeight: contentHeight; clip: true
             spacing: 4
-            model: view.s.homeOnly ? view.s.items.slice(0,1) : view.s.items; currentIndex: view.s.index; keyNavigationEnabled: true
+            model: view.s.items; currentIndex: view.s.index; keyNavigationEnabled: true
             onCurrentIndexChanged: if (activeFocus && currentIndex !== view.s.index) view.node.choose(currentIndex)
             delegate: ItemDelegate {
                 id: navigationItem

@@ -223,14 +223,13 @@ def test_process_queries_latest_selection_cache_and_clean_shutdown(tmp_path):
             request=w.request_id,page=w.current_page,key=w.applied_key,
             worker_pending=w.worker.pending,worker_alive=bool(w.worker.process and w.worker.process.is_alive())))
     try:
-        settle()
+        w.change_page(1);settle()
         w.model.setCurrentIndex(0)
-        w.nav.setCurrentRow(0); settle()
-        assert w.home_panel.data['totals']['calls']['value']==7
+        assert w.metric_panel.data['summary']['value']==7
         w.nav.setCurrentRow(1)
         w.metric_panel.change('filter:source','subagent')
         w.metric_panel.change('filter:source','')
-        w.nav.setCurrentRow(w.navigation_pages.index(2)); settle()
+        w.change_page(2); settle()
         assert w.record_view=='sessions' and w.table.rowCount()==1 and w.selected_session is None
         assert w.worker.process.pid is not None
         assert not w.analysis_errors
@@ -282,19 +281,17 @@ def test_large_population_projection_reuses_calls_across_readiness_but_not_revis
     snapshot=dict(ts=110,sessions=[history()],homes=[],errors=[],unassigned=[],
                   epoch='first',data_revision=1,call_revision=1,index=dict(loading=False))
     try:
-        w.receive(snapshot);w.show();app.processEvents();w.async_mode=True;w.render()
+        w.receive(snapshot);w.show();w.change_page(1);app.processEvents();w.async_mode=True;w.render()
         def deliver(count):
             result=w.engine.page_query(w.pending_query)
             result['analysis']['response_count']=count
             # A compact protocol fixture represents a large population with
             # missing older metrics, without allocating its underlying calls.
-            for key,item in result['usage']['totals'].items():
-                if key=='calls':item.update(value=count,known=count,total=count,partial=False)
-                else:item.update(total=count,partial=True)
+            result['usage']['summary'].update(value=count,known=count,total=count,partial=False)
             w.analysis_ready(dict(id=w.request_id,logical=w.pending_logical,result=result,valid_until=1000))
         deliver(300000);assert not w.analysis_pending
         w.receive(dict(snapshot,ts=111,data_revision=2,index=dict(loading=True)))
-        assert not w.analysis_pending and w.home_panel.data['totals']['calls']['value']==300000
+        assert not w.analysis_pending and w.metric_panel.data['summary']['value']==300000
         changed=dict(snapshot,ts=112,data_revision=3,call_revision=2)
         w.receive(changed);assert w.analysis_pending
         deliver(300001);assert not w.analysis_pending
@@ -317,7 +314,7 @@ def test_hidden_dashboard_defers_all_page_refreshes(tmp_path,monkeypatch,shown_b
         w.tick.stop()
         calls=[]
         monkeypatch.setattr(w.quota_panel,'refresh_status',lambda:calls.append('quota'))
-        for page in range(5):
+        for page in range(1,6):
             w.current_page=page;w._display_dirty=False
             w.render(automatic=True);w.check_stale()
             assert w._display_dirty and not calls

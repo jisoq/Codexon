@@ -118,7 +118,7 @@ def test_rendered_summary_click_and_overlay_speed_navigation(tmp_path):
         index=[key for key,title in window.active_columns].index('output_speed')
         assert window.response_cell(data['latest'],index,Qt.DisplayRole)=='100.0 tok/s'
         window.nav.setCurrentRow(0);window.resize(1000,720);QTest.qWait(60)
-        assert len(window.home_panel.state['totals'])==4
+        assert window.current_page==3 and control(window,window.quota_panel).isVisible()
         assert window.quick.grabFramebuffer().save(str(tmp_path/'dashboard-small.png'))
         links.hide()
         for language in ('ko','en'):

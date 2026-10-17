@@ -65,6 +65,60 @@ def layout_controller(tmp_path,monkeypatch):
     controller.stop();app.processEvents()
 
 
+@pytest.mark.parametrize('compact',[False,True])
+def test_pending_overlay_refresh_keeps_confirmed_panel_until_replacement(layout_controller,monkeypatch,compact):
+    from copy import deepcopy
+    import time
+    c=layout_controller;app=QApplication.instance();m=c.widget.content_model
+    confirmed=deepcopy(c.sessions[0])
+    confirmed.update(_prepared_token=('fixture',1),_overlay_revision=('fixture',1),_recent_refs=False)
+    c._overlay_detail=confirmed
+    requests=[]
+    c.overlay_loader=lambda request,data,**kwargs:requests.append((request,data))
+    def publication(detail):
+        return dict(detail,_recent_refs=True,recent=[{'key':row['id']} for row in detail['recent']],
+                    latest={'key':detail['latest']['id']})
+    def publish(detail,stamp):
+        c.receive_snapshot(dict(overlay_sessions=[publication(detail)],ts=stamp))
+        app.processEvents()
+    stamp=time.time();publish(confirmed,stamp)
+    if compact:c.native.bounds=(0,0,1300,m.monitor_height(True)+32)
+    m.monitor_tab='history';m.pin_call(m.call_id(m.rows()[0]));c.refresh();app.processEvents()
+    assert m.compact is compact
+    selected=m.selected_id;geometry=c.monitor_geometry;before=c.widget.grab().toImage()
+    changed=deepcopy(confirmed)
+    changed.update(_prepared_token=('fixture',2),_overlay_revision=('fixture',2),cost=confirmed['cost']+1)
+    changed['recent'][-1]['output']+=10;changed['latest']=changed['recent'][-1]
+    publish(changed,stamp+1)
+    assert m.data and m.data['cost']==confirmed['cost']
+    assert m.data['latest']['output']==confirmed['latest']['output']
+    assert m.data['_collection']['last_confirmed_at']==stamp
+    assert m.selected_id==selected and m.graph_pinned
+    assert c.monitor_geometry==geometry and c.widget.grab().toImage()==before
+    assert m.notice_card() is None and len(requests)==1
+    # Rejected obsolete reads must not erase the still-valid displayed snapshot.
+    c.receive_overlay_detail(dict(id=requests[-1][0],kind='stale'))
+    app.processEvents()
+    assert c.widget.grab().toImage()==before and m.selected_id==selected
+    # A stalled detail refresh must disclose the age of the retained values.
+    with monkeypatch.context() as clock:
+        clock.setattr('cachemonitor.overlay.time.time',lambda:stamp+20)
+        c.refresh()
+        assert m.data['cost']==confirmed['cost'] and m.note=='수집 지연'
+        assert m.data['_collection']['last_confirmed_at']==stamp and m.freshness_text()
+    changed['_prepared_token']=('fixture',3);publish(changed,stamp+2)
+    c.receive_overlay_detail(dict(id=requests[-1][0],summary=changed,prepared_token=changed['_prepared_token']))
+    app.processEvents()
+    assert m.data['cost']==changed['cost'] and m.data['latest']['output']==changed['latest']['output']
+    assert m.data['_collection']['last_confirmed_at']==stamp+2
+    assert m.selected_id==selected and m.graph_pinned and m.notice_card() is None
+    # Selecting another chat must never display this chat's retained numbers.
+    other=dict(publication(changed),id='another-chat')
+    c.receive_snapshot(dict(overlay_sessions=[other],ts=stamp+3))
+    c.receive_target(dict(target={'hwnd':1},selection=Selection('another-chat')))
+    assert m.notice_card() and not m.rows() and not m.selected_id
+
+
 def test_popup_outside_click_escape_order_and_persisted_opacity(layout_controller):
     controller=layout_controller
     assert controller.opacity==94 and not controller.toolbar.isVisible()

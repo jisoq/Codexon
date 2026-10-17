@@ -134,7 +134,6 @@ RULES = (
     ('cachemonitor/prepared_query.py', ('prepared', 'analysis', 'dashboard', 'details')),
     ('cachemonitor/prepared_analysis.py', ('prepared', 'analysis', 'dashboard', 'details')),
     ('cachemonitor/prepared_history.py', ('prepared', 'analysis', 'dashboard', 'details')),
-    ('cachemonitor/prepared_home.py', ('prepared', 'analysis', 'dashboard')),
     ('cachemonitor/prepared_category.py', ('prepared', 'analysis', 'dashboard')),
     ('cachemonitor/prepared_sums.py', ('prepared', 'analysis', 'dashboard')),
     ('cachemonitor/prepared_performance.py', ('prepared', 'performance_trends')),

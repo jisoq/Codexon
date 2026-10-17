@@ -144,7 +144,7 @@ def main():
                 quota_path=str(Path(folder)/'quota.sqlite'),static_snapshot=None if args.live else snapshot,
                 settings=QSettings(str(Path(folder)/'settings.ini'),QSettings.IniFormat),
                 live_limits=False,collection_autostart=False)
-            window.resize(1480,1000);window.show()
+            window.resize(1480,1000);window.show();window.change_page(1)
             def pending():
                 return window.analysis_pending or window.deferred_result or window.search_timer.isActive() or window.range_timer.isActive()
             def settle():
@@ -164,13 +164,12 @@ def main():
                 memory.append(dict(gui=private_bytes(os.getpid()),worker=private_bytes(window.worker.process.pid)))
                 with window.worker.lock:queue_sizes.append(len(window.worker.commands)+int(window.worker.pending is not None))
             def navigate(page):
-                if window.current_page==0 and page!=0:
-                    delegate=next(x for x in walk(window.quick.rootObject())
-                                  if x.objectName()==f'home-card-{page}' and x.isVisible())
-                else:
-                    item=control(window,window.nav)
-                    row=window.navigation_pages.index(page)
-                    delegate=next(x for x in walk(item) if x.property('index')==row and x.metaObject().indexOfProperty('modelData')>=0)
+                if page==2:
+                    window.change_page(2)
+                    return
+                item=control(window,window.nav)
+                row=window.navigation_pages.index(page)
+                delegate=next(x for x in walk(item) if x.property('index')==row and x.metaObject().indexOfProperty('modelData')>=0)
                 point=delegate.mapToScene(QPointF(delegate.width()/2,delegate.height()/2))
                 QTest.mouseClick(window.quick,Qt.LeftButton,pos=point.toPoint())
                 assert window.current_page==page
@@ -216,9 +215,9 @@ def main():
             window.quick.grabFramebuffer()
             samples.clear();last[0]=time.perf_counter();probe.start(10)
             cpu_started=time.process_time();work_started=time.perf_counter()
-            for page in (1,2,0):sample('page_first',lambda page=page:navigate(page))
+            for page in (1,2,3):sample('page_first',lambda page=page:navigate(page))
             for iteration in range(args.samples):
-                for page in (1,2,0):sample('page_revisit',lambda page=page:navigate(page))
+                for page in (1,2,3):sample('page_revisit',lambda page=page:navigate(page))
                 navigate(2);settle()
                 sample('search',type_search);sample('search_clear',lambda:type_search(True))
                 if window.model.count()>1:

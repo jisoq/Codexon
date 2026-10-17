@@ -181,7 +181,7 @@ def test_tab_loading_keeps_controls_and_ignores_stale_result(tmp_path,language):
         window.analysis_ready(dict(id=old_id,logical=old_logical,
             result=window.engine.page_query(old_query),valid_until=float('inf')))
         assert window.analysis_pending and window.pages.isVisible()
-        assert not window.pages.isPageReady(2)
+        assert not window.pages.isPageReady(1)
         deliver_pending(window)
         assert not window.analysis_pending and window.pages.isVisible()
         assert not window.analysis_loading
@@ -191,7 +191,7 @@ def test_tab_loading_keeps_controls_and_ignores_stale_result(tmp_path,language):
         window.analysis_failed('unbuilt-page failure')
         assert window.pages.isVisible() and not window.analysis_loading['running']
         window.render();deliver_pending(window)
-        wait_for_rendered(lambda:window.pages.isPageReady(2) and window.pages.isVisible(),timeout=5)
+        wait_for_rendered(lambda:window.pages.isPageReady(1) and window.pages.isVisible(),timeout=5)
         assert not window.analysis_loading
         window.render()
         assert not window.analysis_pending and not window.analysis_loading
@@ -200,13 +200,13 @@ def test_tab_loading_keeps_controls_and_ignores_stale_result(tmp_path,language):
         assert control(window,window.performance_panel.model_choice).isVisible()
         assert not control(window,window.performance_panel.chart_scroll).isVisible()
         deliver_pending(window)
-        wait_for_rendered(lambda:window.pages.isPageReady(5) and control(window,window.performance_panel.chart_scroll).isVisible(),timeout=5)
+        wait_for_rendered(lambda:window.pages.isPageReady(4) and control(window,window.performance_panel.chart_scroll).isVisible(),timeout=5)
         assert not window.analysis_loading
         for page in (3,4):
             window.change_page(page)
             assert window.pages.isVisible() and not window.analysis_loading
             window.show_analysis_pending();window.show_analysis_slow()
-            wait_for_rendered(lambda:window.pages.isPageReady(page),timeout=5)
+            wait_for_rendered(lambda:window.pages.isPageReady(page-1),timeout=5)
             assert not window.analysis_loading and not window.pending_label.isVisible()
         assert not window.qml_errors
     finally:window.quit_app();set_language('ko')
@@ -218,10 +218,10 @@ def test_refresh_preserves_only_matching_results_and_failure_can_retry(tmp_path)
     window=dashboard(tmp_path)
     try:
         window.receive(sample());window.show();window.change_page(1);window.render()
-        wait_for_rendered(lambda:window.pages.isPageReady(1) and window.pages.isVisible(),timeout=5)
+        wait_for_rendered(lambda:window.pages.isPageReady(0) and window.pages.isVisible(),timeout=5)
         comparison=window.view_result
         window.change_page(2)
-        wait_for_rendered(lambda:window.pages.isPageReady(2) and window.pages.isVisible(),timeout=5)
+        wait_for_rendered(lambda:window.pages.isPageReady(1) and window.pages.isVisible(),timeout=5)
         window.async_mode=True
         window.snapshot={**window.snapshot,'data_revision':1}
         window.change_page(1)
@@ -285,24 +285,21 @@ def test_empty_result_waits_for_collection_before_showing_empty_charts(tmp_path)
     from test_ui import wait_for_rendered
     window=dashboard(tmp_path)
     try:
-        window.show();window.async_mode=True
+        window.show();window.change_page(1);window.async_mode=True
         window.snapshot['index']={'loading':True}
         window.render();deliver_pending(window)
         assert not window.analysis_pending and window.pages.isVisible()
         assert window.analysis_loading['active'] and window.analysis_loading['running']
         assert window.analysis_stage=='queued'
-        home=control(window,window.home_panel)
-        cards=[item for item in walk(home) if item.objectName().startswith('home-card-')]
-        assert len(cards)==4 and all(card.isVisible() and card.isEnabled() for card in cards)
-        wait_for_rendered(lambda:len([item for item in walk(home)
-            if item.objectName()=='analysis-region-loading' and item.isVisible()])==1)
-        assert all(not any(item.objectName()=='analysis-region-loading' for item in walk(card)) for card in cards)
-        assert home.property('masked')
+        comparison=control(window,window.metric_panel)
+        wait_for_rendered(lambda:any(item.objectName()=='analysis-region-loading' and item.isVisible()
+            for item in walk(comparison)))
+        assert comparison.property('masked')
         window.snapshot['index']['loading']=False
         window.render();deliver_pending(window)
         wait_for_rendered(lambda:window.pages.isVisible(),timeout=5)
         assert not window.analysis_loading
-        assert window.home_panel.state['totals'][1]['value']=='0'
+        assert not window.metric_panel.data['rows']
         assert window.analysis['response_count']==0
         window.change_page(5);window._refresh_after_pending=True
         calls=[];window.render=lambda *args,**kwargs:calls.append(kwargs)
@@ -316,7 +313,7 @@ def test_empty_result_waits_for_collection_before_showing_empty_charts(tmp_path)
 def test_real_conflict_is_visible_but_missing_wire_evidence_is_not_an_error(tmp_path):
     window=dashboard(tmp_path)
     try:
-        window.receive(sample());window.nav.setCurrentRow(window.navigation_pages.index(2))
+        window.receive(sample());window.change_page(2)
         window.record_view='calls';window.render_explorer()
         row=window.record_rows[0]
         assert record_issues(row)==[]
@@ -340,7 +337,7 @@ def test_subscription_prices_and_call_detail_render_supported_models(tmp_path,la
     set_language(language);window=dashboard(tmp_path)
     try:
         snapshot=sample();snapshot['sessions'][0]['history'][0]['service_tier']='Fast'
-        window.receive(snapshot);window.show();window.nav.setCurrentRow(window.navigation_pages.index(2))
+        window.receive(snapshot);window.show();window.change_page(2)
         window.record_view='calls';window.render_explorer()
         row=window.record_rows[0];window.activate_record(0)
         window.record_section='pricing';window.render_record_detail(row)
@@ -380,7 +377,7 @@ def test_subscription_prices_and_call_detail_render_supported_models(tmp_path,la
 def test_unpriced_call_explains_missing_input_without_claiming_collection_error(tmp_path):
     window=dashboard(tmp_path)
     try:
-        window.receive(sample());window.nav.setCurrentRow(window.navigation_pages.index(2))
+        window.receive(sample());window.change_page(2)
         window.record_view='calls';window.render_explorer()
         row=dict(window.record_rows[0],cost=None,service_tier='미확인',price_issue='요청 모드 미확인',price_issues=['요청 모드 미확인'])
         window.render_record_detail(row)

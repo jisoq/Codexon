@@ -33,12 +33,12 @@ def start_smoke(window,app,path,fonts,depth='full'):
             settle()
             assert window.quick.status()==QQuickWidget.Status.Ready
             assert window.taskbar_quota.native is None
-            assert window.nav.count()==5
+            assert window.nav.count()==3
             report['sessions']=len(window.snapshot['sessions'])
             report['model_requests']=0;report['live_quota_requests']=0
-            for page,name in enumerate(('overview','comparison','sessions','quota','settings','performance')):
+            for page,name in ((3,'quota'),(1,'comparison'),(5,'performance'),(2,'calls'),(4,'settings')):
                 if page==4:window.open_settings()
-                else:window.nav.setCurrentRow(window.navigation_pages.index(page))
+                else:window.change_page(page)
                 settle()
                 target=path.with_name(path.stem+'-'+name+'.png')
                 assert window.grab().save(str(target));report['screens'].append(str(target))
@@ -57,7 +57,7 @@ def start_smoke(window,app,path,fonts,depth='full'):
                 window.settings_page.reveal(category);QTest.qWait(60)
                 target=path.with_name(path.stem+f'-settings-{category}.png')
                 assert window.grab().save(str(target));report['screens'].append(str(target))
-            window.nav.setCurrentRow(window.navigation_pages.index(2));settle()
+            window.change_page(2);settle()
             search=control(window,window.search);search.forceActiveFocus()
             QTest.keyClicks(window.quick,'__qml_no_such_session__');settle()
             assert window.table.rowCount()==0
@@ -92,7 +92,7 @@ def start_smoke(window,app,path,fonts,depth='full'):
                 from .qa import interaction_probe
                 report['interactions']=interaction_probe(window,app,settle)
             if window.selected_call:window.close_record_detail()
-            window.nav.setCurrentRow(window.navigation_pages.index(2));settle()
+            window.change_page(2);settle()
             for mode in ('weekly','five_hour'):
                 window.set_quota_mode(mode)
                 assert window.settings.value('tray/quotaMode')==mode

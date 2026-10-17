@@ -154,11 +154,6 @@ class PreparedAnalysisEngine(AnalysisEngine):
         with self.read_scope():
             return project(self, q)
 
-    def prepared_home_totals(self, query):
-        from .prepared_home import project
-        with self.read_scope():
-            return project(self, query)
-
     def query(self, q):
         with self.read_scope():
             return super().query(q)

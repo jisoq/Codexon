@@ -1,9 +1,7 @@
-"""Native Home and metric comparison presentation, backed by worker projections."""
+"""Metric comparison presentation, backed by worker projections."""
 from copy import deepcopy
 from datetime import datetime, timedelta
-import hashlib
-import json
-from PySide6.QtCore import Slot, QTimer, QSize, Qt
+from PySide6.QtCore import Slot, QTimer
 from .presentation import Node
 from .i18n import tr
 from .theme import shared_theme
@@ -27,91 +25,19 @@ def value_text(value, metric):
 class UsagePanel(Node):
     kind='usageDashboard'
 
-    def __init__(self, dashboard, home=False):
-        super().__init__();self.dashboard=dashboard;self.home=home;self.data={}
-        self._thumbnails={};self._thumbnail_keys={};self._thumbnail_pending=None;self._thumbnail_epoch=0
+    def __init__(self, dashboard):
+        super().__init__();self.dashboard=dashboard;self.data={}
         self.options=dict(period='all',start='',end='',filters={},archived=True,dimension='project',metric='calls',
                           mode='amount',search='',sort='desc',page=0,size=8,selected=[],views={},filtersOpen=False,breakdowns=[])
         self.search_timer=QTimer(self);self.search_timer.setSingleShot(True);self.search_timer.setInterval(160)
         self.search_timer.timeout.connect(self.refresh)
         shared_theme().changed.connect(self.restyle)
-        self.put(home=home,options=deepcopy(self.options),cards=[dict(title=t,description=d,page=p,icon=i) for t,d,p,i in (
-            ('지표 비교','조건 별 주요 데이터 비교',1,'compare'),('성능 추이','시간에 따른 주요 데이터 비교',5,'trend'),
-            ('세션 기록','세션 상세 데이터',2,'records'),('구독 모니터링','구독 할당량 API 가치 추적',3,'gauge'))],
+        self.put(options=deepcopy(self.options),
             dimensions=[dict(text=tr(t),value=v) for t,v in DIMENSIONS],metrics=[dict(text=tr(t),value=v) for t,v in METRICS],
-            totals=[],rows=[],legend=[],detail=[],thumbnails={},scope=tr('전체 기록'),pageLabel='',countLabel='',title='',maximum=1,tpsTip='',metricLabel='')
+            rows=[],legend=[],detail=[],scope=tr('전체 기록'),pageLabel='',countLabel='',title='',maximum=1,tpsTip='',metricLabel='')
 
     def restyle(self):
-        if self.home:self.clear_thumbnails()
         if self.data:self.apply(self.data)
-
-    def clear_thumbnails(self,closing=False):
-        retired=list(self._thumbnails.values())
-        self._thumbnail_epoch+=1;self._thumbnails.clear();self._thumbnail_keys.clear()
-        if closing and self._thumbnail_pending:
-            retired.append(self._thumbnail_pending[0])
-            self._thumbnail_pending[0].ready.disconnect(self._thumbnail_ready)
-            self._thumbnail_pending=None
-        self.put(thumbnails={})
-        # Let QML detach image consumers and the current Qt event finish first.
-        if retired:QTimer.singleShot(0,lambda keep=retired:None)
-
-    def remember_page(self,page):
-        """One bounded in-memory capture on departure; never open an unseen page."""
-        w=self.dashboard
-        if (not self.home or page not in (1,2,3,5) or self._thumbnail_pending
-                or not w.isVisible() or w.isMinimized() or w.analysis_pending or w.analysis_errors):return
-        if w._quick is None:return
-        if page==3 and (w.quota_panel._chart_pending is not None or w.quota_panel._query_pending is not None):return
-        targets={2:(w.table,w.record_current),3:(w.quota_panel.history,w.scrollers[3]),
-                 5:(*list(w.performance_panel.plots.values())[:1],w.performance_panel.chart_scroll)}
-        items=[]
-        def visit(item):
-            if not item.isVisible():return
-            items.append(item)
-            for child in item.childItems():visit(child)
-        visit(w.quick.rootObject())
-        item=None
-        if page==1:
-            item=next((item for item in items if item.objectName()=='usage-chart-content'),None)
-        else:
-            for node in targets[page]:
-                item=next((item for item in items if item.metaObject().indexOfProperty('node')>=0 and item.property('node')==node),None)
-                if item is not None:break
-        if item is None or item.width()<1 or item.height()<1:return
-        # Hash only visible aggregates or view settings, never the call history.
-        options=None
-        if page==1:
-            data=w.metric_panel.data
-            options=(data['rows'],data['metric'],data['summary'],data['maximum'],w.metric_panel.options['mode'])
-        elif page==2:options=(w.table.verticalScrollBar().value(),w.table.horizontalScrollBar().value())
-        elif page==3:options=(id(w.quota_panel.report),w.quota_panel._query_parameters(),w.quota_panel.cycle_choice.currentData())
-        elif page==5:options=(w.performance_panel.models,w.performance_panel.modes,w.performance_panel.reasoning_effort,w.performance_panel.show_outer)
-        ratio=w.quick.devicePixelRatioF()
-        state=(None if page==1 else w.snapshot.get('data_revision',w.snapshot.get('ts')),
-               None if page==1 else w.query(),options,round(item.width()),round(item.height()),ratio)
-        key=hashlib.blake2b(json.dumps(state,sort_keys=True,default=str).encode(),digest_size=16).digest()
-        if self._thumbnail_keys.get(page)==key:return
-        # Qt multiplies grab target dimensions by the window's device pixel ratio.
-        limit=QSize(max(1,int(640/ratio)),max(1,int(360/ratio)))
-        size=QSize(round(item.width()),round(item.height())).scaled(limit,Qt.KeepAspectRatio)
-        result=item.grabToImage(size)
-        if not result:return
-        self._thumbnail_pending=(result,page,key,self._thumbnail_epoch)
-        result.ready.connect(self._thumbnail_ready)
-
-    @Slot()
-    def _thumbnail_ready(self):
-        if not self._thumbnail_pending:return
-        result,page,key,epoch=self._thumbnail_pending;self._thumbnail_pending=None
-        result.ready.disconnect(self._thumbnail_ready)
-        if epoch!=self._thumbnail_epoch or result.image().isNull():
-            QTimer.singleShot(0,lambda keep=result:None);return
-        # The grab result owns the URL's pixels. Keep at most one result per Home card.
-        previous=self._thumbnails.get(page)
-        self._thumbnails[page]=result;self._thumbnail_keys[page]=key
-        self.put(thumbnails={str(page):result.url().toString() for page,result in self._thumbnails.items()})
-        if previous:QTimer.singleShot(0,lambda keep=previous:None)
 
     def capture(self):return deepcopy(self.options)
     def restore(self,value):
@@ -159,9 +85,6 @@ class UsagePanel(Node):
         else:return
         self.search_timer.stop();self.put(options=deepcopy(o));self.refresh()
 
-    @Slot(int)
-    def navigate(self,page):self.dashboard.change_page(page)
-
     @Slot()
     def back(self):self.dashboard.go_back()
 
@@ -183,7 +106,7 @@ class UsagePanel(Node):
         self.dashboard.aggregate_records=self.data.get('population');self.dashboard.open_aggregate_records()
 
     def query(self):
-        now=self.dashboard.snapshot['ts'];o=self.options;period='all' if self.home else o['period']
+        now=self.dashboard.snapshot['ts'];o=self.options;period=o['period']
         today=datetime.fromtimestamp(now).replace(hour=0,minute=0,second=0,microsecond=0)
         start=0;end=now+.000001
         if period=='today':start=today.timestamp()
@@ -192,28 +115,15 @@ class UsagePanel(Node):
             try:
                 start=datetime.fromisoformat(o['start']).timestamp();end=min(end,(datetime.fromisoformat(o['end'])+timedelta(days=1)).timestamp())
             except ValueError:start=end
-        filters={} if self.home else dict(o['filters'])
+        filters=dict(o['filters'])
         if filters.get('source')=='미확인':filters['source']='unknown'
-        return dict(page=0 if self.home else 1,category_usage=True,presentation=True,include_whole_history=False,
-                    start=start,end=end,now=now,period=period,archived=True if self.home else o['archived'],
+        return dict(page=1,category_usage=True,presentation=True,include_whole_history=False,
+                    start=start,end=end,now=now,period=period,archived=o['archived'],
                     loading=bool(self.dashboard.snapshot.get('index',{}).get('loading')),**filters,
                     usage={k:o[k] for k in ('dimension','metric','mode','search','sort','page','size','selected','breakdowns')})
 
     def apply(self,data):
         self.data=data;o=self.options;theme=shared_theme()
-        if self.home:
-            totals=[]
-            for key,title,part,part_title in [('cost','구독 가치 환산액',None,''),('calls','호출 수',None,''),('input','입력 토큰 합계','cached','그중 캐시 읽기'),('output','출력 토큰 합계','reasoning','그중 추론')]:
-                item=data['totals'][key];sub=data['totals'].get(part)
-                explanation={'cost':'관측 사용량에 기존 Standard API 단가와 구독 배율을 적용합니다. 실제 청구액이나 실현된 절감액이 아닙니다.',
-                             'calls':'중복을 제거한 관측 호출 수입니다. 부모의 하위 포함 합계를 다시 더하지 않습니다.',
-                             'input':'캐시 읽기를 포함한 입력 토큰 합계입니다. 부분값을 다시 더하지 않습니다.',
-                             'output':'추론을 포함한 출력 토큰 합계입니다. 부분값을 다시 더하지 않습니다.'}[key]
-                totals.append(dict(title=tr(title),value=value_text(item['value'],key),unit='USD' if key=='cost' else tr('회' if key=='calls' else '토큰'),partial=item['partial'] and item['value'] is not None,
-                                   tip=tr(explanation)+f"\n{item['known']:,} / {item['total']:,}",
-                                    sub=(tr(part_title)+' '+value_text(sub['value'],part)+(' ('+tr('확인분')+')' if sub['partial'] and sub['value'] is not None else '')) if sub else '',
-                                   subTip=f"{sub['known']:,} / {sub['total']:,}" if sub else ''))
-            self.put(totals=totals);return
         o['page']=data['page']
         metric=data['metric'];ratio=o['mode']=='ratio' and metric!='tps';total=data['summary'];maximum=max(1,data['maximum']*1.05)
         legends={};rows=[];previous_group=None

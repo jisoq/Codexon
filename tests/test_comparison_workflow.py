@@ -78,7 +78,7 @@ def many_efforts():
     return source,efforts
 
 
-def test_home_card_and_comparison_controls_accept_rendered_input(dashboard):
+def test_comparison_navigation_and_controls_accept_rendered_input(dashboard):
     import time
     from PySide6.QtCore import Qt
     from PySide6.QtTest import QTest
@@ -92,7 +92,10 @@ def test_home_card_and_comparison_controls_accept_rendered_input(dashboard):
             if found:return found[0]
             QTest.qWait(5)
         raise AssertionError(name)
-    click(w,rendered('home-card-1'))
+    navigation=control(w,w.nav)
+    target=next(item for item in walk(navigation) if item.property('index')==1
+                and item.metaObject().indexOfProperty('modelData')>=0)
+    click(w,target)
     assert w.current_page==1
     choice=rendered('usage-dimension');choice.forceActiveFocus()
     QTest.keyClick(w.quick,Qt.Key_Down)
@@ -104,58 +107,23 @@ def test_home_card_and_comparison_controls_accept_rendered_input(dashboard):
     assert not w.qml_errors
 
 
-def test_home_thumbnails_are_bounded_reused_and_navigation_is_not_duplicated(dashboard):
-    from PySide6.QtCore import QPointF
-    from cachemonitor.theme import shared_theme
-    w=dashboard;w.resize(1000,680);home=w.home_panel
-    def rendered(name):
-        return next(item for item in walk(w.quick.rootObject()) if item.objectName()==name and item.isVisible())
-    assert not home._thumbnails
-    assert control(w,w.nav).property('count')==1
-    click(w,rendered('home-card-1'))
-    wait_for_rendered(lambda:w.current_page==1 and not w.analysis_pending)
-    assert control(w,w.nav).property('count')==5
-    w.metric_panel.change('dimension','model')
-    control(w,w.metric_panel)
-    wait_for_rendered(lambda:w.metric_panel.data['dimension']=='model' and rendered('usage-chart-content').width()>0)
-    w.change_page(0)
-    wait_for_rendered(lambda:home._thumbnail_pending is None and 1 in home._thumbnails)
-    first=home._thumbnails[1]
-    assert 0<first.image().width()<=640 and 0<first.image().height()<=360
-    assert control(w,w.nav).property('count')==1
-    assert rendered('home-thumbnail-1').property('source').toString()==first.url().toString()
-    # Revisiting the same displayed data does not allocate another capture.
-    click(w,rendered('home-card-1'))
-    wait_for_rendered(lambda:not w.analysis_pending and w.metric_panel.data['dimension']=='model')
-    w.change_page(0)
-    assert home._thumbnail_pending is None and home._thumbnails[1] is first
-    for page in (5,2,3):
-        click(w,rendered('home-card-'+str(page)))
+@pytest.mark.essential
+def test_primary_routes_start_with_monitoring_and_preserve_drilldown(dashboard):
+    w=dashboard;w.resize(1000,680)
+    assert w.current_page==3
+    assert control(w,w.nav).property('count')==3
+    for page in (1,5,3):
+        w.nav.setCurrentRow(w.navigation_pages.index(page))
         wait_for_rendered(lambda:w.current_page==page and not w.analysis_pending)
-        # The stack exists before its selected lazy page can be captured.
-        assert control(w,w.pages.widget(page)).isVisible()
-        assert not w.quick.grabFramebuffer().isNull()
-        w.change_page(0)
-        wait_for_rendered(lambda:home._thumbnail_pending is None and page in home._thumbnails)
-    assert set(home._thumbnails)=={1,2,3,5}
-    assert sum(grab.image().sizeInBytes() for grab in home._thumbnails.values())<=4*640*360*4
-    for page in (1,2,3,5):
-        card=rendered('home-card-'+str(page))
-        assert w.quick.rect().contains(card.mapToScene(QPointF(card.width()-1,card.height()-1)).toPoint())
-    click(w,rendered('home-card-1'));w.metric_panel.change('metric','input')
-    wait_for_rendered(lambda:not w.analysis_pending and w.metric_panel.data['metric']=='input')
-    w.change_page(0)
-    assert home._thumbnail_pending is not None
-    theme=shared_theme();mode='dark' if not theme.dark else 'light'
-    theme.configure(mode)
-    wait_for_rendered(lambda:home._thumbnail_pending is None)
-    assert not home._thumbnails and not home.state['thumbnails']
-    theme.configure('light')
-    assert not w.qml_errors
+        assert control(w,w.pages.widget(page-1)).isVisible()
+    w.change_page(1);p=w.metric_panel
+    p.records()
+    wait_for_rendered(lambda:w.current_page==2 and not w.analysis_pending)
+    assert w.record_rows and not w.qml_errors
 
 
 def test_project_selection_preserves_filters_and_back_restores_exact_call(dashboard):
-    w=dashboard;w.resize(960,720);w.nav.setCurrentRow(w.navigation_pages.index(2))
+    w=dashboard;w.resize(960,720);w.change_page(2)
     wait_for_rendered(lambda: not control(w,w.record_parent).isVisible())
     click(w,control(w,w.history_projects_button))
     wait_for_rendered(lambda: control(w,w.record_parent).isVisible())
@@ -179,11 +147,11 @@ def test_comparison_detail_home_back_and_refresh_preserve_context(dashboard):
     assert not w.qml_errors
 
 
-def test_metric_modes_and_saved_scope_restore_without_changing_home_totals(dashboard):
-    w=dashboard;totals=copy.deepcopy(w.home_panel.state['totals']);w.change_page(1);p=w.metric_panel
+def test_metric_modes_and_saved_scope_restore_after_monitoring(dashboard):
+    w=dashboard;w.change_page(1);p=w.metric_panel
     p.change('period','7d');p.change('metric','tps');p.change('dimension','model');p.change('sort','name')
-    saved=w.capture_state();w.change_page(0)
-    assert w.home_panel.state['totals']==totals and w.query()['start']==0
+    saved=w.capture_state();w.change_page(3)
+    assert w.current_page==3
     w.restore_state(saved);assert p.options['metric']=='tps' and p.options['dimension']=='model'
     assert p.options['period']=='7d' and p.options['sort']=='name'
     assert not w.qml_errors

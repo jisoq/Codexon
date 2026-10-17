@@ -38,7 +38,7 @@ from .history_timeline import SessionTimeline
 from .dashboard_presentation import Breadcrumbs, RecordFields, labeled_control, move_controls
 
 STYLE = ''
-TITLES = ('Home','지표 비교','세션 기록','구독 모니터링','설정','성능 추이')
+TITLES = {1:'지표 비교',2:'세션 기록',3:'구독 모니터링',4:'설정',5:'성능 추이'}
 PERIODS = [('최근 30분','30m'),('오늘','today'),('최근 7일','7d'),('최근 30일','30d'),('전체 기록','all'),('직접 지정','custom')]
 INPUT_BANDS = [('전체 입력 길이',''),('10k 미만','0:10000'),('10–50k','10000:50000'),('50–100k','50000:100000'),('100–200k','100000:200000'),('200–272k','200000:272001'),('272k 초과','272001:inf')]
 CALL_FILTERS = [('환산 불가','unpriced'),('모드 기록 없음','unknown_mode'),('모델명 불일치','model_mismatch'),('관측 정보 누락 또는 충돌','observation_problem'),('캐시 읽기 0','cache_zero'),('캐시 저하 의심','cache_degradation'),('HTTP/SSE','http')]
@@ -147,8 +147,8 @@ class Dashboard(TrayWindow):
         self.error_state=ErrorState(history=self.confirmed_notifications.records)
         self._error_revision=-1;self.collection_starting=False;self.collection_stopped=False;self._observation_counters=None
         self.collection_snapshot_at=None
-        self.current_page=0;self.restoring=True;self.back_stack=[];self.forward_stack=[];self.temporary_context=None;self.navigation_signature=None
-        self.page_filters={0:{'model':'','effort':'','service_tier':''},2:{'model':'','effort':'','service_tier':''}}
+        self.current_page=3;self.restoring=True;self.back_stack=[];self.forward_stack=[];self.temporary_context=None;self.navigation_signature=None
+        self.page_filters={2:{'model':'','effort':'','service_tier':''}}
         self.filter_values={}
         self.history_navigation=HistoryNavigation()
         self.selected_session=None;self.selected_turn=None;self.selected_call=None;self.selected_event=None;self.selected_call_scope=None
@@ -174,7 +174,7 @@ class Dashboard(TrayWindow):
         side=Group();side.setFixedWidth(200);side.setObjectName('sidebar');side_layout=Column(side)
         side_layout.setContentsMargins(16,24,16,20);side_layout.setSpacing(24)
         side_layout.addWidget(label('CODEXON','brand'))
-        self.navigation_pages=(0,1,5,2,3)
+        self.navigation_pages=(3,1,5)
         self.nav=Navigation();self.nav.addItems(tuple(TITLES[i] for i in self.navigation_pages));self.nav.setObjectName('navigation');self.nav.setMaximumHeight(220)
         side_layout.addWidget(self.nav);side_layout.addStretch()
         self.update_available=Button('업데이트 가능');self.update_available.hide()
@@ -197,7 +197,7 @@ class Dashboard(TrayWindow):
         self.navigation_row.addWidget(self.home_button);self.navigation_row.addWidget(self.back_button)
         self.path_label=label('','muted');self.path_label.put(noElide=False);self.navigation_row.addWidget(self.path_label,1)
         self.history_path=Breadcrumbs();self.history_path.activated.connect(self.activate_history_path);self.navigation_row.addWidget(self.history_path,1)
-        self.heading=label(TITLES[0],'heading');header.addWidget(self.heading);header.addStretch()
+        self.heading=label(TITLES[self.current_page],'heading');header.addWidget(self.heading);header.addStretch()
         self.pending_label=label('','muted');self.pending_label.setFixedHeight(36);self.pending_label.setMaximumWidth(280);header.addWidget(self.pending_label)
         self.retry_button=Button('다시 시도');self.retry_button.clicked.connect(self.retry_analysis);self.retry_button.hide();header.addWidget(self.retry_button)
         self.price_button=Button('API 가격표');self.price_button.put(role='quiet');self.price_button.clicked.connect(self.show_prices);header.addWidget(self.price_button);layout.addLayout(header)
@@ -220,7 +220,7 @@ class Dashboard(TrayWindow):
         self.scope_note=label('수집 중','muted');self.scope_note.put(fontSize=12);self.scope_note.setFixedHeight(18);layout.addWidget(self.scope_note)
         self.pages=Stack();self.pages.put(deferPages=True);layout.addWidget(self.pages,1);self.scrollers={}
         self.analysis_loading={};self._loading_nodes=[]
-        self.build_overview();self.build_compare();self.build_explorer()
+        self.build_compare();self.build_explorer()
         from .quota_panel import QuotaPanel
         self.quota_panel=QuotaPanel(self.settings);quota_scroll=Scroll();quota_scroll.put(fillViewport=True)
         self.quota_panel.centralized_errors=True
@@ -389,7 +389,7 @@ class Dashboard(TrayWindow):
 
     def sync_report_demand(self):
         visible=self.isVisible() and not self.isMinimized()
-        page=getattr(self,'current_page',0)
+        page=getattr(self,'current_page',3)
         for service in getattr(self,'quota_services',{}).values():
             service.set_reports_enabled(visible and page==3 and service is self.quota_service)
 
@@ -397,11 +397,6 @@ class Dashboard(TrayWindow):
         area=Scroll();area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff);body=Group();layout=Column(body)
         layout.setContentsMargins(0,0,8,0);layout.setSpacing(24);area.setWidget(body);self.pages.addWidget(area);self.scrollers[index]=area
         return layout
-
-    def build_overview(self):
-        from .usage_panel import UsagePanel
-        self.home_panel=UsagePanel(self,home=True);self.pages.addWidget(self.home_panel)
-
 
     def build_compare(self):
         from .usage_panel import UsagePanel
@@ -559,7 +554,6 @@ class Dashboard(TrayWindow):
             widths=self.table.state['widths'],temporary=copy.deepcopy(self.temporary_context))
 
     def restore_state(self,state,initial=False):
-        if not initial and self.current_page!=state.get('page',0):self.home_panel.remember_page(self.current_page)
         previous=self.restoring;self.restoring=True
         self.history_navigation.restore({} if initial else state.get('history_navigation',{}))
         for key,value in state.get('common',{}).items():
@@ -593,8 +587,10 @@ class Dashboard(TrayWindow):
         self.search.setText(state.get('search',''));self.outside.setChecked(state.get('outside',False))
         for key,node in self.call_filter_controls.items():node.setChecked(key in state.get('call_filters',[]))
         for key,node in self.extra_column_controls.items():node.setChecked(key in state.get('extras',[]))
-        self.temporary_context=None if initial else state.get('temporary');self.current_page=max(0,min(5,state.get('page',0)))
-        if initial and self.current_page==4:self.current_page=0
+        self.temporary_context=None if initial else state.get('temporary')
+        page=state.get('page',3)
+        self.current_page=page if page in TITLES else 3
+        if initial and self.current_page in (2,4):self.current_page=3
         self.exact_record=None;self.record_request+=1;self._revealed_call=None
         self.settings_page.reveal(state.get('settings_category','general'))
         for key,attr in (('model','model'),('effort','effort'),('service_tier','mode')):
@@ -697,7 +693,7 @@ class Dashboard(TrayWindow):
 
     def filter_changed(self,*_):
         if self.restoring:return
-        if self.current_page in (0,2):self.page_filters[self.current_page]={key:getattr(self,attr).currentData() for key,attr in (('model','model'),('effort','effort'),('service_tier','mode'))}
+        if self.current_page==2:self.page_filters[self.current_page]={key:getattr(self,attr).currentData() for key,attr in (('model','model'),('effort','effort'),('service_tier','mode'))}
         self.render();self.save_preferences()
 
     def refresh_choices(self):
@@ -740,19 +736,19 @@ class Dashboard(TrayWindow):
             choose(node,current);node.blockSignals(blocked)
         self.home.setVisible(len(self.snapshot['homes'])>1)
     def save_page_scope(self):
-        if self.current_page in (0,1,2) and not (self.current_page==2 and self.temporary_context):
+        if self.current_page in (1,2) and not (self.current_page==2 and self.temporary_context):
             self.page_scopes[self.current_page]=dict(common={key:getattr(self,key).currentData() for key in ('home','period','project','source')},
                 dates=[self.date_start.text(),self.date_end.text()],archive=self.archive.isChecked())
 
     def change_page(self,index):
         if self.restoring:return
+        if index not in TITLES:index=3
         if self.current_page!=index:
-            self.home_panel.remember_page(self.current_page)
             self.save_page_scope();self.forward_stack.clear()
         scope=self.page_scopes.get(index) if self.current_page!=index else None
-        if self.current_page in (0,2):
+        if self.current_page==2:
             self.page_filters[self.current_page]={key:getattr(self,attr).currentData() for key,attr in (('model','model'),('effort','effort'),('service_tier','mode'))}
-        self.current_page=max(0,min(5,index));self.pages.setCurrentIndex(self.current_page);self.heading.setText(TITLES[self.current_page])
+        self.current_page=index;self.pages.setCurrentIndex(index-1);self.heading.setText(TITLES[index])
         self.sync_report_demand()
         self.restoring=True
         if scope:
@@ -761,17 +757,16 @@ class Dashboard(TrayWindow):
                 if value and node.findData(value)<0:node.addItem(Verbatim(str(value)),value)
                 choose(node,value)
             self.date_start.setText(scope['dates'][0]);self.date_end.setText(scope['dates'][1]);self.archive.setChecked(scope['archive'])
-        self.nav.put(homeOnly=self.current_page==0)
         self.nav.setCurrentRow(self.navigation_pages.index(self.current_page) if self.current_page in self.navigation_pages else -1)
         self.settings_button.put(checked=self.current_page==4)
         for key,attr in (('model','model'),('effort','effort'),('service_tier','mode')):
-            if self.current_page in (0,2):choose(getattr(self,attr),self.page_filters[self.current_page].get(key,''))
+            if self.current_page==2:choose(getattr(self,attr),self.page_filters[2].get(key,''))
         self.restoring=False
         self.content.put(contentWidth=0 if index==2 else 1808)
         self.project.setVisible(index!=2)
         self.sync_history_filters()
         self.common_filters.hide();self.scope_note.hide()
-        for node in (self.model,self.effort,self.mode):node.setVisible(index in (0,2))
+        for node in (self.model,self.effort,self.mode):node.setVisible(index==2)
         self.request_id+=1;self.analysis_pending=False;self.deferred_result=None;self.defer_timer.stop()
         displayed=self.displayed_pages.get(self.current_page)
         self.display_identity=displayed[0] if displayed else None
@@ -794,7 +789,7 @@ class Dashboard(TrayWindow):
         if kind=='analysis':
             if self.worker is not None and not self.worker.isRunning():
                 self.worker.restart_count=0;self.worker.start()
-            self.client_cache.clear();self.change_page(getattr(self,'_analysis_error_page',0))
+            self.client_cache.clear();self.change_page(getattr(self,'_analysis_error_page',1))
         elif kind=='collection':
             self.open_settings();self.settings_page.reveal('general')
             self.service_controller.invoke('ensure')
@@ -889,7 +884,7 @@ class Dashboard(TrayWindow):
             panel=self.performance_panel
             return dict(page=5,start=0,end=self.snapshot['ts']+.000001,now=self.snapshot['ts'],period='all',presentation=True,
                         time_range=panel.query_range(self.snapshot['ts'],self.snapshot.get('data_revision',self.snapshot['ts'])),plot_width=max(64,min(1024,self.width()-96)),granularity=panel.granularity)
-        if page in (0,1):return (self.home_panel if page==0 else self.metric_panel).query()
+        if page==1:return self.metric_panel.query()
         start,end=self.bounds()
         q=dict(page=page,include_whole_history=True,start=start,end=end,home=self.home.currentData(),project=self.project.currentData(),source=self.source.currentData(),
             archived=self.archive.isChecked(),period=self.period.currentData(),now=self.snapshot['ts'],loading=bool(self.snapshot.get('index',{}).get('loading')),
@@ -997,7 +992,6 @@ class Dashboard(TrayWindow):
         self.pages.show();self.scope_note.hide()
 
     def analysis_regions(self):
-        if self.current_page==0:return [(self.home_panel,True)]
         if self.current_page==1:return [(self.metric_panel,True)]
         if self.current_page==5:
             return [(self.performance_panel.chart_scroll,True),(self.performance_panel.inspector,True),
@@ -1018,7 +1012,7 @@ class Dashboard(TrayWindow):
     def begin_analysis_loading(self,query):
         self.clear_analysis_loading()
         self.pending_retained=(self.display_identity==self.query_identity(query)
-                               and self.pages.isPageReady(self.current_page))
+                               and self.pages.isPageReady(self.pages.currentIndex()))
         self.metric_panel.put(queryPending=query['page']==1)
         self.set_analysis_stage('queued')
         self.show_analysis_pending()
@@ -1065,7 +1059,7 @@ class Dashboard(TrayWindow):
             self.set_analysis_stage('queued')
         else:
             self.display_identity=self.query_identity(query)
-            # Reuse the results already mounted in the four analytical pages.
+            # Reuse the results already mounted in the analytical pages.
             # This adds references, not another serialized result cache.
             self.displayed_pages[self.current_page]=(self.display_identity,result)
 
@@ -1084,7 +1078,7 @@ class Dashboard(TrayWindow):
             return Verbatim(', '.join(str(x) for x in names if x))
         names=[Verbatim(q['home']) if q.get('home') else ('모든 Codex 홈' if len(self.snapshot['homes'])>1 else (Verbatim(self.snapshot['homes'][0]) if self.snapshot['homes'] else '로컬 기록')),
             self.period.currentText(),Verbatim(q['project']) if q.get('project') else '모든 프로젝트',self.source.currentText()]
-        if q['page'] in (0,2):names += [q.get(k) for k in ('model','effort','service_tier') if q.get(k)]
+        if q['page']==2:names += [q.get(k) for k in ('model','effort','service_tier') if q.get(k)]
         return Verbatim(', '.join(tr(x) for x in names if x))
 
     def receive_collection_status(self,result):
@@ -1195,8 +1189,7 @@ class Dashboard(TrayWindow):
         previous=self._applied_pages.get(self.current_page)
         detail_changed=self.current_page==2 and bool(self.selected_call or self.selected_event)!=self.detail_scroll.isVisible()
         if previous is None or previous[0] is not result or previous[1]!=display or detail_changed or getattr(self,'_restore_positions',None):
-            if self.current_page==0:self.render_overview()
-            elif self.current_page==1:
+            if self.current_page==1:
                 self.render_comparison()
             elif self.current_page==2:self.apply_explorer()
             self._applied_pages[self.current_page]=(result,display)
@@ -1230,8 +1223,8 @@ class Dashboard(TrayWindow):
         if facts.get('query_failed') and facts.get('request_id')!=self.request_id:return
         facts.update(current_request_id=self.request_id,
                      retained=self.display_identity==self.query_identity(self.query())
-                              and self.pages.isPageReady(self.current_page))
-        if self.current_page in (0,1,2,5):self._analysis_error_page=self.current_page
+                              and self.pages.isPageReady(self.pages.currentIndex()))
+        if self.current_page in (1,2,5):self._analysis_error_page=self.current_page
         self.observe_error('analysis.query' if facts.get('query_failed') else 'analysis.process','analysis',facts)
         self.client_cache.clear();self.pending_logical=None
         self.request_id+=1;self.deferred_result=None;self.defer_timer.stop();self.clear_analysis_loading()
@@ -1260,7 +1253,7 @@ class Dashboard(TrayWindow):
         if hasattr(self,'sidebar_layout'):self.layout_sidebar()
         if hasattr(self,'settings_page'):self.settings_page.navigation.setFixedWidth(144 if self.width()<1200 else 200)
         if hasattr(self,'detail_scroll'):self.layout_record_detail()
-        if getattr(self,'current_page',0)==5 and hasattr(self,'performance_panel'):self.performance_panel.resize_timer.start()
+        if getattr(self,'current_page',3)==5 and hasattr(self,'performance_panel'):self.performance_panel.resize_timer.start()
     def showEvent(self,event):
         super().showEvent(event)
         self.sync_report_demand()
@@ -1276,7 +1269,6 @@ class Dashboard(TrayWindow):
         if event.type()==QEvent.WindowStateChange:self.sync_report_demand()
 
     def closeEvent(self,event):
-        if self.quitting:self.home_panel.clear_thumbnails(closing=True)
         self.settings.setValue('dashboard/geometry',self.saveGeometry());self.save_preferences();super().closeEvent(event)
     def check_stale(self):
         if not self.quitting:
@@ -1291,10 +1283,6 @@ class Dashboard(TrayWindow):
             self.quota_sidebar.refresh_status()
             if self.current_page==3:self.quota_panel.refresh_status()
         if int(time.time())%10==0:shared_theme().configure(self.settings.value('ui/theme',self.settings.value('overlay/theme','codex')))
-
-    def render_overview(self,*_):
-        self.home_panel.apply(self.view_result['usage'])
-
 
     def open_aggregate_records(self):
         if not self.aggregate_records:return
@@ -1367,12 +1355,12 @@ class Dashboard(TrayWindow):
         history=self.current_page==2
         # Hidden filters keep their rendered owner when leaving for quota or
         # settings. Reparenting recreates every sibling QML delegate repeatedly.
-        if self.current_page in (0,1,2):
+        if self.current_page in (1,2):
             moves=((field,(self.history_period_fields if node in (self.period,self.date_start,self.date_end) else self.history_query_fields)
                     if history and node is not self.project else self.common_filters) for node,field in self.common_fields.items())
             move_controls(moves,orders=() if history else ((self.common_filters,list(self.common_fields.values())),))
         for node in (self.home,self.source,self.archive,self.model,self.effort,self.mode):
-            node.setVisible(self.current_page<3 and (node not in (self.model,self.effort,self.mode) or self.current_page in (0,2)))
+            node.setVisible(self.current_page<3 and (node not in (self.model,self.effort,self.mode) or self.current_page==2))
         self.home.setVisible(self.current_page<3 and len(self.snapshot['homes'])>1)
 
     def render_history_path(self,data):

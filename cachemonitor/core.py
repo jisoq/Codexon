@@ -304,6 +304,7 @@ class Session:
     tier_contexts: dict = field(default_factory=dict)
     tier_evidence: dict = field(default_factory=dict)
     current_tier_evidence: dict = field(default_factory=dict)
+    pending_tier_context: tuple | None = None
     reported_usage: dict = field(default_factory=dict)
     reported_ts: float = 0
     metadata_seen: bool = False
@@ -361,6 +362,7 @@ class Session:
             self.tier_contexts[self.current_turn] = ('Standard' if payload.get('service_tier') is None else payload['service_tier']) if 'service_tier' in payload else self.current_service_tier
             self.tier_evidence[self.current_turn] = (dict(configured_service_tier=payload['service_tier'],request_mode_action='clear' if payload['service_tier'] is None else 'set',request_mode_source='turn_context')
                 if 'service_tier' in payload else dict(self.current_tier_evidence))
+            self.pending_tier_context=(self.current_turn,ts) if 'service_tier' not in payload else None
         elif kind == "token_usage_record":
             if payload.get("thread_id", self.id) != self.id:
                 return  # Forked history must not become this session's usage.
@@ -383,12 +385,18 @@ class Session:
             event_type = payload.get("type")
             if event_type=='thread_settings_applied' and payload.get('thread_id')==self.id:
                 # This is a historical, successfully applied settings snapshot,
-                # not today's config. It affects subsequent turn contexts only.
+                # not today's config. Codex writes the turn's snapshot directly
+                # after its context at the same timestamp; later settings apply
+                # only to future turns. Explicit turn overrides remain stronger.
                 settings=payload.get('thread_settings') or {}
                 if 'service_tier' in settings:
                     value=settings['service_tier']
                     self.current_service_tier='Standard' if value is None else value if isinstance(value,str) and value else '미확인'
                     self.current_tier_evidence=dict(configured_service_tier=value,request_mode_action='clear' if value is None else 'set',request_mode_source='applied_settings')
+                    if self.pending_tier_context==(self.current_turn,ts):
+                        self.tier_contexts[self.current_turn]=self.current_service_tier
+                        self.tier_evidence[self.current_turn]=dict(self.current_tier_evidence)
+                        self.pending_tier_context=None
             if event_type in ("task_started", "task_complete", "task_completed", "turn_aborted") and ts >= self.state_ts:
                 self.state_ts = ts
                 self.running = event_type == "task_started"

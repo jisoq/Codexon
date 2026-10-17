@@ -19,7 +19,7 @@ from .analysis_query_actor import QueryActor
 from .prepared_ingest import ModeEvidenceUnavailable,PreparedCohort, read_catalog
 from .prepared_ledger import PreparedLedger
 from .prepared_query import GenerationJournal,PreparedQuery, token_value, tuple_token
-from .prepared_store import Limits,PreparedStore
+from .prepared_store import Limits,PreparedStore,WriteDeferred
 from .quota_cycles import QuotaLedger
 from .usage_collection import CollectionClient, CollectionCatalogUnavailable
 
@@ -109,6 +109,30 @@ class PreparedWriter:
             raise ValueError('notification floor must be a finite timestamp')
         self.cache_floor=value
 
+    def _maintain(self,store):
+        deadline=time.monotonic()+.02
+        while not self.stopped.is_set():
+            try:
+                if not store.maintain():return False
+            except WriteDeferred:
+                # Cleanup is still owed. Let the bounded query release its read
+                # snapshot without crashing the writer or spinning on the WAL.
+                self.stopped.wait(.05)
+                return True
+            if time.monotonic()>=deadline:return True
+        return True
+
+    def _resume_writes(self,store,speed_writer):
+        try:
+            if store.stage is not None:
+                speed_writer.abort(store.stage)
+            else:
+                store._wal_admission()
+            return True
+        except WriteDeferred:
+            self.stopped.wait(.05)
+            return False
+
     def _run(self):
         collector = ledger = store = speed_writer = None
         try:
@@ -136,13 +160,7 @@ class PreparedWriter:
             ledger_pending=False
             pending_reset=False
             catalog_retries=0
-
-            def maintain():
-                deadline=time.monotonic()+.02
-                while not self.stopped.is_set():
-                    if not store.maintain():return False
-                    if time.monotonic()>=deadline:return True
-                return True
+            write_deferred=False
 
             def timing(stages):
                 nonlocal last_timing
@@ -242,6 +260,11 @@ class PreparedWriter:
                         collector.stop_notifications();notification=None
                     if 'sync' in commands:
                         publish(reset=True)
+                if write_deferred:
+                    # The failed cohort has unwound its own read scopes. Retire
+                    # any uncommitted stage before capturing a fresh catalog.
+                    if not self._resume_writes(store,speed_writer):continue
+                    write_deferred=False
                 if (self.frozen.is_set() and ledger_pending and publisher.token==store.token
                         and store.db.execute('SELECT ready FROM meta WHERE singleton=1').fetchone()[0]):
                     # Freeze completes accounting for the already captured view.
@@ -255,7 +278,7 @@ class PreparedWriter:
                         'SELECT ready FROM meta WHERE singleton=1').fetchone()[0]) if self.frozen.is_set() else False
                 if self.frozen.is_set() and not incomplete:
                     if maintenance_due:
-                        maintenance_due=maintain()
+                        maintenance_due=self._maintain(store)
                     wait([self.control.receiver],timeout=.05 if maintenance_due else None)
                     continue
                 now=time.monotonic()
@@ -308,7 +331,7 @@ class PreparedWriter:
                                 if not change['ready']:
                                     # Keep a large one-time conversion's cleanup
                                     # debt within one admitted cohort.
-                                    while maintain():
+                                    while self._maintain(store):
                                         if self.stopped.is_set():
                                             raise InterruptedError('prepared conversion cleanup cancelled')
                                     maintenance_due=False
@@ -354,6 +377,10 @@ class PreparedWriter:
                     except ModeEvidenceUnavailable as error:
                         disable(error.__cause__)
                         next_poll=0
+                    except WriteDeferred:
+                        write_deferred=True
+                        next_poll=0
+                        continue
                     except InterruptedError:
                         if self.stopped.is_set():break
                         raise
@@ -362,7 +389,7 @@ class PreparedWriter:
                     import_step()
                     if imported or ledger is None:publish()
                 if maintenance_due:
-                    maintenance_due=maintain()
+                    maintenance_due=self._maintain(store)
                 delay=max(0,next_poll-time.monotonic())
                 if maintenance_due:delay=min(delay,.05)
                 if ledger is None:
@@ -384,7 +411,9 @@ class PreparedWriter:
         finally:
             if collector is not None:collector.close()
             if ledger is not None:ledger.close()
-            if speed_writer is not None:speed_writer.close()
+            if speed_writer is not None:
+                try:speed_writer.close()
+                except WriteDeferred:pass  # Startup retires the uncommitted stage.
             if store is not None:store.close()
 
     def close(self):

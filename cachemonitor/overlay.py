@@ -239,6 +239,13 @@ class OverlayController(QObject):
             self.overlay_serial+=1;request=f'overlay-detail-{self.overlay_serial}'
             self.pending_overlay=(request,identity,health,tuple(data.get('_overlay_revision') or ()))
             self.overlay_loader(request,data,health=health)
+        if cached and self.overlay_identity(cached)[:2]==identity[:2]:
+            # Publish a complete replacement only after its calls arrive. Mixing
+            # new totals with old rows, or clearing the panel while querying,
+            # presents an inconsistent frame and drops the user's selection.
+            collection=dict(data.get('_collection',{}),
+                            last_confirmed_at=cached.get('_collection',{}).get('last_confirmed_at'))
+            return dict(cached,_collection=collection),True
         return None,True
 
     def receive_overlay_detail(self,value):
@@ -250,7 +257,7 @@ class OverlayController(QObject):
         if len(matches)!=1:return
         current=matches[0]
         if value.get('kind')=='stale':
-            self._overlay_detail=None;self._overlay_blocked=pending[1]
+            self._overlay_blocked=pending[1]
             self.refresh();return
         detail=value.get('summary')
         token=tuple(value.get('prepared_token') or ())
@@ -610,7 +617,12 @@ class OverlayController(QObject):
             'source_error_count':len(self.errors),
         }}
         data,pending=self.prepared_content(data)
-        return data,note or ('기록 확인 중' if pending else '')
+        if pending and data:
+            confirmed=data['_collection'].get('last_confirmed_at')
+            if confirmed and time.time()-confirmed>ANALYSIS_DELAY_SECONDS and not note:
+                note='수집 지연'
+                data['_collection'].update(delayed=True,reason='detail_delay')
+        return data,note or ('기록 확인 중' if pending and data is None else '')
 
     def activate_control(self, control):
         if self.native and hasattr(self.native,'activate_companion'):

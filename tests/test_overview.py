@@ -101,46 +101,6 @@ def test_category_partial_tokens_and_equal_weight_call_tps():
     assert summary([rows[2]],'tps')['value'] is None
 
 
-def test_call_totals_reuse_unchanged_ranges_and_preserve_request_completeness(monkeypatch):
-    from copy import deepcopy
-    from cachemonitor.analysis_engine import AnalysisEngine
-    from cachemonitor.category_usage import METRICS,summary
-    first=session_view();first['collection_complete']=True
-    other=deepcopy(first);other['home']='other'
-    sources=[first,other];engine=AnalysisEngine();engine.ingest(sources)
-    now=ts('2026-02-03T00:00:00')
-    q=dict(page=0,start=0,end=now,now=now,period='all',category_usage=True,presentation=True)
-    visited=[];original=engine.range_calls
-    def read_range(state,lo,hi,q):
-        for row in original(state,lo,hi,q):visited.append(row['key']);yield row
-    monkeypatch.setattr(engine,'range_calls',read_range)
-    def check(query):
-        value=engine.page_query(query)
-        rows=analyze(sources,start=query['start'],end=query['end'],model=query.get('model',''))['responses']
-        for field in METRICS[:-1]:
-            expected=summary(rows,field);actual=value['usage']['totals'][field]
-            assert actual=={**expected,'value':pytest.approx(expected['value']) if expected['value'] is not None else None}
-        assert value['analysis']['response_count']==len(rows)
-        return value
-    with monkeypatch.context() as patch:
-        patch.setattr(engine,'query',lambda q:pytest.fail('Call totals must not build request analysis'))
-        before=check(q);assert len(visited)==6
-        sources=[dict(s,collection_complete=False) for s in sources]
-        engine.ingest(sources);visited.clear()
-        assert check(q)['usage']==before['usage'] and not visited
-        sources[0]=deepcopy(sources[0])
-        sources[0]['history'][0]['input']+=100
-        sources[0]['history'].pop()
-        engine.ingest(sources);visited.clear();check(q)
-        assert len(visited)==2
-        check({**q,'start':ts('2026-02-01T00:00:00'),'model':'unknown'})
-    requests=engine.query(dict(q,page=2,category_usage=False,unit='turn'))['analysis']['turns']
-    assert requests and not any(r['complete'] for r in requests)
-    sources=[dict(s,collection_complete=True) for s in sources];engine.ingest(sources)
-    requests=engine.query(dict(q,page=2,category_usage=False,unit='turn'))['analysis']['turns']
-    assert [r['complete'] for r in requests]==[r['complete'] for r in analyze(sources)['turns']]
-
-
 def test_model_breakdowns_partition_calls_preserve_scope_and_reuse_projection(monkeypatch):
     from copy import deepcopy
     from cachemonitor.analysis_engine import AnalysisEngine

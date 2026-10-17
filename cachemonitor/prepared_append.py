@@ -24,7 +24,8 @@ from .prepared_summary import summary_for_storage, recent_references
 from .prepared_sums import _Sum
 
 
-FORMAT = ('prepared-owner-append', 1)
+FORMAT = ('prepared-owner-append', 2)
+READ_FORMATS = (('prepared-owner-append', 1), FORMAT)
 EVENT_FORMAT = ('append-health-event', 1)
 TAIL_ROWS = 128
 CHECKPOINT_BYTES = 64 * 1024
@@ -33,7 +34,6 @@ HEALTH_FIELDS_ROW = ('key', 'ts', 'input', 'cached', 'model', 'effort',
     'service_tier', 'service_tier_source', 'mode_conflict', 'cache_policy',
     'compaction_epoch', 'observation_missing', 'cache_policy_conflict',
     'model_conflict', 'input_conflict')
-HOME_FIELDS = ('cost', 'input', 'cached', 'output', 'reasoning')
 
 
 class AppendUnavailable(Exception):
@@ -80,7 +80,6 @@ def _new_totals():
                 ('cost', 'maintenance', 'speed_output', 'speed_seconds')},
         priced=0, component_priced=0, maintenance_calls=0, maintenance_missing=0,
         speed_n=0, assumed=0, mismatch=0, observation_missing=0, observation_conflict=0,
-        home_values=[0]*len(HOME_FIELDS), home_missing=[0]*len(HOME_FIELDS),
         minimum=None, maximum=None,
         token=dict(counts=dict.fromkeys(TOKEN_LABELS,0), known=dict.fromkeys(TOKEN_ORDER,False),
             inp_total=0, out_total=0, partial=False, input_known=False, output_known=False,
@@ -92,11 +91,6 @@ def _add_totals(total, row):
     total['count'] += 1
     total['minimum'] = row['ts'] if total['minimum'] is None else min(total['minimum'],row['ts'])
     total['maximum'] = row['ts']
-    # Home uses per-owner +=, unlike the compensated overlay totals below.
-    for i, field in enumerate(HOME_FIELDS):
-        value = row.get(field)
-        if value is None:total['home_missing'][i] += 1
-        else:total['home_values'][i] += value
     cost = row.get('cost')
     if finite(cost):
         total['priced'] += 1
@@ -334,12 +328,6 @@ def summary_facts(state,health_count):
             maintenance_cost=_value(total['sums'],'maintenance') if total['maintenance_calls']>total['maintenance_missing'] else None))
 
 
-def home_totals(owner,total):
-    from .prepared_home import FORMAT as HOME_FORMAT
-    return dict(format=HOME_FORMAT,owner=tuple(owner),fields=HOME_FIELDS,count=total['count'],
-        minimum=total['minimum'],maximum=total['maximum'],values=tuple(total['home_values']),missing=tuple(total['home_missing']))
-
-
 def seed(material,dependencies,*,raw_count,mode_evidence=None):
     """Add a bounded checkpoint during complete preparation, or decline reuse."""
     source=material['state']['prepared'];rows=source['history'];owner=(source['home'],source['id'])
@@ -550,7 +538,8 @@ def _compact_summary(source,previous,total,misses,health,request,recent,current_
     own['cache_degradation'].pop('events')
     own['_health_ref']=dict(format=HEALTH_FORMAT,owner=(source['home'],source['id']))
     summary=dict(previous['summary'],own=own,partials=facts['partials'],
-        coverage_bounds=(total['minimum'],total['maximum']),home_totals=home_totals((source['home'],source['id']),total))
+        coverage_bounds=(total['minimum'],total['maximum']))
+    summary.pop('home_totals',None)
     return summary_for_storage(summary)
 
 def _sections(snapshot,owner,miss_events,misses,health,latest):
@@ -686,7 +675,7 @@ def prepare(snapshot,owner,transition,dependencies,*,mode_evidence=None,enrich=N
     _require(snapshot.staged_batch is None,'append requires a committed predecessor')
     owner=tuple(owner);old=snapshot.owner(*owner)
     checkpoint=snapshot.derived(*owner,'checkpoint')
-    _require(old is not None and isinstance(checkpoint,dict) and checkpoint.get('format')==FORMAT,'no append checkpoint')
+    _require(old is not None and isinstance(checkpoint,dict) and checkpoint.get('format') in READ_FORMATS,'no append checkpoint')
     _require(checkpoint['owner']==owner and transition is not None and transition.get('format')==1
              and tuple(transition.get('owner',()))==owner,'append owner or format differs')
     _require(len(encoded(transition))<=RESPONSE_BYTES and _size(transition)<=PLAN_BYTES,'append packet exceeds budget')
@@ -735,6 +724,7 @@ def prepare(snapshot,owner,transition,dependencies,*,mode_evidence=None,enrich=N
     _require(call_metadata.keys()==previous_metadata.keys() and all(pack(value)==pack(previous_metadata[key])
              for key,value in call_metadata.items()),'joined call metadata changed')
     total=deepcopy(checkpoint['total']);misses=deepcopy(checkpoint['misses']);health=_Health(checkpoint['health'])
+    total.pop('home_values',None);total.pop('home_missing',None)
     rows=[];miss_events=[]
     for index,raw in enumerate(source['history'],count+1):
         event=_add_miss(misses,raw)
@@ -782,7 +772,7 @@ def prepare(snapshot,owner,transition,dependencies,*,mode_evidence=None,enrich=N
         old['dependencies']['ownership'],tuple((row['session_ordinal']-1,row['key']) for row in rows)))).hexdigest(),
         candidate_source_digest=body,prepared=True,call_count=total['count'],speed_frontier=total['count'],
         coverage_bounds=(total['minimum'],total['maximum']))
-    updated=dict(checkpoint,source_digest=body,candidate_source_digest=body,raw_count=count+len(rows),
+    updated=dict(checkpoint,format=FORMAT,source_digest=body,candidate_source_digest=body,raw_count=count+len(rows),
         frontier=(rows[-1]['ts'],rows[-1]['key']),total=total,misses=misses,health=health.save(),request=request,
         request_count=request_count,header_count=header_count,last_header_order=last_order,
         ledger_append=_ledger_append(snapshot,owner,transition,before,old['dependencies'],dependency))
@@ -836,7 +826,7 @@ def try_apply(cohort,catalog,changed,removed,*,ready,parents):
             old=view.owner(*owner)
             if old is None:return None
             checkpoint=view.derived(*owner,'checkpoint')
-            if not isinstance(checkpoint,dict) or checkpoint.get('format')!=FORMAT:return None
+            if not isinstance(checkpoint,dict) or checkpoint.get('format') not in READ_FORMATS:return None
             entry=catalog['owners'][owner]
             transition=method(owner,old['dependencies']['source_digest'],catalog=catalog)
             if transition is None:return None

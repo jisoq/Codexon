@@ -83,6 +83,10 @@ class CapacityExceeded(PreparedError):
     pass
 
 
+class WriteDeferred(CapacityExceeded):
+    """An existing reader temporarily prevents bounded WAL reuse."""
+
+
 class ReadCancelled(PreparedError):
     pass
 
@@ -571,10 +575,12 @@ class PreparedStore:
             return
         self.db.execute('PRAGMA busy_timeout=0')
         try:
-            self.db.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()
+            checkpoint = self.db.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()
         finally:
             self.db.execute('PRAGMA busy_timeout=200')
         if self._wal_size() > limit:
+            if checkpoint[0]:
+                raise WriteDeferred('reader snapshot pins WAL; retry after it closes')
             raise CapacityExceeded('reader snapshot pins WAL; close/cancel it before writing more')
 
     @contextmanager

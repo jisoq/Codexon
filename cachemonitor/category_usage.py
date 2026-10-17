@@ -1,7 +1,6 @@
 """Non-temporal projections of the engine's owned calls. No source collection."""
 from collections import defaultdict
 import json
-from math import fsum
 from .analytics import output_speed
 from .pricing import request_tier
 from .translation_catalog import CATALOG
@@ -26,42 +25,9 @@ def summary(rows, metric):
     return dict(value=value, known=len(known), total=len(rows), partial=len(known) != len(rows))
 
 
-def call_totals(engine,q):
-    """One compact range aggregate per owner; never retain a second call population."""
-    if hasattr(engine,'prepared_home_totals'):
-        return engine.prepared_home_totals(q)
-    fields=METRICS[1:-1]
-    counts=0;sessions=0;parts=[]
-    filters=tuple(q.get(k,'') for k in ('model','effort','service_tier'))
-    for state,lo,hi in engine.call_ranges(q):
-        signature=(state.get('content_revision',state['revision']),lo,hi,filters)
-        cached=state.get('call_totals')
-        if cached and cached[0]==signature:
-            part=cached[1]
-        else:
-            values=[0]*len(fields);known=[0]*len(fields);count=0
-            for row in engine.range_calls(state,lo,hi,q):
-                count+=1
-                for i,field in enumerate(fields):
-                    value=row.get(field)
-                    if value is not None:values[i]+=value;known[i]+=1
-            part=(count,tuple(values),tuple(known))
-            state['call_totals']=(signature,part)
-        counts+=part[0];sessions+=bool(part[0]);parts.append(part)
-    totals={'calls':dict(value=counts,known=counts,total=counts,partial=False)}
-    for i,field in enumerate(fields):
-        known=sum(part[2][i] for part in parts)
-        values=(part[1][i] for part in parts)
-        value=(fsum(values) if field=='cost' else sum(values)) if known or not counts else None
-        totals[field]=dict(value=value,known=known,total=counts,partial=known!=counts)
-    return dict(key=engine.query_key(q),revision=engine.revision,lookup={},
-                analysis=dict(response_count=counts,session_count=sessions),usage=dict(totals=totals))
-
-
 def project(engine, q):
     # Display choices never invalidate the population or its aggregation.
     scope = {k:v for k,v in q.items() if k not in ('usage', 'presentation')}
-    if q['page']==0:return call_totals(engine,scope)
     options = q.get('usage', {})
     dimension = options.get('dimension', 'project')
     if dimension not in DIMENSIONS:dimension = 'project'
