@@ -554,6 +554,88 @@ def test_category_projection_preserves_filtered_totals_without_decoding_call_bod
             engine.close()
 
 
+def test_corrupt_current_cache_regenerates_without_changing_source_ledger(tmp_path):
+    from contextlib import closing
+
+    path = tmp_path/'analysis.sqlite'
+    ledger = tmp_path/'source-ledger.sqlite'
+    with sqlite3.connect(ledger) as source:
+        source.execute('CREATE TABLE original(value TEXT)')
+        source.execute("INSERT INTO original VALUES('retained source')")
+    ledger_bytes = ledger.read_bytes()
+    with storage.PreparedStore(path) as store:
+        original = publish(store, 1, calls())
+        page = store.db.execute("SELECT rootpage FROM sqlite_master WHERE name='calls'").fetchone()[0]
+        page_size = store.db.execute('PRAGMA page_size').fetchone()[0]
+
+    # Damage a derived-data B-tree, leaving the identifying header and meta intact.
+    with path.open('r+b') as target:
+        target.seek((page-1)*page_size)
+        target.write(b'\x00')
+    with closing(sqlite3.connect(path.as_uri()+'?mode=ro', uri=True)) as check:
+        assert check.execute('PRAGMA quick_check(1)').fetchone()[0] != 'ok'
+    with storage.PreparedStore(path) as store, storage.PreparedReader(path) as reader:
+        assert store.token.instance != original.instance
+        assert store.token.generation == 0
+        assert store.db.execute('PRAGMA quick_check(1)').fetchone()[0] == 'ok'
+        with pytest.raises(storage.NotReady):
+            reader.pin()
+        recovered = publish(store, 1, calls())
+        with reader.pin(recovered) as view:
+            assert view.record(*OWNER, 'call-1')['cost'] == 1.
+    assert ledger.read_bytes() == ledger_bytes
+
+
+@pytest.mark.parametrize('code', [sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_BUSY, sqlite3.SQLITE_IOERR])
+def test_startup_check_recovers_only_reported_corruption(tmp_path, monkeypatch, code):
+    path = tmp_path/'analysis.sqlite'
+    with storage.PreparedStore(path) as store:
+        original = publish(store, 1, calls())
+    before = path.read_bytes()
+    original_connect = sqlite3.connect
+
+    class CheckConnection(sqlite3.Connection):
+        def execute(self, sql, *args, **kwargs):
+            if sql == 'PRAGMA quick_check(1)':
+                error = sqlite3.DatabaseError('injected check failure')
+                error.sqlite_errorcode = code
+                raise error
+            return super().execute(sql, *args, **kwargs)
+
+    def connect(*args, **kwargs):
+        return original_connect(*args, factory=CheckConnection, **kwargs)
+
+    monkeypatch.setattr(storage.sqlite3, 'connect', connect)
+    if code == sqlite3.SQLITE_CORRUPT:
+        with storage.PreparedStore(path) as store:
+            assert store.token.instance != original.instance
+            assert store.token.generation == 0
+    else:
+        with pytest.raises(sqlite3.DatabaseError) as error:
+            storage.PreparedStore(path)
+        assert error.value.sqlite_errorcode == code
+        assert path.read_bytes() == before
+
+
+def test_startup_check_deadline_does_not_replace_a_healthy_cache(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    path = tmp_path/'analysis.sqlite'
+    with storage.PreparedStore(path) as store:
+        original = publish(store, 1, calls())
+        store.db.execute('CREATE TABLE health_rows(value INTEGER)')
+        store.db.executemany('INSERT INTO health_rows VALUES(?)', ((i,) for i in range(2000)))
+    before = path.read_bytes()
+    moments = iter((0., 11.))
+    with monkeypatch.context() as patch:
+        patch.setattr(storage, 'time', SimpleNamespace(monotonic=lambda:next(moments, 11.)))
+        with pytest.raises(TimeoutError, match='integrity check exceeded'):
+            storage.PreparedStore(path)
+    assert path.read_bytes() == before
+    with storage.PreparedStore(path) as store:
+        assert store.token == original
+
+
 def test_known_old_format_regenerates_atomically_and_preserves_other_stores(tmp_path, monkeypatch):
     path = tmp_path/'analysis.sqlite'
     original_connect = sqlite3.connect

@@ -144,7 +144,7 @@ def test_rolling_bands_model_selection_inspection_and_shared_axis(tmp_path,langu
         plot=ui.plots['cost'];assert ui.granularity=='auto' and plot.bands
         assert {p['model'] for p in plot.rows}=={'m'}
         assert not ui.plots['count'].bands and ui.plots['session_cache'].bands
-        assert plot.bounds[1]<200 and not plot.strip
+        assert plot.bounds[1]<=200 and not plot.strip
         assert plot.data['window_seconds']==900 and not plot.data['raw_visible']
         assert all(v is None or 0<=v<=plot.bounds[1] for v in plot_values(plot.data,plot.selected_style))
         assert all(p.bounds[0]==0 for p in ui.plots.values())
@@ -303,9 +303,9 @@ def test_qt_panel_rolling_hover_analysis_and_click(tmp_path):
     try:
         assert next(iter(ui.plots))=='duration'
         chart=ui.plots['cost'];render_plot(host,chart)
-        assert chart.bounds==pytest.approx((0,1120))
+        assert chart.bounds==pytest.approx((0,1250))
         ui.remove_model('outside');app.processEvents();host.quick.grabFramebuffer()
-        assert chart.bounds==pytest.approx((0,2.24))
+        assert chart.bounds==pytest.approx((0,2.5))
         assert {p['model'] for p in chart.rows}=={'m','other'}
         assert chart.rolling and chart.bands and not chart.strip
         item=render_plot(host,chart);point=next(p for p in chart.rows if p['model']=='m' and p['value'] is not None);xy=chart.xy(point)
@@ -353,7 +353,7 @@ def test_reasoning_tabs_share_trend_axis_and_keep_other_charts(tmp_path):
         # Scrolling to the tabs can deliver ambient pointer events to the chart.
         # This check owns the selected interval; hover has separate coverage.
         for node in ui.plots.values():control(host,node).findChild(QObject,'plotHover').setProperty('enabled',False)
-        expected=chart.bounds;assert expected[0]==0 and 15000<expected[1]<18000
+        expected=chart.bounds;assert expected==pytest.approx((0,20000))
         assert all(p.bounds[0]==0 for p in ui.plots.values())
         other_bounds={k:p.bounds for k,p in ui.plots.items() if k!='reasoning'}
         ui.inspect(chart.rows[0]['ts']);app.processEvents()
@@ -399,7 +399,7 @@ def test_reasoning_tabs_share_trend_axis_and_keep_other_charts(tmp_path):
             if r['effort']=='ultra':r['reasoning']=300
         source.revision+=1
         ui.apply(projector.query(source,query(now=base+3*86400,granularity='auto',plot_width=900)))
-        assert chart.bounds[0]==0 and 1500<chart.bounds[1]<1800 and ui.reasoning_effort=='ultra'
+        assert chart.bounds==pytest.approx((0,2000)) and ui.reasoning_effort=='ultra'
         assert not host.qml_errors
     finally:dispose(host)
 
@@ -744,15 +744,35 @@ def test_multi_model_rolling_axis_includes_selected_bands_and_filters_models_and
     owner=SimpleNamespace(is_model_selected=selected.__contains__,modes=modes,show_outer=False,range=(1000,22600))
     plot=PerformancePlot(owner);plot.set_data(data)
     assert plot.bands and not data['raw_visible'] and not plot.strip
-    assert plot.bounds==pytest.approx((0,11.2))
+    assert plot.bounds==pytest.approx((0,12.5))
     assert {p['model'] for p in plot.rows}=={'a','b'} and {p['service_tier'] for p in plot.rows}=={'Standard'}
     point=next(p for p in plot.rows if p['model']=='a' and p['band_valid'])
     assert point['value']==3 and point['distribution']['q3']==10
     selected.remove('a');plot.set_data(data)
-    assert plot.bounds==pytest.approx((0,2.24)) and {p['model'] for p in plot.rows}=={'b'}
+    assert plot.bounds==pytest.approx((0,2.5)) and {p['model'] for p in plot.rows}=={'b'}
     selected.add('a')
     modes['Fast']=True;plot.set_data(data)
-    assert plot.bounds==pytest.approx((0,11200))
+    assert plot.bounds==pytest.approx((0,12500))
+
+
+def test_readable_axis_ticks_preserve_small_costs_integer_counts_and_large_value_differences():
+    from cachemonitor.charts import nice_axis, axis_ticks, axis_tick_text
+
+    cost=nice_axis(0,.000045)
+    assert cost==pytest.approx((0,.00005,.00001))
+    assert [axis_tick_text(value,cost[2]) for value in axis_ticks(cost)]==['0','0.00001','0.00002','0.00003','0.00004','0.00005']
+    quarters=nice_axis(0,10,intervals=4)
+    assert [axis_tick_text(value,quarters[2]) for value in axis_ticks(quarters)]==['0','2.5','5','7.5','10']
+    count=nice_axis(0,.56,minimum_step=1)
+    assert axis_ticks(count)==[0,1]
+    for low,high in ((.0000000001,.0000000005),(1_000_000,1_000_001),(4.65,5.05)):
+        axis=nice_axis(low,high)
+        ticks=axis_ticks(axis)
+        labels=[axis_tick_text(value,axis[2]) for value in ticks]
+        assert axis[0]<=low and axis[1]>=high
+        assert len(ticks)==len(set(labels))
+        assert all(label!='0' for value,label in zip(ticks,labels) if value>0)
+        assert all(b>a for a,b in zip(ticks,ticks[1:]))
 
 
 def test_legacy_calendar_setting_restores_auto_and_preserves_selection(tmp_path):

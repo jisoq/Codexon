@@ -102,7 +102,10 @@ def test_three_matching_axes_detail_pin_escape_and_gap_card(tmp_path,width,dark,
         # Drive application slots without depending on the physical cursor or focus.
         from PySide6.QtCore import QObject
         plot.findChild(QObject,'plotHover').setProperty('enabled',False)
-        assert chart.cost_ceiling==pytest.approx(33.6)
+        assert chart.cost_ceiling==40
+        from cachemonitor.charts import axis_ticks
+        cost_ticks=axis_ticks(chart.axes['cycle_cost'])
+        assert [chart.tick_text('cycle_cost',value) for value in cost_ticks]==['$0','$20','$40']
         assert chart.completed_floor==pytest.approx(9.9)
         assert chart.completed_ceiling==pytest.approx(10.1)
         assert chart.box.width()>150
@@ -113,9 +116,9 @@ def test_three_matching_axes_detail_pin_escape_and_gap_card(tmp_path,width,dark,
         assert chart._picture.save(str(tmp_path/f'axes-{width}-{dark}-{language}.png'))
         assert 0<chart.value_floor<1000
         assert chart.ceiling>1200
-        assert chart.ceiling-chart.value_floor<400
+        assert chart.ceiling-chart.value_floor<=400
         # Ten dollars now span their own cost scale, not the much larger weekly value scale.
-        assert chart.point(0,'cycle_cost').y()-chart.point(1,'cycle_cost').y()>chart.row_boxes['cycle_cost'].height()*.25
+        assert chart.point(0,'cycle_cost').y()-chart.point(1,'cycle_cost').y()==pytest.approx(chart.row_boxes['cycle_cost'].height()*.25)
         x=chart.x_at(1);y=chart.box.center().y()
         plot.showTip(x,y)
         assert [item['color'] for item in plot.detail['items']]==['accent','muted','written','output']
@@ -326,6 +329,7 @@ def test_dynamic_axes_fit_values_and_ignore_missing():
     assert remaining_axis([dict(remaining=0)])[0]==0
     assert remaining_axis([dict(remaining=100)])[1]>100
     assert remaining_axis([dict(remaining=None)])[0:2]==(0,1)
+    assert remaining_axis([dict(remaining=50),dict(remaining=51)])==(49,52,1)
     assert comparison_axis([{'value':98},{'value':99}], 'cache_ratio')[0]>90
 
 
@@ -362,8 +366,8 @@ def test_summary_and_cost_axes_do_not_force_zero():
     try:
         render_plot(host,chart)
         assert chart.axis[0]>800
-        assert chart.bounds('cycle_cost')[0]>490
-        assert chart.bounds('cycle_value')[0]>980
+        assert chart.bounds('cycle_cost')[0]>=490
+        assert chart.bounds('cycle_value')[0]>=980
         for i in range(4):
             for key in ('remaining','cycle_cost','cycle_value'):
                 assert chart.box.contains(chart.point(i,key))

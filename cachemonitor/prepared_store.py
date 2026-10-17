@@ -462,7 +462,7 @@ class PreparedStore:
             self.db = sqlite3.connect(self.path, timeout=.2, isolation_level=None)
             self.db.row_factory = sqlite3.Row
             if existed:
-                if self._validate_format() != FORMAT:
+                if self._validate_format() != FORMAT or not self._healthy():
                     self._rebuild_format()
             else:
                 self._initialize(self.db)
@@ -494,6 +494,39 @@ class PreparedStore:
             raise RebuildRequired('unknown prepared database format')
         return row[0]
 
+    def _healthy(self):
+        """Check a recognized current cache once, before starting ordinary readers."""
+        self.db.execute('PRAGMA mmap_size=0')
+        self.db.execute('PRAGMA cache_size=-8192')
+        pages = self.db.execute('PRAGMA page_count').fetchone()[0]
+        page_size = self.db.execute('PRAGMA page_size').fetchone()[0]
+        if pages * page_size > self.limits.database_bytes:
+            raise CapacityExceeded('existing prepared database exceeds its page budget')
+        deadline = time.monotonic() + 10
+        expired = False
+
+        def progress():
+            nonlocal expired
+            expired = time.monotonic() > deadline
+            return int(expired)
+
+        self.db.set_progress_handler(progress, 1000)
+        try:
+            row = self.db.execute('PRAGMA quick_check(1)').fetchone()
+            if row is None:
+                raise RebuildRequired('prepared integrity check returned no result')
+            return row[0] == 'ok'
+        except sqlite3.DatabaseError as error:
+            code = getattr(error, 'sqlite_errorcode', 0) & 255
+            if code == sqlite3.SQLITE_CORRUPT:
+                return False
+            if code == sqlite3.SQLITE_INTERRUPT and expired:
+                raise TimeoutError('prepared integrity check exceeded its deadline') from error
+            # Contention, I/O failure, and interrupted checks are not corruption.
+            raise
+        finally:
+            self.db.set_progress_handler(None, 0)
+
     def _initialize(self, db):
         db.execute('PRAGMA page_size=4096')
         db.executescript('BEGIN IMMEDIATE;' + _schema())
@@ -503,10 +536,10 @@ class PreparedStore:
         db.execute('COMMIT')
 
     def _rebuild_format(self):
-        """Replace a recognized old cache before readers start, under writer lock.
+        """Replace a recognized old or corrupt cache under the writer lock.
 
         SQLite commits the empty schema atomically. An interrupted replacement
-        leaves either the old recognized format or the new, unready instance.
+        leaves either the original recognized cache or the new, unready instance.
         Only the new schema is copied: at most 1 MiB of pages plus WAL framing.
         Source ledgers and recovery files are never opened or removed here.
         """

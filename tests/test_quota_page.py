@@ -44,7 +44,7 @@ def quota_page(tmp_path):
 
 @pytest.mark.integration
 @pytest.mark.essential
-def test_current_chart_remains_usable_until_full_history_finishes(quota_page):
+def test_current_chart_remains_usable_until_full_history_finishes(quota_page,tmp_path):
     app,panel,scroll=quota_page
     host=mount(scroll,1000,680)
     full=panel.report
@@ -55,6 +55,14 @@ def test_current_chart_remains_usable_until_full_history_finishes(quota_page):
             assert all(panel.summary_values[key].text() in ('계산 중','확인 불가') for key in ('usage','cost','weekly'))
             assert panel.history_loading.isVisible() is not failed
             assert panel.history_loading._state['running'] is not failed
+            if not failed:
+                from cachemonitor.i18n import tr
+                loading=render_plot(host,panel.history_loading)
+                title=next(item for item in walk(loading)
+                           if item.property('text')==tr(panel.history_loading.state['title']))
+                assert host.quick.grabFramebuffer().save(str(tmp_path/'quota-inline-loading.png'))
+                assert abs(title.mapToScene(QPointF(0,0)).x()-loading.mapToScene(QPointF(0,0)).x())<=1
+                assert title.width()>=loading.width()-1
             plot=render_plot(host,panel.history);click(host,plot,x=plot.width()*.6,y=plot.height()*.5)
             QTest.keyClick(host.quick,Qt.Key_Home)
             assert panel.history.cursor==0 and panel.history.rows
@@ -64,6 +72,73 @@ def test_current_chart_remains_usable_until_full_history_finishes(quota_page):
         assert panel.summary_values['cost'].text() not in ('계산 중','확인 불가')
         assert not host.qml_errors
     finally:dispose(host)
+
+
+@pytest.mark.integration
+@pytest.mark.essential
+def test_selected_cycle_reset_updates_visible_chart(quota_page,tmp_path):
+    from cachemonitor.dashboard import Dashboard
+    from test_quota_worker import wait_until
+    app,fixture,_=quota_page
+    quota=fixture.quota;home=str(tmp_path/'home');path=tmp_path/'live.sqlite'
+    seed=QuotaLedger(path)
+    tracking.enable(seed.db,home,time.time()-310)
+    for row in fixture.report['history']:
+        if row['window']!='weekly':continue
+        q={**quota,'requested_at':row['at'],'observed_at':row['at'],'windows':{
+            'weekly':dict(used_percent=row['used'],resets_at=row['reset'],window_minutes=10080)}}
+        seed.observe(home,q);tracking.observe(seed.db,home,q)
+    activity(seed,time.time(),{},[r['at'] for r in fixture.report['history']],home=home)
+    seed.close()
+    previous=app.property('cachemonitorDisableShellIntegration')
+    app.setProperty('cachemonitorDisableShellIntegration',True)
+    settings=QSettings(str(tmp_path/'reset.ini'),QSettings.IniFormat)
+    for key in ('updates/automatic','overlay/enabled','taskbar/enabled'):settings.setValue(key,False)
+    host=Dashboard([home],start_worker=False,settings=settings,index_path=tmp_path/'index.sqlite',quota_path=path,live_limits=False)
+    host.resize(1000,680);host.show();host.start_quota_service(home)
+    panel=host.quota_panel
+    try:
+        wait_until(lambda:'worker_revision' in panel.report and not panel.report.get('history_pending'),app=app)
+        plot=render_plot(host,panel.history)
+        before=panel.history._picture.copy()
+        start=panel.cycle_choice.currentData()
+        click(host,render_plot(host,panel.clear_cycle_button))
+        dialog=panel.clear_cycle_dialog
+        click(dialog.host,render_plot(dialog.host,dialog.confirm))
+        wait_until(lambda:panel.cycle_choice.currentData()!=start,app=app)
+        wait_until(lambda:panel.history._picture!=before,app=app)
+        assert panel.cycle_choice.currentData()!=start
+        assert len(panel.history.rows)==1
+        assert panel.history.rows[0]['at']==panel.cycle_choice.currentData()
+        assert panel.history._picture!=before
+        assert not panel.history_loading.isVisible()
+        cleared=panel.history._picture.copy()
+        at=time.time()
+        quota={**quota,'requested_at':at,'observed_at':at,'windows':{
+            **quota['windows'],'weekly':{**quota['windows']['weekly'],'used_percent':3}}}
+        ledger=QuotaLedger(path)
+        try:
+            turns={'new':dict(started_at=at,ended_at=None)}
+            activity(ledger,at,turns,home=home)
+            ledger.observe(home,quota);tracking.observe(ledger.db,home,quota)
+            call_at=time.time()
+            activity(ledger,call_at,turns,[call_at],home=home)
+            at=time.time()
+            quota={**quota,'requested_at':at,'observed_at':at,'windows':{
+                **quota['windows'],'weekly':{**quota['windows']['weekly'],'used_percent':4}}}
+            ledger.observe(home,quota);tracking.observe(ledger.db,home,quota)
+            activity(ledger,time.time(),turns,[call_at],home=home)
+        finally:ledger.close()
+        revision=panel.report['worker_revision']
+        wait_until(lambda:panel.report['worker_revision']!=revision,app=app)
+        wait_until(lambda:panel.history.rows[-1]['at']==at,app=app)
+        wait_until(lambda:panel.history._picture!=cleared,app=app)
+        assert panel.history.rows[-1]['at']==at
+        assert panel.history.rows[-1]['remaining']==96
+        assert not host.qml_errors
+    finally:
+        host.quota_service.stop();host.tick.stop();host.update_panel.timer.stop();host.tray.hide()
+        dispose(host);app.setProperty('cachemonitorDisableShellIntegration',previous)
 
 
 @pytest.mark.integration

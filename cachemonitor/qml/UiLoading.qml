@@ -16,7 +16,7 @@ Item {
     Accessible.description: appLanguage.text("완료 시간은 아직 알 수 없습니다.")
     ColumnLayout {
         id: body
-        width: Math.min(parent.width, 660)
+        width: root.compact ? parent.width : Math.min(parent.width, 660)
         anchors.horizontalCenter: parent.horizontalCenter
         spacing: root.minimal ? 0 : root.compact ? 8 : 20
         RowLayout {

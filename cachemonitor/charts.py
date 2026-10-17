@@ -1,6 +1,6 @@
 """Selectable analytical charts; each mark retains its actual record population."""
 from collections import defaultdict
-from math import isfinite
+from math import ceil, floor, isfinite, log10
 from PySide6.QtCore import Qt, QRectF, QPointF, QRect, Signal
 from PySide6.QtGui import QColor, QPen, QPolygonF, QPainter, QFont
 from .presentation import Node
@@ -15,6 +15,49 @@ def dynamic_bounds(values):
     low,high=min(values),max(values)
     padding=max((high-low)*.12,abs(high)*.01,abs(low)*.01,1e-6)
     return low-padding,high+padding
+
+
+def nice_axis(low, high, intervals=5, minimum_step=0):
+    """Expand padded finite bounds onto a readable, evenly spaced scale."""
+    if not isfinite(low) or not isfinite(high):return 0.,1.,.25
+    if low>high:low,high=high,low
+    if low==high:
+        padding=max(abs(low)*.05,1e-6)
+        low,high=low-padding,high+padding
+    intervals=max(1,min(20,int(intervals)))
+    raw=max(high/intervals-low/intervals,
+            minimum_step if isfinite(minimum_step) and minimum_step>0 else 0)
+    if raw<=0:raw=high-low
+    scale=10.**max(-323,min(308,floor(log10(raw))))
+    step=next(factor*scale for factor in (1,2,2.5,5,10) if factor*scale>=raw)
+    lower,upper=floor(low/step)*step,ceil(high/step)*step
+    if not isfinite(lower):lower=low
+    if not isfinite(upper):upper=high
+    return lower,upper,step
+
+
+def axis_ticks(axis):
+    """Return a bounded list of finite tick positions for a nice axis."""
+    low,high,step=axis
+    if not all(isfinite(value) for value in axis) or step<=0 or high<low:return []
+    count=min(63,max(0,round(high/step-low/step)))
+    return [value for index in range(count+1) if isfinite(value:=low+index*step)]
+
+
+def axis_tick_text(value, step):
+    """Keep adjacent ticks distinct, including small costs and compact units."""
+    if not isfinite(value) or not isfinite(step) or step<=0:return ''
+    if abs(value)<step*1e-10:return '0'
+    scale,suffix=((1e6,'M') if abs(value)>=1e6 else (1e3,'k') if abs(value)>=1e3 else (1.,''))
+    value,step=value/scale,step/scale
+    places=max(0,-floor(log10(step)))
+    if not abs(round(step,places)-step)<=step*1e-9:places+=1
+    if places>8:
+        digits=min(17,max(1,floor(log10(abs(value)))+places+1))
+        return f'{value:.{digits}g}'+suffix
+    text=f'{value:,.{places}f}'
+    if '.' in text:text=text.rstrip('0').rstrip('.')
+    return text+suffix
 
 
 class Plot(Node):

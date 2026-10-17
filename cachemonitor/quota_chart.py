@@ -3,7 +3,7 @@ from bisect import bisect_left, bisect_right
 from math import ceil
 from PySide6.QtCore import Qt, QRectF, QPointF, Signal, Slot
 from PySide6.QtGui import QColor, QPen, QImage, QPainter, QPainterPath
-from .charts import Plot, dynamic_bounds
+from .charts import Plot, dynamic_bounds, nice_axis, axis_ticks, axis_tick_text
 from .theme import shared_theme
 from .pricing import usd
 from .quota_view import clock, prepare_series, observation_label
@@ -12,11 +12,15 @@ from .token_colors import color_distance, mix
 from .i18n import LocalizedPainter, tr, formatted
 
 
-def quota_bounds(values):
-    """Fit quota values without a negative padded lower bound."""
+def quota_axis(values):
+    """Fit nonnegative quota values to readable, equally spaced ticks."""
     low,high=dynamic_bounds(values)
     low=max(0.,low)
-    return low,max(high,low+1e-6)
+    return nice_axis(low,max(high,low+1e-6),intervals=3)
+
+
+def quota_bounds(values):
+    return quota_axis(values)[:2]
 
 
 class GapPixels:
@@ -166,22 +170,24 @@ class QuotaHistory(Plot):
         p.setRenderHint(QPainter.Antialiasing)
         summary=self.series.get('cycle_summary',False)
         if summary:
-            low,high=quota_bounds((self.series['low'],self.series['high']))
-            self.axis=(low,high,(high-low)/4)
+            self.axis=quota_axis((self.series['low'],self.series['high']))
         else:self.axis=remaining_axis([{'remaining':self.series['low']},{'remaining':self.series['high']}])
         value_low=self.series['value_minimum'] if self.visible('cycle_value') else None
         value_high=self.series['value_maximum'] if self.visible('cycle_value') else float('-inf')
         if self.reference is not None and self.visible('reference'):
             value_low=self.reference if value_low is None else min(value_low,self.reference)
             value_high=max(value_high,self.reference)
-        self.value_floor,self.ceiling=quota_bounds((value_low,value_high) if value_low is not None else ())
-        self.cost_floor,self.cost_ceiling=quota_bounds((self.series['cost_minimum'],self.series['cost_maximum']) if self.series['cost_minimum'] is not None else ())
-        self.completed_floor,self.completed_ceiling=quota_bounds((self.series['completed_minimum'],self.series['completed_maximum']) if self.series['completed_minimum'] is not None else ())
+        self.axes=dict(remaining=self.axis,
+            cycle_value=quota_axis((value_low,value_high) if value_low is not None else ()),
+            cycle_cost=quota_axis((self.series['cost_minimum'],self.series['cost_maximum']) if self.series['cost_minimum'] is not None else ()),
+            completed_cost=quota_axis((self.series['completed_minimum'],self.series['completed_maximum']) if self.series['completed_minimum'] is not None else ()))
+        self.value_floor,self.ceiling=self.axes['cycle_value'][:2]
+        self.cost_floor,self.cost_ceiling=self.axes['cycle_cost'][:2]
+        self.completed_floor,self.completed_ceiling=self.axes['completed_cost'][:2]
         metrics=self.displayed_metrics()
         labels=[]
         for key,_,_,_ in metrics:
-            low,high=self.bounds(key)
-            labels.extend(self.metric_text(key,value) for value in (low,high))
+            labels.extend(self.tick_text(key,value) for value in axis_ticks(self.axes[key]))
         left=max(66,max((p.fontMetrics().horizontalAdvance(label) for label in labels),default=50)+14)
         extra=100 if self.series.get('model_share') else 0
         content_bottom=self.height()-38-extra
@@ -205,13 +211,14 @@ class QuotaHistory(Plot):
         for key,color,title,unit in metrics:
             area=self.row_boxes[key];header=self.row_headers[key]
             low,high=self.bounds(key)
-            for fraction in (0,.5,1):
+            for value in axis_ticks(self.axes[key]):
+                fraction=(value-low)/(high-low)
                 y=area.bottom()-area.height()*fraction
                 grid=QColor(palette['border']);grid.setAlpha(115)
                 p.setPen(QPen(grid,1));p.drawLine(QPointF(area.left(),y),QPointF(area.right(),y))
                 p.setPen(QColor(palette['muted']))
                 p.drawText(QRectF(0,y-9,area.left()-9,18),Qt.AlignRight|Qt.AlignVCenter,
-                           self.metric_text(key,low+(high-low)*fraction))
+                           self.tick_text(key,value))
             for item in self.series.get('exclusions',[]):
                 x=self.x_at_time(item['start']);right=self.x_at_time(item['end'])
                 shade=QColor(palette['muted']);shade.setAlpha(16)
@@ -303,6 +310,10 @@ class QuotaHistory(Plot):
         if value is None:return '—'
         if key=='remaining':return f'{value:g}'+('%p' if self.series.get('cycle_summary') else '%')
         return usd(value)
+
+    def tick_text(self,key,value):
+        label=axis_tick_text(value,self.axes[key][2])
+        return label+('%p' if self.series.get('cycle_summary') else '%') if key=='remaining' else '$'+label
 
     def x_at_time(self,at):
         times=self.series['times'];index=bisect_left(times,at)

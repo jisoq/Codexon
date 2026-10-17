@@ -6,7 +6,7 @@ from math import ceil, log1p, isfinite
 from time import mktime
 from PySide6.QtCore import Qt, QPointF, QRectF, QTimer, QDate, Slot, Signal
 from PySide6.QtGui import QColor, QPen, QPolygonF, QPainter, QPainterPath
-from .charts import AnalyticalPlot, Plot, dynamic_bounds, value_text
+from .charts import AnalyticalPlot, Plot, dynamic_bounds, value_text, nice_axis, axis_ticks, axis_tick_text
 from .presentation import Node, Group, Column, Row, Button, Text, Choice, Input, DateInput, Scroll
 from .theme import shared_theme
 from .i18n import tr, Verbatim, formatted
@@ -23,10 +23,10 @@ def axis_number(value):
     return f'{value:,.4f}'.rstrip('0').rstrip('.') if abs(value)<.01 else f'{value:,.2f}'.rstrip('0').rstrip('.')
 
 
-def trend_bounds(values):
+def trend_bounds(values, minimum_step=0):
     """Anchor nonnegative performance metrics at zero and pad their maximum."""
     maximum=max((v for v in values if v is not None and isfinite(v)),default=0.)
-    return 0.,maximum*1.12 if maximum>0 else 1.
+    return nice_axis(0.,maximum*1.12 if maximum>0 else 1.,minimum_step=minimum_step)[:2]
 
 
 def time_ticks(start,end,width):
@@ -298,6 +298,7 @@ class PerformancePlot(AnalyticalPlot):
     def __init__(self,panel):
         super().__init__();self.panel=panel;self.data={};self.times=[];self.strip=[]
         self.setFixedHeight(390);self.bounds=(0,1);self.shared_bounds=False
+        self.axis=nice_axis(*self.bounds)
         self.put(clickEnabled=False)
         self.setAccessibleName('성능 추이 / 방향키로 시각 확인')
 
@@ -314,7 +315,11 @@ class PerformancePlot(AnalyticalPlot):
                              and self.selected_style(point)),key=lambda p:(p['ts'],p['service_tier'])))
         self.shared_bounds=bounds is not None
         values=plot_values(data,self.selected_style,self.panel.show_outer)
-        self.times=[p['ts'] for p in self.rows];self.bounds=bounds if bounds is not None else trend_bounds(values);self.rebuild_strip()
+        minimum_step=1 if self.metric in ('count','input','cached','output','reasoning') else 0
+        self.times=[p['ts'] for p in self.rows]
+        self.bounds=bounds if bounds is not None else trend_bounds(values,minimum_step)
+        self.axis=nice_axis(*self.bounds,minimum_step=minimum_step);self.bounds=self.axis[:2]
+        self.rebuild_strip()
 
     def selected_style(self,p):
         return p['model'] not in ('미확인','codex-auto-review') and self.panel.is_model_selected(p['model']) and self.panel.modes.get(p['service_tier'],False)
@@ -405,9 +410,9 @@ class PerformancePlot(AnalyticalPlot):
         lo,hi=self.bounds
         p.setPen(self.color('muted'));p.drawText(QRectF(76,0,self.width()-96,20),Qt.AlignLeft|Qt.AlignVCenter,tr('단위')+': '+metric_unit(self.metric))
         p.setPen(QPen(self.color('grid'),1))
-        for f in (0,1/3,2/3,1):
-            y=self.y(lo+(hi-lo)*f);p.drawLine(QPointF(76,y),QPointF(self.width()-20,y))
-            p.setPen(self.color('muted'));p.drawText(QRectF(0,y-10,66,20),Qt.AlignRight|Qt.AlignVCenter,axis_number(lo+(hi-lo)*f))
+        for value in axis_ticks(self.axis):
+            y=self.y(value);p.drawLine(QPointF(76,y),QPointF(self.width()-20,y))
+            p.setPen(self.color('muted'));p.drawText(QRectF(0,y-10,66,20),Qt.AlignRight|Qt.AlignVCenter,axis_tick_text(value,self.axis[2]))
             p.setPen(QPen(self.color('grid'),1))
         p.save();p.setClipRect(QRectF(73,25,max(1,self.width()-90),self.height()-94))
         if self.bands:
@@ -813,7 +818,7 @@ class PerformancePanel(Group):
         if not self.plots:return
         selected=lambda point:point['model'] not in ('미확인','codex-auto-review') and self.is_model_selected(point['model']) and self.modes.get(point['service_tier'],False)
         values=[v for spec in self.reasoning_specs.values() for v in plot_values(spec,selected,self.show_outer)]
-        self.reasoning_bounds=trend_bounds(values)
+        self.reasoning_bounds=trend_bounds(values,minimum_step=1)
         titles={'cost':'호출당 평균 환산액과 분포','output_speed':'전체 응답 기준 출력 속도와 분포','duration':'호출 소요시간 중앙값과 분포',
                 'session_cache':'세션 평균 캐시 적중률과 분포','reasoning':'평균 추론 토큰과 분포','input':'평균 입력 토큰과 분포'}
         for key,spec in list(self.specs.items()):

@@ -27,9 +27,8 @@ def home_key(value):
 
 
 def remaining_axis(rows):
-    from .quota_chart import quota_bounds
-    low,high=quota_bounds(r.get('remaining') for r in rows)
-    return low,high,(high-low)/4
+    from .quota_chart import quota_axis
+    return quota_axis(r.get('remaining') for r in rows)
 
 
 from .quota_chart import QuotaHistory
