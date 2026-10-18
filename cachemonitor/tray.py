@@ -294,7 +294,7 @@ class TrayWindow(QuickHost):
         if monitor:monitor.stop()
         update=getattr(self,'update_panel',None)
         if update:
-            update.timer.stop()
+            update.stop()
             if update.journal and update.journal.read().get('phase') in ('preparing','downloading'):
                 update.journal.cancel()
         if hasattr(self,'save_preferences'):self.save_preferences()

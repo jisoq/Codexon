@@ -23,6 +23,8 @@ class ObservedOverlay:
         self.engine = AnalysisEngine()
         self.summaries = OverlaySummaries()
         self.widget = SessionOverlay()
+        self.widget.content_model.monitor_action('tab-latest')
+        self.widget.content_model.set_detail_group('model')
         self.header = OverlayChrome('header')
         self.header.resize(268, 36)
         self.detail = None
@@ -42,12 +44,12 @@ class ObservedOverlay:
         self.store.write('fixture', attempt or 'attempt-' + key, 1789884000, 'WebSocket', key,
                          requested_model=requested, response_model=response, **values)
 
-    def refresh(self):
+    def refresh(self, children=()):
         self.reader.poll()
         source = self.session.view(1789884100)
         source['history'] = self.reader.enrich('fixture', source['history'])
-        self.engine.ingest([source])
-        data = self.summaries.collect(self.engine)[0]
+        self.engine.ingest([source,*children])
+        data = next(value for value in self.summaries.collect(self.engine) if value['id']==source['id'])
         self.widget.set_content(data)
         self.header.set_title(data['title'], self.widget.content_model.context()[0])
         self.widget.show()
@@ -127,15 +129,16 @@ def test_new_call_clears_old_comparison_then_uses_its_own_completed_evidence(obs
     fixture.refresh()
     latest = '모델 일치 (gpt-5.6-luna)'
     assert model.context()[0] == latest
-    assert latest in detail_values(model) and fixture.widget.toolTip() == ''
-    # Inspecting an older call changes only the call-detail comparison.
+    assert fixture.widget.toolTip() == ''
+    session_detail=detail_values(model)
+    # Inspecting an older graph point leaves session totals and model groups fixed.
     model.select(model.call_id(model.rows()[0]))
     assert model.selected()['key'] == 'old-call'
-    assert old in detail_values(model)
+    assert detail_values(model)==session_detail
     assert model.context()[0] == latest and fixture.widget.toolTip() == ''
 
 
-def test_long_model_names_are_complete_and_wrapped_in_detail(observed_overlay, tmp_path):
+def test_long_model_names_are_elided_with_full_detail_tooltips(observed_overlay, tmp_path):
     fixture = observed_overlay
     requested = 'gpt-shared-long-model-name-' + 'request-variant-' * 5
     response = 'gpt-shared-long-model-name-' + 'response-variant-' * 5
@@ -157,14 +160,21 @@ def test_long_model_names_are_complete_and_wrapped_in_detail(observed_overlay, t
     model.monitor_action('tab-latest')
     assert not any(link['id']=='call-detail' for link in model.monitor_links())
     assert not any(link['id'] in ('cache','cost','speed','latest-context') for link in model.monitor_links())
+    child=Session('long-model-child','fixture',title='Long model child')
+    child.add_usage(1789884002,'child-call',dict(input_tokens=1000,cached_input_tokens=800,
+        cache_write_input_tokens=0,output_tokens=50,reasoning_output_tokens=10),
+        requested,'child-turn','high',service_tier='Standard')
+    child_source=child.view(1789884100)
+    child_source.update(source='subagent',parent_thread_id='model-summary')
+    fixture.refresh([child_source])
+    grouped_model=model.detail_data()['models'][0]['model']
     item = next(item for item in model.detail_items()
-                if (''.join(item[0]) if isinstance(item[0], list) else item[0]) == expected)
-    assert isinstance(item[0], list) and len(item[0]) > 1
+                if (''.join(item[0]) if isinstance(item[0], list) else item[0]) == grouped_model)
+    assert item[0]==grouped_model and item[8]['kind']=='single-line'
     metrics = QFontMetrics(font(model.appearance.family, item[5], item[7]))
-    assert all(metrics.horizontalAdvance(line) <= item[3] for line in item[0])
-    assert item[4] >= metrics.height() * len(item[0])
-    assert '…' not in ''.join(item[0])
-    detail = fixture.reveal_comparison(expected)
+    assert metrics.elidedText(item[0],Qt.ElideRight,int(item[3])).endswith('…')
+    detail = fixture.reveal_comparison(grouped_model)
+    assert any(grouped_model in action['tooltip'] for action in model.state['detailActions'])
     assert widget.grab().save(str(tmp_path / 'long-model-summary.png'))
     assert detail.grab().save(str(tmp_path / 'long-model-detail.png'))
     assert not widget.qml_errors

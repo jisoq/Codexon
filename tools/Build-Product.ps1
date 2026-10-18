@@ -65,8 +65,11 @@ try {
     & $PythonPath (Join-Path $sourceRoot 'tools/prepare_sources.py') --write-offer (Join-Path $stagedProduct 'SOURCE-OFFER.md')
     if ($LASTEXITCODE -ne 0) { throw 'Corresponding source metadata does not match the bundled libraries.' }
     foreach ($guide in @(@('README.md','USER-GUIDE.md'), @('README.ko.md','USER-GUIDE.ko.md'))) {
-        $content = [IO.File]::ReadAllText((Join-Path $sourceRoot $guide[0])).Replace('(README.md)','(USER-GUIDE.md)').Replace('(README.ko.md)','(USER-GUIDE.ko.md)')
+        $content = [IO.File]::ReadAllText((Join-Path $sourceRoot $guide[0])).Replace('(README.md)','(USER-GUIDE.md)').Replace('(README.ko.md)','(USER-GUIDE.ko.md)').Replace('(docs/images/','(')
         [IO.File]::WriteAllText((Join-Path $stagedProduct $guide[1]), $content, [Text.UTF8Encoding]::new($false))
+    }
+    foreach ($image in @('sub-detail-readme-ko.png', 'sub-detail-readme-en.png')) {
+        Copy-Item -LiteralPath (Join-Path $sourceRoot "docs/images/$image") -Destination (Join-Path $stagedProduct $image)
     }
     Copy-Item -LiteralPath (Join-Path $sourceRoot 'LICENSES') -Destination (Join-Path $stagedProduct 'LICENSES') -Recurse
     $pythonBase = (& $PythonPath -c 'import sys; print(sys.base_prefix)').Trim()

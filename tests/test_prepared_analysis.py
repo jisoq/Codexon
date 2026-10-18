@@ -361,6 +361,185 @@ def test_history_window_reuses_scalar_index_and_adopts_corrections(tmp_path, mon
             engine.close()
 
 
+def test_prepared_subagent_finance_matches_full_and_moves_with_lineage():
+    from types import SimpleNamespace
+    from cachemonitor.analysis_engine import AnalysisEngine
+    from cachemonitor.overlay_data import OverlaySummaries
+    from cachemonitor.prepared_ingest import prepare_owner
+    from cachemonitor.prepared_health import split_summary
+    from cachemonitor.prepared_overlays import PreparedOverlays, hydrate_overlay
+    from cachemonitor.prepared_summary import summary_for_storage
+    from test_data_contract import source
+
+    sources={name:source() for name in ('parent','child','grandchild','other')}
+    for name,value in sources.items():
+        value.update(id=name,title=name)
+        value['history'][0].update(key=name,call_id=name)
+    sources['child']['parent_thread_id']='parent'
+    sources['grandchild'].update(parent_thread_id='child',coverage_gaps=[{'start':1}])
+    sources['grandchild']['history'][0]['written']=None
+    owners={};packets={}
+    def replace_owner(name):
+        value=sources[name];key=('home',name)
+        material=prepare_owner(value,owns=lambda *_:True)
+        owners[key]={'metadata':{key:item for key,item in value.items() if key!='history'}}
+        packets[key]=storage.unpack(storage.pack(summary_for_storage(split_summary(material['summary'])[0])))
+    for name in sources:replace_owner(name)
+    view=SimpleNamespace(publication_token=SimpleNamespace(instance='test',generation=1),
+        limits=storage.Limits(), owner=lambda home,sid:owners.get((home,sid)),
+        derived=lambda home,sid,kind:packets[(home,sid)])
+    overlays=PreparedOverlays();full=OverlaySummaries();engine=AnalysisEngine()
+    def collect(changed,removed=()):
+        engine.ingest(list(sources.values()))
+        expected={value['id']:value for value in full.collect(engine)}
+        compact=overlays.collect(view,owners,changed,removed,{})
+        assert all('model_breakdown' not in value and 'subagent_finance' not in value for value in compact)
+        actual={value['id']:hydrate_overlay(view,dict(value,_recent_refs=False),finance=True) for value in compact}
+        for name in sources:
+            assert actual[name].get('subagent_finance')==expected[name].get('subagent_finance')
+        return actual
+    first=collect(None)
+    finance=first['parent']['subagent_finance']
+    assert finance['calls']==2 and finance['priced']==1 and finance['missing']==1
+    assert finance['coverage_gap'] and len(finance['models'])==1
+    assert {value['id'] for value in finance['agents']}=={'child','grandchild'}
+    view.publication_token.generation=2
+    sources['child']['history'][0]['output']+=1;replace_owner('child')
+    updated=collect({('home','child')})
+    assert updated['parent']['_overlay_revision']!=first['parent']['_overlay_revision']
+    assert updated['child']['_overlay_revision']!=first['child']['_overlay_revision']
+    assert updated['grandchild']['_overlay_revision']==first['grandchild']['_overlay_revision']
+    assert updated['other']['_overlay_revision']==first['other']['_overlay_revision']
+    assert updated['parent']['subagent_finance']!=first['parent']['subagent_finance']
+    view.publication_token.generation=3
+    sources['grandchild']['parent_thread_id']='other';replace_owner('grandchild')
+    second=collect({('home','grandchild')})
+    assert second['parent']['subagent_finance']['calls']==1
+    assert second['parent']['subagent_finance']['missing']==0
+    assert second['parent']['_overlay_revision']!=first['parent']['_overlay_revision']
+    assert second['other']['subagent_finance']['cost'] is None
+    assert second['other']['subagent_finance']['missing']==1
+    assert 'subagent_finance' not in second['child']
+    assert second['child']['_overlay_revision']!=updated['child']['_overlay_revision']
+    assert second['other']['_overlay_revision']!=updated['other']['_overlay_revision']
+    view.publication_token.generation=4
+    sources.pop('grandchild');owners.pop(('home','grandchild'));packets.pop(('home','grandchild'))
+    removed=collect(set(),{('home','grandchild')})
+    assert removed['other']['_overlay_revision']!=second['other']['_overlay_revision']
+    assert removed['parent']['_overlay_revision']==second['parent']['_overlay_revision']
+    assert removed['child']['_overlay_revision']==second['child']['_overlay_revision']
+    assert 'subagent_finance' not in removed['other']
+
+
+def test_ready_store_publishes_without_eager_descendant_finance_within_budget(tmp_path, monkeypatch):
+    from cachemonitor.analysis_engine import AnalysisEngine
+    from cachemonitor.overlay_data import OverlaySummaries
+    from cachemonitor.prepared_delivery import PreparedPublisher
+    from cachemonitor.prepared_ingest import prepare_owner, stage_owner, _weight
+    from cachemonitor.prepared_overlays import hydrate_overlay
+    import cachemonitor.prepared_overlays as prepared_overlays
+    from test_data_contract import source
+
+    sources = []
+    for ordinal in range(49):
+        value = source()
+        value.update(id=f'owner-{ordinal}', title=f'Owner {ordinal}')
+        value['history'][0].update(key=f'call-{ordinal}', call_id=f'call-{ordinal}')
+        if ordinal:
+            value['parent_thread_id'] = f'owner-{(ordinal-1)//4}'
+        if ordinal==1:
+            value['history'][-1].update(model='gpt-6.1-sol',analysis_model='gpt-6.1-sol',
+                requested_model='gpt-6.1-sol',response_model='gpt-6.1-sol',response_status='completed',model_match='일치',effort='high')
+        sources.append(value)
+    path = tmp_path/'analysis.sqlite'
+    dependency = {name: 1 for name in storage.DEPENDENCIES}
+    with storage.PreparedStore(path) as store:
+        stage = store.begin(('existing-ready-cache', 1))
+        for ordinal, value in enumerate(sources):
+            stage_owner(stage, prepare_owner(value, owns=lambda *_:True),
+                        dict(dependency, source_digest=f'{ordinal:064x}'), ordinal)
+        original = stage.publish(('existing-ready-cache', 1), ready=True)
+    # Restart against already published packets: upgrading must not rebuild.
+    with storage.PreparedStore(path) as store:
+        publisher = PreparedPublisher(0)
+        publication = publisher.publish(dict(homes=['home']), store)
+        assert store.token == original
+        compact = publication['overlay_sessions']
+        assert len(compact) == len(sources)
+        assert all('model_breakdown' not in value and 'own_model_breakdown' not in value
+                   and 'subagent_finance' not in value for value in compact)
+        engine = AnalysisEngine()
+        engine.ingest(sources)
+        eager_presenter = OverlaySummaries()
+        eager = eager_presenter.collect(engine)
+        # Scale the same conservative tree-admission contract to this fixture.
+        # Eager detail alone exceeds a budget that admits complete publication.
+        retained = (publisher.owners, publisher.choices, publisher.alerts,
+                    publisher.sessions, publisher.overlays, publisher.overlay.own,
+                    publisher.overlay.partials, publisher.overlay.presenter.cache,
+                    publisher.overlay.presenter.rollups, publisher.overlay.presenter.presented,
+                    publisher.overlay.detail_revisions)
+        admitted = _weight(retained, publisher.STATE_BYTES)
+        legacy = (eager, eager_presenter.cache, eager_presenter.rollups, eager_presenter.presented)
+        assert _weight(legacy, publisher.STATE_BYTES) > admitted
+        with pytest.raises(storage.CapacityExceeded):
+            _weight(legacy, admitted)
+        restarted = PreparedPublisher(0)
+        restarted.STATE_BYTES = admitted
+        assert len(restarted.publish(dict(homes=['home']), store)['overlay_sessions']) == len(sources)
+        selected = next(value for value in compact if value['id'] == 'owner-0')
+        expected = next(value for value in eager if value['id'] == 'owner-0')
+        with storage.PreparedReader(path) as reader, reader.pin(original) as view:
+            loaded = []
+            original_derived = view.derived
+            def selected_derived(home, sid, name):
+                loaded.append((home, sid, name))
+                return original_derived(home, sid, name)
+            view.derived = selected_derived
+            requested = []
+            original_records = view.records
+            def selected_records(member, keys, **kwargs):
+                requested.extend((member, key) for key in keys)
+                return original_records(member, keys, **kwargs)
+            view.records = selected_records
+            recent = hydrate_overlay(view, selected)
+            assert 'subagent_finance' not in recent and loaded == []
+            assert [value['id'] for value in recent['recent']] == [value['id'] for value in expected['recent']]
+            assert len(requested) == 12
+            requested.clear()
+            # Opening detail adds descendant finances without rereading graph rows.
+            actual = hydrate_overlay(view, recent, finance=True)
+            assert actual['subagent_finance'] == expected['subagent_finance']
+            child=next(row for row in actual['subagent_finance']['agents'] if row['id']=='owner-1')
+            assert (child['model'],child['effort'],child['model_state'])==('gpt-6.1-sol','high','일치')
+            assert requested == [] and actual['recent'] == recent['recent']
+            assert len(loaded) == len(sources)-1
+            assert all(sid != 'owner-0' and name == 'summary' for _, sid, name in loaded)
+            assert not hasattr(view, 'projected_detail_rows')
+            loaded.clear()
+            assert hydrate_overlay(view, actual, finance=True) == actual
+            assert loaded == [] and requested == []
+            health_reads = []
+            original_health = prepared_overlays.hydrate_health
+            def selected_health(snapshot, owner):
+                health_reads.append(owner)
+                return original_health(snapshot, owner)
+            monkeypatch.setattr(prepared_overlays, 'hydrate_health', selected_health)
+            with_health = hydrate_overlay(view, actual, health=True)
+            assert health_reads == [('home', 'owner-0')]
+            assert hydrate_overlay(view, with_health, health=True, finance=True) == with_health
+            assert health_reads == [('home', 'owner-0')] and requested == []
+            for members in (
+                    [selected['members'][0], selected['members'][1], selected['members'][1]],
+                    [selected['members'][0], ('another-home', selected['members'][1][1])],
+                    [selected['members'][0], selected['members'][-1]]):
+                invalid = dict(selected, members=members, descendants=len(members)-1, _recent_refs=False)
+                with pytest.raises(storage.RebuildRequired):
+                    hydrate_overlay(view, invalid, finance=True)
+            with pytest.raises(storage.StaleGeneration):
+                hydrate_overlay(view, dict(selected, _prepared_token=(original.instance, original.generation+1)))
+
+
 def test_prepared_request_summary_keeps_first_call_at_tied_latest_timestamp():
     from cachemonitor.core import Session
     from cachemonitor.overlay_data import summarize_session
@@ -450,14 +629,14 @@ def test_collector_append_uses_tail_and_historical_correction_uses_full_owner(tm
         initial = collect()
         with storage.PreparedStore(tmp_path/'prepared.sqlite') as store:
             cohort = PreparedCohort(store, client, ledger)
-            # Existing v1 checkpoints retain Home counters. Upgrade their next
-            # certified tail without rebuilding the saved owner or quota data.
-            totals = append._new_totals
-            with monkeypatch.context() as patch:
-                patch.setattr(append, 'FORMAT', ('prepared-owner-append', 1))
-                patch.setattr(append, '_new_totals',
-                    lambda:dict(totals(), home_values=[0]*5, home_missing=[0]*5))
-                assert list(cohort.convert(read_catalog(client)))[-1]['ready']
+            assert list(cohort.convert(read_catalog(client)))[-1]['ready']
+            # Old checkpoints cannot certify a tail without historical model facts.
+            from types import SimpleNamespace
+            for version in (1,2):
+                old=SimpleNamespace(staged_batch=None,owner=lambda *_:{},
+                    derived=lambda *_,version=version:dict(format=('prepared-owner-append',version)))
+                with pytest.raises(append.AppendUnavailable,match='no append checkpoint'):
+                    append.prepare(old,owner,None,{})
             adapter = PreparedLedger(ledger, store)
             list(adapter.sync(envelope(initial)))
             verify(store, initial)
@@ -479,7 +658,7 @@ def test_collector_append_uses_tail_and_historical_correction_uses_full_owner(tm
             with store.read_current() as view:
                 checkpoint = view.derived(*owner, 'checkpoint')
                 assert checkpoint['format'] == append.FORMAT
-                assert not {'home_values', 'home_missing'} & checkpoint['total'].keys()
+                assert checkpoint['total']['models']
             verify(store, appended)
             # An old edit combined with growth must decline the append proof.
             events[2]['payload']['usage']['input_tokens'] = 21000

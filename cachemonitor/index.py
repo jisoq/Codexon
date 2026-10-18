@@ -208,6 +208,7 @@ class UsageIndex:
         self.metadata = {(r[0],r[1]):json.loads(r[2]) for r in self.db.execute('select home,tid,data from metadata') if all_metadata or r[0] in selected_homes}
         self.files = []
         self.queue = deque()
+        self.prioritized_roots = set()
         self.last_discovery = 0
         self.source_catalog = None
         self.initial = True
@@ -229,6 +230,8 @@ class UsageIndex:
         self.pending_rebuilds = deque()
         self.rebuild_deadline = None
         self.source_hashes = {}
+        # Only this process's completed scans can establish a reusable signature.
+        self.verified_sources = {}
         # Only unfinished files own live hash state; overflow waits in the file queue.
         self.source_work = {}
         self.partial_work = OrderedDict()
@@ -315,7 +318,7 @@ class UsageIndex:
                                     self.lineage[key]=session_lineage(header.get('payload'),row['id'])
                             except (OSError,ValueError,TypeError):
                                 pass
-                        meta.update(self.lineage.get(key,{}))
+                        meta.update({field:value for field,value in self.lineage.get(key,{}).items() if not meta.get(field)})
                         if meta.get('parent_thread_id'):meta['thread_source']='subagent'
                         meta.update(names.resolve(meta))
                         if self.metadata.get(key)!=meta:
@@ -339,8 +342,12 @@ class UsageIndex:
                         paths[resolved] = (home, None)
         # Replacing the discovery queue also releases owners that can no longer run.
         self.source_work={path:state for path,state in self.source_work.items() if path in paths}
+        self.source_hashes={path:value for path,value in self.source_hashes.items() if path in paths}
+        self.verified_sources={path:value for path,value in self.verified_sources.items() if path in paths}
+        self.partial_work=OrderedDict((path,value) for path,value in self.partial_work.items() if path in paths)
         self.files = [(path, *value) for path, value in sorted(paths.items())]
         self.queue = deque(self.files)
+        self.prioritized_roots.clear()
         if self.tier_backfill:
             def modified(item):
                 try:return Path(item[0]).stat().st_mtime_ns
@@ -395,12 +402,21 @@ class UsageIndex:
         except FileNotFoundError:
             # Historical paths can move to archived_sessions; discovery covers that location.
             self.source_work.pop(path,None)
+            self.verified_sources.pop(path,None)
             return None
+        signature=(st.st_size,st.st_mtime_ns,str(st.st_ino))
+        verified=self.verified_sources.get(path)
+        if (verified is not None and verified[0]==signature and verified[1][0]==str(home)
+                and path not in self.source_work and path not in self.partial_work
+                and self._source_ready(verified[1])):
+            return None
+        self.verified_sources.pop(path,None)
         old = self.db.execute('select tid,offset,size,mtime,inode from files where path=?', (path,)).fetchone()
         if (old and path not in self.source_work and old[1] == st.st_size and old[2] == st.st_size
                 and old[3] == st.st_mtime_ns and old[4] == str(st.st_ino)):
             self.source_work.pop(path,None)
             key=(str(home),old[0])
+            if self._source_ready(key):self.verified_sources[path]=(signature,key)
             return key if self.initial and key not in self.loaded and not (self.replay and key in self.replay.pending) else None
         offset = old[1] if old else 0
         if old:
@@ -414,7 +430,6 @@ class UsageIndex:
                 self.rebuild_required.add((str(home),tid))
                 offset = 0
                 self.source_work.pop(path,None)
-        signature=(st.st_size,st.st_mtime_ns,str(st.st_ino))
         partial=self.partial_work.get(path)
         if partial is not None and partial['signature']==signature:return None
         if partial is not None:self.partial_work.pop(path,None)
@@ -553,7 +568,15 @@ class UsageIndex:
                 # requires prefix validation anyway; release its parser now.
                 self.partial_work[path]={'signature':signature}
                 while len(self.partial_work)>MAX_SOURCE_WORK:self.partial_work.popitem(last=False)
+            elif tid:
+                self.verified_sources[path]=(signature,(str(home),tid))
         return (str(home), tid) if tid else None
+
+    def _source_ready(self,key):
+        return (not self.initial and not self.cached_restore and key in self.loaded
+                and key not in self.pending_rebuilds and key not in self.rebuild_jobs
+                and key not in self.rebuild_required and not self.new_events.get(key)
+                and not (self.replay and key in self.replay.pending))
 
     def queue_prefix(self,path,home,tid,consumed):
         # Finish ordinary large prefixes before a growing file changes again.
@@ -680,7 +703,7 @@ class UsageIndex:
                 result.append((str(home),None))
         return tuple(result)
 
-    def poll(self, now=None):
+    def poll(self, now=None, *, source_hint=None):
         if self.read_only:raise ValueError('읽기 전용 색인에서는 원본 수집을 실행할 수 없습니다')
         now = now or time.time()
         self.errors = []
@@ -697,7 +720,19 @@ class UsageIndex:
                 self.quota_seeded=True
         elif not self.queue and not self.cached_restore:
             self.queue = deque(self.files)
+            self.prioritized_roots.clear()
             self.done_files = 0
+        if source_hint is not None and source_hint.roots:
+            # A notification identifies a watched tree, not a filename. Include
+            # its files once per authoritative pass. Repeated wakes must not
+            # restart the same prefix and starve the suffix or discovery.
+            roots=source_hint.roots-self.prioritized_roots
+            self.prioritized_roots.update(roots)
+            if roots:
+                priority=[args for args in self.files
+                          if any(Path(args[0]).is_relative_to(root) for root in roots)]
+                paths={args[0] for args in priority}
+                self.queue=deque(priority+[args for args in self.queue if args[0] not in paths])
         changed = set()
         self.prefix_priority = PREFIX_PRIORITY_BUDGET
         deadline = time.monotonic() + .4
@@ -721,6 +756,7 @@ class UsageIndex:
                     changed.add(key)
             except (OSError, sqlite3.Error) as exc:
                 self.source_work.pop(args[0],None)
+                self.verified_sources.pop(args[0],None)
                 self.errors.append(f'기록 읽기: {Path(args[0]).name}: {exc}')
                 self.collection_fault['read_failed']=True
             self.done_files += 1
@@ -941,6 +977,8 @@ class UsageIndex:
         self.activity_rows = []
         self.activity_tokens = {}
         self.source_work.clear()
+        self.prioritized_roots.clear()
+        self.verified_sources.clear()
         self.partial_work.clear()
         if self.archive is not None:self.archive.clear()
         self.model_evidence.close()

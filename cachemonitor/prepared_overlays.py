@@ -2,7 +2,7 @@
 from types import SimpleNamespace
 
 from .analysis_records import compact_record
-from .overlay_data import OverlaySummaries, call_summary
+from .overlay_data import OverlaySummaries, call_summary, _subagent_finance, SUBAGENT_CALL_FIELDS
 from .prepared_health import check_reference, hydrate_health
 from .prepared_store import CapacityExceeded, NotReady, RebuildRequired, _size, pack
 from .prepared_summary import recent_references, MAX_RECENT
@@ -37,7 +37,10 @@ class PreparedOverlays:
             if packet is None:
                 raise NotReady('the displayed owner has no published summary')
             refs = list(recent_references(packet))
-            own = packet['own']
+            # Detailed accounting stays stored once per owner. Whole-session
+            # publication retains only the fields the main overlay displays.
+            own = {name: value for name, value in packet['own'].items()
+                   if name != 'model_breakdown'}
             # An ancestor's winning reference is the contributing member's
             # latest call. These already computed scalars preserve its headline.
             if refs:
@@ -51,7 +54,7 @@ class PreparedOverlays:
         updated = {key: (self.revisions[key], self.own[key]) for key in sessions}
         previous = self.presenter.presented
         result = self.presenter.present(SimpleNamespace(sessions=sessions), updated,
-                                        self.partials, speed_results)
+                                        self.partials, speed_results, include_finance=False)
         token = (view.publication_token.instance, view.publication_token.generation)
         revisions = {}
         for key, current in self.presenter.presented.items():
@@ -65,8 +68,61 @@ class PreparedOverlays:
                      _overlay_revision=revisions[(value['home'], value['id'])]) for value in result]
 
 
-def hydrate_overlay(snapshot, summary, *, health=False):
-    """Hydrate a selected display's top twelve refs in per-owner SQL batches."""
+def _hydrate_finance(snapshot, summary, owner):
+    """Read descendant financial packets only, in the displayed generation."""
+    members = summary.get('members', (owner,))
+    if (not isinstance(members, (list, tuple)) or not members or
+            any(not isinstance(member, (list, tuple)) or len(member) != 2 or
+                any(type(value) is not str for value in member) for member in members)):
+        raise RebuildRequired('invalid displayed financial membership')
+    members = tuple(map(tuple, members))
+    if (members[0] != owner or len(set(members)) != len(members) or
+            any(member[0] != owner[0] for member in members) or
+            len(members) != summary.get('descendants', 0) + 1):
+        raise RebuildRequired('displayed financial membership differs from its owner')
+    if len(members) == 1:
+        return None
+    parents = {}
+    for member in members:
+        entry = snapshot.owner(*member)
+        if entry is None:
+            raise NotReady('a displayed financial member is absent')
+        metadata = entry['metadata']
+        if metadata.get('_internal_review'):
+            raise RebuildRequired('an internal owner cannot contribute displayed finances')
+        parents[member] = (member[0], metadata.get('parent_thread_id'))
+    resolved = {owner}
+    for member in members[1:]:
+        seen = set()
+        while member not in resolved:
+            if member in seen or member not in parents:
+                raise RebuildRequired('a displayed financial member has unrelated ancestry')
+            seen.add(member)
+            member = parents[member]
+        resolved.update(seen)
+    financial = []
+    size = 0
+    fields = ('home', 'id', 'title', 'cost', 'calls', 'priced', 'missing',
+              'coverage_gap', 'assumed', 'model_breakdown', 'token_composition', 'cost_composition') + SUBAGENT_CALL_FIELDS
+    for member in members[1:]:
+        packet = snapshot.derived(*member, 'summary')
+        if packet is None:
+            raise NotReady('a displayed financial member has no summary')
+        # Validate the stored packet without hydrating any historical calls.
+        recent_references(packet)
+        own = packet['own']
+        if (own['home'], own['id']) != member:
+            raise RebuildRequired('financial summary belongs to another owner')
+        value = {name: own[name] for name in fields}
+        size += _size(value)
+        if size > snapshot.limits.page_objects_bytes:
+            raise CapacityExceeded('selected financial detail exceeds the delivered object budget')
+        financial.append(value)
+    return _subagent_finance(financial, summary['child_cost'])
+
+
+def hydrate_overlay(snapshot, summary, *, finance=False, health=False):
+    """Hydrate recent refs; add financial and health detail only on demand."""
     owner = check_reference(snapshot, summary)
     result = dict(summary)
     if summary.get('_recent_refs'):
@@ -106,7 +162,11 @@ def hydrate_overlay(snapshot, summary, *, health=False):
                 raise CapacityExceeded('recent call summaries exceed the delivered object budget')
             recent.append(value)
         result.update(recent=recent, latest=recent[-1] if recent else {}, _recent_refs=False)
-    if health:
+    if finance and 'subagent_finance' not in result:
+        financial = _hydrate_finance(snapshot, summary, owner)
+        if financial is not None:
+            result['subagent_finance'] = financial
+    if health and not result.get('_health_detail'):
         result.update(hydrate_health(snapshot, owner))
         result['_health_detail'] = True
     if _size(result) > snapshot.limits.page_objects_bytes:

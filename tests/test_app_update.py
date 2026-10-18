@@ -124,6 +124,82 @@ def test_update_panel_keeps_success_when_proxy_is_off():
     app.processEvents()
 
 
+def test_update_panel_reloads_atomic_journal_changes_without_idle_json_reads(tmp_path,monkeypatch):
+    from types import SimpleNamespace
+    from PySide6.QtWidgets import QApplication
+    from PySide6.QtTest import QTest
+    from cachemonitor.update_panel import UpdatePanel
+    import time
+    app=QApplication.instance() or QApplication([])
+    panel=UpdatePanel(SimpleNamespace(directory=tmp_path/'updates'));journal=panel.journal
+    reads=[];read=journal.read
+    monkeypatch.setattr(journal,'read',lambda:reads.append(True) or read())
+    def settle(predicate):
+        deadline=time.monotonic()+2
+        while time.monotonic()<deadline:
+            app.processEvents()
+            if predicate():return
+            QTest.qWait(5)
+        raise AssertionError('Journal change did not reach the update panel')
+    def write(phase):
+        journal.write(dict(operation_id='a'*32,phase=phase,app={'state':'current'},proxy={}))
+    try:
+        for _ in range(3):
+            panel.timer.timeout.emit();panel.refresh();panel.proxy_status({'update':{'phase':'off'}})
+        assert not reads
+        write('complete');settle(lambda:panel.record.get('phase')=='complete')
+        for phase in ('failed','complete'):
+            write(phase);settle(lambda:panel.record.get('phase')==phase)
+        journal.path.unlink();settle(lambda:not panel.record)
+        write('partial');settle(lambda:panel.record.get('phase')=='partial')
+        journal.path.unlink();settle(lambda:not panel.record)
+        journal.root.rmdir()
+        write('complete');settle(lambda:panel.record.get('phase')=='complete')
+        write('failed');settle(lambda:panel.record.get('phase')=='failed')
+        reads.clear()
+        for _ in range(3):panel.timer.timeout.emit()
+        assert not reads and panel.execute.isVisible()
+    finally:panel.stop();panel.deleteLater();app.processEvents()
+
+
+def test_hidden_update_panel_recovers_after_owner_exit_without_journal_change(tmp_path,monkeypatch):
+    from types import SimpleNamespace
+    from PySide6.QtWidgets import QApplication
+    from PySide6.QtTest import QTest
+    from cachemonitor import proxy_identity,update_panel
+    from cachemonitor.update_state import UpdateState
+    import time
+    app=QApplication.instance() or QApplication([])
+    journal=UpdateState(tmp_path/'updates');record=journal.begin('app','fixture')
+    record.update(phase='downloading',updated_at=0,owner={'pid':1})
+    journal.path.write_text(json.dumps(record),encoding='utf-8')
+    alive=[True];now=[100.];calls=[];reconcile=app_update.reconcile_update
+    monkeypatch.setattr(proxy_identity,'same_process',lambda owner:alive[0])
+    monkeypatch.setattr(update_panel,'time',SimpleNamespace(monotonic=lambda:now[0]))
+    def recover(*args):
+        calls.append(True);return reconcile(*args)
+    monkeypatch.setattr(app_update,'reconcile_update',recover)
+    panel=update_panel.UpdatePanel(SimpleNamespace(directory=journal.root));panel.hide()
+    def settle(predicate):
+        deadline=time.monotonic()+2
+        while time.monotonic()<deadline:
+            app.processEvents()
+            if predicate():return
+            QTest.qWait(5)
+        raise AssertionError('Hidden update recovery did not finish')
+    try:
+        settle(lambda:panel.operation is None)
+        assert panel.record['phase']=='downloading' and len(calls)==1
+        panel.refresh();assert len(calls)==1
+        alive[0]=False;now[0]+=31;panel.recovery_timer.start(0)
+        settle(lambda:panel.operation is None and panel.record.get('phase')=='interrupted')
+        assert len(calls)==2 and journal.read()['phase']=='interrupted' and not panel.isVisible()
+    finally:
+        panel.stop()
+        if panel.operation:panel.operation.wait()
+        panel.deleteLater();app.processEvents()
+
+
 @pytest.mark.parametrize('previous_kind',[None,'none','app'])
 def test_failed_update_recheck_labels_previous_result_and_recovers(monkeypatch,previous_kind):
     from urllib.error import URLError

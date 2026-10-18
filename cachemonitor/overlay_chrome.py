@@ -202,7 +202,6 @@ class OverlayChrome(QuickHost):
 
 class NavigationModel(Node):
     navigationRequested=Signal(object)
-    detailRequested=Signal(object)
     callSelected=Signal(object)
     def __init__(self,content):
         super().__init__();self.content=content;self.targets={};self.captured=None
@@ -224,8 +223,8 @@ class NavigationModel(Node):
         if getattr(self,'captured_scope',None)!=(data.get('home'),data.get('id')):return
         if isinstance(target,str):self.content.monitor_action(target);return
         if target and (target.home,target.sid) in [tuple(v) for v in data.get('members',[(data.get('home'),data.get('id'))])]:
-            signal={'detail':self.detailRequested,'select':self.callSelected}.get(self.captured_interaction,self.navigationRequested)
-            signal.emit((target,self.captured_row) if self.captured_interaction in ('detail','select') else target)
+            signal=self.callSelected if self.captured_interaction=='select' else self.navigationRequested
+            signal.emit((target,self.captured_row) if self.captured_interaction=='select' else target)
     @Slot(str)
     def inspectCall(self,key):
         row=None
@@ -252,16 +251,18 @@ class DetailModel(NavigationModel):
         self.sync()
 
     @Property(QObject, constant=True)
-    def detailGraph(self): return self.content.detailGraph
-
-    @Property(QObject, constant=True)
     def detailBody(self): return self.content.detailBody
 
     def sync(self):
         from .overlay_navigation import navigation_target
         links=self.link_state(self.content.detail_links())
-        self.targets['selected']=navigation_target(self.content.data,'call',call=self.content.selected())
+        self.targets['session']=navigation_target(self.content.data,'session')
         self.put(**self.content.state,detailLinks=links)
+
+    @Slot(str)
+    def activateDetail(self,key):
+        if key.startswith('mode-'):self.content.set_detail_group(key[5:])
+        elif key.startswith('group-'):self.content.toggle_detail_group(key[6:])
 
     @Slot()
     def escapePanel(self): self.escapeRequested.emit()
@@ -271,13 +272,13 @@ class DetailModel(NavigationModel):
 
 
 class OverlayDetail(QuickHost):
-    """Only this pane receives graph and scrolling input beside the monitor."""
+    """Subagent cost groups and scrolling input beside the monitor."""
     escape = Signal()
     interaction_started = Signal()
 
     def __init__(self, content):
         super().__init__(None, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
-        self.setWindowTitle('Cache Monitor - 호출 상세')
+        self.setWindowTitle('Cache Monitor - Sub 상세')
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.setFocusPolicy(Qt.NoFocus)

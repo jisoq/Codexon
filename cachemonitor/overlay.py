@@ -2,15 +2,43 @@
 import os
 import time
 import math
+from collections import OrderedDict
+from dataclasses import dataclass
 from PySide6.QtCore import Qt, QTimer, QObject, Signal, QVariantAnimation, QEasingCurve
 from PySide6.QtGui import QAction, QActionGroup, QFontDatabase
 from PySide6.QtWidgets import QApplication
-from .overlay_view import OverlayContent, SessionOverlay, TOKEN_COLORS
+from .overlay_view import OverlayContent, SessionOverlay
 from .overlay_monitor import WIDTH, ACTIONS_X, HEADER_X, HEADER_WIDTH, POPUP_X, INLINE_HEADER_WIDTH
 from .overlay_tracking import overlay_geometry, anchor_for_position
 from .overlay_appearance import CodexAppearance, default_appearance
 from .analysis_delivery import ANALYSIS_DELAY_SECONDS
 from .analysis_engine import BoundedCache, retained_bytes
+
+
+@dataclass(frozen=True)
+class OverlayRequest:
+    request_id: str
+    identity: tuple
+    revision: tuple
+    health: bool = False
+    finance: bool = False
+
+    def matches(self,data):
+        identity=OverlayController.overlay_identity(data)
+        return self.identity==identity or bool(self.revision and self.identity[:2]==identity[:2]
+            and self.revision==tuple(data.get('_overlay_revision') or ()))
+
+    def satisfies(self,*,health=False,finance=False):
+        return (self.health or not health) and (self.finance or not finance)
+
+    def accepts(self,value):
+        detail=value.get('summary')
+        return bool(detail and tuple(value.get('prepared_token') or ())==self.identity[2]
+            and OverlayController.overlay_identity(detail)==self.identity
+            and tuple(detail.get('_overlay_revision') or ())==self.revision
+            and not detail.get('_recent_refs')
+            and (not self.health or detail.get('_health_detail'))
+            and (not self.finance or 'subagent_finance' in detail))
 
 
 def system_dark():
@@ -33,14 +61,16 @@ class OverlayController(QObject):
         self.record_loader=None;self.record_serial=0;self.pending_record=None
         self.overlay_loader=None;self.overlay_serial=0;self.pending_overlay=None
         self._overlay_detail=None;self._overlay_blocked=None
+        self._overlay_requests=OrderedDict()
+        self._overlay_restart_pending=False
         self._overlay_cache=BoundedCache(entries=8,rows=8*1024*1024)
         self._pending_overlay_navigation=None
         self.widget = SessionOverlay()
         content=self.widget.content_model;content.settings=settings
-        content.monitor_tab=settings.value('overlay/monitorTab','latest')
-        if content.monitor_tab not in ('history','latest'):content.monitor_tab='latest'
-        content.composition_unit=settings.value('overlay/compositionUnit','tokens')
-        if content.composition_unit not in ('tokens','usd'):content.composition_unit='tokens'
+        content.monitor_tab=settings.value('overlay/monitorTab','history')
+        if content.monitor_tab not in ('history','latest'):content.monitor_tab='history'
+        content.composition_unit=settings.value('overlay/compositionUnit','usd')
+        if content.composition_unit not in ('tokens','usd'):content.composition_unit='usd'
         from .overlay_shadow import OverlayShadow
         self.shadow=OverlayShadow()
         from .overlay_chrome import OverlayChrome, OverlayDetail, OverlayLinks
@@ -48,7 +78,6 @@ class OverlayController(QObject):
         self.detail=OverlayDetail(self.widget.content_model)
         self.links=OverlayLinks(self.widget.content_model)
         self.links.view.navigationRequested.connect(self.navigation_requested)
-        self.links.view.detailRequested.connect(self.open_call_detail)
         self.links.view.callSelected.connect(self.pin_call)
         self.actions.view.detailPressed.connect(self.capture_detail)
         self.actions.view.detailClicked.connect(self.activate_detail)
@@ -120,6 +149,8 @@ class OverlayController(QObject):
         self.appearance_reader = CodexAppearance(appearance_path, QFontDatabase.families())
         self.appearance = default_appearance(self.dark)
         self.next_theme = 0
+        self._pending_detail_at = None
+        self._content_time_state = None
         self.stopped = False
         self.enabled_changed = None
         self.widget.winId()
@@ -137,7 +168,7 @@ class OverlayController(QObject):
             self.tracker.observed.connect(self.receive_target)
             if self.enabled:self.tracker.start()
         self.timer = QTimer(self.widget)
-        self.timer.timeout.connect(self.refresh)
+        self.timer.timeout.connect(self._tick)
         self.input_timer=QTimer(self.widget)
         self.input_timer.timeout.connect(self.poll_popup)
         self._pointer_down=False
@@ -151,37 +182,15 @@ class OverlayController(QObject):
 
 
     def capture_detail(self):
-        from .overlay_navigation import navigation_target
         c=self.widget.content_model;data=c.data or {}
-        row=c.selected() if c.monitor_tab=='history' and c.graph_pinned else data.get('latest') or {}
-        self._detail_capture=((data.get('home'),data.get('id')),navigation_target(data,'call',call=row),dict(row),self.expanded)
+        self._detail_capture=((data.get('home'),data.get('id')),self.expanded)
 
     def activate_detail(self):
         captured=getattr(self,'_detail_capture',None);self._detail_capture=None
         if not captured:return
-        scope,target,row,expanded=captured;data=self.widget.content_model.data or {}
+        scope,expanded=captured;data=self.widget.content_model.data or {}
         if scope!=(data.get('home'),data.get('id')):return
-        if expanded:
-            self.toggle_expanded()
-        elif target:self.open_call_detail((target,row))
-
-    def select_call(self,value):
-        target,snapshot=value
-        content=self.widget.content_model
-        row=next((r for r in [snapshot,*content.rows(),content.selected()] if r and
-                  (r.get('home'),r.get('sid'),str(r.get('id')))==(target.home,target.sid,target.call_id)),None)
-        if not row:return False
-        self.pending_record=None;content.selected_snapshot=row;content.selected_id=content.call_id(row)
-        pinned=content.graph_pinned
-        content.select(content.call_id(row))
-        if pinned:content.follow_latest=False
-        content.update()
-        return True
-
-    def open_call_detail(self,target):
-        if not self.select_call(target):return
-        self.expanded=True;self.settings.setValue('overlay/expanded',True)
-        self.close_popup();self.refresh()
+        if self.expanded==expanded:self.toggle_expanded()
 
     def receive_record(self,value):
         pending=self.pending_record
@@ -210,84 +219,129 @@ class OverlayController(QObject):
                     (cached.get('home'),cached.get('id'),tuple(cached.get('_overlay_revision') or ())))
 
     @staticmethod
-    def refreshed_overlay_detail(data,cached,health):
+    def refreshed_overlay_detail(data,cached,health=False):
         value=dict(data,recent=cached['recent'],latest=cached['latest'],_recent_refs=False,
-                   _health_detail=bool(health and cached.get('_health_detail')))
-        if value['_health_detail']:
+                   _health_detail=bool(data.get('_health_detail') or cached.get('_health_detail')))
+        if 'subagent_finance' in cached:
+            value['subagent_finance']=cached['subagent_finance']
+        if cached.get('_health_detail'):
             value.update({key:cached[key] for key in
                           ('cache_misses','cache_health','cache_degradation') if key in cached})
         return value
 
     def prepared_content(self,data):
-        """Only the selected visible overlay requests calls or health evidence."""
-        if not data.get('_recent_refs'):return data,False
+        """Reuse graph rows and acquire optional detail only when it is shown."""
         identity=self.overlay_identity(data)
         if self.collapsed:
-            self._overlay_detail=None;self.pending_overlay=None
+            self._overlay_detail=None
             return data,False
-        cached=self._overlay_detail
-        health=bool(self.expanded)
+        navigation=getattr(self,'_pending_overlay_navigation',None)
+        if navigation:
+            from .overlay_navigation import NavigationTarget
+            target=NavigationTarget.from_value(navigation)
+            if (target.home,target.sid)!=identity[:2]:
+                self._pending_overlay_navigation=None;navigation=None
+        health=bool(navigation)
+        finance=bool(self.expanded and data.get('descendants',0))
+        if (not data.get('_recent_refs') and (not health or data.get('_health_detail'))
+                and (not finance or 'subagent_finance' in data)):
+            return data,False
+        displayed=self._overlay_detail
         cache=getattr(self,'_overlay_cache',None)
         previous=cache.get(identity[:2]) if cache is not None else None
-        if (previous and (self.overlay_identity(previous)==identity or self.reusable_overlay_detail(data,previous))
-                and (not cached or self.overlay_identity(cached)[:2]!=identity[:2]
-                     or health and not cached.get('_health_detail'))):
-            cached=previous
-        if cached and (self.overlay_identity(cached)==identity or self.reusable_overlay_detail(data,cached)):
-            cached=self.refreshed_overlay_detail(data,cached,health)
+        cached=data if not data.get('_recent_refs') else None
+        for candidate in (displayed,previous):
+            if candidate and (self.overlay_identity(candidate)==identity or self.reusable_overlay_detail(data,candidate)):
+                cached=self.refreshed_overlay_detail(cached or data,candidate)
+        if cached:
             self._overlay_detail=cached
-            if not health or cached.get('_health_detail'):
+            if (not health or cached.get('_health_detail')) and (not finance or 'subagent_finance' in cached):
                 return cached,False
         pending=self.pending_overlay
-        same_pending=bool(pending and (pending[1]==identity or
-            len(pending)>3 and pending[1][:2]==identity[:2] and pending[3] and
-            pending[3]==tuple(data.get('_overlay_revision') or ())))
-        if (self.overlay_loader and self._overlay_blocked!=identity and
-                not (same_pending and (pending[2] or not health))):
-            self.overlay_serial+=1;request=f'overlay-detail-{self.overlay_serial}'
-            self.pending_overlay=(request,identity,health,tuple(data.get('_overlay_revision') or ()))
-            self.overlay_loader(request,data,health=health)
-        if cached and self.overlay_identity(cached)[:2]==identity[:2]:
+        same_pending=bool(pending and pending.matches(data) and pending.satisfies(health=health,finance=finance))
+        blocked=getattr(self,'_overlay_blocked',None) or {}
+        if (self.overlay_loader and not getattr(self,'_overlay_restart_pending',False)
+                and blocked.get(identity[:2])!=identity and not same_pending):
+            self.overlay_serial+=1
+            request=OverlayRequest(f'overlay-detail-{self.overlay_serial}',identity,
+                tuple(data.get('_overlay_revision') or ()),health,finance)
+            requests=getattr(self,'_overlay_requests',None)
+            if requests is None:self._overlay_requests=requests=OrderedDict()
+            requests[request.request_id]=request
+            while len(requests)>8:requests.popitem(last=False)
+            self.pending_overlay=request
+            self.overlay_loader(request.request_id,cached or data,health=health,finance=finance)
+        retained=cached or displayed
+        if retained and self.overlay_identity(retained)[:2]==identity[:2]:
             # Publish a complete replacement only after its calls arrive. Mixing
             # new totals with old rows, or clearing the panel while querying,
             # presents an inconsistent frame and drops the user's selection.
             collection=dict(data.get('_collection',{}),
-                            last_confirmed_at=cached.get('_collection',{}).get('last_confirmed_at'))
-            return dict(cached,_collection=collection),True
+                            last_confirmed_at=retained.get('_collection',{}).get('last_confirmed_at'))
+            return dict(retained,_collection=collection),True
         return None,True
 
+    def block_overlay_request(self,request):
+        blocked=getattr(self,'_overlay_blocked',None)
+        if blocked is None:self._overlay_blocked=blocked=OrderedDict()
+        scope=request.identity[:2]
+        blocked[scope]=request.identity;blocked.move_to_end(scope)
+        while len(blocked)>8:blocked.popitem(last=False)
+
+    def receive_overlay_fault(self,value):
+        requests=getattr(self,'_overlay_requests',None)
+        if value.get('query_failed'):
+            request=requests.pop(value.get('request_id'),None) if requests is not None else None
+            failed=(request,) if request else ()
+        elif value.get('fatal') or value.get('start_failed') or value.get('process_exited'):
+            self._overlay_restart_pending=True
+            failed=tuple(requests.values()) if requests is not None else ()
+            if requests is not None:requests.clear()
+        else:return
+        for request in failed:
+            if value.get('query_failed'):OverlayController.block_overlay_request(self,request)
+            if self.pending_overlay and self.pending_overlay.request_id==request.request_id:self.pending_overlay=None
+        if failed:self.refresh()
+
     def receive_overlay_detail(self,value):
-        pending=self.pending_overlay
-        if not pending or value.get('id')!=pending[0]:return
-        self.pending_overlay=None
-        selection=self.target_state.get('selection')
-        matches=self.session_lookup.get(selection.thread_id,[]) if selection else []
-        if len(matches)!=1:return
-        current=matches[0]
-        if value.get('kind')=='stale':
-            self._overlay_blocked=pending[1]
-            self.refresh();return
-        detail=value.get('summary')
-        token=tuple(value.get('prepared_token') or ())
-        if not detail or token!=pending[1][2] or self.overlay_identity(detail)!=pending[1]:return
-        if detail.get('_recent_refs') or (pending[2] and not detail.get('_health_detail')):return
-        if self.overlay_identity(current)!=pending[1]:
-            if not self.reusable_overlay_detail(current,detail):return
-            detail=self.refreshed_overlay_detail(current,detail,pending[2])
-        self._overlay_detail=detail;self._overlay_blocked=None
+        requests=getattr(self,'_overlay_requests',None)
+        request=requests.pop(value.get('id'),None) if requests is not None else None
+        if request is None:return
+        active=bool(self.pending_overlay and self.pending_overlay.request_id==request.request_id)
+        if active:self.pending_overlay=None
+        if not request.accepts(value):
+            OverlayController.block_overlay_request(self,request)
+            if active:self.refresh()
+            return
+        matches=[data for data in self.session_lookup.get(request.identity[1],[]) if data.get('home')==request.identity[0]]
+        if len(matches)!=1 or not request.matches(matches[0]):return
+        current=matches[0];detail=value['summary']
+        if self.overlay_identity(current)!=request.identity:
+            detail=self.refreshed_overlay_detail(current,detail)
         cache=getattr(self,'_overlay_cache',None)
+        key=request.identity[:2]
         if cache is not None:
-            key=self.overlay_identity(detail)[:2]
             previous=cache.get(key)
-            if (not previous or not previous.get('_health_detail') or detail.get('_health_detail')
-                    or not (self.overlay_identity(previous)==self.overlay_identity(detail)
-                            or self.reusable_overlay_detail(detail,previous))):
-                cache.put(key,detail,retained_bytes((key,detail),cache.rows))
+            if previous and (self.overlay_identity(previous)==self.overlay_identity(detail)
+                             or self.reusable_overlay_detail(detail,previous)):
+                detail=self.refreshed_overlay_detail(detail,previous)
+        displayed=self._overlay_detail
+        if displayed and (self.overlay_identity(displayed)==self.overlay_identity(detail)
+                          or self.reusable_overlay_detail(detail,displayed)):
+            detail=self.refreshed_overlay_detail(detail,displayed)
+        if cache is not None:cache.put(key,detail,retained_bytes((key,detail),cache.rows))
+        blocked=getattr(self,'_overlay_blocked',None)
+        if blocked is not None:blocked.pop(key,None)
+        if not OverlayController.selected_scope(self,*key):return
+        self._overlay_detail=detail
         self.refresh()
-        navigation=self._pending_overlay_navigation
+        navigation=getattr(self,'_pending_overlay_navigation',None)
         if navigation and detail.get('_health_detail'):
-            self._pending_overlay_navigation=None
-            self.navigate_from_dashboard(navigation)
+            from .overlay_navigation import NavigationTarget
+            target=NavigationTarget.from_value(navigation)
+            if (target.home,target.sid)==key:
+                self._pending_overlay_navigation=None
+                self.navigate_from_dashboard(navigation)
 
     def selected_scope(self,home,sid):
         selection=self.target_state.get('selection')
@@ -399,7 +453,7 @@ class OverlayController(QObject):
         self.refresh()
 
     def toggle_expanded(self):
-        if self.widget.content_model.notice_card():return
+        if not self.widget.content_model.has_subagents():return
         self.close_popup()
         self.expanded=not self.expanded
         if not self.expanded:
@@ -527,7 +581,7 @@ class OverlayController(QObject):
         old=self.current_geometry if self.automatic_mode=='icon' else self.monitor_geometry
         box=anchored_monitor_geometry(frame,dpi,old[2]*96/dpi,old[3]*96/dpi,anchor=self.anchor)
         if box is None:return False
-        if self.expanded and self.automatic_mode!='icon':
+        if self.expanded and self.widget.content_model.has_subagents() and self.automatic_mode!='icon':
             inline=extend_monitor_left(frame,dpi,box,240*self.appearance.scale) is None
             if inline!=(self.automatic_mode=='detail-inline'):return False
         dx,dy=box[0]-old[0],box[1]-old[1]
@@ -568,12 +622,18 @@ class OverlayController(QObject):
         for control in self.chrome:control.hide()
 
     def receive_target(self, state):
+        now = time.monotonic()
+        if state == self.target_state:
+            self.observed_at = now
+            self._tick()
+            return
         if (state.get('selection')!=self.target_state.get('selection')
                 or state.get('target')!=self.target_state.get('target')):self.cancel_drag()
         if state.get('selection')!=self.target_state.get('selection'):
             self.close_popup()
+            self._pending_overlay_navigation=None
         self.target_state = state
-        self.observed_at = time.monotonic()
+        self.observed_at = now
         self.refresh()
 
     def set_position(self, position):
@@ -587,10 +647,27 @@ class OverlayController(QObject):
         self.sessions = snapshot.get('overlay_sessions', [])
         self.session_lookup={}
         for s in self.sessions:self.session_lookup.setdefault(s['id'],[]).append(s)
+        owners={(s.get('home'),s['id']):s for s in self.sessions}
         cache=getattr(self,'_overlay_cache',None)
-        if cache is not None:
-            scopes={(s.get('home'),s['id']) for s in self.sessions}
-            cache.discard(lambda key:key not in scopes)
+        if cache is not None:cache.discard(lambda key:key not in owners)
+        requests=getattr(self,'_overlay_requests',None)
+        if requests is not None:
+            for request_id,request in tuple(requests.items()):
+                if request.identity[:2] not in owners:requests.pop(request_id)
+            pending=getattr(self,'pending_overlay',None)
+            if pending and pending.request_id not in requests:self.pending_overlay=None
+        detail=getattr(self,'_overlay_detail',None)
+        if detail and self.overlay_identity(detail)[:2] not in owners:self._overlay_detail=None
+        blocked=getattr(self,'_overlay_blocked',None)
+        if blocked is not None:
+            for key,identity in tuple(blocked.items()):
+                if key not in owners or self.overlay_identity(owners[key])!=identity:blocked.pop(key)
+        navigation=getattr(self,'_pending_overlay_navigation',None)
+        if navigation:
+            from .overlay_navigation import NavigationTarget
+            target=NavigationTarget.from_value(navigation)
+            if (target.home,target.sid) not in owners:self._pending_overlay_navigation=None
+        self._overlay_restart_pending=False
         self.snapshot_at = time.monotonic()
         self.loading = snapshot.get('index', {}).get('loading', False)
         self.errors = snapshot.get('errors', [])
@@ -606,6 +683,7 @@ class OverlayController(QObject):
         self.refresh()
 
     def content(self):
+        self._pending_detail_at = None
         selection = self.target_state.get('selection')
         if not selection or not selection.thread_id:
             return None, '기록 확인 중'
@@ -638,6 +716,7 @@ class OverlayController(QObject):
         data,pending=self.prepared_content(data)
         if pending and data:
             confirmed=data['_collection'].get('last_confirmed_at')
+            self._pending_detail_at=confirmed
             if confirmed and time.time()-confirmed>ANALYSIS_DELAY_SECONDS and not note:
                 note='수집 지연'
                 data['_collection'].update(delayed=True,reason='detail_delay')
@@ -669,7 +748,7 @@ class OverlayController(QObject):
         if self.popup_open:
             self.close_popup()
             return
-        elif self.expanded and not self.widget.content_model.notice_card():
+        elif self.expanded and self.widget.content_model.has_subagents():
             self.toggle_expanded()
             return
         target=self.target_state.get('target')
@@ -713,6 +792,55 @@ class OverlayController(QObject):
     def screen_changed(self,screen):
         QTimer.singleShot(0,self.refresh)
 
+    def _content_time(self):
+        age=max(0,time.monotonic()-self.snapshot_at)
+        data=self.widget.data
+        if data and data.get('_collection',{}).get('reason')=='analysis_delay':
+            data=dict(data,_collection=dict(data['_collection'],received_age=age))
+        return (age>ANALYSIS_DELAY_SECONDS,
+                bool(self._pending_detail_at and time.time()-self._pending_detail_at>ANALYSIS_DELAY_SECONDS),
+                OverlayContent.collection_age(data,self.widget.note))
+
+    def _refresh_appearance(self):
+        now=time.monotonic()
+        if self.drag_context or now<self.next_theme:return False
+        mode=self.settings.value('ui/theme',self.settings.value('overlay/theme','codex'))
+        if mode=='codex':
+            appearance=self.appearance_reader.read(system_dark())
+        else:
+            appearance=default_appearance(system_dark() if mode=='system' else mode=='dark')
+        reduced_motion=bool(hasattr(self.native,'reduce_motion') and self.native.reduce_motion())
+        changed=(appearance,reduced_motion)!=(self.appearance,self.reduced_motion)
+        self.appearance=appearance;self.dark=appearance.dark;self.reduced_motion=reduced_motion
+        from .theme import shared_theme
+        shared_theme().configure(mode,appearance=appearance)
+        self.next_theme=now+1
+        return changed
+
+    def _tick(self):
+        if self.stopped:return
+        target=self.target_state.get('target');selection=self.target_state.get('selection')
+        if (not self.enabled or not self.native or not target or not selection
+                or not selection.thread_id or time.monotonic()-self.observed_at>3
+                or not self.native.visible_target(target['hwnd'])):
+            self.hide_all();return
+        frame=self.native.frame(target['hwnd'])
+        if not frame:self.hide_all();return
+        dpi=self.native.u.GetDpiForWindow(target['hwnd']) or 96
+        placements=getattr(self,'_placements',{})
+        primary=self.icon if self.automatic_mode=='icon' else self.widget
+        if (getattr(self,'_placement_context',None)!=(frame,dpi) or not primary.isVisible()
+                or any(int(control.winId()) in placements and not control.isVisible()
+                       for control in (self.widget,self.shadow,*self.chrome))):
+            self.refresh();return
+        if not self.drag_context:
+            appearance_changed=self._refresh_appearance()
+            if appearance_changed or self._content_time()!=self._content_time_state:
+                self.refresh();return
+        for hwnd,geometry in placements.items():
+            if not self.native.place(hwnd,geometry):
+                self.refresh();return
+
     def _refresh(self,drag_layout=False):
         if self.stopped: return
         target = self.target_state.get('target')
@@ -735,18 +863,10 @@ class OverlayController(QObject):
         self._placement_context=(frame,dpi)
         if not self.drag_context:self._load_collapsed()
         data,note=(self.widget.data,self.widget.note) if self.drag_context else self.content()
-        if not self.drag_context and time.monotonic() >= self.next_theme:
-            mode = self.settings.value('ui/theme', self.settings.value('overlay/theme', 'codex'))
-            if mode == 'codex':
-                self.appearance = self.appearance_reader.read(system_dark())
-            else:
-                self.appearance = default_appearance(system_dark() if mode == 'system' else mode == 'dark')
-            self.dark = self.appearance.dark
-            from .theme import shared_theme
-            shared_theme().configure(mode,appearance=self.appearance)
-            self.reduced_motion=bool(hasattr(self.native,'reduce_motion') and self.native.reduce_motion())
-            self.next_theme = time.monotonic()+1
-        if not self.drag_context:self.widget.set_content(data, note, appearance=self.appearance)
+        self._refresh_appearance()
+        if not self.drag_context:
+            self.widget.set_content(data, note, appearance=self.appearance)
+            self._content_time_state=self._content_time()
         from .overlay_tracking import anchored_monitor_geometry, extend_monitor_left
         content=self.widget.content_model
         scale=self.appearance.scale
@@ -786,7 +906,7 @@ class OverlayController(QObject):
         if self.collapsed or content.is_remote or monitor is None:
             mode='icon'
             geometry=monitor_box(32*scale,32*scale)
-        elif self.expanded and not content.notice_card():
+        elif self.expanded and content.has_subagents():
             side=extend_monitor_left(frame,dpi,monitor,240*scale)
             inline=side is None
             geometry=side or monitor
@@ -825,7 +945,7 @@ class OverlayController(QObject):
             if not self._place(int(self.icon.winId()),icon_geometry):self.icon.hide()
         else:
             self.icon.hide()
-            self.actions.view.put(expanded=self.expanded and not content.notice_card(),canExpand=not content.notice_card(),popupOpen=self.popup_open)
+            self.actions.view.put(expanded=self.expanded and content.has_subagents(),canExpand=content.has_subagents(),popupOpen=self.popup_open)
             self.shadow.apply_appearance(self.appearance,self.opacity)
             self.shadow.set_panel_size(self.widget.panel_width()/scale,geometry[3]/(dpi/96*scale))
             shadow_geometry=self.shadow.physical_geometry(geometry,dpi/96)
@@ -900,6 +1020,7 @@ def install_overlay(window, native_enabled=True):
     if getattr(window,'worker',None) and hasattr(window.worker,'request_overlay_detail'):
         controller.overlay_loader=window.worker.request_overlay_detail
         window.worker.overlay_detail.connect(controller.receive_overlay_detail)
+        if hasattr(window.worker,'fault'):window.worker.fault.connect(controller.receive_overlay_fault)
     if hasattr(window,'navigate'):controller.navigation_requested.connect(window.navigate)
     if hasattr(window,'refresh_overlay_availability'):controller.changed.connect(window.refresh_overlay_availability)
     if getattr(window,'quota_service',None):

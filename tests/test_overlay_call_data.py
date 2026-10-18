@@ -31,9 +31,15 @@ def test_recent_calls_are_chronological_and_share_latest_call_context():
     assert result['cache_rate']==0 and latest['cache_miss']
     assert result['response_model'] is None
     assert latest['model']=='actual-request' and not latest['model_setting']
+    models={item['model']:item for item in result['model_breakdown']}
+    assert models['actual-request']['calls']==1 and models['actual-request']['cost'] is None
     assert latest['mode']=='Fast' and latest['transport_state']=='확정'
     rows.append(row(30))
     assert summarize_session(session(rows))['recent'][-2]['id']==latest['id']
+    rows[-1].update(analysis_model='conflicting-model',model_conflict=True)
+    conflicted=summarize_session(session(rows))
+    assert conflicted['latest']['model']=='미확인'
+    assert next(item for item in conflicted['model_breakdown'] if item['model']=='미확인')['calls']==1
 
 
 def test_coverage_diagnostics_update_without_repricing_or_reusing_stale_scope():
@@ -71,7 +77,8 @@ def test_prepared_overlay_detail_revision_tracks_descendants_and_removed_members
     from types import SimpleNamespace
     from cachemonitor.prepared_ingest import prepare_owner
     from cachemonitor.prepared_health import split_summary
-    from cachemonitor.prepared_overlays import PreparedOverlays
+    from cachemonitor.prepared_overlays import PreparedOverlays, hydrate_overlay
+    from cachemonitor.prepared_store import Limits
     from cachemonitor.prepared_summary import summary_for_storage
 
     sources={name:session([row(i,key=name)],id=name,**metadata) for i,(name,metadata) in enumerate((
@@ -84,10 +91,13 @@ def test_prepared_overlay_detail_revision_tracks_descendants_and_removed_members
         packets[key]=summary_for_storage(split_summary(material['summary'])[0])
     for name in sources:replace_owner(name)
     view=SimpleNamespace(publication_token=SimpleNamespace(instance='test',generation=1),
-                         derived=lambda home,sid,kind:packets[(home,sid)])
+        limits=Limits(), owner=lambda home,sid:owners.get((home,sid)),
+        derived=lambda home,sid,kind:packets[(home,sid)])
     overlays=PreparedOverlays()
     def collect(changed,removed=()):
-        return {item['id']:item for item in overlays.collect(view,owners,changed,removed,{})}
+        compact=overlays.collect(view,owners,changed,removed,{})
+        assert all('model_breakdown' not in item and 'subagent_finance' not in item for item in compact)
+        return {item['id']:hydrate_overlay(view,dict(item,_recent_refs=False),finance=True) for item in compact}
     first=collect(None)
     view.publication_token.generation=2
     sources['other']['history'][0]['output']+=1;replace_owner('other')
@@ -102,9 +112,12 @@ def test_prepared_overlay_detail_revision_tracks_descendants_and_removed_members
     assert [item['key'] for item in third['parent']['recent']]==[item['key'] for item in second['parent']['recent']]
     assert third['parent']['_overlay_revision']!=second['parent']['_overlay_revision']
     assert third['child']['_overlay_revision']!=second['child']['_overlay_revision']
+    assert third['parent']['subagent_finance']['models']!=second['parent']['subagent_finance']['models']
+    assert third['parent']['own_cost']==second['parent']['own_cost']
     view.publication_token.generation=4
     owners.pop(('home','child'))
     fourth=collect(set(),{('home','child')})
     assert fourth['parent']['calls']==1 and 'child' not in fourth
+    assert 'subagent_finance' not in fourth['parent']
     assert fourth['parent']['_overlay_revision']!=third['parent']['_overlay_revision']
     assert set(overlays.detail_revisions)==set(owners)

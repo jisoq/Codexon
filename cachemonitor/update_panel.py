@@ -1,5 +1,5 @@
 """One compact settings row backed by a durable update operation."""
-from PySide6.QtCore import QThread, QTimer, Signal
+from PySide6.QtCore import QFileSystemWatcher, QThread, QTimer, Signal
 from .i18n import formatted, tr
 from .presentation import Button, Column, Group, Text, Row
 from .installation import open_recovery
@@ -41,7 +41,7 @@ class UpdatePanel(Group):
         self.metadata_pending=False;self.checking=False;self.operation_error=False
         self.offer=None;self.discovered_offer=None;self.proxy_update={};self.record={}
         self.pending_plan=None;self.auto_start=False
-        self.next_recovery_check=0
+        self.next_recovery_check=0;self._stopped=False;self._journal_signature=None
         from .installation import installed
         from .update_state import state_for
         import sys
@@ -67,9 +67,14 @@ class UpdatePanel(Group):
         self.cancel=Button('취소');self.cancel.put(role='quiet');self.cancel.clicked.connect(lambda:self.cancel_update(False));secondary.addWidget(self.cancel);self.cancel.hide()
         self.later=Button('나중에 적용');self.later.put(role='quiet');self.later.clicked.connect(lambda:self.cancel_update(True));secondary.addWidget(self.later);self.later.hide()
         secondary.addStretch();controls.addLayout(secondary);row.addLayout(controls,1);layout.addLayout(row)
-        self.timer=QTimer(self);self.timer.setInterval(1000);self.timer.timeout.connect(self.refresh);self.timer.start()
+        self.journal_watcher=QFileSystemWatcher(self)
+        self.journal_watcher.fileChanged.connect(self.refresh)
+        self.journal_watcher.directoryChanged.connect(self.refresh)
+        self.timer=QTimer(self);self.timer.setInterval(30000);self.timer.timeout.connect(self.refresh)
+        self.recovery_timer=QTimer(self);self.recovery_timer.setSingleShot(True);self.recovery_timer.timeout.connect(self.recover)
+        if self.journal:self.timer.start()
         from .theme import shared_theme
-        shared_theme().changed.connect(self.refresh)
+        shared_theme().changed.connect(self.render_record)
         self.refresh()
 
     def status_color(self,attention=False):
@@ -98,7 +103,16 @@ class UpdatePanel(Group):
             self.checking=False;self.launch_operation(self.manager.status)
 
     def closing(self):
-        return bool(getattr(self.owner,'_closing',False))
+        return self._stopped or bool(getattr(self.owner,'_closing',False))
+
+    def stop(self):
+        self._stopped=True;self.timer.stop();self.recovery_timer.stop()
+        paths=self.journal_watcher.files()+self.journal_watcher.directories()
+        if paths:self.journal_watcher.removePaths(paths)
+
+    def setVisible(self,value):
+        super().setVisible(value)
+        if value:self.refresh()
 
     def start(self):
         if self.busy() or self.closing():return
@@ -167,7 +181,8 @@ class UpdatePanel(Group):
         if self.auto_start:
             self.auto_start=False
             if plan and plan['kind'] in ('app','proxy'):self.request_install();return
-        self.button.setEnabled(True);self.execute.setEnabled(True);self.refresh()
+        self.button.setEnabled(True);self.execute.setEnabled(True)
+        self.reload_record(force=True);self.render_record()
 
     def show_plan(self,plan,**_):
         self.offer=plan;self.operation_error=False;self.status.put(color='muted');self.render_offer()
@@ -203,8 +218,9 @@ class UpdatePanel(Group):
 
     def cancel_update(self,later):
         if not self.journal or not self.journal.cancel(later=later):return
-        phase=self.journal.read().get('phase')
+        self.reload_record(force=True);phase=self.record.get('phase')
         if phase in ('waiting','needs_exit') and self.manager:self.manager.cancel_update()
+        self.render_record()
         self.cancel.setEnabled(False);self.later.setEnabled(False)
         self.status.setText('나중에 적용하도록 마무리합니다.' if later else '업데이트 취소 중…')
 
@@ -218,16 +234,49 @@ class UpdatePanel(Group):
             if operation_id:self.journal.proxy_result(operation_id,self.proxy_update)
         self.refresh()
 
-    def refresh(self):
-        from .update_state import ACTIVE,CRITICAL
+    def reload_record(self,*,force=False):
+        if not self.journal or self.closing():return
+        path=self.journal.path
+        try:
+            state=path.stat()
+            signature=(str(path),state.st_size,state.st_mtime_ns,state.st_ctime_ns,state.st_ino)
+        except OSError:signature=(str(path),None)
+        changed=signature!=self._journal_signature
+        watcher=self.journal_watcher;file=str(path);directory=path.parent
+        if changed and file in watcher.files():watcher.removePath(file)
+        while not directory.is_dir() and directory!=directory.parent:directory=directory.parent
+        directory=str(directory)
+        if directory not in watcher.directories():watcher.addPath(directory)
+        if directory in watcher.directories():
+            obsolete=[entry for entry in watcher.directories() if entry!=directory]
+            if obsolete:watcher.removePaths(obsolete)
+        if signature[1] is not None and file not in watcher.files():watcher.addPath(file)
+        if force or changed:
+            self.record=self.journal.read()
+            self._journal_signature=signature if self.record or signature[1] is None else None
+
+    def refresh(self,*_):
         if self.closing():return
-        if self.journal:self.record=self.journal.read()
+        self.reload_record();self.render_record()
+
+    def recover(self):
+        if self.closing():return
         record=self.record;phase=record.get('phase');proxy=record.get('proxy',{})
         legacy_wait=phase in ('waiting','needs_exit') and proxy.get('source_instance') and not proxy.get('operation_id')
-        if self.journal and (phase in ('preparing','downloading','installing') or legacy_wait) and not self.operation and time.monotonic()>self.next_recovery_check:
-            self.next_recovery_check=time.monotonic()+30
-            from .app_update import reconcile_update
-            self.checking=False;self.launch_operation(lambda:reconcile_update(self.journal,self.manager))
+        self.recovery_timer.stop()
+        if not self.journal or self.operation or not (phase in ('preparing','downloading','installing') or legacy_wait):return
+        remaining=self.next_recovery_check-time.monotonic()
+        if remaining>0:
+            self.recovery_timer.start(max(1,int(remaining*1000)+1));return
+        self.next_recovery_check=time.monotonic()+30
+        from .app_update import reconcile_update
+        self.checking=False;self.launch_operation(lambda:reconcile_update(self.journal,self.manager))
+
+    def render_record(self):
+        from .update_state import ACTIVE,CRITICAL
+        if self.closing():return
+        self.recover()
+        record=self.record;phase=record.get('phase');proxy=record.get('proxy',{})
         if not record and self.proxy_update.get('phase') in ('queued','waiting','switching','stopping','starting','verifying','rollback','interrupted','failed'):
             proxy=self.proxy_update;phase=proxy.get('phase')
             if phase=='waiting' and proxy.get('required_action')=='close_client':phase='needs_exit'

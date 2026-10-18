@@ -132,13 +132,14 @@ def test_overlay_parent_refreshes_for_child_cost_without_recounting_responses(mo
 def test_overlay_rollups_keep_weighted_populations_and_bounded_recent_context():
     from types import SimpleNamespace
     from cachemonitor.analytics import output_speed_summary
-    from cachemonitor.overlay_data import token_composition,cost_composition
+    from cachemonitor.overlay_data import token_composition,cost_composition,summarize_models
     from test_overlay_call_data import row,session
     parent=session([row(i,home='home',sid='parent',cost=.1,cost_uncached=.01,cost_cached=.02,
         cost_written=.01,cost_unclassified=.01,cost_output=.05,cost_reasoning=.02,cost_non_reasoning=.03,
         response_status='completed',completion_latency_ms=100.+i,purpose='maintenance' if i%2 else 'work')
         for i in range(20)],id='parent',unclassified={'total':12345})
-    child=session([row(30,home='home',sid='child',input=None,cached=None,written=None,cost=None),
+    child=session([row(30,home='home',sid='child',input=None,cached=None,written=None,cost=None,
+                       analysis_model='gpt-6-sol'),
                    row(31,home='home',sid='child',input=10,cached=5,written=20,input_conflict=True,
                        output_conflict=True,cost=.2,cost_uncached=None,cost_cached=.01,cost_written=.02,
                        cost_unclassified=.03,cost_output=.14,cost_reasoning=.04,cost_non_reasoning=.10,
@@ -155,6 +156,19 @@ def test_overlay_rollups_keep_weighted_populations_and_bounded_recent_context():
     assert result['token_composition']==token_composition({'history':rows})
     assert result['token_composition']['cache_hit_rate']==pytest.approx(100*(20*900+5)/(20*1000+10))
     assert result['unattached_total']==12345 and result['coverage_gap']
+    assert not result['own_coverage_gap']
+    assert result['own_model_breakdown']==summarize_models(parent['history'])
+    models={value['model']:value for value in result['model_breakdown']}
+    assert set(models)=={'gpt-6-astra','gpt-6-sol'}
+    assert models['gpt-6-sol']['cost'] is None and models['gpt-6-sol']['priced']==0
+    assert sum(value['calls'] for value in models.values())==result['calls']
+    assert sum(value['priced'] for value in models.values())==result['priced']
+    assert sum(value['cost'] or 0 for value in models.values())==pytest.approx(result['cost'])
+    for key,count in result['token_composition']['counts'].items():
+        assert sum(value['token_composition']['counts'][key] for value in models.values())==count
+    for value in models.values():
+        expected_rows=[item for item in rows if (item.get('analysis_model') or item['model'])==value['model']]
+        assert value['token_composition']==token_composition({'history':expected_rows})
     expected=output_speed_summary(rows)
     assert result['output_speed_summary']==pytest.approx(expected)
     expected=cost_composition(rows)
@@ -168,6 +182,52 @@ def test_overlay_rollups_keep_weighted_populations_and_bounded_recent_context():
     assert result['maintenance_cost']==pytest.approx(1.2)
     assert len(result['recent'])==12 and result['recent'][-1]['sid']=='child'
     assert result['recent'][-1]['source_title']==child['title']
+
+
+def test_subagent_finance_counts_nested_owners_once_and_tracks_reparenting():
+    from types import SimpleNamespace
+    from cachemonitor.overlay_data import token_composition,summarize_models
+    from test_overlay_call_data import row,session
+    sources=[session([row(0,cost=10)],id='parent'),
+             session([row(1,cost=2,model='gpt-6.1-sol',requested_model='gpt-6.1-sol',response_model='gpt-6.1-sol',
+                          response_status='completed',model_match='일치',effort='xhigh')],id='child',parent_thread_id='parent'),
+             session([row(2,cost=.5),row(3,cost=None,analysis_model='gpt-6-sol',input=None,cached=None)],
+                     id='grandchild',parent_thread_id='child',coverage_gaps=[{'start':1}]),
+             session([],id='empty',parent_thread_id='parent'),session([],id='other')]
+    states={}
+    for value in sources:
+        value.update(cache_misses={'events':[]},cache_health={'events':[]},collection_complete=True)
+        states[(value['home'],value['id'])]=dict(source=value,prepared=value,revision=1,content_revision=1)
+    summaries=OverlaySummaries();summaries.speed_health=SimpleNamespace(collect=lambda engine:{})
+    engine=SimpleNamespace(sessions=states)
+    first={value['id']:value for value in summaries.collect(engine)}
+    finance=first['parent']['subagent_finance']
+    assert (finance['cost'],finance['calls'],finance['priced'],finance['missing'])==(2.5,3,2,1)
+    assert finance['coverage_gap'] and first['parent']['own_cost']==10
+    agents={value['id']:value for value in finance['agents']}
+    assert set(agents)=={'child','grandchild','empty'}
+    assert agents['child']['cost']==2 and agents['grandchild']['cost']==.5
+    assert agents['empty']['cost']==0 and agents['empty']['calls']==0
+    assert (agents['child']['model'],agents['child']['effort'],agents['child']['model_state'])==('gpt-6.1-sol','xhigh','일치')
+    assert agents['grandchild']['model']=='gpt-6-sol' and agents['grandchild']['model_state']=='미확인'
+    descendants=sources[1]['history']+sources[2]['history']
+    assert finance['models']==summarize_models(descendants)
+    unknown=next(value for value in finance['models'] if value['model']=='gpt-6-sol')
+    assert unknown['cost'] is None and unknown['priced']==0
+    assert agents['grandchild']['token_composition']==token_composition(sources[2])
+    own=summaries.cache[('home','grandchild')][1]
+    assert agents['grandchild']['model_breakdown'] is own['model_breakdown']
+    assert agents['grandchild']['token_composition'] is own['token_composition']
+    assert agents['grandchild']['cost_composition'] is own['cost_composition']
+    assert first['child']['subagent_finance']['cost']==.5
+    assert next(value for value in summaries.collect(engine) if value['id']=='parent')['subagent_finance'] is finance
+    sources[2]['parent_thread_id']='other'
+    second={value['id']:value for value in summaries.collect(engine)}
+    assert second['parent']['subagent_finance']['cost']==2
+    assert {value['id'] for value in second['parent']['subagent_finance']['agents']}=={'child','empty'}
+    assert 'subagent_finance' not in second['child']
+    assert second['other']['subagent_finance']['missing']==1
+    assert finance['cost']==2.5
 
 
 def test_real_session_table_shows_parent_without_own_calls_and_click_keeps_breakdown(tmp_path):

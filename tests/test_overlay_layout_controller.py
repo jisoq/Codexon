@@ -6,10 +6,11 @@ from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QApplication
 
 from cachemonitor.analysis_engine import AnalysisEngine
+from cachemonitor.core import Session
 from cachemonitor.overlay import OverlayController
 from cachemonitor.overlay_data import OverlaySummaries
 from cachemonitor.overlay_tracking import Selection
-from test_overlay import A, source
+from test_overlay import A, B, source
 
 
 class Native:
@@ -65,6 +66,136 @@ def layout_controller(tmp_path,monkeypatch):
     controller.stop();app.processEvents()
 
 
+def publish_subagents(controller, *, nested=False):
+    parent=source();sessions=[parent]
+    for sid,parent_id in ((B,A),('grandchild',B)) if nested else ((B,A),):
+        child=Session(sid,'home',title='하위 작업')
+        child.add_usage(103,'sub-'+sid,dict(input_tokens=100,cached_input_tokens=20,
+            cache_write_input_tokens=0,output_tokens=10),'gpt-6-astra','turn','high','default')
+        value=child.view(105)
+        value.update(source='subagent',parent_thread_id=parent_id,archived=False)
+        sessions.append(value)
+    engine=AnalysisEngine();engine.ingest(sessions)
+    controller.receive_snapshot({'overlay_sessions':OverlaySummaries().collect(engine)})
+    return parent
+
+
+def test_subagent_detail_tracks_family_and_preserves_expansion_preference(layout_controller):
+    from cachemonitor.overlay_chrome import named_item
+    c=layout_controller;m=c.widget.content_model
+    c.expanded=True;c.settings.setValue('overlay/expanded',True);c.refresh()
+    button=named_item(c.actions.quick.rootObject(),'expand')
+    assert not button.isVisible() and not c.actions.view.state['canExpand']
+    assert c.automatic_mode=='monitor' and not c.detail.isVisible()
+    c.toggle_expanded()
+    assert c.expanded and c.settings.value('overlay/expanded',False,type=bool)
+    parent=publish_subagents(c,nested=True)
+    assert m.data['descendants']==2 and c.automatic_mode=='detail'
+    assert button.isVisible() and c.detail.isVisible()
+    c.capture_detail()
+    engine=AnalysisEngine();engine.ingest([parent])
+    c.receive_snapshot({'overlay_sessions':OverlaySummaries().collect(engine)})
+    c.activate_detail()
+    assert c.expanded and c.settings.value('overlay/expanded',False,type=bool)
+    assert not button.isVisible() and not c.actions.view.state['expanded']
+    assert c.automatic_mode=='monitor' and not c.detail.isVisible()
+    publish_subagents(c)
+    assert c.automatic_mode=='detail' and c.detail.isVisible()
+    c.receive_target({'target':{'hwnd':1},'selection':Selection(B)})
+    assert c.expanded and not c.actions.view.state['canExpand'] and not c.detail.isVisible()
+    c.receive_target({'target':{'hwnd':1},'selection':Selection(A)})
+    assert c.automatic_mode=='detail' and c.detail.isVisible()
+
+
+def test_equal_heartbeats_keep_watchdog_and_restore_hidden_overlay(layout_controller,monkeypatch):
+    c=layout_controller;now=[100.]
+    monkeypatch.setattr('cachemonitor.overlay.time.monotonic',lambda:now[0])
+    c.observed_at=c.snapshot_at=now[0];c.next_theme=0;c.refresh()
+    state=dict(c.target_state)
+    with monkeypatch.context() as stable:
+        def unexpected():pytest.fail('Stable heartbeat refreshed overlay content')
+        stable.setattr(c,'content',unexpected)
+        for elapsed in (1.,2.,3.):
+            now[0]=100.+elapsed
+            c.receive_target(dict(state));c._tick()
+            assert c.widget.isVisible()
+        hwnd=int(c.widget.winId());c.native.placed[hwnd]=(0,0,1,1)
+        c._tick()
+        assert c.native.placed[hwnd]==c.current_geometry
+    now[0]+=3.01;c._tick()
+    assert not c.widget.isVisible() and not c.icon.isVisible()
+    c.receive_target(dict(state))
+    assert c.widget.isVisible()
+    c.native.visible=False;c._tick()
+    assert not c.widget.isVisible()
+    c.native.visible=True;c.receive_target(dict(state))
+    assert c.widget.isVisible()
+
+
+def test_compact_detail_loading_preserves_visible_summary_and_reuses_rows(layout_controller):
+    from copy import deepcopy
+    from cachemonitor.overlay_view import money
+    c=layout_controller;app=QApplication.instance();m=c.widget.content_model
+    publish_subagents(c)
+    complete=deepcopy(next(value for value in c.sessions if value['id']==A))
+    complete.update(_prepared_token=('detail-test',1),_overlay_revision=('detail-test',1),_recent_refs=False)
+    recent={key:value for key,value in complete.items() if key!='subagent_finance'}
+    compact=dict(recent,_recent_refs=True,recent=[{'key':row['id']} for row in recent['recent']],
+                 latest={'key':recent['latest']['id']})
+    c._overlay_detail=recent;c.expanded=False
+    requests=[];c.overlay_loader=lambda request,data,**options:requests.append((request,data,options))
+    c.receive_snapshot({'overlay_sessions':[compact]})
+    c.native.bounds=(0,0,1300,m.monitor_height(True)+32)
+    c.refresh();app.processEvents()
+    assert m.compact and not requests
+    before=(m.data['cost'],deepcopy(m.rows()))
+    c.toggle_expanded();app.processEvents()
+    assert c.detail.isVisible() and c.widget.isVisible() and m.compact
+    assert (m.data['cost'],m.rows())==before
+    assert m.state['detailSubCost']==money(complete['child_cost'])
+    assert not requests[-1][1]['_recent_refs'] and requests[-1][2]['finance']
+    assert m.detail_items()
+    c.receive_overlay_detail(dict(id=requests[-1][0],summary=complete,prepared_token=complete['_prepared_token']))
+    app.processEvents()
+    assert m.detail_data()==complete['subagent_finance'] and (m.data['cost'],m.rows())==before
+    c.toggle_expanded();c.toggle_expanded();app.processEvents()
+    assert c.detail.isVisible() and len(requests)==1
+
+
+def test_maintenance_updates_snapshot_delay_and_displayed_age(layout_controller,monkeypatch):
+    c=layout_controller;now=[100.];m=c.widget.content_model
+    monkeypatch.setattr('cachemonitor.overlay.time.monotonic',lambda:now[0])
+    c.observed_at=c.snapshot_at=now[0];c.refresh()
+    now[0]=115.;c.receive_target(dict(c.target_state));c._tick()
+    assert not m.note
+    now[0]=115.01;c.receive_target(dict(c.target_state));c._tick()
+    assert m.note=='수집 지연' and m.data['_collection']['reason']=='analysis_delay'
+    previous=m.freshness_text()
+    now[0]=116.01;c.receive_target(dict(c.target_state));c._tick()
+    assert m.freshness_text()!=previous
+    assert m.data['_collection']['received_age']==pytest.approx(16.01)
+    c.receive_snapshot({'overlay_sessions':c.sessions})
+    assert not m.note
+
+
+def test_maintenance_recovers_frame_dpi_and_changed_appearance(layout_controller,monkeypatch):
+    from dataclasses import replace
+    c=layout_controller
+    c.native.bounds=(40,30,1940,2130)
+    monkeypatch.setattr(c.native.u,'GetDpiForWindow',lambda hwnd:144)
+    c.receive_target(dict(c.target_state))
+    assert c._placement_context==(c.native.bounds,144)
+    assert c.native.placed[int(c.widget.winId())]==c.current_geometry
+    assert c.current_geometry[0]>=c.native.bounds[0]
+    assert c.current_geometry[0]+c.current_geometry[2]<=c.native.bounds[2]
+    width=c.current_geometry[2]
+    appearance=replace(c.appearance,font_size=21)
+    c.appearance_reader.read=lambda dark:appearance;c.next_theme=0
+    c._tick()
+    assert c.widget.content_model.appearance==appearance
+    assert c.current_geometry[2]>width
+
+
 @pytest.mark.parametrize('compact',[False,True])
 def test_pending_overlay_refresh_keeps_confirmed_panel_until_replacement(layout_controller,monkeypatch,compact):
     from copy import deepcopy
@@ -103,7 +234,7 @@ def test_pending_overlay_refresh_keeps_confirmed_panel_until_replacement(layout_
     # A stalled detail refresh must disclose the age of the retained values.
     with monkeypatch.context() as clock:
         clock.setattr('cachemonitor.overlay.time.time',lambda:stamp+20)
-        c.refresh()
+        c._tick()
         assert m.data['cost']==confirmed['cost'] and m.note=='수집 지연'
         assert m.data['_collection']['last_confirmed_at']==stamp and m.freshness_text()
     changed['_prepared_token']=('fixture',3);publish(changed,stamp+2)
@@ -121,6 +252,7 @@ def test_pending_overlay_refresh_keeps_confirmed_panel_until_replacement(layout_
 
 def test_popup_outside_click_escape_order_and_persisted_opacity(layout_controller):
     controller=layout_controller
+    publish_subagents(controller)
     assert controller.opacity==94 and not controller.toolbar.isVisible()
     controller.toggle_expanded();controller.toggle_opacity()
     assert controller.popup_open and controller.toolbar.isVisible()
@@ -164,6 +296,7 @@ def test_session_collapse_isolated_and_persistent(layout_controller):
 
 def test_remote_session_uses_icon_and_restores_local_detail(layout_controller):
     c=layout_controller;m=c.widget.content_model
+    publish_subagents(c)
     c.toggle_expanded();local_height=m.base_height()
     c.receive_target({'target':{'hwnd':1},'selection':Selection(A,host='remote:test')})
     assert m.is_remote and m.data is None and not m.rows()
@@ -196,10 +329,22 @@ def test_session_collapse_reloads_from_fresh_controller(layout_controller):
 @pytest.mark.parametrize('source', ['known','missing','remote'])
 def test_drag_moves_without_content_refresh(layout_controller,monkeypatch,mode,source):
     c=layout_controller
+    if mode=='detail' and source=='known':publish_subagents(c)
     if source=='missing':c.receive_snapshot({'overlay_sessions':[]})
     if source=='remote':c.receive_target({'target':{'hwnd':1},'selection':Selection(A,host='remote')})
     c.expanded=mode=='detail';c.collapsed=mode=='icon';c.refresh()
     def unexpected(*args,**kwargs):pytest.fail('Pure drag refreshed content')
+    monkeypatch.setattr(c.widget,'set_content',unexpected)
+    c.begin_drag((500,500));before=c.current_geometry
+    c.move_drag((480,480))
+    assert c.current_geometry[:2]==(before[0]-20,before[1]-20)
+    c.cancel_drag()
+
+
+def test_no_child_expansion_preference_keeps_compact_drag_lightweight(layout_controller,monkeypatch):
+    c=layout_controller;c.expanded=True;c.native.bounds=(0,0,550,1000);c.refresh()
+    assert c.automatic_mode=='monitor' and not c.detail.isVisible()
+    def unexpected(*args,**kwargs):pytest.fail('Hidden detail preference refreshed content while dragging')
     monkeypatch.setattr(c.widget,'set_content',unexpected)
     c.begin_drag((500,500));before=c.current_geometry
     c.move_drag((480,480))
@@ -268,7 +413,7 @@ def test_drag_layout_change_keeps_deferred_content(layout_controller,monkeypatch
 @pytest.mark.parametrize('font_size',[14,21])
 def test_fallback_boundaries_preserve_anchor(layout_controller,monkeypatch,dpi,font_size):
     from dataclasses import replace
-    c=layout_controller;c.appearance=replace(c.appearance,font_size=font_size)
+    c=layout_controller;publish_subagents(c);c.appearance=replace(c.appearance,font_size=font_size)
     monkeypatch.setattr(c.native.u,'GetDpiForWindow',lambda hwnd:dpi)
     c.native.bounds=(0,0,2400,2400);c.refresh()
     m=c.widget.content_model;factor=dpi/96;gap=round(16*factor)

@@ -82,11 +82,11 @@ def test_source_notifications_wake_only_for_rollouts_and_rearm(tmp_path):
         owned.write_bytes(b'own publication')
         assert not changes.wait(time.monotonic()+.05)
         rollout=source/'rollout.jsonl';rollout.write_text('{}\n',encoding='utf8')
-        assert changes.wait(time.monotonic()+1)
+        assert changes.wait(time.monotonic()+1).roots==frozenset({source.resolve()})
         with rollout.open('a',encoding='utf8') as output:output.write('{"done":true}\n')
-        assert changes.wait(time.monotonic()+1)
+        assert changes.wait(time.monotonic()+1).roots==frozenset({source.resolve()})
         rollout.rename(archive/'rollout.jsonl')
-        assert changes.wait(time.monotonic()+1)
+        assert changes.wait(time.monotonic()+1).roots==frozenset({source.resolve(),archive.resolve()})
     finally:changes.close()
     assert not changes.handles
     # A custom app-owned database inside a source tree disables that root;
@@ -95,6 +95,18 @@ def test_source_notifications_wake_only_for_rollouts_and_rearm(tmp_path):
     try:
         changes.sync([home]);assert set(changes.handles)=={archive.resolve()}
     finally:changes.close()
+
+
+def test_source_notification_loss_requests_authoritative_reconciliation(tmp_path):
+    from types import SimpleNamespace
+    from cachemonitor.collection_wake import SourceChanges
+    closed=[];changes=SourceChanges()
+    changes.api=SimpleNamespace(WaitForMultipleObjects=lambda *args:0xffffffff,
+                                FindCloseChangeNotification=closed.append)
+    changes.handles[tmp_path]=(1,(0,0))
+    hint=changes.wait(time.monotonic())
+    assert hint.uncertain and not hint.roots
+    assert closed==[1] and not changes.handles and changes.next_sync==0
 
 
 def test_conflicting_default_cli_path_fails_before_creating_files(default_home,tmp_path):

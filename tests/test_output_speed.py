@@ -98,14 +98,14 @@ def test_rendered_summary_click_and_overlay_speed_navigation(tmp_path):
         assert overlay.quick.grabFramebuffer().save(str(tmp_path/'overlay.png'))
         m.monitor_action('tab-latest')
         links.setGeometry(overlay.geometry());links.sync();links.show();QTest.qWait(30)
-        # Detail entry lives in the header; the detail panel owns dashboard navigation.
-        from cachemonitor.overlay_chrome import DetailModel
-        detail=DetailModel(m);targets=[];detail.navigationRequested.connect(targets.append)
-        detail.captureNavigation('selected');detail.activateNavigation()
-        detail.content.changed.disconnect(detail.sync)
+        # Main-session navigation remains available without any child detail panel.
+        targets=[];links.view.navigationRequested.connect(targets.append)
+        links.view.captureNavigation('session');links.view.activateNavigation()
         assert named_item(links.quick.rootObject(),'nav-call-detail') is None
-        assert targets[-1].call_id==data['latest']['id'] and targets[-1].section=='identity'
+        assert targets[-1].call_id is None and targets[-1].sid==data['id']
         window.navigate(targets[-1])
+        from cachemonitor.overlay_navigation import navigation_target
+        window.navigate(navigation_target(data,'call',call=data['latest']))
         for _ in range(40):
             QTest.qWait(25)
             if window.detail_scroll.verticalPosition.value()>0:break

@@ -80,6 +80,105 @@ def finish(index, now=10010):
     raise AssertionError('index did not finish')
 
 
+def test_verified_source_avoids_idle_metadata_reads_without_hiding_changes(tmp_path):
+    import os
+    home,path=fixture_home(tmp_path);cache=tmp_path/'index.sqlite'
+    index=UsageIndex([home],cache);queries=[]
+    def trace(sql):
+        if sql.lower().startswith('select tid,offset,size,mtime,inode from files '):queries.append(sql)
+    try:
+        finish(index)
+        index.db.set_trace_callback(trace)
+        finish(index,10011)
+        assert not queries
+        with path.open('a',encoding='utf8') as stream:stream.write(json.dumps(usage('after',time=10011))+'\n')
+        result=finish(index,10012)
+        assert queries and [row['key'] for row in result['sessions'][0]['history']]==['r1','after']
+        queries.clear();finish(index,10013)
+        assert not queries
+        before=path.stat()
+        path.write_bytes(path.read_bytes().replace(b'"r1"',b'"r9"'))
+        os.utime(path,ns=(before.st_atime_ns,before.st_mtime_ns+1_000_000))
+        result=finish(index,10014)
+        assert queries and [row['key'] for row in result['sessions'][0]['history']]==['r9','after']
+    finally:index.close()
+    index=UsageIndex([home],cache);queries.clear()
+    try:
+        index.db.set_trace_callback(trace)
+        result=finish(index,10015)
+        assert queries and [row['key'] for row in result['sessions'][0]['history']]==['r9','after']
+    finally:index.close()
+
+
+def test_source_hint_prioritizes_already_scanned_file_and_keeps_unnotified_backlog(tmp_path,monkeypatch):
+    from collections import deque
+    import cachemonitor.index as implementation
+    from cachemonitor.collection_wake import SourceHint
+    sources=[]
+    for name in ('first','second'):
+        folder=tmp_path/name;folder.mkdir()
+        home,path=fixture_home(folder)
+        root=home/'sessions';root.mkdir();target=root/'rollout.jsonl';path.rename(target)
+        with sqlite3.connect(home/'state_5.sqlite') as db:
+            db.execute('UPDATE threads SET rollout_path=?',(str(target),))
+        sources.append((str(target),home,TID))
+    index=UsageIndex([args[1] for args in sources],tmp_path/'index.sqlite')
+    try:
+        finish(index)
+        for args,key in zip(sources,('hinted','missed')):
+            with Path(args[0]).open('a',encoding='utf8') as stream:stream.write(json.dumps(usage(key,time=10011))+'\n')
+        index.queue=deque([sources[1]])
+        clock=[0.];visited=[];scan=index.scan_file
+        monkeypatch.setattr(implementation.time,'monotonic',lambda:clock[0])
+        def bounded_scan(*args):
+            result=scan(*args);visited.append(args[0]);clock[0]+=.41;return result
+        monkeypatch.setattr(index,'scan_file',bounded_scan)
+        index.poll(10011,source_hint=SourceHint(frozenset({Path(sources[0][0]).parent})))
+        assert visited==[sources[0][0]]
+        index.poll(10012)
+        assert visited==[args[0] for args in sources]
+        result=finish(index,10012)
+        histories={session['home']:[row['key'] for row in session['history']] for session in result['sessions']}
+        assert histories=={str(args[1]):['r1',key] for args,key in zip(sources,('hinted','missed'))}
+    finally:index.close()
+
+
+def test_repeated_source_hints_finish_full_pass_and_allow_due_discovery(tmp_path,monkeypatch):
+    from collections import deque
+    import cachemonitor.index as implementation
+    from cachemonitor.collection_wake import SourceHint
+    home,path=fixture_home(tmp_path);root=home/'sessions';root.mkdir()
+    for n in range(2):
+        tid=f'root-session-{n}'
+        (root/f'{n}.jsonl').write_text(json.dumps(event('session_meta',10000,id=tid))+'\n'+
+            json.dumps(usage(f'root-{n}',tid=tid))+'\n',encoding='utf8')
+    index=UsageIndex([home],tmp_path/'index.sqlite')
+    try:
+        finish(index)
+        expected={args[0] for args in index.files}
+        index.queue=deque(index.files)
+        clock=[0.];visited=[];discoveries=[];scan=index.scan_file;discover=index.discover
+        monkeypatch.setattr(implementation.time,'monotonic',lambda:clock[0])
+        def bounded_scan(*args):
+            result=scan(*args);visited.append(args[0]);clock[0]+=.41;return result
+        def discovery(now):discoveries.append(now);return discover(now)
+        monkeypatch.setattr(index,'scan_file',bounded_scan)
+        monkeypatch.setattr(index,'discover',discovery)
+        hint=SourceHint(frozenset({root}))
+        for n in range(len(expected)):
+            result=index.poll(10011+n,source_hint=hint)
+        assert len(visited)==len(expected) and set(visited)==expected
+        assert not result['index']['loading']
+        fresh=root/'new.jsonl';tid='new-root-session'
+        fresh.write_text(json.dumps(event('session_meta',10020,id=tid))+'\n'+
+            json.dumps(usage('discovered',time=10020,tid=tid))+'\n',encoding='utf8')
+        index.poll(10021,source_hint=hint)
+        assert discoveries==[10021]
+        result=finish(index,10021)
+        assert 'discovered' in {row['key'] for session in result['sessions'] for row in session['history']}
+    finally:index.close()
+
+
 def test_discovery_refreshes_grouped_paths_after_directory_link_changes(tmp_path,monkeypatch):
     import os
     import cachemonitor.index as module

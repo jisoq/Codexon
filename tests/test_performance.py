@@ -199,6 +199,43 @@ def test_large_table_formats_only_visible_cells_and_preserves_scroll():
     dispose(host)
 
 
+def test_idle_analysis_bridge_wakes_for_replacement_and_interruption(monkeypatch):
+    from threading import Event
+    from PySide6.QtCore import Qt
+    from cachemonitor import analysis_worker
+    source=history()
+    snapshot=dict(ts=110,sessions=[source],homes=[],errors=[],unassigned=[],index={'loading':False})
+    bridge=analysis_worker.AnalysisBridge([],static_snapshot=snapshot)
+    initial,replaced,waiting=Event(),Event(),Event()
+    errors=[];original_wait=analysis_worker.wait
+    def observe_wait(handles,*args,**kwargs):
+        waiting.set()
+        return original_wait(handles,*args,**kwargs)
+    def receive(value):
+        waiting.clear()
+        (replaced if value['sessions'][0]['title']=='replacement' else initial).set()
+    monkeypatch.setattr(analysis_worker,'wait',observe_wait)
+    bridge.snapshot.connect(receive,Qt.DirectConnection)
+    bridge.failure.connect(errors.append,Qt.DirectConnection)
+    bridge.start()
+    try:
+        assert initial.wait(20),errors
+        assert waiting.wait(5)
+        updated=copy.deepcopy(snapshot);updated['sessions'][0]['title']='replacement'
+        bridge.replace_snapshot(updated)
+        assert replaced.wait(20),errors
+        assert waiting.wait(5)
+        assert not errors
+    finally:
+        bridge.requestInterruption()
+        stopped=bridge.wait(6000)
+        if not stopped:
+            bridge.process.terminate()
+            bridge.wait(6000)
+        assert stopped
+        assert not bridge.process.is_alive()
+
+
 def test_process_queries_latest_selection_cache_and_clean_shutdown(tmp_path):
     from PySide6.QtCore import QSettings
     from PySide6.QtTest import QTest

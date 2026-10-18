@@ -141,7 +141,7 @@ def toggle_segments(m,kind):
     from PySide6.QtGui import QFontMetrics
     from .overlay_view import font
     from .i18n import tr,formatted
-    options=(('tokens','개수'),('usd','$')) if kind=='unit' else (('latest','현재'),('history','최근'))
+    options=(('usd','$'),('tokens','개수')) if kind=='unit' else (('history','최근'),('latest','현재'))
     metrics=QFontMetrics(font(m.appearance.family,11))
     widths=[max(28,metrics.horizontalAdvance(tr(label))+14) for _,label in options]
     x=RIGHT-sum(widths);segments=[]
@@ -155,7 +155,8 @@ def paint(d,m):
     if notice:
         g=m.layout()
         d.rect(MARGIN,SESSION_Y,SECTION_WIDTH,g['height']-SESSION_Y-16,'band',8)
-        d.text(notice[0],MARGIN+16,SESSION_Y+16,SECTION_WIDTH-32,20,12,weight=600)
+        inset=22 if m.checking_records else 0
+        d.text(notice[0],MARGIN+16+inset,SESSION_Y+16,SECTION_WIDTH-32-inset,20,12,weight=600)
         d.text(notice[1],MARGIN+16,g['body'],SECTION_WIDTH-32,g['body_height'],11,'secondary',wrap=True)
         return
     from .overlay_view import amount,money,percent
@@ -167,8 +168,10 @@ def paint(d,m):
         d.text(m.freshness_text(),BODY_LEFT,SESSION_Y,BODY_WIDTH-8,22,11,'secondary',elide=True)
     d.text('세션',MARGIN,g['session'],80,20,12,weight=600)
     count_x=MARGIN+QFontMetrics(d.p.font()).horizontalAdvance(tr('세션'))+8
-    child=f" (하위 {data['descendants']}개 포함)" if data.get('descendants') else ''
-    d.text(f"{data.get('calls',0):,}호출"+child,count_x,g['session'],toggle_segments(m,'unit')[0][0]-8-count_x,20,11,'secondary',elide=True)
+    from .i18n import formatted
+    count=(formatted('{calls}호출 (하위 {children}개 포함)',calls=f"{data.get('calls',0):,}",children=data['descendants'])
+           if data.get('descendants') else formatted('{calls}호출',calls=f"{data.get('calls',0):,}"))
+    d.text(count,count_x,g['session'],toggle_segments(m,'unit')[0][0]-8-count_x,20,11,'secondary',elide=True)
     values=(money(data.get('cost')),percent(c.get('cache_hit_rate')),speed(data.get('output_speed_summary',{}).get('value')))
     d.rect(MARGIN,g['cache'],SECTION_WIDTH,CARD_HEIGHT,'band',8)
     for x,label,value in zip(METRIC_COLUMNS,('비용','캐시 적중률','평균 출력 속도'),values):
@@ -204,6 +207,7 @@ def paint(d,m):
     d.p.save();d.p.setClipRect(BODY_LEFT,g['context'],BODY_WIDTH,g['body_end']-g['context'])
     d.p.translate(0,-m.lower_offset)
     if m.monitor_tab=='history':
+        from PySide6.QtGui import QColor,QPainterPath
         rows=m.rows();step=BODY_WIDTH/max(1,len(rows))
         agent_colors=m.graph_colors(rows)
         inspected=next((r for r in rows if m.call_id(r)==getattr(m,'inspected_call',None)),None)
@@ -212,6 +216,23 @@ def paint(d,m):
         for lane,(key,label,fmt) in enumerate((('cost','비용 ($)',money),('cache_rate','캐시 (%)',percent),('output_speed','출력 속도 (tok/s)',lambda n:'—' if n is None else f'{n:.1f}'),('reasoning','추론 (토큰)',amount))):
             y=g['recent']+lane*GRAPH_ROW;low,high=dynamic_bounds(graph_value(r,key) for r in rows)
             d.text(label,BODY_LEFT,y,BODY_WIDTH-144,16,10,'secondary');d.text((formatted('{number}번: ',number=inspected.get('ordinal','')) if inspected else '')+fmt(graph_value(displayed,key)),RIGHT-144,y,144,16,11,right=True)
+            fills=[];previous={};bottom=y+44
+            for i,row in enumerate(rows):
+                agent=(row.get('home'),row.get('sid'))
+                val=graph_value(row,key);x=BODY_LEFT+(i+.5)*step
+                if val is None:previous.pop(agent,None);continue
+                yy=y+20+24*(high-val)/(high-low)
+                condition=tuple(row.get(k) for k in ('model','effort','mode','transport'))
+                prior=previous.get(agent) if agent[1] else None
+                if prior and (key!='output_speed' or condition==prior[1]):path=prior[0]
+                else:
+                    path=QPainterPath();path.moveTo(x,bottom)
+                    fills.append((path,agent_colors[agent]))
+                path.lineTo(x,yy);previous[agent]=(path,condition)
+            for path,color in fills:
+                path.lineTo(path.currentPosition().x(),bottom);path.closeSubpath()
+                tint=QColor(d.colors.get(color,color));tint.setAlphaF(tint.alphaF()*.14)
+                d.p.fillPath(path,tint)
             previous={}
             for i,row in enumerate(rows):
                 agent=(row.get('home'),row.get('sid'))

@@ -127,7 +127,7 @@ def test_stale_population_closes_chart_hover_and_notification_floor_stays_curren
         overlay=[];bridge.overlay_detail.connect(overlay.append)
         summary={'_prepared_token':('prepared-test',2)}
         bridge.request_overlay_detail(8,summary,health=True)
-        assert bridge.commands[-1]==dict(kind='overlay_detail',id=8,summary=summary,health=True,
+        assert bridge.commands[-1]==dict(kind='overlay_detail',id=8,summary=summary,health=True,finance=False,
             prepared_token=('prepared-test',2))
         bridge._deliver_result(dict(kind='stale',consumer='overlay_detail',id=8,prepared_token=('prepared-test',3)))
         assert len(overlay)==1 and overlay[0]['kind']=='stale'

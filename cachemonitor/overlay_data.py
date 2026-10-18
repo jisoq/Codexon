@@ -2,7 +2,7 @@
 from copy import deepcopy
 from heapq import nlargest
 
-from .analytics import stats, observation_flags, output_speed, output_speed_summary
+from .analytics import stats, observation_flags, output_speed, output_speed_summary, finite
 from .pricing import request_tier, sum_cost
 from .core import token_number, transport_label, token_parts
 from .cache_misses import classify
@@ -10,6 +10,7 @@ from .cache_health import CacheHealth
 from .session_costs import session_costs
 from .speed_health import SpeedHealth
 from .analysis_records import public_record
+from .prepared_sums import _Sum
 
 
 TOKEN_LABELS = {'cached': '캐시 읽기', 'uncached': '일반 입력', 'written': '캐시 쓰기',
@@ -25,6 +26,11 @@ def observed_mode(row):
 
 def assumed_cost(row):
     return bool(row.get('price_assumed'))
+
+
+def canonical_model(row):
+    return ((row.get('analysis_model') or row.get('requested_model') or row.get('model') or '미확인')
+            if not row.get('model_conflict') else '미확인')
 
 
 def token_composition(session,*,_partials=None):
@@ -76,6 +82,7 @@ def _token_view(counts,known,inp_total,out_total,partial,input_known,output_know
         input_parts=input_parts,output_parts=output_parts,input_total=inp_total,output_total=out_total,
         cached=counts['cached'],cached_share=counts['cached']/inp_total if inp_total else 0,
         cache_hit_rate=100*cache_read/cache_input if cache_input else None,
+        cache_input=cache_input,cache_read=cache_read,
         cache_hit_partial=cache_valid<cache_target,cache_valid=cache_valid,cache_target=cache_target,
         written_known=written_known,
         unknown=unknown,non_cache_total=total-counts['cached'],bar_max=maximum,bars=bars,
@@ -111,7 +118,89 @@ def _cost_view(sections,priced,calls):
     return result
 
 
-def _merge_compositions(summaries,partials):
+def new_financial_totals():
+    """Persist only financial facts, including resumable headline summation."""
+    return dict(count=0, cost_sum=(0,0.0,0), priced=0, component_priced=0, assumed=0,
+        token=dict(counts=dict.fromkeys(TOKEN_LABELS,0), known=dict.fromkeys(TOKEN_ORDER,False),
+            inp_total=0, out_total=0, partial=False, input_known=False, output_known=False,
+            written_known=True, cache_input=0, cache_read=0, cache_valid=0),
+        costs={side:dict.fromkeys((key for key,_ in fields),0.) for side,fields in COST_PARTS})
+
+
+def add_financial_total(total,row):
+    total['count']+=1
+    cost=row.get('cost')
+    if finite(cost):
+        total['priced']+=1
+        accumulator=_Sum()
+        accumulator.total,accumulator.correction,accumulator.phase=total['cost_sum']
+        accumulator.add(cost)
+        total['cost_sum']=(accumulator.total,accumulator.correction,accumulator.phase)
+    if cost is not None:
+        total['component_priced']+=1
+        for side,fields in COST_PARTS:
+            counts=total['costs'][side]
+            if side=='output' and (row.get('output_conflict') or
+                    any(row.get(key) is None for key in ('cost_reasoning','cost_non_reasoning'))):
+                counts['output_unknown']+=row.get('cost_output') or 0
+            else:
+                for key,field in fields:counts[key]+=row.get(field) or 0
+    total['assumed']+=assumed_cost(row)
+    token=total['token'];parts=token_parts(row)
+    for side,mapping in (('input',{'ordinary':'uncached','read':'cached','write':'written','unclassified':'input_unknown'}),
+                         ('output',{'ordinary':'output','reasoning':'reasoning','unclassified':'output_unknown'})):
+        for key,destination in mapping.items():token['counts'][destination]+=parts[side][key]
+    inp,cached,written,out,reasoning=(token_number(row.get(key)) for key in
+                                    ('input','cached','written','output','reasoning'))
+    if inp is not None:token['inp_total']+=inp
+    if out is not None:token['out_total']+=out
+    token['input_known']|=inp is not None;token['output_known']|=out is not None
+    if inp is not None and cached is not None and cached<=inp:
+        token['cache_input']+=inp;token['cache_read']+=cached;token['cache_valid']+=1
+    token['partial']|=inp is None or out is None
+    token['written_known']&=written is not None
+    valid_input=(inp is not None and not row.get('input_conflict') and
+        (cached is None or cached<=inp) and (written is None or written<=inp) and
+        (cached is None or written is None or cached+written<=inp))
+    valid_output=out is not None and reasoning is not None and reasoning<=out and not row.get('output_conflict')
+    token['known']['cached']|=valid_input and cached is not None
+    token['known']['written']|=valid_input and written is not None
+    token['known']['uncached']|=valid_input and cached is not None and written is not None
+    token['known']['output']|=valid_output;token['known']['reasoning']|=valid_output
+
+
+def add_model_total(models,row):
+    model=canonical_model(row)
+    if model not in models:models[model]=new_financial_totals()
+    add_financial_total(models[model],row)
+
+
+def financial_cost(total):
+    accumulator=_Sum()
+    accumulator.total,accumulator.correction,accumulator.phase=total['cost_sum']
+    return accumulator.value()
+
+
+def model_breakdown(models):
+    result=[]
+    for model,total in models.items():
+        token=total['token'];calls=total['count']
+        composition=_token_view(deepcopy(token['counts']),deepcopy(token['known']),
+            token['inp_total'],token['out_total'],token['partial'],token['input_known'],token['output_known'],
+            token['cache_input'],token['cache_read'],token['cache_valid'],calls,token['written_known'] and bool(calls))
+        result.append(dict(model=model,cost=financial_cost(total) if total['priced'] else None,
+            calls=calls,priced=total['priced'],assumed=total['assumed'],token_composition=composition,
+            cost_composition=_cost_view(total['costs'],total['component_priced'],calls)))
+    return sorted(result,key=lambda value:(-(value['cost'] or 0),value['model']))
+
+
+def summarize_models(rows):
+    models={}
+    for row in rows:add_model_total(models,row)
+    return model_breakdown(models)
+
+
+def _merge_financial_compositions(summaries,partials):
     tokens=[summary['token_composition'] for summary in summaries]
     counts={key:sum(value['counts'][key] for value in tokens) for key in TOKEN_LABELS}
     known={key:any(value['category_known'][key] for value in tokens) for key in TOKEN_ORDER}
@@ -128,6 +217,49 @@ def _merge_compositions(summaries,partials):
         for section,counts in sections.items():
             for part in cost[section+'_parts']:counts[part['key']]+=part['tokens']
     cost=_cost_view(sections,sum(value['priced'] for value in costs),sum(value['calls'] for value in costs))
+    return dict(token_composition=composition,cost_composition=cost)
+
+
+def merge_model_breakdowns(summaries):
+    groups={}
+    for summary in summaries:
+        for model in summary['model_breakdown']:
+            groups.setdefault(model['model'],[]).append(model)
+    result=[]
+    for model,values in groups.items():
+        priced=sum(value['priced'] for value in values)
+        accumulator=_Sum()
+        for value in values:
+            if value['cost'] is not None:accumulator.add(value['cost'])
+        result.append(dict(model=model,cost=accumulator.value() if priced else None,
+            calls=sum(value['calls'] for value in values),priced=priced,
+            assumed=sum(value['assumed'] for value in values),
+            **_merge_financial_compositions(values,[value['token_composition'] for value in values])))
+    return sorted(result,key=lambda value:(-(value['cost'] or 0),value['model']))
+
+
+SUBAGENT_CALL_FIELDS=('model','effort','response_model','model_state','model_mismatch')
+
+
+def _subagent_finance(summaries,cost):
+    """Project descendant owners once, without retaining calls or health evidence."""
+    agents=[{key:summary[key] for key in (
+        'home','id','title','cost','calls','priced','missing','coverage_gap','assumed',
+        'model_breakdown','token_composition','cost_composition')} for summary in summaries]
+    for agent,summary in zip(agents,summaries):
+        agent.update({field:summary.get(field) for field in SUBAGENT_CALL_FIELDS})
+        if not agent['calls']:agent['cost']=0.
+    agents.sort(key=lambda value:(value['cost'] is None,-(value['cost'] or 0),value['home'],value['id']))
+    calls=sum(value['calls'] for value in agents)
+    priced=sum(value['priced'] for value in agents)
+    return dict(cost=cost,calls=calls,priced=priced,missing=calls-priced,
+        coverage_gap=any(value['coverage_gap'] for value in agents),
+        assumed=sum(value['assumed'] for value in agents),
+        models=merge_model_breakdowns(summaries),agents=agents)
+
+
+def _merge_compositions(summaries,partials):
+    financial=_merge_financial_compositions(summaries,partials)
     speeds=[summary['output_speed_summary'] for summary in summaries]
     output=sum(value['output'] for value in speeds);seconds=sum(value['seconds'] for value in speeds)
     count=sum(value['n'] for value in speeds);target=sum(value['N'] for value in speeds)
@@ -136,7 +268,7 @@ def _merge_compositions(summaries,partials):
     maintenance_missing=sum(value['maintenance_missing'] for value in partials)
     maintenance_cost=(sum(value['maintenance_cost'] for value in partials if value['maintenance_cost'] is not None)
                       if maintenance_calls>maintenance_missing else None)
-    return dict(token_composition=composition,cost_composition=cost,output_speed_summary=speed,
+    return dict(**financial,output_speed_summary=speed,
         maintenance_calls=maintenance_calls,maintenance_missing=maintenance_missing,maintenance_cost=maintenance_cost)
 
 
@@ -196,7 +328,7 @@ def call_summary(row, ordinal, *, miss=False, degradation=False):
     if row.get('cache_policy_conflict'):
         warnings.append('캐시 정책 관측 충돌')
     result.update(id=_call_id(row), ordinal=ordinal,output_speed=output_speed(row),
-        model=(row.get('analysis_model') or row.get('requested_model') or row.get('model') or '미확인') if not row.get('model_conflict') else '미확인',
+        model=canonical_model(row),
         configured_model=row.get('configured_model') or row.get('model'), model_setting=row.get('model_source')=='settings' or not bool(row.get('requested_model')) and bool(row.get('model')),
         response_model=row.get('response_model') or None,
         model_mismatch=model_mismatch,
@@ -269,7 +401,7 @@ def _summary_view(session,latest,recent,facts,*,request,misses,health,degradatio
                 'current':bool(latest_call.get('cache_degradation'))},
             'statuses':statuses,'session_evidence':evidence,
             'model_incident':{'count':facts['mismatch_count'],'key':facts['mismatch_key']},
-            'token_composition': tokens}
+            'token_composition': tokens,'model_breakdown':facts['model_breakdown']}
 
 
 def summarize_session(session,health=None,*,_partials=None,_facts=None):
@@ -339,6 +471,7 @@ def summarize_session(session,health=None,*,_partials=None,_facts=None):
                 priced=sum(r.get('cost') is not None for r in current),assumed=sum(assumed_cost(r) for r in current),
                 partial=any(r.get('cost') is None for r in current)),request_latest=current_latest,
             assumed=sum(assumed_cost(row) for row in rows),speed=output_speed_summary(rows),cost_composition=cost_composition(rows),
+            model_breakdown=summarize_models(rows),
             mismatch_count=len(mismatches),mismatch_key=mismatches[-1]['key'] if mismatches else None,
             observation_missing=sum(observation_flags(r)['missing'] for r in rows),
             observation_conflict=sum(observation_flags(r)['conflict'] for r in rows),degradation_count=len(degradation))
@@ -374,7 +507,7 @@ class OverlaySummaries:
             updated[key] = (revision, summary)
         return self.present(engine, updated, partials, speeds)
 
-    def present(self, engine, updated, partials, speeds):
+    def present(self, engine, updated, partials, speeds, *, include_finance=True):
         """Present prepared own summaries with the same ancestry and readiness rules."""
         self.cache = updated
         self.partials = partials
@@ -389,7 +522,7 @@ class OverlaySummaries:
             if not group['descendants']:
                 result.append(summary)
                 continue
-            signature=tuple((member,updated[member][0]) for member in group['members'])
+            signature=(include_finance,tuple((member,updated[member][0]) for member in group['members']))
             previous=self.rollups.get(key)
             if previous and previous[0]==signature:
                 value=previous[1]
@@ -398,12 +531,17 @@ class OverlaySummaries:
                 compositions=_merge_compositions(own_summaries,[partials[member] for member in group['members']])
                 value=dict(summary,cost=group['cost'],own_cost=group['own_cost'],
                     child_cost=group['child_cost'],descendants=group['descendants'],
+                    own_coverage_gap=summary['coverage_gap'],own_assumed=summary['assumed'],
                     own_calls=summary['calls'],own_priced=summary['priced'],
                     calls=group['calls'],priced=group['priced'],
                     missing=group['calls']-group['priced'],partial=group['partial'],
                     mean_cost=group['cost']/group['priced'] if group['priced'] else None,
                     coverage_gap=group['gap'],
                     assumed=sum(updated[member][1]['assumed'] for member in group['members']))
+                if include_finance:
+                    value.update(subagent_finance=_subagent_finance(own_summaries[1:],group['child_cost']),
+                        own_model_breakdown=summary['model_breakdown'],
+                        model_breakdown=merge_model_breakdowns(own_summaries))
                 recent=_recent_members(group['members'],updated)
                 value.update(recent=recent,latest=recent[-1] if recent else {},members=group['members'],
                              active_requests=sum(updated[m][1]['request'].get('state')=='진행' for m in group['members']),

@@ -41,7 +41,7 @@ GROUPS = {
     'graphics_recovery': test_files('graphics_recovery', 'window_recovery', 'quick_ui', 'overlay_shadow'),
     'data': test_files('core', 'index', 'data_contract', 'subagent_collection', 'request_tier_snapshots', 'collection_defaults', 'collection_crash_recovery', 'collection_transport'),
     'analysis': test_files('comparison', 'overview', 'performance', 'data_contract', 'output_speed'),
-    'prepared': test_files('prepared_analysis') + (
+    'prepared': test_files('prepared_analysis', 'analysis_query_actor') + (
         'tests/test_collection_transport.py::test_analyzer_publication_wakes_before_timer_and_freeze_reclaims_waiter',
         'tests/test_collection_transport.py::test_quiet_notifications_preserve_staleness_and_ledger_retry_deadlines',
         'tests/test_overlay_collection_resilience.py::test_history_recovery_yields_to_details_and_collection'),

@@ -17,7 +17,7 @@ def test_quick_theme_selection_updates_overlay_and_preserves_state(tmp_path):
     from cachemonitor.quick_qa import click, control, walk
     from cachemonitor.theme import shared_theme
     from test_overlay_layout_controller import Native
-    from test_overlay_presentation import summary
+    from test_overlay_presentation import subagent_summary
 
     app = QApplication.instance() or QApplication([])
     app.setProperty('cachemonitorDisableShellIntegration', True)
@@ -37,9 +37,10 @@ def test_quick_theme_selection_updates_overlay_and_preserves_state(tmp_path):
     controller = install_overlay(window, native_enabled=False)
     controller.appearance_reader = CodexAppearance(config)
     controller.native = Native()
-    controller.receive_snapshot({'overlay_sessions': [summary()]})
+    data=subagent_summary()
+    controller.receive_snapshot({'overlay_sessions': [data]})
     def refresh():
-        controller.receive_target(dict(target={'hwnd': 1}, selection=Selection('clean')))
+        controller.receive_target(dict(target={'hwnd': 1}, selection=Selection(data['id'])))
         QTest.qWait(80)
     try:
         window.tick.stop(); window.show(); window.open_settings(); window.settings_page.reveal('display'); QTest.qWait(100)

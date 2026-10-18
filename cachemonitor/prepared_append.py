@@ -13,10 +13,11 @@ from math import isfinite
 from .analysis_records import compact_record
 from .analytics import finite, observation_flags, output_speed, prepare_row, effort_key
 from .cache_health import CacheHealth, segment
-from .core import token_number, token_parts
-from .overlay_data import (COST_PARTS, TOKEN_LABELS, TOKEN_ORDER, _cost_view,
+from .core import token_number
+from .overlay_data import (_cost_view,
                            _token_view, assumed_cost, call_summary,
-                           _summary_view, _request_view)
+                           _summary_view, _request_view, add_model_total, model_breakdown,
+                           new_financial_totals, add_financial_total, financial_cost)
 from .prepared_health import FORMAT as HEALTH_FORMAT, FIELDS as HEALTH_FIELDS, _head
 from .prepared_store import (CapacityExceeded, RebuildRequired, OWNER_FIELDS,
                              FORBIDDEN_OWNER, RAW_TRANSPORT_FIELDS, pack, _size)
@@ -24,8 +25,8 @@ from .prepared_summary import summary_for_storage, recent_references
 from .prepared_sums import _Sum
 
 
-FORMAT = ('prepared-owner-append', 2)
-READ_FORMATS = (('prepared-owner-append', 1), FORMAT)
+FORMAT = ('prepared-owner-append', 3)
+READ_FORMATS = (FORMAT,)
 EVENT_FORMAT = ('append-health-event', 1)
 TAIL_ROWS = 128
 CHECKPOINT_BYTES = 64 * 1024
@@ -76,34 +77,19 @@ def _value(values, name):
 
 
 def _new_totals():
-    return dict(count=0, sums={key:_sum_state(_Sum()) for key in
-                ('cost', 'maintenance', 'speed_output', 'speed_seconds')},
-        priced=0, component_priced=0, maintenance_calls=0, maintenance_missing=0,
+    return dict(new_financial_totals(),sums={key:_sum_state(_Sum()) for key in
+                ('maintenance', 'speed_output', 'speed_seconds')},
+        maintenance_calls=0, maintenance_missing=0,models={},
         speed_n=0, assumed=0, mismatch=0, observation_missing=0, observation_conflict=0,
-        minimum=None, maximum=None,
-        token=dict(counts=dict.fromkeys(TOKEN_LABELS,0), known=dict.fromkeys(TOKEN_ORDER,False),
-            inp_total=0, out_total=0, partial=False, input_known=False, output_known=False,
-            written_known=True, cache_input=0, cache_read=0, cache_valid=0),
-        costs={side:dict.fromkeys((key for key,_ in fields),0.) for side,fields in COST_PARTS})
+        minimum=None, maximum=None)
 
 
 def _add_totals(total, row):
-    total['count'] += 1
+    add_model_total(total['models'],row)
+    add_financial_total(total,row)
     total['minimum'] = row['ts'] if total['minimum'] is None else min(total['minimum'],row['ts'])
     total['maximum'] = row['ts']
     cost = row.get('cost')
-    if finite(cost):
-        total['priced'] += 1
-        _add_sum(total['sums'],'cost',cost)
-    if cost is not None:
-        total['component_priced'] += 1
-        for side, fields in COST_PARTS:
-            counts = total['costs'][side]
-            if side == 'output' and (row.get('output_conflict') or
-                    any(row.get(key) is None for key in ('cost_reasoning','cost_non_reasoning'))):
-                counts['output_unknown'] += row.get('cost_output') or 0
-            else:
-                for key, field in fields:counts[key] += row.get(field) or 0
     if row.get('purpose') == 'maintenance':
         total['maintenance_calls'] += 1
         if cost is None:total['maintenance_missing'] += 1
@@ -112,37 +98,10 @@ def _add_totals(total, row):
         total['speed_n'] += 1
         _add_sum(total['sums'],'speed_output',row['output'])
         _add_sum(total['sums'],'speed_seconds',row['completion_latency_ms']/1000)
-    total['assumed'] += assumed_cost(row)
     total['mismatch'] += bool(row.get('model_alert_confirmed'))
     flags = observation_flags(row)
     total['observation_missing'] += flags['missing']
     total['observation_conflict'] += flags['conflict']
-    token = total['token']
-    parts = token_parts(row)
-    for side, mapping in (('input',{'ordinary':'uncached','read':'cached','write':'written','unclassified':'input_unknown'}),
-                          ('output',{'ordinary':'output','reasoning':'reasoning','unclassified':'output_unknown'})):
-        for key,destination in mapping.items():token['counts'][destination] += parts[side][key]
-    inp,cached,written,out,reasoning = (token_number(row.get(key)) for key in
-                                       ('input','cached','written','output','reasoning'))
-    if inp is not None:token['inp_total'] += inp
-    if out is not None:token['out_total'] += out
-    token['input_known'] |= inp is not None
-    token['output_known'] |= out is not None
-    if inp is not None and cached is not None and cached <= inp:
-        token['cache_input'] += inp
-        token['cache_read'] += cached
-        token['cache_valid'] += 1
-    token['partial'] |= inp is None or out is None
-    token['written_known'] &= written is not None
-    valid_input = (inp is not None and not row.get('input_conflict') and
-        (cached is None or cached <= inp) and (written is None or written <= inp) and
-        (cached is None or written is None or cached+written <= inp))
-    valid_output = out is not None and reasoning is not None and reasoning <= out and not row.get('output_conflict')
-    token['known']['cached'] |= valid_input and cached is not None
-    token['known']['written'] |= valid_input and written is not None
-    token['known']['uncached'] |= valid_input and cached is not None and written is not None
-    token['known']['output'] |= valid_output
-    token['known']['reasoning'] |= valid_output
 
 
 def _new_request(turn):
@@ -308,13 +267,13 @@ def reduce_full(source):
 
 def summary_facts(state,health_count):
     total=state['total'];request=state['request'];tokens=total['token'];calls=total['count'];priced=total['priced']
-    cost=_value(total['sums'],'cost') if priced or not calls else None
+    cost=financial_cost(total) if priced or not calls else None
     seconds=_value(total['sums'],'speed_seconds');speed_output=_value(total['sums'],'speed_output')
     composition=_token_view(deepcopy(tokens['counts']),deepcopy(tokens['known']),
         tokens['inp_total'],tokens['out_total'],tokens['partial'],tokens['input_known'],tokens['output_known'],
         tokens['cache_input'],tokens['cache_read'],tokens['cache_valid'],calls,tokens['written_known'] and bool(calls))
     return dict(cost=dict(sum=cost,mean=cost/priced if priced else None,n=priced,missing=calls-priced),
-        calls=calls,tokens=composition,assumed=total['assumed'],
+        calls=calls,tokens=composition,assumed=total['assumed'],model_breakdown=model_breakdown(total['models']),
         request=dict(calls=request['count'],cost=_sum_load(request['cost']).value() if request['priced'] else None,
             priced=request['priced'],assumed=request['assumed'],partial=request['count']>request['priced']),
         request_latest=state['request_latest'],mismatch_count=total['mismatch'],mismatch_key=state['latest_mismatch'],

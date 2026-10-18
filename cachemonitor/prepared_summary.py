@@ -9,7 +9,7 @@ from .overlay_data import call_summary
 from .prepared_store import CapacityExceeded, NotReady, RebuildRequired, _size
 
 
-FORMAT = ('owner-summary-refs', 1)
+FORMAT = ('owner-summary-refs', 2)
 MAX_RECENT = 12
 
 
@@ -46,6 +46,8 @@ def _validate(packet, owner):
             raise RebuildRequired('invalid own-summary call reference')
     if (packet.get('own', {}).get('home'), packet.get('own', {}).get('id')) != tuple(owner):
         raise RebuildRequired('own-summary metadata belongs to another owner')
+    if not isinstance(packet['own'].get('model_breakdown'),list):
+        raise RebuildRequired('own-summary model accounting is missing')
 
 
 def recent_references(packet):

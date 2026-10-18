@@ -13,6 +13,7 @@ from .analysis_engine import retained_bytes
 
 KINDS = frozenset(('query', 'record', 'population', 'overlay_detail'))
 RESULT_BYTES = 64 * 1024 * 1024
+OVERLAY_COMPLETIONS = 8
 
 
 class QueryActor:
@@ -21,6 +22,8 @@ class QueryActor:
         self.condition = Condition()
         self.pending = OrderedDict()
         self.completed = OrderedDict()
+        self.overlay_completed = OrderedDict()
+        self.overlay_completed_bytes = 0
         self.serial = 0
         self.latest = {}
         self.active = None
@@ -66,6 +69,9 @@ class QueryActor:
                 self.latest.pop(item, None)
                 self.pending.pop(item, None)
                 self.completed.pop(item, None)
+                if item == 'overlay_detail':
+                    self.overlay_completed.clear()
+                    self.overlay_completed_bytes = 0
                 if item == 'query':
                     self.completed.pop('progress', None)
             if self.active is not None and self.active[0] in kinds:
@@ -78,7 +84,10 @@ class QueryActor:
                 self.notification.recv_bytes()
                 self.signalled = False
             values = list(self.completed.values())
+            values.extend(value for value, _ in self.overlay_completed.values())
             self.completed.clear()
+            self.overlay_completed.clear()
+            self.overlay_completed_bytes = 0
             return values
 
     def _run(self):
@@ -99,7 +108,8 @@ class QueryActor:
                 try:
                     progress = lambda stage: self._progress(kind, serial, message, cancel, stage)
                     result = handler(dict(message, _progress=progress), token, cancel.is_set)
-                    if retained_bytes(result, RESULT_BYTES) > RESULT_BYTES:
+                    size = retained_bytes(result, RESULT_BYTES)
+                    if size > RESULT_BYTES:
                         raise ValueError('prepared query result exceeds the admitted delivery budget')
                 except Exception:
                     result = dict(kind='error', id=message.get('id'), error=traceback.format_exc(limit=6))
@@ -111,9 +121,19 @@ class QueryActor:
                         continue
                     if kind == 'query':
                         self.completed.pop('progress', None)
-                    # At most one completion per consumer, including an old
-                    # completion waiting while the writer commits its current slice.
-                    self.completed[kind] = result
+                    if kind == 'overlay_detail' and result.get('kind') == kind:
+                        # A completed owner remains useful after selection changes.
+                        # Active obsolete reads still follow latest-only cancellation.
+                        self.overlay_completed[serial] = (result, size)
+                        self.overlay_completed_bytes += size
+                        while (len(self.overlay_completed) > OVERLAY_COMPLETIONS or
+                               self.overlay_completed_bytes > RESULT_BYTES):
+                            _, (_, old_size) = self.overlay_completed.popitem(last=False)
+                            self.overlay_completed_bytes -= old_size
+                    else:
+                        # Other consumers retain only their latest completion.
+                        self.completed[kind] = result
+                    self.condition.notify_all()
                     if not self.signalled:
                         self._signal.send_bytes(b'1')
                         self.signalled = True
@@ -145,6 +165,8 @@ class QueryActor:
             self.active = None
             self.pending.clear()
             self.completed.clear()
+            self.overlay_completed.clear()
+            self.overlay_completed_bytes = 0
             self.completed['fatal'] = dict(kind='fatal', error=failure)
             if not self.signalled:
                 self._signal.send_bytes(b'1')
@@ -155,6 +177,8 @@ class QueryActor:
             self.stopping = True
             self.pending.clear()
             self.completed.clear()
+            self.overlay_completed.clear()
+            self.overlay_completed_bytes = 0
             if self.active is not None:
                 self.active[-1].set()
             self.condition.notify()

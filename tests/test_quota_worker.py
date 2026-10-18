@@ -424,4 +424,6 @@ def test_pause_cancels_automatic_calculation_but_keeps_manual_queries_available(
         assert results[-1]['value']['key']=='saved-records'
         assert worker.restart_count==0
     finally:
-        release.set();assert worker.close()
+        # Cancellation can terminate the child while it holds the Event lock.
+        # Close the worker without touching synchronization owned by that child.
+        assert worker.close()

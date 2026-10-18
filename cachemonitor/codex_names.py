@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import ntpath
+import re
 import sqlite3
 
 
@@ -15,10 +16,18 @@ def label(value):
     return value.strip() if isinstance(value, str) and value.strip() and '\n' not in value and '\r' not in value and len(value) <= 512 else ''
 
 
+def agent_task_label(value):
+    """Match the human-readable task leaf shown for named subagents."""
+    if not isinstance(value,str) or not re.fullmatch(r'/[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)+',value) or len(value)>256:
+        return ''
+    name=re.sub(r'[_-]+',' ',value.rsplit('/',1)[-1]).strip()
+    return name[:1].upper()+name[1:]
+
+
 def task_select(columns):
     """Older `title` is often the first prompt, including its shortened prefix."""
     keys = [k for k in ('id', 'rollout_path', 'name', 'model', 'model_provider', 'cwd',
-                       'archived', 'thread_source', 'project_id', 'agent_nickname') if k in columns]
+                       'archived', 'thread_source', 'project_id', 'agent_nickname', 'agent_path') if k in columns]
     if {'title', 'first_user_message'} <= columns:
         keys.append("CASE WHEN length(title) BETWEEN 1 AND 160 AND length(first_user_message)>0 "
                     "AND substr(first_user_message,1,length(title))<>title "
@@ -81,7 +90,8 @@ class CodexNames:
 
     def resolve(self, meta):
         tid = meta['id']
-        title = label(meta.get('name')) or label(meta.get('title')) or label(meta.get('agent_nickname')) or f'작업 {tid[:8]}, {tid[-6:]}'
+        title = (label(meta.get('name')) or label(meta.get('title')) or agent_task_label(meta.get('agent_path'))
+                 or label(meta.get('agent_nickname')) or f'작업 {tid[:8]}, {tid[-6:]}')
         cwd = meta.get('cwd') or ''
         result = {'display_title': title}
         identity = meta.get('project_id')

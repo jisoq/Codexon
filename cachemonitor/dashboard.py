@@ -701,23 +701,26 @@ class Dashboard(TrayWindow):
 
     def refresh_choices(self):
         choices=self.snapshot.get('filter_choices',{})
-        rows=[r for s in self.snapshot['sessions'] for r in s.get('history',[])]
         sources=self.snapshot['sessions']
-        projects=project_choices(sources)
+        rows=([r for s in sources for r in s.get('history',[])]
+              if any(key not in choices for key in ('combinations','models','efforts','modes')) else [])
+        projects=(project_choices(sources)
+                  if any(key not in choices for key in ('projects','project_labels','project_paths')) else choices)
         project_labels=choices.get('project_labels',projects['project_labels'])
         project_paths=choices.get('project_paths',projects['project_paths'])
         path_keys=defaultdict(set)
         for key,paths in project_paths.items():
             for path in paths:path_keys[project_key(path)].add(key)
         self.project._value_aliases={path:next(iter(keys)) for path,keys in path_keys.items() if len(keys)==1}
-        self.combinations=choices.get('combinations') or [dict(model=r.get('model') or '미확인',effort=r.get('effort') or '미확인',service_tier=request_tier(r)) for r in rows]
+        self.combinations=(choices['combinations'] if 'combinations' in choices else
+                           [dict(model=r.get('model') or '미확인',effort=r.get('effort') or '미확인',service_tier=request_tier(r)) for r in rows])
         self.filter_values={
-            'model':choices.get('models') or self.snapshot.get('models') or sorted({r.get('model') or '미확인' for r in rows}),
-            'effort':choices.get('efforts') or sorted({r.get('effort') or '미확인' for r in rows}),
-            'service_tier':choices.get('modes') or sorted({request_tier(r) for r in rows}),
-            'project':choices.get('projects') or projects['projects'],
-            'source':choices.get('sources') or sorted({s.get('source') or 'unknown' for s in sources}),
-            'home':choices.get('homes') or self.snapshot['homes']}
+            'model':choices['models'] if 'models' in choices else self.snapshot.get('models') or sorted({r.get('model') or '미확인' for r in rows}),
+            'effort':choices['efforts'] if 'efforts' in choices else sorted({r.get('effort') or '미확인' for r in rows}),
+            'service_tier':choices['modes'] if 'modes' in choices else sorted({request_tier(r) for r in rows}),
+            'project':choices.get('projects',projects['projects']),
+            'source':choices['sources'] if 'sources' in choices else sorted({s.get('source') or 'unknown' for s in sources}),
+            'home':choices.get('homes',self.snapshot['homes'])}
         names={'model':'모든 모델','effort':'모든 추론 설정','service_tier':'모든 요청 모드','project':'모든 프로젝트','source':'모든 작업 종류','home':'모든 Codex 홈'}
         source_names={'user':'유저 에이전트','subagent':'하위 에이전트','guardian_review':'내부 검토','maintenance':'캐시 유지','unknown':'미확인'}
         def caption(key,value):

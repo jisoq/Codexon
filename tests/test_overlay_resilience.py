@@ -105,7 +105,10 @@ def test_auto_fallback_restores_preference_anchor_and_clickthrough(tmp_path):
     native.visible_target=lambda hwnd:bool(native.u.IsWindowVisible(hwnd) and not native.u.IsIconic(hwnd))
     controller.anchor=(1,.7);controller.expanded=True
     engine=AnalysisEngine();s=source();s['request_state']=dict(turn='turn',state='완료',started_at=90,ended_at=104)
-    engine.ingest([s]);controller.receive_snapshot(dict(overlay_sessions=OverlaySummaries().collect(engine)))
+    from copy import deepcopy
+    child=deepcopy(s);child.update(id=B,parent_thread_id=A,source='subagent')
+    for row in child['history']:row['key']='child-'+row['key']
+    engine.ingest([s,child]);controller.receive_snapshot(dict(overlay_sessions=OverlaySummaries().collect(engine)))
     def refresh():
         app.processEvents();controller.receive_target(dict(target={'hwnd':int(host.winId())},selection=Selection(A)))
     def resize_frame(width,height):

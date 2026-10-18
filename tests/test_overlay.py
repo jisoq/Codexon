@@ -17,121 +17,229 @@ A = '11111111-1111-1111-1111-111111111111'
 B = '22222222-2222-2222-2222-222222222222'
 
 
-@pytest.mark.parametrize('health',[False,True])
-def test_overlay_revisits_reuse_complete_sessions_and_reject_changed_or_removed_ones(health):
-    from types import SimpleNamespace
-    from cachemonitor.analysis_engine import BoundedCache
+@pytest.fixture
+def overlay_cache_controller(tmp_path):
+    app=QApplication.instance() or QApplication([])
+    controller=OverlayController(QSettings(str(tmp_path/'cache.ini'),QSettings.IniFormat),native_enabled=False)
     requested=[]
-    controller=SimpleNamespace(collapsed=False,expanded=health,_overlay_detail=None,
-        _overlay_cache=BoundedCache(entries=2,rows=100000),pending_overlay=None,
-        _overlay_blocked=None,overlay_serial=0,_pending_overlay_navigation=None,
-        overlay_loader=lambda *args,**kwargs:requested.append((args,kwargs)),
-        overlay_identity=OverlayController.overlay_identity,
-        reusable_overlay_detail=OverlayController.reusable_overlay_detail,
-        refreshed_overlay_detail=OverlayController.refreshed_overlay_detail,refresh=lambda:None)
-    summaries={sid:dict(home='home',id=sid,_prepared_token=('test',1),_overlay_revision=('test',1),
-        _recent_refs=True,recent=[{'key':sid}],latest={'key':sid}) for sid in (A,B)}
-    def select(sid):
-        controller.target_state={'selection':Selection(sid)}
-        controller.session_lookup={key:[value] for key,value in summaries.items()}
-        return OverlayController.prepared_content(controller,summaries[sid])
+    controller.collapsed=False;controller.expanded=False
+    controller.refresh=lambda:None
+    controller.overlay_loader=lambda *args,**kwargs:requested.append((args,kwargs))
+    yield controller,requested
+    controller.stop();app.processEvents()
+
+
+def overlay_summary(sid, *, descendants=0, generation=1, revision=1):
+    return dict(home='home',id=sid,_prepared_token=('test',generation),_overlay_revision=('test',revision),
+        _recent_refs=True,recent=[{'key':sid}],latest={'key':sid},descendants=descendants,
+        cost=3.5,child_cost=1.25,_collection={'last_confirmed_at':100.})
+
+
+def overlay_select(controller,summaries,sid):
+    controller.target_state={'selection':Selection(sid)}
+    controller.session_lookup={key:[value] for key,value in summaries.items()}
+    return controller.prepared_content(summaries[sid])
+
+
+def overlay_reply(request, **extra):
+    args,options=request
+    summary=args[1]
+    detail=dict(summary,_recent_refs=False,recent=[{'key':summary['id'],'output':100}],
+                latest={'key':summary['id'],'output':100},**extra)
+    return dict(id=args[0],summary=detail,prepared_token=summary['_prepared_token'])
+
+
+@pytest.mark.parametrize('expanded',[False,True])
+def test_overlay_revisits_reuse_complete_sessions_and_reject_changed_or_removed_ones(overlay_cache_controller,expanded):
+    controller,requested=overlay_cache_controller;controller.expanded=expanded
+    summaries={sid:overlay_summary(sid) for sid in (A,B)}
     for sid in (A,B):
-        value,pending=select(sid)
+        value,pending=overlay_select(controller,summaries,sid)
         assert pending and value is None
-        detail=dict(summaries[sid],_recent_refs=False,_health_detail=health,
-                    recent=[{'key':sid,'output':100}],latest={'key':sid,'output':100})
-        if health:detail['cache_health']={'events':[{'id':sid}]}
-        OverlayController.receive_overlay_detail(controller,dict(id=controller.pending_overlay[0],
-            summary=detail,prepared_token=('test',1)))
+        assert requested[-1][1]==dict(health=False,finance=False)
+        controller.receive_overlay_detail(overlay_reply(requested[-1]))
     summaries[A]=dict(summaries[A],_prepared_token=('test',2))
     controller.expanded=False
-    value,pending=select(A)
+    value,pending=overlay_select(controller,summaries,A)
     assert not pending and value['latest']['output']==100 and len(requested)==2
-    if health:
-        controller.expanded=True
-        value,pending=select(A)
-        assert not pending and value['_health_detail'] and value['cache_health']['events']==[{'id':A}]
-        assert len(requested)==2
-    select(B)
+    controller.expanded=expanded
+    value,pending=overlay_select(controller,summaries,A)
+    assert not pending and len(requested)==2
+    overlay_select(controller,summaries,B)
     summaries[A]=dict(summaries[A],_prepared_token=('test',3),_overlay_revision=('test',3))
-    value,pending=select(A)
+    value,pending=overlay_select(controller,summaries,A)
     assert pending and value is None and len(requested)==3
-    # Removing an owner retires its retained data even if it later reappears.
-    OverlayController.receive_snapshot(controller,{'overlay_sessions':[summaries[B]]})
-    summaries[A]=dict(summaries[A],_prepared_token=('test',1),_overlay_revision=('test',1))
-    controller.pending_overlay=None
-    value,pending=select(A)
+    controller.receive_snapshot({'overlay_sessions':[summaries[B]]})
+    summaries[A]=overlay_summary(A)
+    value,pending=overlay_select(controller,summaries,A)
     assert pending and value is None and len(requested)==4
 
 
-@pytest.mark.parametrize('health',[False,True])
-def test_overlay_reuses_verified_detail_across_unrelated_publications(health):
-    from types import SimpleNamespace
-    requested=[]
-    data=dict(home='home',id=A,_prepared_token=('test',1),_overlay_revision=('test',1),
-              _recent_refs=True,recent=[{'key':'call'}],latest={'key':'call'},
-              cache_health={'count':1},speed_health={'active':False},_collection={'received_age':0})
-    detail=dict(data,recent=[{'key':'call','output':100}],latest={'key':'call','output':100},
-                _recent_refs=False,_health_detail=health,
-                cache_health={'count':1,'events':[{'id':'incident'}]} if health else data['cache_health'])
-    controller=SimpleNamespace(collapsed=False,expanded=health,_overlay_detail=detail,
-        pending_overlay=None,_overlay_blocked=None,overlay_serial=0,
-        overlay_loader=lambda *args,**kwargs:requested.append((args,kwargs)),
-        overlay_identity=OverlayController.overlay_identity,
-        reusable_overlay_detail=OverlayController.reusable_overlay_detail,
-        refreshed_overlay_detail=OverlayController.refreshed_overlay_detail)
+@pytest.mark.parametrize('expanded',[False,True])
+def test_overlay_reuses_verified_detail_across_unrelated_publications(overlay_cache_controller,expanded):
+    controller,requested=overlay_cache_controller;controller.expanded=expanded
+    data=overlay_summary(A,descendants=1)
+    finance={'cost':1.25,'agents':[{'home':'home','id':B,'cost':1.25}]}
+    overlay_select(controller,{A:data},A)
+    controller.receive_overlay_detail(overlay_reply(requested[-1],subagent_finance=finance))
     for generation in range(2,22):
         current=dict(data,_prepared_token=('test',generation),speed_health={'active':True},
                      _collection={'received_age':generation})
-        result,pending=OverlayController.prepared_content(controller,current)
+        result,pending=overlay_select(controller,{A:current},A)
         assert not pending and result['latest']['output']==100
         assert result['_prepared_token']==current['_prepared_token']
         assert result['speed_health']==current['speed_health']
         assert result['_collection']==current['_collection']
-        assert result.get('_health_detail') is health
-    assert requested==[]
+        assert result['subagent_finance']==finance
+    assert len(requested)==1
     changed=dict(current,_prepared_token=('test',22),_overlay_revision=('test',22))
     for generation in range(22,43):
-        retained,pending=OverlayController.prepared_content(controller,dict(changed,_prepared_token=('test',generation)))
+        retained,pending=overlay_select(controller,{A:dict(changed,_prepared_token=('test',generation))},A)
         assert pending and retained['latest']['output']==100
         assert retained['_overlay_revision']==('test',1)
         assert retained['_prepared_token']==current['_prepared_token']
-    assert len(requested)==1
-    controller.target_state={'selection':Selection(A)}
-    controller.session_lookup={A:[changed]}
-    controller.refresh=lambda:None
-    controller._pending_overlay_navigation=None
-    request=controller.pending_overlay[0]
-    # An obsolete completion cannot overwrite the changed selected owner.
-    OverlayController.receive_overlay_detail(controller,dict(id=request,summary=detail,
-        prepared_token=detail['_prepared_token']))
+        assert retained['subagent_finance']==finance
+    assert len(requested)==2
+    # A duplicate obsolete completion cannot replace the coherent previous display.
+    controller.receive_overlay_detail(overlay_reply(requested[0],subagent_finance=finance))
     assert controller._overlay_detail['_overlay_revision']==('test',1)
 
 
-def test_overlay_accepts_inflight_detail_only_when_selected_dependencies_are_unchanged():
-    from types import SimpleNamespace
-    old=dict(home='home',id=A,_prepared_token=('test',1),_overlay_revision=('test',1),
-             _recent_refs=False,recent=[{'key':'call','output':100}],latest={'key':'call','output':100})
-    current=dict(old,_prepared_token=('test',2),_recent_refs=True,recent=[{'key':'call'}],latest={'key':'call'})
-    controller=SimpleNamespace(pending_overlay=('request',OverlayController.overlay_identity(old),False),
-        target_state={'selection':Selection(A)},session_lookup={A:[current]},
-        _overlay_detail=None,_overlay_blocked=None,_pending_overlay_navigation=None,refresh=lambda:None,
-        overlay_identity=OverlayController.overlay_identity,
-        reusable_overlay_detail=OverlayController.reusable_overlay_detail,
-        refreshed_overlay_detail=OverlayController.refreshed_overlay_detail)
-    OverlayController.receive_overlay_detail(controller,dict(id='request',summary=old,prepared_token=('test',1)))
-    assert controller._overlay_detail['_prepared_token']==('test',2)
-    assert controller._overlay_detail['latest']['output']==100
+def test_overlay_accepts_inflight_detail_only_when_selected_dependencies_are_unchanged(overlay_cache_controller):
+    controller,requested=overlay_cache_controller
+    old=overlay_summary(A)
+    overlay_select(controller,{A:old},A)
+    current=dict(old,_prepared_token=('test',2))
+    overlay_select(controller,{A:current},A)
+    controller.receive_overlay_detail(overlay_reply(requested[0]))
+    value,pending=overlay_select(controller,{A:current},A)
+    assert not pending and value['_prepared_token']==('test',2)
+    assert value['latest']['output']==100 and len(requested)==1
 
 
-def test_overlay_banner_allows_idle_delivery_grace_and_identifies_failures(monkeypatch):
-    from types import SimpleNamespace
+def test_overlay_caches_completed_offscreen_reply_without_disturbing_current_request(overlay_cache_controller):
+    controller,requested=overlay_cache_controller
+    summaries={sid:overlay_summary(sid) for sid in (A,B)}
+    overlay_select(controller,summaries,A)
+    overlay_select(controller,summaries,B)
+    controller.receive_overlay_detail(overlay_reply(requested[0]))
+    value,pending=overlay_select(controller,summaries,B)
+    assert value is None and pending and len(requested)==2
+    controller.receive_overlay_detail(overlay_reply(requested[1]))
+    value,pending=overlay_select(controller,summaries,A)
+    assert not pending and value['id']==A and value['latest']['output']==100
+    assert len(requested)==2
+
+
+def test_overlay_detail_upgrade_reuses_recent_and_preserves_acquired_capabilities(overlay_cache_controller):
+    controller,requested=overlay_cache_controller
+    summaries={A:overlay_summary(A,descendants=1)}
+    overlay_select(controller,summaries,A)
+    assert requested[-1][1]==dict(health=False,finance=False)
+    controller.receive_overlay_detail(overlay_reply(requested[-1]))
+    controller.expanded=True
+    data,pending=overlay_select(controller,summaries,A)
+    assert pending and data['cost']==3.5 and data['latest']['output']==100
+    assert requested[-1][1]==dict(health=False,finance=True)
+    assert not requested[-1][0][1]['_recent_refs']
+    finance={'cost':1.25,'agents':[{'home':'home','id':B,'cost':1.25}]}
+    controller.receive_overlay_detail(overlay_reply(requested[-1],subagent_finance=finance))
+    controller.expanded=False
+    overlay_select(controller,summaries,A)
+    controller.expanded=True
+    data,pending=overlay_select(controller,summaries,A)
+    assert not pending and data['subagent_finance']==finance and len(requested)==2
+
+
+@pytest.mark.parametrize('retirement',['changed','removed'])
+def test_overlay_rejects_offscreen_reply_after_owner_retirement(overlay_cache_controller,retirement):
+    controller,requested=overlay_cache_controller
+    summaries={sid:overlay_summary(sid) for sid in (A,B)}
+    overlay_select(controller,summaries,A)
+    overlay_select(controller,summaries,B)
+    old=requested[0]
+    if retirement=='changed':summaries[A]=overlay_summary(A,generation=2,revision=2)
+    else:summaries.pop(A)
+    controller.receive_snapshot({'overlay_sessions':list(summaries.values())})
+    controller.receive_overlay_detail(overlay_reply(old))
+    summaries.setdefault(A,overlay_summary(A))
+    value,pending=overlay_select(controller,summaries,A)
+    assert pending and value is None and len(requested)==3
+
+
+def test_overlay_late_base_reply_cannot_downgrade_cached_finance(overlay_cache_controller):
+    controller,requested=overlay_cache_controller
+    summaries={A:overlay_summary(A,descendants=1)}
+    overlay_select(controller,summaries,A)
+    controller.expanded=True
+    overlay_select(controller,summaries,A)
+    finance={'cost':1.25,'agents':[{'home':'home','id':B,'cost':1.25}]}
+    controller.receive_overlay_detail(overlay_reply(requested[1],subagent_finance=finance))
+    controller.receive_overlay_detail(overlay_reply(requested[0]))
+    value,pending=overlay_select(controller,summaries,A)
+    assert not pending and value['subagent_finance']==finance and len(requested)==2
+
+
+def test_overlay_cached_owner_eviction_requires_a_fresh_read(overlay_cache_controller):
+    controller,requested=overlay_cache_controller
+    summaries={str(index):overlay_summary(str(index)) for index in range(9)}
+    for sid in summaries:
+        overlay_select(controller,summaries,sid)
+        controller.receive_overlay_detail(overlay_reply(requested[-1]))
+    value,pending=overlay_select(controller,summaries,'0')
+    assert pending and value is None and len(requested)==10
+
+
+def test_overlay_finance_extension_preserves_health_and_does_not_repeat_rows(overlay_cache_controller):
+    from cachemonitor.overlay_navigation import NavigationTarget
+    controller,requested=overlay_cache_controller
+    summaries={A:overlay_summary(A,descendants=1),B:overlay_summary(B)}
+    navigation=NavigationTarget('home',A,view='incident',event_id='incident')
+    controller._pending_overlay_navigation=navigation
+    resumed=[];controller.navigate_from_dashboard=resumed.append
+    overlay_select(controller,summaries,A)
+    health={'events':[{'id':'incident'}]}
+    controller.receive_overlay_detail(overlay_reply(requested[-1],_health_detail=True,cache_degradation=health))
+    assert resumed==[navigation]
+    controller.expanded=True
+    overlay_select(controller,summaries,A)
+    payload=requested[-1][0][1]
+    assert payload['_health_detail'] and payload['cache_degradation']==health
+    assert not payload['_recent_refs'] and requested[-1][1]['health'] is False
+    finance={'cost':1.25,'agents':[{'home':'home','id':B,'cost':1.25}]}
+    controller.receive_overlay_detail(overlay_reply(requested[-1],subagent_finance=finance))
+    overlay_select(controller,summaries,B)
+    controller.receive_overlay_detail(overlay_reply(requested[-1]))
+    data,pending=overlay_select(controller,summaries,A)
+    assert not pending and data['subagent_finance']==finance and data['cache_degradation']==health
+    assert data['_health_detail'] and len(requested)==3
+
+
+@pytest.mark.parametrize('fault',['query_failed','fatal'])
+def test_overlay_failed_read_recovers_after_fresh_snapshot(overlay_cache_controller,fault):
+    controller,requested=overlay_cache_controller
+    summary=overlay_summary(A)
+    overlay_select(controller,{A:summary},A)
+    controller.receive_overlay_fault({fault:True,'request_id':requested[0][0][0]})
+    overlay_select(controller,{A:summary},A)
+    assert len(requested)==1
+    # A restarted worker can publish the same unchanged prepared generation.
+    current=summary if fault=='fatal' else dict(summary,_prepared_token=('test',2))
+    controller.receive_snapshot({'overlay_sessions':[current]})
+    overlay_select(controller,{A:current},A)
+    assert len(requested)==2
+    controller.receive_overlay_detail(overlay_reply(requested[-1]))
+    data,pending=overlay_select(controller,{A:current},A)
+    assert not pending and data['latest']['output']==100
+
+
+def test_overlay_banner_allows_idle_delivery_grace_and_identifies_failures(monkeypatch,overlay_cache_controller):
     from cachemonitor.overlay_view import OverlayContent
     monkeypatch.setattr('cachemonitor.overlay.time.monotonic',lambda:100.)
-    controller=SimpleNamespace(target_state={'selection':SimpleNamespace(thread_id=A,host='local')},
-        session_lookup={A:[dict(id=A,calls=2,request={'state':'완료'})]},collection_issue='',collection_fault={},errors=[],loading=False,
-        snapshot_at=84.,snapshot_wall_time=1000.,refresh=lambda:None)
-    controller.prepared_content=OverlayController.prepared_content.__get__(controller)
+    controller,_=overlay_cache_controller
+    controller.target_state={'selection':Selection(A)}
+    controller.session_lookup={A:[dict(id=A,calls=2,request={'state':'완료'})]}
+    controller.loading=False;controller.snapshot_at=84.;controller.snapshot_wall_time=1000.
     labels=[]
     for issue,errors,reason in (('',[],'analysis_delay'),('', ['read failure'],'source_error'),
                                ('status failure',[],'service_error'),('수집 결과 갱신 지연',[],'service_delay')):
@@ -168,16 +276,14 @@ def test_overlay_banner_allows_idle_delivery_grace_and_identifies_failures(monke
     assert OverlayController.content(controller)[1]==''
 
 
-def test_verified_session_displays_during_unrelated_restore_without_hiding_faults(monkeypatch):
-    from types import SimpleNamespace
+def test_verified_session_displays_during_unrelated_restore_without_hiding_faults(monkeypatch,overlay_cache_controller):
     from cachemonitor.overlay_view import OverlayContent
     app=QApplication.instance() or QApplication([])
     monkeypatch.setattr('cachemonitor.overlay.time.monotonic',lambda:100.)
     session=dict(id=A,calls=2,collection_complete=True)
-    controller=SimpleNamespace(target_state={'selection':Selection(A)},session_lookup={A:[session]},
-        collection_issue='',collection_fault={},errors=[],loading=True,
-        snapshot_at=100.,snapshot_wall_time=1000.)
-    controller.prepared_content=OverlayController.prepared_content.__get__(controller)
+    controller,_=overlay_cache_controller
+    controller.target_state={'selection':Selection(A)};controller.session_lookup={A:[session]}
+    controller.loading=True;controller.snapshot_at=100.;controller.snapshot_wall_time=1000.
     data,note=OverlayController.content(controller)
     assert not note and not data['_collection']['loading']
     content=OverlayContent();content.set_content(data,note)

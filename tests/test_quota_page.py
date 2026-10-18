@@ -44,6 +44,50 @@ def quota_page(tmp_path):
 
 @pytest.mark.integration
 @pytest.mark.essential
+@pytest.mark.parametrize('width,height',[(1120,680),(520,300)])
+def test_cycle_overview_uses_page_space_and_reveals_last_row(tmp_path,width,height):
+    from cachemonitor.presentation import Column
+    from cachemonitor.quota_cycle_overview import CycleTable
+    from test_ui import wait_for_rendered
+    app=QApplication.instance() or QApplication([])
+    table=CycleTable()
+    periods=[dict(start=1_700_000_000+i*604800,end=1_700_000_060+i*604800,
+                  current=i==8,partial=False,delta=i+1,cost=i+1,
+                  value=None if i==0 else (i+1)*100,calls=1,priced_calls=1)
+             for i in range(9)]
+    table.set_periods(periods[:3])
+    body=Column();body.addWidget(table);body.addStretch()
+    scroll=Scroll();scroll.put(fillViewport=True);scroll.setWidget(body)
+    host=mount(scroll,width,height)
+    opened=[];table.cycle_activated.connect(opened.append)
+    try:
+        from cachemonitor.pricing import usd
+        render_plot(host,table)
+        table.set_periods(periods)
+        assert [table.item(i,2).text() for i in range(len(periods))]==[usd(p['value']) for p in periods]
+        table_control=render_plot(host,table)
+        view=next(item for item in walk(table_control) if item.objectName()=='dataTable')
+        # Every row belongs to the page, instead of an eight-row inner viewport.
+        wait_for_rendered(lambda:view.property('contentHeight')>=len(periods)*table.state['rowHeight'])
+        assert view.height()>=view.property('contentHeight')-1
+        if height>=table_control.height():
+            assert scroll.verticalPosition.value()==0
+        view.forceActiveFocus();QTest.keyClick(host.quick,Qt.Key_End)
+        last=lambda:next((cell for cell in walk(view) if cell.property('row')==8
+                         and cell.property('column')==0 and cell.metaObject().indexOfProperty('display')>=0),None)
+        wait_for_rendered(lambda:last() is not None and
+                          0<=last().mapToScene(QPointF()).y() and
+                          last().mapToScene(QPointF(0,last().height())).y()<=host.quick.height()+1)
+        if height<table_control.height():assert scroll.verticalPosition.value()>0
+        click(host,last())
+        assert opened==[periods[-1]['start']]
+        assert host.grab().save(str(tmp_path/f'quota-cycle-page-{width}.png'))
+        assert not host.qml_errors
+    finally:dispose(host)
+
+
+@pytest.mark.integration
+@pytest.mark.essential
 def test_current_chart_remains_usable_until_full_history_finishes(quota_page,tmp_path):
     app,panel,scroll=quota_page
     host=mount(scroll,1000,680)
@@ -400,7 +444,7 @@ def test_cycle_selector_changes_graph_preserves_lifetime_and_selection_on_refres
         assert panel.cycle_table.item(0,3).text()=='1.0 min'
         for index,period in enumerate(periods):
             assert panel.cycle_table.item(index,1).text()==f"{period['delta']:g}%p"
-            assert panel.cycle_table.item(index,2).text()==usd(period['cost'])
+            assert panel.cycle_table.item(index,2).text()==usd(period['value'])
         assert panel.legend_toggles['cycle_value'].isVisible()
         assert not panel.legend_toggles['remaining'].isVisible() and not panel.legend_toggles['cycle_cost'].isVisible()
         assert len(panel.history.rows)==len(panel._view['periods'])==3
@@ -481,10 +525,13 @@ def test_cycle_selector_changes_graph_preserves_lifetime_and_selection_on_refres
         from PySide6.QtCore import QPoint
         from PySide6.QtGui import QWheelEvent
         point=table_view.mapToScene(QPointF(table_view.width()/2,table_view.height()/2))
-        wheel=QWheelEvent(point,host.quick.mapToGlobal(point.toPoint()),QPoint(),QPoint(0,-1200),
+        previous=scroll.verticalPosition.value()
+        wheel=QWheelEvent(point,host.quick.mapToGlobal(point.toPoint()),QPoint(),
+                          QPoint(0,1200 if previous>0 else -1200),
                           Qt.NoButton,Qt.NoModifier,Qt.NoScrollPhase,False)
         QApplication.sendEvent(host.quick,wheel)
-        wait_for_rendered(lambda:table_view.property('contentY')>0)
+        wait_for_rendered(lambda:scroll.verticalPosition.value()!=previous)
+        assert table_view.property('contentY')==0
         click_row(host,panel.cycle_table,len(periods)-1)
         wait_for_rendered(lambda:panel.cycle_choice.currentData()==latest['start'])
         panel.cycle_choice.setCurrentIndex(0)

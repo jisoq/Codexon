@@ -351,18 +351,26 @@ def test_skipped_certificate_predecessor_cannot_hide_a_prior_correction():
     assert engine.sessions[('h', 's')]['speed_append_from'] is not None
     assert tracker.collect(engine) == expected(engine)
     assert tracker.metrics['replayed_scopes'] == 1
-def test_detail_includes_current_health_without_another_entry():
+def test_main_monitor_keeps_current_speed_health_and_session_navigation():
     from PySide6.QtWidgets import QApplication
     from cachemonitor.overlay_view import OverlayContent
+    from cachemonitor.overlay_data import OverlaySummaries
+    from cachemonitor.overlay_monitor import footer
     app=QApplication.instance() or QApplication([])
     source=session([100]*10+[35]*3)
-    data=dict(source,speed_health=health(source))
-    content=OverlayContent();content.set_content(data);content.set_layout(detail=True)
-    assert '세션 재생성을 권장합니다.' in content.detailBody.state['accessible']
+    engine=AnalysisEngine();engine.ingest([source])
+    data=OverlaySummaries().collect(engine)[0]
+    data['speed_health']=health(source)
+    content=OverlayContent();content.monitor_action('tab-latest');content.set_content(data);content.set_layout(detail=True)
+    assert content.speed_alert()['recent_speed']==35 and content.speed_alert()['baseline_speed']==100
+    assert footer(content)[1]=='warning'
+    session_link=next(link for link in content.monitor_links() if link['id']=='session')
+    assert session_link['target'].sid==source['id'] and session_link['target'].call_id is None
+    assert not content.detail_groups() and not content.detailBody.state['accessible']
     assert not any(link['id']=='speed-info' for link in content.monitor_links())
     content.set_content(dict(data,speed_health={'active':False}))
-    assert '세션 재생성' not in content.detailBody.state['accessible']
+    assert not content.speed_alert()['active']
     content.set_content(data,note='수집 지연')
-    assert '세션 재생성' not in content.detailBody.state['accessible']
+    assert not content.speed_alert()
     assert [r['id'] for r in content.monitor_links() if r.get('target')]==['session','collection']
     content.deleteLater();app.processEvents()

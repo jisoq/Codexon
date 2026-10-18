@@ -52,7 +52,7 @@ def test_child_calls_use_own_applied_settings_and_keep_old_unknown_on_append_res
         assert request_tier(child['history'][0])=='미확인'
         assert child['parent_thread_id']==TID and child['source']=='subagent'
         assert child['agent_path']=='/root/child' and child['spawn_depth']==1
-        assert child['title']=='Lorentz'
+        assert child['title']=='Child' and child['agent_nickname']=='Lorentz'
         old_row=dict(child['history'][0])
         fresh=[settings(10011,CHILD,'default'),
                event('turn_context',10012,turn_id='new-child-turn',model='gpt-6-astra'),

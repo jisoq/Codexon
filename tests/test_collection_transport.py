@@ -1112,7 +1112,8 @@ def test_pipe_requests_and_watch_cancellation_do_not_use_tcp_or_retain_handles(t
             finally:
                 release.set();worker.join(2)
             wait_until(lambda:not server.handlers)
-        assert handles()<=baseline+2
+        # A handler removes itself before its thread finishes releasing OS handles.
+        wait_until(lambda:handles()<=baseline+2)
     finally:release.set();server.close()
     assert not server.thread.is_alive() and not server.handlers and not server.connections
 

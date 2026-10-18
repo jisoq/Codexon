@@ -190,11 +190,14 @@ def test_analysis_bridge_preserves_failure_kind_and_request_id(monkeypatch):
         def recv(self):return self.messages.pop(0)
     parent=Connection([dict(kind='error',id=17,error='private source traceback')]);child=Connection()
     class Process:
+        sentinel=object()
         def start(self):pass
         def is_alive(self):return bool(parent.messages)
         def join(self,*args):pass
     context=SimpleNamespace(Pipe=lambda: (parent,child),Process=lambda **kwargs:Process())
     monkeypatch.setattr('cachemonitor.analysis_worker.mp.get_context',lambda *args:context)
+    monkeypatch.setattr('cachemonitor.analysis_worker.wait',
+                        lambda handles:[parent] if parent.messages else [handles[-1]])
     worker=AnalysisBridge([]);observed=[]
     def receive(facts):
         observed.append(facts);worker.requestInterruption()

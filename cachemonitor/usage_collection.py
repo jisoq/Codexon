@@ -1373,7 +1373,7 @@ class CollectorService:
         return (session.get('scope')==self.channel.scope and session.get('stopped') or
                 self.channel.db.execute("SELECT 1 FROM control WHERE instance=? AND action='stop'",(self.instance,)).fetchone() is not None)
 
-    def poll(self,now=None,*,detailed=True):
+    def poll(self,now=None,*,detailed=True,source_hint=None):
         from .index import UsageIndex
         started=time.monotonic()
         # The next source poll supersedes unfinished admission candidates.
@@ -1388,7 +1388,8 @@ class CollectorService:
             self.index.db.commit()  # Finish schema and TEMP revision setup before replay proofs.
             from .collection_replay import CollectionReplay
             self.index.replay=CollectionReplay.open(self.channel,self.index,restore_metadata=False)
-        snapshot=self.index.poll(now)
+        snapshot=(self.index.poll(now) if source_hint is None else
+                  self.index.poll(now,source_hint=source_hint))
         source_snapshot=snapshot
         collected=time.monotonic()
         changes=getattr(self.index,'collection_changes',None)
@@ -1463,13 +1464,14 @@ def main():
         publish_collector_fault(fault_path,scope,args.instance,error,facts=dict(start_failed=True))
         return 1
     if args.instance:service.instance=args.instance
-    first=True;changes=None
+    first=True;changes=None;source_hint=None
     try:
         from .collection_wake import SourceChanges
         changes=SourceChanges((service.channel.path,service.channel.snapshot_path,evidence))
         changes.sync(service.channel.homes)
         while not service.stopping():
-            snapshot=service.poll(detailed=False)
+            snapshot=service.poll(detailed=False,source_hint=source_hint)
+            source_hint=None
             changes.sync(snapshot['homes'])
             if first:
                 # One bounded record is replaced only on failure or a new healthy
@@ -1484,7 +1486,7 @@ def main():
                 # Keep the existing replay admission budget before accepting a
                 # source hint; a new poll replaces unfinished capture views.
                 if not service.maintain():
-                    changes.wait(deadline)
+                    source_hint=changes.wait(deadline)
                     break
     except Exception as error:
         facts=dict(getattr(service.index,'collection_fault',{}) or {})

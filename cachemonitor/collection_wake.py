@@ -1,10 +1,20 @@
 """Wake source collection for changed rollouts; periodic reconciliation stays authoritative."""
 import ctypes
 from ctypes import wintypes as W
+from dataclasses import dataclass
 import math
 import os
 from pathlib import Path
 import time
+
+
+@dataclass(frozen=True)
+class SourceHint:
+    roots: frozenset[Path] = frozenset()
+    uncertain: bool = False
+
+    def __bool__(self):
+        return bool(self.roots) or self.uncertain
 
 
 class SourceChanges:
@@ -57,24 +67,31 @@ class SourceChanges:
         seconds = max(0., deadline - time.monotonic())
         if not self.handles:
             if seconds: time.sleep(seconds)
-            return False
-        values = tuple(self.handles.values())
-        handles = (W.HANDLE * len(values))(*(value[0] for value in values))
+            return SourceHint(uncertain=True)
+        entries = tuple(self.handles.items())
+        handles = (W.HANDLE * len(entries))(*(value[0] for _, value in entries))
         result = self.api.WaitForMultipleObjects(len(handles), handles, False, math.ceil(seconds * 1000))
-        if result == 0x102: return False
+        if result == 0x102: return SourceHint()
         if result >= len(handles):
             self.close(); self.next_sync = 0.
             if seconds: time.sleep(max(0., deadline - time.monotonic()))
-            return False
+            return SourceHint(uncertain=True)
+        roots = {entries[result][0]}; uncertain = False
         # A fixed window from the first signal bounds burst latency even while
         # more events arrive. No per-event queue or trailing debounce is kept.
         time.sleep(min(self.COALESCE_SECONDS, max(0., deadline - time.monotonic())))
         for root, (handle, _) in tuple(self.handles.items()):
-            if self.api.WaitForSingleObject(handle, 0) == 0:
+            state = self.api.WaitForSingleObject(handle, 0)
+            if state == 0:
+                roots.add(root)
                 # Rearm only a signalled handle. A timeout must not rearm it.
                 if not self.api.FindNextChangeNotification(handle):
                     self.api.FindCloseChangeNotification(handle); self.handles.pop(root)
-        return True
+                    uncertain = True; self.next_sync = 0.
+            elif state != 0x102:
+                self.api.FindCloseChangeNotification(handle); self.handles.pop(root)
+                uncertain = True; self.next_sync = 0.
+        return SourceHint(frozenset(roots), uncertain)
 
     def close(self):
         for handle, _ in self.handles.values(): self.api.FindCloseChangeNotification(handle)

@@ -2,6 +2,27 @@ from cachemonitor.overlay_navigation import navigation_target
 from test_overlay_layout_controller import layout_controller
 
 
+def family_summary(count=12, children=3):
+    from cachemonitor.core import Session
+    from cachemonitor.analysis_engine import AnalysisEngine
+    from cachemonitor.overlay_data import OverlaySummaries
+    sessions=[]
+    for index in range(children+1):
+        sid='clean' if index==0 else 'child-'+str(index)
+        session=Session(sid,'home',title='Main task' if index==0 else 'Sub task '+str(index))
+        for call in range(count if index==0 else 3):
+            session.add_usage(1789884000+call*10+index,str(index)+'-'+str(call),
+                dict(input_tokens=100000,cached_input_tokens=90000,cache_write_input_tokens=0,
+                     output_tokens=1000,reasoning_output_tokens=400),
+                'gpt-6-astra' if index==0 else ('gpt-6-sol' if index%2 else 'gpt-6-luna'),
+                'turn','high','Standard')
+        value=session.view(1789884100)
+        if index:value.update(parent_thread_id='clean',source='subagent')
+        sessions.append(value)
+    engine=AnalysisEngine();engine.ingest(sessions)
+    return next(row for row in OverlaySummaries().collect(engine) if row['id']=='clean')
+
+
 def test_composition_is_passive_and_controls_persist(tmp_path):
     from PySide6.QtWidgets import QApplication
     from PySide6.QtCore import QSettings, QPoint
@@ -45,7 +66,7 @@ def test_pointer_intent_survives_call_refresh_but_not_session_change():
     assert received==[old] and model.captured is None
 
 
-def test_selected_call_outside_recent_window_is_footer_target():
+def test_session_detail_target_is_independent_of_selected_call():
     from PySide6.QtWidgets import QApplication
     from cachemonitor.overlay import SessionOverlay
     from cachemonitor.overlay_chrome import DetailModel
@@ -56,9 +77,10 @@ def test_selected_call_outside_recent_window_is_footer_target():
         old=data['recent'][0];content.select(content.call_id(old));model=DetailModel(content)
         content.set_content(summary(count=30))
         assert old not in content.rows()
-        assert model.targets['selected'].call_id==old['id']
+        target=model.targets['session']
+        assert (target.home,target.sid)==(data['home'],data['id']) and target.call_id is None
         content.set_content(summary(count=31))
-        assert model.targets['selected'].call_id==old['id']
+        assert model.targets['session']==target
         assert model.state['overlaySurface']==content.state['overlaySurface']
         model.content.changed.disconnect(model.sync)
     finally:window.close();app.processEvents()
@@ -70,7 +92,7 @@ def test_dashboard_navigation_validates_session_and_selects_old_event_call(layou
     from cachemonitor.overlay_chrome import named_item
     from cachemonitor.overlay_tracking import Selection
     from test_overlay_presentation import summary
-    c=layout_controller;data=summary(count=30);old_row=summary(count=1)['recent'][0];old=old_row['id']
+    c=layout_controller;data=family_summary(count=30);old_row=summary(count=1)['recent'][0];old=old_row['id']
     requests=[];c.record_loader=lambda request,identity:requests.append(request)
     data['cache_degradation']['events']=[dict(id='event',occurrence_keys=[old])]
     c.receive_snapshot({'overlay_sessions':[data]})
@@ -87,12 +109,12 @@ def test_dashboard_navigation_validates_session_and_selects_old_event_call(layou
     button=named_item(c.detail.quick.rootObject(),'openDashboard')
     from cachemonitor.quick_qa import click
     click(c.detail,button)
-    assert received[-1].call_id==old
+    assert received[-1].call_id is None and received[-1].sid==data['id']
     c.native.confirm_selection=lambda window:Selection('other')
     assert not c.navigate_from_dashboard(target)['enabled'] and activated==[1]
 
 
-def test_current_default_and_saved_tab_restoration(tmp_path):
+def test_overlay_defaults_and_saved_selection_restoration(tmp_path):
     from PySide6.QtCore import QSettings
     from PySide6.QtWidgets import QApplication
     from cachemonitor.overlay import OverlayController
@@ -100,21 +122,28 @@ def test_current_default_and_saved_tab_restoration(tmp_path):
     prefs=QSettings(str(tmp_path/'tabs.ini'),QSettings.IniFormat)
     first=OverlayController(prefs,native_enabled=False)
     try:
-        assert first.widget.content_model.monitor_tab=='latest'
-        first.widget.content_model.monitor_action('tab-history')
+        m=first.widget.content_model
+        assert (m.monitor_tab,m.composition_unit,m.detail_group)==('history','usd','sub')
+        from cachemonitor.overlay_monitor import toggle_segments
+        assert [segment[2] for segment in toggle_segments(m,'tab')]==['history','latest']
+        assert [segment[2] for segment in toggle_segments(m,'unit')]==['usd','tokens']
+        assert [segment['id'] for segment in m.state['detailGroupSegments']]==['sub','model']
+        m.monitor_action('tab-latest');m.monitor_action('unit-tokens')
     finally:first.stop()
     second=OverlayController(prefs,native_enabled=False)
-    try:assert second.widget.content_model.monitor_tab=='history'
+    try:
+        assert second.widget.content_model.monitor_tab=='latest'
+        assert second.widget.content_model.composition_unit=='tokens'
     finally:second.stop()
 
 
-def test_unique_entries_selection_and_captured_call(layout_controller):
+def test_unique_entries_selection_and_session_detail(layout_controller):
     from test_overlay_presentation import summary
     from cachemonitor.overlay_tracking import Selection
-    c=layout_controller;data=summary(count=12)
+    c=layout_controller;data=family_summary(count=12)
     c.receive_snapshot({'overlay_sessions':[data]})
     c.receive_target({'target':{'hwnd':1},'selection':Selection(data['id'])})
-    m=c.widget.content_model;received=[];c.navigation_requested.connect(received.append)
+    m=c.widget.content_model;m.monitor_action('tab-latest');received=[];c.navigation_requested.connect(received.append)
     assert {r['id'] for r in m.monitor_links() if r.get('target')}=={'session'}
     c.links.view.activateLink('session')
     assert received[-1].sort=='time_desc' and received[-1].view=='requests'
@@ -122,11 +151,12 @@ def test_unique_entries_selection_and_captured_call(layout_controller):
     c.links.view.activateLink('call-0')
     assert not c.expanded and m.selected_id==m.call_id(data['recent'][0])
     c.capture_detail()
-    c.receive_snapshot({'overlay_sessions':[summary(count=40)]})
+    c.receive_snapshot({'overlay_sessions':[family_summary(count=40)]})
+    current_selection=m.selected_id
     c.activate_detail()
-    assert c.expanded and m.selected()['id']==data['recent'][0]['id']
+    assert c.expanded and m.selected_id==current_selection
     assert not m.detail_links()
-    assert m.state['detailTooltips']
+    assert m.detail_groups() and m.detail_data()['cost']==data['subagent_finance']['cost']
     c.escape();assert not c.expanded
 
 
@@ -134,6 +164,10 @@ def test_passive_metrics_and_inline_header_regions(layout_controller):
     from PySide6.QtCore import QPoint
     from cachemonitor.overlay_chrome import named_item
     c=layout_controller;m=c.widget.content_model
+    from cachemonitor.overlay_tracking import Selection
+    data=family_summary()
+    c.receive_snapshot({'overlay_sessions':[data]})
+    c.receive_target({'target':{'hwnd':1},'selection':Selection(data['id'])})
     c.links.sync()
     assert c.links.mask().contains(QPoint(50,m.layout()['cache']+35))
     assert c.links.mask().contains(QPoint(50,m.layout()['result_value']+10))
@@ -151,67 +185,61 @@ def test_passive_metrics_and_inline_header_regions(layout_controller):
     assert not any(control.qml_errors for control in c.chrome)
 
 
-def test_detail_formulas_hover_over_values_and_follow_scrolling(layout_controller):
+def test_detail_grouping_and_scrolling_keep_costs_and_panel_height(layout_controller):
     import time
-    from PySide6.QtCore import QObject,QPointF
+    from PySide6.QtCore import Qt
     from PySide6.QtTest import QTest
-    from cachemonitor.i18n import tr
     from cachemonitor.overlay_chrome import named_item
     from cachemonitor.overlay_tracking import Selection
-    from test_overlay_presentation import summary
-    c=layout_controller;m=c.widget.content_model;data=summary(count=3)
+    from cachemonitor.quick_qa import click
+    c=layout_controller;m=c.widget.content_model;m.set_detail_group('model');data=family_summary(count=3,children=8)
     c.receive_snapshot({'overlay_sessions':[data]})
     c.receive_target({'target':{'hwnd':1},'selection':Selection(data['id'])})
     c.expanded=True
-
     def wait_for(condition):
         deadline=time.monotonic()+3
         while not condition():
-            assert time.monotonic()<deadline, str(dict(
-                target_visible=target.isVisible(),target_rect=target.mapRectToScene(target.boundingRect()),
-                quick_visible=c.detail.quick.isVisible(),tip_visible=tooltip.property('visible'),
-                handlers=[(child.metaObject().className(),child.property('hovered')) for child in target.children()]))
+            assert time.monotonic()<deadline
             QTest.qWait(10)
-
-    def hover(target,x,y):
-        point=target.mapToScene(QPointF(target.width()*x,target.height()*y)).toPoint()
-        assert c.detail.quick.rect().contains(point)
-        QTest.mouseMove(c.detail.quick.quickWindow(),point)
-
-    for bounds in ((0,0,1300,1000),(0,0,550,1000)):
+    for bounds in ((0,0,1300,500),(0,0,550,500)):
         c.native.bounds=bounds;c.refresh()
         root=c.detail.quick.rootObject();scroll=named_item(root,'detailScroll')
-        scroll.setProperty('contentY',0)
-        tip_data=m.state['detailTooltips'][0]
-        target=named_item(root,'detailFormulaTarget-'+tip_data['id'])
-        tooltip=target.findChild(QObject,'detailFormulaTip-'+tip_data['id'])
-        selected=m.selected_id
-        hover(target,.2,.2)
-        wait_for(lambda:tooltip.property('opened'))
-        assert tooltip.property('text')==tr(tip_data['tooltip'])
-        hover(target,.8,.8)
-        assert tooltip.property('opened') and m.selected_id==selected
-
-        session_tip=next(tip for tip in m.state['detailTooltips']
-                         if tip['tooltip'].startswith('세션 캐시 읽기 토큰 합계'))
+        height=c.detail.height();selected=m.selected_id
+        model_cost=m.state['detailMainCost'];sub_cost=m.state['detailSubCost']
+        costs=named_item(root,'detailCostHeader')
+        cost_position=costs.mapRectToScene(costs.boundingRect())
+        assert {row['model'] for row in m.detail_groups()}=={'gpt-6-sol','gpt-6-luna'}
+        click(c.detail,named_item(root,'detailMode-sub'))
+        wait_for(lambda:len(m.state['detailActions'])==8)
+        assert len(m.detail_groups())==8
+        group=m.detail_groups()[0]
+        expanded=group['key'] in m.expanded_groups
+        action=named_item(root,'detailAction-group-'+group['key'])
+        click(c.detail,action)
+        wait_for(lambda:(group['key'] in m.expanded_groups)!=expanded)
+        def current_action():return named_item(root,'detailAction-group-'+group['key'])
+        wait_for(lambda:current_action().hasActiveFocus())
+        assert not current_action().property('visualFocus')
+        QTest.keyClick(c.detail.quick,Qt.Key_Tab)
+        QTest.keyClick(c.detail.quick,Qt.Key_Tab,Qt.ShiftModifier)
+        wait_for(lambda:current_action().hasActiveFocus() and current_action().property('visualFocus'))
+        QTest.keyClick(c.detail.quick,Qt.Key_Space)
+        wait_for(lambda:(group['key'] in m.expanded_groups)==expanded)
+        wait_for(lambda:current_action().hasActiveFocus())
+        assert current_action().property('visualFocus')
         maximum=scroll.property('contentHeight')-scroll.height()
-        scroll.setProperty('contentY',min(maximum,session_tip['y']*m.appearance.scale))
-        wait_for(lambda:not tooltip.property('visible'))
-        target=named_item(root,'detailFormulaTarget-'+session_tip['id'])
-        tooltip=target.findChild(QObject,'detailFormulaTip-'+session_tip['id'])
-        hover(target,.9,.7)
-        wait_for(lambda:tooltip.property('opened'))
-        assert tooltip.property('text')==tr(session_tip['tooltip'])
-        assert m.selected_id==selected
-
-        heading=named_item(root,'openDashboard')
-        point=heading.mapToScene(heading.boundingRect().center()).toPoint()
-        QTest.mouseMove(c.detail.quick.quickWindow(),point)
-        wait_for(lambda:not tooltip.property('visible'))
+        assert maximum>0
+        scroll.setProperty('contentY',maximum)
+        wait_for(lambda:scroll.property('contentY')>0)
+        assert c.detail.height()==height and m.selected_id==selected
+        assert costs.mapRectToScene(costs.boundingRect())==cost_position
+        assert (m.state['detailMainCost'],m.state['detailSubCost'])==(model_cost,sub_cost)
+        click(c.detail,named_item(root,'detailMode-model'))
+        wait_for(lambda:scroll.property('contentY')==0)
+        assert c.detail.height()==height
         assert not c.detail.qml_errors
-
     c.toggle_expanded()
-    assert not m.state['detailTooltips']
+    assert not m.state['detailActions']
 
 
 def test_header_pointer_and_graph_pin_values(layout_controller,monkeypatch):
@@ -221,6 +249,10 @@ def test_header_pointer_and_graph_pin_values(layout_controller,monkeypatch):
     from cachemonitor.overlay_view import Drawing
     from cachemonitor.overlay_chrome import named_item
     c=layout_controller;m=c.widget.content_model
+    from cachemonitor.overlay_tracking import Selection
+    data=family_summary()
+    c.receive_snapshot({'overlay_sessions':[data]})
+    c.receive_target({'target':{'hwnd':1},'selection':Selection(data['id'])})
     m.monitor_action('tab-history');c.refresh()
     def click_call(index):
         link=next(r for r in m.monitor_links() if r['id']=='call-'+str(index))

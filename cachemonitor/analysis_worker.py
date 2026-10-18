@@ -1,5 +1,6 @@
 """Analyze shared collector snapshots outside Qt's UI thread."""
 import multiprocessing as mp
+from multiprocessing.connection import wait
 import threading
 import traceback
 from datetime import datetime, timedelta
@@ -137,6 +138,8 @@ class AnalysisBridge(QThread):
         self.quota_path=quota_path
         self.cache_floor=cache_floor
         self.lock=threading.Lock()
+        self._wake_reader,self._wake_writer=mp.Pipe(duplex=False)
+        self._wake_armed=False
         self.pending=None
         self.commands=[]
         self.process=None
@@ -147,11 +150,33 @@ class AnalysisBridge(QThread):
         with self.lock:
             self.pending={'kind':'query','id':request_id,'query':query,'logical':logical}
             self.last_request=self.pending
+            self._wake_locked()
     def enqueue_latest(self,command):
         # Each consumer accepts only its newest request id. Keep one pending
         # command per kind while the child is busy, including a single snapshot.
         self.commands[:]=[old for old in self.commands if old['kind']!=command['kind']]
         self.commands.append(command)
+        self._wake_locked()
+
+    def _wake_locked(self):
+        # One token covers the whole mailbox, so producers cannot fill the pipe.
+        if self._wake_armed or self._wake_writer.closed:return
+        self._wake_writer.send_bytes(b'\0')
+        self._wake_armed=True
+
+    def _take_commands(self):
+        with self.lock:
+            if self._wake_armed:
+                self._wake_reader.recv_bytes()
+                self._wake_armed=False
+            commands,self.commands=self.commands,[]
+            pending,self.pending=self.pending,None
+            return commands,pending
+
+    def requestInterruption(self):
+        super().requestInterruption()
+        with self.lock:self._wake_locked()
+
     def freeze_collection(self):
         with self.lock: self.enqueue_latest({'kind':'freeze'})
     def set_cache_floor(self,value):
@@ -167,9 +192,9 @@ class AnalysisBridge(QThread):
     def request_population(self,request_id,population,assumptions=None):
         with self.lock:self.enqueue_latest(dict(kind='population',id=request_id,population=population,assumptions=assumptions))
 
-    def request_overlay_detail(self,request_id,summary,health=False):
+    def request_overlay_detail(self,request_id,summary,health=False,finance=False):
         with self.lock:self.enqueue_latest(dict(kind='overlay_detail',id=request_id,summary=summary,
-            health=health,prepared_token=summary.get('_prepared_token')))
+            health=health,finance=finance,prepared_token=summary.get('_prepared_token')))
 
     def replace_snapshot(self,snapshot):
         with self.lock:
@@ -186,6 +211,16 @@ class AnalysisBridge(QThread):
         {'record':self.record,'population':self.population,'result':self.result,'stale':self.stale}[kind].emit(message)
 
     def run(self):
+        with self.lock:
+            if self._wake_reader.closed:
+                self._wake_reader,self._wake_writer=mp.Pipe(duplex=False)
+        try:self._run()
+        finally:
+            with self.lock:
+                self._wake_reader.close();self._wake_writer.close()
+                self._wake_armed=False
+
+    def _run(self):
         while not self.isInterruptionRequested():
             receiver=SnapshotReceiver()
             context=mp.get_context('spawn')
@@ -206,12 +241,12 @@ class AnalysisBridge(QThread):
             child.close()
             try:
                 while not self.isInterruptionRequested():
-                    with self.lock:
-                        commands,self.commands=self.commands,[]
-                        pending,self.pending=self.pending,None
+                    commands,pending=self._take_commands()
                     for command in commands: parent.send(command)
                     if pending: parent.send(pending)
-                    if parent.poll(.02):
+                    if self.isInterruptionRequested():break
+                    ready=wait((parent,self._wake_reader,self.process.sentinel))
+                    if parent in ready:
                         message=parent.recv()
                         if message['kind']=='snapshot':
                             try:value=receiver.receive(message['value'])
@@ -226,7 +261,7 @@ class AnalysisBridge(QThread):
                                 fatal=message['kind']=='fatal',retrying=message['kind']=='fatal',
                                 request_id=message.get('id')))
                             if message['kind']=='fatal': break
-                    if not self.process.is_alive(): break
+                    if self.process.sentinel in ready: break
             except (EOFError,BrokenPipeError,OSError) as error:
                 if not self.isInterruptionRequested():
                     self.failure.emit(str(error))
@@ -236,11 +271,12 @@ class AnalysisBridge(QThread):
                 except (OSError,EOFError): pass
                 # Keep draining the pipe so a final snapshot cannot block the
                 # child before it commits/closes its ledger and subscription.
-                while self.process.is_alive():
+                while True:
                     try:
-                        if parent.poll(.05):parent.recv()
+                        ready=wait((parent,self.process.sentinel))
+                        if parent in ready:parent.recv()
                     except (EOFError,OSError):break
-                    self.process.join(.05)
+                    if self.process.sentinel in ready:break
                 self.process.join()
                 parent.close()
             if self.isInterruptionRequested(): break
@@ -253,5 +289,6 @@ class AnalysisBridge(QThread):
             self.fault.emit(dict(process_exited=True,retrying=True))
             with self.lock:
                 self.pending=self.last_request
+                if self.pending:self._wake_locked()
                 if self.last_record:self.enqueue_latest(self.last_record)
             self.msleep(250)

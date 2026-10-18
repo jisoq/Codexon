@@ -1,4 +1,5 @@
-"""Fixed logical-pixel monitor and identifier-based call inspection."""
+"""Fixed logical-pixel monitor and expandable subagent cost detail."""
+import json
 import math
 import re
 import time
@@ -8,9 +9,8 @@ from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen, QBrush
 from .presentation import Node
 from .quick_runtime import QuickHost
 from .overlay_appearance import default_appearance
-from .overlay_navigation import navigation_target
 from .ui_details import recorded, observed_transport, model_comparison
-from .token_colors import TOKEN_COLORS, ui_palette, readable
+from .token_colors import ui_palette
 from .i18n import tr, Verbatim
 from .charts import value_text
 from .overlay_monitor import WIDTH, MARGIN, SECTION_WIDTH, TITLE_WIDTH, INLINE_CLOSE_X
@@ -18,34 +18,6 @@ from .analysis_delivery import ANALYSIS_DELAY_SECONDS
 
 LABELS = dict(cached='캐시 읽기', uncached='일반 입력', written='캐시 쓰기', reasoning='추론', output='추론 외', unknown='미분류')
 ORDER = tuple(LABELS)
-
-# Descriptions follow the displayed population; raw per-call fields have none.
-CALCULATIONS = {
-    '비용':'세션 구독 가치 환산액 합계',
-    '평균 호출 비용':'세션 비용 ÷ 호출 수',
-    '캐시 적중률':'세션 캐시 읽기 합계 ÷ 입력 합계 × 100',
-    'Total':'세션 총 토큰 합계',
-    'Total (확인분)':'확인된 세션 토큰 합계',
-    '일반 입력':'입력 − 캐시 읽기 − 캐시 쓰기',
-    '추론 외':'출력 − 추론 토큰',
-    '입력 미분류':'입력 중 구성 항목을 확인하지 못한 토큰',
-    '출력 미분류':'출력 중 구성 항목을 확인하지 못한 토큰',
-    '미분류':'입력 미분류 + 출력 미분류',
-    '캐시 읽기 0':'입력이 있고 캐시 읽기가 0인 호출 수',
-    '자체 캐시 읽기 0':'자체 호출 중 입력이 있고 캐시 읽기가 0인 호출 수',
-    '해당 입력':'캐시 미적중 호출의 입력 토큰 합계',
-    '자체 호출 비용':'자체 호출 구독 가치 환산액 합계',
-    '최근 평균':'최근 3개 비교 호출의 출력 합계 ÷ 소요 시간 합계',
-    '평소 기준':'이전 비교 호출의 출력 합계 ÷ 소요 시간 합계',
-    '속도 감소':'(1 − 최근 평균 ÷ 평소 기준) × 100',
-    '기준 평균 읽기':'기준 호출의 캐시 읽기 합계 ÷ 기준 호출 수',
-    '기준 적중률':'기준 호출의 캐시 읽기 합계 ÷ 입력 합계 × 100',
-    '세션 저하 의심':'동일 조건에서 연속 저하로 판정된 사건 수',
-    '자체 캐시 저하 의심':'자체 호출에서 연속 저하로 판정된 사건 수',
-    '기준 표본':'평소 기준 계산에 포함된 호출 수',
-    '최근 표본':'최근 평균 계산에 포함된 호출 수',
-}
-
 
 def money(value, compact=True):
     if value is None or not math.isfinite(value): return '—'
@@ -70,7 +42,7 @@ def fitted_money(value,width,size,family):
 def amount(value, exact=False):
     if value is None: return '—'
     if exact: return f'{int(value):,}'
-    for divisor, suffix in ((1e6, 'M'), (1e3, 'K')):
+    for divisor, suffix in ((1e9, 'B'), (1e6, 'M'), (1e3, 'K')):
         if abs(value) >= divisor: return f'{value/divisor:.1f}{suffix}'
     return str(int(value))
 
@@ -172,38 +144,6 @@ class Drawing:
         self.p.setPen(pen);self.p.drawLine(QPointF(x,y),QPointF(x2,y2))
     def dot(self,x,y,color='ink',r=1.5):
         self.p.setPen(Qt.NoPen);self.p.setBrush(QColor(self.colors.get(color,color)));self.p.drawEllipse(QPointF(x,y),r,r)
-    def graphs(self,rows,x,y,width,capacity,detail=False):
-        m=self.model;left=36;plot=width-left;step=plot/capacity
-        cache_y=y+20;cache_h=64 if detail else 32
-        cost_y=cache_y+cache_h+(28 if detail else 8);cost_h=24 if detail else 20;bottom=cost_y+cost_h
-        self.text(f'최근 {capacity}호출',x,y,width)
-        self.text('캐시',x,cache_y+cache_h-16,28,color='meta');self.text('비용',x,cost_y+cost_h-16,28,color='meta')
-        peak=max((r['cost'] for r in rows if r.get('cost') is not None),default=None)
-        if detail:
-            self.text('100%',x,cache_y-2,32,color='meta');self.text(money(peak),x+left,cost_y-20,plot,color='meta',right=True)
-        else:self.text(money(peak),x+left,y,plot,color='meta',right=True)
-        self.line(x+left,cache_y+cache_h,x+width,cache_y+cache_h,'track');self.line(x+left,bottom,x+width,bottom,'track')
-        selected=m.selected_id
-        for index,row in enumerate(rows[-capacity:]):
-            cx=x+left+(capacity-len(rows[-capacity:])+index+.5)*step;bar=min(16,step*.55)
-            rate=row.get('cache_rate',row.get('rate'))
-            if detail and m.call_id(row)==selected:
-                self.rect(cx-step/2,cache_y,step,bottom-cache_y,'accent',alpha=.07);self.line(cx,cache_y,cx,bottom,'accent',.8)
-            elif detail and m.call_id(row)==m.hover_id:
-                self.rect(cx-step/2,cache_y,step,bottom-cache_y,'accent',alpha=.04)
-            warning=bool(row.get('cache_warning') or row.get('cache_miss'));color='warning' if warning else 'cached'
-            if rate is None:self.line(cx-bar/2,cache_y+cache_h/2,cx+bar/2,cache_y+cache_h/2,'meta',1,True)
-            elif rate==0:self.line(cx-bar/2,cache_y+cache_h,cx+bar/2,cache_y+cache_h,color,1.5)
-            else:
-                height=cache_h*max(0,min(100,rate))/100;self.rect(cx-bar/2,cache_y+cache_h-height,bar,height,color)
-            if warning:self.line(cx,cache_y+3,cx,cache_y+7,'warning',1.2);self.dot(cx,cache_y+10,'warning',.8)
-            if index==len(rows[-capacity:])-1:self.dot(cx,cache_y-3,color,1.3)
-            if m.call_id(row)==m.highlight_id:
-                self.line(cx-bar/2-1,cache_y,cx-bar/2-1,cache_y+cache_h,color,1)
-            cost=row.get('cost')
-            if cost is None:self.line(cx-bar/2,cost_y+cost_h/2,cx+bar/2,cost_y+cost_h/2,'meta',1,True)
-            elif peak is not None and peak>0:
-                cy=bottom-cost_h*cost/peak;self.line(cx,bottom,cx,cy,'secondary',1);self.dot(cx,cy,'secondary',1.3)
     def tokens(self,x,y,width=348,title='토큰'):
         c=(self.model.data or {}).get('token_composition',{})
         self.text(title,x,y,width*.5,20,12,weight=500)
@@ -228,25 +168,6 @@ class Drawing:
                 self.text(amount(part['tokens']) if part.get('known',True) else '—',xx+column-48,yy,48,18,11,right=True)
             if narrow:top+=42+max(1,len(parts))*24+12
 
-class DetailGraph(Node):
-    def __init__(self,content):super().__init__(content);self.content=content
-    def paint(self,p):
-        p.scale(self.content.appearance.scale,self.content.appearance.scale);Drawing(p,self.content).graphs(self.content.rows(),0,0,self.content.detail_width,24,True)
-    def row_at(self,x):
-        m=self.content;plot=m.detail_width-36;column=int((x/m.appearance.scale-36)/(plot/24));index=column-(24-len(m.rows()))
-        return m.rows()[index] if x/m.appearance.scale>=36 and 0<=index<len(m.rows()) else None
-    @Slot(float,float)
-    def activate_at(self,x,y):
-        row=self.row_at(x)
-        if row:self.content.select(self.content.call_id(row))
-    @Slot(float,float)
-    def hover_at(self,x,y):
-        row=self.row_at(x);key=self.content.call_id(row) if row else None
-        if key!=self.content.hover_id:self.content.hover_id=key;self.update()
-    @Slot()
-    def clear_hover(self):
-        if self.content.hover_id is not None:self.content.hover_id=None;self.update()
-
 class DetailBody(Node):
     def __init__(self,content):super().__init__(content);self.content=content;self.scroll_offset=0
     @Slot(float)
@@ -258,33 +179,42 @@ class DetailBody(Node):
         for item in self.content._detail_items:
             value,x,y,w,h,size,color,weight=item[:8];style=item[8] if len(item)>8 else {}
             if y+h<top or y>bottom:continue
-            if style.get('kind')=='tokens':d.tokens(x,y,w,title=value)
+            if style.get('kind')=='cost-bar':
+                d.rect(x,y,w,h,'track',h/2);offset=0
+                total=style.get('total',sum(part['value'] for part in style['parts']))
+                for part in style['parts']:
+                    length=min(w-offset,w*part['value']/total) if total else 0
+                    if length:d.rect(x+offset,y,length,h,part['color'],pattern=part['color']=='unknown')
+                    offset+=length
+            elif style.get('kind')=='tokens':d.tokens(x,y,w,title=value)
             elif style.get('kind')=='metric':d.metric(value,x,y,w,h,size,color=color)
             elif isinstance(value,list):
                 for i,line in enumerate(value):d.text(line,x,y+i*18,w,18,size,color,weight,right=style.get('right',False))
-            else:d.text(value,x,y,w,h,size,color,weight,right=style.get('right',False))
+            else:d.text(value,x,y,w,h,size,color,weight,right=style.get('right',False),elide=style.get('kind')=='single-line')
+            if style.get('dot'):d.dot(x-7,y+h/2,style['dot'],2.5)
 
 class OverlayContent(Node):
     kind='plot';WIDTH=WIDTH;HEIGHT=542;BODY_SIZE=12
     def __init__(self):
         super().__init__();self.data=None;self.note='기록 확인 중';self.opacity=94;self.appearance=default_appearance(True);self.dark=True;self.compact=False
         self.detail_open=False;self.detail_inline=False;self.detail_width=208
-        self.selected_id=None;self.selected_snapshot=None;self.hover_id=None;self.follow_latest=True;self.graph_pinned=False;self.quota_lines=('','')
-        self.monitor_tab='latest';self.composition_unit='tokens';self.lower_offset=0;self.settings=None
+        self.detail_group='sub';self.expanded_groups=set()
+        self.selected_id=None;self.selected_snapshot=None;self.follow_latest=True;self.graph_pinned=False;self.quota_lines=('','')
+        self.monitor_tab='history';self.composition_unit='usd';self.lower_offset=0;self.settings=None
         self._freshness_label=''
         self._agent_scope=None;self._agent_slots={}
         self.highlight_id=None;self._highlight_timer=QTimer(self);self._highlight_timer.setSingleShot(True)
         self._highlight_timer.timeout.connect(self.clear_highlight)
-        self._graph=DetailGraph(self);self._body=DetailBody(self)
+        self._body=DetailBody(self)
         self.put(overlayVisible=False,overlayScale=1.,overlayInk=self.appearance.ink,overlayAccent=palette(self.appearance)['accent'].name(),detailBodyHeight=0);self.sync_details()
-    @Property(QObject,constant=True)
-    def detailGraph(self):return self._graph
     @Property(QObject,constant=True)
     def detailBody(self):return self._body
     @property
     def monitor_x(self):return 240 if self.detail_open and not self.detail_inline else 0
     @property
     def is_remote(self):return self.note.startswith('원격 작업')
+    @property
+    def checking_records(self):return self.note in ('기록 확인 중','세션 기록 확인 중','기록 수집 중 (잠정값)')
     def notice_card(self):
         from .overlay_monitor import REMOTE_HEADING,REMOTE_DESCRIPTION
         if self.is_remote:return REMOTE_HEADING,REMOTE_DESCRIPTION
@@ -346,21 +276,27 @@ class OverlayContent(Node):
         old=(self.data or {}).get('id'),(self.data or {}).get('home');new=(data or {}).get('id'),(data or {}).get('home')
         old_call=self.call_id(self.rows()[-1]) if self.rows() else None
         if old!=new:
-            self.selected_id=None;self.selected_snapshot=None;self.hover_id=None;self.follow_latest=True;self.graph_pinned=False
+            self.selected_id=None;self.selected_snapshot=None;self.follow_latest=True;self.graph_pinned=False
+            self.expanded_groups.clear()
         self.data=data;self.note=note;self.appearance=appearance;self.dark=appearance.dark
+        if self.expanded_groups:
+            finance=self.detail_data()
+            valid={self.detail_group_key(row,mode) for mode,field in (('model','models'),('sub','agents'))
+                   for row in finance.get(field,())}
+            self.expanded_groups.intersection_update(valid)
         self._freshness_label=freshness
         self.lower_offset=min(self.lower_offset,max(0,self.base_height(False)-self.base_height()))
         if old!=new:self.inspected_call=None;self.lower_offset=0;self.clear_highlight()
         elif self.rows() and old_call!=self.call_id(self.rows()[-1]) and not self.state.get('reducedMotion'):
             self.highlight_id=self.call_id(self.rows()[-1]);self._highlight_timer.start(120)
-        if not self.rows():self.selected_id=None;self.selected_snapshot=None;self.hover_id=None;self.follow_latest=True;self.graph_pinned=False
+        if not self.rows():self.selected_id=None;self.selected_snapshot=None;self.follow_latest=True;self.graph_pinned=False
         if self.graph_pinned and not any(self.call_id(r)==self.selected_id for r in self.rows()):
             self.release_pin()
         if self.follow_latest and self.rows():self.selected_snapshot=self.rows()[-1];self.selected_id=self.call_id(self.selected_snapshot)
         elif self.selected_id:self.selected_snapshot=next((r for r in self.rows() if self.call_id(r)==self.selected_id),self.selected_snapshot)
         self.put(overlayScale=appearance.scale,overlayInk=appearance.ink,overlayAccent=palette(appearance)['accent'].name(),collecting=False);self.sync_details();self.refresh_accessibility();self.update()
     def clear_highlight(self):
-        self.highlight_id=None;self._highlight_timer.stop();self.update();self._graph.update()
+        self.highlight_id=None;self._highlight_timer.stop();self.update()
     def rows(self):return (self.data or {}).get('recent',[])[-12:]
     def graph_colors(self,rows):
         from .token_colors import categorical
@@ -377,9 +313,9 @@ class OverlayContent(Node):
     def call_id(row):return (row.get('home'),row.get('sid'),row.get('id') or row.get('key'))
     def select(self,key):
         previous=self.selected_snapshot if self.selected_id==key else None
-        self.selected_id=key;self.hover_id=None;self.selected_snapshot=next((r for r in self.rows() if self.call_id(r)==key or str(r.get('id'))==str(key)),previous)
+        self.selected_id=key;self.selected_snapshot=next((r for r in self.rows() if self.call_id(r)==key or str(r.get('id'))==str(key)),previous)
         if self.selected_snapshot:self.selected_id=self.call_id(self.selected_snapshot)
-        self.follow_latest=bool(self.rows() and self.selected_id==self.call_id(self.rows()[-1]));self.sync_details()
+        self.follow_latest=bool(self.rows() and self.selected_id==self.call_id(self.rows()[-1]))
     def pin_call(self,key,toggle=True):
         if toggle and self.graph_pinned and self.selected_id==key:self.release_pin()
         else:
@@ -389,28 +325,76 @@ class OverlayContent(Node):
         self.graph_pinned=False;self.follow_latest=True
         rows=self.rows();self.selected_snapshot=rows[-1] if rows else None
         self.selected_id=self.call_id(rows[-1]) if rows else None
-        self.sync_details()
     def selected(self):return next((r for r in self.rows() if self.call_id(r)==self.selected_id),self.selected_snapshot or {})
     def speed_alert(self):
         # Collection trouble is not evidence that the current session is slow.
         return (self.data or {}).get('speed_health', {}) if not self.note else {}
+    def has_subagents(self):return bool((self.data or {}).get('descendants',0)>0 and not self.notice_card())
+    def set_detail_group(self,mode):
+        if mode not in ('model','sub') or mode==self.detail_group:return
+        self.detail_group=mode;self.sync_details()
+    def toggle_detail_group(self,key):
+        if key not in {row['key'] for row in self.detail_groups()}:return
+        if key in self.expanded_groups:self.expanded_groups.remove(key)
+        else:self.expanded_groups.add(key)
+        self.sync_details()
+    def detail_data(self):
+        return (self.data or {}).get('subagent_finance',{}) if self.has_subagents() else {}
+    @staticmethod
+    def detail_group_key(row,mode):
+        identity=['model',row['model']] if mode=='model' else ['sub',row.get('home'),row['id']]
+        return json.dumps(identity,ensure_ascii=False,separators=(',',':'))
+    def detail_groups(self):
+        data=self.detail_data();rows=[]
+        for row in data.get('models' if self.detail_group=='model' else 'agents',()):
+            key=self.detail_group_key(row,self.detail_group)
+            label=row['model'] if self.detail_group=='model' else row.get('title') or row['id']
+            rows.append(dict(row,key=key,label=label))
+        return sorted(rows,key=lambda row:(-(row.get('cost') or 0),row['key']))
+    def subagent_call_label(self,group):
+        model=group.get('model') or tr('미확인');effort=group.get('effort') or tr('미확인')
+        state=group.get('model_state')
+        match=('불일치' if state=='모델명 불일치' and group.get('model_mismatch') and group.get('response_model') and group['response_model']!=model else
+               '일치' if state=='일치' and group.get('response_model')==model else '미확인')
+        return f'{tr(model)}, {tr(effort)} ({tr(match)})'
     def sync_details(self):
         items=self.detail_items() if self.detail_open else [];self._detail_items=items;height=max((r[2]+r[4] for r in items),default=16)
-        tooltips=[];self._detail_confirmed=None;accessible_offset=0
+        actions=[];self._detail_confirmed=None;accessible_offset=0
         for index,item in enumerate(items):
             style=item[8]
             text=''.join(item[0]) if isinstance(item[0],list) else item[0]
             if style.get('collectionTime'):
                 self._detail_confirmed=(index,accessible_offset,len(text),(self.data or {}).get('_collection',{}).get('last_confirmed_at'))
             accessible_offset+=len(text)+1
-            if not style.get('formula'):continue
-            x,y,width,tip_height=style['formula_bounds']
-            tooltips.append(dict(id=str(index),x=x,y=y,width=width,height=tip_height,tooltip=style['formula']))
+            if style.get('action'):
+                actions.append(dict(id=style['action'],x=item[1],y=item[2],width=item[3],height=item[4],
+                                    label=style.get('actionLabel',text),expanded=style.get('expanded',False),tooltip=style.get('tooltip','')))
         colors=palette(self.appearance)
-        self.put(detailBodyHeight=round(height*self.appearance.scale),detailWidth=self.detail_width,detailTitle='호출 상세',detailCloseX=INLINE_CLOSE_X,
+        data=self.data or {};sub=self.detail_data();family=self.appearance.family
+        widths=[max(28,QFontMetrics(font(family,11)).horizontalAdvance(tr(label))+14) for label in ('Sub','모델')]
+        right=(INLINE_CLOSE_X if self.detail_inline else 204)-8;left=right-sum(widths)
+        segments=[]
+        for (mode,label),width in zip((('sub','Sub'),('model','모델')),widths):
+            segments.append(dict(id=mode,label=tr(label),x=left,width=width));left+=width
+        main_partial=bool(data.get('own_coverage_gap') or data.get('own_calls',0)>data.get('own_priced',0))
+        sub_partial=bool(sub.get('missing') or sub.get('coverage_gap'))
+        sub_cost=sub.get('cost') if sub else data.get('child_cost')
+        def exact(value):return tr('미산정') if value is None else '$0.00' if value==0 else '$'+f'{value:,.10f}'.rstrip('0').rstrip('.')
+        def header_amount(value):
+            width=(self.detail_width-12)/2;size=22;display=fitted_money(value,width,size,family)
+            while size>10 and QFontMetrics(font(family,size,600)).horizontalAdvance(display)>width:size-=1
+            return display,size
+        main_amount,main_size=header_amount(data.get('own_cost'));sub_amount,sub_size=header_amount(sub_cost)
+        from .overlay_monitor import SESSION_Y
+        self.put(detailBodyHeight=round(height*self.appearance.scale),detailWidth=self.detail_width,detailTitle='Sub 상세',detailCloseX=INLINE_CLOSE_X,
+                 checkingRecords=self.checking_records and not self.detail_inline,loadingX=self.monitor_x+MARGIN+16,loadingY=SESSION_Y+19,
                  overlayFamily=self.appearance.family,overlaySurface=colors['surface'].name(),overlayBorder=colors['border'].name(),
-                 overlayWarning=colors['warning'].name(),
-                 detailHasSelection=bool(self.selected()),detailGraphAccessible='선택 호출 상세',detailSelected=str(self.selected_id or ''),detailTooltips=tooltips)
+                 overlayWarning=colors['warning'].name(),overlayBand=colors['band'].name(),overlaySelection=colors['selection'].name(),overlaySecondary=colors['secondary'].name(),
+                 detailHasSession=bool((self.data or {}).get('id')),detailSessionKey=str(((self.data or {}).get('home'),(self.data or {}).get('id'))),
+                 detailGroup=self.detail_group,detailGroupSegments=segments,detailActions=actions,
+                 detailMainCost=main_amount,detailSubCost=sub_amount,detailMainCostSize=main_size,detailSubCostSize=sub_size,
+                 detailMainExact=exact(data.get('own_cost')),detailSubExact=exact(sub_cost),
+                 detailMainPartial=main_partial,detailSubPartial=sub_partial)
         if self.detail_open:self._body.update()
         self._body.setAccessibleName('\n'.join(''.join(r[0]) if isinstance(r[0],list) else r[0] for r in items))
     def refresh_collection_detail(self):
@@ -565,11 +549,11 @@ class OverlayContent(Node):
         values.append(self.freshness_text())
         self.setAccessibleName(Verbatim(values[0]+'\n'+tr('\n'.join(filter(None,values[1:])))))
     def detail_items(self):
-        d=self.data or {};row=self.selected();w=self.detail_width;items=[];y=0
+        d=self.detail_data();w=self.detail_width;items=[];y=0
         def text(value,x=0,width=None,size=11,color='ink',weight=400,height=18,at=None,right=False,kind=None):
             nonlocal y
             yy=y if at is None else at;limit=width if width is not None else w;value=tr(str(value))
-            if at is None:
+            if kind not in ('metric','single-line'):
                 metrics=QFontMetrics(font(self.appearance.family,size,weight));lines=[];line=''
                 for char in value:
                     if line and metrics.horizontalAdvance(line+char)>limit:lines.append(line);line=''
@@ -578,117 +562,81 @@ class OverlayContent(Node):
                 if len(lines)>1:value=lines;height=len(lines)*18
             items.append((value,x,yy,limit,height,size,color,weight,dict(right=right,kind=kind)))
             if at is None:y+=height
-        def pair(label,value,color='ink',numeric=False,formula=None,child=False):
+            return height
+        def exact_money(value):
+            if value is None:return tr('미산정')
+            return '$0.00' if value==0 else '$'+f'{value:,.10f}'.rstrip('0').rstrip('.')
+        def categories(group):
             nonlocal y
-            first=len(items);top=y
-            formula=formula or CALCULATIONS.get(label)
-            value=tr(str(value))
-            metrics=QFontMetrics(font(self.appearance.family,11))
-            if numeric and metrics.horizontalAdvance(str(value))>w-92:
-                text(label,color='secondary');text(value,right=True)
-                items[first][8].update(formula=formula,formula_bounds=(0,top,w,y-top));y+=4;return
-            text(label,x=8 if child else 0,width=80 if child else 88,color='secondary',at=y,
-                 weight=600 if label in ('입력','출력') else 400);metrics=QFontMetrics(font(self.appearance.family,11));lines=[];line=''
-            for char in str(value):
-                if line and metrics.horizontalAdvance(line+char)>w-92:lines.append(line);line=''
-                line+=char
-            lines.append(line);items.append((lines,92,y,w-92,len(lines)*18,11,color,400,dict(right=numeric)))
-            items[first][8].update(formula=formula,formula_bounds=(0,top,w,len(lines)*18));y+=len(lines)*18+4
-        def tokens(value):return amount(value,True)+(' 토큰' if value is not None else '')
-        if self.speed_alert().get('active'):
-            health=self.speed_alert()
-            text('세션 근거: 출력 속도 저하',color='warning',weight=600,size=13,height=24)
-            pair('최근 평균',value_text(health['recent_speed'],'output_speed'),numeric=True)
-            pair('평소 기준',value_text(health['baseline_speed'],'output_speed'),numeric=True)
-            pair('속도 감소',percent(health['drop_percent']),color='warning',numeric=True)
-            text('세션 재생성을 권장합니다.',weight=600)
-            text('재생성 후 속도 회복은 보장되지 않습니다.',color='secondary')
-            text('같은 모델, 추론 강도, 요청 등급, 통신 방식과 유사한 토큰량, 캐시율을 비교합니다.',color='secondary')
-            pair('기준 표본',str(health['baseline_count']),numeric=True)
-            pair('최근 표본',str(health['recent_count']),numeric=True)
-            text('현재 세션의 이전 호출 기준' if health['baseline_source']=='session' else '같은 환경의 다른 세션 기준',color='secondary')
-            y+=16
-        text('최근 호출',color='secondary',weight=600);y+=8
-        if row:
-            text(f"{timestamp(row.get('ts'))}, {row.get('ordinal','—')}호출",color='secondary');y+=8;half=(w-12)/2
-            text('캐시',width=half,color='secondary',at=y);items[-1][8].update(formula='선택 호출 캐시 읽기 ÷ 입력 × 100',formula_bounds=(0,y,half,46))
-            text('비용',x=half+12,width=half,color='secondary',at=y);items[-1][8].update(formula='선택 호출 구독 가치 환산액',formula_bounds=(half+12,y,half,46));y+=18
-            text(percent(row.get('cache_rate',row.get('rate'))),width=half,size=20,color='warning' if row.get('cache_warning') else 'cached_text',weight=600,height=28,at=y,kind='metric')
-            text(fitted_money(row.get('cost'),half,20,self.appearance.family),x=half+12,width=half,size=20,weight=600,height=28,at=y,kind='metric');y+=40
-            pair('정확한 비용',money(row.get('cost'),False),numeric=True,formula='선택 호출 구독 가치 환산액')
-            pair('평균 출력 속도',value_text(row['output_speed'],'output_speed') if row.get('output_speed') is not None else '측정 불가',numeric=True,formula='선택 호출 출력 토큰 ÷ 소요 시간')
-            if row.get('output_speed') is not None:
-                pair('호출 소요시간',value_text(row['completion_latency_ms']/1000,'duration'),numeric=True)
-            for label,key in [('입력','input'),('캐시 읽기','cached'),('캐시 쓰기','written'),('일반 입력','uncached'),('입력 미분류','input_unknown'),
-                              ('출력','output'),('추론','reasoning'),('추론 외','non_reasoning'),('출력 미분류','output_unknown')]:
-                if '미분류' in label and not row.get(key):continue
-                if row.get(key) is None:continue
-                pair(label,tokens(row.get(key)),numeric=True,child=key not in ('input','output'))
-            y+=12
-            comparison=model_comparison(row)
-            if comparison:text(comparison,color='error' if comparison.startswith('모델 불일치') else 'ink')
-            for label,value in [('추론 강도',row.get('effort')),('요청 모드',row.get('mode')),('통신 방식',observed_transport(row))]:
-                if not recorded(value):continue
-                pair(label,value,'error' if '모델' in label and row.get('model_mismatch') else 'ink')
-            for warning in row.get('warnings',[]):
-                label=warning.get('text','') if isinstance(warning,dict) else warning
-                if comparison and label=='모델명 불일치':continue
-                text(label,color='error' if '불일치' in label or '오류' in label else 'warning' if label in ('캐시 미적중','캐시 저하 의심') else 'secondary')
-        else:text('자체 호출 없음' if d.get('descendants') and not d.get('own_calls') else '호출 기록 없음' if d.get('calls')==0 else self.note or '기록 확인 중',color='secondary')
-        y+=16;text('세션 근거',weight=600);text(self.session_scope(),color='secondary');y+=8
-        pair('비용',money(d.get('cost'),False),numeric=True)
-        if d.get('descendants'):
-            pair('자체 호출 비용',money(d.get('own_cost'),False),numeric=True)
-            pair(f"하위 {d['descendants']}개 비용",money(d.get('child_cost'),False),numeric=True,formula='하위 작업 호출 구독 가치 환산액 합계')
-        pair('평균 호출 비용',money(d.get('mean_cost'),False),numeric=True)
-        if d.get('missing'):
-            text(f"산정 {d.get('priced',0)} / {d.get('calls',0)}호출",color='secondary')
-        if d.get('assumed'):text(f"Standard 가정 {d['assumed']}호출",color='secondary')
-        c=d.get('token_composition',{})
-        if c.get('cache_hit_partial'):text('확인분 입력 기준',color='secondary')
+            cost=group.get('cost_composition',{});composition=group.get('token_composition',{})
+            costs={part['key']:part for side in ('input','output') for part in cost.get(side+'_parts',())}
+            quantities={part['key']:part for side in ('input','output') for part in composition.get(side+'_parts',())}
+            for key,label in (('uncached','일반 입력'),('cached','캐시 읽기'),('written','캐시 쓰기'),
+                              ('reasoning','추론 출력'),('output','추론 외 출력'),
+                              ('input_unknown','입력 미분류'),('output_unknown','출력 미분류')):
+                quantity=quantities.get(key);part=costs.get(key)
+                count=quantity['tokens'] if quantity and quantity.get('known',True) else None
+                price=part['tokens'] if part and part.get('known',True) else 0. if cost.get('known') else None
+                if count==0 and price==0:continue
+                if key.endswith('unknown') and not quantity and not part:continue
+                price_text=exact_money(price);stacked=QFontMetrics(font(self.appearance.family,11)).horizontalAdvance(price_text)>w*.55
+                top=y
+                left=text(label,x=10,width=w-10 if stacked else w*.45-10,color='secondary',size=10,at=y)
+                items[-1][8]['dot']=key if key in ORDER else 'unknown'
+                if stacked:
+                    y+=left;text(price_text,right=True)
+                else:
+                    right=text(price_text,x=w*.45,width=w*.55,right=True,at=y);y+=max(left,right)
+                text(amount(count) if count is not None else '미확인',right=True,color='secondary',size=10);y+=5
+        if not d:
+            if self.has_subagents():text('모델별 기록 확인 중',color='secondary')
+            return items
+        groups=self.detail_groups()
+        if not groups:text('호출 기록 없음' if d.get('calls')==0 else '모델별 기록 확인 중',color='secondary')
+        for group in groups:
+            key=group['key'];expanded=key in self.expanded_groups;start=y
+            partial=group.get('priced',0)<group.get('calls',0) or group.get('coverage_gap') or (self.detail_group=='model' and d.get('coverage_gap'))
+            value=group.get('cost');total=d.get('cost')
+            share=percent(value/total*100) if value is not None and total else ('0.0%' if value==0 and total==0 else '—')
+            display=fitted_money(value,w*.48,12,self.appearance.family)
+            price_width=min(w*.48,QFontMetrics(font(self.appearance.family,12,600)).horizontalAdvance(display)+2)
+            name_height=text(group['label'],width=w-price_width-8,weight=600,size=12,at=y,kind='single-line')
+            text(display,x=w-price_width,width=price_width,size=12,weight=600,at=y,kind='metric');y+=name_height
+            if display!=money(value,False):text(exact_money(value),color='secondary',size=10)
+            meta=self.subagent_call_label(group) if self.detail_group=='sub' else ''
+            if partial:meta+=(' / ' if meta else '')+tr('확인분')
+            share_text=share+(' ⌄' if expanded else ' ›')
+            share_width=QFontMetrics(font(self.appearance.family,11)).horizontalAdvance(share_text)+2
+            meta_height=text(meta,width=w-share_width-8,color='error' if group.get('model_mismatch') else 'secondary',size=10,at=y)
+            text(share_text,x=w-share_width,width=share_width,color='secondary',right=True,at=y);y+=max(22,meta_height)
+            cost=group.get('cost_composition',{})
+            parts=[dict(value=max(0,part['tokens']),color=part['key'] if part['key'] in ORDER else 'unknown')
+                   for side in ('input','output') for part in cost.get(side+'_parts',()) if part.get('tokens')]
+            text('',height=5,kind='cost-bar');items[-1][8].update(parts=parts,total=total or 0);y+=10
+            exact=exact_money(value)+(' '+tr('확인분') if partial else '')
+            tip=group['label']+'\n'+(meta+'\n' if meta else '')+exact
+            if self.detail_group=='sub' and group.get('response_model'):tip+='\n'+tr('응답 모델')+': '+group['response_model']
+            items.append(('',0,start,w,y-start,11,'ink',400,dict(action='group-'+key,actionLabel=group['label']+' '+meta+' '+exact,expanded=expanded,tooltip=tip)))
+            if expanded:
+                categories(group)
+                if group.get('priced',0)<group.get('calls',0):
+                    text(f"산정 {group.get('priced',0):,} / {group.get('calls',0):,}호출",color='secondary',size=10)
+            y+=10
+        evidence=[]
+        if d.get('missing'):evidence.append(f"산정 {d.get('priced',0):,} / {d.get('calls',0):,}호출")
+        if d.get('assumed'):evidence.append(f"Standard 가정 {d['assumed']}호출")
+        if d.get('coverage_gap'):evidence.append('이전 기록 누락')
+        for line in evidence:text(line,color='secondary',size=10)
         collection_errors={}
-        for error in d.get('_collection',{}).get('errors',[]):
+        for error in (self.data or {}).get('_collection',{}).get('errors',()):
             label=collection_error_label(error);collection_errors[label]=collection_errors.get(label,0)+1
-        for state,color in self.states():
-            if state!='수집 오류' or not collection_errors:text(state,color=color)
+        if self.note and (self.note!='수집 오류' or not collection_errors):
+            text(self.note,color='error' if '오류' in self.note else 'secondary')
         if '지연' in self.note:
-            pair('마지막 확인',timestamp(d.get('_collection',{}).get('last_confirmed_at')))
+            text('마지막 확인',color='secondary')
+            text(timestamp((self.data or {}).get('_collection',{}).get('last_confirmed_at')))
             items[-1][8]['collectionTime']=True
         for label,count in collection_errors.items():text(label+(f', {count}건' if count>1 else ''),color='error')
-        misses=d.get('cache_misses',{});degraded=d.get('cache_degradation',{});y+=8
-        observed=d.get('calls') is not None
-        pair('자체 캐시 읽기 0' if d.get('descendants') else '캐시 읽기 0',f"{misses.get('count',0):,}회" if observed else '—',numeric=True)
-        pair('해당 입력',tokens(None if not observed or misses.get('input_missing') else misses.get('input',0)),numeric=True)
-        for event in misses.get('events',[]):
-            text(timestamp(event.get('ts')),color='secondary');items[-1][8]['target']=navigation_target(d,'status_total',status='cache_zero');pair('입력',tokens(event.get('input')),numeric=True)
-        if degraded.get('count'):
-            pair('자체 캐시 저하 의심' if d.get('descendants') else '세션 저하 의심',f"{degraded['count']:,}회",numeric=True)
-            for event in degraded.get('events',[]):
-                y+=8;text(timestamp(event.get('ts'))+', '+str(event.get('count',1))+'호출',color='secondary');items[-1][8]['target']=navigation_target(d,'incident',event=event)
-                if event.get('resolved'):pair('회복 확인',timestamp(event.get('ended_at')))
-                segment=event.get('segment',())
-                for label,value in zip(('비교 모델','비교 모드','캐시 정책'),segment):
-                    if value is not None:pair(label,value)
-                baseline_read=event.get('baseline_read')
-                pair('기준 평균 읽기',f'{baseline_read:,.1f}'.removesuffix('.0')+' 토큰' if baseline_read is not None else '—',numeric=True)
-                pair('기준 적중률',percent(event.get('baseline_rate')*100 if event.get('baseline_rate') is not None else None),numeric=True)
-                baseline=event.get('baseline_calls',[])
-                if baseline:pair('기준 호출',', '.join(str(call['ordinal']) for call in baseline)+'호출',numeric=True)
-                elif event.get('baseline_keys'):pair('기준 호출 ID',', '.join(map(str,event['baseline_keys'])))
-                for call in event.get('comparison_calls',[]):
-                    text(f"{timestamp(call.get('ts'))}, {call['ordinal']}호출",color='secondary')
-                    pair('캐시 읽기',tokens(call.get('cached')),numeric=True)
-                    pair('캐시 적중률',percent(call.get('cache_rate')),numeric=True,formula='해당 호출 캐시 읽기 ÷ 입력 × 100')
-        y+=16
-        if self.compact:
-            height=(28+sum(54+24*max(1,len(c.get(k,[]))) for k in ('input_parts','output_parts'))) if w<300 else self.composition_full_height()
-            text('토큰',height=height,kind='tokens');y+=12
-        token_label='Total (확인분)' if c.get('partial') else 'Total'
-        pair(token_label,tokens(c.get('total') if c.get('known',d and d.get('calls')) else None),numeric=True)
-        for part in c.get('parts',[]):pair(part['label'],tokens(part['tokens'])+', '+percent(part['share']*100),numeric=True,
-            formula='세션 '+part['label']+' 토큰 합계 ÷ Total × 100')
-        for key,label in [('input_unknown','입력 미분류'),('output_unknown','출력 미분류')]:
-            if c.get('counts',{}).get(key):pair(label,tokens(c['counts'][key]),numeric=True)
         return items
     def headline_metrics(self):
         """One row shared by painting, hit targets and layout verification."""

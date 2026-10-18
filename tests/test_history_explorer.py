@@ -7,6 +7,29 @@ from cachemonitor.analysis_engine import AnalysisEngine
 from cachemonitor.history_projection import node_key
 
 
+def test_prepared_filter_choices_preserve_empty_values_and_project_aliases(dashboard,monkeypatch):
+    from cachemonitor import dashboard as module
+    from cachemonitor.analytics import project_key
+    w=dashboard
+    choices=dict(models=['model-a'],efforts=['high'],modes=['fast'],combinations=[],
+                 projects=['project-a'],project_labels={'project-a':'Project A'},
+                 project_paths={'project-a':['C:/old']},sources=['user'],homes=['fixture'])
+    def unexpected(*args):raise AssertionError('prepared choices must not re-read source history')
+    class UnreadHistory:
+        __iter__=unexpected
+    monkeypatch.setattr(module,'project_choices',unexpected)
+    w.snapshot={**w.snapshot,'filter_choices':choices,'sessions':[{'history':UnreadHistory()}]}
+    w.refresh_choices()
+    assert w.project.findData('project-a')>=0
+    choices['project_paths']={'project-a':['C:/new']}
+    w.refresh_choices()
+    assert w.project._value_aliases=={project_key('C:/new'):'project-a'}
+    choices.update(models=[],efforts=[],modes=[])
+    w.refresh_choices()
+    assert w.filter_values['model']==w.filter_values['effort']==w.filter_values['service_tier']==[]
+    assert w.combinations==[]
+
+
 @pytest.mark.integration
 def test_project_first_and_selection_does_not_navigate(dashboard):
     w=dashboard;w.change_page(2)

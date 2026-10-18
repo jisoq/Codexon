@@ -6,7 +6,7 @@
 
 - **Spot a request/response model mismatch directly in the overlay.** Compare the requested and reported model names when investigating routing behavior.
 - See the latest call's tokens, cache rate, and subscription value estimate in an overlay while working in Codex.
-- Open call records from the overlay or comparison results. Session totals include confirmed child-agent usage.
+- Open session records from the overlay and call records from comparison results. Session totals include confirmed child-agent usage.
 - Compare usage across models, reasoning efforts and service tiers, and inspect the calls behind each result.
 - Follow remaining usage limits and reset times. The tray and taskbar widget keep them visible without opening the dashboard.
 
@@ -18,7 +18,7 @@ Supported installation target: **Windows 10/11 x64**. Setup includes Python, Qt 
 
 **Check the requested model against the model reported in the response, right in the overlay.** A mismatch highlights the line and shows the response model, such as `(response: gpt-6-sol)`. Matching names display `(match)` beside the requested model.
 
-Use the difference as a clue when investigating routing behavior, then open **Call details** to inspect that call's record. These are recorded request/response names; they do not establish the internal routing path or underlying model implementation.
+Use the difference as a clue when investigating routing behavior, then open **Call details** in the dashboard to inspect that call's record. These are recorded request/response names; they do not establish the internal routing path or underlying model implementation.
 
 ## Weekly allowance, measured from real usage
 
@@ -30,9 +30,11 @@ The default screen is subscription monitoring. The main menu contains subscripti
 
 ## Overlay views
 
-Switch **Count / $** to see the session's token composition or subscription value estimate composition. Switch **Current / Recent** to see the latest confirmed call or trends across the 12 most recent calls. The session totals stay visible above both views.
+![Main overlay with $ and Recent selected beside Sub details](docs/images/sub-detail-readme-en.png)
 
-Use **Open details** in the header to open the overlay's call details. In the recent-call view, select a graph point first to inspect that call. Select **Call details** in the detail panel to open the full dashboard record.
+Switch **$ | Count** to see subscription value or token composition. Switch **Recent | Current** to see trends across the 12 most recent calls or the selected call. The defaults are **$** and **Recent**; saved selections are restored. Session totals stay visible above both views.
+
+The header's **Open details** button appears only when confirmed subagents exist. **Sub details** separates Main Agent and Sub Agent value, with **Sub | Model** grouping for child usage. The default is **Sub**. Select **Session** in the main panel to open its records in the dashboard.
 
 The header controls adjust background transparency and minimize the overlay; select the minimized icon to restore it. Amounts use Standard base rates weighted by subscription usage: Fast is 2.5x Standard for the same tokens. Model comparison reflects recorded request/response names.
 

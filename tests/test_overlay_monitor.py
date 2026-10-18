@@ -103,18 +103,56 @@ def test_waiting_cards_and_old_values_are_distinct(monkeypatch):
     m.set_content(data);assert not m.freshness_text() and m.monitor_links()
 
 
+def test_record_loading_moves_only_while_visible_and_checking(tmp_path):
+    import time
+    from PySide6.QtCore import QObject, QEventLoop
+    from PySide6.QtWidgets import QApplication
+    from cachemonitor.overlay_view import SessionOverlay
+    from test_overlay_presentation import summary
+    app=QApplication.instance() or QApplication([])
+    def until(condition):
+        deadline=time.monotonic()+3
+        while not condition():
+            assert time.monotonic()<deadline
+            app.processEvents(QEventLoop.AllEvents,10)
+    window=SessionOverlay()
+    try:
+        window.set_layout(compact=True)
+        window.set_content(None,'기록 확인 중',dark=False)
+        window.show()
+        until(lambda: window.quick.rootObject() is not None)
+        scene=window.quick.rootObject()
+        spinner=scene.findChild(QObject,'overlay-record-loading')
+        animation=scene.findChild(QObject,'overlay-record-loading-animation')
+        until(lambda: animation.property('running') and spinner.property('rotation')>0)
+        first=window.grab().toImage()
+        until(lambda: window.grab().toImage()!=first)
+        assert window.grab().save(str(tmp_path/'record-loading.png'))
+        window.hide()
+        until(lambda: not animation.property('running'))
+        window.show()
+        until(lambda: animation.property('running'))
+        for data,note in ((None,'수집 오류'),(None,'호출 기록 없음'),(summary(),'')):
+            window.set_content(data,note)
+            until(lambda: not animation.property('running'))
+            assert not spinner.property('visible')
+        assert not window.qml_errors
+    finally:
+        window.close();app.processEvents()
+
+
 @pytest.mark.parametrize('language',['ko','en'])
 def test_fresh_collection_time_updates_open_details_without_rebuilding_evidence(monkeypatch,language):
     from copy import deepcopy
     from PySide6.QtWidgets import QApplication
     from cachemonitor.i18n import set_language
     from cachemonitor.overlay_view import OverlayContent,timestamp
-    from test_overlay_presentation import summary
+    from test_overlay_navigation import family_summary
     app=QApplication.instance() or QApplication([])
     monkeypatch.setattr('cachemonitor.overlay_view.time.time',lambda:1000)
     set_language(language)
     try:
-        content=OverlayContent();data=summary(count=16,misses=16)
+        content=OverlayContent();data=family_summary(count=16)
         data['_collection']={'last_confirmed_at':950}
         content.set_content(data,'수집 지연');content.set_layout(detail=True)
         before=deepcopy(content._detail_items);accessible=content.detailBody.state['accessible']
@@ -169,7 +207,7 @@ def test_layout_collapses_notices_and_composition_has_tooltip_only_regions():
     from test_overlay_presentation import summary
     app=QApplication.instance() or QApplication([])
     m=OverlayContent();m.set_content(summary());base=m.layout()
-    assert m.monitor_tab=='latest' and base['miss'] is None and base['partial'] is None
+    assert m.monitor_tab=='history' and base['miss'] is None and base['partial'] is None
     assert base['tokens']==base['cache']+64+16
     assert base['unit']==base['session']
     assert base['session']-(base['header']+24)==12
@@ -179,7 +217,7 @@ def test_layout_collapses_notices_and_composition_has_tooltip_only_regions():
     assert base['height']-(base['call_parts']+20)==16
     assert base['call_parts']+20==base['recent']+4*52-8
     assert base['divider']==base['rows']+3*18+16
-    assert [r['id'] for r in m.monitor_links() if r['id'].startswith('tab-')]==['tab-latest','tab-history']
+    assert [r['id'] for r in m.monitor_links() if r['id'].startswith('tab-')]==['tab-history','tab-latest']
     assert not any(r.get('formula') or r['id'].startswith('composition-') for r in m.monitor_links())
     # Composition tooltips must never become navigation or mutation targets.
     for x,count in ((20,3),(187,2)):

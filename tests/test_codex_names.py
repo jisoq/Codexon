@@ -77,6 +77,43 @@ def test_unassigned_scratch_folders_use_task_identity_and_agent_names(tmp_path):
         assert first['display_title']=='Lorentz' and second['display_title']=='Codex 작업명'
 
 
+def test_subagent_display_task_survives_index_cache_and_rename(tmp_path):
+    home,path,state=named_home(tmp_path)
+    with sqlite3.connect(home/'state_5.sqlite') as db:
+        for field in ('agent_nickname','agent_path'):
+            db.execute(f'alter table threads add column {field} TEXT')
+        db.execute('update threads set name=NULL,agent_nickname=?,agent_path=?',
+                   ('Hilbert','/root/analyzer_capacity_design'))
+    cache=tmp_path/'index.sqlite'
+    index=UsageIndex([home],cache)
+    try:
+        first=finish(index)['sessions'][0]
+        assert first['title']=='Analyzer capacity design'
+        assert first['agent_nickname']=='Hilbert'
+        before=first['usage_revision']
+    finally:index.close()
+    index=UsageIndex([home],cache)
+    try:
+        assert finish(index)['sessions'][0]['title']==first['title']
+        with sqlite3.connect(home/'state_5.sqlite') as db:
+            db.execute('update threads set agent_path=?',('/root/parent/quota_table_height',))
+        changed=finish(index,10021)['sessions'][0]
+        assert changed['title']=='Quota table height' and changed['usage_revision']>before
+        with sqlite3.connect(home/'state_5.sqlite') as db:
+            db.execute('update threads set name=?',('직접 지정한 이름',))
+        assert finish(index,10032)['sessions'][0]['title']=='직접 지정한 이름'
+    finally:index.close()
+
+
+def test_agent_task_label_falls_back_without_a_valid_task_path(tmp_path):
+    home,path,state=named_home(tmp_path)
+    with sqlite3.connect(home/'state_5.sqlite') as db:
+        names=CodexNames(home,db)
+        for path in (None,'','/root','/root/','/root/bad\nname',42):
+            assert names.resolve(dict(id='child',agent_path=path,agent_nickname='Hilbert'))['display_title']=='Hilbert'
+        assert names.resolve(dict(id='child',agent_path='/root/API_review'))['display_title']=='API review'
+
+
 def test_duplicate_project_names_do_not_merge_or_filter_each_other(tmp_path):
     home,path,state=named_home(tmp_path)
     index=UsageIndex([home],tmp_path/'index.sqlite')

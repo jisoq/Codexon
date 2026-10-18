@@ -122,7 +122,8 @@ class PreparedQuery:
                 if token_value(summary.get('_prepared_token'))!=token:
                     raise StaleGeneration('overlay detail belongs to another displayed generation')
                 with PreparedReader(self.path) as reader,reader.pin(token,cancel=cancellation) as view:
-                    value=hydrate_overlay(view,summary,health=bool(message.get('health')))
+                    value=hydrate_overlay(view,summary,finance=bool(message.get('finance')),
+                                          health=bool(message.get('health')))
                 return dict(kind=kind,id=message['id'],summary=value,prepared_token=tuple_token(token))
             if kind=='record':
                 requested=message.get('prepared_token')
