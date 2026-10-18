@@ -151,7 +151,7 @@ def test_request_statistics_in_current_level_and_filtered_scope(dashboard,unlink
 
 
 def test_overlay_context_clears_blocking_filters_and_back_restores(dashboard):
-    w=dashboard;w.nav.setCurrentRow(1);w.metric_panel.change('period','7d');w.render()
+    w=dashboard;w.nav.setCurrentRow(w.navigation_pages.index(1));w.metric_panel.change('period','7d');w.render()
     before=w.capture_state()
     target=NavigationTarget('fixture','s1',view='calls',call_id='r1-3',section='pricing')
     w.navigate(target);assert w.current_page==2 and w.selected_call=='r1-3'
@@ -186,7 +186,7 @@ def test_preferences_restore_observed_dimensions_before_snapshot(dashboard,tmp_p
     settings=QSettings(str(tmp_path/'restored.ini'),QSettings.IniFormat);settings.setValue('dashboard/state',state)
     second=Dashboard(['fixture'],start_worker=False,settings=settings,static_snapshot=snapshot())
     try:
-        assert second.current_page==3
+        assert second.current_page==6
         second.change_page(2)
         assert second.mode.currentData()=='Standard'
         assert second.model.currentData()=='gpt-6-astra' and second.effort.currentData()=='high'

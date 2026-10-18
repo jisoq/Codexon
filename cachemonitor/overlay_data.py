@@ -12,6 +12,8 @@ from .speed_health import SpeedHealth
 from .analysis_records import public_record
 from .prepared_sums import _Sum
 
+RECENT_CALLS = 20
+
 
 TOKEN_LABELS = {'cached': '캐시 읽기', 'uncached': '일반 입력', 'written': '캐시 쓰기',
                 'reasoning': '추론', 'output': '추론 외', 'input_unknown': '입력 미분류',
@@ -121,6 +123,7 @@ def _cost_view(sections,priced,calls):
 def new_financial_totals():
     """Persist only financial facts, including resumable headline summation."""
     return dict(count=0, cost_sum=(0,0.0,0), priced=0, component_priced=0, assumed=0,
+        speed=dict(output=0,seconds=0.,n=0,N=0),
         token=dict(counts=dict.fromkeys(TOKEN_LABELS,0), known=dict.fromkeys(TOKEN_ORDER,False),
             inp_total=0, out_total=0, partial=False, input_known=False, output_known=False,
             written_known=True, cache_input=0, cache_read=0, cache_valid=0),
@@ -129,6 +132,9 @@ def new_financial_totals():
 
 def add_financial_total(total,row):
     total['count']+=1
+    speed=total['speed'];speed['N']+=1
+    if output_speed(row) is not None:
+        speed['output']+=row['output'];speed['seconds']+=row['completion_latency_ms']/1000;speed['n']+=1
     cost=row.get('cost')
     if finite(cost):
         total['priced']+=1
@@ -190,7 +196,8 @@ def model_breakdown(models):
             token['cache_input'],token['cache_read'],token['cache_valid'],calls,token['written_known'] and bool(calls))
         result.append(dict(model=model,cost=financial_cost(total) if total['priced'] else None,
             calls=calls,priced=total['priced'],assumed=total['assumed'],token_composition=composition,
-            cost_composition=_cost_view(total['costs'],total['component_priced'],calls)))
+            cost_composition=_cost_view(total['costs'],total['component_priced'],calls),
+            output_speed_summary=merge_speeds([total['speed']])))
     return sorted(result,key=lambda value:(-(value['cost'] or 0),value['model']))
 
 
@@ -234,11 +241,12 @@ def merge_model_breakdowns(summaries):
         result.append(dict(model=model,cost=accumulator.value() if priced else None,
             calls=sum(value['calls'] for value in values),priced=priced,
             assumed=sum(value['assumed'] for value in values),
+            output_speed_summary=merge_speeds([value['output_speed_summary'] for value in values]),
             **_merge_financial_compositions(values,[value['token_composition'] for value in values])))
     return sorted(result,key=lambda value:(-(value['cost'] or 0),value['model']))
 
 
-SUBAGENT_CALL_FIELDS=('model','effort','response_model','model_state','model_mismatch')
+SUBAGENT_CALL_FIELDS=('model','effort','response_model','model_state','model_mismatch','latest_ts','output_speed_summary')
 
 
 def _subagent_finance(summaries,cost):
@@ -258,6 +266,17 @@ def _subagent_finance(summaries,cost):
         models=merge_model_breakdowns(summaries),agents=agents)
 
 
+def main_usage(summary):
+    """The selected owner's summary, independent of descendant rollups."""
+    return summary.get('main_usage',summary)
+
+
+def merge_speeds(speeds):
+    output=sum(value['output'] for value in speeds);seconds=sum(value['seconds'] for value in speeds)
+    count=sum(value['n'] for value in speeds);target=sum(value['N'] for value in speeds)
+    return dict(value=output/seconds if seconds else None,output=output,seconds=seconds,n=count,N=target,missing=target-count)
+
+
 def _merge_compositions(summaries,partials):
     financial=_merge_financial_compositions(summaries,partials)
     speeds=[summary['output_speed_summary'] for summary in summaries]
@@ -273,12 +292,12 @@ def _merge_compositions(summaries,partials):
 
 
 def _recent_members(members,updated):
-    # Preserve stable tie ordering while retaining at most twelve candidates.
+    # Preserve stable tie ordering while retaining the bounded Trend window.
     rows=((member,row) for member in members for row in updated[member][1]['recent'])
     def order(item):
         ordinal,(_,row)=item
         return row['ts'],str(row.get('home')),str(row.get('sid')),str(row['id']),ordinal
-    selected=nlargest(12,enumerate(rows),key=order)
+    selected=nlargest(RECENT_CALLS,enumerate(rows),key=order)
     return [dict(row,source_title=updated[member][1]['title'])
             for _,(member,row) in sorted(selected,key=order)]
 
@@ -446,7 +465,7 @@ def summarize_session(session,health=None,*,_partials=None,_facts=None):
     first=max(0,len(rows)-24)
     all_calls=[call_summary(row,ordinal,miss=is_miss(row),
                         degradation=row.get('key') in degradation_keys)
-            for ordinal,row in enumerate(rows[-12:],max(1,len(rows)-11))]
+            for ordinal,row in enumerate(rows[-RECENT_CALLS:],max(1,len(rows)-RECENT_CALLS+1))]
     recent=all_calls
     latest_call=recent[-1] if recent else {}
     lifecycle=session.get('request_state') or {}
@@ -538,6 +557,15 @@ class OverlaySummaries:
                     mean_cost=group['cost']/group['priced'] if group['priced'] else None,
                     coverage_gap=group['gap'],
                     assumed=sum(updated[member][1]['assumed'] for member in group['members']))
+                # Reuse the owner's bounded compositions; never copy calls or
+                # model breakdowns into the main-panel projection.
+                value['main_usage']={field:summary[field] for field in (
+                    'calls','priced','missing','mean_cost','assumed','coverage_gap',
+                    'token_composition','cost_composition','output_speed_summary',
+                    'model','effort','model_state','model_mismatch','response_model')}
+                value['main_usage'].update({field:partials[key][field] for field in (
+                    'maintenance_calls','maintenance_cost','maintenance_missing')})
+                value['main_usage']['cost']=group['own_cost']
                 if include_finance:
                     value.update(subagent_finance=_subagent_finance(own_summaries[1:],group['child_cost']),
                         own_model_breakdown=summary['model_breakdown'],

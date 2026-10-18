@@ -59,8 +59,8 @@ def detect(kind, value, now):
                 '수집기의 실행 상태를 확인하는 중 오류가 발생해 정상 동작 여부를 확인하지 못했습니다.',
                 '기존 기록은 유지되니 수집 상태를 다시 확인해주세요.',
                 '수집 상태 확인','collection')
-        if (not value.get('starting') and value.get('snapshot_at') is not None
-                and now - value['snapshot_at'] > 30):
+        if (not value.get('starting') and (value.get('snapshot_stale') or value.get('snapshot_at') is not None
+                and now - value['snapshot_at'] > 30)):
             return Fault(kind, 'stale', 'warning',
                 '새 수집 결과가 30초 넘게 갱신되지 않아 최신 사용량을 확인할 수 없습니다.',
                 '원인은 아직 확인하지 못했으며, 수집기의 실행 상태를 다시 확인하고 있습니다.',
@@ -184,6 +184,24 @@ def detect(kind, value, now):
 def strongest(faults):
     visible = [fault for fault in faults if fault.tray]
     return next((fault for fault in visible if fault.severity == 'error'), next(iter(visible), None))
+
+
+def collection_phase(evidence, now, *, started_at=None):
+    """Preparation is bounded by real publications, never by repeated pending polls."""
+    facts=evidence.get('collection_fault') or {}
+    if facts.get('expected_stop') or facts.get('disabled'):return 'stopped'
+    fault=detect('collection',{k:v for k,v in facts.items() if k not in ('snapshot_at','snapshot_stale')},now)
+    if fault is not None or evidence.get('usage_errors'):return 'failed'
+    pending=any(facts.get(key) for key in ('starting','status_pending','handoff_pending'))
+    complete=bool(evidence.get('usage_collection_complete',evidence.get('index',{}).get('usage_complete',False)))
+    stamps=[evidence.get('collection_snapshot_at')]
+    # Empty startup snapshots have a synthetic timestamp but no collector identity.
+    if evidence.get('collection') or complete:stamps.append(evidence.get('ts'))
+    stamps=[stamp for stamp in (started_at,*stamps) if isinstance(stamp,(int,float))]
+    if stamps and now-max(stamps)>30:return 'delayed'
+    if (evidence.get('collection_stale') or facts.get('snapshot_stale')) and not (pending and started_at is not None and now-started_at<=30):return 'delayed'
+    if pending or not complete or evidence.get('index',{}).get('loading'):return 'preparing'
+    return 'ready'
 
 
 def exception_facts(error):

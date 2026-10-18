@@ -7,6 +7,39 @@ from cachemonitor.analysis_engine import AnalysisEngine
 from cachemonitor.history_projection import node_key
 
 
+@pytest.mark.integration
+def test_temporary_history_locks_exact_population_and_escape_restores_scope(dashboard):
+    from PySide6.QtCore import QDate
+    from cachemonitor.dashboard import choose
+    from cachemonitor.overlay_navigation import NavigationTarget
+    w=dashboard;w.change_page(2)
+    choose(w.period,'custom');w.date_start.setDate(QDate.currentDate().addDays(1));w.date_end.setDate(QDate.currentDate().addDays(1))
+    choose(w.source,'user');w.filter_changed();w.save_page_scope()
+    ordinary=copy.deepcopy(w.page_scopes[2]);filters=copy.deepcopy(w.page_filters[2])
+    session=w.snapshot['sessions'][0]
+    w.navigate(NavigationTarget(session['home'],session['id'],view='calls'))
+    expected={r['key'] for r in session['history']}
+    assert {r['key'] for r in w.record_rows}==expected
+    assert w.history_locked_banner.isVisible()
+    for node in (w.period,w.date_start,w.date_end,w.home,w.source,w.archive,w.model,w.effort,w.mode):assert not node.isEnabled()
+    assert w.search.isEnabled() and w.sort.isEnabled()
+    assert all(node.isEnabled() for node in w.call_filter_controls.values())
+    locked=copy.deepcopy(w.temporary_context)
+    w.history_unlock.activate()
+    assert w.temporary_context is None and w.record_view=='sessions'
+    assert w.page_scopes[2]==ordinary and w.page_filters[2]==filters
+    assert w.period.currentData()=='custom' and w.source.currentData()=='user'
+    assert w.date_start.text()==ordinary['dates'][0]
+    assert not w.history_locked_banner.isVisible()
+    assert all(node.isEnabled() for node in (w.period,w.date_start,w.home,w.model,w.effort,w.mode))
+    w.go_back()
+    assert w.temporary_context==locked and {r['key'] for r in w.record_rows}==expected
+    assert not w.period.isEnabled()
+    w.go_forward()
+    assert w.temporary_context is None and w.period.isEnabled()
+    assert w.page_scopes[2]==ordinary
+
+
 def test_prepared_filter_choices_preserve_empty_values_and_project_aliases(dashboard,monkeypatch):
     from cachemonitor import dashboard as module
     from cachemonitor.analytics import project_key

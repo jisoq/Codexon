@@ -55,6 +55,9 @@ def test_cycle_overview_uses_page_space_and_reveals_last_row(tmp_path,width,heig
                   current=i==8,partial=False,delta=i+1,cost=i+1,
                   value=None if i==0 else (i+1)*100,calls=1,priced_calls=1)
              for i in range(9)]
+    periods[0].update(cost=None)
+    periods[1].update(cost=0,delta=0)
+    periods[2].update(cost=234.2,delta=13)
     table.set_periods(periods[:3])
     body=Column();body.addWidget(table);body.addStretch()
     scroll=Scroll();scroll.put(fillViewport=True);scroll.setWidget(body)
@@ -65,6 +68,7 @@ def test_cycle_overview_uses_page_space_and_reveals_last_row(tmp_path,width,heig
         render_plot(host,table)
         table.set_periods(periods)
         assert [table.item(i,2).text() for i in range(len(periods))]==[usd(p['value']) for p in periods]
+        assert [table.item(i,1).text() for i in range(3)]==['—/1%p','$0/0%p','$234.2/13%p']
         table_control=render_plot(host,table)
         view=next(item for item in walk(table_control) if item.objectName()=='dataTable')
         # Every row belongs to the page, instead of an eight-row inner viewport.
@@ -139,7 +143,7 @@ def test_selected_cycle_reset_updates_visible_chart(quota_page,tmp_path):
     settings=QSettings(str(tmp_path/'reset.ini'),QSettings.IniFormat)
     for key in ('updates/automatic','overlay/enabled','taskbar/enabled'):settings.setValue(key,False)
     host=Dashboard([home],start_worker=False,settings=settings,index_path=tmp_path/'index.sqlite',quota_path=path,live_limits=False)
-    host.resize(1000,680);host.show();host.start_quota_service(home)
+    host.resize(1000,680);host.show();host.change_page(3);host.start_quota_service(home)
     panel=host.quota_panel
     try:
         wait_until(lambda:'worker_revision' in panel.report and not panel.report.get('history_pending'),app=app)
@@ -443,7 +447,9 @@ def test_cycle_selector_changes_graph_preserves_lifetime_and_selection_on_refres
         assert periods[0]['end']-periods[0]['start']==pytest.approx(60)
         assert panel.cycle_table.item(0,3).text()=='1.0 min'
         for index,period in enumerate(periods):
-            assert panel.cycle_table.item(index,1).text()==f"{period['delta']:g}%p"
+            cost,usage=panel.cycle_table.item(index,1).text().split('/')
+            assert float(cost.removeprefix('$').replace(',',''))==float(usd(period['cost']).removeprefix('$').replace(',',''))
+            assert float(usage.removesuffix('%p'))==period['delta']
             assert panel.cycle_table.item(index,2).text()==usd(period['value'])
         assert panel.legend_toggles['cycle_value'].isVisible()
         assert not panel.legend_toggles['remaining'].isVisible() and not panel.legend_toggles['cycle_cost'].isVisible()
@@ -630,6 +636,7 @@ def test_current_quota_refresh_keeps_history_until_report_or_issue_changes(quota
 @pytest.mark.essential
 def test_monitoring_pause_persists_and_restores_readable_page(quota_page,tmp_path):
     from cachemonitor.dashboard import Dashboard
+    from test_ui import wait_for_rendered
     app,fixture,_=quota_page
     previous=app.property('cachemonitorDisableShellIntegration')
     app.setProperty('cachemonitorDisableShellIntegration',True)
@@ -643,7 +650,9 @@ def test_monitoring_pause_persists_and_restores_readable_page(quota_page,tmp_pat
         window.resize(1120,740);window.show();window.change_page(3)
         window.receive_quota(dict(home='h',quota=fixture.quota,report=fixture.report))
         before=window.quota_sidebar.weekly.text()
-        click(window,control(window,window.quota_pause_button))
+        pause=control(window,window.quota_pause_button)
+        wait_for_rendered(lambda:pause.isVisible() and pause.width()>0 and pause.height()>0)
+        click(window,pause)
         assert settings.value('quota/paused',False,type=bool)
         assert window.quota_pause_badge.isVisible()
         control(window,window.quota_panel.summary)
@@ -661,7 +670,9 @@ def test_monitoring_pause_persists_and_restores_readable_page(quota_page,tmp_pat
         reopened=Dashboard([],start_worker=False,settings=settings)
         reopened.resize(1120,740);reopened.show();reopened.change_page(3)
         assert reopened.quota_paused and reopened.quota_pause_badge.isVisible()
-        click(reopened,control(reopened,reopened.quota_pause_button))
+        resume=control(reopened,reopened.quota_pause_button)
+        wait_for_rendered(lambda:resume.isVisible() and resume.width()>0 and resume.height()>0)
+        click(reopened,resume)
         assert not settings.value('quota/paused',True,type=bool)
         assert not reopened.quota_pause_badge.isVisible()
         control(reopened,reopened.quota_panel.summary)

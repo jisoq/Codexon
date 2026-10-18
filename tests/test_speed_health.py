@@ -355,7 +355,7 @@ def test_main_monitor_keeps_current_speed_health_and_session_navigation():
     from PySide6.QtWidgets import QApplication
     from cachemonitor.overlay_view import OverlayContent
     from cachemonitor.overlay_data import OverlaySummaries
-    from cachemonitor.overlay_monitor import footer
+    from cachemonitor.overlay_monitor import header_status
     app=QApplication.instance() or QApplication([])
     source=session([100]*10+[35]*3)
     engine=AnalysisEngine();engine.ingest([source])
@@ -363,7 +363,7 @@ def test_main_monitor_keeps_current_speed_health_and_session_navigation():
     data['speed_health']=health(source)
     content=OverlayContent();content.monitor_action('tab-latest');content.set_content(data);content.set_layout(detail=True)
     assert content.speed_alert()['recent_speed']==35 and content.speed_alert()['baseline_speed']==100
-    assert footer(content)[1]=='warning'
+    assert header_status(content)[1]=='warning'
     session_link=next(link for link in content.monitor_links() if link['id']=='session')
     assert session_link['target'].sid==source['id'] and session_link['target'].call_id is None
     assert not content.detail_groups() and not content.detailBody.state['accessible']
@@ -372,5 +372,6 @@ def test_main_monitor_keeps_current_speed_health_and_session_navigation():
     assert not content.speed_alert()['active']
     content.set_content(data,note='수집 지연')
     assert not content.speed_alert()
-    assert [r['id'] for r in content.monitor_links() if r.get('target')]==['session','collection']
+    assert [r['id'] for r in content.monitor_links() if r.get('interaction')=='navigate']==['session','collection']
+    assert len([r for r in content.monitor_links() if r.get('interaction')=='select'])==len(content.rows())
     content.deleteLater();app.processEvents()

@@ -1,6 +1,7 @@
 """Display queries keep full-account totals while transferring one table page."""
 from copy import deepcopy
 
+import pytest
 from PySide6.QtCore import QObject, QSettings, Signal
 from PySide6.QtWidgets import QApplication
 
@@ -50,6 +51,50 @@ class QueryWorker(QObject):
     def request(self,kind,**payload):
         self.requests.append(dict(kind=kind,**payload))
         return len(self.requests)
+
+
+@pytest.mark.parametrize('retained',[False,True])
+def test_expired_chart_waits_for_new_report_without_reporting_failure(tmp_path,retained):
+    from cachemonitor.quota_worker import QuotaComputation
+    from cachemonitor.quota_panel import QuotaPanel
+    from test_quota_value_history import sample_report
+    app=QApplication.instance() or QApplication([])
+    engine=QuotaComputation();worker=QueryWorker()
+    panel=QuotaPanel(QSettings(str(tmp_path/'expired-chart.ini'),QSettings.IniFormat))
+    faults=[];panel.fault_changed.connect(faults.append)
+    panel.receive(dict(report={**engine._prepare(sample_report()),'_worker':worker}))
+    panel.cycle_choice.setCurrentIndex(panel.cycle_choice.findData(100))
+    if retained:
+        worker.result.emit(engine.execute(dict(worker.requests[-1],id=1)))
+        panel.receive(dict(report={**engine._prepare(sample_report()),'_worker':worker}))
+    request=worker.requests[-1];rows=panel.history.rows
+    engine._prepare(sample_report())
+    refreshed=engine._prepare(sample_report())
+    expired=engine.execute(dict(request,id=2))
+    assert expired['stale']
+    faults.clear();worker.result.emit(expired)
+    assert not panel.history_empty.isVisible()
+    assert panel.history_loading._state['running']
+    assert panel.history.isVisible() is retained
+    if retained:assert panel.history.rows is rows
+    assert not any(fault.get('calculation_failed') for fault in faults)
+    count=len(worker.requests)
+    panel.render_history()
+    panel.cycle_choice.setCurrentIndex(panel.cycle_choice.findData(250))
+    panel.cycle_choice.setCurrentIndex(panel.cycle_choice.findData(160))
+    panel.cycle_choice.setCurrentIndex(panel.cycle_choice.findData(100))
+    assert len(worker.requests)==count
+    panel.receive(dict(report={**refreshed,'_worker':worker}))
+    worker.result.emit(engine.execute(dict(worker.requests[-1],id=3)))
+    assert panel.cycle_choice.currentData()==100
+    assert panel.history.isVisible() and panel.history.rows[-1]['at']==130
+    assert not panel.history_empty.isVisible() and not panel.history_loading._state['running']
+    panel.cycle_choice.setCurrentIndex(0)
+    worker.result.emit(dict(kind='chart',key=worker.requests[-1]['key'],error='calculation failed'))
+    assert panel.history_empty.isVisible()
+    assert not panel.history_loading._state['running']
+    assert faults[-1]['calculation_failed']
+    app.processEvents()
 
 
 def test_compact_panel_uses_worker_results_and_rejects_stale_filter_response(tmp_path,monkeypatch):

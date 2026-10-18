@@ -51,6 +51,7 @@ Item {
         case "progress": return loadingProgressComponent
         case "statusIcon": return statusIconComponent
         case "button": return s.metricReset ? metricResetComponent : buttonComponent
+        case "homeLink": return homeLinkComponent
         case "toggle": return toggleComponent
         case "switch": return switchComponent
         case "choice": return choiceComponent
@@ -86,6 +87,51 @@ Item {
         }
     }
     Component { id: usageDashboardComponent; UsageDashboard { node: view.node } }
+    Component {
+        id: homeLinkComponent
+        Button {
+            id: homeLink
+            hoverEnabled: true
+            implicitWidth: 420
+            implicitHeight: Math.max(84, homeLinkContent.implicitHeight + 26)
+            padding: 13
+            Accessible.name: view.s.text
+            Accessible.description: appLanguage.text(view.s.description || "")
+            onClicked: view.node.activate()
+            HoverHandler { cursorShape: Qt.PointingHandCursor }
+            background: Rectangle {
+                color: homeLink.down || homeLink.hovered ? appTheme.palette.secondary : "transparent"
+                radius: 5
+                border.color: homeLink.activeFocus ? appTheme.palette.accent : "transparent"
+                border.width: homeLink.activeFocus ? 2 : 0
+                Rectangle { anchors.left: parent.left; anchors.right: parent.right; anchors.bottom: parent.bottom; height: 1; color: appTheme.palette.border }
+            }
+            contentItem: GridLayout {
+                id: homeLinkContent
+                columns: homeLink.width < 570 ? 2 : 3
+                columnSpacing: 16; rowSpacing: 6
+                Text {
+                    text: view.s.text; color: appTheme.palette.ink
+                    font.family: appTheme.family; font.pixelSize: 15; font.bold: true
+                    Layout.preferredWidth: homeLink.width < 570 ? -1 : 155
+                    Layout.fillWidth: homeLink.width < 570
+                    wrapMode: Text.Wrap
+                }
+                Text {
+                    text: appLanguage.text(view.s.description || ""); color: appTheme.palette.muted
+                    font.family: appTheme.family; font.pixelSize: 13
+                    wrapMode: Text.Wrap; Layout.fillWidth: true
+                    Layout.row: homeLink.width < 570 ? 1 : 0
+                    Layout.column: homeLink.width < 570 ? 0 : 1
+                }
+                UiIcon {
+                    name: "right"; ink: appTheme.palette.accent; width: 20; height: 20
+                    Layout.row: 0; Layout.column: homeLink.width < 570 ? 1 : 2
+                    Layout.rowSpan: homeLink.width < 570 ? 2 : 1
+                }
+            }
+        }
+    }
     Component { id: spacerComponent; Item {} }
     Component { id: historyFiltersComponent; HistoryFilters { node: view.node } }
     Component { id: historyWorkspaceComponent; HistoryWorkspace { node: view.node } }

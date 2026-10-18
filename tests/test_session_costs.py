@@ -180,7 +180,7 @@ def test_overlay_rollups_keep_weighted_populations_and_bounded_recent_context():
             assert actual['share']==pytest.approx(wanted['share'])
     assert result['maintenance_calls']==11 and result['maintenance_missing']==0
     assert result['maintenance_cost']==pytest.approx(1.2)
-    assert len(result['recent'])==12 and result['recent'][-1]['sid']=='child'
+    assert len(result['recent'])==20 and result['recent'][-1]['sid']=='child'
     assert result['recent'][-1]['source_title']==child['title']
 
 
@@ -208,6 +208,8 @@ def test_subagent_finance_counts_nested_owners_once_and_tracks_reparenting():
     assert set(agents)=={'child','grandchild','empty'}
     assert agents['child']['cost']==2 and agents['grandchild']['cost']==.5
     assert agents['empty']['cost']==0 and agents['empty']['calls']==0
+    assert agents['child']['latest_ts']==101 and first['child']['latest_ts']==103
+    assert agents['grandchild']['latest_ts']==103 and agents['empty']['latest_ts'] is None
     assert (agents['child']['model'],agents['child']['effort'],agents['child']['model_state'])==('gpt-6.1-sol','xhigh','일치')
     assert agents['grandchild']['model']=='gpt-6-sol' and agents['grandchild']['model_state']=='미확인'
     descendants=sources[1]['history']+sources[2]['history']
@@ -228,6 +230,52 @@ def test_subagent_finance_counts_nested_owners_once_and_tracks_reparenting():
     assert 'subagent_finance' not in second['child']
     assert second['other']['subagent_finance']['missing']==1
     assert finance['cost']==2.5
+
+
+def test_subagent_model_speeds_merge_measured_output_and_time():
+    from cachemonitor.analysis_engine import AnalysisEngine
+    from test_overlay_call_data import row,session
+    parent=session([row(0,model='gpt-6-astra',effort='high')],id='parent')
+    child=session([row(1,model='gpt-6-sol',effort='low',output=100,reasoning=0,
+        response_status='completed',completion_latency_ms=1000)],id='child',parent_thread_id='parent')
+    other=session([row(2,model='gpt-6-sol',output=300,reasoning=0,
+        response_status='completed',completion_latency_ms=6000),
+        row(3,model='gpt-6-sol',output=500,reasoning=0)],id='other',parent_thread_id='parent')
+    engine=AnalysisEngine();engine.ingest([parent,child,other])
+    result=next(v for v in OverlaySummaries().collect(engine) if v['id']=='parent')
+    assert result['main_usage']['model']=='gpt-6-astra' and result['main_usage']['effort']=='high'
+    agents={v['id']:v for v in result['subagent_finance']['agents']}
+    assert agents['child']['output_speed_summary']['value']==100
+    speed=result['subagent_finance']['models'][0]['output_speed_summary']
+    assert speed==pytest.approx(dict(value=400/7,output=400,seconds=7,n=2,N=3,missing=1))
+
+
+@pytest.mark.parametrize('empty_main',[False,True])
+def test_main_overlay_usage_excludes_nested_agents_and_keeps_sub_details(empty_main):
+    from cachemonitor.overlay_data import main_usage
+    from test_overlay_call_data import row,session
+    parent=session([] if empty_main else [row(0,cost=2,input=2000,cached=1500,
+        output=200,response_status='completed',timing_valid=True,completion_latency_ms=1000)],id='parent')
+    child=session([row(1,cost=7,input=9000,cached=1000,output=900,
+        response_status='completed',timing_valid=True,completion_latency_ms=1000)],id='child',parent_thread_id='parent')
+    grandchild=session([row(2,cost=None,input=3000,cached=None)],id='grandchild',parent_thread_id='child')
+    engine=AnalysisEngine();engine.ingest([parent,child,grandchild])
+    presenter=OverlaySummaries();result=next(v for v in presenter.collect(engine) if v['id']=='parent')
+    own_engine=AnalysisEngine();own_engine.ingest([parent])
+    expected=OverlaySummaries().collect(own_engine)[0]
+    own=main_usage(result)
+    for field in ('calls','priced','missing','token_composition','cost_composition','output_speed_summary'):
+        assert own[field]==expected[field]
+    assert own['cost']==(0 if empty_main else expected['cost'])
+    assert own['output_speed_summary']['value']==(None if empty_main else 200)
+    assert result['cost']==own['cost']+result['subagent_finance']['cost']
+    assert result['subagent_finance']['calls']==2 and result['subagent_finance']['missing']==1
+    assert own['missing']==0 and not own['token_composition']['cache_hit_partial']
+    child['history'].append(row(3,cost=11,input=50000,cached=0))
+    engine.ingest([parent,child,grandchild])
+    updated=next(v for v in presenter.collect(engine) if v['id']=='parent')
+    assert main_usage(updated)==own
+    assert updated['subagent_finance']['cost']>result['subagent_finance']['cost']
 
 
 def test_real_session_table_shows_parent_without_own_calls_and_click_keeps_breakdown(tmp_path):

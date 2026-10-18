@@ -72,6 +72,18 @@ def quota_display(quota,mode,now):
             'remaining':remaining,'state':'확인'}
 
 
+def quota_payload_display(payload,mode,now):
+    """Apply the same lookup failure precedence to every allowance summary."""
+    payload=payload or {};display=quota_display(payload.get('quota'),mode,now)
+    facts=(payload.get('quota_faults') or {}).get('lookup') or {}
+    if facts.get('lookup_failed'):
+        from .app_errors import detect
+        fault=detect('quota',facts,now)
+        note=fault.explanation+'\n'+fault.guidance if fault else ''
+        return {**display,'text':'?','remaining':None,'state':'최신 잔여량 미확인','tooltip':note}
+    return display
+
+
 def select_current_quota(direct,local,now,baseline_after=None):
     """Direct 90s / local 120s freshness, independent of observation ordering."""
     for candidate,age in ((direct,90),(local,120)):

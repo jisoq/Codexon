@@ -230,10 +230,18 @@ def edge_anchor_from_legacy(frame, dpi, width, height, anchor, margin=16):
                  for space,size,value in zip(room,sizes,anchor))
 
 
-def extend_monitor_left(frame, dpi, monitor, detail_width, *, margin=16):
+def reserve_detail_space(frame, dpi, monitor, detail_width, *, margin=16):
+    """Shift only far enough to fit an opened right-side detail panel."""
+    if monitor is None:return None
+    x,y,w,h=monitor;gap=round(margin*dpi/96);extra=round(detail_width*dpi/96)
+    if w+extra>frame[2]-frame[0]-2*gap:return monitor
+    return min(x,frame[2]-gap-w-extra),y,w,h
+
+
+def extend_monitor_right(frame, dpi, monitor, detail_width, *, margin=16):
     """Return a side extension only when the existing monitor anchor permits it."""
     x, y, w, h = monitor
     extra = round(detail_width * dpi / 96)
-    if x-extra < frame[0]+round(margin*dpi/96):
+    if x+w+extra > frame[2]-round(margin*dpi/96):
         return None
-    return x-extra, y, w+extra, h
+    return x, y, w+extra, h

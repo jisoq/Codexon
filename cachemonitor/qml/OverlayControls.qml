@@ -84,7 +84,7 @@ Rectangle {
         background: Rectangle {
             radius: 6 * root.s.scale
             color: button.selected ? root.s.accent : root.s.ink
-            opacity: !button.enabled ? 0 : button.down ? 0.10 : button.hovered || button.selected ? 0.06 : 0
+            opacity: !button.enabled ? 0 : button.down ? 0.18 : button.hovered ? (button.selected ? 0.14 : 0.10) : button.selected ? 0.06 : 0
             Behavior on opacity { NumberAnimation { duration: root.s.reducedMotion ? 0 : 100 } }
         }
         Rectangle {
@@ -101,8 +101,8 @@ Rectangle {
                 c.scale(root.s.scale * 12 / 14, root.s.scale * 12 / 14);
                 if (button.glyph === "detail") {
                     c.strokeRect(1, 1, 12, 12);
-                    c.beginPath(); c.moveTo(5, 1); c.lineTo(5, 13); c.stroke();
-                    if (button.selected) { c.globalAlpha = 0.35; c.fillRect(1, 1, 4, 12); }
+                    c.beginPath(); c.moveTo(9, 1); c.lineTo(9, 13); c.stroke();
+                    if (button.selected) { c.globalAlpha = 0.35; c.fillRect(9, 1, 4, 12); }
                 } else if (button.glyph === "opacity") {
                     c.beginPath(); c.arc(7, 7, 5.5, 0, Math.PI * 2); c.stroke();
                     c.beginPath(); c.arc(7, 7, 5.5, Math.PI / 2, Math.PI * 1.5); c.closePath(); c.fill();

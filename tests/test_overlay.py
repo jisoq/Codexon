@@ -319,6 +319,38 @@ def test_missing_session_retains_service_error_and_clears_on_recovery():
     assert OverlayController.content(controller)[1].startswith('원격 작업')
 
 
+@pytest.mark.parametrize('pending',['starting','status_pending','handoff_pending'])
+def test_preparing_collector_is_not_an_error_and_does_not_mask_failure(pending):
+    from types import SimpleNamespace
+    import time
+    controller=SimpleNamespace(target_state={'selection':SimpleNamespace(thread_id=A,host='local')},
+        session_lookup={},collection_issue='수집기 실행 정보 확인 대기',collection_fault={pending:True},
+        errors=[],loading=True,snapshot_at=time.monotonic(),refresh=lambda:None)
+    assert OverlayController.content(controller)==(None,'기록 준비 중')
+    for failure in ('start_failed','runtime_failed','read_failed','save_failed','status_failed'):
+        controller.collection_fault={pending:True,failure:True}
+        assert OverlayController.content(controller)==(None,'수집 오류')
+    controller.collection_fault={pending:True};controller.errors=['source read failed']
+    assert OverlayController.content(controller)==(None,'수집 오류')
+
+
+def test_preparation_keeps_confirmed_detail_while_replacement_is_loading(overlay_cache_controller):
+    from cachemonitor.overlay_view import OverlayContent
+    controller,requested=overlay_cache_controller
+    old=overlay_summary(A);old.update(calls=2,collection_complete=True)
+    overlay_select(controller,{A:old},A)
+    controller.receive_overlay_detail(overlay_reply(requested[-1],calls=2,collection_complete=True))
+    current=overlay_summary(A,generation=2,revision=2)
+    current.update(calls=3,collection_complete=False)
+    controller.session_lookup={A:[current]};controller.loading=True
+    controller.target_state={'selection':Selection(A)}
+    controller.collection_fault={'status_pending':True};controller.collection_issue='실행 정보 확인 대기'
+    data,note=controller.content()
+    model=OverlayContent();model.set_content(data,note)
+    assert model.data['calls']==2 and model.data['cost']==old['cost']
+    assert not model.notice_card() and model.checking_records
+
+
 @pytest.mark.parametrize('version', ['26.915.100.0', '26.917.6896.0', '26.918.1.0', '27.0.0.0'])
 @pytest.mark.parametrize('prefix,namespace', [('/local/', ''), ('/c/', ''), ('/c/local-chatgpt%3A', 'local-chatgpt:')])
 def test_new_desktop_releases_require_live_route_evidence(tmp_path, version, monkeypatch, prefix, namespace):

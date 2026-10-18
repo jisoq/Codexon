@@ -294,13 +294,17 @@ class AppServices:
             with ProcessLock(channel.companion('.collector-update.lock')):
                 snapshot = channel.read_header()
                 identity_snapshot = snapshot
+                marker=read_json(channel.companion('.collector-error.json'))
+                marker_facts=(marker['facts'] if marker.get('scope')==sha256(channel.scope.encode('utf-8')).hexdigest()
+                    and isinstance(marker.get('at'),(int,float)) and marker['at']>(snapshot or {}).get('ts',0)
+                    and isinstance(marker.get('facts'),dict) else {})
                 published = False
                 if self.collector_pending:
                     previous, requested = self.collector_pending
                     current = (snapshot or {}).get('collection', {}).get('instance')
                     if not current or current == previous:
                         if self.clock() - requested < 30:
-                            self.collection_fault=dict(starting=True)
+                            self.collection_fault=dict(starting=True)|marker_facts
                             return '수집 시작 중'
                         # Continue the normal liveness checks after the grace
                         # period, but never inspect the previous owner's PID.
@@ -325,11 +329,7 @@ class AppServices:
                     grace=self.collector_pending and self.clock()-self.collector_pending[1]<30
                     self.collection_fault=dict(runtime_failed=True,
                         retry_exhausted=self.retries.get('collection',{}).get('count',0)>=3 and not grace)
-                marker=read_json(channel.companion('.collector-error.json'))
-                if (marker.get('scope')==sha256(channel.scope.encode('utf-8')).hexdigest()
-                    and isinstance(marker.get('at'),(int,float)) and marker['at']>(snapshot or {}).get('ts',0)
-                    and isinstance(marker.get('facts'),dict) and marker['facts']):
-                    self.collection_fault.update(marker['facts'])
+                self.collection_fault.update(marker_facts)
                 if stopped.get('scope')==channel.scope and stopped.get('stopped'):
                     self.collection_fault=dict(expected_stop=True)
                 if self.collector_pending:self.collection_fault['handoff_pending']=True

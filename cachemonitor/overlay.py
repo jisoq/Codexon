@@ -67,8 +67,7 @@ class OverlayController(QObject):
         self._pending_overlay_navigation=None
         self.widget = SessionOverlay()
         content=self.widget.content_model;content.settings=settings
-        content.monitor_tab=settings.value('overlay/monitorTab','history')
-        if content.monitor_tab not in ('history','latest'):content.monitor_tab='history'
+        content.monitor_tab='history'
         content.composition_unit=settings.value('overlay/compositionUnit','usd')
         if content.composition_unit not in ('tokens','usd'):content.composition_unit='usd'
         from .overlay_shadow import OverlayShadow
@@ -137,6 +136,8 @@ class OverlayController(QObject):
         self.target_state = {}
         self.observed_at = self.snapshot_at = 0
         self.snapshot_wall_time = None
+        self.collection_started_at=time.time()
+        self.collection_evidence={}
         self.sessions = []
         self.session_lookup = {}
         self.loading = True
@@ -172,6 +173,8 @@ class OverlayController(QObject):
         self.input_timer=QTimer(self.widget)
         self.input_timer.timeout.connect(self.poll_popup)
         self._pointer_down=False
+        from .overlay_chrome import OverlayWindowStack
+        self.window_stack=OverlayWindowStack(self)
         if self.native and self.enabled: self.timer.start(1000)
 
     def pin_call(self,value):
@@ -276,7 +279,7 @@ class OverlayController(QObject):
             # Publish a complete replacement only after its calls arrive. Mixing
             # new totals with old rows, or clearing the panel while querying,
             # presents an inconsistent frame and drops the user's selection.
-            collection=dict(data.get('_collection',{}),
+            collection=dict(data.get('_collection',{}),retained=True,
                             last_confirmed_at=retained.get('_collection',{}).get('last_confirmed_at'))
             return dict(retained,_collection=collection),True
         return None,True
@@ -577,12 +580,14 @@ class OverlayController(QObject):
         if (getattr(self,'_placement_context',None)!=(frame,dpi) or not self.enabled
                 or not self.drag_valid()
                 or self.height_animation.state()==QVariantAnimation.Running):return False
-        from .overlay_tracking import anchored_monitor_geometry,extend_monitor_left
+        from .overlay_tracking import anchored_monitor_geometry,extend_monitor_right,reserve_detail_space
         old=self.current_geometry if self.automatic_mode=='icon' else self.monitor_geometry
         box=anchored_monitor_geometry(frame,dpi,old[2]*96/dpi,old[3]*96/dpi,anchor=self.anchor)
         if box is None:return False
         if self.expanded and self.widget.content_model.has_subagents() and self.automatic_mode!='icon':
-            inline=extend_monitor_left(frame,dpi,box,240*self.appearance.scale) is None
+            box=reserve_detail_space(frame,dpi,box,240*self.appearance.scale)
+        if self.expanded and self.widget.content_model.has_subagents() and self.automatic_mode!='icon':
+            inline=extend_monitor_right(frame,dpi,box,240*self.appearance.scale) is None
             if inline!=(self.automatic_mode=='detail-inline'):return False
         dx,dy=box[0]-old[0],box[1]-old[1]
         if not dx and not dy:return True
@@ -669,6 +674,7 @@ class OverlayController(QObject):
             if (target.home,target.sid) not in owners:self._pending_overlay_navigation=None
         self._overlay_restart_pending=False
         self.snapshot_at = time.monotonic()
+        self.collection_evidence={key:snapshot[key] for key in ('ts','collection','usage_collection_complete','index','usage_errors','collection_stale') if key in snapshot}
         self.loading = snapshot.get('index', {}).get('loading', False)
         self.errors = snapshot.get('errors', [])
         self.collection_stale = bool(snapshot.get('collection_stale'))
@@ -678,6 +684,7 @@ class OverlayController(QObject):
 
     def receive_collection_status(self, result):
         if isinstance(result.get('collection_fault'),dict):self.collection_fault=dict(result['collection_fault'])
+        if 'collection_snapshot_at' in result:self.collection_published_at=result['collection_snapshot_at']
         if 'collection_issue' not in result:return
         self.collection_issue = result['collection_issue']
         self.refresh()
@@ -691,15 +698,23 @@ class OverlayController(QObject):
             return None, '원격 작업: 로컬 기록 없음'
         matches = self.session_lookup.get(selection.thread_id,[])
         issue = self.collection_issue
+        from .app_errors import collection_phase
+        facts=getattr(self,'collection_fault',{})
+        phase=collection_phase({**getattr(self,'collection_evidence',{}),'collection_fault':facts,
+            'collection_snapshot_at':getattr(self,'collection_published_at',None)},time.time(),
+            started_at=getattr(self,'collection_started_at',None))
+        pending=any(facts.get(key) for key in ('starting','status_pending','handoff_pending')) or issue=='수집 시작 중'
+        preparing=pending and phase=='preparing'
+        service_error=phase=='failed' or bool(issue and not pending and issue!='수집 결과 갱신 지연')
         if not issue and not self.errors and getattr(self,'collection_stale',False):
             issue='수집 결과 갱신 지연'
-        received_age=max(0,time.monotonic()-self.snapshot_at)
+        received_age=max(0,time.monotonic()-self.snapshot_at) if self.snapshot_at else 0
         delayed=received_age>ANALYSIS_DELAY_SECONDS
-        reason=('service_delay' if issue=='수집 결과 갱신 지연' else 'service_error' if issue else
-                'source_error' if self.errors else 'analysis_delay' if delayed else '')
-        note = ('수집 시작 중' if issue == '수집 시작 중' else
-                '수집 지연' if issue == '수집 결과 갱신 지연' else
-                '수집 오류' if issue or self.errors else
+        reason=('service_error' if service_error else 'source_error' if self.errors else
+                'service_preparing' if preparing else 'service_delay' if issue=='수집 결과 갱신 지연' or phase=='delayed' else
+                'analysis_delay' if delayed else '')
+        note = ('수집 오류' if service_error or self.errors else '기록 준비 중' if preparing else
+                '수집 지연' if issue == '수집 결과 갱신 지연' or phase=='delayed' else
                 '수집 지연' if delayed else '')
         if len(matches) != 1:
             return None, note or ('기록 확인 중' if self.loading else '호출 기록 없음' if not matches else '현재 세션 식별 불가')
@@ -707,7 +722,7 @@ class OverlayController(QObject):
         note = note or ('기록 확인 중' if loading else '')
         data={**matches[0], '_collection': {
             'last_confirmed_at': self.snapshot_wall_time,
-            'errors': [*self.errors, *([issue] if issue else [])], 'loading': loading,
+            'errors': [*self.errors, *([issue] if service_error and issue else [])], 'loading': loading,
             'delayed': delayed, 'reason':reason,'received_age':received_age,
             'service_issue':issue,'service_fault':{**getattr(self,'collection_fault',{}),
                 **({'snapshot_stale':True} if getattr(self,'collection_stale',False) else {})},
@@ -867,7 +882,7 @@ class OverlayController(QObject):
         if not self.drag_context:
             self.widget.set_content(data, note, appearance=self.appearance)
             self._content_time_state=self._content_time()
-        from .overlay_tracking import anchored_monitor_geometry, extend_monitor_left
+        from .overlay_tracking import anchored_monitor_geometry, extend_monitor_right, reserve_detail_space
         content=self.widget.content_model
         scale=self.appearance.scale
         monitor_width=WIDTH*scale
@@ -879,8 +894,9 @@ class OverlayController(QObject):
             self.settings.setValue('overlay/anchorMode','edge');self._legacy_anchor=False
         full_height=content.monitor_height(reduced=False)
         def monitor_box(width,height):
-            return anchored_monitor_geometry(frame,dpi,width,height,reference_width=monitor_width,
+            box=anchored_monitor_geometry(frame,dpi,width,height,reference_width=monitor_width,
                        reference_height=560*scale,position=self.position,anchor=self.anchor)
+            return reserve_detail_space(frame,dpi,box,240*scale) if self.expanded and not self.collapsed and content.has_subagents() and width==monitor_width else box
         monitor=monitor_box(monitor_width,full_height)
         reduced=False
         if monitor is None:
@@ -907,12 +923,11 @@ class OverlayController(QObject):
             mode='icon'
             geometry=monitor_box(32*scale,32*scale)
         elif self.expanded and content.has_subagents():
-            side=extend_monitor_left(frame,dpi,monitor,240*scale)
+            side=extend_monitor_right(frame,dpi,monitor,240*scale)
             inline=side is None
             geometry=side or monitor
             mode='detail-inline' if inline else 'detail'
         content.set_layout(reduced=reduced,detail=mode in ('detail','detail-inline'),inline=inline)
-        previous_mode=self.automatic_mode
         self.automatic_mode=mode
         self.widget.resize(self.widget.panel_width(),self.widget.panel_height())
         if geometry is None:
@@ -966,18 +981,20 @@ class OverlayController(QObject):
                 if not self._place(int(control.winId()),placed):control.hide()
                 return placed
             if mode in ('detail','detail-inline'):
-                place(self.detail,(0,0,WIDTH if inline else 240,geometry[3]/native_scale))
+                place(self.detail,(0 if inline else WIDTH,0,WIDTH if inline else 240,geometry[3]/native_scale))
             else:self.detail.hide()
-            if not inline and self.links.sync():place(self.links,(0,0,WIDTH,geometry[3]/native_scale),monitor)
+            if self.links.sync():place(self.links,(0,0,WIDTH+content.detail_extent,geometry[3]/native_scale),monitor)
             else:self.links.hide()
-            if inline:place(self.header,(150,12,INLINE_HEADER_WIDTH,32),monitor)
-            else:place(self.header,(HEADER_X,12,HEADER_WIDTH,32),monitor)
-            self.actions_geometry=place(self.actions,(ACTIONS_X,13,78,30),monitor)
+            extent=0 if inline else content.detail_extent
+            from .overlay_monitor import header_layout,header_status
+            header_width=header_layout(content)['title_width']+8 if header_status(content)[0] else HEADER_WIDTH+extent
+            place(self.header,(HEADER_X,12,header_width,32),monitor)
+            self.actions_geometry=place(self.actions,(ACTIONS_X+extent,13,78,30),monitor)
             if self.popup_open:
                 # Align below the header. The monitor already guarantees enough
                 # interior width; clamping also handles rounded native pixels.
                 popup_w,popup_h=round(160*native_scale),round(40*native_scale)
-                px=monitor[0]+round(POPUP_X*native_scale)
+                px=monitor[0]+round((POPUP_X+extent)*native_scale)
                 py=monitor[1]+round(44*native_scale)
                 gap=round(16*dpi/96)
                 px=min(frame[2]-gap-popup_w,max(frame[0]+gap,px))
@@ -988,9 +1005,7 @@ class OverlayController(QObject):
                 self.configure_scene(self.toolbar)
                 if not self._place(int(self.toolbar.winId()),self.popup_geometry):self.close_popup()
             else:self.toolbar.hide()
-            if mode!=previous_mode and hasattr(self.native,'raise_companion'):
-                for control in (self.header,self.actions,self.toolbar):
-                    if control.isVisible():self.native.raise_companion(int(control.winId()))
+            self.window_stack.sync()
         if self.drag_context:
             # Rebase after resize/DPI/inline transitions, including screenChanged
             # refreshes arriving between pointer events.
@@ -1000,6 +1015,7 @@ class OverlayController(QObject):
     def stop(self):
         if self.stopped: return
         self.stopped = True
+        self.window_stack.close()
         self.height_animation.stop()
         self.view_animation.stop()
         self.timer.stop(); self.input_timer.stop(); self.hide_all()

@@ -372,9 +372,9 @@ def test_prepared_subagent_finance_matches_full_and_moves_with_lineage():
     from test_data_contract import source
 
     sources={name:source() for name in ('parent','child','grandchild','other')}
-    for name,value in sources.items():
+    for index,(name,value) in enumerate(sources.items()):
         value.update(id=name,title=name)
-        value['history'][0].update(key=name,call_id=name)
+        value['history'][0].update(key=name,call_id=name,ts=100+index)
     sources['child']['parent_thread_id']='parent'
     sources['grandchild'].update(parent_thread_id='child',coverage_gaps=[{'start':1}])
     sources['grandchild']['history'][0]['written']=None
@@ -397,12 +397,14 @@ def test_prepared_subagent_finance_matches_full_and_moves_with_lineage():
         actual={value['id']:hydrate_overlay(view,dict(value,_recent_refs=False),finance=True) for value in compact}
         for name in sources:
             assert actual[name].get('subagent_finance')==expected[name].get('subagent_finance')
+            assert actual[name].get('main_usage')==expected[name].get('main_usage')
         return actual
     first=collect(None)
     finance=first['parent']['subagent_finance']
     assert finance['calls']==2 and finance['priced']==1 and finance['missing']==1
     assert finance['coverage_gap'] and len(finance['models'])==1
     assert {value['id'] for value in finance['agents']}=={'child','grandchild'}
+    assert {value['id']:value['latest_ts'] for value in finance['agents']}=={'child':101,'grandchild':102}
     view.publication_token.generation=2
     sources['child']['history'][0]['output']+=1;replace_owner('child')
     updated=collect({('home','child')})
@@ -505,7 +507,7 @@ def test_ready_store_publishes_without_eager_descendant_finance_within_budget(tm
             recent = hydrate_overlay(view, selected)
             assert 'subagent_finance' not in recent and loaded == []
             assert [value['id'] for value in recent['recent']] == [value['id'] for value in expected['recent']]
-            assert len(requested) == 12
+            assert len(requested) == 20
             requested.clear()
             # Opening detail adds descendant finances without rereading graph rows.
             actual = hydrate_overlay(view, recent, finance=True)

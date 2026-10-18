@@ -183,8 +183,18 @@ class WindowsOverlay:
         return bool(self.u.EndDeferWindowPos(batch))
 
     def raise_companion(self, hwnd):
-        # Used once when a newly shown inline detail pane changes the stack.
+        # Establish order once after changing a native owner relationship.
         return bool(self.u.SetWindowPos(hwnd,W.HWND(-1),0,0,0,0,0x0001|0x0002|0x0010))
+
+    def owner(self, hwnd):
+        return self.u.GetWindowLongPtrW(hwnd, -8) if self.u.IsWindow(hwnd) else None
+
+    def set_owner(self, hwnd, owner):
+        # GWLP_HWNDPARENT sets ownership for top-level windows, not parenting.
+        # Windows then preserves their order even when an owner is activated.
+        if not self.u.IsWindow(hwnd):return False
+        if self.owner(hwnd)!=owner:self.u.SetWindowLongPtrW(hwnd,-8,owner)
+        return self.owner(hwnd)==owner
 
     def cursor(self):
         point=W.POINT()

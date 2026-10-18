@@ -63,6 +63,23 @@ def test_pending_cancelled_old_and_unknown_facts_do_not_create_errors():
     assert detect('update',dict(phase='needs_exit'),100) is None
     assert detect('update',dict(phase='failed',cancel_requested=True),100) is None
     assert detect('update',dict(phase='partial',app=dict(state='verified'),proxy=dict(phase='waiting')),100) is None
+
+
+def test_preparation_expires_without_real_publications_and_never_hides_faults():
+    from cachemonitor.app_errors import collection_phase
+    evidence=dict(ts=120,usage_collection_complete=False,index=dict(loading=True),
+                  collection_fault=dict(status_pending=True))
+    assert collection_phase(evidence,120,started_at=100)=='preparing'
+    evidence['ts']=140
+    assert collection_phase(evidence,140,started_at=100)=='delayed'
+    evidence['collection']={'instance':'new'}
+    assert collection_phase(evidence,140,started_at=100)=='preparing'
+    for failure in ('start_failed','runtime_failed','read_failed','save_failed','status_failed'):
+        evidence['collection_fault']={'status_pending':True,failure:True}
+        assert collection_phase(evidence,140,started_at=100)=='failed'
+    evidence['collection_fault']={};evidence['usage_collection_complete']=True;evidence['index']['loading']=False
+    assert collection_phase(evidence,140,started_at=100)=='ready'
+    assert collection_phase(evidence,171,started_at=100)=='delayed'
     query=detect('analysis',dict(query_failed=True,request_id=2,current_request_id=2),100)
     assert strongest([query]) is None
 

@@ -128,7 +128,7 @@ def hydrate_overlay(snapshot, summary, *, finance=False, health=False):
     if summary.get('_recent_refs'):
         refs = summary['recent']
         if len(refs) > MAX_RECENT:
-            raise CapacityExceeded('select the twelve recent references before hydration')
+            raise CapacityExceeded('select the twenty recent references before hydration')
         groups = {}
         for ref in refs:
             groups.setdefault((ref['home'], ref['sid']), []).append(ref)

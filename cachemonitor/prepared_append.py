@@ -14,7 +14,7 @@ from .analysis_records import compact_record
 from .analytics import finite, observation_flags, output_speed, prepare_row, effort_key
 from .cache_health import CacheHealth, segment
 from .core import token_number
-from .overlay_data import (_cost_view,
+from .overlay_data import (RECENT_CALLS, _cost_view,
                            _token_view, assumed_cost, call_summary,
                            _summary_view, _request_view, add_model_total, model_breakdown,
                            new_financial_totals, add_financial_total, financial_cost)
@@ -696,10 +696,10 @@ def prepare(snapshot,owner,transition,dependencies,*,mode_evidence=None,enrich=N
     header_count,last_order=_finish_headers(snapshot,owner,checkpoint,headers,before,boundaries,rows)
     packet=snapshot.derived(*owner,'summary')
     refs=recent_references(packet)
-    recent_keys=[ref['key'] for ref in refs][-max(0,12-len(rows)):] if len(rows)<12 else []
+    recent_keys=[ref['key'] for ref in refs][-max(0,RECENT_CALLS-len(rows)):] if len(rows)<RECENT_CALLS else []
     found={row['key']:compact_record(row) for row in _pages(snapshot.records,owner,recent_keys)} if recent_keys else {}
     _require(len(found)==len(recent_keys),'recent call references are incomplete')
-    recent=[found[key] for key in recent_keys]+rows[-12:]
+    recent=[found[key] for key in recent_keys]+rows[-RECENT_CALLS:]
     for row in recent:
         if row.get('turn') in states:row['state']=states[row['turn']]
         if row['key'] in health.annotations:row.update(cache_incident_id=health.annotations[row['key']],cache_degradation=True)

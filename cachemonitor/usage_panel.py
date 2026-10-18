@@ -60,29 +60,65 @@ class UsagePanel(Node):
         super().__init__();self.dashboard=dashboard;self.data={};self.row_model=UsageRows(self)
         self.options=dict(period='all',start='',end='',filters={},archived=True,dimension='project',metric='calls',
                           mode='amount',search='',sort='desc',selected=[],views={},filtersOpen=False,breakdowns=[])
+        self.date_draft={key:self.options[key] for key in ('period','start','end')}
         self.search_timer=QTimer(self);self.search_timer.setSingleShot(True);self.search_timer.setInterval(160)
         self.search_timer.timeout.connect(self.refresh)
         shared_theme().changed.connect(self.restyle)
         self.put(options=deepcopy(self.options),
             dimensions=[dict(text=tr(t),value=v) for t,v in DIMENSIONS],metrics=[dict(text=tr(t),value=v) for t,v in METRICS],
             legend=[],detail=[],scope=tr('전체 기록'),countLabel='',title='',maximum=1,tpsTip='',metricLabel='')
+        self.publish_dates()
 
     @Property(QObject,constant=True)
     def rowModel(self):return self.row_model
 
     def restyle(self):
+        self.publish_dates()
         if self.data:self.apply(self.data)
 
     def capture(self):return deepcopy(self.options)
+
+    @staticmethod
+    def custom_range(start,end):
+        try:
+            first=datetime.fromisoformat(start);last=datetime.fromisoformat(end)
+            if first.date().isoformat()!=start or last.date().isoformat()!=end:raise ValueError
+            bounds=(first.timestamp(),(last+timedelta(days=1)).timestamp())
+        except (ValueError,TypeError,OverflowError,OSError):
+            raise ValueError('시작일과 종료일을 YYYY-MM-DD 형식으로 입력하세요.') from None
+        if first>last:raise ValueError('종료일은 시작일보다 빠를 수 없습니다.')
+        return bounds
+
+    def publish_dates(self):
+        draft=self.date_draft;custom=draft['period']=='custom';error=''
+        if custom:
+            try:self.custom_range(draft['start'],draft['end'])
+            except ValueError as exc:error=tr(str(exc))
+        pending=custom and any(draft[key]!=self.options[key] for key in ('period','start','end'))
+        self.put(dateDraft=deepcopy(draft),dateError=error,datePending=pending,
+                 dateCanApply=bool(pending and not error),
+                 dateNotice=error or (tr('날짜를 적용하면 조회 기간이 변경됩니다.') if pending else ''))
+
     def restore(self,value):
-        self.options.update(deepcopy({k:v for k,v in value.items() if k in self.options}))
+        restored=deepcopy({k:v for k,v in value.items() if k in self.options})
+        dates={key:restored.get(key,self.options[key]) for key in ('period','start','end')}
+        if dates['period'] not in ('all','today','7d','30d','custom'):dates['period']='all'
+        restored['period']=dates['period']
+        try:self.custom_range(dates['start'],dates['end'])
+        except ValueError:
+            empty=dates['period']!='custom' and dates['start']==dates['end']==''
+            restored.update({key:'' if empty else self.options[key] for key in ('start','end')})
+            if dates['period']=='custom':restored['period']=self.options['period']
+        else:restored.update(dates)
+        self.options.update(restored)
+        self.date_draft=dates if dates['period']=='custom' else {key:self.options[key] for key in ('period','start','end')}
         o=self.options;legacy=o['dimension']
         if legacy in dict((v,t) for t,v in BREAKDOWNS):
             o['dimension']='model';o['breakdowns']=[legacy]
         o['views']={dimension:{k:v for k,v in view.items() if k in ('search','sort')}
                     for dimension,view in o['views'].items()}
         o['breakdowns']=[key for _,key in BREAKDOWNS if key in o['breakdowns']]
-        self.put(options=deepcopy(o))
+        self.put(options=deepcopy(o));self.publish_dates()
 
     def refresh(self):
         self.dashboard.render();self.dashboard.save_preferences()
@@ -90,10 +126,22 @@ class UsagePanel(Node):
     @Slot(str,str)
     def change(self,key,value):
         o=self.options
-        if key=='filtersOpen':o[key]=not o[key];self.put(options=deepcopy(o));return
-        if key=='search':
+        if key in ('start','end'):
+            self.date_draft[key]=value;self.publish_dates();return
+        if key=='period':
+            if value not in ('all','today','7d','30d','custom'):return
+            if value=='custom':
+                self.date_draft['period']=value;self.publish_dates();return
+            self.dashboard.push_state();o['period']=value
+            self.date_draft={key:o[key] for key in ('period','start','end')};self.publish_dates()
+        elif key=='applyDates':
+            self.publish_dates()
+            if not self.state['dateCanApply']:return
+            self.dashboard.push_state();o.update(self.date_draft);self.publish_dates()
+        elif key=='filtersOpen':o[key]=not o[key];self.put(options=deepcopy(o));return
+        elif key=='search':
             o['search']=value;self.put(options=deepcopy(o));self.search_timer.start();return
-        if key=='dimension':
+        elif key=='dimension':
             if value not in dict((v,t) for t,v in DIMENSIONS):return
             o['views'][o['dimension']]={k:o[k] for k in ('search','sort')}
             o['dimension']=value;o.update(o['views'].get(value,dict(search='',sort='desc')))
@@ -110,9 +158,7 @@ class UsagePanel(Node):
             if value:o['filters'][field]=value
             else:o['filters'].pop(field,None)
             o['selected']=[]
-        elif key in ('period','start','end','metric','mode','sort'):
-            if key in ('period','start','end'):self.dashboard.push_state()
-            o[key]=value
+        elif key in ('metric','mode','sort'):o[key]=value
         else:return
         self.search_timer.stop();self.put(options=deepcopy(o));self.refresh()
 
@@ -143,9 +189,7 @@ class UsagePanel(Node):
         if period=='today':start=today.timestamp()
         elif period in ('7d','30d'):start=(today-timedelta(days=6 if period=='7d' else 29)).timestamp()
         elif period=='custom':
-            try:
-                start=datetime.fromisoformat(o['start']).timestamp();end=min(end,(datetime.fromisoformat(o['end'])+timedelta(days=1)).timestamp())
-            except ValueError:start=end
+            start,finish=self.custom_range(o['start'],o['end']);end=max(start,min(end,finish))
         filters=dict(o['filters'])
         if filters.get('source')=='미확인':filters['source']='unknown'
         return dict(page=1,category_usage=True,presentation=True,include_whole_history=False,

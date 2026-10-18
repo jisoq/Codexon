@@ -204,6 +204,11 @@ def test_tab_loading_keeps_controls_and_ignores_stale_result(tmp_path,language):
         assert not window.analysis_pending and not window.analysis_loading
         window.change_page(5)
         assert window.pages.isVisible() and window.analysis_loading['active']
+        from cachemonitor.quick_qa import click
+        toggle=control(window,window.performance_panel.model_panel_button)
+        if toggle.isVisible():
+            click(window,toggle)
+            wait_for_rendered(lambda:control(window,window.performance_panel.model_choice).isVisible())
         assert control(window,window.performance_panel.model_choice).isVisible()
         assert not control(window,window.performance_panel.chart_scroll).isVisible()
         deliver_pending(window)

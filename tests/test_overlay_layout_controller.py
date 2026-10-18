@@ -80,6 +80,34 @@ def publish_subagents(controller, *, nested=False):
     return parent
 
 
+def test_selected_detail_button_still_changes_on_hover():
+    from PySide6.QtCore import QPoint,QPointF,QRect,QSize,QEvent,Qt
+    from PySide6.QtGui import QEnterEvent,QMouseEvent
+    from cachemonitor.overlay_chrome import OverlayChrome,named_item
+    from tests.test_ui import wait_for_rendered
+    app=QApplication.instance() or QApplication([])
+    chrome=OverlayChrome('actions');chrome.resize(78,30);chrome.move(100,100)
+    chrome.view.put(expanded=True,canExpand=True,reducedMotion=True)
+    try:
+        chrome.show();chrome.raise_();chrome.activateWindow()
+        wait_for_rendered(lambda:chrome.quick is not None and chrome.quick.rootObject() is not None)
+        button=named_item(chrome.quick.rootObject(),'expand')
+        center=button.mapToScene(QPointF(button.width()/2,button.height()/2)).toPoint()
+        top=button.mapToScene(QPointF(0,0)).toPoint()
+        rect=QRect(top,QSize(round(button.width()),round(button.height())))
+        def hover(point):
+            local=QPointF(point);global_pos=QPointF(chrome.quick.mapToGlobal(point))
+            app.sendEvent(chrome.quick,QEnterEvent(local,local,global_pos))
+            app.sendEvent(chrome.quick,QMouseEvent(QEvent.MouseMove,local,global_pos,Qt.NoButton,Qt.NoButton,Qt.NoModifier))
+        hover(QPoint(chrome.quick.width()-1,1))
+        wait_for_rendered(lambda:not button.property('hovered'))
+        before=chrome.quick.grabFramebuffer().copy(rect)
+        hover(center)
+        wait_for_rendered(lambda:button.property('hovered'))
+        wait_for_rendered(lambda:chrome.quick.grabFramebuffer().copy(rect)!=before)
+        assert button.property('selected')
+    finally:chrome.close();app.processEvents()
+
 def test_subagent_detail_tracks_family_and_preserves_expansion_preference(layout_controller):
     from cachemonitor.overlay_chrome import named_item
     c=layout_controller;m=c.widget.content_model
@@ -105,6 +133,38 @@ def test_subagent_detail_tracks_family_and_preserves_expansion_preference(layout
     assert c.expanded and not c.actions.view.state['canExpand'] and not c.detail.isVisible()
     c.receive_target({'target':{'hwnd':1},'selection':Selection(A)})
     assert c.automatic_mode=='detail' and c.detail.isVisible()
+
+
+def test_right_detail_keeps_main_fixed_and_moves_shared_controls(layout_controller):
+    from cachemonitor.overlay_chrome import named_item
+    c=layout_controller;publish_subagents(c,nested=True)
+    c.anchor=(.6,1);c.expanded=False;c.refresh()
+    main=c.monitor_geometry;controls=c.actions_geometry
+    c.capture_detail();c.activate_detail()
+    assert c.monitor_geometry==main and c.current_geometry[:2]==main[:2]
+    detail=c.native.placed[int(c.detail.winId())]
+    assert detail[0]==main[0]+main[2]
+    assert c.actions_geometry[0]-controls[0]==detail[2]
+    root=c.detail.quick.rootObject();m=c.widget.content_model
+    assert named_item(root,'closeDetail') is None
+    heading=named_item(root,'openDashboard')
+    assert heading.y()==m.layout()['session']*m.appearance.scale
+    assert named_item(root,'detailCostAmount-count').property('text')=='2'
+    assert named_item(root,'detailCostAmount-main') is None
+    c.capture_detail();c.activate_detail()
+    assert c.monitor_geometry==main and c.actions_geometry==controls and not c.detail.isVisible()
+
+
+def test_closed_detail_allows_right_edge_and_opening_only_shifts_when_needed(layout_controller):
+    c=layout_controller;publish_subagents(c)
+    c.anchor=(1,1);c.expanded=False;c.refresh()
+    closed=c.monitor_geometry;anchor=c.anchor
+    c.toggle_expanded();opened=c.monitor_geometry
+    assert opened[0]<closed[0] and opened[1:]==closed[1:]
+    assert c.current_geometry[0]+c.current_geometry[2]==closed[0]+closed[2]
+    assert c.automatic_mode=='detail' and c.anchor==anchor
+    c.toggle_expanded()
+    assert c.monitor_geometry==closed
 
 
 def test_equal_heartbeats_keep_watchdog_and_restore_hidden_overlay(layout_controller,monkeypatch):
@@ -301,7 +361,7 @@ def test_remote_session_uses_icon_and_restores_local_detail(layout_controller):
     c.receive_target({'target':{'hwnd':1},'selection':Selection(A,host='remote:test')})
     assert m.is_remote and m.data is None and not m.rows()
     assert c.automatic_mode=='icon' and c.icon.isVisible() and not c.widget.isVisible() and not c.detail.isVisible()
-    assert m.base_height()<local_height and not m.monitor_links()
+    assert m.base_height()<local_height and all(link.get('interaction')=='tooltip' for link in m.monitor_links())
     assert m.lines()[0]=='원격 세션' and '0호출' not in m.state['accessible']
     c.toggle_expanded()
     assert c.expanded  # The local detail preference survives the remote icon.

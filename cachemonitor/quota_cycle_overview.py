@@ -20,15 +20,15 @@ class CycleTable(Table):
     cycle_activated=Signal(float)
 
     def __init__(self):
-        super().__init__(headers=['주기','주기 소모량','주간 예상 가치','실측 시간'])
-        self.put(inline=True,linkedHover=True,highlightedRow=-1,rowHeight=44,widths=[140,95,120,80],
+        super().__init__(headers=['주기','요약','주간 예상 가치','실측 시간'])
+        self.put(inline=True,linkedHover=True,highlightedRow=-1,rowHeight=44,widths=[140,125,120,80],
                  columnStretchWeights=[2,1,1,1])
         self.setMinimumHeight(114)
         self.setAccessibleName('주기별 실측 시간과 소모량 및 주간 예상 가치 / Enter로 상세 열기')
         self.cellClicked.connect(self.activate_cycle);self.cellActivated.connect(self.activate_cycle)
 
     def set_periods(self,periods):
-        fields=('start','end','current','partial','delta','value','calls','priced_calls')
+        fields=('start','end','current','partial','cost','delta','value','calls','priced_calls')
         rows=[dict({key:period[key] for key in fields},id=period['start'])
               for period in sorted(periods,key=lambda period:period['start'])]
         self.set_rows(rows,self.format_row)
@@ -47,11 +47,16 @@ class CycleTable(Table):
                 return clock(row['start'],True)+' → '+clock(row['end'],True)+('\n'+' / '.join(states) if states else '')
             if column==3:
                 return tr('첫 실측부터 마지막 실측까지의 경과 시간입니다. 수집 공백을 포함합니다.')+f"\n{max(0,row['end']-row['start']):g} s"
-            if column==1:return tr('해당 주기에서 관측한 할당량 소모율입니다.')
+            if column==1:
+                text=tr('해당 주기에 측정한 구독 가치 환산액입니다.')+'\n'+tr('해당 주기에서 관측한 할당량 소모율입니다.')
+                if row['priced_calls']<row['calls']:
+                    text+='\n'+tr('확인된 비용의 소계')+f" / {row['priced_calls']:,}/{row['calls']:,}"+tr('호출')
+                return text
             return (tr('확인된 비용의 소계')+f" / {row['priced_calls']:,}/{row['calls']:,}"+tr('호출')
                     +'\n'+tr('선택 주기의 사용 기록으로 계산한 주간 예상 가치')
                     if row['priced_calls']<row['calls'] else tr('선택 주기의 사용 기록으로 계산한 주간 예상 가치'))
         first,last=datetime.fromtimestamp(row['start']),datetime.fromtimestamp(row['end'])
         label=first.strftime('%m/%d %H:%M') if first.date()==last.date() else first.strftime('%m/%d')+' → '+last.strftime('%m/%d')
         if status:label+='\n'+status
-        return [label,f"{row['delta']:g}%p",usd(row['value']),elapsed_text(row['end']-row['start'])][column]
+        cost=usd(row['cost']).rstrip('0').rstrip('.')
+        return [label,f"{cost}/{row['delta']:g}%p",usd(row['value']),elapsed_text(row['end']-row['start'])][column]

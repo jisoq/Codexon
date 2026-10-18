@@ -38,7 +38,7 @@ from .history_timeline import SessionTimeline
 from .dashboard_presentation import Breadcrumbs, RecordFields, labeled_control, move_controls
 
 STYLE = ''
-TITLES = {1:'지표 비교',2:'세션 기록',3:'구독 모니터링',4:'설정',5:'성능 추이'}
+TITLES = {1:'지표 비교',2:'세션 기록',3:'구독 모니터링',4:'설정',5:'성능 추이',6:'홈'}
 PERIODS = [('최근 30분','30m'),('오늘','today'),('최근 7일','7d'),('최근 30일','30d'),('전체 기록','all'),('직접 지정','custom')]
 INPUT_BANDS = [('전체 입력 길이',''),('10k 미만','0:10000'),('10–50k','10000:50000'),('50–100k','50000:100000'),('100–200k','100000:200000'),('200–272k','200000:272001'),('272k 초과','272001:inf')]
 CALL_FILTERS = [('환산 불가','unpriced'),('모드 기록 없음','unknown_mode'),('모델명 불일치','model_mismatch'),('관측 정보 누락 또는 충돌','observation_problem'),('캐시 읽기 0','cache_zero'),('캐시 저하 의심','cache_degradation'),('HTTP/SSE','http')]
@@ -147,7 +147,8 @@ class Dashboard(TrayWindow):
         self.error_state=ErrorState(history=self.confirmed_notifications.records)
         self._error_revision=-1;self.collection_starting=False;self.collection_stopped=False;self._observation_counters=None
         self.collection_snapshot_at=None
-        self.current_page=3;self.restoring=True;self.back_stack=[];self.forward_stack=[];self.temporary_context=None;self.navigation_signature=None
+        self.current_page=6;self.restoring=True;self.back_stack=[];self.forward_stack=[];self.temporary_context=None;self.navigation_signature=None
+        self.home_quota_payload={};self.home_collection_status={}
         self.page_filters={2:{'model':'','effort':'','service_tier':''}}
         self.filter_values={}
         self.history_navigation=HistoryNavigation()
@@ -174,7 +175,7 @@ class Dashboard(TrayWindow):
         side=Group();side.setFixedWidth(200);side.setObjectName('sidebar');side_layout=Column(side)
         side_layout.setContentsMargins(16,24,16,20);side_layout.setSpacing(24)
         side_layout.addWidget(label('CODEXON','brand'))
-        self.navigation_pages=(3,1,5)
+        self.navigation_pages=(6,3,1,5)
         self.nav=Navigation();self.nav.addItems(tuple(TITLES[i] for i in self.navigation_pages));self.nav.setObjectName('navigation');self.nav.setMaximumHeight(220)
         side_layout.addWidget(self.nav);side_layout.addStretch()
         self.update_available=Button('업데이트 가능');self.update_available.hide()
@@ -234,6 +235,11 @@ class Dashboard(TrayWindow):
         from .performance_panel import PerformancePanel
         self.performance_panel=PerformancePanel(self)
         self.pages.addWidget(self.performance_panel);self.scrollers[5]=self.performance_panel.chart_scroll
+        from .home_panel import HomePanel
+        self.home_panel=HomePanel();self.home_panel.navigate.connect(self.change_page)
+        self.home_panel.connection_requested.connect(self.open_home_connection)
+        home_scroll=Scroll();home_scroll.put(fillViewport=True);home_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        home_scroll.setWidget(self.home_panel);self.pages.addWidget(home_scroll);self.scrollers[6]=home_scroll
         self.health=label('','muted',True);self.health.hide()
         self.setup_tray();self.settings_page.bind_tray(self);self.tray.messageClicked.connect(self.open_tray_notification)
         self.tick=QTimer(self);self.tick.timeout.connect(self.check_stale);self.tick.start(1000)
@@ -317,6 +323,7 @@ class Dashboard(TrayWindow):
         services[home].supply_local(self.snapshot.get('quota_by_home',{}).get(services[home].home))
         self.live_quota=None;self.quota_service=services[home]
         self.quota_sidebar.receive({'quota':None})
+        self.home_quota_payload={};self.refresh_home_status()
         self.sync_report_demand()
         self.refresh_tray()
         self.quota_service.wake.set()
@@ -371,6 +378,7 @@ class Dashboard(TrayWindow):
         self.quota_panel.defer_render=self.current_page!=3 or not self.isVisible() or self.isMinimized()
         if self.quota_panel.receive(value) is False:return
         self.quota_sidebar.receive(value)
+        self.home_quota_payload=value;self.refresh_home_status()
         self.live_quota=value.get('quota');self.quota_issue=value.get('issue','');self.refresh_tray()
         facts=value.get('quota_faults')
         if isinstance(facts,dict):
@@ -443,6 +451,11 @@ class Dashboard(TrayWindow):
             chip.clicked.connect(lambda value=key:self.clear_history_filter(value))
             self.history_filter_chips[key]=chip;self.history_active_filters.addWidget(chip)
         layout.addWidget(self.history_active_filters)
+        locked=Row();locked.put(flow=True,spacing=12)
+        self.history_locked_scope=label('','muted',True);locked.addWidget(self.history_locked_scope,1)
+        self.history_unlock=Button('일반 기록 조회로 돌아가기');self.history_unlock.put(role='quiet')
+        self.history_unlock.clicked.connect(self.leave_history_context);locked.addWidget(self.history_unlock)
+        self.history_locked_banner=locked;locked.hide();layout.addWidget(locked)
         self.record_filters.toggle.toggled.connect(lambda _:self.sync_history_filters())
         self.record_message=label('','muted',True)
         self.records_body=HistoryWorkspace();self.records_body.resized.connect(self.layout_record_detail)
@@ -591,9 +604,9 @@ class Dashboard(TrayWindow):
         for key,node in self.call_filter_controls.items():node.setChecked(key in state.get('call_filters',[]))
         for key,node in self.extra_column_controls.items():node.setChecked(key in state.get('extras',[]))
         self.temporary_context=None if initial else state.get('temporary')
-        page=state.get('page',3)
-        self.current_page=page if page in TITLES else 3
-        if initial and self.current_page in (2,4):self.current_page=3
+        page=state.get('page',6)
+        self.current_page=page if page in TITLES else 6
+        if initial and self.current_page in (2,4):self.current_page=6
         self.exact_record=None;self.record_request+=1;self._revealed_call=None
         self.settings_page.reveal(state.get('settings_category','general'))
         for key,attr in (('model','model'),('effort','effort'),('service_tier','mode')):
@@ -676,6 +689,8 @@ class Dashboard(TrayWindow):
         self.back_button.setVisible(self.current_page!=2 or bool(self.back_stack or deep))
 
     def go_home(self):
+        if self.current_page==2 and self.temporary_context:
+            self.leave_history_context();return
         self.push_state()
         if self.current_page==2:
             self.selected_session=self.selected_turn=self.selected_call=self.selected_event=None
@@ -748,11 +763,11 @@ class Dashboard(TrayWindow):
 
     def change_page(self,index):
         if self.restoring:return
-        if index not in TITLES:index=3
+        if index not in TITLES:index=6
         if self.current_page!=index:
             self.save_page_scope();self.forward_stack.clear()
         scope=self.page_scopes.get(index) if self.current_page!=index else None
-        if self.current_page==2:
+        if self.current_page==2 and not self.temporary_context:
             self.page_filters[self.current_page]={key:getattr(self,attr).currentData() for key,attr in (('model','model'),('effort','effort'),('service_tier','mode'))}
         self.current_page=index;self.pages.setCurrentIndex(index-1);self.heading.setText(TITLES[index])
         self.sync_report_demand()
@@ -765,6 +780,7 @@ class Dashboard(TrayWindow):
             self.date_start.setText(scope['dates'][0]);self.date_end.setText(scope['dates'][1]);self.archive.setChecked(scope['archive'])
         self.nav.setCurrentRow(self.navigation_pages.index(self.current_page) if self.current_page in self.navigation_pages else -1)
         self.settings_button.put(checked=self.current_page==4)
+        self.quota_sidebar.setVisible(index!=6)
         for key,attr in (('model','model'),('effort','effort'),('service_tier','mode')):
             if self.current_page==2:choose(getattr(self,attr),self.page_filters[2].get(key,''))
         self.restoring=False
@@ -781,10 +797,34 @@ class Dashboard(TrayWindow):
             if self.current_page!=5:
                 self.analysis=self.view_result['analysis'];self.lookup=self.view_result['lookup']
                 self.applied_key=self.view_result['key']
-        self.price_button.setVisible(index!=4);self.clear_analysis_loading()
+        self.price_button.setVisible(index not in (4,6));self.clear_analysis_loading()
         if hasattr(self,'quota_pause_button'):self.refresh_quota_monitoring()
         self.update_navigation()
         self.render();self.save_preferences()
+        if index==5:QTimer.singleShot(0,self.update_performance_layout)
+
+    def open_home_connection(self):
+        self.push_state();self.change_page(4)
+        self.settings_page.reveal('integration',self.observer_panel.toggle)
+
+    def refresh_home_status(self):
+        if hasattr(self,'home_panel'):
+            evidence={**self.snapshot,**self.home_collection_status}
+            evidence['collection_started_at']=self.started_at
+            evidence['collection_fault']={**(self.snapshot.get('collection_fault') or {}),
+                **{key:value for key,value in (self.home_collection_status.get('collection_fault') or {}).items() if value}}
+            self.home_panel.apply_status(evidence,self.home_quota_payload,time.time())
+
+    def update_performance_layout(self):
+        panel=getattr(self,'performance_panel',None)
+        quick=getattr(self,'_quick',None)
+        if panel is None or not hasattr(panel,'update_layout') or quick is None:return
+        pending=[quick.quickWindow().contentItem()]
+        while pending:
+            item=pending.pop()
+            if item.property('node') is self.pages and item.width()>0:
+                panel.update_layout(item.width());return
+            pending.extend(item.childItems())
 
     def open_settings(self):self.show_window();self.change_page(4)
 
@@ -886,6 +926,7 @@ class Dashboard(TrayWindow):
 
     def query(self):
         page=self.current_page
+        if page==6:return self.home_panel.query(time.time())
         if page==5:
             panel=self.performance_panel
             return dict(page=5,start=0,end=self.snapshot['ts']+.000001,now=self.snapshot['ts'],period='all',presentation=True,
@@ -952,6 +993,7 @@ class Dashboard(TrayWindow):
             if q.get('category_usage'):
                 key_query.pop('loading',None)
                 revision=self.snapshot.get('call_revision',revision)
+            if q['page']==6:key_query['start']=q['start']
             logical=(self.snapshot.get('epoch'),revision,json.dumps(key_query,sort_keys=True))
             if self.analysis_pending:
                 if automatic:
@@ -989,6 +1031,7 @@ class Dashboard(TrayWindow):
         ignored={'now','loading','table_windows','plot_width'}
         if query['period']!='custom':ignored.update(('start','end'))
         identity={k:v for k,v in query.items() if k not in ignored}
+        if query['page']==6:identity['start']=query['start']
         if query['page']==5 and self.performance_panel.follow_latest:
             identity['time_range']=('latest',self.performance_panel.window_span)
         return json.dumps(identity,sort_keys=True)
@@ -1000,6 +1043,7 @@ class Dashboard(TrayWindow):
         self.pages.show();self.scope_note.hide()
 
     def analysis_regions(self):
+        if self.current_page==6:return [(self.home_panel.today_summary,True)]
         if self.current_page==1:return [(self.metric_panel,True)]
         if self.current_page==5:
             return [(self.performance_panel.chart_scroll,True),(self.performance_panel.inspector,False),
@@ -1104,6 +1148,10 @@ class Dashboard(TrayWindow):
         return Verbatim(', '.join(tr(x) for x in names if x))
 
     def receive_collection_status(self,result):
+        self.home_collection_status={**self.home_collection_status,**{key:result[key] for key in
+            ('collection_fault','collection_healthy','collection_snapshot_at') if key in result}}
+        if result.get('collection_healthy') and 'collection_fault' not in result:self.home_collection_status['collection_fault']={}
+        self.refresh_home_status()
         if isinstance(result.get('collection_snapshot_at'),(int,float)):
             self.collection_snapshot_at=result['collection_snapshot_at']
         if isinstance(result.get('collection_fault'),dict):
@@ -1126,9 +1174,12 @@ class Dashboard(TrayWindow):
             value={**value,'sessions':[s['source'] for s in self.engine.sessions.values()],
                    'internal_review_calls':sum(len(s['prepared']['history']) for s in self.engine.internal_sessions.values())}
         self.snapshot=value
+        self.refresh_home_status()
         self.error_state.clear('analysis.process',resolution='분석기 실행 확인')
         if isinstance(value.get('collection_fault'),dict):
-            self.observe_error('collection.source','collection',value['collection_fault'],
+            source_facts=dict(value['collection_fault'])
+            if value.get('usage_errors'):source_facts['read_failed']=True
+            self.observe_error('collection.source','collection',source_facts,
                 healthy=bool(value.get('usage_collection_complete')),resolution='사용 기록 수집 재개 확인')
         elif value.get('usage_errors'):
             self.observe_error('collection.source','collection',dict(read_failed=True))
@@ -1146,7 +1197,7 @@ class Dashboard(TrayWindow):
             overlay.receive_collection_status({'collection_issue':getattr(self,'collection_issue','')})
             overlay.receive_snapshot(value)
         self.refresh_choices();index=value.get('index',{})
-        self.index_status.setText('수집 중' if index.get('loading') else '수집 확인 필요' if value.get('errors') else '자동 수집 켜짐')
+        self.index_status.setText('수집 확인 필요' if value.get('errors') else '기록 준비 중' if not value.get('usage_collection_complete',not index.get('loading')) else '자동 수집 켜짐')
         self.show_confirmed_events(self.confirmed_notifications.cache(value.get('cache_candidates',value['sessions'])))
         if self.worker:self.worker.set_cache_floor(self.confirmed_notifications.cache_floor)
         self.show_confirmed_events(self.confirmed_notifications.http(value['sessions']))
@@ -1200,6 +1251,16 @@ class Dashboard(TrayWindow):
             self.finish_analysis_loading(result,query)
             self.refresh_after_analysis()
             return
+        if query['page']==6:
+            self.view_result=result;self.applied_key=result['key'];self.analysis=result['analysis'];self.lookup=result['lookup']
+            self.home_panel.apply_usage(result['analysis'],result['usage']['summary']);self.refresh_home_status()
+            restored=getattr(self,'_restore_positions',None)
+            if restored:
+                position=restored.get('scrolls',{}).get('6',restored.get('scrolls',{}).get(6,0))
+                self.scrollers[6].verticalPosition.setValue(position)
+            self._restore_positions=None
+            self.finish_analysis_loading(result,query);self.refresh_after_analysis();self.save_preferences()
+            return
         self.view_result=result;self.applied_key=result['key'];self.analysis=result['analysis'];self.lookup=result['lookup']
         self.table.live_update=automatic
         self.parent_table.live_update=automatic
@@ -1246,7 +1307,7 @@ class Dashboard(TrayWindow):
         facts.update(current_request_id=self.request_id,
                      retained=self.display_identity==self.query_identity(self.query())
                               and self.pages.isPageReady(self.pages.currentIndex()))
-        if self.current_page in (1,2,5):self._analysis_error_page=self.current_page
+        if self.current_page in (1,2,5,6):self._analysis_error_page=self.current_page
         self.observe_error('analysis.query' if facts.get('query_failed') else 'analysis.process','analysis',facts)
         self.client_cache.clear();self.pending_logical=None
         self.request_id+=1;self.deferred_result=None;self.defer_timer.stop();self.clear_analysis_loading()
@@ -1275,11 +1336,13 @@ class Dashboard(TrayWindow):
         if hasattr(self,'sidebar_layout'):self.layout_sidebar()
         if hasattr(self,'settings_page'):self.settings_page.navigation.setFixedWidth(144 if self.width()<1200 else 200)
         if hasattr(self,'detail_scroll'):self.layout_record_detail()
+        if hasattr(self,'pages'):QTimer.singleShot(0,self.update_performance_layout)
         if getattr(self,'current_page',3)==5 and hasattr(self,'performance_panel'):self.performance_panel.resize_timer.start()
     def showEvent(self,event):
         super().showEvent(event)
         self.sync_report_demand()
         self.quota_sidebar.refresh_status()
+        self.refresh_home_status()
         if getattr(self,'_display_dirty',False):
             self._display_dirty=False;QTimer.singleShot(0,lambda:self.render(automatic=True))
 
@@ -1294,15 +1357,22 @@ class Dashboard(TrayWindow):
         self.settings.setValue('dashboard/geometry',self.saveGeometry());self.save_preferences();super().closeEvent(event)
     def check_stale(self):
         if not self.quitting:
+            from .app_errors import collection_phase
             observed=max((stamp for stamp in (self.snapshot.get('ts'),self.collection_snapshot_at)
                           if stamp is not None),default=None)
+            evidence={**self.snapshot,**self.home_collection_status}
+            phase=collection_phase(evidence,time.time(),started_at=self.started_at)
             self.observe_error('collection.freshness','collection',
-                dict(snapshot_at=observed,starting=self.collection_starting,expected_stop=self.collection_stopped),
-                healthy=self.collection_stopped or self.collection_starting or observed is not None and time.time()-observed<=30,
+                dict(snapshot_at=observed,snapshot_stale=phase=='delayed',starting=phase=='preparing',expected_stop=self.collection_stopped),
+                healthy=self.collection_stopped or phase=='preparing' or phase!='delayed' and observed is not None and time.time()-observed<=30,
                 resolution='수집기 종료 확인' if self.collection_stopped else '새 수집 결과 확인')
         self.refresh_tray()
         if self.isVisible() and not self.isMinimized():
             self.quota_sidebar.refresh_status()
+            self.refresh_home_status()
+            if self.current_page==6:
+                result=self.displayed_pages.get(6)
+                if result and time.time()>=result[1].get('valid_until',float('inf')) and not self.analysis_pending:self.render(automatic=True)
             if self.current_page==3:self.quota_panel.refresh_status()
         if int(time.time())%10==0:shared_theme().configure(self.settings.value('ui/theme',self.settings.value('overlay/theme','codex')))
 
@@ -1375,6 +1445,11 @@ class Dashboard(TrayWindow):
 
     def sync_history_filters(self):
         history=self.current_page==2
+        locked=history and bool(self.temporary_context)
+        for node in (self.period,self.date_start,self.date_end,self.home,self.source,self.archive,self.model,self.effort,self.mode):
+            node.setEnabled(not locked)
+        self.history_locked_banner.setVisible(locked)
+        if locked:self.history_locked_scope.setText(formatted('고정된 조회 범위: {scope}',scope=self.scope_text(dict(page=2))))
         # Hidden filters keep their rendered owner when leaving for quota or
         # settings. Reparenting recreates every sibling QML delegate repeatedly.
         if self.current_page in (1,2):
@@ -1384,6 +1459,21 @@ class Dashboard(TrayWindow):
         for node in (self.home,self.source,self.archive,self.model,self.effort,self.mode):
             node.setVisible(self.current_page<3 and (node not in (self.model,self.effort,self.mode) or self.current_page==2))
         self.home.setVisible(self.current_page<3 and len(self.snapshot['homes'])>1)
+
+    def leave_history_context(self):
+        if not self.temporary_context:return
+        self.push_state();self.restoring=True
+        self.temporary_context=None;self.navigation_signature=None
+        self.selected_session=self.selected_turn=self.selected_call=self.selected_event=self.selected_call_scope=None
+        self.exact_record=None;self.record_request+=1;self.record_request_token=None;self.record_view='sessions'
+        self.history_navigation.project='';self.search.clear();self.search_timer.stop();self.outside.setChecked(False)
+        for node in self.call_filter_controls.values():node.setChecked(False)
+        scope=self.page_scopes.get(2)
+        if scope:
+            for key,value in scope['common'].items():choose(getattr(self,key),value)
+            self.date_start.setText(scope['dates'][0]);self.date_end.setText(scope['dates'][1]);self.archive.setChecked(scope['archive'])
+        for key,attr in (('model','model'),('effort','effort'),('service_tier','mode')):choose(getattr(self,attr),self.page_filters[2].get(key,''))
+        self.restoring=False;self.detail_scroll.hide();self.change_page(2)
 
     def render_history_path(self,data):
         entries=[dict(item,action='scope',literal=True) for item in data.get('path',[])]
@@ -1705,7 +1795,7 @@ class Dashboard(TrayWindow):
             and self.selected_call==target.call_id and self.selected_event==target.event_id and not self.search.text()
             and not any(node.isChecked() for node in self.call_filter_controls.values())):
             self.show_window();return
-        self.push_state();self.navigation_signature=signature
+        self.push_state();self.save_page_scope();self.navigation_signature=signature
         self.temporary_context=signature;self.selected_session=(target.home,target.sid);self.selected_turn=target.request_id
         self.selected_call=target.call_id;self.selected_event=target.event_id;self.record_section=target.section
         self.selected_call_scope=(target.home,target.sid)
@@ -1908,7 +1998,7 @@ class Dashboard(TrayWindow):
         manager=target(self.observer_home,self.observer_directory,index=self.index_path)
         if self.model_evidence_path:manager.evidence=Path(self.model_evidence_path)
         self.observer_panel=ObserverPanel(self.observer_home,self.observer_directory,active=self.manage_observer,parent=self,manager=manager)
-        self.settings_page.add_widget('integration', self.observer_panel,section='프록시',title='프록시 사용',description='요청 모델과 응답 모델을 비교할 수 있도록 Codex 연결을 중계합니다.',target=self.observer_panel.toggle,aliases='proxy connection')
+        self.settings_page.add_widget('integration', self.observer_panel,section='프록시',title=self.observer_panel.title.text(),description=self.observer_panel.description.text(),target=self.observer_panel.toggle,aliases='proxy connection')
         self.settings_page.entries[-1]['description']=self.observer_panel.description.text()
         legacy_notifications = self.settings.value('notifications',True,type=bool)
         self.notification_master = Switch()

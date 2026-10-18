@@ -32,13 +32,13 @@ class ObserverPanel(Group):
         self.inactive=False
         layout=Column(self);layout.setContentsMargins(0,12,0,12);layout.setSpacing(4)
         row=Row();row.put(collapseBelow=620,minHeight=36);row.setSpacing(8);copy=Column();copy.setSpacing(4)
-        title=Text('프록시 사용');title.setStyleSheet('font-weight: 500;');copy.addWidget(title)
-        description=Text('Codex 연결을 통해 응답의 사용량을 관측합니다.')
+        self.title=Text('요청 모델과 응답 모델 비교');self.title.setStyleSheet('font-weight: 500;');copy.addWidget(self.title)
+        description=Text('선택 기능입니다. 요청한 모델명과 응답에 기록된 모델명을 비교합니다.\n로컬 프록시를 사용하며, 기본 사용량 확인에는 필요하지 않습니다.')
         self.description=description
         description.setWordWrap(True);description.put(color='muted',fontSize=13)
         copy.addWidget(description);row.addLayout(copy,2)
         controls=Row();controls.setSpacing(8)
-        self.toggle=Switch();self.toggle.setAccessibleName('프록시 사용');controls.addWidget(self.toggle)
+        self.toggle=Switch();self.toggle.setAccessibleName('요청 모델과 응답 모델 비교');controls.addWidget(self.toggle)
         self.status_label=Text('꺼짐');self.status_label.put(fontSize=13);controls.addWidget(self.status_label)
         self.progress_link=Button('진행 보기');self.progress_link.put(iconName='right',role='quiet')
         self.progress_link.setFixedSize(32,32);self.progress_link.setAccessibleName('업데이트 진행 보기')
@@ -155,7 +155,7 @@ class ObserverPanel(Group):
                                      '연결 준비 완료' if self.enabled else '직접 연결 설정 복원 완료')
         self.guidance_heading.setVisible(failed or restart)
         self.restart_label.setText('시작 메뉴에서 ‘Codexon 연결 복구’를 실행하세요.' if failed else
-                                   'ChatGPT 앱을 재시작해 응답을 확인하세요.' if restart else '')
+                                   'Codex를 사용하는 앱이나 CLI를 재시작한 뒤 응답을 확인하세요.' if restart else '')
         self.restart_label.setVisible(failed or restart)
         if failed:
             self.error_detail.hide()

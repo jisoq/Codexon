@@ -39,7 +39,7 @@ GROUPS = {
     'chatgpt_startup': test_files('chatgpt_startup'),
     'app_lifetime': test_files('app_services', 'observer_panel', 'windows_startup', 'proxy_update'),
     'graphics_recovery': test_files('graphics_recovery', 'window_recovery', 'quick_ui', 'overlay_shadow'),
-    'data': test_files('core', 'index', 'data_contract', 'subagent_collection', 'request_tier_snapshots', 'collection_defaults', 'collection_crash_recovery', 'collection_transport'),
+    'data': test_files('core', 'index', 'data_contract', 'subagent_collection', 'request_tier_snapshots', 'collection_defaults', 'collection_crash_recovery', 'collection_transport', 'collection_preparation'),
     'analysis': test_files('comparison', 'overview', 'performance', 'data_contract', 'output_speed'),
     'prepared': test_files('prepared_analysis', 'analysis_query_actor') + (
         'tests/test_collection_transport.py::test_analyzer_publication_wakes_before_timer_and_freeze_reclaims_waiter',
@@ -56,7 +56,7 @@ GROUPS = {
     'quota_poll': test_files('quota_polling', 'quota_backlog', 'quota_worker', 'quota_transport', 'overlay_collection_resilience'),
     'quota_ui': test_files('quota_page', 'quota_detail_card', 'quota_gap_axis', 'quota_share_theme', 'quota_exclusion_controls', 'quota_sidebar', 'quota_query'),
     'quota_chart': test_files('quota_gap_axis', 'quota_chart_performance', 'quota_page', 'quota_chart_exclusions'),
-    'dashboard': test_files('ui', 'comparison_workflow', 'dashboard_evidence', 'ui_value_fixes', 'history_explorer', 'history_timeline', 'history_timeline_data', 'dashboard_readability'),
+    'dashboard': test_files('home', 'ui', 'comparison_workflow', 'dashboard_evidence', 'ui_value_fixes', 'history_explorer', 'history_timeline', 'history_timeline_data', 'dashboard_readability'),
     'details': test_files('ui_details', 'call_transport', 'model_ui'),
     'table': test_files('table_order', 'performance'),
     'shared_ui': test_files('quick_ui', 'display_scaling'),
@@ -120,6 +120,7 @@ RULES = (
     ('cachemonitor/analytics.py', ('analysis', 'cost', 'cache', 'speed', 'quota_math')),
     ('cachemonitor/category_usage.py', ('analysis', 'dashboard')),
     ('cachemonitor/usage_panel.py', ('dashboard', 'speed')),
+    ('cachemonitor/home_panel.py', ('dashboard', 'quota_ui')),
     ('cachemonitor/qml/UsageDashboard.qml', ('dashboard', 'shared_ui')),
     ('cachemonitor/qml/AnalysisLoading.qml', ('dashboard', 'shared_ui', 'details', 'speed')),
     ('cachemonitor/dashboard_views.py', ('analysis', 'dashboard', 'details', 'cost')),
@@ -564,7 +565,7 @@ def package_check(executable, report_dir):
                 duration_seconds=report.get('duration_seconds'), session_rollup=rollup)
 
 
-CORE_TESTS = frozenset(test_files('pricing', 'data_contract', 'core', 'request_modes'))
+CORE_TESTS = frozenset(test_files('pricing', 'data_contract', 'core', 'request_modes', 'collection_preparation'))
 PROCESS_TESTS = frozenset(test_files('ui_check_runner', 'install_management', 'proxy_update', 'app_services'))
 
 

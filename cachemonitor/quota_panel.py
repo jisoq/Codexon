@@ -64,6 +64,7 @@ class QuotaPanel(Group):
         self._query_pending=None
         self._prepared_query=None
         self._chart_pending=None
+        self._chart_waiting_revision=None
         self._chart_value=None
         layout=Column(self)
         layout.setContentsMargins(0,0,0,0)
@@ -341,6 +342,7 @@ class QuotaPanel(Group):
             self._bind_worker()
             selection=period['start'] if period else 'all'
             key=(id(self._query_worker),self.report['worker_revision'],selection)
+            if self._chart_waiting_revision!=key[:2]:self._chart_waiting_revision=None
             offered=self._view['chart']
             if offered['selection']==selection and offered.get('series') is not None:
                 self._chart_value=(key,offered['series'])
@@ -353,14 +355,16 @@ class QuotaPanel(Group):
                 if self._query_worker is not None and hasattr(self._query_worker,'select_chart'):
                     self._query_worker.select_chart(selection,series.get('_content_digest'))
             else:
-                if self._query_worker is not None and self._chart_pending!=key:
+                waiting=self._chart_waiting_revision==key[:2]
+                if waiting and hasattr(self._query_worker,'select_chart'):self._query_worker.select_chart(selection)
+                if self._query_worker is not None and not waiting and self._chart_pending!=key:
                     self._chart_pending=key
                     if hasattr(self._query_worker,'select_chart'):self._query_worker.select_chart(selection)
                     self._query_worker.request('chart',key=key,revision=self.report['worker_revision'],selection=selection)
                 retained=bool(self._chart_value and self._chart_value[0][0]==key[0]
                     and self._chart_value[0][2]==selection and self.history.rows
                     and getattr(self,'_selected_cycle',None)==selection)
-                loading=self._query_worker is not None and self._chart_pending==key
+                loading=self._query_worker is not None and (waiting or self._chart_pending==key)
                 self._set_loading(self.history_loading,loading,'선택한 주기의 차트를 준비하고 있습니다.',retained=retained)
                 self.history.setVisible(retained);self.history_legend.setVisible(retained)
                 self.cycle_table.setVisible(retained and all_cycles)
@@ -469,7 +473,7 @@ class QuotaPanel(Group):
                 try:self._query_worker.result.disconnect(self._receive_query)
                 except (RuntimeError,TypeError):pass
             self._query_worker=worker;self._query_pending=None;self._query_cache={}
-            self._chart_value=None;self._chart_pending=None
+            self._chart_value=None;self._chart_pending=None;self._chart_waiting_revision=None
             if worker is not None:worker.result.connect(self._receive_query)
 
     def _prepared_statistics(self):
@@ -499,6 +503,11 @@ class QuotaPanel(Group):
             current=(id(self._query_worker),self.report.get('worker_revision'),self.cycle_choice.currentData())
             if key!=self._chart_pending or key!=current:return
             self._chart_pending=None
+            if message.get('stale'):
+                self._chart_waiting_revision=key[:2]
+                if getattr(self,'defer_render',False):self._render_dirty=True
+                else:self.render_history()
+                return
             if message.get('error'):
                 self._set_loading(self.history_loading,False)
                 self.history_empty.setText('차트를 계산하지 못했습니다.')

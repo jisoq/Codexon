@@ -263,7 +263,7 @@ def test_process_queries_latest_selection_cache_and_clean_shutdown(tmp_path):
         w.change_page(1);settle()
         w.model.setCurrentIndex(0)
         assert w.metric_panel.data['summary']['value']==7
-        w.nav.setCurrentRow(1)
+        w.nav.setCurrentRow(w.navigation_pages.index(1))
         w.metric_panel.change('filter:source','subagent')
         w.metric_panel.change('filter:source','')
         w.change_page(2); settle()

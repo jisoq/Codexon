@@ -1,6 +1,6 @@
 """Interactive companions for the otherwise click-through overlay."""
 from PySide6.QtCore import Qt, QObject, Property, Signal, Slot, QSignalBlocker, QEvent, QRect, QTimer
-from PySide6.QtGui import QRegion
+from PySide6.QtGui import QRegion, QWindow, QPlatformSurfaceEvent
 from PySide6.QtWidgets import QApplication
 from .overlay_appearance import default_appearance
 from .presentation import Node, Slider, Text
@@ -13,6 +13,73 @@ def named_item(root,name):
         item=named_item(child,name)
         if item is not None:return item
     return None
+
+
+class OverlayWindowStack(QObject):
+    """Keep native layers and Quick popups above their own overlay surfaces."""
+    def __init__(self,controller):
+        super().__init__(controller)
+        self.controller=controller
+        self.owners={}
+        QApplication.instance().installEventFilter(self)
+
+    def bind(self,window,owner):
+        native=self.controller.native
+        if not native or not hasattr(native,'set_owner'):return
+        hwnd,parent=int(window.winId()),int(owner.winId())
+        old=self.owners.get(window)
+        if old and (old[0] is not native or old[1]!=hwnd):self.release(window);old=None
+        original=old[2] if old else native.owner(hwnd)
+        changed=native.owner(hwnd)!=parent
+        if native.set_owner(hwnd,parent):
+            self.owners[window]=(native,hwnd,original,parent)
+            # Setting an owner does not reorder an already visible HWND.
+            if changed and window.isVisible():native.raise_companion(hwnd)
+
+    def release(self,window):
+        old=self.owners.pop(window,None)
+        if old:
+            native,hwnd,original,parent=old
+            if native.owner(hwnd)==parent:native.set_owner(hwnd,original or 0)
+
+    def sync(self):
+        c=self.controller
+        # Independent topmost siblings can overtake one another on activation.
+        # Ownership expresses the visual order without raising on every tick.
+        owner=c.shadow
+        for window in (c.widget,c.detail,c.links,c.header,c.actions,c.toolbar):
+            if not window.isVisible():
+                self.release(window);continue
+            self.bind(window,owner);owner=window
+
+    def eventFilter(self,window,event):
+        kind=event.type()
+        if kind not in (QEvent.Show,QEvent.Expose,QEvent.Hide,QEvent.Destroy,QEvent.PlatformSurface):return False
+        if not isinstance(window,QWindow):return False
+        if kind==QEvent.PlatformSurface:
+            if event.surfaceEventType()==QPlatformSurfaceEvent.SurfaceAboutToBeDestroyed:
+                hwnd=int(window.winId())
+                for child,entry in list(self.owners.items()):
+                    if hwnd in (entry[1],entry[3]):self.release(child)
+            return False
+        if kind in (QEvent.Hide,QEvent.Destroy):
+            self.release(window);return False
+        c=self.controller
+        for control in (c.widget,*c.chrome):
+            quick=control._quick
+            if quick is not None and window.transientParent() is quick.quickWindow():
+                # Quick popups point at QQuickWidget's offscreen window, whose
+                # HWND is not an owner. Use the highest overlay layer instead.
+                top=c.toolbar if c.toolbar.isVisible() else c.actions
+                self.bind(window,c.icon if control is c.icon else top)
+                break
+        return False
+
+    def close(self):
+        QApplication.instance().removeEventFilter(self)
+        # Detach before Qt closes native surfaces: native owner destruction
+        # would otherwise destroy owned HWNDs behind their QWidget wrappers.
+        for window in list(self.owners):self.release(window)
 
 
 class ChromeModel(Node):

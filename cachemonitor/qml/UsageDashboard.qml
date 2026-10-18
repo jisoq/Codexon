@@ -41,12 +41,17 @@ Item {
         anchors.fill:parent;spacing:14
         RowLayout {
             Layout.fillWidth:true;spacing:12
-            Field {caption:root.t('조회 기간');field:'period';value:root.o.period;Layout.preferredWidth:150;Layout.maximumWidth:150;entries:[{text:root.t('전체 기록'),value:'all'},{text:root.t('오늘'),value:'today'},{text:root.t('최근 7일'),value:'7d'},{text:root.t('최근 30일'),value:'30d'},{text:root.t('직접 지정'),value:'custom'}]}
-            UiInput {visible:root.o.period==='custom';Layout.preferredWidth:118;placeholderText:'YYYY-MM-DD';text:root.o.start;Accessible.name:root.t('시작일');onEditingFinished:root.node.change('start',text)}
-            UiInput {visible:root.o.period==='custom';Layout.preferredWidth:118;placeholderText:'YYYY-MM-DD';text:root.o.end;Accessible.name:root.t('종료일');onEditingFinished:root.node.change('end',text)}
+            Field {caption:root.t('조회 기간');field:'period';value:root.s.dateDraft.period;Layout.preferredWidth:150;Layout.maximumWidth:150;entries:[{text:root.t('전체 기록'),value:'all'},{text:root.t('오늘'),value:'today'},{text:root.t('최근 7일'),value:'7d'},{text:root.t('최근 30일'),value:'30d'},{text:root.t('직접 지정'),value:'custom'}]}
             UiButton {text:root.t('조회 조건');Layout.alignment:Qt.AlignBottom;onClicked:root.node.change('filtersOpen','')}
             Copy {text:root.masked?'':root.s.scope;Layout.fillWidth:true;color:appTheme.palette.muted;font.pixelSize:12;Layout.alignment:Qt.AlignBottom;Layout.bottomMargin:10}
             UiButton {text:root.t('새로고침');role:'quiet';Layout.alignment:Qt.AlignBottom;onClicked:root.node.change('metric',root.o.metric)}
+        }
+        RowLayout {
+            visible:root.s.dateDraft.period==='custom';Layout.fillWidth:true;spacing:12
+            UiInput {objectName:'usage-date-start';Layout.preferredWidth:118;Layout.maximumWidth:118;placeholderText:'YYYY-MM-DD';text:root.s.dateDraft.start;Accessible.name:root.t('시작일');onTextEdited:root.node.change('start',text)}
+            UiInput {objectName:'usage-date-end';Layout.preferredWidth:118;Layout.maximumWidth:118;placeholderText:'YYYY-MM-DD';text:root.s.dateDraft.end;Accessible.name:root.t('종료일');onTextEdited:root.node.change('end',text)}
+            UiButton {objectName:'usage-date-apply';text:root.t('적용');enabled:root.s.dateCanApply;onClicked:root.node.change('applyDates','')}
+            Copy {objectName:'usage-date-notice';Layout.fillWidth:true;text:root.s.dateNotice;color:root.s.dateError?appTheme.palette.error:appTheme.palette.muted;font.pixelSize:12;Accessible.name:text}
         }
         Flow {
             Layout.fillWidth:true;Layout.preferredHeight:childrenRect.height;spacing:12;visible:root.o.filtersOpen

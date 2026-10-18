@@ -375,6 +375,97 @@ def test_qt_panel_rolling_hover_analysis_and_click(tmp_path):
     finally:dispose(host)
 
 @pytest.mark.integration
+def test_compact_performance_panels_preserve_selection_and_chart_view(tmp_path):
+    import time
+    from PySide6.QtCore import QSettings,QObject,QPointF
+    from PySide6.QtTest import QTest
+    from cachemonitor.performance_panel import PerformancePanel
+    from cachemonitor.presentation import Group,Row
+    from cachemonitor.quick_qa import mount,dispose,control,click,render_plot,scene_view
+
+    calls=[]
+    owner=SimpleNamespace(settings=QSettings(str(tmp_path/'compact.ini'),QSettings.IniFormat),render=lambda:calls.append(True))
+    ui=PerformancePanel(owner)
+    rows=[row(i,model=model,key=f'{model}-{i}') for model in ('m','other') for i in range(20)]
+    ui.apply(PerformanceTrends().query(engine(rows),query(granularity='auto')))
+    # Reserve real sidebar space so the layout receives page width, not window width.
+    shell=Row();shell.setSpacing(20);sidebar=Group();sidebar.setFixedWidth(180)
+    shell.addWidget(sidebar);shell.addWidget(ui,1)
+    host=mount(shell,1000,760)
+    try:
+        def wait_for(condition):
+            deadline=time.monotonic()+3
+            while not condition():
+                assert time.monotonic()<deadline, 'Performance layout did not settle'
+                QTest.qWait(10);host.quick.grabFramebuffer()
+
+        def update_layout():
+            width=scene_view(host,ui).width()
+            assert width<host.quick.width()
+            ui.update_layout(width)
+
+        def x(view):return view.mapToScene(QPointF(0,0)).x()
+
+        def before(left,right):return x(left)+left.width()<=x(right)
+
+        def collapsed_layout():
+            return scene_view(host,ui.chart_scroll).width()>=scene_view(host,ui).width()*.9
+
+        update_layout()
+        chart=ui.plots['cost'];item=render_plot(host,chart)
+        for plot in ui.plots.values():
+            control(host,plot).findChild(QObject,'plotHover').setProperty('enabled',False)
+        ui.solo('m');ui.choose_mode('Standard');ui.set_window(*ui.range,follow=False)
+        point=next(p for p in chart.rows if p['value'] is not None);ui.show_interval(point,'cost')
+        selected=(dict(ui.models),dict(ui.modes),list(ui.time_range),ui.inspected,ui.reasoning_effort)
+        nodes=dict(ui.plots);details=ui.details;calls.clear()
+        wait_for(collapsed_layout)
+        assert not ui.legend_scroll.isVisible() and not ui.inspector.isVisible()
+        assert control(host,ui.model_panel_button).isVisible() and control(host,ui.inspector_button).isVisible()
+
+        def assert_preserved():
+            assert (ui.models,ui.modes,ui.time_range,ui.inspected,ui.reasoning_effort)==selected
+            assert ui.plots==nodes and ui.details is details and control(host,chart) is item
+            assert not calls
+
+        for opened,closed,button in ((ui.legend_scroll,ui.inspector,ui.model_panel_button),
+                                     (ui.inspector,ui.legend_scroll,ui.inspector_button)):
+            click(host,control(host,button))
+            def side_layout():
+                side=scene_view(host,opened);center=scene_view(host,ui.chart_scroll);plot=scene_view(host,chart)
+                ordered=before(side,center) if opened is ui.legend_scroll else before(center,side)
+                return (side.isVisible() and ordered and x(plot)>=x(center)
+                        and x(plot)+plot.width()<=x(center)+center.width())
+            wait_for(side_layout)
+            assert opened.isVisible() and not closed.isVisible() and button.isChecked()
+            view=scene_view(host,chart);origin=view.mapToScene(QPointF(0,0))
+            assert view.width()>=scene_view(host,ui).width()/2
+            assert origin.x()>=0 and origin.x()+view.width()<=host.quick.width()
+            assert_preserved()
+        click(host,control(host,ui.inspector_button))
+        wait_for(collapsed_layout)
+        assert not ui.legend_scroll.isVisible() and not ui.inspector.isVisible()
+
+        for width in (1680,1000):
+            previous_width=scene_view(host,ui).width()
+            host.resize(width,760)
+            wait_for(lambda:host.quick.width()==width and
+                     (scene_view(host,ui).width()>previous_width if width==1680 else scene_view(host,ui).width()<previous_width))
+            update_layout()
+            if width==1680:
+                def wide_layout():
+                    left=scene_view(host,ui.legend_scroll);center=scene_view(host,ui.chart_scroll);right=scene_view(host,ui.inspector)
+                    return left.isVisible() and right.isVisible() and before(left,center) and before(center,right)
+                wait_for(wide_layout)
+            else:
+                wait_for(collapsed_layout)
+                assert not ui.legend_scroll.isVisible() and not ui.inspector.isVisible()
+            assert_preserved()
+        assert not host.qml_errors
+    finally:dispose(host)
+
+
+@pytest.mark.integration
 def test_reasoning_tabs_share_trend_axis_and_keep_other_charts(tmp_path):
     from datetime import datetime
     from PySide6.QtCore import QSettings,QPointF,QObject
@@ -618,8 +709,8 @@ def test_dashboard_tab_worker_contract_and_navigation(tmp_path):
         session.add_usage(1800000000,'r',dict(input_tokens=100,cached_input_tokens=90,cache_write_input_tokens=0,output_tokens=50,reasoning_output_tokens=10),'gpt-6-astra','t','high','Standard')
         session.add_usage(1800000001,'r2',dict(input_tokens=100,cached_input_tokens=90,cache_write_input_tokens=0,output_tokens=50,reasoning_output_tokens=10),'gpt-6.1-sol','t2','high','Standard')
         w.receive(dict(ts=1800100000,sessions=[session.view(1800100000)],homes=['synthetic'],errors=[],unassigned=[],index={'loading':True}))
-        assert w.navigation_pages==(3,1,5)
-        w.nav.setCurrentRow(2)
+        assert w.navigation_pages==(6,3,1,5)
+        w.nav.setCurrentRow(w.navigation_pages.index(5))
         assert w.current_page==5 and not w.common_filters.isVisible()
         assert w.performance_panel.plots['cost'].rows
         q=w.query();result=w.engine.page_query(q)
@@ -714,6 +805,10 @@ def test_dense_workspace_model_comparison_and_hover_analysis(tmp_path,shell):
     owner.render=refresh;ui.apply(data)
     if not shell:host=mount(ui,1440,940)
     try:
+        if ui.compact:
+            click(host,control(host,ui.model_panel_button))
+            from test_ui import wait_for_rendered
+            wait_for_rendered(lambda:control(host,ui.model_choice).isVisible())
         ui.model_choice.choose(ui.model_choice.findData(models[0]));QTest.qWait(60)
         assert [m for m in ui.available if ui.models.get(m,True)]==[models[0]]
         click(host,render_plot(host,ui.add_button));ui.search.setText('6.1')
@@ -740,6 +835,9 @@ def test_dense_workspace_model_comparison_and_hover_analysis(tmp_path,shell):
         assert 'cost_total' not in ui.plots
         assert all(v is None or plot.bounds[0]<=v<=plot.bounds[1] for v in plot_values(plot.data,plot.selected_style))
         trend=next(p for p in plot.rows if p['value'] is not None and p['band_valid'])
+        if ui.compact:
+            click(host,control(host,ui.inspector_button))
+            wait_for_rendered(lambda:control(host,ui.inspector).isVisible())
         item=render_plot(host,plot)
         # Deliver the hover directly, independent of delayed synthetic click movement.
         from PySide6.QtCore import QObject

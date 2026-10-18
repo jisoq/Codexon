@@ -37,13 +37,13 @@ def test_composition_is_passive_and_controls_persist(tmp_path):
         links.view.activateLink('unit-usd')
         assert m.composition_unit=='usd' and m.settings.value('overlay/compositionUnit')=='usd'
         links.view.activateLink('tab-latest')
-        assert m.monitor_tab=='latest' and m.base_height()==before
+        assert m.monitor_tab=='history' and m.base_height()==before
         assert not any(r.get('formula') or r['id'].startswith('composition-') for r in m.monitor_links())
         assert links.mask().contains(QPoint(50,m.layout()['rows']+9))
         assert all(r.get('interaction')=='tooltip' for r in m.monitor_links() if r['x']<=50<r['x']+r['width'] and r['y']<=m.layout()['rows']+9<r['y']+r['height'])
-        assert m.monitor_tab=='latest'
+        assert m.monitor_tab=='history'
         links.view.activateLink('tab-history')
-        assert m.settings.value('overlay/monitorTab')=='history'
+        assert not any(r['id'].startswith('tab-') for r in m.monitor_links())
         w.set_content(dict(summary(),id='other'));assert not m.detail_links()
         assert not links.qml_errors
     finally:links.close();w.close();app.processEvents()
@@ -125,14 +125,14 @@ def test_overlay_defaults_and_saved_selection_restoration(tmp_path):
         m=first.widget.content_model
         assert (m.monitor_tab,m.composition_unit,m.detail_group)==('history','usd','sub')
         from cachemonitor.overlay_monitor import toggle_segments
-        assert [segment[2] for segment in toggle_segments(m,'tab')]==['history','latest']
+        assert not any(r['id'].startswith('tab-') for r in m.monitor_links())
         assert [segment[2] for segment in toggle_segments(m,'unit')]==['usd','tokens']
         assert [segment['id'] for segment in m.state['detailGroupSegments']]==['sub','model']
         m.monitor_action('tab-latest');m.monitor_action('unit-tokens')
     finally:first.stop()
     second=OverlayController(prefs,native_enabled=False)
     try:
-        assert second.widget.content_model.monitor_tab=='latest'
+        assert second.widget.content_model.monitor_tab=='history'
         assert second.widget.content_model.composition_unit=='tokens'
     finally:second.stop()
 
@@ -144,7 +144,7 @@ def test_unique_entries_selection_and_session_detail(layout_controller):
     c.receive_snapshot({'overlay_sessions':[data]})
     c.receive_target({'target':{'hwnd':1},'selection':Selection(data['id'])})
     m=c.widget.content_model;m.monitor_action('tab-latest');received=[];c.navigation_requested.connect(received.append)
-    assert {r['id'] for r in m.monitor_links() if r.get('target')}=={'session'}
+    assert {r['id'] for r in m.monitor_links() if r.get('interaction')=='navigate'}=={'session'}
     c.links.view.activateLink('session')
     assert received[-1].sort=='time_desc' and received[-1].view=='requests'
     m.monitor_action('tab-history');c.refresh()
@@ -177,11 +177,8 @@ def test_passive_metrics_and_inline_header_regions(layout_controller):
     assert m.selected_id==before
     assert named_item(c.actions.quick.rootObject(),'expand') is not None
     c.expanded=True;c.native.bounds=(0,0,550,1000);c.refresh()
-    if m.detail_inline:
-        assert c.header.width()==round(82*m.appearance.scale)
-        close=named_item(c.detail.quick.rootObject(),'closeDetail')
-        assert close.x()+close.width() < c.actions_geometry[0]-c.monitor_geometry[0]
-    assert named_item(c.detail.quick.rootObject(),'closeDetail') is not None
+    assert c.header.width()>0
+    assert named_item(c.detail.quick.rootObject(),'closeDetail') is None
     assert not any(control.qml_errors for control in c.chrome)
 
 
@@ -205,7 +202,7 @@ def test_detail_grouping_and_scrolling_keep_costs_and_panel_height(layout_contro
         c.native.bounds=bounds;c.refresh()
         root=c.detail.quick.rootObject();scroll=named_item(root,'detailScroll')
         height=c.detail.height();selected=m.selected_id
-        model_cost=m.state['detailMainCost'];sub_cost=m.state['detailSubCost']
+        model_cost=m.state['detailAgentCount'];sub_cost=m.state['detailSubCost']
         costs=named_item(root,'detailCostHeader')
         cost_position=costs.mapRectToScene(costs.boundingRect())
         assert {row['model'] for row in m.detail_groups()}=={'gpt-6-sol','gpt-6-luna'}
@@ -233,7 +230,7 @@ def test_detail_grouping_and_scrolling_keep_costs_and_panel_height(layout_contro
         wait_for(lambda:scroll.property('contentY')>0)
         assert c.detail.height()==height and m.selected_id==selected
         assert costs.mapRectToScene(costs.boundingRect())==cost_position
-        assert (m.state['detailMainCost'],m.state['detailSubCost'])==(model_cost,sub_cost)
+        assert (m.state['detailAgentCount'],m.state['detailSubCost'])==(model_cost,sub_cost)
         click(c.detail,named_item(root,'detailMode-model'))
         wait_for(lambda:scroll.property('contentY')==0)
         assert c.detail.height()==height

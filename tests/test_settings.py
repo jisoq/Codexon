@@ -199,7 +199,7 @@ def test_search_navigation_and_preserved_preferences(tmp_path,monkeypatch,langua
         assert values==[option.isChecked() for option in window.notification_options.values()]
         assert not hasattr(window,'cache_panel')
         assert not hasattr(window,'cache_master')
-        assert window.nav.count()==3
+        assert window.nav.count()==4
         calls=[];monkeypatch.setattr('cachemonitor.update_panel.open_recovery',lambda *args:calls.append(args))
         page.reveal('troubleshooting');click(window,render_plot(window,window.recovery_button));assert len(calls)==1
         page.search.setText('cache');page.navigation.choose(page.navigation.currentRow())
@@ -295,6 +295,7 @@ def test_notification_multiline_evidence_is_truncated_and_opens_full_detail(star
 def test_collection_freshness_uses_direct_observation_when_analysis_is_behind(startup_settings_window,monkeypatch):
     window,_=startup_settings_window
     now=1000.;monkeypatch.setattr('cachemonitor.dashboard.time.time',lambda:now)
+    window.started_at=now
     window.error_state.clock=lambda:now
     window.snapshot['ts']=950.
     window.receive_collection_status(dict(collection_fault={},collection_healthy=True,collection_snapshot_at=999.))

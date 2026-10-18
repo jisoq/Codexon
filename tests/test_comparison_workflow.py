@@ -93,7 +93,7 @@ def test_comparison_navigation_and_controls_accept_rendered_input(dashboard):
             QTest.qWait(5)
         raise AssertionError(name)
     navigation=control(w,w.nav)
-    target=next(item for item in walk(navigation) if item.property('index')==1
+    target=next(item for item in walk(navigation) if item.property('index')==w.navigation_pages.index(1)
                 and item.metaObject().indexOfProperty('modelData')>=0)
     click(w,target)
     assert w.current_page==1
@@ -108,11 +108,11 @@ def test_comparison_navigation_and_controls_accept_rendered_input(dashboard):
 
 
 @pytest.mark.essential
-def test_primary_routes_start_with_monitoring_and_preserve_drilldown(dashboard):
+def test_primary_routes_start_with_home_and_preserve_drilldown(dashboard):
     w=dashboard;w.resize(1000,680)
-    assert w.current_page==3
-    assert control(w,w.nav).property('count')==3
-    for page in (1,5,3):
+    assert w.current_page==6
+    assert control(w,w.nav).property('count')==4
+    for page in (1,5,3,6):
         w.nav.setCurrentRow(w.navigation_pages.index(page))
         wait_for_rendered(lambda:w.current_page==page and not w.analysis_pending)
         assert control(w,w.pages.widget(page-1)).isVisible()
@@ -191,6 +191,89 @@ def test_metric_modes_and_saved_scope_restore_after_monitoring(dashboard):
     assert w.current_page==3
     w.restore_state(saved);assert p.options['metric']=='tps' and p.options['dimension']=='model'
     assert p.options['period']=='7d' and p.options['sort']=='name'
+    assert not w.qml_errors
+
+
+@pytest.mark.parametrize('start,end', [
+    ('2026-10-', '2026-10-17'),
+    ('2026-02-30', '2026-10-17'),
+    ('2026-10-18', '2026-10-17'),
+])
+def test_custom_date_drafts_preserve_results_and_apply_exact_cohort(dashboard,monkeypatch,start,end):
+    import json
+    from datetime import datetime
+    from PySide6.QtCore import Qt,QPointF
+    from PySide6.QtTest import QTest
+    w=dashboard;w.tick.stop();w.resize(1000,680)
+    source=snapshot(datetime(2026,10,18,12).timestamp());source['sessions']=source['sessions'][:1]
+    source['sessions'][0]['history']=source['sessions'][0]['history'][:2]
+    for day,row in zip((16,17),source['sessions'][0]['history']):row['ts']=datetime(2026,10,day,12).timestamp()
+    w.receive(source);w.change_page(1);p=w.metric_panel
+    wait_for_rendered(lambda:p.data.get('summary',{}).get('value')==2)
+    usage=control(w,p)
+    def rendered(name):
+        return next(item for item in walk(usage) if item.objectName()==name and item.isVisible())
+    def type_date(name,value):
+        item=rendered(name);click(w,item);QTest.keyClick(w.quick,Qt.Key_A,Qt.ControlModifier)
+        QTest.keyClicks(w.quick,value)
+        wait_for_rendered(lambda:item.property('text')==value)
+    before=copy.deepcopy(p.data);scope=p.state['scope'];accepted=p.query();saved=p.capture()
+    requests=[];page_query=w.engine.page_query
+    def record_query(query):
+        requests.append(copy.deepcopy(query));return page_query(query)
+    monkeypatch.setattr(w.engine,'page_query',record_query)
+    p.change('period','custom')
+    wait_for_rendered(lambda:rendered('usage-date-start').width()>0)
+    type_date('usage-date-start',start);type_date('usage-date-end',end)
+    assert p.state['dateError'] and rendered('usage-date-notice').property('text')
+    assert not rendered('usage-date-apply').isEnabled()
+    p.change('applyDates','')
+    assert not requests and p.data==before and p.state['scope']==scope and p.query()==accepted
+    assert p.capture()==saved
+    w.render(automatic=True)
+    assert requests[-1]['period']==accepted['period'] and requests[-1]['start']==accepted['start']
+    assert p.data==before and p.state['scope']==scope
+    w.save_preferences()
+    assert json.loads(w.settings.value('dashboard/state'))['metric_workspace']==saved
+    requests.clear()
+    type_date('usage-date-start','2026-10-16');type_date('usage-date-end','2026-10-16')
+    assert p.state['dateCanApply'] and not p.state['dateError']
+    assert not requests and p.data==before and p.state['scope']==scope
+    button=rendered('usage-date-apply');position=button.mapToScene(QPointF())
+    assert 0<=position.x()<position.x()+button.width()<=w.quick.width()
+    click(w,button)
+    wait_for_rendered(lambda:p.data['summary']['value']==1 and not p.state['datePending'])
+    assert len(requests)==1 and requests[0]['start']==datetime(2026,10,16).timestamp()
+    assert requests[0]['end']==datetime(2026,10,17).timestamp()
+    assert p.options['period']=='custom' and p.state['scope']!=scope
+    assert json.loads(w.settings.value('dashboard/state'))['metric_workspace']==p.capture()
+    applied=p.capture();applied_query=p.query();applied_scope=p.state['scope']
+    type_date('usage-date-start','2026-10-')
+    assert p.state['dateError'] and p.query()==applied_query and p.state['scope']==applied_scope
+    w.render(automatic=True)
+    assert requests[-1]['start']==applied_query['start'] and requests[-1]['end']==applied_query['end']
+    assert p.data['summary']['value']==1 and p.state['scope']==applied_scope
+    p.records()
+    wait_for_rendered(lambda:w.current_page==2 and len(w.record_rows)==1)
+    assert w.record_rows[0]['key']==source['sessions'][0]['history'][0]['key']
+    w.go_back();wait_for_rendered(lambda:w.current_page==1 and p.data['summary']['value']==1)
+    assert p.capture()==applied and p.date_draft=={key:applied[key] for key in ('period','start','end')}
+    w.go_back();wait_for_rendered(lambda:p.data['summary']['value']==2)
+    assert p.capture()==saved and p.state['scope']==scope
+    assert not w.qml_errors
+
+
+def test_custom_date_restore_rejects_invalid_saved_ranges(dashboard):
+    from datetime import datetime
+    w=dashboard;w.tick.stop();w.change_page(1);p=w.metric_panel
+    p.change('period','7d');accepted=p.query()
+    for values in (dict(start='',end='2026-10-17'),dict(start='2026-10-18',end='2026-10-17')):
+        p.restore(dict(period='custom',**values));w.render()
+        assert p.state['dateError'] and p.capture()['period']=='7d' and p.query()==accepted
+        assert p.data['summary']['value']>0
+    p.change('start','2099-01-01');p.change('end','2099-01-02');p.change('applyDates','')
+    assert p.query()['start']==datetime(2099,1,1).timestamp() and p.query()['end']==p.query()['start']
+    assert p.data['summary']['value']==0 and not p.state['dateError']
     assert not w.qml_errors
 
 

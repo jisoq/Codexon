@@ -1,4 +1,4 @@
-"""Always-visible account allowance and read-only reset-credit details."""
+"""Sidebar account allowance and read-only reset-credit details."""
 from decimal import Decimal
 import time
 
@@ -9,7 +9,7 @@ from .banked_resets import reset_credit_display
 from .charts import Plot
 from .i18n import formatted, tr
 from .presentation import Button, Column, Group, Row, Scroll, Text
-from .quota import quota_display
+from .quota import quota_payload_display
 from .quick_runtime import Dialog
 from .theme import shared_theme
 
@@ -66,7 +66,7 @@ class QuotaSidebar(Group):
     def __init__(self):
         super().__init__()
         self.setObjectName('quota-sidebar');self.put(background='secondary',radius=10)
-        self.quota=None;self.issue='';self.reset_dialog=None;self.reset_items=[]
+        self.quota=None;self.payload={};self.issue='';self.reset_dialog=None;self.reset_items=[]
         self.lookup_failed=False;self.failure_note=''
         self._reset_rows=[];self._reset_note='';self._dialog_signature=None
         body=Column(self);body.setContentsMargins(12,12,12,12);body.setSpacing(7)
@@ -99,6 +99,7 @@ class QuotaSidebar(Group):
         self.refresh_status()
 
     def receive(self,value):
+        self.payload=value
         self.quota=value.get('quota');self.issue=value.get('issue','')
         from .app_errors import detect
         facts=(value.get('quota_faults') or {}).get('lookup') or {}
@@ -117,9 +118,7 @@ class QuotaSidebar(Group):
                    'enterprise':'Enterprise','edu':'Edu'}.get(plan,'')
         self.plan.setText(plan_text);self.plan.setToolTip(plan_text);self.plan.setVisible(bool(plan_text))
         for mode,card in self.current.items():
-            display=quota_display(self.quota,mode,now)
-            if self.lookup_failed:
-                display={**display,'remaining':None,'state':'최신 잔여량 미확인','tooltip':self.failure_note}
+            display=quota_payload_display(self.payload,mode,now)
             remaining=display['remaining']
             card['value'].setText(f'{remaining:.1f}%' if remaining is not None else
                                   '∞' if display['state']=='제한 없음' else '—')

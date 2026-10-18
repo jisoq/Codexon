@@ -88,9 +88,9 @@ def main():
             scroller.setProperty('contentY',min(row[2],scroller.property('contentHeight')-scroller.height()))
             QTest.qWait(40)
         result=widget.grab();painter=QPainter(result)
-        if expanded:painter.drawPixmap(0,0,detail.grab())
-        painter.drawPixmap(round(widget.content_model.monitor_x+ACTIONS_X),13,actions.grab())
-        if opacity_popup:painter.drawPixmap(round(widget.content_model.monitor_x+POPUP_X),44,popup.grab())
+        if expanded:painter.drawPixmap(0 if inline else WIDTH,0,detail.grab())
+        painter.drawPixmap(round(widget.content_model.detail_extent+ACTIONS_X),13,actions.grab())
+        if opacity_popup:painter.drawPixmap(round(widget.content_model.detail_extent+POPUP_X),44,popup.grab())
         painter.end()
         path=args.output.with_name(args.output.stem+'-'+name).with_suffix('.png')
         assert result.save(str(path)), f'Could not save {path}'

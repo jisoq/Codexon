@@ -15,19 +15,24 @@ Rectangle {
     color: appTheme.palette.hit_surface
     clip: true
 
+    Item {
+    id: detailContent
+    objectName: "detailContent"
+    anchors.fill: parent
+    opacity: root.s.contentOpacity === undefined ? 1 : root.s.contentOpacity
 
     Button {
         id: openDashboard
         objectName: "openDashboard"
-        x: root.bodyMargin * root.unitScale; y: 12 * root.unitScale
-        width: implicitWidth; height: 28 * root.unitScale
+        x: root.bodyMargin * root.unitScale; y: (root.s.detailHeadingY || 52) * root.unitScale
+        width: implicitWidth; height: 20 * root.unitScale
         enabled: root.s.detailHasSession || false
-        text: appLanguage.text("Sub 상세")
+        text: "Sub Agents"
         padding: 0
         contentItem: Text {
             text: openDashboard.text
             font.family: root.s.overlayFamily || "Pretendard JP"
-            font.pixelSize: 14 * root.unitScale; font.weight: Font.DemiBold
+            font.pixelSize: 12 * root.unitScale; font.weight: Font.DemiBold
             color: openDashboard.enabled && (openDashboard.hovered || openDashboard.visualFocus) ? root.s.overlayAccent : root.s.overlayInk || appTheme.palette.ink
             verticalAlignment: Text.AlignVCenter
             font.underline: openDashboard.enabled && (openDashboard.hovered || openDashboard.visualFocus)
@@ -42,7 +47,7 @@ Rectangle {
         id: groupingTrack
         property var segments: root.s.detailGroupSegments || []
         x: segments.length ? segments[0].x * root.unitScale : 0
-        y: 16 * root.unitScale
+        y: (root.s.detailHeadingY || 52) * root.unitScale
         width: segments.length ? (segments[0].width + segments[1].width) * root.unitScale : 0
         height: 20 * root.unitScale; radius: height / 2
         color: root.s.overlayBand || appTheme.palette.panel
@@ -53,11 +58,12 @@ Rectangle {
             id: groupingButton
             required property var modelData
             objectName: "detailMode-" + modelData.id
-            x: modelData.x * root.unitScale; y: 14 * root.unitScale
+            x: modelData.x * root.unitScale; y: ((root.s.detailHeadingY || 52) - 2) * root.unitScale
             width: modelData.width * root.unitScale; height: 24 * root.unitScale
             checked: root.s.detailGroup === modelData.id
             text: modelData.label
             padding: 0
+            UiToolTip { visible: groupingButton.hovered; text: appLanguage.text(groupingButton.modelData.tooltip || "") }
             background: Rectangle {
                 x: root.unitScale; y: 3 * root.unitScale
                 width: parent.width - 2 * root.unitScale; height: 18 * root.unitScale
@@ -81,34 +87,14 @@ Rectangle {
             HoverHandler { cursorShape: Qt.PointingHandCursor }
         }
     }
-    ToolButton {
-        id: closeDetail
-        objectName: "closeDetail"
-        x: ((root.s.detailWidth || 208) > 208 ? root.s.detailCloseX : 204) * root.unitScale
-        y: 12 * root.unitScale; width: 24 * root.unitScale; height: 28 * root.unitScale
-        text: "×"
-        contentItem: Text {
-            text: closeDetail.text; color: root.s.overlayInk || appTheme.palette.ink
-            font.pixelSize: 18 * root.unitScale
-            horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter
-        }
-        background: Rectangle {
-            radius: 4 * root.unitScale
-            color: closeDetail.hovered ? (root.s.overlaySurface || appTheme.palette.overlay) : "transparent"
-            border.width: closeDetail.visualFocus ? 2 : 0
-            border.color: root.s.overlayAccent || appTheme.palette.accent
-        }
-        Accessible.name: appLanguage.text("상세 닫기")
-        onClicked: root.presentation.escapePanel()
-    }
     Row {
         objectName: "detailCostHeader"
-        x: root.bodyMargin * root.unitScale; y: 53 * root.unitScale
+        x: root.bodyMargin * root.unitScale; y: ((root.s.detailHeadingY || 52) + 36) * root.unitScale
         spacing: 12 * root.unitScale
         Repeater {
             model: [
-                { id: "main", label: "Main Agent", value: root.s.detailMainCost, size: root.s.detailMainCostSize, exact: root.s.detailMainExact, partial: root.s.detailMainPartial },
-                { id: "sub", label: "Sub Agent", value: root.s.detailSubCost, size: root.s.detailSubCostSize, exact: root.s.detailSubExact, partial: root.s.detailSubPartial }
+                { id: "sub", label: appLanguage.text("비용"), value: root.s.detailSubCost, size: root.s.detailSubCostSize, exact: root.s.detailSubExact, partial: root.s.detailSubPartial },
+                { id: "count", label: appLanguage.text("개수"), value: root.s.detailAgentCount, size: root.s.detailAgentCountSize, exact: root.s.detailAgentCount, partial: false }
             ]
             delegate: Item {
                 id: costSummary
@@ -146,14 +132,14 @@ Rectangle {
         }
     }
     Rectangle {
-        x: root.bodyMargin * root.unitScale; y: 120 * root.unitScale
+        x: root.bodyMargin * root.unitScale; y: ((root.s.detailHeadingY || 52) + 103) * root.unitScale
         width: (root.s.detailWidth || 208) * root.unitScale; height: root.unitScale
         color: root.s.overlayBorder || appTheme.palette.border
     }
     Flickable {
         id: bodyScroll
         objectName: "detailScroll"
-        x: root.bodyMargin * root.unitScale; y: 132 * root.unitScale
+        x: root.bodyMargin * root.unitScale; y: ((root.s.detailHeadingY || 52) + 115) * root.unitScale
         width: (root.s.detailWidth || 208) * root.unitScale
         height: Math.max(0, parent.height - y - 16 * root.unitScale)
         clip: true; boundsBehavior: Flickable.StopAtBounds
@@ -216,7 +202,7 @@ Rectangle {
         }
         ScrollBar.vertical: ScrollBar {
             objectName: "detailScrollBar"
-            parent: root
+            parent: detailContent
             x: bodyScroll.x + bodyScroll.width + ((root.s.detailWidth || 208) > 208 ? 2 : 6) * root.unitScale
             y: bodyScroll.y; height: bodyScroll.height
             width: 4 * root.unitScale; policy: ScrollBar.AsNeeded
@@ -228,4 +214,5 @@ Rectangle {
         }
     }
 
+    }
 }

@@ -40,6 +40,48 @@ def subagent_summary():
     return next(row for row in OverlaySummaries().collect(engine) if row['id']=='parent')
 
 
+def test_sub_groups_sort_by_own_latest_update_without_changing_model_order():
+    app=QApplication.instance() or QApplication([])
+    window=SessionOverlay();data=subagent_summary()
+    agents=data['subagent_finance']['agents']
+    by_id={agent['id']:agent for agent in agents}
+    by_id['child']['latest_ts']=100
+    by_id['other']['latest_ts']=200
+    assert by_id['child']['cost']>by_id['other']['cost']
+    try:
+        window.set_content(data);model=window.content_model
+        assert [row['id'] for row in model.detail_groups()]==['other','child']
+        expanded=model.detail_groups()[0]['key'];model.toggle_detail_group(expanded)
+        updated=copy.deepcopy(data);next(a for a in updated['subagent_finance']['agents'] if a['id']=='child')['latest_ts']=300
+        window.set_content(updated)
+        assert [row['id'] for row in model.detail_groups()]==['child','other']
+        assert expanded in model.expanded_groups
+        model.set_detail_group('model')
+        assert [row['cost'] for row in model.detail_groups()]==sorted((row['cost'] for row in model.detail_groups()),reverse=True)
+    finally:window.close()
+
+
+def test_unknown_agent_identity_and_expanded_speed():
+    app=QApplication.instance() or QApplication([])
+    w=SessionOverlay()
+    try:
+        data=subagent_summary();w.set_content(data);w.set_layout(detail=True);m=w.content_model
+        assert m.subagent_call_label({})=='미확인'
+        assert m.subagent_call_label(dict(model='미확인',effort='미확인'))=='미확인'
+        for mode in ('sub','model'):
+            m.set_detail_group(mode);group=m.detail_groups()[0]
+            m.toggle_detail_group(group['key'])
+            items=m.detail_items()
+            label=next(item for item in items if item[0]=='평균 출력 속도')
+            assert any(item[2]==label[2] and item[8].get('right') for item in items)
+            categories=[item for item in items if item[8].get('square')]
+            assert categories and not any(item[8].get('dot') for item in categories)
+            for item in categories:
+                value=next(row for row in items if row[2]==item[2] and row[8].get('right'))
+                assert '(' in value[0] and value[0].endswith(')')
+    finally:w.close()
+
+
 def test_english_overlay_translates_visible_text_before_detail_layout(monkeypatch):
     import re
     from PySide6.QtGui import QFontMetrics
@@ -70,8 +112,8 @@ def test_english_overlay_translates_visible_text_before_detail_layout(monkeypatc
                 image.fill(0);p=QPainter(image);m.paint(p);p.end()
         detail=[line for item in m._detail_items for line in (item[0] if isinstance(item[0],list) else [item[0]])]
         assert not [value for value in drawn+detail if re.search('[가-힣]',value)]
-        assert 'Output speed' in drawn and 'Current' in drawn and 'Recent' in drawn
-        assert tr(m.state['detailTitle'])=='Sub details' and 'gpt-shared-long-model-name' in ''.join(detail)
+        assert 'Trend' in drawn and 'Current' not in drawn and 'Recent' not in drawn
+        assert tr(m.state['detailTitle'])=='Sub Agents' and 'gpt-shared-long-model-name' in ''.join(detail)
         assert data==original
         # Full sentences must be translated before line splitting, not fragment by fragment.
         formulas=[item for item in m._detail_items if isinstance(item[0],list)]
@@ -123,7 +165,7 @@ def test_call_selection_is_by_identifier_and_never_changes_monitor():
         m.select(m.call_id(m.rows()[0]))
         assert m.selected_id!=fixed and m._detail_items==body
         w.set_content(None,'기록 확인 중');assert m.selected_id is None and m.rows()==[] and m.selected()=={}
-        assert m.notice_card()[0]=='기록 확인 중' and not m.monitor_links()
+        assert m.notice_card()[0]=='기록 준비 중' and len(m.monitor_links())==1
         assert all(value!='—' for value in w.lines())
     finally:w.close();app.processEvents()
 
@@ -198,7 +240,7 @@ def test_subagent_groups_share_one_population_and_fixed_header():
         for value in (123456789012345.67,.00001,.0001,None):
             resized=copy.deepcopy(data);resized['own_cost']=value;resized['subagent_finance']['cost']=value
             w.set_content(resized);app.processEvents()
-            for prefix,name in (('detailMain','main'),('detailSub','sub')):
+            for prefix,name in (('detailSub','sub'),):
                 amount=item('detailCostAmount-'+name)
                 assert amount.property('implicitWidth')<=amount.width()
                 metrics=QFontMetrics(font(m.appearance.family,m.state[prefix+'CostSize'],600))
@@ -229,14 +271,14 @@ def test_detail_expansion_preserves_monitor_pixels_and_font_scale():
             image=QImage(m.panel_width(),m.panel_height(),QImage.Format_ARGB32_Premultiplied);image.fill(0)
             p=QPainter(image);m.paint(p);p.end();return image
         normal=render();m.set_layout(detail=True);detail=render()
-        assert m.panel_width()==590 and m.panel_height()==542 and m.monitor_x==240
-        normal_crop=normal.copy(12,48,326,490);detail_crop=detail.copy(252,48,326,490)
+        assert m.panel_width()==590 and m.panel_height()==normal.height() and m.monitor_x==0
+        normal_crop=normal.copy(12,48,326,normal.height()-52);detail_crop=detail.copy(12,48,326,normal.height()-52)
         a=bytes(normal_crop.constBits());b=bytes(detail_crop.constBits())
         # Qt's translated antialias coverage may differ by one channel level.
         assert max(abs(x-y) for x,y in zip(a,b))<=1
         for size in (10,14,21):
             w.set_content(subagent_summary(),appearance=replace(default_appearance(True),font_size=size));s=max(1,size/14)
-            assert m.panel_width()==round(590*s) and m.panel_height()==round(542*s)
+            assert m.panel_width()==round(590*s) and m.panel_height()==round(normal.height()*s)
     finally:w.close();app.processEvents()
 
 
@@ -266,9 +308,10 @@ def test_collection_errors_show_concise_observed_states_without_paths_or_traceba
     try:
         data=subagent_summary();data['_collection']={'errors':errors.copy()};w.set_content(data,'수집 오류');m=w.content_model
         values=[''.join(item[0]) if isinstance(item[0],list) else item[0] for item in m.detail_items()]
-        for expected in ('기록 손상, 2건','기록 접근 실패','기록 읽기 실패','기록 수집 지연'):assert values.count(expected)==1
+        for expected in ('기록 손상, 2건','기록 접근 실패','기록 읽기 실패','기록 수집 지연'):
+            assert expected not in values and m.status_detail().count(expected)==1
         assert '수집 오류' not in values and m.status_text()=='수집 오류 +4'
-        visible='\n'.join(values)+m.detailBody.state['accessible']
+        visible='\n'.join(values)+m.detailBody.state['accessible']+m.status_detail()
         for diagnostic in ('Traceback','C:\\private','/private/backend.py','PermissionError','sqlite3','RuntimeError'):assert diagnostic not in visible
         assert data['_collection']['errors']==errors and m.data['_collection']['errors']==errors
     finally:w.close();app.processEvents()

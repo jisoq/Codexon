@@ -53,7 +53,8 @@ class QuotaService(QThread):
         self.report_worker=QuotaWorker(self.path,self.home,on_result=self._receive_worker)
 
     def _receive_worker(self, result):
-        if result['kind'] in ('report','exclude','restore','clear_cycle'):
+        if (result['kind'] in ('report','exclude','restore','clear_cycle') or
+                result['kind']=='chart' and result.get('stale')):
             self.worker_results.put(result)
             self.wake.set()
 
@@ -154,6 +155,7 @@ class QuotaService(QThread):
         was_reporting=self.reports_enabled
         monitoring_revision=-1
         paused_report_due=self.paused
+        report_refresh_due=False
 
         def save_pending():
             # Bound recovery work independently of the retained backlog. An ack
@@ -249,6 +251,12 @@ class QuotaService(QThread):
                 while not self.worker_results.empty():
                     computed=self.worker_results.get_nowait()
                     kind=computed['kind']
+                    if kind=='chart':
+                        if report is None or computed['revision']==report['worker_revision']:
+                            report_refresh_due=True
+                        else:
+                            report_ready=True
+                        continue
                     if kind=='report':
                         if computed['id']!=report_request:continue
                         if not computed.get('partial'):report_request=None
@@ -280,6 +288,7 @@ class QuotaService(QThread):
                         aggregation_issue='';aggregate_failures=0;next_aggregate=0
                         calculation_fault={}
                         report_ready=True
+                        if not computed.get('partial'):report_refresh_due=False
                         if kind!='report':
                             # Preserve an immediate refresh requested by changed settings.
                             if next_history:next_history=time.monotonic()+5
@@ -384,7 +393,7 @@ class QuotaService(QThread):
                             self.report_worker.retry(edit_request)
                         edit_active=True
                     elif (self.reports_enabled and report_request is None and not exclusions
-                          and (paused_report_due if paused else report is None or time.monotonic()>=next_history)):
+                          and (report_refresh_due or (paused_report_due if paused else report is None or time.monotonic()>=next_history))):
                         report_request=self.report_worker.request('report')
                         paused_report_due=False
                         next_history=time.monotonic()+5

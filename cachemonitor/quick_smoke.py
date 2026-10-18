@@ -34,10 +34,10 @@ def start_smoke(window,app,path,fonts,depth='full'):
             settle()
             assert window.quick.status()==QQuickWidget.Status.Ready
             assert window.taskbar_quota.native is None
-            assert window.nav.count()==3
+            assert window.nav.count()==4
             report['sessions']=len(window.snapshot['sessions'])
             report['model_requests']=0;report['live_quota_requests']=0
-            for page,name in ((3,'quota'),(1,'comparison'),(5,'performance'),(2,'calls'),(4,'settings')):
+            for page,name in ((6,'home'),(3,'quota'),(1,'comparison'),(5,'performance'),(2,'calls'),(4,'settings')):
                 if page==4:window.open_settings()
                 else:window.change_page(page)
                 settle()
@@ -136,21 +136,19 @@ def start_smoke(window,app,path,fonts,depth='full'):
             selected=model.selected_id
             for link in composition_links:links.view.activateLink(link['id'])
             assert model.selected_id==selected
-            previous_tab,previous_unit=model.monitor_tab,model.composition_unit
+            previous_unit=model.composition_unit
             size=(model.panel_width(),model.panel_height())
-            for tab in ('latest','history'):
-                click(links,named_item(links.quick.rootObject(),'nav-tab-'+tab));QTest.qWait(20)
-                assert model.monitor_tab==tab
-                for unit in ('tokens','usd'):
-                    click(links,named_item(links.quick.rootObject(),'nav-unit-'+unit));QTest.qWait(20)
-                    assert model.composition_unit==unit and not model.detail_links()
-                    assert (model.panel_width(),model.panel_height())==size
-                    frame=QImage(*size,QImage.Format_ARGB32_Premultiplied);frame.fill(0)
-                    painter=QPainter(frame);model.paint(painter);painter.end()
-                    target=path.with_name(path.stem+'-overlay-'+tab+'-'+unit+'.png')
-                    assert frame.save(str(target));report['screens'].append(str(target))
-            report['overlay_controls']=dict(passive_composition=True,unit_toggle=True,tab_toggle=True,stable_size=True)
-            model.monitor_action('tab-'+previous_tab);model.monitor_action('unit-'+previous_unit);links.hide()
+            assert not any(link['id'].startswith('tab-') for link in model.monitor_links())
+            for unit in ('tokens','usd'):
+                click(links,named_item(links.quick.rootObject(),'nav-unit-'+unit));QTest.qWait(20)
+                assert model.composition_unit==unit and not model.detail_links()
+                assert (model.panel_width(),model.panel_height())==size
+                frame=QImage(*size,QImage.Format_ARGB32_Premultiplied);frame.fill(0)
+                painter=QPainter(frame);model.paint(painter);painter.end()
+                target=path.with_name(path.stem+'-overlay-trend-'+unit+'.png')
+                assert frame.save(str(target));report['screens'].append(str(target))
+            report['overlay_controls']=dict(passive_composition=True,unit_toggle=True,trend_only=True,stable_size=True)
+            model.monitor_action('unit-'+previous_unit);links.hide()
             locale=language();title_images=[]
             try:
                 for selected in ('ko','en'):

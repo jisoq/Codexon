@@ -914,7 +914,8 @@ class UsageIndex:
                 'unassigned_dropped': self.monitor.unassigned_dropped,
                 'excluded_title_sessions': sum(s.excluded_title for s in self.monitor.sessions.values() if not hasattr(s,'_replay_body')),
                 'quota_by_home':dict(self.quota_by_home),
-                'index': {'loading': bool(self.queue or self.cached_restore or self.pending_rebuilds or self.rebuild_jobs or self.model_evidence.catching_up), 'done': min(self.done_files, len(self.files)),
+                'index': {'loading': bool(self.queue or self.cached_restore or self.pending_rebuilds or self.rebuild_jobs or self.model_evidence.catching_up
+                                         or self.replay is not None and self.replay.restore_job is not None), 'done': min(self.done_files, len(self.files)),
                           'usage_complete':usage_complete,'last_usage_success':self.last_usage_success,
                           'files': len(self.files), 'bytes_read': self.bytes_read, 'version': self.version,
                           'path': str(self.path)}}

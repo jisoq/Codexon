@@ -117,7 +117,7 @@ def test_rendered_summary_click_and_overlay_speed_navigation(tmp_path):
         window.extra_column_controls['output_speed'].setChecked(True);window.render_explorer()
         index=[key for key,title in window.active_columns].index('output_speed')
         assert window.response_cell(data['latest'],index,Qt.DisplayRole)=='100.0 tok/s'
-        window.nav.setCurrentRow(0);window.resize(1000,720);QTest.qWait(60)
+        window.nav.setCurrentRow(window.navigation_pages.index(3));window.resize(1000,720);QTest.qWait(60)
         assert window.current_page==3 and control(window,window.quota_panel).isVisible()
         assert window.quick.grabFramebuffer().save(str(tmp_path/'dashboard-small.png'))
         links.hide()

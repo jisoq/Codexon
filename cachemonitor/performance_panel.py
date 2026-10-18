@@ -555,6 +555,7 @@ class PerformancePanel(Group):
         self.reasoning_effort=saved.get('reasoning_effort','high');self.reasoning_specs={};self.reasoning_buttons={}
         self.models=saved.get('models',{});self.modes=saved.get('modes',{'Standard':True,'Fast':True})
         self.show_outer=False
+        self.compact=False;self._compact_side=None
         if not any(self.modes.values()):self.modes={'Standard':True,'Fast':True}
         self.resize_timer=QTimer(self);self.resize_timer.setSingleShot(True);self.resize_timer.setInterval(180);self.resize_timer.timeout.connect(self.request)
         self.body=Column(self);self.body.setSpacing(16)
@@ -583,6 +584,12 @@ class PerformancePanel(Group):
         left_body.addWidget(caption('그래프 읽는 법',12,'ink',True));self.chart_help=caption('',12);left_body.addWidget(self.chart_help)
         self.legend_scroll.setWidget(left)
         center=Column();center.setSpacing(10);content.addLayout(center,1)
+        self.side_controls=Row();self.side_controls.setSpacing(6);self.side_controls.hide();center.addLayout(self.side_controls)
+        self.model_panel_button=button('비교 대상',lambda:self.toggle_side('models'))
+        self.inspector_button=button('구간 분석',lambda:self.toggle_side('inspector'))
+        for node in (self.model_panel_button,self.inspector_button):
+            node.setCheckable(True);node.put(selectionTab=True);self.side_controls.addWidget(node)
+        self.side_controls.addStretch()
         self.scope=caption('조회 범위: 전체 프로젝트 / 모든 Codex 홈',12);center.addWidget(self.scope)
         self.scope.setToolTip('이 탭의 조회 기간, 모델, 실행 모드를 적용합니다.')
         periods=Row();periods.put(flow=True,spacing=4);center.addLayout(periods)
@@ -611,13 +618,34 @@ class PerformancePanel(Group):
         self.window_note.setToolTip('조회 기간과 화면 너비에 맞춰 자동으로 계산합니다.')
         self.chart_scroll=Scroll();self.chart_scroll.put(fillViewport=True);self.chart_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         charts=Group();self.chart_body=Column(charts);self.chart_body.setSpacing(8);self.chart_scroll.setWidget(charts);center.addWidget(self.chart_scroll,1)
-        right=Column();right.setFixedWidth(292);right.setSpacing(10);content.addLayout(right)
+        right=Column();self.inspector_column=right;right.setFixedWidth(292);right.setSpacing(10);content.addLayout(right)
         right.addWidget(caption('구간 분석',16,'ink',True))
         self.inspector=Scroll();self.inspector.setFixedWidth(292);self.inspector.put(fillViewport=True)
         self.inspector.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff);right.addWidget(self.inspector,1)
         self.details=IntervalDetails();self.details.put(border='transparent',radius=0);self.inspector.setWidget(self.details)
         self.sync_selection()
         self.sync_navigation()
+
+    def update_layout(self,available_width):
+        """Keep the mounted charts usable inside the actual page viewport."""
+        if available_width<=0:return
+        compact=available_width<1160
+        if self.compact==compact:return
+        self.compact=compact;self.sync_side_visibility()
+
+    def toggle_side(self,side):
+        if not self.compact:return
+        self._compact_side=None if self._compact_side==side else side
+        self.sync_side_visibility()
+
+    def sync_side_visibility(self):
+        # Visibility changes preserve the chart nodes, data and inspection.
+        self.side_controls.setVisible(self.compact)
+        self.legend_scroll.setVisible(not self.compact or self._compact_side=='models')
+        visible=not self.compact or self._compact_side=='inspector'
+        self.inspector_column.setVisible(visible);self.inspector.setVisible(visible)
+        self.model_panel_button.setChecked(self.compact and self._compact_side=='models')
+        self.inspector_button.setChecked(self.compact and self._compact_side=='inspector')
 
     def is_model_selected(self,model):return not self.models or bool(self.models.get(model,False))
     def single_model(self):return bool(self.models) and sum(bool(self.models.get(m)) for m in (self.available or self.models))==1

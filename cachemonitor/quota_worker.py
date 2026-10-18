@@ -245,6 +245,7 @@ class QuotaComputation:
         from .quota_archive import ArchiveUnavailable
         kind = request['kind']
         result = {key: request.get(key) for key in ('kind', 'id', 'key')}
+        if kind=='chart':result['revision']=request['revision']
         try:
             if kind == 'prepare':
                 result['report'] = self._prepare(request['snapshot'])

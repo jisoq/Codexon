@@ -66,6 +66,22 @@ from cachemonitor.observer_state import read_json
 from cachemonitor.proxy_target import ProxyTarget
 
 
+def test_collector_startup_does_not_hide_new_failure_marker(tmp_path,monkeypatch):
+    from cachemonitor.usage_collection import CollectionChannel,publish_collector_fault
+    channel=CollectionChannel([],tmp_path/'index.sqlite')
+    owner=services.AppServices(None,[],channel.path,clock=lambda:5)
+    owner.collector_pending=('old',0)
+    monkeypatch.setattr('cachemonitor.usage_collection.CollectionChannel',lambda *args:channel)
+    monkeypatch.setattr(channel,'close',lambda:None)
+    monkeypatch.setattr(channel,'read_header',lambda:{'ts':1,'collection':{'instance':'old'}})
+    publish_collector_fault(channel.companion('.collector-error.json'),channel.scope,'new',OSError('failed'))
+    try:
+        owner.poll_collection()
+        assert owner.collection_fault.get('runtime_failed')
+        assert not owner.collection_healthy
+    finally:channel.db.close()
+
+
 @pytest.fixture
 def login_services(tmp_path, monkeypatch):
     from cachemonitor.model_evidence import home_key

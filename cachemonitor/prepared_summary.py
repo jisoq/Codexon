@@ -1,16 +1,16 @@
 """Persist own overlay summaries without repeated latest-call projections.
 
-Only the most recent twelve references are retained. Historical health evidence
+Only the most recent twenty references are retained. Historical health evidence
 is preserved verbatim and remains subject to the ordinary packet budget. Its
 event/membership storage is a separate concern; this module never truncates it.
 """
 from .analysis_records import compact_record
-from .overlay_data import call_summary
+from .overlay_data import call_summary, RECENT_CALLS
 from .prepared_store import CapacityExceeded, NotReady, RebuildRequired, _size
 
 
-FORMAT = ('owner-summary-refs', 2)
-MAX_RECENT = 12
+FORMAT = ('owner-summary-refs', 3)
+MAX_RECENT = RECENT_CALLS
 
 
 def summary_for_storage(summary):
@@ -19,7 +19,7 @@ def summary_for_storage(summary):
     owner = (own['home'], own['id'])
     recent = own['recent']
     if len(recent) > MAX_RECENT:
-        raise ValueError('only an own summary with at most twelve recent calls is admitted')
+        raise ValueError('only an own summary with at most twenty recent calls is admitted')
     latest = recent[-1] if recent else {}
     if own['latest'] is not latest and own['latest'] != latest:
         raise ValueError('own latest call differs from the final recent call')
@@ -51,9 +51,9 @@ def _validate(packet, owner):
 
 
 def recent_references(packet):
-    """Expose ordering fields so descendant top-12 selection needs no call reads.
+    """Expose ordering fields so descendant top-20 selection needs no call reads.
 
-    The caller selects references first, then hydrates only the chosen twelve.
+    The caller selects references first, then hydrates only the chosen twenty.
     A rolled-up row adds source_title from that member's stored own title after
     hydration, exactly as OverlaySummaries does today.
     """
@@ -67,11 +67,11 @@ def recent_references(packet):
 
 
 def hydrate_references(snapshot, refs):
-    """Hydrate up to twelve selected references in the caller's pinned snapshot."""
+    """Hydrate up to twenty selected references in the caller's pinned snapshot."""
     selected = []
     for ref in refs:
         if len(selected) >= MAX_RECENT:
-            raise CapacityExceeded('select the twelve recent references before hydration')
+            raise CapacityExceeded('select the twenty recent references before hydration')
         selected.append(ref)
     rows, size = [], 0
     for ref in selected:

@@ -5,8 +5,8 @@
 **Codexon is a Windows app centered on the Codex overlay and subscription monitoring. Compare usage metrics and review performance trends from recorded calls.**
 
 - **Spot a request/response model mismatch directly in the overlay.** Compare the requested and reported model names when investigating routing behavior.
-- See the latest call's tokens, cache rate, and subscription value estimate in an overlay while working in Codex.
-- Open session records from the overlay and call records from comparison results. Session totals include confirmed child-agent usage.
+- See the main agent's accumulated usage and call trends including subagents while working in Codex.
+- Open session records from the overlay and call records from comparison results. Inspect main-agent and subagent usage separately.
 - Compare usage across models, reasoning efforts and service tiers, and inspect the calls behind each result.
 - Follow remaining usage limits and reset times. The tray and taskbar widget keep them visible without opening the dashboard.
 
@@ -16,7 +16,7 @@ Supported installation target: **Windows 10/11 x64**. Setup includes Python, Qt 
 
 ## Requested one model, got a different name back?
 
-**Check the requested model against the model reported in the response, right in the overlay.** A mismatch highlights the line and shows the response model, such as `(response: gpt-6-sol)`. Matching names display `(match)` beside the requested model.
+**Check the requested model against the model reported in the response, right in the overlay.** The model and reasoning effort are followed by `(match)` or `(mismatch)`. Hover over a mismatched Main Agent model label to see the requested and reported model names.
 
 Use the difference as a clue when investigating routing behavior, then open **Call details** in the dashboard to inspect that call's record. These are recorded request/response names; they do not establish the internal routing path or underlying model implementation.
 
@@ -26,17 +26,19 @@ Use the difference as a clue when investigating routing behavior, then open **Ca
 
 These amounts use the previous API-rate conversion policy, before the subscription Fast 2.5x change. Calculated from real local records as of **September 29, 2026, 19:49 KST**. Locally observed intervals in the current cycle account for **$246.96** in value under the previous conversion policy and **19 percentage points** of allowance consumed, yielding **$1,299.80** when extrapolated to a full weekly allowance. Account-wide remaining allowance and locally observed consumption cover different scopes; observation gaps are compressed in the chart.
 
-The default screen is subscription monitoring. The main menu contains subscription monitoring, metric comparison, and performance trends. The Home summary and page previews have been removed.
+Home shows remaining usage and today's activity, with descriptions and links to subscription monitoring, metric comparison, and performance trends. The sidebar usage card is hidden on Home and returns on other screens.
 
 ## Overlay views
 
-![Main overlay with $ and Recent selected beside Sub details](docs/images/sub-detail-readme-en.png)
+![Main Agent with the Sub Agents panel on the right](docs/images/sub-detail-readme-en.png)
 
-Switch **$ | Count** to see subscription value or token composition. Switch **Recent | Current** to see trends across the 12 most recent calls or the selected call. The defaults are **$** and **Recent**; saved selections are restored. Session totals stay visible above both views.
+Switch **$ | Count** to see subscription value or token composition. The default is **$**; saved selections are restored. The top summary shows the Main Agent's model, reasoning effort, and usage. **Trend** shows the 20 most recent calls, including subagents.
 
-The header's **Open details** button appears only when confirmed subagents exist. **Sub details** separates Main Agent and Sub Agent value, with **Sub | Model** grouping for child usage. The default is **Sub**. Select **Session** in the main panel to open its records in the dashboard.
+The header's **Open details** button appears only when confirmed subagents exist. The right-side **Sub Agents** panel shows child value and agent count, with **Agents | Model** grouping. **Agents** is the default, ordered by most recent update. Expand an item for its average output speed and cost breakdown. Select **Main Agent** to open its records in the dashboard.
 
-The header controls adjust background transparency and minimize the overlay; select the minimized icon to restore it. Amounts use Standard base rates weighted by subscription usage: Fast is 2.5x Standard for the same tokens. Model comparison reflects recorded request/response names.
+The header controls adjust background transparency and minimize the overlay. They move to the upper right when details are open. Select the minimized icon to restore the overlay. Preparation, delay, and error messages appear beside the session title. Existing values are dimmed when updates are interrupted or delayed.
+
+Amounts use Standard base rates weighted by subscription usage: Fast is 2.5x Standard for the same tokens. Model comparison reflects recorded request/response names.
 
 ## Get started
 
@@ -50,7 +52,7 @@ The dashboard reads local Codex records. If there are no records yet, use Codex 
 
 ## Optional model monitoring
 
-Enable **Settings → Codex connection → Use proxy** to compare the requested and reported response model. Turning it on checks local readiness without sending a model request. Once setup succeeds, restart Codex to apply the connection change. Session history, cost analysis and usage-limit views can be used without the proxy.
+Enable **Settings → Codex connection → Compare requested and response models** to compare the requested and reported response model. Turning it on checks local readiness without sending a model request. Once setup succeeds, restart the app or CLI where you use Codex to apply the connection change. Session history, cost analysis and usage-limit views can be used without the proxy.
 
 Codexon reports a model match or mismatch only when completed request/response evidence can be linked reliably. Missing or conflicting evidence is not treated as a mismatch. The reported model name does not prove which hardware or internal model implementation handled the request.
 

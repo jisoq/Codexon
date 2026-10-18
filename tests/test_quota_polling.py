@@ -33,6 +33,49 @@ def deterministic_accounting_worker(monkeypatch):
     monkeypatch.setattr(module,'QuotaWorker',InlineWorker)
 
 
+@pytest.mark.parametrize('fail_once',[False,True])
+def test_expired_chart_renews_paused_report_once_without_resuming_monitoring(tmp_path,monkeypatch,fail_once):
+    clock=[1000.];updates=[];expired=[None];renewed=[False];failed_at=[];retried_at=[]
+    monkeypatch.setattr(module,'time',SimpleNamespace(time=lambda:clock[0],monotonic=lambda:clock[0]))
+    service=module.QuotaService(tmp_path/'home',tmp_path/'index.sqlite',live=False,paused=True)
+    service.updated.connect(updates.append)
+    execute=service.report_worker.engine.execute
+    def compute(request):
+        if fail_once and expired[0] is not None and request['kind']=='report':
+            if not failed_at:
+                failed_at.append(clock[0])
+                return dict(kind='report',id=request['id'],error='temporary read failure')
+            retried_at.append(clock[0])
+        return execute(request)
+    monkeypatch.setattr(service.report_worker.engine,'execute',compute)
+    class Wake:
+        def clear(self):pass
+        def set(self):pass
+        def wait(self,seconds):
+            reports=[item['report'] for item in updates if item.get('report')]
+            if reports:
+                revision=reports[-1]['worker_revision']
+                if expired[0] is None:
+                    service.report_worker.engine.reports.clear()
+                    expired[0]=service.report_worker.engine.execute(dict(kind='chart',id=99,
+                        key=(id(service.report_worker),revision,'all'),revision=revision,selection='all'))
+                    assert expired[0]['stale']
+                    service._receive_worker(expired[0]);service._receive_worker(expired[0])
+                elif revision!=expired[0]['key'][1] and not renewed[0]:
+                    renewed[0]=True;service._receive_worker(expired[0])
+            clock[0]+=seconds
+    service.wake=Wake();service.isInterruptionRequested=lambda:clock[0]>=1012
+    service.run()
+    revisions={item['report']['worker_revision'] for item in updates if item.get('report')}
+    assert len(revisions)==2 and renewed[0]
+    assert service.paused and all(item['paused'] for item in updates)
+    faults=[item.get('quota_faults',{}).get('calculation',{}).get('calculation_failed',False) for item in updates]
+    assert any(faults) is fail_once and not faults[-1]
+    if fail_once:assert len(retried_at)==1 and retried_at[0]-failed_at[0]>=5
+    with sqlite3.connect(service.path) as db:
+        assert db.execute('SELECT count(*) FROM observations').fetchone()[0]==0
+
+
 @pytest.mark.parametrize('failed_method',['account/read','account/rateLimits/read'])
 def test_rpc_timeout_records_safe_stage_and_next_fetch_reconnects(tmp_path,monkeypatch,failed_method):
     import io

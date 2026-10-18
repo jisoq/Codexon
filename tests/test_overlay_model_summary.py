@@ -155,8 +155,15 @@ def test_long_model_names_are_elided_with_full_detail_tooltips(observed_overlay,
     top_metrics = QFontMetrics(font(model.appearance.family, 12))
     assert len(model.context_rows()) > 1
     assert all(top_metrics.horizontalAdvance(line) <= 348 for line in model.context_rows())
-    assert model.base_height()==594  # The unpriced-call note adds one row; long model names add none.
-    assert model.layout()['height'] >= model.layout()['status'] + 28
+    from copy import deepcopy
+    from cachemonitor.overlay_view import OverlayContent
+    short=deepcopy(model.data)
+    short['latest'].update(model='short-request',response_model='short-response')
+    reference=OverlayContent();reference.set_content(short)
+    assert model.base_height()==reference.base_height()  # Model name length must not enlarge the panel.
+    assert expected in model.main_model_tooltip()
+    model_link=next(link for link in model.monitor_links() if link['id']=='tip-model')
+    assert requested in model_link['tooltip'] and response in model_link['tooltip']
     model.monitor_action('tab-latest')
     assert not any(link['id']=='call-detail' for link in model.monitor_links())
     assert not any(link['id'] in ('cache','cost','speed','latest-context') for link in model.monitor_links())
