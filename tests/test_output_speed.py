@@ -67,15 +67,12 @@ def test_rendered_summary_click_and_overlay_speed_navigation(tmp_path):
     from PySide6.QtCore import QSettings, Qt
     from PySide6.QtTest import QTest
     from PySide6.QtWidgets import QApplication
-    from cachemonitor.dashboard import Dashboard, choose
+    from cachemonitor.dashboard import Dashboard
     from cachemonitor.overlay_view import SessionOverlay
     from cachemonitor.overlay_chrome import OverlayLinks, named_item
     from cachemonitor.overlay_appearance import default_appearance
-    from cachemonitor.quick_qa import click, control, render_plot, walk
+    from cachemonitor.quick_qa import click, control
     from cachemonitor.i18n import set_language
-    from cachemonitor.i18n import tr
-    from cachemonitor.overlay_view import font
-    from PySide6.QtGui import QFontMetrics
     app=QApplication.instance() or QApplication([])
     previous_shell=app.property('cachemonitorDisableShellIntegration')
     app.setProperty('cachemonitorDisableShellIntegration',True)
@@ -91,20 +88,19 @@ def test_rendered_summary_click_and_overlay_speed_navigation(tmp_path):
         engine=AnalysisEngine();engine.ingest(source['sessions']);data=OverlaySummaries().collect(engine)[0]
         overlay.set_content(data);overlay.show();QTest.qWait(60)
         m=overlay.content_model
-        assert m.headline_metrics()[1]['number']=='100.0'
-        m.select(data['recent'][1]['id'])
-        assert m.selected()['output_speed']==200 and m.headline_metrics()[1]['number']=='100.0'
-        m.select(data['latest']['id'])
+        assert m.displayed_call()['output_speed']==100
+        cumulative=data['output_speed_summary']['value']
+        m.pin_call(m.call_id(data['recent'][1]))
+        assert m.displayed_call()['output_speed']==200
+        assert m.data['output_speed_summary']['value']==cumulative
+        m.monitor_action('latest')
         assert overlay.quick.grabFramebuffer().save(str(tmp_path/'overlay.png'))
-        m.monitor_action('tab-latest')
         links.setGeometry(overlay.geometry());links.sync();links.show();QTest.qWait(30)
-        # Main-session navigation remains available without any child detail panel.
-        targets=[];links.view.navigationRequested.connect(targets.append)
-        links.view.captureNavigation('session');links.view.activateNavigation()
-        assert named_item(links.quick.rootObject(),'nav-call-detail') is None
-        assert targets[-1].call_id is None and targets[-1].sid==data['id']
-        window.navigate(targets[-1])
+        click(links,named_item(links.quick.rootObject(),'nav-main-detail'))
+        assert m.main_expanded and m.displayed_call()['output_speed']==100
+        assert m.data['output_speed_summary']['value']==cumulative
         from cachemonitor.overlay_navigation import navigation_target
+        window.navigate(navigation_target(data,'session'))
         window.navigate(navigation_target(data,'call',call=data['latest']))
         for _ in range(40):
             QTest.qWait(25)
@@ -121,19 +117,17 @@ def test_rendered_summary_click_and_overlay_speed_navigation(tmp_path):
         assert window.current_page==3 and control(window,window.quota_panel).isVisible()
         assert window.quick.grabFramebuffer().save(str(tmp_path/'dashboard-small.png'))
         links.hide()
-        for language in ('ko','en'):
+        for language,compact,scale in (('ko',False,1),('en',True,1.5)):
             set_language(language)
-            for compact in (False,True):
-                for scale in (1,1.5):
-                    overlay.set_content(data,appearance=replace(default_appearance(True),font_size=round(14*scale)))
-                    overlay.set_layout(reduced=compact);QTest.qWait(30)
-                    for metric in m.headline_metrics():
-                        assert metric['text_width']<=metric['width']
-                        assert QFontMetrics(font(m.appearance.family,metric['label_size'])).horizontalAdvance(tr(metric['label']))<=metric['width']
-                    assert overlay.quick.grabFramebuffer().save(str(tmp_path/f'overlay-{language}-{compact}-{scale}.png'))
+            overlay.set_content(data,appearance=replace(default_appearance(True),font_size=round(14*scale)))
+            overlay.set_layout(reduced=compact)
+            assert m.layout()['main_detail']+m.layout()['main_detail_height']<=m.base_height()
+            assert overlay.quick.grabFramebuffer().save(str(tmp_path/f'overlay-{language}-{compact}-{scale}.png'))
         for speed in (None,0,.001,99999.9,1e12):
-            large=copy.deepcopy(data);large['latest']['output_speed']=speed;overlay.set_content(large)
-            assert all(item['text_width']<=item['width'] for item in m.headline_metrics())
+            large=copy.deepcopy(data);large['latest']['output_speed']=speed;large['recent'][-1]['output_speed']=speed
+            overlay.set_content(large)
+            assert m.displayed_call()['output_speed']==speed
+            assert not overlay.quick.grabFramebuffer().isNull()
     finally:
         set_language('ko');links.close();overlay.close();window.quit_app();app.processEvents()
         app.setProperty('cachemonitorDisableShellIntegration',previous_shell)

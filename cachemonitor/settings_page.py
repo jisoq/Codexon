@@ -100,8 +100,28 @@ class SettingsPage(Group):
         self.add_row('display', '작업표시줄 위젯', '마우스로 끌어 작업표시줄 안에서 위치를 조절할 수 있습니다.', self.toggle('widget'), section='작업표시줄 위젯')
         self.add_row('display', '표시할 모니터', '선택한 모니터의 연결이 끊기면 주 모니터에 표시합니다.', self.choice('monitor'), section='작업표시줄 위젯',depth=1)
         self.add_row('display', '세션 오버레이', 'Codex 작업 중 현재 세션의 비용과 토큰 사용량을 작은 창에서 확인할 수 있습니다.', self.toggle('overlay'), section='세션 오버레이')
+        chart_style=self.choice('overlay-chart-style')
+        for title,value in (('막대','bar'),('채움 선형','filled-line')):chart_style.addItem(title,value)
+        chart_style.setCurrentIndex(max(0,chart_style.findData(parent.settings.value('overlay/chartStyle','bar'))))
+        chart_style.currentIndexChanged.connect(self.save_chart_style)
+        self.add_row('display', '차트 표시 방식', '', chart_style, section='세션 오버레이',depth=1,
+                     aliases='chart bars filled line 막대 채움 선형')
         for key in ('startup', 'chatgpt_startup', 'quota', 'widget', 'monitor', 'overlay', 'theme'):
             self.controls[key].setEnabled(False)
+
+    def save_chart_style(self,index):
+        value=self.controls['overlay-chart-style'].itemData(index)
+        if value not in ('bar','filled-line'):return
+        self.owner.settings.setValue('overlay/chartStyle',value)
+        controller=getattr(self.owner,'overlay',None)
+        if controller is not None:controller.set_chart_style(value)
+
+    def bind_overlay(self,controller):
+        control=self.controls['overlay-chart-style']
+        def sync():
+            with QSignalBlocker(control):control.setCurrentIndex(max(0,control.findData(controller.chart_style)))
+        controller.changed.connect(sync)
+        sync()
 
     def refresh_restart(self):
         from .i18n import language

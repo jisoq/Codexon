@@ -8,7 +8,7 @@ from PySide6.QtCore import Qt, QTimer, QObject, Signal, QVariantAnimation, QEasi
 from PySide6.QtGui import QAction, QActionGroup, QFontDatabase
 from PySide6.QtWidgets import QApplication
 from .overlay_view import OverlayContent, SessionOverlay
-from .overlay_monitor import WIDTH, ACTIONS_X, HEADER_X, HEADER_WIDTH, POPUP_X, INLINE_HEADER_WIDTH
+from .overlay_monitor import WIDTH, MARGIN, SECTION_WIDTH, ACTIONS_X, HEADER_X, HEADER_WIDTH, POPUP_X, INLINE_HEADER_WIDTH
 from .overlay_tracking import overlay_geometry, anchor_for_position
 from .overlay_appearance import CodexAppearance, default_appearance
 from .analysis_delivery import ANALYSIS_DELAY_SECONDS
@@ -55,6 +55,10 @@ def system_dark():
 class OverlayController(QObject):
     changed=Signal()
     navigation_requested=Signal(object)
+    @property
+    def expanded(self):return self.widget.content_model.main_expanded
+    @expanded.setter
+    def expanded(self,value):self.widget.content_model.main_expanded=bool(value)
     def __init__(self, settings, native_enabled=True, appearance_path=None):
         super().__init__()
         self.settings = settings
@@ -67,6 +71,12 @@ class OverlayController(QObject):
         self._pending_overlay_navigation=None
         self.widget = SessionOverlay()
         content=self.widget.content_model;content.settings=settings
+        self.chart_style=settings.value('overlay/chartStyle','bar')
+        if self.chart_style not in ('bar','filled-line'):self.chart_style='bar'
+        content.chart_style=self.chart_style
+        self.preferred_height=max(480,min(1440,settings.value('overlay/height',720,type=int)))
+        content.preferred_height=self.preferred_height
+        content.layout_requested.connect(self.refresh)
         content.monitor_tab='history'
         content.composition_unit=settings.value('overlay/compositionUnit','usd')
         if content.composition_unit not in ('tokens','usd'):content.composition_unit='usd'
@@ -76,6 +86,7 @@ class OverlayController(QObject):
         self.header=OverlayChrome('header');self.toolbar=OverlayChrome('toolbar');self.icon=OverlayChrome('icon');self.actions=OverlayChrome('actions')
         self.detail=OverlayDetail(self.widget.content_model)
         self.links=OverlayLinks(self.widget.content_model)
+        content.agent_focus_requested.connect(self.focus_agent)
         self.links.view.navigationRequested.connect(self.navigation_requested)
         self.links.view.callSelected.connect(self.pin_call)
         self.actions.view.detailPressed.connect(self.capture_detail)
@@ -85,9 +96,10 @@ class OverlayController(QObject):
         self.chrome=(self.header,self.toolbar,self.icon,self.actions,self.detail,self.links)
         self.collapsed=False
         self._collapse_scope=None
-        self.expanded=settings.value('overlay/expanded',False,type=bool)
+        self.expanded=False
         self.automatic_mode='monitor'
         self.popup_open=False
+        self.popup_kind='opacity'
         self.monitor_geometry=None
         self.height_animation=QVariantAnimation(self)
         self.height_animation.setDuration(120)
@@ -118,7 +130,10 @@ class OverlayController(QObject):
         self.drag_timer.timeout.connect(self.flush_drag)
         self.actions.collapse.connect(lambda:self.set_collapsed(True))
         self.actions.opacity_toggle.connect(self.toggle_opacity)
-        self.icon.restore.connect(lambda:self.set_collapsed(False))
+        self.actions.settings_toggle.connect(self.toggle_settings)
+        self.toolbar.chart_style_changed.connect(self.set_chart_style)
+        self.toolbar.height_changed.connect(self.change_length)
+        self.icon.restore.connect(self.restore_panel)
         self.toolbar.opacity_changed.connect(self.set_opacity)
         for control in self.chrome:
             control.escape.connect(self.escape)
@@ -245,7 +260,7 @@ class OverlayController(QObject):
             if (target.home,target.sid)!=identity[:2]:
                 self._pending_overlay_navigation=None;navigation=None
         health=bool(navigation)
-        finance=bool(self.expanded and data.get('descendants',0))
+        finance=bool(data.get('descendants',0))
         if (not data.get('_recent_refs') and (not health or data.get('_health_detail'))
                 and (not finance or 'subagent_finance' in data)):
             return data,False
@@ -396,9 +411,8 @@ class OverlayController(QObject):
             return dict(enabled=False,reason='대상 기록을 찾을 수 없음')
         if not self.native.activate_target(window['hwnd']):
             return dict(enabled=False,reason='현재 세션 확인 불가')
-        self.collapsed=False;self.expanded=True
+        self.collapsed=False
         self._store_collapsed()
-        self.settings.setValue('overlay/expanded',True)
         self.observed_at=time.monotonic();self.target_state={**self.target_state,'selection':selection}
         self.refresh()
         if call_id:
@@ -410,7 +424,16 @@ class OverlayController(QObject):
                 self.pending_record=(request,(target.home,target.sid),token) if token else (request,(target.home,target.sid))
                 if token:self.record_loader(request,(target.home,target.sid,call_id),token)
                 else:self.record_loader(request,(target.home,target.sid,call_id))
+            self.widget.content_model.sync_details();self.widget.content_model.update()
         return dict(enabled=True,reason='')
+
+    def focus_agent(self,kind):
+        if kind=='sub' and self.detail.isVisible():self.detail.begin_interaction()
+        elif kind=='main' and self.links.isVisible():
+            self.links.begin_interaction()
+            from .overlay_chrome import named_item
+            item=named_item(self.links.quick.rootObject(),'nav-main-detail')
+            if item is not None:item.forceActiveFocus(Qt.OtherFocusReason)
 
     def forward_wheel(self,event):
         target=self.target_state.get('target')
@@ -456,13 +479,28 @@ class OverlayController(QObject):
         self.refresh()
 
     def toggle_expanded(self):
-        if not self.widget.content_model.has_subagents():return
         self.close_popup()
-        self.expanded=not self.expanded
-        if not self.expanded:
-            self.widget.content_model.sync_details()
-        self.settings.setValue('overlay/expanded',self.expanded)
+        self.widget.content_model.monitor_action('main-detail')
+        self.expanded=self.widget.content_model.main_expanded
+        self.changed.emit()
+
+    def set_chart_style(self,value):
+        if value not in ('bar','filled-line'):return
+        self.chart_style=value
+        self.settings.setValue('overlay/chartStyle',value)
+        self.widget.content_model.chart_style=value
+        self.widget.content_model.update()
+        self.toolbar.view.put(chartStyle=value)
+        self.changed.emit()
+
+    def set_preferred_height(self,value):
+        self.preferred_height=max(480,min(1440,int(value)))
+        self.settings.setValue('overlay/height',self.preferred_height)
+        self.widget.content_model.preferred_height=self.preferred_height
+        self.widget.content_model.sync_details()
         self.changed.emit();self.refresh()
+
+    def change_length(self,delta):self.set_preferred_height(self.preferred_height+int(delta))
 
     def advance_height(self,value):
         self._animated_height=round(float(value))
@@ -505,6 +543,14 @@ class OverlayController(QObject):
             self.view_animation.setEndValue(1.)
             self.view_animation.start()
         else:self.advance_view(1.)
+
+    def restore_panel(self):
+        content=self.widget.content_model
+        if (content.main_expanded and content.available_height is not None
+                and content.layout(reduced=True)['height']>content.available_height):
+            content.main_expanded=False
+            content.sync_details();content.update()
+        self.set_collapsed(False)
 
     def advance_view(self, value):
         for control in (self.widget,self.shadow,*self.chrome):control.setWindowOpacity(float(value))
@@ -580,15 +626,10 @@ class OverlayController(QObject):
         if (getattr(self,'_placement_context',None)!=(frame,dpi) or not self.enabled
                 or not self.drag_valid()
                 or self.height_animation.state()==QVariantAnimation.Running):return False
-        from .overlay_tracking import anchored_monitor_geometry,extend_monitor_right,reserve_detail_space
+        from .overlay_tracking import anchored_monitor_geometry
         old=self.current_geometry if self.automatic_mode=='icon' else self.monitor_geometry
         box=anchored_monitor_geometry(frame,dpi,old[2]*96/dpi,old[3]*96/dpi,anchor=self.anchor)
         if box is None:return False
-        if self.expanded and self.widget.content_model.has_subagents() and self.automatic_mode!='icon':
-            box=reserve_detail_space(frame,dpi,box,240*self.appearance.scale)
-        if self.expanded and self.widget.content_model.has_subagents() and self.automatic_mode!='icon':
-            inline=extend_monitor_right(frame,dpi,box,240*self.appearance.scale) is None
-            if inline!=(self.automatic_mode=='detail-inline'):return False
         dx,dy=box[0]-old[0],box[1]-old[1]
         if not dx and not dy:return True
         shifted={hwnd:(x+dx,y+dy,w,h) for hwnd,(x,y,w,h) in self._placements.items()}
@@ -749,10 +790,17 @@ class OverlayController(QObject):
         if hasattr(self.actions,'view'):self.actions.view.put(popupOpen=False)
 
     def toggle_opacity(self):
-        if self.popup_open:
+        self.toggle_popup('opacity')
+
+    def toggle_settings(self):
+        self.toggle_popup('settings')
+
+    def toggle_popup(self,kind):
+        if self.popup_open and self.popup_kind==kind:
             self.close_popup()
         else:
             self.popup_open=True
+            self.popup_kind=kind
             self._pointer_down=self.native.primary_down() if self.native and hasattr(self.native,'primary_down') else False
             self.input_timer.start(40)
         self.refresh()
@@ -763,7 +811,7 @@ class OverlayController(QObject):
         if self.popup_open:
             self.close_popup()
             return
-        elif self.expanded and self.widget.content_model.has_subagents():
+        elif self.widget.content_model.main_expanded:
             self.toggle_expanded()
             return
         target=self.target_state.get('target')
@@ -882,10 +930,15 @@ class OverlayController(QObject):
         if not self.drag_context:
             self.widget.set_content(data, note, appearance=self.appearance)
             self._content_time_state=self._content_time()
-        from .overlay_tracking import anchored_monitor_geometry, extend_monitor_right, reserve_detail_space
+        from .overlay_tracking import anchored_monitor_geometry
         content=self.widget.content_model
         scale=self.appearance.scale
         monitor_width=WIDTH*scale
+        # QWidget heights are integer logical pixels. Round the available room
+        # down before fitting, so high-DPI rounding cannot exceed the frame.
+        factor=dpi/96
+        room=frame[3]-frame[1]-2*round(16*factor)
+        content.available_height=max(0,int(room/factor)/scale)
         if self._legacy_anchor:
             from .overlay_tracking import edge_anchor_from_legacy
             # Interpret saved free-space anchors with the previous monitor height.
@@ -894,9 +947,8 @@ class OverlayController(QObject):
             self.settings.setValue('overlay/anchorMode','edge');self._legacy_anchor=False
         full_height=content.monitor_height(reduced=False)
         def monitor_box(width,height):
-            box=anchored_monitor_geometry(frame,dpi,width,height,reference_width=monitor_width,
+            return anchored_monitor_geometry(frame,dpi,width,height,reference_width=monitor_width,
                        reference_height=560*scale,position=self.position,anchor=self.anchor)
-            return reserve_detail_space(frame,dpi,box,240*scale) if self.expanded and not self.collapsed and content.has_subagents() and width==monitor_width else box
         monitor=monitor_box(monitor_width,full_height)
         reduced=False
         if monitor is None:
@@ -917,17 +969,12 @@ class OverlayController(QObject):
             if self.height_animation.state()==QVariantAnimation.Running and self._animated_height is not None:
                 monitor=(monitor[0],monitor[1]+monitor[3]-self._animated_height,monitor[2],self._animated_height)
         mode='compact' if reduced else 'monitor'
-        inline=False
         geometry=monitor
         if self.collapsed or content.is_remote or monitor is None:
             mode='icon'
             geometry=monitor_box(32*scale,32*scale)
-        elif self.expanded and content.has_subagents():
-            side=extend_monitor_right(frame,dpi,monitor,240*scale)
-            inline=side is None
-            geometry=side or monitor
-            mode='detail-inline' if inline else 'detail'
-        content.set_layout(reduced=reduced,detail=mode in ('detail','detail-inline'),inline=inline)
+        content.set_layout(reduced=reduced,detail=mode!='icon' and content.has_subagents(),inline=False)
+        content.sync_details()
         self.automatic_mode=mode
         self.widget.resize(self.widget.panel_width(),self.widget.panel_height())
         if geometry is None:
@@ -960,7 +1007,11 @@ class OverlayController(QObject):
             if not self._place(int(self.icon.winId()),icon_geometry):self.icon.hide()
         else:
             self.icon.hide()
-            self.actions.view.put(expanded=self.expanded and content.has_subagents(),canExpand=content.has_subagents(),popupOpen=self.popup_open)
+            self.actions.view.put(popupOpen=self.popup_open,popupKind=self.popup_kind)
+            self.toolbar.view.put(popupKind=self.popup_kind,chartStyle=self.chart_style,heightValue=self.preferred_height,
+                                  displayedHeight=round(content.base_height()),canAdjustHeight=content.has_subagents(),
+                                  canShorten=content.has_subagents() and self.preferred_height>480,
+                                  canLengthen=content.has_subagents() and self.preferred_height<1440)
             self.shadow.apply_appearance(self.appearance,self.opacity)
             self.shadow.set_panel_size(self.widget.panel_width()/scale,geometry[3]/(dpi/96*scale))
             shadow_geometry=self.shadow.physical_geometry(geometry,dpi/96)
@@ -980,26 +1031,27 @@ class OverlayController(QObject):
                 placed=(origin[0]+round(x*native_scale),origin[1]+round(y*native_scale),round(w*native_scale),round(h*native_scale))
                 if not self._place(int(control.winId()),placed):control.hide()
                 return placed
-            if mode in ('detail','detail-inline'):
-                place(self.detail,(0 if inline else WIDTH,0,WIDTH if inline else 240,geometry[3]/native_scale))
+            layout=content.layout()
+            if content.has_subagents():
+                place(self.detail,(MARGIN,layout['sub_y'],SECTION_WIDTH,layout['sub_height']))
             else:self.detail.hide()
-            if self.links.sync():place(self.links,(0,0,WIDTH+content.detail_extent,geometry[3]/native_scale),monitor)
+            if self.links.sync():place(self.links,(0,0,WIDTH,geometry[3]/native_scale),monitor)
             else:self.links.hide()
-            extent=0 if inline else content.detail_extent
             from .overlay_monitor import header_layout,header_status
-            header_width=header_layout(content)['title_width']+8 if header_status(content)[0] else HEADER_WIDTH+extent
-            place(self.header,(HEADER_X,12,header_width,32),monitor)
-            self.actions_geometry=place(self.actions,(ACTIONS_X+extent,13,78,30),monitor)
+            header_width=HEADER_WIDTH
+            place(self.header,(HEADER_X,8,header_width,28),monitor)
+            self.actions_geometry=place(self.actions,(ACTIONS_X,13,78,30),monitor)
             if self.popup_open:
                 # Align below the header. The monitor already guarantees enough
                 # interior width; clamping also handles rounded native pixels.
-                popup_w,popup_h=round(160*native_scale),round(40*native_scale)
-                px=monitor[0]+round((POPUP_X+extent)*native_scale)
+                popup_width,popup_height=(260,150) if self.popup_kind=='settings' else (160,40)
+                popup_w,popup_h=round(popup_width*native_scale),round(popup_height*native_scale)
+                px=monitor[0]+round((WIDTH-MARGIN-popup_width)*native_scale)
                 py=monitor[1]+round(44*native_scale)
                 gap=round(16*dpi/96)
                 px=min(frame[2]-gap-popup_w,max(frame[0]+gap,px))
                 py=min(frame[3]-gap-popup_h,max(frame[1]+gap,py))
-                self.toolbar.resize(round(160*scale),round(40*scale))
+                self.toolbar.resize(round(popup_width*scale),round(popup_height*scale))
                 self.popup_geometry=(px,py,popup_w,popup_h)
                 if not self.toolbar.isVisible():self.toolbar.show()
                 self.configure_scene(self.toolbar)
@@ -1029,6 +1081,8 @@ def install_overlay(window, native_enabled=True):
     from PySide6.QtWidgets import QMenu
     controller = OverlayController(window.settings, native_enabled=native_enabled)
     window.overlay = controller
+    if hasattr(window,'settings_page') and hasattr(window.settings_page,'bind_overlay'):
+        window.settings_page.bind_overlay(controller)
     if getattr(window,'worker',None) and hasattr(window.worker,'request_record'):
         controller.record_loader=window.worker.request_record
         window.worker.record.connect(controller.receive_record)

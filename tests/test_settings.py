@@ -139,6 +139,50 @@ def test_legacy_categories(old,new):
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize('saved,expected',[(None,'bar'),('invalid','bar'),('bar','bar'),('filled-line','filled-line')])
+def test_overlay_chart_style_loads_saved_value_or_defaults_to_bars(startup_settings_window,saved,expected):
+    window,_=startup_settings_window
+    if saved is None:window.settings.remove('overlay/chartStyle')
+    else:window.settings.setValue('overlay/chartStyle',saved)
+    page=SettingsPage(window)
+    try:
+        assert page.controls['overlay-chart-style'].currentData()==expected
+    finally:page.deleteLater()
+
+
+@pytest.mark.integration
+def test_overlay_chart_style_applies_immediately_preserves_selection_and_persists(startup_settings_window,monkeypatch):
+    from cachemonitor.overlay import OverlayController
+    from test_overlay_presentation import summary
+    window,_=startup_settings_window
+    controller=OverlayController(window.settings,native_enabled=False);window.overlay=controller
+    window.settings_page.bind_overlay(controller)
+    model=controller.widget.content_model;data=summary(count=3);model.set_content(data)
+    model.pin_call(model.call_id(model.rows()[0]))
+    selected=model.selected_id
+    def unexpected(*args,**kwargs):pytest.fail('Changing chart presentation requested new usage data')
+    controller.overlay_loader=unexpected;controller.record_loader=unexpected
+    monkeypatch.setattr(controller,'content',unexpected)
+    try:
+        choice=window.settings_page.controls['overlay-chart-style']
+        choice.setCurrentIndex(choice.findData('filled-line'))
+        assert controller.chart_style=='filled-line'
+        assert model.selected_id==selected and model.graph_pinned
+        assert model.data is data
+        window.settings.sync()
+        saved=QSettings(window.settings.fileName(),QSettings.IniFormat)
+        assert saved.value('overlay/chartStyle')=='filled-line'
+        controller.set_chart_style('bar')
+        assert choice.currentData()=='bar'
+        assert model.selected_id==selected and model.graph_pinned
+        assert model.data is data
+        window.settings.sync()
+        saved.sync()
+        assert saved.value('overlay/chartStyle')=='bar'
+    finally:controller.stop();window.overlay=None
+
+
+@pytest.mark.integration
 def test_lazy_setting_categories_and_search_show_progress_until_controls_exist(startup_settings_window):
     window,_=startup_settings_window;page=window.settings_page
     wait_until(lambda:page.stack.isPageReady(0) and window.pages.isPageReady(3))

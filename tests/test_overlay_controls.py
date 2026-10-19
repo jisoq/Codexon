@@ -91,67 +91,50 @@ def native_detail(tmp_path):
         c.receive_target({'target':{'hwnd':int(host.winId())},'selection':Selection(A)})
         c.refresh();app.processEvents()
     try:
-        refresh();publish_subagents(c);c.toggle_expanded();refresh()
+        refresh();publish_subagents(c);refresh()
         wait_for_rendered(lambda:c.detail.isVisible() and c.actions.quick is not None)
         yield c,host,refresh
     finally:c.stop();host.close();app.processEvents()
 
 
 @pytest.mark.skipif(sys.platform!='win32',reason='Native Windows hit testing')
-@pytest.mark.parametrize('mode',['detail','detail-inline'])
-def test_detail_interaction_keeps_header_buttons_reachable(native_detail,mode):
+@pytest.mark.parametrize('width',[1280,420])
+def test_embedded_subagent_interaction_keeps_gear_and_settings_reachable(native_detail,width):
     from ctypes import wintypes as W
-    from PySide6.QtCore import QPointF,QEvent
-    from PySide6.QtGui import QEnterEvent,QMouseEvent
+    from PySide6.QtCore import QPointF
     from cachemonitor.overlay_chrome import named_item
-    from tests.test_ui import wait_for_rendered
-    from cachemonitor.overlay_monitor import WIDTH
     c,host,refresh=native_detail
-    width=1280 if mode=='detail' else round(WIDTH*c.appearance.scale)+64
     host.resize(width,900);refresh()
-    assert c.detail.isVisible()
-    assert c.automatic_mode==mode
-    button=named_item(c.actions.quick.rootObject(),'expand')
-    grouping=named_item(c.detail.quick.rootObject(),'detailMode-model')
-    click(c.detail,grouping);refresh()
-    assert c.widget.content_model.detail_group=='model'
+    assert c.detail.isVisible() and c.automatic_mode=='monitor'
+    button=named_item(c.actions.quick.rootObject(),'settingsButton')
+    model=c.widget.content_model;key=model.detail_groups()[0]['key']
+    group=named_item(c.detail.quick.rootObject(),'detailAction-group-'+key)
+    click(c.detail,group);refresh()
+    assert key in model.expanded_groups and c.detail.isVisible()
     point=button.mapToScene(QPointF(button.width()/2,button.height()/2))
-    # A direct Qt click alone would bypass the HWND that actually receives input.
-    x,y,w,h=c.actions_geometry
-    scale=w/c.actions.width()
+    x,y,w,h=c.actions_geometry;scale=w/c.actions.width()
     native_point=W.POINT(x+round(point.x()*scale),y+round(point.y()*scale))
     api=c.native.u
     api.WindowFromPoint.argtypes=[W.POINT];api.WindowFromPoint.restype=W.HWND
     assert api.WindowFromPoint(native_point)==int(c.actions.winId())
-    global_point=QPointF(c.actions.quick.mapToGlobal(point.toPoint()))
-    app=QApplication.instance()
-    app.sendEvent(c.actions.quick,QEnterEvent(point,point,global_point))
-    app.sendEvent(c.actions.quick,QMouseEvent(QEvent.MouseMove,point,global_point,Qt.NoButton,Qt.NoButton,Qt.NoModifier))
-    wait_for_rendered(lambda:button.property('hovered'))
     click(c.actions,button);refresh()
-    assert not c.expanded and not c.detail.isVisible()
-    click(c.actions,button);refresh()
-    assert c.expanded and c.detail.isVisible()
-    # Re-show and reposition the same expanded mode, then interact again.
-    c.hide_all();refresh()
-    grouping=named_item(c.detail.quick.rootObject(),'detailMode-model')
-    click(c.detail,grouping);refresh()
-    assert api.WindowFromPoint(native_point)==int(c.actions.winId())
-    opacity=named_item(c.actions.quick.rootObject(),'opacityButton')
-    click(c.actions,opacity);refresh()
-    assert c.toolbar.isVisible()
-    click(c.detail,grouping);refresh()
-    foreground=api.GetForegroundWindow()
-    refresh()
-    assert api.GetForegroundWindow()==foreground
+    assert c.popup_open and c.popup_kind=='settings' and c.toolbar.isVisible()
+    line=named_item(c.toolbar.quick.rootObject(),'chartStyle-filled-line')
+    click(c.toolbar,line);refresh()
+    assert c.chart_style=='filled-line'
+    old=c.preferred_height
+    click(c.toolbar,named_item(c.toolbar.quick.rootObject(),'taller'));refresh()
+    assert c.preferred_height>old
     x,y,w,h=c.popup_geometry
     assert api.WindowFromPoint(W.POINT(x+w//2,y+h//2))==int(c.toolbar.winId())
+    c.escape();assert not c.popup_open
+    click(c.actions,named_item(c.actions.quick.rootObject(),'opacityButton'));refresh()
+    assert c.popup_kind=='opacity' and c.toolbar.isVisible()
     c.close_popup()
     click(c.actions,named_item(c.actions.quick.rootObject(),'collapse'));refresh()
     assert c.collapsed and c.icon.isVisible()
     QTest.mouseClick(c.icon,Qt.LeftButton);refresh()
-    assert not c.collapsed and c.expanded and c.detail.isVisible()
-
+    assert not c.collapsed and c.detail.isVisible()
 
 @pytest.mark.skipif(sys.platform!='win32',reason='Native Windows popup stacking')
 @pytest.mark.parametrize('source',['actions','detail'])
@@ -162,7 +145,8 @@ def test_overlay_tooltip_stays_above_panels_after_activation(native_detail,sourc
     from tests.test_ui import wait_for_rendered
     c,host,refresh=native_detail;app=QApplication.instance()
     owner=getattr(c,source)
-    button=named_item(owner.quick.rootObject(),'expand' if source=='actions' else 'detailMode-model')
+    name='settingsButton' if source=='actions' else 'detailAction-'+c.widget.content_model.state['detailActions'][0]['id']
+    button=named_item(owner.quick.rootObject(),name)
     tip=next(o for o in button.findChildren(QObject) if o.metaObject().indexOfProperty('popupType')>=0)
     tip.setProperty('delay',0);tip.setProperty('visible',True)
     def popup():
@@ -180,3 +164,28 @@ def test_overlay_tooltip_stays_above_panels_after_activation(native_detail,sourc
         assert all(order.index(int(window.winId()))<order.index(int(w.winId()))
                    for w in (c.widget,c.detail,c.actions))
     tip.setProperty('visible',False)
+
+
+@pytest.mark.skipif(sys.platform!='win32',reason='Native companion keyboard focus')
+def test_agent_identifier_click_hands_keyboard_focus_to_corresponding_row(native_detail):
+    from cachemonitor.overlay_chrome import named_item
+    from tests.test_ui import wait_for_rendered
+    c,host,refresh=native_detail;m=c.widget.content_model
+    child_index=next(i for i,row in enumerate(m.rows()) if row['sid']!=m.data['id'])
+    child=m.rows()[child_index];key=m.detail_group_key(dict(home=child['home'],id=child['sid']),'sub')
+    c.links.view.inspectCall('call-'+str(child_index))
+    click(c.links,named_item(c.links.quick.rootObject(),'nav-focus-agent'))
+    button=lambda:named_item(c.detail.quick.rootObject(),'detailAction-group-'+key)
+    wait_for_rendered(lambda:button().hasActiveFocus())
+    assert key not in m.expanded_groups and not m.main_expanded
+    assert QApplication.activeWindow() is c.detail
+    QTest.keyClick(c.detail.quick,Qt.Key_Space)
+    wait_for_rendered(lambda:key in m.expanded_groups)
+    own=next(row for row in m.rows() if row['sid']==m.data['id'])
+    m.pin_call(m.call_id(own),toggle=False)
+    click(c.links,named_item(c.links.quick.rootObject(),'nav-focus-agent'))
+    main=lambda:named_item(c.links.quick.rootObject(),'nav-main-detail')
+    wait_for_rendered(lambda:main().hasActiveFocus())
+    assert QApplication.activeWindow() is c.links and not m.main_expanded
+    QTest.keyClick(c.links.quick,Qt.Key_Return)
+    wait_for_rendered(lambda:m.main_expanded)

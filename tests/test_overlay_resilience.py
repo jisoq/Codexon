@@ -97,6 +97,8 @@ def test_tracker_finishes_backlog_and_observes_appends_without_heartbeat(tmp_pat
 @pytest.mark.skipif(sys.platform!='win32',reason='Owned native Windows windows')
 def test_auto_fallback_restores_preference_anchor_and_clickthrough(tmp_path):
     from cachemonitor.overlay_windows import WindowsOverlay
+    from cachemonitor.overlay_monitor import WIDTH,geometry
+    from PySide6.QtCore import QEventLoop
     app=QApplication.instance() or QApplication([])
     host=QWidget();host.setWindowTitle('CacheMonitor owned resize test');host.resize(900,1000);host.show()
     controller=OverlayController(QSettings(str(tmp_path/'settings.ini'),QSettings.IniFormat),native_enabled=False,appearance_path=tmp_path/'codex.toml')
@@ -125,32 +127,35 @@ def test_auto_fallback_restores_preference_anchor_and_clickthrough(tmp_path):
                     refresh();return
                 extra=(raw.right-raw.left-actual[0],raw.bottom-raw.top-actual[1])
                 assert native.u.SetWindowPos(hwnd,None,0,0,width+extra[0],height+extra[1],0x0016)
-            QTest.qWait(20)
+            app.processEvents(QEventLoop.AllEvents,20)
         pytest.fail(f'Frame did not settle: requested={desired}, actual={native.frame(hwnd)}')
     requested=None
     def size_for(mode):
         nonlocal requested
         dpi=native.u.GetDpiForWindow(int(host.winId()));factor=dpi/96;gap=round(16*factor)
         m=controller.widget.content_model
-        full=round(m.monitor_height(False)*factor);compact=round(m.monitor_height(True)*factor)
-        height={'full':full+40,'compact':(full+compact)//2,'icon':compact//2}[mode]
-        requested=(round(660*controller.appearance.scale*factor)+2*gap,height+2*gap)
+        extra=m.main_detail_height()
+        full=round(geometry(m.data,preferred_height=720,main_detail_height=extra)['height']*controller.appearance.scale*factor)
+        minimum=round(geometry(m.data,preferred_height=0,main_detail_height=extra)['height']*controller.appearance.scale*factor)
+        compact=round(geometry(m.data,True,preferred_height=0,main_detail_height=extra)['height']*controller.appearance.scale*factor)
+        height={'full':full+40,'compact':(minimum+compact)//2,'icon':compact//2}[mode]
+        requested=(round(WIDTH*controller.appearance.scale*factor)+2*gap,height+2*gap)
         resize_frame(*requested)
     try:
-        refresh();size_for('full');assert controller.automatic_mode=='detail'
+        refresh();size_for('full');assert controller.automatic_mode=='monitor' and controller.detail.isVisible()
         from PySide6.QtQuick import QQuickItem
         root=controller.actions.quick.rootObject()
         assert controller.can_present('home',A)
-        assert root.findChild(QQuickItem,'evidence') is None and root.findChild(QQuickItem,'expand') is not None
+        assert root.findChild(QQuickItem,'evidence') is None and root.findChild(QQuickItem,'settingsButton') is not None
         assert controller.expanded and not hasattr(controller,'open_evidence')
         size_for('compact')
-        assert controller.automatic_mode in ('detail','detail-inline') and controller.widget.content_model.compact and controller.widget.isVisible()
+        assert controller.automatic_mode=='compact' and controller.widget.content_model.compact and controller.widget.isVisible()
         assert controller.widget.grab().save(str(tmp_path/'compact.png'))
         size_for('icon')
         assert controller.automatic_mode=='icon' and controller.icon.isVisible() and not controller.collapsed
         assert not controller.can_present('home',A)
         size_for('full')
-        assert controller.automatic_mode=='detail' and controller.anchor==(1,.7)
+        assert controller.automatic_mode=='monitor' and controller.anchor==(1,.7)
         assert controller.widget.grab().save(str(tmp_path/'detail.png'))
         assert native.u.GetWindowLongPtrW(int(controller.widget.winId()),-20)&0x20
         controller.set_collapsed(True);size_for('full')

@@ -351,7 +351,7 @@ def test_skipped_certificate_predecessor_cannot_hide_a_prior_correction():
     assert engine.sessions[('h', 's')]['speed_append_from'] is not None
     assert tracker.collect(engine) == expected(engine)
     assert tracker.metrics['replayed_scopes'] == 1
-def test_main_monitor_keeps_current_speed_health_and_session_navigation():
+def test_main_monitor_keeps_current_speed_health_during_call_and_detail_selection():
     from PySide6.QtWidgets import QApplication
     from cachemonitor.overlay_view import OverlayContent
     from cachemonitor.overlay_data import OverlaySummaries
@@ -361,17 +361,19 @@ def test_main_monitor_keeps_current_speed_health_and_session_navigation():
     engine=AnalysisEngine();engine.ingest([source])
     data=OverlaySummaries().collect(engine)[0]
     data['speed_health']=health(source)
-    content=OverlayContent();content.monitor_action('tab-latest');content.set_content(data);content.set_layout(detail=True)
+    content=OverlayContent();content.set_content(data)
     assert content.speed_alert()['recent_speed']==35 and content.speed_alert()['baseline_speed']==100
     assert header_status(content)[1]=='warning'
-    session_link=next(link for link in content.monitor_links() if link['id']=='session')
-    assert session_link['target'].sid==source['id'] and session_link['target'].call_id is None
+    content.pin_call(content.call_id(content.rows()[0]))
+    content.monitor_action('main-detail')
+    assert content.main_expanded and content.graph_pinned
+    assert content.speed_alert()['recent_speed']==35
     assert not content.detail_groups() and not content.detailBody.state['accessible']
     assert not any(link['id']=='speed-info' for link in content.monitor_links())
     content.set_content(dict(data,speed_health={'active':False}))
     assert not content.speed_alert()['active']
     content.set_content(data,note='수집 지연')
     assert not content.speed_alert()
-    assert [r['id'] for r in content.monitor_links() if r.get('interaction')=='navigate']==['session','collection']
-    assert len([r for r in content.monitor_links() if r.get('interaction')=='select'])==len(content.rows())
+    assert [r['id'] for r in content.monitor_links() if r.get('interaction')=='navigate']==['collection']
+    assert any(r['id']=='main-detail' for r in content.monitor_links())
     content.deleteLater();app.processEvents()

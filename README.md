@@ -30,13 +30,13 @@ Home shows remaining usage and today's activity, with descriptions and links to 
 
 ## Overlay views
 
-![Main Agent with the Sub Agents panel on the right](docs/images/sub-detail-readme-en.png)
+![Overlay with a fixed Main summary above the Sub list](docs/images/overlay-column-en.png)
 
-Switch **$ | Count** to see subscription value or token composition. The default is **$**; saved selections are restored. The top summary shows the Main Agent's model, reasoning effort, and usage. **Trend** shows the 20 most recent calls, including subagents.
+The top summary shows total cost and active requests. Three charts show cost, output speed, and reasoning tokens for the 20 most recent calls, including subagents. The selected call's cache hit rate appears beside its cost. Agent markers and charts share colors derived from Codex appearance settings.
 
-The header's **Open details** button appears only when confirmed subagents exist. The right-side **Sub Agents** panel shows child value and agent count, with **Agents | Model** grouping. **Agents** is the default, ordered by most recent update. Expand an item for its average output speed and cost breakdown. Select **Main Agent** to open its records in the dashboard.
+**Main Agent** stays fixed while only the **Sub Agents** list below it scrolls. Each row shows its own cumulative cost, model and reasoning effort, cache hit rate, and average output speed. Expand a row to inspect token composition and the number of priced calls.
 
-The header controls adjust background transparency and minimize the overlay. They move to the upper right when details are open. Select the minimized icon to restore the overlay. Preparation, delay, and error messages appear beside the session title. Existing values are dimmed when updates are interrupted or delayed.
+Open **Settings** in the header to choose bars or a filled line and adjust the height. These preferences survive restarts. Separate controls adjust background transparency and minimize the overlay. Select the minimized icon to restore it. Preparation, delay, and error messages appear below the title. Existing values are dimmed when updates are interrupted or delayed.
 
 Amounts use Standard base rates weighted by subscription usage: Fast is 2.5x Standard for the same tokens. Model comparison reflects recorded request/response names.
 

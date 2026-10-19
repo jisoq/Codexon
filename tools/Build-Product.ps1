@@ -68,7 +68,7 @@ try {
         $content = [IO.File]::ReadAllText((Join-Path $sourceRoot $guide[0])).Replace('(README.md)','(USER-GUIDE.md)').Replace('(README.ko.md)','(USER-GUIDE.ko.md)').Replace('(docs/images/','(')
         [IO.File]::WriteAllText((Join-Path $stagedProduct $guide[1]), $content, [Text.UTF8Encoding]::new($false))
     }
-    foreach ($image in @('sub-detail-readme-ko.png', 'sub-detail-readme-en.png')) {
+    foreach ($image in @('overlay-column-ko.png', 'overlay-column-en.png')) {
         Copy-Item -LiteralPath (Join-Path $sourceRoot "docs/images/$image") -Destination (Join-Path $stagedProduct $image)
     }
     Copy-Item -LiteralPath (Join-Path $sourceRoot 'LICENSES') -Destination (Join-Path $stagedProduct 'LICENSES') -Recurse

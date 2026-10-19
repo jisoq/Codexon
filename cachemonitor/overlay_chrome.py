@@ -92,6 +92,9 @@ class ChromeModel(Node):
     opacityRequested = Signal(int)
     collapseRequested = Signal()
     opacityToggleRequested = Signal()
+    settingsToggleRequested = Signal()
+    chartStyleRequested = Signal(str)
+    heightRequested = Signal(int)
     escapeRequested = Signal()
     interactionRequested = Signal()
     restoreRequested = Signal()
@@ -102,6 +105,12 @@ class ChromeModel(Node):
     def collapsePanel(self): self.collapseRequested.emit()
     @Slot()
     def toggleOpacity(self): self.opacityToggleRequested.emit()
+    @Slot()
+    def toggleSettings(self): self.settingsToggleRequested.emit()
+    @Slot(str)
+    def setChartStyle(self,value): self.chartStyleRequested.emit(value)
+    @Slot(int)
+    def changeHeight(self,delta): self.heightRequested.emit(delta)
     @Slot()
     def escapePanel(self): self.escapeRequested.emit()
     @Slot()
@@ -116,6 +125,9 @@ class OverlayChrome(QuickHost):
     collapse = Signal()
     restore = Signal()
     opacity_toggle = Signal()
+    settings_toggle = Signal()
+    chart_style_changed = Signal(str)
+    height_changed = Signal(int)
     escape = Signal()
     interaction_started = Signal()
     opacity_changed = Signal(int)
@@ -150,6 +162,9 @@ class OverlayChrome(QuickHost):
         self.view.opacityRequested.connect(self.opacity_changed)
         self.view.collapseRequested.connect(self.collapse)
         self.view.opacityToggleRequested.connect(self.opacity_toggle)
+        self.view.settingsToggleRequested.connect(self.settings_toggle)
+        self.view.chartStyleRequested.connect(self.chart_style_changed)
+        self.view.heightRequested.connect(self.height_changed)
         self.view.escapeRequested.connect(self.escape)
         self.view.interactionRequested.connect(self.begin_interaction)
         self.view.restoreRequested.connect(self.restore)
@@ -270,6 +285,7 @@ class OverlayChrome(QuickHost):
 class NavigationModel(Node):
     navigationRequested=Signal(object)
     callSelected=Signal(object)
+    escapeRequested=Signal()
     def __init__(self,content):
         super().__init__();self.content=content;self.targets={};self.captured=None
     def link_state(self,links):
@@ -300,7 +316,25 @@ class NavigationModel(Node):
             if index<len(rows):row=rows[index]
         identity=self.content.call_id(row) if row else None
         if getattr(self.content,'inspected_call',None)!=identity:
-            self.content.inspected_call=identity;self.content.update()
+            self.content.inspected_call=identity;self.content.sync_details();self.content.update()
+
+    @Slot(int,result=bool)
+    def chartKey(self,key):
+        content=self.content;rows=content.rows()
+        if key==Qt.Key_Escape:
+            if content.graph_pinned or not content.follow_latest:content.release_pin();content.inspected_call=None;content.update()
+            else:self.escapeRequested.emit()
+            return True
+        if key in (Qt.Key_Return,Qt.Key_Enter) and rows:
+            content.pin_call(content.selected_id or content.call_id(rows[-1]));return True
+        if key not in (Qt.Key_Left,Qt.Key_Right,Qt.Key_Home,Qt.Key_End) or not rows:return False
+        index=next((i for i,row in enumerate(rows) if content.call_id(row)==content.selected_id),len(rows)-1)
+        index=0 if key==Qt.Key_Home else len(rows)-1 if key==Qt.Key_End else max(0,min(len(rows)-1,index+(-1 if key==Qt.Key_Left else 1)))
+        pinned=content.graph_pinned
+        content.select(content.call_id(rows[index]));content.graph_pinned=pinned
+        if pinned:content.follow_latest=False
+        content.inspected_call=None;content.sync_details();content.update()
+        return True
 
     @Slot(int)
     def scrollLower(self,delta):self.content.scroll_lower(delta)
@@ -309,7 +343,6 @@ class NavigationModel(Node):
 
 
 class DetailModel(NavigationModel):
-    escapeRequested = Signal()
     interactionRequested = Signal()
 
     def __init__(self, content):
@@ -383,12 +416,18 @@ class OverlayLinks(QuickHost):
         self.setWindowTitle('Cache Monitor - 기록 링크');self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.view=NavigationModel(content);self.wheel_forwarder=None
+        self.view.escapeRequested.connect(self.escape)
         content.changed.connect(self.sync)
         self.set_scene(self.view,'OverlayLinks.qml',transparent=True,deferred=True,shared=True)
         self._hover_position=None
     def configure_quick(self,quick):
         quick.installEventFilter(self)
         quick.setMouseTracking(True)
+    def begin_interaction(self):
+        self.interaction_started.emit()
+        self.activateWindow()
+        self.quick.setFocus(Qt.OtherFocusReason)
+        self.quick.quickWindow().contentItem().forceActiveFocus(Qt.OtherFocusReason)
     def sync(self):
         from .overlay_view import palette
         c=self.view.content;scale=c.appearance.scale;links=self.view.link_state(c.monitor_links())
@@ -405,7 +444,9 @@ class OverlayLinks(QuickHost):
     def inspect_position(self,position):
         scale=self.view.content.appearance.scale
         x,y=position.x()/scale,position.y()/scale
-        key=next((r['id'] for r in self.view.state.get('links',[])
+        links=self.view.state.get('links',[])
+        if any(r['id']=='focus-agent' and r['x']<=x<r['x']+r['width'] and r['y']<=y<r['y']+r['height'] for r in links):return
+        key=next((r['id'] for r in links
                   if r['id'].startswith('call-') and r['x']<=x<r['x']+r['width']
                   and r['y']<=y<r['y']+r['height']), '')
         self.view.inspectCall(key)
@@ -422,9 +463,6 @@ class OverlayLinks(QuickHost):
                 self._hover_position=None;self.view.inspectCall('')
 
         if event.type()==QEvent.Wheel and self.wheel_forwarder:
-            c=self.view.content
-            if c.compact and event.position().y()/c.appearance.scale>=c.layout()['context']:
-                c.scroll_lower(-event.angleDelta().y()/4);event.accept();return True
             self.wheel_forwarder(event);event.accept();return True
         if event.type()==QEvent.MouseButtonPress:self.interaction_started.emit()
         return super().eventFilter(watched,event)

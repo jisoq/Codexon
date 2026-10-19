@@ -80,18 +80,18 @@ def publish_subagents(controller, *, nested=False):
     return parent
 
 
-def test_selected_detail_button_still_changes_on_hover():
+def test_selected_settings_button_still_changes_on_hover():
     from PySide6.QtCore import QPoint,QPointF,QRect,QSize,QEvent,Qt
     from PySide6.QtGui import QEnterEvent,QMouseEvent
     from cachemonitor.overlay_chrome import OverlayChrome,named_item
     from tests.test_ui import wait_for_rendered
     app=QApplication.instance() or QApplication([])
     chrome=OverlayChrome('actions');chrome.resize(78,30);chrome.move(100,100)
-    chrome.view.put(expanded=True,canExpand=True,reducedMotion=True)
+    chrome.view.put(popupOpen=True,popupKind='settings',reducedMotion=True)
     try:
         chrome.show();chrome.raise_();chrome.activateWindow()
         wait_for_rendered(lambda:chrome.quick is not None and chrome.quick.rootObject() is not None)
-        button=named_item(chrome.quick.rootObject(),'expand')
+        button=named_item(chrome.quick.rootObject(),'settingsButton')
         center=button.mapToScene(QPointF(button.width()/2,button.height()/2)).toPoint()
         top=button.mapToScene(QPointF(0,0)).toPoint()
         rect=QRect(top,QSize(round(button.width()),round(button.height())))
@@ -108,63 +108,90 @@ def test_selected_detail_button_still_changes_on_hover():
         assert button.property('selected')
     finally:chrome.close();app.processEvents()
 
-def test_subagent_detail_tracks_family_and_preserves_expansion_preference(layout_controller):
+def assert_embedded_subagents(controller):
+    from cachemonitor.overlay_monitor import MARGIN,SECTION_WIDTH
+    c=controller;m=c.widget.content_model;layout=m.layout()
+    x,y,w,h=c.monitor_geometry
+    factor=c.native.u.GetDpiForWindow(1)/96*m.appearance.scale
+    detail=c.native.placed[int(c.detail.winId())]
+    assert detail==(x+round(MARGIN*factor),y+round(layout['sub_y']*factor),
+                    round(SECTION_WIDTH*factor),round(layout['sub_height']*factor))
+    assert detail[0]>=x and detail[1]>=y
+    assert detail[0]+detail[2]<=x+w and detail[1]+detail[3]<=y+h
+    assert c.automatic_mode in ('monitor','compact') and c.detail.isVisible()
+
+
+def compact_frame(controller):
+    from cachemonitor.overlay_monitor import geometry
+    m=controller.widget.content_model
+    height=geometry(m.data,preferred_height=0,main_detail_height=m.main_detail_height())['height']
+    return (0,0,1300,round((height-1)*m.appearance.scale)+32)
+
+
+def test_subagent_viewport_tracks_family_without_main_disclosure(layout_controller):
     from cachemonitor.overlay_chrome import named_item
     c=layout_controller;m=c.widget.content_model
-    c.expanded=True;c.settings.setValue('overlay/expanded',True);c.refresh()
-    button=named_item(c.actions.quick.rootObject(),'expand')
-    assert not button.isVisible() and not c.actions.view.state['canExpand']
+    button=named_item(c.actions.quick.rootObject(),'settingsButton')
+    assert button.isVisible() and named_item(c.actions.quick.rootObject(),'expand') is None
     assert c.automatic_mode=='monitor' and not c.detail.isVisible()
-    c.toggle_expanded()
-    assert c.expanded and c.settings.value('overlay/expanded',False,type=bool)
     parent=publish_subagents(c,nested=True)
-    assert m.data['descendants']==2 and c.automatic_mode=='detail'
-    assert button.isVisible() and c.detail.isVisible()
-    c.capture_detail()
+    assert m.data['descendants']==2 and not m.main_expanded
+    assert_embedded_subagents(c)
     engine=AnalysisEngine();engine.ingest([parent])
     c.receive_snapshot({'overlay_sessions':OverlaySummaries().collect(engine)})
-    c.activate_detail()
-    assert c.expanded and c.settings.value('overlay/expanded',False,type=bool)
-    assert not button.isVisible() and not c.actions.view.state['expanded']
     assert c.automatic_mode=='monitor' and not c.detail.isVisible()
     publish_subagents(c)
-    assert c.automatic_mode=='detail' and c.detail.isVisible()
+    assert_embedded_subagents(c)
     c.receive_target({'target':{'hwnd':1},'selection':Selection(B)})
-    assert c.expanded and not c.actions.view.state['canExpand'] and not c.detail.isVisible()
+    assert not c.detail.isVisible()
     c.receive_target({'target':{'hwnd':1},'selection':Selection(A)})
-    assert c.automatic_mode=='detail' and c.detail.isVisible()
+    assert_embedded_subagents(c)
 
 
-def test_right_detail_keeps_main_fixed_and_moves_shared_controls(layout_controller):
+def test_subagent_companion_uses_only_lower_viewport(layout_controller):
     from cachemonitor.overlay_chrome import named_item
     c=layout_controller;publish_subagents(c,nested=True)
-    c.anchor=(.6,1);c.expanded=False;c.refresh()
-    main=c.monitor_geometry;controls=c.actions_geometry
-    c.capture_detail();c.activate_detail()
-    assert c.monitor_geometry==main and c.current_geometry[:2]==main[:2]
-    detail=c.native.placed[int(c.detail.winId())]
-    assert detail[0]==main[0]+main[2]
-    assert c.actions_geometry[0]-controls[0]==detail[2]
+    c.anchor=(.6,1);c.refresh()
+    assert_embedded_subagents(c)
     root=c.detail.quick.rootObject();m=c.widget.content_model
     assert named_item(root,'closeDetail') is None
-    heading=named_item(root,'openDashboard')
-    assert heading.y()==m.layout()['session']*m.appearance.scale
-    assert named_item(root,'detailCostAmount-count').property('text')=='2'
+    assert named_item(root,'openDashboard') is None
+    assert named_item(root,'detailCostAmount-count') is None
     assert named_item(root,'detailCostAmount-main') is None
-    c.capture_detail();c.activate_detail()
-    assert c.monitor_geometry==main and c.actions_geometry==controls and not c.detail.isVisible()
+    assert named_item(root,'detailScroll').height()==c.detail.height()
+    assert {row['id'] for row in m.detail_groups()}=={B,'grandchild'}
 
 
-def test_closed_detail_allows_right_edge_and_opening_only_shifts_when_needed(layout_controller):
-    c=layout_controller;publish_subagents(c)
-    c.anchor=(1,1);c.expanded=False;c.refresh()
+def test_main_disclosure_changes_height_and_preserves_right_anchor(layout_controller):
+    c=layout_controller;publish_subagents(c);m=c.widget.content_model
+    c.native.bounds=(0,0,1300,2400)
+    c.anchor=(1,1);c.refresh()
     closed=c.monitor_geometry;anchor=c.anchor
-    c.toggle_expanded();opened=c.monitor_geometry
-    assert opened[0]<closed[0] and opened[1:]==closed[1:]
-    assert c.current_geometry[0]+c.current_geometry[2]==closed[0]+closed[2]
-    assert c.automatic_mode=='detail' and c.anchor==anchor
+    before=m.layout();m.monitor_action('main-detail');opened=c.monitor_geometry
+    assert m.main_expanded and m.main_detail_height()>0
+    assert opened[0]==closed[0] and opened[2]==closed[2]
+    assert opened[1]+opened[3]==closed[1]+closed[3]
+    assert opened[3]-closed[3]==round(m.main_detail_height()*m.appearance.scale)
+    assert m.layout()['sub_y']-before['sub_y']==m.main_detail_height()
+    assert c.anchor==anchor
+    assert_embedded_subagents(c)
     c.toggle_expanded()
-    assert c.monitor_geometry==closed
+    assert not m.main_expanded and c.monitor_geometry==closed
+
+
+def test_length_changes_only_subagent_allowance_and_persists_chart_style(layout_controller):
+    c=layout_controller;publish_subagents(c);m=c.widget.content_model
+    c.native.bounds=(0,0,1300,2400);c.refresh()
+    before=m.layout();anchor=c.anchor
+    c.change_length(40)
+    after=m.layout()
+    assert after['charts']==before['charts'] and after['main']==before['main']
+    assert after['sub_y']==before['sub_y'] and after['sub_height']-before['sub_height']==40
+    assert after['height']-before['height']==40 and c.anchor==anchor
+    assert c.settings.value('overlay/height',type=int)==c.preferred_height
+    assert_embedded_subagents(c)
+    c.set_chart_style('filled-line')
+    assert m.chart_style=='filled-line' and c.settings.value('overlay/chartStyle')=='filled-line'
 
 
 def test_equal_heartbeats_keep_watchdog_and_restore_hidden_overlay(layout_controller,monkeypatch):
@@ -194,7 +221,6 @@ def test_equal_heartbeats_keep_watchdog_and_restore_hidden_overlay(layout_contro
 
 def test_compact_detail_loading_preserves_visible_summary_and_reuses_rows(layout_controller):
     from copy import deepcopy
-    from cachemonitor.overlay_view import money
     c=layout_controller;app=QApplication.instance();m=c.widget.content_model
     publish_subagents(c)
     complete=deepcopy(next(value for value in c.sessions if value['id']==A))
@@ -202,24 +228,23 @@ def test_compact_detail_loading_preserves_visible_summary_and_reuses_rows(layout
     recent={key:value for key,value in complete.items() if key!='subagent_finance'}
     compact=dict(recent,_recent_refs=True,recent=[{'key':row['id']} for row in recent['recent']],
                  latest={'key':recent['latest']['id']})
-    c._overlay_detail=recent;c.expanded=False
+    c._overlay_detail=recent
     requests=[];c.overlay_loader=lambda request,data,**options:requests.append((request,data,options))
     c.receive_snapshot({'overlay_sessions':[compact]})
-    c.native.bounds=(0,0,1300,m.monitor_height(True)+32)
+    c.native.bounds=compact_frame(c)
     c.refresh();app.processEvents()
-    assert m.compact and not requests
+    assert m.compact and len(requests)==1
     before=(m.data['cost'],deepcopy(m.rows()))
-    c.toggle_expanded();app.processEvents()
     assert c.detail.isVisible() and c.widget.isVisible() and m.compact
     assert (m.data['cost'],m.rows())==before
-    assert m.state['detailSubCost']==money(complete['child_cost'])
     assert not requests[-1][1]['_recent_refs'] and requests[-1][2]['finance']
     assert m.detail_items()
     c.receive_overlay_detail(dict(id=requests[-1][0],summary=complete,prepared_token=complete['_prepared_token']))
     app.processEvents()
     assert m.detail_data()==complete['subagent_finance'] and (m.data['cost'],m.rows())==before
-    c.toggle_expanded();c.toggle_expanded();app.processEvents()
+    c.refresh();c.refresh();app.processEvents()
     assert c.detail.isVisible() and len(requests)==1
+    assert_embedded_subagents(c)
 
 
 def test_maintenance_updates_snapshot_delay_and_displayed_age(layout_controller,monkeypatch):
@@ -273,7 +298,7 @@ def test_pending_overlay_refresh_keeps_confirmed_panel_until_replacement(layout_
         c.receive_snapshot(dict(overlay_sessions=[publication(detail)],ts=stamp))
         app.processEvents()
     stamp=time.time();publish(confirmed,stamp)
-    if compact:c.native.bounds=(0,0,1300,m.monitor_height(True)+32)
+    if compact:c.native.bounds=compact_frame(c)
     m.monitor_tab='history';m.pin_call(m.call_id(m.rows()[0]));c.refresh();app.processEvents()
     assert m.compact is compact
     selected=m.selected_id;geometry=c.monitor_geometry;before=c.widget.grab().toImage()
@@ -318,9 +343,9 @@ def test_popup_outside_click_escape_order_and_persisted_opacity(layout_controlle
     assert controller.popup_open and controller.toolbar.isVisible()
     assert controller.toolbar.size().width()==160 and controller.toolbar.size().height()==40
     controller.escape()
-    assert not controller.popup_open and controller.expanded
+    assert not controller.popup_open and controller.widget.content_model.main_expanded
     controller.escape()
-    assert not controller.expanded and not controller.collapsed
+    assert not controller.widget.content_model.main_expanded and not controller.collapsed
     controller.escape()
     assert not controller.collapsed
     controller.toggle_opacity();controller.native.pointer=(0,0);controller.native.down=True
@@ -328,6 +353,11 @@ def test_popup_outside_click_escape_order_and_persisted_opacity(layout_controlle
     assert not controller.popup_open
     controller.set_opacity(63)
     assert controller.settings.value('overlay/opacity',type=int)==63
+    controller.toggle_settings()
+    assert controller.popup_open and controller.popup_kind=='settings' and controller.toolbar.isVisible()
+    assert controller.toolbar.size().width()==260 and controller.toolbar.size().height()==150
+    controller.escape()
+    assert not controller.popup_open and not controller.collapsed
 
 
 
@@ -362,15 +392,13 @@ def test_remote_session_uses_icon_and_restores_local_detail(layout_controller):
     assert m.is_remote and m.data is None and not m.rows()
     assert c.automatic_mode=='icon' and c.icon.isVisible() and not c.widget.isVisible() and not c.detail.isVisible()
     assert m.base_height()<local_height and all(link.get('interaction')=='tooltip' for link in m.monitor_links())
-    assert m.lines()[0]=='원격 세션' and '0호출' not in m.state['accessible']
-    c.toggle_expanded()
-    assert c.expanded  # The local detail preference survives the remote icon.
+    assert m.main_expanded  # Main disclosure survives the temporary remote icon.
     c.receive_snapshot({'overlay_sessions':c.sessions})
     assert m.is_remote and m.data is None
     c.receive_target({'target':{'hwnd':1},'selection':Selection(A)})
     assert not m.is_remote and m.data['id']==A
-    assert c.automatic_mode=='detail' and c.detail.isVisible()
-    assert c.actions.view.state['canExpand'] and m.base_height()==local_height
+    assert m.main_expanded and m.base_height()==local_height
+    assert_embedded_subagents(c)
 
 
 def test_session_collapse_reloads_from_fresh_controller(layout_controller):
@@ -385,24 +413,33 @@ def test_session_collapse_reloads_from_fresh_controller(layout_controller):
     finally:restored.stop()
 
 
-@pytest.mark.parametrize('mode', ['monitor','detail','icon'])
+@pytest.mark.parametrize('mode', ['monitor','main-expanded','icon'])
 @pytest.mark.parametrize('source', ['known','missing','remote'])
 def test_drag_moves_without_content_refresh(layout_controller,monkeypatch,mode,source):
+    import time
     c=layout_controller
-    if mode=='detail' and source=='known':publish_subagents(c)
+    # Leave movement room above the expanded fixed Main section.
+    c.native.bounds=(0,0,1300,1600)
+    if mode=='main-expanded' and source=='known':publish_subagents(c)
     if source=='missing':c.receive_snapshot({'overlay_sessions':[]})
     if source=='remote':c.receive_target({'target':{'hwnd':1},'selection':Selection(A,host='remote')})
-    c.expanded=mode=='detail';c.collapsed=mode=='icon';c.refresh()
+    if mode=='main-expanded':c.widget.content_model.monitor_action('main-detail')
+    # The synthetic target has no heartbeat worker while Qt builds its scene.
+    c.observed_at=time.monotonic()
+    c.collapsed=mode=='icon';c.refresh()
     def unexpected(*args,**kwargs):pytest.fail('Pure drag refreshed content')
     monkeypatch.setattr(c.widget,'set_content',unexpected)
+    c.observed_at=time.monotonic()
     c.begin_drag((500,500));before=c.current_geometry
+    assert c.drag_valid()
     c.move_drag((480,480))
     assert c.current_geometry[:2]==(before[0]-20,before[1]-20)
     c.cancel_drag()
 
 
-def test_no_child_expansion_preference_keeps_compact_drag_lightweight(layout_controller,monkeypatch):
-    c=layout_controller;c.expanded=True;c.native.bounds=(0,0,550,1000);c.refresh()
+def test_main_disclosure_without_subagents_keeps_drag_lightweight(layout_controller,monkeypatch):
+    c=layout_controller;c.native.bounds=(0,0,550,1000)
+    c.widget.content_model.monitor_action('main-detail');c.refresh()
     assert c.automatic_mode=='monitor' and not c.detail.isVisible()
     def unexpected(*args,**kwargs):pytest.fail('Hidden detail preference refreshed content while dragging')
     monkeypatch.setattr(c.widget,'set_content',unexpected)
@@ -410,6 +447,20 @@ def test_no_child_expansion_preference_keeps_compact_drag_lightweight(layout_con
     c.move_drag((480,480))
     assert c.current_geometry[:2]==(before[0]-20,before[1]-20)
     c.cancel_drag()
+
+
+def test_restore_recovers_summary_after_main_detail_exceeds_short_frame(layout_controller):
+    c=layout_controller;publish_subagents(c);m=c.widget.content_model
+    c.native.bounds=(0,0,1300,660);c.refresh()
+    assert c.widget.isVisible() and c.detail.isVisible() and not m.main_expanded
+    m.monitor_action('main-detail')
+    assert c.automatic_mode=='icon' and c.icon.isVisible() and not c.collapsed
+    c.icon.restore.emit()
+    assert not m.main_expanded and c.widget.isVisible() and c.detail.isVisible()
+    assert c.automatic_mode!='icon' and not c.collapsed
+    c.set_collapsed(True)
+    c.native.bounds=(0,0,1300,1200);c.refresh()
+    assert c.collapsed and c.icon.isVisible()
 
 
 def test_drag_coalesces_positions_and_applies_latest_snapshot_on_release(layout_controller,monkeypatch):
@@ -473,15 +524,23 @@ def test_drag_layout_change_keeps_deferred_content(layout_controller,monkeypatch
 @pytest.mark.parametrize('font_size',[14,21])
 def test_fallback_boundaries_preserve_anchor(layout_controller,monkeypatch,dpi,font_size):
     from dataclasses import replace
+    from cachemonitor.overlay_layout import WIDTH,MIN_SUB_HEIGHT
+    from cachemonitor.overlay_monitor import geometry
     c=layout_controller;publish_subagents(c);c.appearance=replace(c.appearance,font_size=font_size)
     monkeypatch.setattr(c.native.u,'GetDpiForWindow',lambda hwnd:dpi)
     c.native.bounds=(0,0,2400,2400);c.refresh()
     m=c.widget.content_model;factor=dpi/96;gap=round(16*factor)
-    full=round(m.monitor_height(False)*factor);compact=round(m.monitor_height(True)*factor)
-    width=round(700*c.appearance.scale*factor)+2*gap;anchor=c.anchor
+    full=round(round(geometry(m.data,preferred_height=0)['height']*c.appearance.scale)*factor)
+    compact=round(round(geometry(m.data,True,preferred_height=0)['height']*c.appearance.scale)*factor)
+    width=round(WIDTH*c.appearance.scale*factor)+2*gap;anchor=c.anchor
     for height,reduced,icon in ((full,False,False),(full-1,True,False),(compact,True,False),(compact-1,True,True),(full,False,False)):
         c.native.bounds=(0,0,width,height+2*gap);c.refresh()
         assert (c.automatic_mode=='icon')==icon
         assert m.compact==reduced and c.anchor==anchor and not c.collapsed
-    c.expanded=True;c.native.bounds=(0,0,round(350*c.appearance.scale*factor)+2*gap,full+2*gap);c.refresh()
-    assert c.automatic_mode=='detail-inline'
+        if not icon:
+            assert m.layout()['sub_height']>=MIN_SUB_HEIGHT
+            assert_embedded_subagents(c)
+    c.native.bounds=(0,0,width,round(720*c.appearance.scale*factor)+2*gap);c.refresh()
+    assert c.automatic_mode=='monitor' and m.base_height()==720
+    c.native.bounds=(0,0,width-1,2400);c.refresh()
+    assert c.automatic_mode=='icon' and c.anchor==anchor

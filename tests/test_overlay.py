@@ -133,11 +133,11 @@ def test_overlay_caches_completed_offscreen_reply_without_disturbing_current_req
 
 def test_overlay_detail_upgrade_reuses_recent_and_preserves_acquired_capabilities(overlay_cache_controller):
     controller,requested=overlay_cache_controller
-    summaries={A:overlay_summary(A,descendants=1)}
+    summaries={A:overlay_summary(A)}
     overlay_select(controller,summaries,A)
     assert requested[-1][1]==dict(health=False,finance=False)
     controller.receive_overlay_detail(overlay_reply(requested[-1]))
-    controller.expanded=True
+    summaries[A]=dict(summaries[A],descendants=1)
     data,pending=overlay_select(controller,summaries,A)
     assert pending and data['cost']==3.5 and data['latest']['output']==100
     assert requested[-1][1]==dict(health=False,finance=True)
@@ -169,9 +169,9 @@ def test_overlay_rejects_offscreen_reply_after_owner_retirement(overlay_cache_co
 
 def test_overlay_late_base_reply_cannot_downgrade_cached_finance(overlay_cache_controller):
     controller,requested=overlay_cache_controller
-    summaries={A:overlay_summary(A,descendants=1)}
+    summaries={A:overlay_summary(A)}
     overlay_select(controller,summaries,A)
-    controller.expanded=True
+    summaries[A]=dict(summaries[A],descendants=1)
     overlay_select(controller,summaries,A)
     finance={'cost':1.25,'agents':[{'home':'home','id':B,'cost':1.25}]}
     controller.receive_overlay_detail(overlay_reply(requested[1],subagent_finance=finance))
@@ -193,7 +193,7 @@ def test_overlay_cached_owner_eviction_requires_a_fresh_read(overlay_cache_contr
 def test_overlay_finance_extension_preserves_health_and_does_not_repeat_rows(overlay_cache_controller):
     from cachemonitor.overlay_navigation import NavigationTarget
     controller,requested=overlay_cache_controller
-    summaries={A:overlay_summary(A,descendants=1),B:overlay_summary(B)}
+    summaries={A:overlay_summary(A),B:overlay_summary(B)}
     navigation=NavigationTarget('home',A,view='incident',event_id='incident')
     controller._pending_overlay_navigation=navigation
     resumed=[];controller.navigate_from_dashboard=resumed.append
@@ -201,7 +201,7 @@ def test_overlay_finance_extension_preserves_health_and_does_not_repeat_rows(ove
     health={'events':[{'id':'incident'}]}
     controller.receive_overlay_detail(overlay_reply(requested[-1],_health_detail=True,cache_degradation=health))
     assert resumed==[navigation]
-    controller.expanded=True
+    summaries[A]=dict(summaries[A],descendants=1)
     overlay_select(controller,summaries,A)
     payload=requested[-1][0][1]
     assert payload['_health_detail'] and payload['cache_degradation']==health

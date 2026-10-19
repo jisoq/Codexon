@@ -123,32 +123,38 @@ def start_smoke(window,app,path,fonts,depth='full'):
             original_data=overlay.widget.content_model.data
             data=OverlaySummaries().collect(engine)[0];data['title']='사용한도 주석 표시 정리'
             overlay.widget.set_content(data);model=overlay.widget.content_model
-            from PySide6.QtCore import QPoint
-            links.resize(model.panel_width(),model.panel_height());links.sync();links.show();QTest.qWait(40)
-            assert named_item(links.quick.rootObject(),'nav-composition-input') is None
-            assert not any(link.get('formula') for link in model.monitor_links())
+            def wait_overlay(predicate):
+                deadline=time.monotonic()+5
+                while not predicate():
+                    app.processEvents();QTest.qWait(10)
+                    assert time.monotonic()<deadline,'Overlay control did not render'
+            links.resize(model.panel_width(),model.panel_height());links.sync();links.show()
+            wait_overlay(lambda:named_item(links.quick.rootObject(),'nav-main-detail') is not None)
             scale=model.appearance.scale
-            assert links.mask().contains(QPoint(round(50*scale),round((model.layout()['rows']+9)*scale)))
-            composition_links=[link for link in model.monitor_links()
-                               if link['x']<=50<link['x']+link['width'] and
-                               link['y']<=model.layout()['rows']+9<link['y']+link['height']]
-            assert composition_links and all(link.get('interaction')=='tooltip' for link in composition_links)
             selected=model.selected_id
-            for link in composition_links:links.view.activateLink(link['id'])
-            assert model.selected_id==selected
-            previous_unit=model.composition_unit
             size=(model.panel_width(),model.panel_height())
-            assert not any(link['id'].startswith('tab-') for link in model.monitor_links())
-            for unit in ('tokens','usd'):
-                click(links,named_item(links.quick.rootObject(),'nav-unit-'+unit));QTest.qWait(20)
-                assert model.composition_unit==unit and not model.detail_links()
+            click(links,named_item(links.quick.rootObject(),'nav-main-detail'))
+            wait_overlay(lambda:model.main_expanded)
+            assert model.selected_id==selected and model.main_items()
+            click(links,named_item(links.quick.rootObject(),'nav-main-detail'))
+            wait_overlay(lambda:not model.main_expanded)
+            toolbar=overlay.toolbar;previous_style=overlay.chart_style
+            toolbar.view.put(popupKind='settings',chartStyle=previous_style,
+                             heightValue=overlay.preferred_height,displayedHeight=round(model.base_height()))
+            toolbar.resize(round(260*scale),round(150*scale));toolbar.show()
+            wait_overlay(lambda:named_item(toolbar.quick.rootObject(),'chartStyle-bar') is not None)
+            for style in ('bar','filled-line'):
+                click(toolbar,named_item(toolbar.quick.rootObject(),'chartStyle-'+style))
+                wait_overlay(lambda:model.chart_style==style)
+                assert model.selected_id==selected
+                assert overlay.settings.value('overlay/chartStyle')==style
                 assert (model.panel_width(),model.panel_height())==size
                 frame=QImage(*size,QImage.Format_ARGB32_Premultiplied);frame.fill(0)
                 painter=QPainter(frame);model.paint(painter);painter.end()
-                target=path.with_name(path.stem+'-overlay-trend-'+unit+'.png')
+                target=path.with_name(path.stem+'-overlay-'+style+'.png')
                 assert frame.save(str(target));report['screens'].append(str(target))
-            report['overlay_controls']=dict(passive_composition=True,unit_toggle=True,trend_only=True,stable_size=True)
-            model.monitor_action('unit-'+previous_unit);links.hide()
+            report['overlay_controls']=dict(main_disclosure=True,chart_style=True,selection_preserved=True,stable_size=True)
+            overlay.set_chart_style(previous_style);toolbar.hide();links.hide()
             locale=language();title_images=[]
             try:
                 for selected in ('ko','en'):

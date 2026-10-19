@@ -66,7 +66,7 @@ GROUPS = {
     'overlay_controls': test_files('overlay_controls', 'overlay_layout_controller'),
     'overlay_navigation': test_files('overlay_navigation', 'speed_health') + (
         'tests/test_output_speed.py::test_rendered_summary_click_and_overlay_speed_navigation',),
-    'overlay_render': test_files('overlay_monitor','overlay_presentation', 'completed_layout', 'overlay_shadow'),
+    'overlay_render': test_files('overlay_monitor', 'overlay_presentation', 'overlay_column', 'completed_layout', 'overlay_shadow'),
     'overlay_appearance': test_files('overlay_appearance', 'theme_tokens'),
     'overlay_windows': test_files('overlay_windows'),
     'taskbar': test_files('taskbar', 'taskbar_clock'),
@@ -210,6 +210,7 @@ RULES = (
     ('cachemonitor/overlay_shadow.py', ('overlay_render',)),
     ('cachemonitor/overlay_tracking.py', ('overlay_tracking',)),
     ('cachemonitor/overlay_monitor.py', ('overlay_render', 'overlay_navigation')),
+    ('cachemonitor/overlay_layout.py', ('overlay_render', 'overlay_controls', 'overlay_navigation')),
     ('cachemonitor/overlay.py', ('overlay_tracking', 'overlay_controls', 'overlay_navigation', 'overlay_windows')),
     ('cachemonitor/qml/OverlayLinks.qml', ('overlay_navigation',)),
     ('cachemonitor/qml/OverlayDetail.qml', ('overlay_render', 'overlay_navigation')),

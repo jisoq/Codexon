@@ -3,6 +3,7 @@ import multiprocessing as mp
 from multiprocessing.connection import wait
 import threading
 import traceback
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from bisect import bisect_left
 from PySide6.QtCore import QThread, Signal
@@ -119,6 +120,12 @@ def process_main(connection,homes,index_path,static_snapshot=None,model_evidence
         connection.close()
 
 
+@dataclass
+class _CommandSendState:
+    closing: bool = False
+    error: Exception | None = None
+
+
 class AnalysisBridge(QThread):
     # These Python payloads are consumed as read-only values on the GUI thread.
     # Avoid recursive QVariantMap conversion of the complete analysis graph.
@@ -138,6 +145,7 @@ class AnalysisBridge(QThread):
         self.quota_path=quota_path
         self.cache_floor=cache_floor
         self.lock=threading.Lock()
+        self.command_ready=threading.Condition(self.lock)
         self._wake_reader,self._wake_writer=mp.Pipe(duplex=False)
         self._wake_armed=False
         self.pending=None
@@ -159,19 +167,35 @@ class AnalysisBridge(QThread):
         self._wake_locked()
 
     def _wake_locked(self):
+        self.command_ready.notify()
         # One token covers the whole mailbox, so producers cannot fill the pipe.
         if self._wake_armed or self._wake_writer.closed:return
         self._wake_writer.send_bytes(b'\0')
         self._wake_armed=True
 
-    def _take_commands(self):
+    def _consume_wake(self):
         with self.lock:
             if self._wake_armed:
                 self._wake_reader.recv_bytes()
                 self._wake_armed=False
-            commands,self.commands=self.commands,[]
-            pending,self.pending=self.pending,None
-            return commands,pending
+
+    def _send_commands(self,connection,state):
+        # A blocked command must never prevent the bridge from draining results.
+        try:
+            while True:
+                with self.command_ready:
+                    self.command_ready.wait_for(lambda:state.closing or self.isInterruptionRequested()
+                                                or self.commands or self.pending is not None)
+                    if state.closing or self.isInterruptionRequested():command={'kind':'stop'}
+                    elif self.commands:command=self.commands.pop(0)
+                    else:command,self.pending=self.pending,None
+                connection.send(command)
+                if command['kind']=='stop':return
+                command=None
+        except Exception as error:
+            with self.command_ready:
+                state.error=error
+                self._wake_locked()
 
     def requestInterruption(self):
         super().requestInterruption()
@@ -239,19 +263,25 @@ class AnalysisBridge(QThread):
                 self.fault.emit(dict(start_failed=True,retrying=False))
                 return
             child.close()
+            send_state=_CommandSendState()
+            sender=threading.Thread(target=self._send_commands,args=(parent,send_state),
+                                    name='analysis-command-sender',daemon=True)
+            sender_started=False
             try:
+                sender.start()
+                sender_started=True
                 while not self.isInterruptionRequested():
-                    commands,pending=self._take_commands()
-                    for command in commands: parent.send(command)
-                    if pending: parent.send(pending)
-                    if self.isInterruptionRequested():break
                     ready=wait((parent,self._wake_reader,self.process.sentinel))
+                    if self._wake_reader in ready:self._consume_wake()
+                    if send_state.error is not None:raise OSError(str(send_state.error)) from send_state.error
+                    if self.isInterruptionRequested():break
                     if parent in ready:
                         message=parent.recv()
                         if message['kind']=='snapshot':
                             try:value=receiver.receive(message['value'])
                             except ValueError:
-                                parent.send({'kind':'sync'});receiver=SnapshotReceiver();continue
+                                with self.lock:self.enqueue_latest({'kind':'sync'})
+                                receiver=SnapshotReceiver();continue
                             if value is not None:self.snapshot.emit(value)
                         elif message['kind'] in ('record','population','overlay_detail','result','stale'):self._deliver_result(message)
                         elif message['kind']=='progress':self.progress.emit(message)
@@ -262,22 +292,30 @@ class AnalysisBridge(QThread):
                                 request_id=message.get('id')))
                             if message['kind']=='fatal': break
                     if self.process.sentinel in ready: break
-            except (EOFError,BrokenPipeError,OSError) as error:
+            except (EOFError,BrokenPipeError,OSError,RuntimeError) as error:
                 if not self.isInterruptionRequested():
                     self.failure.emit(str(error))
                     self.fault.emit(dict(process_exited=True,retrying=True))
             finally:
-                try: parent.send({'kind':'stop'})
-                except (OSError,EOFError): pass
-                # Keep draining the pipe so a final snapshot cannot block the
-                # child before it commits/closes its ledger and subscription.
+                with self.command_ready:
+                    send_state.closing=True
+                    self.command_ready.notify()
+                # Drain before joining the sole sender, including its stop frame.
                 while True:
+                    if not sender_started or send_state.error is not None:
+                        if sender_started:sender.join()
+                        # A failed sender cannot deliver stop. EOF releases the
+                        # child's existing cleanup without killing its writer.
+                        parent.close()
+                        break
                     try:
-                        ready=wait((parent,self.process.sentinel))
+                        ready=wait((parent,self._wake_reader,self.process.sentinel))
+                        if self._wake_reader in ready:self._consume_wake()
                         if parent in ready:parent.recv()
                     except (EOFError,OSError):break
                     if self.process.sentinel in ready:break
                 self.process.join()
+                if sender_started:sender.join()
                 parent.close()
             if self.isInterruptionRequested(): break
             self.restart_count+=1

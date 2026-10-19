@@ -17,6 +17,141 @@ def snapshot(session):
     return dict(ts=time.time(),sessions=[session],homes=[session['home']],errors=[],unassigned=[])
 
 
+def _paused_analysis_peer(connection, waiting, release, interrupt):
+    try:
+        assert connection.poll(8)
+        waiting.set()
+        assert release.wait(8)
+        first = connection.recv()
+        assert first['kind'] == 'overlay_detail' and first['id'] == 1
+        next_command = connection.recv()
+        if not interrupt:
+            assert next_command['kind'] == 'overlay_detail' and next_command['id'] == 100
+            connection.send(dict(kind='overlay_detail', id=100, summary=next_command['summary']))
+            next_command = connection.recv()
+        assert next_command['kind'] == 'stop'
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize('interrupt', [False, True])
+def test_bridge_coalesces_or_stops_while_a_command_is_blocked(monkeypatch, interrupt):
+    import multiprocessing
+    from types import SimpleNamespace
+    from PySide6.QtCore import Qt
+    from cachemonitor import analysis_worker
+
+    context = multiprocessing.get_context('spawn')
+    waiting, release = context.Event(), context.Event()
+    def process(**kwargs):
+        return context.Process(target=_paused_analysis_peer,
+            args=(kwargs['args'][0], waiting, release, interrupt), daemon=True)
+    monkeypatch.setattr(analysis_worker.mp, 'get_context',
+                        lambda *_:SimpleNamespace(Pipe=context.Pipe, Process=process))
+    bridge = analysis_worker.AnalysisBridge([])
+    received = threading.Event()
+    bridge.overlay_detail.connect(lambda value:received.set(), Qt.DirectConnection)
+    bridge.request_overlay_detail(1, dict(title='in-flight-' * 32768))
+    bridge.start()
+    try:
+        assert waiting.wait(8), 'peer must observe the blocked command before the next requests'
+        for request_id in range(2, 101):
+            bridge.request_overlay_detail(request_id, dict(title='latest'))
+        if interrupt:
+            bridge.requestInterruption()
+        release.set()
+        if not interrupt:
+            assert received.wait(8), 'only the latest unsent selection must complete'
+            bridge.requestInterruption()
+        assert bridge.wait(5000), 'stop must complete without terminating the analysis process'
+        assert bridge.process.exitcode == 0
+    finally:
+        release.set()
+        bridge.requestInterruption()
+        if not bridge.wait(1000):
+            bridge.process.terminate()
+            assert bridge.wait(5000)
+
+
+@pytest.mark.parametrize('during_stop', [False, True])
+def test_bridge_send_failure_releases_a_live_peer(during_stop):
+    from PySide6.QtCore import Qt
+    from cachemonitor.analysis_worker import AnalysisBridge
+
+    bridge = AnalysisBridge([], static_snapshot=snapshot(source()))
+    faults = []
+    entered, release = threading.Event(), threading.Event()
+    class FailingPayload:
+        def __reduce__(self):
+            entered.set()
+            assert release.wait(8)
+            raise TypeError('test command cannot be serialized')
+    def failed(value):
+        faults.append(value)
+        bridge.requestInterruption()
+    bridge.fault.connect(failed, Qt.DirectConnection)
+    bridge.request_overlay_detail(1, dict(unserializable=FailingPayload()))
+    bridge.start()
+    try:
+        assert entered.wait(8)
+        if during_stop:
+            bridge.requestInterruption()
+        release.set()
+        assert bridge.wait(8000), 'failed sender must release the child through EOF'
+        if not during_stop:
+            assert faults and faults[0]['process_exited']
+        assert bridge.process.exitcode == 0
+    finally:
+        release.set()
+        bridge.requestInterruption()
+        if not bridge.wait(1000):
+            bridge.process.terminate()
+            assert bridge.wait(5000)
+
+
+def test_bridge_delivers_simultaneous_large_command_and_snapshot():
+    from PySide6.QtCore import Qt
+    from cachemonitor.analysis_worker import AnalysisBridge
+
+    session = source()
+    session['title'] = 'publication-' * 16384
+    summary = dict(title='selected-detail-' * 16384)
+    bridge = AnalysisBridge([], static_snapshot=snapshot(session))
+    snapshots = []
+    details = []
+    received = threading.Event()
+
+    def on_snapshot(value):
+        snapshots.append(value)
+        if details:
+            received.set()
+
+    def on_detail(value):
+        details.append(value)
+        if snapshots:
+            received.set()
+
+    bridge.snapshot.connect(on_snapshot, Qt.DirectConnection)
+    bridge.overlay_detail.connect(on_detail, Qt.DirectConnection)
+    bridge.request_overlay_detail(1, summary)
+    bridge.start()
+    try:
+        assert received.wait(8), 'simultaneous command and publication must both arrive'
+        assert snapshots[0]['sessions'][0]['title'] == session['title']
+        assert details[0]['id'] == 1 and details[0]['summary'] == summary
+        assert bridge.restart_count == 0
+    finally:
+        bridge.requestInterruption()
+        stopped = bridge.wait(3000)
+        if not stopped:
+            # Release only this test's child if the regression deadlocks its pipes.
+            if bridge.process is not None:
+                bridge.process.terminate()
+            assert bridge.wait(5000), 'analysis bridge did not release its process'
+        if received.is_set():
+            assert stopped, 'successful delivery must also allow graceful shutdown'
+
+
 def test_delta_heartbeat_correction_deletion_restart_and_old_results():
     engine=AnalysisEngine();summaries=OverlaySummaries();publisher=SnapshotPublisher();receiver=SnapshotReceiver()
     s=source();engine.ingest([s])
