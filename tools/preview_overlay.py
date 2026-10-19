@@ -277,7 +277,7 @@ def verify(preview, output):
                          'rendered newest subagent row')
                     if actor == 3:
                         capture(f'{theme}-fast-agent')
-                assert all(link['id'] in ('main-detail', 'collection', 'tip-status') for link in model.monitor_links())
+                assert all(link['id'] in ('main-detail', 'collection') for link in model.monitor_links())
             report['checks'].append(f'{theme}: next-call control cycles every actor, newest-first rows, stable scroll and no chart links')
             capture(f'{theme}-next-call')
             click(c.actions, rendered(c.actions, 'settingsButton'))
@@ -301,15 +301,11 @@ def verify(preview, output):
             capture(scenario)
             if scenario == 'error':
                 c=preview.controller
-                status=rendered(c.links,'nav-tip-status')
-                tooltip=status.findChild(QObject,'heartbeatStatusTooltip')
-                assert not tooltip.property('visible')
-                hover(c.links,point(c.links,status))
-                wait(lambda: tooltip.property('visible'), 'error status tooltip')
-                assert tooltip.property('text')==c.widget.content_model.status_detail()
-                hover(c.links,QPoint(1,1))
-                wait(lambda: not tooltip.property('visible'), 'error tooltip hides on leave')
-                report['checks'].append('error status is available only while hovering the heartbeat')
+                status=rendered(c.widget,'overlayHeartbeatLabel')
+                assert status.property('text')==c.widget.content_model.state['heartbeatLabel']
+                assert not c.widget.quick.rootObject().findChild(QObject,'overlayHeartbeat').property('visible')
+                assert not any(link.get('interaction')=='tooltip' for link in c.widget.content_model.monitor_links())
+                report['checks'].append('error status replaces the heartbeat without hover')
         errors = [str(error) for w in (preview.controller.widget, *preview.controller.chrome) for error in w.qml_errors]
         assert not errors, errors
         report['passed'] = True

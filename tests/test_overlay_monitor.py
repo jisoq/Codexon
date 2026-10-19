@@ -77,7 +77,7 @@ def test_active_requests_update_heartbeat_without_changing_layout(app):
         assert model.layout() == layout
 
 
-def test_collection_status_is_hover_only_and_keeps_summary_data(app, monkeypatch):
+def test_collection_status_replaces_heartbeat_and_keeps_summary_data(app, monkeypatch):
     model = OverlayContent()
     data = summary(misses=1)
     drawn = capture_text(monkeypatch)
@@ -87,9 +87,10 @@ def test_collection_status_is_hover_only_and_keeps_summary_data(app, monkeypatch
         render(model)
         status = [item for item in drawn if item[0].startswith(note)]
         assert not status
-        link=next(item for item in model.monitor_links() if item['id']=='tip-status')
-        assert note in link['tooltip'] and link['interaction']=='tooltip'
-        assert link['y'] < model.layout()['charts'][0] < model.layout()['main']
+        assert model.state['heartbeatMode']=='error'
+        assert model.state['heartbeatLabel']==note
+        assert not any(item['interaction']=='tooltip' for item in model.monitor_links())
+        assert model.state['heartbeatY'] < model.layout()['charts'][0] < model.layout()['main']
         assert model.data['cache_misses'] == data['cache_misses']
         model.monitor_action('main-detail')
         assert any('캐시 미적중' in str(item[0]) for item in model.main_items())
@@ -235,11 +236,18 @@ def test_heartbeat_animates_active_only_and_error_takes_priority(app, tmp_path):
         window.set_content(active,'수집 오류',dark=False)
         until(lambda: not heartbeat.property('blinking') and heartbeat.property('opacity')==1)
         assert window.content_model.state['heartbeatMode']=='error'
-        ink=heartbeat.property('ink');assert ink.red()>ink.green() and ink.red()>ink.blue()
+        label=scene.findChild(QObject,'overlayHeartbeatLabel')
+        assert not heartbeat.property('visible') and label.property('visible')
+        assert label.property('text')==window.content_model.state['heartbeatLabel']
+        assert label.property('width')>0
         assert window.grab().save(str(tmp_path / 'heartbeat-error.png'))
+        window.set_content(None,'기록 확인 중',dark=False)
+        until(lambda: window.content_model.state['heartbeatMode']=='pending')
+        assert not heartbeat.property('visible') and label.property('visible')
+        assert label.property('text')==window.content_model.state['heartbeatLabel']
         window.set_content(summary(),dark=False)
         until(lambda: window.content_model.state['heartbeatMode']=='idle')
-        assert not heartbeat.property('blinking')
+        assert heartbeat.property('visible') and not heartbeat.property('blinking')
         assert not window.qml_errors
     finally:
         window.close()

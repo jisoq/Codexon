@@ -303,10 +303,12 @@ def test_optional_status_moves_content_without_reserving_an_empty_row():
 def test_notice_keeps_status_available_on_heartbeat_without_usage(column_model):
     column_model.set_content(None,'기록 확인 중')
     assert column_model.notice_card() and column_model.state['totalRowVisible']
-    assert column_model.heartbeat_state()['mode']=='idle'
-    assert column_model.monitor_links()[0]['tooltip']==column_model.status_detail()
+    assert column_model.heartbeat_state()['mode']=='pending'
+    assert column_model.state['heartbeatLabel'] in column_model.status_detail()
+    assert not column_model.monitor_links()
     column_model.set_content(summary())
     assert column_model.notice_card() is None and column_model.state['totalRowVisible']
+    assert column_model.heartbeat_state()['mode']=='idle'
 
 
 def test_synthetic_preview_keeps_active_collection_fresh_after_long_idle(column_controller,monkeypatch):

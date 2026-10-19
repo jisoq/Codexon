@@ -44,19 +44,11 @@ def miss_text(data):
 
 
 def header_status(m):
-    # Status messages belong to the heartbeat hover surface, never the header.
+    # Status messages replace the heartbeat, without reserving a header row.
     return '', 'secondary'
 
 
 def header_layout(m):return dict(title_width=TITLE_WIDTH,status_x=MARGIN,status_width=SECTION_WIDTH)
-
-
-def status_link(m):
-    state=m.heartbeat_state()
-    text=state['message']
-    if not text:return []
-    return [dict(id='tip-status',x=state['x']-3,y=state['y']-3,width=24,height=24,
-                 tooltip=text,accessible=text,interaction='tooltip')]
 
 
 def geometry(data, reduced=False, has_status=False, *, preferred_height=720, main_detail_height=0, available_height=None):
@@ -171,7 +163,7 @@ def paint(d,m):
     displayed=m.latest_call()
     for (key,label),y in zip(CHARTS,g['charts']):_chart(d,m,rows,key,label,y,g['chart_height'],displayed)
     y=g['main'];color=m.graph_colors(rows)[(data.get('home'),data.get('id'))]
-    if displayed and (displayed.get('home'),displayed.get('sid'))==(data.get('home'),data.get('id')):
+    if m.has_subagents() and displayed and (displayed.get('home'),displayed.get('sid'))==(data.get('home'),data.get('id')):
         d.rect(MARGIN-3,y-2,SECTION_WIDTH+6,g['main_height'],color,5,alpha=.13)
     d.line(MARGIN,y-6,RIGHT,y-6)
     paint_items(d,[(item[0],item[1]+MARGIN,item[2]+y,*item[3:])
@@ -196,6 +188,4 @@ def action_links(m):
 
 
 def links(m):
-    if m.notice_card():return status_link(m)
-    result=action_links(m);result.extend(status_link(m))
-    return result
+    return [] if m.notice_card() else action_links(m)

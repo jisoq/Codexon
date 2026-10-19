@@ -542,11 +542,19 @@ class OverlayContent(Node):
     def heartbeat_state(self):
         data=self.data or {}
         count=data.get('active_requests',int(data.get('request',{}).get('state')=='진행'))
-        failed=any(level=='error' or '지연' in value for value,level in self.states()) or bool(data.get('_collection',{}).get('errors'))
-        mode='error' if failed else 'active' if count else 'idle'
-        label=tr('진행 중')+' '+str(count) if mode=='active' else tr('대기') if mode=='idle' else ''
+        failures=[value for value,level in self.states() if level=='error' or '지연' in value]
+        failed=bool(failures or data.get('_collection',{}).get('errors'))
+        pending=not data or bool(self.notice_card())
+        mode='error' if failed else 'pending' if pending else 'active' if count else 'idle'
+        if mode=='error':
+            label=failures[0] if failures else '수집 오류'
+            if label=='수집 지연' and data.get('_collection',{}).get('reason')=='analysis_delay':label='분석 지연'
+        elif mode=='pending':label=self.status_text() or '기록 준비 중'
+        else:label='진행 중' if count else '대기'
+        label=tr(label)+(' '+str(count) if mode=='active' else '')
         label_width=QFontMetrics(font(self.appearance.family,11)).horizontalAdvance(label)
-        colors={'active':('#16803c','#4ade80'),'idle':('#b58500','#facc15'),'error':('#dc2626','#f87171')}
+        colors={'active':('#16803c','#4ade80'),'idle':('#b58500','#facc15'),'error':('#dc2626','#f87171'),
+                'pending':('#737373','#a3a3a3')}
         return dict(mode=mode,count=count,label=label,color=colors[mode][int(self.dark)],
                     x=WIDTH-MARGIN-label_width-(6 if label else 0)-18,y=self.layout().get('total',44)+5,
                     message=self.status_detail())

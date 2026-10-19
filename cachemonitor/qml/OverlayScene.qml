@@ -17,7 +17,7 @@ Item {
     Canvas {
         id: heartbeat
         objectName: "overlayHeartbeat"
-        visible: !!root.s.totalRowVisible
+        visible: !!root.s.totalRowVisible && (root.s.heartbeatMode === "active" || root.s.heartbeatMode === "idle")
         x: root.s.heartbeatX * root.s.overlayScale
         y: (root.s.heartbeatY || 89) * root.s.overlayScale
         width: 18 * root.s.overlayScale; height: width
@@ -30,12 +30,6 @@ Item {
             c.strokeStyle = ink; c.lineWidth = 1.5 * (root.s.overlayScale || 1);
             c.lineJoin = "round"; c.lineCap = "round";
             const mid = height / 2;
-            if (root.s.heartbeatMode === "error") {
-                c.lineWidth = 2.2 * root.s.overlayScale;
-                c.beginPath(); c.moveTo(width/2, height*.2); c.lineTo(width/2, height*.58); c.stroke();
-                c.beginPath(); c.fillStyle=ink; c.arc(width/2,height*.8,1.2*root.s.overlayScale,0,Math.PI*2); c.fill();
-                return;
-            }
             if (root.s.heartbeatMode !== "active") {
                 c.beginPath(); c.moveTo(2*root.s.overlayScale,mid); c.lineTo(width-2*root.s.overlayScale,mid); c.stroke();
                 return;
@@ -58,15 +52,17 @@ Item {
     }
     Text {
         id: heartbeatLabel
-        visible: heartbeat.visible
+        objectName: "overlayHeartbeatLabel"
+        visible: !!root.s.totalRowVisible
         x: root.width - 12 * root.s.overlayScale - width
-        y: heartbeat.y; width: implicitWidth; height: heartbeat.height
+        y: heartbeat.y; width: Math.min(implicitWidth, root.width * .45); height: heartbeat.height
+        elide: Text.ElideRight
         text: root.s.heartbeatLabel || ""
-        color: root.s.overlayInk || appTheme.palette.ink
+        color: root.s.heartbeatMode === "error" || root.s.heartbeatMode === "pending" ? root.s.heartbeatColor : root.s.overlayInk || appTheme.palette.ink
         font.family: root.s.overlayFamily || "Pretendard JP"
         font.pixelSize: Math.round(11 * (root.s.overlayScale || 1))
         verticalAlignment: Text.AlignVCenter
         Accessible.role: Accessible.StaticText
-        Accessible.name: root.s.heartbeatMode === "error" ? appLanguage.text("수집 오류") : text
+        Accessible.name: text
     }
 }

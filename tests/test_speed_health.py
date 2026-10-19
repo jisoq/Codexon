@@ -364,7 +364,7 @@ def test_main_monitor_keeps_current_speed_health_during_call_and_detail_selectio
     content=OverlayContent();content.set_content(data)
     assert content.speed_alert()['recent_speed']==35 and content.speed_alert()['baseline_speed']==100
     assert not header_status(content)[0]
-    assert '출력 속도 저하' in next(r['tooltip'] for r in content.monitor_links() if r['id']=='tip-status')
+    assert '출력 속도 저하' in content.status_detail()
     content.pin_call(content.call_id(content.rows()[0]))
     content.monitor_action('main-detail')
     assert content.main_expanded and content.graph_pinned
@@ -376,6 +376,7 @@ def test_main_monitor_keeps_current_speed_health_during_call_and_detail_selectio
     content.set_content(data,note='수집 지연')
     assert not content.speed_alert()
     assert not any(r.get('interaction')=='navigate' for r in content.monitor_links())
-    assert '수집 지연' in next(r['tooltip'] for r in content.monitor_links() if r['id']=='tip-status')
+    assert content.state['heartbeatMode']=='error'
+    assert content.state['heartbeatLabel'] in content.status_detail()
     assert any(r['id']=='main-detail' for r in content.monitor_links())
     content.deleteLater();app.processEvents()

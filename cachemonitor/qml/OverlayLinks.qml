@@ -56,11 +56,6 @@ Item {
                 onClicked: if (link.modelData.interaction !== "tooltip") { root.forceActiveFocus(Qt.MouseFocusReason); root.presentation.activateNavigation(); }
                 onWheel: wheel => wheel.accepted = false
             }
-            UiToolTip {
-                objectName: link.modelData.id === "tip-status" ? "heartbeatStatusTooltip" : ""
-                visible: link.modelData.id === "tip-status" && pointer.containsMouse
-                text: link.modelData.tooltip || ""
-            }
         }
     }
 }
