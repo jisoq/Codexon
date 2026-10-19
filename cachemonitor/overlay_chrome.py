@@ -95,6 +95,8 @@ class ChromeModel(Node):
     settingsToggleRequested = Signal()
     chartStyleRequested = Signal(str)
     heightRequested = Signal(int)
+    heightPreviewRequested = Signal(int)
+    heightFinished = Signal(int)
     escapeRequested = Signal()
     interactionRequested = Signal()
     restoreRequested = Signal()
@@ -111,6 +113,10 @@ class ChromeModel(Node):
     def setChartStyle(self,value): self.chartStyleRequested.emit(value)
     @Slot(int)
     def changeHeight(self,delta): self.heightRequested.emit(delta)
+    @Slot(int)
+    def previewHeight(self,value): self.heightPreviewRequested.emit(value)
+    @Slot(int)
+    def finishHeight(self,value): self.heightFinished.emit(value)
     @Slot()
     def escapePanel(self): self.escapeRequested.emit()
     @Slot()
@@ -128,6 +134,8 @@ class OverlayChrome(QuickHost):
     settings_toggle = Signal()
     chart_style_changed = Signal(str)
     height_changed = Signal(int)
+    height_previewed = Signal(int)
+    height_finished = Signal(int)
     escape = Signal()
     interaction_started = Signal()
     opacity_changed = Signal(int)
@@ -165,6 +173,8 @@ class OverlayChrome(QuickHost):
         self.view.settingsToggleRequested.connect(self.settings_toggle)
         self.view.chartStyleRequested.connect(self.chart_style_changed)
         self.view.heightRequested.connect(self.height_changed)
+        self.view.heightPreviewRequested.connect(self.height_previewed)
+        self.view.heightFinished.connect(self.height_finished)
         self.view.escapeRequested.connect(self.escape)
         self.view.interactionRequested.connect(self.begin_interaction)
         self.view.restoreRequested.connect(self.restore)
@@ -179,7 +189,6 @@ class OverlayChrome(QuickHost):
     def configure_quick(self,quick):
         quick.setFocusPolicy(Qt.NoFocus)
         quick.installEventFilter(self)
-        quick.setMouseTracking(True)
         if self.kind in ('header','icon'):quick.setAttribute(Qt.WA_TransparentForMouseEvents)
 
     def apply_appearance(self, appearance, opacity):
@@ -284,10 +293,11 @@ class OverlayChrome(QuickHost):
 
 class NavigationModel(Node):
     navigationRequested=Signal(object)
-    callSelected=Signal(object)
     escapeRequested=Signal()
     def __init__(self,content):
         super().__init__();self.content=content;self.targets={};self.captured=None
+    @Slot()
+    def escapePanel(self):self.escapeRequested.emit()
     def link_state(self,links):
         self.interactions={link['id']:link.get('interaction','navigate') for link in links}
         self.targets={link['id']:link['target'] for link in links if link.get('target')}
@@ -297,8 +307,6 @@ class NavigationModel(Node):
     def captureNavigation(self,key):
         self.captured=self.targets.get(key) or getattr(self,'actions',{}).get(key)
         self.captured_interaction=getattr(self,'interactions',{}).get(key,'navigate')
-        rows=[*self.content.rows(),self.content.selected()] if hasattr(self.content,'rows') else []
-        self.captured_row=next((dict(r) for r in rows if r and self.captured and not isinstance(self.captured,str) and (r.get('home'),r.get('sid'),str(r.get('id')))==(self.captured.home,self.captured.sid,self.captured.call_id)),None)
         self.captured_scope=((self.content.data or {}).get('home'),(self.content.data or {}).get('id'))
     @Slot()
     def activateNavigation(self):
@@ -306,38 +314,7 @@ class NavigationModel(Node):
         if getattr(self,'captured_scope',None)!=(data.get('home'),data.get('id')):return
         if isinstance(target,str):self.content.monitor_action(target);return
         if target and (target.home,target.sid) in [tuple(v) for v in data.get('members',[(data.get('home'),data.get('id'))])]:
-            signal=self.callSelected if self.captured_interaction=='select' else self.navigationRequested
-            signal.emit((target,self.captured_row) if self.captured_interaction=='select' else target)
-    @Slot(str)
-    def inspectCall(self,key):
-        row=None
-        if key.startswith('call-') and key[5:].isdigit():
-            index=int(key[5:]);rows=self.content.rows()
-            if index<len(rows):row=rows[index]
-        identity=self.content.call_id(row) if row else None
-        if getattr(self.content,'inspected_call',None)!=identity:
-            self.content.inspected_call=identity;self.content.sync_details();self.content.update()
-
-    @Slot(int,result=bool)
-    def chartKey(self,key):
-        content=self.content;rows=content.rows()
-        if key==Qt.Key_Escape:
-            if content.graph_pinned or not content.follow_latest:content.release_pin();content.inspected_call=None;content.update()
-            else:self.escapeRequested.emit()
-            return True
-        if key in (Qt.Key_Return,Qt.Key_Enter) and rows:
-            content.pin_call(content.selected_id or content.call_id(rows[-1]));return True
-        if key not in (Qt.Key_Left,Qt.Key_Right,Qt.Key_Home,Qt.Key_End) or not rows:return False
-        index=next((i for i,row in enumerate(rows) if content.call_id(row)==content.selected_id),len(rows)-1)
-        index=0 if key==Qt.Key_Home else len(rows)-1 if key==Qt.Key_End else max(0,min(len(rows)-1,index+(-1 if key==Qt.Key_Left else 1)))
-        pinned=content.graph_pinned
-        content.select(content.call_id(rows[index]));content.graph_pinned=pinned
-        if pinned:content.follow_latest=False
-        content.inspected_call=None;content.sync_details();content.update()
-        return True
-
-    @Slot(int)
-    def scrollLower(self,delta):self.content.scroll_lower(delta)
+            self.navigationRequested.emit(target)
     @Slot(str)
     def activateLink(self,key):self.captureNavigation(key);self.activateNavigation()
 
@@ -419,10 +396,8 @@ class OverlayLinks(QuickHost):
         self.view.escapeRequested.connect(self.escape)
         content.changed.connect(self.sync)
         self.set_scene(self.view,'OverlayLinks.qml',transparent=True,deferred=True,shared=True)
-        self._hover_position=None
     def configure_quick(self,quick):
         quick.installEventFilter(self)
-        quick.setMouseTracking(True)
     def begin_interaction(self):
         self.interaction_started.emit()
         self.activateWindow()
@@ -439,29 +414,8 @@ class OverlayLinks(QuickHost):
         if links:
             if region!=self.mask():self.setMask(region)
         else:self.hide()
-        if self._hover_position is not None:self.inspect_position(self._hover_position)
         return bool(links)
-    def inspect_position(self,position):
-        scale=self.view.content.appearance.scale
-        x,y=position.x()/scale,position.y()/scale
-        links=self.view.state.get('links',[])
-        if any(r['id']=='focus-agent' and r['x']<=x<r['x']+r['width'] and r['y']<=y<r['y']+r['height'] for r in links):return
-        key=next((r['id'] for r in links
-                  if r['id'].startswith('call-') and r['x']<=x<r['x']+r['width']
-                  and r['y']<=y<r['y']+r['height']), '')
-        self.view.inspectCall(key)
-
-    def hideEvent(self,event):
-        self._hover_position=None;self.view.inspectCall('')
-        super().hideEvent(event)
-
     def eventFilter(self,watched,event):
-        if watched is self.quick:
-            if event.type()==QEvent.MouseMove:
-                self._hover_position=event.position();self.inspect_position(self._hover_position)
-            elif event.type()==QEvent.Leave:
-                self._hover_position=None;self.view.inspectCall('')
-
         if event.type()==QEvent.Wheel and self.wheel_forwarder:
             self.wheel_forwarder(event);event.accept();return True
         if event.type()==QEvent.MouseButtonPress:self.interaction_started.emit()

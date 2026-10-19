@@ -106,105 +106,49 @@ def test_dashboard_navigation_validates_session_and_selects_old_event_call(layou
     assert not any(model.call_id(row)==model.selected_id for row in model.rows())
     controller.refresh()
     assert model.displayed_call()==model.selected() and model.selected_id==model.call_id(old_row)
-    from PySide6.QtCore import Qt
-    controller.links.view.chartKey(Qt.Key_Escape)
-    assert model.displayed_call()==model.rows()[-1] and model.follow_latest
+    assert model.latest_call()==model.rows()[-1]
     controller.native.confirm_selection = lambda window: Selection('other')
     assert not controller.navigate_from_dashboard(target)['enabled'] and activated == [1]
 
 
-def test_chart_click_selects_call_without_opening_main_or_sub_details(layout_controller):
-    controller = layout_controller
-    model = publish(controller, family_summary())
-    own = deepcopy(model.data['main_usage'])
-    sub = deepcopy(model.detail_data())
-    expanded = set(model.expanded_groups)
-    layout = model.layout()
-    controller.links.view.activateLink('call-0')
-    assert model.graph_pinned and model.selected_id == model.call_id(model.rows()[0])
-    assert not model.main_expanded and model.expanded_groups == expanded
-    assert model.layout() == layout
-    assert model.data['main_usage'] == own and model.detail_data() == sub
-    controller.links.view.activateLink('call-0')
-    assert not model.graph_pinned and model.follow_latest
+def test_charts_have_no_navigation_or_selection_hit_regions(layout_controller):
+    controller=layout_controller
+    model=publish(controller,family_summary())
+    links=model.monitor_links()
+    assert not any(link.get('interaction')=='select' for link in links)
+    chart_top=model.layout()['charts'][0]
+    chart_bottom=model.layout()['charts'][-1]+model.layout()['chart_height']
+    assert all(link['y']+link['height']<=chart_top or link['y']>=chart_bottom for link in links)
+    assert {link['id'] for link in links}.isdisjoint({'latest','focus-agent'})
 
 
-def test_chart_keyboard_moves_pinned_selection_and_latest_escape_release_it(layout_controller):
-    from PySide6.QtCore import Qt
-    controller = layout_controller
-    model = publish(controller, family_summary())
-    navigation = controller.links.view
-    rows = model.rows()
-    assert navigation.chartKey(Qt.Key_Home)
-    assert not model.graph_pinned and model.selected_id == model.call_id(rows[0])
-    assert navigation.chartKey(Qt.Key_Left)
-    assert model.selected_id == model.call_id(rows[0])
-    assert navigation.chartKey(Qt.Key_Right)
-    assert model.selected_id == model.call_id(rows[1])
-    assert navigation.chartKey(Qt.Key_Return) and model.graph_pinned
-    assert navigation.chartKey(Qt.Key_End)
-    assert model.graph_pinned and model.selected_id == model.call_id(rows[-1])
-    assert navigation.chartKey(Qt.Key_Return) and not model.graph_pinned
-    navigation.chartKey(Qt.Key_Home)
-    navigation.activateLink('latest')
-    assert not model.graph_pinned and model.follow_latest
-    navigation.chartKey(Qt.Key_Home)
-    navigation.chartKey(Qt.Key_Escape)
-    assert not model.graph_pinned and model.follow_latest
-    assert not model.main_expanded and not model.expanded_groups
-    assert not navigation.chartKey(Qt.Key_A)
-
-
-def test_chart_root_receives_keyboard_navigation_and_enter_pin_toggle(layout_controller):
+def test_chart_keyboard_does_not_replace_latest_call_or_open_rows(layout_controller):
     from PySide6.QtCore import Qt
     from PySide6.QtTest import QTest
     from tests.test_ui import wait_for_rendered
-    c=layout_controller;m=publish(c,family_summary());rows=m.rows()
+    c=layout_controller;m=publish(c,family_summary())
     c.links.begin_interaction();root=c.links.quick.rootObject();root.forceActiveFocus(Qt.OtherFocusReason)
     wait_for_rendered(lambda:root.hasActiveFocus())
-    QTest.keyClick(c.links.quick,Qt.Key_Home)
-    assert m.displayed_call()==rows[0] and not m.graph_pinned
-    QTest.keyClick(c.links.quick,Qt.Key_Return)
-    assert m.graph_pinned and m.selected_id==m.call_id(rows[0])
-    QTest.keyClick(c.links.quick,Qt.Key_Right)
-    assert m.graph_pinned and m.displayed_call()==rows[1]
-    QTest.keyClick(c.links.quick,Qt.Key_Escape)
-    assert not m.graph_pinned and m.displayed_call()==rows[-1]
-    QTest.keyClick(c.links.quick,Qt.Key_Home)
-    QTest.keyClick(c.links.quick,Qt.Key_End)
-    assert not m.graph_pinned and m.displayed_call()==rows[-1]
+    latest=m.latest_call()
+    for key in (Qt.Key_Home,Qt.Key_Left,Qt.Key_Right,Qt.Key_End,Qt.Key_Return):
+        QTest.keyClick(c.links.quick,key)
+        assert m.latest_call()==latest and not m.main_expanded and not m.expanded_groups
 
 
-def test_hover_cannot_replace_pinned_values_and_latest_clears_hover(layout_controller):
-    controller = layout_controller
-    model = publish(controller, family_summary())
-    controller.links.view.activateLink('call-0')
-    pinned = model.displayed_call()
-    controller.links.view.inspectCall('call-1')
-    assert model.displayed_call() == pinned
-    controller.links.view.activateLink('latest')
-    assert model.displayed_call() == model.rows()[-1]
-    assert model.inspected_call is None
-
-
-def test_agent_focus_targets_displayed_call_without_expanding_details(layout_controller):
-    controller = layout_controller
-    model = publish(controller, family_summary())
-    child = next(row for row in model.rows() if row['sid'] != model.data['id'])
-    child_index = model.rows().index(child)
-    controller.links.view.inspectCall('call-' + str(child_index))
-    expanded = set(model.expanded_groups)
-    selected = model.selected_id
-    controller.links.view.activateLink('focus-agent')
-    key = model.detail_group_key(dict(home=child['home'], id=child['sid']), 'sub')
-    assert model.state['detailFocusKey'] == 'group-' + key
-    assert model.expanded_groups == expanded and not model.main_expanded
-    assert model.selected_id == selected and not model.graph_pinned
-    own = next(row for row in model.rows() if row['sid'] == model.data['id'])
-    model.pin_call(model.call_id(own))
-    controller.links.view.activateLink('focus-agent')
-    assert model.state['mainFocused'] and not model.main_expanded
-    assert model.expanded_groups == expanded
+def test_latest_child_sorts_first_and_uses_its_assigned_highlight_color(layout_controller):
+    c=layout_controller;data=family_summary();m=publish(c,data)
+    child=next(row for row in data['recent'] if row['sid']!=data['id'])
+    updated=deepcopy(data)
+    latest=dict(child,id='new-child-call',key='new-child-call')
+    updated['recent'].append(latest);updated['latest']=latest
+    target=next(agent for agent in updated['subagent_finance']['agents'] if agent['id']==child['sid'])
+    target['latest_ts']=max(agent.get('latest_ts') or 0 for agent in updated['subagent_finance']['agents'])+1
+    m.set_content(updated)
+    assert m.detail_groups()[0]['id']==child['sid']
+    highlights=[item for item in m.detail_items() if item[8].get('kind')=='agent-selection']
+    assert len(highlights)==1
+    assert highlights[0][8]['agentColor']==m.graph_colors(m.rows())[(child['home'],child['sid'])]
+    assert not m.expanded_groups and not m.main_expanded
 
 
 def test_captured_main_action_is_rejected_after_session_change(layout_controller):
@@ -226,10 +170,10 @@ def test_chart_wheel_forwards_to_target_without_scrolling_overlay(layout_control
     model = publish(controller, family_summary())
     forwarded = []
     controller.native.forward_wheel = lambda *arguments: forwarded.append(arguments)
-    link = next(link for link in model.monitor_links() if link['id'] == 'call-0')
+    layout = model.layout()
     scale = model.appearance.scale
-    point = QPointF((link['x'] + link['width'] / 2) * scale,
-                    (link['y'] + link['height'] / 2) * scale)
+    point = QPointF(controller.links.quick.width() / 2,
+                    (layout['charts'][0] + layout['chart_height'] / 2) * scale)
     global_point = QPointF(controller.links.quick.mapToGlobal(point.toPoint()))
     event = QWheelEvent(point, global_point, QPoint(), QPoint(0, -120),
                         Qt.NoButton, Qt.NoModifier, Qt.NoScrollPhase, False)
@@ -243,13 +187,16 @@ def test_chart_wheel_forwards_to_target_without_scrolling_overlay(layout_control
 
 def test_sub_scroll_keeps_main_charts_costs_and_selection_fixed(layout_controller):
     from cachemonitor.overlay_chrome import named_item
+    from test_overlay_layout_controller import compact_frame
     from tests.test_ui import wait_for_rendered
     controller = layout_controller
     model = publish(controller, family_summary(count=3, children=8))
-    for bounds in ((0, 0, 1300, 1000), (0, 0, 550, 580)):
+    short=compact_frame(controller)
+    for bounds,compact in (((0,0,1300,1000),False),((0,0,550,short[3]),True)):
         controller.native.bounds = bounds
         controller.refresh()
         assert controller.widget.isVisible() and controller.detail.isVisible()
+        assert model.compact is compact
         root = controller.detail.quick.rootObject()
         scroll = named_item(root, 'detailScroll')
         wait_for_rendered(lambda: scroll.property('contentHeight') > scroll.height())

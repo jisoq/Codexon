@@ -122,9 +122,19 @@ def test_embedded_subagent_interaction_keeps_gear_and_settings_reachable(native_
     line=named_item(c.toolbar.quick.rootObject(),'chartStyle-filled-line')
     click(c.toolbar,line);refresh()
     assert c.chart_style=='filled-line'
+    from tests.test_ui import wait_for_rendered
+    slider=named_item(c.toolbar.quick.rootObject(),'heightSlider')
+    wait_for_rendered(lambda:slider.isVisible() and slider.isEnabled() and slider.width()>0)
     old=c.preferred_height
-    click(c.toolbar,named_item(c.toolbar.quick.rootObject(),'taller'));refresh()
-    assert c.preferred_height>old
+    start=slider.mapToScene(QPointF(slider.width()*.25,slider.height()/2)).toPoint()
+    end=slider.mapToScene(QPointF(slider.width()*.43,slider.height()/2)).toPoint()
+    QTest.mousePress(c.toolbar.quick,Qt.LeftButton,pos=start)
+    QTest.mouseMove(c.toolbar.quick,end)
+    QTest.mouseRelease(c.toolbar.quick,Qt.LeftButton,pos=end)
+    wait_for_rendered(lambda:c.preferred_height==round(slider.property('value')) and c.preferred_height!=old)
+    assert c.settings.value('overlay/height',type=int)==c.preferred_height
+    assert c.preferred_height%80!=0
+    refresh()
     x,y,w,h=c.popup_geometry
     assert api.WindowFromPoint(W.POINT(x+w//2,y+h//2))==int(c.toolbar.winId())
     c.escape();assert not c.popup_open
@@ -137,16 +147,14 @@ def test_embedded_subagent_interaction_keeps_gear_and_settings_reachable(native_
     assert not c.collapsed and c.detail.isVisible()
 
 @pytest.mark.skipif(sys.platform!='win32',reason='Native Windows popup stacking')
-@pytest.mark.parametrize('source',['actions','detail'])
-def test_overlay_tooltip_stays_above_panels_after_activation(native_detail,source):
+def test_overlay_tooltip_stays_above_panels_after_activation(native_detail):
     from ctypes import wintypes as W
     from PySide6.QtCore import QObject
     from cachemonitor.overlay_chrome import named_item
     from tests.test_ui import wait_for_rendered
     c,host,refresh=native_detail;app=QApplication.instance()
-    owner=getattr(c,source)
-    name='settingsButton' if source=='actions' else 'detailAction-'+c.widget.content_model.state['detailActions'][0]['id']
-    button=named_item(owner.quick.rootObject(),name)
+    owner=c.actions
+    button=named_item(owner.quick.rootObject(),'settingsButton')
     tip=next(o for o in button.findChildren(QObject) if o.metaObject().indexOfProperty('popupType')>=0)
     tip.setProperty('delay',0);tip.setProperty('visible',True)
     def popup():
@@ -166,26 +174,32 @@ def test_overlay_tooltip_stays_above_panels_after_activation(native_detail,sourc
     tip.setProperty('visible',False)
 
 
-@pytest.mark.skipif(sys.platform!='win32',reason='Native companion keyboard focus')
-def test_agent_identifier_click_hands_keyboard_focus_to_corresponding_row(native_detail):
+@pytest.mark.skipif(sys.platform!='win32',reason='Native passive overlay updates')
+def test_latest_agent_updates_preserve_manual_scroll_and_focus(native_detail):
+    from copy import deepcopy
     from cachemonitor.overlay_chrome import named_item
     from tests.test_ui import wait_for_rendered
-    c,host,refresh=native_detail;m=c.widget.content_model
-    child_index=next(i for i,row in enumerate(m.rows()) if row['sid']!=m.data['id'])
-    child=m.rows()[child_index];key=m.detail_group_key(dict(home=child['home'],id=child['sid']),'sub')
-    c.links.view.inspectCall('call-'+str(child_index))
-    click(c.links,named_item(c.links.quick.rootObject(),'nav-focus-agent'))
-    button=lambda:named_item(c.detail.quick.rootObject(),'detailAction-group-'+key)
-    wait_for_rendered(lambda:button().hasActiveFocus())
-    assert key not in m.expanded_groups and not m.main_expanded
-    assert QApplication.activeWindow() is c.detail
-    QTest.keyClick(c.detail.quick,Qt.Key_Space)
-    wait_for_rendered(lambda:key in m.expanded_groups)
-    own=next(row for row in m.rows() if row['sid']==m.data['id'])
-    m.pin_call(m.call_id(own),toggle=False)
-    click(c.links,named_item(c.links.quick.rootObject(),'nav-focus-agent'))
-    main=lambda:named_item(c.links.quick.rootObject(),'nav-main-detail')
-    wait_for_rendered(lambda:main().hasActiveFocus())
-    assert QApplication.activeWindow() is c.links and not m.main_expanded
-    QTest.keyClick(c.links.quick,Qt.Key_Return)
+    c,host,refresh=native_detail;m=c.widget.content_model;app=QApplication.instance()
+    data=deepcopy(m.data);prototype=data['subagent_finance']['agents'][0]
+    agents=[dict(prototype,id='passive-'+str(i),title='Agent '+str(i),latest_ts=100-i) for i in range(12)]
+    data['subagent_finance']['agents']=agents;data['descendants']=len(agents)
+    data['members']=[(data['home'],data['id']),*((agent['home'],agent['id']) for agent in agents)]
+    c.receive_snapshot({'overlay_sessions':[data]});refresh()
+    scroll=named_item(c.detail.quick.rootObject(),'detailScroll')
+    wait_for_rendered(lambda:scroll.property('contentHeight')>scroll.height())
+    offset=min(scroll.height()/2,scroll.property('contentHeight')-scroll.height())
+    scroll.setProperty('contentY',offset)
+    host.activateWindow();app.setActiveWindow(host);active=app.activeWindow()
+    child=next(row for row in data['recent'] if row['sid']!=data['id'])
+    latest=dict(child,sid=agents[-1]['id'],id='passive-call-1',key='passive-call-1')
+    data['recent'].append(latest);data['latest']=latest
+    data['subagent_finance']['agents'][-1]['latest_ts']=200
+    c.receive_snapshot({'overlay_sessions':[data]});refresh()
+    assert m.detail_groups()[0]['id']==agents[-1]['id']
+    assert scroll.property('contentY')==offset
+    assert app.activeWindow() is active and not m.expanded_groups and not m.main_expanded
+    c.receive_snapshot({'overlay_sessions':[deepcopy(data)]});refresh()
+    assert scroll.property('contentY')==offset and app.activeWindow() is active
+    main=named_item(c.links.quick.rootObject(),'nav-main-detail')
+    click(c.links,main)
     wait_for_rendered(lambda:m.main_expanded)

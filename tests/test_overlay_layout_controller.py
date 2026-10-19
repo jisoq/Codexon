@@ -122,10 +122,14 @@ def assert_embedded_subagents(controller):
 
 
 def compact_frame(controller):
-    from cachemonitor.overlay_monitor import geometry
+    from cachemonitor.overlay_monitor import geometry,header_status
     m=controller.widget.content_model
-    height=geometry(m.data,preferred_height=0,main_detail_height=m.main_detail_height())['height']
-    return (0,0,1300,round((height-1)*m.appearance.scale)+32)
+    target=controller.target_state.get('target',{})
+    factor=(controller.native.u.GetDpiForWindow(target.get('hwnd',1)) or 96)/96
+    height=geometry(m.data,has_status=bool(header_status(m)[0]),preferred_height=0,
+                    main_detail_height=m.main_detail_height())['height']
+    full=round(round(height*m.appearance.scale)*factor)
+    return (0,0,1300,full-1+2*round(16*factor))
 
 
 def test_subagent_viewport_tracks_family_without_main_disclosure(layout_controller):
@@ -530,8 +534,10 @@ def test_fallback_boundaries_preserve_anchor(layout_controller,monkeypatch,dpi,f
     monkeypatch.setattr(c.native.u,'GetDpiForWindow',lambda hwnd:dpi)
     c.native.bounds=(0,0,2400,2400);c.refresh()
     m=c.widget.content_model;factor=dpi/96;gap=round(16*factor)
-    full=round(round(geometry(m.data,preferred_height=0)['height']*c.appearance.scale)*factor)
-    compact=round(round(geometry(m.data,True,preferred_height=0)['height']*c.appearance.scale)*factor)
+    from cachemonitor.overlay_monitor import header_status
+    has_status=bool(header_status(m)[0])
+    full=round(round(geometry(m.data,has_status=has_status,preferred_height=0)['height']*c.appearance.scale)*factor)
+    compact=round(round(geometry(m.data,True,has_status=has_status,preferred_height=0)['height']*c.appearance.scale)*factor)
     width=round(WIDTH*c.appearance.scale*factor)+2*gap;anchor=c.anchor
     for height,reduced,icon in ((full,False,False),(full-1,True,False),(compact,True,False),(compact-1,True,True),(full,False,False)):
         c.native.bounds=(0,0,width,height+2*gap);c.refresh()

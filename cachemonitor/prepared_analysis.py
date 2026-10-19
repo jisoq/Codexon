@@ -89,7 +89,6 @@ class PreparedAnalysisEngine(AnalysisEngine):
         """Ingestion supplies its owner delta; no new-generation catalog rescan."""
         if self.snapshot is not None:
             raise RuntimeError('finish the active query before adopting a generation')
-        self.clear_history_projection()
         pending = {}
         with self.reader.pin(token, cancel=self.cancel) as snapshot:
             for key in changed_owners:
@@ -99,12 +98,33 @@ class PreparedAnalysisEngine(AnalysisEngine):
                 owner = snapshot.owner(*key)
                 pending[key] = (self._owner_state(key, owner['metadata'], owner['call_metadata'], token.generation, owner['owner_ordinal'], owner['request_maps'])
                                 if owner is not None else None)
+            order = {}
+            order_bytes = 0
+            for entry in self._pages(snapshot.ordering):
+                key, ordinal = entry['owner'], entry['owner_ordinal']
+                order_bytes += retained_bytes((key,ordinal),self.OWNER_BYTES)+160
+                if order_bytes > self.OWNER_BYTES:
+                    raise CapacityExceeded('query catalog order exceeds its metadata budget')
+                if key in order:
+                    raise NotReady('catalog order repeats a query owner')
+                order[key] = ordinal
+        removed={tuple(key) for key in removed}
+        expected=(self.sessions.keys()|self.internal_sessions.keys()|pending.keys())-removed
+        expected.difference_update(key for key,value in pending.items() if value is None)
+        if order.keys() != expected:
+            raise NotReady('catalog order does not match adopted query owners')
+        differences = {}
+        for key,ordinal in order.items():
+            value = pending.get(key)
+            state = value[0] if value is not None else self.sessions.get(key,self.internal_sessions.get(key))
+            differences[key] = retained_bytes(ordinal,self.OWNER_BYTES)-retained_bytes(state['owner_ordinal'],self.OWNER_BYTES)
         weights={key:retained_bytes((key,value[0]),self.OWNER_BYTES) if value is not None else 0
                  for key,value in pending.items()}
-        removed={tuple(key) for key in removed}
-        admitted=self.owner_bytes-sum(self.owner_weights.get(key,0) for key in pending.keys()|removed)+sum(weights.values())
+        admitted=(self.owner_bytes-sum(self.owner_weights.get(key,0) for key in pending.keys()|removed)
+                  +sum(weight for key,weight in weights.items() if key not in removed)+sum(differences.values()))
         if admitted>self.OWNER_BYTES:
             raise CapacityExceeded('prepared query metadata adoption exceeds its aggregate budget')
+        self.clear_history_projection()
         self.token = token
         self.revision = self.call_revision = self.generation = token.generation
         self.results.clear()
@@ -117,14 +137,26 @@ class PreparedAnalysisEngine(AnalysisEngine):
             self.sessions.pop(tuple(key), None)
             self.internal_sessions.pop(tuple(key), None)
             self.owner_bytes-=self.owner_weights.pop(tuple(key),0)
-        for key in sorted(pending,key=lambda item:weights[item]-self.owner_weights.get(item,0)):
-            state=pending[key]
+        for key,state in pending.items():
+            if key in removed:
+                continue
             if state is None:
                 self.sessions.pop(key, None)
                 self.internal_sessions.pop(key, None)
                 self.owner_bytes-=self.owner_weights.pop(key,0)
             else:
-                self._set_owner(key, *state)
+                value,internal=state
+                target=self.internal_sessions if internal else self.sessions
+                other=self.sessions if internal else self.internal_sessions
+                other.pop(key,None)
+                target[key]=value
+                self.owner_weights[key]=weights[key]
+        for key, ordinal in order.items():
+            state = self.sessions.get(key, self.internal_sessions.get(key))
+            difference = differences[key]
+            state['owner_ordinal'] = ordinal
+            self.owner_weights[key] += difference
+        self.owner_bytes=admitted
         self.sessions = OrderedDict(sorted(self.sessions.items(), key=lambda pair:pair[1]['owner_ordinal']))
         self.internal_sessions = OrderedDict(sorted(self.internal_sessions.items(), key=lambda pair:pair[1]['owner_ordinal']))
 

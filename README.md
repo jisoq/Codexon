@@ -16,7 +16,7 @@ Supported installation target: **Windows 10/11 x64**. Setup includes Python, Qt 
 
 ## Requested one model, got a different name back?
 
-**Check the requested model against the model reported in the response, right in the overlay.** The model and reasoning effort are followed by `(match)` or `(mismatch)`. Hover over a mismatched Main Agent model label to see the requested and reported model names.
+**Check the requested model against the model reported in the response, right in the overlay.** Only a mismatch adds `(mismatch: response model name)` after the model and reasoning effort. Request modes other than Standard also appear after the model and reasoning effort.
 
 Use the difference as a clue when investigating routing behavior, then open **Call details** in the dashboard to inspect that call's record. These are recorded request/response names; they do not establish the internal routing path or underlying model implementation.
 
@@ -36,7 +36,9 @@ The top summary shows total cost and active requests. Three charts show cost, ou
 
 **Main Agent** stays fixed while only the **Sub Agents** list below it scrolls. Each row shows its own cumulative cost, model and reasoning effort, cache hit rate, and average output speed. Expand a row to inspect token composition and the number of priced calls.
 
-Open **Settings** in the header to choose bars or a filled line and adjust the height. These preferences survive restarts. Separate controls adjust background transparency and minimize the overlay. Select the minimized icon to restore it. Preparation, delay, and error messages appear below the title. Existing values are dimmed when updates are interrupted or delayed.
+Open **Settings** in the header to choose bars or a filled line and adjust the height with a slider. These preferences survive restarts. Separate controls adjust background transparency and minimize the overlay. Select the minimized icon to restore it. Preparation, delay, and error messages occupy space below the title only when present. Existing values are dimmed when updates are interrupted or delayed.
+
+Run the [overlay preview](docs/overlay-preview.md) to try source changes without replacing the installed application.
 
 Amounts use Standard base rates weighted by subscription usage: Fast is 2.5x Standard for the same tokens. Model comparison reflects recorded request/response names.
 

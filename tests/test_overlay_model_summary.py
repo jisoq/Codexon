@@ -23,7 +23,6 @@ class ObservedOverlay:
         self.engine = AnalysisEngine()
         self.summaries = OverlaySummaries()
         self.widget = SessionOverlay()
-        self.widget.content_model.monitor_action('tab-latest')
         self.widget.content_model.set_detail_group('model')
         self.header = OverlayChrome('header')
         self.header.resize(268, 36)
@@ -138,7 +137,7 @@ def test_new_call_clears_old_comparison_then_uses_its_own_completed_evidence(obs
     assert model.context()[0] == latest and fixture.widget.toolTip() == ''
 
 
-def test_long_model_names_are_elided_with_full_detail_tooltips(observed_overlay, tmp_path):
+def test_long_model_names_are_elided_with_full_accessible_details(observed_overlay, tmp_path):
     fixture = observed_overlay
     requested = 'gpt-shared-long-model-name-' + 'request-variant-' * 5
     response = 'gpt-shared-long-model-name-' + 'response-variant-' * 5
@@ -162,9 +161,7 @@ def test_long_model_names_are_elided_with_full_detail_tooltips(observed_overlay,
     reference=OverlayContent();reference.set_content(short)
     assert model.base_height()==reference.base_height()  # Model name length must not enlarge the panel.
     assert expected in model.main_model_tooltip()
-    model_link=next(link for link in model.monitor_links() if link['id']=='tip-model')
-    assert requested in model_link['tooltip'] and response in model_link['tooltip']
-    model.monitor_action('tab-latest')
+    assert not any(link.get('interaction')=='tooltip' for link in model.monitor_links())
     assert not any(link['id']=='call-detail' for link in model.monitor_links())
     assert not any(link['id'] in ('cache','cost','speed','latest-context') for link in model.monitor_links())
     child=Session('long-model-child','fixture',title='Long model child')
@@ -176,12 +173,12 @@ def test_long_model_names_are_elided_with_full_detail_tooltips(observed_overlay,
     fixture.refresh([child_source])
     grouped_model=model.detail_data()['models'][0]['model']
     item = next(item for item in model.detail_items()
-                if (''.join(item[0]) if isinstance(item[0], list) else item[0]) == grouped_model)
-    assert item[0]==grouped_model and item[8]['kind']=='single-line'
+                if isinstance(item[0],str) and item[0].startswith(grouped_model))
+    assert item[8]['kind']=='single-line'
     metrics = QFontMetrics(font(model.appearance.family, item[5], item[7]))
     assert metrics.elidedText(item[0],Qt.ElideRight,int(item[3])).endswith('…')
-    detail = fixture.reveal_comparison(grouped_model)
-    assert any(grouped_model in action['tooltip'] for action in model.state['detailActions'])
+    detail = fixture.reveal_comparison(item[0])
+    assert any(grouped_model in action['label'] for action in model.state['detailActions'])
     assert widget.grab().save(str(tmp_path / 'long-model-summary.png'))
     assert detail.grab().save(str(tmp_path / 'long-model-detail.png'))
     assert not widget.qml_errors

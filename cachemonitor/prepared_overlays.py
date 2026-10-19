@@ -114,6 +114,7 @@ def _hydrate_finance(snapshot, summary, owner):
         if (own['home'], own['id']) != member:
             raise RebuildRequired('financial summary belongs to another owner')
         value = {name: own[name] for name in fields}
+        value['request'] = {'state': own.get('request', {}).get('state')}
         size += _size(value)
         if size > snapshot.limits.page_objects_bytes:
             raise CapacityExceeded('selected financial detail exceeds the delivered object budget')

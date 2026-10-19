@@ -482,8 +482,10 @@ class SpeedHealth:
         if self.engine_ref is None or self.engine_ref() is not source.binding:
             self.__init__()
             self.engine_ref = ref(source.binding)
+        fallback = self.metrics.get('capacity_fallback',False), self.metrics.get('fallback_reason')
         self._metrics()
         if signature == self.signature:
+            self.metrics.update(capacity_fallback=fallback[0],fallback_reason=fallback[1])
             return self.results
         self._changes()
         proofs = {}

@@ -191,6 +191,7 @@ def paint_items(d,items,top=0,bottom=math.inf):
     for item in items:
         value,x,y,w,h,size,color,weight=item[:8];style=item[8] if len(item)>8 else {}
         if y+h<top or y>bottom:continue
+        if style.get('kind')=='agent-heartbeat':continue
         if style.get('kind')=='cost-bar':
             d.rect(x,y,w,h,'track',h/2);offset=0
             total=style.get('total',sum(part['value'] for part in style['parts']))
@@ -199,7 +200,11 @@ def paint_items(d,items,top=0,bottom=math.inf):
                 if length:d.rect(x+offset,y,length,h,part['color'],pattern=True)
                 offset+=length
         elif style.get('kind')=='tokens':d.tokens(x,y,w,title=value)
-        elif style.get('kind')=='agent-selection':d.rect(x,y,w,h,'selection',5)
+        elif style.get('kind')=='agent-selection':d.rect(x,y,w,h,style['agentColor'],5,alpha=.13)
+        elif style.get('kind')=='agent-separator':d.rect(x,y,w,h,'border',alpha=.45)
+        elif style.get('kind')=='chevron':
+            points=((x,y+8),(x+3,y+11),(x+6,y+8)) if style['expanded'] else ((x+1,y+7),(x+4,y+h/2),(x+1,y+13))
+            for start,end in zip(points,points[1:]):d.line(*start,*end,color,1)
         elif style.get('kind')=='metric':d.metric(value,x,y,w,h,size,color=color)
         elif isinstance(value,list):
             for i,line in enumerate(value):d.text(line,x,y+i*18,w,18,size,color,weight,right=style.get('right',False))
@@ -222,7 +227,6 @@ class DetailBody(Node):
 
 class OverlayContent(Node):
     layout_requested=Signal()
-    agent_focus_requested=Signal(str)
     kind='plot';WIDTH=WIDTH;HEIGHT=720;BODY_SIZE=12
     def __init__(self):
         super().__init__();self.data=None;self.note='기록 확인 중';self.opacity=94;self.appearance=default_appearance(True);self.dark=True;self.compact=False
@@ -371,6 +375,9 @@ class OverlayContent(Node):
         if self.graph_pinned or not self.follow_latest:return self.selected()
         rows=self.rows()
         return next((row for row in rows if self.call_id(row)==getattr(self,'inspected_call',None)),rows[-1] if rows else {})
+    def latest_call(self):
+        rows=self.rows()
+        return rows[-1] if rows else {}
     def speed_alert(self):
         # Collection trouble is not evidence that the current session is slow.
         return (self.data or {}).get('speed_health', {}) if not self.note else {}
@@ -405,9 +412,13 @@ class OverlayContent(Node):
         if not recorded(group.get('model')) and not recorded(group.get('effort')):return tr('미확인')
         model=group.get('model') or tr('미확인');effort=group.get('effort') or tr('미확인')
         state=group.get('model_state')
-        match=('불일치' if state=='모델명 불일치' and group.get('model_mismatch') and group.get('response_model') and group['response_model']!=model else
-               '일치' if state=='일치' and group.get('response_model')==model else '미확인')
-        return f'{tr(model)}, {tr(effort)} ({tr(match)})'
+        mode=group.get('mode') or group.get('service_tier')
+        label=f'{tr(model)}, {tr(effort)}'
+        if mode and str(mode).casefold() not in ('standard','미확인','unknown'):label+=', '+str(mode).lower()
+        if state=='모델명 불일치' and group.get('model_mismatch') and group.get('response_model') and group['response_model']!=model:
+            from .i18n import formatted
+            label+=' '+formatted('(불일치: {model})',model=group['response_model'])
+        return label
     def main_model_tooltip(self):
         own=main_usage(self.data or {});label=self.subagent_call_label(own)
         if own.get('model_mismatch') and own.get('response_model'):
@@ -427,15 +438,21 @@ class OverlayContent(Node):
         from .overlay_monitor import SESSION_Y,TITLE_Y,header_layout
         header=header_layout(self)
         layout=self.layout()
-        active_count=data.get('active_requests',int(data.get('request',{}).get('state')=='진행'))
-        active=bool(active_count)
+        heartbeat=self.heartbeat_state()
+        def indicators(rows,dx=0,dy=0):
+            return [dict(x=item[1]+dx,y=item[2]+dy,**item[8]['heartbeat'])
+                    for item in rows if item[8].get('kind')=='agent-heartbeat']
+        main_items=self.agent_summary_items(main_usage(data),'Main Agent','ink',self.main_expanded,SECTION_WIDTH,main=True)
         self.put(detailBodyHeight=round(height*self.appearance.scale),detailWidth=self.detail_width,detailTitle='Sub Agents',
+                 mainHeartbeats=indicators(main_items,MARGIN,layout.get('main',0)) if not self.notice_card() else [],
+                 detailHeartbeats=indicators(items),
                  checkingRecords=self.checking_records,loadingX=header['status_x'],loadingY=layout.get('status',38)+2,contentOpacity=self.content_opacity(),
                  overlayFamily=self.appearance.family,overlaySurface=colors['surface'].name(),overlayBorder=colors['border'].name(),
                  overlayWarning=colors['warning'].name(),overlayBand=colors['band'].name(),overlaySelection=colors['selection'].name(),overlaySecondary=colors['secondary'].name(),
                  detailHasSession=bool((self.data or {}).get('id')),detailSessionKey=str(((self.data or {}).get('home'),(self.data or {}).get('id'))),
-                 detailActions=actions,heartbeatActive=active,heartbeatCount=active_count,
-                 heartbeatX=WIDTH-MARGIN-84,heartbeatY=layout.get('total',64)+25)
+                 detailActions=actions,heartbeatActive=heartbeat['mode']=='active',heartbeatCount=heartbeat['count'],totalRowVisible=True,
+                 heartbeatMode=heartbeat['mode'],heartbeatColor=heartbeat['color'],heartbeatLabel=heartbeat['label'],
+                 heartbeatX=heartbeat['x'],heartbeatY=heartbeat['y'])
         self._body.update()
         self._body.setAccessibleName('\n'.join(''.join(r[0]) if isinstance(r[0],list) else r[0] for r in items))
     def monitor_links(self):
@@ -443,16 +460,6 @@ class OverlayContent(Node):
         return links(self)
 
     def monitor_action(self,action):
-        if action=='latest':
-            self.release_pin();self.inspected_call=None;self.update();return
-        if action=='focus-agent':
-            row=self.displayed_call();data=self.data or {}
-            if (row.get('home'),row.get('sid'))==(data.get('home'),data.get('id')):
-                self.put(mainFocused=True);self.update();self.agent_focus_requested.emit('main');return
-            key=self.detail_group_key(dict(home=row.get('home'),id=row.get('sid')),'sub')
-            self.agent_focus_requested.emit('sub')
-            self.put(mainFocused=False,detailFocusKey='group-'+key,detailFocusSerial=self.state.get('detailFocusSerial',0)+1)
-            return
         if action=='main-detail':
             self.main_expanded=not self.main_expanded
             self.sync_details();self.refresh_accessibility();self.update();self.layout_requested.emit();return
@@ -532,6 +539,17 @@ class OverlayContent(Node):
         if self.note in ('수집 지연','수집 오류') and collection.get('last_confirmed_at'):
             values.append(tr('마지막 확인')+': '+timestamp(collection['last_confirmed_at']))
         return '\n'.join(dict.fromkeys(filter(None,values)))
+    def heartbeat_state(self):
+        data=self.data or {}
+        count=data.get('active_requests',int(data.get('request',{}).get('state')=='진행'))
+        failed=any(level=='error' or '지연' in value for value,level in self.states()) or bool(data.get('_collection',{}).get('errors'))
+        mode='error' if failed else 'active' if count else 'idle'
+        label=tr('진행 중')+' '+str(count) if mode=='active' else tr('대기') if mode=='idle' else ''
+        label_width=QFontMetrics(font(self.appearance.family,11)).horizontalAdvance(label)
+        colors={'active':('#16803c','#4ade80'),'idle':('#b58500','#facc15'),'error':('#dc2626','#f87171')}
+        return dict(mode=mode,count=count,label=label,color=colors[mode][int(self.dark)],
+                    x=WIDTH-MARGIN-label_width-(6 if label else 0)-18,y=self.layout().get('total',44)+5,
+                    message=self.status_detail())
     def session_scope(self):
         from .overlay_monitor import scope
         return scope(self.data or {})
@@ -611,7 +629,7 @@ class OverlayContent(Node):
         def row(label,value,*,marker=None,total=False):
             nonlocal y
             label_width=90;inset=16 if marker else 0
-            left=add(label,inset,y,label_width-inset,color='ink' if total else 'secondary',weight=600 if total else 400,size=11 if total else 10,marker=marker)
+            left=add(label,inset,y,label_width-inset,color='ink' if total else 'secondary',weight=600 if total else 400,size=11,marker=marker)
             right=add(value,label_width,y,w-label_width,right=True,weight=600 if total else 400)
             y+=max(left,right)+6
         def component(part,population,key):
@@ -620,7 +638,7 @@ class OverlayContent(Node):
             return population.get('counts',{}).get(key,0) if confirmed is True else None
         def pair(count,price):return formatted('{tokens} 토큰 / {cost}',tokens=amount(count,True),cost=self.exact_money(price))
         add('토큰 구성',0,y,w*.45,weight=600)
-        add(formatted('호출 {priced}/{calls}',priced=f"{group.get('priced',0):,}",calls=f"{group.get('calls',0):,}"),w*.45,y,w*.55,right=True,size=10)
+        add(formatted('호출 {priced}/{calls}',priced=f"{group.get('priced',0):,}",calls=f"{group.get('calls',0):,}"),w*.45,y,w*.55,right=True,size=11)
         y+=26
         cost=group.get('cost_composition',{});composition=group.get('token_composition',{})
         partial=bool(cost.get('partial') or composition.get('partial') or group.get('coverage_gap') or group.get('priced',0)<group.get('calls',0))
@@ -645,39 +663,71 @@ class OverlayContent(Node):
             y+=6
         row('호출 비용',self.exact_money(group.get('cost')),total=True)
         if partial:
-            add('확인분',0,y,w,color='secondary',size=10);y+=22
+            add('확인분',0,y,w,color='secondary',size=11);y+=22
         if own and miss_text(self.data or {}):
-            y+=add(miss_text(self.data or {}),0,y,w,color='secondary',size=10)+6
+            y+=add(miss_text(self.data or {}),0,y,w,color='secondary',size=11)+6
         if group.get('assumed'):
-            y+=add(formatted('Standard 가정 {count}호출',count=group['assumed']),0,y,w,color='secondary',size=10)+6
-        if group.get('coverage_gap'):add('이전 기록 누락',0,y,w,color='secondary',size=10)
+            y+=add(formatted('Standard 가정 {count}호출',count=group['assumed']),0,y,w,color='secondary',size=11)+6
+        if group.get('coverage_gap'):add('이전 기록 누락',0,y,w,color='secondary',size=11)
         return items
     def main_items(self):return self.group_details(main_usage(self.data or {}),own=True)
     def main_detail_height(self):
         return max((item[2]+item[4] for item in self.main_items()),default=0)+8 if self.main_expanded else 0
-    def detail_items(self):
+    def agent_cost_column(self,width):
+        width=min(width,self.detail_width)
+        groups=[main_usage(self.data or {}),*(self.data or {}).get('subagent_finance',{}).get('agents',())]
+        costs=[0 if group.get('calls')==0 else group.get('cost') for group in groups]
+        costs.append((self.data or {}).get('child_cost'))
+        metrics=QFontMetrics(font(self.appearance.family,12,600))
+        available=width*.44
+        price_width=min(available,max((metrics.horizontalAdvance(fitted_money(cost,available,12,self.appearance.family))+6 for cost in costs),default=0))
+        return width-20-price_width,price_width
+    def agent_summary_items(self,group,label,color,expanded,width,*,main=False,cost_column=None):
+        """Keep both agent scopes on the same summary and metric columns."""
         from .overlay_monitor import speed
-        from .i18n import formatted
+        cost=0 if group.get('calls')==0 else group.get('cost')
+        price_x,price_width=cost_column or self.agent_cost_column(width)
+        price=fitted_money(cost,price_width,12,self.appearance.family)
+        chevron_x=price_x+price_width-2
+        name_width=max(0,price_x-26)
+        label_metrics=QFontMetrics(font(self.appearance.family,12,600))
+        heartbeat_x=12+min(name_width,label_metrics.horizontalAdvance(tr(label)))+3
+        request=group.get('request_state',group.get('request',{}).get('state'))
+        mode='active' if request=='진행' else 'idle' if request else 'unknown'
+        heartbeat_color=('#16803c','#4ade80')[int(self.dark)] if mode=='active' else ('#b58500','#facc15')[int(self.dark)] if mode=='idle' else palette(self.appearance)['secondary'].name()
+        items=[(label,12,0,name_width,20,12,'ink',600,dict(kind='single-line',dot=color)),
+               ('',heartbeat_x,1,4,4,11,'secondary',400,dict(kind='agent-heartbeat',heartbeat=dict(
+                   id='main' if main else group.get('key',group.get('id','')),mode=mode,color=heartbeat_color,
+                   accessible=tr(label)+' '+tr('진행 중' if mode=='active' else '대기' if mode=='idle' else '미확인')))),
+               (price,price_x,0,price_width,20,12,'ink',600,dict(kind='single-line')),
+               ('',chevron_x,0,8,20,13,'secondary',400,dict(kind='chevron',expanded=expanded)),
+               (self.subagent_call_label(group),0,24,width,18,11,'error' if group.get('model_mismatch') else 'secondary',400,dict(kind='single-line'))]
+        half=width/2
+        metrics=(('캐시',0,width*.14,False),
+                 (percent(group.get('token_composition',{}).get('cache_hit_rate')),width*.14,half-6,True),
+                 ('평균 출력',half+6,width*.75,False),
+                 (speed(group.get('output_speed_summary',{}).get('value')),width*.75,width,True))
+        items.extend((tr(text),left,47,right-left,18,12 if align else 11,'ink' if align else 'secondary',400,dict(kind='single-line',right=align))
+                     for text,left,right,align in metrics)
+        return items
+    def detail_items(self):
         d=self.detail_data();w=self.detail_width;items=[];y=0
         if not d:
             if self.has_subagents():items.append((tr('모델별 기록 확인 중'),0,0,w,20,11,'secondary',400,{}))
             return items
         colors=self.graph_colors(self.rows())
-        for group in self.detail_groups():
+        cost_column=self.agent_cost_column(w)
+        for index,group in enumerate(self.detail_groups()):
             key=group['key'];expanded=key in self.expanded_groups;start=y
+            if index:items.append(('',0,y-8,w,1,11,'ink',400,dict(kind='agent-separator')))
             agent=(group.get('home'),group.get('id'));col=colors[agent]
-            displayed=self.displayed_call()
+            displayed=self.latest_call()
             if agent==(displayed.get('home'),displayed.get('sid')):
-                items.append(('',0,y-2,w,73,11,'ink',400,dict(kind='agent-selection')))
-            display=fitted_money(group.get('cost'),w*.48,12,self.appearance.family)
-            price_width=min(w*.48,QFontMetrics(font(self.appearance.family,12,600)).horizontalAdvance(display)+6)
-            items.append((group['label'],12,y,w-price_width-12,20,12,'ink',600,dict(kind='single-line',square=col)))
-            items.append((display,w-price_width,y,price_width,20,12,'ink',600,dict(kind='single-line',right=True)));y+=24
+                items.append(('',0,y-2,w,73,11,'ink',400,dict(kind='agent-selection',agentColor=col)))
+            for item in self.agent_summary_items(group,group['label'],col,expanded,w,cost_column=cost_column):
+                items.append((*item[:2],item[2]+y,*item[3:]))
             meta=self.subagent_call_label(group)
-            items.append((meta,0,y,w-20,18,10,'error' if group.get('model_mismatch') else 'secondary',400,dict(kind='single-line')))
-            items.append(('⌄' if expanded else '›',w-16,y,16,18,12,'secondary',400,dict(right=True)));y+=23
-            items.append((formatted('평균 출력 {speed}',speed=speed(group.get('output_speed_summary',{}).get('value'))),0,y,w*.62,18,10,'secondary',400,{}))
-            items.append((formatted('캐시 {rate}',rate=percent(group.get('token_composition',{}).get('cache_hit_rate'))),w*.62,y,w*.38,18,10,'secondary',400,dict(right=True)));y+=24
+            y+=71
             exact=self.exact_money(group.get('cost'))
             tip=group['label']+'\n'+meta+'\n'+exact
             if group.get('response_model'):tip+='\n'+tr('응답 모델')+': '+group['response_model']
@@ -715,12 +765,9 @@ class OverlayContent(Node):
         p.save();p.scale(self.appearance.scale,self.appearance.scale);d=Drawing(p,self);width=WIDTH+self.detail_extent;height=self.base_height()
         surface=QColor(d.colors['surface']);surface.setAlphaF(self.opacity/100);p.setPen(QPen(d.colors['border'],1));p.setBrush(surface);p.drawRoundedRect(QRectF(.5,.5,width-1,height-1),16,16)
         p.save();p.translate(self.monitor_x,0);data=self.data or {};layout=self.layout()
-        from .overlay_monitor import paint,header_layout,header_status
-        header=header_layout(self);status,color=header_status(self)
+        from .overlay_monitor import paint,header_layout
+        header=header_layout(self)
         d.text(Verbatim(self.display_title()),MARGIN,layout['header'],header['title_width'],24,14,weight=600,elide=True)
-        if status:
-            inset=20 if self.checking_records else 0
-            d.text(status,header['status_x']+inset,layout.get('status',38),max(0,header['status_width']-inset),18,10,color,elide=True)
         p.setOpacity(self.content_opacity())
         paint(d,self)
         p.restore();p.restore()

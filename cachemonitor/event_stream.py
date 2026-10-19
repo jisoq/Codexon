@@ -132,6 +132,7 @@ class EventLines:
         self.prefix=bytearray();self.selected=None;self.projection=None;self.error=None
         self.header_only=False
         self.bytes_read=0
+        self.event_end=None
 
     def feed(self,part,complete):
         if self.selected is None:
@@ -167,7 +168,9 @@ class EventLines:
                                 if isinstance(header,dict) and header.get('type')=='session_meta':selected.insert(0,(0,end))
                             self.digest.update(memoryview(block)[:consumed]);self.read_offset+=consumed
                             self.committed=self.line_start=self.read_offset;self.committed_digest=self.digest.copy()
-                            for begin,end in selected:yield start+begin,block[begin:end]
+                            for begin,end in selected:
+                                self.event_end=start+end
+                                yield start+begin,block[begin:end]
                             block=block[consumed:]
                             continue
                     end=block.find(b"\n")+1
@@ -197,5 +200,6 @@ class EventLines:
                         if event is not None:
                             if isinstance(event,Exception):event=b'{'
                             elif not isinstance(event,bytes):event=json.dumps(event,ensure_ascii=False).encode('utf-8')
+                            self.event_end=self.committed
                             yield position,event
         finally:source.seek(self.committed)

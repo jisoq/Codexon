@@ -904,6 +904,203 @@ def test_known_old_format_regenerates_atomically_and_preserves_other_stores(tmp_
     assert not list(tmp_path.glob('*.backup'))
 
 
+def test_catalog_order_upgrade_preserves_history_and_rebuilds_missing_order_schema(tmp_path):
+    from contextlib import closing
+    path = tmp_path/'upgraded-order.sqlite'
+    with storage.PreparedStore(path) as store:
+        previous = publish(store, 1, calls())
+    with closing(sqlite3.connect(path,isolation_level=None)) as db:
+        db.execute('DROP TABLE catalog_orders')
+        db.execute('ALTER TABLE meta DROP COLUMN order_batch')
+        db.execute('UPDATE meta SET format=5 WHERE singleton=1')
+    with storage.PreparedStore(path) as store, storage.PreparedReader(path) as reader:
+        assert store.token == previous
+        assert store.db.execute('SELECT format FROM meta').fetchone()[0] == storage.FORMAT
+        with reader.pin(previous) as view:
+            assert view.record(*OWNER, 'call-1')['cost'] == 1.
+        stage = store.begin(('source', 2))
+        stage.catalog_order([(OWNER, 0)])
+        stage.publish(('source', 2), ready=True)
+    with closing(sqlite3.connect(path,isolation_level=None)) as db:
+        db.execute('DROP TABLE catalog_orders')
+    with storage.PreparedStore(path) as store:
+        assert store.token.generation == 0
+        assert store.token.instance != previous.instance
+
+
+def test_catalog_order_preserves_packets_and_rejects_incomplete_budgeted_stage(tmp_path):
+    owners = (OWNER, ('home', 'second'))
+    packet_columns = ('metadata', 'call_metadata', 'dependencies', *storage.DERIVED,
+                      'request_mask', 'pending', 'deleted')
+    with storage.PreparedStore(tmp_path/'traversal-copy.sqlite') as store:
+        stage = store.begin(('source', 1))
+        dependency = {name: 1 for name in storage.DEPENDENCIES}
+        dependency['source_digest'] = '1'*64
+        for number, owner in enumerate(owners):
+            stage.owner(*owner, dict(home=owner[0], id=owner[1], title='Owner',
+                                    _collection_pending=bool(number)),
+                        dependency, source_ordinal=number, request_maps=('turn_states',),
+                        call_metadata=dict(title='Call'), summary=dict(value=(number, True, None)),
+                        choices=dict(models=['model']), model_alerts={'call': (True, None)},
+                        checkpoint=dict(frontier=(100, 'call')))
+            stage.calls(owner, [dict(key='call', ts=100, session_ordinal=1, cost=number)], reconcile=True)
+        previous = stage.publish(('source', 1), ready=True)
+
+        def stored_packets(owner):
+            return tuple(store.db.execute(
+                f'SELECT {",".join("v."+name for name in packet_columns)} FROM owners o '
+                'JOIN owner_heads h ON h.owner=o.id '
+                'JOIN owner_versions v ON v.owner=o.id AND v.batch=h.batch '
+                'WHERE o.home=? AND o.sid=?', owner).fetchone())
+
+        before = {owner: stored_packets(owner) for owner in owners}
+        positions = [(owner, len(owners)-number-1) for number, owner in enumerate(owners)]
+        stage = store.begin(('source', 2))
+        # The first bounded write may commit internally, but budget exhaustion
+        # must prevent the entire staged view from becoming public.
+        stage.limits = replace(stage.limits, write_rows=1, staging_bytes=32)
+        with pytest.raises(storage.CapacityExceeded):
+            stage.catalog_order(positions)
+        with pytest.raises(storage.IncompletePublication):
+            stage.publish(('source', 2), ready=True)
+        stage.abort()
+        assert store.token == previous
+        assert {owner: stored_packets(owner) for owner in owners} == before
+
+        stage = store.begin(('source', 3))
+        stage.catalog_order(positions)
+        one_row = replace(storage.Limits(), page_rows=1)
+        with storage.PreparedReader(store.path,one_row) as reader, reader.pin(previous) as pinned:
+            first = pinned.ordering()
+            assert first.rows[0]['owner'] == owners[0]
+            published = stage.publish(('source', 3), ready=True)
+            second = pinned.ordering(after=first.after)
+            assert second.rows[0]['owner'] == owners[1]
+            assert pinned.owner(*owners[0])['owner_ordinal'] == 0
+        assert {owner: stored_packets(owner) for owner in owners} == before
+        with storage.PreparedReader(store.path) as reader, reader.pin(published) as current:
+            for number, owner in enumerate(owners):
+                assert current.owner(*owner)['owner_ordinal'] == len(owners)-number-1
+                assert current.record(*owner, 'call')['cost'] == number
+        stage = store.begin(('source', 4))
+        stage.owner(*owners[0], storage.unpack(before[owners[0]][0]),
+                    storage.unpack(before[owners[0]][2]))
+        inherited = stage.publish(('source', 4), ready=True)
+        with storage.PreparedReader(store.path) as reader, reader.pin(inherited) as current:
+            assert current.owner(*owners[0])['owner_ordinal'] == 1
+        assert store.db.execute('SELECT source_ordinal FROM owner_versions WHERE batch=?',
+                                (stage.batch,)).fetchone()[0] == 1
+
+
+def test_owner_retirement_uses_slice_budget_and_preserves_pinned_reads(tmp_path):
+    owners = tuple(('home', str(number)) for number in range(3))
+    with storage.PreparedStore(tmp_path/'retired-owners.sqlite') as store:
+        stage = store.begin(('source', 1))
+        initial_batch = stage.batch
+        dependency = {name: 1 for name in storage.DEPENDENCIES}
+        dependency['source_digest'] = '1'*64
+        for number, owner in enumerate(owners):
+            stage.owner(*owner, dict(home=owner[0], id=owner[1]), dependency, source_ordinal=number)
+            stage.calls(owner, [dict(key='call', ts=100, session_ordinal=1, cost=number)], reconcile=True)
+        previous = stage.publish(('source', 1), ready=True)
+        with storage.PreparedReader(store.path) as reader, reader.pin(previous) as pinned:
+            stage = store.begin(('source', 2))
+            for number, owner in enumerate(owners):
+                stage.owner(*owner, dict(home=owner[0], id=owner[1]), dependency,
+                            source_ordinal=len(owners)-number-1)
+            current = stage.publish(('source', 2), ready=True)
+            assert store.maintain(rows=2) == 2
+            assert store.db.execute('SELECT count(*) FROM owner_versions WHERE batch=?',
+                                    (initial_batch,)).fetchone()[0] == 1
+            assert store.maintain(rows=2) == 1
+            assert store.db.execute('SELECT count(*) FROM owner_versions WHERE batch=?',
+                                    (initial_batch,)).fetchone()[0] == 0
+            for number, owner in enumerate(owners):
+                assert pinned.owner(*owner)['owner_ordinal'] == number
+                assert pinned.record(*owner, 'call')['cost'] == number
+            with storage.PreparedReader(store.path) as latest, latest.pin(current) as view:
+                for number, owner in enumerate(owners):
+                    assert view.owner(*owner)['owner_ordinal'] == len(owners)-number-1
+                    assert view.record(*owner, 'call')['cost'] == number
+
+
+def test_activity_reorder_publishes_order_without_rewriting_analyzed_owners(tmp_path, monkeypatch):
+    from cachemonitor.prepared_ingest import PreparedCohort, dependencies, mode_dependency, source_identity
+    from cachemonitor.prepared_delivery import PreparedPublisher
+    from cachemonitor.prepared_analysis import PreparedAnalysisEngine
+
+    owners = tuple(('home', str(number)) for number in range(3))
+    catalog = dict(scope='scope', path='source', selected_homes=['home'],
+                   catalog_identity=('source', 1), membership_complete=True,
+                   owners={owner: dict(body_digest=f'{number:064x}', source_ordinal=number,
+                                       state={}, owner_lineage={})
+                           for number, owner in enumerate(owners)})
+    limits = replace(storage.Limits(), owners_per_batch=len(owners), page_rows=1)
+    with storage.PreparedStore(tmp_path/'reordered.sqlite', limits) as store:
+        stage = store.begin(source_identity(catalog))
+        for number, owner in enumerate(owners):
+            entry = catalog['owners'][owner]
+            dependency = dependencies(entry['body_digest'], mode_dependency((owner,), catalog, None), 'own')
+            dependency.update(prepared=True, candidate_source_digest=entry['body_digest'])
+            stage.owner(*owner, dict(home=owner[0], id=owner[1], _internal_review=False),
+                        dependency, source_ordinal=number, summary=dict(value=number))
+            stage.calls(owner, [dict(key=str(number), ts=100+number, session_ordinal=1, cost=number)],
+                        reconcile=True)
+        stage.publish(source_identity(catalog), ready=True)
+        publisher = PreparedPublisher(0)
+        publisher.adopt(store, ())
+        engine = PreparedAnalysisEngine(store.path,store.token,limits=limits)
+        bodies = store.db.execute('SELECT count(*) FROM owner_versions').fetchone()[0]
+        catalog['catalog_identity'] = ('source', 2)
+        for number, owner in enumerate(reversed(owners)):
+            catalog['owners'][owner]['source_ordinal'] = number
+        previous = store.token
+        updates = list(PreparedCohort(store, None, None).convert(catalog, cohort_size=1))
+        # Source-read limits must not turn a fitting metadata-only update into
+        # an unavailable public generation.
+        assert len(updates) == 1 and updates[0]['ready']
+        assert updates[0]['changed'] == () and updates[0]['writes']['owners'] == 0
+        assert store.db.execute('SELECT count(*) FROM owner_versions').fetchone()[0] == bodies
+        assert store.token.generation == previous.generation+1
+        # Reject incomplete or over-budget order before changing the old
+        # publication/query token or any retained owner content.
+        publisher_owners=publisher.owners
+        engine_sessions=engine.sessions
+        original_order=storage.Snapshot.ordering
+        with monkeypatch.context() as invalid:
+            def incomplete(view, **kwargs):
+                page=original_order(view,**kwargs)
+                return replace(page,rows=tuple(row for row in page.rows if row['owner']!=owners[0]))
+            invalid.setattr(storage.Snapshot,'ordering',incomplete)
+            with pytest.raises(storage.NotReady):publisher.adopt(store,())
+            with pytest.raises(storage.NotReady):engine.adopt(store.token,())
+        assert publisher.token==previous and publisher.owners is publisher_owners
+        assert engine.token==previous and engine.sessions is engine_sessions
+        with monkeypatch.context() as capacity:
+            capacity.setattr(publisher,'STATE_BYTES',1)
+            capacity.setattr(engine,'OWNER_BYTES',1)
+            with pytest.raises(storage.CapacityExceeded):publisher.adopt(store,())
+            with pytest.raises(storage.CapacityExceeded):engine.adopt(store.token,())
+        assert publisher.token==previous and publisher.owners is publisher_owners
+        assert engine.token==previous and engine.sessions is engine_sessions
+        with monkeypatch.context() as order_only:
+            def forbidden(*args, **kwargs):
+                raise AssertionError('order adoption must not read owner content or derived packets')
+            order_only.setattr(storage.Snapshot, 'owner', forbidden)
+            order_only.setattr(storage.Snapshot, 'derived', forbidden)
+            publisher.adopt(store, ())
+            engine.adopt(store.token, ())
+        assert list(engine.sessions) == list(reversed(owners))
+        assert [publisher.owners[owner]['owner_ordinal'] for owner in owners] == [2,1,0]
+        engine.close()
+        with storage.PreparedReader(store.path) as reader, reader.pin(store.token) as view:
+            for number, owner in enumerate(owners):
+                assert view.owner(*owner)['owner_ordinal'] == len(owners)-number-1
+                assert view.derived(*owner, 'summary') == dict(value=number)
+                rows = list(view.iter_calls(owner))
+                assert len(rows) == 1 and rows[0]['key'] == str(number) and rows[0]['cost'] == number
+
+
 @pytest.mark.parametrize('reorder,capacity_fallback', [(False, False), (True, False), (True, True)])
 def test_competing_source_update_resumes_candidate_inventory_after_restart(tmp_path, monkeypatch, reorder, capacity_fallback):
     from contextlib import closing
@@ -1035,14 +1232,14 @@ def test_competing_source_update_resumes_candidate_inventory_after_restart(tmp_p
                 newcomer.add_usage(120, 'new-first', dict(input_tokens=100, cached_input_tokens=20, output_tokens=10),
                                    'gpt-6-astra', 'request', 'medium', service_tier='Standard')
                 sources.insert(0,deepcopy(newcomer.view(120)))
-                captured = publish_sources(4); later=[]; reorder_batch=coordinator._reorder
-                def source_grows_during_reorder(*args, **kwargs):
+                captured = publish_sources(4); later=[]; publish_batch=coordinator._publish
+                def source_grows_during_publication(*args, **kwargs):
                     if not later:
                         sources[0]['history'].append(dict(sources[0]['history'][0],key='new-later',ts=121))
                         sources[0]['usage_revision']=2
                         later.append(publish_sources(5))
-                    return reorder_batch(*args, **kwargs)
-                monkeypatch.setattr(coordinator,'_reorder',source_grows_during_reorder)
+                    return publish_batch(*args, **kwargs)
+                monkeypatch.setattr(coordinator,'_publish',source_grows_during_publication)
                 assert list(coordinator.convert(captured,cohort_size=1))[-1]['ready']
                 with store.read_current() as view:
                     assert [r['key'] for r in view.iter_calls((writer.homes[0],'newcomer'))] == ['new-first']

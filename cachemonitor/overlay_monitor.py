@@ -21,14 +21,14 @@ TITLE_HEIGHT=24
 SESSION_Y=362
 GRAPH_COUNT=3
 GRAPH_ROW=78
-CHARTS=(('cost','호출 비용'),('output_speed','출력 속도'),('reasoning','추론 토큰'))
+CHARTS=(('cost','비용'),('output_speed','출력 속도'),('reasoning','추론 토큰'))
 REMOTE_TITLE='원격 세션'
 REMOTE_HEADING='사용량 표시 미지원'
 REMOTE_DESCRIPTION='이 오버레이는 로컬 세션만 지원하며, 원격 기기의 사용량은 표시하지 않습니다.'
 
 
 def notice_geometry(m):
-    return dict(header=TITLE_Y,status=38,context=52,body=52,body_height=0,height=72,full_height=72)
+    return dict(header=TITLE_Y,total=44,status=38,context=52,body=52,body_height=0,height=72,full_height=72)
 
 
 def partial_text(data):
@@ -44,26 +44,24 @@ def miss_text(data):
 
 
 def header_status(m):
-    alert=m.speed_alert().get('active')
-    text=m.status_text() or ('출력 속도 저하' if alert else '')
-    return text,'error' if m.states() and m.states()[0][1]=='error' else 'warning' if alert else 'secondary'
+    # Status messages belong to the heartbeat hover surface, never the header.
+    return '', 'secondary'
 
 
 def header_layout(m):return dict(title_width=TITLE_WIDTH,status_x=MARGIN,status_width=SECTION_WIDTH)
 
 
 def status_link(m):
-    text=header_status(m)[0]
+    state=m.heartbeat_state()
+    text=state['message']
     if not text:return []
-    target=navigation_target(m.data or {},'collection') if any(word in m.note for word in ('오류','지연')) else None
-    return [dict(id='collection' if target else 'tip-status',x=MARGIN,y=38,width=SECTION_WIDTH,height=18,
-                 tooltip=m.status_detail(),accessible=m.status_detail(),interaction='navigate' if target else 'tooltip',
-                 **({'target':target} if target else {}))]
+    return [dict(id='tip-status',x=state['x']-3,y=state['y']-3,width=24,height=24,
+                 tooltip=text,accessible=text,interaction='tooltip')]
 
 
 def geometry(data, reduced=False, has_status=False, *, preferred_height=720, main_detail_height=0, available_height=None):
     return ColumnLayout.create(preferred_height=preferred_height,main_detail_height=main_detail_height,
-                               has_subagents=bool((data or {}).get('descendants',0)),reduced=reduced,
+                               has_subagents=bool((data or {}).get('descendants',0)),has_status=has_status,reduced=reduced,
                                available_height=available_height).mapping()
 
 
@@ -72,9 +70,10 @@ def model_text(row):
     comparison=model_comparison(row)
     model=row.get('requested_model') or row.get('model') or '미확인'
     if row.get('model_setting') and not row.get('requested_model'):model='설정: '+model
-    if comparison.startswith('모델 일치'):return model,' (일치)',False
-    if comparison:return model,f" (응답: {row.get('response_model') or '미확인'})",True
-    return model,' (확인 불가)',False
+    if comparison and not comparison.startswith('모델 일치') and row.get('response_model'):
+        from .i18n import formatted
+        return model,' '+formatted('(불일치: {model})',model=row['response_model']),True
+    return model,'',False
 
 
 def graph_value(row,key):
@@ -90,9 +89,14 @@ def graph_value(row,key):
 
 
 def chart_segments(rows,key):
-    """Join only adjacent global calls; an unknown sample breaks the line."""
-    values=[graph_value(row,key) for row in rows]
-    return tuple(((i,a),(i+1,b)) for i,(a,b) in enumerate(zip(values,values[1:])) if a is not None and b is not None)
+    """Join each agent's observations at their original global call slots."""
+    previous={};segments=[]
+    for index,row in enumerate(rows):
+        agent=(row.get('home'),row.get('sid'));value=graph_value(row,key)
+        prior=previous.get(agent)
+        if prior is not None and value is not None:segments.append((prior,(index,value)))
+        previous[agent]=(index,value) if value is not None else None
+    return tuple(segments)
 
 
 def speed(value):return '—' if value is None else f'{value:.1f} tps'
@@ -133,7 +137,6 @@ def _chart(d,m,rows,key,label,y,height,displayed):
     values=[graph_value(row,key) for row in rows]
     _,high=dynamic_bounds([0,*values]);high=max(high,1e-12)
     colors=m.graph_colors(rows);step=SECTION_WIDTH/max(1,len(rows));data=m.data or {}
-    if not rows and key=='cost':d.text('호출 기록 대기',MARGIN,top,SECTION_WIDTH,plot_height,11,'secondary',center=True)
     def position(index,value):return MARGIN+(index+.5)*step,bottom-plot_height*value/high
     def color(row):return colors[(row.get('home'),row.get('sid'))]
     def fill(points,tint):
@@ -151,47 +154,36 @@ def _chart(d,m,rows,key,label,y,height,displayed):
         if value is None:continue
         x,yy=position(i,value);active=m.call_id(row)==m.call_id(displayed);col=color(row)
         if active:d.line(x,top-2,x,bottom+2,'secondary',.7)
-        main=(row.get('home'),row.get('sid'))==(data.get('home'),data.get('id'))
         if m.chart_style=='bar':
-            width=max(1,min(12,step*.7));d.rect(x-width/2,yy,width,max(1,bottom-yy),col,1)
-        radius=3 if active else 2
-        if main:d.dot(x,yy,col,radius)
-        else:d.rect(x-radius,yy-radius,radius*2,radius*2,col)
+            width=max(1,min(12,step*.7)*.7);d.rect(x-width/2,yy,width,max(1,bottom-yy),col)
+        else:
+            radius=3 if active else 2
+            d.dot(x,yy,col,radius)
 
 
 def paint(d,m):
     if m.notice_card():return
-    from .overlay_view import money,percent,paint_items,fitted_money
-    from .i18n import formatted
+    from .overlay_view import paint_items,fitted_money
     data=m.data or {};own=main_usage(data);g=m.layout();rows=m.rows()
-    d.text('총 호출 비용',MARGIN,g['total'],SECTION_WIDTH-28,16,11,'secondary')
-    d.text(fitted_money(m.total_cost(),SECTION_WIDTH-92,26,m.appearance.family),MARGIN,g['total']+18,SECTION_WIDTH-92,30,26,weight=600)
-    displayed=m.displayed_call()
+    d.text('전체 비용',MARGIN,g['total'],56,28,11,'secondary')
+    total_width=m.heartbeat_state()['x']-MARGIN-56-6
+    d.text(fitted_money(m.total_cost(),total_width,22,m.appearance.family),MARGIN+56,g['total'],total_width,28,22,weight=600)
+    displayed=m.latest_call()
     for (key,label),y in zip(CHARTS,g['charts']):_chart(d,m,rows,key,label,y,g['chart_height'],displayed)
-    if displayed:
-        y=g['charts'][-1]+g['chart_height']
-        col=m.graph_colors(rows)[(displayed.get('home'),displayed.get('sid'))]
-        main=(displayed.get('home'),displayed.get('sid'))==(data.get('home'),data.get('id'))
-        if main:d.dot(MARGIN+3,y+9,col,3)
-        else:d.rect(MARGIN,y+6,6,6,col)
-        d.text(agent_label(data,displayed),MARGIN+13,y,SECTION_WIDTH-52,18,10,'secondary',elide=True)
-        d.text('최신',RIGHT-32,y,32,18,10,'secondary',right=True)
     y=g['main'];color=m.graph_colors(rows)[(data.get('home'),data.get('id'))]
-    if m.state.get('mainFocused') or (displayed.get('home'),displayed.get('sid'))==(data.get('home'),data.get('id')):
-        d.rect(MARGIN-3,y-2,SECTION_WIDTH+6,g['main_height'],'selection',5)
+    if displayed and (displayed.get('home'),displayed.get('sid'))==(data.get('home'),data.get('id')):
+        d.rect(MARGIN-3,y-2,SECTION_WIDTH+6,g['main_height'],color,5,alpha=.13)
     d.line(MARGIN,y-6,RIGHT,y-6)
-    d.dot(MARGIN+3,y+10,color,3)
-    d.text('Main Agent',MARGIN+13,y,104,20,12,weight=600)
-    d.text(money(own.get('cost') if own.get('calls') else 0),MARGIN+112,y,SECTION_WIDTH-132,20,13,weight=600,right=True)
-    d.text('⌄' if m.main_expanded else '›',RIGHT-16,y,16,20,13,'secondary',right=True)
-    d.text(m.subagent_call_label(own),MARGIN,y+23,SECTION_WIDTH,18,10,'error' if own.get('model_mismatch') else 'secondary',elide=True)
-    d.text(formatted('평균 출력 {speed}',speed=speed(own.get('output_speed_summary',{}).get('value'))),MARGIN,y+47,SECTION_WIDTH*.62,18,10,'secondary')
-    d.text(formatted('캐시 {rate}',rate=percent(own.get('token_composition',{}).get('cache_hit_rate'))),MARGIN+SECTION_WIDTH*.62,y+47,SECTION_WIDTH*.38,18,10,'secondary',right=True)
+    paint_items(d,[(item[0],item[1]+MARGIN,item[2]+y,*item[3:])
+                   for item in m.agent_summary_items(own,'Main Agent',color,m.main_expanded,SECTION_WIDTH,main=True)])
     if m.main_expanded:
         d.p.save();d.p.translate(MARGIN,g['main_detail']);paint_items(d,m.main_items());d.p.restore()
     if m.has_subagents():
         d.line(MARGIN,g['sub_heading']-6,RIGHT,g['sub_heading']-6)
-        d.text('Sub Agents',MARGIN,g['sub_heading'],SECTION_WIDTH,20,12,weight=600)
+        d.text('Sub Agents',MARGIN,g['sub_heading'],80,20,12,weight=600)
+        d.text(f"{data.get('descendants',0):,}",MARGIN+84,g['sub_heading'],40,20,11,'secondary')
+        price_x,price_width=m.agent_cost_column(SECTION_WIDTH)
+        d.text(fitted_money(data.get('child_cost'),price_width,11,m.appearance.family),MARGIN+price_x,g['sub_heading'],price_width,20,11,'secondary')
 
 
 def action_links(m):
@@ -200,18 +192,6 @@ def action_links(m):
     result.append(dict(id='main-detail',x=MARGIN,y=g['main'],width=SECTION_WIDTH,height=g['main_height'],
                        action='main-detail',interaction='detail',accessible='Main Agent 내역 접기' if m.main_expanded else 'Main Agent 내역 펼치기',selected=m.main_expanded,
                        tooltip=m.main_model_tooltip()))
-    rows=m.rows();step=SECTION_WIDTH/max(1,len(rows))
-    for i,row in enumerate(rows):
-        result.append(dict(id='call-'+str(i),x=MARGIN+i*step,y=g['charts'][0],width=step,
-                           height=g['charts'][-1]+g['chart_height']-g['charts'][0],
-                           target=navigation_target(data,'call',call=row),interaction='select',
-                           selected=m.call_id(row)==m.selected_id,targetHint=True,
-                           accessible=agent_label(data,row)+' / '+str(row.get('ordinal',i+1))+' 호출 선택'))
-    if rows:
-        y=g['charts'][-1]+g['chart_height'];displayed=m.displayed_call()
-        result.append(dict(id='focus-agent',x=MARGIN,y=y,width=SECTION_WIDTH-40,height=18,action='focus-agent',
-                           accessible=agent_label(data,displayed),tooltip=m.subagent_call_label(displayed)))
-        result.append(dict(id='latest',x=RIGHT-32,y=y,width=32,height=18,action='latest',accessible='최신 호출로 돌아가기'))
     return result
 
 

@@ -17,7 +17,7 @@ from .version import VERSION
 
 # Bump for projection or parser changes within one development release. Public
 # releases also invalidate through VERSION, independently of SQLite schemas.
-FORMAT = 2
+FORMAT = 3
 BODY_BUDGET = 64 * 1024 * 1024
 BODY_LIMIT = 2 * 1024 * 1024
 HEADER_LIMIT = 16 * 1024

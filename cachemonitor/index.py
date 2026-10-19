@@ -70,7 +70,9 @@ def _event_lines(source, digest, limit=16 * 1024 * 1024, state=None):
         reader=state['reader']=EventLines(source.tell(),digest)
     before=reader.bytes_read
     try:
-        yield from reader.read(source,limit)
+        for position,event in reader.read(source,limit):
+            state['event_end']=reader.event_end
+            yield position,event
     finally:
         state['digest']=reader.committed_digest.copy()
         state['read_bytes']=state.get('read_bytes',0)+reader.bytes_read-before
@@ -148,6 +150,11 @@ def sanitized(event):
     return {'type': kind, 'timestamp': event.get('timestamp'), 'payload': clean}
 
 
+def source_context_marker(clean, path, end):
+    if clean.get('type')=='turn_context':
+        clean['_next_event_id']=f'{Path(path).name}:{end}'
+
+
 class UsageIndex:
     def __init__(self, homes, path=None, model_evidence_path=None):
         self.read_only=False
@@ -172,12 +179,12 @@ class UsageIndex:
             self.db.execute('CREATE INDEX events_session ON events(home,tid,ts,path,pos)')
             self.db.commit()
         self.db.execute('CREATE TABLE IF NOT EXISTS usage_archive(home TEXT,response_id TEXT,data TEXT,PRIMARY KEY(home,response_id))')
-        # Recover complete default-tier snapshots omitted by older scanners.
+        # Recover complete snapshots and raw adjacency proofs omitted by older scanners.
         # Keep existing events while this incremental backfill proceeds.
-        self.tier_backfill=self.db.execute('pragma user_version').fetchone()[0]<5
+        self.tier_backfill=self.db.execute('pragma user_version').fetchone()[0]<6
         if self.tier_backfill:
             self.db.execute('update files set offset=0')
-            self.db.execute('pragma user_version=5')
+            self.db.execute('pragma user_version=6')
             self.db.commit()
         try:
             self.event_store=EventStore(self.db,self.path)
@@ -375,6 +382,7 @@ class UsageIndex:
                         if session_lineage(payload,tid)!=self.lineage.get((str(home),tid),{}):return False
                     clean=sanitized(event)
                     if clean is None:continue
+                    source_context_marker(clean,path,state['event_end'])
                     # Let the ordinary scanner retain malformed-source warnings.
                     stamp(clean['timestamp'])
                     clean['event_id']=f'{Path(path).name}:{pos}'
@@ -525,6 +533,7 @@ class UsageIndex:
                                 (str(home),tid,json.dumps(self.metadata[(str(home),tid)],ensure_ascii=False)))
                     clean = sanitized(meta) if tid else None
                     if clean:
+                        source_context_marker(clean,path,state['event_end'])
                         encoded=json.dumps(clean,ensure_ascii=False)
                         # Source event identity survives an archive-directory move;
                         # persisted path/pos reconstruct it without duplicating it.

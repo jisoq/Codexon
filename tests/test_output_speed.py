@@ -88,16 +88,12 @@ def test_rendered_summary_click_and_overlay_speed_navigation(tmp_path):
         engine=AnalysisEngine();engine.ingest(source['sessions']);data=OverlaySummaries().collect(engine)[0]
         overlay.set_content(data);overlay.show();QTest.qWait(60)
         m=overlay.content_model
-        assert m.displayed_call()['output_speed']==100
+        assert m.latest_call()['output_speed']==100
         cumulative=data['output_speed_summary']['value']
-        m.pin_call(m.call_id(data['recent'][1]))
-        assert m.displayed_call()['output_speed']==200
-        assert m.data['output_speed_summary']['value']==cumulative
-        m.monitor_action('latest')
         assert overlay.quick.grabFramebuffer().save(str(tmp_path/'overlay.png'))
         links.setGeometry(overlay.geometry());links.sync();links.show();QTest.qWait(30)
         click(links,named_item(links.quick.rootObject(),'nav-main-detail'))
-        assert m.main_expanded and m.displayed_call()['output_speed']==100
+        assert m.main_expanded and m.latest_call()['output_speed']==100
         assert m.data['output_speed_summary']['value']==cumulative
         from cachemonitor.overlay_navigation import navigation_target
         window.navigate(navigation_target(data,'session'))

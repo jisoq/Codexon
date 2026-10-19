@@ -25,10 +25,10 @@ from cachemonitor.analysis_records import compact_record, public_record
 from cachemonitor.observer_state import ProcessLock
 
 
-FORMAT = 5
+FORMAT = 6
 APPLICATION_ID = 0x43505250
 # Only versions whose dedicated, disposable schema is known to this writer.
-REBUILDABLE_FORMATS = frozenset((1, 2, 3, 4))
+REBUILDABLE_FORMATS = frozenset((1, 2, 3, 4, 5))
 METRICS = (
     'ts', 'session_ordinal', 'input', 'cached', 'written', 'output', 'reasoning',
     'total', 'uncached', 'ordinary_input', 'non_reasoning', 'rate', 'cost',
@@ -332,7 +332,7 @@ def _schema():
     return f'''
         CREATE TABLE meta(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
             format INTEGER NOT NULL,instance TEXT NOT NULL,generation INTEGER NOT NULL,
-            ready INTEGER NOT NULL,source BLOB NOT NULL);
+            ready INTEGER NOT NULL,source BLOB NOT NULL,order_batch INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE publications(id INTEGER PRIMARY KEY AUTOINCREMENT,state INTEGER NOT NULL,
             source BLOB NOT NULL,input_bytes INTEGER NOT NULL DEFAULT 0);
         CREATE INDEX publications_state ON publications(state,id);
@@ -346,6 +346,9 @@ def _schema():
         CREATE INDEX owner_versions_order ON owner_versions(source_ordinal,owner,batch);
         CREATE TABLE owner_heads(owner INTEGER PRIMARY KEY,batch INTEGER NOT NULL);
         CREATE INDEX owner_heads_batch ON owner_heads(batch);
+        CREATE TABLE catalog_orders(batch INTEGER NOT NULL,owner INTEGER NOT NULL,
+            source_ordinal INTEGER NOT NULL,PRIMARY KEY(batch,owner));
+        CREATE INDEX catalog_orders_rank ON catalog_orders(batch,source_ordinal,owner);
         CREATE TABLE calls(owner INTEGER NOT NULL,identity BLOB NOT NULL,batch INTEGER NOT NULL,
             deleted INTEGER NOT NULL,signature BLOB NOT NULL,key_value BLOB,turn_value BLOB,
             turn_identity BLOB,owner_mask INTEGER,types BLOB,detail BLOB,encoded_bytes INTEGER,
@@ -462,7 +465,12 @@ class PreparedStore:
             self.db = sqlite3.connect(self.path, timeout=.2, isolation_level=None)
             self.db.row_factory = sqlite3.Row
             if existed:
-                if self._validate_format() != FORMAT or not self._healthy():
+                version = self._validate_format()
+                if version == 5 and self._healthy():
+                    self._upgrade_catalog_order()
+                elif version != FORMAT or not self._healthy():
+                    self._rebuild_format()
+                elif not self._order_schema():
                     self._rebuild_format()
             else:
                 self._initialize(self.db)
@@ -530,10 +538,36 @@ class PreparedStore:
     def _initialize(self, db):
         db.execute('PRAGMA page_size=4096')
         db.executescript('BEGIN IMMEDIATE;' + _schema())
-        db.execute('INSERT INTO meta VALUES(1,?,?,?,?,?)',
+        db.execute('INSERT INTO meta(singleton,format,instance,generation,ready,source) VALUES(1,?,?,?,?,?)',
                    (FORMAT, uuid.uuid4().hex, 0, 0, pack(None, self.limits)))
         db.execute(f'PRAGMA application_id={APPLICATION_ID}')
         db.execute('COMMIT')
+
+    def _order_schema(self):
+        return ('order_batch' in {row[1] for row in self.db.execute('PRAGMA table_info(meta)')}
+            and {'batch','owner','source_ordinal'} <= {
+                row[1] for row in self.db.execute('PRAGMA table_info(catalog_orders)')})
+
+    def _upgrade_catalog_order(self):
+        required = {'owner_versions': {'owner','batch','source_ordinal'},
+                    'owners': {'id','home','sid'}, 'owner_heads': {'owner','batch'},
+                    'meta': {'singleton','format','instance','generation','ready','source'}}
+        if any(not names <= {row[1] for row in self.db.execute('PRAGMA table_info('+table+')')}
+               for table,names in required.items()):
+            self._rebuild_format()
+            return
+        if self.db.execute("SELECT 1 FROM sqlite_master WHERE name='catalog_orders'").fetchone():
+            self._rebuild_format()
+            return
+        # The zero pointer preserves existing version ordinals until a complete
+        # catalog first replaces them. Facts and their checkpoint token survive.
+        self.db.execute('PRAGMA journal_mode=WAL')
+        with self._transaction():
+            self.db.execute('CREATE TABLE catalog_orders(batch INTEGER NOT NULL,owner INTEGER NOT NULL,'
+                            'source_ordinal INTEGER NOT NULL,PRIMARY KEY(batch,owner))')
+            self.db.execute('CREATE INDEX catalog_orders_rank ON catalog_orders(batch,source_ordinal,owner)')
+            self.db.execute('ALTER TABLE meta ADD COLUMN order_batch INTEGER NOT NULL DEFAULT 0')
+            self.db.execute('UPDATE meta SET format=? WHERE singleton=1', (FORMAT,))
 
     def _rebuild_format(self):
         """Replace a recognized old or corrupt cache under the writer lock.
@@ -660,7 +694,7 @@ class PreparedStore:
         abandoned = self.db.execute('SELECT id FROM publications WHERE state=-1 LIMIT 1').fetchone()
         if abandoned:
             batch = abandoned[0]
-            for table in CHECKPOINT_TABLES[:-1]:
+            for table in (*CHECKPOINT_TABLES[:-1], 'catalog_orders'):
                 keys = [row[0] for row in self.db.execute(f'SELECT rowid FROM {table} WHERE batch=? LIMIT ?',(batch,rows))]
                 if keys:
                     with self._transaction():
@@ -694,14 +728,13 @@ class PreparedStore:
                                'WHERE p.state=1 LIMIT 1').fetchone()
         if task:
             kind, owner, key, batch = tuple(task)
-            table = 'owner_versions' if kind == 'owner' else kind
-            if table not in (*KINDS, 'owner_versions'):
+            if kind == 'owner':
+                return self._maintain_owner_versions(rows)
+            table = kind
+            if table not in KINDS:
                 raise RebuildRequired('invalid cleanup task')
-            condition = 'owner=? AND batch<?'
-            args = (owner, batch)
-            if kind != 'owner':
-                condition += ' AND identity=?'
-                args += (key,)
+            condition = 'owner=? AND batch<? AND identity=?'
+            args = (owner, batch, key)
             old = self.db.execute(f'SELECT batch FROM {table} WHERE {condition} LIMIT ?', (*args, rows)).fetchall()
             with self._transaction():
                 for row in old:
@@ -709,14 +742,22 @@ class PreparedStore:
                     self._prune_publication(row[0])
                 if len(old) < rows:
                     self.db.execute('DELETE FROM retired WHERE kind=? AND owner=? AND identity=? AND batch=?', tuple(task))
-                    if kind != 'owner':
-                        self.db.execute(f'DELETE FROM {table} WHERE owner=? AND identity=? AND batch=? AND deleted=1',
-                                        (owner, key, batch))
+                    self.db.execute(f'DELETE FROM {table} WHERE owner=? AND identity=? AND batch=? AND deleted=1',
+                                    (owner, key, batch))
                     self._prune_publication(batch)
             return max(1, len(old))
         checkpoint_work = self._maintain_checkpoint(rows)
         if checkpoint_work:
             return checkpoint_work
+        old_order = self.db.execute('SELECT r.rowid,r.batch FROM catalog_orders r '
+            'JOIN publications p ON p.id=r.batch WHERE p.state=1 AND r.batch<('
+            'SELECT order_batch FROM meta WHERE singleton=1) LIMIT ?', (rows,)).fetchall()
+        if old_order:
+            with self._transaction():
+                self.db.executemany('DELETE FROM catalog_orders WHERE rowid=?', ((row[0],) for row in old_order))
+                for batch in {row[1] for row in old_order}:
+                    self._prune_publication(batch)
+            return len(old_order)
         # Completed reconciliation inventories are the only remaining stage-only rows.
         seen = self.db.execute('SELECT s.batch,s.kind,s.owner,s.identity FROM seen s '
                                'CROSS JOIN publications p ON p.id=s.batch WHERE p.state=1 LIMIT ?', (rows,)).fetchall()
@@ -770,11 +811,40 @@ class PreparedStore:
             return len(seen)
         return 0
 
+    def _maintain_owner_versions(self, rows):
+        """Retire several owners within the existing per-slice row budget."""
+        tasks = self.db.execute('SELECT q.* FROM retired q CROSS JOIN publications p ON p.id=q.batch '
+            "WHERE q.kind='owner' AND p.state=1 LIMIT ?", (rows,)).fetchall()
+        versions = []
+        completed = []
+        remaining = rows
+        for task in tasks:
+            if not remaining:
+                break
+            kind, owner, key, batch = tuple(task)
+            old = self.db.execute('SELECT batch FROM owner_versions WHERE owner=? AND batch<? LIMIT ?',
+                                  (owner,batch,remaining+1)).fetchall()
+            selected = old[:remaining]
+            versions.extend((owner,row[0]) for row in selected)
+            if len(old) <= remaining:
+                completed.append((kind,owner,key,batch))
+            # Empty tasks still consume a bounded amount of cleanup work.
+            remaining -= max(1,len(selected))
+        with self._transaction():
+            self.db.executemany('DELETE FROM owner_versions WHERE owner=? AND batch=?', versions)
+            self.db.executemany('DELETE FROM retired WHERE kind=? AND owner=? AND identity=? AND batch=?', completed)
+            previous = {batch for _,batch in versions} | {task[3] for task in completed}
+            for batch in previous:
+                self._prune_publication(batch)
+        return max(1,rows-remaining)
+
     def _prune_publication(self, batch):
         row = self.db.execute('SELECT state FROM publications WHERE id=?', (batch,)).fetchone()
         if row is None or row[0] != 1:
             return
-        for table in (*KINDS, 'owner_versions', 'seen', 'retired', 'owner_heads', 'owner_retired', *CHECKPOINT_TABLES):
+        if self.db.execute('SELECT 1 FROM meta WHERE singleton=1 AND order_batch=?', (batch,)).fetchone():
+            return
+        for table in (*KINDS, 'owner_versions', 'seen', 'retired', 'owner_heads', 'owner_retired', 'catalog_orders', *CHECKPOINT_TABLES):
             if self.db.execute(f'SELECT 1 FROM {table} WHERE batch=? LIMIT 1', (batch,)).fetchone():
                 return
         self.db.execute('DELETE FROM publications WHERE id=?', (batch,))
@@ -813,10 +883,11 @@ class Stage:
         self.context_changed = set()
         self.facts_started = set()
         self.checkpoint_namespaces = set()
+        self.catalog_staged = False
         self.checkpoint_totals = None
         self.failed = False
         self.finished = False
-        self.writes = dict.fromkeys((*KINDS, 'owners', 'derived', 'seen', 'checkpoint_chunks', 'checkpoint_sections'), 0)
+        self.writes = dict.fromkeys((*KINDS, 'owners', 'derived', 'seen', 'checkpoint_chunks', 'checkpoint_sections', 'catalog'), 0)
 
     @property
     def prospective_token(self):
@@ -888,7 +959,9 @@ class Stage:
                      self.db.execute('SELECT v.* FROM owner_heads h JOIN owner_versions v '
                                      'ON v.owner=h.owner AND v.batch=h.batch WHERE h.owner=?', (owner,)).fetchone())
             if source_ordinal is None and prior:
-                source_ordinal = prior['source_ordinal']
+                ranked = self.db.execute('SELECT source_ordinal FROM catalog_orders WHERE owner=? AND batch=('
+                    'SELECT order_batch FROM meta WHERE singleton=1)', (owner,)).fetchone()
+                source_ordinal = ranked[0] if ranked else prior['source_ordinal']
             if type(source_ordinal) is not int or not 0 <= source_ordinal < 2 ** 63:
                 raise TypeError('new owners require their exact nonnegative source traversal ordinal')
             if request_maps is UNCHANGED:
@@ -925,6 +998,68 @@ class Stage:
         self.owners[key] = owner
         self.writes['owners'] += 1
         return owner
+
+    def catalog_order(self, positions):
+        """Stage a complete light catalog in bounded writes, without owner copies."""
+        self._live()
+        if self.catalog_staged:
+            raise IncompletePublication('one complete catalog order is allowed per stage')
+        seen = set()
+        ordinals = set()
+        count = size = group_objects = 0
+        group = []
+
+        def write(values):
+            placeholders = ','.join('(?,?,?)' for _ in values)
+            rows = self.db.execute(
+                f'WITH wanted(home,sid,ordinal) AS (VALUES {placeholders}) '
+                'SELECT o.id,q.ordinal FROM wanted q JOIN owners o ON o.home=q.home AND o.sid=q.sid '
+                'LEFT JOIN owner_heads h ON h.owner=o.id JOIN owner_versions v ON v.owner=o.id '
+                'AND v.batch=COALESCE((SELECT x.batch FROM owner_versions x WHERE x.owner=o.id '
+                'AND x.batch=?),h.batch) WHERE v.deleted=0',
+                (*tuple(value for item in values for value in item),self.batch)).fetchall()
+            if len(rows) != len(values):
+                raise StaleGeneration('catalog order contains an absent prepared owner')
+            with self.store._transaction():
+                self._charge(32*len(rows))
+                self.db.executemany('INSERT INTO catalog_orders VALUES(?,?,?)',
+                    ((self.batch,row['id'],row['ordinal']) for row in rows))
+            self.writes['catalog'] += len(rows)
+
+        try:
+            for owner, ordinal in positions:
+                if (type(owner) is not tuple or len(owner) != 2 or
+                        any(type(value) is not str for value in owner)):
+                    raise TypeError('catalog order requires exact home/session identities')
+                if owner in seen or ordinal in ordinals:
+                    raise ValueError('catalog order repeats an owner or ordinal')
+                if type(ordinal) is not int or not 0 <= ordinal < 2**63:
+                    raise TypeError('catalog ordinals must be nonnegative integers')
+                pack(owner,self.limits,maximum=self.limits.key_bytes)
+                size += _size((owner,ordinal))+160
+                if size > self.limits.page_objects_bytes:
+                    raise CapacityExceeded('catalog order exceeds its metadata budget')
+                item=(*owner,ordinal)
+                objects=_size(item)
+                if 32>self.limits.fact_write_bytes or objects>self.limits.fact_write_objects:
+                    raise CapacityExceeded('one catalog order row exceeds its transaction budget')
+                if group and (len(group)>=min(self.limits.write_rows,self.limits.fact_write_rows)
+                              or 32*(len(group)+1)>self.limits.fact_write_bytes
+                              or group_objects+objects>self.limits.fact_write_objects):
+                    write(group);group=[];group_objects=0
+                seen.add(owner);ordinals.add(ordinal);count += 1
+                group.append(item);group_objects+=objects
+            if group:write(group)
+            current = self.db.execute('SELECT count(*) FROM owners o LEFT JOIN owner_heads h ON h.owner=o.id '
+                'JOIN owner_versions v ON v.owner=o.id AND v.batch=COALESCE(('
+                'SELECT x.batch FROM owner_versions x WHERE x.owner=o.id AND x.batch=?),h.batch) '
+                'WHERE v.deleted=0', (self.batch,)).fetchone()[0]
+            if count != current or ordinals and (min(ordinals)!=0 or max(ordinals)!=count-1):
+                raise IncompletePublication('catalog order must cover exact complete prepared membership')
+            self.catalog_staged = True
+        except BaseException:
+            self.failed = True
+            raise
 
     def _owner(self, key):
         self._live()
@@ -1336,6 +1471,8 @@ class Stage:
 
     def publish(self, source_identity, *, ready):
         self._live()
+        if self.catalog_staged and not ready:
+            raise IncompletePublication('a complete catalog order requires a ready publication')
         if self.failed or self.reconciling:
             raise IncompletePublication('a failed or unfinished inventory cannot publish')
         if pack(source_identity, self.limits) != self.source:
@@ -1360,6 +1497,8 @@ class Stage:
                 self.db.execute('UPDATE publications SET state=1 WHERE id=?', (self.batch,))
                 self.db.execute('UPDATE meta SET generation=generation+1,ready=?,source=? WHERE singleton=1',
                                 (int(ready), self.source))
+                if self.catalog_staged:
+                    self.db.execute('UPDATE meta SET order_batch=? WHERE singleton=1', (self.batch,))
                 self.store._prune_publication(self.batch)
         except CapacityExceeded:
             # A WAL pressure check may run after COMMIT. Durable publication is
@@ -1452,6 +1591,10 @@ class Snapshot:
             if row is None or row['format'] != FORMAT:
                 raise RebuildRequired('prepared schema version changed')
             self.token = Token(row['instance'], row['generation'])
+            self.order_batch = row['order_batch']
+            if staged_batch is not None and self.db.execute(
+                    'SELECT 1 FROM catalog_orders WHERE batch=? LIMIT 1', (staged_batch,)).fetchone():
+                self.order_batch = staged_batch
             self.publication_token = (Token(self.token.instance,self.token.generation+1)
                                       if staged_batch is not None else self.token)
             if expected is not None and expected != self.token:
@@ -1479,12 +1622,17 @@ class Snapshot:
                        batch=self.staged_batch, publication=publication)
 
     def _owner_tables(self):
+        ranks = f' LEFT JOIN catalog_orders rank ON rank.owner=o.id AND rank.batch={int(self.order_batch)}'
         if self.staged_batch is None:
             return ('owners o JOIN owner_heads h ON h.owner=o.id '
-                    'JOIN owner_versions v ON v.owner=h.owner AND v.batch=h.batch')
+                    'JOIN owner_versions v ON v.owner=h.owner AND v.batch=h.batch') + ranks
         return ('owners o LEFT JOIN owner_heads h ON h.owner=o.id '
                 'JOIN owner_versions v ON v.owner=o.id AND v.batch=COALESCE('
-                f'(SELECT x.batch FROM owner_versions x WHERE x.owner=o.id AND x.batch={int(self.staged_batch)}),h.batch)')
+                f'(SELECT x.batch FROM owner_versions x WHERE x.owner=o.id AND x.batch={int(self.staged_batch)}),h.batch)') + ranks
+
+    @staticmethod
+    def _rank():
+        return 'COALESCE(rank.source_ordinal,v.source_ordinal)'
 
     def _expired(self):
         return time.monotonic() >= self.deadline or self.cancel is not None and self.cancel()
@@ -1514,7 +1662,7 @@ class Snapshot:
                 cursor.close()
 
     def _owner(self, key, *, metadata=True):
-        columns = 'o.id,v.source_ordinal,v.request_mask,v.metadata,v.call_metadata,v.dependencies' if metadata else 'o.id'
+        columns = f'o.id,{self._rank()} AS source_ordinal,v.request_mask,v.metadata,v.call_metadata,v.dependencies' if metadata else 'o.id'
         with self._cursor(f'SELECT {columns} FROM {self._owner_tables()} '
                           'WHERE o.home=? AND o.sid=? AND v.deleted=0', key) as cursor:
             row = cursor.fetchone()
@@ -1567,9 +1715,9 @@ class Snapshot:
     def inventory(self, *, after=None):
         """Conversion inventory excludes public metadata and classifier arrays."""
         args = dict(ordinal=after[0] if after else 0,owner=after[1] if after else 0,n=self.limits.page_rows+1)
-        where = '(v.source_ordinal,v.owner)>(:ordinal,:owner)' if after is not None else '1'
-        sql = (f'SELECT o.home,o.sid,v.owner,v.source_ordinal,v.dependencies FROM {self._owner_tables()} '
-               f'WHERE v.deleted=0 AND {where} ORDER BY v.source_ordinal,v.owner LIMIT :n')
+        where = f'({self._rank()},v.owner)>(:ordinal,:owner)' if after is not None else '1'
+        sql = (f'SELECT o.home,o.sid,v.owner,{self._rank()} AS source_ordinal,v.dependencies FROM {self._owner_tables()} '
+               f'WHERE v.deleted=0 AND {where} ORDER BY {self._rank()},v.owner LIMIT :n')
         return self._page(sql,args,lambda r:dict(owner=(r['home'],r['sid']),owner_ordinal=r['source_ordinal'],
                           dependencies=unpack(r['dependencies'],self.limits)),
                           lambda r:(r['source_ordinal'],r['owner']),
@@ -1578,14 +1726,25 @@ class Snapshot:
     @_read_operation
     def catalog(self, *, after=None):
         args = dict(ordinal=after[0] if after else 0, owner=after[1] if after else 0, n=self.limits.page_rows + 1)
-        where = '(v.source_ordinal,v.owner)>(:ordinal,:owner)' if after is not None else '1'
-        sql = (f'SELECT o.home,o.sid,v.owner,v.source_ordinal,v.request_mask,v.metadata,v.call_metadata,v.dependencies FROM {self._owner_tables()} '
-               f'WHERE v.deleted=0 AND {where} ORDER BY v.source_ordinal,v.owner LIMIT :n')
+        where = f'({self._rank()},v.owner)>(:ordinal,:owner)' if after is not None else '1'
+        sql = (f'SELECT o.home,o.sid,v.owner,{self._rank()} AS source_ordinal,v.request_mask,v.metadata,v.call_metadata,v.dependencies FROM {self._owner_tables()} '
+               f'WHERE v.deleted=0 AND {where} ORDER BY {self._rank()},v.owner LIMIT :n')
         return self._page(sql, args,
             lambda r: dict(owner=(r['home'], r['sid']), owner_ordinal=r['source_ordinal'], request_maps=self._request_maps(r), **{name: unpack(r[name], self.limits)
                          for name in ('metadata', 'call_metadata', 'dependencies')}),
             lambda r: (r['source_ordinal'], r['owner']),
             lambda r: sum(len(r[name]) for name in ('metadata', 'call_metadata', 'dependencies')))
+
+    @_read_operation
+    def ordering(self, *, after=None):
+        args = dict(ordinal=after[0] if after else 0, owner=after[1] if after else 0,
+                    n=self.limits.page_rows+1)
+        where = f'({self._rank()},o.id)>(:ordinal,:owner)' if after is not None else '1'
+        sql = (f'SELECT o.home,o.sid,o.id,{self._rank()} AS ordinal FROM {self._owner_tables()} '
+               f'WHERE v.deleted=0 AND {where} ORDER BY {self._rank()},o.id LIMIT :n')
+        return self._page(sql,args,lambda row:dict(owner=(row['home'],row['sid']),owner_ordinal=row['ordinal']),
+                          lambda row:(row['ordinal'],row['id']),
+                          lambda row:len(row['home'])*4+len(row['sid'])*4+32)
 
     def _decode_call(self, row, metadata, *, metrics=False):
         result = {} if metrics else _detail_unpack(row['detail'], self.limits)
@@ -1936,7 +2095,7 @@ class Snapshot:
             return None,None
         ids=[]
         with self._cursor(f'SELECT o.id,o.home,o.sid FROM {self._owner_tables()} '
-                          'WHERE v.deleted=0 ORDER BY v.source_ordinal,o.id') as cursor:
+                          f'WHERE v.deleted=0 ORDER BY {self._rank()},o.id') as cursor:
             for row in cursor:
                 self._check()
                 if (row['home'],row['sid']) in wanted:
@@ -1988,7 +2147,8 @@ class Snapshot:
                                   'JOIN publications p ON p.id=r.batch '
                                   'JOIN owner_heads h ON h.owner=r.owner '
                                   'JOIN owner_versions v ON v.owner=h.owner AND v.batch=h.batch '
-                                  f'WHERE {where} ORDER BY r.m_ts {order},v.source_ordinal,'
+                                  f'LEFT JOIN catalog_orders rank ON rank.owner=r.owner AND rank.batch={int(self.order_batch)} '
+                                  f'WHERE {where} ORDER BY r.m_ts {order},{self._rank()},'
                                   'r.owner,r.m_session_ordinal,r.identity LIMIT 1',args) as cursor:
                     row=cursor.fetchone()
                 if row is not None:

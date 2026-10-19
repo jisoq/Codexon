@@ -246,7 +246,7 @@ def merge_model_breakdowns(summaries):
     return sorted(result,key=lambda value:(-(value['cost'] or 0),value['model']))
 
 
-SUBAGENT_CALL_FIELDS=('model','effort','response_model','model_state','model_mismatch','latest_ts','output_speed_summary')
+SUBAGENT_CALL_FIELDS=('model','effort','mode','response_model','model_state','model_mismatch','latest_ts','output_speed_summary')
 
 
 def _subagent_finance(summaries,cost):
@@ -256,6 +256,7 @@ def _subagent_finance(summaries,cost):
         'model_breakdown','token_composition','cost_composition')} for summary in summaries]
     for agent,summary in zip(agents,summaries):
         agent.update({field:summary.get(field) for field in SUBAGENT_CALL_FIELDS})
+        agent['request_state']=summary.get('request',{}).get('state')
         if not agent['calls']:agent['cost']=0.
     agents.sort(key=lambda value:(value['cost'] is None,-(value['cost'] or 0),value['home'],value['id']))
     calls=sum(value['calls'] for value in agents)
@@ -562,10 +563,11 @@ class OverlaySummaries:
                 value['main_usage']={field:summary[field] for field in (
                     'calls','priced','missing','mean_cost','assumed','coverage_gap',
                     'token_composition','cost_composition','output_speed_summary',
-                    'model','effort','model_state','model_mismatch','response_model')}
+                    'model','effort','mode','model_state','model_mismatch','response_model')}
                 value['main_usage'].update({field:partials[key][field] for field in (
                     'maintenance_calls','maintenance_cost','maintenance_missing')})
                 value['main_usage']['cost']=group['own_cost']
+                value['main_usage']['request_state']=summary.get('request',{}).get('state')
                 if include_finance:
                     value.update(subagent_finance=_subagent_finance(own_summaries[1:],group['child_cost']),
                         own_model_breakdown=summary['model_breakdown'],

@@ -20,10 +20,13 @@ def test_shadow_clip_stays_inside_codex_frame_and_clears_after_moving_inward():
 
 
 def test_rendered_quick_scene_keeps_panel_clear_and_shadow_visible():
+    from PySide6.QtQuick import QQuickItem
+    from tests.test_ui import wait_for_rendered
     app=QApplication.instance() or QApplication([])
     shadow=OverlayShadow()
     try:
-        shadow.show();QTest.qWait(35)
+        shadow.show()
+        wait_for_rendered(lambda:shadow.quick.rootObject() is not None)
         image=shadow.quick.grabFramebuffer()
         # QQuickWidget's framebuffer is physical-sized even when the returned
         # QImage has its default DPR metadata; use the actual framebuffer ratio.
@@ -32,5 +35,8 @@ def test_rendered_quick_scene_keeps_panel_clear_and_shadow_visible():
         padding=shadow.padding
         assert alpha(padding+190,padding+290)==0
         assert alpha(padding+190,padding+586)>0
+        # A decoration window must never draw labels outside the monitor.
+        assert not [item for item in shadow.quick.rootObject().findChildren(QQuickItem)
+                    if item.isVisible() and item.property('text')]
         assert not shadow.qml_errors
     finally:shadow.close();app.processEvents()

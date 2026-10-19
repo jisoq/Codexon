@@ -89,6 +89,9 @@ def test_prepared_overlay_detail_revision_tracks_descendants_and_removed_members
         material=prepare_owner(source,owns=lambda *_:True)
         owners[key]={'metadata':{k:v for k,v in source.items() if k!='history'}}
         packets[key]=summary_for_storage(split_summary(material['summary'])[0])
+    sources['parent']['history'][0]['service_tier']='priority'
+    sources['parent']['request_state']=dict(turn='turn',state='완료')
+    sources['child']['request_state']=dict(turn='turn',state='진행')
     for name in sources:replace_owner(name)
     view=SimpleNamespace(publication_token=SimpleNamespace(instance='test',generation=1),
         limits=Limits(), owner=lambda home,sid:owners.get((home,sid)),
@@ -99,6 +102,11 @@ def test_prepared_overlay_detail_revision_tracks_descendants_and_removed_members
         assert all('model_breakdown' not in item and 'subagent_finance' not in item for item in compact)
         return {item['id']:hydrate_overlay(view,dict(item,_recent_refs=False),finance=True) for item in compact}
     first=collect(None)
+    assert first['parent']['mode']=='Standard'
+    assert first['parent']['main_usage']['mode']=='Fast'
+    assert first['parent']['subagent_finance']['agents'][0]['mode']=='Standard'
+    assert first['parent']['main_usage']['request_state']=='완료'
+    assert first['parent']['subagent_finance']['agents'][0]['request_state']=='진행'
     view.publication_token.generation=2
     sources['other']['history'][0]['output']+=1;replace_owner('other')
     second=collect({('home','other')})
@@ -108,12 +116,14 @@ def test_prepared_overlay_detail_revision_tracks_descendants_and_removed_members
     assert second['other']['_overlay_revision']!=first['other']['_overlay_revision']
     view.publication_token.generation=3
     sources['child']['history'][0]['output']+=1;replace_owner('child')
+    sources['child']['request_state']['state']='완료';replace_owner('child')
     third=collect({('home','child')})
     assert [item['key'] for item in third['parent']['recent']]==[item['key'] for item in second['parent']['recent']]
     assert third['parent']['_overlay_revision']!=second['parent']['_overlay_revision']
     assert third['child']['_overlay_revision']!=second['child']['_overlay_revision']
     assert third['parent']['subagent_finance']['models']!=second['parent']['subagent_finance']['models']
     assert third['parent']['own_cost']==second['parent']['own_cost']
+    assert third['parent']['subagent_finance']['agents'][0]['request_state']=='완료'
     view.publication_token.generation=4
     owners.pop(('home','child'))
     fourth=collect(set(),{('home','child')})

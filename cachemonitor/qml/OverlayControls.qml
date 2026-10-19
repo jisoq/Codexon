@@ -5,6 +5,7 @@ Rectangle {
     id: root
     required property var presentation
     property var s: presentation.state
+    property int preferredHeight: s.heightValue || 720
     property bool moveControl: s.chromeKind === "icon" || s.chromeKind === "header"
     property real outerMargin: moveControl ? 4 * s.scale : 0
     color: moveControl ? "transparent" : appTheme.palette.hit_surface
@@ -19,7 +20,7 @@ Rectangle {
         visible: root.s.chromeKind === "icon" || root.s.chromeKind === "header"
         activeFocusOnTab: false
         HoverHandler { id: moveHover }
-        UiToolTip { visible: moveHover.hovered; text: appLanguage.text(root.s.chromeKind === "icon" ? "오버레이 펼치기" : "끌어서 이동") }
+        UiToolTip { visible: moveHover.hovered && root.s.chromeKind === "icon"; text: appLanguage.text("오버레이 펼치기") }
 
         Accessible.role: root.s.chromeKind === "icon" ? Accessible.Button : Accessible.Pane
         Accessible.name: root.s.chromeKind === "icon" ? appLanguage.text("복원") : (root.s.title || appLanguage.text("세션 제목")) + appLanguage.text(", 이동")
@@ -30,6 +31,12 @@ Rectangle {
         anchors.fill: moveTarget
         visible: root.moveControl
         color: appTheme.palette.hit_surface
+    }
+    Rectangle {
+        anchors.fill: moveTarget; radius: 6 * root.s.scale
+        visible: root.s.chromeKind === "header"
+        color: root.s.ink
+        opacity: root.s.pressed ? 0.10 : root.s.hovered ? 0.06 : 0
     }
 
     Rectangle {
@@ -198,6 +205,7 @@ Rectangle {
                     objectName: "chartStyle-" + modelData.key
                     width: 114 * root.s.scale; height: 28 * root.s.scale
                     checkable: true; checked: root.s.chartStyle === modelData.key
+                    hoverEnabled: true
                     text: appLanguage.text(modelData.label)
                     onPressed: root.presentation.startInteraction()
                     onClicked: root.presentation.setChartStyle(modelData.key)
@@ -205,7 +213,7 @@ Rectangle {
                     background: Rectangle {
                         radius: 5 * root.s.scale
                         color: styleButton.checked ? root.s.accent : root.s.ink
-                        opacity: styleButton.checked ? 0.2 : styleButton.hovered ? 0.12 : 0.06
+                        opacity: styleButton.down ? 0.26 : styleButton.hovered ? (styleButton.checked ? 0.26 : 0.12) : styleButton.checked ? 0.2 : 0.06
                         border.width: styleButton.visualFocus ? 2 : 0; border.color: root.s.accent
                     }
                     contentItem: Text {
@@ -221,38 +229,58 @@ Rectangle {
             text: appLanguage.text("오버레이 높이")
             color: root.s.ink; font.family: root.s.family; font.pixelSize: 11 * root.s.scale
         }
-        Row {
-            x: 12 * root.s.scale; y: 98 * root.s.scale; spacing: 8 * root.s.scale
-            Button {
-                id: shorter
-                objectName: "shorter"
-                width: 32 * root.s.scale; height: 28 * root.s.scale
-                enabled: root.s.canShorten || false; text: "−"
-                Accessible.name: appLanguage.text("높이 줄이기")
-                onPressed: root.presentation.startInteraction()
-                onClicked: root.presentation.changeHeight(-80)
-                background: Rectangle { radius: 5 * root.s.scale; color: root.s.ink; opacity: shorter.enabled ? (shorter.hovered ? 0.12 : 0.06) : 0.025; border.width: shorter.visualFocus ? 2 : 0; border.color: root.s.accent }
-                contentItem: Text { text: shorter.text; color: root.s.ink; opacity: shorter.enabled ? 1 : 0.35; font.pixelSize: 16 * root.s.scale; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+        Slider {
+            id: heightSlider
+            objectName: "heightSlider"
+            x: 12 * root.s.scale; y: 98 * root.s.scale
+            width: 170 * root.s.scale; height: 28 * root.s.scale
+            from: 480; to: 1440; stepSize: 1
+            value: root.preferredHeight
+            enabled: root.s.canAdjustHeight || false
+            padding: 5 * root.s.scale; hoverEnabled: true
+            focusPolicy: Qt.StrongFocus
+            Accessible.name: appLanguage.text("오버레이 높이")
+            Accessible.description: Math.round(value) + " px"
+            onPressedChanged: {
+                if (pressed) { root.presentation.startInteraction(); forceActiveFocus(Qt.MouseFocusReason); }
+                else root.presentation.finishHeight(Math.round(value));
             }
-            Text {
-                width: 156 * root.s.scale; height: 28 * root.s.scale
-                text: root.s.displayedHeight === root.s.heightValue ? root.s.heightValue + " px" : root.s.displayedHeight + " / " + root.s.heightValue + " px"
-                color: root.s.ink; font.family: root.s.family; font.pixelSize: 11 * root.s.scale
-                verticalAlignment: Text.AlignVCenter; horizontalAlignment: Text.AlignHCenter
-                HoverHandler { id: heightHover }
-                UiToolTip { visible: heightHover.hovered; text: appLanguage.text(root.s.canAdjustHeight ? "표시 높이 / 설정 높이" : "하위 에이전트가 있을 때 높이를 조절합니다.") }
+            onMoved: {
+                root.presentation.previewHeight(Math.round(value));
+                if (!pressed) root.presentation.finishHeight(Math.round(value));
             }
-            Button {
-                id: taller
-                objectName: "taller"
-                width: 32 * root.s.scale; height: 28 * root.s.scale
-                enabled: root.s.canLengthen || false; text: "+"
-                Accessible.name: appLanguage.text("높이 늘리기")
-                onPressed: root.presentation.startInteraction()
-                onClicked: root.presentation.changeHeight(80)
-                background: Rectangle { radius: 5 * root.s.scale; color: root.s.ink; opacity: taller.enabled ? (taller.hovered ? 0.12 : 0.06) : 0.025; border.width: taller.visualFocus ? 2 : 0; border.color: root.s.accent }
-                contentItem: Text { text: taller.text; color: root.s.ink; opacity: taller.enabled ? 1 : 0.35; font.pixelSize: 16 * root.s.scale; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+            background: Rectangle {
+                x: heightSlider.leftPadding; y: heightSlider.height / 2 - height / 2
+                width: heightSlider.availableWidth; height: 3 * root.s.scale; radius: root.s.scale
+                color: root.s.meta; opacity: heightSlider.enabled ? 0.45 : 0.2
+                Rectangle {
+                    width: heightSlider.visualPosition * parent.width; height: parent.height; radius: parent.radius
+                    color: root.s.accent
+                }
             }
+            handle: Rectangle {
+                x: heightSlider.leftPadding + heightSlider.visualPosition * (heightSlider.availableWidth - width)
+                y: heightSlider.height / 2 - height / 2
+                width: 12 * root.s.scale; height: width; radius: width / 2
+                color: root.s.accent; opacity: heightSlider.enabled ? 1 : 0.35
+                Rectangle {
+                    anchors.centerIn: parent; width: 22 * root.s.scale; height: width; radius: width / 2
+                    color: root.s.accent
+                    opacity: heightSlider.pressed ? 0.18 : heightSlider.hovered ? 0.12 : 0
+                }
+                Rectangle {
+                    anchors.fill: parent; anchors.margins: -4 * root.s.scale
+                    visible: heightSlider.visualFocus; radius: width / 2; color: "transparent"
+                    border.width: 2 * root.s.scale; border.color: root.s.accent
+                }
+            }
+        }
+        Text {
+            x: 188 * root.s.scale; y: 98 * root.s.scale
+            width: 60 * root.s.scale; height: 28 * root.s.scale
+            text: Math.round(heightSlider.value) + " px"
+            color: root.s.ink; font.family: root.s.family; font.pixelSize: 11 * root.s.scale
+            horizontalAlignment: Text.AlignRight; verticalAlignment: Text.AlignVCenter
         }
     }
 }

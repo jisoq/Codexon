@@ -166,7 +166,7 @@ def test_filled_line_keeps_missing_call_slot_and_does_not_bridge_it(key):
 
 
 @pytest.mark.parametrize('field', ['model', 'effort', 'mode', 'transport'])
-def test_speed_line_keeps_global_adjacency_when_request_condition_changes(field):
+def test_speed_line_keeps_agent_continuity_when_request_condition_changes(field):
     from cachemonitor.overlay_monitor import chart_segments
     first = dict(output_speed=10, model='model', effort='high',
                  mode='Standard', transport='WebSocket')
@@ -233,20 +233,116 @@ def test_chart_style_change_preserves_selected_call_and_finance(column_controlle
         assert model.data['main_usage'] == own
 
 
-def test_length_buttons_and_chart_style_preferences_survive_restart(column_controller):
+def test_continuous_height_and_chart_style_preferences_survive_restart(column_controller,monkeypatch):
     from cachemonitor.overlay import OverlayController
+    from PySide6.QtCore import QAbstractAnimation
     controller = column_controller
+    monkeypatch.setattr(controller,'refresh',lambda:None)
     controller.set_preferred_height(720)
-    controller.change_length(80)
-    assert controller.preferred_height == 800
-    controller.change_length(-80)
+    controller.preview_height(793)
+    controller.preview_height(827)
     assert controller.preferred_height == 720
+    controller.flush_height()
+    assert controller.preferred_height == 827
+    assert controller.settings.value('overlay/height',type=int)==720
+    assert controller.height_animation.state()!=QAbstractAnimation.State.Running
+    controller.finish_height(831)
+    assert controller.preferred_height == 831
+    assert not controller.height_timer.isActive()
     controller.set_chart_style('filled-line')
     controller.settings.sync()
     restored = OverlayController(controller.settings, native_enabled=False)
     try:
-        assert restored.preferred_height == 720
+        assert restored.preferred_height == 831
         assert restored.chart_style == 'filled-line'
         assert restored.widget.content_model.chart_style == 'filled-line'
     finally:
         restored.stop()
+
+
+@pytest.mark.parametrize('apply_preview',[False,True])
+def test_closing_height_controls_cancels_pending_drag_and_ignores_late_release(column_controller,monkeypatch,apply_preview):
+    controller=column_controller;refreshes=[]
+    monkeypatch.setattr(controller,'refresh',lambda:refreshes.append(controller.preferred_height))
+    controller.set_preferred_height(720)
+    controller.preview_height(793)
+    if apply_preview:controller.flush_height()
+    applied=controller.preferred_height
+    controller.preview_height(827)
+    before=list(refreshes)
+    controller.close_popup()
+    assert not controller.height_timer.isActive() and controller._pending_height is None
+    assert not controller._height_adjusting
+    assert controller.settings.value('overlay/height',type=int)==applied
+    controller.finish_height(827)
+    controller.flush_height()
+    assert controller.preferred_height==applied and refreshes==before
+
+
+@pytest.mark.parametrize('key', ['cost', 'output_speed', 'reasoning'])
+def test_filled_line_connects_only_same_agent_and_preserves_interleaved_slots(key):
+    from cachemonitor.overlay_monitor import chart_segments
+    rows=[dict(home='home',sid=agent,output=100,**{key:value})
+          for agent,value in [('a',1),('b',2),('a',3),('b',4),('a',None),('b',5),('a',6),('a',7)]]
+    assert chart_segments(rows,key)==(((0,1),(2,3)),((1,2),(3,4)),((3,4),(5,5)),((6,6),(7,7)))
+
+
+def test_optional_status_moves_content_without_reserving_an_empty_row():
+    from cachemonitor.overlay_layout import ColumnLayout
+    absent=ColumnLayout.create(has_subagents=True)
+    present=ColumnLayout.create(has_subagents=True,has_status=True)
+    shift=present.total-absent.total
+    assert shift>0
+    assert absent.header<absent.total<present.total
+    assert present.status<present.total<present.charts[0]
+    assert all(after-before==pytest.approx(shift) for before,after in zip(absent.charts,present.charts))
+    assert present.main-absent.main==pytest.approx(shift)
+    assert present.sub_y-absent.sub_y==pytest.approx(shift)
+
+
+def test_notice_keeps_status_available_on_heartbeat_without_usage(column_model):
+    column_model.set_content(None,'기록 확인 중')
+    assert column_model.notice_card() and column_model.state['totalRowVisible']
+    assert column_model.heartbeat_state()['mode']=='idle'
+    assert column_model.monitor_links()[0]['tooltip']==column_model.status_detail()
+    column_model.set_content(summary())
+    assert column_model.notice_card() is None and column_model.state['totalRowVisible']
+
+
+def test_synthetic_preview_keeps_active_collection_fresh_after_long_idle(column_controller,monkeypatch):
+    import time
+    from types import SimpleNamespace
+    from tools.preview_overlay import Preview,synthetic_snapshot
+    controller=column_controller
+    snapshot=synthetic_snapshot('multiagent')
+    before=deepcopy(snapshot['overlay_sessions'])
+    preview=SimpleNamespace(args=SimpleNamespace(snapshot=None),snapshot=snapshot,
+                            controller=controller,selected='preview-main',hwnd=0)
+    started=time.time()
+    for elapsed in (31,3600):
+        monkeypatch.setattr(time,'time',lambda:started+elapsed)
+        Preview.poll(preview)
+        data,note=controller.content()
+        assert not note and not data['_collection']['delayed']
+        assert data['active_requests']==3
+        assert snapshot['overlay_sessions']==before
+
+
+def test_agent_heartbeats_follow_own_requests_not_latest_call_or_aggregate(column_model):
+    from tools.preview_overlay import synthetic_snapshot
+    data=next(row for row in synthetic_snapshot('multiagent')['overlay_sessions'] if row['id']=='preview-main')
+    column_model.set_content(data)
+    assert column_model.state['mainHeartbeats'][0]['mode']=='active'
+    groups={group['key']:group['id'] for group in column_model.detail_groups()}
+    indicators=column_model.state['detailHeartbeats']
+    assert {groups[item['id']] for item in indicators if item['mode']=='active'}=={'preview-agent-2','preview-agent-5'}
+    assert sum(item['mode']=='idle' for item in indicators)==4
+    changed=deepcopy(data)
+    changed['main_usage']['request_state']='완료'
+    for agent in changed['subagent_finance']['agents']:
+        agent['request_state']='진행' if agent['id']=='preview-agent-1' else '완료'
+    changed['active_requests']=1
+    column_model.set_content(changed)
+    assert column_model.state['mainHeartbeats'][0]['mode']=='idle'
+    assert {groups[item['id']] for item in column_model.state['detailHeartbeats'] if item['mode']=='active'}=={'preview-agent-1'}
+    assert column_model.rows()==data['recent']

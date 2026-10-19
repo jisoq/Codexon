@@ -86,9 +86,7 @@ class OverlayController(QObject):
         self.header=OverlayChrome('header');self.toolbar=OverlayChrome('toolbar');self.icon=OverlayChrome('icon');self.actions=OverlayChrome('actions')
         self.detail=OverlayDetail(self.widget.content_model)
         self.links=OverlayLinks(self.widget.content_model)
-        content.agent_focus_requested.connect(self.focus_agent)
         self.links.view.navigationRequested.connect(self.navigation_requested)
-        self.links.view.callSelected.connect(self.pin_call)
         self.actions.view.detailPressed.connect(self.capture_detail)
         self.actions.view.detailClicked.connect(self.activate_detail)
         self.detail.view.navigationRequested.connect(self.navigation_requested)
@@ -133,6 +131,12 @@ class OverlayController(QObject):
         self.actions.settings_toggle.connect(self.toggle_settings)
         self.toolbar.chart_style_changed.connect(self.set_chart_style)
         self.toolbar.height_changed.connect(self.change_length)
+        self.height_timer=QTimer(self)
+        self.height_timer.setSingleShot(True);self.height_timer.setInterval(40)
+        self.height_timer.timeout.connect(self.flush_height)
+        self._pending_height=None;self._height_adjusting=False
+        self.toolbar.height_previewed.connect(self.preview_height)
+        self.toolbar.height_finished.connect(self.finish_height)
         self.icon.restore.connect(self.restore_panel)
         self.toolbar.opacity_changed.connect(self.set_opacity)
         for control in self.chrome:
@@ -191,13 +195,6 @@ class OverlayController(QObject):
         from .overlay_chrome import OverlayWindowStack
         self.window_stack=OverlayWindowStack(self)
         if self.native and self.enabled: self.timer.start(1000)
-
-    def pin_call(self,value):
-        target,snapshot=value
-        content=self.widget.content_model
-        if snapshot and any(content.call_id(r)==content.call_id(snapshot) for r in content.rows()):
-            self.pending_record=None;content.pin_call(content.call_id(snapshot))
-
 
     def capture_detail(self):
         c=self.widget.content_model;data=c.data or {}
@@ -427,14 +424,6 @@ class OverlayController(QObject):
             self.widget.content_model.sync_details();self.widget.content_model.update()
         return dict(enabled=True,reason='')
 
-    def focus_agent(self,kind):
-        if kind=='sub' and self.detail.isVisible():self.detail.begin_interaction()
-        elif kind=='main' and self.links.isVisible():
-            self.links.begin_interaction()
-            from .overlay_chrome import named_item
-            item=named_item(self.links.quick.rootObject(),'nav-main-detail')
-            if item is not None:item.forceActiveFocus(Qt.OtherFocusReason)
-
     def forward_wheel(self,event):
         target=self.target_state.get('target')
         if self.native and target:self.native.forward_wheel(target['hwnd'],event.angleDelta(),event.globalPosition(),event.modifiers())
@@ -493,14 +482,32 @@ class OverlayController(QObject):
         self.toolbar.view.put(chartStyle=value)
         self.changed.emit()
 
-    def set_preferred_height(self,value):
+    def set_preferred_height(self,value,*,persist=True):
         self.preferred_height=max(480,min(1440,int(value)))
-        self.settings.setValue('overlay/height',self.preferred_height)
+        if persist:self.settings.setValue('overlay/height',self.preferred_height)
         self.widget.content_model.preferred_height=self.preferred_height
         self.widget.content_model.sync_details()
         self.changed.emit();self.refresh()
 
     def change_length(self,delta):self.set_preferred_height(self.preferred_height+int(delta))
+
+    def preview_height(self,value):
+        self._height_adjusting=True
+        self.height_animation.stop()
+        self._pending_height=max(480,min(1440,int(value)))
+        if not self.height_timer.isActive():self.height_timer.start()
+
+    def flush_height(self):
+        value,self._pending_height=self._pending_height,None
+        if value is not None and value!=self.preferred_height:self.set_preferred_height(value,persist=False)
+
+    def finish_height(self,value):
+        if not self._height_adjusting:return
+        self.height_timer.stop();self._pending_height=None
+        self._height_adjusting=True
+        self.height_animation.stop()
+        try:self.set_preferred_height(value)
+        finally:self._height_adjusting=False
 
     def advance_height(self,value):
         self._animated_height=round(float(value))
@@ -784,6 +791,11 @@ class OverlayController(QObject):
 
 
     def close_popup(self):
+        if self._height_adjusting:
+            self.height_timer.stop();self._pending_height=None
+            self._height_adjusting=False
+            self.settings.setValue('overlay/height',self.preferred_height)
+            self.toolbar.view.put(heightValue=self.preferred_height)
         self.popup_open=False
         self.toolbar.hide()
         if hasattr(self,'input_timer'):self.input_timer.stop()
@@ -960,7 +972,7 @@ class OverlayController(QObject):
                 self.height_animation.stop();self._height_context=context;self._height_target=monitor[3]
             elif monitor[3]!=self._height_target:
                 self.height_animation.stop();self._height_target=monitor[3]
-                if (not self.drag_context and self.widget.isVisible() and self.monitor_geometry and not self.reduced_motion
+                if (not self.drag_context and not self._height_adjusting and self.widget.isVisible() and self.monitor_geometry and not self.reduced_motion
                         and abs(self.monitor_geometry[3]-monitor[3])<=round(40*scale*dpi/96)):
                     self.height_animation.setStartValue(self.monitor_geometry[3]);self.height_animation.setEndValue(monitor[3])
                     self._configuring_height=True
@@ -1039,8 +1051,8 @@ class OverlayController(QObject):
             else:self.links.hide()
             from .overlay_monitor import header_layout,header_status
             header_width=HEADER_WIDTH
-            place(self.header,(HEADER_X,8,header_width,28),monitor)
-            self.actions_geometry=place(self.actions,(ACTIONS_X,13,78,30),monitor)
+            place(self.header,(HEADER_X,10,header_width,28),monitor)
+            self.actions_geometry=place(self.actions,(ACTIONS_X,9,78,30),monitor)
             if self.popup_open:
                 # Align below the header. The monitor already guarantees enough
                 # interior width; clamping also handles rounded native pixels.
@@ -1069,6 +1081,7 @@ class OverlayController(QObject):
         self.stopped = True
         self.window_stack.close()
         self.height_animation.stop()
+        self.height_timer.stop()
         self.view_animation.stop()
         self.timer.stop(); self.input_timer.stop(); self.hide_all()
         if self.tracker: self.tracker.stop()

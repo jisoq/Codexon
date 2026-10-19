@@ -39,51 +39,46 @@ class PreparedPublisher:
     def adopt(self,store,changed,removed=()):
         if self.token==store.token:
             return
-        content_changed=set()
+        # Admit the whole small delta and order before replacing retained state.
+        # Failures leave the previous token and its content references coherent.
+        owners=self.owners.copy();choices=self.choices.copy();alerts=self.alerts.copy()
+        weights=self.owner_weights.copy();owner_bytes=self.owner_bytes
+        pending_alerts=self.pending_alerts.copy();content_changed=set()
         with store.read_current(seconds=60) as view:
             if not view.db.execute('SELECT ready FROM meta WHERE singleton=1').fetchone()[0]:
                 raise NotReady('cannot deliver a partial owner conversion')
             if self.token is None:
-                current={row['owner']:row for row in pages(view.catalog)}
-                changed=set(current)
-                removed=set()
+                entries=((row['owner'],row) for row in pages(view.catalog))
+                removed=()
             else:
-                current={key:view.owner(*key) for key in changed}
+                entries=((tuple(key),view.owner(*key)) for key in changed)
             for key in removed:
-                self.owners.pop(key,None);self.choices.pop(key,None);self.alerts.pop(key,None)
-                self.owner_bytes-=self.owner_weights.pop(key,0)
-            for key,entry in current.items():
+                key=tuple(key)
+                owners.pop(key,None);choices.pop(key,None);alerts.pop(key,None)
+                owner_bytes-=weights.pop(key,0)
+            for key,entry in entries:
                 if entry is None:
                     raise NotReady('published change references an absent prepared owner')
                 entry={name:value for name,value in entry.items() if name!='owner'}
-                previous=self.owners.get(key)
+                previous=owners.get(key)
                 if previous is not None and (
                         {name:value for name,value in previous.items() if name!='owner_ordinal'} ==
                         {name:value for name,value in entry.items() if name!='owner_ordinal'}):
-                    # Traversal order alone does not change any call, summary,
-                    # choice or alert. Retain the verified content references.
-                    difference=sys.getsizeof(entry['owner_ordinal'])-sys.getsizeof(previous['owner_ordinal'])
-                    if self.owner_bytes+difference>self.STATE_BYTES:
-                        raise CapacityExceeded('prepared publication metadata exceeds its retention budget')
-                    self.owner_bytes+=difference;self.owner_weights[key]+=difference
-                    previous['owner_ordinal']=entry['owner_ordinal']
+                    # Order alone retains every verified content reference.
                     continue
-                old_alerts=self.alerts.get(key,{})
+                old_alerts=alerts.get(key,{})
                 new_alerts=view.derived(*key,'model_alerts') or {}
-                choices=view.derived(*key,'choices') or {}
-                weight=_weight((key,entry,choices,new_alerts),self.STATE_BYTES)
-                total=self.owner_bytes-self.owner_weights.get(key,0)+weight
-                if total>self.STATE_BYTES:
+                owner_choices=view.derived(*key,'choices') or {}
+                weight=_weight((key,entry,owner_choices,new_alerts),self.STATE_BYTES)
+                owner_bytes=owner_bytes-weights.get(key,0)+weight
+                if owner_bytes>self.STATE_BYTES:
                     raise CapacityExceeded('prepared publication metadata exceeds its retention budget')
-                self.owner_bytes=total;self.owner_weights[key]=weight
-                self.owners[key]=entry
-                self.choices[key]=choices
-                self.alerts[key]=new_alerts
+                weights[key]=weight;owners[key]=entry
+                choices[key]=owner_choices;alerts[key]=new_alerts
                 content_changed.add(key)
                 if entry['metadata'].get('_internal_review'):
                     continue
-                # Corrections that resolve a prior confirmed alert still emit
-                # the exact corrected row, selected by key in this generation.
+                # A resolved alert still emits the corrected selected row.
                 keys=[identity for identity in old_alerts.keys()|new_alerts.keys()
                       if old_alerts.get(identity)!=new_alerts.get(identity)]
                 for identity in keys:
@@ -92,11 +87,33 @@ class PreparedPublisher:
                         row=view.record(*key,identity)
                         if row is None:continue
                         signature=tuple(row.get(name) for name in MODEL_KEYS)
-                    self.pending_alerts[(key,identity)]=dict(home=key[0],sid=key[1],
+                    pending_alerts[(key,identity)]=dict(home=key[0],sid=key[1],
                         title=entry['metadata'].get('title',''),**dict(zip(MODEL_KEYS,signature)))
-        self.changed.update(content_changed)
-        self.token=store.token
-        _weight((self.owners,self.choices,self.alerts,self.pending_alerts),self.STATE_BYTES)
+            order={};order_bytes=0
+            for entry in pages(view.ordering):
+                key,ordinal=entry['owner'],entry['owner_ordinal']
+                order_bytes+=_weight((key,ordinal),self.STATE_BYTES)+160
+                if order_bytes>self.STATE_BYTES:
+                    raise CapacityExceeded('prepared order metadata exceeds its retention budget')
+                if key in order:
+                    raise NotReady('catalog order repeats a publication owner')
+                order[key]=ordinal
+            if order.keys()!=owners.keys():
+                raise NotReady('catalog order does not match adopted publication owners')
+            for key,ordinal in order.items():
+                previous=owners[key]['owner_ordinal']
+                difference=sys.getsizeof(ordinal)-sys.getsizeof(previous)
+                owner_bytes+=difference;weights[key]+=difference
+                if ordinal!=previous:
+                    owners[key]=dict(owners[key],owner_ordinal=ordinal)
+            if owner_bytes>self.STATE_BYTES:
+                raise CapacityExceeded('prepared order metadata exceeds its retention budget')
+            _weight((owners,choices,alerts,pending_alerts),self.STATE_BYTES)
+            token=view.token
+        self.owners=owners;self.choices=choices;self.alerts=alerts
+        self.owner_weights=weights;self.owner_bytes=owner_bytes
+        self.pending_alerts=pending_alerts;self.changed.update(content_changed)
+        self.token=token
 
     def _filter_choices(self,snapshot,sessions):
         counts=Counter();transports=set();transport_sources=set();policies=set()

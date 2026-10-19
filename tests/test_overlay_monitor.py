@@ -77,7 +77,7 @@ def test_active_requests_update_heartbeat_without_changing_layout(app):
         assert model.layout() == layout
 
 
-def test_collection_status_remains_above_charts_and_main_summary(app, monkeypatch):
+def test_collection_status_is_hover_only_and_keeps_summary_data(app, monkeypatch):
     model = OverlayContent()
     data = summary(misses=1)
     drawn = capture_text(monkeypatch)
@@ -86,8 +86,10 @@ def test_collection_status_remains_above_charts_and_main_summary(app, monkeypatc
         drawn.clear()
         render(model)
         status = [item for item in drawn if item[0].startswith(note)]
-        assert len(status) == 1
-        assert status[0][2] < model.layout()['charts'][0] < model.layout()['main']
+        assert not status
+        link=next(item for item in model.monitor_links() if item['id']=='tip-status')
+        assert note in link['tooltip'] and link['interaction']=='tooltip'
+        assert link['y'] < model.layout()['charts'][0] < model.layout()['main']
         assert model.data['cache_misses'] == data['cache_misses']
         model.monitor_action('main-detail')
         assert any('캐시 미적중' in str(item[0]) for item in model.main_items())
@@ -170,8 +172,8 @@ def test_agent_name_markers_share_chart_colors_after_sorting_and_rolling(app):
     model.set_content(data)
     colors = model.graph_colors(model.rows())
     def name_colors():
-        return {item[0]: item[8]['square'] for item in model.detail_items()
-                if item[8].get('kind') == 'single-line' and item[8].get('square')}
+        return {item[0]: item[8]['dot'] for item in model.detail_items()
+                if item[8].get('kind') == 'single-line' and item[8].get('dot')}
     names = name_colors()
     assert names == {row['title']: colors[(row['home'], row['id'])]
                      for row in data['subagent_finance']['agents']}
@@ -205,7 +207,7 @@ def test_waiting_cards_and_retained_values_are_distinct(app, monkeypatch):
     assert not model.freshness_text()
 
 
-def test_record_loading_moves_only_while_visible_and_checking(app, tmp_path):
+def test_heartbeat_animates_active_only_and_error_takes_priority(app, tmp_path):
     import time
     from PySide6.QtCore import QObject, QEventLoop
     from cachemonitor.overlay_view import SessionOverlay
@@ -220,20 +222,24 @@ def test_record_loading_moves_only_while_visible_and_checking(app, tmp_path):
         window.show()
         until(lambda: window.quick.rootObject() is not None)
         scene = window.quick.rootObject()
-        spinner = scene.findChild(QObject, 'overlay-record-loading')
-        animation = scene.findChild(QObject, 'overlay-record-loading-animation')
-        until(lambda: animation.property('running') and spinner.property('rotation') > 0)
-        first = window.grab().toImage()
-        until(lambda: window.grab().toImage() != first)
-        assert window.grab().save(str(tmp_path / 'record-loading.png'))
+        heartbeat = scene.findChild(QObject, 'overlayHeartbeat')
+        assert not heartbeat.property('blinking')
+        active=summary();active['active_requests']=2
+        window.set_content(active,dark=False)
+        until(lambda: heartbeat.property('blinking') and heartbeat.property('opacity')<.5)
+        ink=heartbeat.property('ink');assert ink.green()>ink.red() and ink.green()>ink.blue()
         window.hide()
-        until(lambda: not animation.property('running'))
+        until(lambda: not heartbeat.property('blinking'))
         window.show()
-        until(lambda: animation.property('running'))
-        for data, note in ((None, '수집 오류'), (None, '호출 기록 없음'), (summary(), '')):
-            window.set_content(data, note)
-            until(lambda: not animation.property('running'))
-            assert not spinner.property('visible')
+        until(lambda: heartbeat.property('blinking'))
+        window.set_content(active,'수집 오류',dark=False)
+        until(lambda: not heartbeat.property('blinking') and heartbeat.property('opacity')==1)
+        assert window.content_model.state['heartbeatMode']=='error'
+        ink=heartbeat.property('ink');assert ink.red()>ink.green() and ink.red()>ink.blue()
+        assert window.grab().save(str(tmp_path / 'heartbeat-error.png'))
+        window.set_content(summary(),dark=False)
+        until(lambda: window.content_model.state['heartbeatMode']=='idle')
+        assert not heartbeat.property('blinking')
         assert not window.qml_errors
     finally:
         window.close()
@@ -279,11 +285,11 @@ def test_model_labels_require_confirmed_response_and_highlight_only_mismatch():
     from cachemonitor.overlay_monitor import model_text
     row = dict(model='gpt-example', requested_model='gpt-example', response_model='gpt-example',
                response_status='completed', model_match='일치')
-    assert model_text(row) == ('gpt-example', ' (일치)', False)
+    assert model_text(row) == ('gpt-example', '', False)
     row.update(response_model='gpt-other', model_match='불일치', model_alert_confirmed=True)
-    assert model_text(row) == ('gpt-example', ' (응답: gpt-other)', True)
-    assert model_text({**row, 'observation_missing': True}) == ('gpt-example', ' (확인 불가)', False)
-    assert model_text(dict(model='gpt-config', model_setting=True)) == ('설정: gpt-config', ' (확인 불가)', False)
+    assert model_text(row) == ('gpt-example', ' (불일치: gpt-other)', True)
+    assert model_text({**row, 'observation_missing': True}) == ('gpt-example', '', False)
+    assert model_text(dict(model='gpt-config', model_setting=True)) == ('설정: gpt-config', '', False)
 
 
 @pytest.mark.parametrize('changes,expected', [
@@ -294,72 +300,14 @@ def test_reasoning_preserves_zero_and_rejects_missing_or_conflicting_values(chan
     assert graph_value(dict(output=100, reasoning=40) | changes, 'reasoning') == expected
 
 
-def test_three_chart_lanes_share_call_selection_and_cost_cache_value(app, monkeypatch):
-    model = OverlayContent()
-    data = summary(count=3)
-    data['recent'][0].update(cost=.25, cache_rate=75, output_speed=12, reasoning=0)
-    data['recent'][1]['reasoning'] = None
+def test_three_chart_lanes_show_latest_values_without_selection_regions(app,monkeypatch):
+    model=OverlayContent();data=summary(count=3)
+    data['recent'][-1].update(cost=.25,cache_rate=75,output_speed=12,reasoning=0)
     model.set_content(data)
-    model.pin_call(model.call_id(model.rows()[0]))
-    drawn = capture_text(monkeypatch)
-    render(model)
-    layout = model.layout()
-    assert len(CHARTS) == len(layout['charts']) == 3
-    chart_labels = {text for text, x, y in drawn if y in layout['charts']}
-    assert all(label in chart_labels for key, label in CHARTS)
+    drawn=capture_text(monkeypatch);render(model);layout=model.layout()
+    assert len(CHARTS)==len(layout['charts'])==3
+    chart_labels={text for text,x,y in drawn if y in layout['charts']}
+    assert all(label in chart_labels for key,label in CHARTS)
     assert any(money(.25) in text and percent(75) in text for text in chart_labels)
     assert '12.0 tps' in chart_labels
-    links = [link for link in model.monitor_links() if link.get('interaction') == 'select']
-    assert len(links) == len(model.rows())
-    assert all(link['y'] == layout['charts'][0] for link in links)
-    assert all(link['y'] + link['height'] == layout['charts'][-1] + layout['chart_height'] for link in links)
-
-
-def test_hover_repeats_across_columns_refreshes_and_leave(app):
-    from PySide6.QtCore import QEvent, QPointF, Qt
-    from PySide6.QtGui import QMouseEvent
-    from cachemonitor.overlay_chrome import OverlayLinks
-    model = OverlayContent()
-    model.set_content(summary())
-    host = OverlayLinks(model)
-    try:
-        host.resize(model.panel_width(), model.panel_height())
-        host.sync()
-        assert host.quick.hasMouseTracking()
-        for repeat in range(3):
-            for index in (0, 5, 11, 3):
-                link = next(link for link in model.monitor_links() if link['id'] == 'call-' + str(index))
-                point = QPointF(link['x'] + link['width'] / 2, link['y'] + link['height'] / 2)
-                event = QMouseEvent(QEvent.MouseMove, point, point, Qt.NoButton, Qt.NoButton, Qt.NoModifier)
-                QApplication.sendEvent(host.quick, event)
-                assert model.inspected_call == model.call_id(model.rows()[index])
-                model.set_content(summary(count=13 + repeat))
-                host.sync()
-                assert model.inspected_call == model.call_id(model.rows()[index])
-            QApplication.sendEvent(host.quick, QEvent(QEvent.Leave))
-            assert model.inspected_call is None
-    finally:
-        host.close()
-
-
-def test_graph_pin_toggle_refresh_and_window_expiry(app):
-    from cachemonitor.overlay_chrome import NavigationModel
-    model = OverlayContent()
-    model.set_content(summary(count=20))
-    latest = model.selected_id
-    model.pin_call(latest)
-    model.set_content(summary(count=21))
-    assert model.graph_pinned and model.selected_id == latest and not model.follow_latest
-    NavigationModel(model).inspectCall('call-0')
-    assert model.selected_id == latest
-    model.pin_call(latest)
-    assert not model.graph_pinned and model.selected_id == model.call_id(model.rows()[-1])
-    first = model.call_id(model.rows()[0])
-    model.pin_call(first)
-    model.pin_call(first, toggle=False)
-    assert model.graph_pinned
-    model.set_content(summary(count=22))
-    assert not model.graph_pinned and model.follow_latest
-    model.pin_call(model.call_id(model.rows()[0]))
-    model.monitor_action('latest')
-    assert not model.graph_pinned and model.selected_id == model.call_id(model.rows()[-1])
+    assert not any(link.get('interaction')=='select' for link in model.monitor_links())

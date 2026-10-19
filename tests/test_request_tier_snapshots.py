@@ -1,4 +1,5 @@
 import json
+import pytest
 
 from cachemonitor.core import Session, stamp
 from cachemonitor.index import UsageIndex, sanitized
@@ -49,13 +50,13 @@ def test_complete_default_snapshot_prices_future_calls_without_guessing_partial_
 def test_applied_settings_are_historical_scoped_and_do_not_relabel_active_turn():
     s=Session(TID,'h')
     records=[event('turn_context',10000,turn_id='first',model='m'),
-             setting(10001),usage('before',time=10002),
+             usage('before',time=10001),setting(10002),
              event('turn_context',10003,turn_id='second',model='m'),usage('fast',time=10004),
              setting(10005,'default','another-thread'),usage('still-fast',time=10006),
              setting(10007,None),event('turn_context',10008,turn_id='third',model='m'),usage('cleared',time=10009)]
     for record in records:
         if record['type']=='token_usage_record':
-            record['payload']['turn_id']={10002:'first',10004:'second',10006:'second',10009:'third'}[int(stamp(record['timestamp']))]
+            record['payload']['turn_id']={10001:'first',10004:'second',10006:'second',10009:'third'}[int(stamp(record['timestamp']))]
         s.consume(sanitized(record),10010)
     assert [r.service_tier for r in s.requests]==['미확인','priority','priority','Standard']
     assert s.requests[-1].request_mode_action=='clear'
@@ -63,14 +64,15 @@ def test_applied_settings_are_historical_scoped_and_do_not_relabel_active_turn()
     assert 'PRIVATE' not in json.dumps(sanitized(setting(10001)))
 
 
-def test_turn_context_pairs_with_applied_snapshot_at_the_same_timestamp():
+@pytest.mark.parametrize('snapshot_delay',[0,.001])
+def test_turn_context_pairs_with_immediately_following_applied_snapshot(snapshot_delay):
     from cachemonitor.analysis_engine import AnalysisEngine
     from cachemonitor.overlay_data import OverlaySummaries
     s=Session(TID,'h')
     records=[event('turn_context',10000,turn_id='first',model='gpt-6-astra'),
-             setting(10000,'default'),usage('first',time=10001),
+             setting(10000+snapshot_delay,'default'),usage('first',time=10001),
              event('turn_context',10002,turn_id='fast',model='gpt-6-astra'),
-             setting(10002),usage('fast',time=10003),
+             setting(10002+snapshot_delay),usage('fast',time=10003),
              setting(10004,None),usage('still-fast',time=10005),
              event('turn_context',10006,turn_id='override',model='gpt-6-astra',service_tier='priority'),
              complete_setting(10006),usage('override',time=10007)]
@@ -86,6 +88,50 @@ def test_turn_context_pairs_with_applied_snapshot_at_the_same_timestamp():
     overlay=OverlaySummaries().collect(engine)[0]
     assert overlay['priced']==4 and overlay['latest']['mode']=='Fast'
     assert overlay['cost'] is not None
+
+
+@pytest.mark.parametrize('first_snapshot',[
+    setting(10000.001,'priority','another-thread'),
+    setting(9999.999,'priority'),
+])
+def test_snapshot_pairing_rejects_wrong_thread_and_reversed_time(first_snapshot):
+    s=Session(TID,'h')
+    records=[event('turn_context',10000,turn_id='first',model='gpt-6-astra'),
+             first_snapshot,setting(10000.002,'default'),usage('first',time=10001)]
+    for record in records:
+        if record['type']=='token_usage_record':record['payload']['turn_id']='first'
+        s.consume(sanitized(record),10002)
+    assert s.requests[0].service_tier=='미확인'
+    assert s.requests[0].request_mode_source=='unknown'
+
+
+@pytest.mark.parametrize('intervening',[
+    None,
+    event('event_msg',10001.0005,type='user_message',message='PRIVATE'),
+    event('response_item',10001.0005,type='message',content='PRIVATE'),
+])
+def test_index_snapshot_pairing_requires_next_raw_record(tmp_path,monkeypatch,intervening):
+    from cachemonitor.analysis_engine import AnalysisEngine
+    from cachemonitor.overlay_data import OverlaySummaries
+    monkeypatch.setattr('cachemonitor.event_stream.EventLines.CHUNK',32)
+    home,path=fixture_home(tmp_path)
+    records=[event('turn_context',10001,turn_id='paired',model='gpt-6-astra')]
+    if intervening is not None:records.append(intervening)
+    records.extend([setting(10001.001,'default'),usage('paired-response',time=10002)])
+    records[-1]['payload'].update(turn_id='paired')
+    records[-1]['payload']['usage']['cache_write_input_tokens']=0
+    path.write_text(''.join(json.dumps(record)+'\n' for record in records),encoding='utf-8')
+    cache=tmp_path/'index.sqlite'
+    for _ in range(2):
+        index=UsageIndex([home],cache)
+        try:
+            snapshot=finish(index,10010)
+            engine=AnalysisEngine();engine.ingest(snapshot['sessions'])
+            overlay=OverlaySummaries().collect(engine)[0]
+            assert (overlay['latest']['cost'] is not None)==(intervening is None)
+            assert overlay['latest']['mode']==('Standard' if intervening is None else '미확인')
+            assert all('PRIVATE' not in str(row[0]) for row in index.db.execute('SELECT data FROM events'))
+        finally:index.close()
 
 
 def test_old_index_backfills_applied_settings_without_changing_token_counts(tmp_path,monkeypatch):
@@ -107,5 +153,5 @@ def test_old_index_backfills_applied_settings_without_changing_token_counts(tmp_
         after=next(r for r in finish(new,10010)['sessions'][0]['history'] if r['key']=='tier-r')
         assert after['service_tier']=='Standard'
         assert (after['input'],after['output'])==(before['input'],before['output'])
-        assert new.db.execute('pragma user_version').fetchone()[0]==5
+        assert new.db.execute('pragma user_version').fetchone()[0]==6
     finally:new.close()

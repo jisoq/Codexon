@@ -97,7 +97,7 @@ def test_tracker_finishes_backlog_and_observes_appends_without_heartbeat(tmp_pat
 @pytest.mark.skipif(sys.platform!='win32',reason='Owned native Windows windows')
 def test_auto_fallback_restores_preference_anchor_and_clickthrough(tmp_path):
     from cachemonitor.overlay_windows import WindowsOverlay
-    from cachemonitor.overlay_monitor import WIDTH,geometry
+    from cachemonitor.overlay_monitor import WIDTH,geometry,header_status
     from PySide6.QtCore import QEventLoop
     app=QApplication.instance() or QApplication([])
     host=QWidget();host.setWindowTitle('CacheMonitor owned resize test');host.resize(900,1000);host.show()
@@ -135,9 +135,10 @@ def test_auto_fallback_restores_preference_anchor_and_clickthrough(tmp_path):
         dpi=native.u.GetDpiForWindow(int(host.winId()));factor=dpi/96;gap=round(16*factor)
         m=controller.widget.content_model
         extra=m.main_detail_height()
-        full=round(geometry(m.data,preferred_height=720,main_detail_height=extra)['height']*controller.appearance.scale*factor)
-        minimum=round(geometry(m.data,preferred_height=0,main_detail_height=extra)['height']*controller.appearance.scale*factor)
-        compact=round(geometry(m.data,True,preferred_height=0,main_detail_height=extra)['height']*controller.appearance.scale*factor)
+        status=bool(header_status(m)[0])
+        full=round(geometry(m.data,has_status=status,preferred_height=720,main_detail_height=extra)['height']*controller.appearance.scale*factor)
+        minimum=round(geometry(m.data,has_status=status,preferred_height=0,main_detail_height=extra)['height']*controller.appearance.scale*factor)
+        compact=round(geometry(m.data,True,has_status=status,preferred_height=0,main_detail_height=extra)['height']*controller.appearance.scale*factor)
         height={'full':full+40,'compact':(minimum+compact)//2,'icon':compact//2}[mode]
         requested=(round(WIDTH*controller.appearance.scale*factor)+2*gap,height+2*gap)
         resize_frame(*requested)
