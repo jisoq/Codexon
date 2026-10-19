@@ -118,7 +118,8 @@ def test_charts_have_no_navigation_or_selection_hit_regions(layout_controller):
     assert not any(link.get('interaction')=='select' for link in links)
     chart_top=model.layout()['charts'][0]
     chart_bottom=model.layout()['charts'][-1]+model.layout()['chart_height']
-    assert all(link['y']+link['height']<=chart_top or link['y']>=chart_bottom for link in links)
+    chart_links=[link for link in links if link['y']+link['height']>chart_top and link['y']<chart_bottom]
+    assert chart_links and all(link['interaction']=='inspect' and not link.get('action') and not link.get('target') for link in chart_links)
     assert {link['id'] for link in links}.isdisjoint({'latest','focus-agent'})
 
 
@@ -214,6 +215,47 @@ def test_sub_scroll_keeps_main_charts_costs_and_selection_fixed(layout_controlle
         assert model.detailBody.scroll_offset == scroll.property('contentY')
         assert not controller.detail.qml_errors
     assert model.compact
+
+
+def test_chart_hover_inspects_values_without_click_selection_or_agent_changes(layout_controller):
+    from PySide6.QtCore import QPoint, QPointF, Qt, QEvent
+    from PySide6.QtGui import QEnterEvent, QMouseEvent
+    from PySide6.QtWidgets import QApplication
+    from PySide6.QtTest import QTest
+    from cachemonitor.overlay_chrome import named_item
+    from test_overlay_layout_controller import compact_frame
+    from tests.test_ui import wait_for_rendered
+    controller=layout_controller
+    model=publish(controller,family_summary(count=12,children=3))
+    controller.native.bounds=compact_frame(controller)
+    controller.refresh()
+    assert model.compact
+    navigated=[]
+    controller.links.view.navigationRequested.connect(navigated.append)
+    before=(model.selected_id,model.graph_pinned,model.main_expanded,set(model.expanded_groups),model.detail_items())
+    latest=model.latest_call();inspected=model.rows()[0]
+    assert model.call_id(inspected)!=model.call_id(latest)
+    def hover(point):
+        # The fake native placer intentionally leaves companion windows stacked.
+        # Deliver real hover events to the rendered chart's Quick surface.
+        quick=controller.links.quick;local=QPointF(point);global_pos=QPointF(quick.mapToGlobal(point))
+        QApplication.sendEvent(quick,QEnterEvent(local,local,global_pos))
+        QApplication.sendEvent(quick,QMouseEvent(QEvent.MouseMove,local,global_pos,Qt.NoButton,Qt.NoButton,Qt.NoModifier))
+    for style in ('bar','filled-line'):
+        model.chart_style=style;model.update()
+        for chart in range(3):
+            item=named_item(controller.links.quick.rootObject(),f'nav-inspect-{chart}-0')
+            wait_for_rendered(lambda:item is not None and item.isVisible() and item.width()>0)
+            point=item.mapToScene(QPointF(item.width()/2,item.height()/2)).toPoint()
+            hover(point)
+            wait_for_rendered(lambda:model.displayed_call()==inspected)
+            QTest.mouseClick(controller.links.quick,Qt.LeftButton,pos=point)
+            assert not navigated
+            assert before==(model.selected_id,model.graph_pinned,model.main_expanded,set(model.expanded_groups),model.detail_items())
+            assert model.latest_call()==latest
+            hover(QPoint(1,1))
+            wait_for_rendered(lambda:model.displayed_call()==latest)
+    assert not controller.links.qml_errors
 
 
 def test_sub_disclosure_changes_only_its_own_details(layout_controller):

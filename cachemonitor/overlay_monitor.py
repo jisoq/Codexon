@@ -160,8 +160,9 @@ def paint(d,m):
     d.text('전체 비용',MARGIN,g['total'],56,28,11,'secondary')
     total_width=m.heartbeat_state()['x']-MARGIN-56-6
     d.text(fitted_money(m.total_cost(),total_width,22,m.appearance.family),MARGIN+56,g['total'],total_width,28,22,weight=600)
-    displayed=m.latest_call()
+    displayed=m.displayed_call()
     for (key,label),y in zip(CHARTS,g['charts']):_chart(d,m,rows,key,label,y,g['chart_height'],displayed)
+    displayed=m.latest_call()
     y=g['main'];color=m.graph_colors(rows)[(data.get('home'),data.get('id'))]
     if m.has_subagents() and displayed and (displayed.get('home'),displayed.get('sid'))==(data.get('home'),data.get('id')):
         d.rect(MARGIN-3,y-2,SECTION_WIDTH+6,g['main_height'],color,5,alpha=.13)
@@ -188,4 +189,11 @@ def action_links(m):
 
 
 def links(m):
-    return [] if m.notice_card() else action_links(m)
+    if m.notice_card():return []
+    result=action_links(m);g=m.layout();rows=m.rows();step=SECTION_WIDTH/max(1,len(rows))
+    for chart,y in enumerate(g['charts']):
+        for index,row in enumerate(rows):
+            result.append(dict(id=f'inspect-{chart}-{index}',x=MARGIN+index*step,y=y+20,width=step,
+                height=g['chart_height']-20,interaction='inspect',hoverCall=m.call_id(row),
+                accessible=agent_label(m.data or {},row)))
+    return result

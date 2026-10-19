@@ -191,6 +191,16 @@ def verify(preview, output):
                 assert pulse.property('blinking') == (indicator['mode'] == 'active' and in_view)
             report['checks'].append(f'{theme}: individual activity indicators follow own requests and blink subtly')
             capture(f'{theme}-multiagent')
+            chart=rendered(c.links,'nav-inspect-0-0')
+            latest=model.latest_call();selection=model.selected_id
+            hover(c.links,point(c.links,chart))
+            wait(lambda:model.displayed_call()==model.rows()[0],'chart hover value')
+            capture(f'{theme}-chart-hover')
+            click(c.links,chart)
+            assert model.selected_id==selection and not model.graph_pinned
+            hover(c.links,QPoint(1,1))
+            wait(lambda:model.displayed_call()==latest,'chart hover leave')
+            report['checks'].append(f'{theme}: chart hover shows the inspected call; clicking never pins it')
             click(c.actions, rendered(c.actions, 'settingsButton'))
             wait(lambda: c.toolbar.isVisible(), 'settings popup')
             slider = rendered(c.toolbar, 'heightSlider')
@@ -277,8 +287,8 @@ def verify(preview, output):
                          'rendered newest subagent row')
                     if actor == 3:
                         capture(f'{theme}-fast-agent')
-                assert all(link['id'] in ('main-detail', 'collection') for link in model.monitor_links())
-            report['checks'].append(f'{theme}: next-call control cycles every actor, newest-first rows, stable scroll and no chart links')
+                assert all(link['id'] in ('main-detail', 'collection') or link['interaction']=='inspect' for link in model.monitor_links())
+            report['checks'].append(f'{theme}: next-call control cycles every actor, newest-first rows, stable scroll and hover-only charts')
             capture(f'{theme}-next-call')
             click(c.actions, rendered(c.actions, 'settingsButton'))
             click(c.toolbar, rendered(c.toolbar, 'chartStyle-filled-line'))

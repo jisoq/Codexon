@@ -299,10 +299,22 @@ class NavigationModel(Node):
     @Slot()
     def escapePanel(self):self.escapeRequested.emit()
     def link_state(self,links):
+        self.inspections={link['id']:link['hoverCall'] for link in links if link.get('hoverCall')}
         self.interactions={link['id']:link.get('interaction','navigate') for link in links}
         self.targets={link['id']:link['target'] for link in links if link.get('target')}
         self.actions={link['id']:link['action'] for link in links if link.get('action')}
         return [{k:v for k,v in link.items() if k!='target'} for link in links]
+    @Slot(str,bool)
+    def hoverLink(self,key,entered):
+        identity=getattr(self,'inspections',{}).get(key)
+        if identity is None:return
+        current=getattr(self.content,'inspected_call',None)
+        if entered:
+            if identity==current:return
+            self.content.inspected_call=identity
+        elif current==identity:self.content.inspected_call=None
+        else:return
+        self.content.update()
     @Slot(str)
     def captureNavigation(self,key):
         self.captured=self.targets.get(key) or getattr(self,'actions',{}).get(key)
