@@ -92,22 +92,28 @@ jobs:
           path: |
             cachemonitor/_cpu_native.pyd
             cachemonitor/_cpu_native.build.json
-          key: ${{ steps.native-key.outputs.key }}
+            cachemonitor/_cpu_native.notices.zip
+          key: ${{ steps.native-key.outputs.key }}-notices-${{ hashFiles('tools/collect_notices.py') }}
+          restore-keys: ${{ steps.native-key.outputs.key }}
       - name: Reuse or build and test the locked Rust extension
         run: python tools/build_native.py --reuse --test
+      - name: Prepare the matching Rust dependency notices
+        run: python tools/collect_notices.py --prepare-rust-artifact cachemonitor/_cpu_native.notices.zip
       - uses: actions/cache/save@v5
         if: steps.native-cache.outputs.cache-hit != 'true'
         with:
           path: |
             cachemonitor/_cpu_native.pyd
             cachemonitor/_cpu_native.build.json
-          key: ${{ steps.native-key.outputs.key }}
+            cachemonitor/_cpu_native.notices.zip
+          key: ${{ steps.native-key.outputs.key }}-notices-${{ hashFiles('tools/collect_notices.py') }}
       - uses: actions/upload-artifact@v7
         with:
           name: native-${{ github.sha }}-${{ github.run_id }}
           path: |
             cachemonitor/_cpu_native.pyd
             cachemonitor/_cpu_native.build.json
+            cachemonitor/_cpu_native.notices.zip
           retention-days: 30
           overwrite: true
           if-no-files-found: error

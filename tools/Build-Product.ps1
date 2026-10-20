@@ -81,7 +81,11 @@ try {
     $recoveryNotices = Join-Path $stagedProduct 'LICENSES/recovery'
     New-Item -ItemType Directory -Path $recoveryNotices -Force | Out-Null
     Copy-Item -LiteralPath (Join-Path $pythonBase 'tcl/tk8.6/license.terms') -Destination (Join-Path $recoveryNotices 'Tk-license.terms')
-    & $PythonPath (Join-Path $sourceRoot 'tools/collect_notices.py') --toc (Join-Path $workRoot "$Product/PYZ-00.toc") --product $stagedProduct
+    $rustNoticeArguments = @()
+    if ($UseNativeArtifact) {
+        $rustNoticeArguments = @('--rust-artifact', (Join-Path $sourceRoot 'cachemonitor/_cpu_native.notices.zip'))
+    }
+    & $PythonPath (Join-Path $sourceRoot 'tools/collect_notices.py') --toc (Join-Path $workRoot "$Product/PYZ-00.toc") --product $stagedProduct @rustNoticeArguments
     if ($LASTEXITCODE -ne 0) { throw 'Could not prepare dependency notices.' }
     [pscustomobject]@{product=$Product;version=([regex]::Match((Get-Content -LiteralPath (Join-Path $sourceRoot 'cachemonitor/version.py') -Raw),'[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.[0-9]+')).Value;commit=$sourceSha;architecture=[System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant();executable=($Product + '.exe');sha256=(Get-FileHash -LiteralPath $stagedExe -Algorithm SHA256).Hash.ToLowerInvariant();recovery_sha256=$recoveryHash} |
         ConvertTo-Json | Set-Content -LiteralPath (Join-Path $stagedProduct 'build-manifest.json') -Encoding utf8
