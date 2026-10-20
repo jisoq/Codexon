@@ -126,10 +126,10 @@ def _rows(snapshot, owner, section, *, since=None):
         after = page.after
 
 
-def _read_blob(snapshot, owner, descriptor):
+def _read_blob(snapshot, owner, descriptor, *, evidence=True):
     if 'append_event' in descriptor:
         from .prepared_append import read_event
-        return read_event(snapshot,owner,descriptor)
+        return read_event(snapshot,owner,descriptor,evidence=evidence)
     if 'inline' in descriptor:
         return descriptor['inline']
     expected = descriptor['bytes']
@@ -158,14 +158,14 @@ def _budget(snapshot, values):
         raise CapacityExceeded('selected health detail exceeds the delivered object budget')
 
 
-def hydrate_health(snapshot, owner, event_id=None):
+def hydrate_health(snapshot, owner, event_id=None, *, evidence=True):
     """Read exact selected owner evidence or one event from the pinned generation."""
     owner = tuple(owner)
     if event_id is not None:
         row = snapshot.section_item(owner, (FORMAT, 'event-id'), str(event_id))
         if row is None:
             return None
-        result = _read_blob(snapshot, owner, row['value'])
+        result = _read_blob(snapshot, owner, row['value'], evidence=evidence)
         _budget(snapshot, result)
         return result
     packet = snapshot.derived(*owner, 'summary')
@@ -188,7 +188,7 @@ def hydrate_health(snapshot, owner, event_id=None):
             for ordinal, item in enumerate(_rows(snapshot, owner, (FORMAT, field, 'events'))):
                 if item['ordinal'] != ordinal:
                     raise RebuildRequired('health event ordering is incomplete')
-                event = _read_blob(snapshot, owner, item['value'])
+                event = _read_blob(snapshot, owner, item['value'], evidence=evidence)
                 event_size += _size(event)
                 if event_size > snapshot.limits.page_objects_bytes:
                     raise CapacityExceeded('selected health events exceed the delivered object budget')
@@ -197,22 +197,26 @@ def hydrate_health(snapshot, owner, event_id=None):
                 raise NotReady('health event inventory is incomplete')
             value['events'] = tuple(events) if manifest['events']['kind'] == 'tuple' else events
         if 'incident' in manifest:
-            value['incident'] = (_read_blob(snapshot, owner, manifest['incident'])
+            value['incident'] = (_read_blob(snapshot, owner, manifest['incident'], evidence=evidence)
                                  if manifest['incident'] is not None else None)
         _budget(snapshot, result)
     return result
 
 
-def notification_health(snapshot, owner, *, since):
-    """Return current incident plus only zero-read facts beyond a consumer floor."""
-    packet = snapshot.derived(*owner, 'summary')
-    if packet is None:
-        raise NotReady('the owner has no published health head')
-    head = compact_owner_health(packet['own'])
+def notification_health(snapshot, owner, *, own, revision, since):
+    """Use the current own head and read only evidence beyond the consumer floor."""
+    snapshot.check()
+    token = snapshot.publication_token
+    if revision != (token.instance, token.generation):
+        raise StaleGeneration('notification head no longer matches its evidence')
+    if (own.get('home'), own.get('id')) != owner or check_reference(snapshot, own) != owner:
+        raise RebuildRequired('notification head belongs to another owner')
+    head = compact_owner_health(own)
     misses = dict(head.get('cache_misses') or {})
     events = []
     event_size = 0
-    for row in _rows(snapshot, owner, (FORMAT, 'cache_misses', 'events'), since=since):
+    rows=() if type(misses.get('count')) is int and misses['count']==0 else _rows(snapshot, owner, (FORMAT, 'cache_misses', 'events'), since=since)
+    for row in rows:
         event = _read_blob(snapshot, owner, row['value'])
         if event['ts'] > since:
             event_size += _size(event)
@@ -220,7 +224,7 @@ def notification_health(snapshot, owner, *, since):
                 raise CapacityExceeded('fresh cache misses exceed the delivered object budget')
             events.append(event)
     misses['events'] = events
-    return dict(home=owner[0], id=owner[1], title=packet['own']['title'],
+    return dict(home=owner[0], id=owner[1], title=own['title'],
                 cache_misses=misses, cache_health=head.get('cache_health'))
 
 
@@ -250,7 +254,9 @@ def notification_health_pages(snapshot, owner, *, since):
         pack(value, snapshot.limits)
         return value
 
-    for row in _rows(snapshot, owner, (FORMAT, 'cache_misses', 'events'), since=since):
+    misses=base['cache_misses']
+    rows=() if type(misses.get('count')) is int and misses['count']==0 else _rows(snapshot, owner, (FORMAT, 'cache_misses', 'events'), since=since)
+    for row in rows:
         event = _read_blob(snapshot, owner, row['value'])
         if event['ts'] <= since:
             continue

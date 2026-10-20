@@ -3,4 +3,4 @@ interface:
   short_description: "실사용 검증과 반복 실패 분석에 관한 프로젝트 작업방식"
   default_prompt: "$codexon-mode를 적용해 이 프로젝트에서 현재 요청한 작업을 수행해줘."
 policy:
-  allow_implicit_invocation: false
+  allow_implicit_invocation: true

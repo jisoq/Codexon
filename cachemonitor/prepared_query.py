@@ -1,8 +1,8 @@
 """Version-bound operations executed exclusively by the read actor."""
-from collections import deque
+from .prepared_changes import GenerationJournal
 from .analysis_engine import retained_bytes
 from .prepared_analysis import PreparedAnalysisEngine
-from .prepared_store import PreparedReader, Token, StaleGeneration, NotReady
+from .prepared_store import PreparedReader, Token, StaleGeneration, NotReady, CapacityExceeded
 
 
 def token_value(value):
@@ -12,25 +12,6 @@ def token_value(value):
             or type(value[1]) is not int or value[1]<0):
         raise ValueError('query requires an exact prepared generation')
     return Token(*value)
-
-
-class GenerationJournal:
-    """Bounded owner deltas for a reader that may skip writer publications."""
-    def __init__(self):
-        self.entries=deque()
-        self.bytes=0
-
-    def add(self,value):
-        if value is None:return
-        size=retained_bytes(value,4*1024*1024)
-        if size>4*1024*1024 or len(value[2])+len(value[3])>128:
-            self.entries.clear();self.bytes=0
-            return
-        while self.entries and (len(self.entries)>=16 or self.bytes+size>4*1024*1024):
-            self.bytes-=self.entries.popleft()[1]
-        self.entries.append((value,size));self.bytes+=size
-
-    def values(self):return tuple(value for value,_ in self.entries)
 
 
 def _reference_token(reference):
@@ -86,10 +67,25 @@ def _fresh_query(query,token,depth=0):
 class PreparedQuery:
     """One actor owns reader lifetime and its bounded analytical result caches."""
     def __init__(self,path):
+        from .prepared_overlays import FinanceCache
         self.path=path
         self.engine=None
+        self.finance_cache=FinanceCache()
 
-    def _engine(self,token,cancel,changes=()):
+    def _engine(self,token,cancel,changes=(),query=None):
+        # History's explicit source filters are complete membership boundaries.
+        # Foreign drilldowns and other pages retain their wider dependencies.
+        scope=(None,None)
+        explorer=(query or {}).get('explorer') or {}
+        context=explorer.get('context') or {}
+        if (query and query.get('page')==2 and
+                not context.get('population')):
+            scope=(query.get('home') or None,query.get('sid') or None)
+            detail=explorer.get('call_identity')
+            if detail and any(value is not None and detail[i]!=value for i,value in enumerate(scope)):
+                scope=(None,None)
+        if self.engine is not None and self.engine.scope not in ((None,None),scope):
+            self.engine.close();self.engine=None
         if self.engine is not None and self.engine.token!=token:
             at=tuple_token(self.engine.token);changed=set();removed=set()
             for base,target,owners,deleted in changes:
@@ -106,12 +102,24 @@ class PreparedQuery:
                 # metadata. Canonical historical calls remain in the store.
                 self.engine.close();self.engine=None
         if self.engine is None:
-            self.engine=PreparedAnalysisEngine(self.path,token,cancel=cancel)
+            self.engine=PreparedAnalysisEngine(self.path,token,cancel=cancel,scope=scope)
         else:
             self.engine.cancel=cancel
         return self.engine
 
     def __call__(self,message,token,cancel):
+        try:
+            return self._call(message,token,cancel)
+        except CapacityExceeded:
+            # Drop reproducible, lower-priority results after the read scope
+            # unwinds. A second failure belongs only to this selected request.
+            self.finance_cache.clear()
+            if self.engine is not None:
+                self.engine.close()
+                self.engine=None
+        return self._call(message,token,cancel)
+
+    def _call(self,message,token,cancel):
         token=token_value(token)
         cancellation=_Cancellation(cancel)
         kind=message['kind']
@@ -123,7 +131,7 @@ class PreparedQuery:
                     raise StaleGeneration('overlay detail belongs to another displayed generation')
                 with PreparedReader(self.path) as reader,reader.pin(token,cancel=cancellation) as view:
                     value=hydrate_overlay(view,summary,finance=bool(message.get('finance')),
-                                          health=bool(message.get('health')))
+                                          health=bool(message.get('health')),finance_cache=self.finance_cache)
                 return dict(kind=kind,id=message['id'],summary=value,prepared_token=tuple_token(token))
             if kind=='record':
                 requested=message.get('prepared_token')
@@ -154,7 +162,7 @@ class PreparedQuery:
             query=_fresh_query(message['query'],token)
             progress=message.get('_progress')
             if progress:progress('query')
-            engine=self._engine(token,cancellation,message.get('_prepared_changes',()))
+            engine=self._engine(token,cancellation,message.get('_prepared_changes',()),query=query)
             from .analysis_worker import expiry
             engine.progress=progress
             try:
@@ -172,6 +180,7 @@ class PreparedQuery:
             return dict(kind='stale',consumer=kind,id=message['id'],prepared_token=tuple_token(token))
 
     def close(self):
+        self.finance_cache.clear()
         if self.engine is not None:
             self.engine.close();self.engine=None
 

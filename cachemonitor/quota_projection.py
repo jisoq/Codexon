@@ -37,14 +37,21 @@ def initialize(db):
                     column='received' if table=='tracking_observations' else 'at'
                     bound='at' if table in ('tracking_observations','tracking_controls') else 'start'
                     conditions.append(f'(home={side}.home AND ({side}.{column} IS NULL OR {side}.{column}<={bound}))')
+                elif table=='quota_cycle_clears':
+                    conditions.append(f"(home={side}.home AND {side}.baseline IS NOT 'null' AND {side}.start<start)")
                 else:conditions.append(f'home={side}.home')
             predicate=' OR '.join(conditions)
             when=''
             if table=='tracking_observations':
                 # Lossless payload migration does not change an observation.
                 when=' WHEN (SELECT active FROM tracking_payload_migration WHERE id=1)=0'
-            db.execute(f'''CREATE TRIGGER IF NOT EXISTS current_projection_{table}_{operation.lower()}
+            name=f'current_projection_{table}_{operation.lower()}'
+            if table=='quota_cycle_clears':
+                existing=db.execute("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",(name,)).fetchone()
+                if existing and 'preserve_edit_prefix' not in existing[0]:db.execute(f'DROP TRIGGER {name}')
+            db.execute(f'''CREATE TRIGGER IF NOT EXISTS {name}
                 AFTER {operation} ON {table}{when} BEGIN
+                /* preserve_edit_prefix */
                 UPDATE quota_current_projection SET valid=0 WHERE valid=1 AND ({predicate}); END''')
 
 
@@ -76,8 +83,16 @@ def load(db,home,now):
         checkpoint['key']=tuple(checkpoint['key'])
         checkpoint['raw']={int(key):item for key,item in checkpoint['raw'].items()}
         for group in checkpoint['groups']:group['observations']=_PackedRows(group['observations'])
+        resume=value['resume']
+        previous=resume[1][2]
+        if previous is not None:
+            # Deletes hide rows after classification. Recompute only the seam
+            # flag when replay resumes immediately after a removed period.
+            resume[1][1]=bool(db.execute("""SELECT 1 FROM quota_cycle_clears
+                WHERE home=? AND account=? AND baseline='null' AND start<=? AND end>? LIMIT 1""",
+                (home,row['account'],previous['at'],previous['at'])).fetchone())
         return dict(at=row['at'],start=row['start'],account=row['account'],
-                    resume=value['resume'],tracking=checkpoint)
+                    resume=resume,tracking=checkpoint)
     except (ValueError,TypeError,KeyError,zlib.error):
         return {'invalid':True}
 

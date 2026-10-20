@@ -66,6 +66,11 @@ def detect(kind, value, now):
                 '원인은 아직 확인하지 못했으며, 수집기의 실행 상태를 다시 확인하고 있습니다.',
                 '수집 상태 확인', 'collection')
     elif kind == 'analysis':
+        if value.get('publication_failed'):
+            return Fault(kind,'publication','warning',
+                '분석 결과의 메모리 한도를 초과했습니다. 마지막 결과를 유지합니다.',
+                '이전에 표시한 결과는 유지되니 잠시 후 다시 시도해주세요.',
+                '다시 시도','analysis')
         if value.get('fatal') or value.get('start_failed') or value.get('process_exited'):
             retrying = value.get('retrying', False)
             exhausted = value.get('retry_exhausted', False)
@@ -197,9 +202,15 @@ def collection_phase(evidence, now, *, started_at=None):
     stamps=[evidence.get('collection_snapshot_at')]
     # Empty startup snapshots have a synthetic timestamp but no collector identity.
     if evidence.get('collection') or complete:stamps.append(evidence.get('ts'))
-    stamps=[stamp for stamp in (started_at,*stamps) if isinstance(stamp,(int,float))]
-    if stamps and now-max(stamps)>30:return 'delayed'
-    if (evidence.get('collection_stale') or facts.get('snapshot_stale')) and not (pending and started_at is not None and now-started_at<=30):return 'delayed'
+    stamps=[stamp for stamp in stamps if isinstance(stamp,(int,float))]
+    # A fresh publication supersedes stale flags from an older analysis or
+    # service poll. Repeated pending polls must not renew the startup grace.
+    if stamps:
+        if now-max(stamps)>30:return 'delayed'
+    elif started_at is not None:
+        if now-started_at>30:return 'delayed'
+    elif evidence.get('collection_stale') or facts.get('snapshot_stale'):
+        return 'delayed'
     if pending or not complete or evidence.get('index',{}).get('loading'):return 'preparing'
     return 'ready'
 

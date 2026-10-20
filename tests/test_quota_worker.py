@@ -74,6 +74,39 @@ def controlled_process(connection,path,home,entered,release):
     finally:connection.close()
 
 
+def cancellable_process(connection,path,home,entered):
+    from cachemonitor import quota_worker
+    from cachemonitor.quota_cancellation import checkpoint
+    original=quota_worker.QuotaComputation.execute
+    def execute(self,request,phase=lambda value:None,publish=None):
+        if request.get('key')=='superseded':
+            entered.set()
+            while True:checkpoint()
+        return original(self,request,phase,publish)
+    quota_worker.QuotaComputation.execute=execute
+    quota_worker.process_main(connection,path,home)
+
+
+def test_latest_chart_cancels_active_read_without_discarding_prepared_report(monkeypatch):
+    from cachemonitor import quota_worker
+    from test_quota_value_history import sample_report as chart_report
+    context=mp.get_context('spawn');entered=context.Event();results=[]
+    monkeypatch.setattr(quota_worker,'process_main',partial(cancellable_process,entered=entered))
+    worker=QuotaWorker(on_result=results.append)
+    try:
+        worker.request('prepare',snapshot=chart_report())
+        wait_until(lambda:len(results)==1)
+        revision=results[0]['report']['worker_revision'];pid=worker.process.pid
+        worker.request('chart',key='superseded',revision=revision,selection=100)
+        wait_until(entered.is_set)
+        latest=worker.request('chart',key='latest',revision=revision,selection=160)
+        wait_until(lambda:any(r['id']==latest for r in results))
+        assert results[-1]['value']['selection']==160
+        assert worker.process.pid==pid
+        assert not any(r.get('key')=='superseded' for r in results)
+    finally:worker.close()
+
+
 def test_partial_report_keeps_the_request_active_until_complete():
     context=mp.get_context('spawn');entered,release=context.Event(),context.Event();results=[]
     worker=QuotaWorker(on_result=results.append,process_target=partial(controlled_process,entered=entered,release=release))

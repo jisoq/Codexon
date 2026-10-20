@@ -101,6 +101,7 @@ def test_compact_panel_uses_worker_results_and_rejects_stale_filter_response(tmp
     from cachemonitor import quota_panel as module
     app=QApplication.instance() or QApplication([])
     panel=module.QuotaPanel(QSettings(str(tmp_path/'panel.ini'),QSettings.IniFormat))
+    panel.layout().addWidget(panel.conversion);panel.conversion_attached=True
     report=query_report(3);view=report['view'];worker=QueryWorker()
     compact={key:value for key,value in report.items() if key not in ('cycles','history','tracking')}
     compact['view']={**view,'lifetime':{**view['lifetime'],'intervals':[]},
@@ -136,6 +137,7 @@ def test_compact_panel_can_reselect_pending_filter_after_cached_default(tmp_path
     from cachemonitor.quota_panel import QuotaPanel
     app=QApplication.instance() or QApplication([])
     panel=QuotaPanel(QSettings(str(tmp_path/'panel.ini'),QSettings.IniFormat))
+    panel.layout().addWidget(panel.conversion);panel.conversion_attached=True
     report=query_report(3);worker=QueryWorker()
     report={**report,'worker_revision':1,'_worker':worker,
             'view':{**report['view'],'default_query':prepare_quota_query(report,{})}}
@@ -156,6 +158,7 @@ def test_compact_default_refreshes_keep_a_bounded_result_cache(tmp_path):
     from cachemonitor.quota_panel import QuotaPanel
     app=QApplication.instance() or QApplication([])
     panel=QuotaPanel(QSettings(str(tmp_path/'panel.ini'),QSettings.IniFormat))
+    panel.layout().addWidget(panel.conversion);panel.conversion_attached=True
     report=query_report(3);worker=QueryWorker()
     view={**report['view'],'default_query':prepare_quota_query(report,{})}
     for revision in range(20):

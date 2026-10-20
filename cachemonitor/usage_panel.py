@@ -7,16 +7,20 @@ from .presentation import Node
 from .i18n import tr, language
 from .theme import shared_theme
 
-DIMENSIONS = [('프로젝트','project'),('모델','model'),('작업 종류','source')]
+DIMENSIONS = [('전체','all'),('프로젝트','project'),('작업 종류','source'),('요청 모드','service_tier'),
+              ('입력 토큰 규모','input_band'),('캐시 활용 구간','cache_band'),('수집 위치','home')]
 BREAKDOWNS = [('요청 모드','service_tier'),('추론 설정','effort')]
-METRICS = [('호출 수','calls'),('구독 가치 환산액','cost'),('입력 토큰','input'),('출력 토큰','output'),('추론 토큰','reasoning'),('호출당 TPS (평균)','tps')]
+METRICS = [('호출 수','calls'),('구독 가치 환산액','cost'),('호출당 환산액','cost_per_call'),
+           ('평균 응답시간','latency'),('호출당 TPS (평균)','tps'),
+           ('호출당 입력 토큰','input_per_call'),('호출당 출력 토큰','output_per_call'),('추론 토큰','reasoning')]
 NAMES={'user':'유저 에이전트','subagent':'하위 에이전트','unknown':'미확인'}
 TPS='각 호출의 출력 토큰을 전체 응답시간(초)으로 나눈 값의 산술평균입니다. 출력에는 추론이, 시간에는 대기와 통신이 포함됩니다. 유효한 완료 호출만 동일 가중으로 평균합니다.'
 
 
 def value_text(value, metric):
     if value is None:return '—'
-    if metric=='cost':return f'${value:,.2f}'
+    if metric in ('cost','cost_per_call'):return f'${value:,.4f}' if metric=='cost_per_call' else f'${value:,.2f}'
+    if metric=='latency':return f'{value:,.1f}s'
     if metric=='tps':return f'{value:,.1f}'
     if metric=='calls':return f'{round(value):,}'
     if value>=1e9:return f'{value/1e9:.2f}B'
@@ -59,13 +63,14 @@ class UsagePanel(Node):
     def __init__(self, dashboard):
         super().__init__();self.dashboard=dashboard;self.data={};self.row_model=UsageRows(self)
         self.options=dict(period='all',start='',end='',filters={},archived=True,dimension='project',metric='calls',
-                          mode='amount',search='',sort='desc',selected=[],views={},filtersOpen=False,breakdowns=[])
+                          mode='amount',search='',sort='desc',selected=[],views={},filtersOpen=False,breakdowns=[],view='chart',showUnknown=False)
         self.date_draft={key:self.options[key] for key in ('period','start','end')}
         self.search_timer=QTimer(self);self.search_timer.setSingleShot(True);self.search_timer.setInterval(160)
-        self.search_timer.timeout.connect(self.refresh)
+        self.search_timer.timeout.connect(self.present)
         shared_theme().changed.connect(self.restyle)
         self.put(options=deepcopy(self.options),
             dimensions=[dict(text=tr(t),value=v) for t,v in DIMENSIONS],metrics=[dict(text=tr(t),value=v) for t,v in METRICS],
+            tableMetrics=[dict(text=tr(t),value=v) for t,v in METRICS if v!='reasoning'],
             legend=[],detail=[],scope=tr('전체 기록'),countLabel='',title='',maximum=1,tpsTip='',metricLabel='')
         self.publish_dates()
 
@@ -74,7 +79,7 @@ class UsagePanel(Node):
 
     def restyle(self):
         self.publish_dates()
-        if self.data:self.apply(self.data)
+        if self.data:self.present()
 
     def capture(self):return deepcopy(self.options)
 
@@ -111,10 +116,11 @@ class UsagePanel(Node):
             if dates['period']=='custom':restored['period']=self.options['period']
         else:restored.update(dates)
         self.options.update(restored)
+        self.options['showUnknown']=self.options['showUnknown'] is True
         self.date_draft=dates if dates['period']=='custom' else {key:self.options[key] for key in ('period','start','end')}
         o=self.options;legacy=o['dimension']
-        if legacy in dict((v,t) for t,v in BREAKDOWNS):
-            o['dimension']='model';o['breakdowns']=[legacy]
+        if legacy not in dict((v,t) for t,v in DIMENSIONS):o['dimension']='all'
+        if o['metric'] not in dict((v,t) for t,v in METRICS):o['metric']='calls'
         o['views']={dimension:{k:v for k,v in view.items() if k in ('search','sort')}
                     for dimension,view in o['views'].items()}
         o['breakdowns']=[key for _,key in BREAKDOWNS if key in o['breakdowns']]
@@ -122,6 +128,10 @@ class UsagePanel(Node):
 
     def refresh(self):
         self.dashboard.render();self.dashboard.save_preferences()
+
+    def present(self):
+        if getattr(self,'_all_data',None):self.apply(self._all_data)
+        self.dashboard.save_preferences()
 
     @Slot(str,str)
     def change(self,key,value):
@@ -153,12 +163,20 @@ class UsagePanel(Node):
             else:selected.discard(field)
             o['breakdowns']=[key for _,key in BREAKDOWNS if key in selected]
         elif key=='archived':o['archived']=value=='true'
+        elif key=='showUnknown':
+            o[key]=value=='true';self.put(options=deepcopy(o));self.present();return
         elif key.startswith('filter:'):
             self.dashboard.push_state();field=key.split(':',1)[1]
             if value:o['filters'][field]=value
             else:o['filters'].pop(field,None)
             o['selected']=[]
-        elif key in ('metric','mode','sort'):o[key]=value
+        elif key in ('mode','sort','view'):
+            if key=='view' and value not in ('chart','table'):return
+            o[key]=value;self.put(options=deepcopy(o));self.present();return
+        elif key=='metric':
+            if value not in dict((v,t) for t,v in METRICS):return
+            o[key]=value;self.put(options=deepcopy(o));self.present();return
+        elif key=='refresh':pass
         else:return
         self.search_timer.stop();self.put(options=deepcopy(o));self.refresh()
 
@@ -173,6 +191,10 @@ class UsagePanel(Node):
     def select(self,key):
         row=next((row for row in self.data.get('rows',[]) if row['key']==key),None)
         if row is None:return
+        if self.data.get('comparison'):
+            self.dashboard.push_state();o=self.options;o['filters'].update(row['filters'])
+            o.update(selected=[v for pair in row['filters'].items() for v in pair],dimension='all',search='')
+            self.put(options=deepcopy(o));self.refresh();return
         self.dashboard.push_state();o=self.options;dimension=o['dimension'];o['filters'].update(row['filters'])
         o['selected']=[value for pair in row['filters'].items() for value in pair];o['dimension']='source' if dimension=='model' else 'model'
         if o['dimension'] in o['filters']:o['dimension']=next((d for _,d in DIMENSIONS if d not in o['filters']),'model')
@@ -195,11 +217,20 @@ class UsagePanel(Node):
         return dict(page=1,category_usage=True,presentation=True,include_whole_history=False,
                     start=start,end=end,now=now,period=period,archived=o['archived'],
                     loading=bool(self.dashboard.snapshot.get('index',{}).get('loading')),**filters,
-                    usage={k:o[k] for k in ('dimension','metric','mode','search','sort','selected','breakdowns')})
+                    usage=dict(comparison=True,metric='calls',**{k:o[k] for k in ('dimension','selected')}))
 
     def apply(self,data):
+        from .category_usage import display_rows,unknown_category
+        self._all_data=data
+        if data.get('comparison'):
+            from .comparison_usage import choose_metric
+            data=choose_metric(data,self.options['metric'])
+            data=dict(data,rows=[row for row in data['rows'] if row['value'] is not None])
+        rows=display_rows(data['rows'],self.options,data.get('breakdowns',()))
+        data=dict(data,rows=rows,count=len(rows),maximum=max([r['value'] or 0 for r in rows]+[0]))
         self.data=data;o=self.options;theme=shared_theme()
-        metric=data['metric'];ratio=o['mode']=='ratio' and metric!='tps';total=data['summary'];maximum=max(1,data['maximum']*1.05)
+        from .comparison_usage import MEANS
+        metric=data['metric'];ratio=o['mode']=='ratio' and metric not in MEANS;total=data['summary'];maximum=max(1,data['maximum']*1.05)
         if data['dimension']=='model':theme.register_models([row['filters']['model'] for row in data['rows']])
         legends={}
         for row in data['rows']:
@@ -207,10 +238,12 @@ class UsagePanel(Node):
                 key=c['key'];color='unknown' if key=='미확인' else 'muted' if key=='기타' else theme.model_color(key) if data['cross']=='model' else 'accent' if key=='user' else 'reasoning'
                 legends[key]=dict(label=tr(NAMES.get(key,key)),color=color)
         choices=[];labels=self.dashboard.snapshot.get('filter_choices',{}).get('project_labels',{})
-        for caption,key in [('수집 위치','home'),*DIMENSIONS,*reversed(BREAKDOWNS)]:
+        for caption,key in [('수집 위치','home'),('프로젝트','project'),('모델','model'),
+                            ('작업 종류','source'),('요청 모드','service_tier'),('추론 강도','effort')]:
             values=list(self.dashboard.filter_values.get(key,[]))
             selected=o['filters'].get(key)
             if selected and selected not in values:values.append(selected)
+            if not o['showUnknown']:values=[v for v in values if v==selected or not unknown_category(key,v)]
             choices.append(dict(key=key,title=tr(caption),items=[dict(text=tr('전체'),value='')]+[dict(text=labels.get(v,v) if key=='project' else tr(NAMES.get(v,v)),value=v) for v in values]))
         detail=[];item=data['detail'];selected_label=''
         if item:
@@ -221,9 +254,13 @@ class UsagePanel(Node):
             for field,title in [('first','최초 관측'),('last','최근 사용')]:
                 ts=item[field];value=datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M') if ts else '—'
                 detail.append(dict(title=tr(title),value=value,lastTs=ts if field=='last' else 0,tip=tr('전체 보유 기록의 관측 시각입니다. 조회 기간과 무관하며 실제 사용 시작일이나 프로젝트 생성일이 아닙니다.')))
+        elif o['selected']:
+            selected_label=' / '.join(labels.get(v,tr(NAMES.get(v,v))) for v in o['selected'][1::2])
         periods={'all':'전체 기록','today':'오늘','7d':'최근 7일','30d':'최근 30일','custom':o['start']+' ~ '+o['end']}
         scope=tr(periods[o['period']])+' / '+(' / '.join(labels.get(v,tr(NAMES.get(v,v))) for v in o['filters'].values()) or tr('모든 관측 기록'))
         self.put(options=deepcopy(o),legend=[] if metric=='tps' else list(legends.values()),choices=choices,detail=detail,selectedLabel=selected_label,
+                 dimensions=[dict(text=tr(t),value=v) for t,v in DIMENSIONS if v!='home' or len(self.dashboard.filter_values.get('home',[]))>1],
+                 comparison=bool(data.get('comparison')),meanMetric=metric in MEANS,
                  scope=scope+(' / '+tr('보관 제외') if not o['archived'] else ''),title=tr(dict((v,t) for t,v in DIMENSIONS)[data['dimension']])+tr('별 ')+tr(dict((v,t) for t,v in METRICS)[metric]),
                  metric=metric,tpsTip=tr(TPS),metricLabel=tr(dict((v,t) for t,v in METRICS)[metric]),
                  shareLabel=tr('내부 구성비' if item else '전체 비중')+(' ('+tr('확인분')+')' if total['partial'] else ''),
@@ -235,7 +272,21 @@ class UsagePanel(Node):
     def format_row(self,index):
         data=self.data;o=self.options;theme=shared_theme();row=data['rows'][index]
         previous_group=data['rows'][index-1]['group'] if index else None
-        metric=data['metric'];ratio=o['mode']=='ratio' and metric!='tps';total=data['summary'];maximum=max(1,data['maximum']*1.05)
+        from .comparison_usage import MEANS
+        metric=data['metric'];ratio=o['mode']=='ratio' and metric not in MEANS;total=data['summary'];maximum=max(1,data['maximum']*1.05)
+        if data.get('comparison'):
+            metrics=[dict(key=key,title=tr(title),value=value_text(row['metrics'][key]['value'],key),
+                          partial=row['metrics'][key]['partial'],
+                          tip=f"{row['metrics'][key]['known']:,} / {row['metrics'][key]['total']:,}")
+                     for title,key in METRICS if key!='reasoning']
+            group=row.get('group_label',row['group'])
+            return dict(key=row['key'],label=row['label'],group=tr(NAMES.get(group,group)),
+                        groupStart=row['group']!=previous_group,metrics=metrics,
+                        value=value_text(row['value'],metric),missing=row['value'] is None,partial=row['partial'],
+                        fraction=(row['value'] or 0)/(total['value'] or 1) if ratio else (row['value'] or 0)/maximum,
+                        share=f"{row['value']/total['value']:.1%}" if metric not in MEANS and row['value'] is not None and total['value'] else '',
+                        coverage=f"{row['known']:,} / {row['total']:,}",segments=[],
+                        color=theme.model_color(row['filters']['model']),tip=tr(TPS) if metric=='tps' else '')
         segments=[]
         for c in row['components']:
             key=c['key'];color='unknown' if key=='미확인' else 'muted' if key=='기타' else theme.model_color(key) if data['cross']=='model' else 'accent' if key=='user' else 'reasoning'

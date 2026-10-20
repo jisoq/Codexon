@@ -63,6 +63,10 @@ class PreparedAnalysis:
         overlay=self.snapshot['overlay_sessions'][0]
         history=self.session['history']
         assert overlay['calls']==len(history) and overlay['latest_key']==history[-1]['key']
+        self.parent.send(dict(kind='overlay_detail',id='selected-overlay',summary=overlay))
+        detail=self.wait_for(lambda value:value.get('id')=='selected-overlay')
+        assert detail['kind']=='overlay_detail'
+        overlay=detail['summary']
         assert [row['key'] for row in overlay['recent']]==[row['key'] for row in history]
         reference=AnalysisEngine();reference.ingest([copy.deepcopy(self.session)])
         identity=(self.session['home'],self.session['id'],history[-1]['key'])

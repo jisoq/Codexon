@@ -18,8 +18,7 @@ Item {
         anchors.horizontalCenter: parent.horizontalCenter
         width: Math.max(0, Math.min(parent.width-24, 440))
         height: implicitHeight
-        node: ({state: {compact: true, stage: root.status.stage || 0, running: root.status.running,
-                       title: root.status.title, detail: root.status.slow ? root.slowDetail : (root.status.detail || "")}})
+        node: ({state: Object.assign({}, root.status, {compact: true})})
         Accessible.description: root.status.slow ? root.slowDetail : appLanguage.text("완료 시간은 아직 알 수 없습니다.")
         HoverHandler { id: delayHover }
         UiToolTip { visible: delayHover.hovered && !!root.status.slow; text: root.slowDetail }

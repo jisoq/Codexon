@@ -54,6 +54,7 @@ class _Input:
         self.limit = self.snapshot.limits.page_objects_bytes
         self.retained = 0
         self.selection_args = {}
+        self.selection=selection
         self.selection_where = '1'
         if selection is not None:
             models,modes=selection
@@ -112,7 +113,21 @@ class _Input:
         self.stats['sql_statements'] += 1
         return self.snapshot._cursor(self.sql(*args, **kwargs), dict(self.selection_args,**self.args))
 
+    def owner_cursor(self, columns, where, *, tail=''):
+        if not hasattr(self, 'ordering'):
+            self.ordering = ','.join(f'({owner},{rank})' for owner, rank in self.rank.items())
+            self._admit(_size(self.ordering))
+        cohort=('VALUES '+self.ordering) if self.ordering else 'SELECT NULL,NULL WHERE 0'
+        sql=self.sql(columns,where,index='calls_time',tail=tail)
+        sql=sql.replace('JOIN publications p ','JOIN ordering ON ordering.owner=r.owner JOIN publications p ',1)
+        sql='WITH ordering(owner,rank) AS MATERIALIZED ('+cohort+') '+sql
+        self.stats['sql_statements']+=1
+        return self.snapshot._cursor(sql,dict(self.selection_args,**self.args))
+
     def bounds(self, *, speed=False):
+        cache=getattr(self.engine,'_trend_bounds',{})
+        key=(self.selection,speed)
+        if key in cache:return cache[key]
         self.args = {}
         result = []
         for order in ('ASC', 'DESC'):
@@ -121,6 +136,31 @@ class _Input:
             with self.cursor('r.m_ts', where, tail=f'ORDER BY r.m_ts {order} LIMIT 1') as cursor:
                 row = cursor.fetchone()
                 result.append(row[0] if row else None)
+        if len(cache)>=32:cache.clear()
+        cache[key]=result;self.engine._trend_bounds=cache
+        return result
+
+    def catalog(self):
+        cached=getattr(self.engine,'_trend_catalog',None)
+        if cached is not None:return cached
+        # Seek to the next model in the dimension index instead of grouping
+        # every retained call merely to populate the model picker.
+        values=set();self.args={}
+        for null in (True,False):
+            previous=None
+            while True:
+                where='r.m_model IS NULL' if null else 'r.m_model IS NOT NULL'
+                if previous is not None:
+                    self.args['previous_model']=previous;where+=' AND r.m_model>:previous_model'
+                with self.cursor('r.m_model,r.types',where,index='calls_dimensions',
+                                 selected=False,tail='ORDER BY r.m_model LIMIT 1') as cursor:
+                    row=cursor.fetchone()
+                if row is None:break
+                value=_label(_value(row,'model'))
+                if value not in values:self._admit(_size(value)+64);values.add(value)
+                if null:break
+                previous=row['m_model']
+        result=tuple(sorted(values));self.engine._trend_catalog=result
         return result
 
     def metadata(self, end, *, sort_start, sort_keys, global_catalog=False):
@@ -129,20 +169,19 @@ class _Input:
         tags = ','.join(_tag(name) + ' AS t' + str(i) for i, name in enumerate(DIMENSIONS))
         grouped = columns + ',' + ','.join(_tag(name) for name in DIMENSIONS)
         scopes, count = defaultdict(list), 0
-        self.catalog=set()
+        self.catalog_values=self.catalog() if global_catalog else ()
+        self.args = dict(start=sort_start, end=end)
         charge = ('COALESCE(SUM(CASE WHEN r.m_ts>=:start AND r.m_ts<=:end AND (' +
                   self.selection_where + ') THEN ' + _sort_charge(sort_keys) + ' ELSE 0 END),0)')
         count_sql='SUM(CASE WHEN r.m_ts<=:end AND ('+self.selection_where+') THEN 1 ELSE 0 END)'
         size = 0
-        with self.cursor(columns + ',' + tags + ',' + count_sql + ' AS n,' + charge + ' AS sort_bytes',
-                         '1' if global_catalog else 'r.m_ts<=:end', selected=False,
+        with self.owner_cursor(columns + ',' + tags + ',' + count_sql + ' AS n,' + charge + ' AS sort_bytes',
+                         'r.m_ts<=:end',
                          tail='GROUP BY ' + grouped) as cursor:
             for row in cursor:
                 raw = tuple(row['m_' + name] for name in DIMENSIONS)
                 types = tuple(row['t' + str(i)][0] for i in range(3))
                 labels = tuple(_label(_restore_scalar(tag, value)) for tag, value in zip(types, raw))
-                if global_catalog and labels[0] not in self.catalog:
-                    self.catalog.add(labels[0]);self._admit(_size(labels[0])+64)
                 self.stats['metadata_groups'] += 1
                 if global_catalog and not row['n']:continue
                 value = (raw, types)
@@ -173,9 +212,6 @@ class _Input:
         where = 'r.m_ts>=:start AND r.m_ts' + ('<=:end' if inclusive else '<:end')
         if not self.rank:
             return
-        if not hasattr(self, 'ordering'):
-            self.ordering = ','.join(f'({owner},{rank})' for owner, rank in self.rank.items())
-            self._admit(_size(self.ordering))
         if variants is not None:
             predicates = []
             for number, (raw, types) in enumerate(variants):
@@ -200,12 +236,8 @@ class _Input:
             raise CapacityExceeded('performance scalar sort exceeds its admitted temporary payload')
         # The ordering cohort drives this join. Seek each owner's time range;
         # a global-time index would rescan every selected call for every owner.
-        sql = self.sql(columns, where, index='calls_time',
-            tail='ORDER BY r.m_ts,ordering.rank,r.m_session_ordinal,r.identity')
-        sql = sql.replace('JOIN publications p ', 'JOIN ordering ON ordering.owner=r.owner JOIN publications p ', 1)
-        sql = 'WITH ordering(owner,rank) AS MATERIALIZED (VALUES ' + self.ordering + ') ' + sql
-        self.stats['sql_statements'] += 1
-        with self.snapshot._cursor(sql, dict(self.selection_args,**self.args)) as cursor:
+        with self.owner_cursor(columns,where,
+                tail='ORDER BY r.m_ts,ordering.rank,r.m_session_ordinal,r.identity') as cursor:
             for raw in cursor:
                 self.snapshot._check()
                 row = {name:_value(raw, name) for name in FIELDS if raw['types'][POSITIONS[name]]}
@@ -300,7 +332,7 @@ def performance_input(engine, q, width, granularity):
         first=now if first is None else first
     scopes, calls = source.metadata(end, sort_start=start, sort_keys=granularity != 'auto',
                                    global_catalog=selection is not None)
-    catalog=sorted(source.catalog)
+    catalog=list(source.catalog_values)
     if selection is not None:
         scopes={scope:variants for scope,variants in scopes.items()
                 if trend_selected(dict(zip(DIMENSIONS,scope)),selection)}

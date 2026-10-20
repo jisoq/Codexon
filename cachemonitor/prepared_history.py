@@ -126,13 +126,19 @@ def rows(engine, owner, query, *, bodies=False):
             owner,start=query['start'],end=query['end']))
     else:
         yield from engine._pages(engine.snapshot.projected_calls,owner,FIELDS,
-                                 start=query['start'],end=query['end'])
+                                 start=query['start'],end=query['end'],history=True)
+
+
+def selected_match(row,key):
+    if key in BODY_FILTERS and '_history_matches' in row:return key in row['_history_matches']
+    return matches(row,key)
 
 
 def dimensions(row, query):
+    from .comparison_usage import matches as comparison_matches
     return ((not query.get('model') or (row.get('model') or '미확인')==query['model']) and
             (not query.get('effort') or (row.get('effort') or '미확인')==query['effort']) and
-            (not query.get('service_tier') or display_tier(row)==query['service_tier']))
+            (not query.get('service_tier') or display_tier(row)==query['service_tier']) and comparison_matches(row,query))
 
 
 def source_matches(source, owner, query):
@@ -290,6 +296,9 @@ class HistoryProjection:
     """One scope index plus bounded compact metadata, never retained call bodies."""
     def __init__(self,engine,q,result,parents,event_rows,index):
         from .analysis_worker import expiry
+        self.query=dict(q)
+        stable={k:v for k,v in q.items() if k!='now' and (q.get('period')=='custom' or k not in ('start','end'))}
+        self.page_key=engine.query_key(stable)
         self.key=projection_key(engine,q);self.token=engine.token;self.deadline=expiry(engine,q)
         self.index=index;self.parents=parents
         self.events=[dict(home=row['home'],sid=row['sid'],key=row['key']) for row in event_rows]
@@ -298,7 +307,37 @@ class HistoryProjection:
                       if key not in ('records','parents','detail','detail_in_scope','event_rows')})
 
     def weight(self):
-        return retained_bytes((self.key,self.head,self.parents,self.events),CACHE_BYTES)
+        return retained_bytes((self.key,self.head,self.parents,self.events,self.query,self.page_key),CACHE_BYTES)
+
+    def unaffected(self,engine,pending,removed):
+        # A foreign population can depend on owners outside this query's scope.
+        selection=self.query.get('explorer') or {}
+        if (selection.get('context') or {}).get('population'):
+            return False
+        detail=selection.get('call_identity')
+        if detail and tuple(detail[:2]) in pending.keys()|removed:
+            return False
+        for owner in pending.keys()|removed:
+            previous=engine.sessions.get(owner)
+            replacement=pending.get(owner)
+            current=replacement[0] if replacement is not None and not replacement[1] else None
+            if any(state is not None and source_matches(state['prepared'],owner,self.query)
+                   for state in (previous,current)):
+                return False
+        return True
+
+    def adopt(self,engine):
+        self.token=engine.token
+        if '_prepared_token' in self.query:
+            self.query=dict(self.query,_prepared_token=(engine.token.instance,engine.token.generation))
+        self.key=projection_key(engine,self.query)
+        stable={k:v for k,v in self.query.items() if k!='now' and
+                (self.query.get('period')=='custom' or k not in ('start','end'))}
+        self.page_key=engine.query_key(stable)
+        query={k:v for k,v in self.query.items() if k not in
+               ('explorer','table_windows','presentation','compare_model','result_view')}
+        query.update(include_whole_history=False,_session_costs=False)
+        self.head=dict(self.head,key=engine.query_key(query),revision=engine.revision)
 
     def project(self,engine,q):
         self.index.bind(engine.snapshot)
@@ -306,9 +345,9 @@ class HistoryProjection:
         anchor=self.index.anchor(request.get('anchor'))
         start,descriptors=self.index.window(request,anchor)
         budget=Budget(SELECTED_BYTES)
+        detail=selected_detail(engine,selection,budget)
         records=hydrate_records(engine,descriptors,budget)
         event_rows=hydrate_records(engine,self.events,budget)
-        detail=engine.record(*selection['call_identity']) if selection.get('call_identity') else None
         return dict(self.head,analysis={**self.head['analysis'],'responses':event_rows},
             explorer={**self.head['explorer'],'records':dict(start=start,total=self.index.count,rows=records),
                 'parents':window(self.parents,ranges.get('parents',{})),'detail':detail,
@@ -330,11 +369,16 @@ def _project(engine,q,cleanup):
     owner_totals={};project_totals={};request_counts={};combos=Counter();response_sessions=set()
     missing_turns=turn_count=excluded=0;request_view=view=='requests' and scope is not None
     selected_total=Totals()
-    detail=engine.record(*selection['call_identity']) if selection.get('call_identity') else None
+    selected_budget=Budget(SELECTED_BYTES)
+    detail=selected_detail(engine,selection,selected_budget)
     detail_present=False
+    call_index=cleanup.enter_context(SelectionIndex(engine.snapshot)) if view=='calls' else None
+    call_window_state=(_CallWindow(engine,selected_total,detail,selection,
+        q.get('table_windows',{}).get('records',{}),selected_budget,call_index)
+        if call_index is not None else None)
     unlinked_index=cleanup.enter_context(SelectionIndex(engine.snapshot)) if request_view else None
     selected_requests={};selected_headers={};selected_base={};selected_visible={};request_order=[]
-    metadata=None;event=None;phases={};event_keys=set()
+    metadata=None;event=None;phases={};event_keys=set();event_descriptors=[]
     global_unit_calls=query.get('unit','response') in ('response','call')
     for owner,state in engine._selected(query):
         engine.snapshot._check()
@@ -350,9 +394,10 @@ def _project(engine,q,cleanup):
         history_match=not search or search in ' '.join(str(source.get(f,'')) for f in ('title','project_name','cwd','id')).casefold()
         call_match=not search or search in ' '.join(str(source.get(f,'')) for f in ('title','project_name','agent_nickname','cwd','id')).casefold()
         local_budget=Budget(SELECTED_BYTES);counts={};visible_turns=set();aggregates={}
-        bodies=bool(BODY_FILTERS.intersection(filters)) or (request_view and owner==scope)
-        for row in rows(engine,owner,query,bodies=bodies):
+        for row in rows(engine,owner,query):
             if not dimensions(row,query):continue
+            if owner==scope and str(identity(row)[2]) in event_keys:
+                event_descriptors.append(selected_budget.add(dict(home=owner[0],sid=owner[1],key=row['key']),16))
             global_calls.add(row);response_sessions.add((row['home'],row['sid']))
             combo=(row.get('model') or '미확인',row.get('effort') or '미확인',display_tier(row))
             if combo not in combos:budget.add(combo,128)
@@ -366,7 +411,16 @@ def _project(engine,q,cleanup):
                 if request in aggregates:aggregates[request].add(row)
             else:missing_turns+=1
             accepted=population(row,owner,source) and (wanted is None or identity(row) in wanted)
-            accepted=accepted and (not filters or any(matches(row,key) for key in filters))
+            accepted=accepted and (not filters or any(selected_match(row,key) for key in filters))
+            if (scope and view not in ('calls','requests') and (view=='sessions' or owner==scope)
+                    and accepted and call_match
+                    and (not turn or (not request if turn=='__unlinked__' else request==turn))
+                    and (not selection.get('event') or str(identity(row)[2]) in phases)):
+                selected_total.add(row)
+            if (call_window_state is not None and (not scope or owner==scope) and accepted and call_match
+                    and (not turn or (not request if turn=='__unlinked__' else request==turn))
+                    and (not selection.get('event') or str(identity(row)[2]) in phases)):
+                call_window_state.add(dict(row,_incident_phase=phases[str(identity(row)[2])]) if selection.get('event') else row)
             if accepted and history_match:
                 if owner not in owner_totals:owner_totals[owner]=Totals();budget.add(vars(owner_totals[owner]))
                 owner_totals[owner].add(row);global_history.add(row);visible_turns.add(request)
@@ -420,7 +474,6 @@ def _project(engine,q,cleanup):
     project_id=project_identity(metadata) if metadata else selection.get('project','')
     if not project_id and view=='sessions' and navigation:project_id=navigation[0]['project_id']
     available=set();event_rows=[]
-    selected_budget=Budget(SELECTED_BYTES)
 
     def selected_rows(*,outside=False):
         for owner,state,source in selected_states:
@@ -428,24 +481,21 @@ def _project(engine,q,cleanup):
             match=not search or search in ' '.join(str(source.get(f,'')) for f in ('title','project_name','agent_nickname','cwd','id')).casefold()
             # Outside expansion intentionally ignores the original filters/search.
             if not match and not outside:continue
-            values=engine.snapshot.iter_calls(owner,turn=turn) if outside else rows(engine,owner,query,bodies=True)
+            values=(engine._pages(engine.snapshot.projected_calls,owner,FIELDS,history=True,turn=turn)
+                    if outside else rows(engine,owner,query))
             for raw in values:
                 row=compact_record(raw);request=row.get('turn')
                 accepted=(match and query['start']<=row['ts']<query['end'] and dimensions(row,query)
                     and population(row,owner,source) and (wanted is None or identity(row) in wanted)
-                    and (not filters or any(matches(row,key) for key in filters))
+                    and (not filters or any(selected_match(row,key) for key in filters))
                     and (not turn or (not request if turn=='__unlinked__' else request==turn))
                     and (not selection.get('event') or str(identity(row)[2]) in phases))
                 if outside:
                     if not accepted:yield dict(row,_outside=True)
                 elif accepted:yield dict(row,_incident_phase=phases[str(identity(row)[2])]) if selection.get('event') else row
 
-    def calls():
-        yield from selected_rows()
-        if selection.get('outside') and turn and scope and metadata is not None:yield from selected_rows(outside=True)
-
     request_ordinal=engine.request_positions(scope,[turn]).get(turn,(None,None))[0] if scope and turn else None
-    timeline=None;call_index=None
+    timeline=None
     if view=='requests':
         records=[]
         call_match=metadata is not None and (not search or search in ' '.join(str(metadata.get(f,''))
@@ -471,9 +521,9 @@ def _project(engine,q,cleanup):
         if selection.get('timeline') and scope:timeline=project_timeline(records,kind=view)
         records=window(records,q.get('table_windows',{}).get('records',{}))
     elif view=='calls':
-        call_index=cleanup.enter_context(SelectionIndex(engine.snapshot))
-        records,timeline,available,detail_present=call_window(engine,calls,selected_total,detail,
-            selection,q.get('table_windows',{}).get('records',{}),selected_budget,call_index)
+        if selection.get('outside') and turn and scope and metadata is not None:
+            for row in selected_rows(outside=True):call_window_state.add(row)
+        records,timeline,available,detail_present=call_window_state.finish()
     else:
         if view=='projects':records=ordered(tree['projects'],sort)
         elif view=='sessions':records=session_tree(tree,project_id,set(selection.get('expanded',[])),
@@ -481,11 +531,8 @@ def _project(engine,q,cleanup):
         elif view=='children':records=ordered([tree['items'][key] for key in tree['children'].get(scope,[])],sort)
         else:raise ValueError('unsupported History view')
         available=set(available_fields(records));records=window(records,q.get('table_windows',{}).get('records',{}))
-        if scope:
-            for row in selected_rows():selected_total.add(row)
-    if event_keys and scope:
-        for row in rows(engine,scope,query,bodies=True):
-            if dimensions(row,query) and str(identity(row)[2]) in event_keys:event_rows.append(selected_budget.add(row,16))
+    if event_descriptors:
+        event_rows=hydrate_records(engine,event_descriptors,selected_budget)
     summary=selected_total.history() if scope else next((row for row in tree['projects'] if row['project_id']==project_id),{}) if project_id else tree['summary']
     path=[]
     if project_id:path.append(dict(title=next((row['title'] for row in tree['projects'] if row['project_id']==project_id),project_id),project_id=project_id))
@@ -605,37 +652,62 @@ class SelectionIndex:
             self.db.close();self.closed=True
 
 
-def call_window(engine,calls,total,detail,selection,request,budget,index):
-    """One selected-body pass, then indexed rank lookup and <=512 exact records."""
-    sort=selection.get('sort','ts_desc');field='cost' if sort.startswith('cost') else 'ts';descending=sort.endswith('desc')
-    available=set();anchor=None;detail_present=False;points=[];selected=[]
-    for row in calls():
-        if not row.get('_outside'):total.add(row)
-        for name,value in record_items(row,available):
-            if value not in (None,'','미확인','확인 불가') and not isinstance(value,(dict,list)):
-                budget.add(name,64);available.add(name)
-        detail_present|=detail is not None and identity(row)==identity(detail)
+class _CallWindow:
+    """Select during the aggregate pass; hydrate only the visible viewport."""
+    def __init__(self,engine,total,detail,selection,request,budget,index):
+        self.engine,self.total,self.detail=engine,total,detail
+        self.selection,self.request,self.budget,self.index=selection,request,budget,index
+        sort=selection.get('sort','ts_desc')
+        self.field='cost' if sort.startswith('cost') else 'ts'
+        self.descending=sort.endswith('desc')
+        self.available=set();self.anchor=None;self.detail_present=False;self.points=[]
+
+    def add(self,row):
+        if not row.get('_outside'):self.total.add(row)
+        fields=set(row['_available_fields']) if '_available_fields' in row else set(available_fields([row]))
+        fields.update(name for name in ('_outside','_incident_phase') if row.get(name))
+        for name in fields-self.available:self.budget.add(name,64);self.available.add(name)
+        self.detail_present|=self.detail is not None and identity(row)==identity(self.detail)
         descriptor=dict(home=row['home'],sid=row['sid'],key=row['key'])
         for name in ('_outside','_incident_phase'):
             if name in row:descriptor[name]=row[name]
-        value=row.get(field);order=-value if descending and isinstance(value,(int,float)) else value
-        ordinal=index.add(value is None,0 if value is None else order,descriptor,identity(row),row_key(row))
-        if request.get('anchor') and list(row_key(row))==request['anchor']:anchor=ordinal
-        if selection.get('timeline') and selection.get('session'):
-            points.append(budget.add(project_timeline([row])['rows'][0],16))
-    count=index.count;start,selected=index.window(request,anchor)
-    result=hydrate_records(engine,selected,budget)
-    timeline=None
-    if selection.get('timeline') and selection.get('session'):
-        points.sort(key=lambda row:(row['ordinal'] is None,row['ordinal'] or 0,row['ts'] is None,row['ts'] or 0))
-        timeline=dict(rows=points,total=count,omitted_timestamps=sum(row['ts'] is None for row in points))
-    return dict(start=start,total=count,rows=result),timeline,available,detail_present
+        value=row.get(self.field);order=-value if self.descending and isinstance(value,(int,float)) else value
+        ordinal=self.index.add(value is None,0 if value is None else order,descriptor,identity(row),row_key(row))
+        if self.request.get('anchor') and list(row_key(row))==self.request['anchor']:self.anchor=ordinal
+        if self.selection.get('timeline') and self.selection.get('session'):
+            self.points.append(self.budget.add(project_timeline([row])['rows'][0],16))
+
+    def finish(self):
+        count=self.index.count;start,selected=self.index.window(self.request,self.anchor)
+        result=hydrate_records(self.engine,selected,self.budget)
+        timeline=None
+        if self.selection.get('timeline') and self.selection.get('session'):
+            self.points.sort(key=lambda row:(row['ordinal'] is None,row['ordinal'] or 0,row['ts'] is None,row['ts'] or 0))
+            timeline=dict(rows=self.points,total=count,omitted_timestamps=sum(row['ts'] is None for row in self.points))
+        return dict(start=start,total=count,rows=result),timeline,self.available,self.detail_present
+
+
+def selected_detail(engine,selection,budget):
+    if not selection.get('call_identity'):return None
+    detail=engine.record(*selection['call_identity'])
+    if detail is not None:
+        compact=compact_record(detail)
+        budget.hydrated={identity(compact):budget.add(compact,96)}
+    return detail
 
 
 def hydrate_records(engine,selected,budget):
+    if not hasattr(budget,'hydrated'):budget.hydrated={}
+    hydrated=budget.hydrated
     byowner=defaultdict(list)
-    for descriptor in selected:byowner[(descriptor['home'],descriptor['sid'])].append(descriptor['key'])
-    hydrated={}
+    for descriptor in selected:
+        key=(descriptor['home'],descriptor['sid'],descriptor['key'])
+        retained=getattr(engine.snapshot,'history_records',None)
+        if key not in hydrated and retained is not None:
+            row=retained.get(key)
+            if row is not None:hydrated[key]=budget.add(row,96)
+        if key not in hydrated:
+            byowner[(descriptor['home'],descriptor['sid'])].append(descriptor['key'])
     for owner,keys in byowner.items():
         for batch in batches(keys):
             for row in engine._pages(engine.snapshot.records,owner,batch):

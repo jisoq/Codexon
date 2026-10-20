@@ -6,7 +6,7 @@ import time
 from collections import OrderedDict
 from datetime import datetime
 from functools import lru_cache
-from PySide6.QtCore import Qt, QRectF, QPointF, QObject, Property, Slot, Signal, QTimer
+from PySide6.QtCore import Qt, QRectF, QPointF, QObject, Property, Slot, Signal, QTimer, QSequentialAnimationGroup, QPauseAnimation, QVariantAnimation, QEasingCurve
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen, QBrush
 from .presentation import Node
 from .quick_runtime import QuickHost
@@ -18,35 +18,21 @@ from .charts import value_text
 from .overlay_monitor import WIDTH, MARGIN, SECTION_WIDTH, TITLE_WIDTH, INLINE_CLOSE_X
 from .analysis_delivery import ANALYSIS_DELAY_SECONDS
 from .overlay_data import main_usage, RECENT_CALLS
+from .overlay_layout import AGENT_SUMMARY_HEIGHT
 
 LABELS = dict(cached='캐시 읽기', uncached='일반 입력', written='캐시 쓰기', reasoning='추론', output='추론 외', unknown='미분류')
 ORDER = tuple(LABELS)
+SUBAGENT_GAP = 19
 
-def money(value, compact=True):
+def money(value):
     if value is None or not math.isfinite(value): return '—'
-    if value == 0: return '$0.00'
-    if 0 < value < .0001: return '<$0.0001'
-    if compact and abs(value) >= 10000:
-        divisor, suffix = (1e6, 'M') if abs(value) >= 999500 else (1e3, 'K')
-        return f'${value/divisor:.2f}{suffix}'
-    if abs(value) >= 1: return f'${value:,.2f}'
-    return '$'+f'{value:.4f}'.rstrip('0').rstrip('.')
+    places=2 if abs(round(value,4))>=1 else 4
+    return f'${value:,.{places}f}'
 
-def fitted_money(value,width,size,family):
-    result=money(value);metrics=QFontMetrics(font(family,size,600))
-    if metrics.horizontalAdvance(result)<=width or value is None or abs(value)<1000:return result
-    for divisor,suffix in ((1e3,'K'),(1e6,'M')):
-        if abs(value)<divisor:continue
-        for places in (2,1,0):
-            result=f'${value/divisor:.{places}f}{suffix}'
-            if metrics.horizontalAdvance(result)<=width:return result
-    return f'${value/1e6:.0e}M'
-
-def amount(value, exact=False):
+def amount(value):
     if value is None: return '—'
-    if exact: return f'{int(value):,}'
     for divisor, suffix in ((1e9, 'B'), (1e6, 'M'), (1e3, 'K')):
-        if abs(value) >= divisor: return f'{value/divisor:.1f}{suffix}'
+        if abs(value) >= divisor: return f'{value/divisor:.1f}'.removesuffix('.0')+suffix
     return str(int(value))
 
 def call_count(data,family):
@@ -117,13 +103,16 @@ def agent_palette(surface,ink,accent,overlay,count):
     _,a,b=oklab(accent);backgrounds=(surface,overlay)
     if math.hypot(a,b)>=.015:return categorical(accent,backgrounds,count)
     candidates=list(dict.fromkeys(readable(mix_color(surface,ink,k/512),backgrounds,3) for k in range(128,513)))
-    used=[]
+    used=[];seen=set();nearest={}
+    preferred=readable(accent,backgrounds,3)
     for index in range(count):
-        available=[candidate for candidate in candidates if candidate not in used]
+        available=[candidate for candidate in candidates if candidate not in seen]
         if not available:available=candidates
-        preferred=readable(accent,backgrounds,3)
-        selected=max(available,key=lambda c:min((color_distance(c,other) for other in used),default=-color_distance(c,preferred)))
-        used.append(selected)
+        selected=max(available,key=lambda c:nearest[c] if used else -color_distance(c,preferred))
+        for candidate in candidates:
+            distance=color_distance(candidate,selected)
+            nearest[candidate]=min(nearest[candidate],distance) if used else distance
+        used.append(selected);seen.add(selected)
     return tuple(used)
 
 
@@ -132,6 +121,8 @@ class Drawing:
         self.p=painter;self.model=content;self.colors=palette(content.appearance);painter.setRenderHint(QPainter.Antialiasing)
     def text(self,value,x,y,w,h=16,size=11,color='ink',weight=400,right=False,elide=False,center=False,wrap=False):
         literal=isinstance(value,Verbatim);value=tr(str(value))
+        while value.startswith('$') and size>1 and QFontMetrics(font(self.model.appearance.family,size,weight)).horizontalAdvance(value)>w:
+            size-=1
         p=self.p;p.setFont(font(self.model.appearance.family,size,weight));p.setPen(self.colors.get(color,color))
         if elide:value=QFontMetrics(p.font()).elidedText(str(value),Qt.ElideRight,round(w))
         alignment=Qt.AlignHCenter if center else Qt.AlignRight if right else Qt.AlignLeft
@@ -200,7 +191,8 @@ def paint_items(d,items,top=0,bottom=math.inf):
                 if length:d.rect(x+offset,y,length,h,part['color'],pattern=True)
                 offset+=length
         elif style.get('kind')=='tokens':d.tokens(x,y,w,title=value)
-        elif style.get('kind')=='agent-selection':d.rect(x,y,w,h,style['agentColor'],5,alpha=.13)
+        elif style.get('kind')=='agent-selection':
+            if style.get('alpha',0)>0:d.rect(x,y,w,h,style['agentColor'],5,alpha=style['alpha'])
         elif style.get('kind')=='agent-separator':d.rect(x,y,w,h,'border',alpha=.45)
         elif style.get('kind')=='chevron':
             points=((x,y+8),(x+3,y+11),(x+6,y+8)) if style['expanded'] else ((x+1,y+7),(x+4,y+h/2),(x+1,y+13))
@@ -231,7 +223,8 @@ class OverlayContent(Node):
     def __init__(self):
         super().__init__();self.data=None;self.note='기록 확인 중';self.opacity=94;self.appearance=default_appearance(True);self.dark=True;self.compact=False
         self.detail_open=False;self.detail_inline=False;self.detail_width=SECTION_WIDTH-8
-        self.main_expanded=False;self.preferred_height=720;self.available_height=None;self.chart_style='bar'
+        self.main_expanded=False;self.visible_agent_counts={};self.available_height=None;self.chart_style='bar'
+        self._sub_summary_heights=[]
         self.detail_group='sub';self.expanded_groups=set()
         self.selected_id=None;self.selected_snapshot=None;self.follow_latest=True;self.graph_pinned=False;self.quota_lines=('','')
         self.monitor_tab='history';self.composition_unit='usd';self.lower_offset=0;self.settings=None
@@ -239,6 +232,21 @@ class OverlayContent(Node):
         self._agent_scope=None;self._agent_slots={};self._agent_registries=OrderedDict()
         self.highlight_id=None;self._highlight_timer=QTimer(self);self._highlight_timer.setSingleShot(True)
         self._highlight_timer.timeout.connect(self.clear_highlight)
+        self.agent_highlight_opacity=0.
+        self._agent_highlight=QSequentialAnimationGroup(self)
+        self._agent_glow=QVariantAnimation(self._agent_highlight)
+        self._agent_glow.setStartValue(0.);self._agent_glow.setEndValue(.13)
+        self._agent_glow.setDuration(90);self._agent_glow.setEasingCurve(QEasingCurve.OutQuad)
+        self._agent_glow.valueChanged.connect(self.set_agent_highlight_opacity)
+        self._agent_highlight.addAnimation(self._agent_glow)
+        self._agent_hold=QPauseAnimation(310,self._agent_highlight)
+        self._agent_highlight.addAnimation(self._agent_hold)
+        self._agent_fade=QVariantAnimation(self._agent_highlight)
+        self._agent_fade.setStartValue(.13);self._agent_fade.setEndValue(0.)
+        self._agent_fade.setDuration(800);self._agent_fade.setEasingCurve(QEasingCurve.OutCubic)
+        self._agent_fade.valueChanged.connect(self.set_agent_highlight_opacity)
+        self._agent_highlight.addAnimation(self._agent_fade)
+        self._agent_highlight.finished.connect(lambda:self.set_agent_highlight_opacity(0.))
         self._body=DetailBody(self)
         self.put(overlayVisible=False,overlayScale=1.,overlayInk=self.appearance.ink,overlayAccent=palette(self.appearance)['accent'].name(),detailBodyHeight=0);self.sync_details()
     @Property(QObject,constant=True)
@@ -250,12 +258,16 @@ class OverlayContent(Node):
     @property
     def is_remote(self):return self.note.startswith('원격 작업')
     @property
-    def checking_records(self):return self.note in ('기록 준비 중','기록 확인 중','세션 기록 확인 중','기록 수집 중 (잠정값)')
+    def checking_records(self):return self.note in ('기록 준비 중','기록 확인 중','세션 기록 확인 중','기록 수집 중 (잠정값)','갱신 중')
     def content_opacity(self):
-        return .5 if self.checking_records or self.note in ('수집 오류','수집 지연','수집 시작 중','분석 지연') else 1.
+        return .5 if self.checking_records or self.note in ('수집 오류','수집 지연','수집 시작 중','분석 지연','분석 오류') else 1.
     def notice_card(self):
         from .overlay_monitor import REMOTE_HEADING,REMOTE_DESCRIPTION
         if self.is_remote:return REMOTE_HEADING,REMOTE_DESCRIPTION
+        if not self.data and self.note=='분석 오류':
+            return self.note,'분석 결과를 표시하지 못했습니다. 문제 해결 화면에서 오류를 확인해 주세요.'
+        if not self.data and self.note=='갱신 중':
+            return self.note,'새 분석 결과를 기다리고 있습니다.'
         if self.note=='기록 준비 중' and (not self.data or 'calls' not in self.data):
             return '기록 준비 중','세션 기록에서 호출별 사용량을 읽고 있습니다.'
         if not self.data and self.note in ('수집 오류','수집 지연','수집 시작 중'):
@@ -268,7 +280,7 @@ class OverlayContent(Node):
     def freshness_text(self):return self._freshness_label
     @staticmethod
     def collection_age(data,note):
-        if not data or note not in ('수집 지연','수집 오류'):return ''
+        if not data or note not in ('수집 지연','수집 오류','갱신 중'):return ''
         from .i18n import formatted
         collection=data.get('_collection',{});reason=collection.get('reason')
         if reason=='analysis_delay':
@@ -300,6 +312,12 @@ class OverlayContent(Node):
         self.compact,self.detail_open,self.detail_inline=values;self.lower_offset=0;self.detail_width=SECTION_WIDTH-8
         self.sync_details();self.update()
     def set_content(self,data,note='',dark=True,appearance=None):
+        # An incomplete refresh is not evidence that confirmed agents disappeared.
+        old=self.data or {};incoming=data or {};collection=incoming.get('_collection',{})
+        same_scope=(incoming.get('home'),incoming.get('id'))==(old.get('home'),old.get('id'))
+        if (same_scope and old.get('descendants',0)>0 and (collection.get('loading') or collection.get('retained'))
+                and len(incoming.get('subagent_finance',{}).get('agents',()))<len(old.get('subagent_finance',{}).get('agents',()))):
+            data=dict(old,_collection=dict(collection,retained=True))
         appearance=appearance or default_appearance(dark)
         checking=note in ('기록 확인 중','세션 기록 확인 중','기록 수집 중 (잠정값)')
         checking=checking or note=='기록 준비 중' and bool((data or {}).get('_collection',{}).get('loading'))
@@ -328,6 +346,17 @@ class OverlayContent(Node):
         if old!=new:self.inspected_call=None;self.lower_offset=0;self.clear_highlight()
         elif self.rows() and old_call!=self.call_id(self.rows()[-1]) and not self.state.get('reducedMotion'):
             self.highlight_id=self.call_id(self.rows()[-1]);self._highlight_timer.start(120)
+        if old!=new or old_call!=(self.call_id(self.rows()[-1]) if self.rows() else None):
+            self._agent_highlight.stop()
+            self.set_agent_highlight_opacity(0.)
+            if self.rows():
+                reduced=bool(self.state.get('reducedMotion'))
+                self._agent_glow.setDuration(0 if reduced else 90)
+                self._agent_hold.setDuration(300 if reduced else 310)
+                self._agent_fade.setDuration(0 if reduced else 800)
+                self._agent_highlight.start()
+        elif not self.rows():
+            self._agent_highlight.stop();self.set_agent_highlight_opacity(0.)
         if not self.rows() and (self.follow_latest or self.graph_pinned):
             self.selected_id=None;self.selected_snapshot=None;self.follow_latest=True;self.graph_pinned=False
         if self.graph_pinned and not any(self.call_id(r)==self.selected_id for r in self.rows()):
@@ -337,6 +366,13 @@ class OverlayContent(Node):
         self.put(overlayScale=appearance.scale,overlayInk=appearance.ink,overlayAccent=palette(appearance)['accent'].name(),collecting=False);self.sync_details();self.refresh_accessibility();self.update()
     def clear_highlight(self):
         self.highlight_id=None;self._highlight_timer.stop();self.update()
+    def set_agent_highlight_opacity(self,value):
+        self.agent_highlight_opacity=float(value)
+        # Repaint the cached rows without rebuilding actions or moving the scroll view.
+        for item in getattr(self,'_detail_items',()):
+            if item[8].get('kind')=='agent-selection':item[8]['alpha']=float(value)
+        if hasattr(self,'_body'):self._body.update()
+        self.update()
     def rows(self):return (self.data or {}).get('recent',[])[-RECENT_CALLS:]
     def graph_colors(self,rows):
         data=self.data or {};scope=(data.get('home'),data.get('id'))
@@ -447,7 +483,7 @@ class OverlayContent(Node):
                  mainHeartbeats=indicators(main_items,MARGIN,layout.get('main',0)) if not self.notice_card() else [],
                  detailHeartbeats=indicators(items),
                  checkingRecords=self.checking_records,loadingX=header['status_x'],loadingY=layout.get('status',38)+2,contentOpacity=self.content_opacity(),
-                 overlayFamily=self.appearance.family,overlaySurface=colors['surface'].name(),overlayBorder=colors['border'].name(),
+                 overlayMargin=MARGIN,overlayFamily=self.appearance.family,overlaySurface=colors['surface'].name(),overlayBorder=colors['border'].name(),
                  overlayWarning=colors['warning'].name(),overlayBand=colors['band'].name(),overlaySelection=colors['selection'].name(),overlaySecondary=colors['secondary'].name(),
                  detailHasSession=bool((self.data or {}).get('id')),detailSessionKey=str(((self.data or {}).get('home'),(self.data or {}).get('id'))),
                  detailActions=actions,heartbeatActive=heartbeat['mode']=='active',heartbeatCount=heartbeat['count'],totalRowVisible=True,
@@ -523,7 +559,6 @@ class OverlayContent(Node):
         states=self.states();extra=len(states)-1+max(0,len((self.data or {}).get('_collection',{}).get('errors',[]))-1)
         label=states[0][0] if states else ''
         label={'원격 작업: 로컬 기록 없음':'원격 세션','현재 세션 식별 불가':'세션 확인 불가','수집 시작 중':'기록 준비 중'}.get(label,label)
-        if label=='수집 지연' and (self.data or {}).get('_collection',{}).get('reason')=='analysis_delay':label='분석 지연'
         return label+(f' +{extra}' if extra>0 else '') if label else ''
     def status_detail(self):
         from .i18n import formatted
@@ -536,7 +571,7 @@ class OverlayContent(Node):
         for error in collection.get('errors',()):
             label=collection_error_label(error);errors[label]=errors.get(label,0)+1
         values.extend(formatted('{label}, {count}건',label=tr(label),count=count) if count>1 else tr(label) for label,count in errors.items())
-        if self.note in ('수집 지연','수집 오류') and collection.get('last_confirmed_at'):
+        if self.note in ('수집 지연','수집 오류','갱신 중') and collection.get('last_confirmed_at'):
             values.append(tr('마지막 확인')+': '+timestamp(collection['last_confirmed_at']))
         return '\n'.join(dict.fromkeys(filter(None,values)))
     def heartbeat_state(self):
@@ -544,32 +579,39 @@ class OverlayContent(Node):
         count=data.get('active_requests',int(data.get('request',{}).get('state')=='진행'))
         failures=[value for value,level in self.states() if level=='error' or '지연' in value]
         failed=bool(failures or data.get('_collection',{}).get('errors'))
-        pending=not data or bool(self.notice_card())
+        pending=not data or bool(self.notice_card()) or self.note=='갱신 중'
         mode='error' if failed else 'pending' if pending else 'active' if count else 'idle'
         if mode=='error':
             label=failures[0] if failures else '수집 오류'
-            if label=='수집 지연' and data.get('_collection',{}).get('reason')=='analysis_delay':label='분석 지연'
         elif mode=='pending':label=self.status_text() or '기록 준비 중'
         else:label='진행 중' if count else '대기'
         label=tr(label)+(' '+str(count) if mode=='active' else '')
         label_width=QFontMetrics(font(self.appearance.family,11)).horizontalAdvance(label)
-        colors={'active':('#16803c','#4ade80'),'idle':('#b58500','#facc15'),'error':('#dc2626','#f87171'),
+        colors={'active':('#398466','#71b696'),'idle':('#b28924','#c7a457'),'error':('#dc2626','#f87171'),
                 'pending':('#737373','#a3a3a3')}
         return dict(mode=mode,count=count,label=label,color=colors[mode][int(self.dark)],
-                    x=WIDTH-MARGIN-label_width-(6 if label else 0)-18,y=self.layout().get('total',44)+5,
+                    x=WIDTH-MARGIN-label_width-(7 if label else 0)-6,y=self.layout().get('total',44)+5,
                     message=self.status_detail())
     def session_scope(self):
         from .overlay_monitor import scope
         return scope(self.data or {})
     def notice(self):return (self.status_text(),self.states()[0][1]) if self.states() else ('','muted')
-    def layout(self,reduced=None):
+    def agent_count_key(self):
+        data=self.data or {}
+        return json.dumps([data.get('home',''),data['id']],ensure_ascii=False) if data.get('id') else None
+    def visible_agent_count(self):return self.visible_agent_counts.get(self.agent_count_key(),3)
+    def automatic_sub_height(self):
+        heights=self._sub_summary_heights[:self.visible_agent_count()]
+        return sum(heights)+SUBAGENT_GAP*max(0,len(heights)-1)
+    def layout(self,reduced=None,*,constrain=True):
         if self.notice_card():
             from .overlay_monitor import notice_geometry
             return notice_geometry(self)
         reduced=self.compact if reduced is None else reduced
         from .overlay_monitor import geometry,header_status
-        return geometry(self.data,reduced,has_status=bool(header_status(self)[0]),preferred_height=self.preferred_height,
-                        main_detail_height=self.main_detail_height(),available_height=self.available_height)
+        return geometry(self.data,reduced,has_status=bool(header_status(self)[0]),preferred_height=None,
+                        main_detail_height=self.main_detail_height(),available_height=self.available_height if constrain else None,
+                        auto_sub_height=self.automatic_sub_height() if self.has_subagents() else 0)
     def base_height(self,reduced=None):return self.layout(reduced)['height']
     def monitor_height(self,reduced=False):return round(self.base_height(reduced)*self.appearance.scale)
     def panel_width(self):return round((WIDTH+self.detail_extent)*self.appearance.scale)
@@ -579,7 +621,7 @@ class OverlayContent(Node):
     def cost_disclosure(self):
         d=main_usage(self.data or {});values=[]
         if d.get('maintenance_calls'):
-            values.append(f"캐시 유지 {d['maintenance_calls']}회 포함, {money(d.get('maintenance_cost'),False)}, 미확인 {d.get('maintenance_missing',0)}회")
+            values.append(f"캐시 유지 {d['maintenance_calls']}회 포함, {money(d.get('maintenance_cost'))}, 미확인 {d.get('maintenance_missing',0)}회")
         if d.get('assumed'):values.append(f"Standard 가정 {d['assumed']}호출")
         if d.get('coverage_gap'):values.append('이전 기록 누락')
         return ', '.join(values)
@@ -602,19 +644,15 @@ class OverlayContent(Node):
         d=self.data or {};own=main_usage(d)
         values=[d.get('title',''),self.session_scope(),self.main_model_tooltip(),
                 '최근 20호출: 호출 비용과 캐시 적중률, 출력 속도, 추론 토큰',
-                '세션 비용 '+money(own.get('cost'),False),
+                '세션 비용 '+money(own.get('cost')),
                 '세션 캐시 적중률 '+percent(own.get('token_composition',{}).get('cache_hit_rate')),
                 '평균 출력 속도 '+value_text(own.get('output_speed_summary',{}).get('value'),'output_speed').replace('tok/s','tps')]
         if self.main_expanded:
             values.extend(''.join(item[0]) if isinstance(item[0],list) else item[0] for item in self.main_items())
         misses=d.get('cache_misses',{})
-        if misses.get('count'):values.append(f"{'자체 ' if d.get('descendants') else ''}캐시 미적중 {misses['count']}회, 해당 입력 {amount(misses.get('input'),True)}토큰")
+        if misses.get('count'):values.append(f"{'자체 ' if d.get('descendants') else ''}캐시 미적중 {misses['count']}회, 해당 입력 {amount(misses.get('input'))}")
         values.append(self.freshness_text())
         self.setAccessibleName(Verbatim(values[0]+'\n'+tr('\n'.join(filter(None,values[1:])))))
-    @staticmethod
-    def exact_money(value):
-        if value is None:return '—'
-        return '$0.00' if value==0 else '$'+f'{value:,.10f}'.rstrip('0').rstrip('.')
     def total_cost(self):
         data=self.data or {}
         return 0. if data.get('calls')==0 else data.get('cost')
@@ -644,9 +682,8 @@ class OverlayContent(Node):
             if part is not None:return part.get('tokens') if part.get('known',True) else None
             confirmed=population.get('category_known',{}).get(key)
             return population.get('counts',{}).get(key,0) if confirmed is True else None
-        def pair(count,price):return formatted('{tokens} 토큰 / {cost}',tokens=amount(count,True),cost=self.exact_money(price))
-        add('토큰 구성',0,y,w*.45,weight=600)
-        add(formatted('호출 {priced}/{calls}',priced=f"{group.get('priced',0):,}",calls=f"{group.get('calls',0):,}"),w*.45,y,w*.55,right=True,size=11)
+        def pair(count,price):return f'{amount(count)} / {money(price)}'
+        add(f"{tr('토큰 구성')} ({group.get('priced',0):,}/{group.get('calls',0):,})",0,y,w,weight=600)
         y+=26
         cost=group.get('cost_composition',{});composition=group.get('token_composition',{})
         partial=bool(cost.get('partial') or composition.get('partial') or group.get('coverage_gap') or group.get('priced',0)<group.get('calls',0))
@@ -669,7 +706,6 @@ class OverlayContent(Node):
             if parts:
                 items.append(('',0,y,w,8,11,'ink',400,dict(kind='cost-bar',parts=parts,total=sum(p['value'] for p in parts))));y+=16
             y+=6
-        row('호출 비용',self.exact_money(group.get('cost')),total=True)
         if partial:
             add('확인분',0,y,w,color='secondary',size=11);y+=22
         if own and miss_text(self.data or {}):
@@ -688,21 +724,21 @@ class OverlayContent(Node):
         costs.append((self.data or {}).get('child_cost'))
         metrics=QFontMetrics(font(self.appearance.family,12,600))
         available=width*.44
-        price_width=min(available,max((metrics.horizontalAdvance(fitted_money(cost,available,12,self.appearance.family))+6 for cost in costs),default=0))
+        price_width=min(available,max((metrics.horizontalAdvance(money(cost))+6 for cost in costs),default=0))
         return width-20-price_width,price_width
     def agent_summary_items(self,group,label,color,expanded,width,*,main=False,cost_column=None):
         """Keep both agent scopes on the same summary and metric columns."""
         from .overlay_monitor import speed
         cost=0 if group.get('calls')==0 else group.get('cost')
         price_x,price_width=cost_column or self.agent_cost_column(width)
-        price=fitted_money(cost,price_width,12,self.appearance.family)
+        price=money(cost)
         chevron_x=price_x+price_width-2
         name_width=max(0,price_x-26)
         label_metrics=QFontMetrics(font(self.appearance.family,12,600))
         heartbeat_x=12+min(name_width,label_metrics.horizontalAdvance(tr(label)))+3
         request=group.get('request_state',group.get('request',{}).get('state'))
         mode='active' if request=='진행' else 'idle' if request else 'unknown'
-        heartbeat_color=('#16803c','#4ade80')[int(self.dark)] if mode=='active' else ('#b58500','#facc15')[int(self.dark)] if mode=='idle' else palette(self.appearance)['secondary'].name()
+        heartbeat_color=('#116b32','#38b96b')[int(self.dark)]
         items=[(label,12,0,name_width,20,12,'ink',600,dict(kind='single-line',dot=color)),
                ('',heartbeat_x,1,4,4,11,'secondary',400,dict(kind='agent-heartbeat',heartbeat=dict(
                    id='main' if main else group.get('key',group.get('id','')),mode=mode,color=heartbeat_color,
@@ -718,7 +754,10 @@ class OverlayContent(Node):
         items.extend((tr(text),left,47,right-left,18,12 if align else 11,'ink' if align else 'secondary',400,dict(kind='single-line',right=align))
                      for text,left,right,align in metrics)
         return items
+    @staticmethod
+    def agent_summary_height(items):return max(AGENT_SUMMARY_HEIGHT,max((item[2]+item[4] for item in items),default=0))
     def detail_items(self):
+        self._sub_summary_heights=[]
         d=self.detail_data();w=self.detail_width;items=[];y=0
         if not d:
             if self.has_subagents():items.append((tr('모델별 기록 확인 중'),0,0,w,20,11,'secondary',400,{}))
@@ -730,13 +769,16 @@ class OverlayContent(Node):
             if index:items.append(('',0,y-8,w,1,11,'ink',400,dict(kind='agent-separator')))
             agent=(group.get('home'),group.get('id'));col=colors[agent]
             displayed=self.latest_call()
+            summary=self.agent_summary_items(group,group['label'],col,expanded,w,cost_column=cost_column)
+            summary_height=self.agent_summary_height(summary)
             if agent==(displayed.get('home'),displayed.get('sid')):
-                items.append(('',0,y-2,w,73,11,'ink',400,dict(kind='agent-selection',agentColor=col)))
-            for item in self.agent_summary_items(group,group['label'],col,expanded,w,cost_column=cost_column):
+                items.append(('',0,y,w,summary_height,11,'ink',400,dict(kind='agent-selection',agentColor=col,alpha=self.agent_highlight_opacity)))
+            self._sub_summary_heights.append(summary_height)
+            for item in summary:
                 items.append((*item[:2],item[2]+y,*item[3:]))
             meta=self.subagent_call_label(group)
-            y+=71
-            exact=self.exact_money(group.get('cost'))
+            y+=summary_height
+            exact=money(group.get('cost'))
             tip=group['label']+'\n'+meta+'\n'+exact
             if group.get('response_model'):tip+='\n'+tr('응답 모델')+': '+group['response_model']
             items.append(('',0,start,w,y-start,11,'ink',400,dict(action='group-'+key,actionLabel=group['label']+' '+meta+' '+exact,expanded=expanded,tooltip=tip)))
@@ -744,7 +786,7 @@ class OverlayContent(Node):
                 details=self.group_details(group)
                 for item in details:items.append((*item[:2],item[2]+y,*item[3:]))
                 y+=max((item[2]+item[4] for item in details),default=0)+8
-            y+=14
+            y+=SUBAGENT_GAP
         return items
     def headline_metrics(self):
         """One row shared by painting, hit targets and layout verification."""
@@ -757,7 +799,7 @@ class OverlayContent(Node):
                     number='—' if speed is None else '<0.1' if 0<speed<.1 else f'{speed:,.1f}',
                     unit='tps' if speed is not None else '',size=24,unit_size=10,color='ink'),
                dict(id='cost',label='비용',x=264,width=100,
-                    number=fitted_money(data.get('latest_cost'),100,24,self.appearance.family),unit='',size=24,unit_size=10,color='ink')]
+                    number=money(data.get('latest_cost')),unit='',size=24,unit_size=10,color='ink')]
         for item in items:
             def width():
                 return QFontMetrics(font(self.appearance.family,item['size'],600)).horizontalAdvance(item['number'])+(4+QFontMetrics(font(self.appearance.family,item['unit_size'],500)).horizontalAdvance(item['unit']) if item['unit'] else 0)

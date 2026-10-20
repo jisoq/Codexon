@@ -12,7 +12,27 @@ from hashlib import sha256
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-SCENARIOS = ('multiagent', 'active', 'idle', 'loading', 'error', 'mismatch', 'unknown', 'cache-miss', 'slow')
+SCENARIOS = ('multiagent', 'active', 'idle', 'sub-1', 'sub-2', 'sub-3', 'sub-4', 'sub-8', 'loading', 'error', 'mismatch', 'unknown', 'cache-miss', 'slow')
+
+
+def set_preview_margin(margin):
+    """Override geometry only inside this disposable preview process."""
+    from cachemonitor import overlay_layout, overlay_monitor, overlay_view, overlay
+    margin = max(12, min(24, int(margin)))
+    right = overlay_layout.WIDTH - margin
+    section = overlay_layout.WIDTH - 2 * margin
+    actions = right - 72
+    header_x = margin - 4
+    header_width = actions - header_x
+    values = dict(MARGIN=margin, HEADER_Y=margin-6, BOTTOM_MARGIN=margin-3,
+                  RIGHT=right, SECTION_WIDTH=section, BODY_LEFT=margin, BODY_WIDTH=section,
+                  ACTIONS_X=actions, HEADER_X=header_x, HEADER_WIDTH=header_width,
+                  TITLE_WIDTH=header_width-8, POPUP_X=right-260, INLINE_CLOSE_X=actions,
+                  INLINE_HEADER_WIDTH=header_width-8, TITLE_Y=margin-6)
+    for module in (overlay_layout, overlay_monitor, overlay_view, overlay):
+        for key, value in values.items():
+            if hasattr(module, key):
+                setattr(module, key, value)
 
 
 def captured_snapshot(path, cancelled=lambda: False):
@@ -56,7 +76,8 @@ def synthetic_snapshot(scenario='multiagent', language='ko', new_calls=0):
     from cachemonitor.overlay_data import OverlaySummaries
     now = time.time()
     sources = []
-    for agent in range(7 if scenario == 'multiagent' else 1):
+    sub_count=int(scenario[4:]) if scenario.startswith('sub-') else 6 if scenario=='multiagent' else 0
+    for agent in range(sub_count+1):
         sid = f'preview-agent-{agent}' if agent else 'preview-main'
         title = f'Worker {agent}' if agent else ('미리보기 작업' if language == 'ko' else 'Preview task')
         model = ('gpt-6-astra', 'gpt-6-sol', 'gpt-5.6-luna')[agent % 3]
@@ -77,7 +98,7 @@ def synthetic_snapshot(scenario='multiagent', language='ko', new_calls=0):
                              cache_write_input_tokens=0, output_tokens=2000 + agent * 200,
                              reasoning_output_tokens=500), model, f'{sid}-turn',
                         ('high', 'medium', 'low')[agent % 3], mode)
-        active = scenario == 'active' or scenario == 'multiagent' and agent in (0, 2, 5)
+        active = scenario == 'active' or sub_count>0 and agent in (0, 2, 5)
         session.running = active
         session.activity = now if active else now - 120
         session.request_state = dict(turn=f'{sid}-turn', state='진행' if active else '완료',
@@ -112,7 +133,7 @@ def synthetic_snapshot(scenario='multiagent', language='ko', new_calls=0):
 def verify(preview, output):
     """Exercise actual Quick controls using rendered geometry and deadlines."""
     from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRect, QSize, Qt
-    from PySide6.QtGui import QEnterEvent, QMouseEvent, QPainter, QPixmap
+    from PySide6.QtGui import QEnterEvent, QImage, QMouseEvent, QPainter, QPixmap
     from PySide6.QtTest import QTest
     from cachemonitor.overlay_chrome import named_item
     from cachemonitor.quick_qa import walk
@@ -152,8 +173,20 @@ def verify(preview, output):
 
     def capture(name):
         c = preview.controller
+        wait(lambda: c.widget.isVisible() and c.header.isVisible() and c.actions.isVisible(), 'visible overlay header')
         windows = [w for w in (c.widget, *c.chrome) if w.isVisible()]
-        wait(lambda: all(not w.quick.grabFramebuffer().isNull() for w in windows), 'painted frame')
+        frames = {}
+        def painted():
+            for window in windows:
+                if window.quick.grabFramebuffer().isNull():
+                    return False
+                frames[window] = window.grab()
+            for window in (c.header, c.actions):
+                pixels = frames[window].toImage().convertToFormat(QImage.Format_RGBA8888)
+                if not any(bytes(pixels.bits())[3::4]):
+                    return False
+            return True
+        wait(painted, 'painted frame including header and actions')
         bounds = windows[0].geometry()
         for window in windows[1:]:
             bounds = bounds.united(window.geometry())
@@ -161,7 +194,7 @@ def verify(preview, output):
         image.fill(Qt.transparent)
         painter = QPainter(image)
         for window in windows:
-            painter.drawPixmap(window.pos() - bounds.topLeft(), window.grab())
+            painter.drawPixmap(window.pos() - bounds.topLeft(), frames[window])
         painter.end()
         assert image.save(str(output / f'{name}.png'))
         report['captures'].append(f'{name}.png')
@@ -181,12 +214,15 @@ def verify(preview, output):
             assert (heartbeat.width(), heartbeat.height()) == dimensions
             report['checks'].append(f'{theme}: heartbeat blinks without changing dimensions')
             agent_pulse = rendered(c.widget, 'agentHeartbeat-main')
+            assert agent_pulse.property('visible')
             wait(lambda: agent_pulse.opacity() < .35, 'agent heartbeat fades subtly')
             wait(lambda: agent_pulse.opacity() > .55, 'agent heartbeat brightens subtly')
             model = c.widget.content_model
             agent_scroll = rendered(c.detail, 'detailScroll')
             for indicator in model.state['detailHeartbeats']:
-                pulse = rendered(c.detail, 'agentHeartbeat-' + indicator['id'])
+                pulse = named_item(c.detail.quick.rootObject(), 'agentHeartbeat-' + indicator['id'])
+                assert pulse is not None
+                assert pulse.property('visible') == (indicator['mode'] == 'active')
                 in_view = pulse.y() + pulse.height() > agent_scroll.property('contentY') and pulse.y() < agent_scroll.property('contentY') + agent_scroll.height()
                 assert pulse.property('blinking') == (indicator['mode'] == 'active' and in_view)
             report['checks'].append(f'{theme}: individual activity indicators follow own requests and blink subtly')
@@ -203,18 +239,10 @@ def verify(preview, output):
             report['checks'].append(f'{theme}: chart hover shows the inspected call; clicking never pins it')
             click(c.actions, rendered(c.actions, 'settingsButton'))
             wait(lambda: c.toolbar.isVisible(), 'settings popup')
-            slider = rendered(c.toolbar, 'heightSlider')
-            before = c.preferred_height
-            QTest.mouseClick(c.toolbar.quick, Qt.LeftButton, pos=point(c.toolbar, slider, .22))
-            wait(lambda: c.preferred_height != before, 'slider click')
-            clicked = c.preferred_height
-            handle = slider.property('handle')
-            QTest.mousePress(c.toolbar.quick, Qt.LeftButton, pos=point(c.toolbar, handle))
-            end = point(c.toolbar, slider, .68)
-            QTest.mouseMove(c.toolbar.quick, end)
-            wait(lambda: c.preferred_height != clicked, 'continuous slider drag')
-            QTest.mouseRelease(c.toolbar.quick, Qt.LeftButton, pos=end)
-            report['checks'].append(f'{theme}: slider click and continuous drag')
+            for limit in (2,4,3):
+                click(c.toolbar,rendered(c.toolbar,f'agentCount-{limit}'))
+                wait(lambda:c.widget.content_model.visible_agent_count()==limit,'visible agent count choice')
+            report['checks'].append(f'{theme}: visible agent count buttons update the saved limit')
             capture(f'{theme}-height')
             click(c.actions, rendered(c.actions, 'settingsButton'))
             wait(lambda: not c.toolbar.isVisible(), 'settings close')
@@ -276,6 +304,15 @@ def verify(preview, output):
                 wait(lambda: c.widget.content_model.latest_call().get('sid') == expected, 'newest actor selection')
                 model = c.widget.content_model
                 assert scroll.property('contentY') == before_scroll, 'A new call moved the subagent viewport'
+                if actor in (1,7):
+                    levels=[]
+                    def flash_finished():
+                        level=model.agent_highlight_opacity
+                        if not levels or level!=levels[-1]:levels.append(level)
+                        return len(levels)>2 and max(levels)>0 and level==0
+                    wait(flash_finished,'latest agent flash fades away')
+                    assert any(after<before for before,after in zip(levels,levels[1:]))
+                    report['checks'].append(f'{theme}: latest agent flash brightens and fades to zero during live refresh')
                 if actor < 7:
                     group = next(group for group in model.detail_groups() if group['id'] == expected)
                     assert (', fast' in model.subagent_call_label(group)) == (actor == 3)
@@ -309,6 +346,12 @@ def verify(preview, output):
             preview.rebuild()
             wait(lambda: preview.controller.widget.isVisible(), scenario)
             capture(scenario)
+            if scenario in ('active', 'idle', 'unknown'):
+                c=preview.controller
+                pulse=named_item(c.widget.quick.rootObject(),'agentHeartbeat-main')
+                assert pulse is not None
+                assert pulse.property('visible') == (c.widget.content_model.state['mainHeartbeats'][0]['mode']=='active')
+                report['checks'].append(f'{scenario}: main activity dot is only visible while active')
             if scenario == 'error':
                 c=preview.controller
                 status=rendered(c.widget,'overlayHeartbeatLabel')
@@ -316,6 +359,119 @@ def verify(preview, output):
                 assert not c.widget.quick.rootObject().findChild(QObject,'overlayHeartbeat').property('visible')
                 assert not any(link.get('interaction')=='tooltip' for link in c.widget.content_model.monitor_links())
                 report['checks'].append('error status replaces the heartbeat without hover')
+        preview.compact.setChecked(False)
+        preview.theme.setCurrentText('light')
+        preview.controller.set_visible_agent_count(3)
+        height_cases=[]
+        for count in (0,1,2,3,4,8):
+            preview.scenario.setCurrentText(f'sub-{count}' if count else 'idle')
+            preview.rebuild()
+            c=preview.controller;m=c.widget.content_model
+            wait(lambda:c.widget.isVisible(),'height preview')
+            if count:
+                scroll=rendered(c.detail,'detailScroll')
+                actions=[item for item in m.state['detailActions'] if item['id'].startswith('group-')]
+                for action in actions[:3]:
+                    item=rendered(c.detail,'detailAction-'+action['id'])
+                    assert item.y()+item.height()<=scroll.height()+1
+                assert (scroll.property('contentHeight')>scroll.height()+1)==(count>3)
+            capture(f'height-sub-{count}')
+            height_cases.append(dict(agents=count,height=m.base_height(),file=f'height-sub-{count}.png'))
+            if count==0:
+                click(c.actions,rendered(c.actions,'settingsButton'))
+                wait(lambda:c.toolbar.isVisible(),'main-only settings')
+                assert not named_item(c.toolbar.quick.rootObject(),'agentCount-1').isVisible()
+                capture('height-main-settings')
+                c.close_popup()
+        assert height_cases[0]['height']<height_cases[1]['height']<height_cases[2]['height']<height_cases[3]['height']
+        assert height_cases[3]['height']==height_cases[4]['height']==height_cases[5]['height']
+        preview.scenario.setCurrentText('sub-4');preview.rebuild()
+        c=preview.controller
+        c.set_visible_agent_count(4)
+        capture('height-limit-4')
+        shown=c.widget.content_model.base_height()
+        preview.scenario.setCurrentText('sub-8');preview.rebuild()
+        c=preview.controller
+        assert c.widget.content_model.visible_agent_count()==4 and c.widget.content_model.base_height()==shown
+        capture('height-limit-4-growth')
+        click(c.actions,rendered(c.actions,'settingsButton'))
+        wait(lambda:c.toolbar.isVisible(),'visible agent count settings')
+        capture('height-count-settings')
+        for limit in (1,2,3,4):
+            click(c.toolbar,rendered(c.toolbar,f'agentCount-{limit}'))
+            wait(lambda:c.widget.content_model.visible_agent_count()==limit,'agent count choice')
+            scroll=rendered(c.detail,'detailScroll')
+            actions=[item for item in c.widget.content_model.state['detailActions'] if item['id'].startswith('group-')]
+            last=rendered(c.detail,'detailAction-'+actions[limit-1]['id'])
+            following=rendered(c.detail,'detailAction-'+actions[limit]['id'])
+            assert last.y()+last.height()<=scroll.height()+1
+            assert following.y()+following.height()>scroll.height()+1
+            capture(f'height-count-{limit}')
+        click(c.toolbar,rendered(c.toolbar,'agentCount-3'))
+        wait(lambda:c.widget.content_model.visible_agent_count()==3,'default count selected')
+        c.close_popup()
+        assert c.widget.content_model.base_height()==height_cases[3]['height']
+        capture('height-reset')
+        padding_cases=[]
+        for count in range(5):
+            preview.scenario.setCurrentText(f'sub-{count}' if count else 'idle');preview.rebuild()
+            c=preview.controller;m=c.widget.content_model
+            if count:
+                c.set_visible_agent_count(4)
+                actions=[item for item in m.state['detailActions'] if item['id'].startswith('group-')]
+                target_window=c.detail
+                last=rendered(c.detail,'detailAction-'+actions[-1]['id'])
+                scroll=rendered(c.detail,'detailScroll')
+                assert scroll.property('contentHeight')<=scroll.height()+1
+            else:
+                target_window=c.links
+                last=rendered(c.links,'nav-main-detail')
+            capture(f'padding-{count}')
+            end=target_window.quick.mapToGlobal(last.mapToScene(QPointF(0,last.height())).toPoint()).y()
+            pixels=QImage(str(output/f'padding-{count}.png'))
+            ink=[(x,y) for y in range(pixels.height()) for x in range(pixels.width())
+                 if (color:=pixels.pixelColor(x,y)).alpha()>200 and max(color.red(),color.green(),color.blue())<120]
+            insets=dict(top=min(y for x,y in ink),right=pixels.width()-1-max(x for x,y in ink),
+                        bottom=pixels.height()-1-max(y for x,y in ink),left=min(x for x,y in ink))
+            padding_cases.append(dict(agents=count,bottom_gap=c.widget.y()+c.widget.height()-end,
+                                      visual_insets=insets,file=f'padding-{count}.png'))
+            hover(target_window,point(target_window,last))
+            pointer=last if count else next(child for child in last.childItems()
+                if child.metaObject().indexOfProperty('containsMouse')>=0)
+            wait(lambda:bool(pointer.property('hovered' if count else 'containsMouse')),'last agent hover')
+            capture(f'padding-hover-{count}')
+        gaps=[case['bottom_gap'] for case in padding_cases]
+        assert max(gaps)-min(gaps)<=1
+        report['bottom_padding_cases']=padding_cases
+        report['checks'].append('rendered main-only and one to four subagent summary edges have consistent bottom padding within one logical pixel')
+        report['height_cases']=height_cases
+        report['checks'].append('automatic height fits the selected one to four agents; per-conversation selection survives growth and restart')
+        report['checks'].append('main-only settings hide agent count controls')
+        preview.margin.setFocus()
+        for key, expected in ((Qt.Key_Home,12),(Qt.Key_End,24),(Qt.Key_Left,23)):
+            QTest.keyClick(preview.margin,key)
+            wait(lambda:preview.controller.widget.content_model.state.get('overlayMargin')==expected,
+                 'preview margin slider updates rendered geometry')
+            capture(f'margin-{expected}')
+        preview.margin.setValue(preview.args.margin)
+        wait(lambda:preview.controller.widget.content_model.state.get('overlayMargin')==preview.args.margin,
+             'preview margin restored')
+        report['checks'].append('preview margin slider updates geometry from 12 to 24 and supports one-pixel keyboard steps')
+        cards=[('메인 상세: 토큰과 비용 표기','light-main-expanded.png'),('서브 상세: 토큰과 비용 표기','light-agent-expanded.png'),
+               ('차트 호버: 비용 표기','light-hover.png'),
+               ('메인 단독','height-sub-0.png'),('서브 1개','height-sub-1.png'),('서브 2개','height-sub-2.png'),
+               ('서브 3개','height-sub-3.png'),('서브 4개: 3개 높이 유지','height-sub-4.png'),('서브 8개: 3개 높이 유지','height-sub-8.png'),
+               ('4개 표시 선택','height-limit-4.png'),('서브 8개로 증가: 4개 높이 유지','height-limit-4-growth.png'),
+               ('기본 3개 선택','height-reset.png'),('메인 단독 설정','height-main-settings.png'),('표시 개수 설정','height-count-settings.png'),
+               *[(f'{limit}개 표시 설정',f'height-count-{limit}.png') for limit in (1,2,3,4)],
+               *[(('메인 단독' if count==0 else f'서브 {count}개')+' 하단 여백',f'padding-{count}.png') for count in range(5)]]
+        gallery=''.join(f'<figure><figcaption>{title}</figcaption><img src="{file}" alt="{title}"></figure>' for title,file in cards)
+        (output/'height-preview.html').write_text('<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>오버레이 높이 미리보기</title><style>body{font:14px/1.5 system-ui,sans-serif;margin:24px;background:#f6f6f6;color:#222}h1{font-size:20px}main{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:24px;align-items:start}figure{margin:0}figcaption{margin-bottom:10px;font-weight:600}img{max-width:100%;height:auto;vertical-align:top}</style><h1>오버레이 높이 미리보기</h1><p>실제 소스 오버레이의 합성 데이터 화면입니다. 설치본은 변경하지 않았습니다.</p><main>'+gallery+'</main></html>',encoding='utf-8')
+        padding_cards=[]
+        for case in padding_cases:
+            count=case['agents'];name='메인 단독' if count==0 else f'서브 {count}개'
+            padding_cards.append(f'<figure><figcaption>{name}</figcaption><a class="crop" href="padding-{count}.png"><img src="padding-{count}.png" alt="{name}"></a><p>호버 상태</p><a class="crop" href="padding-hover-{count}.png"><img src="padding-hover-{count}.png" alt="{name} 호버"></a></figure>')
+        (output/'bottom-padding-preview.html').write_text('<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>오버레이 여백 비교</title><style>body{margin:24px;font:14px/1.6 system-ui,sans-serif;background:#f6f6f6;color:#222}h1{font-size:20px}main{display:grid;grid-template-columns:repeat(auto-fit,300px);gap:24px}figure{margin:0}figcaption{font-weight:600;margin-bottom:12px}.crop{display:block;position:relative;height:140px;overflow:hidden}.crop img{position:absolute;bottom:0;left:0;width:100%}a{color:inherit}</style><h1>메인 단독과 서브 1~4개 여백 비교</h1><p>기본 상태와 호버 상태의 하단을 같은 높이로 비교합니다. 이미지를 누르면 전체 화면을 확인할 수 있습니다.</p><main>'+''.join(padding_cards)+'</main><p><a href="height-preview.html">전체 상황별 미리보기</a></p></html>',encoding='utf-8')
         errors = [str(error) for w in (preview.controller.widget, *preview.controller.chrome) for error in w.qml_errors]
         assert not errors, errors
         report['passed'] = True
@@ -328,8 +484,8 @@ def verify(preview, output):
 
 class Preview:
     def __init__(self, app, args, settings):
-        from PySide6.QtCore import QTimer
-        from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel, QPushButton, QComboBox, QCheckBox
+        from PySide6.QtCore import QTimer, Qt
+        from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel, QPushButton, QComboBox, QCheckBox, QSlider
         from cachemonitor.overlay_windows import WindowsOverlay
         self.app, self.settings, self.controller = app, settings, None
         self.args, self.worker, self.snapshot = args, None, dict(overlay_sessions=[], index=dict(loading=True))
@@ -344,6 +500,23 @@ class Preview:
         self.note = QLabel('설치 없이 소스 오버레이를 확인합니다.\nSynthetic data and temporary settings.')
         self.note.setWordWrap(True)
         layout.addWidget(self.note)
+        self.margin_label = QLabel(f'상하좌우 여백: {args.margin}px')
+        layout.addWidget(self.margin_label)
+        self.margin = QSlider(Qt.Horizontal)
+        self.margin.setObjectName('previewMargin')
+        self.margin.setAccessibleName('상하좌우 여백')
+        self.margin.setRange(12, 24)
+        self.margin.setSingleStep(1)
+        self.margin.setTickPosition(QSlider.TicksBelow)
+        self.margin.setTickInterval(1)
+        self.margin.setValue(args.margin)
+        layout.addWidget(self.margin)
+        layout.addWidget(QLabel('12px                                      24px'))
+        self.margin_timer = QTimer(self.host)
+        self.margin_timer.setSingleShot(True)
+        self.margin_timer.setInterval(60)
+        self.margin_timer.timeout.connect(self.rebuild)
+        self.margin.valueChanged.connect(self.change_margin)
         self.language, self.theme, self.scenario = QComboBox(), QComboBox(), QComboBox()
         for control, choices, selected in ((self.language, ('ko', 'en'), args.language),
                 (self.theme, ('dark', 'light'), args.theme), (self.scenario, SCENARIOS, args.scenario)):
@@ -394,11 +567,16 @@ class Preview:
         if self.controller:
             self.poll()
 
+    def change_margin(self, value):
+        self.margin_label.setText(f'상하좌우 여백: {value}px')
+        self.margin_timer.start()
+
     def rebuild(self, *_):
         from cachemonitor.i18n import set_language
         from cachemonitor.overlay import OverlayController
         if self.controller:
             self.controller.stop()
+        set_preview_margin(self.margin.value())
         set_language(self.language.currentText())
         self.settings.setValue('ui/theme', self.theme.currentText())
         if not self.args.snapshot:
@@ -502,11 +680,14 @@ class Preview:
 
 
 def main():
+    from cachemonitor.overlay_layout import MARGIN
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--scenario', choices=SCENARIOS, default='multiagent')
     parser.add_argument('--theme', choices=('dark', 'light'), default='dark')
     parser.add_argument('--language', choices=('ko', 'en'), default='ko')
     parser.add_argument('--compact', action='store_true')
+    parser.add_argument('--margin', type=int, choices=range(12, 25), default=MARGIN,
+                        help='Initial preview-only outer margin in pixels (12-24)')
     parser.add_argument('--snapshot', nargs='?', const='default', type=str,
                         help='Capture an existing collector checkpoint read-only; optionally supply its .collection.sqlite path')
     parser.add_argument('--session', help='Initially select this thread id in captured source mode')

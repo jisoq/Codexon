@@ -7,6 +7,7 @@ from collections import OrderedDict
 from multiprocessing import Pipe
 from threading import Condition, Event, Thread
 import traceback
+import time
 
 from .analysis_engine import retained_bytes
 
@@ -106,7 +107,15 @@ class QueryActor:
                     cancel = Event()
                     self.active = (kind, serial, message, token, cancel)
                 try:
-                    progress = lambda stage: self._progress(kind, serial, message, cancel, stage)
+                    last_progress=[None,0.]
+                    def progress(stage):
+                        value=stage if isinstance(stage,dict) else dict(stage=stage)
+                        now=time.monotonic()
+                        if (value.get('stage')==last_progress[0] and now-last_progress[1]<.25
+                                and value.get('processed')!=value.get('total')):
+                            return
+                        last_progress[:]=[value.get('stage'),now]
+                        self._progress(kind, serial, message, cancel, value)
                     result = handler(dict(message, _progress=progress), token, cancel.is_set)
                     size = retained_bytes(result, RESULT_BYTES)
                     if size > RESULT_BYTES:
@@ -152,7 +161,8 @@ class QueryActor:
         with self.condition:
             if self.stopping or cancel.is_set() or self.latest.get(kind) != serial:
                 return
-            self.completed['progress'] = dict(kind='progress', id=message['id'], stage=stage)
+            value=stage if isinstance(stage,dict) else dict(stage=stage)
+            self.completed['progress'] = dict(kind='progress', id=message['id'], **value)
             if not self.signalled:
                 self._signal.send_bytes(b'1')
                 self.signalled = True

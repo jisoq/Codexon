@@ -524,10 +524,10 @@ class OverlaySummaries:
                 summary=summarize_session(dict(state['prepared'],coverage_gaps=coverage_gaps),
                     state['prepared'].get('cache_health'),_partials=parts)
                 partials[key]=parts
-            updated[key] = (revision, summary)
+            updated[key] = previous if previous and previous[0]==revision else (revision, summary)
         return self.present(engine, updated, partials, speeds)
 
-    def present(self, engine, updated, partials, speeds, *, include_finance=True):
+    def present(self, engine, updated, partials, speeds, *, include_finance=True, compact=False, selected=None):
         """Present prepared own summaries with the same ancestry and readiness rules."""
         self.cache = updated
         self.partials = partials
@@ -538,17 +538,20 @@ class OverlaySummaries:
         result = []
         merged = {}
         for key,(_,summary) in updated.items():
+            if selected is not None and key not in selected:
+                continue
             group = rollups[key]
             if not group['descendants']:
                 result.append(summary)
                 continue
-            signature=(include_finance,tuple((member,updated[member][0]) for member in group['members']))
+            signature=(include_finance,compact,tuple((member,updated[member][0]) for member in group['members']))
             previous=self.rollups.get(key)
             if previous and previous[0]==signature:
                 value=previous[1]
             else:
                 own_summaries=[updated[member][1] for member in group['members']]
-                compositions=_merge_compositions(own_summaries,[partials[member] for member in group['members']])
+                compositions=({} if compact else
+                    _merge_compositions(own_summaries,[partials[member] for member in group['members']]))
                 value=dict(summary,cost=group['cost'],own_cost=group['own_cost'],
                     child_cost=group['child_cost'],descendants=group['descendants'],
                     own_coverage_gap=summary['coverage_gap'],own_assumed=summary['assumed'],
@@ -563,7 +566,7 @@ class OverlaySummaries:
                 value['main_usage']={field:summary[field] for field in (
                     'calls','priced','missing','mean_cost','assumed','coverage_gap',
                     'token_composition','cost_composition','output_speed_summary',
-                    'model','effort','mode','model_state','model_mismatch','response_model')}
+                    'model','effort','mode','model_state','model_mismatch','response_model') if field in summary}
                 value['main_usage'].update({field:partials[key][field] for field in (
                     'maintenance_calls','maintenance_cost','maintenance_missing')})
                 value['main_usage']['cost']=group['own_cost']
@@ -579,7 +582,7 @@ class OverlaySummaries:
                 if recent:
                     value.update({k:recent[-1].get(k) for k in ('model','model_setting','response_model','model_mismatch','model_state','effort','mode','response_mode','transport','transport_state','cache_rate')})
                     value.update(latest_cost=recent[-1].get('cost'),latest_ts=recent[-1].get('ts'),latest_key=recent[-1].get('key'))
-            merged[key]=(signature,value)
+            merged[key]=previous if previous and previous[0]==signature else (signature,value)
             result.append(value)
         self.rollups=merged
         presented={};output=[]
@@ -592,9 +595,16 @@ class OverlaySummaries:
                    for member in rollups[key]['members']]
             complete=False if False in flags else True if all(flag is True for flag in flags) else None
             previous=self.presented.get(key)
-            value=(previous[2] if previous and previous[0] is summary and previous[1]==speed
-                   and previous[2].get('collection_complete') is complete
-                   else dict(summary,speed_health=speed,collection_complete=complete))
-            presented[key]=(summary,speed,value);output.append(value)
+            if (previous and previous[0] is summary and previous[1]==speed
+                    and previous[2].get('collection_complete') is complete):
+                presented[key]=previous
+                value=previous[2]
+            else:
+                # Results belong to the speed producer. Snapshot its nested
+                # values before retaining them as immutable presentation state.
+                speed=deepcopy(speed)
+                value=dict(summary,speed_health=speed,collection_complete=complete)
+                presented[key]=(summary,speed,value)
+            output.append(value)
         self.presented=presented
         return output

@@ -295,6 +295,8 @@ class Session:
     activity: float = 0
     pending: bool = False
     contexts: dict = field(default_factory=dict)
+    unresolved_contexts: dict = field(default_factory=dict)
+    context_revision: int = 0
     current_turn: str = ""
     request_state: dict = field(default_factory=dict)
     turn_records: dict = field(default_factory=dict)
@@ -336,8 +338,34 @@ class Session:
         request.compaction_epoch=self.compaction_epoch
         for field_name,value in (mode_metadata or {}).items():
             if field_name in ('configured_service_tier','request_mode_source','request_mode_action'):setattr(request,field_name,value)
+        if turn and (not model or effort in (None,'','미확인') or
+                     service_tier_source=='settings' and service_tier in (None,'','미확인')):
+            self.unresolved_contexts.setdefault(turn,[]).append(request)
         self.coverage_total += values['total'] or 0
         self.activity = max(self.activity, ts)
+
+    def resolve_context(self, turn, *, include_tier=True):
+        """Fill missing fields from evidence explicitly tied to the same turn."""
+        pending=self.unresolved_contexts.pop(turn,())
+        model,effort=self.contexts.get(turn,('', '미확인'))
+        tier=self.tier_contexts.get(turn,'미확인')
+        for request in pending:
+            changed=False
+            if not request.model and model:
+                request.model=request.configured_model=model
+                changed=True
+            if request.effort in (None,'','미확인') and effort not in (None,'','미확인'):
+                request.effort=effort
+                changed=True
+            if (include_tier and request.service_tier_source=='settings' and request.service_tier in (None,'','미확인')
+                    and tier not in (None,'','미확인')):
+                request.service_tier=tier
+                for name,value in self.tier_evidence.get(turn,{}).items():setattr(request,name,value)
+                changed=True
+            if changed:self.context_revision+=1
+            if (not request.model or request.effort in (None,'','미확인') or
+                    request.service_tier_source=='settings' and request.service_tier in (None,'','미확인')):
+                self.unresolved_contexts.setdefault(turn,[]).append(request)
 
     def consume(self, event, now):
         previous_report = (self.reported_ts, self.reported_usage.get('total'))
@@ -365,6 +393,7 @@ class Session:
             self.tier_evidence[self.current_turn] = (dict(configured_service_tier=payload['service_tier'],request_mode_action='clear' if payload['service_tier'] is None else 'set',request_mode_source='turn_context')
                 if 'service_tier' in payload else dict(self.current_tier_evidence))
             self.pending_tier_context=(self.current_turn,ts,event.get('_next_event_id')) if 'service_tier' not in payload else None
+            if payload.get('turn_id'):self.resolve_context(payload['turn_id'],include_tier='service_tier' in payload)
         elif kind == "token_usage_record":
             if payload.get("thread_id", self.id) != self.id:
                 return  # Forked history must not become this session's usage.
@@ -372,6 +401,9 @@ class Session:
                 self.requests=deque(r for r in self.requests if not str(r.key).startswith('legacy:'))
                 self.keys={r.key for r in self.requests}
                 self.coverage_total=sum(r.total or 0 for r in self.requests)
+                self.unresolved_contexts={turn:[r for r in rows if r.key in self.keys]
+                                          for turn,rows in self.unresolved_contexts.items()
+                                          if any(r.key in self.keys for r in rows)}
             self.modern = True
             turn = payload.get("turn_id", "")
             model, effort = self.contexts.get(turn, ("", "미확인"))
@@ -402,6 +434,7 @@ class Session:
                             (not event.get('event_id') or pending_tier_context[2]==event['event_id'])):
                         self.tier_contexts[self.current_turn]=self.current_service_tier
                         self.tier_evidence[self.current_turn]=dict(self.current_tier_evidence)
+                        self.resolve_context(self.current_turn)
             if event_type in ("task_started", "task_complete", "task_completed", "turn_aborted") and ts >= self.state_ts:
                 self.state_ts = ts
                 self.running = event_type == "task_started"
@@ -428,6 +461,7 @@ class Session:
                                    self.tier_contexts.get(self.current_turn,'미확인'),'settings')
                     if ts >= self.reported_ts:
                         self.reported_usage, self.reported_ts = usage_values(total), ts
+        if pending_tier_context is not None:self.resolve_context(pending_tier_context[0])
         current_report = (self.reported_ts, self.reported_usage.get('total'))
         if current_report != previous_report and current_report[1] is not None:
             residual = current_report[1] - self.coverage_total
@@ -476,7 +510,7 @@ class Session:
         return self.transport_details(request)["transport"]
 
     def view(self, now, use_cache=False):
-        signature=(len(self.requests),tuple(vars(self.requests[-1]).items()) if self.requests else (),
+        signature=(len(self.requests),self.context_revision,tuple(vars(self.requests[-1]).items()) if self.requests else (),
                    tuple(sorted(self.reported_usage.items())),self.running,self.activity,self.pending,
                    self.title,self.cwd,self.model,self.provider,tuple(self.request_state.items()),
                    tuple(getattr(self,key) for key in LINEAGE_FIELDS),

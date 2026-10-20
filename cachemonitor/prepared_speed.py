@@ -75,7 +75,8 @@ class OwnerSpeedStamp:
         """
         if type(dependencies) is not dict or not set(DEPENDENCIES) <= dependencies.keys():
             raise ValueError('incomplete durable owner dependencies')
-        revision = hashlib.sha256(pack(dependencies)).hexdigest()
+        from .prepared_ingest import fact_dependencies
+        revision = hashlib.sha256(pack(fact_dependencies(dependencies))).hexdigest()
         return cls(revision, length, last_ordinal, append_from, tail_after)
 
 

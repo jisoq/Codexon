@@ -94,7 +94,7 @@ def test_prepared_overlay_detail_revision_tracks_descendants_and_removed_members
     sources['child']['request_state']=dict(turn='turn',state='진행')
     for name in sources:replace_owner(name)
     view=SimpleNamespace(publication_token=SimpleNamespace(instance='test',generation=1),
-        limits=Limits(), owner=lambda home,sid:owners.get((home,sid)),
+        limits=Limits(), check=lambda:None, owner=lambda home,sid:owners.get((home,sid)),
         derived=lambda home,sid,kind:packets[(home,sid)])
     overlays=PreparedOverlays()
     def collect(changed,removed=()):

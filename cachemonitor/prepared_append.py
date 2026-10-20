@@ -23,6 +23,7 @@ from .prepared_store import (CapacityExceeded, RebuildRequired, OWNER_FIELDS,
                              FORBIDDEN_OWNER, RAW_TRANSPORT_FIELDS, pack, _size)
 from .prepared_summary import summary_for_storage, recent_references
 from .prepared_sums import _Sum
+from .request_modes import requires_parent_mode
 
 
 FORMAT = ('prepared-owner-append', 3)
@@ -290,7 +291,8 @@ def summary_facts(state,health_count):
 def seed(material,dependencies,*,raw_count,mode_evidence=None):
     """Add a bounded checkpoint during complete preparation, or decline reuse."""
     source=material['state']['prepared'];rows=source['history'];owner=(source['home'],source['id'])
-    if (material['internal_review'] or source.get('parent_thread_id') or not rows or
+    if (material['internal_review'] or
+            (source.get('parent_thread_id') and dependencies.get('mode_ancestry_required') is not False) or not rows or
             len(rows)!=raw_count or any(row['session_ordinal']!=i for i,row in enumerate(rows,1))):
         return False
     raw=material['state']['source']['history']
@@ -365,11 +367,11 @@ def _evidence(row,ordinal):
                 cache_rate=cached/inp*100 if inp and cached is not None and cached<=inp else None)
 
 
-def read_event(snapshot,owner,descriptor):
+def read_event(snapshot,owner,descriptor,*,evidence=True):
     """Only selected health detail reconstructs growing membership arrays."""
     if descriptor.get('append_event')!=EVENT_FORMAT:raise RebuildRequired('unknown append health descriptor')
     result=deepcopy(descriptor['event']);result['occurrence_keys']=[]
-    fields=descriptor['evidence_fields']
+    fields=descriptor['evidence_fields'] if evidence else ()
     if 'comparison_calls' in fields:result['comparison_calls']=[]
     size=_size(result);count=descriptor['occurrence_count']
     if type(count) is not int or count<0:raise RebuildRequired('invalid health occurrence count')
@@ -565,14 +567,15 @@ class AppendPlan:
                  'speed predecessor frontier differs')
         return SpeedPrefixCertificate(previous_stamp.revision,self.prior_count,self.prior_frontier)
 
-    def apply(self,stage,source_ordinal,*,cancel=None):
+    def apply(self,stage,source_ordinal,*,cancel=None,replace=False,candidates_staged=False):
         """Once this begins, failures require aborting the caller's entire Stage."""
         from .prepared_store import StaleGeneration
         if stage.expected!=self.expected:raise StaleGeneration('append plan predecessor was replaced')
-        stage.owner(*self.owner,self.metadata,self.dependencies,source_ordinal=source_ordinal,
+        stage.owner(*self.owner,self.metadata,self.dependencies,source_ordinal=source_ordinal,replace=replace,
             call_metadata=self.call_metadata,request_maps=self.request_maps,summary=self.summary,
             choices=self.choices,model_alerts=self.model_alerts,checkpoint=self.checkpoint)
-        stage.candidates(self.owner,((row['key'],row['session_ordinal']-1) for row in self.rows))
+        if not candidates_staged:
+            stage.candidates(self.owner,((row['key'],row['session_ordinal']-1) for row in self.rows))
         # Request-state corrections affect the whole indexed turn. Read only one
         # bounded page under each committed snapshot, then close it before writes.
         for turn,state in self.state_repairs.items():
@@ -617,12 +620,13 @@ def _ledger_append(snapshot,owner,transition,before,prior_dependencies,dependenc
     selected=turns|{turn for turn,_,_ in transition['requests']['upserts']}
     return dict(format=APPEND_FORMAT,prior_source=source_stamp(prior_dependencies),
         source=source_stamp(dependencies),prior_body_digest=transition['prior_body_digest'],
+        prior_request_digest=prior_dependencies.get('analysis_digest') or transition['prior_body_digest'],
         prior_count=transition['prior_raw_count'],count=len(transition['tail']),
         previous_usage={turn:before[turn]['maximum'] for turn in turns
                         if before.get(turn,{}).get('call_count')},request_keys=tuple(sorted(selected)))
 
 
-def prepare(snapshot,owner,transition,dependencies,*,mode_evidence=None,enrich=None):
+def prepare(snapshot,owner,transition,dependencies,*,mode_evidence=None,enrich=None,_retained=None):
     """Read-only admission against one committed predecessor; never publish here.
 
     The selected producer endpoint must bind the complete old/new source bodies.
@@ -632,8 +636,14 @@ def prepare(snapshot,owner,transition,dependencies,*,mode_evidence=None,enrich=N
     """
     from .collection_append import digest,context_digest,RESPONSE_BYTES,encoded
     _require(snapshot.staged_batch is None,'append requires a committed predecessor')
-    owner=tuple(owner);old=snapshot.owner(*owner)
-    checkpoint=snapshot.derived(*owner,'checkpoint')
+    owner=tuple(owner)
+    if _retained is None:
+        old=snapshot.owner(*owner)
+        checkpoint=snapshot.derived(*owner,'checkpoint')
+    else:
+        retained_snapshot,retained_owner,old,checkpoint=_retained
+        _require(retained_snapshot is snapshot and retained_owner==owner,'retained append owner differs')
+        snapshot.check()
     _require(old is not None and isinstance(checkpoint,dict) and checkpoint.get('format') in READ_FORMATS,'no append checkpoint')
     _require(checkpoint['owner']==owner and transition is not None and transition.get('format')==1
              and tuple(transition.get('owner',()))==owner,'append owner or format differs')
@@ -668,11 +678,15 @@ def prepare(snapshot,owner,transition,dependencies,*,mode_evidence=None,enrich=N
     _require(set(old['request_maps'])<=set(request_maps)<=set(('turn_records','turn_states')),'request map presence was removed')
     headers,before,boundaries,states,request_count=_headers(snapshot,owner,checkpoint,transition)
     source=dict(transition['metadata'],history=deepcopy(tail),turn_states=states,turn_records=boundaries)
-    _require(not source.get('parent_thread_id'),'append ancestry is not proven')
+    child=bool(source.get('parent_thread_id'))
+    _require(not child or old['dependencies'].get('mode_ancestry_required') is False,
+             'append predecessor independence from ancestry is not proven')
     if enrich is not None:source=enrich(source)
     # The callback may enrich tail observations, never replace the source scope.
     _require(len(source['history'])==len(tail) and all(a['key']==b['key'] and a['ts']==b['ts']
              for a,b in zip(source['history'],tail)),'mode enrichment changed the tail population')
+    _require(not child or not any(requires_parent_mode(row) for row in source['history']),
+             'append tail requires parent mode inheritance')
     canonical=prepare_row({},source)
     # The store joins raw metadata with canonical overrides. Raw optional None
     # fields stay in that context even when individual calls mark them absent.
@@ -735,6 +749,11 @@ def prepare(snapshot,owner,transition,dependencies,*,mode_evidence=None,enrich=N
         frontier=(rows[-1]['ts'],rows[-1]['key']),total=total,misses=misses,health=health.save(),request=request,
         request_count=request_count,header_count=header_count,last_header_order=last_order,
         ledger_append=_ledger_append(snapshot,owner,transition,before,old['dependencies'],dependency))
+    # This admitted append preserves all comparison scalars in the old prefix.
+    # Request-state and cache-incident repairs below do not affect those scalars.
+    from .comparison_usage import dependency_stamp
+    updated['comparison_append']=dict(format=1,prior=dependency_stamp(old['dependencies']),
+        target=dependency_stamp(dependency),ordinal=count)
     try:
         try:
             checkpoint_bytes=len(pack(updated,snapshot.limits,
@@ -761,15 +780,13 @@ def prepare(snapshot,owner,transition,dependencies,*,mode_evidence=None,enrich=N
 
 def try_apply(cohort,catalog,changed,removed,*,ready,parents):
     """Cohort hook before candidate inventories or complete source retrieval."""
-    if len(changed)!=1 or removed:return None
-    owner=next(iter(changed))
-    if owner in parents:return None
+    if not changed or removed:return None
+    owners=tuple(sorted(changed,key=lambda owner:catalog['owners'][owner]['source_ordinal']))
     method=getattr(cohort.client,'selected_owner_append',None)
     if method is None:return None
     from .prepared_ingest import dependencies,mode_dependency,source_identity,ModeEvidenceUnavailable
     import sqlite3
     ledger=cohort.ledger
-    mode_evidence=ledger.mode_dependency(*owner) if ledger is not None else None
     def enrich(source):
         if ledger is None:return source
         value=dict(homes=catalog['selected_homes'],sessions=[source])
@@ -780,41 +797,89 @@ def try_apply(cohort,catalog,changed,removed,*,ready,parents):
             raise ModeEvidenceUnavailable('optional request-mode evidence failed') from error
         finally:
             ledger._enriched_sessions={}
+    plans=[];tail_keys=set();plan_bytes=_size((plans,tail_keys))
     try:
         with cohort.store.read_current(cancel=cohort.cancel,seconds=60) as view:
-            old=view.owner(*owner)
-            if old is None:return None
-            checkpoint=view.derived(*owner,'checkpoint')
-            if not isinstance(checkpoint,dict) or checkpoint.get('format') not in READ_FORMATS:return None
-            entry=catalog['owners'][owner]
-            transition=method(owner,old['dependencies']['source_digest'],catalog=catalog)
-            if transition is None:return None
-            transition=dict(transition,metadata=dict(transition['metadata'],**entry.get('state',{})))
-            wanted=dependencies(entry['body_digest'],mode_dependency((owner,),catalog,ledger),
-                                old['dependencies']['ownership'],state=entry.get('state',{}))
-            plan=prepare(view,owner,transition,wanted,mode_evidence=mode_evidence,enrich=enrich)
+            retained={};retained_bytes=0
+            for owner in owners:
+                cohort._check()
+                old=view.owner(*owner)
+                retained_bytes+=_size((owner,old))+128
+                if retained_bytes<=4*1024*1024:
+                    retained[owner]=(old,);cohort._append_owners=(view.token,retained)
+                else:
+                    retained.clear();cohort._append_owners=None
+                if old is None:continue
+                if ((owner in parents or old['metadata'].get('parent_thread_id'))
+                        and old['dependencies'].get('mode_ancestry_required') is not False):continue
+                checkpoint=view.derived(*owner,'checkpoint')
+                retained_bytes+=_size(checkpoint)+64
+                if owner in retained and retained_bytes<=4*1024*1024:
+                    retained[owner]=(old,checkpoint)
+                elif retained_bytes>4*1024*1024:
+                    retained.clear();cohort._append_owners=None
+                if not isinstance(checkpoint,dict) or checkpoint.get('format') not in READ_FORMATS:continue
+                entry=catalog['owners'][owner]
+                transition=method(owner,old['dependencies']['source_digest'],catalog=catalog)
+                if transition is None:continue
+                transition=dict(transition,metadata=dict(transition['metadata'],**entry.get('state',{})))
+                wanted=dependencies(entry['body_digest'],mode_dependency((owner,),catalog,ledger),
+                                    old['dependencies']['ownership'],state=entry.get('state',{}))
+                wanted['mode_ancestry_required']=old['dependencies'].get('mode_ancestry_required',True)
+                if entry.get('analysis_digest'):
+                    from .prepared_ingest import state_facts
+                    wanted.update(analysis_digest=entry['analysis_digest'],state_facts=state_facts(entry.get('state',{})))
+                mode_evidence=ledger.mode_dependency(*owner) if ledger is not None else None
+                try:
+                    plan=prepare(view,owner,transition,wanted,mode_evidence=mode_evidence,enrich=enrich,
+                                 _retained=(view,owner,old,checkpoint))
+                except AppendUnavailable as error:
+                    cohort.metrics['append_fallbacks']=cohort.metrics.get('append_fallbacks',0)+1
+                    cohort.metrics['append_last_fallback']=str(error)
+                    continue
+                # prepare checks competing committed candidates. New tails are
+                # absent from that snapshot, so admit their mutual scope here.
+                # Ordinary identities share a home; legacy/record identities
+                # remain local to the source owner, as in candidate_matches.
+                plan_bytes+=plan.plan_bytes+_size(owner)+256
+                for row in plan.rows:
+                    key=row['key']
+                    identity=(owner if key.startswith(('record:','legacy:')) else owner[0],key)
+                    _require(identity not in tail_keys,'new owner tails have a competing candidate')
+                    tail_keys.add(identity)
+                    plan_bytes+=_size(identity)+128
+                _require(plan_bytes<=PLAN_BYTES,'append cohort plans exceed transient budget')
+                plans.append(plan)
     except AppendUnavailable as error:
         cohort.metrics['append_fallbacks']=cohort.metrics.get('append_fallbacks',0)+1
         cohort.metrics['append_last_fallback']=str(error)
+        return None
+    if len(plans)!=len(owners):
+        # The ordinary election stages all candidates first. A full owner's
+        # corrections can invalidate a plan; unrelated owners retain their tail.
+        cohort._append_plans={plan.owner:plan for plan in plans}
         return None
     cohort._check()
     source=source_identity(catalog)
     previous=cohort._speed_inventory() if ready and cohort.speed_writer is not None else None
     stage=cohort.store.begin(source)
     try:
-        plan.apply(stage,entry['source_ordinal'],cancel=cohort.cancel)
+        for plan in plans:
+            plan.apply(stage,catalog['owners'][plan.owner]['source_ordinal'],cancel=cohort.cancel)
         if ready and not cohort._complete(catalog,staged=True,parents=parents):
             raise ValueError('append cohort cannot publish incomplete prepared dependencies')
         current=None
         if previous is not None:
             current=dict(previous)
-            certificate=plan.speed_certificate(previous[owner]) if owner in previous else None
-            current[owner]=cohort._speed_stamp(dict(dependencies=plan.dependencies),certificate)
+            for plan in plans:
+                owner=plan.owner
+                certificate=plan.speed_certificate(previous[owner]) if owner in previous else None
+                current[owner]=cohort._speed_stamp(dict(dependencies=plan.dependencies),certificate)
         token=cohort._publish(stage,source,ready,previous,current)
-        cohort.metrics['append_owners']=cohort.metrics.get('append_owners',0)+1
-        cohort.metrics['append_rows']=cohort.metrics.get('append_rows',0)+len(plan.rows)
-        cohort.metrics['append_checkpoint_bytes']=plan.checkpoint_bytes
-        return dict(token=token,changed=(owner,),removed=(),writes=dict(stage.writes))
+        cohort.metrics['append_owners']=cohort.metrics.get('append_owners',0)+len(plans)
+        cohort.metrics['append_rows']=cohort.metrics.get('append_rows',0)+sum(len(plan.rows) for plan in plans)
+        cohort.metrics['append_checkpoint_bytes']=sum(plan.checkpoint_bytes for plan in plans)
+        return dict(token=token,changed=owners,removed=(),writes=dict(stage.writes))
     except BaseException:
         cohort._abort(stage)
         raise

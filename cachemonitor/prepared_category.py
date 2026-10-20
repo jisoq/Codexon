@@ -127,7 +127,7 @@ def project_data(engine, scope, dimension, metric, breakdowns, selection):
     for state,lo,hi in engine.call_ranges(scope):
         after=None
         while True:
-            page=snapshot.projected_calls(state['owner'],fields,start=lo,end=hi,after=after)
+            page=snapshot.projected_calls(state['owner'],fields,start=lo,end=hi,after=after,filters=scope)
             for row in page.rows:
                 engine.read_metrics['category_projection_rows']=engine.read_metrics.get('category_projection_rows',0)+1
                 if not row_matches(row,scope):
@@ -174,6 +174,7 @@ def project_data(engine, scope, dimension, metric, breakdowns, selection):
             complete=page.complete
             after=page.after
             del page
+            if progress:progress(dict(stage='aggregate',processed=totals.count,unit='calls'))
             if complete:
                 break
     visible=sorted(weights,key=lambda key:-weights[key])[:4]

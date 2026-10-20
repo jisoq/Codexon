@@ -5,7 +5,8 @@ Rectangle {
     id: root
     required property var presentation
     property var s: presentation.state
-    property int preferredHeight: s.heightValue || 720
+    // Native placement sets physical pixels; Qt may use a different logical scale.
+    readonly property real popupScale: width / (s.popupKind === "settings" ? 260 : 160)
     property bool moveControl: s.chromeKind === "icon" || s.chromeKind === "header"
     property real outerMargin: moveControl ? 4 * s.scale : 0
     color: moveControl ? "transparent" : appTheme.palette.hit_surface
@@ -42,11 +43,11 @@ Rectangle {
     Rectangle {
         anchors.fill: parent
         anchors.margins: root.outerMargin
-        radius: (root.s.chromeKind === "toolbar" ? 10 : 8) * root.s.scale
+        radius: root.s.chromeKind === "toolbar" ? 10 * root.popupScale : 8 * root.s.scale
         visible: root.s.chromeKind === "toolbar" || root.s.chromeKind === "icon"
         color: root.s.surface
         opacity: root.s.chromeKind === "toolbar" ? 1 : root.s.opacity / 100
-        border.width: root.s.scale; border.color: root.s.border
+        border.width: root.s.chromeKind === "toolbar" ? root.popupScale : root.s.scale; border.color: root.s.border
     }
     Rectangle {
         anchors.fill: parent; radius: 8 * root.s.scale
@@ -153,35 +154,35 @@ Rectangle {
         Slider {
             id: opacitySlider
             objectName: "opacity"
-            x: 12 * root.s.scale; y: 8 * root.s.scale
-            width: 96 * root.s.scale; height: 24 * root.s.scale
+            x: 12 * root.popupScale; y: 8 * root.popupScale
+            width: 96 * root.popupScale; height: 24 * root.popupScale
             from: 0; to: 80; stepSize: 1; value: 100 - root.s.opacity
-            padding: 4 * root.s.scale; focusPolicy: Qt.NoFocus
+            padding: 4 * root.popupScale; focusPolicy: Qt.NoFocus
             Accessible.name: appLanguage.text("배경 투명도")
             Accessible.description: Math.round(value) + "%"
             onPressedChanged: if (pressed) { root.presentation.startInteraction(); forceActiveFocus(Qt.MouseFocusReason); }
             onMoved: root.presentation.transparency(Math.round(value))
             background: Rectangle {
                 x: opacitySlider.leftPadding; y: opacitySlider.height / 2 - height / 2
-                width: opacitySlider.availableWidth; height: 2 * root.s.scale; radius: root.s.scale
+                width: opacitySlider.availableWidth; height: 2 * root.popupScale; radius: root.popupScale
                 color: root.s.meta; opacity: 0.45
             }
             handle: Rectangle {
                 x: opacitySlider.leftPadding + opacitySlider.visualPosition * (opacitySlider.availableWidth - width)
                 y: opacitySlider.height / 2 - height / 2
-                width: 10 * root.s.scale; height: width; radius: width / 2; color: root.s.accent
+                width: 10 * root.popupScale; height: width; radius: width / 2; color: root.s.accent
                 Rectangle {
-                    anchors.fill: parent; anchors.margins: -4 * root.s.scale
+                    anchors.fill: parent; anchors.margins: -4 * root.popupScale
                     visible: opacitySlider.visualFocus; radius: width / 2; color: "transparent"
-                    border.width: 2 * root.s.scale; border.color: root.s.accent
+                    border.width: 2 * root.popupScale; border.color: root.s.accent
                 }
             }
         }
         Text {
-            x: 116 * root.s.scale; y: 8 * root.s.scale
-            width: 32 * root.s.scale; height: 24 * root.s.scale
+            x: 116 * root.popupScale; y: 8 * root.popupScale
+            width: 32 * root.popupScale; height: 24 * root.popupScale
             text: (100 - root.s.opacity) + "%"
-            color: root.s.ink; font.family: root.s.family; font.pixelSize: 11 * root.s.scale
+            color: root.s.ink; font.family: root.s.family; font.pixelSize: 11 * root.popupScale
             font.features: { "tnum": 1 }
             horizontalAlignment: Text.AlignRight; verticalAlignment: Text.AlignVCenter
         }
@@ -190,20 +191,20 @@ Rectangle {
         anchors.fill: parent
         visible: root.s.chromeKind === "toolbar" && root.s.popupKind === "settings"
         Text {
-            x: 12 * root.s.scale; y: 10 * root.s.scale
+            x: 12 * root.popupScale; y: 10 * root.popupScale
             text: appLanguage.text("차트 표시 방식")
-            color: root.s.ink; font.family: root.s.family; font.pixelSize: 11 * root.s.scale
+            color: root.s.ink; font.family: root.s.family; font.pixelSize: 11 * root.popupScale
         }
         Row {
-            x: 12 * root.s.scale; y: 31 * root.s.scale
-            spacing: 8 * root.s.scale
+            x: 12 * root.popupScale; y: 31 * root.popupScale
+            spacing: 8 * root.popupScale
             Repeater {
                 model: [{ key: "bar", label: "막대" }, { key: "filled-line", label: "채움 선형" }]
                 delegate: Button {
                     id: styleButton
                     required property var modelData
                     objectName: "chartStyle-" + modelData.key
-                    width: 114 * root.s.scale; height: 28 * root.s.scale
+                    width: 114 * root.popupScale; height: 28 * root.popupScale
                     checkable: true; checked: root.s.chartStyle === modelData.key
                     hoverEnabled: true
                     text: appLanguage.text(modelData.label)
@@ -211,76 +212,58 @@ Rectangle {
                     onClicked: root.presentation.setChartStyle(modelData.key)
                     Accessible.name: text; Accessible.checked: checked
                     background: Rectangle {
-                        radius: 5 * root.s.scale
+                        radius: 5 * root.popupScale
                         color: styleButton.checked ? root.s.accent : root.s.ink
                         opacity: styleButton.down ? 0.26 : styleButton.hovered ? (styleButton.checked ? 0.26 : 0.12) : styleButton.checked ? 0.2 : 0.06
                         border.width: styleButton.visualFocus ? 2 : 0; border.color: root.s.accent
                     }
                     contentItem: Text {
                         text: styleButton.text; color: root.s.ink
-                        font.family: root.s.family; font.pixelSize: 11 * root.s.scale
+                        font.family: root.s.family; font.pixelSize: 11 * root.popupScale
                         verticalAlignment: Text.AlignVCenter; horizontalAlignment: Text.AlignHCenter
                     }
                 }
             }
         }
         Text {
-            x: 12 * root.s.scale; y: 76 * root.s.scale
-            text: appLanguage.text("오버레이 높이")
-            color: root.s.ink; font.family: root.s.family; font.pixelSize: 11 * root.s.scale
+            x: 12 * root.popupScale; y: 76 * root.popupScale
+            visible: root.s.canAdjustAgentCount || false
+            text: appLanguage.text("서브에이전트 표시 개수")
+            color: root.s.ink; font.family: root.s.family; font.pixelSize: 11 * root.popupScale
         }
-        Slider {
-            id: heightSlider
-            objectName: "heightSlider"
-            x: 12 * root.s.scale; y: 98 * root.s.scale
-            width: 170 * root.s.scale; height: 28 * root.s.scale
-            from: 480; to: 1440; stepSize: 1
-            value: root.preferredHeight
-            enabled: root.s.canAdjustHeight || false
-            padding: 5 * root.s.scale; hoverEnabled: true
-            focusPolicy: Qt.StrongFocus
-            Accessible.name: appLanguage.text("오버레이 높이")
-            Accessible.description: Math.round(value) + " px"
-            onPressedChanged: {
-                if (pressed) { root.presentation.startInteraction(); forceActiveFocus(Qt.MouseFocusReason); }
-                else root.presentation.finishHeight(Math.round(value));
-            }
-            onMoved: {
-                root.presentation.previewHeight(Math.round(value));
-                if (!pressed) root.presentation.finishHeight(Math.round(value));
-            }
-            background: Rectangle {
-                x: heightSlider.leftPadding; y: heightSlider.height / 2 - height / 2
-                width: heightSlider.availableWidth; height: 3 * root.s.scale; radius: root.s.scale
-                color: root.s.meta; opacity: heightSlider.enabled ? 0.45 : 0.2
-                Rectangle {
-                    width: heightSlider.visualPosition * parent.width; height: parent.height; radius: parent.radius
-                    color: root.s.accent
+        Row {
+            x: 12 * root.popupScale; y: 98 * root.popupScale
+            spacing: 4 * root.popupScale
+            visible: root.s.canAdjustAgentCount || false
+            Repeater {
+                model: [1, 2, 3, 4]
+                Button {
+                    id: countButton
+                    required property int modelData
+                    objectName: "agentCount-" + modelData
+                    width: 56 * root.popupScale; height: 28 * root.popupScale
+                    checkable: true
+                    autoExclusive: true
+                    hoverEnabled: true
+                    checked: (root.s.visibleAgentCount || 3) === modelData
+                    text: String(modelData)
+                    onPressed: root.presentation.startInteraction()
+                    onClicked: root.presentation.setAgentCount(modelData)
+                    Accessible.name: appLanguage.text("서브에이전트 표시 개수") + " " + text
+                    Accessible.checked: checked
+                    background: Rectangle {
+                        radius: 5 * root.popupScale
+                        color: countButton.checked ? root.s.accent : root.s.ink
+                        opacity: countButton.down ? .26 : countButton.hovered ? (countButton.checked ? .26 : .12) : countButton.checked ? .2 : .06
+                        border.width: countButton.visualFocus ? 2 : 0; border.color: root.s.accent
+                    }
+                    contentItem: Text {
+                        text: countButton.text; color: root.s.ink
+                        font.family: root.s.family; font.pixelSize: 11 * root.popupScale
+                        verticalAlignment: Text.AlignVCenter; horizontalAlignment: Text.AlignHCenter
+                    }
                 }
             }
-            handle: Rectangle {
-                x: heightSlider.leftPadding + heightSlider.visualPosition * (heightSlider.availableWidth - width)
-                y: heightSlider.height / 2 - height / 2
-                width: 12 * root.s.scale; height: width; radius: width / 2
-                color: root.s.accent; opacity: heightSlider.enabled ? 1 : 0.35
-                Rectangle {
-                    anchors.centerIn: parent; width: 22 * root.s.scale; height: width; radius: width / 2
-                    color: root.s.accent
-                    opacity: heightSlider.pressed ? 0.18 : heightSlider.hovered ? 0.12 : 0
-                }
-                Rectangle {
-                    anchors.fill: parent; anchors.margins: -4 * root.s.scale
-                    visible: heightSlider.visualFocus; radius: width / 2; color: "transparent"
-                    border.width: 2 * root.s.scale; border.color: root.s.accent
-                }
-            }
-        }
-        Text {
-            x: 188 * root.s.scale; y: 98 * root.s.scale
-            width: 60 * root.s.scale; height: 28 * root.s.scale
-            text: Math.round(heightSlider.value) + " px"
-            color: root.s.ink; font.family: root.s.family; font.pixelSize: 11 * root.s.scale
-            horizontalAlignment: Text.AlignRight; verticalAlignment: Text.AlignVCenter
         }
     }
 }

@@ -196,6 +196,26 @@ def test_delta_heartbeat_correction_deletion_restart_and_old_results():
     with pytest.raises(ValueError):receiver.receive(gap)
 
 
+def test_prepared_envelope_advances_unchanged_detail_pins_only_after_acceptance():
+    receiver=SnapshotReceiver()
+    summary=dict(home='home',id='unchanged',_overlay_revision=('store',1),recent=[{'key':'call'}])
+    first=dict(protocol=1,epoch='epoch',sequence=1,reset=True,prepared_token=('store',1),
+               sessions=[],overlay_sessions=[summary],removed=[])
+    original=receiver.receive(first)
+    update=dict(first,sequence=2,reset=False,prepared_token=('store',2),overlay_sessions=[])
+    current=receiver.receive(update)
+    assert current['overlay_sessions'][0]['_prepared_token']==('store',2)
+    assert current['overlay_sessions'][0]['_overlay_revision']==('store',1)
+    assert original['overlay_sessions'][0]['_prepared_token']==('store',1)
+    assert '_prepared_token' not in summary
+    assert receiver.receive(first) is None
+    with pytest.raises(ValueError):receiver.receive(dict(update,sequence=4,prepared_token=('store',4)))
+    assert receiver.sequence==2
+    final=receiver.receive(dict(update,sequence=3,prepared_token=('store',3)))
+    assert final['overlay_sessions'][0]['_prepared_token']==('store',3)
+    assert current['overlay_sessions'][0]['_prepared_token']==('store',2)
+
+
 @pytest.mark.parametrize('revision',('recovery:1','live:1'))
 def test_replacement_snapshot_releases_previous_raw_history(revision):
     import weakref

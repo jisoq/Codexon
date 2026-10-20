@@ -148,8 +148,9 @@ def test_pricing_ratio_always_reports_priced_and_total_calls_in_details():
     try:
         w.set_content(data);m=w.content_model
         group=m.detail_groups()[0];m.toggle_detail_group(group['key'])
-        assert any(item[0]==f"호출 {group['priced']:,}/{group['calls']:,}" for item in m.detail_items())
-        assert any(item[0]==f"호출 {data['main_usage']['priced']:,}/{data['main_usage']['calls']:,}" for item in m.main_items())
+        assert any(item[0]==f"토큰 구성 ({group['priced']:,}/{group['calls']:,})" for item in m.detail_items())
+        assert any(item[0]==f"토큰 구성 ({data['main_usage']['priced']:,}/{data['main_usage']['calls']:,})" for item in m.main_items())
+        assert not any(item[0]=='호출 비용' for item in [*m.detail_items(),*m.main_items()])
     finally:w.close();app.processEvents()
 
 
@@ -182,6 +183,46 @@ def test_subagent_groups_share_one_population_and_scroll_without_moving_main():
 def test_token_quantities_use_k_m_b_without_unit_word():
     from cachemonitor.overlay_view import amount
     assert [amount(n) for n in (999,1_250,1_250_000,1_250_000_000)]==['999','1.2K','1.2M','1.2B']
+    assert [amount(n) for n in (4_000,23_071_591,1_000_000_000)]==['4K','23.1M','1B']
+
+
+def test_overlay_currency_precision_is_shared_by_totals_charts_agents_and_details(monkeypatch):
+    import re
+    from cachemonitor.overlay_view import Drawing
+    from cachemonitor.overlay_data import main_usage
+    assert [money(n) for n in (0,.00001,.1,.123456,.99999,1,1.23456,20,23456.789,None)]==[
+        '$0.0000','$0.0000','$0.1000','$0.1235','$1.00','$1.00','$1.23','$20.00','$23,456.79','—']
+    app=QApplication.instance() or QApplication([]);w=SessionOverlay();drawn=[]
+    original_draw=Drawing.text
+    def record(d,value,*args,**kwargs):
+        drawn.append(str(value));return original_draw(d,value,*args,**kwargs)
+    monkeypatch.setattr(Drawing,'text',record)
+    data=subagent_summary();original=copy.deepcopy(data)
+    try:
+        w.set_content(data);m=w.content_model
+        for group in m.detail_groups():m.toggle_detail_group(group['key'])
+        m.monitor_action('main-detail')
+        image=QImage(m.panel_width(),m.panel_height(),QImage.Format_ARGB32_Premultiplied);image.fill(0)
+        painter=QPainter(image)
+        try:m.paint(painter)
+        finally:painter.end()
+        assert money(m.total_cost()) in drawn
+        assert money(data['child_cost']) in drawn
+        assert money(main_usage(data)['cost']) in drawn
+        assert any(value.startswith(money(m.displayed_call()['cost'])+' / ') for value in drawn)
+        texts=drawn.copy()
+        for item in [*m.main_items(),*m.detail_items()]:
+            texts.extend(item[0] if isinstance(item[0],list) else [str(item[0])])
+            texts.extend(str(item[8].get(key,'')) for key in ('tooltip','actionLabel'))
+        prices=re.findall(r'\$([\d,]+\.\d+)([KMB]?)','\n'.join(texts))
+        assert prices and not re.search(r'[\dKMB] 토큰','\n'.join(texts))
+        for value,suffix in prices:
+            assert not suffix
+            assert len(value.split('.')[1])==(4 if float(value.replace(',',''))<1 else 2)
+        pairs=[value for value in texts if re.match(r'[\d.]+[KMB] / \$',value)]
+        assert pairs
+        assert data==original
+    finally:w.close();app.processEvents()
 
 
 def test_main_expansion_preserves_charts_and_scales_column_width():

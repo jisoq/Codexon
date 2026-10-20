@@ -26,6 +26,9 @@ def summary(rows, metric):
 
 
 def project(engine, q):
+    if q.get('usage',{}).get('comparison'):
+        from .comparison_usage import project as comparison_project
+        return comparison_project(engine,q)
     # Display choices never invalidate the population or its aggregation.
     scope = {k:v for k,v in q.items() if k not in ('usage', 'presentation')}
     options = q.get('usage', {})
@@ -37,7 +40,7 @@ def project(engine, q):
     selected = options.get('selected', [])
     selection = dict(zip(selected[::2], selected[1::2])) if len(selected)%2 == 0 else {}
     selection = {key:value for key,value in selection.items() if key in (*DIMENSIONS,*BREAKDOWNS)}
-    stable={k:v for k,v in scope.items() if k not in ('now','loading') and (q.get('period')=='custom' or k not in ('start','end'))}
+    stable={k:v for k,v in scope.items() if k not in ('now','loading','_prepared_token') and (q.get('period')=='custom' or k not in ('start','end'))}
     signature=(engine.query_key(stable,calls_only=True),dimension,metric,tuple(selection.items()),breakdowns)
     cached=getattr(engine,'_category_projection',None)
     if cached and cached[0]==signature and q.get('now',q['end'])<cached[2]:
@@ -107,18 +110,29 @@ def project(engine, q):
         from .analysis_engine import retained_bytes
         cached=(signature,data,expiry(engine,q))
         engine._category_projection=cached if retained_bytes(cached,16*1024*1024)<=16*1024*1024 else None
-    categories=data['categories']
+    visible=display_rows(data['categories'],options,breakdowns)
+    # Deliver aggregate rows once; scrolling stays in the virtual presentation model.
+    population=dict(query=scope,path=['analysis','responses'])
+    return dict(common,valid_until=cached[2],usage={**{k:v for k,v in data.items() if k not in ('categories','common')},'rows':visible,
+                              'count':len(visible),'maximum':max([r['value'] or 0 for r in data['categories']]+[0]),
+                              'population':population})
+
+
+def unknown_category(field,value):
+    return value in (None,'','미확인') or field=='source' and value=='unknown'
+
+
+def display_rows(categories,options,breakdowns):
+    """Search and order aggregate rows without reading or changing their population."""
     search=options.get('search','').casefold()
     names={'user':'유저 에이전트','subagent':'하위 에이전트','unknown':'미확인'}
     visible=[r for r in categories if any(search in str(text).casefold() for text in (r['label'],r['group'],names.get(r['label'],r['label']),CATALOG.get(names.get(r['label'],r['label']),r['label']),*[CATALOG.get(v,v) for v in r['filters'].values()]))]
+    if not options.get('showUnknown',True):
+        visible=[r for r in visible if not any(unknown_category(k,v) for k,v in r['filters'].items())]
     order=options.get('sort','desc')
     def rank(value):return (value is None,(value or 0)*(1 if order=='asc' else -1))
     if breakdowns:
         visible.sort(key=lambda r:(r['group'].casefold(),r['label'].casefold()) if order=='name' else (rank(r['group_value']),r['group'],rank(r['value']),r['label']))
     else:
         visible.sort(key=lambda r:str(r['label']).casefold() if order=='name' else rank(r['value']))
-    # Deliver aggregate rows once; scrolling stays in the virtual presentation model.
-    population=dict(query=scope,path=['analysis','responses'])
-    return dict(common,valid_until=cached[2],usage={**{k:v for k,v in data.items() if k not in ('categories','common')},'rows':visible,
-                              'count':len(visible),'maximum':max([r['value'] or 0 for r in categories]+[0]),
-                              'population':population})
+    return visible

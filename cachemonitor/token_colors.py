@@ -73,13 +73,17 @@ def categorical(accent, backgrounds, count=6, rotation=0):
             for scale in (.88,.96):
                 col=lch(max(0,min(1,lightness+delta)),chroma*scale,hue+k*5)
                 if all(contrast_ratio(col,bg)>=3 for bg in backgrounds): pool.append(col)
-    pool=list(dict.fromkeys(pool));used=[]
+    pool=list(dict.fromkeys(pool));used=[];nearest=dict.fromkeys(pool,0)
     for i in range(count):
         preferred=lch(lightness,chroma*.92,hue+rotation+i*137.508)
         def score(col):
-            separation=min((color_distance(col,other) for other in used),default=0)
-            return separation-.38*color_distance(col,preferred)-.6*abs(oklab(col)[0]-lightness)
-        used.append(max(pool,key=score) if pool else readable(preferred,backgrounds,3))
+            return nearest[col]-.38*color_distance(col,preferred)-.6*abs(oklab(col)[0]-lightness)
+        selected=max(pool,key=score) if pool else readable(preferred,backgrounds,3)
+        # Update each candidate once instead of rescanning all previous agents.
+        for col in pool:
+            distance=color_distance(col,selected)
+            nearest[col]=min(nearest[col],distance) if used else distance
+        used.append(selected)
     return tuple(used)
 
 @lru_cache(maxsize=128)

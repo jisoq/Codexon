@@ -81,7 +81,14 @@ Item {
             Accessible.role: Accessible.StaticText
             Accessible.name: view.s.accessible
             Accessible.description: view.s.tooltip
-            UiIcon { name: view.s.iconName; anchors.centerIn: parent; width: 18; height: 18; ink: appTheme.color("accent") }
+            UiIcon {
+                id: refreshIcon
+                name: view.s.iconName; anchors.centerIn: parent; width: 18; height: 18; ink: appTheme.color("accent")
+                RotationAnimator on rotation {
+                    from: 0; to: 360; duration: 1000; loops: Animation.Infinite
+                    running: refreshIcon.visible && !!view.s.running
+                }
+            }
             HoverHandler { id: statusHover }
             UiToolTip { visible: statusHover.hovered; text: view.s.tooltip }
         }

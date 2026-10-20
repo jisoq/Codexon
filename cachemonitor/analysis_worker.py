@@ -203,6 +203,8 @@ class AnalysisBridge(QThread):
 
     def freeze_collection(self):
         with self.lock: self.enqueue_latest({'kind':'freeze'})
+    def request_snapshot(self):
+        with self.lock: self.enqueue_latest({'kind':'sync'})
     def set_cache_floor(self,value):
         with self.lock:
             if value==self.cache_floor:return
@@ -287,7 +289,8 @@ class AnalysisBridge(QThread):
                         elif message['kind']=='progress':self.progress.emit(message)
                         elif message['kind'] in ('error','fatal'):
                             self.failure.emit(message['error'])
-                            self.fault.emit(dict(query_failed=message['kind']=='error',
+                            self.fault.emit(dict(query_failed=message['kind']=='error' and message.get('consumer')!='publication',
+                                publication_failed=message.get('consumer')=='publication',
                                 fatal=message['kind']=='fatal',retrying=message['kind']=='fatal',
                                 request_id=message.get('id')))
                             if message['kind']=='fatal': break

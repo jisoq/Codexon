@@ -3,7 +3,7 @@ import math
 from .charts import dynamic_bounds
 from .overlay_navigation import navigation_target
 from .overlay_data import main_usage
-from .overlay_layout import ColumnLayout, WIDTH, MARGIN
+from .overlay_layout import ColumnLayout, WIDTH, MARGIN, HEADER_Y
 
 RIGHT=WIDTH-MARGIN
 SECTION_WIDTH=WIDTH-2*MARGIN
@@ -16,7 +16,7 @@ TITLE_WIDTH=HEADER_WIDTH-8
 POPUP_X=RIGHT-260
 INLINE_CLOSE_X=ACTIONS_X
 INLINE_HEADER_WIDTH=TITLE_WIDTH
-TITLE_Y=12
+TITLE_Y=HEADER_Y
 TITLE_HEIGHT=24
 SESSION_Y=362
 GRAPH_COUNT=3
@@ -40,7 +40,7 @@ def miss_text(data):
     from .i18n import formatted
     misses=data.get('cache_misses',{})
     if not misses.get('count'):return ''
-    return formatted('캐시 미적중 총 {count}회 ({tokens})',count=misses['count'],tokens=amount(misses.get('input'),True))
+    return formatted('캐시 미적중 총 {count}회 ({tokens})',count=misses['count'],tokens=amount(misses.get('input')))
 
 
 def header_status(m):
@@ -51,8 +51,8 @@ def header_status(m):
 def header_layout(m):return dict(title_width=TITLE_WIDTH,status_x=MARGIN,status_width=SECTION_WIDTH)
 
 
-def geometry(data, reduced=False, has_status=False, *, preferred_height=720, main_detail_height=0, available_height=None):
-    return ColumnLayout.create(preferred_height=preferred_height,main_detail_height=main_detail_height,
+def geometry(data, reduced=False, has_status=False, *, preferred_height=720, main_detail_height=0, available_height=None, auto_sub_height=80):
+    return ColumnLayout.create(preferred_height=preferred_height,main_detail_height=main_detail_height,auto_sub_height=auto_sub_height,
                                has_subagents=bool((data or {}).get('descendants',0)),has_status=has_status,reduced=reduced,
                                available_height=available_height).mapping()
 
@@ -121,7 +121,7 @@ def _chart(d,m,rows,key,label,y,height,displayed):
     from PySide6.QtGui import QColor,QPainterPath
     from .i18n import formatted
     value=graph_value(displayed,key)
-    text=money(value) if key=='cost' else speed(value) if key=='output_speed' else '—' if value is None else formatted('{tokens} 토큰',tokens=amount(value))
+    text=money(value) if key=='cost' else speed(value) if key=='output_speed' else amount(value)
     if key=='cost':text+=' / '+formatted('캐시 {rate}',rate=percent(graph_value(displayed,'cache_rate')))
     d.text(label,MARGIN,y,96,18,11,'secondary')
     d.text(text,MARGIN+96,y,SECTION_WIDTH-96,18,11,right=True)
@@ -155,17 +155,17 @@ def _chart(d,m,rows,key,label,y,height,displayed):
 
 def paint(d,m):
     if m.notice_card():return
-    from .overlay_view import paint_items,fitted_money
+    from .overlay_view import paint_items,money
     data=m.data or {};own=main_usage(data);g=m.layout();rows=m.rows()
     d.text('전체 비용',MARGIN,g['total'],56,28,11,'secondary')
     total_width=m.heartbeat_state()['x']-MARGIN-56-6
-    d.text(fitted_money(m.total_cost(),total_width,22,m.appearance.family),MARGIN+56,g['total'],total_width,28,22,weight=600)
+    d.text(money(m.total_cost()),MARGIN+56,g['total'],total_width,28,22,weight=600)
     displayed=m.displayed_call()
     for (key,label),y in zip(CHARTS,g['charts']):_chart(d,m,rows,key,label,y,g['chart_height'],displayed)
     displayed=m.latest_call()
     y=g['main'];color=m.graph_colors(rows)[(data.get('home'),data.get('id'))]
-    if m.has_subagents() and displayed and (displayed.get('home'),displayed.get('sid'))==(data.get('home'),data.get('id')):
-        d.rect(MARGIN-3,y-2,SECTION_WIDTH+6,g['main_height'],color,5,alpha=.13)
+    if m.agent_highlight_opacity>0 and displayed and (displayed.get('home'),displayed.get('sid'))==(data.get('home'),data.get('id')):
+        d.rect(MARGIN,y,SECTION_WIDTH,g['main_height'],color,5,alpha=m.agent_highlight_opacity)
     d.line(MARGIN,y-6,RIGHT,y-6)
     paint_items(d,[(item[0],item[1]+MARGIN,item[2]+y,*item[3:])
                    for item in m.agent_summary_items(own,'Main Agent',color,m.main_expanded,SECTION_WIDTH,main=True)])
@@ -176,7 +176,7 @@ def paint(d,m):
         d.text('Sub Agents',MARGIN,g['sub_heading'],80,20,12,weight=600)
         d.text(f"{data.get('descendants',0):,}",MARGIN+84,g['sub_heading'],40,20,11,'secondary')
         price_x,price_width=m.agent_cost_column(SECTION_WIDTH)
-        d.text(fitted_money(data.get('child_cost'),price_width,11,m.appearance.family),MARGIN+price_x,g['sub_heading'],price_width,20,11,'secondary')
+        d.text(money(data.get('child_cost')),MARGIN+price_x,g['sub_heading'],price_width,20,11,'secondary')
 
 
 def action_links(m):

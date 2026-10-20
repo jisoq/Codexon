@@ -64,7 +64,15 @@ def validate_exclusion(report, start, end, reason=''):
     if not account:
         raise ValueError('계정을 확인한 뒤 구간을 제외하세요.')
     period=bounds=None;has_start=has_end=False
-    for row in _history_rows(report,'weekly',labels=False,_resume=report.get('_history_resume')):
+    prepared=report.get('_edit_period')
+    if prepared:
+        from bisect import bisect_left
+        times=prepared['times']
+        def observed(at):
+            position=bisect_left(times,at)
+            return position<len(times) and times[position]==at
+        if observed(start) and observed(end):period=[prepared['start'],prepared['end']]
+    for row in (() if prepared else _history_rows(report,'weekly',labels=False,_resume=report.get('_history_resume'))):
         if row.get('account') != account:
             continue
         if bounds is None or row.get('reset_kind'):

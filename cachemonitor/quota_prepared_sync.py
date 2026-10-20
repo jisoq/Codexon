@@ -36,7 +36,8 @@ def require_append(db, transitions):
 
 def source_stamp(dependencies):
     from .prepared_store import pack
-    return sha256(pack(('quota-prepared-source', FORMAT, dependencies))).hexdigest()
+    from .prepared_ingest import fact_dependencies
+    return sha256(pack(('quota-prepared-source', FORMAT, fact_dependencies(dependencies)))).hexdigest()
 
 
 def _triggers():

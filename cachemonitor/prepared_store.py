@@ -16,6 +16,7 @@ import sys
 import time
 import uuid
 import zlib
+from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import wraps
@@ -59,6 +60,7 @@ KINDS = ('calls', 'requests', 'candidates', 'headers', 'sections')
 CHECKPOINT_TABLES = ('checkpoint_chunks', 'checkpoint_sections', 'checkpoint_versions',
                      'checkpoint_seen', 'checkpoint_retired', 'checkpoint_heads')
 DERIVED = ('summary', 'choices', 'model_alerts', 'checkpoint')
+HISTORY_FILTERS=('model_mismatch','observation_missing','observation_conflict','observation_problem')
 UNCHANGED = object()
 METRIC_COLUMNS = ','.join('m_' + name for name in METRICS)
 
@@ -81,6 +83,10 @@ class RebuildRequired(PreparedError):
 
 class CapacityExceeded(PreparedError):
     pass
+
+
+class BatchCapacityExceeded(CapacityExceeded):
+    """An aggregate staging cohort can be retried in smaller bounded groups."""
 
 
 class WriteDeferred(CapacityExceeded):
@@ -247,6 +253,45 @@ def _detail_pack(raw):
     """Compress one bounded nonmetric packet; changed calls remain independent."""
     compressed = zlib.compress(raw, 3) if len(raw) >= 64 else raw
     return b'\x01' + compressed if len(compressed) + 16 < len(raw) else b'\x00' + raw
+
+
+def _history_values(row):
+    from .analysis_records import available_fields
+    from .dashboard_views import matches
+    matched=tuple(name for name in HISTORY_FILTERS[:3] if matches(row,name))
+    if 'observation_missing' in matched or 'observation_conflict' in matched:
+        matched+=('observation_problem',)
+    return dict(available=tuple(name for name in available_fields([row]) if name not in OWNER_FIELDS),
+        matches=matched,
+        extra={name:row[name] for name in ('call_id','response_id','long_context','price_assumed') if name in row})
+
+
+def _history_header(values,limits):
+    return b'\x01'+_detail_pack(pack(values,limits))
+
+
+class _HistoryCache:
+    """Optional compatibility reuse, bounded independently of source length."""
+    def __init__(self,limit):
+        self.limit=min(limit,4*1024*1024);self.bytes=0;self.values=OrderedDict()
+
+    def get(self,key):
+        entry=self.values.get(key)
+        if entry is None:return None
+        self.values.move_to_end(key)
+        return entry[0]
+
+    def clear(self):
+        self.values.clear();self.bytes=0
+
+    def add(self,key,value):
+        amount=_size((key,value))+128
+        if amount>self.limit:return
+        old=self.values.pop(key,None)
+        if old is not None:self.bytes-=old[1]
+        while self.values and self.bytes+amount>self.limit:
+            self.bytes-=self.values.popitem(last=False)[1][1]
+        self.values[key]=(value,amount);self.bytes+=amount
 
 
 def _detail_unpack(packet, limits):
@@ -454,9 +499,12 @@ def _portable_token(value):
 class PreparedStore:
     """Exclusive writer for one dedicated, disposable analysis database."""
     def __init__(self, path, limits=Limits()):
+        from .prepared_changes import GenerationJournal
+        self.changes=GenerationJournal()
         self.path, self.limits = Path(path).resolve(), limits
         self.db = None
         self.stage = None
+        self._reader = None
         self.lock = ProcessLock(self.path.with_suffix(self.path.suffix + '.writer.lock'))
         self.lock.__enter__()
         try:
@@ -680,13 +728,28 @@ class PreparedStore:
     @contextmanager
     def read_current(self, *, staged=False, cancel=None, seconds=None):
         """Writer-only conversion view. Normal readers still require readiness."""
+        if self.db is None:
+            raise PreparedError('the prepared store is closed')
         if staged and self.stage is None:
             raise IncompletePublication('there is no active staged batch')
         batch = self.stage.batch if staged else None
-        with PreparedReader(self.path, self.limits) as reader:
+        # The slot owns only an idle connection. Nested contexts get their own
+        # reader even when an outer snapshot was cancelled or closed early.
+        reader, self._reader = self._reader, None
+        if reader is None:
+            reader = PreparedReader(self.path, self.limits)
+        try:
+            reader.limits = self.limits
             with reader._pin(self.token, cancel=cancel, seconds=seconds,
                              allow_incomplete=True, staged_batch=batch) as snapshot:
                 yield snapshot
+            # A suspended speed generator still owns deferred TEMP cleanup.
+            # Retire its connection so finalization cannot touch a later read.
+            if self.db is not None and self._reader is None and not snapshot.speed_active:
+                self._reader, reader = reader, None
+        finally:
+            if reader is not None:
+                reader.close()
 
     def maintain(self, *, rows=16):
         """One bounded slice. Call from the writer's existing maintenance duty."""
@@ -856,14 +919,23 @@ class PreparedStore:
         self.db.execute('DELETE FROM owners WHERE id=?', (owner,))
 
     def close(self):
-        if self.db is not None:
-            if self.db.in_transaction:
-                self.db.execute('ROLLBACK')
-            self.db.close()
-            self.db = None
-        if self.lock is not None:
-            self.lock.__exit__(None, None, None)
-            self.lock = None
+        reader, self._reader = self._reader, None
+        try:
+            if reader is not None:
+                reader.close()
+        finally:
+            try:
+                if self.db is not None:
+                    try:
+                        if self.db.in_transaction:
+                            self.db.execute('ROLLBACK')
+                    finally:
+                        self.db.close()
+                        self.db = None
+            finally:
+                if self.lock is not None:
+                    self.lock.__exit__(None, None, None)
+                    self.lock = None
 
     def __enter__(self):
         return self
@@ -877,6 +949,8 @@ class Stage:
         self.store, self.db, self.limits = store, store.db, store.limits
         self.batch, self.expected, self.source = batch, expected, source
         self.owners = {}
+        self.removed_owners=set()
+        self.history_headers={};self.history_header_bytes=0
         self.reconciled = set()
         self.reconciling = set()
         self.empty_reconciliations = set()
@@ -922,10 +996,19 @@ class Stage:
             raise IncompletePublication('staging batch is closed')
 
     def _charge(self, amount):
-        current = self.db.execute('SELECT input_bytes FROM publications WHERE id=?', (self.batch,)).fetchone()[0]
-        if current + amount > self.limits.staging_bytes:
-            raise CapacityExceeded('staging payload and inventory budget exceeded')
-        self.db.execute('UPDATE publications SET input_bytes=input_bytes+? WHERE id=?', (amount, self.batch))
+        self._live()
+        if type(amount) is not int or amount < 0:
+            raise ValueError('staging charge must be a nonnegative integer')
+        if amount > self.limits.staging_bytes:
+            raise BatchCapacityExceeded('staging payload and inventory budget exceeded')
+        changed = self.db.execute('UPDATE publications SET input_bytes=input_bytes+? '
+            'WHERE id=? AND state=0 AND input_bytes<=?',
+            (amount, self.batch, self.limits.staging_bytes - amount)).rowcount
+        if changed != 1:
+            state = self.db.execute('SELECT state FROM publications WHERE id=?', (self.batch,)).fetchone()
+            if state is None or state[0] != 0:
+                raise IncompletePublication('staging batch is closed')
+            raise BatchCapacityExceeded('staging payload and inventory budget exceeded')
 
     def owner(self, home, sid, metadata, dependencies, *, source_ordinal=None, request_maps=UNCHANGED, call_metadata=UNCHANGED, replace=False, summary=UNCHANGED,
               choices=UNCHANGED, model_alerts=UNCHANGED, checkpoint=UNCHANGED):
@@ -1069,6 +1152,14 @@ class Stage:
 
     def _call(self, owner, row, metadata):
         row = dict(compact_record(row))
+        header=_history_values(row)
+        header_key=(header['available'],header['matches']) if not header['extra'] else None
+        projection=self.history_headers.get(header_key) if header_key is not None else None
+        if projection is None:
+            projection=_history_header(header,self.limits)
+            amount=_size(header_key)+len(projection)+128
+            if header_key is not None and len(self.history_headers)<128 and self.history_header_bytes+amount<=1024*1024:
+                self.history_headers[header_key]=projection;self.history_header_bytes+=amount
         key = identity(row['key'], self.limits)
         key_value = pack(row.pop('key'), self.limits, maximum=self.limits.key_bytes)
         timestamp = _number(row['ts'], 'ts')
@@ -1094,13 +1185,18 @@ class Stage:
             values.append(value)
             row.pop(name, None)
         detail = pack(row, self.limits)
-        types = bytes(tags)
-        encoded = pack((key_value, turn_value, mask, types, values, detail), self.limits)
+        types = bytes(tags)+projection
+        encoded = pack((key_value, turn_value, mask, bytes(tags), values, detail), self.limits)
+        # pack encodes byte strings as hex; retain that exact packet charge.
+        encoded_bytes=len(encoded)+2*len(projection)
+        if encoded_bytes>self.limits.packet_bytes:
+            # Optional acceleration must not reject an otherwise valid call.
+            types=bytes(tags);encoded_bytes=len(encoded)
         # timestamp/ordinal are columns already; this check guards future field drift.
         assert values[0] == timestamp and values[1] == ordinal
         signature = hashlib.sha256(encoded).digest()
         return (owner, key, self.batch, 0, signature, key_value, turn_value, turn_key,
-                mask, types, _detail_pack(detail), len(encoded), *values)
+                mask, types, _detail_pack(detail), encoded_bytes, *values)
 
     def _request(self, owner, item):
         key, ordinal, metadata = item
@@ -1305,6 +1401,74 @@ class Stage:
         """Rows are (section key,item key,ordinal,optional timestamp,exact value)."""
         self._upsert('sections',owner,rows,reconcile=reconcile)
 
+    def facts(self, owner_key, *, sections, calls, requests, headers):
+        """Combine a new owner's fact kinds within the existing write budgets.
+
+        Existing inventories retain their reconciliation path. Fresh primary
+        keys still reject duplicates, including those crossing a flush. The
+        publication marker, not a fact transaction, makes an owner visible.
+        """
+        owner = self._owner(owner_key)
+        streams = dict(sections=sections, calls=calls, requests=requests, headers=headers)
+        fresh = self.limits.fact_write_objects > 1024 and all(
+            self.db.execute(f'SELECT 1 FROM {kind} WHERE owner=? LIMIT 1', (owner,)).fetchone() is None
+            for kind in streams)
+        if not fresh:
+            for kind, items in streams.items():
+                self._upsert(kind, owner_key, items, reconcile=True)
+            return
+        row = self.db.execute('SELECT metadata,call_metadata FROM owner_versions WHERE owner=? AND batch=?',
+                              (owner, self.batch)).fetchone()
+        metadata = {**unpack(row[0], self.limits), **unpack(row[1], self.limits)}
+        encoders = dict(sections=lambda item:self._section(owner,item),
+                        calls=lambda item:self._call(owner,item,metadata),
+                        requests=lambda item:self._request(owner,item),
+                        headers=lambda item:self._header(owner,item))
+        pending = {kind:[] for kind in streams}
+        count = encoded = 0
+        objects = 1024
+
+        def flush():
+            nonlocal count, encoded, objects
+            if not count: return
+            with self.store._transaction():
+                self._charge(encoded)
+                for kind, records in pending.items():
+                    if records:
+                        self.db.executemany(f'INSERT INTO {kind} VALUES({",".join("?" for _ in records[0])})', records)
+            for kind, records in pending.items():
+                self.writes[kind] += len(records)
+                records.clear()
+            count = encoded = 0
+            objects = 1024
+
+        try:
+            for kind in streams:
+                self.start_reconcile(owner_key, kind)
+            for kind, items in streams.items():
+                for item in items:
+                    record = encoders[kind](item)
+                    size = record[11] if kind == 'calls' else record[-1]
+                    retained = _size(record) + 16
+                    if size > self.limits.fact_write_bytes or retained-16 > self.limits.fact_write_objects:
+                        raise CapacityExceeded('one encoded fact exceeds its transaction budget')
+                    if retained+1024 > self.limits.fact_write_objects:
+                        flush()
+                        self._upsert(kind,owner_key,(item,),reconcile=False)
+                        continue
+                    if count and (count >= self.limits.fact_write_rows or
+                                  encoded+size > self.limits.fact_write_bytes or
+                                  objects+retained > self.limits.fact_write_objects):
+                        flush()
+                    pending[kind].append(record)
+                    count += 1; encoded += size; objects += retained
+            flush()
+            for kind in streams:
+                self.finish_reconcile(owner_key, kind)
+        except BaseException:
+            self.failed = True
+            raise
+
     def _checkpoint_previous(self, namespace, name):
         return self.db.execute('SELECT r.* FROM checkpoint_sections r JOIN publications p ON p.id=r.batch '
             f'WHERE r.namespace=? AND r.name=? AND {_checkpoint_latest(batch=self.batch)}',
@@ -1468,6 +1632,7 @@ class Stage:
         with self.store._transaction():
             self.db.execute('UPDATE owner_versions SET deleted=1 WHERE owner=? AND batch=?', (owner_id, self.batch))
             self.db.execute('INSERT INTO owner_retired VALUES(?,?)', (owner_id, self.batch))
+        self.removed_owners.add(tuple(owner))
 
     def publish(self, source_identity, *, ready):
         self._live()
@@ -1509,6 +1674,9 @@ class Stage:
             if self.store.token == published:
                 self.finished = True
                 self.store.stage = None
+                self.store.changes.add(((self.expected.instance,self.expected.generation),
+                    (published.instance,published.generation),tuple(self.owners.keys()-self.removed_owners),
+                    tuple(self.removed_owners)))
         return published
 
     def abort(self):
@@ -1526,7 +1694,9 @@ class PreparedReader:
         self.db = sqlite3.connect(self.path.as_uri() + '?mode=ro', uri=True, timeout=.2, isolation_level=None)
         self.db.row_factory = sqlite3.Row
         self.active = None
+        self.history_headers=_HistoryCache(limits.page_objects_bytes)
         try:
+            self.db.create_function('history_types',4,lambda *key:self.history_headers.get(key))
             self.db.execute('PRAGMA temp_store=FILE')
             self.db.execute('PRAGMA temp.cache_size=-4096')
             self.db.execute('PRAGMA query_only=ON')
@@ -1554,6 +1724,7 @@ class PreparedReader:
         if self.db is not None:
             self.db.close()
             self.db = None
+        self.history_headers.clear()
 
     def __enter__(self):
         return self
@@ -1591,6 +1762,7 @@ class Snapshot:
             if row is None or row['format'] != FORMAT:
                 raise RebuildRequired('prepared schema version changed')
             self.token = Token(row['instance'], row['generation'])
+            self.ready = bool(row['ready'])
             self.order_batch = row['order_batch']
             if staged_batch is not None and self.db.execute(
                     'SELECT 1 FROM catalog_orders WHERE batch=? LIMIT 1', (staged_batch,)).fetchone():
@@ -1644,6 +1816,10 @@ class Snapshot:
             self.close()
             raise ReadCancelled('read deadline or cancellation reached')
 
+    def check(self):
+        """Keep cache-only consumers inside the pinned read lease."""
+        self._check()
+
     @contextmanager
     def _cursor(self, sql, args=()):
         self._check()
@@ -1658,23 +1834,26 @@ class Snapshot:
                 raise ReadCancelled('read deadline, cancellation, or VM-step budget reached') from error
             raise
         finally:
-            if cursor is not None:
+            if cursor is not None and self.reader.db is not None:
                 cursor.close()
 
-    def _owner(self, key, *, metadata=True):
+    def _owner(self, key, *, metadata=True, publication=False):
         columns = f'o.id,{self._rank()} AS source_ordinal,v.request_mask,v.metadata,v.call_metadata,v.dependencies' if metadata else 'o.id'
+        if publication:columns+=',v.summary,v.choices,v.model_alerts'
         with self._cursor(f'SELECT {columns} FROM {self._owner_tables()} '
                           'WHERE o.home=? AND o.sid=? AND v.deleted=0', key) as cursor:
             row = cursor.fetchone()
         return row
 
     @_read_operation
-    def owner(self, home, sid):
-        row = self._owner((home, sid))
+    def owner(self, home, sid, *, publication=False):
+        row = self._owner((home, sid),publication=publication)
         if row is None:
             return None
         return dict(owner_ordinal=row['source_ordinal'], request_maps=self._request_maps(row), **{
-            name: unpack(row[name], self.limits) for name in ('metadata', 'call_metadata', 'dependencies')})
+            name: unpack(row[name], self.limits) for name in
+            (('metadata', 'call_metadata', 'dependencies')+('summary','choices','model_alerts') if publication
+             else ('metadata', 'call_metadata', 'dependencies'))})
 
     @staticmethod
     def _request_maps(row):
@@ -1691,6 +1870,108 @@ class Snapshot:
                           'WHERE o.home=? AND o.sid=? AND v.deleted=0', (home, sid)) as cursor:
             row = cursor.fetchone()
         return unpack(row[0], self.limits) if row else None
+
+    @_read_operation
+    def ledger_source(self, home, sid):
+        """Read the source proof and coverage metadata, without call joins."""
+        with self._cursor(f'SELECT v.metadata,v.dependencies FROM {self._owner_tables()} '
+                          'WHERE o.home=? AND o.sid=? AND v.deleted=0', (home, sid)) as cursor:
+            row = cursor.fetchone()
+        return ({name: unpack(row[name], self.limits) for name in ('metadata', 'dependencies')}
+                if row is not None else None)
+
+    @_read_operation
+    def financial_member(self, home, sid):
+        """Read lineage and its stored financial summary from one version."""
+        with self._cursor(f'SELECT v.metadata,v.summary FROM {self._owner_tables()} '
+                          'WHERE o.home=? AND o.sid=? AND v.deleted=0', (home, sid)) as cursor:
+            row = cursor.fetchone()
+        return ({name: unpack(row[name], self.limits) for name in ('metadata', 'summary')}
+                if row is not None else None)
+
+    @contextmanager
+    def member_packets(self, owners, kind):
+        """Stream narrow cache misses in caller order inside an explicit lease.
+
+        Only one decoded owner is live at a time. Exiting the context closes
+        both the iterator and SQL cursor, including cancellation and failures.
+        """
+        self._check()
+        if self.staged_batch is not None or not self.ready:
+            raise NotReady('member packets require a complete committed snapshot')
+        fields = {'ledger':('metadata','dependencies'), 'finance':('metadata','summary')}[kind]
+        if (not isinstance(owners, (list, tuple)) or len(owners)>128 or
+                any(not isinstance(key, (list, tuple)) or len(key)!=2 or
+                    any(type(part) is not str for part in key) for key in owners)):
+            raise ValueError('select at most 128 owner identities')
+        keys = tuple(map(tuple, owners))
+        if len(set(keys)) != len(keys):
+            raise ValueError('selected owner identities must be unique')
+        if not keys:
+            yield iter(())
+            return
+        args = tuple(part for key in keys for part in key)
+        selected = ','.join(f'(?,?,{index})' for index in range(len(keys)))
+        columns = ','.join('v.'+name for name in fields)
+        sql = (f'WITH selected(home,sid,position) AS (VALUES {selected}) '
+               f'SELECT o.home,o.sid,v.batch,{columns} FROM {self._owner_tables()} '
+               'JOIN selected s ON s.home=o.home AND s.sid=o.sid WHERE v.deleted=0 ORDER BY s.position')
+        with self._cursor(sql, args) as cursor:
+            def decoded():
+                try:
+                    for row in cursor:
+                        self._check()
+                        packet = {name:unpack(row[name], self.limits) for name in fields}
+                        owner, revision = (row['home'],row['sid']), (self.token.instance,row['batch'])
+                        del row
+                        yield owner, revision, packet
+                        del packet
+                except Exception:
+                    self.close()
+                    raise
+            iterator = decoded()
+            try:
+                yield iterator
+            finally:
+                iterator.close()
+
+    @_read_operation
+    def owner_revisions(self, owners=None, *, after=None):
+        """Resolve immutable committed versions in the current complete snapshot.
+
+        Ordering is separate from a body's version. Selected reads omit absent
+        owners; callers must check membership rather than reuse a missing head.
+        Staged bodies can change in place and cannot prove cache reuse.
+        """
+        if self.staged_batch is not None or not self.ready:
+            raise NotReady('owner revision reuse requires a complete committed snapshot')
+        args = dict(ordinal=after[0] if after else 0, owner=after[1] if after else 0,
+                    n=self.limits.page_rows + 1)
+        where = f'({self._rank()},v.owner)>(:ordinal,:owner)' if after is not None else '1'
+        if owners is not None:
+            if (not isinstance(owners, (list, tuple)) or len(owners) > 128 or
+                    any(not isinstance(key, (list, tuple)) or len(key) != 2 or
+                        any(type(part) is not str for part in key) for key in owners)):
+                raise ValueError('select at most 128 owner identities')
+            keys = tuple(map(tuple, owners))
+            if len(set(keys)) != len(keys):
+                raise ValueError('selected owner identities must be unique')
+            if not keys:
+                return Page((), None, True, 0, 0)
+            names = []
+            for index, (home, sid) in enumerate(keys):
+                args[f'home{index}'], args[f'sid{index}'] = home, sid
+                names.append(f'(:home{index},:sid{index})')
+            where += ' AND (o.home,o.sid) IN (VALUES ' + ','.join(names) + ')'
+        sql = (f'SELECT o.home,o.sid,v.owner,v.batch,{self._rank()} AS source_ordinal '
+               f'FROM {self._owner_tables()} WHERE v.deleted=0 AND {where} '
+               f'ORDER BY {self._rank()},v.owner LIMIT :n')
+        return self._page(sql, args,
+            lambda row: dict(owner=(row['home'], row['sid']),
+                             revision=(self.token.instance, row['batch']),
+                             owner_ordinal=row['source_ordinal']),
+            lambda row: (row['source_ordinal'], row['owner']),
+            lambda row: len(row['home']) * 4 + len(row['sid']) * 4 + 64)
 
     def _page(self, sql, args, decode, cursor_key, encoded_size):
         rows, size, objects, after, complete = [], 0, 0, None, True
@@ -1712,11 +1993,34 @@ class Snapshot:
         return Page(tuple(rows), after, complete, size, objects)
 
     @_read_operation
-    def inventory(self, *, after=None):
+    def inventory(self, *, after=None, owners=None):
         """Conversion inventory excludes public metadata and classifier arrays."""
         args = dict(ordinal=after[0] if after else 0,owner=after[1] if after else 0,n=self.limits.page_rows+1)
         where = f'({self._rank()},v.owner)>(:ordinal,:owner)' if after is not None else '1'
-        sql = (f'SELECT o.home,o.sid,v.owner,{self._rank()} AS source_ordinal,v.dependencies FROM {self._owner_tables()} '
+        if owners is not None:
+            keys=tuple(map(tuple,owners))
+            if len(keys)>128 or len(set(keys))!=len(keys):raise ValueError('select at most 128 unique owners')
+            if not keys:return Page((),None,True,0,0)
+            selected=[]
+            for i,(home,sid) in enumerate(keys):
+                args[f'home{i}'],args[f'sid{i}']=home,sid
+                selected.append(f'(:home{i},:sid{i})')
+            where+=' AND (o.home,o.sid) IN (VALUES '+','.join(selected)+')'
+        prefix, tables = '', self._owner_tables()
+        if self.staged_batch is not None:
+            # Resolve one visible version pointer per owner before joining the
+            # wide owner rows. The correlated staged lookup otherwise repeats
+            # while SQLite scans historical versions. Keep tombstones here so
+            # a staged deletion cannot expose the committed predecessor.
+            prefix = (f'WITH staged_owners AS MATERIALIZED (SELECT owner,batch FROM owner_versions '
+                      f'WHERE batch={int(self.staged_batch)}), visible_owners AS MATERIALIZED ('
+                      'SELECT owner,batch FROM staged_owners UNION ALL '
+                      'SELECT h.owner,h.batch FROM owner_heads h LEFT JOIN staged_owners s '
+                      'ON s.owner=h.owner WHERE s.owner IS NULL) ')
+            tables = ('visible_owners current JOIN owners o ON o.id=current.owner '
+                      'JOIN owner_versions v ON v.owner=current.owner AND v.batch=current.batch '
+                      f'LEFT JOIN catalog_orders rank ON rank.owner=o.id AND rank.batch={int(self.order_batch)}')
+        sql = (prefix+f'SELECT o.home,o.sid,v.owner,{self._rank()} AS source_ordinal,v.dependencies FROM {tables} '
                f'WHERE v.deleted=0 AND {where} ORDER BY {self._rank()},v.owner LIMIT :n')
         return self._page(sql,args,lambda r:dict(owner=(r['home'],r['sid']),owner_ordinal=r['source_ordinal'],
                           dependencies=unpack(r['dependencies'],self.limits)),
@@ -1724,22 +2028,31 @@ class Snapshot:
                           lambda r:len(r['dependencies'])+len(r['home'])*4+len(r['sid'])*4)
 
     @_read_operation
-    def catalog(self, *, after=None):
+    def catalog(self, *, after=None, publication=False, query=False, home=None, sid=None):
         args = dict(ordinal=after[0] if after else 0, owner=after[1] if after else 0, n=self.limits.page_rows + 1)
         where = f'({self._rank()},v.owner)>(:ordinal,:owner)' if after is not None else '1'
-        sql = (f'SELECT o.home,o.sid,v.owner,{self._rank()} AS source_ordinal,v.request_mask,v.metadata,v.call_metadata,v.dependencies FROM {self._owner_tables()} '
+        for name,value in (('home',home),('sid',sid)):
+            if value is not None:
+                where+=f' AND o.{name}=:{name}';args[name]=value
+        fields=('metadata','call_metadata') if query else ('metadata','call_metadata','dependencies')
+        if publication:fields+=('summary','choices','model_alerts')
+        columns=','.join('v.'+name for name in fields)
+        sql = (f'SELECT o.home,o.sid,v.owner,{self._rank()} AS source_ordinal,v.request_mask,{columns} FROM {self._owner_tables()} '
                f'WHERE v.deleted=0 AND {where} ORDER BY {self._rank()},v.owner LIMIT :n')
         return self._page(sql, args,
             lambda r: dict(owner=(r['home'], r['sid']), owner_ordinal=r['source_ordinal'], request_maps=self._request_maps(r), **{name: unpack(r[name], self.limits)
-                         for name in ('metadata', 'call_metadata', 'dependencies')}),
+                         for name in fields}),
             lambda r: (r['source_ordinal'], r['owner']),
-            lambda r: sum(len(r[name]) for name in ('metadata', 'call_metadata', 'dependencies')))
+            lambda r: sum(len(r[name]) for name in fields))
 
     @_read_operation
-    def ordering(self, *, after=None):
+    def ordering(self, *, after=None, home=None, sid=None):
         args = dict(ordinal=after[0] if after else 0, owner=after[1] if after else 0,
                     n=self.limits.page_rows+1)
         where = f'({self._rank()},o.id)>(:ordinal,:owner)' if after is not None else '1'
+        for name,value in (('home',home),('sid',sid)):
+            if value is not None:
+                where+=f' AND o.{name}=:{name}';args[name]=value
         sql = (f'SELECT o.home,o.sid,o.id,{self._rank()} AS ordinal FROM {self._owner_tables()} '
                f'WHERE v.deleted=0 AND {where} ORDER BY {self._rank()},o.id LIMIT :n')
         return self._page(sql,args,lambda row:dict(owner=(row['home'],row['sid']),owner_ordinal=row['ordinal']),
@@ -1800,7 +2113,7 @@ class Snapshot:
                           cursor_key, lambda r: r['encoded_bytes'])
 
     @_read_operation
-    def projected_calls(self, owner, fields, *, start=None, end=None, after=None):
+    def projected_calls(self, owner, fields, *, start=None, end=None, after=None, history=False, turn=None, filters=None, ordinal_start=None):
         """A bounded typed projection, with no unrequested detail or key decode.
 
         Canonical owner defaults are shared by the writer. Rare explicitly
@@ -1809,7 +2122,7 @@ class Snapshot:
         """
         if not isinstance(fields,(tuple,list)) or not fields:
             raise ValueError('projection fields must be a nonempty field sequence')
-        selected=tuple(dict.fromkeys(fields))
+        selected=tuple(dict.fromkeys((*METRICS,*OWNER_FIELDS,'key','turn') if history else fields))
         if any(type(name) is not str or name not in (*METRICS,*OWNER_FIELDS,'key','turn') for name in selected):
             raise ValueError('unknown prepared call projection field')
         owner_fields=tuple(name for name in selected if name in OWNER_FIELDS)
@@ -1826,8 +2139,37 @@ class Snapshot:
         if owner_fields:
             covered=f'(r.owner_mask | (r.owner_mask >> {len(OWNER_FIELDS)}))'
             columns.extend(('r.owner_mask',f'CASE WHEN ({covered} & {mask})={mask} THEN NULL ELSE r.detail END AS override_detail'))
+        if history:
+            cached='history_types(:instance,r.owner,r.identity,r.batch)'
+            columns[1]=f'CASE WHEN length(r.types)={len(METRICS)} THEN coalesce({cached},r.types) ELSE r.types END AS types'
+            columns.extend(('r.batch',f'CASE WHEN length(r.types)={len(METRICS)} AND {cached} IS NULL THEN r.detail ELSE NULL END AS legacy_detail'))
         args=dict(owner=meta['id'],n=self.limits.page_rows+1)
+        if history:args['instance']=self.token.instance
         where=['r.owner=:owner','r.deleted=0',self._visible('calls')]
+        if ordinal_start is not None:
+            args['ordinal_start']=_number(ordinal_start,'ordinal_start')
+            where.append('r.m_session_ordinal>=:ordinal_start')
+        # Filter scalar columns before decoding and accounting for page objects.
+        # Keep the display-mode override and conflict semantics of display_tier.
+        def nonempty(column):
+            return f"({column} IS NOT NULL AND {column} NOT IN ('',0,x''))"
+        for name in ('model','effort'):
+            value=(filters or {}).get(name)
+            if not value:continue
+            args['filter_'+name]=value
+            column='r.m_'+name
+            where.append(f"(CASE WHEN {nonempty(column)} THEN {column} ELSE '미확인' END)=:filter_{name}")
+        mode=(filters or {}).get('service_tier')
+        if mode:
+            args['filter_mode']=mode
+            mode_sql=("CASE WHEN "+nonempty('r.m_display_service_tier')+" THEN r.m_display_service_tier "
+                "WHEN "+nonempty('r.m_mode_conflict')+" OR r.m_service_tier_source='conflict' THEN '미확인' "
+                "WHEN NOT "+nonempty('r.m_service_tier')+" THEN '미확인' "
+                "ELSE CASE r.m_service_tier WHEN 'priority' THEN 'Fast' WHEN 'fast' THEN 'Fast' "
+                "WHEN 'default' THEN 'Standard' WHEN 'standard' THEN 'Standard' ELSE r.m_service_tier END END")
+            where.append(f'({mode_sql})=:filter_mode')
+        if turn is not None:
+            args['turn']=identity(turn,self.limits);where.append('r.turn_identity=:turn')
         for name,value,operation in (('start',start,'>='),('end',end,'<')):
             if value is not None:
                 args[name]=_number(value,name);where.append(f'r.m_ts{operation}:{name}')
@@ -1836,10 +2178,13 @@ class Snapshot:
                 raise ValueError('invalid projected call cursor')
             args.update(zip(('ts','ordinal','key'),after))
             where.append('(r.m_ts,r.m_session_ordinal,r.identity)>(:ts,:ordinal,:key)')
-        sql=(f'SELECT {",".join(columns)} FROM calls r INDEXED BY calls_time '
+        index='calls_ordinal' if ordinal_start is not None else 'calls_time'
+        sql=(f'SELECT {",".join(columns)} FROM calls r INDEXED BY {index} '
              f'JOIN publications p ON p.id=r.batch WHERE {" AND ".join(where)} '
              'ORDER BY r.m_ts,r.m_session_ordinal,r.identity LIMIT :n')
+        headers={};legacy_packets={};header_bytes=0
         def decode(row):
+            nonlocal header_bytes
             result={}
             for name,index in metric_indices.items():
                 tag=row['types'][index]
@@ -1855,11 +2200,45 @@ class Snapshot:
                         result[name]=metadata[name]
                     elif not row['owner_mask'] & (1<<(OWNER_FIELDS.index(name)+len(OWNER_FIELDS))) and name in detail:
                         result[name]=detail[name]
+            if history:
+                if row['legacy_detail'] is not None:
+                    result={**_detail_unpack(row['legacy_detail'],self.limits),**result}
+                    self.history_legacy_rows=getattr(self,'history_legacy_rows',0)+1
+                    header=_history_values(result)
+                    key=(row['types'],header['available'],header['matches']) if not header['extra'] else None
+                    packet=legacy_packets.get(key) if key is not None else None
+                    if packet is None:
+                        packet=row['types']+_history_header(header,self.limits)
+                        amount=_size(key)+len(packet)+128
+                        if key is not None and header_bytes+amount<=min(1024*1024,self.limits.page_objects_bytes//4):
+                            legacy_packets[key]=packet;header_bytes+=amount
+                    self.reader.history_headers.add((self.token.instance,meta['id'],row['identity'],row['batch']),
+                        packet)
+                    self._remember_history_record(owner,result)
+                else:
+                    packet=row['types'][len(METRICS):]
+                    header=headers.get(packet)
+                    if header is None:
+                        header=(_detail_unpack(packet[1:],self.limits) if packet[:1]==b'\x01'
+                                else unpack(packet,self.limits))
+                        amount=len(packet)+_size(header)+128
+                        if header_bytes+amount<=min(1024*1024,self.limits.page_objects_bytes//4):
+                            headers[packet]=header;header_bytes+=amount
+                result.update(header['extra'])
+                from .analysis_records import available_fields
+                result['_available_fields']=tuple(dict.fromkeys((*header['available'],
+                    *available_fields([{name:result[name] for name in OWNER_FIELDS if name in result}]))))
+                result['_history_matches']=header['matches']
             return result
         def charge(row):
             return 128+sum(len(value.encode('utf-8')) if type(value) is str else
                            len(value) if type(value) is bytes else 8 for value in row)
         return self._page(sql,args,decode,lambda row:(row['m_ts'],row['m_session_ordinal'],row['identity']),charge)
+
+    def _remember_history_record(self,owner,result):
+        if not hasattr(self,'history_records'):
+            self.history_records=_HistoryCache(self.limits.page_objects_bytes)
+        self.history_records.add((*owner,result['key']),dict(result))
 
     @_read_operation
     def record(self, home, sid, key):
@@ -1870,7 +2249,13 @@ class Snapshot:
                           f'WHERE r.owner=? AND r.identity=? AND r.deleted=0 AND {self._visible("calls")}',
                           (meta['id'], identity(key, self.limits))) as cursor:
             row = cursor.fetchone()
-        return self._decode_call(row, self._call_metadata(meta)) if row else None
+        if row is None:return None
+        result=self._decode_call(row,self._call_metadata(meta))
+        if len(row['types'])==len(METRICS):
+            self.reader.history_headers.add((self.token.instance,meta['id'],row['identity'],row['batch']),
+                row['types']+_history_header(_history_values(result),self.limits))
+            self._remember_history_record((home,sid),compact_record(result))
+        return result
 
     @_read_operation
     def records(self, owner, keys, *, after=None):
@@ -2507,6 +2892,7 @@ class Snapshot:
             if self.db.in_transaction:
                 self.db.execute('ROLLBACK')
             self.closed = True
+            if hasattr(self,'history_records'):self.history_records.clear()
             if self.reader.active is self:
                 self.reader.active = None
 

@@ -13,6 +13,7 @@ import math
 
 FORMAT = 1
 TAIL_ROWS = 128
+CHAIN_PACKETS = 32
 RETAINED_BYTES = 16 * 1024 * 1024
 RESPONSE_BYTES = 4 * 1024 * 1024
 METADATA_BYTES = 64 * 1024
@@ -37,8 +38,6 @@ def digest(value):
 def context_digest(source):
     """Stable source context; writer separately verifies its own dependencies."""
     from .usage_collection import _catalog_weight
-    if source.get('parent_thread_id'):
-        return None  # Parent-mode inheritance has no source append proof yet.
     value = {key: item for key, item in source.items() if key not in _MUTABLE}
     try:
         _catalog_weight(value, METADATA_BYTES)
@@ -73,18 +72,19 @@ class AppendBudget:
         if len(payload) > RESPONSE_BYTES - METADATA_BYTES or self.used + charge > self.limit:
             return None
         self.used += charge
-        return AppendPacket(self, charge, producer, key, prior_token, token, payload)
+        return AppendPacket(self, charge, producer, key, prior_token, token, payload, len(value['tail']))
 
 
 class AppendPacket:
-    __slots__ = ('budget', 'charge', 'producer', 'key', 'prior_token', 'token', 'payload', 'digest')
+    __slots__ = ('budget', 'charge', 'producer', 'key', 'prior_token', 'token', 'payload', 'digest', 'rows')
 
-    def __init__(self, budget, charge, producer, key, prior_token, token, payload):
+    def __init__(self, budget, charge, producer, key, prior_token, token, payload, rows):
         self.budget, self.charge = budget, charge
         self.producer, self.key = producer, key
         self.prior_token, self.token = prior_token, token
         self.payload = payload
         self.digest = hashlib.sha256(payload).hexdigest()
+        self.rows = rows
 
     def __del__(self):
         self.budget.used -= self.charge
@@ -98,6 +98,77 @@ class AppendReservation:
 
     def __del__(self):
         self.budget.used -= self.charge
+
+
+def bind(packet, epoch, prior_body_digest, body_digest, previous=None):
+    """Keep a bounded chain of charged packets, never historical session bodies."""
+    history = ()
+    if (previous is not None and previous['epoch'] == epoch
+            and previous['body_digest'] == prior_body_digest
+            and previous['packet'].producer is packet.producer
+            and previous['packet'].token == packet.prior_token):
+        candidates = (*previous.get('history', ()),
+                      {key:value for key,value in previous.items() if key != 'history'})
+        rows = packet.rows
+        kept = []
+        for item in reversed(candidates):
+            rows += item['packet'].rows
+            if rows > TAIL_ROWS or len(kept) >= CHAIN_PACKETS-1:
+                break
+            kept.append(item)
+        history = tuple(reversed(kept))
+    return dict(packet=packet, epoch=epoch, prior_body_digest=prior_body_digest,
+                body_digest=body_digest, history=history)
+
+
+def response(binding, prior):
+    """Compose a certified contiguous suffix for a lagging reader."""
+    packet = binding['packet']
+    if binding['prior_body_digest'] == prior:
+        return packet.prior_token, packet.payload, packet.digest
+    chain = (*binding.get('history', ()), binding)
+    start = next((i for i,item in enumerate(chain) if item['prior_body_digest'] == prior), None)
+    if start is None:
+        return None
+    chain = chain[start:]
+    first = json.loads(chain[0]['packet'].payload)
+    value = first
+    tail = list(first['tail'])
+    maps = {name:{row[0]:row for row in first[name]['upserts']} for name in ('requests', 'turns')}
+    if any(first[name]['removed'] for name in maps):
+        return None
+    for before, after in zip(chain, chain[1:]):
+        current = json.loads(after['packet'].payload)
+        if (before['body_digest'] != after['prior_body_digest']
+                or value['token'] != current['prior_token']
+                or value['source_token'] != current['prior_source_token']
+                or value['raw_count'] != current['prior_raw_count']
+                or value['context_digest'] != current['context_digest']
+                or any(value['evidence'][key] != current['evidence'][key] for key in ('generation','join_epoch'))
+                or not set(value['request_maps']) <= set(current['request_maps'])
+                or any(current[name]['removed'] for name in maps)):
+            return None
+        tail.extend(current['tail'])
+        for name in maps:
+            maps[name].update((row[0],row) for row in current[name]['upserts'])
+        value = current
+    if len(tail) > TAIL_ROWS or any(len(rows) > TAIL_ROWS for rows in maps.values()):
+        return None
+    combined = dict(value, prior_token=first['prior_token'], prior_raw_count=first['prior_raw_count'],
+        prior_frontier=first['prior_frontier'], prior_source_token=first['prior_source_token'],
+        tail=tail, tail_digest=digest(tail),
+        evidence=dict(value['evidence'],prior_revision=first['evidence']['prior_revision']),
+        requests=dict(upserts=sorted(maps['requests'].values(),key=lambda row:row[1]),removed=[]),
+        turns=dict(upserts=list(maps['turns'].values()),removed=[]))
+    from .usage_collection import _catalog_weight
+    try:
+        _catalog_weight(combined, RESPONSE_BYTES)
+        payload = encoded(combined)
+    except ValueError:
+        return None
+    if len(payload) > RESPONSE_BYTES-METADATA_BYTES:
+        return None
+    return first['prior_token'], payload, hashlib.sha256(payload).hexdigest()
 
 
 def begin(index, key, session, append, additions):
@@ -142,7 +213,7 @@ def begin(index, key, session, append, additions):
         prior_frontier=[ts, last['key']], context_digest=context,
         evidence=(reader.identity, reader.generation, joined[2], joined[3]),
         source_token=getattr(session, '_replay_source', None), keys=tuple(keys), turns=tuple(turns),
-        request_maps=maps)
+        request_maps=maps, context_revision=session.context_revision)
     reservation = index.append_budget.reserve(proof)
     if reservation is None:return None
     return dict(proof, session=session, reader=reader, reservation=reservation)
@@ -153,6 +224,7 @@ def complete(index, key, origin, source, token):
     from .usage_collection import _catalog_weight
     if origin is None or origin['session'] is not index.monitor.sessions.get(key):return None
     session, reader = origin['session'], index.model_evidence
+    if session.context_revision != origin['context_revision']:return None
     tail_keys, touched_turns = set(origin['keys']), set(origin['turns'])
     identity, generation, join_epoch, revision = origin['evidence']
     if (reader is not origin['reader'] or reader.identity != identity or reader.generation != generation

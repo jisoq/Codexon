@@ -197,7 +197,9 @@ class _PackedRows:
 
     def __iter__(self):
         # Only this process creates these payloads; no disk/network pickle input.
+        from .quota_cancellation import checkpoint
         for block in self.blocks:
+            checkpoint()
             yield from pickle.loads(zlib.decompress(block))
 
     def __getitem__(self, index):
@@ -575,6 +577,8 @@ def _continuous_quota_intervals(cycles):
 def _quota_scope(report, start, end, requests, cache=None, cache_readonly=False):
     """Select observed intervals before calculating their exact request attribution."""
     from .quota_exclusions import retained_intervals
+    from .quota_cancellation import checkpoint
+    checkpoint()
     current_account = report.get('account') or next(
         (c.get('account') for c in report.get('cycles', []) if c.get('account')), '')
     scoped=[]
@@ -593,6 +597,7 @@ def _quota_scope(report, start, end, requests, cache=None, cache_readonly=False)
         requests=requests if requests is not None else RequestWindows(report.get('request_windows',[]))
         local=[]
         for cycle in scoped:
+            checkpoint()
             if current_account and cycle.get('account')!=current_account:continue
             points=cycle.get('endpoints',[])
             overlapping=list(requests.overlapping(points[0][0],points[-1][0])) if points else []
@@ -1766,7 +1771,7 @@ class QuotaLedger:
                 values(:id,:home,:account,:start,:end,:reason,:period_start,:period_end,:created_at,:restored_at)''', record)
             return record
         return self._edit_with_report(home,
-            lambda report:validate_exclusion(report,start,end,reason),save)
+            lambda report:validate_exclusion(report,start,end,reason),save,edit_start=start)
 
     def restore_exclusion(self, home, exclusion_id):
         def restore(account):
@@ -1779,14 +1784,16 @@ class QuotaLedger:
             self.db.execute('update quota_exclusions set restored_at=? where id=?',
                             (time.time(), exclusion_id))
             return True
-        return self._edit_with_report(home,lambda report:report['account'],restore)
+        return self._edit_with_report(home,lambda report:report['account'],restore,edit_history=False)
 
     def clear_selected_cycle(self, home, start, account, *, delete=False):
         from .quota_view import _history_rows
         def prepare(report):
-            starts=[];last=None
-            for last in _history_rows(report,'weekly',labels=False):
-                if not starts or last.get('reset_kind'):starts.append(last['at'])
+            starts=report.get('_edit_periods',[]);last=report.get('_edit_last')
+            if not starts:
+                starts=[]
+                for last in _history_rows(report,'weekly',labels=False):
+                    if not starts or last.get('reset_kind'):starts.append(last['at'])
             if (not account or report['account']!=account or start not in starts
                     or delete != (start!=starts[-1])):
                 raise ValueError('선택한 주기가 변경되었습니다. 기록을 확인한 뒤 다시 시도하세요.')
@@ -1799,15 +1806,15 @@ class QuotaLedger:
             self.db.execute('''insert into quota_cycle_clears values(:home,:account,:start,:end,:baseline)
                 on conflict(home,account,start) do update set end=excluded.end,baseline=excluded.baseline''',record)
             return record
-        return self._edit_with_report(home,prepare,save)
+        return self._edit_with_report(home,prepare,save,edit_start=start)
 
-    def _edit_with_report(self, home, prepare, apply):
+    def _edit_with_report(self, home, prepare, apply, *, edit_start=None, edit_history=True):
         """Validate a stable read snapshot before briefly acquiring the writer lock."""
         for _ in range(3):
             self.db.execute('BEGIN')
             try:
                 revision=self.db.execute('PRAGMA data_version').fetchone()[0]
-                prepared=prepare(self._report(home,exclusion_only=True))
+                prepared=prepare(self._report(home,exclusion_only=True,edit_start=edit_start,edit_history=edit_history))
             finally:
                 self.db.rollback()
             with self.db:
@@ -2270,7 +2277,7 @@ class QuotaLedger:
             self._request_inputs=(key,calls,times,request_windows,weight)
         return calls,times,request_windows
 
-    def _report(self, home, now=None, *, exclusion_only=False, from_at=None):
+    def _report(self, home, now=None, *, exclusion_only=False, from_at=None,edit_start=None,edit_history=True):
         now = time.time() if now is None else now
         if exclusion_only:
             cached=getattr(self,'_report_cache',None)
@@ -2307,6 +2314,29 @@ class QuotaLedger:
         # Editing needs observed boundaries and account ownership, not call costs.
         # Keep this inside the same snapshot/revision check as the full report.
         if exclusion_only:
+            if not edit_history:return context
+            from .quota_archive import load as load_archive
+            from .quota_projection import load as load_projection
+            archive=load_archive(self,home,now,allow_repair=False)
+            projection=load_projection(self.db,home,now)
+            if (archive is not None and projection and not projection.get('invalid')
+                    and archive.account==current_account==projection['account']
+                    and projection['start']<=archive.cutoff):
+                from .quota_view import _history_rows
+                context.update(history=self._report_history(home,projection['start'],now,tables),
+                               _history_resume=projection['resume'])
+                starts=[p['start'] for p in archive.head['periods']];last=None
+                for last in _history_rows(context,'weekly',labels=False,_resume=projection['resume']):
+                    if not starts or last.get('reset_kind') or last['at']==projection['start']:
+                        starts.append(last['at'])
+                context.update(_edit_periods=sorted(set(starts)),_edit_last=last)
+                period=next((p for p in archive.head['periods']
+                             if edit_start is not None and p['start']<=edit_start<=p['end']),None)
+                if period is not None:
+                    source=archive.packet('period',period['start'])['source']
+                    context['_edit_period']=dict(start=period['start'],end=period['end'],
+                                                 times=source['classification'][0])
+                return context
             context['history']=self._report_history(home,cutoff,now,tables)
             return context
         manual_resets = [dict(r) for r in self.db.execute(

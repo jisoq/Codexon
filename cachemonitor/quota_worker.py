@@ -271,7 +271,7 @@ class QuotaComputation:
                     result['exclusion_result'] = self.committed[token]
                     phase('reading')
                 current=None
-                if kind=='report' and self.ledger_factory is None:
+                if self.ledger_factory is None:
                     current=self._archived_current(ledger,time.time())
                     if current is not None:
                         result['report']=self._prepare(current,selection=request.get('selection'),
@@ -329,6 +329,7 @@ class QuotaComputation:
                 finally:
                     self.ledger.close()
                     self.ledger = None
+                    self.archive = None
         return result
 
     def close(self):
@@ -341,15 +342,38 @@ class QuotaComputation:
 
 
 def process_main(connection, path, home):
+    from .quota_cancellation import poll,ReadCancelled
     computation = QuotaComputation(path, home)
     try:
         while True:
             request = connection.recv()
             if request['kind'] == 'stop':
                 return
+            if request['kind']=='cancel':continue
+            deadline=time.monotonic()+120
             def phase(value):
+                nonlocal deadline
+                if value=='reading':
+                    deadline=time.monotonic()+120
+                    poll.set(read_deadline)
                 connection.send(dict(kind='phase', value=value))
-            send_result(connection, computation.execute(request, phase,lambda result:send_result(connection,result)))
+            def read_deadline():
+                if time.monotonic()>=deadline:
+                    raise TimeoutError('Quota calculation exceeded its read deadline')
+                return False
+            def cancelled():
+                read_deadline()
+                if not connection.poll():return False
+                control=connection.recv()
+                return control.get('kind')=='cancel' and control.get('id')==request['id']
+            token=poll.set(cancelled if request['kind'] in ('report','query','chart','preview','prepare') else None)
+            try:
+                result=computation.execute(request,phase,lambda result:send_result(connection,result))
+            except ReadCancelled:
+                if computation.ledger is not None:computation.ledger.db.rollback()
+                result={key:request.get(key) for key in ('kind','id','key')} | dict(cancelled=True)
+            finally:poll.reset(token)
+            send_result(connection,result)
     except (EOFError, BrokenPipeError, OSError):
         pass
     finally:
@@ -429,8 +453,8 @@ class QuotaWorker(QObject):
             if self.commands:
                 return self.commands.popleft()
             if self.pending:
-                _, request = self.pending.popitem(last=False)
-                return request
+                for kind in ('chart','preview','query','prepare','report'):
+                    if kind in self.pending:return self.pending.pop(kind)
         return None
 
     def _deliver(self, result):
@@ -485,7 +509,16 @@ class QuotaWorker(QObject):
                     # phase message. Closing immediately after send is common.
                     self.phase = 'pending-write' if active['kind'] in ('exclude','restore','clear_cycle') else 'reading'
                     connection.send(active)
+                    cancel_sent=False
                     while True:
+                        if not cancel_sent and self.process_target is process_main and active['kind'] in self.COALESCED:
+                            with self.lock:
+                                obsolete=self.latest.get(active['kind'])!=active['id']
+                                urgent=bool(self.commands) or (active['kind']=='report' and any(
+                                    kind in self.pending for kind in ('chart','preview','query')))
+                            if obsolete or urgent:
+                                connection.send(dict(kind='cancel',id=active['id']))
+                                cancel_sent=True
                         if active['kind']=='report' and active['id']<=self.cancel_report_before:
                             release();self.phase='idle'
                             self._deliver({key:active.get(key) for key in ('kind','id','key')} | dict(cancelled=True))
@@ -497,6 +530,9 @@ class QuotaWorker(QObject):
                                 (active['kind']=='report' and active['id']<=self.cancel_report_before))
                             if result['kind'] == 'phase':
                                 self.phase = result['value']
+                                if active['kind'] in ('exclude','restore','clear_cycle'):
+                                    self._deliver(dict(kind='progress',id=active['id'],
+                                        operation=active['kind'],stage=self.phase,home=self.home))
                                 continue
                             if result.get('partial'):
                                 self._deliver(result)

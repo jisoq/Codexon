@@ -28,6 +28,12 @@ def mode_time(session,row):
                  if type(value) in (int,float) and isfinite(value)),None)
 
 
+def requires_parent_mode(row):
+    """Whether local mode evidence leaves this call eligible for inheritance."""
+    return (request_tier(row)=='미확인' and not row.get('mode_conflict')
+            and row.get('service_tier_source')!='conflict')
+
+
 class ParentModeTimeline:
     """Use the parent's mode at the call's start, never a later setting."""
     def __init__(self,session,modes,parent=None):
@@ -62,8 +68,7 @@ class ParentModeTimeline:
         return self.modes[index] if index>=0 else '미확인'
 
     def inherit(self,session,row):
-        if request_tier(row)!='미확인' or row.get('mode_conflict') or row.get('service_tier_source')=='conflict':
-            return row
+        if not requires_parent_mode(row):return row
         mode=self.at(mode_time(session,row))
         if mode not in ('Standard','Fast'):return row
         return dict(row,service_tier=mode,service_tier_source='parent',

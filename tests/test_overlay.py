@@ -233,10 +233,41 @@ def test_overlay_failed_read_recovers_after_fresh_snapshot(overlay_cache_control
     assert not pending and data['latest']['output']==100
 
 
+def test_compact_head_preserves_selected_compositions_on_unrelated_refresh(overlay_cache_controller):
+    controller,requested=overlay_cache_controller
+    summary=dict(overlay_summary(A),_overlay_head=True)
+    overlay_select(controller,{A:summary},A)
+    composition={'total':42}
+    reply=overlay_reply(requested[-1],token_composition=composition,cost_composition=composition,
+                        main_usage={'token_composition':composition})
+    reply['summary'].pop('_overlay_head')
+    controller.receive_overlay_detail(reply)
+    current=dict(summary,_prepared_token=('test',2),main_usage={'cost':3.5})
+    value,pending=overlay_select(controller,{A:current},A)
+    assert not pending and len(requested)==1
+    assert value['token_composition']==composition
+    assert value['main_usage']['token_composition']==composition
+
+
+def test_publication_failure_replaces_initial_wait_and_clears_on_snapshot(overlay_cache_controller):
+    controller,_=overlay_cache_controller
+    controller.target_state={'selection':Selection(A)}
+    controller.receive_overlay_fault({'publication_failed':True})
+    assert controller.content()[0] is None
+    controller.widget.content_model.set_content(*controller.content())
+    assert controller.widget.content_model.notice_card()
+    assert controller.widget.content_model.heartbeat_state()['mode']=='error'
+    controller.receive_snapshot({'overlay_sessions':[],'index':{'loading':False}})
+    assert not controller._analysis_failed
+
+
 def test_overlay_banner_allows_idle_delivery_grace_and_identifies_failures(monkeypatch,overlay_cache_controller):
     from cachemonitor.overlay_view import OverlayContent
     monkeypatch.setattr('cachemonitor.overlay.time.monotonic',lambda:100.)
+    wall=[1000.]
+    monkeypatch.setattr('cachemonitor.overlay.time.time',lambda:wall[0])
     controller,_=overlay_cache_controller
+    controller.collection_started_at=1000.
     controller.target_state={'selection':Selection(A)}
     controller.session_lookup={A:[dict(id=A,calls=2,request={'state':'완료'})]}
     controller.loading=False;controller.snapshot_at=84.;controller.snapshot_wall_time=1000.
@@ -244,12 +275,13 @@ def test_overlay_banner_allows_idle_delivery_grace_and_identifies_failures(monke
     for issue,errors,reason in (('',[],'analysis_delay'),('', ['read failure'],'source_error'),
                                ('status failure',[],'service_error'),('수집 결과 갱신 지연',[],'service_delay')):
         controller.collection_issue=issue;controller.errors=errors
+        controller.collection_published_at=960. if reason=='service_delay' else 1000.
         data,note=OverlayController.content(controller)
         assert data['calls']==2 and data['_collection']['reason']==reason
         labels.append(OverlayContent.collection_age(data,note))
     assert len(set(labels))==4
     assert '16' in labels[0] and '15' in labels[0]
-    controller.collection_issue='';controller.errors=[]
+    controller.collection_issue='';controller.errors=[];controller.collection_published_at=1000.
     for age in (10.01,15.):
         controller.snapshot_at=100.-age
         data,note=OverlayController.content(controller)
@@ -257,13 +289,16 @@ def test_overlay_banner_allows_idle_delivery_grace_and_identifies_failures(monke
         assert not data['_collection']['delayed']
     controller.snapshot_at=84.99
     data,note=OverlayController.content(controller)
-    assert note=='수집 지연' and data['_collection']['reason']=='analysis_delay'
-    assert data['_collection']['delayed']
+    assert note=='갱신 중' and data['_collection']['reason']=='analysis_delay'
+    assert not data['_collection']['delayed']
+    model=OverlayContent();model.set_content(data,note)
+    assert model.heartbeat_state()['mode']=='pending' and model.data['calls']==2
     OverlayController.receive_snapshot(controller,dict(overlay_sessions=[dict(id=A,calls=2)],errors=[],ts=1000.))
     data,note=OverlayController.content(controller)
     assert note=='' and not data['_collection']['delayed']
+    wall[0]=1032.
     OverlayController.receive_snapshot(controller,dict(overlay_sessions=[dict(id=A,calls=2)],
-        errors=[],collection_stale=True,ts=1001.))
+        errors=[],collection_stale=True,ts=1001.,collection={'instance':'live'}))
     data,note=OverlayController.content(controller)
     assert note=='수집 지연' and data['_collection']['source_error_count']==0
     assert data['_collection']['service_fault']['snapshot_stale']
@@ -272,8 +307,42 @@ def test_overlay_banner_allows_idle_delivery_grace_and_identifies_failures(monke
         errors=['read failure'],collection_stale=True,ts=1002.))
     data,note=OverlayController.content(controller)
     assert note=='수집 오류' and data['_collection']['reason']=='source_error'
-    OverlayController.receive_snapshot(controller,dict(overlay_sessions=[dict(id=A,calls=2)],errors=[],ts=1003.))
+    OverlayController.receive_snapshot(controller,dict(overlay_sessions=[dict(id=A,calls=2)],
+        errors=[],ts=1032.,collection={'instance':'live'}))
     assert OverlayController.content(controller)[1]==''
+
+
+def test_healthy_collection_clears_stale_analysis_without_changing_displayed_values(monkeypatch,overlay_cache_controller):
+    monkeypatch.setattr('cachemonitor.overlay.time.time',lambda:100.)
+    monkeypatch.setattr('cachemonitor.overlay.time.monotonic',lambda:100.)
+    controller,_=overlay_cache_controller
+    controller.collection_started_at=1.
+    controller.target_state={'selection':Selection(A)}
+    old=dict(overlay_sessions=[dict(id=A,calls=2,cost=3.5)],ts=60.,
+             collection={'instance':'live'},usage_collection_complete=True,collection_stale=True)
+    controller.receive_snapshot(old)
+    assert controller.content()[1]=='수집 지연'
+    controller.receive_collection_status(dict(collection_issue='',collection_fault={},
+        collection_healthy=True,collection_snapshot_at=100.))
+    data,note=controller.content()
+    assert not note and not data['_collection']['delayed']
+    assert data['calls']==2 and data['cost']==3.5
+    # An older analytical envelope cannot reinstate a cleared collection delay.
+    controller.receive_snapshot(old)
+    assert controller.content()[1]==''
+
+
+def test_analysis_wait_without_session_data_is_not_a_collection_failure(monkeypatch,overlay_cache_controller):
+    from cachemonitor.overlay_view import OverlayContent
+    monkeypatch.setattr('cachemonitor.overlay.time.time',lambda:100.)
+    monkeypatch.setattr('cachemonitor.overlay.time.monotonic',lambda:100.)
+    controller,_=overlay_cache_controller
+    controller.target_state={'selection':Selection(A)}
+    controller.snapshot_at=84.;controller.collection_published_at=100.
+    data,note=controller.content()
+    model=OverlayContent();model.set_content(data,note)
+    assert data is None and note=='갱신 중'
+    assert model.notice_card() and model.heartbeat_state()['mode']=='pending'
 
 
 def test_verified_session_displays_during_unrelated_restore_without_hiding_faults(monkeypatch,overlay_cache_controller):
@@ -298,7 +367,8 @@ def test_verified_session_displays_during_unrelated_restore_without_hiding_fault
     controller.loading=True;session['collection_complete']=True
     controller.errors=['read failure']
     assert OverlayController.content(controller)[1]=='수집 오류'
-    controller.errors=[];controller.collection_stale=True
+    import time
+    controller.errors=[];controller.collection_published_at=time.time()-31
     assert OverlayController.content(controller)[1]=='수집 지연'
 
 
@@ -582,7 +652,7 @@ def test_controller_clears_old_numbers_on_unknown_remote_or_duplicate_home(tmp_p
         assert controller.content()[0] is None
         controller.receive_snapshot({'overlay_sessions': summaries})
         controller.snapshot_at -= 16
-        assert controller.content()[1] == '수집 지연'
+        assert controller.content()[1] == '갱신 중'
         controller.set_enabled(False)
         assert not controller.widget.isVisible()
     finally:

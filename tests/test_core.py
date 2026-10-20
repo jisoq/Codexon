@@ -51,6 +51,43 @@ def fixture_home(tmp_path):
     return home, path
 
 
+def test_late_context_repairs_same_turn_and_invalidates_cached_prefix():
+    session=Session(TID,'home')
+    for key,turn in [('late','a'),('other','b'),('unattributed','')]:
+        session.consume(event('token_usage_record',thread_id=TID,response_id=key,turn_id=turn,
+                              usage={'input_tokens':100,'output_tokens':10}),10001)
+    before=session.view(10001,use_cache=True)
+    session.consume(event('turn_context',10000.009,turn_id='a',model='gpt-6.1-sol',
+                          collaboration_mode={'settings':{'reasoning_effort':'high'}},service_tier=None),10001)
+    after=session.view(10001,use_cache=True)
+    assert after['history'][0]['effort']=='high'
+    assert after['history'][0]['model']=='gpt-6.1-sol'
+    assert after['history'][0]['service_tier']=='Standard'
+    assert before['history'][0]['effort']=='미확인'
+    assert [r['effort'] for r in after['history'][1:]]==['미확인','미확인']
+    assert [(r['key'],r['total']) for r in before['history']]==[(r['key'],r['total']) for r in after['history']]
+    session.consume(event('turn_context',10001,turn_id='a',model='other',effort='low',service_tier='priority'),10002)
+    assert session.view(10002)['history'][0]['effort']=='high'
+    assert session.view(10002)['history'][0]['service_tier']=='Standard'
+
+
+def test_late_context_pairs_applied_mode_without_overwriting_record_mode():
+    session=Session(TID,'home')
+    session.current_service_tier='Standard'
+    for key,extra in [('missing',{}),('record',{'service_tier':'default'})]:
+        session.consume(event('token_usage_record',thread_id=TID,response_id=key,turn_id='a',
+                              usage={'input_tokens':100},**extra),10001)
+    session.consume(event('turn_context',10000.009,turn_id='a',model='m',effort='high'),10001)
+    session.consume(event('event_msg',10000.010,type='thread_settings_applied',thread_id=TID,
+                          thread_settings={'service_tier':'priority'}),10001)
+    missing,record=session.requests
+    assert missing.service_tier=='priority' and missing.request_mode_source=='applied_settings'
+    assert record.service_tier=='default' and record.service_tier_source=='record'
+    session.consume(event('event_msg',10001,type='thread_settings_applied',thread_id=TID,
+                          thread_settings={'service_tier':None}),10002)
+    assert missing.service_tier=='priority'
+
+
 def test_unassigned_diagnostics_expire_and_bound_count_and_encoded_bytes():
     from cachemonitor.core import SessionRegistry,WINDOW
     registry=SessionRegistry();registry.MAX_UNASSIGNED=3;registry.MAX_UNASSIGNED_BYTES=200

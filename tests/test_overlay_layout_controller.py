@@ -127,7 +127,7 @@ def compact_frame(controller):
     target=controller.target_state.get('target',{})
     factor=(controller.native.u.GetDpiForWindow(target.get('hwnd',1)) or 96)/96
     height=geometry(m.data,has_status=bool(header_status(m)[0]),preferred_height=0,
-                    main_detail_height=m.main_detail_height())['height']
+                    main_detail_height=m.main_detail_height(),auto_sub_height=m.automatic_sub_height())['height']
     full=round(round(height*m.appearance.scale)*factor)
     return (0,0,1300,full-1+2*round(16*factor))
 
@@ -183,16 +183,18 @@ def test_main_disclosure_changes_height_and_preserves_right_anchor(layout_contro
     assert not m.main_expanded and c.monitor_geometry==closed
 
 
-def test_length_changes_only_subagent_allowance_and_persists_chart_style(layout_controller):
-    c=layout_controller;publish_subagents(c);m=c.widget.content_model
+def test_visible_count_changes_only_subagent_allowance_and_persists_chart_style(layout_controller):
+    c=layout_controller;publish_subagents(c,nested=True);m=c.widget.content_model
     c.native.bounds=(0,0,1300,2400);c.refresh()
+    c.set_visible_agent_count(1)
     before=m.layout();anchor=c.anchor
-    c.change_length(40)
+    c.set_visible_agent_count(2)
     after=m.layout()
     assert after['charts']==before['charts'] and after['main']==before['main']
-    assert after['sub_y']==before['sub_y'] and after['sub_height']-before['sub_height']==40
-    assert after['height']-before['height']==40 and c.anchor==anchor
-    assert c.settings.value('overlay/height',type=int)==c.preferred_height
+    assert after['sub_y']==before['sub_y'] and after['sub_height']>before['sub_height']
+    assert after['height']-before['height']==after['sub_height']-before['sub_height'] and c.anchor==anchor
+    import json
+    assert json.loads(c.settings.value('overlay/visibleAgentCounts'))[c.widget.content_model.agent_count_key()]==2
     assert_embedded_subagents(c)
     c.set_chart_style('filled-line')
     assert m.chart_style=='filled-line' and c.settings.value('overlay/chartStyle')=='filled-line'
@@ -258,13 +260,30 @@ def test_maintenance_updates_snapshot_delay_and_displayed_age(layout_controller,
     now[0]=115.;c.receive_target(dict(c.target_state));c._tick()
     assert not m.note
     now[0]=115.01;c.receive_target(dict(c.target_state));c._tick()
-    assert m.note=='수집 지연' and m.data['_collection']['reason']=='analysis_delay'
+    assert m.note=='갱신 중' and m.data['_collection']['reason']=='analysis_delay'
+    assert m.heartbeat_state()['mode']=='pending'
     previous=m.freshness_text()
     now[0]=116.01;c.receive_target(dict(c.target_state));c._tick()
     assert m.freshness_text()!=previous
     assert m.data['_collection']['received_age']==pytest.approx(16.01)
     c.receive_snapshot({'overlay_sessions':c.sessions})
     assert not m.note
+
+
+def test_maintenance_detects_collection_timeout_and_service_recovery(layout_controller,monkeypatch):
+    c=layout_controller;now=[100.];m=c.widget.content_model
+    monkeypatch.setattr('cachemonitor.overlay.time.time',lambda:now[0])
+    c.collection_started_at=1.
+    c.receive_collection_status(dict(collection_issue='',collection_fault={},collection_snapshot_at=100.))
+    c.receive_target(dict(c.target_state));c._tick()
+    now[0]=130.
+    c.receive_target(dict(c.target_state));c._tick()
+    assert not m.note
+    now[0]=130.01
+    c.receive_target(dict(c.target_state));c._tick()
+    assert m.note=='수집 지연' and m.heartbeat_state()['mode']=='error'
+    c.receive_collection_status(dict(collection_snapshot_at=now[0]))
+    assert not m.note and m.heartbeat_state()['mode']!='error'
 
 
 def test_maintenance_recovers_frame_dpi_and_changed_appearance(layout_controller,monkeypatch):
@@ -305,7 +324,7 @@ def test_pending_overlay_refresh_keeps_confirmed_panel_until_replacement(layout_
     if compact:c.native.bounds=compact_frame(c)
     m.monitor_tab='history';m.pin_call(m.call_id(m.rows()[0]));c.refresh();app.processEvents()
     assert m.compact is compact
-    selected=m.selected_id;geometry=c.monitor_geometry;before=c.widget.grab().toImage()
+    selected=m.selected_id;geometry=c.monitor_geometry
     changed=deepcopy(confirmed)
     changed.update(_prepared_token=('fixture',2),_overlay_revision=('fixture',2),cost=confirmed['cost']+1)
     changed['recent'][-1]['output']+=10;changed['latest']=changed['recent'][-1]
@@ -314,7 +333,9 @@ def test_pending_overlay_refresh_keeps_confirmed_panel_until_replacement(layout_
     assert m.data['latest']['output']==confirmed['latest']['output']
     assert m.data['_collection']['last_confirmed_at']==stamp
     assert m.selected_id==selected and m.graph_pinned
-    assert c.monitor_geometry==geometry and c.widget.grab().toImage()==before
+    assert c.monitor_geometry==geometry
+    assert m.note=='갱신 중' and m.heartbeat_state()['mode']=='pending'
+    before=c.widget.grab().toImage()
     assert m.notice_card() is None and len(requests)==1
     # Rejected obsolete reads must not erase the still-valid displayed snapshot.
     c.receive_overlay_detail(dict(id=requests[-1][0],kind='stale'))
@@ -324,7 +345,8 @@ def test_pending_overlay_refresh_keeps_confirmed_panel_until_replacement(layout_
     with monkeypatch.context() as clock:
         clock.setattr('cachemonitor.overlay.time.time',lambda:stamp+20)
         c._tick()
-        assert m.data['cost']==confirmed['cost'] and m.note=='수집 지연'
+        assert m.data['cost']==confirmed['cost'] and m.note=='갱신 중'
+        assert m.heartbeat_state()['mode']=='pending'
         assert m.data['_collection']['last_confirmed_at']==stamp and m.freshness_text()
     changed['_prepared_token']=('fixture',3);publish(changed,stamp+2)
     c.receive_overlay_detail(dict(id=requests[-1][0],summary=changed,prepared_token=changed['_prepared_token']))
@@ -359,7 +381,11 @@ def test_popup_outside_click_escape_order_and_persisted_opacity(layout_controlle
     assert controller.settings.value('overlay/opacity',type=int)==63
     controller.toggle_settings()
     assert controller.popup_open and controller.popup_kind=='settings' and controller.toolbar.isVisible()
-    assert controller.toolbar.size().width()==260 and controller.toolbar.size().height()==150
+    from cachemonitor.overlay_chrome import named_item
+    from PySide6.QtCore import QPointF
+    count=named_item(controller.toolbar.quick.rootObject(),'agentCount-4')
+    assert count.isVisible()
+    assert controller.toolbar.quick.rect().contains(count.mapToScene(QPointF(count.width(),count.height())).toPoint())
     controller.escape()
     assert not controller.popup_open and not controller.collapsed
 
@@ -533,20 +559,21 @@ def test_fallback_boundaries_preserve_anchor(layout_controller,monkeypatch,dpi,f
     c=layout_controller;publish_subagents(c);c.appearance=replace(c.appearance,font_size=font_size)
     monkeypatch.setattr(c.native.u,'GetDpiForWindow',lambda hwnd:dpi)
     c.native.bounds=(0,0,2400,2400);c.refresh()
-    m=c.widget.content_model;factor=dpi/96;gap=round(16*factor)
+    m=c.widget.content_model;factor=dpi/96;gap=round(16*factor);automatic=m.base_height()
     from cachemonitor.overlay_monitor import header_status
     has_status=bool(header_status(m)[0])
-    full=round(round(geometry(m.data,has_status=has_status,preferred_height=0)['height']*c.appearance.scale)*factor)
-    compact=round(round(geometry(m.data,True,has_status=has_status,preferred_height=0)['height']*c.appearance.scale)*factor)
+    auto_height=m.automatic_sub_height()
+    full=round(round(geometry(m.data,has_status=has_status,preferred_height=0,auto_sub_height=auto_height)['height']*c.appearance.scale)*factor)
+    compact=round(round(geometry(m.data,True,has_status=has_status,preferred_height=0,auto_sub_height=auto_height)['height']*c.appearance.scale)*factor)
     width=round(WIDTH*c.appearance.scale*factor)+2*gap;anchor=c.anchor
     for height,reduced,icon in ((full,False,False),(full-1,True,False),(compact,True,False),(compact-1,True,True),(full,False,False)):
         c.native.bounds=(0,0,width,height+2*gap);c.refresh()
         assert (c.automatic_mode=='icon')==icon
         assert m.compact==reduced and c.anchor==anchor and not c.collapsed
         if not icon:
-            assert m.layout()['sub_height']>=MIN_SUB_HEIGHT
+            assert m.layout()['sub_height']>=min(MIN_SUB_HEIGHT,auto_height)
             assert_embedded_subagents(c)
     c.native.bounds=(0,0,width,round(720*c.appearance.scale*factor)+2*gap);c.refresh()
-    assert c.automatic_mode=='monitor' and m.base_height()==720
+    assert c.automatic_mode=='monitor' and m.base_height()==automatic
     c.native.bounds=(0,0,width-1,2400);c.refresh()
     assert c.automatic_mode=='icon' and c.anchor==anchor

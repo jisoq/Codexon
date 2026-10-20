@@ -22,4 +22,3 @@
 - Use a dedicated environment built from `requirements-release.lock`. Every import, including those inside functions, must be in the lock.
 - Async tests: wait on an observable condition with a deadline, never a fixed sleep.
 - UI tests: use the hidden desktop and rendered control geometry, and keep compact-window coverage. Deliver chart events directly when testing selection independent of hover.
-- On CI failure, apply the [codexon-mode skill](.agents/skills/codexon-mode/SKILL.md) and inspect the failing assertion and retained evidence before retrying. Preserve numerical, state, and navigation contracts; avoid assertions tied only to copy or punctuation.

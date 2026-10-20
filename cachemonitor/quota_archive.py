@@ -123,12 +123,31 @@ def initialize(db):
             INSERT INTO quota_archive_repairs
             SELECT epoch,new.at,new.at,1 FROM quota_archive_heads
             WHERE new.table_name NOT IN ('state','tracking_health','tracking_tasks','tracking_gaps',
-                'calls','tracking_wire','tracking_call_boundaries') AND (new.at IS NULL OR new.at<=cutoff)
+                'calls','tracking_wire','tracking_call_boundaries','quota_exclusions','quota_cycle_clears') AND (new.at IS NULL OR new.at<=cutoff)
             ON CONFLICT(epoch) DO UPDATE SET structural=1;
             UPDATE quota_archive_heads SET valid=0 WHERE valid=1
             AND new.table_name NOT IN ('state','tracking_health','tracking_tasks','tracking_gaps',
-                'calls','tracking_wire','tracking_call_boundaries')
+                'calls','tracking_wire','tracking_call_boundaries','quota_exclusions','quota_cycle_clears')
             AND (new.at IS NULL OR new.at<=cutoff); END''')
+    for table in ('quota_exclusions','quota_cycle_clears'):
+        for operation in ('INSERT','UPDATE','DELETE'):
+            sides=('old','new') if operation=='UPDATE' else ('old',) if operation=='DELETE' else ('new',)
+            lower='min('+','.join(side+'.start' for side in sides)+')' if len(sides)>1 else sides[0]+'.start'
+            upper='max('+','.join(side+'.end' for side in sides)+')' if len(sides)>1 else sides[0]+'.end'
+            matched=' OR '.join(f'(home={side}.home AND account={side}.account AND {side}.start<cutoff)' for side in sides)
+            # Exclusions change costs only. Removing a whole closed period also
+            # preserves reset classification; undoing a deletion needs replay.
+            structural=('0' if table=='quota_exclusions' else
+                        '1' if operation!='INSERT' else "new.baseline IS NOT 'null'")
+            install(f'quota_archive_{table}_{operation.lower()}',f'''CREATE TRIGGER quota_archive_{table}_{operation.lower()}
+                AFTER {operation} ON {table} BEGIN
+                INSERT INTO quota_archive_repairs SELECT epoch,{lower},{upper},{structural}
+                    FROM quota_archive_heads WHERE {matched}
+                ON CONFLICT(epoch) DO UPDATE SET
+                    start=CASE WHEN start IS NULL THEN excluded.start ELSE min(start,excluded.start) END,
+                    end=CASE WHEN end IS NULL THEN excluded.end ELSE max(end,excluded.end) END,
+                    structural=max(structural,excluded.structural);
+                UPDATE quota_archive_heads SET valid=0 WHERE valid=1 AND ({matched}); END''')
     # Loading and heartbeat changes do not revise completed historical costs.
     # Lost coverage or changed unresolved evidence does.
     install('quota_archive_state_update','''CREATE TRIGGER quota_archive_state_update AFTER UPDATE ON state
@@ -397,13 +416,22 @@ def repair(ledger,row,now):
             tracking=policy.get('tracking')
             if not tracking or not scope or len(scope)>MAX_SCOPE_HOMES:return False
             if sorted((current.get('tracking') or {}).get('homes',[]))!=scope:return False
-            context={**current,'exclusions':policy['exclusions'],'cycle_clears':policy['cycle_clears']}
+            context=dict(current)
             context.pop('_prepared_statistics',None)
+            policy.update(exclusions=current.get('exclusions',[]),cycle_clears=current.get('cycle_clears',[]))
             affected=[]
             for saved in archive.head['cycles']:
                 header=saved['cycle']
                 if header['cycle_end']<dirty['start'] or header['cycle_start']>dirty['end']:continue
                 before=archive.packet('cycle',header['id'])['cycle']
+                if any(edit['baseline']=='null' and edit['start']<=before['start']
+                       and edit['end']>=before['end'] for edit in policy['cycle_clears']):
+                    # Deleted accounting contributes nothing, even if its old
+                    # calls changed. Keep the packet without rereading those
+                    # calls; removing a deletion invalidates this archive.
+                    saved['scope']=_scope_value(_quota_scope({**context,'cycles':[]},None,None,None))
+                    affected.append(header['id'])
+                    continue
                 calls,times,requests,pending=ledger.archive_calls(scope,tracking['started'],before['cycle_start'],before['cycle_end'])
                 after=ledger._forward_cycle_costs({**before,'cost_complete_at':current.get('index_complete_at')},calls,times,pending)
                 windows=RequestWindows(requests)
@@ -413,10 +441,22 @@ def repair(ledger,row,now):
                 del calls,times,requests,pending,before,after,windows
             periods=sorted(archive.head['periods'],key=lambda period:period['start'])
             changed_periods=[]
+            removed_periods=set()
             for position,header in enumerate(periods):
                 following=periods[position+1]['start'] if position+1<len(periods) else archive.cutoff
-                if following<dirty['start'] or header['start']>dirty['end']:continue
+                if header['end']<dirty['start'] or header['start']>dirty['end']:continue
+                deleted=[r for r in policy['cycle_clears'] if r['baseline']=='null']
+                if any(r['start']<=header['start'] and r['end']>=following for r in deleted):
+                    removed_periods.add(header['start']);changed_periods.append(header['start']);continue
                 original=archive.packet('period',header['start']);source=original['source']
+                for name in ('exclusions','cycle_clears'):
+                    if source['report'].get(name,[])!=policy[name]:
+                        source['report'][name]=policy[name]
+                if any(r['end']==header['start'] for r in deleted):
+                    times,flags,kind=source['classification']
+                    flags=bytearray.fromhex(flags)
+                    if flags:flags[0]&=~3
+                    source['classification']=(times,flags.hex(),kind)
                 cycles=[];weight=0
                 for saved in archive.head['cycles']:
                     value=saved['cycle']
@@ -441,10 +481,12 @@ def repair(ledger,row,now):
                               _series_signature=cache[period['start']][0].hex())
                 header.clear();header.update(period)
                 value={**period,'series':None,'_series_detail':detail,
-                       '_series_exclusions':original['period']['_series_exclusions']}
+                       '_series_exclusions':[r for r in policy['exclusions']
+                           if r['start']<period['end'] and r['end']>period['start']]}
                 packet('period',period['start'],dict(period=value,source=source))
                 changed_periods.append(period['start'])
                 del cycles,requests,original,source,detail,period,details
+            archive.head['periods']=[p for p in periods if p['start'] not in removed_periods]
             current['view']=prepare_quota_view(current,deferred=True)
             composed=archive.compose(current)
             composed['_archive_repair_revision']=current['_projection_revision']
@@ -486,7 +528,12 @@ def save(ledger,report,view):
     if report.get('history_pending') or not periods or len(periods)>MAX_PERIODS:return False
     current=next((period for period in periods if period['current']),None)
     if current is None:return False
-    cutoff=current['start'];home=report['home']
+    prefix=report.get('_archive_prefix')
+    # Repair the already certified prefix even when a recent reset cannot yet
+    # advance it: its newly closed tail may still await call coverage.
+    cutoff=(prefix.cutoff if prefix is not None and report.get('_archive_repair_revision') is not None
+            else current['start'])
+    home=report['home']
     old=ledger.db.execute('SELECT epoch,cutoff,valid,version,price FROM quota_archive_heads WHERE home=? ORDER BY rowid DESC LIMIT 1',(home,)).fetchone()
     if (old and old['valid'] and old['cutoff']==cutoff and old['version']==VERSION and old['price']==PRICE_ID and
             getattr(ledger,'_archive_invalid',None)!=old['epoch']):return False

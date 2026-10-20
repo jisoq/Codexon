@@ -34,10 +34,10 @@ def test_subscription_rates_and_historical_models_render(tmp_path, language):
         window=Dashboard(['fixture'],start_worker=False,live_limits=False,
                          settings=QSettings(str(tmp_path/'value.ini'),QSettings.IniFormat),static_snapshot=source)
         window.show();QTest.qWait(80)
-        window.change_page(1);window.metric_panel.change("dimension","model")
+        window.change_page(1);window.metric_panel.change("dimension","all")
         assert window.model.findData('gpt-5.5-pro')>=0
         assert window.model.findData('gpt-5.4-mini')>=0
-        assert {'gpt-5.5-pro','gpt-5.4-mini','gpt-5.6'} <= {r['key'] for r in window.metric_panel.data['rows']}
+        assert {'gpt-5.5-pro','gpt-5.4-mini','gpt-5.6'} <= {r['filters']['model'] for r in window.metric_panel.data['rows']}
         priced=next(iter(window.engine.sessions.values()))['prepared']['history']
         for model in ('gpt-5.4-mini','gpt-5.5-pro'):
             record=next(r for r in priced if r['model']==model)
@@ -99,10 +99,10 @@ def test_comparison_navigation_and_controls_accept_rendered_input(dashboard):
     assert w.current_page==1
     choice=rendered('usage-dimension');choice.forceActiveFocus()
     QTest.keyClick(w.quick,Qt.Key_Down)
-    assert w.metric_panel.options['dimension']=='model'
+    assert w.metric_panel.options['dimension']=='source'
     item=w.metric_panel.data['rows'][0]
     click(w,rendered('usage-row-'+item['key']))
-    assert w.metric_panel.options['filters']['model']==item['key']
+    assert w.metric_panel.options['filters']['model']==item['filters']['model']
     w.go_back();assert not w.metric_panel.options['selected']
     assert not w.qml_errors
 
@@ -154,7 +154,7 @@ def test_virtual_comparison_scroll_reuses_aggregate_without_viewport_queries(das
         configured_model=f'model-{i//8:02}',requested_model=f'model-{i//8:02}',
         effort=f'effort-{i%8}',ts=source['ts']-5) for i in range(160)]
     source['sessions']=source['sessions'][:1]
-    w.receive(source);p.change('dimension','model');p.change('breakdown:effort','true')
+    w.receive(source);p.change('dimension','all')
     usage=control(w,p)
     view=next(item for item in walk(usage) if item.objectName()=='usage-rows')
     wait_for_rendered(lambda:view.property('count')==160)
@@ -163,7 +163,7 @@ def test_virtual_comparison_scroll_reuses_aggregate_without_viewport_queries(das
     wait_for_rendered(lambda:0<len(rendered_rows())<160)
     assert [row['group'] for row in p.data['rows']]==sorted(row['group'] for row in p.data['rows'])
     first=p.data['rows'][0]['key'];last=p.data['rows'][-1]['key']
-    calls=w.request_id;projection=w.engine._category_projection
+    calls=w.request_id;projection=p._all_data
     with monkeypatch.context() as guarded:
         guarded.setattr(w,'render',lambda *args,**kwargs:pytest.fail('Scrolling or resizing must not request analysis'))
         guarded.setattr(w.engine,'query',lambda *args,**kwargs:pytest.fail('Scrolling must not aggregate records'))
@@ -172,7 +172,7 @@ def test_virtual_comparison_scroll_reuses_aggregate_without_viewport_queries(das
         assert len(rendered_rows())<30
         old_height=view.height();w.resize(1000,900)
         wait_for_rendered(lambda:view.height()>old_height)
-        assert w.request_id==calls and w.engine._category_projection is projection
+        assert w.request_id==calls and p._all_data is projection
         assert len(rendered_rows())<40 and len(p.row_model.cache)<=128 and p.row_model.cache_bytes<=4*1024*1024
         position=view.property('contentY');cached=dict(p.row_model.cache)
         p.apply(copy.deepcopy(p.data))
@@ -186,11 +186,64 @@ def test_virtual_comparison_scroll_reuses_aggregate_without_viewport_queries(das
 
 def test_metric_modes_and_saved_scope_restore_after_monitoring(dashboard):
     w=dashboard;w.change_page(1);p=w.metric_panel
-    p.change('period','7d');p.change('metric','tps');p.change('dimension','model');p.change('sort','name')
+    p.change('period','7d');p.change('metric','tps');p.change('dimension','all');p.change('sort','name')
     saved=w.capture_state();w.change_page(3)
     assert w.current_page==3
-    w.restore_state(saved);assert p.options['metric']=='tps' and p.options['dimension']=='model'
+    w.restore_state(saved);assert p.options['metric']=='tps' and p.options['dimension']=='all'
     assert p.options['period']=='7d' and p.options['sort']=='name'
+    assert not w.qml_errors
+
+
+def test_unmeasurable_pairs_hide_without_losing_zero_values_or_cached_metrics(dashboard,monkeypatch,tmp_path):
+    w=dashboard;w.tick.stop();w.resize(1000,680)
+    source=snapshot()
+    for session,effort in zip(source['sessions'],('high','low','medium')):
+        for row in session['history']:
+            row['effort']=effort
+            row['reasoning']=None if effort=='high' else 0 if effort=='low' else 10
+            if effort=='high':
+                row.update(completion_latency_ms=None,response_status='unknown')
+        if effort=='low':session['history'][0]['reasoning']=None
+    w.receive(source);w.change_page(1);p=w.metric_panel
+    usage=control(w,p)
+    view=next(item for item in walk(usage) if item.objectName()=='usage-rows')
+    wait_for_rendered(lambda:view.property('count')==3)
+    unknown=next(row for row in p.data['rows'] if row['filters']['effort']=='high')
+    unknown_project=unknown['filters']['project']
+    projection=p._all_data
+    with monkeypatch.context() as guarded:
+        guarded.setattr(w,'render',lambda *args,**kwargs:pytest.fail('Metric changes must reuse delivered aggregates'))
+        p.change('metric','tps')
+        assert {row['filters']['effort'] for row in p.data['rows']}=={'low','medium'}
+        assert p.data['summary']==projection['metrics']['tps']
+        p.change('metric','reasoning')
+        zero=next(row for row in p.data['rows'] if row['filters']['effort']=='low')
+        assert zero['value']==0 and zero['known']==15 and zero['partial']
+        wait_for_rendered(lambda:view.property('count')==2)
+        assert all(row['value'] is not None for row in p.data['rows'])
+        assert p._all_data is projection
+        p.change('view','table')
+        assert len(p.data['rows'])==2
+        p.change('metric','calls')
+        wait_for_rendered(lambda:view.property('count')==3)
+    p.change('filter:project',unknown_project)
+    wait_for_rendered(lambda:view.property('count')==1)
+    projection=p._all_data
+    with monkeypatch.context() as guarded:
+        guarded.setattr(w,'render',lambda *args,**kwargs:pytest.fail('Empty metric changes must reuse delivered aggregates'))
+        p.change('metric','tps')
+        wait_for_rendered(lambda:view.property('count')==0)
+        assert p.data['count']==0 and p.data['summary']['total']==16
+        assert p._all_data is projection and len(projection['rows'])==1
+        p.change('metric','calls')
+        wait_for_rendered(lambda:view.property('count')==1)
+        p.change('view','chart')
+    p.reset();p.change('metric','tps')
+    wait_for_rendered(lambda:view.property('count')==2)
+    def rendered():
+        return [item for item in walk(view) if item.objectName().startswith('usage-row-') and item.isVisible()]
+    wait_for_rendered(lambda:len(rendered())==2 and all(item.width()>0 and item.height()>0 for item in rendered()))
+    assert w.quick.grabFramebuffer().save(str(tmp_path/'measurable-comparison.png'))
     assert not w.qml_errors
 
 
@@ -277,54 +330,65 @@ def test_custom_date_restore_rejects_invalid_saved_ranges(dashboard):
     assert not w.qml_errors
 
 
-def test_model_breakdowns_combine_and_drill_down_in_compact_window(dashboard):
-    from PySide6.QtCore import QObject,QPointF
+def test_grouped_model_effort_metrics_and_drilldown_in_compact_window(dashboard,monkeypatch,tmp_path):
+    from PySide6.QtCore import QPointF, Qt
+    from PySide6.QtTest import QTest
     w=dashboard;w.resize(1000,680);w.change_page(1);p=w.metric_panel
-    source,_=many_efforts();w.receive(source);p.change('dimension','model')
+    source,_=many_efforts();w.receive(source);p.change('dimension','service_tier')
     control(w,p)
     def rendered(name):
         return next(item for item in walk(w.quick.rootObject()) if item.objectName()==name and item.isVisible())
-    wait_for_rendered(lambda:p.data.get('dimension')=='model' and p.row_model.rowCount()>0)
-    assert [entry['value'] for entry in p.state['dimensions']]==['project','model','source']
-    for field in ('service_tier','effort'):
-        click(w,rendered('usage-breakdown-'+field))
-        wait_for_rendered(lambda:field in p.data.get('breakdowns',[]))
-    assert p.options['breakdowns']==['service_tier','effort']
-    assert p.data['count']==18 and p.data['summary']['value']==216
-    def chart_settled():
-        return rendered('usage-rows').property('count')==p.data['count']
-    wait_for_rendered(chart_settled)
+    wait_for_rendered(lambda:p.data.get('dimension')=='service_tier' and p.row_model.rowCount()>0)
+    assert p.data['count']==16 and p.data['summary']['value']==216
+    assert all(set(row['filters'])=={'service_tier','model','effort'} for row in p.data['rows'])
     row=p.data['rows'][0];scope=p.capture()
-    assert p.format_row(0)['groupStart']
-    click(w,rendered('usage-row-'+row['key']))
-    wait_for_rendered(lambda:p.data.get('dimension')=='source')
+    assert p.format_row(0)['groupStart'] and len(p.format_row(0)['metrics'])==7
+    with monkeypatch.context() as guard:
+        guard.setattr(w,'render',lambda *a,**kw:pytest.fail('Metric selection must reuse delivered aggregates'))
+        toggle=rendered('usage-show-unknown')
+        position=toggle.mapToScene(QPointF())
+        assert position.x()>=0 and position.x()+toggle.width()<=w.quick.width()
+        click(w,toggle)
+        wait_for_rendered(lambda:p.data['count']==18)
+        assert p.data['summary']['value']==216 and p.capture()['showUnknown']
+        saved=p.capture()
+        click(w,toggle)
+        wait_for_rendered(lambda:p.data['count']==16)
+        p.restore(saved);p.present()
+        assert p.data['count']==18
+        p.change('showUnknown','false')
+        p.change('metric','cost_per_call');p.change('metric','calls')
+        choice=rendered('usage-view');choice.forceActiveFocus();QTest.keyClick(w.quick,Qt.Key_Down)
+        wait_for_rendered(lambda:p.options['view']=='table')
+        assert w.quick.grabFramebuffer().save(str(tmp_path/'paired-comparison-table.png'))
+        horizontal=rendered('usage-horizontal')
+        horizontal.setProperty('contentX',horizontal.property('contentWidth')-horizontal.width())
+        wait_for_rendered(lambda:horizontal.property('contentX')>0)
+        assert w.quick.grabFramebuffer().save(str(tmp_path/'paired-comparison-table-end.png'))
+        choice.forceActiveFocus();QTest.keyClick(w.quick,Qt.Key_Up)
+        wait_for_rendered(lambda:p.options['view']=='chart')
+    item=rendered('usage-row-'+row['key'])
+    position=item.mapToScene(QPointF())
+    assert position.x()>=0 and position.x()+item.width()<=w.quick.width()
+    assert w.quick.grabFramebuffer().save(str(tmp_path/'paired-comparison-compact.png'))
+    click(w,item)
+    wait_for_rendered(lambda:p.data.get('dimension')=='all')
     assert all(p.options['filters'][k]==v for k,v in row['filters'].items())
     assert p.data['summary']['value']==12
     p.records();wait_for_rendered(lambda:w.current_page==2 and bool(w.record_rows))
     assert len(w.record_rows)==12
     assert all(record[field]==value for record in w.record_rows for field,value in row['filters'].items())
     w.go_back();wait_for_rendered(lambda:w.current_page==1)
-    w.go_back();wait_for_rendered(lambda:p.data.get('dimension')=='model' and chart_settled())
+    w.go_back();wait_for_rendered(lambda:p.data.get('dimension')=='service_tier')
     assert p.capture()==scope
-    chart_top=rendered('usage-chart').mapToScene(QPointF()).y()
-    p.change('dimension','project')
-    wait_for_rendered(lambda:p.data['dimension']=='project' and rendered('usage-chart').mapToScene(QPointF()).y()==chart_top)
-    p.change('dimension','model')
-    wait_for_rendered(lambda:p.data['dimension']=='model' and rendered('usage-chart').mapToScene(QPointF()).y()==chart_top)
-    assert p.options['breakdowns']==['service_tier','effort']
-    saved=w.capture_state();p.change('breakdown:service_tier','false');w.restore_state(saved)
-    wait_for_rendered(lambda:p.data.get('breakdowns')==['service_tier','effort'])
-    click(w,rendered('usage-breakdown-effort'))
-    wait_for_rendered(lambda:p.data.get('breakdowns')==['service_tier'])
-    assert p.data['count']==2 and p.data['summary']['value']==216
     assert not w.qml_errors
 
 
-def test_saved_single_setting_dimension_restores_as_model_breakdown(dashboard):
+def test_legacy_dimensions_restore_with_fixed_model_effort_pairs(dashboard):
     dashboard.change_page(1);p=dashboard.metric_panel
-    for field in ('effort','service_tier'):
-        p.restore(dict(dimension=field,filters={'project':'saved-project'},selected=[field,'high' if field=='effort' else 'Fast']))
-        assert p.options['dimension']=='model' and p.options['breakdowns']==[field]
+    for field in ('model','effort','service_tier'):
+        p.restore(dict(dimension=field,filters={'project':'saved-project'},selected=[field,'high']))
+        assert p.options['dimension']==('service_tier' if field=='service_tier' else 'all')
         assert p.options['filters']=={'project':'saved-project'} and p.options['selected'][0]==field
     assert {choice['key'] for choice in p.state['choices']} >= {'effort','service_tier'}
 
@@ -342,7 +406,7 @@ def test_metric_drilldown_ignores_history_filters_and_restores_latest_scope(dash
 
 def test_saved_project_scope_remains_explicit_after_project_disappears(dashboard):
     from cachemonitor.analytics import project_identity
-    w=dashboard;w.change_page(1);p=w.metric_panel;key=p.data['rows'][0]['key'];p.select(key)
+    w=dashboard;w.change_page(1);p=w.metric_panel;row=p.data['rows'][0];key=row['filters']['project'];p.select(row['key'])
     source=copy.deepcopy(w.snapshot);source['sessions']=[s for s in source['sessions'] if project_identity(s)!=key]
     w.receive(source)
     assert p.options['filters']['project']==key and p.data['summary']['total']==0

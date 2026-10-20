@@ -2,6 +2,7 @@
 import os
 import time
 import math
+import json
 from collections import OrderedDict
 from dataclasses import dataclass
 from PySide6.QtCore import Qt, QTimer, QObject, Signal, QVariantAnimation, QEasingCurve
@@ -74,8 +75,12 @@ class OverlayController(QObject):
         self.chart_style=settings.value('overlay/chartStyle','bar')
         if self.chart_style not in ('bar','filled-line'):self.chart_style='bar'
         content.chart_style=self.chart_style
-        self.preferred_height=max(480,min(1440,settings.value('overlay/height',720,type=int)))
-        content.preferred_height=self.preferred_height
+        try:
+            saved=json.loads(settings.value('overlay/visibleAgentCounts','{}'))
+            if isinstance(saved,dict):
+                content.visible_agent_counts={key:value for key,value in saved.items()
+                                              if type(value) is int and 1<=value<=4}
+        except (ValueError,TypeError):pass
         content.layout_requested.connect(self.refresh)
         content.monitor_tab='history'
         content.composition_unit=settings.value('overlay/compositionUnit','usd')
@@ -130,13 +135,7 @@ class OverlayController(QObject):
         self.actions.opacity_toggle.connect(self.toggle_opacity)
         self.actions.settings_toggle.connect(self.toggle_settings)
         self.toolbar.chart_style_changed.connect(self.set_chart_style)
-        self.toolbar.height_changed.connect(self.change_length)
-        self.height_timer=QTimer(self)
-        self.height_timer.setSingleShot(True);self.height_timer.setInterval(40)
-        self.height_timer.timeout.connect(self.flush_height)
-        self._pending_height=None;self._height_adjusting=False
-        self.toolbar.height_previewed.connect(self.preview_height)
-        self.toolbar.height_finished.connect(self.finish_height)
+        self.toolbar.agent_count_changed.connect(self.set_visible_agent_count)
         self.icon.restore.connect(self.restore_panel)
         self.toolbar.opacity_changed.connect(self.set_opacity)
         for control in self.chrome:
@@ -169,7 +168,6 @@ class OverlayController(QObject):
         self.appearance_reader = CodexAppearance(appearance_path, QFontDatabase.families())
         self.appearance = default_appearance(self.dark)
         self.next_theme = 0
-        self._pending_detail_at = None
         self._content_time_state = None
         self.stopped = False
         self.enabled_changed = None
@@ -235,8 +233,14 @@ class OverlayController(QObject):
 
     @staticmethod
     def refreshed_overlay_detail(data,cached,health=False):
-        value=dict(data,recent=cached['recent'],latest=cached['latest'],_recent_refs=False,
+        # A stable revision proves the selected composition is still valid.
+        # Global heads intentionally omit it, so retain the hydrated fields.
+        base=dict(cached,**data) if data.get('_overlay_head') else data
+        value=dict(base,recent=cached['recent'],latest=cached['latest'],_recent_refs=False,
                    _health_detail=bool(data.get('_health_detail') or cached.get('_health_detail')))
+        value.pop('_overlay_head',None)
+        if data.get('_overlay_head') and 'main_usage' in cached:
+            value['main_usage']=cached['main_usage']
         if 'subagent_finance' in cached:
             value['subagent_finance']=cached['subagent_finance']
         if cached.get('_health_detail'):
@@ -305,6 +309,11 @@ class OverlayController(QObject):
 
     def receive_overlay_fault(self,value):
         requests=getattr(self,'_overlay_requests',None)
+        if value.get('publication_failed') or value.get('fatal') or value.get('start_failed') or value.get('process_exited'):
+            self._analysis_failed=True
+        if value.get('publication_failed'):
+            self.refresh()
+            return
         if value.get('query_failed'):
             request=requests.pop(value.get('request_id'),None) if requests is not None else None
             failed=(request,) if request else ()
@@ -316,7 +325,7 @@ class OverlayController(QObject):
         for request in failed:
             if value.get('query_failed'):OverlayController.block_overlay_request(self,request)
             if self.pending_overlay and self.pending_overlay.request_id==request.request_id:self.pending_overlay=None
-        if failed:self.refresh()
+        if failed or getattr(self,'_analysis_failed',False):self.refresh()
 
     def receive_overlay_detail(self,value):
         requests=getattr(self,'_overlay_requests',None)
@@ -482,32 +491,14 @@ class OverlayController(QObject):
         self.toolbar.view.put(chartStyle=value)
         self.changed.emit()
 
-    def set_preferred_height(self,value,*,persist=True):
-        self.preferred_height=max(480,min(1440,int(value)))
-        if persist:self.settings.setValue('overlay/height',self.preferred_height)
-        self.widget.content_model.preferred_height=self.preferred_height
-        self.widget.content_model.sync_details()
+    def set_visible_agent_count(self,value):
+        content=self.widget.content_model
+        if not content.has_subagents() or content.agent_count_key() is None:return
+        if type(value) is not int or not 1<=value<=4:return
+        content.visible_agent_counts[content.agent_count_key()]=value
+        self.settings.setValue('overlay/visibleAgentCounts',json.dumps(content.visible_agent_counts,ensure_ascii=False))
+        content.sync_details()
         self.changed.emit();self.refresh()
-
-    def change_length(self,delta):self.set_preferred_height(self.preferred_height+int(delta))
-
-    def preview_height(self,value):
-        self._height_adjusting=True
-        self.height_animation.stop()
-        self._pending_height=max(480,min(1440,int(value)))
-        if not self.height_timer.isActive():self.height_timer.start()
-
-    def flush_height(self):
-        value,self._pending_height=self._pending_height,None
-        if value is not None and value!=self.preferred_height:self.set_preferred_height(value,persist=False)
-
-    def finish_height(self,value):
-        if not self._height_adjusting:return
-        self.height_timer.stop();self._pending_height=None
-        self._height_adjusting=True
-        self.height_animation.stop()
-        try:self.set_preferred_height(value)
-        finally:self._height_adjusting=False
 
     def advance_height(self,value):
         self._animated_height=round(float(value))
@@ -697,6 +688,7 @@ class OverlayController(QObject):
         self.refresh()
 
     def receive_snapshot(self, snapshot):
+        self._analysis_failed=False
         self.sessions = snapshot.get('overlay_sessions', [])
         self.session_lookup={}
         for s in self.sessions:self.session_lookup.setdefault(s['id'],[]).append(s)
@@ -733,12 +725,17 @@ class OverlayController(QObject):
     def receive_collection_status(self, result):
         if isinstance(result.get('collection_fault'),dict):self.collection_fault=dict(result['collection_fault'])
         if 'collection_snapshot_at' in result:self.collection_published_at=result['collection_snapshot_at']
-        if 'collection_issue' not in result:return
-        self.collection_issue = result['collection_issue']
+        if 'collection_issue' in result:self.collection_issue = result['collection_issue']
         self.refresh()
 
+    def collection_phase(self):
+        from .app_errors import collection_phase
+        return collection_phase({**getattr(self,'collection_evidence',{}),
+            'collection_fault':getattr(self,'collection_fault',{}),
+            'collection_snapshot_at':getattr(self,'collection_published_at',None)},time.time(),
+            started_at=getattr(self,'collection_started_at',None))
+
     def content(self):
-        self._pending_detail_at = None
         selection = self.target_state.get('selection')
         if not selection or not selection.thread_id:
             return None, '기록 확인 중'
@@ -746,24 +743,20 @@ class OverlayController(QObject):
             return None, '원격 작업: 로컬 기록 없음'
         matches = self.session_lookup.get(selection.thread_id,[])
         issue = self.collection_issue
-        from .app_errors import collection_phase
         facts=getattr(self,'collection_fault',{})
-        phase=collection_phase({**getattr(self,'collection_evidence',{}),'collection_fault':facts,
-            'collection_snapshot_at':getattr(self,'collection_published_at',None)},time.time(),
-            started_at=getattr(self,'collection_started_at',None))
+        phase=OverlayController.collection_phase(self)
         pending=any(facts.get(key) for key in ('starting','status_pending','handoff_pending')) or issue=='수집 시작 중'
         preparing=pending and phase=='preparing'
         service_error=phase=='failed' or bool(issue and not pending and issue!='수집 결과 갱신 지연')
-        if not issue and not self.errors and getattr(self,'collection_stale',False):
-            issue='수집 결과 갱신 지연'
         received_age=max(0,time.monotonic()-self.snapshot_at) if self.snapshot_at else 0
-        delayed=received_age>ANALYSIS_DELAY_SECONDS
+        updating=received_age>ANALYSIS_DELAY_SECONDS
+        delayed=phase=='delayed'
         reason=('service_error' if service_error else 'source_error' if self.errors else
-                'service_preparing' if preparing else 'service_delay' if issue=='수집 결과 갱신 지연' or phase=='delayed' else
-                'analysis_delay' if delayed else '')
-        note = ('수집 오류' if service_error or self.errors else '기록 준비 중' if preparing else
-                '수집 지연' if issue == '수집 결과 갱신 지연' or phase=='delayed' else
-                '수집 지연' if delayed else '')
+                'service_preparing' if preparing else 'service_delay' if delayed else
+                'analysis_delay' if updating else '')
+        note = ('분석 오류' if getattr(self,'_analysis_failed',False) else
+                '수집 오류' if service_error or self.errors else '기록 준비 중' if preparing else
+                '수집 지연' if delayed else '갱신 중' if updating else '')
         if len(matches) != 1:
             return None, note or ('기록 확인 중' if self.loading else '호출 기록 없음' if not matches else '현재 세션 식별 불가')
         loading = self.loading and matches[0].get('collection_complete') is not True
@@ -777,12 +770,9 @@ class OverlayController(QObject):
             'source_error_count':len(self.errors),
         }}
         data,pending=self.prepared_content(data)
-        if pending and data:
-            confirmed=data['_collection'].get('last_confirmed_at')
-            self._pending_detail_at=confirmed
-            if confirmed and time.time()-confirmed>ANALYSIS_DELAY_SECONDS and not note:
-                note='수집 지연'
-                data['_collection'].update(delayed=True,reason='detail_delay')
+        if pending and data and not note:
+            note='갱신 중'
+            data['_collection']['reason']='detail_pending'
         return data,note or ('기록 확인 중' if pending and data is None else '')
 
     def activate_control(self, control):
@@ -791,11 +781,6 @@ class OverlayController(QObject):
 
 
     def close_popup(self):
-        if self._height_adjusting:
-            self.height_timer.stop();self._pending_height=None
-            self._height_adjusting=False
-            self.settings.setValue('overlay/height',self.preferred_height)
-            self.toolbar.view.put(heightValue=self.preferred_height)
         self.popup_open=False
         self.toolbar.hide()
         if hasattr(self,'input_timer'):self.input_timer.stop()
@@ -868,12 +853,12 @@ class OverlayController(QObject):
         QTimer.singleShot(0,self.refresh)
 
     def _content_time(self):
-        age=max(0,time.monotonic()-self.snapshot_at)
+        age=max(0,time.monotonic()-self.snapshot_at) if self.snapshot_at else 0
         data=self.widget.data
         if data and data.get('_collection',{}).get('reason')=='analysis_delay':
             data=dict(data,_collection=dict(data['_collection'],received_age=age))
         return (age>ANALYSIS_DELAY_SECONDS,
-                bool(self._pending_detail_at and time.time()-self._pending_detail_at>ANALYSIS_DELAY_SECONDS),
+                OverlayController.collection_phase(self),
                 OverlayContent.collection_age(data,self.widget.note))
 
     def _refresh_appearance(self):
@@ -972,7 +957,7 @@ class OverlayController(QObject):
                 self.height_animation.stop();self._height_context=context;self._height_target=monitor[3]
             elif monitor[3]!=self._height_target:
                 self.height_animation.stop();self._height_target=monitor[3]
-                if (not self.drag_context and not self._height_adjusting and self.widget.isVisible() and self.monitor_geometry and not self.reduced_motion
+                if (not self.drag_context and self.widget.isVisible() and self.monitor_geometry and not self.reduced_motion
                         and abs(self.monitor_geometry[3]-monitor[3])<=round(40*scale*dpi/96)):
                     self.height_animation.setStartValue(self.monitor_geometry[3]);self.height_animation.setEndValue(monitor[3])
                     self._configuring_height=True
@@ -1020,10 +1005,8 @@ class OverlayController(QObject):
         else:
             self.icon.hide()
             self.actions.view.put(popupOpen=self.popup_open,popupKind=self.popup_kind)
-            self.toolbar.view.put(popupKind=self.popup_kind,chartStyle=self.chart_style,heightValue=self.preferred_height,
-                                  displayedHeight=round(content.base_height()),canAdjustHeight=content.has_subagents(),
-                                  canShorten=content.has_subagents() and self.preferred_height>480,
-                                  canLengthen=content.has_subagents() and self.preferred_height<1440)
+            self.toolbar.view.put(popupKind=self.popup_kind,chartStyle=self.chart_style,
+                                  visibleAgentCount=content.visible_agent_count(),canAdjustAgentCount=content.has_subagents())
             self.shadow.apply_appearance(self.appearance,self.opacity)
             self.shadow.set_panel_size(self.widget.panel_width()/scale,geometry[3]/(dpi/96*scale))
             shadow_geometry=self.shadow.physical_geometry(geometry,dpi/96)
@@ -1051,12 +1034,13 @@ class OverlayController(QObject):
             else:self.links.hide()
             from .overlay_monitor import header_layout,header_status
             header_width=HEADER_WIDTH
-            place(self.header,(HEADER_X,10,header_width,28),monitor)
-            self.actions_geometry=place(self.actions,(ACTIONS_X,9,78,30),monitor)
+            header_y=content.layout()['header']
+            place(self.header,(HEADER_X,header_y-2,header_width,28),monitor)
+            self.actions_geometry=place(self.actions,(ACTIONS_X,header_y-3,78,30),monitor)
             if self.popup_open:
                 # Align below the header. The monitor already guarantees enough
                 # interior width; clamping also handles rounded native pixels.
-                popup_width,popup_height=(260,150) if self.popup_kind=='settings' else (160,40)
+                popup_width,popup_height=(260,138 if content.has_subagents() else 72) if self.popup_kind=='settings' else (160,40)
                 popup_w,popup_h=round(popup_width*native_scale),round(popup_height*native_scale)
                 px=monitor[0]+round((WIDTH-MARGIN-popup_width)*native_scale)
                 py=monitor[1]+round(44*native_scale)
@@ -1081,7 +1065,6 @@ class OverlayController(QObject):
         self.stopped = True
         self.window_stack.close()
         self.height_animation.stop()
-        self.height_timer.stop()
         self.view_animation.stop()
         self.timer.stop(); self.input_timer.stop(); self.hide_all()
         if self.tracker: self.tracker.stop()

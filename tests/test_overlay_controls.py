@@ -1,6 +1,7 @@
 from cachemonitor.quick_qa import click
 from PySide6.QtQuick import QQuickItem
 import sys
+import json
 import pytest
 from PySide6.QtCore import QSettings,Qt
 from PySide6.QtTest import QTest
@@ -123,17 +124,13 @@ def test_embedded_subagent_interaction_keeps_gear_and_settings_reachable(native_
     click(c.toolbar,line);refresh()
     assert c.chart_style=='filled-line'
     from tests.test_ui import wait_for_rendered
-    slider=named_item(c.toolbar.quick.rootObject(),'heightSlider')
-    wait_for_rendered(lambda:slider.isVisible() and slider.isEnabled() and slider.width()>0)
-    old=c.preferred_height
-    start=slider.mapToScene(QPointF(slider.width()*.25,slider.height()/2)).toPoint()
-    end=slider.mapToScene(QPointF(slider.width()*.43,slider.height()/2)).toPoint()
-    QTest.mousePress(c.toolbar.quick,Qt.LeftButton,pos=start)
-    QTest.mouseMove(c.toolbar.quick,end)
-    QTest.mouseRelease(c.toolbar.quick,Qt.LeftButton,pos=end)
-    wait_for_rendered(lambda:c.preferred_height==round(slider.property('value')) and c.preferred_height!=old)
-    assert c.settings.value('overlay/height',type=int)==c.preferred_height
-    assert c.preferred_height%80!=0
+    count=named_item(c.toolbar.quick.rootObject(),'agentCount-4')
+    wait_for_rendered(lambda:count.isVisible() and count.isEnabled() and count.width()>0)
+    click(c.toolbar,count)
+    wait_for_rendered(lambda:c.widget.content_model.visible_agent_count()==4)
+    assert json.loads(c.settings.value('overlay/visibleAgentCounts'))[c.widget.content_model.agent_count_key()]==4
+    click(c.toolbar,count)
+    assert count.property('checked')
     refresh()
     x,y,w,h=c.popup_geometry
     assert api.WindowFromPoint(W.POINT(x+w//2,y+h//2))==int(c.toolbar.winId())
@@ -145,6 +142,46 @@ def test_embedded_subagent_interaction_keeps_gear_and_settings_reachable(native_
     assert c.collapsed and c.icon.isVisible()
     QTest.mouseClick(c.icon,Qt.LeftButton);refresh()
     assert not c.collapsed and c.detail.isVisible()
+
+@pytest.mark.skipif(sys.platform!='win32',reason='Native Windows popup geometry')
+def test_popup_controls_fit_native_viewport_and_remain_clickable(native_detail,tmp_path):
+    from PySide6.QtCore import QPointF
+    from cachemonitor.overlay_chrome import named_item
+    from tests.test_ui import wait_for_rendered
+    c,host,refresh=native_detail
+    host.resize(420,900);refresh()
+    def item(name):
+        wait_for_rendered(lambda:c.toolbar.quick is not None and c.toolbar.quick.rootObject() is not None)
+        control=named_item(c.toolbar.quick.rootObject(),name)
+        assert control is not None and control.isVisible()
+        top=control.mapToScene(QPointF(0,0))
+        bottom=control.mapToScene(QPointF(control.width(),control.height()))
+        assert top.x()>=0 and top.y()>=0
+        assert bottom.x()<=c.toolbar.quick.width()+1 and bottom.y()<=c.toolbar.quick.height()+1, name
+        return control
+    c.toggle_settings();refresh()
+    for name in ('chartStyle-bar','chartStyle-filled-line',*(f'agentCount-{n}' for n in range(1,5))):item(name)
+    click(c.toolbar,item('chartStyle-filled-line'))
+    wait_for_rendered(lambda:c.chart_style=='filled-line')
+    click(c.toolbar,item('agentCount-4'))
+    wait_for_rendered(lambda:c.widget.content_model.visible_agent_count()==4)
+    assert c.toolbar.grab().save(str(tmp_path/'settings.png'))
+    from cachemonitor.analysis_engine import AnalysisEngine
+    from cachemonitor.overlay_data import OverlaySummaries
+    from test_overlay import source
+    engine=AnalysisEngine();engine.ingest([source()])
+    c.receive_snapshot(dict(overlay_sessions=OverlaySummaries().collect(engine)));refresh()
+    assert not c.widget.content_model.has_subagents()
+    click(c.toolbar,item('chartStyle-bar'))
+    wait_for_rendered(lambda:c.chart_style=='bar')
+    c.toggle_opacity();refresh()
+    slider=item('opacity');before=c.opacity
+    click(c.toolbar,slider,x=slider.width()*.75)
+    wait_for_rendered(lambda:c.opacity!=before)
+    assert c.settings.value('overlay/opacity',type=int)==c.opacity
+    assert c.toolbar.grab().save(str(tmp_path/'opacity.png'))
+    c.escape();assert not c.popup_open
+
 
 @pytest.mark.skipif(sys.platform!='win32',reason='Native Windows popup stacking')
 def test_overlay_tooltip_stays_above_panels_after_activation(native_detail):

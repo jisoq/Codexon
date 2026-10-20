@@ -53,7 +53,7 @@ class QuotaService(QThread):
         self.report_worker=QuotaWorker(self.path,self.home,on_result=self._receive_worker)
 
     def _receive_worker(self, result):
-        if (result['kind'] in ('report','exclude','restore','clear_cycle') or
+        if (result['kind'] in ('report','exclude','restore','clear_cycle','progress') or
                 result['kind']=='chart' and result.get('stale')):
             self.worker_results.put(result)
             self.wake.set()
@@ -247,10 +247,16 @@ class QuotaService(QThread):
                     exclusions.append(self.exclusion_changes.get_nowait())
                     next_report = 0
                 exclusion_results = []
+                operation_progress = []
                 report_ready = False
                 while not self.worker_results.empty():
                     computed=self.worker_results.get_nowait()
                     kind=computed['kind']
+                    if kind=='progress':
+                        if edit_request is not None and computed['id']==edit_request['id']:
+                            if computed['stage']=='reading':edit_request['saved']=True
+                            operation_progress.append(computed)
+                        continue
                     if kind=='chart':
                         if report is None or computed['revision']==report['worker_revision']:
                             report_refresh_due=True
@@ -403,7 +409,7 @@ class QuotaService(QThread):
                 faults=dict(lookup=dict(lookup_failed=bool(lookup_issue),reason=lookup_reason),
                     storage=database_fault or dict(storage_failed=bool(pending.issue or self.observation_issue or self.control_issue)),
                     calculation=dict(calculation_fault))
-                if publish or issue != emitted_issue or faults!=emitted_faults or exclusion_results:
+                if publish or issue != emitted_issue or faults!=emitted_faults or exclusion_results or operation_progress:
                     value={'home':self.home,'quota':latest,'issue':issue,'quota_faults':faults,'report_refreshed':report_ready,
                            'paused':paused,'paused_at':self.paused_at,'monitoring_revision':revision}
                     if self.reports_enabled or exclusion_results:
@@ -413,6 +419,8 @@ class QuotaService(QThread):
                             value['report']={'home':self.home,'cycles':[],'error':True,'index_loading':False}
                     for result in exclusion_results or [None]:
                         self.updated.emit({**value, 'exclusion_result':result} if result else value)
+                    for progress in operation_progress:
+                        self.updated.emit({**value,'operation_progress':progress})
                     emitted_issue = issue;emitted_faults=faults
                     next_report = time.monotonic()+5
                 self.wake.wait(1)

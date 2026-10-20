@@ -92,31 +92,41 @@ def test_cycle_overview_uses_page_space_and_reveals_last_row(tmp_path,width,heig
 
 @pytest.mark.integration
 @pytest.mark.essential
-def test_current_chart_remains_usable_until_full_history_finishes(quota_page,tmp_path):
+@pytest.mark.parametrize('width',[1000,520])
+def test_current_chart_remains_usable_until_full_history_finishes(quota_page,tmp_path,width):
     app,panel,scroll=quota_page
-    host=mount(scroll,1000,680)
+    host=mount(scroll,width,680)
     full=panel.report
     try:
         for failed in (False,True):
             panel.receive(dict(home='h',report={**full,'history_pending':True,'history_failed':failed}))
             assert not panel.cycle_choice.isEnabled() and not panel.manage_button.isEnabled()
             assert all(panel.summary_values[key].text() in ('계산 중','확인 불가') for key in ('usage','cost','weekly'))
-            assert panel.history_loading.isVisible() is not failed
-            assert panel.history_loading._state['running'] is not failed
+            assert panel.cycle_loading.isVisible() is not failed
+            assert panel.cycle_loading._state['running'] is not failed
+            assert not panel.history_loading.isVisible()
             if not failed:
-                from cachemonitor.i18n import tr
-                loading=render_plot(host,panel.history_loading)
-                title=next(item for item in walk(loading)
-                           if item.property('text')==tr(panel.history_loading.state['title']))
-                assert host.quick.grabFramebuffer().save(str(tmp_path/'quota-inline-loading.png'))
-                assert abs(title.mapToScene(QPointF(0,0)).x()-loading.mapToScene(QPointF(0,0)).x())<=1
-                assert title.width()>=loading.width()-1
+                from test_ui import wait_for_rendered
+                loading=render_plot(host,panel.cycle_loading)
+                choice=control(host,panel.cycle_choice)
+                icon=next(item for item in walk(loading) if item.property('name')=='restart')
+                assert icon.isVisible()
+                assert loading.mapToScene(QPointF(loading.width(),0)).x()<=choice.mapToScene(QPointF()).x()
+                assert abs(loading.mapToScene(QPointF(0,loading.height()/2)).y()-
+                           choice.mapToScene(QPointF(0,choice.height()/2)).y())<=1
+                frame=lambda:host.quick.grabFramebuffer().copy(
+                    int(loading.mapToScene(QPointF()).x()),int(loading.mapToScene(QPointF()).y()),
+                    int(loading.width()),int(loading.height()))
+                first=frame()
+                wait_for_rendered(lambda:frame()!=first)
+                assert host.quick.grabFramebuffer().save(str(tmp_path/'quota-cycle-loading.png'))
             plot=render_plot(host,panel.history);click(host,plot,x=plot.width()*.6,y=plot.height()*.5)
             QTest.keyClick(host.quick,Qt.Key_Home)
             assert panel.history.cursor==0 and panel.history.rows
         panel.receive(dict(home='h',report=full))
         assert panel.cycle_choice.isEnabled() and panel.manage_button.isEnabled()
         assert not panel.history_loading.isVisible() and not panel.history_loading._state['running']
+        assert not panel.cycle_loading.isVisible() and not panel.cycle_loading._state['running']
         assert panel.summary_values['cost'].text() not in ('계산 중','확인 불가')
         assert not host.qml_errors
     finally:dispose(host)
@@ -377,17 +387,17 @@ def test_waiting_state_becomes_observed_zero_and_keeps_history_during_lookup_fai
         report=report_for([cycle])
         panel.receive({'report':report})
         QTest.qWait(40)
-        assert panel.statistics['total'] and panel.basis.text()=='0%p'
-        assert panel.cost_value.text()=='$0.0000'
+        assert panel.lifetime_statistics['total'] and panel.summary_values['usage'].text()=='0%'
+        assert panel.summary_values['cost'].text()=='$0.0000'
         assert panel.history.isVisible() and panel.history_legend.isVisible()
         assert control(host,panel.manage_button).isVisible()
-        assert not panel.history_waiting.isVisible() and panel.conversion.isVisible()
+        assert not panel.history_waiting.isVisible() and panel.summary.isVisible()
         assert panel.history.rows
         rows=panel.history.rows
         panel.receive({'issue':'Codex 한도 조회 실패'})
         QTest.qWait(40)
         assert panel.status.isVisible() and panel.history.rows is rows
-        assert panel.basis.text()=='0%p' and panel.cost_value.text()=='$0.0000'
+        assert panel.summary_values['usage'].text()=='0%' and panel.summary_values['cost'].text()=='$0.0000'
         assert not panel.history_waiting.isVisible()
         assert not host.qml_errors
     finally:dispose(host);shared_theme().configure('light')

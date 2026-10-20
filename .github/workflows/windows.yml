@@ -118,7 +118,7 @@ jobs:
           $failed = $false
           foreach ($scale in @('1.25', '2')) {
             $env:CODEXON_OVERLAY_QA_OUTPUT = "artifacts/verification/overlay-scale-$scale"
-            python tools/run_ui_checks.py --timeout 120 --scale $scale -- python -m pytest -p tools.check_progress -q tests/test_overlay_resilience.py::test_auto_fallback_restores_preference_anchor_and_clickthrough --junitxml="artifacts/verification/overlay-scale-$scale.xml"
+            python tools/run_ui_checks.py --timeout 120 --scale $scale -- python -m pytest -p tools.check_progress -q tests/test_overlay_resilience.py::test_auto_fallback_restores_preference_anchor_and_clickthrough tests/test_overlay_controls.py::test_popup_controls_fit_native_viewport_and_remain_clickable --junitxml="artifacts/verification/overlay-scale-$scale.xml"
             if ($LASTEXITCODE -ne 0) { $failed = $true }
           }
           if ($failed) { exit 1 }

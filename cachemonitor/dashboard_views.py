@@ -249,6 +249,9 @@ def resolve_population(engine,ref,flatten=True):
     if 'union' in ref:
         return list({(identity(r),r.get('turn')):r for part in ref['union'] for r in resolve_population(engine,part,flatten)}.values())
     result=engine.query(ref['query']);value=result
+    if ref['path']==['analysis','responses'] and any(ref['query'].get(k) for k in ('input_band','cache_band')):
+        from .comparison_usage import matches as comparison_matches
+        return [row for row in result['analysis']['responses'] if comparison_matches(row,ref['query'])]
     if ref['path'][0]=='summary_populations':
         a=result['analysis'];rows=a['responses'];turns=[t for t in a['turns'] if t['complete']]
         selected=([r for r in rows if r.get('cost') is not None],)*2+([t for t in turns if t.get('cost') is not None],cache_rows(rows),[r for r in rows if r.get('output_speed') is not None])

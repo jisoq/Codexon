@@ -161,17 +161,29 @@ def test_tab_loading_keeps_controls_and_ignores_stale_result(tmp_path,language):
         assert period.isVisible() and period.isEnabled()
         assert control(window,window.nav).isVisible()
         assert not content.isVisible() and not content.isEnabled()
+        result_controls=[item for item in walk(usage)
+                         if item.objectName() in ('usage-result-controls','usage-legend-row')]
+        assert len(result_controls)==2
+        assert all(not item.isVisible() and not item.isEnabled() for item in result_controls)
         texts=[item.property('text') for item in walk(progress) if item.property('text')]
         assert any(('Loading' if language=='en' else '불러오는 중') in text for text in texts)
         if language=='en':assert not any('\uac00'<=char<='\ud7a3' for text in texts for char in text)
         fill=next(item for item in walk(progress) if item.objectName()=='loading-completed')
         assert fill.width()==0
+        activity=next(item for item in walk(progress) if item.objectName()=='loading-activity')
+        position=activity.x()
+        wait_for_rendered(lambda:activity.x()!=position)
+        elapsed=window.analysis_loading.get('elapsedText','')
+        window.analysis_started-=2
+        wait_for_rendered(lambda:bool(window.analysis_loading.get('elapsedText')) and
+                          window.analysis_loading['elapsedText']!=elapsed,timeout=2)
         window.analysis_progressed(dict(id=old_id,stage='query'))
-        wait_for_rendered(lambda:fill.width()>0)
-        reading_width=fill.width()
+        assert fill.width()==0
+        window.analysis_progressed(dict(id=old_id,stage='query',processed=20,total=100,unit='sessions'))
+        wait_for_rendered(lambda:fill.width()>0);reading_width=fill.width()
         assert window.quick.grabFramebuffer().save(str(tmp_path/f'partial-loading-{language}.png'))
         assert window.request_id==old_id
-        window.analysis_progressed(dict(id=old_id,stage='aggregate'))
+        window.analysis_progressed(dict(id=old_id,stage='aggregate',processed=60,total=100,unit='intervals'))
         wait_for_rendered(lambda:fill.width()>reading_width)
         assert window.analysis_stage=='aggregate'
         window.show_analysis_slow()
@@ -242,9 +254,9 @@ def test_refresh_preserves_only_matching_results_and_failure_can_retry(tmp_path)
         deliver_pending(window)
         window.client_cache.clear();window.render(automatic=True)
         assert window.analysis_pending and window.pending_retained and window.pages.isVisible()
-        assert not window.analysis_loading and not window.slow_timer.isActive()
+        assert window.analysis_loading['retained'] and window.slow_timer.isActive()
         window.show_analysis_slow()
-        assert not window.analysis_loading
+        assert window.analysis_loading['slow']
         automatic_request=window.request_id
         window.render()
         assert window.request_id==automatic_request and window.analysis_loading['retained']
@@ -256,22 +268,25 @@ def test_refresh_preserves_only_matching_results_and_failure_can_retry(tmp_path)
         chart=next(item for item in walk(usage) if item.objectName()=='usage-chart-content')
         period=next(item for item in walk(usage) if item.objectName()=='usage-period')
         assert chart.isVisible() and period.isVisible() and period.isEnabled()
+        result_controls=[item for item in walk(usage)
+                         if item.objectName() in ('usage-result-controls','usage-legend-row')]
+        assert len(result_controls)==2
+        assert all(item.isVisible() and item.isEnabled() for item in result_controls)
         previous_id=window.request_id
         window.resize(window.width()+50,window.height()+50)
         assert window.request_id==previous_id
         assert window.pending_retained and window.pages.isVisible()
         window.analysis_failed('synthetic failure')
         assert window.pages.isVisible() and window.error_button.isVisible()
-        assert not window.retry_button.isVisible() and not window.analysis_loading
-        click(window,render_plot(window,window.error_button))
-        assert window.current_page==4 and window.error_panel.selected=='analysis'
-        click(window,render_plot(window,window.error_panel.action))
+        assert window.retry_button.isVisible() and not window.analysis_loading
+        click(window,control(window,window.retry_button))
         assert window.analysis_pending
         deliver_pending(window)
         assert not window.retry_button.isVisible()
         window.metric_panel.change('period','7d')
         assert window.analysis_pending and window.pages.isVisible() and not window.analysis_loading['retained']
         assert not chart.isVisible() and not chart.isEnabled()
+        assert all(not item.isVisible() and not item.isEnabled() for item in result_controls)
         assert period.isVisible() and period.isEnabled()
         window.analysis_failed('changed-filter failure')
         assert window.pages.isVisible() and window.error_button.isVisible()
@@ -288,6 +303,29 @@ def test_refresh_preserves_only_matching_results_and_failure_can_retry(tmp_path)
         assert window.analysis_pending and not window.pending_retained
         assert window.pages.isVisible() and not window.analysis_loading['retained']
         assert not window.qml_errors
+    finally:window.quit_app()
+
+
+def test_comparison_display_controls_keep_chart_without_new_query(tmp_path):
+    from cachemonitor.quick_qa import control,walk
+    from test_ui import wait_for_rendered
+    window=dashboard(tmp_path)
+    try:
+        window.receive(sample());window.resize(1000,680);window.show();window.change_page(1)
+        wait_for_rendered(lambda:window.pages.isPageReady(0),timeout=5)
+        panel=window.metric_panel
+        chart=next(item for item in walk(control(window,panel)) if item.objectName()=='usage-chart-content')
+        window.async_mode=True
+        request=window.request_id
+        rows=panel.data['rows']
+        panel.change('search','no matching project')
+        wait_for_rendered(lambda:not panel.data['rows'])
+        assert window.request_id==request and not window.analysis_pending and chart.isVisible()
+        panel.change('search','')
+        wait_for_rendered(lambda:panel.data['rows']==rows)
+        panel.change('sort','name');panel.change('mode','ratio')
+        assert window.request_id==request and not window.analysis_pending and chart.isVisible()
+        assert panel.options['mode']=='ratio' and not window.qml_errors
     finally:window.quit_app()
 
 

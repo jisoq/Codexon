@@ -144,7 +144,8 @@ def test_pytest_phase_is_visible_before_a_hung_test_exits(tmp_path):
     with log.open('w') as output:
         result = subprocess.run([sys.executable, str(ROOT / 'tools/run_ui_checks.py'),
             '--timeout', '4', '--diagnostics', str(evidence), '--', sys.executable,
-            '-m', 'pytest', '-p', 'tools.check_progress', '-o', 'addopts=', str(probe)],
+            '-m', 'pytest', '-p', 'tools.check_progress', '-o', 'addopts=',
+            '--rootdir', str(tmp_path), '--confcutdir', str(tmp_path), str(probe)],
             stdout=output, stderr=subprocess.STDOUT, timeout=20)
     assert result.returncode == 124, log.read_text()
     active = json.loads((evidence / 'result.json').read_text())['active_test']
@@ -183,7 +184,8 @@ def test_scheduler_process_is_tracked_by_its_fresh_scope(tmp_path, mode, expecte
     try:
         result = subprocess.run([sys.executable, str(ROOT / 'tools/run_ui_checks.py'),
             '--timeout', '20', '--diagnostics', str(evidence), '--', sys.executable,
-            '-m', 'pytest', '-p', 'tools.check_progress', '-o', 'addopts=', str(probe)],
+            '-m', 'pytest', '-p', 'tools.check_progress', '-o', 'addopts=',
+            '--rootdir', str(tmp_path), '--confcutdir', str(tmp_path), str(probe)],
             capture_output=True, text=True, timeout=40)
         assert result.returncode == expected, result.stdout + result.stderr
         task = ObserverTask(scope_file.read_text(), role='RunnerQA')

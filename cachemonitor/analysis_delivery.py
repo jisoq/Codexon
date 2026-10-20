@@ -153,5 +153,12 @@ class SnapshotReceiver:
         for s in value['overlay_sessions']:self.overlays[(s['home'],s['id'])]=s
         if 'models' in value:self.models=value['models']
         if 'filter_choices' in value:self.filter_choices=value['filter_choices']
+        overlays=list(self.overlays.values())
+        if value.get('prepared_token') is not None:
+            # The accepted envelope pins detail reads for the entire view.
+            # Content deltas need not retransmit unchanged summaries merely
+            # to advance that pin. Never mutate an earlier returned snapshot.
+            token=tuple(value['prepared_token'])
+            overlays=[dict(summary,_prepared_token=token) for summary in overlays]
         return {**value,'changed_sessions':value['sessions'],'sessions':list(self.sessions.values()),
-                'overlay_sessions':list(self.overlays.values()),'models':self.models,'filter_choices':self.filter_choices}
+                'overlay_sessions':overlays,'models':self.models,'filter_choices':self.filter_choices}

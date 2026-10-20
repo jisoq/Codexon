@@ -1,5 +1,6 @@
 """Behavior shared by the vertical overlay's charts and fixed summaries."""
 from copy import deepcopy
+import json
 from dataclasses import replace
 
 import pytest
@@ -31,6 +32,47 @@ def test_agent_color_identity_does_not_depend_on_discovery_order(column_model):
         assert {key: original[key] for key in reordered} == reordered
     finally:
         fresh.deleteLater()
+
+
+def test_latest_agent_flash_fades_without_refresh_restarting_it(column_model):
+    m=column_model;data=subagent_summary()
+    child=next(row for row in data['recent'] if row['sid']!=data['id'])
+    data['recent'].append(dict(child,id='flash-child'))
+    m.set_content(data)
+    animation=m._agent_highlight
+    animation.pause()
+    animation.setCurrentTime(animation.duration()//5)
+    peak=m.agent_highlight_opacity
+    assert peak>0
+    animation.setCurrentTime(animation.duration()*3//4)
+    faded=m.agent_highlight_opacity
+    assert 0<faded<peak
+    cached=[item for item in m._detail_items if item[8].get('kind')=='agent-selection']
+    assert len(cached)==1 and cached[0][8]['alpha']==faded
+    elapsed=animation.currentTime()
+    refreshed=dict(data,title='Updated title')
+    m.set_content(refreshed)
+    assert animation.currentTime()==elapsed and m.agent_highlight_opacity==faded
+    animation.setCurrentTime(animation.duration())
+    assert m.agent_highlight_opacity==0
+    main=next(row for row in data['recent'] if row['sid']==data['id'])
+    refreshed=dict(refreshed,recent=[*data['recent'],dict(main,id='flash-main')])
+    m.set_content(refreshed)
+    animation.pause();animation.setCurrentTime(animation.duration()//5)
+    assert m.agent_highlight_opacity==peak and m.latest_call()['sid']==data['id']
+    assert not any(item[8].get('kind')=='agent-selection' for item in m._detail_items)
+    m.set_content(summary())
+    animation.pause();animation.setCurrentTime(animation.duration()//5)
+    assert not m.has_subagents() and m.agent_highlight_opacity==peak
+    from test_overlay_monitor import render
+    elapsed=animation.currentTime()
+    m.set_content(dict(m.data,title='Solo title updated'))
+    assert animation.currentTime()==elapsed and m.agent_highlight_opacity==peak
+    highlighted=render(m)
+    animation.setCurrentTime(animation.duration())
+    assert render(m)!=highlighted
+    m.set_content(dict(m.data,recent=[]))
+    assert m.agent_highlight_opacity==0 and animation.state()==animation.State.Stopped
 
 
 def test_agent_color_survives_rolling_calls_and_subagent_sorting(column_model):
@@ -71,12 +113,12 @@ def test_token_details_keep_explicit_unknown_and_confirmed_zero_distinct(column_
         item=next(item for item in items if item[0]==label)
         result=next(row[0] for row in items if row[2]==item[2] and row[8].get('right'))
         return ''.join(result) if isinstance(result,list) else result
-    assert value('추론')=='— 토큰 / —'
-    assert value('추론 외')=='0 토큰 / $0.00'
-    assert value('캐시 쓰기')=='0 토큰 / —'
-    assert value('입력 (확인분)')=='10 토큰 / $0.1'
-    assert value('출력 (확인분)')=='20 토큰 / $0.4'
-    assert any(item[0]=='호출 3/4' for item in items)
+    assert value('추론')=='— / —'
+    assert value('추론 외')=='0 / $0.0000'
+    assert value('캐시 쓰기')=='0 / —'
+    assert value('입력 (확인분)')=='10 / $0.1000'
+    assert value('출력 (확인분)')=='20 / $0.4000'
+    assert any(item[0]=='토큰 구성 (3/4)' for item in items)
 
 
 def test_codex_accent_changes_chart_palette_without_changing_agent_identity(column_model):
@@ -233,50 +275,33 @@ def test_chart_style_change_preserves_selected_call_and_finance(column_controlle
         assert model.data['main_usage'] == own
 
 
-def test_continuous_height_and_chart_style_preferences_survive_restart(column_controller,monkeypatch):
+def test_visible_agent_count_and_chart_style_preferences_survive_restart(column_controller,monkeypatch):
     from cachemonitor.overlay import OverlayController
-    from PySide6.QtCore import QAbstractAnimation
-    controller = column_controller
+    controller=column_controller
     monkeypatch.setattr(controller,'refresh',lambda:None)
-    controller.set_preferred_height(720)
-    controller.preview_height(793)
-    controller.preview_height(827)
-    assert controller.preferred_height == 720
-    controller.flush_height()
-    assert controller.preferred_height == 827
-    assert controller.settings.value('overlay/height',type=int)==720
-    assert controller.height_animation.state()!=QAbstractAnimation.State.Running
-    controller.finish_height(831)
-    assert controller.preferred_height == 831
-    assert not controller.height_timer.isActive()
+    controller.widget.set_content(subagent_summary())
+    controller.set_visible_agent_count(4)
     controller.set_chart_style('filled-line')
+    controller.settings.setValue('overlay/manualHeights',json.dumps({controller.widget.content_model.agent_count_key():1200}))
     controller.settings.sync()
-    restored = OverlayController(controller.settings, native_enabled=False)
+    restored=OverlayController(controller.settings,native_enabled=False)
     try:
-        assert restored.preferred_height == 831
-        assert restored.chart_style == 'filled-line'
-        assert restored.widget.content_model.chart_style == 'filled-line'
-    finally:
-        restored.stop()
+        restored.widget.set_content(subagent_summary())
+        assert restored.widget.content_model.visible_agent_count()==4
+        assert restored.widget.content_model.base_height()==controller.widget.content_model.base_height()
+        assert restored.chart_style=='filled-line'
+    finally:restored.stop()
 
 
-@pytest.mark.parametrize('apply_preview',[False,True])
-def test_closing_height_controls_cancels_pending_drag_and_ignores_late_release(column_controller,monkeypatch,apply_preview):
-    controller=column_controller;refreshes=[]
-    monkeypatch.setattr(controller,'refresh',lambda:refreshes.append(controller.preferred_height))
-    controller.set_preferred_height(720)
-    controller.preview_height(793)
-    if apply_preview:controller.flush_height()
-    applied=controller.preferred_height
-    controller.preview_height(827)
-    before=list(refreshes)
-    controller.close_popup()
-    assert not controller.height_timer.isActive() and controller._pending_height is None
-    assert not controller._height_adjusting
-    assert controller.settings.value('overlay/height',type=int)==applied
-    controller.finish_height(827)
-    controller.flush_height()
-    assert controller.preferred_height==applied and refreshes==before
+@pytest.mark.parametrize('invalid',[0,5,True,1.5,'2'])
+def test_agent_count_rejects_invalid_choices(column_controller,monkeypatch,invalid):
+    c=column_controller
+    monkeypatch.setattr(c,'refresh',lambda:None)
+    c.widget.set_content(subagent_summary())
+    c.set_visible_agent_count(2)
+    c.set_visible_agent_count(invalid)
+    assert c.widget.content_model.visible_agent_count()==2
+    assert json.loads(c.settings.value('overlay/visibleAgentCounts'))[c.widget.content_model.agent_count_key()]==2
 
 
 @pytest.mark.parametrize('key', ['cost', 'output_speed', 'reasoning'])
@@ -348,3 +373,94 @@ def test_agent_heartbeats_follow_own_requests_not_latest_call_or_aggregate(colum
     assert column_model.state['mainHeartbeats'][0]['mode']=='idle'
     assert {groups[item['id']] for item in column_model.state['detailHeartbeats'] if item['mode']=='active'}=={'preview-agent-1'}
     assert column_model.rows()==data['recent']
+    changed=deepcopy(changed)
+    changed['main_usage'].pop('request_state')
+    changed['main_usage'].pop('request',None)
+    for agent in changed['subagent_finance']['agents']:
+        agent.pop('request_state')
+        agent.pop('request',None)
+    column_model.set_content(changed)
+    assert column_model.state['mainHeartbeats'][0]['mode']=='unknown'
+    assert all(item['mode']=='unknown' for item in column_model.state['detailHeartbeats'])
+
+
+def test_main_and_one_to_four_subagents_share_bottom_padding(column_model):
+    from tools.preview_overlay import synthetic_snapshot
+    from cachemonitor.overlay_data import main_usage
+    gaps=[]
+    for count in range(5):
+        scenario=f'sub-{count}' if count else 'idle'
+        data=next(row for row in synthetic_snapshot(scenario)['overlay_sessions'] if row['id']=='preview-main')
+        column_model.set_content(data)
+        column_model.visible_agent_counts[column_model.agent_count_key()]=4
+        layout=column_model.layout()
+        if count:
+            items=column_model.detail_items();start=layout['sub_y']
+        else:
+            items=column_model.agent_summary_items(main_usage(data),'Main Agent','ink',False,276,main=True)
+            start=layout['main']
+        text_bottom=start+max(item[2]+item[4] for item in items if item[0])
+        gaps.append(layout['height']-text_bottom)
+    assert max(gaps)-min(gaps)<1
+
+
+def test_automatic_height_fits_up_to_three_summaries_and_keeps_expansion_inside(column_model):
+    from tools.preview_overlay import synthetic_snapshot
+    heights=[]
+    bottom_gaps=[]
+    for count in (1,2,3,4,8):
+        data=next(row for row in synthetic_snapshot(f'sub-{count}')['overlay_sessions'] if row['id']=='preview-main')
+        column_model.set_content(data)
+        layout=column_model.layout()
+        summaries=[item for item in column_model.detail_items() if item[8].get('action','').startswith('group-')]
+        assert len(summaries)==count
+        assert all(item[2]+item[4]<=layout['sub_height'] for item in summaries[:3])
+        last_visible=summaries[min(count,3)-1]
+        bottom_gaps.append(layout['sub_height']-last_visible[2]-last_visible[4])
+        if count>3:assert summaries[3][2]+summaries[3][4]>layout['sub_height']
+        heights.append(layout['height'])
+    assert heights[0]<heights[1]<heights[2]==heights[3]==heights[4]
+    assert max(bottom_gaps)-min(bottom_gaps)<1
+    column_model.expanded_groups.add(column_model.detail_groups()[0]['key'])
+    column_model.sync_details()
+    assert column_model.base_height()==heights[-1]
+    assert column_model.state['detailBodyHeight']>column_model.layout()['sub_height']
+
+
+def test_visible_count_is_scoped_and_survives_growth_retention_and_screen_constraints(column_controller,monkeypatch):
+    from tools.preview_overlay import synthetic_snapshot
+    c=column_controller;m=c.widget.content_model
+    monkeypatch.setattr(c,'refresh',lambda:None)
+    def data(count):return next(row for row in synthetic_snapshot(f'sub-{count}')['overlay_sessions'] if row['id']=='preview-main')
+    m.set_content(data(4));automatic=m.base_height()
+    for limit in (1,2,3,4):
+        c.set_visible_agent_count(limit)
+        layout=m.layout();summaries=[item for item in m.detail_items() if item[8].get('action','').startswith('group-')]
+        assert all(item[2]+item[4]<=layout['sub_height'] for item in summaries[:limit])
+        if limit<4:assert summaries[limit][2]+summaries[limit][4]>layout['sub_height']
+    chosen=m.base_height()
+    m.set_content(data(8))
+    assert m.base_height()==chosen and m.visible_agent_count()==4
+    m.available_height=620
+    assert m.base_height()<chosen and m.visible_agent_count()==4
+    m.available_height=None
+    assert m.base_height()==chosen
+    incomplete=dict(m.data,descendants=0,subagent_finance={},_collection=dict(loading=True))
+    m.set_content(incomplete)
+    assert len(m.detail_groups())==8 and m.base_height()==chosen
+    m.set_content(data(1))
+    assert m.visible_agent_count()==4 and m.base_height()<automatic
+    other=dict(data(4),id='other-conversation')
+    m.set_content(other)
+    assert m.visible_agent_count()==3 and m.base_height()==automatic
+    m.set_content(data(4))
+    assert m.base_height()==chosen and m.visible_agent_count()==4
+    solo=next(row for row in synthetic_snapshot('idle')['overlay_sessions'] if row['id']=='preview-main')
+    m.set_content(solo)
+    assert not m.has_subagents() and m.base_height()<automatic
+    c.set_visible_agent_count(1)
+    assert m.visible_agent_count()==4
+    m.set_content(data(4))
+    assert m.base_height()==chosen
+    c.set_visible_agent_count(3)
+    assert m.base_height()==automatic

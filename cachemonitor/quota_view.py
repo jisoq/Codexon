@@ -23,6 +23,7 @@ def history_rows(report, mode, start=None, end=None):
 
 def _history_rows(report, mode, start=None, end=None, *, labels=True, _resume=None, _checkpoint=None, _classification=None):
     """Show remaining allowance and only actual full-recovery events."""
+    from .quota_cancellation import checkpoint
     count=0;removed=False
     previous=None
     detector=ResetTracker()
@@ -74,7 +75,8 @@ def _history_rows(report, mode, start=None, end=None, *, labels=True, _resume=No
             yield from sorted(by_time.values(),key=lambda r:r['at'])
     emitted=False
     classified_position=0
-    for record in preferred():
+    for position,record in enumerate(preferred()):
+        if position%128==0:checkpoint()
         if _classification is not None:
             times,flags,kind=_classification
             if classified_position>=len(times):break

@@ -54,7 +54,7 @@ def configure_quota_layout(panel):
         dialog.confirm.setText('삭제' if delete else '초기화')
         def finish(result):
             if not result or home!=panel.report.get('home') or request['account']!=panel.report.get('account'):return
-            panel._cycle_clear_pending=True;panel.clear_cycle_button.setEnabled(False)
+            panel.begin_edit('clear_cycle',delete=delete)
             panel.cycle_clear_message.hide()
             panel.cycle_clear_requested.emit(request)
         dialog.finished.connect(finish);dialog.open()
@@ -63,6 +63,7 @@ def configure_quota_layout(panel):
     build_exclusion_dialog(panel)
     for node in (panel.summary_heading,panel.history_controls,panel.result,panel.cycle_value,panel.lifetime_basis,panel.cycle_basis,panel.conversion):
         detach(node)
+    panel.conversion_attached=False
     summary=Group();summary.put(background='secondary',radius=12)
     summary_layout=Column(summary);summary_layout.setContentsMargins(0,0,0,0)
     metrics_row=Row();metrics_row.put(collapseBelow=980,columns=2,dividers=True);metrics_row.setSpacing(0)

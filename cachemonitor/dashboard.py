@@ -162,6 +162,8 @@ class Dashboard(TrayWindow):
         self.defer_timer.setSingleShot(True);self.defer_timer.timeout.connect(self.apply_deferred)
         self.slow_timer=QTimer(self);self.slow_timer.setSingleShot(True);self.slow_timer.setInterval(5000)
         self.slow_timer.timeout.connect(self.show_analysis_slow)
+        self.analysis_clock=QTimer(self);self.analysis_clock.setInterval(1000)
+        self.analysis_clock.timeout.connect(self.update_analysis_elapsed)
         QApplication.instance().installEventFilter(self)
         shared_theme().configure(self.settings.value('ui/theme',self.settings.value('overlay/theme','codex')))
         self.setWindowTitle('Codexon');self.setWindowIcon(tray_icon());self.resize(1440,940)
@@ -202,6 +204,8 @@ class Dashboard(TrayWindow):
         self.refresh_status=Group();self.refresh_status.put(kind='statusIcon',iconName='restart')
         self.refresh_status.setObjectName('analysis-refresh-status');self.refresh_status.setFixedSize(28,28)
         self.refresh_status.setAccessibleName('최신 기록 반영 중');self.refresh_status.hide();header.addWidget(self.refresh_status)
+        self.refresh_text=label('','muted');self.refresh_text.put(noElide=False)
+        self.refresh_text.setMaximumWidth(260);self.refresh_text.hide();header.addWidget(self.refresh_text)
         self.retry_button=Button('다시 시도');self.retry_button.clicked.connect(self.retry_analysis);self.retry_button.hide();header.addWidget(self.retry_button)
         self.price_button=Button('API 가격표');self.price_button.put(role='quiet');self.price_button.clicked.connect(self.show_prices);header.addWidget(self.price_button);layout.addLayout(header)
         self.common_filters=Row();self.common_filters.put(flow=True,spacing=8)
@@ -312,13 +316,13 @@ class Dashboard(TrayWindow):
                     tracking_enabled=self.settings.value('quota/trackingEnabled',True,type=bool),reports_enabled=False,
                     paused=self.quota_paused,paused_at=self.quota_paused_at)
                 services[candidate]=service
-                service.updated.connect(lambda value,expected=service: self.receive_quota(value) if self.quota_service is expected else None)
+                service.updated.connect(lambda value,expected=service: self.receive_quota(value) if self.quota_service is expected else self.quota_panel.receive_activity(value))
                 service.start()
         if home not in services:
             services[home]=QuotaService(home,self.index_path,live=self.live_limits,quota_path=self.quota_path,
                 tracking_enabled=self.settings.value('quota/trackingEnabled',True,type=bool),reports_enabled=False,
                 paused=self.quota_paused,paused_at=self.quota_paused_at)
-            services[home].updated.connect(lambda value,expected=services[home]:self.receive_quota(value) if self.quota_service is expected else None)
+            services[home].updated.connect(lambda value,expected=services[home]:self.receive_quota(value) if self.quota_service is expected else self.quota_panel.receive_activity(value))
             services[home].start()
         services[home].supply_local(self.snapshot.get('quota_by_home',{}).get(services[home].home))
         self.live_quota=None;self.quota_service=services[home]
@@ -1037,6 +1041,7 @@ class Dashboard(TrayWindow):
         return json.dumps(identity,sort_keys=True)
 
     def clear_analysis_loading(self):
+        self.analysis_clock.stop()
         self.slow_timer.stop();self.refresh_status.hide();self.retry_button.hide()
         self.set_analysis_loading({})
         self.metric_panel.put(queryPending=False)
@@ -1054,6 +1059,7 @@ class Dashboard(TrayWindow):
                 (node,False) for node in (self.session_scope,self.record_message,self.history_summary,self.history_inspector,self.record_detail_title,self.residual_details.body)]
         return []
 
+    @batched_updates
     def set_analysis_loading(self,state):
         regions=self.analysis_regions() if state else []
         nodes=[node for node,_ in regions]
@@ -1068,19 +1074,32 @@ class Dashboard(TrayWindow):
         state=self.analysis_loading
         refreshing=self._quota_refreshing if self.current_page==3 else bool(state.get('active') and state.get('retained'))
         self.refresh_status.setVisible(refreshing)
+        self.refresh_status.put(running=refreshing)
+        self.refresh_text.setVisible(refreshing and self.current_page!=3)
         if refreshing:
             detail=(tr('선택한 조건의 사용량을 계산하고 있습니다.') if self.current_page==3 else
                     tr('기록 처리에 시간이 걸리고 있습니다. 다른 탭을 이용할 수 있습니다.') if state.get('slow') else state.get('detail',''))
-            self.refresh_status.setToolTip('\n'.join(filter(None,(tr('최신 기록 반영 중'),detail))))
+            progress=state.get('progressText','')
+            elapsed=state.get('elapsedText','')
+            self.refresh_status.setToolTip('\n'.join(filter(None,(tr('최신 기록 반영 중'),detail,progress,elapsed))))
+            self.refresh_text.setText(Verbatim(' / '.join(filter(None,(progress or tr('최신 기록 반영 중'),elapsed)))))
 
     def begin_analysis_loading(self,query):
         self.clear_analysis_loading()
+        self.analysis_started=time.monotonic()
         self.pending_retained=(self.display_identity==self.query_identity(query)
                                and self.pages.isPageReady(self.pages.currentIndex()))
         self.metric_panel.put(queryPending=query['page']==1)
         self.set_analysis_stage('queued')
         self.show_analysis_pending()
-        if self.analysis_loading:self.slow_timer.start()
+        if self.analysis_loading:
+            self.slow_timer.start();self.analysis_clock.start();self.update_analysis_elapsed()
+
+    def update_analysis_elapsed(self):
+        if not self.analysis_pending or not self.analysis_loading:return
+        elapsed=max(0,int(time.monotonic()-self.analysis_started))
+        self.set_analysis_loading(dict(self.analysis_loading,
+            elapsedText=formatted('{seconds}초 경과',seconds=elapsed)))
 
     def set_analysis_stage(self,stage):
         stages={'queued':'분석에 사용할 기록을 준비하고 있습니다.',
@@ -1089,12 +1108,27 @@ class Dashboard(TrayWindow):
                 'present':'화면의 구성 요소를 준비하고 있습니다.'}
         self.analysis_stage=stage
         if self.analysis_loading:
-            self.set_analysis_loading(dict(self.analysis_loading,stage=list(stages).index(stage) if stage in stages else 0,
+            state=dict(self.analysis_loading)
+            if state.get('stageName')!=stage:
+                for key in ('processed','total','progressText'):state.pop(key,None)
+            self.set_analysis_loading(dict(state,stageName=stage,stage=list(stages).index(stage) if stage in stages else 0,
                                            detail=tr(stages.get(stage,stages['queued']))))
 
+    @batched_updates
     def analysis_progressed(self,message):
         if message.get('id')==self.request_id and self.analysis_pending:
             self.set_analysis_stage(message.get('stage'))
+            done=message.get('processed');total=message.get('total')
+            if type(done) is int and done>=0 and self.analysis_loading:
+                templates={'calls':'처리한 호출 {count}건','intervals':'계산 구간 {count}','sessions':'확인한 세션 {count}개'}
+                count=f'{done:,} / {total:,}' if type(total) is int and total>=done else f'{done:,}'
+                detail=formatted(templates.get(message.get('unit'),templates['calls']),count=count)
+                calls=message.get('calls')
+                if type(calls) is int and calls>=0:
+                    detail=formatted(templates['calls'],count=f'{calls:,}')+' / '+detail
+                self.set_analysis_loading(dict(self.analysis_loading,processed=done,
+                    total=total if type(total) is int and total>=done else None,
+                    progressText=detail))
 
     def show_analysis_message(self,title,detail,retry=False):
         self.pages.show();self.scope_note.hide()
@@ -1103,8 +1137,6 @@ class Dashboard(TrayWindow):
     def show_analysis_pending(self):
         if not self.analysis_pending or self.current_page in (3,4):return
         if self.pending_retained:
-            # Normal automatic collection is an enabled state, not a user wait.
-            if self.pending_automatic:return
             self.set_analysis_loading(dict(active=True,retained=True,running=True,title=tr('최신 기록 반영 중'),detail=''))
             self.set_analysis_stage(self.analysis_stage)
         else:
@@ -1132,6 +1164,8 @@ class Dashboard(TrayWindow):
     def retry_analysis(self):
         if self.worker is not None and not self.worker.isRunning():
             self.worker.restart_count=0;self.worker.start()
+        elif self.worker is not None and any(facts.get('publication_failed') for facts in self.analysis_errors):
+            self.worker.request_snapshot()
         self.client_cache.clear();self.pending_logical=None;self.render()
 
     def scope_text(self,q):
@@ -1315,6 +1349,7 @@ class Dashboard(TrayWindow):
         if self.current_page not in (3,4):
             if not facts['retained']:
                 self.show_analysis_message('현재 조건의 결과를 불러오지 못했으므로 잠시 후 다시 시도해주세요.','',retry=True)
+            self.retry_button.show()
 
     def eventFilter(self,watched,event):
         if event.type() in (QEvent.Wheel,QEvent.MouseButtonPress,QEvent.KeyPress):self.interaction_time=time.monotonic()

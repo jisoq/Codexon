@@ -84,6 +84,20 @@ def test_preparation_expires_without_real_publications_and_never_hides_faults():
     assert strongest([query]) is None
 
 
+def test_latest_collection_confirmation_supersedes_old_delay_flags():
+    from cachemonitor.app_errors import collection_phase
+    evidence=dict(ts=60,collection={'instance':'live'},usage_collection_complete=True,
+                  collection_stale=True,collection_snapshot_at=100,
+                  collection_fault={'snapshot_stale':True})
+    assert collection_phase(evidence,130,started_at=1)=='ready'
+    assert collection_phase(evidence,130.01,started_at=1)=='delayed'
+    # Recovery can arrive through analysis before the service's next poll.
+    evidence['ts']=140
+    assert collection_phase(evidence,140,started_at=1)=='ready'
+    evidence['collection_fault']['read_failed']=True
+    assert collection_phase(evidence,140,started_at=1)=='failed'
+
+
 def test_recovery_failure_notifies_once_when_two_status_sources_report_it():
     state=ErrorState()
     facts=dict(phase='recovery_failed',incident=dict(recovery_error='private diagnostic'))

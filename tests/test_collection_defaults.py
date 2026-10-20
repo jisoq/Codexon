@@ -109,6 +109,41 @@ def test_source_notification_loss_requests_authoritative_reconciliation(tmp_path
     assert closed==[1] and not changes.handles and changes.next_sync==0
 
 
+def test_source_metadata_hints_filter_owned_writes_and_bound_bursts(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from cachemonitor import collection_wake as wake
+    clock=[10.]
+    monkeypatch.setattr(wake.time,'monotonic',lambda:clock[0])
+    monkeypatch.setattr(wake.time,'sleep',lambda seconds:clock.__setitem__(0,clock[0]+seconds))
+    changes=wake.SourceChanges();changes.api=None
+    changes.sync([tmp_path])
+    (tmp_path/'index.sqlite').write_bytes(b'owned')
+    (tmp_path/'state_5.sqlite-shm').write_bytes(b'reader locks')
+    assert changes._metadata_changes(clock[0]) == frozenset()
+    (tmp_path/'state_5.sqlite-wal').write_bytes(b'committed title')
+    clock[0]+=.25
+    assert changes.wait(clock[0]+3).metadata == frozenset({tmp_path})
+    (tmp_path/'.codex-global-state.json').write_text('{}',encoding='utf8')
+    assert changes._metadata_changes(clock[0]) == frozenset()
+    clock[0]+=.25
+    assert changes.wait(clock[0]+3).metadata == frozenset({tmp_path})
+    changes.close()
+    changes.api=SimpleNamespace(WaitForMultipleObjects=lambda *args:0,
+        WaitForSingleObject=lambda *args:0,FindNextChangeNotification=lambda *args:1,
+        FindCloseChangeNotification=lambda *args:None)
+    changes.handles[tmp_path]=(1,(0,0))
+    start=clock[0]
+    assert changes.wait(start+3).roots == frozenset({tmp_path})
+    assert clock[0] == start  # No delay on an isolated event.
+    assert changes.wait(start+3).roots == frozenset({tmp_path})
+    assert clock[0] == start+.25  # A continuing burst remains rate limited.
+    clock[0]+=1
+    start=clock[0]
+    changes.wait(start+3)
+    assert clock[0] == start
+    changes.close()
+
+
 def test_conflicting_default_cli_path_fails_before_creating_files(default_home,tmp_path):
     target=tmp_path/'conflicting.sqlite'
     result=subprocess.run([sys.executable,'run.py','--usage-collector','--codex-home',str(default_home),
@@ -177,6 +212,44 @@ def test_encoded_owner_metadata_yields_and_preserves_scalar_types():
         list(encoded_owner_metadata(payload,('owned-home','owner'),'0'*64,max_plain_bytes=1024*1024))
     with pytest.raises(CollectionCatalogUnavailable):
         list(encoded_owner_metadata(payload,('owned-home','owner'),digest,max_plain_bytes=1))
+
+
+def test_parser_upgrade_repairs_retained_unknown_records_without_original_rollout(tmp_path,monkeypatch):
+    from cachemonitor import collection_replay
+    from cachemonitor.core import Session
+    from cachemonitor.usage_collection import CollectionChannel
+    from test_core import event,usage
+    home,path=fixture_home(tmp_path);target=tmp_path/'index.sqlite';evidence=tmp_path/'evidence.sqlite'
+    first=usage();first['payload']['turn_id']='late'
+    context=event('turn_context',10000.009,turn_id='late',model='gpt-6.1-sol',effort='high',service_tier=None)
+    path.write_text(''.join(json.dumps(e)+'\n' for e in [first,context]),encoding='utf8')
+    def collect(service):
+        deadline=time.monotonic()+5
+        while True:
+            value=service.poll(20000)
+            if value['usage_collection_complete'] and not value['index']['loading']:break
+            assert time.monotonic()<deadline
+        reader=CollectionChannel([home],target,evidence)
+        try:return reader.read(shared=True)['sessions'][0]['history']
+        finally:reader.close()
+    with monkeypatch.context() as old:
+        old.setattr(collection_replay,'FORMAT',collection_replay.FORMAT-1)
+        old.setattr(Session,'resolve_context',lambda *a,**kw:None)
+        service=CollectorService([home],target,evidence)
+        try:
+            before=collect(service)
+            deadline=time.monotonic()+5
+            while service.maintain():assert time.monotonic()<deadline
+            assert service.index.replay.db.execute('SELECT count(*) FROM owners').fetchone()[0]==1
+            assert before[0]['effort']=='미확인'
+        finally:service.close()
+    path.unlink()
+    service=CollectorService([home],target,evidence)
+    try:
+        after=collect(service)
+        assert after[0]['effort']=='high' and after[0]['service_tier']=='Standard'
+        assert [(r['key'],r['total']) for r in before]==[(r['key'],r['total']) for r in after]
+    finally:service.close()
 
 
 def test_closed_collection_reuses_bodies_and_replays_only_changed_owners(tmp_path,monkeypatch):

@@ -114,6 +114,17 @@ def publication_fingerprint(value):
     return sha256(encoded).digest()
 
 
+def analysis_proof(session):
+    """Certify every source fact except the top-level display title."""
+    from .collection_replay import EncodedSession
+    if isinstance(session,EncodedSession) or type(session.get('title')) is not str:return None
+    from .collection_append import context_digest
+    context=context_digest(session)
+    if context is None:return None
+    facts={key:value for key,value in session.items() if key not in LiveCollection.volatile and key!='title'}
+    return dict(digest=publication_fingerprint(facts).hex(),title=session['title'],context=context)
+
+
 class SnapshotHeader:
     """Keep zlib/JSON compatibility while isolating collection freshness."""
     def __init__(self,header,previous=None):
@@ -179,7 +190,7 @@ class LiveCollection:
         # Parent proofs take priority inside the existing shared allowance. The
         # temporary map shares its values with entries and retains no histories.
         from .collection_replay import EncodedSession
-        from .collection_append import AppendPacket
+        from .collection_append import AppendPacket, bind
         lineages={}
         for session in snapshot['sessions']:
             key=(session['home'],session['id']);old=prior_entries.get(key)
@@ -218,8 +229,8 @@ class LiveCollection:
                     and packet.key==key and packet.prior_token==prior_sessions.get(key)
                     and packet.token==token and old_body is not None
                     and old_body[3]!=saved[3]):
-                append_bindings[key]=dict(packet=packet,epoch=epoch,
-                    prior_body_digest=old_body[3],body_digest=saved[3])
+                append_bindings[key]=bind(packet,epoch,old_body[3],saved[3],
+                    previous.get('append_bindings',{}).get(key))
             elif same_owner and old_body is not None and old_body[3]==saved[3]:
                 retained=previous.get('append_bindings',{}).get(key)
                 if retained is not None and retained['packet'].token==token:
@@ -233,10 +244,16 @@ class LiveCollection:
                             and 'owner_metadata_bytes' in old else _catalog_weight(metadata,CATALOG_OWNER_BYTES) if metadata is not None else 0)
             if metadata_bytes>metadata_remaining:metadata=None;metadata_bytes=0
             metadata_remaining-=metadata_bytes
+            proof=(old.get('analysis_proof') if old is not None and old['body_digest']==saved[3]
+                   else analysis_proof(session))
+            if proof is not None:
+                proof_bytes=_catalog_weight(proof,CATALOG_OWNER_BYTES)
+                if proof_bytes>metadata_remaining:proof=None
+                else:metadata_remaining-=proof_bytes
             if old is not None and old['revision']==saved[0] and old['state']==state:
-                entry=(old if old.get('owner_metadata')==metadata and old.get('owner_lineage')==lineage else
+                entry=(old if old.get('owner_metadata')==metadata and old.get('owner_lineage')==lineage and old.get('analysis_proof')==proof else
                        {**old,'owner_metadata':metadata,'owner_metadata_bytes':metadata_bytes,
-                        'owner_lineage':lineage,'owner_lineage_bytes':lineage_bytes})
+                        'owner_lineage':lineage,'owner_lineage_bytes':lineage_bytes,'analysis_proof':proof})
                 state_revisions[key]=previous['state_revisions'][key] if entry is old else sequence
             else:
                 if (old is None or old['revision']!=saved[0] or
@@ -246,7 +263,7 @@ class LiveCollection:
                 # Freeze only changed envelopes; unchanged entries are immutable.
                 entry=dict(home=key[0],sid=key[1],revision=saved[0],body_digest=saved[3],
                            state=json.loads(json.dumps(state,ensure_ascii=False)),owner_metadata=metadata,
-                           owner_metadata_bytes=metadata_bytes,owner_lineage=lineage,owner_lineage_bytes=lineage_bytes)
+                           owner_metadata_bytes=metadata_bytes,owner_lineage=lineage,owner_lineage_bytes=lineage_bytes,analysis_proof=proof)
                 state_revisions[key]=sequence
             entries[key]=entry;manifest.append(entry)
         activities_present='request_activity' in snapshot and not snapshot.get('activity_stream')
@@ -417,7 +434,11 @@ class LiveCollection:
                     row=[home_ids[entry['home']],entry['sid'],entry['revision'],entry['body_digest'],
                          [[index,entry['state'][key]] for index,key in enumerate(CATALOG_STATE) if key in entry['state']],
                          entry.get(metadata_field) is not None]
-                    if include:row.append(entry.get(metadata_field))
+                    if include:
+                        envelope=entry.get(metadata_field)
+                        if metadata_kind=='lineage' and envelope is not None and entry.get('analysis_proof') is not None:
+                            envelope=dict(envelope,_analysis_proof=entry['analysis_proof'])
+                        row.append(envelope)
                     weight=_catalog_weight(row,CATALOG_PAGE_BYTES)+32
                     if weight>remaining:
                         if not entries:return fail('catalog_entry_budget')
@@ -427,7 +448,7 @@ class LiveCollection:
                 _catalog_weight(result,CATALOG_PAGE_BYTES)
                 return result,b''
             if kind=='append':
-                from .collection_append import RESPONSE_BYTES
+                from .collection_append import RESPONSE_BYTES, response
                 key=value.get('owner');prior=value.get('prior_body_digest')
                 if (expected_commit is None or not isinstance(key,(list,tuple)) or len(key)!=2
                         or not all(isinstance(part,str) for part in key) or not isinstance(prior,str)
@@ -435,18 +456,21 @@ class LiveCollection:
                 key=tuple(key)
                 if key[0] not in allowed:return fail('scope')
                 bound=current.get('append_bindings',{}).get(key)
-                if (not complete or bound is None or bound['prior_body_digest']!=prior
+                if (not complete or bound is None
                         or key not in current['entries']
                         or current['entries'][key]['body_digest']!=bound['body_digest']):
                     return fail('append_unavailable')
                 packet=bound['packet']
+                selected=response(bound,prior)
+                if selected is None:return fail('append_unavailable')
+                prior_token,payload,packet_digest=selected
                 binding=dict(owner=list(key),epoch=bound['epoch'],prior_body_digest=prior,
-                    body_digest=bound['body_digest'],prior_token=packet.prior_token,token=packet.token,
-                    size=len(packet.payload),packet_digest=packet.digest)
+                    body_digest=bound['body_digest'],prior_token=prior_token,token=packet.token,
+                    size=len(payload),packet_digest=packet_digest)
                 result=dict(base,ready=True,selected_homes=homes,append=binding)
-                if len(packet.payload)+_catalog_weight(result,RESPONSE_BYTES)>RESPONSE_BYTES:
+                if len(payload)+_catalog_weight(result,RESPONSE_BYTES)>RESPONSE_BYTES:
                     return fail('append_unavailable')
-                return result,packet.payload
+                return result,payload
             if kind!='owners' or expected_commit is None:return fail('request')
             requested=value.get('owners')
             if (not isinstance(requested,list) or len(requested)>SELECTED_OWNER_ROWS or
@@ -942,6 +966,11 @@ class CollectionChannel:
                 if include:
                     if requested_kind=='lineage':
                         entry['owner_lineage']=owner_lineage(row[6]) if row[6] is not None else None
+                        proof=row[6].get('_analysis_proof') if isinstance(row[6],dict) else None
+                        if (isinstance(proof,dict) and type(proof.get('title')) is str
+                                and all(type(proof.get(name)) is str and len(proof[name])==64
+                                    and all(c in '0123456789abcdef' for c in proof[name]) for name in ('digest','context'))):
+                            entry.update(analysis_digest=proof['digest'],display_title=proof['title'],append_context=proof['context'])
                     else:entry['owner_metadata']=row[6]
                 owners[(home,row[1])]=entry
             return dict(base,header=metadata['header'],membership_complete=metadata['membership_complete'],

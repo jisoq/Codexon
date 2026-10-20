@@ -7,7 +7,7 @@
 - **Spot a request/response model mismatch directly in the overlay.** Compare the requested and reported model names when investigating routing behavior.
 - See the main agent's accumulated usage and call trends including subagents while working in Codex.
 - Open session records from the overlay and call records from comparison results. Inspect main-agent and subagent usage separately.
-- Compare usage across models, reasoning efforts and service tiers, and inspect the calls behind each result.
+- Compare model and reasoning effort together, grouped by project, request mode, input size, or cache utilization. Unknown entries are hidden by default; use **Show unknown** to include them.
 - Follow remaining usage limits and reset times. The tray and taskbar widget keep them visible without opening the dashboard.
 
 Amounts estimate subscription value using Standard base token rates and a 2.5x Fast usage multiplier; they are not billed charges. [Conversion basis](https://learn.chatgpt.com/docs/agent-configuration/speed). Model monitoring compares names recorded for a request and its response. Live limit checks use the installed Codex app-server and require an available account connection.
@@ -30,15 +30,17 @@ Home shows remaining usage and today's activity, with descriptions and links to 
 
 ## Overlay views
 
-![Overlay with a fixed Main summary above the Sub list](docs/images/overlay-column-en.png)
+![Current overlay with a main agent and six subagents](docs/images/overlay-column-en.png)
+
+Captured with synthetic usage records. Three of the six subagents are visible at once; scroll the list to see the rest.
 
 The top summary shows total cost and active requests. Three charts show cost, output speed, and reasoning tokens for the 20 most recent calls, including subagents. The selected call's cache hit rate appears beside its cost. Agent markers and charts share colors derived from Codex appearance settings.
 
 **Main Agent** stays fixed while only the **Sub Agents** list below it scrolls. Each row shows its own cumulative cost, model and reasoning effort, cache hit rate, and average output speed. Expand a row to inspect token composition and the number of priced calls.
 
-Open **Settings** in the header to choose bars or a filled line and adjust the height with a slider. These preferences survive restarts. Separate controls adjust background transparency and minimize the overlay. Select the minimized icon to restore it. Preparation, delay, and error messages occupy space below the title only when present. Existing values are dimmed when updates are interrupted or delayed.
+Open **Settings** in the header to choose bars or a filled line. When subagents are present, choose how many to show at once, from one to four. The height fits that count and the available screen space. Each conversation's count preference survives restarts. Separate controls adjust background transparency and minimize the overlay. Select the minimized icon to restore it. Preparation, delay, and error messages replace the activity status at the top. Existing values are dimmed when updates are interrupted or delayed.
 
-Run the [overlay preview](docs/overlay-preview.md) to try source changes without replacing the installed application.
+Run the [overlay preview](https://github.com/jisoq/Codexon/blob/main/docs/overlay-preview.md) to try source changes without replacing the installed application.
 
 Amounts use Standard base rates weighted by subscription usage: Fast is 2.5x Standard for the same tokens. Model comparison reflects recorded request/response names.
 

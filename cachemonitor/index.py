@@ -712,6 +712,33 @@ class UsageIndex:
                 result.append((str(home),None))
         return tuple(result)
 
+    def refresh_metadata(self, homes):
+        """Refresh source labels without resetting an unfinished rollout pass."""
+        for home in self.homes:
+            if home.resolve() not in homes: continue
+            try:
+                with readonly(home / 'state_5.sqlite') as db:
+                    cols = {r[1] for r in db.execute('pragma table_info(threads)')}
+                    names = CodexNames(home, db)
+                    self.names[str(home)] = names
+                    for row in db.execute('select ' + task_select(cols) + ' from threads'):
+                        key = (str(home), row['id'])
+                        # New source ownership and immutable headers remain
+                        # discovery's responsibility, including missing files.
+                        if key not in self.metadata: continue
+                        meta = dict(row)
+                        meta.update({field:value for field,value in self.lineage.get(key,{}).items()
+                                     if not meta.get(field)})
+                        if meta.get('parent_thread_id'): meta['thread_source'] = 'subagent'
+                        meta.update(names.resolve(meta))
+                        if self.metadata[key] != meta:
+                            self.metadata[key] = meta
+                            self.db.execute('insert or replace into metadata values(?,?,?)',
+                                (*key, json.dumps(meta, ensure_ascii=False)))
+            except (OSError, sqlite3.Error) as exc:
+                self.errors.append(f'{home.name} / 세션 목록: {exc}')
+                self.collection_fault['read_failed'] = True
+
     def poll(self, now=None, *, source_hint=None):
         if self.read_only:raise ValueError('읽기 전용 색인에서는 원본 수집을 실행할 수 없습니다')
         now = now or time.time()
@@ -727,10 +754,15 @@ class UsageIndex:
             if not self.quota_seeded:
                 self.seed_quota()
                 self.quota_seeded=True
-        elif not self.queue and not self.cached_restore:
-            self.queue = deque(self.files)
-            self.prioritized_roots.clear()
-            self.done_files = 0
+        else:
+            # Discovery already refreshed every home's labels. A metadata hint
+            # needs its own read only when that authoritative pass is not due.
+            if source_hint is not None and source_hint.metadata:
+                self.refresh_metadata(source_hint.metadata)
+            if not self.queue and not self.cached_restore:
+                self.queue = deque(self.files)
+                self.prioritized_roots.clear()
+                self.done_files = 0
         if source_hint is not None and source_hint.roots:
             # A notification identifies a watched tree, not a filename. Include
             # its files once per authoritative pass. Repeated wakes must not

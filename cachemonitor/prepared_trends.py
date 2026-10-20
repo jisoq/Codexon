@@ -1,8 +1,10 @@
 """Exact chart populations from a pinned chronological scalar stream."""
 from array import array
+from bisect import bisect_left, bisect_right
 from collections import deque
 from contextlib import contextmanager
 from heapq import merge
+from itertools import islice
 from math import ceil
 from struct import pack, unpack
 from sys import getsizeof
@@ -86,6 +88,9 @@ class Numbers:
             return unpack('=d', pack('=q', self.bits[position]))[0]
         return self.large[position]
 
+    def __len__(self):return len(self.tags)
+    def __getitem__(self,position):return self.at(position)
+
     def size(self):
         return (getsizeof(self) + getsizeof(self.bits) + getsizeof(self.tags) +
                 getsizeof(self.large) + self.large_bytes)
@@ -147,12 +152,18 @@ class Window:
     def entries(self, start, end, inclusive, scopes):
         for block in self.blocks:
             self.check()
+            times=block.values['ts']
+            # Chronological blocks allow whole-block rejection and two seeks;
+            # do not decode every timestamp again for every displayed metric.
+            if times.at(-1)<start:continue
+            if times.at(0)>end or times.at(0)==end and not inclusive:break
+            left=bisect_left(times,start)
+            right=bisect_right(times,end) if inclusive else bisect_left(times,end)
             selected = [block.positions[scope] for scope in scopes if scope in block.positions]
+            selected=[islice(indices,bisect_left(indices,left),bisect_left(indices,right)) for indices in selected]
             positions = selected[0] if len(selected) == 1 else merge(*selected)
             for position in positions:
                 stamp = block.values['ts'].at(position)
-                if stamp < start or stamp > end or (stamp == end and not inclusive):
-                    continue
                 yield block, position, stamp
 
 
@@ -343,6 +354,7 @@ def rolling(source, q, width, start, end, full, scopes):
     rows = iter(source.ordered_rows(start, end))
     upcoming = next(rows, None)
     count = 0
+    progress=getattr(source.engine,'progress',None)
     try:
         for event_index, event in enumerate(events):
             _, _, a, b, _, support_a, support_b = event
@@ -357,6 +369,9 @@ def rolling(source, q, width, start, end, full, scopes):
                 group = groups[key]
                 group.observe(row, identity);group.samples(row, width, start, end)
                 window.append(row, identity);count += 1
+                if progress and count%512==0:
+                    progress(dict(stage='aggregate',processed=event_index,total=len(events),
+                                  unit='intervals',calls=count))
                 upcoming = next(rows, None)
             for group in groups.values():
                 for metric, _, _ in specs:
@@ -367,6 +382,8 @@ def rolling(source, q, width, start, end, full, scopes):
                     budget.output(_size(value) + 32)
                     group.points.setdefault(metric, {})[event[1]] = value
             if event_index + 1 < len(events):window.discard(lefts[event_index + 1])
+            if progress:progress(dict(stage='aggregate',processed=event_index+1,total=len(events),
+                                      unit='intervals',calls=count))
     finally:
         rows.close()
     panels = []

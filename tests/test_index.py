@@ -80,6 +80,34 @@ def finish(index, now=10010):
     raise AssertionError('index did not finish')
 
 
+def test_late_turn_settings_repair_published_history_and_survive_source_removal(tmp_path):
+    home,path=fixture_home(tmp_path);cache=tmp_path/'index.sqlite'
+    first=usage();first['payload']['turn_id']='late'
+    second=usage('other',time=10000.001);second['payload']['turn_id']='other'
+    path.write_text(''.join(json.dumps(e)+'\n' for e in [first,second]),encoding='utf8')
+    index=UsageIndex([home],cache)
+    try:
+        before=finish(index)['sessions'][0]
+        with path.open('a',encoding='utf8') as stream:
+            stream.write(json.dumps(event('turn_context',10000.009,turn_id='late',model='gpt-6.1-sol',
+                                         effort='high',service_tier=None))+'\n')
+            stream.write(json.dumps(usage('tail',time=10000.010))+'\n')
+        after=finish(index,10011)['sessions'][0]
+        assert after['history'][0]['effort']=='high' and after['history'][0]['service_tier']=='Standard'
+        assert after['history'][1]['effort']=='미확인'
+        assert before['history'][0]['effort']=='미확인'
+        assert after['usage_revision']!=before['usage_revision']
+        assert not index.collection_changes.appends
+    finally:index.close()
+    path.unlink()
+    index=UsageIndex([home],cache)
+    try:
+        restored=finish(index,10012)['sessions'][0]
+        assert [(r['key'],r['effort'],r['service_tier']) for r in restored['history']]==[
+            (r['key'],r['effort'],r['service_tier']) for r in after['history']]
+    finally:index.close()
+
+
 def test_verified_source_avoids_idle_metadata_reads_without_hiding_changes(tmp_path):
     import os
     home,path=fixture_home(tmp_path);cache=tmp_path/'index.sqlite'
@@ -107,6 +135,24 @@ def test_verified_source_avoids_idle_metadata_reads_without_hiding_changes(tmp_p
         index.db.set_trace_callback(trace)
         result=finish(index,10015)
         assert queries and [row['key'] for row in result['sessions'][0]['history']]==['r9','after']
+    finally:index.close()
+
+
+def test_metadata_hint_updates_titles_without_discovery_or_history_rebuild(tmp_path,monkeypatch):
+    from cachemonitor.collection_wake import SourceHint
+    home,path=fixture_home(tmp_path)
+    index=UsageIndex([home],tmp_path/'index.sqlite')
+    try:
+        first=finish(index,10002)
+        history=first['sessions'][0]['history']
+        with sqlite3.connect(home/'state_5.sqlite') as db:
+            db.execute("UPDATE threads SET name='Renamed',title='Renamed'")
+        def forbidden(*args,**kwargs): raise AssertionError('metadata must not rediscover rollouts')
+        monkeypatch.setattr(index,'discover',forbidden)
+        current=index.poll(10003,source_hint=SourceHint(metadata=frozenset({home.resolve()})))
+        assert current['sessions'][0]['title'] == 'Renamed'
+        assert current['sessions'][0]['history'] == history
+        assert not current['usage_errors']
     finally:index.close()
 
 

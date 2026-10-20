@@ -63,6 +63,52 @@ def test_publication_is_atomic_and_interrupted_staging_does_not_replace_saved_fa
             assert current.record(*OWNER, 'call-1') is None
 
 
+@pytest.mark.parametrize('reorder', [False, True])
+def test_staged_inventory_pages_preserve_visible_versions_and_tombstones(tmp_path, reorder):
+    from cachemonitor.prepared_ingest import pages
+
+    owners = tuple(('home', str(number)) for number in range(6))
+    dependency = {name: 1 for name in storage.DEPENDENCIES}
+    dependency['source_digest'] = '1' * 64
+    limits = replace(storage.Limits(), page_rows=2)
+    with storage.PreparedStore(tmp_path/'inventory.sqlite', limits) as store:
+        for revision in (1, 2):
+            stage = store.begin(('source', revision))
+            for owner in owners[:5]:
+                stage.owner(*owner, dict(home=owner[0], id=owner[1]),
+                            dict(dependency, proof=revision), source_ordinal=0)
+                stage.calls(owner, [], reconcile=True)
+            stage.publish(('source', revision), ready=True)
+        with store.read_current(seconds=60) as view:
+            committed = tuple(pages(view.inventory))
+        stage = store.begin(('source', 3))
+        for owner in (owners[0], owners[1], owners[5]):
+            stage.owner(*owner, dict(home=owner[0], id=owner[1]),
+                        dict(dependency, proof=3), source_ordinal=0)
+            if owner != owners[1]:
+                stage.calls(owner, [], reconcile=True)
+        stage.remove_owner(owners[1])
+        remaining = (owners[0], *owners[2:])
+        if reorder:
+            stage.catalog_order([(owner, number) for number, owner in enumerate(reversed(remaining))])
+        with store.read_current(staged=True, seconds=60) as view:
+            values = tuple(pages(view.inventory))
+            assert len(values) == len(remaining)
+            assert {value['owner'] for value in values} == set(remaining)
+            assert [value['dependencies']['proof'] for value in values] == [
+                3 if value['owner'] in (owners[0], owners[5]) else 2 for value in values]
+            for value in values:
+                exact = view.owner(*value['owner'])
+                assert (value['dependencies'], value['owner_ordinal']) == (
+                    exact['dependencies'], exact['owner_ordinal'])
+            assert [value['owner_ordinal'] for value in values] == sorted(
+                value['owner_ordinal'] for value in values)
+            assert view.owner(*owners[1]) is None
+        stage.abort()
+        with store.read_current(seconds=60) as view:
+            assert tuple(pages(view.inventory)) == committed
+
+
 def test_cleanup_waits_for_pinned_reader_without_failing_writer_or_growing_wal(tmp_path):
     from contextlib import closing
     import time
@@ -356,7 +402,7 @@ def test_history_window_reuses_scalar_index_and_adopts_corrections(tmp_path, mon
             assert actual['explorer']['records'] == expected['explorer']['records']
             assert actual['explorer']['parents'] == expected['explorer']['parents']
             assert actual['explorer']['summary'] == expected['explorer']['summary']
-            assert len(decoded) > len(actual['explorer']['records']['rows'])
+            assert len(decoded) == len(actual['explorer']['records']['rows']) == 64
         finally:
             engine.close()
 
@@ -387,7 +433,7 @@ def test_prepared_subagent_finance_matches_full_and_moves_with_lineage():
     for name in sources:replace_owner(name)
     view=SimpleNamespace(publication_token=SimpleNamespace(instance='test',generation=1),
         limits=storage.Limits(), owner=lambda home,sid:owners.get((home,sid)),
-        derived=lambda home,sid,kind:packets[(home,sid)])
+        derived=lambda home,sid,kind:packets[(home,sid)], check=lambda:None)
     overlays=PreparedOverlays();full=OverlaySummaries();engine=AnalysisEngine()
     def collect(changed,removed=()):
         engine.ingest(list(sources.values()))
@@ -431,6 +477,65 @@ def test_prepared_subagent_finance_matches_full_and_moves_with_lineage():
     assert removed['parent']['_overlay_revision']==second['parent']['_overlay_revision']
     assert removed['child']['_overlay_revision']==second['child']['_overlay_revision']
     assert 'subagent_finance' not in removed['other']
+
+
+def test_sparse_publication_preserves_exact_details_and_capacity_retry(tmp_path, monkeypatch):
+    from copy import deepcopy
+    from cachemonitor.analysis_delivery import SnapshotReceiver
+    from cachemonitor.prepared_delivery import PreparedPublisher
+    from cachemonitor.prepared_ingest import prepare_owner, stage_owner
+    from cachemonitor.prepared_overlays import hydrate_overlay
+    from test_data_contract import source
+
+    sources={name:source() for name in ('parent','child','other')}
+    for number,(name,value) in enumerate(sources.items()):
+        value.update(id=name,title=name)
+        value['history'][0].update(key=name,call_id=name,ts=100+number)
+    sources['child']['parent_thread_id']='parent'
+    dependency={name:1 for name in storage.DEPENDENCIES}
+    with storage.PreparedStore(tmp_path/'sparse.sqlite') as store:
+        def commit(names,revision):
+            stage=store.begin(('source',revision))
+            for ordinal,(name,value) in enumerate(sources.items()):
+                if name in names:
+                    stage_owner(stage,prepare_owner(value,owns=lambda *_:True),
+                        dict(dependency,source_digest=f'{revision:064x}'),ordinal)
+            return stage.publish(('source',revision),ready=True)
+        original_token=commit(sources,1)
+        publisher=PreparedPublisher(0);receiver=SnapshotReceiver()
+        speeds={('home','other'):{'active':True,'nested':{'value':1}}}
+        first=receiver.receive(publisher.publish({'homes':['home']},store,speeds))
+        before=deepcopy(first)
+        # Producer-owned mutable speed data cannot rewrite a published view.
+        speeds[('home','other')]['nested']['value']=2
+        assert first==before
+        sources['child']['history'][0]['output']+=100
+        current_token=commit(['child'],2)
+        publisher.adopt(store,[('home','child')])
+        sequence=publisher.sequence;projection=publisher.overlay;sent=publisher.sent_token
+        with monkeypatch.context() as limited:
+            limited.setattr(publisher,'STATE_BYTES',1)
+            with pytest.raises(storage.CapacityExceeded):publisher.publish({'homes':['home']},store)
+        assert publisher.sequence==sequence and publisher.overlay is projection and publisher.sent_token==sent
+        # Retry the committed generation without losing its content delta.
+        wire=publisher.publish({'homes':['home']},store,
+            {('home','other'):{'active':True,'nested':{'value':1}}})
+        assert {row['id'] for row in wire['overlay_sessions']}=={'parent','child'}
+        current=receiver.receive(wire)
+        assert first==before
+        updated={row['id']:row for row in current['overlay_sessions']}
+        previous={row['id']:row for row in first['overlay_sessions']}
+        assert updated['other']['_overlay_revision']==previous['other']['_overlay_revision']
+        assert updated['parent']['_overlay_revision']!=previous['parent']['_overlay_revision']
+        assert all(row['_prepared_token']==(current_token.instance,current_token.generation)
+                   for row in updated.values())
+        with storage.PreparedReader(store.path) as reader,reader.pin(current_token) as view:
+            assert hydrate_overlay(view,updated['other'])['latest']['key']=='other'
+            detail=hydrate_overlay(view,updated['parent'],finance=True)
+            assert detail['subagent_finance']['calls']==len(sources['child']['history'])
+            with pytest.raises(storage.StaleGeneration):hydrate_overlay(view,previous['other'])
+        assert previous['other']['_prepared_token']==(original_token.instance,original_token.generation)
+        assert publisher.publish({'homes':['home']},store)['overlay_sessions']==[]
 
 
 def test_ready_store_publishes_without_eager_descendant_finance_within_budget(tmp_path, monkeypatch):
@@ -487,7 +592,9 @@ def test_ready_store_publishes_without_eager_descendant_finance_within_budget(tm
         with pytest.raises(storage.CapacityExceeded):
             _weight(legacy, admitted)
         restarted = PreparedPublisher(0)
-        restarted.STATE_BYTES = admitted
+        # Admission also covers weight-cache metadata and simultaneous old/new
+        # maps during transactional publication, not only the retained trees.
+        restarted.STATE_BYTES = publisher._retention.retained_bytes * 2
         assert len(restarted.publish(dict(homes=['home']), store)['overlay_sessions']) == len(sources)
         selected = next(value for value in compact if value['id'] == 'owner-0')
         expected = next(value for value in eager if value['id'] == 'owner-0')
@@ -505,7 +612,12 @@ def test_ready_store_publishes_without_eager_descendant_finance_within_budget(tm
                 return original_records(member, keys, **kwargs)
             view.records = selected_records
             recent = hydrate_overlay(view, selected)
-            assert 'subagent_finance' not in recent and loaded == []
+            assert 'subagent_finance' not in recent
+            assert set(loaded)=={('home',value['id'],'summary') for value in sources}
+            assert len(loaded)==len(sources)
+            assert recent['token_composition']==expected['token_composition']
+            assert recent['cost_composition']==expected['cost_composition']
+            loaded.clear()
             assert [value['id'] for value in recent['recent']] == [value['id'] for value in expected['recent']]
             assert len(requested) == 20
             requested.clear()
@@ -531,6 +643,10 @@ def test_ready_store_publishes_without_eager_descendant_finance_within_budget(tm
             assert health_reads == [('home', 'owner-0')]
             assert hydrate_overlay(view, with_health, health=True, finance=True) == with_health
             assert health_reads == [('home', 'owner-0')] and requested == []
+            loaded.clear()
+            direct=hydrate_overlay(view,selected,finance=True)
+            assert direct['subagent_finance']==expected['subagent_finance']
+            assert len(loaded)==len(sources)  # Each selected packet is decoded once.
             for members in (
                     [selected['members'][0], selected['members'][1], selected['members'][1]],
                     [selected['members'][0], ('another-home', selected['members'][1][1])],
@@ -559,7 +675,8 @@ def test_prepared_request_summary_keeps_first_call_at_tied_latest_timestamp():
     assert actual['model']=='gpt-6-astra' and actual['calls']==2
 
 
-def test_collector_append_uses_tail_and_historical_correction_uses_full_owner(tmp_path, monkeypatch):
+@pytest.mark.parametrize('miss_publications', [False, True])
+def test_collector_append_uses_tail_and_historical_correction_uses_full_owner(tmp_path, monkeypatch, miss_publications):
     from copy import deepcopy
     import json
     import time
@@ -642,9 +759,19 @@ def test_collector_append_uses_tail_and_historical_correction_uses_full_owner(tm
             adapter = PreparedLedger(ledger, store)
             list(adapter.sync(envelope(initial)))
             verify(store, initial)
+            from cachemonitor.prepared_analysis import PreparedAnalysisEngine
+            from cachemonitor.comparison_usage import project as comparison
+            comparison_engine=PreparedAnalysisEngine(store.path,store.token)
+            comparison_query=dict(page=1,start=0,end=base+100,now=base+100,period='all',
+                category_usage=True,usage=dict(comparison=True,dimension='project',metric='calls'))
+            assert comparison(comparison_engine,comparison_query)['usage']['summary']['value']==7
+            comparison_reads=comparison_engine.read_metrics['category_projection_rows']
             initial_reads = len(source_reads)
             assert initial_reads>0
-            with path.open('a', encoding='utf-8') as output:output.write(append_usage(7, 0))
+            for number in range(7,14):
+                with path.open('a', encoding='utf-8') as output:
+                    output.write(append_usage(number,0))
+                if miss_publications:collect()
             appended = collect()
             def forbidden(*args, **kwargs):
                 raise AssertionError('Certified append must not retrieve the complete owner')
@@ -656,7 +783,10 @@ def test_collector_append_uses_tail_and_historical_correction_uses_full_owner(tm
                 cohort.apply(read_catalog(client), [owner])
                 list(adapter.sync(envelope(appended)))
             assert cohort.metrics['append_owners']==1 and len(source_reads)==initial_reads
-            assert adapter.metrics['append_owners']==1 and adapter.metrics['call_rows']==prior_call_reads+1
+            comparison_engine.adopt(store.token,[owner])
+            assert comparison(comparison_engine,comparison_query)['usage']['summary']['value']==14
+            assert comparison_engine.read_metrics['category_projection_rows']-comparison_reads==7
+            assert adapter.metrics['append_owners']==1 and adapter.metrics['call_rows']==prior_call_reads+7
             with store.read_current() as view:
                 checkpoint = view.derived(*owner, 'checkpoint')
                 assert checkpoint['format'] == append.FORMAT
@@ -664,7 +794,7 @@ def test_collector_append_uses_tail_and_historical_correction_uses_full_owner(tm
             verify(store, appended)
             # An old edit combined with growth must decline the append proof.
             events[2]['payload']['usage']['input_tokens'] = 21000
-            append_usage(8)
+            append_usage(14)
             path.write_text(''.join(json.dumps(item)+'\n' for item in events), encoding='utf-8')
             corrected = collect()
             cohort.apply(read_catalog(client), [owner])
@@ -672,11 +802,216 @@ def test_collector_append_uses_tail_and_historical_correction_uses_full_owner(tm
             assert cohort.metrics['append_owners']==1 and len(source_reads)>initial_reads
             assert adapter.metrics['append_owners']==1
             verify(store, corrected)
+            comparison_engine.adopt(store.token,[owner])
+            assert comparison(comparison_engine,comparison_query)['usage']==comparison(reference,comparison_query)['usage']
+            comparison_engine.close()
+            if miss_publications:
+                # An expired chain must replay the complete source without
+                # dropping calls or retaining an unbounded packet history.
+                import cachemonitor.collection_append as proofs
+                monkeypatch.setattr(proofs,'CHAIN_PACKETS',2)
+                reads_before=len(source_reads)
+                for number in range(15,18):
+                    with path.open('a',encoding='utf-8') as output:
+                        output.write(append_usage(number))
+                    expired=collect()
+                cohort.apply(read_catalog(client),[owner])
+                list(adapter.sync(envelope(expired)))
+                assert cohort.metrics['append_owners']==1 and len(source_reads)>reads_before
+                verify(store,expired)
     finally:
         ledger.close()
         reference_ledger.close()
         client.close()
         service.close()
+
+
+@pytest.mark.parametrize('tail_scope', [
+    'independent', 'same-home', 'session', 'other-home', 'interrupted', 'missing-proof', 'plan-budget',
+    'children', 'parent-child', 'child-unknown', 'child-own-evidence', 'child-legacy-proof', 'inheriting-child',
+    'seven-children', 'mixed-collision'])
+def test_multiple_collector_tails_publish_atomically_or_fall_back_on_candidate_collision(
+        tmp_path, monkeypatch, tail_scope):
+    from contextlib import closing
+    from copy import deepcopy
+    import json
+    import time
+    from cachemonitor.analysis_engine import AnalysisEngine
+    import cachemonitor.prepared_append as append
+    from cachemonitor.overlay_data import summarize_session
+    from cachemonitor.prepared_health import hydrate_health
+    from cachemonitor.prepared_ingest import PreparedCohort, read_catalog
+    from cachemonitor.prepared_summary import hydrate_summary
+    from cachemonitor.prepared_speed_writer import PreparedSpeedWriter
+    from cachemonitor.quota_cycles import QuotaLedger
+    from cachemonitor.usage_collection import CollectorService, CollectionClient
+    from test_core import fixture_home, usage, event, TID
+
+    homes=[];paths=[]
+    child_scope=tail_scope in ('children','parent-child','child-unknown','child-own-evidence',
+                             'child-legacy-proof','inheriting-child','seven-children')
+    identities=(TID,'22345678-abcd-abcd-abcd-123456789012')
+    if tail_scope=='children':identities+=('32345678-abcd-abcd-abcd-123456789012',)
+    if tail_scope=='seven-children':
+        identities+=tuple(f'{number}2345678-abcd-abcd-abcd-123456789012' for number in range(3,9))
+    base=int(time.time())-20
+    for number,sid in enumerate(identities):
+        if number==0 or tail_scope=='other-home':
+            root=tmp_path/str(number);root.mkdir()
+            home,path=fixture_home(root)
+            homes.append(home)
+            if number:
+                with sqlite3.connect(home/'state_5.sqlite') as db:
+                    db.execute('UPDATE threads SET id=?',(sid,))
+        else:
+            home=homes[0];path=home/f'owner-{number}.jsonl'
+            with sqlite3.connect(home/'state_5.sqlite') as db:
+                db.execute('INSERT INTO threads VALUES(?,?,?,?,?,?,?,?)',
+                    (sid,str(path),base,'Second','Second','test','openai','project'))
+        paths.append(path)
+        events=[event('event_msg',base-2,type='task_started',turn_id='turn'),
+                event('turn_context',base-1,turn_id='turn',model='gpt-6-astra',effort='high')]
+        if child_scope:
+            events[-1]['payload']['service_tier']='Fast' if number==0 else 'Standard'
+            if number:
+                events.insert(0,event('session_meta',base-3,id=sid,parent_thread_id=identities[0]))
+        for ordinal in range(2):
+            row=usage(f'initial-{number}-{ordinal}',time=base+ordinal,tid=sid)
+            if tail_scope=='inheriting-child' and number:row['payload']['service_tier']='미확인'
+            row['payload']['turn_id']='turn';events.append(row)
+        path.write_text(''.join(json.dumps(row)+'\n' for row in events),encoding='utf-8')
+    target=tmp_path/'index.sqlite'
+    reference=AnalysisEngine()
+    with (closing(CollectorService(homes,target)) as service,
+          closing(CollectionClient(homes,target)) as client,
+          storage.PreparedStore(tmp_path/'prepared.sqlite') as store,
+          closing(PreparedSpeedWriter(store,preparation='append-batch-test')) as speed,
+          closing(QuotaLedger(tmp_path/'modes.sqlite')) as ledger):
+        def collect():
+            deadline=time.monotonic()+10
+            while True:
+                value=service.poll(time.time())
+                if value['usage_collection_complete'] and not value['index']['loading']:
+                    assert len(value['sessions'])==len(identities)
+                    return value
+                assert time.monotonic()<deadline,value['index']
+        collect()
+        if tail_scope=='child-own-evidence':
+            ledger.mode_evidence[(str(homes[0].resolve()),identities[1],'tail-turn')]=dict(
+                mode='미확인',request_mode_source='settings_override',request_mode_action='set',mode_conflict=False)
+        cohort=PreparedCohort(store,client,ledger if child_scope else None,speed_writer=speed)
+        assert list(cohort.convert(read_catalog(client)))[-1]['ready']
+        if child_scope:
+            with store.read_current() as view:
+                for sid in identities[1:]:
+                    child=(str(homes[0].resolve()),sid)
+                    assert view.owner(*child)['dependencies']['mode_ancestry_required']==(tail_scope=='inheriting-child')
+                    assert bool(view.derived(*child,'checkpoint'))==(tail_scope!='inheriting-child')
+        if tail_scope=='child-legacy-proof':
+            child=(str(homes[0].resolve()),identities[1])
+            with store.read_current() as view:
+                old=view.owner(*child);source=view.source_identity
+            dependency=dict(old['dependencies']);dependency.pop('mode_ancestry_required')
+            stage=store.begin(source)
+            stage.owner(*child,old['metadata'],dependency,source_ordinal=old['owner_ordinal'])
+            stage.publish(source,ready=True)
+        first=store.token
+        prior_prepared=cohort.metrics['prepared_owners']
+        prior_reads=cohort.metrics['source_reads']
+        for number,(path,sid) in enumerate(zip(paths,identities)):
+            if tail_scope=='children' and number==0:continue
+            key=f'tail-{number}' if child_scope or tail_scope in ('independent','interrupted','missing-proof','plan-budget') else 'shared-tail'
+            if tail_scope=='session':key='record:'+key
+            row=usage(key,time=base+3,tid=sid);row['payload']['turn_id']='turn'
+            additions=[]
+            if tail_scope=='child-unknown' and number:
+                row['payload']['service_tier']='미확인'
+            if tail_scope=='child-own-evidence' and number:
+                row['payload']['turn_id']='tail-turn'
+                additions.append(event('turn_context',base+2,turn_id='tail-turn',model='gpt-6-astra',
+                                       effort='high',service_tier='Standard'))
+            additions.append(row)
+            with path.open('a',encoding='utf-8') as output:
+                output.write(''.join(json.dumps(value)+'\n' for value in additions))
+        updated=collect();catalog=read_catalog(client)
+        owners=set(catalog['owners'])
+        changed={owner for owner in owners if tail_scope!='children' or owner[1]!=identities[0]}
+        collision=tail_scope in ('same-home','mixed-collision')
+        if tail_scope=='interrupted':
+            applied=[];original_apply=append.AppendPlan.apply
+            def interrupted(plan,*args,**kwargs):
+                applied.append(plan.owner)
+                if len(applied)==2:raise InterruptedError('cancel second owner')
+                return original_apply(plan,*args,**kwargs)
+            with monkeypatch.context() as patch:
+                patch.setattr(append.AppendPlan,'apply',interrupted)
+                with pytest.raises(InterruptedError,match='cancel second owner'):
+                    cohort.apply(catalog,changed)
+            assert len(applied)==2 and store.token==first and store.stage is None
+            assert cohort.metrics.get('append_owners',0)==0
+            # Abort deliberately drops the speed cache; restore the durable
+            # checkpoint before checking the committed input again.
+            cohort.current_speeds()
+            with store.read_current() as view:
+                assert all(len(view.calls(owner).rows)==2 for owner in owners)
+                assert all(speed.source.owners[owner].length==2 for owner in owners)
+        fallback=collision or tail_scope in ('missing-proof','plan-budget','child-unknown',
+                                            'child-own-evidence','child-legacy-proof','inheriting-child','seven-children')
+        if fallback:
+            with monkeypatch.context() as patch:
+                if tail_scope in ('missing-proof','seven-children','mixed-collision'):
+                    original_append=client.selected_owner_append
+                    def missing_proof(owner,*args,**kwargs):
+                        return None if owner[1]==identities[1] else original_append(owner,*args,**kwargs)
+                    patch.setattr(client,'selected_owner_append',missing_proof)
+                if tail_scope=='plan-budget':
+                    plan_sizes=[];original_prepare=append.prepare
+                    def bounded_plans(*args,**kwargs):
+                        plan=original_prepare(*args,**kwargs)
+                        plan_sizes.append(plan.plan_bytes)
+                        if len(plan_sizes)==2:
+                            # Admit either real plan alone, but not both live.
+                            patch.setattr(append,'PLAN_BYTES',max(plan_sizes)+min(plan_sizes)//2)
+                        return plan
+                    patch.setattr(append,'prepare',bounded_plans)
+                result=cohort.apply(catalog,changed)
+                if tail_scope=='plan-budget':
+                    assert len(plan_sizes)==2 and max(plan_sizes)<append.PLAN_BYTES<sum(plan_sizes)
+            partial=not collision and tail_scope!='plan-budget'
+            assert cohort.metrics.get('append_owners',0)==(len(identities)-1 if partial else 0)
+            if tail_scope in ('missing-proof','seven-children'):
+                assert cohort.metrics['source_reads']==prior_reads+1
+            if tail_scope in ('same-home','plan-budget'):assert cohort.metrics['append_fallbacks']==1
+            assert cohort.metrics['source_reads']>prior_reads
+        else:
+            def forbidden(*args,**kwargs):
+                raise AssertionError('Independent append tails must not retrieve complete owners')
+            with monkeypatch.context() as patch:
+                patch.setattr(client,'selected_owner_stream',forbidden)
+                patch.setattr(cohort,'_load',forbidden)
+                result=cohort.apply(catalog,changed)
+            assert cohort.metrics['append_owners']==2 and cohort.metrics['append_rows']==2
+            assert cohort.metrics['prepared_owners']==prior_prepared
+            assert cohort.metrics['source_reads']==prior_reads
+        assert result['token'].generation==first.generation+1
+        assert set(result['changed'])==changed and store.stage is None
+        cohort.current_speeds()
+        expected_snapshot=deepcopy(updated)
+        if child_scope:
+            ledger._enriched_sessions={}
+            ledger.enrich_modes(expected_snapshot,scan=False)
+        reference.ingest(expected_snapshot['sessions'])
+        with store.read_current() as view:
+            for owner,state in reference.sessions.items():
+                actual=list(view.calls(owner).rows)
+                expected=state['prepared']['history']
+                assert [compact_record(row) for row in actual]==expected
+                summary=hydrate_summary(view,*owner)['own']
+                summary.update(hydrate_health(view,owner));summary.pop('_health_ref')
+                assert summary==summarize_session(state['prepared'],state['prepared']['cache_health'])
+                assert speed.source.owners[owner].length==len(expected)
+            expected_count=2*len(identities)+len(changed)-(1 if collision else 0)
+            assert sum(len(state['prepared']['history']) for state in reference.sessions.values())==expected_count
 
 
 def test_category_projection_preserves_filtered_totals_without_decoding_call_bodies(tmp_path, monkeypatch):
@@ -717,6 +1052,7 @@ def test_category_projection_preserves_filtered_totals_without_decoding_call_bod
                 assert engine.category_bounds({'model':'gpt-6-astra'}) == (100, 103)
             assert actual == project(reference, query)
             reads = engine.read_metrics['category_projection_rows']
+            assert reads==4
             with engine.read_scope():
                 project(engine, {**query, 'usage':{**query['usage'], 'sort':'name'}})
             assert engine.read_metrics['category_projection_rows'] == reads
@@ -733,6 +1069,73 @@ def test_category_projection_preserves_filtered_totals_without_decoding_call_bod
             assert boundary_reads == [query['end']]
         finally:
             engine.close()
+
+
+def test_category_scalar_filters_preserve_unknown_conflict_and_display_override(tmp_path):
+    from cachemonitor.prepared_category import row_matches
+    rows=[dict(key=str(i),ts=100+i,session_ordinal=i,model=model,effort=effort,service_tier=mode,
+               mode_conflict=conflict,display_service_tier=display)
+          for i,(model,effort,mode,conflict,display) in enumerate([
+              ('model','high','priority',False,None),
+              ('model','low','default',False,None),
+              (None,None,None,False,None),
+              ('','','',False,None),
+              ('model','high','Fast',True,None),
+              ('model','high','Standard',True,'Fast'),
+              ('model','high','Fast',False,'Standard')])]
+    with storage.PreparedStore(tmp_path/'filters.sqlite') as store:
+        token=publish(store,1,rows)
+        with storage.PreparedReader(store.path) as reader,reader.pin(token) as view:
+            for filters in ({'model':'model'},{'model':'미확인'},{'effort':'high'},{'effort':'미확인'},
+                            {'service_tier':'Fast'},{'service_tier':'Standard'},{'service_tier':'미확인'},
+                            {'model':'model','effort':'high','service_tier':'Fast'}):
+                actual=view.projected_calls(OWNER,('key',),filters=filters)
+                assert actual.complete
+                assert [r['key'] for r in actual.rows]==[r['key'] for r in rows if row_matches(r,filters)]
+
+
+def test_chart_metadata_refresh_reuses_facts_and_call_corrections_invalidate(tmp_path,monkeypatch):
+    from cachemonitor.prepared_analysis import PreparedAnalysisEngine
+
+    metadata=dict(home=OWNER[0],id=OWNER[1],_internal_review=False,title='Original')
+    dependency={name:1 for name in storage.DEPENDENCIES}
+    dependency['source_digest']='1'*64
+    rows=[dict(row,service_tier='Standard',effort='high',output_speed=10.,
+               completion_latency_ms=1000) for row in calls()]
+    category=dict(page=1,start=0,end=110,now=110,period='custom',category_usage=True,
+                  usage=dict(dimension='model',metric='cost'))
+    trend=dict(page=5,now=110,plot_width=64,granularity='auto',
+               trend_selection=dict(models=['gpt-6-astra'],modes=['Standard']),trend_period='7d')
+    with storage.PreparedStore(tmp_path/'refresh.sqlite') as store:
+        stage=store.begin(('refresh',1))
+        stage.owner(*OWNER,metadata,dependency,source_ordinal=0)
+        stage.calls(OWNER,rows,reconcile=True)
+        engine=PreparedAnalysisEngine(store.path,stage.publish(('refresh',1),ready=True))
+        try:
+            original_category=engine.page_query(category)['usage']
+            original_trend=engine.page_query(trend)['performance']
+            def unexpected(*args,**kwargs):
+                raise AssertionError('Unchanged chart facts were read again')
+            stage=store.begin(('aborted',1))
+            stage.owner(*OWNER,metadata,dependency,source_ordinal=0)
+            stage.calls(OWNER,[dict(rows[0],cost=999)])
+            stage.abort()
+            stage=store.begin(('refresh',2))
+            stage.owner(*OWNER,dict(metadata,title='Renamed'),dependency,source_ordinal=0)
+            engine.adopt(stage.publish(('refresh',2),ready=True),[OWNER])
+            with monkeypatch.context() as patch:
+                patch.setattr(storage.Snapshot,'projected_calls',unexpected)
+                patch.setattr(engine,'performance_input',unexpected)
+                assert engine.page_query(category)['usage']==original_category
+                assert engine.page_query(trend)['performance']==original_trend
+            # Corrections and deletions must still change both charts.
+            stage=store.begin(('refresh',3))
+            stage.owner(*OWNER,dict(metadata,title='Renamed'),dependency,source_ordinal=0)
+            stage.calls(OWNER,[dict(rows[0],cost=7),rows[2]],reconcile=True)
+            engine.adopt(stage.publish(('refresh',3),ready=True),[OWNER])
+            assert engine.page_query(category)['usage']['summary']['value']==8
+            assert engine.page_query(trend)['performance']['calls']==2
+        finally:engine.close()
 
 
 def test_corrupt_current_cache_regenerates_without_changing_source_ledger(tmp_path):
@@ -1385,6 +1788,31 @@ def test_performance_many_owners_complete_within_the_read_work_budget(tmp_path):
             engine.close()
 
 
+def test_trend_metadata_skips_internal_history_within_read_budget(tmp_path):
+    from cachemonitor.prepared_analysis import PreparedAnalysisEngine
+    from cachemonitor.prepared_performance import _Input
+
+    dependency={name:1 for name in storage.DEPENDENCIES}
+    dependency['source_digest']='1'*64
+    with storage.PreparedStore(tmp_path/'metadata.sqlite') as store:
+        stage=store.begin(('metadata',1))
+        for internal,count in ((False,4),(True,4000)):
+            owner=('home',str(internal))
+            stage.owner(*owner,dict(home=owner[0],id=owner[1],_internal_review=internal),
+                        dependency,source_ordinal=int(internal))
+            stage.calls(owner,[dict(key=str(i),ts=100+i%4,session_ordinal=i,
+                model='model',service_tier='Standard',effort='high') for i in range(count)],reconcile=True)
+        token=stage.publish(('metadata',1),ready=True)
+        engine=PreparedAnalysisEngine(store.path,token,limits=replace(storage.Limits(),read_vm_steps=60_000))
+        try:
+            with engine.read_scope():
+                source=_Input(engine,(('model',),('Standard',)))
+                scopes,count=source.metadata(110,sort_start=0,sort_keys=False,global_catalog=True)
+                assert count==4 and set(scopes)=={('model','Standard','high')}
+                assert source.catalog_values==('model',)
+        finally:engine.close()
+
+
 def test_query_progress_coalesces_and_discards_replaced_requests():
     from cachemonitor.analysis_query_actor import QueryActor
 
@@ -1392,7 +1820,7 @@ def test_query_progress_coalesces_and_discards_replaced_requests():
     class Handler:
         def __call__(self, message, token, cancel):
             message['_progress']('query')
-            message['_progress']('aggregate')
+            message['_progress'](dict(stage='aggregate',processed=12,total=20,unit='calls'))
             if message['id'] == 1:
                 started.set()
                 assert release.wait(5)
@@ -1407,7 +1835,7 @@ def test_query_progress_coalesces_and_discards_replaced_requests():
     try:
         actor.submit(dict(kind='query', id=1), None)
         assert started.wait(5)
-        assert actor.drain() == [dict(kind='progress', id=1, stage='aggregate')]
+        assert actor.drain() == [dict(kind='progress',id=1,stage='aggregate',processed=12,total=20,unit='calls')]
         actor.submit(dict(kind='query', id=2), None)
         release.set()
         assert completed.wait(5)
@@ -1468,6 +1896,9 @@ def test_overlay_detail_completes_without_restarting_pending_page(tmp_path, monk
     try:
         output.put(dict(kind='snapshot', value={}, token=('instance', 1), transition=None))
         receive('snapshot')
+        output.put(dict(kind='error',consumer='publication',capacity=True,error='capacity'))
+        assert receive('error')['capacity']
+        assert thread.is_alive()
         parent.send(dict(kind='query', id='page', query={}, logical=()))
         assert started.wait(5)
         parent.send(dict(kind='overlay_detail', id='overlay', summary={'_prepared_token':('instance', 1)}))

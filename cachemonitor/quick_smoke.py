@@ -140,7 +140,7 @@ def start_smoke(window,app,path,fonts,depth='full'):
             wait_overlay(lambda:not model.main_expanded)
             toolbar=overlay.toolbar;previous_style=overlay.chart_style
             toolbar.view.put(popupKind='settings',chartStyle=previous_style,
-                             heightValue=overlay.preferred_height,displayedHeight=round(model.base_height()))
+                             visibleAgentCount=model.visible_agent_count(),canAdjustAgentCount=model.has_subagents())
             toolbar.resize(round(260*scale),round(150*scale));toolbar.show()
             wait_overlay(lambda:named_item(toolbar.quick.rootObject(),'chartStyle-bar') is not None)
             for style in ('bar','filled-line'):

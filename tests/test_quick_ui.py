@@ -92,8 +92,8 @@ def test_reasoning_tokens_render_independently_of_cost_and_request_unit(tmp_path
     try:
         window.receive({'ts':now,'sessions':[session.view(now)],'homes':[],'errors':[],'unassigned':[]})
         from cachemonitor.dashboard import choose
-        window.change_page(1);window.metric_panel.change('metric','reasoning');window.metric_panel.change('dimension','model')
-        window.metric_panel.change('breakdown:effort','true');window.show()
+        window.change_page(1);window.metric_panel.change('metric','reasoning');window.metric_panel.change('dimension','all')
+        window.show()
         from test_ui import wait_for_rendered
         wait_for_rendered(lambda:len(window.metric_panel.data['rows'])==2)
         groups={g['filters']['effort']:g for g in window.metric_panel.data['rows']}

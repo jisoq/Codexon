@@ -52,11 +52,33 @@ Item {
             clip: true
             Rectangle {
                 objectName: "loading-completed"
-                width: track.width * root.completedStages / root.stages.length
+                width: root.s.total > 0 ? track.width * Math.min(1, (root.s.processed || 0) / root.s.total) : 0
                 height: track.height
                 radius: track.radius
                 color: appTheme.palette && appTheme.color("accent")
             }
+            Rectangle {
+                id: activity
+                objectName: "loading-activity"
+                width: track.width * .22; height: track.height; radius: track.radius
+                color: appTheme.palette && appTheme.color("accent")
+                visible: root.s.running !== false
+                opacity: root.s.total > 0 ? .5 : 1
+                NumberAnimation on x {
+                    from: -activity.width; to: track.width
+                    duration: 1100; loops: Animation.Infinite
+                    running: activity.visible && root.visible
+                }
+            }
+        }
+        Text {
+            objectName: "loading-progress-detail"
+            text: [root.s.progressText || "", root.s.elapsedText || ""].filter(function(v) { return v.length > 0 }).join(" / ")
+            visible: text.length > 0
+            font.family: appTheme.family; font.pixelSize: 12
+            color: appTheme.palette && appTheme.color("muted")
+            Layout.fillWidth: true; wrapMode: Text.WordWrap
+            Accessible.name: text
         }
         GridLayout {
             visible: !root.compact && root.s.showStages !== false
@@ -97,7 +119,7 @@ Item {
             }
         }
         Text {
-            visible: !root.compact
+            visible: !root.compact || !!root.s.slow
             text: appLanguage.text(root.s.slow ? "기록 처리에 시간이 걸리고 있습니다. 다른 탭을 이용할 수 있습니다." : "다른 탭을 이용할 수 있습니다.")
             wrapMode: Text.WordWrap
             font.family: appTheme.family

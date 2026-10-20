@@ -55,9 +55,13 @@ class CodexNames:
             self.projectless.update(outputs)
             self.projectless_roots.update(path_key(ntpath.dirname(path)) for path in outputs.values() if isinstance(path,str) and path)
         try:
-            for tid, cwd in db.execute('select id,cwd from threads'):
-                if tid in self.projectless and cwd:
-                    self.projectless_roots.add(path_key(cwd))
+            selected = tuple(self.projectless)
+            for start in range(0, len(selected), 128):
+                group = selected[start:start+128]
+                slots = ','.join('?' for _ in group)
+                for tid, cwd in db.execute(f'select id,cwd from threads where id in ({slots})', group):
+                    if cwd:
+                        self.projectless_roots.add(path_key(cwd))
         except sqlite3.Error:
             pass
         self.aliases = {}

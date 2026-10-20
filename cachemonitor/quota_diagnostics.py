@@ -1,6 +1,7 @@
 """Bounded local diagnostics without account identities or RPC payloads."""
 import json
 import logging
+from contextlib import contextmanager
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import sqlite3
@@ -21,13 +22,47 @@ def _logger(path):
     return logger
 
 
-def record_slow_cycle(path, stages, source_age, last_report):
+class StageTimings:
+    """Scalar wall and current-thread CPU spans for one writer operation."""
+    def __init__(self):
+        self.started = time.perf_counter()
+        self.cpu_started = time.thread_time()
+        self.seconds = {}
+        self.cpu_seconds = {}
+        self.counts = {}
+        self.outcome = 'complete'
+
+    @contextmanager
+    def measure(self, name):
+        started, cpu = time.perf_counter(), time.thread_time()
+        try:
+            yield
+        except BaseException:
+            self.outcome = 'failed'
+            raise
+        finally:
+            self.seconds[name] = self.seconds.get(name, 0.) + time.perf_counter() - started
+            self.cpu_seconds[name] = self.cpu_seconds.get(name, 0.) + time.thread_time() - cpu
+
+    def snapshot(self, *, complete=False):
+        return dict(version=1, complete=complete, outcome=self.outcome,
+            cycle_seconds=round(time.perf_counter()-self.started, 6),
+            cycle_cpu_seconds=round(time.thread_time()-self.cpu_started, 6),
+            stage_seconds={key:round(value,6) for key,value in self.seconds.items()},
+            stage_cpu_seconds={key:round(value,6) for key,value in self.cpu_seconds.items()},
+            counts=dict(self.counts))
+
+
+def record_slow_cycle(path, stages, source_age, last_report, *, details=None):
     """One bounded timing record per minute; never retain source records."""
     now=time.monotonic()
-    if (sum(stages.values())<=10 and source_age<=30) or now-last_report<60:return last_report
+    elapsed = details['cycle_seconds'] if details is not None else sum(stages.values())
+    if (elapsed<=10 and source_age<=30) or now-last_report<60:return last_report
     try:
-        _logger(path).warning(json.dumps(dict(kind='slow_cycle',source_age_seconds=round(source_age,3),
-            stage_seconds={key:round(value,3) for key,value in stages.items()})))
+        value=dict(kind='slow_cycle',source_age_seconds=round(source_age,3),
+            stage_seconds={key:round(value,3) for key,value in stages.items()})
+        if details is not None:value['analysis_timing']=details
+        _logger(path).warning(json.dumps(value))
     except OSError:pass
     return now
 
