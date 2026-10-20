@@ -257,13 +257,22 @@ def download_and_install(release,install,progress,journal,operation_id):
     launch_installer(output,install['InstallRoot'],operation_id)
 
 
-def retry_proxy(manager,journal):
+def retry_proxy(manager,journal,*,verified_operation_id=None):
     """Resume only the outstanding connection stage of the same operation."""
     from .install_management import activate_proxy
     from .update_state import scope_for
     from .observer_state import ProcessLock
     with ProcessLock(journal.root/'app-update-worker.lock'):
         record=journal.read();operation_id=record.get('operation_id')
+        if verified_operation_id is not None:
+            from .update_state import valid_id
+            if not valid_id(verified_operation_id) or operation_id!=verified_operation_id:
+                raise RuntimeError('업데이트 상태가 바뀌었습니다. 다시 확인하세요.')
+            continuation=continuation_target(journal,manager)
+            if (continuation['verified_operation_id']!=verified_operation_id
+                    or not getattr(sys,'frozen',False)
+                    or Path(continuation['executable']).resolve()!=Path(sys.executable).resolve()):
+                raise RuntimeError('시작 메뉴에서 새 Codexon을 열어 업데이트를 계속하세요.')
         if not operation_id or record.get('phase') not in ('partial','failed','deferred','interrupted'):
             raise RuntimeError('다시 적용할 연결 작업이 없습니다.')
         if record.get('scope')!=scope_for(manager):raise RuntimeError('다른 연결의 업데이트 기록을 보존합니다.')
@@ -271,7 +280,8 @@ def retry_proxy(manager,journal):
             raise RuntimeError('앱 설치가 완료되지 않았습니다. 업데이트를 다시 확인하세요.')
         if getattr(sys,'frozen',False) and record.get('app',{}).get('state')=='verified' and Path(record['app']['executable']).resolve()!=Path(sys.executable).resolve():
             raise RuntimeError('시작 메뉴에서 새 Codexon을 열어 업데이트를 계속하세요.')
-        journal.change(operation_id,phase='waiting',cancel_requested=False,defer_requested=False)
+        if not journal.change(operation_id,phase='waiting',cancel_requested=False,defer_requested=False):
+            raise RuntimeError('업데이트 상태가 바뀌었습니다. 다시 확인하세요.')
         try:
             result=activate_proxy(manager,operation_id=operation_id,update_root=journal.root)
             journal.proxy_result(operation_id,result)
@@ -280,18 +290,107 @@ def retry_proxy(manager,journal):
         return journal.read()
 
 
-def reconcile_update(journal,manager=None):
-    """An expired timer is not failure; prove the owning process/task has ended."""
-    from .proxy_identity import same_process
+def continuation_target(journal, manager):
+    """Validate a committed installed GUI before offering the existing handoff."""
+    from .observer_state import ProcessLock, read_json
+    from .proxy_identity import digest
+    from .update_state import scope_for
+    with ProcessLock(journal.root/'install.lock'):
+        record=journal.read();app=record.get('app',{})
+        if (app.get('state')!='verified' or record.get('scope')!=scope_for(manager)
+                or record.get('phase') not in ('partial','failed','deferred','interrupted')):
+            raise RuntimeError('업데이트 상태가 바뀌었습니다. 다시 확인하세요.')
+        executable=Path(app['executable']).resolve()
+        current=installed()
+        if (not current or Path(current.get('InstallRoot','')).resolve()!=journal.root
+                or Path(current.get('AppPath','')).resolve()!=executable
+                or not executable.is_relative_to(journal.root/'versions')
+                or (journal.root/'activation-pending.json').exists()):
+            raise RuntimeError('시작 메뉴에서 새 Codexon을 열어 업데이트를 계속하세요.')
+        manifest=read_json(executable.parent/'build-manifest.json')
+        recovery=Path(current.get('RecoveryPath','')).resolve()
+        if (manifest.get('product')!='Codexon' or manifest.get('version')!=record['target_version']
+                or manifest.get('version')!=app.get('version') or manifest.get('commit')!=app.get('commit')
+                or manifest.get('sha256')!=app.get('sha256') or digest(executable)!=app['sha256']
+                or not recovery.is_relative_to(journal.root/'maintenance')
+                or digest(recovery)!=manifest.get('recovery_sha256')):
+            raise RuntimeError('설치 파일 검증에 실패했습니다. 현재 버전을 유지합니다.')
+        return dict(kind='continue_app',executable=str(executable),verified_operation_id=record['operation_id'])
+
+
+def settle_waiting_dispatch(journal,manager,record):
+    """Finish the installer-to-proxy gap only after every previous owner releases."""
+    from .observer_state import ProcessLock,read_json
     from .observer_task import ObserverTask
+    from .proxy_identity import same_process
+    from .proxy_update import BUSY,TERMINAL,task_finished
+    from .model_evidence import home_key
+    from .update_state import scope_for
+    operation_id=record['operation_id']
+    with ProcessLock(journal.root/'app-update-worker.lock'):
+        if journal.read()!=record:return journal.read()
+        with ProcessLock(journal.root/'install.lock'):
+            if not task_finished(ObserverTask(str(journal.root),role='Installer').inspect()):return record
+            if record.get('installer_owner') and same_process(record['installer_owner']):return record
+            scope_matches=manager is not None and record.get('scope')==scope_for(manager)
+            if not scope_matches:
+                journal.change(operation_id,phase='partial',message='시작 메뉴에서 새 Codexon을 열어 업데이트를 계속하세요.')
+                return journal.read()
+            with ProcessLock(manager.directory/'proxy-update.lock'):
+                current=read_json(manager.directory/'proxy-update.json')
+                # A linked execution already has a recovery owner. Preserve its
+                # source and cutover data; the regular replay path handles it.
+                if (current.get('operation_id')==operation_id
+                        and current.get('scope')==record.get('scope')
+                        and current.get('phase') in (*BUSY,*TERMINAL,'interrupted')):
+                    return record
+                if not task_finished(ObserverTask(home_key(manager.home),role='ProxyUpdate').inspect()):return record
+                if current.get('worker_owner') and same_process(current['worker_owner']):return record
+                latest=journal.read()
+                if latest.get('operation_id')!=operation_id:return latest
+                if latest.get('cancel_requested') and not latest.get('proxy',{}).get('cutover_started'):
+                    journal.proxy_result(operation_id,dict(phase='cancelled'))
+                    return journal.read()
+                app=latest.get('app',{})
+                current_target=(app.get('state')=='verified' and getattr(sys,'frozen',False)
+                                and Path(app.get('executable','')).resolve()==Path(sys.executable).resolve())
+                if not current_target:
+                    journal.change(operation_id,phase='partial',message='시작 메뉴에서 새 Codexon을 열어 업데이트를 계속하세요.')
+                    return journal.read()
+        from .install_management import activate_proxy
+        try:
+            result=activate_proxy(manager,operation_id=operation_id,update_root=journal.root)
+            journal.proxy_result(operation_id,result)
+        except Exception as exc:journal.fail(operation_id,str(exc))
+        return journal.read()
+
+
+def reconcile_update(journal,manager=None):
+    """Replay durable owner results; age only decides when to probe ownership."""
+    from .proxy_identity import locks_free, same_process
+    from .observer_task import ObserverTask
+    from .observer_state import ProcessLock, read_json
+    from .proxy_update import BUSY, TERMINAL, reconcile_owner, task_finished
+    from .update_state import ACTIVE, matches_proxy_target, scope_for
     record=journal.read();phase=record.get('phase')
+    if not record:return record
     previous=record.get('proxy',{})
-    if manager and phase in ('waiting','needs_exit') and previous.get('source_instance') and not previous.get('operation_id'):
-        from .proxy_update import BUSY
-        from .update_state import scope_for
-        if record.get('scope')!=scope_for(manager):return record
+    replayed_installing=False
+    scope_matches=manager is not None and bool(record.get('scope')) and record['scope'] == scope_for(manager)
+    if scope_matches and phase in ACTIVE:
+        current=read_json(manager.directory/'proxy-update.json')
+        if matches_proxy_target(record,current):
+            if current.get('phase') in BUSY:
+                current=reconcile_owner(manager,current,cancel_requested=record.get('cancel_requested',False))
+            if current.get('phase') in (*TERMINAL,'interrupted'):
+                journal.proxy_result(record['operation_id'],current,replay=True)
+                record=journal.read();phase=record.get('phase')
+                if phase!='installing':return record
+                replayed_installing=True
+    if scope_matches and phase in ('waiting','needs_exit') and previous.get('source_instance') and not previous.get('operation_id'):
         current=manager.update_status()
         if current.get('source_instance')!=previous['source_instance'] or current.get('operation_id'):return record
+        current=reconcile_owner(manager,current)
         if current.get('phase') in BUSY:
             health=manager.health(timeout=3) or {};unknown=(health.get('websocket_states') or {}).get('unknown',0)
             current={**current,'required_action':'close_client' if unknown else None,'unknown_connections':unknown,
@@ -301,22 +400,55 @@ def reconcile_update(journal,manager=None):
             if record.get('cancel_requested'):
                 journal.proxy_result(record['operation_id'],dict(phase='cancelled'))
             else:
-                # A worker from the previous app may only have applied its own
-                # old deployment. Queue the new target and let it prove readiness.
+                # Legacy completion proves its own deployment, so request this
+                # operation's target instead of adopting the older build.
                 from .install_management import activate_proxy
                 try:
                     result=activate_proxy(manager,operation_id=record['operation_id'],update_root=journal.root)
                     journal.proxy_result(record['operation_id'],result)
                 except Exception as exc:journal.fail(record['operation_id'],str(exc))
         return journal.read()
-    if time.time()-record.get('updated_at',0)<90:return record
+    if (not replayed_installing and not record.get('cancel_requested')
+            and time.time()-record.get('updated_at',0)<90):return record
     try:
         if phase in ('preparing','downloading'):
             if not record.get('owner') or same_process(record['owner']):return record
-            journal.change(record['operation_id'],phase='interrupted',message='업데이트 준비가 중단되었습니다. 다시 확인하세요.')
+            with ProcessLock(journal.root/'app-update-worker.lock'):
+                if journal.read()!=record:return journal.read()
+                if record.get('cancel_requested'):
+                    journal.proxy_result(record['operation_id'],dict(phase='cancelled'))
+                else:
+                    journal.change(record['operation_id'],phase='interrupted',message='업데이트 준비가 중단되었습니다. 다시 확인하세요.')
+        elif (phase in ('waiting','needs_exit')
+              and (record.get('app',{}).get('state')=='verified' or record.get('cancel_requested'))):
+            return settle_waiting_dispatch(journal,manager,record)
         elif phase=='installing':
             task=ObserverTask(str(journal.root),role='Installer').inspect()
-            if task.get('registered') and (task.get('running') or task.get('state') in (2,4)):return record
-            journal.fail(record['operation_id'],'설치 완료를 확인하지 못했습니다. 업데이트를 다시 확인하세요.')
-    except (OSError,RuntimeError):return record
+            if not task_finished(task):return record
+            if record.get('installer_owner') and same_process(record['installer_owner']):return record
+            with ProcessLock(journal.root/'app-update-worker.lock'):
+                if journal.read()!=record:return journal.read()
+                if not locks_free([journal.root/'install.lock']):return record
+                if not task_finished(ObserverTask(str(journal.root),role='Installer').inspect()):return record
+                from .install_management import recover_installed
+                recovered=recover_installed(journal,record)
+                if not recovered:
+                    journal.fail(record['operation_id'],'설치 완료를 확인하지 못했습니다. 업데이트를 다시 확인하세요.')
+            if recovered:
+                current=journal.read()
+                if scope_matches:
+                    terminal=read_json(manager.directory/'proxy-update.json')
+                    if terminal.get('phase') in TERMINAL and matches_proxy_target(current,terminal):
+                        journal.proxy_result(record['operation_id'],terminal,replay=True)
+                        return journal.read()
+                executable=current.get('app',{}).get('executable')
+                if (not scope_matches or not getattr(sys,'frozen',False)
+                        or Path(executable or '').resolve()!=Path(sys.executable).resolve()):
+                    journal.change(record['operation_id'],phase='partial',
+                                   message='시작 메뉴에서 새 Codexon을 열어 업데이트를 계속하세요.')
+                    return journal.read()
+                from .install_management import activate_proxy
+                result=activate_proxy(manager,operation_id=record['operation_id'],update_root=journal.root)
+                journal.proxy_result(record['operation_id'],result)
+    except (OSError,RuntimeError,KeyError,TypeError):return journal.read()
     return journal.read()

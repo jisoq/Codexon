@@ -55,11 +55,6 @@ def source_base(github, sha, root=ROOT, *, branch='main', current_run=''):
             continue
         if ancestry.returncode:
             raise RuntimeError('Cannot establish the source-verified ancestor')
-        policy = subprocess.run(['git', 'diff', '--quiet', base, sha, '--', *source_receipt.INPUTS], cwd=root, capture_output=True)
-        if policy.returncode == 1:
-            continue
-        if policy.returncode:
-            raise RuntimeError('Cannot compare source verification policies')
         jobs = github.api(f'actions/runs/{run["id"]}/jobs')['jobs']
         if not any(job['name'] == 'source' and job['conclusion'] == 'success' for job in jobs):
             continue
@@ -141,12 +136,14 @@ def plan(github, sha, current_run, event, ref, publish, root=ROOT, *, prepare=Fa
     has_notes = notes.is_file() and bool(notes.read_text(encoding='utf-8').strip())
     tag = 'v' + current
     existing = tag_commit(github, tag) if on_main else None
-    release = github.release(tag) if (publish or prepare) and existing else None
+    release = github.release(tag) if existing == sha else None
     if (publish or prepare) and (not has_notes or (existing and existing != sha)):
         raise ValueError('A new version and nonempty matching release notes are required')
     published = bool(release and not release['draft'] and existing == sha)
     candidate = prepare and bool(branch) and has_notes and (existing is None or bool(release and release['draft']))
-    reuse = reusable_run(github, sha, current_run) if (prepare or publish) and on_main and not published else ''
+    # GitHub does not guarantee dispatch order: either push or prepare may finish
+    # first. Both may reuse the other's fully verified exact-commit installer.
+    reuse = reusable_run(github, sha, current_run) if on_main and not published else ''
     if publish and not (reuse or published):
         raise ValueError('Prepare this exact commit with prepare=true before publishing; no verified installer is available')
     source = deployment = ''
@@ -160,7 +157,9 @@ def plan(github, sha, current_run, event, ref, publish, root=ROOT, *, prepare=Fa
         # A branch dispatch's tested ancestor also covers a later PR merge tree.
         # Fork jobs themselves never become trusted shared receipts.
         source = source_base(github, sha, root, branch=head_branch, current_run=current_run)
-    return dict(version=current, release_tag=tag, candidate=candidate, published=published,
+    release_artifact = candidate or bool(on_main and has_notes and (existing is None or
+                                        (existing == sha and release and release['draft'])))
+    return dict(version=current, release_tag=tag, candidate=candidate, release_artifact=release_artifact, published=published,
                 reuse_run=reuse, verify=not (reuse or published),
                 source_base=source, base=deployment)
 
@@ -190,6 +189,8 @@ def candidate_receipt(folder, sha, run_id, *, validate=False):
 def final_verdict(plan, results):
     required = ['resolve']
     if plan['verify']:
+        if plan.get('rust'):
+            required.append('native')
         required.append('source')
         if plan['package']:
             required.append('package_build')
@@ -306,7 +307,7 @@ def publish(github, sha, verified_run, current_run, folder, root=ROOT):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=('plan', 'seal', 'publish', 'candidate', 'check-candidate', 'source-receipt', 'verdict'))
+    parser.add_argument('action', choices=('plan', 'seal', 'publish', 'candidate', 'check-candidate', 'source-receipt', 'source-environment', 'verdict'))
     parser.add_argument('--repository', default=os.environ.get('GITHUB_REPOSITORY', 'jisoq/Codexon'))
     parser.add_argument('--sha', default=os.environ.get('GITHUB_SHA', ''))
     parser.add_argument('--run-id', default=os.environ.get('GITHUB_RUN_ID', ''))
@@ -338,6 +339,9 @@ def main():
         result = dict(commit=receipt['commit'], run_id=receipt['run_id'],
                       files_checked=len(receipt['files']),
                       installer_sha256=receipt['files'].get('qa-isolated/Codexon-Setup.exe'))
+    elif args.action == 'source-environment':
+        planned = json.loads(os.environ['CHECK_PLAN']) if os.environ.get('CHECK_PLAN') else json.loads(args.plan.read_text(encoding='utf-8-sig'))
+        result = source_receipt.check_environment(planned, args.sha, ROOT)
     elif args.action == 'source-receipt':
         result = source_receipt.write_receipt(args.folder, json.loads(args.plan.read_text(encoding='utf-8')), args.sha, args.run_id, ROOT)
     elif args.action == 'verdict':

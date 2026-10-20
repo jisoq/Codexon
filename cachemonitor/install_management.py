@@ -115,6 +115,46 @@ def activate_proxy(manager, *, operation_id=None, update_root=None):
     return dict(phase='recovery_required', message='시작 메뉴의 Codexon 연결 복구를 실행해 주세요.')
 
 
+def recover_installed(journal, record):
+    """Replay a committed installation after its installer owner has ended.
+
+    The caller proves task/process release. This lock fences a subsequent
+    installer while checking the operation-bound receipt and recording its result.
+    """
+    from .installation import pointer_path
+    from .proxy_identity import digest
+    from .update_state import valid_id
+    operation_id=record.get('operation_id')
+    if not valid_id(operation_id):return None
+    try:
+        with ProcessLock(journal.root/'install.lock'):
+            if (journal.root/'activation-pending.json').exists():return None
+            receipt=read_json(journal.root/'installation.json')
+            if (receipt.get('operation_id')!=operation_id or receipt.get('isolated') is not False
+                    or receipt.get('scope')!=record.get('scope')
+                    or receipt.get('version')!=record.get('target_version')):
+                return None
+            product=contained(receipt['product'],journal.root/'versions')
+            recovery=contained(receipt['recovery'],journal.root/'maintenance')
+            manifest=read_json(product/'build-manifest.json')
+            if manifest.get('product')!='Codexon':return None
+            if any(not manifest.get(key) or manifest[key]!=receipt.get(key)
+                   for key in ('version','commit','sha256','recovery_sha256')):
+                return None
+            pointer=read_json(pointer_path())
+            if (Path(pointer['InstallRoot']).resolve()!=journal.root
+                    or Path(pointer['AppPath']).resolve()!=product/'Codexon.exe'
+                    or Path(pointer['RecoveryPath']).resolve()!=recovery):
+                return None
+            if (digest(product/'Codexon.exe')!=manifest['sha256']
+                    or digest(recovery)!=manifest['recovery_sha256']):
+                return None
+            return journal.installed(operation_id,product,manifest,
+                                     scope=record.get('scope'),recovered=True)
+    except (OSError,ValueError,TypeError,KeyError,RuntimeError):
+        return None
+
+
 def finish(root, product, recovery, *, isolated=False, launch=True, language='ko',update_id=None):
     root = Path(root).resolve()
     product = contained(product, root/'versions')
@@ -132,6 +172,15 @@ def finish(root, product, recovery, *, isolated=False, launch=True, language='ko
         if not valid_id(update_id) or request.get('operation_id')!=update_id or request.get('target_version')!=manifest['version']:
             raise RuntimeError('요청한 업데이트와 설치 파일이 다릅니다. 이전 설치를 유지합니다.')
     with ProcessLock(root/'install.lock',timeout=10):
+        if update_id:
+            current=journal.read()
+            if (current.get('operation_id')!=update_id
+                    or current.get('target_version')!=manifest['version']
+                    or current.get('scope')!=request.get('scope')):
+                raise RuntimeError('설치 대기 중 업데이트 요청이 변경되었습니다. 이전 설치를 유지합니다.')
+            from .proxy_identity import process_identity
+            if not journal.change(update_id,installer_owner=process_identity(os.getpid())):
+                raise RuntimeError('설치 대기 중 업데이트 요청이 변경되었습니다. 이전 설치를 유지합니다.')
         report = root/('runtime-'+uuid.uuid4().hex+'.json')
         check = subprocess.run([str(exe),'--verify-runtime',str(report)],timeout=45,
                                creationflags=subprocess.CREATE_NO_WINDOW)
@@ -144,6 +193,11 @@ def finish(root, product, recovery, *, isolated=False, launch=True, language='ko
         receipt = dict(product=str(product), recovery=str(recovery), version=manifest['version'],
                        commit=manifest['commit'], previous=previous.get('product'), installed_at=time.time(),
                        isolated=isolated)
+        if update_id:
+            # Written only after runtime/hash checks; absence of the activation
+            # journal then proves this exact request reached committed activation.
+            receipt.update(operation_id=update_id,scope=request.get('scope'),
+                           sha256=manifest['sha256'],recovery_sha256=manifest['recovery_sha256'])
         # Keep rollback payloads until the new GUI verifies all service handoffs.
         try:
             if previous:

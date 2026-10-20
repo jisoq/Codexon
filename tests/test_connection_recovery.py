@@ -1,4 +1,5 @@
 import json
+import sys
 import time
 import tomllib
 from types import SimpleNamespace
@@ -96,3 +97,151 @@ def test_custom_home_recovered_from_record_and_url_restricted(manager):
     restored=target(directory=manager.directory)
     assert restored.home==manager.home and restored.url==manager.url
     with pytest.raises(ValueError):target(manager.home,manager.directory,'https://remote.example')
+
+
+@pytest.fixture
+def interrupted_exit(manager, monkeypatch):
+    from cachemonitor import app_services as services
+    owner = services.AppServices(manager, [], collection=False)
+    manager.write_state(dict(home=home_key(manager.home), enabled=True, phase='active', previous_url=None))
+
+    def write(phase='preparing', **extra):
+        return owner.save(phase=phase, operation_id='interrupted-exit', resume=True,
+            preparation_owner=dict(pid=123, created=1, executable=sys.executable),
+            source=dict(instance='still-serving'), shutdown_incomplete=True,
+            shutdown_incomplete_instance='older-instance', **extra)
+
+    def status():
+        journal = read_json(services.session_path(manager))
+        return dict(configured=manager.config()[1].get('openai_base_url') == manager.url,
+                    phase=journal.get('phase', 'active'), service_phase=journal.get('phase'),
+                    health=dict(instance='still-serving', draining=False), probe_state='healthy')
+
+    monkeypatch.setattr(manager, 'status', status)
+    monkeypatch.setattr('cachemonitor.retired_cache.retire', lambda *a, **k: pytest.fail('Recovery must preserve the old proxy'))
+    monkeypatch.setattr('cachemonitor.proxy_drain.ProxyDrain.run', lambda *a, **k: pytest.fail('Recovery must not drain'))
+    monkeypatch.setattr(services.AppServices, 'stop_proxy', lambda *a, **k: pytest.fail('Recovery must not finish shutdown'))
+    monkeypatch.setattr('cachemonitor.observer_task.ObserverTask.start', lambda *a, **k: pytest.fail('Recovery must not start services'))
+    return SimpleNamespace(manager=manager, owner=owner, write=write)
+
+
+@pytest.mark.parametrize('phase', ['preparing', 'closing'])
+def test_proven_gui_exit_allows_direct_restore_without_touching_proxy(interrupted_exit, monkeypatch, phase):
+    from cachemonitor import app_services as services
+    case = interrupted_exit
+    case.write(phase)
+    monkeypatch.setattr(services.identity, 'same_process', lambda _: False)
+    before = services.session_path(case.manager).read_bytes()
+    result = inspect(case.manager)
+    assert result['code'] == 'interrupted_exit' and result['can_recover']
+    assert services.session_path(case.manager).read_bytes() == before
+    assert restore(case.manager)['code'] == 'restored'
+    assert case.manager.config()[1] == {'model': 'keep'}
+    assert '# preserve me' in case.manager.config_path.read_text()
+    journal = read_json(services.session_path(case.manager))
+    assert journal['phase'] == 'active' and journal['resume'] is False
+    assert journal['source'] == dict(instance='still-serving')
+    assert journal['shutdown_incomplete'] and journal['shutdown_incomplete_instance'] == 'older-instance'
+    assert not list(case.manager.directory.glob('proxy-control-*.json'))
+    assert inspect(case.manager)['code'] == 'direct'
+
+
+@pytest.mark.parametrize('phase', ['preparing', 'closing'])
+@pytest.mark.parametrize('condition', ['live', 'unknown', 'missing'])
+def test_live_or_unknown_exit_owner_blocks_inspection_and_restore(interrupted_exit, monkeypatch, phase, condition):
+    from cachemonitor import app_services as services
+    case = interrupted_exit
+    case.write(phase)
+    if condition == 'missing':
+        journal = read_json(services.session_path(case.manager))
+        journal.pop('preparation_owner')
+        services.atomic_write(services.session_path(case.manager), json.dumps(journal).encode())
+
+    def same_process(_):
+        if condition == 'unknown':
+            raise OSError('owner inspection unavailable')
+        if condition == 'missing':
+            pytest.fail('Missing owner cannot prove exit')
+        return True
+
+    monkeypatch.setattr(services.identity, 'same_process', same_process)
+    before = services.session_path(case.manager).read_bytes()
+    route = case.manager.config()[0]
+    result = inspect(case.manager)
+    assert result['code'] == 'exiting' and not result['can_recover']
+    with pytest.raises(services.ExitRecoveryBlocked):
+        restore(case.manager)
+    assert services.session_path(case.manager).read_bytes() == before
+    assert case.manager.config()[0] == route
+    assert not list(case.manager.directory.glob('proxy-control-*.json'))
+
+
+def test_restore_rechecks_operation_identity_after_acquiring_control_lock(interrupted_exit, monkeypatch):
+    from cachemonitor import app_services as services
+    case = interrupted_exit
+    case.write('closing')
+    monkeypatch.setattr(services.identity, 'same_process', lambda _: False)
+    lock_type = services.ProcessLock
+
+    class NewOperationBeforeLock:
+        def __init__(self, *args, **kwargs):
+            self.lock = lock_type(*args, **kwargs)
+
+        def __enter__(self):
+            case.owner.save(phase='preparing', operation_id='new-operation', resume=True)
+            return self.lock.__enter__()
+
+        def __exit__(self, *args):
+            return self.lock.__exit__(*args)
+
+    monkeypatch.setattr(services, 'ProcessLock', NewOperationBeforeLock)
+    monkeypatch.setattr(case.manager, 'recover_direct', lambda: pytest.fail('A new operation owns recovery'))
+    route = case.manager.config()[0]
+    with pytest.raises(services.ExitRecoveryBlocked, match='종료 작업이 변경'):
+        restore(case.manager)
+    journal = read_json(services.session_path(case.manager))
+    assert journal['operation_id'] == 'new-operation' and journal['resume'] is True
+    assert case.manager.config()[0] == route
+
+
+def test_restore_rechecks_owner_liveness_under_control_lock(interrupted_exit, monkeypatch):
+    from cachemonitor import app_services as services
+    case = interrupted_exit
+    case.write('preparing')
+    observations = iter([False, True])
+    monkeypatch.setattr(services.identity, 'same_process', lambda _: next(observations))
+    monkeypatch.setattr(case.manager, 'recover_direct', lambda: pytest.fail('A live exit owner must retain control'))
+    route = case.manager.config()[0]
+    journal = services.session_path(case.manager).read_bytes()
+    with pytest.raises(services.ExitRecoveryBlocked):
+        restore(case.manager)
+    assert case.manager.config()[0] == route
+    assert services.session_path(case.manager).read_bytes() == journal
+
+
+@pytest.mark.parametrize('route', [None, 'https://custom.example/v1'])
+def test_interrupted_exit_recovery_preserves_prior_off_and_external_route(interrupted_exit, monkeypatch, route):
+    from cachemonitor import app_services as services
+    case = interrupted_exit
+    case.write('closing')
+    case.manager.set_url(route)
+    services.disable_resume(case.manager)
+    before = case.manager.config()[0]
+    monkeypatch.setattr(services.identity, 'same_process', lambda _: False)
+    assert restore(case.manager)['code'] == 'restored'
+    assert case.manager.config()[0] == before
+    assert read_json(services.session_path(case.manager))['resume'] is False
+
+
+def test_unreadable_status_cannot_bypass_live_exit_ownership(interrupted_exit, monkeypatch):
+    from cachemonitor import app_services as services
+    case = interrupted_exit
+    case.write('closing')
+    monkeypatch.setattr(services.identity, 'same_process', lambda _: True)
+
+    def unreadable():
+        raise ValueError('status unavailable')
+
+    monkeypatch.setattr(case.manager, 'status', unreadable)
+    result = inspect(case.manager)
+    assert result['code'] == 'exiting' and not result['can_recover']

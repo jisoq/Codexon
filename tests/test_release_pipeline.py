@@ -55,7 +55,9 @@ def test_release_request_reuses_exact_successful_main_run(root):
     github = FakeGitHub([run_record()])
     result = pipeline.plan(github, SHA, '20', 'workflow_dispatch', 'refs/heads/main', True, root)
     assert not result['candidate'] and result['reuse_run'] == '10' and not result['verify']
-    assert pipeline.plan(github, SHA, '20', 'push', 'refs/heads/main', False, root)['reuse_run'] == ''
+    ordinary = pipeline.plan(github, SHA, '20', 'push', 'refs/heads/main', False, root)
+    assert ordinary['reuse_run'] == '10' and not ordinary['verify']
+    assert not ordinary['candidate']
 
 
 @pytest.mark.parametrize('changes', [
@@ -189,10 +191,9 @@ def test_reused_qa_registers_its_default_scope_before_starting_children(tmp_path
 
 def test_workflow_preserves_successful_jobs_and_publishes_the_retained_artifact():
     workflow = (pipeline.ROOT/'.github/workflows/windows.yml').read_text()
-    assert "format('ci-{0}', github.event.pull_request.number || github.ref)" in workflow
-    assert "format('release-{0}-{1}', github.sha, github.run_id)" in workflow
-    assert 'cancel-in-progress: ${{ !(inputs.prepare || inputs.publish) }}' in workflow
-    assert 'needs: [resolve, source, package_build, package_verify]' in workflow
+    assert 'group: windows-${{ github.event.pull_request.number || github.ref }}-${{ github.sha }}' in workflow
+    assert 'cancel-in-progress: false' in workflow
+    assert 'needs: [resolve, native, source, package_build, package_verify]' in workflow
     verify, publish = workflow.split('\n  publish:\n')
     assert 'needs: [resolve, verify]' in publish
     assert 'release_pipeline.py publish' in publish and 'build.ps1' not in publish
@@ -202,6 +203,8 @@ def test_workflow_preserves_successful_jobs_and_publishes_the_retained_artifact(
     build = workflow.split('\n  package_build:\n')[1].split('\n  package_verify:\n')[0]
     validation = workflow.split('\n  package_verify:\n')[1].split('\n  verify:\n')[0]
     assert 'build.ps1' in build and 'Build-Installer.ps1' in build
+    assert 'needs: [resolve, native]' in build
+    assert 'source-environment' in build
     assert 'build.ps1' not in validation and 'Build-Installer.ps1' not in validation
     assert 'actions/download-artifact@' in validation
     assert 'candidate-${{ github.sha }}-${{ github.run_id }}' in build
@@ -298,11 +301,12 @@ def test_failed_and_nonancestor_runs_cannot_hide_unverified_changes(root, monkey
     assert checked == ['d' * 40, 'b' * 40]
 
 
-def test_missing_verified_baseline_requests_full_checks(root):
+def test_missing_verified_baseline_requests_essential_checks(root):
     assert pipeline.verified_base(FakeGitHub(), SHA, root) == ''
     from tools.ci_plan import build_plan
     checks = build_plan(None, candidate=True)
-    assert checks['source_args'] == ['--integration']
+    assert checks['source_args'] == ['--full']
+    assert checks['source_suite'] == 'essential'
     assert checks['package'] and checks['proxy'] and checks['msix']
 
 
@@ -320,9 +324,9 @@ def test_publish_failure_does_not_discard_successfully_verified_installer(root):
 def test_source_success_survives_install_failure_but_invalid_environment_does_not(root, monkeypatch, branch, base):
     from tools import source_receipt
     record = {**run_record(), 'head_sha': base, 'head_branch': branch, 'conclusion': 'failure'}
-    receipt = dict(schema=1, policy=source_receipt.POLICY, commit=base, run_id='10',
+    receipt = dict(schema=2, policy=source_receipt.POLICY, commit=base, run_id='10',
                    environment=source_receipt.environment_key(root), complete=True,
-                   scope=['tests'], args=['--integration'])
+                   scope=['tests'], args=['--full'], suite='essential', affected_tests=[])
     class SourceGitHub(FakeGitHub):
         def api(self, path, **kwargs):
             if path.endswith('/jobs'):
@@ -397,3 +401,37 @@ def test_notes_do_not_make_an_ordinary_push_a_release_candidate(root):
     assert branch['candidate'] and branch['verify'] and not branch['published']
     with pytest.raises(ValueError, match='non-main'):
         pipeline.plan(github, SHA, '20', 'workflow_dispatch', 'refs/heads/main', False, root, exercise_rerun=True)
+
+
+@pytest.mark.parametrize('state', ['skipped', 'failure', 'cancelled', 'missing'])
+def test_native_contract_must_pass_when_planned(state):
+    plan = dict(verify=True, package=False, qa_reuse=False, rust=True)
+    results = dict(resolve='success', source='success', native='success')
+    assert pipeline.final_verdict(plan, results)['result'] == 'success'
+    with pytest.raises(ValueError, match='native'):
+        pipeline.final_verdict(plan, {**results, 'native': state})
+    assert pipeline.final_verdict({**plan, 'rust': False}, {**results, 'native': 'skipped'})
+
+
+@pytest.mark.parametrize('event, ref, expected', [
+    ('push', 'refs/heads/main', True),
+    ('workflow_dispatch', 'refs/heads/main', True),
+    ('workflow_dispatch', 'refs/heads/preview', False),
+    ('pull_request', 'refs/pull/1/merge', False),
+])
+def test_ordinary_checked_main_installer_can_be_retained_for_prepare(root, event, ref, expected):
+    result = pipeline.plan(FakeGitHub(), SHA, '20', event, ref, False, root)
+    assert result['release_artifact'] is expected
+    assert not result['candidate']
+
+
+def test_existing_public_version_or_missing_notes_cannot_create_release_artifact(root):
+    github = FakeGitHub()
+    github.tag = SHA
+    github.released = dict(draft=False)
+    assert not pipeline.plan(github, SHA, '20', 'push', 'refs/heads/main', False, root)['release_artifact']
+    github.tag = 'b' * 40
+    assert not pipeline.plan(github, SHA, '20', 'push', 'refs/heads/main', False, root)['release_artifact']
+    github.tag = None
+    (root/'docs/releases/2026.10.11.1.md').unlink()
+    assert not pipeline.plan(github, SHA, '20', 'push', 'refs/heads/main', False, root)['release_artifact']

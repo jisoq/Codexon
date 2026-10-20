@@ -1,13 +1,15 @@
 """Application-owned service lifetime; collection remains in CollectorService."""
 import json
-import re
+import os
 import time
 import sys
 import threading
+import uuid
 from pathlib import Path
 from .observer_state import ProcessLock, read_json
 from .observer_control import atomic_write
 from .proxy_target import ProxyTarget, option
+from .shutdown_state import ExitCancelled, ExitControl, ExitProgress, ExitResult
 from . import proxy_identity as identity
 
 def session_path(manager):
@@ -15,7 +17,7 @@ def session_path(manager):
 
 def suspended(manager):
     value = read_json(session_path(manager))
-    return value.get('scope') == ProxyTarget(manager).scope and value.get('phase') in ('closing', 'stopped', 'failed', 'resuming')
+    return value.get('scope') == ProxyTarget(manager).scope and value.get('phase') in ('preparing', 'closing', 'stopped', 'failed', 'resuming')
 
 def require_running(manager):
     if suspended(manager):
@@ -27,6 +29,48 @@ def disable_resume(manager):
     if value.get('scope') == ProxyTarget(manager).scope:
         value['resume'] = False
         atomic_write(path, json.dumps(value).encode())
+
+
+class ExitRecoveryBlocked(RuntimeError):
+    pass
+
+
+def exit_recovery_owner(manager):
+    """Read scoped exit-owner proof without changing services or route intent."""
+    value = read_json(session_path(manager))
+    if value.get('scope') != ProxyTarget(manager).scope or value.get('phase') not in ('preparing', 'closing'):
+        return None
+    owner = value.get('preparation_owner')
+    proof = dict(scope=value['scope'], phase=value['phase'], operation_id=value.get('operation_id'),
+                 preparation_owner=owner, owner_state='unknown')
+    if (not isinstance(proof['operation_id'], str) or not proof['operation_id']
+            or not isinstance(owner, dict) or set(owner) != {'pid', 'created', 'executable'}
+            or type(owner['pid']) is not int or owner['pid'] <= 0
+            or type(owner['created']) is not int or owner['created'] <= 0
+            or not isinstance(owner['executable'], str) or not owner['executable']):
+        return proof
+    try:
+        alive = identity.same_process(owner)
+    except (OSError, ValueError, RuntimeError, TypeError, KeyError):
+        return proof
+    proof['owner_state'] = 'live' if alive is True else 'dead' if alive is False else 'unknown'
+    return proof
+
+
+def recover_after_exit(manager, expected):
+    """Honor explicit Off after a proven owner exit, without touching its proxy."""
+    with ProcessLock(manager.control_lock, timeout=5):
+        current = exit_recovery_owner(manager)
+        if current != expected:
+            raise ExitRecoveryBlocked('종료 작업이 변경되어 직접 연결 복원을 보류했습니다. 상태를 다시 확인하세요.')
+        if not current or current['owner_state'] != 'dead':
+            raise ExitRecoveryBlocked('종료 작업이 진행 중이거나 소유권을 확인하지 못해 직접 연결 복원을 보류했습니다.')
+        status = manager.recover_direct()
+        if manager.config()[1].get('openai_base_url') == manager.url:
+            raise RuntimeError('프록시 연결 설정이 남아 있습니다. 복원이 완료되지 않았습니다.')
+        # Restoring direct access settles route intent, not proxy exit or storage.
+        AppServices(manager, [], collection=False).save(phase='active', resume=False)
+        return status
 
 
 class LoginLaunch:
@@ -51,6 +95,7 @@ class AppServices:
         self.progress, self.clock, self.sleep = (progress, clock, sleep)
         self.collection = collection
         self.active = False
+        self.recovery_deferred = False
         self.closing = threading.Event()
         self.operation_lock = threading.RLock()
         self.retries = {}
@@ -65,6 +110,12 @@ class AppServices:
     def deactivate(self):
         self.closing.set()
         self.active = False
+
+    def release_exit(self, *, defer_recovery=True):
+        """Reopen controls after finalization failure without changing services."""
+        self.recovery_deferred = defer_recovery
+        self.closing.clear()
+        self.active = True
 
     def execute(self, operation):
         """Serialize UI actions and the app's single periodic operation."""
@@ -84,8 +135,12 @@ class AppServices:
                 return result
             if operation in ('turn_on', 'resume'):
                 self.retries.pop('proxy', None)
+                if suspended(self.manager):
+                    resume_proxy(self.manager)
             result = getattr(self.manager, operation)()
             self.remember_proxy(result)
+            if operation in ('turn_on', 'resume'):
+                self.recovery_deferred = False
             return result
 
     def status(self):
@@ -271,6 +326,8 @@ class AppServices:
 
     def retry(self, name, dead, start):
         """A successful restart never replenishes this app session's budget."""
+        if self.recovery_deferred:
+            return
         state = self.retries.setdefault(name, dict(at=None, count=0))
         if not dead:
             state['at'] = None
@@ -382,83 +439,145 @@ class AppServices:
     def publish(self, phase, **value):
         self.progress(value.get('message', '관련 프로세스가 종료됐는지 확인하고 있습니다.'))
 
-    def wait(self, done, message, seconds=30):
+    def wait(self, done, message, seconds=30, *, checkpoint=lambda: None):
         deadline = self.clock() + seconds
-        while not done():
+        while True:
+            checkpoint()
+            if done():
+                return
             if self.clock() >= deadline:
                 raise RuntimeError(message)
             self.sleep(0.2)
 
-    def stop_proxy(self, *, force_requested=lambda: False):
+    def stop_proxy(self, *, force_requested=lambda: False, control=None, publish=None):
         from .model_evidence import home_key
         from .observer_task import ObserverTask
         from .proxy_update import ProxyUpdate, BUSY
         from .proxy_drain import ProxyDrain
         m = self.manager
-        m.cleanup_legacy_check()
-        # The updater must finish verification or rollback before shutdown makes
-        # the shared service state suspended. Never cancel halfway through swap.
-        self.progress('업데이트 적용 또는 복원이 끝나기를 기다리고 있습니다.')
-        self.wait(lambda:not (read_json(m.directory/'proxy-update.json').get('cutover_started')
-                             and read_json(m.directory/'proxy-update.json').get('phase') in BUSY),
-                  '업데이트 적용 또는 복원이 진행 중입니다. 완료 후 다시 종료하세요.')
-        with ProcessLock(m.control_lock, timeout=30):
-            update=read_json(m.directory/'proxy-update.json')
-            if update.get('cutover_started') and update.get('phase') in BUSY:
-                raise RuntimeError('업데이트 적용 또는 복원이 진행 중입니다. 완료 후 다시 종료하세요.')
-            previous = read_json(session_path(m))
-            if previous and previous.get('scope') != self.target.scope:
-                raise RuntimeError('다른 연결의 종료 기록을 보존합니다.')
-            state = m.state()
-            configured = m.config()[1].get('openai_base_url') == m.url
-            if previous.get('phase') not in ('closing', 'failed', 'stopped', 'resuming'):
-                self.save(phase='closing', resume=bool(configured), state=state, source=None, direct_url=state.get('previous_url'))
-            else:
-                self.save(phase='closing')
-            updater = ProxyUpdate(m)
-            if read_json(updater.path).get('phase') in BUSY:
-                updater.publish(read_json(updater.path)['phase'], cancel_requested=True, message='앱을 종료하기 위해 프록시 교체를 중지하고 있습니다.')
-            update_task = ObserverTask(home_key(m.home), role='ProxyUpdate')
-            update_task.suspend()
-            for task in (m.task, m.legacy_task):
-                task.suspend()
-        self.progress('진행 중인 연결 설정 작업이 끝나기를 기다리고 있습니다.')
-        self.wait(lambda: identity.locks_free([m.directory / 'proxy-update.lock']) and (not update_task.inspect().get('running')), '업데이트 프로세스 종료 확인 지연')
-        with ProcessLock(m.control_lock, timeout=30):
-            update_task.suspend()
-            m.task.suspend()
-            health = m.health(timeout=3)
-            data = read_json(session_path(m))
-            source = data.get('source')
-            if not source and (not health):
-                interrupted = read_json(updater.path)
-                if interrupted.get('scope') == self.target.scope and interrupted.get('source'):
-                    source = interrupted['source']
-                    self.save(source=source)
-            if health:
-                source = self.target.capture(health)
-                self.save(source=source)
-                control = source.get('control_id', '')
-                if not re.fullmatch('[0-9a-f]{32}', control):
-                    raise RuntimeError('이 프록시는 안전 종료 제어를 지원하지 않습니다. 실행 중 응답을 유지합니다.')
-                atomic_write(m.directory / ('proxy-control-' + control + '.json'), json.dumps(dict(id=control, action='pause')).encode())
-            elif not source and (not (identity.port_free(m.url) and identity.locks_free(self.target.locks))):
-                raise RuntimeError('관련 프로세스 소유권을 확인하지 못해 종료를 보류했습니다.')
+        control = control or ExitControl()
+        operation_id = uuid.uuid4().hex
+        previous = None
 
-        def restore_route(_=None):
+        def report(phase, **value):
+            self.publish(phase, **value)
+            if publish:
+                publish(ExitProgress(phase, value.get('message', ''),
+                    can_cancel=not control.committed and not control.cancelled,
+                    can_force=bool(value.get('can_force')) and not control.cancelled,
+                    responding=value.get('responding', 0), unknown=value.get('unknown_connections', 0)))
+
+        def force():
+            return control.force_requested or force_requested()
+
+        def commit_route(_=None):
             with ProcessLock(m.control_lock, timeout=30):
-                if m.config()[1].get('openai_base_url') == m.url:
-                    direct = data.get('direct_url')
-                    if direct not in (None, 'https://api.openai.com/v1', 'https://chatgpt.com/backend-api/codex'):
-                        raise RuntimeError('원래 연결 주소를 확인하지 못했습니다.')
+                control.checkpoint()
+                update = read_json(m.directory / 'proxy-update.json')
+                if update.get('cutover_started') and update.get('phase') in BUSY:
+                    raise RuntimeError('업데이트 적용 또는 복원이 진행 중입니다. 완료 후 다시 종료하세요.')
+                data = read_json(session_path(m))
+                if data.get('operation_id') != operation_id:
+                    raise RuntimeError('종료 작업이 변경되어 기존 연결을 보존했습니다.')
+                configured = m.config()[1].get('openai_base_url') == m.url
+                direct = data.get('direct_url')
+                if configured and direct not in (None, 'https://api.openai.com/v1', 'https://chatgpt.com/backend-api/codex'):
+                    raise RuntimeError('원래 연결 주소를 확인하지 못했습니다.')
+                control.commit(lambda: self.save(phase='closing', committed=True))
+                update_task.suspend()
+                for task in (m.task, m.legacy_task):
+                    task.suspend()
+                if configured and m.config()[1].get('openai_base_url') == m.url:
                     m.set_url(direct)
                 state = m.state()
                 state.update(enabled=False, pending=False, phase='off')
                 m.write_state(state)
-        if source:
-            ProxyDrain(m, self.target, publish=self.publish, before_drain=restore_route, clock=self.clock, sleep=self.sleep, force_requested=force_requested).run(source)
-        restore_route()
-        self.save(phase='stopped')
+
+        try:
+            report('preparing', message='업데이트 적용 또는 복원이 끝나기를 기다리고 있습니다.')
+            # A committed replacement owns routing until verification or rollback.
+            self.wait(lambda: not (read_json(m.directory / 'proxy-update.json').get('cutover_started')
+                                  and read_json(m.directory / 'proxy-update.json').get('phase') in BUSY),
+                      '업데이트 적용 또는 복원이 진행 중입니다. 완료 후 다시 종료하세요.', checkpoint=control.checkpoint)
+            with ProcessLock(m.control_lock, timeout=30):
+                control.checkpoint()
+                update = read_json(m.directory / 'proxy-update.json')
+                if update.get('cutover_started') and update.get('phase') in BUSY:
+                    raise RuntimeError('업데이트 적용 또는 복원이 진행 중입니다. 완료 후 다시 종료하세요.')
+                previous = read_json(session_path(m))
+                if previous and previous.get('scope') != self.target.scope:
+                    raise RuntimeError('다른 연결의 종료 기록을 보존합니다.')
+                if previous.get('phase') == 'preparing':
+                    owner = previous.get('preparation_owner')
+                    if not owner or identity.same_process(owner):
+                        raise RuntimeError('다른 종료 준비 작업이 진행 중이거나 소유권을 확인하지 못했습니다.')
+                    previous = {**previous, 'phase': previous.get('preparation_previous_phase', 'active'),
+                                'committed': previous.get('preparation_previous_committed', False)}
+                state = m.state()
+                configured = m.config()[1].get('openai_base_url') == m.url
+                preparation_owner = identity.process_identity(os.getpid())
+                if not preparation_owner:
+                    raise RuntimeError('종료 준비 프로세스의 소유권을 확인하지 못했습니다.')
+                preparation = dict(preparation_owner=preparation_owner,
+                    preparation_previous_phase=previous.get('phase', 'active'),
+                    preparation_previous_committed=previous.get('committed', False))
+                if previous.get('phase') not in ('closing', 'failed', 'stopped', 'resuming'):
+                    self.save(phase='preparing', operation_id=operation_id, committed=False,
+                              resume=bool(configured), state=state, source=previous.get('source'),
+                              direct_url=state.get('previous_url'), **preparation)
+                else:
+                    self.save(phase='preparing', operation_id=operation_id, committed=False,
+                              **preparation)
+                updater = ProxyUpdate(m)
+                update_task = ObserverTask(home_key(m.home), role='ProxyUpdate')
+            # The preparing journal inhibits new mutations. Existing pre-cutover
+            # updaters observe it through target.enabled() and finish cancellation.
+            report('preparing', message='진행 중인 연결 설정 작업이 끝나기를 기다리고 있습니다.')
+            self.wait(lambda: identity.locks_free([m.directory / 'proxy-update.lock'])
+                      and not update_task.inspect().get('running'),
+                      '업데이트 프로세스 종료 확인 지연', checkpoint=control.checkpoint)
+            with ProcessLock(m.control_lock, timeout=30):
+                control.checkpoint()
+                health = m.health(timeout=3)
+                data = read_json(session_path(m))
+                source = self.target.capture(health) if health else self.proxy_source or data.get('source')
+                if not source and not health:
+                    interrupted = read_json(updater.path)
+                    if interrupted.get('scope') == self.target.scope:
+                        source = interrupted.get('source')
+                if source:
+                    self.target.validate_command(source['command'])
+                    self.save(source=source)
+                elif not (identity.port_free(m.url) and identity.locks_free(self.target.locks)):
+                    raise RuntimeError('관련 프로세스 소유권을 확인하지 못해 종료를 보류했습니다.')
+            if source:
+                if not self.target.stopped(source) and self.target.released(source):
+                    commit_route()
+                    self.save(shutdown_incomplete=True, shutdown_incomplete_instance=source['instance'])
+                else:
+                    settled = ProxyDrain(m, self.target, allowed=control.checkpoint, publish=report,
+                        before_drain=commit_route, clock=self.clock, sleep=self.sleep,
+                        force_requested=force, purpose='exit', allow_missing_flush=True).run(source)
+                    if settled is False:
+                        self.save(shutdown_incomplete=True, shutdown_incomplete_instance=source['instance'])
+            if not control.committed:
+                commit_route()
+            m.cleanup_legacy_check()
+            self.save(phase='stopped')
+            data = read_json(session_path(m))
+            if data.get('shutdown_incomplete') and data.get('shutdown_incomplete_instance') == (source or {}).get('instance'):
+                return '종료한 프록시의 기록 저장 완료를 확인하지 못했습니다.'
+            return ''
+        except Exception as exc:
+            with ProcessLock(m.control_lock, timeout=30):
+                data = read_json(session_path(m))
+                if data.get('operation_id') == operation_id:
+                    phase = 'failed' if control.committed else (previous or {}).get('phase', 'active')
+                    if phase == 'preparing':
+                        phase = 'active'
+                    self.save(phase=phase, committed=control.committed or bool((previous or {}).get('committed')),
+                              error='' if isinstance(exc, ExitCancelled) else str(exc))
+            raise
 
     def stop_collection(self):
         from .usage_collection import CollectionChannel, locked
@@ -493,16 +612,31 @@ class AppServices:
         finally:
             channel.close()
 
-    def stop(self, *, force_requested=lambda: False):
+    def stop(self, force_requested=None, *, control=None, publish=None):
+        control = control or ExitControl()
+        warning = ''
         self.deactivate()
-        if self.manager:
+        with self.operation_lock:
             try:
-                self.stop_proxy(force_requested=force_requested)
-            except Exception:
-                self.save(phase='failed')
-                raise
-        if self.collection:
-            self.stop_collection()
+                control.checkpoint()
+                if self.manager:
+                    warning = self.stop_proxy(force_requested=force_requested or (lambda: False),
+                                              control=control, publish=publish)
+                if self.collection:
+                    if not control.committed:
+                        control.commit()
+                    if publish:
+                        publish(ExitProgress('stopping', '수집 기록 저장과 수집기 종료를 확인하고 있습니다.', False))
+                    self.stop_collection()
+                if not control.committed:
+                    control.commit()
+                return ExitResult('completed', committed=control.committed, warning=warning)
+            except ExitCancelled:
+                self.release_exit(defer_recovery=control.committed)
+                return ExitResult('cancelled', committed=control.committed)
+            except Exception as exc:
+                self.release_exit(defer_recovery=control.committed)
+                return ExitResult('failed', committed=control.committed, error=str(exc), warning=warning)
 
 def resume_proxy(manager):
     """Resume only the connection suspended by this app, with its saved role."""
@@ -517,6 +651,21 @@ def resume_proxy(manager):
     if data.get('phase') == 'active':
         return False
     services = AppServices(m, [], progress=lambda _: None)
+    if data.get('phase') == 'preparing':
+        with ProcessLock(m.control_lock, timeout=30):
+            data = read_json(path)
+            if data.get('phase') == 'preparing':
+                owner = data.get('preparation_owner')
+                if not owner:
+                    raise RuntimeError('종료 준비 소유권을 확인하지 못해 연결 재개를 보류했습니다.')
+                if identity.same_process(owner):
+                    return True
+                # Preparation never changed routing or service registrations.
+                phase = data.get('preparation_previous_phase', 'active')
+                services.save(phase=phase, committed=data.get('preparation_previous_committed', False))
+                if phase == 'active':
+                    return False
+                data = read_json(path)
     if data.get('phase') in ('closing', 'failed', 'resuming'):
         services.stop_proxy()
         data = read_json(path)
@@ -526,9 +675,9 @@ def resume_proxy(manager):
             return True
         source = data.get('source')
         if not source:
-            services.save(phase='active', resume=False)
-            return True
-        if not target.stopped(source):
+            raise RuntimeError('이전 프록시의 실행 정보를 확인하지 못해 연결 재개를 보류했습니다.')
+        if not target.stopped(source) and not (data.get('shutdown_incomplete')
+                and data.get('shutdown_incomplete_instance') == source.get('instance') and target.released(source)):
             raise RuntimeError('이전 프로세스 종료 확인 후에만 재개할 수 있습니다.')
         command = target.replacement(source)
         services.save(phase='resuming')

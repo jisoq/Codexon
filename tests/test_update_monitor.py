@@ -268,11 +268,15 @@ def test_dashboard_badge_notification_routes_mute_and_explicit_check(endpoint,tm
         assert window.update_available.isVisible() and len(messages)==count
         restarted.check_manually();settle(lambda:len(e.requests)==2)
         started=time.perf_counter();window.quit_app()
-        assert time.perf_counter()-started<.5 and restarted.reply is None
+        assert time.perf_counter()-started<.5
+        settle(lambda:window.quitting)
+        assert restarted.reply is None
     finally:
         monitor.stop()
         if window.update_panel.operation:window.update_panel.operation.wait()
-        window.quit_app();set_language('ko');e.app.setProperty('cachemonitorDisableShellIntegration',previous)
+        if not window.quitting:
+            window.quit_app();settle(lambda:window.quitting)
+        set_language('ko');e.app.setProperty('cachemonitorDisableShellIntegration',previous)
 
 
 @pytest.mark.parametrize('installed',[True,False])
@@ -311,3 +315,45 @@ def test_cached_offer_install_prepares_selected_release_without_network(endpoint
         if getattr(panel,'dialog',None):panel.dialog.reject()
         if panel.operation:panel.operation.wait()
         panel.deleteLater();e.app.processEvents()
+
+
+def test_explicit_update_continuation_waits_for_service_readiness_and_runs_once():
+    from PySide6.QtCore import QObject,Signal
+    from cachemonitor.app import continue_update_when_ready
+    app=QApplication.instance() or QApplication([])
+    class Controller(QObject):
+        result=Signal(dict)
+    class Operation(QObject):
+        finished=Signal()
+        def isFinished(self):return False
+    controller=Controller();operation=Operation();controller.operation=operation
+    calls=[];services=SimpleNamespace(active=False,collection=True)
+    window=SimpleNamespace(service_controller=controller,app_services=services,manage_observer=True,
+        update_panel=SimpleNamespace(continue_update=calls.append),_closing=False)
+    operation_id='b'*32
+    continue_update_when_ready(window,operation_id)
+    controller.result.emit({'error':'not ready'});app.processEvents()
+    assert not calls
+    services.active=True;controller.result.emit({'collection_issue':'still adopting'});app.processEvents()
+    assert not calls
+    controller.result.emit({});app.processEvents()
+    assert not calls
+    controller.operation=None;operation.finished.emit()
+    settle(lambda:calls==[operation_id])
+    controller.result.emit({});app.processEvents();assert calls==[operation_id]
+    controller.deleteLater();operation.deleteLater();app.processEvents()
+
+
+def test_ordinary_gui_startup_does_not_continue_deferred_update():
+    from PySide6.QtCore import QObject,Signal
+    from cachemonitor.app import continue_update_when_ready
+    app=QApplication.instance() or QApplication([])
+    class Controller(QObject):
+        result=Signal(dict)
+    controller=Controller();controller.operation=None;calls=[]
+    window=SimpleNamespace(service_controller=controller,app_services=SimpleNamespace(active=True,collection=False),
+        manage_observer=False,update_panel=SimpleNamespace(continue_update=calls.append),_closing=False)
+    continue_update_when_ready(window,None)
+    controller.result.emit({});app.processEvents()
+    assert not calls
+    controller.deleteLater();app.processEvents()

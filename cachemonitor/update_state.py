@@ -89,7 +89,7 @@ class UpdateState:
             self.write(value)
             return True
 
-    def installed(self, operation_id, product, manifest, *, scope=None):
+    def installed(self, operation_id, product, manifest, *, scope=None, recovered=False):
         """Called only after installer runtime/hash/activation checks have passed."""
         product = Path(product).resolve()
         if not product.is_relative_to(self.root / 'versions'):
@@ -102,19 +102,37 @@ class UpdateState:
                 return None
             if value['target_version'] != manifest['version']:
                 raise ValueError('요청한 버전과 설치 결과가 다릅니다.')
+            app=dict(state='verified', version=manifest['version'],
+                     executable=str(product / 'Codexon.exe'), sha256=manifest['sha256'],
+                     commit=manifest['commit'])
+            if recovered:
+                if scope != value.get('scope'):
+                    return None
+                if value.get('app') == app:
+                    return operation_id
+                if value.get('phase') != 'installing' or value.get('app',{}).get('state') == 'verified':
+                    return None
             value.update(phase='waiting', scope=scope or value.get('scope'), cancel_requested=False,
-                         app=dict(state='verified', version=manifest['version'],
-                                  executable=str(product / 'Codexon.exe'), sha256=manifest['sha256'],
-                                  commit=manifest['commit']))
+                         app=app)
             self.write(value)
             return operation_id
 
-    def proxy_result(self, operation_id, result):
+    def proxy_result(self, operation_id, result, *, replay=False):
         with ProcessLock(self.lock, timeout=5):
             value = self.read()
             if value.get('operation_id') != operation_id:
                 return False
+            if result.get('operation_id', operation_id) != operation_id:
+                return False
+            if result.get('target_app_version') and result['target_app_version'] != value.get('target_version'):
+                return False
             if result.get('scope') and value.get('scope') and result['scope'] != value['scope']:
+                return False
+            if replay and not matches_proxy_target(value, result):
+                return False
+            previous = value.get('proxy', {})
+            if (result.get('updated_at') and previous.get('updated_at')
+                    and result['updated_at'] < previous['updated_at']):
                 return False
             phase = result.get('phase', '')
             app_done = value.get('app', {}).get('state') in ('verified', 'current')
@@ -130,6 +148,9 @@ class UpdateState:
             elif phase == 'cancelled':
                 mapped = 'deferred' if app_done or value.get('defer_requested') else 'cancelled'
             if phase=='recovery_required':mapped='partial' if app_done else 'failed'
+            if (value.get('phase') == mapped and previous == result
+                    and not value.get('cancel_requested')):
+                return True
             value.update(phase=mapped, proxy=dict(result), required_action=result.get('required_action'),
                          message=result.get('message', ''))
             if phase in ('complete','off','cancelled','failed'):value['cancel_requested']=False
@@ -140,6 +161,32 @@ class UpdateState:
         value = self.read()
         phase = 'partial' if value.get('app', {}).get('state') == 'verified' else 'failed'
         return self.change(operation_id, phase=phase, message=str(message))
+
+
+def matches_proxy_target(record, result):
+    """Only replay evidence bound to the requested operation, connection and build."""
+    if (not record.get('scope') or result.get('scope') != record['scope']
+            or result.get('operation_id') != record.get('operation_id')):
+        return False
+    app = record.get('app', {})
+    previous = record.get('proxy', {})
+    expected = (dict(executable=app.get('executable'), sha256=app.get('sha256'),
+                     commit=app.get('commit')) if app.get('state') == 'verified'
+                else previous.get('distribution'))
+    actual = result.get('distribution')
+    if actual and expected:
+        if any(not expected.get(key) or actual.get(key) != expected[key]
+               for key in ('executable', 'sha256', 'commit')):
+            return False
+    elif result.get('phase') == 'complete':
+        return False
+    target_app = result.get('target_app_version')
+    if target_app:
+        return target_app == record.get('target_version')
+    # Older workers did not publish the app version. Their independently
+    # verified deployment is sufficient only when the requested build matches.
+    return bool(actual and expected and result.get('target_version')
+                and result.get('target_version') == previous.get('target_version'))
 
 
 def scope_for(manager):

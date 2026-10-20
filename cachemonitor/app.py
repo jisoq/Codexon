@@ -52,6 +52,32 @@ def request_login_startup(window, *, initial=False, isolated=False):
         window.service_controller.request_login_launch(launch)
 
 
+def continue_update_when_ready(window,operation_id):
+    """Consume an explicit replacement request after service adoption finishes."""
+    if operation_id is None:return
+    from .update_state import valid_id
+    if not valid_id(operation_id):raise ValueError('Invalid update continuation operation')
+    controller=window.service_controller
+    state=dict(done=False,ready=not (window.manage_observer or window.app_services.collection),waiting=None)
+    def deliver():
+        if state['done'] or not state['ready'] or getattr(window,'_closing',False):return
+        operation=controller.operation
+        if operation is not None:
+            if operation.isFinished():
+                QTimer.singleShot(0,deliver);return
+            if state['waiting'] is not operation:
+                state['waiting']=operation;operation.finished.connect(deliver)
+            return
+        if (window.manage_observer or window.app_services.collection) and not window.app_services.active:return
+        state['done']=True;controller.result.disconnect(observed)
+        window.update_panel.continue_update(operation_id)
+    def observed(result):
+        state['ready']=not result.get('error') and not result.get('collection_issue')
+        if state['ready']:QTimer.singleShot(0,deliver)
+    controller.result.connect(observed)
+    QTimer.singleShot(0,deliver)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Read-only Codex cache monitor")
     parser.add_argument('--version',action='version',version=VERSION)
@@ -62,6 +88,7 @@ def main():
     controls.add_argument('--test-model-observer',action='store_true')
     parser.add_argument('--control-report',help='Save observer control result to JSON')
     parser.add_argument('--replace-gui',action='store_true',help=argparse.SUPPRESS)
+    parser.add_argument('--continue-update',help=argparse.SUPPRESS)
     parser.add_argument('--verify-handoff',type=Path,help=argparse.SUPPRESS)
     parser.add_argument('--verify-services',action='store_true',help=argparse.SUPPRESS)
     parser.add_argument('--managed-services',action='store_true',help=argparse.SUPPRESS)
@@ -78,6 +105,10 @@ def main():
     parser.add_argument("--smoke-depth", choices=('core','full'), default='full',
                         help="Choose the compact release check or full interaction probe")
     args = parser.parse_args()
+    if args.continue_update is not None:
+        from .update_state import valid_id
+        if not args.replace_gui or not valid_id(args.continue_update):
+            parser.error('Update continuation requires GUI replacement and a valid operation ID')
     if args.verify_services and not args.verify_handoff:
         parser.error('Service verification requires isolated handoff verification')
     explicit_index = args.index_path
@@ -163,17 +194,19 @@ def main():
             client.write(b"update-exit" if args.replace_gui else b"windows-startup" if args.windows_startup else b"show")
             client.waitForBytesWritten(400)
             if not args.replace_gui:return 0
-            from .app_restart import handoff_ready
+            from .app_restart import handoff_ready, REPLACEMENT_TIMEOUT
             if not handoff_ready(client):
-                QMessageBox.information(None,'Codexon',tr('새 버전이 설치되었습니다. 기존 Codexon을 트레이에서 종료한 뒤 시작 메뉴에서 다시 여세요. Codex 연결은 유지됩니다.'))
+                QMessageBox.information(None,'Codexon',tr('앱을 다시 시작하지 못했습니다. 기존 Codexon은 계속 사용할 수 있습니다. 진행 중인 설정 변경이 끝난 뒤 다시 시도하세요.'))
                 return 4
-            client.waitForDisconnected(15000)
-            deadline=time.monotonic()+20
+            deadline=time.monotonic()+REPLACEMENT_TIMEOUT
+            client.waitForDisconnected(min(15000,max(1,int((deadline-time.monotonic())*1000))))
             while time.monotonic()<deadline:
                 probe=QLocalSocket();probe.connectToServer(server_name)
                 if not probe.waitForConnected(200):break
                 probe.disconnectFromServer();time.sleep(.2)
-            else:return 4
+            else:
+                QMessageBox.information(None,'Codexon',tr('앱을 다시 시작하지 못했습니다. 기존 Codexon은 계속 사용할 수 있습니다. 잠시 후 다시 시도하세요.'))
+                return 4
         QLocalServer.removeServer(server_name)
         if not server.listen(server_name):
             QMessageBox.warning(None, "Codexon", tr("실행 중인 앱 상태를 확인할 수 없습니다."))
@@ -206,18 +239,16 @@ def main():
     window.service_controller.result.connect(report_login_launch)
     from .overlay import install_overlay
     install_overlay(window, native_enabled=not (args.smoke or args.verify_handoff))
-    def restart():
+    def restart(*,executable=None,continue_update=None):
         from .app_restart import launch_replacement
-        try:launch_replacement(homes,index_path=args.index_path,handoff=args.verify_handoff,evidence_path=args.evidence_path,quota_path=args.quota_path,managed_services=not isolated)
-        except OSError:
+        try:launch_replacement(homes,index_path=args.index_path,handoff=args.verify_handoff,evidence_path=args.evidence_path,quota_path=args.quota_path,managed_services=not isolated,executable=executable,continue_update=continue_update)
+        except (OSError,ValueError):
             window.settings_page.refresh_restart()
             QMessageBox.warning(window,'Codexon',tr('앱을 다시 시작하지 못했습니다. 다시 시도해 주세요.'))
     window.settings_page.restartRequested.connect(restart)
+    window.update_panel.continue_app_requested.connect(lambda request:restart(
+        executable=request['executable'],continue_update=request['verified_operation_id']))
     app.aboutToQuit.connect(window.observer_panel.stop)
-    def finish_update():
-        operation=window.update_panel.operation
-        if operation and operation.isRunning():operation.wait()
-    app.aboutToQuit.connect(finish_update)
     from .update_monitor import UpdateMonitor, production_updates_allowed
     if production_updates_allowed(isolated=bool(isolated or args.smoke or args.verify_handoff or args.verify_services)):
         monitor=UpdateMonitor(window.settings,window)
@@ -237,23 +268,20 @@ def main():
                 if window.observer_panel.busy() or getattr(window,'_closing',False):
                     client.write(b'busy');client.flush()
                 else:
+                    from .app_restart import HANDOFF_TIMEOUT
+                    deadline=time.monotonic()+HANDOFF_TIMEOUT
                     client.write(b'ready-to-exit');client.flush()
-                    QTimer.singleShot(100,lambda:window.quit_app(handoff=True))
+                    QTimer.singleShot(100,lambda:window.quit_app(handoff=True,handoff_deadline=deadline))
             elif command==b'verify-quit' and args.verify_services:
                 client.write(b'quitting');client.flush()
                 QTimer.singleShot(100,window.quit_app)
             elif command in (b'verify-exit-safe',b'verify-exit-force') and args.verify_services:
-                dialog=getattr(window,'exit_confirmation',None)
                 progress=getattr(window,'shutdown_dialog',None)
-                if dialog and dialog.host:
-                    from .quick_qa import control,click
-                    button=dialog.force if command==b'verify-exit-force' else dialog.confirm
-                    assert button.isEnabled()
-                    dialog.host.grab().save(str(args.verify_handoff.with_suffix('.exit.png')))
-                    click(dialog.host,control(dialog.host,button))
-                    client.write(b'accepted')
-                elif progress and command==b'verify-exit-force' and progress.force.isEnabled():
+                if progress and command==b'verify-exit-force' and progress.force.isEnabled():
                     progress.force.click();client.write(b'accepted')
+                elif progress and command==b'verify-exit-safe':
+                    progress.grab().save(str(args.verify_handoff.with_suffix('.exit.png')))
+                    client.write(b'accepted')
                 else:client.write(b'waiting')
                 client.flush()
             elif command==b'verify-settings-restart' and args.verify_handoff:
@@ -300,4 +328,5 @@ def main():
         # Cleanup can only follow this GUI's event-loop startup and the service
         # controller's independently verified readiness, never a launch request.
         QTimer.singleShot(0,lambda:setattr(window.app_services,'gui_ready',True))
+    continue_update_when_ready(window,args.continue_update)
     return app.exec()

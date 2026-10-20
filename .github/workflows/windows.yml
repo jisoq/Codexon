@@ -24,11 +24,9 @@ on:
 permissions:
   contents: read
   actions: read
-# Ordinary branch/PR work is replaceable. Explicit release requests have their
-# own run group, so even a pending candidate is protected from a newer push.
 concurrency:
-  group: windows-${{ (inputs.prepare || inputs.publish) && format('release-{0}-{1}', github.sha, github.run_id) || format('ci-{0}', github.event.pull_request.number || github.ref) }}
-  cancel-in-progress: ${{ !(inputs.prepare || inputs.publish) }}
+  group: windows-${{ github.event.pull_request.number || github.ref }}-${{ github.sha }}
+  cancel-in-progress: false
 env:
   PYTHONUTF8: '1'
   PYTHONIOENCODING: utf-8
@@ -67,13 +65,59 @@ jobs:
           $sourceBase = if ($env:SOURCE_BASE) { $env:SOURCE_BASE } elseif ($env:EVENT_NAME -eq 'pull_request') { $env:PR_BASE } else { '' }
           python tools/ci_plan.py "--base=$packageBase" "--source-base=$sourceBase" --candidate "$env:RELEASE_CANDIDATE" --extended "$env:EXTENDED" --release-plan artifacts/verification/release-plan.json
           exit $LASTEXITCODE
-  source:
+  native:
     needs: resolve
-    if: fromJSON(needs.resolve.outputs.plan).verify
+    if: fromJSON(needs.resolve.outputs.plan).verify && fromJSON(needs.resolve.outputs.plan).rust
+    runs-on: windows-latest
+    timeout-minutes: 10
+    env:
+      CHECK_PLAN: ${{ needs.resolve.outputs.plan }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12.10'
+      - name: Check the planned environment before compilation
+        run: python tools/release_pipeline.py source-environment
+      - name: Identify the exact native build
+        id: native-key
+        shell: pwsh
+        run: |
+          $key = python tools/build_native.py --cache-key
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "key=$key" >> $env:GITHUB_OUTPUT
+      - uses: actions/cache/restore@v5
+        id: native-cache
+        with:
+          path: |
+            cachemonitor/_cpu_native.pyd
+            cachemonitor/_cpu_native.build.json
+          key: ${{ steps.native-key.outputs.key }}
+      - name: Reuse or build and test the locked Rust extension
+        run: python tools/build_native.py --reuse --test
+      - uses: actions/cache/save@v5
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        with:
+          path: |
+            cachemonitor/_cpu_native.pyd
+            cachemonitor/_cpu_native.build.json
+          key: ${{ steps.native-key.outputs.key }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: native-${{ github.sha }}-${{ github.run_id }}
+          path: |
+            cachemonitor/_cpu_native.pyd
+            cachemonitor/_cpu_native.build.json
+          retention-days: 30
+          overwrite: true
+          if-no-files-found: error
+  source:
+    needs: [resolve, native]
+    if: always() && needs.resolve.result == 'success' && fromJSON(needs.resolve.outputs.plan).verify && (needs.native.result == 'success' || needs.native.result == 'skipped')
     runs-on: windows-latest
     timeout-minutes: 25
     env:
-      CODEXON_CPU_BACKEND: rust
+      CODEXON_CPU_BACKEND: ${{ fromJSON(needs.resolve.outputs.plan).rust && 'rust' || 'auto' }}
       CHECK_PLAN: ${{ needs.resolve.outputs.plan }}
     steps:
       - uses: actions/checkout@v7
@@ -84,18 +128,27 @@ jobs:
           python-version: '3.12.10'
           cache: pip
           cache-dependency-path: requirements-release.lock
+      - name: Check the planned environment before source setup
+        run: python tools/release_pipeline.py source-environment
+      - uses: actions/download-artifact@v8
+        if: fromJSON(needs.resolve.outputs.plan).rust
+        with:
+          name: native-${{ github.sha }}-${{ github.run_id }}
+          path: cachemonitor/
+      - name: Validate the shared tested Rust extension
+        if: fromJSON(needs.resolve.outputs.plan).rust
+        run: python tools/build_native.py --check --test
       - name: Install locked dependencies
+        if: join(fromJSON(needs.resolve.outputs.plan).tests, '') != ''
         run: python -m pip install -r requirements-release.lock
       - name: Check source and test environment before running checks
+        if: join(fromJSON(needs.resolve.outputs.plan).tests, '') != ''
         run: python tools/check_environment.py
       - name: Restore the immutable check plan
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force artifacts/verification | Out-Null
           $env:CHECK_PLAN | Set-Content -Encoding utf8 artifacts/verification/plan.json
-      - name: Build and test the locked Rust extension
-        if: fromJSON(needs.resolve.outputs.plan).rust
-        run: python tools/build_native.py --test
       - name: Run selected source checks
         timeout-minutes: 15
         shell: pwsh
@@ -144,8 +197,8 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
   package_build:
-    needs: [resolve, source]
-    if: fromJSON(needs.resolve.outputs.plan).package
+    needs: [resolve, native]
+    if: always() && needs.resolve.result == 'success' && needs.native.result == 'success' && fromJSON(needs.resolve.outputs.plan).verify && fromJSON(needs.resolve.outputs.plan).package
     runs-on: windows-latest
     timeout-minutes: 25
     env:
@@ -159,6 +212,14 @@ jobs:
           python-version: '3.12.10'
           cache: pip
           cache-dependency-path: requirements-release.lock
+      - name: Check the planned environment before build setup
+        run: python tools/release_pipeline.py source-environment
+      - uses: actions/download-artifact@v8
+        with:
+          name: native-${{ github.sha }}-${{ github.run_id }}
+          path: cachemonitor/
+      - name: Validate the shared tested Rust extension
+        run: python tools/build_native.py --check --test
       - name: Install locked dependencies
         run: python -m pip install -r requirements-release.lock
       - name: Check source and test environment before running checks
@@ -186,7 +247,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           .\tools\Build-Installer.ps1 -ProductDir dist-ci/bad-runtime -OutputDir dist-ci/qa-bad-runtime -Compiler $compiler.FullName -Isolated
       - name: Build release installer before validation
-        if: fromJSON(needs.resolve.outputs.plan).candidate
+        if: fromJSON(needs.resolve.outputs.plan).release_artifact
         shell: pwsh
         run: |
           $compiler = Get-ChildItem "${env:ProgramFiles(x86)}\Inno Setup*\ISCC.exe" | Select-Object -First 1
@@ -231,6 +292,8 @@ jobs:
           python-version: '3.12.10'
           cache: pip
           cache-dependency-path: requirements-release.lock
+      - name: Check the planned environment before package setup
+        run: python tools/release_pipeline.py source-environment
       - name: Install locked dependencies
         run: python -m pip install -r requirements-release.lock
       - name: Check source and test environment before running checks
@@ -297,13 +360,13 @@ jobs:
         if: fromJSON(needs.resolve.outputs.plan).package
         run: python tools/package_release.py --product dist-ci/Codexon --validate-only
       - name: Seal the fully verified release candidate
-        if: fromJSON(needs.resolve.outputs.plan).candidate
+        if: fromJSON(needs.resolve.outputs.plan).release_artifact
         shell: pwsh
         run: |
           python tools/release_pipeline.py seal --folder dist-ci/release --product dist-ci/Codexon
           exit $LASTEXITCODE
       - name: Retain the verified installer for later publication
-        if: fromJSON(needs.resolve.outputs.plan).candidate
+        if: fromJSON(needs.resolve.outputs.plan).release_artifact
         uses: actions/upload-artifact@v7
         with:
           name: verified-release-${{ github.sha }}
@@ -325,7 +388,7 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
   verify:
-    needs: [resolve, source, package_build, package_verify]
+    needs: [resolve, native, source, package_build, package_verify]
     if: always()
     runs-on: ubuntu-latest
     steps:

@@ -34,14 +34,16 @@ class UpdateOperation(QThread):
 class UpdatePanel(Group):
     attention_changed=Signal(bool)
     fault_changed=Signal(object)
+    continue_app_requested=Signal(object)
 
     def __init__(self,manager,parent=None):
         super().__init__(parent)
         self.manager=manager;self.owner=parent;self.operation=None;self.monitor=None
         self.metadata_pending=False;self.checking=False;self.operation_error=False
         self.offer=None;self.discovered_offer=None;self.proxy_update={};self.record={}
-        self.pending_plan=None;self.auto_start=False
-        self.next_recovery_check=0;self._stopped=False;self._journal_signature=None
+        self.pending_plan=None;self.auto_start=False;self._continue_app=None
+        self._continue_pending=None;self._continued_operations=set();self._deferred_metadata=[]
+        self.next_recovery_check=0;self._stopped=False;self._exit_pending=False;self._journal_signature=None
         from .installation import installed
         from .update_state import state_for
         import sys
@@ -103,7 +105,15 @@ class UpdatePanel(Group):
             self.checking=False;self.launch_operation(self.manager.status)
 
     def closing(self):
-        return self._stopped or bool(getattr(self.owner,'_closing',False))
+        return self._stopped or self._exit_pending or bool(getattr(self.owner,'_closing',False))
+
+    def set_exit_pending(self, pending):
+        self._exit_pending=bool(pending)
+        if not pending:
+            self.button.setEnabled(not self.operation and not self.metadata_pending)
+            self.execute.setEnabled(not self.operation)
+            self.recheck.setEnabled(not self.operation)
+        self.refresh()
 
     def stop(self):
         self._stopped=True;self.timer.stop();self.recovery_timer.stop()
@@ -147,8 +157,10 @@ class UpdatePanel(Group):
 
     def metadata_received(self,result):
         if not self.metadata_pending:return
+        if self.closing():
+            self._deferred_metadata=[result]
+            return
         self.metadata_pending=False
-        if self.closing():return
         if isinstance(result,Exception):self.receive_result(result);self.finished();return
         from .app_update import check_update
         self.launch_operation(lambda:check_update(self.status_progress,self.manager,release=result))
@@ -158,13 +170,15 @@ class UpdatePanel(Group):
         if operation:operation.progress.emit(text)
 
     def receive_result(self,result):
-        if self.closing():return
+        if self._stopped:return
         if isinstance(result,Exception):
             self.auto_start=False;self.operation_error=True;self.offer=None
             self.status.setText(failure_message(result,self.checking));self.status.setToolTip(str(result));self.status.put(color=self.status_color(True))
             self.execute.hide();self.version.hide();self.components.hide();self.button.show()
             self.fault_changed.emit(dict(checking_failed=bool(self.checking),
                 phase=None if self.checking else 'failed',operation_error=True))
+        elif isinstance(result,dict) and result.get('kind')=='continue_app':
+            self._continue_app=result
         elif isinstance(result,dict) and 'operation_id' in result:
             self.record=result;self.offer=None
         elif isinstance(result,dict) and ('configured' in result or 'health' in result):self.proxy_status(result)
@@ -183,6 +197,36 @@ class UpdatePanel(Group):
             if plan and plan['kind'] in ('app','proxy'):self.request_install();return
         self.button.setEnabled(True);self.execute.setEnabled(True)
         self.reload_record(force=True);self.render_record()
+        continuation=self._continue_app;self._continue_app=None
+        if (continuation and not self.closing()
+                and continuation['verified_operation_id']==self.record.get('operation_id')
+                and continuation['executable']==self.record.get('app',{}).get('executable')):
+            self.continue_app_requested.emit(dict(executable=continuation['executable'],
+                                                 verified_operation_id=continuation['verified_operation_id']))
+        self._start_continuation()
+
+    def continue_update(self,operation_id):
+        from .update_state import valid_id
+        if self._stopped or not valid_id(operation_id) or operation_id in self._continued_operations:
+            return False
+        self._continue_pending=operation_id
+        return self._start_continuation()
+
+    def _start_continuation(self):
+        operation_id=self._continue_pending
+        if not operation_id or self.closing():return False
+        if self.operation or self.metadata_pending:return True
+        self.reload_record(force=True)
+        if (self.record.get('operation_id')!=operation_id
+                or self.record.get('phase') not in ('partial','failed','deferred','interrupted')
+                or self.record.get('app',{}).get('state')!='verified'):
+            self._continue_pending=None
+            return False
+        self._continue_pending=None;self._continued_operations.add(operation_id)
+        from .app_update import retry_proxy
+        self.checking=False;self.operation_error=False
+        self.launch_operation(lambda:retry_proxy(self.manager,self.journal,verified_operation_id=operation_id))
+        return self.operation is not None
 
     def show_plan(self,plan,**_):
         self.offer=plan;self.operation_error=False;self.status.put(color='muted');self.render_offer()
@@ -201,8 +245,20 @@ class UpdatePanel(Group):
             self.status.setText('앱은 최신 버전입니다. Codex 연결 상태를 확인하세요.')
         self.components.hide()
 
+    def needs_new_app(self):
+        import sys
+        from pathlib import Path
+        app=self.record.get('app',{})
+        return (self.record.get('phase') in ('partial','failed','deferred','interrupted')
+                and app.get('state')=='verified' and app.get('executable')
+                and Path(app['executable']).resolve()!=Path(sys.executable).resolve())
+
     def request_install(self):
         if self.busy() or self.closing():return
+        if self.needs_new_app():
+            from .app_update import continuation_target
+            self.checking=False;self.operation_error=False
+            self.launch_operation(lambda:continuation_target(self.journal,self.manager));return
         if self.record.get('phase') in ('partial','failed','deferred','interrupted') and self.record.get('app',{}).get('state') in ('verified','current'):
             from .app_update import retry_proxy
             self.checking=False;self.operation_error=False
@@ -217,9 +273,10 @@ class UpdatePanel(Group):
         self.launch_operation(lambda:update(self.status_progress,self.manager,plan=plan))
 
     def cancel_update(self,later):
-        if not self.journal or not self.journal.cancel(later=later):return
+        if self.closing() or not self.journal or not self.journal.cancel(later=later):return
         self.reload_record(force=True);phase=self.record.get('phase')
-        if phase in ('waiting','needs_exit') and self.manager:self.manager.cancel_update()
+        if phase in ('waiting','needs_exit') and self.manager and not self.operation:
+            self.checking=False;self.launch_operation(self.manager.cancel_update)
         self.render_record()
         self.cancel.setEnabled(False);self.later.setEnabled(False)
         self.status.setText('나중에 적용하도록 마무리합니다.' if later else '업데이트 취소 중…')
@@ -229,13 +286,10 @@ class UpdatePanel(Group):
         unknown=((result.get('health') or {}).get('websocket_states') or {}).get('unknown',0)
         if self.proxy_update.get('phase')=='waiting' and unknown:
             self.proxy_update={**self.proxy_update,'required_action':'close_client','unknown_connections':unknown}
-        if self.journal and self.proxy_update.get('phase')=='interrupted':
-            operation_id=self.proxy_update.get('operation_id')
-            if operation_id:self.journal.proxy_result(operation_id,self.proxy_update)
         self.refresh()
 
     def reload_record(self,*,force=False):
-        if not self.journal or self.closing():return
+        if not self.journal or self._stopped:return
         path=self.journal.path
         try:
             state=path.stat()
@@ -256,7 +310,10 @@ class UpdatePanel(Group):
             self._journal_signature=signature if self.record or signature[1] is None else None
 
     def refresh(self,*_):
-        if self.closing():return
+        if self._stopped:return
+        if self._deferred_metadata and not self.closing():
+            result=self._deferred_metadata.pop()
+            self.metadata_received(result)
         self.reload_record();self.render_record()
 
     def recover(self):
@@ -264,7 +321,8 @@ class UpdatePanel(Group):
         record=self.record;phase=record.get('phase');proxy=record.get('proxy',{})
         legacy_wait=phase in ('waiting','needs_exit') and proxy.get('source_instance') and not proxy.get('operation_id')
         self.recovery_timer.stop()
-        if not self.journal or self.operation or not (phase in ('preparing','downloading','installing') or legacy_wait):return
+        from .update_state import ACTIVE
+        if not self.journal or self.operation or not (phase in ACTIVE or legacy_wait):return
         remaining=self.next_recovery_check-time.monotonic()
         if remaining>0:
             self.recovery_timer.start(max(1,int(remaining*1000)+1));return
@@ -273,8 +331,14 @@ class UpdatePanel(Group):
         self.checking=False;self.launch_operation(lambda:reconcile_update(self.journal,self.manager))
 
     def render_record(self):
+        self._render_record()
+        if self.closing():
+            for control in (self.button,self.execute,self.recheck,self.cancel,self.later):
+                control.setEnabled(False)
+
+    def _render_record(self):
         from .update_state import ACTIVE,CRITICAL
-        if self.closing():return
+        if self._stopped:return
         self.recover()
         record=self.record;phase=record.get('phase');proxy=record.get('proxy',{})
         if not record and self.proxy_update.get('phase') in ('queued','waiting','switching','stopping','starting','verifying','rollback','interrupted','failed'):
@@ -299,7 +363,7 @@ class UpdatePanel(Group):
         self.button.setVisible(not active and not attention)
         self.button.setEnabled(not self.operation and not self.metadata_pending)
         self.execute.setVisible(attention and not active and record.get('app',{}).get('state') in ('verified','current'))
-        self.execute.setText('다시 적용');self.execute.setEnabled(not self.operation)
+        self.execute.setText('새 앱으로 계속' if self.needs_new_app() else '다시 적용');self.execute.setEnabled(not self.operation)
         self.version.hide()
         headings={'preparing':'업데이트 준비','downloading':'업데이트 준비','installing':'앱 설치 중',
                   'queued':'응답 마무리 대기','waiting':'응답 마무리 대기','needs_exit':'연결한 앱 종료 필요',

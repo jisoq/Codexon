@@ -432,9 +432,11 @@ class ObserverManager:
             updater=ProxyUpdate(self)
             task=ObserverTask(home_key(self.home),role='ProxyUpdate')
             current=read_json(updater.path)
-            if current.get('phase') in BUSY and (task.inspect().get('state') in (2,4)
-                    or time.time()-current.get('updated_at',0)<30):
-                return self.status()
+            if current.get('phase') in BUSY:
+                from .proxy_update import updater_released
+                recent=time.time()-current.get('updated_at',0)<30 and not current.get('owner_interrupted')
+                if recent or not updater_released(self,current):
+                    return self.status()
             prior=read_json(updater.path)
             recovering=bool(prior.get('source')) and not prior.get('restored') and prior.get('phase') in (*BUSY,'failed')
             health=self.health(timeout=3)
@@ -453,7 +455,8 @@ class ObserverManager:
                                 scope=updater.target.scope,
                                 message='프록시 업데이트 예약 중…')
             elif operation_id:
-                updater.publish(prior['phase'],operation_id=operation_id,update_root=str(update_root),cancel_requested=False)
+                updater.publish('waiting' if prior['phase']=='failed' else prior['phase'],
+                                operation_id=operation_id,update_root=str(update_root),cancel_requested=False)
             try:task.start(command,autostart=False)
             except Exception:
                 updater.publish('failed',message='업데이트 예약 실패: 기존 연결 유지 중');raise
@@ -469,11 +472,10 @@ class ObserverManager:
         return self.status()
 
     def update_status(self):
-        from .proxy_update import BUSY
-        update=read_json(self.directory/'proxy-update.json')
-        if update.get('phase') in BUSY and time.time()-update.get('updated_at',0)>90:
-            update={**update,'phase':'interrupted','message':'업데이트가 중단되었습니다. 다시 눌러 복구할 수 있습니다.'}
-        return update
+        # Status reads run on UI paths too. Owner reconciliation performs the
+        # process/task/lock probes asynchronously before persisting interruption.
+        from .proxy_update import projected_status
+        return projected_status(read_json(self.directory/'proxy-update.json'))
 
     def running_path(self,health):
         if not health or not isinstance(health.get('pid'),int):return None
@@ -540,7 +542,12 @@ class ObserverManager:
         if state.get('phase')=='recovery_failed':phase='recovery_failed'
         elif not configured and state.get('phase') in ('faulted','failed'):phase=state['phase']
         elif not configured and runtime.get('phase')=='draining':phase='draining'
+        from .proxy_target import ProxyTarget
+        services=read_json(self.directory/'app-services.json')
+        service_phase=services.get('phase') if services.get('scope')==ProxyTarget(self).scope else None
+        if service_phase in ('preparing','closing'):phase=service_phase
         return {'enabled':bool(configured),'configured':configured,'running':health is not None,'validated':valid,'phase':phase,
+                'service_phase':service_phase,
                 'health':health,'service_issue':issue,'evidence_path':str(self.evidence),
                 'probe_state':self.health_state,'url':self.url,'runtime':runtime,'app_version':VERSION,
                 'update':update,

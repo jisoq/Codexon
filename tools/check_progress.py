@@ -7,6 +7,20 @@ from pathlib import Path
 import pytest
 
 
+def pytest_addoption(parser):
+    parser.addoption('--affected-test', action='append', default=[],
+                     help='Include this affected integration contract in the essential sweep')
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_collection_modifyitems(config, items):
+    affected = config.getoption('--affected-test')
+    for item in items:
+        if any(item.nodeid == target or item.nodeid.startswith(target + '::')
+               or item.nodeid.startswith(target + '[') for target in affected):
+            item.add_marker('essential')
+
+
 @pytest.hookimpl(hookwrapper=True)
 def pytest_fixture_setup(fixturedef, request):
     outcome = yield

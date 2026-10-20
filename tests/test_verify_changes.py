@@ -40,6 +40,91 @@ def test_small_ui_changes_select_their_consumer_without_backend_or_package_check
     assert plan['tests'] == ('tests/test_public_release.py',)
 
 
+def test_settings_and_comparison_changes_keep_wiring_without_selecting_unrelated_workflows():
+    settings=select_tests({'cachemonitor/settings_page.py'})
+    assert 'tests/test_settings.py' in settings['tests']
+    assert 'tests/test_theme_tokens.py::test_quick_theme_selection_updates_overlay_and_preserves_state' in settings['tests']
+    assert 'tests/test_app_errors.py::test_sidebar_errors_remain_visible_across_pages_and_do_not_show_main_banner' in settings['tests']
+    assert not any(test.split('::')[0] in ('tests/test_history_explorer.py', 'tests/test_comparison_workflow.py',
+                                          'tests/test_observer_control.py') for test in settings['tests'])
+    comparison=select_tests({'cachemonitor/qml/UsageDashboard.qml'})
+    assert {'tests/test_comparison_workflow.py', 'tests/test_dashboard_readability.py'} <= set(comparison['tests'])
+    assert 'tests/test_dashboard_evidence.py::test_tab_loading_keeps_controls_and_ignores_stale_result' in comparison['tests']
+    assert not any(test.split('::')[0] in ('tests/test_history_explorer.py', 'tests/test_home.py',
+                                          'tests/test_display_scaling.py') for test in comparison['tests'])
+    query=select_tests({'cachemonitor/prepared_query.py'})
+    assert 'tests/test_prepared_analysis.py' in query['tests']
+    assert 'tests/test_history_timeline_data.py' in query['tests']
+    assert 'tests/test_ui.py::test_sequential_drilldown_and_full_call_detail' in query['tests']
+    assert 'tests/test_history_explorer.py::test_session_chart_selection_detail_and_back_preserve_scope' in query['tests']
+    assert 'tests/test_history_explorer.py' not in query['tests']
+    assert not any(test.endswith('test_overlay_controls.py') for test in query['tests'])
+
+
+def test_tool_contracts_run_without_desktop_or_native_build_but_unknown_contracts_keep_native_gate():
+    from tools.verify_changes import tests_require_native
+    tools=['tests/test_verify_changes.py', 'tests/test_build_native.py', 'tests/test_prepare_sources.py',
+           'tests/test_release_pipeline.py', 'tests/test_collect_notices.py', 'tests/test_check_environment.py']
+    commands=pytest_commands(tools)
+    assert len(commands)==1 and commands[0][0]=='core'
+    assert '--no-desktop' in commands[0][1]
+    assert not tests_require_native(tools)
+    assert not tests_require_native(['tests/test_pricing.py::test_example'])
+    assert not tests_require_native([])
+    for targets in (['tests'], ['tests/test_new_contract.py'], ['tests/test_native_usage.py'],
+                    [*tools, 'tests/test_core.py']):
+        assert tests_require_native(targets)
+
+
+def test_full_fallback_retains_affected_integration_targets_without_duplicate_collection(tmp_path,monkeypatch,capsys):
+    plan=select_tests({'requirements-release.lock', 'cachemonitor/settings_page.py'})
+    assert plan['full'] and plan['tests']==('tests',)
+    assert 'tests/test_settings.py' in plan['affected_tests']
+    commands=pytest_commands(plan['tests'], affected_tests=plan['affected_tests'])
+    gui=next(command for kind,command in commands if kind=='gui')
+    assert '--affected-test' in gui and 'tests/test_settings.py' in gui
+    assert 'not extended' not in gui
+    assert select_tests(None)['affected_tests']==()
+    import tools.verify_changes as verify
+    monkeypatch.setattr(verify,'BASELINE',tmp_path/'missing.json')
+    monkeypatch.setattr(verify,'file_hashes',lambda:{'cachemonitor/settings_page.py':'changed'})
+    monkeypatch.setattr(verify,'changed_files',lambda *args:{'cachemonitor/settings_page.py'})
+    monkeypatch.setattr(verify,'release_version_only',lambda **kwargs:False)
+    assert verify.main(['--full','--base','verified','--plan'])==0
+    report=json.loads(capsys.readouterr().out)
+    assert report['suite']=='essential+affected'
+    assert 'tests/test_settings.py' in report['affected_tests']
+
+
+def test_essential_and_affected_collection_runs_each_contract_once_and_excludes_other_integrations(tmp_path):
+    import os
+    import subprocess
+    import sys
+    from xml.etree import ElementTree
+    config=tmp_path/'pytest.ini'
+    config.write_text('[pytest]\naddopts = -m "not extended and (not integration or essential)"\n'
+                      'markers =\n    integration: integration\n    essential: essential\n    extended: extended\n', encoding='utf-8')
+    (tmp_path/'test_contracts.py').write_text(
+        'import pytest\ndef test_unit():pass\n'
+        '@pytest.mark.integration\n@pytest.mark.essential\ndef test_baseline():pass\n'
+        '@pytest.mark.integration\n@pytest.mark.parametrize("value",[1,2])\ndef test_affected(value):pass\n'
+        '@pytest.mark.integration\ndef test_affected_other():pass\n'
+        '@pytest.mark.integration\ndef test_unrelated():pass\n'
+        '@pytest.mark.integration\n@pytest.mark.extended\ndef test_extended():pass\n', encoding='utf-8')
+    (tmp_path/'test_module.py').write_text(
+        'import pytest\n@pytest.mark.integration\ndef test_module():pass\n'
+        '@pytest.mark.extended\ndef test_module_extended():pass\n', encoding='utf-8')
+    report=tmp_path/'results.xml'
+    result=subprocess.run([sys.executable, '-B', '-m', 'pytest', '-q', '-p', 'tools.check_progress',
+        '-c', str(config), '--confcutdir', str(tmp_path), '--junitxml='+str(report),
+        '--affected-test', 'test_contracts.py::test_affected',
+        '--affected-test', 'test_contracts.py::test_affected', '--affected-test', 'test_module.py', str(tmp_path)],
+        cwd=ROOT, env={**os.environ, 'CODEXON_CHECK_DIAGNOSTICS':''}, capture_output=True, text=True)
+    assert result.returncode==0, result.stdout+result.stderr
+    names=[case.attrib['name'] for case in ElementTree.parse(report).iter('testcase')]
+    assert sorted(names)==['test_affected[1]', 'test_affected[2]', 'test_baseline', 'test_module', 'test_unit']
+
+
 def test_calculation_protocol_and_unknown_changes_have_explicit_gates():
     runner = select_tests({'tools/run_ui_checks.py'})
     assert {'tests/test_ui_check_runner.py', 'tests/test_completed_layout.py'} <= set(runner['tests'])
@@ -163,7 +248,7 @@ def test_ci_keeps_changed_contracts_without_repeating_unrelated_release_checks(p
     assert (plan['package'],plan['proxy'],plan['msix']) == (package,proxy,msix)
     assert plan['native'] == (package and not msix)
     assert not plan['unmapped']
-    assert plan['source_args'] == (['--integration'] if path.startswith('requirements') else ['--base','verified'])
+    assert plan['source_args'] == (['--full','--base','verified'] if path.startswith('requirements') else ['--base','verified'])
 
 
 def test_ci_extended_and_qa_tool_fallback_cannot_skip_required_checks():

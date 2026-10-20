@@ -27,6 +27,102 @@ def fixture(root):
     return product,recovery
 
 
+@pytest.fixture
+def committed_installation(tmp_path,monkeypatch,request):
+    """Crash on either side of the verified installation journal write."""
+    import subprocess
+    from cachemonitor import install_cleanup, installation, launch_context, observer_task
+    from cachemonitor.update_state import UpdateState
+    product,recovery=fixture(tmp_path)
+    scope=dict(home=str(tmp_path/'custom home'),evidence=str(tmp_path/'custom evidence.sqlite'),
+               url='http://127.0.0.1:19876',index=None)
+    journal=UpdateState(tmp_path)
+    record=journal.begin('app','test',scope=scope)
+    journal.change(record['operation_id'],phase='installing')
+    record=journal.read()
+    monkeypatch.setattr(install,'register',lambda *a,**k:None)
+    monkeypatch.setattr(install,'migrate_startup',lambda *a:None)
+    monkeypatch.setattr(installation,'pointer_path',lambda:tmp_path/'shared-installation.json')
+    monkeypatch.setattr(launch_context,'preference_path',lambda:tmp_path/'launch.json')
+    monkeypatch.setattr(launch_context,'running_homes',lambda root:[])
+    monkeypatch.setattr(launch_context,'resolve_homes',lambda homes:[scope['home']])
+    monkeypatch.setattr(observer_task,'retire_desktop_startups',lambda root:None)
+    after_installed=getattr(request,'param',False)
+    class InstallerCrash(BaseException):pass
+    def verify(command,**kwargs):
+        if '--complete-install' in command:raise InstallerCrash()
+        Path(command[-1]).write_text(json.dumps(dict(errors=[],version='test')))
+        return subprocess.CompletedProcess(command,0)
+    monkeypatch.setattr(install.subprocess,'run',verify)
+    def crash(root):raise InstallerCrash()
+    monkeypatch.setattr(install_cleanup,'queue',(lambda root:None) if after_installed else crash)
+    with pytest.raises(InstallerCrash):
+        install.finish(tmp_path,product,recovery,launch=False,update_id=record['operation_id'])
+    assert not (tmp_path/'activation-pending.json').exists()
+    assert journal.read()['phase']==('waiting' if after_installed else 'installing')
+    assert json.loads((tmp_path/'installation.json').read_text())['product']==str(product)
+    return journal,record,product,recovery
+
+
+def test_committed_installation_recovers_after_result_writer_crash(committed_installation):
+    journal,record,product,recovery=committed_installation
+    assert install.recover_installed(journal,record)==record['operation_id']
+    result=journal.read()
+    assert result['phase']=='waiting' and result['app']['state']=='verified'
+    assert result['scope']==record['scope']
+    assert result['app']['executable']==str(product/'Codexon.exe')
+    journal.change(record['operation_id'],phase='complete')
+    completed=journal.read()
+    assert install.recover_installed(journal,record)==record['operation_id']
+    assert journal.read()==completed
+
+
+@pytest.mark.parametrize('committed_installation',[True],indirect=True)
+def test_installed_journal_without_proxy_dispatch_exposes_continuation(committed_installation,monkeypatch):
+    from types import SimpleNamespace
+    from cachemonitor import app_update,observer_task,proxy_identity
+    journal,record,product,recovery=committed_installation
+    waiting=journal.read();waiting['updated_at']=0
+    journal.path.write_text(json.dumps(waiting),encoding='utf-8')
+    scope=record['scope']
+    manager=SimpleNamespace(home=Path(scope['home']),evidence=Path(scope['evidence']),
+                            directory=journal.root/'observer',url=scope['url'])
+    monkeypatch.setattr(observer_task.ObserverTask,'inspect',lambda self:{'registered':False})
+    monkeypatch.setattr(proxy_identity,'same_process',lambda owner:False)
+    result=app_update.reconcile_update(journal,manager)
+    assert result['phase']=='partial' and result['app']==waiting['app']
+    assert result['operation_id']==record['operation_id']
+    assert not (manager.directory/'proxy-update.json').exists()
+
+
+@pytest.mark.parametrize('changed',[
+    'operation','scope','version','manifest','binary','recovery','pending','pointer','busy'])
+def test_installation_recovery_requires_matching_committed_proof(committed_installation,changed):
+    from contextlib import nullcontext
+    from cachemonitor.observer_state import ProcessLock
+    journal,record,product,recovery=committed_installation
+    receipt_path=journal.root/'installation.json'
+    receipt=json.loads(receipt_path.read_text())
+    if changed=='operation':receipt['operation_id']='f'*32
+    elif changed=='scope':receipt['scope']={**record['scope'],'home':str(journal.root/'other home')}
+    elif changed=='version':receipt['version']='other'
+    elif changed=='manifest':
+        path=product/'build-manifest.json'
+        manifest=json.loads(path.read_text());manifest['commit']='b'*40
+        path.write_text(json.dumps(manifest))
+    elif changed=='binary':(product/'Codexon.exe').write_bytes(b'changed')
+    elif changed=='recovery':recovery.write_bytes(b'changed')
+    elif changed=='pending':(journal.root/'activation-pending.json').write_text('{}')
+    elif changed=='pointer':
+        (journal.root/'shared-installation.json').write_text('{}')
+    receipt_path.write_text(json.dumps(receipt))
+    before=journal.read()
+    guard=ProcessLock(journal.root/'install.lock') if changed=='busy' else nullcontext()
+    with guard:
+        assert install.recover_installed(journal,record) is None
+    assert journal.read()==before
+
+
 @pytest.mark.parametrize('same_request',[True,False])
 @pytest.mark.parametrize('callers',[[42],[42,43]])
 def test_native_uninstall_exempts_only_its_waiting_dispatcher(tmp_path,monkeypatch,same_request,callers):

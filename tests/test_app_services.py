@@ -458,6 +458,49 @@ def test_update_and_manual_start_cannot_revive_closing_service(running):
     assert not runtime['starts'] and runtime['health']
 
 
+@pytest.mark.parametrize('resume', [False, True])
+def test_restart_recovers_exited_proxy_without_claiming_storage_was_flushed(running, monkeypatch, resume):
+    manager, runtime = running
+    owner = services.AppServices(manager, [], collection=False)
+    source = owner.target.capture(runtime['health'])
+    owner.save(phase='closing', resume=resume, state=manager.state(), source=source, direct_url=None)
+    runtime['health'] = None
+    manager.set_url(None)
+    monkeypatch.setattr(ProxyTarget, 'stopped', lambda self, source: False)
+    monkeypatch.setattr('cachemonitor.proxy_drain.ProxyDrain.run',
+                        lambda *args: pytest.fail('An exited process cannot write a receipt'))
+    services.resume_proxy(manager)
+    journal = read_json(services.session_path(manager))
+    assert journal['phase'] == 'active'
+    assert journal['shutdown_incomplete'] is True
+    assert bool(runtime['starts']) is resume
+    assert not (manager.directory / ('proxy-control-' + source['control_id'] + '.json')).exists()
+    services.require_running(manager)
+
+
+@pytest.mark.parametrize('held', ['process', 'port', 'lock'])
+def test_missing_flush_receipt_cannot_bypass_live_proxy_ownership(running, monkeypatch, held):
+    manager, runtime = running
+    owner = services.AppServices(manager, [], collection=False)
+    source = owner.target.capture(runtime['health'])
+    owner.save(phase='closing', resume=True, state=manager.state(), source=source, direct_url=None)
+    if held != 'process':
+        runtime['health'] = None
+    if held == 'port':
+        monkeypatch.setattr(services.identity, 'port_free', lambda _: False)
+    if held == 'lock':
+        monkeypatch.setattr(services.identity, 'locks_free',
+                            lambda paths: manager.directory/'proxy-supervisor.lock' not in paths)
+    monkeypatch.setattr(ProxyTarget, 'stopped', lambda self, source: False)
+    def blocked(*args):
+        raise RuntimeError('still owned')
+    monkeypatch.setattr('cachemonitor.proxy_drain.ProxyDrain.run', blocked)
+    with pytest.raises(RuntimeError, match='still owned'):
+        services.resume_proxy(manager)
+    assert not runtime['starts']
+    assert not read_json(services.session_path(manager)).get('shutdown_incomplete')
+
+
 def test_gui_start_during_update_does_not_register_the_old_worker(running,monkeypatch):
     manager,runtime=running
     services.atomic_write(manager.directory/'proxy-update.json',b'{"phase":"starting"}')
@@ -557,58 +600,6 @@ def test_legacy_collector_control_checks_real_index_before_retirement(tmp_path,m
     finally:owner.__exit__(None,None,None);channel.close()
 
 
-def test_quit_waits_responsively_and_handoff_does_not_stop_services(tmp_path,monkeypatch):
-    import threading
-    from PySide6.QtCore import QSettings
-    from PySide6.QtWidgets import QApplication
-    from PySide6.QtTest import QTest
-    from cachemonitor.dashboard import Dashboard
-    app=QApplication.instance() or QApplication([])
-    previous_shell=app.property('cachemonitorDisableShellIntegration')
-    app.setProperty('cachemonitorDisableShellIntegration',True)
-    release=threading.Event();entered=threading.Event();finished=[]
-    def stop(self,**kwargs):entered.set();assert release.wait(10)
-    monkeypatch.setattr(services.AppServices,'stop',stop)
-    window=Dashboard([str(tmp_path/'home')],start_worker=False,live_limits=False,
-        index_path=str(tmp_path/'index.sqlite'),settings=QSettings(str(tmp_path/'settings.ini'),QSettings.IniFormat))
-    monkeypatch.setattr(window,'finish_quit',lambda:finished.append(True))
-    try:
-        window.manage_observer=True
-        window.quit_app()
-        assert entered.wait(2) and not finished and not window.quitting
-        for _ in range(3):app.processEvents();QTest.qWait(10)
-        assert window.shutdown_operation.isRunning()
-        window.quit_app();release.set()
-        for _ in range(200):
-            app.processEvents();QTest.qWait(10)
-            if finished:break
-        assert finished==[True]
-        window._closing=False;entered.clear()
-        window.quit_app(handoff=True)
-        assert finished==[True,True] and not entered.is_set()
-    finally:
-        release.set()
-        if getattr(window,'shutdown_operation',None):window.shutdown_operation.wait()
-        window.quitting=True;window.close();window.deleteLater();app.processEvents()
-        app.setProperty('cachemonitorDisableShellIntegration',previous_shell)
-
-
-def test_exit_inventory_uses_exact_home_and_session(tmp_path):
-    from cachemonitor.app_shutdown import ExitConnectionCheck,exit_message
-    manager=SimpleNamespace(home=tmp_path/'home',health=lambda **kw:dict(active_connections=4,
-        supports_force_shutdown=True,connection_sessions=[dict(session_id='a',connections=2),
-        dict(session_id='b',connections=1),dict(session_id='',connections=1)]))
-    check=ExitConnectionCheck(manager,None);check.run()
-    text=exit_message(check,dict(sessions=[dict(home=str(manager.home),id='a',title='My chat'),
-        dict(home=str(tmp_path/'other'),id='b',title='Wrong home')]))
-    assert check.count==4 and 'My chat' in text and 'Wrong home' not in text
-    assert 'b, 연결 1개' in text and '세션 확인 불가' in text
-    manager.health=lambda **kw:None;manager.health_state='unknown'
-    unknown=ExitConnectionCheck(manager,None);unknown.run();assert unknown.count is None
-    manager.health_state='refused'
-    empty=ExitConnectionCheck(manager,None);empty.run();assert empty.count==0
-
-
 @pytest.mark.parametrize('initial',[True,False])
 def test_force_exit_can_escalate_unknown_connections(running,initial):
     manager,runtime=running
@@ -627,33 +618,9 @@ def test_force_exit_can_escalate_unknown_connections(running,initial):
     assert read_json(services.session_path(manager))['phase']=='stopped'
 
 
-def test_exit_dialog_buttons_and_escape(tmp_path):
-    from PySide6.QtWidgets import QApplication
-    from PySide6.QtCore import Qt
-    from PySide6.QtTest import QTest
-    from cachemonitor.app_shutdown import ExitConfirmation,ShutdownProgress
-    app=QApplication.instance() or QApplication([])
-    check=SimpleNamespace(count=1,manager=SimpleNamespace(home=tmp_path),
-        health=dict(supports_force_shutdown=True,connection_sessions=[dict(session_id='session',connections=1)]))
-    for choice in ('cancel','confirm','force','escape'):
-        dialog=ExitConfirmation(check,{},None);results=[];dialog.finished.connect(results.append);dialog.open()
-        app.processEvents();QTest.qWait(30)
-        assert dialog.host.quick.status().name=='Ready' and not dialog.host.qml_errors
-        if choice=='escape':QTest.keyClick(dialog.host,Qt.Key_Escape)
-        else:
-            from cachemonitor.quick_qa import click,control
-            click(dialog.host,control(dialog.host,getattr(dialog,choice)))
-        for _ in range(5):app.processEvents();QTest.qWait(5)
-        assert results==[dict(cancel=0,confirm=1,force=2,escape=0)[choice]]
-    progress=ShutdownProgress(None,True);progress.show();app.processEvents()
-    QTest.keyClick(progress,Qt.Key_Escape);assert progress.isVisible()
-    progress.force.click();assert not progress.force.isEnabled()
-    progress.accept();progress.deleteLater();app.processEvents()
-
-
 def test_force_rejects_unsupported_worker(running):
     manager,runtime=running
     runtime['work']=100
-    with pytest.raises(RuntimeError,match='업데이트'):
-        services.AppServices(manager,[],collection=False).stop(force_requested=lambda:True)
+    result=services.AppServices(manager,[],collection=False).stop(force_requested=lambda:True)
+    assert result.status=='failed' and not result.committed and result.error
     assert runtime['health'] is not None

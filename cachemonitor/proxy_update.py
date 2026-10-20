@@ -11,6 +11,82 @@ from .observer_state import ProcessLock, read_json
 from .version import VERSION, PROXY_VERSION
 
 BUSY = ('queued', 'waiting', 'switching', 'stopping', 'starting', 'verifying', 'rollback')
+TERMINAL = ('complete', 'off', 'cancelled', 'failed')
+
+
+def task_finished(task):
+    if task.get('registered') is False:
+        return True
+    return (task.get('registered') is True and task.get('running') == 0
+            and task.get('state') in (1, 3))
+
+
+def projected_status(record):
+    if record.get('owner_interrupted') and record.get('phase') in BUSY:
+        return {**record,'resume_phase':record['phase'],'phase':'interrupted'}
+    return record
+
+
+def updater_released(manager, record):
+    """Unknown scheduler/process ownership must retain the current operation."""
+    from .model_evidence import home_key
+    from .observer_task import ObserverTask
+    from .proxy_identity import locks_free, same_process
+    try:
+        if record.get('worker_owner') and same_process(record['worker_owner']):
+            return False
+        task = ObserverTask(home_key(manager.home), role='ProxyUpdate').inspect()
+        return task_finished(task) and locks_free([manager.directory/'proxy-update.lock'])
+    except (OSError, RuntimeError, KeyError, TypeError):
+        return False
+
+
+def reconcile_owner(manager, record, *, cancel_requested=False):
+    if record.get('owner_interrupted') and not record.get('cancel_requested') and not cancel_requested:
+        return projected_status(record)
+    if record.get('phase') not in BUSY:
+        return record
+    if (time.time()-record.get('updated_at', 0) < 90
+            and not record.get('cancel_requested') and not cancel_requested):
+        return record
+    from .model_evidence import home_key
+    from .observer_task import ObserverTask
+    from .proxy_identity import same_process
+    try:
+        with ProcessLock(manager.directory/'proxy-update.lock'):
+            current = read_json(manager.directory/'proxy-update.json')
+            if current != record:
+                return current
+            if current.get('worker_owner') and same_process(current['worker_owner']):
+                return current
+            task = ObserverTask(home_key(manager.home), role='ProxyUpdate').inspect()
+            if not task_finished(task):
+                return current
+            path=manager.directory/'proxy-update.json'
+            with ProcessLock(manager.directory/'proxy-update-journal.lock',timeout=5):
+                latest = read_json(path)
+                if latest != current:
+                    return latest
+                cancelled=current.get('cancel_requested',False)
+                if current.get('operation_id') and current.get('update_root'):
+                    from .update_state import UpdateState
+                    cancelled=cancelled or UpdateState(current['update_root']).cancelled(current['operation_id'])
+                if cancelled and not current.get('cutover_started'):
+                    current={**current,'phase':'cancelled','owner_interrupted':False,
+                             'updated_at':time.time(),'message':'연결 비활성화 또는 취소로 재기동을 중단했습니다.'}
+                else:
+                    # The execution phase is recovery data. Project interruption
+                    # without replacing rollback/starting/verifying in the journal.
+                    current={**current,'owner_interrupted':True,'updated_at':time.time(),
+                             'message':'업데이트가 중단되었습니다. 다시 눌러 복구할 수 있습니다.'}
+                atomic_write(path,json.dumps(current,ensure_ascii=False).encode())
+            result=projected_status(current)
+            if result.get('operation_id') and result.get('update_root'):
+                from .update_state import UpdateState
+                UpdateState(result['update_root']).proxy_result(result['operation_id'],result,replay=True)
+            return result
+    except (OSError, RuntimeError, KeyError, TypeError):
+        return record
 
 
 def process_executable(pid):
@@ -34,11 +110,23 @@ class ProxyUpdate:
     def publish(self, phase, **extra):
         with ProcessLock(self.manager.directory/'proxy-update-journal.lock',timeout=5):
             data = read_json(self.path)
-            data.update(phase=phase, updated_at=time.time(), target_version=PROXY_VERSION, **extra)
+            data.update(phase=phase, updated_at=time.time(), target_version=PROXY_VERSION,
+                        target_app_version=VERSION, owner_interrupted=False, **extra)
+            if phase=='rollback':data['rollback_started']=True
+            elif phase in TERMINAL:data['rollback_started']=False
             atomic_write(self.path, json.dumps(data, ensure_ascii=False).encode())
         if data.get('operation_id') and data.get('update_root'):
             from .update_state import UpdateState
             UpdateState(data['update_root']).proxy_result(data['operation_id'],data)
+
+    def reconcile(self, data=None):
+        data = read_json(self.path) if data is None else data
+        if (data.get('operation_id') and data.get('update_root')
+                and data.get('scope') == self.target.scope):
+            from .update_state import UpdateState
+            return UpdateState(data['update_root']).proxy_result(
+                data['operation_id'], data, replay=True)
+        return False
 
     def allowed(self):
         data=read_json(self.path)
@@ -143,12 +231,12 @@ class ProxyUpdate:
             # Windows systems that do not apply RestartOnFailure to that launch.
             # Disable it after a terminal result, under the same UI transaction
             # lock so a new authorized update cannot lose its recovery trigger.
-            if read_json(self.path).get('phase') in ('complete','cancelled','failed'):
+            if read_json(self.path).get('phase') in TERMINAL:
                 from .observer_task import ObserverTask
                 from .model_evidence import home_key
                 if hasattr(self.manager,'home'):
                     with ProcessLock(self.manager.control_lock,timeout=5):
-                        if read_json(self.path).get('phase') in ('complete','cancelled','failed'):
+                        if read_json(self.path).get('phase') in TERMINAL:
                             ObserverTask(home_key(self.manager.home),role='ProxyUpdate').finish_update()
 
     def replace(self):
@@ -156,12 +244,20 @@ class ProxyUpdate:
         try:
             with ProcessLock(m.directory/'proxy-update.lock'):
                 data=read_json(self.path)
-                if data.get('phase') in ('complete','cancelled'):return
+                if data.get('phase') in TERMINAL:
+                    self.reconcile(data)
+                    return
+                from .proxy_identity import process_identity
+                import os
+                owner = process_identity(os.getpid()) if os.name == 'nt' else None
+                self.publish(data.get('phase', 'queued'), worker_owner=owner)
                 try:
                     self.allowed()
                     if data.get('scope') and data['scope']!=self.target.scope:
                         raise RuntimeError('다른 연결의 업데이트 기록을 보존합니다.')
                     distribution=self.preflight()
+                    self.publish(data.get('phase', 'queued'), distribution=distribution,
+                                 scope=self.target.scope)
                     self.allowed()
                     source=data.get('source')
                     command=data.get('command')
@@ -183,7 +279,7 @@ class ProxyUpdate:
                         self.publish('waiting',source=source,command=command,distribution=distribution,
                                      scope=self.target.scope,message='프록시 교체를 준비하고 있습니다.')
                     data=read_json(self.path)
-                    if data.get('phase')=='rollback':
+                    if data.get('phase')=='rollback' or data.get('rollback_started'):
                         self.rollback(data);return
                     current=m.health(timeout=3)
                     if current and current['instance']!=source['instance']:

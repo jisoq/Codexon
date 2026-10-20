@@ -146,7 +146,6 @@ def test_managed_shutdown_finishes_inflight_websocket_without_replay(tmp_path,fo
                         health=await (await client.get(proxy+'/health')).json()
                         assert health['websocket_states']['unknown']==0 and health['websocket_states']['responding']==1
                     control.write_text(json.dumps({'id':token,'action':'drain'}))
-                    await asyncio.sleep(.3)
                     health=await (await client.get(proxy+'/health')).json()
                     assert health['draining'] and health['active_connections']==1
                     assert not stop.is_set() and not ws.closed
@@ -184,7 +183,8 @@ def test_managed_shutdown_keeps_inflight_http_tool_bytes(tmp_path,force):
                 async with client.post(proxy+'/tool',data=b'original') as response:
                     assert await response.content.readexactly(5)==b'first'
                     control.write_text(json.dumps({'id':token,'action':'drain'}))
-                    await asyncio.sleep(.3)
+                    health=await (await client.get(proxy+'/health')).json()
+                    assert health['draining'] and health['http_connections']==1
                     assert not stop.is_set()
                     rejected=await client.post(proxy+'/tool',data=b'do-not-forward')
                     assert rejected.status==503
@@ -197,6 +197,59 @@ def test_managed_shutdown_keeps_inflight_http_tool_bytes(tmp_path,force):
                 await asyncio.wait_for(stop.wait(),3)
                 assert received==[b'original']
         finally:store.close()
+    run_proxy_test(run())
+
+
+@pytest.mark.parametrize('request_type',['response.create','future.request'])
+def test_drain_preserves_work_accepted_after_the_last_idle_probe(tmp_path,request_type):
+    async def run():
+        token='late-work';control=tmp_path/'control.json'
+        stop=asyncio.Event();finish=asyncio.Event();received=[]
+        known=request_type=='response.create'
+
+        async def upstream(request):
+            ws=web.WebSocketResponse();await ws.prepare(request)
+            received.append(await ws.receive_json())
+            await ws.send_json({'type':'response.created' if known else 'future.accepted',
+                                'response':{'id':'late','model':'m'}})
+            await finish.wait()
+            await ws.send_json({'type':'response.completed' if known else 'future.completed',
+                                'response':{'id':'late','model':'m','output':'KEEP_LATE',
+                                            'usage':{'input_tokens':2,'output_tokens':1}}})
+            async for _ in ws:pass
+            return ws
+
+        app=web.Application();app.router.add_get('/responses',upstream)
+        store=EvidenceStore(tmp_path/'late.sqlite')
+        try:
+            async with server(app) as url, server(create_app(store,tmp_path/'home',url,
+                    control_file=control,control_id=token,stop_event=stop)) as proxy, ClientSession() as client:
+                async with client.ws_connect(proxy+'/responses') as ws:
+                    before=await (await client.get(proxy+'/health')).json()
+                    assert before['websocket_states']['idle']==1
+                    # The coordinator's idle observation is now stale: the worker
+                    # must preserve newly accepted work when drain arrives.
+                    await ws.send_json({'type':request_type,'model':'m','input':'keep'})
+                    await asyncio.wait_for(ws.receive_json(),3)
+                    control.write_text(json.dumps({'id':token,'action':'drain'}))
+                    after=await (await client.get(proxy+'/health')).json()
+                    assert after['draining']
+                    assert after['websocket_states']['responding' if known else 'unknown']==1
+                    assert not stop.is_set() and not ws.closed
+                    async with client.post(proxy+'/tool',data=b'not-admitted') as rejected:
+                        assert rejected.status==503
+                    finish.set()
+                    final=await asyncio.wait_for(ws.receive_json(),3)
+                    assert final['response']['output']=='KEEP_LATE'
+                await asyncio.wait_for(stop.wait(),3)
+                assert received==[{'type':request_type,'model':'m','input':'keep'}]
+                if known:
+                    assert store.db.execute(
+                        "select count(*) from model_observations where response_id='late' and status='completed'"
+                    ).fetchone()==(1,)
+        finally:
+            finish.set()
+            store.close()
     run_proxy_test(run())
 
 

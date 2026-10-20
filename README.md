@@ -54,9 +54,9 @@ Codexon is distributed as an installer, with in-app updates, Start-menu shortcut
 
 The dashboard reads local Codex records. If there are no records yet, use Codex first and refresh the dashboard. In **Settings → General → Language**, choose English or 한국어; the selection takes effect on the next launch. Closing the dashboard keeps Codexon in the tray. Use the tray's Exit action to stop it.
 
-## Optional model monitoring
+## Optional output-speed and response-model recording
 
-Enable **Settings → Codex connection → Compare requested and response models** to compare the requested and reported response model. Turning it on checks local readiness without sending a model request. Once setup succeeds, restart the app or CLI where you use Codex to apply the connection change. Session history, cost analysis and usage-limit views can be used without the proxy.
+Enable **Settings → Codex connection → Record output speed and response model** to observe responses through the local proxy. Valid timing from completed responses supplies output speed, and recorded model names supply the request/response comparison. Turning it on checks local readiness without sending a model request. Restart the app or CLI where you use Codex once after changing its connection setting. If you have already restarted it, no further restart is needed. Session history, cost analysis and usage-limit views can be used without the proxy.
 
 Codexon reports a model match or mismatch only when completed request/response evidence can be linked reliably. Missing or conflicting evidence is not treated as a mismatch. The reported model name does not prove which hardware or internal model implementation handled the request.
 
@@ -81,6 +81,10 @@ On Windows, Codexon registers the GUI with Windows Error Reporting for user-appr
 Windows only offers this restart after at least 60 seconds of runtime, and system policy can suppress the error dialog. It does not guarantee unattended recovery or recover a process terminated through Task Manager. You can also launch `Codexon.exe --software-rendering` manually. CPU rendering can change performance and some visual effects. A GUI crash leaves the independently running collector and proxy available; exiting Codexon normally still stops its managed services.
 
 Use **Settings → About → Check for updates**. For connection problems, open **Codexon Connection Recovery** from Start. You can also open recovery from Settings → Codex connection.
+
+The tray's Exit action starts safe shutdown and waits for current responses. You can cancel before connection cleanup begins. Supported proxies also offer an action to interrupt responses and exit. If shutdown fails, the app remains usable so you can inspect the remaining connection state and retry.
+
+Closing ChatGPT alone leaves Codexon running. Replacing the Codexon window for a language change or app update preserves the proxy and collector. Once an update starts replacing the connection worker, verification or rollback must finish.
 
 ## Local data and removal
 

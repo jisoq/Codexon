@@ -15,6 +15,7 @@ from urllib.parse import urlsplit
 from .model_evidence import default_path, home_key
 from .observer_control import ObserverManager, URL, atomic_write
 from .observer_state import ProcessLock, read_json
+from .app_services import ExitRecoveryBlocked, exit_recovery_owner, recover_after_exit
 from .translation_catalog import translate as tr
 
 
@@ -45,28 +46,52 @@ def inspect(manager):
     try:
         status = manager.status()
     except (OSError, ValueError, RuntimeError) as exc:
+        owner = exit_recovery_owner(manager)
+        if owner:
+            return assess(dict(service_phase=owner['phase'], exit_recovery=owner, service_issue=str(exc)))
         return dict(code='unreadable', confirmed=False, can_recover=True,
                     title='연결 설정을 확인하지 못했습니다',
                     detail='설정을 읽을 수 없습니다. 기존 파일은 유지됩니다. 복구를 시도하면 결과를 확인할 수 있습니다.',
                     error=str(exc))
+    owner = exit_recovery_owner(manager)
+    if owner:
+        status = {**status, 'service_phase': owner['phase'], 'exit_recovery': owner}
     return assess(status)
 
 
 def assess(status):
     """Use the same interpretation in the GUI and recovery window."""
+    service_phase=status.get('service_phase') or status.get('phase')
+    if service_phase in ('preparing','closing'):
+        owner = status.get('exit_recovery') or {}
+        if owner.get('owner_state') == 'dead':
+            return dict(code='interrupted_exit', confirmed=False, can_recover=True, status=status,
+                        title='이전 종료 작업이 중단되었습니다',
+                        detail='Codexon 종료 프로세스가 끝났습니다. 기존 응답을 강제로 끊지 않고 직접 연결로 복원할 수 있습니다.')
+        if owner.get('owner_state') == 'unknown':
+            return dict(code='exiting', confirmed=False, can_recover=False, status=status,
+                        title='종료 작업의 소유권을 확인하지 못했습니다',
+                        detail='다른 종료 작업을 방해하지 않도록 복원을 보류합니다. 상태를 다시 확인하고 있습니다.')
+        return dict(code='exiting',confirmed=False,can_recover=False,status=status,
+                    title='종료 준비 중' if service_phase=='preparing' else '종료 처리 중',
+                    detail='Codexon에서 종료를 취소한 뒤 연결 설정을 변경할 수 있습니다.' if service_phase=='preparing'
+                    else '진행 중인 종료 처리가 끝난 뒤 상태를 다시 확인하세요.')
     if not status['configured']:
+        if status.get('phase')=='draining' or (status.get('health') or {}).get('draining'):
+            return dict(code='draining',confirmed=False,can_recover=True,status=status,
+                        title='연결 마무리 중',detail='새 요청의 기록은 꺼져 있습니다. 기존 연결의 응답은 마무리하고 있습니다.')
         restart = status.get('restart_required', False)
         return dict(code='direct', confirmed=False, can_recover=True, status=status,
                     title='Codexon 프록시 연결이 해제되어 있습니다',
-                    detail='Codex가 이전 연결을 사용 중이라면 작업을 마친 뒤 완전히 종료하고 다시 여세요.' if restart
+                    detail='설정 변경 후 아직 재시작하지 않았다면 Codex를 사용하는 앱이나 CLI를 한 번 재시작하세요.\n이미 재시작했다면 추가 재시작은 필요하지 않습니다. 이 안내는 연결 오류를 뜻하지 않습니다.' if restart
                     else '다른 연결, 로그인, 서버 문제는 이 도구의 확인 범위에 포함되지 않습니다.')
     update = status.get('update') or {}
     from .proxy_update import BUSY
-    if update.get('phase') in BUSY:
-        return dict(code='updating', confirmed=False, can_recover=True, status=status,
-                    title='연결 구성요소를 전환하고 있습니다', detail=update.get('message') or '교체 상태를 확인하고 있습니다.')
     probe = status.get('probe_state')
     health = status.get('health') or {}
+    if update.get('phase') in BUSY and not (probe=='healthy' and update.get('phase') in ('queued','waiting')):
+        return dict(code='updating', confirmed=False, can_recover=True, status=status,
+                    title='연결 구성요소를 전환하고 있습니다', detail=update.get('message') or '교체 상태를 확인하고 있습니다.')
     if probe in ('refused', 'identity_mismatch'):
         return dict(code=probe, confirmed=True, can_recover=True, status=status,
                     title='Codexon 프록시 연결을 사용할 수 없습니다',
@@ -89,12 +114,20 @@ def assess(status):
 
 
 def restore(manager):
-    from .retired_cache import retire
-    retire(manager,restore_only=True)
-    with ProcessLock(manager.control_lock, timeout=5):
-        status=manager.recover_direct()
-        if manager.config()[1].get('openai_base_url') == manager.url:
-            raise RuntimeError('프록시 연결 설정이 남아 있습니다. 복원이 완료되지 않았습니다.')
+    owner = exit_recovery_owner(manager)
+    if owner:
+        # Legacy retirement may drain or start a worker; an interrupted GUI exit
+        # needs only explicit route recovery and must preserve the old process.
+        status = recover_after_exit(manager, owner)
+    else:
+        from .retired_cache import retire
+        retire(manager,restore_only=True)
+        with ProcessLock(manager.control_lock, timeout=5):
+            if exit_recovery_owner(manager):
+                raise ExitRecoveryBlocked('종료 작업이 변경되어 직접 연결 복원을 보류했습니다. 상태를 다시 확인하세요.')
+            status=manager.recover_direct()
+            if manager.config()[1].get('openai_base_url') == manager.url:
+                raise RuntimeError('프록시 연결 설정이 남아 있습니다. 복원이 완료되지 않았습니다.')
     detail='진행 중인 작업을 확인한 뒤 Codex를 완전히 종료하고 다시 여세요. 통신 성공 여부는 재시작 후 확인됩니다.'
     if status.get('cleanup_warning'):
         detail+=' 예약 작업 해제가 완료되지 않았습니다. 이 도구에서 복원을 다시 실행해 주세요.'
@@ -141,6 +174,8 @@ class RecoveryWindow:
         self.button.state(['disabled'])
         def work():
             try:result = function(self.manager)
+            except ExitRecoveryBlocked as exc:
+                result = dict(code='exiting', can_recover=False, title='연결 설정 복원을 보류했습니다', detail=str(exc))
             except Exception as exc:
                 result = dict(code='error', title='설정을 복원하지 못했습니다',
                               detail='설정 파일을 읽거나 변경할 수 없습니다. 기존 설정과 백업은 보존됩니다. 파일 접근 권한을 확인한 뒤 다시 시도하세요.')
@@ -151,7 +186,7 @@ class RecoveryWindow:
         threading.Thread(target=work, daemon=False).start()
 
     def recover(self):
-        if not self.busy:
+        if not self.busy and (self.result or {}).get('can_recover',True):
             self.title.configure(text=tr('직접 연결로 복원 중…'))
             self.submit(restore)
 
@@ -161,10 +196,15 @@ class RecoveryWindow:
             self.busy = False
             self.title.configure(text=tr(self.result['title']))
             self.detail.configure(text=tr(self.result['detail']))
-            self.button.state(['!disabled'])
+            available=self.result.get('can_recover',True)
+            self.button.state(['!disabled'] if available else ['disabled'])
+            if not available:self.root.after(1000,self.reinspect)
         except queue.Empty:
             pass
         self.root.after(100, self.poll)
+
+    def reinspect(self):
+        if not self.busy and self.result and not self.result.get('can_recover',True):self.submit(inspect)
 
     def run(self):
         self.root.mainloop()

@@ -86,8 +86,11 @@ class ProxyTarget:
     def exited(self, source):
         return all((not identity.same_process(p) for p in source['processes']))
 
+    def released(self, source):
+        return self.exited(source) and identity.port_free(self.manager.url) and identity.locks_free(self.locks)
+
     def stopped(self, source):
-        if not (self.exited(source) and identity.port_free(self.manager.url) and identity.locks_free(self.locks)):
+        if not self.released(source):
             return False
         from .observer_state import read_json
         receipt_required = source.get('flush_receipt_required', source.get('lifecycle_revision', 0) >= 2 and '--managed' in source.get('command', []))

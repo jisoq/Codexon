@@ -108,7 +108,7 @@ def register_root(root):
 def clear_scopes(folder):
     if not any(folder.glob('owner-*.json')):
         return {}
-    result = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-File',
+    result = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File',
         str(Path(__file__).with_name('clear_check_scopes.ps1')), '-Evidence', str(folder)],
         capture_output=True, timeout=12, creationflags=subprocess.CREATE_NO_WINDOW)
     (folder / 'scope-cleanup.log').write_bytes(result.stdout + result.stderr)

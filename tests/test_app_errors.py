@@ -238,25 +238,30 @@ def test_analysis_bridge_preserves_failure_kind_and_request_id(monkeypatch):
     assert 'private' not in json.dumps(observed)
 
 
-def test_cached_update_offer_does_not_resolve_a_failed_metadata_request(tmp_path):
-    from PySide6.QtCore import QSettings
+def test_cached_update_offer_does_not_resolve_a_failed_metadata_request():
     from PySide6.QtWidgets import QApplication
     from cachemonitor.dashboard import Dashboard
+    from cachemonitor.update_panel import UpdatePanel
     app=QApplication.instance() or QApplication([])
-    window=Dashboard([],start_worker=False,live_limits=False,
-        settings=QSettings(str(tmp_path/'settings.ini'),QSettings.IniFormat))
+    class Receiver:
+        error_state=ErrorState()
+        receive_update_error=Dashboard.receive_update_error
+        def observe_error(self,source,kind,facts,**kwargs):
+            self.error_state.update(source,kind,facts,**kwargs)
+    receiver=Receiver();panel=UpdatePanel(None)
+    panel.fault_changed.connect(receiver.receive_update_error)
     try:
-        window.receive_update_error(dict(checking_failed=True))
-        window.update_panel.show_plan(dict(kind='current'))
-        assert window.error_state.grouped()['update'].code=='check'
-        window.receive_update_error(dict(check_healthy=True))
-        assert 'update' not in window.error_state.grouped()
-    finally:window.quit_app();app.processEvents()
+        panel.checking=True;panel.receive_result(ConnectionError('fixture metadata failure'))
+        panel.show_plan(dict(kind='current'))
+        assert receiver.error_state.grouped()['update'].code=='check'
+        panel.receive_result(dict(kind='current'))
+        assert 'update' not in receiver.error_state.grouped()
+    finally:panel.stop();panel.deleteLater();app.processEvents()
 
 
 @pytest.mark.integration
 def test_sidebar_errors_remain_visible_across_pages_and_do_not_show_main_banner(tmp_path,monkeypatch):
-    from PySide6.QtCore import QSettings,QPointF
+    from PySide6.QtCore import QCoreApplication,QEvent,QSettings,QPointF
     from PySide6.QtWidgets import QApplication
     from cachemonitor.dashboard import Dashboard
     from cachemonitor.quick_qa import click,control,scene_view
@@ -268,6 +273,11 @@ def test_sidebar_errors_remain_visible_across_pages_and_do_not_show_main_banner(
     try:
         window.tick.stop();window.resize(1050,800);window.show()
         window.notification_master.setChecked(False)
+        # Keep the real Dashboard signal connection in this rendered integration.
+        window.update_panel.fault_changed.emit(dict(checking_failed=True))
+        assert window.error_state.grouped()['update'].code=='check'
+        window.update_panel.fault_changed.emit(dict(check_healthy=True))
+        assert 'update' not in window.error_state.grouped()
         window.receive_collection_status(dict(collection_fault=dict(start_failed=True,retry_exhausted=True)))
         assert not sent and window.error_button.isVisible()
         for page in (1,2,3,4,5):
@@ -290,7 +300,13 @@ def test_sidebar_errors_remain_visible_across_pages_and_do_not_show_main_banner(
         assert not window.error_button.isVisible() and window.index_status.isVisible()
         assert window.notification_log.model().rows[0].get('resolution')
         assert not window.qml_errors
-    finally:window.quit_app();app.processEvents()
+    finally:
+        window.quit_app()
+        wait_for_rendered(lambda:window.quitting and window.shutdown_operation is None and window._quick is None,timeout=5)
+        window.close();window.deleteLater()
+        QCoreApplication.sendPostedEvents(None,QEvent.DeferredDelete)
+        from shiboken6 import isValid
+        assert not isValid(window)
 
 
 @pytest.mark.integration

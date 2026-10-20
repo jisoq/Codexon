@@ -59,7 +59,8 @@ def test_native_restart_registration_roundtrip_and_unregister(tmp_path):
 
 
 @pytest.mark.parametrize('handoff', [False, True])
-def test_accepted_exit_disarms_before_scene_teardown_and_cancel_does_not(tmp_path, handoff):
+def test_exit_disarms_before_scene_teardown(tmp_path, handoff):
+    import time
     from PySide6.QtCore import QSettings
     from PySide6.QtWidgets import QApplication
     from cachemonitor.dashboard import Dashboard
@@ -70,34 +71,39 @@ def test_accepted_exit_disarms_before_scene_teardown_and_cancel_does_not(tmp_pat
     app._windows_restart = registration
     window = Dashboard([], start_worker=False, settings=QSettings(str(tmp_path/'ui.ini'), QSettings.IniFormat))
     try:
-        window.exit_confirmation = None
-        window.exit_decided(0)
-        assert events == []
         original_finish = window.finish_quit
         def finish():
             events.append('teardown')
             original_finish()
         window.finish_quit = finish
         window.begin_quit(handoff=handoff)
+        deadline=time.monotonic()+5
+        while 'teardown' not in events and time.monotonic()<deadline:
+            app.processEvents()
         assert events == ['disarm', 'teardown']
     finally:
         app._windows_restart = previous
         window.quitting = True;window.release_scene();window.close();window.deleteLater();app.processEvents()
 
 
-def test_shutdown_failure_rearms_restart(monkeypatch):
+@pytest.mark.parametrize('status',['failed','cancelled'])
+def test_unfinished_shutdown_rearms_restart(monkeypatch,status):
     from PySide6.QtWidgets import QApplication
     from cachemonitor.tray import TrayWindow, QMessageBox
+    from cachemonitor.shutdown_state import ExitResult
     app = QApplication.instance() or QApplication([])
     events = []
     previous = getattr(app, '_windows_restart', None)
     app._windows_restart = SimpleNamespace(arm=lambda: events.append('arm'))
     monkeypatch.setattr(QMessageBox, 'warning', lambda *_: events.append('warning'))
-    window = SimpleNamespace(_closing=True, shutdown_operation=SimpleNamespace(error='failed'),
+    window = SimpleNamespace(_closing=True, shutdown_operation=SimpleNamespace(
+        outcome=ExitResult(status,error='failed' if status=='failed' else ''),
+        display_stopping=False,deleteLater=lambda:None),
         shutdown_dialog=SimpleNamespace(accept=lambda: None, deleteLater=lambda: None))
+    window.set_exit_pending=lambda value:setattr(window,'_closing',value)
     try:
         TrayWindow.shutdown_finished(window)
-        assert not window._closing and events == ['arm', 'warning']
+        assert not window._closing and events == (['arm','warning'] if status=='failed' else ['arm'])
     finally:
         app._windows_restart = previous
 

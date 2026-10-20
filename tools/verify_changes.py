@@ -29,6 +29,10 @@ def test_files(*names):
     return tuple(f'tests/test_{name}.py' for name in names)
 
 
+def test_nodes(module, *names):
+    return tuple(f'tests/test_{module}.py::{name}' for name in names)
+
+
 # Components select observable contracts. There is deliberately no always-run core.
 GROUPS = {
     'native_cpu': test_files('native_cpu', 'native_trends', 'native_usage', 'native_quota_series', 'native_index', 'native_analysis', 'build_native'),
@@ -36,8 +40,13 @@ GROUPS = {
     "performance_trends": test_files("performance_trends"),
     'retirement': test_files('retired_cache'),
     'settings': test_files('settings'),
+    'settings_wiring': test_nodes('theme_tokens', 'test_quick_theme_selection_updates_overlay_and_preserves_state') +
+        test_nodes('ui', 'test_quota_and_settings_have_independent_scope') +
+        test_nodes('app_errors', 'test_sidebar_errors_remain_visible_across_pages_and_do_not_show_main_banner'),
     'chatgpt_startup': test_files('chatgpt_startup'),
-    'app_lifetime': test_files('app_services', 'observer_panel', 'windows_startup', 'proxy_update'),
+    'app_lifetime': test_files('app_services', 'service_exit', 'shutdown_state', 'shutdown_ui',
+                              'observer_panel', 'windows_startup', 'proxy_update') + (
+        'tests/test_model_proxy.py::test_drain_preserves_work_accepted_after_the_last_idle_probe',),
     'graphics_recovery': test_files('graphics_recovery', 'window_recovery', 'quick_ui', 'overlay_shadow'),
     'data': test_files('core', 'index', 'data_contract', 'subagent_collection', 'request_tier_snapshots', 'collection_defaults', 'collection_crash_recovery', 'collection_transport', 'collection_preparation'),
     'analysis': test_files('comparison', 'comparison_usage', 'overview', 'performance', 'data_contract', 'output_speed'),
@@ -61,6 +70,25 @@ GROUPS = {
     'quota_ui': test_files('quota_page', 'quota_detail_card', 'quota_gap_axis', 'quota_share_theme', 'quota_exclusion_controls', 'quota_sidebar', 'quota_query', 'quota_waiting'),
     'quota_chart': test_files('quota_gap_axis', 'quota_chart_performance', 'quota_page', 'quota_chart_exclusions'),
     'dashboard': test_files('home', 'ui', 'comparison_workflow', 'dashboard_evidence', 'ui_value_fixes', 'history_explorer', 'history_timeline', 'history_timeline_data', 'dashboard_readability'),
+    'comparison_ui': test_files('comparison_workflow', 'dashboard_readability') +
+        test_nodes('dashboard_evidence', 'test_tab_loading_keeps_controls_and_ignores_stale_result',
+                   'test_comparison_display_controls_keep_chart_without_new_query',
+                   'test_refresh_indicator_does_not_cover_existing_chart') +
+        test_nodes('quick_ui', 'test_reasoning_tokens_render_independently_of_cost_and_request_unit'),
+    'dashboard_queries': test_files('dashboard_evidence', 'history_timeline_data') +
+        test_nodes('home', 'test_home_today_projection_matches_prepared_calls_and_partial_coverage',
+                   'test_home_loading_masks_only_today_and_readiness_uses_collection_evidence',
+                   'test_home_scope_and_identity_ignore_other_page_filters_but_expire_at_midnight') +
+        test_nodes('ui', 'test_sequential_drilldown_and_full_call_detail',
+                   'test_request_statistics_in_current_level_and_filtered_scope',
+                   'test_event_navigation_retains_conditions_and_exact_evidence_phases') +
+        test_nodes('comparison_workflow', 'test_project_selection_preserves_filters_and_back_restores_exact_call',
+                   'test_unmeasurable_pairs_hide_without_losing_zero_values_or_cached_metrics',
+                   'test_custom_date_drafts_preserve_results_and_apply_exact_cohort',
+                   'test_metric_drilldown_ignores_history_filters_and_restores_latest_scope') +
+        test_nodes('history_explorer', 'test_temporary_history_locks_exact_population_and_escape_restores_scope',
+                   'test_prepared_filter_choices_preserve_empty_values_and_project_aliases',
+                   'test_session_chart_selection_detail_and_back_preserve_scope'),
     'details': test_files('ui_details', 'call_transport', 'model_ui'),
     'table': test_files('table_order', 'performance'),
     'shared_ui': test_files('quick_ui', 'display_scaling'),
@@ -86,10 +114,10 @@ GROUPS = {
     'runtime': test_files('windows_startup', 'graphics_recovery'),
     'translation': ('tests/test_public_release.py::test_english_token_labels_do_not_change_stored_values',),
     'payload': ('tests/test_public_release.py::test_public_payload_rejects_local_paths_and_unneeded_qt',),
-    'selector': test_files('verify_changes', 'check_environment'),
+    'selector': test_files('verify_changes', 'check_environment', 'ci_plan'),
     'qa_ipc': test_files('qa_ipc'),
     'ui_runner': test_files('ui_check_runner', 'completed_layout'),
-    'release': test_files('release_pipeline', 'prepare_sources'),
+    'release': test_files('release_pipeline', 'prepare_sources', 'source_receipt'),
 }
 
 # First match wins: QML and shared helpers must not fall through to a broad UI gate.
@@ -128,7 +156,7 @@ RULES = (
     ('cachemonitor/comparison_usage.py', ('prepared', 'analysis', 'dashboard')),
     ('cachemonitor/usage_panel.py', ('dashboard', 'speed')),
     ('cachemonitor/home_panel.py', ('dashboard', 'quota_ui')),
-    ('cachemonitor/qml/UsageDashboard.qml', ('dashboard', 'shared_ui')),
+    ('cachemonitor/qml/UsageDashboard.qml', ('comparison_ui',)),
     ('cachemonitor/qml/AnalysisLoading.qml', ('dashboard', 'shared_ui', 'details', 'speed')),
     ('cachemonitor/dashboard_views.py', ('analysis', 'dashboard', 'details', 'cost')),
     ('cachemonitor/analysis_engine.py', ('analysis', 'cost', 'cache', 'overlay_data', 'native_cpu')),
@@ -140,9 +168,9 @@ RULES = (
     ('cachemonitor/prepared_ingest.py', ('prepared', 'analysis', 'data', 'cache', 'modes', 'quota_poll')),
     ('cachemonitor/prepared_append.py', ('prepared', 'analysis', 'cache', 'overlay_data', 'quota_poll')),
     ('cachemonitor/prepared_runtime.py', ('prepared', 'analysis', 'quota_poll', 'overlay_tracking', 'notifications')),
-    ('cachemonitor/prepared_query.py', ('prepared', 'analysis', 'dashboard', 'details')),
-    ('cachemonitor/prepared_analysis.py', ('prepared', 'analysis', 'dashboard', 'details')),
-    ('cachemonitor/prepared_history.py', ('prepared', 'analysis', 'dashboard', 'details')),
+    ('cachemonitor/prepared_query.py', ('prepared', 'analysis', 'dashboard_queries', 'details')),
+    ('cachemonitor/prepared_analysis.py', ('prepared', 'analysis', 'dashboard_queries', 'details')),
+    ('cachemonitor/prepared_history.py', ('prepared', 'analysis', 'dashboard_queries', 'details')),
     ('cachemonitor/prepared_category.py', ('prepared', 'analysis', 'dashboard')),
     ('cachemonitor/prepared_sums.py', ('prepared', 'analysis', 'dashboard')),
     ('cachemonitor/prepared_performance.py', ('prepared', 'performance_trends')),
@@ -242,7 +270,7 @@ RULES = (
     ('cachemonitor/charts.py', ('shared_ui', 'quota_chart')),
     ('cachemonitor/theme.py', ('theme',)),
     ('cachemonitor/token_colors.py', ('theme',)),
-    ('cachemonitor/settings_page.py', ('settings', 'dashboard', 'theme', 'observer')),
+    ('cachemonitor/settings_page.py', ('settings', 'settings_wiring')),
     ('cachemonitor/taskbar*.py', ('taskbar',)),
     ('cachemonitor/screens.py', ('window', 'overlay_controls')),
     ('cachemonitor/notifications.py', ('notifications',)),
@@ -288,6 +316,7 @@ RULES = (
     ('cachemonitor/collection_lifecycle.py', ('app_lifetime','quota_poll')),
     ('tools/verify_app_services.py', ('app_lifetime','qa_ipc')),
     ('cachemonitor/app_shutdown.py', ('app_lifetime',)),
+    ('cachemonitor/shutdown_state.py', ('app_lifetime',)),
     ('cachemonitor/proxy_drain.py', ('proxy_lifecycle', 'app_lifetime')),
     ('cachemonitor/tray.py', ('runtime', 'window', 'app_lifetime', 'graphics_recovery')),
     ('cachemonitor/launch_context.py', ('install', 'runtime')),
@@ -503,13 +532,14 @@ def select_tests(changed, *, root=None, deleted=(), version_only=False):
             else:unmapped.add(path)
     # A file selection subsumes any specific node selections from other changes.
     selected = {test for test in selected if '::' not in test or test.split('::')[0] not in selected}
+    affected_tests = tuple(sorted(selected))
     if full:
         selected = {'tests'}
         reasons = {'tests': ['검증 기준점 없음' if first_run else
                             '제거된 구성요소의 남은 참조와 패키지 검증' if removed_contract else
                             '공통 검사 설정 또는 의존성 변경']}
         groups.add('full')
-    return dict(full=full, tests=tuple(sorted(selected)),
+    return dict(full=full, tests=tuple(sorted(selected)), affected_tests=affected_tests,
                 reasons={test: reasons[test] for test in sorted(selected)},
                 groups=tuple(sorted(groups)), unmapped=tuple(sorted(unmapped)),
                 package_impact=package, proxy_impact=proxy,
@@ -576,11 +606,31 @@ def package_check(executable, report_dir):
                 duration_seconds=report.get('duration_seconds'), session_rollup=rollup)
 
 
-CORE_TESTS = frozenset(test_files('pricing', 'data_contract', 'core', 'request_modes', 'collection_preparation'))
+# Audited modules have no Qt imports, including function-local imports and fixtures.
+# The core runner's import guard continues to reject accidental Qt dependencies.
+CORE_TESTS = frozenset(test_files(
+    'pricing', 'data_contract', 'core', 'request_modes', 'collection_preparation',
+    'banked_resets', 'comparison', 'quota', 'quota_tracking',
+    'native_index', 'native_trends', 'native_usage', 'build_native',
+    'verify_changes', 'check_environment', 'collect_notices', 'prepare_sources',
+    'release_pipeline', 'ci_plan', 'source_receipt'))
+
+# These contracts do not execute application CPU kernels. Unknown selections keep
+# the native build gate, so adding a test cannot silently bypass native parity.
+NON_NATIVE_TESTS = frozenset(test_files(
+    'pricing', 'request_modes', 'build_native', 'verify_changes', 'check_environment',
+    'collect_notices', 'prepare_sources', 'release_pipeline', 'ci_plan', 'source_receipt'))
+
+
+def tests_require_native(tests):
+    """Keep native parity for every selection except audited non-kernel contracts."""
+    return any(test.split('::')[0] not in NON_NATIVE_TESTS for test in tests)
+
+
 PROCESS_TESTS = frozenset(test_files('ui_check_runner', 'install_management', 'proxy_update', 'app_services'))
 
 
-def pytest_commands(tests, *, integration=False, extended=False, report_dir=None):
+def pytest_commands(tests, *, integration=False, extended=False, report_dir=None, affected_tests=()):
     """Run audited core contracts without Qt, then GUI and process checks serially."""
     selection = tuple(tests)
     pytest = [sys.executable, '-u', '-B', '-m', 'pytest', '-v', '--tb=short', '--maxfail=1', '--durations=10',
@@ -606,10 +656,13 @@ def pytest_commands(tests, *, integration=False, extended=False, report_dir=None
     for kind, targets in groups.items():
         if not targets:
             continue
+        target_paths = {target.split('::')[0] for target in targets}
+        affected = [arg for test in affected_tests if test.split('::')[0] in target_paths
+                    for arg in ('--affected-test', test)] if selection == ('tests',) else []
         junit = ['--junitxml=' + str(report_dir / f'tests-{kind}.xml')] if report_dir else []
         desktop = ['--no-desktop'] if kind == 'core' else []
         commands.append((kind, [*runner, '--kind', kind, *desktop, '--',
-                                *pytest, '--check-kind', kind, *junit, *targets]))
+                                *pytest, '--check-kind', kind, *affected, *junit, *targets]))
     return commands
 
 
@@ -655,11 +708,12 @@ def main(argv=None):
         plan = {**plan, 'full':True, 'tests':('tests',), 'groups':('full',),
                 'reasons':{'tests':['사용자가 전체 검사를 지정함']}, 'unmapped':()}
     if args.package_only:
-        plan = {**plan, 'full':False, 'tests':(), 'groups':(), 'reasons':{}, 'unmapped':()}
+        plan = {**plan, 'full':False, 'tests':(), 'affected_tests':(), 'groups':(), 'reasons':{}, 'unmapped':()}
     public = dict(changed=sorted(changed) if changed is not None else None,
-                  suite='extended' if args.extended else 'integration' if args.integration else 'essential' if plan['full'] else 'affected',
+                  suite='extended' if args.extended else 'integration' if args.integration else
+                  'essential+affected' if plan['full'] and plan['affected_tests'] else 'essential' if plan['full'] else 'affected',
                   full=plan['full'], unmapped=plan['unmapped'],
-                  groups=plan['groups'], tests=plan['tests'], reasons=plan['reasons'],
+                  groups=plan['groups'], tests=plan['tests'], affected_tests=plan['affected_tests'], reasons=plan['reasons'],
                   package_impact=plan['package_impact'], proxy_impact=plan['proxy_impact'],
                   qa_smokes=plan['qa_smokes'],
                   package_exe=str(args.package_exe) if args.package_exe else None)
@@ -699,7 +753,7 @@ def main(argv=None):
         deadline = started + 820  # Leave the Actions 15-minute step time for evidence upload/exit.
         runs = []
         for name, command in pytest_commands(plan['tests'], integration=args.integration,
-                                             extended=args.extended, report_dir=folder):
+                                             extended=args.extended, report_dir=folder, affected_tests=plan['affected_tests']):
             remaining = deadline - time.monotonic() - 20
             if remaining <= 0:
                 runs.append(dict(environment=name, exit_code=124, seconds=0, summary='Source budget exhausted'))

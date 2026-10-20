@@ -283,3 +283,137 @@ def test_explicit_start_is_single_flight_and_check_remains_read_only(tmp_path,mo
     ({'active_connections':5},5),({'active_connections':-1},None),({'active_connections':True},None)])
 def test_connection_count_preserves_unknown(health,expected):
     assert app_update.connection_count({'health':health})==expected
+
+
+
+def test_update_widget_does_not_persist_inferred_interruption(tmp_path,monkeypatch):
+    from PySide6.QtWidgets import QApplication
+    from types import SimpleNamespace
+    from cachemonitor.update_panel import UpdatePanel
+    app=QApplication.instance() or QApplication([])
+    monkeypatch.setattr(UpdatePanel,'recover',lambda self:None)
+    panel=UpdatePanel(SimpleNamespace(directory=tmp_path/'updates'))
+    try:
+        op=panel.journal.begin('proxy','fixture')['operation_id']
+        panel.journal.proxy_result(op,dict(phase='waiting'))
+        before=panel.journal.path.read_bytes()
+        monkeypatch.setattr(panel.journal,'proxy_result',lambda *a,**k:pytest.fail('Widget persisted inferred terminal result'))
+        panel.proxy_status(dict(update=dict(phase='interrupted',operation_id=op)))
+        assert panel.journal.path.read_bytes()==before and panel.journal.read()['phase']=='waiting'
+    finally:panel.stop();panel.deleteLater();app.processEvents()
+
+
+def test_exit_preparation_blocks_update_actions_and_keeps_journal_refresh(tmp_path,monkeypatch):
+    from PySide6.QtWidgets import QApplication
+    from types import SimpleNamespace
+    from cachemonitor.update_panel import UpdatePanel
+    app=QApplication.instance() or QApplication([])
+    monkeypatch.setattr(UpdatePanel,'recover',lambda self:None)
+    panel=UpdatePanel(SimpleNamespace(directory=tmp_path/'updates'))
+    panel.owner=SimpleNamespace(_closing=True)
+    try:
+        op=panel.journal.begin('proxy','fixture')['operation_id']
+        panel.journal.change(op,phase='complete')
+        panel.set_exit_pending(True)
+        assert not panel.button.isEnabled()
+        panel.journal.change(op,phase='failed',message='durable update failure')
+        panel.refresh()
+        assert panel.record['phase']=='failed' and panel.status.text()=='durable update failure'
+        assert not panel.execute.isEnabled() and not panel.cancel.isEnabled()
+        monkeypatch.setattr(panel,'launch_operation',lambda *a:pytest.fail('Mutation started during exit preparation'))
+        panel.request_install();panel.start();panel.cancel_update(True)
+        panel.owner._closing=False;panel.set_exit_pending(False)
+        assert panel.execute.isEnabled()
+    finally:panel.stop();panel.deleteLater();app.processEvents()
+
+
+
+def test_verified_gui_continuation_emits_only_after_validation_worker_finishes(tmp_path,monkeypatch):
+    import time
+    from types import SimpleNamespace
+    from PySide6.QtWidgets import QApplication
+    from PySide6.QtTest import QTest
+    from cachemonitor.update_panel import UpdatePanel
+    app=QApplication.instance() or QApplication([])
+    monkeypatch.setattr(UpdatePanel,'recover',lambda self:None)
+    panel=UpdatePanel(SimpleNamespace(directory=tmp_path/'updates'))
+    target=str(tmp_path/'versions'/'new'/'Codexon.exe');calls=[]
+    try:
+        record=panel.journal.begin('app','fixture');op=record['operation_id']
+        panel.journal.change(op,phase='partial',app=dict(state='verified',executable=target))
+        monkeypatch.setattr(app_update,'continuation_target',lambda *a:dict(kind='continue_app',executable=target,verified_operation_id=op))
+        panel.continue_app_requested.connect(lambda executable:calls.append((executable,panel.operation)))
+        panel.refresh();panel.request_install()
+        deadline=time.monotonic()+2
+        while not calls and time.monotonic()<deadline:
+            app.processEvents();QTest.qWait(5)
+        assert calls==[(dict(executable=target,verified_operation_id=op),None)]
+    finally:
+        panel.stop()
+        if panel.operation:panel.operation.wait()
+        panel.deleteLater();app.processEvents()
+
+
+
+@pytest.mark.parametrize('metadata_error',[False,True])
+def test_metadata_arriving_during_exit_is_processed_after_cancel(tmp_path,monkeypatch,metadata_error):
+    import time
+    from types import SimpleNamespace
+    from PySide6.QtWidgets import QApplication
+    from PySide6.QtTest import QTest
+    from cachemonitor.update_panel import UpdatePanel
+    app=QApplication.instance() or QApplication([]);panel=UpdatePanel(None)
+    panel.owner=SimpleNamespace(_closing=True)
+    calls=[]
+    monkeypatch.setattr(app_update,'check_update',lambda *a,**k:calls.append(k) or dict(kind='none'))
+    def settle():
+        deadline=time.monotonic()+2
+        while time.monotonic()<deadline:
+            app.processEvents()
+            if panel.operation is None:return
+            QTest.qWait(5)
+        raise AssertionError('Metadata recovery did not finish')
+    try:
+        panel.checking=True;panel.metadata_pending=True;panel.button.setEnabled(False)
+        panel.set_exit_pending(True)
+        panel.metadata_received(RuntimeError('metadata failure') if metadata_error else release())
+        assert panel.metadata_pending and panel.operation is None and not calls
+        panel.owner._closing=False;panel.set_exit_pending(False);settle()
+        assert not panel.metadata_pending and panel.button.isEnabled()
+        assert len(calls)==int(not metadata_error)
+        panel.start();settle()
+        assert len(calls)==int(not metadata_error)+1 and panel.button.isEnabled()
+    finally:
+        panel.stop()
+        if panel.operation:panel.operation.wait()
+        panel.deleteLater();app.processEvents()
+
+
+def test_new_gui_continuation_consumes_only_explicit_matching_intent(tmp_path,monkeypatch):
+    import time
+    from types import SimpleNamespace
+    from PySide6.QtWidgets import QApplication
+    from PySide6.QtTest import QTest
+    from cachemonitor.update_panel import UpdatePanel
+    app=QApplication.instance() or QApplication([])
+    monkeypatch.setattr(UpdatePanel,'recover',lambda self:None)
+    panel=UpdatePanel(SimpleNamespace(directory=tmp_path/'updates'));calls=[]
+    def retry(manager,journal,**kwargs):calls.append(kwargs);return journal.read()
+    monkeypatch.setattr(app_update,'retry_proxy',retry)
+    try:
+        op=panel.journal.begin('app','fixture')['operation_id']
+        panel.journal.change(op,phase='deferred',app=dict(state='verified',executable=str(tmp_path/'Codexon.exe')))
+        panel.refresh();app.processEvents()
+        assert not calls
+        assert not panel.continue_update('f'*32) and not calls
+        assert panel.continue_update(op)
+        assert not panel.continue_update(op)
+        deadline=time.monotonic()+2
+        while panel.operation and time.monotonic()<deadline:
+            app.processEvents();QTest.qWait(5)
+        assert panel.operation is None and calls==[dict(verified_operation_id=op)]
+        panel.refresh();assert not panel.continue_update(op) and len(calls)==1
+    finally:
+        panel.stop()
+        if panel.operation:panel.operation.wait()
+        panel.deleteLater();app.processEvents()

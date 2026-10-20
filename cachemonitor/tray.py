@@ -1,6 +1,6 @@
 from __future__ import annotations
 from PySide6.QtGui import QAction, QActionGroup, QCursor
-from PySide6.QtCore import QThread, Qt
+from PySide6.QtCore import QThread, QTimer, Qt
 import os, sys
 from pathlib import Path
 from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
@@ -9,7 +9,7 @@ from .quota import quota_display
 from .icons import notification_icon, tray_icon
 from .theme import shared_theme
 from .i18n import tr, formatted
-from .app_shutdown import ExitConnectionCheck, ExitConfirmation, ShutdownProgress
+from .app_shutdown import ShutdownProgress
 from .taskbar import TaskbarQuota
 import time
 
@@ -238,118 +238,121 @@ class TrayWindow(QuickHost):
             QMessageBox.warning(self,tr('ChatGPT 자동 시작 설정 실패'),
                 tr('ChatGPT 설치를 확인하지 못했습니다. 설치 상태를 확인한 뒤 다시 켜세요.'))
 
-    def quit_app(self,checked=False,*,handoff=False):
-        if getattr(self,'_closing',False):return
-        check=getattr(self,'exit_check',None)
-        dialog=getattr(self,'exit_confirmation',None)
-        if check:
-            if handoff:self._exit_handoff=True
+    def quit_app(self,checked=False,*,handoff=False,handoff_deadline=None):
+        if getattr(self,'_closing',False):
+            dialog=getattr(self,'shutdown_dialog',None)
+            if dialog:dialog.raise_();dialog.activateWindow()
             return
-        if handoff:
-            if dialog:dialog.reject()
-            self.begin_quit(handoff=True);return
-        if dialog:return
-        services=getattr(self,'app_services',None)
-        manager=services.manager if services else None
-        if manager is None:
-            self.begin_quit();return
-        from PySide6.QtCore import Qt
-        from PySide6.QtWidgets import QProgressDialog
-        self.exit_check_dialog=QProgressDialog(tr('열린 연결 확인 중…'),'',0,0,self)
-        self.exit_check_dialog.setWindowTitle(tr('Codexon 종료 확인'))
-        self.exit_check_dialog.setCancelButton(None)
-        self.exit_check_dialog.setWindowFlag(Qt.WindowCloseButtonHint,False)
-        self.exit_check_dialog.setWindowModality(Qt.ApplicationModal)
-        self.exit_check_dialog.setMinimumDuration(0)
-        self.exit_check_dialog.show()
-        self.exit_check=ExitConnectionCheck(manager,self)
-        self.exit_check.finished.connect(self.exit_connections_checked)
-        self.exit_check.start()
+        self.begin_quit(handoff=handoff,handoff_deadline=handoff_deadline)
 
-    def exit_connections_checked(self):
-        check=self.exit_check;self.exit_check=None
-        count=check.count;check.deleteLater()
-        self.exit_check_dialog.close();self.exit_check_dialog.deleteLater()
-        self.exit_check_dialog=None
-        if getattr(self,'_exit_handoff',False):
-            self._exit_handoff=False;self.begin_quit(handoff=True);return
-        self._exit_force_supported=check.health.get('supports_force_shutdown') is True
-        if count==0:
-            self.begin_quit();return
-        self.exit_confirmation=ExitConfirmation(check,self.snapshot,self)
-        self.exit_confirmation.finished.connect(self.exit_decided)
-        self.exit_confirmation.open()
+    def set_exit_pending(self,pending):
+        self._closing=bool(pending)
+        controller=getattr(self,'service_controller',None)
+        if controller:controller.set_exit_pending(pending)
+        panel=getattr(self,'observer_panel',None)
+        if panel:panel.set_exit_pending(pending)
+        update=getattr(self,'update_panel',None)
+        if update:update.set_exit_pending(pending)
+        if not pending and hasattr(self,'chatgpt_startup'):self.sync_chatgpt_startup_enabled()
+        settings=getattr(self,'settings_page',None)
+        restart=getattr(settings,'controls',{}).get('restart')
+        if restart:
+            if pending:restart.setEnabled(False)
+            else:settings.refresh_restart()
 
-    def exit_decided(self,result):
-        dialog=self.exit_confirmation;self.exit_confirmation=None
-        if dialog:dialog.deleteLater()
-        if result in (1,2) and not getattr(self,'_closing',False):self.begin_quit(force=result==2)
-
-    def begin_quit(self,*,handoff=False,force=False):
+    def begin_quit(self,*,handoff=False,handoff_deadline=None):
         if getattr(self,'_closing',False):return
         from .graphics_recovery import set_restart_enabled
-        set_restart_enabled(False)
-        self._closing=True
-        monitor=getattr(self,'update_monitor',None)
-        if monitor:monitor.stop()
-        update=getattr(self,'update_panel',None)
-        if update:
-            update.stop()
-            if update.journal and update.journal.read().get('phase') in ('preparing','downloading'):
-                update.journal.cancel()
-        if hasattr(self,'save_preferences'):self.save_preferences()
-        controller=getattr(self,'service_controller',None)
-        if controller:controller.stop()
-        panel=getattr(self,'observer_panel',None)
-        if panel:
-            panel.active=False;panel.pending=None;panel.manager.cancelled.set()
-        if getattr(self,'overlay',None):self.overlay.stop()
-        for service in getattr(self,'quota_services',{}).values(): service.stop()
-        self.tick.stop()
-        QApplication.instance().removeEventFilter(self)
-        if hasattr(self,'defer_timer'): self.defer_timer.stop()
-        if self.worker:
-            self.worker.requestInterruption()
-        managed=getattr(self,'manage_observer',False)
-        collection=bool(getattr(self,'app_services',None) and self.app_services.collection)
-        discovery=getattr(self,'chatgpt_discovery',None)
-        if handoff or not (managed or collection):
-            if discovery:discovery.wait()
-            if update and update.operation:update.operation.wait()
-            if controller and controller.operation:controller.operation.wait()
-            if self.worker:self.worker.wait()
-            self.finish_quit();return
         from .app_shutdown import ShutdownOperation
-        self.shutdown_dialog=ShutdownProgress(self,getattr(self,'_exit_force_supported',False))
+        set_restart_enabled(False)
+        self.set_exit_pending(True)
+        self.shutdown_dialog=ShutdownProgress(self,handoff=handoff)
+        if handoff:self.shutdown_dialog.setWindowTitle(tr('Codexon 다시 시작 중'))
         self.shutdown_dialog.show()
+        panel=getattr(self,'observer_panel',None)
         update=getattr(self,'update_panel',None)
-        workers=[self.worker,panel.operation if panel else None,update.operation if update else None,
-                 controller.operation if controller else None,discovery]
-        self.shutdown_operation=ShutdownOperation(self.app_services,workers,self)
-        self.shutdown_dialog.force.clicked.connect(self.shutdown_operation.request_force)
-        if force:
-            self.shutdown_operation.request_force()
-            self.shutdown_dialog.force.setEnabled(False)
-        self.shutdown_operation.progress.connect(lambda text:self.shutdown_dialog.setLabelText(tr(text)))
+        controller=getattr(self,'service_controller',None)
+        workers=[getattr(panel,'operation',None),getattr(update,'operation',None),
+                 getattr(controller,'operation',None),getattr(self,'chatgpt_discovery',None)]
+        display=[getattr(self,'worker',None),*getattr(self,'quota_services',{}).values()]
+        self.shutdown_operation=ShutdownOperation(getattr(self,'app_services',None),workers,self,
+            handoff=handoff,display_workers=display,handoff_deadline=handoff_deadline)
+        self.shutdown_dialog.cancel_requested.connect(self.cancel_quit)
+        self.shutdown_dialog.force_requested.connect(self.force_quit)
+        self.shutdown_operation.progress.connect(self.shutdown_dialog.display)
         self.shutdown_operation.finished.connect(self.shutdown_finished)
         self.shutdown_operation.start()
 
+    def cancel_quit(self):
+        if self.shutdown_operation.request_cancel():self.shutdown_dialog.cancellation_requested()
+        else:self.shutdown_dialog.cancel.setEnabled(False)
+
+    def force_quit(self):
+        if self.shutdown_dialog.force.isEnabled() and self.shutdown_operation.request_force():
+            self.shutdown_dialog.forcing_requested()
+
+    def resume_display_workers(self):
+        def resume_when_ready(worker,restore):
+            if getattr(worker,'_exit_restore_pending',False):return
+            worker._exit_restore_pending=True
+            def ready():
+                if self.quitting:return
+                if getattr(self,'_closing',False):
+                    QTimer.singleShot(100,ready);return
+                worker._exit_restore_pending=False;restore()
+            if worker.isRunning():
+                def finished():
+                    worker.finished.disconnect(finished);ready()
+                worker.finished.connect(finished)
+            else:ready()
+        worker=getattr(self,'worker',None)
+        if worker:resume_when_ready(worker,worker.start)
+        for home,service in list(getattr(self,'quota_services',{}).items()):
+            def resume_quota(home=home,service=service):
+                if self.quota_services.get(home) is not service:return
+                selected=getattr(getattr(self,'quota_service',None),'home',home)
+                del self.quota_services[home];self.start_quota_service(home)
+                if selected!=home and selected in self.quota_services:self.start_quota_service(selected)
+            resume_when_ready(service,resume_quota)
+
     def shutdown_finished(self):
-        error=self.shutdown_operation.error
-        self.shutdown_dialog.accept()
-        self.shutdown_dialog.deleteLater()
-        if error:
-            self._closing=False
+        operation=self.shutdown_operation
+        outcome=operation.outcome
+        if outcome.status=='completed' and operation.handoff_expired():
+            from .shutdown_state import ExitResult
+            outcome=ExitResult('failed',committed=outcome.committed,
+                error='앱 다시 시작 대기 시간이 지났습니다. 기존 Codexon을 계속 사용할 수 있습니다.')
+        self.shutdown_dialog.accept();self.shutdown_dialog.deleteLater();self.shutdown_dialog=None
+        self.shutdown_operation=None;operation.deleteLater()
+        if outcome.status!='completed':
+            if operation.display_stopping and not operation.handoff:self.app_services.release_exit()
+            self.set_exit_pending(False)
+            if operation.display_stopping:self.resume_display_workers()
             from .graphics_recovery import set_restart_enabled
             set_restart_enabled(True)
-            QMessageBox.warning(self,tr('안전한 종료 확인 필요'),
-                tr('종료를 완료하지 못했습니다. 종료를 다시 누르면 재시도합니다.')+'\n'+error)
+            if outcome.status=='failed':
+                QMessageBox.warning(self,tr('안전한 종료 확인 필요'),
+                    tr('종료를 완료하지 못했습니다. 현재 상태를 확인한 뒤 종료를 다시 시도할 수 있습니다.')+'\n'+tr(outcome.error))
             return
+        if outcome.warning:
+            QMessageBox.warning(self,tr('기록 저장 확인 필요'),tr(outcome.warning))
         self.finish_quit()
 
     def finish_quit(self):
+        if hasattr(self,'save_preferences'):self.save_preferences()
+        monitor=getattr(self,'update_monitor',None)
+        if monitor:monitor.stop()
+        update=getattr(self,'update_panel',None)
+        if update:update.stop()
+        controller=getattr(self,'service_controller',None)
+        if controller:controller.stop()
+        panel=getattr(self,'observer_panel',None)
+        if panel:panel.stop()
+        if getattr(self,'overlay',None):self.overlay.stop()
+        for service in getattr(self,'quota_services',{}).values():service.stop()
+        self.tick.stop()
+        QApplication.instance().removeEventFilter(self)
+        if hasattr(self,'defer_timer'):self.defer_timer.stop()
         self.quitting=True
-        self.tray.hide()
-        self.taskbar_quota.close()
-        self.release_scene()
+        self.tray.hide();self.taskbar_quota.close();self.release_scene()
         QApplication.instance().quit()

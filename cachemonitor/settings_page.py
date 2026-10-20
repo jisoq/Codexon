@@ -12,7 +12,7 @@ class SettingsPage(Group):
     TITLES = ('일반', '화면 표시', '알림', 'Codex 연결', '앱 정보')
     ENTRY_IDS = {
         '언어':'language','시스템 시간대':'timezone','위치':'overlay-position',
-        '프록시 사용':'proxy','요청 모델과 응답 모델 비교':'proxy',
+        '프록시 사용':'proxy','요청 모델과 응답 모델 비교':'proxy','출력 속도와 응답 모델 기록':'proxy',
         '알림 표시':'notifications-enabled','HTTP 전환':'http-fallback',
         '캐시 저하 의심':'cache-drop','모델명 불일치':'model-mismatch','프록시 장애':'proxy-failure',
         '캐시 알림 범위':'cache-scope','최근 알림':'notification-history','현재 버전':'version','제작자':'creator',
@@ -126,9 +126,11 @@ class SettingsPage(Group):
     def refresh_restart(self):
         from .i18n import language
         pending=self.owner.settings.value('ui/language','ko')!=language()
-        self.controls['restart'].setEnabled(pending);self.controls['restart'].setVisible(pending)
+        self.controls['restart'].setEnabled(pending and not getattr(self.owner,'_closing',False))
+        self.controls['restart'].setVisible(pending)
 
     def request_restart(self):
+        if getattr(self.owner,'_closing',False):return
         self.owner.settings.sync()
         self.controls['restart'].setEnabled(False)
         self.restartRequested.emit()
