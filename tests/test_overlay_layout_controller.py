@@ -307,6 +307,7 @@ def test_maintenance_recovers_frame_dpi_and_changed_appearance(layout_controller
 @pytest.mark.parametrize('compact',[False,True])
 def test_pending_overlay_refresh_keeps_confirmed_panel_until_replacement(layout_controller,monkeypatch,compact):
     from copy import deepcopy
+    from test_ui import wait_for_rendered
     import time
     c=layout_controller;app=QApplication.instance();m=c.widget.content_model
     confirmed=deepcopy(c.sessions[0])
@@ -335,12 +336,16 @@ def test_pending_overlay_refresh_keeps_confirmed_panel_until_replacement(layout_
     assert m.selected_id==selected and m.graph_pinned
     assert c.monitor_geometry==geometry
     assert m.note=='갱신 중' and m.heartbeat_state()['mode']=='pending'
-    before=c.widget.grab().toImage()
+    # The arrival highlight may still be fading while confirmed values stay
+    # unchanged. Compare rendered content only after that expected animation.
+    wait_for_rendered(lambda:m._agent_highlight.state()==m._agent_highlight.State.Stopped,timeout=5)
+    before=c.widget.quick.grabFramebuffer()
     assert m.notice_card() is None and len(requests)==1
     # Rejected obsolete reads must not erase the still-valid displayed snapshot.
     c.receive_overlay_detail(dict(id=requests[-1][0],kind='stale'))
     app.processEvents()
-    assert c.widget.grab().toImage()==before and m.selected_id==selected
+    assert c.widget.quick.grabFramebuffer()==before and m.selected_id==selected
+    assert m.data['cost']==confirmed['cost'] and m.data['latest']==confirmed['latest']
     # A stalled detail refresh must disclose the age of the retained values.
     with monkeypatch.context() as clock:
         clock.setattr('cachemonitor.overlay.time.time',lambda:stamp+20)
