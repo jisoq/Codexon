@@ -100,7 +100,11 @@ def test_auto_fallback_restores_preference_anchor_and_clickthrough(tmp_path):
     from cachemonitor.overlay_monitor import WIDTH,geometry,header_status
     from PySide6.QtCore import QEventLoop
     app=QApplication.instance() or QApplication([])
-    host=QWidget();host.setWindowTitle('CacheMonitor owned resize test');host.resize(900,1000);host.show()
+    host=QWidget();host.setWindowTitle('CacheMonitor owned resize test')
+    # This owned fixture must reach every fallback threshold even on a small
+    # runner screen. An explicit Qt limit overrides Windows' screen-sized
+    # default maximum tracking size without changing the overlay's limits.
+    host.setMaximumSize(10000,10000);host.resize(900,1000);host.show()
     controller=OverlayController(QSettings(str(tmp_path/'settings.ini'),QSettings.IniFormat),native_enabled=False,appearance_path=tmp_path/'codex.toml')
     native=WindowsOverlay();controller.native=native
     native.configure(int(controller.widget.winId()))
