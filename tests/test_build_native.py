@@ -76,7 +76,6 @@ def test_missing_extension_cannot_pass_the_release_gate(tmp_path):
 @pytest.mark.parametrize('changed', [
     'native/src/lib.rs', 'native/Cargo.lock', 'rust-toolchain.toml',
     'requirements-release.lock', 'tools/build_native.py', 'native/src/compiled-data.json',
-    '.cargo/config.toml', 'native/.cargo/config.toml',
 ])
 def test_changed_build_input_invalidates_binary_and_cache_key(tmp_path, changed):
     root = native_tree(tmp_path)
@@ -107,7 +106,7 @@ def test_replaced_binary_and_new_rust_module_invalidate_the_build(tmp_path):
 @pytest.mark.parametrize('dimension', ['python', 'abi', 'platform', 'rustc', 'compiler', 'flags'])
 def test_changed_build_environment_invalidates_binary_and_cache_key(tmp_path, monkeypatch, dimension):
     root = native_tree(tmp_path)
-    verified_binary(root)
+    binary = verified_binary(root)
     key = build_native.cache_key(root)
     if dimension == 'python':
         monkeypatch.setattr(build_native.sys, 'version', sys.version + ' changed Python build')
@@ -123,7 +122,13 @@ def test_changed_build_environment_invalidates_binary_and_cache_key(tmp_path, mo
         monkeypatch.setenv('RUSTFLAGS', '--cfg changed_build_flag')
     assert build_native.cache_key(root) != key
     with pytest.raises(RuntimeError, match='stale or changed'):
-        build_native.checked_extension(root, smoke=False, require_tested=True)
+        build_native.checked_extension(root, smoke=False, require_tested=True,
+                                       identity=build_native.build_identity(root))
+    if dimension in ('python', 'abi', 'platform'):
+        with pytest.raises(RuntimeError, match='stale or changed'):
+            build_native.checked_extension(root, smoke=False, require_tested=True)
+    else:
+        assert build_native.checked_extension(root, smoke=False, require_tested=True) == binary.resolve()
 
 
 def test_runner_image_patch_alone_preserves_verified_binary(tmp_path, monkeypatch):
@@ -274,3 +279,119 @@ def test_cargo_target_configuration_cannot_select_a_stale_host_binary(tmp_path):
     assert build_native.built_extension(json.dumps(artifact), root/'native/Cargo.toml', target) == actual.resolve()
     with pytest.raises(RuntimeError, match='exactly one'):
         build_native.built_extension('{"reason":"build-finished","success":true}', root/'native/Cargo.toml', target)
+
+
+@pytest.mark.parametrize('config', ['.cargo/config.toml', 'native/.cargo/config.toml'])
+def test_changed_cargo_configuration_invalidates_strict_build_cache(tmp_path, config):
+    root = native_tree(tmp_path)
+    binary = verified_binary(root)
+    key = build_native.cache_key(root)
+    path = root/config
+    path.parent.mkdir(parents=True)
+    path.write_text('[build]\nrustflags = ["--cfg", "changed"]\n', encoding='utf-8')
+    assert build_native.cache_key(root) != key
+    with pytest.raises(build_native.InvalidBuild, match='identity.cargo_config'):
+        build_native.checked_extension(root, smoke=False, require_tested=True,
+                                       identity=build_native.build_identity(root))
+    assert build_native.checked_extension(root, smoke=False, require_tested=True) == binary.resolve()
+
+
+def test_compiler_rollout_allows_artifact_consumption_without_compiler_probes(tmp_path, monkeypatch):
+    root = native_tree(tmp_path)
+    monkeypatch.setattr(build_native, 'compiler_identity',
+                        lambda: {'installation_version': '18.10.12224.181'})
+    binary = verified_binary(root)
+    old_key = build_native.cache_key(root)
+    monkeypatch.setattr(build_native, 'compiler_identity',
+                        lambda: {'installation_version': '18.11.12306.390'})
+    assert build_native.cache_key(root) != old_key
+    with pytest.raises(build_native.InvalidBuild, match='identity.compiler.installation_version'):
+        build_native.checked_extension(root, smoke=False, require_tested=True,
+                                       identity=build_native.build_identity(root))
+    def forbidden(*args):
+        raise AssertionError('Artifact consumers must not probe installed compilers')
+    monkeypatch.setattr(build_native, 'compiler_identity', forbidden)
+    monkeypatch.setattr(build_native, 'toolchain_identity', forbidden)
+    smokes = []
+    monkeypatch.setattr(build_native, 'smoke_extension', lambda path: smokes.append(path))
+    assert build_native.checked_extension(root, require_tested=True) == binary.resolve()
+    assert smokes == [root.resolve()]
+
+
+def test_compiler_rollout_rebuilds_and_retests_strict_cache(tmp_path, monkeypatch):
+    root = native_tree(tmp_path)
+    monkeypatch.setattr(build_native, 'compiler_identity',
+                        lambda: {'installation_version': '18.10.12224.181'})
+    verified_binary(root)
+    monkeypatch.setattr(build_native, 'compiler_identity',
+                        lambda: {'installation_version': '18.11.12306.390'})
+    commands, smokes = fake_compilation(root, monkeypatch)
+    build_native.build_native(root, reuse=True, test=True)
+    assert [command[1] for command in commands] == ['test', 'build']
+    receipt = json.loads(build_native.receipt_path(root).read_text(encoding='utf-8'))
+    assert receipt['identity']['compiler']['installation_version'] == '18.11.12306.390'
+    assert receipt['tests_passed'] is True
+
+
+@pytest.mark.parametrize('name', ['ImageOS', 'VCToolsInstallDir', 'WindowsSDKVersion'])
+def test_native_build_captures_windows_environment_keys(tmp_path, monkeypatch, name):
+    root = native_tree(tmp_path)
+    monkeypatch.setenv(name, 'original compiler setting')
+    identity = build_native.build_identity(root)
+    key = name.upper() if sys.platform == 'win32' else name
+    assert key in identity['environment']
+    assert 'original compiler setting' not in json.dumps(identity)
+    assert len(identity['environment'][key]) == 64
+    monkeypatch.setenv(name, 'changed compiler setting')
+    assert build_native.cache_key(root, identity=identity) != build_native.cache_key(root)
+
+
+def test_build_mismatch_diagnostics_report_fields_without_setting_values(tmp_path, monkeypatch):
+    root = native_tree(tmp_path)
+    monkeypatch.setenv('RUSTFLAGS', 'private-old-setting')
+    verified_binary(root)
+    monkeypatch.setenv('RUSTFLAGS', 'private-new-setting')
+    with pytest.raises(build_native.InvalidBuild, match='identity.environment.RUSTFLAGS') as failure:
+        build_native.checked_extension(root, smoke=False, identity=build_native.build_identity(root))
+    assert 'private-old-setting' not in str(failure.value)
+    assert 'private-new-setting' not in str(failure.value)
+
+
+@pytest.mark.parametrize('invalid', ['missing', 'source', 'binary', 'abi', 'untested', 'import'])
+def test_artifact_check_fails_without_falling_back_to_build(tmp_path, monkeypatch, invalid):
+    root = native_tree(tmp_path)
+    binary = verified_binary(root, tested=invalid != 'untested')
+    if invalid == 'missing':
+        binary.unlink()
+    elif invalid == 'source':
+        (root/'native/src/lib.rs').write_text('changed source', encoding='utf-8')
+    elif invalid == 'binary':
+        binary.write_bytes(b'changed binary')
+    elif invalid == 'abi':
+        monkeypatch.setattr(build_native, 'ABI_VERSION', build_native.ABI_VERSION + 1)
+    def forbidden(*args, **kwargs):
+        raise AssertionError('Artifact-only checks must never build or probe compilers')
+    monkeypatch.setattr(build_native, 'build_native', forbidden)
+    monkeypatch.setattr(build_native, 'compiler_identity', forbidden)
+    monkeypatch.setattr(build_native, 'toolchain_identity', forbidden)
+    def smoke(root):
+        if invalid == 'import':
+            raise subprocess.CalledProcessError(1, ['python', 'import-check'])
+    monkeypatch.setattr(build_native, 'smoke_extension', smoke)
+    check = build_native.checked_extension
+    monkeypatch.setattr(build_native, 'checked_extension', lambda **kwargs: check(root, **kwargs))
+    expected_error = subprocess.CalledProcessError if invalid == 'import' else build_native.InvalidBuild
+    with pytest.raises(expected_error):
+        build_native.main(['--check', '--test'])
+
+
+@pytest.mark.parametrize('invalid_abi', [True, 1.0])
+def test_artifact_abi_must_be_the_declared_integer_version(tmp_path, invalid_abi):
+    root = native_tree(tmp_path)
+    verified_binary(root)
+    path = build_native.receipt_path(root)
+    receipt = json.loads(path.read_text(encoding='utf-8'))
+    receipt['identity']['abi_version'] = invalid_abi
+    path.write_text(json.dumps(receipt), encoding='utf-8')
+    with pytest.raises(build_native.InvalidBuild, match='identity.abi_version'):
+        build_native.checked_extension(root, smoke=False, require_tested=True)

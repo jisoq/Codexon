@@ -55,6 +55,11 @@ def source_base(github, sha, root=ROOT, *, branch='main', current_run=''):
             continue
         if ancestry.returncode:
             raise RuntimeError('Cannot establish the source-verified ancestor')
+        policy = subprocess.run(['git', 'diff', '--quiet', base, sha, '--', *source_receipt.INPUTS], cwd=root, capture_output=True)
+        if policy.returncode == 1:
+            continue
+        if policy.returncode:
+            raise RuntimeError('Cannot compare source verification policies')
         jobs = github.api(f'actions/runs/{run["id"]}/jobs')['jobs']
         if not any(job['name'] == 'source' and job['conclusion'] == 'success' for job in jobs):
             continue

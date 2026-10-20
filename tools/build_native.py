@@ -94,26 +94,8 @@ def compiler_identity():
             'sdk_versions': sorted(path.name for path in sdk.glob('*') if path.is_dir())}
 
 
-def build_identity(root=ROOT):
+def artifact_identity(root=ROOT):
     root = Path(root).resolve()
-    cargo_home = Path(os.environ.get('CARGO_HOME', Path.home() / '.cargo'))
-    configs = {}
-    for label, folder in (('repository', root / '.cargo'), ('native', root / 'native/.cargo'),
-                          ('user', cargo_home),
-                          *((f'ancestor-{index}', parent / '.cargo')
-                            for index, parent in enumerate(root.parents, start=1))):
-        for name in ('config', 'config.toml'):
-            path = folder / name
-            if path.is_file():
-                configs[f'{label}/{name}'] = binary_digest(path)
-    ignored = {'CARGO_HOME', 'RUSTUP_HOME', 'PYO3_PYTHON'}
-    environment = {name: value for name, value in os.environ.items()
-                   if name not in ignored and (name.startswith(('CARGO_', 'RUST', 'PYO3_',
-                                                                'CC_', 'CXX_', 'AR_'))
-                   or name in {'CC', 'CXX', 'AR', 'CFLAGS', 'CPPFLAGS', 'CXXFLAGS', 'LDFLAGS',
-                               'VCToolsVersion', 'WindowsSDKVersion', 'VSCMD_ARG_TGT_ARCH',
-                               'ImageOS', 'CL', '_CL_', 'VSINSTALLDIR', 'VCINSTALLDIR',
-                               'VCToolsInstallDir', 'WindowsSdkDir', 'UCRTVersion', 'UniversalCRTSdkDir'})}
     return {
         'schema': RECEIPT_SCHEMA,
         'abi_version': ABI_VERSION,
@@ -126,6 +108,37 @@ def build_identity(root=ROOT):
                    'gil_disabled': sysconfig.get_config_var('Py_GIL_DISABLED')},
         'platform': {'system': sys.platform, 'machine': platform.machine(),
                      'platform': sysconfig.get_platform(), 'bits': struct.calcsize('P') * 8},
+    }
+
+
+def build_identity(root=ROOT):
+    root = Path(root).resolve()
+    cargo_home = Path(os.environ.get('CARGO_HOME', Path.home() / '.cargo'))
+    configs = {}
+    for label, folder in (('repository', root / '.cargo'), ('native', root / 'native/.cargo'),
+                          ('user', cargo_home),
+                          *((f'ancestor-{index}', parent / '.cargo')
+                            for index, parent in enumerate(root.parents, start=1))):
+        for name in ('config', 'config.toml'):
+            path = folder / name
+            if path.is_file():
+                configs[f'{label}/{name}'] = binary_digest(path)
+    normalize = str.upper if os.name == 'nt' else str
+    ignored = {'CARGO_HOME', 'RUSTUP_HOME', 'PYO3_PYTHON'}
+    included = {normalize(name) for name in (
+        'CC', 'CXX', 'AR', 'CFLAGS', 'CPPFLAGS', 'CXXFLAGS', 'LDFLAGS',
+        'VCToolsVersion', 'WindowsSDKVersion', 'VSCMD_ARG_TGT_ARCH', 'ImageOS', 'CL', '_CL_',
+        'VSINSTALLDIR', 'VCINSTALLDIR', 'VCToolsInstallDir', 'WindowsSdkDir', 'UCRTVersion',
+        'UniversalCRTSdkDir',
+    )}
+    environment = {}
+    for name, value in os.environ.items():
+        name = normalize(name)
+        if name not in ignored and (name in included or name.startswith(
+                ('CARGO_', 'RUST', 'PYO3_', 'CC_', 'CXX_', 'AR_'))):
+            environment[name] = hashlib.sha256(value.encode('utf-8')).hexdigest()
+    return {
+        **artifact_identity(root),
         'toolchain': toolchain_identity(root),
         'compiler': compiler_identity(),
         'cargo_config': configs,
@@ -174,20 +187,46 @@ def smoke_extension(root=ROOT):
                    cwd=root, check=True)
 
 
+def identity_mismatches(expected, actual, *, exact=False, field='identity'):
+    if not isinstance(expected, dict) or not isinstance(actual, dict):
+        return [] if type(expected) is type(actual) and expected == actual else [field]
+    mismatches = []
+    for name, value in expected.items():
+        child = f'{field}.{name}'
+        if name not in actual:
+            mismatches.append(child)
+        else:
+            mismatches.extend(identity_mismatches(value, actual[name], exact=exact, field=child))
+    if exact and actual.keys() - expected.keys():
+        mismatches.append(f'{field}.unexpected_fields')
+    return mismatches
+
+
 def checked_extension(root=ROOT, *, smoke=True, require_tested=False, identity=None):
+    """Check artifact compatibility, or exact build identity when explicitly supplied."""
     root = Path(root).resolve()
     binary = extension_path(root)
-    identity = build_identity(root) if identity is None else identity
+    strict = identity is not None
+    expected = artifact_identity(root) if identity is None else identity
     try:
         receipt = json.loads(receipt_path(root).read_text(encoding='utf-8'))
-        valid = (isinstance(receipt, dict) and receipt.get('schema') == RECEIPT_SCHEMA
-                 and receipt.get('identity') == identity
-                 and receipt.get('binary_sha256') == binary_digest(binary)
-                 and (not require_tested or receipt.get('tests_passed') is True))
+        mismatches = []
+        if not isinstance(receipt, dict):
+            mismatches.append('receipt')
+        else:
+            if type(receipt.get('schema')) is not int or receipt['schema'] != RECEIPT_SCHEMA:
+                mismatches.append('schema')
+            mismatches.extend(identity_mismatches(expected, receipt.get('identity'), exact=strict))
+            if receipt.get('binary_sha256') != binary_digest(binary):
+                mismatches.append('binary_sha256')
+            if require_tested and receipt.get('tests_passed') is not True:
+                mismatches.append('tests_passed')
     except (OSError, ValueError, KeyError, TypeError) as error:
         raise InvalidBuild('Rust extension is missing or unverified; run tools/build_native.py --test.') from error
-    if not valid:
-        raise InvalidBuild('Rust extension is stale or changed, or lacks required tests; run tools/build_native.py --test.')
+    if mismatches:
+        raise InvalidBuild('Rust extension is stale or changed, or lacks required tests; '
+                           f'mismatched fields: {", ".join(mismatches)}; '
+                           'run tools/build_native.py --test.')
     if smoke:
         smoke_extension(root)
     return binary.resolve()

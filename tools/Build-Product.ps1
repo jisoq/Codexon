@@ -2,7 +2,8 @@ param(
     [ValidateSet('Codexon')][string]$Product,
     [string]$DistPath,
     [string]$WorkPath,
-    [string]$PythonPath = ''
+    [string]$PythonPath = '',
+    [switch]$UseNativeArtifact
 )
 $ErrorActionPreference = 'Stop'
 $sourceRoot = [IO.Path]::GetFullPath((Split-Path $PSScriptRoot -Parent))
@@ -43,7 +44,11 @@ Archive-Directory $stagingRoot (Join-Path $sourceRoot '.staging') 'previous-stag
 Archive-Directory (Join-Path $workRoot $Product) $workRoot 'previous-build'
 Push-Location $sourceRoot
 try {
-    & $PythonPath (Join-Path $sourceRoot 'tools/build_native.py') --reuse --test
+    if ($UseNativeArtifact) {
+        & $PythonPath (Join-Path $sourceRoot 'tools/build_native.py') --check --test
+    } else {
+        & $PythonPath (Join-Path $sourceRoot 'tools/build_native.py') --reuse --test
+    }
     if ($LASTEXITCODE -ne 0) { throw 'The required Rust extension did not build or pass its import check.' }
     & $PythonPath -m PyInstaller --noconfirm --clean --distpath $stagingRoot --workpath $workRoot ($Product + '.spec')
     if ($LASTEXITCODE -ne 0) { throw 'Build failed; the previous distribution remains in place.' }

@@ -236,7 +236,7 @@ jobs:
           python -m pip_audit -r requirements-release.lock
       - name: Build Windows package
         shell: pwsh
-        run: .\build.ps1 -DistPath dist-ci -WorkPath build-ci -PythonPath ((Get-Command python).Source)
+        run: .\build.ps1 -DistPath dist-ci -WorkPath build-ci -PythonPath ((Get-Command python).Source) -UseNativeArtifact
       - name: Build isolated installer
         shell: pwsh
         run: |

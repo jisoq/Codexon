@@ -435,3 +435,61 @@ def test_existing_public_version_or_missing_notes_cannot_create_release_artifact
     github.tag = None
     (root/'docs/releases/2026.10.11.1.md').unlink()
     assert not pipeline.plan(github, SHA, '20', 'push', 'refs/heads/main', False, root)['release_artifact']
+
+
+@pytest.fixture
+def source_candidate(root):
+    from tools import source_receipt
+    base = 'b' * 40
+    record = {**run_record(), 'head_sha': base}
+    receipt = dict(schema=2, policy=source_receipt.POLICY, commit=base, run_id='10',
+                   environment=source_receipt.environment_key(root), complete=True,
+                   scope=['tests'], args=['--full'], suite='essential', affected_tests=[])
+    class SourceGitHub(FakeGitHub):
+        def __init__(self):
+            super().__init__([record])
+            self.requests = []
+            self.downloads = []
+        def api(self, path, **kwargs):
+            self.requests.append(path)
+            if path.endswith('/jobs'):
+                return {'jobs': [dict(name='source', conclusion='success')]}
+            if path.endswith('/artifacts'):
+                return {'artifacts': [dict(name='source-verified-' + base, expired=False, size_in_bytes=1024)]}
+            return super().api(path, **kwargs)
+        def command(self, *args):
+            self.downloads.append(args)
+            (Path(args[-1])/'source-verification.json').write_text(json.dumps(receipt))
+    return SourceGitHub(), receipt, base
+
+
+def test_source_prefilter_avoids_remote_metadata_and_downloads_for_incompatible_inputs(root, monkeypatch, source_candidate):
+    github, _, base = source_candidate
+    commands = []
+    def compare(command, **kwargs):
+        commands.append(command)
+        return SimpleNamespace(returncode=1 if command[1] == 'diff' else 0)
+    monkeypatch.setattr(pipeline.subprocess, 'run', compare)
+    assert pipeline.source_base(github, SHA, root) == ''
+    assert len(github.requests) == 1 and not github.downloads
+    assert commands[-1][:6] == ['git', 'diff', '--quiet', base, SHA, '--']
+    assert '.github/workflows/windows.yml' not in commands[-1][6:]
+
+
+@pytest.mark.parametrize('valid_environment', [True, False])
+def test_source_prefilter_still_validates_downloaded_receipts(root, monkeypatch, source_candidate, valid_environment):
+    github, receipt, base = source_candidate
+    if not valid_environment:
+        receipt['environment'] = 'incompatible environment'
+    monkeypatch.setattr(pipeline.subprocess, 'run', lambda *a, **k: SimpleNamespace(returncode=0))
+    assert pipeline.source_base(github, SHA, root) == (base if valid_environment else '')
+    assert len(github.downloads) == 1
+
+
+def test_source_prefilter_git_errors_fail_before_remote_metadata(root, monkeypatch, source_candidate):
+    github, _, _ = source_candidate
+    monkeypatch.setattr(pipeline.subprocess, 'run', lambda command, **kwargs:
+                        SimpleNamespace(returncode=2 if command[1] == 'diff' else 0))
+    with pytest.raises(RuntimeError, match='Cannot compare source verification policies'):
+        pipeline.source_base(github, SHA, root)
+    assert len(github.requests) == 1 and not github.downloads
