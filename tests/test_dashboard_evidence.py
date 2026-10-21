@@ -173,8 +173,9 @@ def test_stale_population_closes_chart_hover_and_notification_floor_stays_curren
 @pytest.mark.parametrize('language',['ko','en'])
 @pytest.mark.essential
 def test_tab_loading_keeps_controls_and_ignores_stale_result(tmp_path,language):
-    from PySide6.QtTest import QTest
+    from PySide6.QtTest import QSignalSpy,QTest
     from cachemonitor.i18n import set_language
+    from cachemonitor.theme import shared_theme
     from cachemonitor.quick_qa import control,walk
     from test_ui import wait_for_rendered
     set_language(language);window=dashboard(tmp_path)
@@ -202,12 +203,14 @@ def test_tab_loading_keeps_controls_and_ignores_stale_result(tmp_path,language):
         fill=next(item for item in walk(progress) if item.objectName()=='loading-completed')
         assert fill.width()==0
         activity=next(item for item in walk(progress) if item.objectName()=='loading-activity')
-        position=activity.x()
-        wait_for_rendered(lambda:activity.x()!=position)
+        reduced_motion=shared_theme().reduceMotion
+        movement=QSignalSpy(activity.xChanged)
+        if not reduced_motion:wait_for_rendered(lambda:movement.count()>0)
         elapsed=window.analysis_loading.get('elapsedText','')
         window.analysis_started-=2
         wait_for_rendered(lambda:bool(window.analysis_loading.get('elapsedText')) and
                           window.analysis_loading['elapsedText']!=elapsed,timeout=2)
+        if reduced_motion:assert movement.count()==0
         window.analysis_progressed(dict(id=old_id,stage='query'))
         assert fill.width()==0
         window.analysis_progressed(dict(id=old_id,stage='query',processed=20,total=100,unit='sessions'))
