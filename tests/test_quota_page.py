@@ -118,7 +118,8 @@ def test_current_chart_remains_usable_until_full_history_finishes(quota_page,tmp
                     int(loading.mapToScene(QPointF()).x()),int(loading.mapToScene(QPointF()).y()),
                     int(loading.width()),int(loading.height()))
                 first=frame()
-                wait_for_rendered(lambda:frame()!=first)
+                reduced_motion=shared_theme().reduceMotion
+                if not reduced_motion:wait_for_rendered(lambda:frame()!=first)
                 assert host.quick.grabFramebuffer().save(str(tmp_path/'quota-cycle-loading.png'))
             plot=render_plot(host,panel.history);click(host,plot,x=plot.width()*.6,y=plot.height()*.5)
             QTest.keyClick(host.quick,Qt.Key_Home)
