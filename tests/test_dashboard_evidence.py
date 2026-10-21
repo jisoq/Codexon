@@ -48,13 +48,13 @@ def deliver_pending(window):
 
 
 def test_saved_maximized_window_starts_and_updates_quota_visibility(tmp_path):
-    from PySide6.QtWidgets import QWidget
     from test_ui import wait_for_rendered
-    app=QApplication.instance() or QApplication([])
-    saved=QWidget();saved.resize(720,620);saved.setWindowState(Qt.WindowMaximized)
-    settings=QSettings(str(tmp_path/'settings.ini'),QSettings.IniFormat)
-    settings.setValue('dashboard/geometry',saved.saveGeometry())
-    saved.close();saved.deleteLater()
+    saved=dashboard(tmp_path)
+    try:
+        saved.resize(720,620);saved.move(100,100);saved.showMaximized()
+        wait_for_rendered(lambda:saved.isMaximized() and saved.windowHandle().isExposed())
+        saved.close()
+    finally:close_dashboard(saved)
     window=dashboard(tmp_path)
     try:
         window.show()
@@ -62,9 +62,10 @@ def test_saved_maximized_window_starts_and_updates_quota_visibility(tmp_path):
         window.change_page(3)
         assert window.quota_panel.presentation_active
         window.showMinimized()
-        wait_for_rendered(lambda:not window.quota_panel.presentation_active)
+        wait_for_rendered(lambda:window.isMinimized() and not window.quota_panel.presentation_active)
         window.showNormal();window.resize(720,620)
-        wait_for_rendered(lambda:window.quota_panel.presentation_active)
+        wait_for_rendered(lambda:not window.isMinimized() and not window.isMaximized() and
+                          window.quota_panel.presentation_active)
         assert not window.qml_errors
     finally:close_dashboard(window)
 
