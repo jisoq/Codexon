@@ -351,7 +351,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python tools/run_ui_checks.py -- python tools/verify_app_services.py --executable dist-ci/Codexon/Codexon.exe --legacy-collector-exe $published.executable --output artifacts/verification/published-app-services
       - name: Check packaged GUI handoff with multiple custom homes
-        if: fromJSON(needs.resolve.outputs.plan).package
+        if: fromJSON(needs.resolve.outputs.plan).gui_handoff
         run: python tools/run_ui_checks.py -- python tools/verify_gui_handoff.py --executable dist-ci/Codexon/Codexon.exe --output artifacts/verification/gui-handoff
       - name: Check proxy replacement with a custom observation filename
         if: fromJSON(needs.resolve.outputs.plan).proxy

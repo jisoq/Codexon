@@ -92,7 +92,7 @@ def test_existing_release_is_idempotent_but_different_commit_is_rejected(root):
         pipeline.plan(github, SHA, '20', 'workflow_dispatch', 'refs/heads/other', True, root)
 
 
-def prepared_artifact(root):
+def prepared_artifact(root, *, plan=None):
     folder = root/'release'
     folder.mkdir()
     product = root/'product'
@@ -106,7 +106,7 @@ def prepared_artifact(root):
     (product/'SOURCE-OFFER.md').write_text(prepare_sources.describe(prepare_sources.load_lock(root))['url'])
     (folder/'Codexon-Setup.exe').write_bytes(b'verified installer')
     (folder/'Codexon-Setup.exe.sha256').write_text(pipeline.digest(folder/'Codexon-Setup.exe') + '  Codexon-Setup.exe\n')
-    pipeline.seal(folder, product, SHA, '10', root)
+    pipeline.seal(folder, product, SHA, '10', root, plan=plan)
     return folder
 
 
@@ -301,13 +301,14 @@ def test_failed_and_nonancestor_runs_cannot_hide_unverified_changes(root, monkey
     assert checked == ['d' * 40, 'b' * 40]
 
 
-def test_missing_verified_baseline_requests_essential_checks(root):
+def test_missing_verified_baseline_requests_basic_source_and_native_package_checks(root):
     assert pipeline.verified_base(FakeGitHub(), SHA, root) == ''
     from tools.ci_plan import build_plan
     checks = build_plan(None, candidate=True)
-    assert checks['source_args'] == ['--full']
-    assert checks['source_suite'] == 'essential'
-    assert checks['package'] and checks['proxy'] and checks['msix']
+    assert checks['source_args'] == ['--basic']
+    assert checks['source_suite'] == 'basic'
+    assert checks['package'] and checks['native']
+    assert not checks['proxy'] and not checks['msix']
 
 
 def test_publish_failure_does_not_discard_successfully_verified_installer(root):
@@ -319,14 +320,17 @@ def test_publish_failure_does_not_discard_successfully_verified_installer(root):
     assert result['reuse_run'] == '10' and not result['verify']
 
 
+@pytest.mark.parametrize('basic', [False, True])
 @pytest.mark.parametrize('branch', ['main', 'codex/verification'])
 @pytest.mark.parametrize('base', ['b' * 40, SHA])
-def test_source_success_survives_install_failure_but_invalid_environment_does_not(root, monkeypatch, branch, base):
+def test_source_success_survives_install_failure_but_basic_cannot_seed_affected_baseline(root, monkeypatch, branch, base, basic):
     from tools import source_receipt
     record = {**run_record(), 'head_sha': base, 'head_branch': branch, 'conclusion': 'failure'}
     receipt = dict(schema=2, policy=source_receipt.POLICY, commit=base, run_id='10',
                    environment=source_receipt.environment_key(root), complete=True,
-                   scope=['tests'], args=['--full'], suite='essential', affected_tests=[])
+                   scope=sorted(source_receipt.basic_tests()) if basic else ['tests'],
+                   args=['--basic'] if basic else ['--full'], suite='basic' if basic else 'essential',
+                   affected_tests=[], scales=False)
     class SourceGitHub(FakeGitHub):
         def api(self, path, **kwargs):
             if path.endswith('/jobs'):
@@ -339,10 +343,10 @@ def test_source_success_survives_install_failure_but_invalid_environment_does_no
             (Path(args[-1])/'source-verification.json').write_text(json.dumps(receipt))
     monkeypatch.setattr(pipeline.subprocess, 'run', lambda *a, **kw: SimpleNamespace(returncode=0))
     github = SourceGitHub([record])
-    assert pipeline.source_base(github, SHA, root, branch=branch) == base
+    assert pipeline.source_base(github, SHA, root, branch=branch) == ('' if basic else base)
     assert pipeline.source_base(github, SHA, root, branch=branch, current_run='10') == ''
     assert pipeline.plan(github, SHA, '20', 'workflow_dispatch', 'refs/heads/' + branch,
-                         False, root, prepare=True)['source_base'] == base
+                         False, root, prepare=True)['source_base'] == ('' if basic else base)
     assert pipeline.verified_base(github, SHA, root, branch=branch) == ''
     assert pipeline.trusted(record, base, github.repository) == (branch == 'main')
     (root/'requirements-release.lock').write_text('changed environment')
@@ -381,8 +385,9 @@ def test_failed_deployment_is_not_hidden_by_a_new_source_baseline():
     from tools.ci_plan import build_plan
     plan = build_plan({'docs/followup.md'}, base='source-passed',
                       package_changed={'cachemonitor/install_activation.py', 'docs/followup.md'})
-    assert plan['tests'] == ()
-    assert plan['package'] and plan['proxy'] and plan['msix']
+    assert plan['source_suite'] == 'basic' and plan['tests']
+    assert plan['package'] and plan['native']
+    assert not plan['proxy'] and not plan['msix']
 
 
 def test_notes_do_not_make_an_ordinary_push_a_release_candidate(root):
@@ -493,3 +498,45 @@ def test_source_prefilter_git_errors_fail_before_remote_metadata(root, monkeypat
     with pytest.raises(RuntimeError, match='Cannot compare source verification policies'):
         pipeline.source_base(github, SHA, root)
     assert len(github.requests) == 1 and not github.downloads
+
+
+@pytest.mark.parametrize('extended, coverage', [(False, 'basic-ci-v1'), (True, 'extended-ci-v1')])
+def test_release_receipt_records_the_immutable_ci_plan_coverage(root, extended, coverage):
+    from tools import source_receipt
+    from tools.ci_plan import build_plan
+    plan = build_plan(set(), candidate=True, extended=extended)
+    plan.update(commit=SHA, source_environment=source_receipt.environment_key(root))
+    folder = prepared_artifact(root, plan=plan)
+    assert pipeline.validate_artifact(folder, SHA, '10', root)['coverage'] == coverage
+    (folder/'Codexon-Setup.exe').write_bytes(b'changed after verification')
+    with pytest.raises(ValueError, match='artifact changed'):
+        pipeline.validate_artifact(folder, SHA, '10', root)
+
+
+def test_release_sealing_rejects_a_partial_basic_plan(root):
+    from tools import source_receipt
+    from tools.ci_plan import build_plan
+    plan = build_plan(set(), candidate=True)
+    plan.update(commit=SHA, source_environment=source_receipt.environment_key(root))
+    plan['tests'] = list(plan['tests'])[:-1]
+    with pytest.raises(ValueError, match='canonical audited selection'):
+        prepared_artifact(root, plan=plan)
+    assert not (root/'release/verification.json').exists()
+
+
+def test_workflow_compatibility_steps_use_the_extended_plan_gates():
+    from tools.ci_plan import build_plan
+    workflow = (pipeline.ROOT/'.github/workflows/windows.yml').read_text()
+    gates = {
+        'Check overlay native scaling':'scales',
+        'Check installation from an MSIX process':'msix',
+        'Check migration from the actual published installer':'proxy',
+        'Check packaged GUI handoff with multiple custom homes':'gui_handoff',
+        'Check proxy replacement with a custom observation filename':'proxy',
+    }
+    basic = build_plan(None, candidate=True)
+    extended = build_plan(None, candidate=True, extended=True)
+    for name, gate in gates.items():
+        step = workflow.split('      - name: ' + name + '\n')[1].split('      - ')[0]
+        assert 'if: fromJSON(needs.resolve.outputs.plan).' + gate in step
+        assert not basic[gate] and extended[gate]

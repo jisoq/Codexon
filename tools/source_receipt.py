@@ -6,7 +6,9 @@ from pathlib import Path
 import platform
 import re
 
-POLICY = 'source-coverage-v3'
+from tools.verify_changes import basic_tests
+
+POLICY = 'source-coverage-v4'
 INPUTS = ('requirements-release.lock', 'rust-toolchain.toml', 'native/Cargo.lock',
           'pytest.ini', 'tests/conftest.py', 'tools/verify_changes.py', 'tools/ci_plan.py',
           'tools/check_environment.py', 'tools/run_ui_checks.py', 'tools/check_processes.py',
@@ -98,7 +100,13 @@ def check_environment(plan, sha, root):
     return dict(environment=key, runner=runner_environment(), commit=sha)
 
 
+def basic_selection(scope, args, affected):
+    return list(scope) == list(basic_tests()) and list(args) == ['--basic'] and not affected
+
+
 def coverage_suite(args, affected=()):
+    if '--basic' in args:
+        return 'basic'
     if '--extended' in args:
         return 'extended'
     if '--integration' in args:
@@ -112,6 +120,8 @@ def write_receipt(folder, plan, sha, run_id, root):
     environment = check_environment(plan, sha, root)
     affected = list(plan.get('affected_tests', ()))
     suite = coverage_suite(plan['source_args'], affected)
+    if suite == 'basic' and (not basic_selection(plan['tests'], plan['source_args'], affected) or plan['scales'] is not False):
+        raise ValueError('Basic source coverage must match the canonical audited selection')
     if plan.get('source_suite', suite) != suite:
         raise ValueError('Source coverage profile does not match the executed arguments')
     receipt = dict(schema=2, policy=POLICY, commit=sha, run_id=str(run_id),
@@ -137,5 +147,7 @@ def valid(receipt, sha, run_id, root):
     scope, args, affected = (receipt.get(name) for name in ('scope', 'args', 'affected_tests'))
     if not all(isinstance(items, list) and all(isinstance(item, str) for item in items)
                for items in (scope, args, affected)):
+        return False
+    if '--basic' in args and (not basic_selection(scope, args, affected) or receipt.get('scales') is not False):
         return False
     return receipt.get('suite') == coverage_suite(args, affected)

@@ -76,7 +76,7 @@ def source_base(github, sha, root=ROOT, *, branch='main', current_run=''):
                 receipt = json.loads(path.read_text(encoding='utf-8'))
             except (ValueError, UnicodeError):
                 continue
-        if source_receipt.valid(receipt, base, run['id'], root):
+        if source_receipt.valid(receipt, base, run['id'], root) and receipt['suite'] != 'basic':
             return base
     return ''
 
@@ -218,7 +218,19 @@ def check_installer(folder):
     return expected
 
 
-def seal(folder, product, sha, run_id, root=ROOT):
+def seal(folder, product, sha, run_id, root=ROOT, *, plan=None):
+    coverage = 'affected-regression-v1'
+    if plan is not None:
+        source_receipt.check_environment(plan, sha, root)
+        suite = source_receipt.coverage_suite(plan['source_args'], plan['affected_tests'])
+        if plan['source_suite'] != suite:
+            raise ValueError('Release coverage does not match the source plan')
+        if suite == 'basic':
+            if not source_receipt.basic_selection(plan['tests'], plan['source_args'], plan['affected_tests']) or plan['scales'] is not False:
+                raise ValueError('Basic release coverage must match the canonical audited selection')
+            coverage = 'basic-ci-v1'
+        elif suite == 'extended':
+            coverage = 'extended-ci-v1'
     manifest = json.loads((product/'build-manifest.json').read_text(encoding='utf-8-sig'))
     if manifest['commit'] != sha or manifest['version'] != version(root):
         raise ValueError('Verified product does not match release commit/version')
@@ -233,7 +245,7 @@ def seal(folder, product, sha, run_id, root=ROOT):
     shutil.copyfile(product/'build-manifest.json', folder/'build-manifest.json')
     shutil.copyfile(root/f'docs/releases/{manifest["version"]}.md', folder/'RELEASE_NOTES.md')
     receipt = dict(schema=1, commit=sha, version=manifest['version'], run_id=str(run_id),
-                   coverage='affected-regression-v1', source_key=reference['key'],
+                   coverage=coverage, source_key=reference['key'],
                    files={name: digest(folder/name) for name in FILES})
     (folder/'verification.json').write_text(json.dumps(receipt, indent=2) + '\n', encoding='utf-8')
     return receipt
@@ -243,7 +255,7 @@ def validate_artifact(folder, sha, run_id, root=ROOT):
     receipt = json.loads((folder/'verification.json').read_text(encoding='utf-8'))
     if (receipt.get('schema') != 1 or receipt.get('commit') != sha
             or receipt.get('version') != version(root) or receipt.get('run_id') != str(run_id)
-            or receipt.get('coverage') not in ('full', 'affected-regression-v1')
+            or receipt.get('coverage') not in ('full', 'affected-regression-v1', 'basic-ci-v1', 'extended-ci-v1')
             or receipt.get('source_key') != describe(load_lock(root))['key']):
         raise ValueError('Artifact verification receipt does not match this release')
     if set(receipt['files']) != set(FILES):
@@ -338,7 +350,8 @@ def main():
                 for key, value in result.items():
                     output.write(f'{key}={str(value).lower() if isinstance(value, bool) else value}\n')
     elif args.action == 'seal':
-        result = seal(args.folder.resolve(), args.product.resolve(), args.sha, args.run_id)
+        planned = json.loads(args.plan.read_text(encoding='utf-8-sig'))
+        result = seal(args.folder.resolve(), args.product.resolve(), args.sha, args.run_id, plan=planned)
     elif args.action in ('candidate', 'check-candidate'):
         receipt = candidate_receipt(args.folder.resolve(), args.sha, args.run_id, validate=args.action == 'check-candidate')
         result = dict(commit=receipt['commit'], run_id=receipt['run_id'],

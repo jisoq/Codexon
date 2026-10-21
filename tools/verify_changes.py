@@ -33,7 +33,6 @@ def test_nodes(module, *names):
     return tuple(f'tests/test_{module}.py::{name}' for name in names)
 
 
-# Components select observable contracts. There is deliberately no always-run core.
 GROUPS = {
     'native_cpu': test_files('native_cpu', 'native_trends', 'native_usage', 'native_quota_series', 'native_index', 'native_analysis', 'build_native'),
     'notices': test_files('collect_notices'),
@@ -625,6 +624,10 @@ NON_NATIVE_TESTS = frozenset(test_files(
     'collect_notices', 'prepare_sources', 'release_pipeline', 'ci_plan', 'source_receipt'))
 
 
+def basic_tests():
+    return tuple(sorted(CORE_TESTS))
+
+
 def tests_require_native(tests):
     """Keep native parity for every selection except audited non-kernel contracts."""
     return any(test.split('::')[0] not in NON_NATIVE_TESTS for test in tests)
@@ -693,12 +696,15 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--plan', action='store_true', help='Show checks without running them')
     parser.add_argument('--base', help='Git ref to compare when intentionally establishing a new baseline')
+    parser.add_argument('--basic', action='store_true', help='Run the fixed audited core CI checks without advancing the local baseline')
     parser.add_argument('--full', action='store_true', help='Run all essential regression checks')
     parser.add_argument('--integration', action='store_true', help='Run all integration checks too (implies --full)')
     parser.add_argument('--extended', action='store_true', help='Also run large-data benchmarks (implies --full)')
     parser.add_argument('--package-exe', type=Path, help='Check a built executable with isolated records')
     parser.add_argument('--package-only', action='store_true', help='Check only the executable after source checks')
     args = parser.parse_args(argv)
+    if args.basic and (args.full or args.integration or args.extended or args.package_only):
+        parser.error('--basic cannot be combined with another source-suite option or --package-only')
     if args.package_only and (not args.package_exe or args.full or args.integration or args.extended):
         parser.error('--package-only requires --package-exe and cannot be combined with a source-suite option')
     current = file_hashes()
@@ -707,13 +713,16 @@ def main(argv=None):
     changed = changed_files(current, baseline, args.base)
     plan = select_tests(changed,deleted=set(changed or ())-current.keys(),
                         version_only=release_version_only(base_ref=args.base, baseline=baseline))
+    if args.basic:
+        plan = {**plan, 'full':False, 'tests':basic_tests(), 'affected_tests':(), 'groups':('basic',),
+                'reasons':{test:['Audited basic CI contract'] for test in basic_tests()}}
     if args.full or args.integration or args.extended:
         plan = {**plan, 'full':True, 'tests':('tests',), 'groups':('full',),
                 'reasons':{'tests':['사용자가 전체 검사를 지정함']}, 'unmapped':()}
     if args.package_only:
         plan = {**plan, 'full':False, 'tests':(), 'affected_tests':(), 'groups':(), 'reasons':{}, 'unmapped':()}
     public = dict(changed=sorted(changed) if changed is not None else None,
-                  suite='extended' if args.extended else 'integration' if args.integration else
+                  suite='basic' if args.basic else 'extended' if args.extended else 'integration' if args.integration else
                   'essential+affected' if plan['full'] and plan['affected_tests'] else 'essential' if plan['full'] else 'affected',
                   full=plan['full'], unmapped=plan['unmapped'],
                   groups=plan['groups'], tests=plan['tests'], affected_tests=plan['affected_tests'], reasons=plan['reasons'],
@@ -798,7 +807,7 @@ def main(argv=None):
             print(json.dumps(dict(result='package_failed',error=str(error),report=str(folder/'report.json')),ensure_ascii=False))
             return 1
     (folder/'report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
-    if not args.package_only:
+    if not args.package_only and not args.basic:
         BASELINE.write_text(json.dumps(dict(version=1,files=current,report=str(folder/'report.json'),
                                            version_contract=current_contract),
                                        ensure_ascii=False,indent=2),encoding='utf-8')

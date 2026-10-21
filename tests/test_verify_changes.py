@@ -245,10 +245,10 @@ def test_extended_checks_are_explicit_and_each_run_retains_test_timings(tmp_path
     ('cachemonitor/version.py', True, True, False, False),
     ('cachemonitor/pricing.py', False, False, False, False),
     ('cachemonitor/qml/OverlayControls.qml', False, False, False, False),
-    ('cachemonitor/install_activation.py', True, True, True, True),
-    ('cachemonitor/model_proxy.py', True, True, True, False),
+    ('cachemonitor/install_activation.py', True, True, False, False),
+    ('cachemonitor/model_proxy.py', True, True, False, False),
     ('cachemonitor/quick_smoke.py', False, True, False, False),
-    ('requirements-release.lock', True, True, True, True),
+    ('requirements-release.lock', True, True, False, False),
     ('docs/releases/example.md', False, False, False, False),
 ])
 def test_ci_keeps_changed_contracts_without_repeating_unrelated_release_checks(path,candidate,package,proxy,msix):
@@ -257,7 +257,7 @@ def test_ci_keeps_changed_contracts_without_repeating_unrelated_release_checks(p
     assert (plan['package'],plan['proxy'],plan['msix']) == (package,proxy,msix)
     assert plan['native'] == (package and not msix)
     assert not plan['unmapped']
-    assert plan['source_args'] == (['--full','--base','verified'] if path.startswith('requirements') else ['--base','verified'])
+    assert plan['source_args'] == ['--basic']
 
 
 def test_ci_extended_and_qa_tool_fallback_cannot_skip_required_checks():
@@ -268,8 +268,8 @@ def test_ci_extended_and_qa_tool_fallback_cannot_skip_required_checks():
     assert not extended['native']
     for reusable in (False,True):
         plan = build_plan({'tools/verify_proxy_update.py'},base='verified',reuse_qa=reusable)
-        assert plan['qa_reuse'] == reusable
-        assert plan['package'] == plan['proxy'] == (not reusable)
+        assert not plan['qa_reuse'] and not plan['qa_smokes']
+        assert not plan['package'] and not plan['proxy']
 
 
 def test_rust_changes_require_native_parity_and_packaging_without_proxy_migration():
@@ -280,9 +280,9 @@ def test_rust_changes_require_native_parity_and_packaging_without_proxy_migratio
         assert plan['rust'] and plan['package'] and plan['native'], path
         assert not plan['full'] and not plan['proxy'] and not plan['msix'], path
         assert not plan['unmapped'], path
-        assert {'tests/test_native_cpu.py', 'tests/test_build_native.py'} <= set(plan['tests']), path
+        assert {'tests/test_native_index.py', 'tests/test_build_native.py'} <= set(plan['tests']), path
     assert build_plan({'cachemonitor/pricing.py'}, base='verified')['rust']
-    assert not build_plan({'README.md'}, base='verified')['rust']
+    assert build_plan({'README.md'}, base='verified')['rust']
 
 
 def test_only_app_version_literal_can_bypass_proxy_compatibility_checks():
@@ -336,3 +336,65 @@ def test_stale_native_extension_stops_before_tests_and_preserves_baseline(tmp_pa
     result=json.loads(capsys.readouterr().out)
     assert result['result']=='native_failed'
     assert baseline.read_bytes()==original
+
+
+@pytest.mark.parametrize('other', ['--full', '--integration', '--extended', '--package-only'])
+def test_basic_rejects_conflicting_profiles_before_execution(other):
+    import tools.verify_changes as verify
+    with pytest.raises(SystemExit) as error:
+        verify.main(['--basic', other, '--plan'])
+    assert error.value.code == 2
+
+
+@pytest.mark.parametrize('existing_baseline', [False, True])
+def test_basic_success_preserves_local_baseline_and_gui_work(tmp_path, monkeypatch, capsys, existing_baseline):
+    from types import SimpleNamespace
+    import tools.verify_changes as verify
+    import tools.check_environment as environment
+    import tools.build_native as native
+    baseline = tmp_path/'last-success.json'
+    if existing_baseline:
+        baseline.write_text(json.dumps({'files':{'cachemonitor/dashboard.py':'old'}}), encoding='utf-8')
+    original = baseline.read_bytes() if existing_baseline else None
+    monkeypatch.setattr(verify, 'BASELINE', baseline)
+    monkeypatch.setattr(verify, 'REPORTS', tmp_path/'reports')
+    monkeypatch.setattr(verify, 'file_hashes', lambda: {'cachemonitor/dashboard.py':'changed'})
+    monkeypatch.setattr(verify, 'changed_files', lambda *args: {'cachemonitor/dashboard.py'})
+    monkeypatch.setattr(verify, 'release_version_only', lambda **kwargs: False)
+    monkeypatch.setattr(environment, 'check_environment', lambda: dict(errors=[]))
+    monkeypatch.setattr(native, 'extension_path', lambda: tmp_path/'absent.pyd')
+    monkeypatch.setenv('CODEXON_CPU_BACKEND', 'auto')
+    executed = []
+    def run(command, log):
+        executed.append(command)
+        log.write_text('Basic contracts passed', encoding='utf-8')
+        return SimpleNamespace(returncode=0, stdout='Basic contracts passed')
+    monkeypatch.setattr(verify, 'run_logged', run)
+    assert verify.main(['--basic']) == 0
+    capsys.readouterr()
+    reports = list((tmp_path/'reports').glob('*/report.json'))
+    report = json.loads(reports[0].read_text(encoding='utf-8'))
+    assert report['suite'] == 'basic' and not report['full'] and report['affected_tests'] == []
+    assert report['tests'] == sorted(verify.CORE_TESTS)
+    assert len(executed) == 1 and '--no-desktop' in executed[0] and 'core' in executed[0]
+    assert report['pytest']['runs'][0]['exit_code'] == 0
+    if existing_baseline:
+        assert baseline.read_bytes() == original
+    else:
+        assert not baseline.exists()
+    assert verify.main(['--plan']) == 0
+    assert 'tests/test_ui.py' in json.loads(capsys.readouterr().out)['tests']
+
+
+def test_basic_missing_baseline_stays_basic_and_keeps_unmapped_guard(tmp_path, monkeypatch, capsys):
+    import tools.verify_changes as verify
+    monkeypatch.setattr(verify, 'BASELINE', tmp_path/'missing.json')
+    monkeypatch.setattr(verify, 'file_hashes', lambda: {})
+    assert verify.main(['--basic', '--plan']) == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert plan['suite'] == 'basic' and not plan['full'] and plan['affected_tests'] == []
+    assert plan['tests'] == sorted(verify.CORE_TESTS)
+    monkeypatch.setattr(verify, 'file_hashes', lambda: {'cachemonitor/unmapped_new.py':'new'})
+    monkeypatch.setattr(verify, 'changed_files', lambda *args: {'cachemonitor/unmapped_new.py'})
+    assert verify.main(['--basic', '--plan']) == 2
+    assert json.loads(capsys.readouterr().out)['unmapped'] == ['cachemonitor/unmapped_new.py']
