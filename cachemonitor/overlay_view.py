@@ -577,7 +577,6 @@ class OverlayContent(Node):
     def visible_agent_count(self):return self.visible_agent_counts.get(self.agent_count_key(),3)
     def automatic_sub_height(self):
         heights=self._sub_summary_heights[:self.visible_agent_count()]
-        # The count preference limits summaries; every open disclosure adds room.
         return sum(heights)+SUBAGENT_GAP*max(0,len(heights)-1)+self._sub_expanded_height
     def layout(self,reduced=None,*,constrain=True):
         if self.notice_card():

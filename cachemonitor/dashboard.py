@@ -410,7 +410,6 @@ class Dashboard(TrayWindow):
             self.quota_panel.receive(dict(home=self.quota_service.home,quota=self.quota_panel.quota,report_pending=True))
 
     def sync_report_demand(self):
-        # Restoring window geometry can emit state changes before panels exist.
         if not hasattr(self,'quota_panel'):return
         visible=self.isVisible() and not self.isMinimized()
         page=getattr(self,'current_page',3)

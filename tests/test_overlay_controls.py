@@ -116,13 +116,11 @@ def test_subagent_disclosure_resizes_native_panel_and_scrolls_at_frame_limit(nat
     assert (opened[0],opened[2])==(closed[0],closed[2]) and c.anchor==anchor
     frame=c.native.frame(int(c.widget.winId()))
     assert frame[3]-frame[1]==opened[3]
-    # The same disclosure stays usable when the target window has less room.
     host.resize(420,closed[3]+100);refresh()
     wait_for_rendered(lambda:scroll().property('contentHeight')>scroll().height())
     assert c.widget.isVisible() and c.detail.isVisible()
     assert c.monitor_geometry[3]<opened[3] and key in m.expanded_groups
     scroll().setProperty('contentY',scroll().property('contentHeight')-scroll().height())
-    # Restore room and reach the disclosure through its rendered control.
     host.resize(420,1200);refresh()
     wait_for_rendered(lambda:scroll().height()>=m.state['detailBodyHeight'])
     click(c.detail,group())

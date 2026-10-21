@@ -37,7 +37,6 @@ def close_dashboard(window):
     from cachemonitor.quick_qa import dispose
     from test_ui import wait_for_rendered
     window.quit_app()
-    # Exit is asynchronous; finish it before another dashboard or Python exits.
     wait_for_rendered(lambda:window.quitting and window.shutdown_operation is None,timeout=10)
     dispose(window)
 

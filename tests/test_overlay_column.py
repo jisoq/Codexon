@@ -430,7 +430,6 @@ def test_subagent_disclosures_add_their_content_height_and_restore_on_close(colu
     data=next(row for row in synthetic_snapshot(f'sub-{count}')['overlay_sessions'] if row['id']=='preview-main')
     m.set_content(data)
     closed=m.layout();body=m.state['detailBodyHeight']
-    # Include an agent reached by scrolling beyond the summary allowance.
     keys=[row['key'] for row in m.detail_groups()][-2:]
     for key in keys:
         m.toggle_detail_group(key)
