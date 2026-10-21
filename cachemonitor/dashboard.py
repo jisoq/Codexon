@@ -295,6 +295,7 @@ class Dashboard(TrayWindow):
         if screen is None:return
         work=screen.availableGeometry()
         self.setMinimumSize(min(1000,work.width()),min(680,work.height()))
+        if self.windowState() & (Qt.WindowMinimized|Qt.WindowMaximized|Qt.WindowFullScreen):return
         self.resize(min(self.width(),work.width()),min(self.height(),work.height()))
         frame=self.frameGeometry()
         x=max(work.left(),min(frame.left(),work.right()-frame.width()+1))
