@@ -326,7 +326,6 @@ class CollectionReplay:
         if (key in self.invalidated or body['activity'] >= now - WINDOW
                 or session._replay_metadata != self.index.metadata.get(key, {})
                 or session._replay_state != self.session_state(session)):
-            self.index.rebuild_required.add(key)
             if key not in self.index.pending_rebuilds:
                 self.index.pending_rebuilds.append(key)
             ready = False

@@ -11,9 +11,10 @@ from itertools import islice
 from bisect import bisect_right
 from collections import defaultdict, OrderedDict
 from collections import deque
+from copy import deepcopy
 from pathlib import Path
 
-from .core import LINEAGE_FIELDS, SessionRegistry, Session, readonly, stamp, session_lineage
+from .core import LINEAGE_FIELDS, WINDOW, SessionRegistry, Session, readonly, stamp, session_lineage
 from .analysis_records import ROW_SIGNATURE_FIELDS
 from .codex_names import CodexNames, task_select
 from .quota import clean_limits
@@ -643,8 +644,11 @@ class UsageIndex:
                         yield tuple(row[1:]),event
                 finally:cursor.close()
         replay_source=self.event_store.owner_replay_token(*key)
+        previous_replay=previous if previous is not None and hasattr(previous,'_replay_body') else None
+        replay_metadata=deepcopy(self.metadata.get(key,{})) if previous_replay is not None else None
+        replay_state=self.replay.session_state(previous_replay) if previous_replay is not None else None
         self.rebuild_required.discard(key)
-        meta = self.metadata.get(key, {})
+        meta = replay_metadata if previous_replay is not None else self.metadata.get(key, {})
         s.metadata_seen = bool(meta)
         s.title = meta.get('display_title') or meta.get('name') or meta.get('title') or f'작업 {key[1][:8]}'
         s.cwd = (meta.get('cwd') or '').removeprefix('\\\\?\\')
@@ -684,12 +688,25 @@ class UsageIndex:
                 request.model = context.get('model') or request.model
                 request.configured_model = context.get('model') or request.configured_model
             if number%REBUILD_BATCH==0 or self.rebuild_deadline is not None and time.monotonic()>=self.rebuild_deadline:yield
+        if not append:
+            if key in self.rebuild_required:return
+            if previous_replay is not None and (
+                    self.monitor.sessions.get(key) is not previous_replay
+                    or replay_metadata != self.metadata.get(key,{})
+                    or replay_state != self.replay.session_state(previous_replay)):
+                self.rebuild_required.add(key)
+                return
         self.event_tails[key]=tail
-        if not append and key in self.rebuild_required:return
         self.turn_states[key] = states
         previous = self.monitor.sessions.get(key)
         if previous:
             s.transports = previous.transports
+        if previous_replay is not None:
+            s.title_request = s.title_request or previous.title_request or key in self.monitor.title_requests
+            for transport in s.transports:
+                if transport.ts >= now - WINDOW:
+                    if transport.model:s.model = transport.model
+                    s.activity = max(s.activity,transport.ts)
         s._replay_source=replay_source
         if self.replay is not None:self.replay.rebuilt(key,previous)
         self.monitor.sessions[key] = s
