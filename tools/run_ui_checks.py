@@ -172,7 +172,8 @@ def run_on_desktop(kernel, desktop, command, env, *, timeout=720, diagnostics=No
             result = W.DWORD()
             checked(kernel.GetExitCodeProcess(process.process, ctypes.byref(result)))
             live = job.pids()
-            settled = time.monotonic() + .5
+            # Native uninstallers may finish self-cleanup after their parent exits.
+            settled = min(time.monotonic() + 2, started + timeout)
             while reason == 'completed' and live and time.monotonic() < settled:
                 time.sleep(.02)
                 live = job.pids()

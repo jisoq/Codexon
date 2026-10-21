@@ -528,15 +528,16 @@ def test_workflow_compatibility_steps_use_the_extended_plan_gates():
     from tools.ci_plan import build_plan
     workflow = (pipeline.ROOT/'.github/workflows/windows.yml').read_text()
     gates = {
-        'Check overlay native scaling':'scales',
-        'Check installation from an MSIX process':'msix',
-        'Check migration from the actual published installer':'proxy',
-        'Check packaged GUI handoff with multiple custom homes':'gui_handoff',
-        'Check proxy replacement with a custom observation filename':'proxy',
+        'tests/test_overlay_resilience.py':'scales',
+        'verify_msix_installation.ps1':'msix',
+        'tools/verify_proxy_update.py':'proxy',
+        'tools/verify_gui_handoff.py':'gui_handoff',
     }
     basic = build_plan(None, candidate=True)
     extended = build_plan(None, candidate=True, extended=True)
-    for name, gate in gates.items():
-        step = workflow.split('      - name: ' + name + '\n')[1].split('      - ')[0]
-        assert 'if: fromJSON(needs.resolve.outputs.plan).' + gate in step
+    for command, gate in gates.items():
+        steps = [step for step in workflow.split('      - ') if command in step]
+        assert steps
+        assert all('if: fromJSON(needs.resolve.outputs.plan).' + gate in step
+                   for step in steps)
         assert not basic[gate] and extended[gate]
