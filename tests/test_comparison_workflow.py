@@ -662,7 +662,7 @@ def test_main_metric_table_fits_resizes_and_preserves_reasoning_coverage(boxplot
     from pathlib import Path
     from PySide6.QtCore import QPoint,QPointF,Qt
     from PySide6.QtGui import QWheelEvent
-    from PySide6.QtTest import QTest
+    from PySide6.QtTest import QSignalSpy,QTest
     from PySide6.QtWidgets import QApplication
     w=dashboard;w.tick.stop();w.resize(1000,680)
     source=snapshot();source['sessions']=source['sessions'][:1]
@@ -708,14 +708,28 @@ def test_main_metric_table_fits_resizes_and_preserves_reasoning_coverage(boxplot
         assert [item.mapToScene(QPointF()).x() for item in headers]==before
         assert rendered('usage-rows').property('contentX')==0
         for size in ((1600,900),(1000,680)):
-            prior=viewport.width();w.resize(*size)
-            wait_for_rendered(lambda:viewport.width()!=prior)
+            frames=QSignalSpy(w.quick.quickWindow().afterRendering)
+            w.resize(*size);w.quick.update()
+            wait_for_rendered(lambda:frames.count()>0 and w.quick.size()==w.size())
             headers,lines=assert_table_geometry(rendered)
-            label=next(item for item in walk(lines[0]) if item.isVisible() and item.objectName()=='usage-table-label')
-            cell=next(item for item in walk(lines[0]) if item.isVisible() and item.objectName()=='usage-cell-calls')
-            assert (label.mapToItem(lines[0],QPointF()).y()+label.height()<=cell.mapToItem(lines[0],QPointF()).y())==(size[0]==1000)
-            if size[0]==1600:
-                assert w.quick.grabFramebuffer().save(str(evidence/f'table-wide-{boxplot_language}.png'))
+            header=rendered('usage-table-header');heading=rendered('usage-table-label-header')
+            stacked=heading.mapToItem(header,QPointF()).y()+heading.height()<=headers[0].mapToItem(header,QPointF()).y()
+            for line in lines:
+                label=next(item for item in walk(line) if item.isVisible() and item.objectName()=='usage-table-label')
+                cell=next(item for item in walk(line) if item.isVisible() and item.objectName()=='usage-cell-calls')
+                label_position=label.mapToItem(line,QPointF());cell_position=cell.mapToItem(line,QPointF())
+                assert (label_position.y()+label.height()<=cell_position.y())==stacked
+                if not stacked:
+                    assert label_position.x()+label.width()<=cell_position.x()
+                    assert label_position.y()<cell_position.y()+cell.height()
+                    assert cell_position.y()<label_position.y()+label.height()
+            geometry=(size,w.size(),viewport.width())
+            if size[0]==1000:
+                assert stacked,geometry
+            elif w.quick.width()>=size[0]:
+                assert not stacked,geometry
+            layout='compact' if stacked else 'wide'
+            assert w.quick.grabFramebuffer().save(str(evidence/f'table-{layout}-{boxplot_language}.png'))
         p.change('metric','reasoning');p.change('sort','asc')
         assert [row['filters']['effort'] for row in p.data['rows']]==['zero','partial','complete']
         p.change('metric','calls')
