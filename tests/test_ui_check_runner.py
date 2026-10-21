@@ -63,7 +63,8 @@ def test_runner_isolates_qt_and_descendants_and_preserves_process_io(tmp_path, e
     env = dict(os.environ, PYTHONUTF8='1', PYTHONIOENCODING='utf-8',
                CODEXON_RUNNER_TEST='환경 전달')
     result = subprocess.run(
-        [sys.executable, str(ROOT / 'tools/run_ui_checks.py'), '--scale', '1.25', '--',
+        [sys.executable, str(ROOT / 'tools/run_ui_checks.py'), '--scale', '1.25',
+         '--diagnostics', str(tmp_path / 'evidence'), '--',
          sys.executable, str(probe), payload, str(exit_code)],
         input='stdin 전달\n', capture_output=True, text=True, encoding='utf-8',
         cwd=tmp_path, env=env, timeout=30)
@@ -77,6 +78,30 @@ def test_runner_isolates_qt_and_descendants_and_preserves_process_io(tmp_path, e
     assert observed['env'] == '환경 전달'
     assert Path(observed['cwd']) == tmp_path
     assert 'runner stderr preserved' in result.stderr
+
+
+def test_runner_allows_finite_cleanup_after_parent_exits(tmp_path):
+    probe = tmp_path / 'cleanup_probe.py'
+    completed = tmp_path / 'cleanup-completed'
+    probe.write_text(textwrap.dedent('''
+        import os, subprocess, sys
+        child = subprocess.Popen([sys.executable, '-c',
+            'import sys, time; from pathlib import Path; '
+            'sys.stdin.buffer.read(); time.sleep(1); Path(sys.argv[1]).touch()',
+            sys.argv[1]], stdin=subprocess.PIPE)
+        os._exit(0)
+    '''), encoding='utf-8')
+    diagnostics = tmp_path / 'evidence'
+    result = subprocess.run([sys.executable, str(ROOT / 'tools/run_ui_checks.py'),
+        '--timeout', '5', '--diagnostics', str(diagnostics), '--',
+        sys.executable, str(probe), str(completed)],
+        capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert completed.exists()
+    evidence = json.loads((diagnostics / 'result.json').read_text())
+    assert evidence['reason'] == 'completed'
+    assert evidence['process_exit_code'] == 0
+    assert evidence['live_pids'] == evidence['remaining_pids'] == []
 
 
 @pytest.mark.parametrize('mode,expected', [('normal', 0), ('hang', 124), ('orphan', 1)])
