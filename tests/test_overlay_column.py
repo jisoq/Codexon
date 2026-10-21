@@ -121,7 +121,7 @@ def test_token_details_keep_explicit_unknown_and_confirmed_zero_distinct(column_
     assert any(item[0]=='토큰 구성 (3/4)' for item in items)
 
 
-def test_codex_accent_changes_chart_palette_without_changing_agent_identity(column_model):
+def test_codex_accent_does_not_reassign_icon_colors(column_model):
     data = subagent_summary()
     first = replace(default_appearance(True), accent='#287cf6')
     second = replace(first, accent='#e04c9a')
@@ -129,8 +129,7 @@ def test_codex_accent_changes_chart_palette_without_changing_agent_identity(colu
     before = column_model.graph_colors(column_model.rows())
     column_model.set_content(data, appearance=second)
     after = column_model.graph_colors(column_model.rows())
-    assert before.keys() == after.keys()
-    assert any(before[key] != after[key] for key in before)
+    assert before == after
 
 
 def test_recent_call_population_keeps_missing_slots_and_original_order(column_model):
@@ -397,14 +396,15 @@ def test_main_and_one_to_four_subagents_share_bottom_padding(column_model):
         if count:
             items=column_model.detail_items();start=layout['sub_y']
         else:
-            items=column_model.agent_summary_items(main_usage(data),'Main Agent','ink',False,276,main=True)
+            from cachemonitor.overlay_icons import agent_mark
+            items=column_model.agent_summary_items(main_usage(data),'Main Agent',agent_mark(data['id'],column_model.appearance),False,276,main=True)
             start=layout['main']
         text_bottom=start+max(item[2]+item[4] for item in items if item[0])
         gaps.append(layout['height']-text_bottom)
     assert max(gaps)-min(gaps)<1
 
 
-def test_automatic_height_fits_up_to_three_summaries_and_keeps_expansion_inside(column_model):
+def test_automatic_height_fits_up_to_three_summaries(column_model):
     from tools.preview_overlay import synthetic_snapshot
     heights=[]
     bottom_gaps=[]
@@ -421,10 +421,40 @@ def test_automatic_height_fits_up_to_three_summaries_and_keeps_expansion_inside(
         heights.append(layout['height'])
     assert heights[0]<heights[1]<heights[2]==heights[3]==heights[4]
     assert max(bottom_gaps)-min(bottom_gaps)<1
-    column_model.expanded_groups.add(column_model.detail_groups()[0]['key'])
-    column_model.sync_details()
-    assert column_model.base_height()==heights[-1]
-    assert column_model.state['detailBodyHeight']>column_model.layout()['sub_height']
+
+
+@pytest.mark.parametrize('count',[1,8])
+def test_subagent_disclosures_add_their_content_height_and_restore_on_close(column_model,count):
+    from tools.preview_overlay import synthetic_snapshot
+    m=column_model
+    data=next(row for row in synthetic_snapshot(f'sub-{count}')['overlay_sessions'] if row['id']=='preview-main')
+    m.set_content(data)
+    closed=m.layout();body=m.state['detailBodyHeight']
+    # Include an agent reached by scrolling beyond the summary allowance.
+    keys=[row['key'] for row in m.detail_groups()][-2:]
+    for key in keys:
+        m.toggle_detail_group(key)
+        opened=m.layout()
+        assert opened['height']>closed['height']
+        assert opened['height']-closed['height']>=m.state['detailBodyHeight']-body
+        assert opened['sub_height']-closed['sub_height']==pytest.approx(opened['height']-closed['height'])
+        assert (opened['charts'],opened['main'],opened['sub_y'])==(closed['charts'],closed['main'],closed['sub_y'])
+        if count<=m.visible_agent_count():assert opened['sub_height']>=m.state['detailBodyHeight']
+    m.available_height=closed['height']+20
+    assert m.base_height()==m.available_height
+    assert m.state['detailBodyHeight']>m.layout()['sub_height']
+    m.available_height=None
+    assert m.layout()==opened
+    for key in reversed(keys):m.toggle_detail_group(key)
+    assert m.layout()==closed and m.state['detailBodyHeight']==body
+    m.toggle_detail_group(keys[0])
+    m.set_content(dict(data,id='other-conversation'))
+    assert not m.expanded_groups and m.layout()==closed
+    m.toggle_detail_group(m.detail_groups()[0]['key'])
+    m.set_content(dict(m.data,descendants=0,subagent_finance={}))
+    assert not m.expanded_groups and m.base_height()<closed['height']
+    m.set_content(data)
+    assert m.layout()==closed
 
 
 def test_visible_count_is_scoped_and_survives_growth_retention_and_screen_constraints(column_controller,monkeypatch):

@@ -99,6 +99,38 @@ def native_detail(tmp_path):
 
 
 @pytest.mark.skipif(sys.platform!='win32',reason='Native Windows hit testing')
+def test_subagent_disclosure_resizes_native_panel_and_scrolls_at_frame_limit(native_detail):
+    from cachemonitor.overlay_chrome import named_item
+    from tests.test_ui import wait_for_rendered
+    c,host,refresh=native_detail
+    host.resize(420,1200);refresh()
+    m=c.widget.content_model;key=m.detail_groups()[0]['key']
+    closed=c.monitor_geometry;anchor=c.anchor
+    body=m.state['detailBodyHeight']
+    def group():return named_item(c.detail.quick.rootObject(),'detailAction-group-'+key)
+    def scroll():return named_item(c.detail.quick.rootObject(),'detailScroll')
+    click(c.detail,group())
+    wait_for_rendered(lambda:c.monitor_geometry[3]>closed[3] and scroll().height()>=m.state['detailBodyHeight'])
+    opened=c.monitor_geometry
+    assert opened[3]-closed[3]>=m.state['detailBodyHeight']-body
+    assert (opened[0],opened[2])==(closed[0],closed[2]) and c.anchor==anchor
+    frame=c.native.frame(int(c.widget.winId()))
+    assert frame[3]-frame[1]==opened[3]
+    # The same disclosure stays usable when the target window has less room.
+    host.resize(420,closed[3]+100);refresh()
+    wait_for_rendered(lambda:scroll().property('contentHeight')>scroll().height())
+    assert c.widget.isVisible() and c.detail.isVisible()
+    assert c.monitor_geometry[3]<opened[3] and key in m.expanded_groups
+    scroll().setProperty('contentY',scroll().property('contentHeight')-scroll().height())
+    # Restore room and reach the disclosure through its rendered control.
+    host.resize(420,1200);refresh()
+    wait_for_rendered(lambda:scroll().height()>=m.state['detailBodyHeight'])
+    click(c.detail,group())
+    wait_for_rendered(lambda:c.monitor_geometry==closed and scroll().property('contentY')==0)
+    assert not m.expanded_groups and c.anchor==anchor
+
+
+@pytest.mark.skipif(sys.platform!='win32',reason='Native Windows hit testing')
 @pytest.mark.parametrize('width',[1280,420])
 def test_embedded_subagent_interaction_keeps_gear_and_settings_reachable(native_detail,width):
     from ctypes import wintypes as W

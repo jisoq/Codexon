@@ -66,7 +66,7 @@ Item {
             UiButton {text:'← '+root.t('뒤로');onClicked:root.node.back()}
             UiButton {text:root.t('지표 비교');role:'quiet';onClicked:root.node.reset()}
             Copy {text:root.masked?'':root.s.selectedLabel||'';Layout.fillWidth:true;elide:Text.ElideRight;wrapMode:Text.NoWrap;color:appTheme.palette.muted}
-            UiButton {text:root.t('세션 기록 열기');enabled:!root.masked;onClicked:root.node.records()}
+            UiButton {objectName:'usage-records';text:root.t('세션 기록 열기');enabled:!root.masked;onClicked:root.node.records()}
         }
         RowLayout {
             objectName:'usage-result-controls'
@@ -85,8 +85,15 @@ Item {
                 ToolTip.visible:hovered
                 ToolTip.text:root.t('모델, 추론 강도 또는 분류가 미확인인 항목을 표시합니다. 전체 합계는 유지됩니다.')
             }
-            UiInput {Layout.preferredWidth:165;placeholderText:root.t('항목 검색');text:root.o.search;Accessible.name:root.t('항목 검색');onTextEdited:root.node.change('search',text)}
+            UiInput {objectName:'usage-search';Layout.preferredWidth:165;placeholderText:root.t('항목 검색');text:root.o.search;Accessible.name:root.t('항목 검색');onTextEdited:root.node.change('search',text)}
             UiChoice {Layout.preferredWidth:120;model:[root.t('큰 값부터'),root.t('작은 값부터'),root.t('이름순')];currentIndex:['desc','asc','name'].indexOf(root.o.sort);Accessible.name:root.t('항목 정렬');onActivated:root.node.change('sort',['desc','asc','name'][currentIndex])}
+        }
+        Copy {
+            objectName:'usage-box-legend'
+            visible:!root.masked && !root.tableView && !!root.s.meanMetric
+            Layout.fillWidth:true;text:root.s.boxLegend||'';tip:root.s.boxTip||''
+            font.pixelSize:12;color:appTheme.palette.muted;wrapMode:Text.NoWrap;elide:Text.ElideRight
+            Accessible.name:text;Accessible.description:tip
         }
         Item {
             id: chart
@@ -96,52 +103,97 @@ Item {
                 objectName:'usage-chart-content'
                 visible:!root.masked;enabled:!root.masked
                 anchors.fill:parent
-                Flickable {
-                    id: horizontal
-                    objectName:'usage-horizontal'
+                Item {
+                    id: viewport
+                    objectName:'usage-viewport'
                     anchors.fill:parent;clip:true
-                    contentWidth:root.tableView?Math.max(width,1130):width
-                    contentHeight:height
-                    flickableDirection:Flickable.HorizontalFlick;boundsBehavior:Flickable.StopAtBounds
-                    ScrollBar.horizontal:UiScrollBar {policy:root.tableView?ScrollBar.AsNeeded:ScrollBar.AlwaysOff}
+                    readonly property real tableWidth:width-rowsScroll.implicitWidth
+                    readonly property real gap:8
+                    readonly property real chevronWidth:28
+                    readonly property bool stackedLabel:tableWidth<1000
+                    readonly property real labelWidth:stackedLabel?0:210
+                    readonly property var columns: {
+                        const metrics=root.s.metrics
+                        const weights=metrics.map(metric=>metric.value==='cost'||metric.value==='cost_per_call'?1.35:1)
+                        const total=weights.reduce((sum,weight)=>sum+weight,0)
+                        const start=labelWidth>0?labelWidth+12:0
+                        const available=Math.max(0,tableWidth-start-chevronWidth-gap*(metrics.length-1))
+                        let x=start
+                        return weights.map(weight=>{
+                            const column={x:x,width:available*weight/total}
+                            x+=column.width+gap
+                            return column
+                        })
+                    }
                     Item {
-                        width:horizontal.contentWidth;height:horizontal.height-(root.tableView?14:0)
+                        anchors.fill:parent
                         RowLayout {
                             id: chartHeader
                             visible:!root.tableView
                             width:parent.width;height:40;spacing:16
                             Copy {text:root.t('모델 / 추론 강도');Layout.preferredWidth:180;font.pixelSize:12;color:appTheme.palette.muted}
-                            RowLayout {Layout.fillWidth:true;Copy{text:'0';font.pixelSize:12;color:appTheme.palette.muted}Item{Layout.fillWidth:true}Copy{text:root.s.middle||'';font.pixelSize:12;color:appTheme.palette.muted}Item{Layout.fillWidth:true}Copy{text:root.s.upper||'';font.pixelSize:12;color:appTheme.palette.muted}}
+                            Item {
+                                Layout.fillWidth:true;Layout.preferredHeight:20
+                                Copy {x:root.s.meanMetric?5:0;text:'0';font.pixelSize:12;color:appTheme.palette.muted}
+                                Copy {anchors.horizontalCenter:parent.horizontalCenter;text:root.s.middle||'';font.pixelSize:12;color:appTheme.palette.muted}
+                                Copy {anchors.right:parent.right;anchors.rightMargin:root.s.meanMetric?5:0;text:root.s.upper||'';font.pixelSize:12;color:appTheme.palette.muted}
+                            }
                             Copy {text:root.s.metricLabel||'';Layout.preferredWidth:110;font.pixelSize:12;horizontalAlignment:Text.AlignRight;color:appTheme.palette.muted;tip:root.o.metric==='tps'?root.s.tpsTip:''}
                             Copy {text:root.s.meanMetric?root.t('유효 호출 / 전체'):root.s.shareLabel||'';Layout.preferredWidth:90;font.pixelSize:12;horizontalAlignment:Text.AlignRight;color:appTheme.palette.muted}
                             Item {Layout.preferredWidth:20}
                         }
-                        RowLayout {
-                            visible:root.tableView;width:parent.width;height:40;spacing:12
-                            Copy {text:root.t('모델 / 추론 강도');Layout.preferredWidth:210;font.pixelSize:12;color:appTheme.palette.muted}
-                            Repeater {model:root.s.tableMetrics;Copy {required property var modelData;text:modelData.text;Layout.fillWidth:true;Layout.preferredWidth:110;font.pixelSize:12;color:appTheme.palette.muted;horizontalAlignment:Text.AlignRight}}
-                            Item {Layout.preferredWidth:20}
+                        Item {
+                            id:tableHeader
+                            objectName:'usage-table-header'
+                            visible:root.tableView;width:viewport.tableWidth
+                            height:Math.max(40,headerValues.y+headerValues.height+8)
+                            Copy {
+                                objectName:'usage-table-label-header'
+                                text:root.t('모델 / 추론 강도');font.pixelSize:12;color:appTheme.palette.muted
+                                width:viewport.stackedLabel?parent.width:viewport.labelWidth
+                                height:viewport.stackedLabel?24:parent.height
+                                elide:Text.ElideRight;wrapMode:Text.NoWrap
+                            }
+                            Item {
+                                id:headerValues
+                                y:viewport.stackedLabel?28:8
+                                width:parent.width;height:childrenRect.height
+                                Repeater {
+                                    model:root.s.metrics
+                                    Copy {
+                                        required property var modelData
+                                        required property int index
+                                        objectName:'usage-header-'+modelData.value
+                                        x:viewport.columns[index].x;width:viewport.columns[index].width;height:implicitHeight
+                                        text:modelData.text;font.pixelSize:12;color:appTheme.palette.muted
+                                        horizontalAlignment:Text.AlignRight
+                                    }
+                                }
+                            }
                         }
-                        Rectangle {y:40;width:parent.width;height:1;color:appTheme.palette.border}
+                        Rectangle {y:root.tableView?tableHeader.height:40;width:parent.width;height:1;color:appTheme.palette.border}
                         ListView {
                             id: rowsView
                             objectName:'usage-rows'
-                            anchors.fill:parent;anchors.topMargin:41
+                            anchors.fill:parent;anchors.topMargin:(root.tableView?tableHeader.height:40)+1
                             model:root.node.rowModel
                             clip:true;reuseItems:true;cacheBuffer:108
-                            boundsBehavior:Flickable.StopAtBounds
-                            ScrollBar.vertical:UiScrollBar {}
+                            boundsBehavior:Flickable.StopAtBounds;flickableDirection:Flickable.VerticalFlick
+                            ScrollBar.vertical:UiScrollBar {id:rowsScroll}
                             delegate: Column {
                                 id:groupLine
                                 required property var modelData
-                                width:ListView.view.width
+                                width:root.tableView?viewport.tableWidth:ListView.view.width
                                 Copy {visible:groupLine.modelData.groupStart;width:parent.width;height:28;text:groupLine.modelData.group;font.pixelSize:13;font.bold:true;elide:Text.ElideRight;wrapMode:Text.NoWrap;tip:groupLine.modelData.group}
                                 AbstractButton {
                                     id:line
                                     objectName:'usage-row-'+modelData.key
                                     readonly property var modelData:groupLine.modelData
-                                    width:parent.width;height:54;hoverEnabled:true;activeFocusOnTab:true
+                                    width:parent.width
+                                    height:root.tableView?Math.max(54,tableValues.height+(viewport.stackedLabel?tableLabel.implicitHeight+24:16)):54
+                                    hoverEnabled:true;activeFocusOnTab:true
                                     Accessible.name:modelData.group+' / '+modelData.label+' '+modelData.value
+                                    Accessible.description:modelData.tip+'\n'+modelData.coverage
                                     onClicked:root.node.select(modelData.key)
                                     background:Rectangle {color:line.hovered||line.activeFocus?appTheme.palette.secondary:'transparent';Rectangle {anchors.bottom:parent.bottom;width:parent.width;height:1;color:appTheme.palette.border;opacity:.4}}
                                     contentItem:Item {
@@ -149,28 +201,75 @@ Item {
                                             visible:!root.tableView;anchors.fill:parent;spacing:16
                                             Copy {text:line.modelData.label;Layout.preferredWidth:180;elide:Text.ElideRight;wrapMode:Text.NoWrap;tip:line.modelData.label}
                                             Item {
+                                                id:plotCell
+                                                objectName:'usage-plot-'+line.modelData.key
+                                                readonly property var plot:line.modelData.plot||({})
+                                                readonly property real span:Math.max(0,width-10)
+                                                readonly property color markColor:appTheme.color(line.modelData.color)
+                                                function position(value) {return 5+span*value}
                                                 Layout.fillWidth:true;Layout.preferredHeight:24
-                                                Rectangle {height:22;width:parent.width*line.modelData.fraction;anchors.verticalCenter:parent.verticalCenter;radius:3;color:appTheme.color(line.modelData.color)}
+                                                Rectangle {
+                                                    objectName:'usage-total-bar'
+                                                    visible:!root.s.meanMetric
+                                                    height:22;width:parent.width*line.modelData.fraction;anchors.verticalCenter:parent.verticalCenter;radius:3;color:plotCell.markColor
+                                                }
+                                                Item {
+                                                    objectName:'usage-box-marks'
+                                                    anchors.fill:parent;visible:plotCell.plot.kind==='box'
+                                                    Rectangle {objectName:'usage-whisker';x:plotCell.position(plotCell.plot.p10||0);y:11;width:Math.max(1,plotCell.span*((plotCell.plot.p90||0)-(plotCell.plot.p10||0)));height:2;color:plotCell.markColor}
+                                                    Rectangle {x:plotCell.position(plotCell.plot.p10||0)-1;y:7;width:2;height:10;color:plotCell.markColor}
+                                                    Rectangle {x:plotCell.position(plotCell.plot.p90||0)-1;y:7;width:2;height:10;color:plotCell.markColor}
+                                                    Rectangle {
+                                                        objectName:'usage-box'
+                                                        x:plotCell.position(plotCell.plot.q1||0);y:5
+                                                        width:Math.max(1,plotCell.span*((plotCell.plot.q3||0)-(plotCell.plot.q1||0)));height:14
+                                                        color:Qt.alpha(plotCell.markColor,.23);border.color:plotCell.markColor
+                                                    }
+                                                    Rectangle {objectName:'usage-median';x:plotCell.position(plotCell.plot.median||0)-1;y:3;width:2;height:18;color:appTheme.palette.ink}
+                                                    Rectangle {objectName:'usage-mean';x:plotCell.position(plotCell.plot.mean||0)-5;y:7;width:10;height:10;radius:5;color:plotCell.markColor;border.width:2;border.color:appTheme.palette.ink}
+                                                }
+                                                HoverHandler {id:plotHover}
+                                                UiToolTip {visible:plotHover.hovered && line.modelData.tip.length>0;text:line.modelData.tip}
                                                 Copy {visible:line.modelData.missing;text:root.t('측정 불가');font.pixelSize:12;color:appTheme.palette.muted}
                                             }
                                             Copy {text:line.modelData.value+(line.modelData.partial?' *':'');Layout.preferredWidth:110;horizontalAlignment:Text.AlignRight;tip:line.modelData.tip+'\n'+line.modelData.coverage}
                                             Copy {text:root.s.meanMetric?line.modelData.coverage:line.modelData.share;Layout.preferredWidth:90;horizontalAlignment:Text.AlignRight;font.pixelSize:12;color:appTheme.palette.muted;tip:line.modelData.coverage}
                                             Copy {text:'›';Layout.preferredWidth:20;font.pixelSize:20}
                                         }
-                                        RowLayout {
-                                            visible:root.tableView;anchors.fill:parent;spacing:12
-                                            Copy {text:line.modelData.label;Layout.preferredWidth:210;elide:Text.ElideRight;wrapMode:Text.NoWrap;tip:line.modelData.label}
-                                            Repeater {
-                                                model:line.modelData.metrics||[]
-                                                Copy {required property var modelData;text:modelData.value+(modelData.partial?' *':'');Layout.fillWidth:true;Layout.preferredWidth:110;horizontalAlignment:Text.AlignRight;font.bold:modelData.key===root.o.metric;tip:root.t('유효 호출 / 전체')+': '+modelData.tip}
+                                        Item {
+                                            visible:root.tableView;anchors.fill:parent
+                                            Copy {
+                                                id:tableLabel
+                                                objectName:'usage-table-label'
+                                                text:line.modelData.label
+                                                width:viewport.stackedLabel?parent.width-viewport.chevronWidth:viewport.labelWidth
+                                                height:implicitHeight;y:viewport.stackedLabel?8:(parent.height-height)/2
+                                                elide:Text.ElideRight;wrapMode:Text.NoWrap;tip:line.modelData.label
                                             }
-                                            Copy {text:'›';Layout.preferredWidth:20;font.pixelSize:20}
+                                            Item {
+                                                id:tableValues
+                                                y:viewport.stackedLabel?tableLabel.height+16:(parent.height-height)/2
+                                                width:parent.width;height:childrenRect.height
+                                                Repeater {
+                                                    model:line.modelData.metrics||[]
+                                                    Copy {
+                                                        required property var modelData
+                                                        required property int index
+                                                        objectName:'usage-cell-'+modelData.key
+                                                        x:viewport.columns[index].x;width:viewport.columns[index].width;height:implicitHeight
+                                                        text:modelData.value+(modelData.partial?' *':'')
+                                                        horizontalAlignment:Text.AlignRight;font.bold:modelData.key===root.o.metric
+                                                        tip:root.t('유효 호출 / 전체')+': '+modelData.tip
+                                                    }
+                                                }
+                                            }
+                                            Copy {objectName:'usage-table-chevron';text:'›';x:parent.width-20;width:20;height:parent.height;font.pixelSize:20}
                                         }
                                     }
                                 }
                             }
                         }
-                        Copy {visible:rowsView.count===0;y:41;width:parent.width;height:100;text:root.t('조건에 맞는 기록 없음');horizontalAlignment:Text.AlignHCenter;color:appTheme.palette.muted}
+                        Copy {visible:rowsView.count===0;y:(root.tableView?tableHeader.height:40)+1;width:parent.width;height:100;text:root.t('조건에 맞는 기록 없음');horizontalAlignment:Text.AlignHCenter;color:appTheme.palette.muted}
                     }
                 }
             }

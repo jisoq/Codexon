@@ -368,7 +368,7 @@ def test_waiting_state_becomes_observed_zero_and_keeps_history_during_lookup_fai
                              if item.isVisible() and item.metaObject().indexOfProperty('text')>=0)
         QTest.qWait(40)
         text=visible_text()
-        assert '사용량 기록 수집 대기' in text
+        assert panel.initial_loading.isVisible() and not panel.history_waiting.isVisible()
         assert '0%p' not in text and '$0.0000' not in text
         assert not panel.history.isVisible() and not panel.history_controls.isVisible()
         assert not panel.history_legend.isVisible() and not panel.conversion.isVisible()

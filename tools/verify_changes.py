@@ -242,6 +242,7 @@ RULES = (
     ('cachemonitor/overlay_navigation.py', ('overlay_navigation',)),
     ('cachemonitor/overlay_chrome.py', ('overlay_controls', 'overlay_navigation')),
     ('cachemonitor/overlay_view.py', ('overlay_render', 'overlay_navigation')),
+    ('cachemonitor/overlay_icons.py', ('overlay_render',)),
     ('cachemonitor/overlay_appearance.py', ('overlay_appearance',)),
     ('cachemonitor/overlay_windows.py', ('overlay_windows', 'overlay_controls')),
     ('cachemonitor/overlay_shadow.py', ('overlay_render',)),
@@ -282,6 +283,7 @@ RULES = (
     ('cachemonitor/brand_icon.py', ('runtime',)),
     ('icons/*.ico', ('runtime', 'payload')),
     ('cachemonitor/assets/brand/*', ('runtime',)),
+    ('cachemonitor/assets/agent-icons/*', ('overlay_render',)),
     ('cachemonitor/assets/fonts/*', ('shared_ui', 'overlay_render')),
     ('cachemonitor/i18n.py', ('translation', 'shared_ui')),
     ('cachemonitor/translation_catalog.py', ('translation',)),
@@ -376,6 +378,7 @@ RULES = (
 # These changes need frozen executable/install checks in addition to source tests.
 PACKAGE_PATTERNS = (
     'native/*', 'rust-toolchain.toml', 'cachemonitor/native_backend.py', 'tools/build_native.py',
+    'cachemonitor/overlay_icons.py', 'cachemonitor/assets/agent-icons/*',
     'cachemonitor/retired_cache.py','cachemonitor/usage_archive.py',
     'requirements*', 'build*.ps1', '*.spec', 'installer/*', 'recovery_main.py', 'icons/*.ico',
     'tools/verify_msix_installation.ps1', 'tools/run_native_checks.py',

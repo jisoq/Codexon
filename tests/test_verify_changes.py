@@ -40,6 +40,15 @@ def test_small_ui_changes_select_their_consumer_without_backend_or_package_check
     assert plan['tests'] == ('tests/test_public_release.py',)
 
 
+def test_bundled_agent_icons_select_rendering_and_frozen_package_checks():
+    for source in ('cachemonitor/overlay_icons.py', 'cachemonitor/assets/agent-icons/00-light.svg',
+                   'cachemonitor/assets/agent-icons/source.json'):
+        plan = select_tests({source})
+        assert 'tests/test_overlay_monitor.py' in plan['tests']
+        assert plan['package_impact'] and not plan['proxy_impact']
+        assert not plan['full'] and not plan['unmapped']
+
+
 def test_settings_and_comparison_changes_keep_wiring_without_selecting_unrelated_workflows():
     settings=select_tests({'cachemonitor/settings_page.py'})
     assert 'tests/test_settings.py' in settings['tests']

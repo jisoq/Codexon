@@ -135,6 +135,9 @@ class UpdateState:
                     and result['updated_at'] < previous['updated_at']):
                 return False
             phase = result.get('phase', '')
+            if (previous.get('cutover_started') and not result.get('cutover_started')
+                    and phase in ('queued','waiting','cancelled')):
+                return False
             app_done = value.get('app', {}).get('state') in ('verified', 'current')
             mapped = phase
             if phase == 'queued':

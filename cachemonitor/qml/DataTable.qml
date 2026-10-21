@@ -155,6 +155,7 @@ Item {
             required property string display; required property string tooltip
             required property string cellBackground; required property real changedCell
             required property bool cacheZero
+            required property bool placeholder
             required property bool verbatim
             required property real cellBar
             required property int alignment
@@ -169,6 +170,7 @@ Item {
             Rectangle { visible: root.viewState.selected === row && column === 0; width: 2; height: parent.height; color: appTheme.palette.accent }
             Rectangle { objectName: "cell-data-bar"; visible: !!root.viewState.dataBars && cellBar >= 0; anchors.left: parent.left; anchors.leftMargin: 6; anchors.verticalCenter: parent.verticalCenter; width: Math.min(140,Math.max(0,parent.width-12))*Math.max(0,cellBar); height: 14; radius: 2; color: appTheme.palette.accent; opacity: .16 }
             Text { id: cellLabel; objectName: "cell-label"; property int textAlignment: horizontalAlignment; anchors.fill: parent; anchors.leftMargin: root.hierarchical && column===0 ? 50+cell.depth*32 : root.cellPadding; anchors.rightMargin: root.cellPadding; text: verbatim ? display : appLanguage.text(display); wrapMode: !root.hierarchical && !exactValue && root.viewState.rowHeight > 40 ? Text.Wrap : Text.NoWrap; elide: exactValue ? Text.ElideNone : Text.ElideRight; horizontalAlignment: alignment & Qt.AlignRight ? Qt.AlignRight : Qt.AlignLeft; verticalAlignment: Text.AlignVCenter; font.pixelSize: 14; font.family: appTheme.family; font.features: { "tnum": 1 }; color: (appTheme.palette && appTheme.color("ink")) }
+            Rectangle { objectName: "unloaded-row"; visible: cell.placeholder; anchors.left: parent.left; anchors.leftMargin: root.cellPadding; anchors.verticalCenter: parent.verticalCenter; width: Math.max(0,Math.min(130,parent.width-2*root.cellPadding)); height: 8; radius: 4; color: appTheme.palette.border }
             Item {
                 visible: root.hierarchical && cell.column===0; anchors.fill: parent
                 Repeater {
@@ -183,10 +185,11 @@ Item {
             Rectangle { objectName: "cache-zero-marker"; visible: cacheZero && column === 0; anchors.left: parent.left; anchors.top: parent.top; anchors.bottom: parent.bottom; width: 3; color: (appTheme.palette && appTheme.color("warning")) }
             Rectangle { objectName:"row-hover-feedback";anchors.fill:parent;color:appTheme.palette.accent;opacity:root.hoveredRow===row || root.viewState.highlightedRow===row ? .08 : 0 }
             Rectangle { objectName: "column-divider"; anchors.right: parent.right; width: 1; height: parent.height; visible: root.readableColumns && !root.viewState.treeNavigation; color: appTheme.palette.border; opacity: .55 }
-            HoverHandler { id: hover;cursorShape:root.viewState.navigationColumn !== undefined && column !== root.viewState.navigationColumn ? Qt.ArrowCursor : Qt.PointingHandCursor;onHoveredChanged: { if(hovered) root.hoveredCell=cell;else if(root.hoveredCell===cell) root.hoveredCell=null } }
+            HoverHandler { id: hover; enabled: !cell.placeholder;cursorShape:root.viewState.navigationColumn !== undefined && column !== root.viewState.navigationColumn ? Qt.ArrowCursor : Qt.PointingHandCursor;onHoveredChanged: { if(hovered) root.hoveredCell=cell;else if(root.hoveredCell===cell) root.hoveredCell=null } }
             Component.onDestruction: if (root.hoveredCell===cell) root.hoveredCell=null
             UiToolTip { objectName: "cell-overflow-tip"; visible: hover.hovered && cellLabel.truncated; text: display }
             TapHandler {
+                enabled: !cell.placeholder
                 onTapped: eventPoint => {
                     if (disclosure.visible && eventPoint.position.x >= disclosure.x && eventPoint.position.x <= disclosure.x+disclosure.width) return
                     table.forceActiveFocus(); table.keyboardColumn=column; root.node.click(row,column)
@@ -208,7 +211,7 @@ Item {
                 Keys.onLeftPressed: { root.node.selectRow(cell.row); root.node.expandCurrent(false); table.forceActiveFocus() }
                 Keys.onRightPressed: { root.node.selectRow(cell.row); root.node.expandCurrent(true); table.forceActiveFocus() }
             }
-            Accessible.role: Accessible.Cell; Accessible.name: display; Accessible.description: (cacheZero ? appLanguage.text("캐시 읽기 0: ") : "") + tooltip
+            Accessible.role: Accessible.Cell; Accessible.name: placeholder ? appLanguage.text("아직 불러오지 않은 기록") : display; Accessible.description: (cacheZero ? appLanguage.text("캐시 읽기 0: ") : "") + tooltip
         }
     }
     function outerScroll() {

@@ -8,6 +8,48 @@ from cachemonitor.quick_qa import control, click, click_row, walk
 from test_ui import dashboard, snapshot, wait_for_rendered
 
 
+def assert_table_geometry(rendered,line=None):
+    from PySide6.QtCore import QPointF
+    keys=['calls','cost','cost_per_call','latency','tps','input_per_call','output_per_call','reasoning']
+    viewport=rendered('usage-viewport');header=rendered('usage-table-header');view=rendered('usage-rows')
+    entries=rendered('usage-metric').property('model')
+    assert [entry['value'] for entry in entries]==keys
+    headers=[item for item in walk(header) if item.isVisible() and item.objectName().startswith('usage-header-')]
+    headers.sort(key=lambda item:item.mapToItem(viewport,QPointF()).x())
+    assert [item.objectName() for item in headers]==['usage-header-'+key for key in keys]
+    top=view.mapToScene(QPointF()).y()
+    lines=[line] if line else [item for item in walk(view) if item.isVisible() and item.objectName().startswith('usage-row-')
+        and top<=item.mapToScene(QPointF()).y() and item.mapToScene(QPointF()).y()+item.height()<=top+view.height()]
+    assert lines
+    for header_cell in headers:
+        position=header_cell.mapToItem(header,QPointF())
+        assert 0<=position.y()<position.y()+header_cell.height()<=header.height()
+        assert header_cell.property('contentWidth')<=header_cell.width()+1
+        assert header_cell.property('contentHeight')<=header_cell.height()+1
+    for row in lines:
+        cells=[next(item for item in walk(row) if item.isVisible() and item.objectName()=='usage-cell-'+key) for key in keys]
+        label=next(item for item in walk(row) if item.isVisible() and item.objectName()=='usage-table-label')
+        chevron=next(item for item in walk(row) if item.isVisible() and item.objectName()=='usage-table-chevron')
+        edge=0
+        for header_cell,cell in zip(headers,cells):
+            position=cell.mapToItem(viewport,QPointF())
+            assert edge<=position.x()<position.x()+cell.width()<=viewport.width()
+            assert position.x()==pytest.approx(header_cell.mapToItem(viewport,QPointF()).x(),abs=.1)
+            assert cell.width()==pytest.approx(header_cell.width(),abs=.1)
+            assert cell.property('contentWidth')<=cell.width()+1
+            assert cell.property('contentHeight')<=cell.height()+1
+            assert cell.property('font').pixelSize()==label.property('font').pixelSize()
+            local=cell.mapToItem(row,QPointF())
+            assert 0<=local.y()<local.y()+cell.height()<=row.height()
+            edge=position.x()+cell.width()
+        assert edge<=chevron.mapToItem(viewport,QPointF()).x()
+        assert chevron.mapToItem(viewport,QPointF()).x()+chevron.width()<viewport.width()
+        first=cells[0].mapToItem(row,QPointF())
+        label_position=label.mapToItem(row,QPointF())
+        assert label_position.y()+label.height()<=first.y() or label_position.x()+label.width()<=first.x()
+    return headers,lines
+
+
 @pytest.mark.parametrize('language', ['ko', 'en'])
 def test_subscription_rates_and_historical_models_render(tmp_path, language):
     from pathlib import Path
@@ -186,10 +228,10 @@ def test_virtual_comparison_scroll_reuses_aggregate_without_viewport_queries(das
 
 def test_metric_modes_and_saved_scope_restore_after_monitoring(dashboard):
     w=dashboard;w.change_page(1);p=w.metric_panel
-    p.change('period','7d');p.change('metric','tps');p.change('dimension','all');p.change('sort','name')
+    p.change('period','7d');p.change('metric','reasoning');p.change('dimension','all');p.change('sort','name')
     saved=w.capture_state();w.change_page(3)
     assert w.current_page==3
-    w.restore_state(saved);assert p.options['metric']=='tps' and p.options['dimension']=='all'
+    w.restore_state(saved);assert p.options['metric']=='reasoning' and p.options['dimension']=='all'
     assert p.options['period']=='7d' and p.options['sort']=='name'
     assert not w.qml_errors
 
@@ -342,7 +384,7 @@ def test_grouped_model_effort_metrics_and_drilldown_in_compact_window(dashboard,
     assert p.data['count']==16 and p.data['summary']['value']==216
     assert all(set(row['filters'])=={'service_tier','model','effort'} for row in p.data['rows'])
     row=p.data['rows'][0];scope=p.capture()
-    assert p.format_row(0)['groupStart'] and len(p.format_row(0)['metrics'])==7
+    assert p.format_row(0)['groupStart'] and len(p.format_row(0)['metrics'])==8
     with monkeypatch.context() as guard:
         guard.setattr(w,'render',lambda *a,**kw:pytest.fail('Metric selection must reuse delivered aggregates'))
         toggle=rendered('usage-show-unknown')
@@ -361,10 +403,12 @@ def test_grouped_model_effort_metrics_and_drilldown_in_compact_window(dashboard,
         choice=rendered('usage-view');choice.forceActiveFocus();QTest.keyClick(w.quick,Qt.Key_Down)
         wait_for_rendered(lambda:p.options['view']=='table')
         assert w.quick.grabFramebuffer().save(str(tmp_path/'paired-comparison-table.png'))
-        horizontal=rendered('usage-horizontal')
-        horizontal.setProperty('contentX',horizontal.property('contentWidth')-horizontal.width())
-        wait_for_rendered(lambda:horizontal.property('contentX')>0)
-        assert w.quick.grabFramebuffer().save(str(tmp_path/'paired-comparison-table-end.png'))
+        assert_table_geometry(rendered)
+        view=rendered('usage-rows')
+        view.setProperty('contentY',view.property('contentHeight')-view.height())
+        wait_for_rendered(lambda:view.property('contentY')>0)
+        assert_table_geometry(rendered)
+        view.setProperty('contentY',0)
         choice.forceActiveFocus();QTest.keyClick(w.quick,Qt.Key_Up)
         wait_for_rendered(lambda:p.options['view']=='chart')
     item=rendered('usage-row-'+row['key'])
@@ -410,4 +454,279 @@ def test_saved_project_scope_remains_explicit_after_project_disappears(dashboard
     source=copy.deepcopy(w.snapshot);source['sessions']=[s for s in source['sessions'] if project_identity(s)!=key]
     w.receive(source)
     assert p.options['filters']['project']==key and p.data['summary']['total']==0
+    assert not w.qml_errors
+
+
+
+@pytest.fixture
+def boxplot_language(request):
+    from cachemonitor.i18n import language,set_language
+    prior=language();set_language(request.param)
+    try:yield request.param
+    finally:set_language(prior)
+
+
+@pytest.mark.parametrize('boxplot_language',['ko','en'],indirect=True)
+def test_boxplots_render_mean_coverage_totals_table_and_keyboard_drilldown(boxplot_language,dashboard,monkeypatch):
+    from pathlib import Path
+    from PySide6.QtCore import QPointF,Qt
+    from PySide6.QtTest import QTest
+    from cachemonitor.theme import shared_theme
+    w=dashboard;w.tick.stop();w.resize(1120,740)
+    source=snapshot();source['sessions']=source['sessions'][:1]
+    template=source['sessions'][0]['history'][0];rows=[]
+    for effort,values in [('high',list(range(1,10))+[100]),('low',[0]),('medium',[4,4,4])]:
+        for index,value in enumerate(values):
+            row=dict(template,key=f'box-{effort}-{index}',effort=effort,input=value*1000,cached=0,written=0,
+                     output=value*100,reasoning=value*10,completion_latency_ms=max(1,value)*1000,
+                     ts=source['ts']-100+len(rows))
+            rows.append(row)
+    source['sessions'][0]['history']=rows
+    w.receive(source);w.change_page(1);p=w.metric_panel
+    p.change('dimension','all');usage=control(w,p)
+    wait_for_rendered(lambda:p.data.get('count')==3)
+    evidence=Path(__file__).resolve().parents[1]/'artifacts/verification/comparison-boxplot'
+    evidence.mkdir(parents=True,exist_ok=True)
+    def rendered(name,within=None):
+        matches=[item for item in walk(within or usage) if item.objectName()==name and item.isVisible()]
+        assert matches,name
+        return matches[0]
+    def metric(value):
+        choice=rendered('usage-metric');choice.forceActiveFocus()
+        target=next(i for i,item in enumerate(p.state['metrics']) if item['value']==value)
+        while choice.property('currentIndex')!=target:
+            prior=choice.property('currentIndex');QTest.keyClick(w.quick,Qt.Key_Down if prior<target else Qt.Key_Up)
+            wait_for_rendered(lambda:choice.property('currentIndex')!=prior)
+        wait_for_rendered(lambda:p.data['metric']==value)
+    def marks(effort):
+        row=next(row for row in p.data['rows'] if row['filters']['effort']==effort)
+        cell=rendered('usage-plot-'+row['key'])
+        return row,cell,rendered('usage-box',cell),rendered('usage-mean',cell),rendered('usage-median',cell)
+    theme=shared_theme();appearance=theme.appearance
+    mode='dark' if boxplot_language=='en' else 'light';theme.configure(mode)
+    suffix=mode+'-'+boxplot_language
+    try:
+        projection=p._all_data
+        with monkeypatch.context() as guard:
+            guard.setattr(w,'render',lambda *a,**kw:pytest.fail('Chart controls must reuse delivered aggregates'))
+            guard.setattr(w.engine,'page_query',lambda *a,**kw:pytest.fail('Chart controls must not read records'))
+            metric('latency')
+            wait_for_rendered(lambda:bool([item for item in walk(usage) if item.objectName()=='usage-mean' and item.isVisible()]))
+            row,cell,box,mean,median=marks('high')
+            assert row['value']==14.5 and row['plot']['median']==5.5
+            assert mean.x()>median.x() and box.width()>0
+            for mark in (box,mean,median,rendered('usage-whisker',cell)):
+                assert 0<=mark.x()<mark.x()+mark.width()<=cell.width()
+                assert 0<=mark.y()<mark.y()+mark.height()<=cell.height()
+            formatted=p.format_row(p.data['rows'].index(row))
+            assert formatted['coverage']=='10 / 10' and formatted['plot']['mean']==row['value']/p.data['markMaximum']
+            assert all(label in formatted['tip'] for label in ('P10','Q1','Q3','P90'))
+            assert w.quick.grabFramebuffer().save(str(evidence/(f'latency-{suffix}.png')))
+            metric('input_per_call')
+            row,cell,box,mean,median=marks('low')
+            assert row['value']==0 and row['known']==1 and row['plot']['q1']==row['plot']['q3']==0
+            assert box.width()>0 and mean.x()>=0 and mean.x()+mean.width()<=cell.width()
+            assert median.height()>mean.height()
+            metric('cost_per_call')
+            assert 0<p.data['markMaximum']<1
+            assert p.format_row(0)['plot']['mean']>.1
+            search=rendered('usage-search');click(w,search);QTest.keyClicks(w.quick,'low')
+            wait_for_rendered(lambda:p.data['count']==1)
+            assert p.data['markMaximum']==1 and p.data['rows'][0]['value']==0
+            QTest.keyClick(w.quick,Qt.Key_A,Qt.ControlModifier);QTest.keyClick(w.quick,Qt.Key_Backspace)
+            wait_for_rendered(lambda:p.data['count']==3)
+            assert 0<p.data['markMaximum']<1
+            for value in ('calls','cost'):
+                metric(value)
+                assert not any(item.isVisible() for item in walk(usage) if item.objectName()=='usage-box')
+                bars=[item for item in walk(usage) if item.objectName()=='usage-total-bar' and item.isVisible()]
+                assert len(bars)==3
+                assert any(item.width()>0 for item in bars)
+            metric('latency')
+            choice=rendered('usage-view');choice.forceActiveFocus();QTest.keyClick(w.quick,Qt.Key_Down)
+            wait_for_rendered(lambda:p.options['view']=='table')
+            row=next(row for row in p.data['rows'] if row['filters']['effort']=='high')
+            line=rendered('usage-row-'+row['key'])
+            assert any(item.isVisible() and item.property('text')=='14.5s' for item in walk(line))
+            assert w.quick.grabFramebuffer().save(str(evidence/(f'table-{suffix}.png')))
+            choice.forceActiveFocus();QTest.keyClick(w.quick,Qt.Key_Up)
+            wait_for_rendered(lambda:p.options['view']=='chart')
+            prior_width=rendered('usage-rows').width();w.resize(1000,680)
+            wait_for_rendered(lambda:rendered('usage-rows').width()<prior_width)
+            for effort in ('high','low','medium'):
+                row,cell,box,mean,median=marks(effort)
+                position=cell.mapToScene(QPointF())
+                assert 0<=position.x()<position.x()+cell.width()<=w.quick.width()
+                assert 0<=mean.x()<mean.x()+mean.width()<=cell.width()
+            assert w.quick.grabFramebuffer().save(str(evidence/(f'latency-compact-{suffix}.png')))
+            for value,expected in [('reasoning',145),('tps',100)]:
+                metric(value)
+                row,cell,box,mean,median=marks('high')
+                assert row['value']==expected and row['known']==10
+                assert p.state['meanMetric'] and box.width()>0
+                assert not any(item.isVisible() for item in walk(usage) if item.objectName()=='usage-total-bar')
+                position=cell.mapToScene(QPointF())
+                assert 0<=position.x()<position.x()+cell.width()<=w.quick.width()
+                assert 0<=mean.x()<mean.x()+mean.width()<=cell.width()
+                if value=='reasoning':
+                    assert {key:row['plot'][key] for key in ('p10','q1','median','q3','p90')}==pytest.approx(dict(p10=19,q1=32.5,median=55,q3=77.5,p90=181))
+                    assert p.data['markMaximum']==pytest.approx(190.05)
+                    assert {'95.0','190.0'}<={item.property('text') for item in walk(usage) if item.isVisible()}
+                    assert mean.x()>median.x()
+                    if boxplot_language=='ko':
+                        assert w.quick.grabFramebuffer().save(str(evidence/'reasoning-compact.png'))
+            metric('latency')
+            if boxplot_language=='en':
+                assert 'mean' in rendered('usage-box-legend').property('text')
+                row,cell,box,mean,median=marks('high')
+                assert 'arithmetic mean' in p.format_row(p.data['rows'].index(row))['tip']
+            assert p._all_data is projection
+        row=next(row for row in p.data['rows'] if row['filters']['effort']=='high')
+        line=rendered('usage-row-'+row['key']);line.forceActiveFocus();QTest.keyClick(w.quick,Qt.Key_Space)
+        wait_for_rendered(lambda:p.options['filters'].get('effort')=='high')
+        assert p.data['summary']['known']==10
+        click(w,rendered('usage-records'))
+        wait_for_rendered(lambda:w.current_page==2 and len(w.record_rows)==10)
+        assert all(record['effort']=='high' for record in w.record_rows)
+        assert not w.qml_errors
+    finally:
+        theme.configure(appearance=appearance)
+
+
+def test_output_mean_table_rounds_unscaled_values_without_changing_chart_or_order(dashboard,monkeypatch):
+    from pathlib import Path
+    from PySide6.QtCore import QPointF,Qt
+    from PySide6.QtTest import QTest
+    w=dashboard;w.tick.stop();w.resize(1000,680)
+    source=snapshot();source['sessions']=source['sessions'][:1]
+    template=source['sessions'][0]['history'][0];rows=[]
+    cases=[('a-plain',[985]*33+[986]*467,985.934,'986'),
+           ('b-lower',[985]*2+[986]*3,985.6,'986'),
+           ('c-boundary',[999]*2+[1000]*3,999.6,'1,000'),
+           ('d-k',[1000],1000,'1.0k'),('d-fraction',[1300],1300,'1.3k'),
+           ('e-k-fraction',[2500],2500,'2.5k'),
+           ('f-m',[1250000],1250000,'1.25M'),('g-b',[1250000000],1250000000,'1.25B'),
+           ('h-zero',[0],0,'0'),('i-missing',[None],None,'—')]
+    for effort,outputs,_,_ in cases:
+        for index,output in enumerate(outputs):
+            rows.append(dict(template,key=f'table-{effort}-{index}',effort=effort,output=output,
+                             reasoning=0,cached=0,written=0,ts=source['ts']-10))
+    source['sessions'][0]['history']=rows
+    w.receive(source);w.change_page(1);p=w.metric_panel;p.change('dimension','all')
+    usage=control(w,p)
+    def rendered(name):
+        return next(item for item in walk(usage) if item.objectName()==name and item.isVisible())
+    wait_for_rendered(lambda:p.data.get('count')==len(cases))
+    projection=p._all_data
+    with monkeypatch.context() as guard:
+        guard.setattr(w,'render',lambda *a,**kw:pytest.fail('Table controls must reuse delivered aggregates'))
+        guard.setattr(w.engine,'page_query',lambda *a,**kw:pytest.fail('Table controls must not read records'))
+        p.change('metric','output_per_call');p.change('sort','asc')
+        efforts=[row['filters']['effort'] for row in p.data['rows']]
+        assert efforts.index('b-lower')<efforts.index('a-plain')
+        index=efforts.index('a-plain')
+        assert p.data['rows'][index]['value']==985.934
+        assert p.format_row(index)['value']=='985.934'
+        assert '985.934' in p.format_row(index)['tip']
+        p.change('metric','calls')
+        choice=rendered('usage-view');choice.forceActiveFocus();QTest.keyClick(w.quick,Qt.Key_Down)
+        wait_for_rendered(lambda:p.options['view']=='table')
+        assert_table_geometry(rendered)
+        for effort,_,value,expected in cases:
+            p.change('search',effort)
+            wait_for_rendered(lambda:p.data['count']==1 and p.data['rows'][0]['filters']['effort']==effort)
+            assert p.data['rows'][0]['metrics']['output_per_call']['value']==value
+            formatted=p.format_row(0)
+            assert len(formatted['metrics'])==8
+            output_cell=next(cell for cell in formatted['metrics'] if cell['key']=='output_per_call')
+            assert output_cell['value']==expected
+            displayed=expected+(' *' if output_cell['partial'] else '')
+            line=rendered('usage-row-'+p.data['rows'][0]['key'])
+            wait_for_rendered(lambda:any(item.isVisible() and item.property('text')==displayed for item in walk(line)))
+            cell=next(item for item in walk(line) if item.isVisible() and item.objectName()=='usage-cell-output_per_call')
+            assert_table_geometry(rendered,line)
+            position=cell.mapToScene(QPointF())
+            assert 0<=position.x()<position.x()+cell.width()<=w.quick.width()
+        p.change('search','a-plain')
+        wait_for_rendered(lambda:p.data['count']==1 and p.data['rows'][0]['filters']['effort']=='a-plain')
+        evidence=Path(__file__).resolve().parents[1]/'artifacts/verification/comparison-boxplot'
+        evidence.mkdir(parents=True,exist_ok=True)
+        assert w.quick.grabFramebuffer().save(str(evidence/'output-table-compact.png'))
+        assert p._all_data is projection
+    assert not w.qml_errors
+
+
+@pytest.mark.parametrize('boxplot_language',['ko','en'],indirect=True)
+def test_main_metric_table_fits_resizes_and_preserves_reasoning_coverage(boxplot_language,dashboard,monkeypatch):
+    import os
+    from pathlib import Path
+    from PySide6.QtCore import QPoint,QPointF,Qt
+    from PySide6.QtGui import QWheelEvent
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QApplication
+    w=dashboard;w.tick.stop();w.resize(1000,680)
+    source=snapshot();source['sessions']=source['sessions'][:1]
+    template=source['sessions'][0]['history'][0]
+    cases=[('complete',[32,34],33,'33.0','2 / 2'),('zero',[0],0,'0.0','1 / 1'),
+           ('missing',[None],None,'— *','0 / 1'),('partial',[12,None],12,'12.0 *','1 / 2')]
+    source['sessions'][0]['history']=[dict(template,key=f'reasoning-{effort}-{index}',effort=effort,
+        input=10**15 if effort=='complete' else 1000,output=100,reasoning=value,cached=0,written=0,
+        ts=source['ts']-10) for effort,values,_,_,_ in cases for index,value in enumerate(values)]
+    w.receive(source);w.change_page(1);p=w.metric_panel;p.change('dimension','all');usage=control(w,p)
+    def rendered(name):
+        return next(item for item in walk(usage) if item.objectName()==name and item.isVisible())
+    wait_for_rendered(lambda:p.data.get('count')==4)
+    diagnostics=os.environ.get('CODEXON_CHECK_DIAGNOSTICS')
+    evidence=(Path(diagnostics).parent if diagnostics else Path(__file__).resolve().parents[1]/'artifacts/verification/metric-table-fit')/'screenshots'
+    evidence.mkdir(parents=True,exist_ok=True)
+    projection=p._all_data
+    with monkeypatch.context() as guard:
+        guard.setattr(w,'render',lambda *a,**kw:pytest.fail('Table controls must reuse delivered aggregates'))
+        guard.setattr(w.engine,'page_query',lambda *a,**kw:pytest.fail('Table controls must not read records'))
+        p.change('view','table')
+        for effort,_,value,expected,coverage in cases:
+            row=next(row for row in p.data['rows'] if row['filters']['effort']==effort)
+            assert row['metrics']['reasoning']['value']==value
+            formatted=p.format_row(p.data['rows'].index(row))
+            cell=next(cell for cell in formatted['metrics'] if cell['key']=='reasoning')
+            assert cell['tip']==coverage and cell['partial']==(effort in ('missing','partial'))
+            line=rendered('usage-row-'+row['key'])
+            wait_for_rendered(lambda:any(item.isVisible() and item.objectName()=='usage-cell-reasoning'
+                and item.property('text')==expected for item in walk(line)))
+        headers,lines=assert_table_geometry(rendered)
+        long_row=rendered('usage-row-'+next(row['key'] for row in p.data['rows'] if row['filters']['effort']=='complete'))
+        currency=next(item for item in walk(long_row) if item.isVisible() and item.objectName()=='usage-cell-cost')
+        assert currency.property('contentHeight')>currency.property('font').pixelSize()*1.5
+        assert w.quick.grabFramebuffer().save(str(evidence/f'table-compact-{boxplot_language}.png'))
+        viewport=rendered('usage-viewport');before=[item.mapToScene(QPointF()).x() for item in headers]
+        point=headers[0].mapToScene(QPointF(headers[0].width()/2,headers[0].height()/2))
+        QTest.mousePress(w.quick,Qt.LeftButton,pos=point.toPoint())
+        QTest.mouseMove(w.quick,(point+QPointF(-120,0)).toPoint())
+        QTest.mouseRelease(w.quick,Qt.LeftButton,pos=(point+QPointF(-120,0)).toPoint())
+        QApplication.sendEvent(w.quick,QWheelEvent(point,QPointF(w.quick.mapToGlobal(point.toPoint())),
+            QPoint(),QPoint(120,0),Qt.NoButton,Qt.NoModifier,Qt.NoScrollPhase,False))
+        assert [item.mapToScene(QPointF()).x() for item in headers]==before
+        assert rendered('usage-rows').property('contentX')==0
+        for size in ((1600,900),(1000,680)):
+            prior=viewport.width();w.resize(*size)
+            wait_for_rendered(lambda:viewport.width()!=prior)
+            headers,lines=assert_table_geometry(rendered)
+            label=next(item for item in walk(lines[0]) if item.isVisible() and item.objectName()=='usage-table-label')
+            cell=next(item for item in walk(lines[0]) if item.isVisible() and item.objectName()=='usage-cell-calls')
+            assert (label.mapToItem(lines[0],QPointF()).y()+label.height()<=cell.mapToItem(lines[0],QPointF()).y())==(size[0]==1000)
+            if size[0]==1600:
+                assert w.quick.grabFramebuffer().save(str(evidence/f'table-wide-{boxplot_language}.png'))
+        p.change('metric','reasoning');p.change('sort','asc')
+        assert [row['filters']['effort'] for row in p.data['rows']]==['zero','partial','complete']
+        p.change('metric','calls')
+        wait_for_rendered(lambda:p.data['count']==4)
+        assert_table_geometry(rendered)
+        assert p._all_data is projection
+    row=next(row for row in p.data['rows'] if row['filters']['effort']=='partial')
+    line=rendered('usage-row-'+row['key']);line.forceActiveFocus();QTest.keyClick(w.quick,Qt.Key_Space)
+    wait_for_rendered(lambda:p.options['filters'].get('effort')=='partial')
+    p.records();wait_for_rendered(lambda:w.current_page==2 and len(w.record_rows)==2)
+    assert {record['reasoning'] for record in w.record_rows}=={12,None}
+    w.go_back();wait_for_rendered(lambda:w.current_page==1)
+    w.go_back();wait_for_rendered(lambda:p.data.get('count')==4)
     assert not w.qml_errors

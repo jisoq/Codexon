@@ -33,10 +33,41 @@ def dashboard(tmp_path):
     finally:app.setProperty('cachemonitorDisableShellIntegration',previous)
 
 
+def close_dashboard(window):
+    from cachemonitor.quick_qa import dispose
+    from test_ui import wait_for_rendered
+    window.quit_app()
+    # Exit is asynchronous; finish it before another dashboard or Python exits.
+    wait_for_rendered(lambda:window.quitting and window.shutdown_operation is None,timeout=10)
+    dispose(window)
+
+
 def deliver_pending(window):
     query=window.pending_query
     window.analysis_ready(dict(id=window.request_id,logical=window.pending_logical,
         result=window.engine.page_query(query),valid_until=float('inf')))
+
+
+def test_saved_maximized_window_starts_and_updates_quota_visibility(tmp_path):
+    from PySide6.QtWidgets import QWidget
+    from test_ui import wait_for_rendered
+    app=QApplication.instance() or QApplication([])
+    saved=QWidget();saved.resize(720,620);saved.setWindowState(Qt.WindowMaximized)
+    settings=QSettings(str(tmp_path/'settings.ini'),QSettings.IniFormat)
+    settings.setValue('dashboard/geometry',saved.saveGeometry())
+    saved.close();saved.deleteLater()
+    window=dashboard(tmp_path)
+    try:
+        window.show()
+        wait_for_rendered(window.isMaximized)
+        window.change_page(3)
+        assert window.quota_panel.presentation_active
+        window.showMinimized()
+        wait_for_rendered(lambda:not window.quota_panel.presentation_active)
+        window.showNormal();window.resize(720,620)
+        wait_for_rendered(lambda:window.quota_panel.presentation_active)
+        assert not window.qml_errors
+    finally:close_dashboard(window)
 
 
 def test_displayed_generation_refreshes_stale_detail_without_losing_selection(tmp_path):
@@ -91,7 +122,7 @@ def test_displayed_generation_refreshes_stale_detail_without_losing_selection(tm
         assert window.record_request_token is None
         bridge._deliver_result(dict(kind='record',id=window.record_request,prepared_token=third,row=row))
         assert window.exact_record is None and window.request_id==old_query+1
-    finally:window.quit_app()
+    finally:close_dashboard(window)
 
 
 def test_stale_population_closes_chart_hover_and_notification_floor_stays_current(tmp_path):
@@ -136,7 +167,7 @@ def test_stale_population_closes_chart_hover_and_notification_floor_stays_curren
         assert not chart.tip and chart.hoverIndex==-1
         assert window.request_id==old_query+1 and not window.analysis_errors
         assert window.current_page==2 and window.selected_session==('home','task')
-    finally:window.quit_app()
+    finally:close_dashboard(window)
 
 
 @pytest.mark.parametrize('language',['ko','en'])
@@ -197,6 +228,10 @@ def test_tab_loading_keeps_controls_and_ignores_stale_result(tmp_path,language):
         window.change_page(2)
         window.analysis_progressed(dict(id=old_id,stage='aggregate'))
         assert window.analysis_stage=='queued'
+        assert window.analysis_clock.isActive() and window.slow_timer.isActive()
+        window.analysis_started-=8
+        window.update_analysis_elapsed();window.show_analysis_slow()
+        assert window.analysis_loading['elapsedText'] and window.analysis_loading['slow']
         window.analysis_ready(dict(id=old_id,logical=old_logical,
             result=window.engine.page_query(old_query),valid_until=float('inf')))
         assert window.analysis_pending and window.pages.isVisible()
@@ -233,7 +268,7 @@ def test_tab_loading_keeps_controls_and_ignores_stale_result(tmp_path,language):
             wait_for_rendered(lambda:window.pages.isPageReady(page-1),timeout=5)
             assert not window.analysis_loading and not window.refresh_status.isVisible()
         assert not window.qml_errors
-    finally:window.quit_app();set_language('ko')
+    finally:close_dashboard(window);set_language('ko')
 
 
 def test_refresh_preserves_only_matching_results_and_failure_can_retry(tmp_path):
@@ -278,7 +313,8 @@ def test_refresh_preserves_only_matching_results_and_failure_can_retry(tmp_path)
         assert window.pending_retained and window.pages.isVisible()
         window.analysis_failed('synthetic failure')
         assert window.pages.isVisible() and window.error_button.isVisible()
-        assert window.retry_button.isVisible() and not window.analysis_loading
+        assert window.retry_button.isVisible() and window.analysis_loading['retained']
+        assert not window.analysis_loading['running'] and window.refresh_text.isVisible()
         click(window,control(window,window.retry_button))
         assert window.analysis_pending
         deliver_pending(window)
@@ -303,7 +339,7 @@ def test_refresh_preserves_only_matching_results_and_failure_can_retry(tmp_path)
         assert window.analysis_pending and not window.pending_retained
         assert window.pages.isVisible() and not window.analysis_loading['retained']
         assert not window.qml_errors
-    finally:window.quit_app()
+    finally:close_dashboard(window)
 
 
 def test_comparison_display_controls_keep_chart_without_new_query(tmp_path):
@@ -326,7 +362,7 @@ def test_comparison_display_controls_keep_chart_without_new_query(tmp_path):
         panel.change('sort','name');panel.change('mode','ratio')
         assert window.request_id==request and not window.analysis_pending and chart.isVisible()
         assert panel.options['mode']=='ratio' and not window.qml_errors
-    finally:window.quit_app()
+    finally:close_dashboard(window)
 
 
 def test_refresh_indicator_does_not_cover_existing_chart(tmp_path):
@@ -355,7 +391,7 @@ def test_refresh_indicator_does_not_cover_existing_chart(tmp_path):
         deliver_pending(window)
         wait_for_rendered(lambda:not indicators())
         assert not window.qml_errors
-    finally:window.quit_app()
+    finally:close_dashboard(window)
 
 
 def test_empty_result_waits_for_collection_before_showing_empty_charts(tmp_path):
@@ -373,6 +409,11 @@ def test_empty_result_waits_for_collection_before_showing_empty_charts(tmp_path)
         wait_for_rendered(lambda:any(item.objectName()=='analysis-region-loading' and item.isVisible()
             for item in walk(comparison)))
         assert comparison.property('masked')
+        window.refresh_collection_wait('failed')
+        assert window.analysis_loading['mode']=='error' and not window.analysis_loading['running']
+        assert window.retry_button.isVisible() and not window.analysis_clock.isActive()
+        window.refresh_collection_wait('preparing')
+        assert window.analysis_loading['running'] and window.analysis_clock.isActive()
         window.snapshot['index']['loading']=False
         window.render();deliver_pending(window)
         wait_for_rendered(lambda:window.pages.isVisible(),timeout=5)
@@ -385,7 +426,43 @@ def test_empty_result_waits_for_collection_before_showing_empty_charts(tmp_path)
         wait_for_rendered(lambda:bool(calls))
         assert calls==[{'automatic':True}]
         assert not window.qml_errors
-    finally:window.quit_app()
+    finally:close_dashboard(window)
+
+
+def test_history_navigation_retains_only_its_own_scope(tmp_path):
+    from cachemonitor.quick_qa import scene_view,control
+    window=dashboard(tmp_path)
+    try:
+        window.receive(sample());window.show();window.change_page(2)
+        control(window,window.session_parent_table)
+        window.async_mode=True;window.client_cache.clear()
+        window.selected_session=('home','task');window.record_view='requests';window.render()
+        assert window.analysis_pending and not window.pending_retained
+        assert not scene_view(window,window.session_parent_table).property('analysisMasked')
+        assert window.history_display_stack.state['analysisLoading']['active']
+        deliver_pending(window)
+        window.client_cache.clear()
+        window.home.addItem('Other home','different-home')
+        window.home.setCurrentIndex(window.home.findData('different-home'));window.render()
+        assert scene_view(window,window.session_parent_table).property('analysisMasked')
+        assert not window.qml_errors
+    finally:close_dashboard(window)
+
+
+def test_quota_retry_immediately_updates_the_selected_home(tmp_path):
+    from types import SimpleNamespace
+    window=dashboard(tmp_path)
+    home=str(tmp_path/'home');requests=[]
+    try:
+        window.quota_panel.set_homes([home])
+        window.quota_panel.receive(dict(home=home,report=dict(home=home,cycles=[],error=True),issue='Failed'))
+        window.quota_service=SimpleNamespace(home=home,retry_report=lambda:requests.append(True))
+        window.retry_quota()
+        assert requests==[True] and window.quota_panel.report_pending
+        assert window.quota_panel.initial_loading.isVisible()
+        assert not window.quota_panel.state_retry.isVisible()
+    finally:
+        window.quota_service=None;close_dashboard(window)
 
 
 def test_real_conflict_is_visible_but_missing_wire_evidence_is_not_an_error(tmp_path):
@@ -402,7 +479,7 @@ def test_real_conflict_is_visible_but_missing_wire_evidence_is_not_an_error(tmp_
         assert 'gpt-5.6-sol' in window.detail_sections['conditions'][1].text()
         window.render_record_detail(row)
         assert not window.detail_sections['evidence'][0].isVisible()
-    finally:window.quit_app()
+    finally:close_dashboard(window)
 
 
 @pytest.mark.parametrize('language',['ko','en'])
@@ -449,7 +526,7 @@ def test_subscription_prices_and_call_detail_render_supported_models(tmp_path,la
     finally:
         if getattr(window,'price_dialog',None) and window.price_dialog.host:
             window.price_dialog.reject();QTest.qWait(30)
-        window.quit_app();set_language('ko')
+        close_dashboard(window);set_language('ko')
 
 
 def test_unpriced_call_explains_missing_input_without_claiming_collection_error(tmp_path):
@@ -466,7 +543,7 @@ def test_unpriced_call_explains_missing_input_without_claiming_collection_error(
         assert '공식 단가' in price_reason(dict(price_issues=['Fast 장문 단가 미확인']))
         assert price_reason(dict(mode_conflict=True,price_issues=['요청 모드 미확인']))=='요청 모드 기록이 서로 다름'
         assert price_reason(dict(model_conflict=True,price_issues=['분석 모델 미확인']))=='요청 모델 기록이 서로 다름'
-    finally:window.quit_app()
+    finally:close_dashboard(window)
 
 
 def test_open_aggregate_refreshes_values_and_records_without_reveal(tmp_path):
@@ -481,4 +558,4 @@ def test_open_aggregate_refreshes_values_and_records_without_reveal(tmp_path):
         window.receive(updated)
         assert p.data['summary']['value']==before*2 and p.options['selected']==selected['selected']
         assert len(__import__('cachemonitor.dashboard_views',fromlist=['resolve_population']).resolve_population(window.engine,p.data['population']))==2
-    finally:window.quit_app()
+    finally:close_dashboard(window)

@@ -7,13 +7,24 @@ Item {
     required property var node
     property var s: node.state
     property bool compact: !!s.compact
+    readonly property bool failed: s.mode === "error"
+    readonly property bool terminal: s.running === false
     readonly property int completedStages: Math.max(0, Math.min(stages.length, s.stage || 0))
     property var stages: ["기록 준비", "기록 조회", "지표 계산", "화면 준비"]
     implicitWidth: compact ? 500 : 660
     implicitHeight: body.implicitHeight
-    Accessible.role: Accessible.ProgressBar
+    Accessible.role: root.failed ? Accessible.AlertMessage : root.terminal ? Accessible.StaticText : Accessible.ProgressBar
     Accessible.name: appLanguage.text(s.title || "불러오는 중") + ": " + appLanguage.text(s.detail || "")
     Accessible.description: appLanguage.text(root.stages[Math.min(root.completedStages, root.stages.length-1)])
+    property string announcedStatus: ""
+    readonly property string statusText: Accessible.name
+    onStatusTextChanged: announceStatus()
+    onVisibleChanged: if (visible) announceStatus()
+    function announceStatus() {
+        if (!visible || !statusText || statusText === announcedStatus) return
+        announcedStatus = statusText
+        if (appTheme.accessibilityActive) Accessible.announce(statusText)
+    }
     ColumnLayout {
         id: body
         width: root.compact ? parent.width : Math.min(parent.width, 660)
@@ -45,6 +56,7 @@ Item {
         Rectangle {
             id: track
             objectName: "loading-track"
+            visible: !root.terminal
             Layout.fillWidth: true
             Layout.preferredHeight: 3
             color: appTheme.palette && appTheme.color("border")
@@ -67,7 +79,7 @@ Item {
                 NumberAnimation on x {
                     from: -activity.width; to: track.width
                     duration: 1100; loops: Animation.Infinite
-                    running: activity.visible && root.visible
+                    running: activity.visible && root.visible && !appTheme.reduceMotion
                 }
             }
         }
@@ -81,7 +93,7 @@ Item {
             Accessible.name: text
         }
         GridLayout {
-            visible: !root.compact && root.s.showStages !== false
+            visible: !root.terminal && !root.compact && root.s.showStages !== false
             Layout.fillWidth: true
             columns: root.width < 560 ? 2 : 4
             rowSpacing: 14
@@ -119,7 +131,7 @@ Item {
             }
         }
         Text {
-            visible: !root.compact || !!root.s.slow
+            visible: !root.terminal && (!root.compact || !!root.s.slow)
             text: appLanguage.text(root.s.slow ? "기록 처리에 시간이 걸리고 있습니다. 다른 탭을 이용할 수 있습니다." : "다른 탭을 이용할 수 있습니다.")
             wrapMode: Text.WordWrap
             font.family: appTheme.family

@@ -3,7 +3,6 @@ import json
 import math
 import re
 import time
-from collections import OrderedDict
 from datetime import datetime
 from functools import lru_cache
 from PySide6.QtCore import Qt, QRectF, QPointF, QObject, Property, Slot, Signal, QTimer, QSequentialAnimationGroup, QPauseAnimation, QVariantAnimation, QEasingCurve
@@ -19,10 +18,13 @@ from .overlay_monitor import WIDTH, MARGIN, SECTION_WIDTH, TITLE_WIDTH, INLINE_C
 from .analysis_delivery import ANALYSIS_DELAY_SECONDS
 from .overlay_data import main_usage, RECENT_CALLS
 from .overlay_layout import AGENT_SUMMARY_HEIGHT
+from .overlay_icons import agent_mark
 
 LABELS = dict(cached='캐시 읽기', uncached='일반 입력', written='캐시 쓰기', reasoning='추론', output='추론 외', unknown='미분류')
 ORDER = tuple(LABELS)
 SUBAGENT_GAP = 19
+AGENT_ICON_SIZE = 12
+AGENT_ICON_GAP = 4
 
 def money(value):
     if value is None or not math.isfinite(value): return '—'
@@ -95,25 +97,6 @@ def palette(appearance):
     p=ui_palette(appearance)
     p.update(surface=p['overlay'],band=p['panel'],secondary=p['muted'],meta=p['muted'])
     return {key:QColor(value) for key,value in p.items()}
-
-
-@lru_cache(maxsize=128)
-def agent_palette(surface,ink,accent,overlay,count):
-    from .token_colors import categorical,oklab,readable,mix as mix_color,color_distance
-    _,a,b=oklab(accent);backgrounds=(surface,overlay)
-    if math.hypot(a,b)>=.015:return categorical(accent,backgrounds,count)
-    candidates=list(dict.fromkeys(readable(mix_color(surface,ink,k/512),backgrounds,3) for k in range(128,513)))
-    used=[];seen=set();nearest={}
-    preferred=readable(accent,backgrounds,3)
-    for index in range(count):
-        available=[candidate for candidate in candidates if candidate not in seen]
-        if not available:available=candidates
-        selected=max(available,key=lambda c:nearest[c] if used else -color_distance(c,preferred))
-        for candidate in candidates:
-            distance=color_distance(candidate,selected)
-            nearest[candidate]=min(nearest[candidate],distance) if used else distance
-        used.append(selected);seen.add(selected)
-    return tuple(used)
 
 
 class Drawing:
@@ -201,6 +184,8 @@ def paint_items(d,items,top=0,bottom=math.inf):
         elif isinstance(value,list):
             for i,line in enumerate(value):d.text(line,x,y+i*18,w,18,size,color,weight,right=style.get('right',False))
         else:d.text(value,x,y,w,h,size,color,weight,right=style.get('right',False),elide=style.get('kind')=='single-line')
+        if mark:=style.get('agentMark'):
+            mark.paint(d.p,QRectF(x-AGENT_ICON_SIZE-AGENT_ICON_GAP,y+(h-AGENT_ICON_SIZE)/2,AGENT_ICON_SIZE,AGENT_ICON_SIZE))
         if style.get('dot'):d.dot(x-7,y+h/2,style['dot'],2.5)
         if style.get('square'):
             if style.get('tokenMarker'):d.rect(x-16,y+5,12,8,style['square'],pattern=True)
@@ -224,12 +209,11 @@ class OverlayContent(Node):
         super().__init__();self.data=None;self.note='기록 확인 중';self.opacity=94;self.appearance=default_appearance(True);self.dark=True;self.compact=False
         self.detail_open=False;self.detail_inline=False;self.detail_width=SECTION_WIDTH-8
         self.main_expanded=False;self.visible_agent_counts={};self.available_height=None;self.chart_style='bar'
-        self._sub_summary_heights=[]
+        self._sub_summary_heights=[];self._sub_expanded_height=0
         self.detail_group='sub';self.expanded_groups=set()
         self.selected_id=None;self.selected_snapshot=None;self.follow_latest=True;self.graph_pinned=False;self.quota_lines=('','')
         self.monitor_tab='history';self.composition_unit='usd';self.lower_offset=0;self.settings=None
         self._freshness_label=''
-        self._agent_scope=None;self._agent_slots={};self._agent_registries=OrderedDict()
         self.highlight_id=None;self._highlight_timer=QTimer(self);self._highlight_timer.setSingleShot(True)
         self._highlight_timer.timeout.connect(self.clear_highlight)
         self.agent_highlight_opacity=0.
@@ -376,18 +360,9 @@ class OverlayContent(Node):
     def rows(self):return (self.data or {}).get('recent',[])[-RECENT_CALLS:]
     def graph_colors(self,rows):
         data=self.data or {};scope=(data.get('home'),data.get('id'))
-        if scope!=self._agent_scope:
-            self._agent_scope=scope
-            self._agent_slots=self._agent_registries.setdefault(scope,{scope:0})
-            self._agent_registries.move_to_end(scope)
-            while len(self._agent_registries)>16:self._agent_registries.popitem(last=False)
         agents={scope,*((r.get('home'),r.get('sid')) for r in rows),
                 *((r.get('home'),r.get('id')) for r in self.detail_data().get('agents',()))}
-        for agent in sorted(agents,key=lambda value:json.dumps(value,ensure_ascii=False)):
-            if agent not in self._agent_slots:self._agent_slots[agent]=len(self._agent_slots)
-        colors=ui_palette(self.appearance)
-        series=agent_palette(colors['surface'],self.appearance.ink,self.appearance.accent,colors['overlay'],len(self._agent_slots))
-        return {agent:series[index] for agent,index in self._agent_slots.items()}
+        return {agent:agent_mark(agent[1],self.appearance).color for agent in agents}
     @staticmethod
     def call_id(row):return (row.get('home'),row.get('sid'),row.get('id') or row.get('key'))
     def select(self,key):
@@ -425,7 +400,7 @@ class OverlayContent(Node):
         if key not in {row['key'] for row in self.detail_groups()}:return
         if key in self.expanded_groups:self.expanded_groups.remove(key)
         else:self.expanded_groups.add(key)
-        self.sync_details()
+        self.sync_details();self.update();self.layout_requested.emit()
     def detail_data(self):
         return (self.data or {}).get('subagent_finance',{}) if self.has_subagents() else {}
     @staticmethod
@@ -478,7 +453,7 @@ class OverlayContent(Node):
         def indicators(rows,dx=0,dy=0):
             return [dict(x=item[1]+dx,y=item[2]+dy,**item[8]['heartbeat'])
                     for item in rows if item[8].get('kind')=='agent-heartbeat']
-        main_items=self.agent_summary_items(main_usage(data),'Main Agent','ink',self.main_expanded,SECTION_WIDTH,main=True)
+        main_items=self.agent_summary_items(main_usage(data),'Main Agent',agent_mark(data.get('id'),self.appearance),self.main_expanded,SECTION_WIDTH,main=True)
         self.put(detailBodyHeight=round(height*self.appearance.scale),detailWidth=self.detail_width,detailTitle='Sub Agents',
                  mainHeartbeats=indicators(main_items,MARGIN,layout.get('main',0)) if not self.notice_card() else [],
                  detailHeartbeats=indicators(items),
@@ -602,7 +577,8 @@ class OverlayContent(Node):
     def visible_agent_count(self):return self.visible_agent_counts.get(self.agent_count_key(),3)
     def automatic_sub_height(self):
         heights=self._sub_summary_heights[:self.visible_agent_count()]
-        return sum(heights)+SUBAGENT_GAP*max(0,len(heights)-1)
+        # The count preference limits summaries; every open disclosure adds room.
+        return sum(heights)+SUBAGENT_GAP*max(0,len(heights)-1)+self._sub_expanded_height
     def layout(self,reduced=None,*,constrain=True):
         if self.notice_card():
             from .overlay_monitor import notice_geometry
@@ -725,21 +701,22 @@ class OverlayContent(Node):
         metrics=QFontMetrics(font(self.appearance.family,12,600))
         available=width*.44
         price_width=min(available,max((metrics.horizontalAdvance(money(cost))+6 for cost in costs),default=0))
-        return width-20-price_width,price_width
-    def agent_summary_items(self,group,label,color,expanded,width,*,main=False,cost_column=None):
+        return width-6-price_width,price_width
+    def agent_summary_items(self,group,label,mark,expanded,width,*,main=False,cost_column=None):
         """Keep both agent scopes on the same summary and metric columns."""
         from .overlay_monitor import speed
         cost=0 if group.get('calls')==0 else group.get('cost')
         price_x,price_width=cost_column or self.agent_cost_column(width)
         price=money(cost)
         chevron_x=price_x+price_width-2
-        name_width=max(0,price_x-26)
+        name_x=AGENT_ICON_SIZE+AGENT_ICON_GAP
+        name_width=max(0,price_x-name_x-14)
         label_metrics=QFontMetrics(font(self.appearance.family,12,600))
-        heartbeat_x=12+min(name_width,label_metrics.horizontalAdvance(tr(label)))+3
+        heartbeat_x=name_x+min(name_width,label_metrics.horizontalAdvance(tr(label)))+3
         request=group.get('request_state',group.get('request',{}).get('state'))
         mode='active' if request=='진행' else 'idle' if request else 'unknown'
         heartbeat_color=('#116b32','#38b96b')[int(self.dark)]
-        items=[(label,12,0,name_width,20,12,'ink',600,dict(kind='single-line',dot=color)),
+        items=[(label,name_x,0,name_width,20,12,'ink',600,dict(kind='single-line',agentMark=mark)),
                ('',heartbeat_x,1,4,4,11,'secondary',400,dict(kind='agent-heartbeat',heartbeat=dict(
                    id='main' if main else group.get('key',group.get('id','')),mode=mode,color=heartbeat_color,
                    accessible=tr(label)+' '+tr('진행 중' if mode=='active' else '대기' if mode=='idle' else '미확인')))),
@@ -757,22 +734,21 @@ class OverlayContent(Node):
     @staticmethod
     def agent_summary_height(items):return max(AGENT_SUMMARY_HEIGHT,max((item[2]+item[4] for item in items),default=0))
     def detail_items(self):
-        self._sub_summary_heights=[]
+        self._sub_summary_heights=[];self._sub_expanded_height=0
         d=self.detail_data();w=self.detail_width;items=[];y=0
         if not d:
             if self.has_subagents():items.append((tr('모델별 기록 확인 중'),0,0,w,20,11,'secondary',400,{}))
             return items
-        colors=self.graph_colors(self.rows())
         cost_column=self.agent_cost_column(w)
         for index,group in enumerate(self.detail_groups()):
             key=group['key'];expanded=key in self.expanded_groups;start=y
             if index:items.append(('',0,y-8,w,1,11,'ink',400,dict(kind='agent-separator')))
-            agent=(group.get('home'),group.get('id'));col=colors[agent]
+            agent=(group.get('home'),group.get('id'));mark=agent_mark(agent[1],self.appearance)
             displayed=self.latest_call()
-            summary=self.agent_summary_items(group,group['label'],col,expanded,w,cost_column=cost_column)
+            summary=self.agent_summary_items(group,group['label'],mark,expanded,w,cost_column=cost_column)
             summary_height=self.agent_summary_height(summary)
             if agent==(displayed.get('home'),displayed.get('sid')):
-                items.append(('',0,y,w,summary_height,11,'ink',400,dict(kind='agent-selection',agentColor=col,alpha=self.agent_highlight_opacity)))
+                items.append(('',0,y,w,summary_height,11,'ink',400,dict(kind='agent-selection',agentColor=mark.color,alpha=self.agent_highlight_opacity)))
             self._sub_summary_heights.append(summary_height)
             for item in summary:
                 items.append((*item[:2],item[2]+y,*item[3:]))
@@ -785,7 +761,8 @@ class OverlayContent(Node):
             if expanded:
                 details=self.group_details(group)
                 for item in details:items.append((*item[:2],item[2]+y,*item[3:]))
-                y+=max((item[2]+item[4] for item in details),default=0)+8
+                detail_height=max((item[2]+item[4] for item in details),default=0)+8
+                self._sub_expanded_height+=detail_height;y+=detail_height
             y+=SUBAGENT_GAP
         return items
     def headline_metrics(self):

@@ -7,9 +7,9 @@ import pytest
 from cachemonitor import app_update
 
 
-def release():
-    prefix='https://github.com/jisoq/Codexon/releases/download/v2026.09.24.1/'
-    return dict(tag_name='v2026.09.24.1',assets=[
+def release(tag='v2026.09.24.1'):
+    prefix='https://github.com/jisoq/Codexon/releases/download/'+tag+'/'
+    return dict(tag_name=tag,assets=[
         dict(name='Codexon-Setup.exe',browser_download_url=prefix+'Codexon-Setup.exe',size=7),
         dict(name='Codexon-Setup.exe.sha256',browser_download_url=prefix+'Codexon-Setup.exe.sha256')])
 
@@ -34,6 +34,85 @@ def test_failed_download_never_launches_installer(tmp_path,monkeypatch):
     monkeypatch.setattr(app_update,'launch_installer',lambda *a:pytest.fail('Unverified installer executed'))
     with pytest.raises(ValueError,match='검증'):app_update.update()
     assert not list(tmp_path.rglob('*.exe')) and not list(tmp_path.rglob('*.partial'))
+
+
+def test_connection_closed_before_download_response_can_retry_same_release(tmp_path,monkeypatch):
+    from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
+    import socket
+    import threading
+    import time
+    from http.client import RemoteDisconnected
+    from types import SimpleNamespace
+    from cachemonitor.update_state import UpdateState
+    from cachemonitor.update_panel import UpdatePanel
+    from cachemonitor.quick_runtime import QuickHost
+    from cachemonitor.quick_qa import control
+    from PySide6.QtWidgets import QApplication
+    from PySide6.QtCore import QPointF,Qt
+    from PySide6.QtTest import QTest
+    app=QApplication.instance() or QApplication([])
+    offered=release('v2099.01.01.1')
+    payload=b'payload';digest=hashlib.sha256(payload).hexdigest();downloads=[]
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self,*args):pass
+        def do_GET(self):
+            if self.path=='/latest':body=json.dumps(offered).encode()
+            elif self.path.endswith('.sha256'):body=(digest+'  Codexon-Setup.exe').encode()
+            else:
+                downloads.append(True)
+                if len(downloads)==1:
+                    self.connection.shutdown(socket.SHUT_RDWR);self.connection.close();return
+                body=payload
+            self.send_response(200);self.send_header('Content-Length',str(len(body)));self.end_headers()
+            self.wfile.write(body)
+    server=ThreadingHTTPServer(('127.0.0.1',0),Handler)
+    thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+    open_url=app_update.urllib.request.urlopen
+    def local(request,**kwargs):
+        url=f'http://127.0.0.1:{server.server_port}/'+request.full_url.rsplit('/',1)[1]
+        return open_url(app_update.urllib.request.Request(url,headers=app_update.HEADERS),**kwargs)
+    monkeypatch.setattr(app_update.urllib.request,'urlopen',local)
+    calls=[];monkeypatch.setattr(app_update,'launch_installer',lambda *args:calls.append(args))
+    m=SimpleNamespace(home=tmp_path/'home',evidence=tmp_path/'evidence.sqlite',url='http://127.0.0.1:18768',
+                      directory=tmp_path,status=lambda:{'configured':False})
+    plan=dict(kind='app',release=offered,install={'InstallRoot':str(tmp_path)},manager=m)
+    monkeypatch.setattr(app_update,'installed',lambda:plan['install'])
+    monkeypatch.setattr(UpdatePanel,'recover',lambda self:None)
+    journal=UpdateState(tmp_path);panel=None;host=None
+    def settle(predicate):
+        deadline=time.monotonic()+3
+        while not predicate() and time.monotonic()<deadline:
+            app.processEvents();QTest.qWait(5)
+        assert predicate()
+    def click(node):
+        item=control(host,node)
+        def ready():
+            app.processEvents();host.quick.grabFramebuffer()
+            return item.isVisible() and item.isEnabled() and item.width()>0 and item.height()>0
+        settle(ready)
+        point=item.mapToScene(QPointF(item.width()/2,item.height()/2)).toPoint()
+        assert host.quick.rect().contains(point)
+        QTest.mouseClick(host.quick,Qt.LeftButton,pos=point)
+    try:
+        with pytest.raises(RemoteDisconnected):app_update.update(plan=plan)
+        failed=journal.read()
+        assert failed['phase']=='failed' and failed['app']['state']=='pending' and not calls
+        assert not list(tmp_path.rglob('*.exe')) and not list(tmp_path.rglob('*.partial'))
+        panel=UpdatePanel(m);host=QuickHost();host.resize(640,240);host.setCentralWidget(panel);host.show()
+        before=journal.path.read_bytes();click(panel.button)
+        settle(lambda:panel.operation is None and bool(panel.offer))
+        assert panel.offer['release']==offered and journal.path.read_bytes()==before
+        click(panel.execute)
+        settle(lambda:panel.operation is None and bool(calls))
+        retried=journal.read()
+        assert retried['operation_id']!=failed['operation_id'] and retried['phase']=='installing'
+        assert len(calls)==1 and Path(calls[0][0]).read_bytes()==payload
+    finally:
+        if panel:
+            panel.stop()
+            if panel.operation:panel.operation.wait()
+        if host:host.release_scene();host.close();host.deleteLater();app.processEvents()
+        server.shutdown();server.server_close();thread.join(timeout=2)
 
 
 def test_download_cache_keeps_recent_active_and_unknown_files(tmp_path,monkeypatch):
@@ -284,6 +363,255 @@ def test_explicit_start_is_single_flight_and_check_remains_read_only(tmp_path,mo
 def test_connection_count_preserves_unknown(health,expected):
     assert app_update.connection_count({'health':health})==expected
 
+
+
+@pytest.mark.parametrize('phase',['failed','interrupted'])
+def test_failed_app_download_can_offer_and_start_retry(tmp_path,monkeypatch,phase):
+    import time
+    from PySide6.QtWidgets import QApplication
+    from PySide6.QtCore import QPointF, Qt
+    from PySide6.QtTest import QTest
+    from cachemonitor.quick_runtime import QuickHost
+    from cachemonitor.quick_qa import control
+    from types import SimpleNamespace
+    from cachemonitor.update_panel import UpdatePanel
+    app=QApplication.instance() or QApplication([])
+    monkeypatch.setattr(UpdatePanel,'recover',lambda self:None)
+    panel=UpdatePanel(SimpleNamespace(directory=tmp_path/'updates'))
+    host=QuickHost();host.resize(640,240);host.setCentralWidget(panel);host.show()
+    try:
+        op=panel.journal.begin('app','fixture')['operation_id']
+        panel.journal.change(op,phase=phase,message='Remote end closed connection without response')
+        panel.refresh()
+        assert panel.button.isVisible() and panel.button.isEnabled()
+        plan=dict(kind='app',release=release('v2099.01.01.1'),connections=0)
+        panel.checking=True;panel.receive_result(plan);panel.finished();panel.refresh()
+        assert panel.execute.isVisible() and panel.execute.isEnabled()
+        assert panel.offer is plan and panel.version.isVisible()
+        assert panel.journal.read()['phase']==phase
+        calls=[]
+        monkeypatch.setattr(panel,'launch_operation',lambda action:calls.append(action))
+        button=control(host,panel.execute)
+        deadline=time.monotonic()+2
+        while time.monotonic()<deadline:
+            app.processEvents();host.quick.grabFramebuffer()
+            if button.isVisible() and button.isEnabled() and button.width()>0 and button.height()>0:break
+            QTest.qWait(5)
+        assert button.isVisible() and button.isEnabled() and button.width()>0 and button.height()>0
+        point=button.mapToScene(QPointF(button.width()/2,button.height()/2)).toPoint()
+        assert host.quick.rect().contains(point)
+        QTest.mouseClick(host.quick,Qt.LeftButton,pos=point)
+        deadline=time.monotonic()+2
+        while not calls and time.monotonic()<deadline:
+            app.processEvents();QTest.qWait(5)
+        assert len(calls)==1
+    finally:
+        panel.stop();host.release_scene();host.close();host.deleteLater();app.processEvents()
+
+
+def test_restart_replays_saved_update_failure_to_error_registry(tmp_path,monkeypatch):
+    from PySide6.QtWidgets import QApplication
+    from types import SimpleNamespace
+    from cachemonitor.update_panel import UpdatePanel
+    from cachemonitor.update_state import UpdateState
+    from cachemonitor.app_errors import ErrorState
+    from cachemonitor.dashboard import Dashboard
+    app=QApplication.instance() or QApplication([])
+    monkeypatch.setattr(UpdatePanel,'recover',lambda self:None)
+    journal=UpdateState(tmp_path/'updates');op=journal.begin('app','fixture')['operation_id']
+    journal.fail(op,'saved network failure')
+    panel=UpdatePanel(SimpleNamespace(directory=journal.root))
+    class Receiver:
+        error_state=ErrorState()
+        receive_update_error=Dashboard.receive_update_error
+        def observe_error(self,source,kind,facts,**kwargs):self.error_state.update(source,kind,facts,**kwargs)
+        def refresh_errors(self):pass
+    receiver=Receiver();panel.fault_changed.connect(receiver.receive_update_error)
+    try:
+        panel.refresh()
+        assert receiver.error_state.grouped()['update'].code=='install'
+        count=len(receiver.error_state.history);panel.refresh()
+        assert len(receiver.error_state.history)==count
+    finally:panel.stop();panel.deleteLater();app.processEvents()
+
+
+def test_retry_progress_replaces_old_operation_fault_but_keeps_check_failure(tmp_path,monkeypatch):
+    from PySide6.QtWidgets import QApplication
+    from types import SimpleNamespace
+    from cachemonitor.update_panel import UpdatePanel
+    from cachemonitor.app_errors import ErrorState
+    from cachemonitor.dashboard import Dashboard
+    app=QApplication.instance() or QApplication([])
+    monkeypatch.setattr(UpdatePanel,'recover',lambda self:None)
+    panel=UpdatePanel(SimpleNamespace(directory=tmp_path/'updates'))
+    class Receiver:
+        error_state=ErrorState()
+        receive_update_error=Dashboard.receive_update_error
+        def observe_error(self,source,kind,facts,**kwargs):self.error_state.update(source,kind,facts,**kwargs)
+        def refresh_errors(self):pass
+    receiver=Receiver();panel.fault_changed.connect(receiver.receive_update_error)
+    try:
+        op=panel.journal.begin('app','fixture')['operation_id'];panel.journal.fail(op,'old error');panel.refresh()
+        panel.checking=False;panel.receive_result(ConnectionError('old download error'))
+        receiver.receive_update_error(dict(checking_failed=True))
+        op=panel.journal.begin('app','fixture')['operation_id'];panel.journal.change(op,phase='downloading');panel.refresh()
+        assert set(receiver.error_state.sources)=={'update.check'}
+        assert receiver.error_state.grouped()['update'].code=='check'
+    finally:panel.stop();panel.deleteLater();app.processEvents()
+
+
+def test_newer_app_offer_does_not_retry_previous_proxy_stage(tmp_path,monkeypatch):
+    import sys
+    from PySide6.QtWidgets import QApplication
+    from types import SimpleNamespace
+    from cachemonitor.update_panel import UpdatePanel
+    app=QApplication.instance() or QApplication([])
+    monkeypatch.setattr(UpdatePanel,'recover',lambda self:None)
+    panel=UpdatePanel(SimpleNamespace(directory=tmp_path/'updates'))
+    calls=[]
+    monkeypatch.setattr(app_update,'update',lambda *a,**kw:calls.append(('app',kw['plan'])))
+    monkeypatch.setattr(app_update,'retry_proxy',lambda *a,**kw:calls.append(('proxy',None)))
+    monkeypatch.setattr(panel,'launch_operation',lambda action:action())
+    try:
+        op=panel.journal.begin('app','2026.01.01.1')['operation_id']
+        panel.journal.change(op,phase='partial',app=dict(state='verified',executable=sys.executable),proxy={'phase':'failed'})
+        panel.refresh()
+        plan=dict(kind='app',release={'tag_name':'v2099.01.01.1'},connections=0)
+        panel.show_plan(plan);panel.refresh()
+        assert panel.version.isVisible()
+        panel.request_install()
+        assert calls==[('app',plan)]
+    finally:panel.stop();panel.deleteLater();app.processEvents()
+
+
+def test_offer_click_cannot_dispatch_a_different_operation(tmp_path,monkeypatch):
+    from PySide6.QtWidgets import QApplication
+    from types import SimpleNamespace
+    from cachemonitor.update_panel import UpdatePanel
+    app=QApplication.instance() or QApplication([])
+    monkeypatch.setattr(UpdatePanel,'recover',lambda self:None)
+    panel=UpdatePanel(SimpleNamespace(directory=tmp_path/'updates'));calls=[]
+    monkeypatch.setattr(panel,'launch_operation',lambda action:calls.append(action))
+    try:
+        op=panel.journal.begin('app','fixture')['operation_id'];panel.journal.fail(op,'old failure')
+        panel.refresh();panel.show_plan(dict(kind='app',release=release('v2099.01.01.1')))
+        other=panel.journal.begin('proxy','fixture')['operation_id'];panel.journal.fail(other,'other failure')
+        panel.request_install()
+        assert panel.record['operation_id']==other and not calls and panel.offer is None
+    finally:panel.stop();panel.deleteLater();app.processEvents()
+
+
+def test_obsolete_successful_check_resolves_only_its_check_fault(tmp_path,monkeypatch):
+    from PySide6.QtWidgets import QApplication
+    from types import SimpleNamespace
+    from cachemonitor.update_panel import UpdatePanel
+    app=QApplication.instance() or QApplication([])
+    monkeypatch.setattr(UpdatePanel,'recover',lambda self:None)
+    panel=UpdatePanel(SimpleNamespace(directory=tmp_path/'updates'));events=[]
+    panel.fault_changed.connect(events.append)
+    try:
+        op=panel.journal.begin('app','fixture')['operation_id'];panel.journal.fail(op,'old failure');panel.refresh()
+        panel.checking=True;panel._check_operation_id=op
+        other=panel.journal.begin('proxy','fixture')['operation_id'];panel.journal.change(other,phase='complete')
+        panel.receive_result(dict(kind='none'))
+        assert any(facts.get('check_healthy') for facts in events)
+        panel.finished()
+        assert panel.offer is None and panel.record['operation_id']==other
+    finally:panel.stop();panel.deleteLater();app.processEvents()
+
+
+@pytest.mark.parametrize('same_operation',[True,False])
+def test_delayed_proxy_status_cannot_block_check_after_completion(tmp_path,monkeypatch,same_operation):
+    import time
+    from PySide6.QtWidgets import QApplication
+    from types import SimpleNamespace
+    from cachemonitor.update_panel import UpdatePanel
+    app=QApplication.instance() or QApplication([])
+    monkeypatch.setattr(UpdatePanel,'recover',lambda self:None)
+    panel=UpdatePanel(SimpleNamespace(directory=tmp_path/'updates'));calls=[]
+    monkeypatch.setattr(panel,'launch_operation',lambda action:calls.append(action))
+    try:
+        op=panel.journal.begin('proxy','fixture')['operation_id']
+        waiting=dict(phase='waiting',operation_id=op,updated_at=time.time())
+        panel.journal.proxy_result(op,dict(phase='complete',operation_id=op,updated_at=time.time()))
+        if not same_operation:
+            new=panel.journal.begin('proxy','newer')['operation_id']
+            panel.journal.proxy_result(new,dict(phase='complete',operation_id=new,updated_at=time.time()))
+        panel.refresh();panel.proxy_status(dict(update=waiting))
+        panel.start()
+        assert panel.record['phase']=='complete' and len(calls)==1
+    finally:panel.stop();panel.deleteLater();app.processEvents()
+
+
+def test_fresh_check_error_survives_previous_verified_install(tmp_path,monkeypatch):
+    from urllib.error import URLError
+    from PySide6.QtWidgets import QApplication
+    from types import SimpleNamespace
+    from cachemonitor.update_panel import UpdatePanel
+    app=QApplication.instance() or QApplication([])
+    monkeypatch.setattr(UpdatePanel,'recover',lambda self:None)
+    panel=UpdatePanel(SimpleNamespace(directory=tmp_path/'updates'))
+    try:
+        op=panel.journal.begin('app','fixture')['operation_id']
+        panel.journal.change(op,phase='complete',app={'state':'verified'})
+        panel.refresh();before=panel.journal.path.read_bytes()
+        panel.checking=True;panel.receive_result(URLError(TimeoutError('current check failure')))
+        current=panel.status.text();panel.finished();panel.refresh()
+        assert panel.status.text()==current and panel.button.isVisible() and panel.button.isEnabled()
+        assert panel.journal.path.read_bytes()==before
+    finally:panel.stop();panel.deleteLater();app.processEvents()
+
+
+def test_manual_metadata_reserves_worker_slot_against_recovery(tmp_path,monkeypatch):
+    import threading,time
+    from PySide6.QtWidgets import QApplication
+    from PySide6.QtTest import QTest
+    from types import SimpleNamespace
+    from cachemonitor.update_panel import UpdatePanel
+    app=QApplication.instance() or QApplication([])
+    panel=UpdatePanel(SimpleNamespace(directory=tmp_path/'updates'));gate=threading.Event();prepared=[]
+    def reconcile(journal,*args):gate.wait(2);return journal.read()
+    monkeypatch.setattr(app_update,'reconcile_update',reconcile)
+    monkeypatch.setattr(app_update,'check_update',lambda *a,**kw:prepared.append(kw['release']) or dict(kind='none'))
+    panel.monitor=SimpleNamespace(check_manually=lambda:None)
+    try:
+        panel.start();assert panel.metadata_pending
+        panel.journal.begin('app','fixture');panel.refresh()
+        assert panel.operation is None and panel.checking
+        panel.metadata_received(release());gate.set()
+        deadline=time.monotonic()+3
+        while panel.operation is not None and time.monotonic()<deadline:
+            app.processEvents();QTest.qWait(5)
+        assert prepared==[release()] and not panel.metadata_pending
+        assert not panel.execute.isVisible()
+    finally:
+        gate.set();panel.stop()
+        if panel.operation:panel.operation.wait()
+        panel.deleteLater();app.processEvents()
+
+
+def test_proxy_retry_exception_preserves_verified_app_in_fault(tmp_path,monkeypatch):
+    from PySide6.QtWidgets import QApplication
+    from types import SimpleNamespace
+    from cachemonitor.update_panel import UpdatePanel
+    from cachemonitor.app_errors import ErrorState
+    from cachemonitor.dashboard import Dashboard
+    app=QApplication.instance() or QApplication([])
+    monkeypatch.setattr(UpdatePanel,'recover',lambda self:None)
+    panel=UpdatePanel(SimpleNamespace(directory=tmp_path/'updates'))
+    class Receiver:
+        error_state=ErrorState()
+        receive_update_error=Dashboard.receive_update_error
+        def observe_error(self,source,kind,facts,**kwargs):self.error_state.update(source,kind,facts,**kwargs)
+        def refresh_errors(self):pass
+    receiver=Receiver();panel.fault_changed.connect(receiver.receive_update_error)
+    try:
+        op=panel.journal.begin('proxy','fixture')['operation_id']
+        panel.journal.fail(op,'proxy start failure');panel.refresh()
+        panel.checking=False;panel.receive_result(ConnectionError('proxy start failure'));panel.finished()
+        assert {fault.code for fault in receiver.error_state.sources.values()}=={'proxy'}
+        assert {record['error_code'] for record in receiver.error_state.history}=={'proxy'}
+    finally:panel.stop();panel.deleteLater();app.processEvents()
 
 
 def test_update_widget_does_not_persist_inferred_interruption(tmp_path,monkeypatch):

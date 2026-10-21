@@ -156,6 +156,7 @@ def _chart(d,m,rows,key,label,y,height,displayed):
 def paint(d,m):
     if m.notice_card():return
     from .overlay_view import paint_items,money
+    from .overlay_icons import agent_mark
     data=m.data or {};own=main_usage(data);g=m.layout();rows=m.rows()
     d.text('전체 비용',MARGIN,g['total'],56,28,11,'secondary')
     total_width=m.heartbeat_state()['x']-MARGIN-56-6
@@ -163,12 +164,12 @@ def paint(d,m):
     displayed=m.displayed_call()
     for (key,label),y in zip(CHARTS,g['charts']):_chart(d,m,rows,key,label,y,g['chart_height'],displayed)
     displayed=m.latest_call()
-    y=g['main'];color=m.graph_colors(rows)[(data.get('home'),data.get('id'))]
+    y=g['main'];mark=agent_mark(data.get('id'),m.appearance)
     if m.agent_highlight_opacity>0 and displayed and (displayed.get('home'),displayed.get('sid'))==(data.get('home'),data.get('id')):
-        d.rect(MARGIN,y,SECTION_WIDTH,g['main_height'],color,5,alpha=m.agent_highlight_opacity)
+        d.rect(MARGIN,y,SECTION_WIDTH,g['main_height'],mark.color,5,alpha=m.agent_highlight_opacity)
     d.line(MARGIN,y-6,RIGHT,y-6)
     paint_items(d,[(item[0],item[1]+MARGIN,item[2]+y,*item[3:])
-                   for item in m.agent_summary_items(own,'Main Agent',color,m.main_expanded,SECTION_WIDTH,main=True)])
+                   for item in m.agent_summary_items(own,'Main Agent',mark,m.main_expanded,SECTION_WIDTH,main=True)])
     if m.main_expanded:
         d.p.save();d.p.translate(MARGIN,g['main_detail']);paint_items(d,m.main_items());d.p.restore()
     if m.has_subagents():

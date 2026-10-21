@@ -8,6 +8,7 @@ Codexon source code is licensed under the custom [Codexon Attribution License 1.
 | Tcl/Tk 8.6 | Independent connection recovery UI | Tcl/Tk notices are included under `LICENSES/recovery/`. The recovery executable embeds its own Python and Tcl/Tk runtime and does not load Qt. |
 | PySide6, shiboken6, Qt 6.11.2 | UI runtime | Module-specific LGPL-3.0 or GPL-3.0/commercial terms. `LICENSES/` contains license texts; `SOURCE-OFFER.md` explains the matching source release asset and how to replace LGPL libraries. |
 | Pretendard JP | UI font | SIL Open Font License 1.1; `cachemonitor/assets/fonts/OFL.txt` is included in source and distribution. |
+| OpenAI Codex agent avatar artwork | Overlay task icons | Artwork from Codex desktop 26.1013.4894.0. The source package and original file hashes are recorded in `cachemonitor/assets/agent-icons/source.json`. |
 | Other bundled Python packages and native libraries | Runtime dependencies | The frozen module graph generates `BUNDLED-PYTHON.md` and copies the installed license files under `LICENSES/python/`. |
 | Rust standard library, PyO3, Serde, and their locked dependencies | Native CPU calculations | `BUNDLED-RUST.md` lists the resolved versions and declared licenses. Unmodified crate notices and the pinned Rust standard-library copyright document are included under `LICENSES/rust/`. |
 

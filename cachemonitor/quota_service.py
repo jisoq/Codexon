@@ -49,6 +49,7 @@ class QuotaService(QThread):
         self.local_observations=queue.Queue(maxsize=1)
         self.exclusion_changes=queue.SimpleQueue()
         self.reports_enabled=reports_enabled
+        self.report_retry=False
         self.worker_results=queue.SimpleQueue()
         self.report_worker=QuotaWorker(self.path,self.home,on_result=self._receive_worker)
 
@@ -65,6 +66,10 @@ class QuotaService(QThread):
             if not enabled and hasattr(self.report_worker,'set_paused'):
                 self.report_worker.set_paused(True)
             self.wake.set()
+
+    def retry_report(self):
+        self.report_retry=True
+        self.wake.set()
 
     def supply_local(self, quota):
         """Persist each new observation before replacing the displayed gauge."""
@@ -150,6 +155,7 @@ class QuotaService(QThread):
         lookup_issue = database_issue = aggregation_issue = ''
         lookup_reason='';database_fault={};calculation_fault={}
         emitted_issue = None;emitted_faults=None
+        emitted_pending=None
         report = None
         stage = 'initialize'
         was_reporting=self.reports_enabled
@@ -235,6 +241,11 @@ class QuotaService(QThread):
                     if was_reporting:
                         next_report=next_history=0
                         if paused and report is None:paused_report_due=True
+                if self.report_retry:
+                    self.report_retry=False
+                    report_refresh_due=True
+                    next_aggregate=next_storage=next_report=0
+                    polling.next_read=0
                 with self.ingress_lock:
                     current_tracking_revision=self.tracking_revision
                     tracking_enabled=self.tracking_enabled
@@ -403,14 +414,17 @@ class QuotaService(QThread):
                         report_request=self.report_worker.request('report')
                         paused_report_due=False
                         next_history=time.monotonic()+5
+                        publish=True
                 latest = select_current_quota(direct, local, time.time())
                 issue = ', '.join(dict.fromkeys(v for v in (lookup_issue, database_issue, aggregation_issue,
                     pending.issue, self.observation_issue, self.control_issue) if v))
                 faults=dict(lookup=dict(lookup_failed=bool(lookup_issue),reason=lookup_reason),
                     storage=database_fault or dict(storage_failed=bool(pending.issue or self.observation_issue or self.control_issue)),
                     calculation=dict(calculation_fault))
-                if publish or issue != emitted_issue or faults!=emitted_faults or exclusion_results or operation_progress:
+                report_pending=report_request is not None
+                if publish or issue != emitted_issue or faults!=emitted_faults or report_pending!=emitted_pending or exclusion_results or operation_progress:
                     value={'home':self.home,'quota':latest,'issue':issue,'quota_faults':faults,'report_refreshed':report_ready,
+                           'report_pending':report_pending,
                            'paused':paused,'paused_at':self.paused_at,'monitoring_revision':revision}
                     if self.reports_enabled or exclusion_results:
                         if report is not None:
@@ -422,6 +436,7 @@ class QuotaService(QThread):
                     for progress in operation_progress:
                         self.updated.emit({**value,'operation_progress':progress})
                     emitted_issue = issue;emitted_faults=faults
+                    emitted_pending=report_pending
                     next_report = time.monotonic()+5
                 self.wake.wait(1)
         finally:

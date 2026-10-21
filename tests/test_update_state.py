@@ -49,6 +49,29 @@ def test_cancel_and_swap_have_one_atomic_winner(tmp_path,cancel_first):
         assert not journal.cancel()
 
 
+def test_delayed_waiting_result_cannot_reopen_cancel_after_cutover(tmp_path):
+    journal=UpdateState(tmp_path);op=journal.begin('proxy','fixture')['operation_id']
+    waiting=dict(phase='waiting',updated_at=1.)
+    assert journal.proxy_result(op,waiting)
+    assert journal.begin_switch(op)
+    assert not journal.proxy_result(op,waiting)
+    assert journal.read()['phase']=='switching' and journal.read()['proxy']['cutover_started']
+    assert not journal.cancel()
+
+
+def test_explicit_proxy_retry_has_a_new_cancel_boundary(tmp_path,monkeypatch):
+    from cachemonitor import install_management
+    journal=UpdateState(tmp_path);m=manager(tmp_path)
+    op=journal.begin('proxy','fixture',scope=scope_for(m))['operation_id']
+    journal.proxy_result(op,dict(phase='failed',cutover_started=True,updated_at=1.))
+    def activate(*args,**kwargs):
+        assert journal.cancel()
+        return dict(phase='cancelled',updated_at=2.)
+    monkeypatch.setattr(install_management,'activate_proxy',activate)
+    result=app_update.retry_proxy(m,journal)
+    assert result['phase']=='deferred' and result['operation_id']==op
+
+
 def test_partial_retry_keeps_app_and_disabled_proxy(tmp_path,monkeypatch):
     from cachemonitor import install_management,retired_cache
     journal=UpdateState(tmp_path);m=manager(tmp_path)

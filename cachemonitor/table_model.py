@@ -62,12 +62,13 @@ class Rows(QAbstractTableModel):
         self.formatter=None;self.cache=OrderedDict();self.formatted=0
     def rowCount(self,parent=QModelIndex()):return 0 if parent.isValid() else len(self.rows)
     def columnCount(self,parent=QModelIndex()):return 0 if parent.isValid() else len(self.headers)
-    def roleNames(self):return {Qt.DisplayRole:b'display',Qt.ToolTipRole:b'tooltip',Qt.BackgroundRole:b'cellBackground',Qt.TextAlignmentRole:b'alignment',Qt.UserRole+1:b'changedCell',Qt.UserRole+2:b'cacheZero',Qt.UserRole+3:b'cellBar',Qt.UserRole+4:b'verbatim',Qt.UserRole+5:b'hierarchy'}
+    def roleNames(self):return {Qt.DisplayRole:b'display',Qt.ToolTipRole:b'tooltip',Qt.BackgroundRole:b'cellBackground',Qt.TextAlignmentRole:b'alignment',Qt.UserRole+1:b'changedCell',Qt.UserRole+2:b'cacheZero',Qt.UserRole+3:b'cellBar',Qt.UserRole+4:b'verbatim',Qt.UserRole+5:b'hierarchy',Qt.UserRole+6:b'placeholder'}
     def headerData(self,section,orientation,role=Qt.DisplayRole):
         if orientation==Qt.Horizontal and role==Qt.DisplayRole and section<len(self.headers):return self.headers[self.owner._order[section]]
     def data(self,index,role=Qt.DisplayRole):
         if not index.isValid() or not 0<=index.row()<len(self.rows) or not 0<=index.column()<len(self.owner._order):return None
         row=index.row();col=self.owner._order[index.column()]
+        if role==Qt.UserRole+6:return isinstance(self.rows,WindowRows) and bool(self.rows[row].get('_placeholder'))
         if role==Qt.UserRole+5:
             record=self.rows[row]
             return {key:record[key] for key in ('depth','guides','last','expandable','expanded') if key in record} if self.owner._state.get('hierarchy') and isinstance(record,dict) else {}

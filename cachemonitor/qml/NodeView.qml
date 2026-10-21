@@ -86,7 +86,7 @@ Item {
                 name: view.s.iconName; anchors.centerIn: parent; width: 18; height: 18; ink: appTheme.color("accent")
                 RotationAnimator on rotation {
                     from: 0; to: 360; duration: 1000; loops: Animation.Infinite
-                    running: refreshIcon.visible && !!view.s.running
+                    running: refreshIcon.visible && !!view.s.running && !appTheme.reduceMotion
                 }
             }
             HoverHandler { id: statusHover }

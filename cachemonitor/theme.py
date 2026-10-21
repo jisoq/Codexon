@@ -1,6 +1,6 @@
 """Role-based shared palette; Codex preferences are only ever read."""
 from PySide6.QtCore import QObject, Property, Signal, Slot, Qt
-from PySide6.QtGui import QGuiApplication, QFontDatabase, QColor
+from PySide6.QtGui import QGuiApplication, QFontDatabase, QColor, QAccessible
 from .token_colors import ui_palette, readable, model_palette, color_distance, oklab, lch
 from math import hypot, degrees, atan2
 from .overlay_appearance import CodexAppearance, default_appearance
@@ -15,6 +15,8 @@ class Theme(QObject):
         self.appearance=default_appearance(False)
         self._palette=ui_palette(self.appearance);self._dark=False
         self._family='Pretendard JP';self._reader=None;self._models=[];self._model_colors={};self._performance_colors={}
+        from .overlay_windows import system_reduce_motion
+        self._reduce_motion=system_reduce_motion()
 
     @Slot(str, str, result=str)
     def readableText(self, foreground, background):
@@ -27,7 +29,20 @@ class Theme(QObject):
     @Property(str, notify=changed)
     def family(self): return self._family
 
+    @Property(bool, notify=changed)
+    def reduceMotion(self):return self._reduce_motion
+
+    @Property(bool)
+    def accessibilityActive(self):return QAccessible.isActive()
+
+    def refresh_motion(self):
+        from .overlay_windows import system_reduce_motion
+        value=system_reduce_motion()
+        if value!=self._reduce_motion:
+            self._reduce_motion=value;self.changed.emit()
+
     def configure(self, mode='codex', appearance=None):
+        self.refresh_motion()
         from .overlay import system_dark
         if appearance is None:
             dark=mode=='dark' if mode not in ('codex','system') else system_dark()

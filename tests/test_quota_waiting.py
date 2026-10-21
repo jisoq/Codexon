@@ -11,6 +11,83 @@ from test_quota_query import QueryWorker,query_report
 from test_quota_value_history import sample_report
 
 
+@pytest.mark.parametrize('width',(1000,520))
+def test_first_report_collection_empty_pause_and_failure_are_distinct(tmp_path,width):
+    from cachemonitor.quick_qa import control
+    app=QApplication.instance() or QApplication([])
+    panel=QuotaPanel(QSettings(str(tmp_path/'states.ini'),QSettings.IniFormat))
+    scroll=Scroll();scroll.put(fillViewport=True);scroll.setWidget(panel)
+    host=mount(scroll,width,680)
+    retries=[];panel.retry_requested.connect(lambda:retries.append(True))
+    try:
+        loading=control(host,panel.initial_loading)
+        assert loading.isVisible() and loading.width()>0 and loading.height()>0
+        assert not panel.history_waiting.isVisible() and not panel.clear_cycle_button.isVisible()
+        panel.set_collection_phase('preparing')
+        panel.receive(dict(report=dict(cycles=[],index_loading=True),report_pending=False))
+        assert panel.initial_loading.isVisible() and panel._activity_timer.isActive()
+        panel.set_collection_phase('ready')
+        assert panel.history_waiting.isVisible() and not panel.initial_loading.isVisible()
+        assert not panel._activity_timer.isActive() and not panel.state_retry.isVisible()
+        panel.set_monitoring_paused(True)
+        assert panel.history_waiting.isVisible() and not panel.initial_loading.isVisible()
+        assert not panel.state_retry.isVisible()
+        panel.set_monitoring_paused(False)
+        panel.receive(dict(report=dict(cycles=[],error=True),report_pending=False,issue='Read failed'))
+        assert panel.state_retry.isVisible() and not panel.initial_loading.isVisible()
+        click(host,render_plot(host,panel.state_retry))
+        assert retries==[True] and not host.qml_errors
+    finally:dispose(host)
+
+
+def test_same_scope_report_refresh_and_failure_preserve_displayed_values(tmp_path):
+    app=QApplication.instance() or QApplication([])
+    panel=QuotaPanel(QSettings(str(tmp_path/'retained.ini'),QSettings.IniFormat))
+    panel.receive(dict(report=sample_report()))
+    rows=panel.history.rows
+    values={key:node.text() for key,node in panel.summary_values.items()}
+    panel.receive(dict(report_pending=True))
+    assert panel.history.rows is rows and not panel.initial_loading.isVisible()
+    assert panel.activity_note.isVisible()
+    panel.receive(dict(report_pending=False,issue='Refresh failed'))
+    assert panel.history.rows is rows and panel.activity_note.isVisible()
+    assert {key:node.text() for key,node in panel.summary_values.items()}==values
+    assert panel.state_retry.isVisible() and not panel._activity_timer.isActive()
+    panel.deleteLater();app.processEvents()
+
+
+def test_paused_report_reads_and_failures_are_distinct_from_paused_collection(tmp_path):
+    app=QApplication.instance() or QApplication([])
+    panel=QuotaPanel(QSettings(str(tmp_path/'paused-read.ini'),QSettings.IniFormat))
+    panel.set_monitoring_paused(True)
+    panel.receive(dict(report_pending=True))
+    assert panel.initial_loading.isVisible() and not panel.history_waiting.isVisible()
+    panel.receive(dict(report=dict(cycles=[],error=True),report_pending=False,issue='Read failed'))
+    assert not panel.initial_loading.isVisible() and panel.state_retry.isVisible()
+    panel.receive(dict(report=dict(cycles=[]),report_pending=False))
+    assert panel.history_waiting.isVisible() and not panel.state_retry.isVisible()
+    panel.deleteLater();app.processEvents()
+
+
+def test_hidden_report_timer_suspends_and_refresh_labels_follow_language(tmp_path):
+    from cachemonitor.i18n import set_language
+    app=QApplication.instance() or QApplication([])
+    panel=QuotaPanel(QSettings(str(tmp_path/'hidden-status.ini'),QSettings.IniFormat))
+    try:
+        panel.receive(dict(report_pending=True))
+        started=panel._loading_since[panel.initial_loading]
+        panel.set_presentation_active(False)
+        assert not panel._activity_timer.isActive()
+        panel.set_presentation_active(True)
+        assert panel._activity_timer.isActive() and panel._loading_since[panel.initial_loading]==started
+        set_language('en')
+        panel.receive(dict(report=sample_report(),report_pending=True))
+        assert panel.activity_note.isVisible()
+        assert not any('\uac00'<=char<='\ud7a3' for char in panel.activity_note.text())
+    finally:
+        set_language('ko');panel.deleteLater();app.processEvents()
+
+
 def test_hidden_conversion_does_not_schedule_queries_on_refresh(tmp_path):
     app=QApplication.instance() or QApplication([])
     panel=QuotaPanel(QSettings(str(tmp_path/'hidden.ini'),QSettings.IniFormat))

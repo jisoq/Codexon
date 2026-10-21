@@ -19,7 +19,7 @@ Item {
         width: Math.max(0, Math.min(parent.width-24, 440))
         height: implicitHeight
         node: ({state: Object.assign({}, root.status, {compact: true})})
-        Accessible.description: root.status.slow ? root.slowDetail : appLanguage.text("완료 시간은 아직 알 수 없습니다.")
+        Accessible.description: root.status.running === false ? appLanguage.text(root.status.detail || "") : root.status.slow ? root.slowDetail : appLanguage.text("완료 시간은 아직 알 수 없습니다.")
         HoverHandler { id: delayHover }
         UiToolTip { visible: delayHover.hovered && !!root.status.slow; text: root.slowDetail }
         Rectangle {

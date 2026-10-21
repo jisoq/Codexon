@@ -18,7 +18,7 @@ from .quota_share import share_label, share_color_key
 from .quota_exclusion_controls import QuotaExclusions
 from .quota_cycle_overview import CycleTable
 from .ui_details import Details
-from .i18n import formatted
+from .i18n import formatted, tr
 
 
 from .quota_view import clock, history_rows, prepare_quota_view, prepare_series, observation_label, model_cost_intervals
@@ -42,11 +42,17 @@ class QuotaPanel(Group):
     cycle_clear_requested=Signal(object)
     fault_changed=Signal(dict)
     refresh_changed=Signal(bool)
+    retry_requested=Signal()
 
     def __init__(self,settings):
         super().__init__()
         self.settings=settings
         self.report={'cycles':[]}
+        self.report_received=False
+        self.report_pending=False
+        self.collection_phase=''
+        self.presentation_active=True
+        self._query_errors={}
         self.statistics=quota_statistics(self.report)
         self.quota=None
         self.issue=''
@@ -94,13 +100,20 @@ class QuotaPanel(Group):
         scope.addWidget(self.model_choice)
         chart=Group();chart.put(background='surface',radius=6)
         chart_layout=Column(chart);chart_layout.setContentsMargins(16,16,16,14);chart_layout.setSpacing(10)
+        self.initial_loading=Group();self.initial_loading.put(kind='progress',compact=True,
+            title='사용 기록 확인 중',detail='저장된 사용 기록을 읽고 있습니다.',running=False)
+        chart_layout.addWidget(self.initial_loading)
         self.history_waiting=Group()
         waiting_layout=Column(self.history_waiting);waiting_layout.setSpacing(8)
-        waiting_title=Text('사용량 기록 수집 대기');waiting_title.put(fontSize=18,bold=True)
-        waiting_note=Text('소모량과 구독 가치 환산액을 계산할 사용 기록을 기다리고 있습니다.')
+        waiting_title=self.waiting_title=Text();waiting_title.put(fontSize=18,bold=True)
+        waiting_note=self.waiting_note=Text()
         waiting_note.put(fontSize=14,color='muted',wrap=True)
         waiting_layout.addWidget(waiting_title);waiting_layout.addWidget(waiting_note)
+        self.state_retry=Button('다시 시도');self.state_retry.clicked.connect(self.retry_failed)
         chart_layout.addWidget(self.history_waiting)
+        self.activity_note=Text();self.activity_note.put(fontSize=13,color='muted',wrap=True)
+        self.activity_note.hide();chart_layout.addWidget(self.activity_note)
+        chart_layout.addWidget(self.state_retry)
         headline=self.summary_heading=Text('전체 기록과 모델 기준 100% 환산 추정액');headline.put(fontSize=15,bold=True)
         chart_layout.addWidget(headline)
         self.result=Text();self.result.setToolTip(TIPS["quota_total"]);self.result.put(fontSize=22,bold=True,noElide=True)
@@ -235,6 +248,65 @@ class QuotaPanel(Group):
         from .quota_layout import refresh_monitoring_style
         refresh_monitoring_style(self)
         if hasattr(self,'update_summary'):self.update_summary()
+        self.refresh_state()
+
+    def set_collection_phase(self,phase):
+        if phase!=self.collection_phase:
+            self.collection_phase=phase
+            self.refresh_state()
+
+    def set_presentation_active(self,active):
+        self.presentation_active=bool(active)
+        if active:
+            if not self.report_received and not self.report_pending:self._loading_since.pop(self.initial_loading,None)
+            self.refresh_state()
+        else:self._activity_timer.stop()
+
+    def failed_queries(self):
+        chart=(id(self._query_worker),self.report.get('worker_revision'),self.cycle_choice.currentData())
+        query=self._query_key() if 'worker_revision' in self.report else None
+        return {kind for kind,key in (('chart',chart),('query',query)) if key is not None and self._query_errors.get(kind)==key}
+
+    def retry_failed(self):
+        failed=self.failed_queries()
+        if failed:
+            for kind in failed:self._query_errors.pop(kind,None)
+            if 'query' in failed:self.render()
+            else:self.render_history();self.refresh_state()
+        else:self.retry_requested.emit()
+
+    def refresh_state(self):
+        lifetime=getattr(self,'lifetime_statistics',self.statistics)
+        has_usage=bool(lifetime['total'] or self.report.get('exclusions') or self.report.get('cycle_clears'))
+        paused=self.monitoring_paused or self.collection_phase=='stopped'
+        failed=bool(self.failed_queries() or not self.report_pending and
+                    (self.report.get('error') or self.report.get('history_failed') or self.issue)
+                    or not paused and self.collection_phase in ('failed','delayed'))
+        busy=not failed and (self.report_pending or self.report.get('history_pending') and not self.report.get('history_failed') or
+              not paused and (not self.report_received or self.collection_phase=='preparing' and not has_usage))
+        title='사용 기록 확인 중'
+        detail=('과거 사용 기록을 계산하고 있습니다.' if self.report.get('history_pending') else
+                'Codex 사용 기록을 읽고 있습니다.' if self.collection_phase=='preparing' else
+                '저장된 사용 기록을 읽고 있습니다.')
+        self._set_loading(self.initial_loading,busy,detail,retained=has_usage)
+        self.history_waiting.setVisible(not has_usage and not busy)
+        if failed:
+            title='사용 기록 확인 필요';detail=self.issue or '사용 기록을 읽지 못했습니다. 수집 상태를 확인하거나 다시 시도하세요.'
+        elif paused:
+            title='기록 수집 일시중지';detail='모니터링을 재개하면 사용 기록을 계속 수집합니다.'
+        elif self.quota or self.report.get('history'):
+            title='주간 추이를 계산할 기록이 아직 부족합니다'
+            detail='사용 기록과 주간 사용량 변화가 쌓이면 자동으로 계산합니다.'
+        else:
+            title='아직 수집된 사용 기록이 없습니다'
+            detail='Codex에서 작업하면 사용 기록이 자동으로 표시됩니다.'
+        self.waiting_title.setText(title);self.waiting_note.setText(detail)
+        self.waiting_title.put(color='error' if failed else 'ink')
+        self.state_retry.setVisible(failed)
+        if has_usage and failed:
+            self.activity_note.setText('갱신 실패, 이전 결과 표시 중');self.activity_note.show()
+        elif not busy and not self._loading_since and not self._edit_jobs:
+            self.activity_note.hide()
 
     def set_homes(self,homes):
         selected=self.home_choice.currentData() or self.report.get('home')
@@ -252,6 +324,8 @@ class QuotaPanel(Group):
         if not home:return
         self.expected_home=home_key(home)
         self.quota=None;self.report={'home':home,'cycles':[]};self.selected_id=None
+        self.report_received=False;self.report_pending=False
+        self._query_errors.clear()
         self.issue='';self.page_index=0
         self._loading_since.clear()
         self.update_activity()
@@ -275,7 +349,7 @@ class QuotaPanel(Group):
         self._cycle_clear_pending=bool(job and job['operation']=='clear_cycle')
         active=bool(job or self._loading_since)
         if not hasattr(self,'cycle_loading'):return
-        self.cycle_loading.put(running=active);self.cycle_loading.setVisible(active)
+        self.cycle_loading.put(running=active);self.cycle_loading.setVisible(active and not self.initial_loading.isVisible())
         if active:
             started=job['started'] if job else min(self._loading_since.values())
             elapsed=int(time.monotonic()-started)
@@ -286,7 +360,8 @@ class QuotaPanel(Group):
             detail=f'{label} / {elapsed:,}초 경과'
             if elapsed>=30:detail+=' / 처리가 계속되고 있습니다.'
             self.cycle_loading.setToolTip(detail);self.cycle_loading.setAccessibleName(detail)
-            self._activity_timer.start()
+            if self.presentation_active:self._activity_timer.start()
+            else:self._activity_timer.stop()
         else:self._activity_timer.stop()
         if self.exclusions._pending!=bool(job):self.exclusions.set_pending(bool(job))
         if job and job['operation']!='clear_cycle':
@@ -304,6 +379,16 @@ class QuotaPanel(Group):
                 self.clear_cycle_button.setText('선택 주기 삭제' if selected and not selected['current'] else '선택 주기 초기화')
                 self.clear_cycle_button.setEnabled(bool(selected and self.report.get('account') and not job
                                                        and not self.report.get('history_pending')))
+                self.clear_cycle_button.setVisible(bool(selected))
+        failed=bool(self.failed_queries() or not self.report_pending and (self.report.get('history_failed') or self.issue))
+        self.activity_note.setVisible(active and not self.initial_loading.isVisible() or failed and not self.history_waiting.isVisible())
+        if active:
+            self.activity_note.setText(formatted('{operation} / {seconds}초 경과',operation=(
+                tr(label if job else '과거 사용 기록 계산 중' if self.report.get('history_pending') else
+                   '사용 기록 갱신 중')),seconds=elapsed))
+            self.initial_loading.put(elapsedText=formatted('{seconds}초 경과',seconds=elapsed),slow=elapsed>=30)
+        elif failed:
+            self.activity_note.setText('갱신 실패, 이전 결과 표시 중')
 
     def receive(self,value):
         self.receive_activity(value)
@@ -312,8 +397,13 @@ class QuotaPanel(Group):
             return False
         if incoming_home:self.expected_home=home_key(incoming_home)
         previous_report,previous_issue,previous_quota=self.report,self.issue,self.quota
-        self.quota=value.get('quota');self.issue=value.get('issue','')
-        if 'report' in value:self.report=value['report'] or {'cycles':[]}
+        previous_pending=self.report_pending
+        self.quota=value.get('quota',self.quota);self.issue=value.get('issue','')
+        if 'report' in value:
+            self.report=value['report'] or {'cycles':[]}
+            self.report_received=True
+        self.report_pending=bool(value.get('report_pending',False if 'report' in value else self.report_pending))
+        if self.report_pending and not previous_pending:self._loading_since[self.initial_loading]=time.monotonic()
         if value.get('exclusion_result'):
             result=value['exclusion_result']
             if result.get('operation')=='clear_cycle':
@@ -329,12 +419,13 @@ class QuotaPanel(Group):
             if value['exclusion_result'].get('ok') and getattr(self,'dialog',None) and self.dialog.host:self.dialog.reject()
         if getattr(self,'defer_render',False):
             if (self.report is not previous_report or self.issue!=previous_issue
-                    or self.quota is not previous_quota or value.get('exclusion_result')):
+                    or self.quota is not previous_quota or self.report_pending!=previous_pending or value.get('exclusion_result')):
                 self._render_dirty=True
             return True
         if (self.report is previous_report and self.issue==previous_issue
                 and not value.get('exclusion_result') and not getattr(self,'_render_dirty',False)):
             if hasattr(self,'update_summary'):self.update_summary()
+            self.refresh_state()
             return True
         self.render(automatic=True)
         return True
@@ -414,6 +505,7 @@ class QuotaPanel(Group):
                   and self._chart_value[1].get('_content_digest')==offered['digest']):
                 self._chart_value=(key,self._chart_value[1])
             if self._chart_value and self._chart_value[0]==key:
+                self._query_errors.pop('chart',None)
                 series=self._chart_value[1];self._chart_pending=None
                 if key not in self._chart_cache:
                     from .analysis_engine import retained_bytes
@@ -430,7 +522,8 @@ class QuotaPanel(Group):
             else:
                 waiting=self._chart_waiting_revision==key[:2]
                 if waiting and hasattr(self._query_worker,'select_chart'):self._query_worker.select_chart(selection)
-                if self._query_worker is not None and not waiting and self._chart_pending!=key:
+                if self._query_worker is not None and not waiting and self._chart_pending!=key and self._query_errors.get('chart')!=key:
+                    self._query_errors.pop('chart',None)
                     self._chart_pending=key
                     if hasattr(self._query_worker,'select_chart'):self._query_worker.select_chart(selection)
                     self._query_worker.request('chart',key=key,revision=self.report['worker_revision'],selection=selection)
@@ -538,11 +631,11 @@ class QuotaPanel(Group):
         if active and retained:self._refreshing.add(node)
         else:self._refreshing.discard(node)
         if before!=bool(self._refreshing):self.refresh_changed.emit(bool(self._refreshing))
-        if node in (self.cycle_loading,self.history_loading):
-            node.put(running=active)
+        if node in (self.cycle_loading,self.history_loading,self.initial_loading):
+            node.put(running=active,**({'detail':detail} if detail is not None else {}))
             if active:self._loading_since.setdefault(node,time.monotonic())
             else:self._loading_since.pop(node,None)
-            if node is self.history_loading:node.setVisible(active and not retained)
+            if node in (self.history_loading,self.initial_loading):node.setVisible(active and not retained)
             self.update_activity()
             return
         node.put(running=active,stage=2 if active else 4,**({'detail':detail} if detail is not None else {}))
@@ -555,6 +648,7 @@ class QuotaPanel(Group):
                 try:self._query_worker.result.disconnect(self._receive_query)
                 except (RuntimeError,TypeError):pass
             self._query_worker=worker;self._query_pending=None;self._query_cache={}
+            self._query_errors.clear()
             self._chart_value=None;self._chart_pending=None;self._chart_waiting_revision=None
             self._chart_cache={}
             if worker is not None:worker.result.connect(self._receive_query)
@@ -569,12 +663,14 @@ class QuotaPanel(Group):
             default=self._view.get('default_query')
             if default is not None:self._cache_query(key,default)
         if key in self._query_cache:
+            self._query_errors.pop('query',None)
             self._query_pending=None
             self._prepared_query=(key,self._query_cache[key])
             if getattr(self,'_query_failed',False):
                 self._query_failed=False;self.fault_changed.emit(dict(query_healthy=True))
             return self._prepared_query[1]
-        if worker is not None and self._query_pending!=key:
+        if worker is not None and self._query_pending!=key and self._query_errors.get('query')!=key:
+            self._query_errors.pop('query',None)
             self._query_pending=key
             worker.request('query',key=key,revision=self.report['worker_revision'],query=query)
         return None
@@ -596,29 +692,34 @@ class QuotaPanel(Group):
                 else:self.render_history()
                 return
             if message.get('error'):
+                self._query_errors['chart']=key
                 self._set_loading(self.history_loading,False)
                 self.history_empty.setText('차트를 계산하지 못했습니다.')
                 self.history_empty.setVisible(not self.history.isVisible())
-                self.fault_changed.emit(dict(calculation_failed=True));return
+                self.fault_changed.emit(dict(calculation_failed=True));self.refresh_state();return
             value=message['value']
             if value['selection']!=key[2] or value.get('series') is None:
                 self._set_loading(self.history_loading,False)
                 return
             self.fault_changed.emit(dict(query_healthy=True))
+            self._query_errors.pop('chart',None)
             self._chart_value=(key,value['series'])
             if getattr(self,'defer_render',False):self._render_dirty=True
-            else:self.render_history()
+            else:self.render_history();self.refresh_state()
             return
         if message.get('kind')!='query' or key!=self._query_pending:return
         self._query_pending=None
         if key!=self._query_key():return
         self._set_loading(self.query_loading,False)
         if message.get('error'):
+            self._query_errors['query']=key
             self._query_failed=True
             self.fault_changed.emit(dict(calculation_failed=True))
             if not getattr(self,'centralized_errors',False):
                 self.status.setText(message.get('issue') or message['error']);self.status.show()
+            self.refresh_state()
             return
+        self._query_errors.pop('query',None)
         self._query_failed=False;self.fault_changed.emit(dict(query_healthy=True))
         self._cache_query(key,message['value'])
         if getattr(self,'defer_render',False):self._render_dirty=True
@@ -634,7 +735,6 @@ class QuotaPanel(Group):
         self.lifetime_statistics=(self.report.get('view') or {}).get('lifetime') or quota_statistics(self.report)
         lifetime=self.lifetime_statistics
         has_usage=bool(lifetime['total'] or self.report.get('exclusions') or self.report.get('cycle_clears'))
-        self.history_waiting.setVisible(not has_usage and not self.report.get('history_pending'))
         for node in (self.summary_heading,self.result,self.lifetime_basis,self.conversion):node.setVisible(has_usage)
         selected_model=self.model_choice.currentData()
         available=self.report['view'].get('available_models')
@@ -661,10 +761,11 @@ class QuotaPanel(Group):
             node=getattr(self,name,None)
             if node is not None:node.setEnabled(not pending)
         self.update_activity()
+        self.refresh_state()
         if pending:
             if self.report.get('history_failed'):
                 self.status.setText('전체 이력을 읽지 못했습니다. 현재 주기는 계속 확인할 수 있습니다.')
-                self.status.put(color='error');self.status.show()
+                self.status.put(color='error');self.status.setVisible(not getattr(self,'centralized_errors',False))
             self.conversion.hide()
             if hasattr(self,'clear_cycle_button'):self.clear_cycle_button.setEnabled(False)
             return

@@ -76,6 +76,36 @@ def test_expired_chart_renews_paused_report_once_without_resuming_monitoring(tmp
         assert db.execute('SELECT count(*) FROM observations').fetchone()[0]==0
 
 
+def test_repeated_report_failures_publish_completion_without_waiting_for_periodic_refresh(tmp_path,monkeypatch):
+    clock=[1000.];updates=[];failures=[];manual=[]
+    monkeypatch.setattr(module,'time',SimpleNamespace(time=lambda:clock[0],monotonic=lambda:clock[0]))
+    service=module.QuotaService(tmp_path/'home',tmp_path/'index.sqlite',live=False,paused=True)
+    service.updated.connect(lambda value:updates.append((clock[0],value)))
+    execute=service.report_worker.engine.execute
+    attempts=[]
+    def compute(request):
+        attempts.append(request['id'])
+        if len(attempts)>1:
+            failures.append(clock[0])
+            return dict(kind='report',id=request['id'],error='temporary read failure')
+        return execute(request)
+    monkeypatch.setattr(service.report_worker.engine,'execute',compute)
+    class Wake:
+        def clear(self):pass
+        def set(self):pass
+        def wait(self,seconds):
+            completed=[value for _,value in updates if value.get('report') and not value.get('report_pending')]
+            if completed and len(manual)<2 and len(failures)==len(manual):
+                manual.append(clock[0]);service.retry_report()
+            clock[0]+=seconds
+    service.wake=Wake();service.isInterruptionRequested=lambda:clock[0]>=1010
+    service.run()
+    assert len(failures)==2
+    for at in failures:
+        assert any(stamp==at+1 and value.get('report_pending') is False
+                   and value['quota_faults']['calculation'].get('calculation_failed') for stamp,value in updates)
+
+
 @pytest.mark.parametrize('failed_method',['account/read','account/rateLimits/read'])
 def test_rpc_timeout_records_safe_stage_and_next_fetch_reconnects(tmp_path,monkeypatch,failed_method):
     import io

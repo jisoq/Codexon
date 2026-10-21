@@ -280,7 +280,8 @@ def retry_proxy(manager,journal,*,verified_operation_id=None):
             raise RuntimeError('앱 설치가 완료되지 않았습니다. 업데이트를 다시 확인하세요.')
         if getattr(sys,'frozen',False) and record.get('app',{}).get('state')=='verified' and Path(record['app']['executable']).resolve()!=Path(sys.executable).resolve():
             raise RuntimeError('시작 메뉴에서 새 Codexon을 열어 업데이트를 계속하세요.')
-        if not journal.change(operation_id,phase='waiting',cancel_requested=False,defer_requested=False):
+        if not journal.change(operation_id,phase='waiting',cancel_requested=False,defer_requested=False,
+                              proxy={**record.get('proxy',{}),'cutover_started':False}):
             raise RuntimeError('업데이트 상태가 바뀌었습니다. 다시 확인하세요.')
         try:
             result=activate_proxy(manager,operation_id=operation_id,update_root=journal.root)

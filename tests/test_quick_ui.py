@@ -98,8 +98,10 @@ def test_reasoning_tokens_render_independently_of_cost_and_request_unit(tmp_path
         wait_for_rendered(lambda:len(window.metric_panel.data['rows'])==2)
         groups={g['filters']['effort']:g for g in window.metric_panel.data['rows']}
         assert groups['low']['value']==0 and groups['low']['known']==1 and groups['low']['partial']
-        assert groups['high']['value']==12000 and groups['high']['known']==2
-        assert window.metric_panel.data['summary']['value']==12000
+        assert groups['high']['value']==6000 and groups['high']['known']==2
+        summary=window.metric_panel.data['summary']
+        assert summary['value']==4000
+        assert summary['known']==3 and summary['total']==4 and summary['partial']
         assert not window.qml_errors
     finally:
         if host:dispose(host)

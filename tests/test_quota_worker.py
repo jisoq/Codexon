@@ -329,6 +329,7 @@ def test_slow_accounting_does_not_delay_observation_storage(tmp_path,monkeypatch
         service.supply_local(observation(1))
         QTimer.singleShot(0,lambda:ticks.append(True))
         wait_until(lambda:stored()==2 and bool(ticks),app=app)
+        wait_until(lambda:any(value.get('report_pending') for value in received),app=app)
         assert not any(value.get('report',{}).get('worker_revision') for value in received)
         release.set()
         wait_until(lambda:any(value.get('report',{}).get('worker_revision') for value in received),app=app)

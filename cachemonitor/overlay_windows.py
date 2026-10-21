@@ -10,6 +10,13 @@ from PySide6.QtCore import QFileSystemWatcher, QThread, Signal, QTimer
 from .overlay_tracking import RouteLog
 
 
+def system_reduce_motion():
+    if os.name!='nt':return False
+    enabled=W.BOOL(True)
+    ctypes.windll.user32.SystemParametersInfoW(0x1042,0,ctypes.byref(enabled),0)
+    return not enabled.value
+
+
 def observe_selection(targets, log, now):
     """A single live process and its route evidence establish compatibility."""
     result = {'target': None, 'selection': None, 'issue': ''}
@@ -145,9 +152,7 @@ class WindowsOverlay:
         return bool(self.u.GetAsyncKeyState(1) & 0x8000)
 
     def reduce_motion(self):
-        enabled = W.BOOL(True)
-        self.u.SystemParametersInfoW(0x1042, 0, ctypes.byref(enabled), 0)
-        return not enabled.value
+        return system_reduce_motion()
 
     def configure(self, hwnd, click_through=True):
         flags = self.u.GetWindowLongPtrW(hwnd, -20)

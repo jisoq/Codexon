@@ -258,7 +258,7 @@ def test_chart_hover_inspects_values_without_click_selection_or_agent_changes(la
     assert not controller.links.qml_errors
 
 
-def test_sub_disclosure_changes_only_its_own_details(layout_controller):
+def test_sub_disclosure_grows_viewport_without_changing_main_usage(layout_controller):
     from cachemonitor.overlay_chrome import named_item
     from cachemonitor.quick_qa import click
     from tests.test_ui import wait_for_rendered
@@ -272,11 +272,14 @@ def test_sub_disclosure_changes_only_its_own_details(layout_controller):
     action = named_item(root, 'detailAction-group-' + group['key'])
     click(controller.detail, action)
     wait_for_rendered(lambda: group['key'] in model.expanded_groups)
-    assert model.layout() == layout and model.selected_id == selected
+    opened = model.layout()
+    assert opened['height'] > layout['height'] and opened['sub_y'] == layout['sub_y']
+    assert model.expanded_groups == {group['key']} and model.selected_id == selected
     assert not model.main_expanded and model.data['main_usage'] == own
     action = named_item(root, 'detailAction-group-' + group['key'])
     click(controller.detail, action)
     wait_for_rendered(lambda: group['key'] not in model.expanded_groups)
+    assert model.layout() == layout
 
 
 def test_tooltip_translations_and_theme_contrast():

@@ -44,6 +44,7 @@ class UpdatePanel(Group):
         self.pending_plan=None;self.auto_start=False;self._continue_app=None
         self._continue_pending=None;self._continued_operations=set();self._deferred_metadata=[]
         self.next_recovery_check=0;self._stopped=False;self._exit_pending=False;self._journal_signature=None
+        self._initializing=True;self._offer_operation_id=None
         from .installation import installed
         from .update_state import state_for
         import sys
@@ -78,6 +79,8 @@ class UpdatePanel(Group):
         from .theme import shared_theme
         shared_theme().changed.connect(self.render_record)
         self.refresh()
+        self._initializing=False
+        QTimer.singleShot(0,self.refresh)
 
     def status_color(self,attention=False):
         if not attention:return 'muted'
@@ -97,8 +100,15 @@ class UpdatePanel(Group):
     def busy(self):
         from .update_state import ACTIVE
         from .proxy_update import BUSY
+        proxy_busy=self.proxy_update.get('phase') in BUSY
+        linked=self.proxy_update.get('operation_id')
+        if self.record and linked:
+            stamp=self.proxy_update.get('updated_at');created=self.record.get('created_at')
+            if (linked==self.record.get('operation_id') or
+                    isinstance(stamp,(int,float)) and isinstance(created,(int,float)) and stamp<created):
+                proxy_busy=False
         return bool(self.operation or self.metadata_pending or self.record.get('phase') in ACTIVE
-                    or self.proxy_update.get('phase') in BUSY)
+                    or proxy_busy)
 
     def recheck_connections(self):
         if not self.operation and self.manager:
@@ -125,7 +135,9 @@ class UpdatePanel(Group):
         if value:self.refresh()
 
     def start(self):
+        self.reload_record(force=True)
         if self.busy() or self.closing():return
+        self._check_operation_id=self.record.get('operation_id')
         self.offer=None;self.discovered_offer=None;self.checking=True;self.operation_error=False
         self.status.setText('업데이트 확인 중…');self.heading.setText('업데이트')
         self.status.show()
@@ -157,10 +169,10 @@ class UpdatePanel(Group):
 
     def metadata_received(self,result):
         if not self.metadata_pending:return
-        if self.closing():
+        if self.closing() or self.operation:
             self._deferred_metadata=[result]
             return
-        self.metadata_pending=False
+        self.metadata_pending=False;self.checking=True
         if isinstance(result,Exception):self.receive_result(result);self.finished();return
         from .app_update import check_update
         self.launch_operation(lambda:check_update(self.status_progress,self.manager,release=result))
@@ -172,19 +184,26 @@ class UpdatePanel(Group):
     def receive_result(self,result):
         if self._stopped:return
         if isinstance(result,Exception):
+            self.reload_record(force=True)
             self.auto_start=False;self.operation_error=True;self.offer=None
             self.status.setText(failure_message(result,self.checking));self.status.setToolTip(str(result));self.status.put(color=self.status_color(True))
             self.execute.hide();self.version.hide();self.components.hide();self.button.show()
             self.fault_changed.emit(dict(checking_failed=bool(self.checking),
-                phase=None if self.checking else 'failed',operation_error=True))
+                phase=None if self.checking else 'failed',operation_error=not self.checking,
+                app=dict(self.record.get('app',{}))))
+            self._reported_fault=None
         elif isinstance(result,dict) and result.get('kind')=='continue_app':
             self._continue_app=result
         elif isinstance(result,dict) and 'operation_id' in result:
             self.record=result;self.offer=None
         elif isinstance(result,dict) and ('configured' in result or 'health' in result):self.proxy_status(result)
         elif isinstance(result,dict):
-            self.pending_plan=result
+            self.reload_record(force=True)
             if self.checking and self.monitor is None:self.fault_changed.emit(dict(check_healthy=True))
+            if (self.checking and hasattr(self,'_check_operation_id')
+                    and self._check_operation_id!=self.record.get('operation_id')):
+                self.auto_start=False;self.offer=None;return
+            self.pending_plan=result
         else:self.status.setText(str(result))
 
     def finished(self):
@@ -204,6 +223,7 @@ class UpdatePanel(Group):
             self.continue_app_requested.emit(dict(executable=continuation['executable'],
                                                  verified_operation_id=continuation['verified_operation_id']))
         self._start_continuation()
+        if self._deferred_metadata and not self.closing():self.refresh()
 
     def continue_update(self,operation_id):
         from .update_state import valid_id
@@ -229,10 +249,16 @@ class UpdatePanel(Group):
         return self.operation is not None
 
     def show_plan(self,plan,**_):
+        from .update_state import ACTIVE
+        self.reload_record(force=True)
+        if self.record.get('phase') in ACTIVE:
+            self.offer=None;return
+        self._offer_operation_id=self.record.get('operation_id')
         self.offer=plan;self.operation_error=False;self.status.put(color='muted');self.render_offer()
 
     def render_offer(self):
         plan=self.offer or {};available=plan.get('kind') in ('app','proxy')
+        self.status.setToolTip('')
         self.heading.setText('새 버전' if plan.get('kind')=='app' else '업데이트')
         self.button.setVisible(not available);self.execute.setVisible(available);self.execute.setText('업데이트 시작')
         self.version.setVisible(plan.get('kind')=='app')
@@ -254,12 +280,15 @@ class UpdatePanel(Group):
                 and Path(app['executable']).resolve()!=Path(sys.executable).resolve())
 
     def request_install(self):
+        self.reload_record(force=True)
+        if self.offer and self._offer_operation_id!=self.record.get('operation_id'):
+            self.offer=None;self.render_record();return
         if self.busy() or self.closing():return
-        if self.needs_new_app():
+        if not self.offer and self.needs_new_app():
             from .app_update import continuation_target
             self.checking=False;self.operation_error=False
             self.launch_operation(lambda:continuation_target(self.journal,self.manager));return
-        if self.record.get('phase') in ('partial','failed','deferred','interrupted') and self.record.get('app',{}).get('state') in ('verified','current'):
+        if not self.offer and self.record.get('phase') in ('partial','failed','deferred','interrupted') and self.record.get('app',{}).get('state') in ('verified','current'):
             from .app_update import retry_proxy
             self.checking=False;self.operation_error=False
             self.launch_operation(lambda:retry_proxy(self.manager,self.journal));return
@@ -267,6 +296,7 @@ class UpdatePanel(Group):
         if self.offer is self.discovered_offer:
             from .app_update import check_update
             release=self.offer['release'];self.auto_start=True;self.checking=True
+            self._check_operation_id=self.record.get('operation_id')
             self.launch_operation(lambda:check_update(self.status_progress,self.manager,release=release));return
         from .app_update import update
         plan=self.offer;self.checking=False;self.operation_error=False
@@ -311,7 +341,7 @@ class UpdatePanel(Group):
 
     def refresh(self,*_):
         if self._stopped:return
-        if self._deferred_metadata and not self.closing():
+        if self._deferred_metadata and not self.closing() and not self.operation:
             result=self._deferred_metadata.pop()
             self.metadata_received(result)
         self.reload_record();self.render_record()
@@ -322,7 +352,7 @@ class UpdatePanel(Group):
         legacy_wait=phase in ('waiting','needs_exit') and proxy.get('source_instance') and not proxy.get('operation_id')
         self.recovery_timer.stop()
         from .update_state import ACTIVE
-        if not self.journal or self.operation or not (phase in ACTIVE or legacy_wait):return
+        if not self.journal or self.operation or self.metadata_pending or not (phase in ACTIVE or legacy_wait):return
         remaining=self.next_recovery_check-time.monotonic()
         if remaining>0:
             self.recovery_timer.start(max(1,int(remaining*1000)+1));return
@@ -345,22 +375,31 @@ class UpdatePanel(Group):
             proxy=self.proxy_update;phase=proxy.get('phase')
             if phase=='waiting' and proxy.get('required_action')=='close_client':phase='needs_exit'
         active=phase in ACTIVE
+        if active or self.offer and self._offer_operation_id!=record.get('operation_id'):
+            self.offer=None
+        if active:self.operation_error=False
         critical=phase in CRITICAL or (active and proxy.get('cutover_started'))
         attention=phase in ('needs_exit','partial','failed','interrupted','deferred')
         fault=dict(phase=phase,proxy=dict(phase=proxy.get('phase')),app=dict(state=record.get('app',{}).get('state')),
             cancel_requested=record.get('cancel_requested',False),
-            status_healthy=phase in ('complete','cancelled'))
-        if fault!=getattr(self,'_reported_fault',None):
+            status_current=bool(record),status_healthy=phase in ('complete','cancelled'),
+            operation_id=record.get('operation_id'))
+        if not self._initializing and fault!=getattr(self,'_reported_fault',None):
             self._reported_fault=fault;self.fault_changed.emit(fault)
         self.attention_changed.emit(attention)
         if self.metadata_pending or (self.operation and self.checking):return
+        if self.operation_error and self.checking and not active:return
         self.recheck.setVisible(phase=='needs_exit')
         self.cancel.setVisible(phase in ('preparing','downloading') and not critical)
         self.later.setVisible(phase in ('waiting','needs_exit') and not critical)
         for control in (self.cancel,self.later):control.setEnabled(not record.get('cancel_requested'))
-        if not phase or (phase in ('complete','cancelled') and self.offer):return
+        retryable=phase in ('failed','interrupted') and record.get('app',{}).get('state') not in ('verified','current')
+        if self.offer and not active:
+            self.render_offer()
+            return
+        if not phase:return
         if self.operation_error and not active and record.get('app',{}).get('state') not in ('verified','current'):return
-        self.button.setVisible(not active and not attention)
+        self.button.setVisible(not active and (not attention or retryable))
         self.button.setEnabled(not self.operation and not self.metadata_pending)
         self.execute.setVisible(attention and not active and record.get('app',{}).get('state') in ('verified','current'))
         self.execute.setText('새 앱으로 계속' if self.needs_new_app() else '다시 적용');self.execute.setEnabled(not self.operation)

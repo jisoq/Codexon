@@ -7,6 +7,7 @@ from PySide6.QtGui import QImage, QPainter
 from PySide6.QtWidgets import QApplication
 
 from cachemonitor.overlay_data import cost_composition, main_usage
+from cachemonitor.overlay_icons import AgentMark, agent_mark
 from cachemonitor.overlay_monitor import CHARTS, graph_value, scope
 from cachemonitor.overlay_view import Drawing, OverlayContent, money, percent
 from cachemonitor.pricing import token_cost
@@ -160,21 +161,21 @@ def test_agent_colors_survive_rolling_calls_and_meet_theme_contrast(app):
     for dark in (True, False):
         model.set_content(dict(home='h', id='parent'), appearance=default_appearance(dark))
         before = model.graph_colors(rows)
-        assert len({before[('h', row['sid'])] for row in rows}) == len(rows)
         after = model.graph_colors(rows[1:] + [dict(home='h', sid='child-3')])
-        assert all(after[key] == value for key, value in before.items())
+        assert all(after[key] == before[key] for key in after.keys() & before.keys())
+        assert model.graph_colors(rows) == before
         background = ui_palette(model.appearance)['overlay']
         assert all(contrast_ratio(color, background) >= 3 for color in after.values())
 
 
-def test_agent_name_markers_share_chart_colors_after_sorting_and_rolling(app):
+def test_agent_name_icons_share_chart_colors_after_sorting_and_rolling(app):
     model = OverlayContent()
     data = subagent_summary()
     model.set_content(data)
     colors = model.graph_colors(model.rows())
     def name_colors():
-        return {item[0]: item[8]['dot'] for item in model.detail_items()
-                if item[8].get('kind') == 'single-line' and item[8].get('dot')}
+        return {item[0]: item[8]['agentMark'].color for item in model.detail_items()
+                if item[8].get('agentMark')}
     names = name_colors()
     assert names == {row['title']: colors[(row['home'], row['id'])]
                      for row in data['subagent_finance']['agents']}
@@ -185,6 +186,80 @@ def test_agent_name_markers_share_chart_colors_after_sorting_and_rolling(app):
     model.set_content(changed)
     assert name_colors() == names
     assert all(model.graph_colors(model.rows())[key] == value for key, value in colors.items())
+
+
+@pytest.mark.parametrize('task_id,index', [
+    ('ab', 25), ('ba', 27), ('\U0001f331', 17),
+    ('019f0000-1234-7000-8000-000000000000', 20),
+    ('019f0000-1234-7000-8000-000000000077', 20)])
+def test_codex_icons_follow_reference_task_ids_and_utf16(app, task_id, index):
+    from cachemonitor.overlay_appearance import default_appearance
+    assert agent_mark(task_id, default_appearance(True)).index == index
+
+
+def test_all_codex_icon_variants_paint_from_packaged_assets(app):
+    from dataclasses import replace
+    from PySide6.QtCore import QRectF
+    from cachemonitor.overlay_appearance import default_appearance
+    appearance = default_appearance(True)
+    ids = {}
+    for number in range(1000):
+        task_id = f'icon-catalog-{number}'
+        ids.setdefault(agent_mark(task_id, appearance).index, task_id)
+        if len(ids) == 28:
+            break
+    assert len(ids) == 28
+    for task_id in ids.values():
+        for dark in (True, False):
+            image = QImage(24, 24, QImage.Format_ARGB32_Premultiplied)
+            image.fill(0)
+            painter = QPainter(image)
+            try:
+                agent_mark(task_id, replace(appearance, dark=dark)).paint(painter, QRectF(image.rect()))
+            finally:
+                painter.end()
+            assert any(image.pixelColor(x, y).alpha() for x in range(image.width()) for y in range(image.height()))
+
+
+def test_rendered_main_and_child_icons_use_task_ids_and_fit_the_name_gutter(app, monkeypatch):
+    data = subagent_summary()
+    model = OverlayContent()
+    model.set_content(data)
+    painted = []
+    original = AgentMark.paint
+    def record(mark, painter, bounds):
+        painted.append((mark.index, bounds))
+        original(mark, painter, bounds)
+    monkeypatch.setattr(AgentMark, 'paint', record)
+    render(model)
+    assert painted and painted[0][0] == agent_mark(data['id'], model.appearance).index
+    from PySide6.QtCore import QRectF
+    from cachemonitor.overlay_view import paint_items
+    image = QImage(model.detail_width, model.panel_height(), QImage.Format_ARGB32_Premultiplied)
+    image.fill(0)
+    painter = QPainter(image)
+    try:
+        paint_items(Drawing(painter, model), model.detail_items())
+    finally:
+        painter.end()
+    expected = [agent_mark(group['id'], model.appearance).index for group in model.detail_groups()]
+    assert [index for index, bounds in painted[1:]] == expected
+    name_items = [item for item in model.detail_items() if item[8].get('agentMark')]
+    for (_, bounds), item in zip(painted[1:], name_items):
+        assert bounds.width() > 0 and bounds.height() > 0
+        assert bounds.left() >= 0 and bounds.right() <= item[1]
+        assert QRectF(0, item[2], item[1], item[4]).contains(bounds)
+
+
+def test_icon_collisions_keep_the_same_chart_and_highlight_color(app):
+    model = OverlayContent()
+    first = '019f0000-1234-7000-8000-000000000000'
+    second = '019f0000-1234-7000-8000-000000000077'
+    model.set_content(dict(home='h', id=first))
+    colors = model.graph_colors([dict(home='other-home', sid=second)])
+    assert colors[('h', first)] == colors[('other-home', second)]
+    model.set_content(dict(home='other-home', id=second))
+    assert model.graph_colors([])[('other-home', second)] == colors[('h', first)]
 
 
 def test_waiting_cards_and_retained_values_are_distinct(app, monkeypatch):
