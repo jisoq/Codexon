@@ -72,7 +72,6 @@ $report = @{
     tasks = @($tasks | ForEach-Object { @{ name=$_.Name; running=$_.GetInstances(0).Count } })
     processes = @($processes | ForEach-Object { @{ pid=$_.Id; started=$_.StartTime.ToUniversalTime().ToString('o'); name=$_.ProcessName } })
 }
-$report | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $Evidence 'external-processes.json') -Encoding utf8
 try {
     foreach ($task in $tasks) { $task.Stop(0); $folder.DeleteTask($task.Name, 0) }
     foreach ($process in $processes) {

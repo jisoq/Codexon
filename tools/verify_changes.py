@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import ast
 import fnmatch
 import hashlib
@@ -14,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -24,6 +26,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 REPORTS = ROOT / 'artifacts' / 'verification'
 BASELINE = REPORTS / 'last-success.json'
+
+from tools.check_diagnostics import (DIAGNOSTIC_EXIT, CheckOutput, DiagnosticFailure, diagnostic_io,
+                                     read_json, reset, retain, status, write_json)
 
 def test_files(*names):
     return tuple(f'tests/test_{name}.py' for name in names)
@@ -339,6 +344,7 @@ RULES = (
     ('tools/check_processes.py', ('ui_runner',)),
     ('tools/check_worker.py', ('ui_runner',)),
     ('tools/check_progress.py', ('ui_runner',)),
+    ('tools/check_diagnostics.py', ('selector', 'ui_runner')),
     ('tools/clear_check_scopes.ps1', ('ui_runner', 'install')),
     ('tools/check_environment.py', ('selector',)),
     ('tools/demo_speed_overlay.py', ('speed',)),
@@ -587,25 +593,31 @@ def package_check(executable, report_dir):
     runtime = report_dir / 'runtime.json'
     check = subprocess.run([str(executable), '--verify-runtime', str(runtime)],
                            capture_output=True, text=True, timeout=60)
-    value = json.loads(runtime.read_text(encoding='utf-8')) if runtime.exists() else {}
-    from cachemonitor.version import VERSION, PROXY_VERSION
-    if (check.returncode or value.get('errors') != [] or value.get('version') != VERSION
-            or value.get('proxy_version') != PROXY_VERSION
-            or value.get('native', {}).get('abi_version') != 1):
-        raise RuntimeError('배포 실행 파일 런타임 확인 실패: '+check.stderr[-1000:])
-    with tempfile.TemporaryDirectory(prefix='cachemonitor-package-qa-') as temp:
-        folder = Path(temp);home = fixture_home(folder)
-        image = report_dir / 'smoke.png'
-        check = subprocess.run([str(executable), '--codex-home', str(home),
-                                '--index-path', str(folder/'usage-index.sqlite'),
-                                '--smoke', str(image), '--smoke-depth', 'core'],
-                               capture_output=True, text=True, timeout=180)
-        report = json.loads(image.with_suffix('.json').read_text(encoding='utf-8')) if image.with_suffix('.json').exists() else {}
-        rollup = report.get('session_rollup') or {}
-        if check.returncode or report.get('errors') != [] or rollup.get('descendants',0) < 1:
-            raise RuntimeError('격리 패키지 화면 검사 실패: '+str(report.get('errors') or check.stderr[-1000:]))
-    return dict(runtime=runtime.name, smoke=image.with_suffix('.json').name,
-                duration_seconds=report.get('duration_seconds'), session_rollup=rollup)
+    try:
+        with diagnostic_io('read package runtime evidence', runtime):
+            value = json.loads(runtime.read_text(encoding='utf-8')) if runtime.exists() else {}
+        from cachemonitor.version import VERSION, PROXY_VERSION
+        if (check.returncode or value.get('errors') != [] or value.get('version') != VERSION
+                or value.get('proxy_version') != PROXY_VERSION
+                or value.get('native', {}).get('abi_version') != 1):
+            raise RuntimeError('배포 실행 파일 런타임 확인 실패: '+check.stderr[-1000:])
+        with tempfile.TemporaryDirectory(prefix='cachemonitor-package-qa-') as temp:
+            folder = Path(temp);home = fixture_home(folder)
+            image = report_dir / 'smoke.png'
+            check = subprocess.run([str(executable), '--codex-home', str(home),
+                                    '--index-path', str(folder/'usage-index.sqlite'),
+                                    '--smoke', str(image), '--smoke-depth', 'core'],
+                                   capture_output=True, text=True, timeout=180)
+            with diagnostic_io('read package smoke evidence', image.with_suffix('.json')):
+                report = json.loads(image.with_suffix('.json').read_text(encoding='utf-8')) if image.with_suffix('.json').exists() else {}
+            rollup = report.get('session_rollup') or {}
+            if check.returncode or report.get('errors') != [] or rollup.get('descendants',0) < 1:
+                raise RuntimeError('격리 패키지 화면 검사 실패: '+str(report.get('errors') or check.stderr[-1000:]))
+        return dict(runtime=runtime.name, smoke=image.with_suffix('.json').name,
+                    duration_seconds=report.get('duration_seconds'), session_rollup=rollup)
+    except DiagnosticFailure as error:
+        error.product_exit_code = check.returncode or None
+        raise
 
 
 # Audited modules have no Qt imports, including function-local imports and fixtures.
@@ -648,7 +660,7 @@ def pytest_commands(tests, *, integration=False, extended=False, report_dir=None
         # Scoped work runs the affected integrations, not only the fast sweep.
         pytest += ['-m', 'not extended']
     if report_dir is not None:
-        pytest += ['-o', 'cache_dir=' + str(REPORTS / 'pytest-cache')]
+        pytest += ['-o', 'cache_dir=' + str(report_dir / 'pytest-cache')]
     runner = [sys.executable, str(ROOT / 'tools/run_ui_checks.py')]
     if selection == ('tests',):
         tests = sorted({path.relative_to(ROOT).as_posix() for pattern in ('test_*.py', '*_test.py')
@@ -672,28 +684,156 @@ def pytest_commands(tests, *, integration=False, extended=False, report_dir=None
     return commands
 
 
+def validate_diagnostics_path(path):
+    try:
+        relative = path.resolve().relative_to(ROOT)
+    except ValueError:
+        return
+    ignored = subprocess.run(['git', 'check-ignore', '--quiet', '--no-index',
+                              (relative / '.diagnostic-output').as_posix()], cwd=ROOT)
+    tracked = git_bytes('ls-files', '-z', '--cached', '--', relative.as_posix())
+    if ignored.returncode or tracked:
+        raise ValueError('Diagnostic output must be outside the checkout or in an untracked Git-ignored directory')
+
+
 def run_logged(command, path):
-    # Persist each test as it runs, including stack dumps on a stalled test.
-    # A detached descendant retaining stdout must not hold a capture pipe open.
-    with path.open('w', encoding='utf-8') as output, path.open('r', encoding='utf-8', errors='replace') as reader:
-        process = subprocess.Popen(command, cwd=ROOT, stdout=output, stderr=subprocess.STDOUT,
-                                   env=dict(os.environ, CODEXON_CHECK_LOG=str(path.resolve())))
-        while process.poll() is None:
-            chunk = reader.read(65536)
-            if chunk:
-                print(chunk, end='', flush=True)
-            else:
-                time.sleep(.1)
-        print(reader.read(), end='', flush=True)
-        result = subprocess.CompletedProcess(command, process.returncode)
-    with path.open('rb') as stream:
-        stream.seek(max(0, path.stat().st_size - 1024 * 1024))
-        result.stdout=stream.read().decode('utf-8',errors='replace')
+    observed = CheckOutput()
+    tail = ''
+    with diagnostic_io('create subprocess capture', Path(tempfile.gettempdir())):
+        validate_diagnostics_path(Path(tempfile.gettempdir()) / 'codexon-capture')
+        temporary = tempfile.TemporaryDirectory(prefix='codexon-check-output-')
+    capture_failed = False
+    try:
+        capture = Path(temporary.name) / 'stdout.log'
+        with diagnostic_io('open subprocess capture', capture):
+            output = capture.open('wb', buffering=0)
+            reader = capture.open('r', encoding='utf-8', errors='replace')
+        with output, reader:
+            try:
+                with diagnostic_io('open check log', path):
+                    mirror = path.open('w', encoding='utf-8')
+            except DiagnosticFailure:
+                result = subprocess.CompletedProcess(command, DIAGNOSTIC_EXIT, stdout='')
+                result.product_exit_code, result.diagnostics = None, status()
+                return result
+            try:
+                process = subprocess.Popen(command, cwd=ROOT, stdout=output, stderr=subprocess.STDOUT,
+                    env=dict(os.environ, CODEXON_CHECK_LOG=str(capture)))
+                while True:
+                    completed = process.poll() is not None
+                    try:
+                        with diagnostic_io('read subprocess capture', capture):
+                            chunk = reader.read(65536)
+                    except DiagnosticFailure:
+                        capture_failed = True
+                        process.wait()
+                        break
+                    if chunk:
+                        tail = (tail + chunk)[-1024 * 1024:]
+                        observed.feed(chunk)
+                        retain(observed.first_error)
+                        print(chunk, end='', flush=True)
+                        if mirror:
+                            try:
+                                with diagnostic_io('write check log', path):
+                                    mirror.write(chunk)
+                                    mirror.flush()
+                            except DiagnosticFailure:
+                                try:
+                                    with diagnostic_io('close check log', path):
+                                        mirror.close()
+                                except DiagnosticFailure:
+                                    pass
+                                mirror = None
+                    elif completed:
+                        break
+                    else:
+                        time.sleep(.1)
+            finally:
+                if mirror:
+                    try:
+                        with diagnostic_io('close check log', path):
+                            mirror.close()
+                    except DiagnosticFailure:
+                        pass
+    finally:
+        try:
+            with diagnostic_io('remove subprocess capture', Path(temporary.name)):
+                temporary.cleanup()
+        except DiagnosticFailure:
+            pass
+    observed.feed('', final=True)
+    retain(observed.first_error)
+    product = observed.product_exit_code if observed.has_outcome else None if capture_failed else process.returncode
+    code = process.returncode or (DIAGNOSTIC_EXIT if status()['first_error'] else 0)
+    if code == DIAGNOSTIC_EXIT and product:
+        code = product
+    result = subprocess.CompletedProcess(command, code, stdout=tail)
+    result.product_exit_code, result.diagnostics = product, status()
     return result
+
+
+def baseline_input():
+    with diagnostic_io('read verification baseline', BASELINE):
+        raw = BASELINE.read_bytes() if BASELINE.exists() else None
+        value = json.loads(raw.decode('utf-8')) if raw is not None else None
+        if value is not None and (not isinstance(value, dict) or not isinstance(value.get('files', {}), dict)):
+            raise ValueError('Verification baseline must contain a file hash mapping')
+    return dict(path=str(BASELINE.resolve()), content=base64.b64encode(raw).decode() if raw is not None else None,
+                sha256=hashlib.sha256(raw).hexdigest() if raw is not None else None, value=value)
+
+
+def save_rerun(selection):
+    with diagnostic_io('write rerun manifest', Path(tempfile.gettempdir())):
+        validate_diagnostics_path(Path(tempfile.gettempdir()) / 'codexon-rerun.json')
+        with tempfile.NamedTemporaryFile(prefix='codexon-rerun-', suffix='.json', delete=False, mode='w', encoding='utf-8') as stream:
+            json.dump(selection, stream, ensure_ascii=False, indent=2)
+            return Path(stream.name)
+
+
+def load_rerun(path):
+    value = read_json(path)
+    with diagnostic_io('validate rerun manifest', path):
+        if (not isinstance(value, dict) or not all(key in value for key in ('base_commit', 'version_contract', 'python_sha256')) or value.get('version') != 1 or value.get('root') != str(ROOT)
+                or value.get('python') != sys.executable or not isinstance(value.get('source_files'), dict)
+                or not isinstance(value.get('plan'), dict) or not isinstance(value.get('baseline'), dict)
+                or not isinstance(value.get('options'), dict)):
+            raise ValueError('Rerun manifest does not match this checkout and Python environment')
+        plan, options, baseline = value['plan'], value['options'], value['baseline']
+        if (not all(key in plan for key in ('tests', 'affected_tests', 'groups', 'unmapped', 'changed', 'full'))
+                or not all(key in options for key in ('basic', 'full', 'integration', 'extended', 'package_only', 'package_exe', 'package_sha256'))
+                or not all(key in baseline for key in ('path', 'content', 'sha256', 'value'))
+                or baseline['path'] != str(BASELINE.resolve())):
+            raise ValueError('Rerun manifest is incomplete or names a different baseline')
+        if (not all(isinstance(plan.get(key), list) and all(isinstance(item, str) for item in plan[key])
+                    for key in ('tests', 'affected_tests', 'groups', 'unmapped', 'qa_smokes'))
+                or not all(isinstance(plan.get(key), bool) for key in ('full', 'package_impact', 'proxy_impact'))
+                or not isinstance(plan.get('reasons'), dict) or not isinstance(plan.get('suite'), str)
+                or not all(isinstance(options[key], bool) for key in ('basic', 'full', 'integration', 'extended', 'package_only'))
+                or (options['package_exe'] is not None and not isinstance(options['package_exe'], str))
+                or (baseline['content'] is not None and not isinstance(baseline['content'], str))
+                or (baseline['value'] is not None and not isinstance(baseline['value'], dict))
+                or (plan['changed'] is not None and not isinstance(plan['changed'], list))
+                or not isinstance(value['version_contract'], str)):
+            raise ValueError('Rerun manifest has invalid selection or baseline fields')
+        raw = base64.b64decode(baseline['content'], validate=True) if baseline['content'] is not None else None
+        if (hashlib.sha256(raw).hexdigest() if raw is not None else None) != baseline['sha256']:
+            raise ValueError('Rerun baseline bytes do not match their digest')
+        if (json.loads(raw.decode('utf-8')) if raw is not None else None) != baseline['value']:
+            raise ValueError('Rerun baseline content does not match its bytes')
+        if value['source_files'] != file_hashes():
+            raise ValueError('Source changed since the original check; start a new verification')
+        if value.get('python_sha256') != hashlib.sha256(Path(sys.executable).read_bytes()).hexdigest():
+            raise ValueError('Python executable changed since the original check')
+        if options['package_exe'] and options['package_sha256'] != hashlib.sha256(Path(options['package_exe']).read_bytes()).hexdigest():
+            raise ValueError('Package executable changed since the original check')
+    return value
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--diagnostics', type=Path, help='Root directory for this invocation diagnostics')
+    parser.add_argument('--rerun', type=Path, help='Replay a frozen verification manifest')
     parser.add_argument('--plan', action='store_true', help='Show checks without running them')
     parser.add_argument('--base', help='Git ref to compare when intentionally establishing a new baseline')
     parser.add_argument('--basic', action='store_true', help='Run the fixed audited core CI checks without advancing the local baseline')
@@ -703,64 +843,150 @@ def main(argv=None):
     parser.add_argument('--package-exe', type=Path, help='Check a built executable with isolated records')
     parser.add_argument('--package-only', action='store_true', help='Check only the executable after source checks')
     args = parser.parse_args(argv)
+    reset()
+    if args.rerun and any((args.base, args.basic, args.full, args.integration, args.extended, args.package_exe, args.package_only)):
+        parser.error('--rerun permits only --diagnostics and --plan')
+    diagnostics_root = (args.diagnostics or REPORTS).resolve()
+    try:
+        validate_diagnostics_path(diagnostics_root)
+    except ValueError as error:
+        parser.error(str(error))
     if args.basic and (args.full or args.integration or args.extended or args.package_only):
         parser.error('--basic cannot be combined with another source-suite option or --package-only')
     if args.package_only and (not args.package_exe or args.full or args.integration or args.extended):
         parser.error('--package-only requires --package-exe and cannot be combined with a source-suite option')
-    current = file_hashes()
-    current_contract = version_contract()
-    baseline = json.loads(BASELINE.read_text(encoding='utf-8')) if BASELINE.is_file() else None
-    changed = changed_files(current, baseline, args.base)
-    plan = select_tests(changed,deleted=set(changed or ())-current.keys(),
-                        version_only=release_version_only(base_ref=args.base, baseline=baseline))
-    if args.basic:
-        plan = {**plan, 'full':False, 'tests':basic_tests(), 'affected_tests':(), 'groups':('basic',),
-                'reasons':{test:['Audited basic CI contract'] for test in basic_tests()}}
-    if args.full or args.integration or args.extended:
-        plan = {**plan, 'full':True, 'tests':('tests',), 'groups':('full',),
-                'reasons':{'tests':['사용자가 전체 검사를 지정함']}, 'unmapped':()}
-    if args.package_only:
-        plan = {**plan, 'full':False, 'tests':(), 'affected_tests':(), 'groups':(), 'reasons':{}, 'unmapped':()}
-    public = dict(changed=sorted(changed) if changed is not None else None,
-                  suite='basic' if args.basic else 'extended' if args.extended else 'integration' if args.integration else
-                  'essential+affected' if plan['full'] and plan['affected_tests'] else 'essential' if plan['full'] else 'affected',
-                  full=plan['full'], unmapped=plan['unmapped'],
-                  groups=plan['groups'], tests=plan['tests'], affected_tests=plan['affected_tests'], reasons=plan['reasons'],
-                  package_impact=plan['package_impact'], proxy_impact=plan['proxy_impact'],
-                  qa_smokes=plan['qa_smokes'],
-                  package_exe=str(args.package_exe) if args.package_exe else None)
+    try:
+        if args.rerun:
+            selection = load_rerun(args.rerun.resolve())
+            current = selection['source_files']
+            current_contract = selection['version_contract']
+            original_baseline = selection['baseline']
+            public = selection['plan']
+            plan = public
+            changed = public['changed']
+            for key, value in selection['options'].items():
+                if key != 'package_sha256':
+                    setattr(args, key, value)
+            args.package_exe = Path(args.package_exe) if args.package_exe else None
+        else:
+            current = file_hashes()
+            current_contract = version_contract()
+            original_baseline = baseline_input()
+            baseline = original_baseline['value']
+            if args.base:
+                args.base = git_bytes('rev-parse', '--verify', args.base + '^{commit}').decode().strip()
+            changed = changed_files(current, baseline, args.base)
+            plan = select_tests(changed,deleted=set(changed or ())-current.keys(),
+                                version_only=release_version_only(base_ref=args.base, baseline=baseline))
+            if args.basic:
+                plan = {**plan, 'full':False, 'tests':basic_tests(), 'affected_tests':(), 'groups':('basic',),
+                        'reasons':{test:['Audited basic CI contract'] for test in basic_tests()}}
+            if args.full or args.integration or args.extended:
+                plan = {**plan, 'full':True, 'tests':('tests',), 'groups':('full',),
+                        'reasons':{'tests':['사용자가 전체 검사를 지정함']}, 'unmapped':()}
+            if args.package_only:
+                plan = {**plan, 'full':False, 'tests':(), 'affected_tests':(), 'groups':(), 'reasons':{}, 'unmapped':()}
+            public = dict(changed=sorted(changed) if changed is not None else None,
+                          suite='basic' if args.basic else 'extended' if args.extended else 'integration' if args.integration else
+                          'essential+affected' if plan['full'] and plan['affected_tests'] else 'essential' if plan['full'] else 'affected',
+                          full=plan['full'], unmapped=plan['unmapped'],
+                          groups=plan['groups'], tests=plan['tests'], affected_tests=plan['affected_tests'], reasons=plan['reasons'],
+                          package_impact=plan['package_impact'], proxy_impact=plan['proxy_impact'],
+                          qa_smokes=plan['qa_smokes'],
+                          package_exe=str(args.package_exe) if args.package_exe else None)
+            if args.package_exe:
+                args.package_exe = args.package_exe.resolve()
+                if not args.package_exe.is_file():
+                    parser.error('Package executable does not exist: ' + str(args.package_exe))
+                public['package_exe'] = str(args.package_exe)
+            selection = dict(version=1, root=str(ROOT), python=sys.executable,
+                             python_sha256=hashlib.sha256(Path(sys.executable).read_bytes()).hexdigest(),
+                             source_files=current, version_contract=current_contract,
+                             baseline=original_baseline, base_commit=args.base, plan=public,
+                             options=dict(basic=args.basic, full=args.full, integration=args.integration,
+                                          extended=args.extended, package_only=args.package_only,
+                                          package_exe=str(args.package_exe) if args.package_exe else None,
+                                          package_sha256=hashlib.sha256(args.package_exe.read_bytes()).hexdigest() if args.package_exe else None))
+    except DiagnosticFailure:
+        print(json.dumps(dict(result='diagnostics_failed', diagnostics=status(), diagnostics_root=str(diagnostics_root),
+                              product_exit_code=None, report_persisted=False, rerun_command=None)))
+        return DIAGNOSTIC_EXIT
     if args.plan:
-        print(json.dumps(public,ensure_ascii=False,indent=2))
+        print(json.dumps(dict(public, diagnostics_root=str(diagnostics_root)),ensure_ascii=False,indent=2))
         return 2 if plan['unmapped'] else 0
     if plan['unmapped']:
         print(json.dumps(dict(result='unmapped', paths=plan['unmapped'],
                              action='tools/verify_changes.py의 RULES에 검사 연결을 추가하거나 --full을 지정하세요.'), ensure_ascii=False))
         return 2
-    REPORTS.mkdir(parents=True,exist_ok=True)
-    folder = REPORTS / datetime.now().strftime('%Y%m%d-%H%M%S')
-    folder.mkdir(exist_ok=False)
-    report = dict(public,logs=[],package=None)
+    folder = diagnostics_root / (datetime.now().strftime('%Y%m%d-%H%M%S-') + uuid.uuid4().hex[:8])
+    print('Diagnostics directory ' + str(folder), file=sys.stderr, flush=True)
+    manifest = None
+    rerun_command = None
+    report = dict(public, logs=[], package=None, diagnostics_root=str(diagnostics_root),
+                  diagnostics_directory=str(folder), baseline_path=str(BASELINE.resolve()),
+                  base_commit=selection['base_commit'], product_exit_code=None)
+
+    def finish(result, code, **details):
+        report.update(diagnostics=status(), rerun_manifest=str(manifest) if manifest else None,
+                      rerun_command=rerun_command, report_persisted=False)
+        try:
+            report['report_persisted'] = True
+            write_json(folder / 'report.json', report)
+        except DiagnosticFailure:
+            report['report_persisted'] = False
+        if code == 0 and not status()['first_error'] and not args.package_only and not args.basic:
+            temporary = BASELINE.with_suffix('.tmp')
+            try:
+                with diagnostic_io('advance verification baseline', BASELINE):
+                    raw = BASELINE.read_bytes() if BASELINE.exists() else None
+                    expected = original_baseline['content']
+                    if raw != (base64.b64decode(expected) if expected is not None else None):
+                        raise ValueError('Verification baseline changed since the original invocation')
+                    BASELINE.parent.mkdir(parents=True, exist_ok=True)
+                    temporary.write_text(json.dumps(dict(version=1, files=current, report=str(folder/'report.json'),
+                        version_contract=current_contract), ensure_ascii=False, indent=2), encoding='utf-8')
+                    temporary.replace(BASELINE)
+            except DiagnosticFailure:
+                pass
+        if status()['first_error']:
+            code = code or DIAGNOSTIC_EXIT
+            result = 'diagnostics_failed'
+            report['diagnostics'] = status()
+            try:
+                write_json(folder / 'report.json', report)
+            except DiagnosticFailure:
+                report['report_persisted'] = False
+        print(json.dumps(dict(result=result, **details, report=str(folder/'report.json'),
+                              diagnostics_root=str(diagnostics_root), diagnostics_directory=str(folder),
+                              diagnostics=status(), product_exit_code=report['product_exit_code'],
+                              report_persisted=report['report_persisted'], rerun_command=rerun_command,
+                              rerun_manifest=str(manifest) if manifest else None), ensure_ascii=False))
+        return code
+
+    try:
+        manifest = args.rerun.resolve() if args.rerun else save_rerun(selection)
+        rerun_command = '& ' + ' '.join("'" + value.replace("'", "''") + "'" for value in
+            [sys.executable, str(ROOT/'tools/verify_changes.py'), '--rerun', str(manifest),
+             '--diagnostics', str(diagnostics_root)])
+        with diagnostic_io('create diagnostics directory', folder):
+            folder.mkdir(parents=True, exist_ok=False)
+    except DiagnosticFailure:
+        return finish('diagnostics_failed', DIAGNOSTIC_EXIT, rerun_available=manifest is not None)
     if plan['tests']:
         from tools.check_environment import check_environment
         environment=check_environment()
         report['environment']=environment
         if environment['errors']:
-            (folder/'report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
-            print(json.dumps(dict(result='environment_failed',**environment,
-                                  action='Use a dedicated environment installed from requirements-release.lock.',
-                                  report=str(folder/'report.json')),ensure_ascii=False,indent=2))
-            return 2
+            return finish('environment_failed', 2, **environment,
+                          action='Use a dedicated environment installed from requirements-release.lock.')
         from tools.build_native import checked_extension, extension_path
         if extension_path().is_file() or os.environ.get('CODEXON_CPU_BACKEND') == 'rust':
             try:
                 report['native'] = {'extension': str(checked_extension()), 'abi_version': 1}
             except (RuntimeError, OSError, subprocess.CalledProcessError) as error:
                 report['native_error'] = str(error)
-                (folder/'report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
-                print(json.dumps(dict(result='native_failed',error=str(error),
-                                      action='Run tools/build_native.py with this Python environment before verifying.',
-                                      report=str(folder/'report.json')),ensure_ascii=False,indent=2))
-                return 2
+                return finish('native_failed', 2, error=str(error),
+                              action='Run tools/build_native.py with this Python environment before verifying.')
         started = time.monotonic()
         deadline = started + 820  # Leave the Actions 15-minute step time for evidence upload/exit.
         runs = []
@@ -775,46 +1001,47 @@ def main(argv=None):
             command[boundary:boundary] = ['--timeout', str(budget), '--diagnostics', str(folder / f'diagnostics-{name}')]
             run_started = time.monotonic()
             run_log = folder / f'pytest-{name}.log'
-            result = run_logged(command, run_log)
-            output = result.stdout
+            try:
+                result = run_logged(command, run_log)
+            except DiagnosticFailure:
+                return finish('diagnostics_failed', DIAGNOSTIC_EXIT)
+            retain(getattr(result, 'diagnostics', {}).get('first_error'))
+            report['product_exit_code'] = getattr(result, 'product_exit_code', result.returncode)
             report['logs'].append(str(run_log))
             runs.append(dict(environment=name, exit_code=result.returncode,
+                             product_exit_code=report['product_exit_code'], diagnostics=getattr(result, 'diagnostics', status()),
                              seconds=round(time.monotonic()-run_started, 2),
                              summary=result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ''))
             if result.returncode:
                 break
         log = folder / 'pytest.log'
-        with log.open('w', encoding='utf-8') as aggregate:
-            for name in report['logs']:
-                with Path(name).open(encoding='utf-8', errors='replace') as source:
-                    shutil.copyfileobj(source, aggregate, length=65536)
+        try:
+            with diagnostic_io('aggregate check logs', log):
+                with log.open('w', encoding='utf-8') as aggregate:
+                    for name in report['logs']:
+                        with Path(name).open(encoding='utf-8', errors='replace') as source:
+                            shutil.copyfileobj(source, aggregate, length=65536)
+        except DiagnosticFailure:
+            pass
         report['logs'].append(str(log))
         exit_code = next((run['exit_code'] for run in runs if run['exit_code']), 0)
         report['pytest'] = dict(exit_code=exit_code, seconds=round(time.monotonic()-started,2),
                                summary=' | '.join(run['summary'] for run in runs), runs=runs)
-        if exit_code:
-            (folder/'report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
-            # Show the actual failure in the job log, without an artifact download.
-            print('\n'.join(log.read_text(encoding='utf-8').splitlines()[-100:]))
-            print(json.dumps(dict(result='failed',**report['pytest'],log=str(log)),ensure_ascii=False))
-            return exit_code
+        if exit_code or status()['first_error']:
+            return finish('failed', exit_code or DIAGNOSTIC_EXIT, **report['pytest'], log=str(log))
     if args.package_exe:
         try:
             report['package'] = package_check(args.package_exe,folder)
+        except DiagnosticFailure as error:
+            report['product_exit_code'] = error.product_exit_code
+            return finish('diagnostics_failed', error.product_exit_code or DIAGNOSTIC_EXIT)
         except Exception as error:
             report['package_error'] = str(error)
-            (folder/'report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
-            print(json.dumps(dict(result='package_failed',error=str(error),report=str(folder/'report.json')),ensure_ascii=False))
-            return 1
-    (folder/'report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
-    if not args.package_only and not args.basic:
-        BASELINE.write_text(json.dumps(dict(version=1,files=current,report=str(folder/'report.json'),
-                                           version_contract=current_contract),
-                                       ensure_ascii=False,indent=2),encoding='utf-8')
-    print(json.dumps(dict(result='passed',changed=len(changed) if changed is not None else None,
-                          groups=plan['groups'],pytest=report.get('pytest'),package=report['package'],
-                          report=str(folder/'report.json')),ensure_ascii=False))
-    return 0
+            report['product_exit_code'] = 1
+            return finish('package_failed', 1, error=str(error))
+    report['product_exit_code'] = 0
+    return finish('passed', 0, changed=len(changed) if changed is not None else None,
+                  groups=plan['groups'], pytest=report.get('pytest'), package=report['package'])
 
 
 if __name__ == '__main__':

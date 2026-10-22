@@ -7,6 +7,8 @@ from pathlib import Path
 import time
 import subprocess
 
+from tools.check_diagnostics import DiagnosticFailure, diagnostic_io, write_json
+
 
 class Limits(ctypes.Structure):
     _fields_ = [('process_time', ctypes.c_int64), ('job_time', ctypes.c_int64),
@@ -102,16 +104,28 @@ def register_root(root):
     import hashlib
     root = str(Path(root).resolve())
     destination = Path(folder) / ('owner-' + hashlib.sha256(root.encode()).hexdigest() + '.json')
-    destination.write_text(json.dumps({'root': root}), encoding='utf-8')
+    with diagnostic_io('register process scope', destination):
+        destination.write_text(json.dumps({'root': root}), encoding='utf-8')
 
 
 def clear_scopes(folder):
-    if not any(folder.glob('owner-*.json')):
-        return {}
+    with diagnostic_io('list process scopes', folder):
+        if not any(folder.glob('owner-*.json')):
+            return {}
     result = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File',
         str(Path(__file__).with_name('clear_check_scopes.ps1')), '-Evidence', str(folder)],
         capture_output=True, timeout=12, creationflags=subprocess.CREATE_NO_WINDOW)
-    (folder / 'scope-cleanup.log').write_bytes(result.stdout + result.stderr)
+    try:
+        with diagnostic_io('write scope cleanup log', folder / 'scope-cleanup.log'):
+            (folder / 'scope-cleanup.log').write_bytes(result.stdout + result.stderr)
+    except DiagnosticFailure:
+        pass
     if result.returncode:
-        raise RuntimeError('External check scope cleanup failed; see scope-cleanup.log')
-    return json.loads(result.stdout.decode('utf-8-sig'))
+        raise RuntimeError('External check scope cleanup failed: ' + result.stderr.decode('utf-8-sig', errors='replace'))
+    with diagnostic_io('decode scope cleanup result', folder):
+        evidence = json.loads(result.stdout.decode('utf-8-sig'))
+    try:
+        write_json(folder / 'external-processes.json', evidence)
+    except DiagnosticFailure:
+        pass
+    return evidence

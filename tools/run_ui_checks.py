@@ -14,6 +14,8 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tools.check_processes import Job, clear_scopes
+from tools.check_diagnostics import (DIAGNOSTIC_EXIT, DiagnosticFailure, diagnostic_io,
+                                     emit, exit_code, read_json, retain, status, write_json)
 
 
 class StartupInfo(ctypes.Structure):
@@ -153,21 +155,27 @@ def run_on_desktop(kernel, desktop, command, env, *, timeout=720, diagnostics=No
             if kernel.ResumeThread(process.thread) == 0xFFFFFFFF:
                 raise ctypes.WinError(ctypes.get_last_error())
             while True:
-                status = kernel.WaitForSingleObject(process.process, 100)
-                if status == 0:
+                wait_status = kernel.WaitForSingleObject(process.process, 100)
+                if wait_status == 0:
                     break
-                if status != 258:  # WAIT_TIMEOUT
+                if wait_status != 258:  # WAIT_TIMEOUT
                     raise ctypes.WinError(ctypes.get_last_error())
                 if time.monotonic() - started >= timeout:
                     reason = 'deadline'
                     break
                 if diagnostics and time.monotonic() - log_check >= 1:
                     log_check = time.monotonic()
-                    logs = list(diagnostics.glob('*.log'))
-                    if env.get('CODEXON_CHECK_LOG'):
-                        logs.append(Path(env['CODEXON_CHECK_LOG']))
-                    if sum(path.stat().st_size for path in logs if path.exists()) > 64 * 1024 * 1024:
-                        reason = 'diagnostic_budget'
+                    try:
+                        with diagnostic_io('inspect diagnostic budget', diagnostics):
+                            logs = list(diagnostics.glob('*.log'))
+                            if env.get('CODEXON_CHECK_LOG'):
+                                logs.append(Path(env['CODEXON_CHECK_LOG']))
+                            over_budget = sum(path.stat().st_size for path in logs if path.exists()) > 64 * 1024 * 1024
+                        if over_budget:
+                            reason = 'diagnostic_budget'
+                            break
+                    except DiagnosticFailure:
+                        reason = 'diagnostics_failed'
                         break
             result = W.DWORD()
             checked(kernel.GetExitCodeProcess(process.process, ctypes.byref(result)))
@@ -180,7 +188,11 @@ def run_on_desktop(kernel, desktop, command, env, *, timeout=720, diagnostics=No
             if reason == 'completed' and live:
                 reason = 'descendants_remain'
             if reason != 'completed' and diagnostics:
-                (diagnostics / 'stack-request').touch()
+                try:
+                    with diagnostic_io('request worker stacks', diagnostics / 'stack-request'):
+                        (diagnostics / 'stack-request').touch()
+                except DiagnosticFailure:
+                    pass
                 # The worker's stack watcher polls every 200 ms. This bounded
                 # diagnostic grace is included in the cleanup reserve.
                 stack_deadline = time.monotonic() + 2
@@ -190,27 +202,69 @@ def run_on_desktop(kernel, desktop, command, env, *, timeout=720, diagnostics=No
             evidence = dict(reason=reason, command=command, pid=process.process_id,
                             live_pids=live, process_exit_code=result.value, timeout_seconds=timeout,
                             seconds=round(time.monotonic() - started, 3))
+            product_exit_code = result.value if reason == 'completed' else None
+            if diagnostics and env.get('CODEXON_CHECK_WORKER'):
+                try:
+                    with diagnostic_io('find worker outcome', diagnostics):
+                        states = list(diagnostics.glob('worker-state-*.json'))
+                        if len(states) != 1:
+                            raise ValueError('Expected one worker outcome file')
+                    state = read_json(states[0])
+                    with diagnostic_io('validate worker outcome', states[0]):
+                        if (not isinstance(state, dict) or state.get('phase') not in ('executing', 'interpreter_shutdown')
+                                or not isinstance(state.get('diagnostics', {}), dict)
+                                or (state.get('product_exit_code') is not None and type(state['product_exit_code']) is not int)):
+                            raise ValueError('Invalid worker outcome')
+                    retain(state.get('diagnostics', {}).get('first_error'))
+                    product_exit_code = state.get('product_exit_code') if state.get('phase') == 'interpreter_shutdown' else None
+                except DiagnosticFailure:
+                    product_exit_code = result.value if reason == 'completed' and result.value not in (0, DIAGNOSTIC_EXIT) else None
             if diagnostics:
-                active = diagnostics / 'active-test.json'
-                if active.exists():
-                    evidence['active_test'] = json.loads(active.read_text(encoding='utf-8'))
-                (diagnostics / 'processes.json').write_text(json.dumps(evidence, indent=2), encoding='utf-8')
+                try:
+                    active = diagnostics / 'active-test.json'
+                    with diagnostic_io('inspect active test', active):
+                        has_active = active.exists()
+                    if has_active:
+                        evidence['active_test'] = read_json(active)
+                    write_json(diagnostics / 'processes.json', evidence)
+                except DiagnosticFailure:
+                    pass
             evidence['remaining_pids'] = job.terminate() if live else []
-            # Scheduler and packaged activation can start outside this Job.
-            # The test registers fresh scopes before launching those processes.
-            if diagnostics:
-                evidence['external'] = clear_scopes(diagnostics)
-                if evidence['external'].get('processes') or any(task['running'] for task in evidence['external'].get('tasks', [])):
-                    reason = evidence['reason'] = 'external_descendants_remain' if reason == 'completed' else reason
-            if diagnostics:
-                (diagnostics / 'result.json').write_text(json.dumps(evidence, indent=2), encoding='utf-8')
-            return 124 if reason == 'deadline' else 1 if reason != 'completed' or evidence['remaining_pids'] else result.value
         except BaseException:
             job.terminate()
             # Assignment can fail before the suspended process joins the job.
             kernel.TerminateProcess(process.process, 1)
             kernel.WaitForSingleObject(process.process, 5000)
             raise
+        finally:
+            if diagnostics:
+                try:
+                    external = clear_scopes(diagnostics)
+                except DiagnosticFailure:
+                    external = {}
+        evidence['external'] = external if diagnostics else {}
+        if evidence['external'].get('processes') or any(task['running'] for task in evidence['external'].get('tasks', [])):
+            reason = evidence['reason'] = 'external_descendants_remain' if reason == 'completed' else reason
+        evidence.update(product_exit_code=product_exit_code, diagnostics=status(),
+                        diagnostics_directory=str(diagnostics) if diagnostics else None)
+        if reason == 'deadline':
+            code = 124
+        elif reason not in ('completed', 'diagnostics_failed') or evidence['remaining_pids']:
+            code = 1
+        elif result.value not in (0, DIAGNOSTIC_EXIT, 259):
+            code = result.value
+        else:
+            code = exit_code(product_exit_code)
+        try:
+            if diagnostics:
+                write_json(diagnostics / 'result.json', evidence)
+        except DiagnosticFailure:
+            pass
+        code = code or exit_code(product_exit_code)
+        if status()['first_error']:
+            emit(dict(product_exit_code=product_exit_code, diagnostics=status()))
+        return code
+
 
 
 def main():
@@ -231,14 +285,27 @@ def main():
     if not 0 < timeout <= 840:
         parser.error('Check budget must be positive and at most 840 seconds')
     diagnostics = (args.diagnostics or Path(__file__).resolve().parents[1] / 'artifacts/verification' / ('runner-' + uuid.uuid4().hex)).resolve()
-    diagnostics.mkdir(parents=True, exist_ok=False)
+    from tools.verify_changes import validate_diagnostics_path
+    try:
+        validate_diagnostics_path(diagnostics)
+    except ValueError as error:
+        parser.error(str(error))
+    print('Diagnostics directory ' + str(diagnostics), file=sys.stderr, flush=True)
+    try:
+        with diagnostic_io('create diagnostics directory', diagnostics):
+            diagnostics.mkdir(parents=True, exist_ok=False)
+    except DiagnosticFailure:
+        emit(dict(product_exit_code=None, diagnostics=status()))
+        return DIAGNOSTIC_EXIT
     env = dict(os.environ)
+    env.pop('CODEXON_CHECK_WORKER', None)
     env['CODEXON_CHECK_DIAGNOSTICS'] = str(diagnostics)
     env['CODEXON_CHECK_TIMEOUT'] = str(timeout)
     # Bootstrap only understood Python invocations; native programs still get
     # the same Job Object deadline and PID evidence.
     if Path(command[0]).name.lower() in ('python', 'python.exe', 'python3', 'python3.exe'):
         command = [command[0], '-u', '-B', str(Path(__file__).with_name('check_worker.py')), *command[1:]]
+        env['CODEXON_CHECK_WORKER'] = '1'
     if args.scale:
         env['QT_SCALE_FACTOR'] = args.scale
     user, kernel = windows_api()
