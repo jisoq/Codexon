@@ -591,16 +591,12 @@ def test_check_output_ignores_non_protocol_json_and_keeps_split_outcome():
 
 
 def test_rerun_command_round_trips_powershell_arguments(tmp_path, monkeypatch, capsys, diagnostic_state):
-    from pathlib import Path
-    import shutil
+    from venv import EnvBuilder
     import subprocess
-    import sys
     verify, _ = verification_probe(tmp_path, monkeypatch)
     special = tmp_path/"Python path $literal's`value"
-    special.mkdir()
-    executable = special/'python.exe'
-    shutil.copyfile(sys.executable, executable)
-    shutil.copyfile(Path(sys.prefix)/'pyvenv.cfg', special/'pyvenv.cfg')
+    EnvBuilder(with_pip=False).create(special)
+    executable = special/'Scripts'/'python.exe'
     tools = special/'tools'; tools.mkdir()
     received = special/'received.json'
     (tools/'verify_changes.py').write_text(
