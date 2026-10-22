@@ -90,6 +90,84 @@ def test_pairs_metrics_and_bands_match_reference_and_drilldown(tmp_path,monkeypa
             assert engine.read_metrics['category_projection_rows']==read
 
 
+def test_request_modes_stay_separate_normalize_and_drill_down_in_every_group(tmp_path):
+    from cachemonitor.category_usage import display_rows
+    values=sources()
+    modes=[dict(service_tier='standard'),dict(service_tier='default'),
+           dict(service_tier='fast'),dict(service_tier='priority'),dict(service_tier=None),
+           dict(service_tier='Fast',mode_conflict=True),
+           dict(service_tier='Standard',service_tier_source='conflict'),
+           dict(service_tier='Fast',display_service_tier='Standard'),dict(service_tier='Experimental')]
+    for source in values:
+        source['source']='user'
+        template=source['history'][0]
+        source['history']=[dict(template,key=f"{source['id']}-{i}",effort='high',**mode)
+                           for i,mode in enumerate(modes)]
+    reference=AnalysisEngine();reference.ingest(values)
+    with storage.PreparedStore(tmp_path/'modes.sqlite') as store:
+        token=publish(store,values,1)
+        with closing(PreparedAnalysisEngine(store.path,token)) as engine:
+            total=project(engine,all_query())['usage']['metrics']
+            for dimension in DIMENSIONS:
+                q=all_query();q['usage']['dimension']=dimension
+                data=project(engine,q)['usage']
+                assert data==project(reference,q)['usage']
+                assert data['metrics']==total and data['summary']['value']==18
+                counts={mode:sum(row['metrics']['calls']['value'] for row in data['rows']
+                                 if row['filters']['service_tier']==mode)
+                        for mode in ('Standard','Fast','미확인','Experimental')}
+                assert counts==dict(Standard=6,Fast=4,미확인=6,Experimental=2)
+                assert len({row['key'] for row in data['rows']})==len(data['rows'])
+                for row in data['rows']:
+                    mode=row['filters']['service_tier']
+                    assert ('⚡' in row['label'])==(mode=='Fast')
+                    if mode in ('Standard','Fast'):assert mode not in row['label']
+                    selected=all_query();selected.update(row['filters'])
+                    detail=project(engine,selected)['usage']
+                    assert detail['metrics']==row['metrics']
+                    assert len(detail['rows'])==1
+                    assert detail['rows'][0]['distributions']==row['distributions']
+                visible=display_rows(data['rows'],dict(showUnknown=False),True)
+                assert sum(row['value'] for row in visible)==12
+                assert all(row['filters']['service_tier']!='미확인' for row in visible)
+                assert data['metrics']==total
+
+
+def test_name_order_uses_numeric_versions_families_efforts_and_keeps_parent_groups(monkeypatch):
+    from cachemonitor.category_usage import display_rows
+    expected=[('gpt-6.10-sol','low'),('gpt-6.9-astra','ultra'),('gpt-6.1.1-luna','low'),
+              *[('gpt-6.1-astra',effort) for effort in ('ultra','max','xhigh','high','medium','low','minimal','미확인')],
+              ('gpt-6.1-sol','ultra'),('gpt-6.1-terra','high'),('gpt-6.1-luna','high'),('gpt-6.1.0-luna','high'),
+              ('gpt-6.1-daybreak','high'),('gpt-6.1','high'),('gpt-6.1-cobalt','high'),
+              ('gpt-6-sol','high'),('gpt-5.6-astra','ultra'),('gpt-daybreak-blue-latest','high'),
+              ('custom-model','high'),('미확인','high')]
+    calls=[dict(scalar_call(index+1),model=model,effort=effort,service_tier=mode,project=parent)
+           for parent in ('Z project','A project') for index,(model,effort) in enumerate(reversed(expected))
+           for mode in ('Standard','Fast')]
+    engine=ProjectedEngine({('home','one'):calls})
+    for dimension in ('all','project'):
+        q=all_query();q['usage'].update(dimension=dimension,sort='name')
+        data=project(engine,q)['usage']
+        groups=['전체'] if dimension=='all' else ['A project','Z project']
+        ordered=[(parent,model,effort,mode) for parent in groups for model,effort in expected
+                 for mode in ('Fast','Standard')]
+        def identity(row):
+            return (row['group'],row['filters']['model'],row['filters']['effort'],row['filters']['service_tier'])
+        assert [identity(row) for row in data['rows']]==ordered
+        with monkeypatch.context() as guard:
+            guard.setattr(engine,'projected_calls',lambda *a,**kw:pytest.fail('Display changes must not read records'))
+            for metric in METRICS:
+                selected=choose_metric(data,metric)
+                shown=display_rows(selected['rows'],dict(sort='name',showUnknown=True),True)
+                assert [identity(row) for row in shown]==ordered
+            for order in ('asc','desc'):
+                shown=display_rows(choose_metric(data,'input_per_call')['rows'],dict(sort=order,showUnknown=True),True)
+                assert [row['group'] for row in shown]==sorted(row['group'] for row in shown)
+                for parent in groups:
+                    amounts=[row['value'] for row in shown if row['group']==parent]
+                    assert amounts==sorted(amounts,reverse=order=='desc')
+
+
 def test_corrections_deletions_and_unchanged_owners_reuse_only_valid_results(tmp_path):
     values=sources()
     with storage.PreparedStore(tmp_path/'comparison.sqlite') as store:
@@ -270,7 +348,7 @@ def test_certified_append_correction_deletion_and_reuse_preserve_distributions()
     actual=project(engine,all_query())['usage']
     assert engine.read_metrics['category_projection_rows']-reads==1
     assert engine._comparison_cache['entries'][('home','two')] is unchanged
-    assert before['entries'][('home','one')]['groups'][('전체','gpt-6-astra','high')][1].totals.count==9
+    assert before['entries'][('home','one')]['groups'][('전체','gpt-6-astra','high','미확인')][1].totals.count==9
     assert actual==project(ProjectedEngine(deepcopy(engine.owners)),all_query())['usage']
     from cachemonitor.prepared_store import _size
     for entry in engine._comparison_cache['entries'].values():
@@ -537,7 +615,7 @@ def test_repeated_certified_appends_fit_the_original_geometric_clone_capacity():
         expected=project(ProjectedEngine(deepcopy(engine.owners)),all_query())
         assert exact_scalars(actual['usage'])==exact_scalars(expected['usage'])
         assert engine.read_metrics['category_projection_rows']-reads==1
-        old=before['entries'][owner]['groups'][('전체','gpt-6-astra','high')][1]
+        old=before['entries'][owner]['groups'][('전체','gpt-6-astra','high','미확인')][1]
         assert old.totals.count==value
         for entry in engine._comparison_cache['entries'].values():
             assert entry['weight']>=sum(256+comparison._size(key)+comparison._size(label)+aggregate.retained_bytes()
@@ -558,7 +636,7 @@ def test_tag_promotion_failure_does_not_publish_partial_append(monkeypatch):
         patch.setattr(comparison._Observations,'_grow',fail_tags)
         with pytest.raises(CapacityExceeded):project(engine,all_query())
     assert engine._comparison_cache is published
-    owner=('home','one');key=('전체','gpt-6-astra','high')
+    owner=('home','one');key=('전체','gpt-6-astra','high','미확인')
     aggregate=published['entries'][owner]['groups'][key][1]
     prior=previous['entries'][owner]['groups'][key][1]
     assert exact_scalars(aggregate.distributions(comparison._Budget(comparison.LIMIT)))==exact_scalars(

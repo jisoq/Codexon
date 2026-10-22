@@ -29,6 +29,8 @@ def assert_table_geometry(rendered,line=None):
     for row in lines:
         cells=[next(item for item in walk(row) if item.isVisible() and item.objectName()=='usage-cell-'+key) for key in keys]
         label=next(item for item in walk(row) if item.isVisible() and item.objectName()=='usage-table-label')
+        assert not label.property('truncated')
+        assert label.property('contentHeight')<=label.height()+1
         chevron=next(item for item in walk(row) if item.isVisible() and item.objectName()=='usage-table-chevron')
         edge=0
         for header_cell,cell in zip(headers,cells):
@@ -242,6 +244,7 @@ def test_unmeasurable_pairs_hide_without_losing_zero_values_or_cached_metrics(da
     for session,effort in zip(source['sessions'],('high','low','medium')):
         for row in session['history']:
             row['effort']=effort
+            row['service_tier']='Standard'
             row['reasoning']=None if effort=='high' else 0 if effort=='low' else 10
             if effort=='high':
                 row.update(completion_latency_ms=None,response_status='unknown')
@@ -372,24 +375,74 @@ def test_custom_date_restore_rejects_invalid_saved_ranges(dashboard):
     assert not w.qml_errors
 
 
-def test_grouped_model_effort_metrics_and_drilldown_in_compact_window(dashboard,monkeypatch,tmp_path):
+@pytest.mark.parametrize('boxplot_language',['ko','en'],indirect=True)
+def test_grouped_model_effort_mode_metrics_and_drilldown_in_compact_window(boxplot_language,dashboard,monkeypatch,tmp_path):
     from PySide6.QtCore import QPointF, Qt
     from PySide6.QtTest import QTest
     w=dashboard;w.resize(1000,680);w.change_page(1);p=w.metric_panel
-    source,_=many_efforts();w.receive(source);p.change('dimension','service_tier')
+    source,_=many_efforts();w.receive(source);p.change('dimension','project')
     control(w,p)
     def rendered(name):
         return next(item for item in walk(w.quick.rootObject()) if item.objectName()==name and item.isVisible())
-    wait_for_rendered(lambda:p.data.get('dimension')=='service_tier' and p.row_model.rowCount()>0)
+    wait_for_rendered(lambda:p.data.get('dimension')=='project' and p.row_model.rowCount()>0)
+    def chart_labels_fit():
+        labels=[item for item in walk(rendered('usage-rows')) if item.isVisible() and item.objectName()=='usage-chart-label']
+        return bool(labels) and all(not item.property('truncated') and item.property('contentHeight')<=item.height()+1
+                                   and 0<=item.y() and item.y()+item.height()<=item.parentItem().height()+1 for item in labels)
+    def result_controls_fit():
+        controls=rendered('usage-result-controls');edge=0
+        for item in sorted((item for item in controls.childItems() if item.isVisible() and item.width()>0),key=lambda item:item.x()):
+            if not edge<=item.x()<item.x()+item.width()<=controls.width()+1:return False
+            position=item.mapToScene(QPointF())
+            if not 0<=position.x()<position.x()+item.width()<=w.quick.width()+1:return False
+            edge=item.x()+item.width()
+        for name in ('usage-group-modes','usage-show-unknown'):
+            labels=[item for item in walk(rendered(name)) if item.isVisible() and item.metaObject().indexOfProperty('truncated')>=0]
+            if not labels or any(item.property('truncated') for item in labels):return False
+        return True
+    def table_geometry_ready():
+        try:assert_table_geometry(rendered)
+        except (AssertionError,StopIteration):return False
+        return True
+    def keys():return [p.rowModel.data(p.rowModel.index(index),Qt.UserRole)['key'] for index in range(p.rowModel.rowCount())]
+    wait_for_rendered(chart_labels_fit);wait_for_rendered(result_controls_fit)
     assert p.data['count']==16 and p.data['summary']['value']==216
-    assert all(set(row['filters'])=={'service_tier','model','effort'} for row in p.data['rows'])
-    row=p.data['rows'][0];scope=p.capture()
+    assert all(set(row['filters'])=={'project','service_tier','model','effort'} for row in p.data['rows'])
+    assert 'service_tier' not in {entry['value'] for entry in rendered('usage-dimension').property('model')}
+    assert {row['filters']['service_tier'] for row in p.data['rows']}=={'Standard','Fast'}
+    row=p.data['rows'][0];scope=p.capture();query=p.query()
+    assert scope['groupModes'] is False
     assert p.format_row(0)['groupStart'] and len(p.format_row(0)['metrics'])==8
     with monkeypatch.context() as guard:
-        guard.setattr(w,'render',lambda *a,**kw:pytest.fail('Metric selection must reuse delivered aggregates'))
+        guard.setattr(w,'render',lambda *a,**kw:pytest.fail('Display changes must reuse delivered aggregates'))
+        guard.setattr(w.engine,'page_query',lambda *a,**kw:pytest.fail('Display changes must not read records'))
+        p.change('sort','name')
+        efforts=('ultra','max','xhigh','high','medium','low','minimal','none')
+        paired=[(effort,mode) for effort in efforts for mode in ('Standard','Fast')]
+        grouped=[(effort,mode) for mode in ('Standard','Fast') for effort in efforts]
+        def order():return [(row['filters']['effort'],row['filters']['service_tier']) for row in p.data['rows']]
+        assert order()==paired
+        group_toggle=rendered('usage-group-modes')
+        assert group_toggle.property('checkable') and not group_toggle.property('checked')
+        assert w.quick.grabFramebuffer().save(str(tmp_path/'paired-comparison-name.png'))
+        group_toggle.forceActiveFocus();QTest.keyClick(w.quick,Qt.Key_Space)
+        wait_for_rendered(lambda:p.options['groupModes'] is True and group_toggle.property('checked'))
+        assert order()==grouped
+        saved=p.capture()
+        click(w,group_toggle)
+        wait_for_rendered(lambda:p.options['groupModes'] is False and not group_toggle.property('checked'))
+        assert order()==paired
+        for invalid in (1,'true',None):
+            p.restore(dict(saved,groupModes=invalid));p.present()
+            assert p.capture()['groupModes'] is False and order()==paired
+        p.restore(saved);p.present()
+        wait_for_rendered(lambda:group_toggle.property('checked'))
+        assert p.capture()['groupModes'] is True and order()==grouped
+        legacy=dict(saved);legacy.pop('groupModes');p.restore(legacy);p.present()
+        wait_for_rendered(lambda:not group_toggle.property('checked'))
+        assert p.capture()['groupModes'] is False and order()==paired
+        p.change('sort',scope['sort'])
         toggle=rendered('usage-show-unknown')
-        position=toggle.mapToScene(QPointF())
-        assert position.x()>=0 and position.x()+toggle.width()<=w.quick.width()
         click(w,toggle)
         wait_for_rendered(lambda:p.data['count']==18)
         assert p.data['summary']['value']==216 and p.capture()['showUnknown']
@@ -400,17 +453,33 @@ def test_grouped_model_effort_metrics_and_drilldown_in_compact_window(dashboard,
         assert p.data['count']==18
         p.change('showUnknown','false')
         p.change('metric','cost_per_call');p.change('metric','calls')
+        paired_keys=keys();shared_model=rendered('usage-rows').property('model')
         choice=rendered('usage-view');choice.forceActiveFocus();QTest.keyClick(w.quick,Qt.Key_Down)
         wait_for_rendered(lambda:p.options['view']=='table')
+        assert rendered('usage-rows').property('model') is shared_model and keys()==paired_keys
+        wait_for_rendered(result_controls_fit);wait_for_rendered(table_geometry_ready)
         assert w.quick.grabFramebuffer().save(str(tmp_path/'paired-comparison-table.png'))
         assert_table_geometry(rendered)
+        click(w,group_toggle)
+        wait_for_rendered(lambda:p.options['groupModes'] is True)
+        grouped_keys=keys()
+        assert grouped_keys!=paired_keys and rendered('usage-rows').property('model') is shared_model
+        assert [row['filters']['service_tier'] for row in p.data['rows']]==['Standard']*8+['Fast']*8
+        wait_for_rendered(table_geometry_ready)
+        assert w.quick.grabFramebuffer().save(str(tmp_path/'grouped-comparison-table.png'))
         view=rendered('usage-rows')
         view.setProperty('contentY',view.property('contentHeight')-view.height())
-        wait_for_rendered(lambda:view.property('contentY')>0)
+        wait_for_rendered(lambda:view.property('contentY')>0);wait_for_rendered(table_geometry_ready)
         assert_table_geometry(rendered)
         view.setProperty('contentY',0)
         choice.forceActiveFocus();QTest.keyClick(w.quick,Qt.Key_Up)
         wait_for_rendered(lambda:p.options['view']=='chart')
+        wait_for_rendered(chart_labels_fit);wait_for_rendered(result_controls_fit)
+        assert rendered('usage-rows').property('model') is shared_model and keys()==grouped_keys
+        assert w.quick.grabFramebuffer().save(str(tmp_path/'grouped-comparison-compact.png'))
+        click(w,group_toggle)
+        wait_for_rendered(lambda:p.options['groupModes'] is False)
+        assert keys()==paired_keys and p.query()==query
     item=rendered('usage-row-'+row['key'])
     position=item.mapToScene(QPointF())
     assert position.x()>=0 and position.x()+item.width()<=w.quick.width()
@@ -423,17 +492,74 @@ def test_grouped_model_effort_metrics_and_drilldown_in_compact_window(dashboard,
     assert len(w.record_rows)==12
     assert all(record[field]==value for record in w.record_rows for field,value in row['filters'].items())
     w.go_back();wait_for_rendered(lambda:w.current_page==1)
-    w.go_back();wait_for_rendered(lambda:p.data.get('dimension')=='service_tier')
+    w.go_back();wait_for_rendered(lambda:p.data.get('dimension')=='project')
     assert p.capture()==scope
+    p.change('filtersOpen','')
+    choice=rendered('usage-filter:service_tier');choice.forceActiveFocus()
+    target=next(i for i,entry in enumerate(choice.property('model')) if entry['value']=='Fast')
+    while choice.property('currentIndex')!=target:
+        prior=choice.property('currentIndex')
+        QTest.keyClick(w.quick,Qt.Key_Down if prior<target else Qt.Key_Up)
+        wait_for_rendered(lambda:choice.property('currentIndex')!=prior)
+    wait_for_rendered(lambda:p.data['summary']['value']==108)
+    assert {row['filters']['service_tier'] for row in p.data['rows']}=={'Fast'}
     assert not w.qml_errors
 
 
-def test_legacy_dimensions_restore_with_fixed_model_effort_pairs(dashboard):
+def test_mode_grouping_preserves_parent_scope_and_selected_metric_order(dashboard,monkeypatch):
+    w=dashboard;source=snapshot();source['sessions']=source['sessions'][:2]
+    samples={
+        'user':[('high','Standard',2,9),('high','Fast',8,2),('low','Standard',6,4),('low','Fast',1,1)],
+        'subagent':[('high','Standard',3,5),('high','Fast',4,7),('low','Standard',7,1),('low','Fast',5,6)]}
+    for session,(parent,groups) in zip(source['sessions'],samples.items()):
+        template=session['history'][0];session['source']=parent;session['history']=[]
+        for effort,mode,count,latency in groups:
+            for index in range(count):
+                session['history'].append(dict(template,key=f'{parent}-{effort}-{mode}-{index}',
+                    turn=f'{effort}-{mode}',effort=effort,service_tier=mode,completion_latency_ms=latency*1000))
+    w.receive(source);w.change_page(1);p=w.metric_panel;p.change('dimension','source')
+    control(w,p);wait_for_rendered(lambda:p.data.get('count')==8)
+    def order():return [(row['group'],row['filters']['effort'],row['filters']['service_tier']) for row in p.data['rows']]
+    def rows(parent,*pairs):return [(parent,effort,mode) for effort,mode in pairs]
+    original={row['key']:(copy.deepcopy(row['filters']),copy.deepcopy(row['metrics'])) for row in p.data['rows']}
+    query=p.query()
+    with monkeypatch.context() as guard:
+        guard.setattr(w,'render',lambda *a,**kw:pytest.fail('Ordering must reuse delivered aggregates'))
+        guard.setattr(w.engine,'page_query',lambda *a,**kw:pytest.fail('Ordering must not read records'))
+        assert order()==rows('subagent',('low','Standard'),('low','Fast'),('high','Standard'),('high','Fast'))+rows(
+            'user',('high','Standard'),('high','Fast'),('low','Standard'),('low','Fast'))
+        p.change('groupModes','true')
+        assert order()==rows('subagent',('low','Standard'),('high','Standard'),('low','Fast'),('high','Fast'))+rows(
+            'user',('low','Standard'),('high','Standard'),('high','Fast'),('low','Fast'))
+        p.change('sort','asc')
+        assert order()==rows('user',('high','Standard'),('low','Standard'),('low','Fast'),('high','Fast'))+rows(
+            'subagent',('high','Standard'),('low','Standard'),('high','Fast'),('low','Fast'))
+        p.change('groupModes','false')
+        assert order()==rows('user',('low','Standard'),('low','Fast'),('high','Standard'),('high','Fast'))+rows(
+            'subagent',('high','Standard'),('high','Fast'),('low','Standard'),('low','Fast'))
+        p.change('metric','latency');p.change('sort','desc')
+        assert order()==rows('subagent',('high','Standard'),('high','Fast'),('low','Standard'),('low','Fast'))+rows(
+            'user',('high','Standard'),('high','Fast'),('low','Standard'),('low','Fast'))
+        p.change('groupModes','true')
+        assert order()==rows('subagent',('high','Standard'),('low','Standard'),('high','Fast'),('low','Fast'))+rows(
+            'user',('high','Standard'),('low','Standard'),('high','Fast'),('low','Fast'))
+        p.change('sort','name')
+        assert order()==rows('subagent',('high','Standard'),('low','Standard'),('high','Fast'),('low','Fast'))+rows(
+            'user',('high','Standard'),('low','Standard'),('high','Fast'),('low','Fast'))
+        p.change('groupModes','false')
+        assert order()==rows('subagent',('high','Standard'),('high','Fast'),('low','Standard'),('low','Fast'))+rows(
+            'user',('high','Standard'),('high','Fast'),('low','Standard'),('low','Fast'))
+        assert {row['key']:(row['filters'],row['metrics']) for row in p.data['rows']}==original
+        assert p.query()==query and p.data['summary']['value']==pytest.approx(139/36)
+    assert not w.qml_errors
+
+
+def test_legacy_dimensions_restore_with_fixed_model_effort_mode_rows(dashboard):
     dashboard.change_page(1);p=dashboard.metric_panel
     for field in ('model','effort','service_tier'):
-        p.restore(dict(dimension=field,filters={'project':'saved-project'},selected=[field,'high']))
-        assert p.options['dimension']==('service_tier' if field=='service_tier' else 'all')
-        assert p.options['filters']=={'project':'saved-project'} and p.options['selected'][0]==field
+        p.restore(dict(dimension=field,filters={'project':'saved-project','service_tier':'Fast'},selected=[field,'high']))
+        assert p.options['dimension']=='all'
+        assert p.options['filters']=={'project':'saved-project','service_tier':'Fast'} and p.options['selected'][0]==field
     assert {choice['key'] for choice in p.state['choices']} >= {'effort','service_tier'}
 
 

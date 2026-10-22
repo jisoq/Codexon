@@ -132,7 +132,7 @@ def display_rows(categories,options,breakdowns):
     order=options.get('sort','desc')
     def rank(value):return (value is None,(value or 0)*(1 if order=='asc' else -1))
     if breakdowns:
-        visible.sort(key=lambda r:(r['group'].casefold(),r['label'].casefold()) if order=='name' else (rank(r['group_value']),r['group'],rank(r['value']),r['label']))
+        visible.sort(key=lambda r:(r['group'].casefold(),r.get('name_order',0),r['label'].casefold()) if order=='name' else (rank(r['group_value']),r['group'],rank(r['value']),r['label']))
     else:
         visible.sort(key=lambda r:str(r['label']).casefold() if order=='name' else rank(r['value']))
     return visible

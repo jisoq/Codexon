@@ -1,9 +1,3 @@
-"""Model/effort comparisons from bounded scalar pages and per-owner aggregates.
-
-The reader actor owns one scope cache. No call bodies or record keys survive a
-page. An admitted writer append certificate permits only an ordinal-tail read;
-corrections and missing certificates rebuild just the affected owner.
-"""
 from array import array
 from copy import deepcopy
 from typing import NamedTuple
@@ -12,6 +6,7 @@ from struct import calcsize
 import sys
 from hashlib import sha256
 import json
+import re
 from math import isfinite
 
 from .analytics import INPUT_BANDS, CACHE_BANDS, condition_match, output_speed, sorted_quantile
@@ -21,12 +16,15 @@ from .prepared_store import CapacityExceeded, _size, pack
 from .prepared_sums import _Sum
 from .pricing import display_tier
 
-DIMENSIONS=('all','project','source','service_tier','home','input_band','cache_band')
+DIMENSIONS=('all','project','source','home','input_band','cache_band')
 METRICS=('calls','cost','cost_per_call','latency','tps','input_per_call','output_per_call','reasoning')
 MEAN_FIELDS=dict(cost_per_call='cost',latency='latency',tps='tps',input_per_call='input',output_per_call='output',reasoning='reasoning')
 MEANS=frozenset(MEAN_FIELDS)
 FIELDS=tuple(dict.fromkeys((*BASE_FIELDS,*SPEED_FIELDS,'cost','input','cached','rate')))
 LIMIT=32*1024*1024
+_FAMILIES={name:i for i,name in enumerate(('astra','sol','terra','luna','daybreak',''))}
+_EFFORTS={name:i for i,name in enumerate(('ultra','max','xhigh','high','medium','low'))}
+_MODE_MARKS={'Standard':'','Fast':' ⚡'}
 
 
 def dependency_stamp(dependencies):
@@ -236,8 +234,15 @@ class _Metric(NamedTuple):
     partial: bool
 
 
+class _ComparisonKey(NamedTuple):
+    parent: str
+    model: str
+    effort: str
+    service_tier: str
+
+
 class _Row(NamedTuple):
-    key: tuple[str,str,str]
+    key: _ComparisonKey
     label: str
     metrics: tuple[_Metric,...]
     boxes: tuple[Box | None,...]
@@ -323,9 +328,9 @@ def mark_bound(rows,metric):
 
 
 def group_key(row,dimension):
-    parent=('전체' if dimension=='all' else display_tier(row) if dimension=='service_tier'
-            else band(row,dimension) if dimension in ('input_band','cache_band') else category(row,dimension))
-    return parent,category(row,'model'),category(row,'effort')
+    parent=('전체' if dimension=='all' else band(row,dimension)
+            if dimension in ('input_band','cache_band') else category(row,dimension))
+    return _ComparisonKey(parent,category(row,'model'),category(row,'effort'),display_tier(row))
 
 
 def add_row(groups,row,dimension,budget):
@@ -455,19 +460,34 @@ def _fold(entries,budget):
     return fold
 
 
+def _name_key(key):
+    model=key.model.casefold();effort=key.effort.casefold()
+    numbered=re.fullmatch(r'gpt-(\d+(?:\.\d+)*)(?:-(.+))?',model)
+    parts=[int(part) for part in numbered[1].split('.')] if numbered else []
+    while parts and parts[-1]==0:parts.pop()
+    version=tuple(-part for part in parts)+(1,) if numbered else ()
+    suffix=(numbered[2] or '') if numbered else model.removeprefix('gpt-')
+    family=suffix.split('-',1)[0]
+    return (numbered is None,version,_FAMILIES.get(family,len(_FAMILIES)),
+            family if family not in _FAMILIES else '',_EFFORTS.get(effort,len(_EFFORTS)),
+            effort,model,key.service_tier.casefold(),key)
+
+
 def _deliver(fold,scope,dimension,options):
     rows=[]
+    name_order={row.key:i for i,row in enumerate(sorted(fold.rows,key=lambda row:_name_key(row.key)))}
     for row in fold.rows:
-        parent,model,effort=row.key
-        filters=dict(model=model,effort=effort)
+        parent,model,effort,service_tier=row.key
+        filters=dict(model=model,effort=effort,service_tier=service_tier)
         if dimension!='all':filters[dimension]=parent
         key=json.dumps(row.key,ensure_ascii=False,separators=(',',':'))
-        rows.append(dict(key=key,label=f'{model} / {effort}',group=parent,group_label=row.label,filters=filters,
+        rows.append(dict(key=key,label=f'{model} / {effort}'+_MODE_MARKS.get(service_tier,f' / {service_tier}'),group=parent,group_label=row.label,
+                         filters=filters,name_order=name_order[row.key],
                          metrics={key:value._asdict() for key,value in zip(METRICS,row.metrics)},
                          distributions={key:box.result() if box else None for key,box in zip(MEAN_FIELDS,row.boxes)},
                          components=[]))
     data=dict(rows=rows,metrics={key:value._asdict() for key,value in zip(METRICS,fold.metrics)},
-              dimension=dimension,cross='model',comparison=True,detail=None,breakdowns=['effort'],
+              dimension=dimension,cross='model',comparison=True,detail=None,breakdowns=['effort','service_tier'],
               population=dict(query=deepcopy(scope),path=['analysis','responses']))
     data=choose_metric(data,options.get('metric','calls'))
     data['rows']=display_rows(data['rows'],options,True);data['count']=len(data['rows'])

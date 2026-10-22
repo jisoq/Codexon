@@ -7,7 +7,7 @@ from .presentation import Node
 from .i18n import tr, language
 from .theme import shared_theme
 
-DIMENSIONS = [('전체','all'),('프로젝트','project'),('작업 종류','source'),('요청 모드','service_tier'),
+DIMENSIONS = [('전체','all'),('프로젝트','project'),('작업 종류','source'),
               ('입력 토큰 규모','input_band'),('캐시 활용 구간','cache_band'),('수집 위치','home')]
 BREAKDOWNS = [('요청 모드','service_tier'),('추론 설정','effort')]
 METRICS = [('호출 수','calls'),('구독 가치 환산액','cost'),('호출당 환산액','cost_per_call'),
@@ -28,6 +28,24 @@ def value_text(value, metric):
     if metric=='calls':return f'{round(value):,}'
     if value>=1e9:return f'{value/1e9:.2f}B'
     return f'{value/1e6:.2f}M' if value>=1e6 else f'{value/1000:.1f}k' if value>=1000 else f'{value:,}'
+
+
+def arrange_comparison_rows(rows,group_modes):
+    parents={}
+    for row in rows:parents.setdefault(row['group'],[]).append(row)
+    def mode_order(row):
+        mode=row['filters']['service_tier']
+        return (0 if mode=='Standard' else 1 if mode=='Fast' else 2,mode.casefold(),mode)
+    arranged=[]
+    for parent in parents.values():
+        buckets={}
+        for row in parent:
+            filters=row['filters']
+            key=filters['service_tier'] if group_modes else (filters['model'],filters['effort'])
+            buckets.setdefault(key,[]).append(row)
+        blocks=sorted(buckets.values(),key=lambda block:mode_order(block[0])) if group_modes else buckets.values()
+        for block in blocks:arranged.extend(block if group_modes else sorted(block,key=mode_order))
+    return arranged
 
 
 class UsageRows(QAbstractListModel):
@@ -66,7 +84,7 @@ class UsagePanel(Node):
     def __init__(self, dashboard):
         super().__init__();self.dashboard=dashboard;self.data={};self.row_model=UsageRows(self)
         self.options=dict(period='all',start='',end='',filters={},archived=True,dimension='project',metric='calls',
-                          mode='amount',search='',sort='desc',selected=[],views={},filtersOpen=False,breakdowns=[],view='chart',showUnknown=False)
+                          mode='amount',search='',sort='desc',selected=[],views={},filtersOpen=False,breakdowns=[],view='chart',showUnknown=False,groupModes=False)
         self.date_draft={key:self.options[key] for key in ('period','start','end')}
         self.search_timer=QTimer(self);self.search_timer.setSingleShot(True);self.search_timer.setInterval(160)
         self.search_timer.timeout.connect(self.present)
@@ -119,6 +137,7 @@ class UsagePanel(Node):
         else:restored.update(dates)
         self.options.update(restored)
         self.options['showUnknown']=self.options['showUnknown'] is True
+        self.options['groupModes']=restored.get('groupModes',False) is True
         self.date_draft=dates if dates['period']=='custom' else {key:self.options[key] for key in ('period','start','end')}
         o=self.options;legacy=o['dimension']
         if legacy not in dict((v,t) for t,v in DIMENSIONS):o['dimension']='all'
@@ -165,7 +184,7 @@ class UsagePanel(Node):
             else:selected.discard(field)
             o['breakdowns']=[key for _,key in BREAKDOWNS if key in selected]
         elif key=='archived':o['archived']=value=='true'
-        elif key=='showUnknown':
+        elif key in ('showUnknown','groupModes'):
             o[key]=value=='true';self.put(options=deepcopy(o));self.present();return
         elif key.startswith('filter:'):
             self.dashboard.push_state();field=key.split(':',1)[1]
@@ -229,6 +248,7 @@ class UsagePanel(Node):
             data=choose_metric(data,self.options['metric'])
             data=dict(data,rows=[row for row in data['rows'] if row['value'] is not None])
         rows=display_rows(data['rows'],self.options,data.get('breakdowns',()))
+        if data.get('comparison'):rows=arrange_comparison_rows(rows,self.options['groupModes'])
         data=dict(data,rows=rows,count=len(rows),maximum=max([r['value'] or 0 for r in rows]+[0]))
         if data.get('comparison'):data['markMaximum']=mark_bound(rows,data['metric'])
         self.data=data;o=self.options;theme=shared_theme()
@@ -286,7 +306,8 @@ class UsagePanel(Node):
                 metrics.append(dict(key=key,title=tr(title),value=text,partial=cell['partial'],
                                     tip=f"{cell['known']:,} / {cell['total']:,}"))
             group=row.get('group_label',row['group']);descriptor=row.get('plot');plot=None
-            tip=tr(TPS) if metric=='tps' else ''
+            tip=' / '.join(row['filters'][field] for field in ('model','effort','service_tier'))
+            if metric=='tps':tip+='\n'+tr(TPS)
             if descriptor:
                 plot=dict(kind='box',mean=row['value']/maximum,
                           **{key:descriptor[key]/maximum for key in ('p10','q1','median','q3','p90')})

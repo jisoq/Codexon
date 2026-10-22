@@ -79,13 +79,20 @@ Item {
             }
             Item {Layout.fillWidth:true}
             UiButton {
+                objectName:'usage-group-modes';text:root.t('모드별 묶기')
+                checkable:true;checked:root.o.groupModes===true
+                onClicked:root.node.change('groupModes',checked?'true':'false')
+                ToolTip.visible:hovered
+                ToolTip.text:root.t('같은 대분류 안에서 Standard 항목을 먼저 모으고 Fast 항목을 이어서 표시합니다. 끄면 같은 모델과 추론 강도의 항목을 나란히 표시합니다.')
+            }
+            UiButton {
                 objectName:'usage-show-unknown';text:root.t('미확인 표시')
                 checkable:true;checked:root.o.showUnknown===true
                 onClicked:root.node.change('showUnknown',checked?'true':'false')
                 ToolTip.visible:hovered
-                ToolTip.text:root.t('모델, 추론 강도 또는 분류가 미확인인 항목을 표시합니다. 전체 합계는 유지됩니다.')
+                ToolTip.text:root.t('모델, 추론 강도, 요청 모드 또는 분류가 미확인인 항목을 표시합니다. 전체 합계는 유지됩니다.')
             }
-            UiInput {objectName:'usage-search';Layout.preferredWidth:165;placeholderText:root.t('항목 검색');text:root.o.search;Accessible.name:root.t('항목 검색');onTextEdited:root.node.change('search',text)}
+            UiInput {objectName:'usage-search';Layout.preferredWidth:165;Layout.minimumWidth:120;Layout.maximumWidth:165;Layout.fillWidth:true;placeholderText:root.t('항목 검색');text:root.o.search;Accessible.name:root.t('항목 검색');onTextEdited:root.node.change('search',text)}
             UiChoice {Layout.preferredWidth:120;model:[root.t('큰 값부터'),root.t('작은 값부터'),root.t('이름순')];currentIndex:['desc','asc','name'].indexOf(root.o.sort);Accessible.name:root.t('항목 정렬');onActivated:root.node.change('sort',['desc','asc','name'][currentIndex])}
         }
         Copy {
@@ -131,7 +138,7 @@ Item {
                             id: chartHeader
                             visible:!root.tableView
                             width:parent.width;height:40;spacing:16
-                            Copy {text:root.t('모델 / 추론 강도');Layout.preferredWidth:180;font.pixelSize:12;color:appTheme.palette.muted}
+                            Copy {text:root.t('모델 / 추론 강도 / 요청 모드');Layout.preferredWidth:180;font.pixelSize:12;color:appTheme.palette.muted}
                             Item {
                                 Layout.fillWidth:true;Layout.preferredHeight:20
                                 Copy {x:root.s.meanMetric?5:0;text:'0';font.pixelSize:12;color:appTheme.palette.muted}
@@ -149,10 +156,10 @@ Item {
                             height:Math.max(40,headerValues.y+headerValues.height+8)
                             Copy {
                                 objectName:'usage-table-label-header'
-                                text:root.t('모델 / 추론 강도');font.pixelSize:12;color:appTheme.palette.muted
+                                text:root.t('모델 / 추론 강도 / 요청 모드');font.pixelSize:12;color:appTheme.palette.muted
                                 width:viewport.stackedLabel?parent.width:viewport.labelWidth
                                 height:viewport.stackedLabel?24:parent.height
-                                elide:Text.ElideRight;wrapMode:Text.NoWrap
+                                wrapMode:Text.Wrap
                             }
                             Item {
                                 id:headerValues
@@ -190,7 +197,7 @@ Item {
                                     objectName:'usage-row-'+modelData.key
                                     readonly property var modelData:groupLine.modelData
                                     width:parent.width
-                                    height:root.tableView?Math.max(54,tableValues.height+(viewport.stackedLabel?tableLabel.implicitHeight+24:16)):54
+                                    height:root.tableView?Math.max(54,tableValues.height+(viewport.stackedLabel?tableLabel.implicitHeight+24:16),tableLabel.implicitHeight+16):Math.max(54,chartLabel.implicitHeight+16)
                                     hoverEnabled:true;activeFocusOnTab:true
                                     Accessible.name:modelData.group+' / '+modelData.label+' '+modelData.value
                                     Accessible.description:modelData.tip+'\n'+modelData.coverage
@@ -199,7 +206,7 @@ Item {
                                     contentItem:Item {
                                         RowLayout {
                                             visible:!root.tableView;anchors.fill:parent;spacing:16
-                                            Copy {text:line.modelData.label;Layout.preferredWidth:180;elide:Text.ElideRight;wrapMode:Text.NoWrap;tip:line.modelData.label}
+                                            Copy {id:chartLabel;objectName:'usage-chart-label';text:line.modelData.label;Layout.preferredWidth:180;tip:line.modelData.tip}
                                             Item {
                                                 id:plotCell
                                                 objectName:'usage-plot-'+line.modelData.key
@@ -244,7 +251,7 @@ Item {
                                                 text:line.modelData.label
                                                 width:viewport.stackedLabel?parent.width-viewport.chevronWidth:viewport.labelWidth
                                                 height:implicitHeight;y:viewport.stackedLabel?8:(parent.height-height)/2
-                                                elide:Text.ElideRight;wrapMode:Text.NoWrap;tip:line.modelData.label
+                                                tip:line.modelData.tip
                                             }
                                             Item {
                                                 id:tableValues
