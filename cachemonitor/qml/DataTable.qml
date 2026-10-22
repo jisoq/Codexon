@@ -118,8 +118,8 @@ Item {
         }
         activeFocusOnTab: true
         property int keyboardColumn: 0
-        onContentYChanged: { root.node.verticalPosition.setValue(contentY); updateVisible() }
-        onContentXChanged: root.node.horizontalPosition.setValue(contentX)
+        onContentYChanged: { root.node.verticalPosition.observe(contentY); updateVisible() }
+        onContentXChanged: root.node.horizontalPosition.observe(contentX)
         onHeightChanged: updateVisible()
         onWidthChanged: forceLayout()
         onRowsChanged: updateVisible()
@@ -330,6 +330,6 @@ Item {
         function onGeometryChanged() { table.forceLayout(); if (root.frozen) firstColumn.forceLayout() }
         function onScrollRequested(row,column) { table.forceLayout(); if (root.frozen && column===0) table.positionViewAtRow(row,TableView.Contain); else table.positionViewAtCell(Qt.point(column,row),TableView.Contain); root.revealRow(row) }
     }
-    Connections { target: root.node.verticalPosition; function onChanged() { table.contentY = root.node.verticalPosition.position } }
-    Connections { target: root.node.horizontalPosition; function onChanged() { table.contentX = root.node.horizontalPosition.position } }
+    Connections { target: root.node.verticalPosition; function onRequested(value) { table.contentY = value } }
+    Connections { target: root.node.horizontalPosition; function onRequested(value) { table.contentX = value } }
 }
