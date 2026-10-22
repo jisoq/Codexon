@@ -402,6 +402,7 @@ def _schema():
         CREATE INDEX calls_ordinal ON calls(owner,m_session_ordinal,identity,batch);
         CREATE INDEX calls_turn ON calls(owner,turn_identity,m_ts,m_session_ordinal,identity,batch);
         CREATE INDEX calls_batch ON calls(batch,owner,identity);
+        CREATE INDEX calls_identity ON calls(identity,owner,batch);
         CREATE INDEX calls_global_time ON calls(m_ts,owner,m_session_ordinal,identity,batch);
         CREATE INDEX calls_dimensions ON calls(m_model,m_service_tier,m_effort,m_ts,owner,m_session_ordinal,identity,batch);
         CREATE INDEX calls_model_mode_time ON calls(m_model,m_service_tier,m_ts,owner,m_session_ordinal,identity,batch);
@@ -535,6 +536,7 @@ class PreparedStore:
                 raise CapacityExceeded('existing prepared database exceeds its page budget')
             # There is one writer lock; an unfinished predecessor cannot still publish.
             with self._transaction():
+                self.db.execute('CREATE INDEX IF NOT EXISTS calls_identity ON calls(identity,owner,batch)')
                 self.db.execute('UPDATE publications SET state=-1 WHERE state=0')
         except BaseException:
             self.close()
@@ -1789,6 +1791,18 @@ class Snapshot:
         self.steps += 1000
         return int(self._expired() or self.steps > self.limits.read_vm_steps)
 
+    @contextmanager
+    def mismatch_shutdown(self, deadline):
+        """Finish an owned archive lease within shutdown's remaining read budget."""
+        cancel,previous=self.cancel,self.deadline
+        self.cancel=None
+        self.deadline=min(previous,deadline)
+        try:
+            self._check()
+            yield
+        finally:
+            self.cancel,self.deadline=cancel,previous
+
     def _visible(self, kind, alias='r', publication='p'):
         return _latest(kind, alias, staged=self.staged_batch is not None,
                        batch=self.staged_batch, publication=publication)
@@ -1934,6 +1948,89 @@ class Snapshot:
                 yield iterator
             finally:
                 iterator.close()
+
+    def _mismatch_owner_tables(self, owners, args):
+        if owners is None:
+            return self._owner_tables(), '1'
+        if not isinstance(owners, (set, frozenset)):
+            raise TypeError('mismatch owners must be a set of owner identities or None')
+        for owner in owners:
+            self._check()
+            if (type(owner) is not tuple or len(owner) != 2 or
+                    any(type(part) is not str for part in owner)):
+                raise TypeError('mismatch owner identities must be exact home and session pairs')
+        args['mismatch_owners'] = json.dumps(tuple(owners), separators=(',', ':'))
+        self._check()
+        batch = '(SELECT h.batch FROM owner_heads h WHERE h.owner=o.id)'
+        if self.staged_batch is not None:
+            batch = ('COALESCE((SELECT x.batch FROM owner_versions x WHERE x.owner=o.id '
+                     f'AND x.batch={int(self.staged_batch)}),{batch})')
+        tables = ('json_each(:mismatch_owners) selected CROSS JOIN owners o CROSS JOIN owner_versions v '
+                  f'LEFT JOIN catalog_orders rank ON rank.owner=o.id AND rank.batch={int(self.order_batch)}')
+        where = ("o.home=json_extract(selected.value,'$[0]') AND o.sid=json_extract(selected.value,'$[1]') "
+                 f'AND v.owner=o.id AND v.batch={batch}')
+        return tables, where
+
+    @_read_operation
+    def mismatch_candidates(self, owners=None, *, after=None):
+        """Page compact alert packets through indexed selected-owner lookups."""
+        from .analysis_delivery import MODEL_KEYS
+        args = dict(ordinal=after[0] if after else 0, owner=after[1] if after else 0,
+                    n=self.limits.page_rows + 1)
+        tables, selected = self._mismatch_owner_tables(owners, args)
+        where = f'({self._rank()},v.owner)>(:ordinal,:owner)' if after is not None else '1'
+        sql = (f'SELECT o.home,o.sid,v.owner,{self._rank()} AS source_ordinal,v.model_alerts '
+               f'FROM {tables} WHERE v.deleted=0 AND {selected} AND {where} '
+               f'ORDER BY {self._rank()},v.owner LIMIT :n')
+        confirmed = MODEL_KEYS.index('model_alert_confirmed')
+        def decode(raw):
+            alerts = unpack(raw['model_alerts'], self.limits) or {}
+            return dict(owner=(raw['home'], raw['sid']),
+                        keys=tuple(key for key, packet in alerts.items() if packet[confirmed]))
+        return self._page(sql, args, decode,
+                          lambda row: (row['source_ordinal'], row['owner']),
+                          lambda row: len(row['model_alerts']) + len(row['home']) * 4 + len(row['sid']) * 4)
+
+    @_read_operation
+    def mismatch_changed_identities(self, owners, *, after=None):
+        """Page present keys from affected owners without hydrating call records.
+
+        Each page visits one owner in catalog order. Empty owners advance the
+        cursor. A real identity can recur when several affected owners contain it.
+        """
+        from .analytics import call_identity
+        if owners is None:
+            raise TypeError('changed mismatch identities require selected owner identities')
+        args = dict(ordinal=after[0] if after else 0, owner=after[1] if after else 0)
+        tables, selected = self._mismatch_owner_tables(owners, args)
+        where = '1'
+        if after is not None:
+            operation = '>=' if after[2] is not None else '>'
+            where = f'({self._rank()},v.owner){operation}(:ordinal,:owner)'
+        sql = (f'SELECT o.home,o.sid,v.owner,{self._rank()} AS source_ordinal '
+               f'FROM {tables} WHERE v.deleted=0 AND {selected} AND {where} '
+               f'ORDER BY {self._rank()},v.owner LIMIT 2')
+        with self._cursor(sql, args) as cursor:
+            owner = cursor.fetchone()
+            more_owners = cursor.fetchone() is not None
+        if owner is None:
+            return Page((), None, True, 0, 0)
+        position = (owner['source_ordinal'], owner['owner'])
+        call_args = dict(owner=owner['owner'], n=self.limits.page_rows + 1)
+        where = ['r.owner=:owner', 'r.deleted=0', self._visible('calls')]
+        if after is not None and after[:2] == position and after[2] is not None:
+            call_args['key'] = after[2]
+            where.append('r.identity>:key')
+        sql = ('SELECT r.identity,r.key_value FROM calls r JOIN publications p ON p.id=r.batch '
+               f'WHERE {" AND ".join(where)} ORDER BY r.identity LIMIT :n')
+        page = self._page(sql, call_args,
+            lambda row: call_identity(owner['home'], owner['sid'],
+                                     unpack(row['key_value'], self.limits, maximum=self.limits.key_bytes)),
+            lambda row: (row['identity'],),
+            lambda row: len(row['key_value']) + len(owner['home']) * 4 + len(owner['sid']) * 4)
+        next_after = (*position, page.after[0] if not page.complete else None)
+        return Page(page.rows, next_after, page.complete and not more_owners,
+                    page.encoded_bytes, page.object_bytes)
 
     @_read_operation
     def owner_revisions(self, owners=None, *, after=None):
@@ -2274,6 +2371,40 @@ class Snapshot:
         metadata = self._call_metadata(meta)
         return self._page(sql,args,lambda row:self._decode_call(row,metadata),
                           lambda row:(row['identity'],),lambda row:row['encoded_bytes'])
+
+    @_read_operation
+    def mismatch_occurrences(self, identity, *, after=None):
+        """Resolve every current full record for one canonical call identity.
+
+        Real response IDs cross session owners within one home. Synthetic record
+        keys remain session scoped. Contradictory occurrences stay separate.
+        """
+        if (type(identity) is not tuple or len(identity) not in (2, 3) or
+                type(identity[0]) is not str or
+                len(identity) == 3 and type(identity[1]) is not str):
+            raise ValueError('mismatch identity must be an exact canonical call identity')
+        scoped = str(identity[-1]).startswith(('record:', 'legacy:'))
+        if scoped != (len(identity) == 3):
+            raise ValueError('mismatch identity has the wrong owner scope')
+        args = dict(home=identity[0], n=self.limits.page_rows + 1)
+        key = self._keys((identity[-1],), args)
+        where = [f'r.identity IN ({key})', 'r.owner=o.id', 'o.home=:home', 'v.deleted=0',
+                 'r.deleted=0', self._visible('calls')]
+        if scoped:
+            args['sid'] = identity[1]
+            where.append('o.sid=:sid')
+        if after is not None:
+            args['after'] = after[0]
+            where.append('r.owner>:after')
+        sql = ('SELECT r.*,o.home AS current_home,o.sid AS current_sid,v.metadata,v.call_metadata '
+               f'FROM calls r INDEXED BY calls_identity CROSS JOIN {self._owner_tables()} '
+               f'JOIN publications p ON p.id=r.batch WHERE {" AND ".join(where)} '
+               'ORDER BY r.owner LIMIT :n')
+        def decode(row):
+            return dict(self._decode_call(row, self._call_metadata(row)),
+                        home=row['current_home'], sid=row['current_sid'])
+        return self._page(sql, args, decode, lambda row: (row['owner'],),
+                          lambda row: row['encoded_bytes'] + len(row['metadata']) + len(row['call_metadata']))
 
     def _decode_request(self, row):
         result = _detail_unpack(row['detail'], self.limits)

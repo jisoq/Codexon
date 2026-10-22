@@ -5,7 +5,7 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 from cachemonitor.settings_page import SettingsPage
 from cachemonitor.dashboard import Dashboard
-from cachemonitor.quick_qa import control,click,render_plot,walk,table_view,scene_view
+from cachemonitor.quick_qa import control,click,render_plot,walk,table_view,scene_view,dispose
 from cachemonitor.i18n import set_language
 
 
@@ -32,7 +32,8 @@ def startup_settings_window(tmp_path,monkeypatch):
         window.resize(900,620);window.show();window.open_settings();window.settings_page.reveal('general')
         yield window,registrations
     finally:
-        window.quit_app();app.setProperty('cachemonitorDisableShellIntegration',previous)
+        window.quitting=True;window.tick.stop();window.tray.hide();window.observer_panel.stop()
+        dispose(window);app.setProperty('cachemonitorDisableShellIntegration',previous)
 
 
 @pytest.mark.integration
@@ -243,7 +244,7 @@ def test_search_navigation_and_preserved_preferences(tmp_path,monkeypatch,langua
         assert values==[option.isChecked() for option in window.notification_options.values()]
         assert not hasattr(window,'cache_panel')
         assert not hasattr(window,'cache_master')
-        assert window.nav.count()==4
+        assert window.nav.count()==5
         calls=[];monkeypatch.setattr('cachemonitor.update_panel.open_recovery',lambda *args:calls.append(args))
         page.reveal('troubleshooting');click(window,render_plot(window,window.recovery_button));assert len(calls)==1
         page.search.setText('cache');page.navigation.choose(page.navigation.currentRow())
@@ -253,7 +254,8 @@ def test_search_navigation_and_preserved_preferences(tmp_path,monkeypatch,langua
         assert isinstance(state['settings_scrolls'],dict)
         assert not window.qml_errors
     finally:
-        window.quit_app();set_language('ko');app.setProperty('cachemonitorDisableShellIntegration',previous)
+        window.quitting=True;window.tick.stop();window.tray.hide();window.observer_panel.stop()
+        dispose(window);set_language('ko');app.setProperty('cachemonitorDisableShellIntegration',previous)
 
 
 @pytest.mark.integration

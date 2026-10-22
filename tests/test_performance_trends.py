@@ -709,7 +709,7 @@ def test_dashboard_tab_worker_contract_and_navigation(tmp_path):
         session.add_usage(1800000000,'r',dict(input_tokens=100,cached_input_tokens=90,cache_write_input_tokens=0,output_tokens=50,reasoning_output_tokens=10),'gpt-6-astra','t','high','Standard')
         session.add_usage(1800000001,'r2',dict(input_tokens=100,cached_input_tokens=90,cache_write_input_tokens=0,output_tokens=50,reasoning_output_tokens=10),'gpt-6.1-sol','t2','high','Standard')
         w.receive(dict(ts=1800100000,sessions=[session.view(1800100000)],homes=['synthetic'],errors=[],unassigned=[],index={'loading':True}))
-        assert w.navigation_pages==(6,3,1,5)
+        assert w.navigation_pages==(6,3,1,5,7)
         w.nav.setCurrentRow(w.navigation_pages.index(5))
         assert w.current_page==5 and not w.common_filters.isVisible()
         assert w.performance_panel.plots['cost'].rows
