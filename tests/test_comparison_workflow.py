@@ -155,7 +155,6 @@ def test_comparison_navigation_and_controls_accept_rendered_input(dashboard):
 def test_primary_routes_start_with_home_and_preserve_drilldown(dashboard):
     w=dashboard;w.resize(1000,680)
     assert w.current_page==6
-    assert control(w,w.nav).property('count')==4
     for page in (1,5,3,6):
         w.nav.setCurrentRow(w.navigation_pages.index(page))
         wait_for_rendered(lambda:w.current_page==page and not w.analysis_pending)

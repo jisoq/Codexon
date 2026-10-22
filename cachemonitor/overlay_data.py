@@ -246,7 +246,7 @@ def merge_model_breakdowns(summaries):
     return sorted(result,key=lambda value:(-(value['cost'] or 0),value['model']))
 
 
-SUBAGENT_CALL_FIELDS=('model','effort','mode','response_model','model_state','model_mismatch','latest_ts','output_speed_summary')
+SUBAGENT_CALL_FIELDS=('model','requested_model','effort','mode','response_model','model_state','model_mismatch','model_alert_confirmed','latest_ts','output_speed_summary')
 
 
 def _subagent_finance(summaries,cost):
@@ -350,8 +350,8 @@ def call_summary(row, ordinal, *, miss=False, degradation=False):
     result.update(id=_call_id(row), ordinal=ordinal,output_speed=output_speed(row),
         model=canonical_model(row),
         configured_model=row.get('configured_model') or row.get('model'), model_setting=row.get('model_source')=='settings' or not bool(row.get('requested_model')) and bool(row.get('model')),
-        response_model=row.get('response_model') or None,
-        model_mismatch=model_mismatch,
+        requested_model=row.get('requested_model'),response_model=row.get('response_model') or None,
+        model_mismatch=model_mismatch,model_alert_confirmed=model_mismatch,
         model_state=model_state, effort=row.get('effort') or '미확인', mode=request_tier(row),
         response_mode=request_tier({'service_tier':row.get('response_service_tier')}),
         transport_kind=row.get('transport'), transport=transport_label(row), transport_state=transport_state,
@@ -398,6 +398,8 @@ def _summary_view(session,latest,recent,facts,*,request,misses,health,degradatio
     return {'id': session['id'], 'home': session['home'],
             'title': ' '.join((session.get('title') or '').split()),
             'model': latest_call.get('model','미확인'), 'model_setting': latest_call.get('model_setting',False),
+            'requested_model':latest_call.get('requested_model'),
+            'model_alert_confirmed':latest_call.get('model_alert_confirmed',False),
             'response_model': latest_call.get('response_model'),
             'model_mismatch': latest_call.get('model_mismatch',False),
             'model_state': latest_call.get('model_state','미확인'),
@@ -566,7 +568,7 @@ class OverlaySummaries:
                 value['main_usage']={field:summary[field] for field in (
                     'calls','priced','missing','mean_cost','assumed','coverage_gap',
                     'token_composition','cost_composition','output_speed_summary',
-                    'model','effort','mode','model_state','model_mismatch','response_model') if field in summary}
+                    'model','requested_model','effort','mode','model_state','model_mismatch','model_alert_confirmed','response_model') if field in summary}
                 value['main_usage'].update({field:partials[key][field] for field in (
                     'maintenance_calls','maintenance_cost','maintenance_missing')})
                 value['main_usage']['cost']=group['own_cost']
@@ -580,7 +582,7 @@ class OverlaySummaries:
                              active_requests=sum(updated[m][1]['request'].get('state')=='진행' for m in group['members']),
                              **compositions)
                 if recent:
-                    value.update({k:recent[-1].get(k) for k in ('model','model_setting','response_model','model_mismatch','model_state','effort','mode','response_mode','transport','transport_state','cache_rate')})
+                    value.update({k:recent[-1].get(k) for k in ('model','requested_model','model_setting','response_model','model_mismatch','model_alert_confirmed','model_state','effort','mode','response_mode','transport','transport_state','cache_rate')})
                     value.update(latest_cost=recent[-1].get('cost'),latest_ts=recent[-1].get('ts'),latest_key=recent[-1].get('key'))
             merged[key]=previous if previous and previous[0]==signature else (signature,value)
             result.append(value)

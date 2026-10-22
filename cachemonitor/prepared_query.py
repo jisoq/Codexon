@@ -1,4 +1,6 @@
 """Version-bound operations executed exclusively by the read actor."""
+from pathlib import Path
+import sqlite3
 from .prepared_changes import GenerationJournal
 from .analysis_engine import retained_bytes
 from .prepared_analysis import PreparedAnalysisEngine
@@ -70,6 +72,9 @@ class PreparedQuery:
         from .prepared_overlays import FinanceCache
         self.path=path
         self.engine=None
+        from .mismatch_history import MismatchReader
+        archive_name=Path(path).name.removesuffix('.prepared.sqlite')+'.mismatches.sqlite'
+        self.mismatches=MismatchReader(Path(path).with_name(archive_name))
         self.finance_cache=FinanceCache()
 
     def _engine(self,token,cancel,changes=(),query=None):
@@ -120,6 +125,14 @@ class PreparedQuery:
         return self._call(message,token,cancel)
 
     def _call(self,message,token,cancel):
+        if message['kind'] in ('mismatch_page','mismatch_record'):
+            kind=message['kind']
+            try:
+                result=(self.mismatches.window(start=message.get('start',0),size=message.get('size',128),cancel=cancel)
+                        if kind=='mismatch_page' else self.mismatches.record(message['identity'],cancel=cancel))
+                return dict(kind=kind,id=message['id'],**result)
+            except (OSError,ValueError,sqlite3.Error) as error:
+                return dict(kind=kind,id=message['id'],error=str(error))
         token=token_value(token)
         cancellation=_Cancellation(cancel)
         kind=message['kind']
@@ -180,6 +193,7 @@ class PreparedQuery:
             return dict(kind='stale',consumer=kind,id=message['id'],prepared_token=tuple_token(token))
 
     def close(self):
+        self.mismatches.close()
         self.finance_cache.clear()
         if self.engine is not None:
             self.engine.close();self.engine=None

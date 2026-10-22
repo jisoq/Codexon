@@ -109,7 +109,8 @@ class PreparedWriter:
             raise ValueError('notification floor must be a finite timestamp')
         self.cache_floor=value
 
-    def _maintain(self,store):
+    def _maintain(self,store,archive=None):
+        if archive is not None and archive.has_work:archive.step()
         deadline=time.monotonic()+.02
         while not self.stopped.is_set():
             try:
@@ -134,11 +135,13 @@ class PreparedWriter:
             return False
 
     def _run(self):
-        collector = ledger = store = speed_writer = None
+        collector = ledger = store = speed_writer = archive = None
         try:
             from .prepared_delivery import PreparedPublisher
             from .quota_diagnostics import StageTimings
             homes,index_path,model_evidence_path,quota_path = self.arguments
+            from .mismatch_history import MismatchArchive,archive_path
+            archive = MismatchArchive(archive_path(quota_path),self.stopped.is_set)
             collector = CollectionClient(homes,index_path,model_evidence_path)
             store = PreparedStore(self.path,replace(Limits(),read_seconds=60,read_vm_steps=20_000_000))
             from .prepared_speed_writer import PreparedSpeedWriter
@@ -207,7 +210,7 @@ class PreparedWriter:
                 if (snapshot is None or publisher.token!=store.token or
                         not store.db.execute('SELECT ready FROM meta WHERE singleton=1').fetchone()[0]):
                     return
-                value=dict(snapshot,ledger_status_known=(imported and not ledger_pending) or ledger is None,
+                value=dict(snapshot,mismatch_history=archive.health(),ledger_status_known=(imported and not ledger_pending) or ledger is None,
                            ledger_fault=dict(ledger_failed=bool(ledger_issue)))
                 if ledger_issue:
                     value['ledger_error']=ledger_issue
@@ -236,6 +239,15 @@ class PreparedWriter:
                     if cycle is None:timing(active)
                 delivery_delta=None
                 pending_reset=False
+
+            def capture_archive(owners=None):
+                scope=store.read_current(cancel=self.stopped)
+                view=scope.__enter__()
+                try:
+                    return archive.capture(view,owners=owners,release=lambda:scope.__exit__(None,None,None))
+                except BaseException:
+                    scope.__exit__(None,None,None)
+                    raise
 
             def sync_ledger():
                 active=cycle or StageTimings()
@@ -304,6 +316,17 @@ class PreparedWriter:
                 next_import=time.monotonic()+.05
 
             while not self.stopped.is_set():
+                if time.monotonic()>=archive.retry_at:
+                    previous_health=archive.health()
+                    archive.retry()
+                    if archive.health()!=previous_health:publish()
+                previous_health=archive.health()
+                if archive.has_work:
+                    archive.step()
+                elif (archive.needs_scan and not archive.error and snapshot is not None
+                      and store.db.execute('SELECT ready FROM meta WHERE singleton=1').fetchone()[0]):
+                    capture_archive()
+                if archive.health()!=previous_health:publish()
                 if self.control.receiver.poll():
                     commands=self.control.take()
                     if 'stop' in commands:
@@ -332,8 +355,10 @@ class PreparedWriter:
                         'SELECT ready FROM meta WHERE singleton=1').fetchone()[0]) if self.frozen.is_set() else False
                 if self.frozen.is_set() and not incomplete:
                     if maintenance_due:
-                        maintenance_due=self._maintain(store)
-                    wait([self.control.receiver],timeout=.05 if maintenance_due else None)
+                        maintenance_due=self._maintain(store,archive)
+                    archive_delay=min(.05 if maintenance_due or archive.has_work else float('inf'),
+                                      max(0,archive.retry_at-time.monotonic()))
+                    wait([self.control.receiver],timeout=None if archive_delay==float('inf') else archive_delay)
                     continue
                 now=time.monotonic()
                 if ledger is None and now>=ledger_retry:
@@ -392,7 +417,7 @@ class PreparedWriter:
                                     if not change['ready']:
                                         # Keep a large one-time conversion's cleanup
                                         # debt within one admitted cohort.
-                                        while self._maintain(store):
+                                        while self._maintain(store,archive):
                                             if self.stopped.is_set():
                                                 raise InterruptedError('prepared conversion cleanup cancelled')
                                         maintenance_due=False
@@ -401,6 +426,7 @@ class PreparedWriter:
                                 cycle.counts[name]=getattr(coordinator,'metrics',{}).get(name,0)
                             with cycle.measure('current_speeds'):
                                 coordinator.current_speeds()
+                            capture_archive(frozenset(pending_changed|pending_removed))
                             previous=publisher.token
                             with cycle.measure('publication_adopt'):
                                 if blocked_publication!=store.token:
@@ -468,9 +494,9 @@ class PreparedWriter:
                     import_step()
                     if imported or ledger is None:publish()
                 if maintenance_due:
-                    maintenance_due=self._maintain(store)
-                delay=max(0,next_poll-time.monotonic())
-                if maintenance_due:delay=min(delay,.05)
+                    maintenance_due=self._maintain(store,archive)
+                delay=min(max(0,next_poll-time.monotonic()),max(0,archive.retry_at-time.monotonic()))
+                if maintenance_due or archive.has_work:delay=min(delay,.05)
                 if ledger is None:
                     delay=min(delay,max(0,ledger_retry-time.monotonic()))
                 elif snapshot is not None and not imported and not snapshot['index'].get('loading'):
@@ -494,6 +520,7 @@ class PreparedWriter:
             if speed_writer is not None:
                 try:speed_writer.close()
                 except WriteDeferred:pass  # Startup retires the uncommitted stage.
+            if archive is not None:archive.close()
             if store is not None:store.close()
 
     def close(self):
@@ -537,7 +564,7 @@ def process_main(connection,homes,index_path,model_evidence_path,quota_path,cach
                     if kind=='freeze':writer.freeze()
                     elif kind=='sync':writer.sync()
                     elif kind=='cache_floor':writer.set_cache_floor(message['value'])
-                    elif kind in ('query','record','population','overlay_detail'):
+                    elif kind in ('query','record','population','overlay_detail','mismatch_page','mismatch_record'):
                         pending[kind]=message
                         if kind=='query':
                             latest_query=message;blocked_query_token=None
@@ -559,6 +586,10 @@ def process_main(connection,homes,index_path,model_evidence_path,quota_path,cach
                         continue
                     connection.send(message)
                     if message['kind']=='fatal':return None
+            for archive_kind in ('mismatch_page','mismatch_record'):
+                if archive_kind in pending:
+                    consumer=detail_actor if archive_kind=='mismatch_record' else actor
+                    consumer.submit(pending.pop(archive_kind),None)
             if current is not None:
                 for kind,message in tuple(pending.items()):
                     if kind=='query' and blocked_query_token==tuple_token(current):continue

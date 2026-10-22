@@ -343,7 +343,8 @@ def test_transport_wire_evidence_priority_conflict_scope_and_missing_model(tmp_p
 
 def test_evidence_does_not_persist_untrusted_strings(tmp_path):
     store=EvidenceStore(tmp_path/'e.sqlite')
-    store.write(tmp_path,'a',1,'WebSocket','r','model\nAuthorization: SECRET','{"prompt":"PRIVATE"}','arbitrary')
+    store.write(tmp_path,'a',1,'WebSocket','r','model\nAuthorization: SECRET','{"prompt":"PRIVATE"}','arbitrary',
+        requested_effort='PRIVATE prompt',response_effort='PRIVATE\noutput')
     text=json.dumps(store.db.execute('select * from model_observations').fetchall())
     store.close()
     assert 'SECRET' not in text and 'PRIVATE' not in text
@@ -389,4 +390,167 @@ def test_request_tier_is_joined_by_response_id_and_never_replaced_by_response_ti
         store.write(home,'c',3,'HTTP/SSE','r','m','m','completed',requested_service_tier='default')
         reader.poll();row=reader.enrich(home,[{'key':'r'}])[0]
         assert row['service_tier']=='미확인' and row['mode_evidence']=='요청 등급 관측 충돌'
+    finally:reader.close();store.close()
+
+
+def test_effort_sides_keep_wire_and_context_provenance_independent(tmp_path):
+    store=EvidenceStore(tmp_path/'effort.sqlite');reader=EvidenceReader(store.path);home=tmp_path/'home'
+    try:
+        store.write(home,'wire',1,'HTTP/SSE','wire','requested','actual','completed',
+            requested_effort='high',response_effort='low')
+        store.write(home,'absent',2,'HTTP/SSE','absent','requested','actual','completed')
+        reader.poll()
+        wire,absent=reader.enrich(home,[dict(key='wire',effort='medium'),dict(key='absent',effort='medium')])
+        assert wire['requested_effort']==wire['effort']=='high'
+        assert wire['requested_effort_source']=='wire' and wire['configured_effort']=='medium'
+        assert wire['response_effort']=='low' and wire['response_effort_source']=='wire'
+        assert wire['response_effort_confirmed'] and wire['model_alert_confirmed']
+        assert absent['requested_effort']==absent['effort']=='medium'
+        assert absent['requested_effort_source']=='turn_context'
+        assert absent['response_effort']=='' and absent['response_effort_source']=='unknown'
+        assert not absent['response_effort_confirmed'] and absent['model_alert_confirmed']
+        assert reader.enrich(home,[wire])[0]['configured_effort']=='medium'
+    finally:reader.close();store.close()
+
+
+def test_effort_conflicts_are_independent_and_never_revoke_model_confirmation(tmp_path):
+    store=EvidenceStore(tmp_path/'conflicts.sqlite');reader=EvidenceReader(store.path);home=tmp_path/'home'
+    try:
+        cases=[('request-values',dict(requested_effort='high',response_effort='low'),
+                 dict(requested_effort='medium',response_effort='low')),
+               ('request-flag',dict(requested_effort_conflict=True,response_effort='low'),{}),
+               ('response-values',dict(requested_effort='high',response_effort='low'),
+                 dict(requested_effort='high',response_effort='medium')),
+               ('response-flag',dict(requested_effort='high',response_effort='low',response_effort_conflict=True),{})]
+        for key,first,second in cases:
+            store.write(home,key+'-a',1,'WebSocket',key,'requested','actual','completed',**first)
+            if second:store.write(home,key+'-b',2,'WebSocket',key,'requested','actual','completed',**second)
+        reader.poll()
+        for key,_,_ in cases:
+            row=reader.enrich(home,[dict(key=key,effort='medium')])[0]
+            assert row['model_alert_confirmed'] and row['model_match']=='불일치'
+            if key.startswith('request'):
+                assert row['requested_effort_conflict'] and row['requested_effort_source']=='conflict'
+                assert row['requested_effort']=='' and row['effort']=='미확인'
+                assert not row['response_effort_conflict'] and row['response_effort_confirmed']
+            else:
+                assert row['response_effort_conflict'] and row['response_effort_source']=='conflict'
+                assert row['response_effort']=='' and not row['response_effort_confirmed']
+                assert not row['requested_effort_conflict'] and row['requested_effort']=='high'
+    finally:reader.close();store.close()
+
+
+def test_response_effort_requires_completed_join_without_observation_gaps(tmp_path):
+    store=EvidenceStore(tmp_path/'unconfirmed.sqlite');reader=EvidenceReader(store.path);home=tmp_path/'home'
+    try:
+        for key,requested,status,missing in [('pending','requested','created',False),
+                ('unpaired','','completed',False),('gap','requested','completed',True)]:
+            store.write(home,key,1,'HTTP/SSE',key,requested,'actual',status,
+                response_effort='low',observation_missing=missing)
+        reader.poll()
+        for key in ('pending','unpaired','gap'):
+            row=reader.enrich(home,[dict(key=key,effort='high')])[0]
+            assert row['response_effort']=='low' and row['response_effort_source']=='wire'
+            assert not row['response_effort_confirmed']
+    finally:reader.close();store.close()
+
+
+def test_effort_legacy_read_defaults_and_additive_upgrade(tmp_path):
+    import sqlite3
+    from cachemonitor.model_evidence import home_key
+    path=tmp_path/'legacy.sqlite';home=tmp_path/'home'
+    with sqlite3.connect(path) as db:
+        db.execute('CREATE TABLE model_observations(seq INTEGER PRIMARY KEY AUTOINCREMENT,home TEXT NOT NULL,'
+            'attempt TEXT NOT NULL,ts REAL NOT NULL,transport TEXT NOT NULL,response_id TEXT NOT NULL,'
+            'requested_model TEXT NOT NULL,response_model TEXT NOT NULL,status TEXT NOT NULL,conflict INTEGER NOT NULL)')
+        db.execute('INSERT INTO model_observations(home,attempt,ts,transport,response_id,requested_model,response_model,status,conflict) '
+            'VALUES(?,?,?,?,?,?,?,?,?)',(home_key(home),'a',1,'HTTP/SSE','r','requested','actual','completed',0))
+    reader=EvidenceReader(path)
+    try:
+        reader.poll();before=reader.enrich(home,[dict(key='r',effort='medium')])[0]
+        assert not reader.error and before['requested_effort_source']=='turn_context'
+        assert before['response_effort']=='' and not before['response_effort_confirmed']
+    finally:reader.close()
+    store=EvidenceStore(path);reader=EvidenceReader(path)
+    try:
+        reader.poll();assert reader.enrich(home,[dict(key='r',effort='medium')])[0]==before
+        store.db.execute('INSERT INTO model_observations(home,attempt,ts,transport,response_id,requested_model,response_model,status,conflict) '
+            'VALUES(?,?,?,?,?,?,?,?,?)',(home_key(home),'old-writer',2,'HTTP/SSE','old','requested','actual','completed',0))
+        store.db.commit();reader.poll()
+        old=reader.enrich(home,[dict(key='old',effort='medium')])[0]
+        assert old['requested_effort']=='medium' and old['response_effort']==''
+        store.write(home,'new',3,'HTTP/SSE','new','requested','actual','completed',requested_effort='high',response_effort='low')
+        reader.poll();assert reader.enrich(home,[dict(key='new')])[0]['response_effort_confirmed']
+    finally:reader.close();store.close()
+
+
+def test_bounded_effort_witnesses_preserve_middle_conflicts_and_missing_values(tmp_path,monkeypatch):
+    from cachemonitor.model_evidence import home_key
+    store=EvidenceStore(tmp_path/'bounded.sqlite');reader=EvidenceReader(store.path);home=tmp_path/'home'
+    cases=('request-values','response-values','response-flag','absent-response')
+    try:
+        for key in cases:
+            for n in range(129):
+                efforts=dict(requested_effort='high',response_effort='low')
+                if n==63:
+                    if key=='request-values':efforts['requested_effort']='medium'
+                    elif key=='response-values':efforts['response_effort']='medium'
+                    elif key=='response-flag':efforts['response_effort_conflict']=True
+                    else:efforts['response_effort']=''
+                store.write(home,key+str(n),n,'HTTP/SSE',key,'requested','actual','completed',**efforts)
+        reader.poll();rows=[dict(key=key,effort='medium') for key in cases]
+        assert all(len(selected)<=48 for _,selected in reader.evidence_rows(home_key(home),rows))
+        actual=reader.enrich(home,rows)
+        assert actual[0]['requested_effort_conflict'] and actual[0]['response_effort_confirmed']
+        assert actual[1]['response_effort_conflict'] and actual[2]['response_effort_conflict']
+        assert not actual[3]['response_effort_conflict'] and not actual[3]['response_effort_confirmed']
+        assert all(row['model_alert_confirmed'] for row in actual)
+        full={key:[dict(row) for row in reader.db.execute('SELECT * FROM model_observations WHERE response_id=?',(key,))]
+              for key in cases}
+        monkeypatch.setattr(reader,'evidence_rows',lambda home,rows:((row,full[row['key']]) for row in rows))
+        assert reader.enrich(home,rows)==actual
+    finally:reader.close();store.close()
+
+
+def test_effort_only_correction_refreshes_index_analysis_and_restart(tmp_path):
+    home,_=fixture_home(tmp_path);path=tmp_path/'index.sqlite'
+    index=UsageIndex([home],path);store=EvidenceStore(tmp_path/'model-evidence.sqlite');engine=AnalysisEngine()
+    try:
+        initial=finish(index)['sessions'];key=initial[0]['history'][0]['key']
+        store.write(home,'attempt',10000,'HTTP/SSE',key,'gpt-6-astra','gpt-5.6-luna','completed',
+            requested_effort='high',response_effort='low')
+        first=finish(index,10011)['sessions'];assert engine.ingest(first)
+        store.db.execute("UPDATE model_observations SET response_effort='medium' WHERE response_id=?",(key,))
+        store.db.commit()
+        second=finish(index,10012)['sessions']
+        assert second[0]['usage_revision']>first[0]['usage_revision'] and engine.ingest(second)
+        assert first[0]['history'][0]['response_effort']=='low'
+        assert second[0]['history'][0]['response_effort']=='medium'
+        assert second[0]['history'][0]['model_alert_confirmed']
+        assert second[0]['history'][0]['effort']=='high'
+    finally:index.close();store.close()
+    restored=UsageIndex([home],path)
+    try:
+        row=finish(restored,10013)['sessions'][0]['history'][0]
+        assert row['response_effort']=='medium' and row['response_effort_confirmed']
+    finally:restored.close()
+
+
+def test_tracker_keeps_effort_when_events_omit_it_and_isolates_replay_conflicts(tmp_path):
+    from cachemonitor.model_proxy import Tracker
+    store=EvidenceStore(tmp_path/'tracker.sqlite');reader=EvidenceReader(store.path);home=tmp_path/'home'
+    tracker=Tracker(store,home,'WebSocket',dict(requests=0,responses=0,storage_errors=0))
+    try:
+        tracker.request(dict(model='requested',reasoning=dict(effort='high')))
+        tracker.response(dict(type='response.created',response=dict(id='r',model='actual',reasoning=dict(effort='low'))))
+        tracker.response(dict(type='response.completed',response=dict(id='r',model='actual')))
+        reader.poll();first=reader.enrich(home,[dict(key='r')])[0]
+        assert first['requested_effort']=='high' and first['response_effort']=='low' and first['response_effort_confirmed']
+        tracker.request(dict(model='next',reasoning=dict(effort='medium')))
+        tracker.response(dict(type='response.completed',response=dict(id='r',model='actual',reasoning=dict(effort='medium'))))
+        reader.poll();second=reader.enrich(home,[dict(key='r')])[0]
+        assert second['response_effort_conflict'] and not second['requested_effort_conflict']
+        assert second['model_alert_confirmed'] and not second['response_effort_confirmed']
+        assert sum(map(len,tracker.pending.values()))==1
+        assert not tracker.completed['r']['conflict']
     finally:reader.close();store.close()

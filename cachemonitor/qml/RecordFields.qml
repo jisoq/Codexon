@@ -5,6 +5,13 @@ ColumnLayout {
     id: root
     required property var node
     spacing: 12
+    function fieldText(field) {
+        if (!field.textRuns || !field.textRuns.length) return field.value
+        return field.textRuns.map(run => {
+            let value=String(run.text).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;")
+            return run.color ? '<font color="'+(appTheme.palette && appTheme.color(run.color))+'">'+value+'</font>' : value
+        }).join("")
+    }
     Repeater {
         model: root.node.state.fields || []
         RowLayout {
@@ -18,7 +25,7 @@ ColumnLayout {
             TextEdit {
                 objectName: "record-field-value"
                 Layout.fillWidth: true; Layout.minimumWidth: 0
-                text: modelData.value; textFormat: TextEdit.PlainText; wrapMode: TextEdit.WrapAnywhere
+                text: root.fieldText(modelData); textFormat: modelData.textRuns && modelData.textRuns.length ? TextEdit.RichText : TextEdit.PlainText; wrapMode: TextEdit.WrapAnywhere
                 readOnly: true; selectByMouse: true; activeFocusOnTab: true
                 font.family: appTheme.family; font.pixelSize: 14; color: appTheme.palette.ink
                 selectionColor: appTheme.palette.selection; selectedTextColor: appTheme.palette.ink

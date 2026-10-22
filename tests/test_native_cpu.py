@@ -31,6 +31,19 @@ def test_metadata_matches_streaming_validation(native, data):
     assert message_metadata(data) == _python_message_metadata(data)
 
 
+@pytest.mark.parametrize('effort', ['high', 'x' * 256, 'x' * 257, None, True, 7, ['high'], {'effort':'high'}])
+def test_native_effort_matches_selected_streaming_fields(native, effort):
+    data=json.dumps(dict(reasoning=dict(effort=effort,summary='PRIVATE'),
+        response=dict(id='r',reasoning=dict(effort=effort,encrypted_content='PRIVATE')),
+        input=[dict(reasoning=dict(effort='PRIVATE'))])).encode()
+    expected=dict(response=dict(id='r'))
+    if isinstance(effort,str) and len(effort)<=256:
+        expected['reasoning']=dict(effort=effort)
+        expected['response']['reasoning']=dict(effort=effort)
+    assert native.message_metadata(data)==expected
+    assert _python_message_metadata(data)==expected
+
+
 def test_metadata_random_nested_payloads_and_text_input(native):
     rng = random.Random(7)
     for _ in range(50):

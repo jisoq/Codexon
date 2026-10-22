@@ -163,10 +163,8 @@ def paint(d,m):
     d.text(money(m.total_cost()),MARGIN+56,g['total'],total_width,28,22,weight=600)
     displayed=m.displayed_call()
     for (key,label),y in zip(CHARTS,g['charts']):_chart(d,m,rows,key,label,y,g['chart_height'],displayed)
-    displayed=m.latest_call()
     y=g['main'];mark=agent_mark(data.get('id'),m.appearance)
-    if m.agent_highlight_opacity>0 and displayed and (displayed.get('home'),displayed.get('sid'))==(data.get('home'),data.get('id')):
-        d.rect(MARGIN,y,SECTION_WIDTH,g['main_height'],mark.color,5,alpha=m.agent_highlight_opacity)
+    d.row_glow(MARGIN,y,SECTION_WIDTH,g['main_height'],m.row_glow_opacity((data.get('home'),data.get('id'))))
     d.line(MARGIN,y-6,RIGHT,y-6)
     paint_items(d,[(item[0],item[1]+MARGIN,item[2]+y,*item[3:])
                    for item in m.agent_summary_items(own,'Main Agent',mark,m.main_expanded,SECTION_WIDTH,main=True)])

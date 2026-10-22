@@ -103,6 +103,9 @@ class Theme(QObject):
         if value.startswith('model-mode:'):
             _,mode,name=value.split(':',2)
             return self.model_mode_color(name,mode)
+        if value.startswith('agent:'):
+            from .overlay_icons import agent_mark
+            return agent_mark(value[6:],self.appearance).color
         if value.startswith('model:'):return self.model_color(value[6:])
         if value in self._palette:return self._palette[value]
         if value=='transparent':return value

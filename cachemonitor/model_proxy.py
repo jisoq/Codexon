@@ -69,10 +69,26 @@ class Tracker:
             self.health['storage_errors'] += 1
             self.health['storage_failure_streak'] = self.health.get('storage_failure_streak', 0)+1
 
+    @staticmethod
+    def effort(obj):
+        reasoning=obj.get('reasoning')
+        return identifier(reasoning.get('effort')) if isinstance(reasoning,dict) else ''
+
+    def response_effort(self,record,response):
+        effort=self.effort(response)
+        if not effort:return False
+        if record['response_effort'] and record['response_effort']!=effort:
+            record['response_effort_conflict']=True
+        if record['response_effort']==effort:return False
+        record['response_effort']=effort
+        return True
+
     def request(self, obj):
         lane = identifier(obj.get('stream_id'))
         record = dict(attempt=str(uuid.uuid4()),ts=time.time(), requested_model=identifier(obj.get('model')),
                       requested_service_tier=identifier(obj.get('service_tier')),
+                      requested_effort=self.effort(obj),response_effort='',
+                      requested_effort_conflict=False,response_effort_conflict=False,
                       wire_service_tier_present='service_tier' in obj,
                       response_id='', response_model='', response_service_tier='',status='pending', conflict=False)
         record['request_observed_at']=time.time()
@@ -100,10 +116,12 @@ class Tracker:
         if rid in self.completed:
             # Replayed terminal events must never consume a queued request.
             record=self.completed[rid]
+            changed=self.response_effort(record,response)
             model=identifier(response.get('model'))
             if model and record['response_model'] and model!=record['response_model']:
                 record['conflict']=True
-                self.save(record)
+                changed=True
+            if changed:self.save(record)
             return
         if rid not in self.active:
             pending=self.pending.get(lane)
@@ -114,9 +132,12 @@ class Tracker:
                 # No exact request association: record response-only evidence, never guess.
                 self.active[rid]=dict(attempt=str(uuid.uuid4()),ts=time.time(),requested_model='',
                                       requested_service_tier='',response_service_tier='',
+                                      requested_effort='',response_effort='',
+                                      requested_effort_conflict=False,response_effort_conflict=False,
                                       response_id='',response_model='',status='pending',conflict=False)
         record=self.active[rid]
         record['response_id']=rid
+        self.response_effort(record,response)
         if response.get('service_tier'):
             record['response_service_tier']=identifier(response['service_tier'])
         model=identifier(response.get('model'))

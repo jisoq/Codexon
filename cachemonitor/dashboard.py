@@ -38,7 +38,7 @@ from .history_timeline import SessionTimeline
 from .dashboard_presentation import Breadcrumbs, RecordFields, labeled_control, move_controls
 
 STYLE = ''
-TITLES = {1:'지표 비교',2:'세션 기록',3:'구독 모니터링',4:'설정',5:'성능 추이',6:'홈'}
+TITLES = {1:'지표 비교',2:'세션 기록',3:'구독 모니터링',4:'설정',5:'성능 추이',6:'홈',7:'모델명 불일치 기록'}
 PERIODS = [('최근 30분','30m'),('오늘','today'),('최근 7일','7d'),('최근 30일','30d'),('전체 기록','all'),('직접 지정','custom')]
 INPUT_BANDS = [('전체 입력 길이',''),('10k 미만','0:10000'),('10–50k','10000:50000'),('50–100k','50000:100000'),('100–200k','100000:200000'),('200–272k','200000:272001'),('272k 초과','272001:inf')]
 CALL_FILTERS = [('환산 불가','unpriced'),('모드 기록 없음','unknown_mode'),('모델명 불일치','model_mismatch'),('관측 정보 누락 또는 충돌','observation_problem'),('캐시 읽기 0','cache_zero'),('캐시 저하 의심','cache_degradation'),('HTTP/SSE','http')]
@@ -124,7 +124,7 @@ class Dashboard(TrayWindow):
     @selected_event.setter
     def selected_event(self,value):self.history_navigation.event=value
 
-    def __init__(self, homes, start_worker=True, settings=None, index_path=None, static_snapshot=None, live_limits=True, manage_observer=False,model_evidence_path=None,quota_path=None,collection_autostart=True):
+    def __init__(self, homes, start_worker=True, settings=None, index_path=None, static_snapshot=None, live_limits=True, manage_observer=False,model_evidence_path=None,quota_path=None,collection_autostart=True,mismatch_reader=None):
         self.quota_path=quota_path
         super().__init__()
         self.settings=settings or QSettings('CacheMonitor','CacheMonitor')
@@ -177,8 +177,8 @@ class Dashboard(TrayWindow):
         side=Group();side.setFixedWidth(200);side.setObjectName('sidebar');side_layout=Column(side)
         side_layout.setContentsMargins(16,24,16,20);side_layout.setSpacing(24)
         side_layout.addWidget(label('CODEXON','brand'))
-        self.navigation_pages=(6,3,1,5)
-        self.nav=Navigation();self.nav.addItems(tuple(TITLES[i] for i in self.navigation_pages));self.nav.setObjectName('navigation');self.nav.setMaximumHeight(220)
+        self.navigation_pages=(6,3,1,5,7)
+        self.nav=Navigation();self.nav.addItems(tuple(TITLES[i] for i in self.navigation_pages));self.nav.setObjectName('navigation');self.nav.setMaximumHeight(250)
         side_layout.addWidget(self.nav);side_layout.addStretch()
         self.update_available=Button('업데이트 가능');self.update_available.hide()
         self.update_available.clicked.connect(self.open_updates);side_layout.addWidget(self.update_available)
@@ -245,6 +245,8 @@ class Dashboard(TrayWindow):
         self.home_panel.connection_requested.connect(self.open_home_connection)
         home_scroll=Scroll();home_scroll.put(fillViewport=True);home_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         home_scroll.setWidget(self.home_panel);self.pages.addWidget(home_scroll);self.scrollers[6]=home_scroll
+        from .mismatch_page import MismatchPage
+        self.mismatch_page=MismatchPage(reader=mismatch_reader);self.pages.addWidget(self.mismatch_page)
         self.health=label('','muted',True);self.health.hide()
         self.setup_tray();self.settings_page.bind_tray(self);self.tray.messageClicked.connect(self.open_tray_notification)
         self.tick=QTimer(self);self.tick.timeout.connect(self.check_stale);self.tick.start(1000)
@@ -261,6 +263,7 @@ class Dashboard(TrayWindow):
                                        cache_floor=self.confirmed_notifications.cache_floor)
             self.worker.snapshot.connect(self.receive);self.worker.result.connect(self.analysis_ready)
             self.worker.stale.connect(self.analysis_stale)
+            self.mismatch_page.set_worker(self.worker)
             self.worker.progress.connect(self.analysis_progressed)
             # The initial page can enter loading before a worker owns its request.
             self.pending_logical=None
@@ -797,7 +800,8 @@ class Dashboard(TrayWindow):
         for key,attr in (('model','model'),('effort','effort'),('service_tier','mode')):
             if self.current_page==2:choose(getattr(self,attr),self.page_filters[2].get(key,''))
         self.restoring=False
-        self.content.put(contentWidth=0 if index==2 else 1808)
+        self.mismatch_page.set_active(index==7)
+        self.content.put(contentWidth=0 if index in (2,7) else 1808)
         self.project.setVisible(index!=2)
         self.sync_history_filters()
         self.common_filters.hide();self.scope_note.hide()
@@ -810,7 +814,7 @@ class Dashboard(TrayWindow):
             if self.current_page!=5:
                 self.analysis=self.view_result['analysis'];self.lookup=self.view_result['lookup']
                 self.applied_key=self.view_result['key']
-        self.price_button.setVisible(index not in (4,6));self.clear_analysis_loading()
+        self.price_button.setVisible(index not in (4,6,7));self.clear_analysis_loading()
         if hasattr(self,'quota_pause_button'):self.refresh_quota_monitoring()
         self.update_navigation()
         self.render();self.save_preferences()
@@ -989,6 +993,9 @@ class Dashboard(TrayWindow):
         if self.restoring or not hasattr(self,'settings_page'):return
         if automatic and (not self.isVisible() or self.isMinimized()):
             self._display_dirty=True;return
+        if self.current_page==7:
+            self.mismatch_page.refresh(automatic=automatic)
+            return
         custom=self.period.currentData()=='custom';self.date_start.setVisible(custom);self.date_end.setVisible(custom)
         if self.current_page in (3,4):
             if self.current_page==3:self.quota_panel.refresh_status()
@@ -1275,6 +1282,7 @@ class Dashboard(TrayWindow):
             value={**value,'sessions':[s['source'] for s in self.engine.sessions.values()],
                    'internal_review_calls':sum(len(s['prepared']['history']) for s in self.engine.internal_sessions.values())}
         self.snapshot=value
+        self.mismatch_page.receive_health(value.get('mismatch_history'))
         self.refresh_home_status()
         self.error_state.clear('analysis.process',resolution='분석기 실행 확인')
         if isinstance(value.get('collection_fault'),dict):
