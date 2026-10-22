@@ -286,12 +286,12 @@ def test_websocket_interleaved_lanes_preserves_frames_and_secrets(tmp_path):
             for lane,model in [('b','different'),('a','model-a')]:
                 for typ in ('created','completed'):
                     await ws.send_json({'type':'response.'+typ,'stream_id':lane,
-                                        'response':{'id':'r-'+lane,'model':model,'output':[{'text':'PRIVATE_OUTPUT'}]}})
+                                        'response':{'id':'r-'+lane,'model':model,'reasoning':{'effort':'low'},'output':[{'text':'PRIVATE_OUTPUT'}]}})
             await ws.close();return ws
         upstream_app=web.Application();upstream_app.router.add_get('/responses',upstream)
         try:
             async with server(upstream_app) as url, server(create_app(store,home,url)) as proxy, ClientSession() as client:
-                messages=[json.dumps({'type':'response.create','stream_id':x,'model':'model-'+x,'input':'PRIVATE_PROMPT'}) for x in ('a','b')]
+                messages=[json.dumps({'type':'response.create','stream_id':x,'model':'model-'+x,'reasoning':{'effort':'high'},'input':'PRIVATE_PROMPT'}) for x in ('a','b')]
                 async with client.ws_connect(proxy+'/responses',headers={'Authorization':'Bearer PRIVATE'}) as ws:
                     for message in messages:await ws.send_str(message)
                     replies=[]
@@ -305,6 +305,8 @@ def test_websocket_interleaved_lanes_preserves_frames_and_secrets(tmp_path):
                 reader=EvidenceReader(path);reader.poll()
                 rows=reader.enrich(home,[{'key':'r-a'},{'key':'r-b'}]);reader.close()
                 assert [r['model_match'] for r in rows]==['일치','불일치']
+                assert all(r['requested_effort']=='high' and r['response_effort']=='low'
+                           and r['response_effort_confirmed'] for r in rows)
                 assert (await (await client.get(proxy+'/health')).json())['requests']==2
                 assert (await client.get(proxy+'/models',headers={'Origin':'https://example.com'})).status==403
                 assert (await client.get(proxy+'/unrelated')).status==404
@@ -316,12 +318,12 @@ def test_websocket_interleaved_lanes_preserves_frames_and_secrets(tmp_path):
 
 def test_http_sse_chunking_json_errors_and_unparsed_body(tmp_path):
     async def run():
-        home=tmp_path/'home';path=tmp_path/'e.sqlite';store=EvidenceStore(path)
-        payload=b'data: '+json.dumps({'type':'response.completed','response':{'id':'sse','model':'m'}}).encode()+b'\r\n\r\n'
+        home=tmp_path/'home';path=tmp_path/'e.sqlite';store=EvidenceStore(path);received=[]
+        payload=b'data: '+json.dumps({'type':'response.completed','response':{'id':'sse','model':'m','reasoning':{'effort':'low'}}}).encode()+b'\r\n\r\n'
         async def upstream(request):
-            data=await request.json()
+            data=await request.json();received.append(data)
             if data.get('case')=='error':return web.json_response({'error':{'message':'secret'}},status=429,headers={'Retry-After':'7'})
-            if data.get('case')=='json':return web.json_response({'object':'response','id':'json','model':'m','status':'completed'})
+            if data.get('case')=='json':return web.json_response({'object':'response','id':'json','model':'m','status':'completed','reasoning':{'effort':'medium'}})
             response=web.StreamResponse(headers={'Content-Type':'text/event-stream'});await response.prepare(request)
             for i in range(0,len(payload),3):await response.write(payload[i:i+3])
             await response.write_eof();return response
@@ -329,12 +331,16 @@ def test_http_sse_chunking_json_errors_and_unparsed_body(tmp_path):
         try:
             async with server(app) as url, server(create_app(store,home,url)) as proxy, ClientSession() as client:
                 for case in ('sse','json','error'):
-                    async with client.post(proxy+'/responses',json={'model':'m','case':case}) as r:
+                    async with client.post(proxy+'/responses',json={'model':'m','case':case,'reasoning':{'effort':'high'}}) as r:
                         data=await r.read()
                         if case=='sse':assert data==payload
                         if case=='error':assert r.status==429 and r.headers['Retry-After']=='7'
             reader=EvidenceReader(path);reader.poll()
-            assert all(r['model_match']=='일치' for r in reader.enrich(home,[{'key':'sse'},{'key':'json'}]))
+            rows=reader.enrich(home,[{'key':'sse'},{'key':'json'}])
+            assert all(r['model_match']=='일치' and r['requested_effort']=='high'
+                       and r['response_effort_confirmed'] for r in rows)
+            assert [r['response_effort'] for r in rows]==['low','medium']
+            assert received==[dict(model='m',case=case,reasoning=dict(effort='high')) for case in ('sse','json','error')]
             reader.close()
             assert store.db.execute("select count(*) from model_observations where status='http_error'").fetchone()[0]==1
         finally:store.close()

@@ -19,6 +19,8 @@ TIMING_FIELDS = ('observation_missing','request_observed_at','generation_observe
 FIELDS += TIMING_FIELDS + ('cache_policy','cache_policy_conflict')
 FIELDS += ('model_conflict','mode_conflict','timing_valid','analysis_model','model_source','configured_model')
 FIELDS += ('request_mode_source','request_mode_action','configured_service_tier','wire_service_tier_present','wire_observed')
+EFFORT_FIELDS = ('requested_effort','response_effort','requested_effort_conflict','response_effort_conflict')
+FIELDS += EFFORT_FIELDS + ('configured_effort','requested_effort_source','response_effort_source','response_effort_confirmed')
 UNKNOWN = '확인 불가'
 CORRECTION_ROWS = 4096
 CORRECTION_KEY_BYTES = 4096
@@ -29,7 +31,8 @@ ATTEMPT_INDEX = 'CREATE INDEX evidence_attempt ON model_observations(home,attemp
 
 
 def observation_record(row):
-    return {key:value for key,value in dict(row).items() if key not in CORRECTION_FIELDS}
+    defaults=dict(requested_effort='',response_effort='',requested_effort_conflict=0,response_effort_conflict=0)
+    return defaults | {key:value for key,value in dict(row).items() if key not in CORRECTION_FIELDS}
 
 
 def correction_stamp(target, reset='0'):
@@ -123,9 +126,12 @@ class EvidenceStore:
             CREATE INDEX IF NOT EXISTS evidence_response ON model_observations(home,response_id,attempt,seq);
         ''')
         columns={row[1] for row in self.db.execute('pragma table_info(model_observations)')}
-        for column in ('requested_service_tier','response_service_tier','cache_policy'):
+        for column in ('requested_service_tier','response_service_tier','cache_policy','requested_effort','response_effort'):
             if column not in columns:
                 self.db.execute(f"alter table model_observations add column {column} TEXT NOT NULL DEFAULT ''")
+        for column in ('requested_effort_conflict','response_effort_conflict'):
+            if column not in columns:
+                self.db.execute(f'alter table model_observations add column {column} INTEGER NOT NULL DEFAULT 0')
         for column in TIMING_FIELDS:
             if column not in columns:
                 self.db.execute(f'alter table model_observations add column {column} REAL')
@@ -170,7 +176,8 @@ class EvidenceStore:
     def write(self, home, attempt, ts, transport, response_id='', requested_model='',
               response_model='', status='', conflict=False,requested_service_tier='',response_service_tier='',
               observation_missing=False,request_observed_at=None,generation_observed_at=None,completed_observed_at=None,
-              generation_latency_ms=None,completion_latency_ms=None,cache_policy='',wire_service_tier_present=None):
+              generation_latency_ms=None,completion_latency_ms=None,cache_policy='',wire_service_tier_present=None,
+              requested_effort='',response_effort='',requested_effort_conflict=False,response_effort_conflict=False):
         # An explicit allowlist: no headers, URLs, prompts, outputs or exception text.
         timings=(int(bool(observation_missing)),request_observed_at,generation_observed_at,completed_observed_at,
                  generation_latency_ms,completion_latency_ms)
@@ -180,14 +187,16 @@ class EvidenceStore:
             (home,attempt,ts,transport,response_id,requested_model,response_model,status,conflict,
              requested_service_tier,response_service_tier,observation_missing,request_observed_at,
              generation_observed_at,completed_observed_at,generation_latency_ms,completion_latency_ms,
-             cache_policy,wire_service_tier_present) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+             cache_policy,wire_service_tier_present,requested_effort,response_effort,
+             requested_effort_conflict,response_effort_conflict) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
                         (home_key(home), identifier(attempt), float(ts),
                          transport if transport in ('WebSocket', 'HTTP/SSE') else '',
                          identifier(response_id), identifier(requested_model), identifier(response_model),
                          status if status in ('pending', 'created', 'completed', 'failed', 'incomplete', 'cancelled',
                                               'disconnected', 'http_error', 'unparsed') else '', int(bool(conflict)),
                          identifier(requested_service_tier), identifier(response_service_tier),
-                         *timings,identifier(cache_policy),present))
+                         *timings,identifier(cache_policy),present,identifier(requested_effort),identifier(response_effort),
+                         int(bool(requested_effort_conflict)),int(bool(response_effort_conflict))))
         self.db.commit()
 
     def gap(self,start,end):
@@ -201,7 +210,7 @@ class EvidenceStore:
 class EvidenceSummary:
     """Bounded witnesses for the join's any/all, conflict and timing decisions."""
     FIELDS=('requested_model','response_model','requested_service_tier','response_service_tier',
-            'cache_policy','transport','wire_service_tier_present')
+            'cache_policy','transport','wire_service_tier_present','requested_effort','response_effort')
     def __init__(self):
         self.records={};self.values={field:set() for field in self.FIELDS}
         self.flags=set();self.first=[];self.earliest=None;self.latest=None
@@ -210,7 +219,7 @@ class EvidenceSummary:
         keep=False
         for field,values in self.values.items():
             value=record.get(field)
-            if field in ('requested_model','response_model','requested_service_tier','response_service_tier') and not value:continue
+            if field in ('requested_model','response_model','requested_service_tier','response_service_tier','requested_effort','response_effort') and not value:continue
             if field=='transport' and value not in ('WebSocket','HTTP/SSE'):continue
             if field=='wire_service_tier_present' and value is None:continue
             if field=='cache_policy':value=value or None
@@ -218,7 +227,9 @@ class EvidenceSummary:
         flags=(bool(missing),bool(record['conflict']),record['status']=='completed',
                bool(record['requested_model'] and record['response_model']),
                bool(record['status']=='completed' and record['requested_model'] and record['response_model']),
-               bool(record['status']=='completed' and record['requested_model'] and record['response_model'] and record.get('response_service_tier')))
+               bool(record['status']=='completed' and record['requested_model'] and record['response_model'] and record.get('response_service_tier')),
+               bool(record.get('requested_effort_conflict')),bool(record.get('response_effort_conflict')),
+               bool(record['status']=='completed' and record['requested_model'] and record['response_model'] and record.get('response_effort')))
         for position,value in enumerate(flags):
             if (position,value) not in self.flags:self.flags.add((position,value));keep=True
         if len(self.first)<2:self.first.append(record)
@@ -541,6 +552,24 @@ class EvidenceReader:
             mode['response_tier_confirmed']=bool(evidence and not conflict and len(response_tiers)==1
                 and len(requested_tiers)<=1 and all(e['status']=='completed' and e['requested_model']
                     and e['response_model'] and e.get('response_service_tier') for e in evidence))
+            requested_efforts={e.get('requested_effort') for e in evidence if e.get('requested_effort')}
+            response_efforts={e.get('response_effort') for e in evidence if e.get('response_effort')}
+            requested_effort_conflict=len(requested_efforts)>1 or any(e.get('requested_effort_conflict') for e in evidence)
+            response_effort_conflict=len(response_efforts)>1 or any(e.get('response_effort_conflict') for e in evidence)
+            configured_effort=row.get('configured_effort',row.get('effort')) or ''
+            context_effort=configured_effort if configured_effort not in ('미확인',UNKNOWN) else ''
+            requested_effort=('' if requested_effort_conflict else next(iter(requested_efforts))
+                              if requested_efforts else context_effort)
+            response_effort=next(iter(response_efforts)) if len(response_efforts)==1 and not response_effort_conflict else ''
+            effort=dict(configured_effort=configured_effort,requested_effort=requested_effort,response_effort=response_effort,
+                requested_effort_conflict=requested_effort_conflict,response_effort_conflict=response_effort_conflict,
+                requested_effort_source='conflict' if requested_effort_conflict else 'wire' if requested_efforts
+                    else 'turn_context' if context_effort else 'unknown',
+                response_effort_source='conflict' if response_effort_conflict else 'wire' if response_effort else 'unknown',
+                response_effort_confirmed=bool(evidence and not conflict and response_effort and not response_effort_conflict
+                    and all(e['status']=='completed' and e['requested_model'] and e['response_model']
+                        and e.get('response_effort') for e in evidence)),
+                effort=requested_effort or '미확인')
             requested = next(iter(req)) if len(req)==1 else ''
             responded = next(iter(res)) if len(res)==1 else ''
             completed_pair = any(e['status']=='completed' and e['requested_model']==requested
@@ -572,7 +601,7 @@ class EvidenceReader:
             wire_present=bool(next(iter(presence))) if len(presence)==1 else True if requested_tiers and not presence else None
             # Older sanitized records did not keep key presence. Preserve that
             # uncertainty instead of claiming omission from an empty string.
-            result.append({**row, **transport, **mode, **timing, 'observation_missing':missing,
+            result.append({**row, **transport, **mode, **timing, **effort, 'observation_missing':missing,
                            'wire_observed':bool(evidence),'wire_service_tier_present':wire_present,
                            'model':analysis_model,'analysis_model':analysis_model,'configured_model':configured,
                            'model_source':'conflict' if model_conflict else 'wire' if requested else 'settings' if configured else 'unknown',

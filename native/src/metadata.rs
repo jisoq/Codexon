@@ -8,7 +8,7 @@ use std::fmt;
 enum Scalar { Text(String), Boolean(bool) }
 type Fields = BTreeMap<String, Scalar>;
 
-struct Selection<'a> { fields: &'a mut Fields, response: bool }
+struct Selection<'a> { fields: &'a mut Fields, prefix: &'static str }
 impl<'de> DeserializeSeed<'de> for Selection<'_> {
     type Value = ();
     fn deserialize<D: de::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
@@ -20,15 +20,22 @@ impl<'de> Visitor<'de> for Selection<'_> {
     fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result { f.write_str("JSON value") }
     fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<(), M::Error> {
         while let Some(key) = map.next_key::<String>()? {
-            if !self.response && key == "response" {
-                map.next_value_seed(Selection { fields: self.fields, response: true })?;
+            let name = format!("{}{key}", self.prefix);
+            let nested = match name.as_str() {
+                "response" => Some("response."),
+                "reasoning" => Some("reasoning."),
+                "response.reasoning" => Some("response.reasoning."),
+                _ => None,
+            };
+            if let Some(prefix) = nested {
+                map.next_value_seed(Selection { fields: self.fields, prefix })?;
                 continue;
             }
-            let name = if self.response { format!("response.{key}") } else { key };
             if matches!(name.as_str(), "model" | "stream_id" | "type" | "object" | "id" |
                 "event_id" | "response_id" | "status" | "generate" | "stream" |
                 "prompt_cache_retention" | "service_tier" | "response.id" |
-                "response.model" | "response.status" | "response.service_tier") {
+                "response.model" | "response.status" | "response.service_tier" |
+                "reasoning.effort" | "response.reasoning.effort") {
                 map.next_value_seed(SelectedScalar { fields: self.fields, name })?;
             } else { map.next_value::<IgnoredAny>()?; }
         }
@@ -63,7 +70,10 @@ impl<'de> Visitor<'de> for SelectedScalar<'_> {
         Ok(())
     }
     fn visit_bool<E: de::Error>(self, value: bool) -> Result<(), E> {
-        self.fields.insert(self.name, Scalar::Boolean(value)); Ok(())
+        if !self.name.ends_with("reasoning.effort") {
+            self.fields.insert(self.name, Scalar::Boolean(value));
+        }
+        Ok(())
     }
     fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<(), M::Error> {
         while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {} Ok(())
@@ -83,7 +93,7 @@ fn select(data: &[u8]) -> Option<Fields> {
     std::str::from_utf8(data).ok()?;
     let mut fields = Fields::new();
     let mut decoder = serde_json::Deserializer::from_slice(data);
-    Selection { fields: &mut fields, response: false }.deserialize(&mut decoder).ok()?;
+    Selection { fields: &mut fields, prefix: "" }.deserialize(&mut decoder).ok()?;
     decoder.end().ok()?;
     Some(fields)
 }
@@ -99,16 +109,20 @@ fn message_metadata<'py>(py: Python<'py>, data: &Bound<'py, PyAny>) -> PyResult<
     // (for example numeric representations outside serde_json's range).
     let Some(fields) = fields else { return Err(pyo3::exceptions::PyValueError::new_err("Use streaming JSON validator")); };
     for (key, value) in fields {
-        let (target, name) = if let Some(name) = key.strip_prefix("response.") {
-            let nested = match output.get_item("response")? {
-                Some(value) => value.cast_into::<PyDict>()?,
-                None => { let value = PyDict::new(py); output.set_item("response", &value)?; value }
-            };
-            (nested, name)
-        } else { (output.clone(), key.as_str()) };
-        match value {
-            Scalar::Text(value) => target.set_item(name, value)?,
-            Scalar::Boolean(value) => target.set_item(name, value)?,
+        let mut target = output.clone();
+        let mut parts = key.split('.').peekable();
+        while let Some(name) = parts.next() {
+            if parts.peek().is_none() {
+                match &value {
+                    Scalar::Text(value) => target.set_item(name, value)?,
+                    Scalar::Boolean(value) => target.set_item(name, value)?,
+                }
+            } else {
+                target = match target.get_item(name)? {
+                    Some(value) => value.cast_into::<PyDict>()?,
+                    None => { let value = PyDict::new(py); target.set_item(name, &value)?; value }
+                };
+            }
         }
     }
     Ok(output)
