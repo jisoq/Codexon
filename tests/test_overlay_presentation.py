@@ -115,7 +115,7 @@ def test_subagent_labels_show_own_call_evidence_and_elide_names():
     action=next(item for item in m.state['detailActions'] if name in item['label'])
     assert name in action['label'] and 'gpt-6.1-sol, high' in action['label']
     for state,mismatch,response,expected in (
-            ('일치',False,'gpt-6.1-sol',''),('모델명 불일치',True,'gpt-6-luna',' (불일치: gpt-6-luna)'),
+            ('일치',False,'gpt-6.1-sol',''),('모델명 불일치',True,'gpt-6-luna',''),
             ('관측 충돌',False,'gpt-6-luna',''),('관측 누락',False,None,'')):
         value=dict(child,model_state=state,model_mismatch=mismatch,response_model=response)
         assert m.subagent_call_label(value)==f'gpt-6.1-sol, high{expected}'

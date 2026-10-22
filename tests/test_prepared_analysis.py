@@ -223,6 +223,7 @@ def test_prepared_failures_keep_sanitized_diagnostics_without_static_fallthrough
     monkeypatch.setattr(prepared_runtime, 'CollectionClient', fail)
     writer = object.__new__(prepared_runtime.PreparedWriter)
     writer.arguments = [], tmp_path/'index.sqlite', tmp_path/'evidence.sqlite', quota
+    writer.stopped = Event()
     writer.output = SimpleNamespace(put=messages.append)
     writer._run()
     assert messages.pop()['kind']=='fatal'

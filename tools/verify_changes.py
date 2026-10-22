@@ -39,6 +39,8 @@ def test_nodes(module, *names):
 
 
 GROUPS = {
+    'mismatch_data': test_files('mismatch_history', 'mismatch_source'),
+    'mismatch_ui': test_files('mismatch_page', 'mismatch_bridge'),
     'native_cpu': test_files('native_cpu', 'native_trends', 'native_usage', 'native_quota_series', 'native_index', 'native_analysis', 'build_native'),
     'notices': test_files('collect_notices'),
     "performance_trends": test_files("performance_trends"),
@@ -167,6 +169,8 @@ RULES = (
     ('cachemonitor/analysis_records.py', ('analysis', 'cost', 'cache', 'overlay_data', 'dashboard', 'details')),
     ('cachemonitor/analysis_worker.py', ('analysis', 'quota_poll', 'overlay_tracking', 'notifications')),
     ('cachemonitor/analysis_query_actor.py', ('prepared', 'analysis', 'quota_poll')),
+    ('cachemonitor/mismatch_history.py', ('mismatch_data', 'mismatch_ui')),
+    ('cachemonitor/mismatch_page.py', ('mismatch_ui',)),
     ('cachemonitor/prepared_store.py', ('prepared', 'analysis', 'data', 'quota_poll')),
     ('cachemonitor/prepared_changes.py', ('prepared', 'analysis', 'quota_poll')),
     ('cachemonitor/prepared_ingest.py', ('prepared', 'analysis', 'data', 'cache', 'modes', 'quota_poll')),
@@ -624,6 +628,7 @@ def package_check(executable, report_dir):
 # The core runner's import guard continues to reject accidental Qt dependencies.
 CORE_TESTS = frozenset(test_files(
     'pricing', 'data_contract', 'core', 'request_modes', 'collection_preparation',
+    'mismatch_history', 'mismatch_source',
     'banked_resets', 'comparison', 'quota', 'quota_tracking',
     'native_index', 'native_trends', 'native_usage', 'build_native',
     'verify_changes', 'check_environment', 'collect_notices', 'prepare_sources',

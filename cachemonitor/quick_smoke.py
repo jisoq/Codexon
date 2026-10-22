@@ -34,7 +34,7 @@ def start_smoke(window,app,path,fonts,depth='full'):
             settle()
             assert window.quick.status()==QQuickWidget.Status.Ready
             assert window.taskbar_quota.native is None
-            assert window.nav.count()==4
+            assert window.nav.count()==5
             report['sessions']=len(window.snapshot['sessions'])
             report['model_requests']=0;report['live_quota_requests']=0
             for page,name in ((6,'home'),(3,'quota'),(1,'comparison'),(5,'performance'),(2,'calls'),(4,'settings')):

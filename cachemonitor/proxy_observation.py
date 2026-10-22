@@ -11,7 +11,8 @@ from .native_backend import get_native
 MAX_OBSERVATION = 128 * 1024 * 1024
 CHUNK = 65536
 FIELDS = {'model','stream_id','type','object','id','event_id','response_id','status','generate','stream','prompt_cache_retention',
-          'service_tier','response.id','response.model','response.status','response.service_tier'}
+          'service_tier','response.id','response.model','response.status','response.service_tier',
+          'reasoning.effort','response.reasoning.effort'}
 
 
 class SelectedJSON:
@@ -29,9 +30,11 @@ class SelectedJSON:
             prefix,event,value=yield
             if prefix in FIELDS and event in ('string','boolean'):
                 if isinstance(value,str) and len(value)>256:continue
-                if prefix.startswith('response.'):
-                    self.fields.setdefault('response',{})[prefix.split('.')[1]]=value
-                else:self.fields[prefix]=value
+                if prefix.endswith('reasoning.effort') and event!='string':continue
+                target=self.fields
+                parts=prefix.split('.')
+                for part in parts[:-1]:target=target.setdefault(part,{})
+                target[parts[-1]]=value
 
     def feed(self,data):
         if not data or self.error or self.closed:return

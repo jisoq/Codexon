@@ -66,9 +66,10 @@ class RecordFields(Text):
     """Aligned, selectable fields with a plain-text representation for export."""
     kind = 'recordFields'
 
-    def set_content(self, text, entries=(), note='', *, literal=False):
+    def set_content(self, text, entries=(), note='', *, literal=False, text_runs=None):
         self.setText(text)
-        self.put(fields=[dict(label=label, value=str(value) if literal else tr(str(value)))
+        self.put(fields=[dict(label=label, value=str(value) if literal else tr(str(value)),
+                              textRuns=(text_runs or {}).get(label, []))
                          for label, value in entries if value is not None and value != ''],
                  note=note if entries else text)
 

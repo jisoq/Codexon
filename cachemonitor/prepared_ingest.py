@@ -19,7 +19,7 @@ from .pricing import Rate, pricing_signature
 from .request_modes import mode_parents, requires_parent_mode
 
 
-PREPARATION = ('canonical-owner', 8)
+PREPARATION = ('canonical-owner', 9)
 CLASSIFIERS = ('cache-miss', 1, 'cache-health', 1)
 
 

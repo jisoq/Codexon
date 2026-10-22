@@ -136,8 +136,10 @@ def test_chart_keyboard_does_not_replace_latest_call_or_open_rows(layout_control
         assert m.latest_call()==latest and not m.main_expanded and not m.expanded_groups
 
 
-def test_latest_child_sorts_first_and_uses_its_assigned_highlight_color(layout_controller):
+def test_latest_child_sorts_without_glow_until_its_visible_content_changes(layout_controller):
+    from test_ui import wait_for_rendered
     c=layout_controller;data=family_summary();m=publish(c,data)
+    wait_for_rendered(lambda:not m.row_glows.needs_frame)
     child=next(row for row in data['recent'] if row['sid']!=data['id'])
     updated=deepcopy(data)
     latest=dict(child,id='new-child-call',key='new-child-call')
@@ -146,9 +148,14 @@ def test_latest_child_sorts_first_and_uses_its_assigned_highlight_color(layout_c
     target['latest_ts']=max(agent.get('latest_ts') or 0 for agent in updated['subagent_finance']['agents'])+1
     m.set_content(updated)
     assert m.detail_groups()[0]['id']==child['sid']
-    highlights=[item for item in m.detail_items() if item[8].get('kind')=='agent-selection']
-    assert len(highlights)==1
-    assert highlights[0][8]['agentColor']==m.graph_colors(m.rows())[(child['home'],child['sid'])]
+    assert not m.row_glows.needs_frame
+    changed=deepcopy(updated)
+    target=next(agent for agent in changed['subagent_finance']['agents'] if agent['id']==child['sid'])
+    target['cost']+=.5;m.set_content(changed)
+    owner=(child['home'],child['sid'])
+    wait_for_rendered(lambda:m.row_glow_opacity(owner)>0)
+    highlights=[item for item in m.detail_items() if item[8].get('kind')=='agent-update' and item[8]['alpha']>0]
+    assert len(highlights)==1 and highlights[0][8]['owner']==owner
     assert not m.expanded_groups and not m.main_expanded
 
 

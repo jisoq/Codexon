@@ -1,4 +1,5 @@
 """Analyze shared collector snapshots outside Qt's UI thread."""
+import sqlite3
 import multiprocessing as mp
 from multiprocessing.connection import wait
 import threading
@@ -57,6 +58,7 @@ def process_main(connection,homes,index_path,static_snapshot=None,model_evidence
             return
         finally:
             connection.close()
+    mismatches=None
     try:
         engine=AnalysisEngine()
         overlays=OverlaySummaries()
@@ -65,6 +67,8 @@ def process_main(connection,homes,index_path,static_snapshot=None,model_evidence
         engine.ingest(snapshot['sessions'])
         pending=ready=None
         details={}
+        from .mismatch_history import MismatchReader,archive_path
+        mismatches=MismatchReader(archive_path(quota_path or ledger_path(index_path)))
 
         def publish():
             connection.send(dict(kind='snapshot',value=publisher.publish(snapshot,engine,overlays.collect(engine))))
@@ -94,6 +98,13 @@ def process_main(connection,homes,index_path,static_snapshot=None,model_evidence
                 elif kind=='query':pending=message;ready=None
                 elif kind=='sync':
                     publisher=SnapshotPublisher();publish()
+                elif kind in ('mismatch_page','mismatch_record'):
+                    try:
+                        value=(mismatches.window(start=message.get('start',0),size=message.get('size',128))
+                               if kind=='mismatch_page' else mismatches.record(message['identity']))
+                        connection.send(dict(kind=kind,id=message['id'],**value))
+                    except (OSError,ValueError,sqlite3.Error) as error:
+                        connection.send(dict(kind=kind,id=message['id'],error=str(error)))
                 elif kind in ('population','record','overlay_detail'):
                     details.pop(kind,None);details[kind]=message
             send_details(False)
@@ -117,6 +128,7 @@ def process_main(connection,homes,index_path,static_snapshot=None,model_evidence
         try:connection.send(dict(kind='fatal',error=traceback.format_exc(limit=6)))
         except (OSError,EOFError):pass
     finally:
+        if mismatches is not None:mismatches.close()
         connection.close()
 
 
@@ -138,6 +150,8 @@ class AnalysisBridge(QThread):
     population=Signal(object)
     overlay_detail=Signal(object)
     stale=Signal(object)
+    mismatch_page=Signal(object)
+    mismatch_record=Signal(object)
     def __init__(self,homes,index_path=None,static_snapshot=None,model_evidence_path=None,quota_path=None,cache_floor=None):
         super().__init__()
         self.homes,self.index_path,self.static_snapshot=homes,index_path,static_snapshot
@@ -154,6 +168,7 @@ class AnalysisBridge(QThread):
         self.restart_count=0
         self.last_request=None
         self.last_record=None
+        self.outstanding_mismatches={}
     def request(self,request_id,query,logical):
         with self.lock:
             self.pending={'kind':'query','id':request_id,'query':query,'logical':logical}
@@ -162,6 +177,8 @@ class AnalysisBridge(QThread):
     def enqueue_latest(self,command):
         # Each consumer accepts only its newest request id. Keep one pending
         # command per kind while the child is busy, including a single snapshot.
+        if command['kind'] in ('mismatch_page','mismatch_record'):
+            self.outstanding_mismatches[command['kind']]=command
         self.commands[:]=[old for old in self.commands if old['kind']!=command['kind']]
         self.commands.append(command)
         self._wake_locked()
@@ -215,6 +232,12 @@ class AnalysisBridge(QThread):
             self.last_record={'kind':'record','id':request_id,'identity':identity}
             if prepared_token is not None:self.last_record['prepared_token']=prepared_token
             self.enqueue_latest(self.last_record)
+    def request_mismatch_page(self,request_id,start=0,size=128):
+        with self.lock:self.enqueue_latest(dict(kind='mismatch_page',id=request_id,start=start,size=size))
+
+    def request_mismatch_record(self,request_id,identity):
+        with self.lock:self.enqueue_latest(dict(kind='mismatch_record',id=request_id,identity=identity))
+
     def request_population(self,request_id,population,assumptions=None):
         with self.lock:self.enqueue_latest(dict(kind='population',id=request_id,population=population,assumptions=assumptions))
 
@@ -230,11 +253,17 @@ class AnalysisBridge(QThread):
     def _deliver_result(self,message):
         kind=message['kind']
         consumer=message.get('consumer') if kind=='stale' else kind
+        if kind in ('mismatch_page','mismatch_record'):
+            with self.lock:
+                outstanding=self.outstanding_mismatches.get(kind)
+                if outstanding and outstanding['id']==message['id']:
+                    self.outstanding_mismatches.pop(kind)
         if consumer=='record':
             with self.lock:
                 if self.last_record and self.last_record['id']==message['id']:self.last_record=None
         if consumer=='overlay_detail':self.overlay_detail.emit(message);return
-        {'record':self.record,'population':self.population,'result':self.result,'stale':self.stale}[kind].emit(message)
+        {'record':self.record,'population':self.population,'result':self.result,'stale':self.stale,
+         'mismatch_page':self.mismatch_page,'mismatch_record':self.mismatch_record}[kind].emit(message)
 
     def run(self):
         with self.lock:
@@ -285,7 +314,7 @@ class AnalysisBridge(QThread):
                                 with self.lock:self.enqueue_latest({'kind':'sync'})
                                 receiver=SnapshotReceiver();continue
                             if value is not None:self.snapshot.emit(value)
-                        elif message['kind'] in ('record','population','overlay_detail','result','stale'):self._deliver_result(message)
+                        elif message['kind'] in ('record','population','overlay_detail','result','stale','mismatch_page','mismatch_record'):self._deliver_result(message)
                         elif message['kind']=='progress':self.progress.emit(message)
                         elif message['kind'] in ('error','fatal'):
                             self.failure.emit(message['error'])
@@ -332,4 +361,5 @@ class AnalysisBridge(QThread):
                 self.pending=self.last_request
                 if self.pending:self._wake_locked()
                 if self.last_record:self.enqueue_latest(self.last_record)
+                for command in self.outstanding_mismatches.values():self.enqueue_latest(command)
             self.msleep(250)

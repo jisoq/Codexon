@@ -90,6 +90,9 @@ def test_prepared_overlay_detail_revision_tracks_descendants_and_removed_members
         owners[key]={'metadata':{k:v for k,v in source.items() if k!='history'}}
         packets[key]=summary_for_storage(split_summary(material['summary'])[0])
     sources['parent']['history'][0]['service_tier']='priority'
+    for name in ('parent','child'):
+        sources[name]['history'][0].update(requested_model='gpt-6-astra',response_model='gpt-6-sol',
+            model_alert_confirmed=True,model_match='불일치',response_status='completed')
     sources['parent']['request_state']=dict(turn='turn',state='완료')
     sources['child']['request_state']=dict(turn='turn',state='진행')
     for name in sources:replace_owner(name)
@@ -107,6 +110,10 @@ def test_prepared_overlay_detail_revision_tracks_descendants_and_removed_members
     assert first['parent']['subagent_finance']['agents'][0]['mode']=='Standard'
     assert first['parent']['main_usage']['request_state']=='완료'
     assert first['parent']['subagent_finance']['agents'][0]['request_state']=='진행'
+    for displayed in (first['parent']['main_usage'],first['parent']['subagent_finance']['agents'][0],
+                      first['parent'],first['parent']['latest']):
+        assert displayed['model_alert_confirmed']
+        assert displayed['requested_model']=='gpt-6-astra' and displayed['response_model']=='gpt-6-sol'
     view.publication_token.generation=2
     sources['other']['history'][0]['output']+=1;replace_owner('other')
     second=collect({('home','other')})
@@ -131,3 +138,18 @@ def test_prepared_overlay_detail_revision_tracks_descendants_and_removed_members
     assert 'subagent_finance' not in fourth['parent']
     assert fourth['parent']['_overlay_revision']!=third['parent']['_overlay_revision']
     assert set(overlays.detail_revisions)==set(owners)
+
+
+def test_overlay_summary_confirmation_and_models_always_follow_the_latest_owner_call():
+    confirmed=row(0,requested_model='gpt-6-astra',response_model='gpt-6-sol',
+        model_alert_confirmed=True,model_match='불일치',response_status='completed')
+    result=summarize_session(session([confirmed]))
+    assert result['requested_model']=='gpt-6-astra' and result['model_alert_confirmed']
+    for latest in (row(1,model='gpt-5.6-luna',effort='low'),
+                   row(1,requested_model='gpt-6-sol',response_model='gpt-6-sol',model_match='일치',model_alert_confirmed=False),
+                   row(1,model_evidence='관측 충돌',observation_missing=True)):
+        current=summarize_session(session([confirmed,latest]))
+        assert not current['model_alert_confirmed']
+        assert current['requested_model']==latest.get('requested_model')
+        assert current['response_model']==latest.get('response_model')
+        assert current['effort']==latest['effort']

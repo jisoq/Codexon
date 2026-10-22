@@ -27,6 +27,15 @@ Item {
         else if (column === (root.viewState.stretchVisual || 0)) requested += extra
         return frozen && column===0 ? Math.min(requested,Math.max(100,root.width-140)) : requested
     }
+    function escapedText(value) {
+        return String(value).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;")
+    }
+    function styledText(runs) {
+        return runs.map(run => {
+            let value=escapedText(run.text)
+            return run.color ? '<font color="'+(appTheme.palette && appTheme.color(run.color))+'">'+value+'</font>' : value
+        }).join("")
+    }
     function columnAlignment(column) {
         return (root.viewState.leftColumns || [0]).indexOf(root.node.logicalColumn(column)) >= 0 ? Text.AlignLeft : Text.AlignRight
     }
@@ -159,6 +168,7 @@ Item {
             required property bool verbatim
             required property real cellBar
             required property int alignment
+            required property var textRuns
             required property var hierarchy
             readonly property var branch: hierarchy || ({})
             readonly property int depth: branch.depth || 0
@@ -169,7 +179,7 @@ Item {
             Rectangle { anchors.left: parent.left; anchors.right: parent.right; anchors.bottom: parent.bottom; height: 1; visible: !root.viewState.treeNavigation; color: (appTheme.palette && appTheme.color("border")) }
             Rectangle { visible: root.viewState.selected === row && column === 0; width: 2; height: parent.height; color: appTheme.palette.accent }
             Rectangle { objectName: "cell-data-bar"; visible: !!root.viewState.dataBars && cellBar >= 0; anchors.left: parent.left; anchors.leftMargin: 6; anchors.verticalCenter: parent.verticalCenter; width: Math.min(140,Math.max(0,parent.width-12))*Math.max(0,cellBar); height: 14; radius: 2; color: appTheme.palette.accent; opacity: .16 }
-            Text { id: cellLabel; objectName: "cell-label"; property int textAlignment: horizontalAlignment; anchors.fill: parent; anchors.leftMargin: root.hierarchical && column===0 ? 50+cell.depth*32 : root.cellPadding; anchors.rightMargin: root.cellPadding; text: verbatim ? display : appLanguage.text(display); wrapMode: !root.hierarchical && !exactValue && root.viewState.rowHeight > 40 ? Text.Wrap : Text.NoWrap; elide: exactValue ? Text.ElideNone : Text.ElideRight; horizontalAlignment: alignment & Qt.AlignRight ? Qt.AlignRight : Qt.AlignLeft; verticalAlignment: Text.AlignVCenter; font.pixelSize: 14; font.family: appTheme.family; font.features: { "tnum": 1 }; color: (appTheme.palette && appTheme.color("ink")) }
+            Text { id: cellLabel; objectName: "cell-label"; property int textAlignment: horizontalAlignment; anchors.fill: parent; anchors.leftMargin: root.hierarchical && column===0 ? 50+cell.depth*32 : root.cellPadding; anchors.rightMargin: root.cellPadding; text: cell.textRuns && cell.textRuns.length ? root.styledText(cell.textRuns) : verbatim ? display : appLanguage.text(display); textFormat: cell.textRuns && cell.textRuns.length ? Text.StyledText : Text.AutoText; wrapMode: !root.hierarchical && !exactValue && root.viewState.rowHeight > 40 ? Text.Wrap : Text.NoWrap; elide: exactValue ? Text.ElideNone : Text.ElideRight; horizontalAlignment: alignment & Qt.AlignRight ? Qt.AlignRight : Qt.AlignLeft; verticalAlignment: Text.AlignVCenter; font.pixelSize: 14; font.family: appTheme.family; font.features: { "tnum": 1 }; color: (appTheme.palette && appTheme.color("ink")) }
             Rectangle { objectName: "unloaded-row"; visible: cell.placeholder; anchors.left: parent.left; anchors.leftMargin: root.cellPadding; anchors.verticalCenter: parent.verticalCenter; width: Math.max(0,Math.min(130,parent.width-2*root.cellPadding)); height: 8; radius: 4; color: appTheme.palette.border }
             Item {
                 visible: root.hierarchical && cell.column===0; anchors.fill: parent
@@ -261,17 +271,18 @@ Item {
             row=Math.max(0,Math.min(table.rows-1,row)); root.node.selectRow(row); table.positionViewAtRow(row,TableView.Contain); root.revealRow(row); event.accepted=true
     }
     Rectangle {
-        id: footer; anchors.left: parent.left; anchors.right: parent.right; anchors.bottom: parent.bottom
+        id: footer; objectName: "table-footer"; anchors.left: parent.left; anchors.right: parent.right; anchors.bottom: parent.bottom
         height: root.viewState.treeNavigation ? 0 : 30; visible: !root.viewState.treeNavigation; color: (appTheme.palette && appTheme.color("secondary"))
         Rectangle { anchors.top: parent.top; width: parent.width; height: 1; visible: !root.viewState.treeNavigation; color: (appTheme.palette && appTheme.color("border")) }
         Text {
             anchors.left: parent.left; anchors.leftMargin: 9; anchors.verticalCenter: parent.verticalCenter
-            text: table.rows.toLocaleString(Qt.locale(), "f", 0) + appLanguage.text("개")
+            objectName: "table-footer-text"
+            text: root.viewState.footerText !== undefined ? root.viewState.footerText : table.rows.toLocaleString(Qt.locale(), "f", 0) + appLanguage.text("개")
             color: (appTheme.palette && appTheme.color("muted")); font.family: appTheme.family; font.pixelSize: 12
         }
         UiButton {
             objectName: "cell-details-button"
-            visible: !root.viewState.rowDetails && !root.viewState.inline
+            visible: root.viewState.footerText === undefined && !root.viewState.rowDetails && !root.viewState.inline
             anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
             text: appLanguage.text("셀 상세"); enabled: root.viewState.selected >= 0
             implicitHeight: 24; implicitWidth: 66; padding: 3

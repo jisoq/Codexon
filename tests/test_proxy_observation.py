@@ -30,3 +30,21 @@ def test_invalid_truncated_or_unsupported_observation_never_fabricates_metadata(
         assert parser.finish()=={} and parser.error
     assert message_metadata(b'{"model":"m",')=={}
     assert message_metadata(b'{"input":{"model":"fake"},"model":"actual"}')=={'model':'actual'}
+
+
+@pytest.mark.parametrize('effort', ['high', 'low', 'x' * 256])
+def test_nested_effort_keeps_only_bounded_scalars(effort):
+    payload=json.dumps(dict(reasoning=dict(effort=effort,summary='PRIVATE'),
+        response=dict(id='r',reasoning=dict(effort='low',encrypted_content='PRIVATE')),
+        input=[dict(reasoning=dict(effort='PRIVATE'))])).encode()
+    parser=SelectedJSON()
+    for offset in range(0,len(payload),3):parser.feed(payload[offset:offset+3])
+    assert parser.finish()==dict(reasoning=dict(effort=effort),response=dict(id='r',reasoning=dict(effort='low')))
+
+
+@pytest.mark.parametrize('effort', [None, True, 1, ['high'], dict(effort='high'), 'x' * 257])
+def test_invalid_effort_does_not_capture_reasoning_content(effort):
+    payload=json.dumps(dict(model='m',reasoning=dict(effort=effort,summary='PRIVATE'),
+        response=dict(reasoning=dict(effort=effort,summary='PRIVATE')))).encode()
+    parser=SelectedJSON();parser.feed(payload)
+    assert parser.finish()==dict(model='m')
