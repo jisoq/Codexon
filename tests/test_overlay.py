@@ -469,6 +469,42 @@ def test_route_compatibility_never_reuses_another_process_or_ambiguous_window(tm
     assert native.confirm_selection(new) is None
 
 
+def test_unrelated_partial_log_keeps_display_without_confirming_navigation(tmp_path,monkeypatch):
+    path=logfile(tmp_path);path.write_text(route(A),encoding='utf-8')
+    reader=RouteLog(tmp_path);target=dict(hwnd=1,pid=42)
+    initial=observe_selection([target],reader,0)
+    assert initial['selection'].thread_id==A
+    native=WindowsOverlay.__new__(WindowsOverlay)
+    native.targets=lambda:[target];native._navigation_log=reader
+    monkeypatch.setenv('LOCALAPPDATA',str(tmp_path))
+    with path.open('ab') as stream:stream.write(b'ordinary refresh diagnostic still being written')
+    pending=observe_selection([target],reader,.1)
+    assert pending['selection']==initial['selection']
+    assert not pending['confirmed'] and not reader.caught_up and not reader.pending_bytes
+    assert reader.poll(42,.2) is None and native.confirm_selection(target) is None
+    with path.open('ab') as stream:stream.write(b'\n')
+    complete=observe_selection([target],reader,.3)
+    assert complete['selection']==initial['selection'] and complete['confirmed']
+    assert native.confirm_selection(target)==initial['selection']
+
+
+@pytest.mark.parametrize('marker,fields,expected',[
+    ('IAB_LIFECYCLE received browser sidebar owner sync',f'windowId=1 ownerRoutePath=/local/{B}',B),
+    ('thread_stream_view_activity_changed',f'active=false conversationId={A} rendererWindowId=1',None),
+])
+def test_partial_selection_markers_never_retain_display(tmp_path,marker,fields,expected):
+    path=logfile(tmp_path);target=dict(hwnd=1,pid=42)
+    for split in range(1,len(marker)+1):
+        path.write_text(route(A),encoding='utf-8');reader=RouteLog(tmp_path)
+        assert observe_selection([target],reader,0)['selection'].thread_id==A
+        with path.open('ab') as stream:stream.write(('diagnostic '+marker[:split]).encode())
+        assert observe_selection([target],reader,.1)['selection'] is None
+        assert reader.poll(42,.2) is None
+        with path.open('ab') as stream:stream.write((marker[split:]+' '+fields+'\n').encode())
+        selected=observe_selection([target],reader,.3)['selection']
+        assert (selected.thread_id if selected else None)==expected
+
+
 def test_daily_route_log_rollover_keeps_same_process_selection_until_new_route(tmp_path):
     from datetime import datetime,timedelta
 

@@ -19,10 +19,11 @@ def system_reduce_motion():
 
 def observe_selection(targets, log, now):
     """A single live process and its route evidence establish compatibility."""
-    result = {'target': None, 'selection': None, 'issue': ''}
+    result = {'target': None, 'selection': None, 'confirmed': False, 'issue': ''}
     if len(targets) == 1:
         target = targets[0]
-        result.update(target=target, selection=log.poll(target['pid'], now))
+        selection=log.observe(target['pid'], now)
+        result.update(target=target, selection=selection, confirmed=bool(selection and log.caught_up))
         if result['selection'] is None:
             result['issue'] = '세션 화면 확인 중'
     elif targets:
@@ -131,7 +132,7 @@ class WindowsOverlay:
             self._navigation_log=RouteLog(local/'Codex/Logs',packaged)
         try:
             # A bounded read that has not caught up fails closed.
-            return observe_selection(targets,self._navigation_log,time.monotonic())['selection']
+            return self._navigation_log.poll(target['pid'],time.monotonic())
         except (OSError,ValueError):return None
 
     def activate_target(self, hwnd):
@@ -269,7 +270,7 @@ class SelectionTracker(QThread):
                 result = observe_selection(targets, log, now)
             except (OSError, ValueError) as error:
                 log.pending_bytes=0
-                result = {'target': None, 'selection': None, 'issue': '화면 추적 오류: ' + str(error)}
+                result = {'target': None, 'selection': None, 'confirmed': False, 'issue': '화면 추적 오류: ' + str(error)}
             wanted=str(log.path) if len(targets)==1 and log.path else None
             watched=watcher.files()
             obsolete=[path for path in watched if path!=wanted]
