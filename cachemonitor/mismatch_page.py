@@ -57,6 +57,11 @@ def model_text(row, response=False):
     return Verbatim(' / '.join(model_values(row, response)))
 
 
+def response_runs(row):
+    model, effort, mode = model_values(row, True)
+    return [dict(text=model, color='agent:'+(row.get('sid') or '')), dict(text=' / '+effort+' / '+mode)]
+
+
 def record_identity(row):
     return tuple(row['identity']) if row.get('identity') else call_identity(row['home'], row['sid'], row['key'])
 
@@ -71,8 +76,7 @@ def cell_value(row, column, role):
     if role == TEXT_RUNS:
         if column != 2:
             return []
-        model, effort, mode = model_values(row, True)
-        return [dict(text=model, color='accent'), dict(text=' / '+effort+' / '+mode)]
+        return response_runs(row)
     if column in (1, 2):
         response = column == 2
         text = model_text(row, response)
@@ -309,7 +313,8 @@ class MismatchPage(Group):
         if row.get('correction_at') is not None:
             entries.extend([('정정 시각', _timestamp(row['correction_at'])), ('정정 사유', correction_text(row))])
         text = Verbatim('\n'.join(tr(title)+'  '+str(value) for title, value in entries if value is not None and value != ''))
-        self.fields.set_content(text, [(tr(title), value) for title, value in entries], literal=True)
+        self.fields.set_content(text, [(tr(title), value) for title, value in entries], literal=True,
+                                text_runs={tr('응답모델'): response_runs(row)})
         self.detail.show()
         self.close_button.show()
 

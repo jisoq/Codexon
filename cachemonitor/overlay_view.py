@@ -179,7 +179,7 @@ class Drawing:
         self.p.save();self.p.setClipRect(QRectF(x,y,w,h))
         for run in runs:
             run_font=font(self.model.appearance.family,size,weight);run_font.setStrikeOut(run.strike)
-            self.p.setFont(run_font);self.p.setPen(self.colors[run.color])
+            self.p.setFont(run_font);self.p.setPen(self.colors.get(run.color,run.color))
             self.p.drawText(QRectF(x,y,w,h),Qt.AlignLeft|Qt.AlignVCenter,run.text)
             advance=metrics.horizontalAdvance(run.text);x+=advance;w-=advance
         self.p.restore()
@@ -510,7 +510,8 @@ class OverlayContent(Node):
         suffix=', '+tr(effort)
         if mode and str(mode).casefold() not in ('standard','미확인','unknown'):suffix+=', '+str(mode).lower()
         if confirmed:
-            return (TextRun(tr(request),strike=True),TextRun(' '+tr(response),'accent'),TextRun(suffix))
+            color=agent_mark(group.get('id') or (self.data or {}).get('id'),self.appearance).color
+            return (TextRun(tr(request),strike=True),TextRun(' '+tr(response),color),TextRun(suffix))
         return (TextRun(tr(model)+suffix),)
     def subagent_call_label(self,group):return ''.join(run.text for run in self.model_runs(group))
     def agent_model_tooltip(self,group):

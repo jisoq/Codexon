@@ -181,7 +181,8 @@ def test_long_model_names_are_elided_with_full_accessible_details(observed_overl
     metrics = QFontMetrics(font(model.appearance.family, item[5], item[7]))
     runs=fitted_model_runs(item[8]['modelRuns'],metrics,item[3])
     assert runs[0].text.endswith('…') and runs[1].text.endswith('…')
-    assert runs[0].strike and runs[1].color=='accent'
+    from cachemonitor.overlay_icons import agent_mark
+    assert runs[0].strike and runs[1].color==agent_mark('long-model-child',model.appearance).color
     assert runs[2].text==', high'
     assert requested in model.detailBody.state['accessible'] and response in model.detailBody.state['accessible']
     detail = fixture.reveal_comparison(item[0])
@@ -214,9 +215,9 @@ def test_confirmed_main_and_child_models_keep_one_line_and_clear_on_new_call(obs
     main_runs=main[8]['modelRuns'];child_runs=child_line[8]['modelRuns']
     assert [run.text for run in main_runs]==['gpt-6-astra',' gpt-6-sol',', high']
     assert [run.text for run in child_runs]==['gpt-5.6-luna',' gpt-6-sol',', medium, fast']
-    for runs in (main_runs,child_runs):
+    for runs,task_id in ((main_runs,fixture.session.id),(child_runs,child.id)):
         assert runs[0].strike and runs[0].color=='secondary'
-        assert runs[1].color=='accent' and not runs[1].strike
+        assert runs[1].color==agent_mark(task_id,model.appearance).color and not runs[1].strike
         assert not runs[2].strike
     from PySide6.QtGui import QImage,QPainter
     from cachemonitor.overlay_view import palette
@@ -234,11 +235,18 @@ def test_confirmed_main_and_child_models_keep_one_line_and_clear_on_new_call(obs
     capture(model.panel_width(),model.panel_height(),model.paint,tmp_path/'inline-main.png')
     capture(round(model.detail_width),model.state['detailBodyHeight'],model.detailBody.paint,tmp_path/'inline-child.png')
     colors=palette(model.appearance)
-    for request in ('gpt-6-astra','gpt-5.6-luna'):
+    for request,task_id in (('gpt-6-astra',fixture.session.id),('gpt-5.6-luna',child.id)):
         rendered=next(value for value in drawn if value[0]==request)
         assert rendered[2] and rendered[3]==colors['secondary'].name()
         response=next(value for value in drawn if value[0]==' gpt-6-sol' and value[1]==rendered[1])
-        assert not response[2] and response[3]==colors['accent'].name()
+        assert not response[2] and response[3]==agent_mark(task_id,model.appearance).color
+    from dataclasses import replace
+    previous=model.appearance
+    fixture.widget.set_content(model.data,appearance=replace(previous,accent='#ff00ff'))
+    assert main_line()[8]['modelRuns'][1].color==agent_mark(fixture.session.id,model.appearance).color
+    assert next(item for item in model._detail_items if item[8].get('modelRuns'))[8]['modelRuns'][1].color==agent_mark(child.id,model.appearance).color
+    assert palette(model.appearance)['accent'].name()=='#ff00ff'
+    fixture.widget.set_content(model.data,appearance=previous)
     geometry=model.layout();height=model.state['detailBodyHeight']
     fixture.call('new-main',configured='gpt-5.6-sol');fixture.refresh([child_source])
     own=main_usage(model.data)

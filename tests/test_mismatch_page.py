@@ -75,7 +75,7 @@ def test_response_effort_and_mode_require_their_own_confirmation(page):
     model = page.table.model()
     assert model.data(model.index(0, 2), Qt.DisplayRole) == 'observed-model / 미확인 / 미확인'
     assert model.data(model.index(0, 1), TEXT_RUNS) == []
-    assert model.data(model.index(0, 2), TEXT_RUNS) == [dict(text='observed-model', color='accent'), dict(text=' / 미확인 / 미확인')]
+    assert model.data(model.index(0, 2), TEXT_RUNS) == [dict(text='observed-model', color='agent:deleted-session'), dict(text=' / 미확인 / 미확인')]
     row = dict(row, response_effort_confirmed=True, response_tier_confirmed=True)
     assert model_values(row, True) == ('observed-model', 'low', 'Standard')
     assert model_values(dict(row, response_effort_conflict=True), True)[1] == '미확인'
@@ -182,15 +182,43 @@ def test_mismatch_navigation_renders_saved_detail_and_full_models(tmp_path, widt
         footer = next(item for item in walk(table) if item.objectName() == 'table-footer-text')
         assert re.search(r'\(UTC[+-]\d{2}:\d{2}\)$', footer.property('text'))
         assert response in page.table.cellDetails(0, 2)
+        from html import escape
+        from cachemonitor.overlay_icons import agent_mark
+        from cachemonitor.theme import shared_theme
+        theme = shared_theme()
+        def response_color():
+            return agent_mark(rows[0]['sid'], theme.appearance).color
+        def response_label():
+            return next(item for item in walk(table) if item.objectName() == 'cell-label'
+                        and escape(response, quote=True) in str(item.property('text')))
+        assert '<font color="'+response_color()+'">' in response_label().property('text')
         assert window.quick.grabFramebuffer().save(str(evidence/f'mismatch-{name}-table.png'))
         click_row(window, page.table, 0, 2)
         wait_for_rendered(lambda: page.detail.isVisible())
         assert response in page.fields.text()
         assert 'private-response-0' not in page.fields.text()
         detail = control(window, page.fields)
-        rendered = [item.property('text') for item in walk(detail) if item.objectName() == 'record-field-value']
-        assert any(response in str(value) for value in rendered)
+        def response_edit():
+            return next((item for item in walk(detail) if item.objectName() == 'record-field-value'
+                         and escape(response, quote=True) in str(item.property('text'))), None)
+        wait_for_rendered(lambda: response_edit() is not None)
+        quick_document = response_edit().property('textDocument')
+        def response_document():
+            return quick_document.textDocument()
+        document = response_document()
+        assert document.toPlainText() == response+' / 미확인 / 미확인'
+        assert document.find(response).charFormat().foreground().color().name() == response_color()
+        assert '<font' not in page.fields.text()
+        from dataclasses import replace
+        from cachemonitor.overlay_appearance import default_appearance
         assert window.quick.grabFramebuffer().save(str(evidence/f'mismatch-{name}-detail.png'))
+        theme.configure(appearance=replace(default_appearance(True), accent='#ff00ff'))
+        wait_for_rendered(lambda: '<font color="'+response_color()+'">' in response_label().property('text'))
+        wait_for_rendered(lambda: response_document().find(response).charFormat().foreground().color().name() == response_color())
+        assert response_color() != theme.color('accent')
+        assert response_document().toPlainText() == response+' / 미확인 / 미확인'
+        assert not window.qml_errors
+        assert window.quick.grabFramebuffer().save(str(evidence/f'mismatch-{name}-detail-dark.png'))
         assert not window.qml_errors
     finally:
         window.quitting=True

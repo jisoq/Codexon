@@ -33,7 +33,7 @@ Item {
     function styledText(runs) {
         return runs.map(run => {
             let value=escapedText(run.text)
-            return run.color === "accent" ? '<font color="'+appTheme.palette.accent+'">'+value+'</font>' : value
+            return run.color ? '<font color="'+(appTheme.palette && appTheme.color(run.color))+'">'+value+'</font>' : value
         }).join("")
     }
     function columnAlignment(column) {
