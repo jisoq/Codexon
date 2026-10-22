@@ -374,13 +374,14 @@ class OverlayController(QObject):
 
     def selection_confirmed(self):
         selection=self.target_state.get('selection')
-        return bool(selection and selection.host=='local' and len(self.session_lookup.get(selection.thread_id,[]))==1
+        return bool(self.target_state.get('confirmed',True) and selection and selection.host=='local'
+                    and len(self.session_lookup.get(selection.thread_id,[]))==1
                     and time.monotonic()-self.observed_at<=3)
 
     def navigation_availability(self, home, sid):
         if not self.enabled:return dict(enabled=False,reason='오버레이 꺼짐')
         target=self.target_state.get('target');selection=self.target_state.get('selection')
-        if (not self.native or not target or not selection or selection.host!='local'
+        if (not self.native or not target or not self.target_state.get('confirmed',True) or not selection or selection.host!='local'
                 or not selection.thread_id or time.monotonic()-self.observed_at>3):
             return dict(enabled=False,reason='현재 세션 확인 불가')
         if not self.selected_scope(home,sid):
@@ -419,7 +420,7 @@ class OverlayController(QObject):
             return dict(enabled=False,reason='현재 세션 확인 불가')
         self.collapsed=False
         self._store_collapsed()
-        self.observed_at=time.monotonic();self.target_state={**self.target_state,'selection':selection}
+        self.observed_at=time.monotonic();self.target_state={**self.target_state,'selection':selection,'confirmed':True}
         self.refresh()
         if call_id:
             self.widget.content_model.graph_pinned=False

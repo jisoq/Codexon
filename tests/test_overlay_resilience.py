@@ -86,13 +86,13 @@ def test_tracker_finishes_backlog_and_observes_appends_without_heartbeat(tmp_pat
         targets=lambda:enumerated.append(1) or list(targets)))
     monkeypatch.setattr(overlay_windows,'WindowEvents',lambda native,changed:
         native_changed.append(changed) or SimpleNamespace(targets=set(),close=lambda:None))
-    read=RouteLog.poll
+    read=RouteLog.observe
     def read_then_close_window(self,*args):
         result=read(self,*args)
         if drop_on_read[0]:
             drop_on_read[0]=False;targets.clear();native_changed[0]()
         return result
-    monkeypatch.setattr(RouteLog,'poll',read_then_close_window)
+    monkeypatch.setattr(RouteLog,'observe',read_then_close_window)
     observe=overlay_windows.observe_selection
     def observe_targets(targets,*args):
         without_target[0]=not targets

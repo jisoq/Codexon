@@ -85,6 +85,12 @@ class RouteLog:
                 elif fields.get('active') == 'true': self.inactive.discard(window)
 
     def poll(self, pid, now):
+        return self._read(pid,now,allow_partial=False)
+
+    def observe(self, pid, now):
+        return self._read(pid,now,allow_partial=True)
+
+    def _read(self, pid, now, *, allow_partial):
         self.pending_bytes = 0
         if self.pid != pid:
             self.pid = pid; self.path = None; self.states.clear(); self.inactive.clear()
@@ -141,7 +147,12 @@ class RouteLog:
         else:
             self.partial = tail
         self.caught_up = self.offset >= size and not self.partial and not self.skipping
-        if not self.caught_up or len(self.states) != 1: return None
+        if not self.caught_up:
+            if not allow_partial or self.pending_bytes or self.skipping:return None
+            markers=(ROUTE_MARKER.encode('ascii'),ACTIVITY_MARKER.encode('ascii'))
+            if any(marker in self.partial or any(self.partial.endswith(marker[:end]) for end in range(1,len(marker)))
+                   for marker in markers):return None
+        if len(self.states) != 1: return None
         selected = next(iter(self.states.values()))
         return None if selected.window_id in self.inactive else selected
 

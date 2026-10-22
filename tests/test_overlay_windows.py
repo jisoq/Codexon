@@ -46,6 +46,8 @@ def test_tool_windows_do_not_count_as_primary_targets(styles, expected, monkeypa
 
     selection = Selection('11111111-1111-1111-1111-111111111111')
     class Log:
+        caught_up=True
+        def observe(self, pid, now):return self.poll(pid, now)
         def poll(self, pid, now):
             assert pid == 42
             return selection
