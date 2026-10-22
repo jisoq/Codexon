@@ -169,7 +169,11 @@ def test_compact_default_refreshes_keep_a_bounded_result_cache(tmp_path):
     app.processEvents()
 
 
-def test_selected_graph_rejects_old_choice_and_reuses_matching_refresh(tmp_path):
+@pytest.mark.parametrize('width',(1000,520))
+def test_selected_graph_rejects_old_choice_and_reuses_matching_refresh(tmp_path,request,width):
+    from PySide6.QtCore import QPointF
+    from cachemonitor.presentation import Scroll
+    from cachemonitor.quick_qa import control,dispose,mount,render_plot
     from cachemonitor.quota_worker import QuotaComputation
     from cachemonitor.quota_panel import QuotaPanel
     from test_quota_value_history import sample_report
@@ -177,8 +181,13 @@ def test_selected_graph_rejects_old_choice_and_reuses_matching_refresh(tmp_path)
     engine=QuotaComputation();worker=QueryWorker()
     compact=engine._prepare(sample_report())
     panel=QuotaPanel(QSettings(str(tmp_path/'charts.ini'),QSettings.IniFormat))
-    refreshes=[];panel.refresh_changed.connect(refreshes.append)
     panel.receive(dict(report={**compact,'_worker':worker}))
+    scroll=Scroll();scroll.put(fillViewport=True);scroll.setWidget(panel)
+    host=mount(scroll,width,680)
+    request.addfinalizer(lambda:dispose(host))
+    def geometry(node):
+        item=control(host,node)
+        return item.mapToItem(control(host,panel),QPointF()),item.width(),item.height()
     assert panel.history.rows[-1]['at']==280
     assert panel.manage_button.isVisible()
     panel.cycle_choice.setCurrentIndex(panel.cycle_choice.findData(100))
@@ -201,16 +210,22 @@ def test_selected_graph_rejects_old_choice_and_reuses_matching_refresh(tmp_path)
     assert len(worker.requests)==pending and panel.history.rows[-1]['at']==220
     assert panel.cycle_choice.currentData()==160
     rows=panel.history.rows
+    render_plot(host,panel.history)
+    positions={node:geometry(node) for node in (panel.history,panel.cycle_choice,panel.manage_button)}
     refreshed=engine._prepare(sample_report())
     panel.receive(dict(report={**refreshed,'_worker':worker}))
     request=worker.requests[-1]
+    render_plot(host,panel.history)
+    assert {node:geometry(node) for node in positions}==positions
+    assert control(host,panel.manage_button).isVisible()
+    assert not panel.exclusions.toggle.isEnabled()
     assert panel.history.isVisible() and panel.history.rows is rows
     assert not panel.history_loading.isVisible() and not panel.history_empty.isVisible()
-    assert refreshes[-1] is True
+    assert panel.cycle_loading.isVisible() and panel.cycle_loading._state['running']
     worker.result.emit(dict(kind='chart',key=request['key'],error='unavailable'))
     assert not panel.history_loading.isVisible() and not panel.history_loading._state['running']
     assert panel.history.isVisible() and panel.history.rows is rows
-    assert refreshes[-1] is False
+    assert not panel.cycle_loading.isVisible() and not panel.cycle_loading._state['running']
     assert panel.activity_note.isVisible() and panel.state_retry.isVisible()
     panel.retry_failed()
     assert panel.history.isVisible() and panel.history.rows is rows
@@ -222,6 +237,17 @@ def test_selected_graph_rejects_old_choice_and_reuses_matching_refresh(tmp_path)
     assert panel.history_loading.isVisible() and not panel.cycle_table.isVisible()
     worker.result.emit(engine.execute(dict(request,id=4)))
     assert panel.cycle_table.isVisible() and panel.cycle_table.rowCount()==len(panel.history.rows)
+    render_plot(host,panel.history)
+    positions={node:geometry(node) for node in (panel.history,panel.cycle_choice,panel.summary_context,panel.manage_button)}
+    refreshed=engine._prepare(sample_report(),selection=160)
+    panel.receive(dict(report={**refreshed,'_worker':worker}))
+    request=worker.requests[-1]
+    render_plot(host,panel.history)
+    assert {node:geometry(node) for node in positions}==positions
+    assert control(host,panel.summary_context).isVisible() and control(host,panel.manage_button).isVisible()
+    worker.result.emit(engine.execute(dict(request,id=45)))
+    render_plot(host,panel.history)
+    assert {node:geometry(node) for node in positions}==positions
     pending=len(worker.requests)
     panel.hover_cycle(0,'table')
     assert panel.history.linked_index==0 and panel.cycle_table.state['highlightedRow']==0
@@ -233,4 +259,5 @@ def test_selected_graph_rejects_old_choice_and_reuses_matching_refresh(tmp_path)
     assert len(worker.requests)==pending and panel.cycle_choice.currentData()=='all'
     panel.cycle_choice.setCurrentIndex(panel.cycle_choice.findData(160))
     assert not panel.cycle_table.isVisible()
+    assert not host.qml_errors
     app.processEvents()

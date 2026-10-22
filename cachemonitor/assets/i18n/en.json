@@ -2868,6 +2868,7 @@
   "Codex에서 작업하면 사용 기록이 자동으로 표시됩니다.": "Usage records appear automatically when you work in Codex.",
   "갱신 실패, 이전 결과 표시 중": "Refresh failed; showing previous results",
   "{operation} / {seconds}초 경과": "{operation} / {seconds}s elapsed",
+  "처리가 계속되고 있습니다.": "Processing is still in progress.",
   "과거 사용 기록 계산 중": "Calculating historical usage records",
   "사용 기록 갱신 중": "Refreshing usage records",
   "기록 수집이 지연되거나 중단되었습니다. 수집 상태를 확인하거나 다시 시도하세요.": "Record collection is delayed or interrupted. Check collection status or try again.",

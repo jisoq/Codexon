@@ -226,13 +226,12 @@ class Dashboard(TrayWindow):
             field=labeled_control(title,node);self.common_fields[node]=field;self.common_filters.addWidget(field)
         self.scope_note=label('수집 중','muted');self.scope_note.put(fontSize=12);self.scope_note.setFixedHeight(18);layout.addWidget(self.scope_note)
         self.pages=Stack();self.pages.put(deferPages=True);layout.addWidget(self.pages,1);self.scrollers={}
-        self.analysis_loading={};self._loading_nodes=[];self._quota_refreshing=False
+        self.analysis_loading={};self._loading_nodes=[]
         self.build_compare();self.build_explorer()
         from .quota_panel import QuotaPanel
         self.quota_panel=QuotaPanel(self.settings);quota_scroll=Scroll();quota_scroll.put(fillViewport=True)
         self.quota_panel.centralized_errors=True
         self.quota_panel.set_presentation_active(False)
-        self.quota_panel.refresh_changed.connect(self.update_refresh_status)
         self.quota_panel.retry_requested.connect(self.retry_quota)
         self.quota_panel.fault_changed.connect(lambda facts:self.observe_error('quota.query','quota',facts,
             healthy=bool(facts.get('query_healthy')),resolution='사용 한도 분석 결과 갱신 확인'))
@@ -1103,10 +1102,9 @@ class Dashboard(TrayWindow):
                 region['retained']=bool(state.get('retained')) or self.history_parent_retained()
             node.put(analysisLoading=region)
 
-    def update_refresh_status(self,quota_refreshing=None):
-        if quota_refreshing is not None:self._quota_refreshing=quota_refreshing
+    def update_refresh_status(self):
         state=self.analysis_loading
-        refreshing=self._quota_refreshing if self.current_page==3 else bool(state.get('active') and state.get('retained'))
+        refreshing=self.current_page!=3 and bool(state.get('active') and state.get('retained'))
         failed=state.get('mode')=='error' and state.get('retained')
         self.refresh_status.setVisible(refreshing and not failed)
         self.refresh_status.put(running=refreshing and not failed)
@@ -1115,8 +1113,7 @@ class Dashboard(TrayWindow):
             self.refresh_text.setText('갱신 실패, 이전 결과 표시 중')
             return
         if refreshing:
-            detail=(tr('선택한 조건의 사용량을 계산하고 있습니다.') if self.current_page==3 else
-                    tr('기록 처리에 시간이 걸리고 있습니다. 다른 탭을 이용할 수 있습니다.') if state.get('slow') else state.get('detail',''))
+            detail=(tr('기록 처리에 시간이 걸리고 있습니다. 다른 탭을 이용할 수 있습니다.') if state.get('slow') else state.get('detail',''))
             progress=state.get('progressText','')
             elapsed=state.get('elapsedText','')
             self.refresh_status.setToolTip('\n'.join(filter(None,(tr('최신 기록 반영 중'),detail,progress,elapsed))))

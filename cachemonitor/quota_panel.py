@@ -41,7 +41,6 @@ class QuotaPanel(Group):
     exclusion_restore_requested=Signal(str)
     cycle_clear_requested=Signal(object)
     fault_changed=Signal(dict)
-    refresh_changed=Signal(bool)
     retry_requested=Signal()
 
     def __init__(self,settings):
@@ -66,7 +65,6 @@ class QuotaPanel(Group):
         self.expected_home=None
         self._query_worker=None
         self._query_cache={}
-        self._refreshing=set()
         self._query_pending=None
         self._prepared_query=None
         self._chart_pending=None
@@ -133,7 +131,11 @@ class QuotaPanel(Group):
         self.cycle_loading.setFixedSize(28,28)
         self.cycle_loading.setAccessibleName('사용량 계산 중')
         self.cycle_loading.setToolTip('전체 이력을 계산하고 있습니다. 현재 주기는 계속 확인할 수 있습니다.')
-        self.cycle_loading.hide();cycle_controls.addWidget(self.cycle_loading)
+        self.cycle_loading.hide()
+        cycle_loading_slot=Group();cycle_loading_slot.setFixedSize(28,28)
+        cycle_loading_layout=Column(cycle_loading_slot);cycle_loading_layout.setContentsMargins(0,0,0,0)
+        cycle_loading_layout.addWidget(self.cycle_loading)
+        cycle_controls.addWidget(cycle_loading_slot)
         cycle_controls.addWidget(self.cycle_choice,1)
         for button in (self.exclusions.toggle,self.exclusions.history_toggle):
             button.put(fontSize=12,height=30,flat=True)
@@ -303,10 +305,8 @@ class QuotaPanel(Group):
         self.waiting_title.setText(title);self.waiting_note.setText(detail)
         self.waiting_title.put(color='error' if failed else 'ink')
         self.state_retry.setVisible(failed)
-        if has_usage and failed:
-            self.activity_note.setText('갱신 실패, 이전 결과 표시 중');self.activity_note.show()
-        elif not busy and not self._loading_since and not self._edit_jobs:
-            self.activity_note.hide()
+        self.activity_note.setVisible(has_usage and failed)
+        if has_usage and failed:self.activity_note.setText('갱신 실패, 이전 결과 표시 중')
 
     def set_homes(self,homes):
         selected=self.home_choice.currentData() or self.report.get('home')
@@ -357,8 +357,10 @@ class QuotaPanel(Group):
                    '삭제 중' if job and job.get('delete') else
                    '초기화 중' if self._cycle_clear_pending else
                    '제외 내역 처리 중' if job else '사용량 계산 중')
-            detail=f'{label} / {elapsed:,}초 경과'
-            if elapsed>=30:detail+=' / 처리가 계속되고 있습니다.'
+            detail=formatted('{operation} / {seconds}초 경과',operation=tr(
+                label if job else '과거 사용 기록 계산 중' if self.report.get('history_pending') else
+                '사용 기록 갱신 중'),seconds=elapsed)
+            if elapsed>=30:detail+=' / '+tr('처리가 계속되고 있습니다.')
             self.cycle_loading.setToolTip(detail);self.cycle_loading.setAccessibleName(detail)
             if self.presentation_active:self._activity_timer.start()
             else:self._activity_timer.stop()
@@ -381,14 +383,10 @@ class QuotaPanel(Group):
                                                        and not self.report.get('history_pending')))
                 self.clear_cycle_button.setVisible(bool(selected))
         failed=bool(self.failed_queries() or not self.report_pending and (self.report.get('history_failed') or self.issue))
-        self.activity_note.setVisible(active and not self.initial_loading.isVisible() or failed and not self.history_waiting.isVisible())
+        self.activity_note.setVisible(failed and not self.history_waiting.isVisible())
         if active:
-            self.activity_note.setText(formatted('{operation} / {seconds}초 경과',operation=(
-                tr(label if job else '과거 사용 기록 계산 중' if self.report.get('history_pending') else
-                   '사용 기록 갱신 중')),seconds=elapsed))
             self.initial_loading.put(elapsedText=formatted('{seconds}초 경과',seconds=elapsed),slow=elapsed>=30)
-        elif failed:
-            self.activity_note.setText('갱신 실패, 이전 결과 표시 중')
+        if failed:self.activity_note.setText('갱신 실패, 이전 결과 표시 중')
 
     def receive(self,value):
         self.receive_activity(value)
@@ -538,8 +536,8 @@ class QuotaPanel(Group):
                 self.model_legend.setVisible(retained and not all_cycles)
                 self.history_empty.setVisible(not loading and not retained)
                 if not loading:self.history_empty.setText('차트를 계산하지 못했습니다.')
-                if hasattr(self,'summary_context'):self.summary_context.hide()
-                if hasattr(self,'manage_button'):self.manage_button.hide()
+                if hasattr(self,'summary_context') and not retained:self.summary_context.hide()
+                if hasattr(self,'manage_button') and not retained:self.manage_button.hide()
                 self.exclusions.set_context(self.report,None,True)
                 self.update_activity()
                 if hasattr(self,'sync_dialog'):self.sync_dialog()
@@ -627,10 +625,6 @@ class QuotaPanel(Group):
         while len(self._query_cache)>8:self._query_cache.pop(next(iter(self._query_cache)))
 
     def _set_loading(self,node,active,detail=None,*,retained=False):
-        before=bool(self._refreshing)
-        if active and retained:self._refreshing.add(node)
-        else:self._refreshing.discard(node)
-        if before!=bool(self._refreshing):self.refresh_changed.emit(bool(self._refreshing))
         if node in (self.cycle_loading,self.history_loading,self.initial_loading):
             node.put(running=active,**({'detail':detail} if detail is not None else {}))
             if active:self._loading_since.setdefault(node,time.monotonic())

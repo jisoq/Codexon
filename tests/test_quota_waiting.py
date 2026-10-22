@@ -1,14 +1,15 @@
 """Visible operation feedback and chart reuse at normal and compact widths."""
 import pytest
-from PySide6.QtCore import QSettings
+from PySide6.QtCore import QPointF, QSettings
 from PySide6.QtWidgets import QApplication
 from cachemonitor.presentation import Scroll
-from cachemonitor.quick_qa import click,dispose,mount,render_plot,walk
+from cachemonitor.quick_qa import click,control,dispose,mount,render_plot,walk
 from cachemonitor.quota_panel import QuotaPanel
 from cachemonitor.quota_worker import QuotaComputation
 from test_quota_page import quota_page
 from test_quota_query import QueryWorker,query_report
 from test_quota_value_history import sample_report
+from test_ui import dashboard
 
 
 @pytest.mark.parametrize('width',(1000,520))
@@ -40,20 +41,35 @@ def test_first_report_collection_empty_pause_and_failure_are_distinct(tmp_path,w
     finally:dispose(host)
 
 
-def test_same_scope_report_refresh_and_failure_preserve_displayed_values(tmp_path):
-    app=QApplication.instance() or QApplication([])
-    panel=QuotaPanel(QSettings(str(tmp_path/'retained.ini'),QSettings.IniFormat))
-    panel.receive(dict(report=sample_report()))
+@pytest.mark.parametrize('width',(1000,520))
+def test_same_scope_report_refresh_and_failure_preserve_displayed_values(dashboard,width):
+    host=dashboard;host.resize(width,680);host.change_page(3)
+    panel=host.quota_panel
+    host.receive_quota(dict(home='fixture',report={**sample_report(),'home':'fixture'}))
     rows=panel.history.rows
     values={key:node.text() for key,node in panel.summary_values.items()}
-    panel.receive(dict(report_pending=True))
-    assert panel.history.rows is rows and not panel.initial_loading.isVisible()
-    assert panel.activity_note.isVisible()
-    panel.receive(dict(report_pending=False,issue='Refresh failed'))
+    render_plot(host,panel.history)
+    def geometry(node):
+        item=control(host,node)
+        return item.mapToItem(control(host,panel),QPointF()),item.width(),item.height()
+    positions={node:geometry(node) for node in (panel.history,panel.cycle_choice)}
+    for _ in range(2):
+        host.receive_quota(dict(home='fixture',report_pending=True))
+        assert render_plot(host,panel.cycle_loading).isVisible()
+        assert panel.history.rows is rows and not panel.initial_loading.isVisible()
+        assert not panel.activity_note.isVisible()
+        assert not control(host,host.refresh_status).isVisible()
+        assert not control(host,host.refresh_text).isVisible()
+        assert {node:geometry(node) for node in positions}==positions
+        host.receive_quota(dict(home='fixture',report=panel.report))
+        render_plot(host,panel.history)
+        assert not panel.cycle_loading.isVisible()
+        assert {node:geometry(node) for node in positions}==positions
+    host.receive_quota(dict(home='fixture',report_pending=False,issue='Refresh failed'))
     assert panel.history.rows is rows and panel.activity_note.isVisible()
     assert {key:node.text() for key,node in panel.summary_values.items()}==values
     assert panel.state_retry.isVisible() and not panel._activity_timer.isActive()
-    panel.deleteLater();app.processEvents()
+    assert not host.qml_errors
 
 
 def test_paused_report_reads_and_failures_are_distinct_from_paused_collection(tmp_path):
@@ -69,10 +85,15 @@ def test_paused_report_reads_and_failures_are_distinct_from_paused_collection(tm
     panel.deleteLater();app.processEvents()
 
 
-def test_hidden_report_timer_suspends_and_refresh_labels_follow_language(tmp_path):
+def test_hidden_report_timer_suspends_and_refresh_labels_follow_language(tmp_path,monkeypatch):
+    from types import SimpleNamespace
+    from PySide6.QtGui import QAccessible
+    import cachemonitor.quota_panel as quota_panel
+    from cachemonitor.quick_qa import scene_view
     from cachemonitor.i18n import set_language
     app=QApplication.instance() or QApplication([])
     panel=QuotaPanel(QSettings(str(tmp_path/'hidden-status.ini'),QSettings.IniFormat))
+    host=None
     try:
         panel.receive(dict(report_pending=True))
         started=panel._loading_since[panel.initial_loading]
@@ -81,11 +102,24 @@ def test_hidden_report_timer_suspends_and_refresh_labels_follow_language(tmp_pat
         panel.set_presentation_active(True)
         assert panel._activity_timer.isActive() and panel._loading_since[panel.initial_loading]==started
         set_language('en')
+        monkeypatch.setattr(quota_panel,'time',SimpleNamespace(monotonic=lambda:started))
         panel.receive(dict(report=sample_report(),report_pending=True))
-        assert panel.activity_note.isVisible()
-        assert not any('\uac00'<=char<='\ud7a3' for char in panel.activity_note.text())
+        scroll=Scroll();scroll.put(fillViewport=True);scroll.setWidget(panel)
+        host=mount(scroll,1000,680)
+        assert panel.cycle_loading.isVisible() and not panel.activity_note.isVisible()
+        for elapsed in (0,31):
+            monkeypatch.setattr(quota_panel,'time',SimpleNamespace(monotonic=lambda:started+elapsed))
+            panel.update_activity()
+            spinner=render_plot(host,panel.cycle_loading)
+            accessible=QAccessible.queryAccessibleInterface(spinner)
+            assert accessible
+            for text in (scene_view(host,panel.cycle_loading).property('toolTipText'),accessible.text(QAccessible.Name)):
+                assert str(elapsed) in text
+                assert not any('\uac00'<=char<='\ud7a3' for char in text),text
     finally:
-        set_language('ko');panel.deleteLater();app.processEvents()
+        set_language('ko')
+        if host is not None:dispose(host)
+        else:panel.deleteLater();app.processEvents()
 
 
 def test_hidden_conversion_does_not_schedule_queries_on_refresh(tmp_path):
