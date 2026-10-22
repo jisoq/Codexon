@@ -99,7 +99,7 @@ def test_full_fallback_retains_affected_integration_targets_without_duplicate_co
     monkeypatch.setattr(verify,'file_hashes',lambda:{'cachemonitor/settings_page.py':'changed'})
     monkeypatch.setattr(verify,'changed_files',lambda *args:{'cachemonitor/settings_page.py'})
     monkeypatch.setattr(verify,'release_version_only',lambda **kwargs:False)
-    assert verify.main(['--full','--base','verified','--plan'])==0
+    assert verify.main(['--full','--base','HEAD','--plan'])==0
     report=json.loads(capsys.readouterr().out)
     assert report['suite']=='essential+affected'
     assert 'tests/test_settings.py' in report['affected_tests']
@@ -218,7 +218,8 @@ def test_unmapped_and_package_only_runs_do_not_advance_source_baseline(tmp_path,
     assert json.loads(capsys.readouterr().out)['result'] == 'unmapped'
     assert baseline.read_bytes() == original
     monkeypatch.setattr(verify, 'package_check', lambda exe, report: {'runtime':'verified'})
-    assert verify.main(['--package-only', '--package-exe', 'synthetic.exe']) == 0
+    executable = tmp_path/'synthetic.exe'; executable.write_bytes(b'package fixture')
+    assert verify.main(['--package-only', '--package-exe', str(executable)]) == 0
     assert json.loads(capsys.readouterr().out)['pytest'] is None
     assert baseline.read_bytes() == original
 
@@ -398,3 +399,284 @@ def test_basic_missing_baseline_stays_basic_and_keeps_unmapped_guard(tmp_path, m
     monkeypatch.setattr(verify, 'changed_files', lambda *args: {'cachemonitor/unmapped_new.py'})
     assert verify.main(['--basic', '--plan']) == 2
     assert json.loads(capsys.readouterr().out)['unmapped'] == ['cachemonitor/unmapped_new.py']
+
+
+@pytest.fixture
+def diagnostic_state(monkeypatch):
+    import tools.check_diagnostics as diagnostics
+    diagnostics.reset()
+    monkeypatch.setattr(diagnostics, 'emit', lambda value: None)
+    yield
+    diagnostics.reset()
+
+
+def test_first_diagnostic_survives_large_output_and_product_failure(tmp_path, diagnostic_state):
+    import sys
+    from tools.verify_changes import run_logged
+    first = tmp_path/'first.json'; first.mkdir()
+    second = tmp_path/'second.json'; second.mkdir()
+    source = (
+        'from pathlib import Path\n'
+        'from tools.check_diagnostics import DiagnosticFailure, write_json, emit, status\n'
+        'import sys\n'
+        f'for name in ({str(first)!r}, {str(second)!r}):\n'
+        '    try: write_json(Path(name), {})\n'
+        '    except DiagnosticFailure: pass\n'
+        'sys.stdout.write("x" * 1100000 + "\\n")\n'
+        'emit(dict(product_exit_code=7, diagnostics=status()))\n'
+        'sys.exit(7)\n')
+    result = run_logged([sys.executable, '-u', '-c', source], tmp_path/'check.log')
+    assert result.returncode == result.product_exit_code == 7
+    assert result.diagnostics['first_error']['path'] == str(first)
+    assert result.diagnostics['first_error']['exception_type'] in ('PermissionError', 'IsADirectoryError')
+    assert str(first) not in result.stdout
+
+
+def verification_probe(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import tools.verify_changes as verify
+    import tools.check_environment as environment
+    import tools.build_native as native
+    baseline = tmp_path/'last-success.json'
+    baseline.write_text(json.dumps({'files':{'cachemonitor/dashboard.py':'before'}}), encoding='utf-8')
+    monkeypatch.setattr(verify, 'BASELINE', baseline)
+    monkeypatch.setattr(verify, 'REPORTS', tmp_path/'reports')
+    monkeypatch.setattr(verify, 'file_hashes', lambda: {'cachemonitor/dashboard.py':'after'})
+    monkeypatch.setattr(verify, 'release_version_only', lambda **kwargs: False)
+    monkeypatch.setattr(environment, 'check_environment', lambda: dict(errors=[]))
+    monkeypatch.setattr(native, 'extension_path', lambda: tmp_path/'absent.pyd')
+    monkeypatch.setenv('CODEXON_CPU_BACKEND', 'auto')
+    def run(command, log):
+        log.write_text('Check completed', encoding='utf-8')
+        return SimpleNamespace(returncode=0, stdout='Check completed')
+    monkeypatch.setattr(verify, 'run_logged', run)
+    return verify, baseline
+
+
+@pytest.mark.parametrize('product_code', [0, 9])
+def test_report_failure_preserves_product_status_and_baseline(tmp_path, monkeypatch, capsys,
+                                                            diagnostic_state, product_code):
+    from types import SimpleNamespace
+    verify, baseline = verification_probe(tmp_path, monkeypatch)
+    original = baseline.read_bytes()
+    def run(command, log):
+        log.write_text('Check completed', encoding='utf-8')
+        (log.parent/'report.json').mkdir(exist_ok=True)
+        return SimpleNamespace(returncode=product_code, stdout='Check completed')
+    monkeypatch.setattr(verify, 'run_logged', run)
+    assert verify.main([]) == (product_code or 86)
+    result = json.loads(capsys.readouterr().out)
+    assert result['product_exit_code'] == product_code
+    assert not result['report_persisted']
+    assert result['diagnostics']['first_error']['path'].endswith('report.json')
+    assert baseline.read_bytes() == original
+    assert __import__('pathlib').Path(result['rerun_manifest']).is_file()
+
+
+def test_relocated_rerun_keeps_selection_resolved_base_and_original_baseline(tmp_path, monkeypatch, capsys, diagnostic_state):
+    import base64
+    from pathlib import Path
+    from types import SimpleNamespace
+    verify, baseline = verification_probe(tmp_path, monkeypatch)
+    original = baseline.read_bytes()
+    resolved = 'a' * 40
+    def git_bytes(*args):
+        if args[0] == 'rev-parse': return resolved.encode()
+        if args[0] == 'diff': return b'cachemonitor/dashboard.py\0'
+        if args[0] == 'ls-files': return b''
+        raise AssertionError(args)
+    monkeypatch.setattr(verify, 'git_bytes', git_bytes)
+    def fail(command, log):
+        log.write_text('Product failed', encoding='utf-8')
+        return SimpleNamespace(returncode=9, stdout='Product failed')
+    monkeypatch.setattr(verify, 'run_logged', fail)
+    first_root = tmp_path/'first'
+    assert verify.main(['--base', 'mutable-ref', '--diagnostics', str(first_root)]) == 9
+    first = json.loads(capsys.readouterr().out)
+    manifest = Path(first['rerun_manifest'])
+    frozen = json.loads(manifest.read_text(encoding='utf-8'))
+    assert frozen['base_commit'] == resolved
+    assert base64.b64decode(frozen['baseline']['content']) == original
+    first_report = json.loads(Path(first['report']).read_text(encoding='utf-8'))
+    baseline.write_text(json.dumps({'files':{'cachemonitor/dashboard.py':'after'}}), encoding='utf-8')
+    newer = baseline.read_bytes()
+    def passed(command, log):
+        log.write_text('Passed', encoding='utf-8')
+        return SimpleNamespace(returncode=0, stdout='Passed')
+    monkeypatch.setattr(verify, 'run_logged', passed)
+    retry_root = tmp_path/'relocated'
+    assert verify.main(['--rerun', str(manifest), '--diagnostics', str(retry_root)]) == 86
+    retry = json.loads(capsys.readouterr().out)
+    retry_report = json.loads(Path(retry['report']).read_text(encoding='utf-8'))
+    assert retry_report['tests'] == first_report['tests']
+    assert retry_report['affected_tests'] == first_report['affected_tests']
+    assert retry_report['base_commit'] == resolved
+    assert Path(retry['diagnostics_directory']).parent == retry_root
+    assert retry['diagnostics']['first_error']['operation'] == 'advance verification baseline'
+    assert baseline.read_bytes() == newer
+    with pytest.raises(SystemExit) as conflict:
+        verify.main(['--rerun', str(manifest), '--basic'])
+    assert conflict.value.code == 2
+    monkeypatch.setattr(verify, 'file_hashes', lambda: {'cachemonitor/dashboard.py':'drift'})
+    assert verify.main(['--rerun', str(manifest), '--diagnostics', str(tmp_path/'drift')]) == 86
+    assert not (tmp_path/'drift').exists()
+
+
+def test_diagnostic_output_failure_retains_replay_and_plan_stays_read_only(tmp_path, monkeypatch, capsys, diagnostic_state):
+    from pathlib import Path
+    verify, baseline = verification_probe(tmp_path, monkeypatch)
+    original = baseline.read_bytes()
+    blocked = tmp_path/'blocked'; blocked.write_text('file')
+    assert verify.main(['--diagnostics', str(blocked)]) == 86
+    result = json.loads(capsys.readouterr().out)
+    assert result['diagnostics_root'] == str(blocked)
+    assert result['product_exit_code'] is None and not result['report_persisted']
+    assert Path(result['rerun_manifest']).is_file() and '--rerun' in result['rerun_command']
+    target = tmp_path/'plan-only'
+    assert verify.main(['--plan', '--diagnostics', str(target)]) == 0
+    assert json.loads(capsys.readouterr().out)['diagnostics_root'] == str(target)
+    assert not target.exists() and baseline.read_bytes() == original
+
+
+def test_diagnostic_output_cannot_enter_source_snapshot(tmp_path, capsys):
+    import tools.verify_changes as verify
+    with pytest.raises(SystemExit) as rejected:
+        verify.main(['--plan', '--diagnostics', str(ROOT/'tools'/'diagnostic-output')])
+    assert rejected.value.code == 2
+    assert not (ROOT/'tools'/'diagnostic-output').exists()
+
+
+
+def test_rerun_preserves_absent_baseline_and_basic_selection(tmp_path, monkeypatch, capsys, diagnostic_state):
+    from pathlib import Path
+    verify, baseline = verification_probe(tmp_path, monkeypatch)
+    baseline.unlink()
+    assert verify.main(['--basic']) == 0
+    first = json.loads(capsys.readouterr().out)
+    manifest = json.loads(Path(first['rerun_manifest']).read_text(encoding='utf-8'))
+    assert manifest['baseline']['content'] is None and manifest['baseline']['sha256'] is None
+    assert verify.main(['--rerun', first['rerun_manifest'], '--diagnostics', str(tmp_path/'retry')]) == 0
+    retry = json.loads(capsys.readouterr().out)
+    report = json.loads(Path(retry['report']).read_text(encoding='utf-8'))
+    assert report['suite'] == 'basic' and report['tests'] == sorted(verify.CORE_TESTS)
+    assert not baseline.exists()
+
+
+def test_unavailable_rerun_manifest_stops_before_checks(tmp_path, monkeypatch, capsys, diagnostic_state):
+    import tempfile
+    verify, baseline = verification_probe(tmp_path, monkeypatch)
+    original = baseline.read_bytes()
+    def unavailable(**kwargs):
+        raise PermissionError('Temporary storage is unavailable')
+    monkeypatch.setattr(tempfile, 'NamedTemporaryFile', unavailable)
+    assert verify.main([]) == 86
+    result = json.loads(capsys.readouterr().out)
+    assert result['rerun_manifest'] is None and result['rerun_command'] is None
+    assert result['product_exit_code'] is None
+    assert result['diagnostics']['first_error']['operation'] == 'write rerun manifest'
+    assert not (tmp_path/'reports').exists() and baseline.read_bytes() == original
+
+
+
+def test_check_output_ignores_non_protocol_json_and_keeps_split_outcome():
+    from tools.check_diagnostics import CheckOutput
+    output = CheckOutput()
+    for value in (None, [], 'text', 7, {'diagnostics':[]}, {'diagnostics':{'first_error':[]}},
+                  {'product_exit_code':False}, {'product_exit_code':'0'}):
+        output.feed('[codexon-check] ' + json.dumps(value) + '\n')
+    assert output.first_error is None and not output.has_outcome
+    output.feed('[codexon-check] {"product_exit_')
+    output.feed('code": 9}\n')
+    assert output.product_exit_code == 9 and output.has_outcome
+
+
+def test_rerun_command_round_trips_powershell_arguments(tmp_path, monkeypatch, capsys, diagnostic_state):
+    from venv import EnvBuilder
+    import subprocess
+    verify, _ = verification_probe(tmp_path, monkeypatch)
+    special = tmp_path/"Python path $literal's`value"
+    EnvBuilder(with_pip=False).create(special)
+    executable = special/'Scripts'/'python.exe'
+    tools = special/'tools'; tools.mkdir()
+    received = special/'received.json'
+    (tools/'verify_changes.py').write_text(
+        'import json, sys\nfrom pathlib import Path\n'
+        f'Path({str(received)!r}).write_text(json.dumps(sys.argv), encoding="utf-8")\n', encoding='utf-8')
+    manifest = special/"manifest $literal's`value.json"
+    manifest.write_text('{}', encoding='utf-8')
+    monkeypatch.setattr(verify, 'ROOT', special)
+    monkeypatch.setattr(verify, 'version_contract', lambda: 'contract')
+    monkeypatch.setattr(verify.sys, 'executable', str(executable))
+    monkeypatch.setattr(verify, 'save_rerun', lambda selection: manifest)
+    output = tmp_path/"output path $literal's`value"
+    assert verify.main(['--basic', '--diagnostics', str(output)]) == 0
+    result = json.loads(capsys.readouterr().out)
+    replay = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command',
+                             result['rerun_command']], capture_output=True, text=True, timeout=20)
+    assert replay.returncode == 0, replay.stdout + replay.stderr
+    assert json.loads(received.read_text(encoding='utf-8')) == [
+        str(tools/'verify_changes.py'), '--rerun', str(manifest), '--diagnostics', str(output)]
+
+
+def test_logged_capture_drains_output_written_at_process_exit(tmp_path, monkeypatch, capsys, diagnostic_state):
+    import tools.verify_changes as verify
+    error = dict(operation='write final evidence', path=str(tmp_path/'blocked.json'),
+                 exception_type='PermissionError', message='blocked evidence', pid=123)
+    payload = 'final stdout\n' + '[codexon-check] ' + json.dumps(
+        dict(product_exit_code=7, diagnostics=dict(first_error=error)))
+    class Process:
+        returncode = None
+
+        def __init__(self, command, *, stdout, **kwargs):
+            self.output = stdout
+
+        def poll(self):
+            if self.returncode is None:
+                self.output.write(payload.encode('utf-8'))
+                self.returncode = 86
+            return self.returncode
+
+        def wait(self):
+            return self.poll()
+
+    monkeypatch.setattr(verify.subprocess, 'Popen', Process)
+    log = tmp_path/'check.log'
+    result = verify.run_logged(['controlled-process'], log)
+    assert result.returncode == result.product_exit_code == 7
+    assert result.diagnostics['first_error'] == error
+    assert result.stdout == log.read_text(encoding='utf-8') == capsys.readouterr().out == payload
+
+
+@pytest.mark.parametrize('stage,package_code,source_first', [
+    ('runtime', 7, False), ('runtime', 0, True), ('smoke', 11, True), ('smoke', 0, False)])
+def test_package_evidence_failure_retains_known_product_outcome(tmp_path, monkeypatch, capsys,
+                                                              diagnostic_state, stage, package_code, source_first):
+    from pathlib import Path
+    from types import SimpleNamespace
+    from cachemonitor.version import VERSION, PROXY_VERSION
+    verify, baseline = verification_probe(tmp_path, monkeypatch)
+    original = baseline.read_bytes()
+    executable = tmp_path/'package.exe'; executable.write_bytes(b'package probe')
+    calls = []
+    def run(command, **kwargs):
+        current = 'runtime' if '--verify-runtime' in command else 'smoke'
+        calls.append(current)
+        evidence = Path(command[command.index('--verify-runtime' if current == 'runtime' else '--smoke') + 1])
+        if current == stage:
+            evidence = evidence if current == 'runtime' else evidence.with_suffix('.json')
+            evidence.write_text('{', encoding='utf-8')
+            return SimpleNamespace(returncode=package_code, stderr='package product failure')
+        evidence.write_text(json.dumps(dict(errors=[], version=VERSION, proxy_version=PROXY_VERSION,
+                                            native=dict(abi_version=1))), encoding='utf-8')
+        return SimpleNamespace(returncode=0, stderr='')
+    monkeypatch.setattr(verify.subprocess, 'run', run)
+    monkeypatch.setattr(verify, 'fixture_home', lambda folder: folder)
+    args = ['--package-exe', str(executable)] + ([] if source_first else ['--package-only'])
+    assert verify.main(args) == (package_code or 86)
+    result = json.loads(capsys.readouterr().out)
+    report = json.loads(Path(result['report']).read_text(encoding='utf-8'))
+    assert result['product_exit_code'] == report['product_exit_code'] == (package_code or None)
+    assert result['diagnostics']['first_error']['operation'] == f'read package {stage} evidence'
+    assert calls == (['runtime'] if stage == 'runtime' else ['runtime', 'smoke'])
+    assert ('pytest' in report) == source_first
+    assert baseline.read_bytes() == original

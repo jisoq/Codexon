@@ -179,7 +179,7 @@ def test_pytest_phase_is_visible_before_a_hung_test_exits(tmp_path):
     assert 'setup' in log.read_text() and 'call' in log.read_text()
 
 
-@pytest.mark.parametrize('mode,expected', [('orphan', 1), ('hang', 124)])
+@pytest.mark.parametrize('mode,expected', [('orphan', 1), ('hang', 124), ('diagnostic', 1)])
 def test_scheduler_process_is_tracked_by_its_fresh_scope(tmp_path, mode, expected):
     from cachemonitor.observer_task import ObserverTask
     from tools.check_processes import clear_scopes
@@ -190,7 +190,7 @@ def test_scheduler_process_is_tracked_by_its_fresh_scope(tmp_path, mode, expecte
                    f'Path({str(ready)!r}).write_text(str(child.pid))\ntime.sleep(120)\n')
     probe = tmp_path / 'scheduler_probe.py'
     probe.write_text(textwrap.dedent(f'''
-        import sys, time
+        import os, sys, time
         from pathlib import Path
         from cachemonitor.observer_task import ObserverTask
         def test_scheduled_process(tmp_path):
@@ -203,6 +203,10 @@ def test_scheduler_process_is_tracked_by_its_fresh_scope(tmp_path, mode, expecte
             while not Path({str(ready)!r}).exists():
                 if time.monotonic() >= deadline: raise RuntimeError('Scheduled probe did not start')
                 time.sleep(.05)
+            if {mode!r} == 'diagnostic':
+                evidence = Path(os.environ['CODEXON_CHECK_DIAGNOSTICS'])
+                (evidence/'processes.json').mkdir()
+                (evidence/'external-processes.json').mkdir()
             if {mode!r} == 'hang': time.sleep(120)
     '''))
     evidence = tmp_path / 'evidence'
@@ -220,6 +224,8 @@ def test_scheduler_process_is_tracked_by_its_fresh_scope(tmp_path, mode, expecte
         assert int(ready.read_text()) in {process['pid'] for process in report['external']['processes']}
         assert task.name in {task['name'] for task in report['external']['tasks']}
         assert not task.inspect()['registered']
+        if mode == 'diagnostic':
+            assert report['diagnostics']['first_error']['path'].endswith('processes.json')
     finally:
         if scope_file.exists():
             # Keep a failing regression run safe even if automatic registration
@@ -227,3 +233,69 @@ def test_scheduler_process_is_tracked_by_its_fresh_scope(tmp_path, mode, expecte
             fallback = tmp_path/'fallback'; fallback.mkdir()
             (fallback/'owner-scheduler.json').write_text(json.dumps({'root': scope_file.read_text()}))
             clear_scopes(fallback)
+
+
+
+def test_pytest_first_progress_write_failure_exits_without_secondary_read_error(tmp_path):
+    from tools.check_diagnostics import CheckOutput
+    evidence = tmp_path/'evidence'; evidence.mkdir()
+    (evidence/'active-test.tmp').mkdir()
+    probe = tmp_path/'test_probe.py'; probe.write_text('def test_probe(): pass\n')
+    result = subprocess.run([sys.executable, '-B', '-m', 'pytest', '-q', '-p', 'tools.check_progress',
+        '-o', 'addopts=', '--rootdir', str(tmp_path), '--confcutdir', str(tmp_path), str(probe)],
+        cwd=ROOT, env={**os.environ, 'CODEXON_CHECK_DIAGNOSTICS':str(evidence)},
+        capture_output=True, text=True, timeout=20)
+    observed = CheckOutput(); observed.feed(result.stdout, final=True)
+    assert result.returncode == 86, result.stdout + result.stderr
+    assert observed.first_error['path'] == str(evidence/'active-test.tmp')
+    assert 'FileNotFoundError' not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize('mode,expected_exit,product_exit', [('product', 7, 7), ('diagnostic', 86, None)])
+def test_product_failure_survives_failed_worker_final_evidence(tmp_path, mode, expected_exit, product_exit):
+    from tools.check_diagnostics import CheckOutput
+    probe = tmp_path/'probe.py'
+    probe.write_text('mode = ' + repr(mode) + '\n' + textwrap.dedent('''
+        import os, sys
+        from pathlib import Path
+        state = Path(os.environ['CODEXON_CHECK_DIAGNOSTICS']) / f'worker-state-{os.getpid()}.json'
+        state.unlink(); state.mkdir()
+        if mode == 'diagnostic':
+            from tools.check_diagnostics import write_json
+            write_json(state, {})
+        sys.exit(7)
+    '''))
+    evidence = tmp_path/'evidence'
+    result = subprocess.run([sys.executable, str(ROOT/'tools/run_ui_checks.py'), '--no-desktop',
+        '--diagnostics', str(evidence), '--', sys.executable, str(probe)],
+        capture_output=True, text=True, timeout=20)
+    observed = CheckOutput(); observed.feed(result.stdout, final=True)
+    assert result.returncode == expected_exit, result.stdout + result.stderr
+    assert observed.product_exit_code == product_exit
+    assert observed.first_error['path'].endswith('.json')
+    report = json.loads((evidence/'result.json').read_text(encoding='utf-8'))
+    assert report['process_exit_code'] == expected_exit and report['remaining_pids'] == []
+    assert report['product_exit_code'] == product_exit
+    assert report['diagnostics']['first_error'] is not None
+
+
+def test_worker_product_exception_traceback_survives_failed_final_evidence(tmp_path):
+    from tools.check_diagnostics import CheckOutput
+    probe = tmp_path/'probe.py'
+    probe.write_text(textwrap.dedent('''
+        import os
+        from pathlib import Path
+        state = Path(os.environ['CODEXON_CHECK_DIAGNOSTICS']) / f'worker-state-{os.getpid()}.json'
+        state.unlink(); state.mkdir()
+        raise OSError('product defect')
+    '''))
+    evidence = tmp_path/'evidence'; evidence.mkdir()
+    result = subprocess.run([sys.executable, str(ROOT/'tools/check_worker.py'), str(probe)],
+        env={**os.environ, 'CODEXON_CHECK_DIAGNOSTICS':str(evidence), 'CODEXON_CHECK_TIMEOUT':'20'},
+        capture_output=True, text=True, timeout=20)
+    observed = CheckOutput(); observed.feed(result.stdout, final=True)
+    assert result.returncode == observed.product_exit_code == 1, result.stdout + result.stderr
+    assert 'Traceback (most recent call last)' in result.stderr
+    assert "raise OSError('product defect')" in result.stderr
+    assert 'OSError: product defect' in result.stderr
+    assert observed.first_error['path'].endswith('.json')

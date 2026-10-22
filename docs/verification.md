@@ -18,6 +18,22 @@ Plain `pytest` uses the fast essential profile. The `integration` marker identif
 
 The local essential sweep retains compact dashboard/quota rendering, rendered loading and stale-result handling, overlay controls, real protocol exchanges, accounting/history invariants, and installation rollback tests. Do not replace those contracts with exact labels, private call sequences, or screenshots without assertions.
 
+## Diagnostic failures and reruns
+
+Use `--diagnostics <directory>` to choose an output root. Each verification creates a unique child directory there. The local baseline stays at `artifacts/verification/last-success.json`. Diagnostic output must be outside the checkout or in an untracked Git-ignored directory.
+
+The console reports the effective directory and the first diagnostic error. It states whether `report.json` was saved. A diagnostic failure exits with code 86. An observed product failure retains its original nonzero code. A deadline retains code 124. `product_exit_code: null` means that execution did not establish a product result. Any diagnostic failure preserves the baseline.
+
+Each execution saves a temporary rerun manifest independently of its diagnostic directory. Use the printed command to repeat the frozen test selection and baseline input. Add `--diagnostics <new-directory>` to relocate its output. For example:
+
+```powershell
+python tools/verify_changes.py --rerun C:\Temp\codexon-rerun-example.json --diagnostics D:\qa\retry
+```
+
+Reruns reject source or executable changes and additional selection flags. A successful rerun replaces the baseline only if its current bytes match the original input. `--plan` inspects the selection without creating output or a manifest. If temporary storage prevents manifest creation, the console reports that rerunning is unavailable and no checks start.
+
+The direct `tools/run_ui_checks.py --diagnostics <directory>` command uses that exact directory. It retains process cleanup when evidence cannot be saved.
+
 ## Native CPU kernels
 
 Source builds require rustup and Microsoft C++ Build Tools for x64. `rust-toolchain.toml` pins the Rust compiler, and `native/Cargo.lock` pins native dependencies. Run these commands with the dedicated Python environment:
