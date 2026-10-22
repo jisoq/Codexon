@@ -33,7 +33,7 @@ foreach($task in $folder.GetTasks(1)){
     $update=$false
     foreach($trigger in $definition.Triggers){if($trigger.Type -eq 9 -and $trigger.Enabled){$trigger.Enabled=$false;$update=$true}}
     if($update){
-        [void]$folder.RegisterTaskDefinition($task.Name,$definition,6,$definition.Principal.UserId,$null,3)
+        [void]$folder.RegisterTaskDefinition($task.Name,$definition,(6 -bor 0x10),$definition.Principal.UserId,$null,3)
         $changed+=$task.Name
     }
 }
@@ -154,7 +154,7 @@ if($p.operation -eq 'suspend'){
         $restart=$xml.SelectSingleNode("//*[local-name()='RestartOnFailure']")
         if($restart){[void]$restart.ParentNode.RemoveChild($restart)}
         $definition.XmlText=$xml.OuterXml
-        [void]$folder.RegisterTaskDefinition($p.name,$definition,6,$definition.Principal.UserId,$null,3)
+        [void]$folder.RegisterTaskDefinition($p.name,$definition,(6 -bor 0x10),$definition.Principal.UserId,$null,3)
     }
     @{suspended=$true} | ConvertTo-Json -Compress
     exit 0
@@ -163,7 +163,7 @@ if($p.operation -eq 'finish_update'){
     if($existing){
         $definition=$existing.Definition
         foreach($trigger in $definition.Triggers){if($trigger.Type -eq 1){$trigger.Enabled=$false}}
-        [void]$folder.RegisterTaskDefinition($p.name,$definition,6,$definition.Principal.UserId,$null,3)
+        [void]$folder.RegisterTaskDefinition($p.name,$definition,(6 -bor 0x10),$definition.Principal.UserId,$null,3)
     }
     @{watchdog=$false} | ConvertTo-Json -Compress
     exit 0
