@@ -328,7 +328,7 @@ def test_pending_overlay_refresh_keeps_confirmed_panel_until_replacement(layout_
     m.monitor_tab='history';m.pin_call(m.call_id(m.rows()[0]));c.refresh();app.processEvents()
     assert m.compact is compact
     selected=m.selected_id;geometry=c.monitor_geometry
-    wait_for_rendered(lambda:m._agent_highlight.state()==m._agent_highlight.State.Stopped,timeout=5)
+    wait_for_rendered(lambda:not m.row_glows.needs_frame,timeout=5)
     frame=c.widget.quick.grabFramebuffer();layout=m.layout()
     scale=m.appearance.scale*frame.width()/c.widget.quick.width()
     body=QRectF(MARGIN*scale,layout['charts'][0]*scale,SECTION_WIDTH*scale,

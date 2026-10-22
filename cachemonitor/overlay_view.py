@@ -4,9 +4,9 @@ import math
 import re
 import time
 from datetime import datetime
-from functools import lru_cache
-from PySide6.QtCore import Qt, QRectF, QPointF, QObject, Property, Slot, Signal, QTimer, QSequentialAnimationGroup, QPauseAnimation, QVariantAnimation, QEasingCurve
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen, QBrush
+from dataclasses import dataclass
+from PySide6.QtCore import Qt, QRectF, QPointF, QObject, Property, Slot, Signal, QTimer
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen, QBrush, QLinearGradient
 from .presentation import Node
 from .quick_runtime import QuickHost
 from .overlay_appearance import default_appearance
@@ -99,6 +99,69 @@ def palette(appearance):
     return {key:QColor(value) for key,value in p.items()}
 
 
+@dataclass(frozen=True)
+class TextRun:
+    text: str
+    color: str = 'secondary'
+    strike: bool = False
+
+
+@dataclass(frozen=True)
+class RowGlow:
+    start_ms: float
+    reduced_motion: bool
+
+    def opacity(self, now_ms):
+        elapsed=max(0,now_ms-self.start_ms)
+        if self.reduced_motion:return .13 if elapsed<300 else 0.
+        if elapsed>=650:return 0.
+        progress=elapsed/70 if elapsed<70 else (650-elapsed)/580
+        return .13*progress*progress*(3-2*progress)
+
+    def finished(self, now_ms):
+        return now_ms-self.start_ms>=(300 if self.reduced_motion else 650)
+
+
+class RowGlows:
+    def __init__(self):
+        self.appearances=None
+        self.active={}
+
+    def update(self, rows, *, now_ms, reduced_motion=False):
+        self.advance(now_ms=now_ms)
+        self.active={owner:glow for owner,glow in self.active.items() if owner in rows}
+        if self.appearances is not None:
+            for owner,appearance in rows.items():
+                if self.appearances.get(owner)!=appearance and owner not in self.active:
+                    self.active[owner]=RowGlow(now_ms,reduced_motion)
+        self.appearances=dict(rows) if rows else None
+
+    def opacity(self, owner, *, now_ms):
+        glow=self.active.get(owner)
+        return glow.opacity(now_ms) if glow else 0.
+
+    def advance(self, *, now_ms):
+        owners=frozenset(self.active)
+        self.active={owner:glow for owner,glow in self.active.items() if not glow.finished(now_ms)}
+        return owners
+
+    @property
+    def needs_frame(self):return bool(self.active)
+
+    def clear(self):
+        self.appearances=None;self.active.clear()
+
+
+def fitted_model_runs(runs, metrics, width):
+    request,response,suffix=runs
+    suffix_width=min(metrics.horizontalAdvance(suffix.text),max(0,width*.35))
+    available=max(0,width-suffix_width)
+    request_width=min(metrics.horizontalAdvance(request.text),max(available/2,available-metrics.horizontalAdvance(response.text)))
+    widths=(request_width,available-request_width,suffix_width)
+    return tuple(TextRun(metrics.elidedText(run.text,Qt.ElideRight,max(0,int(space))),run.color,run.strike)
+                 for run,space in zip(runs,widths))
+
+
 class Drawing:
     def __init__(self,painter,content):
         self.p=painter;self.model=content;self.colors=palette(content.appearance);painter.setRenderHint(QPainter.Antialiasing)
@@ -110,6 +173,22 @@ class Drawing:
         if elide:value=QFontMetrics(p.font()).elidedText(str(value),Qt.ElideRight,round(w))
         alignment=Qt.AlignHCenter if center else Qt.AlignRight if right else Qt.AlignLeft
         p.drawText(QRectF(x,y,w,h),alignment|Qt.AlignVCenter|(Qt.TextWordWrap if wrap else 0),Verbatim(value) if literal else str(value))
+    def model_line(self,runs,x,y,w,h,size=11,weight=400):
+        metrics=QFontMetrics(font(self.model.appearance.family,size,weight))
+        runs=fitted_model_runs(runs,metrics,w)
+        self.p.save();self.p.setClipRect(QRectF(x,y,w,h))
+        for run in runs:
+            run_font=font(self.model.appearance.family,size,weight);run_font.setStrikeOut(run.strike)
+            self.p.setFont(run_font);self.p.setPen(self.colors[run.color])
+            self.p.drawText(QRectF(x,y,w,h),Qt.AlignLeft|Qt.AlignVCenter,run.text)
+            advance=metrics.horizontalAdvance(run.text);x+=advance;w-=advance
+        self.p.restore()
+    def row_glow(self,x,y,w,h,alpha):
+        if alpha<=0:return
+        left=QColor(self.colors['accent']);left.setAlphaF(alpha)
+        right=QColor(left);right.setAlphaF(alpha*.2)
+        gradient=QLinearGradient(x,y,x+w,y);gradient.setColorAt(0,left);gradient.setColorAt(1,right)
+        self.p.setPen(Qt.NoPen);self.p.setBrush(QBrush(gradient));self.p.drawRoundedRect(QRectF(x,y,w,h),5,5)
     def number(self,value,x,baseline,w,size,color='ink',weight=600,right=False):
         value=tr(str(value))
         p=self.p;p.setFont(font(self.model.appearance.family,size,weight));p.setPen(self.colors[color])
@@ -174,13 +253,13 @@ def paint_items(d,items,top=0,bottom=math.inf):
                 if length:d.rect(x+offset,y,length,h,part['color'],pattern=True)
                 offset+=length
         elif style.get('kind')=='tokens':d.tokens(x,y,w,title=value)
-        elif style.get('kind')=='agent-selection':
-            if style.get('alpha',0)>0:d.rect(x,y,w,h,style['agentColor'],5,alpha=style['alpha'])
+        elif style.get('kind')=='agent-update':d.row_glow(x,y,w,h,style.get('alpha',0))
         elif style.get('kind')=='agent-separator':d.rect(x,y,w,h,'border',alpha=.45)
         elif style.get('kind')=='chevron':
             points=((x,y+8),(x+3,y+11),(x+6,y+8)) if style['expanded'] else ((x+1,y+7),(x+4,y+h/2),(x+1,y+13))
             for start,end in zip(points,points[1:]):d.line(*start,*end,color,1)
         elif style.get('kind')=='metric':d.metric(value,x,y,w,h,size,color=color)
+        elif style.get('modelRuns'):d.model_line(style['modelRuns'],x,y,w,h,size,weight)
         elif isinstance(value,list):
             for i,line in enumerate(value):d.text(line,x,y+i*18,w,18,size,color,weight,right=style.get('right',False))
         else:d.text(value,x,y,w,h,size,color,weight,right=style.get('right',False),elide=style.get('kind')=='single-line')
@@ -216,21 +295,9 @@ class OverlayContent(Node):
         self._freshness_label=''
         self.highlight_id=None;self._highlight_timer=QTimer(self);self._highlight_timer.setSingleShot(True)
         self._highlight_timer.timeout.connect(self.clear_highlight)
-        self.agent_highlight_opacity=0.
-        self._agent_highlight=QSequentialAnimationGroup(self)
-        self._agent_glow=QVariantAnimation(self._agent_highlight)
-        self._agent_glow.setStartValue(0.);self._agent_glow.setEndValue(.13)
-        self._agent_glow.setDuration(90);self._agent_glow.setEasingCurve(QEasingCurve.OutQuad)
-        self._agent_glow.valueChanged.connect(self.set_agent_highlight_opacity)
-        self._agent_highlight.addAnimation(self._agent_glow)
-        self._agent_hold=QPauseAnimation(310,self._agent_highlight)
-        self._agent_highlight.addAnimation(self._agent_hold)
-        self._agent_fade=QVariantAnimation(self._agent_highlight)
-        self._agent_fade.setStartValue(.13);self._agent_fade.setEndValue(0.)
-        self._agent_fade.setDuration(800);self._agent_fade.setEasingCurve(QEasingCurve.OutCubic)
-        self._agent_fade.valueChanged.connect(self.set_agent_highlight_opacity)
-        self._agent_highlight.addAnimation(self._agent_fade)
-        self._agent_highlight.finished.connect(lambda:self.set_agent_highlight_opacity(0.))
+        self.row_glows=RowGlows();self._row_glow_backgrounds={}
+        self._row_glow_timer=QTimer(self);self._row_glow_timer.setInterval(16);self._row_glow_timer.setTimerType(Qt.PreciseTimer)
+        self._row_glow_timer.timeout.connect(self.advance_row_glows)
         self._body=DetailBody(self)
         self.put(overlayVisible=False,overlayScale=1.,overlayInk=self.appearance.ink,overlayAccent=palette(self.appearance)['accent'].name(),detailBodyHeight=0);self.sync_details()
     @Property(QObject,constant=True)
@@ -331,17 +398,8 @@ class OverlayContent(Node):
         if old!=new:self.inspected_call=None;self.lower_offset=0;self.clear_highlight()
         elif self.rows() and old_call!=self.call_id(self.rows()[-1]) and not self.state.get('reducedMotion'):
             self.highlight_id=self.call_id(self.rows()[-1]);self._highlight_timer.start(120)
-        if old!=new or old_call!=(self.call_id(self.rows()[-1]) if self.rows() else None):
-            self._agent_highlight.stop()
-            self.set_agent_highlight_opacity(0.)
-            if self.rows():
-                reduced=bool(self.state.get('reducedMotion'))
-                self._agent_glow.setDuration(0 if reduced else 90)
-                self._agent_hold.setDuration(300 if reduced else 310)
-                self._agent_fade.setDuration(0 if reduced else 800)
-                self._agent_highlight.start()
-        elif not self.rows():
-            self._agent_highlight.stop();self.set_agent_highlight_opacity(0.)
+        if old!=new:self.clear_row_glows()
+        self.update_row_glows()
         if not self.rows() and (self.follow_latest or self.graph_pinned):
             self.selected_id=None;self.selected_snapshot=None;self.follow_latest=True;self.graph_pinned=False
         if self.graph_pinned and not any(self.call_id(r)==self.selected_id for r in self.rows()):
@@ -351,11 +409,34 @@ class OverlayContent(Node):
         self.put(overlayScale=appearance.scale,overlayInk=appearance.ink,overlayAccent=palette(appearance)['accent'].name(),collecting=False);self.sync_details();self.refresh_accessibility();self.update()
     def clear_highlight(self):
         self.highlight_id=None;self._highlight_timer.stop();self.update()
-    def set_agent_highlight_opacity(self,value):
-        self.agent_highlight_opacity=float(value)
-        # Repaint the cached rows without rebuilding actions or moving the scroll view.
-        for item in getattr(self,'_detail_items',()):
-            if item[8].get('kind')=='agent-selection':item[8]['alpha']=float(value)
+    def row_appearances(self):
+        if self.notice_card() or not (self.data or {}).get('id'):return {}
+        data=self.data;groups=[((data.get('home'),data['id']),main_usage(data),'Main Agent')]
+        groups.extend(((row.get('home'),row['id']),row,row['label']) for row in self.detail_groups())
+        appearances={}
+        for owner,group,label in groups:
+            items=self.agent_summary_items(group,label,agent_mark(owner[1],self.appearance),False,SECTION_WIDTH,main=owner==groups[0][0])
+            appearances[owner]=tuple((tr(str(item[0])),tuple(item[8].get('modelRuns',())),item[8].get('heartbeat',{}).get('mode'))
+                                     for item in items if item[8].get('kind')!='chevron')
+        return appearances
+    def update_row_glows(self):
+        if not self.state.get('overlayVisible'):self.row_glows.clear()
+        self.row_glows.update(self.row_appearances(),now_ms=time.monotonic()*1000,reduced_motion=bool(self.state.get('reducedMotion')))
+        if self.row_glows.needs_frame and self.state.get('overlayVisible'):
+            if not self._row_glow_timer.isActive():self._row_glow_timer.start()
+        else:self._row_glow_timer.stop()
+    def row_glow_opacity(self,owner):return self.row_glows.opacity(owner,now_ms=time.monotonic()*1000)
+    def advance_row_glows(self):
+        if not self.state.get('overlayVisible'):
+            self.clear_row_glows();return
+        now=time.monotonic()*1000;owners=self.row_glows.advance(now_ms=now)
+        for owner in owners:
+            if style:=self._row_glow_backgrounds.get(owner):style['alpha']=self.row_glows.opacity(owner,now_ms=now)
+        if not self.row_glows.needs_frame:self._row_glow_timer.stop()
+        if owners:self._body.update();self.update()
+    def clear_row_glows(self):
+        self._row_glow_timer.stop();self.row_glows.clear()
+        for style in self._row_glow_backgrounds.values():style['alpha']=0.
         if hasattr(self,'_body'):self._body.update()
         self.update()
     def rows(self):return (self.data or {}).get('recent',[])[-RECENT_CALLS:]
@@ -420,24 +501,28 @@ class OverlayContent(Node):
             stamp=stamp if type(stamp) in (int,float) and math.isfinite(stamp) else float('-inf')
             return (-stamp,cost,row['key'])
         return sorted(rows,key=order)
-    def subagent_call_label(self,group):
-        if not recorded(group.get('model')) and not recorded(group.get('effort')):return tr('미확인')
+    def model_runs(self,group):
+        request=group.get('requested_model');response=group.get('response_model')
+        confirmed=group.get('model_alert_confirmed') and recorded(request) and recorded(response)
+        if not confirmed and not recorded(group.get('model')) and not recorded(group.get('effort')):return (TextRun(tr('미확인')),)
         model=group.get('model') or tr('미확인');effort=group.get('effort') or tr('미확인')
-        state=group.get('model_state')
         mode=group.get('mode') or group.get('service_tier')
-        label=f'{tr(model)}, {tr(effort)}'
-        if mode and str(mode).casefold() not in ('standard','미확인','unknown'):label+=', '+str(mode).lower()
-        if state=='모델명 불일치' and group.get('model_mismatch') and group.get('response_model') and group['response_model']!=model:
-            from .i18n import formatted
-            label+=' '+formatted('(불일치: {model})',model=group['response_model'])
+        suffix=', '+tr(effort)
+        if mode and str(mode).casefold() not in ('standard','미확인','unknown'):suffix+=', '+str(mode).lower()
+        if confirmed:
+            return (TextRun(tr(request),strike=True),TextRun(' '+tr(response),'accent'),TextRun(suffix))
+        return (TextRun(tr(model)+suffix),)
+    def subagent_call_label(self,group):return ''.join(run.text for run in self.model_runs(group))
+    def agent_model_tooltip(self,group):
+        label=self.subagent_call_label(group)
+        if len(self.model_runs(group))>1:
+            request=group['requested_model']
+            label+=tr(f"\n모델 불일치 (요청:{request}, 응답:{group['response_model']})")
         return label
-    def main_model_tooltip(self):
-        own=main_usage(self.data or {});label=self.subagent_call_label(own)
-        if own.get('model_mismatch') and own.get('response_model'):
-            label+=f"\n모델 불일치 (요청:{own.get('model')}, 응답:{own['response_model']})"
-        return label
+    def main_model_tooltip(self):return self.agent_model_tooltip(main_usage(self.data or {}))
     def sync_details(self):
         items=self.detail_items() if self.has_subagents() else [];self._detail_items=items;height=max((r[2]+r[4] for r in items),default=16)
+        self._row_glow_backgrounds={item[8]['owner']:item[8] for item in items if item[8].get('kind')=='agent-update'}
         actions=[]
         for item in items:
             style=item[8]
@@ -466,7 +551,7 @@ class OverlayContent(Node):
                  heartbeatMode=heartbeat['mode'],heartbeatColor=heartbeat['color'],heartbeatLabel=heartbeat['label'],
                  heartbeatX=heartbeat['x'],heartbeatY=heartbeat['y'])
         self._body.update()
-        self._body.setAccessibleName('\n'.join(''.join(r[0]) if isinstance(r[0],list) else r[0] for r in items))
+        self._body.setAccessibleName(Verbatim('\n'.join(item[8].get('actionLabel') or (''.join(item[0]) if isinstance(item[0],list) else item[0]) for item in items)))
     def monitor_links(self):
         from .overlay_monitor import links
         return links(self)
@@ -716,13 +801,15 @@ class OverlayContent(Node):
         request=group.get('request_state',group.get('request',{}).get('state'))
         mode='active' if request=='진행' else 'idle' if request else 'unknown'
         heartbeat_color=('#116b32','#38b96b')[int(self.dark)]
+        runs=self.model_runs(group);model_style=dict(kind='single-line')
+        if len(runs)>1:model_style['modelRuns']=runs
         items=[(label,name_x,0,name_width,20,12,'ink',600,dict(kind='single-line',agentMark=mark)),
                ('',heartbeat_x,1,4,4,11,'secondary',400,dict(kind='agent-heartbeat',heartbeat=dict(
                    id='main' if main else group.get('key',group.get('id','')),mode=mode,color=heartbeat_color,
                    accessible=tr(label)+' '+tr('진행 중' if mode=='active' else '대기' if mode=='idle' else '미확인')))),
                (price,price_x,0,price_width,20,12,'ink',600,dict(kind='single-line')),
                ('',chevron_x,0,8,20,13,'secondary',400,dict(kind='chevron',expanded=expanded)),
-               (self.subagent_call_label(group),0,24,width,18,11,'error' if group.get('model_mismatch') else 'secondary',400,dict(kind='single-line'))]
+               (''.join(run.text for run in runs),0,24,width,18,11,'secondary',400,model_style)]
         half=width/2
         metrics=(('캐시',0,width*.14,False),
                  (percent(group.get('token_composition',{}).get('cache_hit_rate')),width*.14,half-6,True),
@@ -744,19 +831,17 @@ class OverlayContent(Node):
             key=group['key'];expanded=key in self.expanded_groups;start=y
             if index:items.append(('',0,y-8,w,1,11,'ink',400,dict(kind='agent-separator')))
             agent=(group.get('home'),group.get('id'));mark=agent_mark(agent[1],self.appearance)
-            displayed=self.latest_call()
             summary=self.agent_summary_items(group,group['label'],mark,expanded,w,cost_column=cost_column)
             summary_height=self.agent_summary_height(summary)
-            if agent==(displayed.get('home'),displayed.get('sid')):
-                items.append(('',0,y,w,summary_height,11,'ink',400,dict(kind='agent-selection',agentColor=mark.color,alpha=self.agent_highlight_opacity)))
+            items.append(('',0,y,w,summary_height,11,'ink',400,dict(kind='agent-update',owner=agent,alpha=self.row_glow_opacity(agent))))
             self._sub_summary_heights.append(summary_height)
             for item in summary:
                 items.append((*item[:2],item[2]+y,*item[3:]))
-            meta=self.subagent_call_label(group)
+            meta=self.agent_model_tooltip(group)
             y+=summary_height
             exact=money(group.get('cost'))
             tip=group['label']+'\n'+meta+'\n'+exact
-            if group.get('response_model'):tip+='\n'+tr('응답 모델')+': '+group['response_model']
+            if not group.get('model_alert_confirmed') and group.get('response_model'):tip+='\n'+tr('응답 모델')+': '+group['response_model']
             items.append(('',0,start,w,y-start,11,'ink',400,dict(action='group-'+key,actionLabel=group['label']+' '+meta+' '+exact,expanded=expanded,tooltip=tip)))
             if expanded:
                 details=self.group_details(group)
@@ -828,6 +913,7 @@ class SessionOverlay(QuickHost):
     def set_content(self,*args,**kwargs):
         self.content_model.set_content(*args,**kwargs);self.resize(self.panel_width(),self.panel_height());self.setAccessibleName(self.content_model.state['accessible'])
     def closeEvent(self,event):
-        self.release_scene();super().closeEvent(event)
+        self.content_model.clear_row_glows();self.release_scene();super().closeEvent(event)
     def showEvent(self,event):super().showEvent(event);self.content_model.put(overlayVisible=True)
-    def hideEvent(self,event):self.content_model.put(overlayVisible=False);super().hideEvent(event)
+    def hideEvent(self,event):
+        self.content_model.put(overlayVisible=False);self.content_model.clear_row_glows();super().hideEvent(event)

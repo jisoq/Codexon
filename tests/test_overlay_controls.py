@@ -109,22 +109,59 @@ def test_subagent_disclosure_resizes_native_panel_and_scrolls_at_frame_limit(nat
     body=m.state['detailBodyHeight']
     def group():return named_item(c.detail.quick.rootObject(),'detailAction-group-'+key)
     def scroll():return named_item(c.detail.quick.rootObject(),'detailScroll')
+    def capture_geometry(stage):
+        import os
+        import time
+        from pathlib import Path
+        destination=os.environ.get('CODEXON_MISMATCH_EVIDENCE')
+        if not destination:return
+        output=Path(destination);output.mkdir(parents=True,exist_ok=True)
+        host_id=int(host.winId());dpi=c.native.u.GetDpiForWindow(host_id) or 96
+        target_frame=c.native.frame(host_id);viewport=scroll()
+        def rect(value):return [value.x(),value.y(),value.width(),value.height()]
+        screen=host.windowHandle().screen()
+        sample=dict(stage=stage,at=time.monotonic(),host_size=[host.width(),host.height()],
+            host_geometry=rect(host.geometry()),host_frame_geometry=rect(host.frameGeometry()),
+            host_dpr=host.devicePixelRatioF(),dpi=dpi,native_factor=dpi/96,
+            native_host_frame=target_frame,native_panel_frame=c.native.frame(int(c.widget.winId())),
+            native_detail_frame=c.native.frame(int(c.detail.winId())),
+            screen_geometry=rect(screen.geometry()),screen_dpr=screen.devicePixelRatio(),
+            appearance_scale=m.appearance.scale,appearance_font_size=m.appearance.font_size,
+            monitor_geometry=c.monitor_geometry,current_geometry=c.current_geometry,
+            closed_geometry=closed,automatic_mode=c.automatic_mode,compact=m.compact,
+            available_height=m.available_height,layout=m.layout(),unconstrained_layout=m.layout(constrain=False),
+            automatic_sub_height=m.automatic_sub_height(),summary_heights=m._sub_summary_heights,
+            expanded_height=m._sub_expanded_height,expanded_groups=sorted(m.expanded_groups),
+            detail_body_height=m.state['detailBodyHeight'],detail_view_body_height=c.detail.view.state['detailBodyHeight'],
+            detail_widget_size=[c.detail.width(),c.detail.height()],
+            detail_root_geometry=rect(c.detail.quick.rootObject().boundingRect()),
+            viewport_geometry=rect(viewport.boundingRect()),viewport_height=viewport.height(),
+            content_height=viewport.property('contentHeight'),content_y=viewport.property('contentY'))
+        path=output/'native-subagent-height.json'
+        samples=json.loads(path.read_text(encoding='utf-8')) if path.exists() else []
+        samples.append(sample);path.write_text(json.dumps(samples,indent=2),encoding='utf-8')
+    capture_geometry('closed')
     click(c.detail,group())
     wait_for_rendered(lambda:c.monitor_geometry[3]>closed[3] and scroll().height()>=m.state['detailBodyHeight'])
     opened=c.monitor_geometry
+    capture_geometry('opened')
     assert opened[3]-closed[3]>=m.state['detailBodyHeight']-body
     assert (opened[0],opened[2])==(closed[0],closed[2]) and c.anchor==anchor
     frame=c.native.frame(int(c.widget.winId()))
     assert frame[3]-frame[1]==opened[3]
-    host.resize(420,closed[3]+100);refresh()
-    wait_for_rendered(lambda:scroll().property('contentHeight')>scroll().height())
+    host.resize(420,round(closed[3]/host.devicePixelRatioF())+100);refresh()
+    capture_geometry('limited-refresh')
+    try:wait_for_rendered(lambda:scroll().property('contentHeight')>scroll().height())
+    finally:capture_geometry('limited-after-wait')
     assert c.widget.isVisible() and c.detail.isVisible()
     assert c.monitor_geometry[3]<opened[3] and key in m.expanded_groups
     scroll().setProperty('contentY',scroll().property('contentHeight')-scroll().height())
     host.resize(420,1200);refresh()
     wait_for_rendered(lambda:scroll().height()>=m.state['detailBodyHeight'])
+    capture_geometry('restored')
     click(c.detail,group())
     wait_for_rendered(lambda:c.monitor_geometry==closed and scroll().property('contentY')==0)
+    capture_geometry('closed-restored')
     assert not m.expanded_groups and c.anchor==anchor
 
 

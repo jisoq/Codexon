@@ -34,45 +34,113 @@ def test_agent_color_identity_does_not_depend_on_discovery_order(column_model):
         fresh.deleteLater()
 
 
-def test_latest_agent_flash_fades_without_refresh_restarting_it(column_model):
-    m=column_model;data=subagent_summary()
-    child=next(row for row in data['recent'] if row['sid']!=data['id'])
-    data['recent'].append(dict(child,id='flash-child'))
-    m.set_content(data)
-    animation=m._agent_highlight
-    animation.pause()
-    animation.setCurrentTime(animation.duration()//5)
-    peak=m.agent_highlight_opacity
-    assert peak>0
-    animation.setCurrentTime(animation.duration()*3//4)
-    faded=m.agent_highlight_opacity
-    assert 0<faded<peak
-    cached=[item for item in m._detail_items if item[8].get('kind')=='agent-selection']
-    assert len(cached)==1 and cached[0][8]['alpha']==faded
-    elapsed=animation.currentTime()
-    refreshed=dict(data,title='Updated title')
-    m.set_content(refreshed)
-    assert animation.currentTime()==elapsed and m.agent_highlight_opacity==faded
-    animation.setCurrentTime(animation.duration())
-    assert m.agent_highlight_opacity==0
-    main=next(row for row in data['recent'] if row['sid']==data['id'])
-    refreshed=dict(refreshed,recent=[*data['recent'],dict(main,id='flash-main')])
-    m.set_content(refreshed)
-    animation.pause();animation.setCurrentTime(animation.duration()//5)
-    assert m.agent_highlight_opacity==peak and m.latest_call()['sid']==data['id']
-    assert not any(item[8].get('kind')=='agent-selection' for item in m._detail_items)
-    m.set_content(summary())
-    animation.pause();animation.setCurrentTime(animation.duration()//5)
-    assert not m.has_subagents() and m.agent_highlight_opacity==peak
+def test_row_glows_seed_then_track_each_owner_without_extending_active_deadlines():
+    from cachemonitor.overlay_view import RowGlows
+    main=('home','main');child=('home','child');new=('home','new')
+    glows=RowGlows();initial={main:'$0.02',child:'100.0 tps'}
+    glows.update(initial,now_ms=0)
+    assert not glows.needs_frame
+    glows.update(dict(initial),now_ms=100)
+    assert not glows.needs_frame
+    changed={main:'$0.03',child:'120.0 tps'}
+    glows.update(changed,now_ms=200)
+    assert glows.opacity(main,now_ms=200)==0
+    peak=glows.opacity(main,now_ms=270)
+    assert peak>glows.opacity(main,now_ms=235)>0
+    assert glows.opacity(child,now_ms=270)==peak
+    before=glows.opacity(main,now_ms=500)
+    glows.update({main:'$0.04',child:'130.0 tps',new:'new row'},now_ms=500)
+    assert glows.opacity(main,now_ms=500)==before<peak
+    glows.update({main:'$0.04',new:'new row'},now_ms=550)
+    assert glows.opacity(child,now_ms=550)==0 and glows.opacity(main,now_ms=550)>0
+    assert glows.opacity(main,now_ms=849)>0
+    assert glows.opacity(main,now_ms=850)==0
+    assert glows.opacity(child,now_ms=850)==0
+    assert glows.opacity(new,now_ms=850)>0
+    glows.update({main:'$0.04',new:'new row'},now_ms=851)
+    assert glows.opacity(child,now_ms=851)==0
+    glows.advance(now_ms=1150)
+    assert not glows.needs_frame
+    glows.update({main:'$0.05',new:'new row'},now_ms=1200)
+    assert glows.needs_frame
+    glows.clear();glows.update({main:'different scope'},now_ms=1201)
+    assert not glows.needs_frame
+
+
+def test_reduced_motion_row_glow_is_static_and_keeps_its_original_deadline():
+    from cachemonitor.overlay_view import RowGlows
+    owner=('home','main');glows=RowGlows()
+    glows.update({owner:'before'},now_ms=0,reduced_motion=True)
+    glows.update({owner:'first update'},now_ms=10,reduced_motion=True)
+    opacity=glows.opacity(owner,now_ms=10)
+    assert opacity>0
+    glows.update({owner:'second update'},now_ms=200,reduced_motion=True)
+    assert glows.opacity(owner,now_ms=309)==opacity
+    assert glows.opacity(owner,now_ms=310)==0
+    glows.advance(now_ms=310)
+    assert not glows.needs_frame
+
+
+def test_main_and_child_visible_updates_paint_immediately_and_share_one_idle_timer(column_model,monkeypatch):
+    from types import SimpleNamespace
+    from PySide6.QtGui import QImage,QPainter
+    from cachemonitor.overlay_view import money
     from test_overlay_monitor import render
-    elapsed=animation.currentTime()
-    m.set_content(dict(m.data,title='Solo title updated'))
-    assert animation.currentTime()==elapsed and m.agent_highlight_opacity==peak
-    highlighted=render(m)
-    animation.setCurrentTime(animation.duration())
-    assert render(m)!=highlighted
-    m.set_content(dict(m.data,recent=[]))
-    assert m.agent_highlight_opacity==0 and animation.state()==animation.State.Stopped
+    clock=[0.]
+    monkeypatch.setattr('cachemonitor.overlay_view.time',SimpleNamespace(monotonic=lambda:clock[0]))
+    m=column_model;m.put(overlayVisible=True);data=subagent_summary();m.set_content(data)
+    main=('home',data['id']);child=('home',data['subagent_finance']['agents'][0]['id'])
+    assert not m._row_glow_timer.isActive()
+    layout=m.layout();height=m.state['detailBodyHeight']
+    def detail_image():
+        image=QImage(round(m.detail_width),height,QImage.Format_ARGB32_Premultiplied);image.fill(0)
+        painter=QPainter(image)
+        try:m.detailBody.paint(painter)
+        finally:painter.end()
+        return image
+    clock[0]=1.;changed=deepcopy(data)
+    changed['main_usage']['cost']+=.5
+    changed['subagent_finance']['agents'][0]['output_speed_summary']['value']=200.
+    m.set_content(changed)
+    assert money(changed['main_usage']['cost']) in [item[0] for item in m.agent_summary_items(changed['main_usage'],'Main Agent',None,False,m.detail_width,main=True)]
+    assert any(item[0]=='200.0 tps' for item in m._detail_items)
+    flat_main=render(m);flat_child=detail_image()
+    assert m._row_glow_timer.isActive()
+    clock[0]=1.07;m.advance_row_glows()
+    assert m.row_glow_opacity(main)>0 and m.row_glow_opacity(child)>0
+    assert render(m)!=flat_main and detail_image()!=flat_child
+    clock[0]=1.3;opacity=m.row_glow_opacity(main)
+    changed=deepcopy(changed);changed['main_usage']['cost']+=.5
+    changed['subagent_finance']['agents'][0]['output_speed_summary']['value']=300.
+    m.set_content(changed)
+    assert any(item[0]=='300.0 tps' for item in m._detail_items)
+    assert m.row_glow_opacity(main)==opacity
+    assert m.layout()==layout and m.state['detailBodyHeight']==height
+    clock[0]=1.651;m.advance_row_glows()
+    assert m.row_glow_opacity(main)==m.row_glow_opacity(child)==0
+    assert not m._row_glow_timer.isActive()
+    changed=deepcopy(changed);changed['main_usage']['cost']+=.5
+    m.set_content(changed);assert m._row_glow_timer.isActive()
+    m.set_content(None)
+    assert not m._row_glow_timer.isActive() and not m.row_glows.needs_frame
+
+
+def test_row_refresh_ignores_metadata_palette_geometry_and_chart_selection(column_model):
+    m=column_model;m.put(overlayVisible=True);data=subagent_summary();m.set_content(data)
+    refreshed=deepcopy(data);refreshed['title']='Window title update'
+    refreshed['latest_ts']=9000
+    for agent in refreshed['subagent_finance']['agents']:
+        agent['latest_ts']=9000
+        agent['token_composition']['cache_hit_rate']+=.000001
+    m.set_content(refreshed,appearance=replace(m.appearance,accent='#5288cc'))
+    m.select(m.call_id(m.rows()[0]));m.set_layout(reduced=True)
+    assert not m.row_glows.needs_frame and not m._row_glow_timer.isActive()
+    changed=deepcopy(refreshed);changed['main_usage']['cost']+=.5;m.set_content(changed)
+    assert m.row_glows.needs_frame
+    new_scope=deepcopy(changed);new_scope['id']='different-main'
+    m.set_content(new_scope)
+    assert not m.row_glows.needs_frame and not m._row_glow_timer.isActive()
+    m.clear_row_glows()
 
 
 def test_agent_color_survives_rolling_calls_and_subagent_sorting(column_model):

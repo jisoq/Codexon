@@ -12,7 +12,7 @@ from .prepared_store import CapacityExceeded, NotReady, RebuildRequired, _size, 
 from .prepared_summary import recent_references, MAX_RECENT
 
 
-LATEST_FIELDS = ('model', 'model_setting', 'response_model', 'model_mismatch',
+LATEST_FIELDS = ('model', 'requested_model', 'model_setting', 'response_model', 'model_mismatch', 'model_alert_confirmed',
                  'model_state', 'effort', 'mode', 'response_mode', 'transport',
                  'transport_state', 'cache_rate')
 
@@ -119,7 +119,8 @@ def _financial_projection(packet, member):
     own = packet['own']
     if (own['home'], own['id']) != member:
         raise RebuildRequired('financial summary belongs to another owner')
-    value = {name: own[name] for name in FINANCIAL_FIELDS}
+    value = {name: own.get(name) if name in ('requested_model','model_alert_confirmed') else own[name]
+             for name in FINANCIAL_FIELDS}
     value['request'] = {'state': own.get('request', {}).get('state')}
     return value
 
