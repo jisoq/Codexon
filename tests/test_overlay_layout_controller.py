@@ -307,6 +307,8 @@ def test_maintenance_recovers_frame_dpi_and_changed_appearance(layout_controller
 @pytest.mark.parametrize('compact',[False,True])
 def test_pending_overlay_refresh_keeps_confirmed_panel_until_replacement(layout_controller,monkeypatch,compact):
     from copy import deepcopy
+    from PySide6.QtCore import QRectF
+    from cachemonitor.overlay_monitor import MARGIN,SECTION_WIDTH
     from test_ui import wait_for_rendered
     import time
     c=layout_controller;app=QApplication.instance();m=c.widget.content_model
@@ -326,6 +328,13 @@ def test_pending_overlay_refresh_keeps_confirmed_panel_until_replacement(layout_
     m.monitor_tab='history';m.pin_call(m.call_id(m.rows()[0]));c.refresh();app.processEvents()
     assert m.compact is compact
     selected=m.selected_id;geometry=c.monitor_geometry
+    wait_for_rendered(lambda:m._agent_highlight.state()==m._agent_highlight.State.Stopped,timeout=5)
+    frame=c.widget.quick.grabFramebuffer();layout=m.layout()
+    scale=m.appearance.scale*frame.width()/c.widget.quick.width()
+    body=QRectF(MARGIN*scale,layout['charts'][0]*scale,SECTION_WIDTH*scale,
+                (layout['content_end']-layout['charts'][0])*scale).toAlignedRect()
+    confirmed_body=frame.copy(body)
+    assert not confirmed_body.isNull()
     changed=deepcopy(confirmed)
     changed.update(_prepared_token=('fixture',2),_overlay_revision=('fixture',2),cost=confirmed['cost']+1)
     changed['recent'][-1]['output']+=10;changed['latest']=changed['recent'][-1]
@@ -336,9 +345,7 @@ def test_pending_overlay_refresh_keeps_confirmed_panel_until_replacement(layout_
     assert m.selected_id==selected and m.graph_pinned
     assert c.monitor_geometry==geometry
     assert m.note=='갱신 중' and m.heartbeat_state()['mode']=='pending'
-    # The arrival highlight may still be fading while confirmed values stay
-    # unchanged. Compare rendered content only after that expected animation.
-    wait_for_rendered(lambda:m._agent_highlight.state()==m._agent_highlight.State.Stopped,timeout=5)
+    wait_for_rendered(lambda:c.widget.quick.grabFramebuffer().copy(body)==confirmed_body)
     before=c.widget.quick.grabFramebuffer()
     assert m.notice_card() is None and len(requests)==1
     # Rejected obsolete reads must not erase the still-valid displayed snapshot.

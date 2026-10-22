@@ -7,6 +7,7 @@ from PySide6.QtTest import QTest
 from cachemonitor.overlay import OverlayController
 from cachemonitor.overlay_tracking import RouteLog,Selection
 from cachemonitor.overlay_data import OverlaySummaries
+from cachemonitor.overlay_windows import observe_selection
 from cachemonitor.analysis_engine import AnalysisEngine
 from test_overlay import logfile,route,A,B,source
 
@@ -16,18 +17,56 @@ def test_long_line_partial_tail_truncation_and_same_path_replacement(tmp_path):
     path.write_bytes(b'x'*2500+route(B).encode()+b'\n'+route(A).encode())
     offsets=[]
     for i in range(8):
-        selected=reader.poll(42,i*.1);offsets.append(reader.offset)
+        selected=observe_selection([dict(hwnd=1,pid=42)],reader,i*.1)['selection'];offsets.append(reader.offset)
         if selected:break
     assert selected.thread_id==A and reader.offset==path.stat().st_size
     assert offsets==sorted(set(offsets)) and len(reader.partial)<=512
     with path.open('ab') as f:f.write(route(B).encode()[:-1])
-    assert reader.poll(42,1) is None
+    assert observe_selection([dict(hwnd=1,pid=42)],reader,1)['selection'] is None
     with path.open('ab') as f:f.write(b'\n')
-    assert reader.poll(42,1.1).thread_id==B
+    assert observe_selection([dict(hwnd=1,pid=42)],reader,1.1)['selection'].thread_id==B
     path.write_text(route(A),encoding='utf8')
-    assert reader.poll(42,1.2).thread_id==A
+    assert observe_selection([dict(hwnd=1,pid=42)],reader,1.2)['selection'].thread_id==A
     replacement=path.with_suffix('.replacement');replacement.write_text(route(B),encoding='utf8');replacement.replace(path)
-    assert reader.poll(42,1.3).thread_id==B
+    assert observe_selection([dict(hwnd=1,pid=42)],reader,1.3)['selection'].thread_id==B
+
+
+@pytest.mark.skipif(sys.platform!='win32',reason='Owned native Windows windows')
+def test_unrelated_partial_log_keeps_native_overlay_visible_and_navigation_disabled(tmp_path,monkeypatch):
+    from cachemonitor.overlay_windows import SelectionTracker,WindowsOverlay
+    from cachemonitor.overlay_navigation import NavigationTarget
+    from test_ui import wait_for_rendered
+    app=QApplication.instance() or QApplication([])
+    root=tmp_path/'Codex'/'Logs';path=logfile(root);path.write_text(route(A),encoding='utf-8')
+    monkeypatch.setenv('LOCALAPPDATA',str(tmp_path))
+    host=QWidget();host.resize(1000,1000);host.show()
+    target=dict(hwnd=int(host.winId()),pid=42)
+    monkeypatch.setattr(WindowsOverlay,'targets',lambda self:[target])
+    native=WindowsOverlay()
+    native.visible_target=lambda hwnd:bool(native.u.IsWindowVisible(hwnd) and not native.u.IsIconic(hwnd))
+    controller=OverlayController(QSettings(str(tmp_path/'partial.ini'),QSettings.IniFormat),
+                                 native_enabled=False,appearance_path=tmp_path/'codex.toml')
+    controller.native=native;native.configure(int(controller.widget.winId()))
+    engine=AnalysisEngine();engine.ingest([source()])
+    controller.receive_snapshot(dict(overlay_sessions=OverlaySummaries().collect(engine)))
+    tracker=SelectionTracker();tracker.observed.connect(controller.receive_target)
+    activated=[];native.activate_target=lambda hwnd:activated.append(hwnd) or True
+    try:
+        tracker.start()
+        wait_for_rendered(lambda:controller.widget.isVisible() and controller.selection_confirmed(),timeout=3)
+        assert not controller.widget.quick.grabFramebuffer().isNull()
+        with path.open('ab') as stream:stream.write(b'ordinary refresh diagnostic still being written')
+        wait_for_rendered(lambda:not controller.selection_confirmed(),timeout=3)
+        assert controller.widget.isVisible() and controller.widget.data['id']==A
+        assert not controller.target_state['confirmed']
+        assert not controller.navigation_availability('home',A)['enabled']
+        assert not controller.navigate_from_dashboard(NavigationTarget('home',A))['enabled'] and not activated
+        assert native.confirm_selection(target) is None
+        with path.open('ab') as stream:stream.write(b'\n')
+        wait_for_rendered(lambda:controller.selection_confirmed(),timeout=3)
+        assert controller.widget.isVisible() and native.confirm_selection(target).thread_id==A
+    finally:
+        tracker.stop();controller.stop();host.close();app.processEvents()
 
 
 def test_tracker_finishes_backlog_and_observes_appends_without_heartbeat(tmp_path,monkeypatch):
@@ -47,13 +86,13 @@ def test_tracker_finishes_backlog_and_observes_appends_without_heartbeat(tmp_pat
         targets=lambda:enumerated.append(1) or list(targets)))
     monkeypatch.setattr(overlay_windows,'WindowEvents',lambda native,changed:
         native_changed.append(changed) or SimpleNamespace(targets=set(),close=lambda:None))
-    read=RouteLog.poll
+    read=RouteLog.observe
     def read_then_close_window(self,*args):
         result=read(self,*args)
         if drop_on_read[0]:
             drop_on_read[0]=False;targets.clear();native_changed[0]()
         return result
-    monkeypatch.setattr(RouteLog,'poll',read_then_close_window)
+    monkeypatch.setattr(RouteLog,'observe',read_then_close_window)
     observe=overlay_windows.observe_selection
     def observe_targets(targets,*args):
         without_target[0]=not targets
