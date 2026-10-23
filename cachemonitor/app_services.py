@@ -342,13 +342,17 @@ class AppServices:
 
     def poll_collection(self):
         from hashlib import sha256
+        from .collection_lifecycle import startup_snapshot
         from .usage_collection import CollectionChannel, collector_command, locked
         from .observer_task import ObserverTask
         channel = CollectionChannel(self.homes, self.index, self.evidence)
         self.collection_fault={};self.collection_healthy=False
         try:
             with ProcessLock(channel.companion('.collector-update.lock')):
-                snapshot = channel.read_header()
+                if self.collector_pending:
+                    snapshot, broken_default = startup_snapshot(channel, retired_instance=self.collector_pending[0])
+                else:
+                    snapshot, broken_default = channel.read_header(), False
                 identity_snapshot = snapshot
                 marker=read_json(channel.companion('.collector-error.json'))
                 marker_facts=(marker['facts'] if marker.get('scope')==sha256(channel.scope.encode('utf-8')).hexdigest()
@@ -358,7 +362,7 @@ class AppServices:
                 if self.collector_pending:
                     previous, requested = self.collector_pending
                     current = (snapshot or {}).get('collection', {}).get('instance')
-                    if not current or current == previous:
+                    if broken_default or not current or current == previous:
                         if self.clock() - requested < 30:
                             self.collection_fault=dict(starting=True)|marker_facts
                             return '수집 시작 중'
