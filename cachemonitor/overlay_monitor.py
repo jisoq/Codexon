@@ -190,6 +190,11 @@ def action_links(m):
 def links(m):
     if m.notice_card():return []
     result=action_links(m);g=m.layout();rows=m.rows();step=SECTION_WIDTH/max(1,len(rows))
+    from .overlay_icons import agent_mark
+    result.extend(dict(x=MARGIN+item[1],y=g['main']+item[2],width=item[3],height=item[4],**item[8]['link'])
+                  for item in m.agent_summary_items(main_usage(m.data or {}),'Main Agent',
+                      agent_mark((m.data or {}).get('id'),m.appearance),m.main_expanded,SECTION_WIDTH,main=True)
+                  if item[8].get('kind')=='model-info')
     for chart,y in enumerate(g['charts']):
         for index,row in enumerate(rows):
             result.append(dict(id=f'inspect-{chart}-{index}',x=MARGIN+index*step,y=y+20,width=step,

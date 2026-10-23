@@ -2879,6 +2879,7 @@
   "제외 내역 처리 중": "Processing exclusions",
   "상자 Q1~Q3 / 선 중앙값 / 수염 P10~P90 / 점 평균": "Box Q1~Q3 / Line median / Whiskers P10~P90 / Dot mean",
   "상자는 가운데 50%인 Q1~Q3, 선은 중앙값, 수염은 P10~P90, 점은 산술평균입니다. 유효 호출을 동일 가중으로 계산합니다.": "The box spans the middle 50% from Q1 to Q3. The line is the median, whiskers span P10 to P90, and the dot is the arithmetic mean. Each valid call has equal weight.",
+  "호출 모델과 응답 모델이 달라 표시되었습니다.\n호출 모델: {request}, 응답 모델: {response}": "Shown because the requested and response models differ.\nRequested model: {request}, response model: {response}",
   "모델명 불일치 기록": "Model mismatch history",
   "호출 모델": "Requested model",
   "응답모델": "Response model",
