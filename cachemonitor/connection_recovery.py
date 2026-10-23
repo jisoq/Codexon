@@ -226,11 +226,21 @@ def main(argv=None):
     parser.add_argument('--isolated-install', action='store_true')
     parser.add_argument('--no-launch', action='store_true')
     parser.add_argument('--native-install', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--silent', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--restart-client', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--install-caller-pid', type=int, action='append', help=argparse.SUPPRESS)
     parser.add_argument('--language', choices=('en','ko'))
     parser.add_argument('--ui-smoke', type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     if args.language:os.environ['CODEXON_LANGUAGE']=args.language
+    if args.restart_client:
+        from .client_restart import run_restart
+        from .update_state import UpdateState, valid_id
+        if not args.install_root or not valid_id(args.update_id):parser.error('Invalid restart operation')
+        run_restart(UpdateState(args.install_root),args.update_id)
+        from .observer_task import ObserverTask
+        ObserverTask(str(args.install_root.resolve())+':'+args.update_id,role='ClientRestart').remove()
+        return 0
     if args.install_root:
         from .install_management import finish, prepare_uninstall
         from .install_dispatch import packaged_context, native_install
@@ -246,7 +256,7 @@ def main(argv=None):
             else:
                 result=finish(args.install_root,args.product_dir,Path(sys.executable),
                               isolated=args.isolated_install,launch=not args.no_launch,
-                              language=args.language or 'ko',update_id=args.update_id)
+                              language=args.language or 'ko',update_id=args.update_id,silent=args.silent)
         except Exception as exc:
             result=dict(error=str(exc))
             if args.update_id:

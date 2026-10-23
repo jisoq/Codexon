@@ -3,6 +3,7 @@ from PySide6.QtCore import QFileSystemWatcher, QThread, QTimer, Signal
 from .i18n import formatted, tr
 from .presentation import Button, Column, Group, Text, Row
 from .installation import open_recovery
+from .client_restart import needs_reopening
 import time
 
 
@@ -45,6 +46,7 @@ class UpdatePanel(Group):
         self._continue_pending=None;self._continued_operations=set();self._deferred_metadata=[]
         self.next_recovery_check=0;self._stopped=False;self._exit_pending=False;self._journal_signature=None
         self._initializing=True;self._offer_operation_id=None
+        self._restart_confirmation=None
         from .installation import installed
         from .update_state import state_for
         import sys
@@ -162,7 +164,7 @@ class UpdatePanel(Group):
     def release_discovered(self,release):
         if self.busy() or self.closing():return
         if not release:
-            if self.offer is self.discovered_offer:self.offer=None;self.discovered_offer=None;self.render_offer()
+            if self.offer is self.discovered_offer:self.offer=None;self.discovered_offer=None;self.render_record()
             return
         self.discovered_offer=dict(kind='app',release=release,connections=None)
         self.show_plan(self.discovered_offer)
@@ -211,10 +213,10 @@ class UpdatePanel(Group):
         if operation:operation.deleteLater()
         plan=self.pending_plan;self.pending_plan=None
         if plan:self.show_plan(plan)
+        self.button.setEnabled(True);self.execute.setEnabled(True)
         if self.auto_start:
             self.auto_start=False
             if plan and plan['kind'] in ('app','proxy'):self.request_install();return
-        self.button.setEnabled(True);self.execute.setEnabled(True)
         self.reload_record(force=True);self.render_record()
         continuation=self._continue_app;self._continue_app=None
         if (continuation and not self.closing()
@@ -238,15 +240,17 @@ class UpdatePanel(Group):
         if self.operation or self.metadata_pending:return True
         self.reload_record(force=True)
         if (self.record.get('operation_id')!=operation_id
-                or self.record.get('phase') not in ('partial','failed','deferred','interrupted')
+                or self.record.get('phase') not in ('partial','failed','deferred','interrupted','restart_required')
                 or self.record.get('app',{}).get('state')!='verified'):
             self._continue_pending=None
             return False
         self._continue_pending=None;self._continued_operations.add(operation_id)
-        from .app_update import retry_proxy
-        self.checking=False;self.operation_error=False
-        self.launch_operation(lambda:retry_proxy(self.manager,self.journal,verified_operation_id=operation_id))
-        return self.operation is not None
+        if self.record.get('client',{}).get('phase') in ('closed','not_running','not_applicable'):
+            from .app_update import retry_proxy
+            self.checking=False;self.operation_error=False
+            self.launch_operation(lambda:retry_proxy(self.manager,self.journal,verified_operation_id=operation_id))
+        else:self.request_install(verified_operation_id=operation_id)
+        return self.operation is not None or self._restart_confirmation is not None
 
     def show_plan(self,plan,**_):
         from .update_state import ACTIVE
@@ -254,7 +258,7 @@ class UpdatePanel(Group):
         if self.record.get('phase') in ACTIVE:
             self.offer=None;return
         self._offer_operation_id=self.record.get('operation_id')
-        self.offer=plan;self.operation_error=False;self.status.put(color='muted');self.render_offer()
+        self.offer=plan;self.operation_error=False;self.status.put(color='muted');self.render_record()
 
     def render_offer(self):
         plan=self.offer or {};available=plan.get('kind') in ('app','proxy')
@@ -264,8 +268,7 @@ class UpdatePanel(Group):
         self.version.setVisible(plan.get('kind')=='app')
         version=plan.get('release',{}).get('tag_name','').lstrip('v')
         self.version.setText(version);self.version.setToolTip(tr('변경 내역')+' '+version)
-        self.status.setText('교체할 때 연결이 잠시 중단됩니다.' if available else '설치할 새 버전이 없습니다.' if plan else '')
-        if available and plan.get('connection_enabled') is False:self.status.setText('새 앱을 설치한 뒤 다시 실행합니다.')
+        self.status.setText('' if available else '설치할 새 버전이 없습니다.' if plan else '')
         self.status.setVisible(bool(self.status.text()))
         if plan.get('proxy',{}).get('state') in ('unknown','recovery'):
             self.status.setText('앱은 최신 버전입니다. Codex 연결 상태를 확인하세요.')
@@ -275,32 +278,49 @@ class UpdatePanel(Group):
         import sys
         from pathlib import Path
         app=self.record.get('app',{})
-        return (self.record.get('phase') in ('partial','failed','deferred','interrupted')
+        return (self.record.get('phase') in ('partial','failed','deferred','interrupted','restart_required')
                 and app.get('state')=='verified' and app.get('executable')
                 and Path(app['executable']).resolve()!=Path(sys.executable).resolve())
 
-    def request_install(self):
+    def request_install(self,checked=False,*,confirmed=False,verified_operation_id=None):
         self.reload_record(force=True)
         if self.offer and self._offer_operation_id!=self.record.get('operation_id'):
             self.offer=None;self.render_record();return
         if self.busy() or self.closing():return
-        if not self.offer and self.needs_new_app():
+        if self._restart_confirmation:return
+        reopening=needs_reopening(self.record.get('client',{}))
+        if not reopening and not self.offer and self.needs_new_app() and not verified_operation_id:
             from .app_update import continuation_target
             self.checking=False;self.operation_error=False
             self.launch_operation(lambda:continuation_target(self.journal,self.manager));return
-        if not self.offer and self.record.get('phase') in ('partial','failed','deferred','interrupted') and self.record.get('app',{}).get('state') in ('verified','current'):
-            from .app_update import retry_proxy
-            self.checking=False;self.operation_error=False
-            self.launch_operation(lambda:retry_proxy(self.manager,self.journal));return
-        if not self.offer:return
-        if self.offer is self.discovered_offer:
+        retrying=self.record.get('phase') in ('partial','failed','deferred','interrupted','restart_required') and (reopening or not self.offer and self.record.get('app',{}).get('state') in ('verified','current'))
+        if not self.offer and not retrying:return
+        if not retrying and self.offer and self.offer is self.discovered_offer:
             from .app_update import check_update
             release=self.offer['release'];self.auto_start=True;self.checking=True
             self._check_operation_id=self.record.get('operation_id')
             self.launch_operation(lambda:check_update(self.status_progress,self.manager,release=release));return
-        from .app_update import update
+        if not confirmed and not (retrying and reopening):
+            from .client_restart import SAVE_WORK
+            from .quick_runtime import Confirmation
+            plan=self.offer;operation_id=self.record.get('operation_id')
+            dialog=Confirmation('Codex 재시작',SAVE_WORK,self)
+            dialog.confirm.setText('업데이트하고 재시작')
+            self._restart_confirmation=dialog
+            def answered(result):
+                self._restart_confirmation=None
+                self.reload_record(force=True)
+                if result and not self.closing() and self.offer is plan and self.record.get('operation_id')==operation_id:
+                    self.request_install(confirmed=True,verified_operation_id=verified_operation_id)
+            dialog.finished.connect(answered);dialog.open();return
+        from .app_update import update, retry_proxy
+        from .client_restart import capture
         plan=self.offer;self.checking=False;self.operation_error=False
-        self.launch_operation(lambda:update(self.status_progress,self.manager,plan=plan))
+        if retrying:
+            kwargs=dict(consent=capture() if confirmed else None)
+            if verified_operation_id:kwargs['verified_operation_id']=verified_operation_id
+            self.launch_operation(lambda:retry_proxy(self.manager,self.journal,**kwargs))
+        else:self.launch_operation(lambda:update(self.status_progress,self.manager,plan=plan,consent=capture()))
 
     def cancel_update(self,later):
         if self.closing() or not self.journal or not self.journal.cancel(later=later):return
@@ -379,7 +399,7 @@ class UpdatePanel(Group):
             self.offer=None
         if active:self.operation_error=False
         critical=phase in CRITICAL or (active and proxy.get('cutover_started'))
-        attention=phase in ('needs_exit','partial','failed','interrupted','deferred')
+        attention=phase in ('needs_exit','partial','failed','interrupted','deferred','restart_required')
         fault=dict(phase=phase,proxy=dict(phase=proxy.get('phase')),app=dict(state=record.get('app',{}).get('state')),
             cancel_requested=record.get('cancel_requested',False),
             status_current=bool(record),status_healthy=phase in ('complete','cancelled'),
@@ -390,19 +410,20 @@ class UpdatePanel(Group):
         if self.metadata_pending or (self.operation and self.checking):return
         if self.operation_error and self.checking and not active:return
         self.recheck.setVisible(phase=='needs_exit')
-        self.cancel.setVisible(phase in ('preparing','downloading') and not critical)
+        self.cancel.setVisible(phase in ('preparing','downloading','closing_client') and not critical)
         self.later.setVisible(phase in ('waiting','needs_exit') and not critical)
         for control in (self.cancel,self.later):control.setEnabled(not record.get('cancel_requested'))
         retryable=phase in ('failed','interrupted') and record.get('app',{}).get('state') not in ('verified','current')
-        if self.offer and not active:
+        reopening=needs_reopening(record.get('client',{}))
+        if self.offer and not active and not reopening:
             self.render_offer()
             return
         if not phase:return
-        if self.operation_error and not active and record.get('app',{}).get('state') not in ('verified','current'):return
+        if self.operation_error and not active and not reopening and record.get('app',{}).get('state') not in ('verified','current'):return
         self.button.setVisible(not active and (not attention or retryable))
         self.button.setEnabled(not self.operation and not self.metadata_pending)
-        self.execute.setVisible(attention and not active and record.get('app',{}).get('state') in ('verified','current'))
-        self.execute.setText('새 앱으로 계속' if self.needs_new_app() else '다시 적용');self.execute.setEnabled(not self.operation)
+        self.execute.setVisible(attention and not active and (reopening or record.get('app',{}).get('state') in ('verified','current')))
+        self.execute.setText('Codex 다시 실행' if reopening else '새 앱으로 계속' if self.needs_new_app() else '다시 적용');self.execute.setEnabled(not self.operation)
         self.version.hide()
         headings={'preparing':'업데이트 준비','downloading':'업데이트 준비','installing':'앱 설치 중',
                   'queued':'응답 마무리 대기','waiting':'응답 마무리 대기','needs_exit':'연결한 앱 종료 필요',
@@ -410,11 +431,14 @@ class UpdatePanel(Group):
                   'rollback':'이전 프록시 복원 중','complete':'업데이트 적용 완료',
                   'partial':'앱 설치 완료, 연결 적용 대기','deferred':'연결 적용 대기',
                   'failed':'업데이트 실패','interrupted':'업데이트 중단','cancelled':'업데이트 취소됨'}
+        headings.update(closing_client='Codex 종료 중',restarting_client='Codex 다시 실행 중',restart_required='Codex 재시작 필요')
         self.heading.setText(headings.get(phase,'업데이트'))
         self.heading.put(fontSize=14,bold=False,color='muted')
         self.heading.parent().setSpacing(8)
         message=record.get('message') or proxy.get('message','')
-        if phase=='needs_exit':
+        if phase=='restart_required':message=record.get('client',{}).get('message') or '업데이트를 다시 시작하고 Codex 재시작을 확인하세요.'
+        elif phase in ('closing_client','restarting_client'):message=''
+        elif phase=='needs_exit':
             message='연결한 앱이 종료되기를 기다리고 있습니다.\n사용 중인 ChatGPT 앱과 Codex CLI를 종료하세요.\nCodexon은 켜 두세요.'
         elif phase=='waiting':
             count=proxy.get('responding',0)

@@ -11,7 +11,7 @@ import uuid
 from .observer_state import ProcessLock, read_json
 
 ACTIVE = frozenset(('preparing', 'downloading', 'installing', 'waiting', 'needs_exit',
-                    'switching', 'stopping', 'starting', 'verifying', 'rollback'))
+                    'switching', 'stopping', 'starting', 'verifying', 'rollback', 'closing_client', 'restarting_client'))
 CRITICAL = frozenset(('switching', 'stopping', 'starting', 'verifying', 'rollback'))
 
 
@@ -34,16 +34,22 @@ class UpdateState:
         value['updated_at'] = time.time()
         atomic_write(self.path, json.dumps(value, ensure_ascii=False).encode())
 
-    def begin(self, kind, version, *, scope=None, release=None, replace=False):
+    def begin(self, kind, version, *, scope=None, release=None, replace=False, client=None):
         self.root.mkdir(parents=True, exist_ok=True)
         with ProcessLock(self.lock, timeout=5):
             previous = self.read()
             if previous.get('phase') in ACTIVE and not replace:
                 raise RuntimeError('업데이트가 이미 진행 중입니다.')
+            client = dict(client or dict(phase='awaiting_consent'))
+            client.setdefault('reopen_required', bool(client.get('targets')))
+            if (previous.get('kind') == kind and previous.get('target_version') == version
+                    and previous.get('scope') == scope and previous.get('phase') not in ('complete', 'cancelled')):
+                client['reopen_required'] |= previous.get('client', {}).get('reopen_required', False)
             value = dict(operation_id=uuid.uuid4().hex, kind=kind, target_version=version,
                          phase='preparing', created_at=time.time(), scope=scope,
                          app={'state': 'current' if kind == 'proxy' else 'pending'},
                          proxy={'state': 'pending'}, release=release,
+                         client=client,
                          cancel_requested=False, defer_requested=False)
             if os.name=='nt':
                 from .proxy_identity import process_identity
@@ -57,6 +63,9 @@ class UpdateState:
             if value.get('operation_id') != operation_id:
                 return False
             value.update(changes)
+            if 'phase' in changes:
+                value['component_phase'] = changes.get('component_phase', changes['phase'])
+                value['phase'] = overall_phase(value, value['component_phase'])
             self.write(value)
             return True
 
@@ -80,10 +89,46 @@ class UpdateState:
             self.write(value)
             return True
 
+    def client_result(self, operation_id, **changes):
+        with ProcessLock(self.lock, timeout=5):
+            value = self.read()
+            if value.get('operation_id') != operation_id:return False
+            value.setdefault('component_phase', value['phase'])
+            if 'reopen_required' in changes:
+                changes['reopen_required'] |= value.get('client', {}).get('reopen_required', False)
+            value['client'] = {**value.get('client', {}), **changes}
+            value['phase'] = overall_phase(value, value.get('component_phase', value['phase']))
+            self.write(value)
+            return True
+
+    def begin_activation(self, operation_id):
+        with ProcessLock(self.lock, timeout=5):
+            value = self.read()
+            if value.get('operation_id') != operation_id or value.get('cancel_requested'):return False
+            value.update(phase='installing', component_phase='installing', activation_started=True)
+            self.write(value)
+            return True
+
+    def prepare_proxy_retry(self, operation_id, consent):
+        with ProcessLock(self.lock, timeout=5):
+            value = self.read()
+            if value.get('operation_id') != operation_id:return False
+            client = value.get('client', {})
+            reopen_required = client['reopen_required']
+            client = dict(consent if consent is not None else client)
+            client['reopen_required'] = reopen_required or client.get('reopen_required', False)
+            for key in ('ready_at', 'result', 'owner', 'message'):
+                client.pop(key, None)
+            value.update(phase='waiting', component_phase='waiting', client=client,
+                         proxy=dict(state='pending'), cancel_requested=False, defer_requested=False,
+                         activation_started=False, required_action=None, message='')
+            self.write(value)
+            return True
+
     def cancel(self, *, later=False):
         with ProcessLock(self.lock, timeout=5):
             value = self.read()
-            if value.get('proxy',{}).get('cutover_started') or value.get('phase') not in ('preparing', 'downloading', 'waiting', 'needs_exit'):
+            if value.get('activation_started') or value.get('proxy',{}).get('cutover_started') or value.get('phase') not in ('preparing', 'downloading', 'installing', 'waiting', 'needs_exit', 'closing_client', 'restart_required'):
                 return False
             value.update(cancel_requested=True, defer_requested=bool(later))
             self.write(value)
@@ -112,7 +157,7 @@ class UpdateState:
                     return operation_id
                 if value.get('phase') != 'installing' or value.get('app',{}).get('state') == 'verified':
                     return None
-            value.update(phase='waiting', scope=scope or value.get('scope'), cancel_requested=False,
+            value.update(phase='waiting', component_phase='waiting', activation_started=False, scope=scope or value.get('scope'), cancel_requested=False,
                          app=app)
             self.write(value)
             return operation_id
@@ -154,8 +199,9 @@ class UpdateState:
             if (value.get('phase') == mapped and previous == result
                     and not value.get('cancel_requested')):
                 return True
-            value.update(phase=mapped, proxy=dict(result), required_action=result.get('required_action'),
+            value.update(component_phase=mapped, proxy=dict(result), required_action=result.get('required_action'),
                          message=result.get('message', ''))
+            value['phase'] = overall_phase(value, mapped)
             if phase in ('complete','off','cancelled','failed'):value['cancel_requested']=False
             self.write(value)
             return True
@@ -163,7 +209,19 @@ class UpdateState:
     def fail(self, operation_id, message):
         value = self.read()
         phase = 'partial' if value.get('app', {}).get('state') == 'verified' else 'failed'
-        return self.change(operation_id, phase=phase, message=str(message))
+        return self.change(operation_id, phase=phase, component_phase=phase, message=str(message))
+
+
+def overall_phase(record, component_phase):
+    client = record.get('client', {})
+    phase = client.get('phase')
+    if phase == 'blocked':return 'restart_required'
+    if phase == 'closing':return 'closing_client'
+    if phase in ('closed', 'reopening') and component_phase in ('complete', 'partial', 'failed', 'cancelled', 'deferred'):
+        return 'restarting_client'
+    if component_phase == 'complete' and phase not in ('restarted', 'not_running', 'not_applicable'):
+        return 'restart_required'
+    return component_phase
 
 
 def matches_proxy_target(record, result):

@@ -35,7 +35,7 @@ def native_install(args):
     for key in ('product_dir','language','update_id'):
         value=getattr(args,key,None)
         if value:command+=['--'+key.replace('_','-'),str(value)]
-    for key in ('prepare_uninstall','isolated_install','no_launch'):
+    for key in ('prepare_uninstall','isolated_install','no_launch','silent'):
         if getattr(args,key,False):command.append('--'+key.replace('_','-'))
     task=ObserverTask(str(report),role='InstallationActivation')
     task.start(command)
