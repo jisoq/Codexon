@@ -1,4 +1,3 @@
-from .analytics import observation_flags
 """Worker-owned dashboard projections. Historical records never cross the view wire."""
 from collections import Counter
 
@@ -60,16 +59,3 @@ def refresh_bounds(value,q):
     if q.get('start'):
         timeline[0]={**timeline[0],'start_ts':q['start'],'start':datetime.fromtimestamp(q['start']).isoformat()}
     return {**value,'overview':{**overview,'timeline':timeline,'end':datetime.fromtimestamp(q['end']).isoformat()}}
-
-
-def matches(row,key):
-    if key=='unpriced':return row.get('cost') is None
-    if key=='unknown_mode':return request_tier(row)=='미확인'
-    if key=='model_mismatch':return bool(row.get('model_alert_confirmed')) or row.get('model_match')=='모델명 불일치'
-    if key=='observation_missing':return observation_flags(row)['missing']
-    if key=='observation_conflict':return observation_flags(row)['conflict']
-    if key=='observation_problem':return matches(row,'observation_missing') or matches(row,'observation_conflict')
-    if key=='cache_zero':return type(row.get('input')) is int and row['input']>0 and type(row.get('cached')) is int and row['cached']==0
-    if key=='cache_degradation':return bool(row.get('cache_degradation') or row.get('cache_incident_id'))
-    if key=='http':return row.get('transport')=='HTTP/SSE'
-    return False

@@ -18,6 +18,8 @@ def start_smoke(window,app,path,fonts,depth='full'):
                or window.deferred_result or (window.current_page==7 and window.mismatch_page.revision is None)):
             app.processEvents();QTest.qWait(20)
             if window.analysis_errors:raise AssertionError(window.analysis_errors)
+            if window.current_page==7 and any(window.mismatch_page.query_errors.values()):
+                raise AssertionError(window.mismatch_page.query_errors)
             if time.monotonic()>deadline:raise AssertionError('Analysis response timed out')
         QTest.qWait(60)
 

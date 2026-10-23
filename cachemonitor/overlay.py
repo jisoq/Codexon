@@ -580,7 +580,7 @@ class OverlayController(QObject):
                 or state.get('target')!=self.target_state.get('target')):self.cancel_drag()
         if state.get('selection')!=self.target_state.get('selection'):
             self.close_popup()
-            self.target_state = state
+        self.target_state = state
         self.observed_at = now
         self.refresh()
 

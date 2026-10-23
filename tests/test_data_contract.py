@@ -1,5 +1,5 @@
-from cachemonitor.analysis_records import public_record
 """Regression cases for the shared dashboard/overlay observation contract."""
+from cachemonitor.analysis_records import public_record
 import copy
 import json
 import pytest

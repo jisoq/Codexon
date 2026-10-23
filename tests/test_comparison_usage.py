@@ -446,7 +446,7 @@ def test_capacity_failures_preserve_published_aggregate(failure,monkeypatch):
         engine.reader.limits.page_objects_bytes=probe.read_metrics['comparison_working_peak_bytes']-1
     else:
         original=comparison._size
-        monkeypatch.setattr(comparison,'_size',lambda value:comparison.LIMIT+1 if isinstance(value,dict) and 'population' in value else original(value))
+        monkeypatch.setattr(comparison,'_size',lambda value:comparison.LIMIT+1 if isinstance(value,dict) and value.get('comparison') is True else original(value))
     with pytest.raises(CapacityExceeded):project(engine,all_query())
     assert engine._comparison_cache is published
     assert published['end']==retained['end'] and published['signature']==retained['signature']
@@ -460,7 +460,6 @@ def test_capacity_failures_preserve_published_aggregate(failure,monkeypatch):
         engine.reader.limits.page_objects_bytes=comparison.LIMIT
         assert project(engine,all_query())['usage']==project(ProjectedEngine(deepcopy(engine.owners)),all_query())['usage']
     assert accepted['summary']['value']==1
-
 
 
 def test_empty_metric_populations_deliver_no_plot_or_invented_coverage():
@@ -529,7 +528,6 @@ def test_warm_fold_delivers_current_metadata_and_independent_mutable_values():
     first['usage']['rows'][0]['distributions']['input_per_call']['median']=999
     first['usage']['rows'][0]['filters']['model']='changed'
     first['usage']['rows'][0]['components'].append('changed')
-    first['usage']['population']['query']['start']=999
     q=all_query('input_per_call');q.update(now=120,end=120,loading=True,_prepared_token=['new'])
     engine.revision+=1;engine.versions[('home','one')]+=1
     engine.owner=lambda *args:dict(dependencies={'source_digest':'1'})
@@ -538,12 +536,9 @@ def test_warm_fold_delivers_current_metadata_and_independent_mutable_values():
     assert refreshed['valid_until']==300.002
     assert refreshed['valid_until']!=first['valid_until']
     assert refreshed['revision']==engine.revision
-    assert refreshed['key']==engine.query_key(refreshed['usage']['population']['query'])
-    assert refreshed['usage']['population']['query']=={key:value for key,value in q.items() if key not in ('usage','presentation')}
+    assert refreshed['key']==engine.query_key({key:value for key,value in q.items() if key not in ('usage','presentation')})
     expected=project(ProjectedEngine(deepcopy(engine.owners)),q)
     assert exact_scalars(refreshed['usage'])==exact_scalars(expected['usage'])
-    refreshed['usage']['population']['query']['_prepared_token'].append('changed')
-    assert q['_prepared_token']==['new']
 
 
 def test_owner_order_removal_and_context_changes_invalidate_the_fold():

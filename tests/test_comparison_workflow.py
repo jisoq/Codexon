@@ -1,5 +1,5 @@
-from cachemonitor.dashboard import PAGE_INDEX
 """Model-driven comparison and navigation through the real Qt scene."""
+from cachemonitor.dashboard import PAGE_INDEX
 import copy
 import pytest
 

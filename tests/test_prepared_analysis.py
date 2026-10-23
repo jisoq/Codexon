@@ -1357,23 +1357,11 @@ def test_known_old_format_regenerates_atomically_and_preserves_other_stores(tmp_
     assert not list(tmp_path.glob('*.backup'))
 
 
-def test_catalog_order_upgrade_preserves_history_and_rebuilds_missing_order_schema(tmp_path):
+def test_current_cache_rebuilds_missing_catalog_order_schema(tmp_path):
     from contextlib import closing
-    path = tmp_path/'upgraded-order.sqlite'
+    path = tmp_path/'missing-order.sqlite'
     with storage.PreparedStore(path) as store:
         previous = publish(store, 1, calls())
-    with closing(sqlite3.connect(path,isolation_level=None)) as db:
-        db.execute('DROP TABLE catalog_orders')
-        db.execute('ALTER TABLE meta DROP COLUMN order_batch')
-        db.execute('UPDATE meta SET format=5 WHERE singleton=1')
-    with storage.PreparedStore(path) as store, storage.PreparedReader(path) as reader:
-        assert store.token == previous
-        assert store.db.execute('SELECT format FROM meta').fetchone()[0] == storage.FORMAT
-        with reader.pin(previous) as view:
-            assert view.record(*OWNER, 'call-1')['cost'] == 1.
-        stage = store.begin(('source', 2))
-        stage.catalog_order([(OWNER, 0)])
-        stage.publish(('source', 2), ready=True)
     with closing(sqlite3.connect(path,isolation_level=None)) as db:
         db.execute('DROP TABLE catalog_orders')
     with storage.PreparedStore(path) as store:

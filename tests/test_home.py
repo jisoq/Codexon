@@ -1,5 +1,5 @@
-from cachemonitor.dashboard import PAGE_INDEX
 """Home owns a stable today scope and routes to the existing analytical pages."""
+from cachemonitor.dashboard import PAGE_INDEX
 import copy
 import time
 from datetime import datetime

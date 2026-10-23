@@ -1,5 +1,5 @@
-from cachemonitor.analysis_records import public_record
 """Ingest bookkeeping must retain original ownership and object identity."""
+from cachemonitor.analysis_records import public_record
 from copy import deepcopy
 
 import pytest

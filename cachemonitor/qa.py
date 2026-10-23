@@ -1,5 +1,5 @@
+"""Native taskbar verification helpers."""
 from cachemonitor.screens import screen_id
-"""Interaction probe used only by the explicit --smoke verification path."""
 import time
 from PySide6.QtTest import QTest
 

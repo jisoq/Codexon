@@ -56,7 +56,7 @@ GROUPS = {
     'graphics_recovery': test_files('graphics_recovery', 'window_recovery', 'quick_ui', 'overlay_shadow'),
     'data': test_files('core', 'index', 'data_contract', 'subagent_collection', 'request_tier_snapshots', 'collection_defaults', 'collection_crash_recovery', 'collection_transport', 'collection_preparation'),
     'analysis': test_files('comparison', 'comparison_usage', 'overview', 'performance', 'data_contract', 'output_speed'),
-    'prepared': test_files('prepared_analysis', 'analysis_query_actor',
+    'prepared': test_files('prepared_analysis', 'prepared_format_migration', 'analysis_query_actor',
                          'prepared_revision_reads', 'prepared_retention_weights',
                          'prepared_restart_incremental', 'prepared_reader_lifecycle',
                          'prepared_notification_heads', 'prepared_mode_dependencies',
@@ -170,6 +170,7 @@ RULES = (
     ('cachemonitor/prepared_runtime.py', ('prepared', 'analysis', 'quota_poll', 'overlay_tracking', 'notifications')),
     ('cachemonitor/prepared_query.py', ('prepared', 'analysis', 'dashboard_queries', 'details')),
     ('cachemonitor/prepared_analysis.py', ('prepared', 'analysis', 'dashboard_queries', 'details')),
+    ('tests/fixtures/prepared-format6*', ('prepared',)),
     ('cachemonitor/prepared_history.py', ('prepared', 'analysis', 'dashboard_queries', 'details')),
     ('cachemonitor/prepared_category.py', ('prepared', 'analysis', 'dashboard')),
     ('cachemonitor/prepared_sums.py', ('prepared', 'analysis', 'dashboard')),
@@ -607,11 +608,10 @@ def package_check(executable, report_dir):
                                    capture_output=True, text=True, timeout=180)
             with diagnostic_io('read package smoke evidence', image.with_suffix('.json')):
                 report = json.loads(image.with_suffix('.json').read_text(encoding='utf-8')) if image.with_suffix('.json').exists() else {}
-            rollup = report.get('session_rollup') or {}
-            if check.returncode or report.get('errors') != [] or rollup.get('descendants',0) < 1:
+            if check.returncode or report.get('errors') != [] or report.get('mismatch_history') is not True:
                 raise RuntimeError('격리 패키지 화면 검사 실패: '+str(report.get('errors') or check.stderr[-1000:]))
         return dict(runtime=runtime.name, smoke=image.with_suffix('.json').name,
-                    duration_seconds=report.get('duration_seconds'), session_rollup=rollup)
+                    duration_seconds=report.get('duration_seconds'), mismatch_history=report['mismatch_history'])
     except DiagnosticFailure as error:
         error.product_exit_code = check.returncode or None
         raise

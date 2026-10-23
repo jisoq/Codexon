@@ -38,6 +38,22 @@ Default database locations are resolved by `usage_paths.index_location`,
 `launch_context.connection_paths` take precedence. Inventory actual resolved
 paths, including packaged-app redirection, before maintaining files.
 
+## Prepared analysis cache
+
+The analysis writer owns a disposable cache of canonical calls, raw request
+boundaries, shared request facts, health sections, analytical summaries, and
+append checkpoints. These facts still serve comparison, performance, overlays,
+quota accounting, and saved mismatch capture after the session-record screen is
+removed. The mismatch archive preserves its own saved evidence independently.
+
+Prepared format 7 omits record-page filter packets and displayed request ordering.
+Recognized earlier formats, including 5 and 6, use the existing atomic cache
+replacement and regenerate retained facts from their source owners. This requires
+one cold preparation. An unchanged ready restart reuses the resulting cache.
+Append format 4 retains raw request ordering and shared request facts. This
+replacement does not change source recordings, collection storage, quota ledgers,
+model evidence, or the mismatch archive.
+
 ## Retained event storage
 
 The usage index stores source paths and session owners once and references

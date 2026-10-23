@@ -1,8 +1,8 @@
-from .i18n import formatted
 """Compact, keyboard-accessible disclosure for calculation and collection details."""
 from html import escape
 from PySide6.QtCore import Qt
 from .presentation import Button, Column, Group, Scroll, Text
+from .i18n import formatted
 
 
 def recorded(value):

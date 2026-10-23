@@ -32,9 +32,8 @@ def test_view_boundaries_match_full_rows_after_usage_and_metadata_changes(monkey
     import cachemonitor.analysis_engine as implementation
     snapshot=dict(ts=110,sessions=[history()],homes=['fixture'],errors=[],unassigned=[],
                   index=dict(loading=False,done=1,files=1))
-    q=dict(page=2,start=0,end=110,now=110,period='all',model='',source='',archived=True,
-           unit='response',method='mean',metric='cost',band=None,granularity='auto',presentation=True,
-           explorer=dict(view='calls',search='',sort='cost_desc'),table_windows={'records':dict(start=0,size=128)})
+    q=dict(page=1,start=0,end=110,now=110,period='all',model='',source='',archived=True,
+           unit='response',method='mean',metric='cost',band=None,granularity='auto',presentation=True)
     compact=AnalysisEngine()
     full=AnalysisEngine()
     for iteration in range(3):

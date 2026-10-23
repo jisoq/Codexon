@@ -26,8 +26,7 @@ from .prepared_sums import _Sum
 from .request_modes import requires_parent_mode
 
 
-FORMAT = ('prepared-owner-append', 3)
-READ_FORMATS = (FORMAT,)
+FORMAT = ('prepared-owner-append', 4)
 EVENT_FORMAT = ('append-health-event', 1)
 TAIL_ROWS = 128
 CHECKPOINT_BYTES = 64 * 1024
@@ -304,18 +303,13 @@ def seed(material,dependencies,*,raw_count,mode_evidence=None):
     if any(not row.get('key') for row in rows):return False
     reduced=material['append_state']
     total=reduced['total'];request=reduced['request'];misses=reduced['misses']
-    from .prepared_ingest import request_headers
-    last_order=None;headers=0
-    for turn,header in request_headers(source):
-        if header['display_ordinal']:
-            headers+=1;last_order=(header['effective_at'] if header['effective_at'] is not None else float('inf'),turn)
     checkpoint=dict(format=FORMAT,owner=owner,source_digest=dependencies['source_digest'],
         candidate_source_digest=dependencies.get('candidate_source_digest'),
         dependencies={key:dependencies[key] for key in ('pricing','classifier','preparation')},
         mode_evidence=mode_evidence,raw_count=raw_count,frontier=(rows[-1]['ts'],rows[-1]['key']),
         context_digest=context,
         total=total,misses=misses,health=material['state']['health_checkpoint'],request=request,
-        request_count=len(source.get('turn_records',{})),header_count=headers,last_header_order=last_order)
+        request_count=len(source.get('turn_records',{})))
     try:
         encoded=pack(checkpoint,maximum=CHECKPOINT_BYTES)
     except (CapacityExceeded,ValueError,TypeError):
@@ -406,7 +400,7 @@ def read_event(snapshot,owner,descriptor,*,evidence=True):
 
 
 def _headers(snapshot,owner,checkpoint,transition):
-    """Patch touched whole-request facts without renumbering prior requests."""
+    """Patch touched whole-request facts and validate raw request ordering."""
     requests=transition['requests']['upserts'];states=dict(transition['turns']['upserts'])
     turns=set(states)|{turn for turn,_,_ in requests}|{r['turn'] for r in transition['tail'] if r.get('turn')}
     current=(transition['metadata'].get('request_state') or {}).get('turn')
@@ -431,16 +425,15 @@ def _headers(snapshot,owner,checkpoint,transition):
             item['first_key']=first['key'] if first is not None else None
             item['dimensions']=dict(item['dimensions'])
         else:
-            item=dict(display_ordinal=0,effective_at=None,call_count=0,minimum=None,maximum=None,
-                first_key=None,dimensions=dict.fromkeys(('model','effort','service_tier'),'혼합'),request_present=False)
-        if turn in boundaries:item['request_present']=True
+            item=dict(call_count=0,minimum=None,maximum=None,first_key=None,
+                dimensions=dict.fromkeys(('model','effort','service_tier'),'혼합'))
         if turn in states:item['turn_state']=states[turn]
         result[turn]=item
     source_states={turn:value['turn_state'] for turn,value in result.items() if 'turn_state' in value}
     return result,before,boundaries,source_states,request_count
 
 
-def _finish_headers(snapshot,owner,checkpoint,headers,before,boundaries,rows):
+def _finish_headers(headers,rows):
     for row in rows:
         turn=row.get('turn')
         if not turn:continue
@@ -451,27 +444,6 @@ def _finish_headers(snapshot,owner,checkpoint,headers,before,boundaries,rows):
         for field in ('model','effort','service_tier'):
             value=row.get(field) or '미확인'
             if item['dimensions'].setdefault(field,value)!=value:item['dimensions'][field]='혼합'
-    pending=[]
-    for turn,item in headers.items():
-        old=before.get(turn)
-        boundary=boundaries.get(turn)
-        if boundary is None and item['request_present']:
-            stored=snapshot.request(owner,turn)
-            _require(stored is not None,'request header has no boundary')
-            boundary=stored['metadata']
-        started=(boundary or {}).get('started_at')
-        effective=started if started is not None else item['minimum']
-        displayed=bool(item['call_count'] or item['request_present'])
-        if old is not None and old['display_ordinal']:
-            _require(effective==old['effective_at'],'request correction changes display ordering')
-        elif displayed:
-            pending.append((effective if effective is not None else float('inf'),turn))
-        item['effective_at']=effective
-    last=checkpoint['last_header_order'];count=checkpoint['header_count']
-    for position in sorted(pending):
-        _require(last is None or position>tuple(last),'new request precedes an existing displayed request')
-        count+=1;headers[position[1]]['display_ordinal']=count;last=position
-    return count,last
 
 
 def _choices(previous,rows):
@@ -644,7 +616,7 @@ def prepare(snapshot,owner,transition,dependencies,*,mode_evidence=None,enrich=N
         retained_snapshot,retained_owner,old,checkpoint=_retained
         _require(retained_snapshot is snapshot and retained_owner==owner,'retained append owner differs')
         snapshot.check()
-    _require(old is not None and isinstance(checkpoint,dict) and checkpoint.get('format') in READ_FORMATS,'no append checkpoint')
+    _require(old is not None and isinstance(checkpoint,dict) and checkpoint.get('format') == FORMAT,'no append checkpoint')
     _require(checkpoint['owner']==owner and transition is not None and transition.get('format')==1
              and tuple(transition.get('owner',()))==owner,'append owner or format differs')
     _require(len(encoded(transition))<=RESPONSE_BYTES and _size(transition)<=PLAN_BYTES,'append packet exceeds budget')
@@ -707,7 +679,7 @@ def prepare(snapshot,owner,transition,dependencies,*,mode_evidence=None,enrich=N
         _add_totals(total,row);health.add(row);rows.append(row)
     for row in rows:
         if row['key'] in health.annotations:row.update(cache_incident_id=health.annotations[row['key']],cache_degradation=True)
-    header_count,last_order=_finish_headers(snapshot,owner,checkpoint,headers,before,boundaries,rows)
+    _finish_headers(headers,rows)
     packet=snapshot.derived(*owner,'summary')
     refs=recent_references(packet)
     recent_keys=[ref['key'] for ref in refs][-max(0,RECENT_CALLS-len(rows)):] if len(rows)<RECENT_CALLS else []
@@ -747,7 +719,7 @@ def prepare(snapshot,owner,transition,dependencies,*,mode_evidence=None,enrich=N
         coverage_bounds=(total['minimum'],total['maximum']))
     updated=dict(checkpoint,format=FORMAT,source_digest=body,candidate_source_digest=body,raw_count=count+len(rows),
         frontier=(rows[-1]['ts'],rows[-1]['key']),total=total,misses=misses,health=health.save(),request=request,
-        request_count=request_count,header_count=header_count,last_header_order=last_order,
+        request_count=request_count,
         ledger_append=_ledger_append(snapshot,owner,transition,before,old['dependencies'],dependency))
     # This admitted append preserves all comparison scalars in the old prefix.
     # Request-state and cache-incident repairs below do not affect those scalars.
@@ -818,7 +790,7 @@ def try_apply(cohort,catalog,changed,removed,*,ready,parents):
                     retained[owner]=(old,checkpoint)
                 elif retained_bytes>4*1024*1024:
                     retained.clear();cohort._append_owners=None
-                if not isinstance(checkpoint,dict) or checkpoint.get('format') not in READ_FORMATS:continue
+                if not isinstance(checkpoint,dict) or checkpoint.get('format') != FORMAT:continue
                 entry=catalog['owners'][owner]
                 transition=method(owner,old['dependencies']['source_digest'],catalog=catalog)
                 if transition is None:continue

@@ -31,13 +31,12 @@ class PreparedAnalysisEngine(AnalysisEngine):
     """
     OWNER_BYTES=64*1024*1024
 
-    def __init__(self, path, token, *, limits=None, cancel=None, scope=(None,None)):
+    def __init__(self, path, token, *, limits=None, cancel=None):
         super().__init__()
         limits = limits or replace(Limits(), read_seconds=60, read_vm_steps=20_000_000)
         self.reader = PreparedReader(path, limits)
         self.token = token
         self.cancel = cancel
-        self.scope=scope
         self.snapshot = None
         self.revision = self.call_revision = self.generation = token.generation
         self.read_metrics = dict(range_rows=0, whole_rows=0, first_rows=0, header_rows=0)
@@ -50,7 +49,7 @@ class PreparedAnalysisEngine(AnalysisEngine):
                 self.order_identity=(token.instance,self.snapshot.order_batch)
                 after = None
                 while True:
-                    page = self.snapshot.catalog(after=after,query=True,home=scope[0],sid=scope[1])
+                    page = self.snapshot.catalog(after=after,query=True)
                     for row in page.rows:
                         self._adopt_owner(row['owner'], row['metadata'], row['call_metadata'], row['owner_ordinal'], row['request_maps'])
                     if page.complete:
@@ -95,12 +94,9 @@ class PreparedAnalysisEngine(AnalysisEngine):
         if self.snapshot is not None:
             raise RuntimeError('finish the active query before adopting a generation')
         pending = {}
-        def selected(key):
-            return all(value is None or key[i]==value for i,value in enumerate(self.scope))
-        removed={tuple(key) for key in removed if selected(key)}
+        removed=set(map(tuple,removed))
         with self.reader.pin(token, cancel=self.cancel) as snapshot:
             for key in changed_owners:
-                if not selected(key):continue
                 if len(pending) >= self.reader.limits.owners_per_batch:
                     raise CapacityExceeded('owner adoption exceeds the committed batch bound')
                 key = tuple(key)
@@ -138,7 +134,7 @@ class PreparedAnalysisEngine(AnalysisEngine):
                         and all(key in self.sessions or key in self.internal_sessions for key in pending)
                         and all(value is not None for value in pending.values()))
             entries=(dict(owner=key,owner_ordinal=pending[key][0]['owner_ordinal'] if key in pending else state['owner_ordinal'])
-                     for states in (self.sessions,self.internal_sessions) for key,state in states.items()) if same_order else self._pages(snapshot.ordering,home=self.scope[0],sid=self.scope[1])
+                     for states in (self.sessions,self.internal_sessions) for key,state in states.items()) if same_order else self._pages(snapshot.ordering)
             for entry in entries:
                 key, ordinal = entry['owner'], entry['owner_ordinal']
                 order_bytes += retained_bytes((key,ordinal),self.OWNER_BYTES)+160

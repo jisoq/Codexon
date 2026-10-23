@@ -26,10 +26,10 @@ from cachemonitor.analysis_records import compact_record, public_record
 from cachemonitor.observer_state import ProcessLock
 
 
-FORMAT = 6
+FORMAT = 7
 APPLICATION_ID = 0x43505250
 # Only versions whose dedicated, disposable schema is known to this writer.
-REBUILDABLE_FORMATS = frozenset((1, 2, 3, 4, 5))
+REBUILDABLE_FORMATS = frozenset((1, 2, 3, 4, 5, 6))
 METRICS = (
     'ts', 'session_ordinal', 'input', 'cached', 'written', 'output', 'reasoning',
     'total', 'uncached', 'ordinary_input', 'non_reasoning', 'rate', 'cost',
@@ -60,7 +60,6 @@ KINDS = ('calls', 'requests', 'candidates', 'headers', 'sections')
 CHECKPOINT_TABLES = ('checkpoint_chunks', 'checkpoint_sections', 'checkpoint_versions',
                      'checkpoint_seen', 'checkpoint_retired', 'checkpoint_heads')
 DERIVED = ('summary', 'choices', 'model_alerts', 'checkpoint')
-HISTORY_FILTERS=('model_mismatch','observation_missing','observation_conflict','observation_problem')
 UNCHANGED = object()
 METRIC_COLUMNS = ','.join('m_' + name for name in METRICS)
 
@@ -255,45 +254,6 @@ def _detail_pack(raw):
     return b'\x01' + compressed if len(compressed) + 16 < len(raw) else b'\x00' + raw
 
 
-def _history_values(row):
-    from .analysis_records import available_fields
-    from .dashboard_views import matches
-    matched=tuple(name for name in HISTORY_FILTERS[:3] if matches(row,name))
-    if 'observation_missing' in matched or 'observation_conflict' in matched:
-        matched+=('observation_problem',)
-    return dict(available=tuple(name for name in available_fields([row]) if name not in OWNER_FIELDS),
-        matches=matched,
-        extra={name:row[name] for name in ('call_id','response_id','long_context','price_assumed') if name in row})
-
-
-def _history_header(values,limits):
-    return b'\x01'+_detail_pack(pack(values,limits))
-
-
-class _HistoryCache:
-    """Optional compatibility reuse, bounded independently of source length."""
-    def __init__(self,limit):
-        self.limit=min(limit,4*1024*1024);self.bytes=0;self.values=OrderedDict()
-
-    def get(self,key):
-        entry=self.values.get(key)
-        if entry is None:return None
-        self.values.move_to_end(key)
-        return entry[0]
-
-    def clear(self):
-        self.values.clear();self.bytes=0
-
-    def add(self,key,value):
-        amount=_size((key,value))+128
-        if amount>self.limit:return
-        old=self.values.pop(key,None)
-        if old is not None:self.bytes-=old[1]
-        while self.values and self.bytes+amount>self.limit:
-            self.bytes-=self.values.popitem(last=False)[1][1]
-        self.values[key]=(value,amount);self.bytes+=amount
-
-
 def _detail_unpack(packet, limits):
     if not isinstance(packet, bytes) or not packet or len(packet) > limits.packet_bytes + 1:
         raise RebuildRequired('invalid detail packet envelope')
@@ -415,12 +375,10 @@ def _schema():
         CREATE INDEX requests_batch ON requests(batch,owner,identity);
         CREATE INDEX requests_ordinal ON requests(owner,ordinal,identity,batch);
         CREATE TABLE headers(owner INTEGER NOT NULL,identity BLOB NOT NULL,batch INTEGER NOT NULL,
-            deleted INTEGER NOT NULL,signature BLOB NOT NULL,key_value BLOB,display_ordinal INTEGER,
-            effective_at,call_count INTEGER,minimum,maximum,first_key BLOB,dimensions BLOB,
-            turn_state BLOB,state_present INTEGER,request_present INTEGER,encoded_bytes INTEGER,
+            deleted INTEGER NOT NULL,signature BLOB NOT NULL,key_value BLOB,
+            call_count INTEGER,minimum,maximum,first_key BLOB,dimensions BLOB,
+            turn_state BLOB,state_present INTEGER,encoded_bytes INTEGER,
             PRIMARY KEY(owner,identity,batch));
-        CREATE INDEX headers_display ON headers(owner,display_ordinal,identity,batch);
-        CREATE INDEX headers_effective ON headers(owner,effective_at,display_ordinal,identity,batch);
         CREATE INDEX headers_batch ON headers(batch,owner,identity);
         CREATE TABLE candidates(owner INTEGER NOT NULL,identity BLOB NOT NULL,batch INTEGER NOT NULL,
             deleted INTEGER NOT NULL,signature BLOB NOT NULL,key_value BLOB,ordinal INTEGER,
@@ -515,9 +473,7 @@ class PreparedStore:
             self.db.row_factory = sqlite3.Row
             if existed:
                 version = self._validate_format()
-                if version == 5 and self._healthy(cancel):
-                    self._upgrade_catalog_order()
-                elif version != FORMAT or not self._healthy(cancel):
+                if version != FORMAT or not self._healthy(cancel):
                     self._rebuild_format()
                 elif not self._order_schema():
                     self._rebuild_format()
@@ -601,26 +557,6 @@ class PreparedStore:
             and {'batch','owner','source_ordinal'} <= {
                 row[1] for row in self.db.execute('PRAGMA table_info(catalog_orders)')})
 
-    def _upgrade_catalog_order(self):
-        required = {'owner_versions': {'owner','batch','source_ordinal'},
-                    'owners': {'id','home','sid'}, 'owner_heads': {'owner','batch'},
-                    'meta': {'singleton','format','instance','generation','ready','source'}}
-        if any(not names <= {row[1] for row in self.db.execute('PRAGMA table_info('+table+')')}
-               for table,names in required.items()):
-            self._rebuild_format()
-            return
-        if self.db.execute("SELECT 1 FROM sqlite_master WHERE name='catalog_orders'").fetchone():
-            self._rebuild_format()
-            return
-        # The zero pointer preserves existing version ordinals until a complete
-        # catalog first replaces them. Facts and their checkpoint token survive.
-        self.db.execute('PRAGMA journal_mode=WAL')
-        with self._transaction():
-            self.db.execute('CREATE TABLE catalog_orders(batch INTEGER NOT NULL,owner INTEGER NOT NULL,'
-                            'source_ordinal INTEGER NOT NULL,PRIMARY KEY(batch,owner))')
-            self.db.execute('CREATE INDEX catalog_orders_rank ON catalog_orders(batch,source_ordinal,owner)')
-            self.db.execute('ALTER TABLE meta ADD COLUMN order_batch INTEGER NOT NULL DEFAULT 0')
-            self.db.execute('UPDATE meta SET format=? WHERE singleton=1', (FORMAT,))
 
     def _rebuild_format(self):
         """Replace a recognized old or corrupt cache under the writer lock.
@@ -955,7 +891,6 @@ class Stage:
         self.batch, self.expected, self.source = batch, expected, source
         self.owners = {}
         self.removed_owners=set()
-        self.history_headers={};self.history_header_bytes=0
         self.reconciled = set()
         self.reconciling = set()
         self.empty_reconciliations = set()
@@ -1157,14 +1092,6 @@ class Stage:
 
     def _call(self, owner, row, metadata):
         row = dict(compact_record(row))
-        header=_history_values(row)
-        header_key=(header['available'],header['matches']) if not header['extra'] else None
-        projection=self.history_headers.get(header_key) if header_key is not None else None
-        if projection is None:
-            projection=_history_header(header,self.limits)
-            amount=_size(header_key)+len(projection)+128
-            if header_key is not None and len(self.history_headers)<128 and self.history_header_bytes+amount<=1024*1024:
-                self.history_headers[header_key]=projection;self.history_header_bytes+=amount
         key = identity(row['key'], self.limits)
         key_value = pack(row.pop('key'), self.limits, maximum=self.limits.key_bytes)
         timestamp = _number(row['ts'], 'ts')
@@ -1190,18 +1117,13 @@ class Stage:
             values.append(value)
             row.pop(name, None)
         detail = pack(row, self.limits)
-        types = bytes(tags)+projection
-        encoded = pack((key_value, turn_value, mask, bytes(tags), values, detail), self.limits)
-        # pack encodes byte strings as hex; retain that exact packet charge.
-        encoded_bytes=len(encoded)+2*len(projection)
-        if encoded_bytes>self.limits.packet_bytes:
-            # Optional acceleration must not reject an otherwise valid call.
-            types=bytes(tags);encoded_bytes=len(encoded)
+        types = bytes(tags)
+        encoded = pack((key_value, turn_value, mask, types, values, detail), self.limits)
         # timestamp/ordinal are columns already; this check guards future field drift.
         assert values[0] == timestamp and values[1] == ordinal
         signature = hashlib.sha256(encoded).digest()
         return (owner, key, self.batch, 0, signature, key_value, turn_value, turn_key,
-                mask, types, _detail_pack(detail), encoded_bytes, *values)
+                mask, types, _detail_pack(detail), len(encoded), *values)
 
     def _request(self, owner, item):
         key, ordinal, metadata = item
@@ -1235,14 +1157,11 @@ class Stage:
     def _header(self, owner, item):
         """Store caller-computed request facts; never reconstruct them during a query."""
         key, facts = item
-        ordinal, count = facts['display_ordinal'], facts['call_count']
-        if type(ordinal) is not int or ordinal < 0 or type(count) is not int or count < 0:
-            raise TypeError('request display ordinal/count must be exact nonnegative integers')
-        at = facts['effective_at']
-        if ordinal == 0 and (count or facts['request_present'] or at is not None or 'turn_state' not in facts):
-            raise TypeError('ordinal zero is reserved for source state-only entries')
+        count = facts['call_count']
+        if type(count) is not int or count < 0:
+            raise TypeError('request count must be an exact nonnegative integer')
         minimum, maximum = facts['minimum'], facts['maximum']
-        for name, value in (('effective_at', at), ('minimum', minimum), ('maximum', maximum)):
+        for name, value in (('minimum', minimum), ('maximum', maximum)):
             if value is not None:
                 _number(value, name)
         if count and (minimum is None or maximum is None or minimum > maximum):
@@ -1252,13 +1171,14 @@ class Stage:
         dimensions = facts['dimensions']
         if set(dimensions) != {'model', 'effort', 'service_tier'}:
             raise TypeError('request facts require all three exact dimensions')
+        if count and facts['first_key'] is None:
+            raise TypeError('populated request needs a first call identity')
         first = identity(facts['first_key'], self.limits) if count else None
         state_present = 'turn_state' in facts
         state = pack(facts['turn_state'], self.limits) if state_present else None
         key_value = pack(key, self.limits, maximum=self.limits.key_bytes)
         dimensions = pack(dimensions, self.limits)
-        values = (key_value, ordinal, at, count, minimum, maximum, first, dimensions,
-                  state, int(state_present), int(bool(facts['request_present'])))
+        values = (key_value, count, minimum, maximum, first, dimensions,state,int(state_present))
         encoded = pack(values, self.limits)
         return (owner, identity(key, self.limits), self.batch, 0, hashlib.sha256(encoded).digest(),
                 *values, len(encoded))
@@ -1699,9 +1619,7 @@ class PreparedReader:
         self.db = sqlite3.connect(self.path.as_uri() + '?mode=ro', uri=True, timeout=.2, isolation_level=None)
         self.db.row_factory = sqlite3.Row
         self.active = None
-        self.history_headers=_HistoryCache(limits.page_objects_bytes)
         try:
-            self.db.create_function('history_types',4,lambda *key:self.history_headers.get(key))
             self.db.execute('PRAGMA temp_store=FILE')
             self.db.execute('PRAGMA temp.cache_size=-4096')
             self.db.execute('PRAGMA query_only=ON')
@@ -1729,7 +1647,6 @@ class PreparedReader:
         if self.db is not None:
             self.db.close()
             self.db = None
-        self.history_headers.clear()
 
     def __enter__(self):
         return self
@@ -2213,7 +2130,7 @@ class Snapshot:
                           cursor_key, lambda r: r['encoded_bytes'])
 
     @_read_operation
-    def projected_calls(self, owner, fields, *, start=None, end=None, after=None, history=False, turn=None, filters=None, ordinal_start=None):
+    def projected_calls(self, owner, fields, *, start=None, end=None, after=None, turn=None, filters=None, ordinal_start=None):
         """A bounded typed projection, with no unrequested detail or key decode.
 
         Canonical owner defaults are shared by the writer. Rare explicitly
@@ -2222,7 +2139,7 @@ class Snapshot:
         """
         if not isinstance(fields,(tuple,list)) or not fields:
             raise ValueError('projection fields must be a nonempty field sequence')
-        selected=tuple(dict.fromkeys((*METRICS,*OWNER_FIELDS,'key','turn') if history else fields))
+        selected=tuple(dict.fromkeys(fields))
         if any(type(name) is not str or name not in (*METRICS,*OWNER_FIELDS,'key','turn') for name in selected):
             raise ValueError('unknown prepared call projection field')
         owner_fields=tuple(name for name in selected if name in OWNER_FIELDS)
@@ -2239,12 +2156,7 @@ class Snapshot:
         if owner_fields:
             covered=f'(r.owner_mask | (r.owner_mask >> {len(OWNER_FIELDS)}))'
             columns.extend(('r.owner_mask',f'CASE WHEN ({covered} & {mask})={mask} THEN NULL ELSE r.detail END AS override_detail'))
-        if history:
-            cached='history_types(:instance,r.owner,r.identity,r.batch)'
-            columns[1]=f'CASE WHEN length(r.types)={len(METRICS)} THEN coalesce({cached},r.types) ELSE r.types END AS types'
-            columns.extend(('r.batch',f'CASE WHEN length(r.types)={len(METRICS)} AND {cached} IS NULL THEN r.detail ELSE NULL END AS legacy_detail'))
         args=dict(owner=meta['id'],n=self.limits.page_rows+1)
-        if history:args['instance']=self.token.instance
         where=['r.owner=:owner','r.deleted=0',self._visible('calls')]
         if ordinal_start is not None:
             args['ordinal_start']=_number(ordinal_start,'ordinal_start')
@@ -2282,9 +2194,7 @@ class Snapshot:
         sql=(f'SELECT {",".join(columns)} FROM calls r INDEXED BY {index} '
              f'JOIN publications p ON p.id=r.batch WHERE {" AND ".join(where)} '
              'ORDER BY r.m_ts,r.m_session_ordinal,r.identity LIMIT :n')
-        headers={};legacy_packets={};header_bytes=0
         def decode(row):
-            nonlocal header_bytes
             result={}
             for name,index in metric_indices.items():
                 tag=row['types'][index]
@@ -2300,45 +2210,12 @@ class Snapshot:
                         result[name]=metadata[name]
                     elif not row['owner_mask'] & (1<<(OWNER_FIELDS.index(name)+len(OWNER_FIELDS))) and name in detail:
                         result[name]=detail[name]
-            if history:
-                if row['legacy_detail'] is not None:
-                    result={**_detail_unpack(row['legacy_detail'],self.limits),**result}
-                    self.history_legacy_rows=getattr(self,'history_legacy_rows',0)+1
-                    header=_history_values(result)
-                    key=(row['types'],header['available'],header['matches']) if not header['extra'] else None
-                    packet=legacy_packets.get(key) if key is not None else None
-                    if packet is None:
-                        packet=row['types']+_history_header(header,self.limits)
-                        amount=_size(key)+len(packet)+128
-                        if key is not None and header_bytes+amount<=min(1024*1024,self.limits.page_objects_bytes//4):
-                            legacy_packets[key]=packet;header_bytes+=amount
-                    self.reader.history_headers.add((self.token.instance,meta['id'],row['identity'],row['batch']),
-                        packet)
-                    self._remember_history_record(owner,result)
-                else:
-                    packet=row['types'][len(METRICS):]
-                    header=headers.get(packet)
-                    if header is None:
-                        header=(_detail_unpack(packet[1:],self.limits) if packet[:1]==b'\x01'
-                                else unpack(packet,self.limits))
-                        amount=len(packet)+_size(header)+128
-                        if header_bytes+amount<=min(1024*1024,self.limits.page_objects_bytes//4):
-                            headers[packet]=header;header_bytes+=amount
-                result.update(header['extra'])
-                from .analysis_records import available_fields
-                result['_available_fields']=tuple(dict.fromkeys((*header['available'],
-                    *available_fields([{name:result[name] for name in OWNER_FIELDS if name in result}]))))
-                result['_history_matches']=header['matches']
             return result
         def charge(row):
             return 128+sum(len(value.encode('utf-8')) if type(value) is str else
                            len(value) if type(value) is bytes else 8 for value in row)
         return self._page(sql,args,decode,lambda row:(row['m_ts'],row['m_session_ordinal'],row['identity']),charge)
 
-    def _remember_history_record(self,owner,result):
-        if not hasattr(self,'history_records'):
-            self.history_records=_HistoryCache(self.limits.page_objects_bytes)
-        self.history_records.add((*owner,result['key']),dict(result))
 
     @_read_operation
     def record(self, home, sid, key):
@@ -2351,10 +2228,6 @@ class Snapshot:
             row = cursor.fetchone()
         if row is None:return None
         result=self._decode_call(row,self._call_metadata(meta))
-        if len(row['types'])==len(METRICS):
-            self.reader.history_headers.add((self.token.instance,meta['id'],row['identity'],row['batch']),
-                row['types']+_history_header(_history_values(result),self.limits))
-            self._remember_history_record((home,sid),compact_record(result))
         return result
 
     @_read_operation
@@ -2446,28 +2319,6 @@ class Snapshot:
             row = cursor.fetchone()
         return self._decode_request(row) if row else None
 
-    @_read_operation
-    def request_context(self, owner, turn, *, after=None):
-        meta = self._owner(owner)
-        if meta is None:
-            return None
-        key = identity(turn, self.limits)
-        with self._cursor('SELECT r.* FROM requests r JOIN publications p ON p.id=r.batch '
-                          f'WHERE r.owner=? AND r.identity=? AND r.deleted=0 AND {self._visible("requests")}',
-                          (meta['id'], key)) as cursor:
-            request = cursor.fetchone()
-        with self._cursor('SELECT COUNT(*) FROM calls r INDEXED BY calls_turn JOIN publications p ON p.id=r.batch '
-                          f'WHERE r.owner=? AND r.turn_identity=? AND r.deleted=0 AND {self._visible("calls")}',
-                          (meta['id'], key)) as cursor:
-            whole_count = cursor.fetchone()[0]
-        with self._cursor('SELECT r.* FROM calls r INDEXED BY calls_turn JOIN publications p ON p.id=r.batch '
-                          f'WHERE r.owner=? AND r.turn_identity=? AND r.deleted=0 AND {self._visible("calls")} '
-                          'ORDER BY r.m_ts,r.m_session_ordinal,r.identity LIMIT 1', (meta['id'], key)) as cursor:
-            first = cursor.fetchone()
-        calls = self.calls(owner, turn=turn, after=after)
-        return dict(request=self._decode_request(request) if request else None,
-                    whole_count=whole_count, calls=calls,
-                    first_call=self._decode_call(first, self._call_metadata(meta)) if first else None)
 
     def _keys(self, keys, args):
         keys = tuple(keys)
@@ -2478,17 +2329,15 @@ class Snapshot:
 
     def _decode_header(self, row):
         result = dict(key=unpack(row['key_value'], self.limits, maximum=self.limits.key_bytes),
-                      display_ordinal=row['display_ordinal'], effective_at=row['effective_at'],
                       call_count=row['call_count'], minimum=row['minimum'], maximum=row['maximum'],
-                      dimensions=unpack(row['dimensions'], self.limits),
-                      request_present=bool(row['request_present']))
+                      dimensions=unpack(row['dimensions'], self.limits))
         if row['state_present']:
             result['turn_state'] = unpack(row['turn_state'], self.limits)
         return result
 
     @_read_operation
     def request_headers(self, owner, keys=None, *, after=None, with_first=False):
-        """Display ordinals are persisted by ingestion, never counted per selected turn."""
+        """Read shared request facts in stable identity order."""
         meta = self._owner(owner)
         if meta is None:
             return Page((), None, True, 0, 0)
@@ -2497,8 +2346,8 @@ class Snapshot:
         if keys is not None:
             where.append('r.identity IN (' + self._keys(keys, args) + ')')
         if after is not None:
-            args.update(ordinal=after[0], key=after[1])
-            where.append('(r.display_ordinal,r.identity)>(:ordinal,:key)')
+            args['key']=after[0]
+            where.append('r.identity>:key')
         columns, joins = 'r.*', ''
         if with_first:
             first_columns = ('key_value', 'turn_value', 'types', 'detail', 'owner_mask',
@@ -2508,7 +2357,7 @@ class Snapshot:
                      'LEFT JOIN publications fp ON fp.id=f.batch ')
             where.append('(f.identity IS NULL OR (f.deleted=0 AND ' + self._visible('calls', 'f', 'fp') + '))')
         sql = (f'SELECT {columns} FROM headers r JOIN publications p ON p.id=r.batch {joins} '
-               f'WHERE {" AND ".join(where)} ORDER BY r.display_ordinal,r.identity LIMIT :n')
+               f'WHERE {" AND ".join(where)} ORDER BY r.identity LIMIT :n')
         metadata = self._call_metadata(meta) if with_first else None
         def decode(row):
             value = self._decode_header(row)
@@ -2519,7 +2368,7 @@ class Snapshot:
                     raise NotReady('request header points to a missing first call')
                 value['first_call'] = self._decode_call(first, metadata) if first else None
             return value
-        return self._page(sql, args, decode, lambda r: (r['display_ordinal'], r['identity']),
+        return self._page(sql, args, decode, lambda r: (r['identity'],),
                           lambda r: r['encoded_bytes'] + ((r['first_encoded_bytes'] or 0) if with_first else 0))
 
     @_read_operation
@@ -2688,16 +2537,6 @@ class Snapshot:
                             values[i]=value
         return tuple(values)
 
-    @_read_operation
-    def unlinked_count(self, owner):
-        meta = self._owner(owner, metadata=False)
-        if meta is None:
-            return 0
-        with self._cursor('SELECT COUNT(*) FROM calls r INDEXED BY calls_turn '
-                          'JOIN publications p ON p.id=r.batch '
-                          f'WHERE r.owner=? AND r.turn_identity IS NULL AND r.deleted=0 AND {self._visible("calls")}',
-                          (meta['id'],)) as cursor:
-            return cursor.fetchone()[0]
 
     @_read_operation
     def owner_candidates(self, owner, *, after=None):
@@ -3026,7 +2865,6 @@ class Snapshot:
             if self.db.in_transaction:
                 self.db.execute('ROLLBACK')
             self.closed = True
-            if hasattr(self,'history_records'):self.history_records.clear()
             if self.reader.active is self:
                 self.reader.active = None
 
