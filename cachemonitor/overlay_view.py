@@ -12,7 +12,7 @@ from .quick_runtime import QuickHost
 from .overlay_appearance import default_appearance
 from .ui_details import recorded, observed_transport, model_comparison
 from .token_colors import ui_palette
-from .i18n import tr, Verbatim
+from .i18n import tr, Verbatim, formatted
 from .charts import value_text
 from .overlay_monitor import WIDTH, MARGIN, SECTION_WIDTH, TITLE_WIDTH, INLINE_CLOSE_X
 from .analysis_delivery import ANALYSIS_DELAY_SECONDS
@@ -153,11 +153,11 @@ class RowGlows:
 
 
 def fitted_model_runs(runs, metrics, width):
-    request,response,suffix=runs
+    response,request,suffix=runs
     suffix_width=min(metrics.horizontalAdvance(suffix.text),max(0,width*.35))
     available=max(0,width-suffix_width)
-    request_width=min(metrics.horizontalAdvance(request.text),max(available/2,available-metrics.horizontalAdvance(response.text)))
-    widths=(request_width,available-request_width,suffix_width)
+    response_width=min(metrics.horizontalAdvance(response.text),max(available/2,available-metrics.horizontalAdvance(request.text)))
+    widths=(response_width,available-response_width,suffix_width)
     return tuple(TextRun(metrics.elidedText(run.text,Qt.ElideRight,max(0,int(space))),run.color,run.strike)
                  for run,space in zip(runs,widths))
 
@@ -511,7 +511,7 @@ class OverlayContent(Node):
         if mode and str(mode).casefold() not in ('standard','미확인','unknown'):suffix+=', '+str(mode).lower()
         if confirmed:
             color=agent_mark(group.get('id') or (self.data or {}).get('id'),self.appearance).color
-            return (TextRun(tr(request),strike=True),TextRun(' '+tr(response),color),TextRun(suffix))
+            return (TextRun(tr(response),color),TextRun(' '+tr(request),strike=True),TextRun(suffix))
         return (TextRun(tr(model)+suffix),)
     def subagent_call_label(self,group):return ''.join(run.text for run in self.model_runs(group))
     def agent_model_tooltip(self,group):
@@ -573,7 +573,8 @@ class OverlayContent(Node):
         return
 
     def detail_links(self):
-        return []
+        return [dict(x=item[1],y=item[2],width=item[3],height=item[4],**item[8]['link'])
+                for item in self._detail_items if item[8].get('kind')=='model-info']
 
     def context(self):
         d=self.data or {};row=self.rows()[-1] if self.rows() else d.get('latest') or {}
@@ -803,14 +804,24 @@ class OverlayContent(Node):
         mode='active' if request=='진행' else 'idle' if request else 'unknown'
         heartbeat_color=('#116b32','#38b96b')[int(self.dark)]
         runs=self.model_runs(group);model_style=dict(kind='single-line')
-        if len(runs)>1:model_style['modelRuns']=runs
+        model_width=width
+        if len(runs)>1:
+            model_style['modelRuns']=runs;model_width=max(0,width-22)
         items=[(label,name_x,0,name_width,20,12,'ink',600,dict(kind='single-line',agentMark=mark)),
                ('',heartbeat_x,1,4,4,11,'secondary',400,dict(kind='agent-heartbeat',heartbeat=dict(
                    id='main' if main else group.get('key',group.get('id','')),mode=mode,color=heartbeat_color,
                    accessible=tr(label)+' '+tr('진행 중' if mode=='active' else '대기' if mode=='idle' else '미확인')))),
                (price,price_x,0,price_width,20,12,'ink',600,dict(kind='single-line')),
                ('',chevron_x,0,8,20,13,'secondary',400,dict(kind='chevron',expanded=expanded)),
-               (''.join(run.text for run in runs),0,24,width,18,11,'secondary',400,model_style)]
+               (''.join(run.text for run in runs),0,24,model_width,18,11,'secondary',400,model_style)]
+        if len(runs)>1:
+            tip=formatted('호출 모델과 응답 모델이 달라 표시되었습니다.\n호출 모델: {request}, 응답 모델: {response}',
+                          request=group['requested_model'],response=group['response_model'])
+            model_metrics=QFontMetrics(font(self.appearance.family,11))
+            info_x=sum(model_metrics.horizontalAdvance(run.text) for run in fitted_model_runs(runs,model_metrics,model_width))+4
+            items.append(('',info_x,24,18,18,11,'secondary',400,dict(kind='model-info',link=dict(
+                id='main-model-info' if main else 'model-info-'+group['key'],icon='info',interaction='tooltip',
+                color=palette(self.appearance)['secondary'].name(),tooltip=tip,accessible=tip))))
         half=width/2
         metrics=(('캐시',0,width*.14,False),
                  (percent(group.get('token_composition',{}).get('cache_hit_rate')),width*.14,half-6,True),
