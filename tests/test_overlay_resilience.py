@@ -62,6 +62,16 @@ def test_unrelated_partial_log_keeps_native_overlay_visible_and_navigation_disab
         with path.open('ab') as stream:stream.write(b'\n')
         wait_for_rendered(lambda:controller.selection_confirmed(),timeout=3)
         assert controller.widget.isVisible() and native.confirm_selection(target).thread_id==A
+    except AssertionError:
+        print('Native partial-log overlay state',dict(
+            target_state=controller.target_state,confirmed=controller.selection_confirmed(),
+            observed_age=time.monotonic()-controller.observed_at,tracker_running=tracker.isRunning(),
+            host_visible=host.isVisible(),host_minimized=host.isMinimized(),host_geometry=host.geometry().getRect(),
+            native_frame=native.frame(target['hwnd']),dpi=native.u.GetDpiForWindow(target['hwnd']),
+            native_visible=native.visible_target(target['hwnd']),mode=controller.automatic_mode,
+            overlay_visible=controller.widget.isVisible(),icon_visible=controller.icon.isVisible(),
+            enabled=controller.enabled,collapsed=controller.collapsed))
+        raise
     finally:
         tracker.stop();controller.stop();host.close();app.processEvents()
 
