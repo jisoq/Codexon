@@ -305,14 +305,11 @@ def verify(preview, output):
                 model = c.widget.content_model
                 assert scroll.property('contentY') == before_scroll, 'A new call moved the subagent viewport'
                 if actor in (1,7):
-                    levels=[];owner=(model.latest_call().get('home'),expected)
-                    def flash_finished():
-                        level=model.row_glow_opacity(owner)
-                        if not levels or level!=levels[-1]:levels.append(level)
-                        return len(levels)>2 and max(levels)>0 and level==0 and not model.row_glows.needs_frame
-                    wait(flash_finished,'updated agent row glow fades away')
-                    assert any(after<before for before,after in zip(levels,levels[1:]))
-                    report['checks'].append(f'{theme}: updated agent row glow brightens and fades to zero during live refresh')
+                    owner=(model.latest_call().get('home'),expected)
+                    wait(lambda:owner in model.row_glows.active,'updated agent row highlight starts')
+                    wait(lambda:not model.row_glows.needs_frame and not model._row_glow_timer.isActive(),
+                         'updated agent row highlight completes')
+                    report['checks'].append(f'{theme}: updated agent row highlight completes and its timer returns to idle during live refresh')
                 if actor < 7:
                     group = next(group for group in model.detail_groups() if group['id'] == expected)
                     assert (', fast' in model.subagent_call_label(group)) == (actor == 3)

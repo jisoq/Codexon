@@ -4,6 +4,7 @@ from .presentation import Button, Choice, Column, Group, Navigation, Row, Scroll
 from PySide6.QtWidgets import QApplication
 from .controls import Switch
 from .i18n import tr
+from .overlay_view import HighlightStyle
 
 
 class SettingsPage(Group):
@@ -106,6 +107,11 @@ class SettingsPage(Group):
         chart_style.currentIndexChanged.connect(self.save_chart_style)
         self.add_row('display', '차트 표시 방식', '', chart_style, section='세션 오버레이',depth=1,
                      aliases='chart bars filled line 막대 채움 선형')
+        highlight_style=self.choice('overlay-highlight-style')
+        for style in HighlightStyle:highlight_style.addItem(style.label,style.key)
+        highlight_style.setEnabled(False)
+        self.add_row('display', '행 강조 방식', '', highlight_style, section='세션 오버레이',depth=1,
+                     aliases='row highlight '+' '.join(f'{style.key} {style.label} {tr(style.label)}' for style in HighlightStyle))
         for key in ('startup', 'chatgpt_startup', 'quota', 'widget', 'monitor', 'overlay', 'theme'):
             self.controls[key].setEnabled(False)
 
@@ -117,11 +123,14 @@ class SettingsPage(Group):
         if controller is not None:controller.set_chart_style(value)
 
     def bind_overlay(self,controller):
-        control=self.controls['overlay-chart-style']
+        control=self.controls['overlay-chart-style'];highlight=self.controls['overlay-highlight-style']
         def sync():
             with QSignalBlocker(control):control.setCurrentIndex(max(0,control.findData(controller.chart_style)))
+            with QSignalBlocker(highlight):highlight.setCurrentIndex(highlight.findData(controller.highlight_style.key))
         controller.changed.connect(sync)
         sync()
+        highlight.currentIndexChanged.connect(lambda index:controller.set_highlight_style(highlight.itemData(index)))
+        highlight.setEnabled(True)
 
     def refresh_restart(self):
         from .i18n import language

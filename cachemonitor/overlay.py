@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from PySide6.QtCore import Qt, QTimer, QObject, Signal, QVariantAnimation, QEasingCurve
 from PySide6.QtGui import QAction, QActionGroup, QFontDatabase
 from PySide6.QtWidgets import QApplication
-from .overlay_view import OverlayContent, SessionOverlay
+from .overlay_view import HighlightStyle, OverlayContent, SessionOverlay
 from .overlay_monitor import WIDTH, MARGIN, SECTION_WIDTH, ACTIONS_X, HEADER_X, HEADER_WIDTH, POPUP_X, INLINE_HEADER_WIDTH
 from .overlay_tracking import overlay_geometry, anchor_for_position
 from .overlay_appearance import CodexAppearance, default_appearance
@@ -70,6 +70,7 @@ class OverlayController(QObject):
         self.chart_style=settings.value('overlay/chartStyle','bar')
         if self.chart_style not in ('bar','filled-line'):self.chart_style='bar'
         content.chart_style=self.chart_style
+        content.highlight_style=self._parse_highlight_style(settings.value('overlay/highlightStyle'))
         try:
             saved=json.loads(settings.value('overlay/visibleAgentCounts','{}'))
             if isinstance(saved,dict):
@@ -386,6 +387,21 @@ class OverlayController(QObject):
         self.widget.content_model.monitor_action('main-detail')
         self.expanded=self.widget.content_model.main_expanded
         self.changed.emit()
+
+    @staticmethod
+    def _parse_highlight_style(value):
+        return next((style for style in HighlightStyle if style.key==value),HighlightStyle.RIBBON)
+
+    @property
+    def highlight_style(self):return self.widget.content_model.highlight_style
+
+    def set_highlight_style(self,value):
+        style=self._parse_highlight_style(value)
+        self.settings.setValue('overlay/highlightStyle',style.key)
+        content=self.widget.content_model
+        if content.highlight_style is style:return
+        content.highlight_style=style
+        content.detailBody.update();content.update();self.changed.emit()
 
     def set_chart_style(self,value):
         if value not in ('bar','filled-line'):return
@@ -775,15 +791,20 @@ class OverlayController(QObject):
 
     def _refresh_appearance(self):
         now=time.monotonic()
-        if self.drag_context or now<self.next_theme:return False
+        if now<self.next_theme:return False
+        reduced_motion=bool(hasattr(self.native,'reduce_motion') and self.native.reduce_motion())
+        changed=reduced_motion!=self.reduced_motion
+        self.reduced_motion=reduced_motion
+        if self.drag_context:
+            self.next_theme=now+1
+            return changed
         mode=self.settings.value('ui/theme',self.settings.value('overlay/theme','codex'))
         if mode=='codex':
             appearance=self.appearance_reader.read(system_dark())
         else:
             appearance=default_appearance(system_dark() if mode=='system' else mode=='dark')
-        reduced_motion=bool(hasattr(self.native,'reduce_motion') and self.native.reduce_motion())
-        changed=(appearance,reduced_motion)!=(self.appearance,self.reduced_motion)
-        self.appearance=appearance;self.dark=appearance.dark;self.reduced_motion=reduced_motion
+        changed=changed or appearance!=self.appearance
+        self.appearance=appearance;self.dark=appearance.dark
         from .theme import shared_theme
         shared_theme().configure(mode,appearance=appearance)
         self.next_theme=now+1
@@ -805,8 +826,9 @@ class OverlayController(QObject):
                 or any(int(control.winId()) in placements and not control.isVisible()
                        for control in (self.widget,self.shadow,*self.chrome))):
             self.refresh();return
+        appearance_changed=self._refresh_appearance()
+        self.widget.content_model.set_reduced_motion(self.reduced_motion)
         if not self.drag_context:
-            appearance_changed=self._refresh_appearance()
             if appearance_changed or self._content_time()!=self._content_time_state:
                 self.refresh();return
         for hwnd,geometry in placements.items():
@@ -826,6 +848,8 @@ class OverlayController(QObject):
         if not frame:
             self.hide_all(); return
         dpi = self.native.u.GetDpiForWindow(target['hwnd']) or 96
+        self._refresh_appearance()
+        content=self.widget.content_model;content.set_reduced_motion(self.reduced_motion)
         if self.drag_context:
             if not self.drag_valid():self.cancel_drag()
             # Keep receiving snapshots and heartbeats, but leave the displayed
@@ -835,12 +859,10 @@ class OverlayController(QObject):
         self._placement_context=(frame,dpi)
         if not self.drag_context:self._load_collapsed()
         data,note=(self.widget.data,self.widget.note) if self.drag_context else self.content()
-        self._refresh_appearance()
         if not self.drag_context:
             self.widget.set_content(data, note, appearance=self.appearance)
             self._content_time_state=self._content_time()
         from .overlay_tracking import anchored_monitor_geometry
-        content=self.widget.content_model
         scale=self.appearance.scale
         monitor_width=WIDTH*scale
         # QWidget heights are integer logical pixels. Round the available room
@@ -898,7 +920,6 @@ class OverlayController(QObject):
         for control in self.chrome:
             if hasattr(control,'apply_appearance'):control.apply_appearance(self.appearance,self.opacity)
             if hasattr(control,'view'):control.view.put(reducedMotion=self.reduced_motion)
-        content.put(reducedMotion=self.reduced_motion)
         self.icon.view.put(speedWarning=bool(content.speed_alert().get('active')),
                            warning=self.widget.content_model.state.get('overlayWarning'))
         self.header.set_title(content.display_title(),content.context()[0])

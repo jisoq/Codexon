@@ -184,6 +184,74 @@ def test_overlay_chart_style_applies_immediately_preserves_selection_and_persist
 
 
 @pytest.mark.integration
+def test_overlay_highlight_style_persists_all_choices_without_reloading_or_losing_state(startup_settings_window,monkeypatch):
+    from types import SimpleNamespace
+    from copy import deepcopy
+    from cachemonitor.overlay import OverlayController
+    from cachemonitor.overlay_view import HighlightStyle
+    from test_overlay_presentation import subagent_summary
+    window,_=startup_settings_window;page=window.settings_page
+    choice=page.controls['overlay-highlight-style']
+    assert not choice.isEnabled()
+    clock=[0.]
+    monkeypatch.setattr('cachemonitor.overlay_view.time',SimpleNamespace(monotonic=lambda:clock[0]))
+    controller=OverlayController(window.settings,native_enabled=False);window.overlay=controller
+    page.bind_overlay(controller);assert choice.isEnabled()
+    model=controller.widget.content_model;model.put(overlayVisible=True);data=subagent_summary();model.set_content(data)
+    model.pin_call(model.call_id(model.rows()[0]));model.toggle_detail_group(model.detail_groups()[0]['key'])
+    model.detailBody.setScrollOffset(34)
+    changed=deepcopy(data);changed['main_usage']['cost']+=.5;clock[0]=1.;model.set_content(changed)
+    selected=model.selected_id;expanded=set(model.expanded_groups);effects=dict(model.row_glows.active)
+    repaints=[];detail_repaints=[];signals=[]
+    model.changed.connect(lambda:repaints.append(True));model.detailBody.changed.connect(lambda:detail_repaints.append(True))
+    controller.changed.connect(lambda:signals.append(True))
+    def unexpected(*args,**kwargs):pytest.fail('Changing row highlight presentation requested usage data or rebuilt rows')
+    controller.overlay_loader=unexpected
+    for name in ('content','refresh'):monkeypatch.setattr(controller,name,unexpected)
+    for name in ('set_content','sync_details','update_row_glows'):monkeypatch.setattr(model,name,unexpected)
+    try:
+        controller.set_highlight_style('scan')
+        for style in HighlightStyle:
+            before=controller.highlight_style;counts=len(repaints),len(detail_repaints),len(signals)
+            choice.setCurrentIndex(choice.findData(style.key))
+            assert controller.highlight_style is model.highlight_style is style
+            if before is not style:
+                assert len(repaints)>counts[0] and len(detail_repaints)>counts[1] and len(signals)>counts[2]
+            assert model.selected_id==selected and model.graph_pinned and model.expanded_groups==expanded
+            assert model.detailBody.scroll_offset==34 and model.data is changed and model.row_glows.active==effects
+            window.settings.sync();saved=QSettings(window.settings.fileName(),QSettings.IniFormat)
+            assert saved.value('overlay/highlightStyle')==style.key
+            restored=OverlayController(saved,native_enabled=False)
+            try:assert restored.highlight_style is style
+            finally:restored.stop()
+            counts=len(repaints),len(detail_repaints),len(signals)
+            controller.set_highlight_style(style.key)
+            assert (len(repaints),len(detail_repaints),len(signals))==counts
+        controller.set_highlight_style('scan')
+        assert choice.currentData()=='scan'
+        for value in (None,'unknown',42,[]):
+            controller.set_highlight_style(value)
+            assert controller.highlight_style is HighlightStyle.RIBBON and choice.currentData()=='ribbon'
+            assert window.settings.value('overlay/highlightStyle')=='ribbon'
+        assert model.selected_id==selected and model.graph_pinned and model.expanded_groups==expanded
+        assert model.row_glows.active==effects and model.data is changed
+    finally:controller.stop();window.overlay=None
+
+
+@pytest.mark.integration
+def test_overlay_highlight_style_normalizes_missing_and_invalid_stored_values(startup_settings_window):
+    from cachemonitor.overlay import OverlayController
+    from cachemonitor.overlay_view import HighlightStyle
+    window,_=startup_settings_window
+    for value in (None,'invalid',42):
+        if value is None:window.settings.remove('overlay/highlightStyle')
+        else:window.settings.setValue('overlay/highlightStyle',value)
+        controller=OverlayController(window.settings,native_enabled=False)
+        try:assert controller.highlight_style is HighlightStyle.RIBBON
+        finally:controller.stop()
+
+
+@pytest.mark.integration
 def test_lazy_setting_categories_and_search_show_progress_until_controls_exist(startup_settings_window):
     window,_=startup_settings_window;page=window.settings_page
     wait_until(lambda:page.stack.isPageReady(0) and window.pages.isPageReady(2))
