@@ -73,6 +73,31 @@ def recover_after_exit(manager, expected):
         return status
 
 
+def route_readiness(manager, record=None):
+    from .version import PROXY_VERSION
+    target=ProxyTarget(manager)
+    if record and record.get('scope')!=target.scope:return dict(phase='blocked')
+    current=manager.config()[1].get('openai_base_url')
+    session=read_json(session_path(manager))
+    skipped=(record or {}).get('app',{}).get('startup',{}).get('policy')=='no_launch'
+    if (not skipped and session.get('scope')==target.scope and session.get('phase')!='active'
+            and session.get('resume') and current==session.get('direct_url')):
+        return dict(phase='pending')
+    if current!=manager.url:
+        return dict(phase='off',route=dict(kind='direct',url=current,
+                    reason='no_launch' if skipped else 'external_edit' if session.get('resume') else 'off'))
+    status=manager.status();health=status.get('health')
+    if not health:return dict(phase='blocked')
+    source=target.capture(health)
+    app=(record or {}).get('app',{})
+    distribution=({key:app.get(key) for key in ('executable','sha256','commit')}
+                  if app.get('state')=='verified' and not (record or {}).get('proxy',{}).get('restored') else None)
+    version=source['version'] if (record or {}).get('proxy',{}).get('restored') else PROXY_VERSION
+    if not manager.local_ready(health) or not target.ready(health,{**source,'instance':''},source['command'],version,distribution):
+        return dict(phase='blocked')
+    return dict(phase='complete',route=dict(kind='proxy',url=current,instance=health['instance']))
+
+
 class LoginLaunch:
     """A login request can be cancelled on the GUI thread during route recovery."""
     def __init__(self, launch):
@@ -88,7 +113,7 @@ class LoginLaunch:
 
 class AppServices:
 
-    def __init__(self, manager, homes, index=None, evidence=None, *, progress=lambda text: None, clock=time.monotonic, sleep=time.sleep, collection=True, login_launch=None):
+    def __init__(self, manager, homes, index=None, evidence=None, *, progress=lambda text: None, clock=time.monotonic, sleep=time.sleep, collection=True, login_launch=None, installed_update=None):
         self.manager, self.homes = (manager, homes)
         self.index, self.evidence = (index, evidence)
         self.target = ProxyTarget(manager) if manager else None
@@ -106,6 +131,10 @@ class AppServices:
         self.collection_healthy = False
         self.collection_snapshot_at = None
         self.login_launch = login_launch
+        self.installed_update=installed_update
+        if installed_update is not None:
+            journal,record=installed_update
+            if not self.manager or record.get("scope")!=self.target.scope:raise RuntimeError("업데이트 연결 범위가 다릅니다.")
 
     def deactivate(self):
         self.closing.set()
@@ -125,7 +154,11 @@ class AppServices:
             if operation == 'login':
                 return self.launch_login()
             if operation in ('start', 'ensure'):
-                result = self.start() if operation == 'start' else self.poll()
+                proxy_result=None
+                if self.installed_update is not None:
+                    proxy_result=self.finish_installed_update()
+                result = self.start(proxy_result=proxy_result) if operation == 'start' else self.poll()
+                if proxy_result is not None:result.update(proxy_result)
                 if not result.get('collection_issue') and (not result.get('error')):
                     from .install_cleanup import after_services
                     try:
@@ -143,6 +176,56 @@ class AppServices:
                 self.recovery_deferred = False
             return result
 
+    def finish_installed_update(self):
+        from .client_restart import require_stopped
+        from .install_management import activate_proxy
+        from .proxy_update import BUSY
+        from .update_state import matches_proxy_target
+        journal,bound=self.installed_update
+        operation_id=bound['operation_id']
+        record=journal.read()
+        if record.get('operation_id')!=operation_id:
+            self.installed_update=None
+            return None
+        if record['app']['startup']['state']=='ready':return None
+        result={}
+        try:
+            record=journal.bind_installed(operation_id,executable=sys.executable)
+            if record.get('scope')!=self.target.scope:raise RuntimeError('업데이트 연결 범위가 다릅니다.')
+            owner=identity.process_identity(os.getpid())
+            proxy=record.get('proxy',{})
+            if proxy.get('phase') in BUSY:
+                current=read_json(self.manager.directory/'proxy-update.json')
+                if matches_proxy_target(record,current):
+                    journal.proxy_result(operation_id,current,replay=True)
+                proxy=journal.read().get('proxy',{})
+            if proxy.get('phase') not in ('failed','cancelled','interrupted','recovery_required'):
+                journal.startup_result(operation_id,dict(state='starting',owner=owner,message=''))
+            if proxy.get('phase') in BUSY:return self.status()
+            if proxy.get('phase') in ('failed','cancelled','interrupted','recovery_required') and not proxy.get('restored'):
+                raise RuntimeError(proxy.get('message') or '연결 복구 후 업데이트를 다시 시도하세요.')
+            if not proxy.get('phase'):
+                if record.get('client',{}).get('phase') in ('authorized','closing'):return self.status()
+                require_stopped(journal,operation_id)
+                result=self.start_proxy()
+                if result.get('error'):raise RuntimeError(result['error'])
+                proxy=activate_proxy(self.manager,operation_id=operation_id,update_root=journal.root)
+                journal.proxy_result(operation_id,proxy)
+                if proxy.get('phase') in BUSY:return result
+                if proxy.get('phase') not in ('complete','off') and not proxy.get('restored'):
+                    raise RuntimeError(proxy.get('message') or '연결 복구 후 업데이트를 다시 시도하세요.')
+            elif suspended(self.manager):
+                require_stopped(journal,operation_id)
+                result=self.start_proxy()
+                if result.get('error'):raise RuntimeError(result['error'])
+            route=route_readiness(self.manager,journal.read())
+            if route['phase'] not in ('complete','off'):raise RuntimeError('Codex를 다시 열기 전에 연결 준비를 확인해야 합니다.')
+            journal.startup_result(operation_id,dict(state='ready',owner=owner,route=route['route'],message=''))
+        except (OSError,ValueError,RuntimeError,KeyError) as error:
+            journal.startup_result(operation_id,dict(state='blocked',message=str(error)))
+            result['error']=str(error)
+        return result
+
     def status(self):
         return self.manager.status() if self.manager else {}
 
@@ -151,13 +234,13 @@ class AppServices:
         if health.get('instance') and health['instance'] != (self.proxy_source or {}).get('instance'):
             self.proxy_source = self.target.capture(health)
 
-    def start(self):
+    def start(self,*,proxy_result=None):
         from .usage_collection import CollectionPending
         from .app_errors import exception_facts
         self.active = True
         errors = []
         login_pending = self.login_launch is not None
-        result = self.launch_login() if login_pending else {}
+        result = proxy_result if proxy_result is not None else self.launch_login() if login_pending else {}
         if self.collection and not self.closing.is_set():
             try:
                 self.start_collection()
@@ -170,9 +253,9 @@ class AppServices:
             except (OSError, ValueError, RuntimeError) as exc:
                 self.collection_fault=dict(start_failed=True,**exception_facts(exc))
                 errors.append(str(exc))
-        if not login_pending:
+        if not login_pending and proxy_result is None:
             result.update(self.start_proxy())
-        elif not result.get('health') and not result.get('error'):
+        elif proxy_result is None and not result.get('health') and not result.get('error'):
             # Direct mode launches before any optional service probes.
             try:
                 result.update(self.start_proxy())
@@ -245,43 +328,8 @@ class AppServices:
         return result
 
     def collector_identity(self, channel, snapshot):
-        from .usage_collection import locked
-        lock = channel.companion('.collector.lock')
-        if not locked(lock):
-            self.collector_source = None
-            return None
-        try:
-            source = self._collector_identity(channel, snapshot)
-            if not locked(lock):
-                self.collector_source = None
-                return None
-            return source
-        except (OSError, ValueError, RuntimeError):
-            # The owner may have exited during process inspection. A failed
-            # lock probe must propagate rather than authorize a replacement.
-            if not locked(lock):
-                self.collector_source = None
-                return None
-            raise
-
-    def _collector_identity(self, channel, snapshot):
-        from .usage_collection import CollectionPending
-        source = (snapshot or {}).get('collection') or {}
-        if not source.get('pid'):
-            raise CollectionPending('수집기 실행 정보 확인 대기')
-        process = identity.process_identity(source['pid'])
-        if not process:
-            raise CollectionPending('수집기 실행 정보가 변경되었습니다.')
-        saved = self.collector_source
-        if saved and saved['process'] == process and (saved['instance'] == source.get('instance')):
-            return saved
-        command = identity.process_command(process['pid'])
-        homes = [str(Path(command[n + 1]).resolve()) for n, arg in enumerate(command[:-1]) if arg == '--codex-home']
-        if '--usage-collector' not in command or not homes or (not set(homes).issubset(set(channel.homes))) or (Path(option(command, '--index-path', '')).resolve() != channel.path) or (Path(option(command, '--evidence-path', str(channel.default_evidence))).resolve() != Path(channel.scope)) or (Path(process['executable']).resolve() != Path(source.get('executable', '')).resolve()):
-            raise CollectionPending('다른 수집기의 실행 정보를 보존합니다.')
-        if not identity.same_process(process):
-            raise CollectionPending('수집기 실행 정보가 변경되었습니다.')
-        self.collector_source = dict(process=process, instance=source['instance'])
+        from .collection_lifecycle import collector_identity
+        self.collector_source=collector_identity(channel,snapshot,self.collector_source)
         return self.collector_source
 
     def launch_collector(self, task, command, snapshot):

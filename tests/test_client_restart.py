@@ -450,7 +450,7 @@ def test_manual_exit_after_close_refusal_preserves_reopening_on_retry(tmp_path,d
         return dict(phase='off')
     def install(release,installed,progress,journal,operation_id):
         restart.prepare_restart(journal,operation_id,tmp_path/'recovery.exe')
-        journal.change(operation_id,app=dict(state='verified'))
+        journal.change(operation_id,app=dict(state='verified',startup=dict(state='skipped',policy='no_launch')))
         journal.proxy_result(operation_id,activate(manager,operation_id=operation_id))
     monkeypatch.setattr(restart,'start',start)
     monkeypatch.setattr(restart,'recovery_path',lambda *a:tmp_path/'recovery.exe')

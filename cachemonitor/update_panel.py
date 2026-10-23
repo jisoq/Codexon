@@ -441,9 +441,14 @@ class UpdatePanel(Group):
         elif phase=='needs_exit':
             message='연결한 앱이 종료되기를 기다리고 있습니다.\n사용 중인 ChatGPT 앱과 Codex CLI를 종료하세요.\nCodexon은 켜 두세요.'
         elif phase=='waiting':
-            count=proxy.get('responding',0)
-            message=('진행 중인 응답이 끝나기를 기다리고 있습니다.\n새 요청은 업데이트 완료 후 보내세요.' if count else
-                     '기존 연결의 응답 전달과 기록 저장이 끝나기를 기다리고 있습니다.')
+            startup=record.get('app',{}).get('startup') or {}
+            if startup.get('state') in ('waiting','starting') and proxy.get('phase') in (None,'complete','off'):
+                self.heading.setText('Codexon 시작 확인 중')
+                message=''
+            else:
+                count=proxy.get('responding',0)
+                message=('진행 중인 응답이 끝나기를 기다리고 있습니다.\n새 요청은 업데이트 완료 후 보내세요.' if count else
+                         '기존 연결의 응답 전달과 기록 저장이 끝나기를 기다리고 있습니다.')
         elif phase=='downloading':message='설치 파일을 다운로드하고 무결성을 확인하고 있습니다.'
         elif phase=='installing':message='새 버전을 설치하고 실행 상태를 확인하고 있습니다.'
         elif phase=='verifying':message='새 프록시가 정상적으로 실행됐는지 확인하고 있습니다.'

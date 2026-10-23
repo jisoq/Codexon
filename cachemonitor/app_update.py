@@ -278,27 +278,45 @@ def retry_proxy(manager,journal,*,verified_operation_id=None,consent=None):
         from .client_restart import retry, prepare_restart, recovery_path, needs_reopening, CONSENT_REQUIRED
         recovery=recovery_path()
         client=record.get('client',{})
-        if needs_reopening(client):
+        from .update_state import installed_gui_required
+        gui_required=installed_gui_required(record)
+        if needs_reopening(client) and (not gui_required or record.get('proxy',{}).get('phase') in ('complete','off') or record.get('proxy',{}).get('restored')):
+            if gui_required:
+                if record.get('app',{}).get('startup',{}).get('state')!='ready':
+                    journal.startup_result(operation_id,dict(state='waiting',message=''))
+                dispatch_installed_startup(journal,manager)
             retry(journal,operation_id,recovery)
             return journal.read()
         if record.get('app',{}).get('state') not in ('verified','current'):
             raise RuntimeError('앱 설치가 완료되지 않았습니다. 업데이트를 다시 확인하세요.')
-        if verified_operation_id is not None:
+        if verified_operation_id is not None and not gui_required:
             continuation=continuation_target(journal,manager)
             if (continuation['verified_operation_id']!=verified_operation_id
                     or not getattr(sys,'frozen',False)
                     or Path(continuation['executable']).resolve()!=Path(sys.executable).resolve()):
                 raise RuntimeError('시작 메뉴에서 새 Codexon을 열어 업데이트를 계속하세요.')
-        if getattr(sys,'frozen',False) and record.get('app',{}).get('state')=='verified' and Path(record['app']['executable']).resolve()!=Path(sys.executable).resolve():
+        if not gui_required and getattr(sys,'frozen',False) and record.get('app',{}).get('state')=='verified' and Path(record['app']['executable']).resolve()!=Path(sys.executable).resolve():
             raise RuntimeError('시작 메뉴에서 새 Codexon을 열어 업데이트를 계속하세요.')
+        if gui_required and consent is None and needs_reopening(client):
+            consent={**client,'phase':'closed'}
         if consent is None and client.get('phase') not in ('closed','not_running','not_applicable'):
             raise RuntimeError(CONSENT_REQUIRED)
         from .proxy_update import ProxyUpdate
         ProxyUpdate(manager).preflight()
         if not journal.prepare_proxy_retry(operation_id,consent):
             raise RuntimeError('업데이트 상태가 바뀌었습니다. 다시 확인하세요.')
+        if gui_required:
+            from .proxy_identity import same_process
+            owner=record.get('app',{}).get('startup',{}).get('owner')
+            if owner and same_process(owner) is False:owner=None
+            journal.startup_result(operation_id,dict(state='waiting',policy='requested',owner=owner,message=''))
         try:
             prepare_restart(journal,operation_id,recovery)
+            if gui_required:
+                result=dispatch_installed_startup(journal,manager)
+                from .client_restart import start
+                start(journal,operation_id,recovery)
+                return result
             result=activate_proxy(manager,operation_id=operation_id,update_root=journal.root)
             journal.proxy_result(operation_id,result)
         except Exception as exc:
@@ -332,6 +350,32 @@ def continuation_target(journal, manager):
                 or digest(recovery)!=manifest.get('recovery_sha256')):
             raise RuntimeError('설치 파일 검증에 실패했습니다. 현재 버전을 유지합니다.')
         return dict(kind='continue_app',executable=str(executable),verified_operation_id=record['operation_id'])
+
+
+def dispatch_installed_startup(journal,manager):
+    from .app_services import exit_recovery_owner
+    from .observer_task import ObserverTask
+    from .proxy_identity import same_process
+    record=journal.read();operation_id=record.get('operation_id')
+    record=journal.bind_installed(operation_id)
+    from .update_state import scope_for
+    if manager is None or record.get('scope')!=scope_for(manager):
+        journal.change(operation_id,phase='partial',message='시작 메뉴에서 새 Codexon을 열어 업데이트를 계속하세요.')
+        return journal.read()
+    startup=record.get('app',{}).get('startup') or {}
+    owner=startup.get('owner')
+    if owner:
+        try:
+            if same_process(owner) is not False:return record
+        except (OSError,ValueError,RuntimeError,TypeError,KeyError):return record
+    proof=exit_recovery_owner(manager)
+    if proof and proof['owner_state']!='dead':return record
+    executable=record['app']['executable']
+    task=ObserverTask(executable,role='Desktop')
+    if task.inspect().get('running'):return record
+    journal.startup_result(operation_id,dict(state='waiting',policy='requested',owner=None))
+    task.start([executable,'--replace-gui','--finish-install',operation_id])
+    return journal.read()
 
 
 def settle_waiting_dispatch(journal,manager,record):
@@ -370,9 +414,11 @@ def settle_waiting_dispatch(journal,manager,record):
                 app=latest.get('app',{})
                 current_target=(app.get('state')=='verified' and getattr(sys,'frozen',False)
                                 and Path(app.get('executable','')).resolve()==Path(sys.executable).resolve())
-                if not current_target:
+                if not current_target and app.get('startup',{}).get('policy')=='no_launch':
                     journal.change(operation_id,phase='partial',message='시작 메뉴에서 새 Codexon을 열어 업데이트를 계속하세요.')
                     return journal.read()
+        if app.get('state')=='verified' and app.get('startup',{}).get('policy','requested')!='no_launch':
+            return dispatch_installed_startup(journal,manager)
         from .install_management import activate_proxy
         try:
             result=activate_proxy(manager,operation_id=operation_id,update_root=journal.root)
@@ -387,7 +433,7 @@ def reconcile_update(journal,manager=None):
     from .observer_task import ObserverTask
     from .observer_state import ProcessLock, read_json
     from .proxy_update import BUSY, TERMINAL, reconcile_owner, task_finished
-    from .update_state import ACTIVE, matches_proxy_target, scope_for
+    from .update_state import ACTIVE, installed_gui_required, matches_proxy_target, scope_for
     record=journal.read();phase=record.get('phase')
     if not record:return record
     client=record.get('client',{})
@@ -405,7 +451,11 @@ def reconcile_update(journal,manager=None):
             if current.get('phase') in (*TERMINAL,'interrupted'):
                 journal.proxy_result(record['operation_id'],current,replay=True)
                 record=journal.read();phase=record.get('phase')
-                if phase!='installing':return record
+                if phase!='installing':
+                    if installed_gui_required(record) and record.get('app',{}).get('startup',{}).get('state')!='ready':
+                        try:return dispatch_installed_startup(journal,manager)
+                        except (OSError,RuntimeError,KeyError,TypeError):return journal.read()
+                    return record
                 replayed_installing=True
     if scope_matches and phase in ('waiting','needs_exit') and previous.get('source_instance') and not previous.get('operation_id'):
         current=manager.update_status()
@@ -460,7 +510,10 @@ def reconcile_update(journal,manager=None):
                     terminal=read_json(manager.directory/'proxy-update.json')
                     if terminal.get('phase') in TERMINAL and matches_proxy_target(current,terminal):
                         journal.proxy_result(record['operation_id'],terminal,replay=True)
+                        if installed_gui_required(current):return dispatch_installed_startup(journal,manager)
                         return journal.read()
+                if current.get('app',{}).get('startup',{}).get('policy','requested')!='no_launch':
+                    return dispatch_installed_startup(journal,manager)
                 executable=current.get('app',{}).get('executable')
                 if (not scope_matches or not getattr(sys,'frozen',False)
                         or Path(executable or '').resolve()!=Path(sys.executable).resolve()):

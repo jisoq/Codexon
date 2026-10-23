@@ -72,7 +72,7 @@ def test_successful_install_reopens_after_stopped_session_only_when_requested(tm
     assert receipt['product']==str(case.product) and receipt['version']=='test'
     assert not (tmp_path/'activation-pending.json').exists()
     assert session_path(case.manager).read_bytes()==stopped
-    assert case.launches==([[str(case.product/'Codexon.exe'),'--replace-gui']] if opens_gui else [])
+    assert case.launches==([[str(case.product/'Codexon.exe'),'--replace-gui','--finish-install',case.operation_id]] if opens_gui else [])
 
 
 @pytest.mark.parametrize('phase,owner_state,opens_gui',[
@@ -89,7 +89,7 @@ def test_install_reopens_only_after_active_exit_owner_has_ended(tmp_path,ready_i
     state.update(phase=phase,operation_id='exit-request',preparation_owner=owner)
     path.write_text(json.dumps(state))
     receipt=install.finish(tmp_path,case.product,case.recovery,update_id=case.operation_id)
-    assert case.launches==([[str(case.product/'Codexon.exe'),'--replace-gui']] if opens_gui else [])
+    assert case.launches==([[str(case.product/'Codexon.exe'),'--replace-gui','--finish-install',case.operation_id]] if opens_gui else [])
     assert bool(receipt.get('launch')) is (not opens_gui)
     assert json.loads(path.read_text())==state
 
@@ -102,7 +102,7 @@ def test_failed_gui_launch_keeps_the_verified_installation(tmp_path,monkeypatch,
         raise RuntimeError('task start failed')
     monkeypatch.setattr(observer_task.ObserverTask,'start',start)
     receipt=install.finish(tmp_path,case.product,case.recovery,update_id=case.operation_id)
-    assert case.launches==[[str(case.product/'Codexon.exe'),'--replace-gui']]
+    assert case.launches==[[str(case.product/'Codexon.exe'),'--replace-gui','--finish-install',case.operation_id]]
     assert receipt.get('launch')
     assert case.journal.read()['app']['state']=='verified'
     assert json.loads((tmp_path/'installation.json').read_text())['product']==str(case.product)

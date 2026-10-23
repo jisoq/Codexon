@@ -13,6 +13,42 @@ from .usage_paths import index_location,legacy_index_location
 from .event_store import index_tables_valid
 
 
+def collector_identity(channel,snapshot,saved=None):
+    from .usage_collection import locked
+    lock = channel.companion('.collector.lock')
+    if not locked(lock):
+        return None
+    try:
+        source = _collector_identity(channel,snapshot,saved)
+        if not locked(lock):
+            return None
+        return source
+    except (OSError, ValueError, RuntimeError):
+        # The owner may have exited during process inspection. A failed
+        # lock probe must propagate rather than authorize a replacement.
+        if not locked(lock):
+            return None
+        raise
+
+def _collector_identity(channel,snapshot,saved):
+    from .usage_collection import CollectionPending
+    source = (snapshot or {}).get('collection') or {}
+    if not source.get('pid'):
+        raise CollectionPending('수집기 실행 정보 확인 대기')
+    process = identity.process_identity(source['pid'])
+    if not process:
+        raise CollectionPending('수집기 실행 정보가 변경되었습니다.')
+    if saved and saved['process'] == process and (saved['instance'] == source.get('instance')):
+        return saved
+    command = identity.process_command(process['pid'])
+    homes = [str(Path(command[n + 1]).resolve()) for n, arg in enumerate(command[:-1]) if arg == '--codex-home']
+    if '--usage-collector' not in command or not homes or (not set(homes).issubset(set(channel.homes))) or (Path(option(command, '--index-path', '')).resolve() != channel.path) or (Path(option(command, '--evidence-path', str(channel.default_evidence))).resolve() != Path(channel.scope)) or (Path(process['executable']).resolve() != Path(source.get('executable', '')).resolve()):
+        raise CollectionPending('다른 수집기의 실행 정보를 보존합니다.')
+    if not identity.same_process(process):
+        raise CollectionPending('수집기 실행 정보가 변경되었습니다.')
+    return dict(process=process,instance=source['instance'])
+
+
 def startup_snapshot(channel,*,retired_instance=None):
     """Recognize the old default-path bug for control only, never for display."""
     from .usage_collection import CollectionScopeError
