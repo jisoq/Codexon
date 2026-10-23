@@ -437,7 +437,7 @@ def test_capture_compact_native_mismatch_and_glow_frames(observed_overlay):
     source['history']=fixture.reader.enrich('fixture',source['history'])
     source.update(source='subagent',parent_thread_id='model-summary')
     fixture.refresh([source]);widget=fixture.widget;model=widget.content_model
-    model.put(reducedMotion=False);widget.set_layout(reduced=True,detail=True)
+    model.set_reduced_motion(False);widget.set_layout(reduced=True,detail=True)
     fixture.links.resize(widget.size());fixture.links.sync()
     geometry=model.layout();scale=model.appearance.scale
     fixture.detail=OverlayDetail(model)
@@ -462,11 +462,11 @@ def test_capture_compact_native_mismatch_and_glow_frames(observed_overlay):
         return [dict(id=action['id'],x=items['detailAction-'+action['id']].x(),y=items['detailAction-'+action['id']].y(),
                      width=items['detailAction-'+action['id']].width(),height=items['detailAction-'+action['id']].height())
                 for action in model.state['detailActions']]
-    frames=[];errors=[];started=None
+    frames=[];row_images=[];errors=[];started=None
     def capture(stage):
         model.advance_row_glows();fixture.app.processEvents()
         actions=action_geometry()
-        captured_at=time.monotonic();main_opacity=model.row_glow_opacity(main);child_opacity=model.row_glow_opacity(owner)
+        captured_at=time.monotonic();main_active=main in model.row_glows.active;child_active=owner in model.row_glows.active
         image=widget.grab().toImage();child_image=fixture.detail.grab().toImage();link_image=fixture.links.quick.grabFramebuffer()
         painter=QPainter(image)
         try:
@@ -474,9 +474,12 @@ def test_capture_compact_native_mismatch_and_glow_frames(observed_overlay):
             painter.drawImage(round(MARGIN*scale),round(geometry['sub_y']*scale),child_image)
         finally:painter.end()
         assert image.save(str(output/(stage+'.png')))
+        factor=scale*image.devicePixelRatio()
+        row_images.append((image.copy(round(MARGIN*factor),round(geometry['main']*factor),
+            round(SECTION_WIDTH*factor),round(geometry['main_height']*factor)),child_image))
         frames.append(dict(stage=stage,elapsed_ms=None if started is None else (captured_at-started)*1000,
             finished_ms=None if started is None else (time.monotonic()-started)*1000,
-            layout=model.layout(),main_opacity=main_opacity,child_opacity=child_opacity,
+            layout=model.layout(),main_active=main_active,child_active=child_active,
             main_cost=main_usage(model.data)['cost'],
             child_speed=model.data['subagent_finance']['agents'][0]['output_speed_summary']['value'],actions=actions))
     def safely(callback):
@@ -498,14 +501,16 @@ def test_capture_compact_native_mismatch_and_glow_frames(observed_overlay):
         widget.set_content(refreshed);capture('glow-mid-update')
     schedule(70,lambda:capture('glow-70ms'))
     schedule(200,mid_update)
-    schedule(700,lambda:capture('glow-finished'))
     try:
-        until(lambda:len(frames)==4 or errors)
+        until(lambda:len(frames)==3 or errors)
         if errors:raise errors[0]
+        until(lambda:not model.row_glows.needs_frame and not model._row_glow_timer.isActive())
+        capture('glow-finished')
         assert all(frame['layout']==geometry for frame in frames)
-        assert frames[1]['main_opacity']>0 and frames[1]['child_opacity']>0
-        assert frames[2]['child_speed']==300. and frames[2]['main_opacity']>0
-        assert frames[3]['main_opacity']==frames[3]['child_opacity']==0
+        assert frames[1]['main_active'] and frames[1]['child_active']
+        assert frames[2]['child_speed']==300. and frames[2]['main_active']
+        assert not frames[3]['main_active'] and not frames[3]['child_active']
+        assert all(active!=finished for active,finished in zip(row_images[2],row_images[3]))
         assert not model._row_glow_timer.isActive()
         assert not widget.qml_errors and not fixture.detail.qml_errors
     finally:

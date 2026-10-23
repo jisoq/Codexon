@@ -76,9 +76,10 @@ def test_latest_child_sorts_without_glow_until_its_visible_content_changes(layou
     target=next(agent for agent in changed['subagent_finance']['agents'] if agent['id']==child['sid'])
     target['cost']+=.5;m.set_content(changed)
     owner=(child['home'],child['sid'])
-    wait_for_rendered(lambda:m.row_glow_opacity(owner)>0)
-    highlights=[item for item in m.detail_items() if item[8].get('kind')=='agent-update' and item[8]['alpha']>0]
-    assert len(highlights)==1 and highlights[0][8]['owner']==owner
+    wait_for_rendered(lambda:owner in m.row_glows.active)
+    assert set(m.row_glows.active)=={owner}
+    assert any(item[8].get('kind')=='agent-update' and item[8]['owner']==owner for item in m.detail_items())
+    wait_for_rendered(lambda:not m.row_glows.needs_frame)
     assert not m.expanded_groups and not m.main_expanded
 
 
