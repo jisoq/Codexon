@@ -344,7 +344,7 @@ def test_refresh_freshness_uses_activity_label_native_hit_region(native_detail, 
         app.sendEvent(c.links.quick,QEnterEvent(local,local,global_pos))
         app.sendEvent(c.links.quick,QMouseEvent(QEvent.MouseMove,local,global_pos,Qt.NoButton,Qt.NoButton,Qt.NoModifier))
         wait_for_rendered(lambda:tip.property('visible'))
-        assert model.state['heartbeatMode']=='active' and model.state['contentOpacity']==1
+        assert model.state['heartbeatMode']=='pending' and model.state['contentOpacity']==1
         label=named_item(c.widget.quick.rootObject(),'overlayHeartbeatLabel')
         accessible=QAccessible.queryAccessibleInterface(label)
         assert accessible is not None and detail in accessible.text(QAccessible.Description)

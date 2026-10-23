@@ -249,6 +249,187 @@ def test_compact_head_preserves_selected_compositions_on_unrelated_refresh(overl
     assert value['main_usage']['token_composition']==composition
 
 
+@pytest.mark.parametrize('changed_id',[A,B])
+@pytest.mark.parametrize('change',['metadata','new_call','same_summary_correction'])
+def test_live_publications_only_reload_changed_selected_content(tmp_path,overlay_cache_controller,changed_id,change):
+    import time
+    from cachemonitor.analysis_delivery import SnapshotReceiver
+    from cachemonitor.prepared_delivery import PreparedPublisher
+    from cachemonitor.prepared_ingest import PreparedCohort,read_catalog
+    from cachemonitor.prepared_store import PreparedStore
+    from cachemonitor.usage_collection import CollectionChannel,CollectionClient,empty_snapshot
+    from test_data_contract import source as observed_source
+    controller,requested=overlay_cache_controller
+    channel=CollectionChannel([tmp_path/'home'],tmp_path/'source.sqlite')
+    channel.start_live()
+    client=CollectionClient(channel.homes,channel.path)
+    sources={sid:observed_source([dict(input_tokens=100,cached_input_tokens=80,
+        cache_write_input_tokens=10,output_tokens=20,reasoning_output_tokens=5) for _ in range(3)]) for sid in (A,B)}
+    for sid,value in sources.items():
+        value.update(id=sid,home=channel.homes[0],usage_revision=1,request_revision=1)
+        for row in value['history']:row.update(key=sid+'-'+row['key'],call_id=sid+'-'+row['call_id'])
+    sources[B]['parent_thread_id']=A
+    try:
+        with PreparedStore(tmp_path/'prepared.sqlite') as store:
+            cohort=PreparedCohort(store,client,None)
+            publisher=PreparedPublisher(0);receiver=SnapshotReceiver()
+            def publish(sequence):
+                now=time.time()
+                snapshot=empty_snapshot(channel.homes,channel.path,now)
+                snapshot.update(sessions=list(sources.values()),usage_collection_complete=True,
+                    last_usage_collection_success=now,request_activity=[])
+                snapshot['index'].update(loading=False,usage_complete=True,last_usage_success=now)
+                channel.publish(snapshot,'selected-content-proof',sequence)
+                for update in cohort.convert(read_catalog(client)):
+                    publisher.adopt(store,update['changed'],update['removed'])
+                result=receiver.receive(publisher.publish(snapshot,store))
+                controller.receive_snapshot(result)
+                return {row['id']:row for row in result['overlay_sessions']}
+            first=publish(1)
+            from cachemonitor.prepared_overlays import hydrate_overlay
+            for sid in (A,B):
+                overlay_select(controller,first,sid)
+                args,options=requested[-1]
+                with store.read_current() as view:detail=hydrate_overlay(view,args[1],**options)
+                controller.receive_overlay_detail(dict(id=args[0],summary=detail,prepared_token=detail['_prepared_token']))
+            requested.clear()
+            value=sources[changed_id]
+            value.update(status='진행 기록 (갱신 지연)',remaining=9,usage_revision=2,request_revision=2)
+            if change=='new_call':
+                value['history'].append(dict(value['history'][-1],key='new-call',call_id='new-call',ts=104))
+            elif change=='same_summary_correction':
+                value['history'][0]['reasoning']+=1
+                value['history'][0]['non_reasoning']-=1
+                value['history'][1]['reasoning']-=1
+                value['history'][1]['non_reasoning']+=1
+            with store.read_current() as view:
+                previous_calls=list(view.iter_calls((channel.homes[0],changed_id)))
+                previous_summary=view.derived(channel.homes[0],changed_id,'summary')
+            current=publish(2)
+            with store.read_current() as view:
+                current_calls=list(view.iter_calls((channel.homes[0],changed_id)))
+                current_summary=view.derived(channel.homes[0],changed_id,'summary')
+            assert (current_calls==previous_calls)==(change=='metadata')
+            if change!='new_call':assert current_summary==previous_summary
+            expected={A,changed_id} if change!='metadata' else set()
+            for sid in (A,B):
+                detail,pending=overlay_select(controller,current,sid)
+                assert pending==(sid in expected)
+                if not pending:assert detail is not None
+                assert (current[sid]['_overlay_revision']!=first[sid]['_overlay_revision'])==(sid in expected)
+            assert len(requested)==len(expected)
+            assert current[A]['_prepared_token']!=first[A]['_prepared_token']
+            assert publisher.owners[(channel.homes[0],changed_id)]['metadata']['status']==value['status']
+            if change=='metadata':
+                for sequence in (3,4):
+                    value.update(status='진행 기록' if sequence==3 else '진행 기록 (갱신 지연)',
+                        remaining=9-sequence,usage_revision=sequence,request_revision=sequence)
+                    current=publish(sequence)
+                    for sid in (A,B):
+                        assert not overlay_select(controller,current,sid)[1]
+                        assert current[sid]['_overlay_revision']==first[sid]['_overlay_revision']
+                assert not requested
+            else:
+                for args,options in requested:
+                    with store.read_current() as view:detail=hydrate_overlay(view,args[1],**options)
+                    controller.receive_overlay_detail(dict(id=args[0],summary=detail,prepared_token=detail['_prepared_token']))
+                detail,pending=overlay_select(controller,current,changed_id)
+                assert not pending and len(requested)==len(expected)
+                expected_rows={row['key']:row['reasoning'] for row in current_calls}
+                assert {row['key']:row['reasoning'] for row in detail['recent']
+                        if row['key'] in expected_rows}==expected_rows
+    finally:
+        client.close();channel.close()
+
+
+@pytest.mark.parametrize('failure',['none','analysis','source','service'])
+def test_unknown_detail_age_and_initial_loading_keep_errors_visible(monkeypatch,overlay_cache_controller,failure):
+    monkeypatch.setattr('cachemonitor.overlay.time.monotonic',lambda:100.)
+    monkeypatch.setattr('cachemonitor.overlay.time.time',lambda:1000.)
+    controller,requested=overlay_cache_controller
+    controller.collection_started_at=900.;controller.collection_published_at=1000.
+    controller.target_state={'selection':Selection(A)}
+    old=dict(overlay_summary(A),calls=2,collection_complete=True)
+    controller.receive_snapshot(dict(overlay_sessions=[old],ts=1000.,index={'loading':False}))
+    data,note=controller.content()
+    assert data is None and note=='기록 확인 중'
+    reply=overlay_reply(requested[-1],calls=2,collection_complete=True)
+    reply['summary']['_collection']['last_confirmed_at']=None
+    controller.receive_overlay_detail(reply)
+    current=dict(old,_prepared_token=('test',2),_overlay_revision=('test',2))
+    controller.receive_snapshot(dict(overlay_sessions=[current],ts=1000.,index={'loading':False}))
+    if failure=='analysis':controller._analysis_failed=True
+    elif failure=='source':controller.errors=['source read failed']
+    elif failure=='service':controller.collection_issue='collector read failed'
+    data,note=controller.content()
+    assert data['calls']==2 and data['_collection']['retained']
+    assert data['_collection']['last_confirmed_at'] is None
+    assert note==('분석 오류' if failure=='analysis' else '수집 오류' if failure!='none' else '갱신 중')
+    controller.widget.set_content(data,note)
+    assert controller.widget.content_model.heartbeat_state()['mode']==('pending' if failure=='none' else 'error')
+
+
+def test_quiet_retained_detail_keeps_tray_notifications_until_fresh_completion(monkeypatch,overlay_cache_controller):
+    from types import SimpleNamespace
+    from cachemonitor.dashboard import Dashboard
+    from cachemonitor.notifications import ConfirmedNotifications
+    wall=[1000.]
+    monkeypatch.setattr('cachemonitor.overlay.time.monotonic',lambda:100.)
+    monkeypatch.setattr('cachemonitor.overlay.time.time',lambda:wall[0])
+    controller,requested=overlay_cache_controller
+    controller.collection_started_at=900.;controller.collection_published_at=1000.
+    controller.target_state={'selection':Selection(A),'target':{'hwnd':1}}
+    controller.observed_at=100.
+    old=dict(overlay_summary(A),calls=2,collection_complete=True,speed_health={'active':True})
+    controller.receive_snapshot(dict(overlay_sessions=[old],ts=wall[0],index={'loading':False}))
+    controller.content()
+    controller.receive_overlay_detail(overlay_reply(requested[-1]))
+    controller.widget.set_content(*controller.content())
+    controller.widget.show()
+    controller.native=SimpleNamespace(visible_target=lambda hwnd:True)
+    sent=[]
+    notifications=ConfirmedNotifications(lambda:wall[0],lambda:100.)
+    dashboard=SimpleNamespace(overlay=controller,settings=controller.settings,
+        notification_master=SimpleNamespace(isChecked=lambda:True),
+        show_tray_notification=lambda *args:sent.append(args),refresh_notification_log=lambda:None)
+    try:
+        assert controller.can_present('home',A)
+        assert controller.widget.content_model.speed_alert().get('active')
+        wall[0]=1001.
+        current=dict(old,_prepared_token=('test',2),_overlay_revision=('test',2),calls=3,title='Selected task')
+        controller.receive_snapshot(dict(overlay_sessions=[current],ts=wall[0],index={'loading':False}))
+        for index,phase in enumerate(('pending','failed'),1):
+            if phase=='failed':
+                controller.receive_overlay_fault(dict(query_failed=True,request_id=requested[-1][0][0]))
+            controller.widget.set_content(*controller.content())
+            assert controller.widget.note=='' and controller.widget.data['calls']==2
+            assert not controller.can_present('home',A)
+            assert not controller.widget.content_model.speed_alert()
+            incident=dict(id=phase,ts=wall[0],count=1,latest_key=phase,state='Cache incident')
+            current['cache_health']=dict(incident=incident,reason='Confirmed cache incident')
+            events=notifications.cache([current])
+            assert len(events)==1
+            Dashboard.show_confirmed_events(dashboard,events)
+            assert len(sent)==index
+            assert not notifications.cache([current])
+        current=dict(current,_prepared_token=('test',3),
+            cache_health=dict(incident=dict(incident,id='fresh'),reason='Confirmed cache incident'))
+        controller.receive_snapshot(dict(overlay_sessions=[current],ts=wall[0],index={'loading':False}))
+        controller.content()
+        controller.receive_overlay_detail(overlay_reply(requested[-1]))
+        controller.widget.set_content(*controller.content())
+        assert controller.widget.data['calls']==3 and not controller.widget.note
+        assert controller.can_present('home',A)
+        assert controller.widget.content_model.speed_alert().get('active')
+        assert controller.widget.data['cache_health']['incident']['id']=='fresh'
+        events=notifications.cache([current])
+        assert len(events)==1
+        Dashboard.show_confirmed_events(dashboard,events)
+        assert len(sent)==2
+    finally:
+        controller.native=None
+
+
 def test_publication_failure_replaces_initial_wait_and_clears_on_snapshot(overlay_cache_controller):
     controller,_=overlay_cache_controller
     controller.target_state={'selection':Selection(A)}
@@ -292,7 +473,7 @@ def test_overlay_banner_allows_idle_delivery_grace_and_identifies_failures(monke
     assert note=='갱신 중' and data['_collection']['reason']=='analysis_delay'
     assert not data['_collection']['delayed']
     model=OverlayContent();model.set_content(data,note)
-    assert model.heartbeat_state()['mode']=='idle' and model.data['calls']==2
+    assert model.heartbeat_state()['mode']=='pending' and model.data['calls']==2
     OverlayController.receive_snapshot(controller,dict(overlay_sessions=[dict(id=A,calls=2)],errors=[],ts=1000.))
     data,note=OverlayController.content(controller)
     assert note=='' and not data['_collection']['delayed']

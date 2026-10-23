@@ -79,7 +79,7 @@ def test_active_requests_update_heartbeat_without_changing_layout(app):
 
 
 @pytest.mark.parametrize('reason,count,calls', [('analysis_delay', 2, 12), ('detail_pending', 0, 0)])
-def test_background_refresh_preserves_usage_and_activity(app, reason, count, calls):
+def test_delayed_refresh_preserves_usage_and_shows_pending(app, reason, count, calls):
     model = OverlayContent()
     data = summary(count=calls)
     data.update(active_requests=count, _collection={'reason': reason, 'received_age': 16, 'last_confirmed_at': 700})
@@ -89,8 +89,8 @@ def test_background_refresh_preserves_usage_and_activity(app, reason, count, cal
     for note in ('갱신 중', '', '갱신 중', ''):
         model.set_content(deepcopy(data), note)
         assert model.state['contentOpacity'] == 1
-        assert model.state['heartbeatMode'] == ('active' if count else 'idle')
-        assert model.state['heartbeatLabel'] == label
+        assert model.state['heartbeatMode'] == ('pending' if note else 'active' if count else 'idle')
+        if not note:assert model.state['heartbeatLabel'] == label
         assert not model.state['checkingRecords'] and not model.notice_card()
         assert model.data['calls'] == calls and model.total_cost() == (data['cost'] if calls else 0)
         assert model.layout() == layout
@@ -109,10 +109,12 @@ def test_background_refresh_preserves_selected_call_and_speed_alert_suppression(
     call = deepcopy(model.displayed_call())
     usage = deepcopy(model.main_items())
     assert model.speed_alert().get('active')
-    for reason in ('analysis_delay', 'detail_pending', 'analysis_delay'):
+    for reason, note, retained in (('detail_pending', '', True),
+                                   ('analysis_delay', '갱신 중', False),
+                                   ('detail_pending', '갱신 중', True)):
         incoming = deepcopy(data)
-        incoming['_collection'] = {'reason': reason, 'received_age': 16}
-        model.set_content(incoming, '갱신 중')
+        incoming['_collection'] = {'reason': reason, 'received_age': 16, 'retained': retained}
+        model.set_content(incoming, note)
         assert model.selected_id == selected and not model.follow_latest
         assert model.displayed_call() == call and model.main_items() == usage
         assert not model.speed_alert().get('active')
