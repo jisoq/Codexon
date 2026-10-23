@@ -28,8 +28,8 @@ def fixture(root):
     return product,recovery
 
 
-@pytest.mark.parametrize('launch,isolated,opens_gui',[(True,False,True),(False,False,False),(True,True,False)])
-def test_successful_install_reopens_after_stopped_session_only_when_requested(tmp_path,monkeypatch,launch,isolated,opens_gui):
+@pytest.fixture
+def ready_installation(tmp_path,monkeypatch):
     import subprocess
     from types import SimpleNamespace
     from cachemonitor import app_services,install_cleanup,installation,launch_context,observer_task
@@ -59,11 +59,54 @@ def test_successful_install_reopens_after_stopped_session_only_when_requested(tm
         Path(report).write_text(json.dumps(dict(errors=[],version='test',phase='off')))
         return subprocess.CompletedProcess(command,0)
     monkeypatch.setattr(install.subprocess,'run',run)
-    receipt=install.finish(tmp_path,product,recovery,launch=launch,isolated=isolated,update_id=record['operation_id'])
-    assert receipt['product']==str(product) and receipt['version']=='test'
+    return SimpleNamespace(product=product,recovery=recovery,manager=manager,journal=journal,
+                           operation_id=record['operation_id'],launches=launches)
+
+
+@pytest.mark.parametrize('launch,isolated,opens_gui',[(True,False,True),(False,False,False),(True,True,False)])
+def test_successful_install_reopens_after_stopped_session_only_when_requested(tmp_path,ready_installation,launch,isolated,opens_gui):
+    from cachemonitor.app_services import session_path
+    case=ready_installation
+    stopped=session_path(case.manager).read_bytes()
+    receipt=install.finish(tmp_path,case.product,case.recovery,launch=launch,isolated=isolated,update_id=case.operation_id)
+    assert receipt['product']==str(case.product) and receipt['version']=='test'
     assert not (tmp_path/'activation-pending.json').exists()
-    assert json.loads(app_services.session_path(manager).read_text())==stopped
-    assert launches==([[str(product/'Codexon.exe'),'--replace-gui']] if opens_gui else [])
+    assert session_path(case.manager).read_bytes()==stopped
+    assert case.launches==([[str(case.product/'Codexon.exe'),'--replace-gui']] if opens_gui else [])
+
+
+@pytest.mark.parametrize('phase,owner_state,opens_gui',[
+    ('closing','live',False),('preparing','unknown',False),('closing','dead',True)])
+def test_install_reopens_only_after_active_exit_owner_has_ended(tmp_path,ready_installation,phase,owner_state,opens_gui):
+    import os
+    from cachemonitor import app_services,proxy_identity
+    case=ready_installation
+    owner=proxy_identity.process_identity(os.getpid())
+    if owner_state=='dead':owner={**owner,'created':owner['created']+1}
+    elif owner_state=='unknown':owner=None
+    path=app_services.session_path(case.manager)
+    state=json.loads(path.read_text())
+    state.update(phase=phase,operation_id='exit-request',preparation_owner=owner)
+    path.write_text(json.dumps(state))
+    receipt=install.finish(tmp_path,case.product,case.recovery,update_id=case.operation_id)
+    assert case.launches==([[str(case.product/'Codexon.exe'),'--replace-gui']] if opens_gui else [])
+    assert bool(receipt.get('launch')) is (not opens_gui)
+    assert json.loads(path.read_text())==state
+
+
+def test_failed_gui_launch_keeps_the_verified_installation(tmp_path,monkeypatch,ready_installation):
+    from cachemonitor import observer_task
+    case=ready_installation
+    def start(self,command):
+        case.launches.append(command)
+        raise RuntimeError('task start failed')
+    monkeypatch.setattr(observer_task.ObserverTask,'start',start)
+    receipt=install.finish(tmp_path,case.product,case.recovery,update_id=case.operation_id)
+    assert case.launches==[[str(case.product/'Codexon.exe'),'--replace-gui']]
+    assert receipt.get('launch')
+    assert case.journal.read()['app']['state']=='verified'
+    assert json.loads((tmp_path/'installation.json').read_text())['product']==str(case.product)
+    assert not (tmp_path/'activation-pending.json').exists()
 
 @pytest.fixture
 def committed_installation(tmp_path,monkeypatch,request):

@@ -272,8 +272,9 @@ def finish(root, product, recovery, *, isolated=False, launch=True, language='ko
                     receipt['connection'] = dict(phase='recovery_required',message='연결 복구를 실행해 주세요.')
                     if update_id:journal.proxy_result(update_id,receipt['connection'])
                 if launch:
-                    from .app_services import suspended
-                    if suspended(connection_manager()):
+                    from .app_services import exit_recovery_owner
+                    owner=exit_recovery_owner(connection_manager())
+                    if owner and owner['owner_state']!='dead':
                         launch=False
                         receipt['launch']='앱 종료 요청을 유지했습니다.'
                 if launch:
