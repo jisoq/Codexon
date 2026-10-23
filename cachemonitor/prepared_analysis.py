@@ -254,19 +254,13 @@ class PreparedAnalysisEngine(AnalysisEngine):
         source = state['prepared']
         if not q.get('include_whole_history', True):
             result={key:value for key,value in source.items() if key not in ('totals','remaining')}
-            # Only selected incident identities are needed for attention and
-            # event detail. The annotated canonical rows already name them.
             events=[]
-            selection=q.get('explorer') or {}
-            event_id=selection.get('event') if tuple(selection.get('session') or ())==session_key else None
             identities=[]
             if q['page']==0:
                 part=self.query_part(session_key,state,q['start'],q['end'],q.get('model',''),
                                      q.get('effort',''),q.get('service_tier',''))
                 identities=list(dict.fromkeys(row['cache_incident_id'] for row in
                     (part or {}).get('responses',()) if row.get('cache_incident_id') is not None))
-            if event_id is not None and str(event_id) not in {str(value) for value in identities}:
-                identities.append(event_id)
             if identities:
                 from .prepared_health import FORMAT,hydrate_health
                 ordered=[]
