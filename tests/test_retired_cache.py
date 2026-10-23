@@ -205,3 +205,23 @@ def test_proxy_entry_points_use_explicit_observation_filename(tmp_path,monkeypat
     module.main()
     assert captured['manager'].evidence==evidence.resolve()
     assert captured['command'][captured['command'].index('--evidence-path')+1]==str(evidence.resolve())
+
+
+@pytest.mark.parametrize('evidence',['database','receipt','route'])
+def test_foreign_listener_preserves_legacy_retirement_evidence(tmp_path,monkeypatch,evidence):
+    home=tmp_path/'home';home.mkdir()
+    manager=ObserverManager(home,tmp_path/'data','http://127.0.0.1:18995')
+    manager.retirement_index=manager.directory/'index.sqlite'
+    manager.set_url(manager.url)
+    path=manager.directory/{'database':'cache-control.sqlite','receipt':'retirement.json','route':'cache-route.json'}[evidence]
+    original=b'{"pending":true}'
+    path.write_bytes(original)
+    def foreign(**_):
+        manager.health_state='identity_mismatch'
+        raise RuntimeError('foreign listener')
+    monkeypatch.setattr(manager,'health',foreign)
+    before=manager.config_path.read_bytes()
+    with pytest.raises(RuntimeError,match='foreign listener'):retire(manager,restore_only=True)
+    assert path.read_bytes()==original
+    assert manager.config_path.read_bytes()==before
+    assert not list(manager.directory.glob('proxy-control-*.json'))
