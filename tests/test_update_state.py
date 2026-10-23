@@ -490,3 +490,69 @@ def test_explicit_new_gui_intent_retries_exact_operation_once(tmp_path,monkeypat
     assert app_update.retry_proxy(m,journal,verified_operation_id=op)['phase']=='waiting'
     with pytest.raises(RuntimeError):app_update.retry_proxy(m,journal,verified_operation_id=op)
     assert calls==[[str(product/'Codexon.exe'),'--replace-gui','--finish-install',op]]
+
+
+@pytest.mark.parametrize('winerror',[5,32,33,None])
+def test_journal_read_survives_transient_windows_access_denial(tmp_path,monkeypatch,winerror):
+    from cachemonitor import observer_state
+    journal=UpdateState(tmp_path)
+    record=journal.begin('app','fixture')
+    original=Path.read_text;calls=[];delays=[]
+    error=PermissionError(13,'Access denied')
+    if winerror is not None:error.winerror=winerror
+    def read(path,*args,**kwargs):
+        if path==journal.path:
+            calls.append(path)
+            if len(calls)==1:raise error
+        return original(path,*args,**kwargs)
+    monkeypatch.setattr(observer_state,'os',SimpleNamespace(name='nt'))
+    monkeypatch.setattr(observer_state,'time',SimpleNamespace(sleep=delays.append))
+    monkeypatch.setattr(Path,'read_text',read)
+    assert journal.read()==record
+    assert delays==[.02]
+
+
+def test_json_read_permanent_windows_denial_has_bounded_default(tmp_path,monkeypatch):
+    from cachemonitor import observer_state
+    calls=[];delays=[];default={'unavailable':True}
+    def read(path,*args,**kwargs):
+        calls.append(path)
+        raise PermissionError(13,'Access denied')
+    monkeypatch.setattr(observer_state,'os',SimpleNamespace(name='nt'))
+    monkeypatch.setattr(observer_state,'time',SimpleNamespace(sleep=delays.append))
+    monkeypatch.setattr(Path,'read_text',read)
+    assert observer_state.read_json(tmp_path/'journal.json',default) is default
+    assert len(calls)==6 and sum(delays)==pytest.approx(.3)
+
+
+@pytest.mark.parametrize('platform,error',[
+    ('nt',FileNotFoundError(2,'Missing')),
+    ('nt',OSError(5,'I/O error')),
+    ('nt',PermissionError(1,'Other permission error')),
+    ('posix',PermissionError(13,'Access denied')),
+])
+def test_json_read_nonqualifying_error_keeps_immediate_default(tmp_path,monkeypatch,platform,error):
+    from cachemonitor import observer_state
+    calls=[];delays=[];default={'unavailable':True}
+    def read(path,*args,**kwargs):
+        calls.append(path)
+        raise error
+    monkeypatch.setattr(observer_state,'os',SimpleNamespace(name=platform))
+    monkeypatch.setattr(observer_state,'time',SimpleNamespace(sleep=delays.append))
+    monkeypatch.setattr(Path,'read_text',read)
+    assert observer_state.read_json(tmp_path/'journal.json',default) is default
+    assert len(calls)==1 and not delays
+
+
+@pytest.mark.parametrize('content,expected',[(b'\xef\xbb\xbf{"ready":true}',{'ready':True}),
+    (b'{invalid',None),(b'[]',None),(b'null',None)])
+def test_json_read_preserves_bom_and_invalid_value_defaults(tmp_path,monkeypatch,content,expected):
+    from cachemonitor import observer_state
+    path=tmp_path/'journal.json';path.write_bytes(content)
+    delays=[];default={'unavailable':True}
+    monkeypatch.setattr(observer_state,'time',SimpleNamespace(sleep=delays.append))
+    assert observer_state.read_json(path,default)==(expected if expected is not None else default)
+    if expected is None:
+        assert observer_state.read_json(path)=={}
+        assert observer_state.read_json(path,[])=={}
+    assert not delays
