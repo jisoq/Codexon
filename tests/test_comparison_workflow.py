@@ -1,4 +1,5 @@
 """Model-driven comparison and navigation through the real Qt scene."""
+from cachemonitor.dashboard import PAGE_INDEX
 import copy
 import pytest
 
@@ -58,7 +59,7 @@ def test_subscription_rates_and_historical_models_render(tmp_path, language):
     from PySide6.QtCore import QSettings
     from PySide6.QtWidgets import QApplication
     from PySide6.QtTest import QTest
-    from cachemonitor.dashboard import Dashboard
+    from cachemonitor.dashboard import PAGE_INDEX, Dashboard
     from cachemonitor.i18n import set_language
     from cachemonitor.lazy_table import LazyTable
     from cachemonitor.presentation import Text
@@ -79,8 +80,8 @@ def test_subscription_rates_and_historical_models_render(tmp_path, language):
                          settings=QSettings(str(tmp_path/'value.ini'),QSettings.IniFormat),static_snapshot=source)
         window.show();QTest.qWait(80)
         window.change_page(1);window.metric_panel.change("dimension","all")
-        assert window.model.findData('gpt-5.5-pro')>=0
-        assert window.model.findData('gpt-5.4-mini')>=0
+        assert 'gpt-5.5-pro' in window.filter_values['model']
+        assert 'gpt-5.4-mini' in window.filter_values['model']
         assert {'gpt-5.5-pro','gpt-5.4-mini','gpt-5.6'} <= {r['filters']['model'] for r in window.metric_panel.data['rows']}
         priced=next(iter(window.engine.sessions.values()))['prepared']['history']
         for model in ('gpt-5.4-mini','gpt-5.5-pro'):
@@ -158,27 +159,7 @@ def test_primary_routes_start_with_home_and_preserve_drilldown(dashboard):
     for page in (1,5,3,6):
         w.nav.setCurrentRow(w.navigation_pages.index(page))
         wait_for_rendered(lambda:w.current_page==page and not w.analysis_pending)
-        assert control(w,w.pages.widget(page-1)).isVisible()
-    w.change_page(1);p=w.metric_panel
-    p.records()
-    wait_for_rendered(lambda:w.current_page==2 and not w.analysis_pending)
-    assert w.record_rows and not w.qml_errors
-
-
-def test_project_selection_preserves_filters_and_back_restores_exact_call(dashboard):
-    w=dashboard;w.resize(960,720);w.change_page(2)
-    wait_for_rendered(lambda: not control(w,w.record_parent).isVisible())
-    click(w,control(w,w.history_projects_button))
-    wait_for_rendered(lambda: control(w,w.record_parent).isVisible())
-    click_row(w,w.parent_table,1);click_row(w,w.table,0);click_row(w,w.table,1);click_row(w,w.table,1)
-    before=w.capture_state();assert w.selected_call
-    if not w.history_projects_button.isChecked():click(w,control(w,w.history_projects_button))
-    click_row(w,w.parent_table,0)
-    assert w.record_view=='sessions' and w.selected_session is None and w.selected_call is None and w.selected_turn is None
-    assert w.period.currentData()==before['common']['period']
-    click(w,control(w,w.back_button))
-    assert w.selected_call==before['selected_call'] and w.selected_turn==before['selected_turn']
-    assert w.detail_scroll.isVisible() and not w.qml_errors
+        assert control(w,w.pages.widget(PAGE_INDEX[page])).isVisible()
 
 
 def test_comparison_detail_home_back_and_refresh_preserve_context(dashboard):
@@ -350,16 +331,6 @@ def test_custom_date_drafts_preserve_results_and_apply_exact_cohort(dashboard,mo
     w.render(automatic=True)
     assert requests[-1]['start']==applied_query['start'] and requests[-1]['end']==applied_query['end']
     assert p.data['summary']['value']==1 and p.state['scope']==applied_scope
-    p.records()
-    wait_for_rendered(lambda:w.current_page==2 and len(w.record_rows)==1)
-    assert w.record_rows[0]['key']==source['sessions'][0]['history'][0]['key']
-    w.go_back();wait_for_rendered(lambda:w.current_page==1 and p.data['summary']['value']==1)
-    assert p.capture()==applied and p.date_draft=={key:applied[key] for key in ('period','start','end')}
-    w.go_back();wait_for_rendered(lambda:p.data['summary']['value']==2)
-    assert p.capture()==saved and p.state['scope']==scope
-    assert not w.qml_errors
-
-
 def test_custom_date_restore_rejects_invalid_saved_ranges(dashboard):
     from datetime import datetime
     w=dashboard;w.tick.stop();w.change_page(1);p=w.metric_panel
@@ -487,24 +458,6 @@ def test_grouped_model_effort_mode_metrics_and_drilldown_in_compact_window(boxpl
     wait_for_rendered(lambda:p.data.get('dimension')=='all')
     assert all(p.options['filters'][k]==v for k,v in row['filters'].items())
     assert p.data['summary']['value']==12
-    p.records();wait_for_rendered(lambda:w.current_page==2 and bool(w.record_rows))
-    assert len(w.record_rows)==12
-    assert all(record[field]==value for record in w.record_rows for field,value in row['filters'].items())
-    w.go_back();wait_for_rendered(lambda:w.current_page==1)
-    w.go_back();wait_for_rendered(lambda:p.data.get('dimension')=='project')
-    assert p.capture()==scope
-    p.change('filtersOpen','')
-    choice=rendered('usage-filter:service_tier');choice.forceActiveFocus()
-    target=next(i for i,entry in enumerate(choice.property('model')) if entry['value']=='Fast')
-    while choice.property('currentIndex')!=target:
-        prior=choice.property('currentIndex')
-        QTest.keyClick(w.quick,Qt.Key_Down if prior<target else Qt.Key_Up)
-        wait_for_rendered(lambda:choice.property('currentIndex')!=prior)
-    wait_for_rendered(lambda:p.data['summary']['value']==108)
-    assert {row['filters']['service_tier'] for row in p.data['rows']}=={'Fast'}
-    assert not w.qml_errors
-
-
 def test_mode_grouping_preserves_parent_scope_and_selected_metric_order(dashboard,monkeypatch):
     w=dashboard;source=snapshot();source['sessions']=source['sessions'][:2]
     samples={
@@ -562,17 +515,6 @@ def test_legacy_dimensions_restore_with_fixed_model_effort_mode_rows(dashboard):
     assert {choice['key'] for choice in p.state['choices']} >= {'effort','service_tier'}
 
 
-def test_metric_drilldown_ignores_history_filters_and_restores_latest_scope(dashboard):
-    from cachemonitor.dashboard import identity
-    w=dashboard;w.change_page(2);w.call_filter_controls['cache_zero'].setChecked(True)
-    w.change_page(1);p=w.metric_panel;p.select(p.data['rows'][0]['key']);p.change('period','7d')
-    before=p.capture();expected={identity(r) for r in w.engine.query(w.query())['analysis']['responses']}
-    p.records();assert w.current_page==2 and not any(n.isChecked() for n in w.call_filter_controls.values())
-    assert {identity(r) for r in w.record_rows}==expected
-    w.go_back();assert w.current_page==1 and p.capture()==before
-    assert not w.qml_errors
-
-
 def test_saved_project_scope_remains_explicit_after_project_disappears(dashboard):
     from cachemonitor.analytics import project_identity
     w=dashboard;w.change_page(1);p=w.metric_panel;row=p.data['rows'][0];key=row['filters']['project'];p.select(row['key'])
@@ -580,7 +522,6 @@ def test_saved_project_scope_remains_explicit_after_project_disappears(dashboard
     w.receive(source)
     assert p.options['filters']['project']==key and p.data['summary']['total']==0
     assert not w.qml_errors
-
 
 
 @pytest.fixture
@@ -710,10 +651,6 @@ def test_boxplots_render_mean_coverage_totals_table_and_keyboard_drilldown(boxpl
         line=rendered('usage-row-'+row['key']);line.forceActiveFocus();QTest.keyClick(w.quick,Qt.Key_Space)
         wait_for_rendered(lambda:p.options['filters'].get('effort')=='high')
         assert p.data['summary']['known']==10
-        click(w,rendered('usage-records'))
-        wait_for_rendered(lambda:w.current_page==2 and len(w.record_rows)==10)
-        assert all(record['effort']=='high' for record in w.record_rows)
-        assert not w.qml_errors
     finally:
         theme.configure(appearance=appearance)
 
@@ -864,8 +801,3 @@ def test_main_metric_table_fits_resizes_and_preserves_reasoning_coverage(boxplot
     row=next(row for row in p.data['rows'] if row['filters']['effort']=='partial')
     line=rendered('usage-row-'+row['key']);line.forceActiveFocus();QTest.keyClick(w.quick,Qt.Key_Space)
     wait_for_rendered(lambda:p.options['filters'].get('effort')=='partial')
-    p.records();wait_for_rendered(lambda:w.current_page==2 and len(w.record_rows)==2)
-    assert {record['reasoning'] for record in w.record_rows}=={12,None}
-    w.go_back();wait_for_rendered(lambda:w.current_page==1)
-    w.go_back();wait_for_rendered(lambda:p.data.get('count')==4)
-    assert not w.qml_errors

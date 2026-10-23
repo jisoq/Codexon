@@ -388,25 +388,6 @@ def test_heartbeat_animates_active_only_and_error_takes_priority(app, tmp_path):
         app.processEvents()
 
 
-def test_child_call_navigation_and_scope_switch_guard():
-    from cachemonitor.overlay_navigation import navigation_target
-    from cachemonitor.overlay_chrome import NavigationModel
-    row = dict(home='h', sid='child', id='call')
-    content = SimpleNamespace(data=dict(home='h', id='root', members=[('h', 'root'), ('h', 'child')], latest=row))
-    target = navigation_target(content.data, 'call')
-    assert target.sid == 'child'
-    navigation = NavigationModel(content)
-    received = []
-    navigation.navigationRequested.connect(received.append)
-    navigation.link_state([dict(id='call', target=target)])
-    navigation.activateLink('call')
-    assert received == [target]
-    navigation.captureNavigation('call')
-    content.data = {**content.data, 'id': 'different'}
-    navigation.activateNavigation()
-    assert received == [target]
-
-
 def test_collection_time_does_not_mutate_details_or_scroll_charts(app):
     from test_overlay_navigation import family_summary
     model = OverlayContent()

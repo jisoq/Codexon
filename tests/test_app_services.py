@@ -82,6 +82,43 @@ def test_collector_startup_does_not_hide_new_failure_marker(tmp_path,monkeypatch
     finally:channel.db.close()
 
 
+@pytest.mark.parametrize('operation,stamp,failed', [
+    ('start',1000,False), ('ensure',1000,False),
+    ('start',970,False), ('start',1000,True)])
+def test_first_collector_status_preserves_publication_evidence(tmp_path,monkeypatch,operation,stamp,failed):
+    from cachemonitor.app_errors import collection_phase
+    from cachemonitor.usage_collection import CollectionChannel,publish_collector_fault
+    from cachemonitor.observer_task import ObserverTask
+    from cachemonitor.version import VERSION
+
+    channel=CollectionChannel([],tmp_path/'index.sqlite')
+    snapshot=dict(ts=stamp,collection=dict(pid=123,instance='new',version=VERSION))
+    owner=services.AppServices(None,[],channel.path,clock=lambda:1000)
+    owner.active=True
+    if operation=='ensure':owner.collector_pending=('old',0)
+    def identify(*args):
+        owner.collector_source=dict(instance='new',process=dict(executable=sys.executable))
+        return owner.collector_source
+    monkeypatch.setattr('cachemonitor.usage_collection.CollectionChannel',lambda *args:channel)
+    monkeypatch.setattr('cachemonitor.usage_collection.locked',lambda path:True)
+    monkeypatch.setattr('cachemonitor.collection_lifecycle.retire_legacy',lambda channel:None)
+    monkeypatch.setattr(channel,'close',lambda:None)
+    monkeypatch.setattr(channel,'read_header',lambda:snapshot)
+    monkeypatch.setattr(owner,'collector_identity',identify)
+    monkeypatch.setattr(ObserverTask,'configure',lambda *args,**kwargs:None)
+    monkeypatch.setattr(services.time,'time',lambda:1001)
+    if failed:
+        publish_collector_fault(channel.companion('.collector-error.json'),channel.scope,'new',OSError('failed'))
+    try:
+        result=getattr(owner,'start' if operation=='start' else 'poll')()
+        assert result['collection_snapshot_at']==stamp
+        assert result['collection_healthy'] is (stamp==1000)
+        assert owner.collector_pending is None
+        assert bool(result['collection_fault'].get('runtime_failed')) is failed
+        assert collection_phase(result,1001)==('failed' if failed else 'preparing' if stamp==1000 else 'delayed')
+    finally:channel.db.close()
+
+
 @pytest.fixture
 def login_services(tmp_path, monkeypatch):
     from cachemonitor.model_evidence import home_key
@@ -103,6 +140,7 @@ def login_services(tmp_path, monkeypatch):
     monkeypatch.setattr(manager, 'resume', resume)
     owner = services.AppServices(manager, [], login_launch=lambda: events.append('launch') or 'started')
     monkeypatch.setattr(owner, 'start_collection', lambda: events.append('collection'))
+    monkeypatch.setattr(owner, 'poll_collection', lambda: '')
     return owner, manager, status, events
 
 

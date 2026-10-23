@@ -504,53 +504,75 @@ def test_default_migration_preserves_unowned_staging_file(default_home):
 
 
 @pytest.mark.parametrize('alive',[False,True])
-def test_broken_default_snapshot_is_replaced_and_restart_keeps_usage(default_home,monkeypatch,alive):
+@pytest.mark.parametrize('failed',[False,True])
+def test_broken_default_snapshot_is_replaced_and_restart_keeps_usage(default_home,monkeypatch,alive,failed):
     from cachemonitor import app_services as services
+    from cachemonitor.app_errors import collection_phase
     from cachemonitor.observer_task import ObserverTask
+    from cachemonitor.usage_collection import publish_collector_fault
     old=CollectorService([default_home]);current=[];operations=[]
     with monkeypatch.context() as patch:
         patch.setattr(index_module,'index_location',lambda path=None:legacy_index_location())
-        before=old.poll(10002)
-    before['collection']['version']='2026.09.27.1'
+        before=old.poll(time.time()-2)
+    retired_pid=1234567
+    before['collection'].update(version='2026.09.27.1',pid=retired_pid)
     old.channel.publish(before,old.epoch,2)
     client=CollectionClient([default_home]);process={'pid':os.getpid(),'executable':before['collection']['executable'],'created':1}
     live=[alive]
     if not alive:old.close()
     def identify(pid):
-        if not live[0]:raise PermissionError('recycled PID access denied')
-        return process
+        if pid==retired_pid and not live[0]:raise PermissionError('recycled PID access denied')
+        return dict(process,pid=pid)
     monkeypatch.setattr(services.identity,'process_identity',identify)
-    monkeypatch.setattr(services.identity,'same_process',lambda _:live[0])
+    monkeypatch.setattr(services.identity,'same_process',lambda value:value['pid']!=retired_pid or live[0])
     monkeypatch.setattr(services.identity,'process_command',lambda _:collector_command(client.channel))
     monkeypatch.setattr(ObserverTask,'inspect',lambda self:{'running':0})
     monkeypatch.setattr(ObserverTask,'configure',lambda *a,**k:operations.append('configure'))
     def start(self,command,autostart=False):
         assert not live[0]
         operations.append('start')
-        with monkeypatch.context() as patch:
-            patch.setattr(services.identity,'process_identity',lambda _:process)
-            current.append(CollectorService([default_home]))
-        current[-1].poll(10003)
+        current.append(CollectorService([default_home]))
+        if failed:
+            publish_collector_fault(client.channel.companion('.collector-error.json'),client.channel.scope,
+                                    current[-1].instance,OSError('replacement failed before publication'))
     monkeypatch.setattr(ObserverTask,'start',start)
     def wait(done,message,seconds=30):
         assert old.stopping();old.close();live[0]=False;assert done()
     owner=AppServices(None,[str(default_home)]);monkeypatch.setattr(owner,'wait',wait)
     try:
-        rejected=client.poll(10002)
+        rejected=client.poll()
         assert not rejected['sessions'] and rejected['usage_errors']==rejected['errors']
         assert rejected['usage_errors'] and not rejected['index']['loading']
         with pytest.raises(CollectionScopeError):client.channel.read_header()
-        owner.start_collection()
-        after=client.poll(10003)
+        pending=owner.start()
+        assert pending['collection_fault'].get('starting')
+        assert not pending['collection_fault'].get('start_failed')
+        assert bool(pending['collection_fault'].get('runtime_failed')) is failed
+        assert collection_phase(pending,time.time())==('failed' if failed else 'preparing')
+        assert pending['collection_snapshot_at'] is None and not pending['collection_healthy']
+        assert owner.collector_pending is not None
+        with pytest.raises(CollectionScopeError):client.channel.read_header()
+        with sqlite3.connect(client.channel.snapshot_path) as db:db.execute("UPDATE snapshot SET scope='other'")
+        wrong_scope=owner.poll()
+        assert wrong_scope['collection_fault'].get('status_failed')
+        assert wrong_scope['collection_fault']['error_type']=='CollectionScopeError'
+        assert wrong_scope['collection_snapshot_at'] is None and not wrong_scope['collection_healthy']
+        with sqlite3.connect(client.channel.snapshot_path) as db:db.execute('UPDATE snapshot SET scope=?',(client.channel.scope,))
+        pending=owner.poll()
+        assert pending['collection_fault'].get('starting')
+        assert bool(pending['collection_fault'].get('runtime_failed')) is failed
+        published=current[-1].poll()
+        confirmed=owner.poll()
+        assert confirmed['collection_snapshot_at']==published['ts'] and confirmed['collection_healthy']
+        assert owner.collector_pending is None and not confirmed['collection_fault']
+        after=client.poll()
         assert after['sessions'] and not after['usage_errors']
         assert after['sessions'][0]['history']==before['sessions'][0]['history']
         assert operations==(['configure','start'] if alive else ['start'])
         current[-1].close();current.clear()
-        with monkeypatch.context() as patch:
-            patch.setattr(services.identity,'process_identity',lambda _:process)
-            restarted=CollectorService([default_home])
-        current.append(restarted);restarted.poll(10004)
-        assert client.poll(10004)['sessions'][0]['history']==after['sessions'][0]['history']
+        restarted=CollectorService([default_home])
+        current.append(restarted);restarted.poll()
+        assert client.poll()['sessions'][0]['history']==after['sessions'][0]['history']
     finally:
         client.close()
         if old.channel.db:old.close()

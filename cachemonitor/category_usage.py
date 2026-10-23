@@ -112,10 +112,8 @@ def project(engine, q):
         engine._category_projection=cached if retained_bytes(cached,16*1024*1024)<=16*1024*1024 else None
     visible=display_rows(data['categories'],options,breakdowns)
     # Deliver aggregate rows once; scrolling stays in the virtual presentation model.
-    population=dict(query=scope,path=['analysis','responses'])
     return dict(common,valid_until=cached[2],usage={**{k:v for k,v in data.items() if k not in ('categories','common')},'rows':visible,
-                              'count':len(visible),'maximum':max([r['value'] or 0 for r in data['categories']]+[0]),
-                              'population':population})
+                              'count':len(visible),'maximum':max([r['value'] or 0 for r in data['categories']]+[0])})
 
 
 def unknown_category(field,value):

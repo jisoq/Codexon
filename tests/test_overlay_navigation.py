@@ -1,8 +1,6 @@
 """Call selection, scoped navigation, and embedded Sub viewport input."""
 from copy import deepcopy
-from types import SimpleNamespace
 
-from cachemonitor.overlay_navigation import navigation_target
 from test_overlay_layout_controller import layout_controller
 
 
@@ -34,81 +32,6 @@ def publish(controller, data):
     controller.receive_snapshot({'overlay_sessions': [data]})
     controller.receive_target({'target': {'hwnd': 1}, 'selection': Selection(data['id'])})
     return controller.widget.content_model
-
-
-def test_pointer_intent_survives_call_refresh_but_not_session_change():
-    from cachemonitor.overlay_chrome import NavigationModel
-    content = SimpleNamespace(data={'home': 'h', 'id': 's', 'latest': {'id': 'old'}})
-    model = NavigationModel(content)
-    received = []
-    model.navigationRequested.connect(received.append)
-    old = navigation_target(content.data, 'cache')
-    model.link_state([dict(id='cache', target=old)])
-    model.captureNavigation('cache')
-    content.data['latest'] = {'id': 'new'}
-    model.link_state([dict(id='cache', target=navigation_target(content.data, 'cache'))])
-    model.activateNavigation()
-    assert received == [old]
-    model.captureNavigation('cache')
-    content.data = {'home': 'h', 'id': 'other'}
-    model.activateNavigation()
-    assert received == [old] and model.captured is None
-
-
-def test_session_detail_target_is_independent_of_selected_call():
-    from PySide6.QtWidgets import QApplication
-    from cachemonitor.overlay import SessionOverlay
-    from cachemonitor.overlay_chrome import DetailModel
-    from test_overlay_presentation import summary
-    app = QApplication.instance() or QApplication([])
-    window = SessionOverlay()
-    try:
-        data = summary(count=12)
-        window.set_content(data)
-        content = window.content_model
-        old = data['recent'][0]
-        content.select(content.call_id(old))
-        model = DetailModel(content)
-        content.set_content(summary(count=30))
-        assert old not in content.rows()
-        target = model.targets['session']
-        assert (target.home, target.sid) == (data['home'], data['id']) and target.call_id is None
-        content.set_content(summary(count=31))
-        assert model.targets['session'] == target
-        assert model.state['overlaySurface'] == content.state['overlaySurface']
-        model.content.changed.disconnect(model.sync)
-    finally:
-        window.close()
-        app.processEvents()
-
-
-def test_dashboard_navigation_validates_session_and_selects_old_event_call(layout_controller):
-    from cachemonitor.overlay_tracking import Selection
-    from test_overlay_presentation import summary
-    controller = layout_controller
-    data = family_summary(count=30)
-    old_row = summary(count=1)['recent'][0]
-    requests = []
-    controller.record_loader = lambda request, identity: requests.append(request)
-    data['cache_degradation']['events'] = [dict(id='event', occurrence_keys=[old_row['id']])]
-    model = publish(controller, data)
-    activated = []
-    controller.native.confirm_selection = lambda window: Selection(data['id'])
-    controller.native.activate_target = lambda hwnd: activated.append(hwnd) or True
-    target = navigation_target(data, 'incident', event=data['cache_degradation']['events'][0])
-    model.pin_call(model.call_id(model.rows()[0]))
-    assert controller.navigate_from_dashboard(target)['enabled']
-    assert not model.graph_pinned
-    controller.receive_record({'id': requests[-1], 'row': old_row})
-    assert activated == [1] and model.selected_id == model.call_id(old_row)
-    assert model.displayed_call()==model.selected()
-    assert model.displayed_call()['cost']==old_row['cost']
-    assert not any(model.call_id(row)==model.selected_id for row in model.rows())
-    controller.refresh()
-    assert model.displayed_call()==model.selected() and model.selected_id==model.call_id(old_row)
-    assert model.latest_call()==model.rows()[-1]
-    controller.native.confirm_selection = lambda window: Selection('other')
-    assert not controller.navigate_from_dashboard(target)['enabled'] and activated == [1]
 
 
 def test_charts_have_no_navigation_or_selection_hit_regions(layout_controller):
@@ -237,8 +160,6 @@ def test_chart_hover_inspects_values_without_click_selection_or_agent_changes(la
     controller.native.bounds=compact_frame(controller)
     controller.refresh()
     assert model.compact
-    navigated=[]
-    controller.links.view.navigationRequested.connect(navigated.append)
     before=(model.selected_id,model.graph_pinned,model.main_expanded,set(model.expanded_groups),model.detail_items())
     latest=model.latest_call();inspected=model.rows()[0]
     assert model.call_id(inspected)!=model.call_id(latest)
@@ -257,7 +178,6 @@ def test_chart_hover_inspects_values_without_click_selection_or_agent_changes(la
             hover(point)
             wait_for_rendered(lambda:model.displayed_call()==inspected)
             QTest.mouseClick(controller.links.quick,Qt.LeftButton,pos=point)
-            assert not navigated
             assert before==(model.selected_id,model.graph_pinned,model.main_expanded,set(model.expanded_groups),model.detail_items())
             assert model.latest_call()==latest
             hover(QPoint(1,1))

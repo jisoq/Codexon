@@ -49,10 +49,7 @@ class ConfirmedNotifications:
                     _,old=self.http_seen.popitem(last=False);self.http_floor=max(self.http_floor,old)
                 if not self.http_enabled or stamp<=self.http_since:continue
                 item=self.record('http_fallback','HTTP 전환',f"{session.get('title') or session['id']}, HTTP 전환 기록 확인")
-                from .overlay_navigation import NavigationTarget
-                item.update(home=session['home'],sid=session['id'],observation_at=stamp,
-                    target=NavigationTarget(session['home'],session['id'],view='calls',filters=('http',),
-                        request_id=observed.get('turn') or None,section='evidence').as_dict())
+                item.update(home=session['home'],sid=session['id'],observation_at=stamp)
                 events.append(item)
         return events
 
@@ -103,8 +100,6 @@ class ConfirmedNotifications:
                     item=self.record('cache_miss',incident['state'],f"{session['title']}, {health['reason']}, 잠정 규칙")
                     item.update(home=scope[0],sid=scope[1],count=incident['count'],incident_id=incident['id'],
                                 call_id=incident['latest_key'],response_id=incident['latest_key'])
-                    from .overlay_navigation import NavigationTarget
-                    item['target']=NavigationTarget(scope[0],scope[1],view='incident',event_id=str(incident['id']),section='evidence').as_dict()
                     self.cache_incidents[scope]=item;events.append(item)
                     if len(self.cache_incidents)>2048:
                         _,old=self.cache_incidents.popitem(last=False)
@@ -161,9 +156,7 @@ class ConfirmedNotifications:
                 else:
                     item=self.record('model','모델명 불일치 확인',detail)
                     self.groups[group]=(now,item);events.append(item)
-                from .overlay_navigation import NavigationTarget
-                item.update(home=scope[0],sid=scope[1],call_id=row.get('call_id') or row['key'],
-                    target=NavigationTarget(scope[0],scope[1],view='calls',call_id=str(row.get('call_id') or row['key']),section='evidence').as_dict())
+                item.update(home=scope[0],sid=scope[1],call_id=row.get('call_id') or row['key'])
                 self.model_records[key]=item
         self.histories=histories
         return events

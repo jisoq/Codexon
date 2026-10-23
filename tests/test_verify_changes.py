@@ -63,10 +63,7 @@ def test_settings_and_comparison_changes_keep_wiring_without_selecting_unrelated
                                           'tests/test_display_scaling.py') for test in comparison['tests'])
     query=select_tests({'cachemonitor/prepared_query.py'})
     assert 'tests/test_prepared_analysis.py' in query['tests']
-    assert 'tests/test_history_timeline_data.py' in query['tests']
-    assert 'tests/test_ui.py::test_sequential_drilldown_and_full_call_detail' in query['tests']
-    assert 'tests/test_history_explorer.py::test_session_chart_selection_detail_and_back_preserve_scope' in query['tests']
-    assert 'tests/test_history_explorer.py' not in query['tests']
+    assert 'tests/test_home.py::test_home_today_projection_matches_prepared_calls_and_partial_coverage' in query['tests']
     assert not any(test.endswith('test_overlay_controls.py') for test in query['tests'])
 
 
@@ -136,7 +133,7 @@ def test_essential_and_affected_collection_runs_each_contract_once_and_excludes_
 
 def test_calculation_protocol_and_unknown_changes_have_explicit_gates():
     runner = select_tests({'tools/run_ui_checks.py'})
-    assert {'tests/test_ui_check_runner.py', 'tests/test_completed_layout.py'} <= set(runner['tests'])
+    assert {'tests/test_ui_check_runner.py'} <= set(runner['tests'])
     for source in ('cachemonitor/cache_execution.py','cachemonitor/cache_capture.py','cachemonitor/model_proxy.py',
                    'cachemonitor/cache_scheduler.py','cachemonitor/cache_control.py','cachemonitor/cache_hooks.py','cachemonitor/cache_operating.py'):
         chosen=select_tests({source})
@@ -546,7 +543,6 @@ def test_diagnostic_output_cannot_enter_source_snapshot(tmp_path, capsys):
     assert not (ROOT/'tools'/'diagnostic-output').exists()
 
 
-
 def test_rerun_preserves_absent_baseline_and_basic_selection(tmp_path, monkeypatch, capsys, diagnostic_state):
     from pathlib import Path
     verify, baseline = verification_probe(tmp_path, monkeypatch)
@@ -575,7 +571,6 @@ def test_unavailable_rerun_manifest_stops_before_checks(tmp_path, monkeypatch, c
     assert result['product_exit_code'] is None
     assert result['diagnostics']['first_error']['operation'] == 'write rerun manifest'
     assert not (tmp_path/'reports').exists() and baseline.read_bytes() == original
-
 
 
 def test_check_output_ignores_non_protocol_json_and_keeps_split_outcome():

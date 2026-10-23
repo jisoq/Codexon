@@ -32,9 +32,8 @@ def test_view_boundaries_match_full_rows_after_usage_and_metadata_changes(monkey
     import cachemonitor.analysis_engine as implementation
     snapshot=dict(ts=110,sessions=[history()],homes=['fixture'],errors=[],unassigned=[],
                   index=dict(loading=False,done=1,files=1))
-    q=dict(page=2,start=0,end=110,now=110,period='all',model='',source='',archived=True,
-           unit='response',method='mean',metric='cost',band=None,granularity='auto',presentation=True,
-           explorer=dict(view='calls',search='',sort='cost_desc'),table_windows={'records':dict(start=0,size=128)})
+    q=dict(page=1,start=0,end=110,now=110,period='all',model='',source='',archived=True,
+           unit='response',method='mean',metric='cost',band=None,granularity='auto',presentation=True)
     compact=AnalysisEngine()
     full=AnalysisEngine()
     for iteration in range(3):
@@ -47,7 +46,7 @@ def test_view_boundaries_match_full_rows_after_usage_and_metadata_changes(monkey
             patch.setattr(implementation,'compact_record',lambda row:row)
             full.ingest(copy.deepcopy(snapshot['sessions']))
         compact.ingest(copy.deepcopy(snapshot['sessions']))
-        for page in (0,1,2):
+        for page in (0,1):
             expected=full.page_query({**q,'page':page})
             actual=compact.page_query({**q,'page':page})
             assert actual==expected
@@ -55,7 +54,7 @@ def test_view_boundaries_match_full_rows_after_usage_and_metadata_changes(monkey
             assert pickle.loads(pickle.dumps(actual))==expected
         source=next(iter(full.sessions.values()))
         row=source['prepared']['history'][-1]
-        assert compact.record(row['home'],row['sid'],row['key'])==row
+        assert public_record(compact.sessions[(row['home'],row['sid'])]['records'][row['key']][1])==row
         expected_overlay=SnapshotPublisher().publish(snapshot,full,OverlaySummaries().collect(full))
         actual_overlay=SnapshotPublisher().publish(snapshot,compact,OverlaySummaries().collect(compact))
         for value in (expected_overlay,actual_overlay):value.pop('epoch')

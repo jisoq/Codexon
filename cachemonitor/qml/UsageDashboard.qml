@@ -66,7 +66,6 @@ Item {
             UiButton {text:'← '+root.t('뒤로');onClicked:root.node.back()}
             UiButton {text:root.t('지표 비교');role:'quiet';onClicked:root.node.reset()}
             Copy {text:root.masked?'':root.s.selectedLabel||'';Layout.fillWidth:true;elide:Text.ElideRight;wrapMode:Text.NoWrap;color:appTheme.palette.muted}
-            UiButton {objectName:'usage-records';text:root.t('세션 기록 열기');enabled:!root.masked;onClicked:root.node.records()}
         }
         RowLayout {
             objectName:'usage-result-controls'
