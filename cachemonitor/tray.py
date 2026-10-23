@@ -274,7 +274,7 @@ class TrayWindow(QuickHost):
         controller=getattr(self,'service_controller',None)
         workers=[getattr(panel,'operation',None),getattr(update,'operation',None),
                  getattr(controller,'operation',None),getattr(self,'chatgpt_discovery',None)]
-        display=[getattr(self,'worker',None),*getattr(self,'quota_services',{}).values()]
+        display=[getattr(self,'worker',None),getattr(controller,'observer',None),*getattr(self,'quota_services',{}).values()]
         self.shutdown_operation=ShutdownOperation(getattr(self,'app_services',None),workers,self,
             handoff=handoff,display_workers=display,handoff_deadline=handoff_deadline)
         self.shutdown_dialog.cancel_requested.connect(self.cancel_quit)

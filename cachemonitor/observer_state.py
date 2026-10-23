@@ -6,11 +6,18 @@ import time
 
 
 def read_json(path, default=None):
-    try:
-        value = json.loads(Path(path).read_text(encoding='utf-8-sig'))
-        return value if isinstance(value, dict) else (default or {})
-    except (OSError, ValueError):
-        return default or {}
+    for attempt in range(6):
+        try:
+            value = json.loads(Path(path).read_text(encoding='utf-8-sig'))
+            return value if isinstance(value, dict) else (default or {})
+        except OSError as error:
+            code = getattr(error, 'winerror', None)
+            if (os.name != 'nt' or attempt == 5 or not (code in (5, 32, 33)
+                    or code is None and isinstance(error, PermissionError) and error.errno == 13)):
+                return default or {}
+            time.sleep(.02 * (attempt + 1))
+        except ValueError:
+            return default or {}
 
 
 class ProcessLock:

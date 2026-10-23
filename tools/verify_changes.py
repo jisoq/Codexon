@@ -51,7 +51,7 @@ GROUPS = {
         test_nodes('app_errors', 'test_sidebar_errors_remain_visible_across_pages_and_do_not_show_main_banner'),
     'chatgpt_startup': test_files('chatgpt_startup'),
     'app_lifetime': test_files('app_services', 'service_exit', 'shutdown_state', 'shutdown_ui',
-                              'observer_panel', 'windows_startup', 'proxy_update') + (
+                              'observer_panel', 'windows_startup', 'proxy_update', 'collection_observation') + (
         'tests/test_model_proxy.py::test_drain_preserves_work_accepted_after_the_last_idle_probe',),
     'graphics_recovery': test_files('graphics_recovery', 'window_recovery', 'quick_ui', 'overlay_shadow'),
     'data': test_files('core', 'index', 'data_contract', 'subagent_collection', 'request_tier_snapshots', 'collection_defaults', 'collection_crash_recovery', 'collection_transport', 'collection_preparation'),
@@ -108,7 +108,7 @@ GROUPS = {
     'proxy_lifecycle': test_files('managed_proxy', 'proxy_update', 'proxy_supervisor', 'connection_recovery'),
     'observer': test_files('observer_control', 'observer_panel', 'observer_task_errors'),
     'install': test_files('install_activation', 'install_management', 'install_dispatch', 'install_cleanup', 'legacy_release', 'windows_startup'),
-    'update': test_files('app_update','update_monitor','update_state','client_restart'),
+    'update': test_files('app_update','update_monitor','update_state','client_restart','installed_startup','startup_retry_review'),
     'runtime': test_files('windows_startup', 'graphics_recovery'),
     'translation': ('tests/test_public_release.py::test_english_token_labels_do_not_change_stored_values',),
     'payload': ('tests/test_public_release.py::test_public_payload_rejects_local_paths_and_unneeded_qt',),
@@ -318,6 +318,7 @@ RULES = (
     ('cachemonitor/app_services.py', ('app_lifetime',)),
     ('cachemonitor/chatgpt_startup.py', ('chatgpt_startup', 'app_lifetime', 'settings')),
     ('cachemonitor/collection_lifecycle.py', ('app_lifetime','quota_poll')),
+    ('cachemonitor/collection_observation.py', ('app_lifetime','overlay_tracking')),
     ('tools/verify_app_services.py', ('app_lifetime','qa_ipc')),
     ('cachemonitor/app_shutdown.py', ('app_lifetime',)),
     ('cachemonitor/shutdown_state.py', ('app_lifetime',)),

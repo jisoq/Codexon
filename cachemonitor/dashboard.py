@@ -64,7 +64,7 @@ class Dashboard(TrayWindow):
     NAVIGATION_LIMIT=64
 
 
-    def __init__(self, homes, start_worker=True, settings=None, index_path=None, static_snapshot=None, live_limits=True, manage_observer=False,model_evidence_path=None,quota_path=None,collection_autostart=True,mismatch_reader=None):
+    def __init__(self, homes, start_worker=True, settings=None, index_path=None, static_snapshot=None, live_limits=True, manage_observer=False,model_evidence_path=None,quota_path=None,collection_autostart=True,mismatch_reader=None,installed_update=None):
         self.quota_path=quota_path
         super().__init__()
         self.settings=settings or QSettings('CacheMonitor','CacheMonitor')
@@ -184,11 +184,12 @@ class Dashboard(TrayWindow):
         from .app_services import AppServices
         from .app_shutdown import ServiceController
         self.app_services=AppServices(self.observer_panel.manager if manage_observer else None,
-            homes,index_path,model_evidence_path,collection=bool(start_worker and collection_autostart and static_snapshot is None))
+            homes,index_path,model_evidence_path,collection=bool(start_worker and collection_autostart and static_snapshot is None),installed_update=installed_update)
         self.service_controller=ServiceController(self.app_services,self)
         self.observer_panel.services=self.app_services if manage_observer else None
         self.service_controller.result.connect(self.observer_panel.display)
         self.service_controller.result.connect(self.receive_collection_status)
+        self.service_controller.collection_observed.connect(self.receive_collection_observation)
         if manage_observer or self.app_services.collection:
             QTimer.singleShot(0,self.service_controller.start)
 
@@ -440,7 +441,8 @@ class Dashboard(TrayWindow):
         if hasattr(self,'home_panel'):
             evidence={**self.snapshot,**self.home_collection_status}
             evidence['collection_started_at']=self.started_at
-            evidence['collection_fault']={**(self.snapshot.get('collection_fault') or {}),
+            source_observed=(self.home_collection_status.get('collection_observation') or {}).get('source_fault') is not None
+            evidence['collection_fault']={**({} if source_observed else self.snapshot.get('collection_fault') or {}),
                 **{key:value for key,value in (self.home_collection_status.get('collection_fault') or {}).items() if value}}
             self.home_panel.apply_status(evidence,self.home_quota_payload,time.time())
             from .app_errors import collection_phase
@@ -800,6 +802,19 @@ class Dashboard(TrayWindow):
         self.client_cache.clear();self.pending_logical=None;self.render()
 
 
+    def receive_collection_observation(self,value):
+        if self.quitting or getattr(self,'_closing',False):return
+        self.home_collection_status['collection_observation']=value
+        self.observe_error('collection.observer','collection',value.get('collection_fault') or {},
+                           healthy=not value.get('collection_fault'),resolution='수집기 관측 재개 확인')
+        source_fault=value.get('source_fault')
+        if source_fault is not None:
+            self.observe_error('collection.source','collection',source_fault,
+                healthy=not source_fault,resolution='사용 기록 수집 재개 확인')
+        overlay=getattr(self,'overlay',None)
+        if overlay:overlay.receive_collection_observation(value)
+        self.refresh_home_status()
+
     def receive_collection_status(self,result):
         self.home_collection_status={**self.home_collection_status,**{key:result[key] for key in
             ('collection_fault','collection_healthy','collection_snapshot_at') if key in result}}
@@ -813,8 +828,7 @@ class Dashboard(TrayWindow):
             self.observe_error('collection.service','collection',facts,
                 healthy=bool(result.get('collection_healthy')) or bool(facts.get('expected_stop')),
                 resolution='수집기 종료 확인' if facts.get('expected_stop') else '수집기 실행 확인')
-        if 'collection_issue' not in result:return
-        self.collection_issue=result['collection_issue']
+        if 'collection_issue' in result:self.collection_issue=result['collection_issue']
         overlay=getattr(self,'overlay',None)
         if overlay:overlay.receive_collection_status(result)
 
@@ -831,13 +845,14 @@ class Dashboard(TrayWindow):
         self.mismatch_page.receive_health(value.get('mismatch_history'))
         self.refresh_home_status()
         self.error_state.clear('analysis.process',resolution='분석기 실행 확인')
-        if isinstance(value.get('collection_fault'),dict):
-            source_facts=dict(value['collection_fault'])
-            if value.get('usage_errors'):source_facts['read_failed']=True
-            self.observe_error('collection.source','collection',source_facts,
-                healthy=bool(value.get('usage_collection_complete')),resolution='사용 기록 수집 재개 확인')
-        elif value.get('usage_errors'):
-            self.observe_error('collection.source','collection',dict(read_failed=True))
+        if (self.home_collection_status.get('collection_observation') or {}).get('source_fault') is None:
+            if isinstance(value.get('collection_fault'),dict):
+                source_facts=dict(value['collection_fault'])
+                if value.get('usage_errors'):source_facts['read_failed']=True
+                self.observe_error('collection.source','collection',source_facts,
+                    healthy=bool(value.get('usage_collection_complete')),resolution='사용 기록 수집 재개 확인')
+            elif value.get('usage_errors'):
+                self.observe_error('collection.source','collection',dict(read_failed=True))
         if 'observation_read_failed' in value:
             self.observe_error('observation.read','observation',dict(read_failed=bool(value['observation_read_failed'])),
                 healthy=not value['observation_read_failed'],resolution='관측 기록 읽기 확인')
@@ -977,10 +992,9 @@ class Dashboard(TrayWindow):
         self.settings.setValue('dashboard/geometry',self.saveGeometry());self.save_preferences();super().closeEvent(event)
     def check_stale(self):
         if not self.quitting:
-            from .app_errors import collection_phase
-            observed=max((stamp for stamp in (self.snapshot.get('ts'),self.collection_snapshot_at)
-                          if stamp is not None),default=None)
+            from .app_errors import collection_phase,collection_publication_at
             evidence={**self.snapshot,**self.home_collection_status}
+            observed=collection_publication_at(evidence)
             phase=collection_phase(evidence,time.time(),started_at=self.started_at)
             self.observe_error('collection.freshness','collection',
                 dict(snapshot_at=observed,snapshot_stale=phase=='delayed',starting=phase=='preparing',expected_stop=self.collection_stopped),

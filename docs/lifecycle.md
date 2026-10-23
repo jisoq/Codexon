@@ -46,6 +46,12 @@ under the route-control lock. A live or unverifiable owner keeps recovery blocke
 
 ## Updates
 
+A normal update starts the verified replacement Codexon before reopening Codex.
+The new GUI must verify the intended connection route before client restart.
+A temporarily direct route with a pending saved proxy resume is not deliberate Off.
+Readiness belongs to the current update operation and installed executable.
+See the [October 23 startup regressions](regressions/2026-10-23-update-startup.md).
+
 The app update owner reconciles component results using operation identity,
 connection scope and target identity. A terminal proxy result remains consumable
 after a crash between journal writes. Replaying it must be idempotent and cannot

@@ -554,7 +554,7 @@ def test_fresh_check_error_survives_previous_verified_install(tmp_path,monkeypat
     panel=UpdatePanel(SimpleNamespace(directory=tmp_path/'updates'))
     try:
         op=panel.journal.begin('app','fixture')['operation_id']
-        panel.journal.change(op,phase='complete',app={'state':'verified'})
+        panel.journal.change(op,phase='complete',app={'state':'verified','startup':dict(state='skipped',policy='no_launch')})
         panel.refresh();before=panel.journal.path.read_bytes()
         panel.checking=True;panel.receive_result(URLError(TimeoutError('current check failure')))
         current=panel.status.text();panel.finished();panel.refresh()

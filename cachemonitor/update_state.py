@@ -120,7 +120,7 @@ class UpdateState:
             for key in ('ready_at', 'result', 'owner', 'message'):
                 client.pop(key, None)
             value.update(phase='waiting', component_phase='waiting', client=client,
-                         proxy=dict(state='pending'), cancel_requested=False, defer_requested=False,
+                         proxy=dict(state='pending',updated_at=time.time()), cancel_requested=False, defer_requested=False,
                          activation_started=False, required_action=None, message='')
             self.write(value)
             return True
@@ -134,7 +134,7 @@ class UpdateState:
             self.write(value)
             return True
 
-    def installed(self, operation_id, product, manifest, *, scope=None, recovered=False):
+    def installed(self, operation_id, product, manifest, *, scope=None, recovered=False, startup=None):
         """Called only after installer runtime/hash/activation checks have passed."""
         product = Path(product).resolve()
         if not product.is_relative_to(self.root / 'versions'):
@@ -150,10 +150,12 @@ class UpdateState:
             app=dict(state='verified', version=manifest['version'],
                      executable=str(product / 'Codexon.exe'), sha256=manifest['sha256'],
                      commit=manifest['commit'])
+            if startup is not None:app['startup']=startup
             if recovered:
                 if scope != value.get('scope'):
                     return None
-                if value.get('app') == app:
+                existing=value.get('app',{})
+                if {key:item for key,item in existing.items() if key!='startup'}=={key:item for key,item in app.items() if key!='startup'}:
                     return operation_id
                 if value.get('phase') != 'installing' or value.get('app',{}).get('state') == 'verified':
                     return None
@@ -161,6 +163,43 @@ class UpdateState:
                          app=app)
             self.write(value)
             return operation_id
+
+    def bind_installed(self, operation_id, *, executable=None):
+        from .installation import pointer_path
+        from .proxy_identity import digest
+        record=self.read();app=record.get('app',{})
+        if record.get('operation_id')!=operation_id or record.get('kind')!='app' or app.get('state')!='verified':
+            raise RuntimeError('설치된 업데이트 요청을 확인하지 못했습니다.')
+        target=Path(app.get('executable','')).resolve()
+        receipt=read_json(self.root/'installation.json')
+        manifest=read_json(target.parent/'build-manifest.json')
+        pointer=read_json(pointer_path())
+        if (not target.is_relative_to(self.root/'versions') or (self.root/'activation-pending.json').exists()
+                or executable is not None and Path(executable).resolve()!=target
+                or receipt.get('operation_id')!=operation_id or receipt.get('isolated') is not False
+                or receipt.get('scope')!=record.get('scope') or Path(receipt.get('product','')).resolve()!=target.parent
+                or Path(pointer.get('InstallRoot','')).resolve()!=self.root
+                or Path(pointer.get('AppPath','')).resolve()!=target
+                or manifest.get('product')!='Codexon' or manifest.get('version')!=record.get('target_version')
+                or any(not app.get(key) or manifest.get(key)!=app[key] or receipt.get(key)!=app[key]
+                       for key in ('version','commit','sha256')) or digest(target)!=app['sha256']):
+            raise RuntimeError('설치된 업데이트의 실행 파일을 확인하지 못했습니다.')
+        return record
+
+    def startup_result(self, operation_id, result):
+        with ProcessLock(self.lock,timeout=5):
+            value=self.read()
+            if value.get('operation_id')!=operation_id or value.get('app',{}).get('state')!='verified':return False
+            startup=value['app'].get('startup',dict(state='waiting',policy='requested'))
+            if result.get('state')=='ready':
+                owner=result.get('owner') or {}
+                if startup.get('policy')!='requested' or owner.get('executable')!=value['app'].get('executable'):return False
+            value['app']={**value['app'],'startup':{**startup,**result}}
+            if result.get('state') in ('waiting','starting') and value.get('component_phase') in ('failed','partial','cancelled','deferred'):
+                value['component_phase']='waiting'
+            value['phase']=overall_phase(value,value.get('component_phase',value['phase']))
+            self.write(value)
+            return True
 
     def proxy_result(self, operation_id, result, *, replay=False):
         with ProcessLock(self.lock, timeout=5):
@@ -196,7 +235,7 @@ class UpdateState:
             elif phase == 'cancelled':
                 mapped = 'deferred' if app_done or value.get('defer_requested') else 'cancelled'
             if phase=='recovery_required':mapped='partial' if app_done else 'failed'
-            if (value.get('phase') == mapped and previous == result
+            if (value.get('component_phase',value.get('phase')) == mapped and previous == result
                     and not value.get('cancel_requested')):
                 return True
             value.update(component_phase=mapped, proxy=dict(result), required_action=result.get('required_action'),
@@ -212,11 +251,20 @@ class UpdateState:
         return self.change(operation_id, phase=phase, component_phase=phase, message=str(message))
 
 
+def installed_gui_required(record):
+    return (record.get('kind')=='app' and record.get('app',{}).get('state')=='verified'
+            and record.get('app',{}).get('startup',{}).get('policy','requested')!='no_launch')
+
+
 def overall_phase(record, component_phase):
     client = record.get('client', {})
     phase = client.get('phase')
     if phase == 'blocked':return 'restart_required'
     if phase == 'closing':return 'closing_client'
+    startup=record.get('app',{}).get('startup') or {}
+    if installed_gui_required(record) and startup.get('state')!='ready':
+        if startup.get('state')=='blocked':return 'restart_required' if client.get('reopen_required') else 'partial'
+        if component_phase=='complete':return 'waiting'
     if phase in ('closed', 'reopening') and component_phase in ('complete', 'partial', 'failed', 'cancelled', 'deferred'):
         return 'restarting_client'
     if component_phase == 'complete' and phase not in ('restarted', 'not_running', 'not_applicable'):

@@ -20,8 +20,17 @@ def capture():
     return dict(phase='authorized', targets=targets, reopen_required=bool(targets))
 
 
-def needs_reopening(client):
-    return bool(client.get('ready_at')) and client.get('phase') in ('blocked', 'reopening')
+def needs_reopening(record):
+    client=record.get('client',{})
+    if not (client.get('ready_at') or client.get('closed_at')) or client.get('phase') not in ('blocked','reopening'):
+        return False
+    current=desktop.desktop_processes()
+    if not current:return True
+    ready_at=client.get('ready_at')
+    proxy=record.get('proxy',{})
+    return bool(ready_at and (proxy.get('phase') in ('complete','off') or proxy.get('restored'))
+                and installed_gui_ready(record) and (not record.get('scope') or restored_ready(record))
+                and any(p['created']/10_000_000-11644473600>=ready_at for p in current))
 
 
 def confirm_native(language):
@@ -101,7 +110,8 @@ def require_stopped(journal, operation_id):
     record = journal.read()
     if record.get('operation_id') != operation_id:raise RuntimeError(CONSENT_REQUIRED)
     client = record.get('client', {})
-    if client.get('phase') not in ('closed', 'not_running', 'not_applicable'):
+    closed_retry=bool(client.get('closed_at')) and client.get('phase') in ('blocked','reopening')
+    if client.get('phase') not in ('closed', 'not_running', 'not_applicable') and not closed_retry:
         raise RuntimeError(client.get('message') or CONSENT_REQUIRED)
     if client['phase'] != 'not_applicable' and desktop.desktop_processes():
         journal.client_result(operation_id, phase='blocked', message=CONSENT_REQUIRED)
@@ -131,22 +141,28 @@ def prepare_restart(journal, operation_id, recovery):
 
 def restored_ready(record):
     from .connection_recovery import target
-    from .proxy_target import ProxyTarget
-    scope = record.get('scope')
+    from .app_services import route_readiness
+    scope=record.get('scope')
     if not scope:return False
-    manager = target(Path(scope['home']), Path(scope['evidence']).parent, scope['url'])
-    manager.evidence = Path(scope['evidence'])
-    status = manager.status()
-    if not status.get('configured'):return True
-    health = status.get('health')
-    if not health:return False
-    boundary = ProxyTarget(manager)
-    source = boundary.capture(health)
-    return boundary.ready(health, {**source, 'instance':''}, source['command'], source['version'])
+    manager=target(Path(scope['home']),Path(scope['evidence']).parent,scope['url'])
+    manager.evidence=Path(scope['evidence'])
+    return route_readiness(manager,record)['phase'] in ('complete','off')
+
+
+def installed_gui_ready(record):
+    if record.get('kind')!='app' or record.get('app',{}).get('state')!='verified':return True
+    app=record['app'];startup=app.get('startup') or {}
+    if startup.get('state')=='skipped' and startup.get('policy')=='no_launch':return True
+    if startup.get('state')!='ready':return False
+    from .proxy_identity import same_process,digest
+    owner=startup.get('owner') or {}
+    return (owner.get('executable')==app.get('executable') and same_process(owner)
+            and digest(app['executable'])==app.get('sha256'))
 
 
 def run_restart(journal, operation_id):
-    from .proxy_identity import process_identity
+    from .proxy_identity import process_identity, same_process
+    from .update_state import installed_gui_required
     with ProcessLock(journal.root / 'client-restart.lock'):
         record = journal.read()
         if record.get('operation_id') != operation_id:return
@@ -171,23 +187,30 @@ def run_restart(journal, operation_id):
                 journal.client_result(operation_id, phase='closing',targets=current)
                 close_desktop(current)
                 if desktop.desktop_processes():raise RuntimeError(CLOSE_REQUIRED)
-                journal.client_result(operation_id, phase='closed')
+                journal.client_result(operation_id, phase='closed',closed_at=time.time())
             elif phase == 'closing':
                 if desktop.desktop_processes():raise RuntimeError(CONSENT_REQUIRED)
-                journal.client_result(operation_id, phase='closed')
+                journal.client_result(operation_id, phase='closed',closed_at=time.time())
             elif phase not in ('closed', 'reopening'):
                 raise RuntimeError(client.get('message') or CONSENT_REQUIRED)
             while True:
                 record = journal.read()
                 if record.get('operation_id') != operation_id:return
                 client = record['client']; proxy = record.get('proxy', {})
+                gui_ready=installed_gui_ready(record)
                 ready = (record.get('app', {}).get('state') in ('verified', 'current')
-                         and proxy.get('phase') in ('complete', 'off'))
+                         and proxy.get('phase') in ('complete', 'off') and gui_ready
+                         and (not record.get('scope') or restored_ready(record)))
                 failed = record.get('component_phase', record['phase']) in ('failed', 'partial', 'cancelled', 'deferred')
                 cancelled = record.get('cancel_requested') and not record.get('activation_started') and not proxy.get('cutover_started')
-                if ready or (failed or cancelled) and (proxy.get('restored') or restored_ready(record)):
+                if ready or (failed or cancelled) and gui_ready and restored_ready(record):
                     break
-                if failed:
+                startup=record.get('app',{}).get('startup') or {}
+                pending_gui=installed_gui_required(record) and startup.get('state') in ('waiting','starting')
+                if pending_gui and startup.get('owner') and same_process(startup['owner']) is False:
+                    journal.startup_result(operation_id,dict(state='blocked',message='Codexon 시작이 중단되었습니다. 업데이트를 다시 시도하세요.'))
+                    raise RuntimeError('연결 복구 후 Codex를 다시 실행하세요.')
+                if failed and not pending_gui or startup.get('state')=='ready' and not gui_ready or startup.get('state')=='blocked' or (installed_gui_required(record) and not startup):
                     raise RuntimeError('연결 복구 후 Codex를 다시 실행하세요.')
                 time.sleep(.5)
             ready_at = client.get('ready_at') or time.time()
@@ -195,7 +218,11 @@ def run_restart(journal, operation_id):
             current = desktop.desktop_processes()
             fresh = [p for p in current if p['created'] / 10_000_000 - 11644473600 >= ready_at]
             if current and not fresh:raise RuntimeError(CONSENT_REQUIRED)
-            if not fresh:desktop._activate(desktop.CODEX_APP_ID)
+            if not fresh:
+                latest=journal.read()
+                if latest.get('operation_id')!=operation_id or not installed_gui_ready(latest) or latest.get('scope') and not restored_ready(latest):
+                    raise RuntimeError('Codexon과 연결 준비 상태가 변경되어 Codex 재시작을 보류했습니다.')
+                desktop._activate(desktop.CODEX_APP_ID)
             deadline = time.monotonic() + 25
             while not fresh and time.monotonic() < deadline:
                 fresh = [p for p in desktop.desktop_processes()
@@ -209,7 +236,6 @@ def run_restart(journal, operation_id):
 
 
 def retry(journal, operation_id, recovery):
-    client = journal.read().get('client', {})
-    if not needs_reopening(client):raise RuntimeError(CONSENT_REQUIRED)
+    if not needs_reopening(journal.read()):raise RuntimeError(CONSENT_REQUIRED)
     journal.client_result(operation_id, phase='reopening', message='')
     start(journal, operation_id, recovery)
