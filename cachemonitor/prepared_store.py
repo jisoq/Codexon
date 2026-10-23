@@ -499,7 +499,7 @@ def _portable_token(value):
 
 class PreparedStore:
     """Exclusive writer for one dedicated, disposable analysis database."""
-    def __init__(self, path, limits=Limits()):
+    def __init__(self, path, limits=Limits(), *, cancel=None):
         from .prepared_changes import GenerationJournal
         self.changes=GenerationJournal()
         self.path, self.limits = Path(path).resolve(), limits
@@ -515,9 +515,9 @@ class PreparedStore:
             self.db.row_factory = sqlite3.Row
             if existed:
                 version = self._validate_format()
-                if version == 5 and self._healthy():
+                if version == 5 and self._healthy(cancel):
                     self._upgrade_catalog_order()
-                elif version != FORMAT or not self._healthy():
+                elif version != FORMAT or not self._healthy(cancel):
                     self._rebuild_format()
                 elif not self._order_schema():
                     self._rebuild_format()
@@ -552,7 +552,7 @@ class PreparedStore:
             raise RebuildRequired('unknown prepared database format')
         return row[0]
 
-    def _healthy(self):
+    def _healthy(self, cancel=None):
         """Check a recognized current cache once, before starting ordinary readers."""
         self.db.execute('PRAGMA mmap_size=0')
         self.db.execute('PRAGMA cache_size=-8192')
@@ -560,17 +560,20 @@ class PreparedStore:
         page_size = self.db.execute('PRAGMA page_size').fetchone()[0]
         if pages * page_size > self.limits.database_bytes:
             raise CapacityExceeded('existing prepared database exceeds its page budget')
-        deadline = time.monotonic() + 10
-        expired = False
+        if cancel is not None and cancel():
+            raise ReadCancelled('prepared integrity check cancelled')
+        cancelled = False
 
         def progress():
-            nonlocal expired
-            expired = time.monotonic() > deadline
-            return int(expired)
+            nonlocal cancelled
+            cancelled = bool(cancel is not None and cancel())
+            return int(cancelled)
 
         self.db.set_progress_handler(progress, 1000)
         try:
             row = self.db.execute('PRAGMA quick_check(1)').fetchone()
+            if cancel is not None and cancel():
+                raise ReadCancelled('prepared integrity check cancelled')
             if row is None:
                 raise RebuildRequired('prepared integrity check returned no result')
             return row[0] == 'ok'
@@ -578,8 +581,8 @@ class PreparedStore:
             code = getattr(error, 'sqlite_errorcode', 0) & 255
             if code == sqlite3.SQLITE_CORRUPT:
                 return False
-            if code == sqlite3.SQLITE_INTERRUPT and expired:
-                raise TimeoutError('prepared integrity check exceeded its deadline') from error
+            if code == sqlite3.SQLITE_INTERRUPT and cancelled:
+                raise ReadCancelled('prepared integrity check cancelled') from error
             # Contention, I/O failure, and interrupted checks are not corruption.
             raise
         finally:

@@ -1171,7 +1171,8 @@ def test_corrupt_current_cache_regenerates_without_changing_source_ledger(tmp_pa
     assert ledger.read_bytes() == ledger_bytes
 
 
-@pytest.mark.parametrize('code', [sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_BUSY, sqlite3.SQLITE_IOERR])
+@pytest.mark.parametrize('code', [sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_BUSY,
+                                  sqlite3.SQLITE_IOERR, sqlite3.SQLITE_INTERRUPT])
 def test_startup_check_recovers_only_reported_corruption(tmp_path, monkeypatch, code):
     path = tmp_path/'analysis.sqlite'
     with storage.PreparedStore(path) as store:
@@ -1210,13 +1211,163 @@ def test_slow_startup_check_reuses_a_healthy_cache(tmp_path, monkeypatch):
         original = publish(store, 1, calls())
         store.db.execute('CREATE TABLE health_rows(value INTEGER)')
         store.db.executemany('INSERT INTO health_rows VALUES(?)', ((i,) for i in range(2000)))
+        with store.read_current() as view:
+            expected = list(view.iter_calls(OWNER))
     moments = iter((0., 11.))
     with monkeypatch.context() as patch:
         patch.setattr(storage, 'time', SimpleNamespace(monotonic=lambda:next(moments, 11.)))
         with storage.PreparedStore(path) as store:
             assert store.token == original
     with storage.PreparedReader(path) as reader, reader.pin(original) as view:
-        assert [view.record(*OWNER, row['key']) for row in calls()] == calls()
+        assert list(view.iter_calls(OWNER)) == expected
+
+
+@pytest.mark.parametrize('when', ['before', 'during', 'after'])
+def test_cancelled_startup_preserves_facts_and_releases_writer(tmp_path, monkeypatch, when):
+    path = tmp_path/'analysis.sqlite'
+    with storage.PreparedStore(path) as store:
+        original = publish(store, 1, calls())
+        store.db.execute('CREATE TABLE health_rows(value INTEGER)')
+        store.db.executemany('INSERT INTO health_rows VALUES(?)', ((i,) for i in range(2000)))
+        with store.read_current() as view:
+            expected = list(view.iter_calls(OWNER))
+    before = path.read_bytes()
+    stopped = Event()
+    if when == 'before':stopped.set()
+    original_connect = sqlite3.connect
+
+    class CheckConnection(sqlite3.Connection):
+        def execute(self, sql, *args, **kwargs):
+            result = super().execute(sql, *args, **kwargs)
+            if sql == 'PRAGMA quick_check(1)' and when == 'after':stopped.set()
+            return result
+
+        def set_progress_handler(self, callback, steps):
+            if callback is not None and when == 'during':
+                def progress():
+                    stopped.set()
+                    return callback()
+                return super().set_progress_handler(progress, steps)
+            return super().set_progress_handler(callback, steps)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(storage.sqlite3, 'connect',
+                      lambda *args, **kwargs:original_connect(*args, factory=CheckConnection, **kwargs))
+        with pytest.raises(storage.ReadCancelled):
+            storage.PreparedStore(path, cancel=stopped.is_set)
+    assert stopped.is_set()
+    assert path.read_bytes() == before
+    with storage.PreparedStore(path) as store, storage.PreparedReader(path) as reader, reader.pin(original) as view:
+        assert store.token == original
+        assert list(view.iter_calls(OWNER)) == expected
+
+
+def test_writer_shutdown_cancels_integrity_check_without_fatal_error(tmp_path, monkeypatch):
+    from threading import Thread
+    from cachemonitor import prepared_runtime
+
+    quota = tmp_path/'quota.sqlite'
+    path = quota.with_suffix('.prepared.sqlite')
+    with storage.PreparedStore(path) as store:
+        original = publish(store, 1, calls())
+        store.db.execute('CREATE TABLE health_rows(value INTEGER)')
+        store.db.executemany('INSERT INTO health_rows VALUES(?)', ((i,) for i in range(2000)))
+    entered, release = Event(), Event()
+    original_connect = sqlite3.connect
+
+    class CheckConnection(sqlite3.Connection):
+        def set_progress_handler(self, callback, steps):
+            if callback is not None:
+                def progress():
+                    entered.set()
+                    assert release.wait(5), 'integrity check was not released'
+                    return callback()
+                return super().set_progress_handler(progress, steps)
+            return super().set_progress_handler(callback, steps)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(storage.sqlite3, 'connect',
+                      lambda *args, **kwargs:original_connect(*args, factory=CheckConnection, **kwargs))
+        writer = prepared_runtime.PreparedWriter([], tmp_path/'index.sqlite', None, quota)
+        closer = Thread(target=writer.close, daemon=True)
+        try:
+            assert entered.wait(5), 'writer never entered integrity checking'
+            closer.start()
+            assert writer.stopped.wait(5), 'writer did not request cancellation'
+            release.set()
+            closer.join(5)
+            assert not closer.is_alive()
+            assert not writer.thread.is_alive()
+        finally:
+            release.set()
+            if closer.ident is None:writer.close()
+            else:closer.join(5)
+    assert not quota.with_suffix('.analysis.diagnostics.log').exists()
+    with storage.PreparedStore(path) as store, storage.PreparedReader(path) as reader, reader.pin(original) as view:
+        assert store.token == original
+        assert view.record(*OWNER, 'call-1')['cost'] == 1.
+
+
+def test_preparation_upgrade_finishes_groups_before_queries_and_retains_model_evidence(tmp_path, monkeypatch):
+    from contextlib import closing
+    import time
+    from cachemonitor import prepared_ingest
+    from cachemonitor.core import Session
+    from cachemonitor.prepared_analysis import PreparedAnalysisEngine
+    from cachemonitor.usage_collection import CollectionChannel, CollectionClient, empty_snapshot
+
+    path = tmp_path/'prepared.sqlite'
+    with (closing(CollectionChannel([tmp_path/'home'], tmp_path/'source.sqlite')) as channel,
+          closing(CollectionClient(channel.homes, channel.path)) as client):
+        channel.start_live()
+        sources = []
+        for sid in ('first', 'second'):
+            session = Session(sid, channel.homes[0], title=sid)
+            session.add_usage(100, sid+'-call', dict(input_tokens=100, cached_input_tokens=20, output_tokens=10),
+                              'gpt-6-astra', 'request', 'high', service_tier='Standard')
+            source = session.view(110)
+            source['history'][0].update(requested_model='gpt-6-astra', response_model='gpt-6-astra',
+                                        response_status='completed', model_match='일치')
+            sources.append(source)
+        now = time.time()
+        snapshot = empty_snapshot(channel.homes, channel.path, now)
+        snapshot.update(sessions=sources, usage_collection_complete=True, last_usage_collection_success=now,
+                        request_activity=[], quota_by_home={})
+        snapshot['index'].update(loading=False, usage_complete=True, last_usage_success=now)
+        channel.publish(snapshot, 'preparation-upgrade', 1)
+        catalog = prepared_ingest.read_catalog(client)
+        with storage.PreparedStore(path) as store:
+            with monkeypatch.context() as patch:
+                patch.setattr(prepared_ingest, 'PREPARATION', ('canonical-owner', 8))
+                list(prepared_ingest.PreparedCohort(store, client, None).convert(catalog, cohort_size=1))
+            original = store.token
+
+        with storage.PreparedStore(path) as store, storage.PreparedReader(path) as reader:
+            coordinator = prepared_ingest.PreparedCohort(store, client, None)
+            conversion = coordinator.convert(catalog, cohort_size=1)
+            try:
+                assert not next(conversion)['ready']
+                with pytest.raises(storage.NotReady):reader.pin(store.token)
+                assert list(conversion)[-1]['ready']
+            finally:conversion.close()
+            assert store.token.instance == original.instance
+            assert store.token.generation > original.generation
+            with reader.pin(store.token) as view:
+                for source in sources:
+                    owner = source['home'], source['id']
+                    assert view.owner(*owner)['dependencies']['preparation'] == ('canonical-owner', 9)
+                    row = view.record(*owner, source['id']+'-call')
+                    assert (row['effort'], row['requested_model'], row['response_model'], row['model_match']) == (
+                        'high', 'gpt-6-astra', 'gpt-6-astra', '일치')
+            with closing(PreparedAnalysisEngine(path, store.token)) as engine:
+                result = engine.page_query(dict(page=2, start=0, end=200, now=200, period='custom',
+                    presentation=True, explorer=dict(session=[sources[0]['home'], 'first'], view='calls')))
+                assert result['analysis']['response_count'] == 2
+                assert result['explorer']['group']['calls'] == 1
+            final = store.token
+        with storage.PreparedStore(path) as store:
+            assert list(prepared_ingest.PreparedCohort(store, client, None).convert(catalog, cohort_size=1)) == []
+            assert store.token == final
 
 
 def test_known_old_format_regenerates_atomically_and_preserves_other_stores(tmp_path, monkeypatch):

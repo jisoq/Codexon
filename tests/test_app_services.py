@@ -140,6 +140,7 @@ def login_services(tmp_path, monkeypatch):
     monkeypatch.setattr(manager, 'resume', resume)
     owner = services.AppServices(manager, [], login_launch=lambda: events.append('launch') or 'started')
     monkeypatch.setattr(owner, 'start_collection', lambda: events.append('collection'))
+    monkeypatch.setattr(owner, 'poll_collection', lambda: '')
     return owner, manager, status, events
 
 

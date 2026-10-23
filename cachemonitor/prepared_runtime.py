@@ -143,7 +143,8 @@ class PreparedWriter:
             from .mismatch_history import MismatchArchive,archive_path
             archive = MismatchArchive(archive_path(quota_path),self.stopped.is_set)
             collector = CollectionClient(homes,index_path,model_evidence_path)
-            store = PreparedStore(self.path,replace(Limits(),read_seconds=60,read_vm_steps=20_000_000))
+            store = PreparedStore(self.path,replace(Limits(),read_seconds=60,read_vm_steps=20_000_000),
+                                  cancel=self.stopped.is_set)
             from .prepared_speed_writer import PreparedSpeedWriter
             from .prepared_ingest import preparation_signature
             speed_writer=PreparedSpeedWriter(store,preparation=preparation_signature(),

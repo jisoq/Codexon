@@ -161,10 +161,9 @@ class AppServices:
         if self.collection and not self.closing.is_set():
             try:
                 self.start_collection()
-                self.collection_fault=dict(starting=bool(self.collector_pending))
-                self.collection_healthy=bool(self.collector_source and not self.collector_pending)
-                if self.collector_pending:
-                    errors.append('수집 시작 중')
+                issue = self.poll_collection()
+                if issue:
+                    errors.append(issue)
             except CollectionPending as exc:
                 self.collection_fault=dict(status_pending=True)
                 errors.append(str(exc))
@@ -369,10 +368,10 @@ class AppServices:
                     elif time.time() - snapshot['ts'] <= 30:
                         published = True
                 source = self.collector_identity(channel, identity_snapshot)
-                if source and snapshot and not self.collector_pending:
-                    self.collection_snapshot_at=snapshot['ts']
                 if published and source:
                     self.collector_pending = None
+                if source and snapshot and not self.collector_pending:
+                    self.collection_snapshot_at=snapshot['ts']
                 stopped = read_json(channel.companion('.session.json'))
                 task = ObserverTask(str(channel.path), role='UsageCollector')
                 dead = not source and (not locked(channel.companion('.collector.lock'))) and (not task.inspect().get('running')) and (not (stopped.get('scope') == channel.scope and stopped.get('stopped')))
