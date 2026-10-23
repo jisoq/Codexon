@@ -75,27 +75,19 @@ GROUPS = {
     'quota_poll': test_files('quota_polling', 'quota_backlog', 'quota_worker', 'quota_transport', 'overlay_collection_resilience'),
     'quota_ui': test_files('quota_page', 'quota_detail_card', 'quota_gap_axis', 'quota_share_theme', 'quota_exclusion_controls', 'quota_sidebar', 'quota_query', 'quota_waiting'),
     'quota_chart': test_files('quota_gap_axis', 'quota_chart_performance', 'quota_page', 'quota_chart_exclusions'),
-    'dashboard': test_files('home', 'ui', 'comparison_workflow', 'dashboard_evidence', 'ui_value_fixes', 'history_explorer', 'history_timeline', 'history_timeline_data', 'dashboard_readability'),
+    'dashboard': test_files('home', 'ui', 'comparison_workflow', 'dashboard_evidence', 'ui_value_fixes', 'dashboard_readability'),
     'comparison_ui': test_files('comparison_workflow', 'dashboard_readability') +
         test_nodes('dashboard_evidence', 'test_tab_loading_keeps_controls_and_ignores_stale_result',
                    'test_comparison_display_controls_keep_chart_without_new_query',
                    'test_refresh_indicator_does_not_cover_existing_chart') +
         test_nodes('quick_ui', 'test_reasoning_tokens_render_independently_of_cost_and_request_unit'),
-    'dashboard_queries': test_files('dashboard_evidence', 'history_timeline_data') +
+    'dashboard_queries': test_files('dashboard_evidence') +
         test_nodes('home', 'test_home_today_projection_matches_prepared_calls_and_partial_coverage',
                    'test_home_loading_masks_only_today_and_readiness_uses_collection_evidence',
                    'test_home_scope_and_identity_ignore_other_page_filters_but_expire_at_midnight') +
-        test_nodes('ui', 'test_sequential_drilldown_and_full_call_detail',
-                   'test_request_statistics_in_current_level_and_filtered_scope',
-                   'test_event_navigation_retains_conditions_and_exact_evidence_phases') +
-        test_nodes('comparison_workflow', 'test_project_selection_preserves_filters_and_back_restores_exact_call',
-                   'test_unmeasurable_pairs_hide_without_losing_zero_values_or_cached_metrics',
-                   'test_custom_date_drafts_preserve_results_and_apply_exact_cohort',
-                   'test_metric_drilldown_ignores_history_filters_and_restores_latest_scope') +
-        test_nodes('history_explorer', 'test_temporary_history_locks_exact_population_and_escape_restores_scope',
-                   'test_prepared_filter_choices_preserve_empty_values_and_project_aliases',
-                   'test_session_chart_selection_detail_and_back_preserve_scope'),
-    'details': test_files('ui_details', 'call_transport', 'model_ui'),
+        test_nodes('comparison_workflow', 'test_unmeasurable_pairs_hide_without_losing_zero_values_or_cached_metrics',
+                   'test_custom_date_drafts_preserve_results_and_apply_exact_cohort'),
+    'details': test_files('ui_details', 'call_transport'),
     'table': test_files('table_order', 'performance'),
     'shared_ui': test_files('quick_ui', 'display_scaling'),
     'theme': test_files('theme_tokens', 'quota_share_theme'),
@@ -104,7 +96,7 @@ GROUPS = {
     'overlay_controls': test_files('overlay_controls', 'overlay_layout_controller'),
     'overlay_navigation': test_files('overlay_navigation', 'speed_health') + (
         'tests/test_output_speed.py::test_rendered_summary_click_and_overlay_speed_navigation',),
-    'overlay_render': test_files('overlay_monitor', 'overlay_presentation', 'overlay_column', 'completed_layout', 'overlay_shadow'),
+    'overlay_render': test_files('overlay_monitor', 'overlay_presentation', 'overlay_column', 'overlay_shadow'),
     'overlay_appearance': test_files('overlay_appearance', 'theme_tokens'),
     'overlay_windows': test_files('overlay_windows'),
     'taskbar': test_files('taskbar', 'taskbar_clock'),
@@ -122,7 +114,7 @@ GROUPS = {
     'payload': ('tests/test_public_release.py::test_public_payload_rejects_local_paths_and_unneeded_qt',),
     'selector': test_files('verify_changes', 'check_environment', 'ci_plan'),
     'qa_ipc': test_files('qa_ipc'),
-    'ui_runner': test_files('ui_check_runner', 'completed_layout'),
+    'ui_runner': test_files('ui_check_runner'),
     'release': test_files('release_pipeline', 'prepare_sources', 'source_receipt'),
 }
 

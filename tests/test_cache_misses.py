@@ -1,3 +1,4 @@
+from cachemonitor.analysis_records import public_record
 import copy
 from cachemonitor.cache_misses import classify
 from cachemonitor.core import Session
@@ -40,4 +41,4 @@ def test_fact_and_incident_classification_precedes_filters_and_backfill():
     earlier=copy.deepcopy(source['history'][0]);earlier.update(key='earlier',ts=99,cached=5000)
     source['history'].insert(0,earlier);engine.ingest([source])
     assert engine.query(query())['analysis']['sessions'][0]['cache_misses']['count']==4
-    assert engine.record('fixture','miss-session','0')['cache_miss']
+    assert public_record(engine.sessions[('fixture','miss-session')]['records']['0'][1])['cache_miss']

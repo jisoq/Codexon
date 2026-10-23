@@ -21,7 +21,6 @@ class OverlayRequest:
     request_id: str
     identity: tuple
     revision: tuple
-    health: bool = False
     finance: bool = False
 
     def matches(self,data):
@@ -29,8 +28,8 @@ class OverlayRequest:
         return self.identity==identity or bool(self.revision and self.identity[:2]==identity[:2]
             and self.revision==tuple(data.get('_overlay_revision') or ()))
 
-    def satisfies(self,*,health=False,finance=False):
-        return (self.health or not health) and (self.finance or not finance)
+    def satisfies(self,*,finance=False):
+        return self.finance or not finance
 
     def accepts(self,value):
         detail=value.get('summary')
@@ -38,7 +37,6 @@ class OverlayRequest:
             and OverlayController.overlay_identity(detail)==self.identity
             and tuple(detail.get('_overlay_revision') or ())==self.revision
             and not detail.get('_recent_refs')
-            and (not self.health or detail.get('_health_detail'))
             and (not self.finance or 'subagent_finance' in detail))
 
 
@@ -55,7 +53,6 @@ def system_dark():
 
 class OverlayController(QObject):
     changed=Signal()
-    navigation_requested=Signal(object)
     @property
     def expanded(self):return self.widget.content_model.main_expanded
     @expanded.setter
@@ -63,13 +60,11 @@ class OverlayController(QObject):
     def __init__(self, settings, native_enabled=True, appearance_path=None):
         super().__init__()
         self.settings = settings
-        self.record_loader=None;self.record_serial=0;self.pending_record=None
         self.overlay_loader=None;self.overlay_serial=0;self.pending_overlay=None
         self._overlay_detail=None;self._overlay_blocked=None
         self._overlay_requests=OrderedDict()
         self._overlay_restart_pending=False
         self._overlay_cache=BoundedCache(entries=8,rows=8*1024*1024)
-        self._pending_overlay_navigation=None
         self.widget = SessionOverlay()
         content=self.widget.content_model;content.settings=settings
         self.chart_style=settings.value('overlay/chartStyle','bar')
@@ -91,10 +86,8 @@ class OverlayController(QObject):
         self.header=OverlayChrome('header');self.toolbar=OverlayChrome('toolbar');self.icon=OverlayChrome('icon');self.actions=OverlayChrome('actions')
         self.detail=OverlayDetail(self.widget.content_model)
         self.links=OverlayLinks(self.widget.content_model)
-        self.links.view.navigationRequested.connect(self.navigation_requested)
         self.actions.view.detailPressed.connect(self.capture_detail)
         self.actions.view.detailClicked.connect(self.activate_detail)
-        self.detail.view.navigationRequested.connect(self.navigation_requested)
         self.links.wheel_forwarder=self.forward_wheel
         self.chrome=(self.header,self.toolbar,self.icon,self.actions,self.detail,self.links)
         self.collapsed=False
@@ -205,20 +198,6 @@ class OverlayController(QObject):
         if scope!=(data.get('home'),data.get('id')):return
         if self.expanded==expanded:self.toggle_expanded()
 
-    def receive_record(self,value):
-        pending=self.pending_record
-        if not pending or value.get('id')!=pending[0]:return
-        self.pending_record=None
-        content=self.widget.content_model;data=content.data or {}
-        if (data.get('home'),data.get('id'))!=pending[1]:return
-        if len(pending)>2 and (tuple(data.get('_prepared_token') or ())!=pending[2] or
-                              tuple(value.get('prepared_token') or ())!=pending[2]):return
-        row=value.get('row')
-        if row:
-            from .overlay_data import call_summary
-            row=call_summary(row,0)
-            content.selected_snapshot=row;content.selected_id=content.call_id(row);content.follow_latest=False
-            content.sync_details();content.update()
 
     @staticmethod
     def overlay_identity(data):
@@ -232,20 +211,16 @@ class OverlayController(QObject):
                     (cached.get('home'),cached.get('id'),tuple(cached.get('_overlay_revision') or ())))
 
     @staticmethod
-    def refreshed_overlay_detail(data,cached,health=False):
+    def refreshed_overlay_detail(data,cached):
         # A stable revision proves the selected composition is still valid.
         # Global heads intentionally omit it, so retain the hydrated fields.
         base=dict(cached,**data) if data.get('_overlay_head') else data
-        value=dict(base,recent=cached['recent'],latest=cached['latest'],_recent_refs=False,
-                   _health_detail=bool(data.get('_health_detail') or cached.get('_health_detail')))
+        value=dict(base,recent=cached['recent'],latest=cached['latest'],_recent_refs=False)
         value.pop('_overlay_head',None)
         if data.get('_overlay_head') and 'main_usage' in cached:
             value['main_usage']=cached['main_usage']
         if 'subagent_finance' in cached:
             value['subagent_finance']=cached['subagent_finance']
-        if cached.get('_health_detail'):
-            value.update({key:cached[key] for key in
-                          ('cache_misses','cache_health','cache_degradation') if key in cached})
         return value
 
     def prepared_content(self,data):
@@ -254,16 +229,8 @@ class OverlayController(QObject):
         if self.collapsed:
             self._overlay_detail=None
             return data,False
-        navigation=getattr(self,'_pending_overlay_navigation',None)
-        if navigation:
-            from .overlay_navigation import NavigationTarget
-            target=NavigationTarget.from_value(navigation)
-            if (target.home,target.sid)!=identity[:2]:
-                self._pending_overlay_navigation=None;navigation=None
-        health=bool(navigation)
         finance=bool(data.get('descendants',0))
-        if (not data.get('_recent_refs') and (not health or data.get('_health_detail'))
-                and (not finance or 'subagent_finance' in data)):
+        if not data.get('_recent_refs') and (not finance or 'subagent_finance' in data):
             return data,False
         displayed=self._overlay_detail
         cache=getattr(self,'_overlay_cache',None)
@@ -274,22 +241,22 @@ class OverlayController(QObject):
                 cached=self.refreshed_overlay_detail(cached or data,candidate)
         if cached:
             self._overlay_detail=cached
-            if (not health or cached.get('_health_detail')) and (not finance or 'subagent_finance' in cached):
+            if not finance or 'subagent_finance' in cached:
                 return cached,False
         pending=self.pending_overlay
-        same_pending=bool(pending and pending.matches(data) and pending.satisfies(health=health,finance=finance))
+        same_pending=bool(pending and pending.matches(data) and pending.satisfies(finance=finance))
         blocked=getattr(self,'_overlay_blocked',None) or {}
         if (self.overlay_loader and not getattr(self,'_overlay_restart_pending',False)
                 and blocked.get(identity[:2])!=identity and not same_pending):
             self.overlay_serial+=1
             request=OverlayRequest(f'overlay-detail-{self.overlay_serial}',identity,
-                tuple(data.get('_overlay_revision') or ()),health,finance)
+                tuple(data.get('_overlay_revision') or ()),finance)
             requests=getattr(self,'_overlay_requests',None)
             if requests is None:self._overlay_requests=requests=OrderedDict()
             requests[request.request_id]=request
             while len(requests)>8:requests.popitem(last=False)
             self.pending_overlay=request
-            self.overlay_loader(request.request_id,cached or data,health=health,finance=finance)
+            self.overlay_loader(request.request_id,cached or data,finance=finance)
         retained=cached or displayed
         if retained and self.overlay_identity(retained)[:2]==identity[:2]:
             # Publish a complete replacement only after its calls arrive. Mixing
@@ -359,14 +326,6 @@ class OverlayController(QObject):
         if not OverlayController.selected_scope(self,*key):return
         self._overlay_detail=detail
         self.refresh()
-        navigation=getattr(self,'_pending_overlay_navigation',None)
-        if navigation and detail.get('_health_detail'):
-            from .overlay_navigation import NavigationTarget
-            target=NavigationTarget.from_value(navigation)
-            if (target.home,target.sid)==key:
-                self._pending_overlay_navigation=None
-                self.navigate_from_dashboard(navigation)
-
     def selected_scope(self,home,sid):
         selection=self.target_state.get('selection')
         matches=self.session_lookup.get(sid,[])
@@ -378,61 +337,6 @@ class OverlayController(QObject):
                     and len(self.session_lookup.get(selection.thread_id,[]))==1
                     and time.monotonic()-self.observed_at<=3)
 
-    def navigation_availability(self, home, sid):
-        if not self.enabled:return dict(enabled=False,reason='오버레이 꺼짐')
-        target=self.target_state.get('target');selection=self.target_state.get('selection')
-        if (not self.native or not target or not self.target_state.get('confirmed',True) or not selection or selection.host!='local'
-                or not selection.thread_id or time.monotonic()-self.observed_at>3):
-            return dict(enabled=False,reason='현재 세션 확인 불가')
-        if not self.selected_scope(home,sid):
-            return dict(enabled=False,reason='Codex의 현재 세션과 다름')
-        return dict(enabled=True,reason='')
-
-    def navigate_from_dashboard(self, value):
-        from .overlay_navigation import NavigationTarget
-        target=NavigationTarget.from_value(value)
-        available=self.navigation_availability(target.home,target.sid)
-        if not available['enabled']:return available
-        window=self.target_state['target']
-        # Re-read current route and process identity immediately before activation.
-        if not hasattr(self.native,'confirm_selection'):
-            return dict(enabled=False,reason='현재 세션 확인 불가')
-        selection=self.native.confirm_selection(window)
-        if not selection or selection.host!='local' or selection.thread_id!=target.sid:
-            return dict(enabled=False,reason='Codex의 현재 세션과 다름' if selection else '현재 세션 확인 불가')
-        data=next((s for s in self.session_lookup.get(target.sid,[]) if s['home']==target.home),None)
-        cached=self._overlay_detail
-        if data and cached and self.overlay_identity(data)==self.overlay_identity(cached):data=cached
-        rows=(data or {}).get('recent',[])
-        call_id=target.call_id
-        if target.event_id:
-            if (data or {}).get('_health_ref') and not data.get('_health_detail'):
-                if not self.overlay_loader:return dict(enabled=False,reason='대상 기록을 찾을 수 없음')
-                self._pending_overlay_navigation=value
-            else:
-                event=next((e for e in (data or {}).get('cache_degradation',{}).get('events',[]) if str(e.get('id'))==target.event_id),None)
-                if not event:return dict(enabled=False,reason='대상 기록을 찾을 수 없음')
-                keys=event.get('occurrence_keys',event.get('keys',[]));call_id=keys[0] if keys else None
-        missing=call_id and not any(str(row.get('id'))==str(call_id) for row in rows)
-        if missing and not self.record_loader:
-            return dict(enabled=False,reason='대상 기록을 찾을 수 없음')
-        if not self.native.activate_target(window['hwnd']):
-            return dict(enabled=False,reason='현재 세션 확인 불가')
-        self.collapsed=False
-        self._store_collapsed()
-        self.observed_at=time.monotonic();self.target_state={**self.target_state,'selection':selection,'confirmed':True}
-        self.refresh()
-        if call_id:
-            self.widget.content_model.graph_pinned=False
-            self.widget.content_model.select(call_id)
-            if missing:
-                self.record_serial+=1;request=f'overlay-record-{self.record_serial}'
-                token=tuple((data or {}).get('_prepared_token') or ())
-                self.pending_record=(request,(target.home,target.sid),token) if token else (request,(target.home,target.sid))
-                if token:self.record_loader(request,(target.home,target.sid,call_id),token)
-                else:self.record_loader(request,(target.home,target.sid,call_id))
-            self.widget.content_model.sync_details();self.widget.content_model.update()
-        return dict(enabled=True,reason='')
 
     def forward_wheel(self,event):
         target=self.target_state.get('target')
@@ -676,8 +580,7 @@ class OverlayController(QObject):
                 or state.get('target')!=self.target_state.get('target')):self.cancel_drag()
         if state.get('selection')!=self.target_state.get('selection'):
             self.close_popup()
-            self._pending_overlay_navigation=None
-        self.target_state = state
+            self.target_state = state
         self.observed_at = now
         self.refresh()
 
@@ -708,11 +611,6 @@ class OverlayController(QObject):
         if blocked is not None:
             for key,identity in tuple(blocked.items()):
                 if key not in owners or self.overlay_identity(owners[key])!=identity:blocked.pop(key)
-        navigation=getattr(self,'_pending_overlay_navigation',None)
-        if navigation:
-            from .overlay_navigation import NavigationTarget
-            target=NavigationTarget.from_value(navigation)
-            if (target.home,target.sid) not in owners:self._pending_overlay_navigation=None
         self._overlay_restart_pending=False
         self.snapshot_at = time.monotonic()
         self.collection_evidence={key:snapshot[key] for key in ('ts','collection','usage_collection_complete','index','usage_errors','collection_stale') if key in snapshot}
@@ -1080,16 +978,10 @@ def install_overlay(window, native_enabled=True):
     window.overlay = controller
     if hasattr(window,'settings_page') and hasattr(window.settings_page,'bind_overlay'):
         window.settings_page.bind_overlay(controller)
-    if getattr(window,'worker',None) and hasattr(window.worker,'request_record'):
-        controller.record_loader=window.worker.request_record
-        window.worker.record.connect(controller.receive_record)
-        if hasattr(window.worker,'stale'):window.worker.stale.connect(controller.receive_record)
     if getattr(window,'worker',None) and hasattr(window.worker,'request_overlay_detail'):
         controller.overlay_loader=window.worker.request_overlay_detail
         window.worker.overlay_detail.connect(controller.receive_overlay_detail)
         if hasattr(window.worker,'fault'):window.worker.fault.connect(controller.receive_overlay_fault)
-    if hasattr(window,'navigate'):controller.navigation_requested.connect(window.navigate)
-    if hasattr(window,'refresh_overlay_availability'):controller.changed.connect(window.refresh_overlay_availability)
     if getattr(window,'quota_service',None):
         window.quota_service.updated.connect(lambda value:controller.receive_quota(value,window.quota_service.home))
         controller.receive_quota({'quota':window.live_quota,'issue':getattr(window,'quota_issue','')},window.quota_service.home)

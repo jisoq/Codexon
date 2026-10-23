@@ -95,20 +95,6 @@ def test_rendered_summary_click_and_overlay_speed_navigation(tmp_path):
         click(links,named_item(links.quick.rootObject(),'nav-main-detail'))
         assert m.main_expanded and m.latest_call()['output_speed']==100
         assert m.data['output_speed_summary']['value']==cumulative
-        from cachemonitor.overlay_navigation import navigation_target
-        window.navigate(navigation_target(data,'session'))
-        window.navigate(navigation_target(data,'call',call=data['latest']))
-        for _ in range(40):
-            QTest.qWait(25)
-            if window.detail_scroll.verticalPosition.value()>0:break
-        assert window.selected_call==data['latest']['id']
-        assert '100.0 tok/s' in window.detail_sections['usage'][1].text()
-        assert '30.00' in window.detail_sections['time'][1].text()
-        assert window.quick.grabFramebuffer().save(str(tmp_path/'call-detail.png'))
-        window.record_view='calls';window.render_explorer()
-        window.extra_column_controls['output_speed'].setChecked(True);window.render_explorer()
-        index=[key for key,title in window.active_columns].index('output_speed')
-        assert window.response_cell(data['latest'],index,Qt.DisplayRole)=='100.0 tok/s'
         window.nav.setCurrentRow(window.navigation_pages.index(3));window.resize(1000,720);QTest.qWait(60)
         assert window.current_page==3 and control(window,window.quota_panel).isVisible()
         assert window.quick.grabFramebuffer().save(str(tmp_path/'dashboard-small.png'))

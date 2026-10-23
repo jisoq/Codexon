@@ -186,7 +186,7 @@ def test_overlay_chart_style_applies_immediately_preserves_selection_and_persist
 @pytest.mark.integration
 def test_lazy_setting_categories_and_search_show_progress_until_controls_exist(startup_settings_window):
     window,_=startup_settings_window;page=window.settings_page
-    wait_until(lambda:page.stack.isPageReady(0) and window.pages.isPageReady(3))
+    wait_until(lambda:page.stack.isPageReady(0) and window.pages.isPageReady(2))
     page.reveal('notifications')
     assert page.page_loading.isVisible() and page.page_loading.state['running']
     assert not page.stack.isVisible() and page.navigation.isEnabled() and page.search.isEnabled()

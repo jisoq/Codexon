@@ -240,7 +240,7 @@ def test_analysis_bridge_preserves_failure_kind_and_request_id(monkeypatch):
 
 def test_cached_update_offer_does_not_resolve_a_failed_metadata_request():
     from PySide6.QtWidgets import QApplication
-    from cachemonitor.dashboard import Dashboard
+    from cachemonitor.dashboard import PAGE_INDEX, Dashboard
     from cachemonitor.update_panel import UpdatePanel
     app=QApplication.instance() or QApplication([])
     class Receiver:
@@ -283,7 +283,7 @@ def test_sidebar_errors_remain_visible_across_pages_and_do_not_show_main_banner(
         for page in (1,2,3,4,5):
             window.change_page(page)
             assert window.error_button.isVisible()
-            wait_for_rendered(lambda:window.pages.isPageReady(page-1) and not window.analysis_loading,timeout=5)
+            wait_for_rendered(lambda:window.pages.isPageReady(PAGE_INDEX[page]) and not window.analysis_loading,timeout=5)
             assert window.error_button.isVisible() and not window.analysis_loading
             view=scene_view(window,window.error_button);point=view.mapToScene(QPointF(0,0))
             assert point.x()<200 and point.y()>window.height()/2 and point.y()+view.height()<=window.height()

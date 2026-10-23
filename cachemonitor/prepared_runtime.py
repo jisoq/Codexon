@@ -18,7 +18,8 @@ from .analysis_delivery import ANALYSIS_IDLE_WAIT_SECONDS
 from .analysis_query_actor import QueryActor
 from .prepared_ingest import ModeEvidenceUnavailable,PreparedCohort, read_catalog
 from .prepared_ledger import PreparedLedger
-from .prepared_query import GenerationJournal,PreparedQuery, token_value, tuple_token
+from .prepared_changes import GenerationJournal
+from .prepared_query import PreparedQuery, token_value, tuple_token
 from .prepared_store import Limits,PreparedStore,WriteDeferred,ReadCancelled,StaleGeneration,CapacityExceeded
 from .quota_cycles import QuotaLedger
 from .usage_collection import CollectionClient, CollectionCatalogUnavailable
@@ -565,7 +566,7 @@ def process_main(connection,homes,index_path,model_evidence_path,quota_path,cach
                     if kind=='freeze':writer.freeze()
                     elif kind=='sync':writer.sync()
                     elif kind=='cache_floor':writer.set_cache_floor(message['value'])
-                    elif kind in ('query','record','population','overlay_detail','mismatch_page','mismatch_record'):
+                    elif kind in ('query','overlay_detail','mismatch_page','mismatch_record'):
                         pending[kind]=message
                         if kind=='query':
                             latest_query=message;blocked_query_token=None
@@ -594,10 +595,9 @@ def process_main(connection,homes,index_path,model_evidence_path,quota_path,cach
             if current is not None:
                 for kind,message in tuple(pending.items()):
                     if kind=='query' and blocked_query_token==tuple_token(current):continue
-                    requested=(message.get('prepared_token') if kind=='record' else
-                               message['summary'].get('_prepared_token') if kind=='overlay_detail' else None)
+                    requested=message['summary'].get('_prepared_token') if kind=='overlay_detail' else None
                     token=token_value(requested) if requested is not None else current
-                    consumer=detail_actor if kind in ('record','overlay_detail') else actor
+                    consumer=detail_actor if kind=='overlay_detail' else actor
                     consumer.submit(dict(message,_prepared_changes=journal.values()),token)
                     pending.pop(kind,None)
     finally:

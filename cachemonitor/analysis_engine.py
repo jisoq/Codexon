@@ -310,17 +310,11 @@ class AnalysisEngine:
             self.results.clear()
             self.page_results.clear()
             self.parts.discard(lambda key:key[0] not in updated or key[1]!=updated[key[0]]['revision'])
-            self.__dict__.pop('_explorer_projection',None)
-            self.__dict__.pop('_history_prepared',None)
             if calls_changed:
                 self.call_revision+=1
                 self.__dict__.pop('_category_projection',None)
         return changed
 
-    def record(self,home,sid,response_id):
-        state=self.sessions.get((home,sid))
-        found=state['records'].get(response_id) if state else None
-        return public_record(found[1]) if found else None
 
     def stat(self,rows,key,method='mean'):
         signature=(key,method,tuple(map(id,rows)))

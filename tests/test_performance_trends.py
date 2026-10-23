@@ -724,7 +724,7 @@ def test_dashboard_tab_worker_contract_and_navigation(tmp_path):
         assert w.query()['granularity']=='auto'
         assert w.engine.page_query(w.query())['performance']['granularity']=='auto'
         w.show()
-        wait_for_rendered(lambda:w.pages.isPageReady(4) and w.pages.isVisible(),timeout=5)
+        wait_for_rendered(lambda:w.pages.isPageReady(3) and w.pages.isVisible(),timeout=5)
         # Exercise one cold request per preset, then its cached reuse.
         w.async_mode=True;w.client_cache.clear()
         def loading_panels():

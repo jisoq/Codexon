@@ -89,59 +89,6 @@ def test_filter_choices_reuse_unchanged_histories_and_remove_corrected_values(mo
     assert len(publisher.choices)==1
 
 
-def test_superseded_record_and_population_requests_do_not_compute_obsolete_results(monkeypatch):
-    from cachemonitor import analysis_worker, dashboard_views
-    source=history();bridge=analysis_worker.AnalysisBridge([])
-    selected=(source['home'],source['id'],source['history'][-1]['key'])
-    for request in range(50):
-        bridge.request_record(request,selected)
-        bridge.request_population(request,request)
-    assert len(bridge.commands)==2
-    # Already transmitted requests need replacement inside the child too.
-    commands=[dict(kind='population',id=n,population=n) for n in range(49)]
-    commands+=list(bridge.commands);sent=[];computed=[]
-    monkeypatch.setattr(dashboard_views,'population_summary',lambda engine,population,assumptions:
-                        (computed.append(population),{'population':population})[1])
-    class Connection:
-        def poll(self,*args):
-            if args:raise EOFError
-            return bool(commands)
-        def recv(self):return commands.pop(0)
-        def send(self,value):sent.append(value)
-        def close(self):pass
-    snapshot=dict(ts=110,sessions=[source],homes=[],errors=[],unassigned=[],index={'loading':False})
-    analysis_worker.process_main(Connection(),[],None,static_snapshot=snapshot)
-    records=[value for value in sent if value['kind']=='record']
-    populations=[value for value in sent if value['kind']=='population']
-    assert [value['id'] for value in records]==[49]
-    assert records[0]['row']['key']==selected[-1]
-    assert [value['id'] for value in populations]==[49] and computed==[49]
-
-
-def test_detail_coalescing_keeps_snapshot_and_freeze_command_order(monkeypatch):
-    from cachemonitor import analysis_worker,dashboard_views
-    source=history();replacement=copy.deepcopy(source);replacement['title']='changed'
-    def snapshot(value):return dict(ts=110,sessions=[value],homes=[],errors=[],unassigned=[],index={'loading':False})
-    commands=[dict(kind='population',id=n,population=n) for n in (1,2)]
-    commands.append(dict(kind='replace',snapshot=snapshot(replacement)))
-    commands.extend(dict(kind='population',id=n,population=n) for n in (3,4))
-    commands.append(dict(kind='freeze'));sent=[];computed=[]
-    def compute(engine,population,assumptions):
-        title=next(iter(engine.sessions.values()))['prepared']['title']
-        computed.append((population,title));return {}
-    monkeypatch.setattr(dashboard_views,'population_summary',compute)
-    class Connection:
-        def poll(self,*args):
-            if args:raise EOFError
-            return bool(commands)
-        def recv(self):return commands.pop(0)
-        def send(self,value):sent.append(value)
-        def close(self):pass
-    analysis_worker.process_main(Connection(),[],None,static_snapshot=snapshot(source))
-    assert computed==[(2,source['title']),(4,'changed')]
-    assert [value['id'] for value in sent if value['kind']=='population']==[2,4]
-
-
 def test_unchanged_updates_new_calls_corrections_and_metadata_invalidate_precisely():
     source=history(); engine=AnalysisEngine()
     assert engine.ingest([source])
@@ -261,13 +208,10 @@ def test_process_queries_latest_selection_cache_and_clean_shutdown(tmp_path):
             worker_pending=w.worker.pending,worker_alive=bool(w.worker.process and w.worker.process.is_alive())))
     try:
         w.change_page(1);settle()
-        w.model.setCurrentIndex(0)
         assert w.metric_panel.data['summary']['value']==7
         w.nav.setCurrentRow(w.navigation_pages.index(1))
         w.metric_panel.change('filter:source','subagent')
         w.metric_panel.change('filter:source','')
-        w.change_page(2); settle()
-        assert w.record_view=='sessions' and w.table.rowCount()==1 and w.selected_session is None
         assert w.worker.process.pid is not None
         assert not w.analysis_errors
         count=w.worker_metrics['view_builds']
@@ -365,9 +309,9 @@ def test_active_session_parts_survive_more_sessions_than_query_lru():
     source=history()
     sessions=[dict(source,id=f'session-{i}',home=f'home-{i}') for i in range(2200)]
     engine=AnalysisEngine();engine.ingest(sessions)
-    first=engine.query(query(page=2,include_whole_history=False))
+    first=engine.query(query(page=1,include_whole_history=False))
     builds=engine.metrics['part_builds']
-    second=engine.query(query(page=2,now=111,end=111,include_whole_history=False))
+    second=engine.query(query(page=1,now=111,end=111,include_whole_history=False))
     assert engine.metrics['part_builds']==builds
     assert second['analysis']['totals']==first['analysis']['totals']
 
@@ -375,67 +319,27 @@ def test_active_session_parts_survive_more_sessions_than_query_lru():
 def test_live_revisions_release_obsolete_views_without_rebuilding_unchanged_sessions():
     source=history();other=copy.deepcopy(source);other['id']='other';other['home']='other-home'
     engine=AnalysisEngine();engine.ingest([source,other])
-    first=engine.page_query(query(page=2,presentation=True))
+    first=engine.page_query(query(page=1,presentation=True))
     builds=engine.metrics['part_builds']
     for i in range(12):
         changed=copy.deepcopy(source)
         changed['history'][0]['output']+=i+1
         changed['history'][0]['total']+=i+1
         engine.ingest([changed,other])
-        latest=engine.page_query(query(page=2,presentation=True))
+        latest=engine.page_query(query(page=1,presentation=True))
         assert latest['analysis']['response_count']==14
         assert engine.parts.weight<=16
         assert 0<engine.page_results.weight<=engine.page_results.rows
     assert engine.metrics['part_builds']==builds+12
     assert first['analysis']['totals']['cost']<latest['analysis']['totals']['cost']
-    assert engine.page_query(query(page=2,presentation=True)) is latest
-
-
-def test_filter_fields_include_later_values_and_exact_display_aliases():
-    from cachemonitor.analysis_records import available_fields
-    rows=[dict(session_ordinal=1,key='first',cost=None,model=None,turn='',
-               optional='미확인',details={}),
-          dict(session_ordinal=2,key='second',cost=0,model='known',turn='request',
-               optional=False,price_model='distinct',details=[])]
-    assert available_fields(rows)==['analysis_model','cache_degradation','call_id','cost',
-        'key','long_context','model','optional','price_assumed','price_model','request_id',
-        'session_ordinal','turn']
-
-
-def test_dashboard_projection_bounds_rows_and_preserves_drilldown():
-    import pickle
-    from cachemonitor.dashboard_views import resolve_population
-    source=history()
-    sessions=[dict(source,id=f's-{i}',home=f'home-{i}',title=f'Session {i}') for i in range(800)]
-    engine=AnalysisEngine();engine.ingest(sessions)
-    overview=engine.page_query(query(page=0,presentation=True))
-    assert overview['analysis']['response_count']==5600
-    assert 'responses' not in overview['analysis']
-    assert len(pickle.dumps(overview))<200_000
-    summary=overview['summaries'][0]
-    records=resolve_population(engine,summary['population'])
-    assert sum(r['cost'] for r in records)==pytest.approx(overview['overview']['total'])
-    q=query(page=2,presentation=True,explorer=dict(view='calls',search='',sort='cost_desc'),
-        table_windows={'records':{'start':500,'size':128},'parents':{'start':0,'size':64}})
-    from cachemonitor.history_projection import node_key
-    from cachemonitor.analytics import project_identity
-    q['explorer']['expanded']=[node_key('project',project_identity(source))]
-    projected=engine.page_query(q)['explorer']
-    assert projected['records']['total']==5600
-    assert projected['records']['start']==500 and len(projected['records']['rows'])==128
-    assert len(projected['parents']['rows'])==1 and 'sid' not in projected['parents']['rows'][0]
-    assert all('calls' not in row or not isinstance(row['calls'],list) for row in projected['records']['rows'])
-    q['explorer']['search']='Session 42'
-    found=engine.page_query(q)['explorer']
-    assert all('Session 42' in r['title'] for r in found['records']['rows'])
-    assert found['records']['total']<5600
+    assert engine.page_query(query(page=1,presentation=True)) is latest
 
 
 def test_worker_discards_superseded_result_before_sending(monkeypatch):
     from cachemonitor import analysis_worker
     source=history()
     snapshot=dict(ts=110,sessions=[source],homes=[],errors=[],unassigned=[],index={'loading':False})
-    messages=[dict(kind='query',id=1,logical='first',query=query(page=2))];sent=[]
+    messages=[dict(kind='query',id=1,logical='first',query=query(page=1))];sent=[]
     original=AnalysisEngine.page_query
     def compute(self,q):
         result=original(self,q)
@@ -457,7 +361,7 @@ def test_worker_discards_superseded_result_before_sending(monkeypatch):
 
 def test_projected_cache_expires_at_sliding_boundary_and_metadata_revision():
     engine=AnalysisEngine();source=history();engine.ingest([source])
-    q=query(page=2,presentation=True,period='30m',start=99,end=1899,now=1899)
+    q=query(page=1,presentation=True,period='30m',start=99,end=1899,now=1899)
     first=engine.page_query(q)
     assert first['analysis']['response_count']==7
     assert engine.page_query({**q,'now':1899.5,'end':1899.5,'start':99.5}) is first
@@ -466,10 +370,7 @@ def test_projected_cache_expires_at_sliding_boundary_and_metadata_revision():
     source=copy.deepcopy(source);source['title']='Renamed session';engine.ingest([source])
     renamed=engine.page_query(later)
     assert renamed['revision']!=first['revision']
-    from cachemonitor.history_projection import node_key
     from cachemonitor.analytics import project_identity
-    expanded={**later,'explorer':{'view':'sessions','project':project_identity(source)}}
-    assert engine.page_query(expanded)['explorer']['records']['rows'][0]['title']=='Renamed session'
     engine.ingest([])
     assert engine.page_query(later)['analysis']['response_count']==0
 

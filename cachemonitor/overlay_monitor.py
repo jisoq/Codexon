@@ -1,7 +1,6 @@
 """Single-column drawing and matching native hit regions."""
 import math
 from .charts import dynamic_bounds
-from .overlay_navigation import navigation_target
 from .overlay_data import main_usage
 from .overlay_layout import ColumnLayout, WIDTH, MARGIN, HEADER_Y
 

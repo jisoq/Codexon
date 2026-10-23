@@ -7,7 +7,7 @@ import sys
 
 from .analysis_records import compact_record
 from .overlay_data import OverlaySummaries, call_summary, _subagent_finance, SUBAGENT_CALL_FIELDS
-from .prepared_health import check_reference, hydrate_health
+from .prepared_health import check_reference
 from .prepared_store import CapacityExceeded, NotReady, RebuildRequired, _size, pack
 from .prepared_summary import recent_references, MAX_RECENT
 
@@ -339,8 +339,8 @@ def _hydrate_finance(snapshot, summary, owner, cache=None, *, reserved=0):
     return _subagent_finance(financial, summary['child_cost'])
 
 
-def hydrate_overlay(snapshot, summary, *, finance=False, health=False, finance_cache=None):
-    """Hydrate recent refs; add financial and health detail only on demand."""
+def hydrate_overlay(snapshot, summary, *, finance=False, finance_cache=None):
+    """Hydrate recent refs and add financial detail on demand."""
     owner = check_reference(snapshot, summary)
     if summary.get('_overlay_head'):
         owners={}
@@ -427,9 +427,6 @@ def hydrate_overlay(snapshot, summary, *, finance=False, health=False, finance_c
         financial = _hydrate_finance(snapshot, summary, owner, finance_cache, reserved=reserved)
         if financial is not None:
             result['subagent_finance'] = financial
-    if health and not result.get('_health_detail'):
-        result.update(hydrate_health(snapshot, owner))
-        result['_health_detail'] = True
     result_size = _size(result)
     if result_size > snapshot.limits.page_objects_bytes:
         raise CapacityExceeded('selected overlay exceeds the delivered object budget')
@@ -437,12 +434,3 @@ def hydrate_overlay(snapshot, summary, *, finance=False, health=False, finance_c
         finance_cache._workspace(snapshot.limits.page_objects_bytes, result_size)
     snapshot.check()
     return result
-
-
-def health_detail(summary, resolver):
-    """Consumer hook: resolve only selected detail, never a collapsed overlay."""
-    if not summary or not summary.get('_health_ref') or summary.get('_health_detail'):
-        return summary
-    if resolver is None:
-        raise NotReady('selected overlay health detail has not been requested')
-    return resolver(summary, health=True)

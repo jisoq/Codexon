@@ -298,27 +298,3 @@ class ComparisonChart(AnalyticalPlot):
             self.remember(rect,{'records':rows,'kind':'scatter_cell'},f'{len(rows):,}개 실제 표본')
         p.setPen(self.color('muted'));p.drawText(QRectF(left,0,w,22),Qt.AlignLeft,'비용')
         p.drawText(QRectF(left,self.height()-24,w,22),Qt.AlignRight,'소요시간')
-
-class TokenComposition(AnalyticalPlot):
-    """Two independent denominators; exact values remain readable below each bar."""
-    def __init__(self,side):
-        super().__init__();self.side=side;self.total=None;self.setFixedHeight(172 if side=='input' else 146)
-    def set_parts(self,parts):
-        self.total=parts.get('total')
-        labels={'ordinary':'일반 입력' if self.side=='input' else '추론 외','read':'캐시 읽기',
-                'write':'캐시 쓰기','reasoning':'추론','unclassified':'입력 미분류' if self.side=='input' else '출력 미분류'}
-        colors={'ordinary':'uncached' if self.side=='input' else 'output','read':'cached','write':'written','reasoning':'reasoning','unclassified':'unknown'}
-        order=('read','write','ordinary','unclassified') if self.side=='input' else ('reasoning','ordinary','unclassified')
-        self.set_rows([dict(key=k,label=labels[k],total=parts[k],color=colors[k]) for k in order if k in parts])
-    def paint(self,painter):
-        p=self.base();p.setPen(self.color('ink'))
-        title='입력' if self.side=='input' else '출력'
-        p.drawText(QRectF(0,0,self.width(),24),Qt.AlignLeft,title+', '+('미확인' if self.total is None else f'{self.total:,} 토큰'))
-        p.fillRect(QRectF(0,30,self.width(),14),self.color('secondary'));x=0
-        for i,row in enumerate(self.rows):
-            amount=row['total'];width=self.width()*amount/self.total if self.total else 0
-            if width:p.fillRect(QRectF(x,30,width,14),self.color(row['color']));x+=width
-            y=52+i*26;p.fillRect(QRectF(0,y+8,8,8),self.color(row['color']));p.setPen(self.color('ink'))
-            p.drawText(QRectF(16,y,self.width()*.43,24),Qt.AlignLeft|Qt.AlignVCenter,row['label'])
-            percentage=f'{100*amount/self.total:.1f}%' if self.total else '해당 없음' if self.total==0 else '미확인'
-            p.drawText(QRectF(self.width()*.4,y,self.width()*.6,24),Qt.AlignRight|Qt.AlignVCenter,f'{amount:,}, {percentage}')

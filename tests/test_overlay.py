@@ -56,7 +56,7 @@ def test_overlay_revisits_reuse_complete_sessions_and_reject_changed_or_removed_
     for sid in (A,B):
         value,pending=overlay_select(controller,summaries,sid)
         assert pending and value is None
-        assert requested[-1][1]==dict(health=False,finance=False)
+        assert requested[-1][1]==dict(finance=False)
         controller.receive_overlay_detail(overlay_reply(requested[-1]))
     summaries[A]=dict(summaries[A],_prepared_token=('test',2))
     controller.expanded=False
@@ -135,12 +135,12 @@ def test_overlay_detail_upgrade_reuses_recent_and_preserves_acquired_capabilitie
     controller,requested=overlay_cache_controller
     summaries={A:overlay_summary(A)}
     overlay_select(controller,summaries,A)
-    assert requested[-1][1]==dict(health=False,finance=False)
+    assert requested[-1][1]==dict(finance=False)
     controller.receive_overlay_detail(overlay_reply(requested[-1]))
     summaries[A]=dict(summaries[A],descendants=1)
     data,pending=overlay_select(controller,summaries,A)
     assert pending and data['cost']==3.5 and data['latest']['output']==100
-    assert requested[-1][1]==dict(health=False,finance=True)
+    assert requested[-1][1]==dict(finance=True)
     assert not requested[-1][0][1]['_recent_refs']
     finance={'cost':1.25,'agents':[{'home':'home','id':B,'cost':1.25}]}
     controller.receive_overlay_detail(overlay_reply(requested[-1],subagent_finance=finance))
@@ -190,29 +190,21 @@ def test_overlay_cached_owner_eviction_requires_a_fresh_read(overlay_cache_contr
     assert pending and value is None and len(requested)==10
 
 
-def test_overlay_finance_extension_preserves_health_and_does_not_repeat_rows(overlay_cache_controller):
-    from cachemonitor.overlay_navigation import NavigationTarget
+def test_overlay_finance_extension_reuses_hydrated_rows(overlay_cache_controller):
     controller,requested=overlay_cache_controller
     summaries={A:overlay_summary(A),B:overlay_summary(B)}
-    navigation=NavigationTarget('home',A,view='incident',event_id='incident')
-    controller._pending_overlay_navigation=navigation
-    resumed=[];controller.navigate_from_dashboard=resumed.append
     overlay_select(controller,summaries,A)
-    health={'events':[{'id':'incident'}]}
-    controller.receive_overlay_detail(overlay_reply(requested[-1],_health_detail=True,cache_degradation=health))
-    assert resumed==[navigation]
+    controller.receive_overlay_detail(overlay_reply(requested[-1]))
     summaries[A]=dict(summaries[A],descendants=1)
     overlay_select(controller,summaries,A)
     payload=requested[-1][0][1]
-    assert payload['_health_detail'] and payload['cache_degradation']==health
-    assert not payload['_recent_refs'] and requested[-1][1]['health'] is False
+    assert not payload['_recent_refs']
     finance={'cost':1.25,'agents':[{'home':'home','id':B,'cost':1.25}]}
     controller.receive_overlay_detail(overlay_reply(requested[-1],subagent_finance=finance))
     overlay_select(controller,summaries,B)
     controller.receive_overlay_detail(overlay_reply(requested[-1]))
     data,pending=overlay_select(controller,summaries,A)
-    assert not pending and data['subagent_finance']==finance and data['cache_degradation']==health
-    assert data['_health_detail'] and len(requested)==3
+    assert not pending and data['subagent_finance']==finance and len(requested)==3
 
 
 @pytest.mark.parametrize('fault',['query_failed','fatal'])

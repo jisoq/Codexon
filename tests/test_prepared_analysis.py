@@ -323,91 +323,6 @@ def test_canceled_reader_releases_transaction_and_does_not_poison_next_query(tmp
                 assert current.record(*OWNER, 'call-0')['cost'] == 1.
 
 
-@pytest.mark.parametrize('values', [
-    [1e16, 1., -1e16], [2**31, 0.25, 1.], [2**80, 1., -2**80],
-    [True, 0.1, False, 0.2], [-0., -0.], [float('inf'), -float('inf')],
-])
-def test_streamed_display_totals_preserve_builtin_sum_numeric_semantics(values):
-    from cachemonitor.prepared_sums import _Sum
-    total = _Sum()
-    for value in values:
-        total.add(value)
-    assert storage.pack(total.value()) == storage.pack(sum(values))
-
-
-def test_history_window_reuses_scalar_index_and_adopts_corrections(tmp_path, monkeypatch):
-    from copy import deepcopy
-    from cachemonitor.analysis_engine import AnalysisEngine
-    from cachemonitor.core import Session
-    from cachemonitor.prepared_analysis import PreparedAnalysisEngine
-    from cachemonitor.prepared_ingest import prepare_owner, stage_owner
-
-    sources = []
-    for sid, count in (('selected', 160), ('child', 3)):
-        session = Session(sid, 'home', title=sid, cwd='D:/project')
-        for index in range(count):
-            session.add_usage(100+index, f'{sid}-{index}',
-                dict(input_tokens=100+index, cached_input_tokens=20, output_tokens=10),
-                'gpt-6-astra', 'request', 'medium', service_tier='Standard')
-        source = deepcopy(session.view(300))
-        source.update(usage_revision=1, collection_complete=True,
-            turn_records={'request':dict(started_at=90, ended_at=280, state='완료')},
-            turn_states={'request':'완료'})
-        if sid == 'child':source['parent_thread_id'] = 'selected'
-        sources.append(source)
-    reference = AnalysisEngine()
-    reference.ingest(sources)
-    dependency = {name:1 for name in storage.DEPENDENCIES}
-    dependency['source_digest'] = '1'*64
-    query = dict(page=2, start=100, end=300, now=300, period='custom', presentation=True,
-        explorer=dict(session=['home', 'selected'], view='calls'),
-        table_windows={'records':dict(start=0, size=64)})
-    decoded = []
-    original_decode = storage.Snapshot._decode_call
-    def decode(view, row, metadata, **kwargs):
-        if not kwargs.get('metrics'):decoded.append(1)
-        return original_decode(view, row, metadata, **kwargs)
-    monkeypatch.setattr(storage.Snapshot, '_decode_call', decode)
-
-    with storage.PreparedStore(tmp_path/'history.sqlite') as store:
-        stage = store.begin(('history', 1))
-        for ordinal, source in enumerate(sources):
-            stage_owner(stage, prepare_owner(source, owns=lambda *_:True), dependency, ordinal)
-        token = stage.publish(('history', 1), ready=True)
-        engine = PreparedAnalysisEngine(store.path, token)
-        try:
-            actual, expected = engine.page_query(query), reference.page_query(query)
-            assert actual['explorer']['records'] == expected['explorer']['records']
-            assert actual['explorer']['parents'] == expected['explorer']['parents']
-            assert actual['analysis']['response_count'] == expected['analysis']['response_count'] == 163
-            assert actual['explorer']['group']['calls'] == 163
-
-            query = dict(query, table_windows={'records':dict(start=64, size=64)})
-            decoded.clear()
-            actual, expected = engine.page_query(query), reference.page_query(query)
-            assert actual['explorer']['records'] == expected['explorer']['records']
-            assert len(decoded) == len(actual['explorer']['records']['rows']) == 64
-
-            corrected = deepcopy(sources[0])
-            corrected['history'][70]['input'] += 400
-            corrected['usage_revision'] = 2
-            sources[0] = corrected
-            reference.ingest(sources)
-            stage = store.begin(('history', 2))
-            stage_owner(stage, prepare_owner(corrected, owns=lambda *_:True),
-                        {**dependency, 'source_digest':'2'*64}, 0)
-            token = stage.publish(('history', 2), ready=True)
-            engine.adopt(token, [('home', 'selected')])
-            decoded.clear()
-            actual, expected = engine.page_query(query), reference.page_query(query)
-            assert actual['explorer']['records'] == expected['explorer']['records']
-            assert actual['explorer']['parents'] == expected['explorer']['parents']
-            assert actual['explorer']['summary'] == expected['explorer']['summary']
-            assert len(decoded) == len(actual['explorer']['records']['rows']) == 64
-        finally:
-            engine.close()
-
-
 def test_prepared_subagent_finance_matches_full_and_moves_with_lineage():
     from types import SimpleNamespace
     from cachemonitor.analysis_engine import AnalysisEngine
@@ -634,16 +549,6 @@ def test_ready_store_publishes_without_eager_descendant_finance_within_budget(tm
             loaded.clear()
             assert hydrate_overlay(view, actual, finance=True) == actual
             assert loaded == [] and requested == []
-            health_reads = []
-            original_health = prepared_overlays.hydrate_health
-            def selected_health(snapshot, owner):
-                health_reads.append(owner)
-                return original_health(snapshot, owner)
-            monkeypatch.setattr(prepared_overlays, 'hydrate_health', selected_health)
-            with_health = hydrate_overlay(view, actual, health=True)
-            assert health_reads == [('home', 'owner-0')]
-            assert hydrate_overlay(view, with_health, health=True, finance=True) == with_health
-            assert health_reads == [('home', 'owner-0')] and requested == []
             loaded.clear()
             direct=hydrate_overlay(view,selected,finance=True)
             assert direct['subagent_finance']==expected['subagent_finance']
@@ -1359,11 +1264,6 @@ def test_preparation_upgrade_finishes_groups_before_queries_and_retains_model_ev
                     row = view.record(*owner, source['id']+'-call')
                     assert (row['effort'], row['requested_model'], row['response_model'], row['model_match']) == (
                         'high', 'gpt-6-astra', 'gpt-6-astra', '일치')
-            with closing(PreparedAnalysisEngine(path, store.token)) as engine:
-                result = engine.page_query(dict(page=2, start=0, end=200, now=200, period='custom',
-                    presentation=True, explorer=dict(session=[sources[0]['home'], 'first'], view='calls')))
-                assert result['analysis']['response_count'] == 2
-                assert result['explorer']['group']['calls'] == 1
             final = store.token
         with storage.PreparedStore(path) as store:
             assert list(prepared_ingest.PreparedCohort(store, client, None).convert(catalog, cohort_size=1)) == []

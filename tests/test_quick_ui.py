@@ -125,51 +125,6 @@ def test_blocked_choice_updates_still_reach_the_qml_control():
     finally:dispose(host)
 
 
-def test_quick_pages_keep_scroll_and_render_model_evidence(tmp_path):
-    app=QApplication.instance() or QApplication([])
-    previous=app.property('cachemonitorDisableShellIntegration')
-    app.setProperty('cachemonitorDisableShellIntegration',True)
-    window=Dashboard([],start_worker=False,settings=QSettings(str(tmp_path/'quick.ini'),QSettings.IniFormat))
-    now=time.time();session=Session('quick','fixture',title='QML regression')
-    for i in range(250):
-        session.add_usage(now-300+i,str(i),{'input_tokens':5000,'cached_input_tokens':4000,
-            'cache_write_input_tokens':0,'output_tokens':100},'gpt-6-astra','turn','high',service_tier='Standard')
-    source=session.view(now);source['turn_states']={'turn':'완료'}
-    source['history'][-1].update(requested_model='gpt-6-astra',response_model='gpt-6-astra',model_match='일치')
-    source['history'][-2].update(requested_model='gpt-6-astra',response_model='gpt-5.6-sol',model_match='불일치')
-    source['history'][-3].update(requested_model='gpt-6-astra',response_model=None)
-    snapshot={'ts':now,'sessions':[source],'homes':[],'errors':[],'unassigned':[]}
-    try:
-        window.receive(snapshot);window.change_page(2);window.show();QTest.qWait(100)
-        from cachemonitor.dashboard import choose
-        window.record_view='calls';window.render_explorer();QTest.qWait(40)
-        window.extra_column_controls['response_model'].setChecked(True);QTest.qWait(40)
-        response_column=window.table.model().headers.index('응답 모델')
-        assert response_column==7
-        assert '호출 소요시간' not in window.table.model().headers and '관측 상태' not in window.table.model().headers
-        assert window.table.item(0,response_column).text()=='gpt-6-astra'
-        assert window.table.item(1,response_column).text()=='gpt-5.6-sol'
-        table=table_view(window,window.table);table.setProperty('contentY',1800);QTest.qWait(40)
-        before=table.property('contentY')
-        wheel(window,window.table,-120);QTest.qWait(20)
-        assert table.property('contentY')>before
-        wheel(window,window.table,120);QTest.qWait(20)
-        assert table.property('contentY')==before
-        for page in (3,1,5,2):window.change_page(page);QTest.qWait(40)
-        assert table_view(window,window.table).property('contentY')==before
-        window.receive(snapshot);QTest.qWait(40)
-        assert table_view(window,window.table).property('contentY')==before
-        window.table.verticalScrollBar().setValue(0);QTest.qWait(40)
-        click_row(window,window.table,1);QTest.qWait(40)
-        assert 'gpt-5.6-sol' in window.detail_sections['conditions'][1].text()
-        assert window.detail_scroll.isVisible() and not window.table.isVisible()
-        window.close_record_detail();assert window.table.isVisible()
-        assert window.selected_call_scope==('fixture','quick')  # global calls retain exact owning scope
-        assert not window.qml_errors,window.qml_errors
-    finally:
-        window.quit_app();app.setProperty('cachemonitorDisableShellIntegration',previous)
-
-
 @pytest.mark.integration
 @pytest.mark.parametrize('mode',['light','dark'])
 def test_common_control_roles_keep_keyboard_selection_and_disabled_behavior(tmp_path,mode):

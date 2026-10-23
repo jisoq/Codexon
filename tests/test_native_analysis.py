@@ -1,3 +1,4 @@
+from cachemonitor.analysis_records import public_record
 """Ingest bookkeeping must retain original ownership and object identity."""
 from copy import deepcopy
 
@@ -57,7 +58,7 @@ def test_ingest_revision_fast_path_and_corrected_historical_usage(backend):
     source.update(usage_revision=1, collection_complete=True)
     engine = AnalysisEngine()
     assert engine.ingest([source])
-    first = engine.record('home', 'session', 'response')
+    first = public_record(engine.sessions[('home','session')]['records']['response'][1])
     assert first['input'] == 100 and first['cached'] == 80
     metrics = dict(engine.metrics)
     assert not engine.ingest([dict(source)])
@@ -66,17 +67,17 @@ def test_ingest_revision_fast_path_and_corrected_historical_usage(backend):
     corrected['usage_revision'] = 2
     corrected['history'][0].update(input=120, uncached=40, ordinary_input=40, total=140)
     assert engine.ingest([corrected])
-    record = engine.record('home', 'session', 'response')
+    record = public_record(engine.sessions[('home','session')]['records']['response'][1])
     assert record['input'] == 120 and record['cached'] == 80 and record['total'] == 140
     assert record['call_id'] == 'response' and record['session_ordinal'] == 1
     pending=dict(source,id='a',collection_complete=False,_collection_pending=True)
     engine.ingest([pending,corrected])
-    assert engine.record('home','session','response')['input']==120
-    assert engine.record('home','a','response') is None
+    assert public_record(engine.sessions[('home','session')]['records']['response'][1])['input']==120
+    assert 'response' not in engine.sessions[('home','a')]['records']
     # Once confirmed, the normal deterministic owner rule applies again.
     engine.ingest([dict(pending,_collection_pending=False),corrected])
-    assert engine.record('home','a','response')['input']==100
-    assert engine.record('home','session','response') is None
+    assert public_record(engine.sessions[('home','a')]['records']['response'][1])['input']==100
+    assert 'response' not in engine.sessions[('home','session')]['records']
 
 
 def test_recent_request_boundaries_match_full_scan_after_corrections(backend):

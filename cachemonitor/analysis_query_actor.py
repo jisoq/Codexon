@@ -12,7 +12,7 @@ import time
 from .analysis_engine import retained_bytes
 
 
-KINDS = frozenset(('query', 'record', 'population', 'overlay_detail', 'mismatch_page', 'mismatch_record'))
+KINDS = frozenset(('query', 'overlay_detail', 'mismatch_page', 'mismatch_record'))
 RESULT_BYTES = 64 * 1024 * 1024
 OVERLAY_COMPLETIONS = 8
 
@@ -54,7 +54,7 @@ class QueryActor:
                 active_kind, active_serial, active_message, active_token, cancel = self.active
                 if active_kind == kind:
                     cancel.set()
-                elif kind in ('record','overlay_detail','mismatch_record') and active_kind == 'query':
+                elif kind in ('overlay_detail','mismatch_record') and active_kind == 'query':
                     # Exact keyboard selection can interrupt a large page. Retry
                     # that page only while it is still this consumer's latest.
                     cancel.set()
@@ -102,7 +102,6 @@ class QueryActor:
                     if self.stopping:
                         return
                     kind = ('mismatch_record' if 'mismatch_record' in self.pending else
-                            'record' if 'record' in self.pending else
                             'overlay_detail' if 'overlay_detail' in self.pending else next(iter(self.pending)))
                     serial, message, token = self.pending.pop(kind)
                     cancel = Event()

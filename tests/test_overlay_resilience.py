@@ -34,7 +34,6 @@ def test_long_line_partial_tail_truncation_and_same_path_replacement(tmp_path):
 @pytest.mark.skipif(sys.platform!='win32',reason='Owned native Windows windows')
 def test_unrelated_partial_log_keeps_native_overlay_visible_and_navigation_disabled(tmp_path,monkeypatch):
     from cachemonitor.overlay_windows import SelectionTracker,WindowsOverlay
-    from cachemonitor.overlay_navigation import NavigationTarget
     from test_ui import wait_for_rendered
     app=QApplication.instance() or QApplication([])
     root=tmp_path/'Codex'/'Logs';path=logfile(root);path.write_text(route(A),encoding='utf-8')
@@ -59,8 +58,6 @@ def test_unrelated_partial_log_keeps_native_overlay_visible_and_navigation_disab
         wait_for_rendered(lambda:not controller.selection_confirmed(),timeout=3)
         assert controller.widget.isVisible() and controller.widget.data['id']==A
         assert not controller.target_state['confirmed']
-        assert not controller.navigation_availability('home',A)['enabled']
-        assert not controller.navigate_from_dashboard(NavigationTarget('home',A))['enabled'] and not activated
         assert native.confirm_selection(target) is None
         with path.open('ab') as stream:stream.write(b'\n')
         wait_for_rendered(lambda:controller.selection_confirmed(),timeout=3)

@@ -119,8 +119,6 @@ class ChromeModel(Node):
     def restorePanel(self): self.restoreRequested.emit()
 
 
-
-
 class OverlayChrome(QuickHost):
     collapse = Signal()
     restore = Signal()
@@ -203,7 +201,6 @@ class OverlayChrome(QuickHost):
         self.view.put(title=title)
 
 
-
     def begin_interaction(self):
         self.interaction_started.emit()
         self.activateWindow()
@@ -282,18 +279,16 @@ class OverlayChrome(QuickHost):
 
 
 class NavigationModel(Node):
-    navigationRequested=Signal(object)
     escapeRequested=Signal()
     def __init__(self,content):
-        super().__init__();self.content=content;self.targets={};self.captured=None
+        super().__init__();self.content=content;self.captured=None
     @Slot()
     def escapePanel(self):self.escapeRequested.emit()
     def link_state(self,links):
         self.inspections={link['id']:link['hoverCall'] for link in links if link.get('hoverCall')}
         self.interactions={link['id']:link.get('interaction','navigate') for link in links}
-        self.targets={link['id']:link['target'] for link in links if link.get('target')}
         self.actions={link['id']:link['action'] for link in links if link.get('action')}
-        return [{k:v for k,v in link.items() if k!='target'} for link in links]
+        return links
     @Slot(str,bool)
     def hoverLink(self,key,entered):
         identity=getattr(self,'inspections',{}).get(key)
@@ -307,7 +302,7 @@ class NavigationModel(Node):
         self.content.update()
     @Slot(str)
     def captureNavigation(self,key):
-        self.captured=self.targets.get(key) or getattr(self,'actions',{}).get(key)
+        self.captured=getattr(self,'actions',{}).get(key)
         self.captured_interaction=getattr(self,'interactions',{}).get(key,'navigate')
         self.captured_scope=((self.content.data or {}).get('home'),(self.content.data or {}).get('id'))
     @Slot()
@@ -315,8 +310,6 @@ class NavigationModel(Node):
         target,self.captured=self.captured,None;data=self.content.data or {}
         if getattr(self,'captured_scope',None)!=(data.get('home'),data.get('id')):return
         if isinstance(target,str):self.content.monitor_action(target);return
-        if target and (target.home,target.sid) in [tuple(v) for v in data.get('members',[(data.get('home'),data.get('id'))])]:
-            self.navigationRequested.emit(target)
     @Slot(str)
     def activateLink(self,key):self.captureNavigation(key);self.activateNavigation()
 
@@ -333,9 +326,7 @@ class DetailModel(NavigationModel):
     def detailBody(self): return self.content.detailBody
 
     def sync(self):
-        from .overlay_navigation import navigation_target
         links=self.link_state(self.content.detail_links())
-        self.targets['session']=navigation_target(self.content.data,'session')
         self.put(**self.content.state,detailLinks=links)
 
     @Slot(str)
@@ -378,7 +369,6 @@ class OverlayDetail(QuickHost):
         self.activateWindow()
         self.quick.setFocus(Qt.MouseFocusReason)
         self.quick.quickWindow().contentItem().forceActiveFocus(Qt.MouseFocusReason)
-
 
 
     def closeEvent(self, event):

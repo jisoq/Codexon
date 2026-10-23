@@ -21,3 +21,11 @@ def test_details_keyboard_toggle_preserves_expansion_and_escapes_data():
     QTest.keyClick(host.quick,Qt.Key_Space)
     assert not details.content.isVisible()
     dispose(host)
+
+
+def test_duration_preserves_precision_and_missing_values():
+    from cachemonitor.ui_details import history_duration
+    assert history_duration(None)=='—'
+    assert history_duration(0)=='0.00초'
+    assert history_duration(62.345)=='1분 2.34초'
+    assert history_duration(3662.34)=='1시간 1분 2.34초'

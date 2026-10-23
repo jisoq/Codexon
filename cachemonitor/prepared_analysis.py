@@ -162,10 +162,6 @@ class PreparedAnalysisEngine(AnalysisEngine):
                   +sum(weight for key,weight in weights.items() if key not in removed)+sum(differences.values()))
         if admitted>self.OWNER_BYTES:
             raise CapacityExceeded('prepared query metadata adoption exceeds its aggregate budget')
-        history=getattr(self,'_prepared_history_projection',None)
-        keep_history=history is not None and same_order and history.unaffected(self,pending,removed)
-        saved_page=self.page_results.get(history.page_key) if keep_history else None
-        if not keep_history:self.clear_history_projection()
         self.token = token
         self.order_identity=order_identity
         self.publication_batch=publication_batch
@@ -176,8 +172,6 @@ class PreparedAnalysisEngine(AnalysisEngine):
         affected=set(pending)|{tuple(key) for key in removed}
         self.parts.discard(lambda key:key[0] in affected)
         self.page_results.clear()
-        for name in ('_explorer_projection', '_history_prepared'):
-            self.__dict__.pop(name, None)
         if not same_facts:
             for name in ('_category_projection','performance','_trend_catalog','_trend_bounds'):
                 self.__dict__.pop(name,None)
@@ -209,15 +203,6 @@ class PreparedAnalysisEngine(AnalysisEngine):
         self.owner_bytes=admitted
         self.sessions = OrderedDict(sorted(self.sessions.items(), key=lambda pair:pair[1]['owner_ordinal']))
         self.internal_sessions = OrderedDict(sorted(self.internal_sessions.items(), key=lambda pair:pair[1]['owner_ordinal']))
-        if keep_history:
-            history.adopt(self)
-            if saved_page is not None:
-                value,deadline=saved_page
-                value=dict(value,key=history.head['key'],revision=self.revision)
-                cached=(value,deadline)
-                self.page_results.put(history.page_key,cached,
-                    retained_bytes((history.page_key,cached),self.page_results.rows))
-
     @contextmanager
     def read_scope(self):
         if self.snapshot is not None:
@@ -231,18 +216,9 @@ class PreparedAnalysisEngine(AnalysisEngine):
                 self.snapshot = None
 
     def close(self):
-        self.clear_history_projection()
         if hasattr(self, 'reader'):
             self.reader.close()
 
-    def clear_history_projection(self):
-        from .prepared_history import close_for_engine
-        close_for_engine(self)
-
-    def history_project(self, q):
-        from .prepared_history import project
-        with self.read_scope():
-            return project(self, q)
 
     def query(self, q):
         with self.read_scope():
@@ -252,11 +228,6 @@ class PreparedAnalysisEngine(AnalysisEngine):
         with self.read_scope():
             return super().page_query(q)
 
-    def record(self, home, sid, key):
-        if (home, sid) not in self.sessions:
-            return None
-        with self.read_scope():
-            return self.snapshot.record(home, sid, key)
 
     def _pages(self, method, *args, **kwargs):
         after = None
@@ -409,25 +380,6 @@ class PreparedAnalysisEngine(AnalysisEngine):
                     (not mode or display_tier(row) == mode)):
                     yield row
 
-    def whole_request_calls(self, owner, turn):
-        with self.read_scope():
-            for row in self.snapshot.iter_calls(owner, turn=turn):
-                self.read_metrics['whole_rows'] += 1
-                yield compact_record(row)
-
-    def request_positions(self, owner, turns):
-        result = {}
-        with self.read_scope():
-            for selected in batches(dict.fromkeys(turns)):
-                for header in self._pages(self.snapshot.request_headers, owner, selected):
-                    result[header['key']] = (header['display_ordinal'] or None,
-                        header['effective_at'] if header['effective_at'] is not None else float('inf'))
-                    self.read_metrics['header_rows'] += 1
-        return result
-
-    def unlinked_total(self, owner):
-        with self.read_scope():
-            return self.snapshot.unlinked_count(owner)
 
     def performance_input(self, query, width, granularity):
         from .prepared_performance import performance_input

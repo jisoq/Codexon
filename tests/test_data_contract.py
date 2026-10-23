@@ -1,3 +1,4 @@
+from cachemonitor.analysis_records import public_record
 """Regression cases for the shared dashboard/overlay observation contract."""
 import copy
 import json
@@ -192,4 +193,4 @@ def test_partial_sums_weighted_cache_and_whole_lookup_stay_shared():
     assert summary==full['summary'] and summary['cache']['value']==95
     assert len(result['lookup']['whole_turns'][('home','s','turn')])==2
     assert len(result['analysis']['responses'])==1
-    assert engine.record('home','s','0')['session_ordinal']==1
+    assert public_record(engine.sessions[('home','s')]['records']['0'][1])['session_ordinal']==1

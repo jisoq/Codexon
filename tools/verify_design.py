@@ -99,37 +99,21 @@ def main():
                 if state['kind'] in ('button','choice','input','switch','toggle') and item.height()<34:
                     report['layout_errors'].append(dict(view=name,kind=state['kind'],text=state['text'],height=item.height()))
         try:
-            assert window.nav.count()==3 and window.quota_service is None
+            assert window.nav.count()==5 and window.quota_service is None
             window.setAttribute(Qt.WA_ShowWithoutActivating);window.show()
             for theme in ('light','dark','codex'):
                 window.settings.setValue('ui/theme',theme)
                 shared_theme().configure(theme)
                 for width,height in ((1120,760),(1440,940)):
                     window.resize(width,height);prefix=f'{theme}-{width}'
-                    for page,name in ((3,'quota'),(1,'comparison'),(5,'performance'),(2,'calls'),(4,'settings')):
+                    for page,name in ((3,'quota'),(1,'comparison'),(5,'performance'),(7,'mismatch'),(4,'settings')):
                         if page==4:window.open_settings()
                         else:window.change_page(page)
                         capture(prefix+'-'+name);check_layout(prefix+'-'+name)
                         if theme!='codex':assert shared_theme().dark==(theme=='dark')
                         if page==1:
                             window.metric_panel.change('dimension','model');settle();capture(prefix+'-model-comparison')
-                        if page==2:
-                            state=window.capture_state()
-                            assert window.record_view=='sessions' and window.table.rowCount()==10
-                            click_row(window,window.table,0);settle();assert window.record_view=='requests'
-                            capture(prefix+'-requests')
-                            request=window.record_rows[0];click_row(window,window.table,0);settle()
-                            assert window.record_view=='calls' and window.table.rowCount()==request['responses']
-                            capture(prefix+'-calls')
-                            table=table_view(window,window.table);table.forceActiveFocus()
-                            QTest.keyClick(window.quick,Qt.Key_Home);QTest.keyClick(window.quick,Qt.Key_Return);settle()
-                            assert window.selected_call and window.detail_scroll.isVisible()
-                            capture(prefix+'-call-detail')
-                            window.detail_scroll.ensureWidgetVisible(window.detail_sections['evidence'][0])
-                            capture(prefix+'-call-evidence')
-                            window.restore_state(state);settle()
-                            report['interactions'].append(dict(size=width,theme=theme,sequential_records=True,keyboard_detail=True))
-                        elif page==3:
+                        if page==3:
                             panel=window.quota_panel
                             capture(prefix+'-quota-weekly-cost')
                             if panel.intervals.rowCount():panel.intervals.selectRow(0)

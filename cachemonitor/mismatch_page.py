@@ -4,7 +4,7 @@ from PySide6.QtCore import Qt
 
 from .analytics import call_identity
 from .dashboard_presentation import RecordFields
-from .history_navigation import history_duration
+from .ui_details import history_duration
 from .i18n import Verbatim, tr
 from .mismatch_history import COLUMNS
 from .presentation import Button, Column, Group, Row, Scroll, Text
