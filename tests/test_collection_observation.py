@@ -204,3 +204,46 @@ def test_reused_process_identity_and_retired_instance_cannot_refresh_a_publicati
     assert case.observer.observe()['collection_snapshot_at']==110
     case.publish(120,2,instance='current')
     assert case.observer.observe()['collection_snapshot_at'] is None
+
+
+def test_published_read_fault_reaches_dashboard_while_analysis_is_held(publication,tmp_path,app):
+    from PySide6.QtCore import QCoreApplication,QEvent,QSettings
+    from cachemonitor.dashboard import Dashboard
+    from cachemonitor.overlay import OverlayController
+    case=publication;now=time.time()
+    settings=QSettings(str(tmp_path/'settings.ini'),QSettings.IniFormat)
+    window=Dashboard(case.writer.homes,start_worker=False,live_limits=False,collection_autostart=False,
+                     index_path=case.writer.path,settings=settings)
+    overlay=OverlayController(settings,native_enabled=False)
+    window.overlay=overlay
+    try:
+        window.tick.stop();window.notification_master.setChecked(False)
+        analysis={**window.snapshot,'ts':now-1,'usage_collection_complete':True,
+                  'collection_fault':{},'usage_errors':[]}
+        window.receive(analysis)
+        case.publish(now,1,collection_fault=dict(read_failed=True),usage_errors=['Read failed'])
+        window.receive_collection_observation(case.observer.observe())
+        assert 'collection.source' in window.error_state.sources
+        assert 'collection.observer' not in window.error_state.sources
+        assert overlay.collection_phase()=='failed'
+        assert window.snapshot['ts']==now-1
+        held={**analysis,'ts':now,'collection_fault':dict(read_failed=True),'usage_errors':['Read failed']}
+        window.receive(held)
+        window.receive_collection_status(dict(collection_fault=dict(start_failed=True)))
+        case.publish(now+1,2,collection_fault={})
+        window.receive_collection_observation(case.observer.observe())
+        assert 'collection.source' not in window.error_state.sources
+        assert 'collection.service' in window.error_state.sources
+        assert overlay.collection_phase()=='failed'
+        window.receive_collection_status(dict(collection_fault={},collection_healthy=True))
+        window.receive(held)
+        window.refresh_home_status()
+        assert 'collection.source' not in window.error_state.sources
+        assert overlay.collection_phase()=='ready'
+        assert window.quota_panel.collection_phase=='ready'
+        assert window.snapshot['collection_fault']==dict(read_failed=True)
+    finally:
+        window.quit_app()
+        wait_until(app,lambda:window.quitting and window.shutdown_operation is None and window._quick is None)
+        window.close();window.deleteLater()
+        QCoreApplication.sendPostedEvents(None,QEvent.DeferredDelete)
