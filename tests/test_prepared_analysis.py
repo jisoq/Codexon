@@ -1202,7 +1202,7 @@ def test_startup_check_recovers_only_reported_corruption(tmp_path, monkeypatch, 
         assert path.read_bytes() == before
 
 
-def test_startup_check_deadline_does_not_replace_a_healthy_cache(tmp_path, monkeypatch):
+def test_slow_startup_check_reuses_a_healthy_cache(tmp_path, monkeypatch):
     from types import SimpleNamespace
 
     path = tmp_path/'analysis.sqlite'
@@ -1210,15 +1210,13 @@ def test_startup_check_deadline_does_not_replace_a_healthy_cache(tmp_path, monke
         original = publish(store, 1, calls())
         store.db.execute('CREATE TABLE health_rows(value INTEGER)')
         store.db.executemany('INSERT INTO health_rows VALUES(?)', ((i,) for i in range(2000)))
-    before = path.read_bytes()
     moments = iter((0., 11.))
     with monkeypatch.context() as patch:
         patch.setattr(storage, 'time', SimpleNamespace(monotonic=lambda:next(moments, 11.)))
-        with pytest.raises(TimeoutError, match='integrity check exceeded'):
-            storage.PreparedStore(path)
-    assert path.read_bytes() == before
-    with storage.PreparedStore(path) as store:
-        assert store.token == original
+        with storage.PreparedStore(path) as store:
+            assert store.token == original
+    with storage.PreparedReader(path) as reader, reader.pin(original) as view:
+        assert [view.record(*OWNER, row['key']) for row in calls()] == calls()
 
 
 def test_known_old_format_regenerates_atomically_and_preserves_other_stores(tmp_path, monkeypatch):
