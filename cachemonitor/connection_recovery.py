@@ -27,18 +27,17 @@ def target(home=None, directory=None, url=None,*,index=None):
         directory=Path(paths['evidence_path']).parent
     directory = Path(directory) if directory else default_path().parent
     state = read_json(directory / 'model-observer.json')
-    home = Path(home or state.get('home') or os.environ.get('CODEX_HOME') or Path.home()/'.codex')
-    url = url or (state.get('url') if state.get('home') == home_key(home) else None) or URL
-    parsed = urlsplit(url)
+    home = Path(home or state.get('home') or selected)
+    manager=ObserverManager(home,directory,url or (state.get('url') if state.get('home') == home_key(home) else None) or URL)
+    from .retired_cache import select_route
+    select_route(manager,index or (paths.get('index_path') if manager.home.resolve()==Path(selected).resolve() else None),url=url)
+    parsed = urlsplit(manager.url)
     if (parsed.scheme != 'http' or parsed.hostname != '127.0.0.1' or not parsed.port
             or parsed.username or parsed.password or parsed.path not in ('', '/')
             or parsed.query or parsed.fragment):
         raise ValueError('Codexon 로컬 프록시 주소가 아닙니다. 설정을 변경하지 않았습니다.')
-    manager=ObserverManager(home,directory,url)
     if paths.get('evidence_path') and Path(paths['evidence_path']).parent.resolve()==directory.resolve():
         manager.evidence=Path(paths['evidence_path']).resolve()
-    from .retired_cache import select_route
-    select_route(manager,index or (paths.get('index_path') if manager.home.resolve()==Path(selected).resolve() else None))
     return manager
 
 
@@ -131,80 +130,204 @@ def restore(manager):
     detail='진행 중인 작업을 확인한 뒤 Codex를 완전히 종료하고 다시 여세요. 통신 성공 여부는 재시작 후 확인됩니다.'
     if status.get('cleanup_warning'):
         detail+=' 예약 작업 해제가 완료되지 않았습니다. 이 도구에서 복원을 다시 실행해 주세요.'
-    return dict(code='restored', title='연결 설정 복원 완료',detail=detail)
+    return dict(code='restored', title='연결 설정 복원 완료',detail=detail,
+                can_recover=bool(status.get('cleanup_warning')),cleanup_warning=status.get('cleanup_warning'))
 
 
 class RecoveryWindow:
     def __init__(self, manager):
         import tkinter as tk
-        from tkinter import ttk
+        from tkinter import font, ttk
         self.manager = manager
         self.root = tk.Tk()
         self.root.title(tr('Codexon 연결 복구'))
-        self.root.geometry('580x310')
+        self.root.iconbitmap(str(Path(__file__).resolve().parents[1]/'icons'/'Codexon.ico'))
+        self.root.geometry('600x340')
         self.root.minsize(480, 280)
-        self.root.configure(bg='#f5f6f8')
+        self.root.configure(bg='#F3F5F7')
         self.messages = queue.Queue()
-        self.busy = False
+        self.operation = None
         self.result = None
+        self.recheck_timer = None
         style = ttk.Style(self.root)
         if 'vista' in style.theme_names():style.theme_use('vista')
-        style.configure('TButton', font=('맑은 고딕', 11), padding=(12, 8))
-        frame = tk.Frame(self.root, bg='#f5f6f8', padx=24, pady=24)
+        self.body_font = font.nametofont('TkDefaultFont').copy()
+        self.body_font.configure(size=10)
+        self.heading_font = self.body_font.copy()
+        self.heading_font.configure(size=15, weight='bold')
+        style.configure('Recovery.TButton', font=self.body_font, padding=(12, 7))
+        style.configure('Recovery.TEntry', font=self.body_font, padding=5)
+        frame = tk.Frame(self.root, bg='#F3F5F7', padx=24, pady=20)
         frame.pack(fill='both', expand=True)
-        self.title = tk.Label(frame, text=tr('연결 상태 확인 중…'), bg='#f5f6f8', fg='#18212c',
-                              font=('맑은 고딕', 16, 'bold'), anchor='w', justify='left', wraplength=510)
-        self.title.pack(fill='x')
-        self.detail = tk.Label(frame, text=tr('인터넷이나 Codexon 본체 없이 복구할 수 있습니다.'), bg='#f5f6f8',
-                               fg='#475365', font=('맑은 고딕', 11), anchor='nw', justify='left', wraplength=510)
-        self.detail.pack(fill='both', expand=True, pady=(14, 16))
-        self.button = ttk.Button(frame, text=tr('직접 연결로 복원'), command=self.recover)
-        self.button.pack(anchor='w')
+        frame.columnconfigure(0,weight=1)
+        frame.rowconfigure(0,weight=1)
+        card = tk.Frame(frame,bg='white',highlightbackground='#DDE3EA',highlightthickness=1)
+        card.grid(row=0,column=0,sticky='nsew')
+        card.columnconfigure(2,weight=1)
+        card.rowconfigure(0,weight=1)
+        self.accent = tk.Frame(card,bg='#3769A0',width=4)
+        self.accent.grid(row=0,column=0,sticky='ns')
+        self.icon = tk.Label(card,bg='white',fg='#3769A0',font=('Segoe UI Symbol',20,'bold'),width=2,anchor='n')
+        self.icon.grid(row=0,column=1,sticky='n',padx=(12,4),pady=16)
+        self.diagnosis = tk.Text(card,bg='white',fg='#18212C',font=self.body_font,wrap='word',
+            borderwidth=0,highlightthickness=0,padx=0,pady=0,height=4,width=1,
+            cursor='xterm',takefocus=True,exportselection=False)
+        self.diagnosis.grid(row=0,column=2,sticky='nsew',padx=(0,16),pady=18)
+        self.diagnosis.tag_configure('heading',font=self.heading_font,spacing3=12)
+        self.diagnosis.tag_configure('detail',foreground='#475365',spacing1=2,spacing3=4)
+        self.scrollbar = ttk.Scrollbar(card,orient='vertical',command=self.diagnosis.yview)
+        self.diagnosis.configure(yscrollcommand=self.scroll_detail)
+        tk.Label(frame,text=tr('Codex 설정 파일'),bg='#F3F5F7',fg='#475365',font=self.body_font,
+            anchor='w').grid(row=1,column=0,sticky='ew',pady=(14,4))
+        self.path = ttk.Entry(frame,style='Recovery.TEntry')
+        self.path.insert(0,str(manager.config_path))
+        self.path.configure(state='readonly')
+        self.path.grid(row=2,column=0,sticky='ew')
+        self.progress = ttk.Progressbar(frame,mode='indeterminate')
+        self.progress.grid(row=3,column=0,sticky='ew',pady=(12,0))
+        self.footer = tk.Frame(frame,bg='#F3F5F7')
+        self.footer.grid(row=4,column=0,sticky='ew',pady=(12,0))
+        self.footer.columnconfigure(1,weight=1)
+        self.recheck_button = ttk.Button(self.footer,text=tr('다시 확인'),style='Recovery.TButton',command=self.recheck)
+        self.recheck_button.grid(row=0,column=0,sticky='w')
+        self.actions = tk.Frame(self.footer,bg='#F3F5F7')
+        self.actions.grid(row=0,column=1,sticky='e')
+        self.close_button = ttk.Button(self.actions,text=tr('닫기'),style='Recovery.TButton',command=self.root.destroy)
+        self.close_button.grid(row=0,column=0,padx=(12,0))
+        self.button = ttk.Button(self.actions,text=tr('직접 연결로 복원'),style='Recovery.TButton',command=self.recover)
+        self.button.grid(row=0,column=1,padx=(8,0))
+        for button in (self.recheck_button,self.close_button,self.button):
+            button.bind('<Return>',self.activate_focused)
+        self.root.bind('<Return>',self.activate_default)
+        self.root.bind('<F5>',lambda event:self.recheck())
+        self.root.bind('<Escape>',lambda event:self.root.destroy())
         self.root.bind('<Configure>', self.resize)
         self.root.after(100, self.poll)
         self.submit(inspect)
 
-    def resize(self, event):
-        if event.widget == self.root:
-            self.title.configure(wraplength=max(350, event.width-48))
-            self.detail.configure(wraplength=max(350, event.width-48))
+    @property
+    def busy(self):
+        return self.operation is not None
+
+    def scroll_detail(self,first,last):
+        self.scrollbar.set(first,last)
+        if float(first)>0 or float(last)<1:
+            self.scrollbar.grid(row=0,column=3,sticky='ns',pady=12,padx=(0,8))
+        else:self.scrollbar.grid_remove()
+
+    def resize(self, event=None):
+        if event is None or event.widget == self.root:
+            available=self.root.winfo_width()-48
+            needed=self.recheck_button.winfo_reqwidth()+self.actions.winfo_reqwidth()+16
+            compact=needed>available
+            self.actions.grid_configure(row=1 if compact else 0,column=0 if compact else 1,
+                columnspan=2 if compact else 1,pady=(8,0) if compact else 0)
+
+    def activate_focused(self,event):
+        event.widget.invoke()
+        return 'break'
+
+    def activate_default(self,event):
+        if not self.busy:
+            if (self.result or {}).get('code')=='restored' and not self.result.get('can_recover',False):
+                self.close_button.invoke()
+            else:self.button.invoke()
+        return 'break'
+
+    def render(self):
+        result=self.result or {}
+        code=result.get('code')
+        cleanup_warning=result.get('cleanup_warning') or (result.get('status') or {}).get('cleanup_warning')
+        refreshing_exiting=self.operation is inspect and code=='exiting'
+        title=tr(result.get('title','연결 상태 확인 중…'))
+        detail=tr(result.get('detail',''))
+        glyph,color='i','#3769A0'
+        if self.busy and not refreshing_exiting:
+            title=tr('직접 연결로 복원 중…' if self.operation is restore else '연결 상태 확인 중…')
+            detail=''
+            glyph='…'
+        elif code=='restored' and not cleanup_warning:
+            glyph,color='✓','#267548'
+        elif code=='error':glyph,color='!','#B23B37'
+        elif result.get('confirmed') or code in ('unreadable','exiting','unknown','interrupted_exit') or cleanup_warning:
+            glyph,color='!','#9B661A'
+        if not self.busy or refreshing_exiting:
+            error=result.get('error') or cleanup_warning
+            if error:detail+='\n\n'+tr(error)
+        self.icon.configure(text=glyph,fg=color)
+        self.accent.configure(bg=color)
+        if self.diagnosis.get('1.0','end-1c')!=title+'\n'+detail:
+            self.diagnosis.configure(state='normal')
+            self.diagnosis.delete('1.0','end')
+            self.diagnosis.insert('end',title+'\n','heading')
+            self.diagnosis.insert('end',detail,'detail')
+            self.diagnosis.configure(state='disabled')
+            self.diagnosis.yview_moveto(0)
+        completed=code=='restored' and not result.get('can_recover',False)
+        if completed and not self.busy:
+            focused=self.root.focus_get()==self.button
+            self.button.grid_remove()
+            if focused:self.close_button.focus_set()
+        else:self.button.grid()
+        self.button.configure(text=tr('정리 다시 시도' if cleanup_warning else '직접 연결로 복원'),
+            default='normal' if completed else 'active')
+        self.close_button.configure(default='active' if completed else 'normal')
+        self.button.state(['disabled'] if self.busy or not result.get('can_recover',True) else ['!disabled'])
+        self.recheck_button.state(['disabled'] if self.busy else ['!disabled'])
+        if self.busy and not refreshing_exiting:
+            self.progress.grid()
+            self.progress.start(12)
+        else:
+            self.progress.stop()
+            self.progress.grid_remove()
+        self.root.after_idle(self.resize)
 
     def submit(self, function):
-        self.busy = True
-        self.button.state(['disabled'])
+        if self.busy:return False
+        if self.recheck_timer is not None:
+            self.root.after_cancel(self.recheck_timer)
+            self.recheck_timer=None
+        self.operation = function
+        self.render()
         def work():
             try:result = function(self.manager)
             except ExitRecoveryBlocked as exc:
                 result = dict(code='exiting', can_recover=False, title='연결 설정 복원을 보류했습니다', detail=str(exc))
             except Exception as exc:
-                result = dict(code='error', title='설정을 복원하지 못했습니다',
-                              detail='설정 파일을 읽거나 변경할 수 없습니다. 기존 설정과 백업은 보존됩니다. 파일 접근 권한을 확인한 뒤 다시 시도하세요.')
+                result = dict(code='error',can_recover=True,
+                    title='설정을 복원하지 못했습니다' if function is restore else '연결 상태를 확인하지 못했습니다',
+                    detail='요청한 작업을 완료하지 못했습니다. 일부 설정은 이미 변경되었을 수 있습니다. 상태를 다시 확인한 뒤 다시 시도하세요.' if function is restore
+                    else '설정 파일과 접근 권한을 확인한 뒤 다시 시도하세요.',error=str(exc))
                 if isinstance(exc,RuntimeError) and '다른 프록시 설정 작업' in str(exc):
                     result['detail']='다른 연결 설정 작업이 진행 중입니다. 잠시 기다린 뒤 복원을 다시 실행해 주세요.'
             self.messages.put(result)
         # Keep an already-started recovery transaction alive if the window closes.
         threading.Thread(target=work, daemon=False).start()
+        return True
 
     def recover(self):
         if not self.busy and (self.result or {}).get('can_recover',True):
-            self.title.configure(text=tr('직접 연결로 복원 중…'))
             self.submit(restore)
+
+    def recheck(self):
+        self.submit(inspect)
 
     def poll(self):
         try:
+            initial=self.result is None
             self.result = self.messages.get_nowait()
-            self.busy = False
-            self.title.configure(text=tr(self.result['title']))
-            self.detail.configure(text=tr(self.result['detail']))
-            available=self.result.get('can_recover',True)
-            self.button.state(['!disabled'] if available else ['disabled'])
-            if not available:self.root.after(1000,self.reinspect)
+            self.operation = None
+            self.render()
+            if initial and self.root.focus_get() in (None,self.root) and self.button.instate(['!disabled']):
+                self.button.focus_set()
+            if self.result['code']=='exiting':self.recheck_timer=self.root.after(1000,self.reinspect)
         except queue.Empty:
             pass
         self.root.after(100, self.poll)
 
     def reinspect(self):
-        if not self.busy and self.result and not self.result.get('can_recover',True):self.submit(inspect)
+        self.recheck_timer=None
+        if self.result and self.result['code']=='exiting':self.submit(inspect)
 
     def run(self):
         self.root.mainloop()
@@ -282,6 +405,7 @@ def main(argv=None):
                         or not (manager.home/'codexon-test-home').exists()):
                     raise ValueError('UI checks require an explicitly isolated test home and port')
                 window.smoke_activations=0
+                window.smoke_rechecks=0
                 window.smoke_reports=0
                 def callback_error(kind,value,trace):
                     import traceback
@@ -291,25 +415,35 @@ def main(argv=None):
                 def report_ui():
                     window.root.after(250,report_ui)
                     window.smoke_reports+=1
-                    action=args.ui_smoke.with_suffix('.click')
                     button=window.button
                     ready=bool(button.winfo_ismapped() and button.instate(['!disabled']))
-                    if action.exists() and ready:
-                        action.unlink()
-                        # Use Tk's normal button activation binding. A synthetic
-                        # pointer press can lose its pressed state when Windows
-                        # delivers a native Leave event on an unshown desktop.
-                        button.event_generate('<<Invoke>>')
-                        window.smoke_activations+=1
+                    for suffix,control in (('.click',button),('.recheck',window.recheck_button)):
+                        action=args.ui_smoke.with_suffix(suffix)
+                        if action.exists() and control.winfo_ismapped() and control.instate(['!disabled']):
+                            action.unlink()
+                            # Hidden desktops can deliver Leave during pointer presses.
+                            control.event_generate('<<Invoke>>')
+                            if suffix=='.click':window.smoke_activations+=1
+                            else:window.smoke_rechecks+=1
+                    controls={name:dict(x=control.winfo_rootx()-window.root.winfo_rootx(),
+                        y=control.winfo_rooty()-window.root.winfo_rooty(),width=control.winfo_width(),
+                        height=control.winfo_height(),visible=bool(control.winfo_ismapped()))
+                        for name,control in dict(restore=button,recheck=window.recheck_button,
+                            close=window.close_button,path=window.path,diagnosis=window.diagnosis).items()}
                     atomic_write(args.ui_smoke,json.dumps(dict(busy=window.busy,result=window.result,
                         hwnd=window.root.winfo_id(),button=window.button.winfo_id(),
                         width=button.winfo_width(),height=button.winfo_height(),
-                        ready=ready,activations=window.smoke_activations,reports=window.smoke_reports)).encode())
+                        ready=ready,activations=window.smoke_activations,rechecks=window.smoke_rechecks,
+                        controls=controls,client=[window.root.winfo_width(),window.root.winfo_height()],
+                        reports=window.smoke_reports)).encode())
                 window.root.after(250,report_ui)
             window.run()
             return 0
     except Exception as exc:
         result = dict(code='error', error=str(exc))
+        if not (args.status or args.restore):
+            from tkinter import messagebox
+            messagebox.showerror(tr('Codexon 연결 복구'),tr('연결 설정을 확인하지 못했습니다')+'\n\n'+str(exc))
     if args.report:
         atomic_write(args.report, json.dumps(result, ensure_ascii=False, indent=2).encode())
     return 1 if result['code']=='error' else 0

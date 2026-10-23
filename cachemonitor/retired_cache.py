@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import sqlite3
 import time
+import tomllib
 from contextlib import closing,contextmanager,nullcontext
 from urllib.parse import urlsplit
 
@@ -52,13 +53,18 @@ def verify_legacy_settlement(database,exit_code):
             raise RuntimeError('Legacy send settlement incomplete; records preserved')
 
 
-def select_route(manager,index=None):
+def select_route(manager,index=None,*,url=None):
     from .usage_paths import index_location
     from .launch_context import resolve_homes
     default=index_location() if Path(resolve_homes()[0]).resolve()==manager.home.resolve() else manager.directory/'usage-index.sqlite'
     manager.retirement_index=Path(index or default).resolve()
+    if url is not None:
+        manager.url=url.rstrip('/')
+        return
     address=read_json(manager.retirement_index.with_name('cache-route.json')).get('url')
-    if not address:address=manager.config()[1].get('openai_base_url')
+    if not address:
+        try:address=manager.config()[1].get('openai_base_url')
+        except (OSError,UnicodeDecodeError,tomllib.TOMLDecodeError):return
     parsed=urlsplit(address or '')
     if parsed.scheme=='http' and parsed.hostname=='127.0.0.1' and parsed.port and not parsed.username and parsed.path in ('','/'):
         manager.url=address.rstrip('/')
@@ -165,13 +171,17 @@ def retire(manager,*,restore_only=False,clock=time.monotonic,sleep=time.sleep):
     from .model_evidence import home_key
     from .version import PROXY_VERSION
     if not hasattr(manager,'retirement_index'):select_route(manager)
-    health=manager.health(timeout=3)
     storage=manager.retirement_index.parent
     if not (storage/'cache-control.sqlite').exists() and (manager.directory/'cache-control.sqlite').exists():storage=manager.directory
     database=storage/'cache-control.sqlite'
     receipt_path=manager.directory/'retirement.json'
     pending=read_json(receipt_path)
-    if not (health or {}).get('cache_management') and not database.exists() and not pending and not manager.retirement_index.with_name('cache-route.json').exists():
+    legacy_evidence=database.exists() or receipt_path.exists() or manager.retirement_index.with_name('cache-route.json').exists()
+    try:health=manager.health(timeout=3)
+    except RuntimeError:
+        if not restore_only or manager.health_state!='identity_mismatch' or legacy_evidence:raise
+        health=None
+    if not (health or {}).get('cache_management') and not legacy_evidence:
         remove_hooks(manager.home);return False
     task=ObserverTask(str(manager.home),role='CacheWorker')
     registration=task.inspect()
