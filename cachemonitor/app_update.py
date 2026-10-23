@@ -280,7 +280,7 @@ def retry_proxy(manager,journal,*,verified_operation_id=None,consent=None):
         client=record.get('client',{})
         from .update_state import installed_gui_required
         gui_required=installed_gui_required(record)
-        if needs_reopening(client) and (not gui_required or record.get('proxy',{}).get('phase') in ('complete','off') or record.get('proxy',{}).get('restored')):
+        if consent is None and needs_reopening(record) and (not gui_required or record.get('proxy',{}).get('phase') in ('complete','off') or record.get('proxy',{}).get('restored')):
             if gui_required:
                 if record.get('app',{}).get('startup',{}).get('state')!='ready':
                     journal.startup_result(operation_id,dict(state='waiting',message=''))
@@ -297,7 +297,7 @@ def retry_proxy(manager,journal,*,verified_operation_id=None,consent=None):
                 raise RuntimeError('시작 메뉴에서 새 Codexon을 열어 업데이트를 계속하세요.')
         if not gui_required and getattr(sys,'frozen',False) and record.get('app',{}).get('state')=='verified' and Path(record['app']['executable']).resolve()!=Path(sys.executable).resolve():
             raise RuntimeError('시작 메뉴에서 새 Codexon을 열어 업데이트를 계속하세요.')
-        if gui_required and consent is None and needs_reopening(client):
+        if gui_required and consent is None and needs_reopening(record):
             consent={**client,'phase':'closed'}
         if consent is None and client.get('phase') not in ('closed','not_running','not_applicable'):
             raise RuntimeError(CONSENT_REQUIRED)

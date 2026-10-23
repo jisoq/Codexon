@@ -205,8 +205,12 @@ def collection_phase(evidence, now, *, started_at=None):
     facts=evidence.get('collection_fault') or {}
     if facts.get('expected_stop') or facts.get('disabled'):return 'stopped'
     fault=detect('collection',{k:v for k,v in facts.items() if k not in ('snapshot_at','snapshot_stale')},now)
-    observed_fault=(evidence.get('collection_observation') or {}).get('collection_fault') or {}
-    if fault is not None or detect('collection',observed_fault,now) or evidence.get('usage_errors'):return 'failed'
+    observation=evidence.get('collection_observation') or {}
+    observed_fault=observation.get('collection_fault') or {}
+    source_fault=observation.get('source_fault')
+    if (fault is not None or detect('collection',observed_fault,now)
+            or detect('collection',source_fault or {},now)
+            or source_fault is None and evidence.get('usage_errors')):return 'failed'
     pending=any(facts.get(key) for key in ('starting','status_pending','handoff_pending'))
     complete=bool(evidence.get('usage_collection_complete',evidence.get('index',{}).get('usage_complete',False)))
     published=collection_publication_at(evidence)

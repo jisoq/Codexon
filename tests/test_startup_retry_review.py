@@ -168,3 +168,32 @@ def test_rejected_gui_handoff_blocks_startup_and_releases_restart_lock(tmp_path,
     finally:
         case.journal.startup_result(case.operation_id,dict(state='blocked'))
         worker.join(5)
+
+
+def test_ordinary_duplicate_launch_preserves_pending_startup_owner(tmp_path,route_case,monkeypatch,app):
+    from cachemonitor import app as application,proxy_identity
+    state=route_case;case=state.case
+    install_management.finish(tmp_path,case.product,case.recovery,update_id=case.operation_id)
+    case.journal.startup_result(case.operation_id,dict(state='starting',owner=state.gui))
+    startup=case.journal.read()['app']['startup']
+    duplicate={**state.gui,'created':state.gui['created']+1}
+    monkeypatch.setattr(proxy_identity,'process_identity',lambda pid:duplicate)
+    home=state.manager.home;home.mkdir(exist_ok=True)
+    (home/'codexon-test-home').touch()
+    monkeypatch.setattr(sys,'argv',['Codexon.exe','--managed-services','--codex-home',str(home),
+        '--index-path',str(tmp_path/'index.sqlite'),'--verify-handoff',str(tmp_path/'handoff.json')])
+    monkeypatch.setattr(application,'QApplication',lambda *args:app)
+    monkeypatch.setattr(application,'load_bundled_fonts',lambda:[])
+    monkeypatch.setattr(application,'configure_font_rendering',lambda:None)
+    monkeypatch.setattr(application,'configure_high_dpi',lambda:None)
+    commands=[]
+    class Socket:
+        def connectToServer(self,name):pass
+        def waitForConnected(self,timeout):return True
+        def write(self,data):commands.append(data)
+        def waitForBytesWritten(self,timeout):return True
+    monkeypatch.setattr(application,'QLocalSocket',Socket)
+    assert application.main()==0
+    assert commands==[b'show']
+    assert case.journal.read()['app']['startup']==startup
+    assert not state.events

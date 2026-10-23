@@ -195,12 +195,36 @@ def main():
             server_name = 'CodexonQA-'+hashlib.sha256(str(Path(args.index_path).resolve()).encode()).hexdigest()[:24]
         client = QLocalSocket()
         client.connectToServer(server_name)
-        if client.waitForConnected(400):
-            client.write(b"update-exit" if args.replace_gui else b"windows-startup" if args.windows_startup else b"show")
+        existing_gui=client.waitForConnected(400)
+        if existing_gui and not args.replace_gui:
+            client.write(b"windows-startup" if args.windows_startup else b"show")
             client.waitForBytesWritten(400)
-            if not args.replace_gui:return 0
+            return 0
+    installed_update=None
+    if not isolated:
+        from .installation import installed
+        from .update_state import state_for
+        journal=state_for(install=installed())
+        record=journal.read() if journal else {}
+        request_id=args.finish_install
+        startup=record.get('app',{}).get('startup') or {}
+        if request_id is None and record.get('phase') not in ('complete','cancelled') and (record.get('kind')=='app' and record.get('app',{}).get('state')=='verified'
+                and startup.get('state')!='ready' and startup.get('policy','requested')=='requested'):
+            request_id=record['operation_id']
+        if request_id is not None:
+            if journal is None:raise RuntimeError('설치된 업데이트 요청을 확인하지 못했습니다.')
+            bound=journal.bind_installed(request_id,executable=sys.executable)
+            from .proxy_identity import process_identity
+            journal.startup_result(request_id,dict(state='starting',owner=process_identity(os.getpid())))
+            installed_update=(journal,bound)
+    if not args.smoke:
+        if existing_gui:
+            client.write(b"update-exit")
+            client.waitForBytesWritten(400)
             from .app_restart import handoff_ready, REPLACEMENT_TIMEOUT
             if not handoff_ready(client):
+                if installed_update:
+                    journal.startup_result(request_id,dict(state='blocked',message='앱을 다시 시작하지 못했습니다. 기존 Codexon은 계속 사용할 수 있습니다. 진행 중인 설정 변경이 끝난 뒤 다시 시도하세요.'))
                 QMessageBox.information(None,'Codexon',tr('앱을 다시 시작하지 못했습니다. 기존 Codexon은 계속 사용할 수 있습니다. 진행 중인 설정 변경이 끝난 뒤 다시 시도하세요.'))
                 return 4
             deadline=time.monotonic()+REPLACEMENT_TIMEOUT
@@ -210,10 +234,14 @@ def main():
                 if not probe.waitForConnected(200):break
                 probe.disconnectFromServer();time.sleep(.2)
             else:
+                if installed_update:
+                    journal.startup_result(request_id,dict(state='blocked',message='앱을 다시 시작하지 못했습니다. 기존 Codexon은 계속 사용할 수 있습니다. 잠시 후 다시 시도하세요.'))
                 QMessageBox.information(None,'Codexon',tr('앱을 다시 시작하지 못했습니다. 기존 Codexon은 계속 사용할 수 있습니다. 잠시 후 다시 시도하세요.'))
                 return 4
         QLocalServer.removeServer(server_name)
         if not server.listen(server_name):
+            if installed_update:
+                journal.startup_result(request_id,dict(state='blocked',message='실행 중인 앱 상태를 확인할 수 없습니다.'))
             QMessageBox.warning(None, "Codexon", tr("실행 중인 앱 상태를 확인할 수 없습니다."))
             return 1
     smoke_settings = None
@@ -233,23 +261,6 @@ def main():
         from .usage_collection import isolated_collector
         collector_cleanup=isolated_collector(homes,args.index_path,args.evidence_path)
         app.aboutToQuit.connect(collector_cleanup)
-    installed_update=None
-    if not isolated:
-        from .installation import installed
-        from .update_state import state_for
-        journal=state_for(install=installed())
-        record=journal.read() if journal else {}
-        request_id=args.finish_install
-        startup=record.get('app',{}).get('startup') or {}
-        if request_id is None and record.get('phase') not in ('complete','cancelled') and (record.get('kind')=='app' and record.get('app',{}).get('state')=='verified'
-                and startup.get('state')!='ready' and startup.get('policy','requested')=='requested'):
-            request_id=record['operation_id']
-        if request_id is not None:
-            if journal is None:raise RuntimeError('설치된 업데이트 요청을 확인하지 못했습니다.')
-            bound=journal.bind_installed(request_id,executable=sys.executable)
-            from .proxy_identity import process_identity
-            journal.startup_result(request_id,dict(state='starting',owner=process_identity(os.getpid())))
-            installed_update=(journal,bound)
     window = Dashboard(homes,index_path=args.index_path,installed_update=installed_update,model_evidence_path=args.evidence_path,quota_path=args.quota_path,
         collection_autostart=not (args.smoke or args.verify_handoff) or args.verify_services,
         live_limits=not (args.smoke or args.verify_handoff),manage_observer=args.verify_services or (not (args.smoke or args.verify_handoff) and not isolated), **({'settings':smoke_settings} if smoke_settings else {}))

@@ -44,7 +44,12 @@ class CollectionObserver:
                 and isinstance(marker.get('at'),(int,float)) and marker['at']>(stamp or 0)
                 and isinstance(marker.get('facts'),dict)):
             facts.update(marker['facts'])
-        return dict(collection_snapshot_at=stamp,collection_fault=facts)
+        source_fault=None
+        if self.snapshot is not None:
+            source_fault=dict(self.snapshot.get('collection_fault') or {})
+            if self.snapshot.get('usage_errors'):source_fault['read_failed']=True
+            if not source_fault and not self.snapshot.get('usage_collection_complete'):source_fault=None
+        return dict(collection_snapshot_at=stamp,collection_fault=facts,source_fault=source_fault)
 
     def close(self):
         self.reader.close()

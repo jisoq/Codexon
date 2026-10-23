@@ -20,8 +20,17 @@ def capture():
     return dict(phase='authorized', targets=targets, reopen_required=bool(targets))
 
 
-def needs_reopening(client):
-    return bool(client.get('ready_at') or client.get('closed_at')) and client.get('phase') in ('blocked', 'reopening')
+def needs_reopening(record):
+    client=record.get('client',{})
+    if not (client.get('ready_at') or client.get('closed_at')) or client.get('phase') not in ('blocked','reopening'):
+        return False
+    current=desktop.desktop_processes()
+    if not current:return True
+    ready_at=client.get('ready_at')
+    proxy=record.get('proxy',{})
+    return bool(ready_at and (proxy.get('phase') in ('complete','off') or proxy.get('restored'))
+                and installed_gui_ready(record) and (not record.get('scope') or restored_ready(record))
+                and any(p['created']/10_000_000-11644473600>=ready_at for p in current))
 
 
 def confirm_native(language):
@@ -227,7 +236,6 @@ def run_restart(journal, operation_id):
 
 
 def retry(journal, operation_id, recovery):
-    client = journal.read().get('client', {})
-    if not needs_reopening(client):raise RuntimeError(CONSENT_REQUIRED)
+    if not needs_reopening(journal.read()):raise RuntimeError(CONSENT_REQUIRED)
     journal.client_result(operation_id, phase='reopening', message='')
     start(journal, operation_id, recovery)

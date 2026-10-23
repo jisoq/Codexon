@@ -288,7 +288,7 @@ class UpdatePanel(Group):
             self.offer=None;self.render_record();return
         if self.busy() or self.closing():return
         if self._restart_confirmation:return
-        reopening=needs_reopening(self.record.get('client',{}))
+        reopening=needs_reopening(self.record)
         if not reopening and not self.offer and self.needs_new_app() and not verified_operation_id:
             from .app_update import continuation_target
             self.checking=False;self.operation_error=False
@@ -414,7 +414,7 @@ class UpdatePanel(Group):
         self.later.setVisible(phase in ('waiting','needs_exit') and not critical)
         for control in (self.cancel,self.later):control.setEnabled(not record.get('cancel_requested'))
         retryable=phase in ('failed','interrupted') and record.get('app',{}).get('state') not in ('verified','current')
-        reopening=needs_reopening(record.get('client',{}))
+        reopening=needs_reopening(record)
         if self.offer and not active and not reopening:
             self.render_offer()
             return

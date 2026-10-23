@@ -108,7 +108,7 @@ GROUPS = {
     'proxy_lifecycle': test_files('managed_proxy', 'proxy_update', 'proxy_supervisor', 'connection_recovery'),
     'observer': test_files('observer_control', 'observer_panel', 'observer_task_errors'),
     'install': test_files('install_activation', 'install_management', 'install_dispatch', 'install_cleanup', 'legacy_release', 'windows_startup'),
-    'update': test_files('app_update','update_monitor','update_state','client_restart','installed_startup'),
+    'update': test_files('app_update','update_monitor','update_state','client_restart','installed_startup','startup_retry_review'),
     'runtime': test_files('windows_startup', 'graphics_recovery'),
     'translation': ('tests/test_public_release.py::test_english_token_labels_do_not_change_stored_values',),
     'payload': ('tests/test_public_release.py::test_public_payload_rejects_local_paths_and_unneeded_qt',),

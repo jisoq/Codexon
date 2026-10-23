@@ -441,7 +441,8 @@ class Dashboard(TrayWindow):
         if hasattr(self,'home_panel'):
             evidence={**self.snapshot,**self.home_collection_status}
             evidence['collection_started_at']=self.started_at
-            evidence['collection_fault']={**(self.snapshot.get('collection_fault') or {}),
+            source_observed=(self.home_collection_status.get('collection_observation') or {}).get('source_fault') is not None
+            evidence['collection_fault']={**({} if source_observed else self.snapshot.get('collection_fault') or {}),
                 **{key:value for key,value in (self.home_collection_status.get('collection_fault') or {}).items() if value}}
             self.home_panel.apply_status(evidence,self.home_quota_payload,time.time())
             from .app_errors import collection_phase
@@ -806,6 +807,10 @@ class Dashboard(TrayWindow):
         self.home_collection_status['collection_observation']=value
         self.observe_error('collection.observer','collection',value.get('collection_fault') or {},
                            healthy=not value.get('collection_fault'),resolution='수집기 관측 재개 확인')
+        source_fault=value.get('source_fault')
+        if source_fault is not None:
+            self.observe_error('collection.source','collection',source_fault,
+                healthy=not source_fault,resolution='사용 기록 수집 재개 확인')
         overlay=getattr(self,'overlay',None)
         if overlay:overlay.receive_collection_observation(value)
         self.refresh_home_status()
@@ -840,13 +845,14 @@ class Dashboard(TrayWindow):
         self.mismatch_page.receive_health(value.get('mismatch_history'))
         self.refresh_home_status()
         self.error_state.clear('analysis.process',resolution='분석기 실행 확인')
-        if isinstance(value.get('collection_fault'),dict):
-            source_facts=dict(value['collection_fault'])
-            if value.get('usage_errors'):source_facts['read_failed']=True
-            self.observe_error('collection.source','collection',source_facts,
-                healthy=bool(value.get('usage_collection_complete')),resolution='사용 기록 수집 재개 확인')
-        elif value.get('usage_errors'):
-            self.observe_error('collection.source','collection',dict(read_failed=True))
+        if (self.home_collection_status.get('collection_observation') or {}).get('source_fault') is None:
+            if isinstance(value.get('collection_fault'),dict):
+                source_facts=dict(value['collection_fault'])
+                if value.get('usage_errors'):source_facts['read_failed']=True
+                self.observe_error('collection.source','collection',source_facts,
+                    healthy=bool(value.get('usage_collection_complete')),resolution='사용 기록 수집 재개 확인')
+            elif value.get('usage_errors'):
+                self.observe_error('collection.source','collection',dict(read_failed=True))
         if 'observation_read_failed' in value:
             self.observe_error('observation.read','observation',dict(read_failed=bool(value['observation_read_failed'])),
                 healthy=not value['observation_read_failed'],resolution='관측 기록 읽기 확인')
