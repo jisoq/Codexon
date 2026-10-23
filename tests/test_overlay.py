@@ -292,7 +292,7 @@ def test_overlay_banner_allows_idle_delivery_grace_and_identifies_failures(monke
     assert note=='갱신 중' and data['_collection']['reason']=='analysis_delay'
     assert not data['_collection']['delayed']
     model=OverlayContent();model.set_content(data,note)
-    assert model.heartbeat_state()['mode']=='pending' and model.data['calls']==2
+    assert model.heartbeat_state()['mode']=='idle' and model.data['calls']==2
     OverlayController.receive_snapshot(controller,dict(overlay_sessions=[dict(id=A,calls=2)],errors=[],ts=1000.))
     data,note=OverlayController.content(controller)
     assert note=='' and not data['_collection']['delayed']

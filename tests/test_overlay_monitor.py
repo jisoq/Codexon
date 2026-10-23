@@ -78,11 +78,67 @@ def test_active_requests_update_heartbeat_without_changing_layout(app):
         assert model.layout() == layout
 
 
+@pytest.mark.parametrize('reason,count,calls', [('analysis_delay', 2, 12), ('detail_pending', 0, 0)])
+def test_background_refresh_preserves_usage_and_activity(app, reason, count, calls):
+    model = OverlayContent()
+    data = summary(count=calls)
+    data.update(active_requests=count, _collection={'reason': reason, 'received_age': 16, 'last_confirmed_at': 700})
+    model.set_content(data)
+    label = model.state['heartbeatLabel']
+    layout = model.layout()
+    for note in ('갱신 중', '', '갱신 중', ''):
+        model.set_content(deepcopy(data), note)
+        assert model.state['contentOpacity'] == 1
+        assert model.state['heartbeatMode'] == ('active' if count else 'idle')
+        assert model.state['heartbeatLabel'] == label
+        assert not model.state['checkingRecords'] and not model.notice_card()
+        assert model.data['calls'] == calls and model.total_cost() == (data['cost'] if calls else 0)
+        assert model.layout() == layout
+        if note:
+            assert model.status_detail().splitlines().count(note) == 1
+            assert model.freshness_text() in model.status_detail()
+
+
+def test_background_refresh_preserves_selected_call_and_speed_alert_suppression(app):
+    model = OverlayContent()
+    data = summary()
+    data['speed_health'] = {'active': True}
+    model.set_content(data)
+    selected = model.call_id(model.rows()[0])
+    model.select(selected)
+    call = deepcopy(model.displayed_call())
+    usage = deepcopy(model.main_items())
+    assert model.speed_alert().get('active')
+    for reason in ('analysis_delay', 'detail_pending', 'analysis_delay'):
+        incoming = deepcopy(data)
+        incoming['_collection'] = {'reason': reason, 'received_age': 16}
+        model.set_content(incoming, '갱신 중')
+        assert model.selected_id == selected and not model.follow_latest
+        assert model.displayed_call() == call and model.main_items() == usage
+        assert not model.speed_alert().get('active')
+    model.set_content(data)
+    assert model.selected_id == selected and model.speed_alert().get('active')
+
+
+@pytest.mark.parametrize('failure', ['status', 'collection'])
+def test_background_refresh_keeps_real_errors_above_activity(app, failure):
+    model = OverlayContent()
+    data = summary()
+    data.update(active_requests=2, _collection={'reason': 'detail_pending'})
+    if failure == 'status':
+        data['statuses'] = ['분석 오류']
+    else:
+        data['_collection']['errors'] = ['database read failure']
+    model.set_content(data, '갱신 중')
+    assert model.state['heartbeatMode'] == 'error' and not model.state['heartbeatActive']
+    assert model.data['calls'] == data['calls']
+
+
 def test_collection_status_replaces_heartbeat_and_keeps_summary_data(app, monkeypatch):
     model = OverlayContent()
     data = summary(misses=1)
     drawn = capture_text(monkeypatch)
-    for note in ('수집 오류', '수집 지연'):
+    for note in ('수집 오류', '수집 지연', '분석 오류'):
         model.set_content(data, note)
         drawn.clear()
         render(model)
@@ -90,7 +146,7 @@ def test_collection_status_replaces_heartbeat_and_keeps_summary_data(app, monkey
         assert not status
         assert model.state['heartbeatMode']=='error'
         assert model.state['heartbeatLabel']==note
-        assert not any(item['interaction']=='tooltip' for item in model.monitor_links())
+        assert any(item['interaction']=='tooltip' and item.get('tooltip')==model.status_detail() for item in model.monitor_links())
         assert model.state['heartbeatY'] < model.layout()['charts'][0] < model.layout()['main']
         assert model.data['cache_misses'] == data['cache_misses']
         model.monitor_action('main-detail')
@@ -264,9 +320,10 @@ def test_icon_collisions_keep_the_same_chart_and_highlight_color(app):
 
 def test_waiting_cards_and_retained_values_are_distinct(app, monkeypatch):
     model = OverlayContent()
-    for note in ('기록 확인 중', '수집 오류', '수집 지연', '수집 시작 중'):
+    for note in ('기록 확인 중', '수집 오류', '수집 지연', '수집 시작 중', '갱신 중'):
         model.set_content(None, note)
         assert model.notice_card()
+        assert model.state['heartbeatMode'] == ('error' if note in ('수집 오류', '수집 지연') else 'pending')
         assert not any(link.get('interaction') == 'select' for link in model.monitor_links())
     model.set_content(summary(count=0))
     assert not model.notice_card() and model.total_cost() == 0
