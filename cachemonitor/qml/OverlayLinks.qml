@@ -50,6 +50,8 @@ Item {
                 visible: link.infoIcon
             }
 
+            UiToolTip { visible: pointer.containsMouse && modelData.interaction === "tooltip"; text: modelData.tooltip || "" }
+
             MouseArea {
                 id: pointer
                 anchors.fill: parent; hoverEnabled: true; cursorShape: link.passive ? Qt.ArrowCursor : Qt.PointingHandCursor

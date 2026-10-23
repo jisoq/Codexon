@@ -190,6 +190,10 @@ def action_links(m):
 def links(m):
     if m.notice_card():return []
     result=action_links(m);g=m.layout();rows=m.rows();step=SECTION_WIDTH/max(1,len(rows))
+    heartbeat=m.heartbeat_state()
+    if heartbeat['message']:
+        result.append(dict(id='heartbeat',x=heartbeat['x'],y=heartbeat['y'],width=RIGHT-heartbeat['x'],height=18,
+                           interaction='tooltip',tooltip=heartbeat['message'],accessible=heartbeat['message']))
     for chart,y in enumerate(g['charts']):
         for index,row in enumerate(rows):
             result.append(dict(id=f'inspect-{chart}-{index}',x=MARGIN+index*step,y=y+20,width=step,
