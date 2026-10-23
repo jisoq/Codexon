@@ -4,6 +4,7 @@ import time
 from types import SimpleNamespace
 
 import pytest
+from tests.restart_fixture import no_running_desktop
 from PySide6.QtCore import QCoreApplication, QEvent, QSettings
 from PySide6.QtNetwork import QHostAddress, QTcpServer
 from PySide6.QtWidgets import QApplication, QSystemTrayIcon
@@ -204,7 +205,7 @@ def test_production_gate_excludes_source_qa_and_other_installations(tmp_path,mon
 def test_dashboard_badge_notification_routes_mute_and_explicit_check(endpoint,tmp_path,monkeypatch,language):
     from cachemonitor.dashboard import Dashboard
     from cachemonitor.i18n import set_language
-    from cachemonitor.quick_qa import control,click,walk,render_plot
+    from cachemonitor.quick_qa import control,click,render_plot
     e=endpoint;set_language(language)
     previous=e.app.property('cachemonitorDisableShellIntegration');e.app.setProperty('cachemonitorDisableShellIntegration',True)
     window=Dashboard([],start_worker=False,settings=e.settings,live_limits=False,manage_observer=False,
@@ -254,9 +255,6 @@ def test_dashboard_badge_notification_routes_mute_and_explicit_check(endpoint,tm
         socket.disconnectFromHost()
         settle(lambda:not window.update_panel.metadata_pending and window.update_panel.operation is None)
         assert window.update_panel.offer['kind']=='app' and status_calls==[True]
-        from cachemonitor.i18n import tr
-        settle(lambda:any(item.isVisible() and item.property('text')==tr('교체할 때 연결이 잠시 중단됩니다.')
-                          for item in walk(control(window,window.update_panel.status))))
         assert len(messages)==2
         monitor.publish();assert window.update_panel.offer['kind']=='app'
         click(window,control(window,window.auto_update))

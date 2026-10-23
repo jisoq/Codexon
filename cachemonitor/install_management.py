@@ -82,6 +82,10 @@ def register(root, product, recovery, *, isolated=False):
 
 
 def activate_proxy(manager, *, operation_id=None, update_root=None):
+    if operation_id:
+        from .update_state import UpdateState
+        from .client_restart import require_stopped
+        require_stopped(UpdateState(update_root),operation_id)
     from .retired_cache import retire
     retire(manager)
     manager.cleanup_legacy_check()
@@ -155,7 +159,7 @@ def recover_installed(journal, record):
         return None
 
 
-def finish(root, product, recovery, *, isolated=False, launch=True, language='ko',update_id=None):
+def finish(root, product, recovery, *, isolated=False, launch=True, language='ko',update_id=None,silent=False):
     root = Path(root).resolve()
     product = contained(product, root/'versions')
     recovery = contained(recovery, root/'maintenance')
@@ -171,93 +175,117 @@ def finish(root, product, recovery, *, isolated=False, launch=True, language='ko
         request=journal.read()
         if not valid_id(update_id) or request.get('operation_id')!=update_id or request.get('target_version')!=manifest['version']:
             raise RuntimeError('요청한 업데이트와 설치 파일이 다릅니다. 이전 설치를 유지합니다.')
-    with ProcessLock(root/'install.lock',timeout=10):
-        if update_id:
-            current=journal.read()
-            if (current.get('operation_id')!=update_id
-                    or current.get('target_version')!=manifest['version']
-                    or current.get('scope')!=request.get('scope')):
-                raise RuntimeError('설치 대기 중 업데이트 요청이 변경되었습니다. 이전 설치를 유지합니다.')
-            from .proxy_identity import process_identity
-            if not journal.change(update_id,installer_owner=process_identity(os.getpid())):
-                raise RuntimeError('설치 대기 중 업데이트 요청이 변경되었습니다. 이전 설치를 유지합니다.')
-        report = root/('runtime-'+uuid.uuid4().hex+'.json')
-        check = subprocess.run([str(exe),'--verify-runtime',str(report)],timeout=45,
-                               creationflags=subprocess.CREATE_NO_WINDOW)
-        value = read_json(report)
-        if check.returncode or value.get('errors')!=[] or value.get('version')!=manifest['version']:
-            raise RuntimeError('새 버전 실행 검사에 실패했습니다. 이전 버전을 유지합니다.')
-        from .install_activation import Activation, publish_shell
-        activation = Activation(root, isolated)
-        previous = read_json(root/'installation.json')
-        receipt = dict(product=str(product), recovery=str(recovery), version=manifest['version'],
-                       commit=manifest['commit'], previous=previous.get('product'), installed_at=time.time(),
-                       isolated=isolated)
-        if update_id:
-            # Written only after runtime/hash checks; absence of the activation
-            # journal then proves this exact request reached committed activation.
-            receipt.update(operation_id=update_id,scope=request.get('scope'),
-                           sha256=manifest['sha256'],recovery_sha256=manifest['recovery_sha256'])
-        # Keep rollback payloads until the new GUI verifies all service handoffs.
-        try:
-            if previous:
-                atomic_write(root/('installation-'+uuid.uuid4().hex+'.json'),json.dumps(previous).encode())
+    try:
+        with ProcessLock(root/'install.lock',timeout=10):
+            if update_id:
+                current=journal.read()
+                if (current.get('operation_id')!=update_id
+                        or current.get('target_version')!=manifest['version']
+                        or current.get('scope')!=request.get('scope')):
+                    raise RuntimeError('설치 대기 중 업데이트 요청이 변경되었습니다. 이전 설치를 유지합니다.')
+                from .proxy_identity import process_identity
+                if not journal.change(update_id,installer_owner=process_identity(os.getpid())):
+                    raise RuntimeError('설치 대기 중 업데이트 요청이 변경되었습니다. 이전 설치를 유지합니다.')
+            report = root/('runtime-'+uuid.uuid4().hex+'.json')
+            check = subprocess.run([str(exe),'--verify-runtime',str(report)],timeout=45,
+                                   creationflags=subprocess.CREATE_NO_WINDOW)
+            value = read_json(report)
+            if check.returncode or value.get('errors')!=[] or value.get('version')!=manifest['version']:
+                raise RuntimeError('새 버전 실행 검사에 실패했습니다. 이전 버전을 유지합니다.')
             if not isolated:
-                from .launch_context import running_homes, save_homes, resolve_homes
-                homes = running_homes(root)
-                if homes:save_homes(homes)
-                receipt['homes']=resolve_homes(homes)
-                from .retired_cache import remove_hooks
-                hook_homes=set(receipt['homes'])
-                for record in [previous, *[read_json(p) for p in root.glob('installation-*.json')]]:
-                    hook_homes.update(h for h in record.get('homes',[]) if isinstance(h,str) and Path(h).is_absolute())
-                for home in hook_homes:
-                    remove_hooks(home,before_write=activation.track_file)
-            register(root, product, recovery, isolated=isolated)
-            publish_shell(product, recovery, isolated=isolated, language=language)
-            if not isolated:migrate_startup(exe)
-            atomic_write(root/'installation.json',json.dumps(receipt,indent=2).encode())
-            if not isolated:
-                from .installation import pointer_path
-                pointer=dict(InstallRoot=str(root),AppPath=str(exe),RecoveryPath=str(recovery))
-                atomic_write(pointer_path(),json.dumps(pointer).encode())
-                if read_json(pointer_path())!=pointer:raise OSError('Installation pointer verification failed')
-            if read_json(root/'installation.json')!=receipt:raise OSError('Installation receipt verification failed')
-            activation.commit()
-        except Exception:
-            activation.rollback()
-            raise
-        from .install_cleanup import queue
-        try:queue(root)
-        except (OSError,ValueError,RuntimeError) as exc:receipt['cleanup_warning']=str(exc)
-        if not isolated:
-            update_id=journal.installed(update_id,product,manifest)
-            from .observer_task import retire_desktop_startups
-            try:retire_desktop_startups(root)
-            except RuntimeError as exc:receipt['startup_warning']=str(exc)
-            result_path = root/'connection-update.json'
+                from .client_restart import capture, confirm_native, prepare_restart, CONSENT_REQUIRED
+                previous=read_json(root/'installation.json')
+                client=journal.read().get('client',{})
+                if not update_id:
+                    from .update_state import scope_for
+                    consent=capture()
+                    if previous or consent['targets']:
+                        if silent or not confirm_native(language):raise RuntimeError(CONSENT_REQUIRED)
+                    else:consent['phase']='not_running'
+                    request=journal.begin('app',manifest['version'],scope=scope_for(connection_manager()),
+                                          client=consent)
+                    update_id=request['operation_id']
+                elif client.get('phase')=='awaiting_consent' or not client:
+                    if not confirm_native(language):raise RuntimeError(CONSENT_REQUIRED)
+                    journal.client_result(update_id,**capture())
+                prepare_restart(journal,update_id,recovery)
+                if not journal.begin_activation(update_id):
+                    from .app_update import UpdateCancelled
+                    raise UpdateCancelled('업데이트를 취소했습니다.')
+            from .install_activation import Activation, publish_shell
+            activation = Activation(root, isolated)
+            previous = read_json(root/'installation.json')
+            receipt = dict(product=str(product), recovery=str(recovery), version=manifest['version'],
+                           commit=manifest['commit'], previous=previous.get('product'), installed_at=time.time(),
+                           isolated=isolated)
+            if update_id:
+                # Written only after runtime/hash checks; absence of the activation
+                # journal then proves this exact request reached committed activation.
+                receipt.update(operation_id=update_id,scope=request.get('scope'),
+                               sha256=manifest['sha256'],recovery_sha256=manifest['recovery_sha256'])
+            # Keep rollback payloads until the new GUI verifies all service handoffs.
             try:
-                command=[str(exe),'--complete-install','--control-report',str(result_path)]
-                if update_id:command+=['--update-id',update_id,'--update-root',str(root)]
-                result = subprocess.run(command,
-                                        timeout=60,creationflags=subprocess.CREATE_NO_WINDOW)
-                receipt['connection'] = read_json(result_path)
-                if result.returncode:raise RuntimeError('Connection update did not complete')
-            except (OSError,RuntimeError,subprocess.TimeoutExpired):
-                receipt['connection'] = dict(phase='recovery_required',message='연결 복구를 실행해 주세요.')
-                if update_id:journal.proxy_result(update_id,receipt['connection'])
-            if launch:
-                from .app_services import suspended
-                if suspended(connection_manager()):
-                    launch=False
-                    receipt['launch']='앱 종료 요청을 유지했습니다.'
-            if launch:
-                from .observer_task import ObserverTask
-                # A new task identity must be able to run while the old GUI task
-                # is still alive; that new process performs the graceful handoff.
-                try:ObserverTask(str(exe),role='Desktop').start([str(exe),'--replace-gui'])
-                except RuntimeError:receipt['launch']='시작 메뉴에서 Codexon을 열어 주세요.'
-        return receipt
+                if previous:
+                    atomic_write(root/('installation-'+uuid.uuid4().hex+'.json'),json.dumps(previous).encode())
+                if not isolated:
+                    from .launch_context import running_homes, save_homes, resolve_homes
+                    homes = running_homes(root)
+                    if homes:save_homes(homes)
+                    receipt['homes']=resolve_homes(homes)
+                    from .retired_cache import remove_hooks
+                    hook_homes=set(receipt['homes'])
+                    for record in [previous, *[read_json(p) for p in root.glob('installation-*.json')]]:
+                        hook_homes.update(h for h in record.get('homes',[]) if isinstance(h,str) and Path(h).is_absolute())
+                    for home in hook_homes:
+                        remove_hooks(home,before_write=activation.track_file)
+                register(root, product, recovery, isolated=isolated)
+                publish_shell(product, recovery, isolated=isolated, language=language)
+                if not isolated:migrate_startup(exe)
+                atomic_write(root/'installation.json',json.dumps(receipt,indent=2).encode())
+                if not isolated:
+                    from .installation import pointer_path
+                    pointer=dict(InstallRoot=str(root),AppPath=str(exe),RecoveryPath=str(recovery))
+                    atomic_write(pointer_path(),json.dumps(pointer).encode())
+                    if read_json(pointer_path())!=pointer:raise OSError('Installation pointer verification failed')
+                if read_json(root/'installation.json')!=receipt:raise OSError('Installation receipt verification failed')
+                activation.commit()
+            except Exception:
+                activation.rollback()
+                raise
+            from .install_cleanup import queue
+            try:queue(root)
+            except (OSError,ValueError,RuntimeError) as exc:receipt['cleanup_warning']=str(exc)
+            if not isolated:
+                update_id=journal.installed(update_id,product,manifest)
+                from .observer_task import retire_desktop_startups
+                try:retire_desktop_startups(root)
+                except RuntimeError as exc:receipt['startup_warning']=str(exc)
+                result_path = root/'connection-update.json'
+                try:
+                    command=[str(exe),'--complete-install','--control-report',str(result_path)]
+                    if update_id:command+=['--update-id',update_id,'--update-root',str(root)]
+                    result = subprocess.run(command,
+                                            timeout=60,creationflags=subprocess.CREATE_NO_WINDOW)
+                    receipt['connection'] = read_json(result_path)
+                    if result.returncode:raise RuntimeError('Connection update did not complete')
+                except (OSError,RuntimeError,subprocess.TimeoutExpired):
+                    receipt['connection'] = dict(phase='recovery_required',message='연결 복구를 실행해 주세요.')
+                    if update_id:journal.proxy_result(update_id,receipt['connection'])
+                if launch:
+                    from .app_services import suspended
+                    if suspended(connection_manager()):
+                        launch=False
+                        receipt['launch']='앱 종료 요청을 유지했습니다.'
+                if launch:
+                    from .observer_task import ObserverTask
+                    # A new task identity must be able to run while the old GUI task
+                    # is still alive; that new process performs the graceful handoff.
+                    try:ObserverTask(str(exe),role='Desktop').start([str(exe),'--replace-gui'])
+                    except RuntimeError:receipt['launch']='시작 메뉴에서 Codexon을 열어 주세요.'
+            return receipt
+    except Exception as exc:
+        if update_id:journal.fail(update_id,str(exc))
+        raise
 
 
 def processes_under(root):

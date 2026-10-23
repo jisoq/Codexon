@@ -67,6 +67,24 @@ def test_removed_app_reports_failure_without_false_success(monkeypatch):
         startup.launch_chatgpt(APP_ID)
 
 
+def test_restart_discovery_excludes_legacy_chatgpt_command_runner_and_other_sessions(monkeypatch):
+    from cachemonitor import proxy_identity
+    processes={11:(1,APP_ID),12:(1,'OpenAI.Codex_2p2nqsd0c76g0!CodexCoreCommandRunner'),
+               13:(1,'OpenAI.ChatGPT-Desktop_2p2nqsd0c76g0!App'),14:(2,APP_ID)}
+    def set_value(pointer,value):C.cast(pointer,C.POINTER(W.DWORD)).contents.value=value
+    def session(pid,pointer):
+        set_value(pointer,1 if pid==startup.os.getpid() else processes[pid][0]);return True
+    def enumerate_processes(buffer,size,used):
+        for i,pid in enumerate(processes):buffer[i]=pid
+        set_value(used,len(processes)*C.sizeof(W.DWORD));return True
+    def identity(pid,size,value):value.value=processes[pid][1];return 0
+    api=SimpleNamespace(ProcessIdToSessionId=session,K32EnumProcesses=enumerate_processes,
+        OpenProcess=lambda access,inherit,pid:pid,GetApplicationUserModelId=identity,CloseHandle=lambda handle:None)
+    monkeypatch.setattr(startup,'_process_api',lambda:api)
+    monkeypatch.setattr(proxy_identity,'process_identity',lambda pid:dict(pid=pid,created=42,executable='manifest-path'))
+    assert startup.desktop_processes()==[dict(pid=11,created=42,executable='manifest-path',session=1,app_id=APP_ID)]
+
+
 @pytest.mark.parametrize('current_status, expected', [(259, True), (0, False)])
 def test_native_detection_matches_session_identity_and_liveness(monkeypatch, current_status, expected):
     closed = []

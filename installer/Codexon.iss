@@ -155,6 +155,7 @@ begin
     Args := '--native-install --install-root "' + ExpandConstant('{app}') + '" --product-dir "' + ProductPath('') +
       '" --report "' + ExpandConstant('{app}\install-result.json') + '"{#ExtraArgs}';
     UpdateId := ExpandConstant('{param:UPDATEID|}');
+    if WizardSilent then Args := Args + ' --silent';
     if UpdateId <> '' then begin
       if Length(UpdateId) <> 32 then RaiseException('Invalid update identifier');
       for I := 1 to Length(UpdateId) do

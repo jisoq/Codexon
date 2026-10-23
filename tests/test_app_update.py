@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 
 import pytest
+from tests.restart_fixture import no_running_desktop
 
 from cachemonitor import app_update
 
@@ -174,7 +175,7 @@ def test_current_release_updates_the_active_observation_proxy(tmp_path,monkeypat
     from types import SimpleNamespace
     from cachemonitor import install_management
     calls=[]
-    manager=SimpleNamespace(home=tmp_path/'home',evidence=tmp_path/'evidence.sqlite',url='http://127.0.0.1:18768',status=lambda:{'configured':True,'health':{'status':'ok'}},
+    manager=SimpleNamespace(directory=tmp_path,home=tmp_path/'home',evidence=tmp_path/'evidence.sqlite',url='http://127.0.0.1:18768',status=lambda:{'configured':True,'health':{'status':'ok'}},
         cleanup_legacy_check=lambda:None,adopt_registrations=lambda:None,
         update_proxy=lambda **kw:calls.append(kw) or {'update':{'phase':'queued','message':'연결 종료 후 적용'}})
     monkeypatch.setattr(app_update,'VERSION',release()['tag_name'].lstrip('v'))

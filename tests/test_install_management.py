@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 
 import pytest
+from tests.restart_fixture import no_running_desktop
 
 from cachemonitor import install_management as install
 

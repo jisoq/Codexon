@@ -3,6 +3,7 @@ from pathlib import Path
 import subprocess
 
 import pytest
+from tests.restart_fixture import no_running_desktop
 
 from cachemonitor import install_activation as activation, install_management as install
 from cachemonitor.launch_context import resolve_homes, save_homes, homes_from_command
