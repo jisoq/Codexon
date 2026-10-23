@@ -95,6 +95,12 @@ Rectangle {
                 HoverHandler { cursorShape: Qt.PointingHandCursor }
             }
         }
+        OverlayLinks {
+            width: bodyScroll.contentWidth; height: bodyScroll.contentHeight
+            presentation: root.presentation
+            links: root.s.detailLinks || []
+            unitScale: root.unitScale
+        }
         ScrollBar.vertical: ScrollBar {
             id: detailBar
             objectName: "detailScrollBar"

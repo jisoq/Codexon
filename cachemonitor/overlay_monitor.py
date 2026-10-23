@@ -194,6 +194,11 @@ def links(m):
     if heartbeat['message']:
         result.append(dict(id='heartbeat',x=heartbeat['x'],y=heartbeat['y'],width=RIGHT-heartbeat['x'],height=18,
                            interaction='tooltip',tooltip=heartbeat['message'],accessible=heartbeat['message']))
+    from .overlay_icons import agent_mark
+    result.extend(dict(x=MARGIN+item[1],y=g['main']+item[2],width=item[3],height=item[4],**item[8]['link'])
+                  for item in m.agent_summary_items(main_usage(m.data or {}),'Main Agent',
+                      agent_mark((m.data or {}).get('id'),m.appearance),m.main_expanded,SECTION_WIDTH,main=True)
+                  if item[8].get('kind')=='model-info')
     for chart,y in enumerate(g['charts']):
         for index,row in enumerate(rows):
             result.append(dict(id=f'inspect-{chart}-{index}',x=MARGIN+index*step,y=y+20,width=step,
