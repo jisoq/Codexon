@@ -2,7 +2,7 @@
 import json
 import time
 from pathlib import Path
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QRectF, QTimer
 from PySide6.QtTest import QTest
 from PySide6.QtQuickWidgets import QQuickWidget
 from .quick_qa import control
@@ -12,7 +12,7 @@ def start_smoke(window,app,path,fonts,depth='full'):
     path=Path(path).resolve();path.parent.mkdir(parents=True,exist_ok=True)
     started=time.monotonic()
 
-    def settle():
+    def settle(node=None):
         deadline=time.monotonic()+30
         while (window.analysis_pending or (window.current_page in (1,5,6) and window.view_result is None)
                or window.deferred_result or (window.current_page==7 and window.mismatch_page.revision is None)):
@@ -21,7 +21,17 @@ def start_smoke(window,app,path,fonts,depth='full'):
             if window.current_page==7 and any(window.mismatch_page.query_errors.values()):
                 raise AssertionError(window.mismatch_page.query_errors)
             if time.monotonic()>deadline:raise AssertionError('Analysis response timed out')
-        QTest.qWait(60)
+        if node is None:
+            stack=window.settings_page.stack if window.current_page==4 else window.pages
+            node=stack.widget(stack.currentIndex())
+        item=control(window,node)
+        while True:
+            frame=window.quick.grabFramebuffer()
+            if (item.isVisible() and item.width()>0 and item.height()>0
+                    and item.mapRectToScene(item.boundingRect()).intersects(QRectF(window.quick.rect()))
+                    and not frame.isNull()):break
+            app.processEvents();QTest.qWait(20)
+            if time.monotonic()>deadline:raise AssertionError('Page did not finish rendering')
 
     def finish():
         if window.snapshot.get('index',{}).get('loading',False) or window.analysis_pending:
@@ -57,7 +67,7 @@ def start_smoke(window,app,path,fonts,depth='full'):
             assert window.settings.value('quota/trackingEnabled',True,type=bool) is original
             report['weekly_monitoring_toggle']=True
             for category in (window.settings_page.IDS if depth=='full' else ('general','integration')):
-                window.settings_page.reveal(category);QTest.qWait(60)
+                window.settings_page.reveal(category);settle()
                 target=path.with_name(path.stem+f'-settings-{category}.png')
                 assert window.grab().save(str(target));report['screens'].append(str(target))
             window.change_page(7);settle()
@@ -70,7 +80,10 @@ def start_smoke(window,app,path,fonts,depth='full'):
                     app.processEvents();QTest.qWait(20)
                     assert not any(mismatch.query_errors.values()),mismatch.query_errors
                     assert time.monotonic()<deadline,'Mismatch detail response timed out'
+                settle(mismatch.fields)
                 assert mismatch.detail.isVisible()
+                target=path.with_name(path.stem+'-mismatch-detail.png')
+                assert window.grab().save(str(target));report['screens'].append(str(target))
                 report['mismatch_detail']=True
                 mismatch.close_detail()
             report['mismatch_history']=True
@@ -137,7 +150,7 @@ def start_smoke(window,app,path,fonts,depth='full'):
                 assert title_images[0]==title_images[1]
                 report['session_title_preserved']=True
             finally:set_language(locale);overlay.widget.set_content(original_data)
-            window.open_settings();window.settings_page.navigation.setCurrentRow(0);QTest.qWait(60)
+            window.open_settings();window.settings_page.navigation.setCurrentRow(0);settle()
             choices=window.settings_page.controls;choice=choices['language'];button=choices['restart']
             choice.setCurrentIndex(choice.findData(locale));QTest.qWait(20)
             assert not control(window,button).isEnabled()
