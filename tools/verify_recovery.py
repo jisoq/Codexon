@@ -84,11 +84,36 @@ def main():
     try:
         state=wait_report(report,lambda d:not d['busy'] and d.get('result') and d.get('ready'))
         assert state['result']['code']=='refused'
+        user.GetAncestor.argtypes=[W.HWND,W.UINT];user.GetAncestor.restype=W.HWND
+        user.GetWindowRect.argtypes=[W.HWND,ctypes.POINTER(W.RECT)]
+        user.GetClientRect.argtypes=[W.HWND,ctypes.POINTER(W.RECT)]
+        user.SetWindowPos.argtypes=[W.HWND,W.HWND,ctypes.c_int,ctypes.c_int,ctypes.c_int,ctypes.c_int,W.UINT]
+        hwnd=user.GetAncestor(state['hwnd'],2)
+        outer=W.RECT();client=W.RECT()
+        assert user.GetWindowRect(hwnd,ctypes.byref(outer)) and user.GetClientRect(hwnd,ctypes.byref(client))
+        assert user.SetWindowPos(hwnd,None,0,0,480+outer.right-outer.left-client.right,
+            280+outer.bottom-outer.top-client.bottom,0x16)
+        wait_report(report,lambda d:d.get('client')==[480,280])
+        direct='# untouched personal setting\nmodel="synthetic"\n'
+        (home/'config.toml').write_text(direct)
+        report.with_suffix('.recheck').touch()
+        state=wait_report(report,lambda d:not d['busy'] and (d.get('result') or {}).get('code')=='direct')
+        assert state['rechecks']==1 and state['controls']['restore']['visible']
+        assert (home/'config.toml').read_text()==direct
+        (home/'config.toml').write_text(original)
+        report.with_suffix('.recheck').touch()
+        wait_report(report,lambda d:not d['busy'] and (d.get('result') or {}).get('code')=='refused' and d['rechecks']==2)
         # PrintWindow synchronously sends native paint messages into Tk. Keep
         # external capture after the interaction so it cannot disturb the input.
         report.with_suffix('.click').touch()
         state=wait_report(report,lambda d:(d.get('result') or {}).get('code')=='restored')
         assert state['activations']==1
+        assert not state['result']['can_recover'] and not state['controls']['restore']['visible']
+        for name in ('recheck','close','path','diagnosis'):
+            control=state['controls'][name]
+            assert control['visible'] and control['width']>0 and control['height']>0
+            assert 0<=control['x']<control['x']+control['width']<=state['client'][0]
+            assert 0<=control['y']<control['y']+control['height']<=state['client'][1]
         capture(state['hwnd'],root/'after.png')
         assert tomllib.loads((home/'config.toml').read_text())=={'model':'synthetic'}
         assert '# untouched personal setting' in (home/'config.toml').read_text()
@@ -96,7 +121,8 @@ def main():
         verify_saved_connection_recovery(root/'saved-connection',exe)
         result=dict(passed=True,independent_executable=True,actual_button_activation=True,
                     activation_event='Tk <<Invoke>>',model_requests=0,
-                    config_restored=True,auth_preserved=True,saved_connection_recovery=True)
+                    config_restored=True,auth_preserved=True,saved_connection_recovery=True,
+                    manual_recheck_read_only=True,completion_action=True,compact_controls=True)
         (root/'result.json').write_text(json.dumps(result,indent=2))
         print(json.dumps(result))
     finally:
@@ -121,7 +147,10 @@ def verify_saved_connection_recovery(root,exe):
     url=f'http://127.0.0.1:{port}'
     (home/'config.toml').write_text('model="synthetic"\nopenai_base_url="'+url+'"\n',encoding='utf-8')
     auth=home/'auth.json';auth.write_text('{"synthetic":"preserve"}',encoding='utf-8')
-    env={**os.environ,'USERPROFILE':str(profile),'CODEX_HOME':str(home)}
+    other=root/'environment home';other.mkdir()
+    other_config=other/'config.toml';other_config.write_text('openai_base_url="https://custom.example/v1"\n')
+    untouched=other_config.read_bytes()
+    env={**os.environ,'USERPROFILE':str(profile),'CODEX_HOME':str(other)}
     report=root/'result.json'
     for action in ('--status','--restore'):
         result=subprocess.run([str(exe),action,'--report',str(report)],env=env,timeout=45,creationflags=subprocess.CREATE_NO_WINDOW)
@@ -131,6 +160,7 @@ def verify_saved_connection_recovery(root,exe):
     assert tomllib.loads((home/'config.toml').read_text(encoding='utf-8'))==dict(model='synthetic')
     assert auth.read_text(encoding='utf-8')=='{"synthetic":"preserve"}'
     assert not index.with_name('cache-control.sqlite').exists()
+    assert other_config.read_bytes()==untouched
 
 
 
