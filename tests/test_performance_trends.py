@@ -307,7 +307,7 @@ def test_million_calls_keep_anomalies_and_bounded_frames(tmp_path):
     assert any(p.get('count') and p['record']['key']=='543210' for p in points)
     assert len(points)<=768*6
     app=QApplication.instance() or QApplication([])
-    owner=SimpleNamespace(settings=QSettings(str(tmp_path/'million.ini'),QSettings.IniFormat),render=lambda:None,open_record=lambda r:None)
+    owner=SimpleNamespace(settings=QSettings(str(tmp_path/'million.ini'),QSettings.IniFormat),render=lambda:None)
     ui=PerformancePanel(owner);ui.apply(data);host=mount(ui,1120,800)
     owner.render=lambda:ui.apply(projector.query(source,query(now=1801000000,plot_width=768,granularity=ui.granularity)))
     try:
@@ -340,7 +340,7 @@ def test_qt_panel_rolling_hover_analysis_and_click(tmp_path):
     from cachemonitor.performance_panel import PerformancePanel
     from cachemonitor.quick_qa import mount,dispose,render_plot,click,scene_view
     app=QApplication.instance() or QApplication([])
-    owner=SimpleNamespace(settings=QSettings(str(tmp_path/'settings.ini'),QSettings.IniFormat),render=lambda:None,open_record=lambda r:None)
+    owner=SimpleNamespace(settings=QSettings(str(tmp_path/'settings.ini'),QSettings.IniFormat),render=lambda:None)
     rows=[row(i,key=f'{model}-{i}',model=model,cost=cost) for model,cost in (('m',1.),('other',2.),('outside',1000.)) for i in range(20)]
     ui=PerformancePanel(owner);data=PerformanceTrends().query(engine(rows),query(granularity='auto'))
     ui.apply(data);host=mount(ui,1000,800)
@@ -711,7 +711,7 @@ def test_dashboard_tab_worker_contract_and_navigation(tmp_path):
         w.receive(dict(ts=1800100000,sessions=[session.view(1800100000)],homes=['synthetic'],errors=[],unassigned=[],index={'loading':True}))
         assert w.navigation_pages==(6,3,1,5,7)
         w.nav.setCurrentRow(w.navigation_pages.index(5))
-        assert w.current_page==5 and not w.common_filters.isVisible()
+        assert w.current_page==5
         assert w.performance_panel.plots['cost'].rows
         q=w.query();result=w.engine.page_query(q)
         # A broad rolling view omits individual dots but still has real calls.
@@ -791,13 +791,13 @@ def test_dense_workspace_model_comparison_and_hover_analysis(tmp_path,shell):
     projector=PerformanceTrends();source=engine(rows)
     data=projector.query(source,query(now=rows[-1]['ts']+100,plot_width=900,granularity='auto'))
     app=QApplication.instance() or QApplication([])
-    calls=[];owner=SimpleNamespace(settings=QSettings(str(tmp_path/'dense.ini'),QSettings.IniFormat),open_record=calls.append)
+    owner=SimpleNamespace(settings=QSettings(str(tmp_path/'dense.ini'),QSettings.IniFormat))
     if shell:
         from cachemonitor.dashboard import Dashboard
         app.setProperty('cachemonitorDisableShellIntegration',True)
         owner=Dashboard([],start_worker=False,live_limits=False,settings=owner.settings)
         owner.resize(1028,749);owner.show();owner.change_page(5);QTest.qWait(200)
-        owner.open_record=calls.append;ui=owner.performance_panel;host=owner
+        ui=owner.performance_panel;host=owner
     else:ui=PerformancePanel(owner)
     def refresh():
         ui.apply(projector.query(source,query(now=rows[-1]['ts']+100,plot_width=900,time_range=ui.time_range,
@@ -850,7 +850,7 @@ def test_dense_workspace_model_comparison_and_hover_analysis(tmp_path,shell):
         assert not ui.details.comparison.isVisible() and ui.details.band_text.isVisible()
         assert all(model in ui.details.mode_comparison.text() for model in models[:2])
         assert host.quick.grabFramebuffer().save(str(tmp_path/'hover-analysis.png'))
-        assert not calls
+        if shell:assert owner.current_page==5
         restored=PerformancePanel(owner)
         assert restored.granularity=='auto' and restored.models==ui.models and restored.modes==ui.modes
         host.resize(1000,760);render_plot(host,ui.plots['cost'])

@@ -162,7 +162,7 @@ def test_overlay_chart_style_applies_immediately_preserves_selection_and_persist
     model.pin_call(model.call_id(model.rows()[0]))
     selected=model.selected_id
     def unexpected(*args,**kwargs):pytest.fail('Changing chart presentation requested new usage data')
-    controller.overlay_loader=unexpected;controller.record_loader=unexpected
+    controller.overlay_loader=unexpected
     monkeypatch.setattr(controller,'content',unexpected)
     try:
         choice=window.settings_page.controls['overlay-chart-style']
