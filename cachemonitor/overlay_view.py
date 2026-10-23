@@ -5,8 +5,9 @@ import re
 import time
 from datetime import datetime
 from dataclasses import dataclass
-from PySide6.QtCore import Qt, QRectF, QPointF, QObject, Property, Slot, Signal, QTimer
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen, QBrush, QLinearGradient
+from enum import Enum
+from PySide6.QtCore import Qt, QRectF, QPointF, QObject, Property, Slot, Signal, QTimer, QEasingCurve
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen, QBrush, QLinearGradient, QPainterPath
 from .presentation import Node
 from .quick_runtime import QuickHost
 from .overlay_appearance import default_appearance
@@ -106,20 +107,28 @@ class TextRun:
     strike: bool = False
 
 
+class HighlightStyle(Enum):
+    RIBBON = ('ribbon', '잔광 리본')
+    SCAN = ('scan', '라이트 스캔')
+    EDGE = ('edge', '테두리 스윕')
+    BRACKET = ('bracket', '포커스 브래킷')
+    TRAIL = ('trail', '신호 트레일')
+
+    def __init__(self, key, label):
+        self.key = key
+        self.label = label
+
+
 @dataclass(frozen=True)
 class RowGlow:
     start_ms: float
     reduced_motion: bool
 
-    def opacity(self, now_ms):
-        elapsed=max(0,now_ms-self.start_ms)
-        if self.reduced_motion:return .13 if elapsed<300 else 0.
-        if elapsed>=650:return 0.
-        progress=elapsed/70 if elapsed<70 else (650-elapsed)/580
-        return .13*progress*progress*(3-2*progress)
+    def progress(self, now_ms):
+        return max(0.,min(1.,(now_ms-self.start_ms)/(300 if self.reduced_motion else 520)))
 
     def finished(self, now_ms):
-        return now_ms-self.start_ms>=(300 if self.reduced_motion else 650)
+        return self.progress(now_ms)>=1.
 
 
 class RowGlows:
@@ -132,13 +141,9 @@ class RowGlows:
         self.active={owner:glow for owner,glow in self.active.items() if owner in rows}
         if self.appearances is not None:
             for owner,appearance in rows.items():
-                if self.appearances.get(owner)!=appearance and owner not in self.active:
+                if self.appearances.get(owner)!=appearance:
                     self.active[owner]=RowGlow(now_ms,reduced_motion)
         self.appearances=dict(rows) if rows else None
-
-    def opacity(self, owner, *, now_ms):
-        glow=self.active.get(owner)
-        return glow.opacity(now_ms) if glow else 0.
 
     def advance(self, *, now_ms):
         owners=frozenset(self.active)
@@ -163,8 +168,11 @@ def fitted_model_runs(runs, metrics, width):
 
 
 class Drawing:
+    _glow_easing=QEasingCurve(QEasingCurve.BezierSpline)
+    _glow_easing.addCubicBezierSegment(QPointF(.16,.7),QPointF(.25,1),QPointF(1,1))
     def __init__(self,painter,content):
-        self.p=painter;self.model=content;self.colors=palette(content.appearance);painter.setRenderHint(QPainter.Antialiasing)
+        self.p=painter;self.model=content;self.colors=palette(content.appearance);self.now_ms=time.monotonic()*1000
+        painter.setRenderHint(QPainter.Antialiasing)
     def text(self,value,x,y,w,h=16,size=11,color='ink',weight=400,right=False,elide=False,center=False,wrap=False):
         literal=isinstance(value,Verbatim);value=tr(str(value))
         while value.startswith('$') and size>1 and QFontMetrics(font(self.model.appearance.family,size,weight)).horizontalAdvance(value)>w:
@@ -183,12 +191,71 @@ class Drawing:
             self.p.drawText(QRectF(x,y,w,h),Qt.AlignLeft|Qt.AlignVCenter,run.text)
             advance=metrics.horizontalAdvance(run.text);x+=advance;w-=advance
         self.p.restore()
-    def row_glow(self,x,y,w,h,alpha):
-        if alpha<=0:return
-        left=QColor(self.colors['accent']);left.setAlphaF(alpha)
-        right=QColor(left);right.setAlphaF(alpha*.2)
-        gradient=QLinearGradient(x,y,x+w,y);gradient.setColorAt(0,left);gradient.setColorAt(1,right)
-        self.p.setPen(Qt.NoPen);self.p.setBrush(QBrush(gradient));self.p.drawRoundedRect(QRectF(x,y,w,h),5,5)
+    def row_glow(self,x,y,w,h,*,owner,color):
+        glow=self.model.row_glows.active.get(owner)
+        if glow is None or glow.finished(self.now_ms):return
+        progress=glow.progress(self.now_ms);p=self.p
+        def tint(alpha):
+            result=QColor(color);result.setAlphaF(alpha);return result
+        def wash(alpha,width):
+            gradient=QLinearGradient(x,y,x+width,y)
+            gradient.setColorAt(0,tint(alpha));gradient.setColorAt(1,tint(alpha*.16))
+            p.setPen(Qt.NoPen);p.setBrush(QBrush(gradient));p.drawRoundedRect(QRectF(x,y,width,h),5,5)
+        p.save()
+        try:
+            clip=QPainterPath();clip.addRoundedRect(QRectF(x,y,w,h),5,5)
+            p.setClipPath(clip,Qt.IntersectClip)
+            if glow.reduced_motion:
+                wash(.13*(1-progress),w);return
+            age=self._glow_easing.valueForProgress(progress);peak=.85
+            def at(*frames):
+                for (start,a),(end,b) in zip(frames,frames[1:]):
+                    if age<=end:return a+(b-a)*(age-start)/(end-start)
+                return frames[-1][1]
+            style=self.model.highlight_style
+            if style is HighlightStyle.RIBBON:
+                alpha=peak*at((0,1),(.22,.72),(1,0))
+                width=w*at((0,.83),(.22,1),(1,1))
+                wash(.19*alpha,width)
+            elif style is HighlightStyle.SCAN:
+                alpha=peak*at((0,0),(.18,1),(.7,.6),(1,0))
+                width=w*.75;left=x+width*(-1.1+2.6*age)
+                gradient=QLinearGradient(left,y,left+width,y)
+                gradient.setColorAt(0,tint(0));gradient.setColorAt(.5,tint(.24*alpha));gradient.setColorAt(1,tint(0))
+                p.setPen(Qt.NoPen);p.setBrush(QBrush(gradient));p.drawRect(QRectF(left,y,width,h))
+                tip=x+(w-1)*age
+                gradient=QLinearGradient(tip,y+5,tip,y+h-5)
+                gradient.setColorAt(0,tint(0));gradient.setColorAt(.5,tint(peak*at((0,0),(.15,1),(1,0))));gradient.setColorAt(1,tint(0))
+                p.setBrush(QBrush(gradient));p.drawRect(QRectF(tip,y+5,1,h-10))
+            elif style is HighlightStyle.EDGE:
+                wash(.19*peak*at((0,0),(.35,.25),(1,0)),w)
+                length=(w-10)*at((0,.04),(.5,1),(1,1))
+                alpha=peak*at((0,1),(.5,1),(1,0))
+                for left,top in ((x+5,y),(x+w-5-length,y+h-1)):
+                    gradient=QLinearGradient(left,top,left+length,top)
+                    gradient.setColorAt(0,tint(0));gradient.setColorAt(.5,tint(alpha));gradient.setColorAt(1,tint(0))
+                    p.setPen(Qt.NoPen);p.setBrush(QBrush(gradient));p.drawRect(QRectF(left,top,length,1))
+            elif style is HighlightStyle.BRACKET:
+                alpha=peak*at((0,0),(.2,1),(.65,.7),(1,0))
+                offset=at((0,5),(.2,0),(.65,0),(1,2))
+                p.setPen(QPen(tint(alpha),1.5));p.setBrush(Qt.NoBrush)
+                for left,direction in ((x+.75-offset,1),(x+w-.75+offset,-1)):
+                    path=QPainterPath(QPointF(left+6*direction,y+4))
+                    path.lineTo(left,y+4);path.lineTo(left,y+h-4);path.lineTo(left+6*direction,y+h-4)
+                    p.drawPath(path)
+            elif style is HighlightStyle.TRAIL:
+                alpha=peak*at((0,0),(.18,1),(.72,.75),(1,0))
+                length=min(42,w*.2);left=x-length+(w-5+length)*age
+                gradient=QLinearGradient(left,y,left+length,y)
+                gradient.setColorAt(0,tint(0));gradient.setColorAt(1,tint(alpha))
+                p.setPen(Qt.NoPen);p.setBrush(QBrush(gradient));p.drawRect(QRectF(left,y+h-1.5,length,1.5))
+                p.setBrush(tint(peak*at((0,0),(.2,1),(1,0))))
+                p.drawEllipse(QPointF(x+(w-5)*age,y+h-1.5),1.5,1.5)
+                if progress<.65:
+                    ring=self._glow_easing.valueForProgress(progress/.65);radius=7*(.7+ring)
+                    p.setPen(QPen(tint(peak*(1-ring)),1));p.setBrush(Qt.NoBrush)
+                    p.drawEllipse(QPointF(x+AGENT_ICON_SIZE/2,y+12),radius,radius)
+        finally:p.restore()
     def number(self,value,x,baseline,w,size,color='ink',weight=600,right=False):
         value=tr(str(value))
         p=self.p;p.setFont(font(self.model.appearance.family,size,weight));p.setPen(self.colors[color])
@@ -253,7 +320,7 @@ def paint_items(d,items,top=0,bottom=math.inf):
                 if length:d.rect(x+offset,y,length,h,part['color'],pattern=True)
                 offset+=length
         elif style.get('kind')=='tokens':d.tokens(x,y,w,title=value)
-        elif style.get('kind')=='agent-update':d.row_glow(x,y,w,h,style.get('alpha',0))
+        elif style.get('kind')=='agent-update':d.row_glow(x,y,w,h,owner=style['owner'],color=style['color'])
         elif style.get('kind')=='agent-separator':d.rect(x,y,w,h,'border',alpha=.45)
         elif style.get('kind')=='chevron':
             points=((x,y+8),(x+3,y+11),(x+6,y+8)) if style['expanded'] else ((x+1,y+7),(x+4,y+h/2),(x+1,y+13))
@@ -295,7 +362,7 @@ class OverlayContent(Node):
         self._freshness_label=''
         self.highlight_id=None;self._highlight_timer=QTimer(self);self._highlight_timer.setSingleShot(True)
         self._highlight_timer.timeout.connect(self.clear_highlight)
-        self.row_glows=RowGlows();self._row_glow_backgrounds={}
+        self.highlight_style=HighlightStyle.RIBBON;self.row_glows=RowGlows()
         self._row_glow_timer=QTimer(self);self._row_glow_timer.setInterval(16);self._row_glow_timer.setTimerType(Qt.PreciseTimer)
         self._row_glow_timer.timeout.connect(self.advance_row_glows)
         self._body=DetailBody(self)
@@ -419,7 +486,7 @@ class OverlayContent(Node):
         appearances={}
         for owner,group,label in groups:
             items=self.agent_summary_items(group,label,agent_mark(owner[1],self.appearance),False,SECTION_WIDTH,main=owner==groups[0][0])
-            appearances[owner]=tuple((tr(str(item[0])),tuple(item[8].get('modelRuns',())),item[8].get('heartbeat',{}).get('mode'))
+            appearances[owner]=tuple((tr(str(item[0])),tuple((run.text,run.strike) for run in item[8].get('modelRuns',())),item[8].get('heartbeat',{}).get('mode'))
                                      for item in items if item[8].get('kind')!='chevron')
         return appearances
     def update_row_glows(self):
@@ -428,18 +495,24 @@ class OverlayContent(Node):
         if self.row_glows.needs_frame and self.state.get('overlayVisible'):
             if not self._row_glow_timer.isActive():self._row_glow_timer.start()
         else:self._row_glow_timer.stop()
-    def row_glow_opacity(self,owner):return self.row_glows.opacity(owner,now_ms=time.monotonic()*1000)
+    def set_reduced_motion(self,enabled):
+        if enabled==bool(self.state.get('reducedMotion')):return
+        self.put(reducedMotion=enabled)
+        if enabled:
+            now=time.monotonic()*1000;self.row_glows.advance(now_ms=now)
+            for owner,glow in self.row_glows.active.items():
+                if not glow.reduced_motion:self.row_glows.active[owner]=RowGlow(now,True)
+            self.clear_highlight()
+            if not self.row_glows.needs_frame:self._row_glow_timer.stop()
+        self._body.update();self.update()
     def advance_row_glows(self):
         if not self.state.get('overlayVisible'):
             self.clear_row_glows();return
         now=time.monotonic()*1000;owners=self.row_glows.advance(now_ms=now)
-        for owner in owners:
-            if style:=self._row_glow_backgrounds.get(owner):style['alpha']=self.row_glows.opacity(owner,now_ms=now)
         if not self.row_glows.needs_frame:self._row_glow_timer.stop()
         if owners:self._body.update();self.update()
     def clear_row_glows(self):
         self._row_glow_timer.stop();self.row_glows.clear()
-        for style in self._row_glow_backgrounds.values():style['alpha']=0.
         if hasattr(self,'_body'):self._body.update()
         self.update()
     def rows(self):return (self.data or {}).get('recent',[])[-RECENT_CALLS:]
@@ -527,7 +600,6 @@ class OverlayContent(Node):
     def main_model_tooltip(self):return self.agent_model_tooltip(main_usage(self.data or {}))
     def sync_details(self):
         items=self.detail_items() if self.has_subagents() else [];self._detail_items=items;height=max((r[2]+r[4] for r in items),default=16)
-        self._row_glow_backgrounds={item[8]['owner']:item[8] for item in items if item[8].get('kind')=='agent-update'}
         actions=[]
         for item in items:
             style=item[8]
@@ -849,7 +921,7 @@ class OverlayContent(Node):
             agent=(group.get('home'),group.get('id'));mark=agent_mark(agent[1],self.appearance)
             summary=self.agent_summary_items(group,group['label'],mark,expanded,w,cost_column=cost_column)
             summary_height=self.agent_summary_height(summary)
-            items.append(('',0,y,w,summary_height,11,'ink',400,dict(kind='agent-update',owner=agent,alpha=self.row_glow_opacity(agent))))
+            items.append(('',0,y,w,summary_height,11,'ink',400,dict(kind='agent-update',owner=agent,color=mark.color)))
             self._sub_summary_heights.append(summary_height)
             for item in summary:
                 items.append((*item[:2],item[2]+y,*item[3:]))
