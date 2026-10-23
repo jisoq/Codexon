@@ -476,7 +476,8 @@ class OverlayContent(Node):
         return rows[-1] if rows else {}
     def speed_alert(self):
         # Collection trouble is not evidence that the current session is slow.
-        return (self.data or {}).get('speed_health', {}) if not self.note else {}
+        data=self.data or {}
+        return data.get('speed_health', {}) if not self.note and not data.get('_collection',{}).get('retained') else {}
     def has_subagents(self):return bool((self.data or {}).get('descendants',0)>0 and not self.notice_card())
     def set_detail_group(self,mode):
         if mode not in ('model','sub') or mode==self.detail_group:return
@@ -644,7 +645,7 @@ class OverlayContent(Node):
         count=data.get('active_requests',int(data.get('request',{}).get('state')=='진행'))
         failures=[value for value,level in self.states() if level=='error' or '지연' in value]
         failed=bool(failures or data.get('_collection',{}).get('errors'))
-        pending=not data or bool(self.notice_card()) or self.note=='갱신 중' and not self.background_refresh
+        pending=not data or bool(self.notice_card()) or self.note=='갱신 중'
         mode='error' if failed else 'pending' if pending else 'active' if count else 'idle'
         if mode=='error':
             label=failures[0] if failures else '수집 오류'

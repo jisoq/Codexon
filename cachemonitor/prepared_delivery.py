@@ -302,6 +302,19 @@ class PreparedPublisher:
                         {name:value for name,value in entry.items() if name!='owner_ordinal'}):
                     # Order alone retains every verified content reference.
                     continue
+                preserve_content=bool(previous is not None and key in overlay.own and
+                    {name:value for name,value in previous['metadata'].items()
+                     if name not in ('status','remaining','usage_revision','request_revision')} ==
+                    {name:value for name,value in entry['metadata'].items()
+                     if name not in ('status','remaining','usage_revision','request_revision')} and
+                    {name:value for name,value in previous['dependencies'].items()
+                     if name not in ('state','state_facts')} ==
+                    {name:value for name,value in entry['dependencies'].items()
+                     if name not in ('state','state_facts')} and
+                    {name:value for name,value in previous.items()
+                     if name not in ('owner_ordinal','metadata','dependencies')} ==
+                    {name:value for name,value in entry.items()
+                     if name not in ('owner_ordinal','metadata','dependencies')})
                 old_alerts=alerts.get(key,{})
                 weight=_weight((key,entry,owner_choices,new_alerts),self.STATE_BYTES)
                 owner_bytes=owner_bytes-weights.get(key,0)+weight
@@ -312,7 +325,8 @@ class PreparedPublisher:
                 content_changed.add(key)
                 if entry['metadata'].get('_internal_review'):
                     continue
-                if isinstance(summary,dict) and 'owner' in summary:overlay.prime(view,key,summary)
+                if isinstance(summary,dict) and 'owner' in summary:
+                    overlay.prime(view,key,summary,preserve_content=preserve_content)
                 # A resolved alert still emits the corrected selected row.
                 keys=[identity for identity in old_alerts.keys()|new_alerts.keys()
                       if old_alerts.get(identity)!=new_alerts.get(identity)]

@@ -440,7 +440,7 @@ class OverlayController(QObject):
 
     def can_present(self,home,sid):
         return bool(self.enabled and self.selected_scope(home,sid) and self.widget.isVisible()
-                    and not self.widget.note
+                    and not self.widget.note and not (self.widget.data or {}).get('_collection',{}).get('retained')
                     and self.native and self.native.visible_target(self.target_state['target']['hwnd'])
                     and time.monotonic()-self.observed_at<=3)
 
@@ -736,6 +736,13 @@ class OverlayController(QObject):
             'collection_snapshot_at':getattr(self,'collection_published_at',None)},time.time(),
             started_at=getattr(self,'collection_started_at',None))
 
+    @staticmethod
+    def retained_detail_delayed(data):
+        collection=(data or {}).get('_collection',{})
+        confirmed=collection.get('last_confirmed_at')
+        return bool(collection.get('retained') and
+                    (not confirmed or time.time()-confirmed>ANALYSIS_DELAY_SECONDS))
+
     def content(self):
         selection = self.target_state.get('selection')
         if not selection or not selection.thread_id:
@@ -771,7 +778,7 @@ class OverlayController(QObject):
             'source_error_count':len(self.errors),
         }}
         data,pending=self.prepared_content(data)
-        if pending and data and not note:
+        if pending and data and not note and self.retained_detail_delayed(data):
             note='갱신 중'
             data['_collection']['reason']='detail_pending'
         return data,note or ('기록 확인 중' if pending and data is None else '')
@@ -859,6 +866,7 @@ class OverlayController(QObject):
         if data and data.get('_collection',{}).get('reason')=='analysis_delay':
             data=dict(data,_collection=dict(data['_collection'],received_age=age))
         return (age>ANALYSIS_DELAY_SECONDS,
+                self.retained_detail_delayed(data),
                 OverlayController.collection_phase(self),
                 OverlayContent.collection_age(data,self.widget.note))
 
