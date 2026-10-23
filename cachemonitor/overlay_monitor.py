@@ -190,6 +190,10 @@ def action_links(m):
 def links(m):
     if m.notice_card():return []
     result=action_links(m);g=m.layout();rows=m.rows();step=SECTION_WIDTH/max(1,len(rows))
+    heartbeat=m.heartbeat_state()
+    if heartbeat['message']:
+        result.append(dict(id='heartbeat',x=heartbeat['x'],y=heartbeat['y'],width=RIGHT-heartbeat['x'],height=18,
+                           interaction='tooltip',tooltip=heartbeat['message'],accessible=heartbeat['message']))
     from .overlay_icons import agent_mark
     result.extend(dict(x=MARGIN+item[1],y=g['main']+item[2],width=item[3],height=item[4],**item[8]['link'])
                   for item in m.agent_summary_items(main_usage(m.data or {}),'Main Agent',

@@ -63,7 +63,7 @@ Item {
             }
             UiToolTip {
                 objectName: "tooltip-" + link.modelData.id
-                visible: link.infoIcon && pointer.containsMouse
+                visible: pointer.containsMouse && (link.infoIcon || link.modelData.interaction === "tooltip")
                 text: link.modelData.tooltip || ""
             }
 

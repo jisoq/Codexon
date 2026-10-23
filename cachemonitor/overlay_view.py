@@ -309,9 +309,12 @@ class OverlayContent(Node):
     @property
     def is_remote(self):return self.note.startswith('원격 작업')
     @property
-    def checking_records(self):return self.note in ('기록 준비 중','기록 확인 중','세션 기록 확인 중','기록 수집 중 (잠정값)','갱신 중')
+    def background_refresh(self):
+        return bool(self.data and 'calls' in self.data and self.note=='갱신 중'
+                    and self.data.get('_collection',{}).get('reason') in ('analysis_delay','detail_pending'))
+    @property
+    def checking_records(self):return not self.background_refresh and self.note in ('기록 준비 중','기록 확인 중','세션 기록 확인 중','기록 수집 중 (잠정값)','갱신 중')
     def content_opacity(self):
-        if self.note=='갱신 중' and (self.data or {}).get('_collection',{}).get('reason')=='detail_pending':return 1.
         return .5 if self.checking_records or self.note in ('수집 오류','수집 지연','수집 시작 중','분석 지연','분석 오류') else 1.
     def notice_card(self):
         from .overlay_monitor import REMOTE_HEADING,REMOTE_DESCRIPTION
@@ -473,7 +476,8 @@ class OverlayContent(Node):
         return rows[-1] if rows else {}
     def speed_alert(self):
         # Collection trouble is not evidence that the current session is slow.
-        return (self.data or {}).get('speed_health', {}) if not self.note else {}
+        data=self.data or {}
+        return data.get('speed_health', {}) if not self.note and not data.get('_collection',{}).get('retained') else {}
     def has_subagents(self):return bool((self.data or {}).get('descendants',0)>0 and not self.notice_card())
     def set_detail_group(self,mode):
         if mode not in ('model','sub') or mode==self.detail_group:return
@@ -549,7 +553,7 @@ class OverlayContent(Node):
                  overlayWarning=colors['warning'].name(),overlayBand=colors['band'].name(),overlaySelection=colors['selection'].name(),overlaySecondary=colors['secondary'].name(),
                  detailHasSession=bool((self.data or {}).get('id')),detailSessionKey=str(((self.data or {}).get('home'),(self.data or {}).get('id'))),
                  detailActions=actions,heartbeatActive=heartbeat['mode']=='active',heartbeatCount=heartbeat['count'],totalRowVisible=True,
-                 heartbeatMode=heartbeat['mode'],heartbeatColor=heartbeat['color'],heartbeatLabel=heartbeat['label'],
+                 heartbeatMode=heartbeat['mode'],heartbeatColor=heartbeat['color'],heartbeatLabel=heartbeat['label'],heartbeatMessage=heartbeat['message'],
                  heartbeatX=heartbeat['x'],heartbeatY=heartbeat['y'])
         self._body.update()
         self._body.setAccessibleName(Verbatim('\n'.join(item[8].get('actionLabel') or (''.join(item[0]) if isinstance(item[0],list) else item[0]) for item in items)))
