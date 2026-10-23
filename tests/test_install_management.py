@@ -28,6 +28,43 @@ def fixture(root):
     return product,recovery
 
 
+@pytest.mark.parametrize('launch,isolated,opens_gui',[(True,False,True),(False,False,False),(True,True,False)])
+def test_successful_install_reopens_after_stopped_session_only_when_requested(tmp_path,monkeypatch,launch,isolated,opens_gui):
+    import subprocess
+    from types import SimpleNamespace
+    from cachemonitor import app_services,install_cleanup,installation,launch_context,observer_task
+    from cachemonitor.proxy_target import ProxyTarget
+    from cachemonitor.update_state import UpdateState
+    product,recovery=fixture(tmp_path)
+    manager=SimpleNamespace(home=tmp_path/'custom home',evidence=tmp_path/'custom evidence.sqlite',
+                            directory=tmp_path/'observer',url='http://127.0.0.1:19876')
+    manager.directory.mkdir()
+    stopped=dict(scope=ProxyTarget(manager).scope,phase='stopped',resume=False)
+    app_services.session_path(manager).write_text(json.dumps(stopped))
+    journal=UpdateState(tmp_path)
+    record=journal.begin('app','test',scope=stopped['scope'])
+    launches=[]
+    monkeypatch.setattr(install,'connection_manager',lambda:manager)
+    monkeypatch.setattr(install,'register',lambda *a,**k:None)
+    monkeypatch.setattr(install,'migrate_startup',lambda *a:None)
+    monkeypatch.setattr(installation,'pointer_path',lambda:tmp_path/'shared-installation.json')
+    monkeypatch.setattr(launch_context,'preference_path',lambda:tmp_path/'launch.json')
+    monkeypatch.setattr(launch_context,'running_homes',lambda root:[])
+    monkeypatch.setattr(launch_context,'resolve_homes',lambda homes:[str(manager.home)])
+    monkeypatch.setattr(install_cleanup,'queue',lambda root:None)
+    monkeypatch.setattr(observer_task,'retire_desktop_startups',lambda root:None)
+    monkeypatch.setattr(observer_task.ObserverTask,'start',lambda self,command:launches.append(command))
+    def run(command,**kwargs):
+        report=command[command.index('--control-report')+1] if '--control-report' in command else command[-1]
+        Path(report).write_text(json.dumps(dict(errors=[],version='test',phase='off')))
+        return subprocess.CompletedProcess(command,0)
+    monkeypatch.setattr(install.subprocess,'run',run)
+    receipt=install.finish(tmp_path,product,recovery,launch=launch,isolated=isolated,update_id=record['operation_id'])
+    assert receipt['product']==str(product) and receipt['version']=='test'
+    assert not (tmp_path/'activation-pending.json').exists()
+    assert json.loads(app_services.session_path(manager).read_text())==stopped
+    assert launches==([[str(product/'Codexon.exe'),'--replace-gui']] if opens_gui else [])
+
 @pytest.fixture
 def committed_installation(tmp_path,monkeypatch,request):
     """Crash on either side of the verified installation journal write."""
