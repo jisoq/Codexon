@@ -206,7 +206,7 @@ def finish(root, product, recovery, *, isolated=False, launch=True, language='ko
                                           client=consent)
                     update_id=request['operation_id']
                 elif client.get('phase')=='awaiting_consent' or not client:
-                    if silent or not confirm_native(language):raise RuntimeError(CONSENT_REQUIRED)
+                    if not confirm_native(language):raise RuntimeError(CONSENT_REQUIRED)
                     journal.client_result(update_id,**capture())
                 prepare_restart(journal,update_id,recovery)
                 if not journal.begin_activation(update_id):

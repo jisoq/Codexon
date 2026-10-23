@@ -226,34 +226,43 @@ restart.start(UpdateState(sys.argv[2]),sys.argv[3],Path(sys.argv[4]))
         task.remove()
 
 
-@pytest.mark.parametrize('silent', [True,False])
-def test_standalone_upgrade_requires_consent_after_preflight_before_activation(tmp_path,desktop,monkeypatch,silent):
+@pytest.mark.parametrize('silent,app_initiated', [(True,False),(False,False),(True,True)])
+def test_upgrade_requires_consent_after_preflight_before_activation(tmp_path,desktop,monkeypatch,silent,app_initiated):
     from cachemonitor import install_management as install
     from tests.test_install_management import fixture
     product,recovery=fixture(tmp_path)
     (tmp_path/'installation.json').write_text(json.dumps(dict(product='old')))
+    journal=UpdateState(tmp_path)
+    request=journal.begin('app','test') if app_initiated else {}
+    if request:
+        request.pop('client');journal.write(request)
     verified=[];prompts=[]
     def runtime(command,**kwargs):
         verified.append(True);Path(command[-1]).write_text(json.dumps(dict(errors=[],version='test')))
         return SimpleNamespace(returncode=0)
     monkeypatch.setattr(install.subprocess,'run',runtime)
     monkeypatch.setattr(restart,'confirm_native',lambda language:prompts.append(bool(verified)) or False)
+    monkeypatch.setattr(restart,'prepare_restart',lambda *a:pytest.fail('Restart preparation preceded consent'))
     from cachemonitor import install_activation
     monkeypatch.setattr(install_activation,'Activation',lambda *a:pytest.fail('Activation preceded consent'))
-    with pytest.raises(RuntimeError,match='재시작'):install.finish(tmp_path,product,recovery,silent=silent)
-    assert verified and prompts==([] if silent else [True])
-    assert not desktop.closed
+    with pytest.raises(RuntimeError,match='재시작'):
+        install.finish(tmp_path,product,recovery,silent=silent,update_id=request.get('operation_id'))
+    assert verified and prompts==([True] if app_initiated or not silent else [])
+    assert not desktop.closed and not desktop.activated
+    assert not journal.read().get('activation_started')
 
 
-@pytest.mark.parametrize('supplied_id,failure', [(False,'register'),(False,'constructor'),(True,'register')])
-def test_install_failure_after_closure_reports_its_operation_and_reopens(tmp_path,desktop,monkeypatch,supplied_id,failure):
+@pytest.mark.parametrize('supplied_id,failure,legacy', [(False,'register',False),(False,'constructor',False),(True,'register',False),(True,'register',True)])
+def test_install_failure_after_closure_reports_its_operation_and_reopens(tmp_path,desktop,monkeypatch,supplied_id,failure,legacy):
     from cachemonitor import install_activation,install_management as install,launch_context
     from tests.test_install_management import fixture
     product,recovery=fixture(tmp_path)
     (tmp_path/'installation.json').write_text(json.dumps(dict(product='old')))
     manager=SimpleNamespace(directory=tmp_path,home=tmp_path/'home',evidence=tmp_path/'evidence.sqlite',url='http://127.0.0.1:18768')
-    journal=UpdateState(tmp_path);workers=[];restored=[]
+    journal=UpdateState(tmp_path);workers=[];restored=[];prompts=[]
     op=journal.begin('app','test',client=restart.capture())['operation_id'] if supplied_id else None
+    if legacy:
+        request=journal.read();request.pop('client');journal.write(request)
     def runtime(command,**kwargs):
         Path(command[-1]).write_text(json.dumps(dict(errors=[],version='test')))
         return SimpleNamespace(returncode=0)
@@ -266,7 +275,7 @@ def test_install_failure_after_closure_reports_its_operation_and_reopens(tmp_pat
         def rollback(self):restored.append(True)
     monkeypatch.setattr(install.subprocess,'run',runtime)
     monkeypatch.setattr(install,'connection_manager',lambda:manager)
-    monkeypatch.setattr(restart,'confirm_native',lambda language:True)
+    monkeypatch.setattr(restart,'confirm_native',lambda language:prompts.append(not workers and not desktop.closed and not restored) or True)
     monkeypatch.setattr(restart,'start',start)
     monkeypatch.setattr(restart,'restored_ready',lambda record:bool(restored))
     monkeypatch.setattr(install_activation,'Activation',Activation)
@@ -275,7 +284,8 @@ def test_install_failure_after_closure_reports_its_operation_and_reopens(tmp_pat
     monkeypatch.setattr(install,'register',lambda *a,**kw:(_ for _ in ()).throw(OSError('Activation failed')))
     try:
         with pytest.raises(OSError,match='Activation failed'):
-            install.finish(tmp_path,product,recovery,launch=False,update_id=op)
+            install.finish(tmp_path,product,recovery,launch=False,update_id=op,silent=legacy)
+        assert prompts==([True] if legacy or not supplied_id else [])
         assert restored and desktop.closed
         assert journal.read()['component_phase']=='failed'
         settle(lambda:all(not worker.is_alive() for worker in workers))
