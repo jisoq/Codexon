@@ -179,6 +179,7 @@ def cleanup(root, executable, services):
     root=Path(root).absolute();executable=Path(executable).absolute()
     with ProcessLock(root/'install.lock'):
         current=read_json(root/'installation.json')
+        client=read_json(root/'app-update.json').get('client',{})
         if Path(current.get('product',''))/'Codexon.exe'!=executable:
             raise RuntimeError('not-current-installation')
         if (root/'activation-pending.json').exists():raise RuntimeError('activation-pending')
@@ -206,6 +207,9 @@ def cleanup(root, executable, services):
                     # A service or installer may have started since inventory.
                     if any(referenced(path,p.get('ExecutablePath','')) or referenced(path,p.get('CommandLine',''))
                            for p in processes_under(root)):reason='process-running'
+                    elif (client.get('phase') not in
+                          ('restarted','not_running','not_applicable') and referenced(path,
+                          client.get('recovery',''))):reason='client-restart-pending'
                     elif any(referenced(path,t.get('actions',[])) for t in tasks):reason='task-reference'
                     elif any(referenced(path,text) for text in refs):reason='startup-or-hook-reference'
                     else:

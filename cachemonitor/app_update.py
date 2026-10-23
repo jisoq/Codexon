@@ -132,7 +132,7 @@ def connection_count(status):
     return count if type(count) is int and count>=0 else None
 
 
-def update(progress=lambda _:None, manager=None, *, plan=None):
+def update(progress=lambda _:None, manager=None, *, plan=None, consent=None):
     # The GUI passes the exact offer the user confirmed; do not fetch a newer
     # release between confirmation and installation.
     plan=check_update(progress,manager) if plan is None else plan
@@ -154,17 +154,21 @@ def update(progress=lambda _:None, manager=None, *, plan=None):
             if current['state']!='required' or current.get('instance')!=plan.get('proxy',{}).get('instance'):
                 raise RuntimeError('연결 상태가 바뀌었습니다. 업데이트를 다시 확인하세요.')
         record=journal.begin(plan['kind'],plan['release']['tag_name'].lstrip('v') if plan['kind']=='app' else VERSION,
-                             scope=scope_for(manager),release=plan.get('release'))
+                             scope=scope_for(manager),release=plan.get('release'),client=consent)
         operation_id=record['operation_id']
         try:
             if plan['kind']=='proxy':
                 from .install_management import activate_proxy
+                from .client_restart import prepare_restart, recovery_path
+                from .proxy_update import ProxyUpdate
+                ProxyUpdate(manager).preflight()
+                prepare_restart(journal,operation_id,recovery_path(install))
                 result=activate_proxy(manager,operation_id=operation_id,update_root=journal.root)
                 journal.proxy_result(operation_id,result)
             else:
                 download_and_install(plan['release'],install,progress,journal,operation_id)
         except UpdateCancelled:
-            journal.change(operation_id,phase='cancelled',message='업데이트를 취소했습니다.')
+            journal.change(operation_id,phase='cancelled',component_phase='cancelled',message='업데이트를 취소했습니다.')
         except Exception as exc:
             journal.fail(operation_id,str(exc))
             raise
@@ -257,7 +261,7 @@ def download_and_install(release,install,progress,journal,operation_id):
     launch_installer(output,install['InstallRoot'],operation_id)
 
 
-def retry_proxy(manager,journal,*,verified_operation_id=None):
+def retry_proxy(manager,journal,*,verified_operation_id=None,consent=None):
     """Resume only the outstanding connection stage of the same operation."""
     from .install_management import activate_proxy
     from .update_state import scope_for
@@ -268,22 +272,33 @@ def retry_proxy(manager,journal,*,verified_operation_id=None):
             from .update_state import valid_id
             if not valid_id(verified_operation_id) or operation_id!=verified_operation_id:
                 raise RuntimeError('업데이트 상태가 바뀌었습니다. 다시 확인하세요.')
+        if not operation_id or record.get('phase') not in ('partial','failed','deferred','interrupted','restart_required'):
+            raise RuntimeError('다시 적용할 연결 작업이 없습니다.')
+        if record.get('scope')!=scope_for(manager):raise RuntimeError('다른 연결의 업데이트 기록을 보존합니다.')
+        from .client_restart import retry, prepare_restart, recovery_path, needs_reopening, CONSENT_REQUIRED
+        recovery=recovery_path()
+        client=record.get('client',{})
+        if needs_reopening(client):
+            retry(journal,operation_id,recovery)
+            return journal.read()
+        if record.get('app',{}).get('state') not in ('verified','current'):
+            raise RuntimeError('앱 설치가 완료되지 않았습니다. 업데이트를 다시 확인하세요.')
+        if verified_operation_id is not None:
             continuation=continuation_target(journal,manager)
             if (continuation['verified_operation_id']!=verified_operation_id
                     or not getattr(sys,'frozen',False)
                     or Path(continuation['executable']).resolve()!=Path(sys.executable).resolve()):
                 raise RuntimeError('시작 메뉴에서 새 Codexon을 열어 업데이트를 계속하세요.')
-        if not operation_id or record.get('phase') not in ('partial','failed','deferred','interrupted'):
-            raise RuntimeError('다시 적용할 연결 작업이 없습니다.')
-        if record.get('scope')!=scope_for(manager):raise RuntimeError('다른 연결의 업데이트 기록을 보존합니다.')
-        if record.get('app',{}).get('state') not in ('verified','current'):
-            raise RuntimeError('앱 설치가 완료되지 않았습니다. 업데이트를 다시 확인하세요.')
         if getattr(sys,'frozen',False) and record.get('app',{}).get('state')=='verified' and Path(record['app']['executable']).resolve()!=Path(sys.executable).resolve():
             raise RuntimeError('시작 메뉴에서 새 Codexon을 열어 업데이트를 계속하세요.')
-        if not journal.change(operation_id,phase='waiting',cancel_requested=False,defer_requested=False,
-                              proxy={**record.get('proxy',{}),'cutover_started':False}):
+        if consent is None and client.get('phase') not in ('closed','not_running','not_applicable'):
+            raise RuntimeError(CONSENT_REQUIRED)
+        from .proxy_update import ProxyUpdate
+        ProxyUpdate(manager).preflight()
+        if not journal.prepare_proxy_retry(operation_id,consent):
             raise RuntimeError('업데이트 상태가 바뀌었습니다. 다시 확인하세요.')
         try:
+            prepare_restart(journal,operation_id,recovery)
             result=activate_proxy(manager,operation_id=operation_id,update_root=journal.root)
             journal.proxy_result(operation_id,result)
         except Exception as exc:
@@ -299,7 +314,7 @@ def continuation_target(journal, manager):
     with ProcessLock(journal.root/'install.lock'):
         record=journal.read();app=record.get('app',{})
         if (app.get('state')!='verified' or record.get('scope')!=scope_for(manager)
-                or record.get('phase') not in ('partial','failed','deferred','interrupted')):
+                or record.get('phase') not in ('partial','failed','deferred','interrupted','restart_required')):
             raise RuntimeError('업데이트 상태가 바뀌었습니다. 다시 확인하세요.')
         executable=Path(app['executable']).resolve()
         current=installed()
@@ -375,6 +390,10 @@ def reconcile_update(journal,manager=None):
     from .update_state import ACTIVE, matches_proxy_target, scope_for
     record=journal.read();phase=record.get('phase')
     if not record:return record
+    client=record.get('client',{})
+    if client.get('phase') in ('closing','closed','reopening') and client.get('recovery'):
+        from .client_restart import start
+        start(journal,record['operation_id'],client['recovery'])
     previous=record.get('proxy',{})
     replayed_installing=False
     scope_matches=manager is not None and bool(record.get('scope')) and record['scope'] == scope_for(manager)

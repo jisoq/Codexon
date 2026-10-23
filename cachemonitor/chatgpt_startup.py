@@ -15,6 +15,7 @@ APP_ID_KEY = 'startup/chatgptAppId'
 # Package family IDs are stable across Store updates and include OpenAI's publisher ID.
 _APP_IDS = ('OpenAI.Codex_2p2nqsd0c76g0!App',
             'OpenAI.ChatGPT-Desktop_2p2nqsd0c76g0!App')
+CODEX_APP_ID = _APP_IDS[0]
 
 
 def _require_windows():
@@ -27,7 +28,7 @@ def discover_chatgpt():
     _require_windows()
     script = ("$ErrorActionPreference='Stop'; "
               "[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); "
-              "@(Get-StartApps | Where-Object { $_.Name -eq 'ChatGPT' } | "
+              "@(Get-StartApps | "
               "Select-Object -ExpandProperty AppID) | ConvertTo-Json -Compress")
     powershell = Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32/WindowsPowerShell/v1.0/powershell.exe'
     try:
@@ -97,6 +98,35 @@ def _already_running(app_id):
     return False
 
 
+def desktop_processes():
+    from .proxy_identity import process_identity
+    _require_windows()
+    api = _process_api()
+    session = W.DWORD()
+    if not api.ProcessIdToSessionId(os.getpid(), C.byref(session)):
+        raise OSError('현재 Windows 로그인 세션을 확인하지 못했습니다.')
+    capacity = 1024
+    while True:
+        pids = (W.DWORD * capacity)(); used = W.DWORD()
+        if not api.K32EnumProcesses(pids, C.sizeof(pids), C.byref(used)):
+            raise OSError('실행 중인 Codex를 확인하지 못했습니다.')
+        if used.value < C.sizeof(pids):break
+        capacity *= 2
+    found = []
+    for pid in pids[:used.value // C.sizeof(W.DWORD)]:
+        other = W.DWORD()
+        if not pid or not api.ProcessIdToSessionId(pid, C.byref(other)) or other.value != session.value:continue
+        handle = api.OpenProcess(0x1000, False, pid)
+        if not handle:continue
+        try:
+            size = W.UINT(512); value = C.create_unicode_buffer(size.value)
+            if api.GetApplicationUserModelId(handle, C.byref(size), value) or value.value != CODEX_APP_ID:continue
+            identity = process_identity(pid)
+            if identity:found.append(dict(identity, app_id=CODEX_APP_ID, session=session.value))
+        finally:api.CloseHandle(handle)
+    return found
+
+
 def _activate(app_id):
     """Activate by AUMID and surface Windows' result instead of spawning Explorer."""
     ole = C.OleDLL('ole32')
@@ -122,6 +152,7 @@ def _activate(app_id):
         result = activate(manager, app_id, None, 2, C.byref(pid))  # AO_NOERRORUI
         if result < 0:
             raise OSError(f'Windows 앱 실행 오류: 0x{result & 0xffffffff:08X}')
+        return pid.value
     finally:
         if manager:
             table = C.cast(manager, C.POINTER(C.POINTER(C.c_void_p))).contents

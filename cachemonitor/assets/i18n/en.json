@@ -2906,5 +2906,17 @@
   "응답 추론 설정 근거": "Response effort evidence",
   "요청 모드 근거": "Request mode evidence",
   "정정 시각": "Corrected at",
-  "정정 사유": "Correction reason"
+  "정정 사유": "Correction reason",
+  "진행 중인 작업을 마치고 저장하세요. 업데이트하려면 Codex를 종료한 뒤 다시 실행해야 합니다.": "Finish and save your work. Updating requires closing and reopening Codex.",
+  "Codex 재시작": "Restart Codex",
+  "업데이트하고 재시작": "Update and restart",
+  "Codex 재시작 필요": "Codex restart required",
+  "Codex 종료 중": "Closing Codex",
+  "Codex 다시 실행 중": "Reopening Codex",
+  "Codex 다시 실행": "Reopen Codex",
+  "Codex를 완전히 종료한 뒤 다시 시도하세요.": "Exit Codex completely, then try again.",
+  "Codex를 다시 실행하지 못했습니다. 다시 시도하세요.": "Could not reopen Codex. Try again.",
+  "업데이트를 다시 시작하고 Codex 재시작을 확인하세요.": "Start the update again and confirm the Codex restart.",
+  "Codex 종료 확인을 완료하지 못했습니다. 다시 시도하세요.": "Could not confirm that Codex exited. Try again.",
+  "연결 복구 후 Codex를 다시 실행하세요.": "Restore the connection, then reopen Codex."
 }

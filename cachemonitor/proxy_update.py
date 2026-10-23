@@ -143,6 +143,8 @@ class ProxyUpdate:
             data=read_json(self.path)
             if data.get('operation_id') and data.get('update_root') and not data.get('cutover_started'):
                 from .update_state import UpdateState
+                from .client_restart import require_stopped
+                require_stopped(UpdateState(data['update_root']),data['operation_id'])
                 if not UpdateState(data['update_root']).begin_switch(data['operation_id']):raise UpdateCancelled()
             self.publish('switching',cutover_started=True,required_action=None,
                          message='기존 연결을 마무리하고 프록시를 교체하고 있습니다.')

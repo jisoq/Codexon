@@ -4,6 +4,7 @@ from pathlib import Path
 import hashlib
 import io
 import pytest
+from tests.restart_fixture import no_running_desktop
 from cachemonitor.update_state import UpdateState,scope_for
 from cachemonitor import app_update
 
