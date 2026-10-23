@@ -349,7 +349,7 @@ class LiveCollection:
                 finally:self.waiters.discard(client)
         if value.get('close') or value.get('lease_only'):return dict(ready=current is not None),b''
         if current is None:return dict(ready=False),b''
-        if value.get('header_only'):return dict(ready=True,header=current['header']),b''
+        if value.get('header_only'):return dict(ready=True,header=current['header'],publication=current['publication']),b''
         if value.get('protocol')==CATALOG_PROTOCOL:return self.catalog_request(current,value)
         # Older clients can still use the unchanged durable SQLite schema.
         protocol=value.get('protocol')
@@ -497,8 +497,7 @@ def locked(path):
     else:probe.__exit__(None,None,None);return False
 
 
-class CollectionChannel:
-    """IPC contains sanitized results and requested homes, never source offsets."""
+class CollectionHeaderReader:
     def __init__(self,homes,path=None,evidence=None):
         self.path=index_location(path);self.index_path=path;self.evidence=evidence
         self.homes=list(dict.fromkeys(str(Path(h).resolve()) for h in homes))
@@ -508,6 +507,72 @@ class CollectionChannel:
         self.default_evidence=self.path.with_name('model-evidence.sqlite') if path is not None else default_path()
         self.scope=self.scope_key(evidence)
         self.snapshot_path=self.companion('.collection.sqlite')
+        self.client=uuid.uuid4().hex
+        self.header=None;self.publication=None;self.last_read_live=False
+
+    def companion(self,suffix):
+        return self.path.with_name(self.path.name+'.codexon-'+suffix.lstrip('.'))
+
+    def scope_key(self,evidence):
+        return os.path.normcase(str(Path(evidence or self.default_evidence).resolve()))
+
+    def live_request(self,**value):
+        from .collection_transport import request
+        return request(self.companion('.collection-live.json'),
+                       dict(path=str(self.path),scope=self.scope,client=self.client,homes=self.homes,**value),
+                       response_limits=(CATALOG_PAGE_BYTES,0) if value.get('header_only') else None)
+
+    def validate_header(self,header):
+        source=header.get('index',{}).get('path')
+        if not source or os.path.normcase(str(Path(source).resolve()))!=os.path.normcase(str(self.path)):
+            raise CollectionScopeError('수집 결과의 사용량 색인 경로가 일치하지 않습니다.')
+        if header.get('collection_schema',1) not in (1,2):
+            raise CollectionScopeError('지원하지 않는 수집 형식입니다.')
+
+    def accept_header(self,header,publication):
+        self.validate_header(header)
+        publication=tuple(publication) if publication is not None else None
+        if (self.header is not None and self.publication and publication
+                and publication[0]==self.publication[0] and publication[1]<self.publication[1]):
+            return self.header
+        self.header={key:value for key,value in header.items()
+                     if key not in ('sessions','request_activity','session_manifest','collection_schema')}
+        self.publication=publication
+        return self.header
+
+    def read_header(self):
+        for protocol in (5,4,3):
+            response=self.live_request(header_only=True,protocol=protocol,activity_stream=True)
+            if response is None:break
+            metadata,body=response
+            if metadata.get('error'):raise CollectionScopeError('수집 결과의 관측 범위가 일치하지 않습니다.')
+            if metadata.get('ready'):
+                self.last_read_live=True
+                return self.accept_header(metadata['header'],metadata.get('publication'))
+        if not self.snapshot_path.exists():return None
+        with closing(sqlite3.connect(self.snapshot_path.as_uri()+'?mode=ro',uri=True,timeout=1)) as db:
+            db.execute('BEGIN')
+            row=db.execute('SELECT scope,epoch,sequence,length(payload) FROM snapshot WHERE id=1').fetchone()
+            if not row:return None
+            if row[0]!=self.scope:raise CollectionScopeError('수집 결과의 관측 범위가 일치하지 않습니다.')
+            publication=(row[1],row[2])
+            if self.header is not None and self.publication and publication[0]==self.publication[0] and publication[1]<=self.publication[1]:
+                return self.header
+            if row[3]>CATALOG_PAGE_BYTES:raise ValueError('Collection header exceeds read budget')
+            payload=db.execute('SELECT payload FROM snapshot WHERE id=1').fetchone()[0]
+            decoder=zlib.decompressobj();decoded=decoder.decompress(payload,2*CATALOG_PAGE_BYTES+1)
+            if len(decoded)>2*CATALOG_PAGE_BYTES or not decoder.eof:raise ValueError('Collection header exceeds read budget')
+            return self.accept_header(json.loads(decoded),publication)
+
+    def close(self):
+        if self.last_read_live:self.live_request(close=True)
+        self.header=None;self.publication=None
+
+
+class CollectionChannel(CollectionHeaderReader):
+    """IPC contains sanitized results and requested homes, never source offsets."""
+    def __init__(self,homes,path=None,evidence=None):
+        super().__init__(homes,path,evidence)
         self.snapshot_path.parent.mkdir(parents=True,exist_ok=True)
         self.db=sqlite3.connect(self.snapshot_path)
         tables={row[0] for row in self.db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -528,12 +593,6 @@ class CollectionChannel:
         self.live_session_cache={};self.live_activity_cache={}
         self.retain_pending=False;self.pending_checkpoint=None
         self.checkpoint_exclusions=set()
-
-    def companion(self,suffix):
-        return self.path.with_name(self.path.name+'.codexon-'+suffix.lstrip('.'))
-
-    def scope_key(self,evidence):
-        return os.path.normcase(str(Path(evidence or self.default_evidence).resolve()))
 
     def _recovery_catalog(self):
         budget=4*1024*1024
@@ -565,11 +624,6 @@ class CollectionChannel:
         self.live=LiveCollection(self.path,self.scope,recovery=self._recovery_catalog())
         try:self.live_server=LiveServer(self.companion('.collection-live.json'),self.live.request)
         except BaseException:self.live=None;raise
-
-    def live_request(self,**value):
-        from .collection_transport import request
-        return request(self.companion('.collection-live.json'),
-                       dict(path=str(self.path),scope=self.scope,client=self.client,homes=self.homes,**value))
 
     def subscribe(self,now):
         if self.last_read_live:return
@@ -894,12 +948,8 @@ class CollectionChannel:
             payload=db.execute('SELECT payload FROM snapshot WHERE id=1').fetchone()[0]
             header=json.loads(zlib.decompress(payload))
         else:header=self.cached
-        source=header.get('index',{}).get('path')
-        if not source or os.path.normcase(str(Path(source).resolve()))!=os.path.normcase(str(self.path)):
-            raise CollectionScopeError('수집 결과의 사용량 색인 경로가 일치하지 않습니다.')
-        schema=header.get('collection_schema',1)
-        if schema not in (1,2):raise CollectionScopeError('지원하지 않는 수집 형식입니다.')
-        return header,schema
+        self.validate_header(header)
+        return header,header.get('collection_schema',1)
 
     def _durable_sessions(self,db,entries,previous):
         """Read only these catalog owners inside the caller's read transaction."""

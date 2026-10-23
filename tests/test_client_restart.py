@@ -450,7 +450,7 @@ def test_manual_exit_after_close_refusal_preserves_reopening_on_retry(tmp_path,d
         return dict(phase='off')
     def install(release,installed,progress,journal,operation_id):
         restart.prepare_restart(journal,operation_id,tmp_path/'recovery.exe')
-        journal.change(operation_id,app=dict(state='verified'))
+        journal.change(operation_id,app=dict(state='verified',startup=dict(state='skipped',policy='no_launch')))
         journal.proxy_result(operation_id,activate(manager,operation_id=operation_id))
     monkeypatch.setattr(restart,'start',start)
     monkeypatch.setattr(restart,'recovery_path',lambda *a:tmp_path/'recovery.exe')
@@ -671,3 +671,38 @@ def test_rendered_confirmation_cancel_then_update_preserves_exact_offer(tmp_path
         panel.stop()
         if panel.operation:panel.operation.wait()
         host.release_scene();host.close();host.deleteLater();app.processEvents();i18n.set_language('ko')
+
+
+@pytest.mark.parametrize('proxy',[dict(phase='off'),dict(phase='failed',restored=True)])
+def test_installed_update_never_reopens_while_saved_resume_is_pending(tmp_path,desktop,monkeypatch,proxy):
+    from cachemonitor import connection_recovery
+    from cachemonitor.proxy_target import ProxyTarget
+    manager=SimpleNamespace(home=tmp_path/'home',evidence=tmp_path/'evidence.sqlite',
+        directory=tmp_path/'observer',url='http://127.0.0.1:18768',
+        status=lambda:dict(configured=False),config=lambda:('',{}),state=lambda:dict(enabled=False))
+    manager.directory.mkdir()
+    (manager.directory/'app-services.json').write_text(json.dumps(dict(
+        scope=ProxyTarget(manager).scope,phase='stopped',resume=True,direct_url=None)))
+    monkeypatch.setattr(connection_recovery,'target',lambda *a:manager)
+    journal=UpdateState(tmp_path)
+    op=journal.begin('app','fixture',scope=ProxyTarget(manager).scope,client=restart.capture())['operation_id']
+    desktop.running=[]
+    journal.client_result(op,phase='closed')
+    journal.change(op,app=dict(state='verified',startup=dict(state='blocked')))
+    journal.proxy_result(op,proxy)
+    journal.change(op,phase='partial')
+    restart.run_restart(journal,op)
+    assert not desktop.activated
+    assert journal.read()['client']['phase']=='blocked'
+
+
+def test_retry_before_route_readiness_reuses_completed_close_authorization(tmp_path,desktop,monkeypatch):
+    journal,op=operation(tmp_path,desktop,ready=False)
+    desktop.running=[]
+    journal.client_result(op,phase='blocked',closed_at=time.time())
+    started=[]
+    monkeypatch.setattr(restart,'start',lambda *args:started.append(args))
+    restart.retry(journal,op,tmp_path/'recovery.exe')
+    assert len(started)==1
+    assert not desktop.closed and not desktop.activated
+    assert journal.read()['client']['phase']=='reopening'

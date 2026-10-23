@@ -67,7 +67,8 @@ def test_explicit_proxy_retry_has_a_new_cancel_boundary(tmp_path,monkeypatch):
     journal.proxy_result(op,dict(phase='failed',cutover_started=True,updated_at=1.))
     def activate(*args,**kwargs):
         assert journal.cancel()
-        return dict(phase='cancelled',updated_at=2.)
+        import time
+        return dict(phase='cancelled',updated_at=time.time())
     monkeypatch.setattr(install_management,'activate_proxy',activate)
     result=app_update.retry_proxy(m,journal)
     assert result['phase']=='deferred' and result['operation_id']==op
@@ -79,7 +80,7 @@ def test_partial_retry_keeps_app_and_disabled_proxy(tmp_path,monkeypatch):
     m.cleanup_legacy_check=lambda:None;m.adopt_registrations=lambda:None
     monkeypatch.setattr(retired_cache,'retire',lambda m:None)
     record=journal.begin('app','2026.10.09.1',scope=scope_for(m));op=record['operation_id']
-    journal.installed(op,tmp_path/'versions'/'new'/'Codexon',dict(version='2026.10.09.1',sha256='a'*64,commit='b'*40))
+    journal.installed(op,tmp_path/'versions'/'new'/'Codexon',dict(version='2026.10.09.1',sha256='a'*64,commit='b'*40),startup=dict(state='skipped',policy='no_launch'))
     journal.proxy_result(op,dict(phase='failed',restored=True))
     app=journal.read()['app']
     monkeypatch.setattr(app_update,'launch_installer',lambda *a:pytest.fail('Must not reinstall the app'))
@@ -159,7 +160,7 @@ def linked_proxy(tmp_path):
     return journal,m,result
 
 
-@pytest.mark.parametrize('phase,summary',[('complete','complete'),('off','complete'),('cancelled','deferred'),('failed','partial')])
+@pytest.mark.parametrize('phase,summary',[('complete','waiting'),('off','waiting'),('cancelled','deferred'),('failed','partial')])
 def test_terminal_proxy_result_replays_after_crash_between_journals(tmp_path,monkeypatch,phase,summary):
     from cachemonitor.proxy_update import ProxyUpdate
     journal,m,result=linked_proxy(tmp_path)
@@ -206,10 +207,13 @@ def test_app_owner_replays_matching_proxy_result_without_owner_probes(tmp_path,m
     journal,m,result=linked_proxy(tmp_path);result.update(phase='complete',updated_at=2)
     (m.directory/'proxy-update.json').write_text(json.dumps(result),encoding='utf-8')
     monkeypatch.setattr(observer_task.ObserverTask,'inspect',lambda self:pytest.fail('Terminal evidence needs no task probe'))
-    assert app_update.reconcile_update(journal,m)['phase']=='complete'
+    assert app_update.reconcile_update(journal,m)['phase']=='waiting'
     before=journal.path.read_bytes()
-    assert app_update.reconcile_update(journal,m)['phase']=='complete'
+    assert app_update.reconcile_update(journal,m)['phase']=='waiting'
     assert journal.path.read_bytes()==before
+    with pytest.raises(RuntimeError):journal.begin('proxy','2026.10.20.2',scope=scope_for(m))
+    assert journal.cancel(later=True)
+    journal.proxy_result(journal.read()['operation_id'],dict(phase='cancelled'))
     newer=journal.begin('proxy','2026.10.20.2',scope=scope_for(m))
     assert app_update.reconcile_update(journal,m)['operation_id']==newer['operation_id']
     assert journal.read()['phase']=='preparing'
@@ -299,6 +303,7 @@ def test_stale_proxy_status_is_read_only_and_does_not_probe_scheduler(tmp_path,m
 def test_recovered_installation_cannot_reset_terminal_or_newer_journal(tmp_path):
     journal,m,result=linked_proxy(tmp_path);record=journal.read();op=record['operation_id']
     app=record['app'];manifest=dict(version=app['version'],sha256=app['sha256'],commit=app['commit'])
+    journal.change(op,app={**app,'startup':dict(state='skipped',policy='no_launch')})
     journal.proxy_result(op,{**result,'phase':'complete','updated_at':2})
     before=journal.path.read_bytes()
     assert journal.installed(op, Path(app['executable']).parent,manifest,
@@ -315,7 +320,7 @@ def test_installer_reconciliation_composes_with_proxy_result_or_action(tmp_path,
     import json,sys
     from cachemonitor import install_management,observer_task
     journal,m,result=linked_proxy(tmp_path)
-    record=journal.read();app=record['app'];op=record['operation_id']
+    record=journal.read();app={**record['app'],'startup':dict(state='skipped',policy='no_launch')};op=record['operation_id']
     manifest=dict(version=app['version'],sha256=app['sha256'],commit=app['commit'])
     record.update(phase='installing',app={'state':'pending'},updated_at=0)
     journal.path.write_text(json.dumps(record),encoding='utf-8')
@@ -323,7 +328,7 @@ def test_installer_reconciliation_composes_with_proxy_result_or_action(tmp_path,
         (m.directory/'proxy-update.json').write_text(json.dumps({**result,'phase':'complete','updated_at':2}),encoding='utf-8')
     calls=[]
     def recover(journal,record):
-        return journal.installed(op,Path(app['executable']).parent,manifest,scope=record['scope'],recovered=True)
+        return journal.installed(op,Path(app['executable']).parent,manifest,scope=record['scope'],recovered=True,startup=app['startup'])
     monkeypatch.setattr(install_management,'recover_installed',recover,raising=False)
     monkeypatch.setattr(install_management,'activate_proxy',lambda *a,**k:calls.append(k) or dict(phase='off'))
     monkeypatch.setattr(observer_task.ObserverTask,'inspect',lambda self:dict(registered=False))
@@ -365,6 +370,7 @@ def test_verified_install_waiting_without_dispatch_resumes_or_settles(tmp_path,m
     import json,sys
     from cachemonitor import install_management,observer_task,proxy_identity
     journal,m,result=linked_proxy(tmp_path);record=journal.read();op=record['operation_id'];app=record['app']
+    app['startup']=dict(state='skipped',policy='no_launch')
     record.update(phase='waiting',proxy={'state':'pending'},updated_at=0,
                   installer_owner={'pid':77,'created':1,'executable':'finished-installer.exe'})
     journal.path.write_text(json.dumps(record),encoding='utf-8')
@@ -459,16 +465,94 @@ def test_restart_during_rollback_drain_restores_original_command(tmp_path,monkey
 
 
 def test_explicit_new_gui_intent_retries_exact_operation_once(tmp_path,monkeypatch):
-    import sys
-    from cachemonitor import install_management
+    import json
+    from cachemonitor import install_management,installation,observer_task
+    from tests.test_install_management import fixture
     journal,m,result=linked_proxy(tmp_path);record=journal.read();op=record['operation_id']
-    journal.change(op,phase='deferred')
-    target=record['app']['executable'];calls=[]
-    monkeypatch.setattr(app_update,'continuation_target',lambda *a:dict(executable=target,verified_operation_id=op))
-    monkeypatch.setattr(sys,'frozen',True,raising=False);monkeypatch.setattr(sys,'executable',target)
-    monkeypatch.setattr(install_management,'activate_proxy',lambda *a,**k:calls.append(k) or dict(phase='off'))
+    product,recovery=fixture(journal.root)
+    manifest=json.loads((product/'build-manifest.json').read_text())
+    manifest.update(version=record['target_version'],commit=record['app']['commit'])
+    (product/'build-manifest.json').write_text(json.dumps(manifest))
+    receipt=dict(product=str(product),recovery=str(recovery),operation_id=op,scope=record['scope'],
+                 isolated=False,launch_requested=True,
+                 **{key:manifest[key] for key in ('version','commit','sha256','recovery_sha256')})
+    (journal.root/'installation.json').write_text(json.dumps(receipt))
+    pointer=tmp_path/'shared-installation.json'
+    pointer.write_text(json.dumps(dict(InstallRoot=str(journal.root),AppPath=str(product/'Codexon.exe'),RecoveryPath=str(recovery))))
+    monkeypatch.setattr(installation,'pointer_path',lambda:pointer)
+    journal.change(op,phase='deferred',app={**record['app'],'sha256':manifest['sha256']})
+    calls=[]
+    monkeypatch.setattr(observer_task.ObserverTask,'inspect',lambda self:dict(running=False))
+    monkeypatch.setattr(observer_task.ObserverTask,'start',lambda self,command:calls.append(command))
+    monkeypatch.setattr(install_management,'activate_proxy',lambda *a,**k:pytest.fail('Route work belongs to the new GUI'))
     with pytest.raises(RuntimeError):app_update.retry_proxy(m,journal,verified_operation_id='f'*32)
     assert not calls and journal.read()['phase']=='deferred'
-    assert app_update.retry_proxy(m,journal,verified_operation_id=op)['phase']=='complete'
+    assert app_update.retry_proxy(m,journal,verified_operation_id=op)['phase']=='waiting'
     with pytest.raises(RuntimeError):app_update.retry_proxy(m,journal,verified_operation_id=op)
-    assert len(calls)==1
+    assert calls==[[str(product/'Codexon.exe'),'--replace-gui','--finish-install',op]]
+
+
+@pytest.mark.parametrize('winerror',[5,32,33,None])
+def test_journal_read_survives_transient_windows_access_denial(tmp_path,monkeypatch,winerror):
+    from cachemonitor import observer_state
+    journal=UpdateState(tmp_path)
+    record=journal.begin('app','fixture')
+    original=Path.read_text;calls=[];delays=[]
+    error=PermissionError(13,'Access denied')
+    if winerror is not None:error.winerror=winerror
+    def read(path,*args,**kwargs):
+        if path==journal.path:
+            calls.append(path)
+            if len(calls)==1:raise error
+        return original(path,*args,**kwargs)
+    monkeypatch.setattr(observer_state,'os',SimpleNamespace(name='nt'))
+    monkeypatch.setattr(observer_state,'time',SimpleNamespace(sleep=delays.append))
+    monkeypatch.setattr(Path,'read_text',read)
+    assert journal.read()==record
+    assert delays==[.02]
+
+
+def test_json_read_permanent_windows_denial_has_bounded_default(tmp_path,monkeypatch):
+    from cachemonitor import observer_state
+    calls=[];delays=[];default={'unavailable':True}
+    def read(path,*args,**kwargs):
+        calls.append(path)
+        raise PermissionError(13,'Access denied')
+    monkeypatch.setattr(observer_state,'os',SimpleNamespace(name='nt'))
+    monkeypatch.setattr(observer_state,'time',SimpleNamespace(sleep=delays.append))
+    monkeypatch.setattr(Path,'read_text',read)
+    assert observer_state.read_json(tmp_path/'journal.json',default) is default
+    assert len(calls)==6 and sum(delays)==pytest.approx(.3)
+
+
+@pytest.mark.parametrize('platform,error',[
+    ('nt',FileNotFoundError(2,'Missing')),
+    ('nt',OSError(5,'I/O error')),
+    ('nt',PermissionError(1,'Other permission error')),
+    ('posix',PermissionError(13,'Access denied')),
+])
+def test_json_read_nonqualifying_error_keeps_immediate_default(tmp_path,monkeypatch,platform,error):
+    from cachemonitor import observer_state
+    calls=[];delays=[];default={'unavailable':True}
+    def read(path,*args,**kwargs):
+        calls.append(path)
+        raise error
+    monkeypatch.setattr(observer_state,'os',SimpleNamespace(name=platform))
+    monkeypatch.setattr(observer_state,'time',SimpleNamespace(sleep=delays.append))
+    monkeypatch.setattr(Path,'read_text',read)
+    assert observer_state.read_json(tmp_path/'journal.json',default) is default
+    assert len(calls)==1 and not delays
+
+
+@pytest.mark.parametrize('content,expected',[(b'\xef\xbb\xbf{"ready":true}',{'ready':True}),
+    (b'{invalid',None),(b'[]',None),(b'null',None)])
+def test_json_read_preserves_bom_and_invalid_value_defaults(tmp_path,monkeypatch,content,expected):
+    from cachemonitor import observer_state
+    path=tmp_path/'journal.json';path.write_bytes(content)
+    delays=[];default={'unavailable':True}
+    monkeypatch.setattr(observer_state,'time',SimpleNamespace(sleep=delays.append))
+    assert observer_state.read_json(path,default)==(expected if expected is not None else default)
+    if expected is None:
+        assert observer_state.read_json(path)=={}
+        assert observer_state.read_json(path,[])=={}
+    assert not delays

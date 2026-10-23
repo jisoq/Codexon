@@ -154,7 +154,9 @@ def recover_installed(journal, record):
                     or digest(recovery)!=manifest['recovery_sha256']):
                 return None
             return journal.installed(operation_id,product,manifest,
-                                     scope=record.get('scope'),recovered=True)
+                                     scope=record.get('scope'),recovered=True,
+                                     startup=(dict(state='waiting',policy='requested') if receipt.get('launch_requested',True)
+                                              else dict(state='skipped',policy='no_launch')))
     except (OSError,ValueError,TypeError,KeyError,RuntimeError):
         return None
 
@@ -217,7 +219,7 @@ def finish(root, product, recovery, *, isolated=False, launch=True, language='ko
             previous = read_json(root/'installation.json')
             receipt = dict(product=str(product), recovery=str(recovery), version=manifest['version'],
                            commit=manifest['commit'], previous=previous.get('product'), installed_at=time.time(),
-                           isolated=isolated)
+                           isolated=isolated,launch_requested=bool(launch))
             if update_id:
                 # Written only after runtime/hash checks; absence of the activation
                 # journal then proves this exact request reached committed activation.
@@ -256,32 +258,39 @@ def finish(root, product, recovery, *, isolated=False, launch=True, language='ko
             try:queue(root)
             except (OSError,ValueError,RuntimeError) as exc:receipt['cleanup_warning']=str(exc)
             if not isolated:
-                update_id=journal.installed(update_id,product,manifest)
+                startup=dict(state='waiting',policy='requested') if launch else dict(state='skipped',policy='no_launch')
+                update_id=journal.installed(update_id,product,manifest,startup=startup)
                 from .observer_task import retire_desktop_startups
                 try:retire_desktop_startups(root)
                 except RuntimeError as exc:receipt['startup_warning']=str(exc)
-                result_path = root/'connection-update.json'
-                try:
-                    command=[str(exe),'--complete-install','--control-report',str(result_path)]
-                    if update_id:command+=['--update-id',update_id,'--update-root',str(root)]
-                    result = subprocess.run(command,
-                                            timeout=60,creationflags=subprocess.CREATE_NO_WINDOW)
-                    receipt['connection'] = read_json(result_path)
-                    if result.returncode:raise RuntimeError('Connection update did not complete')
-                except (OSError,RuntimeError,subprocess.TimeoutExpired):
-                    receipt['connection'] = dict(phase='recovery_required',message='연결 복구를 실행해 주세요.')
-                    if update_id:journal.proxy_result(update_id,receipt['connection'])
+                if not launch:
+                    result_path = root/'connection-update.json'
+                    try:
+                        command=[str(exe),'--complete-install','--control-report',str(result_path)]
+                        if update_id:command+=['--update-id',update_id,'--update-root',str(root)]
+                        result = subprocess.run(command,
+                                                timeout=60,creationflags=subprocess.CREATE_NO_WINDOW)
+                        receipt['connection'] = read_json(result_path)
+                        if result.returncode:raise RuntimeError('Connection update did not complete')
+                    except (OSError,RuntimeError,subprocess.TimeoutExpired):
+                        receipt['connection'] = dict(phase='recovery_required',message='연결 복구를 실행해 주세요.')
+                        if update_id:journal.proxy_result(update_id,receipt['connection'])
+                else:receipt['connection']=dict(phase='waiting')
                 if launch:
-                    from .app_services import suspended
-                    if suspended(connection_manager()):
+                    from .app_services import exit_recovery_owner
+                    owner=exit_recovery_owner(connection_manager())
+                    if owner and owner['owner_state']!='dead':
                         launch=False
                         receipt['launch']='앱 종료 요청을 유지했습니다.'
+                        journal.startup_result(update_id,dict(state='blocked',message=receipt['launch']))
                 if launch:
                     from .observer_task import ObserverTask
                     # A new task identity must be able to run while the old GUI task
                     # is still alive; that new process performs the graceful handoff.
-                    try:ObserverTask(str(exe),role='Desktop').start([str(exe),'--replace-gui'])
-                    except RuntimeError:receipt['launch']='시작 메뉴에서 Codexon을 열어 주세요.'
+                    try:ObserverTask(str(exe),role='Desktop').start([str(exe),'--replace-gui','--finish-install',update_id])
+                    except RuntimeError:
+                        receipt['launch']='시작 메뉴에서 Codexon을 열어 주세요.'
+                        journal.startup_result(update_id,dict(state='blocked',message=receipt['launch']))
             return receipt
     except Exception as exc:
         if update_id:journal.fail(update_id,str(exc))
@@ -399,7 +408,10 @@ def complete_main():
                 manager=target(Path(scope['home']),Path(scope['evidence']).parent,scope['url'])
                 manager.evidence=Path(scope['evidence'])
             else:journal.change(args.update_id,scope=scope_for(manager))
-        result=activate_proxy(manager,operation_id=args.update_id,update_root=args.update_root)
+        from .update_state import installed_gui_required
+        if journal and installed_gui_required(journal.read()):
+            result=dict(phase='waiting',message='새 Codexon에서 연결 준비를 확인하고 있습니다.')
+        else:result=activate_proxy(manager,operation_id=args.update_id,update_root=args.update_root)
     except Exception as exc:result=dict(phase='recovery_required',error=str(exc))
     if journal:journal.proxy_result(args.update_id,result)
     atomic_write(args.control_report,json.dumps(result,ensure_ascii=False).encode())

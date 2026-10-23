@@ -29,6 +29,86 @@ def fixture(root):
 
 
 @pytest.fixture
+def ready_installation(tmp_path,monkeypatch):
+    import subprocess
+    from types import SimpleNamespace
+    from cachemonitor import app_services,install_cleanup,installation,launch_context,observer_task
+    from cachemonitor.proxy_target import ProxyTarget
+    from cachemonitor.update_state import UpdateState
+    product,recovery=fixture(tmp_path)
+    manager=SimpleNamespace(home=tmp_path/'custom home',evidence=tmp_path/'custom evidence.sqlite',
+                            directory=tmp_path/'observer',url='http://127.0.0.1:19876')
+    manager.directory.mkdir()
+    stopped=dict(scope=ProxyTarget(manager).scope,phase='stopped',resume=False)
+    app_services.session_path(manager).write_text(json.dumps(stopped))
+    journal=UpdateState(tmp_path)
+    record=journal.begin('app','test',scope=stopped['scope'])
+    launches=[]
+    monkeypatch.setattr(install,'connection_manager',lambda:manager)
+    monkeypatch.setattr(install,'register',lambda *a,**k:None)
+    monkeypatch.setattr(install,'migrate_startup',lambda *a:None)
+    monkeypatch.setattr(installation,'pointer_path',lambda:tmp_path/'shared-installation.json')
+    monkeypatch.setattr(launch_context,'preference_path',lambda:tmp_path/'launch.json')
+    monkeypatch.setattr(launch_context,'running_homes',lambda root:[])
+    monkeypatch.setattr(launch_context,'resolve_homes',lambda homes:[str(manager.home)])
+    monkeypatch.setattr(install_cleanup,'queue',lambda root:None)
+    monkeypatch.setattr(observer_task,'retire_desktop_startups',lambda root:None)
+    monkeypatch.setattr(observer_task.ObserverTask,'start',lambda self,command:launches.append(command))
+    def run(command,**kwargs):
+        report=command[command.index('--control-report')+1] if '--control-report' in command else command[-1]
+        Path(report).write_text(json.dumps(dict(errors=[],version='test',phase='off')))
+        return subprocess.CompletedProcess(command,0)
+    monkeypatch.setattr(install.subprocess,'run',run)
+    return SimpleNamespace(product=product,recovery=recovery,manager=manager,journal=journal,
+                           operation_id=record['operation_id'],launches=launches)
+
+
+@pytest.mark.parametrize('launch,isolated,opens_gui',[(True,False,True),(False,False,False),(True,True,False)])
+def test_successful_install_reopens_after_stopped_session_only_when_requested(tmp_path,ready_installation,launch,isolated,opens_gui):
+    from cachemonitor.app_services import session_path
+    case=ready_installation
+    stopped=session_path(case.manager).read_bytes()
+    receipt=install.finish(tmp_path,case.product,case.recovery,launch=launch,isolated=isolated,update_id=case.operation_id)
+    assert receipt['product']==str(case.product) and receipt['version']=='test'
+    assert not (tmp_path/'activation-pending.json').exists()
+    assert session_path(case.manager).read_bytes()==stopped
+    assert case.launches==([[str(case.product/'Codexon.exe'),'--replace-gui','--finish-install',case.operation_id]] if opens_gui else [])
+
+
+@pytest.mark.parametrize('phase,owner_state,opens_gui',[
+    ('closing','live',False),('preparing','unknown',False),('closing','dead',True)])
+def test_install_reopens_only_after_active_exit_owner_has_ended(tmp_path,ready_installation,phase,owner_state,opens_gui):
+    import os
+    from cachemonitor import app_services,proxy_identity
+    case=ready_installation
+    owner=proxy_identity.process_identity(os.getpid())
+    if owner_state=='dead':owner={**owner,'created':owner['created']+1}
+    elif owner_state=='unknown':owner=None
+    path=app_services.session_path(case.manager)
+    state=json.loads(path.read_text())
+    state.update(phase=phase,operation_id='exit-request',preparation_owner=owner)
+    path.write_text(json.dumps(state))
+    receipt=install.finish(tmp_path,case.product,case.recovery,update_id=case.operation_id)
+    assert case.launches==([[str(case.product/'Codexon.exe'),'--replace-gui','--finish-install',case.operation_id]] if opens_gui else [])
+    assert bool(receipt.get('launch')) is (not opens_gui)
+    assert json.loads(path.read_text())==state
+
+
+def test_failed_gui_launch_keeps_the_verified_installation(tmp_path,monkeypatch,ready_installation):
+    from cachemonitor import observer_task
+    case=ready_installation
+    def start(self,command):
+        case.launches.append(command)
+        raise RuntimeError('task start failed')
+    monkeypatch.setattr(observer_task.ObserverTask,'start',start)
+    receipt=install.finish(tmp_path,case.product,case.recovery,update_id=case.operation_id)
+    assert case.launches==[[str(case.product/'Codexon.exe'),'--replace-gui','--finish-install',case.operation_id]]
+    assert receipt.get('launch')
+    assert case.journal.read()['app']['state']=='verified'
+    assert json.loads((tmp_path/'installation.json').read_text())['product']==str(case.product)
+    assert not (tmp_path/'activation-pending.json').exists()
+
+@pytest.fixture
 def committed_installation(tmp_path,monkeypatch,request):
     """Crash on either side of the verified installation journal write."""
     import subprocess

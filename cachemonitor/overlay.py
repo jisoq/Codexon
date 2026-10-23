@@ -621,6 +621,10 @@ class OverlayController(QObject):
             self.snapshot_wall_time = snapshot.get('last_usage_collection_success') or snapshot.get('ts')
         self.refresh()
 
+    def receive_collection_observation(self,value):
+        self.collection_observation=value
+        self.refresh()
+
     def receive_collection_status(self, result):
         if isinstance(result.get('collection_fault'),dict):self.collection_fault=dict(result['collection_fault'])
         if 'collection_snapshot_at' in result:self.collection_published_at=result['collection_snapshot_at']
@@ -631,7 +635,8 @@ class OverlayController(QObject):
         from .app_errors import collection_phase
         return collection_phase({**getattr(self,'collection_evidence',{}),
             'collection_fault':getattr(self,'collection_fault',{}),
-            'collection_snapshot_at':getattr(self,'collection_published_at',None)},time.time(),
+            'collection_snapshot_at':getattr(self,'collection_published_at',None),
+            'collection_observation':getattr(self,'collection_observation',None)},time.time(),
             started_at=getattr(self,'collection_started_at',None))
 
     @staticmethod

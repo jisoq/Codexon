@@ -1,7 +1,8 @@
 """Qt adapters for the app-owned service lifetime."""
-from PySide6.QtCore import QObject, QThread, QTimer, Signal
+from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
 from shiboken6 import isValid
 import time
+import threading
 from .shutdown_state import ExitCancelled, ExitControl, ExitProgress, ExitResult
 from .app_restart import HANDOFF_TIMEOUT
 class ServiceOperation(QThread):
@@ -20,20 +21,72 @@ class ServiceOperation(QThread):
             self.result.emit(result)
 
 
-class ServiceController(QObject):
-    """One app timer; panels only consume its result or request explicit actions."""
-    result=Signal(dict)
+class CollectionObservationWorker(QThread):
+    observed=Signal(dict)
 
     def __init__(self,services,parent):
         super().__init__(parent)
-        self.services=services;self.operation=None;self.closed=False;self.exit_pending=False
+        self.homes,self.index,self.evidence=services.homes,services.index,services.evidence
+        self.wake=threading.Event()
+
+    def run(self):
+        from .collection_observation import CollectionObserver
+        from .app_errors import exception_facts
+        observer=None
+        try:
+            observer=CollectionObserver(self.homes,self.index,self.evidence)
+            while not self.isInterruptionRequested():
+                self.wake.clear()
+                value=observer.observe()
+                if self.isInterruptionRequested():break
+                self.observed.emit(value)
+                self.wake.wait(15)
+        except Exception as error:
+            if not self.isInterruptionRequested():
+                self.observed.emit(dict(collection_snapshot_at=None,
+                    collection_fault=dict(status_failed=True,**exception_facts(error))))
+        finally:
+            if observer is not None:observer.close()
+
+
+class ServiceController(QObject):
+    """One app timer; panels only consume its result or request explicit actions."""
+    result=Signal(dict)
+    collection_observed=Signal(dict)
+
+    def __init__(self,services,parent):
+        super().__init__(parent)
+        self.services=services;self.operation=None;self.observer=None;self.closed=False;self.exit_pending=False
         self.timer=QTimer(self);self.timer.setInterval(15000)
         self.timer.timeout.connect(self.poll)
 
     def start(self):
         if self.closed or self.exit_pending:return
+        self.start_observation()
         self.timer.start()
         if not self.services.active:self.invoke('start')
+
+    def start_observation(self):
+        if self.closed or self.exit_pending or not self.services.collection or self.observer is not None:return
+        worker=CollectionObservationWorker(self.services,self)
+        self.observer=worker
+        worker.observed.connect(self.receive_observation)
+        worker.finished.connect(self.observation_finished)
+        worker.start()
+
+    @Slot(dict)
+    def receive_observation(self,value):
+        worker=self.sender()
+        if self.observer is worker and not self.closed and not self.exit_pending and not worker.isInterruptionRequested():
+            self.collection_observed.emit(value)
+
+    @Slot()
+    def observation_finished(self):
+        worker=self.sender()
+        if self.observer is worker:self.observer=None
+        interrupted=worker.isInterruptionRequested()
+        worker.deleteLater()
+        if interrupted:self.start_observation()
 
     def request_login_launch(self, launch):
         if self.closed or self.exit_pending:
@@ -44,6 +97,8 @@ class ServiceController(QObject):
         else:self.start()
 
     def poll(self):
+        self.start_observation()
+        if self.observer is not None:self.observer.wake.set()
         panel=getattr(self.parent(),'observer_panel',None)
         if panel and panel.busy():return
         self.invoke('ensure')
@@ -64,10 +119,15 @@ class ServiceController(QObject):
 
     def set_exit_pending(self,pending):
         self.exit_pending=bool(pending)
-        if not pending and not self.closed:self.poll()
+        if not pending and not self.closed:
+            self.start_observation()
+            self.poll()
 
     def stop(self):
         self.closed=True;self.timer.stop();self.services.deactivate()
+        if self.observer is not None:
+            self.observer.requestInterruption();self.observer.wake.set()
+            if not self.observer.wait(30000):raise RuntimeError('Collection observation did not stop')
 
 
 class ShutdownOperation(QThread):

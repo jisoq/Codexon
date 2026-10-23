@@ -191,22 +191,31 @@ def strongest(faults):
     return next((fault for fault in visible if fault.severity == 'error'), next(iter(visible), None))
 
 
+def collection_publication_at(evidence):
+    observation=evidence.get('collection_observation')
+    if observation is not None:return observation.get('collection_snapshot_at')
+    stamps=[evidence.get('collection_snapshot_at')]
+    complete=bool(evidence.get('usage_collection_complete',evidence.get('index',{}).get('usage_complete',False)))
+    if evidence.get('collection') or complete:stamps.append(evidence.get('ts'))
+    return max((stamp for stamp in stamps if isinstance(stamp,(int,float))),default=None)
+
+
 def collection_phase(evidence, now, *, started_at=None):
     """Preparation is bounded by real publications, never by repeated pending polls."""
     facts=evidence.get('collection_fault') or {}
     if facts.get('expected_stop') or facts.get('disabled'):return 'stopped'
     fault=detect('collection',{k:v for k,v in facts.items() if k not in ('snapshot_at','snapshot_stale')},now)
-    if fault is not None or evidence.get('usage_errors'):return 'failed'
+    observation=evidence.get('collection_observation') or {}
+    observed_fault=observation.get('collection_fault') or {}
+    source_fault=observation.get('source_fault')
+    if (fault is not None or detect('collection',observed_fault,now)
+            or detect('collection',source_fault or {},now)
+            or source_fault is None and evidence.get('usage_errors')):return 'failed'
     pending=any(facts.get(key) for key in ('starting','status_pending','handoff_pending'))
     complete=bool(evidence.get('usage_collection_complete',evidence.get('index',{}).get('usage_complete',False)))
-    stamps=[evidence.get('collection_snapshot_at')]
-    # Empty startup snapshots have a synthetic timestamp but no collector identity.
-    if evidence.get('collection') or complete:stamps.append(evidence.get('ts'))
-    stamps=[stamp for stamp in stamps if isinstance(stamp,(int,float))]
-    # A fresh publication supersedes stale flags from an older analysis or
-    # service poll. Repeated pending polls must not renew the startup grace.
-    if stamps:
-        if now-max(stamps)>30:return 'delayed'
+    published=collection_publication_at(evidence)
+    if published is not None:
+        if now-published>30:return 'delayed'
     elif started_at is not None:
         if now-started_at>30:return 'delayed'
     elif evidence.get('collection_stale') or facts.get('snapshot_stale'):
@@ -225,7 +234,7 @@ def exception_facts(error):
 class ErrorState:
     # A fixed number of source slots prevents home, file and request IDs from
     # growing the registry. Each category can retain several independent failures.
-    SOURCES=frozenset(('collection.service','collection.source','collection.freshness',
+    SOURCES=frozenset(('collection.service','collection.source','collection.freshness','collection.observer',
         'analysis.process','analysis.query','quota.ledger','quota.analysis','quota.live','quota.edit','quota.calculation','quota.query',
         'connection.status','connection.protection','connection.operation','observation.read',
         'observation.health','observation.protection','update.status','update.operation','update.check'))
