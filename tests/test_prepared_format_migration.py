@@ -1,4 +1,3 @@
-"""Recognized record-page caches regenerate only retained prepared facts."""
 from contextlib import closing
 from copy import deepcopy
 from dataclasses import replace

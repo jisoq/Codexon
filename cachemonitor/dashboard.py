@@ -587,8 +587,6 @@ class Dashboard(TrayWindow):
             return
         q=self.query()
         if self.async_mode:
-            # Retain exact overview bucket endpoints; comparison populations
-            # are reusable until the worker's next call or request boundary.
             key_query={k:v for k,v in q.items() if k!='now' and (q['period']=='custom' or k not in ('start','end'))}
             if q['page']==5 and self.performance_panel.follow_latest:
                 # Heartbeats move the requested endpoint without changing calls.

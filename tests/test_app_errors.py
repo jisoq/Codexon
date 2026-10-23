@@ -240,7 +240,7 @@ def test_analysis_bridge_preserves_failure_kind_and_request_id(monkeypatch):
 
 def test_cached_update_offer_does_not_resolve_a_failed_metadata_request():
     from PySide6.QtWidgets import QApplication
-    from cachemonitor.dashboard import PAGE_INDEX, Dashboard
+    from cachemonitor.dashboard import Dashboard
     from cachemonitor.update_panel import UpdatePanel
     app=QApplication.instance() or QApplication([])
     class Receiver:
@@ -263,7 +263,7 @@ def test_cached_update_offer_does_not_resolve_a_failed_metadata_request():
 def test_sidebar_errors_remain_visible_across_pages_and_do_not_show_main_banner(tmp_path,monkeypatch):
     from PySide6.QtCore import QCoreApplication,QEvent,QSettings,QPointF
     from PySide6.QtWidgets import QApplication
-    from cachemonitor.dashboard import Dashboard
+    from cachemonitor.dashboard import PAGE_INDEX, Dashboard
     from cachemonitor.quick_qa import click,control,scene_view
     from test_ui import wait_for_rendered
     app=QApplication.instance() or QApplication([])
@@ -280,7 +280,7 @@ def test_sidebar_errors_remain_visible_across_pages_and_do_not_show_main_banner(
         assert 'update' not in window.error_state.grouped()
         window.receive_collection_status(dict(collection_fault=dict(start_failed=True,retry_exhausted=True)))
         assert not sent and window.error_button.isVisible()
-        for page in (1,2,3,4,5):
+        for page in (1,3,4,5,6,7):
             window.change_page(page)
             assert window.error_button.isVisible()
             wait_for_rendered(lambda:window.pages.isPageReady(PAGE_INDEX[page]) and not window.analysis_loading,timeout=5)

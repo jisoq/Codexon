@@ -400,7 +400,6 @@ def read_event(snapshot,owner,descriptor,*,evidence=True):
 
 
 def _headers(snapshot,owner,checkpoint,transition):
-    """Patch touched whole-request facts and validate raw request ordering."""
     requests=transition['requests']['upserts'];states=dict(transition['turns']['upserts'])
     turns=set(states)|{turn for turn,_,_ in requests}|{r['turn'] for r in transition['tail'] if r.get('turn')}
     current=(transition['metadata'].get('request_state') or {}).get('turn')

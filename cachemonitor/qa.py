@@ -1,4 +1,3 @@
-"""Native taskbar verification helpers."""
 from cachemonitor.screens import screen_id
 import time
 from PySide6.QtTest import QTest
