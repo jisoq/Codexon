@@ -2,24 +2,36 @@
 import json
 import time
 from pathlib import Path
-from PySide6.QtCore import QTimer, Qt, QSignalBlocker
+from PySide6.QtCore import QRectF, QTimer
 from PySide6.QtTest import QTest
 from PySide6.QtQuickWidgets import QQuickWidget
-from .quick_qa import control, table_view
+from .quick_qa import control
 
 
 def start_smoke(window,app,path,fonts,depth='full'):
     path=Path(path).resolve();path.parent.mkdir(parents=True,exist_ok=True)
     started=time.monotonic()
 
-    def settle():
+    def settle(node=None):
         deadline=time.monotonic()+30
-        while (window.analysis_pending or (window.current_page in (1,2,5) and window.view_result is None)
-               or window.search_timer.isActive() or window.range_timer.isActive() or window.deferred_result):
+        while (window.analysis_pending or (window.current_page in (1,5,6) and window.view_result is None)
+               or window.deferred_result or (window.current_page==7 and window.mismatch_page.revision is None)):
             app.processEvents();QTest.qWait(20)
             if window.analysis_errors:raise AssertionError(window.analysis_errors)
+            if window.current_page==7 and any(window.mismatch_page.query_errors.values()):
+                raise AssertionError(window.mismatch_page.query_errors)
             if time.monotonic()>deadline:raise AssertionError('Analysis response timed out')
-        QTest.qWait(60)
+        if node is None:
+            stack=window.settings_page.stack if window.current_page==4 else window.pages
+            node=stack.widget(stack.currentIndex())
+        item=control(window,node)
+        while True:
+            frame=window.quick.grabFramebuffer()
+            if (item.isVisible() and item.width()>0 and item.height()>0
+                    and item.mapRectToScene(item.boundingRect()).intersects(QRectF(window.quick.rect()))
+                    and not frame.isNull()):break
+            app.processEvents();QTest.qWait(20)
+            if time.monotonic()>deadline:raise AssertionError('Page did not finish rendering')
 
     def finish():
         if window.snapshot.get('index',{}).get('loading',False) or window.analysis_pending:
@@ -37,7 +49,7 @@ def start_smoke(window,app,path,fonts,depth='full'):
             assert window.nav.count()==5
             report['sessions']=len(window.snapshot['sessions'])
             report['model_requests']=0;report['live_quota_requests']=0
-            for page,name in ((6,'home'),(3,'quota'),(1,'comparison'),(5,'performance'),(2,'calls'),(4,'settings')):
+            for page,name in ((6,'home'),(3,'quota'),(1,'comparison'),(5,'performance'),(7,'mismatch'),(4,'settings')):
                 if page==4:window.open_settings()
                 else:window.change_page(page)
                 settle()
@@ -55,59 +67,30 @@ def start_smoke(window,app,path,fonts,depth='full'):
             assert window.settings.value('quota/trackingEnabled',True,type=bool) is original
             report['weekly_monitoring_toggle']=True
             for category in (window.settings_page.IDS if depth=='full' else ('general','integration')):
-                window.settings_page.reveal(category);QTest.qWait(60)
+                window.settings_page.reveal(category);settle()
                 target=path.with_name(path.stem+f'-settings-{category}.png')
                 assert window.grab().save(str(target));report['screens'].append(str(target))
-            window.change_page(2);settle()
-            search=control(window,window.search);search.forceActiveFocus()
-            QTest.keyClicks(window.quick,'__qml_no_such_session__');settle()
-            assert window.table.rowCount()==0
-            expected='검색 조건에 맞는 기록 없음' if window.snapshot['sessions'] else '사용 기록 없음'
-            assert window.record_message.text()==expected
-            assert window.table.state['emptyText']==expected
-            if window.snapshot['sessions']:assert window.table.nodes[0].isVisible()
-            # Send the edit keys to the rendered field. Other native windows
-            # (including the overlay) must not redirect this test's input.
-            from PySide6.QtCore import QCoreApplication,QEvent
-            from PySide6.QtGui import QKeyEvent
-            search.forceActiveFocus()
-            for key,modifiers in ((Qt.Key_A,Qt.ControlModifier),(Qt.Key_Backspace,Qt.NoModifier)):
-                for event_type in (QEvent.KeyPress,QEvent.KeyRelease):
-                    QCoreApplication.sendEvent(search,QKeyEvent(event_type,key,modifiers))
-            settle();assert window.search.text()==''
-            report['search_keyboard']=True
-            if window.record_view=='projects' and window.record_rows:window.activate_record(0);settle()
-            parents=[(i,row) for i,row in enumerate(window.record_rows) if row.get('descendants')]
-            if parents:
-                from .quick_qa import click_row
-                i,row=parents[0]
-                click_row(window,window.table,i);settle()
-                assert window.selected_session==(row['home'],row['sid'])
-                if row['cost'] is not None:
-                    assert abs(row['cost']-(row['own_cost'] or 0)-(row['child_cost'] or 0))<1e-9
-                target=path.with_name(path.stem+'-session-cost.png')
+            window.change_page(7);settle()
+            mismatch=window.mismatch_page
+            assert not any(mismatch.query_errors.values()),mismatch.query_errors
+            if mismatch.table.rowCount():
+                mismatch.open_record(0)
+                deadline=time.monotonic()+30
+                while mismatch.saved_record is None:
+                    app.processEvents();QTest.qWait(20)
+                    assert not any(mismatch.query_errors.values()),mismatch.query_errors
+                    assert time.monotonic()<deadline,'Mismatch detail response timed out'
+                settle(mismatch.fields)
+                assert mismatch.detail.isVisible()
+                target=path.with_name(path.stem+'-mismatch-detail.png')
                 assert window.grab().save(str(target));report['screens'].append(str(target))
-                report['session_rollup']=dict(sid=row['sid'],cost=row['cost'],
-                    own=row['own_cost'],children=row['child_cost'],descendants=row['descendants'])
-            if depth=='full':
-                from .qa import interaction_probe
-                report['interactions']=interaction_probe(window,app,settle)
-            if window.selected_call:window.close_record_detail()
-            window.change_page(2);settle()
+                report['mismatch_detail']=True
+                mismatch.close_detail()
+            report['mismatch_history']=True
             for mode in ('weekly','five_hour'):
                 window.set_quota_mode(mode)
                 assert window.settings.value('tray/quotaMode')==mode
             report['tray_modes']=True
-            for width,height in (((1120,760),(1440,940)) if depth=='full' else ((1120,760),)):
-                window.resize(width,height);QTest.qWait(100)
-                assert table_view(window,window.table).width()>150
-                if window.table.rowCount():
-                    table=table_view(window,window.table);table.forceActiveFocus()
-                    QTest.keyClick(window.quick,Qt.Key_End)
-                    assert window.table.currentRow()==window.table.rowCount()-1
-                    QTest.keyClick(window.quick,Qt.Key_Home)
-                    assert window.table.currentRow()==0
-            report['record_keyboard']=True
             from .overlay_chrome import named_item
             overlay=window.overlay;overlay.timer.stop();overlay.input_timer.stop()
             links=overlay.links
@@ -167,7 +150,7 @@ def start_smoke(window,app,path,fonts,depth='full'):
                 assert title_images[0]==title_images[1]
                 report['session_title_preserved']=True
             finally:set_language(locale);overlay.widget.set_content(original_data)
-            window.open_settings();window.settings_page.navigation.setCurrentRow(0);QTest.qWait(60)
+            window.open_settings();window.settings_page.navigation.setCurrentRow(0);settle()
             choices=window.settings_page.controls;choice=choices['language'];button=choices['restart']
             choice.setCurrentIndex(choice.findData(locale));QTest.qWait(20)
             assert not control(window,button).isEnabled()

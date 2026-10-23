@@ -2,6 +2,7 @@
 from html import escape
 from PySide6.QtCore import Qt
 from .presentation import Button, Column, Group, Scroll, Text
+from .i18n import formatted
 
 
 def recorded(value):
@@ -26,46 +27,6 @@ def model_comparison(row):
     if requested!=response and row.get('model_match')=='불일치' and row.get('model_alert_confirmed'):
         return f'모델 불일치 (요청:{requested}, 응답:{response})'
     return ''
-
-
-def record_issues(row):
-    """Only actionable data problems, not absence of optional wire telemetry."""
-    issues=[]
-    for key,title in (('model_conflict','요청 모델 기록 충돌'),('mode_conflict','요청 모드 기록 충돌'),
-                      ('cache_policy_conflict','캐시 정책 기록 충돌'),('input_conflict','입력 토큰 구성 충돌'),
-                      ('output_conflict','출력 토큰 구성 충돌')):
-        if row.get(key):issues.append(title)
-    if row.get('model_alert_confirmed'):issues.append('요청 모델과 응답 모델이 다릅니다.')
-    if row.get('observation_missing'):issues.append('요청과 응답 관측 기록을 저장하지 못했습니다. 모델 응답 대조에 사용할 수 없습니다.')
-    if row.get('transport_source')=='conflict':issues.append('통신 방식 기록이 서로 다릅니다.')
-    missing=[name for key,name in (('input','입력'),('output','출력')) if row.get(key) is None]
-    if missing:issues.append('로컬 사용 기록에 '+', '.join(missing)+' 토큰 수가 없어 합계와 환산에서 제외됩니다.')
-    return list(dict.fromkeys(issues))
-
-
-def price_reason(row):
-    """Explain absent source fields and unsupported prices separately from errors."""
-    replacements={
-        '요청 모드 미확인':'요청 모드가 기록되지 않음',
-        '입력 토큰 미확인':'입력 토큰 수가 기록되지 않음',
-        '출력 토큰 미확인':'출력 토큰 수가 기록되지 않음',
-        '캐시 읽기 미확인':'캐시 읽기 토큰 수가 기록되지 않음',
-        '캐시 쓰기 미확인':'캐시 쓰기 토큰 수가 기록되지 않음',
-        '모델 미확인':'모델이 기록되지 않음',
-        '분석 모델 미확인':'모델이 기록되지 않음',
-        '모델 기준 단가 미확인':'이 모델의 환산 단가가 등록되지 않음',
-        '기준 단가 미확인':'이 모델의 환산 단가가 등록되지 않음',
-        '모델 단가 미확인':'이 모델의 환산 단가가 등록되지 않음',
-        'Fast 장문 단가 미확인':'Fast 장문 요청의 공식 단가가 제공되지 않음',
-        '구독 배율 미확인':'구독 배율 미확인',
-    }
-    if row.get('mode_conflict'):
-        replacements['요청 모드 미확인']='요청 모드 기록이 서로 다름'
-    if row.get('model_conflict'):
-        for key in ('모델 미확인','분석 모델 미확인'):
-            replacements[key]='요청 모델 기록이 서로 다름'
-    reasons=row.get('price_issues') or [row.get('price_issue')]
-    return ' / '.join(dict.fromkeys(replacements.get(x,x) for x in reasons if x)) or '환산에 필요한 사용 기록이 없습니다.'
 
 
 def strong(value):
@@ -113,3 +74,14 @@ class Details(Group):
     def set_sections(self, sections):
         self.body.setText(''.join('<p style="margin: 0 0 8px">'+strong(title)+(' &nbsp; ' if self.compact else '<br>')+
                                  escape(str(text)).replace('\n','<br>')+'</p>' for title,text in sections if text))
+
+
+def history_duration(value):
+    if value is None:return '—'
+    minutes,centiseconds=divmod(round(value*100),6000)
+    seconds=f'{centiseconds/100:.2f}'
+    if minutes>=60:
+        hours,minutes=divmod(minutes,60)
+        return formatted('{hours}시간 {minutes}분 {seconds}초',hours=hours,minutes=minutes,seconds=seconds)
+    if minutes:return formatted('{minutes}분 {seconds}초',minutes=minutes,seconds=seconds)
+    return formatted('{seconds}초',seconds=seconds)

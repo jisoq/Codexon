@@ -1,7 +1,6 @@
 """Version-bound operations executed exclusively by the read actor."""
 from pathlib import Path
 import sqlite3
-from .prepared_changes import GenerationJournal
 from .analysis_engine import retained_bytes
 from .prepared_analysis import PreparedAnalysisEngine
 from .prepared_store import PreparedReader, Token, StaleGeneration, NotReady, CapacityExceeded
@@ -16,54 +15,9 @@ def token_value(value):
     return Token(*value)
 
 
-def _reference_token(reference):
-    """A union may combine populations only from the same displayed generation."""
-    if retained_bytes(reference,4*1024*1024)>4*1024*1024:
-        raise ValueError('population reference exceeds its delivery budget')
-    pending=[(reference,0)];tokens=set()
-    while pending:
-        value,depth=pending.pop()
-        if depth>32 or not isinstance(value,dict):
-            raise ValueError('invalid population reference')
-        if 'union' in value:
-            parts=value['union']
-            if not isinstance(parts,(list,tuple)):
-                raise ValueError('invalid population union')
-            pending.extend((part,depth+1) for part in parts)
-        else:
-            tokens.add(token_value(value.get('query',{}).get('_prepared_token')))
-    if len(tokens)!=1:
-        raise StaleGeneration('population references belong to different displayed generations')
-    return tokens.pop()
-
-
 class _Cancellation:
     def __init__(self,callback):self.callback=callback
     def is_set(self):return self.callback()
-
-
-def _fresh_reference(value,token,depth):
-    if depth>32 or not isinstance(value,dict):
-        raise ValueError('invalid refreshed population reference')
-    if 'union' in value:
-        return dict(value,union=[_fresh_reference(part,token,depth+1) for part in value['union']])
-    return dict(value,query=_fresh_query(value['query'],token,depth+1))
-
-
-def _fresh_query(query,token,depth=0):
-    """A page refresh recomputes its drilldown query on the new generation.
-
-    Exact detail requests never use this rebinding. Only query definitions,
-    rather than rows or previously calculated memberships, are carried forward.
-    """
-    if depth>32:raise ValueError('population reference nesting exceeds its limit')
-    result=dict(query,_prepared_token=tuple_token(token))
-    explorer=query.get('explorer') or {}
-    context=explorer.get('context') or {}
-    if context.get('population'):
-        result['explorer']=dict(explorer,context=dict(context,
-            population=_fresh_reference(context['population'],token,depth+1)))
-    return result
 
 
 class PreparedQuery:
@@ -77,20 +31,7 @@ class PreparedQuery:
         self.mismatches=MismatchReader(Path(path).with_name(archive_name))
         self.finance_cache=FinanceCache()
 
-    def _engine(self,token,cancel,changes=(),query=None):
-        # History's explicit source filters are complete membership boundaries.
-        # Foreign drilldowns and other pages retain their wider dependencies.
-        scope=(None,None)
-        explorer=(query or {}).get('explorer') or {}
-        context=explorer.get('context') or {}
-        if (query and query.get('page')==2 and
-                not context.get('population')):
-            scope=(query.get('home') or None,query.get('sid') or None)
-            detail=explorer.get('call_identity')
-            if detail and any(value is not None and detail[i]!=value for i,value in enumerate(scope)):
-                scope=(None,None)
-        if self.engine is not None and self.engine.scope not in ((None,None),scope):
-            self.engine.close();self.engine=None
+    def _engine(self,token,cancel,changes=()):
         if self.engine is not None and self.engine.token!=token:
             at=tuple_token(self.engine.token);changed=set();removed=set()
             for base,target,owners,deleted in changes:
@@ -107,7 +48,7 @@ class PreparedQuery:
                 # metadata. Canonical historical calls remain in the store.
                 self.engine.close();self.engine=None
         if self.engine is None:
-            self.engine=PreparedAnalysisEngine(self.path,token,cancel=cancel,scope=scope)
+            self.engine=PreparedAnalysisEngine(self.path,token,cancel=cancel)
         else:
             self.engine.cancel=cancel
         return self.engine
@@ -144,38 +85,16 @@ class PreparedQuery:
                     raise StaleGeneration('overlay detail belongs to another displayed generation')
                 with PreparedReader(self.path) as reader,reader.pin(token,cancel=cancellation) as view:
                     value=hydrate_overlay(view,summary,finance=bool(message.get('finance')),
-                                          health=bool(message.get('health')),finance_cache=self.finance_cache)
+                                          finance_cache=self.finance_cache)
                 return dict(kind=kind,id=message['id'],summary=value,prepared_token=tuple_token(token))
-            if kind=='record':
-                requested=message.get('prepared_token')
-                if requested is not None and token_value(requested)!=token:
-                    raise StaleGeneration('selected record belongs to another displayed generation')
-                # A selected record never waits for all owner metadata to load.
-                with PreparedReader(self.path) as reader,reader.pin(token,cancel=cancellation) as view:
-                    home,sid,key=message['identity']
-                    owner=view.owner(home,sid)
-                    internal=owner['metadata'].get('_internal_review') if owner else None
-                    if owner is not None and type(internal) is not bool:
-                        raise NotReady('selected owner has no canonical classification')
-                    row=view.record(home,sid,key) if owner is not None and not internal else None
-                return dict(kind='record',id=message['id'],row=row,prepared_token=tuple_token(token))
-            if kind=='population':
-                for reference in (message['population'],message.get('assumptions')):
-                    if reference is not None and _reference_token(reference)!=token:
-                        raise StaleGeneration('population no longer matches the displayed generation')
-                from .dashboard_views import population_summary
-                engine=self._engine(token,cancellation,message.get('_prepared_changes',()))
-                with engine.read_scope():
-                    value=population_summary(engine,message['population'],message.get('assumptions'))
-                return dict(kind='population',id=message['id'],summary=value,prepared_token=tuple_token(token))
             if kind!='query':
                 raise ValueError('unknown prepared query operation')
             if retained_bytes(message['query'],4*1024*1024)>4*1024*1024:
                 raise ValueError('page query exceeds its request budget')
-            query=_fresh_query(message['query'],token)
+            query=dict(message['query'],_prepared_token=tuple_token(token))
             progress=message.get('_progress')
             if progress:progress('query')
-            engine=self._engine(token,cancellation,message.get('_prepared_changes',()),query=query)
+            engine=self._engine(token,cancellation,message.get('_prepared_changes',()))
             from .analysis_worker import expiry
             engine.progress=progress
             try:

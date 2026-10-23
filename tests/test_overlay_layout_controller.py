@@ -80,6 +80,22 @@ def publish_subagents(controller, *, nested=False):
     return parent
 
 
+def test_same_selection_updates_confirmation_and_wheel_target(layout_controller):
+    from types import SimpleNamespace
+    controller = layout_controller
+    initial = dict(controller.target_state)
+    assert controller.selection_confirmed()
+    controller.receive_target(dict(initial, target={'hwnd': 2}, confirmed=False))
+    assert not controller.selection_confirmed()
+    delivered = []
+    controller.native.forward_wheel = lambda hwnd, *args: delivered.append(hwnd)
+    event = SimpleNamespace(angleDelta=lambda: 120, globalPosition=lambda: (0, 0), modifiers=lambda: 0)
+    controller.forward_wheel(event)
+    assert delivered == [2]
+    controller.receive_target(dict(initial, target={'hwnd': 2}, confirmed=True))
+    assert controller.selection_confirmed()
+
+
 def test_selected_settings_button_still_changes_on_hover():
     from PySide6.QtCore import QPoint,QPointF,QRect,QSize,QEvent,Qt
     from PySide6.QtGui import QEnterEvent,QMouseEvent

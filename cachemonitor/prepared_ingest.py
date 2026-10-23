@@ -297,26 +297,14 @@ def request_headers(source):
     for turn in boundaries:
         facts.setdefault(turn, dict(call_count=0, minimum=None, maximum=None, first_key=None,
                                    dimensions=dict.fromkeys(('model','effort','service_tier'), '혼합')))
-    def position(turn):
-        started = boundaries.get(turn, {}).get('started_at')
-        value = started if started is not None else facts[turn]['minimum']
-        return (value if value is not None else float('inf'), turn)
-    for ordinal, turn in enumerate(sorted(facts, key=position), 1):
-        at = position(turn)[0]
-        value = dict(facts[turn], display_ordinal=ordinal,
-                     effective_at=None if at == float('inf') else at,
-                     request_present=turn in boundaries)
+    for turn, value in facts.items():
         if turn in source.get('turn_states', {}):
             value['turn_state'] = source['turn_states'][turn]
         yield turn, value
-    # A state observation without calls or a boundary is still part of the
-    # general source metadata. It must not acquire a displayed request ordinal.
     for turn, state in source.get('turn_states', {}).items():
         if turn not in facts:
-            yield turn, dict(display_ordinal=0, effective_at=None, call_count=0,
-                minimum=None, maximum=None, first_key=None,
-                dimensions=dict.fromkeys(('model','effort','service_tier'), '혼합'),
-                request_present=False, turn_state=state)
+            yield turn, dict(call_count=0,minimum=None,maximum=None,first_key=None,
+                dimensions=dict.fromkeys(('model','effort','service_tier'), '혼합'),turn_state=state)
 
 
 def prepare_owner(source, *, owns):

@@ -221,9 +221,6 @@ class UsagePanel(Node):
         if o['dimension'] in o['filters']:o['dimension']=next((d for _,d in DIMENSIONS if d not in o['filters']),'model')
         o.update(search='');self.put(options=deepcopy(o));self.refresh()
 
-    @Slot()
-    def records(self):
-        self.dashboard.aggregate_records=self.data.get('population');self.dashboard.open_aggregate_records()
 
     def query(self):
         now=self.dashboard.snapshot['ts'];o=self.options;period=o['period']

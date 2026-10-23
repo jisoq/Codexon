@@ -31,13 +31,12 @@ class PreparedAnalysisEngine(AnalysisEngine):
     """
     OWNER_BYTES=64*1024*1024
 
-    def __init__(self, path, token, *, limits=None, cancel=None, scope=(None,None)):
+    def __init__(self, path, token, *, limits=None, cancel=None):
         super().__init__()
         limits = limits or replace(Limits(), read_seconds=60, read_vm_steps=20_000_000)
         self.reader = PreparedReader(path, limits)
         self.token = token
         self.cancel = cancel
-        self.scope=scope
         self.snapshot = None
         self.revision = self.call_revision = self.generation = token.generation
         self.read_metrics = dict(range_rows=0, whole_rows=0, first_rows=0, header_rows=0)
@@ -50,7 +49,7 @@ class PreparedAnalysisEngine(AnalysisEngine):
                 self.order_identity=(token.instance,self.snapshot.order_batch)
                 after = None
                 while True:
-                    page = self.snapshot.catalog(after=after,query=True,home=scope[0],sid=scope[1])
+                    page = self.snapshot.catalog(after=after,query=True)
                     for row in page.rows:
                         self._adopt_owner(row['owner'], row['metadata'], row['call_metadata'], row['owner_ordinal'], row['request_maps'])
                     if page.complete:
@@ -95,12 +94,9 @@ class PreparedAnalysisEngine(AnalysisEngine):
         if self.snapshot is not None:
             raise RuntimeError('finish the active query before adopting a generation')
         pending = {}
-        def selected(key):
-            return all(value is None or key[i]==value for i,value in enumerate(self.scope))
-        removed={tuple(key) for key in removed if selected(key)}
+        removed=set(map(tuple,removed))
         with self.reader.pin(token, cancel=self.cancel) as snapshot:
             for key in changed_owners:
-                if not selected(key):continue
                 if len(pending) >= self.reader.limits.owners_per_batch:
                     raise CapacityExceeded('owner adoption exceeds the committed batch bound')
                 key = tuple(key)
@@ -138,7 +134,7 @@ class PreparedAnalysisEngine(AnalysisEngine):
                         and all(key in self.sessions or key in self.internal_sessions for key in pending)
                         and all(value is not None for value in pending.values()))
             entries=(dict(owner=key,owner_ordinal=pending[key][0]['owner_ordinal'] if key in pending else state['owner_ordinal'])
-                     for states in (self.sessions,self.internal_sessions) for key,state in states.items()) if same_order else self._pages(snapshot.ordering,home=self.scope[0],sid=self.scope[1])
+                     for states in (self.sessions,self.internal_sessions) for key,state in states.items()) if same_order else self._pages(snapshot.ordering)
             for entry in entries:
                 key, ordinal = entry['owner'], entry['owner_ordinal']
                 order_bytes += retained_bytes((key,ordinal),self.OWNER_BYTES)+160
@@ -162,10 +158,6 @@ class PreparedAnalysisEngine(AnalysisEngine):
                   +sum(weight for key,weight in weights.items() if key not in removed)+sum(differences.values()))
         if admitted>self.OWNER_BYTES:
             raise CapacityExceeded('prepared query metadata adoption exceeds its aggregate budget')
-        history=getattr(self,'_prepared_history_projection',None)
-        keep_history=history is not None and same_order and history.unaffected(self,pending,removed)
-        saved_page=self.page_results.get(history.page_key) if keep_history else None
-        if not keep_history:self.clear_history_projection()
         self.token = token
         self.order_identity=order_identity
         self.publication_batch=publication_batch
@@ -176,8 +168,6 @@ class PreparedAnalysisEngine(AnalysisEngine):
         affected=set(pending)|{tuple(key) for key in removed}
         self.parts.discard(lambda key:key[0] in affected)
         self.page_results.clear()
-        for name in ('_explorer_projection', '_history_prepared'):
-            self.__dict__.pop(name, None)
         if not same_facts:
             for name in ('_category_projection','performance','_trend_catalog','_trend_bounds'):
                 self.__dict__.pop(name,None)
@@ -209,15 +199,6 @@ class PreparedAnalysisEngine(AnalysisEngine):
         self.owner_bytes=admitted
         self.sessions = OrderedDict(sorted(self.sessions.items(), key=lambda pair:pair[1]['owner_ordinal']))
         self.internal_sessions = OrderedDict(sorted(self.internal_sessions.items(), key=lambda pair:pair[1]['owner_ordinal']))
-        if keep_history:
-            history.adopt(self)
-            if saved_page is not None:
-                value,deadline=saved_page
-                value=dict(value,key=history.head['key'],revision=self.revision)
-                cached=(value,deadline)
-                self.page_results.put(history.page_key,cached,
-                    retained_bytes((history.page_key,cached),self.page_results.rows))
-
     @contextmanager
     def read_scope(self):
         if self.snapshot is not None:
@@ -231,18 +212,9 @@ class PreparedAnalysisEngine(AnalysisEngine):
                 self.snapshot = None
 
     def close(self):
-        self.clear_history_projection()
         if hasattr(self, 'reader'):
             self.reader.close()
 
-    def clear_history_projection(self):
-        from .prepared_history import close_for_engine
-        close_for_engine(self)
-
-    def history_project(self, q):
-        from .prepared_history import project
-        with self.read_scope():
-            return project(self, q)
 
     def query(self, q):
         with self.read_scope():
@@ -252,11 +224,6 @@ class PreparedAnalysisEngine(AnalysisEngine):
         with self.read_scope():
             return super().page_query(q)
 
-    def record(self, home, sid, key):
-        if (home, sid) not in self.sessions:
-            return None
-        with self.read_scope():
-            return self.snapshot.record(home, sid, key)
 
     def _pages(self, method, *args, **kwargs):
         after = None
@@ -287,19 +254,13 @@ class PreparedAnalysisEngine(AnalysisEngine):
         source = state['prepared']
         if not q.get('include_whole_history', True):
             result={key:value for key,value in source.items() if key not in ('totals','remaining')}
-            # Only selected incident identities are needed for attention and
-            # event detail. The annotated canonical rows already name them.
             events=[]
-            selection=q.get('explorer') or {}
-            event_id=selection.get('event') if tuple(selection.get('session') or ())==session_key else None
             identities=[]
             if q['page']==0:
                 part=self.query_part(session_key,state,q['start'],q['end'],q.get('model',''),
                                      q.get('effort',''),q.get('service_tier',''))
                 identities=list(dict.fromkeys(row['cache_incident_id'] for row in
                     (part or {}).get('responses',()) if row.get('cache_incident_id') is not None))
-            if event_id is not None and str(event_id) not in {str(value) for value in identities}:
-                identities.append(event_id)
             if identities:
                 from .prepared_health import FORMAT,hydrate_health
                 ordered=[]
@@ -409,25 +370,6 @@ class PreparedAnalysisEngine(AnalysisEngine):
                     (not mode or display_tier(row) == mode)):
                     yield row
 
-    def whole_request_calls(self, owner, turn):
-        with self.read_scope():
-            for row in self.snapshot.iter_calls(owner, turn=turn):
-                self.read_metrics['whole_rows'] += 1
-                yield compact_record(row)
-
-    def request_positions(self, owner, turns):
-        result = {}
-        with self.read_scope():
-            for selected in batches(dict.fromkeys(turns)):
-                for header in self._pages(self.snapshot.request_headers, owner, selected):
-                    result[header['key']] = (header['display_ordinal'] or None,
-                        header['effective_at'] if header['effective_at'] is not None else float('inf'))
-                    self.read_metrics['header_rows'] += 1
-        return result
-
-    def unlinked_total(self, owner):
-        with self.read_scope():
-            return self.snapshot.unlinked_count(owner)
 
     def performance_input(self, query, width, granularity):
         from .prepared_performance import performance_input

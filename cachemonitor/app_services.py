@@ -161,10 +161,9 @@ class AppServices:
         if self.collection and not self.closing.is_set():
             try:
                 self.start_collection()
-                self.collection_fault=dict(starting=bool(self.collector_pending))
-                self.collection_healthy=bool(self.collector_source and not self.collector_pending)
-                if self.collector_pending:
-                    errors.append('수집 시작 중')
+                issue = self.poll_collection()
+                if issue:
+                    errors.append(issue)
             except CollectionPending as exc:
                 self.collection_fault=dict(status_pending=True)
                 errors.append(str(exc))
@@ -343,13 +342,17 @@ class AppServices:
 
     def poll_collection(self):
         from hashlib import sha256
+        from .collection_lifecycle import startup_snapshot
         from .usage_collection import CollectionChannel, collector_command, locked
         from .observer_task import ObserverTask
         channel = CollectionChannel(self.homes, self.index, self.evidence)
         self.collection_fault={};self.collection_healthy=False
         try:
             with ProcessLock(channel.companion('.collector-update.lock')):
-                snapshot = channel.read_header()
+                if self.collector_pending:
+                    snapshot, broken_default = startup_snapshot(channel, retired_instance=self.collector_pending[0])
+                else:
+                    snapshot, broken_default = channel.read_header(), False
                 identity_snapshot = snapshot
                 marker=read_json(channel.companion('.collector-error.json'))
                 marker_facts=(marker['facts'] if marker.get('scope')==sha256(channel.scope.encode('utf-8')).hexdigest()
@@ -359,7 +362,7 @@ class AppServices:
                 if self.collector_pending:
                     previous, requested = self.collector_pending
                     current = (snapshot or {}).get('collection', {}).get('instance')
-                    if not current or current == previous:
+                    if broken_default or not current or current == previous:
                         if self.clock() - requested < 30:
                             self.collection_fault=dict(starting=True)|marker_facts
                             return '수집 시작 중'
@@ -369,10 +372,10 @@ class AppServices:
                     elif time.time() - snapshot['ts'] <= 30:
                         published = True
                 source = self.collector_identity(channel, identity_snapshot)
-                if source and snapshot and not self.collector_pending:
-                    self.collection_snapshot_at=snapshot['ts']
                 if published and source:
                     self.collector_pending = None
+                if source and snapshot and not self.collector_pending:
+                    self.collection_snapshot_at=snapshot['ts']
                 stopped = read_json(channel.companion('.session.json'))
                 task = ObserverTask(str(channel.path), role='UsageCollector')
                 dead = not source and (not locked(channel.companion('.collector.lock'))) and (not task.inspect().get('running')) and (not (stopped.get('scope') == channel.scope and stopped.get('stopped')))

@@ -68,11 +68,7 @@ class PreparedAnalysis:
         assert detail['kind']=='overlay_detail'
         overlay=detail['summary']
         assert [row['key'] for row in overlay['recent']]==[row['key'] for row in history]
-        reference=AnalysisEngine();reference.ingest([copy.deepcopy(self.session)])
-        identity=(self.session['home'],self.session['id'],history[-1]['key'])
-        self.parent.send(dict(kind='record',id=1,identity=identity,prepared_token=self.snapshot['prepared_token']))
-        message=self.wait_for(lambda value:value.get('id')==1)
-        assert message['kind']=='record' and message['row']==reference.record(*identity)
+        assert overlay['latest']['key']==history[-1]['key']
 
     def __enter__(self):
         self.publish();self.thread.start();return self

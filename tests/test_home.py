@@ -1,4 +1,5 @@
 """Home owns a stable today scope and routes to the existing analytical pages."""
+from cachemonitor.dashboard import PAGE_INDEX
 import copy
 import time
 from datetime import datetime
@@ -65,10 +66,10 @@ def test_home_routes_keep_native_pages_and_restore_sidebar(dashboard):
     for page in (3,1,5):
         click(w,render_plot(w,w.home_panel.links[page]));assert w.current_page==page
         assert w.quota_sidebar.isVisible()
-        assert w.pages.nodes[page-1] is (w.scrollers[3] if page==3 else w.metric_panel if page==1 else w.performance_panel)
+        assert w.pages.nodes[PAGE_INDEX[page]] is (w.scrollers[3] if page==3 else w.metric_panel if page==1 else w.performance_panel)
         w.change_page(6)
     click(w,render_plot(w,w.home_panel.connection));assert w.current_page==4 and w.quota_sidebar.isVisible()
-    w.change_page(2);assert w.quota_sidebar.isVisible()
+    w.change_page(7);assert w.quota_sidebar.isVisible()
     assert not w.qml_errors
 
 
@@ -153,8 +154,8 @@ def test_home_saved_scroll_restores_rendered_viewport_and_consumes_pending_state
 
 @pytest.mark.integration
 def test_home_scope_and_identity_ignore_other_page_filters_but_expire_at_midnight(dashboard):
-    from cachemonitor.dashboard import choose
-    w=dashboard;w.change_page(2);choose(w.period,'all');choose(w.source,'user');w.archive.setChecked(False)
+    from cachemonitor.dashboard import PAGE_INDEX, choose
+    w=dashboard;w.change_page(1);w.metric_panel.change('period','all');w.metric_panel.change('filter:source','user')
     w.change_page(6);q=w.query()
     assert q['period']=='today' and q['archived'] and q['home']==q['source']==q['model']==''
     tomorrow=dict(q,start=day_start(q['now'])+86400,end=q['end']+86400,now=q['now']+86400)
@@ -162,7 +163,7 @@ def test_home_scope_and_identity_ignore_other_page_filters_but_expire_at_midnigh
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize('saved,expected',[(0,6),(99,6),(1,1),(3,3),(5,5),(6,6)])
+@pytest.mark.parametrize('saved,expected',[(0,6),(2,6),(99,6),(1,1),(3,3),(5,5),(6,6)])
 def test_home_migrates_initial_page_without_replacing_saved_analysis_page(dashboard,saved,expected):
     w=dashboard;state=w.capture_state();state['page']=saved
     w.restore_state(state,initial=True)

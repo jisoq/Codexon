@@ -13,7 +13,7 @@ from .usage_paths import index_location,legacy_index_location
 from .event_store import index_tables_valid
 
 
-def startup_snapshot(channel):
+def startup_snapshot(channel,*,retired_instance=None):
     """Recognize the old default-path bug for control only, never for display."""
     from .usage_collection import CollectionScopeError
     try:return channel.read_header(),False
@@ -32,7 +32,7 @@ def startup_snapshot(channel):
                 not source.get('instance') or not source.get('pid') or not source.get('executable')):raise
         from .usage_collection import locked
         lock=channel.companion('.collector.lock')
-        if not locked(lock):return snapshot,True
+        if source['instance']==retired_instance or not locked(lock):return snapshot,True
         try:
             process=identity.process_identity(source['pid'])
             if process:

@@ -71,14 +71,6 @@ def test_confirmed_alerts_reach_tray_and_click_opens_evidence(tmp_path,monkeypat
         assert rows[0]['error_kind']=='connection' and rows[0]['error_code']=='refused'
         window.observer_panel.display(dict(configured=True,probe_state='healthy',phase='active'))
         assert len(sent)==2 and window.notification_log.model().rows[0]['resolution']=='정상 식별 응답 확인'
-        window.open_notification_record(1)
-        assert window.current_page==2 and window.selected_call=='r'
-        assert window.selected_call_scope==(str(tmp_path),'task')
-        assert window.record_section=='evidence'
-        capture=os.environ.get('CACHEMONITOR_NOTIFICATION_CAPTURE')
-        if capture:
-            window.resize(1350,1000);app.processEvents()
-            assert window.grab().save(capture)
     finally:
         reader.close();store.close()
         window.quitting=True;window.tick.stop();window.tray.hide();window.close()

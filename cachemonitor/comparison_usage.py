@@ -487,8 +487,7 @@ def _deliver(fold,scope,dimension,options):
                          distributions={key:box.result() if box else None for key,box in zip(MEAN_FIELDS,row.boxes)},
                          components=[]))
     data=dict(rows=rows,metrics={key:value._asdict() for key,value in zip(METRICS,fold.metrics)},
-              dimension=dimension,cross='model',comparison=True,detail=None,breakdowns=['effort','service_tier'],
-              population=dict(query=deepcopy(scope),path=['analysis','responses']))
+              dimension=dimension,cross='model',comparison=True,detail=None,breakdowns=['effort','service_tier'])
     data=choose_metric(data,options.get('metric','calls'))
     data['rows']=display_rows(data['rows'],options,True);data['count']=len(data['rows'])
     return data

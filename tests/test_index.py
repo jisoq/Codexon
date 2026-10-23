@@ -779,7 +779,7 @@ def test_usage_revision_preserves_corrections_to_sanitized_token_evidence(tmp_pa
         assert after[0]['history'][0]['written'] is None
         assert not after[0]['history'][0]['input_conflict']
         assert engine.ingest(after)
-        row=engine.record(after[0]['home'],after[0]['id'],'r1')
+        row=engine.query(dict(page=0,start=0,end=20000))['analysis']['responses'][0]
         assert row['input_conflict'] is False
         assert row['cost']==analyze(after)['responses'][0]['cost']
     finally:index.close()

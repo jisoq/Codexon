@@ -1,3 +1,4 @@
+from cachemonitor.analysis_records import public_record
 import copy
 import pytest
 from cachemonitor.core import Session
@@ -123,7 +124,7 @@ def test_price_policy_change_invalidates_revision_shortcut_and_overlay(monkeypat
     assert engine.ingest([source])
     assert overlays.collect(engine)[0]['cost']==pytest.approx(3.645)
     assert first['cost']==pytest.approx(3.24)
-    assert engine.record('h','s','5')['cost'] is None
+    assert public_record(engine.sessions[('h','s')]['records']['5'][1])['cost'] is None
 
 
 def test_unknown_price_migration_retains_original_mode_and_excludes_base_amount(tmp_path):

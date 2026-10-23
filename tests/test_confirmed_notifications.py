@@ -26,11 +26,6 @@ def test_http_fallback_requires_explicit_observation_and_never_replays():
     assert engine.http([source])==[]
     observed['evidence']='HTTP 전환 기록'
     events=engine.http([source]);assert len(events)==1
-    assert events[0]['target']['home']=='home'
-    assert events[0]['target']['sid']=='task'
-    assert events[0]['target']['request_id']=='turn'
-    assert events[0]['target']['call_id'] is None
-    assert events[0]['target']['filters']==('http',)
     assert engine.http([source])==[]
     engine.enable_http(False);clock[0]=103
     source['transports'].append({**observed,'ts':103})

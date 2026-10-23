@@ -6,7 +6,7 @@
 
 - **Spot a request/response model mismatch directly in the overlay.** Compare the requested and reported model names when investigating routing behavior.
 - See the main agent's accumulated usage and call trends including subagents while working in Codex.
-- Open session records from the overlay and call records from comparison results. Inspect main-agent and subagent usage separately.
+- Inspect main-agent and subagent usage separately in the overlay.
 - Compare model and reasoning effort together, grouped by project, request mode, input size, or cache utilization. Unknown entries are hidden by default; use **Show unknown** to include them.
 - Follow remaining usage limits and reset times. The tray and taskbar widget keep them visible without opening the dashboard.
 
@@ -18,7 +18,7 @@ Supported installation target: **Windows 10/11 x64**. Setup includes Python, Qt 
 
 **Check the requested model against the model reported in the response, right in the overlay.** Only a mismatch adds `(mismatch: response model name)` after the model and reasoning effort. Request modes other than Standard also appear after the model and reasoning effort.
 
-Use the difference as a clue when investigating routing behavior, then open **Call details** in the dashboard to inspect that call's record. These are recorded request/response names; they do not establish the internal routing path or underlying model implementation.
+Use the difference as a clue when investigating routing behavior, then open **Model mismatch history** in the dashboard to inspect saved mismatch evidence. These are recorded request/response names; they do not establish the internal routing path or underlying model implementation.
 
 ## Weekly allowance, measured from real usage
 
@@ -56,7 +56,7 @@ The dashboard reads local Codex records. If there are no records yet, use Codex 
 
 ## Optional output-speed and response-model recording
 
-Enable **Settings → Codex connection → Record output speed and response model** to observe responses through the local proxy. Valid timing from completed responses supplies output speed, and recorded model names supply the request/response comparison. Turning it on checks local readiness without sending a model request. Restart the app or CLI where you use Codex once after changing its connection setting. If you have already restarted it, no further restart is needed. Session history, cost analysis and usage-limit views can be used without the proxy.
+Enable **Settings → Codex connection → Record output speed and response model** to observe responses through the local proxy. Valid timing from completed responses supplies output speed, and recorded model names supply the request/response comparison. Turning it on checks local readiness without sending a model request. Restart the app or CLI where you use Codex once after changing its connection setting. If you have already restarted it, no further restart is needed. Metric comparison, performance trends and usage-limit views can be used without the proxy.
 
 Codexon reports a model match or mismatch only when completed request/response evidence can be linked reliably. Missing or conflicting evidence is not treated as a mismatch. The reported model name does not prove which hardware or internal model implementation handled the request.
 
