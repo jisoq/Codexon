@@ -62,8 +62,8 @@ class PreparedOverlays:
         updated = {}
         for key in sessions:
             prior = self.presenter.cache.get(key)
-            updated[key] = (prior if prior and prior[0] == self.revisions[key]
-                            and prior[1] is self.own[key] else (self.revisions[key], self.own[key]))
+            updated[key] = (prior if prior and prior[1] is self.own[key]
+                            else (self.revisions[key], self.own[key]))
         previous = self.presenter.presented
         result = self.presenter.present(SimpleNamespace(sessions=sessions), updated,
                                         self.partials, speed_results, include_finance=self.finance,
@@ -90,21 +90,22 @@ class PreparedOverlays:
         return ([dict(value, _prepared_token=token) for value in summaries.values()]
                 if bind_generation else list(summaries.values()))
 
-    def prime(self,view,key,packet):
+    def prime(self,view,key,packet,*,preserve_content=False):
         """Retain only overlay scalars from an already decoded publication packet."""
-        refs=list(recent_references(packet))
-        own={name:value for name,value in packet['own'].items()
-             if name!='model_breakdown' or self.finance}
-        if self.compact:
-            # Only the latest reference is needed for the global status head.
-            # Compositions and the graph's twenty calls belong to selection.
-            refs=refs[-1:]
-            for name in ('token_composition','cost_composition'):
-                own.pop(name,None)
-        if refs:
-            refs[-1]=dict(refs[-1],**{name:own.get(name) for name in LATEST_FIELDS},cost=own.get('latest_cost'))
-        self.own[key]=dict(own,recent=refs,latest=refs[-1] if refs else {})
-        self.partials[key]=packet['summary']['partials']
+        if not preserve_content:
+            refs=list(recent_references(packet))
+            own={name:value for name,value in packet['own'].items()
+                 if name!='model_breakdown' or self.finance}
+            if self.compact:
+                # Only the latest reference is needed for the global status head.
+                # Compositions and the graph's twenty calls belong to selection.
+                refs=refs[-1:]
+                for name in ('token_composition','cost_composition'):
+                    own.pop(name,None)
+            if refs:
+                refs[-1]=dict(refs[-1],**{name:own.get(name) for name in LATEST_FIELDS},cost=own.get('latest_cost'))
+            self.own[key]=dict(own,recent=refs,latest=refs[-1] if refs else {})
+            self.partials[key]=packet['summary']['partials']
         self.revisions[key]=(view.publication_token.instance,view.publication_token.generation)
 
 

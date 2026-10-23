@@ -261,7 +261,8 @@ def test_maintenance_updates_snapshot_delay_and_displayed_age(layout_controller,
     assert not m.note
     now[0]=115.01;c.receive_target(dict(c.target_state));c._tick()
     assert m.note=='갱신 중' and m.data['_collection']['reason']=='analysis_delay'
-    assert m.heartbeat_state()['mode']=='pending'
+    assert m.state['heartbeatMode']=='pending'
+    assert m.state['contentOpacity']==1
     previous=m.freshness_text()
     now[0]=116.01;c.receive_target(dict(c.target_state));c._tick()
     assert m.freshness_text()!=previous
@@ -328,6 +329,7 @@ def test_pending_overlay_refresh_keeps_confirmed_panel_until_replacement(layout_
     m.monitor_tab='history';m.pin_call(m.call_id(m.rows()[0]));c.refresh();app.processEvents()
     assert m.compact is compact
     selected=m.selected_id;geometry=c.monitor_geometry
+    activity=m.state['heartbeatMode'],m.state['heartbeatLabel']
     wait_for_rendered(lambda:not m.row_glows.needs_frame,timeout=5)
     frame=c.widget.quick.grabFramebuffer();layout=m.layout()
     scale=m.appearance.scale*frame.width()/c.widget.quick.width()
@@ -344,7 +346,8 @@ def test_pending_overlay_refresh_keeps_confirmed_panel_until_replacement(layout_
     assert m.data['_collection']['last_confirmed_at']==stamp
     assert m.selected_id==selected and m.graph_pinned
     assert c.monitor_geometry==geometry
-    assert m.note=='갱신 중' and m.heartbeat_state()['mode']=='pending'
+    assert not m.note
+    assert (m.state['heartbeatMode'],m.state['heartbeatLabel'])==activity
     wait_for_rendered(lambda:c.widget.quick.grabFramebuffer().copy(body)==confirmed_body)
     before=c.widget.quick.grabFramebuffer()
     assert m.notice_card() is None and len(requests)==1
@@ -355,10 +358,17 @@ def test_pending_overlay_refresh_keeps_confirmed_panel_until_replacement(layout_
     assert m.data['cost']==confirmed['cost'] and m.data['latest']==confirmed['latest']
     # A stalled detail refresh must disclose the age of the retained values.
     with monkeypatch.context() as clock:
-        clock.setattr('cachemonitor.overlay.time.time',lambda:stamp+20)
-        c._tick()
+        wall=[stamp+15]
+        clock.setattr('cachemonitor.overlay.time.time',lambda:wall[0])
+        changed['_prepared_token']=('fixture',3);publish(changed,stamp+14)
+        c.receive_target(dict(c.target_state));c._tick()
+        assert not m.note
+        wall[0]=stamp+15.01
+        c.receive_target(dict(c.target_state));c._tick()
         assert m.data['cost']==confirmed['cost'] and m.note=='갱신 중'
-        assert m.heartbeat_state()['mode']=='pending'
+        assert m.state['heartbeatMode']=='pending' and m.state['contentOpacity']==1
+        assert m.selected_id==selected and m.graph_pinned
+        assert m.data['_collection']['reason']=='detail_pending'
         assert m.data['_collection']['last_confirmed_at']==stamp and m.freshness_text()
     changed['_prepared_token']=('fixture',3);publish(changed,stamp+2)
     c.receive_overlay_detail(dict(id=requests[-1][0],summary=changed,prepared_token=changed['_prepared_token']))

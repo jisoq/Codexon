@@ -307,3 +307,46 @@ def test_latest_agent_updates_preserve_manual_scroll_and_focus(native_detail):
     main=named_item(c.links.quick.rootObject(),'nav-main-detail')
     click(c.links,main)
     wait_for_rendered(lambda:m.main_expanded)
+
+
+@pytest.mark.skipif(sys.platform!='win32',reason='Native Windows heartbeat hover')
+def test_refresh_freshness_uses_activity_label_native_hit_region(native_detail, monkeypatch):
+    from copy import deepcopy
+    from ctypes import wintypes as W
+    from PySide6.QtCore import QObject,QPointF,QEvent
+    from PySide6.QtGui import QAccessible,QEnterEvent,QMouseEvent
+    from cachemonitor.overlay_chrome import named_item
+    from tests.test_ui import wait_for_rendered
+    c,host,refresh=native_detail;app=QApplication.instance();model=c.widget.content_model
+    monkeypatch.setattr('cachemonitor.overlay_view.time.time',lambda:1000)
+    data=deepcopy(model.data);data['active_requests']=2
+    for compact,reason in ((False,'analysis_delay'),(True,'detail_pending')):
+        data['_collection']={'reason':reason,'received_age':16,'last_confirmed_at':700}
+        c.widget.set_layout(reduced=compact)
+        c.widget.set_content(deepcopy(data),'갱신 중')
+        wait_for_rendered(lambda:c.links.quick is not None and c.links.quick.rootObject() is not None)
+        link=named_item(c.links.quick.rootObject(),'nav-heartbeat')
+        assert link is not None
+        wait_for_rendered(lambda:link.width()>0 and link.height()>0)
+        tip=next(item for item in link.findChildren(QObject) if item.metaObject().indexOfProperty('popupType')>=0)
+        tip.setProperty('delay',0)
+        detail=model.status_detail()
+        assert detail and model.freshness_text() in detail
+        accessible=QAccessible.queryAccessibleInterface(link)
+        assert accessible is not None and detail in accessible.text(QAccessible.Name)
+        assert tip.property('text')==detail
+        center=link.mapToScene(QPointF(link.width()/2,link.height()/2)).toPoint()
+        assert c.links.mask().contains(center)
+        left,top,right,bottom=c.native.frame(int(c.links.winId()));scale=(right-left)/c.links.width()
+        api=c.native.u;api.WindowFromPoint.argtypes=[W.POINT];api.WindowFromPoint.restype=W.HWND
+        assert api.WindowFromPoint(W.POINT(left+round(center.x()*scale),top+round(center.y()*scale)))==int(c.links.winId())
+        local=QPointF(center);global_pos=QPointF(c.links.quick.mapToGlobal(center))
+        app.sendEvent(c.links.quick,QEnterEvent(local,local,global_pos))
+        app.sendEvent(c.links.quick,QMouseEvent(QEvent.MouseMove,local,global_pos,Qt.NoButton,Qt.NoButton,Qt.NoModifier))
+        wait_for_rendered(lambda:tip.property('visible'))
+        assert model.state['heartbeatMode']=='pending' and model.state['contentOpacity']==1
+        label=named_item(c.widget.quick.rootObject(),'overlayHeartbeatLabel')
+        accessible=QAccessible.queryAccessibleInterface(label)
+        assert accessible is not None and detail in accessible.text(QAccessible.Description)
+        assert not c.links.qml_errors and not c.widget.qml_errors
+        tip.setProperty('visible',False)

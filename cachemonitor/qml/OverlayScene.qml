@@ -52,5 +52,6 @@ Item {
         verticalAlignment: Text.AlignVCenter
         Accessible.role: Accessible.StaticText
         Accessible.name: text
+        Accessible.description: root.s.heartbeatMessage || ""
     }
 }
