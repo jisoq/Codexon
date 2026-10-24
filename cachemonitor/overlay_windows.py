@@ -104,9 +104,11 @@ class WindowsOverlay:
         return rect.left, rect.top, rect.right, rect.bottom
 
     def visible_target(self, hwnd):
+        foreground=self.u.GetForegroundWindow()
         return bool(self.u.IsWindow(hwnd) and self.u.IsWindowVisible(hwnd)
                     and not self.u.IsIconic(hwnd)
-                    and self.u.GetForegroundWindow() in ({hwnd} | self.companions))
+                    and (foreground in ({hwnd} | self.companions)
+                         or self.owner(foreground) in self.companions))
 
     def set_companions(self, handles):
         self.companions = {int(handle) for handle in handles}
