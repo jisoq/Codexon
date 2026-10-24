@@ -44,6 +44,10 @@ def agent_mark(task_id, appearance):
     return _mark(value % _ICON_COUNT, appearance)
 
 
+def agent_palette(appearance):
+    return tuple(_mark(index, appearance).color for index in range(_ICON_COUNT))
+
+
 @lru_cache(maxsize=56)
 def _variant(index, dark):
     svg = (_ASSETS / f'{index:02d}-{"dark" if dark else "light"}.svg').read_bytes()

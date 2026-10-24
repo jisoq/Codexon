@@ -51,14 +51,14 @@ def test_row_glows_restart_each_changed_owner_without_queueing():
         assert len(glows.active)<=3
     glows.update({main:str(1000)},now_ms=1100)
     assert set(glows.active)=={main}
-    assert not glows.active[main].finished(1519)
-    glows.advance(now_ms=1520)
+    assert not glows.active[main].finished(1200)
+    glows.advance(now_ms=2000)
     assert not glows.needs_frame
-    glows.update({main:str(1000)},now_ms=1600)
+    glows.update({main:str(1000)},now_ms=2100)
     assert not glows.needs_frame
-    glows.update({main:'new update'},now_ms=1700)
+    glows.update({main:'new update'},now_ms=2200)
     assert glows.needs_frame
-    glows.clear();glows.update({main:'different scope'},now_ms=1701)
+    glows.clear();glows.update({main:'different scope'},now_ms=2201)
     assert not glows.needs_frame
 
 
@@ -108,7 +108,7 @@ def test_main_and_child_visible_updates_paint_immediately_and_share_one_idle_tim
     assert all(glow.progress(1100)==0 for glow in m.row_glows.active.values())
     assert m.layout()==layout and m.state['detailBodyHeight']==height
     clock[0]=1.2;active_main=render(m);active_child=detail_image()
-    clock[0]=1.621;m.advance_row_glows()
+    clock[0]=2.1;m.advance_row_glows()
     assert not m.row_glows.needs_frame and not m._row_glow_timer.isActive()
     assert render(m)!=active_main and detail_image()!=active_child
     changed=deepcopy(changed);changed['main_usage']['cost']+=.5
@@ -211,7 +211,7 @@ def test_native_row_treatments_use_own_mark_colors_and_preserve_clip(column_mode
     from cachemonitor.overlay_view import Drawing,HighlightStyle,RowGlow
     from cachemonitor.overlay_icons import agent_mark
     from test_overlay_monitor import render
-    clock=[1.04]
+    clock=[1.12]
     monkeypatch.setattr('cachemonitor.overlay_view.time',SimpleNamespace(monotonic=lambda:clock[0]))
     from cachemonitor.core import Session
     from cachemonitor.analysis_engine import AnalysisEngine
@@ -261,7 +261,7 @@ def test_native_row_treatments_use_own_mark_colors_and_preserve_clip(column_mode
         images.append(image)
     assert all(left!=right for index,left in enumerate(images) for right in images[index+1:])
     m.set_reduced_motion(True);stationary=[]
-    for now in (1.04,1.14):
+    for now in (1.12,1.22):
         clock[0]=now
         image=QImage(250,90,QImage.Format_ARGB32_Premultiplied);image.fill(0)
         painter=QPainter(image)
@@ -692,3 +692,116 @@ def test_visible_count_is_scoped_and_survives_growth_retention_and_screen_constr
     assert m.base_height()==chosen
     c.set_visible_agent_count(3)
     assert m.base_height()==automatic
+
+
+def test_highlight_sample_matches_real_row_painter_for_every_style(column_model,monkeypatch):
+    from types import SimpleNamespace
+    from PySide6.QtGui import QImage,QPainter
+    from cachemonitor.overlay_chrome import HighlightPreview
+    from cachemonitor.overlay_view import Drawing,HighlightStyle
+    clock=[1.]
+    source=SimpleNamespace(monotonic=lambda:clock[0])
+    monkeypatch.setattr('cachemonitor.overlay_view.time',source)
+    monkeypatch.setattr('cachemonitor.overlay_chrome.time',source)
+    m=column_model;preview=HighlightPreview(None);owner=('home','sample')
+    preview._paint_width=220;preview._paint_height=32
+    try:
+        preview.set_visible(True)
+        for reduced in (False,True):
+            for style in HighlightStyle:
+                m.highlight_style=style
+                preview.configure(style,m.appearance,reduced);preview.play()
+                for _ in range(3):
+                    m.row_glows.active={owner:preview.glow}
+                    clock[0]=(preview.glow.start_ms+120)/1000
+                    images=[]
+                    for sample in (False,True):
+                        image=QImage(220,32,QImage.Format_ARGB32_Premultiplied);image.fill(0)
+                        painter=QPainter(image)
+                        try:
+                            if sample:preview.paint(painter)
+                            else:Drawing(painter,m).row_glow(0,0,220,32,owner=owner,color=preview.color)
+                        finally:painter.end()
+                        images.append(image)
+                    assert images[0]==images[1]
+                    assert any(images[0].pixelColor(x,y).alpha() for y in range(32) for x in range(220))
+                    clock[0]=(preview.glow.start_ms+(300 if reduced else 800))/1000
+                    preview.advance()
+                assert preview.glow is None
+    finally:preview.clear();preview.deleteLater()
+
+
+@pytest.mark.parametrize('dark',[False,True])
+@pytest.mark.parametrize('reduced',[False,True])
+def test_highlight_sample_plays_exactly_three_distinct_icon_colors(column_model,monkeypatch,dark,reduced):
+    from types import SimpleNamespace
+    from cachemonitor.overlay_chrome import HighlightPreview
+    from cachemonitor.overlay_icons import agent_palette
+    from cachemonitor.overlay_view import HighlightStyle
+    clock=[1.]
+    monkeypatch.setattr('cachemonitor.overlay_chrome.time',SimpleNamespace(monotonic=lambda:clock[0]))
+    preview=HighlightPreview(None);appearance=default_appearance(dark)
+    colors=agent_palette(appearance)[:3]
+    assert len(colors)==len(set(colors))==3
+    try:
+        preview.configure(HighlightStyle.SCAN,appearance,reduced)
+        preview.play();assert preview.glow is None and not preview.timer.isActive()
+        preview.set_visible(True)
+        for color in colors:
+            assert preview.color==color and preview.glow.reduced_motion is reduced
+            assert preview.timer.isActive()
+            end=preview.glow.start_ms+(300 if reduced else 800)
+            clock[0]=(end-1)/1000;preview.advance()
+            assert preview.color==color
+            clock[0]=end/1000;preview.advance()
+        assert preview.glow is None and not preview.timer.isActive()
+        clock[0]+=10;preview.advance()
+        assert preview.glow is None and not preview.timer.isActive()
+    finally:preview.clear();preview.deleteLater()
+
+
+def test_highlight_choice_replaces_running_sequence(column_controller,monkeypatch):
+    from types import SimpleNamespace
+    from cachemonitor.overlay_icons import agent_palette
+    from cachemonitor.overlay_view import HighlightStyle
+    clock=[1.]
+    monkeypatch.setattr('cachemonitor.overlay_chrome.time',SimpleNamespace(monotonic=lambda:clock[0]))
+    c=column_controller;preview=c.toolbar.view.highlightPreview
+    preview.set_visible(True)
+    colors=agent_palette(preview.appearance)[:3]
+    clock[0]=1.8;preview.advance();assert preview.color==colors[1]
+    clock[0]=1.9;c.choose_highlight_style(HighlightStyle.EDGE.key)
+    assert c.highlight_style is HighlightStyle.EDGE
+    assert preview.style is HighlightStyle.EDGE and preview.color==colors[0]
+    assert preview.glow.start_ms==1900
+    for color in colors:
+        assert preview.color==color
+        clock[0]=(preview.glow.start_ms+800)/1000;preview.advance()
+    assert preview.glow is None and not preview.timer.isActive()
+    preview.set_visible(False);preview.advance()
+    assert preview.glow is None and not preview.timer.isActive()
+
+
+def test_highlight_sample_reduced_motion_never_resumes_current_travel(column_model,monkeypatch):
+    from types import SimpleNamespace
+    from cachemonitor.overlay_chrome import HighlightPreview
+    from cachemonitor.overlay_view import HighlightStyle
+    clock=[1.]
+    monkeypatch.setattr('cachemonitor.overlay_chrome.time',SimpleNamespace(monotonic=lambda:clock[0]))
+    preview=HighlightPreview(None)
+    try:
+        preview.configure(HighlightStyle.SCAN,column_model.appearance,False)
+        preview.set_visible(True);first=preview.glow
+        assert first is not None and preview.timer.isActive()
+        clock[0]=1.2;preview.configure(HighlightStyle.EDGE,column_model.appearance,False)
+        assert preview.glow is first
+        clock[0]=1.3;preview.configure(HighlightStyle.EDGE,column_model.appearance,True)
+        stationary=preview.glow
+        assert stationary.reduced_motion and stationary.start_ms==1300
+        preview.configure(HighlightStyle.EDGE,column_model.appearance,False)
+        assert preview.glow is stationary
+        preview.set_visible(False);preview.advance()
+        assert preview.glow is None and not preview.timer.isActive()
+        preview.set_visible(True);assert preview.glow is not None
+        preview.set_visible(False)
+    finally:preview.deleteLater()
