@@ -296,7 +296,7 @@ def test_cached_offer_install_prepares_selected_release_without_network(endpoint
     try:
         monitor.start()
         assert panel.offer['release']==cached and panel.execute.isVisible() and not calls
-        assert not panel.button.isVisible()
+        assert panel.button.isVisible() and panel.button.isEnabled()
         panel.request_install();panel.request_install()
         settle(lambda:panel.operation is None)
         assert not e.requests
@@ -313,6 +313,95 @@ def test_cached_offer_install_prepares_selected_release_without_network(endpoint
         if getattr(panel,'dialog',None):panel.dialog.reject()
         if panel.operation:panel.operation.wait()
         panel.deleteLater();e.app.processEvents()
+
+
+@pytest.mark.parametrize('outcome',['newer','same','current','failure'])
+def test_recheck_preserves_offer_until_metadata_result(endpoint,tmp_path,monkeypatch,outcome):
+    from cachemonitor.update_panel import UpdatePanel
+    e=endpoint;cached=release()
+    e.settings.setValue('updates/cache',json.dumps(dict(release=cached)))
+    monitor=e.make();panel=UpdatePanel(SimpleNamespace(status=lambda:{}));panel.bind_monitor(monitor)
+    monkeypatch.setattr(app_update,'installed',lambda:dict(InstallRoot=str(tmp_path)))
+    monkeypatch.setattr(app_update,'inspect_proxy',lambda manager:dict(state='off',reason='프록시 사용 안 함',connections=0))
+    installs=[];monkeypatch.setattr(app_update,'update',lambda *a,**kw:installs.append(kw['plan']) or '설치 시작')
+    try:
+        monitor.start();previous=panel.offer
+        panel.start();settle(lambda:len(e.requests)==1)
+        assert panel.offer is previous and panel.version.text()=='2099.01.01.1'
+        assert panel.version.isVisible() and panel.execute.isVisible() and not panel.execute.isEnabled()
+        assert panel.button.isVisible() and not panel.button.isEnabled()
+        panel.request_install();panel.start()
+        assert not installs and len(e.requests)==1
+        if outcome=='failure':
+            monitor.timed_out()
+        else:
+            result=release('v2099.02.01.1' if outcome=='newer' else 'v'+app_update.VERSION if outcome=='current' else cached['tag_name'])
+            body=json.dumps(result).encode();socket=e.sockets[-1]
+            socket.write(b'HTTP/1.1 200 OK\r\nContent-Length: '+str(len(body)).encode()+b'\r\nConnection: close\r\n\r\n'+body)
+            socket.disconnectFromHost()
+        settle(lambda:not panel.metadata_pending and panel.operation is None)
+        assert panel.button.isVisible() and panel.button.isEnabled() and not installs
+        if outcome=='failure':
+            assert panel.offer is previous and panel.execute.isVisible() and panel.execute.isEnabled()
+            assert '응답이 늦어지고 있습니다' in panel.status.text()
+            panel.refresh()
+            assert '응답이 늦어지고 있습니다' in panel.status.text()
+            panel.request_install();settle(lambda:panel.operation is None and bool(installs))
+            assert installs[0]['release']==cached
+        elif outcome=='current':
+            assert panel.offer['kind']=='none' and not panel.execute.isVisible() and not panel.version.isVisible()
+            assert panel.status.text()=='설치할 새 버전이 없습니다.'
+        else:
+            assert panel.offer['release']==result and panel.version.text()==result['tag_name'].lstrip('v')
+            assert panel.execute.isVisible() and panel.execute.isEnabled()
+    finally:
+        monitor.stop();panel.stop()
+        if panel.operation:panel.operation.wait()
+        panel.deleteLater();e.app.processEvents()
+
+
+def test_cached_offer_renders_check_and_start_and_preserves_version_during_recheck(endpoint,tmp_path):
+    from cachemonitor.update_panel import UpdatePanel
+    from cachemonitor.quick_runtime import QuickHost
+    from cachemonitor.quick_qa import control,click
+    e=endpoint;cached=release();e.settings.setValue('updates/cache',json.dumps(dict(release=cached)))
+    monitor=e.make();panel=UpdatePanel(None);panel.bind_monitor(monitor)
+    host=QuickHost();host.resize(700,240);host.setCentralWidget(panel);host.show()
+    try:
+        monitor.start()
+        check=control(host,panel.button);start=control(host,panel.execute);version=control(host,panel.version)
+        settle(lambda:start.isVisible() and start.width()>0 and start.height()>0)
+        assert check.isVisible() and check.isEnabled() and check.width()>0 and check.height()>0
+        assert start.isEnabled() and version.isVisible() and panel.version.text()=='2099.01.01.1'
+        click(host,check);settle(lambda:len(e.requests)==1)
+        assert version.isVisible() and panel.version.text()=='2099.01.01.1'
+        assert check.isVisible() and not check.isEnabled() and start.isVisible() and not start.isEnabled()
+        monitor.timed_out();settle(lambda:not panel.metadata_pending)
+        settle(lambda:check.isEnabled() and start.isEnabled())
+        assert version.isVisible() and '응답이 늦어지고 있습니다' in panel.status.text()
+        assert host.grab().save(str(tmp_path/'update-recheck-failure.png'))
+    finally:
+        monitor.stop();panel.stop()
+        if panel.operation:panel.operation.wait()
+        host.release_scene();host.close();host.deleteLater();e.app.processEvents()
+
+
+def test_new_release_discovery_cannot_retarget_active_update(endpoint,tmp_path,monkeypatch):
+    from cachemonitor.update_panel import UpdatePanel
+    e=endpoint;monitor=e.make()
+    monkeypatch.setattr(UpdatePanel,'recover',lambda self:None)
+    panel=UpdatePanel(SimpleNamespace(directory=tmp_path/'updates'));panel.bind_monitor(monitor)
+    try:
+        operation=panel.journal.begin('app','2098.01.01.1')['operation_id']
+        panel.journal.change(operation,phase='downloading');panel.refresh()
+        before=panel.journal.path.read_bytes()
+        panel.start();assert not e.requests
+        e.responses.append((200,{},release()))
+        monitor.check_manually();settle(lambda:len(e.requests)==1 and monitor.reply is None)
+        assert panel.journal.path.read_bytes()==before and panel.record['operation_id']==operation
+        assert panel.offer is None and not panel.version.isVisible() and not panel.execute.isVisible()
+    finally:
+        monitor.stop();panel.stop();panel.deleteLater();e.app.processEvents()
 
 
 def test_explicit_update_continuation_waits_for_service_readiness_and_runs_once():
