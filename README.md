@@ -38,7 +38,7 @@ The top summary shows total cost and active requests. Three charts show cost, ou
 
 **Main Agent** stays fixed while only the **Sub Agents** list below it scrolls. Each row shows its own cumulative cost, model and reasoning effort, cache hit rate, and average output speed. Expand a row to inspect token composition and the number of priced calls.
 
-Open **Settings** in the header to choose bars or a filled line. When subagents are present, choose how many to show at once, from one to four. The height fits that count and the available screen space. Each conversation's count preference survives restarts. Separate controls adjust background transparency and minimize the overlay. Select the minimized icon to restore it. Preparation, delay, and error messages replace the activity status at the top. Existing values are dimmed when updates are interrupted or delayed.
+Open **Settings** in the header to choose bars or a filled line. When subagents are present, choose how many to show at once, from one to four. The height fits that count and the available screen space. Each conversation's count preference survives restarts. Separate controls adjust background transparency and minimize the overlay. Select the minimized icon to restore it. Preparation, delay, and error messages replace the activity status at the top.
 
 Run the [overlay preview](https://github.com/jisoq/Codexon/blob/main/docs/overlay-preview.md) to try source changes without replacing the installed application.
 
