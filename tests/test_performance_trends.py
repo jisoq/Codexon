@@ -4,15 +4,6 @@ import pytest
 from cachemonitor.performance_trends import PerformanceTrends,assessment
 
 
-@pytest.fixture(autouse=True)
-def restore_shell_integration():
-    from PySide6.QtWidgets import QApplication
-    app=QApplication.instance() or QApplication([])
-    previous=app.property('cachemonitorDisableShellIntegration')
-    yield
-    app.setProperty('cachemonitorDisableShellIntegration',previous)
-
-
 def row(i,**changes):
     return dict(dict(ts=1000+i,home='test',sid='s',key=str(i),turn='t',model='m',service_tier='Standard',effort='high',
                      cost=1.,input=100,cached=90,output=100,reasoning=50,duration=1.,completion_latency_ms=1000,output_speed=100),**changes)
