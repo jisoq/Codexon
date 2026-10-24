@@ -36,7 +36,7 @@ Item {
             Rectangle {
                 anchors.fill: parent; radius: 5 * root.unitScale
                 visible: !link.passive && !link.infoIcon
-                color: root.accent
+                color: root.s.interactionTint || root.s.overlayInteractionTint
                 opacity: pointer.pressed ? 0.16 : pointer.containsMouse ? 0.09 : 0
                 border.width: link.activeFocus ? root.unitScale : 0
                 border.color: root.accent

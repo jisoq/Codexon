@@ -13,6 +13,43 @@ from cachemonitor.model_evidence import home_key
 from cachemonitor.observer_state import read_json
 
 
+@pytest.fixture
+def restored_ui_reports(monkeypatch):
+    from tools import verify_recovery as verifier
+    clock=[0]
+    monkeypatch.setattr(verifier,'time',SimpleNamespace(monotonic=lambda:clock[0],
+        sleep=lambda seconds:clock.__setitem__(0,clock[0]+seconds)))
+    pending=dict(busy=False,result=dict(code='restored',can_recover=False),client=[480,280],controls=dict(
+        restore=dict(x=275,y=221,width=181,height=39,visible=False),
+        recheck=dict(x=24,y=174,width=109,height=39,visible=True),
+        close=dict(x=158,y=221,width=109,height=39,visible=True),
+        path=dict(x=24,y=99,width=432,height=29,visible=True),
+        diagnosis=dict(x=83,y=39,width=331,height=34,visible=False)))
+    rendered={**pending,'controls':dict(
+        restore=dict(x=464,y=221,width=181,height=39,visible=False),
+        recheck=dict(x=24,y=221,width=109,height=39,visible=True),
+        close=dict(x=347,y=221,width=109,height=39,visible=True),
+        path=dict(x=24,y=180,width=432,height=29,visible=True),
+        diagnosis=dict(x=83,y=39,width=356,height=81,visible=True))}
+    return pending,rendered
+
+
+def test_recovery_verifier_waits_for_rendered_completion(restored_ui_reports,monkeypatch,tmp_path):
+    from tools import verify_recovery as verifier
+    pending,rendered=restored_ui_reports
+    reports=iter((pending,rendered))
+    monkeypatch.setattr(verifier,'read_json',lambda path:next(reports))
+    assert verifier.wait_report(tmp_path/'ui.json',verifier.restored_controls_ready)==rendered
+
+
+def test_recovery_verifier_fails_if_completed_diagnosis_stays_hidden(restored_ui_reports,monkeypatch,tmp_path):
+    from tools import verify_recovery as verifier
+    pending,_=restored_ui_reports
+    monkeypatch.setattr(verifier,'read_json',lambda path:pending)
+    with pytest.raises(RuntimeError,match='diagnosis'):
+        verifier.wait_report(tmp_path/'ui.json',verifier.restored_controls_ready,timeout=1)
+
+
 
 
 @pytest.mark.parametrize('phase',['queued','waiting','stopping','starting','verifying','rollback'])

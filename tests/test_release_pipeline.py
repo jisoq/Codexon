@@ -2,6 +2,7 @@ import copy
 import json
 from pathlib import Path
 import shutil
+import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -209,7 +210,7 @@ def test_workflow_preserves_successful_jobs_and_publishes_the_retained_artifact(
     assert 'actions/download-artifact@' in validation
     assert 'candidate-${{ github.sha }}-${{ github.run_id }}' in build
     assert 'candidate-${{ github.sha }}-${{ github.run_id }}' in validation
-    assert 'source-verified-${{ github.sha }}' in workflow
+    assert 'name: source-verified-${{ fromJSON(needs.resolve.outputs.plan).source_key || github.sha }}' in workflow
 
 
 @pytest.mark.parametrize('existing_draft', [False, True])
@@ -320,39 +321,6 @@ def test_publish_failure_does_not_discard_successfully_verified_installer(root):
     assert result['reuse_run'] == '10' and not result['verify']
 
 
-@pytest.mark.parametrize('basic', [False, True])
-@pytest.mark.parametrize('branch', ['main', 'codex/verification'])
-@pytest.mark.parametrize('base', ['b' * 40, SHA])
-def test_source_success_survives_install_failure_but_basic_cannot_seed_affected_baseline(root, monkeypatch, branch, base, basic):
-    from tools import source_receipt
-    record = {**run_record(), 'head_sha': base, 'head_branch': branch, 'conclusion': 'failure'}
-    receipt = dict(schema=2, policy=source_receipt.POLICY, commit=base, run_id='10',
-                   environment=source_receipt.environment_key(root), complete=True,
-                   scope=sorted(source_receipt.basic_tests()) if basic else ['tests'],
-                   args=['--basic'] if basic else ['--full'], suite='basic' if basic else 'essential',
-                   affected_tests=[], scales=False)
-    class SourceGitHub(FakeGitHub):
-        def api(self, path, **kwargs):
-            if path.endswith('/jobs'):
-                return {'jobs':[dict(name='source', conclusion='success'),
-                                dict(name='package_verify', conclusion='failure')]}
-            if path.endswith('/artifacts'):
-                return {'artifacts':[dict(name='source-verified-'+base, expired=False, size_in_bytes=1024)]}
-            return super().api(path, **kwargs)
-        def command(self, *args):
-            (Path(args[-1])/'source-verification.json').write_text(json.dumps(receipt))
-    monkeypatch.setattr(pipeline.subprocess, 'run', lambda *a, **kw: SimpleNamespace(returncode=0))
-    github = SourceGitHub([record])
-    assert pipeline.source_base(github, SHA, root, branch=branch) == ('' if basic else base)
-    assert pipeline.source_base(github, SHA, root, branch=branch, current_run='10') == ''
-    assert pipeline.plan(github, SHA, '20', 'workflow_dispatch', 'refs/heads/' + branch,
-                         False, root, prepare=True)['source_base'] == ('' if basic else base)
-    assert pipeline.verified_base(github, SHA, root, branch=branch) == ''
-    assert pipeline.trusted(record, base, github.repository) == (branch == 'main')
-    (root/'requirements-release.lock').write_text('changed environment')
-    assert pipeline.source_base(github, SHA, root, branch=branch) == ''
-
-
 def test_required_skipped_or_missing_job_cannot_pass_final_verdict():
     plan = dict(verify=True, package=True, qa_reuse=False)
     results = {name:'success' for name in ('resolve', 'source', 'package_build', 'package_verify')}
@@ -442,64 +410,6 @@ def test_existing_public_version_or_missing_notes_cannot_create_release_artifact
     assert not pipeline.plan(github, SHA, '20', 'push', 'refs/heads/main', False, root)['release_artifact']
 
 
-@pytest.fixture
-def source_candidate(root):
-    from tools import source_receipt
-    base = 'b' * 40
-    record = {**run_record(), 'head_sha': base}
-    receipt = dict(schema=2, policy=source_receipt.POLICY, commit=base, run_id='10',
-                   environment=source_receipt.environment_key(root), complete=True,
-                   scope=['tests'], args=['--full'], suite='essential', affected_tests=[])
-    class SourceGitHub(FakeGitHub):
-        def __init__(self):
-            super().__init__([record])
-            self.requests = []
-            self.downloads = []
-        def api(self, path, **kwargs):
-            self.requests.append(path)
-            if path.endswith('/jobs'):
-                return {'jobs': [dict(name='source', conclusion='success')]}
-            if path.endswith('/artifacts'):
-                return {'artifacts': [dict(name='source-verified-' + base, expired=False, size_in_bytes=1024)]}
-            return super().api(path, **kwargs)
-        def command(self, *args):
-            self.downloads.append(args)
-            (Path(args[-1])/'source-verification.json').write_text(json.dumps(receipt))
-    return SourceGitHub(), receipt, base
-
-
-def test_source_prefilter_avoids_remote_metadata_and_downloads_for_incompatible_inputs(root, monkeypatch, source_candidate):
-    github, _, base = source_candidate
-    commands = []
-    def compare(command, **kwargs):
-        commands.append(command)
-        return SimpleNamespace(returncode=1 if command[1] == 'diff' else 0)
-    monkeypatch.setattr(pipeline.subprocess, 'run', compare)
-    assert pipeline.source_base(github, SHA, root) == ''
-    assert len(github.requests) == 1 and not github.downloads
-    assert commands[-1][:6] == ['git', 'diff', '--quiet', base, SHA, '--']
-    assert '.github/workflows/windows.yml' not in commands[-1][6:]
-
-
-@pytest.mark.parametrize('valid_environment', [True, False])
-def test_source_prefilter_still_validates_downloaded_receipts(root, monkeypatch, source_candidate, valid_environment):
-    github, receipt, base = source_candidate
-    if not valid_environment:
-        receipt['environment'] = 'incompatible environment'
-    monkeypatch.setattr(pipeline.subprocess, 'run', lambda *a, **k: SimpleNamespace(returncode=0))
-    assert pipeline.source_base(github, SHA, root) == (base if valid_environment else '')
-    assert len(github.downloads) == 1
-
-
-def test_source_prefilter_git_errors_fail_before_remote_metadata(root, monkeypatch, source_candidate):
-    github, _, _ = source_candidate
-    monkeypatch.setattr(pipeline.subprocess, 'run', lambda command, **kwargs:
-                        SimpleNamespace(returncode=2 if command[1] == 'diff' else 0))
-    with pytest.raises(RuntimeError, match='Cannot compare source verification policies'):
-        pipeline.source_base(github, SHA, root)
-    assert len(github.requests) == 1 and not github.downloads
-
-
 @pytest.mark.parametrize('extended, coverage', [(False, 'basic-ci-v1'), (True, 'extended-ci-v1')])
 def test_release_receipt_records_the_immutable_ci_plan_coverage(root, extended, coverage):
     from tools import source_receipt
@@ -541,3 +451,152 @@ def test_workflow_compatibility_steps_use_the_extended_plan_gates():
         assert all('if: fromJSON(needs.resolve.outputs.plan).' + gate in step
                    for step in steps)
         assert not basic[gate] and extended[gate]
+
+
+@pytest.fixture
+def basic_candidate(root):
+    from tools import source_receipt
+    key = 'c' * 64
+    record = {**run_record(), 'repository': {'full_name': 'jisoq/Codexon', 'id': 123},
+              'head_repository': {'full_name': 'jisoq/Codexon', 'id': 123},
+              'conclusion': 'failure'}
+    receipt = dict(schema=2, policy=source_receipt.POLICY, commit=SHA, run_id='10',
+                   environment=source_receipt.environment_key(root), complete=True,
+                   scope=list(source_receipt.basic_tests()), args=['--basic'], suite='basic',
+                   affected_tests=[], scales=False, input_key=key)
+    artifact = dict(id=100, name='source-verified-' + key, expired=False, size_in_bytes=1024,
+                    workflow_run={'id': 10})
+    class SourceGitHub(FakeGitHub):
+        def __init__(self):
+            self.requests = []
+            self.downloads = []
+            self.jobs = [dict(name='source', conclusion='success'),
+                         dict(name='package_verify', conclusion='failure')]
+            self.payload = None
+        def api(self, path, **kwargs):
+            self.requests.append(path)
+            if path == f'actions/artifacts?name=source-verified-{key}&per_page=100':
+                return {'artifacts': [artifact]}
+            if path == 'actions/runs/10':
+                return record
+            if path == 'actions/runs/10/jobs':
+                return {'jobs': self.jobs}
+            pytest.fail('Unexpected source lookup request ' + path)
+        def command(self, *args):
+            self.downloads.append(args)
+            assert args[:5] == ('run', 'download', '10', '--name', 'source-verified-' + key)
+            text = json.dumps(receipt) if self.payload is None else self.payload
+            (Path(args[-1])/'source-verification.json').write_text(text)
+    return SourceGitHub(), key, record, receipt, artifact
+
+
+@pytest.mark.parametrize('event', ['push', 'workflow_dispatch', 'pull_request'])
+def test_identical_basic_source_survives_downstream_failure_and_same_repo_pr_merge(root, basic_candidate, event):
+    github, key, record, receipt, _ = basic_candidate
+    record['event'] = event
+    if event == 'pull_request':
+        record['pull_requests'] = [dict(head={'repo': {'id': 123}})]
+        receipt['commit'] = 'b' * 40
+    assert pipeline.reusable_source(github, key, root) == '10'
+    assert len(github.downloads) == 1
+    assert pipeline.trusted(record, SHA, github.repository) == (event != 'pull_request')
+
+
+@pytest.mark.parametrize('invalid', ['artifact_name', 'expired', 'artifact_size', 'false_size', 'producer',
+                                     'workflow', 'repository', 'head_repository', 'fork_pr',
+                                     'missing_pr_origin', 'source_failure', 'wrong_key',
+                                     'wrong_run', 'wrong_commit', 'false_coverage', 'partial_scope',
+                                     'legacy_receipt', 'receipt_size', 'invalid_json'])
+def test_untrusted_or_incompatible_basic_evidence_runs_fresh_checks(root, basic_candidate, invalid):
+    github, key, record, receipt, artifact = basic_candidate
+    if invalid == 'artifact_name':
+        artifact['name'] += '-foreign'
+    elif invalid == 'expired':
+        artifact['expired'] = True
+    elif invalid == 'artifact_size':
+        artifact['size_in_bytes'] = 65537
+    elif invalid == 'false_size':
+        artifact['size_in_bytes'] = False
+    elif invalid == 'producer':
+        artifact['workflow_run']['id'] = 11
+    elif invalid == 'workflow':
+        record['path'] = '.github/workflows/foreign.yml'
+    elif invalid == 'repository':
+        record['repository']['full_name'] = 'foreign/repo'
+    elif invalid == 'head_repository':
+        record['head_repository']['full_name'] = 'foreign/repo'
+    elif invalid in ('fork_pr', 'missing_pr_origin'):
+        record['event'] = 'pull_request'
+        record['pull_requests'] = [dict(head={'repo': {'id': 999}})] if invalid == 'fork_pr' else []
+    elif invalid == 'source_failure':
+        github.jobs[0]['conclusion'] = 'failure'
+    elif invalid == 'wrong_key':
+        receipt['input_key'] = 'd' * 64
+    elif invalid == 'wrong_run':
+        receipt['run_id'] = '11'
+    elif invalid == 'wrong_commit':
+        receipt['commit'] = 'b' * 40
+    elif invalid == 'false_coverage':
+        receipt['complete'] = False
+    elif invalid == 'partial_scope':
+        receipt['scope'].pop()
+    elif invalid == 'legacy_receipt':
+        receipt.pop('input_key')
+    elif invalid == 'receipt_size':
+        github.payload = ' ' * 32769
+    else:
+        github.payload = '{broken json'
+    if invalid == 'producer':
+        original_api = github.api
+        github.api = lambda path, **kwargs: {**record, 'id': 10} if path == 'actions/runs/11' else original_api(path, **kwargs)
+    assert pipeline.reusable_source(github, key, root) == ''
+
+
+def test_optional_source_lookup_failure_runs_checks_and_reports_the_fallback(root, basic_candidate, capsys):
+    github, key, *_ = basic_candidate
+    def unavailable(*args, **kwargs):
+        raise RuntimeError('Actions API unavailable')
+    github.api = unavailable
+    assert pipeline.reusable_source(github, key, root) == ''
+    assert 'Actions API unavailable' in capsys.readouterr().err
+
+
+def test_source_lookup_does_not_hide_programming_errors(root, basic_candidate):
+    github, key, *_ = basic_candidate
+    def invalid(*args, **kwargs):
+        raise TypeError('programming defect')
+    github.api = invalid
+    with pytest.raises(TypeError, match='programming defect'):
+        pipeline.reusable_source(github, key, root)
+
+
+@pytest.mark.parametrize('event, ref', [('push', 'refs/heads/main'),
+                                      ('workflow_dispatch', 'refs/heads/preview'),
+                                      ('pull_request', 'refs/pull/1/merge')])
+def test_release_planning_does_not_scan_source_baselines_for_fixed_source_profiles(root, event, ref):
+    class PlanningGitHub(FakeGitHub):
+        def api(self, path, **kwargs):
+            if '?branch=' in path:
+                assert 'status=completed' in path, 'Only deployment coverage uses ancestor runs'
+            return super().api(path, **kwargs)
+    result = pipeline.plan(PlanningGitHub(), SHA, '20', event, ref, False, root)
+    assert result['verify'] and result['base'] == ''
+
+
+def test_dependency_audit_install_failure_stops_resolve_before_downstream_jobs(tmp_path):
+    workflow = (pipeline.ROOT/'.github/workflows/windows.yml').read_text()
+    resolve = workflow.split('\n  resolve:\n')[1].split('\n  native:\n')[0]
+    build = workflow.split('\n  package_build:\n')[1].split('\n  package_verify:\n')[0]
+    step = next(step for step in resolve.split('      - ') if 'python -m pip_audit' in step)
+    assert 'python -m pip_audit' not in build
+    assert 'steps.plan.outputs.plan).verify && fromJSON(steps.plan.outputs.plan).dependencies' in step
+    script = step.split('run: |\n', 1)[1]
+    script = '\n'.join(line[10:] for line in script.splitlines() if line.startswith('          '))
+    harness = tmp_path/'audit.ps1'
+    harness.write_text("function python {\n"
+                       "  if ($args[1] -eq 'pip') { $global:LASTEXITCODE = 17 }\n"
+                       "  else { Write-Output 'AUDIT_RAN'; $global:LASTEXITCODE = 0 }\n"
+                       "}\n" + script)
+    result = subprocess.run(['pwsh', '-NoProfile', '-NonInteractive', '-File', str(harness)],
+                            capture_output=True, text=True)
+    assert result.returncode == 17 and 'AUDIT_RAN' not in result.stdout

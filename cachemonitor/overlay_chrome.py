@@ -498,8 +498,8 @@ class OverlayLinks(QuickHost):
     def sync(self):
         from .overlay_view import palette
         c=self.view.content;scale=c.appearance.scale;links=self.view.link_state(c.monitor_links())
-        self.view.put(links=links,scale=scale,accent=palette(c.appearance)['accent'].name(),
-                      warning=palette(c.appearance)['warning'].name())
+        colors=palette(c.appearance)
+        self.view.put(links=links,scale=scale,accent=colors['accent'].name(),warning=colors['warning'].name(),interactionTint=colors['interaction_tint'].name())
         region=QRegion()
         for link in links:
             region|=QRegion(QRect(round(link['x']*scale),round(link['y']*scale),round(link['width']*scale),round(link['height']*scale)))

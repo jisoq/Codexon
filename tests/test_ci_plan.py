@@ -93,6 +93,8 @@ def test_deferred_qa_does_not_probe_published_binaries(tmp_path, monkeypatch, ca
     monkeypatch.setattr(ci_plan, 'file_hashes', lambda: dict.fromkeys(paths, 'current'))
     monkeypatch.setattr(ci_plan, 'changed_files', lambda *args, **kwargs: paths)
     monkeypatch.setattr(ci_plan, 'release_version_only', lambda **kwargs: False)
+    monkeypatch.setattr(ci_plan, 'basic_input_key', lambda root, plan: 'key')
+    monkeypatch.delenv('GITHUB_REPOSITORY', raising=False)
     monkeypatch.setattr(ci_plan.sys, 'argv', ['ci_plan.py', '--base', 'verified'])
     monkeypatch.delenv('GITHUB_OUTPUT', raising=False)
     def unexpected():
@@ -102,3 +104,63 @@ def test_deferred_qa_does_not_probe_published_binaries(tmp_path, monkeypatch, ca
     plan = json.loads(capsys.readouterr().out)
     assert plan['source_args'] == ['--basic'] and plan['qa_smokes'] == []
     assert not plan['qa_reuse'] and not plan['package']
+
+
+@pytest.mark.parametrize('package', [False, True])
+@pytest.mark.parametrize('hit', [False, True])
+def test_planned_source_reuse_skips_only_the_completed_source_native_demand(tmp_path, monkeypatch, capsys, package, hit):
+    paths = {'cachemonitor/install_activation.py'} if package else {'docs/followup.md'}
+    monkeypatch.setattr(ci_plan, 'ROOT', tmp_path)
+    monkeypatch.setattr(ci_plan, 'file_hashes', lambda: dict.fromkeys(paths, 'current'))
+    monkeypatch.setattr(ci_plan, 'changed_files', lambda *args, **kwargs: paths)
+    monkeypatch.setattr(ci_plan, 'release_version_only', lambda **kwargs: False)
+    monkeypatch.setattr(ci_plan, 'basic_input_key', lambda root, plan: 'exact-input-key')
+    monkeypatch.setattr(ci_plan, 'reusable_source', lambda github, key, root: '10' if hit else '')
+    monkeypatch.setenv('GITHUB_REPOSITORY', 'jisoq/Codexon')
+    monkeypatch.delenv('GITHUB_OUTPUT', raising=False)
+    monkeypatch.setattr(ci_plan.sys, 'argv', ['ci_plan.py', '--base', 'verified'])
+    ci_plan.main()
+    plan = json.loads(capsys.readouterr().out)
+    assert plan['source_key'] == 'exact-input-key'
+    assert plan['source_reuse_run'] == ('10' if hit else '')
+    assert plan['rust'] == (package or not hit)
+    assert plan['package'] is package and plan['native'] is package
+    assert plan['tests'] == sorted(CORE_TESTS) and plan['source_args'] == ['--basic']
+    assert json.loads((tmp_path/'artifacts/verification/plan.json').read_text()) == plan
+
+
+def test_extended_planning_executes_without_looking_up_basic_receipts(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(ci_plan, 'ROOT', tmp_path)
+    monkeypatch.setattr(ci_plan, 'file_hashes', lambda: {})
+    monkeypatch.setattr(ci_plan, 'changed_files', lambda *args, **kwargs: set())
+    monkeypatch.setattr(ci_plan, 'release_version_only', lambda **kwargs: False)
+    monkeypatch.setenv('GITHUB_REPOSITORY', 'jisoq/Codexon')
+    monkeypatch.delenv('GITHUB_OUTPUT', raising=False)
+    monkeypatch.setattr(ci_plan.sys, 'argv', ['ci_plan.py', '--base', 'verified', '--extended', 'true'])
+    def unexpected(*args):
+        pytest.fail('Explicit extended checks must execute')
+    monkeypatch.setattr(ci_plan, 'reusable_source', unexpected)
+    ci_plan.main()
+    plan = json.loads(capsys.readouterr().out)
+    assert plan['source_key'] == plan['source_reuse_run'] == ''
+    assert plan['source_args'] == ['--extended'] and plan['rust'] and plan['package']
+
+
+def test_verified_installer_needs_no_source_result_lookup(tmp_path, monkeypatch, capsys):
+    release = tmp_path/'release-plan.json'
+    release.write_text(json.dumps(dict(verify=False, reuse_run='10')))
+    monkeypatch.setattr(ci_plan, 'ROOT', tmp_path)
+    monkeypatch.setattr(ci_plan, 'file_hashes', lambda: {})
+    monkeypatch.setattr(ci_plan, 'changed_files', lambda *args, **kwargs: set())
+    monkeypatch.setattr(ci_plan, 'release_version_only', lambda **kwargs: False)
+    monkeypatch.setenv('GITHUB_REPOSITORY', 'jisoq/Codexon')
+    monkeypatch.delenv('GITHUB_OUTPUT', raising=False)
+    monkeypatch.setattr(ci_plan.sys, 'argv', ['ci_plan.py', '--base', 'verified', '--release-plan', str(release)])
+    def unexpected(*args):
+        pytest.fail('A verified installer already supplies this run result')
+    monkeypatch.setattr(ci_plan, 'basic_input_key', unexpected)
+    monkeypatch.setattr(ci_plan, 'reusable_source', unexpected)
+    ci_plan.main()
+    plan = json.loads(capsys.readouterr().out)
+    assert not plan['verify'] and plan['reuse_run'] == '10'
+    assert plan['source_key'] == plan['source_reuse_run'] == ''

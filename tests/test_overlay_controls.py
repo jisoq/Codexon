@@ -455,6 +455,7 @@ def test_highlight_dropdown_autoplays_three_icon_colors_without_changing_live_ro
         wait_for_rendered(lambda:popup() is not None)
         window=popup();option=named_item(window.contentItem(),'highlightStyle-'+style.key)
         wait_for_rendered(lambda:option is not None and option.isVisible())
+        option_width_ratio=option.width()/choice.width()
         point=option.mapToScene(QPointF(option.width()/2,option.height()/2)).toPoint()
         left,top,right,bottom=c.native.frame(int(window.winId()))
         factor=(right-left)/window.width()
@@ -495,6 +496,17 @@ def test_highlight_dropdown_autoplays_three_icon_colors_without_changing_live_ro
     c.toggle_opacity();refresh()
     preview.advance();assert preview.glow is None and not preview.timer.isActive()
     c.toggle_settings();refresh();assert preview.glow is not None
+    click(c.toolbar,choice)
+    wait_for_rendered(lambda:popup() is not None)
+    window=popup()
+    assert window.width()>=choice.width()-1
+    for style in HighlightStyle:
+        option=named_item(window.contentItem(),'highlightStyle-'+style.key)
+        wait_for_rendered(lambda:option is not None and option.isVisible())
+        assert option.width()>=choice.width()*option_width_ratio-1
+    point=option.mapToScene(QPointF(option.width()/2,option.height()/2)).toPoint()
+    QTest.mouseClick(window,Qt.LeftButton,pos=point)
+    wait_for_rendered(lambda:c.highlight_style is style and popup() is None)
     c.close_popup();preview.advance();assert preview.glow is None and not preview.timer.isActive()
     c.toggle_settings();refresh();assert preview.glow is not None
     c.toolbar.close();preview.advance();assert preview.glow is None and not preview.timer.isActive()
