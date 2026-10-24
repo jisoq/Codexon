@@ -10,17 +10,11 @@
 - Do not carry the legacy v2026.09.25.6 automatic proxy replacement warning into future release notes.
 - Keep installation/download references below the categories in their existing format, and verify they apply to the release.
 
-## Publishing
+## Verification and CI Workflow
 
-- Push the reviewed version and notes to `main`, run `windows.yml` with `prepare=true` for that commit, then run it separately with `publish=true` after verification succeeds. Publishing reuses the verified installer and does not rebuild.
-- Do not delete or duplicate source archives referenced by earlier releases. When Qt/PySide6 changes, update `third-party-sources.lock.json` with the upstream hashes.
-
-## Verification before CI
-
-- Run `tools/verify_changes.py` against the last verified state (`--base <commit>`), not the full suite after every edit.
-- Use `--full`, `--integration`, `--extended` only when needed.
-- Add tests only for distinct user-visible behavior, data invariants, protocol contracts, or demonstrated failures. Avoid asserting on implementation details, copy, pixel constants, or UI matrices.
-- CI selects checks via `tools/ci_plan.py`. A release or manual dispatch alone does not require all tests. See [verification policy](docs/verification.md).
-- Use a dedicated environment built from `requirements-release.lock`. Every import, including those inside functions, must be in the lock.
-- Async tests: wait on an observable condition with a deadline, never a fixed sleep.
-- UI tests: use the hidden desktop and rendered control geometry, and keep compact-window coverage. Deliver chart events directly when testing selection independent of hover.
+- Run `tools/verify_changes.py --base <last-verified-commit>` in the environment built from `requirements-release.lock`. Check affected changes first; use broader profiles only for a concrete coverage gap.
+- Reuse successful results when code, dependencies, environment, and check settings match. A new session, PR merge, release, or manual dispatch alone does not justify rerunning them. Follow the existing planner and receipts in [verification policy](docs/verification.md).
+- Run cheap failure checks before builds. Build a candidate once, verify that artifact, and publish the verified artifact without rebuilding.
+- On failure, inspect that run's logs and artifacts first. Identify product, environment, or verifier failures, batch related fixes into one push, and rerun only invalidated checks. Never blindly retry an unchanged failure.
+- In asynchronous and UI checks, wait for observable readiness with a deadline. Do not substitute fixed sleeps or longer timeouts for the correct completion condition.
+- At handoff, record the verified commit, environment, check scope, CI run and artifact links, and unresolved failures. Never report incomplete or failed checks as passed.
