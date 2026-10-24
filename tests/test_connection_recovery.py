@@ -437,6 +437,7 @@ def test_native_exiting_rechecks_preserve_diagnosis_selection_and_scroll(recover
     window.recheck_button.event_generate('<<Invoke>>')
     wait(lambda:not window.busy and window.result['code']=='exiting')
     wait(lambda:window.scrollbar.winfo_ismapped())
+    wait(lambda:not window.root.tk.call(window.diagnosis._w,'pendingsync'))
     window.diagnosis.yview_moveto(1)
     window.diagnosis.tag_add('sel','2.0','2.30')
     wait(lambda:window.diagnosis.yview()[0]>0)
