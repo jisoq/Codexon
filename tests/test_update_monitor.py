@@ -330,6 +330,8 @@ def test_recheck_preserves_offer_until_metadata_result(endpoint,tmp_path,monkeyp
         assert panel.offer is previous and panel.version.text()=='2099.01.01.1'
         assert panel.version.isVisible() and panel.execute.isVisible() and not panel.execute.isEnabled()
         assert panel.button.isVisible() and not panel.button.isEnabled()
+        panel.set_exit_pending(True);panel.set_exit_pending(False)
+        assert not panel.execute.isEnabled()
         panel.request_install();panel.start()
         assert not installs and len(e.requests)==1
         if outcome=='failure':
@@ -343,9 +345,10 @@ def test_recheck_preserves_offer_until_metadata_result(endpoint,tmp_path,monkeyp
         assert panel.button.isVisible() and panel.button.isEnabled() and not installs
         if outcome=='failure':
             assert panel.offer is previous and panel.execute.isVisible() and panel.execute.isEnabled()
-            assert '응답이 늦어지고 있습니다' in panel.status.text()
-            panel.refresh()
-            assert '응답이 늦어지고 있습니다' in panel.status.text()
+            assert panel.status.isVisible() and '응답이 늦어지고 있습니다' in panel.status.text()
+            from cachemonitor.theme import shared_theme
+            panel.refresh();shared_theme().changed.emit()
+            assert panel.status.isVisible() and '응답이 늦어지고 있습니다' in panel.status.text()
             panel.request_install();settle(lambda:panel.operation is None and bool(installs))
             assert installs[0]['release']==cached
         elif outcome=='current':
@@ -378,7 +381,12 @@ def test_cached_offer_renders_check_and_start_and_preserves_version_during_reche
         assert check.isVisible() and not check.isEnabled() and start.isVisible() and not start.isEnabled()
         monitor.timed_out();settle(lambda:not panel.metadata_pending)
         settle(lambda:check.isEnabled() and start.isEnabled())
+        status=control(host,panel.status)
+        settle(lambda:status.isVisible() and status.width()>0 and status.height()>0)
         assert version.isVisible() and '응답이 늦어지고 있습니다' in panel.status.text()
+        panel.refresh()
+        from cachemonitor.theme import shared_theme
+        shared_theme().changed.emit();assert status.isVisible()
         assert host.grab().save(str(tmp_path/'update-recheck-failure.png'))
     finally:
         monitor.stop();panel.stop()
