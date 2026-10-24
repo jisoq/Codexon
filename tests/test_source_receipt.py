@@ -1,3 +1,5 @@
+import subprocess
+
 import pytest
 
 from tools import source_receipt
@@ -134,3 +136,80 @@ def test_basic_receipt_rejects_scope_that_differs_from_the_audited_selection(roo
     with pytest.raises(ValueError, match='canonical audited selection'):
         source_receipt.write_receipt(root/'rejected', plan, SHA, '10', root)
     assert not (root/'rejected/source-verification.json').exists()
+
+
+@pytest.fixture
+def git_root(root):
+    subprocess.run(['git', 'init', '--quiet', str(root)], check=True)
+    subprocess.run(['git', '-C', str(root), 'add', '.'], check=True)
+    subprocess.run(['git', '-C', str(root), '-c', 'user.name=CI Test', '-c',
+                    'user.email=ci@example.invalid', 'commit', '--quiet', '-m', 'Initial inputs'], check=True)
+    return root
+
+
+def test_basic_identity_reuses_identical_trees_across_commits_and_release_stages(git_root):
+    plan = planned(git_root, ['--basic'])
+    key = source_receipt.basic_input_key(git_root, plan)
+    first = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=git_root)
+    subprocess.run(['git', '-c', 'user.name=CI Test', '-c', 'user.email=ci@example.invalid',
+                    'commit', '--quiet', '--allow-empty', '-m', 'Prepare release'], cwd=git_root, check=True)
+    assert subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=git_root) != first
+    plan.update(commit='b' * 40, candidate=True, package=True, release_artifact=True)
+    assert source_receipt.basic_input_key(git_root, plan) == key
+
+
+@pytest.mark.parametrize('path', ['cachemonitor/pricing.py', 'tests/test_pricing.py',
+                                  'requirements-release.lock', 'pytest.ini'])
+def test_basic_identity_covers_all_tracked_source_test_lock_and_config_inputs(git_root, path):
+    plan = planned(git_root, ['--basic'])
+    key = source_receipt.basic_input_key(git_root, plan)
+    target = git_root/path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text('changed input\n')
+    subprocess.run(['git', 'add', path], cwd=git_root, check=True)
+    subprocess.run(['git', '-c', 'user.name=CI Test', '-c', 'user.email=ci@example.invalid',
+                    'commit', '--quiet', '-m', 'Change input'], cwd=git_root, check=True)
+    assert source_receipt.basic_input_key(git_root, plan) != key
+
+
+@pytest.mark.parametrize('change', ['python', 'image_os', 'backend', 'selection', 'command'])
+def test_basic_identity_binds_environment_and_exact_execution(git_root, monkeypatch, change):
+    plan = planned(git_root, ['--basic'])
+    key = source_receipt.basic_input_key(git_root, plan)
+    if change == 'python':
+        monkeypatch.setattr(source_receipt.platform, 'python_version', lambda: '3.12.11')
+    elif change == 'image_os':
+        monkeypatch.setenv('ImageOS', 'different-runner-family')
+    elif change == 'backend':
+        monkeypatch.setattr(source_receipt, 'tests_require_native', lambda tests: False)
+    elif change == 'selection':
+        plan['tests'] = plan['tests'][:-1]
+        with pytest.raises(ValueError, match='canonical audited selection'):
+            source_receipt.basic_input_key(git_root, plan)
+        return
+    else:
+        path = git_root/'.github/workflows/windows.yml'
+        path.write_text(WORKFLOW.replace('--full', '--basic --changed-command'))
+    assert source_receipt.basic_input_key(git_root, plan) != key
+
+
+def test_basic_receipt_binds_planned_inputs_and_cannot_reissue_a_reused_result(git_root):
+    plan = planned(git_root, ['--basic'])
+    plan['source_key'] = source_receipt.basic_input_key(git_root, plan)
+    receipt = source_receipt.write_receipt(git_root/'receipt', plan, SHA, '10', git_root)
+    assert receipt['input_key'] == plan['source_key']
+    assert source_receipt.valid(receipt, SHA, '10', git_root, input_key=plan['source_key'])
+    assert not source_receipt.valid(receipt, SHA, '10', git_root, input_key='wrong')
+    plan['source_reuse_run'] = '10'
+    with pytest.raises(ValueError, match='reused|Reused'):
+        source_receipt.write_receipt(git_root/'reissued', plan, SHA, '20', git_root)
+    assert not (git_root/'reissued/source-verification.json').exists()
+    plan['source_reuse_run'] = ''
+    plan['source_key'] = 'changed after planning'
+    with pytest.raises(ValueError, match='input|identity'):
+        source_receipt.write_receipt(git_root/'changed', plan, SHA, '20', git_root)
+    assert not (git_root/'changed/source-verification.json').exists()
+
+
+def test_explicit_extended_has_no_reusable_basic_identity(root):
+    assert source_receipt.basic_input_key(root, planned(root, ['--extended'])) == ''
