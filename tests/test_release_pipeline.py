@@ -473,6 +473,7 @@ def basic_candidate(root):
             self.jobs = [dict(name='source', conclusion='success'),
                          dict(name='package_verify', conclusion='failure')]
             self.payload = None
+            self.pulls = []
         def api(self, path, **kwargs):
             self.requests.append(path)
             if path == f'actions/artifacts?name=source-verified-{key}&per_page=100':
@@ -481,6 +482,8 @@ def basic_candidate(root):
                 return record
             if path == 'actions/runs/10/jobs':
                 return {'jobs': self.jobs}
+            if path == f'commits/{record["head_sha"]}/pulls?per_page=100':
+                return self.pulls
             pytest.fail('Unexpected source lookup request ' + path)
         def command(self, *args):
             self.downloads.append(args)
@@ -500,6 +503,26 @@ def test_identical_basic_source_survives_downstream_failure_and_same_repo_pr_mer
     assert pipeline.reusable_source(github, key, root) == '10'
     assert len(github.downloads) == 1
     assert pipeline.trusted(record, SHA, github.repository) == (event != 'pull_request')
+
+
+@pytest.mark.parametrize('origin', ['same_repo', 'fork', 'other_head', 'foreign_base', 'missing_head_repo', 'empty'])
+def test_merged_pr_source_reuse_requires_commit_bound_same_repository_origin(root, basic_candidate, origin):
+    github, key, record, _, _ = basic_candidate
+    record.update(event='pull_request', head_sha='e2c55000c9ebe5f13f24e7ec71022fa9a164d24b', pull_requests=[])
+    record['repository']['id'] = record['head_repository']['id'] = 1383017076
+    pull = dict(number=28, state='closed', base={'repo': {'id': 1383017076}},
+                head={'sha': record['head_sha'], 'repo': {'id': 1383017076}})
+    if origin == 'fork':
+        pull['head']['repo']['id'] = 999
+    elif origin == 'other_head':
+        pull['head']['sha'] = 'b' * 40
+    elif origin == 'foreign_base':
+        pull['base']['repo']['id'] = 999
+    elif origin == 'missing_head_repo':
+        pull['head']['repo'] = None
+    github.pulls = [] if origin == 'empty' else [pull]
+    assert pipeline.reusable_source(github, key, root) == ('10' if origin == 'same_repo' else '')
+    assert len(github.downloads) == (1 if origin == 'same_repo' else 0)
 
 
 @pytest.mark.parametrize('invalid', ['artifact_name', 'expired', 'artifact_size', 'false_size', 'producer',
