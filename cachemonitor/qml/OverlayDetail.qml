@@ -13,7 +13,6 @@ Rectangle {
     onSessionScopeChanged: if (bodyScroll) bodyScroll.contentY = 0
     color: appTheme.palette.hit_surface
     clip: true
-    opacity: root.s.contentOpacity === undefined ? 1 : root.s.contentOpacity
     Keys.onEscapePressed: event => { root.presentation.escapePanel(); event.accepted = true; }
     Flickable {
         id: bodyScroll

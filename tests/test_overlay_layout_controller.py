@@ -278,7 +278,6 @@ def test_maintenance_updates_snapshot_delay_and_displayed_age(layout_controller,
     now[0]=115.01;c.receive_target(dict(c.target_state));c._tick()
     assert m.note=='갱신 중' and m.data['_collection']['reason']=='analysis_delay'
     assert m.state['heartbeatMode']=='pending'
-    assert m.state['contentOpacity']==1
     previous=m.freshness_text()
     now[0]=116.01;c.receive_target(dict(c.target_state));c._tick()
     assert m.freshness_text()!=previous
@@ -382,7 +381,7 @@ def test_pending_overlay_refresh_keeps_confirmed_panel_until_replacement(layout_
         wall[0]=stamp+15.01
         c.receive_target(dict(c.target_state));c._tick()
         assert m.data['cost']==confirmed['cost'] and m.note=='갱신 중'
-        assert m.state['heartbeatMode']=='pending' and m.state['contentOpacity']==1
+        assert m.state['heartbeatMode']=='pending'
         assert m.selected_id==selected and m.graph_pinned
         assert m.data['_collection']['reason']=='detail_pending'
         assert m.data['_collection']['last_confirmed_at']==stamp and m.freshness_text()

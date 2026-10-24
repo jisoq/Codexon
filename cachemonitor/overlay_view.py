@@ -381,8 +381,6 @@ class OverlayContent(Node):
                     and self.data.get('_collection',{}).get('reason') in ('analysis_delay','detail_pending'))
     @property
     def checking_records(self):return not self.background_refresh and self.note in ('기록 준비 중','기록 확인 중','세션 기록 확인 중','기록 수집 중 (잠정값)','갱신 중')
-    def content_opacity(self):
-        return .5 if self.checking_records or self.note in ('수집 오류','수집 지연','수집 시작 중','분석 지연','분석 오류') else 1.
     def notice_card(self):
         from .overlay_monitor import REMOTE_HEADING,REMOTE_DESCRIPTION
         if self.is_remote:return REMOTE_HEADING,REMOTE_DESCRIPTION
@@ -620,7 +618,7 @@ class OverlayContent(Node):
         self.put(detailBodyHeight=round(height*self.appearance.scale),detailWidth=self.detail_width,detailTitle='Sub Agents',
                  mainHeartbeats=indicators(main_items,MARGIN,layout.get('main',0)) if not self.notice_card() else [],
                  detailHeartbeats=indicators(items),
-                 checkingRecords=self.checking_records,loadingX=header['status_x'],loadingY=layout.get('status',38)+2,contentOpacity=self.content_opacity(),
+                 checkingRecords=self.checking_records,loadingX=header['status_x'],loadingY=layout.get('status',38)+2,
                  overlayMargin=MARGIN,overlayFamily=self.appearance.family,overlaySurface=colors['surface'].name(),overlayBorder=colors['border'].name(),
                  overlayWarning=colors['warning'].name(),overlayBand=colors['band'].name(),overlaySelection=colors['selection'].name(),overlaySecondary=colors['secondary'].name(),
                  detailHasSession=bool((self.data or {}).get('id')),detailSessionKey=str(((self.data or {}).get('home'),(self.data or {}).get('id'))),
@@ -968,7 +966,6 @@ class OverlayContent(Node):
         from .overlay_monitor import paint,header_layout
         header=header_layout(self)
         d.text(Verbatim(self.display_title()),MARGIN,layout['header'],header['title_width'],24,14,weight=600,elide=True)
-        p.setOpacity(self.content_opacity())
         paint(d,self)
         p.restore();p.restore()
 
