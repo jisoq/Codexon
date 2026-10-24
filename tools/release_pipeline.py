@@ -64,6 +64,10 @@ def reusable_source(github, key, root=ROOT):
                 continue
             if event == 'pull_request':
                 pulls = run.get('pull_requests', [])
+                if not pulls:
+                    pulls = github.api(f'commits/{run["head_sha"]}/pulls?per_page=100')
+                    pulls = [pull for pull in pulls if pull.get('head', {}).get('sha') == run['head_sha']
+                             and (pull.get('base', {}).get('repo') or {}).get('id') == repository.get('id')]
                 if not repository.get('id') or not pulls or any(
                         (pull.get('head', {}).get('repo') or {}).get('id') != repository['id'] for pull in pulls):
                     continue

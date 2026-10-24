@@ -33,6 +33,10 @@ env:
 jobs:
   resolve:
     runs-on: windows-latest
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
     outputs:
       plan: ${{ steps.plan.outputs.plan }}
     steps:
