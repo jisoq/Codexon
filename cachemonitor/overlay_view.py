@@ -97,6 +97,8 @@ def contrast(a,b):
 def palette(appearance):
     p=ui_palette(appearance)
     p.update(surface=p['overlay'],band=p['panel'],secondary=p['muted'],meta=p['muted'])
+    neutral='#ffffff' if contrast(p['surface'],'#ffffff')>contrast(p['surface'],'#000000') else '#000000'
+    p['interaction_tint']=mix(p['surface'],neutral,.60)
     return {key:QColor(value) for key,value in p.items()}
 
 
@@ -623,6 +625,7 @@ class OverlayContent(Node):
                  checkingRecords=self.checking_records,loadingX=header['status_x'],loadingY=layout.get('status',38)+2,
                  overlayMargin=MARGIN,overlayFamily=self.appearance.family,overlaySurface=colors['surface'].name(),overlayBorder=colors['border'].name(),
                  overlayWarning=colors['warning'].name(),overlayBand=colors['band'].name(),overlaySelection=colors['selection'].name(),overlaySecondary=colors['secondary'].name(),
+                 overlayInteractionTint=colors['interaction_tint'].name(),
                  detailHasSession=bool((self.data or {}).get('id')),detailSessionKey=str(((self.data or {}).get('home'),(self.data or {}).get('id'))),
                  detailActions=actions,heartbeatActive=heartbeat['mode']=='active',heartbeatCount=heartbeat['count'],totalRowVisible=True,
                  heartbeatMode=heartbeat['mode'],heartbeatColor=heartbeat['color'],heartbeatLabel=heartbeat['label'],heartbeatMessage=heartbeat['message'],

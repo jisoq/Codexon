@@ -60,7 +60,9 @@ Rectangle {
                 hoverEnabled: true
                 contentItem: Item {}
                 background: Rectangle {
-                    color: root.s.overlayAccent || appTheme.palette.accent; radius: 5 * root.unitScale
+                    color: detailAction.down || detailAction.hovered ? root.s.overlayInteractionTint
+                           : root.s.overlayAccent || appTheme.palette.accent
+                    radius: 5 * root.unitScale
                     opacity: detailAction.down ? 0.16 : detailAction.hovered ? 0.09 : detailAction.visualFocus ? 0.12 : 0
                     border.width: detailAction.visualFocus ? 2 : 0
                     border.color: root.s.overlayAccent || appTheme.palette.accent
