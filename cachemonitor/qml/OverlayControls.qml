@@ -292,6 +292,7 @@ Rectangle {
                 popupType: Popup.Window
                 y: highlightChoice.height + 4 * root.popupScale
                 width: highlightChoice.width
+                implicitWidth: highlightChoice.width
                 implicitHeight: contentItem.implicitHeight + 8 * root.popupScale
                 padding: 4 * root.popupScale
                 contentItem: ListView {
