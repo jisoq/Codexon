@@ -111,7 +111,7 @@ class HighlightStyle(Enum):
     RIBBON = ('ribbon', '잔광 리본')
     SCAN = ('scan', '라이트 스캔')
     EDGE = ('edge', '테두리 스윕')
-    BRACKET = ('bracket', '포커스 브래킷')
+    PULSE = ('pulse', '소프트 펄스')
     TRAIL = ('trail', '신호 트레일')
 
     def __init__(self, key, label):
@@ -125,7 +125,7 @@ class RowGlow:
     reduced_motion: bool
 
     def progress(self, now_ms):
-        return max(0.,min(1.,(now_ms-self.start_ms)/(300 if self.reduced_motion else 520)))
+        return max(0.,min(1.,(now_ms-self.start_ms)/(300 if self.reduced_motion else 800)))
 
     def finished(self, now_ms):
         return self.progress(now_ms)>=1.
@@ -167,9 +167,72 @@ def fitted_model_runs(runs, metrics, width):
                  for run,space in zip(runs,widths))
 
 
+_glow_easing=QEasingCurve(QEasingCurve.BezierSpline)
+_glow_easing.addCubicBezierSegment(QPointF(.2,.5),QPointF(.4,1),QPointF(1,1))
+
+
+def paint_row_glow(p,x,y,w,h,*,style,glow,now_ms,color):
+    if glow.finished(now_ms):return
+    progress=glow.progress(now_ms)
+    def tint(alpha):
+        result=QColor(color);result.setAlphaF(alpha);return result
+    def wash(alpha,width):
+        gradient=QLinearGradient(x,y,x+width,y)
+        gradient.setColorAt(0,tint(alpha));gradient.setColorAt(1,tint(alpha*.16))
+        p.setPen(Qt.NoPen);p.setBrush(QBrush(gradient));p.drawRoundedRect(QRectF(x,y,width,h),5,5)
+    p.save()
+    try:
+        p.setRenderHint(QPainter.Antialiasing)
+        clip=QPainterPath();clip.addRoundedRect(QRectF(x,y,w,h),5,5)
+        p.setClipPath(clip,Qt.IntersectClip)
+        if glow.reduced_motion:
+            wash(.17*(1-progress),w);return
+        age=_glow_easing.valueForProgress(progress);peak=.95
+        def at(*frames):
+            for (start,a),(end,b) in zip(frames,frames[1:]):
+                if age<=end:return a+(b-a)*(age-start)/(end-start)
+            return frames[-1][1]
+        if style is HighlightStyle.RIBBON:
+            alpha=peak*at((0,1),(.22,.72),(1,0))
+            width=w*at((0,.83),(.22,1),(1,1))
+            wash(.25*alpha,width)
+        elif style is HighlightStyle.SCAN:
+            alpha=peak*at((0,0),(.18,1),(.7,.6),(1,0))
+            width=w*.75;left=x+width*(-1.1+2.6*age)
+            gradient=QLinearGradient(left,y,left+width,y)
+            gradient.setColorAt(0,tint(0));gradient.setColorAt(.5,tint(.31*alpha));gradient.setColorAt(1,tint(0))
+            p.setPen(Qt.NoPen);p.setBrush(QBrush(gradient));p.drawRect(QRectF(left,y,width,h))
+            tip=x+(w-1)*age
+            gradient=QLinearGradient(tip,y+5,tip,y+h-5)
+            gradient.setColorAt(0,tint(0));gradient.setColorAt(.5,tint(peak*at((0,0),(.15,1),(1,0))));gradient.setColorAt(1,tint(0))
+            p.setBrush(QBrush(gradient));p.drawRect(QRectF(tip,y+5,1.6,h-10))
+        elif style is HighlightStyle.EDGE:
+            wash(.25*peak*at((0,0),(.35,.25),(1,0)),w)
+            length=(w-10)*at((0,.04),(.5,1),(1,1))
+            alpha=peak*at((0,1),(.5,1),(1,0))
+            for left,top in ((x+5,y),(x+w-5-length,y+h-1.6)):
+                gradient=QLinearGradient(left,top,left+length,top)
+                gradient.setColorAt(0,tint(0));gradient.setColorAt(.5,tint(alpha));gradient.setColorAt(1,tint(0))
+                p.setPen(Qt.NoPen);p.setBrush(QBrush(gradient));p.drawRect(QRectF(left,top,length,1.6))
+        elif style is HighlightStyle.PULSE:
+            p.setPen(Qt.NoPen);p.setBrush(tint(.23*math.sin(math.pi*progress)))
+            p.drawRoundedRect(QRectF(x,y,w,h),5,5)
+        elif style is HighlightStyle.TRAIL:
+            alpha=peak*at((0,0),(.18,1),(.72,.75),(1,0))
+            length=min(42,w*.2);left=x-length+(w-5+length)*age
+            gradient=QLinearGradient(left,y,left+length,y)
+            gradient.setColorAt(0,tint(0));gradient.setColorAt(1,tint(alpha))
+            p.setPen(Qt.NoPen);p.setBrush(QBrush(gradient));p.drawRect(QRectF(left,y+h-2,length,2))
+            p.setBrush(tint(peak*at((0,0),(.2,1),(1,0))))
+            p.drawEllipse(QPointF(x+(w-5)*age,y+h-2),2,2)
+            if progress<.65:
+                ring=_glow_easing.valueForProgress(progress/.65);radius=7*(.7+ring)
+                p.setPen(QPen(tint(peak*(1-ring)),1.5));p.setBrush(Qt.NoBrush)
+                p.drawEllipse(QPointF(x+AGENT_ICON_SIZE/2,y+12),radius,radius)
+    finally:p.restore()
+
+
 class Drawing:
-    _glow_easing=QEasingCurve(QEasingCurve.BezierSpline)
-    _glow_easing.addCubicBezierSegment(QPointF(.16,.7),QPointF(.25,1),QPointF(1,1))
     def __init__(self,painter,content):
         self.p=painter;self.model=content;self.colors=palette(content.appearance);self.now_ms=time.monotonic()*1000
         painter.setRenderHint(QPainter.Antialiasing)
@@ -193,69 +256,8 @@ class Drawing:
         self.p.restore()
     def row_glow(self,x,y,w,h,*,owner,color):
         glow=self.model.row_glows.active.get(owner)
-        if glow is None or glow.finished(self.now_ms):return
-        progress=glow.progress(self.now_ms);p=self.p
-        def tint(alpha):
-            result=QColor(color);result.setAlphaF(alpha);return result
-        def wash(alpha,width):
-            gradient=QLinearGradient(x,y,x+width,y)
-            gradient.setColorAt(0,tint(alpha));gradient.setColorAt(1,tint(alpha*.16))
-            p.setPen(Qt.NoPen);p.setBrush(QBrush(gradient));p.drawRoundedRect(QRectF(x,y,width,h),5,5)
-        p.save()
-        try:
-            clip=QPainterPath();clip.addRoundedRect(QRectF(x,y,w,h),5,5)
-            p.setClipPath(clip,Qt.IntersectClip)
-            if glow.reduced_motion:
-                wash(.13*(1-progress),w);return
-            age=self._glow_easing.valueForProgress(progress);peak=.85
-            def at(*frames):
-                for (start,a),(end,b) in zip(frames,frames[1:]):
-                    if age<=end:return a+(b-a)*(age-start)/(end-start)
-                return frames[-1][1]
-            style=self.model.highlight_style
-            if style is HighlightStyle.RIBBON:
-                alpha=peak*at((0,1),(.22,.72),(1,0))
-                width=w*at((0,.83),(.22,1),(1,1))
-                wash(.19*alpha,width)
-            elif style is HighlightStyle.SCAN:
-                alpha=peak*at((0,0),(.18,1),(.7,.6),(1,0))
-                width=w*.75;left=x+width*(-1.1+2.6*age)
-                gradient=QLinearGradient(left,y,left+width,y)
-                gradient.setColorAt(0,tint(0));gradient.setColorAt(.5,tint(.24*alpha));gradient.setColorAt(1,tint(0))
-                p.setPen(Qt.NoPen);p.setBrush(QBrush(gradient));p.drawRect(QRectF(left,y,width,h))
-                tip=x+(w-1)*age
-                gradient=QLinearGradient(tip,y+5,tip,y+h-5)
-                gradient.setColorAt(0,tint(0));gradient.setColorAt(.5,tint(peak*at((0,0),(.15,1),(1,0))));gradient.setColorAt(1,tint(0))
-                p.setBrush(QBrush(gradient));p.drawRect(QRectF(tip,y+5,1,h-10))
-            elif style is HighlightStyle.EDGE:
-                wash(.19*peak*at((0,0),(.35,.25),(1,0)),w)
-                length=(w-10)*at((0,.04),(.5,1),(1,1))
-                alpha=peak*at((0,1),(.5,1),(1,0))
-                for left,top in ((x+5,y),(x+w-5-length,y+h-1)):
-                    gradient=QLinearGradient(left,top,left+length,top)
-                    gradient.setColorAt(0,tint(0));gradient.setColorAt(.5,tint(alpha));gradient.setColorAt(1,tint(0))
-                    p.setPen(Qt.NoPen);p.setBrush(QBrush(gradient));p.drawRect(QRectF(left,top,length,1))
-            elif style is HighlightStyle.BRACKET:
-                alpha=peak*at((0,0),(.2,1),(.65,.7),(1,0))
-                offset=at((0,5),(.2,0),(.65,0),(1,2))
-                p.setPen(QPen(tint(alpha),1.5));p.setBrush(Qt.NoBrush)
-                for left,direction in ((x+.75-offset,1),(x+w-.75+offset,-1)):
-                    path=QPainterPath(QPointF(left+6*direction,y+4))
-                    path.lineTo(left,y+4);path.lineTo(left,y+h-4);path.lineTo(left+6*direction,y+h-4)
-                    p.drawPath(path)
-            elif style is HighlightStyle.TRAIL:
-                alpha=peak*at((0,0),(.18,1),(.72,.75),(1,0))
-                length=min(42,w*.2);left=x-length+(w-5+length)*age
-                gradient=QLinearGradient(left,y,left+length,y)
-                gradient.setColorAt(0,tint(0));gradient.setColorAt(1,tint(alpha))
-                p.setPen(Qt.NoPen);p.setBrush(QBrush(gradient));p.drawRect(QRectF(left,y+h-1.5,length,1.5))
-                p.setBrush(tint(peak*at((0,0),(.2,1),(1,0))))
-                p.drawEllipse(QPointF(x+(w-5)*age,y+h-1.5),1.5,1.5)
-                if progress<.65:
-                    ring=self._glow_easing.valueForProgress(progress/.65);radius=7*(.7+ring)
-                    p.setPen(QPen(tint(peak*(1-ring)),1));p.setBrush(Qt.NoBrush)
-                    p.drawEllipse(QPointF(x+AGENT_ICON_SIZE/2,y+12),radius,radius)
-        finally:p.restore()
+        if glow is not None:
+            paint_row_glow(self.p,x,y,w,h,style=self.model.highlight_style,glow=glow,now_ms=self.now_ms,color=color)
     def number(self,value,x,baseline,w,size,color='ink',weight=600,right=False):
         value=tr(str(value))
         p=self.p;p.setFont(font(self.model.appearance.family,size,weight));p.setPen(self.colors[color])

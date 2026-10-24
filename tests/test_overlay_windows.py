@@ -75,10 +75,15 @@ def test_foreground_companion_does_not_hide_its_codex_target():
         def IsWindowVisible(self,hwnd):return True
         def IsIconic(self,hwnd):return self.minimized
         def GetForegroundWindow(self):return self.foreground
+        def GetWindowLongPtrW(self,hwnd,index):return {4:2,5:1}.get(hwnd,0)
     native=WindowsOverlay.__new__(WindowsOverlay)
     native.u=API()
     native.set_companions([2,3])
     assert native.visible_target(1)
+    native.u.foreground=4
+    assert native.visible_target(1)
+    native.u.foreground=5
+    assert not native.visible_target(1)
     native.u.foreground=9
     assert not native.visible_target(1)
     native.u.foreground=1

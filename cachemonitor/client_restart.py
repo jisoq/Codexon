@@ -8,7 +8,9 @@ import time
 from . import chatgpt_startup as desktop
 from .observer_state import ProcessLock
 
-SAVE_WORK = '진행 중인 작업을 마치고 저장하세요. 업데이트하려면 Codex를 종료한 뒤 다시 실행해야 합니다.'
+SAVE_WORK = ('확인을 누르면 현재 사용 중인 ChatGPT가 종료됩니다.\n\n'
+             '설치가 끝나면 ChatGPT가 자동으로 다시 실행됩니다.\n'
+             '진행 중인 작업을 마치고 저장한 뒤 확인을 누르세요.')
 CLOSE_REQUIRED = 'Codex를 완전히 종료한 뒤 다시 시도하세요.'
 RESTART_REQUIRED = 'Codex를 다시 실행하지 못했습니다. 다시 시도하세요.'
 CONSENT_REQUIRED = '업데이트를 다시 시작하고 Codex 재시작을 확인하세요.'

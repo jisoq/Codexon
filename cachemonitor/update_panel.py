@@ -304,7 +304,7 @@ class UpdatePanel(Group):
             from .client_restart import SAVE_WORK
             from .quick_runtime import Confirmation
             plan=self.offer;operation_id=self.record.get('operation_id')
-            dialog=Confirmation('Codex 재시작',SAVE_WORK,self)
+            dialog=Confirmation('ChatGPT 재시작',SAVE_WORK,self)
             dialog.confirm.setText('업데이트하고 재시작')
             self._restart_confirmation=dialog
             def answered(result):

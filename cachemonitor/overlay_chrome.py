@@ -1,10 +1,13 @@
 """Interactive companions for the otherwise click-through overlay."""
+import time
 from PySide6.QtCore import Qt, QObject, Property, Signal, Slot, QSignalBlocker, QEvent, QRect, QTimer
 from PySide6.QtGui import QRegion, QWindow, QPlatformSurfaceEvent
 from PySide6.QtWidgets import QApplication
 from .overlay_appearance import default_appearance
+from .overlay_icons import agent_palette
 from .presentation import Node, Slider, Text
 from .quick_runtime import QuickHost
+from .overlay_view import HighlightStyle, RowGlow, paint_row_glow
 
 
 def named_item(root,name):
@@ -81,8 +84,83 @@ class OverlayWindowStack(QObject):
         # would otherwise destroy owned HWNDs behind their QWidget wrappers.
         for window in list(self.owners):self.release(window)
 
+    def popup_contains(self,x,y):
+        toolbar=self.controller.toolbar
+        if toolbar._quick is None:return False
+        for window in self.owners:
+            if (isinstance(window,QWindow) and window.isVisible()
+                    and window.transientParent() is toolbar._quick.quickWindow()):
+                left,top,right,bottom=self.controller.native.frame(int(window.winId()))
+                if left<=x<right and top<=y<bottom:return True
+        return False
+
+
+class HighlightPreview(Node):
+    def __init__(self,parent):
+        super().__init__(parent)
+        self.style=HighlightStyle.RIBBON
+        self.appearance=default_appearance(True)
+        self.reduced_motion=False
+        self.visible=False
+        self.glow=None
+        self.color=None
+        self.remaining_colors=[]
+        self.timer=QTimer(self);self.timer.setInterval(16);self.timer.setTimerType(Qt.PreciseTimer)
+        self.timer.timeout.connect(self.advance)
+
+    def configure(self,style,appearance,reduced_motion):
+        self.style,self.appearance=style,appearance
+        if reduced_motion and not self.reduced_motion and self.glow is not None:
+            now=time.monotonic()*1000
+            if not self.glow.finished(now):self.glow=RowGlow(now,True)
+        self.reduced_motion=reduced_motion
+        self.update()
+
+    def set_visible(self,visible):
+        if visible==self.visible:return
+        self.visible=visible
+        if visible:self.play()
+        else:self.clear()
+
+    def play(self):
+        if not self.visible:return
+        self.remaining_colors=list(agent_palette(self.appearance)[:3])
+        self.glow=None
+        self.advance();self.timer.start()
+
+    def advance(self):
+        now=time.monotonic()*1000
+        if self.glow is None or self.glow.finished(now):
+            if not self.remaining_colors:self.clear();return
+            self.color=self.remaining_colors.pop(0)
+            self.glow=RowGlow(now,self.reduced_motion)
+        self.update()
+
+    def clear(self):
+        self.glow=None;self.color=None;self.remaining_colors.clear()
+        self.timer.stop();self.update()
+
+    def paint(self,painter):
+        if self.glow is None:return
+        scale=self.appearance.scale
+        painter.save()
+        try:
+            painter.scale(scale,scale)
+            paint_row_glow(painter,0,0,self._paint_width/scale,self._paint_height/scale,
+                           style=self.style,glow=self.glow,now_ms=time.monotonic()*1000,
+                           color=self.color)
+        finally:painter.restore()
+
 
 class ChromeModel(Node):
+    def __init__(self,kind):
+        super().__init__()
+        self.preview=HighlightPreview(self) if kind=='toolbar' else None
+        self.put(highlightStyles=[dict(key=style.key,label=style.label) for style in HighlightStyle])
+
+    @Property(QObject,constant=True)
+    def highlightPreview(self):return self.preview
+
     detailPressed = Signal()
     detailClicked = Signal()
     @Slot()
@@ -94,6 +172,7 @@ class ChromeModel(Node):
     opacityToggleRequested = Signal()
     settingsToggleRequested = Signal()
     chartStyleRequested = Signal(str)
+    highlightStyleRequested = Signal(str)
     agentCountRequested = Signal(int)
     escapeRequested = Signal()
     interactionRequested = Signal()
@@ -109,6 +188,8 @@ class ChromeModel(Node):
     def toggleSettings(self): self.settingsToggleRequested.emit()
     @Slot(str)
     def setChartStyle(self,value): self.chartStyleRequested.emit(value)
+    @Slot(str)
+    def setHighlightStyle(self,value): self.highlightStyleRequested.emit(value)
     @Slot(int)
     def setAgentCount(self,value): self.agentCountRequested.emit(value)
     @Slot()
@@ -125,6 +206,7 @@ class OverlayChrome(QuickHost):
     opacity_toggle = Signal()
     settings_toggle = Signal()
     chart_style_changed = Signal(str)
+    highlight_style_changed = Signal(str)
     agent_count_changed = Signal(int)
     escape = Signal()
     interaction_started = Signal()
@@ -149,11 +231,11 @@ class OverlayChrome(QuickHost):
         self.setFocusPolicy(Qt.NoFocus)
         self.setAccessibleName(names[kind])
         if kind in ('header', 'icon'): self.setCursor(Qt.OpenHandCursor)
-        self.view = ChromeModel()
+        self.view = ChromeModel(kind)
         from .overlay_view import palette
         initial = palette(self.appearance)
         self.view.put(chromeKind=kind, scale=1., opacity=94, hovered=False, pressed=False,
-                      expanded=False, canExpand=True, popupOpen=False,
+                      expanded=False, canExpand=True, popupOpen=False,popupKind='opacity',
                       **{key:initial[key].name() for key in ('surface','ink','meta','border','accent')},
                       family='Pretendard JP', reducedMotion=False)
         self.set_scene(self.view, 'OverlayControls.qml', transparent=True,deferred=True,shared=True)
@@ -162,6 +244,7 @@ class OverlayChrome(QuickHost):
         self.view.opacityToggleRequested.connect(self.opacity_toggle)
         self.view.settingsToggleRequested.connect(self.settings_toggle)
         self.view.chartStyleRequested.connect(self.chart_style_changed)
+        self.view.highlightStyleRequested.connect(self.highlight_style_changed)
         self.view.agentCountRequested.connect(self.agent_count_changed)
         self.view.escapeRequested.connect(self.escape)
         self.view.interactionRequested.connect(self.begin_interaction)
@@ -200,6 +283,22 @@ class OverlayChrome(QuickHost):
         self.setAccessibleName('\n'.join(value for value in (title,model_summary) if value))
         self.view.put(title=title)
 
+    def configure_highlight(self,style,reduced_motion):
+        self.view.put(highlightStyle=style.key)
+        self.view.preview.configure(style,self.appearance,reduced_motion)
+
+    def set_popup_kind(self,kind):
+        self.view.put(popupKind=kind)
+        self.view.preview.set_visible(self.isVisible() and kind=='settings')
+
+    def showEvent(self,event):
+        super().showEvent(event)
+        if self.view.preview is not None:self.view.preview.set_visible(self.view.state['popupKind']=='settings')
+
+    def hideEvent(self,event):
+        if self.view.preview is not None:self.view.preview.set_visible(False)
+        super().hideEvent(event)
+
 
     def begin_interaction(self):
         self.interaction_started.emit()
@@ -209,6 +308,7 @@ class OverlayChrome(QuickHost):
 
 
     def closeEvent(self, event):
+        if self.view.preview is not None:self.view.preview.set_visible(False)
         self.release_scene()
         super().closeEvent(event)
 

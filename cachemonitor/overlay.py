@@ -85,6 +85,7 @@ class OverlayController(QObject):
         self.shadow=OverlayShadow()
         from .overlay_chrome import OverlayChrome, OverlayDetail, OverlayLinks
         self.header=OverlayChrome('header');self.toolbar=OverlayChrome('toolbar');self.icon=OverlayChrome('icon');self.actions=OverlayChrome('actions')
+        self.toolbar.configure_highlight(content.highlight_style,False)
         self.detail=OverlayDetail(self.widget.content_model)
         self.links=OverlayLinks(self.widget.content_model)
         self.actions.view.detailPressed.connect(self.capture_detail)
@@ -129,6 +130,7 @@ class OverlayController(QObject):
         self.actions.opacity_toggle.connect(self.toggle_opacity)
         self.actions.settings_toggle.connect(self.toggle_settings)
         self.toolbar.chart_style_changed.connect(self.set_chart_style)
+        self.toolbar.highlight_style_changed.connect(self.choose_highlight_style)
         self.toolbar.agent_count_changed.connect(self.set_visible_agent_count)
         self.icon.restore.connect(self.restore_panel)
         self.toolbar.opacity_changed.connect(self.set_opacity)
@@ -390,6 +392,7 @@ class OverlayController(QObject):
 
     @staticmethod
     def _parse_highlight_style(value):
+        if value=='bracket':return HighlightStyle.PULSE
         return next((style for style in HighlightStyle if style.key==value),HighlightStyle.RIBBON)
 
     @property
@@ -399,9 +402,14 @@ class OverlayController(QObject):
         style=self._parse_highlight_style(value)
         self.settings.setValue('overlay/highlightStyle',style.key)
         content=self.widget.content_model
+        self.toolbar.configure_highlight(style,self.reduced_motion)
         if content.highlight_style is style:return
         content.highlight_style=style
         content.detailBody.update();content.update();self.changed.emit()
+
+    def choose_highlight_style(self,value):
+        self.set_highlight_style(value)
+        self.toolbar.view.highlightPreview.play()
 
     def set_chart_style(self,value):
         if value not in ('bar','filled-line'):return
@@ -752,7 +760,8 @@ class OverlayController(QObject):
         if pressed and not self._pointer_down:
             x,y=self.native.cursor()
             areas=(getattr(self,'popup_geometry',None),getattr(self,'actions_geometry',None))
-            if not any(area and area[0]<=x<area[0]+area[2] and area[1]<=y<area[1]+area[3] for area in areas):
+            if (not any(area and area[0]<=x<area[0]+area[2] and area[1]<=y<area[1]+area[3] for area in areas)
+                    and not self.window_stack.popup_contains(x,y)):
                 self.close_popup()
         self._pointer_down=pressed
 
@@ -938,7 +947,9 @@ class OverlayController(QObject):
         else:
             self.icon.hide()
             self.actions.view.put(popupOpen=self.popup_open,popupKind=self.popup_kind)
-            self.toolbar.view.put(popupKind=self.popup_kind,chartStyle=self.chart_style,
+            self.toolbar.configure_highlight(content.highlight_style,self.reduced_motion)
+            self.toolbar.set_popup_kind(self.popup_kind)
+            self.toolbar.view.put(chartStyle=self.chart_style,
                                   visibleAgentCount=content.visible_agent_count(),canAdjustAgentCount=content.has_subagents())
             self.shadow.apply_appearance(self.appearance,self.opacity)
             self.shadow.set_panel_size(self.widget.panel_width()/scale,geometry[3]/(dpi/96*scale))
@@ -973,7 +984,7 @@ class OverlayController(QObject):
             if self.popup_open:
                 # Align below the header. The monitor already guarantees enough
                 # interior width; clamping also handles rounded native pixels.
-                popup_width,popup_height=(260,138 if content.has_subagents() else 72) if self.popup_kind=='settings' else (160,40)
+                popup_width,popup_height=(260,148 if content.has_subagents() else 112) if self.popup_kind=='settings' else (160,40)
                 popup_w,popup_h=round(popup_width*native_scale),round(popup_height*native_scale)
                 px=monitor[0]+round((WIDTH-MARGIN-popup_width)*native_scale)
                 py=monitor[1]+round(44*native_scale)
@@ -1010,8 +1021,6 @@ def install_overlay(window, native_enabled=True):
     from PySide6.QtWidgets import QMenu
     controller = OverlayController(window.settings, native_enabled=native_enabled)
     window.overlay = controller
-    if hasattr(window,'settings_page') and hasattr(window.settings_page,'bind_overlay'):
-        window.settings_page.bind_overlay(controller)
     if getattr(window,'worker',None) and hasattr(window.worker,'request_overlay_detail'):
         controller.overlay_loader=window.worker.request_overlay_detail
         window.worker.overlay_detail.connect(controller.receive_overlay_detail)
