@@ -40,6 +40,18 @@ def pytest_sessionfinish(session, exitstatus):
 
 
 @pytest.fixture(autouse=True)
+def restore_shell_integration(request):
+    if request.config.getoption('--check-kind') != 'gui':
+        yield
+        return
+    from PySide6.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication([])
+    previous = app.property('cachemonitorDisableShellIntegration')
+    yield
+    app.setProperty('cachemonitorDisableShellIntegration', previous)
+
+
+@pytest.fixture(autouse=True)
 def isolate_taskbar(request, monkeypatch):
     if request.config.getoption('--check-kind') == 'core':
         return

@@ -60,6 +60,16 @@ def wait_report(path,predicate,timeout=30):
     raise RuntimeError('Recovery UI did not reach the expected state: '+str(read_json(path)))
 
 
+def restored_controls_ready(state):
+    if state['busy'] or (state.get('result') or {}).get('code')!='restored':return False
+    for name in ('recheck','close','path','diagnosis'):
+        control=state['controls'][name]
+        if not (control['visible'] and control['width']>0 and control['height']>0
+                and 0<=control['x']<control['x']+control['width']<=state['client'][0]
+                and 0<=control['y']<control['y']+control['height']<=state['client'][1]):return False
+    return True
+
+
 def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--executable',type=Path,required=True)
@@ -106,14 +116,14 @@ def main():
         # PrintWindow synchronously sends native paint messages into Tk. Keep
         # external capture after the interaction so it cannot disturb the input.
         report.with_suffix('.click').touch()
-        state=wait_report(report,lambda d:(d.get('result') or {}).get('code')=='restored')
+        state=wait_report(report,restored_controls_ready)
         assert state['activations']==1
         assert not state['result']['can_recover'] and not state['controls']['restore']['visible']
         for name in ('recheck','close','path','diagnosis'):
             control=state['controls'][name]
-            assert control['visible'] and control['width']>0 and control['height']>0
-            assert 0<=control['x']<control['x']+control['width']<=state['client'][0]
-            assert 0<=control['y']<control['y']+control['height']<=state['client'][1]
+            assert control['visible'] and control['width']>0 and control['height']>0,(name,state)
+            assert 0<=control['x']<control['x']+control['width']<=state['client'][0],(name,state)
+            assert 0<=control['y']<control['y']+control['height']<=state['client'][1],(name,state)
         capture(state['hwnd'],root/'after.png')
         assert tomllib.loads((home/'config.toml').read_text())=={'model':'synthetic'}
         assert '# untouched personal setting' in (home/'config.toml').read_text()

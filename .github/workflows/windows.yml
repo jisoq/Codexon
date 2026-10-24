@@ -54,16 +54,23 @@ jobs:
         id: plan
         shell: pwsh
         env:
+          GH_TOKEN: ${{ github.token }}
           EVENT_NAME: ${{ github.event_name }}
           PR_BASE: ${{ github.event.pull_request.base.sha }}
           PACKAGE_BASE: ${{ steps.release.outputs.base }}
-          SOURCE_BASE: ${{ steps.release.outputs.source_base }}
           RELEASE_CANDIDATE: ${{ steps.release.outputs.candidate }}
           EXTENDED: ${{ inputs.extended || false }}
         run: |
           $packageBase = if ($env:EVENT_NAME -eq 'pull_request') { $env:PR_BASE } else { $env:PACKAGE_BASE }
-          $sourceBase = if ($env:SOURCE_BASE) { $env:SOURCE_BASE } elseif ($env:EVENT_NAME -eq 'pull_request') { $env:PR_BASE } else { '' }
-          python tools/ci_plan.py "--base=$packageBase" "--source-base=$sourceBase" --candidate "$env:RELEASE_CANDIDATE" --extended "$env:EXTENDED" --release-plan artifacts/verification/release-plan.json
+          python tools/ci_plan.py "--base=$packageBase" --candidate "$env:RELEASE_CANDIDATE" --extended "$env:EXTENDED" --release-plan artifacts/verification/release-plan.json
+          exit $LASTEXITCODE
+      - name: Check changed dependencies for vulnerabilities
+        if: fromJSON(steps.plan.outputs.plan).verify && fromJSON(steps.plan.outputs.plan).dependencies
+        shell: pwsh
+        run: |
+          python -m pip install pip-audit
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pip_audit -r requirements-release.lock
           exit $LASTEXITCODE
   native:
     needs: resolve
@@ -132,30 +139,32 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12.10'
-          cache: pip
+          cache: ${{ fromJSON(needs.resolve.outputs.plan).source_reuse_run == '' && 'pip' || '' }}
           cache-dependency-path: requirements-release.lock
       - name: Check the planned environment before source setup
         run: python tools/release_pipeline.py source-environment
       - uses: actions/download-artifact@v8
-        if: fromJSON(needs.resolve.outputs.plan).rust
+        if: fromJSON(needs.resolve.outputs.plan).source_reuse_run == '' && fromJSON(needs.resolve.outputs.plan).rust
         with:
           name: native-${{ github.sha }}-${{ github.run_id }}
           path: cachemonitor/
       - name: Validate the shared tested Rust extension
-        if: fromJSON(needs.resolve.outputs.plan).rust
+        if: fromJSON(needs.resolve.outputs.plan).source_reuse_run == '' && fromJSON(needs.resolve.outputs.plan).rust
         run: python tools/build_native.py --check --test
       - name: Install locked dependencies
-        if: join(fromJSON(needs.resolve.outputs.plan).tests, '') != ''
+        if: fromJSON(needs.resolve.outputs.plan).source_reuse_run == '' && join(fromJSON(needs.resolve.outputs.plan).tests, '') != ''
         run: python -m pip install -r requirements-release.lock
       - name: Check source and test environment before running checks
-        if: join(fromJSON(needs.resolve.outputs.plan).tests, '') != ''
+        if: fromJSON(needs.resolve.outputs.plan).source_reuse_run == '' && join(fromJSON(needs.resolve.outputs.plan).tests, '') != ''
         run: python tools/check_environment.py
       - name: Restore the immutable check plan
+        if: fromJSON(needs.resolve.outputs.plan).source_reuse_run == ''
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force artifacts/verification | Out-Null
           $env:CHECK_PLAN | Set-Content -Encoding utf8 artifacts/verification/plan.json
       - name: Run selected source checks
+        if: fromJSON(needs.resolve.outputs.plan).source_reuse_run == ''
         timeout-minutes: 15
         shell: pwsh
         # Keep synthetic databases and process fixtures on the job's scratch
@@ -182,16 +191,18 @@ jobs:
           }
           if ($failed) { exit 1 }
       - name: Record successful source coverage before deployment checks
+        if: fromJSON(needs.resolve.outputs.plan).source_reuse_run == ''
         run: python tools/release_pipeline.py source-receipt --folder artifacts/source-receipt
       - uses: actions/upload-artifact@v7
+        if: fromJSON(needs.resolve.outputs.plan).source_reuse_run == ''
         with:
-          name: source-verified-${{ github.sha }}
+          name: source-verified-${{ fromJSON(needs.resolve.outputs.plan).source_key || github.sha }}
           path: artifacts/source-receipt/source-verification.json
           retention-days: 30
           overwrite: true
           if-no-files-found: error
       - name: Upload synthetic verification evidence
-        if: always()
+        if: always() && fromJSON(needs.resolve.outputs.plan).source_reuse_run == ''
         uses: actions/upload-artifact@v7
         with:
           name: source-${{ github.run_attempt }}
@@ -235,11 +246,6 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force artifacts/verification | Out-Null
           $env:CHECK_PLAN | Set-Content -Encoding utf8 artifacts/verification/plan.json
-      - name: Check changed dependencies for vulnerabilities
-        if: fromJSON(needs.resolve.outputs.plan).dependencies
-        run: |
-          python -m pip install pip-audit
-          python -m pip_audit -r requirements-release.lock
       - name: Build Windows package
         shell: pwsh
         run: .\build.ps1 -DistPath dist-ci -WorkPath build-ci -PythonPath ((Get-Command python).Source) -UseNativeArtifact

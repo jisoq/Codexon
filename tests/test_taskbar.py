@@ -170,7 +170,9 @@ def test_taskbar_data_visibility_menu_and_persistence(tmp_path, monkeypatch, own
         indicator = w.taskbar_quota
         assert indicator.monitor_menu.title() == '표시할 모니터'
         assert indicator.monitor_actions[''].isChecked()
-        assert indicator.isVisible()
+        assert indicator.isVisible(), (sys.platform,
+            app.property('cachemonitorDisableShellIntegration'), indicator.native is None,
+            indicator.enabled, indicator.embedding_error, indicator._native_id)
         assert indicator.native.api.GetParent(int(indicator.winId())) == indicator.native.host()
         now = time.time()
         w.snapshot['quota_by_home']={}
