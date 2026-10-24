@@ -577,15 +577,18 @@ Path(sys.argv[2]).write_text(json.dumps(confirm_native('en')))
 
 
 @pytest.mark.skipif(os.name!='nt',reason='Native desktop process handles')
-@pytest.mark.parametrize('refuse',[False,True])
-def test_native_normal_close_uses_only_owned_exact_handles(tmp_path,monkeypatch,refuse):
+@pytest.mark.parametrize('close_behavior',['close','refuse','background'])
+def test_native_normal_close_uses_only_owned_exact_handles(tmp_path,monkeypatch,close_behavior):
     from cachemonitor.proxy_identity import process_identity
     helper=tmp_path/'window.py'
     helper.write_text('''import json,os,sys,tkinter as tk
 from pathlib import Path
 root=tk.Tk();root.geometry('240x100')
 stop=Path(sys.argv[1]);ready=Path(sys.argv[2])
-root.protocol('WM_DELETE_WINDOW',lambda:None if sys.argv[3]=='refuse' else root.destroy())
+def close():
+    if sys.argv[3]=='background':root.withdraw()
+    elif sys.argv[3]!='refuse':root.destroy()
+root.protocol('WM_DELETE_WINDOW',close)
 def poll():
     if stop.exists():root.destroy()
     else:root.after(10,poll)
@@ -595,18 +598,27 @@ root.update();ready.write_text(json.dumps({'hwnd':root.winfo_id(),'pid':os.getpi
     try:
         for name in ('target','cli-surrogate'):
             ready=tmp_path/(name+'.json');stop=tmp_path/(name+'.stop')
-            worker=subprocess.Popen([sys.executable,str(helper),str(stop),str(ready),'refuse' if refuse else 'close'])
+            worker=subprocess.Popen([sys.executable,str(helper),str(stop),str(ready),close_behavior])
             owned.append((worker,stop));settle(ready.exists)
         target=process_identity(json.loads((tmp_path/'target.json').read_text())['pid'])
         kernel=restart.desktop._process_api();session=W.DWORD()
         assert kernel.ProcessIdToSessionId(os.getpid(),C.byref(session))
         target.update(app_id=restart.desktop.CODEX_APP_ID,session=session.value)
-        if refuse:
+        if close_behavior=='refuse':
             with pytest.raises(RuntimeError):restart.close_desktop([target],timeout=.3)
             assert owned[0][0].poll() is None
         else:
-            restart.close_desktop([target],timeout=4)
-            assert owned[0][0].wait(2)==0
+            try:
+                restart.close_desktop([target],timeout=4)
+            finally:
+                if close_behavior=='background':
+                    user=C.WinDLL('user32',use_last_error=True)
+                    user.IsWindowVisible.argtypes=[W.HWND]
+                    hwnd=json.loads((tmp_path/'target.json').read_text())['hwnd']
+                    assert not user.IsWindowVisible(hwnd)
+                    assert owned[1][0].poll() is None
+            assert owned[0][0].wait(2) is not None
+            if close_behavior=='close':assert owned[0][0].returncode==0
         assert owned[1][0].poll() is None
     finally:
         for worker,stop in owned:stop.touch()
