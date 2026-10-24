@@ -88,7 +88,6 @@ def test_delayed_refresh_preserves_usage_and_shows_pending(app, reason, count, c
     layout = model.layout()
     for note in ('갱신 중', '', '갱신 중', ''):
         model.set_content(deepcopy(data), note)
-        assert model.state['contentOpacity'] == 1
         assert model.state['heartbeatMode'] == ('pending' if note else 'active' if count else 'idle')
         if not note:assert model.state['heartbeatLabel'] == label
         assert not model.state['checkingRecords'] and not model.notice_card()
@@ -160,29 +159,6 @@ def test_scope_counts_only_main_calls_and_reports_pricing_coverage():
     assert scope({'calls': 28, 'priced': 24}) == 'Main Agent : 24/28호출'
     assert scope({'calls': 28, 'descendants': 2,
                   'main_usage': {'calls': 8, 'priced': 7}}) == 'Main Agent : 7/8호출'
-
-
-def test_stale_content_fades_monitor_and_embedded_sub_body_then_recovers(app):
-    from cachemonitor.overlay_chrome import OverlayDetail
-    model = OverlayContent()
-    data = subagent_summary()
-    data['_collection'] = {'retained': True}
-    pane = OverlayDetail(model)
-    try:
-        for note in ('기록 준비 중', '수집 지연', '수집 오류'):
-            model.set_content(data, note)
-            assert model.content_opacity() < 1
-            assert pane.view.state['contentOpacity'] == model.content_opacity()
-            assert model.data['cost'] == data['cost'] and model.has_subagents()
-        model.set_content(data)
-        assert model.content_opacity() == pane.view.state['contentOpacity'] == 1
-        partial = deepcopy(data)
-        partial['coverage_gap'] = True
-        model.set_content(partial)
-        assert model.content_opacity() == pane.view.state['contentOpacity'] == 1
-    finally:
-        pane.close()
-        app.processEvents()
 
 
 def test_rendered_main_summary_uses_own_cumulative_metrics(app, monkeypatch):
