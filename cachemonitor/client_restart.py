@@ -43,9 +43,14 @@ def confirm_native(language):
 
 
 def close_desktop(targets, timeout=25):
+    deadline = time.monotonic() + timeout
+    cooperative_deadline = deadline - timeout / 5
     from .proxy_identity import process_identity
     kernel = desktop._process_api()
     kernel.WaitForSingleObject.argtypes = [W.HANDLE, W.DWORD]
+    kernel.WaitForSingleObject.restype = W.DWORD
+    kernel.TerminateProcess.argtypes = [W.HANDLE, W.UINT]
+    kernel.TerminateProcess.restype = W.BOOL
     user = C.WinDLL('user32', use_last_error=True)
     callback_type = C.WINFUNCTYPE(W.BOOL, W.HWND, W.LPARAM)
     user.EnumWindows.argtypes = [callback_type, W.LPARAM]
@@ -58,7 +63,7 @@ def close_desktop(targets, timeout=25):
         if not kernel.ProcessIdToSessionId(os.getpid(), C.byref(session)):raise OSError(CLOSE_REQUIRED)
         for target in targets:
             if target['session'] != session.value:raise RuntimeError(CONSENT_REQUIRED)
-            handle = kernel.OpenProcess(0x100000 | 0x1000, False, target['pid'])
+            handle = kernel.OpenProcess(0x100000 | 0x1000 | 0x0001, False, target['pid'])
             if not handle:
                 if process_identity(target['pid']) is None:continue
                 raise OSError(CLOSE_REQUIRED)
@@ -67,17 +72,38 @@ def close_desktop(targets, timeout=25):
             if actual != {k:target[k] for k in ('pid', 'created', 'executable')}:
                 kernel.CloseHandle(handles.pop(target['pid']))
                 continue
+        visible = set()
         @callback_type
-        def close_window(hwnd, _):
+        def visible_window(hwnd, _):
             pid = W.DWORD()
             user.GetWindowThreadProcessId(hwnd, C.byref(pid))
-            if pid.value in handles and user.IsWindowVisible(hwnd):user.PostMessageW(hwnd, 0x10, 0, 0)
+            if pid.value in handles and user.IsWindowVisible(hwnd):visible.add(hwnd)
             return True
-        if not user.EnumWindows(close_window, 0):raise OSError(CLOSE_REQUIRED)
-        deadline = time.monotonic() + timeout
-        while any(kernel.WaitForSingleObject(handle, 0) != 0 for handle in handles.values()):
-            if time.monotonic() >= deadline:raise RuntimeError(CLOSE_REQUIRED)
-            time.sleep(.1)
+        if not user.EnumWindows(visible_window, 0):raise OSError(CLOSE_REQUIRED)
+        for hwnd in visible:user.PostMessageW(hwnd, 0x10, 0, 0)
+        force_requested = False
+        while True:
+            pending = []
+            for handle in handles.values():
+                status = kernel.WaitForSingleObject(handle, 0)
+                if status == 258:pending.append(handle)
+                elif status != 0:raise OSError(CLOSE_REQUIRED)
+            if not pending:return
+            now = time.monotonic()
+            if now >= deadline:raise RuntimeError(CLOSE_REQUIRED)
+            if not force_requested and now >= cooperative_deadline:
+                visible.clear()
+                if not user.EnumWindows(visible_window, 0):raise OSError(CLOSE_REQUIRED)
+                if not visible:
+                    if time.monotonic() >= deadline:raise RuntimeError(CLOSE_REQUIRED)
+                    for handle in pending:
+                        status = kernel.WaitForSingleObject(handle, 0)
+                        if status == 0:continue
+                        if status != 258:raise OSError(CLOSE_REQUIRED)
+                        if not kernel.TerminateProcess(handle, 1):
+                            if kernel.WaitForSingleObject(handle, 0) != 0:raise OSError(CLOSE_REQUIRED)
+                    force_requested = True
+            time.sleep(min(.1, max(0, deadline - time.monotonic())))
     finally:
         for handle in handles.values():kernel.CloseHandle(handle)
 
