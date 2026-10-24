@@ -531,11 +531,14 @@ def test_delayed_proxy_status_cannot_block_check_after_completion(tmp_path,monke
     monkeypatch.setattr(UpdatePanel,'recover',lambda self:None)
     panel=UpdatePanel(SimpleNamespace(directory=tmp_path/'updates'));calls=[]
     monkeypatch.setattr(panel,'launch_operation',lambda action:calls.append(action))
+    now=[1000.]
+    monkeypatch.setattr(time,'time',lambda:now[0])
     try:
         op=panel.journal.begin('proxy','fixture')['operation_id']
         waiting=dict(phase='waiting',operation_id=op,updated_at=time.time())
         panel.journal.proxy_result(op,dict(phase='complete',operation_id=op,updated_at=time.time()))
         if not same_operation:
+            now[0]+=1
             new=panel.journal.begin('proxy','newer')['operation_id']
             panel.journal.proxy_result(new,dict(phase='complete',operation_id=new,updated_at=time.time()))
         panel.refresh();panel.proxy_status(dict(update=waiting))
