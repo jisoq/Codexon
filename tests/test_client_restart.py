@@ -549,25 +549,38 @@ Path(sys.argv[2]).write_text(json.dumps(confirm_native('en')))
 ''',encoding='utf-8')
     user=C.WinDLL('user32',use_last_error=True)
     callback_type=C.WINFUNCTYPE(W.BOOL,W.HWND,W.LPARAM)
-    user.EnumWindows.argtypes=[callback_type,W.LPARAM]
-    user.GetWindowThreadProcessId.argtypes=[W.HWND,C.POINTER(W.DWORD)]
-    user.PostMessageW.argtypes=[W.HWND,W.UINT,W.WPARAM,W.LPARAM]
+    user.EnumWindows.argtypes=[callback_type,W.LPARAM];user.EnumWindows.restype=W.BOOL
+    user.GetWindowThreadProcessId.argtypes=[W.HWND,C.POINTER(W.DWORD)];user.GetWindowThreadProcessId.restype=W.DWORD
+    user.PostMessageW.argtypes=[W.HWND,W.UINT,W.WPARAM,W.LPARAM];user.PostMessageW.restype=W.BOOL
+    user.GetDlgItem.argtypes=[W.HWND,C.c_int];user.GetDlgItem.restype=W.HWND
+    user.IsWindowVisible.argtypes=[W.HWND];user.IsWindowVisible.restype=W.BOOL
+    user.IsWindowEnabled.argtypes=[W.HWND];user.IsWindowEnabled.restype=W.BOOL
+    user.GetWindowRect.argtypes=[W.HWND,C.POINTER(W.RECT)];user.GetWindowRect.restype=W.BOOL
     worker=subprocess.Popen([sys.executable,str(helper),str(Path(__file__).resolve().parents[1]),str(result),str(ready)])
-    windows=[];owned_pid=None
+    windows=[];owned_pid=None;prompt=None
     @callback_type
     def owned(hwnd,_):
         pid=W.DWORD();user.GetWindowThreadProcessId(hwnd,C.byref(pid))
         if pid.value==owned_pid:windows.append(hwnd)
         return True
     def visible():
-        windows.clear();user.EnumWindows(owned,0)
-        return bool(windows)
+        nonlocal prompt
+        windows.clear();user.EnumWindows(owned,0);prompt=None
+        for hwnd in windows:
+            if not user.IsWindowVisible(hwnd):continue
+            cancel=user.GetDlgItem(hwnd,2);rect=W.RECT()
+            if (cancel and user.IsWindowVisible(cancel) and user.IsWindowEnabled(cancel)
+                    and user.GetWindowRect(cancel,C.byref(rect))
+                    and rect.right>rect.left and rect.bottom>rect.top):
+                prompt=hwnd
+                return True
+        return False
     try:
         settle(ready.exists)
         owned_pid=json.loads(ready.read_text())['pid']
         settle(visible)
-        assert user.PostMessageW(windows[0],0x100,13,0)
-        assert user.PostMessageW(windows[0],0x101,13,0)
+        assert user.PostMessageW(prompt,0x100,13,0)
+        assert user.PostMessageW(prompt,0x101,13,0)
         assert worker.wait(5)==0 and json.loads(result.read_text()) is False
     finally:
         if worker.poll() is None:
