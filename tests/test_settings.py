@@ -145,10 +145,12 @@ def test_overlay_chart_style_loads_saved_value_or_defaults_to_bars(startup_setti
     window,_=startup_settings_window
     if saved is None:window.settings.remove('overlay/chartStyle')
     else:window.settings.setValue('overlay/chartStyle',saved)
-    page=SettingsPage(window)
+    from cachemonitor.overlay import OverlayController
+    controller=OverlayController(window.settings,native_enabled=False)
     try:
-        assert page.controls['overlay-chart-style'].currentData()==expected
-    finally:page.deleteLater()
+        assert controller.chart_style==controller.widget.content_model.chart_style==expected
+    finally:controller.stop()
+
 
 
 @pytest.mark.integration
@@ -157,7 +159,6 @@ def test_overlay_chart_style_applies_immediately_preserves_selection_and_persist
     from test_overlay_presentation import summary
     window,_=startup_settings_window
     controller=OverlayController(window.settings,native_enabled=False);window.overlay=controller
-    window.settings_page.bind_overlay(controller)
     model=controller.widget.content_model;data=summary(count=3);model.set_content(data)
     model.pin_call(model.call_id(model.rows()[0]))
     selected=model.selected_id
@@ -165,8 +166,7 @@ def test_overlay_chart_style_applies_immediately_preserves_selection_and_persist
     controller.overlay_loader=unexpected
     monkeypatch.setattr(controller,'content',unexpected)
     try:
-        choice=window.settings_page.controls['overlay-chart-style']
-        choice.setCurrentIndex(choice.findData('filled-line'))
+        controller.toolbar.view.setChartStyle('filled-line')
         assert controller.chart_style=='filled-line'
         assert model.selected_id==selected and model.graph_pinned
         assert model.data is data
@@ -174,7 +174,7 @@ def test_overlay_chart_style_applies_immediately_preserves_selection_and_persist
         saved=QSettings(window.settings.fileName(),QSettings.IniFormat)
         assert saved.value('overlay/chartStyle')=='filled-line'
         controller.set_chart_style('bar')
-        assert choice.currentData()=='bar'
+        assert controller.toolbar.view.state['chartStyle']=='bar'
         assert model.selected_id==selected and model.graph_pinned
         assert model.data is data
         window.settings.sync()
@@ -190,13 +190,10 @@ def test_overlay_highlight_style_persists_all_choices_without_reloading_or_losin
     from cachemonitor.overlay import OverlayController
     from cachemonitor.overlay_view import HighlightStyle
     from test_overlay_presentation import subagent_summary
-    window,_=startup_settings_window;page=window.settings_page
-    choice=page.controls['overlay-highlight-style']
-    assert not choice.isEnabled()
+    window,_=startup_settings_window
     clock=[0.]
     monkeypatch.setattr('cachemonitor.overlay_view.time',SimpleNamespace(monotonic=lambda:clock[0]))
     controller=OverlayController(window.settings,native_enabled=False);window.overlay=controller
-    page.bind_overlay(controller);assert choice.isEnabled()
     model=controller.widget.content_model;model.put(overlayVisible=True);data=subagent_summary();model.set_content(data)
     model.pin_call(model.call_id(model.rows()[0]));model.toggle_detail_group(model.detail_groups()[0]['key'])
     model.detailBody.setScrollOffset(34)
@@ -213,7 +210,7 @@ def test_overlay_highlight_style_persists_all_choices_without_reloading_or_losin
         controller.set_highlight_style('scan')
         for style in HighlightStyle:
             before=controller.highlight_style;counts=len(repaints),len(detail_repaints),len(signals)
-            choice.setCurrentIndex(choice.findData(style.key))
+            controller.set_highlight_style(style.key)
             assert controller.highlight_style is model.highlight_style is style
             if before is not style:
                 assert len(repaints)>counts[0] and len(detail_repaints)>counts[1] and len(signals)>counts[2]
@@ -228,10 +225,10 @@ def test_overlay_highlight_style_persists_all_choices_without_reloading_or_losin
             controller.set_highlight_style(style.key)
             assert (len(repaints),len(detail_repaints),len(signals))==counts
         controller.set_highlight_style('scan')
-        assert choice.currentData()=='scan'
+        assert controller.toolbar.view.state['highlightStyle']=='scan'
         for value in (None,'unknown',42,[]):
             controller.set_highlight_style(value)
-            assert controller.highlight_style is HighlightStyle.RIBBON and choice.currentData()=='ribbon'
+            assert controller.highlight_style is HighlightStyle.RIBBON and controller.toolbar.view.state['highlightStyle']=='ribbon'
             assert window.settings.value('overlay/highlightStyle')=='ribbon'
         assert model.selected_id==selected and model.graph_pinned and model.expanded_groups==expanded
         assert model.row_glows.active==effects and model.data is changed
@@ -249,6 +246,22 @@ def test_overlay_highlight_style_normalizes_missing_and_invalid_stored_values(st
         controller=OverlayController(window.settings,native_enabled=False)
         try:assert controller.highlight_style is HighlightStyle.RIBBON
         finally:controller.stop()
+
+
+@pytest.mark.integration
+def test_overlay_legacy_bracket_preference_loads_as_soft_pulse(startup_settings_window):
+    from cachemonitor.overlay import OverlayController
+    from cachemonitor.overlay_view import HighlightStyle
+    window,_=startup_settings_window
+    window.settings.setValue('overlay/highlightStyle','bracket')
+    controller=OverlayController(window.settings,native_enabled=False)
+    try:
+        assert controller.highlight_style is HighlightStyle.PULSE
+        assert controller.toolbar.view.state['highlightStyle']=='pulse'
+        controller.set_highlight_style('bracket')
+        assert controller.highlight_style is HighlightStyle.PULSE
+        assert window.settings.value('overlay/highlightStyle')=='pulse'
+    finally:controller.stop()
 
 
 @pytest.mark.integration

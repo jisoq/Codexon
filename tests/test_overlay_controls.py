@@ -211,10 +211,14 @@ def test_embedded_subagent_interaction_keeps_gear_and_settings_reachable(native_
     assert not c.collapsed and c.detail.isVisible()
 
 @pytest.mark.skipif(sys.platform!='win32',reason='Native Windows popup geometry')
-def test_popup_controls_fit_native_viewport_and_remain_clickable(native_detail,tmp_path):
+@pytest.mark.parametrize('locale',['ko','en'])
+def test_popup_controls_fit_native_viewport_and_remain_clickable(native_detail,tmp_path,locale,request):
     from PySide6.QtCore import QPointF
     from cachemonitor.overlay_chrome import named_item
     from tests.test_ui import wait_for_rendered
+    from cachemonitor.i18n import set_language,language
+    original=language();set_language(locale)
+    request.addfinalizer(lambda:set_language(original))
     c,host,refresh=native_detail
     host.resize(420,900);refresh()
     def item(name):
@@ -227,7 +231,7 @@ def test_popup_controls_fit_native_viewport_and_remain_clickable(native_detail,t
         assert bottom.x()<=c.toolbar.quick.width()+1 and bottom.y()<=c.toolbar.quick.height()+1, name
         return control
     c.toggle_settings();refresh()
-    for name in ('chartStyle-bar','chartStyle-filled-line',*(f'agentCount-{n}' for n in range(1,5))):item(name)
+    for name in ('chartStyle-bar','chartStyle-filled-line','highlightStyle','highlightPreview',*(f'agentCount-{n}' for n in range(1,5))):item(name)
     click(c.toolbar,item('chartStyle-filled-line'))
     wait_for_rendered(lambda:c.chart_style=='filled-line')
     click(c.toolbar,item('agentCount-4'))
@@ -350,3 +354,147 @@ def test_refresh_freshness_uses_activity_label_native_hit_region(native_detail, 
         assert accessible is not None and detail in accessible.text(QAccessible.Description)
         assert not c.links.qml_errors and not c.widget.qml_errors
         tip.setProperty('visible',False)
+
+
+@pytest.mark.skipif(sys.platform!='win32',reason='Native Windows dropdown input')
+def test_highlight_choice_retains_settings_with_native_popup_foreground(native_detail,monkeypatch):
+    import ctypes
+    import time
+    from ctypes import wintypes as W
+    from types import SimpleNamespace
+    from PySide6.QtCore import QPointF
+    from cachemonitor.overlay_chrome import named_item
+    from cachemonitor.overlay_icons import agent_palette
+    from cachemonitor.overlay_view import HighlightStyle
+    from tests.test_ui import wait_for_rendered
+    c,host,refresh=native_detail;host.resize(420,900);refresh()
+    native=c.native
+    state=SimpleNamespace(foreground=int(host.winId()),pressed=False,position=(0,0))
+    monkeypatch.delattr(native,'visible_target')
+    monkeypatch.delattr(native,'primary_down')
+    monkeypatch.setattr(native.u,'GetForegroundWindow',lambda:state.foreground)
+    monkeypatch.setattr(native.u,'GetAsyncKeyState',lambda key:0x8000 if state.pressed else 0)
+    def cursor(point):
+        position=ctypes.cast(point,ctypes.POINTER(W.POINT)).contents
+        position.x,position.y=state.position
+        return True
+    monkeypatch.setattr(native.u,'GetCursorPos',cursor)
+    c.toggle_settings();refresh()
+    state.foreground=int(c.toolbar.winId())
+    choice=named_item(c.toolbar.quick.rootObject(),'highlightStyle')
+    def popup():
+        return next((window for window in QApplication.topLevelWindows() if window.isVisible()
+                     and window.transientParent() is c.toolbar.quick.quickWindow()),None)
+    click(c.toolbar,choice)
+    wait_for_rendered(lambda:popup() is not None)
+    window=popup();option=named_item(window.contentItem(),'highlightStyle-trail')
+    wait_for_rendered(lambda:option is not None and option.isVisible())
+    point=option.mapToScene(QPointF(option.width()/2,option.height()/2)).toPoint()
+    left,top,right,bottom=native.frame(int(window.winId()))
+    factor=(right-left)/window.width()
+    state.position=(left+round(point.x()*factor),top+round(point.y()*factor))
+    x,y,w,h=c.popup_geometry
+    assert not (x<=state.position[0]<x+w and y<=state.position[1]<y+h)
+    state.foreground=int(window.winId());state.pressed=True
+    QTest.mousePress(window,Qt.LeftButton,pos=point)
+    c.poll_popup()
+    assert c.popup_open and c.toolbar.isVisible(), (
+        f'Settings closed during option press with foreground={state.foreground}, '
+        f'popup_owner={native.owner(state.foreground)}, toolbar={int(c.toolbar.winId())}')
+    QTest.mouseRelease(window,Qt.LeftButton,pos=point)
+    state.foreground=int(c.toolbar.winId());state.pressed=False
+    c.poll_popup()
+    wait_for_rendered(lambda:c.highlight_style is HighlightStyle.TRAIL and popup() is None)
+    preview=c.toolbar.view.highlightPreview
+    observed=[]
+    def completed():
+        assert c.popup_open and c.toolbar.isVisible()
+        if preview.glow is None:return True
+        if preview.color not in observed and preview.glow.progress(time.monotonic()*1000)>=.15:
+            observed.append(preview.color)
+        return False
+    wait_for_rendered(completed,timeout=4)
+    assert observed==list(agent_palette(c.appearance)[:3])
+    click(c.toolbar,choice)
+    wait_for_rendered(lambda:popup() is not None)
+    window=popup();state.foreground=int(window.winId())
+    QTest.keyClick(window,Qt.Key_Escape)
+    state.foreground=int(c.toolbar.winId())
+    wait_for_rendered(lambda:popup() is None)
+    assert c.popup_open and c.toolbar.isVisible()
+    QTest.keyClick(c.toolbar.quick,Qt.Key_Escape)
+    assert not c.popup_open and not c.toolbar.isVisible()
+    c.toggle_settings();refresh()
+    state.position=(0,0);state.foreground=int(host.winId());state.pressed=True
+    c.poll_popup()
+    assert not c.popup_open and not c.toolbar.isVisible()
+
+
+@pytest.mark.skipif(sys.platform!='win32',reason='Native Windows dropdown input')
+def test_highlight_dropdown_autoplays_three_icon_colors_without_changing_live_rows(native_detail,tmp_path):
+    import time
+    from PySide6.QtCore import QPointF
+    from cachemonitor.overlay_chrome import named_item
+    from cachemonitor.overlay_icons import agent_palette
+    from cachemonitor.overlay_view import HighlightStyle
+    from tests.test_ui import wait_for_rendered
+    c,host,refresh=native_detail;host.resize(420,900);refresh()
+    m=c.widget.content_model
+    m.pin_call(m.call_id(m.rows()[0]));m.toggle_detail_group(m.detail_groups()[0]['key'])
+    m.detailBody.setScrollOffset(10)
+    c.toggle_settings();refresh()
+    selected=m.selected_id;expanded=set(m.expanded_groups);data=m.data;offset=m.detailBody.scroll_offset
+    preview=c.toolbar.view.highlightPreview
+    assert preview.glow is not None and preview.timer.isActive()
+    choice=named_item(c.toolbar.quick.rootObject(),'highlightStyle')
+    def popup():
+        return next((w for w in QApplication.topLevelWindows() if w.isVisible()
+                     and w.transientParent() is c.toolbar.quick.quickWindow()),None)
+    for style in reversed(list(HighlightStyle)):
+        click(c.toolbar,choice)
+        wait_for_rendered(lambda:popup() is not None)
+        window=popup();option=named_item(window.contentItem(),'highlightStyle-'+style.key)
+        wait_for_rendered(lambda:option is not None and option.isVisible())
+        point=option.mapToScene(QPointF(option.width()/2,option.height()/2)).toPoint()
+        left,top,right,bottom=c.native.frame(int(window.winId()))
+        factor=(right-left)/window.width()
+        native_point=(left+round(point.x()*factor),top+round(point.y()*factor))
+        if style is HighlightStyle.TRAIL:
+            x,y,w,h=c.popup_geometry
+            assert not (x<=native_point[0]<x+w and y<=native_point[1]<y+h)
+            assert c.toolbar.grab().save(str(tmp_path/'dropdown-toolbar.png'))
+            assert window.grabWindow().save(str(tmp_path/'dropdown-options.png'))
+        effects=dict(m.row_glows.active)
+        c.native.primary_down=lambda:True;c.native.cursor=lambda:native_point
+        QTest.mousePress(window,Qt.LeftButton,pos=point)
+        c.poll_popup()
+        assert c.popup_open and c.toolbar.isVisible()
+        QTest.mouseRelease(window,Qt.LeftButton,pos=point)
+        c.native.primary_down=lambda:False;c.poll_popup()
+        wait_for_rendered(lambda:c.highlight_style is style and popup() is None)
+        assert c.settings.value('overlay/highlightStyle')==style.key
+        assert preview.glow is not None and preview.timer.isActive()
+        assert m.selected_id==selected and m.graph_pinned and m.expanded_groups==expanded
+        assert m.data is data and m.detailBody.scroll_offset==offset and m.row_glows.active==effects
+    choice.forceActiveFocus(Qt.TabFocusReason)
+    QTest.keyClick(c.toolbar.quick,Qt.Key_Space)
+    wait_for_rendered(lambda:popup() is not None)
+    QTest.keyClick(c.toolbar.quick,Qt.Key_End);QTest.keyClick(c.toolbar.quick,Qt.Key_Return)
+    wait_for_rendered(lambda:c.highlight_style is HighlightStyle.TRAIL and popup() is None)
+    colors=agent_palette(c.appearance)[:3];observed=[]
+    def completed():
+        if preview.glow is None:return True
+        if preview.color not in observed and preview.glow.progress(time.monotonic()*1000)>=.15:
+            observed.append(preview.color)
+            assert c.toolbar.grab().save(str(tmp_path/f'preview-{len(observed)}.png'))
+        return False
+    wait_for_rendered(completed,timeout=4)
+    assert observed==list(colors) and not preview.timer.isActive()
+    c.choose_highlight_style(HighlightStyle.SCAN.key)
+    assert preview.glow is not None and preview.timer.isActive()
+    c.toggle_opacity();refresh()
+    preview.advance();assert preview.glow is None and not preview.timer.isActive()
+    c.toggle_settings();refresh();assert preview.glow is not None
+    c.close_popup();preview.advance();assert preview.glow is None and not preview.timer.isActive()
+    c.toggle_settings();refresh();assert preview.glow is not None
+    c.toolbar.close();preview.advance();assert preview.glow is None and not preview.timer.isActive()

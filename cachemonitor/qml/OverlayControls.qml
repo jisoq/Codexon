@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Controls
+import CacheMonitor 6.0
 
 Rectangle {
     id: root
@@ -187,81 +188,165 @@ Rectangle {
             horizontalAlignment: Text.AlignRight; verticalAlignment: Text.AlignVCenter
         }
     }
+    component SettingButton: Button {
+        id: button
+        width: implicitContentWidth + 16 * root.popupScale
+        height: 26 * root.popupScale
+        padding: 0; hoverEnabled: true
+        onPressed: { root.presentation.startInteraction(); forceActiveFocus(Qt.MouseFocusReason); }
+        background: Rectangle {
+            radius: 5 * root.popupScale
+            color: button.checked ? root.s.accent : root.s.ink
+            opacity: button.down ? .26 : button.hovered ? (button.checked ? .26 : .12) : button.checked ? .2 : .06
+            border.width: button.visualFocus ? 2 * root.popupScale : 0
+            border.color: root.s.accent
+        }
+        contentItem: Text {
+            text: button.text; color: root.s.ink
+            font.family: root.s.family; font.pixelSize: 11 * root.popupScale
+            verticalAlignment: Text.AlignVCenter; horizontalAlignment: Text.AlignHCenter
+        }
+        Accessible.name: text
+        Accessible.checked: checked
+    }
     Item {
         anchors.fill: parent
         visible: root.s.chromeKind === "toolbar" && root.s.popupKind === "settings"
         Text {
             x: 12 * root.popupScale; y: 10 * root.popupScale
+            height: 26 * root.popupScale
             text: appLanguage.text("차트 표시 방식")
             color: root.s.ink; font.family: root.s.family; font.pixelSize: 11 * root.popupScale
+            verticalAlignment: Text.AlignVCenter
         }
         Row {
-            x: 12 * root.popupScale; y: 31 * root.popupScale
-            spacing: 8 * root.popupScale
+            x: 108 * root.popupScale; y: 10 * root.popupScale
+            spacing: 4 * root.popupScale
             Repeater {
                 model: [{ key: "bar", label: "막대" }, { key: "filled-line", label: "채움 선형" }]
-                delegate: Button {
-                    id: styleButton
+                delegate: SettingButton {
                     required property var modelData
                     objectName: "chartStyle-" + modelData.key
-                    width: 114 * root.popupScale; height: 28 * root.popupScale
                     checkable: true; checked: root.s.chartStyle === modelData.key
-                    hoverEnabled: true
                     text: appLanguage.text(modelData.label)
-                    onPressed: root.presentation.startInteraction()
                     onClicked: root.presentation.setChartStyle(modelData.key)
-                    Accessible.name: text; Accessible.checked: checked
-                    background: Rectangle {
-                        radius: 5 * root.popupScale
-                        color: styleButton.checked ? root.s.accent : root.s.ink
-                        opacity: styleButton.down ? 0.26 : styleButton.hovered ? (styleButton.checked ? 0.26 : 0.12) : styleButton.checked ? 0.2 : 0.06
-                        border.width: styleButton.visualFocus ? 2 : 0; border.color: root.s.accent
-                    }
-                    contentItem: Text {
-                        text: styleButton.text; color: root.s.ink
-                        font.family: root.s.family; font.pixelSize: 11 * root.popupScale
-                        verticalAlignment: Text.AlignVCenter; horizontalAlignment: Text.AlignHCenter
-                    }
                 }
             }
         }
         Text {
-            x: 12 * root.popupScale; y: 76 * root.popupScale
+            x: 12 * root.popupScale; y: 42 * root.popupScale
+            height: 26 * root.popupScale
+            text: appLanguage.text("행 강조 방식")
+            color: root.s.ink; font.family: root.s.family; font.pixelSize: 11 * root.popupScale
+            verticalAlignment: Text.AlignVCenter
+        }
+        ComboBox {
+            id: highlightChoice
+            objectName: "highlightStyle"
+            x: 108 * root.popupScale; y: 42 * root.popupScale
+            width: 140 * root.popupScale; height: 26 * root.popupScale
+            model: (root.s.highlightStyles || []).map(entry => ({key: entry.key, label: appLanguage.text(entry.label)}))
+            textRole: "label"; valueRole: "key"
+            currentIndex: model.findIndex(entry => entry.key === root.s.highlightStyle)
+            leftPadding: 8 * root.popupScale; rightPadding: 22 * root.popupScale
+            font.family: root.s.family; font.pixelSize: 11 * root.popupScale
+            hoverEnabled: true
+            onPressedChanged: if (pressed) { root.presentation.startInteraction(); forceActiveFocus(Qt.MouseFocusReason); }
+            onActivated: root.presentation.setHighlightStyle(currentValue)
+            Accessible.name: appLanguage.text("행 강조 방식")
+            contentItem: Text {
+                text: highlightChoice.displayText; font: highlightChoice.font; color: root.s.ink
+                verticalAlignment: Text.AlignVCenter
+            }
+            indicator: Text {
+                x: parent.width - 18 * root.popupScale; height: parent.height
+                text: "⌄"; color: root.s.meta; font.pixelSize: 14 * root.popupScale
+                verticalAlignment: Text.AlignVCenter
+            }
+            background: Rectangle {
+                radius: 5 * root.popupScale; color: root.s.ink
+                opacity: highlightChoice.hovered ? .12 : .06
+                border.width: highlightChoice.visualFocus ? 2 * root.popupScale : 0
+                border.color: root.s.accent
+            }
+            delegate: ItemDelegate {
+                id: option
+                required property var modelData
+                required property int index
+                objectName: "highlightStyle-" + modelData.key
+                width: highlightChoice.popup.availableWidth; height: 28 * root.popupScale
+                highlighted: highlightChoice.highlightedIndex === index
+                Accessible.name: modelData.label
+                Accessible.checked: highlightChoice.currentIndex === index
+                contentItem: Text {
+                    text: option.modelData.label; font: highlightChoice.font; color: root.s.ink
+                    verticalAlignment: Text.AlignVCenter
+                }
+                background: Rectangle {
+                    radius: 4 * root.popupScale; color: root.s.accent
+                    opacity: option.highlighted ? .2 : highlightChoice.currentIndex === option.index ? .1 : 0
+                }
+            }
+            popup: Popup {
+                objectName: "highlightStylePopup"
+                popupType: Popup.Window
+                y: highlightChoice.height + 4 * root.popupScale
+                width: highlightChoice.width
+                implicitHeight: contentItem.implicitHeight + 8 * root.popupScale
+                padding: 4 * root.popupScale
+                contentItem: ListView {
+                    clip: true; implicitHeight: contentHeight
+                    model: highlightChoice.popup.visible ? highlightChoice.delegateModel : null
+                    currentIndex: highlightChoice.highlightedIndex
+                }
+                background: Rectangle {
+                    radius: 6 * root.popupScale; color: root.s.surface
+                    border.width: root.popupScale; border.color: root.s.border
+                }
+            }
+        }
+        Rectangle {
+            x: 12 * root.popupScale; y: 72 * root.popupScale
+            width: 236 * root.popupScale; height: 32 * root.popupScale
+            radius: 5 * root.popupScale; color: "transparent"
+            border.width: root.popupScale; border.color: root.s.border
+            QuickPlot {
+                objectName: "highlightPreview"
+                anchors.fill: parent
+                source: root.presentation.highlightPreview
+                activeFocusOnTab: false
+                Accessible.role: Accessible.Graphic
+                Accessible.name: appLanguage.text("행 강조 미리보기")
+            }
+            Text {
+                x: 10 * root.popupScale; anchors.verticalCenter: parent.verticalCenter
+                text: appLanguage.text("미리보기")
+                color: root.s.meta; font.family: root.s.family; font.pixelSize: 11 * root.popupScale
+            }
+        }
+        Text {
+            x: 12 * root.popupScale; y: 114 * root.popupScale
+            height: 26 * root.popupScale
             visible: root.s.canAdjustAgentCount || false
             text: appLanguage.text("서브에이전트 표시 개수")
             color: root.s.ink; font.family: root.s.family; font.pixelSize: 11 * root.popupScale
+            verticalAlignment: Text.AlignVCenter
         }
         Row {
-            x: 12 * root.popupScale; y: 98 * root.popupScale
+            x: 124 * root.popupScale; y: 114 * root.popupScale
             spacing: 4 * root.popupScale
             visible: root.s.canAdjustAgentCount || false
             Repeater {
                 model: [1, 2, 3, 4]
-                Button {
-                    id: countButton
+                delegate: SettingButton {
                     required property int modelData
                     objectName: "agentCount-" + modelData
-                    width: 56 * root.popupScale; height: 28 * root.popupScale
-                    checkable: true
-                    autoExclusive: true
-                    hoverEnabled: true
+                    width: 28 * root.popupScale
+                    checkable: true; autoExclusive: true
                     checked: (root.s.visibleAgentCount || 3) === modelData
                     text: String(modelData)
-                    onPressed: root.presentation.startInteraction()
                     onClicked: root.presentation.setAgentCount(modelData)
                     Accessible.name: appLanguage.text("서브에이전트 표시 개수") + " " + text
-                    Accessible.checked: checked
-                    background: Rectangle {
-                        radius: 5 * root.popupScale
-                        color: countButton.checked ? root.s.accent : root.s.ink
-                        opacity: countButton.down ? .26 : countButton.hovered ? (countButton.checked ? .26 : .12) : countButton.checked ? .2 : .06
-                        border.width: countButton.visualFocus ? 2 : 0; border.color: root.s.accent
-                    }
-                    contentItem: Text {
-                        text: countButton.text; color: root.s.ink
-                        font.family: root.s.family; font.pixelSize: 11 * root.popupScale
-                        verticalAlignment: Text.AlignVCenter; horizontalAlignment: Text.AlignHCenter
-                    }
                 }
             }
         }
