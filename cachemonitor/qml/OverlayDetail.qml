@@ -78,10 +78,11 @@ Rectangle {
                 onClicked: {
                     const key = modelData.id;
                     const reason = detailAction.focusReason;
+                    const actions = detailActions;
                     root.presentation.activateDetail(key);
                     Qt.callLater(() => {
-                        for (let i = 0; i < detailActions.count; i++) {
-                            const action = detailActions.itemAt(i);
+                        for (let i = 0; i < actions.count; i++) {
+                            const action = actions.itemAt(i);
                             if (action && action.modelData.id === key) { action.forceActiveFocus(reason); break; }
                         }
                     });
