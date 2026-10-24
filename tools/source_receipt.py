@@ -5,8 +5,9 @@ import os
 from pathlib import Path
 import platform
 import re
+import subprocess
 
-from tools.verify_changes import basic_tests
+from tools.verify_changes import basic_tests, tests_require_native
 
 POLICY = 'source-coverage-v4'
 INPUTS = ('requirements-release.lock', 'rust-toolchain.toml', 'native/Cargo.lock',
@@ -104,6 +105,18 @@ def basic_selection(scope, args, affected):
     return list(scope) == list(basic_tests()) and list(args) == ['--basic'] and not affected
 
 
+def basic_input_key(root, plan):
+    if plan['source_suite'] != 'basic':
+        return ''
+    if not basic_selection(plan['tests'], plan['source_args'], plan['affected_tests']) or plan['scales'] is not False:
+        raise ValueError('Basic source coverage must match the canonical audited selection')
+    tree = subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], cwd=root, text=True).strip()
+    inputs = dict(tree=tree, environment=environment_key(root), suite='basic', scope=list(plan['tests']),
+                  args=plan['source_args'], affected_tests=list(plan['affected_tests']), scales=False,
+                  backend='rust' if tests_require_native(plan['tests']) else 'auto')
+    return hashlib.sha256(json.dumps(inputs, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+
 def coverage_suite(args, affected=()):
     if '--basic' in args:
         return 'basic'
@@ -117,6 +130,8 @@ def coverage_suite(args, affected=()):
 
 
 def write_receipt(folder, plan, sha, run_id, root):
+    if plan.get('source_reuse_run'):
+        raise ValueError('Reused source coverage cannot be recorded as a new execution')
     environment = check_environment(plan, sha, root)
     affected = list(plan.get('affected_tests', ()))
     suite = coverage_suite(plan['source_args'], affected)
@@ -129,6 +144,10 @@ def write_receipt(folder, plan, sha, run_id, root):
                    base=plan['source_base'], comparison_base=plan.get('source_comparison_base', plan['source_base']),
                    scope=list(plan['tests']), args=plan['source_args'],
                    suite=suite, affected_tests=affected, scales=plan['scales'], complete=True)
+    if plan.get('source_key'):
+        if plan['source_key'] != basic_input_key(root, plan):
+            raise ValueError('Source input identity changed after planning')
+        receipt['input_key'] = plan['source_key']
     folder.mkdir(parents=True, exist_ok=True)
     text = json.dumps(receipt, indent=2)
     if len(text.encode('utf-8')) > 32768:
@@ -137,7 +156,7 @@ def write_receipt(folder, plan, sha, run_id, root):
     return receipt
 
 
-def valid(receipt, sha, run_id, root):
+def valid(receipt, sha, run_id, root, *, input_key=None):
     if not (isinstance(receipt, dict) and receipt.get('schema') == 2
             and receipt.get('policy') == POLICY and receipt.get('commit') == sha
             and receipt.get('run_id') == str(run_id)
@@ -149,5 +168,8 @@ def valid(receipt, sha, run_id, root):
                for items in (scope, args, affected)):
         return False
     if '--basic' in args and (not basic_selection(scope, args, affected) or receipt.get('scales') is not False):
+        return False
+    if input_key is not None and (receipt.get('input_key') != input_key or receipt.get('suite') != 'basic'
+                                  or not isinstance(sha, str) or not re.fullmatch(r'[0-9a-f]{40}', sha)):
         return False
     return receipt.get('suite') == coverage_suite(args, affected)

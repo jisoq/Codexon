@@ -42,42 +42,48 @@ def verification_passed(github, run_id):
     return any(j['name'] == 'verify' and j['conclusion'] == 'success' for j in jobs)
 
 
-def source_base(github, sha, root=ROOT, *, branch='main', current_run=''):
-    # A downstream failure or cancellation must not erase a completed source job.
-    runs = github.api(f'actions/workflows/windows.yml/runs?branch={quote(branch, safe="")}&per_page=100')['workflow_runs']
-    for run in sorted(runs, key=lambda r: r['id'], reverse=True):
-        base = run.get('head_sha', '')
-        if (str(run['id']) == str(current_run) or not re.fullmatch(r'[0-9a-f]{40}', base)
-                or not trusted_checks(run, base, github.repository, branch)):
-            continue
-        ancestry = subprocess.run(['git', 'merge-base', '--is-ancestor', base, sha], cwd=root, capture_output=True)
-        if ancestry.returncode in (1, 128):
-            continue
-        if ancestry.returncode:
-            raise RuntimeError('Cannot establish the source-verified ancestor')
-        policy = subprocess.run(['git', 'diff', '--quiet', base, sha, '--', *source_receipt.INPUTS], cwd=root, capture_output=True)
-        if policy.returncode == 1:
-            continue
-        if policy.returncode:
-            raise RuntimeError('Cannot compare source verification policies')
-        jobs = github.api(f'actions/runs/{run["id"]}/jobs')['jobs']
-        if not any(job['name'] == 'source' and job['conclusion'] == 'success' for job in jobs):
-            continue
-        name = f'source-verified-{base}'
-        artifacts = github.api(f'actions/runs/{run["id"]}/artifacts')['artifacts']
-        if not any(a['name'] == name and not a['expired'] and a.get('size_in_bytes', 65537) <= 65536 for a in artifacts):
-            continue
-        with tempfile.TemporaryDirectory(prefix='codexon-source-receipt-') as temporary:
-            github.command('run', 'download', str(run['id']), '--name', name, '--dir', temporary)
-            path = Path(temporary) / 'source-verification.json'
-            if not path.is_file() or path.stat().st_size > 32768:
+def reusable_source(github, key, root=ROOT):
+    name = f'source-verified-{key}'
+    try:
+        artifacts = github.api(f'actions/artifacts?name={name}&per_page=100')['artifacts']
+        for artifact in sorted(artifacts, key=lambda a: a['id'], reverse=True):
+            size = artifact.get('size_in_bytes')
+            if (artifact.get('name') != name or artifact.get('expired') is not False
+                    or type(size) is not int or not 0 < size <= 65536):
                 continue
-            try:
-                receipt = json.loads(path.read_text(encoding='utf-8'))
-            except (ValueError, UnicodeError):
+            run_id = (artifact.get('workflow_run') or {}).get('id')
+            if not re.fullmatch(r'[1-9][0-9]*', str(run_id)):
                 continue
-        if source_receipt.valid(receipt, base, run['id'], root) and receipt['suite'] != 'basic':
-            return base
+            run = github.api(f'actions/runs/{run_id}')
+            repository = run.get('repository') or {}
+            event = run.get('event')
+            if (str(run.get('id')) != str(run_id) or run.get('path') != WORKFLOW
+                    or repository.get('full_name') != github.repository
+                    or (run.get('head_repository') or {}).get('full_name') != github.repository
+                    or event not in ('push', 'workflow_dispatch', 'pull_request')):
+                continue
+            if event == 'pull_request':
+                pulls = run.get('pull_requests', [])
+                if not repository.get('id') or not pulls or any(
+                        (pull.get('head', {}).get('repo') or {}).get('id') != repository['id'] for pull in pulls):
+                    continue
+            jobs = github.api(f'actions/runs/{run_id}/jobs')['jobs']
+            if not any(job['name'] == 'source' and job['conclusion'] == 'success' for job in jobs):
+                continue
+            with tempfile.TemporaryDirectory(prefix='codexon-source-reuse-') as temporary:
+                github.command('run', 'download', str(run_id), '--name', name, '--dir', temporary)
+                path = Path(temporary) / 'source-verification.json'
+                if not path.is_file() or path.stat().st_size > 32768:
+                    continue
+                try:
+                    receipt = json.loads(path.read_text(encoding='utf-8'))
+                except (ValueError, UnicodeError):
+                    continue
+            sha = receipt.get('commit') if event == 'pull_request' and isinstance(receipt, dict) else run.get('head_sha')
+            if source_receipt.valid(receipt, sha, run_id, root, input_key=key):
+                return str(run_id)
+    except (RuntimeError, subprocess.CalledProcessError, OSError) as error:
+        print(f'Source result lookup unavailable. Running current checks. {error}', file=sys.stderr)
     return ''
 
 
@@ -123,7 +129,7 @@ def tag_commit(github, tag):
     return obj['sha']
 
 
-def plan(github, sha, current_run, event, ref, publish, root=ROOT, *, prepare=False, exercise_rerun=False, head_branch=''):
+def plan(github, sha, current_run, event, ref, publish, root=ROOT, *, prepare=False, exercise_rerun=False):
     if not re.fullmatch(r'[0-9a-f]{40}', sha):
         raise ValueError('Invalid release commit')
     branch = ref.removeprefix('refs/heads/') if event in ('push', 'workflow_dispatch') and ref.startswith('refs/heads/') else ''
@@ -151,22 +157,16 @@ def plan(github, sha, current_run, event, ref, publish, root=ROOT, *, prepare=Fa
     reuse = reusable_run(github, sha, current_run) if on_main and not published else ''
     if publish and not (reuse or published):
         raise ValueError('Prepare this exact commit with prepare=true before publishing; no verified installer is available')
-    source = deployment = ''
+    deployment = ''
     if branch and not (reuse or published):
-        source = source_base(github, sha, root, branch=branch, current_run=current_run)
         deployment = verified_base(github, sha, root, branch=branch)
         if branch != 'main':
-            source = source or source_base(github, sha, root, current_run=current_run)
             deployment = deployment or verified_base(github, sha, root)
-    elif event == 'pull_request' and head_branch:
-        # A branch dispatch's tested ancestor also covers a later PR merge tree.
-        # Fork jobs themselves never become trusted shared receipts.
-        source = source_base(github, sha, root, branch=head_branch, current_run=current_run)
     release_artifact = candidate or bool(on_main and has_notes and (existing is None or
                                         (existing == sha and release and release['draft'])))
     return dict(version=current, release_tag=tag, candidate=candidate, release_artifact=release_artifact, published=published,
                 reuse_run=reuse, verify=not (reuse or published),
-                source_base=source, base=deployment)
+                base=deployment)
 
 
 def candidate_inventory(folder):
@@ -333,7 +333,6 @@ def main():
     parser.add_argument('--publish', choices=('true', 'false'), default='false')
     parser.add_argument('--prepare', choices=('true', 'false'), default='false')
     parser.add_argument('--exercise-rerun', choices=('true', 'false'), default='false')
-    parser.add_argument('--head-branch', default=os.environ.get('GITHUB_HEAD_REF', ''))
     parser.add_argument('--verified-run')
     parser.add_argument('--folder', type=Path, default=ROOT/'artifacts/release')
     parser.add_argument('--product', type=Path)
@@ -342,7 +341,7 @@ def main():
     github = GitHub(args.repository)
     if args.action == 'plan':
         result = plan(github, args.sha, args.run_id, args.event, args.ref, args.publish == 'true',
-                      prepare=args.prepare == 'true', exercise_rerun=args.exercise_rerun == 'true', head_branch=args.head_branch)
+                      prepare=args.prepare == 'true', exercise_rerun=args.exercise_rerun == 'true')
         args.plan.parent.mkdir(parents=True, exist_ok=True)
         args.plan.with_name('release-plan.json').write_text(json.dumps(result), encoding='utf-8')
         if os.environ.get('GITHUB_OUTPUT'):

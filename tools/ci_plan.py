@@ -11,7 +11,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from tools.verify_changes import basic_tests, changed_files, file_hashes, release_version_only, select_tests, tests_require_native
 from tools.verify_release_tools import can_reuse
-from tools.source_receipt import coverage_suite, environment_key, runner_environment
+from tools.source_receipt import basic_input_key, coverage_suite, environment_key, runner_environment
+from tools.release_pipeline import reusable_source
+from tools.release_github import GitHub
 
 
 def select_qa_smokes(smokes, *, extended=False):
@@ -80,6 +82,10 @@ def main():
                 reuse_run=release.get('reuse_run', ''), published=release.get('published', False))
     if plan['unmapped']:
         raise ValueError('Unmapped changes: ' + ', '.join(plan['unmapped']))
+    plan['source_key'] = basic_input_key(ROOT, plan) if plan['verify'] else ''
+    repository = os.environ.get('GITHUB_REPOSITORY', '')
+    plan['source_reuse_run'] = reusable_source(GitHub(repository), plan['source_key'], ROOT) if repository and plan['source_key'] else ''
+    plan['rust'] = bool(plan['package'] or (not plan['source_reuse_run'] and tests_require_native(plan['tests'])))
     folder = ROOT/'artifacts/verification'
     folder.mkdir(parents=True, exist_ok=True)
     (folder/'plan.json').write_text(json.dumps(plan, indent=2, ensure_ascii=False), encoding='utf-8')
