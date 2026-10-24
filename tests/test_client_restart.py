@@ -577,7 +577,7 @@ Path(sys.argv[2]).write_text(json.dumps(confirm_native('en')))
 
 
 @pytest.mark.skipif(os.name!='nt',reason='Native desktop process handles')
-@pytest.mark.parametrize('close_behavior',['close','refuse','background'])
+@pytest.mark.parametrize('close_behavior',['close','refuse','background','windowless','mixed_visible'])
 def test_native_normal_close_uses_only_owned_exact_handles(tmp_path,monkeypatch,close_behavior):
     from cachemonitor.proxy_identity import process_identity
     helper=tmp_path/'window.py'
@@ -588,7 +588,9 @@ stop=Path(sys.argv[1]);ready=Path(sys.argv[2])
 def close():
     if sys.argv[3]=='background':root.withdraw()
     elif sys.argv[3]!='refuse':root.destroy()
+    ready.with_suffix('.closed').touch()
 root.protocol('WM_DELETE_WINDOW',close)
+if sys.argv[3]=='windowless':root.withdraw()
 def poll():
     if stop.exists():root.destroy()
     else:root.after(10,poll)
@@ -596,17 +598,26 @@ root.update();ready.write_text(json.dumps({'hwnd':root.winfo_id(),'pid':os.getpi
 ''',encoding='utf-8')
     owned=[]
     try:
-        for name in ('target','cli-surrogate'):
+        behaviors=[('target','refuse' if close_behavior=='mixed_visible' else close_behavior),('cli-surrogate','close')]
+        if close_behavior=='mixed_visible':behaviors.append(('hidden-sibling','windowless'))
+        for name,behavior in behaviors:
             ready=tmp_path/(name+'.json');stop=tmp_path/(name+'.stop')
-            worker=subprocess.Popen([sys.executable,str(helper),str(stop),str(ready),close_behavior])
+            worker=subprocess.Popen([sys.executable,str(helper),str(stop),str(ready),behavior])
             owned.append((worker,stop));settle(ready.exists)
         target=process_identity(json.loads((tmp_path/'target.json').read_text())['pid'])
         kernel=restart.desktop._process_api();session=W.DWORD()
         assert kernel.ProcessIdToSessionId(os.getpid(),C.byref(session))
         target.update(app_id=restart.desktop.CODEX_APP_ID,session=session.value)
-        if close_behavior=='refuse':
-            with pytest.raises(RuntimeError):restart.close_desktop([target],timeout=.3)
+        targets=[target]
+        if close_behavior=='mixed_visible':
+            sibling=process_identity(owned[2][0].pid)
+            sibling.update(app_id=restart.desktop.CODEX_APP_ID,session=session.value)
+            targets.append(sibling)
+        if close_behavior in ('refuse','mixed_visible'):
+            with pytest.raises(RuntimeError):restart.close_desktop(targets,timeout=.5)
             assert owned[0][0].poll() is None
+            assert (tmp_path/'target.closed').exists()
+            if close_behavior=='mixed_visible':assert owned[2][0].poll() is None
         else:
             try:
                 restart.close_desktop([target],timeout=4)
@@ -615,6 +626,7 @@ root.update();ready.write_text(json.dumps({'hwnd':root.winfo_id(),'pid':os.getpi
                     user=C.WinDLL('user32',use_last_error=True)
                     user.IsWindowVisible.argtypes=[W.HWND]
                     hwnd=json.loads((tmp_path/'target.json').read_text())['hwnd']
+                    assert (tmp_path/'target.closed').exists()
                     assert not user.IsWindowVisible(hwnd)
                     assert owned[1][0].poll() is None
             assert owned[0][0].wait(2) is not None
@@ -623,6 +635,37 @@ root.update();ready.write_text(json.dumps({'hwnd':root.winfo_id(),'pid':os.getpi
     finally:
         for worker,stop in owned:stop.touch()
         for worker,_ in owned:worker.wait(4)
+
+
+@pytest.mark.skipif(os.name!='nt',reason='Native desktop process handles')
+@pytest.mark.parametrize('failure',['wait_failed','termination_pending'])
+def test_native_close_requires_observed_process_exit(tmp_path,monkeypatch,failure):
+    from cachemonitor.proxy_identity import process_identity
+    ready=tmp_path/'background.ready'
+    worker=subprocess.Popen([sys.executable,'-c',
+        "import sys,tkinter as tk;from pathlib import Path;"
+        "root=tk.Tk();root.withdraw();root.update();Path(sys.argv[1]).touch();sys.stdin.read()",str(ready)],
+        stdin=subprocess.PIPE,text=True)
+    try:
+        settle(ready.exists)
+        kernel=restart.desktop._process_api();session=W.DWORD()
+        kernel.WaitForSingleObject.argtypes=[W.HANDLE,W.DWORD]
+        kernel.WaitForSingleObject.restype=W.DWORD
+        assert kernel.ProcessIdToSessionId(os.getpid(),C.byref(session))
+        target=process_identity(worker.pid)
+        target.update(app_id=restart.desktop.CODEX_APP_ID,session=session.value)
+        api=SimpleNamespace(**{name:getattr(kernel,name) for name in (
+            'ProcessIdToSessionId','OpenProcess','CloseHandle','WaitForSingleObject','TerminateProcess')})
+        if failure=='wait_failed':
+            def failed_wait(handle,timeout):return kernel.WaitForSingleObject(None,timeout)
+            api.WaitForSingleObject=failed_wait
+        else:api.TerminateProcess=lambda handle,code:True
+        monkeypatch.setattr(restart.desktop,'_process_api',lambda:api)
+        with pytest.raises(OSError if failure=='wait_failed' else RuntimeError):
+            restart.close_desktop([target],timeout=.5)
+        assert worker.poll() is None
+    finally:
+        worker.communicate('',timeout=4)
 
 
 @pytest.mark.parametrize('language', ['ko','en'])
