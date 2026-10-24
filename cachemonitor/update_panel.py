@@ -123,7 +123,7 @@ class UpdatePanel(Group):
         self._exit_pending=bool(pending)
         if not pending:
             self.button.setEnabled(not self.operation and not self.metadata_pending)
-            self.execute.setEnabled(not self.operation)
+            self.execute.setEnabled(not self.operation and not self.metadata_pending)
             self.recheck.setEnabled(not self.operation)
         self.refresh()
 
@@ -140,10 +140,11 @@ class UpdatePanel(Group):
         self.reload_record(force=True)
         if self.busy() or self.closing():return
         self._check_operation_id=self.record.get('operation_id')
-        self.offer=None;self.discovered_offer=None;self.checking=True;self.operation_error=False
+        self.checking=True;self.operation_error=False
+        self.render_offer()
         self.status.setText('업데이트 확인 중…');self.heading.setText('업데이트')
         self.status.show()
-        self.version.hide();self.execute.hide();self.components.hide();self.button.setEnabled(False)
+        self.execute.setEnabled(False);self.components.hide();self.button.setEnabled(False)
         if self.monitor:
             self.metadata_pending=True;self.monitor.check_manually()
         else:self.launch_operation(None)
@@ -186,10 +187,16 @@ class UpdatePanel(Group):
     def receive_result(self,result):
         if self._stopped:return
         if isinstance(result,Exception):
+            from .update_state import ACTIVE
             self.reload_record(force=True)
-            self.auto_start=False;self.operation_error=True;self.offer=None
+            preserve=(self.checking and not self.auto_start and self.offer and self.offer.get('kind') in ('app','proxy')
+                      and self._offer_operation_id==self.record.get('operation_id') and self.record.get('phase') not in ACTIVE)
+            self.auto_start=False;self.operation_error=True
+            if preserve:self.render_offer()
+            else:
+                self.offer=None;self.execute.hide();self.version.hide();self.components.hide();self.button.show()
             self.status.setText(failure_message(result,self.checking));self.status.setToolTip(str(result));self.status.put(color=self.status_color(True))
-            self.execute.hide();self.version.hide();self.components.hide();self.button.show()
+            self.status.show()
             self.fault_changed.emit(dict(checking_failed=bool(self.checking),
                 phase=None if self.checking else 'failed',operation_error=not self.checking,
                 app=dict(self.record.get('app',{}))))
@@ -264,7 +271,7 @@ class UpdatePanel(Group):
         plan=self.offer or {};available=plan.get('kind') in ('app','proxy')
         self.status.setToolTip('')
         self.heading.setText('새 버전' if plan.get('kind')=='app' else '업데이트')
-        self.button.setVisible(not available);self.execute.setVisible(available);self.execute.setText('업데이트 시작')
+        self.button.show();self.execute.setVisible(available);self.execute.setText('업데이트 시작')
         self.version.setVisible(plan.get('kind')=='app')
         version=plan.get('release',{}).get('tag_name','').lstrip('v')
         self.version.setText(version);self.version.setToolTip(tr('변경 내역')+' '+version)

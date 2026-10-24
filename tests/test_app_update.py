@@ -280,7 +280,7 @@ def test_hidden_update_panel_recovers_after_owner_exit_without_journal_change(tm
         panel.deleteLater();app.processEvents()
 
 
-@pytest.mark.parametrize('previous_kind',[None,'none','app'])
+@pytest.mark.parametrize('previous_kind',[None,'none','app','proxy'])
 def test_failed_update_recheck_labels_previous_result_and_recovers(monkeypatch,previous_kind):
     from urllib.error import URLError
     from PySide6.QtWidgets import QApplication
@@ -294,15 +294,18 @@ def test_failed_update_recheck_labels_previous_result_and_recovers(monkeypatch,p
             if panel.operation is None:return
         raise AssertionError('Update check did not finish')
     try:
+        previous=dict(kind=previous_kind,release=release('v2099.01.01.1'),reason='프록시 사용 안 함')
         if previous_kind:
-            panel.pending_plan=dict(kind=previous_kind,reason='프록시 사용 안 함')
+            panel.pending_plan=previous
             panel.finished()
         def fail(*args):raise URLError(TimeoutError('synthetic timeout'))
         monkeypatch.setattr(app_update,'check_update',fail)
         panel.start();settle()
         assert '응답이 늦어지고 있습니다' in panel.status.text()
         assert 'synthetic timeout' not in panel.status.text()
-        assert not panel.execute.isVisible() and panel.offer is None
+        available=previous_kind in ('app','proxy')
+        assert panel.execute.isVisible()==available and panel.execute.isEnabled()
+        assert panel.offer is previous if available else panel.offer is None
         panel.proxy_status({'update':{'phase':'complete','message':'이전 업데이트 완료'}})
         assert '응답이 늦어지고 있습니다' in panel.status.text()
         monkeypatch.setattr(app_update,'check_update',lambda *args:dict(kind='none',reason='프록시 사용 안 함'))
@@ -345,7 +348,7 @@ def test_explicit_start_is_single_flight_and_check_remains_read_only(tmp_path,mo
         raise AssertionError('Update operation did not reach the expected state')
     try:
         panel.start();settle()
-        assert not calls and panel.execute.isVisible() and not panel.button.isVisible()
+        assert not calls and panel.execute.isVisible() and panel.button.isVisible()
         if closing:panel.owner=SimpleNamespace(_closing=True)
         panel.request_install();panel.request_install();panel.start()
         if closing:assert panel.operation is None
