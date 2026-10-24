@@ -98,6 +98,42 @@ def native_detail(tmp_path):
     finally:c.stop();host.close();app.processEvents()
 
 
+@pytest.mark.skipif(sys.platform!='win32',reason='Native Windows disclosure input')
+@pytest.mark.parametrize('activation',['mouse','keyboard'])
+def test_subagent_disclosure_retains_keyboard_target_without_qml_errors(native_detail,activation):
+    from cachemonitor.overlay_chrome import named_item
+    from tests.test_ui import wait_for_rendered
+    c,host,refresh=native_detail
+    host.resize(420,1200);refresh()
+    key=c.widget.content_model.detail_groups()[0]['key']
+    root=c.detail.quick.rootObject()
+    def group():return named_item(root,'detailAction-group-'+key)
+    scroll=named_item(root,'detailScroll')
+    wait_for_rendered(lambda:group() is not None and group().isVisible() and group().width()>0)
+    assert not group().property('checked')
+    closed_height=scroll.property('contentHeight')
+    if activation=='keyboard':
+        c.detail.begin_interaction()
+        group().forceActiveFocus(Qt.TabFocusReason)
+        wait_for_rendered(lambda:group().hasActiveFocus())
+    for expanded in (True,False):
+        if activation=='mouse':click(c.detail,group())
+        else:QTest.keyClick(c.detail.quick,Qt.Key_Space)
+        wait_for_rendered(lambda:group() is not None and group().property('checked') is expanded
+                          and group().hasActiveFocus()
+                          and c.detail.quick.quickWindow().activeFocusItem() is group())
+        if expanded:assert scroll.property('contentHeight')>closed_height
+        else:assert scroll.property('contentHeight')==closed_height
+        assert group().hasActiveFocus(), c.detail.qml_errors
+        assert c.detail.quick.quickWindow().activeFocusItem() is group()
+        assert not c.detail.qml_errors
+        assert not c.detail.quick.grabFramebuffer().isNull()
+    QTest.keyClick(c.detail.quick,Qt.Key_Space)
+    wait_for_rendered(lambda:group().property('checked') and group().hasActiveFocus()
+                      and c.detail.quick.quickWindow().activeFocusItem() is group())
+    assert group().hasActiveFocus() and not c.detail.qml_errors
+
+
 @pytest.mark.skipif(sys.platform!='win32',reason='Native Windows hit testing')
 def test_subagent_disclosure_resizes_native_panel_and_scrolls_at_frame_limit(native_detail):
     from cachemonitor.overlay_chrome import named_item
