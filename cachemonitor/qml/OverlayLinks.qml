@@ -52,7 +52,7 @@ Item {
                 opacity: pointer.pressed ? 0.20 : pointer.containsMouse ? 0.12 : 0
                 visible: link.infoIcon
             }
-            Text {
+            UiText {
                 anchors.fill: parent
                 visible: link.infoIcon
                 text: "ⓘ"

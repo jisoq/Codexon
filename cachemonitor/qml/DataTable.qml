@@ -65,7 +65,7 @@ Item {
         Rectangle {
             required property var display; required property int column; implicitWidth: 150; implicitHeight: 40
             color: (appTheme.palette && appTheme.color("secondary"))
-            Text { id: headerLabel; objectName: "table-header-label"; property int textAlignment: horizontalAlignment; anchors.fill: parent; anchors.topMargin: 9; anchors.bottomMargin: 9; anchors.leftMargin: root.hierarchical && column===0 ? 50 : root.cellPadding; anchors.rightMargin: root.cellPadding; text: appLanguage.text(display); elide: Text.ElideRight; horizontalAlignment: root.readableColumns ? root.columnAlignment(column) : Text.AlignLeft; verticalAlignment: Text.AlignVCenter; color: (appTheme.palette && appTheme.color(root.readableColumns ? "ink" : "muted")); font.pixelSize: 14; font.weight: root.readableColumns ? Font.DemiBold : Font.Medium; font.family: appTheme.family }
+            UiText { id: headerLabel; objectName: "table-header-label"; property int textAlignment: horizontalAlignment; anchors.fill: parent; anchors.topMargin: 9; anchors.bottomMargin: 9; anchors.leftMargin: root.hierarchical && column===0 ? 50 : root.cellPadding; anchors.rightMargin: root.cellPadding; text: appLanguage.text(display); elide: Text.ElideRight; horizontalAlignment: root.readableColumns ? root.columnAlignment(column) : Text.AlignLeft; verticalAlignment: Text.AlignVCenter; color: (appTheme.palette && appTheme.color(root.readableColumns ? "ink" : "muted")); font.pixelSize: 14; font.weight: root.readableColumns ? Font.DemiBold : Font.Medium; font.family: appTheme.family }
             Rectangle { anchors.right: parent.right; width: 1; height: parent.height; visible: root.readableColumns; color: appTheme.palette.border }
             Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; visible: root.readableColumns; color: appTheme.palette.border }
             HoverHandler { id: headerHover }
@@ -179,7 +179,7 @@ Item {
             Rectangle { anchors.left: parent.left; anchors.right: parent.right; anchors.bottom: parent.bottom; height: 1; visible: !root.viewState.treeNavigation; color: (appTheme.palette && appTheme.color("border")) }
             Rectangle { visible: root.viewState.selected === row && column === 0; width: 2; height: parent.height; color: appTheme.palette.accent }
             Rectangle { objectName: "cell-data-bar"; visible: !!root.viewState.dataBars && cellBar >= 0; anchors.left: parent.left; anchors.leftMargin: 6; anchors.verticalCenter: parent.verticalCenter; width: Math.min(140,Math.max(0,parent.width-12))*Math.max(0,cellBar); height: 14; radius: 2; color: appTheme.palette.accent; opacity: .16 }
-            Text { id: cellLabel; objectName: "cell-label"; property int textAlignment: horizontalAlignment; anchors.fill: parent; anchors.leftMargin: root.hierarchical && column===0 ? 50+cell.depth*32 : root.cellPadding; anchors.rightMargin: root.cellPadding; text: cell.textRuns && cell.textRuns.length ? root.styledText(cell.textRuns) : verbatim ? display : appLanguage.text(display); textFormat: cell.textRuns && cell.textRuns.length ? Text.StyledText : Text.AutoText; wrapMode: !root.hierarchical && !exactValue && root.viewState.rowHeight > 40 ? Text.Wrap : Text.NoWrap; elide: exactValue ? Text.ElideNone : Text.ElideRight; horizontalAlignment: alignment & Qt.AlignRight ? Qt.AlignRight : Qt.AlignLeft; verticalAlignment: Text.AlignVCenter; font.pixelSize: 14; font.family: appTheme.family; font.features: { "tnum": 1 }; color: (appTheme.palette && appTheme.color("ink")) }
+            UiText { id: cellLabel; objectName: "cell-label"; property int textAlignment: horizontalAlignment; anchors.fill: parent; anchors.leftMargin: root.hierarchical && column===0 ? 50+cell.depth*32 : root.cellPadding; anchors.rightMargin: root.cellPadding; text: cell.textRuns && cell.textRuns.length ? root.styledText(cell.textRuns) : verbatim ? display : appLanguage.text(display); textFormat: cell.textRuns && cell.textRuns.length ? Text.StyledText : Text.AutoText; wrapMode: !root.hierarchical && !exactValue && root.viewState.rowHeight > 40 ? Text.Wrap : Text.NoWrap; elide: exactValue ? Text.ElideNone : Text.ElideRight; horizontalAlignment: alignment & Qt.AlignRight ? Qt.AlignRight : Qt.AlignLeft; verticalAlignment: Text.AlignVCenter; font.pixelSize: 14; font.family: appTheme.family; font.features: { "tnum": 1 }; color: (appTheme.palette && appTheme.color("ink")) }
             Rectangle { objectName: "unloaded-row"; visible: cell.placeholder; anchors.left: parent.left; anchors.leftMargin: root.cellPadding; anchors.verticalCenter: parent.verticalCenter; width: Math.max(0,Math.min(130,parent.width-2*root.cellPadding)); height: 8; radius: 4; color: appTheme.palette.border }
             Item {
                 visible: root.hierarchical && cell.column===0; anchors.fill: parent
@@ -274,7 +274,7 @@ Item {
         id: footer; objectName: "table-footer"; anchors.left: parent.left; anchors.right: parent.right; anchors.bottom: parent.bottom
         height: root.viewState.treeNavigation ? 0 : 30; visible: !root.viewState.treeNavigation; color: (appTheme.palette && appTheme.color("secondary"))
         Rectangle { anchors.top: parent.top; width: parent.width; height: 1; visible: !root.viewState.treeNavigation; color: (appTheme.palette && appTheme.color("border")) }
-        Text {
+        UiText {
             anchors.left: parent.left; anchors.leftMargin: 9; anchors.verticalCenter: parent.verticalCenter
             objectName: "table-footer-text"
             text: root.viewState.footerText !== undefined ? root.viewState.footerText : table.rows.toLocaleString(Qt.locale(), "f", 0) + appLanguage.text("개")
@@ -294,13 +294,13 @@ Item {
         objectName: "table-empty-state"
         anchors.centerIn: root.frozen ? root : table; visible: table.rows === 0
         width: Math.max(0, Math.min(480, (root.frozen ? root.width : table.width) - 32)); spacing: 12
-        Text {
+        UiText {
             objectName: "table-empty-title"
             Layout.fillWidth: true; horizontalAlignment: Text.AlignHCenter; wrapMode: Text.Wrap
             text: appLanguage.text(root.viewState.emptyText || "기록 없음")
             color: appTheme.palette.muted; font.family: appTheme.family; font.pixelSize: 14
         }
-        Text {
+        UiText {
             Layout.fillWidth: true; horizontalAlignment: Text.AlignHCenter; wrapMode: Text.Wrap
             visible: text.length > 0; text: appLanguage.text(root.viewState.emptyDescription || "")
             color: appTheme.palette.muted; font.family: appTheme.family; font.pixelSize: 13
@@ -321,7 +321,7 @@ Item {
         padding: 20; modal: true; focus: true
         background: Rectangle { color: (appTheme.palette && appTheme.color("surface")); radius: 8; border.color: (appTheme.palette && appTheme.color("border")) }
         contentItem: ColumnLayout {
-            Text { text: appLanguage.text("셀 상세"); font.family: appTheme.family; font.pixelSize: 18; font.bold: true; color: (appTheme.palette && appTheme.color("ink")) }
+            UiText { text: appLanguage.text("셀 상세"); font.family: appTheme.family; font.pixelSize: 18; font.bold: true; color: (appTheme.palette && appTheme.color("ink")) }
             ScrollView {
                 Layout.fillWidth: true; Layout.fillHeight: true; clip: true
                 contentWidth: availableWidth

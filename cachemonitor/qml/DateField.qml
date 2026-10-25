@@ -29,7 +29,7 @@ RowLayout {
                     implicitWidth:36;implicitHeight:32;radius:4
                     color:model.today ? appTheme.palette.secondary : "transparent"
                     Rectangle { anchors.fill:parent;radius:4;color:appTheme.palette.accent;opacity:dayHover.hovered ? .12 : 0 }
-                    Text { anchors.centerIn:parent;text:model.day;font.family:appTheme.family;color:model.month===grid.month ? appTheme.palette.ink : appTheme.palette.muted }
+                    UiText { anchors.centerIn:parent;text:model.day;font.family:appTheme.family;color:model.month===grid.month ? appTheme.palette.ink : appTheme.palette.muted }
                     HoverHandler { id:dayHover;cursorShape:Qt.PointingHandCursor }
                 }
                 onClicked: date => { root.node.edit(Qt.formatDate(date,"yyyy-MM-dd")); calendar.close() }

@@ -179,7 +179,7 @@ Rectangle {
                 }
             }
         }
-        Text {
+        UiText {
             x: 116 * root.popupScale; y: 8 * root.popupScale
             width: 32 * root.popupScale; height: 24 * root.popupScale
             text: (100 - root.s.opacity) + "%"
@@ -201,7 +201,7 @@ Rectangle {
             border.width: button.visualFocus ? 2 * root.popupScale : 0
             border.color: root.s.accent
         }
-        contentItem: Text {
+        contentItem: UiText {
             text: button.text; color: root.s.ink
             font.family: root.s.family; font.pixelSize: 11 * root.popupScale
             verticalAlignment: Text.AlignVCenter; horizontalAlignment: Text.AlignHCenter
@@ -212,7 +212,7 @@ Rectangle {
     Item {
         anchors.fill: parent
         visible: root.s.chromeKind === "toolbar" && root.s.popupKind === "settings"
-        Text {
+        UiText {
             x: 12 * root.popupScale; y: 10 * root.popupScale
             height: 26 * root.popupScale
             text: appLanguage.text("차트 표시 방식")
@@ -233,7 +233,7 @@ Rectangle {
                 }
             }
         }
-        Text {
+        UiText {
             x: 12 * root.popupScale; y: 42 * root.popupScale
             height: 26 * root.popupScale
             text: appLanguage.text("행 강조 방식")
@@ -254,11 +254,11 @@ Rectangle {
             onPressedChanged: if (pressed) { root.presentation.startInteraction(); forceActiveFocus(Qt.MouseFocusReason); }
             onActivated: root.presentation.setHighlightStyle(currentValue)
             Accessible.name: appLanguage.text("행 강조 방식")
-            contentItem: Text {
+            contentItem: UiText {
                 text: highlightChoice.displayText; font: highlightChoice.font; color: root.s.ink
                 verticalAlignment: Text.AlignVCenter
             }
-            indicator: Text {
+            indicator: UiText {
                 x: parent.width - 18 * root.popupScale; height: parent.height
                 text: "⌄"; color: root.s.meta; font.pixelSize: 14 * root.popupScale
                 verticalAlignment: Text.AlignVCenter
@@ -278,7 +278,7 @@ Rectangle {
                 highlighted: highlightChoice.highlightedIndex === index
                 Accessible.name: modelData.label
                 Accessible.checked: highlightChoice.currentIndex === index
-                contentItem: Text {
+                contentItem: UiText {
                     text: option.modelData.label; font: highlightChoice.font; color: root.s.ink
                     verticalAlignment: Text.AlignVCenter
                 }
@@ -319,13 +319,13 @@ Rectangle {
                 Accessible.role: Accessible.Graphic
                 Accessible.name: appLanguage.text("행 강조 미리보기")
             }
-            Text {
+            UiText {
                 x: 10 * root.popupScale; anchors.verticalCenter: parent.verticalCenter
                 text: appLanguage.text("미리보기")
                 color: root.s.meta; font.family: root.s.family; font.pixelSize: 11 * root.popupScale
             }
         }
-        Text {
+        UiText {
             x: 12 * root.popupScale; y: 114 * root.popupScale
             height: 26 * root.popupScale
             visible: root.s.canAdjustAgentCount || false

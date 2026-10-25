@@ -89,14 +89,14 @@ FocusScope {
             Rectangle { anchors.centerIn: parent; width: 2; height: 12; color: appTheme.palette.onaccent }
         }
     }
-    Text {
+    UiText {
         visible: root.height >= 56
         anchors.left: parent.left; anchors.leftMargin: 16; y: 37
         width: (parent.width - 32) / 2; text: root.s.oldestLabel || ""
         font.family: appTheme.family; font.pixelSize: 12; color: appTheme.palette.muted
         elide: Text.ElideRight
     }
-    Text {
+    UiText {
         visible: root.height >= 56
         anchors.right: parent.right; anchors.rightMargin: 16; y: 37
         width: (parent.width - 32) / 2; text: root.s.latestLabel || ""

@@ -33,7 +33,7 @@ Item {
         RowLayout {
             Layout.fillWidth: true
             spacing: 12
-            Text {
+            UiText {
                 text: appLanguage.text(root.s.title || "불러오는 중")
                 font.family: appTheme.family
                 font.pixelSize: root.compact ? 14 : 20
@@ -44,7 +44,7 @@ Item {
                 horizontalAlignment: root.compact ? Text.AlignLeft : Text.AlignHCenter
             }
         }
-        Text {
+        UiText {
             text: appLanguage.text(root.s.detail || "")
             font.family: appTheme.family
             font.pixelSize: 14
@@ -83,7 +83,7 @@ Item {
                 }
             }
         }
-        Text {
+        UiText {
             objectName: "loading-progress-detail"
             text: [root.s.progressText || "", root.s.elapsedText || ""].filter(function(v) { return v.length > 0 }).join(" / ")
             visible: text.length > 0
@@ -110,7 +110,7 @@ Item {
                         border.width: index === root.s.stage ? 1 : 0
                         border.color: appTheme.palette && appTheme.color("accent")
                         color: appTheme.palette && appTheme.color(index <= root.s.stage ? "hover" : "transparent")
-                        Text {
+                        UiText {
                             anchors.centerIn: parent
                             text: index < root.s.stage ? "✓" : String(index + 1)
                             font.family: appTheme.family
@@ -118,7 +118,7 @@ Item {
                             color: appTheme.palette && appTheme.color(index === root.s.stage ? "accent" : "muted")
                         }
                     }
-                    Text {
+                    UiText {
                         text: appLanguage.text(modelData)
                         font.family: appTheme.family
                         font.pixelSize: 13
@@ -130,7 +130,7 @@ Item {
                 }
             }
         }
-        Text {
+        UiText {
             visible: !root.terminal && (!root.compact || !!root.s.slow)
             text: appLanguage.text(root.s.slow ? "기록 처리에 시간이 걸리고 있습니다. 다른 탭을 이용할 수 있습니다." : "다른 탭을 이용할 수 있습니다.")
             wrapMode: Text.WordWrap

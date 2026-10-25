@@ -17,7 +17,7 @@ ColumnLayout {
         RowLayout {
             required property var modelData
             Layout.fillWidth: true; spacing: 18
-            Text {
+            UiText {
                 Layout.preferredWidth: Math.min(140, root.width * .32); Layout.alignment: Qt.AlignTop
                 text: appLanguage.text(modelData.label); wrapMode: Text.Wrap; textFormat: Text.PlainText
                 font.family: appTheme.family; font.pixelSize: 14; color: appTheme.palette && root.node.state.readableLabels ? appTheme.readableText("muted","surface") : appTheme.palette.muted
