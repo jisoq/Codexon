@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(SPECPATH).resolve()))
 from tools.build_native import checked_extension
+from tools.package_release import QT_QML_BUILD_SUFFIXES
 native_extension = checked_extension(Path(SPECPATH))
 if sys.platform == 'win32':
     os.environ['PATH'] = os.pathsep.join((str(Path(sys.executable).parent), sys.base_prefix,
@@ -62,7 +63,8 @@ blocked_qml = ('/qt3d/', '/qtcharts/', '/qtgraphs/', '/qtquick3d/',
 def keep_runtime(entry):
     name = entry[0].replace('\\', '/').lower()
     basename = name.rsplit('/', 1)[-1]
-    return not (basename.startswith(blocked_dlls) or any(mark in '/' + name for mark in blocked_qml))
+    return not (basename.startswith(blocked_dlls) or any(mark in '/' + name for mark in blocked_qml)
+                or (name.startswith('pyside6/qml/') and Path(name).suffix in QT_QML_BUILD_SUFFIXES))
 a.binaries = [entry for entry in a.binaries if keep_runtime(entry)]
 a.datas = [entry for entry in a.datas if keep_runtime(entry)]
 

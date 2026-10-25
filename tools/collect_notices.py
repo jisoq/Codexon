@@ -17,8 +17,10 @@ from pathlib import Path, PurePosixPath
 
 if __package__:
     from . import build_native
+    from .package_release import PYTHON_NOTICE_CODE_SUFFIXES
 else:
     import build_native
+    from package_release import PYTHON_NOTICE_CODE_SUFFIXES
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -249,6 +251,7 @@ def main(argv=None):
         dist = metadata.distribution(name)
         files = [item for item in (dist.files or [])
                  if any(part in str(item).lower() for part in ('license', 'copying', 'notice'))
+                 and Path(str(item)).suffix.lower() not in PYTHON_NOTICE_CODE_SUFFIXES
                  and dist.locate_file(item).is_file()]
         if not files:
             raise RuntimeError(f'No installed license file for {name}')

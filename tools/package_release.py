@@ -14,6 +14,8 @@ REQUIRED = {'Codexon.exe', 'CodexonRecovery.exe', 'build-manifest.json', 'LICENS
 MANIFEST_KEYS = {'product', 'version', 'commit', 'architecture', 'executable', 'sha256', 'recovery_sha256'}
 FORBIDDEN_NAMES = {'.env', 'config.toml', 'auth.json','codexonhook.exe'}
 FORBIDDEN_SUFFIXES = {'.db', '.sqlite', '.jsonl', '.log', '.ini', '.zip', '.sha256'}
+PYTHON_NOTICE_CODE_SUFFIXES = frozenset({'.py', '.pyc'})
+QT_QML_BUILD_SUFFIXES = frozenset({'.lib', '.prl'})
 PRIVATE_PATH = re.compile(rb'(?i)(?:[a-z]:\\(?:users|repos)\\|/users/[^/\r\n]+/|\\users\\[^\\\r\n]+\\)')
 
 
@@ -30,14 +32,22 @@ def payload(folder: Path):
         if path.is_symlink():
             raise ValueError(f'Symlink in distribution: {path}')
         rel = path.relative_to(folder).as_posix()
+        normalized = rel.lower()
+        suffix = path.suffix.lower()
+        if path.parent == folder and path.name not in REQUIRED | {'overlay-column-en.png', 'overlay-column-ko.png'}:
+            raise ValueError(f'Unexpected top-level distribution file: {rel}')
+        if ((normalized.startswith('licenses/python/') and suffix in PYTHON_NOTICE_CODE_SUFFIXES)
+                or (normalized.startswith('_internal/pyside6/qml/') and suffix in QT_QML_BUILD_SUFFIXES)):
+            raise ValueError(f'Unneeded code or build file in distribution: {rel}')
         if path.parent != folder and not rel.startswith(('_internal/', 'LICENSES/')):
             raise ValueError(f'Unexpected distribution path: {rel}')
-        if path.name.lower() in FORBIDDEN_NAMES or (path.suffix.lower() in FORBIDDEN_SUFFIXES
+        if path.name.lower() in FORBIDDEN_NAMES or (suffix in FORBIDDEN_SUFFIXES
                 and rel != '_internal/base_library.zip'):
             raise ValueError(f'Private or diagnostic file in distribution: {rel}')
-        if any(part.lower() in {'artifacts', 'screenshots', 'captures', '.codex'} for part in path.relative_to(folder).parts):
-            raise ValueError(f'Diagnostic directory in distribution: {rel}')
-        if path.suffix.lower() in {'.json', '.toml', '.txt', '.md', '.qml'} and path.stat().st_size < 5_000_000:
+        if any(part.startswith('.') or part.lower() in {'artifacts', 'screenshots', 'captures'}
+               for part in path.relative_to(folder).parts):
+            raise ValueError(f'Hidden or diagnostic path in distribution: {rel}')
+        if suffix in {'.json', '.toml', '.txt', '.md', '.qml'} and path.stat().st_size < 5_000_000:
             if PRIVATE_PATH.search(path.read_bytes()):
                 raise ValueError(f'Local absolute path in distribution: {rel}')
     manifest = json.loads((folder/'build-manifest.json').read_text(encoding='utf-8-sig'))
