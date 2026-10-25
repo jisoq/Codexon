@@ -13,6 +13,51 @@ from tools import build_native, collect_notices
 from tools.collect_notices import copy_rust_notices, rust_dependencies
 
 
+@pytest.mark.parametrize('with_documents', [True, False], ids=['license-documents', 'code-only'])
+def test_python_notice_collection_omits_code_and_requires_license_documents(tmp_path, monkeypatch, with_documents):
+    product = tmp_path/'product'
+    qt = product/'_internal/PySide6/Qt6Core.dll'
+    qt.parent.mkdir(parents=True)
+    qt.write_bytes(b'Qt runtime')
+    toc = tmp_path/'PYZ-00.toc'
+    toc.write_text(repr((None, [('packaging.licenses', None), ('setuptools', None)])), encoding='utf-8')
+    distributions = {}
+    expected = {}
+    for name in ('packaging', 'setuptools', 'PySide6', 'PySide6_Addons', 'PySide6_Essentials', 'shiboken6'):
+        documents = {'LICENSE': b'License terms\r\n'}
+        code = {}
+        if name in ('packaging', 'setuptools'):
+            prefix = 'packaging/licenses' if name == 'packaging' else 'setuptools/_vendor/packaging/licenses'
+            code = {f'{prefix}/{path}': b'Python code' for path in
+                    ('__init__.py', '_spdx.py', '__pycache__/__init__.cpython-312.pyc',
+                     '__pycache__/_spdx.cpython-312.PYC')}
+            documents = {'LICENSE': b'License terms\r\n', 'COPYING': b'Copying terms\n',
+                         'NOTICE': b'Notice\n', f'{name}-1.0.dist-info/licenses/Apache-2.0.txt': b'SPDX license\r\n',
+                         f'{prefix}/license.terms': b'Additional license terms\n'} if with_documents else {}
+        root = tmp_path/'installed'/name
+        files = {**documents, **code}
+        for path, content in files.items():
+            target = root/path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+        distributions[name] = SimpleNamespace(files=[Path(path) for path in files], version='1.0',
+            metadata={'License': 'Synthetic license'}, locate_file=lambda path, root=root: root/path)
+        expected.update({f'{name}/{path}': content for path, content in documents.items()})
+    monkeypatch.setattr(collect_notices.metadata, 'packages_distributions',
+                        lambda: {'packaging': ['packaging'], 'setuptools': ['setuptools']})
+    monkeypatch.setattr(collect_notices.metadata, 'distribution', distributions.__getitem__)
+    monkeypatch.setattr(collect_notices, 'collect_rust_notices', lambda *args, **kwargs: 0)
+    arguments = ['--toc', str(toc), '--product', str(product)]
+    if not with_documents:
+        with pytest.raises(RuntimeError, match='No installed license file for packaging'):
+            collect_notices.main(arguments)
+        return
+    collect_notices.main(arguments)
+    notices = product/'LICENSES/python'
+    assert {path.relative_to(notices).as_posix(): path.read_bytes()
+            for path in notices.rglob('*') if path.is_file()} == expected
+
+
 def rust_graph(root):
     packages = []
     for name, kind in [('app', 'cdylib'), ('runtime', 'lib'), ('macros', 'proc-macro'), ('helper', 'lib')]:

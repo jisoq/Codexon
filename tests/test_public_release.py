@@ -132,6 +132,33 @@ def test_public_payload_rejects_local_paths_and_unneeded_qt(tmp_path):
     native.write_bytes(b'synthetic native payload')
     assert payload(folder)[2] == manifest
     (internal/'base_library.zip').write_bytes(b'python standard library archive')
+    retained = ('overlay-column-en.png', 'overlay-column-ko.png',
+                'LICENSES/python/example/LICENSE', 'LICENSES/python/example/license.terms',
+                'LICENSES/python/example/dist-info/licenses/Apache-2.0.txt',
+                '_internal/certifi/cacert.pem', '_internal/PySide6/Qt6Core.dll',
+                '_internal/PySide6/qml/Qt/labs/assetdownloader/plugin.dll',
+                '_internal/PySide6/qml/Qt/labs/assetdownloader/qmldir',
+                '_internal/PySide6/qml/Qt/labs/assetdownloader/plugins.qmltypes',
+                '_internal/PySide6/qml/QtQuick/Main.qml', '_internal/other/runtime.lib',
+                '_internal/other/runtime.prl', '_internal/example/module.py',
+                '_internal/example/module.pyc')
+    for relative in retained:
+        target = folder/relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b'required redistribution content')
+    assert payload(folder)[2] == manifest
+    for relative in ('extra.txt', '_internal/assets/.env.production', '_internal/.serena/project.yml',
+                     'LICENSES/python/packaging/packaging/licenses/__init__.py',
+                     'LICENSES/python/setuptools/setuptools/_vendor/packaging/licenses/__pycache__/_spdx.cpython-312.PYC',
+                     '_internal/PySide6/qml/Qt/labs/assetdownloader/assetdownloader.lib',
+                     '_internal/PySide6/qml/Qt/labs/assetdownloader/assetdownloader.PRL'):
+        target = folder/relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b'unneeded build or executable file')
+        with pytest.raises(ValueError) as error:
+            payload(folder)
+        assert relative in str(error.value)
+        target.unlink()
     assert payload(folder)[2] == manifest
     (internal/'diagnostics.zip').write_bytes(b'not an app dependency')
     with pytest.raises(ValueError):payload(folder)
@@ -139,6 +166,6 @@ def test_public_payload_rejects_local_paths_and_unneeded_qt(tmp_path):
     file.write_text(json.dumps({**manifest,'source':r'C:\Users\developer\repo'}), encoding='utf-8')
     with pytest.raises(ValueError):payload(folder)
     file.write_text(json.dumps(manifest), encoding='utf-8')
-    dll = folder/'_internal'/'PySide6'/'Qt6Graphs.dll';dll.parent.mkdir(parents=True)
+    dll = folder/'_internal'/'PySide6'/'Qt6Graphs.dll'
     dll.write_bytes(b'not a redistributable module for this product')
     with pytest.raises(ValueError):payload(folder)

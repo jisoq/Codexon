@@ -49,6 +49,14 @@ def test_bundled_agent_icons_select_rendering_and_frozen_package_checks():
         assert not plan['full'] and not plan['unmapped']
 
 
+def test_public_payload_policy_selects_notice_and_frozen_runtime_consumers():
+    plan = select_tests({'tools/package_release.py'})
+    assert {'tests/test_collect_notices.py', 'tests/test_windows_startup.py',
+            'tests/test_graphics_recovery.py',
+            'tests/test_public_release.py::test_public_payload_rejects_local_paths_and_unneeded_qt'} <= set(plan['tests'])
+    assert plan['package_impact'] and not plan['full'] and not plan['unmapped']
+
+
 def test_settings_and_comparison_changes_keep_wiring_without_selecting_unrelated_workflows():
     settings=select_tests({'cachemonitor/settings_page.py'})
     assert 'tests/test_settings.py' in settings['tests']
