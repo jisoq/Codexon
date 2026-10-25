@@ -39,7 +39,7 @@ Rectangle {
         spacing: 5
         RowLayout {
             Layout.fillWidth: true
-            Text {
+            UiText {
                 text: card.detailData.title || ""
                 font.family: appTheme.family; font.pixelSize: 15; font.bold: true
                 color: appTheme.palette.ink; wrapMode: Text.Wrap
@@ -51,7 +51,7 @@ Rectangle {
                 text: "×"; font.pixelSize: 18
                 padding: 0
                 Layout.preferredWidth: 22; Layout.preferredHeight: 22
-                contentItem: Text {
+                contentItem: UiText {
                     text: "×"; font.pixelSize: 18; color: appTheme.palette.ink
                     horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter
                 }
@@ -90,13 +90,13 @@ Rectangle {
                             Layout.preferredHeight: 10
                             color: modelData.model ? (appTheme.palette && appTheme.color(modelData.swatch)) : "transparent"
                         }
-                        Text {
+                        UiText {
                             text: appLanguage.text(modelData.label)
                             font.family: appTheme.family; font.pixelSize: 13
                             color: modelData.model ? appTheme.palette.ink : (appTheme.palette && appTheme.readableText(modelData.color, "surface"))
                             wrapMode: Text.Wrap; Layout.fillWidth: true
                         }
-                        Text {
+                        UiText {
                             objectName: "quotaDetailValue"
                             text: modelData.value
                             font.family: appTheme.family; font.pixelSize: modelData.subordinate ? 13 : 15; font.bold: !modelData.subordinate
@@ -108,7 +108,7 @@ Rectangle {
                 }
             }
         }
-        Text {
+        UiText {
             text: appLanguage.text(card.detailData.note || "")
             visible: text.length > 0
             Layout.fillWidth: true

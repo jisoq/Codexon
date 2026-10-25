@@ -14,7 +14,7 @@ Item {
     Timer {interval:60000;repeat:true;running:root.visible && root.o.selected.length>0;onTriggered:root.now=Date.now()/1000}
     function t(text) { return appLanguage.text(text) }
     function selected(items,value) { for(let i=0;i<items.length;i++) if(items[i].value===value)return i;return 0 }
-    component Copy: Text {
+    component Copy: UiText {
         id: copyText
         property string tip: ""
         color: appTheme.palette.ink; font.family: appTheme.family; font.pixelSize: 14

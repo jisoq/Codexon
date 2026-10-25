@@ -19,7 +19,7 @@ ComboBox {
     implicitWidth: 180; implicitHeight: Math.max(36, selectedText.contentHeight + topPadding + bottomPadding)
     leftPadding: 10; rightPadding: 40; topPadding: 8; bottomPadding: 8
     font.family: appTheme.family; font.pixelSize: 14
-    contentItem: Text {
+    contentItem: UiText {
         id: selectedText
         text: control.displayText; font: control.font
         color: control.enabled ? (appTheme.palette && appTheme.color((control.selectedEntry && control.selectedEntry.ink) || "ink")) : (appTheme.palette && appTheme.color("unknown"))
@@ -56,7 +56,7 @@ ComboBox {
         implicitHeight: Math.max(36, contentItem.implicitHeight + topPadding + bottomPadding)
         leftPadding: 32; rightPadding: 10; topPadding: 8; bottomPadding: 8
         highlighted: control.highlightedIndex === index
-        contentItem: Text {
+        contentItem: UiText {
             text: modelData[control.textRole] || modelData
             font.family: control.font.family; font.pixelSize: control.font.pixelSize
             font.weight: option.selected ? Font.DemiBold : Font.Normal

@@ -144,3 +144,52 @@ host.release_scene();host.close()
         env=dict(os.environ, QT_QUICK_BACKEND='rhi', QSG_RHI_BACKEND='d3d11', QT_WIDGETS_RHI='1'),
         capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_software_text_keeps_first_glyph_edges():
+    code = r"""
+import time
+from pathlib import Path
+from PySide6.QtCore import QUrl
+from PySide6.QtQml import QQmlComponent
+from PySide6.QtQuickWidgets import QQuickWidget
+from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QApplication
+from cachemonitor.fonts import configure_font_rendering, configure_high_dpi, load_bundled_fonts
+from cachemonitor.graphics_recovery import use_software_renderer
+configure_font_rendering();configure_high_dpi();use_software_renderer()
+app=QApplication([]);load_bundled_fonts()
+host=QQuickWidget();host.resize(300,120)
+component=QQmlComponent(host.engine())
+component.setData('''import QtQuick
+Rectangle {
+    width: 300; height: 120; color: "white"
+    UiText { x: 20; y: 20; text: "69%"; font.family: "Pretendard JP"; font.pixelSize: 14; font.weight: Font.DemiBold }
+    UiText { x: 20; y: 60; text: "69%"; font.family: "Pretendard JP"; font.pixelSize: 14; font.weight: Font.DemiBold; leftPadding: 5; rightPadding: 5 }
+    UiText { x: 120; y: 20; text: "설정"; font.family: "Pretendard JP"; font.pixelSize: 14; font.bold: true }
+    UiText { x: 120; y: 60; text: "설정"; font.family: "Pretendard JP"; font.pixelSize: 14; font.bold: true; leftPadding: 5; rightPadding: 5 }
+}
+'''.encode('utf-8'), QUrl.fromLocalFile(str(Path('cachemonitor/qml/EdgeProbe.qml').resolve())))
+root=component.create()
+assert root is not None, component.errors()
+host.setContent(QUrl(),component,root);host.show()
+deadline=time.monotonic()+5
+while host.grabFramebuffer().isNull():
+    assert time.monotonic()<deadline
+    app.processEvents();QTest.qWait(10)
+app.processEvents()
+image=host.grabFramebuffer();ratio=image.devicePixelRatio()
+def ink(left,top):
+    pixels={(x,y) for y in range(round(top*ratio),round((top+32)*ratio))
+            for x in range(round(left*ratio),round((left+90)*ratio))
+            if image.pixelColor(x,y).lightness()<128}
+    assert pixels, (left,top)
+    x0=min(x for x,y in pixels);y0=min(y for x,y in pixels)
+    return {(x-x0,y-y0) for x,y in pixels}
+for left in (20,120):
+    assert ink(left,20)==ink(left,60), 'Text lost glyph pixels compared with an ample-padding reference'
+host.close()
+"""
+    result=subprocess.run([sys.executable,'-B','-c',code],cwd=Path(__file__).resolve().parents[1],
+                          capture_output=True,text=True,timeout=30)
+    assert result.returncode==0,result.stdout+result.stderr

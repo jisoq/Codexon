@@ -16,9 +16,9 @@ CheckBox {
         color: control.checked ? (appTheme.palette && appTheme.color("accent")) : (appTheme.palette && appTheme.color("surface"))
         border.color: control.activeFocus ? (appTheme.palette && appTheme.color("focus")) : control.checked ? (appTheme.palette && appTheme.color("accent")) : (appTheme.palette && appTheme.color("muted"))
         border.width: control.activeFocus ? 2 : 1
-        Text { anchors.centerIn: parent; text: "✓"; visible: control.checked; color: appTheme.palette.onaccent; font.pixelSize: 14 }
+        UiText { anchors.centerIn: parent; text: "✓"; visible: control.checked; color: appTheme.palette.onaccent; font.pixelSize: 14 }
     }
-    contentItem: Text {
+    contentItem: UiText {
         text: control.text; font: control.font; color: control.enabled ? (appTheme.palette && control.textColor) : (appTheme.palette && appTheme.color("unknown"))
         leftPadding: control.indicator.width + control.spacing
         verticalAlignment: Text.AlignVCenter

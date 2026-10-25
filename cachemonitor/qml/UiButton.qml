@@ -29,9 +29,9 @@ Button {
         implicitHeight: 20
         UiIcon { visible: control.iconName.length > 0; name: control.iconName; anchors.centerIn: parent; width:20;height:20; ink: control.contentInk }
         UiIcon { visible: !control.iconName.length && control.leadingIcon.length > 0; name: control.leadingIcon; anchors.left: parent.left; anchors.verticalCenter: parent.verticalCenter; width:18;height:18; ink: control.contentInk }
-        Text {
+        UiText {
             id: caption; anchors.fill:parent; visible: !control.iconName.length
-            text: control.text; font: control.font; leftPadding: control.legend ? 26 : control.disclosure ? 18 : control.leadingIcon.length ? 24 : 0
+            text: control.text; font: control.font; leftPadding: control.legend ? 26 : control.disclosure ? 18 : control.leadingIcon.length ? 24 : 1
             color: control.contentInk
             horizontalAlignment: control.disclosure || control.legend || control.navigationAction ? Text.AlignLeft : Text.AlignHCenter; verticalAlignment: Text.AlignVCenter
             elide: Text.ElideRight

@@ -114,14 +114,14 @@ Item {
                 id: homeLinkContent
                 columns: homeLink.width < 570 ? 2 : 3
                 columnSpacing: 16; rowSpacing: 6
-                Text {
+                UiText {
                     text: view.s.text; color: appTheme.palette.ink
                     font.family: appTheme.family; font.pixelSize: 15; font.bold: true
                     Layout.preferredWidth: homeLink.width < 570 ? -1 : 155
                     Layout.fillWidth: homeLink.width < 570
                     wrapMode: Text.Wrap
                 }
-                Text {
+                UiText {
                     text: appLanguage.text(view.s.description || ""); color: appTheme.palette.muted
                     font.family: appTheme.family; font.pixelSize: 13
                     wrapMode: Text.Wrap; Layout.fillWidth: true
@@ -260,7 +260,7 @@ Item {
             // Text and TextEdit use different line metrics. Reserve the height
             // of the visible renderer, including its final wrapped line.
             implicitHeight: Math.ceil(view.s.selectable ? selectableText.contentHeight : label.contentHeight) + view.s.margins[1] + view.s.margins[3]
-            Text {
+            UiText {
                 id: label; anchors.fill: parent
                 anchors.leftMargin: view.s.margins[0] + (view.s.swatch ? 18 : 0); anchors.rightMargin: view.s.margins[2]
                 anchors.topMargin: view.s.margins[1]; anchors.bottomMargin: view.s.margins[3]
@@ -324,13 +324,13 @@ Item {
             HoverHandler { cursorShape: Qt.PointingHandCursor }
             contentItem: Item {
                 implicitHeight: 26
-                Text {
+                UiText {
                     objectName: "reset-label"
                     anchors.left: parent.left; anchors.verticalCenter: parent.verticalCenter
                     text: appLanguage.text("초기화권"); color: appTheme.palette.muted
                     font.family: appTheme.family; font.pixelSize: 12
                 }
-                Text {
+                UiText {
                     objectName: "reset-value"
                     anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
                     text: view.node.textValue; color: appTheme.palette.ink
@@ -414,7 +414,7 @@ Item {
                 width: ListView.view.width; text: modelData.text; highlighted: index === view.s.index
                 implicitHeight: 42
                 leftPadding: 14; rightPadding: 12
-                contentItem: Text {
+                contentItem: UiText {
                     text: modelData.text; font.family: appTheme.family; font.pixelSize: 14
                     font.weight: highlighted ? Font.DemiBold : Font.Normal
                     color: highlighted ? (appTheme.palette && appTheme.color("accent")) : (appTheme.palette && appTheme.color("muted"))
@@ -585,7 +585,7 @@ Item {
                         required property var modelData; required property int index
                         text: modelData.state.tabTitle; implicitHeight: 44
                         width: implicitWidth; leftPadding: 18; rightPadding: 18
-                        contentItem: Text {
+                        contentItem: UiText {
                             text: modelData.state.tabTitle; font.family: appTheme.family; font.pixelSize: 14
                             font.bold: index === view.s.index
                             color: index === view.s.index ? (appTheme.palette && appTheme.color("accent")) : (appTheme.palette && appTheme.color("muted"))

@@ -38,7 +38,7 @@ Item {
             NumberAnimation { from: 0.35; to: 1; duration: 800; easing.type: Easing.InOutSine }
         }
     }
-    Text {
+    UiText {
         id: heartbeatLabel
         objectName: "overlayHeartbeatLabel"
         visible: !!root.s.totalRowVisible
