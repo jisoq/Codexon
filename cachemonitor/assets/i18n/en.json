@@ -2779,5 +2779,8 @@
   "Codex를 다시 실행하지 못했습니다. 다시 시도하세요.": "Could not reopen Codex. Try again.",
   "업데이트를 다시 시작하고 Codex 재시작을 확인하세요.": "Start the update again and confirm the Codex restart.",
   "Codex 종료 확인을 완료하지 못했습니다. 다시 시도하세요.": "Could not confirm that Codex exited. Try again.",
-  "연결 복구 후 Codex를 다시 실행하세요.": "Restore the connection, then reopen Codex."
+  "연결 복구 후 Codex를 다시 실행하세요.": "Restore the connection, then reopen Codex.",
+  "기간별": "Timeline",
+  "시간대별": "Time of day",
+  "색상은 모델, 표식은 실행 모드입니다.\n대표선: 지표별 평균 또는 중앙값\n분포 띠: 중앙 50% 표본 범위\nStandard: 채운 원\nFast: 빈 삼각형": "Color identifies the model; markers identify its mode.\nLine: mean or median for each metric\nBand: central 50% of samples\nStandard: filled circle\nFast: hollow triangle"
 }

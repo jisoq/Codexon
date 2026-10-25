@@ -1800,6 +1800,94 @@ def test_selected_performance_windows_preserve_catalog_and_exact_speed_populatio
             engine.close()
 
 
+def test_clock_hour_prepared_parity_filters_and_scalar_admission(tmp_path,monkeypatch):
+    from collections import OrderedDict
+    from datetime import datetime
+    from types import SimpleNamespace
+    from cachemonitor.performance_trends import PerformanceTrends
+    from cachemonitor.prepared_analysis import PreparedAnalysisEngine
+
+    monkeypatch.setenv('CODEXON_CPU_BACKEND','python')
+    owners=OrderedDict()
+    for number,owner in enumerate((('home','same'),('home','other'),('other','same'))):
+        rows=[]
+        for index in range(84):
+            day=index//12;hour=(0,9,10,23)[index%4]
+            rows.append(dict(home=owner[0],sid=owner[1],key=f'{number}-{index}',session_ordinal=index,turn='request',
+                ts=datetime(2026,10,1+day,hour,index%3,index%5).timestamp(),model='alpha' if index%3 else 'beta',
+                service_tier='Standard' if index%2 else 'Fast',effort='high' if index%3 else 'low',
+                duration=None if index%11==0 else float(index%7),cost=.1*(index%9),
+                input=2**70 if index==0 else 100,cached=90 if number!=1 else 10,
+                input_conflict=index%13==0,output=100,completion_latency_ms=1000 if index%5 else 9000,
+                output_speed=None if index%17==0 else 100 if index%5 else 100/9,reasoning=index))
+        owners[owner]=rows
+    start=datetime(2026,10,1).timestamp();end=datetime(2026,10,8).timestamp()
+    owners[('home','same')].extend([
+        dict(owners[('home','same')][0],key='end',ts=end),
+        dict(owners[('home','same')][0],key='before',ts=start-1),
+        dict(owners[('home','same')][0],key='after',ts=end+1)])
+    reference=SimpleNamespace(revision=1,sessions=OrderedDict((owner,dict(prepared=dict(history=rows))) for owner,rows in owners.items()))
+    limits=replace(storage.Limits(),read_seconds=60,read_vm_steps=20_000_000)
+    with storage.PreparedStore(tmp_path/'clock.sqlite') as store:
+        stage=store.begin(('clock',1));dependency={name:1 for name in storage.DEPENDENCIES};dependency['source_digest']='1'*64
+        for ordinal,(owner,rows) in reversed(list(enumerate(owners.items()))):
+            stage.owner(*owner,dict(home=owner[0],id=owner[1],_internal_review=False),dependency,source_ordinal=ordinal)
+            stage.calls(owner,rows,reconcile=True)
+        token=stage.publish(('clock',1),ready=True)
+        def forbidden(*args,**kwargs):raise AssertionError('Clock trends must only read scalar call columns')
+        monkeypatch.setattr(storage.Snapshot,'_decode_call',forbidden)
+        engine=PreparedAnalysisEngine(store.path,token,limits=limits)
+        try:
+            base=dict(page=5,now=end,plot_width=64,granularity='auto',time_range=[start,end],trend_mode='hour_of_day')
+            for change in ({},{'trend_selection':dict(models=['alpha'],modes=['Standard'])},
+                           {'trend_selection':dict(models=['beta'],modes=['Fast'])},
+                           {'trend_selection':dict(models=[],modes=['Standard'])},
+                           {'time_range':[datetime(2026,10,2,9).timestamp(),datetime(2026,10,6,10).timestamp()]},
+                           {'trend_mode':'timeline'},{'trend_mode':'hour_of_day','granularity':'month'}):
+                query=dict(base,**change)
+                actual=engine.page_query(query)['performance']
+                assert actual==PerformanceTrends().query(reference,query)
+                assert engine.read_metrics['trend_body_decodes']==0
+                assert engine.read_metrics['trend_scalar_peak_bytes']<=limits.page_objects_bytes
+                if query['trend_mode']=='hour_of_day':
+                    counts=next(p for p in actual['panels'] if p['key']=='count')
+                    assert sum(p['calls'] for line in counts['lines'] for p in line['points'])==actual['calls']
+                    assert engine.read_metrics['trend_selected_rows']==actual['calls']
+        finally:engine.close()
+        for limited in (replace(limits,page_objects_bytes=16*1024),replace(limits,speed_sort_bytes=1)):
+            engine=PreparedAnalysisEngine(store.path,token,limits=limited)
+            try:
+                with pytest.raises(storage.CapacityExceeded):engine.page_query(base)
+            finally:engine.close()
+        from cachemonitor import prepared_trends
+        with monkeypatch.context() as patch:
+            patch.setattr(prepared_trends,'RESULT_BYTES',1)
+            engine=PreparedAnalysisEngine(store.path,token,limits=limits)
+            try:
+                with pytest.raises(storage.CapacityExceeded):engine.page_query(base)
+            finally:engine.close()
+        cancelled=Event()
+        engine=PreparedAnalysisEngine(store.path,token,limits=limits,cancel=cancelled.is_set)
+        engine.progress=lambda value:cancelled.set() if value=='aggregate' else None
+        try:
+            with pytest.raises(storage.ReadCancelled):engine.page_query(base)
+            cancelled.clear();engine.progress=None
+            assert engine.page_query(base)['performance']==PerformanceTrends().query(reference,base)
+        finally:engine.close()
+        clock=[100.]
+        with monkeypatch.context() as patch:
+            patch.setattr(storage,'time',SimpleNamespace(monotonic=lambda:clock[0]))
+            engine=PreparedAnalysisEngine(store.path,token,limits=limits)
+            def expire(value):
+                if value=='aggregate':clock[0]=200.
+            engine.progress=expire
+            try:
+                with pytest.raises(storage.ReadCancelled):engine.page_query(base)
+                clock[0]=100.;engine.progress=None
+                assert engine.page_query(base)['performance']==PerformanceTrends().query(reference,base)
+            finally:engine.close()
+
+
 def test_performance_many_owners_complete_within_the_read_work_budget(tmp_path):
     from cachemonitor.prepared_analysis import PreparedAnalysisEngine
     from cachemonitor.prepared_performance import _Input

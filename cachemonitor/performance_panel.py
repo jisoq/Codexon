@@ -224,18 +224,19 @@ class IntervalDetails(Group):
             row.setVisible(index<len(rows))
             if index<len(rows):label.setText(tr(rows[index][0]));value.setText(Verbatim(rows[index][1]))
 
-    def set_point(self,point,spec,bands=False):
+    def set_point(self,point,spec,bands=False,source_range=None):
         unit=spec['unit'];fmt=lambda value:tr(value_text(value,unit))
         self.hint.hide();self.title.setText(tr(spec['title']))
         self.identity.setText(Verbatim(point['model']+' / '+point['service_tier']+(' / '+point['effort'] if point.get('effort') else '')))
         self.value.setText(Verbatim(axis_number(point['value']) if point['value'] is not None else '—'));self.unit.setText(Verbatim(metric_unit(unit)))
-        period=interval_dates(point['start'],point['end'])
-        if not point['complete']:period+='  /  '+tr(point['status'])
-        self.period.setText(Verbatim(period));self.comparison.show()
-        if point['baseline'] is None:
+        clock=point['kind']=='clock_hour'
+        period=(f"{point['hour']:02d}:00 - {point['hour']+1:02d}:00\n"+interval_dates(*source_range) if clock else interval_dates(point['start'],point['end']))
+        if point['status'] and (clock or not point['complete']):period+='  /  '+tr(point['status'])
+        self.period.setText(Verbatim(period));self.comparison.setVisible(not clock)
+        if not clock and point['baseline'] is None:
             self.change.put(fontSize=14,color='muted');self.change.setText(tr('비교 구간 없음'))
             self.previous.setText(tr('직전 완전 구간 비교 불가'));self.absolute_change.setText('')
-        else:
+        elif not clock:
             delta=point['delta'];relative=point['baseline'] and unit!='cache_ratio'
             change=f'{delta/point["baseline"]:+.1%}' if relative else f'{delta:+.1f}%p' if unit=='cache_ratio' else ('+' if delta>=0 else '−')+fmt(abs(delta))
             self.change.put(fontSize=26,color='accent');self.change.setText(Verbatim(change))
@@ -270,7 +271,7 @@ class IntervalDetails(Group):
                 self.formula.setText(tr('대표선: 호출 소요시간 중앙값'))
                 if stats['p90'] is not None:self.band_text.setText(Verbatim(self.band_text.text()+'\nP90  '+fmt(stats['p90'])))
             self.range_plot.set_stats(dict(stats,p10=stats['q1'] if point['band_valid'] else None,p90=stats['q3'] if point['band_valid'] else None))
-            if point['value'] is None and point['complete']:self.period.setText(Verbatim(period+' / '+tr(point['status'])))
+            if not clock and point['value'] is None and point['complete']:self.period.setText(Verbatim(period+' / '+tr(point['status'])))
 
     def set_modes(self,points,unit):
         self.mode_comparison.setVisible(bool(points))
@@ -308,15 +309,23 @@ class PerformancePlot(AnalyticalPlot):
     @property
     def bands(self):return self.rolling and self.data.get('unit')!='count'
 
+    @property
+    def clock(self):return self.data.get('trend_mode')=='hour_of_day'
+
+    @property
+    def plot_range(self):return (0,24) if self.clock else self.panel.range
+
+    def coordinate(self,point):return point['hour']+.5 if self.clock else point['ts']
+
     def set_data(self,data,bounds=None):
         self.data=data;self.metric=data['unit']
         self.put(clickEnabled=self.rolling)
         self.set_rows(sorted((point for line in data['lines'] for point in line['points'] if (point['value'] is not None or self.bands)
-                             and self.selected_style(point)),key=lambda p:(p['ts'],p['service_tier'])))
+                             and self.selected_style(point)),key=lambda p:(self.coordinate(p),p['service_tier'])))
         self.shared_bounds=bounds is not None
         values=plot_values(data,self.selected_style,self.panel.show_outer)
         minimum_step=1 if self.metric in ('count','input','cached','output','reasoning') else 0
-        self.times=[p['ts'] for p in self.rows]
+        self.times=[self.coordinate(p) for p in self.rows]
         self.bounds=bounds if bounds is not None else trend_bounds(values,minimum_step)
         self.axis=nice_axis(*self.bounds,minimum_step=minimum_step);self.bounds=self.axis[:2]
         self.rebuild_strip()
@@ -330,7 +339,7 @@ class PerformancePlot(AnalyticalPlot):
         color.setAlphaF(alpha if selected else min(.1,alpha));return color
 
     def x(self,ts):
-        a,z=self.panel.range;return 76+(self.width()-96)*(ts-a)/(z-a)
+        a,z=self.plot_range;return 76+(self.width()-96)*(ts-a)/(z-a)
 
     def y(self,value):
         lo,hi=self.bounds;return self.height()-72-((value-lo)/(hi-lo))*(self.height()-100)
@@ -338,7 +347,7 @@ class PerformancePlot(AnalyticalPlot):
     def strip_top(self):return self.height()-62
 
     def xy(self,p):
-        return QPointF(self.x(p['ts']),self.y(p['value'] if p['value'] is not None else self.bounds[0]))
+        return QPointF(self.x(self.coordinate(p)),self.y(p['value'] if p['value'] is not None else self.bounds[0]))
 
     def paint_bands(self,p):
         for line in self.data['lines']:
@@ -350,7 +359,7 @@ class PerformancePlot(AnalyticalPlot):
                 for point in line['points']:
                     if not point.get(valid_key):previous=None;continue
                     if previous and point['bucket']==previous['bucket']+1:
-                        a,b=previous['distribution'],point['distribution'];x1,x2=self.x(previous['ts']),self.x(point['ts'])
+                        a,b=previous['distribution'],point['distribution'];x1,x2=self.x(self.coordinate(previous)),self.x(self.coordinate(point))
                         p.setPen(Qt.NoPen);p.setBrush(self.ink(line,alpha))
                         p.drawPolygon(QPolygonF([QPointF(x1,self.y(a[low])),QPointF(x1,self.y(a[high])),
                                                 QPointF(x2,self.y(b[high])),QPointF(x2,self.y(b[low]))]))
@@ -365,8 +374,8 @@ class PerformancePlot(AnalyticalPlot):
             if not self.selected_style(line) or not line['points']:continue
             sequence=line['points']
             # Both modes use the same sampling grid. Inspection snaps to a real calculation.
-            times=[p['ts'] for p in sequence];index=bisect_left(times,stamp)
-            point=min(sequence[max(0,index-1):index+1],key=lambda p:abs(p['ts']-stamp))
+            times=[self.coordinate(p) for p in sequence];index=bisect_left(times,stamp)
+            point=min(sequence[max(0,index-1):index+1],key=lambda p:abs(self.coordinate(p)-stamp))
             points.append(point)
         return sorted(points,key=lambda p:(p['model'],p['service_tier']!='Standard'))
 
@@ -387,6 +396,18 @@ class PerformancePlot(AnalyticalPlot):
         return next((c for c in self.strip if c['index']==index and c['direction']==direction),None)
 
     def time_labels(self,metrics):
+        if self.clock:
+            spacing=24/max(1,(self.width()-96)/72)
+            step=next(value for value in (1,2,3,4,6,12,24) if value>=spacing)
+            labels=[]
+            for hour in range(0,25,step):
+                text=f'{hour:02d}:00';width=metrics.horizontalAdvance(text)+4
+                left=max(76,min(self.width()-20-width,self.x(hour)-width/2))
+                rect=QRectF(left,self.height()-36,width,36)
+                if hour==24:
+                    while labels and rect.left()<labels[-1][2].right()+12:labels.pop()
+                if not labels or rect.left()>=labels[-1][2].right()+12:labels.append((hour,text,rect))
+            return labels
         ticks,step=time_ticks(*self.panel.range,max(1,self.width()-96))
         labels=[]
         for stamp in ticks:
@@ -405,7 +426,7 @@ class PerformancePlot(AnalyticalPlot):
 
     def paint(self,painter):
         p=self.base()
-        if not self.rows and not self.shared_bounds:
+        if not self.rows and not self.shared_bounds and not self.clock:
             return
         lo,hi=self.bounds
         p.setPen(self.color('muted'));p.drawText(QRectF(76,0,self.width()-96,20),Qt.AlignLeft|Qt.AlignVCenter,tr('단위')+': '+metric_unit(self.metric))
@@ -452,7 +473,7 @@ class PerformancePlot(AnalyticalPlot):
                           points[index-1]['bucket']+1!=point['bucket'] or
                           index==len(points)-1 or points[index+1]['value'] is None or
                           point['bucket']+1!=points[index+1]['bucket'])
-                x=self.x(point['ts'])
+                x=self.x(self.coordinate(point))
                 if not self.bands or boundary or last_mark is None or x-last_mark>=64:
                     series_mark(p,self.xy(point),mode);last_mark=x
         p.restore()
@@ -473,7 +494,7 @@ class PerformancePlot(AnalyticalPlot):
     def paint_overlay(self,p):
         if not self.rows and not self.shared_bounds:return
         stamp=self.panel.inspection_time
-        if stamp is not None and self.panel.range[0]<=stamp<=self.panel.range[1]:
+        if stamp is not None and self.panel.inspection[0]==('clock_hour' if self.clock else 'timeline') and self.plot_range[0]<=stamp<=self.plot_range[1]:
             p.setRenderHint(QPainter.Antialiasing)
             p.setPen(QPen(self.color('muted'),1,Qt.DashLine))
             p.drawLine(QPointF(self.x(stamp),15),QPointF(self.x(stamp),self.strip_top()+20))
@@ -485,7 +506,7 @@ class PerformancePlot(AnalyticalPlot):
 
     def nearest(self,x,y):
         if not self.rows:return None
-        a,z=self.panel.range;t=a+(x-76)/max(1,self.width()-96)*(z-a)
+        a,z=self.plot_range;t=a+(x-76)/max(1,self.width()-96)*(z-a)
         if self.rolling:
             points=self.matching_points(t)
             valid=[point for point in points if point['value'] is not None]
@@ -496,7 +517,7 @@ class PerformancePlot(AnalyticalPlot):
         if not candidates:
             i=bisect_left(self.times,t);candidates=self.rows[max(0,i-1):i+1]
         selected=[r for r in candidates if self.selected_style(r)];candidates=selected or candidates
-        return min(candidates,key=lambda r:(self.x(r['ts'])-x)**2+(self.y(r['value'])-y)**2)
+        return min(candidates,key=lambda r:(self.x(self.coordinate(r))-x)**2+(self.y(r['value'])-y)**2)
 
     def tip_at(self,x,y):
         cell=self.strip_cell(x,y)
@@ -512,11 +533,21 @@ class PerformancePlot(AnalyticalPlot):
         if self.rolling:self.tip_at(x,y)
 
     def key(self,key):
-        if key in (Qt.Key_Plus,Qt.Key_Equal):self.panel.zoom(.5)
-        elif key==Qt.Key_Minus:self.panel.zoom(2)
+        if key in (Qt.Key_Plus,Qt.Key_Equal):
+            if not self.clock:self.panel.zoom(.5)
+        elif key==Qt.Key_Minus:
+            if not self.clock:self.panel.zoom(2)
         elif self.rows:
             if key in (Qt.Key_Left,Qt.Key_Right):
-                self.cursor=max(0,min(len(self.rows)-1,self.cursor+(-1 if key==Qt.Key_Left else 1)));self.panel.show_interval(self.rows[self.cursor],self.data['key'])
+                direction=-1 if key==Qt.Key_Left else 1
+                if self.clock:
+                    hour=self.panel.inspection[1] if self.panel.inspection and self.panel.inspection[0]=='clock_hour' else -1 if direction>0 else 24
+                    points=self.matching_points(max(0,min(23,hour+direction))+.5)
+                    previous=self.panel.inspected[0] if self.panel.inspected else None
+                    point=next((p for p in points if previous and p['model']==previous['model'] and p['service_tier']==previous['service_tier']),points[0])
+                    self.panel.show_interval(point,self.data['key'])
+                else:
+                    self.cursor=max(0,min(len(self.rows)-1,self.cursor+direction));self.panel.show_interval(self.rows[self.cursor],self.data['key'])
 
 
 class TimeNavigator(Node):
@@ -548,10 +579,12 @@ class PerformancePanel(Group):
         super().__init__();self.dashboard=dashboard;self.range=(0,1);self.full=(0,1);self.time_range=None
         self.follow_latest=True;self.window_span=7*86400;self.period_preset='7d';self._follow_revision=object();self.navigation_ready=False
         self._query_now=None
-        self.plots={};self.inspection_time=None;self.inspected=None;self.available=[];self.updating=False
+        self.plots={};self.inspection=None;self.inspected=None;self.available=[];self.updating=False
         try:saved=json.loads(dashboard.settings.value('performance/selection','{}'))
         except (ValueError,TypeError):saved={}
         self.granularity='auto'
+        self.trend_mode=saved.get('trend_mode','timeline')
+        if self.trend_mode not in ('timeline','hour_of_day'):self.trend_mode='timeline'
         self.reasoning_effort=saved.get('reasoning_effort','high');self.reasoning_specs={};self.reasoning_buttons={}
         self.models=saved.get('models',{});self.modes=saved.get('modes',{'Standard':True,'Fast':True})
         self.show_outer=False
@@ -598,6 +631,10 @@ class PerformancePanel(Group):
         for title,preset,width in (('최근 7일','7d',92),('최근 30일','30d',100),('전체','all',64)):
             b=button(title,lambda p=preset:self.choose_period(p));b.setCheckable(True);b.put(selectionTab=True,flat=True)
             b.setMinimumWidth(width);periods.addWidget(b);self.period_buttons[preset]=b
+        self.trend_buttons={}
+        for title,mode in (('기간별','timeline'),('시간대별','hour_of_day')):
+            b=button(title,lambda m=mode:self.choose_trend_mode(m));b.setCheckable(True);b.put(selectionTab=True,flat=True)
+            b.setMinimumWidth(76);b.setChecked(mode==self.trend_mode);periods.addWidget(b);self.trend_buttons[mode]=b
         self.period=button('',self.toggle_dates);self.period.setAccessibleName('조회 기간 변경')
         self.date_editor=Group();self.date_editor.hide()
         dates=Row();dates.put(flow=True,spacing=6);Column(self.date_editor).addLayout(dates)
@@ -650,7 +687,12 @@ class PerformancePanel(Group):
     def is_model_selected(self,model):return not self.models or bool(self.models.get(model,False))
     def single_model(self):return bool(self.models) and sum(bool(self.models.get(m)) for m in (self.available or self.models))==1
     def request(self):self.dashboard.render()
-    def persist(self):self.dashboard.settings.setValue('performance/selection',json.dumps(dict(models=self.models,modes=self.modes,reasoning_effort=self.reasoning_effort)))
+    def persist(self):self.dashboard.settings.setValue('performance/selection',json.dumps(dict(models=self.models,modes=self.modes,reasoning_effort=self.reasoning_effort,trend_mode=self.trend_mode)))
+
+    def choose_trend_mode(self,mode):
+        for key,b in self.trend_buttons.items():b.setChecked(key==mode)
+        if mode==self.trend_mode:return
+        self.trend_mode=mode;self.inspect(None);self.persist();self.request()
     def selection_is_current(self):
         selected=[m for m in self.available if self.is_model_selected(m)]
         single=self.single_model()
@@ -678,9 +720,6 @@ class PerformancePanel(Group):
                     mark.active=active;mark.update();mark.label.put(color='ink' if active else 'muted')
         # Range results already refresh plot data; unchanged selection UI stays mounted.
         if self.selection_is_current():return
-        self.window_note.show()
-        self.chart_help.setText('색상은 모델, 표식은 실행 모드입니다.\n대표선: 지표별 평균 또는 중앙값\n분포 띠: 중앙 50% 표본 범위\nStandard: 채운 원\nFast: 빈 삼각형\n확대하면 개별 호출을 확인할 수 있습니다.')
-        self.chart_help.setToolTip('소요시간은 중앙값, 출력 속도는 전체 응답시간 기준 시간 가중평균입니다. 이동 구간의 소요시간 중앙값은 표본 5개 이상에서 표시합니다. 띠는 표본 분포입니다. 호출 수는 겹치지 않는 구간 합계입니다.')
         mode='all' if all(self.modes.get(m,False) for m in ('Standard','Fast')) else 'Fast' if self.modes.get('Fast') else 'Standard'
         for key,b in self.mode_buttons.items():b.setChecked(key==mode)
         clear(self.legend);self.legend_entries=[]
@@ -821,7 +860,7 @@ class PerformancePanel(Group):
 
     def reset(self):self.choose_period('all')
     def zoom(self,factor):
-        a,z=self.range;center=self.inspection_time if self.inspection_time is not None else (a+z)/2
+        a,z=self.range;center=self.inspection_time if self.inspection is not None and self.inspection[0]=='timeline' else (a+z)/2
         first,last=self.navigation_bounds()
         width=min(last-first,max(1,(z-a)*factor));start=max(first,min(last-width,center-width/2))
         self.set_window(start,start+width)
@@ -841,12 +880,13 @@ class PerformancePanel(Group):
 
     def show_interval(self,point,key):
         if self.inspected==(point,key):return
-        self.inspected=(point,key);self.inspect(point['ts'])
+        self.inspected=(point,key)
+        self.inspect(point['hour'] if point['kind']=='clock_hour' else point['ts'],'clock_hour' if point['kind']=='clock_hour' else 'timeline')
         plot=self.plots[key]
         spec=dict(self.specs[key],title=self.labels[key].text()) if plot.bands else self.specs[key]
-        self.details.set_point(point,spec,plot.bands)
+        self.details.set_point(point,spec,plot.bands,self.range)
         if plot.rolling:
-            self.details.comparison.hide();self.details.set_modes(plot.matching_points(point['ts']),spec['unit'])
+            self.details.comparison.hide();self.details.set_modes(plot.matching_points(plot.coordinate(point)),spec['unit'])
 
     def refresh_inspection(self,previous=None,only=None):
         keys=[only] if only else list(self.plots)
@@ -855,15 +895,22 @@ class PerformancePanel(Group):
             plot=self.plots[key];points=[p for p in plot.rows if plot.selected_style(p) and p['value'] is not None]
             if not points:points=[p for p in plot.rows if plot.selected_style(p) and p['coverage'][0]]
             if points:
-                matching=[p for p in points if previous and p['model']==previous[0]['model'] and p['service_tier']==previous[0]['service_tier']]
-                point=min(matching,key=lambda p:abs(p['ts']-previous[0]['ts'])) if matching else points[-1]
+                matching=[p for p in points if previous and p['kind']==previous[0]['kind'] and p['model']==previous[0]['model'] and p['service_tier']==previous[0]['service_tier']]
+                point=min(matching,key=lambda p:abs(plot.coordinate(p)-plot.coordinate(previous[0]))) if matching else points[-1]
                 self.show_interval(point,key);return
         self.inspect(None)
 
-    def inspect(self,stamp):
+    @property
+    def inspection_time(self):
+        if self.inspection is None:return None
+        mode,stamp=self.inspection
+        return stamp+.5 if mode=='clock_hour' else stamp
+
+    def inspect(self,stamp,mode='timeline'):
         if stamp is None:self.inspected=None;self.details.clear()
-        if stamp==self.inspection_time:return
-        self.inspection_time=stamp
+        inspection=None if stamp is None else (mode,stamp)
+        if inspection==self.inspection:return
+        self.inspection=inspection
         for plot in self.plots.values():plot.repaintRequested.emit()
 
     def reasoning_spec(self):
@@ -905,6 +952,10 @@ class PerformancePanel(Group):
 
     def apply(self,data):
         previous=self.inspected
+        loaded_mode=data.get('trend_mode','timeline')
+        changed=getattr(self,'loaded_trend_mode','timeline')!=loaded_mode
+        if changed:previous=None
+        self.loaded_trend_mode=loaded_mode
         self.inspect(None)
         self.range=(data['start'],data['end']);self.full=data['full'];self.available=[m for m in data['models'] if m not in ('미확인','codex-auto-review')]
         if self.follow_latest and self.time_range is not None:self.time_range=list(self.range)
@@ -947,4 +998,9 @@ class PerformancePanel(Group):
                 self.reasoning_tabs.addWidget(b);self.reasoning_buttons[effort]=b
         self.refresh_plots()
         self.sync_selection()
-        self.refresh_inspection(previous)
+        self.window_note.setVisible(loaded_mode=='timeline')
+        help_text='색상은 모델, 표식은 실행 모드입니다.\n대표선: 지표별 평균 또는 중앙값\n분포 띠: 중앙 50% 표본 범위\nStandard: 채운 원\nFast: 빈 삼각형'
+        if loaded_mode=='timeline':help_text+='\n확대하면 개별 호출을 확인할 수 있습니다.'
+        self.chart_help.setText(help_text)
+        self.chart_help.setToolTip('출력 속도는 시간 가중평균, 소요시간은 중앙값, 나머지는 평균입니다. 소요시간 중앙값은 표본 5개 이상에서 표시합니다. 띠는 신뢰구간이 아닌 표본 분포입니다. 호출 수는 겹치지 않는 구간 합계입니다.')
+        if not changed:self.refresh_inspection(previous)

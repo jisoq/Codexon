@@ -67,6 +67,23 @@ def representative_mean(values,totals,metric):
     return sum(values)/len(values) if values else None
 
 
+def clock_point(metric,model,mode,hour,population):
+    counted=metric=='count'
+    eligible=population['eligible'];mean=population['mean'];stats=population['distribution']
+    representative=stats['median'] if metric=='duration' else mean
+    minimum=MIN_CENTER if metric=='duration' else 1
+    support=counted or eligible>0
+    return dict(kind='clock_hour',hour=hour,bucket=hour,
+        value=representative if counted or eligible>=minimum else None,
+        mean=mean,representative=representative,
+        statistic='median' if metric=='duration' else 'time_weighted_mean' if metric=='output_speed' else 'count' if counted else 'mean',
+        model=model,service_tier=mode,effort=metric.split(':',1)[1] if metric.startswith('reasoning:') else '',
+        coverage=(eligible,population['total']),distribution=stats,totals=population['totals'],
+        calls=population['calls'],sessions=population['sessions'],support=support,
+        band_valid=not counted and eligible>=MIN_BAND,outer_valid=not counted and eligible>=MIN_OUTER_BAND,
+        status='기록 공백' if not support else '표본 부족' if not counted and eligible<minimum else '')
+
+
 def bounded_observations(items,metric,start,end,width):
     """Preserve extrema and endpoints per screen column without changing statistics."""
     if metric in ('session_cache','count') or end-start>3600:return []
@@ -166,14 +183,18 @@ class PerformanceTrends:
         self.signature=None;self.view=None
 
     def query(self,engine,q):
+        mode=q.get('trend_mode','timeline')
+        if mode not in ('timeline','hour_of_day'):mode='timeline'
+        q=dict(q,trend_mode=mode)
         width=max(64,min(1024,int(q.get('plot_width',768))))
         unit=q.get('granularity','day')
         if unit not in ('auto','day','week','month'):unit='day'
-        key=(engine.revision,tuple(q.get('time_range') or ()),width,unit,
+        key=(engine.revision,tuple(q.get('time_range') or ()),width,unit,mode,
              trend_selection_key(q),q.get('trend_period'))
         now=q['now']
         if key!=self.signature or now>=self.deadline:
             self.build(engine,q,width,unit);self.signature=key
+            self.view['trend_mode']=mode
         return dict(self.view)
 
     def build(self,engine,q,width,granularity):
@@ -202,6 +223,10 @@ class PerformanceTrends:
         else:
             rows=context['rows'];first=context['first'];full=context['full']
             start,end=context['start'],context['end']
+        if q['trend_mode']=='hour_of_day':
+            self.build_hour_of_day(rows,q,start,end,full)
+            if context is None and selection is not None:self.view['models']=catalog
+            return
         if granularity=='auto':
             self.build_rolling(rows,q,width,start,end,full,context)
             if context is None and selection is not None:self.view['models']=catalog
@@ -348,6 +373,37 @@ class PerformanceTrends:
                        models=context['models'] if context is not None else sorted({r.get('model') or '미확인' for r in rows}),
                        calls=context['calls'] if context is not None else len(rows),valid_until=self.deadline)
         if context is None and selection is not None:self.view['models']=catalog
+
+    def build_hour_of_day(self,history,q,start,end,full):
+        rows=[r for r in history if start<=r['ts']<=end]
+        groups=defaultdict(list)
+        for row in rows:groups[(row.get('model') or '미확인',row.get('service_tier') or '미확인')].append(row)
+        efforts=sorted({r.get('effort') or '미확인' for r in history if r['ts']<=end},key=effort_key)
+        specs=list(METRICS)+[('reasoning:'+e,'평균 추론 토큰 / '+e,'reasoning') for e in efforts]+[('count','호출 수','count')]
+        panels=[]
+        for metric,title,unit in specs:
+            lines=[];bounds=[];n=0;N=0
+            for (model,mode),group in sorted(groups.items()):
+                own=[r for r in group if not metric.startswith('reasoning:') or (r.get('effort') or '미확인')==metric.split(':',1)[1]]
+                if not own:continue
+                values,group_total,_=metric_population(own,metric)
+                eligible=len(own) if metric=='count' else len(values)
+                n+=eligible;N+=group_total;bounds.extend(values)
+                hours=[[] for _ in range(24)]
+                for row in own:hours[datetime.fromtimestamp(row['ts']).hour].append(row)
+                points=[]
+                for hour,items in enumerate(hours):
+                    values,total,totals=metric_population(items,metric)
+                    population=dict(eligible=len(items) if metric=='count' else len(values),total=total,totals=totals,
+                        distribution=distribution_statistics(values),mean=representative_mean(values,totals,metric),
+                        calls=len(items),sessions=len({(r['home'],r['sid']) for r in items}))
+                    points.append(clock_point(metric,model,mode,hour,population))
+                lines.append(dict(model=model,service_tier=mode,points=points,coverage=(eligible,group_total)))
+            panels.append(dict(key=metric,title=title,unit=unit,n=n,N=N,points=[],low=min(bounds,default=0),
+                high=max(bounds,default=1),lines=lines,rolling=True,raw_visible=False,trend_mode='hour_of_day'))
+        self.deadline=q['now']+60
+        self.view=dict(panels=panels,start=start,end=end,full=full,granularity='auto',trend_mode='hour_of_day',
+            models=sorted({r.get('model') or '미확인' for r in history if r['ts']<=end}),calls=len(rows),valid_until=self.deadline)
 
     def build_rolling(self,history,q,width,start,end,full,context=None):
         """Project exact overlapping populations once in the worker, never in paint/hover."""

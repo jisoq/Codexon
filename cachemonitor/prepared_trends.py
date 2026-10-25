@@ -3,6 +3,7 @@ from array import array
 from bisect import bisect_left, bisect_right
 from collections import deque
 from contextlib import contextmanager
+from datetime import datetime
 from heapq import merge
 from itertools import islice
 from math import ceil
@@ -11,7 +12,7 @@ from sys import getsizeof
 
 from .analytics import effort_key
 from .performance_trends import (METRICS, MIN_BAND, MIN_CENTER, MIN_OUTER_BAND,
-    distribution_statistics, rolling_window, valid)
+    clock_point, distribution_statistics, rolling_window, valid)
 from .prepared_store import CapacityExceeded, _size
 from .prepared_sums import _Sum
 
@@ -252,17 +253,16 @@ class Group:
 
 
 @contextmanager
-def population(window, group, metric, start, end, inclusive, support_start, support_end):
+def population(entries, budget, metric, support_start, support_end):
     """One metric's values and per-session totals; no retained call records."""
-    scopes = group.efforts[metric.split(':', 1)[1]] if metric.startswith('reasoning:') else group.scopes
     field = 'reasoning' if metric.startswith('reasoning:') else metric
-    with window.budget.scratch() as reserve:
+    with budget.scratch() as reserve:
         reserve(512)
         values, sessions = [], {}
         calls = 0
         support = metric == 'count'
         numerator, seconds = _Sum(), _Sum()
-        for block, position, stamp in window.entries(start, end, inclusive, scopes):
+        for block, position, stamp in entries:
             calls += 1
             owner = block.owners[position]
             if owner not in sessions:
@@ -377,7 +377,8 @@ def rolling(source, q, width, start, end, full, scopes):
                 for metric, _, _ in specs:
                     if (metric == 'count') != (event[0] == 'count'):continue
                     if metric.startswith('reasoning:') and metric.split(':', 1)[1] not in group.efforts:continue
-                    with population(window, group, metric, a, b, b == end, support_a, support_b) as values:
+                    selected = group.efforts[metric.split(':', 1)[1]] if metric.startswith('reasoning:') else group.scopes
+                    with population(window.entries(a, b, b == end, selected), budget, metric, support_a, support_b) as values:
                         value = point(metric, group, event, duration, now, values)
                     budget.output(_size(value) + 32)
                     group.points.setdefault(metric, {})[event[1]] = value
@@ -417,3 +418,66 @@ def rolling(source, q, width, start, end, full, scopes):
     source.stats.update(scalar_peak_bytes=budget.peak, scratch_peak_bytes=budget.scratch_peak, output_bytes=budget.result)
     return dict(panels=panels, start=start, end=end, full=full, granularity='auto', window_seconds=duration,
         models=sorted({scope[0] for scope in scopes}), calls=count, valid_until=now + max(1, min(60, step)))
+
+
+def hour_of_day(source, q, start, end, full, scopes):
+    budget=Budget(source.limit)
+    budget.add(source.retained)
+    efforts=sorted({scope[2] for scope in scopes},key=effort_key)
+    specs=list(METRICS)+[('reasoning:'+e,'평균 추론 토큰 / '+e,'reasoning') for e in efforts]+[('count','호출 수','count')]
+    panels=[dict(key=metric,title=title,unit=unit,n=0,N=0,points=[],low=None,high=None,lines=[],
+                 rolling=True,raw_visible=False,trend_mode='hour_of_day') for metric,title,unit in specs]
+    grouped={}
+    budget.add(_size(grouped)+_size(panels))
+    for scope,variants in scopes.items():
+        key=scope[:2]
+        if key not in grouped:
+            budget.add(_size(key)+160);grouped[key]={}
+        for raw,types in variants:
+            identity=(raw[:2],types[:2])
+            if identity not in grouped[key]:
+                budget.add(_size((identity,(raw,types)))+96);grouped[key][identity]=(raw,types)
+    count=0;progress=getattr(source.engine,'progress',None)
+    for key,variants in sorted(grouped.items()):
+        retained=budget.used
+        group=Group(key,budget);window=Window(budget,source.snapshot._check)
+        rows=source.ordered_rows(start,end,variants=variants.values())
+        try:
+            for row in rows:
+                effort=row.get('effort') or '미확인'
+                hour=datetime.fromtimestamp(row['ts']).hour
+                group.observe(row,effort);window.append(row,(effort,hour));count+=1
+                if progress and count%512==0:
+                    progress(dict(stage='aggregate',processed=count,unit='calls'))
+            if not group.count:continue
+            for spec in panels:
+                metric=spec['key']
+                if metric.startswith('reasoning:') and metric.split(':',1)[1] not in group.efforts:continue
+                selected=group.efforts[metric.split(':',1)[1]] if metric.startswith('reasoning:') else group.scopes
+                eligible,total,low,high=group.summary(metric)
+                spec['n']+=eligible;spec['N']+=total
+                if low is not None:
+                    spec['low']=min(spec['low'],low) if spec['low'] is not None else low
+                    spec['high']=max(spec['high'],high) if spec['high'] is not None else high
+                points=[]
+                for hour in range(24):
+                    source.snapshot._check()
+                    def entries():
+                        for block in window.blocks:
+                            source.snapshot._check()
+                            for position in merge(*(block.positions.get((scope,hour),()) for scope in selected)):
+                                yield block,position,block.values['ts'].at(position)
+                    with population(entries(),budget,metric,start,end) as values:
+                        value=clock_point(metric,key[0],key[1],hour,values)
+                    budget.output(_size(value)+32);points.append(value)
+                line=dict(model=key[0],service_tier=key[1],points=points,coverage=(eligible,total))
+                budget.output(256);spec['lines'].append(line)
+        finally:
+            rows.close()
+            del group,window
+            budget.add(retained-budget.used)
+    for spec in panels:
+        if spec['low'] is None:spec['low']=0;spec['high']=1
+    source.stats.update(scalar_peak_bytes=budget.peak,scratch_peak_bytes=budget.scratch_peak,output_bytes=budget.result)
+    return dict(panels=panels,start=start,end=end,full=full,granularity='auto',trend_mode='hour_of_day',
+        models=sorted({scope[0] for scope in scopes}),calls=count,valid_until=q['now']+60)

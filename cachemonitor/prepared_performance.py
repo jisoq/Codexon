@@ -316,6 +316,7 @@ class _Input:
 def performance_input(engine, q, width, granularity):
     """Finish an exact chart from one pinned scalar stream and bounded state."""
     selection=trend_selection_key(q)
+    clock=q.get('trend_mode')=='hour_of_day'
     source = _Input(engine,selection)
     first, last = source.bounds(speed=selection is not None)
     now = q['now']
@@ -328,9 +329,9 @@ def performance_input(engine, q, width, granularity):
         start,end,full,empty=trend_range(q,(first,last))
         if empty:source.selection_where='0'
         # Calendar causal context still begins at the first selected call.
-        if granularity!='auto':first,_=source.bounds()
+        if granularity!='auto' and not clock:first,_=source.bounds()
         first=now if first is None else first
-    scopes, calls = source.metadata(end, sort_start=start, sort_keys=granularity != 'auto',
+    scopes, calls = source.metadata(end, sort_start=start, sort_keys=granularity != 'auto' and not clock,
                                    global_catalog=selection is not None)
     catalog=list(source.catalog_values)
     if selection is not None:
@@ -338,7 +339,10 @@ def performance_input(engine, q, width, granularity):
                 if trend_selected(dict(zip(DIMENSIONS,scope)),selection)}
     progress=getattr(engine,'progress',None)
     if progress:progress('aggregate')
-    if granularity == 'auto':
+    if clock:
+        from .prepared_trends import hour_of_day
+        view = hour_of_day(source, q, start, end, full, scopes)
+    elif granularity == 'auto':
         from .prepared_trends import rolling
         view = rolling(source, q, width, start, end, full, scopes)
     else:
