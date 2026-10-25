@@ -146,50 +146,106 @@ host.release_scene();host.close()
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_software_text_keeps_first_glyph_edges():
+def test_software_text_matches_unclipped_glyph_runs():
     code = r"""
 import time
 from pathlib import Path
-from PySide6.QtCore import QUrl
+from PySide6.QtCore import QPointF, Qt, QUrl
+from PySide6.QtGui import QColor, QImage, QPainter, QTextLayout, QTextOption
 from PySide6.QtQml import QQmlComponent
+from PySide6.QtQuick import QQuickItem, QSGRendererInterface
 from PySide6.QtQuickWidgets import QQuickWidget
-from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
-from cachemonitor.fonts import configure_font_rendering, configure_high_dpi, load_bundled_fonts
+from cachemonitor.fonts import (configure_application_font, configure_font_rendering,
+                                configure_high_dpi, load_bundled_fonts)
 from cachemonitor.graphics_recovery import use_software_renderer
+from cachemonitor.theme import shared_theme
 configure_font_rendering();configure_high_dpi();use_software_renderer()
-app=QApplication([]);load_bundled_fonts()
-host=QQuickWidget();host.resize(300,120)
-component=QQmlComponent(host.engine())
-component.setData('''import QtQuick
-Rectangle {
-    width: 300; height: 120; color: "white"
-    UiText { x: 20; y: 20; text: "69%"; font.family: "Pretendard JP"; font.pixelSize: 14; font.weight: Font.DemiBold }
-    UiText { x: 20; y: 60; text: "69%"; font.family: "Pretendard JP"; font.pixelSize: 14; font.weight: Font.DemiBold; leftPadding: 5; rightPadding: 5 }
-    UiText { x: 120; y: 20; text: "설정"; font.family: "Pretendard JP"; font.pixelSize: 14; font.bold: true }
-    UiText { x: 120; y: 60; text: "설정"; font.family: "Pretendard JP"; font.pixelSize: 14; font.bold: true; leftPadding: 5; rightPadding: 5 }
-}
-'''.encode('utf-8'), QUrl.fromLocalFile(str(Path('cachemonitor/qml/EdgeProbe.qml').resolve())))
-root=component.create()
-assert root is not None, component.errors()
-host.setContent(QUrl(),component,root);host.show()
-deadline=time.monotonic()+5
-while host.grabFramebuffer().isNull():
-    assert time.monotonic()<deadline
-    app.processEvents();QTest.qWait(10)
-app.processEvents()
-image=host.grabFramebuffer();ratio=image.devicePixelRatio()
-def ink(left,top):
-    pixels={(x,y) for y in range(round(top*ratio),round((top+32)*ratio))
-            for x in range(round(left*ratio),round((left+90)*ratio))
-            if image.pixelColor(x,y).lightness()<128}
-    assert pixels, (left,top)
-    x0=min(x for x,y in pixels);y0=min(y for x,y in pixels)
-    return {(x-x0,y-y0) for x,y in pixels}
-for left in (20,120):
-    assert ink(left,20)==ink(left,60), 'Text lost glyph pixels compared with an ample-padding reference'
+app = QApplication([])
+load_bundled_fonts()
+app.setStyle('Fusion')
+configure_application_font(app)
+host = QQuickWidget()
+host.resize(540, 110)
+host.engine().rootContext().setContextProperty('appTheme', shared_theme())
+frames = []
+host.quickWindow().afterRendering.connect(lambda: frames.append(True))
+results = []
+cases = [('UiButton', '2026.10.24.3'), ('UiButton', '2026.10.25.1'),
+         ('Text', '2026.10.24.3'), ('TextInput', '2026.10.25.1'),
+         ('TextEdit', '2026.10.24.3'), ('UiInput', '2026.10.25.1')]
+for kind, text in cases:
+    if kind == 'UiButton':
+        properties = 'width:160;height:36;role:"quiet"'
+    else:
+        properties = 'width:320;height:40;font.family:"Pretendard JP";font.pixelSize:14'
+        if kind != 'Text':
+            properties += ';readOnly:true;cursorVisible:false'
+        if kind == 'UiInput':
+            properties += ';background:null'
+    qml = ('import QtQuick\nRectangle { width:540;height:110;color:"white"; '
+           + kind + ' { x:36;y:36;text:"' + text + '";' + properties + ' } }')
+    component = QQmlComponent(host.engine())
+    component.setData(qml.encode(), QUrl.fromLocalFile(str(Path('cachemonitor/qml/GlyphProbe.qml').resolve())))
+    root = component.create()
+    assert root is not None, component.errors()
+    host.setContent(QUrl(), component, root)
+    captions = [item for item in root.findChildren(QQuickItem)
+                if item.property('text') == text and item.metaObject().indexOfProperty('contentWidth') >= 0]
+    assert len(captions) == 1, (kind, captions)
+    caption = captions[0]
+    frame_count = len(frames)
+    host.show();host.quickWindow().update();host.update();host.repaint()
+    deadline = time.monotonic() + 5
+    while len(frames) <= frame_count:
+        assert time.monotonic() < deadline, 'No scene rendering completed'
+        app.processEvents()
+    image = host.grabFramebuffer().convertToFormat(QImage.Format_RGBA8888)
+    assert not image.isNull()
+    ratio = image.devicePixelRatio()
+    assert ratio == 1.5, ratio
+    assert host.devicePixelRatioF() == ratio
+    assert host.quickWindow().rendererInterface().graphicsApi() == QSGRendererInterface.Software
+    assert caption.property('truncated') is not True, (kind, text)
+    left = caption.property('leftPadding')
+    right = caption.property('rightPadding')
+    content_width = caption.property('contentWidth')
+    assert content_width <= caption.width() - left - right, (kind, text, content_width)
+    origin = caption.mapToScene(QPointF(0, 0))
+    offset_x = left
+    if host.engine().newQObject(caption).property('horizontalAlignment').toInt() == Qt.AlignHCenter:
+        offset_x += (caption.width() - left - right - content_width) / 2
+    layout = QTextLayout(text, caption.property('font'))
+    option = QTextOption()
+    option.setUseDesignMetrics(True)
+    layout.setTextOption(option)
+    layout.beginLayout()
+    line = layout.createLine()
+    line.setLineWidth(500)
+    layout.endLayout()
+    reference = QImage(image.size(), image.format())
+    reference.setDevicePixelRatio(ratio)
+    reference.fill(QColor('white'))
+    painter = QPainter(reference)
+    painter.setPen(caption.property('color'))
+    for run in layout.glyphRuns():
+        painter.drawGlyphRun(QPointF(origin.x() + offset_x,
+                                    origin.y() + caption.property('baselineOffset') - line.ascent()), run)
+    painter.end()
+    actual = bytes(image.bits())
+    expected = bytes(reference.bits())
+    assert min(expected) < 255, (kind, text, 'Empty reference')
+    differences = [(actual[i:i+4], expected[i:i+4]) for i in range(0, len(actual), 4)
+                   if actual[i:i+4] != expected[i:i+4]]
+    missing = sum(any(a > e for a, e in zip(pixel, ref)) for pixel, ref in differences)
+    extra = sum(any(a < e for a, e in zip(pixel, ref)) for pixel, ref in differences)
+    results.append((kind, text, missing, extra))
 host.close()
+for kind, text, missing, extra in results:
+    print(f'{kind} {text}: missing={missing} extra={extra}', flush=True)
+assert all(missing == extra == 0 for _, _, missing, extra in results), 'Glyph ink differs from the unclipped reference'
 """
-    result=subprocess.run([sys.executable,'-B','-c',code],cwd=Path(__file__).resolve().parents[1],
-                          capture_output=True,text=True,timeout=30)
-    assert result.returncode==0,result.stdout+result.stderr
+    result = subprocess.run([sys.executable, '-B', '-c', code], cwd=Path(__file__).resolve().parents[1],
+                            env=dict(os.environ, QT_SCALE_FACTOR='1', QT_SCREEN_SCALE_FACTORS='1.5'),
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
