@@ -7,12 +7,13 @@ import tempfile
 import time
 from pathlib import Path
 from PySide6.QtCore import Qt, QTimer, QSettings, QLocale
-from PySide6.QtGui import QFont, QFontInfo
+from PySide6.QtGui import QFontInfo
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication, QMessageBox, QSystemTrayIcon
 from .usage_collection import CollectionClient
 from .dashboard import Dashboard as UsageDashboard, STYLE, average_tokens
-from .fonts import load_bundled_fonts, configure_font_rendering, configure_high_dpi
+from .fonts import (configure_application_font, configure_font_rendering,
+                    configure_high_dpi, load_bundled_fonts)
 from .version import VERSION
 from .i18n import set_language, tr
 
@@ -181,10 +182,7 @@ def main():
     bundled_fonts = load_bundled_fonts()
     app.setQuitOnLastWindowClosed(False)
     app.setStyle("Fusion")
-    font = QFont('Pretendard JP')
-    font.setPixelSize(14)
-    font.setStyleStrategy(QFont.PreferAntialias | QFont.PreferQuality)
-    app.setFont(font)
+    configure_application_font(app)
     app.setStyleSheet(STYLE)
     server = QLocalServer()
     if not args.smoke:

@@ -7,20 +7,17 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QFont, QFontInfo
+from PySide6.QtGui import QFontInfo
 from PySide6.QtWidgets import QApplication
 from cachemonitor.quick_runtime import QuickHost
 from cachemonitor.presentation import Group, Column, Text, Tabs
-from cachemonitor.fonts import load_bundled_fonts, configure_high_dpi
+from cachemonitor.fonts import configure_application_font, configure_high_dpi, load_bundled_fonts
 
 configure_high_dpi()
 app = QApplication([])
 load_bundled_fonts()
 app.setStyle('Fusion')
-font = QFont('Pretendard JP')
-font.setPixelSize(14)
-font.setStyleStrategy(QFont.PreferAntialias | QFont.PreferQuality)
-app.setFont(font)
+configure_application_font(app)
 widget = QuickHost()
 root=Group();widget.setCentralWidget(root)
 widget.setStyleSheet('QWidget {font-family:"Pretendard JP";font-size:14px;font-weight:400;background:#fff;color:#263344;}')
