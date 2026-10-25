@@ -29,6 +29,7 @@ def configure_application_font(app: QGuiApplication) -> None:
     font = QFont('Pretendard JP')
     font.setPixelSize(14)
     font.setStyleStrategy(QFont.PreferAntialias | QFont.PreferQuality)
+    font.setHintingPreference(QFont.PreferNoHinting)
     app.setFont(font)
 
 
