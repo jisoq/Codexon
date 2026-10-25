@@ -367,7 +367,7 @@ RULES = (
     ('tools/installer_identity.py', ('install',)),
     ('tools/prepare_bad_runtime.py', ('install',)),
     ('tools/collect_notices.py', ('payload', 'notices')),
-    ('tools/package_release.py', ('payload',)),
+    ('tools/package_release.py', ('payload', 'notices', 'runtime')),
     ('tools/prepare_sources.py', ('payload', 'release')),
     ('tools/Build-*.ps1', ('install', 'runtime', 'payload')),
     ('tools/configure-app-task.ps1', ('install',)),

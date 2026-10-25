@@ -12,6 +12,7 @@ dist-*/
 !CodexonRecovery.spec
 artifacts/
 .codex/
+.serena/
 .env
 .env.*
 *.sqlite
