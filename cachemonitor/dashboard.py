@@ -197,7 +197,7 @@ class Dashboard(TrayWindow):
 
     def layout_sidebar(self):
         compact=self.height()<800
-        self.sidebar_layout.setSpacing(6 if compact else 24)
+        self.sidebar_layout.setSpacing(4 if compact else 24)
         self.sidebar_layout.setContentsMargins(16,8 if compact else 24,16,8 if compact else 20)
         self.sidebar_footer_layout.setSpacing(4 if compact else 8)
 
