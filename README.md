@@ -1,3 +1,8 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="cachemonitor/assets/brand/codexon-dark-ui.png">
+  <img src="cachemonitor/assets/brand/codexon-light-ui.png" alt="Codexon logo" width="64" height="64">
+</picture>
+
 # CODEX, ON
 
 [한국어](README.ko.md) |  [English](README.md)

@@ -50,6 +50,7 @@ Item {
         case "textarea": return textAreaComponent
         case "progress": return loadingProgressComponent
         case "statusIcon": return statusIconComponent
+        case "brandLogo": return brandLogoComponent
         case "button": return s.metricReset ? metricResetComponent : buttonComponent
         case "homeLink": return homeLinkComponent
         case "toggle": return toggleComponent
@@ -68,6 +69,14 @@ Item {
         case "recordFields": return recordFieldsComponent
         case "plot": return s.timeNavigation ? timeNavigationComponent : plotComponent
         default: return spacerComponent
+        }
+    }
+    Component {
+        id: brandLogoComponent
+        Image {
+            source: "../assets/brand/codexon-" + (appTheme.dark ? "dark" : "light") + "-ui.png"
+            fillMode: Image.PreserveAspectFit
+            Accessible.ignored: true
         }
     }
     Component { id: loadingProgressComponent; UiLoading { node: view.node } }
