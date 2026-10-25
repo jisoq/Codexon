@@ -15,6 +15,166 @@ def query(**changes):return dict(dict(now=2000,plot_width=64),**changes)
 
 def panel(view,key):return next(p for p in view['panels'] if p['key']==key)
 
+
+def test_clock_hours_pool_calls_across_dates_without_averaging_daily_statistics():
+    from datetime import datetime
+    first=datetime(2026,10,1,9).timestamp();second=datetime(2026,10,2,9).timestamp()
+    rows=[row(0,ts=first,duration=100.)]+[row(i,ts=second+i,duration=1.) for i in range(1,10)]
+    rows.extend([row(11,ts=second+20,sid='other',input=10,cached=1,duration=None),
+                 row(12,ts=first+3600,output=100,completion_latency_ms=1000,output_speed=100),
+                 row(13,ts=second+3600,output=100,completion_latency_ms=9000,output_speed=100/9),
+                 row(14,ts=second+30,sid='invalid',cached=101,duration=None),
+                 row(15,ts=second+40,sid='conflict',input_conflict=True,duration=None)])
+    q=query(now=second+7200,time_range=[first,second+7200],trend_mode='hour_of_day')
+    source=engine(rows);projector=PerformanceTrends();view=projector.query(source,q)
+    assert (view['start'],view['end'])==(first,second+7200)
+    duration=panel(view,'duration')['lines'][0]['points'][9]
+    assert duration['value']==1 and duration['distribution']['median']==1
+    assert duration['kind']=='clock_hour' and duration['hour']==duration['bucket']==9
+    assert not {'ts','start','end','baseline','delta','direction'} & duration.keys()
+    assert duration['coverage']==(10,13) and duration['band_valid'] and not duration['outer_valid']
+    speed=panel(view,'output_speed')['lines'][0]['points'][10]
+    assert speed['value']==20 and speed['totals']==dict(output=200,seconds=10)
+    cache=panel(view,'session_cache')['lines'][0]['points'][9]
+    assert cache['value']==50 and cache['coverage']==(2,4) and cache['totals']['valid_calls']==11
+    assert panel(view,'session_cache')['lines'][0]['coverage']==(2,4)
+    assert panel(view,'cost')['lines'][0]['points'][8]['value'] is None
+    assert sum(p['value'] for p in panel(view,'count')['lines'][0]['points'])==len(rows)
+    timeline=projector.query(source,dict(q,trend_mode='timeline',granularity='auto'))
+    assert timeline['trend_mode']=='timeline' and panel(timeline,'duration')['lines'][0]['points'][0]['kind']=='rolling'
+    assert projector.query(source,q)==view
+
+
+@pytest.mark.parametrize('samples',[0,1,4,5,9,10,29,30])
+def test_clock_hours_keep_missing_and_insufficient_samples_as_gaps(samples):
+    from datetime import datetime
+    start=datetime(2026,10,1).timestamp();end=datetime(2026,10,3).timestamp()
+    rows=[row(i,ts=datetime(2026,10,1,23).timestamp()+i) for i in range(samples)]
+    rows.extend([row(100,ts=start-1),row(101,ts=end),row(102,ts=end+1)])
+    view=PerformanceTrends().query(engine(rows),query(now=end,time_range=[start,end],trend_mode='hour_of_day'))
+    duration=panel(view,'duration')['lines'][0]['points']
+    point=duration[23]
+    assert point['value']==(1 if samples>=5 else None)
+    assert point['band_valid']==(samples>=10) and point['outer_valid']==(samples>=30)
+    assert point['coverage']==(samples,samples)
+    assert all(p['value'] is None for p in duration[1:23])
+    counts=panel(view,'count')['lines'][0]['points']
+    assert counts[0]['value']==1 and counts[23]['value']==samples
+    assert sum(p['value'] for p in counts)==samples+1
+    assert len(counts)==24
+
+
+@pytest.mark.integration
+@pytest.mark.essential
+def test_native_clock_controls_render_inspect_and_keep_epoch_navigation(tmp_path):
+    import time
+    from pathlib import Path
+    from datetime import datetime
+    from PySide6.QtCore import QSettings,QObject,Qt,QPointF
+    from PySide6.QtGui import QFontMetrics
+    from PySide6.QtTest import QTest
+    from cachemonitor.performance_panel import PerformancePanel
+    from cachemonitor.quick_qa import mount,dispose,control,click,render_plot,scene_view
+    from cachemonitor.i18n import set_language,tr
+
+    start=datetime(2026,10,1).timestamp();end=datetime(2026,10,8).timestamp()
+    rows=[row(index,ts=datetime(2026,10,1+day,hour,sample).timestamp(),model=model,service_tier=mode,
+              cost=(1 if model=='alpha' else 3)+sample/10,duration=float(sample),effort='high')
+          for index,(day,hour,sample,model,mode) in enumerate(
+              (day,hour,sample,model,mode) for day in range(7) for hour in (0,9,10,23)
+              for sample in range(6) for model in ('alpha','beta') for mode in ('Standard','Fast'))]
+    source=engine(rows);projector=PerformanceTrends();pending=[]
+    owner=SimpleNamespace(settings=QSettings(str(tmp_path/'clock.ini'),QSettings.IniFormat),snapshot=dict(ts=end),render=lambda:None)
+    ui=PerformancePanel(owner)
+    def current_query():
+        return query(now=end,plot_width=768,time_range=ui.query_range(end,1),granularity='auto',trend_mode=ui.trend_mode,
+                     trend_selection=dict(models=sorted(m for m,v in ui.models.items() if v) if ui.models else None,
+                                          modes=sorted(m for m,v in ui.modes.items() if v)))
+    owner.render=lambda:pending.append(current_query())
+    ui.apply(projector.query(source,current_query()))
+    ui.time_range=[start,end];ui.follow_latest=False
+    host=mount(ui,1440,880)
+    evidence=Path(__file__).resolve().parents[1]/'artifacts/time-of-day';evidence.mkdir(parents=True,exist_ok=True)
+    def wait_for(condition):
+        deadline=time.monotonic()+4
+        while not condition():
+            assert time.monotonic()<deadline,'Clock controls did not settle'
+            QTest.qWait(10);host.quick.grabFramebuffer()
+    try:
+        chart=ui.plots['cost'];item=render_plot(host,chart)
+        for plot in ui.plots.values():control(host,plot).findChild(QObject,'plotHover').setProperty('enabled',False)
+        old=next(p for p in chart.rows if p['value'] is not None);ui.show_interval(old,'cost')
+        before=(list(ui.time_range),ui.follow_latest,dict(ui.models),dict(ui.modes))
+        assert host.quick.grabFramebuffer().save(str(evidence/'clock-before.png'))
+        click(host,control(host,ui.trend_buttons['hour_of_day']))
+        assert ui.trend_mode=='hour_of_day' and ui.inspected is None
+        assert not chart.clock and chart.plot_range==(start,end)
+        assert pending[-1]['time_range']==[start,end]
+        ui.show_interval(old,'cost');assert ui.inspection[0]=='timeline'
+        ui.apply(projector.query(source,pending[-1]))
+        assert ui.inspected is None and ui.inspection is None
+        assert chart.clock and chart.plot_range==(0,24) and ui.range==(start,end)
+        assert (ui.time_range,ui.follow_latest,ui.models,ui.modes)==before
+        assert not ui.window_note.isVisible() and '확대하면' not in ui.chart_help.text()
+        item=render_plot(host,chart)
+        labels=chart.time_labels(QFontMetrics(host.font()))
+        assert labels[0][1]=='00:00' and labels[-1][1]=='24:00'
+        assert all(a[2].right()+12<=b[2].left() for a,b in zip(labels,labels[1:]))
+        point=next(p for p in chart.rows if p['hour']==23 and p['model']=='alpha' and p['service_tier']=='Standard')
+        click(host,item,chart.xy(point).x(),chart.xy(point).y())
+        assert ui.inspected[0]['hour']==23 and ui.inspection==('clock_hour',23)
+        assert ui.details.period.text().startswith('23:00 - 24:00\n2026.10.01')
+        assert not ui.details.comparison.isVisible()
+        assert 'alpha / Standard' in ui.details.mode_comparison.text() and 'beta / Fast' in ui.details.mode_comparison.text()
+        click(host,control(host,ui.mode_buttons['Standard']))
+        assert chart.clock and {p['service_tier'] for p in chart.rows}=={'Standard'}
+        assert pending[-1]['trend_selection']['modes']==['Standard'] and '확대하면' not in ui.chart_help.text()
+        click(host,control(host,ui.mode_buttons['all']))
+        assert host.quick.grabFramebuffer().save(str(evidence/'clock-wide.png'))
+        image=host.quick.grabFramebuffer();scale=image.width()/host.quick.width()
+        def pixel(hour,value):
+            xy=item.mapToScene(QPointF(chart.x(hour),chart.y(value)))
+            return image.pixelColor(round(xy.x()*scale),round(xy.y()*scale))
+        def distance(a,b):return sum(abs(a.getRgb()[i]-b.getRgb()[i]) for i in range(3))
+        ink=chart.ink(point);background=chart.color('surface')
+        assert distance(pixel(10,1.25),ink)<distance(pixel(10,1.25),background)
+        assert distance(pixel(14,1.25),background)<distance(pixel(14,1.25),ink)
+        item.forceActiveFocus();QTest.keyClick(host.quick,Qt.Key_Plus)
+        assert ui.time_range==[start,end] and chart.plot_range==(0,24)
+        QTest.keyClick(host.quick,Qt.Key_Left)
+        assert ui.inspection==('clock_hour',22) and ui.inspected[0]['value'] is None
+        QTest.keyClick(host.quick,Qt.Key_Right);assert ui.inspection==('clock_hour',23)
+        navigator=control(host,ui.navigator);navigator.forceActiveFocus();QTest.keyClick(host.quick,Qt.Key_Plus)
+        assert ui.time_range[0]>start and ui.time_range[1]<end
+        assert pending[-1]['time_range']==ui.time_range and min(ui.time_range)>1_000_000_000
+        click(host,control(host,ui.follow_button))
+        assert ui.follow_latest and ui.time_range[1]==end
+        restored=PerformancePanel(owner);assert restored.trend_mode=='hour_of_day'
+        restored.deleteLater()
+        host.resize(760,800);ui.update_layout(760)
+        wait_for(lambda:scene_view(host,ui.chart_scroll).width()>650)
+        chart=ui.plots['cost'];item=render_plot(host,chart)
+        labels=chart.time_labels(QFontMetrics(host.font()))
+        assert labels[0][1]=='00:00' and labels[-1][1]=='24:00'
+        for node in ui.trend_buttons.values():
+            target=control(host,node);origin=target.mapToScene(QPointF(0,0))
+            assert target.isVisible() and origin.x()>=0 and origin.x()+target.width()<=host.quick.width()
+        assert host.quick.grabFramebuffer().save(str(evidence/'clock-compact.png'))
+        click(host,control(host,ui.trend_buttons['timeline']))
+        assert ui.inspected is None and chart.clock
+        ui.apply(projector.query(source,pending[-1]))
+        assert not chart.clock and chart.plot_range==ui.range and ui.inspection is None
+        click(host,control(host,ui.trend_buttons['hour_of_day']))
+        empty=dict(pending[-1],trend_selection=dict(models=[],modes=['Standard']))
+        ui.apply(projector.query(source,empty));chart=ui.plots['cost'];item=render_plot(host,chart)
+        assert not chart.rows and chart.time_labels(QFontMetrics(host.font()))[-1][1]=='24:00'
+        assert host.quick.grabFramebuffer().save(str(evidence/'clock-empty.png'))
+        set_language('en')
+        assert tr('기간별')=='Timeline' and tr('시간대별')=='Time of day'
+        assert not host.qml_errors
+    finally:
+        set_language('ko');dispose(host)
+
 def test_rendered_series_survive_later_curves_and_keep_isolated_modes(tmp_path):
     from PySide6.QtCore import QSettings,QObject
     from PySide6.QtGui import QColor
@@ -690,7 +850,7 @@ def test_dashboard_tab_worker_contract_and_navigation(tmp_path):
     from PySide6.QtWidgets import QApplication
     from cachemonitor.dashboard import Dashboard
     from cachemonitor.core import Session
-    from cachemonitor.quick_qa import dispose,scene_view,walk
+    from cachemonitor.quick_qa import dispose,scene_view,walk,control,click
     from test_ui import wait_for_rendered
     app=QApplication.instance() or QApplication([])
     app.setProperty('cachemonitorDisableShellIntegration',True)
@@ -716,6 +876,12 @@ def test_dashboard_tab_worker_contract_and_navigation(tmp_path):
         assert w.engine.page_query(w.query())['performance']['granularity']=='auto'
         w.show()
         wait_for_rendered(lambda:w.pages.isPageReady(3) and w.pages.isVisible(),timeout=5)
+        bounds=w.performance_panel.range
+        click(w,control(w,w.performance_panel.trend_buttons['hour_of_day']))
+        assert w.query()['trend_mode']=='hour_of_day' and w.performance_panel.plots['cost'].clock
+        assert w.performance_panel.range==bounds and min(w.query()['time_range'])>1_000_000_000
+        click(w,control(w,w.performance_panel.trend_buttons['timeline']))
+        assert w.query()['trend_mode']=='timeline' and not w.performance_panel.plots['cost'].clock
         # Exercise one cold request per preset, then its cached reuse.
         w.async_mode=True;w.client_cache.clear()
         def loading_panels():
