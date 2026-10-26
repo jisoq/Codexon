@@ -167,12 +167,10 @@ class PreparedAnalysisEngine(AnalysisEngine):
         self.results.clear()
         affected=set(pending)|{tuple(key) for key in removed}
         self.parts.discard(lambda key:key[0] in affected)
-        self.page_results.clear()
+        self.page_results.discard(lambda key:not same_facts or key[0]!='performance')
         if not same_facts:
-            for name in ('_category_projection','performance','_trend_catalog','_trend_bounds'):
+            for name in ('_category_projection','_trend_catalog','_trend_bounds'):
                 self.__dict__.pop(name,None)
-        elif getattr(self,'performance',None) is not None and self.performance.signature is not None:
-            self.performance.signature=(self.revision,*self.performance.signature[1:])
         for key in removed:
             self.sessions.pop(tuple(key), None)
             self.internal_sessions.pop(tuple(key), None)
