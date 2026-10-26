@@ -21,7 +21,7 @@ class CycleTable(Table):
 
     def __init__(self):
         super().__init__(headers=['주기','요약','주간 예상 가치','실측 시간'])
-        self.put(inline=True,linkedHover=True,highlightedRow=-1,rowHeight=44,widths=[140,125,120,80],
+        self.put(rowDetails=True,linkedHover=True,highlightedRow=-1,rowHeight=44,widths=[140,125,120,80],
                  columnStretchWeights=[2,1,1,1])
         self.setMinimumHeight(114)
         self.setAccessibleName('주기별 실측 시간과 소모량 및 주간 예상 가치 / Enter로 상세 열기')
@@ -32,7 +32,6 @@ class CycleTable(Table):
         rows=[dict({key:period[key] for key in fields},id=period['start'])
               for period in sorted(periods,key=lambda period:period['start'])]
         self.set_rows(rows,self.format_row)
-        self.setFixedHeight(max(114,70+self._state['rowHeight']*len(rows)))
 
     def activate_cycle(self,index,column=0):
         if 0<=index<self.rowCount():self.cycle_activated.emit(self.model().rows[index]['start'])

@@ -12,7 +12,6 @@ dist-*/
 !CodexonRecovery.spec
 artifacts/
 .codex/
-.serena/
 .env
 .env.*
 *.sqlite
@@ -31,3 +30,6 @@ cachemonitor/_cpu_native*.pyd
 cachemonitor/_cpu_native*.so
 cachemonitor/_cpu_native.build.json
 cachemonitor/_cpu_native*.tmp
+!/.serena/
+/.serena/*
+!/.serena/project.yml

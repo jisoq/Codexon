@@ -168,7 +168,7 @@ class QuotaPanel(Group):
         self.history_loading=Group()
         self.history_loading.hide();chart_layout.addWidget(self.history_loading)
         chart_layout.addWidget(self.history)
-        self.cycle_table=CycleTable();self.cycle_table.hide();chart_layout.addWidget(self.cycle_table)
+        self.cycle_table=CycleTable();self.cycle_table.hide();chart_layout.addWidget(self.cycle_table,1)
         self.cycle_table.cycle_activated.connect(self.open_summary_cycle)
         self._cycle_hover_owner=None
         self.cycle_table.rowHovered.connect(lambda index:self.hover_cycle(index,'table'))
@@ -181,6 +181,7 @@ class QuotaPanel(Group):
         chart_layout.addWidget(self.exclusions.history)
         chart_layout.addWidget(self.exclusions.message)
         self.cycle_choice.currentIndexChanged.connect(self.render_history)
+        self._history_section=chart
         layout.addWidget(chart)
         self.conversion=Group();self.conversion.put(background='surface',radius=6)
         conversion_layout=Column(self.conversion);conversion_layout.setContentsMargins(20,18,20,18);conversion_layout.setSpacing(16)
@@ -240,6 +241,7 @@ class QuotaPanel(Group):
         self.model_choice.currentIndexChanged.connect(self.change_model)
         self.mode_assumption.toggled.connect(self.render)
         layout.addStretch()
+        self._page_spacer=layout.itemAt(layout.count()-1)
         self.render()
         from .quota_layout import configure_quota_layout
         configure_quota_layout(self)
@@ -455,6 +457,11 @@ class QuotaPanel(Group):
         # Finish the chart's pointer event before replacing its selected data.
         QTimer.singleShot(0,select)
 
+    def _show_cycle_table(self,visible):
+        self.cycle_table.setVisible(visible)
+        self._history_section.put(stretch=1 if visible else 0)
+        self._page_spacer.setVisible(not visible)
+
     def render_history(self,*_):
         from bisect import bisect_left
         self._set_loading(self.cycle_loading,
@@ -532,7 +539,7 @@ class QuotaPanel(Group):
                 self.history_loading.setFixedHeight(max(300,self.history.height()))
                 self._set_loading(self.history_loading,loading,'선택한 주기의 차트를 준비하고 있습니다.',retained=retained)
                 self.history.setVisible(retained);self.history_legend.setVisible(retained)
-                self.cycle_table.setVisible(retained and all_cycles)
+                self._show_cycle_table(retained and all_cycles)
                 self.model_legend.setVisible(retained and not all_cycles)
                 self.history_empty.setVisible(not loading and not retained)
                 if not loading:self.history_empty.setText('차트를 계산하지 못했습니다.')
@@ -555,7 +562,7 @@ class QuotaPanel(Group):
         self.remaining_legend.setText('주기 소모량 (%p)' if all_cycles else '남은 사용량 (%)')
         self.history.set_series(series)
         if all_cycles:self.cycle_table.set_periods(self._view['periods'])
-        self.cycle_table.setVisible(all_cycles and bool(self.history.rows))
+        self._show_cycle_table(all_cycles and bool(self.history.rows))
         self.history.legendChanged.emit(self.history.legend_values())
         models=series.get('model_share',{}).get('models',[])
         if getattr(self,'_legend_models',None)!=models:

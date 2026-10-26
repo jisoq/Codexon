@@ -413,7 +413,8 @@ QA_SMOKES = {
     'tools/verify_recovery.py': 'recovery',
 }
 DOC_PATTERNS = ('docs/*', 'releases/*', '*.md', '*.txt', 'LICENSE*', '.gitignore',
-                '.gitattributes', '.github/ISSUE_TEMPLATE/*', '.agents/skills/*/agents/openai.yaml')
+                '.gitattributes', '.github/ISSUE_TEMPLATE/*', '.agents/skills/*/agents/openai.yaml',
+                '.serena/project.yml')
 
 
 def matches(path, patterns):

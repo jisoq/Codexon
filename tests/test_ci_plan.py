@@ -87,6 +87,21 @@ def test_basic_ci_preserves_unmapped_change_failure():
     assert plan['unmapped'] == ['cachemonitor/unmapped_new.py', 'tools/unmapped_new.py']
 
 
+@pytest.mark.parametrize('changed,package_changed', [
+    ({'.serena/project.yml'}, set()),
+    (set(), {'.serena/project.yml'}),
+    ({'.serena/project.yml'}, {'.serena/project.yml'}),
+])
+def test_serena_project_configuration_has_no_runtime_or_deployment_impact(changed, package_changed):
+    plan = build_plan(changed, base='verified', package_changed=package_changed)
+    assert not plan['unmapped']
+    assert plan['source_args'] == ['--basic']
+    assert plan['tests'] == tuple(sorted(CORE_TESTS))
+    assert not plan['affected_tests'] and not plan['full']
+    assert not plan['package'] and not plan['package_impact']
+    assert not plan['qa_smokes'] and not plan['dependencies']
+
+
 def test_deferred_qa_does_not_probe_published_binaries(tmp_path, monkeypatch, capsys):
     paths = {'tools/verify_proxy_update.py', 'tools/verify_gui_handoff.py'}
     monkeypatch.setattr(ci_plan, 'ROOT', tmp_path)
