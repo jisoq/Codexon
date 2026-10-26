@@ -103,9 +103,6 @@ class PreparedAnalysisEngine(AnalysisEngine):
                 owner = snapshot.owner(*key)
                 pending[key] = (self._owner_state(key, owner['metadata'], owner['call_metadata'], token.generation, owner['owner_ordinal'], owner['request_maps'])
                                 if owner is not None else None)
-            # Request activity and titles do not change category or chart facts.
-            # Inspect committed call writes, including deletion markers, rather
-            # than treating the publication generation as a call revision.
             with snapshot._cursor('SELECT COALESCE(MAX(id),0) FROM publications WHERE state=1') as cursor:
                 publication_batch=cursor.fetchone()[0]
             with snapshot._cursor('SELECT 1 FROM calls r INDEXED BY calls_batch '

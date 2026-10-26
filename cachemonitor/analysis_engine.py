@@ -133,8 +133,6 @@ class AnalysisEngine:
         self.results=BoundedCache(6,160000)
         self.statistics=BoundedCache(2048,160000)
         self.summaries=BoundedCache(64,160000)
-        # Cache the delivered projection by its retained bytes, independently
-        # of how many historical calls contributed to its exact totals.
         self.page_results=BoundedCache(8,16*1024*1024)
         self.revision=0
         self.call_revision=0

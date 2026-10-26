@@ -1933,7 +1933,7 @@ def test_trend_metadata_skips_internal_history_within_read_budget(tmp_path):
         try:
             with engine.read_scope():
                 source=_Input(engine,(('model',),('Standard',)))
-                scopes,count=source.metadata(110,sort_start=0,sort_keys=False,global_catalog=True)
+                scopes,count=source.metadata(110,global_catalog=True)
                 assert count==4 and set(scopes)=={('model','Standard','high')}
                 assert source.catalog_values==('model',)
         finally:engine.close()
