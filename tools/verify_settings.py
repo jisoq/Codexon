@@ -10,7 +10,7 @@ sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('--output',type=Path,required=True)
     args=parser.parse_args();args.output.mkdir(parents=True,exist_ok=True)
-    from cachemonitor.fonts import configure_font_rendering,configure_high_dpi,load_bundled_fonts
+    from cachemonitor.fonts import configure_application_font,configure_font_rendering,configure_high_dpi,load_bundled_fonts
     configure_font_rendering();configure_high_dpi()
     from PySide6.QtCore import QSettings,Qt
     from PySide6.QtWidgets import QApplication
@@ -20,7 +20,8 @@ def main():
     from cachemonitor.i18n import set_language
     from cachemonitor.theme import shared_theme
     from cachemonitor.version import VERSION
-    app=QApplication([]);load_bundled_fonts();app.setProperty('cachemonitorDisableShellIntegration',True)
+    app=QApplication([]);load_bundled_fonts();app.setStyle('Fusion');configure_application_font(app)
+    app.setProperty('cachemonitorDisableShellIntegration',True)
     report={'model_requests':0,'captures':[]}
     for language in ('ko','en'):
         set_language(language)

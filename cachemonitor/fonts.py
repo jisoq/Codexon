@@ -4,7 +4,7 @@ import os
 import sys
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QFontDatabase, QGuiApplication
+from PySide6.QtGui import QFont, QFontDatabase, QGuiApplication
 
 
 def configure_high_dpi():
@@ -22,6 +22,15 @@ def configure_font_rendering():
         platform = os.environ.get('QT_QPA_PLATFORM', 'windows')
         if platform.split(':', 1)[0] == 'windows' and 'fontengine=' not in platform:
             os.environ['QT_QPA_PLATFORM'] = platform + ':fontengine=freetype'
+
+
+def configure_application_font(app: QGuiApplication) -> None:
+    """Set the default UI font before any Qt Quick scene is created."""
+    font = QFont('Pretendard JP')
+    font.setPixelSize(14)
+    font.setStyleStrategy(QFont.PreferAntialias | QFont.PreferQuality)
+    font.setHintingPreference(QFont.PreferNoHinting)
+    app.setFont(font)
 
 
 def load_bundled_fonts(weights=('Regular', 'Medium', 'SemiBold', 'Bold')):

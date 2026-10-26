@@ -35,8 +35,10 @@ def snapshot(now=None):
 @pytest.fixture
 def dashboard(tmp_path):
     app=QApplication.instance() or QApplication([])
-    from cachemonitor.fonts import load_bundled_fonts
-    load_bundled_fonts();previous=app.property('cachemonitorDisableShellIntegration');app.setProperty('cachemonitorDisableShellIntegration',True)
+    from cachemonitor.fonts import configure_application_font, load_bundled_fonts
+    previous_font=app.font()
+    load_bundled_fonts();configure_application_font(app)
+    previous=app.property('cachemonitorDisableShellIntegration');app.setProperty('cachemonitorDisableShellIntegration',True)
     settings=QSettings(str(tmp_path/'dashboard.ini'),QSettings.IniFormat);settings.setValue('ui/theme','light')
     window=Dashboard(['fixture'],start_worker=False,settings=settings,static_snapshot=snapshot())
     window.show();QTest.qWait(70)
@@ -45,6 +47,7 @@ def dashboard(tmp_path):
     finally:
         window.quitting=True;window.tick.stop();window.tray.hide();window.observer_panel.stop()
         dispose(window)
+        app.setFont(previous_font)
         app.setProperty('cachemonitorDisableShellIntegration',previous)
 
 
