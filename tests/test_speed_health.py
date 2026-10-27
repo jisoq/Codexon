@@ -2,6 +2,7 @@
 from copy import deepcopy
 from types import SimpleNamespace
 import weakref
+import pytest
 
 from cachemonitor.speed_health import classify, SpeedHealth, MAX_BASELINE
 from cachemonitor import speed_health as speed_module
@@ -380,3 +381,165 @@ def test_main_monitor_keeps_current_speed_health_during_call_and_detail_selectio
     assert content.state['heartbeatLabel'] in content.status_detail()
     assert any(r['id']=='main-detail' for r in content.monitor_links())
     content.deleteLater();app.processEvents()
+
+def test_retained_graph_bound_covers_large_peer_keys_and_dirty_previous_results(monkeypatch):
+    from tools.benchmark_prepared_speed import retained_graph_bytes
+    peer = session([100]*30, sid='reference', model='model'+'x'*8000)
+    for number, row in enumerate(peer['history']):
+        row['key'] = 'peer-' + str(number) + '界'*300
+    sources = [peer] + [session([35]*4, sid=f'owner-{number}', start=5000+number*1000,
+                               model='model'+'x'*8000) for number in range(24)]
+    engine, tracker = AnalysisEngine(), SpeedHealth()
+    ingest(engine, sources)
+    assert tracker.collect(engine) == expected(engine)
+    assert retained_graph_bytes(tracker) <= tracker.metrics['estimated_metadata_bytes']
+    previous = tracker.results
+    saved = deepcopy(previous)
+    retired = [weakref.ref(replay) for replay in tracker.replays.values()]
+    staged = [None]
+    admit = speed_module.SpeedHealth._admit
+    advance = speed_module._ScopeReplay.advance
+
+    def audited_admit(current, proofs):
+        value = admit(current, proofs)
+        staged[0] = proofs
+        assert retained_graph_bytes(current, proofs, previous) <= current.metrics['estimated_metadata_bytes']
+        return value
+
+    def audited_advance(replay, steps):
+        assert all(ref() is None for ref in retired)
+        assert retained_graph_bytes(tracker, staged[0], previous) <= tracker.metrics['estimated_metadata_bytes']
+        result = advance(replay, steps)
+        assert retained_graph_bytes(tracker, staged[0], previous) <= tracker.metrics['estimated_metadata_bytes']
+        return result
+
+    monkeypatch.setattr(speed_module.SpeedHealth, '_admit', audited_admit)
+    monkeypatch.setattr(speed_module._ScopeReplay, 'advance', audited_advance)
+    peer['history'][0]['completion_latency_ms'] *= 2
+    ingest(engine, sources, peer)
+    assert tracker.collect(engine) == expected(engine)
+    assert previous == saved
+    assert retained_graph_bytes(tracker, previous) <= tracker.metrics['estimated_metadata_bytes']
+
+
+def test_empty_reducer_graph_fits_its_retained_bound():
+    from tools.benchmark_prepared_speed import retained_graph_bytes
+    tracker = SpeedHealth()
+    assert tracker.collect(AnalysisEngine()) == {}
+    assert retained_graph_bytes(tracker) <= tracker.metrics['estimated_metadata_bytes']
+
+def test_long_condition_populations_are_reused_or_released_during_corrections(monkeypatch):
+    from tools.benchmark_prepared_speed import retained_graph_bytes
+    sources = [session([100]*4, sid=f'wide-{number}', model=f'model-{number}-'+'x'*28000)
+               for number in range(8)]
+    engine, tracker = AnalysisEngine(), SpeedHealth()
+    ingest(engine, sources)
+    assert tracker.collect(engine) == expected(engine)
+    previous = [tracker.results]
+    admit = speed_module.SpeedHealth._admit
+    advance = speed_module._ScopeReplay.advance
+
+    def audit(current, proofs):
+        assert current.proofs is proofs
+        pools = admit(current, proofs)
+        assert retained_graph_bytes(current, previous[0]) <= current.metrics['estimated_metadata_bytes']
+        return pools
+
+    def audited_advance(replay, steps):
+        assert retained_graph_bytes(tracker, previous[0]) <= tracker.metrics['estimated_metadata_bytes']
+        result = advance(replay, steps)
+        assert retained_graph_bytes(tracker, previous[0]) <= tracker.metrics['estimated_metadata_bytes']
+        return result
+
+    monkeypatch.setattr(speed_module.SpeedHealth, '_admit', audit)
+    monkeypatch.setattr(speed_module._ScopeReplay, 'advance', audited_advance)
+    for operation in ('correct', 'remove', 'change-model'):
+        previous[0] = tracker.results
+        saved = deepcopy(previous[0])
+        if operation == 'remove':
+            sources = sources[4:]
+            ingest(engine, sources)
+        else:
+            for source in sources:
+                for row in source['history']:
+                    row['model'] = row['model'].encode().decode() + ('new' if operation == 'change-model' else '')
+                    row['output'] += 1
+            ingest(engine, sources, *sources)
+        assert tracker.collect(engine) == expected(engine)
+        assert previous[0] == saved
+        for (_, condition), replay in tracker.replays.items():
+            assert condition is replay.condition
+            assert any(condition is key for proof in tracker.proofs.values() for key in proof.buckets)
+        assert retained_graph_bytes(tracker, previous[0]) <= tracker.metrics['estimated_metadata_bytes']
+
+
+def test_shared_scope_owner_removal_releases_previous_peer_pool_before_admission(monkeypatch):
+    from tools.benchmark_prepared_speed import retained_graph_bytes
+    survivor = session([100], sid='a', start=20000)
+    removed = session([100]*100, sid='b')
+    for number, row in enumerate(removed['history']):
+        row['key'] = f'b-{number}-'+'x'*1500
+    engine, tracker = AnalysisEngine(), SpeedHealth()
+    ingest(engine, [survivor, removed])
+    assert tracker.collect(engine) == expected(engine)
+    previous = tracker.results
+    assert all(not result['active'] for result in previous.values())
+    saved = deepcopy(previous)
+    old_replay = weakref.ref(next(iter(tracker.replays.values())))
+    admit = speed_module.SpeedHealth._admit
+    observed = []
+
+    def audited_admit(current, proofs):
+        pools = admit(current, proofs)
+        actual = retained_graph_bytes(current, previous)
+        estimate = current.metrics['estimated_metadata_bytes']
+        observed.append((actual, estimate))
+        assert actual <= estimate, (actual, estimate)
+        assert old_replay() is None
+        return pools
+
+    monkeypatch.setattr(speed_module.SpeedHealth, '_admit', audited_admit)
+    ingest(engine, [survivor])
+    assert tracker.collect(engine) == expected(engine)
+    assert observed and previous == saved
+    assert retained_graph_bytes(tracker, previous) <= tracker.metrics['estimated_metadata_bytes']
+
+
+
+@pytest.mark.parametrize('remove_first', [False, True])
+def test_removed_owner_condition_identities_fit_the_admission_bound(monkeypatch, remove_first):
+    import sys
+    from tools.benchmark_prepared_speed import retained_graph_bytes
+    first, second = [], []
+    for number in range(4):
+        model = f'model-{number}-'+'x'*30000
+        home = f'home-{number}-'+'h'*300
+        first.append(session([100], sid=f'a{number}', start=20000,
+            home=home.encode().decode(), model=model.encode().decode()))
+        second.append(session([100], sid=f'b{number}',
+            home=home.encode().decode(), model=model.encode().decode()))
+        assert first[-1]['home'] is not second[-1]['home']
+        assert first[-1]['history'][0]['model'] is not second[-1]['history'][0]['model']
+    engine, tracker = AnalysisEngine(), SpeedHealth()
+    ingest(engine, [item for pair in zip(first, second) for item in pair])
+    assert tracker.collect(engine) == expected(engine)
+    previous = tracker.results
+    saved = deepcopy(previous)
+    admit = speed_module.SpeedHealth._admit
+    observed = []
+
+    def audited_admit(current, proofs):
+        pools = admit(current, proofs)
+        caller = sys._getframe(1).f_locals
+        dirty, bucket = caller['dirty'], caller.get('bucket')
+        assert dirty
+        actual = retained_graph_bytes(current, previous, dirty, bucket)
+        estimate = current.metrics['estimated_metadata_bytes']
+        observed.append((actual, estimate))
+        assert actual <= estimate, (actual, estimate)
+        return pools
+
+    monkeypatch.setattr(speed_module.SpeedHealth, '_admit', audited_admit)
+    ingest(engine, second if remove_first else first)
+    assert tracker.collect(engine) == expected(engine)
+    assert observed and previous == saved

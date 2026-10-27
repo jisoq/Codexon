@@ -695,6 +695,9 @@ class OverlayContent(Node):
         if not d.get('model_mismatch') and d.get('model_state') in ('관측 충돌','충돌'):
             result.append(('모델 관측 충돌','secondary'))
         if d.get('model_state')=='관측 누락':result.append(('모델 관측 누락','secondary'))
+        warning=self.speed_alert().get('status')
+        if warning=='pending':result.append(('출력 속도 경고 분석 중','secondary'))
+        elif warning=='unavailable':result.append(('출력 속도 경고 미확인','secondary'))
         # Current collection failures take precedence over historical gaps.
         return sorted(dict.fromkeys(result),key=lambda item:0 if item[1]=='error' else 1 if '지연' in item[0] else 2)
     def status_text(self):

@@ -110,13 +110,18 @@ class PreparedWriter:
             raise ValueError('notification floor must be a finite timestamp')
         self.cache_floor=value
 
-    def _maintain(self,store,archive=None):
+    def _maintain(self,store,archive=None,speed_writer=None):
         if archive is not None and archive.has_work:archive.step()
         deadline=time.monotonic()+.02
         while not self.stopped.is_set():
             try:
-                if not store.maintain():return False
+                if not store.maintain():
+                    if speed_writer is not None:
+                        store._wal_admission()
+                        speed_writer.resume_optional()
+                    return False
             except WriteDeferred:
+                if speed_writer is not None:speed_writer.cancel_optional()
                 # Cleanup is still owed. Let the bounded query release its read
                 # snapshot without crashing the writer or spinning on the WAL.
                 self.stopped.wait(.05)
@@ -125,11 +130,12 @@ class PreparedWriter:
         return True
 
     def _resume_writes(self,store,speed_writer):
+        speed_writer.cancel_optional()
         try:
             if store.stage is not None:
                 speed_writer.abort(store.stage)
-            else:
-                store._wal_admission()
+            store._wal_admission()
+            speed_writer.resume_optional()
             return True
         except WriteDeferred:
             self.stopped.wait(.05)
@@ -146,10 +152,10 @@ class PreparedWriter:
             collector = CollectionClient(homes,index_path,model_evidence_path)
             store = PreparedStore(self.path,replace(Limits(),read_seconds=60,read_vm_steps=20_000_000),
                                   cancel=self.stopped.is_set)
-            from .prepared_speed_writer import PreparedSpeedWriter
+            from .prepared_speed_writer import PreparedWarningWorker
             from .prepared_ingest import preparation_signature
-            speed_writer=PreparedSpeedWriter(store,preparation=preparation_signature(),
-                                              cancel=self.stopped,read_seconds=60)
+            speed_writer=PreparedWarningWorker(store,preparation=preparation_signature(),
+                cancel=self.stopped,read_seconds=60,wake=lambda:self.control.put('speed'))
             publisher = PreparedPublisher(self.cache_floor)
             blocked_publication = None
             adapter = None
@@ -225,7 +231,7 @@ class PreparedWriter:
                     if pending_reset:
                         publisher.reset()
                     with active.measure('publication'):
-                        light=publisher.publish(value,store,speed_writer.tracker.results)
+                        light=publisher.publish(value,store,speed_writer.results)
                     active.counts['generation']=store.token.generation
                     active.counts['publications']=active.counts.get('publications',0)+1
                     for name,field in (('session_delta','sessions'),('overlay_delta','overlay_sessions'),('removed_delta','removed')):
@@ -241,6 +247,30 @@ class PreparedWriter:
                     if cycle is None:timing(active)
                 delivery_delta=None
                 pending_reset=False
+
+            def finish_warnings():
+                nonlocal delivery_delta,maintenance_due,write_deferred
+                before=store.token
+                try:
+                    completion=speed_writer.commit_completed()
+                except WriteDeferred:
+                    speed_writer.cancel_optional()
+                    write_deferred=True
+                    return
+                if completion is None:return
+                if completion.error is not None:
+                    from .quota_diagnostics import record_failure
+                    name,message,frames=completion.error
+                    record_failure(Path(quota_path).with_suffix('.analysis.sqlite'),
+                        'prepared speed warnings',RuntimeError(name+': '+message+'\n'+frames))
+                if store.token!=before:
+                    try:publisher.adopt(store,(),())
+                    except CapacityExceeded as error:
+                        publication_failed(error)
+                        return
+                    delivery_delta=(tuple_token(before),tuple_token(store.token),(),())
+                    maintenance_due=True
+                    publish()
 
             def capture_archive(owners=None):
                 scope=store.read_current(cancel=self.stopped)
@@ -339,6 +369,7 @@ class PreparedWriter:
                         blocked_publication=None
                         next_poll=0
                         publish(reset=True)
+                if not write_deferred:finish_warnings()
                 if write_deferred:
                     # The failed cohort has unwound its own read scopes. Retire
                     # any uncommitted stage before capturing a fresh catalog.
@@ -357,7 +388,7 @@ class PreparedWriter:
                         'SELECT ready FROM meta WHERE singleton=1').fetchone()[0]) if self.frozen.is_set() else False
                 if self.frozen.is_set() and not incomplete:
                     if maintenance_due:
-                        maintenance_due=self._maintain(store,archive)
+                        maintenance_due=self._maintain(store,archive,speed_writer)
                     archive_delay=min(.05 if maintenance_due or archive.has_work else float('inf'),
                                       max(0,archive.retry_at-time.monotonic()))
                     wait([self.control.receiver],timeout=None if archive_delay==float('inf') else archive_delay)
@@ -380,6 +411,8 @@ class PreparedWriter:
                         with cycle.measure('catalog'):
                             catalog=read_catalog(collector,cancel=self.stopped.is_set)
                         catalog_received=True
+                        notification=(None if self.frozen.is_set() else
+                                      collector.notification_connection(catalog['publication']))
                         cycle.counts.update(catalog_owners=len(catalog.get('owners',{})),
                             membership_complete=bool(catalog['membership_complete']))
                         # An incomplete live membership cannot withdraw owners
@@ -419,7 +452,7 @@ class PreparedWriter:
                                     if not change['ready']:
                                         # Keep a large one-time conversion's cleanup
                                         # debt within one admitted cohort.
-                                        while self._maintain(store,archive):
+                                        while self._maintain(store,archive,speed_writer):
                                             if self.stopped.is_set():
                                                 raise InterruptedError('prepared conversion cleanup cancelled')
                                         maintenance_due=False
@@ -449,8 +482,6 @@ class PreparedWriter:
                                 pending_changed.clear();pending_removed.clear()
                             ledger_interrupted=sync_ledger()
                             publish()
-                            notification=(None if self.frozen.is_set() else
-                                          collector.notification_connection(catalog['publication']))
                             age=time.time()-snapshot['ts']
                             delay=.1 if snapshot['index'].get('loading') else (
                                 3 if notification is None or age>30 else min(ANALYSIS_IDLE_WAIT_SECONDS,max(.01,30-age+.01)))
@@ -477,6 +508,7 @@ class PreparedWriter:
                         disable(error.__cause__)
                         next_poll=0
                     except WriteDeferred:
+                        speed_writer.cancel_optional()
                         cycle.outcome='write_deferred'
                         write_deferred=True
                         next_poll=0
@@ -496,7 +528,7 @@ class PreparedWriter:
                     import_step()
                     if imported or ledger is None:publish()
                 if maintenance_due:
-                    maintenance_due=self._maintain(store,archive)
+                    maintenance_due=self._maintain(store,archive,speed_writer)
                 delay=min(max(0,next_poll-time.monotonic()),max(0,archive.retry_at-time.monotonic()))
                 if maintenance_due or archive.has_work:delay=min(delay,.05)
                 if ledger is None:

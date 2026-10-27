@@ -1,5 +1,6 @@
 """Store each call fact once; restore display aliases at view boundaries."""
 from .core import TRANSPORT_FIELDS
+from .pricing import price_profile
 from .model_evidence import FIELDS as MODEL_FIELDS
 
 
@@ -28,6 +29,7 @@ def public_record(row):
     if 'session_ordinal' in row and 'cost' in row and 'key' in row:
         for key,value in aliases(row).items():
             result.setdefault(key,value)
+        result['price_profile']=price_profile(result['price_model'])
     return result
 
 

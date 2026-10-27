@@ -31,6 +31,69 @@ def calls():
             for i in range(3)]
 
 
+def test_catalog_order_checks_heads_newer_than_saved_order_and_staged_membership(tmp_path):
+    from cachemonitor.prepared_ingest import pages
+    owners = [('home', name) for name in ('a', 'b', 'c', 'new')]
+    dependencies = dict.fromkeys(storage.DEPENDENCIES, 1)
+    dependencies['source_digest'] = '1'*64
+
+    def declare(stage, owner, title, ordinal):
+        stage.owner(*owner, dict(home=owner[0], id=owner[1], title=title),
+                    dependencies, source_ordinal=ordinal)
+
+    with storage.PreparedStore(tmp_path/'catalog-heads.sqlite') as store:
+        stage = store.begin(('source', 1))
+        for ordinal, owner in enumerate(owners[:3]):
+            declare(stage, owner, owner[1], ordinal)
+        stage.catalog_order((owner, ordinal) for ordinal, owner in enumerate(owners[:3]))
+        stage.publish(('source', 1), ready=True)
+
+        stage = store.begin(('source', 2))
+        declare(stage, owners[0], 'Updated', 0)
+        declare(stage, owners[1], 'b', 1)
+        stage.remove_owner(owners[1])
+        stage.publish(('source', 2), ready=True)
+
+        stage = store.begin(('source', 3))
+        with pytest.raises(storage.StaleGeneration, match='absent prepared owner'):
+            stage.catalog_order((owner, ordinal) for ordinal, owner in enumerate(owners[:3]))
+        stage.abort()
+
+        stage = store.begin(('source', 4))
+        declare(stage, owners[3], 'New', 0)
+        expected = [owners[3], owners[0], owners[2]]
+        stage.catalog_order((owner, ordinal) for ordinal, owner in enumerate(expected))
+        stage.publish(('source', 4), ready=True)
+        with store.read_current() as view:
+            assert [row['owner'] for row in pages(view.ordering)] == expected
+            assert view.owner(*owners[0])['metadata']['title'] == 'Updated'
+            assert view.owner(*owners[1]) is None
+
+        stage = store.begin(('source', 5))
+        declare(stage, owners[0], 'Updated', 1)
+        stage.remove_owner(owners[0])
+        with pytest.raises(storage.StaleGeneration, match='absent prepared owner'):
+            stage.catalog_order((owner, ordinal) for ordinal, owner in enumerate(expected))
+        stage.abort()
+
+
+def test_catalog_order_rechecks_deletion_after_order_in_the_same_batch(tmp_path):
+    owners = [('home', 'removed'), ('home', 'live')]
+    dependencies = dict.fromkeys(storage.DEPENDENCIES, 1)
+    dependencies['source_digest'] = '1'*64
+    with storage.PreparedStore(tmp_path/'catalog-same-batch.sqlite') as store:
+        stage = store.begin(('source', 1))
+        for ordinal, owner in enumerate(owners):
+            stage.owner(*owner, dict(home=owner[0], id=owner[1]), dependencies, source_ordinal=ordinal)
+        stage.catalog_order((owner, ordinal) for ordinal, owner in enumerate(owners))
+        stage.remove_owner(owners[0])
+        stage.publish(('source', 1), ready=True)
+        stage = store.begin(('source', 2))
+        with pytest.raises(storage.StaleGeneration, match='absent prepared owner'):
+            stage.catalog_order([(owners[0], 0)])
+        stage.abort()
+
+
 def test_publication_is_atomic_and_interrupted_staging_does_not_replace_saved_facts(tmp_path):
     path = tmp_path/'analysis.sqlite'
     rows = calls()
@@ -113,14 +176,14 @@ def test_cleanup_waits_for_pinned_reader_without_failing_writer_or_growing_wal(t
     from contextlib import closing
     import time
     from cachemonitor.prepared_runtime import PreparedWriter
-    from cachemonitor.prepared_speed_writer import PreparedSpeedWriter
+    from cachemonitor.prepared_speed_writer import PreparedWarningWorker
 
     path = tmp_path/'analysis.sqlite'
     rows = calls()
     writer = object.__new__(PreparedWriter)
     writer.stopped = Event()
     with (storage.PreparedStore(path) as store, storage.PreparedReader(path) as reader,
-          closing(PreparedSpeedWriter(store, preparation='test')) as speed_writer):
+          closing(PreparedWarningWorker(store, preparation='test')) as speed_writer):
         first = publish(store, 1, rows)
         store.db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
         with reader.pin(first) as old:
@@ -2039,3 +2102,29 @@ def test_overlay_detail_completes_without_restarting_pending_page(tmp_path, monk
         parent.close();child.close();output.close()
     assert not thread.is_alive() and not failures
     assert closed.count('reader') == 2 and closed.count('writer') == 1
+
+
+def test_inventory_projects_model_choices_and_charges_the_complete_packet(tmp_path):
+    owners=(('home','missing'),('home','empty'),('home','unknown'))
+    choices=(None,dict(models=[]),dict(models=['미확인'],combinations=['x'*4000]))
+    dependency={name:1 for name in storage.DEPENDENCIES}
+    dependency['source_digest']='1'*64
+    path=tmp_path/'inventory-models.sqlite'
+    with storage.PreparedStore(path) as store:
+        stage=store.begin(('source',1))
+        for owner,choice in zip(owners,choices):
+            stage.owner(*owner,dict(home=owner[0],id=owner[1]),dependency,
+                source_ordinal=0,choices=choice)
+            stage.calls(owner,[],reconcile=True)
+        token=stage.publish(('source',1),ready=True)
+        with store.read_current() as view:
+            page=view.inventory()
+            assert [value['models'] for value in page.rows]==[None,[],['미확인']]
+            assert page.encoded_bytes==sum(len(storage.pack(dependency))+len(storage.pack(choice))
+                +4*sum(map(len,owner)) for owner,choice in zip(owners,choices))
+            selected=view.inventory(owners=(owners[-1],))
+        for limits in (replace(store.limits,page_bytes=selected.encoded_bytes-1),
+                       replace(store.limits,page_objects_bytes=selected.object_bytes-1)):
+            with storage.PreparedReader(path,limits) as reader,reader.pin(token) as view:
+                with pytest.raises(storage.CapacityExceeded,match='delivered-page'):
+                    view.inventory(owners=(owners[-1],))

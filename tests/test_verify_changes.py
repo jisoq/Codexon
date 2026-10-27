@@ -311,7 +311,11 @@ def test_environment_failure_stops_before_tests_and_preserves_baseline(tmp_path,
     monkeypatch.setattr(verify,'file_hashes',lambda:{'cachemonitor/dashboard.py':'changed'})
     problem=dict(kind='unlocked_import',module='yaml',file='tests/test_release_pipeline.py',line=1)
     monkeypatch.setattr(environment,'check_environment',lambda:dict(errors=[problem]))
-    def unexpected(*args,**kwargs):raise AssertionError('Tests must not run after failed preflight')
+    original_run=verify.subprocess.run
+    def unexpected(command,*args,**kwargs):
+        if command[:2] in (['git','check-ignore'],['git','ls-files']):
+            return original_run(command,*args,**kwargs)
+        raise AssertionError('Tests must not run after failed preflight')
     monkeypatch.setattr(verify.subprocess,'run',unexpected)
     assert verify.main([])==2
     result=json.loads(capsys.readouterr().out)
@@ -336,7 +340,11 @@ def test_stale_native_extension_stops_before_tests_and_preserves_baseline(tmp_pa
     monkeypatch.setattr(native,'extension_path',lambda:binary)
     def stale():raise RuntimeError('Rust extension is stale or changed')
     monkeypatch.setattr(native,'checked_extension',stale)
-    def unexpected(*args,**kwargs):raise AssertionError('Tests must not run with a stale extension')
+    original_run=verify.subprocess.run
+    def unexpected(command,*args,**kwargs):
+        if command[:2] in (['git','check-ignore'],['git','ls-files']):
+            return original_run(command,*args,**kwargs)
+        raise AssertionError('Tests must not run with a stale extension')
     monkeypatch.setattr(verify.subprocess,'run',unexpected)
     assert verify.main([])==2
     result=json.loads(capsys.readouterr().out)
@@ -642,7 +650,13 @@ def test_logged_capture_drains_output_written_at_process_exit(tmp_path, monkeypa
         def wait(self):
             return self.poll()
 
-    monkeypatch.setattr(verify.subprocess, 'Popen', Process)
+    original_popen=verify.subprocess.Popen
+    def start(command,**kwargs):
+        if command[:2] in (['git','check-ignore'],['git','ls-files']):
+            return original_popen(command,**kwargs)
+        assert command==['controlled-process']
+        return Process(command,**kwargs)
+    monkeypatch.setattr(verify.subprocess, 'Popen', start)
     log = tmp_path/'check.log'
     result = verify.run_logged(['controlled-process'], log)
     assert result.returncode == result.product_exit_code == 7
@@ -661,7 +675,10 @@ def test_package_evidence_failure_retains_known_product_outcome(tmp_path, monkey
     original = baseline.read_bytes()
     executable = tmp_path/'package.exe'; executable.write_bytes(b'package probe')
     calls = []
+    original_run=verify.subprocess.run
     def run(command, **kwargs):
+        if command[:2] in (['git','check-ignore'],['git','ls-files']):
+            return original_run(command,**kwargs)
         current = 'runtime' if '--verify-runtime' in command else 'smoke'
         calls.append(current)
         evidence = Path(command[command.index('--verify-runtime' if current == 'runtime' else '--smoke') + 1])
@@ -683,3 +700,19 @@ def test_package_evidence_failure_retains_known_product_outcome(tmp_path, monkey
     assert calls == (['runtime'] if stage == 'runtime' else ['runtime', 'smoke'])
     assert ('pytest' in report) == source_first
     assert baseline.read_bytes() == original
+
+
+def test_check_output_retains_complete_progress_and_final_outcomes():
+    from tools.check_diagnostics import CheckOutput
+    output = CheckOutput()
+    first = dict(test='test_example', phase='call', started='now', pid=123)
+    record = '[codexon-check] '+json.dumps(dict(active_test=first))+'\n'
+    output.feed(record[:30])
+    assert output.active_test is None
+    output.feed(record[30:])
+    assert output.active_test == first
+    second = dict(first, phase='finished')
+    output.feed('[codexon-check] '+json.dumps(dict(active_test=second)), final=True)
+    assert output.active_test == first
+    output.feed('[codexon-check] '+json.dumps(dict(product_exit_code=7)), final=True)
+    assert output.product_exit_code == 7

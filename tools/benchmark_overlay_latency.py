@@ -38,9 +38,10 @@ sys.path.insert(0, str(ROOT))
 
 
 class Trace:
+    lock = threading.Lock()
+
     def __init__(self, path):
         self.path = Path(path)
-        self.lock = threading.Lock()
 
     def emit(self, stage, **values):
         row = dict(stage=stage, ns=time.perf_counter_ns(), pid=os.getpid(), **values)
@@ -197,18 +198,18 @@ def collector_process(connection, home, index, evidence, trace_path, profile, mo
         connection.close()
 
 
-def collected_matches(snapshot, selected, command):
+def collected_matches(snapshot, selected, command, *, observed_activity=None):
     return bool(snapshot['usage_collection_complete']
                 and len(snapshot['sessions']) >= command.get('owners', 0)
                 and len(selected.get('history', ())) == command['calls']
                 and (not command.get('activity') or any(
                     all(row.get(k) == v for k, v in command['activity'].items())
-                    for row in snapshot.get('request_activity', ())))
+                    for row in (snapshot.get('request_activity', ()) if observed_activity is None else observed_activity)))
                 and all(selected['history'][-1].get(k) == v
                         for k, v in command.get('evidence', {}).items()))
 
 
-def watcher_process(connection, home, index, evidence, trace_path, profile):
+def watcher_process(connection, home, index, evidence, trace_path, profile, *, homes=None):
     from cachemonitor import usage_collection
     from cachemonitor.collection_replay import EncodedSession
     import zlib
@@ -235,6 +236,8 @@ def watcher_process(connection, home, index, evidence, trace_path, profile):
                 stopping.set()
                 return
             with expectation_lock:
+                command['observed_activity'] = []
+                command['activity_observed_ns'] = None
                 expectation[0] = command
             send(dict(kind='armed', scenario=command['scenario']))
 
@@ -249,19 +252,31 @@ def watcher_process(connection, home, index, evidence, trace_path, profile):
             selected = next((row for row in value['sessions'] if row['id'] == command['sid']), {})
             if isinstance(selected, EncodedSession):
                 selected = json.loads(zlib.decompress(selected.payload))
-            if collected_matches(value, selected, command):
+            if command.get('activity'):
+                matches = [row for row in value.get('request_activity', ())
+                    if all(row.get(key)==expected for key,expected in command['activity'].items())]
+                if matches:
+                    command['observed_activity'] = matches
+                    if command['activity_observed_ns'] is None:
+                        command['activity_observed_ns'] = stamp
+                        trace.emit('collector_activity',scenario=command['scenario'],observed_ns=stamp,
+                            complete=value['usage_collection_complete'],calls=len(selected.get('history',())))
+            if collected_matches(value, selected, command, observed_activity=command['observed_activity']):
                 trace.emit('collector_publication', scenario=command['scenario'],
-                           published_ns=stamp, owners=len(value['sessions']),
+                           published_ns=stamp, owners=len(value['sessions']), source_epoch=service.epoch,
                            selected=fingerprint(dict(selected, calls=len(selected.get('history', ())),
                                latest_key=selected['history'][-1]['key'] if selected.get('history') else None)),
                            cpu_seconds=time.process_time() - started,
-                           source_hint=bool(kwargs.get('source_hint')))
+                           source_hint=bool(kwargs.get('source_hint')),
+                           activity_observed_ns=command['activity_observed_ns'])
                 with expectation_lock:
                     if expectation[0] is command:
                         expectation[0] = None
                 send(dict(kind='collected', ns=stamp, selected=selected,
                           owners=len(value['sessions']), errors=value['errors'], source_at=value['ts'],
-                          activity=value.get('request_activity', [])))
+                          activity=(command['observed_activity'] if command.get('activity')
+                              else value.get('request_activity', [])),
+                          activity_observed_ns=command['activity_observed_ns']))
         return value
 
     usage_collection.CollectorService.poll = poll
@@ -269,8 +284,9 @@ def watcher_process(connection, home, index, evidence, trace_path, profile):
     controls_thread = threading.Thread(target=controls, name='benchmark-control', daemon=True)
     controls_thread.start()
     send(dict(kind='started', pid=os.getpid()))
-    sys.argv = ['usage-collector', '--codex-home', str(home), '--index-path', str(index),
-                '--evidence-path', str(evidence)]
+    sys.argv = ['usage-collector', *[part for item in (homes or [home])
+        for part in ('--codex-home', str(item))], '--index-path', str(index),
+        '--evidence-path', str(evidence)]
     try:
         result = usage_collection.main()
         if result:
@@ -320,12 +336,12 @@ class Scenario:
         return [str(home), self.sid, len(self.rows), self.rows[-1]['key']]
 
 
-def add_session(home, sid, title):
+def add_session(home, sid, title, *, started_at=None):
     path = home / 'sessions' / (sid + '.jsonl')
     with sqlite3.connect(home / 'state_5.sqlite') as db:
         db.execute('INSERT INTO threads VALUES(?,?,?,?,?,?,?,?)',
                    (sid, str(path), int(time.time()), title, title, 'gpt-6.1-sol', 'openai', str(home)))
-    path.write_text(json.dumps(event('session_meta', time.time() - 100, id=sid)) + '\n', encoding='utf-8')
+    path.write_text(json.dumps(event('session_meta', time.time() - 100 if started_at is None else started_at, id=sid)) + '\n', encoding='utf-8')
     return path
 
 
@@ -380,20 +396,65 @@ def host_snapshot():
     return json.loads(result.stdout) if result.returncode == 0 else dict(error=result.stderr)
 
 
-def run(args, directory, report):
+def native_application():
     from cachemonitor.fonts import configure_font_rendering, configure_high_dpi, load_bundled_fonts
     configure_font_rendering()
     configure_high_dpi()
-    from PySide6.QtCore import QEventLoop, QSettings, QTimer, Qt
-    from PySide6.QtWidgets import QApplication, QWidget
-    from cachemonitor import analysis_worker
-    from cachemonitor.overlay import OverlayController
-    from cachemonitor.overlay_tracking import Selection
-    from cachemonitor.overlay_windows import WindowsOverlay
-    from cachemonitor.overlay_view import OverlayContent
+    from PySide6.QtWidgets import QApplication
     app = QApplication.instance() or QApplication([])
     app.setQuitOnLastWindowClosed(False)
     load_bundled_fonts()
+    return app
+
+
+class NativeOverlayTarget:
+    def __init__(self, directory, app):
+        from PySide6.QtCore import QSettings
+        from PySide6.QtWidgets import QWidget
+        from cachemonitor.overlay import OverlayController
+        from cachemonitor.overlay_windows import WindowsOverlay
+        self.app = app
+        self.host = QWidget()
+        self.host.setWindowTitle('Codexon isolated overlay latency target')
+        self.host.resize(1100, 900)
+        self.host.show()
+        self.native = WindowsOverlay()
+        self.native.visible_target = lambda hwnd:bool(self.native.u.IsWindowVisible(hwnd) and not self.native.u.IsIconic(hwnd))
+        self.controller = OverlayController(QSettings(str(directory/'overlay.ini'), QSettings.IniFormat),
+                                           native_enabled=False, appearance_path=directory/'appearance.toml')
+        self.controller.native = self.native
+        self.native.configure(int(self.controller.widget.winId()))
+
+    def select(self, sid):
+        from cachemonitor.overlay_tracking import Selection
+        self.controller.receive_target(dict(target=dict(hwnd=int(self.host.winId())),
+                                            selection=Selection(sid), confirmed=True))
+
+    def capture(self, path):
+        controller = self.controller
+        assert controller.widget.isVisible() and self.native.u.IsWindowVisible(int(controller.widget.winId()))
+        assert not any(w.qml_errors for w in (controller.widget, *controller.chrome))
+        image = controller.widget.quick.grabFramebuffer()
+        assert not image.isNull() and image.width() > 0 and image.height() > 0, (
+            image.isNull(), image.width(), image.height(),
+            controller.widget.quick.width(), controller.widget.quick.height())
+        colors = {image.pixelColor(x, y).rgba() for x in range(0, image.width(), 7)
+                  for y in range(0, image.height(), 7)}
+        assert len(colors) > 10, 'native frame contains no rendered overlay content'
+        assert image.save(str(path))
+        return hashlib.sha256(bytes(image.constBits())).hexdigest()
+
+    def stop(self):
+        self.controller.stop()
+        self.host.close()
+        self.app.processEvents()
+
+
+def run(args, directory, report):
+    app = native_application()
+    from PySide6.QtCore import QEventLoop, QTimer, Qt
+    from cachemonitor import analysis_worker
+    from cachemonitor.overlay_view import OverlayContent
     home = directory / 'home'
     home.mkdir()
     (home / 'sessions').mkdir()
@@ -407,16 +468,8 @@ def run(args, directory, report):
     parent, child = context.Pipe()
     collector = context.Process(target=collector_process,
         args=(child, home, index, evidence, directory / 'collector.jsonl', args.profile, args.collector))
-    host = QWidget()
-    host.setWindowTitle('Codexon isolated overlay latency target')
-    host.resize(1100, 900)
-    host.show()
-    native = WindowsOverlay()
-    native.visible_target = lambda hwnd: bool(native.u.IsWindowVisible(hwnd) and not native.u.IsIconic(hwnd))
-    controller = OverlayController(QSettings(str(directory / 'overlay.ini'), QSettings.IniFormat),
-                                   native_enabled=False, appearance_path=directory / 'appearance.toml')
-    controller.native = native
-    native.configure(int(controller.widget.winId()))
+    surface = NativeOverlayTarget(directory, app)
+    controller, native = surface.controller, surface.native
     bridge = None
     current = None
     connected = False
@@ -567,22 +620,14 @@ def run(args, directory, report):
             bridge = None
 
     def select(scenario):
-        controller.receive_target(dict(target=dict(hwnd=int(host.winId())),
-            selection=Selection(scenario.sid), confirmed=True))
+        surface.select(scenario.sid)
 
     def finish(scenario):
         wait_for(lambda: scenario.frame_ns is not None, scenario.name + ' native frame')
         data = controller.widget.content_model.data
         assert scenario.source_ns <= scenario.content_ns <= scenario.paint_ns <= scenario.frame_ns
         assert check_output(data, scenario, home)
-        assert controller.widget.isVisible() and native.u.IsWindowVisible(int(controller.widget.winId()))
-        assert not any(w.qml_errors for w in (controller.widget, *controller.chrome))
-        image = controller.widget.quick.grabFramebuffer()
-        assert not image.isNull() and image.width() > 100 and image.height() > 100
-        colors = {image.pixelColor(x, y).rgba() for x in range(0, image.width(), 7)
-                  for y in range(0, image.height(), 7)}
-        assert len(colors) > 10, 'native frame contains no rendered overlay content'
-        assert image.save(str(directory / (scenario.name + '.png')))
+        frame_hash = surface.capture(directory/(scenario.name + '.png'))
         if scenario.evidence:
             speed = next(item for item in controller.widget.content_model.headline_metrics() if item['id'] == 'speed')
             expected = scenario.evidence['output_speed']
@@ -591,7 +636,6 @@ def run(args, directory, report):
             metrics = {item['id']:item['number'] for item in controller.widget.content_model.headline_metrics()}
             assert controller.widget.content_model.latest_call() == {}
             assert metrics['cost'] == metrics['speed'] == '—'
-        frame_hash = hashlib.sha256(bytes(image.constBits())).hexdigest()
         output = (dict(calls=0, cost=None, latest={}, revision=None, recent_keys=[])
                   if scenario.unattributed else dict(calls=data['calls'], cost=data['cost'], latest=data['latest'],
                     revision=data.get('_overlay_revision'), recent_keys=[r['key'] for r in data['recent']]))
@@ -701,13 +745,14 @@ def run(args, directory, report):
         finish(current)
         stop_bridge()
         if not args.skip_growth:
-            # New owners exceed the production cohort size without changing it.
-            for number in range(17):
+            from cachemonitor.prepared_store import Limits
+            growth_owners=Limits().owners_per_batch+1
+            for number in range(growth_owners):
                 owner = Scenario('growth_seed', str(uuid.uuid4()))
                 add_session(home, owner.sid, 'Conversion benchmark session ' + str(number))
                 append_rows(home, owner, args.rows, trace)
             current = Scenario('growth_seed', current.sid, list(current.rows))
-            collect(current, owners=args.owners + 18)
+            collect(current, owners=args.owners + growth_owners + 1)
             entered, release = context.Event(), context.Event()
             quota = directory / 'growth-quota.sqlite'
             start_bridge('growth', entered, release)
@@ -727,9 +772,7 @@ def run(args, directory, report):
         stop_bridge()
         OverlayContent.paint = paint
         analysis_worker.SnapshotReceiver = receiver
-        controller.stop()
-        host.close()
-        app.processEvents()
+        surface.stop()
         if collector.pid and collector.is_alive():
             parent.send(dict(kind='stop'))
             collector.join(min(10, args.deadline))
@@ -749,7 +792,7 @@ def code_identity(directory, name='sources.json'):
     paths.extend(str(path.relative_to(ROOT)).replace('\\', '/')
                  for path in (ROOT / 'cachemonitor').rglob('*')
                  if path.suffix in ('.py', '.qml'))
-    paths.append('tools/benchmark_overlay_latency.py')
+    paths.extend(('tools/benchmark_overlay_latency.py', 'tools/benchmark_overlay_recovery.py'))
     hashes = {path:hashlib.sha256((ROOT / path).read_bytes()).hexdigest()
               for path in sorted(set(paths)) if path and (ROOT / path).is_file()}
     (directory / name).write_text(json.dumps(hashes, sort_keys=True, indent=2), encoding='utf-8')

@@ -8,8 +8,9 @@ import sys
 from .analysis_records import compact_record
 from .overlay_data import OverlaySummaries, call_summary, _subagent_finance, SUBAGENT_CALL_FIELDS
 from .prepared_health import check_reference
-from .prepared_store import CapacityExceeded, NotReady, RebuildRequired, _size, pack
+from .prepared_store import CapacityExceeded, NotReady, RebuildRequired, SPEED_FIELDS, _size, pack
 from .prepared_summary import recent_references, MAX_RECENT
+from .speed_health import scope as speed_scope
 
 
 LATEST_FIELDS = ('model', 'requested_model', 'model_setting', 'response_model', 'model_mismatch', 'model_alert_confirmed',
@@ -96,6 +97,12 @@ class PreparedOverlays:
             refs=list(recent_references(packet))
             own={name:value for name,value in packet['own'].items()
                  if name!='model_breakdown' or self.finance}
+            if '_speed_eligible' not in own:
+                if refs:
+                    rows=view.projected_calls(key,SPEED_FIELDS,keys=(refs[-1]['key'],)).rows
+                    if not rows:raise NotReady('latest own call has no canonical speed facts')
+                    own['_speed_eligible']=speed_scope(rows[0]) is not None
+                else:own['_speed_eligible']=False
             if self.compact:
                 # Only the latest reference is needed for the global status head.
                 # Compositions and the graph's twenty calls belong to selection.

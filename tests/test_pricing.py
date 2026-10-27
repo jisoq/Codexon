@@ -113,3 +113,60 @@ def test_call_and_turn_cost_use_the_same_completed_population():
     assert paired['call_cost']==pytest.approx(.405)
     assert paired['turn_cost']==pytest.approx(.81)
     assert paired['call_cost']*paired['calls']==pytest.approx(paired['turn_cost']*paired['turns'])
+
+
+def test_owner_signature_preserves_legacy_and_ignores_unused_policy(monkeypatch):
+    from dataclasses import replace
+    import cachemonitor.pricing as pricing
+
+    legacy=(pricing.VERIFIED,tuple(pricing.RATE_VERIFIED.items()),pricing.MULTIPLIER_VERIFIED,
+        pricing.MODEL_VERIFIED,pricing.PRICE_POLICY,tuple(pricing.RATES.items()),
+        tuple(pricing.FAST_RATES.items()),tuple(pricing.SUBSCRIPTION_FAST_MULTIPLIERS.items()),
+        tuple(pricing.ALIASES.items()))
+    assert pricing.pricing_signature()==legacy
+    before=pricing.pricing_signature(['gpt-6-astra'])
+    monkeypatch.setattr(pricing,'VERIFIED','later')
+    monkeypatch.setattr(pricing,'MULTIPLIER_VERIFIED','later')
+    monkeypatch.setattr(pricing,'MODEL_VERIFIED','later')
+    monkeypatch.setitem(pricing.RATE_VERIFIED,'gpt-6-astra','later')
+    monkeypatch.setitem(pricing.RATES,'unused-model',pricing.Rate(1,2,3))
+    monkeypatch.setitem(pricing.ALIASES,'unused-alias','unused-model')
+    monkeypatch.setattr(pricing,'SUPPORTED_MODELS',())
+    monkeypatch.setitem(pricing.RATES,'gpt-6-astra',replace(pricing.RATES['gpt-6-astra'],
+        long_threshold=1,promo_minimum='unused'))
+    assert pricing.pricing_signature(['gpt-6-astra'])==before
+    assert pricing.pricing_signature()!=legacy
+    monkeypatch.setitem(pricing.RATES,'gpt-6-astra',replace(pricing.RATES['gpt-6-astra'],input=99))
+    assert pricing.pricing_signature(['gpt-6-astra'])!=before
+
+
+def test_owner_signature_uses_original_fast_rules_and_one_alias_resolution(monkeypatch):
+    import cachemonitor.pricing as pricing
+
+    daybreak=pricing.pricing_signature(['gpt-daybreak-blue-latest'])
+    sol=pricing.pricing_signature(['gpt-5.6-sol'])
+    monkeypatch.setitem(pricing.SUBSCRIPTION_FAST_MULTIPLIERS,'gpt-5.6-sol',99)
+    assert pricing.pricing_signature(['gpt-daybreak-blue-latest'])==daybreak
+    assert pricing.pricing_signature(['gpt-5.6-sol'])!=sol
+    monkeypatch.setitem(pricing.ALIASES,'first','gpt-6-astra')
+    before=pricing.pricing_signature(['first'])
+    monkeypatch.setitem(pricing.ALIASES,'gpt-6-astra','unused-second-hop')
+    assert pricing.pricing_signature(['first'])==before
+    monkeypatch.setitem(pricing.ALIASES,'first','gpt-5.6-sol')
+    assert pricing.pricing_signature(['first'])!=before
+
+
+def test_owner_signature_preserves_unsupported_names_and_unknown_bucket_dependencies(monkeypatch):
+    import cachemonitor.pricing as pricing
+
+    unknown=pricing.pricing_signature(['unlisted-original'])
+    empty=pricing.pricing_signature([])
+    bucket=pricing.pricing_signature([''])
+    assert bucket==pricing.pricing_signature(['미확인'])
+    assert empty!=bucket and unknown!=bucket
+    monkeypatch.setitem(pricing.RATES,'미확인',pricing.Rate(1,2,3))
+    assert pricing.pricing_signature([''])!=bucket
+    assert pricing.pricing_signature([])==empty
+    assert pricing.pricing_signature(['unlisted-original'])==unknown
+    monkeypatch.setitem(pricing.RATES,'unlisted-original',pricing.Rate(1,2,3))
+    assert pricing.pricing_signature(['unlisted-original'])!=unknown

@@ -27,7 +27,7 @@ if str(ROOT) not in sys.path:
 REPORTS = ROOT / 'artifacts' / 'verification'
 BASELINE = REPORTS / 'last-success.json'
 
-from tools.check_diagnostics import (DIAGNOSTIC_EXIT, CheckOutput, DiagnosticFailure, diagnostic_io,
+from tools.check_diagnostics import (DIAGNOSTIC_EXIT, CheckOutput, DiagnosticFailure, capture_stdout, diagnostic_io,
                                      read_json, reset, retain, status, write_json)
 
 def test_files(*names):
@@ -126,6 +126,7 @@ RULES = (
     ('tools/build_native.py', ('native_cpu', 'payload')),
     ('tools/benchmark_cpu.py', ('native_cpu',)),
     ('tools/benchmark_analysis.py', ('prepared', 'performance_trends')),
+    ('tools/benchmark_prepared_speed.py', ('prepared', 'speed')),
     ('cachemonitor/performance_trends.py', ('performance_trends', 'native_cpu', 'prepared')),
     ("cachemonitor/performance_*.py", ("performance_trends",)),
     ('cachemonitor/retired_cache.py', ('retirement','proxy_lifecycle','install')),
@@ -700,16 +701,13 @@ def validate_diagnostics_path(path):
 def run_logged(command, path):
     observed = CheckOutput()
     tail = ''
-    with diagnostic_io('create subprocess capture', Path(tempfile.gettempdir())):
+    with diagnostic_io('validate subprocess capture', Path(tempfile.gettempdir())):
         validate_diagnostics_path(Path(tempfile.gettempdir()) / 'codexon-capture')
-        temporary = tempfile.TemporaryDirectory(prefix='codexon-check-output-')
     capture_failed = False
-    try:
-        capture = Path(temporary.name) / 'stdout.log'
-        with diagnostic_io('open subprocess capture', capture):
-            output = capture.open('wb', buffering=0)
+    with capture_stdout() as (capture, output):
+        with diagnostic_io('open subprocess capture reader', capture):
             reader = capture.open('r', encoding='utf-8', errors='replace')
-        with output, reader:
+        with reader:
             try:
                 with diagnostic_io('open check log', path):
                     mirror = path.open('w', encoding='utf-8')
@@ -718,8 +716,9 @@ def run_logged(command, path):
                 result.product_exit_code, result.diagnostics = None, status()
                 return result
             try:
-                process = subprocess.Popen(command, cwd=ROOT, stdout=output, stderr=subprocess.STDOUT,
-                    env=dict(os.environ, CODEXON_CHECK_LOG=str(capture)))
+                env = dict(os.environ, CODEXON_CHECK_LOG=str(capture))
+                env.pop('CODEXON_CHECK_EVENT_LOG', None)
+                process = subprocess.Popen(command, cwd=ROOT, stdout=output, stderr=subprocess.STDOUT, env=env)
                 while True:
                     completed = process.poll() is not None
                     try:
@@ -757,12 +756,6 @@ def run_logged(command, path):
                             mirror.close()
                     except DiagnosticFailure:
                         pass
-    finally:
-        try:
-            with diagnostic_io('remove subprocess capture', Path(temporary.name)):
-                temporary.cleanup()
-        except DiagnosticFailure:
-            pass
     observed.feed('', final=True)
     retain(observed.first_error)
     product = observed.product_exit_code if observed.has_outcome else None if capture_failed else process.returncode

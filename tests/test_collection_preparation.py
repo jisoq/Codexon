@@ -1,5 +1,6 @@
 """Pending replay recovery stays visible and keeps the collector working."""
 import json
+from pathlib import Path
 import sqlite3
 from time import monotonic
 from types import SimpleNamespace
@@ -8,10 +9,11 @@ import pytest
 
 from cachemonitor import index as index_module
 from cachemonitor import usage_collection
+from cachemonitor.collection_replay import CollectionReplay
 from cachemonitor.index import UsageIndex
 from cachemonitor.collection_wake import SourceHint
 from cachemonitor.core import TITLE_HANDLER, TITLE_PROMPT
-from cachemonitor.model_evidence import EvidenceStore
+from cachemonitor.model_evidence import EvidenceReader, EvidenceStore
 from test_core import TID, fixture_home, usage
 
 
@@ -255,3 +257,249 @@ def test_replayed_owner_preserves_live_log_facts(replayed_owner, replay_budget, 
         assert cold.index.monitor.sessions[key].title_request
     finally:
         cold.close()
+
+
+@pytest.fixture
+def cached_sources(tmp_path):
+    home, path = fixture_home(tmp_path)
+    other = '23456789-abcd-abcd-abcd-123456789012'
+    second = home/'second.jsonl'
+    second.write_text(json.dumps(usage('r2',tid=other,input=500,cached=200))+'\n',encoding='utf8')
+    with sqlite3.connect(home/'logs_2.sqlite') as db:
+        db.execute('DELETE FROM logs')
+    with sqlite3.connect(home/'state_5.sqlite') as db:
+        db.execute('INSERT INTO threads(id,rollout_path,model) VALUES(?,?,?)',(other,str(second),'test'))
+    evidence = tmp_path/'evidence.sqlite'
+    store = EvidenceStore(evidence)
+    try:
+        for number, response in enumerate(('r1','r2','outside')):
+            store.write(home,str(number),10000+number,'WebSocket',response,'test','test','completed')
+    finally:
+        store.close()
+    target = tmp_path/'index.sqlite'
+    service = usage_collection.CollectorService([home],target,evidence)
+    try:
+        first = _collect_complete(service,20000)
+        histories = {row['id']:row['history'] for row in first['sessions']}
+        assert {sid:[(r['key'],r['input'],r['cached'],r['output'],r['total']) for r in rows]
+                for sid,rows in histories.items()} == {
+            TID:[('r1',10000,9000,10,10010)],other:[('r2',500,200,10,510)]}
+        deadline = monotonic()+5
+        while service.maintain():
+            assert monotonic() < deadline
+        assert service.index.replay.db.execute('SELECT count(*) FROM owners').fetchone()[0] == 2
+        replay_path = service.channel.companion('.collection-replay.sqlite')
+    finally:
+        service.close()
+    return SimpleNamespace(home=home,path=path,evidence=evidence,target=target,
+                           other=other,histories=histories,replay_path=replay_path)
+
+
+@pytest.fixture
+def catching_service(cached_sources,monkeypatch):
+    source = cached_sources
+    monkeypatch.setattr(EvidenceReader,'MAX_POLL_ROWS',1)
+    rebuilt = []
+    original = UsageIndex.rebuild_steps
+    def track(index,key,now):
+        rebuilt.append(key[1])
+        yield from original(index,key,now)
+    monkeypatch.setattr(UsageIndex,'rebuild_steps',track)
+    service = usage_collection.CollectorService([source.home],source.target,source.evidence)
+    try:
+        yield source,service,rebuilt
+    finally:
+        service.close()
+
+
+def test_evidence_catchup_defers_unchanged_cached_owners(catching_service):
+    source,service,rebuilt = catching_service
+    pending = service.poll(20001)
+    replay = service.index.replay
+    assert service.index.model_evidence.catching_up
+    assert replay.pending == {(str(source.home),sid) for sid in source.histories}
+    assert not replay.started and replay.restore_job is None
+    assert pending['index']['loading'] and not pending['usage_collection_complete']
+    assert not rebuilt
+    complete = _collect_complete(service,20002)
+    assert {row['id']:row['history'] for row in complete['sessions']} == source.histories
+    assert not rebuilt and not replay.pending and replay.restore_job is None
+
+
+@pytest.mark.parametrize('change',['append','rewrite'])
+def test_evidence_catchup_does_not_defer_changed_source(catching_service,change):
+    source,service,rebuilt = catching_service
+    if change == 'append':
+        with source.path.open('a',encoding='utf8') as output:
+            output.write(json.dumps(usage('new',time=10003,input=200,cached=50))+'\n')
+        expected = [('r1',10000,9000,10,10010),('new',200,50,10,210)]
+    else:
+        source.path.write_text(json.dumps(usage('new',input=200,cached=50))+'\n',encoding='utf8')
+        expected = [('new',200,50,10,210)]
+    pending = service.poll(20001)
+    assert service.index.model_evidence.catching_up
+    assert TID in rebuilt and source.other not in rebuilt
+    assert (str(source.home),TID) not in service.index.replay.pending
+    assert pending['index']['loading']
+    complete = _collect_complete(service,20002)
+    histories = {row['id']:row['history'] for row in complete['sessions']}
+    assert [(r['key'],r['input'],r['cached'],r['output'],r['total']) for r in histories[TID]] == expected
+    assert histories[source.other] == source.histories[source.other]
+    assert set(rebuilt) == {TID}
+
+
+def test_early_pending_catalog_cap_keeps_uncatalogued_source_fallback(catching_service,monkeypatch):
+    source,service,rebuilt = catching_service
+    opening = CollectionReplay.open
+    oversized = ('','z'*(4*1024*1024))
+    admitted = ('','admitted')
+    def open_catalog(*args,**kwargs):
+        replay = opening(*args,**kwargs)
+        database = replay.db
+        class Catalog:
+            def execute(self,sql,*values):
+                if sql == 'SELECT home,sid FROM owners':
+                    return iter([admitted,oversized,*database.execute(sql,*values)])
+                return database.execute(sql,*values)
+            def __getattr__(self,name):
+                return getattr(database,name)
+            def __enter__(self):
+                database.__enter__()
+                return self
+            def __exit__(self,*values):
+                return database.__exit__(*values)
+        replay.db = Catalog()
+        return replay
+    monkeypatch.setattr(CollectionReplay,'open',open_catalog)
+    service.poll(20001)
+    assert service.index.model_evidence.catching_up
+    assert service.index.replay.pending == {admitted}
+    assert set(rebuilt) == set(source.histories)
+    complete = _collect_complete(service,20002)
+    assert {row['id']:row['history'] for row in complete['sessions']} == source.histories
+
+
+def test_evidence_read_error_releases_early_deferrals(catching_service,monkeypatch):
+    source,service,rebuilt = catching_service
+    service.poll(20001)
+    assert service.index.replay.pending and not rebuilt
+    stat = Path.stat
+    def unreadable(path,*args,**kwargs):
+        if path == source.evidence:
+            raise PermissionError('blocked evidence stat')
+        return stat(path,*args,**kwargs)
+    with monkeypatch.context() as patch:
+        patch.setattr(Path,'stat',unreadable)
+        for now in (20002,20003,20004):
+            pending = service.poll(now)
+            assert service.index.model_evidence.error
+            assert not service.index.replay.pending
+            assert service.index.replay.restore_job is None
+            assert pending['index']['loading'] and not pending['usage_collection_complete']
+        assert set(rebuilt) == set(source.histories)
+        assert service.index.loaded == {(str(source.home),sid) for sid in source.histories}
+    complete = _collect_complete(service,20005)
+    assert {row['id']:row['history'] for row in complete['sessions']} == source.histories
+
+
+@pytest.mark.parametrize('presence',['loaded','log_only'])
+def test_present_owners_skip_observation_proof_scan(catching_service,presence):
+    source,service,rebuilt = catching_service
+    service.poll(20001)
+    index = service.index
+    if presence == 'loaded':
+        for sid in source.histories:
+            index.rebuild((str(source.home),sid),20001)
+    else:
+        with sqlite3.connect(source.home/'logs_2.sqlite') as db:
+            for number,sid in enumerate(source.histories,1):
+                db.execute("INSERT INTO logs VALUES(?,?,0,'feedback_tags',?,'p1',?)",(number,19999,sid,
+                    'request{transport="responses_websocket" api.path="/responses"}: auth_header_attached=true'))
+        index.monitor.read_logs(source.home,20001)
+        assert not index.loaded
+    assert set(index.monitor.sessions)=={(str(source.home),sid) for sid in source.histories}
+    while index.model_evidence.catching_up:
+        index.model_evidence.poll()
+    queries = []
+    index.model_evidence.db.set_trace_callback(queries.append)
+    try:
+        index.replay.begin(20001)
+    finally:
+        index.model_evidence.db.set_trace_callback(None)
+    assert not any('model_observations' in query for query in queries)
+    assert not index.replay.pending and index.replay.restore_job is None
+    if presence == 'log_only':
+        assert not index.loaded
+    complete = _collect_complete(service,20002)
+    assert {row['id']:row['history'] for row in complete['sessions']} == source.histories
+    assert set(rebuilt) == set(source.histories)
+
+
+def test_present_owners_close_active_proof_job(catching_service,monkeypatch):
+    source,service,rebuilt = catching_service
+    store = EvidenceStore(source.evidence)
+    try:
+        for number in range(128):
+            store.write(source.home,'extra-'+str(number),10003+number,'WebSocket',
+                        'outside-'+str(number),'test','test','completed')
+    finally:
+        store.close()
+    monkeypatch.setattr(EvidenceReader,'MAX_POLL_ROWS',5000)
+    clock = [0.]
+    original = CollectionReplay._restore
+    jobs = []
+    def yielding(*args):
+        inner = original(*args)
+        jobs.append(inner)
+        try:
+            for value in inner:
+                clock[0] += .2
+                yield value
+        finally:
+            inner.close()
+    monkeypatch.setattr(CollectionReplay,'_restore',yielding)
+    monkeypatch.setattr(index_module.time,'monotonic',lambda:clock[0])
+    service.poll(20001)
+    replay = service.index.replay
+    active = replay.restore_job
+    assert active is not None and jobs[0].gi_frame is not None
+    for sid in source.histories:
+        service.index.rebuild((str(source.home),sid),20001)
+    service.index.model_evidence.poll()
+    queries = []
+    replay.db.set_trace_callback(queries.append)
+    try:
+        replay.begin(20001)
+    finally:
+        replay.db.set_trace_callback(None)
+    assert not any('FROM responses WHERE key' in query for query in queries)
+    assert replay.restore_job is None and active.gi_frame is None and jobs[0].gi_frame is None
+    assert not replay.pending
+    assert {row['id']:row['history'] for row in _collect_complete(service,20002)['sessions']} == source.histories
+
+
+def test_mixed_present_and_absent_owners_still_verify_absent_proof(catching_service):
+    source,service,rebuilt = catching_service
+    service.poll(20001)
+    index = service.index
+    with sqlite3.connect(source.home/'logs_2.sqlite') as db:
+        db.execute("INSERT INTO logs VALUES(1,19999,0,'feedback_tags',?,'p1',?)",(TID,
+            'request{transport="responses_websocket" api.path="/responses"}: auth_header_attached=true'))
+    index.monitor.read_logs(source.home,20001)
+    assert (str(source.home),TID) in index.monitor.sessions
+    assert (str(source.home),source.other) not in index.monitor.sessions
+    while index.model_evidence.catching_up:
+        index.model_evidence.poll()
+    queries = []
+    index.model_evidence.db.set_trace_callback(queries.append)
+    try:
+        index.replay.begin(20001)
+    finally:
+        index.model_evidence.db.set_trace_callback(None)
+    assert any('GROUP BY home,response_id,attempt' in query for query in queries)
+    assert (str(source.home),TID) not in index.loaded
+    assert (str(source.home),source.other) in index.loaded
+    assert hasattr(index.monitor.sessions[(str(source.home),source.other)],'_replay_body')
+    complete = _collect_complete(service,20002)
+    assert {row['id']:row['history'] for row in complete['sessions']} == source.histories
+    assert rebuilt == [TID]

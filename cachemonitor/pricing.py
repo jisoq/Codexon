@@ -96,7 +96,17 @@ def rate_verified(model):
     return RATE_VERIFIED.get(ALIASES.get(model, model), VERIFIED)
 
 
-def pricing_signature():
+def pricing_signature(models=None):
+    if models is not None:
+        names=set(models)
+        if '' in names or '미확인' in names:names.update(('', '미확인'))
+        def rates(rate):
+            return None if rate is None else (rate.input,rate.cached,rate.output,rate.written)
+        return ('owner-pricing',1,PRICE_POLICY,tuple(
+            (model,ALIASES.get(model,model),standard_rate(model) is not None,
+             tuple((tier,rates(request_rate(dict(model=model,service_tier=tier))),
+                    subscription_multiplier(model,tier)) for tier in ('Standard','Fast')))
+            for model in sorted(names)))
     return (VERIFIED, tuple(RATE_VERIFIED.items()), MULTIPLIER_VERIFIED, MODEL_VERIFIED,
             PRICE_POLICY, tuple(RATES.items()), tuple(FAST_RATES.items()),
             tuple(SUBSCRIPTION_FAST_MULTIPLIERS.items()), tuple(ALIASES.items()))
@@ -132,13 +142,17 @@ def usd(value):
     return f'${value:,.{precision}f}'
 
 
+def price_profile(model):
+    return rate_verified(model) + ' 단가 / ' + MULTIPLIER_VERIFIED + ' 구독 배율'
+
+
 def _token_cost(row):
     model = ALIASES.get(row.get('model'), row.get('model'))
     tier=request_tier(row)
     rate = request_rate(row)
     result = {key: None for key in COST_KEYS}
     result.update(price_model=model, price_tier=tier, price_assumed=False, price_issue='', long_context=False,
-                  price_profile=rate_verified(model) + ' 단가 / ' + MULTIPLIER_VERIFIED + ' 구독 배율')
+                  price_profile=price_profile(model))
     if tier not in ('Fast','Standard'):
         result['price_issue']='요청 모드 미확인' if tier=='미확인' else '요청 모드 단가 미지원'
         return result

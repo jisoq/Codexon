@@ -156,6 +156,14 @@ class CollectionReplay:
     def _begin(self, now):
         if not self.enabled:
             self.enabled = self.index.event_store.enable_replay_tokens() is not None
+            if self.enabled:
+                weight = 0
+                for home, sid in self.db.execute('SELECT home,sid FROM owners'):
+                    if not isinstance(home,str) or not isinstance(sid,str):continue
+                    weight += 256 + 4 * (len(home) + len(sid))
+                    if weight > 16 * 1024 * 1024:
+                        break
+                    self.pending.add((home, sid))
         if not self.enabled:
             return
         reader = self.index.model_evidence
@@ -171,21 +179,18 @@ class CollectionReplay:
                         'SELECT o.home,o.sid FROM responses r JOIN owners o ON o.id=r.owner WHERE r.key=?',
                         (response_key(home, key),)))
         self.join_epoch = reader.join_epoch
+        if reader.error:
+            self.pending.clear()
+        else:
+            self.pending.difference_update(self.index.monitor.sessions)
+        if not self.pending and self.restore_job is not None:
+            self.restore_job.close();self.restore_job = None
         version = self.reader_version()
         if version is None:
             return
         initial = not self.started
         if initial:
             self.started = True
-            # A bounded key catalog lets ordinary file scans defer only owners
-            # whose existing proof is being checked. Changed sources still run.
-            weight = 0
-            for home, sid in self.db.execute('SELECT home,sid FROM owners'):
-                if not isinstance(home,str) or not isinstance(sid,str):continue
-                weight += 256 + 4 * (len(home) + len(sid))
-                if weight > 16 * 1024 * 1024:
-                    break
-                self.pending.add((home, sid))
             if self.pending:
                 self.restore_job = self._restore(version, now)
         if self.restore_job is not None:

@@ -1031,22 +1031,34 @@ class Stage:
         ordinals = set()
         count = size = group_objects = 0
         group = []
+        order_batch = self.db.execute('SELECT order_batch FROM meta WHERE singleton=1').fetchone()[0]
 
         def write(values):
-            placeholders = ','.join('(?,?,?)' for _ in values)
-            rows = self.db.execute(
-                f'WITH wanted(home,sid,ordinal) AS (VALUES {placeholders}) '
-                'SELECT o.id,q.ordinal FROM wanted q JOIN owners o ON o.home=q.home AND o.sid=q.sid '
-                'LEFT JOIN owner_heads h ON h.owner=o.id JOIN owner_versions v ON v.owner=o.id '
-                'AND v.batch=COALESCE((SELECT x.batch FROM owner_versions x WHERE x.owner=o.id '
-                'AND x.batch=?),h.batch) WHERE v.deleted=0',
-                (*tuple(value for item in values for value in item),self.batch)).fetchall()
+            rows, committed = [], []
+            for home, sid, ordinal in values:
+                owner = (home, sid)
+                if owner in self.removed_owners:
+                    raise StaleGeneration('catalog order contains an absent prepared owner')
+                if owner in self.owners:
+                    rows.append((self.owners[owner], ordinal))
+                else:
+                    committed.append((home, sid, ordinal))
+            if committed:
+                placeholders = ','.join('(?,?,?)' for _ in committed)
+                rows.extend(self.db.execute(
+                    f'WITH wanted(home,sid,ordinal) AS (VALUES {placeholders}) '
+                    'SELECT o.id,q.ordinal FROM wanted q JOIN owners o ON o.home=q.home AND o.sid=q.sid '
+                    'LEFT JOIN owner_heads h ON h.owner=o.id WHERE CASE WHEN EXISTS('
+                    'SELECT 1 FROM catalog_orders c WHERE c.batch=? AND c.owner=o.id AND h.batch<c.batch) '
+                    'THEN 1 ELSE COALESCE((SELECT v.deleted=0 FROM owner_versions v '
+                    'WHERE v.owner=o.id AND v.batch=h.batch),0) END',
+                    (*tuple(value for item in committed for value in item),order_batch)).fetchall())
             if len(rows) != len(values):
                 raise StaleGeneration('catalog order contains an absent prepared owner')
             with self.store._transaction():
                 self._charge(32*len(rows))
                 self.db.executemany('INSERT INTO catalog_orders VALUES(?,?,?)',
-                    ((self.batch,row['id'],row['ordinal']) for row in rows))
+                    ((self.batch,row[0],row[1]) for row in rows))
             self.writes['catalog'] += len(rows)
 
         try:
@@ -1407,18 +1419,6 @@ class Stage:
                 len(totals) > self.limits.checkpoint_namespaces):
             raise CapacityExceeded('merged checkpoint exceeds its global byte/section/namespace budget')
 
-    def _checkpoint_tombstone(self, namespace, name):
-        previous = self._checkpoint_previous(namespace,name)
-        if previous is None or previous['deleted']:
-            return 0,0
-        with self.store._transaction():
-            self._charge(len(name.encode('utf-8'))+128)
-            self.db.execute('INSERT INTO checkpoint_sections(namespace,name,batch,deleted) VALUES(?,?,?,1)',
-                            (namespace,name,self.batch))
-            self.db.execute('INSERT OR IGNORE INTO checkpoint_retired VALUES(?,?,?)',(namespace,name,self.batch))
-        self.writes['checkpoint_sections'] += 1
-        return previous['encoded_bytes'],1
-
     def checkpoint(self, namespace, sections, *, base, token, tombstones=(), complete=False):
         """Stage a bounded namespace delta; no codec import or synthetic owner.
 
@@ -1450,6 +1450,36 @@ class Stage:
                     'JOIN checkpoint_versions v ON v.namespace=h.namespace AND v.batch=h.batch')}
             total,count = (0,0) if complete else self.checkpoint_totals.get(namespace,(0,0))
             self._checkpoint_budget(namespace,total,count)
+            pending = {kind:[] for kind in ('seen','sections','chunks','tombstones','retired')}
+            pending_rows = pending_bytes = pending_charge = 0
+            def flush():
+                nonlocal pending_rows,pending_bytes,pending_charge
+                if not pending_rows:return
+                with self.store._transaction():
+                    self._charge(pending_charge)
+                    self.db.executemany('INSERT INTO checkpoint_seen VALUES(?,?,?)',pending['seen'])
+                    self.db.executemany('INSERT INTO checkpoint_sections VALUES(?,?,?,0,?,?,?,?)',pending['sections'])
+                    self.db.executemany('INSERT INTO checkpoint_chunks VALUES(?,?,?,?,?)',pending['chunks'])
+                    self.db.executemany('INSERT INTO checkpoint_sections(namespace,name,batch,deleted) VALUES(?,?,?,1)',pending['tombstones'])
+                    self.db.executemany('INSERT OR IGNORE INTO checkpoint_retired VALUES(?,?,?)',pending['retired'])
+                self.writes['checkpoint_chunks'] += len(pending['chunks'])
+                self.writes['checkpoint_sections'] += len(pending['sections'])+len(pending['tombstones'])
+                for values in pending.values():values.clear()
+                pending_rows = pending_bytes = pending_charge = 0
+            def queue(kind,record,charge=0):
+                nonlocal pending_rows,pending_bytes,pending_charge
+                size=_size(record)
+                if pending_rows and (pending_rows>=self.limits.write_rows or
+                        pending_bytes+size>min(self.limits.fact_write_bytes,self.limits.fact_write_objects)):
+                    flush()
+                pending[kind].append(record)
+                pending_rows+=1;pending_bytes+=size;pending_charge+=charge
+            def tombstone(name):
+                previous=self._checkpoint_previous(namespace,name)
+                if previous is None or previous['deleted']:return 0,0
+                queue('tombstones',(namespace,name,self.batch),len(name.encode('utf-8'))+128)
+                queue('retired',(namespace,name,self.batch))
+                return previous['encoded_bytes'],1
             header = False
             input_bytes = input_sections = 0
             for name,digest,chunks in sections:
@@ -1480,36 +1510,27 @@ class Stage:
                 old_size = previous['encoded_bytes'] if previous is not None and not previous['deleted'] else 0
                 old_count = int(previous is not None and not previous['deleted'])
                 total,count = (total+size,count+1) if complete else (total-old_size+size,count-old_count+1)
-                with self.store._transaction():
-                    self._charge(len(name.encode('utf-8'))+64)
-                    self.db.execute('INSERT INTO checkpoint_seen VALUES(?,?,?)',(self.batch,namespace,name))
+                queue('seen',(self.batch,namespace,name),len(name.encode('utf-8'))+64)
                 header |= name == 'header'
                 if previous is not None and not previous['deleted'] and previous['signature'] == signature:
                     continue
-                with self.store._transaction():
-                    self._charge(size+len(name.encode('utf-8'))+128)
-                    self.db.execute('INSERT INTO checkpoint_sections VALUES(?,?,?,0,?,?,?,?)',
-                        (namespace,name,self.batch,digest,signature,len(chunks),size))
-                    if previous is not None:
-                        self.db.execute('INSERT OR IGNORE INTO checkpoint_retired VALUES(?,?,?)',(namespace,name,self.batch))
-                for group in _chunks(enumerate(chunks),self.limits.write_rows):
-                    with self.store._transaction():
-                        self.db.executemany('INSERT INTO checkpoint_chunks VALUES(?,?,?,?,?)',
-                            ((namespace,name,self.batch,ordinal,payload) for ordinal,payload in group))
-                    self.writes['checkpoint_chunks'] += len(group)
-                self.writes['checkpoint_sections'] += 1
+                queue('sections',(namespace,name,self.batch,digest,signature,len(chunks),size),
+                      size+len(name.encode('utf-8'))+128)
+                if previous is not None:queue('retired',(namespace,name,self.batch))
+                for ordinal,payload in enumerate(chunks):
+                    queue('chunks',(namespace,name,self.batch,ordinal,payload))
+            flush()
             if not header:
                 raise IncompletePublication('every checkpoint publication requires its new header')
             for name in tombstones:
                 name = _checkpoint_name(name)
                 if name == 'header':
                     raise IncompletePublication('checkpoint header cannot be removed')
-                with self.store._transaction():
-                    self._charge(len(name.encode('utf-8'))+64)
-                    self.db.execute('INSERT INTO checkpoint_seen VALUES(?,?,?)',(self.batch,namespace,name))
-                removed,number = self._checkpoint_tombstone(namespace,name)
+                queue('seen',(self.batch,namespace,name),len(name.encode('utf-8'))+64)
+                removed,number = tombstone(name)
                 if not complete:
                     total,count = total-removed,count-number
+            flush()
             if complete:
                 after = ''
                 while True:
@@ -1520,8 +1541,9 @@ class Stage:
                     if not missing:
                         break
                     for row in missing:
-                        self._checkpoint_tombstone(namespace,row[0])
+                        tombstone(row[0])
                     after = missing[-1][0]
+            flush()
             self._checkpoint_budget(namespace,total,count)
             with self.store._transaction():
                 self._charge(256+len(namespace.encode('utf-8')))
@@ -1676,6 +1698,8 @@ class Snapshot:
         self.staged_batch = staged_batch
         self.speed_active = False
         self.speed_cursor = None
+        self._speed_admissions = None
+        self._speed_admission_bytes = 0
         self.public = not allow_incomplete and staged_batch is None
         self.steps = 0
         try:
@@ -2037,12 +2061,15 @@ class Snapshot:
             tables = ('visible_owners current JOIN owners o ON o.id=current.owner '
                       'JOIN owner_versions v ON v.owner=current.owner AND v.batch=current.batch '
                       f'LEFT JOIN catalog_orders rank ON rank.owner=o.id AND rank.batch={int(self.order_batch)}')
-        sql = (prefix+f'SELECT o.home,o.sid,v.owner,{self._rank()} AS source_ordinal,v.dependencies FROM {tables} '
+        sql = (prefix+f'SELECT o.home,o.sid,v.owner,{self._rank()} AS source_ordinal,v.dependencies,v.choices FROM {tables} '
                f'WHERE v.deleted=0 AND {where} ORDER BY {self._rank()},v.owner LIMIT :n')
-        return self._page(sql,args,lambda r:dict(owner=(r['home'],r['sid']),owner_ordinal=r['source_ordinal'],
-                          dependencies=unpack(r['dependencies'],self.limits)),
-                          lambda r:(r['source_ordinal'],r['owner']),
-                          lambda r:len(r['dependencies'])+len(r['home'])*4+len(r['sid'])*4)
+        def decode(row):
+            choices=unpack(row['choices'],self.limits)
+            return dict(owner=(row['home'],row['sid']),owner_ordinal=row['source_ordinal'],
+                        dependencies=unpack(row['dependencies'],self.limits),
+                        models=choices.get('models') if choices is not None else None)
+        return self._page(sql,args,decode,lambda r:(r['source_ordinal'],r['owner']),
+                          lambda r:len(r['dependencies'])+len(r['choices'])+len(r['home'])*4+len(r['sid'])*4)
 
     @_read_operation
     def catalog(self, *, after=None, publication=False, query=False, home=None, sid=None):
@@ -2130,7 +2157,7 @@ class Snapshot:
                           cursor_key, lambda r: r['encoded_bytes'])
 
     @_read_operation
-    def projected_calls(self, owner, fields, *, start=None, end=None, after=None, turn=None, filters=None, ordinal_start=None):
+    def projected_calls(self, owner, fields, *, start=None, end=None, after=None, turn=None, filters=None, ordinal_start=None, keys=None):
         """A bounded typed projection, with no unrequested detail or key decode.
 
         Canonical owner defaults are shared by the writer. Rare explicitly
@@ -2158,6 +2185,8 @@ class Snapshot:
             columns.extend(('r.owner_mask',f'CASE WHEN ({covered} & {mask})={mask} THEN NULL ELSE r.detail END AS override_detail'))
         args=dict(owner=meta['id'],n=self.limits.page_rows+1)
         where=['r.owner=:owner','r.deleted=0',self._visible('calls')]
+        if keys is not None:
+            where.append('r.identity IN ('+self._keys(keys,args)+')')
         if ordinal_start is not None:
             args['ordinal_start']=_number(ordinal_start,'ordinal_start')
             where.append('r.m_session_ordinal>=:ordinal_start')
@@ -2190,7 +2219,7 @@ class Snapshot:
                 raise ValueError('invalid projected call cursor')
             args.update(zip(('ts','ordinal','key'),after))
             where.append('(r.m_ts,r.m_session_ordinal,r.identity)>(:ts,:ordinal,:key)')
-        index='calls_ordinal' if ordinal_start is not None else 'calls_time'
+        index='calls_identity' if keys is not None else 'calls_ordinal' if ordinal_start is not None else 'calls_time'
         sql=(f'SELECT {",".join(columns)} FROM calls r INDEXED BY {index} '
              f'JOIN publications p ON p.id=r.batch WHERE {" AND ".join(where)} '
              'ORDER BY r.m_ts,r.m_session_ordinal,r.identity LIMIT :n')
@@ -2740,6 +2769,27 @@ class Snapshot:
             if not self.closed:
                 self.db.set_progress_handler(self._progress, 1000)
 
+    def _speed_admission_room(self, extra=0, *, entry=False):
+        active = self.speed_work['selection_input_bytes'] + self.speed_work['selection_database_bytes']
+        while True:
+            memo = self._speed_admissions
+            table = sys.getsizeof(memo) if memo is not None else 0
+            retained = table + self._speed_admission_bytes
+            if memo is not None:
+                retained += sys.getsizeof(self._speed_admission_bytes)
+            if entry:
+                retained += 4*max(table, sys.getsizeof({})) + 256
+            if (len(memo or ()) + int(entry) <= self.limits.speed_range_rows and
+                    active + retained + extra <= self.limits.speed_temp_bytes):
+                return True
+            if not memo:
+                self._speed_admissions = None
+                return active + extra <= self.limits.speed_temp_bytes and not entry
+            key, value = memo.popitem()
+            self._speed_admission_bytes -= _size(key) + _size(value)
+            if not memo:
+                self._speed_admissions = None
+
     def _speed_load(self, ranges):
         self.db.execute('PRAGMA query_only=OFF')
         try:
@@ -2768,14 +2818,28 @@ class Snapshot:
                        'INSERT INTO temp.speed_selection(owner,frontier) '
                        f'SELECT o.id,q.frontier FROM requested q,{self._owner_tables()} '
                        'WHERE q.home=o.home AND q.sid=o.sid AND v.deleted=0')
+                self.speed_work['selected_owners'] = count
+                self.speed_work['selection_input_bytes'] = size
+                database = self.db.execute('PRAGMA temp.page_count').fetchone()[0]*page_size
+                self.speed_work['selection_database_bytes'] = database
+                self._speed_admission_room(extra=database + 2*(len(group)+1)*page_size)
+                memo = self._speed_admissions
+                retained = (sys.getsizeof(memo) + self._speed_admission_bytes +
+                            sys.getsizeof(self._speed_admission_bytes)) if memo is not None else 0
+                pages = (self.limits.speed_temp_bytes-size-retained)//page_size
+                if pages <= 0 or self.db.execute(f'PRAGMA temp.max_page_count={pages}').fetchone()[0] > pages:
+                    raise CapacityExceeded('speed owner selection exceeds its metadata budget')
                 before = self.db.total_changes
                 with self._cursor(sql,args):
                     pass
+                self.speed_work['selection_database_bytes'] = self.db.execute('PRAGMA temp.page_count').fetchone()[0]*page_size
                 if self.db.total_changes-before != len(group):
                     raise NotReady('speed selection contains an owner absent from this generation')
             self.speed_work['selected_owners'] = count
             self.speed_work['selection_input_bytes'] = size
             self.speed_work['selection_database_bytes'] = self.db.execute('PRAGMA temp.page_count').fetchone()[0]*page_size
+            if not self._speed_admission_room():
+                raise CapacityExceeded('speed owner selection exceeds its metadata budget')
         finally:
             self.db.execute('PRAGMA query_only=ON')
 
@@ -2791,7 +2855,8 @@ class Snapshot:
             raise PreparedError('only one grouped speed stream may use a snapshot')
         self.speed_active = True
         self.speed_work = dict(selected_owners=0,selection_input_bytes=0,selection_database_bytes=0,
-                               selected_rows=0,sort_estimated_bytes=0,rows_yielded=0,body_decodes=0)
+                               selected_rows=0,sort_estimated_bytes=0,rows_yielded=0,body_decodes=0,
+                               admission_hits=0,admission_reads=0)
         try:
             self._speed_load(ranges)
             visible = ('r.owner=q.owner AND r.m_session_ordinal>q.frontier AND r.deleted=0 AND '
@@ -2804,11 +2869,31 @@ class Snapshot:
                        " AS BLOB)) WHEN 'blob' THEN length(r.m_"+field+") ELSE 8 END+16"
                        for field in SPEED_FIELDS]
             charge = '(256+length(r.key_value)+COALESCE(length(r.turn_value),0)+length(r.types)+'+'+'.join(charges)+')'
-            with self._cursor(f'SELECT COUNT(*),COALESCE(SUM({charge}),0) FROM {tables} WHERE {visible}') as cursor:
-                count, size = cursor.fetchone()
-            self.speed_work.update(selected_rows=count,sort_estimated_bytes=size)
-            if size > self.limits.speed_sort_bytes:
-                raise CapacityExceeded('speed chronological sort exceeds its admitted temporary payload')
+            count = size = 0
+            for owner, frontier in ranges.items():
+                self._check()
+                key = (owner, frontier)
+                admitted = self._speed_admissions.get(key) if self._speed_admissions is not None else None
+                if admitted is None:
+                    sql = (f'SELECT COUNT(*),COALESCE(SUM({charge}),0) FROM {tables} WHERE {visible} '
+                           'AND q.owner=(SELECT id FROM owners WHERE home=? AND sid=?)')
+                    with self._cursor(sql, owner) as cursor:
+                        admitted = tuple(cursor.fetchone())
+                    self.speed_work['admission_reads'] += 1
+                    retained = _size(key) + _size(admitted)
+                    if self._speed_admission_room(retained, entry=True):
+                        if self._speed_admissions is None:
+                            self._speed_admissions = {}
+                        self._speed_admissions[key] = admitted
+                        self._speed_admission_bytes += retained
+                        self._speed_admission_room()
+                else:
+                    self.speed_work['admission_hits'] += 1
+                count += admitted[0]
+                size += admitted[1]
+                self.speed_work.update(selected_rows=count, sort_estimated_bytes=size)
+                if size > self.limits.speed_sort_bytes:
+                    raise CapacityExceeded('speed chronological sort exceeds its admitted temporary payload')
             columns = 'r.key_value,r.turn_value,r.types,'+','.join('r.m_'+name for name in SPEED_FIELDS)
             sql = ('WITH selected AS MATERIALIZED ('
                    'SELECT q.owner,q.frontier,o.home,o.sid,ROW_NUMBER() OVER(ORDER BY o.home,o.sid) AS owner_rank '
@@ -2865,6 +2950,8 @@ class Snapshot:
             if self.db.in_transaction:
                 self.db.execute('ROLLBACK')
             self.closed = True
+            self._speed_admissions = None
+            self._speed_admission_bytes = 0
             if self.reader.active is self:
                 self.reader.active = None
 

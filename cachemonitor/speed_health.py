@@ -143,6 +143,7 @@ class _ScopeReplay:
     def advance(self, steps):
         for event, reset in steps:
             ts, home, sid, _ = event.order
+            event.condition = self.condition
             row = event
             identity = event.session
             state = self.states.setdefault(identity, {})
@@ -345,43 +346,52 @@ class SpeedHealth:
             condition = scope(row)
             if condition is not None:
                 _condition_bytes(condition)
+                replay = self.replays.get((owner[0], condition))
+                if replay is not None:
+                    condition = replay.condition
                 count, largest = buckets.get(condition, (0, 0))
                 buckets[condition] = (count + 1, max(largest, key_bytes))
                 if len(buckets) > MAX_TRACKED_SCOPES:
                     raise _Capacity('scope count')
                 tail_min.setdefault((owner[0], condition),
                                     (timestamp, *owner, ordinal))
+        if condition is not None:
+            condition = next(value for value in buckets if value == condition)
         proof = _Proof(state.revision, state.length, buckets, condition, previous_ts)
         return proof, prefix, tail_min
 
     def _admit(self, proofs):
-        """Conservative bytes and sample slots, before any reducer mutation.
-
-        Shared strings and aliased samples are deliberately counted repeatedly.
-        Frozen baseline IDs, recent/recovery lists, result dictionaries, owner
-        proofs and temporary per-scope owner state are included. The estimate
-        is a provisional allowance, not measured private process memory.
-        """
-        size = 1024 + sum(_proof_bytes(o, p) for o, p in proofs.items())
+        previous_results = getsizeof(self.results)
+        for owner, result in self.results.items():
+            previous_results += getsizeof(owner) + sum(_text(value) for value in owner) + getsizeof(result)
+            for key, value in result.items():
+                previous_results += getsizeof(key) + getsizeof(value)
+                if isinstance(value, list):
+                    previous_results += sum(_text(item) for item in value)
+        retired = getsizeof(self.removed_scopes) + sum(
+            getsizeof(bucket) + _text(bucket[0]) + _condition_bytes(bucket[1])
+            for bucket in self.removed_scopes)
+        size = 4096 + previous_results + retired + sum(_proof_bytes(o, p) for o, p in proofs.items())
         pools = {}
         samples = pairs = 0
         for owner, proof in proofs.items():
             owner_bytes = sum(_text(v) for v in owner) + 56
             for condition, (count, key_bytes) in proof.buckets.items():
                 pairs += 1
-                # Five rows cover recent three plus two recovery references.
                 current = min(5, count)
                 sample_bytes = 512 + owner_bytes + key_bytes
                 samples += current
-                size += (2048 + 2 * MAX_BASELINE * key_bytes
-                         + current * sample_bytes)
+                size += 2048 + current * sample_bytes
                 bucket = (owner[0], condition)
-                n, largest = pools.get(bucket, (0, 0))
-                pools[bucket] = (n + count, max(largest, sample_bytes))
+                n, largest, largest_key = pools.get(bucket, (0, 0, 0))
+                pools[bucket] = (n + count, max(largest, sample_bytes), max(largest_key, key_bytes))
                 if (pairs > MAX_RETAINED_SAMPLES
                         or len(pools) > MAX_TRACKED_SCOPES):
                     raise _Capacity('owner/scope membership or scope count')
-        for count, sample_bytes in pools.values():
+        for owner, proof in proofs.items():
+            for condition in proof.buckets:
+                size += MAX_BASELINE * pools[(owner[0], condition)][2]
+        for count, sample_bytes, _ in pools.values():
             retained = min(MAX_BASELINE * 4, count)
             samples += retained
             size += 2048 + retained * sample_bytes
@@ -521,15 +531,28 @@ class SpeedHealth:
             self.removed_owners = self.proofs.keys() - proofs.keys()
             for owner in self.removed_owners:
                 dirty.update((owner[0], c) for c in self.proofs[owner].buckets)
+            self.removed_scopes = set(self.replays)
+            self.removed_scopes.difference_update((owner[0], condition)
+                for owner, proof in proofs.items() for condition in proof.buckets)
+            for bucket in self.removed_scopes:
+                self.replays.pop(bucket)
+            dirty.difference_update(self.removed_scopes)
+            for owner, proof in proofs.items():
+                for condition in proof.buckets:
+                    bucket = (owner[0], condition)
+                    if bucket in dirty:
+                        dirty.remove(bucket)
+                        dirty.add(bucket)
+            for bucket in dirty:
+                self.replays.pop(bucket, None)
+            self.proofs = proofs
+            old = replay = minima = bucket = None
             pools = self._admit(proofs)
         except (_Capacity, _Unsupported) as exc:
             return self._fallback(source, signature, str(exc))
-        self.removed_scopes = self.replays.keys() - pools.keys()
-        for bucket in self.removed_scopes:
-            self.replays.pop(bucket)
         dirty.intersection_update(pools)
         for bucket in pools:
-            if bucket in dirty or bucket not in self.replays:
+            if bucket not in self.replays:
                 self.changed_scopes.add(bucket)
                 self.replays[bucket] = _ScopeReplay(bucket[1])
         self.metrics['replayed_scopes'] = len(dirty)
@@ -539,7 +562,6 @@ class SpeedHealth:
             self._advance(self._steps(source,ranges,dirty,'replay_rows'),appended=False)
         append_scopes = pools.keys() - dirty
         self._advance(self._steps(source,tails,append_scopes,'append_scan_rows'),appended=True)
-        self.proofs = proofs
         self._finish(proofs)
         self.signature = signature
         return self.results

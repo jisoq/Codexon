@@ -1,14 +1,8 @@
-"""Explicit prepared-writer input to the shared SpeedHealth reducer.
-
-The writer creates OwnerSpeedStamp only after electing canonical calls. An
-append certificate covers the exact old prepared prefix, including its raw
-session_ordinal frontier. This is not a duck-typed proof of canonical input.
-"""
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 import hashlib
 
-from .prepared_store import DEPENDENCIES, PreparedReader, PreparedStore, Stage, Token, pack
+from .prepared_store import DEPENDENCIES, PreparedReader, PreparedStore, Snapshot, Stage, Token, pack
 
 
 def speed_prefix_signature(row):
@@ -76,23 +70,19 @@ class OwnerSpeedStamp:
         if type(dependencies) is not dict or not set(DEPENDENCIES) <= dependencies.keys():
             raise ValueError('incomplete durable owner dependencies')
         from .prepared_ingest import fact_dependencies
-        revision = hashlib.sha256(pack(fact_dependencies(dependencies))).hexdigest()
+        facts={key:value for key,value in fact_dependencies(dependencies).items() if key!='pricing'}
+        revision = hashlib.sha256(pack(facts)).hexdigest()
         return cls(revision, length, last_ordinal, append_from, tail_after)
 
 
 class PreparedSpeedInput:
-    """A stable writer-owned binding to one exact, committed prepared token.
-
-    ``owners`` comes from complete persisted canonical owner metadata. Do not
-    construct it from a partial changed-owner working set. The store read
-    snapshot verifies the token and encoded source identity before streaming.
-    The writer withholds publication to consumers until classifier completion.
-    """
     def __init__(self, store, *, limits=None, cancel=None, read_seconds=None):
         if not isinstance(store, PreparedStore):
             raise TypeError('PreparedSpeedInput requires the actual prepared writer')
         self.store = store
-        self.reader = PreparedReader(store.path, limits or store.limits)
+        self.limits = limits or store.limits
+        self.reader = PreparedReader(store.path, self.limits)
+        self._borrowed = None
         self.cancel = cancel
         self.read_seconds = read_seconds
         self.instance = store.token.instance
@@ -103,11 +93,46 @@ class PreparedSpeedInput:
         self.stage = None
         self.read_rows = 0
 
+    @classmethod
+    def from_snapshot(cls, snapshot):
+        if (not isinstance(snapshot,Snapshot) or not isinstance(snapshot.reader,PreparedReader)
+                or snapshot.reader.active is not snapshot or not snapshot.public
+                or not snapshot.ready or snapshot.staged_batch is not None):
+            raise TypeError('prepared speed input requires an actual ready public Snapshot')
+        snapshot.check()
+        source=cls.__new__(cls)
+        source.store=None
+        source.reader=snapshot.reader
+        source.limits=snapshot.limits
+        source._borrowed=snapshot
+        source.cancel=snapshot.cancel
+        source.read_seconds=None
+        source.instance=snapshot.token.instance
+        source.token=snapshot.token
+        source.source_identity=pack(snapshot.source_identity,snapshot.limits)
+        source.snapshot=source.stage=None
+        source.read_rows=0
+        source.owners={}
+        after=None
+        while True:
+            page=snapshot.catalog(after=after)
+            for entry in page.rows:
+                if entry['metadata'].get('_internal_review'):continue
+                values=entry['dependencies']
+                if not values.get('prepared'):
+                    raise ValueError('public speed owner has incomplete canonical preparation')
+                source.owners[entry['owner']]=OwnerSpeedStamp.from_dependencies(
+                    values,values['call_count'],values['speed_frontier'])
+            if page.complete:break
+            after=page.after
+        return source
+
     @property
     def binding(self):
-        return self.store
+        return self.store if self.store is not None else self.reader
 
     def bind(self, token, owners, source_identity):
+        if self.store is None:raise TypeError('a public Snapshot input cannot be rebound by a writer')
         if not isinstance(token, Token) or token.instance != self.instance or token != self.store.token:
             raise ValueError('prepared speed token is not the current writer generation')
         self._bind(token,owners,source_identity,None)
@@ -118,7 +143,7 @@ class PreparedSpeedInput:
         self._bind(stage.prospective_token,owners,source_identity,stage)
 
     def _bind(self,token,owners,source_identity,stage):
-        if type(source_identity) is not bytes or len(source_identity) > self.store.limits.packet_bytes:
+        if type(source_identity) is not bytes or len(source_identity) > self.limits.packet_bytes:
             raise ValueError('invalid encoded prepared source identity')
         if self.snapshot is not None:
             raise RuntimeError('cannot replace a pinned speed generation')
@@ -134,19 +159,22 @@ class PreparedSpeedInput:
     def read_scope(self):
         if self.token is None or self.snapshot is not None:
             raise RuntimeError('invalid prepared speed read scope')
-        scope=(self.stage.read_snapshot(cancel=self.cancel, seconds=self.read_seconds)
+        if self._borrowed is not None:self._borrowed.check()
+        scope=(nullcontext(self._borrowed) if self._borrowed is not None else
+               self.stage.read_snapshot(cancel=self.cancel, seconds=self.read_seconds)
                if self.stage is not None else self.reader._pin(
                    self.token, cancel=self.cancel, seconds=self.read_seconds,
                    allow_incomplete=True))
         with scope as snapshot:
             if getattr(snapshot,'publication_token',snapshot.token)!=self.token:
                 raise ValueError('prepared speed snapshot has a different publication token')
-            if pack(snapshot.source_identity, self.store.limits) != self.source_identity:
+            if pack(snapshot.source_identity, self.limits) != self.source_identity:
                 raise ValueError('prepared source identity does not match the certified generation')
             self.snapshot = snapshot
             self.read_rows = 0
             try:
                 yield self
+                if self._borrowed is not None:snapshot.check()
             finally:
                 self.snapshot = None
 
@@ -207,4 +235,5 @@ class PreparedSpeedInput:
         return classify(sessions.values())
 
     def close(self):
-        self.reader.close()
+        if self.store is not None:self.reader.close()
+        self._borrowed=None

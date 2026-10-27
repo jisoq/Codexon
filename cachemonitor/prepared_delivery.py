@@ -273,13 +273,17 @@ class PreparedPublisher:
             return
         # Admit the whole small delta and order before replacing retained state.
         # Failures leave the previous token and its content references coherent.
-        owners=self.owners.copy();choices=self.choices.copy();alerts=self.alerts.copy()
-        weights=self.owner_weights.copy();owner_bytes=self.owner_bytes
-        pending_alerts=self.pending_alerts.copy();content_changed=set()
-        overlay=self.overlay._fork()
         with store.read_current(seconds=60) as view:
             if not view.db.execute('SELECT ready FROM meta WHERE singleton=1').fetchone()[0]:
                 raise NotReady('cannot deliver a partial owner conversion')
+            if (self.token is not None and not changed and not removed
+                    and self.order_identity==(view.token.instance,view.order_batch)):
+                self.token=view.token
+                return
+            owners=self.owners.copy();choices=self.choices.copy();alerts=self.alerts.copy()
+            weights=self.owner_weights.copy();owner_bytes=self.owner_bytes
+            pending_alerts=self.pending_alerts.copy();content_changed=set()
+            overlay=self.overlay._fork()
             if self.token is None:
                 entries=((row['owner'],row) for row in pages(view.catalog,publication=True))
                 removed=()

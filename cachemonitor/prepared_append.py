@@ -712,11 +712,14 @@ def prepare(snapshot,owner,transition,dependencies,*,mode_evidence=None,enrich=N
     for row in rows:
         if row.get('model_alert_confirmed'):alerts[row['key']]=tuple(row.get(k) for k in MODEL_KEYS)
     choices=_choices(snapshot.derived(*owner,'choices'),rows)
-    dependency=dict(dependencies,ownership=sha256(pack(('owner-append-ownership',1,
+    from .prepared_ingest import _pricing_dependency, pricing_signature
+    dependency=dict(dependencies,pricing=_pricing_dependency(pricing_signature(choices['models'])),
+        ownership=sha256(pack(('owner-append-ownership',1,
         old['dependencies']['ownership'],tuple((row['session_ordinal']-1,row['key']) for row in rows)))).hexdigest(),
         candidate_source_digest=body,prepared=True,call_count=total['count'],speed_frontier=total['count'],
         coverage_bounds=(total['minimum'],total['maximum']))
-    updated=dict(checkpoint,format=FORMAT,source_digest=body,candidate_source_digest=body,raw_count=count+len(rows),
+    updated=dict(checkpoint,format=FORMAT,dependencies=dict(checkpoint['dependencies'],pricing=dependency['pricing']),
+        source_digest=body,candidate_source_digest=body,raw_count=count+len(rows),
         frontier=(rows[-1]['ts'],rows[-1]['key']),total=total,misses=misses,health=health.save(),request=request,
         request_count=request_count,
         ledger_append=_ledger_append(snapshot,owner,transition,before,old['dependencies'],dependency))
@@ -794,8 +797,11 @@ def try_apply(cohort,catalog,changed,removed,*,ready,parents):
                 transition=method(owner,old['dependencies']['source_digest'],catalog=catalog)
                 if transition is None:continue
                 transition=dict(transition,metadata=dict(transition['metadata'],**entry.get('state',{})))
+                choices=view.derived(*owner,'choices')
+                if choices is None or choices.get('models') is None:continue
                 wanted=dependencies(entry['body_digest'],mode_dependency((owner,),catalog,ledger),
-                                    old['dependencies']['ownership'],state=entry.get('state',{}))
+                                    old['dependencies']['ownership'],state=entry.get('state',{}),models=choices['models'])
+                choices=None
                 wanted['mode_ancestry_required']=old['dependencies'].get('mode_ancestry_required',True)
                 if entry.get('analysis_digest'):
                     from .prepared_ingest import state_facts

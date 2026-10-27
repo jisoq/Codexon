@@ -121,6 +121,78 @@ def test_notification_failure_releases_socket_and_allows_polling_recovery(tmp_pa
     finally:reader.close();writer.close()
 
 
+def test_benchmark_trace_instances_keep_concurrent_records_complete(tmp_path):
+    import json
+    from threading import Barrier, Thread
+    from tools.benchmark_overlay_latency import Trace
+    path = tmp_path/'concurrent.jsonl'
+    start = Barrier(4)
+    failures = []
+
+    def write(number):
+        try:
+            trace = Trace(path)
+            start.wait(timeout=2)
+            for ordinal in range(8):
+                trace.emit('record', writer=number, ordinal=ordinal, payload='x'*100000)
+        except BaseException as error:
+            failures.append(error)
+
+    workers = [Thread(target=write, args=(number,)) for number in range(4)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(5)
+    assert not any(worker.is_alive() for worker in workers)
+    assert not failures
+    records = [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines()]
+    assert {(row['writer'], row['ordinal']) for row in records} == {
+        (number, ordinal) for number in range(4) for ordinal in range(8)}
+    assert len(records) == 32 and all(row['payload'] == 'x'*100000 for row in records)
+
+
+def test_benchmark_watcher_keeps_activity_until_owner_replay_finishes(tmp_path,monkeypatch):
+    from queue import Queue
+    from threading import Event,current_thread
+    from types import SimpleNamespace
+    import sys
+    from cachemonitor import usage_collection
+    from tools.benchmark_overlay_latency import watcher_process
+    activity=dict(attempt='request',status='created')
+    command=dict(kind='poll',scenario='created',sid='owner',calls=1,
+                 activity=activity,evidence=dict(response_status='created'))
+    commands=Queue();commands.put(command)
+    armed=Event();sent=[];threads=[]
+    class Connection:
+        def recv(self):
+            threads.append(current_thread())
+            value=commands.get(timeout=5)
+            if value is None:raise EOFError
+            return value
+        def send(self,value):
+            sent.append(value)
+            if value['kind']=='armed':armed.set()
+        def close(self):commands.put(None)
+    selected=dict(home='home',id='owner',history=[dict(key='response',response_status='created')])
+    snapshots=iter([
+        dict(usage_collection_complete=False,sessions=[],request_activity=[activity],errors=[],ts=1),
+        dict(usage_collection_complete=True,sessions=[selected],request_activity=[],errors=[],ts=2)])
+    monkeypatch.setattr(usage_collection.CollectorService,'poll',lambda *args,**kwargs:next(snapshots))
+    monkeypatch.setattr(usage_collection.CollectorService,'stopping',usage_collection.CollectorService.stopping)
+    def main():
+        assert armed.wait(5)
+        for _ in range(2):usage_collection.CollectorService.poll(SimpleNamespace(epoch='watcher-test-epoch'))
+        return 0
+    monkeypatch.setattr(usage_collection,'main',main)
+    monkeypatch.setattr(sys,'argv',[])
+    watcher_process(Connection(),tmp_path,tmp_path/'index',tmp_path/'evidence',tmp_path/'trace.jsonl',False)
+    for thread in set(threads):thread.join(5);assert not thread.is_alive()
+    collected=[value for value in sent if value['kind']=='collected']
+    assert len(collected)==1
+    assert collected[0]['selected']==selected and collected[0]['source_at']==2
+    assert collected[0]['activity']==[activity]
+
+
 def test_analyzer_publication_wakes_before_timer_and_freeze_reclaims_waiter(tmp_path):
     import multiprocessing as mp
     from cachemonitor.analysis_worker import process_main
@@ -143,9 +215,11 @@ def test_analyzer_publication_wakes_before_timer_and_freeze_reclaims_waiter(tmp_
         wait_until(lambda:bool(writer.live.waiters))
         changed=copy.deepcopy(value);changed['ts']+=.25
         started=time.perf_counter();writer.publish(changed,'epoch',2)
-        assert parent.poll(1)
-        second=parent.recv();assert second['kind']=='snapshot'
-        assert second['value']['ts']==changed['ts']
+        while True:
+            remaining=1-(time.perf_counter()-started)
+            assert remaining>0 and parent.poll(remaining)
+            second=parent.recv();assert second['kind']=='snapshot'
+            if second['value']['ts']==changed['ts']:break
         assert not second['value']['sessions'] and not second['value']['overlay_sessions']
         assert not second['value']['model_candidates'] and not second['value']['cache_candidates']
         assert time.perf_counter()-started<1
@@ -196,10 +270,13 @@ def test_quiet_notifications_preserve_staleness_and_ledger_retry_deadlines(monke
         recovered=worker.wait_snapshot(lambda value:value.get('ledger_status_known') and not value.get('ledger_error'))
         assert opens==[100.,105.]
         token=recovered['prepared_token']
+        revision=recovered['overlay_sessions'][0]['_overlay_revision']
         target[0]=130.02
         stale=worker.wait_snapshot(lambda value:value.get('collection_stale'))
         assert any(130.<at<130.1 for at in reads)
-        assert stale['ts']==100. and stale['prepared_token']==token
+        assert stale['ts']==100. and stale['prepared_token'][0]==token[0]
+        assert stale['prepared_token'][1]>=token[1]
+        assert stale['overlay_sessions'][0]['_overlay_revision']==revision
         assert not stale['usage_collection_complete'] and not stale['index']['usage_complete']
         assert not stale['errors']
         worker.assert_calls_and_detail()
@@ -207,17 +284,22 @@ def test_quiet_notifications_preserve_staleness_and_ledger_retry_deadlines(monke
         fresh_at=clock[0]
         worker.publish(at=fresh_at,errors=['retained source error'])
         fresh=worker.wait_snapshot(lambda value:value['ts']==fresh_at and not value.get('collection_stale'))
-        assert fresh['usage_collection_complete'] and fresh['prepared_token']==token
+        assert fresh['usage_collection_complete'] and fresh['prepared_token'][0]==token[0]
+        assert fresh['prepared_token'][1]>=stale['prepared_token'][1]
+        assert fresh['overlay_sessions'][0]['_overlay_revision']==revision
         worker.channel.close()
         target[0]=fresh_at+34
         disconnected=worker.wait_snapshot(lambda value:value.get('collection_stale'))
         assert disconnected['ts']==fresh_at and disconnected['errors']==['retained source error']
-        assert disconnected['prepared_token']==token and not disconnected['usage_collection_complete']
+        assert disconnected['prepared_token'][0]==token[0] and not disconnected['usage_collection_complete']
+        assert disconnected['prepared_token'][1]>=fresh['prepared_token'][1]
+        assert disconnected['overlay_sessions'][0]['_overlay_revision']==revision
         worker.assert_calls_and_detail()
         query=dict(page=2,start=99,end=200,now=200,period='custom',include_whole_history=False)
         worker.parent.send(dict(kind='query',id=2,query=query,logical='stale-source'))
         result=worker.wait_for(lambda value:value.get('id')==2 and value.get('kind')=='result')
-        assert result['kind']=='result' and result['result']['prepared_token']==token
+        assert result['kind']=='result' and result['result']['prepared_token'][0]==token[0]
+        assert result['result']['prepared_token'][1]>=disconnected['prepared_token'][1]
 
 
 def test_new_session_loading_does_not_reprocess_existing_call_history(tmp_path):
