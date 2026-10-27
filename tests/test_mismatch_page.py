@@ -135,6 +135,12 @@ def test_archive_query_error_survives_healthy_capture_and_detail_uses_saved_meta
     assert 'deleted-session' not in text and 'private-response-1' not in text
     page.receive_health(dict(revision=1, status='capture_gap', error='disk full', gap=True))
     assert page.error.isVisible() and 'disk full' in page.error.text()
+    worker.mismatch_record.emit(dict(id=latest['id'], error='detail reader unavailable'))
+    page.receive_health(dict(revision=1, status='capture_gap', error='', pending=0, gap=True))
+    assert page.error.isVisible() and 'detail reader unavailable' in page.error.text()
+    assert 'disk full' not in page.error.text()
+    worker.mismatch_record.emit(dict(id=latest['id'], row=rows[1], revision=1))
+    assert not page.error.isVisible()
     page.close_detail()
     worker.mismatch_record.emit(dict(id=latest['id'], row=rows[1], revision=1))
     assert not page.detail.isVisible()
@@ -177,6 +183,18 @@ def test_mismatch_navigation_renders_saved_detail_and_full_models(tmp_path, widt
         wait_for_rendered(lambda: any(item.objectName() == 'cell-label' and item.isVisible() for item in walk(table)))
         assert page.table.rowCount() == 3
         assert reader.windows and all(size <= 512 for _, size in reader.windows)
+        page.receive_health(dict(revision=1, status='capture_gap', error='', pending=0, gap=True))
+        warning = control(window, page.error)
+        wait_for_rendered(lambda: warning.isVisible() == page.error.isVisible())
+        assert window.quick.grabFramebuffer().save(str(evidence/f'mismatch-{name}-historical-gap.png'))
+        assert not warning.isVisible()
+        page.receive_health(dict(revision=1, status='capture_gap', error='disk full', pending=1, gap=True))
+        warning_text = next(item for item in walk(warning) if item.property('readOnly'))
+        wait_for_rendered(lambda: warning_text.isVisible() and 'disk full' in str(warning_text.property('text')))
+        assert '불일치 기록을 갱신하지 못해 다시 시도하고 있습니다.' in warning_text.property('text')
+        assert window.quick.grabFramebuffer().save(str(evidence/f'mismatch-{name}-current-error.png'))
+        page.receive_health(dict(revision=1, status='capture_gap', error='', pending=0, gap=True))
+        wait_for_rendered(lambda: not warning.isVisible())
         position = table.mapToScene(QPointF(0, 0))
         assert position.y() >= 0 and position.y()+table.height() <= window.quick.height()+1
         footer = next(item for item in walk(table) if item.objectName() == 'table-footer-text')
@@ -229,11 +247,26 @@ def test_mismatch_navigation_renders_saved_detail_and_full_models(tmp_path, widt
         app.setProperty('cachemonitorDisableShellIntegration', previous)
 
 
-def test_saved_gap_is_visible_before_prepared_health_arrives(page):
-    worker=QueryFixture()
+def test_saved_gap_is_silent_before_prepared_health_arrives(page):
+    worker = QueryFixture()
     page.set_worker(worker)
     page.request_page()
-    page.page_ready(dict(id=page.page_request,revision=1,capture_gap=True,
-                         window=dict(start=0,total=0,rows=[])))
+    page.page_ready(dict(id=page.page_request, revision=1, capture_gap=True,
+                         window=dict(start=0, total=0, rows=[])))
+    assert not page.error.isVisible()
+    assert page.error.text() == ''
+
+
+def test_current_error_is_visible_and_recovery_is_silent_with_saved_gap(page):
+    page.receive_health(dict(revision=1, status='capture_gap', error='disk full', pending=1, gap=True))
     assert page.error.isVisible()
-    assert page.health['gap']
+    assert page.error.text() == '불일치 기록을 갱신하지 못해 다시 시도하고 있습니다.\ndisk full'
+    page.receive_health(dict(revision=1, status='capture_gap', error='', pending=0, gap=True))
+    assert not page.error.isVisible()
+    assert page.error.text() == ''
+
+
+def test_pending_writes_without_error_are_silent(page):
+    page.receive_health(dict(revision=1, status='retry_pending', error='', pending=2, gap=False))
+    assert not page.error.isVisible()
+    assert page.error.text() == ''
