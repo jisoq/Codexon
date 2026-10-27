@@ -189,12 +189,27 @@ class PerformanceTrends:
         width=max(64,min(1024,int(q.get('plot_width',768))))
         unit=q.get('granularity','day')
         if unit not in ('auto','day','week','month'):unit='day'
-        key=(engine.revision,tuple(q.get('time_range') or ()),width,unit,mode,
+        cache=getattr(engine,'page_results',None)
+        key=('performance',getattr(engine,'call_revision',engine.revision),'view',
+             tuple(q.get('time_range') or ()),width,unit,mode,
              trend_selection_key(q),q.get('trend_period'))
         now=q['now']
-        if key!=self.signature or now>=self.deadline:
-            self.build(engine,q,width,unit);self.signature=key
+        if cache is not None:
+            cached=cache.get(key)
+            if cached is not None and now<cached['valid_until']:
+                snapshot=getattr(engine,'snapshot',None)
+                if snapshot is not None:snapshot.check()
+                return dict(cached)
+        if cache is not None or key!=self.signature or now>=self.deadline:
+            self.build(engine,q,width,unit)
             self.view['trend_mode']=mode
+            if cache is None:self.signature=key
+            else:
+                from .analysis_engine import retained_bytes
+                weight=retained_bytes((key,self.view),cache.rows)
+                snapshot=getattr(engine,'snapshot',None)
+                if snapshot is not None:snapshot.check()
+                cache.put(key,self.view,weight)
         return dict(self.view)
 
     def build(self,engine,q,width,granularity):

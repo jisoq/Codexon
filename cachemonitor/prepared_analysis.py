@@ -103,9 +103,6 @@ class PreparedAnalysisEngine(AnalysisEngine):
                 owner = snapshot.owner(*key)
                 pending[key] = (self._owner_state(key, owner['metadata'], owner['call_metadata'], token.generation, owner['owner_ordinal'], owner['request_maps'])
                                 if owner is not None else None)
-            # Request activity and titles do not change category or chart facts.
-            # Inspect committed call writes, including deletion markers, rather
-            # than treating the publication generation as a call revision.
             with snapshot._cursor('SELECT COALESCE(MAX(id),0) FROM publications WHERE state=1') as cursor:
                 publication_batch=cursor.fetchone()[0]
             with snapshot._cursor('SELECT 1 FROM calls r INDEXED BY calls_batch '
@@ -167,12 +164,10 @@ class PreparedAnalysisEngine(AnalysisEngine):
         self.results.clear()
         affected=set(pending)|{tuple(key) for key in removed}
         self.parts.discard(lambda key:key[0] in affected)
-        self.page_results.clear()
+        self.page_results.discard(lambda key:not same_facts or key[0]!='performance')
         if not same_facts:
-            for name in ('_category_projection','performance','_trend_catalog','_trend_bounds'):
+            for name in ('_category_projection','_trend_catalog','_trend_bounds'):
                 self.__dict__.pop(name,None)
-        elif getattr(self,'performance',None) is not None and self.performance.signature is not None:
-            self.performance.signature=(self.revision,*self.performance.signature[1:])
         for key in removed:
             self.sessions.pop(tuple(key), None)
             self.internal_sessions.pop(tuple(key), None)

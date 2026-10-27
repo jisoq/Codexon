@@ -60,7 +60,7 @@ GROUPS = {
                          'prepared_revision_reads', 'prepared_retention_weights',
                          'prepared_restart_incremental', 'prepared_reader_lifecycle',
                          'prepared_notification_heads', 'prepared_mode_dependencies',
-                         'prepared_ledger_reuse', 'prepared_finance_reuse', 'prepared_read_optimization') + (
+                         'prepared_ledger_reuse', 'prepared_finance_reuse', 'prepared_read_optimization', 'performance_reuse') + (
         'tests/test_collection_transport.py::test_analyzer_publication_wakes_before_timer_and_freeze_reclaims_waiter',
         'tests/test_collection_transport.py::test_quiet_notifications_preserve_staleness_and_ledger_retry_deadlines',
         'tests/test_overlay_collection_resilience.py::test_history_recovery_yields_to_details_and_collection'),
@@ -125,6 +125,7 @@ RULES = (
     ('cachemonitor/native_backend.py', ('native_cpu', 'data', 'analysis', 'performance_trends', 'evidence', 'quota_math')),
     ('tools/build_native.py', ('native_cpu', 'payload')),
     ('tools/benchmark_cpu.py', ('native_cpu',)),
+    ('tools/benchmark_analysis.py', ('prepared', 'performance_trends')),
     ('cachemonitor/performance_trends.py', ('performance_trends', 'native_cpu', 'prepared')),
     ("cachemonitor/performance_*.py", ("performance_trends",)),
     ('cachemonitor/retired_cache.py', ('retirement','proxy_lifecycle','install')),

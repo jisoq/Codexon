@@ -8,6 +8,7 @@ all statements, including work before their first delivered row.
 from collections import defaultdict
 from heapq import heappush, heapreplace
 
+from .analysis_engine import retained_bytes
 from .analytics import effort_key
 from .performance_trends import trend_range, trend_selected, trend_selection_key
 from .prepared_store import METRICS, CapacityExceeded, NotReady, _restore_scalar, _size, unpack
@@ -93,6 +94,8 @@ class _Input:
         self.excluded = (' AND r.owner NOT IN (' + ','.join(str(x) for x in excluded) + ')'
                          if excluded else '')
         self._admit(_size(self.excluded))
+        self.ordering = ','.join(f'({owner},{rank})' for owner, rank in self.rank.items())
+        self._admit(_size(self.ordering))
 
     def _admit(self, size):
         self.retained += size
@@ -114,9 +117,6 @@ class _Input:
         return self.snapshot._cursor(self.sql(*args, **kwargs), dict(self.selection_args,**self.args))
 
     def owner_cursor(self, columns, where, *, tail=''):
-        if not hasattr(self, 'ordering'):
-            self.ordering = ','.join(f'({owner},{rank})' for owner, rank in self.rank.items())
-            self._admit(_size(self.ordering))
         cohort=('VALUES '+self.ordering) if self.ordering else 'SELECT NULL,NULL WHERE 0'
         sql=self.sql(columns,where,index='calls_time',tail=tail)
         sql=sql.replace('JOIN publications p ','JOIN ordering ON ordering.owner=r.owner JOIN publications p ',1)
@@ -126,7 +126,7 @@ class _Input:
 
     def bounds(self, *, speed=False):
         cache=getattr(self.engine,'_trend_bounds',{})
-        key=(self.selection,speed)
+        key=(self.selection,self.selection_where=='0',speed)
         if key in cache:return cache[key]
         self.args = {}
         result = []
@@ -142,7 +142,9 @@ class _Input:
 
     def catalog(self):
         cached=getattr(self.engine,'_trend_catalog',None)
-        if cached is not None:return cached
+        if cached is not None:
+            self._admit(sum(_size(value)+64 for value in cached))
+            return cached
         # Seek to the next model in the dimension index instead of grouping
         # every retained call merely to populate the model picker.
         values=set();self.args={}
@@ -163,36 +165,42 @@ class _Input:
         result=tuple(sorted(values));self.engine._trend_catalog=result
         return result
 
-    def metadata(self, end, *, sort_start, sort_keys, global_catalog=False):
-        self.args = dict(start=sort_start, end=end)
+    def metadata(self, end, *, global_catalog=False):
+        self.catalog_values=self.catalog() if global_catalog else ()
+        _,last=self.bounds()
+        cutoff=min(end,last) if last is not None else None
+        key=('performance',self.engine.call_revision,'history',self.selection,
+             self.selection_where=='0',cutoff)
+        cache=self.engine.page_results
+        cached=cache.get(key)
+        if cached is not None:
+            scopes,count,charge=cached
+            self._admit(charge)
+            self.snapshot.check()
+            return scopes,count
+        self.args = dict(end=cutoff)
         columns = ','.join('r.m_' + name for name in DIMENSIONS)
         tags = ','.join(_tag(name) + ' AS t' + str(i) for i, name in enumerate(DIMENSIONS))
         grouped = columns + ',' + ','.join(_tag(name) for name in DIMENSIONS)
-        scopes, count = defaultdict(list), 0
-        self.catalog_values=self.catalog() if global_catalog else ()
-        self.args = dict(start=sort_start, end=end)
-        charge = ('COALESCE(SUM(CASE WHEN r.m_ts>=:start AND r.m_ts<=:end AND (' +
-                  self.selection_where + ') THEN ' + _sort_charge(sort_keys) + ' ELSE 0 END),0)')
-        count_sql='SUM(CASE WHEN r.m_ts<=:end AND ('+self.selection_where+') THEN 1 ELSE 0 END)'
-        size = 0
-        with self.owner_cursor(columns + ',' + tags + ',' + count_sql + ' AS n,' + charge + ' AS sort_bytes',
-                         'r.m_ts<=:end',
-                         tail='GROUP BY ' + grouped) as cursor:
+        scopes, count, charge = defaultdict(list), 0, 0
+        with self.owner_cursor(columns + ',' + tags + ',COUNT(*) AS n', 'r.m_ts<=:end',
+                               tail='GROUP BY ' + grouped) as cursor:
             for row in cursor:
                 raw = tuple(row['m_' + name] for name in DIMENSIONS)
                 types = tuple(row['t' + str(i)][0] for i in range(3))
                 labels = tuple(_label(_restore_scalar(tag, value)) for tag, value in zip(types, raw))
                 self.stats['metadata_groups'] += 1
-                if global_catalog and not row['n']:continue
                 value = (raw, types)
+                amount = _size((labels, value))
+                self._admit(amount)
+                charge += amount
                 scopes[labels].append(value)
-                self._admit(_size((labels, value)))
                 count += row['n']
-                size += row['sort_bytes']
-        # Metadata already visits these exact scalar rows. Reuse its byte sum
-        # for the main window; narrower predecessor queries keep their own guard.
-        self.sort_admission = (sort_start, end, sort_keys, size)
-        self._admit(_size(self.sort_admission))
+        scopes={labels:tuple(variants) for labels,variants in scopes.items()}
+        cached=(scopes,count,charge)
+        weight=retained_bytes((key,cached),cache.rows)
+        self.snapshot.check()
+        cache.put(key,cached,weight)
         return scopes, count
 
     def scope(self, raw, types, count=3):
@@ -225,12 +233,8 @@ class _Input:
             where += ' AND (' + ' OR '.join(predicates) + ')'
         columns = 'r.owner,r.types,' + ','.join('r.m_' + name for name in FIELDS)
         if keys:columns += ',r.key_value,r.turn_value'
-        admitted = getattr(self, 'sort_admission', None)
-        if variants is None and inclusive and admitted is not None and admitted[:3] == (start, end, keys):
-            size = admitted[3]
-        else:
-            with self.cursor('COALESCE(SUM(' + _sort_charge(keys) + '),0)', where) as cursor:
-                size = cursor.fetchone()[0]
+        with self.cursor('COALESCE(SUM(' + _sort_charge(keys) + '),0)', where) as cursor:
+            size = cursor.fetchone()[0]
         self.stats['sort_estimated_bytes'] = max(size, self.stats.get('sort_estimated_bytes', 0))
         if size > self.snapshot.limits.speed_sort_bytes:
             raise CapacityExceeded('performance scalar sort exceeds its admitted temporary payload')
@@ -331,8 +335,7 @@ def performance_input(engine, q, width, granularity):
         # Calendar causal context still begins at the first selected call.
         if granularity!='auto' and not clock:first,_=source.bounds()
         first=now if first is None else first
-    scopes, calls = source.metadata(end, sort_start=start, sort_keys=granularity != 'auto' and not clock,
-                                   global_catalog=selection is not None)
+    scopes, calls = source.metadata(end, global_catalog=selection is not None)
     catalog=list(source.catalog_values)
     if selection is not None:
         scopes={scope:variants for scope,variants in scopes.items()

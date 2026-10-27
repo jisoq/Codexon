@@ -133,8 +133,6 @@ class AnalysisEngine:
         self.results=BoundedCache(6,160000)
         self.statistics=BoundedCache(2048,160000)
         self.summaries=BoundedCache(64,160000)
-        # Cache the delivered projection by its retained bytes, independently
-        # of how many historical calls contributed to its exact totals.
         self.page_results=BoundedCache(8,16*1024*1024)
         self.revision=0
         self.call_revision=0
@@ -368,8 +366,7 @@ class AnalysisEngine:
             return value
         if q['page']==5:
             from .performance_trends import PerformanceTrends
-            if not hasattr(self,'performance'):self.performance=PerformanceTrends()
-            data=self.performance.query(self,q)
+            data=PerformanceTrends().query(self,q)
             return dict(key=self.query_key(q),revision=self.revision,performance=data,valid_until=data['valid_until'],analysis={'response_count':data['calls']})
         if not q.get('presentation'):return public_records(self.query(q))
         from .dashboard_views import project, refresh_bounds
