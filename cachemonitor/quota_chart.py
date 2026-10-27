@@ -351,8 +351,10 @@ class QuotaHistory(Plot):
         theme=shared_theme()
         styles=[]
         for name in share['models']:
-            color=QColor(theme.color(share_color_key(name)));pattern=theme.model_pattern(name[0])
-            styles.append((name,color,QBrush(QColor(palette['surface']),pattern) if pattern else None))
+            color=QColor(theme.color(share_color_key(name)))
+            fast=name[1]=='Fast'
+            pattern=Qt.FDiagPattern if fast else theme.model_pattern(name[0])
+            styles.append((name,color,QBrush(QColor('white' if fast else palette['surface']),pattern) if pattern else None))
         last_end=None;last_right=None
         for start,end,bucket in paint_spans(share):
             item=share_bin(share,bucket)
