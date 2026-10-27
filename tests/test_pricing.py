@@ -33,6 +33,25 @@ def test_gpt61_sol_official_rates(tier, expected):
     assert token_cost(row('gpt-6-sol'))['cost']==pytest.approx(.081)
 
 
+@pytest.mark.parametrize('tier, expected', [
+    ('default', (.01, .004, .0125, .01, .0365)),
+    ('priority', (.025, .01, .03125, .025, .09125)),
+])
+def test_gpt61_terra_official_rates_and_analysis(tier, expected):
+    priced=token_cost(row('gpt-6.1-terra',service_tier=tier))
+    assert priced['price_model']=='gpt-6.1-terra'
+    assert tuple(priced[key] for key in (
+        'cost_uncached','cost_cached','cost_written','cost_output','cost'))==pytest.approx(expected)
+    assert priced['price_issues']==[]
+    session=Session('terra','h',title='Terra')
+    session.add_usage(10000,'terra-call',dict(input_tokens=100000,cached_input_tokens=80000,
+        cache_write_input_tokens=10000,output_tokens=2000,reasoning_output_tokens=1000),
+        'gpt-6.1-terra','turn','high',service_tier=tier)
+    analysis=analyze([session.view(10001)])
+    assert len(analysis['responses'])==1
+    assert analysis['totals']['cost']==pytest.approx(expected[-1])
+
+
 def test_subscription_conversion_has_no_long_context_surcharge():
     short=token_cost({**row(),'input':272000})
     long=token_cost({**row(),'input':272001})
@@ -54,7 +73,7 @@ def test_unknown_prices_or_usage_are_not_zero():
 
 
 def test_codex_catalog_new_sol_rates_and_historical_models():
-    assert set(SUPPORTED_MODELS)=={'gpt-6.1-sol','gpt-6-astra','gpt-6-sol','gpt-6-luna',
+    assert set(SUPPORTED_MODELS)=={'gpt-6.1-sol','gpt-6.1-terra','gpt-6-astra','gpt-6-sol','gpt-6-luna',
         'gpt-5.6-sol','gpt-5.6-terra','gpt-5.6-luna','gpt-5.5'}
     assert set(SUBSCRIPTION_FAST_MULTIPLIERS)==set(RATES)-{'gpt-5.5-pro'}
     # Historical records keep their prices even after removal from the picker.

@@ -16,7 +16,7 @@ from .tray import TrayWindow, tray_icon
 from .analytics import analyze, project_choices, project_key
 from .analysis_engine import AnalysisEngine, BoundedCache, retained_bytes
 from .analysis_worker import AnalysisBridge
-from .pricing import usd, ALIASES, VERIFIED, MULTIPLIER_VERIFIED, MODEL_VERIFIED, standard_rate, subscription_multiplier, rate_verified, SUPPORTED_MODELS, request_tier
+from .pricing import usd, ALIASES, FAST_MULTIPLIER, MULTIPLIER_VERIFIED, MODEL_VERIFIED, standard_rate, subscription_multiplier, rate_verified, SUPPORTED_MODELS, request_tier
 from .observer_panel import ObserverPanel
 from .notifications import ConfirmedNotifications
 from .theme import shared_theme
@@ -1019,23 +1019,50 @@ class Dashboard(TrayWindow):
 
 
     def show_prices(self):
-        dialog=Dialog(self);dialog.setWindowTitle(tr('API 가격표')+' / '+MODEL_VERIFIED+' '+tr('지원 모델'));dialog.resize(1080,720)
+        dialog=Dialog(self);dialog.setWindowTitle(tr('API 가격표'));dialog.resize(1080,720)
         body=Column(dialog);body.setContentsMargins(20,20,20,20);body.setSpacing(16)
-        body.addWidget(label('Standard API 단가 × 구독 차감 배율','section'))
-        prices=table(['모델','일반 입력','캐시 읽기','캐시 쓰기','출력','Fast 배수'])
-        for i,width in enumerate((310,135,135,135,135,160)):prices.setColumnWidth(i,width)
+        heading=Row();heading.addWidget(label('Standard API 단가','section'));heading.addStretch()
+        heading.addWidget(label('USD / 100만 토큰','muted'));body.addLayout(heading)
+        prices=table(['모델','일반 입력','캐시 읽기','캐시 쓰기','출력','단가 확인','Fast 배수'])
+        for i,width in enumerate((240,135,135,135,100,140,150)):prices.setColumnWidth(i,width)
         rows=[]
         for model in (*SUPPORTED_MODELS, 'gpt-daybreak-blue-latest'):
             rate=standard_rate(model);multiplier=subscription_multiplier(model,'Fast')
             rows.append([model,usd(rate.input),usd(rate.cached) if rate.cached is not None else '미지원',
                          usd(rate.written) if rate.written is not None else '입력 단가',usd(rate.output),
-                         f'×{multiplier:g}' if multiplier is not None else '미지원'])
+                         rate_verified(model),f'×{multiplier:g}' if multiplier is not None else '미지원'])
         fill(prices,rows);body.addWidget(prices,1)
-        body.addWidget(label('Standard 1배 / 장문 할증 제외 / USD / 100만 토큰','muted',True))
-        body.addWidget(label(f'API 단가 확인 {VERIFIED} / GPT-6.1 Sol 단가 확인 {rate_verified("gpt-6.1-sol")}\n구독 배율 확인 {MULTIPLIER_VERIFIED}','muted',True))
-        body.addWidget(label('GPT-5.6 Sol 프로모션 확인 기한 2026-11-21','muted',True))
-        body.addWidget(label('가격 별칭: '+' / '.join(f'{alias} → {model}' for alias,model in ALIASES.items()),'muted',True))
-        buttons=DialogButtons(DialogButtons.Close);buttons.rejected.connect(dialog.reject);body.addWidget(buttons);dialog.open();self.price_dialog=dialog
+        summary=Group();summary.put(background='surface',radius=6)
+        summary_row=Row(summary);summary_row.setContentsMargins(16,12,16,12);summary_row.setSpacing(32)
+        for title,value in (('구독 차감 배율',f'Standard ×1 / Fast ×{FAST_MULTIPLIER:g}'),('장문 입력','할증 제외')):
+            column=Column();column.setSpacing(4)
+            column.addWidget(label(title,'muted'));column.addWidget(label(value,'section'))
+            summary_row.addLayout(column,1)
+        body.addWidget(summary)
+
+        def show_reference():
+            reference=Dialog(dialog);reference.setWindowTitle(tr('가격 기준 및 별칭'));reference.resize(880,540)
+            layout=Column(reference);layout.setContentsMargins(20,20,20,20);layout.setSpacing(16)
+            layout.addWidget(label('가격 기준','section'))
+            criteria=table(['항목','확인일 / 기한']);criteria.put(inline=True,rowDetails=False)
+            criteria.setColumnWidth(0,300);criteria.setColumnWidth(1,500);criteria.setFixedHeight(200)
+            fill(criteria,[['지원 모델 확인',MODEL_VERIFIED],['구독 배율 확인',MULTIPLIER_VERIFIED],
+                           ['GPT-5.6 Sol 프로모션','최소 2026-11-21까지']],numeric_from=2)
+            layout.addWidget(criteria)
+            layout.addWidget(label('가격 별칭','section'))
+            aliases=table(['기록된 모델명','단가 적용 모델']);aliases.put(inline=True,rowDetails=False)
+            aliases.setColumnWidth(0,420);aliases.setColumnWidth(1,380)
+            fill(aliases,[(alias,model) for alias,model in ALIASES.items()
+                          if model not in ('gpt-5.4-mini','gpt-5.5')],numeric_from=2);layout.addWidget(aliases,1)
+            close_row=Row();close_row.addStretch()
+            close=Button('닫기');close.setObjectName('price-reference-close');close.put(iconName='');close.setFixedWidth(80)
+            close.clicked.connect(reference.reject);close_row.addWidget(close);layout.addLayout(close_row)
+            reference.open();dialog.reference_dialog=reference
+
+        actions=Row();reference_button=Button('가격 기준 및 별칭');reference_button.setObjectName('price-reference-button')
+        reference_button.clicked.connect(show_reference);actions.addWidget(reference_button);actions.addStretch()
+        buttons=DialogButtons(DialogButtons.Close);buttons.rejected.connect(dialog.reject);actions.addWidget(buttons)
+        body.addLayout(actions);dialog.open();self.price_dialog=dialog
 
 
     def build_settings(self):

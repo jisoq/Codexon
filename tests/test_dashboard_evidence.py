@@ -349,7 +349,7 @@ def test_quota_retry_immediately_updates_the_selected_home(tmp_path):
 
 @pytest.mark.parametrize('language',['ko','en'])
 def test_subscription_prices_and_call_detail_render_supported_models(tmp_path,language):
-    from PySide6.QtTest import QTest
+    from PySide6.QtTest import QTest,QSignalSpy
     from cachemonitor.i18n import set_language
     from cachemonitor.pricing import usd
     from cachemonitor.table_model import Table
@@ -361,19 +361,35 @@ def test_subscription_prices_and_call_detail_render_supported_models(tmp_path,la
         prices=next(node for node in dialog.findChildren(Table))
         assert window.price_button.text()=='API 가격표'
         assert dialog.host.windowTitle().startswith('API prices' if language=='en' else 'API 가격표')
-        assert prices.model().headers==['모델','일반 입력','캐시 읽기','캐시 쓰기','출력','Fast 배수']
+        assert prices.model().headers==['모델','일반 입력','캐시 읽기','캐시 쓰기','출력','단가 확인','Fast 배수']
         rows=prices.model().rows
         models=[cells[0] for cells in rows]
-        assert len(models)==9 and 'gpt-6.1-sol' in models and 'gpt-daybreak-blue-latest' in models
+        assert len(models)==10 and 'gpt-6.1-sol' in models and 'gpt-6.1-terra' in models and 'gpt-daybreak-blue-latest' in models
         assert all(model not in models for model in ('gpt-5.5-pro','gpt-5.4-mini','gpt-5.6'))
         assert next(cells for cells in rows if cells[0]=='gpt-daybreak-blue-latest')[-1]=='미지원'
         sol=next(cells for cells in rows if cells[0]=='gpt-6.1-sol')
-        assert sol[1:]==['$2.00','$0.1000','$2.50','$10.00','×2.5']
+        assert sol[1:]==['$2.00','$0.1000','$2.50','$10.00','2026-09-30','×2.5']
+        terra=next(cells for cells in rows if cells[0]=='gpt-6.1-terra')
+        assert terra[1:]==['$1.00','$0.0500','$1.25','$5.00','2026-10-27','×2.5']
         assert '청구액' not in str(dialog.state)
         if language=='en':
             assert 'not a bill' not in str(dialog.state)
         QTest.qWait(80)
         assert dialog.host.grab().save(str(tmp_path/f'subscription-prices-{language}.png'))
+        from cachemonitor.presentation import Button
+        from cachemonitor.quick_qa import click,control
+        reference_button=dialog.findChild(Button,'price-reference-button')
+        click(dialog.host,control(dialog.host,reference_button))
+        reference=dialog.reference_dialog
+        criteria,aliases=reference.findChildren(Table)
+        assert criteria.model().rows[-1]==['GPT-5.6 Sol 프로모션','최소 2026-11-21까지']
+        assert aliases.model().rows==[('gpt-5.6','gpt-5.6-sol'),('gpt-daybreak-blue-latest','gpt-5.6-sol')]
+        assert not reference.host.qml_errors
+        assert reference.host.grab().save(str(tmp_path/f'price-reference-{language}.png'))
+        close_button=reference.findChild(Button,'price-reference-close')
+        closed=QSignalSpy(reference.finished)
+        click(reference.host,control(reference.host,close_button))
+        assert closed.count()==1
         assert not window.qml_errors and not dialog.host.qml_errors
     finally:
         if getattr(window,'price_dialog',None) and window.price_dialog.host:
