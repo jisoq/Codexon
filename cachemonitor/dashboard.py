@@ -550,7 +550,7 @@ class Dashboard(TrayWindow):
 
     def update_discovered(self,release):
         self.update_available.setVisible(bool(release))
-        if not release:return
+        if not release or self.update_panel.auto_start:return
         from .i18n import formatted
         tag=release['tag_name'];version=tag.lstrip('v')
         monitor=self.update_monitor
@@ -1138,7 +1138,7 @@ class Dashboard(TrayWindow):
         self.settings_page.add_row('about','업데이트 자동 확인',
             '앱 실행 중 6시간 간격으로 새 버전을 확인합니다.',
             self.auto_update,section='버전',aliases='automatic update',depth=1)
-        self.settings_page.add_widget('about',self.update_panel,section='업데이트',title='업데이트 확인',target=self.update_panel.button,aliases='정보 문제 해결 update')
+        self.settings_page.add_widget('about',self.update_panel,section='업데이트',title='업데이트 확인',target=self.update_panel,aliases='정보 문제 해결 update')
         self.recovery_button=SettingsPage.shortcut('연결 복구',self.update_panel.open_recovery)
         self.recovery_status=Text();self.recovery_status.setWordWrap(True)
         self.update_panel.recovery_status=self.recovery_status

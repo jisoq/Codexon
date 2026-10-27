@@ -230,10 +230,13 @@ def test_dashboard_badge_notification_routes_mute_and_explicit_check(endpoint,tm
         panel=window.update_panel
         assert panel.execute.isVisible() and panel.execute.isEnabled()
         assert panel.offer['release']==release() and not status_calls and not e.requests
+        newest=release('v2099.02.01.1');e.responses.append((200,{},newest))
         click(window,render_plot(window,panel.execute))
         settle(lambda:panel.operation is None and bool(installs))
-        assert status_calls==[True] and not e.requests
-        assert len(installs)==1 and installs[0]['release']==release()
+        assert status_calls==[True] and len(e.requests)==1
+        assert len(installs)==1 and installs[0]['release']==newest
+        assert len(messages)==1 and window.update_available.isVisible()
+        assert e.settings.value('updates/notifiedVersion')=='2099.01.01.1'
         status_calls.clear()
         window.open_settings();window.tray.messageClicked.emit()
         assert window.settings_page.current_category()=='about'
@@ -242,20 +245,20 @@ def test_dashboard_badge_notification_routes_mute_and_explicit_check(endpoint,tm
         assert window.settings_page.current_category()=='notifications'
         assert window.notification_log.isVisible()
         # Start auto transport, then join it through the real UpdatePanel.
-        e.now=monitor.timestamp('nextCheck');monitor.due();settle(lambda:len(e.requests)==1)
+        e.now=monitor.timestamp('nextCheck');monitor.due();settle(lambda:len(e.requests)==2)
         assert not status_calls
         window.open_updates();window.update_panel.start()
         assert window.update_panel.metadata_pending
         current=window.update_panel.status.text();monitor.publish()
         window.update_panel.proxy_status({'update':{'message':'must not overwrite'}})
         assert window.update_panel.status.text()==current
-        assert len(e.requests)==1
-        data=json.dumps(release()).encode();socket=e.sockets[-1]
+        assert len(e.requests)==2
+        data=json.dumps(newest).encode();socket=e.sockets[-1]
         socket.write(b'HTTP/1.1 200 OK\r\nContent-Length: '+str(len(data)).encode()+b'\r\nConnection: close\r\n\r\n'+data)
         socket.disconnectFromHost()
         settle(lambda:not window.update_panel.metadata_pending and window.update_panel.operation is None)
         assert window.update_panel.offer['kind']=='app' and status_calls==[True]
-        assert len(messages)==2
+        assert len(messages)==3 and e.settings.value('updates/notifiedVersion')=='2099.02.01.1'
         monitor.publish();assert window.update_panel.offer['kind']=='app'
         click(window,control(window,window.auto_update))
         assert not monitor.enabled and not monitor.timer.isActive()
@@ -264,7 +267,7 @@ def test_dashboard_badge_notification_routes_mute_and_explicit_check(endpoint,tm
         count=len(messages);monitor.stop();e.settings.setValue('updates/automatic',True)
         restarted=e.make();window.bind_update_monitor(restarted);restarted.start()
         assert window.update_available.isVisible() and len(messages)==count
-        restarted.check_manually();settle(lambda:len(e.requests)==2)
+        restarted.check_manually();settle(lambda:len(e.requests)==3)
         started=time.perf_counter();window.quit_app()
         assert time.perf_counter()-started<.5
         settle(lambda:window.quitting)
@@ -278,95 +281,159 @@ def test_dashboard_badge_notification_routes_mute_and_explicit_check(endpoint,tm
 
 
 @pytest.mark.parametrize('installed',[True,False])
-def test_cached_offer_install_prepares_selected_release_without_network(endpoint,tmp_path,monkeypatch,installed):
+def test_cached_start_downloads_newest_release_after_one_refresh(endpoint,tmp_path,monkeypatch,installed):
+    import hashlib
+    import io
+    from pathlib import Path
     from cachemonitor.update_panel import UpdatePanel
-    from cachemonitor.quick_qa import control,click
-    e=endpoint;cached=release()
+    from cachemonitor.quick_runtime import Confirmation
+    e=endpoint;cached=release();newest=release('v2099.02.01.1');payload=b'newest!'
+    digest=hashlib.sha256(payload).hexdigest()
     e.settings.setValue('updates/cache',json.dumps(dict(release=cached)))
     e.settings.setValue('updates/lastSuccess',e.now)
-    monitor=e.make();calls=[]
-    panel=UpdatePanel(SimpleNamespace(status=lambda:calls.append('status') or {'health':{'active_connections':4}}))
-    panel.bind_monitor(monitor)
+    monitor=e.make();calls=[];downloads=[];launches=[];consents=[]
+    monkeypatch.setattr(UpdatePanel,'recover',lambda self:None)
+    manager=SimpleNamespace(directory=tmp_path,home=tmp_path/'home',evidence=tmp_path/'evidence.sqlite',
+        url='http://127.0.0.1:18768',status=lambda:calls.append('status') or {'health':{'active_connections':4}})
+    panel=UpdatePanel(manager);panel.bind_monitor(monitor)
     def installation():
         calls.append('installed')
         return dict(InstallRoot=str(tmp_path)) if installed else None
+    def checksum(url,*args):
+        assert url==newest['assets'][1]['browser_download_url']
+        downloads.append(url);return (digest+'  Codexon-Setup.exe').encode()
+    def download(request,**kwargs):
+        assert request.full_url==newest['assets'][0]['browser_download_url']
+        downloads.append(request.full_url);return io.BytesIO(payload)
+    def confirm(dialog):consents.append(dialog);dialog.finish(1)
     monkeypatch.setattr(app_update,'installed',installation)
-    monkeypatch.setattr(app_update,'read_url',lambda *a,**k:pytest.fail('Cached offer must not fetch metadata'))
-    installs=[];monkeypatch.setattr(app_update,'update',lambda *a,**kw:installs.append(kw['plan']) or '설치 시작')
+    monkeypatch.setattr(app_update,'read_url',checksum)
+    monkeypatch.setattr(app_update.urllib.request,'urlopen',download)
+    monkeypatch.setattr(app_update,'launch_installer',lambda *args:launches.append(args))
+    monkeypatch.setattr(Confirmation,'open',confirm)
     try:
         monitor.start()
         assert panel.offer['release']==cached and panel.execute.isVisible() and not calls
-        assert panel.button.isVisible() and panel.button.isEnabled()
+        assert not panel.button.isVisible()
+        e.responses.append((200,{},newest))
         panel.request_install();panel.request_install()
-        settle(lambda:panel.operation is None)
-        assert not e.requests
+        settle(lambda:not panel.metadata_pending and panel.operation is None)
+        assert len(e.requests)==1
         if installed:
-            assert calls==['installed','status']
-            assert len(installs)==1 and installs[0]['release']==cached
-            assert installs[0]['connections']==4
+            assert calls==['installed','status'] and len(consents)==1
+            assert downloads==[newest['assets'][1]['browser_download_url'],newest['assets'][0]['browser_download_url']]
+            assert len(launches)==1 and Path(launches[0][0]).read_bytes()==payload
+            record=panel.journal.read()
+            assert record['phase']=='installing' and record['release']==newest
+            assert record['target_version']=='2099.02.01.1'
         else:
-            assert calls==['installed'] and not installs
+            assert calls==['installed'] and not downloads and not launches and not consents
             assert panel.operation_error and panel.offer is None and not panel.execute.isVisible()
             assert panel.button.isEnabled() and '설치형 Codexon' in panel.status.text()
-    finally:
-        monitor.stop()
-        if getattr(panel,'dialog',None):panel.dialog.reject()
-        if panel.operation:panel.operation.wait()
-        panel.deleteLater();e.app.processEvents()
-
-
-@pytest.mark.parametrize('outcome',['newer','same','current','failure'])
-def test_recheck_preserves_offer_until_metadata_result(endpoint,tmp_path,monkeypatch,outcome):
-    from cachemonitor.update_panel import UpdatePanel
-    e=endpoint;cached=release()
-    e.settings.setValue('updates/cache',json.dumps(dict(release=cached)))
-    monitor=e.make();panel=UpdatePanel(SimpleNamespace(status=lambda:{}));panel.bind_monitor(monitor)
-    monkeypatch.setattr(app_update,'installed',lambda:dict(InstallRoot=str(tmp_path)))
-    monkeypatch.setattr(app_update,'inspect_proxy',lambda manager:dict(state='off',reason='프록시 사용 안 함',connections=0))
-    installs=[];monkeypatch.setattr(app_update,'update',lambda *a,**kw:installs.append(kw['plan']) or '설치 시작')
-    try:
-        monitor.start();previous=panel.offer
-        panel.start();settle(lambda:len(e.requests)==1)
-        assert panel.offer is previous and panel.version.text()=='2099.01.01.1'
-        assert panel.version.isVisible() and panel.execute.isVisible() and not panel.execute.isEnabled()
-        assert panel.button.isVisible() and not panel.button.isEnabled()
-        panel.set_exit_pending(True);panel.set_exit_pending(False)
-        assert not panel.execute.isEnabled()
-        panel.request_install();panel.start()
-        assert not installs and len(e.requests)==1
-        if outcome=='failure':
-            monitor.timed_out()
-        else:
-            result=release('v2099.02.01.1' if outcome=='newer' else 'v'+app_update.VERSION if outcome=='current' else cached['tag_name'])
-            body=json.dumps(result).encode();socket=e.sockets[-1]
-            socket.write(b'HTTP/1.1 200 OK\r\nContent-Length: '+str(len(body)).encode()+b'\r\nConnection: close\r\n\r\n'+body)
-            socket.disconnectFromHost()
-        settle(lambda:not panel.metadata_pending and panel.operation is None)
-        assert panel.button.isVisible() and panel.button.isEnabled() and not installs
-        if outcome=='failure':
-            assert panel.offer is previous and panel.execute.isVisible() and panel.execute.isEnabled()
-            assert panel.status.isVisible() and '응답이 늦어지고 있습니다' in panel.status.text()
-            from cachemonitor.theme import shared_theme
-            panel.refresh();shared_theme().changed.emit()
-            assert panel.status.isVisible() and '응답이 늦어지고 있습니다' in panel.status.text()
-            panel.request_install();settle(lambda:panel.operation is None and bool(installs))
-            assert installs[0]['release']==cached
-        elif outcome=='current':
-            assert panel.offer['kind']=='none' and not panel.execute.isVisible() and not panel.version.isVisible()
-            assert panel.status.text()=='설치할 새 버전이 없습니다.'
-        else:
-            assert panel.offer['release']==result and panel.version.text()==result['tag_name'].lstrip('v')
-            assert panel.execute.isVisible() and panel.execute.isEnabled()
     finally:
         monitor.stop();panel.stop()
         if panel.operation:panel.operation.wait()
         panel.deleteLater();e.app.processEvents()
 
 
-def test_cached_offer_renders_check_and_start_and_preserves_version_during_recheck(endpoint,tmp_path):
+@pytest.mark.parametrize('outcome',['newer','same','304','current','timeout','rate-limit','malformed','proxy'])
+def test_start_refresh_preserves_version_and_continues_only_valid_result(endpoint,tmp_path,monkeypatch,outcome):
+    from cachemonitor.update_panel import UpdatePanel
+    from cachemonitor.quick_runtime import Confirmation
+    e=endpoint;cached=release()
+    e.settings.setValue('updates/cache',json.dumps(dict(release=cached,etag='"cached"')))
+    monitor=e.make();panel=UpdatePanel(SimpleNamespace(status=lambda:{}));panel.bind_monitor(monitor)
+    monkeypatch.setattr(app_update,'installed',lambda:dict(InstallRoot=str(tmp_path)))
+    proxy=dict(state='required' if outcome=='proxy' else 'off',reason='fixture',connections=0,instance='fixture')
+    monkeypatch.setattr(app_update,'inspect_proxy',lambda manager:proxy)
+    monkeypatch.setattr(app_update,'read_url',lambda *a,**k:pytest.fail('Start must use the monitor metadata result'))
+    installs=[];dialogs=[]
+    monkeypatch.setattr(app_update,'update',lambda *a,**kw:installs.append(kw['plan']) or '설치 시작')
+    monkeypatch.setattr(Confirmation,'open',lambda self:dialogs.append(self))
+    try:
+        monitor.start();previous=panel.offer
+        panel.request_install();settle(lambda:len(e.requests)==1)
+        assert panel.offer is previous and panel.version.text()=='2099.01.01.1'
+        assert panel.version.isVisible() and panel.execute.isVisible() and not panel.execute.isEnabled()
+        assert not panel.button.isVisible()
+        panel.set_exit_pending(True);panel.set_exit_pending(False)
+        assert not panel.execute.isEnabled()
+        panel.request_install();panel.start()
+        assert not installs and len(e.requests)==1
+        if outcome=='timeout':monitor.timed_out()
+        else:
+            result=release('v2099.02.01.1' if outcome=='newer' else 'v'+app_update.VERSION if outcome in ('current','proxy') else cached['tag_name'])
+            status=304 if outcome=='304' else 429 if outcome=='rate-limit' else 200
+            body=b'' if status!=200 else b'broken json' if outcome=='malformed' else json.dumps(result).encode()
+            headers=b'Retry-After: 90000\r\n' if status==429 else b''
+            socket=e.sockets[-1]
+            socket.write(f'HTTP/1.1 {status} Test\r\nContent-Length: {len(body)}\r\nConnection: close\r\n'.encode()+headers+b'\r\n'+body)
+            socket.disconnectFromHost()
+        settle(lambda:not panel.metadata_pending and panel.operation is None)
+        assert not installs and not panel.auto_start
+        if outcome in ('timeout','rate-limit','malformed'):
+            assert panel.offer is None and not panel.execute.isVisible() and not panel.version.isVisible()
+            assert panel.button.isVisible() and panel.button.isEnabled() and not dialogs
+            message=panel.status.text();assert message and panel.status.isVisible()
+            from cachemonitor.theme import shared_theme
+            panel.refresh();shared_theme().changed.emit()
+            assert panel.status.isVisible() and panel.status.text()==message
+            if outcome=='rate-limit':
+                panel.start();assert not panel.metadata_pending and len(e.requests)==1 and not installs
+        elif outcome=='current':
+            assert panel.offer['kind']=='none' and not panel.execute.isVisible() and not panel.version.isVisible()
+            assert panel.button.isVisible() and panel.status.text()=='설치할 새 버전이 없습니다.' and not dialogs
+        else:
+            assert len(dialogs)==1 and not panel.button.isVisible()
+            prepared=panel.offer
+            if outcome=='proxy':assert prepared['kind']=='proxy' and prepared['proxy']==proxy
+            else:
+                assert prepared['release']==(cached if outcome=='304' else result)
+                assert panel.version.text()==prepared['release']['tag_name'].lstrip('v')
+            if outcome=='304':assert b'If-None-Match: "cached"' in e.requests[0]
+            panel.request_install();assert len(dialogs)==1
+            dialogs[0].finish(1);settle(lambda:panel.operation is None and bool(installs))
+            assert installs==[prepared] and len(e.requests)==1 and len(dialogs)==1
+    finally:
+        if panel._restart_confirmation:panel._restart_confirmation.finish(0)
+        monitor.stop();panel.stop()
+        if panel.operation:panel.operation.wait()
+        panel.deleteLater();e.app.processEvents()
+
+
+def test_prepared_offer_and_declined_consent_refresh_again_on_next_start(endpoint,tmp_path,monkeypatch):
+    from cachemonitor.update_panel import UpdatePanel
+    from cachemonitor.quick_runtime import Confirmation
+    e=endpoint;monitor=e.make();panel=UpdatePanel(SimpleNamespace(status=lambda:{}));panel.bind_monitor(monitor)
+    monkeypatch.setattr(app_update,'installed',lambda:dict(InstallRoot=str(tmp_path)))
+    monkeypatch.setattr(app_update,'read_url',lambda *a,**k:pytest.fail('Start must share monitor transport'))
+    installs=[];dialogs=[]
+    monkeypatch.setattr(app_update,'update',lambda *a,**kw:installs.append(kw['plan']) or '설치 시작')
+    monkeypatch.setattr(Confirmation,'open',lambda self:dialogs.append(self))
+    try:
+        first=release();e.responses.append((200,{},first));panel.start()
+        settle(lambda:not panel.metadata_pending and panel.operation is None)
+        assert panel.offer['release']==first and panel.offer is not panel.discovered_offer and not dialogs
+        second=release('v2099.02.01.1');e.responses.append((200,{},second));panel.request_install()
+        settle(lambda:len(dialogs)==1)
+        assert panel.offer['release']==second and len(e.requests)==2 and not installs
+        dialogs[0].finish(0)
+        third=release('v2099.03.01.1');e.responses.append((200,{},third));panel.request_install()
+        settle(lambda:len(dialogs)==2)
+        assert panel.offer['release']==third and len(e.requests)==3 and not installs
+        dialogs[1].finish(1);settle(lambda:panel.operation is None and bool(installs))
+        assert len(installs)==1 and installs[0]['release']==third and len(e.requests)==3
+    finally:
+        if panel._restart_confirmation:panel._restart_confirmation.finish(0)
+        monitor.stop();panel.stop()
+        if panel.operation:panel.operation.wait()
+        panel.deleteLater();e.app.processEvents()
+
+
+def test_cached_offer_renders_start_only_and_check_after_refresh_failure(endpoint,tmp_path):
     from cachemonitor.update_panel import UpdatePanel
     from cachemonitor.quick_runtime import QuickHost
-    from cachemonitor.quick_qa import control,click
+    from cachemonitor.quick_qa import control,click,render_plot
     e=endpoint;cached=release();e.settings.setValue('updates/cache',json.dumps(dict(release=cached)))
     monitor=e.make();panel=UpdatePanel(None);panel.bind_monitor(monitor)
     host=QuickHost();host.resize(700,240);host.setCentralWidget(panel);host.show()
@@ -374,24 +441,25 @@ def test_cached_offer_renders_check_and_start_and_preserves_version_during_reche
         monitor.start()
         check=control(host,panel.button);start=control(host,panel.execute);version=control(host,panel.version)
         settle(lambda:start.isVisible() and start.width()>0 and start.height()>0)
-        assert check.isVisible() and check.isEnabled() and check.width()>0 and check.height()>0
+        assert not check.isVisible()
         assert start.isEnabled() and version.isVisible() and panel.version.text()=='2099.01.01.1'
-        click(host,check);settle(lambda:len(e.requests)==1)
+        click(host,render_plot(host,panel.execute));settle(lambda:len(e.requests)==1)
         assert version.isVisible() and panel.version.text()=='2099.01.01.1'
-        assert check.isVisible() and not check.isEnabled() and start.isVisible() and not start.isEnabled()
+        assert not check.isVisible() and start.isVisible() and not start.isEnabled()
         monitor.timed_out();settle(lambda:not panel.metadata_pending)
-        settle(lambda:check.isEnabled() and start.isEnabled())
+        settle(lambda:check.isVisible() and check.isEnabled() and not start.isVisible())
         status=control(host,panel.status)
         settle(lambda:status.isVisible() and status.width()>0 and status.height()>0)
-        assert version.isVisible() and '응답이 늦어지고 있습니다' in panel.status.text()
+        assert not version.isVisible() and '응답이 늦어지고 있습니다' in panel.status.text()
         panel.refresh()
         from cachemonitor.theme import shared_theme
         shared_theme().changed.emit();assert status.isVisible()
-        assert host.grab().save(str(tmp_path/'update-recheck-failure.png'))
+        assert host.grab().save(str(tmp_path/'update-start-refresh-failure.png'))
     finally:
         monitor.stop();panel.stop()
         if panel.operation:panel.operation.wait()
         host.release_scene();host.close();host.deleteLater();e.app.processEvents()
+
 
 
 def test_new_release_discovery_cannot_retarget_active_update(endpoint,tmp_path,monkeypatch):

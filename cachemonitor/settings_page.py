@@ -240,7 +240,14 @@ class SettingsPage(Group):
         if query:
             with QSignalBlocker(self.search):self.search.setText(query)
             self._search_return=(query,position);self.search_back.show()
-        QTimer.singleShot(0,lambda:target.focusRequested.emit())
+        index=self.IDS.index(entry['category'])
+        if self.stack.isPageReady(index):QTimer.singleShot(0,target.focusRequested.emit)
+        else:
+            def focus_when_ready(ready):
+                if ready!=index:return
+                self.stack.pageReady.disconnect(focus_when_ready)
+                if self.stack.currentIndex()==index:target.focusRequested.emit()
+            self.stack.pageReady.connect(focus_when_ready)
 
     def return_to_search(self):
         if self._search_return is None:return

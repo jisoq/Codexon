@@ -66,6 +66,7 @@ class UpdatePanel(Group):
         self.button=Button('업데이트 확인');self.button.clicked.connect(self.start);actions.addWidget(self.button)
         self.execute=Button('업데이트 시작');self.execute.put(role='primary');self.execute.clicked.connect(self.request_install)
         actions.addWidget(self.execute);self.execute.hide()
+        self.focusRequested.connect(lambda:(self.execute if self.execute.isVisible() else self.button).focusRequested.emit())
         self.recheck=Button('종료 여부 다시 확인');self.recheck.clicked.connect(self.recheck_connections);actions.addWidget(self.recheck);self.recheck.hide()
         actions.addStretch();controls.addLayout(actions)
         secondary=Row();secondary.setSpacing(8)
@@ -223,7 +224,7 @@ class UpdatePanel(Group):
         self.button.setEnabled(True);self.execute.setEnabled(True)
         if self.auto_start:
             self.auto_start=False
-            if plan and plan['kind'] in ('app','proxy'):self.request_install();return
+            if plan and plan['kind'] in ('app','proxy'):self.request_install(prepared_plan=plan);return
         self.reload_record(force=True);self.render_record()
         continuation=self._continue_app;self._continue_app=None
         if (continuation and not self.closing()
@@ -271,7 +272,7 @@ class UpdatePanel(Group):
         plan=self.offer or {};available=plan.get('kind') in ('app','proxy')
         self.status.setToolTip('')
         self.heading.setText('새 버전' if plan.get('kind')=='app' else '업데이트')
-        self.button.show();self.execute.setVisible(available);self.execute.setText('업데이트 시작')
+        self.button.setVisible(not available);self.execute.setVisible(available);self.execute.setText('업데이트 시작')
         self.version.setVisible(plan.get('kind')=='app')
         version=plan.get('release',{}).get('tag_name','').lstrip('v')
         self.version.setText(version);self.version.setToolTip(tr('변경 내역')+' '+version)
@@ -289,7 +290,7 @@ class UpdatePanel(Group):
                 and app.get('state')=='verified' and app.get('executable')
                 and Path(app['executable']).resolve()!=Path(sys.executable).resolve())
 
-    def request_install(self,checked=False,*,confirmed=False,verified_operation_id=None):
+    def request_install(self,checked=False,*,confirmed=False,verified_operation_id=None,prepared_plan=None):
         self.reload_record(force=True)
         if self.offer and self._offer_operation_id!=self.record.get('operation_id'):
             self.offer=None;self.render_record();return
@@ -302,11 +303,9 @@ class UpdatePanel(Group):
             self.launch_operation(lambda:continuation_target(self.journal,self.manager));return
         retrying=self.record.get('phase') in ('partial','failed','deferred','interrupted','restart_required') and (reopening or not self.offer and self.record.get('app',{}).get('state') in ('verified','current'))
         if not self.offer and not retrying:return
-        if not retrying and self.offer and self.offer is self.discovered_offer:
-            from .app_update import check_update
-            release=self.offer['release'];self.auto_start=True;self.checking=True
-            self._check_operation_id=self.record.get('operation_id')
-            self.launch_operation(lambda:check_update(self.status_progress,self.manager,release=release));return
+        if prepared_plan is not None and self.offer is not prepared_plan:return
+        if not retrying and prepared_plan is None:
+            self.auto_start=True;self.start();return
         if not confirmed and not (retrying and reopening):
             from .client_restart import SAVE_WORK
             from .quick_runtime import Confirmation
@@ -318,7 +317,7 @@ class UpdatePanel(Group):
                 self._restart_confirmation=None
                 self.reload_record(force=True)
                 if result and not self.closing() and self.offer is plan and self.record.get('operation_id')==operation_id:
-                    self.request_install(confirmed=True,verified_operation_id=verified_operation_id)
+                    self.request_install(confirmed=True,verified_operation_id=verified_operation_id,prepared_plan=prepared_plan)
             dialog.finished.connect(answered);dialog.open();return
         from .app_update import update, retry_proxy
         from .client_restart import capture
