@@ -194,12 +194,8 @@ class MismatchPage(Group):
 
     def update_error(self):
         messages = []
-        status = self.health.get('status')
-        if status == 'capture_gap' or self.health.get('gap'):
-            messages.append(tr('일부 불일치 기록을 저장하지 못했습니다. 현재 저장된 기록만 표시합니다.'))
-        elif status == 'retry_pending':
-            messages.append(tr('불일치 기록 저장을 다시 시도하고 있습니다. 저장 전 기록은 보존되지 않을 수 있습니다.'))
         if self.health.get('error'):
+            messages.append(tr('불일치 기록을 갱신하지 못해 다시 시도하고 있습니다.'))
             messages.append(str(self.health['error']))
         messages.extend(value for value in self.query_errors.values() if value)
         self.error.setText(Verbatim('\n'.join(messages)))
