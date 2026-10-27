@@ -2,7 +2,8 @@
 
 Verified 2026-09-23 against OpenAI's pricing and individual model pages.
 GPT-6.1 Sol added from its official model pricing on 2026-09-30.
-Included-subscription Fast multiplier verified on 2026-10-01.
+GPT-6.1 Terra added from its official model pricing on 2026-10-27.
+Included-subscription Fast multiplier verified on 2026-10-27.
 All amounts are USD per million tokens. Cache writes replace ordinary input
 pricing for the written portion; they are not added at full price a second time.
 """
@@ -13,12 +14,12 @@ from datetime import date
 
 VERIFIED = '2026-09-23'
 PRICE_POLICY = 'subscription-standard-api-equivalent-v6'
-MULTIPLIER_VERIFIED = '2026-10-01'
+MULTIPLIER_VERIFIED = '2026-10-27'
 FAST_MULTIPLIER = 2.5
-SUPPORTED_MODELS = ('gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna',
+SUPPORTED_MODELS = ('gpt-6.1-sol', 'gpt-6.1-terra', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna',
                     'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5')
-MODEL_VERIFIED = '2026-09-30'
-RATE_VERIFIED = {'gpt-6.1-sol': '2026-09-30'}
+MODEL_VERIFIED = '2026-10-27'
+RATE_VERIFIED = {'gpt-6.1-sol': '2026-09-30', 'gpt-6.1-terra': '2026-10-27'}
 PROFILE_NAME = VERIFIED + ' 단가 / ' + MULTIPLIER_VERIFIED + ' 구독 배율'
 SOURCE = 'https://developers.openai.com/api/docs/pricing'
 MODEL_SOURCE = 'https://learn.chatgpt.com/docs/models'
@@ -48,6 +49,7 @@ RATES = {
     'gpt-5.6-luna': Rate(.2, .02, 1.2, .25),
     'gpt-6-astra': Rate(10, 1, 50, 12.5),
     'gpt-6.1-sol': Rate(2, .1, 10, 2.5),
+    'gpt-6.1-terra': Rate(1, .05, 5, 1.25),
     'gpt-6-sol': Rate(2, .2, 10, 2.5),
     'gpt-6-luna': Rate(.1, .01, .5, .125),
 }
