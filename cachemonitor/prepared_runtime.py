@@ -249,7 +249,7 @@ class PreparedWriter:
                 pending_reset=False
 
             def finish_warnings():
-                nonlocal delivery_delta,maintenance_due,write_deferred
+                nonlocal delivery_delta,maintenance_due,write_deferred,next_poll
                 before=store.token
                 try:
                     completion=speed_writer.commit_completed()
@@ -264,12 +264,15 @@ class PreparedWriter:
                     record_failure(Path(quota_path).with_suffix('.analysis.sqlite'),
                         'prepared speed warnings',RuntimeError(name+': '+message+'\n'+frames))
                 if store.token!=before:
+                    maintenance_due=True
+                    if publisher.token!=before:
+                        next_poll=0
+                        return
                     try:publisher.adopt(store,(),())
                     except CapacityExceeded as error:
                         publication_failed(error)
                         return
                     delivery_delta=(tuple_token(before),tuple_token(store.token),(),())
-                    maintenance_due=True
                     publish()
 
             def capture_archive(owners=None):

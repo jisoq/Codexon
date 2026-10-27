@@ -56,6 +56,70 @@ def test_writer_survives_publication_capacity_and_recovers_on_sync(tmp_path,monk
         channel.close()
 
 
+@pytest.mark.parametrize('change',['title','membership'])
+def test_warning_completion_preserves_failed_canonical_adoption(tmp_path,monkeypatch,change):
+    from copy import deepcopy
+    from threading import Event
+    from cachemonitor import prepared_delivery,prepared_speed_writer
+    from cachemonitor.prepared_store import CapacityExceeded
+    from test_data_contract import source
+
+    fail_adoption=Event();allow_completion=Event();completed=Event()
+    class Limited(PreparedPublisher):
+        def adopt(self,*args,**kwargs):
+            if fail_adoption.is_set():
+                fail_adoption.clear()
+                raise CapacityExceeded('canonical publication pressure')
+            return super().adopt(*args,**kwargs)
+    class Warnings(prepared_speed_writer.PreparedWarningWorker):
+        def commit_completed(self):
+            if not allow_completion.is_set():return None
+            result=super().commit_completed()
+            if result is not None:completed.set()
+            return result
+    monkeypatch.setattr(prepared_delivery,'PreparedPublisher',Limited)
+    monkeypatch.setattr(prepared_speed_writer,'PreparedWarningWorker',Warnings)
+    channel=CollectionChannel([tmp_path/'home'],tmp_path/'source.sqlite')
+    channel.start_live()
+    snapshot=empty_snapshot(channel.homes,channel.path,time.time())
+    value=source();value['home']=channel.homes[0]
+    snapshot.update(sessions=[value],usage_collection_complete=True,request_activity=[],quota_by_home={})
+    snapshot['index'].update(loading=False,usage_complete=True)
+    channel.publish(snapshot,'pressure',1)
+    writer=PreparedWriter(channel.homes,channel.path,None,tmp_path/'quota.sqlite')
+    def receive(predicate):
+        deadline=time.monotonic()+10
+        while time.monotonic()<deadline:
+            assert writer.output.receiver.poll(max(0,deadline-time.monotonic()))
+            message=writer.output.take()
+            assert message['kind']!='fatal',message
+            if predicate(message):return message
+        raise AssertionError('writer did not recover the canonical publication')
+    try:
+        baseline=receive(lambda row:row['kind']=='snapshot')
+        updated=deepcopy(snapshot)
+        updated['sessions'][0]['title']='Updated'
+        if change=='membership':
+            added=source();added.update(id='added',home=channel.homes[0],title='Added')
+            added['history'][0]['key']='added-call'
+            updated['sessions'].append(added)
+        fail_adoption.set()
+        channel.publish(updated,'pressure',2)
+        assert receive(lambda row:row['kind']=='error')['capacity']
+        allow_completion.set()
+        writer.control.put('speed')
+        assert completed.wait(10),'warning completion did not reach the canonical writer'
+        result=receive(lambda row:row['kind']=='snapshot' and row['token']!=baseline['token'])
+        sessions={row['id']:row for row in result['value']['sessions']}
+        assert sessions[value['id']]['title']=='Updated'
+        assert set(sessions)==({value['id'],'added'} if change=='membership' else {value['id']})
+        assert writer.thread.is_alive()
+    finally:
+        allow_completion.set()
+        writer.close()
+        channel.close()
+
+
 def test_query_evicts_optional_caches_before_one_retry(tmp_path,monkeypatch):
     from types import SimpleNamespace
     from cachemonitor.prepared_query import PreparedQuery
