@@ -24,11 +24,14 @@ class SourceChanges:
     RESCAN_SECONDS = 3.
     METADATA_SECONDS = .25
 
-    def __init__(self, excluded=()):
+    def __init__(self, excluded=(), *, evidence=None):
         self.handles = {}; self.next_sync = 0.
         self.metadata = {}; self.next_metadata = 0.
         self.last_wake = float('-inf')
         self.excluded = tuple(Path(path).resolve() for path in excluded)
+        evidence = Path(evidence).resolve() if evidence is not None else None
+        self.evidence = (evidence, evidence.with_name(evidence.name+'-wal')) if evidence is not None else ()
+        self.evidence_signature = self._signature(self.evidence)
         self.api = None
         if os.name != 'nt': return
         try:
@@ -70,38 +73,42 @@ class SourceChanges:
             if handle not in (None, ctypes.c_void_p(-1).value): self.handles[root] = (handle, identity)
 
     @staticmethod
-    def _metadata_signature(home):
-        # Exact source filenames only: our databases, SHM reader locks and
-        # unrelated home-directory writes must never wake collection.
+    def _signature(paths):
         result = []
-        for name in ('state_5.sqlite', 'state_5.sqlite-wal', '.codex-global-state.json'):
+        for path in paths:
             try:
-                value = (home / name).stat()
+                value = path.stat()
                 result.append((value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns))
             except OSError:
                 result.append(None)
         return tuple(result)
 
-    def _metadata_changes(self, now):
-        if now < self.next_metadata: return frozenset()
+    @classmethod
+    def _metadata_signature(cls, home):
+        return cls._signature(home/name for name in
+            ('state_5.sqlite', 'state_5.sqlite-wal', '.codex-global-state.json'))
+
+    def _changes(self, now):
+        if now < self.next_metadata: return SourceHint()
         self.next_metadata = now + self.METADATA_SECONDS
         changed = set()
         for home, previous in self.metadata.items():
             current = self._metadata_signature(home)
             if current != previous:
                 changed.add(home); self.metadata[home] = current
-        return frozenset(changed)
+        current = self._signature(self.evidence)
+        evidence_changed = current != self.evidence_signature
+        self.evidence_signature = current
+        return SourceHint(uncertain=evidence_changed, metadata=frozenset(changed))
 
     def wait(self, deadline):
         """Return a coalesced hint, never a claim that all source writes are durable."""
-        # Probe only source metadata at a bounded cadence. A missing or
-        # replaced source file is also a hint; the reader remains authoritative.
         while True:
             now = time.monotonic()
-            metadata = self._metadata_changes(now)
-            if metadata: return SourceHint(metadata=metadata)
+            hint = self._changes(now)
+            if hint: return hint
             seconds = max(0., deadline - now)
-            interval = min(seconds, max(0., self.next_metadata-now)) if self.metadata else seconds
+            interval = min(seconds, max(0., self.next_metadata-now)) if self.metadata or self.evidence else seconds
             if not self.handles:
                 if interval: time.sleep(interval)
                 if time.monotonic() >= deadline: return SourceHint(uncertain=True)
@@ -133,7 +140,8 @@ class SourceChanges:
                 self.api.FindCloseChangeNotification(handle); self.handles.pop(root)
                 uncertain = True; self.next_sync = 0.
         self.last_wake = time.monotonic()
-        return SourceHint(frozenset(roots), uncertain, self._metadata_changes(self.last_wake))
+        hint = self._changes(self.last_wake)
+        return SourceHint(frozenset(roots), uncertain or hint.uncertain, hint.metadata)
 
     def close(self):
         for handle, _ in self.handles.values(): self.api.FindCloseChangeNotification(handle)

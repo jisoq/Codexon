@@ -66,7 +66,7 @@ def analysis_process(connection, *args, trace_path, profile=False, entered=None,
         def send(self, value):
             if value['kind'] == 'snapshot':
                 snapshot = value['value']
-                trace.emit('analysis_publication', token=snapshot.get('prepared_token'),
+                trace.emit('analysis_publication', token=snapshot.get('prepared_token'), source_at=snapshot.get('ts'),
                            summaries=[fingerprint(s) for s in snapshot.get('overlay_sessions', [])],
                            revisions={s['id']:s.get('_overlay_revision') for s in snapshot.get('overlay_sessions', [])})
             elif value['kind'] in ('fatal', 'error', 'overlay_detail', 'stale'):
@@ -182,12 +182,13 @@ def collector_process(connection, home, index, evidence, trace_path, profile, mo
                 profiler.dump_stats(str(Path(trace_path).with_name(command['scenario'] + '-collector.pstats')))
             stamp = trace.emit('collector_publication', scenario=command['scenario'],
                                owners=len(sessions), calls=sum(len(s['history']) for s in sessions.values()),
-                               selected=fingerprint(dict(selected, calls=len(selected['history']),
-                                   latest_key=selected['history'][-1]['key'])), polls=polls,
+                               selected=fingerprint(dict(selected, calls=len(selected.get('history', ())),
+                                   latest_key=selected['history'][-1]['key'] if selected.get('history') else None)), polls=polls,
                                cpu_seconds=time.process_time() - cpu,
                                bytes_read=value['index'].get('bytes_read'))
             connection.send(dict(kind='collected', ns=stamp, selected=selected,
-                                 owners=len(sessions), errors=value['errors']))
+                                 owners=len(sessions), errors=value['errors'], source_at=value['ts'],
+                                 activity=value.get('request_activity', [])))
     except BaseException:
         connection.send(dict(kind='error', error=traceback.format_exc()))
     finally:
@@ -200,6 +201,9 @@ def collected_matches(snapshot, selected, command):
     return bool(snapshot['usage_collection_complete']
                 and len(snapshot['sessions']) >= command.get('owners', 0)
                 and len(selected.get('history', ())) == command['calls']
+                and (not command.get('activity') or any(
+                    all(row.get(k) == v for k, v in command['activity'].items())
+                    for row in snapshot.get('request_activity', ())))
                 and all(selected['history'][-1].get(k) == v
                         for k, v in command.get('evidence', {}).items()))
 
@@ -248,15 +252,16 @@ def watcher_process(connection, home, index, evidence, trace_path, profile):
             if collected_matches(value, selected, command):
                 trace.emit('collector_publication', scenario=command['scenario'],
                            published_ns=stamp, owners=len(value['sessions']),
-                           selected=fingerprint(dict(selected, calls=len(selected['history']),
-                               latest_key=selected['history'][-1]['key'])),
+                           selected=fingerprint(dict(selected, calls=len(selected.get('history', ())),
+                               latest_key=selected['history'][-1]['key'] if selected.get('history') else None)),
                            cpu_seconds=time.process_time() - started,
                            source_hint=bool(kwargs.get('source_hint')))
                 with expectation_lock:
                     if expectation[0] is command:
                         expectation[0] = None
                 send(dict(kind='collected', ns=stamp, selected=selected,
-                          owners=len(value['sessions']), errors=value['errors']))
+                          owners=len(value['sessions']), errors=value['errors'], source_at=value['ts'],
+                          activity=value.get('request_activity', [])))
         return value
 
     usage_collection.CollectorService.poll = poll
@@ -295,11 +300,21 @@ class Scenario:
     receiver_ns: int | None = None
     previous_revision: tuple | None = None
     evidence: dict = field(default_factory=dict)
+    activity: dict = field(default_factory=dict)
+    observed_activity: list = field(default_factory=list)
+    source_at: float = 0.
+    unattributed: bool = False
 
     def matches(self, data, home):
         return bool(self.rows and fingerprint(data) == self.identity(home)
                     and (self.previous_revision is None
                          or tuple(data.get('_overlay_revision') or ()) != self.previous_revision))
+
+    def matches_snapshot(self, value, home):
+        if self.unattributed:
+            return bool(self.source_at and value['ts'] >= self.source_at
+                        and not any(s['id'] == self.sid for s in value.get('overlay_sessions', ())))
+        return any(self.matches(s, home) for s in value.get('overlay_sessions', ()))
 
     def identity(self, home):
         return [str(home), self.sid, len(self.rows), self.rows[-1]['key']]
@@ -338,6 +353,8 @@ def append_rows(home, scenario, count, trace):
 
 
 def check_output(data, scenario, home):
+    if scenario.unattributed:
+        return data is None and scenario.collector_ns is not None and scenario.bridge_ns is not None
     if not scenario.matches(data, home) or data.get('_recent_refs'):
         return False
     if scenario.evidence and any(data.get('latest', {}).get(k) != v for k, v in scenario.evidence.items()):
@@ -410,7 +427,7 @@ def run(args, directory, report):
         def receive(self, value):
             result = super().receive(value)
             if current is not None and result is not None:
-                if any(current.matches(s, home) for s in result.get('overlay_sessions', [])):
+                if current.matches_snapshot(result, home):
                     if current.receiver_ns is None:
                         current.receiver_ns = trace.emit('snapshot_receiver', scenario=current.name)
             return result
@@ -477,7 +494,7 @@ def run(args, directory, report):
 
     def arm(scenario, count=0, owners=0):
         command = dict(kind='poll', scenario=scenario.name, sid=scenario.sid,
-                       calls=len(scenario.rows) + count, owners=owners, deadline=args.deadline,
+                       calls=len(scenario.rows) + count, owners=owners, deadline=args.deadline, activity=scenario.activity,
                        evidence={k:v for k,v in scenario.evidence.items()
                                  if k in ('response_status', 'response_model', 'timing_valid')})
         if args.collector == 'watcher':
@@ -496,15 +513,20 @@ def run(args, directory, report):
             arm(scenario, owners=owners)
         if args.collector == 'entry':
             parent.send(dict(kind='poll', scenario=scenario.name, sid=scenario.sid,
-                             calls=len(scenario.rows), owners=owners, deadline=args.deadline,
+                             calls=len(scenario.rows), owners=owners, deadline=args.deadline, activity=scenario.activity,
                              evidence={k:v for k,v in scenario.evidence.items()
                                        if k in ('response_status', 'response_model', 'timing_valid')}))
         wait_for(parent.poll, 'collector publication')
         value = parent.recv()
         assert value['kind'] == 'collected', value
         assert not value['errors'], value
-        assert [r['key'] for r in value['selected']['history']] == [r['key'] for r in scenario.rows]
+        assert [r['key'] for r in value['selected'].get('history', ())] == [r['key'] for r in scenario.rows]
         scenario.collector_ns = value['ns']
+        scenario.source_at = value['source_at']
+        scenario.observed_activity = [row for row in value.get('activity', ())
+            if scenario.activity and all(row.get(k) == v for k, v in scenario.activity.items())]
+        if scenario.activity:
+            assert len(scenario.observed_activity) == 1, value
         armed[0] = None
         return value
 
@@ -517,10 +539,12 @@ def run(args, directory, report):
             model_evidence_path=evidence, quota_path=quota, cache_floor=0)
 
         def snapshot(value):
-            if current is not None and any(current.matches(s, home) for s in value.get('overlay_sessions', [])):
+            if current is not None and current.matches_snapshot(value, home):
                 if current.bridge_ns is None:
                     current.bridge_ns = trace.emit('bridge_snapshot', scenario=current.name)
             controller.receive_snapshot(value)
+            if current is not None and current.unattributed and current.bridge_ns is not None:
+                controller.widget.content_model.update()
 
         def detail(value):
             if current is not None and current.matches(value.get('summary'), home):
@@ -561,26 +585,72 @@ def run(args, directory, report):
         assert image.save(str(directory / (scenario.name + '.png')))
         if scenario.evidence:
             speed = next(item for item in controller.widget.content_model.headline_metrics() if item['id'] == 'speed')
-            assert speed['number'] == f"{scenario.evidence['output_speed']:,.1f}"
+            expected = scenario.evidence['output_speed']
+            assert speed['number'] == ('—' if expected is None else f'{expected:,.1f}')
+        if scenario.unattributed:
+            metrics = {item['id']:item['number'] for item in controller.widget.content_model.headline_metrics()}
+            assert controller.widget.content_model.latest_call() == {}
+            assert metrics['cost'] == metrics['speed'] == '—'
         frame_hash = hashlib.sha256(bytes(image.constBits())).hexdigest()
+        output = (dict(calls=0, cost=None, latest={}, revision=None, recent_keys=[])
+                  if scenario.unattributed else dict(calls=data['calls'], cost=data['cost'], latest=data['latest'],
+                    revision=data.get('_overlay_revision'), recent_keys=[r['key'] for r in data['recent']]))
         result = dict(name=scenario.name, calls=len(scenario.rows), source_ns=scenario.source_ns,
+            source_at=scenario.source_at, unattributed=scenario.unattributed, activity=scenario.observed_activity,
             stage_ms={name: (value - scenario.source_ns) / 1e6 for name, value in
                 [('collector', scenario.collector_ns), ('receiver', scenario.receiver_ns), ('bridge', scenario.bridge_ns),
                  ('detail', scenario.detail_ns), ('content', scenario.content_ns),
                  ('paint', scenario.paint_ns), ('frame', scenario.frame_ns)] if value is not None},
             frame_sha256=frame_hash, native_hwnd=int(controller.widget.winId()),
-            output=dict(calls=data['calls'], cost=data['cost'], latest=data['latest'],
-                        revision=data.get('_overlay_revision'),
-                        recent_keys=[r['key'] for r in data['recent']]))
+            output=output)
         report['samples'].append(result)
         trace.emit('assertions_passed', scenario=scenario.name, calls=len(scenario.rows), frame_sha256=frame_hash)
         print(json.dumps(dict(scenario=scenario.name, stage_ms=result['stage_ms']), ensure_ascii=False), flush=True)
+
+    def observe(scenario, status, response_id):
+        arm(scenario)
+        rollout = home / 'sessions' / (scenario.sid + '.jsonl')
+        source_hash = hashlib.sha256(rollout.read_bytes()).hexdigest()
+        from cachemonitor.model_evidence import EvidenceStore
+        store = EvidenceStore(evidence)
+        at = time.time()
+        scenario.source_at = at
+        try:
+            store.write(home, scenario.activity['attempt'], at, 'WebSocket',
+                response_id=response_id, requested_model='gpt-6.1-sol',
+                response_model='gpt-6.1-sol' if response_id else '', status=status,
+                requested_service_tier='default', response_service_tier='default' if response_id else '',
+                request_observed_at=at - 1,
+                generation_observed_at=at - .75 if status != 'pending' else None,
+                completed_observed_at=at if status == 'completed' else None,
+                generation_latency_ms=250. if status != 'pending' else None,
+                completion_latency_ms=1000. if status == 'completed' else None)
+        finally:
+            store.close()
+        scenario.source_ns = trace.emit('evidence_event', scenario=scenario.name,
+            sid=scenario.sid, simulated_local_timing=True, status=status, response_id=response_id)
+        collect(scenario)
+        if scenario.unattributed:
+            controller.widget.content_model.update()
+        finish(scenario)
+        assert hashlib.sha256(rollout.read_bytes()).hexdigest() == source_hash
 
     try:
         collector.start()
         child.close()
         wait_for(parent.poll, 'collector startup')
         assert parent.recv()['kind'] == 'started'
+        unknown = str(uuid.uuid4())
+        add_session(home, unknown, 'Unattributed request benchmark')
+        for status in ('pending', 'created', 'completed'):
+            current = Scenario('unattributed_' + status, unknown, unattributed=True,
+                activity=dict(attempt='local-unattributed-request', status=status,
+                              response_id='' if status == 'pending' else 'unbound-response'))
+            select(current)
+            if bridge is None:
+                start_bridge('unattributed')
+            observe(current, status, current.activity['response_id'])
+        stop_bridge()
         fresh = Scenario('fresh', str(uuid.uuid4()))
         add_session(home, fresh.sid, 'Fresh benchmark session')
         current = fresh
@@ -593,32 +663,18 @@ def run(args, directory, report):
         append(current, 1)
         collect(current)
         finish(current)
-        current = Scenario('response_evidence', current.sid, list(current.rows),
-                           previous_revision=tuple(controller.widget.data.get('_overlay_revision') or ()))
-        current.evidence = dict(response_status='completed', requested_model='gpt-6.1-sol',
-            response_model='gpt-6.1-sol', model_match='일치', timing_valid=True,
-            generation_latency_ms=250., completion_latency_ms=1000.,
-            output_speed=float(current.rows[-1]['output']))
-        arm(current)
-        rollout = home / 'sessions' / (current.sid + '.jsonl')
-        source_hash = hashlib.sha256(rollout.read_bytes()).hexdigest()
-        from cachemonitor.model_evidence import EvidenceStore
-        store = EvidenceStore(evidence)
-        at = time.time()
-        try:
-            store.write(home, 'local-simulated-completion', at, 'WebSocket',
-                response_id=current.rows[-1]['key'], requested_model='gpt-6.1-sol',
-                response_model='gpt-6.1-sol', status='completed',
-                requested_service_tier='default', response_service_tier='default',
-                request_observed_at=at - 1, generation_observed_at=at - .75,
-                completed_observed_at=at, generation_latency_ms=250., completion_latency_ms=1000.)
-        finally:
-            store.close()
-        current.source_ns = trace.emit('evidence_event', scenario=current.name,
-            sid=current.sid, simulated_local_timing=True, completion_latency_ms=1000.)
-        collect(current)
-        finish(current)
-        assert hashlib.sha256(rollout.read_bytes()).hexdigest() == source_hash
+        for status in ('created', 'completed'):
+            current = Scenario('response_progress' if status == 'created' else 'response_evidence',
+                current.sid, list(current.rows),
+                previous_revision=tuple(controller.widget.data.get('_overlay_revision') or ()),
+                activity=dict(attempt='local-simulated-completion', status=status,
+                              response_id=current.rows[-1]['key']))
+            current.evidence = dict(response_status=status, requested_model='gpt-6.1-sol',
+                response_model='gpt-6.1-sol', timing_valid=status == 'completed',
+                output_speed=float(current.rows[-1]['output']) if status == 'completed' else None)
+            if status == 'completed':
+                current.evidence.update(model_match='일치', generation_latency_ms=250., completion_latency_ms=1000.)
+            observe(current, status, current.rows[-1]['key'])
         stop_bridge()
         retained = current
         for number in range(args.owners - 1):
@@ -712,10 +768,13 @@ def summarize_trace(directory, report):
     for path in directory.glob('*.jsonl'):
         events.extend(json.loads(line) for line in path.read_text(encoding='utf-8').splitlines())
     for sample in report['samples']:
-        fingerprint = [None, None, sample['calls'], sample['output']['latest']['key']]
+        fingerprint = [None, None, sample['calls'], sample['output']['latest'].get('key')]
         for value in sorted(events, key=lambda row:row['ns']):
             if value['stage'] == 'analysis_publication' and value['ns'] >= sample['source_ns']:
-                if (any(row[2:] == fingerprint[2:] for row in value.get('summaries', []))
+                if sample['unattributed'] and value.get('source_at', 0) >= sample['source_at']:
+                    sample['stage_ms']['analysis'] = (value['ns'] - sample['source_ns']) / 1e6
+                    break
+                if (not sample['unattributed'] and any(row[2:] == fingerprint[2:] for row in value.get('summaries', []))
                         and value.get('revisions', {}).get(sample['output']['latest']['sid']) == json.loads(json.dumps(sample['output']['revision']))):
                     sample['stage_ms']['analysis'] = (value['ns'] - sample['source_ns']) / 1e6
                     break
@@ -759,6 +818,7 @@ def main():
         claim='Source file close to matching native Qt paint and afterRendering; triggered collector poll; explicit owned-window selection.',
         excludes=['source-watcher scheduling', 'Codex route discovery', 'physical presentation', 'upstream model timing'],
         collector=args.collector, simulated_model_timings=True,
+        identity_limit='Global attempts without source-bound response identities do not identify a selected owner. Their native cost and speed stay unknown.',
         checkout=str(ROOT), python=sys.executable, owners=args.owners, rows=args.rows,
         lock_sha256=hashlib.sha256((ROOT / 'requirements-release.lock').read_bytes()).hexdigest(),
         samples=[], errors=[], host_before=host_snapshot())

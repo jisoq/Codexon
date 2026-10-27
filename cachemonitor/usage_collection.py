@@ -1546,7 +1546,7 @@ def main():
     first=True;changes=None;source_hint=None
     try:
         from .collection_wake import SourceChanges
-        changes=SourceChanges((service.channel.path,service.channel.snapshot_path,evidence))
+        changes=SourceChanges((service.channel.path,service.channel.snapshot_path,evidence),evidence=evidence)
         changes.sync(service.channel.homes)
         while not service.stopping():
             snapshot=service.poll(detailed=False,source_hint=source_hint)

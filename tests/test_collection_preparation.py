@@ -45,7 +45,7 @@ def _next_collector_wait(monkeypatch, snapshot, path):
     polled = []
 
     class Changes:
-        def __init__(self, *args):
+        def __init__(self, *args, evidence=None):
             pass
 
         def sync(self, homes):
