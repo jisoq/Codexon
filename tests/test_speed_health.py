@@ -132,6 +132,41 @@ def test_incremental_appends_corrections_and_removals_match_complete_replay():
     assert tracker.metrics['retained_rows'] == tracker.metrics['baseline_rows'] == tracker.metrics['live_states'] == 0
 
 
+@pytest.mark.parametrize('start',[3000,1500,1900],ids=['after-frontier','late','equal-earlier-owner'])
+def test_first_eligible_replacement_reuses_only_causally_valid_peer_pool(monkeypatch,start):
+    from collections import Counter
+    peer=session([100]*10,'peer')
+    joining=session([35],'new',start=start,timing_valid=False)
+    sources=[peer,joining]
+    engine,tracker=AnalysisEngine(),SpeedHealth()
+    ingest(engine,sources)
+    assert tracker.collect(engine)==expected(engine)
+    assert not tracker.proofs[('h','new')].buckets
+    reads=Counter()
+    original=speed_module._EngineInput.rows
+    def rows(source,owner,ordinal):
+        for result in original(source,owner,ordinal):
+            reads[owner]+=1
+            yield result
+    monkeypatch.setattr(speed_module._EngineInput,'rows',rows)
+    joining['history'][0]['timing_valid']=True
+    ingest(engine,sources,joining)
+    assert tracker.collect(engine)==expected(engine)
+    late=start<=peer['history'][-1]['ts']
+    assert tracker.metrics['replayed_scopes']==int(late)
+    assert (reads[('h','peer')]>0)==late
+    appended(joining,[35,35])
+    for ordinal,row in enumerate(joining['history']):row['ts']=start+ordinal*100
+    ingest(engine,sources,joining)
+    assert tracker.collect(engine)==expected(engine)
+    if not late:
+        assert tracker.results[('h','new')]['active']
+        assert tracker.results[('h','new')]['baseline_source']=='peers'
+    appended(peer,[100],ts=4000)
+    ingest(engine,sources,peer)
+    assert tracker.collect(engine)==expected(engine)
+
+
 def test_changed_peer_scope_does_not_replay_unrelated_conditions():
     reference = session([100] * 10, 'reference')
     peer = session([35] * 3, 'peer', start=3000)

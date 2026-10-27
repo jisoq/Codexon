@@ -338,6 +338,7 @@ def observe_health(trace, expected, warm, first_row, exited, warm_done):
         if current and current['source'] is source:current['tracker'] = health
         result = collect(health,source)
         if current and current['source'] is source:
+            current['read_rows'] = source.read_rows
             current['collected'] = True
             verify_warm(health.proofs,source)
             if health.metrics.get('capacity_fallback'):
@@ -361,7 +362,8 @@ def observe_health(trace, expected, warm, first_row, exited, warm_done):
                 success = current['collected'] and current['error'] is None
                 trace.emit('health_operation_exit',operation='warning_worker',success=success,
                     elapsed_ns=time.perf_counter_ns()-current['started'],cpu_seconds=time.thread_time()-current['cpu'],
-                    read_rows=source.read_rows,observed_rows=current['observed_rows'],checkpoint=dict(restored=current['restored'],recovery=current['recovery']),
+                    read_rows=current['read_rows'] if current['collected'] else source.read_rows,
+                    observed_rows=current['observed_rows'],checkpoint=dict(restored=current['restored'],recovery=current['recovery']),
                     metrics={} if health is None else dict(health.metrics),token=token(source.token),error=current['error'])
                 if current['missing']:
                     trace.emit('health_recovery_exit',success=success,token=token(source.token))
@@ -859,6 +861,7 @@ def audit_case(case):
     reads = [r for r in health if r['stage'] == 'health_operation_exit' and r['operation'] == 'warning_worker']
     checkpoints = [r for r in health if r['stage'] == 'health_checkpoint_committed']
     assert reads and any(r['success'] for r in reads) and checkpoints,health
+    assert all(r['read_rows']==r['observed_rows'] for r in reads if r['success']),reads
     case.report['health'] = health
     case.report['worker_pass_failures'] = [r for r in reads if not r['success']]
     if case.args.case == 'restart':

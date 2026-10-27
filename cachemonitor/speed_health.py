@@ -511,14 +511,14 @@ class SpeedHealth:
                 else:
                     self.changed_owners.add(owner)
                     proof, prefix, minima = self._proof(owner, state, old, source)
-                    if old is not None and not prefix:
+                    if old is not None and old.buckets and not prefix:
                         dirty.update((owner[0], c) for c in old.buckets)
                         dirty.update((owner[0], c) for c in proof.buckets)
                     else:
-                        start = old.length if old is not None else 0
+                        start = old.length if prefix else 0
                         if proof.length > start:
                             tails[owner] = (start,
-                                (old.condition, old.timestamp) if old else (None, None))
+                                (old.condition, old.timestamp) if prefix else (None, None))
                         for bucket, order in minima.items():
                             replay = self.replays.get(bucket)
                             if (replay is not None and replay.last_order is not None
