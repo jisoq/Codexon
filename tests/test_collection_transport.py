@@ -1474,7 +1474,7 @@ def test_lineage_catalog_preserves_parent_policy_without_full_metadata_scans(tmp
     finally:reader.close();writer.close()
 
 
-def membership_snapshot(channel, count=24, width=300):
+def membership_snapshot(channel, count=64, width=300):
     value=snapshot(channel)
     home=channel.homes[0]
     ids=[f'owner-{n}-'+('x'*width) for n in range(count)]
@@ -1488,11 +1488,12 @@ def membership_snapshot(channel, count=24, width=300):
 def test_catalog_pages_preserve_source_membership_before_loaded_owners(tmp_path,monkeypatch):
     from cachemonitor import usage_collection as collection
     monkeypatch.setattr(collection,'CATALOG_PAGE_ROWS',3)
-    monkeypatch.setattr(collection,'CATALOG_PAGE_BYTES',12*1024)
+    monkeypatch.setattr(collection,'CATALOG_PAGE_BYTES',32*1024)
     writer=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite');writer.start_live()
     reader=CollectionChannel(writer.homes,writer.path)
     try:
         value=membership_snapshot(writer)
+        assert len(json.dumps(value).encode())>collection.CATALOG_PAGE_BYTES
         writer.publish(value,'epoch',1)
         pages=[];cursor=None
         while True:
@@ -1518,13 +1519,14 @@ def test_catalog_pages_preserve_source_membership_before_loaded_owners(tmp_path,
 @pytest.mark.parametrize('passive',[False,True])
 def test_status_projection_preserves_full_catalog_and_body_readers(tmp_path,monkeypatch,live,passive):
     from cachemonitor import usage_collection as collection
-    monkeypatch.setattr(collection,'CATALOG_PAGE_BYTES',4096)
+    monkeypatch.setattr(collection,'CATALOG_PAGE_BYTES',16*1024)
     writer=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite')
     if live:writer.start_live()
     reader=CollectionChannel(writer.homes,writer.path)
     status=collection.CollectionHeaderReader(writer.homes,writer.path) if passive else reader
     try:
         value=membership_snapshot(writer)
+        assert len(json.dumps(value).encode())>2*collection.CATALOG_PAGE_BYTES
         writer.publish(value,'epoch',1)
         header=status.read_header()
         assert header['ts']==value['ts'] and header['index']==value['index']
@@ -1695,7 +1697,7 @@ def test_catalog_scan_budget_includes_filtered_owner_positions(tmp_path,monkeypa
     finally:reader.close();writer.close()
 
 
-@pytest.mark.parametrize('suffix',[b'\0'*70000,b'\0'*70000+b'invalid'])
+@pytest.mark.parametrize('suffix',[b'\0'*70000,b'\0'*70000+b'invalid'],ids=['zero-padding','nonzero-padding'])
 def test_durable_status_validates_padding_after_the_zlib_stream(tmp_path,suffix):
     import zlib
     from cachemonitor import usage_collection as collection
