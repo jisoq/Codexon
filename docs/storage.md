@@ -96,9 +96,6 @@ retained objects. Their defaults are separate from total history capacity.
 
 The [capacity policy](capacity.md) distinguishes removed population admissions
 from retained object guards, work slices, optional caches, and semantic values.
-Format-9 core ownership and durable quota handoff are implemented. Source selected-publication integration,
-runtime consumers, and delivery corrections remain under integration and
-verification. This storage description does not certify a final build or install.
 
 ## Retained event storage
 

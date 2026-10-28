@@ -61,6 +61,7 @@ GROUPS = {
                          'prepared_restart_incremental', 'prepared_reader_lifecycle',
                          'prepared_notification_heads', 'prepared_mode_dependencies',
                          'prepared_delivery_continuation', 'prepared_publication_pressure',
+                         'prepared_catalog_capacity', 'prepared_query_owners',
                          'prepared_warning_worker', 'selected_preparation',
                          'prepared_ledger_reuse', 'prepared_finance_reuse', 'prepared_read_optimization', 'performance_reuse') + (
         'tests/test_collection_transport.py::test_analyzer_publication_wakes_before_timer_and_freeze_reclaims_waiter',

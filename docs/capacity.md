@@ -115,7 +115,7 @@ Removing the prepared writer's lifetime admission requires no persisted-limit
 reset migration. Recovery-schema and backlog page limits still belong to their
 own connections.
 
-## Selected authority and integration status
+## Selected authority
 
 Prepared format 9 separates selected membership and relative order from the
 retained canonical population and global order. A selected result cannot retire
@@ -124,8 +124,4 @@ resolve its family through the existing source index. Paging all history is not
 an overlay prerequisite. Aggregate consumers retain complete-membership work.
 See [prepared analysis cache](storage.md#prepared-analysis-cache).
 
-The format-9 core and durable quota handoff are implemented. Source selected-publication integration,
-runtime consumers, and delivery corrections remain under integration and
-verification. This document does not certify a final source candidate, package,
-installation, live overlay recovery, or universal capacity. Exact-default
-calibration and long-lived replay memory remain separate evidence gaps.
+Exact-default calibration and long-lived replay memory remain evidence gaps.
