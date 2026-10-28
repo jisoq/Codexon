@@ -564,6 +564,34 @@ def test_selected_writer_completes_with_empty_mode_ancestor_outside_family(tmp_p
         assert detail['summary']['latest']['mode']=='미확인'
 
 
+def test_current_session_updates_while_aggregate_source_is_unavailable(tmp_path,monkeypatch):
+    home,_=fixture_home(tmp_path)
+    write_session(home,TID,count=1)
+    other=write_session(home,OTHER,count=3)
+    target=tmp_path/'index.sqlite';quota=tmp_path/'quota.sqlite'
+    receiver=SnapshotReceiver()
+    release=Event();rebuilding=Event()
+    source_open=io.open
+    def held_open(path,*args,**kwargs):
+        if str(path)==str(other) and not release.is_set():
+            rebuilding.set()
+            raise PermissionError('aggregate source is held unavailable')
+        return source_open(path,*args,**kwargs)
+    with closing(CollectorService([home],target)) as service,closing(PreparedWriter([home],target,None,quota)) as writer:
+        writer.set_selected([(None,TID)])
+        first=publication(service,writer,receiver,lambda value:any(row['id']==TID for row in value['sessions']))
+        monkeypatch.setattr(io,'open',held_open)
+        writer.set_aggregate(7)
+        publication(service,writer,receiver,lambda value:rebuilding.is_set())
+        write_session(home,TID,count=2)
+        updated=publication(service,writer,receiver,lambda value:
+            any(row['id']==TID and row['calls']==2 for row in value['overlay_sessions']))
+        detail,_=selected_detail(service,writer,receiver,updated,TID,'updated')
+        assert len(detail['summary']['recent'])==2
+        assert not release.is_set()
+        assert updated.get('aggregate_request') is None
+
+
 def test_writer_keeps_selected_detail_live_until_explicit_aggregate_completes_and_preserves_ledger(tmp_path,monkeypatch):
     home,_=fixture_home(tmp_path)
     selected=write_session(home,TID,count=25)

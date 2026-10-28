@@ -331,6 +331,12 @@ class Dashboard(TrayWindow):
         page=getattr(self,'current_page',3)
         if self.worker is not None and hasattr(self.worker,'cancel_queries') and (not visible or page in (3,4,7)):
             self.worker.cancel_queries()
+            if self.analysis_pending:
+                self.request_id+=1;self.analysis_pending=False
+                self.deferred_result=None;self.defer_timer.stop()
+                self.clear_analysis_loading();self._display_dirty=True
+        if visible and getattr(self,'_display_dirty',False):
+            self._display_dirty=False;QTimer.singleShot(0,lambda:self.render(automatic=True))
         self.quota_panel.set_presentation_active(visible and page==3)
         for service in getattr(self,'quota_services',{}).values():
             service.set_reports_enabled(visible and page==3 and service is self.quota_service)
@@ -730,10 +736,13 @@ class Dashboard(TrayWindow):
             elapsedText=formatted('{seconds}초 경과',seconds=elapsed),slow=bool(self.analysis_loading.get('slow') or elapsed>=5)))
 
     def set_analysis_stage(self,stage):
-        stages={'queued':'분석에 사용할 기록을 준비하고 있습니다.',
-                'query':'선택한 조건에 맞는 사용 기록을 읽고 있습니다.',
-                'aggregate':'조회한 기록으로 지표를 계산하고 있습니다.',
-                'present':'화면의 구성 요소를 준비하고 있습니다.'}
+        stages={'queued':(0,'분석에 사용할 기록을 준비하고 있습니다.'),
+                'collecting':(0,'저장된 Codex 사용 기록을 읽고 있습니다.'),
+                'converting':(0,'확인한 기록으로 사용량을 계산하고 있습니다.'),
+                'publishing':(0,'확인한 사용량을 화면에 반영하고 있습니다.'),
+                'query':(1,'선택한 조건에 맞는 사용 기록을 읽고 있습니다.'),
+                'aggregate':(2,'조회한 기록으로 지표를 계산하고 있습니다.'),
+                'present':(3,'화면의 구성 요소를 준비하고 있습니다.')}
         self.analysis_stage=stage
         if self.preparation is not None:
             self.sync_preparation();return
@@ -741,8 +750,8 @@ class Dashboard(TrayWindow):
             state=dict(self.analysis_loading)
             if state.get('stageName')!=stage:
                 for key in ('processed','total','progressText'):state.pop(key,None)
-            self.set_analysis_loading(dict(state,stageName=stage,stage=list(stages).index(stage) if stage in stages else 0,
-                                           detail=tr(stages.get(stage,stages['queued']))))
+            position,detail=stages.get(stage,stages['queued'])
+            self.set_analysis_loading(dict(state,stageName=stage,stage=position,detail=tr(detail)))
 
     @batched_updates
     def analysis_progressed(self,message):
@@ -759,7 +768,8 @@ class Dashboard(TrayWindow):
             if self.preparation is not None:return
             done=message.get('processed');total=message.get('total')
             if type(done) is int and done>=0 and self.analysis_loading:
-                templates={'calls':'처리한 호출 {count}건','intervals':'계산 구간 {count}','sessions':'확인한 세션 {count}개'}
+                templates={'calls':'처리한 호출 {count}건','intervals':'계산 구간 {count}',
+                           'sessions':'확인한 세션 {count}개','files':'확인한 파일 {count}개'}
                 count=f'{done:,} / {total:,}' if type(total) is int and total>=done else f'{done:,}'
                 detail=formatted(templates.get(message.get('unit'),templates['calls']),count=count)
                 calls=message.get('calls')
@@ -1052,8 +1062,6 @@ class Dashboard(TrayWindow):
         self.sync_report_demand()
         self.quota_sidebar.refresh_status()
         self.refresh_home_status()
-        if getattr(self,'_display_dirty',False):
-            self._display_dirty=False;QTimer.singleShot(0,lambda:self.render(automatic=True))
 
     def hideEvent(self,event):
         super().hideEvent(event);self.sync_report_demand()

@@ -100,6 +100,7 @@ class CollectionReplay:
         ''')
         self.started = False
         self.enabled = False
+        self.aggregate_active = False
         self.weight = 0
         self.evidence_version = None
         self.join_epoch = None
@@ -156,16 +157,18 @@ class CollectionReplay:
     def _begin(self, now):
         if not self.enabled:
             self.enabled = self.index.event_store.enable_replay_tokens() is not None
-            if self.enabled:
-                weight = 0
-                for home, sid in self.db.execute('SELECT home,sid FROM owners'):
-                    if not isinstance(home,str) or not isinstance(sid,str):continue
-                    weight += 256 + 4 * (len(home) + len(sid))
-                    if weight > 16 * 1024 * 1024:
-                        break
-                    self.pending.add((home, sid))
         if not self.enabled:
             return
+        aggregate=self.index.demand is None or self.index.demand['aggregate']
+        if aggregate and not self.aggregate_active:
+            weight = 0
+            for home, sid in self.db.execute('SELECT home,sid FROM owners'):
+                if not isinstance(home,str) or not isinstance(sid,str):continue
+                weight += 256 + 4 * (len(home) + len(sid))
+                if weight > 16 * 1024 * 1024:
+                    break
+                self.pending.add((home, sid))
+        self.aggregate_active=aggregate
         reader = self.index.model_evidence
         # Poll deltas live for one reader batch. Preserve invalidation even when
         # later batches or a read error defer restoration and publication.
@@ -188,7 +191,7 @@ class CollectionReplay:
         if not self.pending and self.restore_job is not None:
             self.restore_job.close();self.restore_job = None
         version = self.reader_version()
-        if self.index.demand is not None and not self.index.demand['aggregate']:
+        if not aggregate:
             self.pending.clear()
             if self.restore_job is not None:
                 self.restore_job.close();self.restore_job=None
@@ -197,11 +200,9 @@ class CollectionReplay:
             return
         if version is None:
             return
-        initial = not self.started
-        if initial:
-            self.started = True
-            if self.pending:
-                self.restore_job = self._restore(version, now)
+        self.started = True
+        if self.pending and self.restore_job is None:
+            self.restore_job = self._restore(version, now)
         if self.restore_job is not None:
             deadline = time.monotonic() + .1
             while time.monotonic() < deadline:

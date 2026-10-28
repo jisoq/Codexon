@@ -67,11 +67,12 @@ def _catalog_status(page):
         'header':header,'owners':{}}
 
 
-def read_catalog(client, *, store=None, cancel=None):
+def read_catalog(client, *, store=None, cancel=None, selected=None):
     cursor = None
     catalog = None
     demand = getattr(client,'active_demand',None)
-    selected = demand is not None and not demand['aggregate'] and callable(getattr(client,'poll_selection',None))
+    if selected is None:
+        selected = demand is not None and not demand['aggregate'] and callable(getattr(client,'poll_selection',None))
     poll = client.poll_selection if selected else client.poll_catalog
     try:
         while True:
@@ -140,11 +141,16 @@ def read_catalog(client, *, store=None, cancel=None):
         raise
 
 
+def is_scoped_catalog(catalog):
+    """An available source projection cannot retire retained prepared owners."""
+    return catalog.get('authority')=='selected' or catalog.get('aggregate_complete') is False
+
+
 def source_identity(catalog):
     source = (catalog['scope'], catalog['path'], tuple(catalog['selected_homes']),
               tuple(catalog['catalog_identity']))
-    if catalog.get('authority')=='selected':
-        source += (('selected',catalog['selection_request']),)
+    if is_scoped_catalog(catalog):
+        source += (('selected',catalog.get('selection_request')),)
     return source
 
 
@@ -491,7 +497,7 @@ class PreparedCohort:
 
     def _speed_inventory(self):
         current=self.speed_writer.owner_stamps(self.store.token)
-        selected = getattr(self,'catalog',{}).get('authority')=='selected'
+        selected = is_scoped_catalog(getattr(self,'catalog',{}))
         result={}
         with self.store.read_current(seconds=60) as view:
             if not selected and current is not None and not view.db.execute(
@@ -589,7 +595,7 @@ class PreparedCohort:
         count = 0
         with self.store.read_current(staged=staged, seconds=60) as view:
             inventory = self._inventory(view)
-            values = (inventory.get(owner) for owner in catalog['owners']) if catalog.get('authority')=='selected' else inventory.values()
+            values = (inventory.get(owner) for owner in catalog['owners']) if is_scoped_catalog(catalog) else inventory.values()
             for value in values:
                 if value is None:
                     return False
@@ -661,7 +667,7 @@ class PreparedCohort:
         if not catalog['membership_complete']:
             raise ValueError('canonical cohort needs complete source membership')
         self.catalog = catalog = self._capture_catalog(catalog)
-        selected = catalog.get('authority')=='selected'
+        selected = is_scoped_catalog(catalog)
         references = ChainMap(catalog['owners'],catalog.get('mode_sources',{})) if selected else catalog['owners']
         changed, removed = set(changed), set(removed)
         if selected and removed:
@@ -910,7 +916,7 @@ class PreparedCohort:
             self.cache.clear()
             self.cache_bytes = 0
 
-    def convert(self, catalog, *, cohort_size=None):
+    def convert(self, catalog, *, cohort_size=None, progress=None):
         if not catalog['membership_complete']:
             raise ValueError('conversion waits for complete source membership')
         automatic = cohort_size is None
@@ -918,7 +924,7 @@ class PreparedCohort:
         if not 1 <= cohort_size <= self.store.limits.owners_per_batch:
             raise ValueError('invalid conversion cohort size')
         was_ready = bool(self.store.db.execute('SELECT ready FROM meta WHERE singleton=1').fetchone()[0])
-        selected = catalog.get('authority')=='selected'
+        selected = is_scoped_catalog(catalog)
         self.order_changed = not was_ready
         work = ConversionPlan(self.store)
         try:
@@ -957,6 +963,7 @@ class PreparedCohort:
                         if owner not in catalog['owners']:
                             work.add(owner,keep=False)
             total = sum(work.counts.values())
+            if progress is not None:progress(0,total)
             self.order_changed = self.order_changed or bool(work.counts[False])
             if not total:
                 if self.order_changed:

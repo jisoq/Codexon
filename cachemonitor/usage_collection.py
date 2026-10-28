@@ -869,8 +869,12 @@ class CollectionChannel(CollectionHeaderReader):
             encoded_header=SnapshotHeader(header,old_header)
             self.db.executemany('INSERT OR REPLACE INTO sessions VALUES(?,?,?,?)',writes)
             removed=previous.keys()-current.keys()
-            if snapshot.get('index',{}).get('loading'):
-                retained=retained-current.keys()
+            complete=(snapshot.get('catalog_scope')!='selected'
+                and snapshot.get('catalog_complete',True) and snapshot.get('usage_collection_complete',True)
+                and not snapshot.get('index',{}).get('loading'))
+            if not complete:
+                retained=(retained|removed)-current.keys()
+                removed=set()
             else:
                 removed|=retained-current.keys()
                 retained=set()

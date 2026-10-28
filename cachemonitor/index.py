@@ -586,7 +586,8 @@ class UsageIndex:
         for key in removed:
             job=self.rebuild_jobs.pop(key,None)
             if job is not None:job.close()
-            self.monitor.sessions.pop(key,None)
+            previous=self.monitor.sessions.pop(key,None)
+            if self.replay is not None:self.replay.rebuilt(key,previous)
             self.loaded.discard(key)
             self.new_events.pop(key,None)
             self.rebuild_required.discard(key)

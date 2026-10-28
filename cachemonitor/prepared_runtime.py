@@ -16,7 +16,7 @@ import traceback
 from .analysis_engine import retained_bytes
 from .analysis_delivery import ANALYSIS_IDLE_WAIT_SECONDS
 from .analysis_query_actor import QueryActor
-from .prepared_ingest import ModeEvidenceUnavailable,PreparedCohort, read_catalog
+from .prepared_ingest import ModeEvidenceUnavailable,PreparedCohort,is_scoped_catalog,read_catalog
 from .prepared_ledger import PreparedLedger
 from .prepared_changes import GenerationJournal
 from .prepared_query import PreparedQuery, token_value, tuple_token
@@ -36,8 +36,8 @@ class Mailbox:
         self.advisory = False
 
     def offer_progress(self, value):
-        if value.get('kind') != 'progress' or value.get('scope') != 'startup':
-            raise ValueError('only startup progress is advisory')
+        if value.get('kind') != 'progress' or value.get('scope') not in ('startup','aggregate'):
+            raise ValueError('only preparation progress is advisory')
         with self.condition:
             if self.stopped.is_set() or self.value is not None and not self.advisory:
                 return False
@@ -176,23 +176,28 @@ class PreparedWriter:
     def _run(self):
         collector = ledger = store = speed_writer = archive = catalog = None
         initial = True
+        aggregate = None
         last_progress = None
         progress_at = 0.
 
         def progress(stage, processed=None, total=None):
             nonlocal last_progress, progress_at
-            if not initial:return
-            value = stage, processed, total
+            request=aggregate
+            if not initial and request is None:return
+            scope='startup' if initial else 'aggregate'
+            value = stage, processed, total, scope, request
             if value == last_progress:return
             now = time.monotonic()
             immediate = (last_progress is None or stage != last_progress[0]
-                         or total and not last_progress[2])
+                         or total and not last_progress[2] or value[3:]!=last_progress[3:])
             if not immediate and now-progress_at < 1:return
-            message = dict(kind='progress', scope='startup', stage=stage.value)
+            message = dict(kind='progress', scope=scope, stage=stage.value)
+            if scope=='aggregate':
+                message.update(id=request,unit='files' if stage==PreparationStage.COLLECTING else 'sessions')
             if total:
                 message.update(processed=processed, total=total)
-            self.output.offer_progress(message)
-            last_progress, progress_at = value, now
+            if self.output.offer_progress(message):
+                last_progress, progress_at = value, now
 
         try:
             progress(PreparationStage.STARTING)
@@ -342,7 +347,7 @@ class PreparedWriter:
                     publish()
 
             def capture_archive(owners=None):
-                if owners is None and catalog is not None and catalog.get('authority')=='selected':
+                if owners is None and catalog is not None and is_scoped_catalog(catalog):
                     owners=catalog['owners']
                 scope=store.read_current(cancel=self.stopped)
                 view=scope.__enter__()
@@ -376,7 +381,7 @@ class PreparedWriter:
                 if ledger is not None and (complete or catalog['owners'] or store.has_ledger_pending() or snapshot.get('request_activity')):
                     try:
                         envelope=snapshot if complete else dict(snapshot,collection_partial=True)
-                        owners=catalog['owners'] if catalog.get('authority')=='selected' else None
+                        owners=catalog['owners'] if is_scoped_catalog(catalog) else None
                         batches=adapter.sync(envelope,owners=owners)
                         try:
                             for batch in batches:
@@ -424,6 +429,77 @@ class PreparedWriter:
                 if ledger is not None and imported:
                     ledger_issue=None;failures=0
                 next_import=time.monotonic()+.05
+
+            def install_prepared(coordinator, *, accounting=True):
+                nonlocal snapshot,aggregate_complete,ledger_pending,delivery_delta,catalog_installed
+                with cycle.measure('current_speeds'):
+                    coordinator.current_speeds()
+                capture_archive(frozenset(pending_changed|pending_removed))
+                previous=publisher.token
+                with cycle.measure('publication_adopt'):
+                    if blocked_publication!=store.token:
+                        try:publisher.adopt(store,pending_changed,pending_removed,
+                            selected=catalog['selected_members'] if catalog['header'].get('demand') is not None else None)
+                        except CapacityExceeded as error:publication_failed(error)
+                if previous!=store.token and publisher.token==store.token:
+                    delivery_delta=((tuple_token(previous),tuple_token(store.token),
+                        tuple(pending_changed),tuple(pending_removed)) if previous is not None and
+                        len(pending_changed)+len(pending_removed)<=store.limits.owners_per_batch else None)
+                publisher.cache_floor=self.cache_floor
+                with cycle.measure('activity_page'):
+                    snapshot=collector.channel.activity_page(dict(catalog['header']),catalog['publication'][0],
+                        live=not catalog.get('aggregate_complete',True))
+                if accounting:catalog_installed=True
+                aggregate_complete=catalog.get('aggregate_complete',True)
+                snapshot['aggregate_request']=aggregate if aggregate_complete else None
+                ledger_pending=ledger is not None and bool(aggregate_complete
+                    or catalog['owners'] or store.has_ledger_pending() or snapshot.get('request_activity'))
+                if previous!=store.token:publish()
+                if publisher.token==store.token:
+                    pending_changed.clear();pending_removed.clear()
+                interrupted=sync_ledger() if accounting else False
+                publish()
+                return interrupted
+
+            def refresh_selected():
+                nonlocal catalog,maintenance_due,interleaved_catalog
+                from .prepared_ingest import state_facts
+                full=catalog
+                live=None
+                try:
+                    if self.frozen.is_set():return False
+                    try:live=read_catalog(collector,store=store,cancel=cancelled,selected=True)
+                    except CollectionCatalogUnavailable:return False
+                    if self.frozen.is_set():return False
+                    if not live['membership_complete']:return False
+                    catalog=live
+                    coordinator=PreparedCohort(store,collector,ledger,cancel=cancelled,speed_writer=speed_writer)
+                    if ledger is not None:
+                        try:
+                            for owners in live.mode_groups(store.limits.owners_per_batch):
+                                ledger.scan_modes(live['selected_homes'],owners=owners)
+                        except sqlite3.Error as error:disable(error)
+                    coordinator.ledger=ledger
+                    for change in coordinator.convert(live):
+                        pending_removed.difference_update(change['changed'])
+                        pending_changed.update(change['changed'])
+                        maintenance_due=True
+                    # Historical ledger work remains durable and pending. It
+                    # must not run ahead of the selected display at each yield.
+                    install_prepared(coordinator,accounting=False)
+                    if isinstance(interleaved_catalog,CatalogWork):interleaved_catalog.close()
+                    interleaved_catalog=live
+                    for entries in (live['owners'],live.get('mode_sources',{})):
+                        for owner,entry in entries.items():
+                            previous=full['owners'].get(owner) or full.get('mode_sources',{}).get(owner)
+                            if (previous is None or entry['body_digest']!=previous['body_digest']
+                                    or state_facts(entry.get('state',{}))!=state_facts(previous.get('state',{}))
+                                    or entry.get('owner_lineage')!=previous.get('owner_lineage')):
+                                return True
+                    return False
+                finally:
+                    catalog=full
+                    if live is not interleaved_catalog and isinstance(live,CatalogWork):live.close()
 
             while not self.stopped.is_set():
                 if time.monotonic()>=archive.retry_at:
@@ -504,6 +580,7 @@ class PreparedWriter:
                     catalog_received=False
                     previous_catalog=catalog
                     catalog_installed=False
+                    interleaved_catalog=None
                     try:
                         with cycle.measure('catalog'):
                             catalog=read_catalog(collector,store=store,cancel=cancelled)
@@ -540,10 +617,7 @@ class PreparedWriter:
                             progress(PreparationStage.CONVERTING)
                             coordinator=PreparedCohort(store,collector,ledger,
                                 cancel=cancelled,speed_writer=speed_writer)
-                            expanding=False
-                            if catalog.get('authority')!='selected':
-                                with store.read_current(seconds=60) as current_view:
-                                    expanding=catalog.limit_additions(coordinator._inventory(current_view),16)
+                            full=catalog.get('authority')!='selected'
                             if ledger is not None:
                                 try:
                                     with cycle.measure('mode_scan'):
@@ -555,61 +629,41 @@ class PreparedWriter:
                                 except sqlite3.Error as error:disable(error)
                             coordinator.ledger=ledger
                             with cycle.measure('conversion'):
-                                for change in coordinator.convert(catalog):
-                                    if 'processed' in change:
-                                        progress(PreparationStage.CONVERTING,change['processed'],change['total'])
-                                    pending_removed.difference_update(change['changed'])
-                                    pending_changed.update(change['changed'])
-                                    pending_changed.difference_update(change['removed'])
-                                    pending_removed.update(change['removed'])
-                                    maintenance_due=True
-                                    if self.stopped.is_set():
-                                        raise InterruptedError('prepared conversion cancelled')
-                                    if not change['ready']:
-                                        # Keep a large one-time conversion's cleanup
-                                        # debt within one admitted cohort.
-                                        while self._maintain(store,archive,speed_writer):
-                                            if self.stopped.is_set():
-                                                raise InterruptedError('prepared conversion cleanup cancelled')
-                                        maintenance_due=False
+                                changes=coordinator.convert(catalog,cohort_size=16 if full else None,
+                                    progress=lambda done,total:progress(PreparationStage.CONVERTING,done,total))
+                                try:
+                                    for change in changes:
+                                        if 'processed' in change:
+                                            progress(PreparationStage.CONVERTING,change['processed'],change['total'])
+                                        pending_removed.difference_update(change['changed'])
+                                        pending_changed.update(change['changed'])
+                                        pending_changed.difference_update(change['removed'])
+                                        pending_removed.update(change['removed'])
+                                        maintenance_due=True
+                                        if self.stopped.is_set():
+                                            raise InterruptedError('prepared conversion cancelled')
+                                        if self.frozen.is_set():
+                                            collector.stop_notifications();notification=None
+                                        if not change['ready'] or change.get('processed',0)<change.get('total',0):
+                                            if selected:
+                                                changed=refresh_selected()
+                                                coordinator.order_changed=True
+                                                if changed:
+                                                    raise CollectionCatalogUnavailable('selected_source_changed')
+                                            while self._maintain(store,archive,speed_writer):
+                                                if self.stopped.is_set():
+                                                    raise InterruptedError('prepared conversion cleanup cancelled')
+                                            maintenance_due=False
+                                finally:changes.close()
                             cycle.counts.update(changed_owners=len(pending_changed),removed_owners=len(pending_removed))
                             progress(PreparationStage.PUBLISHING)
                             for name in ('source_reads','prepared_owners','candidate_rows','append_owners','append_rows','append_fallbacks'):
                                 cycle.counts[name]=getattr(coordinator,'metrics',{}).get(name,0)
-                            with cycle.measure('current_speeds'):
-                                coordinator.current_speeds()
-                            capture_archive(frozenset(pending_changed|pending_removed))
-                            previous=publisher.token
-                            with cycle.measure('publication_adopt'):
-                                if blocked_publication!=store.token:
-                                    try:publisher.adopt(store,pending_changed,pending_removed,
-                                        selected=catalog['selected_members'] if catalog['header'].get('demand') is not None else None)
-                                    except CapacityExceeded as error:publication_failed(error)
-                            if previous!=store.token and publisher.token==store.token:
-                                delivery_delta=((tuple_token(previous),tuple_token(store.token),
-                                    tuple(pending_changed),tuple(pending_removed)) if previous is not None and
-                                    len(pending_changed)+len(pending_removed)<=store.limits.owners_per_batch else None)
-                            publisher.cache_floor=self.cache_floor
-                            with cycle.measure('activity_page'):
-                                snapshot=collector.channel.activity_page(dict(catalog['header']),catalog['publication'][0],
-                                    live=not catalog.get('aggregate_complete',True))
-                            catalog_installed=True
-                            aggregate_complete=catalog.get('aggregate_complete',True)
-                            snapshot['aggregate_request']=aggregate if aggregate_complete else None
-                            ledger_pending=ledger is not None and bool(catalog.get('aggregate_complete',True)
-                                or catalog['owners'] or store.has_ledger_pending() or snapshot.get('request_activity'))
-                            if previous!=store.token:
-                                # A verified display need not await independent
-                                # accounting replay. Its pending status is explicit.
-                                publish()
-                            if publisher.token==store.token:
-                                pending_changed.clear();pending_removed.clear()
-                            ledger_interrupted=sync_ledger()
-                            publish()
+                            ledger_interrupted=install_prepared(coordinator)
                             age=time.time()-snapshot['ts']
                             delay=.1 if snapshot['index'].get('loading') else (
                                 3 if notification is None or age>30 else min(ANALYSIS_IDLE_WAIT_SECONDS,max(.01,30-age+.01)))
-                            next_poll=0 if ledger_interrupted or expanding else time.monotonic()+delay
+                            next_poll=0 if ledger_interrupted else time.monotonic()+delay
                             catalog_retries=0
                     except CollectionCatalogUnavailable:
                         progress(PreparationStage.COLLECTING)
@@ -657,9 +711,13 @@ class PreparedWriter:
                         if catalog is not previous_catalog:
                             if catalog_installed:
                                 if isinstance(previous_catalog,CatalogWork):previous_catalog.close()
+                                if isinstance(interleaved_catalog,CatalogWork):interleaved_catalog.close()
                             else:
                                 if isinstance(catalog,CatalogWork):catalog.close()
-                                catalog=previous_catalog
+                                if interleaved_catalog is not None:
+                                    if isinstance(previous_catalog,CatalogWork):previous_catalog.close()
+                                    catalog=interleaved_catalog
+                                else:catalog=previous_catalog
                         timing(cycle)
                         cycle=None
                 if (ledger is not None and snapshot is not None and not imported

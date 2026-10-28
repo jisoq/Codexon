@@ -286,6 +286,7 @@ class PreparedPublisher:
         self._retention=retention
 
     def adopt(self,store,changed,removed=(),*,selected=UNCHANGED):
+        changed=set(changed);removed=set(removed)
         if selected is UNCHANGED:
             selected=self.owners if self.scoped else None
         scoped=selected is not None
@@ -300,6 +301,7 @@ class PreparedPublisher:
             'title TEXT,internal INTEGER,PRIMARY KEY(work,home,sid))')
         prior_work=self._alert_work
         next_work=prior_work
+        database.execute('SAVEPOINT delivery_alert_update')
         try:
             with (store.read_current(seconds=60) as view,
                   store.read_current(seconds=60,selected=scoped) as owner_view):
@@ -311,8 +313,10 @@ class PreparedPublisher:
                 if (self.token is not None and not changed and not removed and same_scope
                         and self.order_identity==order_identity):
                     self.token=view.token
+                    database.execute('RELEASE delivery_alert_update')
                     return
-                scan_alerts=self.token!=view.token or prior_work is None
+                scan_alerts=(prior_work is None or self._alert_store is not store
+                    or self.token is None or self.token.instance!=view.token.instance)
                 if scan_alerts:next_work=uuid.uuid4().hex
                 had_alerts=bool(prior_work is not None and database.execute(
                     'SELECT 1 FROM delivery_alerts WHERE work=? LIMIT 1',(prior_work,)).fetchone())
@@ -320,32 +324,41 @@ class PreparedPublisher:
                 pending_alerts=self.pending_alerts.copy();content_changed=set()
                 overlay=self.overlay._fork()
                 notification_changed=set()
-                if scan_alerts:
-                    for row in view.pages(view.publication_heads):
-                        key=row['owner'];metadata=row['metadata']
-                        new_alerts=row['model_alerts'] or {}
-                        if not metadata.get('_internal_review') and (self.token is None or key in changed):
-                            notification_changed.add(key)
-                        if new_alerts:
-                            database.execute('INSERT INTO delivery_alert_owners VALUES(?,?,?,?,?)',
-                                (next_work,*key,metadata.get('title',''),int(bool(metadata.get('_internal_review')))))
-                            database.executemany('INSERT INTO delivery_alerts VALUES(?,?,?,?,?)',
-                                ((next_work,*key,identity,pack(signature,store.limits))
-                                 for identity,signature in new_alerts.items()))
-                        old_alerts=({item['identity']:unpack(item['signature'],store.limits) for item in
-                            database.execute('SELECT identity,signature FROM delivery_alerts '
-                                'WHERE work=? AND home=? AND sid=?',(prior_work,*key))}
-                            if had_alerts else {})
-                        if not metadata.get('_internal_review'):
-                            for identity in old_alerts.keys()|new_alerts.keys():
-                                signature=new_alerts.get(identity)
-                                if old_alerts.get(identity)==signature:continue
-                                if signature is None:
-                                    record=view.record(*key,identity)
-                                    if record is None:continue
-                                    signature=tuple(record.get(name) for name in MODEL_KEYS)
-                                pending_alerts[(key,identity)]=dict(home=key[0],sid=key[1],
-                                    title=metadata.get('title',''),**dict(zip(MODEL_KEYS,signature)))
+                changed_keys=tuple(changed)
+                heads=(view.pages(view.publication_heads) if scan_alerts else
+                    (row for start in range(0,len(changed_keys),128)
+                     for row in view.pages(view.publication_heads,owners=changed_keys[start:start+128])))
+                for key in removed:
+                    database.execute('DELETE FROM delivery_alerts WHERE work=? AND home=? AND sid=?',(next_work,*key))
+                    database.execute('DELETE FROM delivery_alert_owners WHERE work=? AND home=? AND sid=?',(next_work,*key))
+                for row in heads:
+                    key=row['owner'];metadata=row['metadata']
+                    new_alerts=row['model_alerts'] or {}
+                    if not metadata.get('_internal_review') and (self.token is None or key in changed):
+                        notification_changed.add(key)
+                    old_alerts=({item['identity']:unpack(item['signature'],store.limits) for item in
+                        database.execute('SELECT identity,signature FROM delivery_alerts '
+                            'WHERE work=? AND home=? AND sid=?',(prior_work,*key))}
+                        if had_alerts else {})
+                    if not scan_alerts:
+                        database.execute('DELETE FROM delivery_alerts WHERE work=? AND home=? AND sid=?',(next_work,*key))
+                        database.execute('DELETE FROM delivery_alert_owners WHERE work=? AND home=? AND sid=?',(next_work,*key))
+                    if new_alerts:
+                        database.execute('INSERT INTO delivery_alert_owners VALUES(?,?,?,?,?)',
+                            (next_work,*key,metadata.get('title',''),int(bool(metadata.get('_internal_review')))))
+                        database.executemany('INSERT INTO delivery_alerts VALUES(?,?,?,?,?)',
+                            ((next_work,*key,identity,pack(signature,store.limits))
+                             for identity,signature in new_alerts.items()))
+                    if not metadata.get('_internal_review'):
+                        for identity in old_alerts.keys()|new_alerts.keys():
+                            signature=new_alerts.get(identity)
+                            if old_alerts.get(identity)==signature:continue
+                            if signature is None:
+                                record=view.record(*key,identity)
+                                if record is None:continue
+                                signature=tuple(record.get(name) for name in MODEL_KEYS)
+                            pending_alerts[(key,identity)]=dict(home=key[0],sid=key[1],
+                                title=metadata.get('title',''),**dict(zip(MODEL_KEYS,signature)))
                 entries=(((row['owner'],row) for row in owner_view.pages(owner_view.catalog,publication=True))
                          if owner_view.selected or not scoped else
                          ((tuple(key),owner_view.owner(*key,publication=True)) for key in selected))
@@ -395,10 +408,10 @@ class PreparedPublisher:
             retention=self._admit(owners=owners,choices=choices,alerts=alerts,weights=weights,overlay=overlay,
                                   pending_alerts=pending_alerts,changed=changed)
         except BaseException:
-            if next_work!=prior_work:
-                database.execute('DELETE FROM delivery_alerts WHERE work=?',(next_work,))
-                database.execute('DELETE FROM delivery_alert_owners WHERE work=?',(next_work,))
+            database.execute('ROLLBACK TO delivery_alert_update')
+            database.execute('RELEASE delivery_alert_update')
             raise
+        database.execute('RELEASE delivery_alert_update')
         if prior_work is not None and prior_work!=next_work:
             database.execute('DELETE FROM delivery_alerts WHERE work=?',(prior_work,))
             database.execute('DELETE FROM delivery_alert_owners WHERE work=?',(prior_work,))

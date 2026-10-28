@@ -428,22 +428,6 @@ class CatalogWork(dict):
             self.db.execute('UPDATE catalog_work_owners SET financial_ordinal=? WHERE work=? AND home=? AND sid=?',
                 (ordinal,self.work,row['home'],row['sid']))
 
-    def limit_additions(self, current, count):
-        additions = 0
-        for row in self.owner_rows(fields='home,sid,admitted'):
-            if row['admitted'] != 1:
-                continue
-            owner = row['home'],row['sid']
-            if owner not in self['selected_members'] and owner not in current:
-                additions += 1
-                if additions > count:
-                    self.db.execute('UPDATE catalog_work_owners SET admitted=2 WHERE work=? AND home=? AND sid=?',
-                                    (self.work,*owner))
-        if additions > count:
-            self['aggregate_complete'] = False
-            self.reindex()
-        return additions > count
-
     def mode_groups(self, count):
         self.check()
         cursor = self.db.execute('SELECT home,sid FROM catalog_work_owners WHERE work=? '
@@ -2607,15 +2591,25 @@ class Snapshot:
             lambda r: sum(len(r[name]) for name in fields))
 
     @_read_operation
-    def publication_heads(self, *, after=None):
+    def publication_heads(self, *, after=None, owners=None):
         args = dict(after=after or 0, n=self.limits.page_rows+1)
+        where = 'v.deleted=0 AND o.id>:after'
+        if owners is not None:
+            keys=tuple(map(tuple,owners))
+            if len(keys)>128 or len(set(keys))!=len(keys):raise ValueError('select at most 128 unique owners')
+            if not keys:return Page((),None,True,0,0)
+            selected=[]
+            for number,(home,sid) in enumerate(keys):
+                args[f'home{number}'],args[f'sid{number}']=home,sid
+                selected.append(f'(:home{number},:sid{number})')
+            where+=' AND (o.home,o.sid) IN (VALUES '+','.join(selected)+')'
         metadata = ("json_array('d',json((SELECT json_group_array(json(field.value)) "
             "FROM json_each(v.metadata,'$[1]') field "
             "WHERE json_extract(field.value,'$[0][1]') IN ('title','_internal_review'))))")
         sql = (f'SELECT o.id,o.home,o.sid,{metadata} AS metadata,v.model_alerts '
             'FROM owners o JOIN owner_heads h ON h.owner=o.id '
             'JOIN owner_versions v ON v.owner=h.owner AND v.batch=h.batch '
-            'WHERE v.deleted=0 AND o.id>:after ORDER BY o.id LIMIT :n')
+            f'WHERE {where} ORDER BY o.id LIMIT :n')
         return self._page(sql,args,
             lambda row: dict(owner=(row['home'],row['sid']),
                 metadata=unpack(row['metadata'].encode('utf-8'),self.limits),
