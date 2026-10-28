@@ -310,6 +310,37 @@ def test_cancelled_selected_cohort_can_switch_through_aggregate(tmp_path,source_
 
 
 
+def test_warning_selection_switch_does_not_compare_the_retained_global_population(tmp_path,source_reader):
+    from threading import Condition,Event
+    from types import SimpleNamespace
+    from cachemonitor.prepared_speed_writer import PreparedWarningWorker,_WarningTarget
+
+    class GlobalPopulation(dict):
+        def keys(self):
+            raise AssertionError('selected warning setup traversed the retained global owner population')
+        def items(self):
+            raise AssertionError('selected warning setup traversed the retained global owner population')
+
+    sources=source_reader
+    sources.update(a=source('a'),unrelated=source('unrelated'))
+    with storage.PreparedStore(tmp_path/'warning-scope.sqlite') as store:
+        list(ingest.PreparedCohort(store,None,None).convert(catalog(sources)))
+        with store.read_current() as view:
+            stamps={owner:ingest.PreparedCohort._speed_stamp(view.owner(*owner))
+                    for owner in (('home','a'),('home','unrelated'))}
+        previous=_WarningTarget(store.token,storage.pack(ingest.source_identity(catalog(sources))),
+                                GlobalPopulation(stamps),{})
+        worker=SimpleNamespace(_target=previous,_active=None,_anchor=previous,_pending=None,_completed=None,
+                               _known=None,_failure=None,condition=Condition(),interrupt=Event())
+        selected=catalog(sources,2,family=('a',))
+        selected_token=storage.Token(store.token.instance,store.token.generation+1)
+        PreparedWarningWorker._offer(worker,selected_token,{('home','a'):stamps[('home','a')]},
+                                     storage.pack(ingest.source_identity(selected)))
+        assert worker.interrupt.is_set()
+        assert set(worker._target.owners)=={('home','a')}
+        assert worker._target.prefixes=={}
+
+
 def test_writer_selected_scope_survives_aggregate_lease_and_source_revision(tmp_path,monkeypatch):
     from contextlib import closing
     import sqlite3
