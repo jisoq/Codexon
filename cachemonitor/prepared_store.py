@@ -337,9 +337,9 @@ class CatalogWork(dict):
 
     def finish(self, demand):
         self.check()
-    if self.cancel is not None:
-        self.db.set_progress_handler(self.cancel,1000)
-    try:
+        if self.cancel is not None:
+            self.db.set_progress_handler(self.cancel,1000)
+        try:
             self.db.execute('INSERT INTO catalog_work_nodes(work,home,sid,parent_sid) '
                 'SELECT work,home,sid,parent_sid FROM catalog_work_sessions WHERE work=?', (self.work,))
             for row in self.owner_rows():
@@ -388,12 +388,12 @@ class CatalogWork(dict):
                         (self.work,sid)).fetchone()[0]] for home,sid in demand['selected'] if home is None]
             self.reindex()
             return self
-    except sqlite3.OperationalError:
-        self.check()
-        raise
-    finally:
-        if self.cancel is not None:
-            self.db.set_progress_handler(None,0)
+        except sqlite3.OperationalError:
+            self.check()
+            raise
+        finally:
+            if self.cancel is not None:
+                self.db.set_progress_handler(None,0)
 
     def reindex(self):
         for ordinal,row in enumerate(self.owner_rows('admitted=1',fields='home,sid')):
