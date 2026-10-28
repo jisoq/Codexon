@@ -152,7 +152,7 @@ def test_scoped_publication_preserves_global_model_alert_corrections(tmp_path):
             stage = store.begin(('source', revision))
             for ordinal, sid in enumerate(('b', 'internal')):
                 key = ('home', sid)
-                row = dict(key=f'{sid}-call', ts=101, model_observation_ts=101,
+                row = dict(key=f'{sid}-call', ts=101, session_ordinal=0, model_observation_ts=101,
                     model_alert_confirmed=confirmed, requested_model='asked', response_model='reported')
                 summary, sections = split_summary(dict(own=dict(home='home', id=sid, title=sid,
                     cache_misses=dict(count=0, events=[]), cache_health=dict(incident=None))))
