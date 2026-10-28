@@ -102,8 +102,6 @@ class IncompletePublication(PreparedError):
 
 @dataclass(frozen=True)
 class Limits:
-    # The main-file limit includes current, staging, obsolete rows, and indices.
-    database_bytes: int = 1024 * 1024 * 1024
     wal_bytes: int = 128 * 1024 * 1024
     write_reserve_bytes: int = 32 * 1024 * 1024
     staging_bytes: int = 256 * 1024 * 1024
@@ -354,6 +352,7 @@ def _schema():
         CREATE TABLE catalog_orders(batch INTEGER NOT NULL,owner INTEGER NOT NULL,
             source_ordinal INTEGER NOT NULL,PRIMARY KEY(batch,owner));
         CREATE INDEX catalog_orders_rank ON catalog_orders(batch,source_ordinal,owner);
+        CREATE UNIQUE INDEX catalog_orders_position ON catalog_orders(batch,source_ordinal);
         CREATE TABLE calls(owner INTEGER NOT NULL,identity BLOB NOT NULL,batch INTEGER NOT NULL,
             deleted INTEGER NOT NULL,signature BLOB NOT NULL,key_value BLOB,turn_value BLOB,
             turn_identity BLOB,owner_mask INTEGER,types BLOB,detail BLOB,encoded_bytes INTEGER,
@@ -486,13 +485,11 @@ class PreparedStore:
             self.db.execute('PRAGMA temp_store=MEMORY')
             self.db.execute('PRAGMA wal_autocheckpoint=1024')
             self.db.execute(f'PRAGMA journal_size_limit={limits.wal_bytes}')
-            pages = limits.database_bytes // self.db.execute('PRAGMA page_size').fetchone()[0]
-            actual = self.db.execute(f'PRAGMA max_page_count={pages}').fetchone()[0]
-            if actual > pages:
-                raise CapacityExceeded('existing prepared database exceeds its page budget')
             # There is one writer lock; an unfinished predecessor cannot still publish.
             with self._transaction():
                 self.db.execute('CREATE INDEX IF NOT EXISTS calls_identity ON calls(identity,owner,batch)')
+                self.db.execute('CREATE UNIQUE INDEX IF NOT EXISTS catalog_orders_position '
+                                'ON catalog_orders(batch,source_ordinal)')
                 self.db.execute('UPDATE publications SET state=-1 WHERE state=0')
         except BaseException:
             self.close()
@@ -512,10 +509,6 @@ class PreparedStore:
         """Check a recognized current cache once, before starting ordinary readers."""
         self.db.execute('PRAGMA mmap_size=0')
         self.db.execute('PRAGMA cache_size=-8192')
-        pages = self.db.execute('PRAGMA page_count').fetchone()[0]
-        page_size = self.db.execute('PRAGMA page_size').fetchone()[0]
-        if pages * page_size > self.limits.database_bytes:
-            raise CapacityExceeded('existing prepared database exceeds its page budget')
         if cancel is not None and cancel():
             raise ReadCancelled('prepared integrity check cancelled')
         cancelled = False
@@ -568,8 +561,7 @@ class PreparedStore:
         """
         if self.db.execute('PRAGMA page_size').fetchone()[0] != 4096:
             raise RebuildRequired('unrecognized prepared database page size')
-        pages = min(256, self.limits.database_bytes // 4096,
-                    (self.limits.wal_bytes - 32) // 4120)
+        pages = min(256, (self.limits.wal_bytes - 32) // 4120)
         if pages < 1:
             raise CapacityExceeded('empty prepared schema exceeds its budget')
         self.db.execute('PRAGMA cache_size=-8192')
@@ -1023,13 +1015,11 @@ class Stage:
         return owner
 
     def catalog_order(self, positions):
-        """Stage a complete light catalog in bounded writes, without owner copies."""
+        """Stage exact complete catalog order with bounded input groups."""
         self._live()
         if self.catalog_staged:
             raise IncompletePublication('one complete catalog order is allowed per stage')
-        seen = set()
-        ordinals = set()
-        count = size = group_objects = 0
+        group_objects = 0
         group = []
         order_batch = self.db.execute('SELECT order_batch FROM meta WHERE singleton=1').fetchone()[0]
 
@@ -1055,10 +1045,16 @@ class Stage:
                     (*tuple(value for item in committed for value in item),order_batch)).fetchall())
             if len(rows) != len(values):
                 raise StaleGeneration('catalog order contains an absent prepared owner')
-            with self.store._transaction():
-                self._charge(32*len(rows))
-                self.db.executemany('INSERT INTO catalog_orders VALUES(?,?,?)',
-                    ((self.batch,row[0],row[1]) for row in rows))
+            try:
+                with self.store._transaction():
+                    self._charge(32*len(rows))
+                    self.db.executemany('INSERT INTO catalog_orders VALUES(?,?,?)',
+                        ((self.batch,row[0],row[1]) for row in rows))
+            except sqlite3.IntegrityError as error:
+                if error.sqlite_errorcode in (sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY,
+                                              sqlite3.SQLITE_CONSTRAINT_UNIQUE):
+                    raise ValueError('catalog order repeats an owner or ordinal') from error
+                raise
             self.writes['catalog'] += len(rows)
 
         try:
@@ -1066,14 +1062,9 @@ class Stage:
                 if (type(owner) is not tuple or len(owner) != 2 or
                         any(type(value) is not str for value in owner)):
                     raise TypeError('catalog order requires exact home/session identities')
-                if owner in seen or ordinal in ordinals:
-                    raise ValueError('catalog order repeats an owner or ordinal')
                 if type(ordinal) is not int or not 0 <= ordinal < 2**63:
                     raise TypeError('catalog ordinals must be nonnegative integers')
                 pack(owner,self.limits,maximum=self.limits.key_bytes)
-                size += _size((owner,ordinal))+160
-                if size > self.limits.page_objects_bytes:
-                    raise CapacityExceeded('catalog order exceeds its metadata budget')
                 item=(*owner,ordinal)
                 objects=_size(item)
                 if 32>self.limits.fact_write_bytes or objects>self.limits.fact_write_objects:
@@ -1082,14 +1073,20 @@ class Stage:
                               or 32*(len(group)+1)>self.limits.fact_write_bytes
                               or group_objects+objects>self.limits.fact_write_objects):
                     write(group);group=[];group_objects=0
-                seen.add(owner);ordinals.add(ordinal);count += 1
                 group.append(item);group_objects+=objects
             if group:write(group)
-            current = self.db.execute('SELECT count(*) FROM owners o LEFT JOIN owner_heads h ON h.owner=o.id '
+            count,first,last = self.db.execute(
+                'SELECT count(*),min(source_ordinal),max(source_ordinal) '
+                'FROM catalog_orders WHERE batch=?', (self.batch,)).fetchone()
+            live = ('FROM owners o LEFT JOIN owner_heads h ON h.owner=o.id '
                 'JOIN owner_versions v ON v.owner=o.id AND v.batch=COALESCE(('
                 'SELECT x.batch FROM owner_versions x WHERE x.owner=o.id AND x.batch=?),h.batch) '
-                'WHERE v.deleted=0', (self.batch,)).fetchone()[0]
-            if count != current or ordinals and (min(ordinals)!=0 or max(ordinals)!=count-1):
+                'WHERE v.deleted=0')
+            current = self.db.execute('SELECT count(*) '+live, (self.batch,)).fetchone()[0]
+            missing = self.db.execute('SELECT 1 '+live+' AND NOT EXISTS('
+                'SELECT 1 FROM catalog_orders c WHERE c.batch=? AND c.owner=o.id) LIMIT 1',
+                (self.batch,self.batch)).fetchone()
+            if missing is not None or count != current or count and (first!=0 or last!=count-1):
                 raise IncompletePublication('catalog order must cover exact complete prepared membership')
             self.catalog_staged = True
         except BaseException:
