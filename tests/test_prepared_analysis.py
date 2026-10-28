@@ -2236,8 +2236,8 @@ def catalog_page_client(session_rows, owner_keys, *, selected, paged=True):
 
 
 @pytest.mark.parametrize('paged', [False, True])
-def test_complete_catalog_exceeds_old_admission_and_preserves_selected_family(tmp_path, paged):
-    from cachemonitor.prepared_ingest import IngestLimits, mode_context, mode_parent_index, read_catalog
+def test_complete_catalog_preserves_selected_family_with_unrelated_owners(tmp_path, paged):
+    from cachemonitor.prepared_ingest import mode_context, mode_parent_index, read_catalog
 
     parent, selected, child = (('home', name) for name in ('parent', 'selected', 'child'))
     unrelated = [('home', f'unrelated-{number:03d}-'+('x'*128)) for number in range(40)]
@@ -2245,7 +2245,7 @@ def test_complete_catalog_exceeds_old_admission_and_preserves_selected_family(tm
     rows = [(*owner, None) for owner in unrelated]
     rows.extend([(*selected, parent[1]), (*child, selected[1]), (*parent, None)])
     client = catalog_page_client(rows, owners, selected=[[None, selected[1]]], paged=paged)
-    catalog = read_catalog(client, limits=replace(IngestLimits(), catalog_bytes=16*1024))
+    catalog = read_catalog(client)
     assert catalog['membership_complete']
     assert list(catalog['owners']) == [child, selected]
     assert [entry['source_ordinal'] for entry in catalog['owners'].values()] == [0, 1]

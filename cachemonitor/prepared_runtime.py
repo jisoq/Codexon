@@ -20,7 +20,7 @@ from .prepared_ingest import ModeEvidenceUnavailable,PreparedCohort, read_catalo
 from .prepared_ledger import PreparedLedger
 from .prepared_changes import GenerationJournal
 from .prepared_query import PreparedQuery, token_value, tuple_token
-from .prepared_store import Limits,PreparedStore,WriteDeferred,ReadCancelled,StaleGeneration,CapacityExceeded
+from .prepared_store import CatalogWork,Limits,PreparedStore,WriteDeferred,ReadCancelled,StaleGeneration,CapacityExceeded
 from .quota_cycles import QuotaLedger
 from .usage_collection import CollectionClient, CollectionCatalogUnavailable
 from .preparation_progress import PreparationStage
@@ -174,7 +174,7 @@ class PreparedWriter:
             return False
 
     def _run(self):
-        collector = ledger = store = speed_writer = archive = None
+        collector = ledger = store = speed_writer = archive = catalog = None
         initial = True
         last_progress = None
         progress_at = 0.
@@ -215,6 +215,7 @@ class PreparedWriter:
             snapshot = None
             catalog = None
             notification = None
+            notification_publication = None
             imported = False
             ledger_issue = None
             failures = 0
@@ -359,10 +360,11 @@ class PreparedWriter:
                     if cycle is None:timing(active)
 
             def apply_ledger():
-                nonlocal notification,ledger_pending,ledger_issue,failures
+                nonlocal notification,notification_publication,ledger_pending,ledger_issue,failures
                 interrupted=False
+                notification_publication=catalog['publication']
                 notification=(None if self.frozen.is_set() else
-                              collector.notification_connection(catalog['publication']))
+                              collector.notification_connection(notification_publication))
                 poll_at=time.monotonic()+3
                 complete=catalog.get('aggregate_complete',True)
                 if ledger is not None and (complete or catalog['owners'] or snapshot.get('request_activity')):
@@ -379,9 +381,9 @@ class PreparedWriter:
                                 # committed proofs, never resumes an old generator.
                                 if not batch['remaining'] or self.frozen.is_set():continue
                                 if notification is not None and notification.poll():
-                                    notice=collector.consume_notification(catalog['publication'])
+                                    notice=collector.consume_notification(notification_publication)
                                     interrupted=notice is True
-                                    notification=(collector.notification_connection(catalog['publication'])
+                                    notification=(collector.notification_connection(notification_publication)
                                                   if notice is False else None)
                                 if notification is None and time.monotonic()>=poll_at:interrupted=True
                                 if interrupted:break
@@ -492,9 +494,11 @@ class PreparedWriter:
                     cycle=StageTimings()
                     cycle.counts['initial_publication']=publisher.token is None
                     catalog_received=False
+                    previous_catalog=catalog
+                    catalog_installed=False
                     try:
                         with cycle.measure('catalog'):
-                            catalog=read_catalog(collector,cancel=self.stopped.is_set)
+                            catalog=read_catalog(collector,store=store,cancel=self.stopped.is_set)
                         demand=catalog['header'].get('demand')
                         if demand is not None and (any(list(owner) not in demand['selected'] for owner in selected)
                                 or aggregate is not None and not demand['aggregate']):
@@ -502,8 +506,9 @@ class PreparedWriter:
                         index=catalog['header'].get('index',{})
                         progress(PreparationStage.COLLECTING,index.get('done'),index.get('files'))
                         catalog_received=True
+                        notification_publication=catalog['publication']
                         notification=(None if self.frozen.is_set() else
-                                      collector.notification_connection(catalog['publication']))
+                                      collector.notification_connection(notification_publication))
                         cycle.counts.update(catalog_owners=len(catalog.get('owners',{})),
                             membership_complete=bool(catalog['membership_complete']))
                         # An incomplete live membership cannot withdraw owners
@@ -515,7 +520,9 @@ class PreparedWriter:
                                 # Keep committed owners and replay acknowledgement
                                 # while making stale/loading/error state visible.
                                 header=catalog['header']
-                                snapshot={**snapshot,**{key:value for key,value in header.items()
+                                snapshot={**{key:value for key,value in snapshot.items()
+                                    if key not in ('session_catalog','demand_members','selected_resolutions')},
+                                    **{key:value for key,value in header.items()
                                     if key not in ('sessions','request_activity','activity_cursor')}}
                                 if 'collection_stale' not in header:
                                     snapshot.pop('collection_stale',None)
@@ -526,23 +533,15 @@ class PreparedWriter:
                             coordinator=PreparedCohort(store,collector,ledger,
                                 cancel=cancelled,speed_writer=speed_writer)
                             with store.read_current(seconds=60) as current_view:
-                                admitted=set(coordinator._inventory(current_view))
-                            selected_members=catalog.get('selected_members',set())
-                            additions=[key for key in catalog['owners'] if key not in admitted and key not in selected_members]
-                            expanding=len(additions)>16
-                            if expanding:
-                                keep=admitted|selected_members|set(additions[:16])
-                                catalog=dict(catalog,mode_sources={**catalog.get('mode_sources',{}),
-                                    **{key:entry for key,entry in catalog['owners'].items() if key not in keep}},
-                                    owners={key:dict(entry,source_ordinal=ordinal)
-                                    for ordinal,(key,entry) in enumerate((item for item in catalog['owners'].items() if item[0] in keep))},
-                                    aggregate_complete=False)
+                                expanding=catalog.limit_additions(coordinator._inventory(current_view),16)
                             if ledger is not None:
                                 try:
                                     with cycle.measure('mode_scan'):
-                                        ledger.scan_modes(catalog['selected_homes'],
-                                            owners=None if aggregate is not None else
-                                            set(catalog['owners'])|set(catalog.get('mode_sources',{})))
+                                        if aggregate is not None:
+                                            ledger.scan_modes(catalog['selected_homes'])
+                                        else:
+                                            for owners in catalog.mode_groups(store.limits.owners_per_batch):
+                                                ledger.scan_modes(catalog['selected_homes'],owners=owners)
                                 except sqlite3.Error as error:disable(error)
                             coordinator.ledger=ledger
                             with cycle.measure('conversion'):
@@ -585,6 +584,7 @@ class PreparedWriter:
                             with cycle.measure('activity_page'):
                                 snapshot=collector.channel.activity_page(dict(catalog['header']),catalog['publication'][0],
                                     live=not catalog.get('aggregate_complete',True))
+                            catalog_installed=True
                             aggregate_complete=catalog.get('aggregate_complete',True)
                             snapshot['aggregate_request']=aggregate if aggregate_complete else None
                             ledger_pending=ledger is not None and bool(catalog.get('aggregate_complete',True)
@@ -608,7 +608,8 @@ class PreparedWriter:
                         # New demand may precede its first catalog. Its source
                         # completion still advances the last valid publication.
                         if not self.frozen.is_set() and catalog is not None:
-                            notification=collector.notification_connection(catalog['publication'])
+                            notification_publication=catalog['publication']
+                            notification=collector.notification_connection(notification_publication)
                         # AppServices owns collector startup and restart. The
                         # query writer never starts a duplicate source reader.
                         if snapshot is not None and time.time()-snapshot['ts']>30 and not snapshot.get('collection_stale'):
@@ -644,6 +645,12 @@ class PreparedWriter:
                         cycle.outcome='failed'
                         raise
                     finally:
+                        if catalog is not previous_catalog:
+                            if catalog_installed:
+                                if isinstance(previous_catalog,CatalogWork):previous_catalog.close()
+                            else:
+                                if isinstance(catalog,CatalogWork):catalog.close()
+                                catalog=previous_catalog
                         timing(cycle)
                         cycle=None
                 if (ledger is not None and snapshot is not None and not imported
@@ -663,16 +670,17 @@ class PreparedWriter:
                 if notification is not None:handles.append(notification)
                 ready=wait(handles,timeout=delay)
                 if notification is not None and notification in ready:
-                    notice=collector.consume_notification(catalog['publication'])
+                    notice=collector.consume_notification(notification_publication)
                     if notice is True:next_poll=0
                     elif notice is None:next_poll=min(next_poll,time.monotonic()+3)
-                    notification=collector.notification_connection(catalog['publication']) if notice is False else None
+                    notification=collector.notification_connection(notification_publication) if notice is False else None
         except Exception as error:
             if isinstance(error,(InterruptedError,ReadCancelled)) and self.stopped.is_set():return
             from .quota_diagnostics import record_failure
             record_failure(Path(self.arguments[3]).with_suffix('.analysis.sqlite'), 'prepared writer', error)
             self.output.put(dict(kind='fatal',error=traceback.format_exc(limit=6)))
         finally:
+            if isinstance(catalog,CatalogWork):catalog.close()
             if collector is not None:collector.close()
             if ledger is not None:ledger.close()
             if speed_writer is not None:

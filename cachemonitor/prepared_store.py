@@ -17,6 +17,7 @@ import time
 import uuid
 import zlib
 from collections import OrderedDict
+from collections.abc import Mapping, Set
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import wraps
@@ -140,6 +141,366 @@ class Page:
     complete: bool
     encoded_bytes: int
     object_bytes: int
+
+
+class _CatalogOwners(Mapping):
+    def __init__(self, catalog, *, financial):
+        self.catalog = catalog
+        self.financial = financial
+
+    def _where(self):
+        return 'admitted=1' if self.financial else 'admitted!=1 AND complete=1'
+
+    def __len__(self):
+        self.catalog.check()
+        return self.catalog.db.execute('SELECT count(*) FROM catalog_work_owners '
+            'WHERE work=? AND '+self._where(), (self.catalog.work,)).fetchone()[0]
+
+    def __iter__(self):
+        for row in self.catalog.owner_rows(self._where(), fields='home,sid'):
+            yield row['home'], row['sid']
+
+    def __getitem__(self, key):
+        self.catalog.check()
+        row = self.catalog.db.execute('SELECT entry,ordinal,financial_ordinal FROM catalog_work_owners '
+            'WHERE work=? AND home=? AND sid=? AND '+self._where(), (self.catalog.work,*key)).fetchone()
+        if row is None:
+            raise KeyError(key)
+        return self.catalog.owner_entry(row, financial=self.financial)
+
+    def items(self):
+        for row in self.catalog.owner_rows(self._where()):
+            yield (row['home'],row['sid']), self.catalog.owner_entry(row, financial=self.financial)
+
+    def values(self):
+        for _, entry in self.items():
+            yield entry
+
+
+class _CatalogMembers(Set):
+    def __init__(self, catalog):
+        self.catalog = catalog
+
+    def __len__(self):
+        self.catalog.check()
+        return self.catalog.db.execute('SELECT count(*) FROM catalog_work_sessions '
+            'WHERE work=? AND required=1', (self.catalog.work,)).fetchone()[0]
+
+    def __contains__(self, key):
+        self.catalog.check()
+        return self.catalog.db.execute('SELECT 1 FROM catalog_work_sessions '
+            'WHERE work=? AND home=? AND sid=? AND required=1', (self.catalog.work,*key)).fetchone() is not None
+
+    def __iter__(self):
+        cursor = self.catalog.db.execute('SELECT home,sid FROM catalog_work_sessions '
+            'WHERE work=? AND required=1 ORDER BY ordinal', (self.catalog.work,))
+        try:
+            for row in cursor:
+                self.catalog.check()
+                yield row['home'], row['sid']
+        finally:
+            cursor.close()
+
+
+class _CatalogParents(Mapping):
+    def __init__(self, catalog):
+        self.catalog = catalog
+
+    def __getitem__(self, key):
+        self.catalog.check()
+        row = self.catalog.db.execute('SELECT n.parent_sid FROM catalog_work_nodes n '
+            'WHERE n.work=? AND n.home=? AND n.sid=? AND n.valid=1 AND EXISTS('
+            'SELECT 1 FROM catalog_work_nodes p WHERE p.work=n.work AND p.home=n.home AND p.sid=n.parent_sid)',
+            (self.catalog.work,*key)).fetchone()
+        if row is None:
+            raise KeyError(key)
+        return key[0], row[0]
+
+    def __iter__(self):
+        cursor = self.catalog.db.execute('SELECT n.home,n.sid FROM catalog_work_nodes n '
+            'WHERE n.work=? AND n.valid=1 AND EXISTS(SELECT 1 FROM catalog_work_nodes p '
+            'WHERE p.work=n.work AND p.home=n.home AND p.sid=n.parent_sid) ORDER BY n.home,n.sid',
+            (self.catalog.work,))
+        try:
+            for row in cursor:
+                self.catalog.check()
+                yield row['home'], row['sid']
+        finally:
+            cursor.close()
+
+    def __len__(self):
+        self.catalog.check()
+        return self.catalog.db.execute('SELECT count(*) FROM catalog_work_nodes n '
+            'WHERE n.work=? AND n.valid=1 AND EXISTS(SELECT 1 FROM catalog_work_nodes p '
+            'WHERE p.work=n.work AND p.home=n.home AND p.sid=n.parent_sid)', (self.catalog.work,)).fetchone()[0]
+
+
+class CatalogWork(dict):
+    """Unpublished indexed source membership under the prepared writer's lifetime."""
+    TABLES = ('sessions','members','owners','nodes')
+
+    def __init__(self, values, *, store=None, cancel=None):
+        super().__init__(values)
+        self.cancel = cancel
+        self.closed = False
+        self.owns_connection = store is None
+        self.db = (sqlite3.connect('', isolation_level=None) if store is None else store.db)
+        self.db.row_factory = sqlite3.Row
+        if self.db.execute('PRAGMA temp_store').fetchone()[0] != 1:
+            self.db.execute('PRAGMA temp_store=FILE')
+        self.db.execute('PRAGMA temp.cache_size=-4096')
+        if self.owns_connection:
+            self.db.execute('PRAGMA cache_size=-8192')
+        statements = (
+            'CREATE TEMP TABLE IF NOT EXISTS catalog_work(id INTEGER PRIMARY KEY AUTOINCREMENT)',
+            'CREATE TEMP TABLE IF NOT EXISTS catalog_work_sessions(work INTEGER,ordinal INTEGER,home TEXT,sid TEXT,'
+                'parent TEXT,parent_sid TEXT,required INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(work,home,sid),UNIQUE(work,ordinal))',
+            'CREATE INDEX IF NOT EXISTS temp.catalog_work_children ON catalog_work_sessions(work,home,parent_sid)',
+            'CREATE INDEX IF NOT EXISTS temp.catalog_work_sid ON catalog_work_sessions(work,sid,home)',
+            'CREATE TEMP TABLE IF NOT EXISTS catalog_work_members(work INTEGER,ordinal INTEGER,home TEXT,sid TEXT,'
+                'PRIMARY KEY(work,home,sid),UNIQUE(work,ordinal))',
+            'CREATE TEMP TABLE IF NOT EXISTS catalog_work_owners(work INTEGER,ordinal INTEGER,home TEXT,sid TEXT,'
+                'entry TEXT,complete INTEGER,admitted INTEGER NOT NULL DEFAULT 1,financial_ordinal INTEGER,'
+                'PRIMARY KEY(work,home,sid),UNIQUE(work,ordinal))',
+            'CREATE INDEX IF NOT EXISTS temp.catalog_work_admitted ON catalog_work_owners(work,admitted,ordinal)',
+            'CREATE TEMP TABLE IF NOT EXISTS catalog_work_nodes(work INTEGER,home TEXT,sid TEXT,parent_sid TEXT,'
+                'valid INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(work,home,sid))',
+            'CREATE INDEX IF NOT EXISTS temp.catalog_work_parent ON catalog_work_nodes(work,home,parent_sid)',
+        )
+        for statement in statements:
+            self.db.execute(statement)
+        self.work = self.db.execute('INSERT INTO catalog_work DEFAULT VALUES').lastrowid
+        self.present = set()
+        self.counts = dict(session_catalog=0,demand_members=0,owners=0)
+        self['owners'] = _CatalogOwners(self, financial=True)
+        self['mode_sources'] = _CatalogOwners(self, financial=False)
+        self['selected_members'] = _CatalogMembers(self)
+        self.parents = _CatalogParents(self)
+
+    def check(self):
+        if self.closed:
+            raise PreparedError('catalog work is closed')
+        if self.cancel is not None and self.cancel():
+            raise InterruptedError('prepared catalog cancelled')
+
+    def add_membership(self, name, rows):
+        self.present.add(name)
+        table = 'sessions' if name=='session_catalog' else 'members'
+        for row in rows:
+            self.check()
+            if (not isinstance(row,(tuple,list)) or len(row)!=(3 if table=='sessions' else 2)
+                    or any(type(value) is not str for value in row[:2])):
+                raise ValueError('catalog membership requires exact home/session identities')
+            home,sid = row[:2]
+            ordinal = self.counts[name]
+            try:
+                if table=='sessions':
+                    parent = row[2]
+                    self.db.execute('INSERT INTO catalog_work_sessions(work,ordinal,home,sid,parent,parent_sid) '
+                        'VALUES(?,?,?,?,?,?)', (self.work,ordinal,home,sid,json.dumps(parent),parent if type(parent) is str else None))
+                else:
+                    self.db.execute('INSERT INTO catalog_work_members VALUES(?,?,?,?)', (self.work,ordinal,home,sid))
+            except sqlite3.IntegrityError as error:
+                raise ValueError('catalog repeats source membership') from error
+            self.counts[name] += 1
+
+    def add_owners(self, owners):
+        for key, entry in owners.items():
+            self.check()
+            try:
+                self.db.execute('INSERT INTO catalog_work_owners(work,ordinal,home,sid,entry,complete) '
+                    'VALUES(?,?,?,?,?,?)', (self.work,self.counts['owners'],*key,
+                    json.dumps(entry,ensure_ascii=False,separators=(',',':')),
+                    int(bool(entry.get('state',{}).get('collection_complete')))))
+            except sqlite3.IntegrityError as error:
+                raise ValueError('catalog repeats an owner') from error
+            self.counts['owners'] += 1
+
+    def owner_rows(self, where='1', *, fields='*'):
+        self.check()
+        cursor = self.db.execute('SELECT '+fields+' FROM catalog_work_owners '
+            'WHERE work=? AND '+where+' ORDER BY ordinal', (self.work,))
+        try:
+            for row in cursor:
+                self.check()
+                yield row
+        finally:
+            cursor.close()
+
+    @staticmethod
+    def owner_entry(row, *, financial):
+        return dict(json.loads(row['entry']), source_ordinal=row['financial_ordinal'] if financial else row['ordinal'])
+
+    def set_entry(self, owner, entry):
+        self.db.execute('UPDATE catalog_work_owners SET entry=? WHERE work=? AND home=? AND sid=?',
+            (json.dumps(entry,ensure_ascii=False,separators=(',',':')),self.work,*owner))
+
+    def finish(self, demand):
+        self.check()
+        self.db.execute('INSERT INTO catalog_work_nodes(work,home,sid,parent_sid) '
+            'SELECT work,home,sid,parent_sid FROM catalog_work_sessions WHERE work=?', (self.work,))
+        for row in self.owner_rows():
+            entry = json.loads(row['entry'])
+            lineage = entry['owner_lineage']
+            parent = lineage.get('parent_thread_id')
+            existing = self.db.execute('SELECT parent FROM catalog_work_sessions '
+                'WHERE work=? AND home=? AND sid=?', (self.work,row['home'],row['sid'])).fetchone()
+            if existing is not None and 'parent_thread_id' in lineage and json.loads(existing[0]) != parent:
+                raise ValueError('owner lineage contradicts complete source membership')
+            self.db.execute('INSERT INTO catalog_work_nodes(work,home,sid,parent_sid) VALUES(?,?,?,?) '
+                'ON CONFLICT(work,home,sid) DO UPDATE SET parent_sid=excluded.parent_sid',
+                (self.work,row['home'],row['sid'],parent if type(parent) is str else None))
+        self.db.execute('WITH RECURSIVE rooted(home,sid) AS ('
+            'SELECT n.home,n.sid FROM catalog_work_nodes n WHERE n.work=? AND NOT EXISTS('
+            'SELECT 1 FROM catalog_work_nodes p WHERE p.work=n.work AND p.home=n.home AND p.sid=n.parent_sid) '
+            'UNION SELECT n.home,n.sid FROM catalog_work_nodes n JOIN rooted p '
+            'ON n.home=p.home AND n.parent_sid=p.sid WHERE n.work=?) '
+            'UPDATE catalog_work_nodes SET valid=1 WHERE work=? AND (home,sid) IN (SELECT home,sid FROM rooted)',
+            (self.work,self.work,self.work))
+        if demand is not None:
+            for home,sid in demand['selected']:
+                found = self.db.execute('SELECT home FROM catalog_work_sessions WHERE work=? AND sid=? '
+                    'AND (? IS NULL OR home=?) LIMIT 2', (self.work,sid,home,home)).fetchall()
+                if len(found)==1:
+                    self.db.execute('UPDATE catalog_work_sessions SET required=1 WHERE work=? AND home=? AND sid=?',
+                        (self.work,found[0][0],sid))
+            self.db.execute('WITH RECURSIVE family(home,sid) AS ('
+                'SELECT home,sid FROM catalog_work_sessions WHERE work=? AND required=1 '
+                'UNION SELECT c.home,c.sid FROM catalog_work_sessions c JOIN family p '
+                'ON c.home=p.home AND c.parent_sid=p.sid WHERE c.work=?) '
+                'UPDATE catalog_work_sessions SET required=1 WHERE work=? AND (home,sid) IN (SELECT home,sid FROM family)',
+                (self.work,self.work,self.work))
+            membership = 'members' if demand['aggregate'] else 'sessions'
+            selected = '' if demand['aggregate'] else ' AND m.required=1'
+            self.db.execute('UPDATE catalog_work_owners SET admitted=complete AND EXISTS('
+                'SELECT 1 FROM catalog_work_'+membership+' m WHERE m.work=catalog_work_owners.work '
+                'AND m.home=catalog_work_owners.home AND m.sid=catalog_work_owners.sid'+selected+') WHERE work=?',
+                (self.work,))
+            missing = self.db.execute('SELECT 1 FROM catalog_work_sessions s WHERE s.work=? AND s.required=1 '
+                'AND NOT EXISTS(SELECT 1 FROM catalog_work_owners o WHERE o.work=s.work AND o.home=s.home '
+                'AND o.sid=s.sid AND o.admitted=1) LIMIT 1', (self.work,)).fetchone()
+            known = ('session_catalog' in self.present and
+                     (not demand['aggregate'] or 'demand_members' in self.present))
+            self['membership_complete'] = bool(known and missing is None)
+            self['aggregate_complete'] = bool(demand['aggregate'] and self['header'].get('usage_collection_complete'))
+            if self['membership_complete']:
+                self['header']['selected_resolutions'] = [[sid,self.db.execute(
+                    'SELECT count(*) FROM catalog_work_sessions WHERE work=? AND sid=?',
+                    (self.work,sid)).fetchone()[0]] for home,sid in demand['selected'] if home is None]
+        self.reindex()
+        return self
+
+    def reindex(self):
+        for ordinal,row in enumerate(self.owner_rows('admitted=1',fields='home,sid')):
+            self.db.execute('UPDATE catalog_work_owners SET financial_ordinal=? WHERE work=? AND home=? AND sid=?',
+                (ordinal,self.work,row['home'],row['sid']))
+
+    def limit_additions(self, current, count):
+        additions = 0
+        for row in self.owner_rows(fields='home,sid,admitted'):
+            if row['admitted'] != 1:
+                continue
+            owner = row['home'],row['sid']
+            if owner not in self['selected_members'] and owner not in current:
+                additions += 1
+                if additions > count:
+                    self.db.execute('UPDATE catalog_work_owners SET admitted=2 WHERE work=? AND home=? AND sid=?',
+                                    (self.work,*owner))
+        if additions > count:
+            self['aggregate_complete'] = False
+            self.reindex()
+        return additions > count
+
+    def mode_groups(self, count):
+        self.check()
+        cursor = self.db.execute('SELECT home,sid FROM catalog_work_owners WHERE work=? '
+            'AND (admitted=1 OR complete=1) ORDER BY home,sid',(self.work,))
+        try:
+            while True:
+                rows = cursor.fetchmany(count)
+                if not rows:
+                    return
+                self.check()
+                yield [(row['home'],row['sid']) for row in rows]
+        finally:
+            cursor.close()
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        if self.owns_connection:
+            self.db.close()
+        else:
+            for table in self.TABLES:
+                self.db.execute('DELETE FROM catalog_work_'+table+' WHERE work=?', (self.work,))
+            self.db.execute('DELETE FROM catalog_work WHERE id=?', (self.work,))
+
+    def __del__(self):
+        if getattr(self,'owns_connection',False) and not getattr(self,'closed',True):
+            self.db.close()
+
+
+class SnapshotInventory(Mapping):
+    """Conversion lookups owned by an existing pinned read transaction."""
+    def __init__(self, view):
+        self.view = view
+
+    def __getitem__(self, key):
+        for row in self.view.pages(self.view.inventory,owners=(key,)):
+            return row
+        raise KeyError(key)
+
+    def __iter__(self):
+        for row in self.view.pages(self.view.inventory_scan,metadata=False):
+            yield row['owner']
+
+    def __len__(self):
+        return sum(1 for _ in self)
+
+    def values(self):
+        yield from self.view.pages(self.view.inventory_scan)
+
+    def items(self):
+        for row in self.values():
+            yield row['owner'],row
+
+
+class ConversionPlan:
+    """Unpublished owner operations in bounded conversion order."""
+    def __init__(self, store):
+        self.store, self.db = store, store.db
+        self.table = 'conversion_plan_'+uuid.uuid4().hex
+        self.counts = {False:0,True:0}
+        self.closed = False
+        self.db.execute('CREATE TEMP TABLE '+self.table+'(ordinal INTEGER PRIMARY KEY,keep INTEGER,'
+                        'home TEXT,sid TEXT,UNIQUE(home,sid))')
+        self.db.execute('CREATE INDEX temp.'+self.table+'_order ON '+self.table+'(keep,ordinal)')
+
+    def add(self, owner, *, keep):
+        ordinal = sum(self.counts.values())
+        self.db.execute('INSERT INTO '+self.table+' VALUES(?,?,?,?)',(ordinal,int(keep),*owner))
+        self.counts[keep] += 1
+
+    def groups(self, count):
+        after = (-1,-1)
+        while True:
+            rows = self.db.execute('SELECT * FROM '+self.table+' WHERE (keep,ordinal)>(?,?) '
+                'ORDER BY keep,ordinal LIMIT ?',(*after,count)).fetchall()
+            if not rows:
+                return
+            yield [(bool(row['keep']),(row['home'],row['sid'])) for row in rows]
+            after = rows[-1]['keep'],rows[-1]['ordinal']
+
+    def close(self):
+        if not self.closed:
+            self.closed = True
+            if self.store.db is self.db:
+                self.db.execute('DROP TABLE IF EXISTS '+self.table)
+
+    def __del__(self):
+        if hasattr(self,'table'):
+            self.close()
 
 
 def _size(value):
@@ -482,7 +843,8 @@ class PreparedStore:
             self.db.execute('PRAGMA synchronous=NORMAL')
             self.db.execute('PRAGMA mmap_size=0')
             self.db.execute('PRAGMA cache_size=-8192')
-            self.db.execute('PRAGMA temp_store=MEMORY')
+            self.db.execute('PRAGMA temp_store=FILE')
+            self.db.execute('PRAGMA temp.cache_size=-4096')
             self.db.execute('PRAGMA wal_autocheckpoint=1024')
             self.db.execute(f'PRAGMA journal_size_limit={limits.wal_bytes}')
             # There is one writer lock; an unfinished predecessor cannot still publish.
@@ -2096,6 +2458,48 @@ class Snapshot:
                         models=choices.get('models') if choices is not None else None)
         return self._page(sql,args,decode,lambda r:(r['source_ordinal'],r['owner']),
                           lambda r:len(r['dependencies'])+len(r['choices'])+len(r['home'])*4+len(r['sid'])*4)
+
+
+    @_read_operation
+    def inventory_scan(self, *, after=None, metadata=True):
+        """Advance by stored owner ID, including skipped tombstones and orphans."""
+        version = ('h.batch' if self.staged_batch is None else
+            'COALESCE((SELECT x.batch FROM owner_versions x WHERE x.owner=o.id '
+            f'AND x.batch={int(self.staged_batch)}),h.batch)')
+        fields = ',v.dependencies,v.choices' if metadata else ''
+        sql = (f'SELECT o.id,o.home,o.sid,v.deleted,{self._rank()} AS ordinal'+fields+
+            ' FROM owners o LEFT JOIN owner_heads h ON h.owner=o.id '
+            f'LEFT JOIN owner_versions v ON v.owner=o.id AND v.batch={version} '
+            f'LEFT JOIN catalog_orders rank ON rank.owner=o.id AND rank.batch={int(self.order_batch)} '
+            'WHERE o.id>? ORDER BY o.id LIMIT ?')
+        rows, size, objects, cursor_after, complete = [], 0, 0, after, True
+        with self._cursor(sql,(after or 0,self.limits.page_rows+1)) as cursor:
+            for scanned, raw in enumerate(cursor):
+                self._check()
+                if scanned >= self.limits.page_rows:
+                    complete = False
+                    break
+                if raw['deleted'] is None or raw['deleted']:
+                    cursor_after = raw['id']
+                    continue
+                value = dict(owner=(raw['home'],raw['sid']),owner_ordinal=raw['ordinal'])
+                n = 4*(len(raw['home'])+len(raw['sid']))+32
+                if metadata:
+                    choices = unpack(raw['choices'],self.limits)
+                    value.update(dependencies=unpack(raw['dependencies'],self.limits),
+                                 models=choices.get('models') if choices is not None else None)
+                    n += len(raw['dependencies'])+len(raw['choices'])
+                m = _size(value)
+                if size+n > self.limits.page_bytes or objects+m > self.limits.page_objects_bytes:
+                    if not rows:
+                        raise CapacityExceeded('one result exceeds the delivered-page budget')
+                    complete = False
+                    break
+                rows.append(value)
+                size += n
+                objects += m
+                cursor_after = raw['id']
+        return Page(tuple(rows),cursor_after,complete,size,objects)
 
     @_read_operation
     def catalog(self, *, after=None, publication=False, query=False, home=None, sid=None):

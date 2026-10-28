@@ -618,9 +618,6 @@ class PreparedWarningWorker:
             if retry or completion.error is not None:raise
             if self.wake is not None:self.wake()
             return None
-        cached=getattr(self.store,'_conversion_inventory',None)
-        if cached is not None and cached[0]==target.token:
-            self.store._conversion_inventory=(token,*cached[1:])
         committed=replace(target,token=token,prefixes={})
         self._target=committed
         self._known=(replace(completion,target=committed,delta=None) if completion.error is None else None)

@@ -89,14 +89,14 @@ def test_failed_conversion_does_not_report_uncommitted_sessions(tmp_path,monkeyp
 
 
 @pytest.mark.parametrize('operation', ['convert', 'apply', 'publish_ready'])
-@pytest.mark.parametrize(('with_proof', 'tight_budget'), [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize(('with_proof', 'large_metadata'), [(False, False), (True, False), (True, True)])
 def test_identical_body_without_optional_proof_reuses_complete_facts(
-        tmp_path, monkeypatch, operation, with_proof, tight_budget):
+        tmp_path, monkeypatch, operation, with_proof, large_metadata):
     from cachemonitor.usage_collection import analysis_proof
     sources = dict(child=_source('child'))
     owner = ('home', 'child')
     initial = _catalog(sources)
-    if tight_budget:
+    if large_metadata:
         initial['owners'][owner]['state']['status'] = 'ready-' + 'x'*10000
     if with_proof:
         proof = analysis_proof(sources['child'])
@@ -120,7 +120,7 @@ def test_identical_body_without_optional_proof_reuses_complete_facts(
         assert expected[0]['key'] == 'child-response'
 
     captured = _catalog(sources, 2)
-    if tight_budget:
+    if large_metadata:
         captured['owners'][owner]['state'].update(initial['owners'][owner]['state'])
     original = deepcopy(captured)
 
@@ -129,10 +129,7 @@ def test_identical_body_without_optional_proof_reuses_complete_facts(
 
     monkeypatch.setattr(ingest, 'read_source', forbidden_read)
     with storage.PreparedStore(path) as store:
-        limits = ingest.IngestLimits()
-        if tight_budget:
-            limits = replace(limits, catalog_bytes=ingest._weight(captured, limits.catalog_bytes)*3//2)
-        cohort = ingest.PreparedCohort(store, None, None, limits=limits)
+        cohort = ingest.PreparedCohort(store, None, None)
         if operation == 'convert':
             updates = list(cohort.convert(captured))
             assert updates == []

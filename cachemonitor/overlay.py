@@ -629,11 +629,15 @@ class OverlayController(QObject):
         selection=self.target_state.get('selection')
         self.target_resolution=None
         demand=snapshot.get('demand')
-        if (selection and selection.host=='local' and snapshot.get('catalog_complete') and 'session_catalog' in snapshot
+        if (selection and selection.host=='local' and snapshot.get('catalog_complete')
                 and not snapshot.get('collection_stale') and not snapshot.get('collection_recovery')
                 and demand is not None and any(home is None and sid==selection.thread_id for home,sid in demand['selected'])):
-            homes={home for home,sid,parent in snapshot.get('session_catalog',()) if sid==selection.thread_id}
-            self.target_resolution=(selection.thread_id,len(homes))
+            if 'selected_resolutions' in snapshot:
+                self.target_resolution=next(((sid,count) for sid,count in snapshot['selected_resolutions']
+                    if sid==selection.thread_id),None)
+            elif 'session_catalog' in snapshot:
+                homes={home for home,sid,parent in snapshot['session_catalog'] if sid==selection.thread_id}
+                self.target_resolution=(selection.thread_id,len(homes))
         if (not selection or selection.host!='local' or any(s['id']==selection.thread_id
                 for s in snapshot.get('overlay_sessions',())) or self.target_resolution is not None
                 and self.target_resolution[1]!=1):self.preparation=None
