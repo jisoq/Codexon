@@ -200,3 +200,58 @@ def test_large_normalized_observation_replays_through_existing_ledger(tmp_path, 
             assert backlog.first() is None and backlog.available()
     finally:
         backlog.close()
+
+
+
+def test_inflight_response_over_remaining_bytes_uses_one_record_reserve_and_recovers(tmp_path):
+    backlog = ObservationBacklog(tmp_path/'quota.sqlite', 'home')
+    previous = dict(observed_at=1, payload='x'*(31*256*1024))
+    response = dict(observed_at=2, payload='y'*(512*1024))
+    try:
+        assert backlog.append('quota', previous)
+        assert backlog.available() and backlog.reserve_fetch()
+        assert backlog.append('quota', response)
+        assert backlog.unsaved is not None
+        assert backlog.db.execute('SELECT bytes FROM budget').fetchone()[0] <= backlog.MAX_BYTES
+        assert not backlog.available()
+        assert not backlog.append('quota', dict(observed_at=3))
+        row = backlog.first()
+        assert row[1:] == ('quota', previous)
+        backlog.acknowledge(row[0])
+        assert backlog.available()
+        row = backlog.first()
+        assert row[1:] == ('quota', response)
+        backlog.acknowledge(row[0])
+        assert backlog.first() is None and backlog.unsaved is None
+        assert backlog.available() and not backlog.issue
+    finally:
+        backlog.close()
+
+
+
+def test_cancelled_fetch_reservation_cannot_admit_unrequested_overflow(tmp_path):
+    backlog = ObservationBacklog(tmp_path/'quota.sqlite', 'home')
+    backlog.MAX_BYTES = 100
+    backlog.OBSERVATION_RESERVE_BYTES = 8
+    previous = dict(value='x'*40)
+    response = dict(value='y'*60)
+    try:
+        assert backlog.append('quota', previous)
+        assert backlog.reserve_fetch()
+        assert not backlog.reserve_fetch()
+        backlog.cancel_fetch()
+        assert not backlog.append('quota', response)
+        assert backlog.unsaved is None
+        assert backlog.reserve_fetch()
+        assert backlog.append('quota', response)
+        assert backlog.unsaved is not None
+        row = backlog.first()
+        assert row[1:] == ('quota', previous)
+        backlog.acknowledge(row[0])
+        assert backlog.available()
+        row = backlog.first()
+        assert row[1:] == ('quota', response)
+        backlog.acknowledge(row[0])
+        assert backlog.first() is None
+    finally:
+        backlog.close()
