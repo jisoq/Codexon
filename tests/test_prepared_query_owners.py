@@ -181,3 +181,99 @@ def test_adoption_validates_changed_owner_before_committing_generation(tmp_path)
             assert engine.snapshot is None and not engine.reader.db.in_transaction
         finally:
             engine.close()
+
+
+@pytest.mark.extended
+def test_real_default_owner_inventory_overflow_keeps_lazy_exact_reads(tmp_path, monkeypatch):
+    retired_limit = 64 * 1024 * 1024
+    assert PreparedAnalysisEngine.OWNER_BYTES == retired_limit
+    limits = storage.Limits()
+
+    def owner_weight(row, generation):
+        state, internal = PreparedAnalysisEngine._owner_state(
+            row['owner'], row['metadata'], row['call_metadata'], generation,
+            row['owner_ordinal'], row['request_maps'])
+        weight = retained_bytes((row['owner'], state), retired_limit)
+        assert not internal and weight < retired_limit
+        return weight
+
+    owner_count = retired_weight = cohort = 0
+    with storage.PreparedStore(tmp_path / 'default-owner-inventory.sqlite') as store:
+        while retired_weight <= retired_limit:
+            cohort += 1
+            source = ('owner-inventory-64mib', cohort)
+            home = f'cohort-{cohort - 1:03}'
+            stage = store.begin(source)
+            dependency = dict.fromkeys(storage.DEPENDENCIES, 1)
+            dependency['source_digest'] = f'{cohort:064x}'
+            for number in range(owner_count, owner_count + limits.owners_per_batch):
+                key = (home, f'owner-{number:06}')
+                metadata = dict(home=home, id=key[1], title=f'Owner {number}',
+                                _internal_review=False, source='cli', project='stress')
+                metadata.update((f'detail_{field:02}', f'{number:06}:{field:02}:' + 'x' * 900)
+                                for field in range(48))
+                stage.owner(*key, metadata, dependency, source_ordinal=number)
+            token = stage.publish(source, ready=True)
+            with storage.PreparedReader(store.path) as reader, reader.pin(token) as view:
+                for row in view.pages(view.catalog, query=True, home=home):
+                    retired_weight += owner_weight(row, token.generation)
+                    owner_count += 1
+        with storage.PreparedReader(store.path) as reader, reader.pin(token) as view:
+            retired_weight = sum(owner_weight(row, token.generation)
+                                 for row in view.pages(view.catalog, query=True))
+        assert retired_weight > retired_limit
+
+        selected = ('cohort-000', 'owner-000000')
+        catalog_reads = point_reads = 0
+        catalog = storage.Snapshot.catalog
+        owner = storage.Snapshot.owner
+
+        def selected_catalog(view, **kwargs):
+            nonlocal catalog_reads
+            assert kwargs.get('home') == selected[0] and kwargs.get('sid') == selected[1]
+            page = catalog(view, **kwargs)
+            assert all(row['owner'] == selected for row in page.rows)
+            catalog_reads += len(page.rows)
+            return page
+
+        def selected_owner(view, home, sid, **kwargs):
+            nonlocal point_reads
+            assert (home, sid) == selected
+            point_reads += 1
+            return owner(view, home, sid, **kwargs)
+
+        with monkeypatch.context() as reads:
+            reads.setattr(storage.Snapshot, 'catalog', selected_catalog)
+            reads.setattr(storage.Snapshot, 'owner', selected_owner)
+            engine = PreparedAnalysisEngine(store.path, token)
+            try:
+                assert catalog_reads == point_reads == 0
+                assert engine.snapshot is None and not engine.reader.db.in_transaction
+                assert engine.sessions[selected]['prepared']['title'] == 'Owner 0'
+                assert point_reads == 1 and catalog_reads == 0
+                assert engine.snapshot is None and not engine.reader.db.in_transaction
+                ranges = list(engine.call_ranges(query(home=selected[0], sid=selected[1])))
+                assert len(ranges) == 1 and ranges[0][0]['owner'] == selected
+                assert ranges[0][1:] == (0, 1000)
+                assert catalog_reads == 1 and point_reads == 1
+                assert engine.snapshot is None and not engine.reader.db.in_transaction
+                reads.undo()
+                traversed = 0
+                for key, state in engine.sessions.items():
+                    expected = (f'cohort-{traversed // limits.owners_per_batch:03}', f'owner-{traversed:06}')
+                    assert key == expected and state['owner_ordinal'] == traversed
+                    assert state['prepared']['title'] == f'Owner {traversed}'
+                    assert engine._query_owners.bytes <= retired_limit
+                    traversed += 1
+                assert traversed == owner_count and retired_weight > retired_limit
+                assert len(engine._query_owners.cache) < owner_count
+                assert selected not in engine._query_owners.cache
+                assert engine.snapshot is None and not engine.reader.db.in_transaction
+                assert engine.sessions[selected]['prepared']['title'] == 'Owner 0'
+                assert engine._query_owners.bytes <= retired_limit
+                assert engine.snapshot is None and not engine.reader.db.in_transaction
+                print(f'owner_inventory_experiment source={source!r} owners={owner_count} '
+                      f'retired_owner_weight_bytes={retired_weight} retired_owner_limit_bytes={retired_limit} '
+                      f'optional_cache_weight_bytes={engine._query_owners.bytes} rss=not_measured')
+            finally:
+                engine.close()
