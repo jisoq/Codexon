@@ -27,10 +27,10 @@ from cachemonitor.analysis_records import compact_record, public_record
 from cachemonitor.observer_state import ProcessLock
 
 
-FORMAT = 8
+FORMAT = 9
 APPLICATION_ID = 0x43505250
 # Only versions whose dedicated, disposable schema is known to this writer.
-REBUILDABLE_FORMATS = frozenset((1, 2, 3, 4, 5, 6, 7))
+REBUILDABLE_FORMATS = frozenset((1, 2, 3, 4, 5, 6, 7, 8))
 METRICS = (
     'ts', 'session_ordinal', 'input', 'cached', 'written', 'output', 'reasoning',
     'total', 'uncached', 'ordinary_input', 'non_reasoning', 'rate', 'cost',
@@ -738,6 +738,7 @@ def _schema():
         CREATE INDEX owner_versions_order ON owner_versions(source_ordinal,owner,batch);
         CREATE TABLE owner_heads(owner INTEGER PRIMARY KEY,batch INTEGER NOT NULL);
         CREATE INDEX owner_heads_batch ON owner_heads(batch);
+        CREATE TABLE ledger_pending(owner INTEGER PRIMARY KEY);
         CREATE TABLE catalog_orders(batch INTEGER NOT NULL,owner INTEGER NOT NULL,
             source_ordinal INTEGER NOT NULL,PRIMARY KEY(batch,owner));
         CREATE INDEX catalog_orders_rank ON catalog_orders(batch,source_ordinal,owner);
@@ -938,7 +939,8 @@ class PreparedStore:
     def _order_schema(self):
         return ({'order_batch','selection_batch'} <= {row[1] for row in self.db.execute('PRAGMA table_info(meta)')}
             and {'batch','owner','source_ordinal'} <= {
-                row[1] for row in self.db.execute('PRAGMA table_info(catalog_orders)')})
+                row[1] for row in self.db.execute('PRAGMA table_info(catalog_orders)')}
+            and {'owner'} <= {row[1] for row in self.db.execute('PRAGMA table_info(ledger_pending)')})
 
 
     def _rebuild_format(self):
@@ -1235,8 +1237,25 @@ class PreparedStore:
                 return
         self.db.execute('DELETE FROM publications WHERE id=?', (batch,))
 
+    def has_ledger_pending(self):
+        return self.db.execute('SELECT 1 FROM ledger_pending LIMIT 1').fetchone() is not None
+
+    def acknowledge_ledger(self, owners, *, expected):
+        pending=[]
+        for home,sid in owners:
+            row=self.db.execute('SELECT p.owner FROM ledger_pending p JOIN owners o ON o.id=p.owner '
+                                'WHERE o.home=? AND o.sid=?',(home,sid)).fetchone()
+            if row is not None:pending.append(row[0])
+        if not pending:return
+        with self._transaction():
+            if self.token != expected:
+                raise StaleGeneration('prepared ledger acknowledgment belongs to an older generation')
+            for owner in pending:
+                self.db.execute('DELETE FROM ledger_pending WHERE owner=?',(owner,))
+                self._prune_owner(owner)
+
     def _prune_owner(self, owner):
-        for table in (*KINDS, 'owner_versions', 'owner_heads', 'seen'):
+        for table in (*KINDS, 'owner_versions', 'owner_heads', 'seen', 'ledger_pending'):
             if self.db.execute(f'SELECT 1 FROM {table} WHERE owner=? LIMIT 1', (owner,)).fetchone():
                 return
         self.db.execute('DELETE FROM owners WHERE id=?', (owner,))
@@ -2001,6 +2020,7 @@ class Stage:
                 for owner in self.owners.values():
                     self.db.execute('INSERT INTO owner_heads VALUES(?,?) ON CONFLICT(owner) '
                                     'DO UPDATE SET batch=excluded.batch', (owner, self.batch))
+                    self.db.execute('INSERT OR IGNORE INTO ledger_pending VALUES(?)',(owner,))
                 for namespace in self.checkpoint_namespaces:
                     previous = self.db.execute('SELECT batch FROM checkpoint_heads WHERE namespace=?',(namespace,)).fetchone()
                     self.db.execute('INSERT INTO checkpoint_heads VALUES(?,?) ON CONFLICT(namespace) '
@@ -2419,6 +2439,17 @@ class Snapshot:
         next_after = (*position, page.after[0] if not page.complete else None)
         return Page(page.rows, next_after, page.complete and not more_owners,
                     page.encoded_bytes, page.object_bytes)
+
+    @_read_operation
+    def ledger_pending(self, *, after=None):
+        where='' if after is None else 'WHERE p.owner>? '
+        args=(() if after is None else (after,))+(self.limits.page_rows+1,)
+        sql=('SELECT p.owner,o.home,o.sid,COALESCE(v.deleted,1) AS deleted FROM ledger_pending p '
+             'JOIN owners o ON o.id=p.owner LEFT JOIN owner_heads h ON h.owner=p.owner '
+             'LEFT JOIN owner_versions v ON v.owner=h.owner AND v.batch=h.batch '+where+
+             'ORDER BY p.owner LIMIT ?')
+        return self._page(sql,args,lambda row:dict(owner=(row['home'],row['sid']),deleted=bool(row['deleted'])),
+                          lambda row:row['owner'],lambda row:len(row['home'])*4+len(row['sid'])*4+32)
 
     @_read_operation
     def owner_revisions(self, owners=None, *, after=None):

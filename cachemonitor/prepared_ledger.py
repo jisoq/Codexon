@@ -131,6 +131,25 @@ class PreparedLedger:
             if ordinal % OWNER_BATCH == 0:
                 db.commit()
 
+        def stage_owners(view, keys):
+            for group in _groups(keys,OWNER_BATCH):
+                group=[key for key in group if db.execute(
+                    'SELECT 1 FROM temp.prepared_ledger_sources WHERE home=? AND sid=?',key).fetchone() is None]
+                if not group:continue
+                headers = list(view.pages(view.owner_revisions,group))
+                if len(headers) != len(group):
+                    raise NotReady('selected ledger plan references an absent owner')
+                with closing(self._source_entries(view,headers,self._source_cache)) as entries:
+                    for header,entry in entries:
+                        key = header['owner']
+                        previous = self._source_cache.get(key)
+                        if previous is not None and previous[0]==header['revision']:
+                            source = previous[1]
+                        else:
+                            _,source,_,_ = self._source_slot(key,header['revision'],entry)
+                            self.metrics['metadata_reads'] = self.metrics.get('metadata_reads',0)+1
+                        stage_source(key,source,source['usage_revision'])
+
         cached = None
         try:
             if owners is None:
@@ -141,20 +160,7 @@ class PreparedLedger:
             with self.store.read_current(cancel=self.cancel,seconds=60) as view:
                 self._require_view(view)
                 token = view.token
-                for group in _groups(owners,OWNER_BATCH):
-                    headers = list(view.pages(view.owner_revisions,group))
-                    if len(headers) != len(group):
-                        raise NotReady('selected ledger plan references an absent owner')
-                    with closing(self._source_entries(view,headers,self._source_cache)) as entries:
-                        for header,entry in entries:
-                            key = header['owner']
-                            previous = self._source_cache.get(key)
-                            if previous is not None and previous[0]==header['revision']:
-                                source = previous[1]
-                            else:
-                                _,source,_,_ = self._source_slot(key,header['revision'],entry)
-                                self.metrics['metadata_reads'] = self.metrics.get('metadata_reads',0)+1
-                            stage_source(key,source,source['usage_revision'])
+                stage_owners(view,owners)
         elif cached is not None:
             sources, certificates = cached
             del cached
@@ -175,6 +181,17 @@ class PreparedLedger:
                     self.metrics['metadata_reads'] = self.metrics.get('metadata_reads', 0)+1
                     stage_source(key, source, source['usage_revision'])
                     del source, entry
+        with self.store.read_current(cancel=self.cancel,seconds=60) as view:
+            self._require_view(view,token)
+            for group in _groups(view.pages(view.ledger_pending),OWNER_BATCH):
+                live=[]
+                for entry in group:
+                    if entry['deleted']:
+                        db.execute('INSERT OR IGNORE INTO temp.prepared_ledger_retired VALUES(?,?)',entry['owner'])
+                    else:
+                        live.append(entry['owner'])
+                stage_owners(view,live)
+                db.commit()
         self._check_plan(token)
         if owners is None:
             self._source_token = token
@@ -486,10 +503,14 @@ class PreparedLedger:
                 retired = tuple(tuple(row) for row in rows
                     if not self.ledger._recovered_home(row[0], envelope))
                 progress.retire(db, retired)
+                db.executemany('DELETE FROM temp.prepared_ledger_requests WHERE home=? AND sid=?',retired)
                 db.executemany('DELETE FROM temp.prepared_ledger_retired WHERE home=? AND sid=?',
                                (tuple(row) for row in rows))
                 self._check_plan(token)
             if retired:
+                if progress.applied(db,retired):
+                    raise ValueError('prepared ledger retirement was not confirmed')
+                self.store.acknowledge_ledger(retired,expected=token)
                 yield dict(owners=(), remaining=True, retired=retired)
 
         after = -1
@@ -587,5 +608,17 @@ class PreparedLedger:
         for _ in self.ledger.reconcile_prepared_coverage(envelope, check=lambda: self._check_plan(token),
                                                        metadata_bytes=METADATA_BYTES):
             yield dict(owners=(), remaining=True, retired=())
+        after=-1
+        while True:
+            self._check_plan(token)
+            rows=db.execute('SELECT ordinal,home,sid,certificate FROM temp.prepared_ledger_sources '
+                            'WHERE pending=0 AND ordinal>? ORDER BY ordinal LIMIT ?',
+                            (after,OWNER_BATCH)).fetchall()
+            if not rows:break
+            wanted={(row['home'],row['sid']):row['certificate'] for row in rows}
+            saved=progress.applied(db,wanted)
+            confirmed=tuple(key for key,certificate in wanted.items() if saved.get(key)==certificate)
+            if confirmed:self.store.acknowledge_ledger(confirmed,expected=token)
+            after=rows[-1]['ordinal']
         self._clear_plan()
         yield dict(owners=(), remaining=False, retired=())

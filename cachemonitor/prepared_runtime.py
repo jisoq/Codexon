@@ -4,7 +4,6 @@ The process connection belongs to the dispatcher. The writer owns collection,
 ledger and prepared-store connections; the page and detail actors own separate
 read-only connections. None may send on the GUI connection from a background thread.
 """
-from itertools import chain
 from multiprocessing import Pipe
 from multiprocessing.connection import wait
 from dataclasses import replace
@@ -223,7 +222,7 @@ class PreparedWriter:
             ledger_retry = next_poll = next_import = 0.
             last_timing = float('-inf')
             delivery_delta=None
-            pending_changed=set();pending_removed=set();ledger_removed=set();ledger_changed=set()
+            pending_changed=set();pending_removed=set()
             maintenance_due=True
             ledger_pending=False
             pending_reset=False
@@ -374,16 +373,13 @@ class PreparedWriter:
                               collector.notification_connection(notification_publication))
                 poll_at=time.monotonic()+3
                 complete=catalog.get('aggregate_complete',True)
-                if ledger is not None and (complete or catalog['owners'] or ledger_changed or snapshot.get('request_activity')):
+                if ledger is not None and (complete or catalog['owners'] or store.has_ledger_pending() or snapshot.get('request_activity')):
                     try:
                         envelope=snapshot if complete else dict(snapshot,collection_partial=True)
-                        owners=(chain(catalog['owners'],(owner for owner in ledger_changed if owner not in catalog['owners']))
-                                if catalog.get('authority')=='selected' else None)
-                        batches=adapter.sync(envelope,removed=ledger_removed if complete else (),owners=owners)
+                        owners=catalog['owners'] if catalog.get('authority')=='selected' else None
+                        batches=adapter.sync(envelope,owners=owners)
                         try:
                             for batch in batches:
-                                ledger_removed.difference_update(batch.get('retired',()))
-                                ledger_changed.difference_update(batch.get('owners',()))
                                 if self.stopped.is_set():
                                     raise InterruptedError('prepared ledger interrupted between durable batches')
                                 # A yielded batch is durable. Abandon this inventory
@@ -402,11 +398,9 @@ class PreparedWriter:
                                 if interrupted:break
                         finally:batches.close()
                         if not interrupted:
-                            ledger_changed.clear()
                             if snapshot.get('activity_live_cursor'):collector.channel.acknowledge_activity(snapshot)
                             if complete:
                                 if snapshot.get('activity_cursor'):collector.channel.acknowledge_activity(snapshot)
-                                ledger_removed.clear()
                             if imported:ledger_issue=None;failures=0
                     except StaleGeneration:
                         # A source plan cannot certify facts from a later
@@ -566,13 +560,8 @@ class PreparedWriter:
                                         progress(PreparationStage.CONVERTING,change['processed'],change['total'])
                                     pending_removed.difference_update(change['changed'])
                                     pending_changed.update(change['changed'])
-                                    ledger_changed.update(change['changed'])
-                                    ledger_changed.difference_update(change['removed'])
                                     pending_changed.difference_update(change['removed'])
                                     pending_removed.update(change['removed'])
-                                    if catalog.get('aggregate_complete',True):
-                                        ledger_removed.difference_update(change['changed'])
-                                        ledger_removed.update(change['removed'])
                                     maintenance_due=True
                                     if self.stopped.is_set():
                                         raise InterruptedError('prepared conversion cancelled')
@@ -608,7 +597,7 @@ class PreparedWriter:
                             aggregate_complete=catalog.get('aggregate_complete',True)
                             snapshot['aggregate_request']=aggregate if aggregate_complete else None
                             ledger_pending=ledger is not None and bool(catalog.get('aggregate_complete',True)
-                                or catalog['owners'] or ledger_changed or snapshot.get('request_activity'))
+                                or catalog['owners'] or store.has_ledger_pending() or snapshot.get('request_activity'))
                             if previous!=store.token:
                                 # A verified display need not await independent
                                 # accounting replay. Its pending status is explicit.
