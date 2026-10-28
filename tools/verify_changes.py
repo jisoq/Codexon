@@ -631,6 +631,8 @@ def package_check(executable, report_dir):
 CORE_TESTS = frozenset(test_files(
     'pricing', 'data_contract', 'core', 'request_modes', 'collection_preparation',
     'mismatch_history', 'mismatch_source',
+    'collection_replay_reactivation', 'prepared_delivery_incremental_alerts',
+    'prepared_partial_reuse',
     'banked_resets', 'comparison', 'quota', 'quota_tracking',
     'native_index', 'native_trends', 'native_usage', 'build_native',
     'verify_changes', 'check_environment', 'collect_notices', 'prepare_sources',
@@ -644,7 +646,12 @@ NON_NATIVE_TESTS = frozenset(test_files(
 
 
 def basic_tests():
-    return tuple(sorted(CORE_TESTS))
+    return tuple(sorted((*CORE_TESTS,
+        'tests/test_prepared_freeze_scheduling.py',
+        'tests/test_prepared_live_scheduling.py',
+        'tests/test_prepared_selection_retry.py',
+        'tests/test_dashboard_evidence.py::test_aggregate_preparation_displays_actual_totals_before_query',
+        'tests/test_dashboard_evidence.py::test_hidden_dashboard_restored_navigation_never_requests_aggregate_until_shown')))
 
 
 def tests_require_native(tests):
@@ -835,7 +842,7 @@ def main(argv=None):
     parser.add_argument('--rerun', type=Path, help='Replay a frozen verification manifest')
     parser.add_argument('--plan', action='store_true', help='Show checks without running them')
     parser.add_argument('--base', help='Git ref to compare when intentionally establishing a new baseline')
-    parser.add_argument('--basic', action='store_true', help='Run the fixed audited core CI checks without advancing the local baseline')
+    parser.add_argument('--basic', action='store_true', help='Run the fixed core and dashboard CI checks without advancing the local baseline')
     parser.add_argument('--full', action='store_true', help='Run all essential regression checks')
     parser.add_argument('--integration', action='store_true', help='Run all integration checks too (implies --full)')
     parser.add_argument('--extended', action='store_true', help='Also run large-data benchmarks (implies --full)')

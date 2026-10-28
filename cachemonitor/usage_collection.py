@@ -160,14 +160,17 @@ class CollectionChanges:
     Session tokens cover retained fields outside LiveCollection.volatile;
     activity tokens cover the entire record. Producers replace tokens for
     corrections as well as appends. An activity revision also covers ordering
-    and removal. Callers without those guarantees retain full validation.
+    and removal. Removed session keys identify loaded, complete sources which
+    no longer produce a public body. Scope eviction is not a removal.
+    Callers without those guarantees retain full validation.
     """
-    __slots__=('owner','sessions','activities','activity_revision','appends')
+    __slots__=('owner','sessions','activities','activity_revision','appends','removed')
 
-    def __init__(self,owner,sessions,activities,*,activity_revision=None,appends=None):
+    def __init__(self,owner,sessions,activities,*,activity_revision=None,appends=None,removed=()):
         self.owner=owner;self.sessions=sessions;self.activities=activities
         self.activity_revision=activity_revision
         self.appends=appends or {}
+        self.removed=removed
 
 
 class LiveCollection:
@@ -775,12 +778,14 @@ class CollectionChannel(CollectionHeaderReader):
 
     def publish(self,snapshot,epoch,sequence,*,changes=None,selections=None,selection_revision=None):
         self.removed_sessions=()
+        known_removed=changes.removed if isinstance(changes,CollectionChanges) and changes.owner is not None else ()
         if snapshot.get('activity_stream'):
             snapshot={**snapshot,'activity_highwater':getattr(self,'activity_row_revision',0),
                       'activity_live_start':getattr(self,'activity_live_start',0)}
         candidate=(self.live.prepare(snapshot,epoch,sequence,changes=changes,selections=selections,
                                      selection_revision=selection_revision) if self.live else None)
-        if candidate is not None and self.live.current is not None and candidate['durable']==self.live.current['durable']:
+        if (candidate is not None and self.live.current is not None and candidate['durable']==self.live.current['durable']
+                and not any(key in self.published or key in getattr(self,'retained_session_keys',()) for key in known_removed)):
             candidate['catalog_identity']=self.live.current.get('catalog_identity')
             self.live.publish(candidate)
             return
@@ -868,15 +873,16 @@ class CollectionChannel(CollectionHeaderReader):
                 if 'request_activity' in snapshot:header['activity_revision']=activity_revision
             encoded_header=SnapshotHeader(header,old_header)
             self.db.executemany('INSERT OR REPLACE INTO sessions VALUES(?,?,?,?)',writes)
-            removed=previous.keys()-current.keys()
+            absent=previous.keys()-current.keys()
+            proven=set(known_removed)-current.keys()
             complete=(snapshot.get('catalog_scope')!='selected'
                 and snapshot.get('catalog_complete',True) and snapshot.get('usage_collection_complete',True)
                 and not snapshot.get('index',{}).get('loading'))
             if not complete:
-                retained=(retained|removed)-current.keys()
-                removed=set()
+                retained=(retained|absent)-current.keys()-proven
+                removed=proven
             else:
-                removed|=retained-current.keys()
+                removed=absent|proven|(retained-current.keys())
                 retained=set()
             self.db.executemany('DELETE FROM sessions WHERE home=? AND sid=?',removed)
             updated=False

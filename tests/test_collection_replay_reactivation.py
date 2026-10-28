@@ -3,7 +3,7 @@ from contextlib import closing
 import pytest
 
 from cachemonitor.index import UsageIndex
-from cachemonitor.usage_collection import CollectionChannel, CollectionClient, CollectorService
+from cachemonitor.usage_collection import CollectionChanges, CollectionChannel, CollectionClient, CollectorService
 from test_collection_preparation import cached_sources
 from test_collection_transport import snapshot
 from test_core import TID, usage
@@ -97,3 +97,27 @@ def test_only_complete_full_publication_retires_saved_bodies(tmp_path,partial):
         channel.publish(authoritative,'epoch',3)
         assert channel.db.execute('SELECT sid FROM sessions').fetchall()==[('session',)]
         assert channel.removed_sessions=={(channel.homes[0],'other')}
+
+
+def test_verified_source_removal_retires_retained_body_before_full_collection_finishes(tmp_path):
+    with closing(CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite')) as channel:
+        channel.start_live()
+        full=snapshot(channel)
+        full['catalog_scope']='full'
+        full['sessions'].append(dict(home=channel.homes[0],id='other',history=[dict(key='two',output=7)],
+            collection_complete=True,status='idle'))
+        channel.publish(full,'epoch',1)
+        selected={**full,'ts':101.,'catalog_scope':'selected','sessions':full['sessions'][:1]}
+        channel.publish(selected,'epoch',2)
+        pending={**selected,'ts':102.,'catalog_scope':'full','usage_collection_complete':False,
+            'index':{**selected['index'],'loading':True}}
+        channel.publish(pending,'epoch',3)
+        assert channel.db.execute('SELECT count(*) FROM sessions').fetchone()[0]==2
+        removed=(channel.homes[0],'other')
+        changes=CollectionChanges(object(),{}, {},removed={removed})
+        channel.publish({**pending,'ts':103.},'epoch',4,changes=changes)
+        assert channel.db.execute('SELECT sid FROM sessions').fetchall()==[('session',)]
+        assert channel.removed_sessions=={removed}
+        writes=channel.db.total_changes
+        channel.publish({**pending,'ts':104.},'epoch',5,changes=changes)
+        assert channel.db.total_changes==writes

@@ -1263,10 +1263,10 @@ class UsageIndex:
                           'usage_complete':usage_complete,'last_usage_success':self.last_usage_success,
                           'files': file_count, 'bytes_read': self.bytes_read, 'version': self.version,
                           'path': str(self.path)}}
-        self.track_publication(snapshot)
+        self.track_publication(snapshot,ready=ready)
         return snapshot
 
-    def track_publication(self, snapshot):
+    def track_publication(self, snapshot, *, ready=None):
         from .usage_collection import CollectionChanges, LiveCollection, publication_fingerprint
         from .collection_append import complete as complete_append
         from .collection_replay import EncodedSession
@@ -1280,8 +1280,10 @@ class UsageIndex:
         current = {}
         tokens = {}
         appends = {}
+        visible = set()
         for view in snapshot['sessions']:
             key = (view['home'],view['id'])
+            visible.add(key)
             if isinstance(view,EncodedSession):
                 tokens[key]=view.digest
                 continue
@@ -1309,7 +1311,8 @@ class UsageIndex:
         self.append_origins.clear()
         self.publication_rows = current
         self.collection_changes = CollectionChanges(self.publication_owner,tokens,self.activity_tokens,
-                                                    activity_revision=self.activity_publication,appends=appends)
+            activity_revision=self.activity_publication,appends=appends,
+            removed=(ready & self.loaded)-visible if ready is not None else ())
 
     def close(self):
         if self.replay is not None:self.replay.close();self.replay=None
