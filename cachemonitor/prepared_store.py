@@ -337,54 +337,63 @@ class CatalogWork(dict):
 
     def finish(self, demand):
         self.check()
-        self.db.execute('INSERT INTO catalog_work_nodes(work,home,sid,parent_sid) '
-            'SELECT work,home,sid,parent_sid FROM catalog_work_sessions WHERE work=?', (self.work,))
-        for row in self.owner_rows():
-            entry = json.loads(row['entry'])
-            lineage = entry['owner_lineage']
-            parent = lineage.get('parent_thread_id')
-            self.db.execute('INSERT INTO catalog_work_nodes(work,home,sid,parent_sid) VALUES(?,?,?,?) '
-                'ON CONFLICT(work,home,sid) DO UPDATE SET parent_sid=excluded.parent_sid',
-                (self.work,row['home'],row['sid'],parent if type(parent) is str else None))
-        self.db.execute('WITH RECURSIVE rooted(home,sid) AS ('
-            'SELECT n.home,n.sid FROM catalog_work_nodes n WHERE n.work=? AND NOT EXISTS('
-            'SELECT 1 FROM catalog_work_nodes p WHERE p.work=n.work AND p.home=n.home AND p.sid=n.parent_sid) '
-            'UNION SELECT n.home,n.sid FROM catalog_work_nodes n JOIN rooted p '
-            'ON n.home=p.home AND n.parent_sid=p.sid WHERE n.work=?) '
-            'UPDATE catalog_work_nodes SET valid=1 WHERE work=? AND (home,sid) IN (SELECT home,sid FROM rooted)',
-            (self.work,self.work,self.work))
-        if demand is not None:
-            for home,sid in demand['selected']:
-                found = self.db.execute('SELECT home FROM catalog_work_sessions WHERE work=? AND sid=? '
-                    'AND (? IS NULL OR home=?) LIMIT 2', (self.work,sid,home,home)).fetchall()
-                if len(found)==1:
-                    self.db.execute('UPDATE catalog_work_sessions SET required=1 WHERE work=? AND home=? AND sid=?',
-                        (self.work,found[0][0],sid))
-            self.db.execute('WITH RECURSIVE family(home,sid) AS ('
-                'SELECT home,sid FROM catalog_work_sessions WHERE work=? AND required=1 '
-                'UNION SELECT c.home,c.sid FROM catalog_work_sessions c JOIN family p '
-                'ON c.home=p.home AND c.parent_sid=p.sid WHERE c.work=?) '
-                'UPDATE catalog_work_sessions SET required=1 WHERE work=? AND (home,sid) IN (SELECT home,sid FROM family)',
+    if self.cancel is not None:
+        self.db.set_progress_handler(self.cancel,1000)
+    try:
+            self.db.execute('INSERT INTO catalog_work_nodes(work,home,sid,parent_sid) '
+                'SELECT work,home,sid,parent_sid FROM catalog_work_sessions WHERE work=?', (self.work,))
+            for row in self.owner_rows():
+                entry = json.loads(row['entry'])
+                lineage = entry['owner_lineage']
+                parent = lineage.get('parent_thread_id')
+                self.db.execute('INSERT INTO catalog_work_nodes(work,home,sid,parent_sid) VALUES(?,?,?,?) '
+                    'ON CONFLICT(work,home,sid) DO UPDATE SET parent_sid=excluded.parent_sid',
+                    (self.work,row['home'],row['sid'],parent if type(parent) is str else None))
+            self.db.execute('WITH RECURSIVE rooted(home,sid) AS ('
+                'SELECT n.home,n.sid FROM catalog_work_nodes n WHERE n.work=? AND NOT EXISTS('
+                'SELECT 1 FROM catalog_work_nodes p WHERE p.work=n.work AND p.home=n.home AND p.sid=n.parent_sid) '
+                'UNION SELECT n.home,n.sid FROM catalog_work_nodes n JOIN rooted p '
+                'ON n.home=p.home AND n.parent_sid=p.sid WHERE n.work=?) '
+                'UPDATE catalog_work_nodes SET valid=1 WHERE work=? AND (home,sid) IN (SELECT home,sid FROM rooted)',
                 (self.work,self.work,self.work))
-            membership = 'members' if demand['aggregate'] else 'sessions'
-            selected = '' if demand['aggregate'] else ' AND m.required=1'
-            self.db.execute('UPDATE catalog_work_owners SET admitted=complete AND EXISTS('
-                'SELECT 1 FROM catalog_work_'+membership+' m WHERE m.work=catalog_work_owners.work '
-                'AND m.home=catalog_work_owners.home AND m.sid=catalog_work_owners.sid'+selected+') WHERE work=?',
-                (self.work,))
-            missing = self.db.execute('SELECT 1 FROM catalog_work_sessions s WHERE s.work=? AND s.required=1 '
-                'AND NOT EXISTS(SELECT 1 FROM catalog_work_owners o WHERE o.work=s.work AND o.home=s.home '
-                'AND o.sid=s.sid AND o.admitted=1) LIMIT 1', (self.work,)).fetchone()
-            known = ('session_catalog' in self.present and
-                     (not demand['aggregate'] or 'demand_members' in self.present))
-            self['membership_complete'] = bool(known and missing is None)
-            self['aggregate_complete'] = bool(demand['aggregate'] and self['header'].get('usage_collection_complete'))
-            if self['membership_complete']:
-                self['header']['selected_resolutions'] = [[sid,self.db.execute(
-                    'SELECT count(*) FROM catalog_work_sessions WHERE work=? AND sid=?',
-                    (self.work,sid)).fetchone()[0]] for home,sid in demand['selected'] if home is None]
-        self.reindex()
-        return self
+            if demand is not None:
+                for home,sid in demand['selected']:
+                    found = self.db.execute('SELECT home FROM catalog_work_sessions WHERE work=? AND sid=? '
+                        'AND (? IS NULL OR home=?) LIMIT 2', (self.work,sid,home,home)).fetchall()
+                    if len(found)==1:
+                        self.db.execute('UPDATE catalog_work_sessions SET required=1 WHERE work=? AND home=? AND sid=?',
+                            (self.work,found[0][0],sid))
+                self.db.execute('WITH RECURSIVE family(home,sid) AS ('
+                    'SELECT home,sid FROM catalog_work_sessions WHERE work=? AND required=1 '
+                    'UNION SELECT c.home,c.sid FROM catalog_work_sessions c JOIN family p '
+                    'ON c.home=p.home AND c.parent_sid=p.sid WHERE c.work=?) '
+                    'UPDATE catalog_work_sessions SET required=1 WHERE work=? AND (home,sid) IN (SELECT home,sid FROM family)',
+                    (self.work,self.work,self.work))
+                membership = 'members' if demand['aggregate'] else 'sessions'
+                selected = '' if demand['aggregate'] else ' AND m.required=1'
+                self.db.execute('UPDATE catalog_work_owners SET admitted=complete AND EXISTS('
+                    'SELECT 1 FROM catalog_work_'+membership+' m WHERE m.work=catalog_work_owners.work '
+                    'AND m.home=catalog_work_owners.home AND m.sid=catalog_work_owners.sid'+selected+') WHERE work=?',
+                    (self.work,))
+                missing = self.db.execute('SELECT 1 FROM catalog_work_sessions s WHERE s.work=? AND s.required=1 '
+                    'AND NOT EXISTS(SELECT 1 FROM catalog_work_owners o WHERE o.work=s.work AND o.home=s.home '
+                    'AND o.sid=s.sid AND o.admitted=1) LIMIT 1', (self.work,)).fetchone()
+                known = ('session_catalog' in self.present and
+                         (not demand['aggregate'] or 'demand_members' in self.present))
+                self['membership_complete'] = bool(known and missing is None)
+                self['aggregate_complete'] = bool(demand['aggregate'] and self['header'].get('usage_collection_complete'))
+                if self['membership_complete']:
+                    self['header']['selected_resolutions'] = [[sid,self.db.execute(
+                        'SELECT count(*) FROM catalog_work_sessions WHERE work=? AND sid=?',
+                        (self.work,sid)).fetchone()[0]] for home,sid in demand['selected'] if home is None]
+            self.reindex()
+            return self
+    except sqlite3.OperationalError:
+        self.check()
+        raise
+    finally:
+        if self.cancel is not None:
+            self.db.set_progress_handler(None,0)
 
     def reindex(self):
         for ordinal,row in enumerate(self.owner_rows('admitted=1',fields='home,sid')):
