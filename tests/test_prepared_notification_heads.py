@@ -105,7 +105,7 @@ def test_publication_preserves_unselected_cache_incident_lifecycle(tmp_path, sel
                     cache_health=dict(incident=incident if sid == 'b' else None, reason='cache evidence'))
                 summary, sections = split_summary(dict(material['summary'], own=own))
                 stage.derived(key, summary=summary_for_storage(summary))
-                stage.sections(key, sections, reconcile=True)
+                stage.sections(key, sections)
             return stage.publish(('source', revision), ready=True)
 
         commit(1)
