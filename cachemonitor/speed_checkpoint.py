@@ -120,8 +120,6 @@ def _binding(token, preparation, source_identity):
     _text(token[0], 128)
     _integer(token[1])
     _text(preparation, 256)
-    _require(type(source_identity) is bytes and len(source_identity) <= CHUNK_BYTES,
-             'source identity must be the writer encoded packet')
     return dict(format=FORMAT, classifier=_policy(), token=list(token),
                 owner_binding='prepared-fact-dependencies-excluding-pricing-pack-sha256-2',
                 preparation=preparation, source=hashlib.sha256(source_identity).hexdigest())
