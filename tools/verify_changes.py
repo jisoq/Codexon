@@ -170,6 +170,7 @@ RULES = (
     ('cachemonitor/prepared_ingest.py', ('prepared', 'analysis', 'data', 'cache', 'modes', 'quota_poll')),
     ('cachemonitor/prepared_append.py', ('prepared', 'analysis', 'cache', 'overlay_data', 'quota_poll')),
     ('cachemonitor/prepared_runtime.py', ('prepared', 'analysis', 'quota_poll', 'overlay_tracking', 'notifications')),
+    ('cachemonitor/preparation_progress.py', ('prepared', 'dashboard_queries', 'overlay_data', 'translation')),
     ('cachemonitor/prepared_query.py', ('prepared', 'analysis', 'dashboard_queries', 'details')),
     ('cachemonitor/prepared_analysis.py', ('prepared', 'analysis', 'dashboard_queries', 'details')),
     ('tests/fixtures/prepared-format6*', ('prepared',)),

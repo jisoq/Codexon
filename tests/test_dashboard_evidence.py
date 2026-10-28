@@ -46,6 +46,137 @@ def deliver_pending(window):
         result=window.engine.page_query(query),valid_until=float('inf')))
 
 
+@pytest.mark.parametrize('language',['ko','en'])
+def test_initial_preparation_reaches_native_dashboard_before_any_snapshot(tmp_path,monkeypatch,language):
+    from PySide6.QtTest import QSignalSpy
+    from cachemonitor.i18n import set_language
+    from cachemonitor.preparation_progress import PreparationStage,PreparationWork
+    from cachemonitor.quick_qa import control,scene_view,walk
+    from cachemonitor.usage_collection import CollectionChannel,empty_snapshot
+    from cachemonitor.theme import shared_theme
+    from test_ui import wait_for_rendered
+    app=QApplication.instance() or QApplication([])
+    previous=app.property('cachemonitorDisableShellIntegration')
+    app.setProperty('cachemonitorDisableShellIntegration',True)
+    monkeypatch.setattr(Dashboard,'start_quota_service',lambda *args:None)
+    monkeypatch.setattr('cachemonitor.overlay_windows.system_reduce_motion',lambda:language=='en')
+    set_language(language)
+    channel=CollectionChannel([tmp_path/'home'],tmp_path/'source.sqlite');channel.start_live()
+    snapshot=empty_snapshot(channel.homes,channel.path,time.time())
+    snapshot['index'].update(done=3,files=20)
+    channel.publish(snapshot,'startup-feedback',1)
+    window=controller=None
+    def header_text():
+        return ' '.join(item.property('text') for item in walk(control(window,window.refresh_text))
+            if item.isVisible() and item.property('text'))
+    try:
+        window=Dashboard(channel.homes,live_limits=False,collection_autostart=False,
+            index_path=channel.path,quota_path=tmp_path/'quota.sqlite',
+            settings=QSettings(str(tmp_path/'startup.ini'),QSettings.IniFormat))
+        progress=[];snapshots=[]
+        window.worker.progress.connect(progress.append);window.worker.snapshot.connect(snapshots.append)
+        origin=window.preparation.started_at
+        window.resize(1000,680);window.show()
+        wait_for_rendered(lambda:any(isinstance(value,PreparationWork) and value.processed==3 for value in progress),timeout=15)
+        assert not snapshots and window.preparation.started_at==origin
+        control(window,window.home_panel.today_summary)
+        summary=scene_view(window,window.home_panel.today_summary)
+        wait_for_rendered(lambda:any(item.objectName()=='analysis-region-loading' and item.isVisible()
+            for item in walk(summary)))
+        region=next(item for item in walk(summary) if item.objectName()=='analysis-region-loading')
+        wait_for_rendered(lambda:region.isVisible() and region.height()>0)
+        texts=[item.property('text') for item in walk(region) if item.isVisible() and item.property('text')]
+        assert any(('Reading saved' if language=='en' else '저장된 Codex') in text for text in texts)
+        assert any('3 / 20' in text for text in texts)
+        assert any(('other tabs' if language=='en' else '다른 탭') in text for text in texts)
+        for node in (window.home_panel.readiness_title,window.home_panel.readiness_note):
+            assert not control(window,node).isVisible()
+        assert not window.refresh_text.isVisible()
+        assert window.quick.grabFramebuffer().save(str(tmp_path/f'initial-home-{language}.png'))
+        elapsed=window.analysis_loading['elapsedText']
+        activity=next(item for item in walk(region) if item.objectName()=='loading-activity')
+        movement=QSignalSpy(activity.xChanged)
+        wait_for_rendered(lambda:window.analysis_loading.get('elapsedText')!=elapsed,timeout=3)
+        assert shared_theme().reduceMotion==(language=='en')
+        if language=='en':assert movement.count()==0
+        else:assert movement.count()>0
+        for page in (4,3,7):
+            window.change_page(page)
+            wait_for_rendered(lambda:window.pages.isPageReady(PAGE_INDEX[page]),timeout=5)
+            wait_for_rendered(lambda:control(window,window.refresh_text).isVisible())
+            header=control(window,window.refresh_text)
+            wait_for_rendered(lambda:'3 / 20' in header_text())
+            assert window.analysis_loading['elapsedText'] and window.preparation.started_at==origin
+            assert not window.analysis_regions()
+            if page==4:assert window.quick.grabFramebuffer().save(str(tmp_path/f'initial-settings-{language}.png'))
+        window.change_page(1)
+        current=window.preparation
+        window.analysis_progressed(dict(id=window.request_id,stage='query',processed=999,total=1000))
+        assert window.preparation==current and window.analysis_loading['processed']==3
+        assert not window.refresh_text.isVisible()
+        snapshot['index']['done']=13;channel.publish(snapshot,'startup-feedback',2)
+        wait_for_rendered(lambda:window.analysis_loading.get('processed')==13,timeout=5)
+        assert not snapshots and window.preparation.started_at==origin
+        from cachemonitor.overlay import install_overlay
+        controller=install_overlay(window,native_enabled=False)
+        assert controller.preparation==window.preparation
+        snapshot['index']['done']=20;channel.publish(snapshot,'startup-feedback',3)
+        wait_for_rendered(lambda:window.analysis_loading.get('processed')==20,timeout=5)
+        assert window.preparation is not None and not snapshots
+        window.change_page(6)
+        window.analysis_failed(dict(publication_failed=True))
+        window.analysis_progressed(PreparationWork(PreparationStage.CONVERTING,1,2))
+        assert window.analysis_loading['mode']=='error' and not window.analysis_loading['running']
+        wait_for_rendered(lambda:any(item.property('text')==window.analysis_loading['title']
+            for item in walk(scene_view(window,window.home_panel.today_summary))))
+        for node in (window.home_panel.readiness_title,window.home_panel.readiness_note):
+            assert not control(window,node).isVisible()
+        assert window.quick.grabFramebuffer().save(str(tmp_path/f'initial-error-{language}.png'))
+        for page in (4,3,7):
+            window.change_page(page)
+            header=control(window,window.refresh_text)
+            wait_for_rendered(header.isVisible)
+            assert ('Try again' if language=='en' else '다시 시도') in header_text()
+            assert '1 / 2' not in header_text() and '20 / 20' not in header_text()
+            assert not control(window,window.refresh_status).isVisible()
+            assert window.retry_button.isVisible()
+        window.change_page(6)
+        window.retry_analysis()
+        assert window.preparation.started_at==origin and window.analysis_loading['running']
+        window.receive_collection_status({'collection_fault':{'expected_stop':True}})
+        window.sync_preparation()
+        assert window.preparation.started_at==origin and controller.preparation is None
+        for page in (4,3,7):
+            window.change_page(page)
+            header=control(window,window.refresh_text)
+            wait_for_rendered(header.isVisible)
+            assert header_text()==('Usage collection stopped' if language=='en' else '사용 기록 수집 중지')
+            assert not control(window,window.refresh_status).isVisible()
+            assert not window.retry_button.isVisible()
+        window.change_page(6)
+        window.receive_collection_status({'collection_fault':{},'collection_healthy':True})
+        window.sync_preparation()
+        assert window.analysis_loading['running'] and window.preparation.started_at==origin
+        snapshot['ts']=time.time();snapshot['usage_collection_complete']=True
+        snapshot['index'].update(loading=False,usage_complete=True)
+        snapshot.update(request_activity=[],quota_by_home={})
+        channel.publish(snapshot,'startup-feedback',4)
+        wait_for_rendered(lambda:bool(snapshots) and window.preparation is None,timeout=15)
+        wait_for_rendered(lambda:not window.analysis_pending and not window.analysis_loading,timeout=10)
+        assert not window.snapshot['sessions']
+        assert window.home_panel.readiness=='empty'
+        for node in (window.home_panel.readiness_title,window.home_panel.readiness_note):
+            wait_for_rendered(lambda:control(window,node).isVisible())
+        window.analysis_progressed(PreparationStage.STARTING)
+        assert window.preparation is None and not window.analysis_loading
+        assert controller.preparation is None
+        assert not window.qml_errors
+    finally:
+        if controller is not None:controller.stop()
+        if window is not None:close_dashboard(window)
+        channel.close();set_language('ko');app.setProperty('cachemonitorDisableShellIntegration',previous)
+
+
 def test_saved_maximized_window_starts_and_updates_quota_visibility(tmp_path):
     from test_ui import wait_for_rendered
     saved=dashboard(tmp_path)

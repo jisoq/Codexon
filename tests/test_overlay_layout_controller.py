@@ -32,6 +32,83 @@ class Native:
     def reduce_motion(self): return True
 
 
+@pytest.mark.parametrize('language',['ko','en'])
+@pytest.mark.parametrize('scale',[1.,1.25])
+def test_initial_preparation_body_is_visible_and_updates_in_native_overlay(tmp_path,language,scale):
+    import time
+    from dataclasses import replace
+    from cachemonitor.i18n import set_language
+    from cachemonitor.overlay_appearance import default_appearance
+    from cachemonitor.preparation_progress import PreparationPending,PreparationStage,PreparationWork
+    from cachemonitor.quick_qa import walk
+    from test_ui import wait_for_rendered
+    app=QApplication.instance() or QApplication([])
+    set_language(language)
+    controller=OverlayController(QSettings(str(tmp_path/'startup-overlay.ini'),QSettings.IniFormat),native_enabled=False)
+    try:
+        controller.native=Native()
+        controller.appearance=replace(default_appearance(True),font_size=14*scale)
+        controller.appearance_reader.read=lambda dark:controller.appearance
+        pending=PreparationPending(time.monotonic(),PreparationStage.STARTING)
+        controller.receive_preparation(pending)
+        controller.receive_target({'target':{'hwnd':1},'selection':Selection(A)})
+        model=controller.widget.content_model
+        wait_for_rendered(lambda:controller.widget.isVisible() and not controller.widget.quick.grabFramebuffer().isNull())
+        assert model.layout()['body_height']>0 and controller.widget.height()>72*scale
+        assert controller.reduced_motion
+        labels=[item for item in walk(controller.widget.quick.rootObject()) if item.objectName()=='overlayHeartbeatLabel']
+        assert len(labels)==1 and not labels[0].isVisible()
+        assert ('Usage will appear' if language=='en' else '저장된 사용 기록') in model.state['accessible']
+        assert not any(('other tabs' if language=='en' else '다른 탭') in line for line in model.lines())
+        assert controller.widget.quick.grabFramebuffer().save(str(tmp_path/f'initial-overlay-{language}-{scale}.png'))
+        pending=replace(pending,progress=PreparationWork(PreparationStage.CONVERTING,16,49))
+        controller.observed_at=time.monotonic()
+        controller.receive_preparation(pending)
+        wait_for_rendered(lambda:'16 / 49' in model.state['accessible'])
+        root=controller.widget.quick.rootObject()
+        wait_for_rendered(lambda:root.property('announcedPreparation')==model.preparation['title'])
+        announced=root.property('announcedPreparation')
+        assert model.preparation['processed']==16 and model.preparation['total']==49
+        controller.observed_at=time.monotonic()
+        controller.receive_preparation(replace(pending,progress=PreparationWork(PreparationStage.CONVERTING,32,49)))
+        wait_for_rendered(lambda:'32 / 49' in model.state['accessible'])
+        elapsed=model.preparation['elapsedText']
+        controller.observed_at=time.monotonic()
+        controller.timer.start(1000)
+        wait_for_rendered(lambda:model.preparation['elapsedText']!=elapsed,timeout=2.5)
+        controller.timer.stop()
+        assert root.property('announcedPreparation')==announced
+        controller.observed_at=time.monotonic()
+        assert controller.widget.quick.grabFramebuffer().save(str(tmp_path/f'measured-overlay-{language}-{scale}.png'))
+        assert controller.widget.height()==round(model.layout()['height']*scale)
+        x,y,width,height=controller.current_geometry
+        assert x>=0 and y>=0 and x+width<=controller.native.bounds[2] and y+height<=controller.native.bounds[3]
+        controller.receive_collection_status({'collection_fault':{'expected_stop':True}})
+        wait_for_rendered(lambda:labels[0].isVisible())
+        assert labels[0].property('text')==('Usage collection stopped' if language=='en' else '사용 기록 수집 중지')
+        assert ('Automatic collection has stopped.' if language=='en' else '자동 수집이 중지되었습니다.') in model.state['accessible']
+        assert model.preparation is None and not root.property('preparationVisible')
+        stopped_text=model.state['accessible']
+        controller.receive_preparation(replace(pending,started_at=pending.started_at-10,
+            progress=PreparationWork(PreparationStage.CONVERTING,49,49)))
+        assert model.preparation is None and model.state['accessible']==stopped_text
+        controller.receive_collection_status({'collection_fault':{}})
+        controller.receive_preparation(pending)
+        controller.receive_overlay_fault({'publication_failed':True})
+        assert model.preparation is None and model.heartbeat_state()['mode']=='error'
+        controller.receive_snapshot({'overlay_sessions':[],'index':{'loading':False},'ts':time.time()})
+        assert controller.preparation is None and model.preparation is None
+        controller.receive_preparation(pending)
+        controller.receive_target({'target':{'hwnd':1},'selection':Selection(A,host='remote:test')})
+        assert controller.automatic_mode=='icon' and model.preparation is None
+        controller.receive_target({'target':{'hwnd':1},'selection':Selection(A)})
+        controller.native.bounds=(0,0,400,110);controller.refresh()
+        assert controller.automatic_mode=='icon' and not controller.widget.isVisible()
+        assert not controller.widget.qml_errors
+    finally:
+        controller.stop();app.processEvents();set_language('ko')
+
+
 def test_collection_error_does_not_advance_last_confirmed_time(monkeypatch):
     from types import SimpleNamespace
     from cachemonitor import overlay

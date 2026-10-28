@@ -32,6 +32,62 @@ def _catalog(sources, revision=1):
             for ordinal, (sid, source) in enumerate(sources.items())})
 
 
+@pytest.mark.parametrize('cohort_size',[None,1])
+def test_conversion_progress_counts_committed_changed_and_removed_sessions(tmp_path,monkeypatch,cohort_size):
+    sources={f'owner-{number}':_source(f'owner-{number}') for number in range(20)}
+    def read_source(client,owner,catalog,*,limits,**kwargs):
+        source=deepcopy(sources[owner[1]])
+        return source,ingest._weight(source,limits.owner_source_bytes)
+    monkeypatch.setattr(ingest,'read_source',read_source)
+    with storage.PreparedStore(tmp_path/'progress.sqlite') as store:
+        initial=[]
+        for row in ingest.PreparedCohort(store,None,None).convert(_catalog(sources)):
+            with store.read_current() as view:
+                assert len(list(ingest.pages(view.inventory)))==row['processed']
+            initial.append(row)
+        assert [(row['processed'],row['total']) for row in initial]==[(16,20),(20,20)]
+        del sources['owner-0']
+        for source in sources.values():source['history'][0]['input']+=1
+        conversion=ingest.PreparedCohort(store,None,None).convert(_catalog(sources,2),cohort_size=cohort_size)
+        changes=[]
+        for row in conversion:
+            with store.read_current() as view:
+                owners={entry['owner'] for entry in ingest.pages(view.inventory)}
+                assert not owners.intersection(row['removed'])
+                for owner in row['changed']:
+                    assert view.record(*owner,owner[1]+'-response')['input']==101
+            changes.append(row)
+        expected=[(20,20)] if cohort_size is None else [(done,20) for done in range(1,21)]
+        assert [(row['processed'],row['total']) for row in changes]==expected
+        assert sum(len(row['changed'])+len(row['removed']) for row in changes)==20
+        with store.read_current() as view:
+            assert {row['owner'][1] for row in ingest.pages(view.inventory)}==set(sources)
+        assert list(ingest.PreparedCohort(store,None,None).convert(_catalog(sources,2)))==[]
+
+
+def test_empty_preparation_publishes_without_a_measured_denominator(tmp_path):
+    with storage.PreparedStore(tmp_path/'empty.sqlite') as store:
+        changes=list(ingest.PreparedCohort(store,None,None).convert(_catalog({})))
+        assert len(changes)==1 and changes[0]['ready']
+        assert 'total' not in changes[0] and 'processed' not in changes[0]
+
+
+def test_failed_conversion_does_not_report_uncommitted_sessions(tmp_path,monkeypatch):
+    sources={sid:_source(sid) for sid in ('first','second')}
+    def read_source(client,owner,catalog,*,limits,**kwargs):
+        if owner[1]=='second':raise ValueError('controlled source failure')
+        source=deepcopy(sources[owner[1]])
+        return source,ingest._weight(source,limits.owner_source_bytes)
+    monkeypatch.setattr(ingest,'read_source',read_source)
+    with storage.PreparedStore(tmp_path/'failed-progress.sqlite') as store:
+        conversion=ingest.PreparedCohort(store,None,None).convert(_catalog(sources),cohort_size=1)
+        first=next(conversion)
+        assert (first['processed'],first['total'])==(1,2)
+        with pytest.raises(ValueError,match='controlled source failure'):next(conversion)
+        with store.read_current() as view:
+            assert [row['owner'] for row in ingest.pages(view.inventory)]==[('home','first')]
+
+
 @pytest.mark.parametrize('operation', ['convert', 'apply', 'publish_ready'])
 @pytest.mark.parametrize(('with_proof', 'tight_budget'), [(False, False), (True, False), (True, True)])
 def test_identical_body_without_optional_proof_reuses_complete_facts(

@@ -949,12 +949,12 @@ class PreparedCohort:
                 # malformed packets, individual limits and WAL pressure do not.
                 pass
             else:
-                yield dict(result, ready=True)
+                yield dict(result, ready=True, processed=len(work), total=len(work))
                 return
         completed = 0
         for group in _groups(work,cohort_size):
-            completed += len(group)
-            ready = metadata_only and not removed or completed == len(work)
+            ready = metadata_only and not removed or completed + len(group) == len(work)
             result = self.apply(catalog,[key for keep,key in group if keep],
                                 [key for keep,key in group if not keep],ready=ready,_parents=parents)
-            yield dict(result,ready=ready)
+            completed += len(group)
+            yield dict(result,ready=ready,processed=completed,total=len(work))

@@ -23,6 +23,7 @@ from .prepared_query import PreparedQuery, token_value, tuple_token
 from .prepared_store import Limits,PreparedStore,WriteDeferred,ReadCancelled,StaleGeneration,CapacityExceeded
 from .quota_cycles import QuotaLedger
 from .usage_collection import CollectionClient, CollectionCatalogUnavailable
+from .preparation_progress import PreparationStage
 
 
 class Mailbox:
@@ -32,22 +33,38 @@ class Mailbox:
         self.condition = Condition()
         self.receiver, self.signal = Pipe(duplex=False)
         self.value = None
+        self.advisory = False
+
+    def offer_progress(self, value):
+        if value.get('kind') != 'progress' or value.get('scope') != 'startup':
+            raise ValueError('only startup progress is advisory')
+        with self.condition:
+            if self.stopped.is_set() or self.value is not None and not self.advisory:
+                return False
+            empty = self.value is None
+            self.value = value
+            self.advisory = True
+            if empty:self.signal.send_bytes(b'1')
+            return True
 
     def put(self, value):
         if retained_bytes(value, 64*1024*1024) > 64*1024*1024:
             raise CapacityExceeded('prepared publication exceeds its delivery budget')
         with self.condition:
-            self.condition.wait_for(lambda:self.value is None or self.stopped.is_set())
+            self.condition.wait_for(lambda:self.value is None or self.advisory or self.stopped.is_set())
             if self.stopped.is_set():
                 return False
+            empty = self.value is None
             self.value = value
-            self.signal.send_bytes(b'1')
+            self.advisory = False
+            if empty:self.signal.send_bytes(b'1')
             return True
 
     def take(self):
         with self.condition:
             self.receiver.recv_bytes()
             value, self.value = self.value, None
+            self.advisory = False
             self.condition.notify_all()
             return value
 
@@ -143,7 +160,27 @@ class PreparedWriter:
 
     def _run(self):
         collector = ledger = store = speed_writer = archive = None
+        initial = True
+        last_progress = None
+        progress_at = 0.
+
+        def progress(stage, processed=None, total=None):
+            nonlocal last_progress, progress_at
+            if not initial:return
+            value = stage, processed, total
+            if value == last_progress:return
+            now = time.monotonic()
+            immediate = (last_progress is None or stage != last_progress[0]
+                         or total and not last_progress[2])
+            if not immediate and now-progress_at < 1:return
+            message = dict(kind='progress', scope='startup', stage=stage.value)
+            if total:
+                message.update(processed=processed, total=total)
+            self.output.offer_progress(message)
+            last_progress, progress_at = value, now
+
         try:
+            progress(PreparationStage.STARTING)
             from .prepared_delivery import PreparedPublisher
             from .quota_diagnostics import StageTimings
             homes,index_path,model_evidence_path,quota_path = self.arguments
@@ -211,7 +248,7 @@ class PreparedWriter:
                 pending_reset=True
 
             def publish(*, reset=False):
-                nonlocal delivery_delta,pending_reset
+                nonlocal delivery_delta,pending_reset,initial
                 pending_reset=pending_reset or reset
                 if blocked_publication==store.token:
                     return
@@ -238,8 +275,9 @@ class PreparedWriter:
                         active.counts[name]=active.counts.get(name,0)+len(light.get(field,()))
                     light['analysis_timing']=active.snapshot()
                     with active.measure('publication_queue'):
-                        self.output.put(dict(kind='snapshot',value=light,token=tuple_token(store.token),
-                                             transition=delivery_delta))
+                        delivered=self.output.put(dict(kind='snapshot',value=light,token=tuple_token(store.token),
+                                                       transition=delivery_delta))
+                        if delivered:initial=False
                 except CapacityExceeded as error:
                     publication_failed(error)
                     return
@@ -413,6 +451,8 @@ class PreparedWriter:
                     try:
                         with cycle.measure('catalog'):
                             catalog=read_catalog(collector,cancel=self.stopped.is_set)
+                        index=catalog['header'].get('index',{})
+                        progress(PreparationStage.COLLECTING,index.get('done'),index.get('files'))
                         catalog_received=True
                         notification=(None if self.frozen.is_set() else
                                       collector.notification_connection(catalog['publication']))
@@ -434,6 +474,7 @@ class PreparedWriter:
                                 publish()
                             next_poll=time.monotonic()+(3 if snapshot is not None else .1)
                         else:
+                            progress(PreparationStage.CONVERTING)
                             if ledger is not None:
                                 try:
                                     with cycle.measure('mode_scan'):
@@ -443,6 +484,8 @@ class PreparedWriter:
                                 cancel=self.stopped.is_set,speed_writer=speed_writer)
                             with cycle.measure('conversion'):
                                 for change in coordinator.convert(catalog):
+                                    if 'processed' in change:
+                                        progress(PreparationStage.CONVERTING,change['processed'],change['total'])
                                     pending_removed.difference_update(change['changed'])
                                     pending_changed.update(change['changed'])
                                     pending_changed.difference_update(change['removed'])
@@ -460,6 +503,7 @@ class PreparedWriter:
                                                 raise InterruptedError('prepared conversion cleanup cancelled')
                                         maintenance_due=False
                             cycle.counts.update(changed_owners=len(pending_changed),removed_owners=len(pending_removed))
+                            progress(PreparationStage.PUBLISHING)
                             for name in ('source_reads','prepared_owners','candidate_rows','append_owners','append_rows','append_fallbacks'):
                                 cycle.counts[name]=getattr(coordinator,'metrics',{}).get(name,0)
                             with cycle.measure('current_speeds'):
@@ -491,6 +535,7 @@ class PreparedWriter:
                             next_poll=0 if ledger_interrupted else time.monotonic()+delay
                             catalog_retries=0
                     except CollectionCatalogUnavailable:
+                        progress(PreparationStage.COLLECTING)
                         cycle.outcome='catalog_retry'
                         # AppServices owns collector startup and restart. The
                         # query writer never starts a duplicate source reader.

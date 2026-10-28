@@ -4,6 +4,16 @@ Item {
     id: root
     required property var presentation
     readonly property var s: presentation.state
+    readonly property string preparationStatus: s.preparationStatus || ""
+    readonly property bool preparationVisible: !!s.overlayVisible && preparationStatus.length > 0
+    property string announcedPreparation: ""
+    onPreparationStatusChanged: announcePreparation()
+    onPreparationVisibleChanged: if (preparationVisible) announcePreparation()
+    function announcePreparation() {
+        if (!preparationVisible || preparationStatus === announcedPreparation) return
+        announcedPreparation = preparationStatus
+        if (appTheme.accessibilityActive) Accessible.announce(preparationStatus)
+    }
     QuickPlot { anchors.fill: parent; source: parent.presentation }
     Repeater {
         model: root.s.mainHeartbeats || []

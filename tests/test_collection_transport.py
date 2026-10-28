@@ -210,7 +210,11 @@ def test_analyzer_publication_wakes_before_timer_and_freeze_reclaims_waiter(tmp_
         while True:
             remaining=deadline-time.monotonic()
             assert remaining>0 and parent.poll(remaining)
-            first=parent.recv();assert first['kind']=='snapshot',first
+            first=parent.recv()
+            if first['kind']=='progress':
+                assert first.get('scope')=='startup',first
+                continue
+            assert first['kind']=='snapshot',first
             if first['value'].get('ledger_status_known'):break
         wait_until(lambda:bool(writer.live.waiters))
         changed=copy.deepcopy(value);changed['ts']+=.25

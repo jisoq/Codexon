@@ -27,7 +27,25 @@ REMOTE_DESCRIPTION='이 오버레이는 로컬 세션만 지원하며, 원격 �
 
 
 def notice_geometry(m):
-    return dict(header=TITLE_Y,total=44,status=38,context=52,body=52,body_height=0,height=72,full_height=72)
+    layout=dict(header=TITLE_Y,total=44,status=38,context=52,body=52,body_height=0,height=72,full_height=72)
+    if m.preparation:
+        from PySide6.QtCore import QRect,Qt
+        from PySide6.QtGui import QFontMetrics
+        from .overlay_view import font
+        state=m.preparation
+        y=44
+        rows=[]
+        footer=' / '.join(filter(None,(state.get('progressText'),state['elapsedText'])))
+        for text,size,weight,color in ((state['title'],14,600,'ink'),(state['detail'],12,400,'secondary'),
+                                       (footer,11,400,'secondary')):
+            metrics=QFontMetrics(font(m.appearance.family,size,weight))
+            height=max(metrics.height(),metrics.boundingRect(QRect(0,0,SECTION_WIDTH,1000),Qt.TextWordWrap,text).height())
+            rows.append((text,y,height,size,weight,color))
+            y+=height+8
+        if state.get('total'):y+=7
+        height=y+8
+        layout.update(body=44,body_height=height-44,height=height,full_height=height,preparation_rows=rows)
+    return layout
 
 
 def partial_text(data):
@@ -153,6 +171,17 @@ def _chart(d,m,rows,key,label,y,height,displayed):
 
 
 def paint(d,m):
+    if m.preparation:
+        from .i18n import Verbatim
+        g=m.layout()
+        for text,y,height,size,weight,color in g['preparation_rows']:
+            d.text(Verbatim(text),MARGIN,y,SECTION_WIDTH,height,size,color,weight,wrap=True)
+        state=m.preparation
+        if state.get('total'):
+            y=g['height']-15
+            d.rect(MARGIN,y,SECTION_WIDTH,3,'border',radius=1.5)
+            d.rect(MARGIN,y,SECTION_WIDTH*state['processed']/state['total'],3,'accent',radius=1.5)
+        return
     if m.notice_card():return
     from .overlay_view import paint_items,money
     from .overlay_icons import agent_mark

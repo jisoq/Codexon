@@ -266,7 +266,7 @@ def test_prepared_shutdown_cancellation_is_not_reported_as_a_failure(tmp_path,mo
     writer.arguments=[],tmp_path/'index.sqlite',None,tmp_path/'quota.sqlite'
     writer.stopped=Event()
     if stopping:writer.stopped.set()
-    writer.output=SimpleNamespace(put=messages.append)
+    writer.output=SimpleNamespace(put=messages.append,offer_progress=lambda message:True)
     def cancelled(*args,**kwargs):raise storage.ReadCancelled('cancelled work')
     monkeypatch.setattr(prepared_runtime,'CollectionClient',cancelled)
     writer._run()
@@ -287,7 +287,7 @@ def test_prepared_failures_keep_sanitized_diagnostics_without_static_fallthrough
     writer = object.__new__(prepared_runtime.PreparedWriter)
     writer.arguments = [], tmp_path/'index.sqlite', tmp_path/'evidence.sqlite', quota
     writer.stopped = Event()
-    writer.output = SimpleNamespace(put=messages.append)
+    writer.output = SimpleNamespace(put=messages.append,offer_progress=lambda message:True)
     writer._run()
     assert messages.pop()['kind']=='fatal'
 

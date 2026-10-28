@@ -364,6 +364,7 @@ class OverlayContent(Node):
         self.selected_id=None;self.selected_snapshot=None;self.follow_latest=True;self.graph_pinned=False;self.quota_lines=('','')
         self.monitor_tab='history';self.composition_unit='usd';self.lower_offset=0;self.settings=None
         self._freshness_label=''
+        self.preparation=None
         self.highlight_id=None;self._highlight_timer=QTimer(self);self._highlight_timer.setSingleShot(True)
         self._highlight_timer.timeout.connect(self.clear_highlight)
         self.highlight_style=HighlightStyle.RIBBON;self.row_glows=RowGlows()
@@ -388,16 +389,18 @@ class OverlayContent(Node):
     def notice_card(self):
         from .overlay_monitor import REMOTE_HEADING,REMOTE_DESCRIPTION
         if self.is_remote:return REMOTE_HEADING,REMOTE_DESCRIPTION
+        if self.preparation:return self.preparation['title'],self.preparation['detail']
         if not self.data and self.note=='분석 오류':
             return self.note,'분석 결과를 표시하지 못했습니다. 문제 해결 화면에서 오류를 확인해 주세요.'
         if not self.data and self.note=='갱신 중':
             return self.note,'새 분석 결과를 기다리고 있습니다.'
         if self.note=='기록 준비 중' and (not self.data or 'calls' not in self.data):
             return '기록 준비 중','세션 기록에서 호출별 사용량을 읽고 있습니다.'
-        if not self.data and self.note in ('수집 오류','수집 지연','수집 시작 중'):
+        if not self.data and self.note in ('수집 오류','수집 지연','수집 시작 중','사용 기록 수집 중지'):
             return self.note, {'수집 오류':'사용량 수집을 확인하지 못했습니다. 문제 해결 화면에서 오류를 확인해 주세요.',
                                '수집 지연':'새 수집 결과가 도착하지 않았습니다. 마지막 수집 상태를 확인해 주세요.',
-                               '수집 시작 중':'수집기 실행을 요청했습니다. 새 수집 결과를 기다리고 있습니다.'}[self.note]
+                               '수집 시작 중':'수집기 실행을 요청했습니다. 새 수집 결과를 기다리고 있습니다.',
+                               '사용 기록 수집 중지':'자동 수집이 중지되었습니다. 확인된 기록은 계속 표시합니다.'}[self.note]
         if self.note in ('기록 확인 중','세션 기록 확인 중','기록 수집 중 (잠정값)') and not (self.data or {}).get('_collection',{}).get('retained'):
             return '기록 준비 중','세션 기록에서 호출별 사용량을 읽고 있습니다.'
         return None
@@ -435,7 +438,7 @@ class OverlayContent(Node):
         if values==(self.compact,self.detail_open,self.detail_inline):return
         self.compact,self.detail_open,self.detail_inline=values;self.lower_offset=0;self.detail_width=SECTION_WIDTH-8
         self.sync_details();self.update()
-    def set_content(self,data,note='',dark=True,appearance=None):
+    def set_content(self,data,note='',dark=True,appearance=None,*,preparation=None):
         # An incomplete refresh is not evidence that confirmed agents disappeared.
         old=self.data or {};incoming=data or {};collection=incoming.get('_collection',{})
         same_scope=(incoming.get('home'),incoming.get('id'))==(old.get('home'),old.get('id'))
@@ -447,10 +450,16 @@ class OverlayContent(Node):
         checking=checking or note=='기록 준비 중' and bool((data or {}).get('_collection',{}).get('loading'))
         if data and checking and not data.get('_collection',{}).get('retained'):data={key:data[key] for key in ('id','home','title') if key in data}
         if note.startswith('원격 작업') or note=='현재 세션 식별 불가':data=None
+        waiting=note in ('기록 준비 중','기록 확인 중','세션 기록 확인 중','기록 수집 중 (잠정값)','갱신 중','호출 기록 없음','')
+        if (preparation is not None and waiting and not (data or {}).get('calls')
+                and not (data or {}).get('_collection',{}).get('retained')):
+            from .preparation_progress import preparation_loading
+            loading=preparation_loading(preparation,now=time.monotonic())
+        else:loading=None
         def visible(value):
             return {k:v for k,v in (value or {}).items() if k!='_collection'} | {'_errors':(value or {}).get('_collection',{}).get('errors',[])}
         freshness=self.collection_age(data,note)
-        if (visible(data),note,appearance,freshness)==(visible(self.data),self.note,self.appearance,self._freshness_label):
+        if (visible(data),note,appearance,freshness,loading)==(visible(self.data),self.note,self.appearance,self._freshness_label,self.preparation):
             self.data=data
             return
         old=(self.data or {}).get('id'),(self.data or {}).get('home');new=(data or {}).get('id'),(data or {}).get('home')
@@ -459,7 +468,7 @@ class OverlayContent(Node):
             self.selected_id=None;self.selected_snapshot=None;self.follow_latest=True;self.graph_pinned=False
             self.expanded_groups.clear()
             self.put(mainFocused=False,detailFocusKey='')
-        self.data=data;self.note=note;self.appearance=appearance;self.dark=appearance.dark
+        self.data=data;self.note=note;self.appearance=appearance;self.dark=appearance.dark;self.preparation=loading
         if self.expanded_groups:
             finance=self.detail_data()
             valid={self.detail_group_key(row,mode) for mode,field in (('model','models'),('sub','agents'))
@@ -627,7 +636,8 @@ class OverlayContent(Node):
                  overlayWarning=colors['warning'].name(),overlayBand=colors['band'].name(),overlaySelection=colors['selection'].name(),overlaySecondary=colors['secondary'].name(),
                  overlayInteractionTint=colors['interaction_tint'].name(),
                  detailHasSession=bool((self.data or {}).get('id')),detailSessionKey=str(((self.data or {}).get('home'),(self.data or {}).get('id'))),
-                 detailActions=actions,heartbeatActive=heartbeat['mode']=='active',heartbeatCount=heartbeat['count'],totalRowVisible=True,
+                 preparationStatus=self.preparation['title'] if self.preparation else '',
+                 detailActions=actions,heartbeatActive=heartbeat['mode']=='active',heartbeatCount=heartbeat['count'],totalRowVisible=not bool(self.preparation),
                  heartbeatMode=heartbeat['mode'],heartbeatColor=heartbeat['color'],heartbeatLabel=heartbeat['label'],heartbeatMessage=heartbeat['message'],
                  heartbeatX=heartbeat['x'],heartbeatY=heartbeat['y'])
         self._body.update()
@@ -778,6 +788,9 @@ class OverlayContent(Node):
         return 84+24*(rows-1)
     def composition_height(self):return 0 if self.compact else self.composition_full_height()
     def lines(self):
+        if self.preparation:
+            return [self.display_title(),self.preparation['title'],self.preparation['detail'],
+                    self.preparation.get('progressText',''),self.preparation['elapsedText']]
         if self.notice_card():return [self.display_title(),*[tr(text) for text in self.notice_card()]]
         d=self.data or {};own=main_usage(d);a,b=self.context()
         return [d.get('title',''),a,b,percent(d.get('cache_rate')),money(own.get('cost')),money(own.get('mean_cost')),money(d.get('latest_cost')),

@@ -131,6 +131,17 @@ class _CommandSendState:
     error: Exception | None = None
 
 
+def _preparation_progress(message):
+    from .preparation_progress import PreparationStage, PreparationWork
+    try:stage=PreparationStage(message.get('stage'))
+    except ValueError:return None
+    done,total=message.get('processed'),message.get('total')
+    if (stage in (PreparationStage.COLLECTING,PreparationStage.CONVERTING)
+            and type(done) is int and type(total) is int and 0<=done<=total and total>0):
+        return PreparationWork(stage,done,total)
+    return stage
+
+
 class AnalysisBridge(QThread):
     # These Python payloads are consumed as read-only values on the GUI thread.
     # Avoid recursive QVariantMap conversion of the complete analysis graph.
@@ -295,7 +306,11 @@ class AnalysisBridge(QThread):
                                 receiver=SnapshotReceiver();continue
                             if value is not None:self.snapshot.emit(value)
                         elif message['kind'] in ('overlay_detail','result','stale','mismatch_page','mismatch_record'):self._deliver_result(message)
-                        elif message['kind']=='progress':self.progress.emit(message)
+                        elif message['kind']=='progress':
+                            if message.get('scope')=='startup':
+                                progress=_preparation_progress(message)
+                                if progress is not None:self.progress.emit(progress)
+                            else:self.progress.emit(message)
                         elif message['kind'] in ('error','fatal'):
                             self.failure.emit(message['error'])
                             self.fault.emit(dict(query_failed=message['kind']=='error' and message.get('consumer')!='publication',

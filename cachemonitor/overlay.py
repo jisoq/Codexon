@@ -155,6 +155,7 @@ class OverlayController(QObject):
         self.sessions = []
         self.session_lookup = {}
         self.loading = True
+        self.preparation = None
         self.errors = []
         self.collection_issue = ''
         self.collection_fault = {}
@@ -616,6 +617,7 @@ class OverlayController(QObject):
         self.refresh()
 
     def receive_snapshot(self, snapshot):
+        self.preparation=None
         self._analysis_failed=False
         self.sessions = snapshot.get('overlay_sessions', [])
         self.session_lookup={}
@@ -643,6 +645,11 @@ class OverlayController(QObject):
         self.collection_stale = bool(snapshot.get('collection_stale'))
         if not self.errors and not self.collection_stale:
             self.snapshot_wall_time = snapshot.get('last_usage_collection_success') or snapshot.get('ts')
+        self.refresh()
+
+    def receive_preparation(self, pending):
+        if self.preparation==pending:return
+        self.preparation=pending
         self.refresh()
 
     def receive_collection_observation(self,value):
@@ -690,7 +697,8 @@ class OverlayController(QObject):
                 'service_preparing' if preparing else 'service_delay' if delayed else
                 'analysis_delay' if updating else '')
         note = ('분석 오류' if getattr(self,'_analysis_failed',False) else
-                '수집 오류' if service_error or self.errors else '기록 준비 중' if preparing else
+                '수집 오류' if service_error or self.errors else
+                '사용 기록 수집 중지' if phase=='stopped' and len(matches)<=1 else '기록 준비 중' if preparing else
                 '수집 지연' if delayed else '갱신 중' if updating else '')
         if len(matches) != 1:
             return None, note or ('기록 확인 중' if self.loading else '호출 기록 없음' if not matches else '현재 세션 식별 불가')
@@ -796,7 +804,9 @@ class OverlayController(QObject):
         return (age>ANALYSIS_DELAY_SECONDS,
                 self.retained_detail_delayed(data),
                 OverlayController.collection_phase(self),
-                OverlayContent.collection_age(data,self.widget.note))
+                OverlayContent.collection_age(data,self.widget.note),
+                max(0,int(time.monotonic()-self.preparation.started_at))
+                if self.preparation is not None and self.widget.content_model.preparation else None)
 
     def _refresh_appearance(self):
         now=time.monotonic()
@@ -869,7 +879,9 @@ class OverlayController(QObject):
         if not self.drag_context:self._load_collapsed()
         data,note=(self.widget.data,self.widget.note) if self.drag_context else self.content()
         if not self.drag_context:
-            self.widget.set_content(data, note, appearance=self.appearance)
+            preparation=(self.preparation if selection.host=='local'
+                         and len(self.session_lookup.get(selection.thread_id,[]))<=1 else None)
+            self.widget.set_content(data, note, appearance=self.appearance,preparation=preparation)
             self._content_time_state=self._content_time()
         from .overlay_tracking import anchored_monitor_geometry
         scale=self.appearance.scale
@@ -1021,6 +1033,9 @@ def install_overlay(window, native_enabled=True):
     from PySide6.QtWidgets import QMenu
     controller = OverlayController(window.settings, native_enabled=native_enabled)
     window.overlay = controller
+    if getattr(window,'preparation',None) is None and 'overlay_sessions' in window.snapshot:
+        controller.receive_snapshot(window.snapshot)
+    controller.receive_preparation(getattr(window,'preparation',None))
     if getattr(window,'worker',None) and hasattr(window.worker,'request_overlay_detail'):
         controller.overlay_loader=window.worker.request_overlay_detail
         window.worker.overlay_detail.connect(controller.receive_overlay_detail)
