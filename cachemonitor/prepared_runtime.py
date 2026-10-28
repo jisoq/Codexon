@@ -4,6 +4,7 @@ The process connection belongs to the dispatcher. The writer owns collection,
 ledger and prepared-store connections; the page and detail actors own separate
 read-only connections. None may send on the GUI connection from a background thread.
 """
+from itertools import chain
 from multiprocessing import Pipe
 from multiprocessing.connection import wait
 from dataclasses import replace
@@ -222,7 +223,7 @@ class PreparedWriter:
             ledger_retry = next_poll = next_import = 0.
             last_timing = float('-inf')
             delivery_delta=None
-            pending_changed=set();pending_removed=set();ledger_removed=set()
+            pending_changed=set();pending_removed=set();ledger_removed=set();ledger_changed=set()
             maintenance_due=True
             ledger_pending=False
             pending_reset=False
@@ -342,6 +343,8 @@ class PreparedWriter:
                     publish()
 
             def capture_archive(owners=None):
+                if owners is None and catalog is not None and catalog.get('authority')=='selected':
+                    owners=catalog['owners']
                 scope=store.read_current(cancel=self.stopped)
                 view=scope.__enter__()
                 try:
@@ -371,18 +374,24 @@ class PreparedWriter:
                               collector.notification_connection(notification_publication))
                 poll_at=time.monotonic()+3
                 complete=catalog.get('aggregate_complete',True)
-                if ledger is not None and (complete or catalog['owners'] or snapshot.get('request_activity')):
+                if ledger is not None and (complete or catalog['owners'] or ledger_changed or snapshot.get('request_activity')):
                     try:
                         envelope=snapshot if complete else dict(snapshot,collection_partial=True)
-                        batches=adapter.sync(envelope,removed=ledger_removed if complete else ())
+                        owners=(chain(catalog['owners'],(owner for owner in ledger_changed if owner not in catalog['owners']))
+                                if catalog.get('authority')=='selected' else None)
+                        batches=adapter.sync(envelope,removed=ledger_removed if complete else (),owners=owners)
                         try:
                             for batch in batches:
                                 ledger_removed.difference_update(batch.get('retired',()))
+                                ledger_changed.difference_update(batch.get('owners',()))
                                 if self.stopped.is_set():
                                     raise InterruptedError('prepared ledger interrupted between durable batches')
                                 # A yielded batch is durable. Abandon this inventory
                                 # before new facts arrive; the next sync starts from
                                 # committed proofs, never resumes an old generator.
+                                if cancelled():
+                                    interrupted=True
+                                    break
                                 if not batch['remaining'] or self.frozen.is_set():continue
                                 if notification is not None and notification.poll():
                                     notice=collector.consume_notification(notification_publication)
@@ -393,6 +402,7 @@ class PreparedWriter:
                                 if interrupted:break
                         finally:batches.close()
                         if not interrupted:
+                            ledger_changed.clear()
                             if snapshot.get('activity_live_cursor'):collector.channel.acknowledge_activity(snapshot)
                             if complete:
                                 if snapshot.get('activity_cursor'):collector.channel.acknowledge_activity(snapshot)
@@ -502,7 +512,7 @@ class PreparedWriter:
                     catalog_installed=False
                     try:
                         with cycle.measure('catalog'):
-                            catalog=read_catalog(collector,store=store,cancel=self.stopped.is_set)
+                            catalog=read_catalog(collector,store=store,cancel=cancelled)
                         demand=catalog['header'].get('demand')
                         if demand is not None and (any(list(owner) not in demand['selected'] for owner in selected)
                                 or aggregate is not None and not demand['aggregate']):
@@ -536,8 +546,10 @@ class PreparedWriter:
                             progress(PreparationStage.CONVERTING)
                             coordinator=PreparedCohort(store,collector,ledger,
                                 cancel=cancelled,speed_writer=speed_writer)
-                            with store.read_current(seconds=60) as current_view:
-                                expanding=catalog.limit_additions(coordinator._inventory(current_view),16)
+                            expanding=False
+                            if catalog.get('authority')!='selected':
+                                with store.read_current(seconds=60) as current_view:
+                                    expanding=catalog.limit_additions(coordinator._inventory(current_view),16)
                             if ledger is not None:
                                 try:
                                     with cycle.measure('mode_scan'):
@@ -554,6 +566,8 @@ class PreparedWriter:
                                         progress(PreparationStage.CONVERTING,change['processed'],change['total'])
                                     pending_removed.difference_update(change['changed'])
                                     pending_changed.update(change['changed'])
+                                    ledger_changed.update(change['changed'])
+                                    ledger_changed.difference_update(change['removed'])
                                     pending_changed.difference_update(change['removed'])
                                     pending_removed.update(change['removed'])
                                     if catalog.get('aggregate_complete',True):
@@ -594,7 +608,7 @@ class PreparedWriter:
                             aggregate_complete=catalog.get('aggregate_complete',True)
                             snapshot['aggregate_request']=aggregate if aggregate_complete else None
                             ledger_pending=ledger is not None and bool(catalog.get('aggregate_complete',True)
-                                or catalog['owners'] or snapshot.get('request_activity'))
+                                or catalog['owners'] or ledger_changed or snapshot.get('request_activity'))
                             if previous!=store.token:
                                 # A verified display need not await independent
                                 # accounting replay. Its pending status is explicit.

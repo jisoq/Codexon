@@ -6,7 +6,7 @@ from typing import cast
 import sys
 
 from . import quota_prepared_sync as progress
-from .prepared_ingest import _weight, pages
+from .prepared_ingest import _groups, _weight, pages
 from .prepared_store import CapacityExceeded, NotReady, StaleGeneration, ReadCancelled, Page, pack, unpack
 
 
@@ -85,7 +85,7 @@ class PreparedLedger:
                                ((row[0],) for row in rows))
                 db.commit()
 
-    def _stage_plan(self, envelope, removed):
+    def _stage_plan(self, envelope, removed, owners=None):
         db = self.ledger.db
         if db.in_transaction:
             raise RuntimeError('prepare the source plan before starting quota application')
@@ -133,10 +133,29 @@ class PreparedLedger:
 
         cached = None
         try:
-            cached = self._sources()
+            if owners is None:
+                cached = self._sources()
         except _SourcePopulationAdmission:
             pass
-        if cached is not None:
+        if owners is not None:
+            with self.store.read_current(cancel=self.cancel,seconds=60) as view:
+                self._require_view(view)
+                token = view.token
+                for group in _groups(owners,OWNER_BATCH):
+                    headers = list(view.pages(view.owner_revisions,group))
+                    if len(headers) != len(group):
+                        raise NotReady('selected ledger plan references an absent owner')
+                    with closing(self._source_entries(view,headers,self._source_cache)) as entries:
+                        for header,entry in entries:
+                            key = header['owner']
+                            previous = self._source_cache.get(key)
+                            if previous is not None and previous[0]==header['revision']:
+                                source = previous[1]
+                            else:
+                                _,source,_,_ = self._source_slot(key,header['revision'],entry)
+                                self.metrics['metadata_reads'] = self.metrics.get('metadata_reads',0)+1
+                            stage_source(key,source,source['usage_revision'])
+        elif cached is not None:
             sources, certificates = cached
             del cached
             token = self._source_token
@@ -157,13 +176,16 @@ class PreparedLedger:
                     stage_source(key, source, source['usage_revision'])
                     del source, entry
         self._check_plan(token)
-        self._source_token = token
+        if owners is None:
+            self._source_token = token
         for number, owner in enumerate(removed, 1):
             db.execute('INSERT OR IGNORE INTO temp.prepared_ledger_retired VALUES(?,?)', owner)
             if number % OWNER_BATCH == 0:
                 self._check_plan(token)
                 db.commit()
         db.commit()
+        if owners is not None:
+            return token
         after = None
         while True:
             self._check_plan(token)
@@ -444,10 +466,14 @@ class PreparedLedger:
         self.metrics['owner_reads']+=1;self.metrics['call_rows']+=len(rows);self.metrics['request_rows']+=len(boundaries)
         return dict(history=rows,turn_records=boundaries),size,dict(transition,policy=policy)
 
-    def sync(self, envelope, *, removed=()):
+    def sync(self, envelope, *, removed=(), owners=None):
         """Yield durable batches with a boolean signal for remaining work."""
         db = self.ledger.db
-        token = self._stage_plan(envelope, removed)
+        if owners is not None:
+            if removed:
+                raise ValueError('a selected ledger plan cannot retire owners')
+            envelope = dict(envelope,collection_partial=True)
+        token = self._stage_plan(envelope, removed, owners)
         while True:
             self._check_plan(token)
             rows = db.execute('SELECT home,sid FROM temp.prepared_ledger_retired '

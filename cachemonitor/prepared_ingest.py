@@ -491,12 +491,17 @@ class PreparedCohort:
 
     def _speed_inventory(self):
         current=self.speed_writer.owner_stamps(self.store.token)
-        if current is not None:return dict(current)
+        selected = getattr(self,'catalog',{}).get('authority')=='selected'
         result={}
         with self.store.read_current(seconds=60) as view:
-            for entry in pages(view.catalog):
-                if entry['dependencies'].get('prepared') and not entry['metadata'].get('_internal_review'):
-                    result[entry['owner']]=self._speed_stamp(entry)
+            if not selected and current is not None and not view.db.execute(
+                    'SELECT selection_batch FROM meta WHERE singleton=1').fetchone()[0]:
+                return dict(current)
+            entries = ((owner,view.owner(*owner)) for owner in self.catalog['owners']) if selected else (
+                (entry['owner'],entry) for entry in pages(view.catalog))
+            for owner,entry in entries:
+                if entry is not None and entry['dependencies'].get('prepared') and not entry['metadata'].get('_internal_review'):
+                    result[owner]=current[owner] if current is not None and owner in current else self._speed_stamp(entry)
         return result
 
     def current_speeds(self):
@@ -883,6 +888,8 @@ class PreparedCohort:
                 current_speed={key:value for key,value in previous_speed.items() if key not in removed}
                 with self.store.read_current(staged=True,seconds=60) as view:
                     for owner in affected:
+                        if selected and owner not in catalog['owners']:
+                            continue
                         entry=view.owner(*owner)
                         if entry['metadata'].get('_internal_review'):
                             current_speed.pop(owner,None)
