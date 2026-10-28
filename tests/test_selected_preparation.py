@@ -194,3 +194,116 @@ def test_format7_cache_rebuilds_before_selected_authority_is_read(tmp_path, sour
         assert store.db.execute('SELECT format,selection_batch FROM meta').fetchone()[:] == (8,0)
         list(ingest.PreparedCohort(store,None,None).convert(catalog(sources,2,family=('a',))))
         assert store.db.execute('SELECT selection_batch FROM meta').fetchone()[0] > 0
+
+@pytest.mark.parametrize('consumer',['speed','publisher'])
+def test_selected_consumers_do_not_read_unrelated_metadata(tmp_path, monkeypatch, source_reader, consumer):
+    from cachemonitor.prepared_delivery import PreparedPublisher
+    sources = source_reader
+    sources.update(a=source('a'), unrelated=source('unrelated'), b=source('b'))
+    with storage.PreparedStore(tmp_path/'consumers.sqlite') as store:
+        list(ingest.PreparedCohort(store,None,None).convert(catalog(sources)))
+        selected = catalog(sources,2,family=('b','a'))
+        coordinator = ingest.PreparedCohort(store,None,None)
+        list(coordinator.convert(selected))
+        original_catalog = storage.Snapshot.catalog
+        original_owner = storage.Snapshot.owner
+        def bounded_catalog(view, **kwargs):
+            result = original_catalog(view,**kwargs)
+            assert all(row['owner'] != ('home','unrelated') for row in result.rows)
+            return result
+        def bounded_owner(view, home, sid, **kwargs):
+            assert sid != 'unrelated'
+            return original_owner(view,home,sid,**kwargs)
+        monkeypatch.setattr(storage.Snapshot,'catalog',bounded_catalog)
+        monkeypatch.setattr(storage.Snapshot,'owner',bounded_owner)
+        if consumer=='speed':
+            received=[]
+            coordinator.speed_writer=SimpleNamespace(owner_stamps=lambda token:None,
+                current_results=lambda owners,identity:received.append(tuple(owners)) or {},
+                checkpoint_recovery_needed=False)
+            assert coordinator.current_speeds()=={}
+            assert received==[(('home','b'),('home','a'))]
+        else:
+            publisher=PreparedPublisher(0)
+            publisher.adopt(store,(),selected=selected['selected_members'])
+            published=publisher.publish(dict(homes=['home'],ts=400),store,{})
+            assert [row['id'] for row in published['sessions']]==['b','a']
+            assert list(publisher.owners)==[('home','b'),('home','a')]
+
+
+def test_selected_ledger_patch_preserves_unrelated_certificates_and_coverage(
+        tmp_path, monkeypatch, source_reader):
+    from contextlib import closing
+    from cachemonitor.prepared_ledger import PreparedLedger
+    from cachemonitor.quota_cycles import QuotaLedger
+    from cachemonitor import quota_prepared_sync as progress
+    from test_prepared_ledger_reuse import _envelope
+    sources = source_reader
+    sources.update(a=source('a'), unrelated=source('unrelated'))
+    with closing(QuotaLedger(tmp_path/'quota.sqlite')) as ledger, storage.PreparedStore(tmp_path/'ledger.sqlite') as store:
+        list(ingest.PreparedCohort(store,None,None).convert(catalog(sources)))
+        adapter=PreparedLedger(ledger,store)
+        list(adapter.sync(_envelope()))
+        previous=progress.applied(ledger.db,[('home','unrelated')])
+        certificate=tuple(ledger.db.execute('SELECT request_digest,policy FROM temp.prepared_ledger_requests '
+            "WHERE home='home' AND sid='unrelated'").fetchone())
+        complete_at=ledger.db.execute("SELECT complete_at FROM state WHERE home='home'").fetchone()[0]
+        sources['a']=source('a',amount=101)
+        list(ingest.PreparedCohort(store,None,None).convert(catalog(sources,2,family=('a',))))
+        revisions=storage.Snapshot.owner_revisions
+        def bounded_revisions(view, owners=None, **kwargs):
+            assert owners is not None and set(owners)<={('home','a')}
+            return revisions(view,owners,**kwargs)
+        monkeypatch.setattr(storage.Snapshot,'owner_revisions',bounded_revisions)
+        results=list(adapter.sync(dict(_envelope(201),collection_partial=True),owners=(('home','a'),)))
+        assert results[-1]['remaining'] is False
+        assert progress.applied(ledger.db,[('home','unrelated')])==previous
+        assert tuple(ledger.db.execute('SELECT request_digest,policy FROM temp.prepared_ledger_requests '
+            "WHERE home='home' AND sid='unrelated'").fetchone())==certificate
+        assert ledger.db.execute("SELECT complete_at FROM state WHERE home='home'").fetchone()[0]==complete_at
+        assert [tuple(row) for row in ledger.db.execute('SELECT sid,input FROM calls ORDER BY sid')]==[
+            ('a',101),('unrelated',100)]
+
+
+def test_unavailable_outside_competitor_requests_exact_evidence_without_publishing(tmp_path,source_reader):
+    sources=source_reader
+    sources.update(a=source('a',response='shared'),z=source('z',response='shared'))
+    requested=[]
+    client=SimpleNamespace(request_sources=lambda owners:requested.extend(owners))
+    with storage.PreparedStore(tmp_path/'missing-competitor.sqlite') as store:
+        list(ingest.PreparedCohort(store,None,None).convert(catalog(sources)))
+        previous=store.token
+        sources['a']=source('a',response='new')
+        with pytest.raises(ingest.CollectionCatalogUnavailable):
+            list(ingest.PreparedCohort(store,client,None).convert(catalog(sources,2,family=('a',))))
+        assert requested==[('home','z')]
+        assert store.token==previous
+        with store.read_current() as view:
+            assert view.record('home','a','shared')['input']==100
+            assert view.record('home','z','shared') is None
+
+
+def test_cancelled_selected_cohort_can_switch_through_aggregate(tmp_path,source_reader):
+    sources=source_reader
+    sources.update(a=source('a'),b=source('b'),unrelated=source('unrelated'))
+    stopped=[False]
+    with storage.PreparedStore(tmp_path/'cancel.sqlite') as store:
+        list(ingest.PreparedCohort(store,None,None).convert(catalog(sources)))
+        with storage.PreparedReader(store.path) as reader,reader.pin(store.token) as pinned:
+            sources['a']=source('a',amount=101)
+            sources['b']=source('b',amount=102)
+            updates=ingest.PreparedCohort(store,None,None,cancel=lambda:stopped[0]).convert(
+                catalog(sources,2,family=('b','a')),cohort_size=1)
+            first=next(updates)
+            assert first['ready'] is False
+            stopped[0]=True
+            with pytest.raises(InterruptedError):next(updates)
+            assert pinned.record('home','a','a-response')['input']==100
+            assert pinned.record('home','b','b-response')['input']==100
+        list(ingest.PreparedCohort(store,None,None).convert(catalog(sources,3)))
+        list(ingest.PreparedCohort(store,None,None).convert(catalog(sources,4,family=('a',))))
+        with store.read_current() as view:
+            assert view.record('home','unrelated','unrelated-response')['input']==100
+            assert view.record('home','b','b-response')['input']==102
+        with storage.PreparedReader(store.path) as reader,reader.pin(store.token) as view:
+            assert [row['owner'] for row in ingest.pages(view.catalog)]==[('home','a')]
