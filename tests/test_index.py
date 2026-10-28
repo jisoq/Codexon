@@ -1305,3 +1305,48 @@ def test_discovery_preserves_selected_metadata_projection_admission(tmp_path,mon
         assert failed['usage_errors'] and failed['collection_fault']['read_failed']
         assert not any(row[1]==sid for row in failed['session_catalog'])
     finally:index.close()
+
+
+@pytest.mark.parametrize('catalogued',[False,True],ids=['source-only','catalogued'])
+def test_unchanged_index_reuses_discovered_child_identity_and_lineage(tmp_path,catalogued):
+    home,_=fixture_home(tmp_path)
+    path,sid=discovery_child(home,4096,catalogued=catalogued)
+    cache=tmp_path/'index.sqlite'
+    for reopened in (False,True):
+        index=UsageIndex([home],cache)
+        index.demand=dict(selected=[(None,TID)],aggregate=False,evidence=[])
+        try:
+            complete=finish(index)
+            assert complete['catalog_complete'] and complete['usage_collection_complete']
+            assert [str(home.resolve()),sid,TID] in complete['session_catalog']
+            assert {row['key'] for row in analyze(complete['sessions'])['responses']}=={'r1','child-response'}
+            if reopened:assert index.bytes_read==0
+        finally:index.close()
+
+
+@pytest.mark.parametrize('parent',[None,'12345678-abcd-abcd-abcd-444444444444'],ids=['root','other-parent'])
+def test_replaced_indexed_header_replaces_persisted_lineage_before_reopen(tmp_path,parent):
+    import os
+    home,_=fixture_home(tmp_path)
+    path,sid=discovery_child(home,4096)
+    cache=tmp_path/'index.sqlite'
+    index=UsageIndex([home],cache)
+    try:assert [str(home.resolve()),sid,TID] in finish(index)['session_catalog']
+    finally:index.close()
+    original=path.stat();replacement=path.with_suffix('.replacement')
+    content=json.dumps(event('session_meta',id=sid,parent_thread_id=parent,ignored='x'*1024))+'\n'
+    content+=json.dumps(usage('replacement',tid=sid))+'\n'
+    replacement.write_text(content,encoding='utf8')
+    os.utime(replacement,ns=(original.st_atime_ns,original.st_mtime_ns))
+    replacement.replace(path)
+    for reopened in (False,True):
+        index=UsageIndex([home],cache)
+        try:
+            complete=finish(index)
+            assert complete['catalog_complete'] and complete['usage_collection_complete'] and not complete['usage_errors']
+            assert [str(home.resolve()),sid,parent] in complete['session_catalog']
+            if parent is None:
+                assert next(session for session in complete['sessions'] if session['id']==sid)['source']!='subagent'
+            assert {row['key'] for row in analyze(complete['sessions'])['responses']}=={'r1','replacement'}
+            if reopened:assert index.bytes_read==0
+        finally:index.close()

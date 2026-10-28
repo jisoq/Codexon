@@ -318,13 +318,19 @@ class UsageIndex:
         self.header_pending.add(path);signature=None;state=None
         try:
             st=Path(path).stat();signature=(st.st_size,st.st_mtime_ns,str(st.st_ino))
+            state=self.source_work.get(path)
+            saved=self.db.execute('SELECT home,tid,offset,size,mtime,inode FROM files WHERE path=?',(path,)).fetchone()
+            if (saved is not None and saved[0]==str(home) and saved[1] and saved[2]>0
+                    and (tid is None or saved[1]==tid) and tuple(saved[3:])==signature
+                    and (str(home),saved[1]) in self.metadata):
+                self.header_pending.discard(path)
+                return saved[1]
             partial=self.partial_work.get(path)
             if partial is not None and partial.get('header_pending'):
                 if partial['signature']==signature:
                     if partial.get('error'):raise ValueError('Invalid source header')
                     return tid
                 self.partial_work.pop(path)
-            state=self.source_work.get(path)
             if state is None:
                 if len(self.source_work)>=MAX_SOURCE_WORK:return tid
                 state={};self.source_work[path]=state
@@ -347,9 +353,11 @@ class UsageIndex:
                 if tid:
                     key=(str(home),tid);lineage=session_lineage(payload,tid)
                     self.lineage[key]=lineage
-                    prior=self.metadata.get(key);meta=dict(prior or {},id=tid)
-                    meta.update({field:value for field,value in lineage.items() if not meta.get(field)})
+                    prior=self.metadata.get(key)
+                    meta={field:value for field,value in (prior or {}).items() if field not in LINEAGE_FIELDS}
+                    meta.update(id=tid,**lineage)
                     if meta.get('parent_thread_id'):meta['thread_source']='subagent'
+                    elif meta.get('thread_source')=='subagent':meta.pop('thread_source')
                     names=self.names.get(str(home))
                     if names:meta.update(names.resolve(meta))
                     if meta!=prior:
