@@ -518,6 +518,59 @@ def test_coverage_interruption_retains_watermark_and_calls_until_exact_restart(t
             assert progress.applied(ledger.db, expected) == expected
 
 
+@pytest.mark.parametrize('pending_work', ['retirement', 'coverage'])
+def test_runtime_progress_can_interrupt_pending_retirements_and_coverage(tmp_path, monkeypatch, pending_work):
+    names = [f'owner-{number:03d}' for number in range(5)]
+    keys = {('home', sid) for sid in names}
+    monkeypatch.setattr(delivery, 'OWNER_BATCH', 2)
+    monkeypatch.setattr(QuotaLedger, 'SYNC_BATCH_ROWS', 2)
+    with storage.PreparedStore(tmp_path/'prepared.sqlite') as store, closing(QuotaLedger(tmp_path/'quota.sqlite')) as ledger:
+        _publish(store, 1, {sid: 1 for sid in names})
+        adapter = delivery.PreparedLedger(ledger, store)
+        list(adapter.sync(_envelope()))
+        pending_removed = keys.copy() if pending_work == 'retirement' else set()
+        _publish(store, 2, {} if pending_removed else {sid: 2 for sid in names},
+                 removed=names if pending_removed else (),
+                 source_metadata={sid: dict(unclassified=True) for sid in names})
+        updates = adapter.sync(_envelope(201), removed=pending_removed)
+        interrupted = False
+        try:
+            for batch in updates:
+                pending_removed.difference_update(batch['retired'])
+                # PreparedRuntime checks a new collection notification only while work remains.
+                if not batch['remaining']:
+                    continue
+                notification_ready = (bool(batch['retired']) if pending_work == 'retirement' else
+                    ledger.db.execute("SELECT loading FROM state WHERE home='home'").fetchone()[0])
+                if notification_ready:
+                    interrupted = True
+                    break
+        finally:
+            updates.close()
+
+        assert interrupted
+        assert tuple(ledger.db.execute(
+            "SELECT complete_at,loading,unclassified FROM state WHERE home='home'").fetchone()) == (
+                200, int(pending_work == 'coverage'), 0)
+        assert ledger.db.execute('SELECT count(*) FROM coverage_issues').fetchone()[0] == (
+            2 if pending_work == 'coverage' else 0)
+        assert [tuple(row) for row in ledger.db.execute('SELECT sid,cost FROM calls ORDER BY sid')] == [
+            (sid, .2 if pending_work == 'coverage' else .1) for sid in names]
+        assert len(progress.applied(ledger.db, keys)) == (3 if pending_work == 'retirement' else 5)
+
+        adapter = delivery.PreparedLedger(ledger, store)
+        resumed = list(adapter.sync(_envelope(201), removed=pending_removed))
+        assert resumed[-1]['remaining'] == 0
+        assert all(batch['remaining'] for batch in resumed[:-1])
+        assert tuple(ledger.db.execute(
+            "SELECT complete_at,loading,unclassified FROM state WHERE home='home'").fetchone()) == (
+                201, 0, 5 if pending_work == 'coverage' else 0)
+        assert ledger.db.execute('SELECT count(*) FROM calls').fetchone()[0] == 5
+        assert ledger.db.execute('SELECT count(*) FROM coverage_issues').fetchone()[0] == (
+            5 if pending_work == 'coverage' else 0)
+        assert len(progress.applied(ledger.db, keys)) == (0 if pending_work == 'retirement' else 5)
+
+
 def test_pending_owner_retains_issues_and_calls_during_complete_coverage_reconciliation(tmp_path):
     owner = ('home', 'pending')
     with closing(QuotaLedger(tmp_path/'quota.sqlite')) as ledger, storage.PreparedStore(tmp_path/'prepared.sqlite') as store:
