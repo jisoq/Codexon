@@ -82,7 +82,7 @@ class Dashboard(TrayWindow):
         self.quitting=False;self.worker=None;self.engine=AnalysisEngine();self.async_mode=start_worker
         self.preparation=(PreparationPending(time.monotonic(),PreparationStage.STARTING)
                           if start_worker and static_snapshot is None else None)
-        self.analysis=analyze([]);self.analysis_pending=False;self.analysis_errors=[];self.analysis_error_history=[]
+        self.analysis=analyze([]);self.analysis_pending=False;self.analysis_errors=[]
         self.client_cache=BoundedCache(8,64*1024*1024);self.request_id=0;self.view_result=None;self.applied_key=None
         self.display_identity=None;self.pending_retained=False;self.displayed_pages={}
         self.lookup={'sessions':{},'turns':{},'session_turns':{}};self.page_frames={}
@@ -1019,7 +1019,7 @@ class Dashboard(TrayWindow):
         self.observe_error('analysis.query' if facts.get('query_failed') else 'analysis.process','analysis',facts)
         self.client_cache.clear();self.pending_logical=None
         self.request_id+=1;self.deferred_result=None;self.defer_timer.stop();self.clear_analysis_loading()
-        self.analysis_pending=False;self.analysis_errors=[facts];self.analysis_error_history=(self.analysis_error_history+[facts])[-10:]
+        self.analysis_pending=False;self.analysis_errors=[facts]
         if self.current_page not in (3,4):
             if not facts['retained']:
                 self.show_analysis_message('현재 조건의 결과를 불러오지 못했으므로 잠시 후 다시 시도해주세요.','',retry=True)

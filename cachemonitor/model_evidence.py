@@ -266,7 +266,6 @@ class EvidenceProof:
 
 class EvidenceReader:
     """Incremental read-only join, scoped to Codex home and exact response ID."""
-    READ_BATCH = 5000
     READ_SECONDS = .4
     MAX_RECORDS = 4096
     MAX_POLL_ROWS = 5000
@@ -386,7 +385,7 @@ class EvidenceReader:
                 while getattr(self,position) < highwater and read_count<self.MAX_POLL_ROWS:
                     rows = self.db.execute('SELECT * FROM model_observations WHERE seq>? AND seq<=? '
                                            'ORDER BY seq LIMIT ?',
-                                           (getattr(self,position), highwater, min(self.READ_BATCH,self.MAX_POLL_ROWS-read_count))).fetchall()
+                                           (getattr(self,position), highwater, self.MAX_POLL_ROWS-read_count)).fetchall()
                     if not rows:break
                     read_count+=len(rows)
                     refresh=position=='offset' and self.offset<self.live_offset
