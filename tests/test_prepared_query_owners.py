@@ -1,4 +1,3 @@
-"""Query owner metadata stays lazy across exact prepared generations."""
 from collections.abc import Mapping
 from dataclasses import replace
 

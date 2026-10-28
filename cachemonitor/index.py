@@ -370,8 +370,6 @@ class UsageIndex:
             return tid
         except (OSError,ValueError,TypeError) as error:
             if isinstance(error,OSError) and tid:
-                # The app catalog establishes this owner. Its unavailable source
-                # blocks that owner without withdrawing unrelated ready owners.
                 self.header_pending.discard(path)
                 partial=self.partial_work.get(path)
                 if partial is not None and partial.get('header_pending'):self.partial_work.pop(path)

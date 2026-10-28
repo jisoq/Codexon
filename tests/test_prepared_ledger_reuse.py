@@ -537,7 +537,6 @@ def test_runtime_progress_can_interrupt_pending_retirements_and_coverage(tmp_pat
         try:
             for batch in updates:
                 pending_removed.difference_update(batch['retired'])
-                # PreparedRuntime checks a new collection notification only while work remains.
                 if not batch['remaining']:
                     continue
                 notification_ready = (bool(batch['retired']) if pending_work == 'retirement' else

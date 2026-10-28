@@ -1566,8 +1566,6 @@ def test_activity_reorder_publishes_order_without_rewriting_analyzed_owners(tmp_
         assert updates[0]['changed'] == () and updates[0]['writes']['owners'] == 0
         assert store.db.execute('SELECT count(*) FROM owner_versions').fetchone()[0] == bodies
         assert store.token.generation == previous.generation+1
-        # The publisher rejects incomplete or over-budget order before
-        # changing its publication token or retained owner content.
         publisher_owners=publisher.owners
         engine_sessions=engine.sessions
         original_order=storage.Snapshot.ordering

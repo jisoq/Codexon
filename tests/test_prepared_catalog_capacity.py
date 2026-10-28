@@ -1,4 +1,3 @@
-"""Default-scale incoming catalog coverage; run explicitly with -m extended."""
 import json
 
 import pytest

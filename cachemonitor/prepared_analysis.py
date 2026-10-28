@@ -70,7 +70,6 @@ class PreparedAnalysisEngine(AnalysisEngine):
         return state, internal
 
     def adopt(self, token, changed_owners, removed=()):
-        """Validate the committed delta before advancing the query generation."""
         if self.snapshot is not None:
             raise RuntimeError('finish the active query before adopting a generation')
         affected = set()

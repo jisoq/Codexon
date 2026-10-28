@@ -77,6 +77,7 @@ Cancellation, the generation pin, and the existing per-cursor SQL instruction
 allowance remain active. A long pinned traversal can retain WAL pages until it
 closes. Per-owner materialization and required-result guards still protect actual
 retained objects. Their defaults are separate from total history capacity.
+
 ## Retained event storage
 
 The usage index stores source paths and session owners once and references

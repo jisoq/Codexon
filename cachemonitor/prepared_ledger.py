@@ -20,7 +20,7 @@ class _SourceCacheAdmission(CapacityExceeded):
 
 
 class _SourcePopulationAdmission(CapacityExceeded):
-    """The complete envelope inventory needs file-backed continuation."""
+    pass
 
 
 class PreparedLedger:

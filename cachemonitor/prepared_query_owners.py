@@ -1,4 +1,3 @@
-"""Lazy owner mappings bound to a prepared engine's current read generation."""
 from collections import OrderedDict
 from collections.abc import ItemsView, Mapping
 
