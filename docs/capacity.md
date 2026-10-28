@@ -105,7 +105,7 @@ Complete-history admission is the responsibility removed by this cleanup.
 
 The [durable backlog introduction](https://github.com/jisoq/Codexon/commit/56437c2d3e8a673c8236ef8f96d1aae3b794f746)
 established bounded failure recovery and producer backpressure. The
-[checkpoint correction](https://github.com/jisoq/Codexon/commit/71a77cb2f7e53d5eddc5297b726fcf92dcf6a3af)
+[checkpoint cleanup](../cachemonitor/speed_checkpoint.py)
 removes duplicate source validation while retaining the owning packet guard.
 The historical Selector socket rationale does not derive today's Proactor
 connection defaults.
