@@ -482,6 +482,9 @@ def test_writer_selected_scope_survives_aggregate_lease_and_source_revision(tmp_
             global_order=list(view.db.execute('SELECT owner,source_ordinal FROM catalog_orders WHERE batch=? ORDER BY source_ordinal',
                                                (global_batch,)))
             unrelated=view.owner(str(home),OTHER)['dependencies']
+            unrelated_head=view.db.execute('SELECT h.batch,p.owner FROM owners o JOIN owner_heads h ON h.owner=o.id '
+                'LEFT JOIN ledger_pending p ON p.owner=o.id WHERE o.home=? AND o.sid=?',(str(home),OTHER)).fetchone()
+            unrelated_batch,pending_before_selection=tuple(unrelated_head)
 
         original_catalog=storage.Snapshot.catalog
         original_inventory=storage.Snapshot.inventory
@@ -510,7 +513,18 @@ def test_writer_selected_scope_survives_aggregate_lease_and_source_revision(tmp_
                 return original_inventory(view,*args,owners=owners,**kwargs)
             def selected_revisions(view,owners=None,*args,**kwargs):
                 if selected_started:
-                    assert owners is not None and set(owners)<=family,'global ledger inventory'
+                    assert owners is not None,'global ledger inventory'
+                    for owner in set(owners)-family:
+                        assert owner==(str(home),OTHER) and pending_before_selection is not None
+                        work=view.db.execute('SELECT h.batch,v.dependencies FROM ledger_pending p '
+                            'JOIN owners o ON o.id=p.owner JOIN owner_heads h ON h.owner=p.owner '
+                            'JOIN owner_versions v ON v.owner=h.owner AND v.batch=h.batch '
+                            'WHERE o.home=? AND o.sid=?',owner).fetchone()
+                        assert work is not None and work[0]==unrelated_batch
+                        assert storage.unpack(work[1])==unrelated
+                        from cachemonitor import quota_prepared_sync as progress
+                        with sqlite3.connect(quota) as db:
+                            assert progress.applied(db,[owner]).get(owner)==progress.source_stamp(unrelated)
                 return original_revisions(view,owners,*args,**kwargs)
             scoped.setattr(CollectionClient,'poll_catalog',poll_catalog)
             scoped.setattr(CollectionClient,'poll_selection',poll_selection)
