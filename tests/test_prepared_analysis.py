@@ -2292,6 +2292,45 @@ def test_catalog_root_lineage_accepts_the_published_parent_forms(tmp_path,parent
         catalog.close()
 
 
+def test_standalone_catalog_native_cleanup_can_run_on_another_thread(monkeypatch):
+    import gc
+    import sqlite3
+    import sys
+    import weakref
+    from threading import Thread
+    from cachemonitor.prepared_ingest import read_catalog
+
+    class Connection(sqlite3.Connection):
+        pass
+
+    original = sqlite3.connect
+    connections = []
+    def connect(*args,**kwargs):
+        connection = original(*args,**dict(kwargs,factory=Connection))
+        connections.append(weakref.ref(connection))
+        return connection
+    errors = []
+    monkeypatch.setattr(storage.sqlite3,'connect',connect)
+    monkeypatch.setattr(sys,'unraisablehook',errors.append)
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        owner = ('home','root')
+        catalog = read_catalog(catalog_page_client([(*owner,None)],[owner],selected=[[None,owner[1]]]))
+        owners = catalog['owners']
+        assert list(owners) == [owner]
+        reference = weakref.ref(catalog)
+        del catalog,owners
+        worker = Thread(target=gc.collect)
+        worker.start();worker.join(5)
+        assert not worker.is_alive()
+        assert not errors,[str(error.exc_value) for error in errors]
+        assert reference() is None
+        assert len(connections)==1 and connections[0]() is None
+    finally:
+        if enabled:gc.enable()
+
+
 def test_incomplete_catalog_exposes_status_without_partial_membership(tmp_path):
     from cachemonitor.prepared_ingest import read_catalog
 
