@@ -1002,6 +1002,7 @@ class QuotaLedger:
         initialize(self.db)
         self.db.executescript('''
             PRAGMA journal_mode=WAL;
+            PRAGMA temp_store=FILE;
             CREATE TABLE IF NOT EXISTS observations(
                 id TEXT PRIMARY KEY, home TEXT, at REAL, source TEXT, account TEXT,
                 used REAL, reset REAL, minutes INTEGER, separate TEXT);
@@ -1362,7 +1363,7 @@ class QuotaLedger:
                 session_key=key[:2]
                 self.mode_revisions[session_key]=self.mode_revisions.get(session_key,0)+1
 
-    def scan_modes(self, homes):
+    def scan_modes(self, homes, *, owners=None):
         from contextlib import closing
         from .request_modes import request_mode_observation
         # Bound source work separately from retained bodies so sparse handler
@@ -1372,6 +1373,9 @@ class QuotaLedger:
         def scan(source,condition='',parameters=(),reverse=False):
             rows=[];first=last=None
             order=' desc' if reverse else ''
+            if selected_sid is not None:
+                condition+=(' AND ' if condition else ' WHERE ')+"thread_id=? AND target='codex_core::session::handlers'"
+                parameters=(*parameters,selected_sid)
             with closing(source.execute(columns+condition+' order by id'+order+' limit ?',
                                         (*parameters,MODE_SCAN_ROWS))) as cursor:
                 for row in cursor:
@@ -1381,26 +1385,28 @@ class QuotaLedger:
                         rows.append(row)
                         if len(rows)>=MODE_SCAN_MATCHES:break
             return rows,first,last
-        for home in homes:
+        sources=((home,None) for home in homes) if owners is None else iter(sorted(owners))
+        for home,selected_sid in sources:
+            cursor_key=home if selected_sid is None else (home,selected_sid)
             path=Path(home)/'logs_2.sqlite'
             if not path.exists():continue
             try:
                 with closing(sqlite3.connect(path.as_uri()+'?mode=ro',uri=True,timeout=.3)) as source:
                     maximum=source.execute('select max(id) from logs').fetchone()[0] or 0
-                    if maximum<self.mode_offsets.get(home,0):
-                        self.mode_offsets.pop(home,None);self.mode_backfill.pop(home,None)
-                    if home not in self.mode_offsets:
+                    if maximum<self.mode_offsets.get(cursor_key,0):
+                        self.mode_offsets.pop(cursor_key,None);self.mode_backfill.pop(cursor_key,None)
+                    if cursor_key not in self.mode_offsets:
                         rows,first,last=scan(source,reverse=True)
                         rows.reverse()
                         latest=first or 0
-                        self.mode_backfill[home]=last or 0
+                        self.mode_backfill[cursor_key]=last or 0
                     else:
-                        rows,_,last=scan(source,' where id>?',(self.mode_offsets[home],))
-                        latest=last if last is not None else self.mode_offsets[home]
-                    before=self.mode_backfill.get(home,0)
+                        rows,_,last=scan(source,' where id>?',(self.mode_offsets[cursor_key],))
+                        latest=last if last is not None else self.mode_offsets[cursor_key]
+                    before=self.mode_backfill.get(cursor_key,0)
                     if before:
                         older,_,last=scan(source,' where id<?',(before,),reverse=True)
-                        self.mode_backfill[home]=last or 0
+                        self.mode_backfill[cursor_key]=last or 0
                         rows=older[::-1]+rows
                 changed=False
                 for identifier,sid,body in rows:
@@ -1413,9 +1419,10 @@ class QuotaLedger:
                             self.db.execute('insert or replace into mode_events values(?,?,?,?,?)',
                                             (home,identifier,sid,parsed['turn'],data));changed=True
                 if changed:self.rebuild_mode_evidence(home)
-                self.mode_offsets[home]=latest
-                checkpoint=(latest,self.mode_backfill.get(home,0))
-                saved=self.db.execute('select latest,before_id from mode_scan where home=?',(home,)).fetchone()
+                self.mode_offsets[cursor_key]=latest
+                if selected_sid is not None:continue
+                checkpoint=(latest,self.mode_backfill.get(cursor_key,0))
+                saved=self.db.execute('select latest,before_id from mode_scan where home=?',(cursor_key,)).fetchone()
                 # A conditional UPSERT still opens a write transaction when
                 # nothing changed. Read the durable cursor before taking that
                 # lock; do not trust the in-memory scan cursor after failures.
@@ -1423,7 +1430,7 @@ class QuotaLedger:
                     self.db.execute('''insert into mode_scan values(?,?,?) on conflict(home) do update set
                         latest=excluded.latest,before_id=excluded.before_id
                         where mode_scan.latest is not excluded.latest or mode_scan.before_id is not excluded.before_id''',
-                        (home,*checkpoint))
+                        (cursor_key,*checkpoint))
             except sqlite3.Error:pass
         self.db.commit()
 
@@ -1518,7 +1525,175 @@ class QuotaLedger:
                 select ?,id from observations where id=? and not exists
                 (select 1 from window_observations where id=?)''',(weekly_ref,key,weekly_ref))
 
-    def sync(self, engine, snapshot, *, applied_sources=None, append_sources=None):
+    @staticmethod
+    def _coverage_errors(snapshot):
+        errors = snapshot.get('usage_errors')
+        if errors is None:
+            errors = [error for error in snapshot.get('errors', [])
+                      if '기록 읽기' in error or '세션 목록' in error or '일부 기록 형식' in error]
+        return errors
+
+    @staticmethod
+    def _coverage_rows(session):
+        home, sid = session['home'], session.get('id', '')
+        if session.get('unclassified') and not session.get('coverage_available'):
+            bounds = session.get('_coverage_bounds')
+            if bounds is None:
+                times = [row['ts'] for row in session.get('history', []) if row.get('ts') is not None]
+                bounds = (min(times) if times else None, max(times) if times else None)
+            yield home, sid, *bounds, '참고: 누계 차액의 발생 경계 미확인'
+        for gap in session.get('coverage_gaps', []):
+            yield home, sid, gap['start'], gap['end'], f"누계 차액 증가 {gap['tokens']}토큰, {gap['start']}"
+
+    def _save_coverage_state(self, snapshot, home, unclassified, pending):
+        errors = self._coverage_errors(snapshot)
+        index = snapshot.get('index', {})
+        loading = bool(index.get('loading'))
+        complete = index.get('usage_complete', snapshot.get('usage_collection_complete', not loading and not errors))
+        previous = self.db.execute('SELECT complete_at,unclassified FROM state WHERE home=?', (home,)).fetchone()
+        if pending and previous:
+            unclassified = previous['unclassified']
+        watermark = previous['complete_at'] if previous else None
+        if complete:
+            stamp = (index.get('usage_complete_at') or index.get('last_usage_success')
+                     or snapshot.get('last_usage_collection_success') or snapshot['ts'])
+            watermark = max(watermark or 0, stamp)
+        self.db.execute('INSERT INTO state(home,at,loading,unclassified,complete_at) VALUES(?,?,?,?,?) '
+            'ON CONFLICT(home) DO UPDATE SET at=excluded.at,loading=excluded.loading,'
+            'unclassified=excluded.unclassified,complete_at=excluded.complete_at',
+            (home, snapshot['ts'], loading, unclassified, watermark))
+
+    def _recovered_home(self, home, snapshot):
+        if not snapshot.get('collection_recovery'):
+            return False
+        state = self.db.execute('SELECT at FROM state WHERE home=?', (home,)).fetchone()
+        health = self.db.execute('SELECT at FROM tracking_health WHERE home=?', (home,)).fetchone()
+        latest = max((row[0] for row in (state, health) if row and row[0] is not None), default=None)
+        return latest is not None and latest >= snapshot['ts']
+
+    def stage_prepared_coverage(self, source):
+        home = source['home']
+        if source.get('_collection_pending'):
+            self.db.execute('UPDATE temp.prepared_ledger_homes SET pending_count=pending_count+1 WHERE home=?', (home,))
+            return
+        self.db.execute('UPDATE temp.prepared_ledger_homes SET unclassified=unclassified+? WHERE home=?',
+                        (int(bool(source.get('unclassified'))), home))
+        self.db.executemany('INSERT OR REPLACE INTO temp.prepared_ledger_coverage VALUES(?,?,?,?,?)',
+                            self._coverage_rows(source))
+
+    def reconcile_prepared_coverage(self, snapshot, *, check, metadata_bytes):
+        from .prepared_ingest import _weight
+        from .quota_tracking_store import sync_activity
+
+        if snapshot.get('collection_partial'):
+            return
+
+        def pages(table, home):
+            after = None
+            while True:
+                check()
+                rows = []
+                size = 0
+                where = '' if after is None else ' AND (sid,reason)>(?,?)'
+                cursor = self.db.execute(f'SELECT sid,start,end,reason FROM {table} '
+                    'WHERE home=?'+where+' ORDER BY sid,reason LIMIT ?',
+                    (home, *(() if after is None else after), self.SYNC_BATCH_ROWS))
+                try:
+                    for record in cursor:
+                        row = tuple(record)
+                        weight = _weight(row, metadata_bytes)
+                        if rows and size+weight > metadata_bytes:
+                            break
+                        rows.append(row)
+                        size += weight
+                finally:
+                    cursor.close()
+                if not rows:
+                    return
+                after = (rows[-1][0], rows[-1][3])
+                yield rows
+
+        after = None
+        while True:
+            check()
+            where = '' if after is None else ' AND home>?'
+            homes = self.db.execute('SELECT home,unclassified,pending_count FROM temp.prepared_ledger_homes '
+                'WHERE scope=1'+where+' ORDER BY home LIMIT ?',
+                (*(() if after is None else (after,)), self.SYNC_BATCH_ROWS)).fetchall()
+            if not homes:
+                return
+            for home, unclassified, pending in homes:
+                check()
+                if self._recovered_home(home, snapshot):
+                    continue
+                errors = self._coverage_errors(snapshot)
+                if errors:
+                    self.db.execute('INSERT OR REPLACE INTO temp.prepared_ledger_coverage VALUES(?,?,?,?,?)',
+                        (home, '', None, None, '로컬 호출 기록 읽기 실패: '+', '.join(errors)))
+                    self.db.commit()
+                loading = False
+
+                def require_current():
+                    check()
+                    if self._recovered_home(home, snapshot):
+                        raise ValueError('newer recovery state replaced the prepared coverage plan')
+
+                def begin_loading():
+                    nonlocal loading
+                    if loading:
+                        return
+                    with self.db:
+                        self.db.execute('BEGIN IMMEDIATE')
+                        require_current()
+                        self.db.execute('INSERT INTO state(home,at,loading,unclassified,complete_at) VALUES(?,NULL,1,0,NULL) '
+                            'ON CONFLICT(home) DO UPDATE SET loading=1', (home,))
+                    getattr(self, '_coverage_signatures', {}).pop(home, None)
+                    loading = True
+
+                for rows in pages('coverage_issues', home):
+                    obsolete = []
+                    for sid, start, end, reason in rows:
+                        wanted = self.db.execute('SELECT 1 FROM temp.prepared_ledger_coverage '
+                            'WHERE home=? AND sid=? AND reason=?', (home, sid, reason)).fetchone()
+                        retained = self.db.execute('SELECT 1 FROM temp.prepared_ledger_sources '
+                            'WHERE home=? AND sid=? AND pending=1', (home, sid)).fetchone()
+                        if wanted is None and retained is None:
+                            obsolete.append((home, sid, reason))
+                    if obsolete:
+                        begin_loading()
+                        with self.db:
+                            self.db.execute('BEGIN IMMEDIATE')
+                            require_current()
+                            self.db.executemany('DELETE FROM coverage_issues WHERE home=? AND sid=? AND reason=?', obsolete)
+                            require_current()
+                        yield home
+                for rows in pages('temp.prepared_ledger_coverage', home):
+                    changed = []
+                    for sid, start, end, reason in rows:
+                        old = self.db.execute('SELECT start,end FROM coverage_issues WHERE home=? AND sid=? AND reason=?',
+                                              (home, sid, reason)).fetchone()
+                        if old is None or tuple(old) != (start, end):
+                            changed.append((home, sid, start, end, reason))
+                    if changed:
+                        begin_loading()
+                        with self.db:
+                            self.db.execute('BEGIN IMMEDIATE')
+                            require_current()
+                            self.db.executemany('INSERT OR REPLACE INTO coverage_issues VALUES(?,?,?,?,?)', changed)
+                            require_current()
+                        yield home
+                with self.db:
+                    self.db.execute('BEGIN IMMEDIATE')
+                    require_current()
+                    self._save_coverage_state(snapshot, home, unclassified, pending)
+                    sync_activity(self.db, dict(snapshot, homes=[home], sessions=[], request_activity=[]),
+                                  getattr(self, '_tracking_sync_cache', None))
+                    check()
+                getattr(self, '_coverage_signatures', {}).pop(home, None)
+                yield home
+            after = homes[-1][0]
+
+    def sync(self, engine, snapshot, *, applied_sources=None, append_sources=None, prepared_plan=False):
         """Use the existing deduplicated analytical rows; don't parse conversations twice."""
         from .quota_tracking_store import sync_activity
         if append_sources:
@@ -1543,14 +1718,12 @@ class QuotaLedger:
             # newer evidence, including evidence committed by another writer.
             if not self.db.in_transaction:self.db.execute('BEGIN IMMEDIATE')
             for home in snapshot.get('homes',[]):
-                latest=self.db.execute('''select max(at) from (
-                    select at from state where home=? union all
-                    select at from tracking_health where home=?)''',(home,home)).fetchone()[0]
-                if latest is not None and latest>=snapshot['ts']:recovered_homes.add(home)
+                if self._recovered_home(home,snapshot):recovered_homes.add(home)
             if recovered_homes:
                 snapshot={**snapshot,'homes':[home for home in snapshot['homes'] if home not in recovered_homes]}
         if not hasattr(self,'_tracking_sync_cache'):self._tracking_sync_cache={}
-        sync_activity(self.db, snapshot,self._tracking_sync_cache)
+        sync_activity(self.db, snapshot,self._tracking_sync_cache,
+                      update_health=not (prepared_plan and snapshot.get('collection_recovery')))
         certificates={}
         for key, session in {**engine.sessions,**getattr(engine,'internal_sessions',{})}.items():
             if key[0] in recovered_homes or key in pending:continue
@@ -1624,11 +1797,8 @@ class QuotaLedger:
                 self.db.executemany('delete from calls where home=? and sid=? and uid=?',
                                     [(home,sid,uid) for uid in old_uids-current_uids])
             if applied_sources is not None:certificates[key]=revision
-        for home in snapshot.get('homes', []):
-            usage_errors=snapshot.get('usage_errors')
-            if usage_errors is None:
-                usage_errors=[error for error in snapshot.get('errors',[])
-                              if '기록 읽기' in error or '세션 목록' in error or '일부 기록 형식' in error]
+        for home in (() if snapshot.get('collection_partial') else snapshot.get('homes', [])):
+            usage_errors=self._coverage_errors(snapshot)
             signatures=getattr(self,'_coverage_signatures',{})
             relevant=[s for s in snapshot['sessions'] if s['home']==home]
             pending_sids=frozenset(sid for pending_home,sid in pending if pending_home==home)
@@ -1645,36 +1815,15 @@ class QuotaLedger:
                 for session in snapshot['sessions']:
                     if session['home'] != home:
                         continue
-                    if session.get('unclassified') and not session.get('coverage_available'):
-                        bounds=session.get('_coverage_bounds')
-                        if bounds is None:
-                            times = [r['ts'] for r in session.get('history',[]) if r.get('ts') is not None]
-                            bounds=(min(times) if times else None,max(times) if times else None)
-                        self.db.execute('insert or replace into coverage_issues values(?,?,?,?,?)',
-                                        (home,session.get('id',''),*bounds,'참고: 누계 차액의 발생 경계 미확인'))
-                    for gap in session.get('coverage_gaps', []):
-                        self.db.execute('insert or replace into coverage_issues values(?,?,?,?,?)',
-                                        (home, session.get('id',''),gap['start'],gap['end'],
-                                         f"누계 차액 증가 {gap['tokens']}토큰, {gap['start']}"))
+                    self.db.executemany('insert or replace into coverage_issues values(?,?,?,?,?)',
+                                        self._coverage_rows(session))
                 if usage_errors:
                     self.db.execute('insert or replace into coverage_issues values(?,?,?,?,?)',
                                     (home, '', None, None, '로컬 호출 기록 읽기 실패: '+', '.join(usage_errors)))
                 signatures[home]=signature
                 self._coverage_signatures=signatures
             unclassified = sum(bool(s.get('unclassified')) for s in snapshot['sessions'] if s['home'] == home)
-            index=snapshot.get('index',{})
-            loading=bool(index.get('loading'))
-            complete=index.get('usage_complete',snapshot.get('usage_collection_complete',not loading and not usage_errors))
-            previous=self.db.execute('select complete_at,unclassified from state where home=?',(home,)).fetchone()
-            if pending_sids and previous:unclassified=previous['unclassified']
-            watermark=previous['complete_at'] if previous else None
-            if complete:
-                stamp=index.get('usage_complete_at') or index.get('last_usage_success') or snapshot.get('last_usage_collection_success') or snapshot['ts']
-                watermark=max(watermark or 0,stamp)
-            self.db.execute('''insert into state(home,at,loading,unclassified,complete_at) values(?,?,?,?,?)
-                on conflict(home) do update set at=excluded.at,loading=excluded.loading,
-                unclassified=excluded.unclassified,complete_at=excluded.complete_at''',
-                (home,snapshot['ts'],loading,unclassified,watermark))
+            self._save_coverage_state(snapshot,home,unclassified,pending_sids)
         cursor=snapshot.get('activity_cursor')
         if cursor:self.db.execute('INSERT INTO collection_activity_cursor VALUES(1,?,?) ON CONFLICT(id) DO UPDATE SET '
             'source=excluded.source,revision=excluded.revision WHERE source IS NOT excluded.source OR revision IS NOT excluded.revision',tuple(cursor))

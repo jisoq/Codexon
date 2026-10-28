@@ -120,10 +120,8 @@ def _binding(token, preparation, source_identity):
     _text(token[0], 128)
     _integer(token[1])
     _text(preparation, 256)
-    _require(type(source_identity) is bytes and len(source_identity) <= CHUNK_BYTES,
-             'source identity must be the writer encoded packet')
     return dict(format=FORMAT, classifier=_policy(), token=list(token),
-                owner_binding='prepared-dependencies-pack-sha256-1',
+                owner_binding='prepared-fact-dependencies-excluding-pricing-pack-sha256-2',
                 preparation=preparation, source=hashlib.sha256(source_identity).hexdigest())
 
 
@@ -133,7 +131,7 @@ def _signature(source):
     return frozenset((owner,state.revision) for owner,state in source.owners.items())
 
 
-def _section(name, records, budget):
+def _section(name, records, budget, check=None):
     """Encode one logical section as bounded NDJSON records and byte chunks."""
     encoder = json.JSONEncoder(ensure_ascii=True, sort_keys=True,
                                separators=(',', ':'), allow_nan=False)
@@ -150,10 +148,12 @@ def _section(name, records, budget):
             pending.extend(view[:take])
             view = view[take:]
             if len(pending) == CHUNK_BYTES:
+                if check is not None:check()
                 chunks.append(bytes(pending))
                 pending.clear()
 
     for record in records:
+        if check is not None:check()
         length = 0
         for part in encoder.iterencode(record):
             data = part.encode('ascii')
@@ -178,12 +178,13 @@ def _invalid_constant(value):
     raise CheckpointRejected('nonfinite JSON constant')
 
 
-def _records(section, budget):
+def _records(section, budget, check=None):
     _require(type(section) is Section and type(section.chunks) is tuple, 'invalid section')
     _text(section.name, 128)
     _require(type(section.digest) is str and len(section.digest) == 64, 'invalid section digest')
     digest, pending = hashlib.sha256(), bytearray()
     for chunk in section.chunks:
+        if check is not None:check()
         _require(type(chunk) is bytes and 0 < len(chunk) <= CHUNK_BYTES, 'invalid chunk size')
         budget[0] += len(chunk)
         _require(budget[0] <= CHECKPOINT_BYTES, 'encoded checkpoint capacity')
@@ -214,6 +215,7 @@ def _sample(value, home, condition, proofs):
     _integer(ordinal)
     _require(ordinal < proofs[owner].length, 'sample outside prepared length')
     _text(key)
+    _require(sys.getsizeof(key) <= proofs[owner].buckets[condition][1], 'sample key exceeds its owner proof')
     _number(at)
     _number(output)
     _number(elapsed)
@@ -260,6 +262,12 @@ def _state(value, owner, condition, proofs):
             result[field] = [_sample(row, owner[0], condition, proofs) for row in result[field]]
             _require(all(row.session == owner for row in result[field]), 'sample in another owner state')
     _require(bool(result['recent']), 'missing recent samples')
+    recovery = result.get('recovery', ())
+    if recovery:
+        tail = result['recent'][-len(recovery):]
+        _require(len(tail) == len(recovery) and all(
+            left.order == right.order and _exact(left, right) for left, right in zip(recovery, tail)),
+            'recovery samples differ from the recent suffix')
     if 'active' in result:
         _require(result['active'] is True and len(result['recent']) == speed.SLOW_CALLS
                  and 'incident_id' in result, 'invalid active incident')
@@ -339,7 +347,7 @@ def _export(tracker, source, preparation, base):
     header = _binding(token, preparation, source.source_identity)
     header.update(owners=len(tracker.proofs), scopes=len(tracker.replays))
     budget = [0]
-    sections = [_section('header', (header,), budget)]
+    sections = [_section('header', (header,), budget,source.snapshot.check)]
     owners = tracker.proofs.keys() if complete else tracker.changed_owners
     scopes = tracker.replays.keys() if complete else tracker.changed_scopes
     for owner in sorted(owners):
@@ -354,7 +362,7 @@ def _export(tracker, source, preparation, base):
             ['state', _state_value(state) if state is not None else None],
             ['result', tracker.results[owner]],
         )
-        sections.append(_section(_owner_name(owner), records, budget))
+        sections.append(_section(_owner_name(owner), records, budget,source.snapshot.check))
     for home, condition in sorted(scopes):
         replay = tracker.replays[(home, condition)]
         def records():
@@ -362,12 +370,34 @@ def _export(tracker, source, preparation, base):
             for sid, sample in replay.pool:
                 _require(sid == sample.session[1], 'pool owner mismatch')
                 yield ['pool', *_sample_value(sample)]
-        sections.append(_section(_scope_name(home, condition), records(), budget))
+        sections.append(_section(_scope_name(home, condition), records(), budget,source.snapshot.check))
     removed = () if complete else tuple(sorted(
         [_owner_name(owner) for owner in tracker.removed_owners]
         + [_scope_name(*bucket) for bucket in tracker.removed_scopes]))
     _require(_signature(source) == signature, 'prepared metadata changed during checkpoint export')
     return CheckpointDelta(base, token, tuple(sections), removed, complete)
+
+
+def promote_checkpoint(delta, stage, *, preparation, source_identity):
+    from .prepared_store import Stage
+    _require(isinstance(stage,Stage) and stage.store.stage is stage and not stage.finished
+             and stage.expected==stage.store.token and not any(stage.writes.values())
+             and not stage.owners and not stage.checkpoint_namespaces and not stage.catalog_staged,
+             'warning promotion requires an empty current metadata stage')
+    _require(type(delta) is CheckpointDelta and delta.token==_token(stage.expected)
+             and source_identity==stage.source and delta.sections and delta.sections[0].name=='header',
+             'warning completion differs from the current canonical generation')
+    records=tuple(_records(delta.sections[0],[0]))
+    _require(len(records)==1 and type(records[0]) is dict,'invalid completed checkpoint header')
+    header=records[0]
+    expected=_binding(delta.token,preparation,source_identity)
+    _require(all(header.get(key)==value for key,value in expected.items()),
+             'completed checkpoint source or policy differs')
+    token=_token(stage.prospective_token)
+    header=dict(header,**_binding(token,preparation,source_identity))
+    budget=[sum(len(chunk) for section in delta.sections[1:] for chunk in section.chunks)]
+    promoted=_section('header',(header,),budget)
+    return CheckpointDelta(delta.base,token,(promoted,*delta.sections[1:]),delta.tombstones,delta.complete)
 
 
 def restore_checkpoint(tracker, source, sections, *, preparation):
@@ -397,7 +427,7 @@ def _restore(source,sections,preparation):
     _require(all(type(section) is Section for section in sections),'invalid checkpoint sections')
     budget = [0]
     _require(sections[0].name == 'header', 'missing checkpoint header')
-    records = iter(_records(sections[0], budget))
+    records = iter(_records(sections[0], budget,source.snapshot.check))
     header = next(records, None)
     _require(type(header) is dict and next(records, None) is None, 'invalid checkpoint header')
     token=(source.token.instance,source.token.generation)
@@ -419,7 +449,7 @@ def _restore(source,sections,preparation):
         if section.name.startswith('scope:'):
             scope_sections.append(section)
             continue
-        rows = iter(_records(section, budget))
+        rows = iter(_records(section, budget,source.snapshot.check))
         row = next(rows, None)
         _require(type(row) is list and len(row) == 8 and row[0] == 'owner', 'invalid owner proof')
         owner = _owner(row[1])
@@ -444,6 +474,8 @@ def _restore(source,sections,preparation):
         timestamp = _number(row[7]) if length else None
         _require((length > 0 or row[7] is None and condition is None and not buckets)
                  and (condition is None or condition in buckets), 'invalid proof frontier')
+        if condition is not None:
+            condition = next(value for value in buckets if value == condition)
         revision = stamp.revision
         restored.proofs[owner] = speed._Proof(revision, length, buckets, condition, timestamp)
         state_row, result_row = next(rows, None), next(rows, None)
@@ -461,7 +493,7 @@ def _restore(source,sections,preparation):
     pools = restored._admit(restored.proofs)
     _require(len(pools) == header['scopes'], 'peer scope count mismatch')
     for section in scope_sections:
-        rows = iter(_records(section, budget))
+        rows = iter(_records(section, budget,source.snapshot.check))
         first = next(rows, None)
         _require(type(first) is list and len(first) == 4 and first[0] == 'scope', 'missing peer scope')
         home, condition = _text(first[1]), _condition(first[2])
@@ -474,6 +506,8 @@ def _restore(source,sections,preparation):
         frontier_owner = (home, order[2])
         _require(frontier_owner in restored.proofs and condition in restored.proofs[frontier_owner].buckets
                  and order[3] < restored.proofs[frontier_owner].length, 'scope frontier outside owner')
+        condition = next(value for value in restored.proofs[frontier_owner].buckets if value == condition)
+        bucket = (home, condition)
         replay = speed._ScopeReplay(condition)
         replay.last_order = tuple(order)
         for row in rows:
@@ -488,7 +522,29 @@ def _restore(source,sections,preparation):
     _require(restored.replays.keys() == pools.keys() and _signature(source) == signature,
              'incomplete or changed prepared generation')
     for owner, (state, result) in owner_states.items():
+        condition = restored.proofs[owner].condition
+        bucket = (owner[0], condition)
+        if state:
+            _require(all(sys.getsizeof(key) <= pools[bucket][2] for key in state['baseline']['baseline_keys']),
+                     'baseline key exceeds its peer proof')
+            if 'incident_id' in state:
+                _require(sys.getsizeof(state['incident_id']) <= restored.proofs[owner].buckets[condition][1],
+                         'incident key exceeds its owner proof')
+    for owner, (state, result) in owner_states.items():
         replay = restored.replays[(owner[0], restored.proofs[owner].condition)]
+        for sample in state.get('recent', ()):
+            sample.condition = replay.condition
+        if state.get('recovery'):
+            state['recovery'] = state['recent'][-len(state['recovery']):]
+        if 'incident_id' in state:
+            state['incident_id'] = next((row['key'] for row in state['recent']
+                if row['key'] == state['incident_id']), state['incident_id'])
+        if result['active']:
+            result.update(state['baseline'])
+            result['recent_keys'] = [row['key'] for row in state['recent']]
+            result['call_id'] = state['recent'][-1]['key']
+            result['incident_id'] = state['incident_id']
+            result['model'], result['effort'], result['tier'] = replay.condition[:3]
         replay.states[owner], replay.results[owner] = state, result
     restored._finish(restored.proofs)
     restored.signature = signature

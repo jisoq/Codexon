@@ -121,31 +121,142 @@ def test_notification_failure_releases_socket_and_allows_polling_recovery(tmp_pa
     finally:reader.close();writer.close()
 
 
+def test_notification_lease_restores_latest_demand_after_lease_loss(tmp_path):
+    writer=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite')
+    reader=CollectionClient(writer.homes,writer.path)
+    writer.start_live()
+    try:
+        value=snapshot(writer);writer.publish(value,'epoch',1)
+        reader.set_demand([(None,'first')])
+        wake=reader.notification_connection(('epoch',1))
+        wait_until(lambda:bool(writer.live.waiters))
+        reader.set_demand([(None,'second')],aggregate=True,evidence=[(writer.homes[0],'parent')])
+        writer.publish(value,'epoch',2)
+        assert wake.poll(2) and reader.consume_notification()
+        with writer.live.lock:writer.live.leases.pop(reader.channel.client)
+        reader.notification_connection(('epoch',2))
+        wait_until(lambda:reader.channel.client in writer.live.leases)
+        assert writer.live.requested_demand(time.time())==dict(selected=[(None,'second')],aggregate=True,
+            evidence=[(writer.homes[0],'parent')])
+    finally:reader.close();writer.close()
+
+
+def test_benchmark_trace_instances_keep_concurrent_records_complete(tmp_path):
+    import json
+    from threading import Barrier, Thread
+    from tools.benchmark_overlay_latency import Trace
+    path = tmp_path/'concurrent.jsonl'
+    start = Barrier(4)
+    failures = []
+
+    def write(number):
+        try:
+            trace = Trace(path)
+            start.wait(timeout=2)
+            for ordinal in range(8):
+                trace.emit('record', writer=number, ordinal=ordinal, payload='x'*100000)
+        except BaseException as error:
+            failures.append(error)
+
+    workers = [Thread(target=write, args=(number,)) for number in range(4)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(5)
+    assert not any(worker.is_alive() for worker in workers)
+    assert not failures
+    records = [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines()]
+    assert {(row['writer'], row['ordinal']) for row in records} == {
+        (number, ordinal) for number in range(4) for ordinal in range(8)}
+    assert len(records) == 32 and all(row['payload'] == 'x'*100000 for row in records)
+
+
+def test_benchmark_watcher_keeps_activity_until_owner_replay_finishes(tmp_path,monkeypatch):
+    from queue import Queue
+    from threading import Event,current_thread
+    from types import SimpleNamespace
+    import sys
+    from cachemonitor import usage_collection
+    from tools.benchmark_overlay_latency import watcher_process
+    activity=dict(attempt='request',status='created')
+    command=dict(kind='poll',scenario='created',sid='owner',calls=1,
+                 activity=activity,evidence=dict(response_status='created'))
+    commands=Queue();commands.put(command)
+    armed=Event();sent=[];threads=[]
+    class Connection:
+        def recv(self):
+            threads.append(current_thread())
+            value=commands.get(timeout=5)
+            if value is None:raise EOFError
+            return value
+        def send(self,value):
+            sent.append(value)
+            if value['kind']=='armed':armed.set()
+        def close(self):commands.put(None)
+    selected=dict(home='home',id='owner',history=[dict(key='response',response_status='created')])
+    snapshots=iter([
+        dict(usage_collection_complete=False,sessions=[],request_activity=[activity],errors=[],ts=1),
+        dict(usage_collection_complete=True,sessions=[selected],request_activity=[],errors=[],ts=2)])
+    monkeypatch.setattr(usage_collection.CollectorService,'poll',lambda *args,**kwargs:next(snapshots))
+    monkeypatch.setattr(usage_collection.CollectorService,'stopping',usage_collection.CollectorService.stopping)
+    def main():
+        assert armed.wait(5)
+        for _ in range(2):usage_collection.CollectorService.poll(SimpleNamespace(epoch='watcher-test-epoch'))
+        return 0
+    monkeypatch.setattr(usage_collection,'main',main)
+    monkeypatch.setattr(sys,'argv',[])
+    watcher_process(Connection(),tmp_path,tmp_path/'index',tmp_path/'evidence',tmp_path/'trace.jsonl',False)
+    for thread in set(threads):thread.join(5);assert not thread.is_alive()
+    collected=[value for value in sent if value['kind']=='collected']
+    assert len(collected)==1
+    assert collected[0]['selected']==selected and collected[0]['source_at']==2
+    assert collected[0]['activity']==[activity]
+
+
 def test_analyzer_publication_wakes_before_timer_and_freeze_reclaims_waiter(tmp_path):
     import multiprocessing as mp
+    from cachemonitor.analysis_delivery import SnapshotReceiver
     from cachemonitor.analysis_worker import process_main
-    from test_overlay import source
-    writer=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite')
-    writer.start_live()
-    context=mp.get_context('spawn');parent,child=context.Pipe()
+    from cachemonitor.usage_collection import CollectorService
+    from test_core import TID, fixture_home
+    from test_demand_loading import write_session
+    home,_=fixture_home(tmp_path)
+    write_session(home,TID)
+    service=CollectorService([home],tmp_path/'index.sqlite');writer=service.channel
+    context=mp.get_context('spawn');parent,child=context.Pipe();receiver=SnapshotReceiver()
     process=context.Process(target=process_main,args=(child,writer.homes,writer.path),
         kwargs={'quota_path':tmp_path/'quota.sqlite'})
     try:
-        value=snapshot(writer,time.time());session=source();session['home']=writer.homes[0]
-        value['sessions']=[session];writer.publish(value,'epoch',1)
+        service.poll(detailed=False)
         process.start();child.close()
-        deadline=time.monotonic()+15
+        parent.send(dict(kind='selected',owners=[(None,TID)]))
+        deadline=time.monotonic()+15;current=None
         while True:
             remaining=deadline-time.monotonic()
-            assert remaining>0 and parent.poll(remaining)
-            first=parent.recv();assert first['kind']=='snapshot',first
-            if first['value'].get('ledger_status_known'):break
+            assert remaining>0,dict(usage_complete=None if current is None else current['usage_collection_complete'],
+                overlays=[] if current is None else [(row['id'],row['calls']) for row in current['overlay_sessions']])
+            service.poll(detailed=False)
+            if not parent.poll(min(.05,remaining)):continue
+            first=parent.recv()
+            if first['kind']=='progress':
+                assert first.get('scope')=='startup',first
+                continue
+            assert first['kind']=='snapshot',first
+            current=receiver.receive(first['value'])
+            if current is not None and current['usage_collection_complete'] and any(
+                    row['id']==TID and row['calls']==1 for row in current['overlay_sessions']):break
         wait_until(lambda:bool(writer.live.waiters))
-        changed=copy.deepcopy(value);changed['ts']+=.25
-        started=time.perf_counter();writer.publish(changed,'epoch',2)
-        assert parent.poll(1)
-        second=parent.recv();assert second['kind']=='snapshot'
-        assert second['value']['ts']==changed['ts']
+        changed_at=current['ts']+.25
+        started=time.perf_counter();service.poll(now=changed_at,detailed=False)
+        while True:
+            remaining=1-(time.perf_counter()-started)
+            assert remaining>0 and parent.poll(remaining)
+            second=parent.recv();assert second['kind']=='snapshot'
+            current=receiver.receive(second['value'])
+            if current is not None and current['ts']==changed_at:break
+        assert {row['id'] for row in current['sessions']}=={TID}
+        assert {row['id'] for row in current['overlay_sessions']}=={TID}
+        assert current['overlay_sessions'][0]['calls']==1
         assert not second['value']['sessions'] and not second['value']['overlay_sessions']
         assert not second['value']['model_candidates'] and not second['value']['cache_candidates']
         assert time.perf_counter()-started<1
@@ -158,7 +269,7 @@ def test_analyzer_publication_wakes_before_timer_and_freeze_reclaims_waiter(tmp_
         if process.pid and process.is_alive():
             parent.send({'kind':'stop'});process.join(3)
             if process.is_alive():process.terminate();process.join()
-        parent.close();child.close();writer.close()
+        parent.close();child.close();service.close()
 
 
 def test_quiet_notifications_preserve_staleness_and_ledger_retry_deadlines(monkeypatch,tmp_path):
@@ -191,15 +302,20 @@ def test_quiet_notifications_preserve_staleness_and_ledger_retry_deadlines(monke
             super().__init__(*args,**kwargs)
     monkeypatch.setattr(prepared_runtime,'QuotaLedger',Ledger)
     with PreparedAnalysis(tmp_path,at=100.) as worker:
+        query=dict(page=2,start=99,end=200,now=200,period='custom',include_whole_history=False)
+        worker.parent.send(dict(kind='query',id=1,query=query,logical='initial-source'))
         worker.wait_snapshot(lambda value:value.get('ledger_error'))
         target[0]=105.
         recovered=worker.wait_snapshot(lambda value:value.get('ledger_status_known') and not value.get('ledger_error'))
         assert opens==[100.,105.]
         token=recovered['prepared_token']
+        revision=recovered['overlay_sessions'][0]['_overlay_revision']
         target[0]=130.02
         stale=worker.wait_snapshot(lambda value:value.get('collection_stale'))
         assert any(130.<at<130.1 for at in reads)
-        assert stale['ts']==100. and stale['prepared_token']==token
+        assert stale['ts']==100. and stale['prepared_token'][0]==token[0]
+        assert stale['prepared_token'][1]>=token[1]
+        assert stale['overlay_sessions'][0]['_overlay_revision']==revision
         assert not stale['usage_collection_complete'] and not stale['index']['usage_complete']
         assert not stale['errors']
         worker.assert_calls_and_detail()
@@ -207,17 +323,21 @@ def test_quiet_notifications_preserve_staleness_and_ledger_retry_deadlines(monke
         fresh_at=clock[0]
         worker.publish(at=fresh_at,errors=['retained source error'])
         fresh=worker.wait_snapshot(lambda value:value['ts']==fresh_at and not value.get('collection_stale'))
-        assert fresh['usage_collection_complete'] and fresh['prepared_token']==token
+        assert fresh['usage_collection_complete'] and fresh['prepared_token'][0]==token[0]
+        assert fresh['prepared_token'][1]>=stale['prepared_token'][1]
+        assert fresh['overlay_sessions'][0]['_overlay_revision']==revision
         worker.channel.close()
         target[0]=fresh_at+34
         disconnected=worker.wait_snapshot(lambda value:value.get('collection_stale'))
         assert disconnected['ts']==fresh_at and disconnected['errors']==['retained source error']
-        assert disconnected['prepared_token']==token and not disconnected['usage_collection_complete']
+        assert disconnected['prepared_token'][0]==token[0] and not disconnected['usage_collection_complete']
+        assert disconnected['prepared_token'][1]>=fresh['prepared_token'][1]
+        assert disconnected['overlay_sessions'][0]['_overlay_revision']==revision
         worker.assert_calls_and_detail()
-        query=dict(page=2,start=99,end=200,now=200,period='custom',include_whole_history=False)
         worker.parent.send(dict(kind='query',id=2,query=query,logical='stale-source'))
         result=worker.wait_for(lambda value:value.get('id')==2 and value.get('kind')=='result')
-        assert result['kind']=='result' and result['result']['prepared_token']==token
+        assert result['kind']=='result' and result['result']['prepared_token'][0]==token[0]
+        assert result['result']['prepared_token'][1]>=disconnected['prepared_token'][1]
 
 
 def test_new_session_loading_does_not_reprocess_existing_call_history(tmp_path):
@@ -1365,4 +1485,247 @@ def test_lineage_catalog_preserves_parent_policy_without_full_metadata_scans(tmp
                 assert {key:entry['owner_lineage'] for key,entry in old['owners'].items()}=={
                     key:entry['owner_lineage'] for key,entry in catalog['owners'].items()}
         assert reader.channel.identity is None and not reader.channel.session_cache
+    finally:reader.close();writer.close()
+
+
+def membership_snapshot(channel, count=64, width=300):
+    value=snapshot(channel)
+    home=channel.homes[0]
+    ids=[f'owner-{n}-'+('x'*width) for n in range(count)]
+    value.update(catalog_complete=True,demand=dict(selected=[[None,ids[0]]],aggregate=False,evidence=[]),
+        session_catalog=[[home,sid,ids[n-1] if n else None] for n,sid in enumerate(ids)],
+        demand_members=[[home,sid] for sid in ids])
+    value['sessions'][0]['id']=ids[0]
+    return value
+
+
+def test_catalog_pages_preserve_source_membership_before_loaded_owners(tmp_path,monkeypatch):
+    from cachemonitor import usage_collection as collection
+    monkeypatch.setattr(collection,'CATALOG_PAGE_ROWS',3)
+    monkeypatch.setattr(collection,'CATALOG_PAGE_BYTES',32*1024)
+    writer=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite');writer.start_live()
+    reader=CollectionChannel(writer.homes,writer.path)
+    try:
+        value=membership_snapshot(writer)
+        assert len(json.dumps(value).encode())>collection.CATALOG_PAGE_BYTES
+        writer.publish(value,'epoch',1)
+        pages=[];cursor=None
+        while True:
+            page=reader.read_catalog(source='live',cursor=cursor,include_metadata=True)
+            pages.append(page)
+            assert page['catalog_identity']==('epoch',1) and page['membership_complete']
+            assert 'session_catalog' not in page['header'] and 'demand_members' not in page['header']
+            assert len(page['membership']['session_catalog'])+len(page['membership']['demand_members'])+len(page['owners'])<=3
+            cursor=page['cursor']
+            if cursor is None:break
+            assert len(pages)<100
+            assert cursor['membership_format']=='paged-v1'
+        assert [row for page in pages for row in page['membership']['session_catalog']]==value['session_catalog']
+        assert [row for page in pages for row in page['membership']['demand_members']]==value['demand_members']
+        owners={key:entry for page in pages for key,entry in page['owners'].items()}
+        key=(writer.homes[0],value['sessions'][0]['id'])
+        assert list(owners)==[key]
+        assert reader.read_owners([key],catalog=pages[-1])['sessions']==value['sessions']
+    finally:reader.close();writer.close()
+
+
+@pytest.mark.parametrize('live',[False,True])
+@pytest.mark.parametrize('passive',[False,True])
+def test_status_projection_preserves_full_catalog_and_body_readers(tmp_path,monkeypatch,live,passive):
+    from cachemonitor import usage_collection as collection
+    monkeypatch.setattr(collection,'CATALOG_PAGE_BYTES',16*1024)
+    writer=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite')
+    if live:writer.start_live()
+    reader=CollectionChannel(writer.homes,writer.path)
+    status=collection.CollectionHeaderReader(writer.homes,writer.path) if passive else reader
+    try:
+        value=membership_snapshot(writer)
+        assert len(json.dumps(value).encode())>2*collection.CATALOG_PAGE_BYTES
+        writer.publish(value,'epoch',1)
+        header=status.read_header()
+        assert header['ts']==value['ts'] and header['index']==value['index']
+        assert header['usage_collection_complete'] and header['catalog_complete']
+        assert not {'sessions','session_manifest','session_catalog','demand_members'}&header.keys()
+        assert reader.read(shared=True)==value
+        catalog=reader.read_catalog()
+        assert catalog['header']['session_catalog']==value['session_catalog']
+        assert catalog['header']['demand_members']==value['demand_members']
+        assert reader.read(shared=True)==value
+        row=writer.db.execute('SELECT * FROM snapshot WHERE id=1').fetchone()
+        assert len(row)==6
+        import zlib
+        durable=json.loads(zlib.decompress(row[5]))
+        assert durable['session_catalog']==value['session_catalog']
+        assert durable['demand_members']==value['demand_members']
+        if live:
+            for protocol in (3,4,5):
+                metadata,body=writer.live.request(dict(path=str(writer.path),scope=writer.scope,protocol=protocol,activity_stream=True))
+                assert metadata['ready'] and metadata['header']['session_catalog']==value['session_catalog']
+                assert metadata['header']['demand_members']==value['demand_members'] and body
+    finally:
+        if passive:status.close()
+        reader.close();writer.close()
+
+
+def test_optional_analysis_proof_capacity_keeps_canonical_title_and_facts(tmp_path):
+    writer=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite');writer.start_live()
+    reader=CollectionChannel(writer.homes,writer.path)
+    try:
+        value=snapshot(writer)
+        value['sessions'][0]['title']='title-'+('x'*5000)
+        writer.publish(value,'epoch',1)
+        assert reader.read(shared=True)==value
+        catalog=reader.read_catalog(source='live',include_metadata=True,metadata_kind='lineage')
+        key=(writer.homes[0],'session')
+        assert reader.read_owners([key],catalog=catalog)['sessions']==value['sessions']
+        stream=reader.selected_owner_stream(key,catalog=catalog)
+        with stream:records=list(stream.records())
+        assert stream.verified
+        assert [row[4] for row in records if row[0]=='history' and row[1]=='item']==value['sessions'][0]['history']
+    finally:reader.close();writer.close()
+
+
+def test_append_availability_does_not_depend_on_source_membership_size(tmp_path):
+    writer=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite');writer.start_live()
+    try:
+        value=membership_snapshot(writer,count=900)
+        writer.publish(value,'epoch',1)
+        metadata,body=writer.live.request(dict(path=str(writer.path),scope=writer.scope,protocol=6,read='append',
+            homes=writer.homes,catalog_identity=('epoch',1),owner=[writer.homes[0],value['sessions'][0]['id']],
+            prior_body_digest='0'*64))
+        assert not metadata['ready'] and metadata['error']=='append_unavailable' and not body
+    finally:writer.close()
+
+
+@pytest.mark.extended
+def test_real_default_membership_growth_exceeds_old_full_header_limits(tmp_path):
+    from cachemonitor import usage_collection as collection
+    writer=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite');writer.start_live()
+    reader=CollectionChannel(writer.homes,writer.path)
+    status=collection.CollectionHeaderReader(writer.homes,writer.path)
+    try:
+        value=membership_snapshot(writer,count=2496,width=1800)
+        assert len(json.dumps({key:item for key,item in value.items() if key!='sessions'}).encode())>8*1024*1024
+        writer.publish(value,'epoch',1)
+        session_rows=[];demand_rows=[];owners={};cursor=None
+        while True:
+            page=reader.read_catalog(source='live',cursor=cursor)
+            assert page['membership_complete'] and page['catalog_identity']==('epoch',1)
+            session_rows.extend(page['membership']['session_catalog'])
+            demand_rows.extend(page['membership']['demand_members'])
+            owners.update(page['owners']);cursor=page['cursor']
+            if cursor is None:break
+        assert session_rows==value['session_catalog'] and demand_rows==value['demand_members']
+        assert list(owners)==[(writer.homes[0],value['sessions'][0]['id'])]
+        assert status.read_header()['index']==value['index']
+        assert reader.read_header()['ts']==value['ts']
+        status.close();reader.close()
+        writer.live_server.close();writer.live_server=None
+        writer.live.close();writer.live=None
+        reader=CollectionChannel(writer.homes,writer.path)
+        status=collection.CollectionHeaderReader(writer.homes,writer.path)
+        assert status.read_header()['usage_collection_complete']
+        assert reader.read_header()['catalog_complete']
+        assert reader.read(shared=True)==value
+    finally:status.close();reader.close();writer.close()
+
+
+@pytest.mark.parametrize('present',[False,True])
+def test_paged_membership_distinguishes_absent_and_empty_source_sections(tmp_path,present):
+    writer=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite');writer.start_live()
+    reader=CollectionChannel(writer.homes,writer.path)
+    try:
+        value=snapshot(writer)
+        if present:value.update(session_catalog=[],demand_members=[])
+        writer.publish(value,'epoch',1)
+        page=reader.read_catalog(source='live')
+        assert page['membership_format']=='paged-v1'
+        assert page['membership']==({'session_catalog':[],'demand_members':[]} if present else {})
+        assert page['cursor'] is None and page['membership_complete']
+        assert list(page['owners'])==[(writer.homes[0],'session')]
+    finally:reader.close();writer.close()
+
+
+def test_catalog_legacy_peer_retains_membership_during_selected_body_read(tmp_path,monkeypatch):
+    from cachemonitor import usage_collection as collection
+    monkeypatch.setattr(collection,'CATALOG_PAGE_ROWS',1)
+    writer=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite');writer.start_live()
+    reader=CollectionChannel(writer.homes,writer.path)
+    original=writer.live.catalog_request
+    def older(current,request):
+        return original(current,{key:item for key,item in request.items() if key!='membership_format'})
+    monkeypatch.setattr(writer.live,'catalog_request',older)
+    try:
+        value=membership_snapshot(writer,count=2,width=10)
+        value['sessions'].append(dict(value['sessions'][0],id=value['session_catalog'][1][1]))
+        writer.publish(value,'epoch',1)
+        first=reader.read_catalog(source='live')
+        assert 'membership' not in first and 'membership_format' not in first
+        assert first['header']['session_catalog']==value['session_catalog']
+        second=reader.read_catalog(source='live',cursor=first['cursor'])
+        assert second['cursor'] is None and 'membership' not in second
+        assert second['header']['demand_members']==value['demand_members']
+        key=next(iter(first['owners']))
+        selected=reader.read_owners([key],catalog=first)
+        assert selected['sessions']==value['sessions'][:1]
+        assert selected['catalog']['header']['session_catalog']==value['session_catalog']
+        assert selected['catalog']['header']['demand_members']==value['demand_members']
+    finally:reader.close();writer.close()
+
+
+def test_paged_catalog_rejects_membership_layout_change_during_traversal(tmp_path,monkeypatch):
+    from cachemonitor import usage_collection as collection
+    monkeypatch.setattr(collection,'CATALOG_PAGE_ROWS',1)
+    writer=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite');writer.start_live()
+    reader=CollectionChannel(writer.homes,writer.path)
+    try:
+        value=membership_snapshot(writer,count=2,width=10)
+        writer.publish(value,'epoch',1)
+        page=reader.read_catalog(source='live')
+        original=writer.live.catalog_request
+        def older(current,request):
+            return original(current,{key:item for key,item in request.items() if key!='membership_format'})
+        monkeypatch.setattr(writer.live,'catalog_request',older)
+        with pytest.raises(collection.CollectionCatalogUnavailable,match='membership_format'):
+            reader.read_catalog(source='live',cursor=page['cursor'])
+    finally:reader.close();writer.close()
+
+
+def test_catalog_scan_budget_includes_filtered_owner_positions(tmp_path,monkeypatch):
+    from cachemonitor import usage_collection as collection
+    monkeypatch.setattr(collection,'CATALOG_PAGE_ROWS',1)
+    writer=CollectionChannel([tmp_path/'one',tmp_path/'two'],tmp_path/'index.sqlite');writer.start_live()
+    reader=CollectionChannel(writer.homes[:1],writer.path)
+    try:
+        value=snapshot(writer)
+        value['sessions']=[dict(value['sessions'][0],home=writer.homes[1],id='filtered'),value['sessions'][0]]
+        value.update(session_catalog=[[writer.homes[1],'unloaded',None]],demand_members=[])
+        writer.publish(value,'epoch',1)
+        first=reader.read_catalog(source='live')
+        assert first['membership']['session_catalog']==value['session_catalog'] and first['owners']=={}
+        filtered=reader.read_catalog(source='live',cursor=first['cursor'])
+        assert filtered['membership']=={'session_catalog':[],'demand_members':[]} and filtered['owners']=={}
+        assert filtered['cursor'] is not None and filtered['membership_complete']
+        selected=reader.read_catalog(source='live',cursor=filtered['cursor'])
+        assert selected['cursor'] is None and list(selected['owners'])==[(writer.homes[0],'session')]
+    finally:reader.close();writer.close()
+
+
+@pytest.mark.parametrize('suffix',[b'\0'*70000,b'\0'*70000+b'invalid'],ids=['zero-padding','nonzero-padding'])
+def test_durable_status_validates_padding_after_the_zlib_stream(tmp_path,suffix):
+    import zlib
+    from cachemonitor import usage_collection as collection
+    writer=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite')
+    reader=collection.CollectionHeaderReader(writer.homes,writer.path)
+    try:
+        value=snapshot(writer)
+        writer.publish(value,'epoch',1)
+        raw=json.dumps(value,ensure_ascii=False).encode()
+        with writer.db:
+            writer.db.execute('UPDATE snapshot SET payload=? WHERE id=1',(zlib.compress(raw)+suffix,))
+        if suffix.endswith(b'invalid'):
+            with pytest.raises(collection.CollectionScopeError):reader.read_header()
+        else:
+            assert reader.read_header()['index']==value['index']
+            assert 'sessions' not in reader.header
     finally:reader.close();writer.close()

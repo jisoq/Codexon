@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import time
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
@@ -22,6 +23,7 @@ from .notifications import ConfirmedNotifications
 from .theme import shared_theme
 from .version import VERSION
 from .i18n import tr, Verbatim, formatted
+from .preparation_progress import PreparationPending, PreparationStage, PreparationWork, preparation_loading
 
 STYLE = ''
 TITLES = {1:'지표 비교',3:'구독 모니터링',4:'설정',5:'성능 추이',6:'홈',7:'모델명 불일치 기록'}
@@ -78,7 +80,9 @@ class Dashboard(TrayWindow):
         self.model_evidence_path=model_evidence_path
         self.snapshot={'ts':time.time(),'sessions':[],'homes':homes,'unassigned':[],'errors':[]}
         self.quitting=False;self.worker=None;self.engine=AnalysisEngine();self.async_mode=start_worker
-        self.analysis=analyze([]);self.analysis_pending=False;self.analysis_errors=[];self.analysis_error_history=[]
+        self.preparation=(PreparationPending(time.monotonic(),PreparationStage.STARTING)
+                          if start_worker and static_snapshot is None else None)
+        self.analysis=analyze([]);self.analysis_pending=False;self.analysis_errors=[]
         self.client_cache=BoundedCache(8,64*1024*1024);self.request_id=0;self.view_result=None;self.applied_key=None
         self.display_identity=None;self.pending_retained=False;self.displayed_pages={}
         self.lookup={'sessions':{},'turns':{},'session_turns':{}};self.page_frames={}
@@ -325,6 +329,14 @@ class Dashboard(TrayWindow):
         if not hasattr(self,'quota_panel'):return
         visible=self.isVisible() and not self.isMinimized()
         page=getattr(self,'current_page',3)
+        if self.worker is not None and hasattr(self.worker,'cancel_queries') and (not visible or page in (3,4,7)):
+            self.worker.cancel_queries()
+            if self.analysis_pending:
+                self.request_id+=1;self.analysis_pending=False
+                self.deferred_result=None;self.defer_timer.stop()
+                self.clear_analysis_loading();self._display_dirty=True
+        if visible and getattr(self,'_display_dirty',False):
+            self._display_dirty=False;QTimer.singleShot(0,lambda:self.render(automatic=True))
         self.quota_panel.set_presentation_active(visible and page==3)
         for service in getattr(self,'quota_services',{}).values():
             service.set_reports_enabled(visible and page==3 and service is self.quota_service)
@@ -432,7 +444,7 @@ class Dashboard(TrayWindow):
                 self.applied_key=self.view_result['key']
         self.price_button.setVisible(index not in (4,6,7));self.clear_analysis_loading()
         if hasattr(self,'quota_pause_button'):self.refresh_quota_monitoring()
-        self.render();self.save_preferences()
+        self.render();self.sync_preparation();self.save_preferences()
         if index==5:QTimer.singleShot(0,self.update_performance_layout)
 
     def open_home_connection(self):
@@ -446,7 +458,7 @@ class Dashboard(TrayWindow):
             source_observed=(self.home_collection_status.get('collection_observation') or {}).get('source_fault') is not None
             evidence['collection_fault']={**({} if source_observed else self.snapshot.get('collection_fault') or {}),
                 **{key:value for key,value in (self.home_collection_status.get('collection_fault') or {}).items() if value}}
-            self.home_panel.apply_status(evidence,self.home_quota_payload,time.time())
+            self.home_panel.apply_status(evidence,self.home_quota_payload,time.time(),preparing=self.preparation is not None)
             from .app_errors import collection_phase
             phase=collection_phase(evidence,time.time(),started_at=self.started_at)
             self.quota_panel.set_collection_phase(phase)
@@ -550,7 +562,7 @@ class Dashboard(TrayWindow):
 
     def update_discovered(self,release):
         self.update_available.setVisible(bool(release))
-        if not release:return
+        if not release or self.update_panel.auto_start:return
         from .i18n import formatted
         tag=release['tag_name'];version=tag.lstrip('v')
         monitor=self.update_monitor
@@ -581,7 +593,7 @@ class Dashboard(TrayWindow):
 
     def render(self,*_,automatic=False):
         if self.restoring or not hasattr(self,'settings_page'):return
-        if automatic and (not self.isVisible() or self.isMinimized()):
+        if (self.async_mode or automatic) and (not self.isVisible() or self.isMinimized()):
             self._display_dirty=True;return
         if self.current_page==7:
             self.mismatch_page.refresh(automatic=automatic)
@@ -673,6 +685,21 @@ class Dashboard(TrayWindow):
 
     def update_refresh_status(self):
         state=self.analysis_loading
+        if self.preparation is not None and state and not (state.get('retained') and state.get('mode')=='error'):
+            self.refresh_text.setWordWrap(True);self.refresh_text.put(noElide=True,maxWidth=16777215)
+            visible=not self.analysis_regions() or bool(state.get('retained'))
+            running=visible and bool(state.get('running'))
+            self.refresh_status.setVisible(running);self.refresh_status.put(running=running)
+            self.refresh_text.setVisible(visible)
+            text=' / '.join(filter(None,(state.get('title'),state.get('progressText'),state.get('elapsedText'))))
+            description='\n'.join(filter(None,(text,state.get('detail'),state.get('guidanceText'))))
+            self.refresh_text.setText(Verbatim(text));self.refresh_text.setAccessibleName(Verbatim(description))
+            self.refresh_status.setAccessibleName(Verbatim(state.get('title','')))
+            self.refresh_status.setToolTip(Verbatim(description))
+            return
+        self.refresh_text.setWordWrap(False);self.refresh_text.put(noElide=False,maxWidth=260)
+        self.refresh_text.setAccessibleName('');self.refresh_status.setAccessibleName('최신 기록 반영 중')
+        self.refresh_status.setToolTip('')
         refreshing=self.current_page!=3 and bool(state.get('active') and state.get('retained'))
         failed=state.get('mode')=='error' and state.get('retained')
         self.refresh_status.setVisible(refreshing and not failed)
@@ -700,6 +727,8 @@ class Dashboard(TrayWindow):
             self.slow_timer.start();self.analysis_clock.start();self.update_analysis_elapsed()
 
     def update_analysis_elapsed(self):
+        if self.preparation is not None:
+            self.sync_preparation();return
         if not self.analysis_loading or not self.analysis_loading.get('running'):return
         if not self.analysis_pending and not self.analysis_loading.get('collectionWait'):return
         elapsed=max(0,int(time.monotonic()-self.analysis_started))
@@ -707,25 +736,40 @@ class Dashboard(TrayWindow):
             elapsedText=formatted('{seconds}초 경과',seconds=elapsed),slow=bool(self.analysis_loading.get('slow') or elapsed>=5)))
 
     def set_analysis_stage(self,stage):
-        stages={'queued':'분석에 사용할 기록을 준비하고 있습니다.',
-                'query':'선택한 조건에 맞는 사용 기록을 읽고 있습니다.',
-                'aggregate':'조회한 기록으로 지표를 계산하고 있습니다.',
-                'present':'화면의 구성 요소를 준비하고 있습니다.'}
+        stages={'queued':(0,'분석에 사용할 기록을 준비하고 있습니다.'),
+                'collecting':(0,'저장된 Codex 사용 기록을 읽고 있습니다.'),
+                'converting':(0,'확인한 기록으로 사용량을 계산하고 있습니다.'),
+                'publishing':(0,'확인한 사용량을 화면에 반영하고 있습니다.'),
+                'query':(1,'선택한 조건에 맞는 사용 기록을 읽고 있습니다.'),
+                'aggregate':(2,'조회한 기록으로 지표를 계산하고 있습니다.'),
+                'present':(3,'화면의 구성 요소를 준비하고 있습니다.')}
         self.analysis_stage=stage
+        if self.preparation is not None:
+            self.sync_preparation();return
         if self.analysis_loading:
             state=dict(self.analysis_loading)
             if state.get('stageName')!=stage:
                 for key in ('processed','total','progressText'):state.pop(key,None)
-            self.set_analysis_loading(dict(state,stageName=stage,stage=list(stages).index(stage) if stage in stages else 0,
-                                           detail=tr(stages.get(stage,stages['queued']))))
+            position,detail=stages.get(stage,stages['queued'])
+            self.set_analysis_loading(dict(state,stageName=stage,stage=position,detail=tr(detail)))
 
     @batched_updates
     def analysis_progressed(self,message):
+        if isinstance(message,(PreparationStage,PreparationWork)):
+            overlay=getattr(self,'overlay',None)
+            if overlay is not None and overlay.preparation is not None:
+                overlay.receive_preparation(replace(overlay.preparation,progress=message))
+            if self.preparation is not None:
+                self.preparation=replace(self.preparation,progress=message)
+                self.sync_preparation()
+            return
         if message.get('id')==self.request_id and self.analysis_pending:
             self.set_analysis_stage(message.get('stage'))
+            if self.preparation is not None:return
             done=message.get('processed');total=message.get('total')
             if type(done) is int and done>=0 and self.analysis_loading:
-                templates={'calls':'처리한 호출 {count}건','intervals':'계산 구간 {count}','sessions':'확인한 세션 {count}개'}
+                templates={'calls':'처리한 호출 {count}건','intervals':'계산 구간 {count}',
+                           'sessions':'확인한 세션 {count}개','files':'확인한 파일 {count}개'}
                 count=f'{done:,} / {total:,}' if type(total) is int and total>=done else f'{done:,}'
                 detail=formatted(templates.get(message.get('unit'),templates['calls']),count=count)
                 calls=message.get('calls')
@@ -741,6 +785,8 @@ class Dashboard(TrayWindow):
             mode='error' if retry else 'loading',title=tr(title),detail=tr(detail)))
 
     def show_analysis_pending(self):
+        if self.preparation is not None:
+            self.sync_preparation();return
         if not self.analysis_pending or self.current_page in (3,4):return
         if self.pending_retained:
             self.set_analysis_loading(dict(active=True,retained=True,running=True,title=tr('최신 기록 반영 중'),detail=''))
@@ -751,6 +797,7 @@ class Dashboard(TrayWindow):
             self.set_analysis_stage(self.analysis_stage)
 
     def show_analysis_slow(self):
+        if self.preparation is not None:return
         if not self.analysis_loading or not self.analysis_loading.get('running') or self.current_page in (3,4):return
         self.set_analysis_loading(dict(self.analysis_loading,slow=True))
 
@@ -801,7 +848,34 @@ class Dashboard(TrayWindow):
             self.worker.restart_count=0;self.worker.start()
         elif self.worker is not None and any(facts.get('publication_failed') for facts in self.analysis_errors):
             self.worker.request_snapshot()
+        if getattr(self,'preparation',None) is not None:self.analysis_errors.clear()
         self.client_cache.clear();self.pending_logical=None;self.render()
+        if getattr(self,'preparation',None) is not None:self.sync_preparation()
+
+    def sync_preparation(self):
+        pending=self.preparation
+        overlay=getattr(self,'overlay',None)
+        if pending is None:
+            return
+        from .app_errors import collection_phase
+        phase=collection_phase({**self.snapshot,**self.home_collection_status},time.time(),started_at=self.started_at)
+        if overlay:overlay.receive_preparation(None if self.analysis_errors or phase in ('failed','delayed','stopped') else pending)
+        if self.analysis_errors:
+            self.show_analysis_message('현재 조건의 결과를 불러오지 못했으므로 잠시 후 다시 시도해주세요.','',retry=True)
+            self.retry_button.show()
+            return
+        if phase in ('failed','delayed','stopped'):
+            stopped=phase=='stopped'
+            self.show_analysis_message('사용 기록 수집 중지' if stopped else '사용 기록 수집 확인 필요',
+                '자동 수집이 중지되었습니다. 확인된 기록은 계속 표시합니다.' if stopped else
+                '기록 수집이 지연되거나 중단되었습니다. 수집 상태를 확인하거나 다시 시도하세요.',retry=not stopped)
+            if stopped:self.set_analysis_loading(dict(self.analysis_loading,running=False,mode='empty'))
+            self.retry_button.setVisible(not stopped)
+            return
+        state=preparation_loading(pending,now=time.monotonic())
+        state['retained']=bool(self.pending_retained and self.analysis_regions())
+        self.set_analysis_loading(state)
+        self.retry_button.hide()
 
 
     def receive_collection_observation(self,value):
@@ -835,6 +909,14 @@ class Dashboard(TrayWindow):
         if overlay:overlay.receive_collection_status(result)
 
     def receive(self,value):
+        preparing=self.preparation is not None
+        self.preparation=None
+        if preparing:
+            self.clear_analysis_loading()
+            if self.analysis_pending:
+                self.show_analysis_pending()
+                if self.analysis_loading.get('running'):
+                    self.analysis_clock.start();self.slow_timer.start();self.update_analysis_elapsed()
         if value.get('epoch')!=self.snapshot.get('epoch'):
             self.collection_wait_started=None
             self.client_cache.clear()
@@ -947,7 +1029,7 @@ class Dashboard(TrayWindow):
         self.observe_error('analysis.query' if facts.get('query_failed') else 'analysis.process','analysis',facts)
         self.client_cache.clear();self.pending_logical=None
         self.request_id+=1;self.deferred_result=None;self.defer_timer.stop();self.clear_analysis_loading()
-        self.analysis_pending=False;self.analysis_errors=[facts];self.analysis_error_history=(self.analysis_error_history+[facts])[-10:]
+        self.analysis_pending=False;self.analysis_errors=[facts]
         if self.current_page not in (3,4):
             if not facts['retained']:
                 self.show_analysis_message('현재 조건의 결과를 불러오지 못했으므로 잠시 후 다시 시도해주세요.','',retry=True)
@@ -980,8 +1062,6 @@ class Dashboard(TrayWindow):
         self.sync_report_demand()
         self.quota_sidebar.refresh_status()
         self.refresh_home_status()
-        if getattr(self,'_display_dirty',False):
-            self._display_dirty=False;QTimer.singleShot(0,lambda:self.render(automatic=True))
 
     def hideEvent(self,event):
         super().hideEvent(event);self.sync_report_demand()
@@ -993,6 +1073,7 @@ class Dashboard(TrayWindow):
     def closeEvent(self,event):
         self.settings.setValue('dashboard/geometry',self.saveGeometry());self.save_preferences();super().closeEvent(event)
     def check_stale(self):
+        self.sync_preparation()
         if not self.quitting:
             from .app_errors import collection_phase,collection_publication_at
             evidence={**self.snapshot,**self.home_collection_status}
@@ -1138,7 +1219,7 @@ class Dashboard(TrayWindow):
         self.settings_page.add_row('about','업데이트 자동 확인',
             '앱 실행 중 6시간 간격으로 새 버전을 확인합니다.',
             self.auto_update,section='버전',aliases='automatic update',depth=1)
-        self.settings_page.add_widget('about',self.update_panel,section='업데이트',title='업데이트 확인',target=self.update_panel.button,aliases='정보 문제 해결 update')
+        self.settings_page.add_widget('about',self.update_panel,section='업데이트',title='업데이트 확인',target=self.update_panel,aliases='정보 문제 해결 update')
         self.recovery_button=SettingsPage.shortcut('연결 복구',self.update_panel.open_recovery)
         self.recovery_status=Text();self.recovery_status.setWordWrap(True)
         self.update_panel.recovery_status=self.recovery_status

@@ -31,6 +31,20 @@ def test_long_line_partial_tail_truncation_and_same_path_replacement(tmp_path):
     assert observe_selection([dict(hwnd=1,pid=42)],reader,1.3)['selection'].thread_id==B
 
 
+@pytest.mark.parametrize('leading', [b'', b'\n'])
+def test_route_line_at_read_limit_is_independent_of_alignment(tmp_path, leading):
+    path=logfile(tmp_path);reader=RouteLog(tmp_path)
+    prefix=route(A).rstrip('\n').encode()
+    line=prefix+b' '*(reader.READ_LIMIT-len(prefix))
+    path.write_bytes(leading+line+b'\n')
+    selected=None
+    for index in range(3):
+        selected=reader.poll(42,index*.1)
+        if reader.caught_up:break
+    assert reader.caught_up
+    assert selected is not None and selected.thread_id==A
+
+
 @pytest.mark.skipif(sys.platform!='win32',reason='Owned native Windows windows')
 def test_unrelated_partial_log_keeps_native_overlay_visible_and_navigation_disabled(tmp_path,monkeypatch):
     from cachemonitor.overlay_windows import SelectionTracker,WindowsOverlay

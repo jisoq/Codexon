@@ -4,14 +4,14 @@ import pytest
 
 from tools import ci_plan
 from tools.ci_plan import build_plan
-from tools.verify_changes import CORE_TESTS
+from tools.verify_changes import basic_tests
 
 
 def test_missing_baseline_uses_basic_source_and_native_deployment_contracts():
     plan = build_plan(None, candidate=True)
     assert plan['source_args'] == ['--basic']
     assert plan['source_suite'] == 'basic'
-    assert plan['tests'] == tuple(sorted(CORE_TESTS))
+    assert plan['tests'] == basic_tests()
     assert plan['affected_tests'] == () and not plan['full']
     assert plan['package'] and plan['native'] and plan['rust']
     assert not any(plan[key] for key in ('msix', 'proxy', 'scales', 'gui_handoff'))
@@ -27,7 +27,7 @@ def test_shared_dependency_change_keeps_basic_source_and_packages_current_produc
 
 def test_policy_only_checks_keep_fixed_basic_selection_without_an_installer():
     plan = build_plan({'tools/source_receipt.py'}, base='verified')
-    assert plan['tests'] == tuple(sorted(CORE_TESTS))
+    assert plan['tests'] == basic_tests()
     assert plan['rust'] and not plan['package']
 
 
@@ -41,7 +41,7 @@ def test_extended_always_remains_explicit_and_includes_all_contracts():
 
 def test_source_baseline_does_not_hide_failed_deployment_contracts():
     plan = build_plan(set(), base='source-passed', package_changed={'cachemonitor/install_activation.py'})
-    assert plan['tests'] == tuple(sorted(CORE_TESTS))
+    assert plan['tests'] == basic_tests()
     assert plan['package'] and plan['native']
     assert not plan['proxy'] and not plan['msix']
 
@@ -96,7 +96,7 @@ def test_serena_project_configuration_has_no_runtime_or_deployment_impact(change
     plan = build_plan(changed, base='verified', package_changed=package_changed)
     assert not plan['unmapped']
     assert plan['source_args'] == ['--basic']
-    assert plan['tests'] == tuple(sorted(CORE_TESTS))
+    assert plan['tests'] == basic_tests()
     assert not plan['affected_tests'] and not plan['full']
     assert not plan['package'] and not plan['package_impact']
     assert not plan['qa_smokes'] and not plan['dependencies']
@@ -140,7 +140,7 @@ def test_planned_source_reuse_skips_only_the_completed_source_native_demand(tmp_
     assert plan['source_reuse_run'] == ('10' if hit else '')
     assert plan['rust'] == (package or not hit)
     assert plan['package'] is package and plan['native'] is package
-    assert plan['tests'] == sorted(CORE_TESTS) and plan['source_args'] == ['--basic']
+    assert plan['tests'] == list(basic_tests()) and plan['source_args'] == ['--basic']
     assert json.loads((tmp_path/'artifacts/verification/plan.json').read_text()) == plan
 
 

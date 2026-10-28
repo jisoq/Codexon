@@ -17,6 +17,7 @@ import time
 import uuid
 import zlib
 from collections import OrderedDict
+from collections.abc import Mapping, Set
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import wraps
@@ -26,10 +27,10 @@ from cachemonitor.analysis_records import compact_record, public_record
 from cachemonitor.observer_state import ProcessLock
 
 
-FORMAT = 7
+FORMAT = 9
 APPLICATION_ID = 0x43505250
 # Only versions whose dedicated, disposable schema is known to this writer.
-REBUILDABLE_FORMATS = frozenset((1, 2, 3, 4, 5, 6))
+REBUILDABLE_FORMATS = frozenset((1, 2, 3, 4, 5, 6, 7, 8))
 METRICS = (
     'ts', 'session_ordinal', 'input', 'cached', 'written', 'output', 'reasoning',
     'total', 'uncached', 'ordinary_input', 'non_reasoning', 'rate', 'cost',
@@ -102,8 +103,6 @@ class IncompletePublication(PreparedError):
 
 @dataclass(frozen=True)
 class Limits:
-    # The main-file limit includes current, staging, obsolete rows, and indices.
-    database_bytes: int = 1024 * 1024 * 1024
     wal_bytes: int = 128 * 1024 * 1024
     write_reserve_bytes: int = 32 * 1024 * 1024
     staging_bytes: int = 256 * 1024 * 1024
@@ -142,6 +141,377 @@ class Page:
     complete: bool
     encoded_bytes: int
     object_bytes: int
+
+
+class _CatalogOwners(Mapping):
+    def __init__(self, catalog, *, financial):
+        self.catalog = catalog
+        self.financial = financial
+
+    def _where(self):
+        return 'admitted=1' if self.financial else 'admitted!=1 AND complete=1'
+
+    def __len__(self):
+        self.catalog.check()
+        return self.catalog.db.execute('SELECT count(*) FROM catalog_work_owners '
+            'WHERE work=? AND '+self._where(), (self.catalog.work,)).fetchone()[0]
+
+    def __iter__(self):
+        for row in self.catalog.owner_rows(self._where(), fields='home,sid'):
+            yield row['home'], row['sid']
+
+    def __getitem__(self, key):
+        self.catalog.check()
+        row = self.catalog.db.execute('SELECT entry,ordinal,financial_ordinal FROM catalog_work_owners '
+            'WHERE work=? AND home=? AND sid=? AND '+self._where(), (self.catalog.work,*key)).fetchone()
+        if row is None:
+            raise KeyError(key)
+        return self.catalog.owner_entry(row, financial=self.financial)
+
+    def items(self):
+        for row in self.catalog.owner_rows(self._where()):
+            yield (row['home'],row['sid']), self.catalog.owner_entry(row, financial=self.financial)
+
+    def values(self):
+        for _, entry in self.items():
+            yield entry
+
+
+class _CatalogMembers(Set):
+    def __init__(self, catalog):
+        self.catalog = catalog
+
+    def __len__(self):
+        self.catalog.check()
+        return self.catalog.db.execute('SELECT count(*) FROM catalog_work_sessions '
+            'WHERE work=? AND required=1', (self.catalog.work,)).fetchone()[0]
+
+    def __contains__(self, key):
+        self.catalog.check()
+        return self.catalog.db.execute('SELECT 1 FROM catalog_work_sessions '
+            'WHERE work=? AND home=? AND sid=? AND required=1', (self.catalog.work,*key)).fetchone() is not None
+
+    def __iter__(self):
+        cursor = self.catalog.db.execute('SELECT home,sid FROM catalog_work_sessions '
+            'WHERE work=? AND required=1 ORDER BY ordinal', (self.catalog.work,))
+        try:
+            for row in cursor:
+                self.catalog.check()
+                yield row['home'], row['sid']
+        finally:
+            cursor.close()
+
+
+class _CatalogParents(Mapping):
+    def __init__(self, catalog):
+        self.catalog = catalog
+
+    def __getitem__(self, key):
+        self.catalog.check()
+        row = self.catalog.db.execute('SELECT n.parent_sid FROM catalog_work_nodes n '
+            'WHERE n.work=? AND n.home=? AND n.sid=? AND n.valid=1 AND EXISTS('
+            'SELECT 1 FROM catalog_work_nodes p WHERE p.work=n.work AND p.home=n.home AND p.sid=n.parent_sid)',
+            (self.catalog.work,*key)).fetchone()
+        if row is None:
+            raise KeyError(key)
+        return key[0], row[0]
+
+    def __iter__(self):
+        cursor = self.catalog.db.execute('SELECT n.home,n.sid FROM catalog_work_nodes n '
+            'WHERE n.work=? AND n.valid=1 AND EXISTS(SELECT 1 FROM catalog_work_nodes p '
+            'WHERE p.work=n.work AND p.home=n.home AND p.sid=n.parent_sid) ORDER BY n.home,n.sid',
+            (self.catalog.work,))
+        try:
+            for row in cursor:
+                self.catalog.check()
+                yield row['home'], row['sid']
+        finally:
+            cursor.close()
+
+    def __len__(self):
+        self.catalog.check()
+        return self.catalog.db.execute('SELECT count(*) FROM catalog_work_nodes n '
+            'WHERE n.work=? AND n.valid=1 AND EXISTS(SELECT 1 FROM catalog_work_nodes p '
+            'WHERE p.work=n.work AND p.home=n.home AND p.sid=n.parent_sid)', (self.catalog.work,)).fetchone()[0]
+
+
+class CatalogWork(dict):
+    TABLES = ('sessions','members','owners','nodes')
+
+    def __init__(self, values, *, store=None, cancel=None):
+        super().__init__(values)
+        self.cancel = cancel
+        self.closed = False
+        self.owns_connection = store is None
+        self.db = (sqlite3.connect('', isolation_level=None) if store is None else store.db)
+        self.db.row_factory = sqlite3.Row
+        if self.db.execute('PRAGMA temp_store').fetchone()[0] != 1:
+            self.db.execute('PRAGMA temp_store=FILE')
+        self.db.execute('PRAGMA temp.cache_size=-4096')
+        if self.owns_connection:
+            self.db.execute('PRAGMA cache_size=-8192')
+        statements = (
+            'CREATE TEMP TABLE IF NOT EXISTS catalog_work(id INTEGER PRIMARY KEY AUTOINCREMENT)',
+            'CREATE TEMP TABLE IF NOT EXISTS catalog_work_sessions(work INTEGER,ordinal INTEGER,home TEXT,sid TEXT,'
+                'parent_sid TEXT,required INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(work,home,sid),UNIQUE(work,ordinal))',
+            'CREATE INDEX IF NOT EXISTS temp.catalog_work_children ON catalog_work_sessions(work,home,parent_sid)',
+            'CREATE INDEX IF NOT EXISTS temp.catalog_work_sid ON catalog_work_sessions(work,sid,home)',
+            'CREATE TEMP TABLE IF NOT EXISTS catalog_work_members(work INTEGER,ordinal INTEGER,home TEXT,sid TEXT,'
+                'PRIMARY KEY(work,home,sid),UNIQUE(work,ordinal))',
+            'CREATE TEMP TABLE IF NOT EXISTS catalog_work_owners(work INTEGER,ordinal INTEGER,home TEXT,sid TEXT,'
+                'entry TEXT,complete INTEGER,admitted INTEGER NOT NULL DEFAULT 1,financial_ordinal INTEGER,'
+                'PRIMARY KEY(work,home,sid),UNIQUE(work,ordinal))',
+            'CREATE INDEX IF NOT EXISTS temp.catalog_work_admitted ON catalog_work_owners(work,admitted,ordinal)',
+            'CREATE TEMP TABLE IF NOT EXISTS catalog_work_nodes(work INTEGER,home TEXT,sid TEXT,parent_sid TEXT,'
+                'valid INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(work,home,sid))',
+            'CREATE INDEX IF NOT EXISTS temp.catalog_work_parent ON catalog_work_nodes(work,home,parent_sid)',
+        )
+        for statement in statements:
+            self.db.execute(statement)
+        self.work = self.db.execute('INSERT INTO catalog_work DEFAULT VALUES').lastrowid
+        self.present = set()
+        self.counts = dict(session_catalog=0,demand_members=0,owners=0)
+        self['owners'] = _CatalogOwners(self, financial=True)
+        self['mode_sources'] = _CatalogOwners(self, financial=False)
+        self['selected_members'] = _CatalogMembers(self)
+        self.parents = _CatalogParents(self)
+
+    def check(self):
+        if self.closed:
+            raise PreparedError('catalog work is closed')
+        if self.cancel is not None and self.cancel():
+            raise InterruptedError('prepared catalog cancelled')
+
+    def add_membership(self, name, rows):
+        self.present.add(name)
+        if name=='matches':
+            self.setdefault('matches',[]).extend(rows)
+            return
+        table = 'sessions' if name=='session_catalog' else 'members'
+        for row in rows:
+            self.check()
+            if (not isinstance(row,(tuple,list)) or len(row)!=(3 if table=='sessions' else 2)
+                    or any(type(value) is not str for value in row[:2])):
+                raise ValueError('catalog membership requires exact home/session identities')
+            home,sid = row[:2]
+            ordinal = self.counts[name]
+            try:
+                if table=='sessions':
+                    parent = row[2]
+                    self.db.execute('INSERT INTO catalog_work_sessions(work,ordinal,home,sid,parent_sid) '
+                        'VALUES(?,?,?,?,?)', (self.work,ordinal,home,sid,parent if type(parent) is str else None))
+                else:
+                    self.db.execute('INSERT INTO catalog_work_members VALUES(?,?,?,?)', (self.work,ordinal,home,sid))
+            except sqlite3.IntegrityError as error:
+                raise ValueError('catalog repeats source membership') from error
+            self.counts[name] += 1
+
+    def add_owners(self, owners):
+        for key, entry in owners.items():
+            self.check()
+            try:
+                self.db.execute('INSERT INTO catalog_work_owners(work,ordinal,home,sid,entry,complete) '
+                    'VALUES(?,?,?,?,?,?)', (self.work,entry['source_ordinal'] if self.get('authority')=='selected' else self.counts['owners'],*key,
+                    json.dumps(entry,ensure_ascii=False,separators=(',',':')),
+                    int(bool(entry.get('state',{}).get('collection_complete')))))
+            except sqlite3.IntegrityError as error:
+                raise ValueError('catalog repeats an owner') from error
+            self.counts['owners'] += 1
+
+    def owner_rows(self, where='1', *, fields='*'):
+        self.check()
+        cursor = self.db.execute('SELECT '+fields+' FROM catalog_work_owners '
+            'WHERE work=? AND '+where+' ORDER BY ordinal', (self.work,))
+        try:
+            for row in cursor:
+                self.check()
+                yield row
+        finally:
+            cursor.close()
+
+    @staticmethod
+    def owner_entry(row, *, financial):
+        return dict(json.loads(row['entry']), source_ordinal=row['financial_ordinal'] if financial else row['ordinal'])
+
+    def set_entry(self, owner, entry):
+        self.db.execute('UPDATE catalog_work_owners SET entry=? WHERE work=? AND home=? AND sid=?',
+            (json.dumps(entry,ensure_ascii=False,separators=(',',':')),self.work,*owner))
+
+    def finish(self, demand):
+        self.check()
+        if self.cancel is not None:
+            self.db.set_progress_handler(self.cancel,1000)
+        try:
+            self.db.execute('INSERT INTO catalog_work_nodes(work,home,sid,parent_sid) '
+                'SELECT work,home,sid,parent_sid FROM catalog_work_sessions WHERE work=?', (self.work,))
+            for row in self.owner_rows():
+                entry = json.loads(row['entry'])
+                lineage = entry['owner_lineage']
+                parent = lineage.get('parent_thread_id')
+                self.db.execute('INSERT INTO catalog_work_nodes(work,home,sid,parent_sid) VALUES(?,?,?,?) '
+                    'ON CONFLICT(work,home,sid) DO UPDATE SET parent_sid=excluded.parent_sid',
+                    (self.work,row['home'],row['sid'],parent if type(parent) is str else None))
+            self.db.execute('WITH RECURSIVE rooted(home,sid) AS ('
+                'SELECT n.home,n.sid FROM catalog_work_nodes n WHERE n.work=? AND NOT EXISTS('
+                'SELECT 1 FROM catalog_work_nodes p WHERE p.work=n.work AND p.home=n.home AND p.sid=n.parent_sid) '
+                'UNION SELECT n.home,n.sid FROM catalog_work_nodes n JOIN rooted p '
+                'ON n.home=p.home AND n.parent_sid=p.sid WHERE n.work=?) '
+                'UPDATE catalog_work_nodes SET valid=1 WHERE work=? AND (home,sid) IN (SELECT home,sid FROM rooted)',
+                (self.work,self.work,self.work))
+            if demand is not None:
+                for home,sid in demand['selected']:
+                    found = self.db.execute('SELECT home FROM catalog_work_sessions WHERE work=? AND sid=? '
+                        'AND (? IS NULL OR home=?) LIMIT 2', (self.work,sid,home,home)).fetchall()
+                    if len(found)==1:
+                        self.db.execute('UPDATE catalog_work_sessions SET required=1 WHERE work=? AND home=? AND sid=?',
+                            (self.work,found[0][0],sid))
+                self.db.execute('WITH RECURSIVE family(home,sid) AS ('
+                    'SELECT home,sid FROM catalog_work_sessions WHERE work=? AND required=1 '
+                    'UNION SELECT c.home,c.sid FROM catalog_work_sessions c JOIN family p '
+                    'ON c.home=p.home AND c.parent_sid=p.sid WHERE c.work=?) '
+                    'UPDATE catalog_work_sessions SET required=1 WHERE work=? AND (home,sid) IN (SELECT home,sid FROM family)',
+                    (self.work,self.work,self.work))
+                membership = 'members' if demand['aggregate'] else 'sessions'
+                selected = '' if demand['aggregate'] else ' AND m.required=1'
+                self.db.execute('UPDATE catalog_work_owners SET admitted=complete AND EXISTS('
+                    'SELECT 1 FROM catalog_work_'+membership+' m WHERE m.work=catalog_work_owners.work '
+                    'AND m.home=catalog_work_owners.home AND m.sid=catalog_work_owners.sid'+selected+') WHERE work=?',
+                    (self.work,))
+                missing = self.db.execute('SELECT 1 FROM catalog_work_sessions s WHERE s.work=? AND s.required=1 '
+                    'AND NOT EXISTS(SELECT 1 FROM catalog_work_owners o WHERE o.work=s.work AND o.home=s.home '
+                    'AND o.sid=s.sid AND o.admitted=1) LIMIT 1', (self.work,)).fetchone()
+                known = ('session_catalog' in self.present and
+                         (not demand['aggregate'] or 'demand_members' in self.present))
+                self['membership_complete'] = bool(known and missing is None)
+                self['aggregate_complete'] = bool(demand['aggregate'] and self['header'].get('usage_collection_complete'))
+                if self['membership_complete']:
+                    self['header']['selected_resolutions'] = [[sid,self.db.execute(
+                        'SELECT count(*) FROM catalog_work_sessions WHERE work=? AND sid=?',
+                        (self.work,sid)).fetchone()[0]] for home,sid in demand['selected'] if home is None]
+            self.reindex()
+            return self
+        except sqlite3.OperationalError:
+            self.check()
+            raise
+        finally:
+            if self.cancel is not None:
+                self.db.set_progress_handler(None,0)
+
+    def finish_selection(self):
+        self.check()
+        self.db.execute('UPDATE catalog_work_sessions SET required=EXISTS('
+            'SELECT 1 FROM catalog_work_members m WHERE m.work=catalog_work_sessions.work '
+            'AND m.home=catalog_work_sessions.home AND m.sid=catalog_work_sessions.sid) WHERE work=?',
+            (self.work,))
+        self.db.execute('UPDATE catalog_work_owners SET admitted=complete AND EXISTS('
+            'SELECT 1 FROM catalog_work_members m WHERE m.work=catalog_work_owners.work '
+            'AND m.home=catalog_work_owners.home AND m.sid=catalog_work_owners.sid) WHERE work=?',
+            (self.work,))
+        missing = self.db.execute('SELECT 1 FROM catalog_work_members m WHERE m.work=? AND NOT EXISTS('
+            'SELECT 1 FROM catalog_work_owners o WHERE o.work=m.work AND o.home=m.home '
+            'AND o.sid=m.sid AND o.admitted=1) LIMIT 1', (self.work,)).fetchone()
+        self['membership_complete'] = bool(self['membership_complete'] and missing is None
+            and {'session_catalog','demand_members','matches'} <= self.present
+            and all(homes is not None for _,_,homes in self['matches']))
+        self['aggregate_complete'] = False
+        if self['membership_complete']:
+            self['header']['selected_resolutions'] = [[sid,len(homes)]
+                for home,sid,homes in self['matches'] if home is None]
+        return self.finish(None)
+
+    def reindex(self):
+        if self.get('authority')=='selected':
+            self.db.execute('UPDATE catalog_work_owners SET financial_ordinal=ordinal WHERE work=? AND admitted=1',
+                            (self.work,))
+            return
+        for ordinal,row in enumerate(self.owner_rows('admitted=1',fields='home,sid')):
+            self.db.execute('UPDATE catalog_work_owners SET financial_ordinal=? WHERE work=? AND home=? AND sid=?',
+                (ordinal,self.work,row['home'],row['sid']))
+
+    def mode_groups(self, count):
+        self.check()
+        cursor = self.db.execute('SELECT home,sid FROM catalog_work_owners WHERE work=? '
+            'AND (admitted=1 OR complete=1) ORDER BY home,sid',(self.work,))
+        try:
+            while True:
+                rows = cursor.fetchmany(count)
+                if not rows:
+                    return
+                self.check()
+                yield [(row['home'],row['sid']) for row in rows]
+        finally:
+            cursor.close()
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        if self.owns_connection:
+            self.db.close()
+        else:
+            for table in self.TABLES:
+                self.db.execute('DELETE FROM catalog_work_'+table+' WHERE work=?', (self.work,))
+            self.db.execute('DELETE FROM catalog_work WHERE id=?', (self.work,))
+
+
+class SnapshotInventory(Mapping):
+    def __init__(self, view):
+        self.view = view
+
+    def __getitem__(self, key):
+        for row in self.view.pages(self.view.inventory,owners=(key,)):
+            return row
+        raise KeyError(key)
+
+    def __iter__(self):
+        for row in self.view.pages(self.view.inventory_scan,metadata=False):
+            yield row['owner']
+
+    def __len__(self):
+        return sum(1 for _ in self)
+
+    def values(self):
+        yield from self.view.pages(self.view.inventory_scan)
+
+    def items(self):
+        for row in self.values():
+            yield row['owner'],row
+
+
+class ConversionPlan:
+    def __init__(self, store):
+        self.store, self.db = store, store.db
+        self.table = 'conversion_plan_'+uuid.uuid4().hex
+        self.counts = {False:0,True:0}
+        self.closed = False
+        self.db.execute('CREATE TEMP TABLE '+self.table+'(ordinal INTEGER PRIMARY KEY,keep INTEGER,'
+                        'home TEXT,sid TEXT,UNIQUE(home,sid))')
+        self.db.execute('CREATE INDEX temp.'+self.table+'_order ON '+self.table+'(keep,ordinal)')
+
+    def add(self, owner, *, keep):
+        ordinal = sum(self.counts.values())
+        self.db.execute('INSERT INTO '+self.table+' VALUES(?,?,?,?)',(ordinal,int(keep),*owner))
+        self.counts[keep] += 1
+
+    def groups(self, count):
+        after = (-1,-1)
+        while True:
+            rows = self.db.execute('SELECT * FROM '+self.table+' WHERE (keep,ordinal)>(?,?) '
+                'ORDER BY keep,ordinal LIMIT ?',(*after,count)).fetchall()
+            if not rows:
+                return
+            yield [(bool(row['keep']),(row['home'],row['sid'])) for row in rows]
+            after = rows[-1]['keep'],rows[-1]['ordinal']
+
+    def close(self):
+        if not self.closed:
+            self.closed = True
+            if self.store.db is self.db:
+                self.db.execute('DROP TABLE IF EXISTS '+self.table)
+
+    def __del__(self):
+        if hasattr(self,'table'):
+            self.close()
 
 
 def _size(value):
@@ -337,7 +707,8 @@ def _schema():
     return f'''
         CREATE TABLE meta(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
             format INTEGER NOT NULL,instance TEXT NOT NULL,generation INTEGER NOT NULL,
-            ready INTEGER NOT NULL,source BLOB NOT NULL,order_batch INTEGER NOT NULL DEFAULT 0);
+            ready INTEGER NOT NULL,source BLOB NOT NULL,order_batch INTEGER NOT NULL DEFAULT 0,
+            selection_batch INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE publications(id INTEGER PRIMARY KEY AUTOINCREMENT,state INTEGER NOT NULL,
             source BLOB NOT NULL,input_bytes INTEGER NOT NULL DEFAULT 0);
         CREATE INDEX publications_state ON publications(state,id);
@@ -351,9 +722,11 @@ def _schema():
         CREATE INDEX owner_versions_order ON owner_versions(source_ordinal,owner,batch);
         CREATE TABLE owner_heads(owner INTEGER PRIMARY KEY,batch INTEGER NOT NULL);
         CREATE INDEX owner_heads_batch ON owner_heads(batch);
+        CREATE TABLE ledger_pending(owner INTEGER PRIMARY KEY);
         CREATE TABLE catalog_orders(batch INTEGER NOT NULL,owner INTEGER NOT NULL,
             source_ordinal INTEGER NOT NULL,PRIMARY KEY(batch,owner));
         CREATE INDEX catalog_orders_rank ON catalog_orders(batch,source_ordinal,owner);
+        CREATE UNIQUE INDEX catalog_orders_position ON catalog_orders(batch,source_ordinal);
         CREATE TABLE calls(owner INTEGER NOT NULL,identity BLOB NOT NULL,batch INTEGER NOT NULL,
             deleted INTEGER NOT NULL,signature BLOB NOT NULL,key_value BLOB,turn_value BLOB,
             turn_identity BLOB,owner_mask INTEGER,types BLOB,detail BLOB,encoded_bytes INTEGER,
@@ -483,16 +856,15 @@ class PreparedStore:
             self.db.execute('PRAGMA synchronous=NORMAL')
             self.db.execute('PRAGMA mmap_size=0')
             self.db.execute('PRAGMA cache_size=-8192')
-            self.db.execute('PRAGMA temp_store=MEMORY')
+            self.db.execute('PRAGMA temp_store=FILE')
+            self.db.execute('PRAGMA temp.cache_size=-4096')
             self.db.execute('PRAGMA wal_autocheckpoint=1024')
             self.db.execute(f'PRAGMA journal_size_limit={limits.wal_bytes}')
-            pages = limits.database_bytes // self.db.execute('PRAGMA page_size').fetchone()[0]
-            actual = self.db.execute(f'PRAGMA max_page_count={pages}').fetchone()[0]
-            if actual > pages:
-                raise CapacityExceeded('existing prepared database exceeds its page budget')
             # There is one writer lock; an unfinished predecessor cannot still publish.
             with self._transaction():
                 self.db.execute('CREATE INDEX IF NOT EXISTS calls_identity ON calls(identity,owner,batch)')
+                self.db.execute('CREATE UNIQUE INDEX IF NOT EXISTS catalog_orders_position '
+                                'ON catalog_orders(batch,source_ordinal)')
                 self.db.execute('UPDATE publications SET state=-1 WHERE state=0')
         except BaseException:
             self.close()
@@ -512,10 +884,6 @@ class PreparedStore:
         """Check a recognized current cache once, before starting ordinary readers."""
         self.db.execute('PRAGMA mmap_size=0')
         self.db.execute('PRAGMA cache_size=-8192')
-        pages = self.db.execute('PRAGMA page_count').fetchone()[0]
-        page_size = self.db.execute('PRAGMA page_size').fetchone()[0]
-        if pages * page_size > self.limits.database_bytes:
-            raise CapacityExceeded('existing prepared database exceeds its page budget')
         if cancel is not None and cancel():
             raise ReadCancelled('prepared integrity check cancelled')
         cancelled = False
@@ -553,9 +921,10 @@ class PreparedStore:
         db.execute('COMMIT')
 
     def _order_schema(self):
-        return ('order_batch' in {row[1] for row in self.db.execute('PRAGMA table_info(meta)')}
+        return ({'order_batch','selection_batch'} <= {row[1] for row in self.db.execute('PRAGMA table_info(meta)')}
             and {'batch','owner','source_ordinal'} <= {
-                row[1] for row in self.db.execute('PRAGMA table_info(catalog_orders)')})
+                row[1] for row in self.db.execute('PRAGMA table_info(catalog_orders)')}
+            and {'owner'} <= {row[1] for row in self.db.execute('PRAGMA table_info(ledger_pending)')})
 
 
     def _rebuild_format(self):
@@ -568,8 +937,7 @@ class PreparedStore:
         """
         if self.db.execute('PRAGMA page_size').fetchone()[0] != 4096:
             raise RebuildRequired('unrecognized prepared database page size')
-        pages = min(256, self.limits.database_bytes // 4096,
-                    (self.limits.wal_bytes - 32) // 4120)
+        pages = min(256, (self.limits.wal_bytes - 32) // 4120)
         if pages < 1:
             raise CapacityExceeded('empty prepared schema exceeds its budget')
         self.db.execute('PRAGMA cache_size=-8192')
@@ -667,7 +1035,7 @@ class PreparedStore:
         return self.stage
 
     @contextmanager
-    def read_current(self, *, staged=False, cancel=None, seconds=None):
+    def read_current(self, *, staged=False, cancel=None, seconds=None, selected=False):
         """Writer-only conversion view. Normal readers still require readiness."""
         if self.db is None:
             raise PreparedError('the prepared store is closed')
@@ -682,7 +1050,7 @@ class PreparedStore:
         try:
             reader.limits = self.limits
             with reader._pin(self.token, cancel=cancel, seconds=seconds,
-                             allow_incomplete=True, staged_batch=batch) as snapshot:
+                             allow_incomplete=True, staged_batch=batch, selected=selected) as snapshot:
                 yield snapshot
             # A suspended speed generator still owns deferred TEMP cleanup.
             # Retire its connection so finalization cannot touch a later read.
@@ -754,8 +1122,8 @@ class PreparedStore:
         if checkpoint_work:
             return checkpoint_work
         old_order = self.db.execute('SELECT r.rowid,r.batch FROM catalog_orders r '
-            'JOIN publications p ON p.id=r.batch WHERE p.state=1 AND r.batch<('
-            'SELECT order_batch FROM meta WHERE singleton=1) LIMIT ?', (rows,)).fetchall()
+            'JOIN publications p ON p.id=r.batch WHERE p.state=1 AND r.batch NOT IN ('
+            'SELECT order_batch FROM meta UNION ALL SELECT selection_batch FROM meta) LIMIT ?', (rows,)).fetchall()
         if old_order:
             with self._transaction():
                 self.db.executemany('DELETE FROM catalog_orders WHERE rowid=?', ((row[0],) for row in old_order))
@@ -846,15 +1214,32 @@ class PreparedStore:
         row = self.db.execute('SELECT state FROM publications WHERE id=?', (batch,)).fetchone()
         if row is None or row[0] != 1:
             return
-        if self.db.execute('SELECT 1 FROM meta WHERE singleton=1 AND order_batch=?', (batch,)).fetchone():
+        if self.db.execute('SELECT 1 FROM meta WHERE singleton=1 AND (order_batch=? OR selection_batch=?)', (batch,batch)).fetchone():
             return
         for table in (*KINDS, 'owner_versions', 'seen', 'retired', 'owner_heads', 'owner_retired', 'catalog_orders', *CHECKPOINT_TABLES):
             if self.db.execute(f'SELECT 1 FROM {table} WHERE batch=? LIMIT 1', (batch,)).fetchone():
                 return
         self.db.execute('DELETE FROM publications WHERE id=?', (batch,))
 
+    def has_ledger_pending(self):
+        return self.db.execute('SELECT 1 FROM ledger_pending LIMIT 1').fetchone() is not None
+
+    def acknowledge_ledger(self, owners, *, expected):
+        pending=[]
+        for home,sid in owners:
+            row=self.db.execute('SELECT p.owner FROM ledger_pending p JOIN owners o ON o.id=p.owner '
+                                'WHERE o.home=? AND o.sid=?',(home,sid)).fetchone()
+            if row is not None:pending.append(row[0])
+        if not pending:return
+        with self._transaction():
+            if self.token != expected:
+                raise StaleGeneration('prepared ledger acknowledgment belongs to an older generation')
+            for owner in pending:
+                self.db.execute('DELETE FROM ledger_pending WHERE owner=?',(owner,))
+                self._prune_owner(owner)
+
     def _prune_owner(self, owner):
-        for table in (*KINDS, 'owner_versions', 'owner_heads', 'seen'):
+        for table in (*KINDS, 'owner_versions', 'owner_heads', 'seen', 'ledger_pending'):
             if self.db.execute(f'SELECT 1 FROM {table} WHERE owner=? LIMIT 1', (owner,)).fetchone():
                 return
         self.db.execute('DELETE FROM owners WHERE id=?', (owner,))
@@ -898,6 +1283,8 @@ class Stage:
         self.facts_started = set()
         self.checkpoint_namespaces = set()
         self.catalog_staged = False
+        identity = unpack(source, self.limits)
+        self.selected = isinstance(identity, tuple) and len(identity)==5 and identity[4][0]=='selected'
         self.checkpoint_totals = None
         self.failed = False
         self.finished = False
@@ -981,10 +1368,20 @@ class Stage:
                                     (owner,self.batch)).fetchone() if replacing else
                      self.db.execute('SELECT v.* FROM owner_heads h JOIN owner_versions v '
                                      'ON v.owner=h.owner AND v.batch=h.batch WHERE h.owner=?', (owner,)).fetchone())
+            if self.selected:
+                source_ordinal = None
             if source_ordinal is None and prior:
                 ranked = self.db.execute('SELECT source_ordinal FROM catalog_orders WHERE owner=? AND batch=('
                     'SELECT order_batch FROM meta WHERE singleton=1)', (owner,)).fetchone()
                 source_ordinal = ranked[0] if ranked else prior['source_ordinal']
+            if source_ordinal is None and self.selected:
+                last_owner = self.db.execute('SELECT source_ordinal FROM owner_versions '
+                    'ORDER BY source_ordinal DESC,owner DESC,batch DESC LIMIT 1').fetchone()
+                last_order = self.db.execute('SELECT source_ordinal FROM catalog_orders WHERE batch=('
+                    'SELECT order_batch FROM meta WHERE singleton=1) '
+                    'ORDER BY source_ordinal DESC,owner DESC LIMIT 1').fetchone()
+                source_ordinal = max(last_owner[0] if last_owner else -1,
+                                     last_order[0] if last_order else -1)+1
             if type(source_ordinal) is not int or not 0 <= source_ordinal < 2 ** 63:
                 raise TypeError('new owners require their exact nonnegative source traversal ordinal')
             if request_maps is UNCHANGED:
@@ -1023,30 +1420,46 @@ class Stage:
         return owner
 
     def catalog_order(self, positions):
-        """Stage a complete light catalog in bounded writes, without owner copies."""
+        """Stage exact complete catalog order with bounded input groups."""
         self._live()
         if self.catalog_staged:
             raise IncompletePublication('one complete catalog order is allowed per stage')
-        seen = set()
-        ordinals = set()
-        count = size = group_objects = 0
+        group_objects = 0
         group = []
+        order_batch = self.db.execute('SELECT order_batch FROM meta WHERE singleton=1').fetchone()[0]
 
         def write(values):
-            placeholders = ','.join('(?,?,?)' for _ in values)
-            rows = self.db.execute(
-                f'WITH wanted(home,sid,ordinal) AS (VALUES {placeholders}) '
-                'SELECT o.id,q.ordinal FROM wanted q JOIN owners o ON o.home=q.home AND o.sid=q.sid '
-                'LEFT JOIN owner_heads h ON h.owner=o.id JOIN owner_versions v ON v.owner=o.id '
-                'AND v.batch=COALESCE((SELECT x.batch FROM owner_versions x WHERE x.owner=o.id '
-                'AND x.batch=?),h.batch) WHERE v.deleted=0',
-                (*tuple(value for item in values for value in item),self.batch)).fetchall()
+            rows, committed = [], []
+            for home, sid, ordinal in values:
+                owner = (home, sid)
+                if owner in self.removed_owners:
+                    raise StaleGeneration('catalog order contains an absent prepared owner')
+                if owner in self.owners:
+                    rows.append((self.owners[owner], ordinal))
+                else:
+                    committed.append((home, sid, ordinal))
+            if committed:
+                placeholders = ','.join('(?,?,?)' for _ in committed)
+                rows.extend(self.db.execute(
+                    f'WITH wanted(home,sid,ordinal) AS (VALUES {placeholders}) '
+                    'SELECT o.id,q.ordinal FROM wanted q JOIN owners o ON o.home=q.home AND o.sid=q.sid '
+                    'LEFT JOIN owner_heads h ON h.owner=o.id WHERE CASE WHEN EXISTS('
+                    'SELECT 1 FROM catalog_orders c WHERE c.batch=? AND c.owner=o.id AND h.batch<c.batch) '
+                    'THEN 1 ELSE COALESCE((SELECT v.deleted=0 FROM owner_versions v '
+                    'WHERE v.owner=o.id AND v.batch=h.batch),0) END',
+                    (*tuple(value for item in committed for value in item),order_batch)).fetchall())
             if len(rows) != len(values):
                 raise StaleGeneration('catalog order contains an absent prepared owner')
-            with self.store._transaction():
-                self._charge(32*len(rows))
-                self.db.executemany('INSERT INTO catalog_orders VALUES(?,?,?)',
-                    ((self.batch,row['id'],row['ordinal']) for row in rows))
+            try:
+                with self.store._transaction():
+                    self._charge(32*len(rows))
+                    self.db.executemany('INSERT INTO catalog_orders VALUES(?,?,?)',
+                        ((self.batch,row[0],row[1]) for row in rows))
+            except sqlite3.IntegrityError as error:
+                if error.sqlite_errorcode in (sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY,
+                                              sqlite3.SQLITE_CONSTRAINT_UNIQUE):
+                    raise ValueError('catalog order repeats an owner or ordinal') from error
+                raise
             self.writes['catalog'] += len(rows)
 
         try:
@@ -1054,14 +1467,9 @@ class Stage:
                 if (type(owner) is not tuple or len(owner) != 2 or
                         any(type(value) is not str for value in owner)):
                     raise TypeError('catalog order requires exact home/session identities')
-                if owner in seen or ordinal in ordinals:
-                    raise ValueError('catalog order repeats an owner or ordinal')
                 if type(ordinal) is not int or not 0 <= ordinal < 2**63:
                     raise TypeError('catalog ordinals must be nonnegative integers')
                 pack(owner,self.limits,maximum=self.limits.key_bytes)
-                size += _size((owner,ordinal))+160
-                if size > self.limits.page_objects_bytes:
-                    raise CapacityExceeded('catalog order exceeds its metadata budget')
                 item=(*owner,ordinal)
                 objects=_size(item)
                 if 32>self.limits.fact_write_bytes or objects>self.limits.fact_write_objects:
@@ -1070,14 +1478,23 @@ class Stage:
                               or 32*(len(group)+1)>self.limits.fact_write_bytes
                               or group_objects+objects>self.limits.fact_write_objects):
                     write(group);group=[];group_objects=0
-                seen.add(owner);ordinals.add(ordinal);count += 1
                 group.append(item);group_objects+=objects
             if group:write(group)
-            current = self.db.execute('SELECT count(*) FROM owners o LEFT JOIN owner_heads h ON h.owner=o.id '
+            if self.selected:
+                self.catalog_staged = True
+                return
+            count,first,last = self.db.execute(
+                'SELECT count(*),min(source_ordinal),max(source_ordinal) '
+                'FROM catalog_orders WHERE batch=?', (self.batch,)).fetchone()
+            live = ('FROM owners o LEFT JOIN owner_heads h ON h.owner=o.id '
                 'JOIN owner_versions v ON v.owner=o.id AND v.batch=COALESCE(('
                 'SELECT x.batch FROM owner_versions x WHERE x.owner=o.id AND x.batch=?),h.batch) '
-                'WHERE v.deleted=0', (self.batch,)).fetchone()[0]
-            if count != current or ordinals and (min(ordinals)!=0 or max(ordinals)!=count-1):
+                'WHERE v.deleted=0')
+            current = self.db.execute('SELECT count(*) '+live, (self.batch,)).fetchone()[0]
+            missing = self.db.execute('SELECT 1 '+live+' AND NOT EXISTS('
+                'SELECT 1 FROM catalog_orders c WHERE c.batch=? AND c.owner=o.id) LIMIT 1',
+                (self.batch,self.batch)).fetchone()
+            if missing is not None or count != current or count and (first!=0 or last!=count-1):
                 raise IncompletePublication('catalog order must cover exact complete prepared membership')
             self.catalog_staged = True
         except BaseException:
@@ -1407,18 +1824,6 @@ class Stage:
                 len(totals) > self.limits.checkpoint_namespaces):
             raise CapacityExceeded('merged checkpoint exceeds its global byte/section/namespace budget')
 
-    def _checkpoint_tombstone(self, namespace, name):
-        previous = self._checkpoint_previous(namespace,name)
-        if previous is None or previous['deleted']:
-            return 0,0
-        with self.store._transaction():
-            self._charge(len(name.encode('utf-8'))+128)
-            self.db.execute('INSERT INTO checkpoint_sections(namespace,name,batch,deleted) VALUES(?,?,?,1)',
-                            (namespace,name,self.batch))
-            self.db.execute('INSERT OR IGNORE INTO checkpoint_retired VALUES(?,?,?)',(namespace,name,self.batch))
-        self.writes['checkpoint_sections'] += 1
-        return previous['encoded_bytes'],1
-
     def checkpoint(self, namespace, sections, *, base, token, tombstones=(), complete=False):
         """Stage a bounded namespace delta; no codec import or synthetic owner.
 
@@ -1450,6 +1855,36 @@ class Stage:
                     'JOIN checkpoint_versions v ON v.namespace=h.namespace AND v.batch=h.batch')}
             total,count = (0,0) if complete else self.checkpoint_totals.get(namespace,(0,0))
             self._checkpoint_budget(namespace,total,count)
+            pending = {kind:[] for kind in ('seen','sections','chunks','tombstones','retired')}
+            pending_rows = pending_bytes = pending_charge = 0
+            def flush():
+                nonlocal pending_rows,pending_bytes,pending_charge
+                if not pending_rows:return
+                with self.store._transaction():
+                    self._charge(pending_charge)
+                    self.db.executemany('INSERT INTO checkpoint_seen VALUES(?,?,?)',pending['seen'])
+                    self.db.executemany('INSERT INTO checkpoint_sections VALUES(?,?,?,0,?,?,?,?)',pending['sections'])
+                    self.db.executemany('INSERT INTO checkpoint_chunks VALUES(?,?,?,?,?)',pending['chunks'])
+                    self.db.executemany('INSERT INTO checkpoint_sections(namespace,name,batch,deleted) VALUES(?,?,?,1)',pending['tombstones'])
+                    self.db.executemany('INSERT OR IGNORE INTO checkpoint_retired VALUES(?,?,?)',pending['retired'])
+                self.writes['checkpoint_chunks'] += len(pending['chunks'])
+                self.writes['checkpoint_sections'] += len(pending['sections'])+len(pending['tombstones'])
+                for values in pending.values():values.clear()
+                pending_rows = pending_bytes = pending_charge = 0
+            def queue(kind,record,charge=0):
+                nonlocal pending_rows,pending_bytes,pending_charge
+                size=_size(record)
+                if pending_rows and (pending_rows>=self.limits.write_rows or
+                        pending_bytes+size>min(self.limits.fact_write_bytes,self.limits.fact_write_objects)):
+                    flush()
+                pending[kind].append(record)
+                pending_rows+=1;pending_bytes+=size;pending_charge+=charge
+            def tombstone(name):
+                previous=self._checkpoint_previous(namespace,name)
+                if previous is None or previous['deleted']:return 0,0
+                queue('tombstones',(namespace,name,self.batch),len(name.encode('utf-8'))+128)
+                queue('retired',(namespace,name,self.batch))
+                return previous['encoded_bytes'],1
             header = False
             input_bytes = input_sections = 0
             for name,digest,chunks in sections:
@@ -1480,36 +1915,27 @@ class Stage:
                 old_size = previous['encoded_bytes'] if previous is not None and not previous['deleted'] else 0
                 old_count = int(previous is not None and not previous['deleted'])
                 total,count = (total+size,count+1) if complete else (total-old_size+size,count-old_count+1)
-                with self.store._transaction():
-                    self._charge(len(name.encode('utf-8'))+64)
-                    self.db.execute('INSERT INTO checkpoint_seen VALUES(?,?,?)',(self.batch,namespace,name))
+                queue('seen',(self.batch,namespace,name),len(name.encode('utf-8'))+64)
                 header |= name == 'header'
                 if previous is not None and not previous['deleted'] and previous['signature'] == signature:
                     continue
-                with self.store._transaction():
-                    self._charge(size+len(name.encode('utf-8'))+128)
-                    self.db.execute('INSERT INTO checkpoint_sections VALUES(?,?,?,0,?,?,?,?)',
-                        (namespace,name,self.batch,digest,signature,len(chunks),size))
-                    if previous is not None:
-                        self.db.execute('INSERT OR IGNORE INTO checkpoint_retired VALUES(?,?,?)',(namespace,name,self.batch))
-                for group in _chunks(enumerate(chunks),self.limits.write_rows):
-                    with self.store._transaction():
-                        self.db.executemany('INSERT INTO checkpoint_chunks VALUES(?,?,?,?,?)',
-                            ((namespace,name,self.batch,ordinal,payload) for ordinal,payload in group))
-                    self.writes['checkpoint_chunks'] += len(group)
-                self.writes['checkpoint_sections'] += 1
+                queue('sections',(namespace,name,self.batch,digest,signature,len(chunks),size),
+                      size+len(name.encode('utf-8'))+128)
+                if previous is not None:queue('retired',(namespace,name,self.batch))
+                for ordinal,payload in enumerate(chunks):
+                    queue('chunks',(namespace,name,self.batch,ordinal,payload))
+            flush()
             if not header:
                 raise IncompletePublication('every checkpoint publication requires its new header')
             for name in tombstones:
                 name = _checkpoint_name(name)
                 if name == 'header':
                     raise IncompletePublication('checkpoint header cannot be removed')
-                with self.store._transaction():
-                    self._charge(len(name.encode('utf-8'))+64)
-                    self.db.execute('INSERT INTO checkpoint_seen VALUES(?,?,?)',(self.batch,namespace,name))
-                removed,number = self._checkpoint_tombstone(namespace,name)
+                queue('seen',(self.batch,namespace,name),len(name.encode('utf-8'))+64)
+                removed,number = tombstone(name)
                 if not complete:
                     total,count = total-removed,count-number
+            flush()
             if complete:
                 after = ''
                 while True:
@@ -1520,8 +1946,9 @@ class Stage:
                     if not missing:
                         break
                     for row in missing:
-                        self._checkpoint_tombstone(namespace,row[0])
+                        tombstone(row[0])
                     after = missing[-1][0]
+            flush()
             self._checkpoint_budget(namespace,total,count)
             with self.store._transaction():
                 self._charge(256+len(namespace.encode('utf-8')))
@@ -1577,6 +2004,7 @@ class Stage:
                 for owner in self.owners.values():
                     self.db.execute('INSERT INTO owner_heads VALUES(?,?) ON CONFLICT(owner) '
                                     'DO UPDATE SET batch=excluded.batch', (owner, self.batch))
+                    self.db.execute('INSERT OR IGNORE INTO ledger_pending VALUES(?)',(owner,))
                 for namespace in self.checkpoint_namespaces:
                     previous = self.db.execute('SELECT batch FROM checkpoint_heads WHERE namespace=?',(namespace,)).fetchone()
                     self.db.execute('INSERT INTO checkpoint_heads VALUES(?,?) ON CONFLICT(namespace) '
@@ -1588,7 +2016,10 @@ class Stage:
                 self.db.execute('UPDATE meta SET generation=generation+1,ready=?,source=? WHERE singleton=1',
                                 (int(ready), self.source))
                 if self.catalog_staged:
-                    self.db.execute('UPDATE meta SET order_batch=? WHERE singleton=1', (self.batch,))
+                    if self.selected:
+                        self.db.execute('UPDATE meta SET selection_batch=? WHERE singleton=1', (self.batch,))
+                    else:
+                        self.db.execute('UPDATE meta SET order_batch=?,selection_batch=0 WHERE singleton=1', (self.batch,))
                 self.store._prune_publication(self.batch)
         except CapacityExceeded:
             # A WAL pressure check may run after COMMIT. Durable publication is
@@ -1634,10 +2065,10 @@ class PreparedReader:
     def pin(self, expected=None, *, cancel=None, seconds=None):
         return self._pin(expected, cancel=cancel, seconds=seconds)
 
-    def _pin(self, expected=None, *, cancel=None, seconds=None, allow_incomplete=False, staged_batch=None):
+    def _pin(self, expected=None, *, cancel=None, seconds=None, allow_incomplete=False, staged_batch=None, selected=False):
         if self.active is not None:
             raise PreparedError('close the existing read transaction before opening another')
-        snapshot = Snapshot(self, expected, cancel, seconds, allow_incomplete, staged_batch)
+        snapshot = Snapshot(self, expected, cancel, seconds, allow_incomplete, staged_batch, selected)
         self.active = snapshot
         return snapshot
 
@@ -1668,14 +2099,17 @@ def _read_operation(function):
 
 
 class Snapshot:
-    def __init__(self, reader, expected, cancel, seconds, allow_incomplete=False, staged_batch=None):
+    def __init__(self, reader, expected, cancel, seconds, allow_incomplete=False, staged_batch=None, selected=False):
         self.reader, self.db, self.limits = reader, reader.db, reader.limits
         self.cancel = cancel.is_set if cancel is not None and not callable(cancel) else cancel
-        self.deadline = time.monotonic() + min(seconds or self.limits.read_seconds, self.limits.read_seconds)
+        self.slice_seconds = min(seconds or self.limits.read_seconds, self.limits.read_seconds)
+        self.deadline = time.monotonic() + self.slice_seconds
         self.closed = False
         self.staged_batch = staged_batch
         self.speed_active = False
         self.speed_cursor = None
+        self._speed_admissions = None
+        self._speed_admission_bytes = 0
         self.public = not allow_incomplete and staged_batch is None
         self.steps = 0
         try:
@@ -1685,10 +2119,15 @@ class Snapshot:
                 raise RebuildRequired('prepared schema version changed')
             self.token = Token(row['instance'], row['generation'])
             self.ready = bool(row['ready'])
-            self.order_batch = row['order_batch']
+            self.selected = bool((self.public or selected) and row['selection_batch'])
+            self.order_batch = row['selection_batch'] if self.selected else row['order_batch']
             if staged_batch is not None and self.db.execute(
                     'SELECT 1 FROM catalog_orders WHERE batch=? LIMIT 1', (staged_batch,)).fetchone():
-                self.order_batch = staged_batch
+                staged_source = unpack(self.db.execute('SELECT source FROM publications WHERE id=?',
+                    (staged_batch,)).fetchone()[0], self.limits)
+                if not (isinstance(staged_source,tuple) and len(staged_source)==5
+                        and staged_source[4][0]=='selected'):
+                    self.order_batch = staged_batch
             self.publication_token = (Token(self.token.instance,self.token.generation+1)
                                       if staged_batch is not None else self.token)
             if expected is not None and expected != self.token:
@@ -1729,6 +2168,11 @@ class Snapshot:
 
     def _owner_tables(self):
         ranks = f' LEFT JOIN catalog_orders rank ON rank.owner=o.id AND rank.batch={int(self.order_batch)}'
+        if self.selected:
+            return (f'catalog_orders rank JOIN owners o ON o.id=rank.owner '
+                    'JOIN owner_heads h ON h.owner=o.id '
+                    'JOIN owner_versions v ON v.owner=h.owner AND v.batch=h.batch '
+                    f'AND rank.batch={int(self.order_batch)}')
         if self.staged_batch is None:
             return ('owners o JOIN owner_heads h ON h.owner=o.id '
                     'JOIN owner_versions v ON v.owner=h.owner AND v.batch=h.batch') + ranks
@@ -1753,6 +2197,34 @@ class Snapshot:
     def check(self):
         """Keep cache-only consumers inside the pinned read lease."""
         self._check()
+
+    def pages(self, method, *args, **kwargs):
+        """Continue bounded Page operations inside this exact generation pin."""
+        if getattr(method,'__self__',None) is not self:
+            raise ValueError('page operation belongs to another read transaction')
+        after = None
+        while True:
+            if self.closed:
+                raise ReadCancelled('read transaction is closed')
+            if self.cancel is not None and self.cancel():
+                self.close()
+                raise ReadCancelled('read cancellation reached')
+            self.deadline = time.monotonic() + self.slice_seconds
+            page = method(*args, after=after, **kwargs)
+            self._check()
+            if not page.complete and (page.after is None or page.after==after):
+                self.close()
+                raise IncompletePublication('prepared page cursor did not advance')
+            for row in page.rows:
+                if self.closed:
+                    raise ReadCancelled('read transaction is closed')
+                if self.cancel is not None and self.cancel():
+                    self.close()
+                    raise ReadCancelled('read cancellation reached')
+                yield row
+            if page.complete:
+                return
+            after = page.after
 
     @contextmanager
     def _cursor(self, sql, args=()):
@@ -1953,6 +2425,17 @@ class Snapshot:
                     page.encoded_bytes, page.object_bytes)
 
     @_read_operation
+    def ledger_pending(self, *, after=None):
+        where='' if after is None else 'WHERE p.owner>? '
+        args=(() if after is None else (after,))+(self.limits.page_rows+1,)
+        sql=('SELECT p.owner,o.home,o.sid,COALESCE(v.deleted,1) AS deleted FROM ledger_pending p '
+             'JOIN owners o ON o.id=p.owner LEFT JOIN owner_heads h ON h.owner=p.owner '
+             'LEFT JOIN owner_versions v ON v.owner=h.owner AND v.batch=h.batch '+where+
+             'ORDER BY p.owner LIMIT ?')
+        return self._page(sql,args,lambda row:dict(owner=(row['home'],row['sid']),deleted=bool(row['deleted'])),
+                          lambda row:row['owner'],lambda row:len(row['home'])*4+len(row['sid'])*4+32)
+
+    @_read_operation
     def owner_revisions(self, owners=None, *, after=None):
         """Resolve immutable committed versions in the current complete snapshot.
 
@@ -2037,12 +2520,57 @@ class Snapshot:
             tables = ('visible_owners current JOIN owners o ON o.id=current.owner '
                       'JOIN owner_versions v ON v.owner=current.owner AND v.batch=current.batch '
                       f'LEFT JOIN catalog_orders rank ON rank.owner=o.id AND rank.batch={int(self.order_batch)}')
-        sql = (prefix+f'SELECT o.home,o.sid,v.owner,{self._rank()} AS source_ordinal,v.dependencies FROM {tables} '
+        sql = (prefix+f'SELECT o.home,o.sid,v.owner,{self._rank()} AS source_ordinal,v.dependencies,v.choices FROM {tables} '
                f'WHERE v.deleted=0 AND {where} ORDER BY {self._rank()},v.owner LIMIT :n')
-        return self._page(sql,args,lambda r:dict(owner=(r['home'],r['sid']),owner_ordinal=r['source_ordinal'],
-                          dependencies=unpack(r['dependencies'],self.limits)),
-                          lambda r:(r['source_ordinal'],r['owner']),
-                          lambda r:len(r['dependencies'])+len(r['home'])*4+len(r['sid'])*4)
+        def decode(row):
+            choices=unpack(row['choices'],self.limits)
+            return dict(owner=(row['home'],row['sid']),owner_ordinal=row['source_ordinal'],
+                        dependencies=unpack(row['dependencies'],self.limits),
+                        models=choices.get('models') if choices is not None else None)
+        return self._page(sql,args,decode,lambda r:(r['source_ordinal'],r['owner']),
+                          lambda r:len(r['dependencies'])+len(r['choices'])+len(r['home'])*4+len(r['sid'])*4)
+
+
+    @_read_operation
+    def inventory_scan(self, *, after=None, metadata=True):
+        """Advance by stored owner ID, including skipped tombstones and orphans."""
+        version = ('h.batch' if self.staged_batch is None else
+            'COALESCE((SELECT x.batch FROM owner_versions x WHERE x.owner=o.id '
+            f'AND x.batch={int(self.staged_batch)}),h.batch)')
+        fields = ',v.dependencies,v.choices' if metadata else ''
+        sql = (f'SELECT o.id,o.home,o.sid,v.deleted,{self._rank()} AS ordinal'+fields+
+            ' FROM owners o LEFT JOIN owner_heads h ON h.owner=o.id '
+            f'LEFT JOIN owner_versions v ON v.owner=o.id AND v.batch={version} '
+            f'LEFT JOIN catalog_orders rank ON rank.owner=o.id AND rank.batch={int(self.order_batch)} '
+            'WHERE o.id>? ORDER BY o.id LIMIT ?')
+        rows, size, objects, cursor_after, complete = [], 0, 0, after, True
+        with self._cursor(sql,(after or 0,self.limits.page_rows+1)) as cursor:
+            for scanned, raw in enumerate(cursor):
+                self._check()
+                if scanned >= self.limits.page_rows:
+                    complete = False
+                    break
+                if raw['deleted'] is None or raw['deleted']:
+                    cursor_after = raw['id']
+                    continue
+                value = dict(owner=(raw['home'],raw['sid']),owner_ordinal=raw['ordinal'])
+                n = 4*(len(raw['home'])+len(raw['sid']))+32
+                if metadata:
+                    choices = unpack(raw['choices'],self.limits)
+                    value.update(dependencies=unpack(raw['dependencies'],self.limits),
+                                 models=choices.get('models') if choices is not None else None)
+                    n += len(raw['dependencies'])+len(raw['choices'])
+                m = _size(value)
+                if size+n > self.limits.page_bytes or objects+m > self.limits.page_objects_bytes:
+                    if not rows:
+                        raise CapacityExceeded('one result exceeds the delivered-page budget')
+                    complete = False
+                    break
+                rows.append(value)
+                size += n
+                objects += m
+                cursor_after = raw['id']
+        return Page(tuple(rows),cursor_after,complete,size,objects)
 
     @_read_operation
     def catalog(self, *, after=None, publication=False, query=False, home=None, sid=None):
@@ -2061,6 +2589,34 @@ class Snapshot:
                          for name in fields}),
             lambda r: (r['source_ordinal'], r['owner']),
             lambda r: sum(len(r[name]) for name in fields))
+
+    @_read_operation
+    def publication_heads(self, *, after=None, owners=None):
+        args = dict(after=after or 0, n=self.limits.page_rows+1)
+        where = 'v.deleted=0 AND o.id>:after'
+        if owners is not None:
+            keys=tuple(map(tuple,owners))
+            if len(keys)>128 or len(set(keys))!=len(keys):raise ValueError('select at most 128 unique owners')
+            if not keys:return Page((),None,True,0,0)
+            selected=[]
+            for number,(home,sid) in enumerate(keys):
+                args[f'home{number}'],args[f'sid{number}']=home,sid
+                selected.append(f'(:home{number},:sid{number})')
+            where+=' AND (o.home,o.sid) IN (VALUES '+','.join(selected)+')'
+        metadata = ("json_array('d',json((SELECT json_group_array(json(field.value)) "
+            "FROM json_each(v.metadata,'$[1]') field "
+            "WHERE json_extract(field.value,'$[0][1]') IN ('title','_internal_review'))))")
+        sql = (f'SELECT o.id,o.home,o.sid,{metadata} AS metadata,v.model_alerts '
+            'FROM owners o JOIN owner_heads h ON h.owner=o.id '
+            'JOIN owner_versions v ON v.owner=h.owner AND v.batch=h.batch '
+            f'WHERE {where} ORDER BY o.id LIMIT :n')
+        return self._page(sql,args,
+            lambda row: dict(owner=(row['home'],row['sid']),
+                metadata=unpack(row['metadata'].encode('utf-8'),self.limits),
+                model_alerts=unpack(row['model_alerts'],self.limits)),
+            lambda row:row['id'],
+            lambda row:len(row['metadata'].encode('utf-8'))+len(row['model_alerts'])+
+                4*(len(row['home'])+len(row['sid'])))
 
     @_read_operation
     def ordering(self, *, after=None, home=None, sid=None):
@@ -2130,7 +2686,7 @@ class Snapshot:
                           cursor_key, lambda r: r['encoded_bytes'])
 
     @_read_operation
-    def projected_calls(self, owner, fields, *, start=None, end=None, after=None, turn=None, filters=None, ordinal_start=None):
+    def projected_calls(self, owner, fields, *, start=None, end=None, after=None, turn=None, filters=None, ordinal_start=None, keys=None):
         """A bounded typed projection, with no unrequested detail or key decode.
 
         Canonical owner defaults are shared by the writer. Rare explicitly
@@ -2158,6 +2714,8 @@ class Snapshot:
             columns.extend(('r.owner_mask',f'CASE WHEN ({covered} & {mask})={mask} THEN NULL ELSE r.detail END AS override_detail'))
         args=dict(owner=meta['id'],n=self.limits.page_rows+1)
         where=['r.owner=:owner','r.deleted=0',self._visible('calls')]
+        if keys is not None:
+            where.append('r.identity IN ('+self._keys(keys,args)+')')
         if ordinal_start is not None:
             args['ordinal_start']=_number(ordinal_start,'ordinal_start')
             where.append('r.m_session_ordinal>=:ordinal_start')
@@ -2190,7 +2748,7 @@ class Snapshot:
                 raise ValueError('invalid projected call cursor')
             args.update(zip(('ts','ordinal','key'),after))
             where.append('(r.m_ts,r.m_session_ordinal,r.identity)>(:ts,:ordinal,:key)')
-        index='calls_ordinal' if ordinal_start is not None else 'calls_time'
+        index='calls_identity' if keys is not None else 'calls_ordinal' if ordinal_start is not None else 'calls_time'
         sql=(f'SELECT {",".join(columns)} FROM calls r INDEXED BY {index} '
              f'JOIN publications p ON p.id=r.batch WHERE {" AND ".join(where)} '
              'ORDER BY r.m_ts,r.m_session_ordinal,r.identity LIMIT :n')
@@ -2740,6 +3298,27 @@ class Snapshot:
             if not self.closed:
                 self.db.set_progress_handler(self._progress, 1000)
 
+    def _speed_admission_room(self, extra=0, *, entry=False):
+        active = self.speed_work['selection_input_bytes'] + self.speed_work['selection_database_bytes']
+        while True:
+            memo = self._speed_admissions
+            table = sys.getsizeof(memo) if memo is not None else 0
+            retained = table + self._speed_admission_bytes
+            if memo is not None:
+                retained += sys.getsizeof(self._speed_admission_bytes)
+            if entry:
+                retained += 4*max(table, sys.getsizeof({})) + 256
+            if (len(memo or ()) + int(entry) <= self.limits.speed_range_rows and
+                    active + retained + extra <= self.limits.speed_temp_bytes):
+                return True
+            if not memo:
+                self._speed_admissions = None
+                return active + extra <= self.limits.speed_temp_bytes and not entry
+            key, value = memo.popitem()
+            self._speed_admission_bytes -= _size(key) + _size(value)
+            if not memo:
+                self._speed_admissions = None
+
     def _speed_load(self, ranges):
         self.db.execute('PRAGMA query_only=OFF')
         try:
@@ -2768,14 +3347,28 @@ class Snapshot:
                        'INSERT INTO temp.speed_selection(owner,frontier) '
                        f'SELECT o.id,q.frontier FROM requested q,{self._owner_tables()} '
                        'WHERE q.home=o.home AND q.sid=o.sid AND v.deleted=0')
+                self.speed_work['selected_owners'] = count
+                self.speed_work['selection_input_bytes'] = size
+                database = self.db.execute('PRAGMA temp.page_count').fetchone()[0]*page_size
+                self.speed_work['selection_database_bytes'] = database
+                self._speed_admission_room(extra=database + 2*(len(group)+1)*page_size)
+                memo = self._speed_admissions
+                retained = (sys.getsizeof(memo) + self._speed_admission_bytes +
+                            sys.getsizeof(self._speed_admission_bytes)) if memo is not None else 0
+                pages = (self.limits.speed_temp_bytes-size-retained)//page_size
+                if pages <= 0 or self.db.execute(f'PRAGMA temp.max_page_count={pages}').fetchone()[0] > pages:
+                    raise CapacityExceeded('speed owner selection exceeds its metadata budget')
                 before = self.db.total_changes
                 with self._cursor(sql,args):
                     pass
+                self.speed_work['selection_database_bytes'] = self.db.execute('PRAGMA temp.page_count').fetchone()[0]*page_size
                 if self.db.total_changes-before != len(group):
                     raise NotReady('speed selection contains an owner absent from this generation')
             self.speed_work['selected_owners'] = count
             self.speed_work['selection_input_bytes'] = size
             self.speed_work['selection_database_bytes'] = self.db.execute('PRAGMA temp.page_count').fetchone()[0]*page_size
+            if not self._speed_admission_room():
+                raise CapacityExceeded('speed owner selection exceeds its metadata budget')
         finally:
             self.db.execute('PRAGMA query_only=ON')
 
@@ -2791,7 +3384,8 @@ class Snapshot:
             raise PreparedError('only one grouped speed stream may use a snapshot')
         self.speed_active = True
         self.speed_work = dict(selected_owners=0,selection_input_bytes=0,selection_database_bytes=0,
-                               selected_rows=0,sort_estimated_bytes=0,rows_yielded=0,body_decodes=0)
+                               selected_rows=0,sort_estimated_bytes=0,rows_yielded=0,body_decodes=0,
+                               admission_hits=0,admission_reads=0)
         try:
             self._speed_load(ranges)
             visible = ('r.owner=q.owner AND r.m_session_ordinal>q.frontier AND r.deleted=0 AND '
@@ -2804,11 +3398,31 @@ class Snapshot:
                        " AS BLOB)) WHEN 'blob' THEN length(r.m_"+field+") ELSE 8 END+16"
                        for field in SPEED_FIELDS]
             charge = '(256+length(r.key_value)+COALESCE(length(r.turn_value),0)+length(r.types)+'+'+'.join(charges)+')'
-            with self._cursor(f'SELECT COUNT(*),COALESCE(SUM({charge}),0) FROM {tables} WHERE {visible}') as cursor:
-                count, size = cursor.fetchone()
-            self.speed_work.update(selected_rows=count,sort_estimated_bytes=size)
-            if size > self.limits.speed_sort_bytes:
-                raise CapacityExceeded('speed chronological sort exceeds its admitted temporary payload')
+            count = size = 0
+            for owner, frontier in ranges.items():
+                self._check()
+                key = (owner, frontier)
+                admitted = self._speed_admissions.get(key) if self._speed_admissions is not None else None
+                if admitted is None:
+                    sql = (f'SELECT COUNT(*),COALESCE(SUM({charge}),0) FROM {tables} WHERE {visible} '
+                           'AND q.owner=(SELECT id FROM owners WHERE home=? AND sid=?)')
+                    with self._cursor(sql, owner) as cursor:
+                        admitted = tuple(cursor.fetchone())
+                    self.speed_work['admission_reads'] += 1
+                    retained = _size(key) + _size(admitted)
+                    if self._speed_admission_room(retained, entry=True):
+                        if self._speed_admissions is None:
+                            self._speed_admissions = {}
+                        self._speed_admissions[key] = admitted
+                        self._speed_admission_bytes += retained
+                        self._speed_admission_room()
+                else:
+                    self.speed_work['admission_hits'] += 1
+                count += admitted[0]
+                size += admitted[1]
+                self.speed_work.update(selected_rows=count, sort_estimated_bytes=size)
+                if size > self.limits.speed_sort_bytes:
+                    raise CapacityExceeded('speed chronological sort exceeds its admitted temporary payload')
             columns = 'r.key_value,r.turn_value,r.types,'+','.join('r.m_'+name for name in SPEED_FIELDS)
             sql = ('WITH selected AS MATERIALIZED ('
                    'SELECT q.owner,q.frontier,o.home,o.sid,ROW_NUMBER() OVER(ORDER BY o.home,o.sid) AS owner_rank '
@@ -2865,6 +3479,8 @@ class Snapshot:
             if self.db.in_transaction:
                 self.db.execute('ROLLBACK')
             self.closed = True
+            self._speed_admissions = None
+            self._speed_admission_bytes = 0
             if self.reader.active is self:
                 self.reader.active = None
 

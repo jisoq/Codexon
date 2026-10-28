@@ -8,7 +8,7 @@ from .core import token_number, transport_label, token_parts
 from .cache_misses import classify
 from .cache_health import CacheHealth
 from .session_costs import session_costs
-from .speed_health import SpeedHealth
+from .speed_health import SpeedHealth, scope as speed_scope
 from .analysis_records import public_record
 from .prepared_sums import _Sum
 
@@ -413,6 +413,7 @@ def _summary_view(session,latest,recent,facts,*,request,misses,health,degradatio
             'unattached_total':token_number((session.get('unclassified') or {}).get('total')),
             'assumed': assumed, 'coverage_gap': gap, 'warnings': latest_call.get('warnings',[]),
             'latest_ts': latest.get('ts'), 'latest_key': latest.get('key'),
+            '_speed_eligible':speed_scope(latest) is not None,
             'latest':latest_call,'request':request,'recent':recent,'cache_health':health,
             'output_speed_summary':facts['speed'],'cost_composition':facts['cost_composition'],
             'members':[(session['home'],session['id'])],
@@ -444,8 +445,6 @@ def summarize_session(session,health=None,*,_partials=None,_facts=None):
     if not incidents and health.get('incident'):
         incidents=[health['incident']]
     degradation=[event for event in incidents if event.get('state')=='캐시 저하 의심']
-    # Keep classifier evidence available after the graph's 24-call window rolls
-    # forward. These are observed rows, never reconstructed from session totals.
     evidence_rows={}
     evidence_keys=set()
     for event in degradation:
@@ -465,7 +464,6 @@ def summarize_session(session,health=None,*,_partials=None,_facts=None):
         event['recovery_calls']=[deepcopy(evidence_rows[key]) for key in event.get('recovery_keys',()) if key in evidence_rows]
     degradation_keys={key for event in degradation for key in event.get('occurrence_keys',event.get('keys', (
         event.get('first_key'),event.get('latest_key')))) if key is not None}
-    first=max(0,len(rows)-24)
     all_calls=[call_summary(row,ordinal,miss=is_miss(row),
                         degradation=row.get('key') in degradation_keys)
             for ordinal,row in enumerate(rows[-RECENT_CALLS:],max(1,len(rows)-RECENT_CALLS+1))]
@@ -590,7 +588,9 @@ class OverlaySummaries:
         presented={};output=[]
         for summary in result:
             key=(summary['home'],summary['id'])
-            speed=speeds.get(key,{'active':False})
+            speed=speeds.get(key,{'active':None,'status':'pending'})
+            if speed.get('active') is None and updated[key][1].get('_speed_eligible') is False:
+                speed=dict(active=False)
             # Readiness changes independently of priced history. Include every
             # displayed descendant without invalidating the expensive summaries.
             flags=[engine.sessions[member].get('source',engine.sessions[member]['prepared']).get('collection_complete')

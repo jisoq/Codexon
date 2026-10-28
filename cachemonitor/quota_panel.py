@@ -556,7 +556,9 @@ class QuotaPanel(Group):
         follow=not self.history.rows or self.history.cursor==len(self.history.rows)-1
         self._selected_cycle=(period['start'] if period else None)
         self.history.money=True
-        self.history.reference=self.lifetime_value if all_cycles else period['value'] if period else None
+        reference=self.lifetime_value if all_cycles else period['value'] if period else None
+        if self.history.reference!=reference:
+            self.history.reference=reference;self.history.update()
         self.history.empty_text='표시할 사용 기록이 없습니다'
         self.chart_title.setText('주기별 사용량 추이' if all_cycles else '선택 주기의 사용량 추이')
         self.remaining_legend.setText('주기 소모량 (%p)' if all_cycles else '남은 사용량 (%)')
@@ -726,6 +728,27 @@ class QuotaPanel(Group):
         if getattr(self,'defer_render',False):self._render_dirty=True
         else:self.render(automatic=True)
 
+    def value_cycle_selection(self):
+        import hashlib
+        import json
+        scope=json.dumps((home_key(self.report.get('home')),self.report.get('account') or ''))
+        key='quota/value_cycles/'+hashlib.sha256(scope.encode()).hexdigest()
+        try:
+            saved=json.loads(self.settings.value(key,'[]'))
+        except (TypeError,ValueError):saved=[]
+        excluded={value for value in saved if type(value) in (int,float) and math.isfinite(value)} if isinstance(saved,list) else set()
+        return key,excluded
+
+    def weekly_value(self,excluded):
+        periods=self.report['view']['periods']
+        selected=[period for period in periods if period['start'] not in excluded]
+        if len(selected)==len(periods):
+            value=self.lifetime_statistics['per_percent']
+            return value*100 if value is not None else None
+        costs=[period['cost'] for period in selected if period['cost'] is not None]
+        delta=sum(period['delta'] for period in selected)
+        return sum(costs)/delta*100 if costs and delta else None
+
     def render(self,*_,automatic=False):
         self.refresh_status()
         self._set_loading(self.query_loading,False)
@@ -749,7 +772,13 @@ class QuotaPanel(Group):
             for model in available:self.model_choice.addItem(model,model)
             self.model_choice.setCurrentIndex(max(0,self.model_choice.findData(selected_model)))
             self.model_choice.blockSignals(False)
-        self.lifetime_value=lifetime['per_percent']*100 if lifetime['per_percent'] is not None else None
+        _,excluded=self.value_cycle_selection()
+        self.lifetime_value=self.weekly_value(excluded)
+        if hasattr(self,'value_cycles_button'):
+            periods=self.report['view']['periods']
+            self.value_cycles_button.setText(formatted('산정 주기 관리 ({selected}/{total})',
+                selected=sum(period['start'] not in excluded for period in periods),total=len(periods)))
+            self.value_cycles_button.setEnabled(bool(periods) and not self.report.get('history_pending'))
         self.result.setText(usd(self.lifetime_value))
         self.lifetime_basis.setText(
             f"주간 100%p 기준 / 누적 환산액 {usd(lifetime['cost'])} / 소모 {lifetime['delta']:g}%p"

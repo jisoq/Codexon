@@ -1,5 +1,5 @@
 
-from PySide6.QtTest import QTest
+from PySide6.QtTest import QSignalSpy
 from PySide6.QtWidgets import QApplication
 
 from cachemonitor.overlay_shadow import OverlayShadow
@@ -25,8 +25,9 @@ def test_rendered_quick_scene_keeps_panel_clear_and_shadow_visible():
     app=QApplication.instance() or QApplication([])
     shadow=OverlayShadow()
     try:
+        rendered=QSignalSpy(shadow.quick.quickWindow().afterRendering)
         shadow.show()
-        wait_for_rendered(lambda:shadow.quick.rootObject() is not None)
+        wait_for_rendered(lambda:shadow.quick.rootObject() is not None and rendered.count()>0)
         image=shadow.quick.grabFramebuffer()
         # QQuickWidget's framebuffer is physical-sized even when the returned
         # QImage has its default DPR metadata; use the actual framebuffer ratio.

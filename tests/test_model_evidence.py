@@ -1,10 +1,171 @@
 import json
+import time
 
 from cachemonitor.model_evidence import EvidenceStore, EvidenceReader
 from cachemonitor.analysis_engine import AnalysisEngine
 from cachemonitor.index import UsageIndex
 from test_index import finish
 from test_core import fixture_home
+
+
+def test_selected_exact_evidence_does_not_replay_unrelated_history(tmp_path,monkeypatch):
+    from types import SimpleNamespace
+    from cachemonitor import model_evidence
+    from cachemonitor.model_evidence import home_key
+    store=EvidenceStore(tmp_path/'evidence.sqlite');reader=EvidenceReader(store.path);home=tmp_path/'home'
+    try:
+        store.db.executemany('INSERT INTO model_observations '
+            '(home,attempt,ts,transport,response_id,requested_model,response_model,status,conflict) '
+            'VALUES(?,?,?,?,?,?,?,?,?)',
+            ((home_key(home),'historical'+str(n),n,'WebSocket','old'+str(n),'old','old','completed',0)
+             for n in range(reader.MAX_POLL_ROWS+1)))
+        store.write(home,'selected',10000,'WebSocket','selected','gpt-6-astra','gpt-6-astra','completed',
+            requested_service_tier='priority',request_observed_at=9999,
+            generation_latency_ms=120,completion_latency_ms=450)
+        decode=model_evidence.observation_record;decoded=[]
+        def selected_only(row):
+            assert row['attempt']=='selected','Unrelated historical observation was decoded'
+            decoded.append(row['seq'])
+            return decode(row)
+        monkeypatch.setattr(model_evidence,'observation_record',selected_only)
+        reader.poll(historical=False)
+        rows=[{'key':'selected','input':123,'cached':100,'output':4}]
+        owner=SimpleNamespace(keys={'selected'})
+        actual=reader.enrich_owned(home_key(home),rows,owner,capture_proof=True)
+        assert reader.offset==0 and reader.catching_up and decoded==[reader.highwater]
+        assert not reader.changed_activity and not reader.error
+        assert actual[0]['model']=='gpt-6-astra' and actual[0]['service_tier']=='priority'
+        assert actual[0]['generation_latency_ms']==120 and actual[0]['completion_latency_ms']==450
+        full=[dict(row) for row in reader.db.execute('SELECT * FROM model_observations WHERE seq IN '
+            '(SELECT max(seq) FROM model_observations WHERE home=? AND response_id=? GROUP BY attempt)',
+            (home_key(home),'selected'))]
+        monkeypatch.setattr(reader,'evidence_rows',lambda home,rows:((row,full) for row in rows))
+        assert reader.enrich(home,rows)==actual
+        assert reader.offset==0
+    finally:reader.close();store.close()
+
+
+def test_live_activity_and_corrections_stay_current_during_historical_replay(tmp_path,monkeypatch):
+    from types import SimpleNamespace
+    from cachemonitor.model_evidence import home_key
+    store=EvidenceStore(tmp_path/'evidence.sqlite');reader=EvidenceReader(store.path);home=tmp_path/'home'
+    monkeypatch.setattr(reader,'MAX_POLL_ROWS',2)
+    monkeypatch.setattr(reader,'MAX_RECORDS',2)
+    rows=[{'key':'live'}];owner=SimpleNamespace(keys={'live'});key=(home_key(home),'current')
+    try:
+        for n in range(7):store.write(home,'old'+str(n),n,'WebSocket','old'+str(n),status='completed')
+        reader.poll(historical=False)
+        assert reader.offset==0 and not reader.activity_records
+        store.write(home,'current',10,'WebSocket',status='pending',request_observed_at=10)
+        reader.poll(historical=False)
+        pending=reader.changed_activity[key]
+        assert pending['status']=='pending' and not pending['response_id']
+        assert not reader.enrich_owned(home_key(home),rows,owner)[0]['wire_observed']
+        store.write(home,'current',11,'WebSocket','live','requested',status='created',request_observed_at=10)
+        reader.poll(historical=False)
+        created=reader.enrich_owned(home_key(home),rows,owner,capture_proof=True)[0]
+        assert created['response_status']=='created' and not created['timing_valid']
+        store.write(home,'current',12,'WebSocket','live','requested','requested','completed',
+            request_observed_at=10,completed_observed_at=12,generation_latency_ms=100,completion_latency_ms=2000)
+        reader.poll(historical=False)
+        completed=reader.enrich_owned(home_key(home),rows,owner,capture_proof=True)[0]
+        assert completed['response_status']=='completed' and completed['completion_latency_ms']==2000
+        assert pending['status']=='pending' and created['response_status']=='created'
+        assert reader.offset==0
+        store.db.execute("UPDATE model_observations SET requested_model='corrected' WHERE seq=?",(reader.highwater,))
+        store.db.commit();reader.poll(historical=False)
+        corrected=reader.enrich_owned(home_key(home),rows,owner,capture_proof=True)
+        assert corrected[0]['requested_model']=='corrected' and reader.changed_activity[key]['requested_model']=='corrected'
+        proof=owner._evidence_proof[1]
+        store.gap(11,13);reader.poll(historical=False)
+        gapped=reader.enrich_owned(home_key(home),rows,owner,capture_proof=True)
+        assert gapped[0]['observation_missing'] and owner._evidence_proof[1]!=proof
+        deadline=time.monotonic()+10
+        while reader.catching_up:
+            assert time.monotonic()<deadline
+            reader.poll()
+            assert not reader.error
+            if key in reader.changed_activity:
+                assert reader.changed_activity[key]['status']=='completed'
+                assert reader.changed_activity[key]['requested_model']=='corrected'
+        assert reader.offset==reader.highwater
+        assert reader.activity_records[key]['status']=='completed'
+        assert reader.records[(key[0],'live')]['current']['requested_model']=='corrected'
+        assert reader.enrich_owned(home_key(home),rows,owner,capture_proof=True)==gapped
+    finally:reader.close();store.close()
+
+
+def test_selected_exact_join_covers_unprocessed_live_tail(tmp_path,monkeypatch):
+    from types import SimpleNamespace
+    from cachemonitor.model_evidence import EvidenceProof,home_key
+    store=EvidenceStore(tmp_path/'evidence.sqlite');reader=EvidenceReader(store.path);home=tmp_path/'home'
+    monkeypatch.setattr(reader,'MAX_POLL_ROWS',2)
+    rows=[{'key':'selected'}];owner=SimpleNamespace(keys={'selected'});key=home_key(home)
+    try:
+        store.write(home,'current',10,'WebSocket','selected','old','old','completed',
+            requested_service_tier='default',generation_latency_ms=10,completion_latency_ms=20)
+        reader.poll(historical=False)
+        initial=reader.enrich_owned(key,rows,owner,capture_proof=True)
+        initial_proof=owner._evidence_proof[1]
+        store.write(home,'unrelated-one',11,'WebSocket','unrelated-one',status='completed')
+        store.write(home,'unrelated-two',12,'WebSocket','unrelated-two',status='completed')
+        store.write(home,'current',13,'WebSocket','selected','current','current','completed',
+            requested_service_tier='priority',response_service_tier='priority',
+            request_observed_at=12,completed_observed_at=13,generation_latency_ms=120,completion_latency_ms=1000)
+        reader.poll(historical=False)
+        assert reader.offset==0 and reader.live_offset<reader.highwater
+        assert 'selected' not in reader.changed_responses.get(key,set())
+        actual=reader.enrich_owned(key,rows,owner,capture_proof=True)
+        proof=EvidenceProof(reader.gaps)
+        expected=reader.enrich_home(key,rows,proof=proof)
+        assert actual==expected
+        assert actual[0]['model']=='current' and actual[0]['requested_service_tier']=='priority'
+        assert actual[0]['response_service_tier']=='priority'
+        assert actual[0]['generation_latency_ms']==120 and actual[0]['completion_latency_ms']==1000
+        assert owner._evidence_proof[1]==proof.digest()!=initial_proof
+        assert initial[0]['model']=='old' and initial[0]['completion_latency_ms']==20
+        assert reader.enrich_owned(key,rows,owner,capture_proof=True) is actual
+        assert reader.offset==0 and reader.live_offset<reader.highwater
+    finally:reader.close();store.close()
+
+
+def test_selected_join_created_before_first_poll_does_not_skip_captured_history(tmp_path,monkeypatch):
+    from types import SimpleNamespace
+    from cachemonitor.model_evidence import home_key
+    store=EvidenceStore(tmp_path/'evidence.sqlite');reader=EvidenceReader(store.path);home=tmp_path/'home'
+    monkeypatch.setattr(reader,'MAX_POLL_ROWS',2)
+    rows=[{'key':'selected'}];owner=SimpleNamespace(keys={'selected'});key=home_key(home)
+    try:
+        initial=reader.enrich_owned(key,rows,owner,capture_proof=True)
+        for number in range(3):store.write(home,str(number),number,'WebSocket',str(number),status='completed')
+        store.write(home,'current',4,'WebSocket','selected','current','current','completed')
+        reader.poll(historical=False)
+        actual=reader.enrich_owned(key,rows,owner,capture_proof=True)
+        assert not initial[0]['wire_observed'] and actual[0]['model']=='current'
+        assert reader.offset==0
+    finally:reader.close();store.close()
+
+
+def test_selected_join_invalidates_replaced_evidence_without_acknowledging_history(tmp_path):
+    from types import SimpleNamespace
+    from cachemonitor.model_evidence import home_key
+    store=EvidenceStore(tmp_path/'evidence.sqlite');reader=EvidenceReader(store.path);home=tmp_path/'home'
+    rows=[{'key':'selected'}];owner=SimpleNamespace(keys={'selected'})
+    try:
+        store.write(home,'old',1,'WebSocket','selected','old','old','completed')
+        reader.poll(historical=False)
+        assert reader.enrich_owned(home_key(home),rows,owner,capture_proof=True)[0]['model']=='old'
+        proof=owner._evidence_proof[1];generation=reader.generation
+        store.db.execute('DELETE FROM model_observations')
+        store.db.execute("DELETE FROM sqlite_sequence WHERE name='model_observations'")
+        store.write(home,'replacement',2,'WebSocket','selected','new','new','completed')
+        store.write(home,'next',3,'WebSocket','other',status='created')
+        reader.poll(historical=False)
+        assert reader.generation>generation and reader.offset==0
+        assert reader.enrich_owned(home_key(home),rows,owner,capture_proof=True)[0]['model']=='new'
+        assert owner._evidence_proof[1]!=proof
+        assert not reader.activity_records
+    finally:reader.close();store.close()
 
 
 def test_old_evidence_remains_queryable_after_bounded_memory_eviction(tmp_path,monkeypatch):
@@ -43,37 +204,52 @@ def test_many_attempts_keep_all_conflict_decisions_with_bounded_join_memory(tmp_
     finally:reader.close();store.close()
 
 
-def test_reader_drains_available_batches_without_waiting_between_polls(tmp_path, monkeypatch):
+def test_reader_drains_available_rows_across_polls_and_honors_deadline(tmp_path, monkeypatch):
     store=EvidenceStore(tmp_path/'evidence.sqlite');reader=EvidenceReader(store.path)
-    monkeypatch.setattr(reader,'READ_BATCH',2)
+    monkeypatch.setattr(reader,'MAX_POLL_ROWS',2)
     try:
         for n in range(7):store.write(tmp_path/'home',f'a{n}',n,'WebSocket',f'r{n}',status='completed')
         reader.poll()
-        assert len(reader.records)==7 and not reader.catching_up
-        monkeypatch.setattr(reader,'READ_SECONDS',0)
+        assert reader.catching_up and len(reader.records)==2
+        deadline=time.monotonic()+10
+        while reader.catching_up:
+            assert time.monotonic()<deadline
+            previous=reader.offset
+            reader.poll()
+            assert not reader.error and previous<reader.offset<=previous+2
+        assert len(reader.records)==7
         for n in range(7,12):store.write(tmp_path/'home',f'a{n}',n,'WebSocket',f'r{n}',status='completed')
-        reader.poll()
+        reader.poll(historical=False)
         assert reader.catching_up and len(reader.records)==9
-        monkeypatch.setattr(reader,'READ_SECONDS',10)
+        monkeypatch.setattr(reader,'READ_SECONDS',0)
+        monkeypatch.setattr(reader,'MAX_POLL_ROWS',10)
         reader.poll()
-        assert not reader.catching_up and len(reader.records)==12
+        assert reader.live_offset==reader.highwater and reader.offset==7
+        assert reader.catching_up and len(reader.records)==12
+        monkeypatch.setattr(reader,'READ_SECONDS',10)
+        deadline=time.monotonic()+10
+        while reader.catching_up:
+            assert time.monotonic()<deadline
+            reader.poll()
+            assert not reader.error
+        assert reader.offset==reader.highwater and len(reader.records)==12
     finally:reader.close();store.close()
 
 
-def test_partial_observation_read_advances_publication_revision_and_recovers(tmp_path,monkeypatch):
+def test_partial_observation_read_advances_publication_revision_and_recovers(tmp_path):
     import sqlite3
     store=EvidenceStore(tmp_path/'evidence.sqlite');reader=EvidenceReader(store.path);home=tmp_path/'home'
     try:
         store.write(home,'first',1,'WebSocket','first',status='completed');reader.poll()
         before=reader.revision;db=reader.db
         for n in range(2,4):store.write(home,f'a{n}',n,'WebSocket',f'r{n}',status='completed')
-        monkeypatch.setattr(reader,'READ_BATCH',1)
         class Interrupted:
             def __init__(self):self.batches=0
             def execute(self,sql,*args):
                 if 'seq>? AND seq<=?' in sql:
                     self.batches+=1
                     if self.batches==2:raise sqlite3.OperationalError('interrupted observation read')
+                    return db.execute(sql,(*args[0][:-1],1))
                 return db.execute(sql,*args)
             def close(self):db.close()
         reader.db=Interrupted();reader.poll()

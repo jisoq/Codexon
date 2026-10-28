@@ -311,7 +311,11 @@ def test_environment_failure_stops_before_tests_and_preserves_baseline(tmp_path,
     monkeypatch.setattr(verify,'file_hashes',lambda:{'cachemonitor/dashboard.py':'changed'})
     problem=dict(kind='unlocked_import',module='yaml',file='tests/test_release_pipeline.py',line=1)
     monkeypatch.setattr(environment,'check_environment',lambda:dict(errors=[problem]))
-    def unexpected(*args,**kwargs):raise AssertionError('Tests must not run after failed preflight')
+    original_run=verify.subprocess.run
+    def unexpected(command,*args,**kwargs):
+        if command[:2] in (['git','check-ignore'],['git','ls-files']):
+            return original_run(command,*args,**kwargs)
+        raise AssertionError('Tests must not run after failed preflight')
     monkeypatch.setattr(verify.subprocess,'run',unexpected)
     assert verify.main([])==2
     result=json.loads(capsys.readouterr().out)
@@ -336,7 +340,11 @@ def test_stale_native_extension_stops_before_tests_and_preserves_baseline(tmp_pa
     monkeypatch.setattr(native,'extension_path',lambda:binary)
     def stale():raise RuntimeError('Rust extension is stale or changed')
     monkeypatch.setattr(native,'checked_extension',stale)
-    def unexpected(*args,**kwargs):raise AssertionError('Tests must not run with a stale extension')
+    original_run=verify.subprocess.run
+    def unexpected(command,*args,**kwargs):
+        if command[:2] in (['git','check-ignore'],['git','ls-files']):
+            return original_run(command,*args,**kwargs)
+        raise AssertionError('Tests must not run with a stale extension')
     monkeypatch.setattr(verify.subprocess,'run',unexpected)
     assert verify.main([])==2
     result=json.loads(capsys.readouterr().out)
@@ -350,6 +358,36 @@ def test_basic_rejects_conflicting_profiles_before_execution(other):
     with pytest.raises(SystemExit) as error:
         verify.main(['--basic', other, '--plan'])
     assert error.value.code == 2
+
+
+def test_basic_ci_keeps_history_reuse_and_live_update_regressions_in_their_runners():
+    import tools.verify_changes as verify
+    history = {
+        'tests/test_collection_replay_reactivation.py',
+        'tests/test_prepared_delivery_incremental_alerts.py',
+        'tests/test_prepared_freeze_scheduling.py',
+        'tests/test_prepared_live_scheduling.py',
+        'tests/test_prepared_partial_reuse.py',
+        'tests/test_prepared_selection_retry.py',
+    }
+    dashboard = {
+        'tests/test_dashboard_evidence.py::test_aggregate_preparation_displays_actual_totals_before_query',
+        'tests/test_dashboard_evidence.py::test_hidden_dashboard_restored_navigation_never_requests_aggregate_until_shown',
+    }
+    selection = verify.basic_tests()
+    gui_history = {
+        'tests/test_prepared_freeze_scheduling.py',
+        'tests/test_prepared_live_scheduling.py',
+        'tests/test_prepared_selection_retry.py',
+    }
+    assert history - gui_history <= verify.CORE_TESTS
+    assert not gui_history & verify.CORE_TESTS
+    assert history | dashboard <= set(selection)
+    commands = dict(verify.pytest_commands(selection))
+    assert history - gui_history <= set(commands['core'])
+    assert '--no-desktop' in commands['core']
+    assert dashboard | gui_history <= set(commands['gui'])
+    assert '--no-desktop' not in commands['gui']
 
 
 @pytest.mark.parametrize('existing_baseline', [False, True])
@@ -381,8 +419,10 @@ def test_basic_success_preserves_local_baseline_and_gui_work(tmp_path, monkeypat
     reports = list((tmp_path/'reports').glob('*/report.json'))
     report = json.loads(reports[0].read_text(encoding='utf-8'))
     assert report['suite'] == 'basic' and not report['full'] and report['affected_tests'] == []
-    assert report['tests'] == sorted(verify.CORE_TESTS)
-    assert len(executed) == 1 and '--no-desktop' in executed[0] and 'core' in executed[0]
+    assert report['tests'] == list(verify.basic_tests())
+    assert len(executed) == 2
+    assert '--no-desktop' in executed[0] and 'core' in executed[0]
+    assert '--no-desktop' not in executed[1] and 'gui' in executed[1]
     assert report['pytest']['runs'][0]['exit_code'] == 0
     if existing_baseline:
         assert baseline.read_bytes() == original
@@ -399,7 +439,7 @@ def test_basic_missing_baseline_stays_basic_and_keeps_unmapped_guard(tmp_path, m
     assert verify.main(['--basic', '--plan']) == 0
     plan = json.loads(capsys.readouterr().out)
     assert plan['suite'] == 'basic' and not plan['full'] and plan['affected_tests'] == []
-    assert plan['tests'] == sorted(verify.CORE_TESTS)
+    assert plan['tests'] == list(verify.basic_tests())
     monkeypatch.setattr(verify, 'file_hashes', lambda: {'cachemonitor/unmapped_new.py':'new'})
     monkeypatch.setattr(verify, 'changed_files', lambda *args: {'cachemonitor/unmapped_new.py'})
     assert verify.main(['--basic', '--plan']) == 2
@@ -562,7 +602,7 @@ def test_rerun_preserves_absent_baseline_and_basic_selection(tmp_path, monkeypat
     assert verify.main(['--rerun', first['rerun_manifest'], '--diagnostics', str(tmp_path/'retry')]) == 0
     retry = json.loads(capsys.readouterr().out)
     report = json.loads(Path(retry['report']).read_text(encoding='utf-8'))
-    assert report['suite'] == 'basic' and report['tests'] == sorted(verify.CORE_TESTS)
+    assert report['suite'] == 'basic' and report['tests'] == list(verify.basic_tests())
     assert not baseline.exists()
 
 
@@ -642,7 +682,13 @@ def test_logged_capture_drains_output_written_at_process_exit(tmp_path, monkeypa
         def wait(self):
             return self.poll()
 
-    monkeypatch.setattr(verify.subprocess, 'Popen', Process)
+    original_popen=verify.subprocess.Popen
+    def start(command,**kwargs):
+        if command[:2] in (['git','check-ignore'],['git','ls-files']):
+            return original_popen(command,**kwargs)
+        assert command==['controlled-process']
+        return Process(command,**kwargs)
+    monkeypatch.setattr(verify.subprocess, 'Popen', start)
     log = tmp_path/'check.log'
     result = verify.run_logged(['controlled-process'], log)
     assert result.returncode == result.product_exit_code == 7
@@ -661,7 +707,10 @@ def test_package_evidence_failure_retains_known_product_outcome(tmp_path, monkey
     original = baseline.read_bytes()
     executable = tmp_path/'package.exe'; executable.write_bytes(b'package probe')
     calls = []
+    original_run=verify.subprocess.run
     def run(command, **kwargs):
+        if command[:2] in (['git','check-ignore'],['git','ls-files']):
+            return original_run(command,**kwargs)
         current = 'runtime' if '--verify-runtime' in command else 'smoke'
         calls.append(current)
         evidence = Path(command[command.index('--verify-runtime' if current == 'runtime' else '--smoke') + 1])
@@ -683,3 +732,19 @@ def test_package_evidence_failure_retains_known_product_outcome(tmp_path, monkey
     assert calls == (['runtime'] if stage == 'runtime' else ['runtime', 'smoke'])
     assert ('pytest' in report) == source_first
     assert baseline.read_bytes() == original
+
+
+def test_check_output_retains_complete_progress_and_final_outcomes():
+    from tools.check_diagnostics import CheckOutput
+    output = CheckOutput()
+    first = dict(test='test_example', phase='call', started='now', pid=123)
+    record = '[codexon-check] '+json.dumps(dict(active_test=first))+'\n'
+    output.feed(record[:30])
+    assert output.active_test is None
+    output.feed(record[30:])
+    assert output.active_test == first
+    second = dict(first, phase='finished')
+    output.feed('[codexon-check] '+json.dumps(dict(active_test=second)), final=True)
+    assert output.active_test == first
+    output.feed('[codexon-check] '+json.dumps(dict(product_exit_code=7)), final=True)
+    assert output.product_exit_code == 7

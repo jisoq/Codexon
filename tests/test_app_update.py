@@ -348,7 +348,7 @@ def test_explicit_start_is_single_flight_and_check_remains_read_only(tmp_path,mo
         raise AssertionError('Update operation did not reach the expected state')
     try:
         panel.start();settle()
-        assert not calls and panel.execute.isVisible() and panel.button.isVisible()
+        assert not calls and panel.execute.isVisible() and not panel.button.isVisible()
         if closing:panel.owner=SimpleNamespace(_closing=True)
         panel.request_install();panel.request_install();panel.start()
         if closing:assert panel.operation is None
@@ -475,17 +475,24 @@ def test_newer_app_offer_does_not_retry_previous_proxy_stage(tmp_path,monkeypatc
     calls=[]
     monkeypatch.setattr(app_update,'update',lambda *a,**kw:calls.append(('app',kw['plan'])))
     monkeypatch.setattr(app_update,'retry_proxy',lambda *a,**kw:calls.append(('proxy',None)))
-    monkeypatch.setattr(panel,'launch_operation',lambda action:action())
     try:
         op=panel.journal.begin('app','2026.01.01.1')['operation_id']
         panel.journal.change(op,phase='partial',app=dict(state='verified',executable=sys.executable),proxy={'phase':'failed'})
         panel.refresh()
         plan=dict(kind='app',release={'tag_name':'v2099.01.01.1'},connections=0)
+        monkeypatch.setattr(app_update,'check_update',lambda *args:plan)
         panel.show_plan(plan);panel.refresh()
         assert panel.version.isVisible()
         panel.request_install()
-        assert calls==[('app',plan)]
-    finally:panel.stop();panel.deleteLater();app.processEvents()
+        from PySide6.QtTest import QTest
+        import time
+        deadline=time.monotonic()+2
+        while (panel.operation is not None or not calls) and time.monotonic()<deadline:QTest.qWait(5)
+        assert panel.operation is None and calls==[('app',plan)]
+    finally:
+        panel.stop()
+        if panel.operation:panel.operation.wait()
+        panel.deleteLater();app.processEvents()
 
 
 def test_offer_click_cannot_dispatch_a_different_operation(tmp_path,monkeypatch):

@@ -2,11 +2,12 @@
 from types import SimpleNamespace
 from copy import deepcopy
 from contextlib import closing
+from typing import cast
 import sys
 
 from . import quota_prepared_sync as progress
-from .prepared_ingest import _weight, pages
-from .prepared_store import CapacityExceeded, NotReady, StaleGeneration, ReadCancelled, Page
+from .prepared_ingest import _groups, _weight, pages
+from .prepared_store import CapacityExceeded, NotReady, StaleGeneration, ReadCancelled, Page, pack, unpack
 
 
 METADATA_BYTES = 64 * 1024 * 1024
@@ -18,6 +19,10 @@ class _SourceCacheAdmission(CapacityExceeded):
     """Optional retained templates cannot share the invocation's metadata cap."""
 
 
+class _SourcePopulationAdmission(CapacityExceeded):
+    pass
+
+
 class PreparedLedger:
     def __init__(self, ledger, store, *, cancel=None):
         self.ledger, self.store = ledger, store
@@ -26,12 +31,192 @@ class PreparedLedger:
         self.metrics = dict(owner_reads=0,call_rows=0,request_rows=0,applied_owners=0)
         # Call certificates do not certify tracking applicability. Request maps
         # are replayed once per process and again when tracking policy changes.
-        self.task_revisions={}
+        self._initialize_plan()
         self._source_cache={}
         self._cache_token=None
         self._cache_order=None
         self._source_token=None
         self._source_cache_bytes=sys.getsizeof(self._source_cache)
+
+    def _initialize_plan(self):
+        db = self.ledger.db
+        db.execute(f'PRAGMA temp.cache_size=-{self.ledger.CACHE_KIB}')
+        db.executescript('''
+            DROP TABLE IF EXISTS temp.prepared_ledger_sources;
+            DROP TABLE IF EXISTS temp.prepared_ledger_homes;
+            DROP TABLE IF EXISTS temp.prepared_ledger_coverage;
+            DROP TABLE IF EXISTS temp.prepared_ledger_retired;
+            DROP TABLE IF EXISTS temp.prepared_ledger_requests;
+            CREATE TEMP TABLE prepared_ledger_sources(
+                ordinal INTEGER PRIMARY KEY,home TEXT NOT NULL,sid TEXT NOT NULL,
+                source BLOB NOT NULL,weight INTEGER NOT NULL,certificate TEXT NOT NULL,
+                request_digest TEXT NOT NULL,pending INTEGER NOT NULL,
+                call_waiting INTEGER NOT NULL,task_waiting INTEGER NOT NULL,UNIQUE(home,sid));
+            CREATE INDEX temp.prepared_ledger_waiting
+                ON prepared_ledger_sources((call_waiting OR task_waiting),ordinal);
+            CREATE TEMP TABLE prepared_ledger_homes(
+                home TEXT PRIMARY KEY,policy BLOB NOT NULL,active INTEGER NOT NULL,scope INTEGER NOT NULL,
+                unclassified INTEGER NOT NULL DEFAULT 0,pending_count INTEGER NOT NULL DEFAULT 0);
+            CREATE INDEX temp.prepared_ledger_scope ON prepared_ledger_homes(scope,home);
+            CREATE TEMP TABLE prepared_ledger_coverage(
+                home TEXT NOT NULL,sid TEXT NOT NULL,start REAL,end REAL,reason TEXT NOT NULL,
+                PRIMARY KEY(home,sid,reason));
+            CREATE TEMP TABLE prepared_ledger_retired(home TEXT NOT NULL,sid TEXT NOT NULL,PRIMARY KEY(home,sid));
+            CREATE TEMP TABLE prepared_ledger_requests(
+                home TEXT NOT NULL,sid TEXT NOT NULL,request_digest TEXT NOT NULL,policy BLOB NOT NULL,
+                PRIMARY KEY(home,sid));
+        ''')
+
+    def _request_token(self, key):
+        row = self.ledger.db.execute('SELECT request_digest,policy FROM temp.prepared_ledger_requests '
+                                     'WHERE home=? AND sid=?', key).fetchone()
+        return (row[0], unpack(row[1], maximum=METADATA_BYTES)) if row else None
+
+    def _clear_plan(self):
+        db = self.ledger.db
+        for table in ('sources', 'homes', 'coverage', 'retired'):
+            while True:
+                if self.cancel is not None and self.cancel():
+                    raise ReadCancelled('prepared ledger synchronization cancelled')
+                rows = db.execute(f'SELECT rowid FROM temp.prepared_ledger_{table} LIMIT ?', (OWNER_BATCH,)).fetchall()
+                if not rows:
+                    break
+                db.executemany(f'DELETE FROM temp.prepared_ledger_{table} WHERE rowid=?',
+                               ((row[0],) for row in rows))
+                db.commit()
+
+    def _stage_plan(self, envelope, removed, owners=None):
+        db = self.ledger.db
+        if db.in_transaction:
+            raise RuntimeError('prepare the source plan before starting quota application')
+        self._clear_plan()
+        ordinal = 0
+        token = None
+
+        def home_policy(home, scope=0):
+            row = db.execute('SELECT policy,active,scope FROM temp.prepared_ledger_homes WHERE home=?', (home,)).fetchone()
+            if row is None:
+                active, policy = self._task_policy(home)
+                encoded = pack(policy, maximum=METADATA_BYTES)
+                db.execute('INSERT INTO temp.prepared_ledger_homes(home,policy,active,scope) VALUES(?,?,?,?)',
+                           (home, encoded, int(active), scope))
+                return encoded, active
+            if scope and not row[2]:
+                db.execute('UPDATE temp.prepared_ledger_homes SET scope=1 WHERE home=?', (home,))
+            return row[0], row[1]
+
+        for home in envelope.get('homes', ()):
+            home_policy(home, 1)
+        db.commit()
+
+        def stage_source(key, source, certificate):
+            nonlocal ordinal
+            self._check_plan(token)
+            policy, active = home_policy(key[0])
+            pending = bool(source.get('_collection_pending'))
+            committed = progress.applied(db, (key,)).get(key)
+            request_digest = source['_request_source_digest']
+            previous = db.execute('SELECT request_digest,policy FROM temp.prepared_ledger_requests '
+                                  'WHERE home=? AND sid=?', key).fetchone()
+            calls = not pending and committed != certificate
+            tasks = not pending and active and (previous is None or tuple(previous) != (request_digest, policy))
+            packet = pack(source, maximum=METADATA_BYTES)
+            weight = _weight(source, METADATA_BYTES)+len(packet)
+            if weight > METADATA_BYTES:
+                raise CapacityExceeded('prepared ledger source exceeds its metadata budget')
+            db.execute('INSERT INTO temp.prepared_ledger_sources VALUES(?,?,?,?,?,?,?,?,?,?)',
+                       (ordinal, *key, packet, weight, certificate, request_digest, int(pending), int(calls), int(tasks)))
+            self.ledger.stage_prepared_coverage(source)
+            ordinal += 1
+            if ordinal % OWNER_BATCH == 0:
+                db.commit()
+
+        def stage_owners(view, keys):
+            for group in _groups(keys,OWNER_BATCH):
+                group=[key for key in group if db.execute(
+                    'SELECT 1 FROM temp.prepared_ledger_sources WHERE home=? AND sid=?',key).fetchone() is None]
+                if not group:continue
+                headers = list(view.pages(view.owner_revisions,group))
+                if len(headers) != len(group):
+                    raise NotReady('selected ledger plan references an absent owner')
+                with closing(self._source_entries(view,headers,self._source_cache)) as entries:
+                    for header,entry in entries:
+                        key = header['owner']
+                        previous = self._source_cache.get(key)
+                        if previous is not None and previous[0]==header['revision']:
+                            source = previous[1]
+                        else:
+                            _,source,_,_ = self._source_slot(key,header['revision'],entry)
+                            self.metrics['metadata_reads'] = self.metrics.get('metadata_reads',0)+1
+                        stage_source(key,source,source['usage_revision'])
+
+        cached = None
+        try:
+            if owners is None:
+                cached = self._sources()
+        except _SourcePopulationAdmission:
+            pass
+        if owners is not None:
+            with self.store.read_current(cancel=self.cancel,seconds=60) as view:
+                self._require_view(view)
+                token = view.token
+                stage_owners(view,owners)
+        elif cached is not None:
+            sources, certificates = cached
+            del cached
+            token = self._source_token
+            for key, source in sources.items():
+                stage_source(key, source, certificates[key])
+            del sources, certificates
+        else:
+            with self.store.read_current(cancel=self.cancel, seconds=60) as view:
+                self._require_view(view)
+                token = view.token
+                for header in view.pages(view.owner_revisions):
+                    key = header['owner']
+                    entry = view.ledger_source(*key)
+                    if entry is None:
+                        raise NotReady('prepared ledger inventory references an absent owner')
+                    _, source, _, _ = self._source_slot(key, header['revision'], entry)
+                    self.metrics['metadata_reads'] = self.metrics.get('metadata_reads', 0)+1
+                    stage_source(key, source, source['usage_revision'])
+                    del source, entry
+        with self.store.read_current(cancel=self.cancel,seconds=60) as view:
+            self._require_view(view,token)
+            for group in _groups(view.pages(view.ledger_pending),OWNER_BATCH):
+                live=[]
+                for entry in group:
+                    if entry['deleted']:
+                        db.execute('INSERT OR IGNORE INTO temp.prepared_ledger_retired VALUES(?,?)',entry['owner'])
+                    else:
+                        live.append(entry['owner'])
+                stage_owners(view,live)
+                db.commit()
+        self._check_plan(token)
+        if owners is None:
+            self._source_token = token
+        for number, owner in enumerate(removed, 1):
+            db.execute('INSERT OR IGNORE INTO temp.prepared_ledger_retired VALUES(?,?)', owner)
+            if number % OWNER_BATCH == 0:
+                self._check_plan(token)
+                db.commit()
+        db.commit()
+        if owners is not None:
+            return token
+        after = None
+        while True:
+            self._check_plan(token)
+            where = '' if after is None else 'WHERE (home,sid)>(?,?) '
+            rows = db.execute('SELECT home,sid FROM temp.prepared_ledger_requests '+where+
+                'ORDER BY home,sid LIMIT ?', (*(() if after is None else after), OWNER_BATCH)).fetchall()
+            if not rows:
+                break
+            for row in rows:
+                if db.execute('SELECT 1 FROM temp.prepared_ledger_sources WHERE home=? AND sid=?', tuple(row)).fetchone() is None:
+                    db.execute('DELETE FROM temp.prepared_ledger_requests WHERE home=? AND sid=?', tuple(row))
+            db.commit()
+            after = tuple(rows[-1])
+        return token
 
     @staticmethod
     def _require_view(view, expected=None):
@@ -112,7 +297,7 @@ class PreparedLedger:
                                 page.encoded_bytes,page.object_bytes),METADATA_BYTES))
                 raw_peak=max(raw_peak,page_bytes)
                 if retained+sys.getsizeof(sources)+sys.getsizeof(certificates)+raw_peak>METADATA_BYTES:
-                    raise CapacityExceeded('prepared ledger source page exceeds its metadata budget')
+                    raise _SourcePopulationAdmission('prepared ledger source page exceeds its metadata budget')
                 for header in page.rows:
                     view.check()
                     key=header['owner']
@@ -132,7 +317,7 @@ class PreparedLedger:
                     raw_peak=max(raw_peak,page_bytes+decoded+sys.getsizeof(slot)+2*sys.getsizeof(slot[2]))
                     del entry,slot
                     if retained+sys.getsizeof(sources)+sys.getsizeof(certificates)+raw_peak>METADATA_BYTES:
-                        raise CapacityExceeded('prepared ledger sources exceed their metadata budget')
+                        raise _SourcePopulationAdmission('prepared ledger sources exceed their metadata budget')
                 after,complete=page.after,page.complete
                 if page.rows:del header
                 del page
@@ -242,7 +427,7 @@ class PreparedLedger:
         with self.store.read_current(cancel=self.cancel,seconds=60) as view:
             self._require_view(view,expected)
             if calls:
-                for row in view.iter_calls(key):
+                for row in view.pages(view.calls,key):
                     size+=_weight(row,remaining-size)+16
                     if size>remaining:raise CapacityExceeded('prepared ledger owner exceeds its fact budget')
                     rows.append(row)
@@ -273,7 +458,7 @@ class PreparedLedger:
             if (not isinstance(transition,dict) or transition.get('format')!=progress.APPEND_FORMAT
                     or transition.get('prior_source')!=committed
                     or transition.get('source')!=source['usage_revision']
-                    or self.task_revisions.get(key)!=(transition.get('prior_request_digest',transition.get('prior_body_digest')),policy)):
+                    or self._request_token(key)!=(transition.get('prior_request_digest',transition.get('prior_body_digest')),policy)):
                 return None
             owner=view.owner(*key)
             if owner is None or progress.source_stamp(owner['dependencies'])!=source['usage_revision']:
@@ -283,107 +468,157 @@ class PreparedLedger:
             if (type(count) is not int or not 0<count<=128 or type(prior) is not int or prior<1
                     or len(selected)>128 or owner['dependencies'].get('call_count')!=prior+count):
                 return None
-            rows=[];boundaries={};size=0;after=None
-            while True:
-                page=view.calls(key,ordinal_start=prior+1,after=after)
-                for row in page.rows:
-                    if len(rows)>=count or row['session_ordinal']!=prior+len(rows)+1:return None
-                    size+=_weight(row,remaining-size)+16
-                    if size>remaining:raise CapacityExceeded('prepared ledger tail exceeds its fact budget')
-                    rows.append(row)
-                if page.complete:break
-                after=page.after
+            rows=[];boundaries={};size=0
+            for row in view.pages(view.calls,key,ordinal_start=prior+1):
+                if len(rows)>=count or row['session_ordinal']!=prior+len(rows)+1:return None
+                size+=_weight(row,remaining-size)+16
+                if size>remaining:raise CapacityExceeded('prepared ledger tail exceeds its fact budget')
+                rows.append(row)
             if len(rows)!=count:return None
             if selected:
-                after=None
-                while True:
-                    page=view.requests(key,selected,after=after)
-                    for item in page.rows:
-                        size+=_weight((item['key'],item['metadata']),remaining-size)+96
-                        if size>remaining:raise CapacityExceeded('prepared ledger tail requests exceed their fact budget')
-                        boundaries[item['key']]=item['metadata']
-                    if page.complete:break
-                    after=page.after
+                for item in view.pages(view.requests,key,selected):
+                    size+=_weight((item['key'],item['metadata']),remaining-size)+96
+                    if size>remaining:raise CapacityExceeded('prepared ledger tail requests exceed their fact budget')
+                    boundaries[item['key']]=item['metadata']
         self.metrics['owner_reads']+=1;self.metrics['call_rows']+=len(rows);self.metrics['request_rows']+=len(boundaries)
         return dict(history=rows,turn_records=boundaries),size,dict(transition,policy=policy)
 
-    def sync(self, envelope, *, removed=()):
-        """Yield after bounded commits; caller may ACK only after completion.
-
-        Source certificates and calls commit together. A crash before a later
-        owner batch leaves those owners uncommitted and safely replayable.
-        """
-        sources,certificates=self._sources()
-        token=self._source_token
-        self.task_revisions={key:token for key,token in self.task_revisions.items() if key in sources}
-        committed=progress.applied(self.ledger.db,sources)
-        call_waiting={key for key in sources if committed.get(key)!=certificates[key]}
-        policies={home:self._task_policy(home) for home in {key[0] for key in sources}}
-        task_tokens={key:(source['_request_source_digest'],policies[key[0]][1]) for key,source in sources.items()}
-        task_waiting={key for key in sources if policies[key[0]][0] and self.task_revisions.get(key)!=task_tokens[key]}
-        waiting=[key for key in sources if key in call_waiting or key in task_waiting]
-        # A light uncommitted owner must not populate sync_activity's revision
-        # cache with empty request maps before its actual request records arrive.
-        for key,source in sources.items():
-            if key not in task_waiting:
-                source['request_revision']=task_tokens[key]
-            else:
-                source.pop('request_revision',None)
-        retired=tuple(removed)
-        index=0;allow_append=True
-        while index<len(waiting):
-            batch_start=index;states={};requests={};append_sources={};size=0
-            while index<len(waiting) and len(requests)<OWNER_BATCH:
-                key=waiting[index]
-                try:
-                    appended=(self._append(key,sources[key],committed.get(key),policies[key[0]][1],FACT_BYTES-size,
-                                          expected=token)
-                              if allow_append and key in call_waiting else None)
-                    if appended is None:
-                        prepared,weight=self._owner(key,FACT_BYTES-size,calls=key in call_waiting,
-                                                    requests=key in call_waiting or key in task_waiting,expected=token)
-                    else:
-                        prepared,weight,append_sources[key]=appended
-                except CapacityExceeded:
-                    if requests:break
-                    raise
-                size+=weight;index+=1
-                if key in call_waiting:states[key]=dict(prepared=prepared,revision=certificates[key])
-                requests[key]=prepared['turn_records']
-            selected={key:certificates[key] for key in states}
-            sessions=[dict(source,turn_records=requests[key],request_revision=task_tokens[key])
-                      if key in requests else source for key,source in sources.items()]
-            snapshot=dict(envelope,sessions=sessions)
+    def sync(self, envelope, *, removed=(), owners=None):
+        """Yield durable batches with a boolean signal for remaining work."""
+        db = self.ledger.db
+        if owners is not None:
+            if removed:
+                raise ValueError('a selected ledger plan cannot retire owners')
+            envelope = dict(envelope,collection_partial=True)
+        token = self._stage_plan(envelope, removed, owners)
+        while True:
             self._check_plan(token)
+            rows = db.execute('SELECT home,sid FROM temp.prepared_ledger_retired '
+                              'ORDER BY home,sid LIMIT ?', (OWNER_BATCH,)).fetchall()
+            if not rows:
+                break
+            with db:
+                db.execute('BEGIN IMMEDIATE')
+                self._check_plan(token)
+                retired = tuple(tuple(row) for row in rows
+                    if not self.ledger._recovered_home(row[0], envelope))
+                progress.retire(db, retired)
+                db.executemany('DELETE FROM temp.prepared_ledger_requests WHERE home=? AND sid=?',retired)
+                db.executemany('DELETE FROM temp.prepared_ledger_retired WHERE home=? AND sid=?',
+                               (tuple(row) for row in rows))
+                self._check_plan(token)
             if retired:
-                progress.retire(self.ledger.db,retired)
-            try:
-                self.ledger.sync(SimpleNamespace(sessions=states,internal_sessions={}),snapshot,
-                                 applied_sources=selected,append_sources=append_sources)
-            except progress.AppendPredecessorChanged:
-                # The quota guard runs before activity/call mutations. Retry
-                # this invocation through its original full-owner path once.
-                self.ledger.db.rollback()
-                index=batch_start;allow_append=False
-                self.metrics['append_fallbacks']=self.metrics.get('append_fallbacks',0)+len(append_sources)
-                continue
-            committed_retired=retired;retired=()
-            self.metrics['append_owners']=self.metrics.get('append_owners',0)+len(append_sources)
-            saved=progress.applied(self.ledger.db,selected)
-            if any(saved.get(key)!=stamp for key,stamp in selected.items()):
-                raise ValueError('unconfirmed or older recovery owners were not applied to the ledger')
-            for key in requests:
-                sources[key]['request_revision']=task_tokens[key]
-                if not envelope.get('collection_recovery') and not sources[key].get('_collection_pending'):
-                    self.task_revisions[key]=task_tokens[key]
-            self.metrics['applied_owners']+=len(states)
-            yield dict(owners=tuple(states),task_owners=tuple(key for key in requests if key in task_waiting),
-                       remaining=len(waiting)-index,retired=committed_retired)
-        if not waiting:
-            # Freshness, coverage and activity still commit on a heartbeat.
-            # There are no historical call reads in this path.
-            snapshot=dict(envelope,sessions=list(sources.values()))
+                if progress.applied(db,retired):
+                    raise ValueError('prepared ledger retirement was not confirmed')
+                self.store.acknowledge_ledger(retired,expected=token)
+                yield dict(owners=(), remaining=True, retired=retired)
+
+        after = -1
+        allow_append = True
+        activity_done = False
+        while True:
             self._check_plan(token)
-            if retired:progress.retire(self.ledger.db,retired)
-            self.ledger.sync(SimpleNamespace(sessions={},internal_sessions={}),snapshot,applied_sources={})
-            yield dict(owners=(),remaining=0,retired=retired)
+            headers = db.execute('SELECT ordinal,home,sid,weight,certificate,request_digest,call_waiting,task_waiting '
+                'FROM temp.prepared_ledger_sources WHERE (call_waiting OR task_waiting)=1 AND ordinal>? '
+                'ORDER BY ordinal LIMIT ?', (after, OWNER_BATCH)).fetchall()
+            if not headers:
+                break
+            states = {}
+            requests = {}
+            append_sources = {}
+            selected = {}
+            sessions = []
+            task_tokens = {}
+            task_policies = {}
+            size = 0
+            metadata_size = 0
+            end = after
+            committed = progress.applied(db, ((row['home'], row['sid']) for row in headers))
+            for header in headers:
+                if requests and metadata_size+header['weight'] > METADATA_BYTES:
+                    break
+                key = (header['home'], header['sid'])
+                packet = db.execute('SELECT source FROM temp.prepared_ledger_sources WHERE ordinal=?',
+                                    (header['ordinal'],)).fetchone()[0]
+                source = cast(dict, unpack(packet, maximum=METADATA_BYTES))
+                del packet
+                home = db.execute('SELECT policy,scope FROM temp.prepared_ledger_homes WHERE home=?', (key[0],)).fetchone()
+                policy = unpack(home['policy'], maximum=METADATA_BYTES)
+                try:
+                    appended = (self._append(key, source, committed.get(key), policy, FACT_BYTES-size, expected=token)
+                                if allow_append and header['call_waiting'] else None)
+                    if appended is None:
+                        prepared, weight = self._owner(key, FACT_BYTES-size, calls=bool(header['call_waiting']),
+                                                       expected=token)
+                    else:
+                        prepared, weight, append_sources[key] = appended
+                    del appended
+                except CapacityExceeded:
+                    if requests:
+                        del source
+                        break
+                    raise
+                size += weight
+                metadata_size += header['weight']
+                end = header['ordinal']
+                if header['call_waiting']:
+                    states[key] = dict(prepared=prepared, revision=header['certificate'])
+                    selected[key] = header['certificate']
+                requests[key] = prepared['turn_records']
+                task_tokens[key] = (header['request_digest'], policy)
+                task_policies[key] = home['policy']
+                sessions.append(dict(source, turn_records=prepared['turn_records'], request_revision=task_tokens[key]))
+                del source, prepared
+            snapshot = dict(envelope, sessions=sessions, collection_partial=True)
+            if activity_done:
+                snapshot['homes'] = [home for home in dict.fromkeys(key[0] for key in requests)
+                    if db.execute('SELECT scope FROM temp.prepared_ledger_homes WHERE home=?', (home,)).fetchone()[0]]
+                snapshot['request_activity'] = []
+                snapshot.pop('activity_cursor', None)
+            self._check_plan(token)
+            try:
+                self.ledger.sync(SimpleNamespace(sessions=states, internal_sessions={}), snapshot,
+                                 applied_sources=selected, append_sources=append_sources, prepared_plan=True)
+            except progress.AppendPredecessorChanged:
+                db.rollback()
+                allow_append = False
+                self.metrics['append_fallbacks'] = self.metrics.get('append_fallbacks', 0)+len(append_sources)
+                continue
+            saved = progress.applied(db, selected)
+            if any(saved.get(key) != stamp for key, stamp in selected.items()):
+                raise ValueError('unconfirmed or older recovery owners were not applied to the ledger')
+            if not envelope.get('collection_recovery'):
+                db.executemany('INSERT INTO temp.prepared_ledger_requests VALUES(?,?,?,?) '
+                    'ON CONFLICT(home,sid) DO UPDATE SET request_digest=excluded.request_digest,policy=excluded.policy',
+                    ((*key, task_tokens[key][0], task_policies[key]) for key in requests))
+                db.commit()
+            activity_done = True
+            after = end
+            self.metrics['applied_owners'] += len(states)
+            self.metrics['append_owners'] = self.metrics.get('append_owners', 0)+len(append_sources)
+            yield dict(owners=tuple(states), task_owners=tuple(
+                (row['home'], row['sid']) for row in headers
+                if row['ordinal']<=end and row['task_waiting']), remaining=True, retired=())
+            del states, requests, sessions, append_sources, selected, snapshot
+        if not activity_done:
+            self._check_plan(token)
+            self.ledger.sync(SimpleNamespace(sessions={}, internal_sessions={}),
+                             dict(envelope, sessions=[], collection_partial=True), applied_sources={}, prepared_plan=True)
+            yield dict(owners=(), remaining=True, retired=())
+        for _ in self.ledger.reconcile_prepared_coverage(envelope, check=lambda: self._check_plan(token),
+                                                       metadata_bytes=METADATA_BYTES):
+            yield dict(owners=(), remaining=True, retired=())
+        after=-1
+        while True:
+            self._check_plan(token)
+            rows=db.execute('SELECT ordinal,home,sid,certificate FROM temp.prepared_ledger_sources '
+                            'WHERE pending=0 AND ordinal>? ORDER BY ordinal LIMIT ?',
+                            (after,OWNER_BATCH)).fetchall()
+            if not rows:break
+            wanted={(row['home'],row['sid']):row['certificate'] for row in rows}
+            saved=progress.applied(db,wanted)
+            confirmed=tuple(key for key,certificate in wanted.items() if saved.get(key)==certificate)
+            if confirmed:self.store.acknowledge_ledger(confirmed,expected=token)
+            after=rows[-1]['ordinal']
+        self._clear_plan()
+        yield dict(owners=(), remaining=False, retired=())

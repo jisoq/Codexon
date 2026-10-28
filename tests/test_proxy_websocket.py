@@ -138,6 +138,66 @@ def test_completed_and_unmatched_lanes_leave_no_empty_queues():
     assert not activity.pending and not tracker.pending and not activity.busy
 
 
+@pytest.mark.parametrize('observation_enabled', [False, True])
+def test_relay_lifetime_replay_preserves_new_request_and_original_late_update(observation_enabled):
+    from types import SimpleNamespace
+    from cachemonitor.model_proxy import Tracker
+    from cachemonitor.proxy_websocket import Activity
+    rows=[];store=SimpleNamespace(write=lambda home,**row:rows.append(row))
+    health=dict(requests=0,responses=0,observation_enabled=observation_enabled)
+    tracker=Tracker(store,'home','WebSocket',health);activity=Activity(clock=lambda:0.)
+    activity.connected()
+    request=dict(type='response.create',stream_id='lane',model='original')
+    for index in range(2049):
+        activity.begin(request,True);activity.delivered(request,True);tracker.request(request)
+        terminal=dict(type='response.completed',stream_id='lane',response=dict(id=f'r{index}',model='reported'))
+        activity.begin(terminal,False);tracker.response(terminal);activity.delivered(terminal,False)
+    queued=dict(request,model='queued-after-completions')
+    activity.begin(queued,True);activity.delivered(queued,True);tracker.request(queued)
+    replay=dict(type='response.completed',stream_id='lane',
+                response=dict(id='r0',model='reported',reasoning=dict(effort='low')))
+    activity.begin(replay,False);tracker.response(replay)
+    assert activity.busy
+    activity.delivered(replay,False)
+    assert activity.busy and activity.state=='responding'
+    assert len(tracker.pending['lane'])==1
+    if observation_enabled:
+        assert rows[-1]['response_id']=='r0'
+        assert rows[-1]['requested_model']=='original' and rows[-1]['response_effort']=='low'
+    fresh=dict(type='response.completed',stream_id='lane',response=dict(id='fresh',model='reported'))
+    activity.begin(fresh,False);tracker.response(fresh);activity.delivered(fresh,False)
+    assert not activity.busy and not tracker.pending
+    assert tracker.completed['fresh']['requested_model']=='queued-after-completions'
+    assert health['requests']==2050 and health['responses']==2050
+
+
+@pytest.mark.parametrize('observation_enabled', [False, True])
+def test_observed_terminal_keeps_activity_busy_until_downstream_delivery(observation_enabled):
+    from types import SimpleNamespace
+    from cachemonitor.model_proxy import Tracker
+    from cachemonitor.proxy_websocket import Activity
+    tracker=Tracker(SimpleNamespace(write=lambda *args,**kwargs:None),'home','WebSocket',
+                    dict(requests=0,responses=0,observation_enabled=observation_enabled))
+    activity=Activity();activity.connected()
+    request=dict(type='response.create',stream_id='lane',model='m')
+    activity.begin(request,True);tracker.request(request);activity.delivered(request,True)
+    terminal=dict(type='response.completed',stream_id='lane',response=dict(id='observed',model='m'))
+    activity.begin(terminal,False);tracker.response(terminal)
+    assert activity.busy and activity.state=='responding' and activity.idle_since is None
+    assert len(activity.pending['lane'])==1
+    activity.delivered(terminal,False)
+    assert not activity.busy and activity.state=='idle'
+
+
+def test_tracker_finish_releases_relay_replay_history():
+    from cachemonitor.model_proxy import Tracker
+    tracker=Tracker(None,'home','WebSocket',dict(requests=0,responses=0,observation_enabled=False))
+    tracker.request(dict(model='m'))
+    tracker.response(dict(type='response.completed',response=dict(id='finished',model='m')))
+    tracker.finish()
+    assert not tracker.completed
+
+
 def test_idle_limit_pressure_and_all_busy_capacity():
     from dataclasses import replace
     from cachemonitor.proxy_websocket import Activity,WebSocketBudget,POLICY,LocalCapacity

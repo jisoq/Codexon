@@ -628,20 +628,24 @@ class SessionRegistry:
             self.sessions[key] = Session(tid, str(home), title_request=key in self.title_requests)
         return self.sessions[key]
 
-    def read_logs(self, home, now):
+    def read_logs(self, home, now, *, owners=None):
+        if owners is not None and not any(key[0]==str(home) for key in owners):return
         with readonly(home / "logs_2.sqlite") as conn:
             high = conn.execute("SELECT max(id) FROM logs").fetchone()[0] or 0
-            cursor = self.cursors.get(str(home))
+            selected=sorted(sid for owner_home,sid in owners if owner_home==str(home)) if owners is not None else None
+            cursor_key=str(home) if selected is None else (str(home),tuple(selected))
+            cursor = self.cursors.get(cursor_key)
             if cursor is None or high < cursor:
                 # Indexed timestamp lookup, then incremental primary-key reads.
                 cursor = conn.execute("SELECT min(id) FROM logs WHERE ts>=?", (now - SESSION_WINDOW,)).fetchone()[0]
                 cursor = cursor - 1 if cursor else high
             placeholders = ",".join("?" for _ in TARGETS)
+            condition=(' AND thread_id IN ('+','.join('?' for _ in selected)+')') if selected is not None else ''
             rows = conn.execute(
                 f"SELECT id,ts,ts_nanos,target,thread_id,process_uuid,feedback_log_body FROM logs "
                 f"WHERE id>? AND id<=? AND ((target IN ({placeholders}) AND ts>=?) "
-                "OR (target=? AND instr(feedback_log_body,?)>0)) ORDER BY id",
-                (cursor, high, *TARGETS, now - WINDOW, TITLE_HANDLER, TITLE_PROMPT))
+                "OR (target=? AND instr(feedback_log_body,?)>0))"+condition+" ORDER BY id",
+                (cursor, high, *TARGETS, now - WINDOW, TITLE_HANDLER, TITLE_PROMPT,*(selected or ())))
             for row in rows:
                 if is_title_request(row):
                     key = (str(home), row["thread_id"])
@@ -665,4 +669,4 @@ class SessionRegistry:
                     s.activity = max(s.activity, transport.ts)
                 else:
                     self.add_unassigned({"home": str(home), **vars(transport)})
-            self.cursors[str(home)] = high
+            self.cursors[cursor_key] = high

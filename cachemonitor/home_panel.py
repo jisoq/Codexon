@@ -35,7 +35,7 @@ class HomePanel(Group):
         body=Column(self);body.setSpacing(22)
         self.readiness_title=text('기록 준비 중',16,bold=True)
         self.readiness_note=text('Codex 사용 기록을 읽고 있습니다.',13,'muted')
-        readiness=Group();ready=Column(readiness);ready.setSpacing(5)
+        self.readiness_panel=readiness=Group();ready=Column(readiness);ready.setSpacing(5)
         ready.addWidget(self.readiness_title);ready.addWidget(self.readiness_note);body.addWidget(readiness)
         summary_panel=Group();summary_panel.setObjectName('panel');summary_layout=Column(summary_panel);summary_layout.setSpacing(0)
         summaries=Row();summaries.put(collapseBelow=760,columns=2,spacing=0,dividers=True);summary_layout.addLayout(summaries)
@@ -84,7 +84,7 @@ class HomePanel(Group):
         self.coverage.setText(formatted('환산 가능 {known} / {total}호출',known=f"{summary['known']:,}",total=f"{summary['total']:,}")
                               if summary['partial'] else '이 기기에서 수집한 기록')
 
-    def apply_status(self,evidence,quota_payload,now):
+    def apply_status(self,evidence,quota_payload,now,preparing=False):
         faults=dict(evidence.get('collection_fault') or {})
         if faults.get('snapshot_at') is None:
             faults['snapshot_at']=evidence.get('collection_snapshot_at',evidence.get('ts'))
@@ -107,6 +107,7 @@ class HomePanel(Group):
         else:
             self.readiness='empty';title='첫 사용 기록을 기다리고 있습니다';note='Codex에서 작업을 시작하면 사용 기록이 자동으로 표시됩니다.'
         self.readiness_title.setText(title);self.readiness_note.setText(note)
+        self.readiness_panel.setVisible(not preparing)
         quota=(quota_payload or {}).get('quota') or {};self.plan.setText((quota.get('plan_type') or '').title())
         zone=QTimeZone.systemTimeZone()
         for mode,card in self.quota_cards.items():

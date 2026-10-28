@@ -4,6 +4,7 @@ import json
 import pickle
 
 from cachemonitor.analysis_records import compact_record, public_record, public_records
+from cachemonitor.pricing import price_profile
 from cachemonitor.analysis_engine import AnalysisEngine
 from cachemonitor.analysis_delivery import SnapshotPublisher
 from cachemonitor.overlay_data import OverlaySummaries
@@ -19,12 +20,12 @@ def test_display_aliases_round_trip_without_changing_prices_or_types():
     original=copy.deepcopy(row)
     compact=compact_record(row)
     assert type(compact) is dict and len(compact)==len(row)-8
-    assert public_record(compact)==original and row==original
+    assert public_record(compact)==dict(original,price_profile=price_profile(original['price_model'])) and row==original
     exceptional={**row,'price_model':'different-price-model','price_tier':'Fast',
                  'price_assumed':True,'long_context':0,'cache_degradation':None}
     restored=public_record(compact_record(exceptional))
-    assert restored==exceptional and type(restored['long_context']) is int
-    assert restored['price_profile']=='saved price profile'
+    assert restored==dict(exceptional,price_profile=price_profile(exceptional['price_model'])) and type(restored['long_context']) is int
+    assert exceptional['price_profile']=='saved price profile'
     assert public_record({'key':'unprepared'})=={'key':'unprepared'}
 
 
@@ -70,3 +71,26 @@ def test_public_expansion_keeps_shared_rows_and_does_not_mutate_worker_values():
     assert 'call_id' not in source
     assert type(expanded['rows'][0]) is dict
     assert expanded['rows'][0]['call_id']=='call'
+
+
+def test_public_profile_refresh_preserves_saved_cost_and_resolved_model(monkeypatch):
+    import cachemonitor.pricing as pricing
+
+    monkeypatch.setitem(pricing.ALIASES,'original-model','price-model')
+    monkeypatch.setitem(pricing.ALIASES,'price-model','profile-model')
+    monkeypatch.setitem(pricing.RATES,'price-model',pricing.Rate(1,.1,3))
+    monkeypatch.setitem(pricing.RATE_VERIFIED,'profile-model','old-date')
+    call=dict(key='call',model='original-model',service_tier='Standard',
+        input=100,cached=50,written=0,output=20,session_ordinal=1)
+    call.update(pricing.token_cost(call))
+    saved=compact_record(call);original=copy.deepcopy(saved)
+    assert call['price_model']=='price-model' and call['price_profile'].startswith('old-date ')
+    monkeypatch.setitem(pricing.RATE_VERIFIED,'profile-model','current-date')
+    monkeypatch.setattr(pricing,'MULTIPLIER_VERIFIED','current-multiplier')
+    monkeypatch.setitem(pricing.RATES,'price-model',pricing.Rate(99,.1,3))
+    def forbidden(*args,**kwargs):raise AssertionError('public display recalculated cost')
+    monkeypatch.setattr(pricing,'token_cost',forbidden)
+    current=public_record(saved)
+    assert current==dict(call,price_profile='current-date 단가 / current-multiplier 구독 배율',
+        call_id='call',request_id='',analysis_model='original-model',cache_degradation=False)
+    assert saved==original

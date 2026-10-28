@@ -236,19 +236,25 @@ def test_scheduler_process_is_tracked_by_its_fresh_scope(tmp_path, mode, expecte
 
 
 
-def test_pytest_first_progress_write_failure_exits_without_secondary_read_error(tmp_path):
+def test_pytest_progress_stdout_failure_remains_a_diagnostic_failure(tmp_path):
     from tools.check_diagnostics import CheckOutput
-    evidence = tmp_path/'evidence'; evidence.mkdir()
-    (evidence/'active-test.tmp').mkdir()
-    probe = tmp_path/'test_probe.py'; probe.write_text('def test_probe(): pass\n')
-    result = subprocess.run([sys.executable, '-B', '-m', 'pytest', '-q', '-p', 'tools.check_progress',
-        '-o', 'addopts=', '--rootdir', str(tmp_path), '--confcutdir', str(tmp_path), str(probe)],
-        cwd=ROOT, env={**os.environ, 'CODEXON_CHECK_DIAGNOSTICS':str(evidence)},
-        capture_output=True, text=True, timeout=20)
+    probe = tmp_path/'test_probe.py'
+    probe.write_text('def test_probe(): pass\n')
+    source = tmp_path/'closed_progress.py'
+    source.write_text('import os, pytest\nfrom tools import check_diagnostics as diagnostics\n'
+        'os.close(diagnostics._stdout)\ndiagnostics._stdout = None\n'
+        f'raise SystemExit(pytest.main(["-q", "-p", "tools.check_progress", "-o", "addopts=", '
+        f'"--rootdir", {str(tmp_path)!r}, "--confcutdir", {str(tmp_path)!r}, {str(probe)!r}]))\n')
+    evidence = tmp_path/'evidence'
+    result = subprocess.run([sys.executable, str(ROOT/'tools/run_ui_checks.py'), '--no-desktop',
+        '--diagnostics', str(evidence), '--', sys.executable, str(source)],
+        cwd=ROOT, capture_output=True, text=True, timeout=20)
     observed = CheckOutput(); observed.feed(result.stdout, final=True)
     assert result.returncode == 86, result.stdout + result.stderr
-    assert observed.first_error['path'] == str(evidence/'active-test.tmp')
+    assert observed.first_error['operation'] == 'emit active test'
     assert 'FileNotFoundError' not in result.stdout + result.stderr
+    report = json.loads((evidence/'result.json').read_text())
+    assert report['product_exit_code'] is None and report['remaining_pids'] == []
 
 
 @pytest.mark.parametrize('mode,expected_exit,product_exit', [('product', 7, 7), ('diagnostic', 86, None)])
@@ -299,3 +305,226 @@ def test_worker_product_exception_traceback_survives_failed_final_evidence(tmp_p
     assert "raise OSError('product defect')" in result.stderr
     assert 'OSError: product defect' in result.stderr
     assert observed.first_error['path'].endswith('.json')
+
+
+def test_noop_progress_uses_complete_stdout_events_in_direct_and_parent_runners(tmp_path):
+    from tools.check_diagnostics import CheckOutput
+    from tools.verify_changes import run_logged
+    probe = tmp_path/'test_noop.py'
+    probe.write_text('import pytest\n@pytest.mark.parametrize("number", range(256))\ndef test_noop(number): pass\n')
+    for parent in (False, True):
+        evidence = tmp_path/('parent' if parent else 'direct')
+        command = [sys.executable, str(ROOT/'tools/run_ui_checks.py'), '--no-desktop',
+            '--diagnostics', str(evidence), '--', sys.executable, '-m', 'pytest', '-q',
+            '-p', 'tools.check_progress', '-o', 'addopts=', '--rootdir', str(tmp_path),
+            '--confcutdir', str(tmp_path), str(probe)]
+        if parent:
+            result = run_logged(command, tmp_path/'parent.log')
+            assert result.product_exit_code == 0 and result.diagnostics['first_error'] is None
+            output = result.stdout
+        else:
+            result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, timeout=30,
+                                    env=dict(os.environ, CODEXON_CHECK_EVENT_LOG=str(tmp_path/'inherited-events.log')))
+            assert not (tmp_path/'inherited-events.log').exists()
+            output = result.stdout
+        assert result.returncode == 0, output
+        observed = CheckOutput(); observed.feed(output, final=True)
+        progress = [line.split('[codexon-check] ', 1)[1] for line in output.splitlines()
+                    if '[codexon-check] {"active_test":' in line]
+        assert progress and len(progress) == len(set(progress))
+        report = json.loads((evidence/'result.json').read_text())
+        assert report['active_test'] == observed.active_test
+        assert observed.active_test['phase'] == 'finished'
+        assert observed.active_test['test'].endswith('test_noop[255]')
+        assert not (evidence/'active-test.json').exists()
+        assert not (evidence/'active-test.tmp').exists()
+        assert report['remaining_pids'] == []
+
+
+@pytest.mark.parametrize('cleanup_error', [False, True])
+def test_direct_runner_deadline_survives_unread_stdout_pipe(tmp_path, cleanup_error):
+    probe = tmp_path/'blocked_output.py'
+    marker = tmp_path/'worker.pid'
+    probe.write_text(
+        'import os, sys\nfrom pathlib import Path\n'
+        'from tools.check_diagnostics import emit\n'
+        'Path(sys.argv[1]).write_text(str(os.getpid()))\n'
+        "emit(dict(active_test=dict(test='blocked-output', phase='call', pid=os.getpid())))\n"
+        "os.write(1, b'x'*(4*1024*1024))\n"
+        "raise RuntimeError('unread stdout accepted the entire probe')\n")
+    diagnostics = tmp_path/'evidence'
+    command = [sys.executable, str(ROOT/'tools/run_ui_checks.py'),
+        '--no-desktop', '--timeout', '3', '--diagnostics', str(diagnostics), '--',
+        sys.executable, str(probe), str(marker)]
+    if cleanup_error:
+        command = [sys.executable, str(cleanup_denial_wrapper(tmp_path)), *command[1:]]
+    with (tmp_path/'stderr.log').open('wb') as errors:
+        process = subprocess.Popen(command, cwd=ROOT, stdout=subprocess.PIPE, stderr=errors)
+        try:
+            code = process.wait(timeout=12)
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=5)
+            output, _ = process.communicate(timeout=5)
+    assert code == 124, (code, (tmp_path/'stderr.log').read_text())
+    report = json.loads((diagnostics/'result.json').read_text(encoding='utf-8'))
+    assert report['reason'] == 'deadline' and report['remaining_pids'] == []
+    assert int(marker.read_text()) in report['live_pids']
+    assert report['active_test']['test'] == 'blocked-output'
+    assert b'[codexon-check]' in output
+    error = report['diagnostics']['first_error']
+    assert (error is not None) == cleanup_error
+    if cleanup_error:
+        assert error['operation'] == 'remove subprocess capture'
+
+
+def cleanup_denial_wrapper(tmp_path):
+    wrapper = tmp_path/'cleanup_failure.py'
+    wrapper.write_text(
+        f'import sys\nsys.path.insert(0, {str(ROOT)!r})\n'
+        'from tools import check_diagnostics as diagnostics\n'
+        'from tools import run_ui_checks\n'
+        'cleanup = diagnostics.tempfile.TemporaryDirectory.cleanup\n'
+        'def denied(self):\n'
+        '    cleanup(self)\n'
+        "    raise PermissionError('injected capture cleanup denial')\n"
+        'diagnostics.tempfile.TemporaryDirectory.cleanup = denied\n'
+        'sys.argv = sys.argv[1:]\nraise SystemExit(run_ui_checks.main())\n')
+    return wrapper
+
+
+def test_direct_runner_capture_cleanup_failure_cannot_pass(tmp_path):
+    from tools.check_diagnostics import CheckOutput
+    diagnostics = tmp_path/'evidence'
+    command = ['run_ui_checks.py', '--no-desktop', '--diagnostics', str(diagnostics),
+               '--', sys.executable, '-c', 'pass']
+    wrapper = cleanup_denial_wrapper(tmp_path)
+    result = subprocess.run([sys.executable, str(wrapper), *command], cwd=ROOT,
+                            capture_output=True, text=True, timeout=20)
+    assert result.returncode == 86, result.stdout + result.stderr
+    report = json.loads((diagnostics/'result.json').read_text(encoding='utf-8'))
+    assert report['product_exit_code'] == 0 and report['remaining_pids'] == []
+    assert report['diagnostics']['first_error']['operation'] == 'remove subprocess capture'
+    observed = CheckOutput(); observed.feed(result.stdout, final=True)
+    assert observed.product_exit_code == 0
+    assert observed.first_error == report['diagnostics']['first_error']
+
+
+def test_direct_runner_final_result_write_failure_cannot_pass(tmp_path):
+    from tools.check_diagnostics import CheckOutput
+    probe = tmp_path/'result_failure.py'
+    probe.write_text('import os\nfrom pathlib import Path\n'
+        "(Path(os.environ['CODEXON_CHECK_DIAGNOSTICS'])/'result.json').mkdir()\n")
+    result = subprocess.run([sys.executable, str(ROOT/'tools/run_ui_checks.py'), '--no-desktop',
+        '--diagnostics', str(tmp_path/'evidence'), '--', sys.executable, str(probe)],
+        cwd=ROOT, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 86, result.stdout + result.stderr
+    observed = CheckOutput(); observed.feed(result.stdout, final=True)
+    assert observed.product_exit_code == 0
+    assert observed.first_error['operation'] == 'write JSON'
+    assert observed.first_error['path'].endswith('result.json')
+
+
+def test_nested_runner_restores_its_host_worker_event_route(tmp_path):
+    source = tmp_path/'nested_runner.py'
+    inner = tmp_path/'inner'
+    inner_code = ("from tools.check_diagnostics import emit; "
+        "emit(dict(active_test=dict(test='inner-only',phase='call')),strict=True)")
+    command = ['run_ui_checks.py', '--no-desktop', '--diagnostics', str(inner),
+               '--', sys.executable, '-c', inner_code]
+    source.write_text(
+        'import os, sys\nfrom pathlib import Path\n'
+        'from tools import check_diagnostics as diagnostics\nfrom tools import run_ui_checks\n'
+        'emit = diagnostics.emit\nowned = Path(diagnostics._event_log)\n'
+        "emit(dict(active_test=dict(test='outer-before',phase='call')),strict=True)\n"
+        f'sys.argv = {command!r}\nassert run_ui_checks.main() == 0\n'
+        "emit(dict(active_test=dict(test='outer-after',phase='finished')),strict=True)\n"
+        "events = owned.read_text(encoding='utf-8')\n"
+        "assert 'inner-only' not in events\nassert 'outer-after' in events\n")
+    outer = tmp_path/'outer'
+    result = subprocess.run([sys.executable, str(ROOT/'tools/run_ui_checks.py'), '--no-desktop',
+        '--diagnostics', str(outer), '--', sys.executable, str(source)],
+        cwd=ROOT, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stdout + result.stderr
+    report = json.loads((outer/'result.json').read_text(encoding='utf-8'))
+    assert report['active_test']['test'] == 'outer-after'
+    assert report['remaining_pids'] == []
+
+
+def test_supervisor_capture_failure_retains_unknown_product_outcome(tmp_path):
+    from tools.check_diagnostics import CheckOutput
+    diagnostics = tmp_path/'evidence'
+    wrapper = tmp_path/'capture_failure.py'
+    command = ['run_ui_checks.py', '--no-desktop', '--diagnostics', str(diagnostics),
+               '--', sys.executable, '-c', 'pass']
+    wrapper.write_text(
+        f'import sys\nsys.path.insert(0, {str(ROOT)!r})\nfrom pathlib import Path\n'
+        'from tools import run_ui_checks\noriginal = Path.open\n'
+        'def denied(self, *args, **kwargs):\n'
+        "    if self.name == 'stdout.log' and args and args[0] == 'rb':\n"
+        "        raise PermissionError('injected capture reader denial')\n"
+        '    return original(self, *args, **kwargs)\nPath.open = denied\n'
+        f'sys.argv = {command!r}\nraise SystemExit(run_ui_checks.main())\n')
+    result = subprocess.run([sys.executable, str(wrapper)], cwd=ROOT,
+                            capture_output=True, text=True, timeout=20)
+    assert result.returncode == 86, result.stdout + result.stderr
+    observed = CheckOutput(); observed.feed(result.stdout, final=True)
+    assert observed.has_outcome and observed.product_exit_code is None
+    assert observed.first_error['operation'] == 'open runner capture reader'
+
+
+def test_worker_default_emit_keeps_a_complete_frame_under_stdout_backpressure(tmp_path):
+    import ctypes
+    from ctypes import wintypes as W
+    import msvcrt
+    import time
+    from tools.check_diagnostics import CheckOutput
+    event = dict(active_test=dict(test='large-'+'x'*32768, phase='call'))
+    probe = tmp_path/'large_event.py'
+    probe.write_text('from tools.check_diagnostics import emit\n'
+                     f'emit({event!r})\n')
+    evidence = tmp_path/'evidence'
+    api = ctypes.WinDLL('kernel32', use_last_error=True)
+    api.PeekNamedPipe.argtypes = [W.HANDLE, ctypes.c_void_p, W.DWORD,
+        ctypes.POINTER(W.DWORD), ctypes.POINTER(W.DWORD), ctypes.POINTER(W.DWORD)]
+    api.PeekNamedPipe.restype = W.BOOL
+    process = subprocess.Popen([sys.executable, str(ROOT/'tools/run_ui_checks.py'), '--no-desktop',
+        '--timeout', '10', '--diagnostics', str(evidence), '--', sys.executable, str(probe)],
+        cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    try:
+        deadline = time.monotonic()+8
+        available = W.DWORD()
+        while not available.value:
+            assert api.PeekNamedPipe(msvcrt.get_osfhandle(process.stdout.fileno()), None,
+                                     0, None, ctypes.byref(available), None)
+            assert time.monotonic() < deadline
+            if not available.value:
+                time.sleep(.01)
+        output, _ = process.communicate(timeout=15)
+        assert process.returncode == 0
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.communicate(timeout=5)
+    observed = CheckOutput(); observed.feed(output.decode('utf-8'), final=True)
+    report = json.loads((evidence/'result.json').read_text(encoding='utf-8'))
+    assert observed.active_test == event['active_test'] == report['active_test']
+    assert report['remaining_pids'] == []
+
+
+
+@pytest.mark.parametrize('target', [
+    'tests/test_verify_changes.py::test_first_diagnostic_survives_large_output_and_product_failure',
+    'tests/test_ui_check_runner.py::test_worker_product_exception_traceback_survives_failed_final_evidence',
+])
+def test_independent_child_diagnostics_stay_with_their_capture_owner(tmp_path, target):
+    evidence = tmp_path/'evidence'
+    result = subprocess.run([sys.executable, str(ROOT/'tools/run_ui_checks.py'), '--no-desktop',
+        '--kind', 'core', '--timeout', '20', '--diagnostics', str(evidence), '--', sys.executable,
+        '-m', 'pytest', '-q', '-p', 'tools.check_progress', '-o', 'addopts=', target],
+        cwd=ROOT, capture_output=True, text=True, timeout=40)
+    assert result.returncode == 0, result.stdout + result.stderr
+    report = json.loads((evidence/'result.json').read_text(encoding='utf-8'))
+    assert report['product_exit_code'] == 0 and report['diagnostics']['first_error'] is None
+    assert report['remaining_pids'] == []

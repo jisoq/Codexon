@@ -60,7 +60,7 @@ class OverlayController(QObject):
     def __init__(self, settings, native_enabled=True, appearance_path=None):
         super().__init__()
         self.settings = settings
-        self.overlay_loader=None;self.overlay_serial=0;self.pending_overlay=None
+        self.overlay_loader=None;self.selection_loader=None;self.overlay_serial=0;self.pending_overlay=None
         self._overlay_detail=None;self._overlay_blocked=None
         self._overlay_requests=OrderedDict()
         self._overlay_restart_pending=False
@@ -154,7 +154,9 @@ class OverlayController(QObject):
         self.collection_evidence={}
         self.sessions = []
         self.session_lookup = {}
+        self.target_resolution = None
         self.loading = True
+        self.preparation = None
         self.errors = []
         self.collection_issue = ''
         self.collection_fault = {}
@@ -603,7 +605,15 @@ class OverlayController(QObject):
         if (state.get('selection')!=self.target_state.get('selection')
                 or state.get('target')!=self.target_state.get('target')):self.cancel_drag()
         if state.get('selection')!=self.target_state.get('selection'):
+            self.target_resolution=None
             self.close_popup()
+            selection=state.get('selection')
+            if self.selection_loader:
+                self.selection_loader(selection.thread_id if selection and selection.host=='local' else None)
+            if selection and selection.host=='local':
+                from .preparation_progress import PreparationPending,PreparationStage
+                self.preparation=PreparationPending(now,PreparationStage.COLLECTING)
+            else:self.preparation=None
         self.target_state = state
         self.observed_at = now
         self.refresh()
@@ -616,6 +626,21 @@ class OverlayController(QObject):
         self.refresh()
 
     def receive_snapshot(self, snapshot):
+        selection=self.target_state.get('selection')
+        self.target_resolution=None
+        demand=snapshot.get('demand')
+        if (selection and selection.host=='local' and snapshot.get('catalog_complete')
+                and not snapshot.get('collection_stale') and not snapshot.get('collection_recovery')
+                and demand is not None and any(home is None and sid==selection.thread_id for home,sid in demand['selected'])):
+            if 'selected_resolutions' in snapshot:
+                self.target_resolution=next(((sid,count) for sid,count in snapshot['selected_resolutions']
+                    if sid==selection.thread_id),None)
+            elif 'session_catalog' in snapshot:
+                homes={home for home,sid,parent in snapshot['session_catalog'] if sid==selection.thread_id}
+                self.target_resolution=(selection.thread_id,len(homes))
+        if (not selection or selection.host!='local' or any(s['id']==selection.thread_id
+                for s in snapshot.get('overlay_sessions',())) or self.target_resolution is not None
+                and self.target_resolution[1]!=1):self.preparation=None
         self._analysis_failed=False
         self.sessions = snapshot.get('overlay_sessions', [])
         self.session_lookup={}
@@ -643,6 +668,11 @@ class OverlayController(QObject):
         self.collection_stale = bool(snapshot.get('collection_stale'))
         if not self.errors and not self.collection_stale:
             self.snapshot_wall_time = snapshot.get('last_usage_collection_success') or snapshot.get('ts')
+        self.refresh()
+
+    def receive_preparation(self, pending):
+        if self.preparation==pending:return
+        self.preparation=pending
         self.refresh()
 
     def receive_collection_observation(self,value):
@@ -690,9 +720,13 @@ class OverlayController(QObject):
                 'service_preparing' if preparing else 'service_delay' if delayed else
                 'analysis_delay' if updating else '')
         note = ('분석 오류' if getattr(self,'_analysis_failed',False) else
-                '수집 오류' if service_error or self.errors else '기록 준비 중' if preparing else
+                '수집 오류' if service_error or self.errors else
+                '사용 기록 수집 중지' if phase=='stopped' and len(matches)<=1 else '기록 준비 중' if preparing else
                 '수집 지연' if delayed else '갱신 중' if updating else '')
         if len(matches) != 1:
+            resolution=getattr(self,'target_resolution',None)
+            if resolution is not None and resolution[0]==selection.thread_id and resolution[1]!=1:
+                return None,note or ('현재 세션 식별 불가' if resolution[1]>1 else '호출 기록 없음')
             return None, note or ('기록 확인 중' if self.loading else '호출 기록 없음' if not matches else '현재 세션 식별 불가')
         loading = self.loading and matches[0].get('collection_complete') is not True
         note = note or ('기록 확인 중' if loading else '')
@@ -796,7 +830,9 @@ class OverlayController(QObject):
         return (age>ANALYSIS_DELAY_SECONDS,
                 self.retained_detail_delayed(data),
                 OverlayController.collection_phase(self),
-                OverlayContent.collection_age(data,self.widget.note))
+                OverlayContent.collection_age(data,self.widget.note),
+                max(0,int(time.monotonic()-self.preparation.started_at))
+                if self.preparation is not None and self.widget.content_model.preparation else None)
 
     def _refresh_appearance(self):
         now=time.monotonic()
@@ -869,7 +905,9 @@ class OverlayController(QObject):
         if not self.drag_context:self._load_collapsed()
         data,note=(self.widget.data,self.widget.note) if self.drag_context else self.content()
         if not self.drag_context:
-            self.widget.set_content(data, note, appearance=self.appearance)
+            preparation=(self.preparation if selection.host=='local'
+                         and len(self.session_lookup.get(selection.thread_id,[]))<=1 else None)
+            self.widget.set_content(data, note, appearance=self.appearance,preparation=preparation)
             self._content_time_state=self._content_time()
         from .overlay_tracking import anchored_monitor_geometry
         scale=self.appearance.scale
@@ -1021,8 +1059,15 @@ def install_overlay(window, native_enabled=True):
     from PySide6.QtWidgets import QMenu
     controller = OverlayController(window.settings, native_enabled=native_enabled)
     window.overlay = controller
+    if getattr(window,'preparation',None) is None and 'overlay_sessions' in window.snapshot:
+        controller.receive_snapshot(window.snapshot)
+    controller.receive_preparation(getattr(window,'preparation',None))
     if getattr(window,'worker',None) and hasattr(window.worker,'request_overlay_detail'):
         controller.overlay_loader=window.worker.request_overlay_detail
+        if hasattr(window.worker,'select_session'):
+            controller.selection_loader=window.worker.select_session
+            selection=controller.target_state.get('selection')
+            controller.selection_loader(selection.thread_id if selection and selection.host=='local' else None)
         window.worker.overlay_detail.connect(controller.receive_overlay_detail)
         if hasattr(window.worker,'fault'):window.worker.fault.connect(controller.receive_overlay_fault)
     if getattr(window,'quota_service',None):

@@ -31,7 +31,7 @@ class PreparedAnalysis:
     def publish(self,*,at=None,errors=()):
         self.sequence+=1
         value=empty_snapshot(self.channel.homes,self.channel.path,self.at if at is None else at)
-        value.update(sessions=[copy.deepcopy(self.session)],usage_collection_complete=True,
+        value.update(sessions=[copy.deepcopy(self.session)],catalog_scope='full',usage_collection_complete=True,
                      last_usage_collection_success=value['ts'],request_activity=[],quota_by_home={},errors=list(errors))
         value['index'].update(loading=False,usage_complete=True,last_usage_success=value['ts'])
         self.channel.publish(value,'prepared-test',self.sequence)
@@ -62,16 +62,31 @@ class PreparedAnalysis:
     def assert_calls_and_detail(self):
         overlay=self.snapshot['overlay_sessions'][0]
         history=self.session['history']
-        assert overlay['calls']==len(history) and overlay['latest_key']==history[-1]['key']
-        self.parent.send(dict(kind='overlay_detail',id='selected-overlay',summary=overlay))
-        detail=self.wait_for(lambda value:value.get('id')=='selected-overlay')
+        owner=(overlay['home'],overlay['id'])
+        deadline=time.monotonic()+10
+        while True:
+            assert overlay['calls']==len(history) and overlay['latest_key']==history[-1]['key']
+            attempted=overlay['_prepared_token']
+            self.parent.send(dict(kind='overlay_detail',id='selected-overlay',summary=overlay))
+            detail=self.wait_for(lambda value:value.get('id')=='selected-overlay',
+                                 seconds=deadline-time.monotonic())
+            if detail['kind']!='stale':break
+            assert detail['consumer']=='overlay_detail' and detail['prepared_token']==attempted
+            refreshed=self.wait_snapshot(lambda value:any(
+                (summary['home'],summary['id'])==owner and summary['_prepared_token']!=attempted
+                for summary in value['overlay_sessions']),seconds=deadline-time.monotonic())
+            overlay=next(summary for summary in refreshed['overlay_sessions']
+                         if (summary['home'],summary['id'])==owner)
         assert detail['kind']=='overlay_detail'
         overlay=detail['summary']
         assert [row['key'] for row in overlay['recent']]==[row['key'] for row in history]
         assert overlay['latest']['key']==history[-1]['key']
 
     def __enter__(self):
-        self.publish();self.thread.start();return self
+        self.publish()
+        self.parent.send(dict(kind='query',id='fixture-aggregate',logical='fixture-aggregate',
+            query=dict(page=2,start=0,end=self.at,now=self.at,period='custom',include_whole_history=False)))
+        self.thread.start();return self
 
     def __exit__(self,*exc):
         try:
@@ -85,6 +100,38 @@ class PreparedAnalysis:
             assert not self.thread.is_alive(),'normal analysis worker did not stop'
             assert self.error is None,self.error
         finally:self.parent.close();self.child.close();self.channel.close()
+
+
+def test_incomplete_catalog_subscribes_to_completion_before_reconciliation_poll(tmp_path, monkeypatch):
+    armed = Event()
+    original = prepared_runtime.CollectionClient.notification_connection
+
+    def notification(client, publication=None):
+        result = original(client, publication)
+        if publication is not None and tuple(publication) == ('prepared-test', 2):
+            armed.set()
+        return result
+
+    monkeypatch.setattr(prepared_runtime.CollectionClient, 'notification_connection', notification)
+    with PreparedAnalysis(tmp_path) as analysis:
+        initial = analysis.wait_snapshot(lambda value: bool(value.get('overlay_sessions')))
+        calls = initial['overlay_sessions'][0]['calls']
+        partial = empty_snapshot(analysis.channel.homes, analysis.channel.path, time.time())
+        partial.update(sessions=[copy.deepcopy(analysis.session)], usage_collection_complete=False)
+        partial['index'].update(loading=True, usage_complete=False)
+        analysis.sequence += 1
+        analysis.channel.publish(partial, 'prepared-test', analysis.sequence)
+        pending = analysis.wait_snapshot(lambda value: not value.get('usage_collection_complete'))
+        assert pending['overlay_sessions'][0]['calls'] == calls
+        assert armed.wait(1), 'incomplete catalog did not arm its completion notification'
+        analysis.session['history'].append(dict(analysis.session['history'][-1],
+            key='after-completion', ts=analysis.session['history'][-1]['ts']+1))
+        analysis.session['usage_revision'] += 1
+        analysis.publish(at=time.time())
+        current = analysis.wait_snapshot(lambda value: value.get('usage_collection_complete') and any(
+            owner['calls'] == calls+1 and owner['latest_key'] == 'after-completion'
+            for owner in value.get('overlay_sessions', ())), seconds=1)
+        assert current['overlay_sessions'][0]['calls'] == calls+1
 
 
 @pytest.mark.parametrize('failure_stage',['init','enrich','sync','import'])
@@ -130,7 +177,7 @@ def test_usage_ledger_retries_after_transient_failure(monkeypatch,tmp_path):
         worker.assert_calls_and_detail()
         recovered=worker.wait_snapshot(lambda value:value.get('ledger_status_known') and not value.get('ledger_error'))
         assert not recovered['ledger_fault']['ledger_failed']
-        assert recovered['prepared_token']==failed['prepared_token']
+        assert recovered['overlay_sessions'][0]['_overlay_revision']==failed['overlay_sessions'][0]['_overlay_revision']
         assert len(opens)==2 and opens[1][0]-failures[0]>=5
         assert [path for _,path in opens]==[quota_path,quota_path]
     from cachemonitor.quota_service import QuotaService
@@ -166,7 +213,8 @@ def test_history_recovery_yields_to_details_and_collection(monkeypatch,tmp_path)
             worker.assert_calls_and_detail()
             worker.session['history'][-1]['output']+=1;worker.session['usage_revision']+=1
             worker.publish();release[0].set()
-            changed=worker.wait_snapshot(lambda value:value['prepared_token']!=first['prepared_token'])
+            changed=worker.wait_snapshot(lambda value:
+                value['overlay_sessions'][0]['_overlay_revision']!=first['overlay_sessions'][0]['_overlay_revision'])
             assert not changed['ledger_status_known'] and entered[1].wait(3)
             worker.assert_calls_and_detail()
             assert steps==[False,False]
@@ -216,7 +264,8 @@ def test_ledger_replay_yields_to_new_calls_between_committed_batches(monkeypatch
             if clients[0].waiter is not None:
                 assert clients[0].waiter.receiver.poll(3),'new collection did not notify the analyzer'
             release.set()
-            changed=worker.wait_snapshot(lambda value:value['prepared_token']!=first['prepared_token'])
+            changed=worker.wait_snapshot(lambda value:
+                value['overlay_sessions'][0]['_overlay_revision']!=first['overlay_sessions'][0]['_overlay_revision'])
             assert not changed['ledger_status_known'] and len(passes[0])==1
             worker.assert_calls_and_detail()
             worker.wait_snapshot(lambda value:value.get('ledger_status_known'))
@@ -251,9 +300,10 @@ def test_service_collects_large_record_once_for_gui_and_worker(tmp_path,monkeypa
         monkeypatch.setattr(UsageIndex,'scan_file',no_scan)
         for client in (gui,worker):
             snapshot=client.poll(10010)
-            transport={'activity_cursor','activity_highwater','activity_more'}
+            transport={'activity_cursor','activity_highwater','activity_more','activity_live_start'}
             assert {k:v for k,v in snapshot.items() if k not in transport}==json.loads(json.dumps(produced))
             assert snapshot['activity_cursor'][1]==snapshot['activity_highwater']==0
+            assert snapshot['activity_live_start']==0
             assert not snapshot['activity_more']
             assert {r['key'] for s in snapshot['sessions'] for r in s['history']}=={'first','last'}
             assert not hasattr(client,'index') and not hasattr(client,'collector')
@@ -525,6 +575,9 @@ def test_collection_reuses_history_and_atomically_replaces_current_sessions(tmp_
     path=tmp_path/'index.sqlite'
     writer=CollectionChannel([],path);reader=CollectionChannel([],path)
     snapshot=empty_snapshot([],path,100)
+    snapshot.update(catalog_scope='full',catalog_complete=True,usage_collection_complete=True,
+                    last_usage_collection_success=100)
+    snapshot['index'].update(loading=False,usage_complete=True,last_usage_success=100)
     snapshot['sessions']=[dict(home='h',id='s',history=[dict(key='a',output=1)],remaining=10,
                                usage_revision=1,turn_records={'turn':{'state':'running'}})]
     snapshot['request_activity']=[dict(home='h',attempt='a',status='started'),dict(home='h',attempt='b',status='started')]
@@ -825,6 +878,7 @@ def test_idle_collector_keeps_nested_freshness_without_republishing_log_history(
              for i in range(2000)])
     service=CollectorService([home],path);reader=CollectionClient([home],path)
     try:
+        reader.set_demand(aggregate=True)
         service.channel.db.execute('PRAGMA wal_autocheckpoint=0')
         service.poll(now);initial=service.poll(now+2)
         assert initial['usage_collection_complete'] and len(initial['unassigned'])==2000
@@ -836,7 +890,7 @@ def test_idle_collector_keeps_nested_freshness_without_republishing_log_history(
             assert produced['last_usage_collection_success']==current
             assert produced['index']['last_usage_success']==current
             received=reader.poll(current)
-            assert {k:v for k,v in received.items() if k not in ('activity_cursor','activity_highwater','activity_more')}==produced
+            assert {k:v for k,v in received.items() if k not in ('activity_cursor','activity_highwater','activity_more','activity_live_start')}==produced
         assert wal.stat().st_size-initial_size<payload_size
     finally:reader.close();service.close()
 

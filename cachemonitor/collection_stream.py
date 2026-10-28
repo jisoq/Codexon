@@ -131,8 +131,8 @@ class _JSONLexical:
 
 
 class _JSONInput:
-    def __init__(self,owner):
-        self.owner=owner;self.decoder=zlib.decompressobj();self.digest=sha256()
+    def __init__(self,owner,*,padded=False):
+        self.owner=owner;self.padded=padded;self.decoder=zlib.decompressobj();self.digest=sha256()
         self.pending=b'';self.output=b'';self.compressed=0;self.decompressed=0;self.complete=False
         self.lexical=_JSONLexical();self.lexical_done=False
         self.plain_prefix=None;self.prefix_offset=0
@@ -151,9 +151,17 @@ class _JSONInput:
             return value
         if self.complete:return b''
         if self.decoder.eof:
-            if self.decoder.unused_data or self.compressed!=self.owner.length:
+            if self.padded:
+                if any(self.decoder.unused_data):
+                    raise CollectionScopeError('수집 상태의 압축 패딩이 일치하지 않습니다.')
+                while self.compressed<self.owner.length:
+                    padding=self.owner.blob.read(CHUNK_BYTES)
+                    if not padding or any(padding):
+                        raise CollectionScopeError('수집 상태의 압축 패딩이 일치하지 않습니다.')
+                    self.compressed+=len(padding)
+            elif self.decoder.unused_data or self.compressed!=self.owner.length:
                 raise CollectionScopeError('수집 본문의 압축 경계가 일치하지 않습니다.')
-            if self.digest.hexdigest()!=self.owner.expected_digest:
+            if self.owner.expected_digest is not None and self.digest.hexdigest()!=self.owner.expected_digest:
                 if getattr(self.owner,'forward_commit',False):
                     raise CollectionCatalogUnavailable('stale')
                 raise CollectionScopeError('수집 본문의 검증값이 일치하지 않습니다.')
@@ -211,7 +219,7 @@ class SelectedOwnerStream(_SessionJSON):
         token=channel._catalog_token(catalog)
         if not isinstance(key,(tuple,list)) or len(key)!=2 or not all(isinstance(part,str) for part in key):
             raise CollectionScopeError('수집 목록의 선택 세션이 일치하지 않습니다.')
-        self.key=tuple(key);entry=catalog.get('owners',{}).get(self.key)
+        self.key=tuple(key);entry=catalog.get('owners',{}).get(self.key) or catalog.get('mode_sources',{}).get(self.key)
         if entry is None or self.key[0] not in channel.homes:raise CollectionCatalogUnavailable('missing')
         digest=entry.get('body_digest')
         if not isinstance(digest,str) or len(digest)!=64:raise CollectionScopeError('수집 본문의 검증값이 없습니다.')
@@ -357,6 +365,39 @@ class SelectedOwnerStream(_SessionJSON):
         self.proof=dict(path=self.source_path,scope=self.scope,selected_homes=self.selected_homes,
             catalog_identity=self.identity,owner=self.key,source_digest=self.expected_digest,
             compressed_bytes=self.length,decompressed_bytes=self.input.decompressed)
+
+
+class _SnapshotStatus(_SessionJSON):
+    def __init__(self,blob):
+        self.blob=blob;self.length=len(blob);self.expected_digest=None
+        self.input=_JSONInput(self,padded=True)
+
+    def _check(self):
+        pass
+
+
+def snapshot_status(db):
+    """Read status from the existing snapshot without retaining membership."""
+    from .usage_collection import CATALOG_PAGE_BYTES,STATUS_FIELDS,_catalog_weight
+    with db.blobopen('snapshot','payload',1,readonly=True) as blob:
+        stream=_SnapshotStatus(blob)
+        try:
+            events=iter(stream._events());header={}
+            if next(events)!=('start_map',None):raise CollectionScopeError('수집 상태가 객체가 아닙니다.')
+            while True:
+                event,field=next(events)
+                if event=='end_map':break
+                if event!='map_key':raise CollectionScopeError('수집 상태의 필드가 일치하지 않습니다.')
+                retain=field in STATUS_FIELDS
+                value=SelectedOwnerStream._object(next(events),events,retain=retain)
+                if retain:
+                    header[field]=value
+                    _catalog_weight(header,CATALOG_PAGE_BYTES)
+            if next(events,None) is not None or not stream.input.complete:
+                raise CollectionScopeError('수집 상태의 압축 경계가 일치하지 않습니다.')
+            return header
+        except (StopIteration,JSONError,zlib.error) as error:
+            raise CollectionScopeError('수집 상태를 읽을 수 없습니다.') from error
 
 
 class _EncodedMetadata(_SessionJSON):

@@ -4,12 +4,12 @@ Source checkouts may run without a compiled extension. Release packaging checks
 the extension separately and fails if it is missing. A requested Rust backend
 never silently falls back to a missing or incompatible extension.
 """
-from functools import lru_cache
+from functools import cache
 import importlib
 import os
 
 
-@lru_cache(maxsize=1)
+@cache
 def _load():
     try:
         module = importlib.import_module('cachemonitor._cpu_native')

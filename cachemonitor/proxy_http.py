@@ -47,7 +47,7 @@ class HTTPRelayPool:
             try:client=self.idle.get_nowait()
             except asyncio.QueueEmpty:
                 transport=httpx.AsyncHTTPTransport(http2=True,retries=0,verify=self.ssl_context,
-                    limits=httpx.Limits(max_connections=1,max_keepalive_connections=1))
+                    limits=httpx.Limits(max_connections=1))
                 client=httpx.AsyncClient(transport=transport,trust_env=False,cookies=NoCookieJar(),
                                           timeout=httpx.Timeout(None,connect=30))
                 self.clients.add(client)

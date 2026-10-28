@@ -33,7 +33,7 @@ class ObservationBacklog:
     # Remote drives retain rollback journaling. Only one failed write stays in RAM.
     MAX_ITEMS = 4096
     MAX_BYTES = 8 * 1024 * 1024
-    MAX_ITEM_BYTES = 64 * 1024
+    OBSERVATION_RESERVE_BYTES = 64 * 1024
     MAX_PAGES = 4096
     MAX_WAL_BYTES = 2 * 1024 * 1024
     BATCH_SIZE = 32
@@ -47,8 +47,8 @@ class ObservationBacklog:
         self.wal = False
         self.db = None
         self.unsaved = None
+        self._fetch_reserved = False
         self.issue = ''
-        self.rejected = ''
         self.lock = threading.RLock()
 
     def connection(self):
@@ -96,7 +96,7 @@ class ObservationBacklog:
             db.execute('begin immediate')
             count, size = db.execute('select items,bytes from budget where id=1').fetchone()
             reserve = self.CONTROL_RESERVE if kind == 'control' else 0
-            if count >= self.MAX_ITEMS + reserve or size + len(encoded) > self.MAX_BYTES + reserve*self.MAX_ITEM_BYTES:
+            if count >= self.MAX_ITEMS + reserve or size + len(encoded) > self.MAX_BYTES + reserve*self.OBSERVATION_RESERVE_BYTES:
                 raise BufferError('quota observation backlog capacity')
             db.execute('insert into pending(kind,data) values(?,?)', (kind, encoded))
             db.commit()
@@ -117,9 +117,6 @@ class ObservationBacklog:
 
     @synchronized
     def available(self):
-        if self.rejected:
-            self.issue = self.rejected
-            return False
         if not self.flush():
             return False
         try:
@@ -127,8 +124,7 @@ class ObservationBacklog:
             self.journal_room(db)
             count, size = db.execute(
                 'select items,bytes from budget where id=1').fetchone()
-            # Reserve room for one maximum-size response before making a request.
-            if count >= self.MAX_ITEMS or size + self.MAX_ITEM_BYTES > self.MAX_BYTES:
+            if count >= self.MAX_ITEMS or size + self.OBSERVATION_RESERVE_BYTES > self.MAX_BYTES:
                 self.issue = '한도 관측 복구 대기 공간이 가득 찼습니다. 저장 복구까지 새 조회를 중지합니다.'
                 return False
         except (sqlite3.Error, OSError):
@@ -138,18 +134,33 @@ class ObservationBacklog:
         return True
 
     @synchronized
+    def reserve_fetch(self):
+        """Admit one account fetch whose response can use the in-flight slot."""
+        if self._fetch_reserved or not self.available():
+            return False
+        self._fetch_reserved = True
+        return True
+
+    @synchronized
+    def cancel_fetch(self):
+        self._fetch_reserved = False
+
+    @synchronized
     def append(self, kind, value):
         encoded = json.dumps(value, ensure_ascii=False, separators=(',', ':')).encode()
-        if len(encoded) > self.MAX_ITEM_BYTES:
-            self.rejected = self.issue = '한도 관측 크기가 저장 한도를 초과했습니다. 새 조회를 중지했습니다. 앱을 다시 열어 재시도하세요.'
-            return False
+        admitted = self._fetch_reserved and kind in ('quota', 'failure')
+        if kind in ('quota', 'failure'):
+            self._fetch_reserved = False
         if self.unsaved is not None:
             return False
         try:
             self._store(kind, encoded)
         except BufferError:
-            self.issue = '한도 관측 복구 대기 공간이 가득 찼습니다. 새 기록을 받지 못했습니다.'
-            return False
+            if not admitted or len(encoded) > self.MAX_BYTES:
+                self.issue = '한도 관측 복구 대기 공간이 가득 찼습니다. 새 기록을 받지 못했습니다.'
+                return False
+            self.unsaved = (kind, encoded)
+            self.issue = '한도 관측 복구 대기 공간이 가득 찼습니다. 저장 복구까지 새 조회를 중지합니다.'
         except (sqlite3.Error, OSError):
             self.unsaved = (kind, encoded)
             self.issue = '한도 관측 임시 저장 실패: 새 조회를 중지했습니다. 종료 전 저장 공간을 확인하세요.'
@@ -177,6 +188,7 @@ class ObservationBacklog:
     @synchronized
     def close(self):
         saved = self.flush()
+        self._fetch_reserved = False
         if self.db is not None:
             self.db.close()
             self.db = None

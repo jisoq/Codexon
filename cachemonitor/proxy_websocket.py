@@ -2,7 +2,7 @@
 import asyncio
 import re
 import time
-from collections import Counter, OrderedDict, defaultdict, deque
+from collections import Counter, defaultdict, deque
 from dataclasses import asdict, dataclass
 
 
@@ -81,7 +81,7 @@ class Activity:
         self.idle_since = None
         self.pending = defaultdict(deque)
         self.active = {}
-        self.completed = OrderedDict()
+        self.completed = set()
         self.cancelling = set()
         self.forwarding = 0
         self.unknown = not known
@@ -146,8 +146,7 @@ class Activity:
                 if terminal:
                     ended_lane=self.active.pop(rid, None)
                     self.cancelling.discard(ended_lane)
-                    self.completed[rid] = True
-                    if len(self.completed) > 2048: self.completed.popitem(last=False)
+                    self.completed.add(rid)
             elif typ == 'error':
                 pending=self.pending.get(lane)
                 if lane in self.cancelling:pass
@@ -199,7 +198,8 @@ class WebSocketBudget:
         self.reap(exclude=None if self.draining else key)
 
     def release(self, key):
-        self.entries.pop(key, None)
+        entry=self.entries.pop(key, None)
+        if entry is not None:entry[0].completed.clear()
         self.changed.set()
 
     def reap(self, incoming=0, exclude=None):

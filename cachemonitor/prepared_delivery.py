@@ -6,7 +6,7 @@ import uuid
 from .analysis_delivery import MODEL_KEYS
 from .analytics import effort_key, project_choices
 from .prepared_ingest import _weight, pages
-from .prepared_store import CapacityExceeded, NotReady
+from .prepared_store import UNCHANGED, CapacityExceeded, NotReady, pack, unpack
 
 
 class _WeightMemo:
@@ -229,16 +229,21 @@ class PreparedPublisher:
         self.order_identity=None
         self.cache_floor=cache_floor
         self._retention=_Retention()
+        self.scoped=False;self.global_choices={};self.global_models=[];self._choices_dirty=True
+        self._projection_dirty=True
+        self._alert_store=None;self._alert_work=None
         self.reset()
 
     def _admit(self, *, owners=None, choices=None, alerts=None, weights=None,
                pending_alerts=None, sessions=None, overlays=None, overlay=None,
-               changed=None, extra=0):
+               changed=None, global_choices=None, global_models=None, extra=0):
         overlay = self.overlay if overlay is None else overlay
         roots = dict(owners=self.owners if owners is None else owners,
             choices=self.choices if choices is None else choices,
             alerts=self.alerts if alerts is None else alerts,
             weights=self.owner_weights if weights is None else weights,
+            global_result=dict(choices=self.global_choices if global_choices is None else global_choices,
+                               models=self.global_models if global_models is None else global_models),
             pending_alerts=self.pending_alerts if pending_alerts is None else pending_alerts,
             sessions=self.sessions if sessions is None else sessions,
             overlays=self.overlays if overlays is None else overlays,
@@ -253,146 +258,203 @@ class PreparedPublisher:
         return self._retention.stage(roots, self.STATE_BYTES, extra=extra)
 
     def reset(self):
-        pending_alerts={
-            (key,identity):dict(home=key[0],sid=key[1],title=self.owners[key]['metadata'].get('title',''),
-                                **dict(zip(MODEL_KEYS,signature)))
-            for key,alerts in self.alerts.items() if not self.owners[key]['metadata'].get('_internal_review')
-            for identity,signature in alerts.items()}
-        changed=set(self.owners)
+        if self._alert_work is None:
+            pending_alerts={
+                (key,identity):dict(home=key[0],sid=key[1],title=self.owners[key]['metadata'].get('title',''),
+                                    **dict(zip(MODEL_KEYS,signature)))
+                for key,alerts in self.alerts.items() if not self.owners[key]['metadata'].get('_internal_review')
+                for identity,signature in alerts.items()}
+        else:
+            pending_alerts={}
+            rows=self._alert_store.db.execute('SELECT a.home,a.sid,a.identity,a.signature,o.title '
+                'FROM delivery_alerts a JOIN delivery_alert_owners o '
+                'ON o.work=a.work AND o.home=a.home AND o.sid=a.sid WHERE a.work=? AND o.internal=0 '
+                'ORDER BY a.home,a.sid,a.identity',(self._alert_work,))
+            for row in rows:
+                key=row['home'],row['sid']
+                signature=unpack(row['signature'],self._alert_store.limits)
+                pending_alerts[(key,row['identity'])]=dict(home=key[0],sid=key[1],title=row['title'],
+                    **dict(zip(MODEL_KEYS,signature)))
+        changed=self.changed|self.owners.keys()
         sessions={};overlays={}
         retention=self._admit(pending_alerts=pending_alerts,sessions=sessions,overlays=overlays,changed=changed)
         self.epoch=uuid.uuid4().hex
         self.sequence=0
-        self.sent_token=None
+        self.sent_token=None;self._projection_dirty=True
         self.sessions=sessions;self.overlays=overlays
         self.pending_alerts=pending_alerts;self.changed=changed
         self._retention=retention
 
-    def adopt(self,store,changed,removed=()):
-        if self.token==store.token:
+    def adopt(self,store,changed,removed=(),*,selected=UNCHANGED):
+        changed=set(changed);removed=set(removed)
+        if selected is UNCHANGED:
+            selected=self.owners if self.scoped else None
+        scoped=selected is not None
+        same_scope=(scoped==self.scoped and (not scoped or len(selected)==len(self.owners)
+                    and all(key in selected for key in self.owners)))
+        if self.token==store.token and same_scope:
             return
-        # Admit the whole small delta and order before replacing retained state.
-        # Failures leave the previous token and its content references coherent.
-        owners=self.owners.copy();choices=self.choices.copy();alerts=self.alerts.copy()
-        weights=self.owner_weights.copy();owner_bytes=self.owner_bytes
-        pending_alerts=self.pending_alerts.copy();content_changed=set()
-        overlay=self.overlay._fork()
-        with store.read_current(seconds=60) as view:
-            if not view.db.execute('SELECT ready FROM meta WHERE singleton=1').fetchone()[0]:
-                raise NotReady('cannot deliver a partial owner conversion')
-            if self.token is None:
-                entries=((row['owner'],row) for row in pages(view.catalog,publication=True))
-                removed=()
-            else:
-                entries=((tuple(key),view.owner(*key,publication=True)) for key in changed)
-            for key in removed:
-                key=tuple(key)
-                owners.pop(key,None);choices.pop(key,None);alerts.pop(key,None)
-                owner_bytes-=weights.pop(key,0)
-            for key,entry in entries:
-                if entry is None:
-                    raise NotReady('published change references an absent prepared owner')
-                new_alerts=entry['model_alerts'] or {}
-                owner_choices=entry['choices'] or {}
-                summary=entry['summary']
-                entry={name:value for name,value in entry.items() if name not in ('owner','summary','choices','model_alerts')}
-                previous=owners.get(key)
-                if previous is not None and (
-                        {name:value for name,value in previous.items() if name!='owner_ordinal'} ==
-                        {name:value for name,value in entry.items() if name!='owner_ordinal'}):
-                    # Order alone retains every verified content reference.
-                    continue
-                preserve_content=bool(previous is not None and key in overlay.own and
-                    {name:value for name,value in previous['metadata'].items()
-                     if name not in ('status','remaining','usage_revision','request_revision')} ==
-                    {name:value for name,value in entry['metadata'].items()
-                     if name not in ('status','remaining','usage_revision','request_revision')} and
-                    {name:value for name,value in previous['dependencies'].items()
-                     if name not in ('state','state_facts')} ==
-                    {name:value for name,value in entry['dependencies'].items()
-                     if name not in ('state','state_facts')} and
-                    {name:value for name,value in previous.items()
-                     if name not in ('owner_ordinal','metadata','dependencies')} ==
-                    {name:value for name,value in entry.items()
-                     if name not in ('owner_ordinal','metadata','dependencies')})
-                old_alerts=alerts.get(key,{})
-                weight=_weight((key,entry,owner_choices,new_alerts),self.STATE_BYTES)
-                owner_bytes=owner_bytes-weights.get(key,0)+weight
-                if owner_bytes>self.STATE_BYTES:
-                    raise CapacityExceeded('prepared publication metadata exceeds its retention budget')
-                weights[key]=weight;owners[key]=entry
-                choices[key]=owner_choices;alerts[key]=new_alerts
-                content_changed.add(key)
-                if entry['metadata'].get('_internal_review'):
-                    continue
-                if isinstance(summary,dict) and 'owner' in summary:
-                    overlay.prime(view,key,summary,preserve_content=preserve_content)
-                # A resolved alert still emits the corrected selected row.
-                keys=[identity for identity in old_alerts.keys()|new_alerts.keys()
-                      if old_alerts.get(identity)!=new_alerts.get(identity)]
-                for identity in keys:
-                    signature=new_alerts.get(identity)
-                    if signature is None:
-                        row=view.record(*key,identity)
-                        if row is None:continue
-                        signature=tuple(row.get(name) for name in MODEL_KEYS)
-                    pending_alerts[(key,identity)]=dict(home=key[0],sid=key[1],
-                        title=entry['metadata'].get('title',''),**dict(zip(MODEL_KEYS,signature)))
-            order={};order_bytes=0
-            order_identity=(view.token.instance,view.order_batch)
-            same_order=(self.token is None or (order_identity==self.order_identity
-                        and owners.keys()==self.owners.keys()))
-            entries=(dict(owner=key,owner_ordinal=value['owner_ordinal']) for key,value in owners.items()) if same_order else pages(view.ordering)
-            for entry in entries:
-                key,ordinal=entry['owner'],entry['owner_ordinal']
-                order_bytes+=_weight((key,ordinal),self.STATE_BYTES)+160
-                if order_bytes>self.STATE_BYTES:
-                    raise CapacityExceeded('prepared order metadata exceeds its retention budget')
-                if key in order:
-                    raise NotReady('catalog order repeats a publication owner')
-                order[key]=ordinal
-            if order.keys()!=owners.keys():
-                raise NotReady('catalog order does not match adopted publication owners')
-            for key,ordinal in order.items():
-                previous=owners[key]['owner_ordinal']
-                difference=sys.getsizeof(ordinal)-sys.getsizeof(previous)
-                if difference:
-                    owner_bytes+=difference;weights[key]+=difference
-                if ordinal!=previous:
-                    owners[key]=dict(owners[key],owner_ordinal=ordinal)
-            if owner_bytes>self.STATE_BYTES:
-                raise CapacityExceeded('prepared order metadata exceeds its retention budget')
-            token=view.token
-        changed=self.changed|content_changed
-        retention=self._admit(owners=owners,choices=choices,alerts=alerts,weights=weights,overlay=overlay,
-                              pending_alerts=pending_alerts,changed=changed)
+        database=store.db
+        database.execute('CREATE TEMP TABLE IF NOT EXISTS delivery_alerts(work TEXT,home TEXT,sid TEXT,'
+            'identity TEXT,signature BLOB,PRIMARY KEY(work,home,sid,identity))')
+        database.execute('CREATE TEMP TABLE IF NOT EXISTS delivery_alert_owners(work TEXT,home TEXT,sid TEXT,'
+            'title TEXT,internal INTEGER,PRIMARY KEY(work,home,sid))')
+        prior_work=self._alert_work
+        next_work=prior_work
+        database.execute('SAVEPOINT delivery_alert_update')
+        try:
+            with (store.read_current(seconds=60) as view,
+                  store.read_current(seconds=60,selected=scoped) as owner_view):
+                if owner_view.token!=view.token:
+                    raise NotReady('publication projections belong to different generations')
+                if not view.db.execute('SELECT ready FROM meta WHERE singleton=1').fetchone()[0]:
+                    raise NotReady('cannot deliver a partial owner conversion')
+                order_identity=(owner_view.token.instance,owner_view.order_batch)
+                if (self.token is not None and not changed and not removed and same_scope
+                        and self.order_identity==order_identity):
+                    self.token=view.token
+                    database.execute('RELEASE delivery_alert_update')
+                    return
+                scan_alerts=(prior_work is None or self._alert_store is not store
+                    or self.token is None or self.token.instance!=view.token.instance)
+                if scan_alerts:next_work=uuid.uuid4().hex
+                had_alerts=bool(prior_work is not None and database.execute(
+                    'SELECT 1 FROM delivery_alerts WHERE work=? LIMIT 1',(prior_work,)).fetchone())
+                owners={};choices={};alerts={};weights={};owner_bytes=0
+                pending_alerts=self.pending_alerts.copy();content_changed=set()
+                overlay=self.overlay._fork()
+                notification_changed=set()
+                changed_keys=tuple(changed)
+                heads=(view.pages(view.publication_heads) if scan_alerts else
+                    (row for start in range(0,len(changed_keys),128)
+                     for row in view.pages(view.publication_heads,owners=changed_keys[start:start+128])))
+                for key in removed:
+                    database.execute('DELETE FROM delivery_alerts WHERE work=? AND home=? AND sid=?',(next_work,*key))
+                    database.execute('DELETE FROM delivery_alert_owners WHERE work=? AND home=? AND sid=?',(next_work,*key))
+                for row in heads:
+                    key=row['owner'];metadata=row['metadata']
+                    new_alerts=row['model_alerts'] or {}
+                    if not metadata.get('_internal_review') and (self.token is None or key in changed):
+                        notification_changed.add(key)
+                    old_alerts=({item['identity']:unpack(item['signature'],store.limits) for item in
+                        database.execute('SELECT identity,signature FROM delivery_alerts '
+                            'WHERE work=? AND home=? AND sid=?',(prior_work,*key))}
+                        if had_alerts else {})
+                    if not scan_alerts:
+                        database.execute('DELETE FROM delivery_alerts WHERE work=? AND home=? AND sid=?',(next_work,*key))
+                        database.execute('DELETE FROM delivery_alert_owners WHERE work=? AND home=? AND sid=?',(next_work,*key))
+                    if new_alerts:
+                        database.execute('INSERT INTO delivery_alert_owners VALUES(?,?,?,?,?)',
+                            (next_work,*key,metadata.get('title',''),int(bool(metadata.get('_internal_review')))))
+                        database.executemany('INSERT INTO delivery_alerts VALUES(?,?,?,?,?)',
+                            ((next_work,*key,identity,pack(signature,store.limits))
+                             for identity,signature in new_alerts.items()))
+                    if not metadata.get('_internal_review'):
+                        for identity in old_alerts.keys()|new_alerts.keys():
+                            signature=new_alerts.get(identity)
+                            if old_alerts.get(identity)==signature:continue
+                            if signature is None:
+                                record=view.record(*key,identity)
+                                if record is None:continue
+                                signature=tuple(record.get(name) for name in MODEL_KEYS)
+                            pending_alerts[(key,identity)]=dict(home=key[0],sid=key[1],
+                                title=metadata.get('title',''),**dict(zip(MODEL_KEYS,signature)))
+                entries=(((row['owner'],row) for row in owner_view.pages(owner_view.catalog,publication=True))
+                         if owner_view.selected or not scoped else
+                         ((tuple(key),owner_view.owner(*key,publication=True)) for key in selected))
+                for key,row in entries:
+                    if row is None:
+                        raise NotReady('published selection references an absent prepared owner')
+                    if scoped and key not in selected:continue
+                    metadata=row['metadata'];new_alerts=row['model_alerts'] or {}
+                    owner_choices=row['choices'] or {}
+                    summary=row['summary']
+                    entry={name:value for name,value in row.items()
+                           if name not in ('owner','summary','choices','model_alerts')}
+                    previous=self.owners.get(key)
+                    equal=bool(previous is not None and
+                        {name:value for name,value in previous.items() if name!='owner_ordinal'}==
+                        {name:value for name,value in entry.items() if name!='owner_ordinal'})
+                    if equal:
+                        if previous['owner_ordinal']==entry['owner_ordinal']:entry=previous
+                        owner_choices=self.choices[key];new_alerts=self.alerts[key]
+                        weight=self.owner_weights[key]+sys.getsizeof(entry['owner_ordinal'])-sys.getsizeof(previous['owner_ordinal'])
+                    else:
+                        preserve_content=bool(previous is not None and key in overlay.own and
+                            {name:value for name,value in previous['metadata'].items()
+                             if name not in ('status','remaining','usage_revision','request_revision')}==
+                            {name:value for name,value in metadata.items()
+                             if name not in ('status','remaining','usage_revision','request_revision')} and
+                            {name:value for name,value in previous['dependencies'].items()
+                             if name not in ('state','state_facts')}==
+                            {name:value for name,value in entry['dependencies'].items()
+                             if name not in ('state','state_facts')} and
+                            {name:value for name,value in previous.items()
+                             if name not in ('owner_ordinal','metadata','dependencies')}==
+                            {name:value for name,value in entry.items()
+                             if name not in ('owner_ordinal','metadata','dependencies')})
+                        weight=_weight((key,entry,owner_choices,new_alerts),self.STATE_BYTES)
+                        content_changed.add(key)
+                        if not metadata.get('_internal_review') and isinstance(summary,dict) and 'owner' in summary:
+                            overlay.prime(owner_view,key,summary,preserve_content=preserve_content)
+                    owner_bytes+=weight
+                    if owner_bytes>self.STATE_BYTES:
+                        raise CapacityExceeded('prepared publication metadata exceeds its retention budget')
+                    owners[key]=entry;choices[key]=owner_choices;alerts[key]=new_alerts;weights[key]=weight
+                if scoped:
+                    if len(owners)!=len(selected):raise NotReady('selected publication membership is incomplete')
+                token=view.token
+            changed=(self.changed-set(removed))|notification_changed|content_changed
+            retention=self._admit(owners=owners,choices=choices,alerts=alerts,weights=weights,overlay=overlay,
+                                  pending_alerts=pending_alerts,changed=changed)
+        except BaseException:
+            database.execute('ROLLBACK TO delivery_alert_update')
+            database.execute('RELEASE delivery_alert_update')
+            raise
+        database.execute('RELEASE delivery_alert_update')
+        if prior_work is not None and prior_work!=next_work:
+            database.execute('DELETE FROM delivery_alerts WHERE work=?',(prior_work,))
+            database.execute('DELETE FROM delivery_alert_owners WHERE work=?',(prior_work,))
+        self._choices_dirty=self._choices_dirty or self.token!=token
+        self._alert_store=store;self._alert_work=next_work
         self.owners=owners;self.choices=choices;self.alerts=alerts
         self.owner_weights=weights;self.owner_bytes=owner_bytes
         self.pending_alerts=pending_alerts;self.changed=changed
         self._retention=retention
-        self.token=token
-        self.order_identity=order_identity
-        self.overlay=overlay
+        self.token=token;self.order_identity=order_identity;self.scoped=scoped
+        self.overlay=overlay;self._projection_dirty=True
 
-    def _filter_choices(self,snapshot,sessions):
+    def _filter_choices(self,snapshot,view=None):
         counts=Counter();transports=set();transport_sources=set();policies=set()
-        for key in sessions:
-            value=self.choices[key]
-            counts.update({(c['model'],c['effort'],c['service_tier']):c['count']
-                           for c in value.get('combinations',())})
-            transports.update(value.get('transports',()))
-            transport_sources.update(value.get('transport_sources',()))
-            policies.update(value.get('cache_policies',()))
-        return dict(models=sorted({key[0] for key in counts}),
+        homes=set(snapshot.get('homes',()));sources=set();models=set();internal=0
+        def metadata():
+            nonlocal internal
+            complete_choices=self.scoped and not view.db.execute(
+                'SELECT selection_batch FROM meta WHERE singleton=1').fetchone()[0]
+            entries=((row['owner'],row['metadata'],row['choices'] or {},row['dependencies'])
+                     for row in view.pages(view.catalog,publication=True)) if complete_choices else (
+                     (key,row['metadata'],self.choices[key],row['dependencies']) for key,row in self.owners.items())
+            for key,owner,choices,dependency in entries:
+                if owner.get('_internal_review'):
+                    internal+=dependency.get('call_count',0)
+                    continue
+                counts.update({(item['model'],item['effort'],item['service_tier']):item['count']
+                               for item in choices.get('combinations',())})
+                transports.update(choices.get('transports',()))
+                transport_sources.update(choices.get('transport_sources',()))
+                policies.update(choices.get('cache_policies',()))
+                models.update(choices.get('models',()))
+                homes.add(key[0]);sources.add(owner.get('source','unknown'))
+                yield owner
+        projects=project_choices(metadata())
+        result=dict(models=sorted({key[0] for key in counts}),
             efforts=sorted({key[1] for key in counts},key=effort_key),
             modes=sorted({key[2] for key in counts}),
-            combinations=[dict(model=m,effort=e,service_tier=t,count=n)
-                          for (m,e,t),n in sorted(counts.items())],
+            combinations=[dict(model=model,effort=effort,service_tier=mode,count=count)
+                          for (model,effort,mode),count in sorted(counts.items())],
             transports=sorted(transports),transport_sources=sorted(transport_sources),
-            cache_policies=sorted(policies),
-            homes=sorted(set(snapshot.get('homes',()))|{key[0] for key in sessions}),
-            sources=sorted({s.get('source','unknown') for s in sessions.values()}),
-            **project_choices(sessions.values()))
+            cache_policies=sorted(policies),homes=sorted(homes),sources=sorted(sources),**projects)
+        return result,internal,sorted(models)
 
     def publish(self,snapshot,store,speeds=None):
         if self.token is None:
@@ -404,17 +466,15 @@ class PreparedPublisher:
         base=dict(protocol=1,epoch=self.epoch,sequence=sequence,reset=sequence==1,
                   data_revision=self.token.generation,call_revision=self.token.generation,
                   prepared_token=(self.token.instance,self.token.generation))
-        if self.sent_token==self.token and sequence!=1:
+        if self.sent_token==self.token and sequence!=1 and not self._projection_dirty:
             self.sequence=sequence
             return dict(message,**base,sessions=[],overlay_sessions=[],removed=[],
                         model_candidates=[],cache_candidates=[],internal_review_calls=self.internal_count)
-        sessions={};internal=0
+        sessions={}
         excluded={'_internal_review','_collection_pending','history','requests','groups','totals',
                   'turn_records','turn_states','transports','unmatched_transports','coverage_gaps','remaining'}
         for key,entry in sorted(self.owners.items(),key=lambda pair:pair[1]['owner_ordinal']):
-            if entry['metadata'].get('_internal_review'):
-                internal+=entry['dependencies'].get('call_count',0)
-            else:
+            if not entry['metadata'].get('_internal_review'):
                 previous=self.sessions.get(key)
                 sessions[key]=(previous if previous is not None and key not in self.changed else
                                {name:value for name,value in entry['metadata'].items() if name not in excluded})
@@ -423,10 +483,18 @@ class PreparedPublisher:
             overlays=overlay.collect(view,self.owners,
                 None if sequence==1 else self.changed,self.sessions.keys()-sessions.keys(),speeds or {},
                 bind_generation=False)
-            from .prepared_health import notification_health
-            candidates=[notification_health(view,key,own=overlay.own[key],
-                                            revision=overlay.revisions[key],since=self.cache_floor)
-                        for key in sessions if key in self.changed]
+            from .prepared_health import notification_health_pages
+            candidates=[]
+            for key in self.changed:
+                if key in self.owners and self.owners[key]['metadata'].get('_internal_review'):continue
+                for candidate in notification_health_pages(view,key,since=self.cache_floor):
+                    if not (candidate.get('cache_health') or {}).get('incident'):
+                        candidate.pop('title')
+                    candidates.append(candidate)
+            if self._choices_dirty:
+                global_choices,internal,models=self._filter_choices(snapshot,view)
+            else:
+                global_choices,internal,models=self.global_choices,self.internal_count,self.global_models
         overlays={(value['home'],value['id']):value for value in overlays}
         message.update(**base,sessions=[value for key,value in sessions.items()
                                         if self.sessions.get(key) is not value and self.sessions.get(key)!=value],
@@ -434,20 +502,102 @@ class PreparedPublisher:
                               if self.overlays.get(key) is not value and self.overlays.get(key)!=value],
             removed=list(self.sessions.keys()-sessions.keys()),model_candidates=list(self.pending_alerts.values()),
             cache_candidates=candidates,internal_review_calls=internal,
-            filter_choices=self._filter_choices(snapshot,sessions),
-            models=sorted({model for key in sessions for model in self.choices[key].get('models',())}))
-        # Lists in the wire packet reference already charged immutable content.
-        # Independently built small choices/candidates and container allocation
-        # remain live alongside the staged retained projection until return.
+            filter_choices=global_choices,models=models)
         extra=(sys.getsizeof(message)+sum(sys.getsizeof(value) for value in message.values()
                                          if isinstance(value,list))+
-               _weight((candidates,message['filter_choices'],message['models']),self.STATE_BYTES))
+               _weight((candidates,global_choices,models),self.STATE_BYTES))
         pending_alerts={};changed=set()
         retention=self._admit(sessions=sessions,overlays=overlays,overlay=overlay,
-                              pending_alerts=pending_alerts,changed=changed,extra=extra)
+            pending_alerts=pending_alerts,changed=changed,global_choices=global_choices,global_models=models,extra=extra)
         self.sessions=sessions;self.overlays=overlays;self.internal_count=internal
+        self.global_choices=global_choices;self.global_models=models;self._choices_dirty=False
         self.overlay=overlay;self._retention=retention
         self.sequence=sequence
         self.sent_token=self.token
-        self.changed=changed;self.pending_alerts=pending_alerts
+        self.changed=changed;self.pending_alerts=pending_alerts;self._projection_dirty=False
         return message
+
+    def publish_pages(self,snapshot,store,speeds=None):
+        """Deliver one admitted result through bounded, atomically consumed fragments."""
+        from .analysis_engine import retained_bytes
+
+        message=self.publish(snapshot,store,speeds)
+        arrays=('sessions','overlay_sessions','removed','model_candidates','cache_candidates','models')
+        metadata={key:value for key,value in message.items()
+                  if key not in (*arrays,'filter_choices','protocol','sequence','reset')}
+        minimal={key:value for key,value in metadata.items()
+                 if key in ('epoch','prepared_token','data_revision','call_revision','aggregate_request')}
+        def packet(number,first):
+            return dict(metadata if first else minimal,protocol=2,sequence=number,
+                reset=bool(first and message['reset']),more=True,sessions=[],overlay_sessions=[],
+                removed=[],model_candidates=[],cache_candidates=[])
+        def parts():
+            for name in arrays:
+                if name not in message:continue
+                if not message[name] and name=='models':yield name,None,[]
+                for value in message[name]:yield name,None,value
+            for name,values in message.get('filter_choices',{}).items():
+                if isinstance(values,list):
+                    if not values:yield 'filter_choices',name,[]
+                    for value in values:yield 'filter_choices',name,[value]
+                elif name=='project_paths':
+                    if not values:yield 'filter_choices',name,{}
+                    for project,paths in values.items():
+                        if not paths:yield 'filter_choices',name,{project:[]}
+                        for path in paths:yield 'filter_choices',name,{project:[path]}
+                elif isinstance(values,dict):
+                    if not values:yield 'filter_choices',name,{}
+                    for key,value in values.items():yield 'filter_choices',name,{key:value}
+                else:yield 'filter_choices',name,values
+        def append(target,name,key,value):
+            if name=='filter_choices':
+                choices=target.setdefault(name,{})
+                if isinstance(value,list):choices.setdefault(key,[]).extend(value)
+                elif key=='project_paths':
+                    paths=choices.setdefault(key,{})
+                    for project,items in value.items():paths.setdefault(project,[]).extend(items)
+                elif isinstance(value,dict):choices.setdefault(key,{}).update(value)
+                else:choices[key]=value
+            elif name=='models':
+                target.setdefault(name,[]).extend(value if value==[] else [value])
+            else:target[name].append(value)
+        def admitted(value):
+            size=retained_bytes(dict(kind='snapshot',value=value),store.limits.page_objects_bytes)
+            if size>store.limits.page_objects_bytes:
+                raise CapacityExceeded('one publication fragment exceeds the delivered-page budget')
+            return size
+
+        first=True
+        current=packet(message['sequence'],True)
+        size=retained_bytes(dict(kind='snapshot',value=current),sys.maxsize);count=0
+        for name,key,value in parts():
+            part={name:{key:value}} if name=='filter_choices' else {name:[value]}
+            weight=_weight(part,sys.maxsize)
+            if count and (count>=store.limits.page_rows or size+weight>store.limits.page_objects_bytes):
+                admitted(current)
+                self.sequence=current['sequence']
+                yield current
+                first=False
+                current=packet(self.sequence+1,False)
+                size=retained_bytes(dict(kind='snapshot',value=current),sys.maxsize);count=0
+            if not count:
+                candidate=packet(current['sequence'],first)
+                append(candidate,name,key,value)
+                actual=retained_bytes(dict(kind='snapshot',value=candidate),sys.maxsize)
+                if actual>store.limits.page_objects_bytes and first:
+                    admitted(current)
+                    self.sequence=current['sequence']
+                    yield current
+                    first=False
+                    candidate=packet(self.sequence+1,False)
+                    append(candidate,name,key,value)
+                size=admitted(candidate)
+                current=candidate
+            else:
+                append(current,name,key,value)
+                size+=weight
+            count+=1
+        current['more']=False
+        admitted(current)
+        self.sequence=current['sequence']
+        yield current

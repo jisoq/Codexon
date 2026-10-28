@@ -694,10 +694,11 @@ def test_rendered_confirmation_cancel_then_update_preserves_exact_offer(tmp_path
     app=QApplication.instance() or QApplication([]);i18n.set_language(language)
     calls=[];checks=[]
     plan=dict(kind='app',release=dict(tag_name='v2099.01.01.1'))
+    previous=dict(kind='app',release=dict(tag_name='v2098.01.01.1'))
     monkeypatch.setattr(UpdatePanel,'recover',lambda self:None)
     monkeypatch.setattr(restart,'capture',lambda:dict(phase='authorized',targets=[]))
     monkeypatch.setattr(app_update,'update',lambda *a,**kw:calls.append(kw) or 'queued')
-    monkeypatch.setattr(app_update,'check_update',lambda *a,**kw:checks.append(kw['release']) or plan)
+    monkeypatch.setattr(app_update,'check_update',lambda *a,**kw:checks.append(True) or plan)
     panel=UpdatePanel(SimpleNamespace(directory=tmp_path/'updates'))
     host=QuickHost();host.resize(520,300);host.setCentralWidget(panel);host.show()
     def wait(predicate):
@@ -712,12 +713,12 @@ def test_rendered_confirmation_cancel_then_update_preserves_exact_offer(tmp_path
         assert window.quick.rect().contains(point)
         QTest.mouseClick(window.quick,Qt.LeftButton,pos=point)
     try:
-        if discovered:panel.release_discovered(plan['release'])
-        else:panel.show_plan(plan)
+        if discovered:panel.release_discovered(previous['release'])
+        else:panel.show_plan(previous)
         click(host,panel.execute)
         wait(lambda:panel._restart_confirmation is not None)
         dialog=panel._restart_confirmation
-        assert not calls and bool(checks)==discovered
+        assert not calls and checks==[True] and panel.offer is plan
         wait(lambda:dialog.host.quick.isVisible())
         output=Path(__file__).resolve().parents[1]/'artifacts/update-restart/implementation-checks'
         output.mkdir(parents=True,exist_ok=True)
@@ -733,7 +734,7 @@ def test_rendered_confirmation_cancel_then_update_preserves_exact_offer(tmp_path
         dialog=panel._restart_confirmation
         click(dialog.host,dialog.confirm)
         wait(lambda:panel.operation is None and len(calls)==1)
-        assert calls[0]['plan'] is plan and calls[0]['consent']['phase']=='authorized'
+        assert calls[0]['plan'] is plan and calls[0]['consent']['phase']=='authorized' and checks==[True,True]
     finally:
         if panel._restart_confirmation:panel._restart_confirmation.reject();app.processEvents()
         panel.stop()

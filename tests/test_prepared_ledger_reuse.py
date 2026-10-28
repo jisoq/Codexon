@@ -1,5 +1,5 @@
 """Exact prepared owner reuse never substitutes for mutable quota progress."""
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, nullcontext
 from threading import Event
 
 import pytest
@@ -10,7 +10,7 @@ from cachemonitor import quota_prepared_sync as progress
 from cachemonitor.quota_cycles import QuotaLedger
 
 
-def _publish(store, number, changes, *, removed=(), order=None, malformed=False):
+def _publish(store, number, changes, *, removed=(), order=None, malformed=False, source_metadata=None):
     stage = store.begin(('source', number))
     for ordinal, (sid, revision) in enumerate(changes.items()):
         owner = ('home', sid)
@@ -19,6 +19,7 @@ def _publish(store, number, changes, *, removed=(), order=None, malformed=False)
                             call_count=1, speed_frontier=1)
         metadata = dict(home='home', id=sid, title=f'{sid}-{revision}', _internal_review=False,
                         custom={'values': [revision]})
+        metadata.update((source_metadata or {}).get(sid, {}))
         stage.owner(*owner, metadata, dependencies, source_ordinal=ordinal,
                     request_maps=('turn_records',))
         stage.calls(owner, [dict(key=sid+'-call', ts=100, session_ordinal=1, turn='turn',
@@ -262,3 +263,473 @@ def test_different_store_instance_never_reuses_equal_batch_number(tmp_path):
         sources,_=adapter._sources()
         assert sources[('home','first')]['title'] == 'first-2'
         assert adapter.metrics['metadata_reads'] == 2
+
+
+
+def test_certificate_population_does_not_refuse_authoritative_facts(tmp_path, monkeypatch):
+    monkeypatch.setattr(progress, 'MAX_BYTES', 1024, raising=False)
+    owners = [('home', 'first'), ('home', 'second')]
+    with closing(QuotaLedger(tmp_path/'quota.sqlite')) as ledger, storage.PreparedStore(tmp_path/'prepared.sqlite') as store:
+        _publish(store, 1, {'first': 1, 'second': 2})
+        adapter = delivery.PreparedLedger(ledger, store)
+        _, expected = adapter._sources()
+        updates = list(adapter.sync(_envelope()))
+        assert {owner for update in updates for owner in update['owners']} == set(owners)
+        assert progress.applied(ledger.db, owners) == expected
+        assert [tuple(row) for row in ledger.db.execute('SELECT sid,cost FROM calls ORDER BY sid')] == [
+            ('first', .1), ('second', .2)]
+        assert [tuple(row) for row in ledger.db.execute(
+            'SELECT uid,started FROM tracking_call_boundaries ORDER BY uid')] == [
+            ('first-call', 90), ('second-call', 90)]
+        assert list(adapter.sync(_envelope(201)))[0]['owners'] == ()
+        assert progress.applied(ledger.db, owners) == expected
+
+
+def test_legacy_certificate_budget_is_removed_without_losing_valid_progress(tmp_path):
+    owners = [('home', 'first'), ('home', 'second')]
+    with closing(QuotaLedger(tmp_path/'quota.sqlite')) as ledger, storage.PreparedStore(tmp_path/'prepared.sqlite') as store:
+        _publish(store, 1, {'first': 1})
+        adapter = delivery.PreparedLedger(ledger, store)
+        list(adapter.sync(_envelope()))
+        committed = progress.applied(ledger.db, owners)
+        ledger.db.execute('CREATE TABLE IF NOT EXISTS prepared_analysis_budget(id INTEGER PRIMARY KEY,bytes INTEGER NOT NULL)')
+        ledger.db.execute('INSERT OR REPLACE INTO prepared_analysis_budget VALUES(1,548)')
+        for name in ('prepared_applied_admit', 'prepared_applied_insert', 'prepared_applied_delete'):
+            ledger.db.execute(f'DROP TRIGGER IF EXISTS {name}')
+        ledger.db.execute("CREATE TRIGGER prepared_applied_admit BEFORE INSERT ON prepared_analysis_applied BEGIN "
+            "SELECT CASE WHEN (SELECT bytes FROM prepared_analysis_budget WHERE id=1)"
+            "+(512+4*length(new.home)+4*length(new.sid))>1024 "
+            "THEN RAISE(ABORT,'prepared ledger progress exceeds its metadata budget') END; END")
+        ledger.db.execute('CREATE TRIGGER prepared_applied_insert AFTER INSERT ON prepared_analysis_applied BEGIN '
+            'UPDATE prepared_analysis_budget SET bytes=bytes+(512+4*length(new.home)+4*length(new.sid)) WHERE id=1; END')
+        ledger.db.execute('CREATE TRIGGER prepared_applied_delete AFTER DELETE ON prepared_analysis_applied BEGIN '
+            'UPDATE prepared_analysis_budget SET bytes=bytes-(512+4*length(old.home)+4*length(old.sid)) WHERE id=1; END')
+        ledger.db.commit()
+        progress.initialize(ledger.db)
+        progress.initialize(ledger.db)
+        assert progress.applied(ledger.db, owners) == committed
+        assert ledger.db.execute("SELECT name FROM sqlite_master WHERE name IN "
+            "('prepared_analysis_budget','prepared_applied_admit','prepared_applied_insert','prepared_applied_delete')").fetchall() == []
+        _publish(store, 2, {'second': 2})
+        list(adapter.sync(_envelope(201)))
+        _, expected = adapter._sources()
+        assert progress.applied(ledger.db, owners) == expected
+        assert ledger.db.execute('SELECT count(*) FROM calls').fetchone()[0] == 2
+        assert ledger.db.execute('SELECT count(*) FROM tracking_call_boundaries').fetchone()[0] == 2
+
+
+def test_certificate_failure_rolls_back_candidate_facts_and_preserves_previous_owner(tmp_path, monkeypatch):
+    import sqlite3
+
+    owners = [('home', 'first'), ('home', 'second')]
+    path = tmp_path/'quota.sqlite'
+    with closing(QuotaLedger(path)) as ledger, storage.PreparedStore(tmp_path/'prepared.sqlite') as store:
+        _publish(store, 1, {'first': 1})
+        adapter = delivery.PreparedLedger(ledger, store)
+        list(adapter.sync(_envelope()))
+        committed = progress.applied(ledger.db, owners)
+        _publish(store, 2, {'second': 2})
+        original = progress.save
+        def fail_after_certificate(db, certificates):
+            original(db, certificates)
+            assert db.execute("SELECT count(*) FROM calls WHERE sid='second'").fetchone()[0] == 1
+            assert db.execute("SELECT count(*) FROM tracking_call_boundaries WHERE uid='second-call'").fetchone()[0] == 1
+            assert progress.applied(db, [('home', 'second')]) == certificates
+            raise RuntimeError('injected interruption before commit')
+        with monkeypatch.context() as interrupted:
+            interrupted.setattr(progress, 'save', fail_after_certificate)
+            with pytest.raises(RuntimeError, match='injected interruption'):
+                list(adapter.sync(_envelope(201)))
+        assert ledger.db.in_transaction
+        with closing(sqlite3.connect(path)) as reader:
+            assert reader.execute('SELECT sid FROM calls').fetchall() == [('first',)]
+            assert reader.execute('SELECT uid FROM tracking_call_boundaries').fetchall() == [('first-call',)]
+            assert dict(((home, sid), stamp) for home, sid, stamp in reader.execute(
+                'SELECT home,sid,signature FROM prepared_analysis_applied')) == committed
+        ledger.db.rollback()
+        assert progress.applied(ledger.db, owners) == committed
+        assert ledger.db.execute('SELECT count(*) FROM calls').fetchone()[0] == 1
+        adapter = delivery.PreparedLedger(ledger, store)
+        list(adapter.sync(_envelope(202)))
+        _, expected = adapter._sources()
+        assert progress.applied(ledger.db, owners) == expected
+        assert ledger.db.execute('SELECT count(*) FROM calls').fetchone()[0] == 2
+
+
+@pytest.mark.parametrize('certificate', [None, '0'*64])
+def test_sync_requires_positive_postcommit_certificate_confirmation(tmp_path, monkeypatch, certificate):
+    with closing(QuotaLedger(tmp_path/'quota.sqlite')) as ledger, storage.PreparedStore(tmp_path/'prepared.sqlite') as store:
+        _publish(store, 1, {'first': 1})
+        adapter = delivery.PreparedLedger(ledger, store)
+        original = progress.save
+        def lose_certificate(db, certificates):
+            if certificate is not None:
+                original(db, {owner: certificate for owner in certificates})
+        monkeypatch.setattr(progress, 'save', lose_certificate)
+        with pytest.raises(ValueError, match='unconfirmed or older recovery owners'):
+            next(adapter.sync(_envelope()))
+        assert not ledger.db.in_transaction
+        assert ledger.db.execute('SELECT count(*) FROM calls').fetchone()[0] == 1
+        assert ledger.db.execute('SELECT count(*) FROM tracking_call_boundaries').fetchone()[0] == 1
+        assert adapter.metrics['applied_owners'] == 0
+
+
+@pytest.mark.parametrize('mutation', [
+    "UPDATE calls SET cost=99 WHERE sid='first'",
+    "DELETE FROM calls WHERE sid='first'",
+    "INSERT OR REPLACE INTO calls SELECT home,uid,'second',ts,model,input,cached,written,output,reasoning,cost,price_id,signature,service_tier FROM calls WHERE sid='first'",
+    "UPDATE tracking_call_boundaries SET started=80 WHERE uid='first-call'",
+    "DELETE FROM tracking_call_boundaries WHERE uid='first-call'",
+    "INSERT OR REPLACE INTO tracking_call_boundaries VALUES('home','first-call',80)",
+])
+def test_certificate_invalidation_survives_budget_migration(tmp_path, mutation):
+    owner = ('home', 'first')
+    with closing(QuotaLedger(tmp_path/'quota.sqlite')) as ledger, storage.PreparedStore(tmp_path/'prepared.sqlite') as store:
+        _publish(store, 1, {'first': 1})
+        adapter = delivery.PreparedLedger(ledger, store)
+        list(adapter.sync(_envelope()))
+        progress.initialize(ledger.db)
+        assert owner in progress.applied(ledger.db, [owner])
+        ledger.db.execute(mutation)
+        ledger.db.commit()
+        assert progress.applied(ledger.db, [owner]) == {}
+
+
+def test_append_still_requires_exact_committed_certificate(tmp_path):
+    owner = ('home', 'first')
+    with closing(QuotaLedger(tmp_path/'quota.sqlite')) as ledger, storage.PreparedStore(tmp_path/'prepared.sqlite') as store:
+        _publish(store, 1, {'first': 1})
+        adapter = delivery.PreparedLedger(ledger, store)
+        list(adapter.sync(_envelope()))
+        committed = progress.applied(ledger.db, [owner])
+        with pytest.raises(progress.AppendPredecessorChanged):
+            progress.require_append(ledger.db, {owner: dict(
+                format=progress.APPEND_FORMAT, count=1, prior_source='0'*64, policy=(None, None))})
+        ledger.db.rollback()
+        assert progress.applied(ledger.db, [owner]) == committed
+        assert ledger.db.execute('SELECT cost FROM calls').fetchone()[0] == .1
+
+
+
+@pytest.mark.parametrize('owner_count', [4, 64])
+def test_source_population_fits_when_each_owner_and_application_cohort_fit(tmp_path, monkeypatch, owner_count):
+    allowance = 64*1024
+    changes = {f'owner-{number:03d}': number+1 for number in range(owner_count)}
+    owners = [('home', sid) for sid in changes]
+    metadata = {sid: dict(unclassified=number%3 == 0,
+        coverage_gaps=[dict(start=95, end=96, tokens=number+10)] if number%5 == 0 else [])
+        for number, sid in enumerate(changes)}
+    expected_issues = sorted(
+        [(sid, 90, 100) for number, sid in enumerate(changes) if number%3 == 0] +
+        [(sid, 95, 96) for number, sid in enumerate(changes) if number%5 == 0])
+    monkeypatch.setattr(delivery, 'OWNER_BATCH', 4)
+    with storage.PreparedStore(tmp_path/'prepared.sqlite') as store:
+        _publish(store, 1, changes, source_metadata=metadata)
+        expected_certificates = {}
+        with store.read_current() as view:
+            for owner in owners:
+                entry = view.ledger_source(*owner)
+                assert delivery._weight(entry, allowance) < allowance//8
+                expected_certificates[owner] = progress.source_stamp(entry['dependencies'])
+        results = []
+        for label, limit in [('control', delivery.METADATA_BYTES), ('small', allowance)]:
+            with closing(QuotaLedger(tmp_path/(label+'.sqlite'))) as ledger, monkeypatch.context() as bounded:
+                bounded.setattr(delivery, 'METADATA_BYTES', limit)
+                adapter = delivery.PreparedLedger(ledger, store)
+                for owner in owners:
+                    _, weight = adapter._owner(owner, delivery.FACT_BYTES)
+                    assert weight < allowance//8
+                updates = list(adapter.sync(_envelope()))
+                assert {owner for update in updates for owner in update['owners']} == set(owners)
+                calls = [tuple(row) for row in ledger.db.execute(
+                    'SELECT sid,uid,cost FROM calls ORDER BY sid')]
+                assert calls == [(sid, sid+'-call', .1*revision) for sid, revision in changes.items()]
+                certificates = progress.applied(ledger.db, owners)
+                assert certificates == expected_certificates
+                boundaries = [tuple(row) for row in ledger.db.execute(
+                    'SELECT uid,started FROM tracking_call_boundaries ORDER BY uid')]
+                assert boundaries == [(sid+'-call', 90) for sid in changes]
+                issues = [tuple(row) for row in ledger.db.execute(
+                    'SELECT sid,start,end FROM coverage_issues ORDER BY sid,start,end')]
+                assert issues == expected_issues
+                state = tuple(ledger.db.execute(
+                    "SELECT at,complete_at,loading,unclassified FROM state WHERE home='home'").fetchone())
+                assert state == (200, 200, 0, sum(number%3 == 0 for number in range(owner_count)))
+                results.append((calls, certificates, boundaries, issues, state))
+        assert results[0] == results[1]
+
+
+
+@pytest.mark.parametrize('interruption', ['before', 'during', 'final'])
+def test_coverage_interruption_retains_watermark_and_calls_until_exact_restart(tmp_path, monkeypatch, interruption):
+    import sqlite3
+
+    stopped = Event()
+    path = tmp_path/'quota.sqlite'
+    names = [f'owner-{number:03d}' for number in range(8)]
+    retired = ('home', 'retained')
+    monkeypatch.setattr(delivery, 'OWNER_BATCH', 4)
+    with storage.PreparedStore(tmp_path/'prepared.sqlite') as store:
+        with closing(QuotaLedger(path)) as ledger:
+            _publish(store, 1, {sid: 1 for sid in names[:4]+['retained']},
+                     source_metadata={names[0]: dict(unclassified=True)})
+            adapter = delivery.PreparedLedger(ledger, store, cancel=stopped.is_set)
+            list(adapter.sync(_envelope()))
+            _publish(store, 2, {sid: 2 for sid in names}, removed=['retained'],
+                     source_metadata={sid: dict(unclassified=number%2 == 1)
+                                      for number, sid in enumerate(names)})
+            if interruption == 'during':
+                ledger.db.execute("CREATE TEMP TRIGGER interrupt_coverage BEFORE INSERT ON main.coverage_issues "
+                    "WHEN new.sid='owner-003' BEGIN SELECT RAISE(ABORT,'injected coverage interruption'); END")
+            elif interruption == 'final':
+                ledger.db.execute("CREATE TEMP TRIGGER interrupt_completion BEFORE UPDATE ON main.state "
+                    "WHEN new.complete_at=201 BEGIN SELECT RAISE(ABORT,'injected completion interruption'); END")
+            updates = adapter.sync(_envelope(201), removed=[retired])
+            if interruption == 'before':
+                applied = set()
+                while applied != {('home', sid) for sid in names}:
+                    applied.update(next(updates)['owners'])
+                stopped.set()
+                with pytest.raises(storage.ReadCancelled):
+                    list(updates)
+            else:
+                with pytest.raises(sqlite3.IntegrityError, match='injected'):
+                    list(updates)
+            ledger.db.rollback()
+            with closing(sqlite3.connect(path)) as reader:
+                state = reader.execute("SELECT complete_at,loading,unclassified FROM state WHERE home='home'").fetchone()
+                assert state == (200, int(interruption != 'before'), 1)
+                assert reader.execute('SELECT sid,cost FROM calls ORDER BY sid').fetchall() == [
+                    *[(sid, .2) for sid in names], ('retained', .1)]
+                assert reader.execute("SELECT uid FROM tracking_call_boundaries WHERE uid='retained-call'").fetchone()
+        stopped.clear()
+        with closing(QuotaLedger(path)) as ledger:
+            adapter = delivery.PreparedLedger(ledger, store, cancel=stopped.is_set)
+            list(adapter.sync(_envelope(201), removed=[retired]))
+            assert tuple(ledger.db.execute(
+                "SELECT complete_at,loading,unclassified FROM state WHERE home='home'").fetchone()) == (201, 0, 4)
+            assert [tuple(row) for row in ledger.db.execute('SELECT sid,start,end FROM coverage_issues ORDER BY sid')] == [
+                (sid, 90, 100) for number, sid in enumerate(names) if number%2 == 1]
+            assert ledger.db.execute('SELECT count(*) FROM calls').fetchone()[0] == 9
+            assert ledger.db.execute("SELECT cost FROM calls WHERE sid='retained'").fetchone()[0] == .1
+            assert progress.applied(ledger.db, [retired]) == {}
+            with store.read_current() as view:
+                expected = {('home', sid): progress.source_stamp(view.owner('home', sid)['dependencies']) for sid in names}
+            assert progress.applied(ledger.db, expected) == expected
+
+
+@pytest.mark.parametrize('pending_work', ['retirement', 'coverage'])
+def test_runtime_progress_can_interrupt_pending_retirements_and_coverage(tmp_path, monkeypatch, pending_work):
+    names = [f'owner-{number:03d}' for number in range(5)]
+    keys = {('home', sid) for sid in names}
+    monkeypatch.setattr(delivery, 'OWNER_BATCH', 2)
+    monkeypatch.setattr(QuotaLedger, 'SYNC_BATCH_ROWS', 2)
+    with storage.PreparedStore(tmp_path/'prepared.sqlite') as store, closing(QuotaLedger(tmp_path/'quota.sqlite')) as ledger:
+        _publish(store, 1, {sid: 1 for sid in names})
+        adapter = delivery.PreparedLedger(ledger, store)
+        list(adapter.sync(_envelope()))
+        pending_removed = keys.copy() if pending_work == 'retirement' else set()
+        _publish(store, 2, {} if pending_removed else {sid: 2 for sid in names},
+                 removed=names if pending_removed else (),
+                 source_metadata={sid: dict(unclassified=True) for sid in names})
+        updates = adapter.sync(_envelope(201), removed=pending_removed)
+        interrupted = False
+        try:
+            for batch in updates:
+                pending_removed.difference_update(batch['retired'])
+                if not batch['remaining']:
+                    continue
+                notification_ready = (bool(batch['retired']) if pending_work == 'retirement' else
+                    ledger.db.execute("SELECT loading FROM state WHERE home='home'").fetchone()[0])
+                if notification_ready:
+                    interrupted = True
+                    break
+        finally:
+            updates.close()
+
+        assert interrupted
+        assert tuple(ledger.db.execute(
+            "SELECT complete_at,loading,unclassified FROM state WHERE home='home'").fetchone()) == (
+                200, int(pending_work == 'coverage'), 0)
+        assert ledger.db.execute('SELECT count(*) FROM coverage_issues').fetchone()[0] == (
+            2 if pending_work == 'coverage' else 0)
+        assert [tuple(row) for row in ledger.db.execute('SELECT sid,cost FROM calls ORDER BY sid')] == [
+            (sid, .2 if pending_work == 'coverage' else .1) for sid in names]
+        assert len(progress.applied(ledger.db, keys)) == (3 if pending_work == 'retirement' else 5)
+
+        adapter = delivery.PreparedLedger(ledger, store)
+        resumed = list(adapter.sync(_envelope(201), removed=pending_removed))
+        assert resumed[-1]['remaining'] == 0
+        assert all(batch['remaining'] for batch in resumed[:-1])
+        assert tuple(ledger.db.execute(
+            "SELECT complete_at,loading,unclassified FROM state WHERE home='home'").fetchone()) == (
+                201, 0, 5 if pending_work == 'coverage' else 0)
+        assert ledger.db.execute('SELECT count(*) FROM calls').fetchone()[0] == 5
+        assert ledger.db.execute('SELECT count(*) FROM coverage_issues').fetchone()[0] == (
+            5 if pending_work == 'coverage' else 0)
+        assert len(progress.applied(ledger.db, keys)) == (0 if pending_work == 'retirement' else 5)
+
+
+def test_pending_owner_retains_issues_and_calls_during_complete_coverage_reconciliation(tmp_path):
+    owner = ('home', 'pending')
+    with closing(QuotaLedger(tmp_path/'quota.sqlite')) as ledger, storage.PreparedStore(tmp_path/'prepared.sqlite') as store:
+        _publish(store, 1, {'pending': 1, 'ready': 1}, source_metadata={'pending': dict(unclassified=True)})
+        adapter = delivery.PreparedLedger(ledger, store)
+        list(adapter.sync(_envelope()))
+        previous = progress.applied(ledger.db, [owner])
+        _publish(store, 2, {'pending': 2, 'ready': 2}, source_metadata={
+            'pending': dict(_collection_pending=True, unclassified=False),
+            'ready': dict(coverage_gaps=[dict(start=95, end=96, tokens=10)])})
+        list(adapter.sync(_envelope(201)))
+        assert progress.applied(ledger.db, [owner]) == previous
+        assert ledger.db.execute("SELECT cost FROM calls WHERE sid='pending'").fetchone()[0] == .1
+        assert ledger.db.execute("SELECT cost FROM calls WHERE sid='ready'").fetchone()[0] == .2
+        assert [tuple(row) for row in ledger.db.execute('SELECT sid,start,end FROM coverage_issues ORDER BY sid')] == [
+            ('pending', 90, 100), ('ready', 95, 96)]
+        assert tuple(ledger.db.execute(
+            "SELECT complete_at,loading,unclassified FROM state WHERE home='home'").fetchone()) == (201, 0, 1)
+
+
+def test_older_recovery_heartbeat_cannot_reconcile_newer_coverage(tmp_path):
+    with closing(QuotaLedger(tmp_path/'quota.sqlite')) as ledger, storage.PreparedStore(tmp_path/'prepared.sqlite') as store:
+        _publish(store, 1, {'first': 1}, source_metadata={'first': dict(unclassified=True)})
+        adapter = delivery.PreparedLedger(ledger, store)
+        list(adapter.sync(_envelope()))
+        _publish(store, 2, {'first': 1}, source_metadata={'first': dict(unclassified=False)})
+        before = [tuple(row) for row in ledger.db.execute('SELECT * FROM coverage_issues')]
+        list(adapter.sync(dict(_envelope(199), collection_recovery=True)))
+        assert [tuple(row) for row in ledger.db.execute('SELECT * FROM coverage_issues')] == before
+        assert tuple(ledger.db.execute(
+            "SELECT at,complete_at,loading,unclassified FROM state WHERE home='home'").fetchone()) == (200, 200, 0, 1)
+
+
+
+def test_fresh_recovery_continues_owner_cohorts_after_its_own_tracking_activity(tmp_path, monkeypatch):
+    monkeypatch.setattr(delivery, 'OWNER_BATCH', 4)
+    names = [f'owner-{number:03d}' for number in range(12)]
+    with closing(QuotaLedger(tmp_path/'quota.sqlite')) as ledger, storage.PreparedStore(tmp_path/'prepared.sqlite') as store:
+        ledger.db.execute("INSERT INTO tracking_config VALUES('home',50)")
+        ledger.db.execute("INSERT INTO tracking_controls VALUES('home',50,1)")
+        ledger.db.commit()
+        _publish(store, 1, {sid: 1 for sid in names})
+        adapter = delivery.PreparedLedger(ledger, store)
+        list(adapter.sync(_envelope()))
+        _publish(store, 2, {sid: 2 for sid in names})
+        updates = list(adapter.sync(dict(_envelope(201), collection_recovery=True)))
+        assert {owner for update in updates for owner in update['owners']} == {('home', sid) for sid in names}
+        assert [tuple(row) for row in ledger.db.execute('SELECT sid,cost FROM calls ORDER BY sid')] == [(sid, .2) for sid in names]
+        assert ledger.db.execute('SELECT count(*) FROM tracking_tasks').fetchone()[0] == len(names)
+        assert tuple(ledger.db.execute("SELECT at,complete_at,loading FROM state WHERE home='home'").fetchone()) == (201, 201, 0)
+        assert tuple(ledger.db.execute("SELECT at,complete FROM tracking_health WHERE home='home'").fetchone()) == (201, 1)
+        with store.read_current() as view:
+            expected = {('home', sid): progress.source_stamp(view.owner('home', sid)['dependencies']) for sid in names}
+        assert progress.applied(ledger.db, expected) == expected
+
+
+@pytest.mark.parametrize('reopen', [False, True], ids=['same-adapter', 'reopened'])
+@pytest.mark.parametrize('interruption', ['owners', 'coverage'])
+def test_recovery_resumes_same_envelope_after_durable_interruption(tmp_path, monkeypatch, interruption, reopen):
+    monkeypatch.setattr(delivery, 'OWNER_BATCH', 4)
+    monkeypatch.setattr(QuotaLedger, 'SYNC_BATCH_ROWS', 2)
+    names = [f'owner-{number:03d}' for number in range(12)]
+    path = tmp_path/'quota.sqlite'
+    with closing(QuotaLedger(path)) as ledger, storage.PreparedStore(tmp_path/'prepared.sqlite') as store:
+        ledger.db.execute("INSERT INTO tracking_config VALUES('home',50)")
+        ledger.db.execute("INSERT INTO tracking_controls VALUES('home',50,1)")
+        ledger.db.commit()
+        _publish(store, 1, {sid: 1 for sid in names})
+        adapter = delivery.PreparedLedger(ledger, store)
+        list(adapter.sync(_envelope()))
+        _publish(store, 2, {sid: 2 for sid in names},
+                 source_metadata={sid: dict(unclassified=True) for sid in names})
+        recovery = dict(_envelope(201), collection_recovery=True, request_activity=[
+            dict(home='home', attempt='recovery-request', ts=195, request_observed_at=195,
+                 completed_observed_at=201, status='completed')])
+        updates = adapter.sync(recovery)
+        applied = set()
+        interrupted = False
+        try:
+            for batch in updates:
+                applied.update(owner[1] for owner in batch['owners'])
+                if not batch['remaining']:
+                    continue
+                loading = ledger.db.execute("SELECT loading FROM state WHERE home='home'").fetchone()[0]
+                if (interruption == 'owners' and batch['owners']) or (interruption == 'coverage' and loading):
+                    interrupted = True
+                    break
+        finally:
+            updates.close()
+        assert interrupted
+        assert len(applied) == (4 if interruption == 'owners' else len(names))
+        assert tuple(ledger.db.execute(
+            "SELECT at,complete_at,loading,unclassified FROM state WHERE home='home'").fetchone()) == (
+                200, 200, int(interruption == 'coverage'), 0)
+        assert ledger.db.execute('SELECT count(*) FROM coverage_issues').fetchone()[0] == (
+            2 if interruption == 'coverage' else 0)
+        assert [tuple(row) for row in ledger.db.execute('SELECT sid,cost FROM calls ORDER BY sid')] == [
+            (sid, .2 if sid in applied else .1) for sid in names]
+        assert tuple(ledger.db.execute(
+            "SELECT start,end,status FROM tracking_wire WHERE identity='recovery-request'").fetchone()) == (
+                195, 201, 'completed')
+
+        if reopen:
+            ledger.close()
+        with (closing(QuotaLedger(path)) if reopen else nullcontext(ledger)) as resumed:
+            if reopen:
+                adapter = delivery.PreparedLedger(resumed, store)
+            batches = list(adapter.sync(recovery))
+            assert batches[-1]['remaining'] is False
+            assert all(batch['remaining'] is True for batch in batches[:-1])
+            assert [tuple(row) for row in resumed.db.execute('SELECT sid,cost FROM calls ORDER BY sid')] == [
+                (sid, .2) for sid in names]
+            assert [tuple(row) for row in resumed.db.execute(
+                'SELECT sid,start,end FROM coverage_issues ORDER BY sid')] == [(sid, 90, 100) for sid in names]
+            assert resumed.db.execute('SELECT count(*) FROM tracking_tasks').fetchone()[0] == len(names)
+            assert tuple(resumed.db.execute(
+                "SELECT start,end,status FROM tracking_wire WHERE identity='recovery-request'").fetchone()) == (
+                    195, 201, 'completed')
+            assert tuple(resumed.db.execute(
+                "SELECT at,complete_at,loading,unclassified FROM state WHERE home='home'").fetchone()) == (
+                    201, 201, 0, len(names))
+            assert tuple(resumed.db.execute(
+                "SELECT at,complete FROM tracking_health WHERE home='home'").fetchone()) == (201, 1)
+            with store.read_current() as view:
+                expected = {('home', sid): progress.source_stamp(view.owner('home', sid)['dependencies']) for sid in names}
+            assert progress.applied(resumed.db, expected) == expected
+
+
+@pytest.mark.parametrize('newer', ['coverage', 'activity'])
+def test_recovery_cohort_cannot_overwrite_newer_state_committed_during_plan(tmp_path, monkeypatch, newer):
+    import sqlite3
+
+    monkeypatch.setattr(delivery, 'OWNER_BATCH', 4)
+    names = [f'owner-{number:03d}' for number in range(12)]
+    path = tmp_path/'quota.sqlite'
+    with closing(QuotaLedger(path)) as ledger, storage.PreparedStore(tmp_path/'prepared.sqlite') as store:
+        ledger.db.execute("INSERT INTO tracking_config VALUES('home',50)")
+        ledger.db.execute("INSERT INTO tracking_controls VALUES('home',50,1)")
+        ledger.db.commit()
+        _publish(store, 1, {sid: 1 for sid in names})
+        adapter = delivery.PreparedLedger(ledger, store)
+        list(adapter.sync(_envelope()))
+        _publish(store, 2, {sid: 2 for sid in names})
+        updates = adapter.sync(dict(_envelope(201), collection_recovery=True))
+        first = next(updates)
+        applied = {owner[1] for owner in first['owners']}
+        assert len(applied) == 4
+        with sqlite3.connect(path) as writer:
+            if newer == 'coverage':
+                writer.execute("UPDATE state SET at=202,complete_at=202,loading=0,unclassified=99 WHERE home='home'")
+            else:
+                writer.execute("UPDATE tracking_health SET at=202,complete=0 WHERE home='home'")
+        with pytest.raises(ValueError, match='unconfirmed|newer|recovery'):
+            list(updates)
+        ledger.db.rollback()
+        assert tuple(ledger.db.execute(
+            "SELECT at,complete_at,loading,unclassified FROM state WHERE home='home'").fetchone()) == (
+                (202, 202, 0, 99) if newer == 'coverage' else (200, 200, 0, 0))
+        if newer == 'activity':
+            assert tuple(ledger.db.execute(
+                "SELECT at,complete FROM tracking_health WHERE home='home'").fetchone()) == (202, 0)
+        assert [tuple(row) for row in ledger.db.execute('SELECT sid,cost FROM calls ORDER BY sid')] == [
+            (sid, .2 if sid in applied else .1) for sid in names]

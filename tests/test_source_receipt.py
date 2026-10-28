@@ -3,7 +3,7 @@ import subprocess
 import pytest
 
 from tools import source_receipt
-from tools.verify_changes import CORE_TESTS
+from tools.verify_changes import basic_tests
 
 SHA = 'a' * 40
 WORKFLOW = """env:
@@ -37,7 +37,7 @@ def root(tmp_path):
 
 def planned(root, args=('--full',), affected=()):
     return dict(source_environment=source_receipt.environment_key(root), commit=SHA,
-                source_base='', tests=sorted(CORE_TESTS) if '--basic' in args else ['tests'], source_args=list(args), scales=False,
+                source_base='', tests=list(basic_tests()) if '--basic' in args else ['tests'], source_args=list(args), scales=False,
                 affected_tests=list(affected),
                 source_suite=source_receipt.coverage_suite(args, affected))
 

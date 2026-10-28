@@ -27,7 +27,7 @@ if str(ROOT) not in sys.path:
 REPORTS = ROOT / 'artifacts' / 'verification'
 BASELINE = REPORTS / 'last-success.json'
 
-from tools.check_diagnostics import (DIAGNOSTIC_EXIT, CheckOutput, DiagnosticFailure, diagnostic_io,
+from tools.check_diagnostics import (DIAGNOSTIC_EXIT, CheckOutput, DiagnosticFailure, capture_stdout, diagnostic_io,
                                      read_json, reset, retain, status, write_json)
 
 def test_files(*names):
@@ -54,12 +54,15 @@ GROUPS = {
                               'observer_panel', 'windows_startup', 'proxy_update', 'collection_observation') + (
         'tests/test_model_proxy.py::test_drain_preserves_work_accepted_after_the_last_idle_probe',),
     'graphics_recovery': test_files('graphics_recovery', 'window_recovery', 'quick_ui', 'overlay_shadow'),
-    'data': test_files('core', 'index', 'data_contract', 'subagent_collection', 'request_tier_snapshots', 'collection_defaults', 'collection_crash_recovery', 'collection_transport', 'collection_preparation'),
+    'data': test_files('core', 'index', 'selected_collection', 'demand_loading', 'data_contract', 'subagent_collection', 'request_tier_snapshots', 'collection_defaults', 'collection_crash_recovery', 'collection_transport', 'collection_preparation'),
     'analysis': test_files('comparison', 'comparison_usage', 'overview', 'performance', 'data_contract', 'output_speed'),
-    'prepared': test_files('prepared_analysis', 'prepared_format_migration', 'analysis_query_actor',
+    'prepared': test_files('prepared_analysis', 'prepared_format_migration', 'analysis_query_actor', 'demand_loading',
                          'prepared_revision_reads', 'prepared_retention_weights',
                          'prepared_restart_incremental', 'prepared_reader_lifecycle',
                          'prepared_notification_heads', 'prepared_mode_dependencies',
+                         'prepared_delivery_continuation', 'prepared_publication_pressure',
+                         'prepared_catalog_capacity', 'prepared_query_owners',
+                         'prepared_warning_worker', 'selected_preparation',
                          'prepared_ledger_reuse', 'prepared_finance_reuse', 'prepared_read_optimization', 'performance_reuse') + (
         'tests/test_collection_transport.py::test_analyzer_publication_wakes_before_timer_and_freeze_reclaims_waiter',
         'tests/test_collection_transport.py::test_quiet_notifications_preserve_staleness_and_ledger_retry_deadlines',
@@ -126,6 +129,7 @@ RULES = (
     ('tools/build_native.py', ('native_cpu', 'payload')),
     ('tools/benchmark_cpu.py', ('native_cpu',)),
     ('tools/benchmark_analysis.py', ('prepared', 'performance_trends')),
+    ('tools/benchmark_prepared_speed.py', ('prepared', 'speed')),
     ('cachemonitor/performance_trends.py', ('performance_trends', 'native_cpu', 'prepared')),
     ("cachemonitor/performance_*.py", ("performance_trends",)),
     ('cachemonitor/retired_cache.py', ('retirement','proxy_lifecycle','install')),
@@ -169,8 +173,10 @@ RULES = (
     ('cachemonitor/prepared_ingest.py', ('prepared', 'analysis', 'data', 'cache', 'modes', 'quota_poll')),
     ('cachemonitor/prepared_append.py', ('prepared', 'analysis', 'cache', 'overlay_data', 'quota_poll')),
     ('cachemonitor/prepared_runtime.py', ('prepared', 'analysis', 'quota_poll', 'overlay_tracking', 'notifications')),
+    ('cachemonitor/preparation_progress.py', ('prepared', 'dashboard_queries', 'overlay_data', 'translation')),
     ('cachemonitor/prepared_query.py', ('prepared', 'analysis', 'dashboard_queries', 'details')),
     ('cachemonitor/prepared_analysis.py', ('prepared', 'analysis', 'dashboard_queries', 'details')),
+    ('cachemonitor/prepared_query_owners.py', ('prepared', 'analysis', 'dashboard_queries', 'details')),
     ('tests/fixtures/prepared-format6*', ('prepared',)),
     ('cachemonitor/prepared_history.py', ('prepared', 'analysis', 'dashboard_queries', 'details')),
     ('cachemonitor/prepared_category.py', ('prepared', 'analysis', 'dashboard')),
@@ -625,6 +631,8 @@ def package_check(executable, report_dir):
 CORE_TESTS = frozenset(test_files(
     'pricing', 'data_contract', 'core', 'request_modes', 'collection_preparation',
     'mismatch_history', 'mismatch_source',
+    'collection_replay_reactivation', 'prepared_delivery_incremental_alerts',
+    'prepared_partial_reuse',
     'banked_resets', 'comparison', 'quota', 'quota_tracking',
     'native_index', 'native_trends', 'native_usage', 'build_native',
     'verify_changes', 'check_environment', 'collect_notices', 'prepare_sources',
@@ -638,7 +646,12 @@ NON_NATIVE_TESTS = frozenset(test_files(
 
 
 def basic_tests():
-    return tuple(sorted(CORE_TESTS))
+    return tuple(sorted((*CORE_TESTS,
+        'tests/test_prepared_freeze_scheduling.py',
+        'tests/test_prepared_live_scheduling.py',
+        'tests/test_prepared_selection_retry.py',
+        'tests/test_dashboard_evidence.py::test_aggregate_preparation_displays_actual_totals_before_query',
+        'tests/test_dashboard_evidence.py::test_hidden_dashboard_restored_navigation_never_requests_aggregate_until_shown')))
 
 
 def tests_require_native(tests):
@@ -700,16 +713,13 @@ def validate_diagnostics_path(path):
 def run_logged(command, path):
     observed = CheckOutput()
     tail = ''
-    with diagnostic_io('create subprocess capture', Path(tempfile.gettempdir())):
+    with diagnostic_io('validate subprocess capture', Path(tempfile.gettempdir())):
         validate_diagnostics_path(Path(tempfile.gettempdir()) / 'codexon-capture')
-        temporary = tempfile.TemporaryDirectory(prefix='codexon-check-output-')
     capture_failed = False
-    try:
-        capture = Path(temporary.name) / 'stdout.log'
-        with diagnostic_io('open subprocess capture', capture):
-            output = capture.open('wb', buffering=0)
+    with capture_stdout() as (capture, output):
+        with diagnostic_io('open subprocess capture reader', capture):
             reader = capture.open('r', encoding='utf-8', errors='replace')
-        with output, reader:
+        with reader:
             try:
                 with diagnostic_io('open check log', path):
                     mirror = path.open('w', encoding='utf-8')
@@ -718,8 +728,9 @@ def run_logged(command, path):
                 result.product_exit_code, result.diagnostics = None, status()
                 return result
             try:
-                process = subprocess.Popen(command, cwd=ROOT, stdout=output, stderr=subprocess.STDOUT,
-                    env=dict(os.environ, CODEXON_CHECK_LOG=str(capture)))
+                env = dict(os.environ, CODEXON_CHECK_LOG=str(capture))
+                env.pop('CODEXON_CHECK_EVENT_LOG', None)
+                process = subprocess.Popen(command, cwd=ROOT, stdout=output, stderr=subprocess.STDOUT, env=env)
                 while True:
                     completed = process.poll() is not None
                     try:
@@ -757,12 +768,6 @@ def run_logged(command, path):
                             mirror.close()
                     except DiagnosticFailure:
                         pass
-    finally:
-        try:
-            with diagnostic_io('remove subprocess capture', Path(temporary.name)):
-                temporary.cleanup()
-        except DiagnosticFailure:
-            pass
     observed.feed('', final=True)
     retain(observed.first_error)
     product = observed.product_exit_code if observed.has_outcome else None if capture_failed else process.returncode
@@ -837,7 +842,7 @@ def main(argv=None):
     parser.add_argument('--rerun', type=Path, help='Replay a frozen verification manifest')
     parser.add_argument('--plan', action='store_true', help='Show checks without running them')
     parser.add_argument('--base', help='Git ref to compare when intentionally establishing a new baseline')
-    parser.add_argument('--basic', action='store_true', help='Run the fixed audited core CI checks without advancing the local baseline')
+    parser.add_argument('--basic', action='store_true', help='Run the fixed core and dashboard CI checks without advancing the local baseline')
     parser.add_argument('--full', action='store_true', help='Run all essential regression checks')
     parser.add_argument('--integration', action='store_true', help='Run all integration checks too (implies --full)')
     parser.add_argument('--extended', action='store_true', help='Also run large-data benchmarks (implies --full)')

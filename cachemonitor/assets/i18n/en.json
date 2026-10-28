@@ -2770,8 +2770,7 @@
   "모델명 불일치 기록 없음": "No model mismatch records",
   "기록 상세": "Record details",
   "기록을 읽는 중": "Reading records",
-  "일부 불일치 기록을 저장하지 못했습니다. 현재 저장된 기록만 표시합니다.": "Some mismatch records could not be saved. Only saved records are shown.",
-  "불일치 기록 저장을 다시 시도하고 있습니다. 저장 전 기록은 보존되지 않을 수 있습니다.": "Retrying mismatch record storage. Unsaved records may be lost.",
+  "불일치 기록을 갱신하지 못해 다시 시도하고 있습니다.": "Could not update mismatch history. Retrying.",
   "불일치 기록을 읽지 못했습니다.": "Could not read mismatch records.",
   "저장된 기록 상세를 읽지 못했습니다.": "Could not read the saved record details.",
   "저장된 기록을 찾을 수 없습니다.": "The saved record could not be found.",
@@ -2796,6 +2795,13 @@
   "Codex 종료 확인을 완료하지 못했습니다. 다시 시도하세요.": "Could not confirm that Codex exited. Try again.",
   "연결 복구 후 Codex를 다시 실행하세요.": "Restore the connection, then reopen Codex.",
   "기간별": "Timeline",
+  "산정 주기 관리": "Manage calculation cycles",
+  "전체 선택": "Select all",
+  "전체 해제": "Deselect all",
+  "산정 주기 관리 ({selected}/{total})": "Manage calculation cycles ({selected}/{total})",
+  "주간 할당량 가치 산정 주기": "Cycles for weekly allowance value",
+  "선택한 주기의 환산액 합계 ÷ 소모량 합계 × 100": "Total value of selected cycles ÷ total consumption × 100",
+  "선택한 주기 {selected}/{total}개 / {value}": "Selected cycles {selected}/{total} / {value}",
   "시간대별": "Time of day",
   "색상은 모델, 표식은 실행 모드입니다.\n대표선: 지표별 평균 또는 중앙값\n분포 띠: 중앙 50% 표본 범위\nStandard: 채운 원\nFast: 빈 삼각형": "Color identifies the model; markers identify its mode.\nLine: mean or median for each metric\nBand: central 50% of samples\nStandard: filled circle\nFast: hollow triangle"
 }

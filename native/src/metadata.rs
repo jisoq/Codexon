@@ -103,7 +103,6 @@ fn message_metadata<'py>(py: Python<'py>, data: &Bound<'py, PyAny>) -> PyResult<
     let bytes = if let Ok(value) = data.cast::<PyBytes>() { value.as_bytes() }
         else { data.cast::<PyString>()?.to_str()?.as_bytes() };
     let output = PyDict::new(py);
-    if bytes.len() > 128 * 1024 * 1024 { return Ok(output); }
     let fields = py.detach(|| select(bytes));
     // Returning None lets the mature streaming validator handle unusual JSON
     // (for example numeric representations outside serde_json's range).

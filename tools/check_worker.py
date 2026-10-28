@@ -8,12 +8,13 @@ import threading
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from tools.check_diagnostics import (DIAGNOSTIC_EXIT, DiagnosticFailure, diagnostic_io,
+from tools.check_diagnostics import (DIAGNOSTIC_EXIT, DiagnosticFailure, claim_event_log, diagnostic_io,
                                      emit, status, write_json)
 
 
 def main():
     global stack
+    claim_event_log()
     folder = Path(os.environ['CODEXON_CHECK_DIAGNOSTICS'])
     # Separate files avoid races between nested runners or Python workers.
     with diagnostic_io('open worker stacks', folder / f'stacks-{os.getpid()}.log'):

@@ -131,6 +131,17 @@ class _CommandSendState:
     error: Exception | None = None
 
 
+def _preparation_progress(message):
+    from .preparation_progress import PreparationStage, PreparationWork
+    try:stage=PreparationStage(message.get('stage'))
+    except ValueError:return None
+    done,total=message.get('processed'),message.get('total')
+    if (stage in (PreparationStage.COLLECTING,PreparationStage.CONVERTING)
+            and type(done) is int and type(total) is int and 0<=done<=total and total>0):
+        return PreparationWork(stage,done,total)
+    return stage
+
+
 class AnalysisBridge(QThread):
     # These Python payloads are consumed as read-only values on the GUI thread.
     # Avoid recursive QVariantMap conversion of the complete analysis graph.
@@ -158,12 +169,25 @@ class AnalysisBridge(QThread):
         self.process=None
         self.restart_count=0
         self.last_request=None
+        self.selected_owners=[]
         self.outstanding_mismatches={}
     def request(self,request_id,query,logical):
         with self.lock:
             self.pending={'kind':'query','id':request_id,'query':query,'logical':logical}
             self.last_request=self.pending
             self._wake_locked()
+
+    def select_session(self,thread_id=None,home=None):
+        owners=[[home,thread_id]] if thread_id else []
+        with self.lock:
+            if owners==self.selected_owners:return
+            self.selected_owners=owners
+            self.enqueue_latest(dict(kind='selected',owners=owners))
+
+    def cancel_queries(self):
+        with self.lock:
+            self.pending=None;self.last_request=None
+            self.enqueue_latest(dict(kind='aggregate_close'))
     def enqueue_latest(self,command):
         # Each consumer accepts only its newest request id. Keep one pending
         # command per kind while the child is busy, including a single snapshot.
@@ -295,7 +319,11 @@ class AnalysisBridge(QThread):
                                 receiver=SnapshotReceiver();continue
                             if value is not None:self.snapshot.emit(value)
                         elif message['kind'] in ('overlay_detail','result','stale','mismatch_page','mismatch_record'):self._deliver_result(message)
-                        elif message['kind']=='progress':self.progress.emit(message)
+                        elif message['kind']=='progress':
+                            if message.get('scope')=='startup':
+                                progress=_preparation_progress(message)
+                                if progress is not None:self.progress.emit(progress)
+                            else:self.progress.emit(message)
                         elif message['kind'] in ('error','fatal'):
                             self.failure.emit(message['error'])
                             self.fault.emit(dict(query_failed=message['kind']=='error' and message.get('consumer')!='publication',
@@ -340,5 +368,6 @@ class AnalysisBridge(QThread):
             with self.lock:
                 self.pending=self.last_request
                 if self.pending:self._wake_locked()
+                self.enqueue_latest(dict(kind='selected',owners=self.selected_owners))
                 for command in self.outstanding_mismatches.values():self.enqueue_latest(command)
             self.msleep(250)

@@ -40,6 +40,44 @@ def capture_text(monkeypatch):
     return drawn
 
 
+@pytest.mark.parametrize('language',['ko','en'])
+def test_preparation_painter_draws_wrapped_explanation_counts_and_elapsed(app,monkeypatch,tmp_path,language):
+    import time
+    from PySide6.QtCore import Qt,QRect
+    from PySide6.QtGui import QFontMetrics
+    from cachemonitor.i18n import set_language
+    from cachemonitor.overlay_monitor import SECTION_WIDTH
+    from cachemonitor.overlay_view import font
+    from cachemonitor.preparation_progress import PreparationPending,PreparationStage,PreparationWork
+    set_language(language)
+    try:
+        model=OverlayContent();drawn=capture_text(monkeypatch)
+        pending=PreparationPending(time.monotonic()-8,PreparationWork(PreparationStage.COLLECTING,1234,5678))
+        model.set_content(None,'기록 확인 중',preparation=pending)
+        image=render(model)
+        assert image.save(str(tmp_path/f'preparation-painter-{language}.png'))
+        state=model.preparation;layout=model.layout()
+        assert state['title'] in {row[0] for row in drawn}
+        assert state['detail'] in {row[0] for row in drawn}
+        assert any('1,234 / 5,678' in text and state['elapsedText'] in text for text,_,_ in drawn)
+        previous_bottom=36
+        for text,y,height,size,weight,color in layout['preparation_rows']:
+            metrics=QFontMetrics(font(model.appearance.family,size,weight))
+            bounds=metrics.boundingRect(QRect(0,0,SECTION_WIDTH,1000),Qt.TextWordWrap,text)
+            assert y>=previous_bottom and height>=bounds.height()
+            previous_bottom=y+height
+        assert previous_bottom<layout['height']
+        assert state['progressText'] in model.state['accessible'] and state['elapsedText'] in model.state['accessible']
+        confirmed=summary();model.set_content(confirmed,'갱신 중',preparation=pending)
+        assert model.preparation is None and model.data['calls']==confirmed['calls']
+        model.set_content(dict(confirmed,calls=0,_collection={'retained':True}),'기록 확인 중',preparation=pending)
+        assert model.preparation is None
+        for note in ('원격 작업: 로컬 기록 없음','현재 세션 식별 불가','분석 오류','수집 오류','수집 지연'):
+            model.set_content(None,note,preparation=pending)
+            assert model.preparation is None
+    finally:set_language('ko')
+
+
 def priced(**changes):
     row = dict(model='gpt-6-astra', service_tier='Standard', input=1000,
                cached=800, written=20, output=100, reasoning=40)

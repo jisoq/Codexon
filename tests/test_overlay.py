@@ -434,6 +434,50 @@ def test_publication_failure_replaces_initial_wait_and_clears_on_snapshot(overla
     assert not controller._analysis_failed
 
 
+@pytest.mark.parametrize(('homes','notice'),[([], '호출 기록 없음'),(['first','second'], '현재 세션 식별 불가')])
+def test_completed_target_resolution_clears_preparation_without_session_bodies(overlay_cache_controller,homes,notice):
+    controller,_=overlay_cache_controller
+    controller.receive_target({'selection':Selection(A)})
+    assert controller.preparation is not None
+    controller.receive_snapshot(dict(overlay_sessions=[],catalog_complete=True,
+        demand=dict(selected=[[None,A]],aggregate=False,evidence=[]),
+        session_catalog=[[home,A,None] for home in homes],index=dict(loading=False)))
+    assert controller.preparation is None
+    assert controller.content()==(None,notice)
+
+
+@pytest.mark.parametrize('count',[0,1,2])
+@pytest.mark.parametrize('stale',[False,True])
+def test_compact_target_resolution_preserves_preparation_policy(overlay_cache_controller,count,stale):
+    controller,_ = overlay_cache_controller
+    controller.receive_target({'selection':Selection(A)})
+    pending = controller.preparation
+    controller.receive_snapshot(dict(overlay_sessions=[],catalog_complete=True,collection_stale=stale,
+        demand=dict(selected=[[None,A]],aggregate=False,evidence=[]),
+        selected_resolutions=[[A,count]],index=dict(loading=False)))
+    assert controller.target_resolution == (None if stale else (A,count))
+    if stale or count==1:
+        assert controller.preparation is pending
+    else:
+        assert controller.preparation is None
+        assert controller.content() == (None,'호출 기록 없음' if count==0 else '현재 세션 식별 불가')
+
+
+@pytest.mark.parametrize('change',[
+    dict(catalog_complete=False),dict(collection_stale=True),dict(collection_recovery=True),
+    dict(demand=dict(selected=[[None,B]],aggregate=False,evidence=[])),
+    dict(session_catalog=[['home',A,None]]),
+])
+def test_incomplete_stale_or_different_target_resolution_keeps_preparation(overlay_cache_controller,change):
+    controller,_=overlay_cache_controller
+    controller.receive_target({'selection':Selection(A)})
+    pending=controller.preparation
+    controller.receive_snapshot({**dict(overlay_sessions=[],catalog_complete=True,
+        demand=dict(selected=[[None,A]],aggregate=False,evidence=[]),session_catalog=[],
+        index=dict(loading=True)),**change})
+    assert controller.preparation is pending
+
+
 def test_overlay_banner_allows_idle_delivery_grace_and_identifies_failures(monkeypatch,overlay_cache_controller):
     from cachemonitor.overlay_view import OverlayContent
     monkeypatch.setattr('cachemonitor.overlay.time.monotonic',lambda:100.)

@@ -266,7 +266,6 @@ class EvidenceProof:
 
 class EvidenceReader:
     """Incremental read-only join, scoped to Codex home and exact response ID."""
-    READ_BATCH = 5000
     READ_SECONDS = .4
     MAX_RECORDS = 4096
     MAX_POLL_ROWS = 5000
@@ -275,6 +274,7 @@ class EvidenceReader:
         self.path = Path(path)
         self.db = None
         self.offset = 0
+        self.live_offset = None
         self.records = {}
         self.activity_records = OrderedDict()
         self.changed_activity = {}
@@ -289,6 +289,7 @@ class EvidenceReader:
         self.anchor = None
         self.catching_up = False
         self.highwater=0
+        self.invalidation_range=(0,0)
         self.source_marker=''
         self.source_version=None
         self.correction_schema=None
@@ -301,6 +302,7 @@ class EvidenceReader:
             self.db.close()
         self.db = None
         self.offset = 0
+        self.live_offset = None
         self.records.clear()
         self.activity_records.clear()
         self.changed_activity.clear()
@@ -309,6 +311,7 @@ class EvidenceReader:
         self.anchor = None
         self.catching_up = False
         self.highwater=0
+        self.invalidation_range=(0,0)
         self.source_marker=''
         self.source_version=None
         self.correction_schema=None
@@ -319,8 +322,9 @@ class EvidenceReader:
         self.revision += 1
         self.join_epoch += 1
 
-    def poll(self):
+    def poll(self, *, historical=True):
         self.previous_revision = self.revision
+        self.invalidation_range=(self.highwater,self.highwater)
         self.changed_responses = {}
         self.changed_activity={}
         self.error = ''
@@ -350,20 +354,20 @@ class EvidenceReader:
                 return
         changed = False
         try:
+            highwater = self.db.execute('SELECT coalesce(max(seq),0) FROM model_observations').fetchone()[0]
+            self.highwater=highwater
             changed=self._poll_corrections()
             if changed is None:
                 self._reset()
-                return self.poll()
-            highwater = self.db.execute('SELECT coalesce(max(seq),0) FROM model_observations').fetchone()[0]
-            self.highwater=highwater
+                return self.poll(historical=historical)
             if not self.source_marker and highwater:
-                first=self.db.execute('SELECT * FROM model_observations ORDER BY seq LIMIT 1').fetchone()
-                self.source_marker=hashlib.sha256(json.dumps(observation_record(first),sort_keys=True).encode()).hexdigest()
+                first=self.db.execute('SELECT seq FROM model_observations ORDER BY seq LIMIT 1').fetchone()[0]
+                self.source_marker=hashlib.sha256(repr((first,self.correction_epoch)).encode()).hexdigest()
             anchor = self.db.execute('SELECT * FROM model_observations WHERE seq=?',
                                      (self.offset,)).fetchone() if self.offset else None
             if self.offset and (highwater < self.offset or anchor is None or observation_record(anchor) != self.anchor):
                 self._reset()
-                return self.poll()
+                return self.poll(historical=historical)
             if self.db.execute("select 1 from sqlite_master where name='observation_gaps'").fetchone():
                 gaps=[tuple(r) for r in self.db.execute('SELECT start,end FROM observation_gaps')]
                 if gaps!=self.gaps:
@@ -372,20 +376,30 @@ class EvidenceReader:
                     self.join_epoch+=1
             deadline = time.monotonic() + self.READ_SECONDS
             read_count=0
-            while self.offset < highwater and read_count<self.MAX_POLL_ROWS:
-                rows = self.db.execute('SELECT * FROM model_observations WHERE seq>? AND seq<=? '
-                                       'ORDER BY seq LIMIT ?',
-                                       (self.offset, highwater, min(self.READ_BATCH,self.MAX_POLL_ROWS-read_count))).fetchall()
-                if not rows:break
-                read_count+=len(rows)
-                for row in rows:
-                    self.offset = row['seq']
-                    # Replace values so already published observations remain immutable.
-                    record = observation_record(row)
-                    self._remember_record(record)
-                    self.anchor = record
-                changed = True
-                if time.monotonic() >= deadline:break
+            if self.live_offset is None:self.live_offset=highwater
+            live_start=self.live_offset
+            self.invalidation_range=(live_start,live_start)
+            positions=(['live_offset'] if not historical or self.offset<self.live_offset else [])
+            if historical:positions.append('offset')
+            for position in positions:
+                while getattr(self,position) < highwater and read_count<self.MAX_POLL_ROWS:
+                    rows = self.db.execute('SELECT * FROM model_observations WHERE seq>? AND seq<=? '
+                                           'ORDER BY seq LIMIT ?',
+                                           (getattr(self,position), highwater, self.MAX_POLL_ROWS-read_count)).fetchall()
+                    if not rows:break
+                    read_count+=len(rows)
+                    refresh=position=='offset' and self.offset<self.live_offset
+                    if refresh:self._refresh_activity({(row['home'],row['attempt']) for row in rows})
+                    for row in rows:
+                        setattr(self,position,row['seq'])
+                        record = observation_record(row)
+                        if not refresh:self._remember_record(record)
+                        if position=='offset':self.anchor=record
+                    self.live_offset=max(self.live_offset,self.offset)
+                    self.invalidation_range=(live_start,self.live_offset)
+                    changed = True
+                    if time.monotonic() >= deadline:break
+                if changed and time.monotonic() >= deadline:break
             self.catching_up = self.offset < highwater
         except sqlite3.Error:
             if changed:self.catching_up = self.offset < highwater
@@ -406,14 +420,14 @@ class EvidenceReader:
                 and actual.get('evidence_corrections')==CORRECTION_INDEX
                 and actual.get('evidence_attempt')==ATTEMPT_INDEX
                 and all(actual.get(name)==sql for name,sql in correction_triggers(columns).items()))
-            if self.source_version is not None and self.offset:
+            if self.source_version is not None and (self.offset or self.live_offset):
                 return None
             self.correction_schema=schema
         if self.correction_tracked:
             latest=self.db.execute('SELECT correction_revision,correction_reset,correction_epoch FROM model_observations '
                 'WHERE correction_revision>0 ORDER BY correction_revision DESC LIMIT 1').fetchone()
             revision,floor,epoch=tuple(latest) if latest else (0,0,None)
-            if self.source_version is not None and self.offset and (epoch!=self.correction_epoch
+            if self.source_version is not None and (self.offset or self.live_offset) and (epoch!=self.correction_epoch
                     or revision<self.correction_revision or floor>self.correction_revision):
                 return None
             if revision>self.correction_revision:
@@ -428,15 +442,15 @@ class EvidenceReader:
                     'WHERE correction_revision>0 AND correction_revision>? AND correction_revision<=?',
                     (CORRECTION_KEY_BYTES,CORRECTION_KEY_BYTES,CORRECTION_KEY_BYTES,self.correction_revision,revision)):
                     if home is None:
-                        if self.source_version is not None and self.offset:return None
+                        if self.source_version is not None and (self.offset or self.live_offset):return None
                         continue
                     if response:self.changed_responses.setdefault(home,set()).add(response)
                     attempts.add((home,attempt))
-                self._refresh_activity(attempts)
+                if self.source_version is not None:self._refresh_activity(attempts)
                 changed=True
             self.correction_revision=revision
             self.correction_epoch=epoch
-        elif self.source_version is not None and self.offset and version!=self.source_version:
+        elif self.source_version is not None and (self.offset or self.live_offset) and version!=self.source_version:
             # Legacy/read-only sources cannot identify old edits. Do not assume
             # an increased append high-water mark excludes a simultaneous edit.
             return None
@@ -451,13 +465,15 @@ class EvidenceReader:
             for row in self.db.execute(f'WITH changed(home,attempt) AS (VALUES {slots}) '
                 'SELECT m.* FROM changed c JOIN model_observations m ON m.seq='
                 '(SELECT max(seq) FROM model_observations WHERE home=c.home AND attempt=c.attempt AND seq<=?)',
-                (*[value for key in batch for value in key],self.offset)):
+                (*[value for key in batch for value in key],self.highwater)):
                 record=observation_record(row)
                 if self.activity_records.get((record['home'],record['attempt']))!=record:
                     self._remember_record(record)
 
     def _remember_record(self, record):
         activity_key=(record['home'],record['attempt'])
+        old=self.activity_records.get(activity_key)
+        if old is not None and old['seq']>record['seq']:return
         old=self.activity_records.pop(activity_key,None)
         if old and old['response_id']!=record['response_id']:self._forget_record(old)
         self.activity_records[activity_key]=record
@@ -488,7 +504,7 @@ class EvidenceReader:
                 for record in self.db.execute('SELECT m.* FROM model_observations m '
                     'JOIN (SELECT max(seq) seq FROM model_observations '
                     f'WHERE home=? AND response_id IN ({slots}) AND seq<=? GROUP BY response_id,attempt) latest '
-                    'ON m.seq=latest.seq',(home,*responses,self.offset)):
+                    'ON m.seq=latest.seq',(home,*responses,self.highwater)):
                     value=observation_record(record)
                     if proof is not None:proof.observe(value)
                     missing=value.get('observation_missing') or any(a<=value['ts']<=b for a,b in self.gaps)
@@ -513,6 +529,8 @@ class EvidenceReader:
         if (previous is not None and previous[0] is self and previous[1] is rows
                 and (not capture_proof or proof is not None and proof[0] is previous[4])
                 and previous[2]==self.join_epoch
+                and (previous[5]==self.highwater or self.invalidation_range[0]<=previous[5]
+                     and self.invalidation_range[1]>=self.highwater)
                 and (previous[3]==self.revision or previous[3]==self.previous_revision
                      and (not changed or changed.isdisjoint(owner.keys)))):
             result=previous[4]
@@ -522,7 +540,7 @@ class EvidenceReader:
                 result=self.enrich_home(key,rows,proof=proof)
                 owner._evidence_proof=(result,proof.digest())
             else:result=self.enrich_home(key,rows)
-        owner._evidence_join=(self,rows,self.join_epoch,self.revision,result)
+        owner._evidence_join=(self,rows,self.join_epoch,self.revision,result,self.highwater)
         return result
 
     def enrich_home(self, key, rows,proof=None):

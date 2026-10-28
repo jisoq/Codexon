@@ -1,5 +1,6 @@
 """Run Windows UI checks on a hidden desktop."""
 import argparse
+import codecs
 from contextlib import contextmanager, ExitStack
 import ctypes
 from ctypes import wintypes as W
@@ -14,7 +15,7 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tools.check_processes import Job, clear_scopes
-from tools.check_diagnostics import (DIAGNOSTIC_EXIT, DiagnosticFailure, diagnostic_io,
+from tools.check_diagnostics import (DIAGNOSTIC_EXIT, CheckOutput, DiagnosticFailure, capture_stdout, defer_notifications, diagnostic_io,
                                      emit, exit_code, read_json, retain, status, write_json)
 
 
@@ -104,6 +105,7 @@ def isolated_desktop(user):
         checked(user.CloseWindowStation(station))
 
 
+@defer_notifications()
 def run_on_desktop(kernel, desktop, command, env, *, timeout=720, diagnostics=None):
     # subprocess.STARTUPINFO does not forward lpDesktop to CreateProcessW.
     # Use the real structure and inherit only the three standard streams.
@@ -115,6 +117,42 @@ def run_on_desktop(kernel, desktop, command, env, *, timeout=720, diagnostics=No
     with ExitStack() as cleanup:
         job = Job()
         cleanup.callback(job.close)
+        env = dict(env)
+        env.pop('CODEXON_CHECK_EVENT_LOG', None)
+        capture_path = env.get('CODEXON_CHECK_LOG')
+        captured = False
+        if capture_path:
+            try:
+                captured = os.path.samefile(capture_path, 1)
+            except OSError:
+                pass
+        if captured:
+            capture = Path(capture_path)
+        else:
+            capture, _ = cleanup.enter_context(capture_stdout())
+            env.pop('CODEXON_CHECK_LOG', None)
+            if env.get('CODEXON_CHECK_WORKER'):
+                env['CODEXON_CHECK_EVENT_LOG'] = str(capture)
+        with diagnostic_io('open runner capture reader', capture):
+            reader = cleanup.enter_context(capture.open('rb'))
+        decoder = codecs.getincrementaldecoder('utf-8')('replace')
+        observed = CheckOutput()
+        capture_failed = False
+
+        def drain(*, final=False):
+            while True:
+                with diagnostic_io('read runner capture', capture):
+                    chunk = reader.read(65536)
+                if not chunk:
+                    break
+                observed.feed(decoder.decode(chunk))
+                retain(observed.first_error)
+                if not final:
+                    break
+            if final:
+                observed.feed(decoder.decode(b'', final=True), final=True)
+                retain(observed.first_error)
+
         handles = []
         for descriptor in range(3):
             try:
@@ -156,6 +194,12 @@ def run_on_desktop(kernel, desktop, command, env, *, timeout=720, diagnostics=No
                 raise ctypes.WinError(ctypes.get_last_error())
             while True:
                 wait_status = kernel.WaitForSingleObject(process.process, 100)
+                try:
+                    drain()
+                except DiagnosticFailure:
+                    capture_failed = True
+                    reason = 'diagnostics_failed'
+                    break
                 if wait_status == 0:
                     break
                 if wait_status != 258:  # WAIT_TIMEOUT
@@ -168,8 +212,7 @@ def run_on_desktop(kernel, desktop, command, env, *, timeout=720, diagnostics=No
                     try:
                         with diagnostic_io('inspect diagnostic budget', diagnostics):
                             logs = list(diagnostics.glob('*.log'))
-                            if env.get('CODEXON_CHECK_LOG'):
-                                logs.append(Path(env['CODEXON_CHECK_LOG']))
+                            logs.append(capture)
                             over_budget = sum(path.stat().st_size for path in logs if path.exists()) > 64 * 1024 * 1024
                         if over_budget:
                             reason = 'diagnostic_budget'
@@ -221,11 +264,8 @@ def run_on_desktop(kernel, desktop, command, env, *, timeout=720, diagnostics=No
                     product_exit_code = result.value if reason == 'completed' and result.value not in (0, DIAGNOSTIC_EXIT) else None
             if diagnostics:
                 try:
-                    active = diagnostics / 'active-test.json'
-                    with diagnostic_io('inspect active test', active):
-                        has_active = active.exists()
-                    if has_active:
-                        evidence['active_test'] = read_json(active)
+                    if observed.active_test is not None:
+                        evidence['active_test'] = observed.active_test
                     write_json(diagnostics / 'processes.json', evidence)
                 except DiagnosticFailure:
                     pass
@@ -242,77 +282,85 @@ def run_on_desktop(kernel, desktop, command, env, *, timeout=720, diagnostics=No
                     external = clear_scopes(diagnostics)
                 except DiagnosticFailure:
                     external = {}
+        if not capture_failed:
+            try:
+                drain(final=True)
+            except DiagnosticFailure:
+                pass
+        if observed.active_test is not None:
+            evidence['active_test'] = observed.active_test
         evidence['external'] = external if diagnostics else {}
         if evidence['external'].get('processes') or any(task['running'] for task in evidence['external'].get('tasks', [])):
             reason = evidence['reason'] = 'external_descendants_remain' if reason == 'completed' else reason
-        evidence.update(product_exit_code=product_exit_code, diagnostics=status(),
-                        diagnostics_directory=str(diagnostics) if diagnostics else None)
-        if reason == 'deadline':
-            code = 124
-        elif reason not in ('completed', 'diagnostics_failed') or evidence['remaining_pids']:
-            code = 1
-        elif result.value not in (0, DIAGNOSTIC_EXIT, 259):
-            code = result.value
-        else:
-            code = exit_code(product_exit_code)
-        try:
-            if diagnostics:
-                write_json(diagnostics / 'result.json', evidence)
-        except DiagnosticFailure:
-            pass
-        code = code or exit_code(product_exit_code)
-        if status()['first_error']:
-            emit(dict(product_exit_code=product_exit_code, diagnostics=status()))
-        return code
+    evidence.update(product_exit_code=product_exit_code, diagnostics=status(),
+                    diagnostics_directory=str(diagnostics) if diagnostics else None)
+    if reason == 'deadline':
+        code = 124
+    elif reason not in ('completed', 'diagnostics_failed') or evidence['remaining_pids']:
+        code = 1
+    elif result.value not in (0, DIAGNOSTIC_EXIT, 259):
+        code = result.value
+    else:
+        code = exit_code(product_exit_code)
+    try:
+        if diagnostics:
+            write_json(diagnostics / 'result.json', evidence)
+    except DiagnosticFailure:
+        pass
+    code = code or exit_code(product_exit_code)
+    if status()['first_error']:
+        emit(dict(product_exit_code=product_exit_code, diagnostics=status()), blocking=False)
+    return code
 
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--scale')
-    parser.add_argument('--kind', choices=('gui', 'installation', 'core'), default='gui')
-    parser.add_argument('--timeout', type=float)
-    parser.add_argument('--diagnostics', type=Path)
-    parser.add_argument('--no-desktop', action='store_true')
-    parser.add_argument('command', nargs=argparse.REMAINDER)
-    args = parser.parse_args()
-    command = args.command
-    if command and command[0] == '--':
-        command = command[1:]
-    if not command:
-        parser.error('A command is required')
-    timeout = args.timeout if args.timeout is not None else dict(gui=720, installation=540, core=180)[args.kind]
-    if not 0 < timeout <= 840:
-        parser.error('Check budget must be positive and at most 840 seconds')
-    diagnostics = (args.diagnostics or Path(__file__).resolve().parents[1] / 'artifacts/verification' / ('runner-' + uuid.uuid4().hex)).resolve()
-    from tools.verify_changes import validate_diagnostics_path
     try:
-        validate_diagnostics_path(diagnostics)
-    except ValueError as error:
-        parser.error(str(error))
-    print('Diagnostics directory ' + str(diagnostics), file=sys.stderr, flush=True)
-    try:
-        with diagnostic_io('create diagnostics directory', diagnostics):
-            diagnostics.mkdir(parents=True, exist_ok=False)
+        parser = argparse.ArgumentParser(description=__doc__)
+        parser.add_argument('--scale')
+        parser.add_argument('--kind', choices=('gui', 'installation', 'core'), default='gui')
+        parser.add_argument('--timeout', type=float)
+        parser.add_argument('--diagnostics', type=Path)
+        parser.add_argument('--no-desktop', action='store_true')
+        parser.add_argument('command', nargs=argparse.REMAINDER)
+        args = parser.parse_args()
+        command = args.command
+        if command and command[0] == '--':
+            command = command[1:]
+        if not command:
+            parser.error('A command is required')
+        timeout = args.timeout if args.timeout is not None else dict(gui=720, installation=540, core=180)[args.kind]
+        if not 0 < timeout <= 840:
+            parser.error('Check budget must be positive and at most 840 seconds')
+        diagnostics = (args.diagnostics or Path(__file__).resolve().parents[1] / 'artifacts/verification' / ('runner-' + uuid.uuid4().hex)).resolve()
+        from tools.verify_changes import validate_diagnostics_path
+        try:
+            validate_diagnostics_path(diagnostics)
+        except ValueError as error:
+            parser.error(str(error))
+        print('Diagnostics directory ' + str(diagnostics), file=sys.stderr, flush=True)
+        try:
+            with diagnostic_io('create diagnostics directory', diagnostics):
+                diagnostics.mkdir(parents=True, exist_ok=False)
+        except DiagnosticFailure:
+            emit(dict(product_exit_code=None, diagnostics=status()))
+            return DIAGNOSTIC_EXIT
+        env = dict(os.environ)
+        env.pop('CODEXON_CHECK_WORKER', None)
+        env['CODEXON_CHECK_DIAGNOSTICS'] = str(diagnostics)
+        env['CODEXON_CHECK_TIMEOUT'] = str(timeout)
+        if Path(command[0]).name.lower() in ('python', 'python.exe', 'python3', 'python3.exe'):
+            command = [command[0], '-u', '-B', str(Path(__file__).with_name('check_worker.py')), *command[1:]]
+            env['CODEXON_CHECK_WORKER'] = '1'
+        if args.scale:
+            env['QT_SCALE_FACTOR'] = args.scale
+        user, kernel = windows_api()
+        if args.no_desktop:
+            return run_on_desktop(kernel, None, command, env, timeout=timeout, diagnostics=diagnostics)
+        with isolated_desktop(user) as desktop:
+            return run_on_desktop(kernel, desktop, command, env, timeout=timeout, diagnostics=diagnostics)
     except DiagnosticFailure:
-        emit(dict(product_exit_code=None, diagnostics=status()))
         return DIAGNOSTIC_EXIT
-    env = dict(os.environ)
-    env.pop('CODEXON_CHECK_WORKER', None)
-    env['CODEXON_CHECK_DIAGNOSTICS'] = str(diagnostics)
-    env['CODEXON_CHECK_TIMEOUT'] = str(timeout)
-    # Bootstrap only understood Python invocations; native programs still get
-    # the same Job Object deadline and PID evidence.
-    if Path(command[0]).name.lower() in ('python', 'python.exe', 'python3', 'python3.exe'):
-        command = [command[0], '-u', '-B', str(Path(__file__).with_name('check_worker.py')), *command[1:]]
-        env['CODEXON_CHECK_WORKER'] = '1'
-    if args.scale:
-        env['QT_SCALE_FACTOR'] = args.scale
-    user, kernel = windows_api()
-    if args.no_desktop:
-        return run_on_desktop(kernel, None, command, env, timeout=timeout, diagnostics=diagnostics)
-    with isolated_desktop(user) as desktop:
-        return run_on_desktop(kernel, desktop, command, env, timeout=timeout, diagnostics=diagnostics)
 
 
 if __name__ == '__main__':

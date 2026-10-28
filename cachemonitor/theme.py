@@ -73,7 +73,7 @@ class Theme(QObject):
         if mode=="Standard":return base
         if mode!="Fast":return self._palette["muted"]
         lightness,a,b=oklab(base)
-        return lch(max(0,min(1,lightness+(.14 if self.dark else -.14))),
+        return lch(max(0,min(1,lightness-.10)),
                    hypot(a,b),degrees(atan2(b,a)))
 
     def performance_color(self,name,mode='Standard'):

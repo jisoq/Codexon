@@ -1,12 +1,10 @@
 """Pytest phase evidence independent of capture and buffered Actions output."""
 from datetime import datetime, timezone
-import json
 import os
-from pathlib import Path
 
 import pytest
 
-from tools.check_diagnostics import DIAGNOSTIC_EXIT, DiagnosticFailure, diagnostic_io, status
+from tools.check_diagnostics import DIAGNOSTIC_EXIT, DiagnosticFailure, diagnostic_io, emit, status
 
 
 _active_event = None
@@ -72,12 +70,9 @@ def save_phase():
     folder = os.environ.get('CODEXON_CHECK_DIAGNOSTICS')
     if not folder or status()['first_error']:
         return
-    path = Path(folder) / 'active-test.json'
-    temporary = path.with_suffix('.tmp')
     try:
-        with diagnostic_io('write active test', temporary):
-            temporary.write_text(json.dumps(_active_event), encoding='utf-8')
-            temporary.replace(path)
+        with diagnostic_io('emit active test', folder):
+            emit(dict(active_test=_active_event), strict=True)
     except DiagnosticFailure as error:
         pytest.exit(str(error), returncode=1 if _product_failed else DIAGNOSTIC_EXIT)
 

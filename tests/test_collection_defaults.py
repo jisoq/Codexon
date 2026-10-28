@@ -119,12 +119,12 @@ def test_source_metadata_hints_filter_owned_writes_and_bound_bursts(tmp_path, mo
     changes.sync([tmp_path])
     (tmp_path/'index.sqlite').write_bytes(b'owned')
     (tmp_path/'state_5.sqlite-shm').write_bytes(b'reader locks')
-    assert changes._metadata_changes(clock[0]) == frozenset()
+    assert not changes._changes(clock[0])
     (tmp_path/'state_5.sqlite-wal').write_bytes(b'committed title')
     clock[0]+=.25
     assert changes.wait(clock[0]+3).metadata == frozenset({tmp_path})
     (tmp_path/'.codex-global-state.json').write_text('{}',encoding='utf8')
-    assert changes._metadata_changes(clock[0]) == frozenset()
+    assert not changes._changes(clock[0])
     clock[0]+=.25
     assert changes.wait(clock[0]+3).metadata == frozenset({tmp_path})
     changes.close()
@@ -277,7 +277,8 @@ def test_closed_collection_reuses_bodies_and_replays_only_changed_owners(tmp_pat
         while True:
             value=service.poll(now)
             if value['usage_collection_complete'] and not value['index']['loading']:break
-            assert time.monotonic()<deadline
+            assert time.monotonic()<deadline,dict(index=value['index'],errors=value['usage_errors'],
+                header_pending=sorted(service.index.header_pending))
         reader=CollectionChannel([home],target,evidence)
         try:value=reader.read(shared=True)
         finally:reader.close()
@@ -609,3 +610,69 @@ def test_broken_default_recovery_preserves_unowned_or_busy_collector(default_hom
         assert not index_location().exists()
         assert old.stopping()==(failure=='timeout')
     finally:old.close()
+
+
+def test_evidence_hints_watch_authoritative_files_without_refreshing_home_labels(tmp_path,monkeypatch):
+    from cachemonitor import collection_wake as wake
+    clock=[10.]
+    monkeypatch.setattr(wake.time,'monotonic',lambda:clock[0])
+    monkeypatch.setattr(wake.time,'sleep',lambda seconds:clock.__setitem__(0,clock[0]+seconds))
+    evidence=tmp_path/'outside-home'/'evidence.sqlite';evidence.parent.mkdir()
+    home=tmp_path/'home';home.mkdir()
+    changes=wake.SourceChanges((tmp_path/'index.sqlite',evidence),evidence=evidence)
+    changes.api=None;changes.sync([home])
+    try:
+        evidence.with_name(evidence.name+'-shm').write_bytes(b'reader locks')
+        (tmp_path/'index.sqlite').write_bytes(b'our publication')
+        (home/'unrelated.sqlite').write_bytes(b'unrelated write')
+        assert not changes._changes(clock[0])
+        clock[0]+=.25
+        evidence.with_name(evidence.name+'-wal').write_bytes(b'committed observation')
+        hint=changes.wait(clock[0]+3)
+        assert hint.uncertain and not hint.metadata and not hint.roots
+        evidence.with_name(evidence.name+'-wal').write_bytes(b'next observation')
+        assert not changes._changes(clock[0])
+        before=clock[0];hint=changes.wait(clock[0]+3)
+        assert hint and not hint.metadata and clock[0]==before+.25
+        evidence.write_bytes(b'replacement database')
+        assert changes.wait(clock[0]+3).uncertain
+        evidence.unlink()
+        assert changes.wait(clock[0]+3).uncertain
+    finally:changes.close()
+
+
+@pytest.mark.integration
+def test_normal_collector_publishes_evidence_ingress_without_rollout_changes(tmp_path):
+    import hashlib
+    from threading import Event
+    from cachemonitor.model_evidence import EvidenceStore
+    from cachemonitor.usage_collection import isolated_collector
+    home,path=fixture_home(tmp_path)
+    from test_core import usage
+    path.write_text(json.dumps(usage(time=time.time()-1))+'\n',encoding='utf8')
+    evidence=tmp_path/'observations.sqlite';index=tmp_path/'index.sqlite'
+    store=EvidenceStore(evidence)
+    client=CollectionClient([home],index,model_evidence_path=evidence)
+    stop=isolated_collector([home],index,evidence)
+    before=hashlib.sha256(path.read_bytes()).digest()
+    def until(predicate,seconds=2):
+        deadline=time.monotonic()+seconds
+        while True:
+            value=client.poll()
+            assert not value['errors'],value
+            if predicate(value):return value
+            assert time.monotonic()<deadline,'evidence did not wake the normal collector before reconciliation'
+            Event().wait(.005)
+    try:
+        until(lambda value:value['usage_collection_complete'] and bool(value['sessions']))
+        for status,response in [('pending',''),('created','r1'),('completed','r1')]:
+            store.write(home,'wake-attempt',time.time(),'WebSocket',response,'gpt-6.1-sol',
+                        'gpt-6.1-sol' if response else '',status)
+            value=until(lambda value:any(row['attempt']=='wake-attempt' and row['status']==status
+                                        for row in value['request_activity']))
+            if response:
+                assert value['sessions'][0]['history'][0]['response_status']==status
+            client.channel.acknowledge_activity(value)
+        assert hashlib.sha256(path.read_bytes()).digest()==before
+    finally:
+        stop();client.close();store.close()

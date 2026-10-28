@@ -417,6 +417,8 @@ def test_highlight_choice_retains_settings_with_native_popup_foreground(native_d
     monkeypatch.setattr(native.u,'GetCursorPos',cursor)
     c.toggle_settings();refresh()
     state.foreground=int(c.toolbar.winId())
+    c.toolbar.activateWindow()
+    wait_for_rendered(c.toolbar.isActiveWindow)
     choice=named_item(c.toolbar.quick.rootObject(),'highlightStyle')
     def popup():
         return next((window for window in QApplication.topLevelWindows() if window.isVisible()
@@ -480,6 +482,8 @@ def test_highlight_dropdown_autoplays_three_icon_colors_without_changing_live_ro
     m.detailBody.setScrollOffset(10)
     c.toggle_settings();refresh()
     selected=m.selected_id;expanded=set(m.expanded_groups);data=m.data;offset=m.detailBody.scroll_offset
+    c.toolbar.activateWindow()
+    wait_for_rendered(c.toolbar.isActiveWindow)
     preview=c.toolbar.view.highlightPreview
     assert preview.glow is not None and preview.timer.isActive()
     choice=named_item(c.toolbar.quick.rootObject(),'highlightStyle')

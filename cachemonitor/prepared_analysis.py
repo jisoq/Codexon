@@ -1,13 +1,14 @@
 """Query-only AnalysisEngine adapter for a published prepared-store generation."""
-from collections import OrderedDict, defaultdict
+from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import replace
 
-from .analysis_engine import AnalysisEngine,retained_bytes
+from .analysis_engine import AnalysisEngine
 from .analysis_records import compact_record
 from .analytics import WholeRequestFacts, analyze, project_matches
 from .pricing import display_tier
 from .prepared_store import Limits, PreparedReader, NotReady, CapacityExceeded
+from .prepared_query_owners import PreparedQueryOwners
 
 
 def batches(values, count=128):
@@ -22,7 +23,7 @@ def batches(values, count=128):
 
 
 class PreparedAnalysisEngine(AnalysisEngine):
-    """Retains light owner state and ordinary bounded result caches, never raw history.
+    """Streams owner metadata through optional bounded caches, never raw history.
 
     The owner supplies a committed Token after ingestion. Every query/detail pins
     that token; a newer database generation returns StaleGeneration to the actor.
@@ -40,28 +41,18 @@ class PreparedAnalysisEngine(AnalysisEngine):
         self.snapshot = None
         self.revision = self.call_revision = self.generation = token.generation
         self.read_metrics = dict(range_rows=0, whole_rows=0, first_rows=0, header_rows=0)
-        self.owner_weights={};self.owner_bytes=0
-        self.order_identity=None
+        self._query_owners = PreparedQueryOwners(self)
+        self.sessions = self._query_owners.sessions
+        self.internal_sessions = self._query_owners.internal_sessions
+        self.order_identity = None
         try:
             with self.read_scope():
                 with self.snapshot._cursor('SELECT COALESCE(MAX(id),0) FROM publications WHERE state=1') as cursor:
-                    self.publication_batch=cursor.fetchone()[0]
-                self.order_identity=(token.instance,self.snapshot.order_batch)
-                after = None
-                while True:
-                    page = self.snapshot.catalog(after=after,query=True)
-                    for row in page.rows:
-                        self._adopt_owner(row['owner'], row['metadata'], row['call_metadata'], row['owner_ordinal'], row['request_maps'])
-                    if page.complete:
-                        break
-                    after = page.after
+                    self.publication_batch = cursor.fetchone()[0]
+                self.order_identity = (token.instance, self.snapshot.order_batch)
         except BaseException:
             self.close()
             raise
-
-    def _adopt_owner(self, key, metadata, call_metadata, ordinal, request_maps):
-        state, internal = self._owner_state(key, metadata, call_metadata, self.revision, ordinal, request_maps)
-        self._set_owner(key, state, internal)
 
     @staticmethod
     def _owner_state(key, metadata, call_metadata, revision, ordinal, request_maps):
@@ -78,122 +69,78 @@ class PreparedAnalysisEngine(AnalysisEngine):
                      call_owner={**source,**call_metadata}, request_maps=request_maps)
         return state, internal
 
-    def _set_owner(self, key, state, internal):
-        weight=retained_bytes((key,state),self.OWNER_BYTES)
-        admitted=self.owner_bytes-self.owner_weights.get(key,0)+weight
-        if admitted>self.OWNER_BYTES:
-            raise CapacityExceeded('prepared query owner metadata exceeds its aggregate budget')
-        self.owner_weights[key]=weight;self.owner_bytes=admitted
-        target = self.internal_sessions if internal else self.sessions
-        other = self.sessions if target is self.internal_sessions else self.internal_sessions
-        other.pop(key, None)
-        target[key] = state
-
     def adopt(self, token, changed_owners, removed=()):
-        """Ingestion supplies its owner delta; no new-generation catalog rescan."""
         if self.snapshot is not None:
             raise RuntimeError('finish the active query before adopting a generation')
-        pending = {}
-        removed=set(map(tuple,removed))
+        affected = set()
+        cached_parts = {key[0] for key in self.parts.data}
+        has_removals = False
+        for key in removed:
+            key = tuple(key)
+            has_removals = True
+            if self._query_owners.cached(key) is not None or key in cached_parts:
+                affected.add(key)
+        analytical_fields = ('home', 'id', 'sid', 'project', 'project_name', 'cwd', 'source', 'archived',
+                             'model', 'effort', 'service_tier', 'mode_conflict',
+                             'service_tier_source', 'display_service_tier')
+        changed_count = 0
+        same_metadata = not has_removals
         with self.reader.pin(token, cancel=self.cancel) as snapshot:
             for key in changed_owners:
-                if len(pending) >= self.reader.limits.owners_per_batch:
+                if changed_count >= self.reader.limits.owners_per_batch:
                     raise CapacityExceeded('owner adoption exceeds the committed batch bound')
+                changed_count += 1
                 key = tuple(key)
+                previous = self._query_owners.cached(key)
+                if previous is not None or key in cached_parts:
+                    affected.add(key)
                 owner = snapshot.owner(*key)
-                pending[key] = (self._owner_state(key, owner['metadata'], owner['call_metadata'], token.generation, owner['owner_ordinal'], owner['request_maps'])
-                                if owner is not None else None)
+                if owner is None:
+                    same_metadata = False
+                    continue
+                state, internal = self._owner_state(
+                    key, owner['metadata'], owner['call_metadata'], token.generation,
+                    owner['owner_ordinal'], owner['request_maps'])
+                if previous is None:
+                    same_metadata = False
+                else:
+                    old_state, old_internal = previous
+                    if internal != old_internal or any(
+                            old_state['call_owner'].get(field) != state['call_owner'].get(field)
+                            or old_state['prepared'].get(field) != state['prepared'].get(field)
+                            for field in analytical_fields):
+                        same_metadata = False
             with snapshot._cursor('SELECT COALESCE(MAX(id),0) FROM publications WHERE state=1') as cursor:
-                publication_batch=cursor.fetchone()[0]
+                publication_batch = cursor.fetchone()[0]
             with snapshot._cursor('SELECT 1 FROM calls r INDEXED BY calls_batch '
                     'JOIN publications p ON p.id=r.batch '
                     'WHERE r.batch>? AND r.batch<=? AND p.state=1 LIMIT 1',
-                    (self.publication_batch,publication_batch)) as cursor:
-                calls_changed=cursor.fetchone() is not None
-            analytical_fields=('home','id','sid','project','project_name','cwd','source','archived',
-                               'model','effort','service_tier','mode_conflict',
-                               'service_tier_source','display_service_tier')
-            same_facts=not calls_changed and not removed
-            for key,replacement in pending.items():
-                previous=self.sessions.get(key,self.internal_sessions.get(key))
-                if previous is None or replacement is None:
-                    same_facts=False;break
-                state,internal=replacement
-                if (internal!=(key in self.internal_sessions) or any(
-                        previous['call_owner'].get(field)!=state['call_owner'].get(field)
-                        or previous['prepared'].get(field)!=state['prepared'].get(field)
-                        for field in analytical_fields)):
-                    same_facts=False;break
-            order = {}
-            order_bytes = 0
-            order_identity=(token.instance,snapshot.order_batch)
-            same_order=(order_identity==self.order_identity and not removed
-                        and all(key in self.sessions or key in self.internal_sessions for key in pending)
-                        and all(value is not None for value in pending.values()))
-            entries=(dict(owner=key,owner_ordinal=pending[key][0]['owner_ordinal'] if key in pending else state['owner_ordinal'])
-                     for states in (self.sessions,self.internal_sessions) for key,state in states.items()) if same_order else self._pages(snapshot.ordering)
-            for entry in entries:
-                key, ordinal = entry['owner'], entry['owner_ordinal']
-                order_bytes += retained_bytes((key,ordinal),self.OWNER_BYTES)+160
-                if order_bytes > self.OWNER_BYTES:
-                    raise CapacityExceeded('query catalog order exceeds its metadata budget')
-                if key in order:
-                    raise NotReady('catalog order repeats a query owner')
-                order[key] = ordinal
-        expected=(self.sessions.keys()|self.internal_sessions.keys()|pending.keys())-removed
-        expected.difference_update(key for key,value in pending.items() if value is None)
-        if order.keys() != expected:
-            raise NotReady('catalog order does not match adopted query owners')
-        differences = {}
-        for key,ordinal in order.items():
-            value = pending.get(key)
-            state = value[0] if value is not None else self.sessions.get(key,self.internal_sessions.get(key))
-            differences[key] = retained_bytes(ordinal,self.OWNER_BYTES)-retained_bytes(state['owner_ordinal'],self.OWNER_BYTES)
-        weights={key:retained_bytes((key,value[0]),self.OWNER_BYTES) if value is not None else 0
-                 for key,value in pending.items()}
-        admitted=(self.owner_bytes-sum(self.owner_weights.get(key,0) for key in pending.keys()|removed)
-                  +sum(weight for key,weight in weights.items() if key not in removed)+sum(differences.values()))
-        if admitted>self.OWNER_BYTES:
-            raise CapacityExceeded('prepared query metadata adoption exceeds its aggregate budget')
+                    (self.publication_batch, publication_batch)) as cursor:
+                calls_changed = cursor.fetchone() is not None
+            order_identity = (token.instance, snapshot.order_batch)
+        delta_known = token == self.token or (
+            token.instance == self.token.instance and token.generation == self.token.generation + 1
+            and (changed_count > 0 or has_removals))
+        same_order = order_identity == self.order_identity
+        same_facts = delta_known and same_metadata and same_order and not calls_changed
+        reset_owners = not delta_known or not same_order
         self.token = token
-        self.order_identity=order_identity
-        self.publication_batch=publication_batch
+        self.order_identity = order_identity
+        self.publication_batch = publication_batch
         self.revision = self.generation = token.generation
-        same_facts=same_facts and same_order
-        if not same_facts:self.call_revision=token.generation
-        self.results.clear()
-        affected=set(pending)|{tuple(key) for key in removed}
-        self.parts.discard(lambda key:key[0] in affected)
-        self.page_results.discard(lambda key:not same_facts or key[0]!='performance')
+        self._query_owners.invalidate(affected, clear=reset_owners)
         if not same_facts:
-            for name in ('_category_projection','_trend_catalog','_trend_bounds'):
-                self.__dict__.pop(name,None)
-        for key in removed:
-            self.sessions.pop(tuple(key), None)
-            self.internal_sessions.pop(tuple(key), None)
-            self.owner_bytes-=self.owner_weights.pop(tuple(key),0)
-        for key,state in pending.items():
-            if key in removed:
-                continue
-            if state is None:
-                self.sessions.pop(key, None)
-                self.internal_sessions.pop(key, None)
-                self.owner_bytes-=self.owner_weights.pop(key,0)
-            else:
-                value,internal=state
-                target=self.internal_sessions if internal else self.sessions
-                other=self.sessions if internal else self.internal_sessions
-                other.pop(key,None)
-                target[key]=value
-                self.owner_weights[key]=weights[key]
-        for key, ordinal in order.items():
-            state = self.sessions.get(key, self.internal_sessions.get(key))
-            difference = differences[key]
-            state['owner_ordinal'] = ordinal
-            self.owner_weights[key] += difference
-        self.owner_bytes=admitted
-        self.sessions = OrderedDict(sorted(self.sessions.items(), key=lambda pair:pair[1]['owner_ordinal']))
-        self.internal_sessions = OrderedDict(sorted(self.internal_sessions.items(), key=lambda pair:pair[1]['owner_ordinal']))
+            self.call_revision = token.generation
+        self.results.clear()
+        if reset_owners:
+            self.parts.clear()
+        else:
+            self.parts.discard(lambda key: key[0] in affected)
+        self.page_results.discard(lambda key: not same_facts or key[0] != 'performance')
+        if not same_facts:
+            for name in ('_category_projection', '_trend_catalog', '_trend_bounds'):
+                self.__dict__.pop(name, None)
+
     @contextmanager
     def read_scope(self):
         if self.snapshot is not None:
@@ -231,15 +178,11 @@ class PreparedAnalysisEngine(AnalysisEngine):
             del page
 
     def _selected(self, q):
-        for key, state in self.sessions.items():
+        for key, state in self._query_owners.items(False, home=q.get('home') or None, sid=q.get('sid') or None):
             source = state['prepared']
             if not q.get('archived', True) and source.get('archived'):
                 continue
             if q.get('source') and source.get('source', 'unknown') != q['source']:
-                continue
-            if q.get('home') and key[0] != q['home']:
-                continue
-            if q.get('sid') and key[1] != q['sid']:
                 continue
             if q.get('project') and not project_matches(source, q['project']):
                 continue

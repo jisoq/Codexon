@@ -225,7 +225,7 @@ def test_archive_failure_keeps_normal_writer_publication_live_and_retries_saved_
     def publish(sequence):
         now=time.time()
         snapshot=empty_snapshot(channel.homes,channel.path,now)
-        snapshot.update(sessions=[source],usage_collection_complete=True,last_usage_collection_success=now,
+        snapshot.update(sessions=[source],catalog_scope='full',usage_collection_complete=True,last_usage_collection_success=now,
                         request_activity=[],quota_by_home={})
         snapshot['index'].update(loading=False,usage_complete=True,last_usage_success=now)
         channel.publish(snapshot,'mismatch-runtime',sequence)
@@ -242,6 +242,7 @@ def test_archive_failure_keeps_normal_writer_publication_live_and_retries_saved_
 
     publish(1)
     writer=PreparedWriter(channel.homes,channel.path,None,quota)
+    writer.set_aggregate('mismatch-archive-fixture')
     try:
         first=receive(writer,lambda value:value.get('mismatch_history',{}).get('status')=='retry_pending')
         assert first['mismatch_history']['pending']==1

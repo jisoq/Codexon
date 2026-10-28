@@ -31,6 +31,69 @@ def calls():
             for i in range(3)]
 
 
+def test_catalog_order_checks_heads_newer_than_saved_order_and_staged_membership(tmp_path):
+    from cachemonitor.prepared_ingest import pages
+    owners = [('home', name) for name in ('a', 'b', 'c', 'new')]
+    dependencies = dict.fromkeys(storage.DEPENDENCIES, 1)
+    dependencies['source_digest'] = '1'*64
+
+    def declare(stage, owner, title, ordinal):
+        stage.owner(*owner, dict(home=owner[0], id=owner[1], title=title),
+                    dependencies, source_ordinal=ordinal)
+
+    with storage.PreparedStore(tmp_path/'catalog-heads.sqlite') as store:
+        stage = store.begin(('source', 1))
+        for ordinal, owner in enumerate(owners[:3]):
+            declare(stage, owner, owner[1], ordinal)
+        stage.catalog_order((owner, ordinal) for ordinal, owner in enumerate(owners[:3]))
+        stage.publish(('source', 1), ready=True)
+
+        stage = store.begin(('source', 2))
+        declare(stage, owners[0], 'Updated', 0)
+        declare(stage, owners[1], 'b', 1)
+        stage.remove_owner(owners[1])
+        stage.publish(('source', 2), ready=True)
+
+        stage = store.begin(('source', 3))
+        with pytest.raises(storage.StaleGeneration, match='absent prepared owner'):
+            stage.catalog_order((owner, ordinal) for ordinal, owner in enumerate(owners[:3]))
+        stage.abort()
+
+        stage = store.begin(('source', 4))
+        declare(stage, owners[3], 'New', 0)
+        expected = [owners[3], owners[0], owners[2]]
+        stage.catalog_order((owner, ordinal) for ordinal, owner in enumerate(expected))
+        stage.publish(('source', 4), ready=True)
+        with store.read_current() as view:
+            assert [row['owner'] for row in pages(view.ordering)] == expected
+            assert view.owner(*owners[0])['metadata']['title'] == 'Updated'
+            assert view.owner(*owners[1]) is None
+
+        stage = store.begin(('source', 5))
+        declare(stage, owners[0], 'Updated', 1)
+        stage.remove_owner(owners[0])
+        with pytest.raises(storage.StaleGeneration, match='absent prepared owner'):
+            stage.catalog_order((owner, ordinal) for ordinal, owner in enumerate(expected))
+        stage.abort()
+
+
+def test_catalog_order_rechecks_deletion_after_order_in_the_same_batch(tmp_path):
+    owners = [('home', 'removed'), ('home', 'live')]
+    dependencies = dict.fromkeys(storage.DEPENDENCIES, 1)
+    dependencies['source_digest'] = '1'*64
+    with storage.PreparedStore(tmp_path/'catalog-same-batch.sqlite') as store:
+        stage = store.begin(('source', 1))
+        for ordinal, owner in enumerate(owners):
+            stage.owner(*owner, dict(home=owner[0], id=owner[1]), dependencies, source_ordinal=ordinal)
+        stage.catalog_order((owner, ordinal) for ordinal, owner in enumerate(owners))
+        stage.remove_owner(owners[0])
+        stage.publish(('source', 1), ready=True)
+        stage = store.begin(('source', 2))
+        with pytest.raises(storage.StaleGeneration, match='absent prepared owner'):
+            stage.catalog_order([(owners[0], 0)])
+        stage.abort()
+
+
 def test_publication_is_atomic_and_interrupted_staging_does_not_replace_saved_facts(tmp_path):
     path = tmp_path/'analysis.sqlite'
     rows = calls()
@@ -113,14 +176,14 @@ def test_cleanup_waits_for_pinned_reader_without_failing_writer_or_growing_wal(t
     from contextlib import closing
     import time
     from cachemonitor.prepared_runtime import PreparedWriter
-    from cachemonitor.prepared_speed_writer import PreparedSpeedWriter
+    from cachemonitor.prepared_speed_writer import PreparedWarningWorker
 
     path = tmp_path/'analysis.sqlite'
     rows = calls()
     writer = object.__new__(PreparedWriter)
     writer.stopped = Event()
     with (storage.PreparedStore(path) as store, storage.PreparedReader(path) as reader,
-          closing(PreparedSpeedWriter(store, preparation='test')) as speed_writer):
+          closing(PreparedWarningWorker(store, preparation='test')) as speed_writer):
         first = publish(store, 1, rows)
         store.db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
         with reader.pin(first) as old:
@@ -203,7 +266,7 @@ def test_prepared_shutdown_cancellation_is_not_reported_as_a_failure(tmp_path,mo
     writer.arguments=[],tmp_path/'index.sqlite',None,tmp_path/'quota.sqlite'
     writer.stopped=Event()
     if stopping:writer.stopped.set()
-    writer.output=SimpleNamespace(put=messages.append)
+    writer.output=SimpleNamespace(put=messages.append,offer_progress=lambda message:True)
     def cancelled(*args,**kwargs):raise storage.ReadCancelled('cancelled work')
     monkeypatch.setattr(prepared_runtime,'CollectionClient',cancelled)
     writer._run()
@@ -224,7 +287,7 @@ def test_prepared_failures_keep_sanitized_diagnostics_without_static_fallthrough
     writer = object.__new__(prepared_runtime.PreparedWriter)
     writer.arguments = [], tmp_path/'index.sqlite', tmp_path/'evidence.sqlite', quota
     writer.stopped = Event()
-    writer.output = SimpleNamespace(put=messages.append)
+    writer.output = SimpleNamespace(put=messages.append,offer_progress=lambda message:True)
     writer._run()
     assert messages.pop()['kind']=='fatal'
 
@@ -1395,6 +1458,14 @@ def test_catalog_order_preserves_packets_and_rejects_incomplete_budgeted_stage(t
                 'WHERE o.home=? AND o.sid=?', owner).fetchone())
 
         before = {owner: stored_packets(owner) for owner in owners}
+        stage = store.begin(('source', 2))
+        with pytest.raises(storage.IncompletePublication,match='exact complete prepared membership'):
+            stage.catalog_order([(owners[0],0)])
+        with pytest.raises(storage.IncompletePublication):
+            stage.publish(('source', 2),ready=True)
+        stage.abort()
+        assert store.token == previous
+        assert {owner: stored_packets(owner) for owner in owners} == before
         positions = [(owner, len(owners)-number-1) for number, owner in enumerate(owners)]
         stage = store.begin(('source', 2))
         # The first bounded write may commit internally, but budget exhaustion
@@ -1503,30 +1574,21 @@ def test_activity_reorder_publishes_order_without_rewriting_analyzed_owners(tmp_
         assert updates[0]['changed'] == () and updates[0]['writes']['owners'] == 0
         assert store.db.execute('SELECT count(*) FROM owner_versions').fetchone()[0] == bodies
         assert store.token.generation == previous.generation+1
-        # Reject incomplete or over-budget order before changing the old
-        # publication/query token or any retained owner content.
         publisher_owners=publisher.owners
         engine_sessions=engine.sessions
-        original_order=storage.Snapshot.ordering
-        with monkeypatch.context() as invalid:
-            def incomplete(view, **kwargs):
-                page=original_order(view,**kwargs)
-                return replace(page,rows=tuple(row for row in page.rows if row['owner']!=owners[0]))
-            invalid.setattr(storage.Snapshot,'ordering',incomplete)
-            with pytest.raises(storage.NotReady):publisher.adopt(store,())
-            with pytest.raises(storage.NotReady):engine.adopt(store.token,())
-        assert publisher.token==previous and publisher.owners is publisher_owners
-        assert engine.token==previous and engine.sessions is engine_sessions
         with monkeypatch.context() as capacity:
             capacity.setattr(publisher,'STATE_BYTES',1)
             capacity.setattr(engine,'OWNER_BYTES',1)
             with pytest.raises(storage.CapacityExceeded):publisher.adopt(store,())
-            with pytest.raises(storage.CapacityExceeded):engine.adopt(store.token,())
+            engine.adopt(store.token,())
+            assert list(engine.sessions)==list(reversed(owners))
+            assert [engine.sessions[owner]['owner_ordinal'] for owner in owners]==[2,1,0]
         assert publisher.token==previous and publisher.owners is publisher_owners
-        assert engine.token==previous and engine.sessions is engine_sessions
+        assert engine.token==store.token and engine.sessions is engine_sessions
         with monkeypatch.context() as order_only:
             def forbidden(*args, **kwargs):
                 raise AssertionError('order adoption must not read owner content or derived packets')
+            order_only.setattr(storage.Snapshot, 'ordering', forbidden)
             order_only.setattr(storage.Snapshot, 'owner', forbidden)
             order_only.setattr(storage.Snapshot, 'derived', forbidden)
             publisher.adopt(store, ())
@@ -1990,7 +2052,9 @@ def test_overlay_detail_completes_without_restarting_pending_page(tmp_path, monk
     page_starts = []
     failures = []
     writer = SimpleNamespace(path=tmp_path/'prepared.sqlite', output=output,
-                             close=lambda:closed.append('writer'))
+                             close=lambda:closed.append('writer'),
+                             set_aggregate=lambda request_id:output.put(dict(kind='snapshot',
+                                 value=dict(aggregate_request=request_id),token=('instance',1),transition=None)))
     monkeypatch.setattr(prepared_runtime, 'PreparedWriter', lambda *args:writer)
     class Handler:
         def __init__(self, path):pass
@@ -2039,3 +2103,332 @@ def test_overlay_detail_completes_without_restarting_pending_page(tmp_path, monk
         parent.close();child.close();output.close()
     assert not thread.is_alive() and not failures
     assert closed.count('reader') == 2 and closed.count('writer') == 1
+
+
+def test_inventory_projects_model_choices_and_charges_the_complete_packet(tmp_path):
+    owners=(('home','missing'),('home','empty'),('home','unknown'))
+    choices=(None,dict(models=[]),dict(models=['미확인'],combinations=['x'*4000]))
+    dependency={name:1 for name in storage.DEPENDENCIES}
+    dependency['source_digest']='1'*64
+    path=tmp_path/'inventory-models.sqlite'
+    with storage.PreparedStore(path) as store:
+        stage=store.begin(('source',1))
+        for owner,choice in zip(owners,choices):
+            stage.owner(*owner,dict(home=owner[0],id=owner[1]),dependency,
+                source_ordinal=0,choices=choice)
+            stage.calls(owner,[],reconcile=True)
+        token=stage.publish(('source',1),ready=True)
+        with store.read_current() as view:
+            page=view.inventory()
+            assert [value['models'] for value in page.rows]==[None,[],['미확인']]
+            assert page.encoded_bytes==sum(len(storage.pack(dependency))+len(storage.pack(choice))
+                +4*sum(map(len,owner)) for owner,choice in zip(owners,choices))
+            selected=view.inventory(owners=(owners[-1],))
+        for limits in (replace(store.limits,page_bytes=selected.encoded_bytes-1),
+                       replace(store.limits,page_objects_bytes=selected.object_bytes-1)):
+            with storage.PreparedReader(path,limits) as reader,reader.pin(token) as view:
+                with pytest.raises(storage.CapacityExceeded,match='delivered-page'):
+                    view.inventory(owners=(owners[-1],))
+
+
+def test_prepared_history_grows_past_legacy_database_admission(tmp_path):
+    from types import SimpleNamespace
+    from cachemonitor.prepared_ingest import pages
+
+    path = tmp_path/'growing-history.sqlite'
+    original = calls()
+    with storage.PreparedStore(path) as store:
+        previous = publish(store, 1, original)
+    with sqlite3.connect(path) as db:
+        page_count = db.execute('PRAGMA page_count').fetchone()[0]
+        page_size = db.execute('PRAGMA page_size').fetchone()[0]
+        assert db.execute('PRAGMA quick_check(1)').fetchone()[0] == 'ok'
+    legacy = SimpleNamespace(**(vars(storage.Limits()) | {
+        'database_bytes': (page_count-1)*page_size,
+    }))
+    replacement = [dict(key=f'call-{number:04d}-'+('x'*256), ts=100+number,
+                        session_ordinal=number, turn='request', input=100,
+                        cached=20, output=10, cost=1.)
+                   for number in range(200)]
+    with storage.PreparedStore(path, limits=legacy) as store:
+        assert store.token == previous
+        with store.read_current() as view:
+            assert [row['key'] for row in pages(view.calls, OWNER)] == [row['key'] for row in original]
+        current = publish(store, 2, replacement)
+        with store.read_current() as view:
+            assert view.token == current
+            assert [row['key'] for row in pages(view.calls, OWNER)] == [row['key'] for row in replacement]
+        assert store.db.execute('PRAGMA page_count').fetchone()[0] > page_count
+    with storage.PreparedStore(path) as store:
+        assert store.token == current
+        with store.read_current() as view:
+            assert len(list(pages(view.calls, OWNER))) == len(replacement)
+
+
+def test_catalog_order_streams_complete_membership_past_page_scratch(tmp_path):
+    from cachemonitor.prepared_ingest import pages
+
+    owners = [('home', f'owner-{number:03d}-'+('x'*128)) for number in range(40)]
+    dependency = dict.fromkeys(storage.DEPENDENCIES, 1)
+    dependency['source_digest'] = '1'*64
+    with storage.PreparedStore(tmp_path/'streamed-order.sqlite') as store:
+        stage = store.begin(('source', 1))
+        for ordinal, owner in enumerate(owners):
+            stage.owner(*owner, dict(home=owner[0], id=owner[1]), dependency,
+                        source_ordinal=ordinal)
+        stage.publish(('source', 1), ready=True)
+        stage = store.begin(('source', 2))
+        stage.limits = replace(stage.limits, page_objects_bytes=1024, write_rows=2)
+        expected = list(reversed(owners))
+        stage.catalog_order((owner, ordinal) for ordinal, owner in enumerate(expected))
+        stage.publish(('source', 2), ready=True)
+        with store.read_current() as view:
+            assert [row['owner'] for row in pages(view.ordering)] == expected
+            assert [view.owner(*owner)['owner_ordinal'] for owner in expected] == list(range(len(owners)))
+
+
+def catalog_page_client(session_rows, owner_keys, *, selected, paged=True):
+    from types import SimpleNamespace
+
+    parents = {(home, sid): parent for home, sid, parent in session_rows}
+    demand = dict(selected=selected, aggregate=False)
+    header = dict(ts=100, homes=['home', 'other-home'], demand=demand,
+                  catalog_complete=True, usage_collection_complete=True,
+                  index=dict(loading=False, usage_complete=True))
+    entries = {owner: dict(home=owner[0], sid=owner[1], revision=1,
+                          body_digest=f'{ordinal+1:064x}',
+                          state=dict(collection_complete=True), metadata_available=True,
+                          owner_lineage=dict(parent_thread_id=parents.get(owner)))
+               for ordinal, owner in enumerate(owner_keys)}
+    base = dict(source='live', scope='scope', path='index.sqlite',
+                selected_homes=['home', 'other-home'], publication=('source', 1),
+                catalog_identity=('source', 1), header=header,
+                membership_complete=True, include_metadata=True, metadata_kind='lineage')
+    pages = []
+    if paged:
+        for start in range(0, len(session_rows), 7):
+            pages.append(dict(base, membership_format='paged-v1', owners={},
+                membership=dict(session_catalog=session_rows[start:start+7], demand_members=[])))
+        for start in range(0, len(owner_keys), 7):
+            pages.append(dict(base, membership_format='paged-v1', owners={},
+                membership=dict(session_catalog=[], demand_members=[list(key) for key in owner_keys[start:start+7]])))
+    else:
+        header.update(session_catalog=session_rows, demand_members=[list(key) for key in owner_keys])
+    for start in range(0, len(owner_keys), 3):
+        page = dict(base, owners={owner: entries[owner] for owner in owner_keys[start:start+3]})
+        if paged:
+            page.update(membership_format='paged-v1', membership=dict(session_catalog=[], demand_members=[]))
+        pages.append(page)
+    if not pages:
+        pages.append(dict(base, owners={}))
+    for ordinal, page in enumerate(pages):
+        page['cursor'] = ('page', ordinal+1) if ordinal+1 < len(pages) else None
+
+    def poll_catalog(*, cursor=None, **kwargs):
+        return pages[0 if cursor is None else cursor[1]]
+
+    def selected_owner_stream(*args, **kwargs):
+        raise AssertionError('complete catalog lineage must not load source bodies')
+
+    return SimpleNamespace(poll_catalog=poll_catalog, active_demand=demand,
+                           selected_owner_stream=selected_owner_stream, pages=pages)
+
+
+@pytest.mark.parametrize('paged', [False, True])
+def test_complete_catalog_preserves_selected_family_with_unrelated_owners(tmp_path, paged):
+    from cachemonitor.prepared_ingest import mode_context, mode_parent_index, read_catalog
+
+    parent, selected, child = (('home', name) for name in ('parent', 'selected', 'child'))
+    unrelated = [('home', f'unrelated-{number:03d}-'+('x'*128)) for number in range(40)]
+    owners = [child, parent, *unrelated, selected]
+    rows = [(*owner, None) for owner in unrelated]
+    rows.extend([(*selected, parent[1]), (*child, selected[1]), (*parent, None)])
+    client = catalog_page_client(rows, owners, selected=[[None, selected[1]]], paged=paged)
+    catalog = read_catalog(client)
+    assert catalog['membership_complete']
+    assert list(catalog['owners']) == [child, selected]
+    assert [entry['source_ordinal'] for entry in catalog['owners'].values()] == [0, 1]
+    assert set(catalog['selected_members']) == {selected, child}
+    assert len(catalog['mode_sources']) == len(unrelated)+1
+    parents = mode_parent_index(catalog)
+    assert mode_context(selected, catalog, parents=parents) == (parent, selected)
+    assert mode_context(child, catalog, parents=parents) == (parent, selected, child)
+
+
+@pytest.mark.parametrize('ambiguous', [False, True])
+def test_paged_catalog_resolves_selection_against_late_unloaded_membership(tmp_path, ambiguous):
+    from cachemonitor.prepared_ingest import read_catalog
+
+    selected = ('home', 'selected')
+    rows = [(*selected, None)]
+    if ambiguous:
+        rows.extend(('other-home', f'unloaded-{number}', None) for number in range(8))
+        rows.append(('other-home', selected[1], None))
+    client = catalog_page_client(rows, [selected], selected=[[None, selected[1]]])
+    catalog = read_catalog(client)
+    assert catalog['membership_complete']
+    assert list(catalog['owners']) == ([] if ambiguous else [selected])
+    assert set(catalog['selected_members']) == (set() if ambiguous else {selected})
+    assert list(catalog['mode_sources']) == ([selected] if ambiguous else [])
+    assert catalog['header']['selected_resolutions'] == [[selected[1],2 if ambiguous else 1]]
+    assert 'session_catalog' not in catalog['header']
+
+
+@pytest.mark.parametrize('parent',[None,''])
+def test_catalog_root_lineage_accepts_the_published_parent_forms(tmp_path,parent):
+    from cachemonitor.prepared_ingest import mode_parent_index,read_catalog
+    owner = ('home','root')
+    client = catalog_page_client([(*owner,None)],[owner],selected=[[None,owner[1]]])
+    for page in client.pages:
+        if owner in page['owners']:
+            page['owners'][owner]['owner_lineage']['parent_thread_id'] = parent
+    catalog = read_catalog(client)
+    try:
+        assert catalog['membership_complete']
+        assert list(catalog['owners']) == [owner]
+        assert mode_parent_index(catalog).get(owner) is None
+    finally:
+        catalog.close()
+
+
+def test_standalone_catalog_native_cleanup_can_run_on_another_thread(monkeypatch):
+    import gc
+    import sqlite3
+    import sys
+    import weakref
+    from threading import Thread
+    from cachemonitor.prepared_ingest import read_catalog
+
+    class Connection(sqlite3.Connection):
+        pass
+
+    original = sqlite3.connect
+    connections = []
+    def connect(*args,**kwargs):
+        connection = original(*args,**dict(kwargs,factory=Connection))
+        connections.append(weakref.ref(connection))
+        return connection
+    errors = []
+    monkeypatch.setattr(storage.sqlite3,'connect',connect)
+    monkeypatch.setattr(sys,'unraisablehook',errors.append)
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        owner = ('home','root')
+        catalog = read_catalog(catalog_page_client([(*owner,None)],[owner],selected=[[None,owner[1]]]))
+        owners = catalog['owners']
+        assert list(owners) == [owner]
+        reference = weakref.ref(catalog)
+        del catalog,owners
+        worker = Thread(target=gc.collect)
+        worker.start();worker.join(5)
+        assert not worker.is_alive()
+        assert not errors,[str(error.exc_value) for error in errors]
+        assert reference() is None
+        assert len(connections)==1 and connections[0]() is None
+    finally:
+        if enabled:gc.enable()
+
+
+def test_incomplete_catalog_exposes_status_without_partial_membership(tmp_path):
+    from cachemonitor.prepared_ingest import read_catalog
+
+    selected = ('home', 'selected')
+    client = catalog_page_client([(*selected, None)], [selected], selected=[[None, selected[1]]])
+    client.pages[-1]['membership_complete'] = False
+    path = tmp_path/'catalog-interrupted.sqlite'
+    with storage.PreparedStore(path) as store:
+        previous = publish(store, 1, calls())
+        pending = read_catalog(client)
+        assert pending['membership_complete'] is False
+        assert not pending['owners']
+        assert 'membership' not in pending
+        assert not {'session_catalog', 'demand_members'}.intersection(pending['header'])
+        assert store.token == previous
+        with store.read_current() as view:
+            assert view.record(*OWNER, 'call-0')['cost'] == 1.
+
+
+def test_pinned_page_continuation_preserves_generation_and_per_operation_vm_guard(tmp_path):
+    from cachemonitor.prepared_ingest import pages
+
+    owners = [('home', f'owner-{number:03d}') for number in range(80)]
+    dependency = dict.fromkeys(storage.DEPENDENCIES, 1)
+    dependency['source_digest'] = '1'*64
+    with storage.PreparedStore(tmp_path/'page-vm-slices.sqlite') as store:
+        stage = store.begin(('source', 1))
+        for ordinal, owner in enumerate(owners):
+            stage.owner(*owner, dict(home=owner[0], id=owner[1], title='Original'),
+                        dependency, source_ordinal=ordinal)
+        token = stage.publish(('source', 1), ready=True)
+        limits = replace(store.limits, page_rows=2, read_vm_steps=20_000, read_seconds=10)
+        with storage.PreparedReader(store.path, limits) as reader, reader.pin(token) as view:
+            rows = pages(view.catalog)
+            first = next(rows)
+            stage = store.begin(('source', 2))
+            stage.owner(*owners[0], dict(home=owners[0][0], id=owners[0][1], title='Updated'), dependency)
+            updated = stage.publish(('source', 2), ready=True)
+            actual = [first, *rows]
+            assert [row['owner'] for row in actual] == owners
+            assert all(row['metadata']['title']=='Original' for row in actual)
+            assert view.token == token
+        with store.read_current() as current:
+            assert current.token == updated
+            assert current.owner(*owners[0])['metadata']['title'] == 'Updated'
+        with storage.PreparedReader(store.path, replace(limits, read_vm_steps=1)) as reader:
+            with reader.pin(updated) as view:
+                with pytest.raises(storage.ReadCancelled):
+                    list(pages(view.catalog))
+                assert view.closed
+
+
+def test_pinned_page_continuation_renews_time_only_between_pages(tmp_path, monkeypatch):
+    from cachemonitor.prepared_ingest import pages
+
+    with storage.PreparedStore(tmp_path/'page-time-slices.sqlite') as store:
+        token = publish(store, 1, calls())
+        limits = replace(store.limits, page_rows=1, read_seconds=1)
+        clock = [100.]
+        with monkeypatch.context() as patch:
+            patch.setattr(storage.time, 'monotonic', lambda: clock[0])
+            with storage.PreparedReader(store.path, limits) as reader, reader.pin(token) as view:
+                rows = pages(view.calls, OWNER)
+                first = next(rows)
+                clock[0] += 2
+                assert [first['key'], *(row['key'] for row in rows)] == ['call-0', 'call-1', 'call-2']
+                assert view.token == token
+
+
+def test_pinned_page_continuation_handles_empty_progress_and_cancellation(tmp_path):
+    from types import MethodType
+
+    def advancing(self, *, after=None):
+        if after is None:
+            return storage.Page((), ('empty', 1), False, 0, 0)
+        return storage.Page(('complete',), None, True, 0, 0)
+
+    def stalled(self, *, after=None):
+        return storage.Page((), None, False, 0, 0)
+
+    with storage.PreparedStore(tmp_path/'page-continuation-controls.sqlite') as store:
+        token = publish(store, 1, calls())
+        limits = replace(store.limits, page_rows=1)
+        with storage.PreparedReader(store.path, limits) as reader:
+            with reader.pin(token) as view:
+                assert list(view.pages(MethodType(advancing, view))) == ['complete']
+                assert view.token == token
+                with pytest.raises(storage.IncompletePublication, match='cursor'):
+                    list(view.pages(MethodType(stalled, view)))
+                assert view.closed
+            stopped = Event()
+            with reader.pin(token, cancel=stopped) as view:
+                rows = view.pages(view.calls, OWNER)
+                assert next(rows)['key'] == 'call-0'
+                stopped.set()
+                with pytest.raises(storage.ReadCancelled):
+                    next(rows)
+                assert view.closed
+            with reader.pin(token) as view:
+                with storage.PreparedReader(store.path, limits) as other, other.pin(token) as foreign:
+                    with pytest.raises(ValueError, match='another read transaction'):
+                        list(view.pages(foreign.calls, OWNER))

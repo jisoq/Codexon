@@ -15,7 +15,7 @@ Item {
     implicitHeight: body.implicitHeight
     Accessible.role: root.failed ? Accessible.AlertMessage : root.terminal ? Accessible.StaticText : Accessible.ProgressBar
     Accessible.name: appLanguage.text(s.title || "불러오는 중") + ": " + appLanguage.text(s.detail || "")
-    Accessible.description: appLanguage.text(root.stages[Math.min(root.completedStages, root.stages.length-1)])
+    Accessible.description: s.guidanceText ? [s.progressText || "", s.elapsedText || "", s.guidanceText].filter(function(v) { return v.length > 0 }).join(" / ") : appLanguage.text(root.stages[Math.min(root.completedStages, root.stages.length-1)])
     property string announcedStatus: ""
     readonly property string statusText: Accessible.name
     onStatusTextChanged: announceStatus()
@@ -131,8 +131,8 @@ Item {
             }
         }
         UiText {
-            visible: !root.terminal && (!root.compact || !!root.s.slow)
-            text: appLanguage.text(root.s.slow ? "기록 처리에 시간이 걸리고 있습니다. 다른 탭을 이용할 수 있습니다." : "다른 탭을 이용할 수 있습니다.")
+            visible: !root.terminal && (!!root.s.guidanceText || !root.compact || !!root.s.slow)
+            text: root.s.guidanceText || appLanguage.text(root.s.slow ? "기록 처리에 시간이 걸리고 있습니다. 다른 탭을 이용할 수 있습니다." : "다른 탭을 이용할 수 있습니다.")
             wrapMode: Text.WordWrap
             font.family: appTheme.family
             font.pixelSize: 12
