@@ -147,9 +147,14 @@ def test_title_only_and_mixed_updates_do_not_reload_unchanged_facts(tmp_path,mon
             reference=AnalysisEngine();reference.ingest(values)
             with store.read_current() as view:
                 assert list(view.iter_calls(owner))==[storage.public_record(row) for row in reference.sessions[owner]['prepared']['history']]
-            # The committed inventory must remain usable across coordinator instances.
-            def forbidden(*args,**kwargs):raise AssertionError('unchanged conversion reread its inventory')
-            monkeypatch.setattr(storage.Snapshot,'inventory',forbidden)
+            original_inventory=storage.Snapshot.inventory
+            def bounded_inventory(view,*,owners=None,**kwargs):
+                assert owners is not None,'conversion requested the complete metadata population'
+                return original_inventory(view,owners=owners,**kwargs)
+            def forbidden_source(*args,**kwargs):
+                raise AssertionError('unchanged conversion decoded certified source history')
+            monkeypatch.setattr(storage.Snapshot,'inventory',bounded_inventory)
+            monkeypatch.setattr(client,'selected_owner_stream',forbidden_source)
             assert list(PreparedCohort(store,client,None,speed_writer=speed).convert(read_catalog(client)))==[]
     finally:
         client.close();writer.close()

@@ -2275,6 +2275,23 @@ def test_paged_catalog_resolves_selection_against_late_unloaded_membership(tmp_p
     assert 'session_catalog' not in catalog['header']
 
 
+@pytest.mark.parametrize('parent',[None,''])
+def test_catalog_root_lineage_accepts_the_published_parent_forms(tmp_path,parent):
+    from cachemonitor.prepared_ingest import mode_parent_index,read_catalog
+    owner = ('home','root')
+    client = catalog_page_client([(*owner,None)],[owner],selected=[[None,owner[1]]])
+    for page in client.pages:
+        if owner in page['owners']:
+            page['owners'][owner]['owner_lineage']['parent_thread_id'] = parent
+    catalog = read_catalog(client)
+    try:
+        assert catalog['membership_complete']
+        assert list(catalog['owners']) == [owner]
+        assert mode_parent_index(catalog).get(owner) is None
+    finally:
+        catalog.close()
+
+
 def test_incomplete_catalog_exposes_status_without_partial_membership(tmp_path):
     from cachemonitor.prepared_ingest import read_catalog
 

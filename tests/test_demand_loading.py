@@ -472,7 +472,8 @@ def test_writer_resolves_unavailable_target_without_loading_bodies_and_finds_new
         resolved=publication(service,writer,receiver,lambda value:value.get('catalog_complete')
             and [None,wanted] in value.get('demand',{}).get('selected',()))
         assert not resolved['sessions'] and not resolved['overlay_sessions']
-        assert sum(sid==wanted for _,sid,_ in resolved['session_catalog'])==(2 if ambiguous else 0)
+        assert resolved['selected_resolutions']==[[wanted,2 if ambiguous else 0]]
+        assert 'session_catalog' not in resolved
         assert not reads.bodies and not reads.cached and not reads.events
         if not ambiguous:
             created=write_session(home,NEW)
