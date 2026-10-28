@@ -173,6 +173,7 @@ RULES = (
     ('cachemonitor/preparation_progress.py', ('prepared', 'dashboard_queries', 'overlay_data', 'translation')),
     ('cachemonitor/prepared_query.py', ('prepared', 'analysis', 'dashboard_queries', 'details')),
     ('cachemonitor/prepared_analysis.py', ('prepared', 'analysis', 'dashboard_queries', 'details')),
+    ('cachemonitor/prepared_query_owners.py', ('prepared', 'analysis', 'dashboard_queries', 'details')),
     ('tests/fixtures/prepared-format6*', ('prepared',)),
     ('cachemonitor/prepared_history.py', ('prepared', 'analysis', 'dashboard_queries', 'details')),
     ('cachemonitor/prepared_category.py', ('prepared', 'analysis', 'dashboard')),

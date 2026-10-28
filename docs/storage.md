@@ -22,7 +22,7 @@ explicit; the earlier storage cleanup is not completion of that investigation.
 | Historical price calculations | Accounting updates when recorded inputs or price policy change | Preserve prior calculations and their policy identifiers. This is not a per-poll snapshot. Growth depends on calls and actual repricing. |
 | Current task/request activity | Collector-to-accounting synchronization | One current row per task/request. The unused append-only `tracking_activity_versions` journal is retired. Its readers were absent from the application. |
 | Collection transport database | Collector publishes changed sessions and activity | Compressed session and request payloads, plus one current snapshot. Durable data supports restart and upgrade recovery; live IPC avoids repeated full disk reads. |
-| Pending quota writes | Storage failure recovery | At most 4,096 ordinary items and 8 MiB of encoded data, with 32 control reservations. Database ceiling is 16 MiB. A full backlog pauses new reads instead of losing history. |
+| Pending quota writes | Storage failure recovery | The durable backlog admits 4,096 ordinary items and 8 MiB of encoded data, with 32 control reservations. Database ceiling is 16 MiB. One reserved in-flight observation can use the existing unsaved slot, up to 8 MiB, while a full backlog pauses new reads. The 64 KiB reservation estimates fetch room; it does not reject larger individual observations. |
 | Quota/analysis diagnostics | Failures and slow cycles | Three files of up to 256 KiB per diagnostic stream. Slow-cycle records are limited to one per minute. |
 | Runtime/control JSON and locks | Startup, shutdown, status, failure and recovery | Current state is replaced atomically. Heartbeat writes provide liveness, so a fixed file size does not mean zero I/O. Obsolete per-instance control files are small, but should be counted separately from usage history. |
 | Preferences and connection backups | Explicit settings/connection changes | Current preferences replace prior state. Configuration backups remain recoverable and may contain sensitive settings. They are not log files eligible for arbitrary eviction. |
@@ -54,6 +54,29 @@ Append format 4 retains raw request ordering and shared request facts. This
 replacement does not change source recordings, collection storage, quota ledgers,
 model evidence, or the mismatch archive.
 
+The prepared cache grows with retained source history. It has no application
+lifetime file ceiling. Disk errors and the existing write and WAL guards remain.
+Quota certificates grow with the facts they certify. Facts, request boundaries,
+and certificates commit together, and synchronization confirms that commit before
+acknowledging the source.
+
+The analysis writer stages complete catalog membership and owner work in
+file-backed SQLite tables. Bounded pages retain one source generation until the
+traversal completes. Incomplete membership cannot resolve an absent selection or
+retire previous facts. Query owner metadata uses a bounded optional cache. Evicted
+metadata remains readable from the same prepared generation.
+
+Quota synchronization stages large owner and coverage plans in the existing
+ledger connection's file-backed temporary tables. It applies bounded cohorts
+while coverage reports `loading=1`. Readers can observe partial coverage during
+that explicit loading state. Complete coverage is published after reconciliation.
+Owner facts and their certificates retain their existing atomic commit boundary.
+
+`Snapshot.pages` renews the elapsed allowance for each advancing bounded read.
+Cancellation, the generation pin, and the existing per-cursor SQL instruction
+allowance remain active. A long pinned traversal can retain WAL pages until it
+closes. Per-owner materialization and required-result guards still protect actual
+retained objects. Their defaults are separate from total history capacity.
 ## Retained event storage
 
 The usage index stores source paths and session owners once and references
