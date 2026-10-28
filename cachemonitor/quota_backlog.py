@@ -47,6 +47,7 @@ class ObservationBacklog:
         self.wal = False
         self.db = None
         self.unsaved = None
+        self._fetch_reserved = False
         self.issue = ''
         self.lock = threading.RLock()
 
@@ -133,15 +134,33 @@ class ObservationBacklog:
         return True
 
     @synchronized
+    def reserve_fetch(self):
+        """Admit one account fetch whose response can use the in-flight slot."""
+        if self._fetch_reserved or not self.available():
+            return False
+        self._fetch_reserved = True
+        return True
+
+    @synchronized
+    def cancel_fetch(self):
+        self._fetch_reserved = False
+
+    @synchronized
     def append(self, kind, value):
         encoded = json.dumps(value, ensure_ascii=False, separators=(',', ':')).encode()
+        admitted = self._fetch_reserved and kind in ('quota', 'failure')
+        if kind in ('quota', 'failure'):
+            self._fetch_reserved = False
         if self.unsaved is not None:
             return False
         try:
             self._store(kind, encoded)
         except BufferError:
-            self.issue = '한도 관측 복구 대기 공간이 가득 찼습니다. 새 기록을 받지 못했습니다.'
-            return False
+            if not admitted or len(encoded) > self.MAX_BYTES:
+                self.issue = '한도 관측 복구 대기 공간이 가득 찼습니다. 새 기록을 받지 못했습니다.'
+                return False
+            self.unsaved = (kind, encoded)
+            self.issue = '한도 관측 복구 대기 공간이 가득 찼습니다. 저장 복구까지 새 조회를 중지합니다.'
         except (sqlite3.Error, OSError):
             self.unsaved = (kind, encoded)
             self.issue = '한도 관측 임시 저장 실패: 새 조회를 중지했습니다. 종료 전 저장 공간을 확인하세요.'
@@ -169,6 +188,7 @@ class ObservationBacklog:
     @synchronized
     def close(self):
         saved = self.flush()
+        self._fetch_reserved = False
         if self.db is not None:
             self.db.close()
             self.db = None

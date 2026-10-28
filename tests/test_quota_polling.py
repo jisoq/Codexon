@@ -300,7 +300,7 @@ def test_rejected_live_observation_remains_visible_and_stops_new_reads(tmp_path,
         def fetch(self):
             reads.append(clock[0])
             return dict(source='live',account='test',requested_at=clock[0],observed_at=clock[0],
-                oversized='x'*module.ObservationBacklog.MAX_ITEM_BYTES,
+                oversized='x'*module.ObservationBacklog.MAX_BYTES,
                 windows={'weekly':dict(used_percent=10,resets_at=20000,window_minutes=10080)})
     class Wake:
         def clear(self):pass
