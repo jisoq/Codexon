@@ -27,10 +27,10 @@ from cachemonitor.analysis_records import compact_record, public_record
 from cachemonitor.observer_state import ProcessLock
 
 
-FORMAT = 7
+FORMAT = 8
 APPLICATION_ID = 0x43505250
 # Only versions whose dedicated, disposable schema is known to this writer.
-REBUILDABLE_FORMATS = frozenset((1, 2, 3, 4, 5, 6))
+REBUILDABLE_FORMATS = frozenset((1, 2, 3, 4, 5, 6, 7))
 METRICS = (
     'ts', 'session_ordinal', 'input', 'cached', 'written', 'output', 'reasoning',
     'total', 'uncached', 'ordinary_input', 'non_reasoning', 'rate', 'cost',
@@ -284,6 +284,9 @@ class CatalogWork(dict):
 
     def add_membership(self, name, rows):
         self.present.add(name)
+        if name=='matches':
+            self.setdefault('matches',[]).extend(rows)
+            return
         table = 'sessions' if name=='session_catalog' else 'members'
         for row in rows:
             self.check()
@@ -308,7 +311,7 @@ class CatalogWork(dict):
             self.check()
             try:
                 self.db.execute('INSERT INTO catalog_work_owners(work,ordinal,home,sid,entry,complete) '
-                    'VALUES(?,?,?,?,?,?)', (self.work,self.counts['owners'],*key,
+                    'VALUES(?,?,?,?,?,?)', (self.work,entry['source_ordinal'] if self.get('authority')=='selected' else self.counts['owners'],*key,
                     json.dumps(entry,ensure_ascii=False,separators=(',',':')),
                     int(bool(entry.get('state',{}).get('collection_complete')))))
             except sqlite3.IntegrityError as error:
@@ -394,7 +397,33 @@ class CatalogWork(dict):
             if self.cancel is not None:
                 self.db.set_progress_handler(None,0)
 
+    def finish_selection(self):
+        self.check()
+        self.db.execute('UPDATE catalog_work_sessions SET required=EXISTS('
+            'SELECT 1 FROM catalog_work_members m WHERE m.work=catalog_work_sessions.work '
+            'AND m.home=catalog_work_sessions.home AND m.sid=catalog_work_sessions.sid) WHERE work=?',
+            (self.work,))
+        self.db.execute('UPDATE catalog_work_owners SET admitted=complete AND EXISTS('
+            'SELECT 1 FROM catalog_work_members m WHERE m.work=catalog_work_owners.work '
+            'AND m.home=catalog_work_owners.home AND m.sid=catalog_work_owners.sid) WHERE work=?',
+            (self.work,))
+        missing = self.db.execute('SELECT 1 FROM catalog_work_members m WHERE m.work=? AND NOT EXISTS('
+            'SELECT 1 FROM catalog_work_owners o WHERE o.work=m.work AND o.home=m.home '
+            'AND o.sid=m.sid AND o.admitted=1) LIMIT 1', (self.work,)).fetchone()
+        self['membership_complete'] = bool(self['membership_complete'] and missing is None
+            and {'session_catalog','demand_members','matches'} <= self.present
+            and all(homes is not None for _,_,homes in self['matches']))
+        self['aggregate_complete'] = False
+        if self['membership_complete']:
+            self['header']['selected_resolutions'] = [[sid,len(homes)]
+                for home,sid,homes in self['matches'] if home is None]
+        return self.finish(None)
+
     def reindex(self):
+        if self.get('authority')=='selected':
+            self.db.execute('UPDATE catalog_work_owners SET financial_ordinal=ordinal WHERE work=? AND admitted=1',
+                            (self.work,))
+            return
         for ordinal,row in enumerate(self.owner_rows('admitted=1',fields='home,sid')):
             self.db.execute('UPDATE catalog_work_owners SET financial_ordinal=? WHERE work=? AND home=? AND sid=?',
                 (ordinal,self.work,row['home'],row['sid']))
@@ -694,7 +723,8 @@ def _schema():
     return f'''
         CREATE TABLE meta(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
             format INTEGER NOT NULL,instance TEXT NOT NULL,generation INTEGER NOT NULL,
-            ready INTEGER NOT NULL,source BLOB NOT NULL,order_batch INTEGER NOT NULL DEFAULT 0);
+            ready INTEGER NOT NULL,source BLOB NOT NULL,order_batch INTEGER NOT NULL DEFAULT 0,
+            selection_batch INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE publications(id INTEGER PRIMARY KEY AUTOINCREMENT,state INTEGER NOT NULL,
             source BLOB NOT NULL,input_bytes INTEGER NOT NULL DEFAULT 0);
         CREATE INDEX publications_state ON publications(state,id);
@@ -906,7 +936,7 @@ class PreparedStore:
         db.execute('COMMIT')
 
     def _order_schema(self):
-        return ('order_batch' in {row[1] for row in self.db.execute('PRAGMA table_info(meta)')}
+        return ({'order_batch','selection_batch'} <= {row[1] for row in self.db.execute('PRAGMA table_info(meta)')}
             and {'batch','owner','source_ordinal'} <= {
                 row[1] for row in self.db.execute('PRAGMA table_info(catalog_orders)')})
 
@@ -1019,7 +1049,7 @@ class PreparedStore:
         return self.stage
 
     @contextmanager
-    def read_current(self, *, staged=False, cancel=None, seconds=None):
+    def read_current(self, *, staged=False, cancel=None, seconds=None, selected=False):
         """Writer-only conversion view. Normal readers still require readiness."""
         if self.db is None:
             raise PreparedError('the prepared store is closed')
@@ -1034,7 +1064,7 @@ class PreparedStore:
         try:
             reader.limits = self.limits
             with reader._pin(self.token, cancel=cancel, seconds=seconds,
-                             allow_incomplete=True, staged_batch=batch) as snapshot:
+                             allow_incomplete=True, staged_batch=batch, selected=selected) as snapshot:
                 yield snapshot
             # A suspended speed generator still owns deferred TEMP cleanup.
             # Retire its connection so finalization cannot touch a later read.
@@ -1106,8 +1136,8 @@ class PreparedStore:
         if checkpoint_work:
             return checkpoint_work
         old_order = self.db.execute('SELECT r.rowid,r.batch FROM catalog_orders r '
-            'JOIN publications p ON p.id=r.batch WHERE p.state=1 AND r.batch<('
-            'SELECT order_batch FROM meta WHERE singleton=1) LIMIT ?', (rows,)).fetchall()
+            'JOIN publications p ON p.id=r.batch WHERE p.state=1 AND r.batch NOT IN ('
+            'SELECT order_batch FROM meta UNION ALL SELECT selection_batch FROM meta) LIMIT ?', (rows,)).fetchall()
         if old_order:
             with self._transaction():
                 self.db.executemany('DELETE FROM catalog_orders WHERE rowid=?', ((row[0],) for row in old_order))
@@ -1198,7 +1228,7 @@ class PreparedStore:
         row = self.db.execute('SELECT state FROM publications WHERE id=?', (batch,)).fetchone()
         if row is None or row[0] != 1:
             return
-        if self.db.execute('SELECT 1 FROM meta WHERE singleton=1 AND order_batch=?', (batch,)).fetchone():
+        if self.db.execute('SELECT 1 FROM meta WHERE singleton=1 AND (order_batch=? OR selection_batch=?)', (batch,batch)).fetchone():
             return
         for table in (*KINDS, 'owner_versions', 'seen', 'retired', 'owner_heads', 'owner_retired', 'catalog_orders', *CHECKPOINT_TABLES):
             if self.db.execute(f'SELECT 1 FROM {table} WHERE batch=? LIMIT 1', (batch,)).fetchone():
@@ -1250,6 +1280,8 @@ class Stage:
         self.facts_started = set()
         self.checkpoint_namespaces = set()
         self.catalog_staged = False
+        identity = unpack(source, self.limits)
+        self.selected = isinstance(identity, tuple) and len(identity)==5 and identity[4][0]=='selected'
         self.checkpoint_totals = None
         self.failed = False
         self.finished = False
@@ -1333,10 +1365,20 @@ class Stage:
                                     (owner,self.batch)).fetchone() if replacing else
                      self.db.execute('SELECT v.* FROM owner_heads h JOIN owner_versions v '
                                      'ON v.owner=h.owner AND v.batch=h.batch WHERE h.owner=?', (owner,)).fetchone())
+            if self.selected:
+                source_ordinal = None
             if source_ordinal is None and prior:
                 ranked = self.db.execute('SELECT source_ordinal FROM catalog_orders WHERE owner=? AND batch=('
                     'SELECT order_batch FROM meta WHERE singleton=1)', (owner,)).fetchone()
                 source_ordinal = ranked[0] if ranked else prior['source_ordinal']
+            if source_ordinal is None and self.selected:
+                last_owner = self.db.execute('SELECT source_ordinal FROM owner_versions '
+                    'ORDER BY source_ordinal DESC,owner DESC,batch DESC LIMIT 1').fetchone()
+                last_order = self.db.execute('SELECT source_ordinal FROM catalog_orders WHERE batch=('
+                    'SELECT order_batch FROM meta WHERE singleton=1) '
+                    'ORDER BY source_ordinal DESC,owner DESC LIMIT 1').fetchone()
+                source_ordinal = max(last_owner[0] if last_owner else -1,
+                                     last_order[0] if last_order else -1)+1
             if type(source_ordinal) is not int or not 0 <= source_ordinal < 2 ** 63:
                 raise TypeError('new owners require their exact nonnegative source traversal ordinal')
             if request_maps is UNCHANGED:
@@ -1435,6 +1477,9 @@ class Stage:
                     write(group);group=[];group_objects=0
                 group.append(item);group_objects+=objects
             if group:write(group)
+            if self.selected:
+                self.catalog_staged = True
+                return
             count,first,last = self.db.execute(
                 'SELECT count(*),min(source_ordinal),max(source_ordinal) '
                 'FROM catalog_orders WHERE batch=?', (self.batch,)).fetchone()
@@ -1967,7 +2012,10 @@ class Stage:
                 self.db.execute('UPDATE meta SET generation=generation+1,ready=?,source=? WHERE singleton=1',
                                 (int(ready), self.source))
                 if self.catalog_staged:
-                    self.db.execute('UPDATE meta SET order_batch=? WHERE singleton=1', (self.batch,))
+                    if self.selected:
+                        self.db.execute('UPDATE meta SET selection_batch=? WHERE singleton=1', (self.batch,))
+                    else:
+                        self.db.execute('UPDATE meta SET order_batch=?,selection_batch=0 WHERE singleton=1', (self.batch,))
                 self.store._prune_publication(self.batch)
         except CapacityExceeded:
             # A WAL pressure check may run after COMMIT. Durable publication is
@@ -2013,10 +2061,10 @@ class PreparedReader:
     def pin(self, expected=None, *, cancel=None, seconds=None):
         return self._pin(expected, cancel=cancel, seconds=seconds)
 
-    def _pin(self, expected=None, *, cancel=None, seconds=None, allow_incomplete=False, staged_batch=None):
+    def _pin(self, expected=None, *, cancel=None, seconds=None, allow_incomplete=False, staged_batch=None, selected=False):
         if self.active is not None:
             raise PreparedError('close the existing read transaction before opening another')
-        snapshot = Snapshot(self, expected, cancel, seconds, allow_incomplete, staged_batch)
+        snapshot = Snapshot(self, expected, cancel, seconds, allow_incomplete, staged_batch, selected)
         self.active = snapshot
         return snapshot
 
@@ -2047,7 +2095,7 @@ def _read_operation(function):
 
 
 class Snapshot:
-    def __init__(self, reader, expected, cancel, seconds, allow_incomplete=False, staged_batch=None):
+    def __init__(self, reader, expected, cancel, seconds, allow_incomplete=False, staged_batch=None, selected=False):
         self.reader, self.db, self.limits = reader, reader.db, reader.limits
         self.cancel = cancel.is_set if cancel is not None and not callable(cancel) else cancel
         self.slice_seconds = min(seconds or self.limits.read_seconds, self.limits.read_seconds)
@@ -2067,10 +2115,15 @@ class Snapshot:
                 raise RebuildRequired('prepared schema version changed')
             self.token = Token(row['instance'], row['generation'])
             self.ready = bool(row['ready'])
-            self.order_batch = row['order_batch']
+            self.selected = bool((self.public or selected) and row['selection_batch'])
+            self.order_batch = row['selection_batch'] if self.selected else row['order_batch']
             if staged_batch is not None and self.db.execute(
                     'SELECT 1 FROM catalog_orders WHERE batch=? LIMIT 1', (staged_batch,)).fetchone():
-                self.order_batch = staged_batch
+                staged_source = unpack(self.db.execute('SELECT source FROM publications WHERE id=?',
+                    (staged_batch,)).fetchone()[0], self.limits)
+                if not (isinstance(staged_source,tuple) and len(staged_source)==5
+                        and staged_source[4][0]=='selected'):
+                    self.order_batch = staged_batch
             self.publication_token = (Token(self.token.instance,self.token.generation+1)
                                       if staged_batch is not None else self.token)
             if expected is not None and expected != self.token:
@@ -2111,6 +2164,11 @@ class Snapshot:
 
     def _owner_tables(self):
         ranks = f' LEFT JOIN catalog_orders rank ON rank.owner=o.id AND rank.batch={int(self.order_batch)}'
+        if self.selected:
+            return (f'catalog_orders rank JOIN owners o ON o.id=rank.owner '
+                    'JOIN owner_heads h ON h.owner=o.id '
+                    'JOIN owner_versions v ON v.owner=h.owner AND v.batch=h.batch '
+                    f'AND rank.batch={int(self.order_batch)}')
         if self.staged_batch is None:
             return ('owners o JOIN owner_heads h ON h.owner=o.id '
                     'JOIN owner_versions v ON v.owner=h.owner AND v.batch=h.batch') + ranks

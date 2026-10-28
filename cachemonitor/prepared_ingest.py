@@ -3,7 +3,7 @@
 The coordinator owns catalog completeness, candidate election and publication.
 These functions never acknowledge collection or publish a partially read owner.
 """
-from collections import OrderedDict
+from collections import ChainMap, OrderedDict
 from dataclasses import asdict, dataclass, replace
 from functools import lru_cache
 from hashlib import sha256
@@ -70,12 +70,15 @@ def _catalog_status(page):
 def read_catalog(client, *, store=None, cancel=None):
     cursor = None
     catalog = None
+    demand = getattr(client,'active_demand',None)
+    selected = demand is not None and not demand['aggregate'] and callable(getattr(client,'poll_selection',None))
+    poll = client.poll_selection if selected else client.poll_catalog
     try:
         while True:
             if cancel is not None and cancel():
                 raise InterruptedError('prepared catalog cancelled')
-            page = client.poll_catalog(cursor=cursor, include_metadata=True,
-                                       metadata_kind='lineage', defer_incomplete=cursor is None)
+            options = {} if selected else dict(defer_incomplete=cursor is None)
+            page = poll(cursor=cursor, include_metadata=True, metadata_kind='lineage', **options)
             if not page['membership_complete']:
                 if catalog is not None:
                     catalog.close()
@@ -88,6 +91,8 @@ def read_catalog(client, *, store=None, cancel=None):
                             catalog.add_membership(name,page['header'][name])
             elif any(page[key] != catalog[key] for key in ('scope','path','selected_homes','catalog_identity')):
                 raise ValueError('catalog pages belong to different committed sources')
+            if selected and page.get('selection_request') != catalog.get('selection_request'):
+                raise ValueError('selection request changed during traversal')
             if page.get('membership_format') != catalog.get('membership_format'):
                 raise ValueError('catalog membership format changed during traversal')
             if page.get('membership_format') is not None:
@@ -120,7 +125,10 @@ def read_catalog(client, *, store=None, cancel=None):
             catalog.set_entry(key,entry)
         demand = ((getattr(client,'active_demand',None) or catalog['header']['demand'])
                   if catalog['header'].get('demand') is not None else None)
-        catalog.finish(demand)
+        if selected:
+            catalog.finish_selection()
+        else:
+            catalog.finish(demand)
         if not catalog['membership_complete']:
             status = _catalog_status(catalog)
             catalog.close()
@@ -133,8 +141,11 @@ def read_catalog(client, *, store=None, cancel=None):
 
 
 def source_identity(catalog):
-    return (catalog['scope'], catalog['path'], tuple(catalog['selected_homes']),
-            tuple(catalog['catalog_identity']))
+    source = (catalog['scope'], catalog['path'], tuple(catalog['selected_homes']),
+              tuple(catalog['catalog_identity']))
+    if catalog.get('authority')=='selected':
+        source += (('selected',catalog['selection_request']),)
+    return source
 
 
 def read_source(client, key, catalog, *, cancel=None, limits=IngestLimits()):
@@ -282,7 +293,8 @@ def read_enriched_source(client, key, catalog, ledger, *, parents=None, cancel=N
             enrich(snapshot)
         source = next(s for s in snapshot['sessions'] if (s['home'],s['id']) == key)
         dependency = mode_dependency(context, catalog, ledger)
-        source = dict(source, usage_revision=(catalog['owners'][key]['body_digest'], dependency))
+        entry = catalog['owners'].get(key) or catalog.get('mode_sources',{})[key]
+        source = dict(source, usage_revision=(entry['body_digest'], dependency))
         return (source, dependency, ancestry_required) if include_mode_proof else (source, dependency)
     finally:
         # This adapter deliberately does not retain raw ancestors between owners.
@@ -518,7 +530,7 @@ class PreparedCohort:
         self._check()
         entry=self.catalog['owners'].get(owner) or self.catalog.get('mode_sources',{}).get(owner)
         if entry is None:
-            self.client.request_mode_sources((owner,))
+            self.client.request_sources((owner,))
             raise CollectionCatalogUnavailable('mode_source_pending')
         cache_key = (owner, entry['body_digest'])
         old = self.cache.get(cache_key)
@@ -545,17 +557,16 @@ class PreparedCohort:
 
     def _declare(self, stage, owner, current, *, final=False, replace=False, pending=None):
         old = current.get(owner)
+        entry = self.catalog['owners'].get(owner) or self.catalog.get('mode_sources',{}).get(owner)
         if old is not None:
             metadata = dict(old['metadata'])
             dependency = dict(old['dependencies'])
         else:
-            entry = self.catalog['owners'][owner]
             metadata = dict(entry.get('owner_lineage', entry.get('owner_metadata', {})),
                             home=owner[0], id=owner[1], **entry.get('state', {}))
             metadata['_internal_review'] = False  # unpublished candidate inventory only
             dependency = dependencies(entry['body_digest'], None, None)
-        if owner in self.catalog['owners']:
-            entry = self.catalog['owners'][owner]
+        if entry is not None:
             dependency['source_digest'] = entry['body_digest']
             ordinal = entry['source_ordinal']
         else:
@@ -572,7 +583,11 @@ class PreparedCohort:
     def _complete(self, catalog, *, staged, parents):
         count = 0
         with self.store.read_current(staged=staged, seconds=60) as view:
-            for value in self._inventory(view).values():
+            inventory = self._inventory(view)
+            values = (inventory.get(owner) for owner in catalog['owners']) if catalog.get('authority')=='selected' else inventory.values()
+            for value in values:
+                if value is None:
+                    return False
                 self.metrics['complete_visits']=self.metrics.get('complete_visits',0)+1
                 owner, actual = value['owner'], value['dependencies']
                 entry = catalog['owners'].get(owner)
@@ -641,8 +656,12 @@ class PreparedCohort:
         if not catalog['membership_complete']:
             raise ValueError('canonical cohort needs complete source membership')
         self.catalog = catalog = self._capture_catalog(catalog)
+        selected = catalog.get('authority')=='selected'
+        references = ChainMap(catalog['owners'],catalog.get('mode_sources',{})) if selected else catalog['owners']
         changed, removed = set(changed), set(removed)
-        if (changed & removed or any(owner not in catalog['owners'] for owner in changed)
+        if selected and removed:
+            raise ValueError('a selected publication cannot retire owners')
+        if (changed & removed or any(owner not in references for owner in changed)
                 or any(owner in catalog['owners'] for owner in removed)):
             raise ValueError('cohort membership does not match its captured catalog')
         if len(changed | removed) > self.store.limits.owners_per_batch:
@@ -651,7 +670,9 @@ class PreparedCohort:
         from .prepared_append import try_apply
         self._append_owners=None
         self._append_plans={}
-        try:appended=try_apply(self,catalog,changed,removed,ready=ready,parents=parents)
+        try:
+            appended = (None if any(owner not in catalog['owners'] for owner in changed) else
+                        try_apply(self,catalog,changed,removed,ready=ready,parents=parents))
         finally:
             retained=self._append_owners
             self._append_owners=None
@@ -671,7 +692,7 @@ class PreparedCohort:
                                   and owner in retained[1] else view.owner(*owner))
                 old = current[owner]
                 if owner not in removed and old is not None:
-                    entry=catalog['owners'][owner];prior=old['dependencies']
+                    entry=references[owner];prior=old['dependencies']
                     context=mode_context(owner,catalog,parents=parents,
                         ancestry_required=prior.get('mode_ancestry_required') is not False)
                     choices=view.derived(*owner,'choices')
@@ -700,7 +721,7 @@ class PreparedCohort:
                         if retained is not None and retained[0]==view.token and len(retained[1].get(owner,()))==2:
                             metadata_checkpoints[owner]=retained[1][owner][1]
                 candidate_changed = (owner in removed or old is None or
-                    old['dependencies'].get('candidate_source_digest') != catalog['owners'][owner]['body_digest'])
+                    old['dependencies'].get('candidate_source_digest') != references[owner]['body_digest'])
                 if candidate_changed and owner not in display and owner not in append_plans:
                     keys = [item['key'] for item in pages(view.owner_candidates, owner)]
                     before_refs[owner] = {ref['owner'] for ref in self._matches(view, owner, keys)}
@@ -713,12 +734,13 @@ class PreparedCohort:
         elected=set()
         appended_plans=[]
         try:
-            for owner in changed | removed:
+            for owner in sorted(changed | removed, key=lambda owner: (references[owner]['source_ordinal']
+                    if owner in references else current[owner]['owner_ordinal'])):
                 declared_pending=self._declare(stage, owner, current)
                 if owner in append_plans:
                     plan=append_plans[owner]
                     stage.candidates(owner,((row['key'],row['session_ordinal']-1) for row in plan.rows))
-                    candidate_sources[owner]=catalog['owners'][owner]['body_digest']
+                    candidate_sources[owner]=references[owner]['body_digest']
                     continue
                 if owner in removed:
                     stage.remove_owner(owner)
@@ -737,7 +759,7 @@ class PreparedCohort:
                 for ordinal, row in enumerate(raw['history']):
                     candidates.setdefault(row.get('key'), ordinal)
                 stage.candidates(owner, candidates.items(), reconcile=True)
-                candidate_sources[owner] = catalog['owners'][owner]['body_digest']
+                candidate_sources[owner] = references[owner]['body_digest']
                 self.metrics['candidate_rows'] += len(candidates)
                 affected.update(before_refs[owner])
                 elected.update(before_refs[owner])
@@ -749,22 +771,35 @@ class PreparedCohort:
                 affected -= removed
                 # A complete catalog may withdraw several competing owners in
                 # separate bounded cohorts. Future removals need no preparation.
-                affected = {owner for owner in affected if owner in catalog['owners']}
+                if selected:
+                    missing = {owner for owner in affected if owner not in references
+                               or not references[owner].get('state',{}).get('collection_complete')}
+                    if missing:
+                        self.client.request_sources(missing)
+                        raise CollectionCatalogUnavailable('canonical_sources_pending')
+                else:
+                    affected = {owner for owner in affected if owner in references}
                 if len(affected | removed) > self.store.limits.owners_per_batch:
                     raise BatchCapacityExceeded('ownership correction exceeds one coherent cohort')
                 for owner in affected - changed:
                     current[owner] = view.owner(*owner)
-            for owner in affected - changed:
+                refresh = {owner for owner in affected - changed if selected and
+                    (current[owner] is None or current[owner]['dependencies'].get('candidate_source_digest')
+                     != references[owner]['body_digest'])}
+            if refresh:
+                self._abort(stage)
+                return self.apply(catalog,changed | refresh,removed,ready=ready,_parents=parents)
+            for owner in sorted(affected - changed, key=lambda key:references[key]['source_ordinal']):
                 self._declare(stage, owner, current)
-            for owner in sorted(affected, key=lambda key:catalog['owners'][key]['source_ordinal']):
+            for owner in sorted(affected, key=lambda key:references[key]['source_ordinal']):
                 self._check()
                 if owner in unchanged and owner not in elected:
                     stage.owner(*owner,current[owner]['metadata'],unchanged[owner],
-                        source_ordinal=catalog['owners'][owner]['source_ordinal'],replace=True)
+                        source_ordinal=references[owner]['source_ordinal'],replace=True)
                     continue
                 if owner in append_plans and owner not in elected:
                     plan=append_plans[owner]
-                    plan.apply(stage,catalog['owners'][owner]['source_ordinal'],cancel=self.cancel,
+                    plan.apply(stage,references[owner]['source_ordinal'],cancel=self.cancel,
                                replace=True,candidates_staged=True)
                     if previous_speed is not None and owner in previous_speed:
                         speed_certificates[owner]=plan.speed_certificate(previous_speed[owner])
@@ -781,11 +816,11 @@ class PreparedCohort:
                         update=dict(checkpoint,dependencies=dict(checkpoint['dependencies'],pricing=dependency['pricing']))
                         self.metrics['pricing_checkpoint_updates']=self.metrics.get('pricing_checkpoint_updates',0)+1
                     stage.owner(*owner,old['metadata'],dependency,
-                        source_ordinal=catalog['owners'][owner]['source_ordinal'],replace=True,checkpoint=update)
+                        source_ordinal=references[owner]['source_ordinal'],replace=True,checkpoint=update)
                     self.metrics['pricing_updates']=self.metrics.get('pricing_updates',0)+1
                     continue
                 if owner in display and owner not in elected:
-                    old=current[owner];entry=catalog['owners'][owner];dependency=display[owner]
+                    old=current[owner];entry=references[owner];dependency=display[owner]
                     metadata=dict(old['metadata'],title=entry['display_title'],
                         usage_revision=(entry['body_digest'],dependency['mode']),request_revision=entry['body_digest'])
                     calls=dict(metadata,**old['call_metadata'])
@@ -824,12 +859,12 @@ class PreparedCohort:
                 if previous_speed is not None and owner in previous_speed and not material['internal_review']:
                     speed_certificates[owner]=self.speed_writer.prefix_certificate(
                         owner,previous_speed[owner],material['state']['prepared']['history'])
-                dependency = dependencies(catalog['owners'][owner]['body_digest'], mode, ownership.hexdigest(),
-                                          state=catalog['owners'][owner].get('state',{}),models=material['choices']['models'])
+                dependency = dependencies(references[owner]['body_digest'], mode, ownership.hexdigest(),
+                                          state=references[owner].get('state',{}),models=material['choices']['models'])
                 dependency['mode_ancestry_required'] = mode_ancestry_required
-                dependency['state_facts']=state_facts(catalog['owners'][owner].get('state',{}))
-                if catalog['owners'][owner].get('analysis_digest'):
-                    dependency['analysis_digest']=catalog['owners'][owner]['analysis_digest']
+                dependency['state_facts']=state_facts(references[owner].get('state',{}))
+                if references[owner].get('analysis_digest'):
+                    dependency['analysis_digest']=references[owner]['analysis_digest']
                 # A competing owner's new body may be prepared before its own
                 # conversion cohort reconciles candidates. Keep that inventory's
                 # independent proof so later cohorts and restarts still owe it.
@@ -837,7 +872,7 @@ class PreparedCohort:
                 dependency['candidate_source_digest'] = candidate_sources.get(owner,
                     old['dependencies'].get('candidate_source_digest') if old is not None else None)
                 dependency['prepared'] = True
-                stage_owner(stage, material, dependency, catalog['owners'][owner]['source_ordinal'], replace=True,
+                stage_owner(stage, material, dependency, references[owner]['source_ordinal'], replace=True,
                     append_mode_evidence=self.ledger.mode_dependency(*owner) if self.ledger is not None else None)
                 self.metrics['prepared_owners'] += 1
                 del material, raw, winners, keys
@@ -876,11 +911,16 @@ class PreparedCohort:
         if not 1 <= cohort_size <= self.store.limits.owners_per_batch:
             raise ValueError('invalid conversion cohort size')
         was_ready = bool(self.store.db.execute('SELECT ready FROM meta WHERE singleton=1').fetchone()[0])
+        selected = catalog.get('authority')=='selected'
         self.order_changed = not was_ready
         work = ConversionPlan(self.store)
         try:
             with self.store.read_current(seconds=60) as view:
                 current = self._inventory(view)
+                if selected:
+                    self.order_changed = self.order_changed or view.source_identity != source_identity(catalog)
+                elif view.db.execute('SELECT selection_batch FROM meta WHERE singleton=1').fetchone()[0]:
+                    self.order_changed = True
                 self.catalog = catalog = self._capture_catalog(catalog,current)
                 parents = mode_parent_index(catalog)
                 metadata_only = was_ready
@@ -888,7 +928,7 @@ class PreparedCohort:
                 for owner,entry in catalog['owners'].items():
                     self._check()
                     old = current.get(owner)
-                    if old is None or old['owner_ordinal'] != entry['source_ordinal']:
+                    if not selected and (old is None or old['owner_ordinal'] != entry['source_ordinal']):
                         self.order_changed = True
                     wanted = dependencies(entry['body_digest'],
                         mode_dependency(mode_context(owner,catalog,parents=parents,
@@ -904,10 +944,11 @@ class PreparedCohort:
                             or old['dependencies'].get('candidate_source_digest') != entry['body_digest']
                             or any(old['dependencies'].get(key) != value for key,value in wanted.items())):
                         work.add(owner,keep=True)
-                for owner in current:
-                    self._check()
-                    if owner not in catalog['owners']:
-                        work.add(owner,keep=False)
+                if not selected:
+                    for owner in current:
+                        self._check()
+                        if owner not in catalog['owners']:
+                            work.add(owner,keep=False)
             total = sum(work.counts.values())
             self.order_changed = self.order_changed or bool(work.counts[False])
             if not total:

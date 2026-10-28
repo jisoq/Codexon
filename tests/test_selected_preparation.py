@@ -125,7 +125,7 @@ def test_selected_query_uses_captured_membership_and_tie_order(tmp_path, source_
         engine = PreparedAnalysisEngine(store.path,store.token)
         try:
             result = engine.query(dict(page=3,start=0,end=1000,now=1000,period='all',
-                include_whole_history=False,home='home',sid='root'))['analysis']
+                include_whole_history=False))['analysis']
             assert [row['id'] for row in result['sessions']] == ['child','root']
             assert [row['sid'] for row in result['responses']] == ['child','root']
             assert result['totals']['input'] == 200
@@ -179,3 +179,18 @@ def test_new_selected_ranks_remain_stable_and_pinned_order_survives_switches(
         with store.read_current() as view:
             assert [view.owner('home',sid)['owner_ordinal'] for sid in sources] == [0,1,2,3]
             assert all(view.record('home',sid,sid+'-response') for sid in sources)
+
+def test_format7_cache_rebuilds_before_selected_authority_is_read(tmp_path, source_reader):
+    sources = source_reader
+    sources['a'] = source('a')
+    path = tmp_path/'format7.sqlite'
+    with storage.PreparedStore(path) as store:
+        list(ingest.PreparedCohort(store,None,None).convert(catalog(sources)))
+        old = store.token
+        store.db.execute('ALTER TABLE meta DROP COLUMN selection_batch')
+        store.db.execute('UPDATE meta SET format=7 WHERE singleton=1')
+    with storage.PreparedStore(path) as store:
+        assert store.token.instance != old.instance and store.token.generation == 0
+        assert store.db.execute('SELECT format,selection_batch FROM meta').fetchone()[:] == (8,0)
+        list(ingest.PreparedCohort(store,None,None).convert(catalog(sources,2,family=('a',))))
+        assert store.db.execute('SELECT selection_batch FROM meta').fetchone()[0] > 0
