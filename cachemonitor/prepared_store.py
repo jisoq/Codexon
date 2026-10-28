@@ -236,7 +236,6 @@ class _CatalogParents(Mapping):
 
 
 class CatalogWork(dict):
-    """Unpublished indexed source membership under the prepared writer's lifetime."""
     TABLES = ('sessions','members','owners','nodes')
 
     def __init__(self, values, *, store=None, cancel=None):
@@ -443,7 +442,6 @@ class CatalogWork(dict):
 
 
 class SnapshotInventory(Mapping):
-    """Conversion lookups owned by an existing pinned read transaction."""
     def __init__(self, view):
         self.view = view
 
@@ -468,7 +466,6 @@ class SnapshotInventory(Mapping):
 
 
 class ConversionPlan:
-    """Unpublished owner operations in bounded conversion order."""
     def __init__(self, store):
         self.store, self.db = store, store.db
         self.table = 'conversion_plan_'+uuid.uuid4().hex

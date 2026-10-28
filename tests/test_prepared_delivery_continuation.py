@@ -1,4 +1,3 @@
-"""Selected delivery and atomic continuation preserve complete result choices."""
 from contextlib import closing
 from copy import deepcopy
 import time

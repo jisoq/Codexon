@@ -68,7 +68,6 @@ def _catalog_status(page):
 
 
 def read_catalog(client, *, store=None, cancel=None):
-    """Stage one coherent source traversal before exposing indexed membership."""
     cursor = None
     catalog = None
     try:
@@ -870,7 +869,6 @@ class PreparedCohort:
             self.cache_bytes = 0
 
     def convert(self, catalog, *, cohort_size=None):
-        """Yield durable cohorts after planning against one pinned generation."""
         if not catalog['membership_complete']:
             raise ValueError('conversion waits for complete source membership')
         automatic = cohort_size is None
@@ -917,7 +915,6 @@ class PreparedCohort:
                     token = self.publish_ready(catalog)
                     yield dict(token=token,changed=(),removed=(),writes=self.last_writes,ready=True)
                 return
-            # A fitting restart correction preserves its existing atomic publication.
             if automatic and was_ready and cohort_size < total <= self.store.limits.owners_per_batch:
                 group = next(work.groups(self.store.limits.owners_per_batch))
                 try:
