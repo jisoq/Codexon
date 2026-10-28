@@ -432,10 +432,6 @@ class CatalogWork(dict):
                 self.db.execute('DELETE FROM catalog_work_'+table+' WHERE work=?', (self.work,))
             self.db.execute('DELETE FROM catalog_work WHERE id=?', (self.work,))
 
-    def __del__(self):
-        if getattr(self,'owns_connection',False) and not getattr(self,'closed',True):
-            self.db.close()
-
 
 class SnapshotInventory(Mapping):
     """Conversion lookups owned by an existing pinned read transaction."""
