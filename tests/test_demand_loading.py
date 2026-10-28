@@ -582,7 +582,23 @@ def test_writer_keeps_selected_detail_live_until_explicit_aggregate_completes_an
         assert not service.last['usage_collection_complete']
         release.set()
         aggregate=publication(service,writer,receiver,lambda value:value.get('aggregate_request')==7)
-        assert {row['id'] for row in aggregate['sessions']}=={TID,OTHER}
+        assert {row['id'] for row in aggregate['sessions']}=={TID}
+        deadline=time.monotonic()+10
+        with closing(PreparedQuery(writer.path)) as query:
+            while time.monotonic()<deadline:
+                now=time.time()
+                result=query(dict(kind='query',id='all-calls',logical=(),query=dict(
+                    page=1,start=0,end=now,now=now,period='custom',category_usage=True,
+                    usage=dict(dimension='model',metric='calls'))),
+                    token_value(aggregate['prepared_token']),lambda:False)
+                if result['kind']!='stale':break
+                aggregate=publication(service,writer,receiver,
+                    lambda value:value.get('aggregate_request')==7,deadline=deadline)
+            else:pytest.fail('Complete aggregate query did not reach the displayed publication')
+        assert result['kind']=='result'
+        assert result['result']['usage']['summary']['value']==28
+        assert result['result']['analysis']['response_count']==28
+        assert result['result']['analysis']['session_count']==2
         deadline=time.monotonic()+10
         while time.monotonic()<deadline:
             with sqlite3.connect(quota) as db:
@@ -591,6 +607,8 @@ def test_writer_keeps_selected_detail_live_until_explicit_aggregate_completes_an
             if saved==28:break
             publication(service,writer,receiver,lambda value:value.get('aggregate_request')==7)
         assert saved==28
+        with sqlite3.connect(quota) as db:
+            assert dict(db.execute('SELECT sid,count(*) FROM calls GROUP BY sid'))=={TID:25,OTHER:3}
         writer.set_aggregate(None)
         writer.set_selected([(None,OTHER)])
         selected_again=publication(service,writer,receiver,lambda value:

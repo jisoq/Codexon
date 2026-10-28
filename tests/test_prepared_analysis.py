@@ -1458,6 +1458,14 @@ def test_catalog_order_preserves_packets_and_rejects_incomplete_budgeted_stage(t
                 'WHERE o.home=? AND o.sid=?', owner).fetchone())
 
         before = {owner: stored_packets(owner) for owner in owners}
+        stage = store.begin(('source', 2))
+        with pytest.raises(storage.IncompletePublication,match='exact complete prepared membership'):
+            stage.catalog_order([(owners[0],0)])
+        with pytest.raises(storage.IncompletePublication):
+            stage.publish(('source', 2),ready=True)
+        stage.abort()
+        assert store.token == previous
+        assert {owner: stored_packets(owner) for owner in owners} == before
         positions = [(owner, len(owners)-number-1) for number, owner in enumerate(owners)]
         stage = store.begin(('source', 2))
         # The first bounded write may commit internally, but budget exhaustion
@@ -1568,16 +1576,6 @@ def test_activity_reorder_publishes_order_without_rewriting_analyzed_owners(tmp_
         assert store.token.generation == previous.generation+1
         publisher_owners=publisher.owners
         engine_sessions=engine.sessions
-        original_order=storage.Snapshot.ordering
-        with monkeypatch.context() as invalid:
-            def incomplete(view, **kwargs):
-                page=original_order(view,**kwargs)
-                return replace(page,rows=tuple(row for row in page.rows if row['owner']!=owners[0]))
-            invalid.setattr(storage.Snapshot,'ordering',incomplete)
-            with pytest.raises(storage.NotReady):publisher.adopt(store,())
-            engine.adopt(store.token,())
-        assert publisher.token==previous and publisher.owners is publisher_owners
-        assert engine.token==store.token and engine.sessions is engine_sessions
         with monkeypatch.context() as capacity:
             capacity.setattr(publisher,'STATE_BYTES',1)
             capacity.setattr(engine,'OWNER_BYTES',1)
@@ -1590,6 +1588,7 @@ def test_activity_reorder_publishes_order_without_rewriting_analyzed_owners(tmp_
         with monkeypatch.context() as order_only:
             def forbidden(*args, **kwargs):
                 raise AssertionError('order adoption must not read owner content or derived packets')
+            order_only.setattr(storage.Snapshot, 'ordering', forbidden)
             order_only.setattr(storage.Snapshot, 'owner', forbidden)
             order_only.setattr(storage.Snapshot, 'derived', forbidden)
             publisher.adopt(store, ())
