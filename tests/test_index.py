@@ -1151,3 +1151,62 @@ def test_explicit_record_tier_survives_sanitizing_index_and_restart(tmp_path):
             assert rows[0]['cost']==pytest.approx(1.0125)
             assert not any('must-not-persist' in unpack_event(r[0]) for r in index.db.execute('select data from events'))
         finally:index.close()
+
+
+def discovery_child(home,ignored_bytes,*,catalogued=False):
+    sid='12345678-abcd-abcd-abcd-333333333333'
+    folder=home/'sessions';folder.mkdir()
+    path=folder/'child.jsonl'
+    header={'ignored':'x'*ignored_bytes,**event('session_meta',id=sid,parent_thread_id=TID,agent_nickname='helper',
+        source={'subagent':{'thread_spawn':{'parent_thread_id':TID,'agent_path':'/agents/helper','depth':1}}})}
+    path.write_bytes((json.dumps(header)+'\n'+json.dumps(usage('child-response',tid=sid))+'\n').encode())
+    if catalogued:
+        with sqlite3.connect(home/'state_5.sqlite') as db:
+            db.execute('INSERT INTO threads VALUES(?,?,?,?,?,?,?,?)',
+                       (sid,str(path),10000,None,'Child','test','openai','project'))
+    return path,sid
+
+
+@pytest.mark.parametrize('catalogued',[False,True],ids=['source-only','catalogued'])
+def test_selected_parent_discovers_child_after_large_ignored_session_metadata(tmp_path,catalogued):
+    home,_=fixture_home(tmp_path)
+    path,sid=discovery_child(home,2*1024*1024+128,catalogued=catalogued)
+    original=path.read_bytes()
+    index=UsageIndex([home],tmp_path/'index.sqlite')
+    index.demand=dict(selected=[(None,TID)],aggregate=False,evidence=[])
+    try:
+        result=finish(index)
+        assert result['catalog_complete'] and result['usage_collection_complete'] and not result['usage_errors']
+        assert [str(home.resolve()),sid,TID] in result['session_catalog']
+        assert [str(home.resolve()),sid] in result['demand_members']
+        child=next(session for session in result['sessions'] if session['id']==sid)
+        assert child['parent_thread_id']==TID and child['agent_nickname']=='helper' and child['spawn_depth']==1
+        assert {row['key'] for row in analyze(result['sessions'])['responses']}=={'r1','child-response'}
+    finally:index.close()
+    assert path.read_bytes()==original
+
+
+def test_pending_discovery_header_resumes_before_membership_is_complete(tmp_path,monkeypatch):
+    import cachemonitor.index as implementation
+    monkeypatch.setattr(implementation,'FILE_READ_BUDGET',1024)
+    home,_=fixture_home(tmp_path)
+    path,sid=discovery_child(home,8192)
+    index=UsageIndex([home],tmp_path/'index.sqlite')
+    index.demand=dict(selected=[(None,TID)],aggregate=False,evidence=[])
+    clock=[0.];scan=index.scan_file
+    monkeypatch.setattr(implementation.time,'monotonic',lambda:clock[0])
+    def one_slice(*args):
+        result=scan(*args)
+        if args[0]==str(path.resolve()):clock[0]+=.41
+        return result
+    monkeypatch.setattr(index,'scan_file',one_slice)
+    try:
+        partial=index.poll(10010)
+        assert partial['index']['loading'] and not partial['catalog_complete']
+        assert not partial['usage_collection_complete']
+        complete=finish(index)
+        assert complete['catalog_complete'] and complete['usage_collection_complete'] and not complete['usage_errors']
+        assert [str(home.resolve()),sid,TID] in complete['session_catalog']
+        assert [str(home.resolve()),sid] in complete['demand_members']
+        assert {row['key'] for row in analyze(complete['sessions'])['responses']}=={'r1','child-response'}
+    finally:index.close()
