@@ -471,9 +471,13 @@ class PreparedPublisher:
                 None if sequence==1 else self.changed,self.sessions.keys()-sessions.keys(),speeds or {},
                 bind_generation=False)
             from .prepared_health import notification_health_pages
-            candidates=[candidate for key in self.changed
-                        if key not in self.owners or not self.owners[key]['metadata'].get('_internal_review')
-                        for candidate in notification_health_pages(view,key,since=self.cache_floor)]
+            candidates=[]
+            for key in self.changed:
+                if key in self.owners and self.owners[key]['metadata'].get('_internal_review'):continue
+                for candidate in notification_health_pages(view,key,since=self.cache_floor):
+                    if not (candidate.get('cache_health') or {}).get('incident'):
+                        candidate.pop('title')
+                    candidates.append(candidate)
             if self._choices_dirty:
                 global_choices,internal,models=self._filter_choices(snapshot,sessions,view)
             else:

@@ -111,6 +111,7 @@ def test_publication_preserves_unselected_cache_incident_lifecycle(tmp_path, sel
         commit(1)
         publisher.adopt(store, [('home', 'a'), owner], selected=selected)
         initial = publisher.publish(dict(homes=['home']), store)
+        assert all('title' not in row for row in initial['cache_candidates'])
         assert notifications.cache(initial['cache_candidates']) == []
 
         incident = dict(id='b-incident', ts=101, state='cache anomaly',
@@ -120,6 +121,8 @@ def test_publication_preserves_unselected_cache_incident_lifecycle(tmp_path, sel
         current = publisher.publish(dict(homes=['home']), store)
         assert set(publisher.owners) == set(selected)
         assert {row['id'] for row in current['sessions']} <= {key[1] for key in selected}
+        assert [row['title'] for row in current['cache_candidates']
+                if (row.get('cache_health') or {}).get('incident')] == ['B']
         visible = notifications.cache(current['cache_candidates'])
         assert [(row['home'], row['sid'], row['incident_id']) for row in visible] == [
             ('home', 'b', 'b-incident')]
@@ -132,6 +135,10 @@ def test_publication_preserves_unselected_cache_incident_lifecycle(tmp_path, sel
                title='Renamed B')
         publisher.adopt(store, [owner], selected=selected)
         final = publisher.publish(dict(homes=['home']), store)
+        if resolution == 'corrected':
+            assert all('title' not in row for row in final['cache_candidates'])
+        else:
+            assert [row['title'] for row in final['cache_candidates']] == ['Renamed B']
         assert notifications.cache(final['cache_candidates']) == []
         expected = '회복 확인' if resolution == 'recovered' else '기록 정정: 이상 판정 해제'
         assert record['resolution'] == expected
