@@ -271,6 +271,8 @@ def test_selected_pages_keep_frozen_positions_with_an_aggregate_lease(collector,
     service, reader, home = collector
     aggregate = collection.CollectionClient([home], service.channel.path, service.channel.evidence)
     monkeypatch.setattr(collection, 'CATALOG_PAGE_ROWS', 2)
+    with (home / 'session.jsonl').open('a', encoding='utf8') as stream:
+        stream.write(json.dumps(usage('newer-unrelated-owner', time=10001)) + '\n')
     try:
         aggregate.set_demand([], aggregate=True)
         reader.set_demand([(None, OTHER)])
@@ -346,28 +348,33 @@ def test_selected_cursor_rejects_changed_demand_and_expired_lease(collector, mon
 
 def test_selected_mode_context_preserves_family_and_body_parent_roles(collector):
     service, reader, home = collector
-    reader.set_demand([(None, TID)])
-    collect(service)
     child_path = home / 'sessions' / (CHILD + '.jsonl')
-    with child_path.open('a', encoding='utf8') as stream:
-        stream.write(json.dumps(event('session_meta', id=CHILD, parent_thread_id=OTHER)) + '\n')
+    lines = child_path.read_text(encoding='utf8').splitlines()
+    lines[0] = json.dumps(event('session_meta', id=CHILD, parent_thread_id=OTHER))
+    child_path.write_text('\n'.join(lines) + '\n', encoding='utf8')
+    reader.set_demand([(None, CHILD)])
+    collect(service)
+    lines[0] = json.dumps(event('session_meta', id=CHILD, parent_thread_id=TID))
+    child_path.write_text('\n'.join(lines) + '\n', encoding='utf8')
     service.index.scan_file(str(child_path), home, CHILD)
     service.index.db.commit()
-    reader.set_demand([(None, OTHER)])
+    assert service.index.lineage[(str(home), CHILD)]['parent_thread_id'] == TID
+    assert service.index.metadata[(str(home), CHILD)]['parent_thread_id'] == OTHER
+    reader.set_demand([(None, TID)])
     collect(service)
     pages = selected_pages(reader)
     membership = [row for page in pages for row in page['membership']['session_catalog']]
     family = [row for page in pages for row in page['membership']['demand_members']]
     refs = {key: value for page in pages for key, value in page['owners'].items()}
-    assert [str(home), CHILD, OTHER] in membership
-    assert [str(home), TID, None] in membership
-    assert [str(home), CHILD] in family and [str(home), TID] not in family
-    assert refs[(str(home), CHILD)]['owner_lineage']['parent_thread_id'] == TID
-    reader.request_sources([(str(home), TID)])
+    assert [str(home), CHILD, TID] in membership
+    assert [str(home), OTHER, None] in membership
+    assert [str(home), CHILD] in family and [str(home), OTHER] not in family
+    assert refs[(str(home), CHILD)]['owner_lineage']['parent_thread_id'] == OTHER
+    reader.request_sources([(str(home), OTHER)])
     collect(service)
     expanded = selected_pages(reader)
-    assert (str(home), TID) in {key for page in expanded for key in page['owners']}
-    assert [str(home), TID] not in [row for page in expanded for row in page['membership']['demand_members']]
+    assert (str(home), OTHER) in {key for page in expanded for key in page['owners']}
+    assert [str(home), OTHER] not in [row for page in expanded for row in page['membership']['demand_members']]
 
 
 def test_modern_selected_capability_failure_never_reads_full_catalog(collector, monkeypatch):
@@ -411,6 +418,19 @@ def test_selected_wildcards_use_global_homes_but_bodies_keep_client_scope(collec
     finally:
         other.close()
 
+
+def test_status_only_legacy_reads_do_not_admit_aggregate_bodies(collector):
+    service, reader, home = collector
+    reader.set_demand([(None, TID)])
+    collect(service)
+    status = collection.CollectionHeaderReader([home], service.channel.path, service.channel.evidence)
+    try:
+        assert status.read_header()['ts'] == 10010
+        assert service.channel.live.requested_demand(10010)['aggregate'] is False
+        collect(service)
+        assert service.index.active_sources == {(str(home), TID), (str(home), CHILD)}
+    finally:
+        status.close()
 
 def test_full_readers_remain_pending_until_an_aggregate_publication(collector):
     service, reader, home = collector
@@ -485,24 +505,29 @@ def test_selected_known_unavailable_source_never_becomes_absent(collector, monke
 
 def test_selected_context_captures_the_whole_path_entering_a_mode_cycle(collector):
     service, reader, home = collector
-    thread(home, 'cycle', TID)
-    root_path = home / 'session.jsonl'
-    root_path.write_text(json.dumps(event('session_meta', id=TID, parent_thread_id='cycle')) + '\n'
-                         + root_path.read_text(encoding='utf8'), encoding='utf8')
-    reader.set_demand([(None, TID)])
+    thread(home, 'cycle', OTHER)
+    for sid, parent in ((OTHER, 'cycle'), (CHILD, OTHER)):
+        path = home / 'sessions' / (sid + '.jsonl')
+        lines = path.read_text(encoding='utf8').splitlines()
+        lines[0] = json.dumps(event('session_meta', id=sid, parent_thread_id=parent))
+        path.write_text('\n'.join(lines) + '\n', encoding='utf8')
+    reader.set_demand([(None, CHILD)])
     collect(service)
     child_path = home / 'sessions' / (CHILD + '.jsonl')
-    with child_path.open('a', encoding='utf8') as stream:
-        stream.write(json.dumps(event('session_meta', id=CHILD, parent_thread_id=OTHER)) + '\n')
+    lines = child_path.read_text(encoding='utf8').splitlines()
+    lines[0] = json.dumps(event('session_meta', id=CHILD, parent_thread_id=TID))
+    child_path.write_text('\n'.join(lines) + '\n', encoding='utf8')
     service.index.scan_file(str(child_path), home, CHILD)
     service.index.db.commit()
-    reader.set_demand([(None, OTHER)])
+    assert service.index.lineage[(str(home), CHILD)]['parent_thread_id'] == TID
+    assert service.index.metadata[(str(home), CHILD)]['parent_thread_id'] == OTHER
+    reader.set_demand([(None, TID)])
     collect(service)
     pages = selected_pages(reader)
     context = {tuple(row) for page in pages for row in page['membership']['session_catalog']}
-    assert {(str(home), TID, 'cycle'), (str(home), 'cycle', TID)} <= context
+    assert {(str(home), OTHER, 'cycle'), (str(home), 'cycle', OTHER)} <= context
     refs = {key: entry for page in pages for key, entry in page['owners'].items()}
-    assert refs[(str(home), CHILD)]['owner_lineage']['parent_thread_id'] == TID
+    assert refs[(str(home), CHILD)]['owner_lineage']['parent_thread_id'] == OTHER
     assert {tuple(row) for page in pages for row in page['membership']['demand_members']} == {
-        (str(home), OTHER), (str(home), CHILD),
+        (str(home), TID), (str(home), CHILD),
     }
