@@ -556,7 +556,7 @@ def test_selected_writer_completes_with_empty_mode_ancestor_outside_family(tmp_p
             any(row['id']==CHILD and row['calls']==1 for row in value['overlay_sessions']))
         assert {row['id'] for row in current['sessions']}=={CHILD}
         assert {row['id'] for row in current['overlay_sessions']}=={CHILD}
-        assert [str(home),TID] in service.channel.live.requested_demand(time.time())['evidence']
+        assert (str(home),TID) in service.channel.live.requested_demand(time.time())['evidence']
         parent=next(row for row in service.last['sessions'] if row['id']==TID)
         assert parent['collection_complete']
         detail,_=selected_detail(service,writer,receiver,current,CHILD,'empty-mode-ancestor')
