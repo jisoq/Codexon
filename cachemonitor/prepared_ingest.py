@@ -14,7 +14,7 @@ from .analysis_engine import AnalysisEngine
 from .analysis_delivery import SnapshotPublisher, MODEL_KEYS
 from .analytics import prepare_row
 from .overlay_data import summarize_session
-from .prepared_store import UNCHANGED, CapacityExceeded, BatchCapacityExceeded, OWNER_FIELDS, FORBIDDEN_OWNER, RAW_TRANSPORT_FIELDS, pack
+from .prepared_store import UNCHANGED, CapacityExceeded, BatchCapacityExceeded, Snapshot, OWNER_FIELDS, FORBIDDEN_OWNER, RAW_TRANSPORT_FIELDS, pack
 from .pricing import Rate, pricing_signature
 from .request_modes import mode_parents, requires_parent_mode
 from .usage_collection import CollectionCatalogUnavailable
@@ -433,6 +433,10 @@ def state_facts(state):
 
 
 def pages(method, *args, **kwargs):
+    view = getattr(method, '__self__', None)
+    if isinstance(view, Snapshot):
+        yield from view.pages(method, *args, **kwargs)
+        return
     after = None
     while True:
         page = method(*args, after=after, **kwargs)

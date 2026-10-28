@@ -1690,7 +1690,8 @@ class Snapshot:
     def __init__(self, reader, expected, cancel, seconds, allow_incomplete=False, staged_batch=None):
         self.reader, self.db, self.limits = reader, reader.db, reader.limits
         self.cancel = cancel.is_set if cancel is not None and not callable(cancel) else cancel
-        self.deadline = time.monotonic() + min(seconds or self.limits.read_seconds, self.limits.read_seconds)
+        self.slice_seconds = min(seconds or self.limits.read_seconds, self.limits.read_seconds)
+        self.deadline = time.monotonic() + self.slice_seconds
         self.closed = False
         self.staged_batch = staged_batch
         self.speed_active = False
@@ -1774,6 +1775,34 @@ class Snapshot:
     def check(self):
         """Keep cache-only consumers inside the pinned read lease."""
         self._check()
+
+    def pages(self, method, *args, **kwargs):
+        """Continue bounded Page operations inside this exact generation pin."""
+        if getattr(method,'__self__',None) is not self:
+            raise ValueError('page operation belongs to another read transaction')
+        after = None
+        while True:
+            if self.closed:
+                raise ReadCancelled('read transaction is closed')
+            if self.cancel is not None and self.cancel():
+                self.close()
+                raise ReadCancelled('read cancellation reached')
+            self.deadline = time.monotonic() + self.slice_seconds
+            page = method(*args, after=after, **kwargs)
+            self._check()
+            if not page.complete and (page.after is None or page.after==after):
+                self.close()
+                raise IncompletePublication('prepared page cursor did not advance')
+            for row in page.rows:
+                if self.closed:
+                    raise ReadCancelled('read transaction is closed')
+                if self.cancel is not None and self.cancel():
+                    self.close()
+                    raise ReadCancelled('read cancellation reached')
+                yield row
+            if page.complete:
+                return
+            after = page.after
 
     @contextmanager
     def _cursor(self, sql, args=()):

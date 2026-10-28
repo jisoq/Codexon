@@ -2292,7 +2292,7 @@ def test_incomplete_catalog_exposes_status_without_partial_membership(tmp_path):
             assert view.record(*OWNER, 'call-0')['cost'] == 1.
 
 
-def test_pinned_page_continuation_renews_vm_slices_without_changing_generation(tmp_path):
+def test_pinned_page_continuation_preserves_generation_and_per_operation_vm_guard(tmp_path):
     from cachemonitor.prepared_ingest import pages
 
     owners = [('home', f'owner-{number:03d}') for number in range(80)]
@@ -2340,3 +2340,38 @@ def test_pinned_page_continuation_renews_time_only_between_pages(tmp_path, monke
                 clock[0] += 2
                 assert [first['key'], *(row['key'] for row in rows)] == ['call-0', 'call-1', 'call-2']
                 assert view.token == token
+
+
+def test_pinned_page_continuation_handles_empty_progress_and_cancellation(tmp_path):
+    from types import MethodType
+
+    def advancing(self, *, after=None):
+        if after is None:
+            return storage.Page((), ('empty', 1), False, 0, 0)
+        return storage.Page(('complete',), None, True, 0, 0)
+
+    def stalled(self, *, after=None):
+        return storage.Page((), None, False, 0, 0)
+
+    with storage.PreparedStore(tmp_path/'page-continuation-controls.sqlite') as store:
+        token = publish(store, 1, calls())
+        limits = replace(store.limits, page_rows=1)
+        with storage.PreparedReader(store.path, limits) as reader:
+            with reader.pin(token) as view:
+                assert list(view.pages(MethodType(advancing, view))) == ['complete']
+                assert view.token == token
+                with pytest.raises(storage.IncompletePublication, match='cursor'):
+                    list(view.pages(MethodType(stalled, view)))
+                assert view.closed
+            stopped = Event()
+            with reader.pin(token, cancel=stopped) as view:
+                rows = view.pages(view.calls, OWNER)
+                assert next(rows)['key'] == 'call-0'
+                stopped.set()
+                with pytest.raises(storage.ReadCancelled):
+                    next(rows)
+                assert view.closed
+            with reader.pin(token) as view:
+                with storage.PreparedReader(store.path, limits) as other, other.pin(token) as foreign:
+                    with pytest.raises(ValueError, match='another read transaction'):
+                        list(view.pages(foreign.calls, OWNER))
