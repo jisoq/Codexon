@@ -97,7 +97,7 @@ def test_initial_preparation_reaches_native_dashboard_before_any_snapshot(tmp_pa
     monkeypatch.setattr('cachemonitor.overlay_windows.system_reduce_motion',lambda:language=='en')
     set_language(language)
     channel=CollectionChannel([tmp_path/'home'],tmp_path/'source.sqlite');channel.start_live()
-    snapshot=empty_snapshot(channel.homes,channel.path,time.time())
+    snapshot=empty_snapshot(channel.homes,channel.path,time.time());snapshot['catalog_scope']='full'
     snapshot['index'].update(done=3,files=20)
     channel.publish(snapshot,'startup-feedback',1)
     window=controller=None
@@ -135,22 +135,14 @@ def test_initial_preparation_reaches_native_dashboard_before_any_snapshot(tmp_pa
         assert shared_theme().reduceMotion==(language=='en')
         if language=='en':assert movement.count()==0
         else:assert movement.count()>0
+        startup_query=dict(window.pending_query)
         for page in (4,3,7):
             window.change_page(page)
+            window.worker.request('startup-progress-fixture',startup_query,('startup-progress-fixture',))
             wait_for_rendered(lambda:window.pages.isPageReady(PAGE_INDEX[page]),timeout=5)
             wait_for_rendered(lambda:control(window,window.refresh_text).isVisible())
             header=control(window,window.refresh_text)
-            try:
-                wait_for_rendered(lambda:'3 / 20' in header_text())
-            except AssertionError:
-                process=window.worker.process
-                raise AssertionError(dict(language=language,page=window.current_page,
-                    rendered_header=header_text(),loading=window.analysis_loading,
-                    preparation=window.preparation,startup_progress=progress,snapshots=len(snapshots),
-                    worker_running=window.worker.isRunning(),worker_request=window.worker.last_request,
-                    worker_process=None if process is None else dict(pid=process.pid,alive=process.is_alive(),exitcode=process.exitcode),
-                    selected_owners=window.worker.selected_owners,collection_status=window.home_collection_status,
-                    analysis_errors=window.analysis_errors,qml_errors=window.qml_errors)) from None
+            wait_for_rendered(lambda:'3 / 20' in header_text())
             assert window.analysis_loading['elapsedText'] and window.preparation.started_at==origin
             assert not window.analysis_regions()
             if page==4:assert window.quick.grabFramebuffer().save(str(tmp_path/f'initial-settings-{language}.png'))
