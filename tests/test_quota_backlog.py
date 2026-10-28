@@ -152,3 +152,48 @@ def test_control_reserve_retains_stop_boundary_when_observation_capacity_is_full
         first=backlog.first();backlog.acknowledge(first[0])
         assert backlog.first()[1:]==('control',[False,2])
     finally:backlog.close()
+
+
+
+@pytest.mark.parametrize('model_count,minimum_bytes', [(1400, 64*1024), (6000, 256*1024)])
+def test_large_normalized_observation_replays_through_existing_ledger(tmp_path, model_count, minimum_bytes):
+    from contextlib import closing
+    import json
+
+    from cachemonitor import quota_payloads, quota_tracking_store as tracking
+    from cachemonitor.quota_cycles import QuotaLedger
+    from cachemonitor.quota_live import normalize_limits
+
+    models = [f'fixture-model-{number:05d}-'+'x'*48 for number in range(model_count)]
+    buckets = {'codex': dict(limitId='codex', planType='plus',
+        primary=dict(usedPercent=20, windowDurationMins=300, resetsAt=1000),
+        secondary=dict(usedPercent=10, windowDurationMins=10080, resetsAt=2000))}
+    buckets.update((model, dict(normalModelSlug=model)) for model in models)
+    quota = normalize_limits(dict(rateLimitsByLimitId=buckets), 100, 'fixture-account')
+    encoded = json.dumps(quota, ensure_ascii=False, separators=(',', ':')).encode()
+    assert minimum_bytes < len(encoded) < 8*1024*1024
+    path = tmp_path/'quota.sqlite'
+    backlog = ObservationBacklog(path, 'home')
+    try:
+        with closing(QuotaLedger(path)) as ledger:
+            tracking.enable(ledger.db, 'control', 90)
+            ledger.observe('control', quota, commit=False)
+            tracking.observe(ledger.db, 'control', quota)
+            control = ledger.db.execute("SELECT * FROM tracking_observations WHERE home='control'").fetchone()
+            assert quota_payloads.PayloadReader(ledger.db).decode(control) == quota
+            assert backlog.append('quota', quota)
+            assert backlog.close()
+            row = backlog.first()
+            assert row[1:] == ('quota', quota)
+            tracking.enable(ledger.db, 'home', 90)
+            ledger.observe('home', row[2], commit=False)
+            tracking.observe(ledger.db, 'home', row[2])
+            tracking.observe(ledger.db, 'home', row[2])
+            saved = ledger.db.execute("SELECT * FROM tracking_observations WHERE home='home'").fetchall()
+            assert len(saved) == 1
+            assert quota_payloads.PayloadReader(ledger.db).decode(saved[0]) == quota
+            assert len(quota['separate_models']) == model_count
+            backlog.acknowledge(row[0])
+            assert backlog.first() is None and backlog.available()
+    finally:
+        backlog.close()
