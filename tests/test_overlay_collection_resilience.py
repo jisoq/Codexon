@@ -575,6 +575,9 @@ def test_collection_reuses_history_and_atomically_replaces_current_sessions(tmp_
     path=tmp_path/'index.sqlite'
     writer=CollectionChannel([],path);reader=CollectionChannel([],path)
     snapshot=empty_snapshot([],path,100)
+    snapshot.update(catalog_scope='full',catalog_complete=True,usage_collection_complete=True,
+                    last_usage_collection_success=100)
+    snapshot['index'].update(loading=False,usage_complete=True,last_usage_success=100)
     snapshot['sessions']=[dict(home='h',id='s',history=[dict(key='a',output=1)],remaining=10,
                                usage_revision=1,turn_records={'turn':{'state':'running'}})]
     snapshot['request_activity']=[dict(home='h',attempt='a',status='started'),dict(home='h',attempt='b',status='started')]
