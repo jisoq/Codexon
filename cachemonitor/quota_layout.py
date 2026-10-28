@@ -1,6 +1,6 @@
 """Usage summary, unified chart legend and modal exclusion management."""
 from time import time
-from .presentation import Button, Column, Group, Row, Scroll, Text
+from .presentation import Button, Column, Group, Row, Scroll, Text, Toggle
 from .quick_runtime import Dialog, QuickHost
 from .i18n import Verbatim, formatted, tr
 from .pricing import usd
@@ -82,6 +82,10 @@ def configure_quota_layout(panel):
         label=Text(title);label.put(fontSize=16,color='muted',wrap=True)
         number=Text();number.put(fontSize=32,bold=True,color='ink',noElide=True,wrap=True,fitText=True)
         content.addWidget(label);content.addWidget(number);pair.addWidget(card,1)
+        if key=='weekly':
+            panel.value_cycles_button=Button('산정 주기 관리');panel.value_cycles_button.put(fontSize=12,height=30,role='quiet')
+            panel.value_cycles_button.setEnabled(False)
+            content.addWidget(panel.value_cycles_button)
         panel.summary_cards[key]=card;panel.summary_values[key]=number
     panel.summary_values['elapsed'].setToolTip('측정 시작부터 현재까지의 경과 시간입니다. 측정 중지와 수집 공백을 포함합니다.')
     panel.summary_values['usage'].setToolTip('관측한 주간 할당량 소모율의 누적 합계입니다. 초기화 전후의 사용량을 합산합니다.')
@@ -130,6 +134,71 @@ def configure_quota_layout(panel):
     extras=[node for node in panel.history_legend._nodes if node not in panel.legend_toggles.values()]
     panel.history_legend._nodes=[panel.legend_toggles[key] for key in order]+extras
     panel.history_legend.structureChanged.emit()
+    build_value_cycle_dialog(panel)
+
+
+def build_value_cycle_dialog(panel):
+    import json
+    from .quota_view import clock
+    dialog=Dialog(panel);dialog.setWindowTitle('산정 주기 관리')
+    panel.value_cycles_dialog=dialog
+    outer=Column(dialog);outer.setContentsMargins(20,20,20,20);outer.setSpacing(12)
+    title=Text('주간 할당량 가치 산정 주기');title.put(fontSize=20,bold=True,wrap=True);outer.addWidget(title)
+    formula=Text('선택한 주기의 환산액 합계 ÷ 소모량 합계 × 100');formula.put(fontSize=12,color='muted',wrap=True)
+    outer.addWidget(formula)
+    actions=Row();outer.addLayout(actions)
+    select=Button('전체 선택');clear=Button('전체 해제')
+    for button in (select,clear):button.put(fontSize=12,height=30);actions.addWidget(button)
+    actions.addStretch()
+    scroll=Scroll();outer.addWidget(scroll,1)
+    rows=Column();rows.setContentsMargins(0,0,0,0);rows.setSpacing(8);scroll.setWidget(rows)
+    preview=Text();preview.put(fontSize=14,bold=True,wrap=True);outer.addWidget(preview)
+    panel.value_cycles_preview=preview
+    footer=Row();footer.addStretch()
+    cancel=Button('취소');save=Button('적용');save.put(role='primary')
+    footer.addWidget(cancel);footer.addWidget(save);outer.addLayout(footer)
+    panel.value_cycles_apply=save;panel.value_cycles_cancel=cancel
+    panel.value_cycle_checks={}
+    key=None;excluded=set()
+    def selection():
+        return (excluded-panel.value_cycle_checks.keys())|{start for start,check in panel.value_cycle_checks.items() if not check.isChecked()}
+    def update_preview(*_):
+        preview.setText(formatted('선택한 주기 {selected}/{total}개 / {value}',
+            selected=sum(check.isChecked() for check in panel.value_cycle_checks.values()),
+            total=len(panel.value_cycle_checks),value=usd(panel.weekly_value(selection()))))
+    def select_all(checked):
+        for check in panel.value_cycle_checks.values():check.setChecked(checked)
+    select.clicked.connect(lambda:select_all(True));clear.clicked.connect(lambda:select_all(False))
+    def apply():
+        panel.settings.setValue(key,json.dumps(sorted(selection())))
+        panel.render();dialog.finish(1)
+    save.clicked.connect(apply);cancel.clicked.connect(dialog.reject)
+    def open_dialog():
+        nonlocal key,excluded
+        if dialog.host:
+            dialog.host.raise_();dialog.host.activateWindow();return
+        key,excluded=panel.value_cycle_selection()
+        old=rows._nodes;rows._nodes=[];rows.structureChanged.emit()
+        for node in old:node.deleteLater()
+        panel.value_cycle_checks={}
+        for period in panel.report['view']['periods']:
+            row=Row();row.put(collapseBelow=400,columns=1)
+            check=Toggle(clock(period['start'],True)[:16]+' → '+clock(period['end'],True)[:16])
+            check.put(fontSize=12);check.setChecked(period['start'] not in excluded)
+            check.setToolTip(period['label']);check.setAccessibleName(period['label'])
+            amount=Text(f"{usd(period['cost'])} / {period['delta']:g}%p");amount.put(fontSize=12)
+            row.addWidget(check,1);row.addWidget(amount);rows.addWidget(row)
+            panel.value_cycle_checks[period['start']]=check
+            check.toggled.connect(update_preview)
+        update_preview()
+        host=host_for(panel)
+        if host is None:return
+        dialog.resize(min(720,max(480,host.width()-40)),min(560,max(320,host.height()-80)))
+        dialog.open()
+    def closed(*_):
+        dialog.setParent(panel);dialog.host=None
+    dialog.finished.connect(closed)
+    panel.value_cycles_button.clicked.connect(open_dialog)
 
 
 def build_exclusion_dialog(panel):

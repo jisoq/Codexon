@@ -84,11 +84,11 @@ Rectangle {
                         Layout.fillWidth: true
                         spacing: 10
                         Layout.leftMargin: modelData.subordinate ? 14 : 0
-                        Rectangle {
+                        UiSwatch {
                             visible: !!modelData.model
-                            Layout.preferredWidth: visible ? 10 : 0
-                            Layout.preferredHeight: 10
-                            color: modelData.model ? (appTheme.palette && appTheme.color(modelData.swatch)) : "transparent"
+                            Layout.preferredWidth: visible ? 12 : 0
+                            Layout.preferredHeight: 12
+                            colorKey: modelData.swatch || ""
                         }
                         UiText {
                             text: appLanguage.text(modelData.label)
