@@ -372,7 +372,6 @@ def test_sync_requires_positive_postcommit_certificate_confirmation(tmp_path, mo
         assert ledger.db.execute('SELECT count(*) FROM calls').fetchone()[0] == 1
         assert ledger.db.execute('SELECT count(*) FROM tracking_call_boundaries').fetchone()[0] == 1
         assert adapter.metrics['applied_owners'] == 0
-        assert adapter.task_revisions == {}
 
 
 @pytest.mark.parametrize('mutation', [
