@@ -364,7 +364,7 @@ def test_writer_first_selection_after_idle_wakes_on_source_completion(tmp_path,m
     target=tmp_path/'index.sqlite';receiver=SnapshotReceiver()
     change_selection=Event();wake_consumed=Event();resume_writer=Event();pending=Event()
     consume_notification=CollectionClient.consume_notification
-    poll_catalog=CollectionClient.poll_catalog
+    poll_selection=CollectionClient.poll_selection
     def consume(client,*args,**kwargs):
         notice=consume_notification(client,*args,**kwargs)
         if notice is True and change_selection.is_set():
@@ -372,14 +372,14 @@ def test_writer_first_selection_after_idle_wakes_on_source_completion(tmp_path,m
             wake_consumed.set()
             assert resume_writer.wait(10)
         return notice
-    def catalog(client,*args,**kwargs):
-        value=poll_catalog(client,*args,**kwargs)
-        if ([None,TID] in client.active_demand['selected']
-                and [None,TID] not in value['header'].get('demand',{}).get('selected',())):
-            pending.set()
-        return value
+    def selection(client,*args,**kwargs):
+        try:return poll_selection(client,*args,**kwargs)
+        except CollectionCatalogUnavailable as error:
+            if error.reason=='selected_pending' and [None,TID] in client.active_demand['selected']:
+                pending.set()
+            raise
     monkeypatch.setattr(CollectionClient,'consume_notification',consume)
-    monkeypatch.setattr(CollectionClient,'poll_catalog',catalog)
+    monkeypatch.setattr(CollectionClient,'poll_selection',selection)
     with closing(CollectorService([home],target)) as service,\
             closing(PreparedWriter([home],target,None,tmp_path/'quota.sqlite')) as writer:
         idle=publication(service,writer,receiver,lambda value:value.get('catalog_complete')
@@ -472,7 +472,8 @@ def test_writer_resolves_unavailable_target_without_loading_bodies_and_finds_new
         resolved=publication(service,writer,receiver,lambda value:value.get('catalog_complete')
             and [None,wanted] in value.get('demand',{}).get('selected',()))
         assert not resolved['sessions'] and not resolved['overlay_sessions']
-        assert sum(sid==wanted for _,sid,_ in resolved['session_catalog'])==(2 if ambiguous else 0)
+        assert resolved['selected_resolutions']==[[wanted,2 if ambiguous else 0]]
+        assert 'session_catalog' not in resolved
         assert not reads.bodies and not reads.cached and not reads.events
         if not ambiguous:
             created=write_session(home,NEW)
@@ -543,6 +544,54 @@ def test_selected_family_and_actual_mode_ancestor_are_the_only_admitted_historie
             assert OTHER not in reads.bodies and OTHER not in reads.cached
 
 
+def test_selected_writer_completes_with_empty_mode_ancestor_outside_family(tmp_path):
+    home,_=fixture_home(tmp_path)
+    write_session(home,TID,count=0,mode=None)
+    write_session(home,CHILD,parent=TID,mode=None)
+    target=tmp_path/'index.sqlite';receiver=SnapshotReceiver()
+    with closing(CollectorService([home],target)) as service,\
+            closing(PreparedWriter([home],target,None,tmp_path/'quota.sqlite')) as writer:
+        writer.set_selected([(None,CHILD)])
+        current=publication(service,writer,receiver,lambda value:
+            any(row['id']==CHILD and row['calls']==1 for row in value['overlay_sessions']))
+        assert {row['id'] for row in current['sessions']}=={CHILD}
+        assert {row['id'] for row in current['overlay_sessions']}=={CHILD}
+        assert (str(home),TID) in service.channel.live.requested_demand(time.time())['evidence']
+        parent=next(row for row in service.last['sessions'] if row['id']==TID)
+        assert parent['collection_complete']
+        detail,_=selected_detail(service,writer,receiver,current,CHILD,'empty-mode-ancestor')
+        assert detail['summary']['calls']==1
+        assert detail['summary']['latest']['mode']=='미확인'
+
+
+def test_current_session_updates_while_aggregate_source_is_unavailable(tmp_path,monkeypatch):
+    home,_=fixture_home(tmp_path)
+    write_session(home,TID,count=1)
+    other=write_session(home,OTHER,count=3)
+    target=tmp_path/'index.sqlite';quota=tmp_path/'quota.sqlite'
+    receiver=SnapshotReceiver()
+    release=Event();rebuilding=Event()
+    source_open=io.open
+    def held_open(path,*args,**kwargs):
+        if str(path)==str(other) and not release.is_set():
+            rebuilding.set()
+            raise PermissionError('aggregate source is held unavailable')
+        return source_open(path,*args,**kwargs)
+    with closing(CollectorService([home],target)) as service,closing(PreparedWriter([home],target,None,quota)) as writer:
+        writer.set_selected([(None,TID)])
+        first=publication(service,writer,receiver,lambda value:any(row['id']==TID for row in value['sessions']))
+        monkeypatch.setattr(io,'open',held_open)
+        writer.set_aggregate(7)
+        publication(service,writer,receiver,lambda value:rebuilding.is_set())
+        write_session(home,TID,count=2)
+        updated=publication(service,writer,receiver,lambda value:
+            any(row['id']==TID and row['calls']==2 for row in value['overlay_sessions']))
+        detail,_=selected_detail(service,writer,receiver,updated,TID,'updated')
+        assert len(detail['summary']['recent'])==2
+        assert not release.is_set()
+        assert updated.get('aggregate_request') is None
+
+
 def test_writer_keeps_selected_detail_live_until_explicit_aggregate_completes_and_preserves_ledger(tmp_path,monkeypatch):
     home,_=fixture_home(tmp_path)
     selected=write_session(home,TID,count=25)
@@ -581,7 +630,23 @@ def test_writer_keeps_selected_detail_live_until_explicit_aggregate_completes_an
         assert not service.last['usage_collection_complete']
         release.set()
         aggregate=publication(service,writer,receiver,lambda value:value.get('aggregate_request')==7)
-        assert {row['id'] for row in aggregate['sessions']}=={TID,OTHER}
+        assert {row['id'] for row in aggregate['sessions']}=={TID}
+        deadline=time.monotonic()+10
+        with closing(PreparedQuery(writer.path)) as query:
+            while time.monotonic()<deadline:
+                now=time.time()
+                result=query(dict(kind='query',id='all-calls',logical=(),query=dict(
+                    page=1,start=0,end=now,now=now,period='custom',category_usage=True,
+                    usage=dict(dimension='model',metric='calls'))),
+                    token_value(aggregate['prepared_token']),lambda:False)
+                if result['kind']!='stale':break
+                aggregate=publication(service,writer,receiver,
+                    lambda value:value.get('aggregate_request')==7,deadline=deadline)
+            else:pytest.fail('Complete aggregate query did not reach the displayed publication')
+        assert result['kind']=='result'
+        assert result['result']['usage']['summary']['value']==28
+        assert result['result']['analysis']['response_count']==28
+        assert result['result']['analysis']['session_count']==2
         deadline=time.monotonic()+10
         while time.monotonic()<deadline:
             with sqlite3.connect(quota) as db:
@@ -590,6 +655,8 @@ def test_writer_keeps_selected_detail_live_until_explicit_aggregate_completes_an
             if saved==28:break
             publication(service,writer,receiver,lambda value:value.get('aggregate_request')==7)
         assert saved==28
+        with sqlite3.connect(quota) as db:
+            assert dict(db.execute('SELECT sid,count(*) FROM calls GROUP BY sid'))=={TID:25,OTHER:3}
         writer.set_aggregate(None)
         writer.set_selected([(None,OTHER)])
         selected_again=publication(service,writer,receiver,lambda value:

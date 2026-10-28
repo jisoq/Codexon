@@ -5,7 +5,7 @@ import argparse
 import asyncio
 import time
 import uuid
-from collections import OrderedDict, defaultdict, deque, Counter
+from collections import defaultdict, deque, Counter
 from pathlib import Path
 import os
 import sqlite3
@@ -52,7 +52,7 @@ class Tracker:
         self.store, self.home, self.transport, self.health = store,home,transport,health
         self.pending = defaultdict(deque)
         self.active = {}
-        self.completed = OrderedDict()
+        self.completed = {}
         self.timings = {}
 
     def save(self, record):
@@ -162,8 +162,6 @@ class Tracker:
             self.active.pop(rid,None)
             self.timings.pop(record['attempt'],None)
             self.completed[rid]=record
-            if len(self.completed)>2048:
-                self.completed.popitem(last=False)
             self.health['responses'] += 1
 
     def finish(self, status='disconnected'):
@@ -172,7 +170,7 @@ class Tracker:
             record['status']=status
             self.save(record)
         self.active.clear();self.pending.clear()
-        self.timings.clear()
+        self.timings.clear();self.completed.clear()
 
 
 def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *, diagnostics=None,ssl_context=None,
@@ -273,7 +271,7 @@ def create_app(store, home, upstream='https://chatgpt.com/backend-api/codex', *,
 
     async def lifecycle(app):
         async with ClientSession(timeout=ClientTimeout(total=None,connect=30,sock_read=600),
-                                 connector=TCPConnector(limit=policy.budget,limit_per_host=policy.budget,ssl=ssl_context or True),
+                                 connector=TCPConnector(limit=0,limit_per_host=0,ssl=ssl_context or True),
                                  auto_decompress=False,trust_env=False,cookie_jar=DummyCookieJar(),
                                  skip_auto_headers={'Accept','Accept-Encoding','User-Agent','Content-Type'}) as client:
             # Keep the OS trust store used by the previous transport. HTTP/2 is

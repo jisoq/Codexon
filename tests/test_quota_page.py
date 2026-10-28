@@ -2,7 +2,7 @@
 import time
 
 import pytest
-from PySide6.QtCore import QPointF, QSettings, Qt
+from PySide6.QtCore import QObject, QPointF, QSettings, Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
@@ -40,6 +40,109 @@ def quota_page(tmp_path):
     scroll=Scroll();scroll.put(fillViewport=True);scroll.setWidget(panel)
     yield app,panel,scroll
     ledger.close()
+
+
+def test_selected_weekly_value_weights_consumption_and_preserves_unknown_costs(tmp_path):
+    app=QApplication.instance() or QApplication([])
+    panel=QuotaPanel(QSettings(str(tmp_path/'value.ini'),QSettings.IniFormat))
+    panel.lifetime_statistics={'per_percent':70/60}
+    panel.report={'view':{'periods':[
+        dict(start=1,cost=10,delta=10),dict(start=2,cost=60,delta=30),
+        dict(start=3,cost=None,delta=20)]}}
+    try:
+        assert panel.weekly_value(set())==pytest.approx(116.6666667)
+        assert panel.weekly_value({3})==175
+        assert panel.weekly_value({1})==120
+        assert panel.weekly_value({1,2}) is None
+        assert panel.weekly_value({1,2,3}) is None
+        panel.report['view']['periods'].append(dict(start=4,cost=10,delta=10))
+        assert panel.weekly_value({1,3})==175
+    finally:panel.deleteLater();app.processEvents()
+
+
+@pytest.mark.integration
+def test_value_cycle_management_updates_reference_and_persists_selection(quota_page,tmp_path):
+    from cachemonitor.presentation import Button
+    from cachemonitor.pricing import usd
+    from test_ui import wait_for_rendered
+    app,panel,scroll=quota_page
+    panel.cycle_choice.setCurrentIndex(0)
+    host=mount(scroll,520,900)
+    report=panel.report
+    original=panel.lifetime_value
+    totals={key:panel.summary_values[key].text() for key in ('usage','cost')}
+    chosen=next(period for period in panel._view['periods'] if period['value'] is not None and period['value']!=original)
+    def open_management():
+        click(host,render_plot(host,panel.value_cycles_button))
+        wait_for_rendered(lambda:panel.value_cycles_dialog.host is not None)
+        dialog=panel.value_cycles_dialog
+        return dialog.host,next(node for node in dialog.findChildren(Button) if node.text()=='전체 해제')
+    try:
+        render_plot(host,panel.history);raster=panel.history._picture.copy()
+        dialog,clear=open_management()
+        click(dialog,control(dialog,clear))
+        assert not any(check.isChecked() for check in panel.value_cycle_checks.values())
+        assert panel.value_cycles_preview.text().endswith('—')
+        click(dialog,control(dialog,panel.value_cycles_cancel))
+        wait_for_rendered(lambda:panel.value_cycles_dialog.host is None)
+        assert panel.lifetime_value==original and not panel.value_cycle_selection()[1]
+        dialog,clear=open_management()
+        click(dialog,control(dialog,clear))
+        click(dialog,control(dialog,panel.value_cycle_checks[chosen['start']]))
+        assert panel.value_cycles_preview.text().endswith(usd(chosen['value']))
+        assert dialog.quick.grabFramebuffer().save(str(tmp_path/'value-cycle-management.png'))
+        click(dialog,control(dialog,panel.value_cycles_apply))
+        wait_for_rendered(lambda:panel.value_cycles_dialog.host is None)
+        assert panel.lifetime_value==pytest.approx(chosen['value'])
+        assert panel.summary_values['weekly'].text()==usd(chosen['value'])
+        assert panel.history.reference==pytest.approx(chosen['value'])
+        render_plot(host,panel.history)
+        assert panel.history._picture!=raster
+        assert panel.cycle_table.rowCount()==len(panel._view['periods'])
+        assert {key:panel.summary_values[key].text() for key in totals}==totals
+        panel.settings.sync()
+        restored=QuotaPanel(QSettings(panel.settings.fileName(),QSettings.IniFormat))
+        try:
+            restored.receive(dict(report=report))
+            assert restored.lifetime_value==pytest.approx(chosen['value'])
+            key,excluded=restored.value_cycle_selection()
+            assert chosen['start'] not in excluded and len(excluded)==len(panel._view['periods'])-1
+            restored.report={**report,'account':'another-account'}
+            assert restored.value_cycle_selection()[0]!=key and not restored.value_cycle_selection()[1]
+            restored.report={**report,'home':'another-home'}
+            assert restored.value_cycle_selection()[0]!=key and not restored.value_cycle_selection()[1]
+        finally:restored.deleteLater();app.processEvents()
+        assert not host.qml_errors,host.qml_errors
+    finally:
+        if panel.value_cycles_dialog.host:panel.value_cycles_dialog.reject();app.processEvents()
+        dispose(host)
+
+
+@pytest.mark.integration
+def test_quota_legend_text_and_swatch_follow_theme_without_new_report(quota_page):
+    from cachemonitor.overlay_appearance import Appearance
+    from test_ui import wait_for_rendered
+    app,panel,scroll=quota_page
+    panel.cycle_choice.setCurrentIndex(0)
+    host=mount(scroll,860,900)
+    theme=shared_theme()
+    try:
+        render_plot(host,panel.history)
+        report=panel.report
+        controls=[control(host,panel.legend_toggles[key]) for key in ('cycle_value','reference')]
+        captions=[next(item for item in walk(button) if item.property('text')==button.property('text')
+                       and item.metaObject().indexOfProperty('color')>=0) for button in controls]
+        swatches=[next(item for item in walk(button.findChild(QObject,'legendSwatch'))
+                       if item.metaObject().indexOfProperty('color')>=0 and item.property('height')==2) for button in controls]
+        first=captions[0].property('color').name()
+        theme.configure(appearance=Appearance(False,'#faf5ee','#302c28','#b44354'))
+        expected=theme.readableText('accent','surface')
+        assert expected!=first
+        wait_for_rendered(lambda:all(text.property('color').name()==expected for text in captions))
+        wait_for_rendered(lambda:all(swatch.property('color').name()==theme.color('accent') for swatch in swatches))
+        assert panel.report is report and all(button.property('checked') for button in controls)
+        assert not host.qml_errors,host.qml_errors
+    finally:dispose(host);theme.configure('light')
 
 
 @pytest.mark.integration

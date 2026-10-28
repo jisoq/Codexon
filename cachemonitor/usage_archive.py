@@ -4,6 +4,8 @@ import json
 from .core import Session
 
 
+ARCHIVE_OWNER = "coalesce(nullif(json_extract(data,'$.purpose'),''),'imported')||':'||json_extract(data,'$.sid')"
+
 def _load(db,homes,owners=None):
     groups={};records={}
     if owners is not None and not owners:return []
@@ -56,6 +58,18 @@ class ArchiveSessions:
             db.execute(f'''CREATE TEMP TRIGGER IF NOT EXISTS usage_archive_{action.lower()}
                 AFTER {action} ON main.usage_archive BEGIN
                 UPDATE usage_archive_revision SET value=value+1; END''')
+
+    def lookup(self, home, sid, *, children=False):
+        expression = "json_extract(data,'$.sid')" if children else ARCHIVE_OWNER
+        rows = self.db.execute(f'''SELECT {ARCHIVE_OWNER},json_extract(data,'$.sid'),json_extract(data,'$.purpose')
+            FROM usage_archive WHERE home=? AND {expression}=?
+            GROUP BY json_extract(data,'$.sid'),json_extract(data,'$.purpose')''', (home, sid))
+        owners = {}
+        for owner, parent, _ in rows:
+            if owner in owners:
+                raise ValueError('Duplicate imported session identity')
+            owners[owner] = parent
+        return owners
 
     def views(self,now,homes,owners=None):
         key=(frozenset(homes),None if owners is None else frozenset(owners),self.db.execute('PRAGMA data_version').fetchone()[0],

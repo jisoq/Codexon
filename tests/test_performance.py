@@ -239,11 +239,16 @@ def test_process_queries_latest_selection_cache_and_clean_shutdown(tmp_path):
         deadline=time.monotonic()+20
         while time.monotonic()<deadline:
             app.processEvents();QTest.qWait(40)
-            if w.worker.process.pid!=old_pid and w.worker.process.is_alive() and not w.analysis_pending and not w.analysis_errors and w.analysis_error_history:
+            if (w.worker.process.pid!=old_pid and w.worker.process.is_alive()
+                    and not w.analysis_pending and not w.analysis_errors
+                    and any(record.get('source')=='analysis.process' for record in w.error_state.history)):
                 break
             QTest.qWait(20)
         assert w.worker.process.pid!=old_pid
         assert not w.analysis_errors and w.analysis['response_count']==8
+        assert 'analysis.process' not in w.error_state.sources
+        assert any(record.get('source')=='analysis.process' and record.get('resolution')
+                   for record in w.error_state.history)
     finally:
         w.quitting=True; w.tick.stop()
         w.worker.requestInterruption()

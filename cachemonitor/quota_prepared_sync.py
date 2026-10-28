@@ -7,7 +7,6 @@ They are optional derived progress; absence requests idempotent reapplication.
 from hashlib import sha256
 
 
-MAX_BYTES = 32 * 1024 * 1024
 FORMAT = 1
 APPEND_FORMAT = 1
 
@@ -55,17 +54,6 @@ def _triggers():
         selections = ' UNION '.join(f'SELECT home,sid FROM calls WHERE home={side}.home AND uid={side}.uid' for side in sides)
         statements[name] = (f'CREATE TRIGGER {name} BEFORE {event} ON tracking_call_boundaries BEGIN '
             f'DELETE FROM prepared_analysis_applied WHERE (home,sid) IN ({selections}); END')
-    size = '(512 + 4*length(new.home) + 4*length(new.sid))'
-    statements['prepared_applied_admit'] = (
-        'CREATE TRIGGER prepared_applied_admit BEFORE INSERT ON prepared_analysis_applied BEGIN '
-        f'SELECT CASE WHEN (SELECT bytes FROM prepared_analysis_budget WHERE id=1)+{size}>{MAX_BYTES} '
-        "THEN RAISE(ABORT,'prepared ledger progress exceeds its metadata budget') END; END")
-    statements['prepared_applied_insert'] = (
-        'CREATE TRIGGER prepared_applied_insert AFTER INSERT ON prepared_analysis_applied BEGIN '
-        f'UPDATE prepared_analysis_budget SET bytes=bytes+{size} WHERE id=1; END')
-    statements['prepared_applied_delete'] = (
-        'CREATE TRIGGER prepared_applied_delete AFTER DELETE ON prepared_analysis_applied BEGIN '
-        'UPDATE prepared_analysis_budget SET bytes=bytes-(512+4*length(old.home)+4*length(old.sid)) WHERE id=1; END')
     return statements
 
 
@@ -77,7 +65,9 @@ def initialize(db):
     try:
         db.execute('CREATE TABLE IF NOT EXISTS prepared_analysis_applied('
                    'home TEXT NOT NULL,sid TEXT NOT NULL,signature TEXT NOT NULL,PRIMARY KEY(home,sid)) WITHOUT ROWID')
-        db.execute('CREATE TABLE IF NOT EXISTS prepared_analysis_budget(id INTEGER PRIMARY KEY,bytes INTEGER NOT NULL)')
+        for name in ('prepared_applied_admit','prepared_applied_insert','prepared_applied_delete'):
+            db.execute(f'DROP TRIGGER IF EXISTS {name}')
+        db.execute('DROP TABLE IF EXISTS prepared_analysis_budget')
         definitions = _triggers()
         actual = dict(db.execute("SELECT name,sql FROM sqlite_master WHERE type='trigger' AND name LIKE 'prepared_applied_%'"))
         if any(actual.get(name) != sql for name,sql in definitions.items()):
@@ -87,8 +77,6 @@ def initialize(db):
                 if actual.get(name) != sql:
                     db.execute(f'DROP TRIGGER IF EXISTS {name}')
                     db.execute(sql)
-        total = db.execute('SELECT coalesce(sum(512+4*length(home)+4*length(sid)),0) FROM prepared_analysis_applied').fetchone()[0]
-        db.execute('INSERT INTO prepared_analysis_budget VALUES(1,?) ON CONFLICT(id) DO UPDATE SET bytes=excluded.bytes', (total,))
         db.commit()
     except BaseException:
         db.rollback()
@@ -116,7 +104,6 @@ def save(db, certificates):
         if (type(home) is not str or type(sid) is not str or type(signature) is not str
                 or len(signature) != 64 or any(c not in '0123456789abcdef' for c in signature)):
             raise ValueError('invalid prepared ledger certificate')
-        # UPDATE preserves the budget counter; never use REPLACE here.
         old = db.execute('SELECT signature FROM prepared_analysis_applied WHERE home=? AND sid=?',(home,sid)).fetchone()
         if old is None:
             db.execute('INSERT INTO prepared_analysis_applied VALUES(?,?,?)',(home,sid,signature))

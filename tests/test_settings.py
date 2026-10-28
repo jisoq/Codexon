@@ -333,6 +333,13 @@ def test_search_navigation_and_preserved_preferences(tmp_path,monkeypatch,langua
         page.restore_scrolls([100]*7)
         state=window.capture_state();assert state['settings_category']=='integration'
         assert isinstance(state['settings_scrolls'],dict)
+        entry=next(entry for entry in page.entries if entry['widget'] is window.update_panel)
+        for plan,action in ((dict(kind='app',release={'tag_name':'v2099.01.01.1'}),window.update_panel.execute),
+                            (dict(kind='none'),window.update_panel.button)):
+            window.update_panel.show_plan(plan);page.search.setText('update')
+            page.reveal_item(entry['id'])
+            wait_until(lambda:control(window,action).property('activeFocus'))
+            assert control(window,action).isVisible() and page.current_category()=='about'
         assert not window.qml_errors
     finally:
         window.quitting=True;window.tick.stop();window.tray.hide();window.observer_panel.stop()

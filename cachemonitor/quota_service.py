@@ -351,12 +351,14 @@ class QuotaService(QThread):
                     tracking_at_request=self.tracking_enabled and not self.paused
                     can_observe = (self.live and polling.ready(time.monotonic())
                         and not (self.observation_issue or self.control_issue)
-                        and (not tracking_at_request or pending.available()))
+                        and (not tracking_at_request or pending.reserve_fetch()))
                 if can_observe:
                     try:
                         fetched = client.fetch()
                         with self.ingress_lock:
-                            if self.monitoring_revision!=revision:continue
+                            if self.monitoring_revision!=revision:
+                                pending.cancel_fetch()
+                                continue
                             direct=fetched
                             if tracking_at_request:
                                 if not pending.append('quota', direct):
@@ -365,7 +367,9 @@ class QuotaService(QThread):
                         lookup_reason=''
                         polling.finish(time.monotonic(), True, direct, time.time())
                     except Exception as exc:
-                        if self.monitoring_revision!=revision:continue
+                        if self.monitoring_revision!=revision:
+                            pending.cancel_fetch()
+                            continue
                         record_failure(self.path, 'account lookup', exc)
                         lookup_reason=getattr(exc,'code','timeout' if isinstance(exc,TimeoutError) else 'lookup')
                         lookup_issue = ('Codex 한도 조회 지연: 자동 재시도 중' if isinstance(exc, (TimeoutError, ConnectionError))

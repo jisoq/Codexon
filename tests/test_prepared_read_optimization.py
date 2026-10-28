@@ -43,7 +43,7 @@ def test_metadata_only_generation_reuses_admitted_inventory_and_publication(tmp_
         before = publisher.publish(dict(ts=1000, homes=['home']), store)
         expected = deepcopy(publisher.overlays)
         with store.read_current() as view:
-            inventory = deepcopy(cohort._inventory(view))
+            inventory = deepcopy(dict(cohort._inventory(view).items()))
         stage = store.begin(ingest.source_identity(catalog))
         latest = stage.publish(ingest.source_identity(catalog), ready=True)
         traversals = Counter()
@@ -58,7 +58,7 @@ def test_metadata_only_generation_reuses_admitted_inventory_and_publication(tmp_
         observed(ingest, 'inventory')
         observed(delivery, 'publication')
         with store.read_current() as view:
-            assert cohort._inventory(view) == inventory
+            assert dict(cohort._inventory(view).items()) == inventory
         publisher.adopt(store, ())
         assert traversals == {}
         after = publisher.publish(dict(ts=1001, homes=['home']), store)
@@ -147,9 +147,14 @@ def test_title_only_and_mixed_updates_do_not_reload_unchanged_facts(tmp_path,mon
             reference=AnalysisEngine();reference.ingest(values)
             with store.read_current() as view:
                 assert list(view.iter_calls(owner))==[storage.public_record(row) for row in reference.sessions[owner]['prepared']['history']]
-            # The committed inventory must remain usable across coordinator instances.
-            def forbidden(*args,**kwargs):raise AssertionError('unchanged conversion reread its inventory')
-            monkeypatch.setattr(storage.Snapshot,'inventory',forbidden)
+            original_inventory=storage.Snapshot.inventory
+            def bounded_inventory(view,*,owners=None,**kwargs):
+                assert owners is not None,'conversion requested the complete metadata population'
+                return original_inventory(view,owners=owners,**kwargs)
+            def forbidden_source(*args,**kwargs):
+                raise AssertionError('unchanged conversion decoded certified source history')
+            monkeypatch.setattr(storage.Snapshot,'inventory',bounded_inventory)
+            monkeypatch.setattr(client,'selected_owner_stream',forbidden_source)
             assert list(PreparedCohort(store,client,None,speed_writer=speed).convert(read_catalog(client)))==[]
     finally:
         client.close();writer.close()

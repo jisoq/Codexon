@@ -133,31 +133,71 @@ class SnapshotPublisher:
 class SnapshotReceiver:
     def __init__(self):
         self.epoch=None;self.sequence=0;self.sessions={};self.overlays={};self.models=[]
-        self.retired=set();self.filter_choices={}
+        self.retired=set();self.filter_choices={};self.pending=None
 
     def receive(self,value):
         if 'protocol' not in value:return value
+        continued = value['protocol']==2
         if value.get('reset'):
             if value['epoch'] in self.retired:return None
             if value['epoch']==self.epoch and value['sequence']<=self.sequence:return None
             if self.epoch and self.epoch!=value['epoch']:
                 if len(self.retired)>=64:raise ValueError('분석 동기화 재시작 필요')
                 self.retired.add(self.epoch)
-            self.epoch=value['epoch'];self.sequence=0;self.sessions={};self.overlays={}
+            self.epoch=value['epoch'];self.sequence=0;self.pending=None
+            if not continued:self.sessions={};self.overlays={}
         if value['epoch']!=self.epoch or value['sequence']<=self.sequence:return None
         if value['sequence']!=self.sequence+1:raise ValueError('분석 변경분 순서 누락')
         self.sequence=value['sequence']
-        for key in value['removed']:
-            self.sessions.pop(tuple(key),None);self.overlays.pop(tuple(key),None)
-        for s in value['sessions']:self.sessions[(s['home'],s['id'])]=s
-        for s in value['overlay_sessions']:self.overlays[(s['home'],s['id'])]=s
-        if 'models' in value:self.models=value['models']
-        if 'filter_choices' in value:self.filter_choices=value['filter_choices']
+        if continued:
+            if self.pending is None:
+                self.pending=dict(sessions={} if value.get('reset') else self.sessions.copy(),
+                    overlays={} if value.get('reset') else self.overlays.copy(),
+                    models=self.models,filter_choices=self.filter_choices,models_started=False,choices_started=False,
+                    changed=[],removed=[],model_candidates=[],cache_candidates=[],meta={},reset=bool(value.get('reset')))
+            pending=self.pending
+            token=value.get('prepared_token');prior=pending['meta'].get('prepared_token')
+            if prior is not None and token is not None and tuple(token)!=tuple(prior):
+                raise ValueError('분석 변경분 세대 불일치')
+            lists=('sessions','overlay_sessions','removed','model_candidates','cache_candidates','filter_choices','models')
+            pending['meta'].update({key:item for key,item in value.items() if key not in (*lists,'reset','more')})
+            for key in value['removed']:
+                pending['sessions'].pop(tuple(key),None);pending['overlays'].pop(tuple(key),None)
+            for row in value['sessions']:pending['sessions'][(row['home'],row['id'])]=row
+            for row in value['overlay_sessions']:pending['overlays'][(row['home'],row['id'])]=row
+            pending['changed'].extend(value['sessions'])
+            for name in ('removed','model_candidates','cache_candidates'):pending[name].extend(value[name])
+            if 'models' in value:
+                if not pending['models_started']:
+                    pending['models']=[];pending['models_started']=True
+                pending['models'].extend(value['models'])
+            if 'filter_choices' in value:
+                if not pending['choices_started']:
+                    pending['filter_choices']={};pending['choices_started']=True
+                for name,items in value['filter_choices'].items():
+                    if isinstance(items,list):pending['filter_choices'].setdefault(name,[]).extend(items)
+                    elif name=='project_paths':
+                        paths=pending['filter_choices'].setdefault(name,{})
+                        for project,values in items.items():paths.setdefault(project,[]).extend(values)
+                    elif isinstance(items,dict):pending['filter_choices'].setdefault(name,{}).update(items)
+                    else:pending['filter_choices'][name]=items
+            if value.get('more'):return None
+            self.sessions=pending['sessions'];self.overlays=pending['overlays']
+            self.models=pending['models'];self.filter_choices=pending['filter_choices']
+            self.pending=None
+            value=dict(pending['meta'],reset=pending['reset'],more=False,
+                sessions=pending['changed'],removed=pending['removed'],
+                model_candidates=pending['model_candidates'],cache_candidates=pending['cache_candidates'])
+        else:
+            if self.pending is not None:raise ValueError('분석 변경분 형식 불일치')
+            for key in value['removed']:
+                self.sessions.pop(tuple(key),None);self.overlays.pop(tuple(key),None)
+            for row in value['sessions']:self.sessions[(row['home'],row['id'])]=row
+            for row in value['overlay_sessions']:self.overlays[(row['home'],row['id'])]=row
+            if 'models' in value:self.models=value['models']
+            if 'filter_choices' in value:self.filter_choices=value['filter_choices']
         overlays=list(self.overlays.values())
         if value.get('prepared_token') is not None:
-            # The accepted envelope pins detail reads for the entire view.
-            # Content deltas need not retransmit unchanged summaries merely
-            # to advance that pin. Never mutate an earlier returned snapshot.
             token=tuple(value['prepared_token'])
             overlays=[dict(summary,_prepared_token=token) for summary in overlays]
         return {**value,'changed_sessions':value['sessions'],'sessions':list(self.sessions.values()),

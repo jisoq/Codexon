@@ -203,6 +203,15 @@ class EventStore:
     def owners(self, homes=None):
         return event_owners(self.db,homes)
 
+    def has_owner(self, home, sid):
+        if self.replay_table == 'events':
+            return self.db.execute('SELECT 1 FROM events WHERE home=? AND tid=? LIMIT 1', (home, sid)).fetchone() is not None
+        if self.db.execute('''SELECT 1 FROM event_sessions s WHERE home=? AND tid=?
+                AND EXISTS(SELECT 1 FROM event_records r WHERE r.session_id=s.id)''', (home, sid)).fetchone():
+            return True
+        return bool(self.legacy and self.db.execute(
+            'SELECT 1 FROM events_legacy WHERE home=? AND tid=? LIMIT 1', (home, sid)).fetchone())
+
     def _views(self):
         db=self.db
         for name in ('events_insert','events_update','events_delete'):db.execute('DROP TRIGGER IF EXISTS '+name)

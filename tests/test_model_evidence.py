@@ -204,37 +204,52 @@ def test_many_attempts_keep_all_conflict_decisions_with_bounded_join_memory(tmp_
     finally:reader.close();store.close()
 
 
-def test_reader_drains_available_batches_without_waiting_between_polls(tmp_path, monkeypatch):
+def test_reader_drains_available_rows_across_polls_and_honors_deadline(tmp_path, monkeypatch):
     store=EvidenceStore(tmp_path/'evidence.sqlite');reader=EvidenceReader(store.path)
-    monkeypatch.setattr(reader,'READ_BATCH',2)
+    monkeypatch.setattr(reader,'MAX_POLL_ROWS',2)
     try:
         for n in range(7):store.write(tmp_path/'home',f'a{n}',n,'WebSocket',f'r{n}',status='completed')
         reader.poll()
-        assert len(reader.records)==7 and not reader.catching_up
-        monkeypatch.setattr(reader,'READ_SECONDS',0)
+        assert reader.catching_up and len(reader.records)==2
+        deadline=time.monotonic()+10
+        while reader.catching_up:
+            assert time.monotonic()<deadline
+            previous=reader.offset
+            reader.poll()
+            assert not reader.error and previous<reader.offset<=previous+2
+        assert len(reader.records)==7
         for n in range(7,12):store.write(tmp_path/'home',f'a{n}',n,'WebSocket',f'r{n}',status='completed')
-        reader.poll()
+        reader.poll(historical=False)
         assert reader.catching_up and len(reader.records)==9
-        monkeypatch.setattr(reader,'READ_SECONDS',10)
+        monkeypatch.setattr(reader,'READ_SECONDS',0)
+        monkeypatch.setattr(reader,'MAX_POLL_ROWS',10)
         reader.poll()
-        assert not reader.catching_up and len(reader.records)==12
+        assert reader.live_offset==reader.highwater and reader.offset==7
+        assert reader.catching_up and len(reader.records)==12
+        monkeypatch.setattr(reader,'READ_SECONDS',10)
+        deadline=time.monotonic()+10
+        while reader.catching_up:
+            assert time.monotonic()<deadline
+            reader.poll()
+            assert not reader.error
+        assert reader.offset==reader.highwater and len(reader.records)==12
     finally:reader.close();store.close()
 
 
-def test_partial_observation_read_advances_publication_revision_and_recovers(tmp_path,monkeypatch):
+def test_partial_observation_read_advances_publication_revision_and_recovers(tmp_path):
     import sqlite3
     store=EvidenceStore(tmp_path/'evidence.sqlite');reader=EvidenceReader(store.path);home=tmp_path/'home'
     try:
         store.write(home,'first',1,'WebSocket','first',status='completed');reader.poll()
         before=reader.revision;db=reader.db
         for n in range(2,4):store.write(home,f'a{n}',n,'WebSocket',f'r{n}',status='completed')
-        monkeypatch.setattr(reader,'READ_BATCH',1)
         class Interrupted:
             def __init__(self):self.batches=0
             def execute(self,sql,*args):
                 if 'seq>? AND seq<=?' in sql:
                     self.batches+=1
                     if self.batches==2:raise sqlite3.OperationalError('interrupted observation read')
+                    return db.execute(sql,(*args[0][:-1],1))
                 return db.execute(sql,*args)
             def close(self):db.close()
         reader.db=Interrupted();reader.poll()

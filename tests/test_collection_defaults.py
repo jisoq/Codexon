@@ -277,7 +277,8 @@ def test_closed_collection_reuses_bodies_and_replays_only_changed_owners(tmp_pat
         while True:
             value=service.poll(now)
             if value['usage_collection_complete'] and not value['index']['loading']:break
-            assert time.monotonic()<deadline
+            assert time.monotonic()<deadline,dict(index=value['index'],errors=value['usage_errors'],
+                header_pending=sorted(service.index.header_pending))
         reader=CollectionChannel([home],target,evidence)
         try:value=reader.read(shared=True)
         finally:reader.close()

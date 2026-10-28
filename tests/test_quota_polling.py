@@ -300,7 +300,7 @@ def test_rejected_live_observation_remains_visible_and_stops_new_reads(tmp_path,
         def fetch(self):
             reads.append(clock[0])
             return dict(source='live',account='test',requested_at=clock[0],observed_at=clock[0],
-                oversized='x'*module.ObservationBacklog.MAX_ITEM_BYTES,
+                oversized='x'*module.ObservationBacklog.MAX_BYTES,
                 windows={'weekly':dict(used_percent=10,resets_at=20000,window_minutes=10080)})
     class Wake:
         def clear(self):pass
@@ -770,3 +770,54 @@ def test_pause_keeps_allowance_fresh_without_recording_excluded_interval(tmp_pat
         assert [row[0] for row in db.execute('select at from observations')]==[resumed_at]
         controls=list(db.execute('select at,enabled from tracking_controls order by at'))
         assert controls==([(1000,0),(resumed_at,1)] if initially_paused else [(1000,1),(1001,0),(resumed_at,1)])
+
+
+
+def test_large_inflight_response_replays_and_polling_resumes_after_backlog_drains(tmp_path, monkeypatch):
+    import json
+    from cachemonitor import quota_payloads
+
+    clock = [1000.]
+    reads = []
+    responses = []
+    monkeypatch.setattr(module, 'time', SimpleNamespace(time=lambda: clock[0], monotonic=lambda: clock[0]))
+    class Client:
+        def __init__(self, *args):
+            pass
+        def close(self):
+            pass
+        def fetch(self):
+            reads.append(clock[0])
+            quota = dict(source='live', account='test', requested_at=clock[0], observed_at=clock[0],
+                windows={'weekly': dict(used_percent=10, resets_at=20000, window_minutes=10080)})
+            if len(reads) == 1:
+                previous = dict(quota, source='local', observed_at=999, padding='x'*(31*256*1024))
+                assert service.backlog.append('local', previous)
+                quota['separate_models'] = [f'fixture-model-{number:05d}' for number in range(24000)]
+                assert len(json.dumps(quota).encode()) > 512*1024
+            responses.append(quota)
+            return quota
+    class Wake:
+        def clear(self):
+            pass
+        def set(self):
+            pass
+        def wait(self, seconds):
+            clock[0] += seconds
+    monkeypatch.setattr(module, 'AccountClient', Client)
+    service = module.QuotaService(tmp_path/'home', tmp_path/'index.sqlite', reports_enabled=False)
+    service.wake = Wake()
+    service.isInterruptionRequested = lambda: clock[0] >= 1121
+    service.run()
+    assert len(reads) >= 2
+    assert not service.observation_issue
+    with sqlite3.connect(service.path) as db:
+        db.row_factory = sqlite3.Row
+        reader = quota_payloads.PayloadReader(db)
+        saved = [reader.decode(row) for row in db.execute('SELECT * FROM tracking_observations ORDER BY received')]
+        assert saved == responses
+    backlog = module.ObservationBacklog(service.path, service.home)
+    try:
+        assert backlog.first() is None and backlog.available()
+    finally:
+        backlog.close()

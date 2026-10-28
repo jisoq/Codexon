@@ -52,7 +52,7 @@ def test_old_record_cache_regenerates_shared_facts_and_reuses_ready_restart(tmp_
             reader.pin()
         assert list(ingest.PreparedCohort(store, None, None).convert(catalog))[-1]['ready']
         token = store.token
-        assert store.db.execute('SELECT format FROM meta').fetchone()[0] == 7
+        assert store.db.execute('SELECT format FROM meta').fetchone()[0] == storage.FORMAT
         columns = {row[1] for row in store.db.execute('PRAGMA table_info(headers)')}
         assert not {'display_ordinal', 'effective_at', 'request_present'} & columns
         indexes = {row[0] for row in store.db.execute("SELECT name FROM sqlite_master WHERE type='index'")}

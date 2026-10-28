@@ -195,7 +195,7 @@ def test_mode_colors_and_long_share_card(tmp_path,dark):
         assert details[1]['label']=='model-00 (Fast)'
         standard=theme.color(details[0]['swatch']);fast=theme.color(details[1]['swatch'])
         assert standard==theme.model_color('model-00')
-        assert (oklab(fast)[0]>oklab(standard)[0])==dark
+        assert oklab(fast)[0]<oklab(standard)[0]
         assert all(theme.color(item['swatch'])==theme.model_mode_color(item['model'],item['service_tier']) for item in details)
         theme.register_models(['another-model'])
         assert theme.color(share_color_key(identities[0]))==standard

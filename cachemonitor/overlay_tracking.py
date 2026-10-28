@@ -142,7 +142,7 @@ class RouteLog:
             if len(line) <= self.READ_LIMIT:
                 self.consume(line.decode('utf-8', 'replace'))
         tail = pieces[-1]
-        if len(tail) >= self.READ_LIMIT:
+        if len(tail) > self.READ_LIMIT:
             self.skipping = True
         else:
             self.partial = tail

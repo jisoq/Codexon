@@ -445,8 +445,6 @@ def summarize_session(session,health=None,*,_partials=None,_facts=None):
     if not incidents and health.get('incident'):
         incidents=[health['incident']]
     degradation=[event for event in incidents if event.get('state')=='캐시 저하 의심']
-    # Keep classifier evidence available after the graph's 24-call window rolls
-    # forward. These are observed rows, never reconstructed from session totals.
     evidence_rows={}
     evidence_keys=set()
     for event in degradation:
@@ -466,7 +464,6 @@ def summarize_session(session,health=None,*,_partials=None,_facts=None):
         event['recovery_calls']=[deepcopy(evidence_rows[key]) for key in event.get('recovery_keys',()) if key in evidence_rows]
     degradation_keys={key for event in degradation for key in event.get('occurrence_keys',event.get('keys', (
         event.get('first_key'),event.get('latest_key')))) if key is not None}
-    first=max(0,len(rows)-24)
     all_calls=[call_summary(row,ordinal,miss=is_miss(row),
                         degradation=row.get('key') in degradation_keys)
             for ordinal,row in enumerate(rows[-RECENT_CALLS:],max(1,len(rows)-RECENT_CALLS+1))]

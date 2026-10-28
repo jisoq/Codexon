@@ -46,7 +46,9 @@ def deliver_pending(window):
         result=window.engine.page_query(query),valid_until=float('inf')))
 
 
-def test_hidden_dashboard_restored_navigation_never_requests_aggregate_until_shown(tmp_path,monkeypatch):
+@pytest.mark.parametrize('page',[1,5])
+@pytest.mark.parametrize('suspend',['hide','minimize'])
+def test_hidden_dashboard_restored_navigation_never_requests_aggregate_until_shown(tmp_path,monkeypatch,page,suspend):
     from cachemonitor.analysis_worker import AnalysisBridge
     from test_ui import wait_for_rendered
     app=QApplication.instance() or QApplication([])
@@ -57,25 +59,35 @@ def test_hidden_dashboard_restored_navigation_never_requests_aggregate_until_sho
     monkeypatch.setattr(AnalysisBridge,'request',lambda self,*args:requests.append(args))
     monkeypatch.setattr(Dashboard,'start_quota_service',lambda *args:None)
     settings=QSettings(str(tmp_path/'demand.ini'),QSettings.IniFormat)
-    settings.setValue('dashboard/page',1)
+    settings.setValue('dashboard/page',page)
     window=None
     try:
         window=Dashboard([],settings=settings,index_path=tmp_path/'index.sqlite',
             quota_path=tmp_path/'quota.sqlite',live_limits=False,collection_autostart=False)
         assert not window.isVisible() and not requests
-        window.change_page(1)
+        window.change_page(page)
         window.render();window.render(automatic=True)
         app.processEvents()
         assert not requests
         window.show()
         wait_for_rendered(lambda:bool(requests))
-        assert requests[-1][1]['page']==1
-        window.hide()
+        assert requests[-1][1]['page']==page
+        old_id=window.request_id
+        window.hide() if suspend=='hide' else window.showMinimized()
+        wait_for_rendered(lambda:not window.analysis_pending)
         before=len(requests)
         window.render();window.render(automatic=True)
         app.processEvents()
         assert len(requests)==before
         assert window.worker.last_request is None
+        assert window.request_id>old_id
+        assert not window.analysis_clock.isActive() and not window.slow_timer.isActive()
+        window.analysis_progressed(dict(id=old_id,stage='converting',processed=5,total=10,unit='sessions'))
+        assert not window.analysis_loading
+        window.show() if suspend=='hide' else window.showNormal()
+        wait_for_rendered(lambda:len(requests)>before,timeout=3)
+        assert requests[-1][1]['page']==page
+        assert window.analysis_pending and window.analysis_clock.isActive()
     finally:
         if window is not None:close_dashboard(window)
         app.setProperty('cachemonitorDisableShellIntegration',previous)
@@ -97,7 +109,7 @@ def test_initial_preparation_reaches_native_dashboard_before_any_snapshot(tmp_pa
     monkeypatch.setattr('cachemonitor.overlay_windows.system_reduce_motion',lambda:language=='en')
     set_language(language)
     channel=CollectionChannel([tmp_path/'home'],tmp_path/'source.sqlite');channel.start_live()
-    snapshot=empty_snapshot(channel.homes,channel.path,time.time())
+    snapshot=empty_snapshot(channel.homes,channel.path,time.time());snapshot['catalog_scope']='full'
     snapshot['index'].update(done=3,files=20)
     channel.publish(snapshot,'startup-feedback',1)
     window=controller=None
@@ -135,8 +147,10 @@ def test_initial_preparation_reaches_native_dashboard_before_any_snapshot(tmp_pa
         assert shared_theme().reduceMotion==(language=='en')
         if language=='en':assert movement.count()==0
         else:assert movement.count()>0
+        startup_query=dict(window.pending_query)
         for page in (4,3,7):
             window.change_page(page)
+            window.worker.request('startup-progress-fixture',startup_query,('startup-progress-fixture',))
             wait_for_rendered(lambda:window.pages.isPageReady(PAGE_INDEX[page]),timeout=5)
             wait_for_rendered(lambda:control(window,window.refresh_text).isVisible())
             header=control(window,window.refresh_text)
@@ -234,6 +248,44 @@ def test_saved_maximized_window_starts_and_updates_quota_visibility(tmp_path):
                           window.quota_panel.presentation_active)
         assert not window.qml_errors
     finally:close_dashboard(window)
+
+
+@pytest.mark.parametrize('page',[1,5])
+@pytest.mark.parametrize('language',['ko','en'])
+@pytest.mark.essential
+def test_aggregate_preparation_displays_actual_totals_before_query(tmp_path,page,language):
+    from cachemonitor.i18n import set_language
+    from cachemonitor.quick_qa import control,walk
+    from test_ui import wait_for_rendered
+    set_language(language);window=dashboard(tmp_path)
+    try:
+        window.receive(sample());window.resize(1000,680);window.show();window.render();window.async_mode=True
+        window.change_page(page)
+        request_id=window.request_id
+        panel=window.metric_panel if page==1 else window.performance_panel
+        region=next(item for item in walk(control(window,panel))
+                    if item.objectName()=='analysis-region-loading' and item.isVisible())
+        text=next(item for item in walk(region) if item.objectName()=='loading-progress-detail')
+        fill=next(item for item in walk(region) if item.objectName()=='loading-completed')
+        window.analysis_progressed(dict(id=request_id,scope='aggregate',stage='collecting',
+                                       processed=12,total=2605,unit='files'))
+        wait_for_rendered(lambda:'12 / 2,605' in text.property('text') and fill.width()>0)
+        assert ('Files checked' if language=='en' else '확인한 파일') in text.property('text')
+        assert window.analysis_loading['detail']
+        window.analysis_progressed(dict(id=request_id,scope='aggregate',stage='converting',
+                                       processed=16,total=1200,unit='sessions'))
+        wait_for_rendered(lambda:'16 / 1,200' in text.property('text'))
+        assert ('Sessions checked' if language=='en' else '확인한 세션') in text.property('text')
+        assert window.analysis_loading['stageName']=='converting'
+        state=dict(window.analysis_loading)
+        window.analysis_progressed(dict(id=request_id-1,scope='aggregate',stage='collecting',
+                                       processed=999,total=1000,unit='files'))
+        assert window.analysis_loading==state
+        window.analysis_progressed(dict(id=request_id,scope='aggregate',stage='publishing'))
+        assert window.analysis_loading['stageName']=='publishing'
+        assert 'progressText' not in window.analysis_loading
+        assert not window.qml_errors
+    finally:close_dashboard(window);set_language('ko')
 
 
 @pytest.mark.parametrize('language',['ko','en'])

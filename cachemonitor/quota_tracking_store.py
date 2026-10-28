@@ -114,7 +114,7 @@ def enable(db, home, at=None, enabled=True):
     db.commit()
 
 
-def sync_activity(db, snapshot, cache=None):
+def sync_activity(db, snapshot, cache=None, *, update_health=True):
     cache = {} if cache is None else cache
     if not db.execute("select 1 from sqlite_master where name='tracking_config'").fetchone():
         return
@@ -125,13 +125,14 @@ def sync_activity(db, snapshot, cache=None):
         control=db.execute('select enabled from tracking_controls where home=? order by at desc limit 1',(home,)).fetchone()
         if control is not None and not control[0]:
             continue
-        complete = snapshot.get('usage_collection_complete', snapshot.get('index', {}).get('usage_complete', False))
-        previous = db.execute('select * from tracking_health where home=?', (home,)).fetchone()
-        if snapshot.get('collection_partial'):complete=bool(previous and previous['complete'])
-        if previous and snapshot['ts']-previous['at'] > 15:
-            db.execute('insert or replace into tracking_gaps values(?,?,?)', (home, previous['at'], snapshot['ts']))
-        db.execute('''insert into tracking_health values(?,?,?) on conflict(home) do update set
-            at=excluded.at,complete=excluded.complete''', (home, snapshot['ts'], int(complete)))
+        if update_health:
+            complete = snapshot.get('usage_collection_complete', snapshot.get('index', {}).get('usage_complete', False))
+            previous = db.execute('select * from tracking_health where home=?', (home,)).fetchone()
+            if snapshot.get('collection_partial'):complete=bool(previous and previous['complete'])
+            if previous and snapshot['ts']-previous['at'] > 15:
+                db.execute('insert or replace into tracking_gaps values(?,?,?)', (home, previous['at'], snapshot['ts']))
+            db.execute('''insert into tracking_health values(?,?,?) on conflict(home) do update set
+                at=excluded.at,complete=excluded.complete''', (home, snapshot['ts'], int(complete)))
         for session in snapshot.get('sessions', []):
             if session['home'] != home:
                 continue

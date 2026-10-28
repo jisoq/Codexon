@@ -347,6 +347,35 @@ def test_http_sse_chunking_json_errors_and_unparsed_body(tmp_path):
     run_proxy_test(run())
 
 
+def test_http_sse_after_decoded_total_preserves_wire_and_terminal_observation(tmp_path,monkeypatch):
+    from cachemonitor import proxy_observation
+    monkeypatch.setattr(proxy_observation,'MAX_OBSERVATION',256)
+    filler=b'data: {"type":"response.output_text.delta","delta":"PRIVATE_OUTPUT"}\n\n'
+    terminal=dict(type='response.completed',response=dict(id='after-total',model='reported'))
+    payload=filler*16+b'data: '+json.dumps(terminal).encode()+b'\n\n'
+    async def run():
+        received=[]
+        async def upstream(request):
+            received.append(await request.read())
+            response=web.StreamResponse(headers={'Content-Type':'text/event-stream'})
+            await response.prepare(request)
+            for offset in range(0,len(payload),37):await response.write(payload[offset:offset+37])
+            await response.write_eof();return response
+        app=web.Application();app.router.add_post('/responses',upstream)
+        store=EvidenceStore(tmp_path/'e.sqlite')
+        request=b'{"model":"asked","input":"PRIVATE_REQUEST"}'
+        try:
+            async with server(app) as upstream_url,server(create_app(store,'home',upstream_url)) as proxy,ClientSession() as client:
+                async with client.post(proxy+'/responses',data=request) as response:
+                    assert await response.read()==payload
+                assert received==[request]
+            rows=store.db.execute('select response_id,requested_model,response_model,status from model_observations').fetchall()
+            assert ('after-total','asked','reported','completed') in rows
+            assert 'PRIVATE' not in str(store.db.execute('select * from model_observations').fetchall())
+        finally:store.close()
+    run_proxy_test(run())
+
+
 @pytest.mark.parametrize('websocket',[False,True])
 def test_invalid_event_type_does_not_break_passive_relay(tmp_path,websocket):
     async def run():

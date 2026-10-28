@@ -296,11 +296,10 @@ Item {
                 selectionColor: appTheme.palette.selection; selectedTextColor: appTheme.palette.ink
                 onLinkActivated: link => { if (view.s.externalLinks) Qt.openUrlExternally(link) }
             }
-            Rectangle {
+            UiSwatch {
                 visible: !!view.s.swatch
                 anchors.left: parent.left; anchors.verticalCenter: parent.verticalCenter
-                width: 12; height: 4
-                color: view.s.swatch ? (appTheme.palette && appTheme.color(view.s.swatch)) : "transparent"
+                colorKey: view.s.swatch || ""
             }
             HoverHandler { id: textHover }
             UiToolTip { visible: textHover.hovered && (view.s.tooltip.length > 0 || label.truncated); text: view.s.tooltip || label.text }

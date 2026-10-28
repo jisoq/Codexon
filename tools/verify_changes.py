@@ -54,12 +54,15 @@ GROUPS = {
                               'observer_panel', 'windows_startup', 'proxy_update', 'collection_observation') + (
         'tests/test_model_proxy.py::test_drain_preserves_work_accepted_after_the_last_idle_probe',),
     'graphics_recovery': test_files('graphics_recovery', 'window_recovery', 'quick_ui', 'overlay_shadow'),
-    'data': test_files('core', 'index', 'demand_loading', 'data_contract', 'subagent_collection', 'request_tier_snapshots', 'collection_defaults', 'collection_crash_recovery', 'collection_transport', 'collection_preparation'),
+    'data': test_files('core', 'index', 'selected_collection', 'demand_loading', 'data_contract', 'subagent_collection', 'request_tier_snapshots', 'collection_defaults', 'collection_crash_recovery', 'collection_transport', 'collection_preparation'),
     'analysis': test_files('comparison', 'comparison_usage', 'overview', 'performance', 'data_contract', 'output_speed'),
     'prepared': test_files('prepared_analysis', 'prepared_format_migration', 'analysis_query_actor', 'demand_loading',
                          'prepared_revision_reads', 'prepared_retention_weights',
                          'prepared_restart_incremental', 'prepared_reader_lifecycle',
                          'prepared_notification_heads', 'prepared_mode_dependencies',
+                         'prepared_delivery_continuation', 'prepared_publication_pressure',
+                         'prepared_catalog_capacity', 'prepared_query_owners',
+                         'prepared_warning_worker', 'selected_preparation',
                          'prepared_ledger_reuse', 'prepared_finance_reuse', 'prepared_read_optimization', 'performance_reuse') + (
         'tests/test_collection_transport.py::test_analyzer_publication_wakes_before_timer_and_freeze_reclaims_waiter',
         'tests/test_collection_transport.py::test_quiet_notifications_preserve_staleness_and_ledger_retry_deadlines',
@@ -173,6 +176,7 @@ RULES = (
     ('cachemonitor/preparation_progress.py', ('prepared', 'dashboard_queries', 'overlay_data', 'translation')),
     ('cachemonitor/prepared_query.py', ('prepared', 'analysis', 'dashboard_queries', 'details')),
     ('cachemonitor/prepared_analysis.py', ('prepared', 'analysis', 'dashboard_queries', 'details')),
+    ('cachemonitor/prepared_query_owners.py', ('prepared', 'analysis', 'dashboard_queries', 'details')),
     ('tests/fixtures/prepared-format6*', ('prepared',)),
     ('cachemonitor/prepared_history.py', ('prepared', 'analysis', 'dashboard_queries', 'details')),
     ('cachemonitor/prepared_category.py', ('prepared', 'analysis', 'dashboard')),
@@ -627,6 +631,8 @@ def package_check(executable, report_dir):
 CORE_TESTS = frozenset(test_files(
     'pricing', 'data_contract', 'core', 'request_modes', 'collection_preparation',
     'mismatch_history', 'mismatch_source',
+    'collection_replay_reactivation', 'prepared_delivery_incremental_alerts',
+    'prepared_partial_reuse',
     'banked_resets', 'comparison', 'quota', 'quota_tracking',
     'native_index', 'native_trends', 'native_usage', 'build_native',
     'verify_changes', 'check_environment', 'collect_notices', 'prepare_sources',
@@ -640,7 +646,12 @@ NON_NATIVE_TESTS = frozenset(test_files(
 
 
 def basic_tests():
-    return tuple(sorted(CORE_TESTS))
+    return tuple(sorted((*CORE_TESTS,
+        'tests/test_prepared_freeze_scheduling.py',
+        'tests/test_prepared_live_scheduling.py',
+        'tests/test_prepared_selection_retry.py',
+        'tests/test_dashboard_evidence.py::test_aggregate_preparation_displays_actual_totals_before_query',
+        'tests/test_dashboard_evidence.py::test_hidden_dashboard_restored_navigation_never_requests_aggregate_until_shown')))
 
 
 def tests_require_native(tests):
@@ -831,7 +842,7 @@ def main(argv=None):
     parser.add_argument('--rerun', type=Path, help='Replay a frozen verification manifest')
     parser.add_argument('--plan', action='store_true', help='Show checks without running them')
     parser.add_argument('--base', help='Git ref to compare when intentionally establishing a new baseline')
-    parser.add_argument('--basic', action='store_true', help='Run the fixed audited core CI checks without advancing the local baseline')
+    parser.add_argument('--basic', action='store_true', help='Run the fixed core and dashboard CI checks without advancing the local baseline')
     parser.add_argument('--full', action='store_true', help='Run all essential regression checks')
     parser.add_argument('--integration', action='store_true', help='Run all integration checks too (implies --full)')
     parser.add_argument('--extended', action='store_true', help='Also run large-data benchmarks (implies --full)')

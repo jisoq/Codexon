@@ -82,7 +82,7 @@ class Dashboard(TrayWindow):
         self.quitting=False;self.worker=None;self.engine=AnalysisEngine();self.async_mode=start_worker
         self.preparation=(PreparationPending(time.monotonic(),PreparationStage.STARTING)
                           if start_worker and static_snapshot is None else None)
-        self.analysis=analyze([]);self.analysis_pending=False;self.analysis_errors=[];self.analysis_error_history=[]
+        self.analysis=analyze([]);self.analysis_pending=False;self.analysis_errors=[]
         self.client_cache=BoundedCache(8,64*1024*1024);self.request_id=0;self.view_result=None;self.applied_key=None
         self.display_identity=None;self.pending_retained=False;self.displayed_pages={}
         self.lookup={'sessions':{},'turns':{},'session_turns':{}};self.page_frames={}
@@ -331,6 +331,12 @@ class Dashboard(TrayWindow):
         page=getattr(self,'current_page',3)
         if self.worker is not None and hasattr(self.worker,'cancel_queries') and (not visible or page in (3,4,7)):
             self.worker.cancel_queries()
+            if self.analysis_pending:
+                self.request_id+=1;self.analysis_pending=False
+                self.deferred_result=None;self.defer_timer.stop()
+                self.clear_analysis_loading();self._display_dirty=True
+        if visible and getattr(self,'_display_dirty',False):
+            self._display_dirty=False;QTimer.singleShot(0,lambda:self.render(automatic=True))
         self.quota_panel.set_presentation_active(visible and page==3)
         for service in getattr(self,'quota_services',{}).values():
             service.set_reports_enabled(visible and page==3 and service is self.quota_service)
@@ -556,7 +562,7 @@ class Dashboard(TrayWindow):
 
     def update_discovered(self,release):
         self.update_available.setVisible(bool(release))
-        if not release:return
+        if not release or self.update_panel.auto_start:return
         from .i18n import formatted
         tag=release['tag_name'];version=tag.lstrip('v')
         monitor=self.update_monitor
@@ -730,10 +736,13 @@ class Dashboard(TrayWindow):
             elapsedText=formatted('{seconds}초 경과',seconds=elapsed),slow=bool(self.analysis_loading.get('slow') or elapsed>=5)))
 
     def set_analysis_stage(self,stage):
-        stages={'queued':'분석에 사용할 기록을 준비하고 있습니다.',
-                'query':'선택한 조건에 맞는 사용 기록을 읽고 있습니다.',
-                'aggregate':'조회한 기록으로 지표를 계산하고 있습니다.',
-                'present':'화면의 구성 요소를 준비하고 있습니다.'}
+        stages={'queued':(0,'분석에 사용할 기록을 준비하고 있습니다.'),
+                'collecting':(0,'저장된 Codex 사용 기록을 읽고 있습니다.'),
+                'converting':(0,'확인한 기록으로 사용량을 계산하고 있습니다.'),
+                'publishing':(0,'확인한 사용량을 화면에 반영하고 있습니다.'),
+                'query':(1,'선택한 조건에 맞는 사용 기록을 읽고 있습니다.'),
+                'aggregate':(2,'조회한 기록으로 지표를 계산하고 있습니다.'),
+                'present':(3,'화면의 구성 요소를 준비하고 있습니다.')}
         self.analysis_stage=stage
         if self.preparation is not None:
             self.sync_preparation();return
@@ -741,8 +750,8 @@ class Dashboard(TrayWindow):
             state=dict(self.analysis_loading)
             if state.get('stageName')!=stage:
                 for key in ('processed','total','progressText'):state.pop(key,None)
-            self.set_analysis_loading(dict(state,stageName=stage,stage=list(stages).index(stage) if stage in stages else 0,
-                                           detail=tr(stages.get(stage,stages['queued']))))
+            position,detail=stages.get(stage,stages['queued'])
+            self.set_analysis_loading(dict(state,stageName=stage,stage=position,detail=tr(detail)))
 
     @batched_updates
     def analysis_progressed(self,message):
@@ -759,7 +768,8 @@ class Dashboard(TrayWindow):
             if self.preparation is not None:return
             done=message.get('processed');total=message.get('total')
             if type(done) is int and done>=0 and self.analysis_loading:
-                templates={'calls':'처리한 호출 {count}건','intervals':'계산 구간 {count}','sessions':'확인한 세션 {count}개'}
+                templates={'calls':'처리한 호출 {count}건','intervals':'계산 구간 {count}',
+                           'sessions':'확인한 세션 {count}개','files':'확인한 파일 {count}개'}
                 count=f'{done:,} / {total:,}' if type(total) is int and total>=done else f'{done:,}'
                 detail=formatted(templates.get(message.get('unit'),templates['calls']),count=count)
                 calls=message.get('calls')
@@ -1019,7 +1029,7 @@ class Dashboard(TrayWindow):
         self.observe_error('analysis.query' if facts.get('query_failed') else 'analysis.process','analysis',facts)
         self.client_cache.clear();self.pending_logical=None
         self.request_id+=1;self.deferred_result=None;self.defer_timer.stop();self.clear_analysis_loading()
-        self.analysis_pending=False;self.analysis_errors=[facts];self.analysis_error_history=(self.analysis_error_history+[facts])[-10:]
+        self.analysis_pending=False;self.analysis_errors=[facts]
         if self.current_page not in (3,4):
             if not facts['retained']:
                 self.show_analysis_message('현재 조건의 결과를 불러오지 못했으므로 잠시 후 다시 시도해주세요.','',retry=True)
@@ -1052,8 +1062,6 @@ class Dashboard(TrayWindow):
         self.sync_report_demand()
         self.quota_sidebar.refresh_status()
         self.refresh_home_status()
-        if getattr(self,'_display_dirty',False):
-            self._display_dirty=False;QTimer.singleShot(0,lambda:self.render(automatic=True))
 
     def hideEvent(self,event):
         super().hideEvent(event);self.sync_report_demand()
@@ -1211,7 +1219,7 @@ class Dashboard(TrayWindow):
         self.settings_page.add_row('about','업데이트 자동 확인',
             '앱 실행 중 6시간 간격으로 새 버전을 확인합니다.',
             self.auto_update,section='버전',aliases='automatic update',depth=1)
-        self.settings_page.add_widget('about',self.update_panel,section='업데이트',title='업데이트 확인',target=self.update_panel.button,aliases='정보 문제 해결 update')
+        self.settings_page.add_widget('about',self.update_panel,section='업데이트',title='업데이트 확인',target=self.update_panel,aliases='정보 문제 해결 update')
         self.recovery_button=SettingsPage.shortcut('연결 복구',self.update_panel.open_recovery)
         self.recovery_status=Text();self.recovery_status.setWordWrap(True)
         self.update_panel.recovery_status=self.recovery_status

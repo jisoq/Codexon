@@ -56,6 +56,9 @@ class SelectedJSON:
 def message_metadata(data):
     native = get_native()
     if native is not None and type(data) in (bytes, str):
+        size=len(data) if type(data) is bytes else sum(
+            len(data[offset:offset+CHUNK].encode('utf-8')) for offset in range(0,len(data),CHUNK))
+        if size>MAX_OBSERVATION:return {}
         try:
             return native.message_metadata(data)
         except ValueError:
@@ -142,17 +145,27 @@ class ResponseMetadata:
         if self.error:return
         if self.parser is not None:
             self.parser.feed(data);return
-        self.prefix.extend(data)
-        probe=bytes(self.prefix).lstrip(b' \t\r\n')
-        if probe.startswith(b'\xef\xbb\xbf'):probe=probe[3:]
-        if probe.startswith(b'{'):
-            self.kind='json';self.parser=SelectedJSON()
-        elif probe.startswith((b'data:',b'event:',b':',b'id:',b'retry:')):
-            self.kind='sse';self.parser=EventStream(self.callback)
-        elif len(self.prefix)>16:
-            self.error='unknown_format';self.prefix.clear();return
-        else:return
-        self.parser.feed(probe);self.prefix.clear()
+        markers=(b'data:',b'event:',b':',b'id:',b'retry:')
+        bom=b'\xef\xbb\xbf'
+        offset=0
+        while offset<len(data):
+            if not self.prefix or self.prefix==bom:
+                offset=len(data)-len(data[offset:].lstrip(b' \t\r\n'))
+                if offset==len(data):return
+            self.prefix.append(data[offset]);offset+=1
+            prefix=bytes(self.prefix)
+            if prefix==bom:continue
+            probe=prefix.removeprefix(bom)
+            if probe==b'{':
+                self.kind='json';self.parser=SelectedJSON()
+            elif probe in markers:
+                self.kind='sse';self.parser=EventStream(self.callback)
+            elif bom.startswith(prefix) or any(marker.startswith(probe) for marker in markers):
+                continue
+            else:
+                self.error='unknown_format';self.prefix.clear();return
+            self.parser.feed(probe);self.prefix.clear()
+            self.parser.feed(data[offset:]);return
 
     def finish(self):
         if self.parser is None:return
@@ -168,7 +181,6 @@ class DecodedObservation:
         self.consumer=consumer
         self.encoding=encoding.strip().lower()
         self.error=None
-        self.size=0
         self.decoder=None
         self.closed=False
         self.result=None
@@ -180,8 +192,6 @@ class DecodedObservation:
         else:self.error='unsupported_encoding'
 
     def write(self,data):
-        self.size+=len(data)
-        if self.size>MAX_OBSERVATION:raise ValueError('observation_limit')
         self.consumer.feed(data)
         return len(data)
 
@@ -195,7 +205,7 @@ class DecodedObservation:
                     self.write(self.decoder.decompress(data,CHUNK))
                     data=self.decoder.unconsumed_tail
         except (ValueError,zlib.error,zstandard.ZstdError):
-            self.error='observation_limit' if self.size>MAX_OBSERVATION else 'decode_error'
+            self.error='decode_error'
 
     def finish(self):
         if self.closed:return self.result

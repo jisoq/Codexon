@@ -87,8 +87,10 @@ def test_startup_collection_counts_are_sampled_and_unavailable_catalog_is_unmeas
     monkeypatch.setattr(prepared_runtime.Mailbox,'offer_progress',offer)
     monkeypatch.setattr(prepared_runtime,'time',SimpleNamespace(monotonic=lambda:clock[0],time=time.time))
     channel=CollectionChannel([tmp_path/'home'],tmp_path/'source.sqlite');channel.start_live()
-    snapshot=empty_snapshot(channel.homes,channel.path,time.time());snapshot['index'].update(done=1,files=10)
+    snapshot=empty_snapshot(channel.homes,channel.path,time.time());snapshot['catalog_scope']='full'
+    snapshot['index'].update(done=1,files=10)
     writer=PreparedWriter(channel.homes,channel.path,None,tmp_path/'quota.sqlite')
+    writer.set_aggregate('publication-pressure')
     try:
         requested.get(timeout=10)
         samples.put('unavailable');writer.sync();requested.get(timeout=5)
@@ -135,10 +137,11 @@ def test_writer_survives_publication_capacity_and_recovers_on_sync(tmp_path,monk
     channel.start_live()
     snapshot=empty_snapshot(channel.homes,channel.path,time.time())
     value=source();value['home']=channel.homes[0]
-    snapshot.update(sessions=[value],usage_collection_complete=True,request_activity=[],quota_by_home={})
+    snapshot.update(sessions=[value],catalog_scope='full',usage_collection_complete=True,request_activity=[],quota_by_home={})
     snapshot['index'].update(loading=False,usage_complete=True)
     channel.publish(snapshot,'pressure',1)
     writer=PreparedWriter(channel.homes,channel.path,None,tmp_path/'quota.sqlite')
+    writer.set_aggregate('publication-pressure')
     def receive(kind):
         deadline=time.monotonic()+10
         while time.monotonic()<deadline:
@@ -187,10 +190,11 @@ def test_warning_completion_preserves_failed_canonical_adoption(tmp_path,monkeyp
     channel.start_live()
     snapshot=empty_snapshot(channel.homes,channel.path,time.time())
     value=source();value['home']=channel.homes[0]
-    snapshot.update(sessions=[value],usage_collection_complete=True,request_activity=[],quota_by_home={})
+    snapshot.update(sessions=[value],catalog_scope='full',usage_collection_complete=True,request_activity=[],quota_by_home={})
     snapshot['index'].update(loading=False,usage_complete=True)
     channel.publish(snapshot,'pressure',1)
     writer=PreparedWriter(channel.homes,channel.path,None,tmp_path/'quota.sqlite')
+    writer.set_aggregate('publication-pressure')
     def receive(predicate):
         deadline=time.monotonic()+10
         while time.monotonic()<deadline:
@@ -258,3 +262,113 @@ def test_publication_retry_requests_snapshot_without_restarting_worker(initial):
     assert bool(window.analysis_errors)!=initial
     fault=detect('analysis',dict(publication_failed=True),time.time())
     assert fault is not None and fault.code=='publication'
+
+
+@pytest.mark.parametrize('abandon', [False, True], ids=['complete', 'restart'])
+def test_publisher_fragments_each_project_path_through_mailbox(tmp_path, abandon):
+    from dataclasses import replace
+    from threading import Event
+
+    from cachemonitor.analysis_delivery import SnapshotReceiver
+    from cachemonitor.analysis_engine import retained_bytes
+    from cachemonitor.prepared_ingest import prepare_owner, stage_owner
+    from cachemonitor.prepared_runtime import Mailbox
+    from cachemonitor import prepared_store as storage
+    from test_data_contract import source
+
+    limits = replace(storage.Limits(), page_objects_bytes=64*1024)
+    paths = [f'C:\\scratch\\{number:03d}-' + 'x'*2048 for number in range(48)]
+    stopped = Event()
+    output = Mailbox(stopped)
+    receiver = SnapshotReceiver()
+
+    try:
+        with storage.PreparedStore(tmp_path/'project-paths.sqlite', limits=limits) as store:
+            stage = store.begin(('source', 1))
+            for ordinal, path in enumerate(paths):
+                value = source()
+                value.update(id=f'session-{ordinal:03d}', cwd=path,
+                             project='unassigned:home', project_name='Scratch')
+                stage_owner(stage, prepare_owner(value, owns=lambda *_: True),
+                            dict(dict.fromkeys(storage.DEPENDENCIES, 1), source_digest=f'{1:064x}'), ordinal)
+            stage.publish(('source', 1), ready=True)
+            publisher = PreparedPublisher(0)
+            publisher.adopt(store, [('home', f'session-{number:03d}') for number in range(48)],
+                            selected=[])
+            fragments = publisher.publish_pages(dict(homes=['home']), store)
+            path_fragments = 0
+            delivered = None
+
+            def consume(fragment):
+                message = dict(kind='snapshot', value=fragment)
+                assert retained_bytes(message, limits.page_objects_bytes) <= limits.page_objects_bytes
+                assert output.put(message)
+                assert output.receiver.poll()
+                return receiver.receive(output.take()['value'])
+
+            if abandon:
+                for fragment in fragments:
+                    assert consume(fragment) is None
+                    if fragment.get('filter_choices', {}).get('project_paths'):
+                        assert fragment['more']
+                        break
+                else:
+                    pytest.fail('publication did not split its project paths')
+                fragments.close()
+                assert receiver.filter_choices == {}
+                publisher.reset()
+                fragments = publisher.publish_pages(dict(homes=['home']), store)
+
+            for fragment in fragments:
+                if fragment.get('filter_choices', {}).get('project_paths'):
+                    path_fragments += 1
+                result = consume(fragment)
+                if fragment['more']:
+                    assert result is None
+                else:
+                    delivered = result
+            assert path_fragments > 1
+            assert delivered['filter_choices']['project_paths'] == {'unassigned:home': paths}
+            assert delivered['filter_choices']['project_labels'] == {'unassigned:home': 'Scratch'}
+            assert delivered['sessions'] == []
+            assert publisher.owners == {}
+    finally:
+        stopped.set()
+        output.stop()
+        output.close()
+
+
+def test_receiver_extends_project_paths_and_discards_abandoned_nested_choices():
+    from cachemonitor.analysis_delivery import SnapshotReceiver
+
+    receiver = SnapshotReceiver()
+
+    def frame(sequence, paths, *, epoch='first', reset=False, more=False):
+        return dict(protocol=2, epoch=epoch, sequence=sequence, reset=reset, more=more,
+            sessions=[], overlay_sessions=[], removed=[], model_candidates=[], cache_candidates=[],
+            filter_choices=dict(project_paths={'project': paths}))
+
+    assert receiver.receive(frame(1, ['C:/one'], reset=True, more=True)) is None
+    initial = receiver.receive(frame(2, ['C:/two']))
+    assert initial['filter_choices']['project_paths'] == {'project': ['C:/one', 'C:/two']}
+
+    assert receiver.receive(frame(3, ['C:/abandoned'], more=True)) is None
+    assert receiver.filter_choices['project_paths'] == {'project': ['C:/one', 'C:/two']}
+    assert receiver.receive(frame(1, ['C:/new-one'], epoch='replacement', reset=True, more=True)) is None
+    final = receiver.receive(frame(2, ['C:/new-two'], epoch='replacement'))
+    assert final['filter_choices']['project_paths'] == {'project': ['C:/new-one', 'C:/new-two']}
+    assert initial['filter_choices']['project_paths'] == {'project': ['C:/one', 'C:/two']}
+    assert receiver.receive(frame(4, ['C:/late'])) is None
+
+
+def test_publisher_rejects_an_indivisible_metadata_fragment(tmp_path):
+    from dataclasses import replace
+    from cachemonitor import prepared_store as storage
+
+    limits = replace(storage.Limits(), page_objects_bytes=4096)
+    with storage.PreparedStore(tmp_path/'indivisible.sqlite', limits=limits) as store:
+        stage = store.begin(('source', 1))
+        stage.publish(('source', 1), ready=True)
+        publisher = PreparedPublisher(0)
+        with pytest.raises(storage.CapacityExceeded, match='publication fragment'):
+            list(publisher.publish_pages(dict(status='x'*8192), store))

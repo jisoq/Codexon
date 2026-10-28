@@ -16,7 +16,7 @@ Button {
     readonly property bool textButton: quiet || selectionTab || legend || navigationAction
     readonly property color neutralInk: appTheme.palette.ink
     readonly property color actionFill: Qt.tint(appTheme.palette.surface, Qt.rgba(neutralInk.r, neutralInk.g, neutralInk.b, .09))
-    readonly property color contentInk: !enabled ? appTheme.palette.unknown : legend ? appTheme.readableText(checked ? legendColor : "muted", "surface") : role === "primary" && !textButton ? appTheme.readableText("surface", "accent") : checked ? appTheme.palette.accent : appTheme.palette.ink
+    readonly property color contentInk: appTheme.palette && (!enabled ? appTheme.palette.unknown : legend ? appTheme.readableText(checked ? legendColor : "muted", "surface") : role === "primary" && !textButton ? appTheme.readableText("surface", "accent") : checked ? appTheme.palette.accent : appTheme.palette.ink)
     hoverEnabled: true
     implicitWidth: iconName.length ? 36 : legend ? contentItem.implicitWidth + 12 : Math.max(80, contentItem.implicitWidth + 28)
     implicitHeight: legend ? 30 : 36
@@ -50,7 +50,7 @@ Button {
                     model: control.legendDashed ? 3 : 1
                     Rectangle {
                         width: control.legendDashed ? 4 : 18; height: 2
-                        color: appTheme.color(control.checked ? control.legendColor : "muted")
+                        color: appTheme.palette && appTheme.color(control.checked ? control.legendColor : "muted")
                     }
                 }
             }

@@ -360,6 +360,36 @@ def test_basic_rejects_conflicting_profiles_before_execution(other):
     assert error.value.code == 2
 
 
+def test_basic_ci_keeps_history_reuse_and_live_update_regressions_in_their_runners():
+    import tools.verify_changes as verify
+    history = {
+        'tests/test_collection_replay_reactivation.py',
+        'tests/test_prepared_delivery_incremental_alerts.py',
+        'tests/test_prepared_freeze_scheduling.py',
+        'tests/test_prepared_live_scheduling.py',
+        'tests/test_prepared_partial_reuse.py',
+        'tests/test_prepared_selection_retry.py',
+    }
+    dashboard = {
+        'tests/test_dashboard_evidence.py::test_aggregate_preparation_displays_actual_totals_before_query',
+        'tests/test_dashboard_evidence.py::test_hidden_dashboard_restored_navigation_never_requests_aggregate_until_shown',
+    }
+    selection = verify.basic_tests()
+    gui_history = {
+        'tests/test_prepared_freeze_scheduling.py',
+        'tests/test_prepared_live_scheduling.py',
+        'tests/test_prepared_selection_retry.py',
+    }
+    assert history - gui_history <= verify.CORE_TESTS
+    assert not gui_history & verify.CORE_TESTS
+    assert history | dashboard <= set(selection)
+    commands = dict(verify.pytest_commands(selection))
+    assert history - gui_history <= set(commands['core'])
+    assert '--no-desktop' in commands['core']
+    assert dashboard | gui_history <= set(commands['gui'])
+    assert '--no-desktop' not in commands['gui']
+
+
 @pytest.mark.parametrize('existing_baseline', [False, True])
 def test_basic_success_preserves_local_baseline_and_gui_work(tmp_path, monkeypatch, capsys, existing_baseline):
     from types import SimpleNamespace
@@ -389,8 +419,10 @@ def test_basic_success_preserves_local_baseline_and_gui_work(tmp_path, monkeypat
     reports = list((tmp_path/'reports').glob('*/report.json'))
     report = json.loads(reports[0].read_text(encoding='utf-8'))
     assert report['suite'] == 'basic' and not report['full'] and report['affected_tests'] == []
-    assert report['tests'] == sorted(verify.CORE_TESTS)
-    assert len(executed) == 1 and '--no-desktop' in executed[0] and 'core' in executed[0]
+    assert report['tests'] == list(verify.basic_tests())
+    assert len(executed) == 2
+    assert '--no-desktop' in executed[0] and 'core' in executed[0]
+    assert '--no-desktop' not in executed[1] and 'gui' in executed[1]
     assert report['pytest']['runs'][0]['exit_code'] == 0
     if existing_baseline:
         assert baseline.read_bytes() == original
@@ -407,7 +439,7 @@ def test_basic_missing_baseline_stays_basic_and_keeps_unmapped_guard(tmp_path, m
     assert verify.main(['--basic', '--plan']) == 0
     plan = json.loads(capsys.readouterr().out)
     assert plan['suite'] == 'basic' and not plan['full'] and plan['affected_tests'] == []
-    assert plan['tests'] == sorted(verify.CORE_TESTS)
+    assert plan['tests'] == list(verify.basic_tests())
     monkeypatch.setattr(verify, 'file_hashes', lambda: {'cachemonitor/unmapped_new.py':'new'})
     monkeypatch.setattr(verify, 'changed_files', lambda *args: {'cachemonitor/unmapped_new.py'})
     assert verify.main(['--basic', '--plan']) == 2
@@ -570,7 +602,7 @@ def test_rerun_preserves_absent_baseline_and_basic_selection(tmp_path, monkeypat
     assert verify.main(['--rerun', first['rerun_manifest'], '--diagnostics', str(tmp_path/'retry')]) == 0
     retry = json.loads(capsys.readouterr().out)
     report = json.loads(Path(retry['report']).read_text(encoding='utf-8'))
-    assert report['suite'] == 'basic' and report['tests'] == sorted(verify.CORE_TESTS)
+    assert report['suite'] == 'basic' and report['tests'] == list(verify.basic_tests())
     assert not baseline.exists()
 
 

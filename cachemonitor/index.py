@@ -156,6 +156,35 @@ def source_context_marker(clean, path, end):
         clean['_next_event_id']=f'{Path(path).name}:{end}'
 
 
+class SourceFiles:
+    def __init__(self, rows=()):
+        self.paths = {}
+        self.owners = defaultdict(set)
+        for row in rows:
+            self.replace(*row)
+
+    def __iter__(self):
+        return iter(self.paths.values())
+
+    def __len__(self):
+        return len(self.paths)
+
+    def replace(self, path, home, sid):
+        previous = self.paths.get(path)
+        if previous is not None:
+            key = (str(previous[1]), previous[2])
+            self.owners[key].discard(path)
+            if not self.owners[key]:
+                del self.owners[key]
+        self.paths[path] = (path, home, sid)
+        self.owners[(str(home), sid)].add(path)
+
+    def selected(self, owners, pending=()):
+        paths = set(pending)
+        for key in owners:
+            paths.update(self.owners.get(key, ()))
+        return (self.paths[path] for path in sorted(paths) if path in self.paths)
+
 class UsageIndex:
     def __init__(self, homes, path=None, model_evidence_path=None):
         self.read_only=False
@@ -174,12 +203,16 @@ class UsageIndex:
             CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY, home TEXT, tid TEXT,
                 offset INTEGER, size INTEGER, mtime INTEGER, inode TEXT);
             CREATE TABLE IF NOT EXISTS metadata(home TEXT, tid TEXT, data TEXT, PRIMARY KEY(home,tid));
+            CREATE INDEX IF NOT EXISTS metadata_parent ON metadata(home,json_extract(data,'$.parent_thread_id'),tid);
         ''')
         if 'events' in tables and [r[2] for r in self.db.execute('PRAGMA index_info(events_session)')]!=['home','tid','ts','path','pos']:
             self.db.execute('DROP INDEX IF EXISTS events_session')
             self.db.execute('CREATE INDEX events_session ON events(home,tid,ts,path,pos)')
             self.db.commit()
         self.db.execute('CREATE TABLE IF NOT EXISTS usage_archive(home TEXT,response_id TEXT,data TEXT,PRIMARY KEY(home,response_id))')
+        from .usage_archive import ARCHIVE_OWNER
+        self.db.execute("CREATE INDEX IF NOT EXISTS usage_archive_parent ON usage_archive(home,json_extract(data,'$.sid'),response_id)")
+        self.db.execute(f'CREATE INDEX IF NOT EXISTS usage_archive_owner ON usage_archive(home,{ARCHIVE_OWNER},response_id)')
         # Recover complete snapshots and raw adjacency proofs omitted by older scanners.
         # Keep existing events while this incremental backfill proceeds.
         self.tier_backfill=self.db.execute('pragma user_version').fetchone()[0]<6
@@ -214,12 +247,15 @@ class UsageIndex:
         self.active_members=set()
         self.active_sources=set()
         self.selected_members=set()
-        self.catalog_complete=False
+        self.discovery_complete=False
+        self.header_pending=set()
         self.replay = None
         selected_homes={str(h) for h in self.homes}
         self.metadata = {(r[0],r[1]):json.loads(r[2]) for r in self.db.execute('select home,tid,data from metadata') if all_metadata or r[0] in selected_homes}
         self.catalog_owners=set(self.metadata)
-        self.files = []
+        self.files = SourceFiles()
+        self.lineage_overrides = {}
+        self.lineage_children = {}
         self.queue = deque()
         self.prioritized_roots = set()
         self.last_discovery = 0
@@ -308,8 +344,89 @@ class UsageIndex:
                         except (ValueError,TypeError,AttributeError): continue
                 except (OSError,ValueError,TypeError,AttributeError): continue
 
+    @property
+    def catalog_complete(self):
+        return self.discovery_complete and not self.header_pending
+
+    def discover_header(self,path,home,tid):
+        from .event_stream import EventLines
+        self.header_pending.add(path);signature=None;state=None
+        try:
+            st=Path(path).stat();signature=(st.st_size,st.st_mtime_ns,str(st.st_ino))
+            state=self.source_work.get(path)
+            known_empty=bool(tid) and st.st_size==0
+            saved=self.db.execute('SELECT home,tid,offset,size,mtime,inode FROM files WHERE path=?',(path,)).fetchone()
+            if (saved is not None and saved[0]==str(home) and saved[1] and saved[2]>0
+                    and (tid is None or saved[1]==tid) and tuple(saved[3:])==signature
+                    and (str(home),saved[1]) in self.metadata):
+                self.header_pending.discard(path)
+                return saved[1]
+            partial=self.partial_work.get(path)
+            if partial is not None and partial.get('header_pending'):
+                if partial['signature']==signature and not known_empty:
+                    if partial.get('error'):raise ValueError('Invalid source header')
+                    return tid
+                self.partial_work.pop(path)
+            if state is None:
+                if len(self.source_work)>=MAX_SOURCE_WORK:return tid
+                state={};self.source_work[path]=state
+            if state.get('header_signature')!=signature:
+                state.update(header_signature=signature,header_reader=EventLines(0,hashlib.sha256()))
+            reader=state['header_reader'];before=reader.bytes_read
+            with Path(path).open('rb') as source:
+                try:record=next(reader.read(source,FILE_READ_BUDGET,first_record=True),None)
+                finally:self.bytes_read+=reader.bytes_read-before
+            if not reader.committed:
+                if known_empty and reader.read_offset==0:
+                    self.header_pending.discard(path)
+                elif reader.read_offset>=st.st_size:
+                    self.partial_work[path]=dict(signature=signature,header_pending=True)
+                return tid
+            header=json.loads(record[1]) if record is not None else None
+            if isinstance(header,dict) and header.get('type')=='session_meta':
+                payload=header.get('payload')
+                if tid is None:
+                    candidate=payload.get('id') if isinstance(payload,dict) else None
+                    tid=candidate if isinstance(candidate,str) else None
+                if tid:
+                    key=(str(home),tid);lineage=session_lineage(payload,tid)
+                    self.lineage[key]=lineage
+                    prior=self.metadata.get(key)
+                    meta={field:value for field,value in (prior or {}).items() if field not in LINEAGE_FIELDS}
+                    meta.update(id=tid,**lineage)
+                    if meta.get('parent_thread_id'):meta['thread_source']='subagent'
+                    elif meta.get('thread_source')=='subagent':meta.pop('thread_source')
+                    names=self.names.get(str(home))
+                    if names:meta.update(names.resolve(meta))
+                    if meta!=prior:
+                        self.metadata[key]=meta
+                        self.db.execute('INSERT OR REPLACE INTO metadata VALUES(?,?,?)',(*key,json.dumps(meta,ensure_ascii=False)))
+                    self.index_lineage(key)
+            self.header_pending.discard(path)
+            return tid
+        except FileNotFoundError:
+            self.header_pending.discard(path)
+            return tid
+        except (OSError,ValueError,TypeError) as error:
+            if isinstance(error,OSError) and tid:
+                self.header_pending.discard(path)
+                partial=self.partial_work.get(path)
+                if partial is not None and partial.get('header_pending'):self.partial_work.pop(path)
+            elif signature is not None:
+                self.partial_work[path]=dict(signature=signature,header_pending=True,error=True)
+            self.failed_sources.add((str(home),tid))
+            self.errors.append(f'기록 머리말 확인 필요: {Path(path).name}')
+            self.collection_fault['read_failed']=True
+            return tid
+        finally:
+            partial=self.partial_work.get(path)
+            if state is not None and (path not in self.header_pending or partial is not None and partial.get('header_pending')):
+                state.pop('header_reader',None);state.pop('header_signature',None)
+                if not state:self.source_work.pop(path,None)
+            while len(self.partial_work)>MAX_SOURCE_WORK:self.partial_work.popitem(last=False)
+
     def discover(self, now):
-        paths = {}
+        paths = {};self.discovery_complete=True
         for home in self.homes:
             try:
                 with readonly(home / 'state_5.sqlite') as db:
@@ -322,27 +439,21 @@ class UsageIndex:
                     for row in db.execute('select ' + task_select(cols) + ' from threads'):
                         meta = dict(row)
                         key = (str(home), row['id'])
-                        # Read only the immutable header for lineage. Existing
-                        # event offsets and historical mode values are untouched.
                         if key not in self.lineage and row['rollout_path']:
-                            try:
-                                with Path(row['rollout_path']).open('rb') as source:
-                                    header=json.loads(source.readline(2*1024*1024))
-                                if isinstance(header,dict) and header.get('type')=='session_meta':
-                                    self.lineage[key]=session_lineage(header.get('payload'),row['id'])
-                            except (OSError,ValueError,TypeError):
-                                pass
+                            self.discover_header(str(Path(row['rollout_path']).resolve()).removeprefix('\\\\?\\'),home,row['id'])
                         meta.update({field:value for field,value in self.lineage.get(key,{}).items() if not meta.get(field)})
                         if meta.get('parent_thread_id'):meta['thread_source']='subagent'
                         meta.update(names.resolve(meta))
                         if self.metadata.get(key)!=meta:
                             self.metadata[key] = meta
                             self.db.execute('insert or replace into metadata values(?,?,?)',(*key,json.dumps(meta,ensure_ascii=False)))
+                        self.index_lineage(key)
                         if row['rollout_path']:
                             source=resolved.get(row['rollout_path'])
                             if source is None:source=str(Path(row['rollout_path']).resolve()).removeprefix('\\\\?\\')
                             paths[source] = (home, row['id'])
             except (OSError, sqlite3.Error) as exc:
+                self.discovery_complete=False
                 self.errors.append(f'{home.name} / 세션 목록: {exc}')
                 self.collection_fault['read_failed']=True
             for folder in ('sessions', 'archived_sessions'):
@@ -353,23 +464,15 @@ class UsageIndex:
                     resolved = str(path.resolve()).removeprefix('\\\\?\\')
                     if resolved not in paths:
                         # A filename is not proof of ownership; session_meta supplies the ID.
-                        try:
-                            with path.open('rb') as source:header=json.loads(source.readline(2*1024*1024))
-                            payload=header.get('payload') if isinstance(header,dict) else None
-                            tid=payload.get('id') if isinstance(payload,dict) and header.get('type')=='session_meta' else None
-                            if not isinstance(tid,str):tid=None
-                        except (OSError,ValueError,TypeError):tid=None
-                        if tid:
-                            key=(str(home),tid)
-                            self.lineage[key]=session_lineage(payload,tid)
-                            self.metadata.setdefault(key,dict(id=tid,**self.lineage[key]))
+                        tid=self.discover_header(resolved,home,None)
                         paths[resolved] = (home, tid)
         # Replacing the discovery queue also releases owners that can no longer run.
+        self.header_pending.intersection_update(paths)
         self.source_work={path:state for path,state in self.source_work.items() if path in paths}
         self.source_hashes={path:value for path,value in self.source_hashes.items() if path in paths}
         self.verified_sources={path:value for path,value in self.verified_sources.items() if path in paths}
         self.partial_work=OrderedDict((path,value) for path,value in self.partial_work.items() if path in paths)
-        self.files = [(path, *value) for path, value in sorted(paths.items())]
+        self.files = SourceFiles((path, *value) for path, value in sorted(paths.items()))
         self.queue = deque(self.files)
         self.prioritized_roots.clear()
         if self.tier_backfill:
@@ -380,32 +483,111 @@ class UsageIndex:
             self.tier_backfill=False
         self.done_files = 0
         self.last_discovery = now
-        self.catalog_complete=not self.errors
+
+    def index_lineage(self, key):
+        previous = self.lineage_overrides.pop(key, None)
+        if previous is not None:
+            bucket = self.lineage_children[(key[0], previous)]
+            bucket.discard(key)
+            if not bucket:
+                del self.lineage_children[(key[0], previous)]
+        metadata = self.metadata.get(key, {})
+        parent = (self.lineage.get(key) or metadata).get('parent_thread_id')
+        if parent != metadata.get('parent_thread_id'):
+            self.lineage_overrides[key] = parent
+            if parent is not None:
+                self.lineage_children.setdefault((key[0], parent), set()).add(key)
+
+    def resolve_selection(self, selected=(), *, evidence=()):
+        homes = tuple(str(home) for home in self.homes)
+        complete = self.catalog_complete
+        matches = []
+        family = set()
+        catalog = {}
+        imported = {}
+
+        def present(key):
+            if (key in self.metadata or key in self.files.owners or
+                    self.event_store.has_owner(*key)):
+                return True
+            found = self.archive.lookup(*key) if self.archive is not None else {}
+            imported.update(((key[0], sid), parent) for sid, parent in found.items())
+            return key in imported
+
+        def parent(key):
+            if key in imported:
+                return imported[key]
+            return (self.lineage.get(key) or self.metadata.get(key, {})).get('parent_thread_id')
+
+        for home, sid in selected:
+            found = [candidate for candidate in homes if (home is None or home == candidate)
+                     and present((candidate, sid))]
+            matches.append([home, sid, found if complete else None])
+            if len(found) == 1:
+                family.add((found[0], sid))
+        pending = list(family)
+        while pending:
+            key = pending.pop()
+            catalog[key] = parent(key)
+            children = {(key[0], row[0]) for row in self.db.execute(
+                "SELECT tid FROM metadata WHERE home=? AND json_extract(data,'$.parent_thread_id')=?", key)}
+            children.update(self.lineage_children.get(key, ()))
+            children = {child for child in children if parent(child) == key[1]}
+            if self.archive is not None:
+                found = self.archive.lookup(*key, children=True)
+                imported.update(((key[0], sid), raw) for sid, raw in found.items())
+                children.update((key[0], sid) for sid in found)
+            fresh = children - family
+            family.update(fresh)
+            pending.extend(fresh)
+        sources = set(family)
+        for key in map(tuple, evidence):
+            if key[0] in homes and present(key):
+                sources.add(key)
+        pending = list(sources)
+        context = set()
+        while pending:
+            key = pending.pop()
+            if key in context:
+                continue
+            context.add(key)
+            catalog[key] = parent(key)
+            meta = self.metadata.get(key, {})
+            session = self.monitor.sessions.get(key)
+            mode_parent = (meta.get('parent_thread_id') if 'parent_thread_id' in meta else
+                           getattr(session, 'parent_thread_id', None))
+            if key in imported:
+                mode_parent = imported[key]
+            for ancestor in (catalog[key], mode_parent):
+                if isinstance(ancestor, str) and ancestor:
+                    target = (key[0], ancestor)
+                    if target not in context and present(target):
+                        pending.append(target)
+        return dict(membership_complete=complete, matches=matches,
+                    session_catalog=[[home, sid, catalog[(home, sid)]] for home, sid in sorted(catalog)],
+                    demand_members=[list(key) for key in sorted(family)],
+                    sources=sources)
 
     def admit_demand(self):
-        known=set(self.metadata)|set(self.event_store.owners(tuple(str(home) for home in self.homes)))
-        known.update((str(home),tid) for _,home,tid in self.files if tid)
-        self.catalog_owners=known
-        if self.demand is None:
-            selected=set()
-            members=known
-            sources=known
+        full = self.demand is None or self.demand['aggregate']
+        resolution = self.resolve_selection(self.demand['selected'], evidence=self.demand['evidence']) if self.demand is not None else None
+        selected = {tuple(key) for key in resolution['demand_members']} if resolution is not None else set()
+        if full:
+            known = set(self.metadata) | set(self.event_store.owners(tuple(str(home) for home in self.homes)))
+            known.update(key for key in self.files.owners if key[1])
+            self.catalog_owners = known
+            members = known | selected
+            sources = members | (resolution['sources'] if resolution is not None else set())
         else:
-            selected=set()
-            for home,sid in self.demand['selected']:
-                matches={key for key in known if key[1]==sid and (home is None or home==key[0])}
-                if len(matches)==1:selected.update(matches)
-            while True:
-                children={key for key in known if (key[0],(self.lineage.get(key) or self.metadata.get(key,{})).get('parent_thread_id')) in selected}
-                if children<=selected:break
-                selected.update(children)
-            members=set(known) if self.demand['aggregate'] else set(selected)
-            sources=members|{tuple(key) for key in self.demand['evidence'] if tuple(key) in known}
+            self.catalog_owners = {(home, sid) for home, sid, _ in resolution['session_catalog']}
+            members = selected
+            sources = resolution['sources']
         removed=self.active_sources-sources
         for key in removed:
             job=self.rebuild_jobs.pop(key,None)
             if job is not None:job.close()
-            self.monitor.sessions.pop(key,None)
+            previous=self.monitor.sessions.pop(key,None)
+            if self.replay is not None:self.replay.rebuilt(key,previous)
             self.loaded.discard(key)
             self.new_events.pop(key,None)
             self.rebuild_required.discard(key)
@@ -417,15 +599,16 @@ class UsageIndex:
                 self.replay.restore_job.close();self.replay.restore_job=None
             self.replay.pending.clear()
         if self.demand is not None:
-            self.queue=deque(args for args in self.queue if self.demand['aggregate'] or (str(args[1]),args[2]) in sources)
+            self.queue=deque(args for args in self.queue if args[0] in self.header_pending or self.demand['aggregate'] or (str(args[1]),args[2]) in sources)
             self.pending_rebuilds=deque(key for key in self.pending_rebuilds if key in sources)
             self.cached_restore=deque(dict.fromkeys([key for key in self.cached_restore if key in sources]+
                 [key for key in sources if key not in self.loaded]))
             self.cached_restore=deque(sorted(self.cached_restore,key=lambda key:key not in selected))
             self.pending_rebuilds=deque(sorted(self.pending_rebuilds,key=lambda key:key not in selected))
             queued={args[0] for args in self.queue}
-            self.queue.extend(args for args in self.files if (self.demand['aggregate'] or (str(args[1]),args[2]) in sources)
-                              and (str(args[1]),args[2]) not in self.loaded and args[0] not in queued)
+            files = self.files if self.demand['aggregate'] else self.files.selected(sources, self.header_pending)
+            self.queue.extend(args for args in files if (args[0] in self.header_pending or
+                              (str(args[1]),args[2]) not in self.loaded) and args[0] not in queued)
 
     def validate_cached_prefix(self, source, offset, path, home, tid, state, budget):
         """Check one prefix slice; None means more validation remains."""
@@ -467,6 +650,14 @@ class UsageIndex:
             rows.close()
 
     def scan_file(self, path, home, tid):
+        if path in self.header_pending:
+            tid=self.discover_header(path,home,tid)
+            if path in self.header_pending:
+                state=self.source_work.get(path)
+                if state is not None and 'header_reader' in state:self.queue.append((path,home,tid))
+                return None
+            self.files.replace(path,home,tid)
+            if self.demand is not None and not self.demand['aggregate'] and (str(home),tid) not in self.active_sources:return None
         p = Path(path)
         try:
             st = p.stat()
@@ -594,6 +785,7 @@ class UsageIndex:
                                 self.metadata[(str(home), tid)].update(names.resolve(self.metadata[(str(home), tid)]))
                             self.db.execute('insert or replace into metadata values(?,?,?)',
                                 (str(home),tid,json.dumps(self.metadata[(str(home),tid)],ensure_ascii=False)))
+                        if tid:self.index_lineage((str(home),tid))
                     clean = sanitized(meta) if tid else None
                     if clean:
                         source_context_marker(clean,path,state['event_end'])
@@ -815,6 +1007,7 @@ class UsageIndex:
                             self.metadata[key] = meta
                             self.db.execute('insert or replace into metadata values(?,?,?)',
                                 (*key, json.dumps(meta, ensure_ascii=False)))
+                        self.index_lineage(key)
             except (OSError, sqlite3.Error) as exc:
                 self.errors.append(f'{home.name} / 세션 목록: {exc}')
                 self.collection_fault['read_failed'] = True
@@ -842,7 +1035,8 @@ class UsageIndex:
             if source_hint is not None and source_hint.metadata:
                 self.refresh_metadata(source_hint.metadata)
             if not self.queue and not self.cached_restore:
-                self.queue = deque(self.files)
+                files = self.files if self.demand is None or self.demand['aggregate'] else self.files.selected(self.active_sources, self.header_pending)
+                self.queue = deque(files)
                 self.prioritized_roots.clear()
                 self.done_files = 0
         self.admit_demand()
@@ -853,8 +1047,8 @@ class UsageIndex:
             roots=source_hint.roots-self.prioritized_roots
             self.prioritized_roots.update(roots)
             if roots:
-                priority=[args for args in self.files if self.demand is None or (str(args[1]),args[2]) in self.active_sources
-                          if any(Path(args[0]).is_relative_to(root) for root in roots)]
+                files = self.files if self.demand is None or self.demand['aggregate'] else self.files.selected(self.active_sources)
+                priority=[args for args in files if any(Path(args[0]).is_relative_to(root) for root in roots)]
                 paths={args[0] for args in priority}
                 self.queue=deque(priority+[args for args in self.queue if args[0] not in paths])
         if self.demand is not None:
@@ -873,6 +1067,7 @@ class UsageIndex:
             # Periodic discovery still runs, but cannot consume every startup
             # recovery budget. Reserve half for retained owners, half for scans.
             self.restore_cached(now,min(deadline,time.monotonic()+.2))
+        pending_headers=bool(self.header_pending)
         while self.queue and time.monotonic() < deadline:
             args = self.queue.popleft()
             try:
@@ -887,6 +1082,7 @@ class UsageIndex:
                 self.errors.append(f'기록 읽기: {Path(args[0]).name}: {exc}')
                 self.collection_fault['read_failed']=True
             self.done_files += 1
+        if pending_headers:self.admit_demand()
         try:self.db.commit()
         except sqlite3.Error:
             self.collection_fault['save_failed']=True
@@ -905,7 +1101,7 @@ class UsageIndex:
         if not self.rebuild_jobs and time.monotonic()<deadline:
             self.event_store.migrate(deadline,owners=self.active_sources if self.demand is not None and not self.demand['aggregate'] else None)
         usage_errors=list(self.errors)
-        usage_complete=not self.queue and not self.cached_restore and not self.pending_rebuilds and not self.rebuild_jobs and not usage_errors
+        usage_complete=not self.header_pending and not self.queue and not self.cached_restore and not self.pending_rebuilds and not self.rebuild_jobs and not usage_errors
         if self.replay is not None and self.replay.restore_job is not None:usage_complete=False
         if self.demand is not None and self.demand['aggregate']:
             self.active_members.update(self.monitor.sessions)
@@ -967,6 +1163,7 @@ class UsageIndex:
             self.errors.append(self.model_evidence.error)
         ready=self.ready_sessions(usage_complete)
         views = []
+        evidence_sources={tuple(owner) for owner in self.demand['evidence']} if self.demand is not None else set()
         # Resolve each home once per publication, not once per retained session.
         # The next publication resolves again so changed links are still observed.
         evidence_homes = {home:home_key(home) for home in dict.fromkeys(home for home,_ in self.monitor.sessions)}
@@ -980,7 +1177,8 @@ class UsageIndex:
             s.trim(now)
             if s.excluded_title:
                 continue
-            if not s.requests and not s.reported_usage and not s.transports and not s.request_state and key not in self.selected_members:
+            if (not s.requests and not s.reported_usage and not s.transports and not s.request_state
+                    and key not in self.selected_members and key not in evidence_sources):
                 continue
             view = dict(s.view(now,use_cache=True))
             view['history'] = self.model_evidence.enrich_owned(evidence_homes[s.home],view['history'],s,
@@ -1026,13 +1224,19 @@ class UsageIndex:
         if self.pending_rebuilds:usage_complete=False
         if usage_complete:self.last_usage_success=now
         if self.archive is not None:views.extend(self.archive.views(now,{str(h) for h in self.homes},
-            owners=None if self.demand is None or self.demand['aggregate'] else self.active_members))
+            owners=None if self.demand is None or self.demand['aggregate'] else self.active_sources))
         activity_revision = (self.model_evidence.generation,self.model_evidence.revision)
         if activity_revision != self.activity_publication:
             self.activity_rows = list(self.model_evidence.changed_activity.values())
             self.activity_tokens = {(row['home'],row['attempt']):(self.model_evidence.generation,row['seq'])
                                    for row in self.activity_rows}
             self.activity_publication = activity_revision
+        full = self.demand is None or self.demand['aggregate']
+        file_count = len(self.files) if full else sum(len(self.files.owners.get(key, ())) for key in self.active_sources)
+        catalog = ([[home,sid,(self.lineage.get((home,sid)) or self.metadata.get((home,sid),{})).get('parent_thread_id')]
+                    for home,sid in sorted(self.catalog_owners)]+
+                   [[view['home'],view['id'],view.get('parent_thread_id')] for view in views if view.get('source')=='imported']
+                   if full else self.resolve_selection(self.demand['selected'], evidence=self.demand['evidence'])['session_catalog'])
         snapshot = {'ts': now, 'sessions': sorted(views, key=lambda s: s['activity'], reverse=True),
                 'request_activity': list(self.model_evidence.changed_activity.values()),
                 'activity_stream':True,
@@ -1042,11 +1246,10 @@ class UsageIndex:
                 'activity_source_offset':self.model_evidence.offset,
                 'usage_collection_complete':usage_complete,'last_usage_collection_success':self.last_usage_success,
                 'catalog_complete':self.catalog_complete,
+                'catalog_scope':'full' if full else 'selected',
                 'demand':self.demand,
                 'demand_members':[list(key) for key in sorted(self.active_members|{(view['home'],view['id']) for view in views if view.get('source')=='imported'})],
-                'session_catalog':[[home,sid,(self.lineage.get((home,sid)) or self.metadata.get((home,sid),{})).get('parent_thread_id')]
-                                   for home,sid in sorted(self.catalog_owners)]+
-                                  [[view['home'],view['id'],view.get('parent_thread_id')] for view in views if view.get('source')=='imported'],
+                'session_catalog':catalog,
                 'usage_errors':usage_errors,
                 'collection_fault':dict(self.collection_fault),
                 'observation_read_failed':bool(self.model_evidence.error),
@@ -1055,15 +1258,15 @@ class UsageIndex:
                 'unassigned_dropped': self.monitor.unassigned_dropped,
                 'excluded_title_sessions': sum(s.excluded_title for s in self.monitor.sessions.values() if not hasattr(s,'_replay_body')),
                 'quota_by_home':dict(self.quota_by_home),
-                'index': {'loading': bool(self.queue or self.cached_restore or self.pending_rebuilds or self.rebuild_jobs or evidence_pending
-                                         or self.replay is not None and self.replay.restore_job is not None), 'done': min(self.done_files, sum(self.demand is None or self.demand['aggregate'] or (str(home),tid) in self.active_sources for _,home,tid in self.files)),
+                'index': {'loading': bool(self.header_pending or self.queue or self.cached_restore or self.pending_rebuilds or self.rebuild_jobs or evidence_pending
+                                         or self.replay is not None and self.replay.restore_job is not None), 'done': min(self.done_files, file_count),
                           'usage_complete':usage_complete,'last_usage_success':self.last_usage_success,
-                          'files': sum(self.demand is None or self.demand['aggregate'] or (str(home),tid) in self.active_sources for _,home,tid in self.files), 'bytes_read': self.bytes_read, 'version': self.version,
+                          'files': file_count, 'bytes_read': self.bytes_read, 'version': self.version,
                           'path': str(self.path)}}
-        self.track_publication(snapshot)
+        self.track_publication(snapshot,ready=ready)
         return snapshot
 
-    def track_publication(self, snapshot):
+    def track_publication(self, snapshot, *, ready=None):
         from .usage_collection import CollectionChanges, LiveCollection, publication_fingerprint
         from .collection_append import complete as complete_append
         from .collection_replay import EncodedSession
@@ -1077,8 +1280,10 @@ class UsageIndex:
         current = {}
         tokens = {}
         appends = {}
+        visible = set()
         for view in snapshot['sessions']:
             key = (view['home'],view['id'])
+            visible.add(key)
             if isinstance(view,EncodedSession):
                 tokens[key]=view.digest
                 continue
@@ -1106,7 +1311,8 @@ class UsageIndex:
         self.append_origins.clear()
         self.publication_rows = current
         self.collection_changes = CollectionChanges(self.publication_owner,tokens,self.activity_tokens,
-                                                    activity_revision=self.activity_publication,appends=appends)
+            activity_revision=self.activity_publication,appends=appends,
+            removed=(ready & self.loaded)-visible if ready is not None else ())
 
     def close(self):
         if self.replay is not None:self.replay.close();self.replay=None
@@ -1119,6 +1325,7 @@ class UsageIndex:
         self.activity_rows = []
         self.activity_tokens = {}
         self.source_work.clear()
+        self.header_pending.clear()
         self.prioritized_roots.clear()
         self.verified_sources.clear()
         self.partial_work.clear()
